@@ -286,7 +286,7 @@ class TestAtomicWriteJson:
         path = tmp_path / "state.json"
 
         monkeypatch.setattr(
-            mod.json, "dump", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom"))
+            mod.json, "dumps", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom"))
         )
 
         with pytest.raises(ValueError):
@@ -306,7 +306,7 @@ class TestAtomicWriteJson:
         path.write_text(original_content)
 
         monkeypatch.setattr(
-            mod.json, "dump", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom"))
+            mod.json, "dumps", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom"))
         )
 
         with pytest.raises(ValueError):

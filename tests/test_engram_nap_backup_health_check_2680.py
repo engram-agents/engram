@@ -1,11 +1,11 @@
 """Tests for the engram-nap SKILL.md backup-health check (engram-alpha#2680).
 
-The skill's Step 3 prescribes a small snippet the agent runs by hand after
-calling engram_checkpoint() (formerly engram_nap()) to surface a degrading backup instead of burying it in
-the return dict. That snippet is prose, not imported code -- there is
-nothing for pytest to exercise directly. This file pins down the CORRECT
-predicate as a real, testable function (_backup_health_ok, mirroring the
-skill's own corrected snippet line-for-line) and verifies it against REAL
+The skill's Step 3 has the agent surface a degrading backup after calling
+engram_checkpoint() (formerly engram_nap()) instead of burying it in the
+return dict. Since #4012 the verdict is computed once, by the server's
+``_backup_ok`` helper, and the skill reads it from compact/last-checkpoint.json.
+This file pins down the CORRECT predicate by calling that helper
+(_backup_health_ok adds only the reason text) and verifies it against REAL
 captured return shapes from the two underlying functions it reads
 (engram_core._write_binary_backup, engram_snapshot_worker.write_durable_
 snapshot) rather than hand-typed fixtures, plus a synthetic failure case
@@ -42,14 +42,16 @@ import pytest
 
 import engram_core as core
 import engram_snapshot_worker as worker
+from engram_lifecycle import _backup_ok
 
 
 def _backup_health_ok(version_control: dict) -> tuple[bool, str | None]:
-    """The CORRECTED predicate, mirroring skills/engram-nap/SKILL.md's Step
-    3 snippet line-for-line (see that file for the prose form an agent
-    actually runs). Returns (healthy, reason) -- reason is None when
-    healthy, else every non-None error string found, joined with "; " (a
-    same-nap dual failure surfaces both, not just the first).
+    """The CORRECTED predicate. The verdict is the server's own ``_backup_ok``
+    (engram_lifecycle.py, #4012), the one definition of the rule that the
+    engram-nap skill's Step 3 reads from compact/last-checkpoint.json; this
+    wrapper only adds the reason text. Returns (healthy, reason) -- reason is
+    None when healthy, else every non-None error string found, joined with
+    "; " (a same-nap dual failure surfaces both, not just the first).
 
     Per each function's own return contract: the ONLY unhealthy shape is
     an "error" key. A fresh write ({"path","bytes",...}) and an idempotent
@@ -59,9 +61,7 @@ def _backup_health_ok(version_control: dict) -> tuple[bool, str | None]:
     vc = version_control or {}
     db_backup = vc.get("db_backup") or {}
     binary_backup = vc.get("binary_backup") or {}
-    db_ok = "error" not in db_backup
-    binary_ok = "error" not in binary_backup
-    if db_ok and binary_ok:
+    if _backup_ok(vc):
         return True, None
     reasons = [e for e in (db_backup.get("error"), binary_backup.get("error")) if e]
     return False, "; ".join(reasons)

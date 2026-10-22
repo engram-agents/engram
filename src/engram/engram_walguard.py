@@ -57,11 +57,11 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from engram_config_io import atomic_write_text
 from engram_regular_io import read_regular_text
 
 
@@ -720,24 +720,8 @@ def write_degraded_marker(
         "recovery": recovery_block(),
     }
 
-    # Atomic write: write to a sibling tmp file, then os.replace
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=".tmp",
-        dir=str(Path(data_dir)),
-        prefix=".substrate-degraded-",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, str(target))
-    except Exception:
-        # Clean up the tmp file on failure; do not leave a partial marker
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    # Atomic, mode- and group-preserving (#4013): the marker is read by other seats and tools.
+    atomic_write_text(target, json.dumps(payload, indent=2) + "\n", encoding="utf-8", follow_symlinks=False)
 
     return str(target)
 

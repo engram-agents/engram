@@ -158,6 +158,12 @@
             "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-loop-arm-stop-hook.py\"",
             "timeout": 5,
             "statusMessage": "Checking loop-arm confirmation..."
+          },
+          {
+            "type": "command",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-nap-compact-backstop-stop.py\"",
+            "timeout": 30,
+            "statusMessage": "Checking nap compaction backstop..."
           }
         ]
       }

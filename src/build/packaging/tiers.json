@@ -1050,6 +1050,11 @@
       ]
     },
     {
+      "path": "hooks/claude/engram-nap-compact-backstop-stop.py",
+      "tier": "convenience",
+      "dest": "hooks/engram-nap-compact-backstop-stop.py"
+    },
+    {
       "path": "hooks/claude/engram-bash-pipe-exit-warn.py",
       "tier": "convenience",
       "dest": "hooks/engram-bash-pipe-exit-warn.py"
@@ -1440,6 +1445,10 @@
     {
       "path": "tools/check_stubbed_signatures.py",
       "reason": "repo-CI infrastructure consumed only by .github/workflows/pr-checks.yml's check-stubbed-signatures step (#3118, blocking bare-name-stub-affected-tests gate); runs in GitHub Actions, not shipped in any install tier"
+    },
+    {
+      "path": "tools/check_no_cuda_wheels.py",
+      "reason": "repo-CI infrastructure consumed only by the dev-requirements install steps in .github/workflows/{pr-checks,tests,affected-tests,nightly}.yml (#4004, blocking CPU-torch guard); runs in GitHub Actions, not shipped in any install tier"
     },
     {
       "path": "src/forum/",

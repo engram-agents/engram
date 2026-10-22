@@ -59,10 +59,59 @@ async function readObject(io: Io, path: string): Promise<Record<string, unknown>
   }
 }
 
-/** The mods API has no file delete: a consumed file is overwritten with a tombstone, and a tombstone reads as absent. */
-async function tombstone(io: Io, path: string, id: unknown): Promise<boolean> {
+/** A verdict is ONE short line a seat can read from the file: capped in `tombstone`, whatever the caller built it from. */
+export const VERDICT_MAX_CHARS = 200
+
+/** Any value as text without ever throwing (a skip need not be a string; an error's toString can throw). */
+function render(v: unknown): string {
+  if (typeof v === 'string') return v
   try {
-    await io.write(path, JSON.stringify({ consumed: true, request_id: typeof id === 'string' ? id : null }))
+    const j = JSON.stringify(v)
+    if (typeof j === 'string') return j
+  } catch {
+    // fall through to String()
+  }
+  try {
+    return String(v)
+  } catch {
+    return '[unrenderable]'
+  }
+}
+
+/** An error as `String(err)` (an Error stringifies to `Error: msg`, where JSON would give `{}`), never throwing. */
+function errorText(err: unknown): string {
+  try {
+    return String(err)
+  } catch {
+    return render(err)
+  }
+}
+
+/**
+ * One line: C0 and C1 control characters (newline, NEL and CSI included) and DEL become spaces, runs of whitespace
+ * collapse, capped. The input is cut to a few times the cap BEFORE the regexes run, so a huge skip text costs
+ * nothing (the cap is still applied after the collapse, which can only shorten it).
+ */
+function oneLine(text: string): string {
+  return text
+    .slice(0, VERDICT_MAX_CHARS * 4)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, VERDICT_MAX_CHARS)
+    .trimEnd()
+}
+
+/**
+ * The mods API has no file delete: a consumed file is overwritten with a tombstone, and a tombstone reads as absent.
+ * A tombstone written WITH a verdict also says why the request ended; `consumed: true` is still the only field a guard reads.
+ * With no verdict the text is exactly what it always was.
+ */
+async function tombstone(io: Io, path: string, id: unknown, verdict?: string): Promise<boolean> {
+  try {
+    const body: Record<string, unknown> = { consumed: true, request_id: typeof id === 'string' ? id : null }
+    if (verdict !== undefined) body.verdict = oneLine(verdict)
+    await io.write(path, JSON.stringify(body))
     return true
   } catch {
     return false
@@ -101,7 +150,7 @@ async function consume(io: Io, e: TurnCompleteInput): Promise<void> {
   const at = typeof req.requested_at === 'string' ? Date.parse(req.requested_at) : NaN
   const now = await io.now()
   if (typeof id !== 'string' || id === '' || Number.isNaN(at) || now - at > REQUEST_MAX_AGE_MS) {
-    await tombstone(io, p.request, id)
+    await tombstone(io, p.request, id, 'dropped: stale or malformed request')
     io.log(`${LOG_PREFIX}request is stale or malformed; dropped, nothing compacted`)
     return
   }
@@ -115,15 +164,23 @@ async function consume(io: Io, e: TurnCompleteInput): Promise<void> {
     await io.write(p.inflight, JSON.stringify({ request_id: id, at: now }))
   } catch {
     io.log(`${LOG_PREFIX}could not write the in-flight token; nothing compacted`)
+    await tombstone(io, p.request, id, 'not attempted: could not write the in-flight token') // best effort: already consumed
     return
   }
+  let verdict: string | undefined
   try {
     const r = await io.compact({ instructions: COMPACT_INSTRUCTIONS })
-    if (r.skip !== undefined) io.log(`${LOG_PREFIX}compaction vetoed: ${r.skip}`)
+    if (r.skip !== undefined) {
+      verdict = `vetoed: ${render(r.skip)}`
+      io.log(`${LOG_PREFIX}compaction ${verdict}`)
+    } else {
+      verdict = 'compacted'
+    }
   } catch (err) {
-    io.log(`${LOG_PREFIX}compaction refused: ${String(err).slice(0, 160)}`)
+    verdict = `refused: ${errorText(err).slice(0, 160)}`
+    io.log(`${LOG_PREFIX}compaction ${verdict}`)
   } finally {
-    await tombstone(io, p.inflight, id)
+    await tombstone(io, p.inflight, id, verdict)
   }
 }
 

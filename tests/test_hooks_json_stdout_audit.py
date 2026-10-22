@@ -68,6 +68,25 @@ PRETOOL_ACTIVE_FIXTURES = {
 }
 
 
+# Hooks whose fixture must reach the SUCCESS path (not only the silent no-op one): the audit then
+# asserts the hook did its work, so "empty stdout" is checked on the path that could have printed.
+SUCCESS_PATH_FIXTURES = {"engram-nap-compact-backstop-stop.py"}
+
+
+def _seed_nap_backstop_home(engram_home: Path) -> None:
+    """A finished nap in a loop: checkpoint header + record, a briefing written after it, a loop marker."""
+    header = "2026-10-21T10:00:00"
+    epoch = 1792576800 + 0  # 2026-10-21T10:00:00Z
+    (engram_home / "session_log.md").write_text(f"## Nap (turn 1) — {header}\n", encoding="utf-8")
+    briefing = engram_home / "warm-briefing.md"
+    briefing.write_text("# W\n\n## From this session\n\nan arc\n", encoding="utf-8")
+    os.utime(briefing, (epoch + 120, epoch + 120))
+    (engram_home / "loop-mode.json").write_text('{"kind": "loop"}', encoding="utf-8")
+    (engram_home / "compact").mkdir()
+    (engram_home / "compact" / "last-checkpoint.json").write_text(
+        json.dumps({"checkpoint_at": header, "session_id": None, "backup_ok": True}), encoding="utf-8")
+
+
 def _seed_lesson_tripwire_db(engram_home: Path) -> None:
     """Create the minimal active-lesson DB state needed to exercise the hook."""
     db = engram_home / "knowledge.db"
@@ -172,6 +191,11 @@ def test_referenced_python_hook_stdout_is_empty_or_json_object(
     )
     if script_name == "engram-lesson-tripwire-hook.py":
         _seed_lesson_tripwire_db(engram_home)
+    if script_name in SUCCESS_PATH_FIXTURES:
+        _seed_nap_backstop_home(engram_home)
+        # The sweep's ENGRAM_RUNTIME_DIR (the repo root) does not hold the runtime modules; this hook
+        # imports engram_config_io from there, so point it at the source package for its fixture.
+        env["ENGRAM_RUNTIME_DIR"] = str(REPO_ROOT / "src" / "engram")
 
     result = subprocess.run(
         [sys.executable, str(hook_path)],
@@ -187,6 +211,11 @@ def test_referenced_python_hook_stdout_is_empty_or_json_object(
         f"stdout: {result.stdout[:500]!r}\n"
         f"stderr: {result.stderr[:500]!r}"
     )
+
+    if script_name in SUCCESS_PATH_FIXTURES:
+        assert (engram_home / "compact" / "request.json").exists(), (
+            f"{script_name} fixture must exercise its success path; stderr: {result.stderr[:300]!r}"
+        )
 
     stdout = result.stdout.strip()
     if not stdout:

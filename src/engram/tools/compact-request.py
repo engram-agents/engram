@@ -14,11 +14,17 @@ files under ``$ENGRAM_HOME/compact/``:
 
 Usage:
     compact-request.py --clear [--session <id>]     (a declined nap: remove any pending request; exit 0, or 4 if a file could not be removed; --session is ignored)
-    compact-request.py --session <id> --backup-ok true|false
+    compact-request.py --session <id> [--backup-ok true|false]
                        [--checkpoint-at <ISO>] [--wake-armed-at HH:MMZ] [--wake-for HH:MMZ]
 
+--backup-ok is optional (#4012): the checkpoint records its own verdict in
+``$ENGRAM_HOME/compact/last-checkpoint.json``, and omitting the flag reads it. A record counts only
+when its ``checkpoint_at`` is the same instant as the latest session_log.md nap header.
+
 Refusals (exit 3, one stderr line naming the check, nothing written):
-    * --backup-ok false (the checkpoint's backup verdict)
+    * --backup-ok false, or a record saying the backup failed (the checkpoint's backup verdict)
+    * --backup-ok omitted and no record for the latest checkpoint
+    * --backup-ok given and disagreeing with a record for the latest checkpoint
     * the warm briefing fails any of: exactly one ``^## From this session`` anchor,
       a non-empty arc below it, a file mtime at or after the last checkpoint
 Exit codes: 0 written (or cleared, with --clear), 2 usage, 3 refused, 4 could not remove a file
@@ -127,6 +133,39 @@ def _checkpoint_epoch(home: Path, override: str | None) -> float | None:
         return None
     matches = list(_CHECKPOINT_HEADER_RE.finditer(content))
     return _parse_ts(matches[-1].group(1)) if matches else None
+
+
+def _checkpoint_record(home: Path, override: str | None) -> dict | None:
+    """``compact/last-checkpoint.json`` when it is a well-formed record of the LATEST checkpoint
+    (its ``checkpoint_at`` is the same instant as the newest nap header), else None."""
+    try:
+        record = json.loads((home / "compact" / "last-checkpoint.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or not isinstance(record.get("backup_ok"), bool):
+        return None
+    at = record.get("checkpoint_at")
+    recorded = _parse_ts(at) if isinstance(at, str) else None
+    latest = _checkpoint_epoch(home, override)
+    if recorded is None or latest is None or recorded != latest:
+        return None
+    return record
+
+
+def _backup_verdict(home: Path, flag: str | None, override: str | None) -> bool:
+    """The backup verdict: the flag if given, else the checkpoint's record; Refused when they
+    disagree, or when the flag is omitted and there is no record."""
+    record = _checkpoint_record(home, override)
+    if flag is None:
+        if record is None:
+            raise Refused("no checkpoint record for the latest checkpoint")
+        return record["backup_ok"]
+    given = flag == "true"
+    if record is not None and record["backup_ok"] != given:
+        raise Refused(
+            f"--backup-ok {flag} disagrees with the checkpoint record (backup_ok {str(record['backup_ok']).lower()})"
+        )
+    return given
 
 
 def check_warm_briefing(home: Path, checkpoint_override: str | None) -> str:
@@ -240,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ap = argparse.ArgumentParser(prog="compact-request.py", description=__doc__.split("\n")[0])
     ap.add_argument("--session", required=True)
-    ap.add_argument("--backup-ok", required=True, choices=["true", "false"])
+    ap.add_argument("--backup-ok", default=None, choices=["true", "false"])
     ap.add_argument("--checkpoint-at", default=None)
     ap.add_argument("--wake-armed-at", default=None)
     ap.add_argument("--wake-for", default=None)
@@ -248,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
 
     tmps: list[Path] = []
     try:
-        if args.backup_ok != "true":
+        if not _backup_verdict(home, args.backup_ok, args.checkpoint_at):
             raise Refused("the checkpoint's backup is not ok")
         arc = check_warm_briefing(home, args.checkpoint_at)
         context, in_loop = assemble(home, arc, args.session, args.wake_armed_at, args.wake_for)

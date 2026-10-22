@@ -116,7 +116,7 @@ test('M5 a request older than 30 minutes is tombstoned, not compacted', ON, asyn
   await $.session.start(START)
   await $.turn.complete(COMPLETE)
   expect(seen.compactCalls.length).toBe(0)
-  expect(readJson(seen, REQUEST)).toEqual({ consumed: true, request_id: digest })
+  expect(readJson(seen, REQUEST)).toEqual({ consumed: true, request_id: digest, verdict: 'dropped: stale or malformed request' })
 })
 
 test('M5 control: a 29 minute old request still compacts', ON, async ($, on) => {

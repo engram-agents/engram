@@ -65,14 +65,13 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
-from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, _trim_to_line_boundary
+from _hooklib import atomic_write_json, atomic_write_text, resolve_runtime_dir, emit_context, _trim_to_line_boundary
 from _hooklib import _open_regular_fd
 from _hooklib import prune_shown_records
 # #3591: every other open() in this hook is non-blocking and regular-file-only.
@@ -1514,18 +1513,8 @@ def write_agent_registration(
         }
         dest = os.path.join(registry_dir, f"{agent_name}.json")
 
-        # Atomic write: temp file in same dir + os.replace (same-fs, no TOCTOU).
-        fd, tmp_path = tempfile.mkstemp(dir=registry_dir, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(record, f)
-            os.replace(tmp_path, dest)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        # Atomic write, mode- and group-preserving (#4013): peers read the registry through group.
+        atomic_write_json(dest, record)
     except Exception:
         # Fail-soft: never raise from a multi-agent convenience side-effect.
         pass
@@ -1631,20 +1620,8 @@ def update_counterparts_from_registry(
 
         config["counterparts"] = co_host_names
 
-        # Atomic write: temp in same dir as config.json, then os.replace
-        config_dir = os.path.dirname(config_path)
-        fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2)
-                f.write("\n")
-            os.replace(tmp_path, config_path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        # Atomic write, mode- and group-preserving (#4013), same bytes as before (indent=2 + newline).
+        atomic_write_text(config_path, json.dumps(config, indent=2) + "\n", encoding="utf-8", follow_symlinks=False)
     except Exception:
         # Fail-soft: never raise from a multi-agent convenience side-effect.
         pass

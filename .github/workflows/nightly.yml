@@ -97,6 +97,9 @@ jobs:
           # beautifulsoup4 + html5lib) — deps live in src/forum/requirements.txt,
           # not the main requirements. (Same as tests.yml.)
           pip install --no-cache-dir -r src/forum/requirements.txt
+          # Guard (#4004): CPU torch is the repo rule (requirements-lock.txt header);
+          # fail loudly if a CUDA stack came back.
+          python3 tools/check_no_cuda_wheels.py
 
       - name: disk usage — before suite
         # #3539 — MEASUREMENT ONLY. Contract: a disk-read step can NEVER change

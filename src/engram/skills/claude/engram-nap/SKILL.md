@@ -73,37 +73,7 @@ The `nap` mode:
 - Does NOT advance the turn counter — no forgetting triggered (turn advance is reserved for post-dream session checkpoints)
 - Arms the `nap_checkpoint` feeling-nudge marker (TTL=5 turns) — the return JSON includes `feeling_report_nudge` text asking whether any moment in this burst produced a distinct internal state worth marking
 
-**After calling `engram_checkpoint()`, check the return value for backup health:**
-
-```python
-result = engram_checkpoint(message="...")
-vc = result.get("version_control") or {}
-db_backup = vc.get("db_backup") or {}
-binary_backup = vc.get("binary_backup") or {}
-# Both fields are nested under version_control, not top-level (#2680: an
-# earlier version of this check read result.get("db_backup", {}) directly
-# and always saw {}). Neither field ever carries a "status" key -- read
-# each function's own return contract directly (_write_binary_backup /
-# engram_snapshot_worker.write_durable_snapshot) rather than guessing a
-# shape: db_backup is one of {"path","bytes","pruned"}
-# (fresh write), {"skipped": "same-day copy exists", "path"} (idempotent
-# skip -- also healthy), or {"error": str}; binary_backup is one of
-# {"path","bytes","fsynced": True} or {"error": str}. In every shape, the
-# ONLY unhealthy outcome is an "error" key -- so that is the one thing to
-# check, not a "status"/"ok" string that never exists in either dict.
-db_ok = "error" not in db_backup
-binary_ok = "error" not in binary_backup
-if not (db_ok and binary_ok):
-    # Surface visibly — a silently-degrading backup is discovered only when needed.
-    # Join both errors (not just the first) so a same-nap dual failure isn't
-    # silently truncated to one displayed reason.
-    reasons = [e for e in (db_backup.get("error"), binary_backup.get("error")) if e]
-    print(f"⚠ backup FAILED: {'; '.join(reasons)}")
-else:
-    print("✓ backup ok")
-```
-
-Log `✓ backup ok` / `⚠ backup FAILED: <reason>` alongside the nap summary so a recurring outage is visible, not buried in the return dict. The mechanism is already there; this is the surfacing step.
+**After calling `engram_checkpoint()`, read the backup verdict.** The checkpoint records it in `compact/last-checkpoint.json` (under `$ENGRAM_HOME`) as `backup_ok`, computed by one helper in the server; read it there and do not re-derive it from the return value (#2680 and #4012 explain why a hand-written copy of that rule drifted). Use the record only if its `checkpoint_at` equals `result["checkpoint_at"]`, the timestamp of the nap header this call just wrote; if it differs or the file is missing, treat the backup verdict as not ok and print the warning, so a failed record write can never surface the previous nap's ✓. Print `✓ backup ok` when `backup_ok` is true. Otherwise print `⚠ backup FAILED: <reason>`, taking the reason from the `error` text in `result["version_control"]["db_backup"]` and `["binary_backup"]` (join both, so a dual failure shows both). Log the line alongside the nap summary so a recurring outage is visible, not buried in the return dict.
 
 **Also check the return value for the warm-briefing advisory (#2997):**
 
@@ -291,7 +261,7 @@ Last, after Step 5b and the focus rotation (Step 7): the context the tool assemb
 python tools/compact-request.py --session <your session id> --backup-ok <true|false>
 ```
 
-`--backup-ok` is the Step 3 verdict (`true` only on `✓ backup ok`). Under a loop marker you may add `--wake-armed-at HH:MMZ --wake-for HH:MMZ` (the armed ScheduleWakeup's times) so the post-compaction context names them. The tool refuses (exit 3) when the backup failed or the warm briefing is not in order (one anchor, a non-empty arc, written since the checkpoint), and says which check on stderr; say so once and move on. Exit 4 means nothing was written; say that too. Never retry in a loop.
+`--backup-ok` is the Step 3 verdict (`true` only on `✓ backup ok`); it is optional, and when you omit it the tool reads the verdict the checkpoint recorded. Under a loop marker you may add `--wake-armed-at HH:MMZ --wake-for HH:MMZ` (the armed ScheduleWakeup's times) so the post-compaction context names them. The tool refuses (exit 3) when the backup failed or the warm briefing is not in order (one anchor, a non-empty arc, written since the checkpoint), and says which check on stderr; say so once and move on. Exit 4 means nothing was written; say that too. Never retry in a loop.
 
 ---
 
