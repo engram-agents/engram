@@ -2953,8 +2953,9 @@ def engram_checkpoint(payload_json: str) -> str:
         })
     if "message" not in params:
         return json.dumps({"error": "payload_json must include required field 'message'"})
-    # session_id is consumed here (advisory-only, #2997) — _nap_impl's own
-    # signature doesn't accept it, so it must not reach **params below.
+    # session_id is consumed here (advisory-only, #2997) and passed to _nap_impl
+    # by name below, where it is only recorded in compact/last-checkpoint.json
+    # (#4012); it must not also reach **params.
     # As of #3014, session_id is accepted-but-unused: the warm_briefing
     # advisory no longer depends on session identity (see
     # _compute_warm_briefing_advisory) — the pop is kept only so existing
@@ -2968,7 +2969,7 @@ def engram_checkpoint(payload_json: str) -> str:
     # "non-stale" and defeating the #3014 fix. Do not move this call below
     # _nap_impl.
     last_checkpoint_at = _last_checkpoint_timestamp(core.LOG_PATH)
-    result_dict = json.loads(_nap_impl(**params))
+    result_dict = json.loads(_nap_impl(**params, session_id=session_id))
     # Diagnostic snapshot (best-effort, never blocks checkpoint). engram_diagnose
     # lives in server.py; the lifecycle impl cannot call it directly (acyclic
     # constraint), so the wrapper adds it here — wave-3 structural split.
@@ -3076,10 +3077,10 @@ def engram_nap(payload_json: str) -> str:
     return engram_checkpoint(payload_json)
 
 
-def _nap_impl(message: str) -> str:
+def _nap_impl(message: str, session_id=None) -> str:
     """Impl for engram_checkpoint (formerly engram_nap; also used by the
     engram_nap deprecated alias) — delegates to engram_lifecycle (wave 3)."""
-    return _lifecycle_mod._nap_impl(message=message)
+    return _lifecycle_mod._nap_impl(message=message, session_id=session_id)
 
 
 # Matches the checkpoint headers _checkpoint_internal (engram_lifecycle.py)

@@ -1050,6 +1050,11 @@
       ]
     },
     {
+      "path": "hooks/claude/engram-nap-compact-backstop-stop.py",
+      "tier": "convenience",
+      "dest": "hooks/engram-nap-compact-backstop-stop.py"
+    },
+    {
       "path": "hooks/claude/engram-bash-pipe-exit-warn.py",
       "tier": "convenience",
       "dest": "hooks/engram-bash-pipe-exit-warn.py"
