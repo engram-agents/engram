@@ -12,7 +12,8 @@ Usage:
         [--judging-sheet OUT.md --judging-key OUT.json]
         [--exclude-source-class CLASS ...]
         [--swap ITEM_NUMBER ...]            (needs an existing --judging-key)
-        [--score-sheet FILLED.md --judging-key KEY.json]
+        [--sheet-part-bytes B]              (with --judging-sheet)
+        [--score-sheet FILLED.md [FILLED2.md ...] --judging-key KEY.json]
 
     --db PATH        knowledge.db; default ENGRAM_HOME/knowledge.db (same
                      discovery and the same mode=ro open as anchoring_report).
@@ -27,8 +28,17 @@ Usage:
                      terse stratum), deterministically from the seed and the
                      swap order, never reusing a node already drawn. Rewrites
                      sheet and key; the key's meta.swaps goes up by one.
+    --sheet-part-bytes B
+                     Also write OUT.part1of{N}.md ... (the sheet's stem, then
+                     .partKofN, then its suffix), each at most B bytes, whole
+                     items only, global item numbers, the sheet's header plus a
+                     "Part K of N" line. An item that cannot fit exits 2 and
+                     writes nothing. For handing a sheet across a size limit.
     --score-sheet    Score a filled sheet against its key: per-bin yes / partly
-                     / no shares and the two pre-registered verdicts.
+                     / no shares and the two pre-registered verdicts. Several
+                     files (filled parts) are joined in the order given; an item
+                     in two parts is a duplicate header, an item in none is
+                     missing.
 
 Similarity is `engram_anchoring.quote_claim_similarity` (the single home); when
 the embedder is unavailable the value is null with a reason, never 0.
@@ -352,24 +362,99 @@ def _blockquote(text: str) -> str:
     return "\n".join("> " + ln for ln in lines)
 
 
+_SHEET_HEADER = [
+    "# Quote judging sheet (node ids are masked as [id])\n",
+    "For each item read the quote, the interpretation and the "
+    "claim, then fill in the answers after `Answer:`. Items are in random order.\n",
+]
+
+
+def _render_item(it: dict) -> str:
+    return (
+        f"## Item {it['number']}\n\n"
+        f"**Quote:**\n{_blockquote(it['quote'])}\n\n"
+        f"**Interpretation:**\n{_blockquote(it['interp'])}\n\n"
+        f"**Claim:**\n{_blockquote(it['claim'])}\n\n"
+        f"{QUESTION_A} \n\n"
+        f"{QUESTION_B} \n\n"
+        "(c) Note: \n"
+    )
+
+
 def render_sheet(items: list[dict]) -> str:
     """items: dicts with number, quote, interp, claim -- nothing else is shown."""
-    parts = [
-        "# Quote judging sheet (node ids are masked as [id])\n",
-        "For each item read the quote, the interpretation and the "
-        "claim, then fill in the answers after `Answer:`. Items are in random order.\n",
-    ]
-    for it in sorted(items, key=lambda i: i["number"]):
-        parts.append(
-            f"## Item {it['number']}\n\n"
-            f"**Quote:**\n{_blockquote(it['quote'])}\n\n"
-            f"**Interpretation:**\n{_blockquote(it['interp'])}\n\n"
-            f"**Claim:**\n{_blockquote(it['claim'])}\n\n"
-            f"{QUESTION_A} \n\n"
-            f"{QUESTION_B} \n\n"
-            "(c) Note: \n"
-        )
-    return "\n".join(parts)
+    return "\n".join(_SHEET_HEADER + [_render_item(it) for it in sorted(items, key=lambda i: i["number"])])
+
+
+def _part_line(k: int, n: int, first: int, last: int, total: int) -> str:
+    return f"Part {k} of {n}: items {first}-{last} of {total}.\n"
+
+
+def plan_sheet_parts(items: list[dict], max_bytes: int) -> list[str]:
+    """Split the sheet into parts of at most `max_bytes` UTF-8 bytes each: whole items
+    only, in the sheet's order, with the sheet's own item numbers. Every part starts with
+    the sheet's header plus a "Part K of N: items A-B of T." line. Raises ValueError (naming
+    the item and its size) when one item plus the header cannot fit: it never exceeds the
+    bound. The part line's width is reserved at its widest (every number as wide as the
+    total), so the part count, which the line itself contains, needs no second pass."""
+    ordered = sorted(items, key=lambda i: i["number"])
+    total = len(ordered)
+    top = max((it["number"] for it in ordered), default=0)
+    widest = len(_part_line(total, total, top, top, total).encode())
+    # header + part line, then the "\n" that joins them to the first item
+    overhead = len("\n".join(_SHEET_HEADER).encode()) + 1 + widest + 1
+    groups: list[list[tuple[int, str]]] = []
+    used = 0
+    for it in ordered:
+        text = _render_item(it)
+        size = len(text.encode())
+        if overhead + size > max_bytes:
+            raise ValueError(f"item {it['number']} is {size} bytes and needs {overhead + size} bytes with "
+                             f"the header and part line, over --sheet-part-bytes {max_bytes}")
+        if groups and used + 1 + size <= max_bytes:  # +1: the "\n" joining two items
+            groups[-1].append((it["number"], text))
+            used += 1 + size
+        else:
+            groups.append([(it["number"], text)])
+            used = overhead + size
+    n = len(groups)
+    return ["\n".join(_SHEET_HEADER + [_part_line(k, n, g[0][0], g[-1][0], total)] + [t for _, t in g])
+            for k, g in enumerate(groups, start=1)]
+
+
+def sheet_part_path(sheet: Path, k: int, n: int) -> Path:
+    return sheet.with_name(f"{sheet.stem}.part{k}of{n}{sheet.suffix}")
+
+
+def remove_stale_parts(sheet: Path) -> int:
+    """Delete the part files an earlier run left next to `sheet`: names matching exactly
+    <stem>.part<K>of<N><suffix>, in the same directory, and only files or symlinks (a
+    directory of that name is left alone). A symlink is unlinked itself and never followed:
+    leaving it would let the next write go through it to its target. Returns the count.
+    Call it only after every validation has passed, so a refused run deletes nothing."""
+    pat = re.compile(re.escape(sheet.stem) + r"\.part[0-9]+of[0-9]+" + re.escape(sheet.suffix))
+    removed = 0
+    for entry in sorted(sheet.parent.iterdir()):
+        if not pat.fullmatch(entry.name):
+            continue
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+            removed += 1
+    return removed
+
+
+def _refresh_sheet_parts(sheet: Path, parts: list[str]) -> int:
+    """Remove stale parts, write the new ones (if any), say so on stderr. Returns the stale count."""
+    removed = remove_stale_parts(sheet)
+    _write_parts(sheet, parts)
+    if removed:
+        print(f"removed {removed} stale sheet part file(s) next to {sheet}", file=sys.stderr)
+    return removed
+
+
+def _write_parts(sheet: Path, parts: list[str]) -> None:
+    for k, text in enumerate(parts, start=1):
+        _write_sheet(sheet_part_path(sheet, k, len(parts)), text)
 
 
 def _sheet_items(key_items: dict, by_id: dict) -> list[dict]:
@@ -381,14 +466,19 @@ def _sheet_items(key_items: dict, by_id: dict) -> list[dict]:
 
 
 def _write_sheet(path: Path, text: str) -> None:
-    """The sheet is for another seat to read: normal default mode."""
-    path.write_text(text)
+    """The sheet is for another seat to read: normal default mode (0o666 less the umask,
+    which is what write_text gave). O_NOFOLLOW: never write through a symlink."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o666)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
 
 
 def _write_key(path: Path, text: str) -> None:
     """The key is private. Created 0600 at open(), so there is no window where it
-    exists with a looser mode; fchmod covers a key file that already existed."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    exists with a looser mode; fchmod covers a key file that already existed.
+    O_NOFOLLOW: a symlink at the path is never followed, so fchmod can never
+    change the mode of some other file."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as fh:
         os.fchmod(fh.fileno(), 0o600)
         fh.write(text)
@@ -601,6 +691,17 @@ def _print_score_human(res: dict) -> None:
         print("n_unparsed=0")
 
 
+def _plan_parts_or_exit(parser, sheet_items: list[dict], max_bytes: int | None) -> list[str]:
+    """[] when no bound was asked for. An item that cannot fit exits 2 BEFORE anything is
+    written, so a refused run leaves no sheet, parts or key behind."""
+    if max_bytes is None:
+        return []
+    try:
+        return plan_sheet_parts(sheet_items, max_bytes)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", default=None)
@@ -608,16 +709,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--judging-sheet", default=None)
     parser.add_argument("--judging-key", default=None)
-    parser.add_argument("--score-sheet", default=None)
+    parser.add_argument("--score-sheet", nargs="+", default=None,
+                        help="one filled sheet, or several filled parts (read in the order given)")
+    parser.add_argument("--sheet-part-bytes", type=int, default=None,
+                        help="also write the sheet as parts of at most this many bytes")
     parser.add_argument("--exclude-source-class", action="append", default=[])
     parser.add_argument("--swap", action="append", type=int, default=[])
     args = parser.parse_args(argv)
+
+    if args.sheet_part_bytes is not None:
+        if args.sheet_part_bytes <= 0:
+            parser.error("--sheet-part-bytes must be positive")
+        if args.score_sheet or not args.judging_sheet:
+            parser.error("--sheet-part-bytes goes with --judging-sheet")
 
     if args.score_sheet:
         if not args.judging_key:
             parser.error("--score-sheet needs --judging-key")
         key = json.loads(Path(args.judging_key).read_text())
-        res = score_sheet(key, parse_filled_sheet(Path(args.score_sheet).read_text()))
+        # one file keeps today's behaviour; several are joined in the order given
+        filled_text = "\n".join(Path(p).read_text() for p in args.score_sheet)
+        res = score_sheet(key, parse_filled_sheet(filled_text))
         if args.format == "json":
             print(json.dumps(res, indent=2))
         else:
@@ -632,6 +744,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--judging-sheet and --judging-key must be different paths")
     if args.swap and not (args.judging_key and args.judging_sheet):
         parser.error("--swap needs the existing --judging-key and the --judging-sheet to rewrite")
+    # Before anything is read from the graph, written or deleted: the sheet and key writers
+    # never follow a symlink, so a link at either path is refused here, by name.
+    for flag, given in (("--judging-sheet", args.judging_sheet), ("--judging-key", args.judging_key)):
+        if given and os.path.islink(given):
+            parser.error(f"{flag} {given} is a symlink; refusing to write through it "
+                         "(remove the link or give a real path)")
 
     db_path = Path(args.db) if args.db else (core.DATA_DIR / "knowledge.db")
     conn = _open_readonly(db_path)
@@ -653,9 +771,13 @@ def main(argv: list[str] | None = None) -> int:
         by_id = {r["id"]: r for r in records}
         sheet_items = _sheet_items(key["items"], by_id)
         key["meta"]["masked_id_tokens"] = masked_token_count(sheet_items)
+        parts = _plan_parts_or_exit(parser, sheet_items, args.sheet_part_bytes)
         _write_sheet(Path(args.judging_sheet), render_sheet(sheet_items))
+        _refresh_sheet_parts(Path(args.judging_sheet), parts)
         _write_key(key_path, json.dumps(key, indent=2))
-        print(f"swapped items {args.swap}; swaps={key['meta']['swaps']}", file=sys.stderr)
+        print(f"swapped items {args.swap}; swaps={key['meta']['swaps']}"
+              + (f"; sheet_parts={len(parts)} sheet_part_bytes={args.sheet_part_bytes}" if parts else ""),
+              file=sys.stderr)
         print(PRIVACY_NOTICE, file=sys.stderr)
         return 0
 
@@ -700,10 +822,16 @@ def main(argv: list[str] | None = None) -> int:
             },
             "items": key_items,
         }
+        parts = _plan_parts_or_exit(parser, sheet_items, args.sheet_part_bytes)
         _write_sheet(Path(args.judging_sheet), render_sheet(sheet_items))
+        _refresh_sheet_parts(Path(args.judging_sheet), parts)
         _write_key(Path(args.judging_key), json.dumps(key, indent=2))
+        if parts:
+            meta["sheet_parts"] = len(parts)
+            meta["sheet_part_bytes"] = args.sheet_part_bytes
         print(PRIVACY_NOTICE, file=sys.stderr)
         print(f"wrote {len(key_items)} items; sheet={args.judging_sheet} key={args.judging_key}"
+              + (f"; sheet_parts={len(parts)} sheet_part_bytes={args.sheet_part_bytes}" if parts else "")
               + (f"; smaller than requested: {shortfalls}" if shortfalls else ""), file=note_stream)
 
     if args.format == "json":

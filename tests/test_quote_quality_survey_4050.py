@@ -850,3 +850,394 @@ def test_d4_exit_codes(capsys):
     dirty = _item_block(1, f"{_QA} no", f"{_QB} no") + _item_block(2, f"{_QA} perhaps", f"{_QB} yes")
     out = _score_text(tool, dirty, capsys, fmt="json", expect_rc=3)
     assert json.loads(out)["verdicts"], "verdicts are still in the JSON"
+
+
+# --------------------------------------------------------------------------- P: sheet parts
+_PART_BYTES = 1500  # planted items are a few hundred bytes each: a few items per part
+# sha256 of the 30-item sheet that _planted_graph + seed 7 produced before --sheet-part-bytes existed
+_SHEET_SHA256_BEFORE_PARTS = "78426c8b7ed4c33e32a04e9e5ef06047bf8140af0cec4ec1a35348899c43e4be"
+
+
+def _items_section(text):
+    """Everything from the first item header on (the sheet's own header stripped)."""
+    return text[text.index("## Item "):]
+
+
+def _part_files(tmp, stem="sheet"):
+    def k_of(p):
+        return int(re.search(r"\.part(\d+)of\d+\.md$", p.name).group(1))
+    return sorted(tmp.glob(f"{stem}.part*of*.md"), key=k_of)
+
+
+def _item_numbers(text):
+    return [int(n) for n in re.findall(r"^## Item (\d+)[ \t]*$", text, re.M)]
+
+
+def _sample_parts(tool, capsys, b=_PART_BYTES):
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    sheet, key, out = _sample(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", str(b)))
+    return tmp, sheet, key, _part_files(tmp), out
+
+
+def _fill_text(text, answers):
+    """Fill every (a) and (b) answer for the item numbers present in `text`."""
+    def fill(m):
+        a, b = answers[int(m.group(1))]
+        blk = m.group(0).replace(_QA + " ", _QA + f" {a}", 1)
+        return blk.replace(_QB + " ", _QB + f" {b}", 1)
+    return re.sub(r"^## Item (\d+)\n.*?(?=^## Item |\Z)", fill, text, flags=re.S | re.M)
+
+
+def _answers_for(numbers):
+    cyc_a, cyc_b = ("yes", "partly", "no", "no", "partly"), ("yes", "no")
+    return {n: (cyc_a[n % 5], cyc_b[n % 2]) for n in numbers}
+
+
+def _score_files(tool, key_path, texts, capsys, tmp):
+    paths = []
+    for i, t in enumerate(texts):
+        p = tmp / f"filled_{i}.md"
+        p.write_text(t)
+        paths.append(str(p))
+    rc = tool.main(["--score-sheet", *paths, "--judging-key", str(key_path), "--format", "json"])
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def test_p1_parts_concatenate_to_the_full_sheets_items_numbers_unchanged(capsys):
+    tool = _load_tool()
+    tmp, sheet, key, parts, _ = _sample_parts(tool, capsys)
+    assert len(parts) > 1
+    full_text = sheet.read_text()
+    texts = [p.read_text() for p in parts]
+    assert "\n".join(_items_section(t) for t in texts) == _items_section(full_text)
+    assert [n for t in texts for n in _item_numbers(t)] == list(range(1, 31))
+    head = full_text[:full_text.index("## Item ")]
+    n = len(parts)
+    for k, t in enumerate(texts, start=1):
+        assert head.rstrip("\n") in t[:t.index("## Item ")], "the sheet's own instructions are in every part"
+        nums = _item_numbers(t)
+        assert f"Part {k} of {n}: items {nums[0]}-{nums[-1]} of 30." in t
+    assert [p.name for p in parts] == [f"sheet.part{k}of{n}.md" for k in range(1, n + 1)]
+
+
+def test_p2_every_part_within_the_byte_bound_and_ranges_are_contiguous(capsys):
+    tool = _load_tool()
+    tmp, sheet, key, parts, _ = _sample_parts(tool, capsys)
+    assert len(parts) > 1
+    prev_last = 0
+    for p in parts:
+        assert len(p.read_bytes()) <= _PART_BYTES
+        nums = _item_numbers(p.read_text())
+        assert nums[0] == prev_last + 1 and nums == list(range(nums[0], nums[-1] + 1))
+        prev_last = nums[-1]
+    assert prev_last == 30
+
+
+def test_p3_an_item_larger_than_the_bound_is_refused_exit_2_and_names_it(capsys):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    for i, r in enumerate(rows[:12]):  # the whole lowest bin: some of them are in any 30-item draw
+        old_quote = r["quote"]
+        r["quote"] = "x" * 3000 + f" big quote {i}"
+        sims[r["quote"]] = sims.pop(old_quote)
+    db = _make_db(rows)
+    # the same draw with no bound: find the oversized item's number and size
+    sheet, key, _ = _sample(tool, db, _tmp(), sims, capsys)
+    # an item's own bytes: its header line to its last line, without the "\n" that joins items
+    sizes = {}
+    for m in re.finditer(r"^## Item (\d+)\n.*?(?=^## Item |\Z)", sheet.read_text(), flags=re.S | re.M):
+        blk = m.group(0)
+        sizes[int(m.group(1))] = len((blk[:-1] if blk.endswith("\n\n") else blk).encode())
+    big_nums = [n for n, s in sizes.items() if s > 3000]
+    assert big_nums, "an oversized node must be in the 30-item draw (seed 7)"
+    capsys.readouterr()
+    tmp2 = _tmp()
+    with pytest.raises(SystemExit) as exc:
+        _sample(tool, db, tmp2, sims, capsys, extra=("--sheet-part-bytes", "2000"))
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert f"item {big_nums[0]} " in err and str(sizes[big_nums[0]]) in err
+    assert _part_files(tmp2) == []
+
+
+def test_p4_scoring_filled_parts_equals_scoring_the_filled_full_sheet(capsys):
+    tool = _load_tool()
+    tmp, sheet, key, parts, _ = _sample_parts(tool, capsys)
+    ans = _answers_for(range(1, 31))
+    rc_full, full = _score_files(tool, key, [_fill_text(sheet.read_text(), ans)], capsys, _tmp())
+    rc_parts, byparts = _score_files(tool, key, [_fill_text(p.read_text(), ans) for p in parts],
+                                     capsys, _tmp())
+    assert rc_full == rc_parts == 0
+    assert full["verdicts"] == byparts["verdicts"]
+    assert full["per_bin"] == byparts["per_bin"]
+    assert full["n_unparsed"] == 0 and any(s["n_answered"] for s in full["per_bin"].values())
+
+
+def test_p5_item_in_two_parts_is_a_duplicate_and_item_in_no_part_is_missing(capsys):
+    tool = _load_tool()
+    tmp, sheet, key, parts, _ = _sample_parts(tool, capsys)
+    ans = _answers_for(range(1, 31))
+    texts = [_fill_text(p.read_text(), ans) for p in parts]
+    # duplicate: item 1 (first part) also appears at the end of the second part
+    item1 = re.search(r"^## Item 1\n.*?(?=^## Item 2\n)", texts[0], re.S | re.M).group(0)
+    dup = [texts[0], texts[1] + "\n" + item1, *texts[2:]]
+    rc, res = _score_files(tool, key, dup, capsys, _tmp())
+    assert rc == 3 and res["n_unparsed"] == 1 and res["unparsed_items"] == [1]
+    assert res["unparsed_fields"]["1"] == {"a": "duplicate item header", "b": "duplicate item header"}
+    # missing: item 2 cut out of the part that holds it
+    cut = re.sub(r"^## Item 2\n.*?(?=^## Item 3\n)", "", texts[0], flags=re.S | re.M)
+    assert "## Item 2\n" not in cut
+    rc, res = _score_files(tool, key, [cut, *texts[1:]], capsys, _tmp())
+    assert rc == 3 and res["n_unparsed"] == 1 and res["unparsed_items"] == [2]
+    assert res["unparsed_fields"]["2"] == {"a": "item missing from the sheet",
+                                           "b": "item missing from the sheet"}
+
+
+def test_p6_parts_have_the_sheets_mode_and_the_key_stays_0600(capsys):
+    tool = _load_tool()
+    old = os.umask(0o022)
+    try:
+        tmp, sheet, key, parts, _ = _sample_parts(tool, capsys)
+    finally:
+        os.umask(old)
+    assert parts
+    mode = lambda p: p.stat().st_mode & 0o777
+    assert all(mode(p) == mode(sheet) for p in parts)
+    assert mode(sheet) & 0o044 == 0o044 and mode(sheet) != 0o600
+    assert mode(key) == 0o600
+    assert len(list(tmp.glob("*.json"))) == 1, "one private key file"
+
+
+def test_p7_without_the_flag_the_output_is_byte_identical_and_no_parts(capsys):
+    import hashlib
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    sheet, key, out = _sample(tool, db, tmp, sims, capsys)
+    assert hashlib.sha256(sheet.read_bytes()).hexdigest() == _SHEET_SHA256_BEFORE_PARTS
+    assert _part_files(tmp) == []
+    meta = json.loads(out)["meta"]
+    assert "sheet_parts" not in meta and "sheet_part_bytes" not in meta
+    # and the flag leaves the full sheet itself untouched
+    _, sheet2, _, parts2, _ = _sample_parts(tool, capsys)
+    assert sheet2.read_bytes() == sheet.read_bytes() and parts2
+
+
+def test_p8_export_reports_sheet_parts_in_meta_and_notice(capsys):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    tool.engram_anchoring.quote_claim_similarity = _stub(sims)
+    assert tool.main(["--db", str(db), "--format", "json", "--judging-sheet", str(tmp / "sheet.md"),
+                      "--judging-key", str(tmp / "key.json"), "--sheet-part-bytes", str(_PART_BYTES)]) == 0
+    cap = capsys.readouterr()
+    parts = _part_files(tmp)
+    meta = json.loads(cap.out)["meta"]
+    assert meta["sheet_parts"] == len(parts) > 1 and meta["sheet_part_bytes"] == _PART_BYTES
+    err = cap.err
+    assert f"sheet_parts={len(parts)}" in err and f"sheet_part_bytes={_PART_BYTES}" in err
+
+
+# --------------------------------------------------------------------------- P: stale parts, multi-byte
+def _export_raw(tool, db, tmp, sims, capsys, extra=(), swap=(), sheet_name="sheet.md"):
+    """Run main directly so stderr survives; returns (rc, captured)."""
+    tool.engram_anchoring.quote_claim_similarity = _stub(sims)
+    argv = ["--db", str(db), "--format", "json", "--judging-sheet", str(tmp / sheet_name),
+            "--judging-key", str(tmp / "key.json"), "--seed", "7", *extra]
+    for n in swap:
+        argv += ["--swap", str(n)]
+    rc = tool.main(argv)
+    return rc, capsys.readouterr()
+
+
+def _all_parts(tmp):
+    return sorted(p.name for p in tmp.glob("*.part*of*"))
+
+
+def test_p9_rerun_with_fewer_parts_leaves_only_the_new_parts(capsys):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    rc, _ = _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", "1000"))
+    first = _part_files(tmp)
+    assert rc == 0 and len(first) > 3
+    rc, cap = _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", "10000000"))
+    assert rc == 0
+    assert _all_parts(tmp) == ["sheet.part1of1.md"]
+    assert f"removed {len(first)} stale sheet part file" in cap.err
+
+
+def test_p10_swap_without_the_flag_removes_every_old_part(capsys):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", str(_PART_BYTES)))
+    old = _part_files(tmp)
+    assert len(old) > 1
+    rc, cap = _export_raw(tool, db, tmp, sims, capsys, swap=(1,))
+    assert rc == 0
+    assert _all_parts(tmp) == []
+    assert f"removed {len(old)} stale sheet part file" in cap.err
+
+
+def test_p11_a_refused_run_writes_and_deletes_nothing(capsys):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", str(_PART_BYTES)))
+    before = {p.name: p.read_bytes() for p in tmp.iterdir()}
+    assert len(_part_files(tmp)) > 1
+    with pytest.raises(SystemExit) as exc:
+        _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", "100"))
+    assert exc.value.code == 2
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", "100"), swap=(1,))
+    assert exc.value.code == 2
+    assert {p.name: p.read_bytes() for p in tmp.iterdir()} == before
+
+
+def test_p12_only_exact_part_names_of_this_sheet_are_removed(capsys):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    keep = ["sheet.part1of2.md.bak", "other.part1of2.md", "sheet.part1of2.txt", "sheet.partXof2.md",
+            "sheet.part1of.md", "xsheet.part1of2.md", "sheet.part1of2.md.md"]
+    for name in keep:
+        (tmp / name).write_text("keep me")
+    (tmp / "sheet.part1of2.md").write_text("stale")
+    (tmp / "sheet.part07of12.md").write_text("stale")
+    rc, cap = _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", "10000000"))
+    assert rc == 0
+    for name in keep:
+        assert (tmp / name).read_text() == "keep me", name
+    assert not (tmp / "sheet.part07of12.md").exists()
+    assert (tmp / "sheet.part1of1.md").is_file() and not (tmp / "sheet.part1of2.md").exists()
+    assert "removed 2 stale sheet part file" in cap.err
+
+
+def test_p13_a_directory_with_a_part_name_is_left_alone(capsys):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    (tmp / "sheet.part1of2.md").mkdir()
+    (tmp / "sheet.part1of2.md" / "inner.txt").write_text("keep me")
+    rc, _ = _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", "10000000"))
+    assert rc == 0 and (tmp / "sheet.part1of2.md" / "inner.txt").read_text() == "keep me"
+
+
+def test_p14_a_symlink_with_a_part_name_is_unlinked_not_followed(capsys):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    target = tmp / "precious.txt"
+    target.write_text("KEEP")
+    # a stale link, and a link sitting exactly where the new part will be written
+    (tmp / "sheet.part1of1.md").symlink_to(target)
+    (tmp / "sheet.part3of9.md").symlink_to(tmp / "no-such-target")  # dangling
+    rc, cap = _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", "10000000"))
+    assert rc == 0
+    assert target.read_text() == "KEEP", "writing the new part must not go through the old link"
+    assert not (tmp / "sheet.part1of1.md").is_symlink()
+    assert not os.path.lexists(tmp / "sheet.part3of9.md")
+    assert "removed 2 stale sheet part file" in cap.err
+
+
+def test_p15_multibyte_parts_are_within_the_bound_in_encoded_bytes(capsys):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    mb = "é中文🙂" * 90  # 360 characters, 1080 bytes: bytes and characters differ by 3x
+    for i, r in enumerate(rows):
+        if r["quote_type"] == "hard_data":
+            continue
+        old = r["quote"]
+        r["quote"] = f"{old} {mb}"
+        sims[r["quote"]] = sims.pop(old)
+    db = _make_db(rows)
+    tmp = _tmp()
+    b = 3000
+    rc, _ = _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", str(b)))
+    assert rc == 0
+    parts = _part_files(tmp)
+    assert len(parts) > 3
+    for p in parts:
+        assert len(p.read_bytes()) <= b, p.name
+        assert len(p.read_text(encoding="utf-8")) < len(p.read_bytes()), "the part really is multi-byte"
+    full = (tmp / "sheet.md").read_text(encoding="utf-8")
+    assert "\n".join(_items_section(p.read_text(encoding="utf-8")) for p in parts) == _items_section(full)
+
+
+@pytest.mark.parametrize("sheet_name,decoys,stale", [
+    ("a.b.md", ["aXb.part1of2.md", "a.b.part1of2.mdX", "a.b.part1of2Xmd", "a.b.part1of2.txt"],
+     "a.b.part1of2.md"),
+    ("x+y.md", ["xxy.part1of2.md", "xy.part1of2.md", "x+y.part1of2.mdd"], "x+y.part1of2.md"),
+    ("s(1).md", ["s1.part1of2.md"], "s(1).part1of2.md"),
+])
+def test_p16_regex_metacharacters_in_the_sheet_name_never_delete_a_non_part(
+        capsys, sheet_name, decoys, stale):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    for name in decoys:
+        (tmp / name).write_text("keep me")
+    (tmp / stale).write_text("stale")
+    rc, cap = _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", "10000000"),
+                          sheet_name=sheet_name)
+    assert rc == 0
+    for name in decoys:
+        assert (tmp / name).read_text() == "keep me", name
+    assert not (tmp / stale).exists()
+    assert "removed 1 stale sheet part file" in cap.err
+
+
+def _snapshot(tmp):
+    """name -> (kind, bytes-or-link-target, mode) for every entry, never following links."""
+    snap = {}
+    for p in sorted(tmp.iterdir()):
+        st = p.lstat()
+        if p.is_symlink():
+            snap[p.name] = ("link", os.readlink(p), None)
+        else:
+            snap[p.name] = ("file", p.read_bytes(), st.st_mode & 0o777)
+    return snap
+
+
+@pytest.mark.parametrize("which", ["sheet", "key"])
+@pytest.mark.parametrize("mode", ["export", "export-parts", "swap"])
+def test_p17_a_symlink_at_the_sheet_or_key_path_is_refused_exit_2_and_nothing_changes(capsys, which, mode):
+    tool = _load_tool()
+    rows, sims = _planted_graph()
+    db = _make_db(rows)
+    tmp = _tmp()
+    link = tmp / ("sheet.md" if which == "sheet" else "key.json")
+    if mode == "swap":
+        _export_raw(tool, db, tmp, sims, capsys, extra=("--sheet-part-bytes", str(_PART_BYTES)))
+        real = tmp / "elsewhere.dat"
+        link.rename(real)
+    else:
+        real = tmp / "precious.txt"
+        real.write_text("KEEP")
+        if mode == "export-parts":
+            (tmp / "sheet.part1of8.md").write_text("an old part")
+    real.chmod(0o640)  # the key writer used to chmod the link TARGET to 0600
+    link.symlink_to(real)
+    before = _snapshot(tmp)
+    extra = ("--sheet-part-bytes", str(_PART_BYTES)) if mode != "export" else ()
+    with pytest.raises(SystemExit) as exc:
+        _export_raw(tool, db, tmp, sims, capsys, extra=extra, swap=(1,) if mode == "swap" else ())
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert str(link) in err and "symlink" in err
+    assert _snapshot(tmp) == before, "a refused run writes and deletes nothing, and the target is untouched"
+    assert link.is_symlink()
