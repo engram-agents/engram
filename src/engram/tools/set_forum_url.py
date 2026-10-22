@@ -51,7 +51,16 @@ import re
 import sys
 import tempfile
 from typing import Any, NamedTuple, Optional
+from pathlib import Path
 from urllib.parse import urlsplit
+
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). `tools` is found one directory above
+# this file in BOTH layouts (src/engram/ and the deployed plugin root). Appended, not inserted: an in-process load
+# (a test) must not leave src/engram at sys.path[0] (#4029).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
 
 EXIT_OK = 0
 EXIT_INVALID = 2
@@ -210,8 +219,7 @@ def set_forum_url(config_path, url, *, force: bool = False) -> SetResult:
 
 
 def _default_config() -> str:
-    home = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
-    return os.path.join(home, "config.json")
+    return os.path.join(str(owner_read.engram_home()), "config.json")  # ValueError on a relative ENGRAM_HOME (main refuses)
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -222,7 +230,12 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--force", action="store_true",
                         help="overwrite a different existing forum.url, or a non-object forum")
     args = parser.parse_args(argv)  # a missing URL exits 2 (argparse)
-    result = set_forum_url(args.config or _default_config(), args.url, force=args.force)
+    try:
+        config = args.config or _default_config()
+    except ValueError as exc:  # a relative ENGRAM_HOME: refused, nothing read or written (#3863)
+        print(f"set_forum_url: {exc}", file=sys.stderr)
+        return EXIT_INVALID
+    result = set_forum_url(config, args.url, force=args.force)
     print(result.message, file=sys.stderr if result.status == "refused" else sys.stdout)
     return result.exit_code
 

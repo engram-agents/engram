@@ -46,7 +46,7 @@ from typing import Optional
 # Bootstrap: ensure forum_api is importable from tools/
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from forum_api import ForumClient, ForumHttpError, ForumNetworkError
+from forum_api import ForumClient, ForumHttpError, ForumNetworkError, engram_home
 
 # ---------------------------------------------------------------------------
 # Frontmatter parsing (mirrors baton.py / coordination/markdown.py)
@@ -79,11 +79,9 @@ def _parse_participants(participants_str: str) -> list:
 # Config helpers (same as baton.py)
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-
-
 def _load_config() -> dict:
-    config_path = Path(ENGRAM_HOME) / "config.json"
+    # forum_api.engram_home() is the ONE resolution (#3863): ValueError on a relative ENGRAM_HOME (main refuses).
+    config_path = engram_home() / "config.json"
     if config_path.exists():
         try:
             return json.loads(config_path.read_text())
@@ -232,7 +230,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = _load_config()
+    try:
+        config = _load_config()
+    except ValueError as exc:  # a relative ENGRAM_HOME: refused before anything is read or POSTed (#3863)
+        print(f"baton-migrate: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     # Resolve projects-dir
     if args.projects_dir:

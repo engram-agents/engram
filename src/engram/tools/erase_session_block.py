@@ -39,6 +39,14 @@ import re
 import sys
 from pathlib import Path
 
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). `tools` is found one directory above
+# this file in BOTH layouts (src/engram/ and the deployed plugin root). Appended, not inserted: an in-process load
+# (a test) must not leave src/engram at sys.path[0] (#4029).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
 HEADING = "## From this session"
 ANCHOR_RE = re.compile(r"(?m)^## From this session")
 # Best-effort structural proxy: an ATX level-1/2 heading per CommonMark (up to 3
@@ -183,8 +191,11 @@ def main(argv=None) -> int:
     if args.file:
         path = Path(args.file)
     else:
-        home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-        path = Path(home) / "warm-briefing.md"
+        try:
+            path = owner_read.engram_home() / "warm-briefing.md"
+        except ValueError as exc:  # a RELATIVE ENGRAM_HOME: refused before any read or write
+            print(f"erase_session_block: {exc}", file=sys.stderr)
+            return 2
 
     try:
         with open(path, "r", encoding="utf-8", newline="") as f:

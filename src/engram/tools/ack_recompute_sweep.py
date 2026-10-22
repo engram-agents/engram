@@ -29,7 +29,6 @@ Usage:
 """
 
 import argparse
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -38,11 +37,13 @@ from pathlib import Path
 _ENGRAM_DIR = str(Path(__file__).resolve().parent.parent)
 if _ENGRAM_DIR not in sys.path:
     sys.path.append(_ENGRAM_DIR)
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863); `tools` sits in that same directory
+# in BOTH layouts (src/engram/ and the deployed plugin root).
+from tools import _owner_read as owner_read  # noqa: E402
 
 
 def _default_db() -> Path:
-    home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
-    return Path(home) / "knowledge.db"
+    return owner_read.engram_home() / "knowledge.db"  # ValueError on a relative ENGRAM_HOME (main refuses)
 
 
 def sweep(conn: sqlite3.Connection, apply: bool = False) -> dict:
@@ -103,7 +104,11 @@ def main(argv=None) -> int:
     ap.add_argument("--apply", action="store_true",
                     help="write the changes (default is a dry run)")
     args = ap.parse_args(argv)
-    db = args.db or _default_db()
+    try:
+        db = args.db or _default_db()
+    except ValueError as exc:  # a relative ENGRAM_HOME: refused, nothing opened (#3863)
+        print(f"ack_recompute_sweep: {exc}", file=sys.stderr)
+        return 2
     if not db.exists():
         print(f"no such database: {db}", file=sys.stderr)
         return 2

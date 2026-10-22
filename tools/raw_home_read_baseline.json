@@ -5,19 +5,6 @@
     "tools/"
   ],
   "baseline": {
-    "src/engram/tools/ack_recompute_sweep.py": 1,
-    "src/engram/tools/baton-migrate-to-coord-store.py": 1,
-    "src/engram/tools/baton_gate.py": 1,
-    "src/engram/tools/cites_step3.py": 1,
-    "src/engram/tools/codex-umwelt-wake.py": 1,
-    "src/engram/tools/compact-request.py": 1,
-    "src/engram/tools/dream_pickup.py": 1,
-    "src/engram/tools/erase_session_block.py": 1,
-    "src/engram/tools/inspect_raw.py": 1,
-    "src/engram/tools/set_forum_url.py": 1,
-    "src/engram/tools/supervision_probe.py": 1,
-    "src/engram/tools/surgical.py": 1,
-    "src/engram/tools/write_sleep_marker.py": 1,
     "src/engram/viz/agents.py": 2,
     "src/engram/viz/version_info.py": 1,
     "tools/borges_session_eval.py": 1,
@@ -70,6 +57,10 @@
       "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
     },
     "src/engram/hooks/claude/engram-time-bar-hook.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/tools/baton_gate.py": {
       "class": "resolver",
       "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
     }

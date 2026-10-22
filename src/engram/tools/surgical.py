@@ -48,6 +48,23 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 # shape, and the actual root cause the test file's own sibling fix
 # (removing its now-redundant insert(0)) could not close on its own.
 sys.path.append(str(PROJECT_DIR))
+
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863; `tools` sits in PROJECT_DIR in BOTH
+# layouts). It is resolved BEFORE the engram_* imports below, because engram_core raises on a relative value at its own
+# import (a traceback): run as a script, a relative value is refused here with one stderr line and exit 2. Imported as
+# a library it must not raise here (the importing tests still work): main() refuses it, and until then the constants
+# point below a file (/dev/null), where nothing can be opened or created.
+from tools import _owner_read as owner_read  # noqa: E402
+
+try:
+    DATA_DIR = owner_read.engram_home()
+    _HOME_REFUSAL = None
+except ValueError as _home_exc:
+    _HOME_REFUSAL = str(_home_exc)
+    DATA_DIR = Path("/dev/null/engram-home-refused")
+    if __name__ == "__main__":
+        print(f"surgical: {_HOME_REFUSAL}", file=sys.stderr)
+        sys.exit(2)
 from engram_confidence import (
     CONFIDENCE_MAP, SOURCE_CLASS_CONFIDENCE_DISCOUNT,
     PREDICTIVE_CONFIDENCE_CAP, REASONING_CLASS, REASONING_DISCOUNT,
@@ -58,7 +75,6 @@ from engram_core import (
     _pending_markers_for_node, _recompute_premise_ids,
 )
 
-DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
 DB_PATH = DATA_DIR / "knowledge.db"
 SNAPSHOT_PATH = DATA_DIR / "graph_snapshot.md"
 GIT_EXE = "git"
@@ -1006,6 +1022,9 @@ def edge_remove(phase: str, source_id: str, target_id: str, relation: str,
 # ── CLI interface ────────────────────────────────────────────────────────
 
 def main():
+    if _HOME_REFUSAL is not None:  # a relative ENGRAM_HOME: refuse before any other step (#3863)
+        print(f"surgical: {_HOME_REFUSAL}", file=sys.stderr)
+        sys.exit(2)
     parser = argparse.ArgumentParser(
         description="ENGRAM Surgical Tools — data correction with audit trail",
         formatter_class=argparse.RawDescriptionHelpFormatter,

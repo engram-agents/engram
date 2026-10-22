@@ -693,6 +693,10 @@ class TestS8Installer:
         tool_dir = src / "src" / "engram" / "tools"
         tool_dir.mkdir(parents=True)
         (tool_dir / "set_forum_url.py").write_text(TOOL.read_text())
+        # #3863 step 3b: the tool resolves the home through its sibling tools/_owner_read.py, so a checkout-shaped
+        # tools/ dir carries it (and the package marker) beside the tool.
+        for sibling in ("__init__.py", "_owner_read.py"):
+            (tool_dir / sibling).write_text((TOOL.parent / sibling).read_text())
         _write(tmp_path / "config.json", {"forum": {"url": "http://other:5002"}})
         before = (tmp_path / "config.json").read_bytes()
         script = (

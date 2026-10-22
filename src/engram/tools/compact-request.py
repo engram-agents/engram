@@ -50,6 +50,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). `tools` is found one directory above
+# this file in BOTH layouts (src/engram/ and the deployed plugin root). Appended, not inserted: an in-process load
+# (a test) must not leave src/engram at sys.path[0] (#4029).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
 HOOK_NAME = "engram-session-start-hook.py"
 # One compaction must stay one compaction: a context past this many UTF-8 bytes is refused.
 MAX_CONTEXT_BYTES = 60_000
@@ -249,7 +257,11 @@ def _atomic_write(path: Path, text: str, tmps: list[Path]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    home = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
+    try:
+        home = owner_read.engram_home()  # a RELATIVE ENGRAM_HOME is refused BEFORE the first action (the unlink below)
+    except ValueError as exc:
+        print(f"compact-request: {exc}", file=sys.stderr)
+        return 2
     out_dir = home / "compact"
     request_path = out_dir / "request.json"
     # Any older request goes first, whatever happens next (even a bad invocation).

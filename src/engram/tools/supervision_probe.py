@@ -188,6 +188,14 @@ import sys
 from pathlib import Path
 from typing import NamedTuple, Optional
 
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). `tools` is found one directory above
+# this file in BOTH layouts (src/engram/ and the deployed plugin root). Appended, not inserted: an in-process load
+# (a test) must not leave src/engram at sys.path[0] (#4029).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
 _START_TOLERANCE_SECONDS = 5.0
 _SESSION_CGROUP_MARKER = "agent-session@"
 _DAEMON_LAUNCHD_LABEL = "com.engram.surface-daemon"
@@ -650,7 +658,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument(
         "--engram-home",
-        default=os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram")),
+        default=None,  # resolved after parsing, so building the parser (for --help) never refuses a relative $ENGRAM_HOME
         help="ENGRAM_HOME to resolve config/paths from (default: $ENGRAM_HOME or ~/.engram)",
     )
     parser.add_argument(
@@ -660,7 +668,14 @@ def main(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
-    engram_home = Path(args.engram_home).expanduser()
+    if args.engram_home is None:
+        try:
+            engram_home = owner_read.engram_home()
+        except ValueError as exc:  # a relative ENGRAM_HOME: refused when it is actually used (an explicit flag wins)
+            print(f"supervision_probe: {exc}", file=sys.stderr)
+            return 2
+    else:
+        engram_home = Path(args.engram_home).expanduser()
     seat = seat_name(engram_home)
 
     checks = [

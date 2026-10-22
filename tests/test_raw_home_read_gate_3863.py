@@ -281,11 +281,11 @@ def test_d_the_pinned_resolvers_are_the_four_layers_plus_the_build_engine_plus_t
     four = {layer["path"] for layer in home.RESOLVER_LAYERS}
     assert len(four) == 4
     # #3863 step 2 added the runtime layer (Borges's step-2 rulings on #3863, 2026-10-21)
-    # #3863 step 3a added the four standalone hooks that carry an inline verbatim copy
+    # #3863 step 3a added the four standalone hooks that carry an inline verbatim copy; step 3b added baton_gate.py
     hooks = {"src/engram/hooks/claude/" + h for h in (
         "engram-lesson-tripwire-hook.py", "engram-loop-arm-stop-hook.py",
         "engram-stale-tree-warn-hook.py", "engram-time-bar-hook.py")}
-    assert set(gate.PINNED_RESOLVERS) == four | {"src/build/engine/flows.py", "src/engram/engram_home_resolver.py"} | hooks
+    assert set(gate.PINNED_RESOLVERS) == four | {"src/build/engine/flows.py", "src/engram/engram_home_resolver.py", "src/engram/tools/baton_gate.py"} | hooks
 
 
 @pytest.mark.parametrize("rel", [

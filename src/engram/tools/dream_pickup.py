@@ -32,6 +32,15 @@ import stat
 import sys
 import tempfile
 import time
+from pathlib import Path
+
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). `tools` is found one directory above
+# this file in BOTH layouts (src/engram/ and the deployed plugin root). Appended, not inserted: an in-process load
+# (a test) must not leave src/engram at sys.path[0] (#4029).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
 
 _HEADING_RE = re.compile(r"^##\s+(.*?)\s*$")
 _NUMBERED_RE = re.compile(r"^(\d+)\.\s+(.*)$")
@@ -274,7 +283,10 @@ def main(argv=None) -> int:
         if args.record:
             path = args.record
         else:
-            home = args.home or os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
+            try:
+                home = args.home or str(owner_read.engram_home())  # --home stays raw and explicit; the env goes through the resolver
+            except ValueError as exc:  # a relative ENGRAM_HOME: refused, nothing read or written
+                raise Refusal(str(exc))
             path = _latest(home)
         if not os.path.isfile(path):
             raise Refusal(f"not a record file: {path}")

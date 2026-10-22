@@ -1447,7 +1447,10 @@ def _main(argv):
     rep = validate_report(_read_json(args.report, "report"))
     labels = validate_labels(_read_json(args.labels, "labels")) if args.labels else None
 
-    home = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")).expanduser().resolve()
+    try:
+        home = owner_read.engram_home().resolve()  # a RELATIVE ENGRAM_HOME is refused (alpha #3863)
+    except ValueError as exc:
+        raise Refusal(str(exc))
     cfg = _read_json(home / "config.json", "config")
     agent, lineage = cfg.get("agent_name"), cfg.get("self_lineage")
     _need(agent and lineage, f"config.json at {home} lacks agent_name / self_lineage")

@@ -5,8 +5,8 @@ Ruling: Borges's ruling on #3863, 2026-10-21.
 
 A relative ENGRAM_HOME resolves against the CALLING process's cwd, so a hook, the owner daemon and the
 MCP server would each land in a different home. The ONE resolution that refuses a relative value lives in
-ten pinned files (PINNED_RESOLVERS: the tools, hooks, prompt-hooks and shared-bin layers, the build
-engine's flows.py, the runtime layer's src/engram/engram_home_resolver.py, and four standalone hooks that carry an inline copy), each AST-identical to tools/_owner_read.engram_home() (tests/test_engram_home_parity_3863.py).
+eleven pinned files (PINNED_RESOLVERS: the tools, hooks, prompt-hooks and shared-bin layers, the build
+engine's flows.py, the runtime layer's src/engram/engram_home_resolver.py, four standalone hooks and baton_gate.py that carry an inline copy), each AST-identical to tools/_owner_read.engram_home() (tests/test_engram_home_parity_3863.py).
 Every OTHER module that reads the variable raw (the get, the subscript or getenv forms, see RAW_READ_RE)
 takes the value as given and can silently use a relative one. This gate stops the number of those sites
 growing.
@@ -20,13 +20,16 @@ assigned to (a write), `setdefault`, `pop`, `dict(os.environ, ENGRAM_HOME=...)`,
 A line that abspaths, expands or resolves the raw value is STILL a site: that is the silent version of the
 defect (it turns a relative value into a cwd-dependent absolute one), never an exemption.
 
-EXEMPT. The ten PINNED_RESOLVERS files, as whole files. A pinned file is never in the baseline.
+EXEMPT. The eleven PINNED_RESOLVERS files, as whole files. A pinned file is never in the baseline.
 
 KNOWN BOUNDS (an instrument with edges, not a proof):
   * One physical line: a call split so the literal sits on another line is invisible.
   * A name held in a variable (`os.environ.get(KEY)`) or a loop (`for k in ("ENGRAM_HOME", ...)`) is invisible.
   * A pinned file is exempt whole, so a second raw read inside one of them is not counted. The parity test
-    pins the resolver body, not the rest of the file.
+    pins the resolver body; for the five standalone files (four hooks, baton_gate.py) a per-file cell there
+    (test_s4) also pins the raw-read lines OUTSIDE that body to the ones each file has today. The other
+    pinned files are not covered by that cell (_hooklib.py and _prompthooklib.py read the variable raw outside
+    their body today).
   * A docstring that quotes a raw read verbatim counts like code.
   * Only src/ and tools/ are read; other trees are not measured.
   * Spellings the line pattern does not see (measured by the colleague pass on #4034): an alias read
@@ -76,7 +79,7 @@ from pathlib import Path
 BASELINE_REL = "tools/raw_home_read_baseline.json"
 SCAN_PREFIXES = ("src/", "tools/")
 _SCHEMA = 1
-# The ten files that carry the ONE resolver body (four layers + the build engine's flows.py + the runtime layer + four standalone hooks). They are
+# The eleven files that carry the ONE resolver body (four layers + the build engine's flows.py + the runtime layer + four standalone hooks + baton_gate). They are
 # exempt whole. Adding one is a deliberate act here and in tests/test_engram_home_parity_3863.py.
 PINNED_RESOLVERS = (
     "src/engram/tools/_owner_read.py",
@@ -91,6 +94,9 @@ PINNED_RESOLVERS = (
     "src/engram/hooks/claude/engram-loop-arm-stop-hook.py",
     "src/engram/hooks/claude/engram-stale-tree-warn-hook.py",
     "src/engram/hooks/claude/engram-time-bar-hook.py",
+    # #3863 step 3b: baton_gate.py is loaded by path by the forum server (`cp -L` of only that file), so it cannot
+    # import the sibling and carries a VERBATIM inline copy; pinned by the same parity test (STANDALONE_PINNED).
+    "src/engram/tools/baton_gate.py",
 )
 _Q = r"""["']"""
 # environ.get( / getenv( with the literal as the first argument, or the subscript form unless it is only

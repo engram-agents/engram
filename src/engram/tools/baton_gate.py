@@ -90,6 +90,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+
+def engram_home() -> Path:
+    """The ENGRAM home for this standalone module: $ENGRAM_HOME (default ~/.engram) when set and
+    non-empty, expanded and absolute; a RELATIVE value is refused (ValueError naming it). A copy of
+    tools/_owner_read.engram_home() (the canonical body): the forum server loads ONLY this file by path
+    (`cp -L` into $APP/tools/, server._load_baton_gate()) and tools/baton.py imports it by bare name, so it
+    cannot import `tools._owner_read`. tests/test_engram_home_parity_3863.py pins the copy AST-identical."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
+
+
+# `_resolve_pool_sentinel` below takes a parameter named `engram_home`, which shadows the function above.
+_resolve_engram_home = engram_home
+
 # ---------------------------------------------------------------------------
 # GitHub anchor parsing (moved verbatim from tools/baton.py; #2884)
 # ---------------------------------------------------------------------------
@@ -289,7 +306,15 @@ def _resolve_pool_sentinel(engram_home: Optional[str] = None) -> str:
     if _POOL_SENTINEL_CACHE:
         return _POOL_SENTINEL_CACHE[0]
 
-    home = engram_home or os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+    if engram_home:
+        home = engram_home  # an explicit argument wins, as before (never read from the environment)
+    else:
+        try:
+            home = _resolve_engram_home()
+        except ValueError as exc:
+            # A relative ENGRAM_HOME resolves against the calling process's cwd: refuse it. The forum server's
+            # handlers map PoolSentinelUnresolved to a fail-closed 422; a bare ValueError would be a 500 (#3863).
+            raise PoolSentinelUnresolved(f"cannot determine pool sentinel: {exc}") from exc
     try:
         config_path = Path(home) / "config.json"
         pu = json.loads(config_path.read_text()).get("primary_user")

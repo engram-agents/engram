@@ -267,6 +267,11 @@ STANDALONE_HOOKS = {
 }
 
 
+# #3863 step 3b: tools/baton_gate.py is loaded by path by the forum server (`cp -L` of only that file) and imported by
+# bare name by tools/baton.py, so it cannot import `tools._owner_read` and carries the same verbatim copy.
+STANDALONE_PINNED = {**STANDALONE_HOOKS, "baton-gate": SRC / "tools" / "baton_gate.py"}
+
+
 def _lifted(path: Path):
     fn = _func(path)
     ns = {"os": os, "Path": Path}
@@ -274,15 +279,15 @@ def _lifted(path: Path):
     return ns["engram_home"]
 
 
-@pytest.mark.parametrize("hook", list(STANDALONE_HOOKS))
+@pytest.mark.parametrize("hook", list(STANDALONE_PINNED))
 def test_s1_a_standalone_hook_copy_is_ast_identical_to_the_canonical(hook):
     canon = _dump_without_docstring(_func(LAYERS["tools"]))
-    assert _dump_without_docstring(_func(STANDALONE_HOOKS[hook])) == canon, f"{hook} drifted"
+    assert _dump_without_docstring(_func(STANDALONE_PINNED[hook])) == canon, f"{hook} drifted"
 
 
-@pytest.mark.parametrize("hook", list(STANDALONE_HOOKS))
+@pytest.mark.parametrize("hook", list(STANDALONE_PINNED))
 def test_s2_a_standalone_hook_copy_behaves_like_the_canonical(hook, monkeypatch, tmp_path):
-    fn = _lifted(STANDALONE_HOOKS[hook])
+    fn = _lifted(STANDALONE_PINNED[hook])
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("ENGRAM_HOME", raising=False)
     assert fn() == tmp_path / ".engram"
@@ -302,5 +307,58 @@ def test_s3_the_standalone_hooks_are_pinned_in_the_gate_allowlist():
     spec = importlib.util.spec_from_file_location("_gate_for_step3a", REPO / "tools" / "raw_home_read_gate.py")
     gate = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gate)
-    for path in STANDALONE_HOOKS.values():
+    for path in STANDALONE_PINNED.values():
         assert str(path.relative_to(REPO)) in gate.PINNED_RESOLVERS, path
+
+
+# ---------------------------------------------------------------------------
+# #3863 step 3b (the colleague pass on #4065, measured): the gate exempts a pinned file WHOLE, so a planted raw
+# `os.environ.get("ENGRAM_HOME")` elsewhere in one of the standalone files would pass the gate. One cell per
+# standalone pinned file pins the raw-read lines OUTSIDE its `engram_home` body to exactly the ones it has today,
+# enumerated with the gate's OWN detector (raw_home_read_gate.line_is_raw_read), never hand-picked.
+# ---------------------------------------------------------------------------
+
+_PRESENCE_TEST = 'if os.environ.get("ENGRAM_HOME"):'  # each hook asks "is it set?" before it normalises the value
+EXPECTED_OUTSIDE_RAW_READS = {
+    "tripwire": [_PRESENCE_TEST],
+    "loop-arm-stop": [_PRESENCE_TEST],
+    "stale-tree-warn": [_PRESENCE_TEST],
+    "time-bar": [_PRESENCE_TEST],
+    "baton-gate": [],  # the pinned copy is the only raw read in the file
+}
+
+
+def _gate_module():
+    spec = importlib.util.spec_from_file_location("_gate_for_step3b", REPO / "tools" / "raw_home_read_gate.py")
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    return gate
+
+
+def _raw_reads_outside_engram_home(text: str) -> list:
+    gate = _gate_module()
+    fn = next(n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and n.name == "engram_home")
+    return [line.strip() for n, line in enumerate(text.split("\n"), 1)
+            if gate.line_is_raw_read(line) and not (fn.lineno <= n <= fn.end_lineno)]
+
+
+def test_s4_the_table_covers_every_standalone_pinned_file():
+    assert set(EXPECTED_OUTSIDE_RAW_READS) == set(STANDALONE_PINNED)
+
+
+@pytest.mark.parametrize("hook", list(STANDALONE_PINNED))
+def test_s4_a_standalone_pinned_file_has_no_raw_read_outside_its_resolver_but_the_known_ones(hook):
+    """Mutation (run in the PR report): plant `os.environ.get("ENGRAM_HOME")` in one of these files -> only that
+    file's cell is red."""
+    found = _raw_reads_outside_engram_home(STANDALONE_PINNED[hook].read_text(encoding="utf-8"))
+    assert found == EXPECTED_OUTSIDE_RAW_READS[hook], (hook, found)
+
+
+@pytest.mark.parametrize("hook", list(STANDALONE_PINNED))
+def test_s5_a_planted_raw_read_is_seen_by_the_detector_the_cell_uses(hook):
+    """The cell above must be able to fail: plant one extra raw read in a copy of THIS file's text and the detector
+    reports exactly that one extra line, after the known ones."""
+    text = STANDALONE_PINNED[hook].read_text(encoding="utf-8")
+    planted = '_planted = os.environ.get("ENGRAM_HOME")'
+    found = _raw_reads_outside_engram_home(text + "\n\n" + planted + "\n")
+    assert found == EXPECTED_OUTSIDE_RAW_READS[hook] + [planted], (hook, found)

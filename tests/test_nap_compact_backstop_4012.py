@@ -497,6 +497,10 @@ def test_b9_deployed_flattened_layout_finds_the_tool_by_walk_parents(tmp_path):
     _copy_hooks(root / "hooks")
     (root / "tools").mkdir()
     shutil.copy2(TOOL_PATH, root / "tools" / "compact-request.py")
+    # #3863 step 3b: the tool resolves the home through its sibling tools/_owner_read.py (an essential-tier file every
+    # build ships beside it, with the package marker), so a deployed-shaped tools/ dir carries both.
+    for sibling in ("__init__.py", "_owner_read.py"):
+        shutil.copy2(SRC_ENGRAM / "tools" / sibling, root / "tools" / sibling)
     home = make_home(tmp_path)
     done = stop(home, root, unset_plugin_root=True)
     assert done.returncode == 0, done.stderr
