@@ -187,8 +187,9 @@ mechanism, not luck:
   umwelt's. Crossing into the other's lane is fine and takes **one line saying
   so first** — never a silent concurrent merge into the same tip. *(Amended
   2026-10-22 by *Owner merge* below: for project owners the lanes are suspended
-  and the one-line rule applies to every merge into a shared tip until the dev
-  merge queue is on.)*
+  and the one-line rule applies to every merge into a shared tip; the base-SHA
+  assertion there is the serialization mechanism, the dev merge queue being
+  unavailable to this repository.)*
 - **Whoever starts a multi-PR stack finishes it.** A stacked series lands
   bottom-up under one hand (live example at adoption: the health-score series
   #2187 → #2189 → PR3 → PR4 — PR3/PR4 not yet opened when this was written,
@@ -233,7 +234,8 @@ errors, as long as we can catch them and learn from them."* On the PR that adds 
 section he ruled it merges as the team's consensus text without his read (*"No need to
 bring it to me, just merge as your concensus version."*). So owner merge is **in force
 from 2026-10-22 14:03Z**, on his word, not from the merge of this PR; the dev merge
-queue switches on separately (see *Serialization* below). The stance he asked the team
+queue he ruled on the same evening was later found unavailable to this repository (see
+*Serialization* below). The stance he asked the team
 to carry is the one in the quote: practise, catch the slips, learn from them.
 
 **Who.** The **owner of the project the PR belongs to** (the Project Register in the
@@ -336,24 +338,28 @@ seat can run it and any other seat can check that it ran.
     samples merge records at day-end; a record missing an item is the finding,
     whatever the merge's outcome.
 
-**Serialization — the property two holders kept by hand, now kept by the queue.**
-On engram-alpha the **dev merge queue** (`merge_group` runs of `pr-checks`) replaces
-the "one holder per repo lane" rule: every merge waits its turn and re-runs the
-checks on the queued tree, which closes the jointly-broken case (two owners each
-passing a scratch merge that omits the other's PR; Borges, 2026-09-13). **In the
-interim, and on repos without a queue, the default-lane rule of *Who presses the
-button* is suspended for owners** and replaced by two things. The correctness
-mechanism is the **base-SHA assertion of items 4 and 8**: a press on a base the
-seat's own run never saw is refused by the seat's own check, and the re-run on the
-moved tip is what the queue will later do for everyone. The courtesy is **one line in
-the Square before merging into a tip another owner may be merging into**, so a
-moved-tip re-run is expected rather than a surprise. *Whoever starts a multi-PR stack
-finishes it* (unchanged). The assertion also covers repos that will never get a
-queue (local-model-lab, gpu-broker). The queue switches on after
-the v0.5.4-rc1 cut (done 2026-10-22 13:08Z) and after the `merge_group` workflow PR
-lands; the switch itself is a repo setting Lei or the repo admin flips. **The
-commander records the switch date on the next line when it happens.**
-*Queue status: OFF as of 2026-10-22.*
+**Serialization — the property two holders kept by hand, now kept by the base
+assertion.** The dev merge queue (`merge_group` runs of `pr-checks`) was the planned
+replacement for the "one holder per repo lane" rule: every merge waits its turn and
+re-runs the checks on the queued tree, which closes the jointly-broken case (two owners
+each passing a scratch merge that omits the other's PR; Borges, 2026-09-13). **It is not
+available to this repository** (measured 2026-10-22 16:05Z: the rulesets API refuses a
+`merge_queue` rule on the `dev` ruleset with `422 Invalid rule`; GitHub offers that rule
+only to public organization repositories and to private repositories on Enterprise
+Cloud, and engram-agents is a private organization on the Team plan), and it would
+conflict with this repository's stacked-PR practice even where offered (a merge-queue
+rule disables gh-stack's `/stacks` on the repo, gh-stack discussion #392; sibling
+threads there report a squash queue dropping stacked children). So the **base-SHA assertion of items 4 and 8 is the standing
+serialization mechanism, not an interim one**: a press on a base the seat's own run never
+saw is refused by the seat's own check, and the re-run on the moved tip is what a queue
+would have done. The default-lane rule of *Who presses the button* stays suspended for
+owners; the courtesy of **one line in the Square before merging into a tip another owner
+may be merging into** stays, so a moved-tip re-run is expected rather than a surprise;
+*whoever starts a multi-PR stack finishes it* (unchanged). The `merge_group` support in
+`pr-checks` (#4060) remains on `dev` as dormant wiring, harmless until a plan change makes
+the queue available; that plan change is Lei's call, with the zero-cost default of no
+change.
+*Queue status: NOT AVAILABLE on this repository (Team plan, private), measured 2026-10-22 16:05Z.*
 
 **What the merge seats still do.** Kepler and Borges (Ariadne on umwelt) keep the
 seat for ownerless PRs, release cuts, reconciles, the three groups under *Who* above,
