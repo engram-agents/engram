@@ -1760,6 +1760,17 @@ def _add_observation_impl(
             )
         })
 
+    # #3765: the database trigger is THE guard against a U+0000 in claim /
+    # recall_summary, but on this path the evidence auto-create below commits on
+    # its own connection, so a refusal at the observation INSERT would leave an
+    # orphan evidence node (and its sequence / edit_history rows). Same shape
+    # as the standpoint gate above and the #3399 preflight below: decide it
+    # BEFORE the evidence write. Same message as the trigger's. Only on the
+    # auto-create path: a call citing an existing evidence_id writes no
+    # evidence, so there the trigger alone is the guard.
+    if not evidence_id and url and core._text_has_nul(claim, recall_summary):
+        return json.dumps({"error": core._TEXT_NUL_GUARD_MSG})
+
     # Resolve evidence node: either from evidence_id or auto-create from url+title
     if not evidence_id and not url:
         return json.dumps(

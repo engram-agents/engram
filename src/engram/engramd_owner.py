@@ -1904,13 +1904,14 @@ OWNER_WRITE_LOCK_WAIT = 1.0
 USE_REWARD_MONOTONE_FLOOR = 0.99  # ids at or above this utility are exempt from the monotone read-back invariant
 USE_REWARD_BUSY_RETRY_SLEEP = 0.02  # seconds between attempts while a direct writer holds the store's write lock
 
-# The triggers on `nodes` in the real schema, MEASURED (7), pinned against sqlite_master by a test: a newly
+# The triggers on `nodes` in the real schema, MEASURED (9), pinned against sqlite_master by a test: a newly
 # added trigger fails that cell loudly. None of them fires on UPDATE of utility_score / importance_score /
 # recall_turn (each is AFTER INSERT / AFTER DELETE / BEFORE UPDATE OF metadata / AFTER UPDATE OF status,
 # is_current, claim-and-text columns), so the set whose statements the op admits BY NAME is empty.
 USE_REWARD_NODES_TRIGGERS_PINNED = frozenset({
     "nodes_fts_insert", "nodes_fts_delete", "nodes_retract_remove_from_fts", "nodes_fts_supersede_remove",
     "nodes_fts_rewrite_resync", "nodes_metadata_json_guard_insert", "nodes_metadata_json_guard_update",
+    "nodes_text_nul_guard_insert", "nodes_text_nul_guard_update",  # #3765
 })
 USE_REWARD_ADMITTED_TRIGGERS: frozenset = frozenset()
 
@@ -2078,7 +2079,7 @@ FILL_EMBEDDINGS_MAX_ITEMS = 50  # per call; enforced before any SQL
 FILL_EMBEDDINGS_DIM = 384
 FILL_EMBEDDINGS_VEC_SAVEPOINT = "engram_fill_vec"  # the vec mirror's own SAVEPOINT: a vec failure never poisons the fill
 
-# MEASURED (authorizer-recorded over real runs on the real schema, which carries the seven pinned `nodes` triggers):
+# MEASURED (authorizer-recorded over real runs on the real schema, which carries the nine pinned `nodes` triggers):
 # NO trigger or view fires on `UPDATE nodes SET embedding` (every trigger on `nodes` is on metadata / status /
 # is_current / claim-and-text columns), and none fires during the FTS rebuild or the restore-flag writes (the finish op
 # never writes `nodes`). So the set of triggers whose statements either op admits BY NAME is empty, pinned against

@@ -258,7 +258,7 @@ def _seed_pre_rung(core):
 
 def test_c5_rung_quarantines_invalid_rows_and_touches_nothing_else(core):
     before = _seed_pre_rung(core)
-    assert _reopen_setup(core) == 8
+    assert _reopen_setup(core) == core.LATEST_SCHEMA_VERSION
 
     c = _raw(core)
     for nid in _BAD_META:
@@ -277,14 +277,14 @@ def test_c5_rung_quarantines_invalid_rows_and_touches_nothing_else(core):
 
 def test_c6_rung_twice_is_idempotent(core):
     _seed_pre_rung(core)
-    assert _reopen_setup(core) == 8
-    assert _reopen_setup(core) == 8
+    assert _reopen_setup(core) == core.LATEST_SCHEMA_VERSION
+    assert _reopen_setup(core) == core.LATEST_SCHEMA_VERSION
     # force the rung body to run a SECOND time over the already-quarantined graph
     c = _raw(core)
     c.execute("PRAGMA user_version = 6")
     c.commit()
     c.close()
-    assert _reopen_setup(core) == 8
+    assert _reopen_setup(core) == core.LATEST_SCHEMA_VERSION
     c = _raw(core)
     assert c.execute("SELECT COUNT(*) FROM metadata_quarantine").fetchone()[0] == 3
     assert len(_guard_triggers(c)) == 2
@@ -319,7 +319,7 @@ def test_c7_fault_in_quarantine_step_stays_at_v6_then_next_start_completes(core)
     c.commit()
     c.close()
 
-    assert _reopen_setup(core) == 8  # next start completes it
+    assert _reopen_setup(core) == core.LATEST_SCHEMA_VERSION  # next start completes it
     c = _raw(core)
     assert c.execute("SELECT COUNT(*) FROM metadata_quarantine").fetchone()[0] == 3
     for nid in _BAD_META:
@@ -353,7 +353,7 @@ def test_c8_diagnose_reports_zero_not_omitted_when_table_missing(core):
 
 def test_c8_diagnose_reports_count_and_flare_when_rows_quarantined(core):
     _seed_pre_rung(core)
-    assert _reopen_setup(core) == 8
+    assert _reopen_setup(core) == core.LATEST_SCHEMA_VERSION
     finding = _diagnose(core)["metadata_quarantine"]
     assert finding["count"] == 3
     assert finding["flare"] is True
@@ -484,7 +484,7 @@ def _assert_rolled_back(core):
 
 def _assert_completed(core):
     c = _raw(core)
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert c.execute("PRAGMA user_version").fetchone()[0] == core.LATEST_SCHEMA_VERSION
     assert c.execute("SELECT COUNT(*) FROM metadata_quarantine").fetchone()[0] == 2
     assert len(_guard_triggers(c)) == 2
     assert c.execute(
@@ -504,7 +504,7 @@ def test_c7a_fault_after_the_update_rolls_everything_back(core, monkeypatch):
     assert _reopen_setup(core) == 6
     _assert_rolled_back(core)
     monkeypatch.setattr(core, "_ensure_metadata_json_guard_triggers", real)
-    assert _reopen_setup(core) == 8
+    assert _reopen_setup(core) == core.LATEST_SCHEMA_VERSION
     _assert_completed(core)
 
 
@@ -520,7 +520,7 @@ def test_c7b_fault_after_both_create_triggers_rolls_everything_back(core, monkey
     assert _reopen_setup(core) == 6
     _assert_rolled_back(core)
     monkeypatch.setattr(core, "_ensure_metadata_json_guard_triggers", real)
-    assert _reopen_setup(core) == 8
+    assert _reopen_setup(core) == core.LATEST_SCHEMA_VERSION
     _assert_completed(core)
 
 

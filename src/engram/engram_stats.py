@@ -957,6 +957,29 @@ def _diagnose_impl() -> str:
             "flare": _mq_count > 0 or _mq_live > 0,
         }
 
+        # ── Text NUL guard (#3765) ─────────────────────────────────────────
+        # Nodes whose claim or recall_summary holds a U+0000 RIGHT NOW (rows that
+        # predate migration rung 9, a restore of an old dump, or a dropped guard).
+        # The rung COUNTS and never alters them, so this live count is the only
+        # place they stay visible. Always present, 0 included; non-zero => flare.
+        # ONE pass: the count and the sample come from the same statement. It fetches
+        # every matching id (short strings): zero rows on a clean store, bounded by the
+        # number of corrupt rows otherwise.
+        _nul_all = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT id FROM nodes WHERE {core._TEXT_NUL_ROW_WHERE} ORDER BY id"
+            ).fetchall()
+        ]
+        _nul_live = len(_nul_all)
+        _nul_ids = _nul_all[:10]
+        metrics["text_nul_guard"] = {
+            "entity_kind": "node",
+            "live_count": _nul_live,
+            "sample_ids": _nul_ids,
+            "flare": _nul_live > 0,
+        }
+
         # ── Agent Experience ─────────────────────────────────────────────
         experience: dict = {}
 

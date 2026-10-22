@@ -4047,6 +4047,109 @@ def _ensure_metadata_json_guard_triggers(conn: sqlite3.Connection) -> None:
     )
 
 
+# ── #3765: nodes.claim / nodes.recall_summary must not contain U+0000 ──────
+# A NUL embedded in node text is corrupt input: any consumer that treats the
+# value as a C string stops at it. It is a WRITE-path defect with many writers
+# (16 INSERT sites plus the recall_summary UPDATE), so the guard is ONE pair
+# of BEFORE triggers at the database, copied from the #3425 metadata guard
+# above, not one check per writer. REJECT, never strip: stripping would
+# store text the caller never wrote. The test is byte-level
+# (`instr(CAST(.. AS BLOB), x'00')`) because a TEXT instr can stop at the NUL
+# on some builds.
+# The UPDATE trigger is `UPDATE OF claim, recall_summary` and checks a column
+# only when that column CHANGES (NEW IS NOT OLD). The guard refuses WRITING a
+# NUL; it does not freeze a row that already holds one. So a legacy NUL row can
+# still be retracted / rescored, get its other column written (the batch-summary
+# fairy's recall_summary UPDATE on a row whose CLAIM holds a NUL), and an
+# identical rewrite of a NUL value passes as a no-op: nothing new is written.
+# The repair is to supersede, or to write clean text into the column that holds
+# the NUL. A plain BEFORE UPDATE would make such a row impossible to retract.
+# Created at migration rung TEXT_NUL_GUARD_RUNG and re-ensured on every start at
+# user_version >= that rung (CREATE TRIGGER IF NOT EXISTS). Neither trigger's
+# SQL mentions nodes_fts, so engram_backup's FTS-trigger drop plan leaves them
+# in a dump. Existing NUL rows are COUNTED and reported, never altered.
+# RENUMBERING: a second change may want the same rung; whichever merges second
+# edits THREE places: this constant, the literal `PRAGMA user_version = N` in
+# the rung (the repo's LATEST_SCHEMA_VERSION oracle test parses that literal),
+# and LATEST_SCHEMA_VERSION. A test ties the first two together.
+TEXT_NUL_GUARD_RUNG = 9
+_TEXT_NUL_GUARD_MSG = "nodes.claim and nodes.recall_summary must not contain U+0000 (NUL)"
+_TEXT_NUL_GUARD_TRIGGER_NAMES = (
+    "nodes_text_nul_guard_insert",
+    "nodes_text_nul_guard_update",
+)
+_TEXT_NUL_GUARD_WHEN = (
+    "instr(CAST(NEW.claim AS BLOB), x'00') > 0 "
+    "OR instr(CAST(NEW.recall_summary AS BLOB), x'00') > 0"
+)
+
+# The UPDATE trigger's WHEN: a column is checked only when it changes (see the comment above).
+# The INSERT trigger keeps _TEXT_NUL_GUARD_WHEN; _text_has_nul is the twin of THAT one only.
+_TEXT_NUL_GUARD_UPDATE_WHEN = (
+    "(NEW.claim IS NOT OLD.claim "
+    "AND instr(CAST(NEW.claim AS BLOB), x'00') > 0) "
+    "OR (NEW.recall_summary IS NOT OLD.recall_summary "
+    "AND instr(CAST(NEW.recall_summary AS BLOB), x'00') > 0)"
+)
+
+
+def _text_has_nul(*values) -> bool:
+    """The Python twin of _TEXT_NUL_GUARD_WHEN, for a tool-layer pre-check that must
+    refuse before an earlier commit (the one rule, spelled once per language; a test
+    evaluates the WHEN text itself against this over a corpus). True if any value is
+    a str containing U+0000 or a bytes/bytearray containing a zero byte; None and
+    every other type are False."""
+    for v in values:
+        if isinstance(v, str):
+            if "\x00" in v:
+                return True
+        elif isinstance(v, (bytes, bytearray)):
+            if b"\x00" in v:
+                return True
+    return False
+
+
+def _ensure_text_nul_guard_triggers(conn: sqlite3.Connection) -> None:
+    """Create the two NUL write-guard triggers on nodes (idempotent)."""
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS nodes_text_nul_guard_insert
+        BEFORE INSERT ON nodes
+        WHEN {_TEXT_NUL_GUARD_WHEN}
+        BEGIN
+            SELECT RAISE(ABORT, '{_TEXT_NUL_GUARD_MSG}');
+        END
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS nodes_text_nul_guard_update
+        BEFORE UPDATE OF claim, recall_summary ON nodes
+        WHEN {_TEXT_NUL_GUARD_UPDATE_WHEN}
+        BEGIN
+            SELECT RAISE(ABORT, '{_TEXT_NUL_GUARD_MSG}');
+        END
+        """
+    )
+
+
+# The ROW form of the rule (columns unprefixed), for the rung's count and engram_diagnose. The
+# trigger's NEW.-prefixed _TEXT_NUL_GUARD_WHEN is a different expression and stays its own constant.
+_TEXT_NUL_ROW_WHERE = (
+    "instr(CAST(claim AS BLOB), x'00') > 0 "
+    "OR instr(CAST(recall_summary AS BLOB), x'00') > 0"
+)
+
+
+def _count_text_nul_rows(conn: sqlite3.Connection) -> int:
+    """Number of nodes whose claim or recall_summary holds a NUL right now.
+    A COUNT only (the rung never alters existing text). Keep the COUNT(id) form: the
+    connection proxy in test_2181 matches the star form of this query by substring."""
+    return conn.execute(
+        f"SELECT COUNT(id) FROM nodes WHERE {_TEXT_NUL_ROW_WHERE}"
+    ).fetchone()[0]
+
+
 def _quarantine_invalid_metadata(conn: sqlite3.Connection) -> int:
     """Copy every invalid-JSON nodes.metadata blob to metadata_quarantine,
     then NULL it on the node. Returns the number of rows quarantined. Does
@@ -4278,7 +4381,7 @@ def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
 # pre-migration backup, and engramd_owner's start() gate refuses a store whose
 # user_version is below it (read through this module attribute at call time, never
 # copied). Adding a rung means bumping this single line.
-LATEST_SCHEMA_VERSION = 8
+LATEST_SCHEMA_VERSION = 9
 
 
 def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
@@ -5795,6 +5898,40 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 file=sys.stderr,
             )
 
+    # Migration version 9 (#3765; the number is TEXT_NUL_GUARD_RUNG): nodes.claim /
+    # nodes.recall_summary must not contain U+0000. A COUNT first (never an
+    # alteration: stripping would store text the caller never wrote), then the
+    # CREATE TRIGGERs, then the version bump. NOT one transaction: in Python's
+    # sqlite3 a CREATE TRIGGER and a PRAGMA run in autocommit (the COUNT is a
+    # SELECT and opens none), so a failure does not roll the triggers back.
+    # What makes it safe: the triggers are CREATE ... IF NOT EXISTS and the rung
+    # retries while user_version is still the previous one, so a crash between
+    # the trigger creation and the PRAGMA re-runs harmlessly on the next start.
+    # The count is reported, not fixed: one stderr line when non-zero, and
+    # engram_diagnose reports the live count.
+    if _rung_ready(conn, TEXT_NUL_GUARD_RUNG, _pre_migration_backup_ok):
+        try:
+            _nul_count = _count_text_nul_rows(conn)
+            _ensure_text_nul_guard_triggers(conn)
+            conn.execute("PRAGMA user_version = 9")
+            conn.commit()
+            if _nul_count:
+                print(
+                    f"[_run_db_one_time_setup] migration {TEXT_NUL_GUARD_RUNG} (#3765): "
+                    f"{_nul_count} node(s) already hold a U+0000 in claim or "
+                    "recall_summary; left unchanged (the write guard now "
+                    "refuses new ones). engram_diagnose reports the live count.",
+                    file=sys.stderr,
+                )
+        except sqlite3.DatabaseError as _migration9_err:
+            conn.rollback()
+            print(
+                f"[_run_db_one_time_setup] migration {TEXT_NUL_GUARD_RUNG} (#3765 NUL write guard) "
+                "FAILED, will retry on next "
+                f"startup: {_migration9_err!r}",
+                file=sys.stderr,
+            )
+
     # #2732 (A): a rung that landed leaves its new index (or any DDL) with no
     # planner statistics, and the next plain `PRAGMA optimize` -- which every
     # checkpoint runs -- then re-analyzes that WHOLE table under SQLite's
@@ -5845,6 +5982,21 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
             print(
                 "[_run_db_one_time_setup] created_at index self-heal "
                 f"FAILED: {_cai_err!r}",
+                file=sys.stderr,
+            )
+
+    # Self-heal (#3765): at user_version >= the NUL-guard rung the two triggers
+    # must exist. Re-created every startup (IF NOT EXISTS) so a hand edit or a
+    # restore heals. Gated on the LIVE version, so it never papers over a failed
+    # rung (the rung itself owns that retry).
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= TEXT_NUL_GUARD_RUNG:
+        try:
+            _ensure_text_nul_guard_triggers(conn)
+            conn.commit()
+        except sqlite3.DatabaseError as _nul_err:
+            print(
+                "[_run_db_one_time_setup] NUL guard self-heal (#3765) "
+                f"FAILED: {_nul_err!r}",
                 file=sys.stderr,
             )
 

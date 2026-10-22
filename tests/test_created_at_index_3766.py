@@ -190,7 +190,7 @@ def test_c1_checkpoint_statements_plan_the_created_at_index(core, monkeypatch, s
 
 def test_c2_fresh_and_migrated_stores_carry_the_same_indexes(core):
     c = _raw(core)
-    assert _version(c) == 8
+    assert _version(c) == core.LATEST_SCHEMA_VERSION
     c.close()
     fresh = _index_rows(core)
     assert any(name == IDX for name, _ in fresh)
@@ -200,7 +200,7 @@ def test_c2_fresh_and_migrated_stores_carry_the_same_indexes(core):
 
     _rewind_to_v7(core)
     assert IDX not in [n for n, _ in _index_rows(core)]
-    assert _setup(core) == 8
+    assert _setup(core) == core.LATEST_SCHEMA_VERSION
     migrated = _index_rows(core)
     assert migrated == fresh  # same names AND same SQL
 
@@ -210,12 +210,12 @@ def test_c2_fresh_and_migrated_stores_carry_the_same_indexes(core):
 
 def test_c3_setup_twice_on_a_v8_store_changes_nothing_and_is_silent(core, capsys):
     c = _raw(core)
-    assert _version(c) == 8
+    assert _version(c) == core.LATEST_SCHEMA_VERSION
     c.close()
     before = _index_rows(core)
     capsys.readouterr()
-    assert _setup(core) == 8
-    assert _setup(core) == 8
+    assert _setup(core) == core.LATEST_SCHEMA_VERSION
+    assert _setup(core) == core.LATEST_SCHEMA_VERSION
     err = capsys.readouterr().err
     assert "migration 8" not in err
     assert _index_rows(core) == before
@@ -228,7 +228,7 @@ def test_c3_v7_store_that_already_has_the_index_migrates_to_8_with_one_index(cor
     assert _version(c) == 7
     assert c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?", (IDX,)).fetchone()[0] == 1
     c.close()
-    assert _setup(core) == 8
+    assert _setup(core) == core.LATEST_SCHEMA_VERSION
     c = _raw(core)
     assert c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?", (IDX,)).fetchone()[0] == 1
     c.close()
@@ -250,7 +250,7 @@ def test_c4_failing_create_index_stays_at_v7_does_not_crash_and_retries(core, ca
     conn.close()
     assert IDX not in [n for n, _ in _index_rows(core)]
     # next startup, fault removed
-    assert _setup(core) == 8
+    assert _setup(core) == core.LATEST_SCHEMA_VERSION
     assert IDX in [n for n, _ in _index_rows(core)]
 
 
@@ -324,7 +324,7 @@ def test_c6_a_populated_v7_store_gets_a_pre_migration_backup_before_rung_8(core)
     _insert_rows(c, [("n0", "observation", "a row worth protecting", ts(0))])
     c.close()
     _rewind_to_v7(core)
-    assert _setup(core) == 8
+    assert _setup(core) == core.LATEST_SCHEMA_VERSION
     backups = sorted((Path(core.DATA_DIR) / "db-backup").glob("pre-migration-v7-*.db"))
     assert len(backups) == 1, [p.name for p in backups]
     b = sqlite3.connect(str(backups[0]))
@@ -340,13 +340,13 @@ def test_c6_a_populated_v7_store_gets_a_pre_migration_backup_before_rung_8(core)
 def test_c7_self_heal_recreates_a_lost_index_on_a_v8_store(core, capsys):
     fresh = _index_rows(core)
     c = _raw(core)
-    assert _version(c) == 8
+    assert _version(c) == core.LATEST_SCHEMA_VERSION
     c.execute(f"DROP INDEX IF EXISTS {IDX}")
     c.commit()
     c.close()
     assert IDX not in [n for n, _ in _index_rows(core)]
     capsys.readouterr()
-    assert _setup(core) == 8
+    assert _setup(core) == core.LATEST_SCHEMA_VERSION
     err = capsys.readouterr().err
     assert _index_rows(core) == fresh  # same names and same SQL as a fresh store
     assert err == "", err
@@ -371,7 +371,7 @@ def test_c7_self_heal_does_not_paper_over_a_failed_rung_8(core, capsys):
 def test_c7_self_heal_failure_is_loud_not_fatal_and_retries(core, capsys):
     fresh = _index_rows(core)
     c = _raw(core)
-    assert _version(c) == 8
+    assert _version(c) == core.LATEST_SCHEMA_VERSION
     c.execute(f"DROP INDEX IF EXISTS {IDX}")
     c.commit()
     c.close()
@@ -384,9 +384,9 @@ def test_c7_self_heal_failure_is_loud_not_fatal_and_retries(core, capsys):
     conn.set_authorizer(None)
     conn.close()
     assert err.count("created_at index self-heal FAILED") == 1, err  # (2) loud, exactly once
-    assert version == 8  # (3) the version is untouched
+    assert version == core.LATEST_SCHEMA_VERSION  # (3) the version is untouched
     assert IDX not in [n for n, _ in _index_rows(core)]  # (4) still absent
     # fault removed: the next start restores it, silently
-    assert _setup(core) == 8
+    assert _setup(core) == core.LATEST_SCHEMA_VERSION
     assert _index_rows(core) == fresh
     assert capsys.readouterr().err == ""
