@@ -49,3 +49,25 @@ docs/DEVELOPMENT.md
 
 # v0.5.0 cut (2026-09-02): internal fleet runbook naming a superseded rc tag; no public reader (Ariadne, roster scan)
 docs/rc-upgrade-runbook.md
+
+# --- Team-process and dev-convention docs (merge policy, review conventions, CI
+#     cost, lane rubric, internal design briefs). Their audience is contributors
+#     on the private repo, not users of the release. Chosen 2026-10-22 for Seed 3
+#     (public docs root cleanup) after checking that no file the snapshot keeps
+#     links to them. Two kinds of mention remain, and neither is a link: path
+#     mentions in old docs/CHANGELOG.md entries (same precedent as
+#     docs/RELEASING.md above), and `to_doc` values in the dev-only CLAUDE.md-prune
+#     mapping read by tools/claude_md_moves_check.py (which cannot run in the
+#     snapshot anyway, since CLAUDE.md is excluded). The two directory entries
+#     are root-anchored because each contains a slash that is not trailing. ---
+docs/PR-MERGE-POLICY.md
+docs/PR-REVIEW-CONVENTION.md
+docs/PR-ISSUE-CLOSURE.md
+docs/GH-STACK.md
+docs/CONTRACT-FIRST-TESTS.md
+docs/CI-COST-MODEL.md
+docs/LANE-PRIORITIZATION.md
+docs/conclusion-warrant-falsifier-log.md
+docs/2652-as-built-brief.md
+docs/spec/
+docs/983-review/
