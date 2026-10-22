@@ -47,10 +47,15 @@ Ties → the smaller issue first (less context to hold, faster feedback).
    score.** A node type, edge type or verb change can still be *built* at its
    scored position; who may merge it, and when, is that doc's rule, not this
    one's.
-3. **Security content → the Aleph/Mira lane regardless of score.** Auth,
-   credentials, enrollment, capability-channel security route around the
-   commander's seat entirely (Kepler's standing recusal). The commander may
-   rank the lane's *position*, never its *content*.
+3. **Security content → the security seat's lane regardless of score.** Auth,
+   credentials, enrollment, capability-channel security route to the security
+   seat (Zephyr since Lei's 2026-10-06 ruling, Mira reading additively; Aleph
+   for security design) and around the commander's seat whenever that seat is
+   not on one of Lei's cyber-security-cleared accounts (the recusal is Lei's
+   2026-08-10 rule, lifted per account on 2026-09-18 and 2026-10-16, standing
+   on Lin's account). The commander may rank the lane's *position* in every
+   case, and its *content* only on a cleared account. Roles here are named by
+   seat, not by person; the holder is dated where it matters.
 4. **A seat's active epic is not pre-empted by a higher-scoring leaf** unless
    the leaf's B is 2. Context switches cost more than the score difference
    shows. (Lei, 2026-09-26: Luria stays on the engram-manager epic.)

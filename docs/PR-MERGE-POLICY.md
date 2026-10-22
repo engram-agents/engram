@@ -139,7 +139,7 @@ merge** (operational reading of the grant; the two steps are not Lei's words):
    plumbing (names, file layout, error text) is not.
 
 **Scope limits.** This does not touch the live deploy (still Lei's — see "When
-Lei is away"), the security clause (Mira's approval is still the gate there),
+Lei is away"), the security clause (the security seat's approval is still the gate there),
 or any other repo. It adds nothing to the ⛔ list and removes nothing from it;
 it changes who merges an item on that list once Lei has read its design.
 
@@ -208,7 +208,11 @@ mechanism, not luck:
   security-PR merge click goes to Lei under this ruling — a narrow exception
   scoped to PRs Mira has reviewed; it does not relax the ⛔ list below for a
   security PR that also carries substrate-concept changes outside Mira's
-  review scope.
+  review scope. **Seat note (Lei, 2026-10-06, relayed by Mira):** the
+  security-review seat moved from Mira to Zephyr "for now", with Mira reading
+  additively; read "Mira" in this bullet's heading, its two 2026-09-09 rulings and
+  the review-scope lines above as "the security seat", which today means Zephyr's exact-head approval, with Mira's read
+  additive and never a substitute for it.
 
 So "flip to Lei for substrate" is an **engram-alpha** rule. Do not extend it to a delegated-authority repo; do not relax it inside engram-alpha beyond what the 2026-09-27 delegation above grants. When you're unsure which repo's rule applies, the repo you're merging *into* decides.
 
@@ -255,7 +259,9 @@ umwelt and soma, per *Scope* and *Who presses the button* above):
 merges a ⛔-list (substrate-concept) PR: it goes to Lei first, or, when it implements a
 design he already read, through the 2026-09-27 delegation's two steps (the PR links the
 read design; the merging seat writes the conformance check), and those two steps stay
-with the merge seats. A security PR carries Mira's exact-head approval as its gate and
+with the merge seats. A security PR carries the security seat's exact-head approval as
+its gate (Zephyr since Lei's 2026-10-06 ruling, Mira additive; see the seat note under
+*Who presses the button*) and
 is merged by the merge seats under the two directions in *Who presses the button*; an
 owner does not click it. The owner merges exactly what the merge seats could already
 merge on a fix or non-substrate PR, by exactly the same gate.
@@ -399,8 +405,8 @@ Merge once colleague-converged + CI-green, **no per-PR Lei permission needed**:
     the "Gray areas" line on a fix that changes a substrate behavior says; "in full"
     describes the baton system, not whatever else a PR carries. **A change that makes
     the forum or the baton authenticate its callers is a security PR** under "Security
-    PRs" above: Mira's approval is its merge gate, and it goes to Lei only if it also
-    changes a ⛔-listed concept outside her review scope.
+    PRs" above: the security seat's approval is its merge gate, and it goes to Lei only if it also
+    changes a ⛔-listed concept outside its review scope.
 - **docs, brand, i18n**
 - **refactors** that don't change a substrate concept
 - **substrate PRs that implement a design Lei already read** — only after the merge seat has linked his read and written the conformance check ("Delegated by Lei, 2026-09-27" above)
