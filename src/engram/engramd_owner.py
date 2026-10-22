@@ -662,6 +662,15 @@ class OwnerAlreadyRunning(RuntimeError):
     `_bind_socket_or_raise()` below."""
 
 
+class OwnerRestartRefused(RuntimeError):
+    """Raised by EngramdOwner.start() on an object whose start() has already run (#4068): one object, one
+    lifetime, whether that start finished, was stopped, or raised partway. A CALLER error (a programming
+    mistake), deliberately NOT in `_REFUSAL_EXIT`: it is not an operator-facing environment condition,
+    main() never restarts an owner, and an exit code for it would hand an operator a condition they
+    cannot fix. Raised before anything is touched (no lock, connection, socket or pidfile). To start
+    again, build a new EngramdOwner."""
+
+
 class OwnerPermissionUnsupported(RuntimeError):
     """Raised by EngramdOwner.start() when this seat's platform/tooling
     cannot support the socket permission layer (#3194, design doc §2.2's
@@ -2529,6 +2538,8 @@ class EngramdOwner:
         self._client_read_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._bound_socket = False
+        # #4068: set as the first thing start() does and never reset: one object, one lifetime.
+        self._start_called = False
         # #3882: the fd of the store-maintenance flock, held from start() to the end of _cleanup().
         self._maint_lock_fd: int | None = None
         self._accept_thread: threading.Thread | None = None
@@ -2594,6 +2605,14 @@ class EngramdOwner:
         removes a socket this owner bound and a pidfile that does not name another process) and only then
         releases the lock: the lock is never released while an owner connection is open. A failure before any
         connection exists just releases, as before."""
+        # #4068: one object, one lifetime. FIRST, before any other work, and never reset, so a start() that
+        # raised partway still counts and a second call is refused having touched nothing.
+        if self._start_called:
+            raise OwnerRestartRefused(
+                "start() was already called on this EngramdOwner object (it finished, was stopped, or "
+                "failed); an owner object has one lifetime. Build a new EngramdOwner to start again"
+            )
+        self._start_called = True
         try:
             self._start_inner(install_signal_handlers=install_signal_handlers)
         except BaseException:

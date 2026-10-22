@@ -63,7 +63,8 @@ PREFLIGHT_RAISES = [
     "OwnerStorePathNotRegular",
 ]
 # Owner* RuntimeErrors that are NOT start() refusals main() maps: they propagate today.
-UNMAPPED = {"OwnerStalePathUnsafe", "OwnerPeerCredentialsMalformed", "OwnerPythonTooOld"}
+# OwnerRestartRefused (#4068) is a caller error (a second start() on one object), deliberately unmapped.
+UNMAPPED = {"OwnerStalePathUnsafe", "OwnerPeerCredentialsMalformed", "OwnerPythonTooOld", "OwnerRestartRefused"}
 
 
 @pytest.fixture

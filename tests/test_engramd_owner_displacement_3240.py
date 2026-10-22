@@ -259,34 +259,83 @@ def test_D7_unrequested_displacement_caught_at_shutdown(owner, home):
 # -- D8 ----------------------------------------------------------------------
 
 
-def test_D8_restart_resets_displaced_flag(owner, home):
+def test_D8a_a_displaced_stopped_object_refuses_a_second_start_and_touches_nothing(owner, home, monkeypatch):
+    """One owner object, one lifetime (#4068): a displaced, stopped owner is never restarted. The refusal
+    comes before anything is touched: the parked connections are the SAME objects and still open, the
+    maintenance lock is neither re-taken nor released, and no socket or pidfile appears."""
+    import engram_core as core
+
+    oc, cc = owner._owner_conn, owner._client_read_conn
     _displace(home, "-shm")
     result = _snap(owner, home / "d8.db")
     assert isinstance(result, ec.Rejected) and result.reason == "substrate_displaced"
     owner.stop()
     assert owner._displaced is True
+    keep = eo._DISPLACED_CONNECTIONS_KEEPALIVE
+    assert any(c is oc for c in keep) and any(c is cc for c in keep)
+    fd_before = owner._maint_lock_fd
+    run_dir = owner.socket_path.parent
+    run_before = sorted(p.name for p in run_dir.iterdir())
+    acquires = []
+    real_acquire = core.acquire_store_maint_lock
 
-    # A fresh healthy store at a NEW path: this test process still holds the
-    # parked (unlinked) old fds, and the fd scan keys on path, so reusing the
-    # old path would make the new store look displaced -- an artifact of
-    # in-process testing that a real exit (os._exit) never has.
-    fresh = home / "fresh.db"
-    conn = sqlite3.connect(str(fresh))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)")
-    conn.execute("INSERT INTO widgets (name) VALUES ('a')")
-    conn.commit()
-    conn.close()
-    stamp_current_schema(fresh)  # #3753
-    owner.store_path = fresh
-    owner.start(install_signal_handlers=False)
-    assert owner._displaced is False
-    oc, cc = owner._owner_conn, owner._client_read_conn
-    assert isinstance(_snap(owner, home / "d8b.db"), ec.Ok)
+    def spy(*a, **kw):
+        acquires.append(a)
+        return real_acquire(*a, **kw)
+
+    try:
+        # A scoped context, not monkeypatch.undo(): undo() would also revert the conftest autouse patches.
+        with monkeypatch.context() as mp:
+            mp.setattr(core, "acquire_store_maint_lock", spy)
+            with pytest.raises(eo.OwnerRestartRefused):
+                owner.start(install_signal_handlers=False)
+            assert acquires == [], f"the refused start took the lock again: {acquires}"
+            # The lock is exactly as the displaced stop left it: still held, by the same fd (a displaced
+            # owner's lock lives as long as its parked connections), and not touched by the refusal.
+            assert owner._maint_lock_fd == fd_before
+        assert "_2126_no_real_global_gitconfig" in os.environ.get("GIT_CONFIG_GLOBAL", ""), \
+            "an early monkeypatch.undo() reverted the conftest autouse patches"
+        with pytest.raises(core.StoreMaintLockHeld):
+            core.acquire_store_maint_lock(str(owner.store_path), "x")
+        # The parked connections are the same objects and still open.
+        assert any(c is oc for c in keep) and any(c is cc for c in keep)
+        for conn in (oc, cc):
+            conn.execute("select 1")  # not closed
+        assert owner._owner_conn is None and owner._client_read_conn is None
+        assert not os.path.lexists(owner.socket_path), "a socket was bound"
+        assert not os.path.lexists(owner.pid_path), "a pidfile was written"
+        assert sorted(p.name for p in run_dir.iterdir()) == run_before
+    finally:
+        owner._release_maint_lock()  # the displaced stop left it held; free it for the next test
+
+
+def test_D8b_a_fresh_owner_after_a_displaced_one_starts_clean(owner, home):
+    """What D8 protected: displacement state does not leak into the NEXT owner. A new EngramdOwner on a
+    fresh store (a new path: this process still holds the old, unlinked fds, and the fd scan keys on
+    path, an artifact of in-process testing that a real exit never has) starts with _displaced False,
+    serves a working snapshot, and closes both connections on stop()."""
+    _displace(home, "-shm")
+    result = _snap(owner, home / "d8.db")
+    assert isinstance(result, ec.Rejected) and result.reason == "substrate_displaced"
     owner.stop()
-    for conn in (oc, cc):
-        with pytest.raises(sqlite3.ProgrammingError):
-            conn.execute("select 1")
+    assert owner._displaced is True
+    try:
+        fresh_home = home / "fresh"
+        fresh_home.mkdir()
+        _seed_wal_store(fresh_home)
+        fresh = eo.EngramdOwner(fresh_home, request_deadline=0.6)
+        fresh.start(install_signal_handlers=False)
+        try:
+            assert fresh._displaced is False
+            oc, cc = fresh._owner_conn, fresh._client_read_conn
+            assert isinstance(_snap(fresh, fresh_home / "d8b.db"), ec.Ok)
+        finally:
+            fresh.stop()
+        for conn in (oc, cc):
+            with pytest.raises(sqlite3.ProgrammingError):
+                conn.execute("select 1")
+    finally:
+        owner._release_maint_lock()  # the displaced stop left it held
 
 
 # -- D9 ----------------------------------------------------------------------

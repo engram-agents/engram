@@ -1063,30 +1063,37 @@ def test_a_cleanup_failing_with_a_non_oserror_in_the_failed_start_handler_still_
     stays held, and one warning names the cleanup failure."""
     db = str(inproc_home / "knowledge.db")
     owner = eo.EngramdOwner(inproc_home)
-    _fail_bind(monkeypatch, OSError(errno.EACCES, "planted bind failure"))
 
     def failing_cleanup():
         raise RuntimeError("planted cleanup failure")
 
-    monkeypatch.setattr(owner, "_cleanup", failing_cleanup)
-    seen = _capture_conns(monkeypatch)
     try:
-        with caplog.at_level("WARNING", logger="engramd_owner"):
-            with pytest.raises(OSError) as ei:
-                owner.start(install_signal_handlers=False)
-        # OSError(EACCES, ...) is built as its PermissionError subclass; it must not be the RuntimeError.
-        assert type(ei.value) is PermissionError and "planted bind failure" in str(ei.value), (
-            f"the start error was replaced by: {ei.value!r}")
-        assert "planted cleanup failure" not in str(ei.value)
-        assert seen["owner"] is not None and seen["client"] is not None, "the failure came before the connections opened"
-        with pytest.raises(core.StoreMaintLockHeld):
-            core.acquire_store_maint_lock(db, "x")
-        warned = [r for r in caplog.records if r.name == "engramd_owner" and "planted cleanup failure" in r.getMessage()]
-        assert len(warned) == 1 and warned[0].levelno == logging.WARNING, [r.getMessage() for r in caplog.records]
+        # A scoped context, not monkeypatch.undo(): undo() would also revert the conftest autouse patches
+        # that share this monkeypatch instance.
+        with monkeypatch.context() as mp:
+            _fail_bind(mp, OSError(errno.EACCES, "planted bind failure"))
+            mp.setattr(owner, "_cleanup", failing_cleanup)
+            seen = _capture_conns(mp)
+            with caplog.at_level("WARNING", logger="engramd_owner"):
+                with pytest.raises(OSError) as ei:
+                    owner.start(install_signal_handlers=False)
+            # OSError(EACCES, ...) is built as its PermissionError subclass; it must not be the RuntimeError.
+            assert type(ei.value) is PermissionError and "planted bind failure" in str(ei.value), (
+                f"the start error was replaced by: {ei.value!r}")
+            assert "planted cleanup failure" not in str(ei.value)
+            assert seen["owner"] is not None and seen["client"] is not None, "the failure came before the connections opened"
+            with pytest.raises(core.StoreMaintLockHeld):
+                core.acquire_store_maint_lock(db, "x")
+            warned = [r for r in caplog.records if r.name == "engramd_owner" and "planted cleanup failure" in r.getMessage()]
+            assert len(warned) == 1 and warned[0].levelno == logging.WARNING, [r.getMessage() for r in caplog.records]
     finally:
-        monkeypatch.undo()  # puts the real _cleanup back
+        # The context has exited: the real _cleanup is back, and the autouse patches are still in force.
         owner._cleanup()  # the real close path: frees the lock for the next test
         owner._release_maint_lock()
+    # The scoped restore above must not have reverted the autouse patches that share this monkeypatch
+    # (tests/conftest.py's _no_real_git_config_leak): its env var is still in force.
+    assert "_2126_no_real_global_gitconfig" in os.environ.get("GIT_CONFIG_GLOBAL", ""), \
+        "an early monkeypatch.undo() reverted the conftest autouse patches"
 
 
 def _plant_holder(tmp_path, content: bytes):
@@ -1544,3 +1551,155 @@ def test_r3_a_retryable_errno_gets_neither_remedy(inproc_home, monkeypatch):
     _inject_errno(monkeypatch, "mkdir", "ENOSPC")
     text = _tool_refusal(inproc_home)
     assert "transient" in text and "copy the store" not in text and "Fix or remove" not in text, text
+
+
+# ---------------------------------------------------------------------------
+# #4068 points 1-2: one EngramdOwner object, one lifetime. A second start() on an object whose start() has
+# already run (finished, stopped, or raised partway) is refused with OwnerRestartRefused BEFORE anything is
+# touched. A fresh object is the way to start again.
+# ---------------------------------------------------------------------------
+
+
+def _tree_snapshot(root: Path) -> dict:
+    """Names, modes and bytes of everything under `root` (bytes only for regular files; a socket has none)."""
+    snap = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in sorted(dirnames + filenames):
+            p = Path(dirpath) / name
+            st = p.lstat()
+            data = p.read_bytes() if stat.S_ISREG(st.st_mode) else None
+            snap[str(p.relative_to(root))] = (stat.S_IMODE(st.st_mode), stat.S_IFMT(st.st_mode), data)
+    return snap
+
+
+def _count_acquires(monkeypatch) -> list:
+    calls = []
+    real = core.acquire_store_maint_lock
+
+    def spy(*a, **kw):
+        calls.append(a)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(core, "acquire_store_maint_lock", spy)
+    return calls
+
+
+def _assert_refused_and_touched_nothing(owner, home, monkeypatch):
+    db = str(home / "knowledge.db")
+    before = _tree_snapshot(home)
+    # A scoped context, not monkeypatch.undo(): undo() would also revert the conftest autouse patches.
+    with monkeypatch.context() as mp:
+        acquires = _count_acquires(mp)
+        with pytest.raises(eo.OwnerRestartRefused):
+            owner.start(install_signal_handlers=False)
+        assert acquires == [], f"the refused start took the lock: {acquires}"
+        assert _tree_snapshot(home) == before, "the refused start changed the home directory"
+        assert owner._maint_lock_fd is None and owner._owner_conn is None and owner._client_read_conn is None
+        assert not os.path.lexists(owner.socket_path) and not os.path.lexists(owner.pid_path)
+    # The scoped restore above must not have reverted the autouse patches that share this monkeypatch
+    # (tests/conftest.py's _no_real_git_config_leak): its env var is still in force.
+    assert "_2126_no_real_global_gitconfig" in os.environ.get("GIT_CONFIG_GLOBAL", ""), \
+        "an early monkeypatch.undo() reverted the conftest autouse patches"
+    fd = core.acquire_store_maint_lock(db, "x")  # the lock is free, and stays free
+    core.release_store_maint_lock(fd)
+
+
+@requires_linux_owner
+def test_a_second_start_after_a_successful_start_and_stop_is_refused_and_touches_nothing(inproc_home, monkeypatch):
+    owner = eo.EngramdOwner(inproc_home)
+    owner.start(install_signal_handlers=False)
+    owner.stop()
+    _assert_refused_and_touched_nothing(owner, inproc_home, monkeypatch)
+
+
+@requires_linux_owner
+def test_a_second_start_after_a_failed_start_is_refused_and_holds_nothing(inproc_home, monkeypatch):
+    owner = eo.EngramdOwner(inproc_home)
+    _fail_bind(monkeypatch, OSError(errno.EACCES, "planted bind failure"))
+    with pytest.raises(OSError):
+        owner.start(install_signal_handlers=False)
+    _assert_refused_and_touched_nothing(owner, inproc_home, monkeypatch)
+
+
+@requires_linux_owner
+def test_a_start_that_raised_before_taking_anything_still_counts_as_started(inproc_home, monkeypatch):
+    """The flag is the FIRST thing start() does: a start that failed on the very first refusal check
+    (before any lock, file, connection or socket) is still refused on retry, not given a second life."""
+
+    def refuse(self):
+        raise eo.OwnerHomeTccProtected("planted refusal on the first check")
+
+    monkeypatch.setattr(eo.EngramdOwner, "check_start_refusals", refuse)
+    owner = eo.EngramdOwner(inproc_home)
+    with pytest.raises(eo.OwnerHomeTccProtected):
+        owner.start(install_signal_handlers=False)
+    _assert_refused_and_touched_nothing(owner, inproc_home, monkeypatch)
+
+
+@requires_linux_owner
+def test_a_second_start_on_a_running_owner_is_refused_and_leaves_the_running_owner_untouched(inproc_home, monkeypatch):
+    """The restart guard must sit BEFORE start()'s failure handler: raised inside it, the refusal would run
+    `_cleanup()` and close the LIVE connections of an owner that is still serving."""
+    import engramd_client as ec
+
+    db = str(inproc_home / "knowledge.db")
+    owner = eo.EngramdOwner(inproc_home)
+    owner.start(install_signal_handlers=False)
+    try:
+        oc, cc, fd = owner._owner_conn, owner._client_read_conn, owner._maint_lock_fd
+        assert oc is not None and cc is not None and fd is not None
+        # A scoped context, not monkeypatch.undo(): undo() would also revert the conftest autouse patches.
+        with monkeypatch.context() as mp:
+            acquires = _count_acquires(mp)
+            with pytest.raises(eo.OwnerRestartRefused):
+                owner.start(install_signal_handlers=False)
+            assert acquires == [], f"the refused start took the lock: {acquires}"
+        assert "_2126_no_real_global_gitconfig" in os.environ.get("GIT_CONFIG_GLOBAL", ""), \
+            "an early monkeypatch.undo() reverted the conftest autouse patches"
+        assert owner._owner_conn is oc and owner._client_read_conn is cc, "a connection object was replaced"
+        for conn in (oc, cc):
+            conn.execute("select 1")  # still open and usable
+        assert owner._maint_lock_fd == fd
+        with pytest.raises(core.StoreMaintLockHeld):
+            core.acquire_store_maint_lock(db, "x")
+        assert os.path.lexists(owner.socket_path) and os.path.lexists(owner.pid_path)
+        assert isinstance(ec.read("ping", {}, timeout=3.0, socket_path=owner.socket_path), ec.Ok)
+    finally:
+        owner.stop()
+
+
+@requires_linux_owner
+def test_a_fresh_owner_object_still_starts_normally_after_a_refused_restart(inproc_home):
+    first = eo.EngramdOwner(inproc_home)
+    first.start(install_signal_handlers=False)
+    first.stop()
+    with pytest.raises(eo.OwnerRestartRefused):
+        first.start(install_signal_handlers=False)
+    second = eo.EngramdOwner(inproc_home)
+    second.start(install_signal_handlers=False)
+    try:
+        assert second._owner_conn is not None and second._client_read_conn is not None
+        assert os.path.lexists(second.socket_path)
+        with pytest.raises(core.StoreMaintLockHeld):
+            core.acquire_store_maint_lock(str(inproc_home / "knowledge.db"), "x")
+    finally:
+        second.stop()
+
+
+def test_owner_restart_refused_is_a_caller_error_outside_the_operator_refusals(inproc_home, monkeypatch):
+    """A second start is a programming error, not an environment condition: it is a RuntimeError, it is
+    in no class of the operator-refusal table main() maps to exit codes, and main() does not handle it."""
+    exc = eo.OwnerRestartRefused("x")
+    assert isinstance(exc, RuntimeError)
+    mapped = [cls for cls, _code in eo._REFUSAL_EXIT]
+    assert eo.OwnerRestartRefused not in mapped
+    assert not any(isinstance(exc, cls) for cls in mapped), "under an operator-refusal class"
+    assert eo._refusal_exit_code(exc) is None
+
+    def restart(self, **kw):
+        raise eo.OwnerRestartRefused("planted")
+
+    monkeypatch.setenv("ENGRAM_HOME", str(inproc_home))
+    monkeypatch.setattr(eo.EngramdOwner, "start", restart)
+    with pytest.raises(eo.OwnerRestartRefused):
+        eo.main([])
