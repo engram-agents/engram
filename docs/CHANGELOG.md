@@ -47,7 +47,19 @@ ships in v0.6.0.
   like a plain `open()`, instead of 0600. Not fixed here: the two hand-written
   marker updates in the `engram-loop` skill.
 
-<!-- #4012 / PR #4018 entry goes here once its squash commit is picked; check each sentence against the merged code. -->
+- **A nap that skips its last step still asks for compaction (#4012, PR
+  #4018).** The nap skill's final step writes the compaction request. A nap
+  that stopped before it left no request, so the compaction mod had nothing to
+  act on. Now the checkpoint records its backup verdict in
+  `compact/last-checkpoint.json`, and a new `Stop` hook,
+  `engram-nap-compact-backstop-stop.py`, runs the same request tool when a nap
+  checkpoint is newer than the last compaction and no request for it exists.
+  The tool still applies its own checks (the warm briefing written after the
+  checkpoint, the backup verdict). The hook runs only in a loop
+  (`loop-mode.json` present), writes nothing to stdout, never blocks a turn,
+  and does not retry a refused attempt until a new checkpoint or briefing
+  write. Turn it off with `"compaction": {"nap_backstop": false}` in
+  `config.json`.
 
 ## [v0.5.3] - 2026-10-15
 
