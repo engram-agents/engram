@@ -142,14 +142,24 @@ def length_bin(n: int) -> str:
     return ">=320"
 
 
+_JSON_WS_STRIP = str.maketrans("", "", " \t\n\r")
+
+
 def _source_class(metadata_raw: str | None) -> str:
     if not metadata_raw:
         return "external"
-    try:
-        meta = json.loads(metadata_raw)
-    except (TypeError, ValueError):
-        return "unknown"
-    if not isinstance(meta, dict):
+    meta = core._metadata_dict(metadata_raw)
+    if not meta:
+        # _metadata_dict maps malformed AND a real empty object to {}. The
+        # survey must tell them apart (malformed -> "unknown", so the per-class
+        # shares do not silently absorb it), so look at the raw text instead of
+        # parsing it a second time: "{}" with JSON whitespace removed is a
+        # real empty object. Only the four JSON whitespace characters (space,
+        # tab, LF, CR) are ignored, never str.split()'s Unicode whitespace:
+        # json.loads rejects e.g. NBSP or U+2028, so those stay "unknown".
+        # (engram-alpha#4085)
+        if isinstance(metadata_raw, str) and metadata_raw.translate(_JSON_WS_STRIP) == "{}":
+            return "external"
         return "unknown"
     return meta.get("source_class") or "external"
 

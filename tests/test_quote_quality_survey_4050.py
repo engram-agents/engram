@@ -261,6 +261,35 @@ def test_c4_rule_is_one_module_constant():
     assert "pre-registered" in _TOOL_PATH.read_text().lower()
 
 
+# engram-alpha#4085: _source_class tells absent / malformed / empty-object apart.
+_SOURCE_CLASS_CASES = [
+    (None, "external"),
+    ("", "external"),
+    ("{}", "external"),
+    ("{ }", "external"),
+    ("not json", "unknown"),
+    ("[1,2]", "unknown"),
+    ("5", "unknown"),
+    ('{"source_class": "user_stated"}', "user_stated"),
+    ('{"source_class": ""}', "external"),
+    ('{"other": 1}', "external"),
+    # JSON whitespace is only space, tab, LF, CR. Unicode whitespace makes
+    # json.loads fail, so these stay malformed ("unknown").
+    ("\xa0{}", "unknown"),
+    ("{}\xa0", "unknown"),
+    ("{} ", "unknown"),
+    ("{} ", "external"),
+    ("{\n}", "external"),
+    ("\t{ }\r\n", "external"),
+]
+
+
+@pytest.mark.parametrize("raw,expected", _SOURCE_CLASS_CASES)
+def test_source_class_three_way_4085(raw, expected):
+    tool = _load_tool()
+    assert tool._source_class(raw) == expected
+
+
 # --------------------------------------------------------------------------- C5
 def test_c5_blind_sheet(capsys):
     tool = _load_tool()
