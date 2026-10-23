@@ -40,6 +40,9 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src" / "engram"
 TOOLS = SRC / "tools"
+# The #728 advisory engram_core prints at import time on an interpreter without sqlite-vec. It is deliberately
+# loud ("Loud, not silent"), so surgical.py's stderr carries it there; the test tolerates exactly this line.
+SQLITE_VEC_ADVISORY_PREFIX = "[engram] sqlite-vec unavailable"
 REL = "rel/x"
 REFUSAL = "ENGRAM_HOME must be an absolute path, got 'rel/x'"
 
@@ -266,7 +269,8 @@ def _plant_surgical(root, ctx):
 
 
 def _check_surgical(r, H, ctx):
-    assert r.stderr == ""
+    rest = [ln for ln in r.stderr.splitlines() if not ln.startswith(SQLITE_VEC_ADVISORY_PREFIX)]
+    assert rest == [], r.stderr
     doc = json.loads(r.stdout)
     assert "ob_9" in json.dumps(doc), doc  # the store was opened and the node looked up in it
     assert r.returncode == 0, (r.returncode, r.stdout)

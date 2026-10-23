@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -229,8 +230,13 @@ def test_test_id_set_check_runs_on_the_queue_with_aggregated_markers(wf):
 
 BARE = "bare subject without a suffix"
 
+# macOS has no /usr/bin/bash; resolve it on the same /usr/bin:/bin the step is given (Linux: /usr/bin/bash).
+_BASH = shutil.which("bash", path="/usr/bin:/bin")
+
 
 def _run_queue_arm(wf, tmp_path, *, log_lines, log_exit=0):
+    if _BASH is None:
+        pytest.skip("no bash on /usr/bin:/bin to run the queue arm under")
     run = str(_test_id_step(wf)["run"])
     run = run.replace("${{ env.BASE_REF }}", "$BASE_REF").replace("${{ github.repository }}", "$GH_REPO")
     assert "${{" not in run, "unsubstituted expression left in the step"
@@ -241,7 +247,7 @@ def _run_queue_arm(wf, tmp_path, *, log_lines, log_exit=0):
     (tmp_path / "subjects.txt").write_text("".join(ln + "\n" for ln in log_lines))
     stub_git = bin_dir / "git"
     stub_git.write_text(
-        "#!/usr/bin/bash\n"
+        f"#!{_BASH}\n"
         'case "$1" in\n'
         "  merge-base) echo cafe1234 ;;\n"
         f'  log) if [ {log_exit} -ne 0 ]; then echo "fatal: bad revision" >&2; exit {log_exit}; fi;'
@@ -250,7 +256,7 @@ def _run_queue_arm(wf, tmp_path, *, log_lines, log_exit=0):
         "esac\n"
     )
     stub_py = bin_dir / "python3"
-    stub_py.write_text(f'#!/usr/bin/bash\necho "$@" > "{tmp_path}/TOOL_RAN"\nexit 0\n')
+    stub_py.write_text(f'#!{_BASH}\necho "$@" > "{tmp_path}/TOOL_RAN"\nexit 0\n')
     for f in (stub_git, stub_py):
         f.chmod(0o755)
     env = {
@@ -262,7 +268,7 @@ def _run_queue_arm(wf, tmp_path, *, log_lines, log_exit=0):
         "GH_TOKEN": "",
     }
     return subprocess.run(
-        ["/usr/bin/bash", "-eo", "pipefail", str(script)],
+        [_BASH, "-eo", "pipefail", str(script)],
         env=env, cwd=tmp_path, capture_output=True, text=True, timeout=30,
     )
 
