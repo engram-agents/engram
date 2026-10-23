@@ -308,6 +308,7 @@ import shlex
 import stat
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b, step 3a): it would resolve against this process's cwd, a
@@ -635,6 +636,21 @@ _CODEX_PACER_NUDGE_TEXT = (
     "managed codex-umwelt-wake.py bridge and this agent's systemd heartbeat "
     "timer, then correct the marker to pacer systemd before continuing.]"
 )
+
+
+# alpha #4104: a human's reply is swallowed when the turn ends on a tool call
+# (only a turn's FINAL assistant text renders). Deliberately says nothing about
+# arming: this block must never push the agent back into a trailing arm.
+_REPLY_NOT_RENDERED_TEXT = (
+    "[Reply Delivery Check: your reply to the human was not rendered, because "
+    "this turn ends on a tool call and only a turn's final text renders. Write "
+    "the reply now as the turn's final text, with no tool call after it.]"
+)
+
+# Wake-pending: a wake due further out than this is "pending" (#4104).
+_WAKE_PENDING_MIN_SECONDS = 90
+# Wake-pending: tail-scan bound for the transcript file.
+_WAKE_PENDING_TAIL_BYTES = 4 * 1024 * 1024
 
 
 def _pacer_is_schedule_wakeup(loop_marker_path: str) -> bool:
@@ -1102,6 +1118,225 @@ def _read_turn_delta(transcript_path: str) -> bytes | None:
         return None
 
 
+def _strict_records(delta_bytes: bytes) -> list | None:
+    """Records of a delta, or None unless EVERY non-blank line parses (the
+    strictness `_delta_is_quiet_wake` applies; the #4104 reply gate fails
+    toward today's behaviour on anything less)."""
+    if not delta_bytes or not delta_bytes.strip():
+        return None
+    records, any_parsed = _parse_jsonl_records(delta_bytes)
+    if not any_parsed or not records:
+        return None
+    nonblank = [ln for ln in delta_bytes.decode("utf-8", errors="replace").split("\n") if ln.strip()]
+    if len(records) != len(nonblank):
+        return None
+    return records
+
+
+# Local to _human_prompt_index (deliberately NOT in _NOT_A_TRIGGER_PREFIXES:
+# other consumers keep today's behaviour).
+# Injected user text with no provenance fields: a skill expansion, and the
+# compact-request post-compaction context (tools/compact-request.py).
+_INJECTED_TEXT_PREFIXES = (
+    "Base directory for this skill:",
+    "# Post-compaction context",
+)
+
+
+def _record_fields_say_not_human(rec: dict) -> bool:
+    """True when a user record's own provenance fields mark it as injected.
+
+    Real Claude Code user records carry `origin` / `promptSource` /
+    `turnOrigin` / `isMeta` (a typed prompt: origin.kind "human", promptSource
+    "typed", turnOrigin "human"; skill expansions and Stop-hook feedback are
+    isMeta). These are EXCLUSIONS only, applied when a field is present; old
+    transcripts and synthetic fixtures without them keep the text rules."""
+    if rec.get("isMeta") is True:
+        return True
+    origin = rec.get("origin")
+    if isinstance(origin, dict):
+        kind = origin.get("kind")
+        if isinstance(kind, str) and kind != "human":
+            return True
+    turn_origin = rec.get("turnOrigin")
+    if isinstance(turn_origin, str) and turn_origin != "human":
+        return True
+    return rec.get("promptSource") == "system"
+
+
+def _human_prompt_index(records: list) -> int | None:
+    """Index of the LAST user record that is a genuine human prompt: has text
+    that is not Stop-hook feedback / a compaction summary, carries no
+    `<loop-wake>` marker and no `<task-notification>` (after HTML-unescape).
+    A later wake / task-notification record clears an earlier human prompt;
+    so does a record that merely QUOTES the marker inside a human prompt (fails
+    toward today's behaviour; rare, accepted). Stop-hook feedback, compaction
+    summaries and skill expansions never clear."""
+    found = None
+    for i, rec in enumerate(records):
+        text = _record_user_text(rec)
+        if text is None or not text.strip():
+            continue
+        if text.lstrip().startswith(_NOT_A_TRIGGER_PREFIXES):
+            continue
+        # Skill expansions / post-compaction context are injected text that may
+        # quote the marker (the engram-loop skill does): not human, and must not
+        # clear a human prompt either.
+        if text.lstrip().startswith(_INJECTED_TEXT_PREFIXES) or rec.get("turnCompanion") is True:
+            continue
+        unescaped = html.unescape(text)
+        if _LOOP_WAKE_MARKER in unescaped or "<task-notification>" in unescaped:
+            # A wake / task notification after the human prompt starts a new
+            # turn: the turn being ended is not the human's. Checked BEFORE the
+            # field exclusions because real wake records are isMeta too.
+            found = None
+            continue
+        if _record_fields_say_not_human(rec):
+            continue
+        found = i
+    return found
+
+
+def _reply_rendered(records: list, after: int) -> bool:
+    """True iff, after record index `after`, the LAST assistant record carries
+    non-empty text and no tool_use follows that text (an earlier tool_use is
+    fine: the text must be last)."""
+    last = None
+    for rec in records[after + 1:]:
+        if rec.get("type") == "assistant":
+            last = rec
+    if last is None:
+        return False
+    message = last.get("message")
+    content = message.get("content", []) if isinstance(message, dict) else []
+    if not isinstance(content, list):
+        return False
+    text_seen = False
+    for block in _walk_content_blocks(content):
+        btype = block.get("type")
+        if btype == "text":
+            body = block.get("text")
+            if isinstance(body, str) and body.strip():
+                text_seen = True
+        elif btype == "tool_use":
+            text_seen = False  # a tool call after the text: the text is not final
+    return text_seen
+
+
+def _delta_reply_state(delta_bytes: bytes) -> tuple[bool, bool]:
+    """(has_human_prompt, reply_rendered) for a turn delta. (False, False) when
+    the delta cannot be parsed strictly or holds no human prompt."""
+    records = _strict_records(delta_bytes)
+    if records is None:
+        return (False, False)
+    idx = _human_prompt_index(records)
+    if idx is None:
+        return (False, False)
+    return (True, _reply_rendered(records, idx))
+
+
+def _parse_iso_utc(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    v = value.strip()
+    if v.endswith(("Z", "z")):
+        v = v[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _now_utc() -> datetime:
+    """Current UTC time. ENGRAM_LOOP_ARM_NOW_ISO (ISO-8601) overrides it when
+    set: a TEST SEAM for the wake-pending cells, nothing else reads it."""
+    raw = os.environ.get("ENGRAM_LOOP_ARM_NOW_ISO")
+    if raw:
+        parsed = _parse_iso_utc(raw)
+        if parsed is not None:
+            return parsed
+    return datetime.now(timezone.utc)
+
+
+def _read_transcript_tail(transcript_path: str) -> bytes | None:
+    """At most the last 4 MiB of the file; when truncated, the first (possibly
+    partial) line is dropped. None when unreadable."""
+    try:
+        size = os.path.getsize(transcript_path)
+        # non-blocking, regular-file-only open (#3628); bytes via its .buffer
+        with open_regular_text(transcript_path) as tf:
+            f = tf.buffer
+            if size > _WAKE_PENDING_TAIL_BYTES:
+                f.seek(size - _WAKE_PENDING_TAIL_BYTES)
+                data = f.read(_WAKE_PENDING_TAIL_BYTES)
+                nl = data.find(b"\n")
+                return b"" if nl < 0 else data[nl + 1:]
+            return f.read()
+    except OSError:
+        return None
+
+
+def _loop_wake_arm_blocks(rec: dict) -> list:
+    """The loop-wake ScheduleWakeup tool_use blocks of one assistant record."""
+    if rec.get("type") != "assistant":
+        return []
+    message = rec.get("message")
+    content = message.get("content", []) if isinstance(message, dict) else []
+    if not isinstance(content, list):
+        return []
+    out = []
+    for block in _walk_content_blocks(content):
+        if block.get("type") == "tool_use" and block.get("name") in _WAKE_ARMING_TOOL_NAMES:
+            prompt = _tool_use_prompt_text(block)
+            if prompt and _LOOP_WAKE_MARKER in html.unescape(prompt):
+                out.append(block)
+    return out
+
+
+def _wake_pending(transcript_path: str, now: datetime) -> bool:
+    """True iff the LATEST assistant loop-wake ScheduleWakeup in the transcript
+    (tail-bounded) is due more than 90 s after `now` and no later user text
+    record carries the marker (a fired wake consumes it). A missing/invalid
+    timestamp or delaySeconds, an unreadable file, or no such arm -> False
+    (fail toward today's forced-arm behaviour)."""
+    if not transcript_path:
+        return False
+    data = _read_transcript_tail(transcript_path)
+    if not data:
+        return False
+    records, _parsed = _parse_jsonl_records(data)
+    arm_idx = None
+    for i, rec in enumerate(records):
+        if _loop_wake_arm_blocks(rec):
+            arm_idx = i
+    if arm_idx is None:
+        return False
+    arm = records[arm_idx]
+    armed_at = _parse_iso_utc(arm.get("timestamp"))
+    if armed_at is None:
+        return False
+    delay = None
+    for block in _loop_wake_arm_blocks(arm):
+        d = block["input"].get("delaySeconds")
+        if isinstance(d, (int, float)) and not isinstance(d, bool):
+            delay = d
+    if delay is None:
+        return False
+    for rec in records[arm_idx + 1:]:
+        text = _record_user_text(rec)
+        # Stop-hook feedback / compaction summaries quote the marker; they are
+        # not a fired wake (same exclusion as the human-prompt definition).
+        if text is None or text.lstrip().startswith(_NOT_A_TRIGGER_PREFIXES):
+            continue
+        if _LOOP_WAKE_MARKER in html.unescape(text):
+            return False
+    due = armed_at + timedelta(seconds=delay)
+    return (due - now).total_seconds() > _WAKE_PENDING_MIN_SECONDS
+
+
 def _read_quiet_ticks(transcript_path: str) -> int:
     """Stored count for THIS transcript; missing/corrupt/other-transcript -> 0."""
     try:
@@ -1154,6 +1389,50 @@ def _quiet_wake_step(transcript_path: str, can_nudge: bool) -> int | None:
         return ticks if due else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _emit_hook_fire(session_id: str, transcript_path: str, _t0: float) -> None:
+    """Emit the engram.hook.fire event (shared by the nudge and reply-gate paths)."""
+    _duration_ms = int((time.perf_counter() - _t0) * 1000)
+
+    # Emit engram.hook.fire event, matching the sibling Stop hooks'
+    # observability convention. Failure must not break the hook.
+    #
+    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
+    # its own try/except so an INIT_FAILED outcome is recordable and
+    # distinct from an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md
+    # §1/§5).
+    _emitter = None
+    try:
+        from engram_log_emitter import Emitter
+        _emitter = Emitter.init(
+            session_id=session_id,
+            transcript_path=transcript_path,
+        )
+    except Exception:
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "init_failed"},
+        )
+
+    if _emitter is not None:
+        _uid = _emitter.emit(
+            event_type="engram.hook.fire",
+            level=1,
+            data={
+                "hook_name": "engram-loop-arm-stop-hook",
+                "hook_type": "Stop",
+                "duration_ms": _duration_ms,
+                "exit_code": 0,
+            },
+            site="loop-arm-stop-hook.hook_fire",
+        )
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "delivered" if _uid is not None else "dropped"},
+        )
 
 
 def main() -> None:
@@ -1220,6 +1499,39 @@ def main() -> None:
     except Exception:  # noqa: BLE001
         confirmed = False  # fail-open: nudge fires
 
+    # alpha #4104: reply-delivery gate. Decided from the transcript delta only.
+    # A human prompt whose turn does not END on assistant text means the reply
+    # was swallowed (e.g. a trailing arm): block, ahead of the arm check.
+    has_human = reply_rendered = False
+    try:
+        _delta = _read_turn_delta(transcript_path)
+        if _delta is not None:
+            has_human, reply_rendered = _delta_reply_state(_delta)
+    except Exception:  # noqa: BLE001
+        has_human = reply_rendered = False
+
+    if has_human and not reply_rendered:
+        _quiet_wake_step(transcript_path, can_nudge=False)  # keep the counter honest
+        print(json.dumps({"decision": "block", "reason": _REPLY_NOT_RENDERED_TEXT}))
+        if _STOPHOOKLIB_OK:
+            _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+        _emit_hook_fire(session_id, transcript_path, _t0)
+        return
+
+    # A human-answering turn whose reply rendered, with a wake still pending:
+    # the heartbeat is already covered, so no forced arm.
+    if has_human and not confirmed:
+        pending = False
+        try:
+            pending = _wake_pending(transcript_path, _now_utc())
+        except Exception:  # noqa: BLE001
+            pending = False
+        if pending:
+            _quiet_wake_step(transcript_path, can_nudge=False)
+            if _STOPHOOKLIB_OK:
+                _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+            return
+
     # alpha #3919 M2: runs BEFORE the confirmed-early-return (a quiet turn
     # normally DOES contain the re-arm) and BEFORE the offset write (it reads
     # the same delta). It never emits when the arm-check nudge is firing.
@@ -1244,47 +1556,7 @@ def main() -> None:
     # Lib unavailable -- no offset state to write without it, so skip that
     # bookkeeping (nothing else to do with it); the nudge above still fired.
 
-    _duration_ms = int((time.perf_counter() - _t0) * 1000)
-
-    # Emit engram.hook.fire event, matching the sibling Stop hooks'
-    # observability convention. Failure must not break the hook.
-    #
-    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
-    # its own try/except so an INIT_FAILED outcome is recordable and
-    # distinct from an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md
-    # §1/§5).
-    _emitter = None
-    try:
-        from engram_log_emitter import Emitter
-        _emitter = Emitter.init(
-            session_id=session_id,
-            transcript_path=transcript_path,
-        )
-    except Exception:
-        write_telemetry_record(
-            manifest_id=_HOOK_FIRE_SITE,
-            event_type="engram.hook.fire",
-            fields={"outcome": "init_failed"},
-        )
-
-    if _emitter is not None:
-        _uid = _emitter.emit(
-            event_type="engram.hook.fire",
-            level=1,
-            data={
-                "hook_name": "engram-loop-arm-stop-hook",
-                "hook_type": "Stop",
-                "duration_ms": _duration_ms,
-                "exit_code": 0,
-            },
-            site="loop-arm-stop-hook.hook_fire",
-        )
-        write_telemetry_record(
-            manifest_id=_HOOK_FIRE_SITE,
-            event_type="engram.hook.fire",
-            fields={"outcome": "delivered" if _uid is not None else "dropped"},
-        )
-
+    _emit_hook_fire(session_id, transcript_path, _t0)
 
 if __name__ == "__main__":
     main()

@@ -509,7 +509,11 @@ def test_human_turn_resets_via_subprocess(tmp_path):
     s = Seat(tmp_path)
     s.quiet()
     sw, cl = _batched_arm_records("t_sw", "t_cl", _REAL_LOOP_PROMPT, "msg_human_rearm")
-    assert s.fire(HUMAN, sw, cl) == ""
+    # #4104: a human turn must END on assistant text (a trailing arm swallows the reply and the
+    # reply gate blocks it), so the reply follows the arm as the turn's final text.
+    reply = json.dumps({"type": "assistant", "message": {"id": "msg_reply", "content": [
+        {"type": "text", "text": "the test fails on the stale fixture"}]}})
+    assert s.fire(HUMAN, sw, cl, reply) == ""
     assert s.ticks() == 0
 
 
