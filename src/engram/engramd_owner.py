@@ -716,6 +716,17 @@ class OwnerPidfileNotRegular(RuntimeError):
     without one reads as down while it holds the socket."""
 
 
+class OwnerPidfileNotWritable(RuntimeError):
+    """Raised by EngramdOwner.start() (and `--preflight`) when the pidfile
+    path (<ENGRAM_HOME>/engramd.pid) holds a regular file this user cannot
+    write, or holds nothing and its directory is not writable (#4068):
+    typically a pidfile left behind by another user, or one whose mode was
+    changed. Exit EXIT_PATH_NOT_REGULAR (4), not retried, for
+    the same reason as OwnerPidfileNotRegular: retrying cannot fix it, and an
+    uncaught PermissionError here was a traceback and a respawn every
+    throttle interval (#3709). The text names the path and the remedy."""
+
+
 class OwnerSocketPathTooLong(RuntimeError):
     """Raised by EngramdOwner.start() when the socket path
     (<ENGRAM_HOME>/run/engramd.sock) is longer in BYTES than an AF_UNIX
@@ -2899,6 +2910,34 @@ class EngramdOwner:
             f"nothing was bound. Remove it and start again"
         )
 
+    def _pidfile_not_writable_text(self) -> str:
+        """The refusal text for EACCES/EPERM on the pidfile write. True in both
+        cases the errno covers (#4068), decided by one `lstat` of the path at
+        the point of the error: the pidfile exists (the file's mode is the
+        problem), or it does not and its DIRECTORY is not writable."""
+        try:
+            os.lstat(self.pid_path)
+        except OSError as lstat_exc:
+            directory = os.path.dirname(str(self.pid_path)) or "."
+            # ENOENT: the pidfile is plainly absent. Any other lstat failure (e.g. a
+            # directory that cannot be searched) means we could not check, so say so.
+            absent = (
+                "does not exist"
+                if isinstance(lstat_exc, FileNotFoundError)
+                else "does not exist or cannot be checked"
+            )
+            return (
+                f"refusing to start: the pidfile {self.pid_path} {absent} and its "
+                f"directory {directory} is not writable by this user, so it cannot be "
+                f"created; nothing was bound. Make {directory} writable by the user that "
+                f"runs the owner"
+            )
+        return (
+            f"refusing to start: the pidfile {self.pid_path} exists but this user cannot "
+            f"write it; nothing was bound. Make it writable by the user that runs the "
+            f"owner, or remove it"
+        )
+
     def _write_pidfile(self) -> None:
         """Write this process's pid to the pidfile (#3768). The write
         sequence (O_NOFOLLOW, O_NONBLOCK, no O_TRUNC, fstat regular-and-
@@ -2910,12 +2949,17 @@ class EngramdOwner:
         A refusal (`NotRegularFile`) becomes OwnerPidfileNotRegular after
         releasing what start() already acquired (the socket and both store
         connections; the accept thread does not exist yet). Any other
-        OSError propagates unchanged."""
+        OSError propagates unchanged, except EACCES/EPERM (#4068): an existing
+        pidfile this user cannot write becomes OwnerPidfileNotWritable, with
+        the same cleanup first."""
         try:
             write_pidfile(self.pid_path, str(os.getpid()).encode("ascii"))
         except NotRegularFile as exc:
             self._cleanup()
             raise OwnerPidfileNotRegular(self._pidfile_refusal_text(exc.st_mode, exc.nlink)) from exc
+        except PermissionError as exc:  # EACCES and EPERM
+            self._cleanup()
+            raise OwnerPidfileNotWritable(self._pidfile_not_writable_text()) from exc
 
     def _load_read_registry(self, dynamic: bool) -> "rr.Registry":
         """Load the committed template list, classifying each template
@@ -2971,6 +3015,22 @@ class EngramdOwner:
            fresh start and passes, which is what makes this safe before mkdir.
            The race between this check and the write is closed in
            `_write_pidfile`, which keeps its own checks.
+           #4068: a regular pidfile this user cannot write (`os.access`,
+           pure) is refused by name too, `OwnerPidfileNotWritable`, same exit.
+           #4068: an ABSENT pidfile whose directory this user cannot write or
+           search (`os.access(W_OK | X_OK)`, the predicate the write meets) is
+           refused too, but ONLY where start() would actually reach the pidfile
+           write: `_refuse_absent_pidfile_in_unwritable_dir` walks the refusals
+           start() makes first (setlimit, dynamic flag, maintenance lock
+           directory, store schema gate) and lets each keep its own name, so the
+           no-store layout still gets `OwnerStoreBehindSchema` from both paths.
+           Why preflight must match start() here: launchd restarts every
+           non-zero exit, refusals included, every ThrottleInterval, so a
+           preflight that passes where start() then exits 4 loops forever.
+           The parity rule (preflight raises the exception class start() raises,
+           or both pass) is pinned per layout by
+           tests/test_engramd_owner_pidfile_identity_4068.py, cell 3f; the order is
+           mirrored by hand, and that cell is what catches the next drift.
         5. #3785: the store path (<ENGRAM_HOME>/knowledge.db), when it exists,
            must be a regular file: a FIFO, directory, socket or device is
            refused by name (`OwnerStorePathNotRegular`, exit 4 from `main()`),
@@ -3000,7 +3060,49 @@ class EngramdOwner:
         if pid_stat is not None and (not stat.S_ISREG(pid_stat.st_mode) or pid_stat.st_nlink > 1):
             raise OwnerPidfileNotRegular(
                 self._pidfile_refusal_text(pid_stat.st_mode, pid_stat.st_nlink))
+        # #4068: an existing regular pidfile this user cannot write is refused by
+        # name too (the write would meet EACCES). `os.access(W_OK)` is access(2): it
+        # opens nothing, so it cannot create, truncate or block; pure like the lstat.
+        if pid_stat is not None and not os.access(self.pid_path, os.W_OK):
+            raise OwnerPidfileNotWritable(self._pidfile_not_writable_text())
         _refuse_non_regular_store(self.store_path)
+        if pid_stat is None:
+            self._refuse_absent_pidfile_in_unwritable_dir()
+
+    def _refuse_absent_pidfile_in_unwritable_dir(self) -> None:
+        """#4068: the absent-pidfile arm of `check_start_refusals`. No-op unless the
+        pidfile's directory exists and this user cannot write and search it
+        (`os.access(W_OK | X_OK)`: pure, the predicate `_write_pidfile` meets). When it
+        is, start() would exit 4 at the pidfile write, so preflight must refuse
+        too -- but only after the refusals start() makes BEFORE that write, in start()'s
+        order, so each keeps its own name: setlimit, the dynamic-template flag, the
+        maintenance lock directory (cannot be created in this directory), then the store
+        schema gate (the only non-pure step: a read-only probe, run only on this already-
+        failing path). A refusal the live process can still hit but preflight cannot see
+        (another owner holding the lock) is left to start(), as before. So is a planted
+        lock path (a symlink or a foreign-owned directory): start() refuses it under its
+        own name, and it is not mirrored here."""
+        directory = os.path.dirname(str(self.pid_path)) or "."
+        if not os.path.isdir(directory) or os.access(directory, os.W_OK | os.X_OK):
+            return
+        _require_sqlite_setlimit()
+        rr.resolve_dynamic_flag(os.environ, _read_install_tier(self.engram_home))
+        if os.path.lexists(self.store_path):
+            try:
+                import engram_core
+            except ImportError:
+                engram_core = None  # the schema gate below refuses it by name
+            if engram_core is not None:
+                lock_path = engram_core.store_maint_lock_path(str(self.store_path))
+                if not os.path.lexists(lock_path):
+                    raise OwnerStoreLockDirUnusable(
+                        f"refusing to start: the maintenance lock directory {lock_path} does not "
+                        f"exist and its directory {directory} is not writable by this user, so it "
+                        f"cannot be created; nothing was created or bound. Make {directory} writable "
+                        f"by this account, then start the owner again."
+                    )
+        _require_store_schema_current(self.store_path)
+        raise OwnerPidfileNotWritable(self._pidfile_not_writable_text())
 
     def _check_platform_support(self) -> None:
         """Refuse to start rather than silently degrade the permission
@@ -3363,70 +3465,21 @@ class EngramdOwner:
                 self._server.close()
             except OSError:
                 pass
-        # PID_PATH: removed only if it still names THIS process -- mirrors
-        # engram-surface-daemon.py's cleanup(): guards against a delayed
-        # signal firing after a newer instance already wrote its own fresh
-        # pidfile (which would otherwise delete the NEW instance's pidfile
-        # out from under it).
-        #
-        # #3768: this read decides whether to UNLINK, so it refuses symlinks
-        # and non-regular files (O_NOFOLLOW, O_NONBLOCK, then fstat): a FIFO
-        # must not hang it and must not be unlinked, a symlink is not ours.
-        still_ours = False
-        not_regular_kind = None
-        hard_links = None
-        try:
-            fd = os.open(self.pid_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-        except OSError as exc:
-            if exc.errno == errno.ELOOP:
-                not_regular_kind = "symlink"
-            else:
-                # No pidfile, or unreadable -- nothing to protect, proceed
-                # with removing it (matches the surface daemon's identical
-                # fallback) -- unless the path is something other than a
-                # regular file that open() merely failed on (e.g. a
-                # socket-type file: ENXIO on Linux, EOPNOTSUPP on macOS),
-                # which is not ours to unlink.
-                still_ours = True
-                try:
-                    lmode = os.lstat(self.pid_path).st_mode
-                except OSError:
-                    pass
-                else:
-                    if not stat.S_ISREG(lmode):
-                        still_ours = False
-                        not_regular_kind = self._kind_of_mode(lmode)
-        else:
-            try:
-                fst = os.fstat(fd)
-                mode = fst.st_mode
-                if not stat.S_ISREG(mode):
-                    not_regular_kind = self._kind_of_mode(mode)
-                elif fst.st_nlink > 1:
-                    # hard-linked: another name shares this inode, not ours
-                    hard_links = fst.st_nlink
-                else:
-                    try:
-                        with os.fdopen(fd, closefd=False) as f:
-                            still_ours = int(f.read().strip()) == os.getpid()
-                    except (OSError, ValueError):
-                        # garbage/unreadable content: same fallback as above
-                        still_ours = True
-            finally:
-                os.close(fd)
-        if not_regular_kind is not None:
-            logging.getLogger("engramd_owner").warning(
-                "pidfile %s is a %s, not a regular file; leaving it alone",
-                self.pid_path, not_regular_kind)
-        if hard_links is not None:
-            logging.getLogger("engramd_owner").warning(
-                "pidfile %s has %d hard links; leaving it alone",
-                self.pid_path, hard_links)
-        if still_ours:
+        # PID_PATH: unlinked ONLY on confirmed identity (content == this pid),
+        # by the one rule in engram_pidfile.classify_own_pidfile, shared with
+        # the surface daemon's cleanup (#4068): a delayed signal after a newer
+        # instance wrote its own pidfile, an empty file caught mid-write, an
+        # unreadable or garbage file, a symlink, a FIFO or a hard link are all
+        # left alone, and each says so once.
+        status, reason = engram_pidfile.classify_own_pidfile(self.pid_path)
+        if status == engram_pidfile.PIDFILE_OURS:
             try:
                 self.pid_path.unlink()
             except FileNotFoundError:
                 pass
+        elif status != engram_pidfile.PIDFILE_ABSENT:
+            logging.getLogger("engramd_owner").warning(
+                "pidfile %s %s; leaving it alone", self.pid_path, reason)
         # SOCKET_PATH: removed only if THIS process actually bound it
         # (_bound_socket) -- independent of pidfile identity, same
         # reasoning as engram-surface-daemon.py's #2713 fix: a pidfile-
@@ -5462,6 +5515,7 @@ _REFUSAL_EXIT: tuple[tuple[type[RuntimeError], int], ...] = (
     (OwnerAclNotStripped, 1),
     (OwnerPermissionUnsupported, 1),
     (OwnerPidfileNotRegular, EXIT_PATH_NOT_REGULAR),  # retrying cannot fix a planted path
+    (OwnerPidfileNotWritable, EXIT_PATH_NOT_REGULAR),  # #4068: nor an unwritable one
     (OwnerStorePathNotRegular, EXIT_PATH_NOT_REGULAR),
     # Its own code (not 1, not os._exit): non-zero, so the supervisor retries while the first
     # migration finishes.
