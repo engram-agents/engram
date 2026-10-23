@@ -2249,3 +2249,178 @@ def test_installer_runs_the_stale_process_check_informationally_after_the_versio
     assert run[0].lstrip().startswith("if ! ")
     assert "--informational" in run[0]
     assert 'WARNING: check_stale_processes.py could not run' in text[stamp:]
+
+
+# ── #4099: an unreadable checkout fails loudly, never silently ───────────────
+#
+# `REPO_ROOT="$(git ... rev-parse --show-toplevel 2>/dev/null)"` used to exit the
+# script under `set -e` with git's own status (128) and NO output when git refused
+# the checkout (e.g. "detected dubious ownership"), before the guard on the next
+# line could print anything.
+
+_DUBIOUS_TEXT = (
+    "fatal: detected dubious ownership in repository at '{path}'\n"
+    "To add an exception for this directory, call:\n\n"
+    "\tgit config --global --add safe.directory {path}\n"
+)
+
+
+def _fake_git_failing_toplevel(tmp_path, stderr_text, *, exit_code=128):
+    """A `git` shim that fails `rev-parse --show-toplevel` and passes everything else
+    to the real git. Returns the PATH value to run the installer under."""
+    real_git = shutil.which("git")
+    shim_dir = tmp_path / "fake-git-bin"
+    shim_dir.mkdir()
+    text_file = tmp_path / "fake-git-stderr.txt"
+    text_file.write_text(stderr_text)
+    shim = shim_dir / "git"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do\n'
+        '  if [ "$a" = "--show-toplevel" ]; then\n'
+        f'    cat "{text_file}" >&2\n'
+        f"    exit {exit_code}\n"
+        "  fi\n"
+        "done\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
+def _run_with_failing_toplevel(tmp_path, stderr_text):
+    repo = _make_scratch_repo(tmp_path)
+    engram_home = tmp_path / "engram-home"
+    path = _fake_git_failing_toplevel(tmp_path, stderr_text.replace("{path}", str(repo)))
+    result = _run_scratch_installer(
+        repo, engram_home, extra_env={"PATH": path},
+        extra_args=("--allow-branch", "--allow-untagged"),
+    )
+    return repo, result
+
+
+def test_unresolvable_repo_root_exits_one_with_message(tmp_path):
+    """C1: git failing on --show-toplevel exits 1 (not 128) with a loud stderr line."""
+    _, result = _run_with_failing_toplevel(tmp_path, _DUBIOUS_TEXT)
+
+    assert result.returncode == 1, (result.returncode, result.stderr)
+    assert "could not resolve repo root" in result.stderr
+
+
+def test_unresolvable_repo_root_carries_git_stderr_and_safe_directory_remedy(tmp_path):
+    """C2: git's own stderr is shown, and a dubious-ownership refusal names the remedy
+    with the actual checkout path."""
+    repo, result = _run_with_failing_toplevel(tmp_path, _DUBIOUS_TEXT)
+
+    assert "detected dubious ownership" in result.stderr  # git's text, not swallowed
+    assert f"git config --global --add safe.directory '{repo}'" in result.stderr
+
+
+def test_unresolvable_repo_root_without_dubious_ownership_has_no_remedy(tmp_path):
+    """C2 (negative): a different git failure still gets git's text and exit 1, but is
+    not told to run a safe.directory command that would not help."""
+    _, result = _run_with_failing_toplevel(tmp_path, "fatal: some other git failure\n")
+
+    assert result.returncode == 1
+    assert "could not resolve repo root" in result.stderr
+    assert "some other git failure" in result.stderr
+    assert "safe.directory" not in result.stderr
+
+
+def test_resolvable_repo_root_is_unchanged(tmp_path):
+    """C3: with a working git, the repo root resolves and the install proceeds past it."""
+    repo = _make_scratch_repo(tmp_path)
+    result = _run_scratch_installer(
+        repo, tmp_path / "engram-home", extra_args=("--allow-branch", "--allow-untagged")
+    )
+
+    assert "could not resolve repo root" not in result.stderr
+    assert "safe.directory" not in result.stderr
+
+
+# ── #4100: a missing config.json is the fresh-install default, a broken one fails ──
+
+
+def _run_skip_build_no_check(tmp_path):
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    return subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+
+def test_venv_block_missing_config_json_uses_fresh_install_default(tmp_path):
+    """C4: venv present + no config.json -> convenience / single-agent, one log line,
+    no exit 1 from this block, and the block reached pip with the default tier."""
+    assert not (tmp_path / "config.json").exists()
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_skip_build_no_check(tmp_path)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "failed to parse" not in result.stderr
+    notes = [ln for ln in result.stdout.splitlines() if "does not exist yet" in ln]
+    assert len(notes) == 1, result.stdout
+    assert "config.json" in notes[0] and "fresh-install default" in notes[0]
+    assert "Provisioning venv at" in result.stdout
+    assert "tier: convenience" in result.stdout
+    calls = log_file.read_text()
+    assert "requirements/requirements.txt" in calls
+    assert "requirements-dev.txt" not in calls  # not tier dev
+    assert "src/forum/requirements.txt" not in calls  # not multi-agent
+
+
+@pytest.mark.parametrize("content", ["{not valid json", "", json.dumps({"install_tier": 0})])
+def test_venv_block_malformed_config_json_still_fails_loud(tmp_path, content):
+    """C5: a present-but-broken config.json still exits 1 with the existing message
+    (the #2951/#2965 contract is not weakened by C4)."""
+    (tmp_path / "config.json").write_text(content)
+    _fake_venv(tmp_path, tmp_path / "venv-calls.log")
+
+    result = _run_skip_build_no_check(tmp_path)
+
+    assert result.returncode == 1
+    assert "failed to parse" in result.stderr
+    assert "does not exist yet" not in result.stdout
+
+
+def test_venv_block_config_json_is_directory_still_fails_loud(tmp_path):
+    """C5b: a config.json that is a DIRECTORY is present, not missing: the
+    fresh-install default applies only when nothing exists at the path."""
+    (tmp_path / "config.json").mkdir()
+    _fake_venv(tmp_path, tmp_path / "venv-calls.log")
+
+    result = _run_skip_build_no_check(tmp_path)
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "failed to parse" in result.stderr
+    assert "does not exist yet" not in result.stdout
+
+
+def test_venv_block_config_json_dangling_symlink_still_fails_loud(tmp_path):
+    """C5c: a DANGLING symlink config.json is present (a link exists), not missing."""
+    (tmp_path / "config.json").symlink_to(tmp_path / "no-such-target.json")
+    assert not (tmp_path / "config.json").exists()
+    _fake_venv(tmp_path, tmp_path / "venv-calls.log")
+
+    result = _run_skip_build_no_check(tmp_path)
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "failed to parse" in result.stderr
+    assert "does not exist yet" not in result.stdout
+
+
+def test_venv_block_absent_venv_with_missing_config_is_skipped(tmp_path):
+    """C6: no venv -> the block is skipped (no note, no provisioning), as before."""
+    assert not (tmp_path / "config.json").exists()
+
+    result = _run_skip_build_no_check(tmp_path)
+
+    assert result.returncode == 0
+    assert "Provisioning venv at" not in result.stdout
+    assert "does not exist yet" not in result.stdout

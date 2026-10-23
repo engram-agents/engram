@@ -174,8 +174,30 @@ case "$TARGET" in
 esac
 
 _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
-REPO_ROOT="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>/dev/null)"
-[ -n "$REPO_ROOT" ] || { echo "install-local-marketplace: ERROR — could not resolve repo root via git" >&2; exit 1; }
+# #4099: a bare `VAR="$(cmd)"` carries cmd's exit status, so under `set -e` a
+# failing git (e.g. 128 "detected dubious ownership" on a checkout owned by
+# another user) would exit the script HERE, silently, before the guard below
+# could print anything. Test the assignment in an `if` so the guard is
+# reachable; on failure re-run git once to capture its own words (no temp file).
+_git_root_err=""
+if ! REPO_ROOT="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>/dev/null)"; then
+  REPO_ROOT=""
+  _git_root_err="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>&1 || true)"
+fi
+if [ -z "$REPO_ROOT" ]; then
+  echo "install-local-marketplace: ERROR — could not resolve repo root via git" >&2
+  [ -z "$_git_root_err" ] || printf '%s\n' "$_git_root_err" >&2
+  case "$_git_root_err" in
+    *"dubious ownership"*)
+      # git names the exact path it refused; fall back to the script's directory.
+      _unsafe_path="$(printf '%s\n' "$_git_root_err" | sed -n "s/.*repository at '\([^']*\)'.*/\1/p" | sed -n '1p')"
+      [ -n "$_unsafe_path" ] || _unsafe_path="$(dirname "$_self")"
+      echo "install-local-marketplace: this checkout is owned by another user. To trust it, run:" >&2
+      echo "    git config --global --add safe.directory '$_unsafe_path'" >&2
+      ;;
+  esac
+  exit 1
+fi
 if [[ ! -f "$REPO_ROOT/src/engram/server.py" ]]; then
   die "Must be run from the repo root (expected src/engram/server.py at $REPO_ROOT/src/engram/server.py)"
 fi
@@ -571,6 +593,16 @@ if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
   # calls (not merged into one heredoc like the _ma_tier_out block) --
   # deliberate minimal-diff scope: this fix makes the existing two calls
   # fail loud, it does not restructure them.
+  # #4100: a MISSING config.json is the fresh-install default (the earlier
+  # build-flag read treats it the same way), not a parse failure -- a
+  # bootstrap-spawned seat has this venv before any config exists. Only a
+  # PRESENT file goes through the fail-loud reads below, so #2951/#2965's
+  # "a parse/type failure is never silently the default" is unchanged.
+  if [[ ! -e "$ENGRAM_HOME/config.json" && ! -L "$ENGRAM_HOME/config.json" ]]; then
+    log "$ENGRAM_HOME/config.json does not exist yet (fresh install): using the fresh-install default (tier convenience, single-agent) for venv provisioning"
+    _eff_tier="convenience"
+    _eff_multi_agent="false"
+  else
   if ! _eff_tier="$(python3 -c "import json,sys
 path = sys.argv[1]
 try:
@@ -621,6 +653,7 @@ except Exception as e:
     exit 1
   fi
   [[ -z "$_eff_multi_agent" ]] && _eff_multi_agent="false"
+  fi
   _runtime_req="$REPO_ROOT/requirements/requirements.txt"
   if [[ -f "$_runtime_req" ]]; then
     log "Provisioning venv at $HOME/.engram/venv (tier: $_eff_tier)"
