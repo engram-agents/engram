@@ -247,9 +247,14 @@ def _affected_contradiction_ids(conn, node_id: str) -> list:
     needs a third caller — three copies of a walk whose subtlety is exactly
     that it does not follow the rule the other walk follows.
     """
+    # #4075: `acknowledged_contradicts` is a side edge too. When a contradiction was
+    # acknowledged after a side was superseded, the original `contradicts` edge points at
+    # the now non-current side; this edge points at the live successor, so a later revision
+    # of the successor marks the contradiction again.
     rows = conn.execute(
         "SELECT source_id, target_id FROM edges "
-        "WHERE relation = 'contradicts' AND (source_id = ? OR target_id = ?)",
+        "WHERE relation IN ('contradicts', 'acknowledged_contradicts') "
+        "AND (source_id = ? OR target_id = ?)",
         (node_id, node_id),
     ).fetchall()
     out = set()
@@ -969,7 +974,9 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
 #     with OPPOSITE rules: markers do NOT re-cascade on resolution, confidence
 #     DOES.
 
-_CASCADE_RESOLUTION_KINDS = ("acknowledged", "retracted", "superseded")
+# 'resolved' (#4075) is the fourth kind and is CONTRADICTION-ONLY: the contradiction was
+# settled by a side's revision. It is the only kind that writes a status (via _resolve_impl).
+_CASCADE_RESOLUTION_KINDS = ("acknowledged", "resolved", "retracted", "superseded")
 
 # root_op -> the resolution_kind that root op amounts to, for a cascade ROOT
 # that is also a direct premise of the node being adjudicated. The root never
@@ -979,6 +986,51 @@ _CASCADE_RESOLUTION_KINDS = ("acknowledged", "retracted", "superseded")
 # This is the 2026-08-26 amendment: the root counts as a premise resolving as
 # root_op.
 _CASCADE_ROOT_OP_AS_RESOLUTION = {"retract": "retracted", "supersede": "superseded"}
+
+
+def _cascade_node_type(conn, node_id: str):
+    """The node's type, or None when the node does not exist."""
+    row = conn.execute("SELECT type FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    return row["type"] if row else None
+
+
+def _cascade_contradiction_sides(conn, ct_id: str) -> list:
+    """Every node ``ct_id`` stands against, current or not: the targets of its
+    ``contradicts`` edges plus its ``acknowledged_contradicts`` edges (#4075), sorted.
+    The original edges are never removed, so a revised side stays listed here."""
+    rows = conn.execute(
+        "SELECT DISTINCT target_id FROM edges WHERE source_id = ? "
+        "AND relation IN ('contradicts', 'acknowledged_contradicts') ORDER BY target_id",
+        (ct_id,),
+    ).fetchall()
+    return [r["target_id"] for r in rows]
+
+
+def _cascade_affected_sides(conn, ct_id: str) -> list:
+    """The contradiction counterpart of ``_cascade_affected_premises`` (#4075): which of
+    ``ct_id``'s sides were revised by its OWN pending cascade events, and how.
+
+    A contradiction has no CITATION_SUPPORT_RELATIONS premises, so the read cannot go through
+    the premise ids. It goes through the marker instead: a contradiction is only ever marked by
+    the parallel contradicts-edge walk, whose marker records the revised side as ``root_node``
+    and the revision as ``root_op``. One entry per pending event (never collapsed: several
+    events can sit on one contradiction, one retracting a side and another superseding the
+    other, and invariant 8 says over-surface rather than pick one). The entry keeps the
+    premise-read shape so the refusal payloads need no second vocabulary: ``premise_id`` is
+    the revised SIDE, ``via`` is "side", ``still_pending`` is False (a side's revision is a
+    fact of the event, not a state awaiting its own marker).
+    """
+    out = []
+    for m in core._pending_markers_for_node(conn, ct_id):
+        out.append({
+            "premise_id": m["root_node"],
+            "cascade_event": m["cascade_event"],
+            "via": "side",
+            "resolution_kind": _CASCADE_ROOT_OP_AS_RESOLUTION.get(m["root_op"]),
+            "still_pending": False,
+        })
+    out.sort(key=lambda a: (a["cascade_event"], a["premise_id"], a["via"]))
+    return out
 
 
 def _cascade_affected_premises(conn, node_id: str) -> list:
@@ -998,7 +1050,14 @@ def _cascade_affected_premises(conn, node_id: str) -> list:
     its cascade flag in #2252 Stage 1.3, so a supported_by parent is never
     itself marked BY the walk) and it is the right breadth here: this read
     asks which of MY premises moved, not which edges conduct a cascade.
+
+    A CONTRADICTION node (#4075) has no premises: its legs are its SIDES, and the
+    revised side is named by each pending marker's own ``root_node`` / ``root_op``.
+    That case is answered by ``_cascade_affected_sides`` (same entry shape, ``via``
+    = "side"); every other type goes through the premise read below, unchanged.
     """
+    if _cascade_node_type(conn, node_id) == "contradiction":
+        return _cascade_affected_sides(conn, node_id)
     premises = set(core._direct_premise_ids(conn, node_id))
     if not premises:
         return []
@@ -1060,7 +1119,20 @@ def _cascade_eligible_shapes(conn, node_id: str, affected: list = None) -> dict:
     Computed here and NEVER persisted; severity has no column (§1). Derived
     fresh at each node's own resolution turn, which is the only time it is
     knowable (§6).
+
+    A CONTRADICTION node (#4075; Lei's ruling: "the sides are the legs") takes the
+    same rule over its sides, plus a fourth shape:
+
+        {retract, supersede, resolved}               if any pending event's root op
+                                                     is a retract
+        {retract, supersede, acknowledge, resolved}  otherwise
+
+    ``resolved`` is eligible on contradictions ONLY (no derivation's list ever carries
+    it). Several pending events on one contradiction follow the premise rule: acknowledge
+    is withdrawn if ANY event retracted a side, and every retracted side is named in
+    ``acknowledge_blocked_by``.
     """
+    is_contradiction = _cascade_node_type(conn, node_id) == "contradiction"
     if affected is None:
         affected = _cascade_affected_premises(conn, node_id)
     blockers = sorted({
@@ -1069,6 +1141,8 @@ def _cascade_eligible_shapes(conn, node_id: str, affected: list = None) -> dict:
     eligible = ["retracted", "superseded"]
     if not blockers:
         eligible.append("acknowledged")
+    if is_contradiction:
+        eligible.append("resolved")
     return {
         "eligible": eligible,
         "acknowledge_blocked_by": blockers,
@@ -1347,6 +1421,116 @@ def _cascade_record_acknowledgement_edges(conn, node_id: str,
     return out
 
 
+def _cascade_record_contradiction_ack_edges(conn, ct_id: str, affected: list,
+                                            now: str) -> tuple:
+    """#4075: the contradiction counterpart of ``_cascade_record_acknowledgement_edges``.
+    Acknowledging a contradiction whose side was SUPERSEDED says the contradiction now holds
+    against that side's replacement, so record it eagerly:
+    ``ct --acknowledged_contradicts--> <live successor of the superseded side>``.
+
+    WHY IT MUST EXIST: the contradiction's only side edge points at the superseded (non-current)
+    node. After an acknowledgement the marker is resolved, so a LATER revision of the replacement
+    would reach nothing: ``_affected_contradiction_ids`` walks side edges of the revised node,
+    and the replacement has none. The new edge is that missing side edge. The original
+    ``contradicts`` edge stays as provenance.
+
+    THE TARGET IS THE LIVE END OF THE CHAIN, never one hop off ``superseded_by``: a side
+    superseded twice has a first successor that is itself non-current, and an edge to it would
+    strand the contradiction exactly as before. The walk is ``_bears_on_replacement_of`` (the
+    mixed supersede / retract-with-replacement chain follower, visited-set guarded and
+    hop-capped), the one chain walker in this module, not a second one.
+
+    Returns ``(edges, unlinked)``. A superseded side whose chain has no live end (the
+    replacement was itself retracted with none), or whose live end is already a side of this
+    contradiction or the contradiction itself, gets no edge and is REPORTED in ``unlinked``
+    rather than skipped silently. No cycle guard is needed or run: the relation is in no
+    acyclicity family (see its EDGE_CLASSIFICATIONS entry).
+    """
+    edges, unlinked, seen = [], [], set()
+    sides = set(_cascade_contradiction_sides(conn, ct_id))
+    for a in affected:
+        if a["resolution_kind"] != "superseded":
+            continue
+        side = a["premise_id"]
+        if side in seen:
+            continue
+        seen.add(side)
+        live = _bears_on_replacement_of(conn, side)
+        if live is None:
+            unlinked.append({
+                "side_id": side,
+                "reason": "the supersede/retract chain from this side has no live end "
+                          "(its replacement was retracted without one), so there is "
+                          "nothing to record the contradiction against",
+            })
+            continue
+        if live == ct_id or live in sides:
+            unlinked.append({
+                "side_id": side,
+                "reason": f"the live successor {live} is already a side of this "
+                          f"contradiction (or the contradiction itself); no edge needed",
+            })
+            continue
+        exists = conn.execute(
+            "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? "
+            "AND relation = 'acknowledged_contradicts'",
+            (ct_id, live),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) "
+                "VALUES (?, ?, 'acknowledged_contradicts', ?)",
+                (ct_id, live, now),
+            )
+        edges.append({"premise_id": side, "replacement_id": live})
+    return edges, unlinked
+
+
+def _cascade_contradiction_resolver_error(conn, ct_id: str, resolver_id: str):
+    """#4075: validate the ``resolving_node_id`` of a ``resolved`` resolution. Returns an
+    error string naming WHY, or None when the resolver is acceptable.
+
+    No auto-pick (#229's pure-wire rule): the caller names the node that settles the
+    contradiction and the server only checks it. Acceptable means claim-bearing, current, not
+    the contradiction itself, and either a CURRENT SIDE of this contradiction (the side that
+    stands) or the LIVE successor / replacement of a revised side. The live end is found by
+    walking the whole chain (``_bears_on_replacement_of``); a node one hop off
+    ``superseded_by`` that is itself non-current is refused, and one that is current but
+    further along the chain is the live end and accepted.
+    """
+    resolver = conn.execute(
+        "SELECT id, type, is_current FROM nodes WHERE id = ?", (resolver_id,)
+    ).fetchone()
+    if not resolver:
+        return f"resolving_node_id '{resolver_id}' not found."
+    if resolver_id == ct_id:
+        return (f"resolving_node_id '{resolver_id}' is the contradiction itself; a "
+                f"contradiction cannot resolve itself.")
+    if not core._is_claim_bearing(resolver["type"]):
+        return (f"resolving_node_id '{resolver_id}' is type '{resolver['type']}', which is not "
+                f"claim-bearing. Name the side that stands or the live replacement of the "
+                f"revised side.")
+    if resolver["is_current"] != 1:
+        live = _bears_on_replacement_of(conn, resolver_id)
+        hint = (f" Its live successor is '{live}'." if live else "")
+        return (f"resolving_node_id '{resolver_id}' is not current (superseded or "
+                f"retracted).{hint}")
+    sides = _cascade_contradiction_sides(conn, ct_id)
+    if resolver_id in sides:
+        return None
+    successors = {}
+    for side in sides:
+        row = conn.execute("SELECT is_current FROM nodes WHERE id = ?", (side,)).fetchone()
+        if row and row["is_current"] != 1:
+            successors[side] = _bears_on_replacement_of(conn, side)
+    if resolver_id in successors.values():
+        return None
+    return (f"resolving_node_id '{resolver_id}' is neither a current side of {ct_id} nor the "
+            f"live successor/replacement of one of its revised sides. Sides: {sides}. Live "
+            f"successors of revised sides: "
+            f"{ {k: v for k, v in sorted(successors.items())} }.")
+
+
 def _cascade_auto_resolve_trivial(conn, node_id: str, now: str) -> list:
     """§4's trivial-resolution rule, applied downstream of a node that has
     just resolved: a child auto-resolves as 'acknowledged' iff its derived
@@ -1488,9 +1672,21 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                           replacement_id: str = "", note: str = "",
                           error_type: str = "other",
                           replacement_absent_because: str = "",
-                          replacement_absent_note: str = "") -> str:
+                          replacement_absent_note: str = "",
+                          resolving_node_id: str = "") -> str:
     """Impl for engram_cascade_resolve — see the @mcp.tool wrapper's
     docstring in server.py for the full contract.
+
+    #4075: ``resolution_kind='resolved'`` is the contradiction-only fourth shape. The caller
+    names the settling node in ``resolving_node_id`` (validated by
+    ``_cascade_contradiction_resolver_error``); the status write is DELEGATED to
+    ``_resolve_impl`` (the `resolves` edge, status from the resolver's confidence,
+    idempotence, summary invalidation), and only then are the contradiction's pending markers
+    stamped ``resolved`` with the resolver as ``resolution_replacement_id``. The delegate opens
+    and commits its own connection, exactly as the retract / supersede delegates do, so the
+    "validation on its own connection" rule below holds unchanged. If the process dies between
+    the delegate's commit and the marker stamp, a retry re-enters here, the delegate answers
+    ``no_op`` (the edge exists) and the stamp completes: no second edge, no lost marker.
 
     Records the agent's adjudication of ONE frontier node: stamps
     ``resolution_kind`` on ALL of that node's pending markers, recomputes
@@ -1548,6 +1744,31 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
     replacement_id = (replacement_id or "").strip()
     replacement_absent_because = (replacement_absent_because or "").strip()
     replacement_absent_note = (replacement_absent_note or "").strip()
+    # #4075: resolving_node_id is the 'resolved' shape's one argument and meaningless for every
+    # other shape (same reasoning as the 'acknowledged' + replacement_id refusal below: a caller
+    # who passes it has a different model of what they are doing than the machine does).
+    resolving_node_id = (str(resolving_node_id) if resolving_node_id else "").strip()
+    if resolution_kind == "resolved":
+        if replacement_id:
+            return json.dumps({
+                "error": "replacement_id does not apply to resolution_kind 'resolved'. "
+                         "Name the node that settles the contradiction in "
+                         "resolving_node_id (a current side, or the live "
+                         "successor/replacement of a revised side).",
+            })
+        if not resolving_node_id:
+            return json.dumps({
+                "error": "resolving_node_id is required when resolution_kind is "
+                         "'resolved'. engram_cascade_resolve is PURE-WIRE — it never "
+                         "picks the resolver for you. Name the claim-bearing, current "
+                         "node that settles the contradiction: the side that stands, or "
+                         "the live successor/replacement of the revised side.",
+            })
+    elif resolving_node_id:
+        return json.dumps({
+            "error": f"resolving_node_id is only meaningful when resolution_kind is "
+                     f"'resolved' (got {resolution_kind!r}).",
+        })
     if resolution_kind == "superseded" and not replacement_id:
         return json.dumps({
             "error": "replacement_id is required when resolution_kind is "
@@ -1594,6 +1815,14 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
             return json.dumps({
                 "error": f"Node '{node_id}' is not current (already superseded "
                          f"or retracted) — there is nothing left to adjudicate.",
+            })
+        if resolution_kind == "resolved" and node["type"] != "contradiction":
+            return json.dumps({
+                "error": f"'resolved' is a contradiction-only resolution shape: it says the "
+                         f"contradiction was settled by one of its sides being revised, and "
+                         f"only a contradiction has sides. '{node_id}' is type "
+                         f"'{node['type']}'; adjudicate it as retracted, superseded or "
+                         f"acknowledged instead.",
             })
 
         pending = core._pending_markers_for_node(conn, node_id)
@@ -1653,15 +1882,34 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
         affected = _cascade_affected_premises(conn, node_id)
         eligibility = _cascade_eligible_shapes(conn, node_id, affected)
         if resolution_kind not in eligibility["eligible"]:
+            if node["type"] == "contradiction":
+                _why = (f"Acknowledge is available iff NO pending event revised a side "
+                        f"by retracting it — a retracted side is a leg removed from the "
+                        f"argument, so 'the contradiction stays the same' is not "
+                        f"available (blocked by: "
+                        f"{eligibility['acknowledge_blocked_by']}).")
+            else:
+                _why = (f"Acknowledge is available iff NO affected direct premise "
+                        f"resolved as retracted — only retract removes a leg from the "
+                        f"argument.")
             return json.dumps({
                 "error": f"'{resolution_kind}' is not an eligible resolution "
-                         f"shape for '{node_id}'. Acknowledge is available iff "
-                         f"NO affected direct premise resolved as retracted — "
-                         f"only retract removes a leg from the argument.",
+                         f"shape for '{node_id}'. {_why}",
                 "eligible": eligibility["eligible"],
                 "acknowledge_blocked_by": eligibility["acknowledge_blocked_by"],
                 "affected_premises": affected,
             })
+
+        if resolution_kind == "resolved":
+            _resolver_err = _cascade_contradiction_resolver_error(
+                conn, node_id, resolving_node_id
+            )
+            if _resolver_err:
+                return json.dumps({
+                    "error": _resolver_err,
+                    "eligible": eligibility["eligible"],
+                    "affected_premises": affected,
+                })
 
         if resolution_kind == "superseded":
             repl = conn.execute(
@@ -1680,14 +1928,22 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
 
     # ---- Phase 2: apply the resolution shape ----------------------------
     delegated = None
+    unlinked_sides = []
     if resolution_kind == "acknowledged":
         conn = core._get_db()
         try:
             now = core._now()
             try:
-                ack_edges = _cascade_record_acknowledgement_edges(
-                    conn, node_id, affected, now
-                )
+                if node_type == "contradiction":
+                    # #4075: a contradiction rests on its sides, not on premises; the
+                    # edge goes to the live successor of each superseded side.
+                    ack_edges, unlinked_sides = _cascade_record_contradiction_ack_edges(
+                        conn, node_id, affected, now
+                    )
+                else:
+                    ack_edges = _cascade_record_acknowledgement_edges(
+                        conn, node_id, affected, now
+                    )
             except _CascadeCycleError as exc:
                 # §12.7: refuse loudly, not partial success — nothing from
                 # this call is committed (no ack edges, no marker
@@ -1768,6 +2024,33 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
             _resolve_own_markers(conn, node_id, "acknowledged", now)
             core._log_edit(conn, "cascade_acknowledged", node_id, node_type,
                            {"cascade_events": resolved_events,
+                            "note": (note or "")[:200]})
+            conn.commit()
+        finally:
+            conn.close()
+    elif resolution_kind == "resolved":
+        ack_edges = []
+        # #4075: the status write is `_resolve_impl`'s (resolves edge, status from the
+        # resolver's confidence, idempotence, summary invalidation) — ONE resolve core, not a
+        # second one. It opens and commits its own connection; the marker stamp follows on a
+        # fresh one. A refusal here changes nothing (it validates before it writes).
+        delegated = json.loads(_resolve_impl(
+            target_id=node_id, resolving_node_id=resolving_node_id,
+        ))
+        if "error" in delegated:
+            return json.dumps({
+                "error": f"resolve core refused this resolution: {delegated['error']}",
+                "phase": "apply",
+                "markers_unchanged": True,
+            })
+        conn = core._get_db()
+        try:
+            now = core._now()
+            _resolve_own_markers(conn, node_id, "resolved", now,
+                                 replacement_id=resolving_node_id)
+            core._log_edit(conn, "cascade_resolved", node_id, node_type,
+                           {"cascade_events": resolved_events,
+                            "resolved_by": resolving_node_id,
                             "note": (note or "")[:200]})
             conn.commit()
         finally:
@@ -1936,11 +2219,18 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
             "transitively — see confidence_recompute."
         ),
     }
+    if unlinked_sides:
+        # #4075: present ONLY when a superseded side got no acknowledged_contradicts edge,
+        # and then it says which and why (absent on the healthy path, like the other
+        # warning keys of this response).
+        response["acknowledgement_unlinked_sides"] = unlinked_sides
+    if resolution_kind == "resolved":
+        response["resolving_node_id"] = resolving_node_id
     if delegated is not None:
-        response["delegated_to"] = (
-            "_supersede_impl" if resolution_kind == "superseded"
-            else "_retract_impl"
-        )
+        response["delegated_to"] = {
+            "superseded": "_supersede_impl",
+            "resolved": "_resolve_impl",
+        }.get(resolution_kind, "_retract_impl")
         response["delegated_result"] = delegated
     return json.dumps(response)
 

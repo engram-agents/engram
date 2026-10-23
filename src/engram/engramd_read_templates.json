@@ -249,13 +249,6 @@
       ]
     },
     {
-      "key": "c4c336fb9802f92e244bed1ab36b75acd83db33fc04a07015a3e9c344893a1d7",
-      "sql": "SELECT DISTINCT e.target_id FROM edges e JOIN nodes ct ON ct.id = e.source_id WHERE e.relation = 'contradicts' AND ct.type = 'contradiction' AND ct.is_current = 1 AND ct.status IN (SELECT value FROM json_each(?))",
-      "sites": [
-        "tools/weakest_load_bearing.py:_contested_ids"
-      ]
-    },
-    {
       "key": "c7ebb686c91c35f89f5bff3b5f1e3b9a746e2568d35a35899fc868a0d8d99223",
       "sql": "SELECT id, claim, logical_chain, metadata FROM nodes WHERE type = 'person' AND is_current = 1",
       "sites": [
@@ -317,6 +310,13 @@
       "sql": "\nSELECT\n    id,\n    COALESCE(\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.anchor_line'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.surfacing_nudge'),\n        claim\n    ) AS nudge,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.match_scope')  AS match_scope,\n    recall_summary,\n    claim\nFROM nodes\nWHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''\n",
       "sites": [
         "hooks/claude/engram-lesson-tripwire-hook.py:load_tripwires"
+      ]
+    },
+    {
+      "key": "df2a043a09fecd8f84e186a0ad064e0f1ce209a75d7731f103dc47458eb405dd",
+      "sql": "SELECT DISTINCT e.target_id FROM edges e JOIN nodes ct ON ct.id = e.source_id WHERE e.relation IN ('contradicts', 'acknowledged_contradicts') AND ct.type = 'contradiction' AND ct.is_current = 1 AND ct.status IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/weakest_load_bearing.py:_contested_ids"
       ]
     },
     {

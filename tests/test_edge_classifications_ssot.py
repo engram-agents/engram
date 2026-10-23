@@ -52,7 +52,12 @@ def test_dag_exempt_matches_pre_refactor_set():
                           # answer's direction is unknown when the edge is
                           # written and the answer may pre-date the question's
                           # filing, so it is exempt from creation-order.
-                          "bears_on"})
+                          "bears_on",
+                          # `acknowledged_contradicts` added (#4075): the
+                          # contradiction counterpart of acknowledged_derives_from;
+                          # the contradiction predates the successor it comes to
+                          # stand against, so it inverts creation order.
+                          "acknowledged_contradicts"})
     # Allow the new constant to add `cites` ONLY if a separate ob/dv
     # cites the design call that allowed it.
     assert DAG_EXEMPT_RELATIONS == expected, (
@@ -107,6 +112,8 @@ def test_no_unclassified_relations_in_schema():
                          # specific abstraction/classification edge.
         "bears_on",     # #3615 — question -> claim: the eventual answer will
                          # count for or against the claim. Non-cascade.
+        "acknowledged_contradicts",  # #4075 — contradiction -> live successor
+                         # of a superseded side. Non-cascade, not in a DAG family.
     }
     assert set(EDGE_CLASSIFICATIONS.keys()) == known_relations, (
         f"Drift between EDGE_CLASSIFICATIONS and known relations: "

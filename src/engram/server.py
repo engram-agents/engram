@@ -2670,7 +2670,7 @@ def engram_cascade_frontier(payload_json: str) -> str:
 # it could silently disarm the cascade on an ordinary revision.
 _CASCADE_RESOLVE_FIELDS = frozenset({
     "node_id", "resolution_kind", "replacement_id", "note", "error_type",
-    "replacement_absent_because", "replacement_absent_note",
+    "replacement_absent_because", "replacement_absent_note", "resolving_node_id",
 })
 
 
@@ -2679,8 +2679,9 @@ _CASCADE_RESOLVE_FIELDS = frozenset({
     capability=(
         "Record your adjudication of ONE cascade-marked node that is on the "
         "frontier: retract it, supersede it with an already-created "
-        "replacement, or acknowledge that the upstream change does not touch "
-        "its claim. Stamps the decision on ALL that node's pending markers, "
+        "replacement, acknowledge that the upstream change does not touch "
+        "its claim, or (contradictions only) mark it resolved by the revision "
+        "of one of its sides. Stamps the decision on ALL that node's pending markers, "
         "recomputes confidence transitively, and auto-resolves any dependent "
         "the decision renders trivial. Never creates a node."
     ),
@@ -2701,11 +2702,27 @@ def engram_cascade_resolve(payload_json: str) -> str:
     the blocking ancestors named — its eligible shapes are a function of how
     ALL its premises resolve, so they are not knowable until they have.
 
-    THE THREE SHAPES (#2013 §4):
+    THE THREE SHAPES (#2013 §4), plus a FOURTH for contradictions only:
       retracted    — the argument is broken.
       superseded   — the claim survives on the remaining premises, and you
                      have ALREADY created the replacement node.
       acknowledged — the upstream delta provably does not touch this claim.
+      resolved     — CONTRADICTIONS ONLY (#4075): the contradiction is
+                     properly settled by one of its sides having been
+                     retracted or superseded. Name the settling node in
+                     `resolving_node_id`. Every other node type refuses it.
+
+    A CONTRADICTION is a special derivation whose two premises contradict
+    each other, so its SIDES are its legs: a retracted side withdraws
+    'acknowledged' (acknowledge_blocked_by names the side); a superseded side
+    keeps all four open and you judge. With several pending events on one
+    contradiction, 'acknowledged' is withdrawn if ANY event retracted a side.
+    'acknowledged' / 'retracted' / 'superseded' never change the
+    contradiction's RESOLUTION status (active / partially_resolved / resolved;
+    a retract still retracts it, as any retract does); only 'resolved' does, through engram_resolve's own
+    core (a `resolves` edge, status `resolved` or `partially_resolved` by the
+    resolver's confidence, idempotent) — the marker records the resolver in
+    `resolution_replacement_id`.
 
     'acknowledged' is available IFF no affected direct premise resolved as
     retracted. Supersede and acknowledge both permit it; only retract forbids
@@ -2730,6 +2747,13 @@ def engram_cascade_resolve(payload_json: str) -> str:
     the repair window, so without the edge nothing would re-read this node if
     the replacement is itself superseded later.
 
+    Acknowledging a CONTRADICTION whose side was superseded writes the same
+    kind of edge, `acknowledged_contradicts`, from the contradiction to the
+    LIVE successor of that side (the supersede / retract chain walked to its
+    live end, never one hop). The original `contradicts` edge stays as
+    provenance; the new edge is what makes a later revision of the successor
+    mark the contradiction again.
+
     THE DERIVATION CASCADE DOES NOT RE-FIRE. No claim-bearing node is marked
     by this resolution, whatever shape you choose, so nothing downstream
     acquires a second marker to adjudicate. If you want a fresh derivation
@@ -2750,14 +2774,22 @@ def engram_cascade_resolve(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             node_id (str, REQUIRED): the frontier node you are adjudicating.
             resolution_kind (str, REQUIRED): one of "retracted",
-                "superseded", "acknowledged".
+                "superseded", "acknowledged", or "resolved" (contradictions
+                only, #4075).
             replacement_id (str): REQUIRED iff resolution_kind is
                 "superseded"; PERMITTED (not required by itself) when
                 resolution_kind is "retracted" — #2613: a retraction reached
                 through the frontier can name a successor when one
                 demonstrably exists, the normal case in a sweep. Refused for
-                "acknowledged". Must already exist — this tool never creates
-                it.
+                "acknowledged" and for "resolved" (use resolving_node_id).
+                Must already exist — this tool never creates it.
+            resolving_node_id (str): REQUIRED iff resolution_kind is
+                "resolved"; refused for every other kind (#4075). The node
+                that settles the contradiction: claim-bearing, current, and
+                either a current side of this contradiction (the side that
+                stands) or the LIVE successor/replacement of a revised side.
+                Anything else is refused with the reason, and a refusal
+                changes nothing. The server never picks it for you.
             replacement_absent_because (str): only meaningful when
                 resolution_kind is "retracted". #2613: a replacement
                 decision is required-always on the retract path — supply
@@ -2784,14 +2816,18 @@ def engram_cascade_resolve(payload_json: str) -> str:
         changed, skipped, passes} — plus convergence_warning if the
         recompute could not settle, which should be unreachable and most
         likely means a CASCADE_RELATIONS cycle), auto_resolved_trivial,
-        acknowledgement_edges, note (a human-readable summary, always
-        present, null when empty),
+        acknowledgement_edges, acknowledgement_unlinked_sides (present only
+        when a superseded side of a contradiction got no
+        `acknowledged_contradicts` edge: its chain has no live end, or the
+        live end is already a side; each entry says which and why),
+        resolving_node_id (only for "resolved"), note (a human-readable
+        summary, always present, null when empty),
         marked_contradictions (contradiction nodes
         this resolution marked for review), contradiction_cascade_event (the
         dedicated event id they were marked under, or null when the node has
         no contradictions), re_cascade (an explanation of what did and
-        did not propagate), and — only when resolution_kind is `superseded`
-        or `retracted` — delegated_to + delegated_result, naming the verb
+        did not propagate), and — only when resolution_kind is `superseded`,
+        `retracted` or `resolved` — delegated_to + delegated_result, naming the verb
         this resolution handed off to and what it returned. The #3625
         bears_on hint keys (`bears_on_hints`, `bears_on_hint_prompt`,
         `bears_on_hint_error`) arrive NESTED under `delegated_result`, never

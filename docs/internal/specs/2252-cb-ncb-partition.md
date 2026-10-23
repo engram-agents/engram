@@ -192,6 +192,7 @@ issue #2357 for that property). For every relation below except
 | `supersedes` | **False** | False | True | False | revision-history: same family as `retracts` (1.0a) |
 | `about` | False | False | False | True | pure relational/aboutness |
 | `contradicts` | False | False | False | False | structural commitment, DAG-exempt |
+| `acknowledged_contradicts` | False | False | False | False | #4075: contradiction→live successor of an acknowledged, superseded side (mirrors `acknowledged_derives_from`'s role, but not cascade-bearing: a contradiction is non-claim-bearing and has no premises); DAG-exempt, written only by `engram_cascade_resolve` |
 | `exemplifies` | False | False | False | True | incident→lesson membership, DAG-exempt |
 | `instantiates` | False | False | False | True | achievement-shaped relevance marker, DAG-exempt |
 | `generalizes` | False | False | False | True | #2753 epic WS1: general→specific abstraction/membership edge — NOT DAG-exempt (`dag_family=abstraction`, real acyclicity within its own family, cycle-guarded at write time; diverges from `temporal_causal` like `acknowledged_derives_from` above) |

@@ -109,7 +109,8 @@ a `CASCADE_RELATIONS` cycle) needs investigating, not resolving.
 # Adjudication: engram_cascade_resolve (the write half)
 
 For each frontier node, `engram_cascade_resolve` records **one of three
-shapes**, per node (not per marker — one judgement stamps every pending
+shapes** (a fourth, `resolved`, exists for contradictions only; see "Pattern D"
+below), per node (not per marker — one judgement stamps every pending
 marker on that node at once, since the frontier packet already showed you all
 of them):
 
@@ -132,13 +133,15 @@ of them):
   confidence. Available IFF no affected direct premise resolved as
   `retracted` — only retract removes a leg from the argument, so only retract
   forbids acknowledging.
+- **`resolved`** — **contradiction nodes only** (#4075). See Pattern D.
 
 ```
-# superseded / acknowledged
+# superseded / acknowledged (and `resolved`, contradiction nodes only: see Pattern D)
 engram_cascade_resolve(payload_json=json.dumps({
     "node_id": "<frontier node>",
-    "resolution_kind": "retracted" | "superseded" | "acknowledged",
+    "resolution_kind": "retracted" | "superseded" | "acknowledged" | "resolved",
     "replacement_id": "<required for superseded>",
+    "resolving_node_id": "<required for resolved, refused for the other kinds>",
     "note": "<your reasoning>",
 }))
 
@@ -299,6 +302,49 @@ example A.
 offered), never on how small the change feels. The agent's judgment enters
 only in example B, choosing between acknowledge and derive-new — in example A
 there is nothing to judge.
+
+# Pattern D — A contradiction whose side was retracted or superseded (#4075)
+
+A contradiction is a special derivation whose two premises contradict each
+other, so its **sides are its legs**. Its marker names the revised side
+(`root_node`, `root_op`), and eligibility follows the same rule as for a
+derivation:
+
+- A side was **retracted** -> `acknowledged` is withdrawn; the refusal's
+  `acknowledge_blocked_by` names the side. Open to you: `retracted`,
+  `superseded`, `resolved`.
+- A side was **superseded** -> all four are open and you judge.
+- Several pending events on one contradiction: `acknowledged` is withdrawn if
+  **any** event retracted a side (every retracted side is named).
+
+What each does to the **contradiction's status** (which stays independent of the
+marker):
+
+- `acknowledged` — "I checked; the revised side does not change the meaning of
+  this contradiction, so it stays the same." The status is **not touched**. If
+  the side was superseded, the machine also writes
+  `ct --acknowledged_contradicts--> <live successor of that side>` (the chain
+  walked to its live end), so a later revision of the successor marks the
+  contradiction again. The original `contradicts` edge stays.
+- `resolved` — "the contradiction is properly settled by this side being
+  retracted or superseded." You **name the settling node** (no auto-pick):
+
+```
+engram_cascade_resolve(payload_json=json.dumps({
+    "node_id": "<the contradiction>",
+    "resolution_kind": "resolved",
+    "resolving_node_id": "<claim-bearing, current: the side that stands, OR the "
+                         "live successor/replacement of the revised side>",
+    "note": "<your reasoning>",
+}))
+```
+
+  The status write is `engram_resolve`'s own core: a `resolves` edge from your
+  node, status `resolved` or `partially_resolved` by that node's confidence. A
+  resolver that is not a current side or the live end of a revised side's chain
+  (one hop off `superseded_by` is not enough), is not current, is not
+  claim-bearing, or is the contradiction itself is refused with the reason and
+  **nothing changes**. Every other node type refuses `resolved`.
 
 # Pattern B — Cornerstone or lesson with support_lost
 

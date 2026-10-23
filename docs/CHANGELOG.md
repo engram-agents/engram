@@ -9,6 +9,30 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+### Added
+
+- **A contradiction can be marked `resolved` through the cascade (#4075, PR
+  #4088).** `engram_cascade_resolve` has a fourth kind, `resolved`, valid on
+  contradiction nodes only. The caller names the settling node with the new
+  `resolving_node_id`: a current side of the contradiction, or the live
+  successor of a revised side. The status write is `engram_resolve`'s own. The
+  other kinds never change a contradiction's status. A retracted side no longer
+  offers `acknowledged`. Acknowledging a superseded side writes a new
+  `acknowledged_contradicts` edge to its live successor, so a later revision of
+  the successor marks the contradiction again. The obsolescence scan no longer
+  reports such a contradiction as ready for resolution, and the compact
+  snapshot lists the successor under `Conflicts`.
+
+### Changed
+
+- **Schema version 10 (#4075, PR #4088).** Migration rung 10 rebuilds
+  `cascade_markers` so its `resolution_kind` check admits `resolved`, keeping
+  every row and the id counter, in one transaction with the usual pre-migration
+  backup. It runs after the NUL write guard (rung 9). Restart a running
+  engramd owner after the upgrade: an older owner keeps serving, but answers
+  the one changed `weakest_load_bearing` read with `unregistered_template`
+  and asks for the restart.
+
 ## [v0.5.4] - 2026-10-21
 
 A patch release. The reason for it is one v0.5.3 feature: agent-decided

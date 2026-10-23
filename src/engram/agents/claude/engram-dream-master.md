@@ -297,7 +297,7 @@ So: `engram_reflect` → `bucket_findings()` → **this sweep** → the bucket w
    pass, and read a packet before you adjudicate from it.
 
 3. For each frontier entry, call
-   `engram_cascade_resolve(node_id, resolution_kind, replacement_id?, replacement_absent_because?, note)`:
+   `engram_cascade_resolve(node_id, resolution_kind, replacement_id?, replacement_absent_because?, resolving_node_id?, note)`:
    - **`retracted`** — a leg of the argument is gone. #2613: a replacement
      decision is required-always — pass EITHER `replacement_id` (a
      demonstrably-existing successor; the normal case in a sweep, since the
@@ -314,6 +314,12 @@ So: `engram_reflect` → `bucket_findings()` → **this sweep** → the bucket w
      never your judgment** — read the packet's `dead_premises` and
      `immediate_cause` and decide. `acknowledged` is the common case and is
      still a decision; do not blanket-acknowledge a frontier.
+   - **`resolved`** — **contradiction nodes only** (#4075): a side was retracted
+     or superseded and the contradiction is thereby settled. Pass
+     `resolving_node_id` (a current side, or the live successor of a revised
+     side); the verb refuses anything else, and refuses `resolved` on every
+     other node type. On a contradiction with a retracted side `acknowledged`
+     is not offered; the other kinds never change the contradiction's status.
 
    Confidence is **always** recomputed, whatever shape you choose, and is
    never typed by you. An acknowledgement also writes an
@@ -477,7 +483,7 @@ Iterate metric bindings in **declaration order** — the canonical order is `[m.
 
 3. **Admitted, available, `repair == "tool:cascade-resolve"`** (`pending_premise_rate`) — **no new scan.** The provenance is a RE-READ of the cascade sweep's own end-state, which you already ran earlier THIS SAME CYCLE (see "# The cascade sweep (mode B)", above — it runs before anything else that writes). `detector`/`population` come straight from this metric's own binding (`scan:cascade-frontier` / `claim_bearing_nodes`):
    - `findings_count` = `total_pending_nodes` from the sweep's FIRST `engram_cascade_frontier({})` call (driver-loop step 1 of the cascade sweep) — the frontier size at the START of tonight's sweep.
-   - `repairs_dispatched` = the count of `engram_cascade_resolve` calls the sweep actually made, across all its passes (acknowledged + superseded + retracted, combined).
+   - `repairs_dispatched` = the count of `engram_cascade_resolve` calls the sweep actually made, across all its passes (acknowledged + superseded + retracted + resolved, combined).
    - `status`: `"carried"` if the sweep did NOT reach a clear frontier (one of the four "Stop loud, never silent" conditions fired, OR the per-night pass cap was hit) — the remaining node IDs already live in the dream record's own "Cascade sweep" section; a bare `status: "carried"` here is enough, do not duplicate the full list into this record. Otherwise `"done"`. `reason: null` in either case (round 2: nothing to explain beyond `status` itself — this branch's own logic is UNCHANGED by round 2's ruling).
 
 4. **Admitted, available, `repair == "tool:resolve"`** (`open_contradiction_rate`) — **no new scan.** The provenance is a RE-READ of the bucket walk's own **resolutions** bucket outcome ("Working order — batch-by-type pass" step 5's FIRST bucket, above), restricted to the CONTRADICTION-type findings within that bucket (`node_id` carrying the `ct_` prefix — the resolutions bucket also carries question/conjecture/prediction resolutions, which are out of scope for this metric's own provenance):
@@ -650,7 +656,7 @@ Format:
   is no graph-wide MARKER count in the tool output**, markers are countable
   only by summing `events` across the frontier entries you actually saw)
 - Passes run: P (suggested cap 12 — a convention, not enforced)
-- Resolved: acknowledged A · superseded S · retracted R  (node IDs per kind)
+- Resolved: acknowledged A · superseded S · retracted R · resolved C (contradictions only)  (node IDs per kind)
 - Auto-resolved trivial children: T (the machine did these; they never surfaced)
 - Contradictions newly marked by a resolution: list ct_ IDs + their event id
 - Identity-layer nodes on the frontier: surfaced, NOT adjudicated (list; also in Flagged-for-user)

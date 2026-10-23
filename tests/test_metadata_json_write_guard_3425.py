@@ -21,7 +21,7 @@ behaviour, not an inferred one):
       metadata NULL, `metadata_quarantine` holds exactly those 3 (raw
       byte-for-byte, node_id correct), valid rows untouched, every other
       column of the invalid nodes unchanged.
-  C6  the rung twice: second run adds 0 rows, version stays 8 (the top rung), no error.
+  C6  the rung twice: second run adds 0 rows, version stays 10 (the top rung), no error.
   C7  fault injection: if the quarantine step raises, user_version stays 6,
       nothing is half-applied, and the next start completes the rung.
   C8  engram_diagnose names the finding `metadata_quarantine` with the table's

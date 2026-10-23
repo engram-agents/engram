@@ -12,7 +12,7 @@ Contract (written before the implementation; every cell is a stated behaviour):
       three statistics states: no `sqlite_stat1` at all, `sqlite_stat1` after ANALYZE, and a
       STALE `sqlite_stat1` (ANALYZE on the empty table, then the rows arrive).
   C2  A store built from scratch and a store migrated up from user_version 7 carry the same
-      index names AND the same index SQL; both end at user_version 8.
+      index names AND the same index SQL; both end at the latest version (10 since #4075).
   C3  Idempotent: setup twice on a v8 store changes nothing and says nothing about migration 8;
       a v7 store that already HAS the index (crash between CREATE INDEX and the version bump)
       migrates to 8 with exactly one index of that name.

@@ -1609,6 +1609,17 @@ VALID_RELATIONS = {
                      # Deliberately backwards in creation time (see its
                      # EDGE_CLASSIFICATIONS entry) — never hand-addable; minted
                      # by the cascade-resolution machinery once #2349 lands.
+    "acknowledged_contradicts",  # #4075: the contradiction counterpart of
+                     # acknowledged_derives_from. When a contradiction's side was
+                     # SUPERSEDED and the agent acknowledges that the contradiction
+                     # still stands, the machine records `ct --acknowledged_contradicts-->
+                     # <live successor of that side>`, so a LATER revision of the
+                     # successor marks the contradiction again (the original
+                     # `contradicts` edge points at a now non-current node and would no
+                     # longer be walked). Written only by engram_cascade_resolve; never
+                     # agent-supplied. Contradictions are non-claim-bearing, so this edge
+                     # is NOT a cascade relation: it is read by the parallel
+                     # contradicts-edge walk (_affected_contradiction_ids), nowhere else.
     "generalizes",  # #2753 epic, WS1: general -> specific abstraction edge
                      # (source is the more general node, target the more
                      # specific one it generalizes). Allowed endpoints:
@@ -1736,6 +1747,22 @@ EDGE_CLASSIFICATIONS = {
         "removable": False,     # cascade-bearing, mirrors derives_from.
         "addable_after_creation": False,
         "provenance": True,
+    },
+    "acknowledged_contradicts": {
+        # #4075: `ct --acknowledged_contradicts--> successor` is written when the
+        # contradiction is acknowledged AFTER one of its sides was superseded; the
+        # contradiction exists BEFORE the successor, so the edge always inverts
+        # creation order: temporal_causal=False, by design (mirrors
+        # acknowledged_derives_from). Unlike that relation it is NOT cascade-bearing
+        # and not in a DAG family: a contradiction is non-claim-bearing and has no
+        # premises, the edge points at a CONTESTED claim rather than a premise, and
+        # `contradicts` (its sibling) is exempt on the same grounds.
+        "cascade": False,
+        "temporal_causal": False,
+        "dag_family": None,
+        "removable": False,     # structural commitment, mirrors contradicts.
+        "addable_after_creation": False,    # minted by engram_cascade_resolve only.
+        "provenance": False,
     },
     "exemplifies": {
         "cascade": False,
@@ -2060,6 +2087,7 @@ EDGE_TIERS: dict[str, str] = {
                                     # supported_by, which it is split out of.
     # relational tier: symmetric / cross-temporal; temporal_causal=False expected
     "contradicts":  "relational",
+    "acknowledged_contradicts": "relational",   # #4075: same stance as contradicts, cross-temporal; temporal_causal=False matches the tier
     "tensions":     "relational",
     "about":        "relational",
     "resolves":     "relational",   # epistemic-stance edge: a resolution closes a question/contradiction (pairs with contradicts), not a realization/membership
@@ -4430,7 +4458,133 @@ def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
 # pre-migration backup, and engramd_owner's start() gate refuses a store whose
 # user_version is below it (read through this module attribute at call time, never
 # copied). Adding a rung means bumping this single line.
-LATEST_SCHEMA_VERSION = 9
+LATEST_SCHEMA_VERSION = 10
+
+
+# Migration rung of #4075 (the fourth cascade resolution kind). A renumber edits THREE places, as for
+# TEXT_NUL_GUARD_RUNG above: this constant, the literal `PRAGMA user_version = N` in the rung, and
+# LATEST_SCHEMA_VERSION; tests/test_cascade_resolved_kind_4075.py ties them together.
+CASCADE_RESOLVED_KIND_RUNG = 10
+
+
+# #4075 (schema v10): the cascade_markers table with its fourth resolution kind. SQLite cannot
+# alter a CHECK, so migration rung 10 renames the old table aside and creates THIS one under the
+# canonical name. It must stay textually in step with the CREATE TABLE IF NOT EXISTS in
+# _init_db's script (a fresh store gets that one, a migrated store gets this one);
+# tests/test_cascade_resolved_kind_4075.py compares the two structurally.
+_CASCADE_MARKERS_V10_DDL = """CREATE TABLE cascade_markers (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id                 TEXT NOT NULL REFERENCES nodes(id),
+    cascade_event           TEXT NOT NULL,
+    root_node               TEXT NOT NULL,
+    root_op                 TEXT NOT NULL CHECK (root_op IN ('retract', 'supersede')),
+    status                  TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved')),
+    resolution_kind         TEXT CHECK (resolution_kind IN ('superseded', 'acknowledged', 'retracted', 'resolved') OR resolution_kind IS NULL),
+    resolution_replacement_id TEXT,
+    created_at              TEXT NOT NULL,
+    resolved_at             TEXT,
+    backfill_provenance     TEXT CHECK (backfill_provenance IN ('recovered', 'migration_time') OR backfill_provenance IS NULL),
+    backfill_anomaly        INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(node_id, cascade_event)
+)"""
+_CASCADE_MARKERS_V10_COLUMNS = (
+    "id", "node_id", "cascade_event", "root_node", "root_op", "status", "resolution_kind",
+    "resolution_replacement_id", "created_at", "resolved_at", "backfill_provenance",
+    "backfill_anomaly",
+)
+_CASCADE_MARKERS_INDEX_NAMES = (
+    "idx_cascade_markers_node", "idx_cascade_markers_node_status", "idx_cascade_markers_event",
+)
+_CASCADE_MARKERS_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_cascade_markers_node ON cascade_markers(node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cascade_markers_node_status ON cascade_markers(node_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_cascade_markers_event ON cascade_markers(cascade_event)",
+)
+
+
+def _rebuild_cascade_markers_for_resolved_kind(conn: sqlite3.Connection, bump_version) -> None:
+    """Migration rung 10 body (#4075; the number is CASCADE_RESOLVED_KIND_RUNG): give `cascade_markers` its fourth resolution kind
+    ('resolved') and bump the schema version, atomically.
+
+    `bump_version` is a zero-argument callable that executes the `PRAGMA user_version = 10`
+    write. The CALLER passes it so the literal stays in `_run_db_one_time_setup`, where
+    test_2181_latest_schema_version_constant_matches_max_rung_target reads every rung's
+    target; it runs INSIDE the rebuild's transaction, so the version only advances with the
+    table.
+
+    A table that already carries the kind (a store the ladder just created, or one this rung
+    already rebuilt) gets only the version bump, so running it twice is a no-op. Otherwise the
+    old table is renamed aside, the v10 table is created under the canonical name, every row is
+    copied (ids and AUTOINCREMENT counter included), the copy is counted against the source,
+    and only then is the old table dropped. One transaction: a fault anywhere rolls the whole
+    rebuild back, leaves user_version at its old value (9 or below), and the rung retries on the next start.
+
+    Refuses (raises sqlite3.DatabaseError, which the caller reports as a FAILED, retryable
+    rung) when the old table has a column this rung does not know: dropping it silently would
+    lose data. `foreign_keys` is switched off around the rebuild, as SQLite's own procedure for
+    table rebuilds prescribes, so a marker whose node row is gone (hand surgery) is carried
+    over as it is rather than failing the copy.
+    """
+    conn.commit()
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='cascade_markers'"
+    ).fetchone()
+    if row is None:
+        raise sqlite3.DatabaseError("cascade_markers table is missing; cannot migrate to v10")
+    if "'retracted', 'resolved')" in " ".join((row[0] or "").split()):
+        bump_version()
+        conn.commit()
+        return
+    old_cols = [r[1] for r in conn.execute("PRAGMA table_info(cascade_markers)").fetchall()]
+    unknown = [c for c in old_cols if c not in _CASCADE_MARKERS_V10_COLUMNS]
+    if unknown:
+        raise sqlite3.DatabaseError(
+            f"cascade_markers has column(s) {unknown} that the v10 rebuild does not carry; "
+            f"refusing to drop data"
+        )
+    cols = ", ".join(c for c in _CASCADE_MARKERS_V10_COLUMNS if c in old_cols)
+    fk_was_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    if fk_was_on:
+        conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for name in _CASCADE_MARKERS_INDEX_NAMES:
+                conn.execute(f"DROP INDEX IF EXISTS {name}")
+            conn.execute("ALTER TABLE cascade_markers RENAME TO cascade_markers_prev")
+            conn.execute(_CASCADE_MARKERS_V10_DDL)
+            conn.execute(
+                f"INSERT INTO cascade_markers ({cols}) SELECT {cols} FROM cascade_markers_prev ORDER BY id"
+            )
+            n_old = conn.execute("SELECT COUNT(*) FROM cascade_markers_prev").fetchone()[0]
+            n_new = conn.execute("SELECT COUNT(*) FROM cascade_markers").fetchone()[0]
+            if n_old != n_new:
+                raise sqlite3.DatabaseError(
+                    f"cascade_markers rebuild copied {n_new} of {n_old} rows; rolled back"
+                )
+            seq = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'cascade_markers_prev'"
+            ).fetchone()
+            if seq is not None:
+                if conn.execute(
+                    "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'cascade_markers'",
+                    (seq[0],),
+                ).rowcount == 0:
+                    conn.execute(
+                        "INSERT INTO sqlite_sequence (name, seq) VALUES ('cascade_markers', ?)",
+                        (seq[0],),
+                    )
+            conn.execute("DROP TABLE cascade_markers_prev")
+            for stmt in _CASCADE_MARKERS_INDEX_SQL:
+                conn.execute(stmt)
+            bump_version()
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        if fk_was_on:
+            conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
@@ -4587,7 +4741,11 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
             root_node               TEXT NOT NULL,
             root_op                 TEXT NOT NULL CHECK (root_op IN ('retract', 'supersede')),
             status                  TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved')),
-            resolution_kind         TEXT CHECK (resolution_kind IN ('superseded', 'acknowledged', 'retracted') OR resolution_kind IS NULL),
+            -- 'resolved' (#4075, schema v10) is valid on CONTRADICTION nodes only: the
+            -- contradiction was settled by a side's revision. The kind set lives in
+            -- engram_revision._CASCADE_RESOLUTION_KINDS; migration rung 10 rebuilds an
+            -- older table to this exact CHECK (SQLite cannot alter one in place).
+            resolution_kind         TEXT CHECK (resolution_kind IN ('superseded', 'acknowledged', 'retracted', 'resolved') OR resolution_kind IS NULL),
             resolution_replacement_id TEXT,
             created_at              TEXT NOT NULL,
             resolved_at             TEXT,
@@ -5978,6 +6136,26 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 f"[_run_db_one_time_setup] migration {TEXT_NUL_GUARD_RUNG} (#3765 NUL write guard) "
                 "FAILED, will retry on next "
                 f"startup: {_migration9_err!r}",
+                file=sys.stderr,
+            )
+
+    # Migration version 10 (#4075; the number is CASCADE_RESOLVED_KIND_RUNG): the fourth cascade resolution kind, 'resolved', valid on
+    # contradiction nodes. cascade_markers.resolution_kind is schema-constrained and SQLite cannot
+    # alter a CHECK, so this rung rebuilds the table preserving every row (see
+    # _rebuild_cascade_markers_for_resolved_kind). On failure the version stays where it was and the rung
+    # retries on the next start; the pre-migration backup gate (_rung_ready) applies as for every
+    # rung. No backfill: existing stores gain the kind from the next resolution on.
+    if _rung_ready(conn, CASCADE_RESOLVED_KIND_RUNG, _pre_migration_backup_ok):
+        try:
+            _rebuild_cascade_markers_for_resolved_kind(
+                conn, lambda: conn.execute("PRAGMA user_version = 10")
+            )
+        except sqlite3.DatabaseError as _migration10_err:
+            conn.rollback()
+            print(
+                f"[_run_db_one_time_setup] migration {CASCADE_RESOLVED_KIND_RUNG} (#4075 cascade_markers "
+                "'resolved' kind) FAILED, will retry on next "
+                f"startup: {_migration10_err!r}",
                 file=sys.stderr,
             )
 
@@ -9210,7 +9388,8 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 lines.append(f"### {n['id']} [{status_tag}]")
                 lines.append(f"Description: {n['claim']}")
                 edges = conn.execute(
-                    "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'contradicts'",
+                    "SELECT target_id FROM edges WHERE source_id = ? "
+                    "AND relation IN ('contradicts', 'acknowledged_contradicts') ORDER BY id",
                     (n["id"],),
                 ).fetchall()
                 for e in edges:
@@ -11392,7 +11571,8 @@ def _open_contradiction_ids(conn: sqlite3.Connection, node_id: str) -> list:
     rows = conn.execute(
         """SELECT DISTINCT ct.id FROM edges e
            JOIN nodes ct ON ct.id = e.source_id
-           WHERE e.target_id = ? AND e.relation = 'contradicts'
+           WHERE e.target_id = ?
+             AND e.relation IN ('contradicts', 'acknowledged_contradicts')
              AND ct.type = 'contradiction' AND ct.is_current = 1
              AND ct.status = 'active'
            ORDER BY ct.id""",
