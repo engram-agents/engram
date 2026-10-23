@@ -74,6 +74,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
+# #4093: each hook load runs the hook's module-level sys.path.insert; the shared window
+# (#4029) puts sys.path and the src/engram modules back after each test.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_DIR = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 DAEMON_PY_PATH = DAEMON_DIR / "engram-surface-daemon.py"

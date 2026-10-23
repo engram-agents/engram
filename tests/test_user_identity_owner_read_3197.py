@@ -48,6 +48,10 @@ _HOOK_PATH = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-user-id
 import engramd_client as ec  # noqa: E402
 import engramd_owner as eo  # noqa: E402
 
+# #4093: each hook load runs the hook's module-level sys.path.insert; the shared window
+# (#4029) puts sys.path and the src/engram modules back after each test.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 FLAG_KEY = "user_identity_reads_via_owner"
 
 
