@@ -1222,7 +1222,20 @@ def _get_timing_conn() -> sqlite3.Connection:
         except Exception:
             pass
 
-    conn = sqlite3.connect(resolved_path, check_same_thread=False)
+    # #4107: NON-CREATING open. A plain sqlite3.connect creates a missing file,
+    # and this runs from the finally-block of every tool call -- including a
+    # first call that just failed because _get_db() refused the absent
+    # knowledge.db. The empty file it left behind then passed the daemon's
+    # missing-file guard, ran the full one-time setup on a 0-node store, and
+    # made bootstrap.py refuse. Only bootstrap creates knowledge.db; here an
+    # absent file raises sqlite3.OperationalError, which _record_tool_timing
+    # swallows (timing for that call is skipped) and nothing is cached, so the
+    # next call retries once the file exists.
+    conn = sqlite3.connect(
+        Path(resolved_path).absolute().as_uri() + "?mode=rw",
+        uri=True,
+        check_same_thread=False,
+    )
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     # #1685 (blueprint H6 follow-up to #1672/#1684): apply the same

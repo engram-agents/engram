@@ -387,7 +387,10 @@ def bump_utility(
         _log(f"bump_utility: owner flag helper failed ({_code(_OWNER_FLAGS_FAILURE)}); using the direct path")
     if engram_restamp is None:
         raise RuntimeError(f"engram_restamp unavailable ({_RESTAMP_IMPORT_ERROR})")
-    conn = sqlite3.connect(db_path, timeout=5.0)
+    # #4107: NON-CREATING open (mode=rw fails with OperationalError when the file is absent). A plain
+    # connect would create an empty knowledge.db on a fresh home that mentions a node id before
+    # bootstrap has run, and bootstrap.py then refuses. The failure is logged by the caller.
+    conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=rw", uri=True, timeout=5.0)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         if restamp:

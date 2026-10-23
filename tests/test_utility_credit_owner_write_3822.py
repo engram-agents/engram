@@ -39,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -209,7 +210,11 @@ class StoreOpenCounter:
 
         def counting(database, *a, **k):
             try:
-                target = os.path.realpath(os.fspath(database))
+                raw = os.fspath(database)
+                if isinstance(raw, str) and raw.startswith("file:"):
+                    # a URI open (e.g. the hook's non-creating mode=rw open, #4107) names the same file
+                    raw = urllib.parse.unquote(urllib.parse.urlsplit(raw).path)
+                target = os.path.realpath(raw)
             except TypeError:
                 target = ""
             if target.startswith(counter.store) and threading.current_thread() is threading.main_thread():
