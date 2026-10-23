@@ -1500,7 +1500,7 @@ def test_r3_the_retryable_set_is_one_constant_not_an_if_chain_at_each_site():
 # round 3, T2: the "copy the store" remedy only for a permission or creation failure
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name", ["EACCES", "EPERM", "EROFS", "ENOENT"])
+@pytest.mark.parametrize("name", ["EACCES", "EPERM", "EROFS"])
 def test_r3_a_permission_or_creation_failure_keeps_the_copy_the_store_remedy(inproc_home, monkeypatch, name):
     _inject_errno(monkeypatch, "mkdir", name)
     text = _tool_refusal(inproc_home)
@@ -1551,6 +1551,234 @@ def test_r3_a_retryable_errno_gets_neither_remedy(inproc_home, monkeypatch):
     _inject_errno(monkeypatch, "mkdir", "ENOSPC")
     text = _tool_refusal(inproc_home)
     assert "transient" in text and "copy the store" not in text and "Fix or remove" not in text, text
+
+
+# ---------------------------------------------------------------------------
+# #4056 (part of #2652): the remedy text follows the real cause. The design seat's contract cells.
+# Exit codes do not change: the owner sends planted, permission and unknown alike to exit 4; a tool is
+# always STORE_MAINT_REFUSED_EXIT (6). Only the TEXT moves.
+# ---------------------------------------------------------------------------
+
+_not_root = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+
+
+def _lock_dir(inproc_home) -> Path:
+    return Path(core.store_maint_lock_path(str(inproc_home / "knowledge.db")))
+
+
+def _unusable_kind(inproc_home):
+    """(kind, errno_code) of the StoreMaintLockUnusable a real acquire raises for this home."""
+    with pytest.raises(core.StoreMaintLockUnusable) as ei:
+        core.acquire_store_maint_lock(str(inproc_home / "knowledge.db"), "t")
+    return ei.value.kind, ei.value.errno_code
+
+
+@_not_root
+@requires_linux_owner
+def test_4056_cell1_an_own_dir_with_mode_0_is_planted_owner_exit_4_and_tool_exit_6_both_say_fix_or_remove(
+    home, ctl, fake_user_home, inproc_home
+):
+    # the owner side, in process, against a real 0000 directory of our own at the lock name
+    lp = _lock_dir(inproc_home)
+    lp.mkdir(mode=0o700)
+    os.chmod(lp, 0)
+    try:
+        assert _unusable_kind(inproc_home) == ("planted", errno.EACCES)
+        code, msg = _owner_refusal(inproc_home)
+        assert code == eo.EXIT_PATH_NOT_REGULAR == 4, (code, msg)
+        assert "Fix or remove" in msg, msg
+        assert "copy" not in msg.lower(), msg
+    finally:
+        os.chmod(lp, 0o700)
+    # the tool side, a real process against its own real 0000 directory
+    db = build_store(home, fake_user_home)
+    tool_lp = _lock_path(home)
+    tool_lp.mkdir(mode=0o700)
+    os.chmod(tool_lp, 0)
+    try:
+        run = run_tool("migrate_person_nodes", home, fake_user_home, ctl, ["--db", str(db)])
+    finally:
+        os.chmod(tool_lp, 0o700)
+    assert run.rc == core.STORE_MAINT_REFUSED_EXIT == 6, (run.rc, run.err)
+    _assert_planted_wording(run.err, tool_lp)
+    assert run.opens == []
+
+
+@_not_root
+def test_4056_cell2_control_an_unwritable_parent_with_the_lock_absent_is_still_permission(inproc_home):
+    os.chmod(inproc_home, 0o555)
+    try:
+        assert not _lock_dir(inproc_home).exists()
+        assert _unusable_kind(inproc_home) == ("permission", errno.EACCES)
+        text = _tool_refusal(inproc_home)
+    finally:
+        os.chmod(inproc_home, 0o700)
+    _assert_unusable_wording(text, _lock_dir(inproc_home))
+    assert "Fix or remove" not in text, text
+
+
+def test_4056_an_own_dir_with_full_owner_rwx_stays_permission_when_the_create_is_refused(inproc_home, monkeypatch):
+    """An own directory with rwx for its owner is not what refused us, so it is not called planted.
+    EACCES is injected at the create step (the instrument) with a real own 0700 directory at the name."""
+    _lock_dir(inproc_home).mkdir(mode=0o700)
+    _inject_errno(monkeypatch, "mkdir", "EACCES")
+    assert _unusable_kind(inproc_home) == ("permission", errno.EACCES)
+
+
+def test_4056_a_symlink_to_an_own_0000_dir_is_seen_as_a_link_by_lstat_so_it_stays_permission(
+    inproc_home, monkeypatch
+):
+    """lstat, never stat: a stat would follow the link to the 0000 directory and call it planted. EACCES is
+    injected at the create step (the instrument); the path is a real symlink to a real own 0000 directory."""
+    target = inproc_home / "elsewhere"
+    target.mkdir(mode=0o700)
+    os.chmod(target, 0)
+    try:
+        _lock_dir(inproc_home).symlink_to(target)
+        _inject_errno(monkeypatch, "mkdir", "EACCES")
+        assert _unusable_kind(inproc_home) == ("permission", errno.EACCES)
+    finally:
+        os.chmod(target, 0o700)
+
+
+def test_4056_an_own_regular_file_with_mode_0600_is_not_a_directory_so_it_stays_permission(
+    inproc_home, monkeypatch
+):
+    """The planted rule needs a DIRECTORY: S_ISDIR is part of it. A real own regular file at the lock name has
+    an owner mode short of rwx (0600), so without the directory test it would be called planted. A real open
+    of a regular file fails with an errno-less 'not a directory' error (already planted by another route), so
+    EACCES is injected at the create step (the instrument), to reach the errno classifier with this path."""
+    lp = _lock_dir(inproc_home)
+    lp.write_bytes(b"x")
+    os.chmod(lp, 0o600)
+    _inject_errno(monkeypatch, "mkdir", "EACCES")
+    assert _unusable_kind(inproc_home) == ("permission", errno.EACCES)
+    text = _tool_refusal(inproc_home)
+    assert "Fix or remove" not in text, text
+    assert "copy the store" in text, text
+
+
+def test_4056_a_failing_lstat_stays_permission(inproc_home, monkeypatch):
+    """The lock path is a real own 0000 directory (planted by the rule), but lstat of it fails: no verdict,
+    so permission."""
+    lp = _lock_dir(inproc_home)
+    lp.mkdir(mode=0o700)
+    os.chmod(lp, 0)
+    real_lstat = os.lstat
+
+    def lstat(path, *a, **k):
+        if str(path).endswith(core.STORE_MAINT_LOCK_SUFFIX):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_lstat(path, *a, **k)
+
+    try:
+        _inject_errno(monkeypatch, "mkdir", "EACCES")
+        monkeypatch.setattr(core.os, "lstat", lstat)
+        assert _unusable_kind(inproc_home) == ("permission", errno.EACCES)
+    finally:
+        os.chmod(lp, 0o700)
+
+
+def test_4056_a_dir_owned_by_another_uid_is_planted(inproc_home, monkeypatch):
+    """A real foreign-owned 0700 directory cannot be made without a second account, so os.lstat is PATCHED
+    to report a foreign st_uid for the lock path (everything else about the directory is real: own, 0700).
+    This covers the uid branch of the rule, not a real second account."""
+    import types
+
+    _lock_dir(inproc_home).mkdir(mode=0o700)
+    real_lstat = os.lstat
+
+    def lstat(path, *a, **k):
+        st = real_lstat(path, *a, **k)
+        if str(path).endswith(core.STORE_MAINT_LOCK_SUFFIX):
+            return types.SimpleNamespace(st_mode=st.st_mode, st_uid=st.st_uid + 1)
+        return st
+
+    _inject_errno(monkeypatch, "mkdir", "EACCES")
+    monkeypatch.setattr(core.os, "lstat", lstat)
+    assert _unusable_kind(inproc_home) == ("planted", errno.EACCES)
+    assert "Fix or remove that path" in _tool_refusal(inproc_home)
+
+
+@requires_linux_owner
+def test_4056_cell4_enoent_is_unknown_the_errno_is_named_and_no_remedy_is_given(inproc_home, monkeypatch):
+    assert errno.ENOENT not in core.STORE_MAINT_PERMISSION_ERRNOS
+    _inject_errno(monkeypatch, "mkdir", "ENOENT")
+    assert _unusable_kind(inproc_home) == ("unknown", errno.ENOENT)
+    text = _tool_refusal(inproc_home)
+    assert "ENOENT" in text, text
+    for phrase in ("copy the store", "writable directory", "Fix or remove", "transient"):
+        assert phrase not in text, (phrase, text)
+    code, msg = _owner_refusal(inproc_home)
+    assert code == 4 and "ENOENT" in msg, (code, msg)
+    for phrase in ("copy", "Fix", "fix", "start the owner again", "transient"):
+        assert phrase not in msg, (phrase, msg)
+
+
+@requires_linux_owner
+def test_4056_cell5_the_owners_permission_text_says_make_it_writable_and_has_no_copy_instruction(
+    inproc_home, monkeypatch
+):
+    _inject_errno(monkeypatch, "mkdir", "EACCES")
+    code, msg = _owner_refusal(inproc_home)
+    assert code == 4, (code, msg)
+    assert "EACCES" in msg and "writable" in msg and "start the owner again" in msg, msg
+    for phrase in ("copy", "-wal", "-shm", "Fix or remove"):
+        assert phrase not in msg, (phrase, msg)
+
+
+@requires_linux_owner
+@pytest.mark.parametrize("name", ["EACCES", "EPERM", "EROFS"])
+def test_4056_r2_the_owners_permission_remedy_is_true_for_every_errno_in_the_kind(
+    inproc_home, monkeypatch, name
+):
+    """EROFS (a read-only filesystem) is in the permission kind, and fixing permissions does not fix it, so the
+    remedy names writability, and never the copy remedy."""
+    _inject_errno(monkeypatch, "mkdir", name)
+    code, msg = _owner_refusal(inproc_home)
+    assert code == 4 and name in msg, (code, msg)
+    assert msg.endswith("Make that directory (or the directory that holds it) writable by this account, "
+                        "then start the owner again."), msg
+    for phrase in ("copy", "-wal", "-shm", "Fix or remove", "permissions"):
+        assert phrase not in msg, (phrase, msg)
+
+
+@requires_linux_owner
+@pytest.mark.parametrize("how", ["planted", "permission", "unknown", "retryable"])
+def test_4056_the_cause_sentence_is_one_mapping_shared_by_the_owner_and_the_tools(
+    inproc_home, monkeypatch, how
+):
+    if how == "planted":
+        _plant(inproc_home, monkeypatch, "not-a-directory")
+    else:
+        _inject_errno(monkeypatch, "mkdir", {"permission": "EACCES", "unknown": "EIO", "retryable": "ENOSPC"}[how])
+    cause = core.store_maint_cause_text(how)
+    assert cause and cause.strip() == cause
+    assert cause in core.STORE_MAINT_CAUSE.values()
+    assert cause in _tool_refusal(inproc_home)
+    code, msg = _owner_refusal(inproc_home)
+    assert cause in msg, msg
+    assert code == (6 if how == "retryable" else 4), (code, msg)
+
+
+def test_4056_the_tools_retryable_text_keeps_its_one_sentence_wording(inproc_home, monkeypatch):
+    """Only the cause clause comes from the shared mapping; the rest of the tool's line is today's text."""
+    _inject_errno(monkeypatch, "mkdir", "ENOSPC")
+    text = _tool_refusal(inproc_home)
+    assert "; this tool touched nothing. Retry later: no path needs fixing." in text, text
+
+
+@requires_linux_owner
+def test_4056_the_owners_retryable_text_keeps_its_own_wording(inproc_home, monkeypatch):
+    _inject_errno(monkeypatch, "mkdir", "ENOSPC")
+    code, msg = _owner_refusal(inproc_home)
+    assert code == eo.EXIT_STORE_MAINTENANCE == 6 and "ENOSPC" in msg, (code, msg)
+    assert "nothing was created or bound" in msg and "The supervisor retries with back-off" in msg, msg
+    assert "Fix" not in msg and "copy" not in msg, msg
+    # the join reads as sentences: the cause starts its own sentence, never a capital after a semicolon
+    cause = core.store_maint_cause_text("retryable")
+    assert msg.endswith(f"; nothing was created or bound. {cause}. The supervisor retries with back-off"), msg
+    assert "; This" not in msg, msg
 
 
 # ---------------------------------------------------------------------------

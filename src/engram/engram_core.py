@@ -607,8 +607,11 @@ STORE_MAINT_RETRYABLE_ERRNOS = frozenset({
     errno.EMFILE, errno.ENFILE, errno.ENOSPC, errno.ENOLCK, errno.EAGAIN,
 })
 # A permission or creation failure the operator works around with a writable copy of the store: permission
-# denied, a read-only filesystem, a missing parent directory. (Used for the refusal's remedy only.)
-STORE_MAINT_PERMISSION_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT})
+# denied, a read-only filesystem. (Used for the refusal's remedy only.) ENOENT is NOT here: a missing
+# parent directory means the store the remedy would copy is not there either, so it is "unknown" (the
+# errno is named, no remedy is guessed). EACCES and EPERM are further split by
+# _classify_store_maint_unusable: when the lock path itself is a directory we cannot use, it is "planted".
+STORE_MAINT_PERMISSION_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 
 
 class DbSetupLockError(RuntimeError):
@@ -647,8 +650,9 @@ class StoreMaintLockUnusable(StoreMaintLockError):
     """The maintenance lock directory could not be opened, validated or flocked; the caller refused to
     touch the store without it. `kind` says whether a retry can clear it: "retryable" (an errno in
     STORE_MAINT_RETRYABLE_ERRNOS), or one a retry cannot fix -- "planted" (a symlink, a non-directory, a
-    foreign owner, a mode that cannot be tightened), "permission" (permission denied, read-only
-    filesystem, missing parent) or "unknown" (any other error, failed closed). `errno_code` is the
+    foreign owner, a mode that cannot be tightened, or a directory of ours that refused the open for want
+    of owner rwx), "permission" (permission denied, read-only filesystem) or "unknown" (any other error,
+    a missing parent directory included, failed closed). `errno_code` is the
     OSError's errno when it had one."""
 
     def __init__(self, message, *, kind="unknown", errno_code=None):
@@ -959,12 +963,31 @@ def _read_store_maint_holder(dir_fd: int):
     return (pid, role)
 
 
-def _classify_store_maint_unusable(exc: BaseException):
+def _lock_path_is_unusable_dir(lock_path) -> bool:
+    """True iff `lock_path` exists, is a directory (lstat: a symlink is not one) and either belongs to
+    another uid or lacks full owner rwx. Any failure of lstat itself, an absent path, or an own directory
+    with full owner rwx is False. Reads only; never changes a mode."""
+    import stat as _stat
+
+    if lock_path is None:
+        return False
+    try:
+        st = os.lstat(lock_path)
+    except OSError:
+        return False
+    return _stat.S_ISDIR(st.st_mode) and (
+        st.st_uid != os.geteuid() or (st.st_mode & _stat.S_IRWXU) != _stat.S_IRWXU
+    )
+
+
+def _classify_store_maint_unusable(exc: BaseException, lock_path=None):
     """(kind, errno_code) for the error that made the lock directory unusable. An OSError WITH an errno came
     from the system: a resource limit is retryable, a permission or read-only failure is "permission", any
-    other is "unknown" (fail closed). An OSError WITHOUT an errno is one the primitive raised itself for a
-    path it refuses (symlink, not a directory, foreign owner, mode): "planted". Anything else (a failed
-    fcntl import) is "unknown"."""
+    other (ENOENT included) is "unknown" (fail closed). EACCES and EPERM are "planted" instead when the lock
+    path itself is a directory this account cannot use (_lock_path_is_unusable_dir); a path that is absent
+    (the usual case: the parent is not writable) or cannot be examined stays "permission". An OSError
+    WITHOUT an errno is one the primitive raised itself for a path it refuses (symlink, not a directory,
+    foreign owner, mode): "planted". Anything else (a failed fcntl import) is "unknown"."""
     if not isinstance(exc, OSError):
         return ("unknown", None)
     code = exc.errno
@@ -972,6 +995,8 @@ def _classify_store_maint_unusable(exc: BaseException):
         return ("planted", None)
     if code in STORE_MAINT_RETRYABLE_ERRNOS:
         return ("retryable", code)
+    if code in (errno.EACCES, errno.EPERM) and _lock_path_is_unusable_dir(lock_path):
+        return ("planted", code)
     if code in STORE_MAINT_PERMISSION_ERRNOS:
         return ("permission", code)
     return ("unknown", code)
@@ -979,7 +1004,7 @@ def _classify_store_maint_unusable(exc: BaseException):
 
 def _store_maint_unusable(lock_path: str, exc: BaseException, stage: str) -> "StoreMaintLockUnusable":
     verb = "flock" if stage == "flock" else "use"
-    kind, code = _classify_store_maint_unusable(exc)
+    kind, code = _classify_store_maint_unusable(exc, lock_path)
     named = f" [{errno.errorcode.get(code, code)}]" if code is not None else ""
     return StoreMaintLockUnusable(
         f"cannot {verb} store-maintenance lock directory {lock_path}: {type(exc).__name__}: {exc}{named}; "
@@ -1048,6 +1073,26 @@ def _owner_service_commands(db_path):
     return ("systemctl --user stop " + unit, "systemctl --user start " + unit)
 
 
+# The ONE mapping from an unusable lock directory's kind to the sentence that says what is wrong. The
+# offline tools (store_maint_refusal_text) and the owner (engramd_owner, OwnerStoreLockDirUnusable) both read
+# it through store_maint_cause_text; the REMEDY stays per audience, because the owner serves the live store
+# and must never be told to copy it.
+# Each sentence has no final full stop: a caller closes it, or joins it to a clause of its own with ";".
+STORE_MAINT_CAUSE = {
+    "planted": "The lock path cannot be used as the lock directory: it is a symlink, not a directory, or a "
+               "directory with another owner or without full owner permissions",
+    "permission": "This account cannot create or open the lock directory (permission denied, or a read-only "
+                  "filesystem)",
+    "unknown": "The cause above is not one that is recognised, so no remedy is suggested",
+    "retryable": "This looks transient (a resource limit, not a planted path)",
+}
+
+
+def store_maint_cause_text(kind: str) -> str:
+    """The cause sentence for a StoreMaintLockUnusable `kind` (see STORE_MAINT_CAUSE)."""
+    return STORE_MAINT_CAUSE[kind]
+
+
 def store_maint_refusal_text(exc: "StoreMaintLockError", db_path=None) -> str:
     """The text a refused tool prints: what held the lock, that nothing was touched, and how to proceed.
     When the holder is an owner (or unknown), the platform's command to stop the owner and the one to
@@ -1056,19 +1101,22 @@ def store_maint_refusal_text(exc: "StoreMaintLockError", db_path=None) -> str:
     A lock directory that cannot be used at all (StoreMaintLockUnusable) is a different problem: no
     owner is involved, so the text names the directory and the cause (the exception's own message, which
     names the errno), says nothing was touched, and keys the remedy on the cause: a resource limit
-    (retryable) is transient, retry later; a permission or creation failure (denied, read-only, missing
-    parent) gets a copy of the store (with any -wal and -shm) to run against; a planted path (symlink,
-    non-directory, foreign owner, mode) gets "fix or remove that path"; an unrecognised error gets no
-    guessed remedy. No stop/start owner commands."""
+    (retryable) is transient, retry later; a permission or creation failure (denied, read-only) gets a
+    copy of the store (with any -wal and -shm) to run against; a planted path (symlink, non-directory,
+    foreign owner, mode, an own directory without owner rwx) gets "fix or remove that path"; an
+    unrecognised error (a missing parent directory included) gets no guessed remedy. The sentence that
+    names the cause comes from store_maint_cause_text, which the owner shares. No stop/start owner
+    commands."""
     if isinstance(exc, StoreMaintLockUnusable) and exc.retryable:
         return "\n".join([
             str(exc),
-            "This looks transient (a resource limit, not a planted path); this tool touched nothing. "
+            store_maint_cause_text("retryable") + "; this tool touched nothing. "
             "Retry later: no path needs fixing.",
         ])
     if isinstance(exc, StoreMaintLockUnusable) and exc.kind == "planted":
         return "\n".join([
             str(exc),
+            store_maint_cause_text("planted") + ".",
             "This tool needs a usable lock directory beside the store; it touched nothing.",
             "Fix or remove that path, then run again.",
         ])
@@ -1076,12 +1124,13 @@ def store_maint_refusal_text(exc: "StoreMaintLockError", db_path=None) -> str:
         # Neither remedy is known to apply: name the cause (the message carries the errno) and stop.
         return "\n".join([
             str(exc),
-            "This tool needs a usable lock directory beside the store; it touched nothing. The cause above "
-            "is not one this tool recognises, so no remedy is suggested.",
+            "This tool needs a usable lock directory beside the store; it touched nothing. "
+            + store_maint_cause_text("unknown") + ".",
         ])
     if isinstance(exc, StoreMaintLockUnusable):  # kind "permission": cannot create the lock where it must live
         return "\n".join([
             str(exc),
+            store_maint_cause_text("permission") + ".",
             "This tool needs a writable directory beside the store for its lock; it touched nothing.",
             "To report on a read-only copy, copy the store, with any -wal and -shm files, to a writable "
             "directory and run against the copy.",

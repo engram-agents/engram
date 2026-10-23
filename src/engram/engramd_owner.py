@@ -2677,12 +2677,19 @@ class EngramdOwner:
         except engram_core.StoreMaintLockUnusable as exc:
             if exc.retryable:  # a resource limit (engram_core.STORE_MAINT_RETRYABLE_ERRNOS): a retry can clear it
                 raise OwnerStoreMaintenance(
-                    f"refusing to start: {exc}; this is transient; nothing was created or bound. The "
-                    f"supervisor retries with back-off"
+                    f"refusing to start: {exc}; nothing was created or bound. "
+                    f"{engram_core.store_maint_cause_text(exc.kind)}. The supervisor retries with back-off"
                 ) from exc
+            # The cause sentence is engram_core's one mapping (shared with the offline tools); the remedy is
+            # the owner's own: it serves the live store, so it is never told to copy it.
+            remedy = {
+                "planted": " Fix or remove that path, then start the owner again.",
+                "permission": " Make that directory (or the directory that holds it) writable by this "
+                              "account, then start the owner again.",
+            }.get(exc.kind, "")
             raise OwnerStoreLockDirUnusable(
-                f"refusing to start: {exc}; nothing was created or bound. Fix or remove that path, then start "
-                f"the owner again"
+                f"refusing to start: {exc}; nothing was created or bound. "
+                f"{engram_core.store_maint_cause_text(exc.kind)}.{remedy}"
             ) from exc
         self._maint_lock_fd = fd
 
