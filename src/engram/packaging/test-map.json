@@ -722,6 +722,12 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/install_selfcheck.py",
+      "test_globs": [
+        "tests/test_install_selfcheck.py"
+      ]
+    },
+    {
       "path_prefix_or_glob": "tools/operator-setup-viz.sh",
       "test_globs": [
         "tests/test_engine_phase3.py"

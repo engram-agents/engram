@@ -579,6 +579,99 @@ fi
 # for --skip-build callers too: a venv kept in sync is independent of whether
 # this run rebuilt the plugin tree.
 _ENGRAM_VENV_PY="$HOME/.engram/venv/bin/python"
+
+# #4103: pre-warm the embedding model so the MCP server does not die at its first
+# start (server.py refuses to start with the model uncached). Everything model-
+# related comes from the runtime in the plugin tree just assembled, never from a
+# string here: the model name from engram_core._get_embedding_config (falling back
+# to its DEFAULT_EMBEDDING_MODEL), "already cached" from server._embedding_cache_status
+# (the server's own startup predicate), the download through
+# engram_core._embedder._load_model (same kwargs as the server), and success is
+# reported only if that same predicate is True AFTER the load. HF_HOME and
+# HF_HUB_CACHE pass through untouched; this runs as the installing user, so the
+# cache it fills is the one the server will read. A path-shaped model name is never
+# downloaded. Any failure sets _venv_fail so every exit path exits non-zero.
+# The snippet is a plain stdin heredoc (not $(...)-nested), so the #2979 quote-parity
+# landmine does not apply to it.
+_prewarm_embedding_model() {
+  local _plugin_dir="$MARKETPLACE_ROOT/plugins/engram"
+  local _rc=0
+  ENGRAM_HOME="$ENGRAM_HOME" "$_ENGRAM_VENV_PY" - "$_plugin_dir" "$_ENGRAM_VENV_PY" <<'PY' || _rc=$?
+import os
+import sys
+
+plugin_dir, venv_py = sys.argv[1], sys.argv[2]
+TAG = "[install-local-marketplace] "
+
+
+def say(msg):
+    print(TAG + msg, flush=True)
+
+
+def cache_dir():
+    for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if os.environ.get(var):
+            return os.environ[var]
+    if os.environ.get("HF_HOME"):
+        return os.path.join(os.environ["HF_HOME"], "hub")
+    try:
+        from huggingface_hub import constants
+        return str(constants.HF_HUB_CACHE)
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+
+
+def remedy(model):
+    return (
+        venv_py + " -c "
+        + chr(34) + "from sentence_transformers import SentenceTransformer; "
+        + "SentenceTransformer(" + repr(model) + ")" + chr(34)
+    )
+
+
+sys.path.insert(0, plugin_dir)
+try:
+    import engram_core as core
+    import server
+except Exception as exc:
+    say("ERROR: pre-warm cannot import the runtime from " + plugin_dir + ": "
+        + type(exc).__name__ + ": " + str(exc))
+    say("       The venv may be missing runtime packages; re-run this installer after fixing the pip output above.")
+    sys.exit(3)
+
+model = core._get_embedding_config().get("model", core.DEFAULT_EMBEDDING_MODEL)
+
+if server._embedding_cache_status(model):
+    say("pre-warm: " + model + " already cached under " + cache_dir())
+    sys.exit(0)
+
+if server._looks_like_local_model_path(model):
+    say("ERROR: pre-warm: embedding model path " + model + " does not exist or is not a usable model directory;")
+    say("       a path is never downloaded. Fix embedding.model in config.json (an absolute path with modules.json or config.json).")
+    sys.exit(4)
+
+say("embedding model " + model + " is not cached under " + cache_dir() + "; downloading once")
+core._embedder._load_model(model)
+if core._embedder._model is None:
+    say("ERROR: pre-warm: could not download embedding model " + model + " (cache dir tried: " + cache_dir() + ").")
+    say("       The MCP server will not start until it is cached. With network access, run:")
+    say("         " + remedy(model))
+    sys.exit(5)
+# The loader succeeding is not the server's start-up test: re-ask the server's own predicate.
+if not server._embedding_cache_status(model):
+    say("ERROR: pre-warm: could not download embedding model " + model + " (cache dir tried: " + cache_dir() + ").")
+    say("       The model loaded but is not where the server looks (for example SENTENCE_TRANSFORMERS_HOME is set),")
+    say("       so the MCP server would still refuse to start. Unset it, or fill the server's cache with:")
+    say("         " + remedy(model))
+    sys.exit(5)
+say("pre-warm: " + model + " downloaded to " + cache_dir())
+PY
+  if [[ $_rc -ne 0 ]]; then
+    log "WARN: embedding model pre-warm failed (continuing install; will exit non-zero)"
+    _venv_fail=1
+  fi
+}
+
 if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
   # #2951: these two reads used to swallow ANY parse failure and silently
   # resolve to convenience/not-multi-agent, dropping the dev/forum
@@ -663,8 +756,13 @@ except Exception as e:
     # are already assembled) but flag it so the script exits non-zero at the
     # end — unattended/cron upgrades key on exit code and would otherwise
     # report success over a broken server (Lei, 2026-08-10).
-    "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_runtime_req" \
-      || { log "WARN: venv runtime-requirements install failed (continuing install; will exit non-zero)"; _venv_fail=1; }
+    if "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_runtime_req"; then
+      # Only after the runtime packages are in (#4103): pre-warm the embedding model.
+      _prewarm_embedding_model
+    else
+      log "WARN: venv runtime-requirements install failed (continuing install; will exit non-zero)"
+      _venv_fail=1
+    fi
   fi
   if [[ "$_eff_tier" == "dev" ]]; then
     _dev_req="$REPO_ROOT/requirements/requirements-dev.txt"

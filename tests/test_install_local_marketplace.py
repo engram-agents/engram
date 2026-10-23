@@ -2424,3 +2424,217 @@ def test_venv_block_absent_venv_with_missing_config_is_skipped(tmp_path):
     assert result.returncode == 0
     assert "Provisioning venv at" not in result.stdout
     assert "does not exist yet" not in result.stdout
+
+
+# ── #4103: the tier-aware venv block pre-warms the embedding model ───────────
+#
+# Contract (slice 2 spec, A1-A6). The pre-warm calls the RUNTIME's own load path
+# from the just-assembled plugin tree (engram_core._embedder._load_model; model name
+# from engram_core._get_embedding_config), decides "already cached" with the server's
+# own predicate (server._embedding_cache_status), and never carries a model string of
+# its own. These cells run the real snippet under a real python against a FAKE plugin
+# tree (fake server.py / engram_core.py), so no network and no real model.
+
+_FAKE_SERVER_PY = '''\
+import os
+def _cache_root():
+    return os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+def _embedding_cache_status(model_name):
+    return os.path.exists(os.path.join(_cache_root(), "cached-" + model_name.replace("/", "_")))
+def _looks_like_local_model_path(model_name):
+    return os.path.isabs(model_name) or model_name.count("/") > 1
+'''
+
+_FAKE_CORE_PY = '''\
+import json, os
+DEFAULT_EMBEDDING_MODEL = "fake-default-model"
+def _get_embedding_config():
+    path = os.path.join(os.environ["ENGRAM_HOME"], "config.json")
+    try:
+        with open(path) as f:
+            return json.load(f).get("embedding", {"model": DEFAULT_EMBEDDING_MODEL})
+    except OSError:
+        return {"model": DEFAULT_EMBEDDING_MODEL}
+class _Embedder:
+    def __init__(self):
+        self._model = None
+    def _load_model(self, model_name):
+        with open(os.environ["FAKE_LOAD_LOG"], "a") as f:
+            f.write(model_name + "\\n")
+        if os.environ.get("FAKE_DOWNLOAD_FAIL"):
+            return
+        if os.environ.get("FAKE_LOAD_NOFILL"):
+            # the loader "succeeds" but fills a cache the server's predicate does not read
+            self._model = object()
+            return
+        root = os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        os.makedirs(root, exist_ok=True)
+        open(os.path.join(root, "cached-" + model_name.replace("/", "_")), "w").close()
+        self._model = object()
+_embedder = _Embedder()
+'''
+
+
+def _prewarm_venv(tmp_path, log_file, *, pip_rc=0):
+    """A venv python for the pre-warm cells: pip calls are logged no-ops (exit pip_rc);
+    anything else (the pre-warm snippet) runs under the real interpreter, stdin and all."""
+    venv_bin = _login_home(tmp_path) / ".engram" / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    fake_py = venv_bin / "python"
+    fake_py.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{log_file}"\n'
+        f'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then exit {pip_rc}; fi\n'
+        f'exec "{sys.executable}" "$@"\n'
+    )
+    fake_py.chmod(0o755)
+    return fake_py
+
+
+def _run_prewarm(tmp_path, *, config=None, env_extra=None, pip_rc=0, with_venv=True):
+    """Run the installer (--skip-build) against a fake plugin tree that carries the fake
+    server/core. Returns (CompletedProcess, load_log Path)."""
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    (build_root / "server.py").write_text(_FAKE_SERVER_PY)
+    (build_root / "engram_core.py").write_text(_FAKE_CORE_PY)
+    (tmp_path / "config.json").write_text(
+        json.dumps(config if config is not None else {"install_tier": "convenience"})
+    )
+    calls = tmp_path / "venv-calls.log"
+    load_log = tmp_path / "load.log"
+    if with_venv:
+        _prewarm_venv(tmp_path, calls, pip_rc=pip_rc)
+    extra = {"FAKE_LOAD_LOG": load_log, "HF_HOME": tmp_path / "hf-home"}
+    extra.update(env_extra or {})
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root, **extra),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    return result, load_log
+
+
+def _prewarm_lines(result):
+    return [ln for ln in (result.stdout + result.stderr).splitlines() if "pre-warm:" in ln]
+
+
+def test_prewarm_already_cached_logs_one_line_and_does_not_download(tmp_path):
+    """A2: cached by the server's predicate -> one 'already cached' line, no load call."""
+    hf = tmp_path / "hf-home"
+    hf.mkdir()
+    (hf / "cached-fake-default-model").write_text("")
+
+    result, load_log = _run_prewarm(tmp_path)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    lines = _prewarm_lines(result)
+    assert len(lines) == 1 and "pre-warm: fake-default-model already cached" in lines[0], lines
+    assert str(hf / "hub") in lines[0], lines  # the cache dir the check used is printed
+    assert not load_log.exists(), "a cached model must not be loaded/downloaded again"
+
+
+def test_prewarm_cache_dir_in_the_lines_follows_hf_hub_cache_first(tmp_path):
+    """The printed cache dir uses the precedence HF_HUB_CACHE > HF_HOME/hub."""
+    hub = tmp_path / "explicit-hub"
+    result, _ = _run_prewarm(tmp_path, env_extra={"HF_HUB_CACHE": hub})
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    lines = _prewarm_lines(result)
+    assert len(lines) == 1 and "downloaded to " + str(hub) in lines[0], lines
+    assert str(tmp_path / "hf-home" / "hub") not in lines[0], lines
+
+
+def test_prewarm_downloads_through_the_runtime_load_path_when_not_cached(tmp_path):
+    """A3 success: not cached -> the runtime's _load_model is called with the model name
+    from the runtime's own config reader (A1: the installer carries no model string)."""
+    result, load_log = _run_prewarm(
+        tmp_path, config={"install_tier": "convenience", "embedding": {"model": "org/custom-model"}}
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert load_log.read_text().splitlines() == ["org/custom-model"]
+    lines = _prewarm_lines(result)
+    assert len(lines) == 1 and "pre-warm: org/custom-model" in lines[0], lines
+
+
+def test_prewarm_falls_back_to_the_runtime_default_model_when_config_names_none(tmp_path):
+    """A1: with no embedding.model in config the name is the runtime's DEFAULT, not an installer literal."""
+    result, load_log = _run_prewarm(tmp_path)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert load_log.read_text().splitlines() == ["fake-default-model"]
+
+
+def test_prewarm_failure_exits_nonzero_naming_model_cache_dir_and_remedy(tmp_path):
+    """A3 failure: offline / HF error -> install exits non-zero (via _venv_fail), message
+    names the model, the cache dir it tried, and the exact one-line remedy."""
+    result, _ = _run_prewarm(tmp_path, env_extra={"FAKE_DOWNLOAD_FAIL": "1"})
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "fake-default-model" in out
+    assert str(tmp_path / "hf-home") in out  # the cache dir it tried (HF_HOME honoured)
+    assert "SentenceTransformer('fake-default-model')" in out  # the remedy command
+    assert str(_login_home(tmp_path) / ".engram" / "venv" / "bin" / "python") in out
+    assert "ERROR: venv runtime-requirements provisioning failed" in out  # the _venv_fail trap ran
+
+
+def test_prewarm_fails_when_the_model_loaded_but_the_server_predicate_is_still_false(tmp_path):
+    """The success test is the SERVER's predicate after the load, not the loader's own
+    _model: a load that fills a cache the server does not read (e.g. SENTENCE_TRANSFORMERS_HOME)
+    exits non-zero with the same failure message plus a sentence saying so."""
+    result, load_log = _run_prewarm(tmp_path, env_extra={"FAKE_LOAD_NOFILL": "1"})
+
+    out = result.stdout + result.stderr
+    assert load_log.exists(), "the loader must have been called"
+    assert result.returncode != 0, out
+    assert "downloaded to" not in out, out
+    assert "fake-default-model" in out
+    assert str(tmp_path / "hf-home") in out  # the cache dir tried
+    assert "SentenceTransformer('fake-default-model')" in out  # the remedy
+    assert "loaded but is not where the server looks" in out
+    assert "ERROR: venv runtime-requirements provisioning failed" in out  # the _venv_fail trap ran
+
+
+def test_prewarm_honours_hf_home_and_fills_the_cache_the_server_will_read(tmp_path):
+    """A4: HF_HOME is passed through untouched; the cache it fills is the one the predicate reads."""
+    custom = tmp_path / "shared-hf"
+    result, _ = _run_prewarm(tmp_path, env_extra={"HF_HOME": custom})
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert (custom / "cached-fake-default-model").exists()
+    assert not (_login_home(tmp_path) / ".cache").exists()
+
+
+def test_prewarm_never_downloads_a_local_path_model_that_does_not_exist(tmp_path):
+    """A5: a path-shaped model name is never downloaded; a missing path fails with a message saying so."""
+    missing = str(tmp_path / "no" / "such" / "model-dir")
+    result, load_log = _run_prewarm(
+        tmp_path, config={"install_tier": "convenience", "embedding": {"model": missing}}
+    )
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert missing in out and "does not exist" in out
+    assert not load_log.exists(), "a local path must never reach the download path"
+
+
+def test_prewarm_is_skipped_when_the_venv_is_absent(tmp_path):
+    """A6: no venv -> the block is skipped as before; no pre-warm line, exit 0."""
+    result, load_log = _run_prewarm(tmp_path, with_venv=False)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert _prewarm_lines(result) == []
+    assert not load_log.exists()
+
+
+def test_prewarm_does_not_run_after_a_failed_runtime_pip_install(tmp_path):
+    """The pre-warm runs only AFTER the runtime pip install succeeds."""
+    result, load_log = _run_prewarm(tmp_path, pip_rc=1)
+
+    assert result.returncode != 0
+    assert _prewarm_lines(result) == []
+    assert not load_log.exists()

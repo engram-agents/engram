@@ -498,6 +498,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/install_selfcheck.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/dream_lottery.py",
       "tier": "essential"
     },
