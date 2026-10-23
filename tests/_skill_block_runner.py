@@ -57,6 +57,7 @@ def run_block(script, tmp_path, mode="default"):
     cwd.mkdir()
     env = {k: v for k, v in os.environ.items() if k not in ("ENGRAM_HOME", "CLAUDE_PLUGIN_ROOT")}
     env["HOME"] = str(user_home)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"  # macOS python3 otherwise writes ~/Library/Caches/com.apple.python under the temp HOME
     if mode == "default":
         home = user_home / ".engram"
     else:

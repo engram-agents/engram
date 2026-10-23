@@ -68,15 +68,16 @@ state; absence is a hard start failure that leaves no marker.
 
 Run the whole arming transaction in **one Bash invocation**. Do not split these
 snippets across Codex shell calls: shell variables do not persist between calls.
-Fill the seven inputs first; the canonical cadence is 1800 unless the user
-explicitly named another value.
+Fill the seven inputs first; the canonical cadence is the configured heartbeat cadence
+(`loop.heartbeat_cadence_seconds`, read via `loop_prompt.py --cadence`; team default 900 since
+2026-10-23) unless the user explicitly named another value.
 
 ```bash
 cat > /tmp/arm-codex-loop.sh <<'BASH'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 : "${CURRENT_THREAD:?}" "${END_AT:?}" "${LOOP_KIND:?}" "${TOPIC:?}" "${INSTRUCTIONS:?}" "${STATE:?}"
-CADENCE_SECONDS=${CADENCE_SECONDS:-1800}
+CADENCE_SECONDS=${CADENCE_SECONDS:-$(python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --cadence)}
 root="${ENGRAM_HOME:-$HOME/.engram}/codex-wake/loop-host-state"
 pending="${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json.pending"
 marker="${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json"
@@ -141,7 +142,7 @@ chmod +x /tmp/arm-codex-loop.sh
 
 CURRENT_THREAD='<Active session id>' END_AT='<ISO-8601 UTC bound>' \
 LOOP_KIND='<kind>' TOPIC='<topic>' INSTRUCTIONS='<instructions>' STATE='<state>' \
-CADENCE_SECONDS=1800 /tmp/arm-codex-loop.sh
+CADENCE_SECONDS="$(python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --cadence)" /tmp/arm-codex-loop.sh
 ```
 
 If the user named only a cadence and not an end time, use today's documented
@@ -318,6 +319,10 @@ holds the loop's full state — topic, the per-iteration brief, and the live
 pending-work — not just an "I'm looping" flag:
 
 ```bash
+# Cadence FIRST, into a variable: a failed lookup (older plugin without --cadence, missing tool)
+# must never leave `"cadence_seconds": ,` in the marker -- it falls back to 900, loudly.
+CADENCE_SECONDS="$(python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --cadence </dev/null)" || CADENCE_SECONDS=""
+case "$CADENCE_SECONDS" in ''|*[!0-9]*|0*) echo "loop_prompt.py --cadence failed or printed a non-positive-integer (${CADENCE_SECONDS:-nothing}) -- falling back to 900" >&2; CADENCE_SECONDS=900;; esac
 cat > "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json <<JSON
 {
   "FIRST_ACTION": "THE RE-ARM NOW HAPPENS LAST, NOT FIRST — see Step 2 item 3 (arm-last ritual; if the turn carries a reply the human must see, item 3's reply-carrying split applies: batch the arm with a sibling tool call in one parallel block, reply as the turn's final text, #2098). Do the iteration's actual work first, using this marker's 'state' + 'instructions' fields. At the END of the turn — the FINAL action, after the work is done AND this marker's 'state' field is rewritten to reflect it: read cadence_seconds from this marker and batch ScheduleWakeup at that value with CronList in ONE parallel block (the ONLY documented arm shape; a solo ScheduleWakeup IS the defect, Step 2 item 3c, #4007). For the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. The CronList result is your verify step: confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue.",
@@ -326,7 +331,7 @@ cat > "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json <<JSON
   "topic": "<one-line loop topic>",
   "instructions": "<what to do each iteration — the loop's standing brief>",
   "state": "<live handoff: pending work, in-flight fairies, key node IDs, next step>",
-  "cadence_seconds": 1800,
+  "cadence_seconds": $CADENCE_SECONDS,
   "pacer": "scheduleWakeup",
   "loop_prompt": "<exact text passed to ScheduleWakeup prompt= parameter>"
 }
@@ -357,7 +362,7 @@ JSON
   the marker always reflects where the loop is. This is what a post-compaction
   self (or a teammate) reads to resume.
 - `cadence_seconds` — the loop's **input** cadence: hand-written at the
-  template's `1800` default, and overwritten whenever a cadence is named
+  configured heartbeat cadence (`loop_prompt.py --cadence`), and overwritten whenever a cadence is named
   (Step 2 item 1's cases (a)/(b)). It is the interval the arm obeys. It is
   INPUT, not derived — hand-writing it is correct and expected.
 - `loop_prompt` — the exact text passed to `ScheduleWakeup`'s `prompt` parameter.
@@ -421,17 +426,19 @@ cannot be stale.)*
 
 ## Step 2 — The loop body (per iteration)
 
-1. **Pace with `ScheduleWakeup` at 1800s (30 min) — the canonical default.**
-   (Set 2026-06-12, superseding the earlier 270s floor: the Anthropic
+1. **Pace with `ScheduleWakeup` at the configured heartbeat cadence — the canonical default**
+   (`loop.heartbeat_cadence_seconds` in config.json, read via `loop_prompt.py --cadence`; team
+   default 900 = 15 min since Lei's 2026-10-23 word).
+   (Set 2026-06-12 at 1800s, superseding the earlier 270s floor: the Anthropic
    prompt-cache window is far longer in practice than the old 5-min
    assumption, so a 30-min heartbeat stays cache-warm while cutting wasted
-   wakes.) Responsiveness to a counterpart's inter-agent inbox comes from the
+   wakes. The default became the configurable 900s on 2026-10-23.) Responsiveness to a counterpart's inter-agent inbox comes from the
    Monitor (see `engram-collaborating-loop`), not a tight heartbeat. **Do not
-   deviate from 1800s unless the user explicitly says otherwise.** When the
-   user says "start your engram-loop" (or equivalent), `ScheduleWakeup(1800)`
+   deviate from the configured cadence unless the user explicitly says otherwise.** When the
+   user says "start your engram-loop" (or equivalent), `ScheduleWakeup` at the configured cadence
    is the assumed cadence — no judgment call required, no need to ask.
 
-   Intervals beyond 1800s (up to the 3300s / 55-min relaxed ceiling) are
+   Intervals beyond the configured cadence (up to the 3300s / 55-min relaxed ceiling) are
    appropriate ONLY in these cases:
 
    (a) The user has explicitly named a different cadence for this loop
@@ -452,9 +459,9 @@ cannot be stale.)*
        that signal. **Record it in `cadence_seconds` too (the same write
        as (a)).**
 
-   Self-selecting an interval beyond the 1800s default as an "idle fallback"
+   Self-selecting an interval beyond the configured default as an "idle fallback"
    is a discipline lapse, not a sensible default — even when the queue feels
-   quiet, 1800s is the right floor (counterpart-inbox arrivals are caught by
+   quiet, the configured cadence is the right floor (counterpart-inbox arrivals are caught by
    the Monitor, not the heartbeat).
 
    **Never omit the re-arm.** The heartbeat is the loop's lifeline — at the
@@ -574,7 +581,7 @@ cannot be stale.)*
       free text. Without `--string` the value is JSON: `3300` stores a
       number, `"3300"` a string, so a NUMERIC field such as `cadence_seconds`
       takes no `--string` — a string there is rejected by the re-arm helper,
-      which falls back to the 1800 default. It prints `loop_marker_set: <KEY>
+      which falls back to the configured default. It prints `loop_marker_set: <KEY>
       set` on success and refuses (exit 1, one stderr line) on a missing or
       unparseable marker; it never creates one.
 
@@ -787,7 +794,7 @@ one place when it evolves.
 `engram-deep-research` reference this SSoT (migrated). `engram-school-day`
 keeps its own marker write/remove and a pre-rescope stale-guard — it stores
 school-day-specific cycle/iteration state in the marker (the legitimately-
-specialized part) — but follows the SSoT cadence (the 1800s floor). The
+specialized part) — but follows the SSoT cadence (the configured floor). The
 migration question (#507) is closed; the remaining duplication is the
 school-day-specific marker handling, not a cadence gap.
 

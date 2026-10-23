@@ -33,6 +33,12 @@ with an `-alpha` suffix during the alpha phase.
   the one changed `weakest_load_bearing` read with `unregistered_template`
   and asks for the restart.
 
+- **The heartbeat cadence is a config field, team default 900s (Lei, 2026-10-23).**
+  `loop.heartbeat_cadence_seconds` in `$ENGRAM_HOME/config.json`, resolved by
+  `loop_prompt.py` (`--cadence` prints it; `--rearm-delay` falls back to it when the
+  marker carries no valid `cadence_seconds`). The Claude boot charges and the two loop
+  skills read it instead of a hardcoded 1800 (30 minutes).
+
 ## [v0.5.4] - 2026-10-21
 
 A patch release. The reason for it is one v0.5.3 feature: agent-decided

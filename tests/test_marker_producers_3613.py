@@ -126,7 +126,7 @@ def _school_day_written_marker(tmp_path, mode):
     text = (_SKILLS / "engram-school-day" / "SKILL.md").read_text(encoding="utf-8")
     script = _runner.block_where(
         text,
-        lambda b: b.startswith("printf '%s\\n' '{\"FIRST_ACTION\""),
+        lambda b: "printf '%s\\n' '{\"FIRST_ACTION\"" in b,
         label="school-day SKILL.md",
     )
     r, home = _runner.run_block(script, tmp_path, mode)

@@ -74,6 +74,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -445,12 +446,17 @@ def test_compute_rearm_does_not_read_the_clock():
 # CLI helpers
 # ---------------------------------------------------------------------------
 
+_EMPTY_HOME = tempfile.mkdtemp(prefix="engram-home-3005-")  # no config.json: the unconfigured team default
+
+
 def _run(*args, stdin=None):
+    # Hermetic: the fallback cadence reads $ENGRAM_HOME/config.json, never the seat's real one.
     return subprocess.run(
         [sys.executable, str(LP_PATH), *args],
         capture_output=True,
         text=True,
         input=stdin,
+        env=dict(os.environ, ENGRAM_HOME=_EMPTY_HOME),
     )
 
 
@@ -704,7 +710,7 @@ def test_cli_bad_cadence_is_loud_and_arms_default(
     marker = _write_cadence_marker(tmp_path, json_literal)
     res = _run("--rearm-delay", "--wake-kind", "heartbeat", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
-    assert res.stdout.strip() == "1800", res.stdout           # default armed
+    assert res.stdout.strip() == "900", res.stdout            # team default armed
     assert res.stderr.strip() != "", (
         f"{case_id}: a present-but-invalid cadence was SILENT on stderr"
     )
@@ -729,7 +735,7 @@ def test_cli_absent_cadence_stays_silent(tmp_path):
     _write_marker(marker, {"kind": "heartbeat"})   # no cadence_seconds
     res = _run("--rearm-delay", "--wake-kind", "heartbeat", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
-    assert res.stdout.strip() == "1800"
+    assert res.stdout.strip() == "900"
     assert res.stderr == ""
 
 
@@ -740,7 +746,7 @@ def test_cli_bad_cadence_notice_fires_without_migration_notice(tmp_path):
     marker = _write_cadence_marker(tmp_path, '"3300"')   # no next_due_at
     res = _run("--rearm-delay", "--wake-kind", "other", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
-    assert res.stdout.strip() == "1800"
+    assert res.stdout.strip() == "900"
     assert "loop_prompt: invalid_cadence:" in res.stderr, res.stderr
     assert "loop_prompt: migrated_absent:" not in res.stderr, res.stderr
 
@@ -989,15 +995,15 @@ def test_bool_cadence_is_rejected_not_read_as_one():
         heartbeat = lp.compute_rearm(
             {"cadence_seconds": value}, now=NOW, is_heartbeat=True
         )
-        assert heartbeat.delay_seconds == 1800, (
+        assert heartbeat.delay_seconds == 900, (
             f"cadence_seconds={value!r} (a bool) must fall back to the "
-            f"default 1800, not be read as the int {int(value)}"
+            f"default 900, not be read as the int {int(value)}"
         )
         # And on the migration path the default is armed too.
         migrated = lp.compute_rearm(
             {"cadence_seconds": value}, now=NOW, is_heartbeat=False
         )
-        assert migrated.delay_seconds == 1800, migrated.delay_seconds
+        assert migrated.delay_seconds == 900, migrated.delay_seconds
 
 
 def test_cli_wake_kind_defaults_to_cadence(tmp_path):

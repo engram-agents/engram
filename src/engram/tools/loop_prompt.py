@@ -192,12 +192,18 @@ def is_loop_wake(body: str) -> bool:
 # invent a second shape.
 _TS_FORMAT: str = "%Y-%m-%dT%H:%M:%SZ"
 
-# The floor on any re-arm delay: a due moment already past (or less than a
-# minute away) still gets a real, positive wake rather than a busy loop.
+# The smallest heartbeat cadence the config field may set: a configured
+# `loop.heartbeat_cadence_seconds` below this is rejected with one stderr line and
+# the default is used (see configured_cadence_seconds).
 _MIN_DELAY_SECONDS: int = 60
 
-# Default cadence when the marker carries none.  Canonical loop default.
-DEFAULT_CADENCE_SECONDS: int = 1800
+# The TEAM default heartbeat cadence (15 minutes, Lei 2026-10-23, replacing his
+# 2026-08-21 30-minute default).  Used ONLY when the config field
+# ``loop.heartbeat_cadence_seconds`` (see ``configured_cadence_seconds``) is
+# absent or invalid -- callers wanting "the cadence" ask the resolver, not this.
+DEFAULT_CADENCE_SECONDS: int = 900
+
+CADENCE_CONFIG_FIELD: str = "loop.heartbeat_cadence_seconds"
 
 def default_marker_path() -> str:
     """Default marker path: ``loop-mode.json`` under the ENGRAM home (Step 0 of the engram-loop
@@ -215,6 +221,77 @@ def default_marker_path() -> str:
     from tools import _owner_read
 
     return str(_owner_read.engram_home() / "loop-mode.json")
+
+
+def configured_cadence_seconds() -> int:
+    """The heartbeat cadence from ``loop.heartbeat_cadence_seconds`` in ``$ENGRAM_HOME/config.json``.
+
+    Absent file / ``loop`` / key -> ``DEFAULT_CADENCE_SECONDS``, silently (the
+    legitimate unconfigured state).  A PRESENT-but-invalid value (not a positive
+    int; ``bool`` is not an int here), a non-object ``loop``, or an unreadable /
+    unparseable config.json (RecursionError included) -> the default AND exactly one
+    stderr line naming the field (or the file).  A value under ``_MIN_DELAY_SECONDS`` is
+    invalid too (the field and the minimum are named).  Never raises.  The home comes from the one shared
+    resolver (#3863), resolved at call time like ``default_marker_path``.
+    """
+    pkg_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if pkg_root not in sys.path:
+        sys.path.insert(0, pkg_root)
+    try:
+        from tools import _owner_read
+
+        path = _owner_read.engram_home() / "config.json"
+    except Exception as exc:  # e.g. a relative ENGRAM_HOME: refuse loudly, keep the loop alive
+        sys.stderr.write(
+            f"loop_prompt: invalid_config: cannot locate config.json ({exc}) -- using the "
+            f"default heartbeat cadence {DEFAULT_CADENCE_SECONDS}s.\n"
+        )
+        return DEFAULT_CADENCE_SECONDS
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            config = json.load(fh)
+    except FileNotFoundError:
+        return DEFAULT_CADENCE_SECONDS
+    except (OSError, ValueError, RecursionError) as exc:  # JSONDecodeError, UnicodeDecodeError, absurd nesting
+        sys.stderr.write(
+            f"loop_prompt: invalid_config: cannot read {path} ({type(exc).__name__}) -- using "
+            f"the default heartbeat cadence {DEFAULT_CADENCE_SECONDS}s.\n"
+        )
+        return DEFAULT_CADENCE_SECONDS
+    if not isinstance(config, dict):
+        sys.stderr.write(
+            f"loop_prompt: invalid_config: {path} is not a JSON object -- using the default "
+            f"heartbeat cadence {DEFAULT_CADENCE_SECONDS}s.\n"
+        )
+        return DEFAULT_CADENCE_SECONDS
+    if "loop" not in config:
+        return DEFAULT_CADENCE_SECONDS
+    loop = config["loop"]
+    if not isinstance(loop, dict):
+        sys.stderr.write(
+            f"loop_prompt: invalid_cadence_config: {CADENCE_CONFIG_FIELD}: `loop` is {loop!r} "
+            f"(type {type(loop).__name__}), not an object in {path} -- using the default "
+            f"{DEFAULT_CADENCE_SECONDS}s.\n"
+        )
+        return DEFAULT_CADENCE_SECONDS
+    if "heartbeat_cadence_seconds" not in loop:
+        return DEFAULT_CADENCE_SECONDS
+    value = loop["heartbeat_cadence_seconds"]
+    if not _is_valid_cadence(value):
+        sys.stderr.write(
+            f"loop_prompt: invalid_cadence_config: {CADENCE_CONFIG_FIELD} is {value!r} "
+            f"(type {type(value).__name__}) in {path} -- using the default "
+            f"{DEFAULT_CADENCE_SECONDS}s; set it to a positive integer.\n"
+        )
+        return DEFAULT_CADENCE_SECONDS
+    if value < _MIN_DELAY_SECONDS:
+        sys.stderr.write(
+            f"loop_prompt: invalid_cadence_config: {CADENCE_CONFIG_FIELD} is {value!r} "
+            f"in {path}, below the minimum {_MIN_DELAY_SECONDS}s -- using the default "
+            f"{DEFAULT_CADENCE_SECONDS}s.\n"
+        )
+        return DEFAULT_CADENCE_SECONDS
+    return value
 
 
 @dataclass(frozen=True)
@@ -395,11 +472,19 @@ def _rearm_main(args: argparse.Namespace) -> int:
     # it gets its own loud reason token — distinct from the `next_due_at`
     # reasons below, which describe a different field.
     cadence_notice = _cadence_notice(marker)
+    # Fallback source for a marker with no valid cadence: the configured value
+    # (config field, team default 900).  Resolved only when needed, so a marker
+    # that carries its own cadence never triggers a config read or its loud lines.
+    fallback = (
+        DEFAULT_CADENCE_SECONDS
+        if _is_valid_cadence(marker.get("cadence_seconds") if isinstance(marker, Mapping) else None)
+        else configured_cadence_seconds()
+    )
     if cadence_notice is not None:
         sys.stderr.write(
             f"loop_prompt: invalid_cadence: {cadence_notice} in "
             f"{marker_path} — using the default cadence "
-            f"{DEFAULT_CADENCE_SECONDS}s; set cadence_seconds to a positive "
+            f"{fallback}s; set cadence_seconds to a positive "
             f"integer.\n"
         )
 
@@ -407,6 +492,7 @@ def _rearm_main(args: argparse.Namespace) -> int:
         marker,
         now=datetime.now(timezone.utc),
         is_heartbeat=(args.wake_kind == "heartbeat"),
+        default_cadence=fallback,
     )
 
     # stdout carries the integer and NOTHING else, so `delay=$(...)` composes.
@@ -433,7 +519,8 @@ def _main() -> None:
         default=None,
         help="Loop kind string embedded in the machine-readable meta line (e.g. 'working').",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--rearm-delay",
         dest="rearm_delay",
         action="store_true",
@@ -459,7 +546,17 @@ def _main() -> None:
         help="Loop marker path (default: loop-mode.json in the ENGRAM home, "
              "i.e. $ENGRAM_HOME/loop-mode.json; resolved only on --rearm-delay).",
     )
+    mode.add_argument(
+        "--cadence",
+        action="store_true",
+        help="Print the configured heartbeat cadence in seconds as a bare integer "
+             "(config field loop.heartbeat_cadence_seconds, team default 900).",
+    )
     args = parser.parse_args()
+
+    if args.cadence:
+        sys.stdout.write(f"{configured_cadence_seconds()}\n")
+        sys.exit(0)
 
     if args.rearm_delay:
         sys.exit(_rearm_main(args))
