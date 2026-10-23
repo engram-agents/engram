@@ -275,7 +275,12 @@ Once a PR is merge-ready (next section), **who merges it** depends on what it
 changes: **substrate-concept features → Lei reads the PR first**, unless the PR
 implements a design he already read (Lei, 2026-09-27 — then the team merges
 after a written conformance check); **fixes + non-substrate → the team merges
-after peer review**. This gate is
+after peer review**, and since 2026-10-22 the **project owner presses their own
+converged PR** under the policy's written *Owner merge* gate (Lei, in session: the
+colleague's recorded run on the exact head is the test gate; the owner's scratch
+merge on the current base and the base-SHA assertion stay; CI is the floor, since
+`pr-checks` runs only a fixed set of guard test files on `dev` PRs, never the full
+suite). This gate is
 **engram-alpha-only** — other repos (umwelt, soma) carry their own delegated
 authority. During an explicit Lei-absence day-grant, a settled substrate PR may
 be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
@@ -797,7 +802,9 @@ baton file, shown by `baton show`). That is **necessary, not sufficient**: the C
 above still applies at merge time; `baton merge` itself requires the turn to be at a
 maintainer-role holder (the pool sentinel, or a named agent who is neither the colleague nor
 the author) and does **not** read `phase` at all, so checking the phase (`baton show`) before
-`baton merge` is a rule for whoever sits at the merge seat, not something the tool enforces;
+`baton merge` is a rule for whoever sits at the merge seat, not something the tool enforces
+(an owner pressing their own PR under *Owner merge* cannot run `baton merge` at all, since
+the turn is theirs; they record the press with `baton close PR-N --status merged`);
 and a flip does not move the phase back out of `merge` — a PR the maintainer hands back to
 the author for rework keeps `phase: merge`, so a turn at the author means *not ready*
 whatever the phase says. `turn` stays the whose-move cursor: `baton advance`

@@ -238,20 +238,38 @@ queue he ruled on the same evening was later found unavailable to this repositor
 *Serialization* below). The stance he asked the team
 to carry is the one in the quote: practise, catch the slips, learn from them.
 
+**Amendment (Lei, 2026-10-22 23:23Z–23:31Z, in session with Kepler).** Lei asked whether
+the author-cannot-press rule *"is a little too strict and fights with our owner merge their
+own project rule"*, proposing *"as long as the PR passes our GitHub rule, we allow the owner
+to merge, regardless of whether they are the author or not ... let the GitHub CI be the SSoT
+for merge-readiness. And the local full tests becomes reviewer's gate."* Kepler's answer, which
+Lei confirmed verbatim as *"exactly what I want"*: **yes, the owner presses their own PR**; the
+**colleague's recorded run on the exact head is the test gate**; the press **keeps the base
+assertion and the owner's scratch merge on the current base** (the two steps that caught
+that day's one dev red and every moved-base case); and **GitHub's rules are the mechanical
+floor, not the test truth, because `pr-checks` runs static scrubs and a fixed set of guard
+test files on `dev` PRs, never the full `tests/` suite** (the #1597 cost model; the merge queue that would run the suite is unavailable here, *Serialization*
+below). Making CI the test truth needs the full suite back on `dev` PRs, a billing decision
+of Lei's, not a policy edit. Lei: *"make that change now, don't wait tomorrow morning ... you
+need to update all the surfaces that contains this merge rule, and make sure we don't leave
+contradicting rules behind."* The surfaces changed in the same PR: this section, CLAUDE.md
+§ *PR merge authority* and § *Every PR carries a baton*, and Kepler's own authority table.
+
 **Who.** The **owner of the project the PR belongs to** (the Project Register in the
 Workshop, an in-world surface, not a file in this repo) merges it. Not the colleague
 who approved it, and not a seat that merely holds the baton. **Scope:** owner merge
 applies on every org repo whose merge authority is the team's (engram-alpha under this
 policy, umwelt, local-model-lab, gpu-broker and the rest under the 2026-08-22 grant);
-soma stays Ariadne's as principal approver and merger (*Scope* above). Three groups go
+soma stays Ariadne's as principal approver and merger (*Scope* above). Two groups go
 to the **merge seats** instead (Kepler and Borges on all org repos, with Ariadne on
 umwelt and soma, per *Scope* and *Who presses the button* above):
 
 - a PR with **no project owner**, a **release cut** (a `dev`→`main` release PR or a
   hotfix PR into `main`), and a **reconcile** PR;
-- a PR whose **author is its project owner**: the owner runs the gate below and posts
-  the record, and a merge seat presses the button on that record, so no seat merges its
-  own PR;
+- *(retired 2026-10-22 23:31Z, see the Amendment above)* ~~a PR whose author is its
+  project owner goes to a merge seat for the press~~ — **the owner presses their own PR**
+  once the record below is posted; the hand-off to a seat was clerical once the record
+  existed, and the record is what any seat checks;
 - a seat whose **own user's authority table does not grant merge clicks** (as of
   2026-10-22, Aleph and Clio, whose user has not granted it, so a merge click is a
   destructive action outside this repo's delegation for them): that seat runs the
@@ -279,9 +297,15 @@ seat can run it and any other seat can check that it ran.
    Compare the oid and the two timestamps; never trust `reviewDecision` alone. The
    second check exists because an `update-branch` can re-point an older approval at a
    newer head (see *Merge-seat test rules*, last subsection). Any later commit needs a
-   fresh approval.
+   fresh approval. **The colleague's own test run on that exact head, stated in the
+   approval with its count and platform, is the test gate** (Lei, 2026-10-22 amendment):
+   a bare APPROVE without a run is a read, not a gate, and the owner asks for the run
+   before pressing.
 3. **`pr-checks` green on the EXACT head** (Luria, Aleph): mandatory, because a
-   scratch merge on a Mac cannot see what the Linux runner's SQLite does. Read
+   scratch merge on a Mac cannot see what the Linux runner's SQLite does. It is the
+   **mechanical floor, not the test truth**: on `dev` PRs it runs static scrubs and a
+   fixed set of guard test files, never the full `tests/` suite (#1597), so a PR can be
+   CI-green with a red test in it; items 2 and 4 carry the tests. Read
    `mergeStateStatus` first; `CLEAN` ends it; anything else goes through the
    deduped rollup and the cancelled-same-SHA rule in *Merge-seat test rules* below.
 4. **The seat's own run, on a scratch merge of the base tip plus the head** (rules 1
@@ -314,7 +338,11 @@ seat can run it and any other seat can check that it ran.
 7. **The baton's peer→merge advance stays the readiness signal** (Zephyr): the
    **author** runs `baton advance` once the colleague has approved, the server gates it
    on GitHub's own approval, and the owner merges only from `phase: merge`. The phase
-   keeps its meaning because the gate reads GitHub, not the caller.
+   keeps its meaning because the gate reads GitHub, not the caller. **An owner pressing
+   their own PR closes the baton with `baton close PR-N --status merged` after the
+   read-back**: the `baton merge` verb refuses a turn held by the author (CLAUDE.md
+   § *Every PR carries a baton*), a tool rule written for the seat model; its
+   relaxation is tracked as a tool issue, and `close` is the record either way.
 8. **The merge command pins the head, and the seat pins the base:**
    `--match-head-commit <full 40-char headRefOid>` read from
    `gh pr view --json headRefOid` in the same step, and **in that same step** a
@@ -362,15 +390,16 @@ change.
 *Queue status: NOT AVAILABLE on this repository (Team plan, private), measured 2026-10-22 16:05Z.*
 
 **What the merge seats still do.** Kepler and Borges (Ariadne on umwelt) keep the
-seat for ownerless PRs, release cuts, reconciles, the three groups under *Who* above,
-⛔-list and security PRs, and any merge an owner declines ("I'd rather a second pair
+seat for ownerless PRs, release cuts, reconciles, the seats whose user has not granted
+merge clicks (*Who* above), ⛔-list and security PRs, and any merge an owner declines ("I'd rather a second pair
 of eyes" is always allowed and never a demerit); the commander keeps the day-end
 sample of merge records. The seat is no longer the serial point; the written gate is.
 
 *Origin: Lei's 2026-10-21 23:31Z proposal and 23:53Z–00:02Z rulings, Meeting 18's
 nine additions (2026-10-22 00:23Z, Square), Lei's 2026-10-22 09:59 AM NY question
 and 10:03 AM NY ruling, both in session with Kepler. Drafted by Kepler 2026-10-22;
-reviewer-fairy round 1 folded the same day.*
+reviewer-fairy round 1 folded the same day. Amended 2026-10-22 23:23Z–23:31Z on Lei's in-session
+ruling (owner presses own PR; colleague's exact-head run is the test gate; CI the floor).*
 
 ## ⛔ Lei reads before merge — SUBSTRATE FEATURES
 
