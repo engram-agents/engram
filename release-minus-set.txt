@@ -22,6 +22,7 @@ tools/borges_session_eval.py
 #     carries the src/engram/ source root. Its test file lives under tests/, which
 #     is already excluded wholesale below. ---
 src/engram/tools/s2_clause_sheet.py
+src/engram/tools/s2_score.py
 
 # --- Dev test suite (lives in the private engram-alpha; the public repo is a
 #     user-facing release snapshot). Also avoids publishing leak-detection test
