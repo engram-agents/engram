@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """s2_clause_sheet -- clause-check sheet builder (engram-alpha#4050 S2).
 
-Implements the signed S2 pre-registration (draft 4, issue comment 6385972287;
-sha256 d638538e... of the text between its two rules). The pre-registration is
-the contract: where this file and that text disagree, that text wins. This
-tool only builds the sheets. It changes no write path, no floor, no refusal.
+Implements the S2 pre-registration, draft 5 (issue comment 6387983396; change-log
+entry 14, presentation order). The seed stays pinned to draft 4's value
+(SEED_HEX d638538e, from issue comment 6385972287) so the sample does not move.
+The pre-registration is the contract: where this file and that text disagree,
+that text wins. This tool only builds the sheets. It changes no write path, no
+floor, no refusal.
+
+Presentation order (draft 5): render numbers all items, real and planted, by
+sha256(seed_hex || 'order' || id) ascending (ORDER_SALT = "order"). The
+selection sort key, swaps and the re-split set keep sha256(seed_hex || id).
 
 Subcommands
     select --db PATH --out-dir DIR [--seed-hex HEX8] [--build-commit SHA]
@@ -73,7 +79,12 @@ mask_ids = _s1.mask_ids
 TOOL_VERSION = "2"
 
 # The signed seed: first 8 hex digits of the sha256 of the signed text (draft 4).
+# Draft 5 pins it to this value; it is unchanged.
 SEED_HEX = "d638538e"
+
+# Presentation-order salt (draft 5, change-log entry 14): the five ASCII letters.
+ORDER_SALT = "order"
+ORDER_KEY_DESCRIPTION = "sha256(seed_hex || 'order' || id)"
 
 # Pinned by the pre-registration ("Sample"): not a flag.
 WINDOW_START = "2026-10-10T15:00:00Z"
@@ -162,6 +173,11 @@ def load_scrubber(path: str | None) -> Scrubber:
 def sort_hash(seed_hex: str, ident: str) -> str:
     """sha256(seed_hex || id), hex digest, compared as a string."""
     return hashlib.sha256((seed_hex + ident).encode("utf-8")).hexdigest()
+
+
+def order_hash(seed_hex: str, ident: str) -> str:
+    """Presentation key: sha256(seed_hex || ORDER_SALT || id), hex digest, compared as a string."""
+    return hashlib.sha256((seed_hex + ORDER_SALT + ident).encode("utf-8")).hexdigest()
 
 
 def bin_of(sim: float) -> str:
@@ -298,7 +314,7 @@ def cmd_select(args) -> int:
                           "claim": c["claim"], "quote": c["quote"], "interpretation": c["interpretation"]})
     key = {
         "tool_version": TOOL_VERSION,
-        "preregistration": "engram-alpha#4050 S2 draft 4, issue comment 6385972287",
+        "preregistration": "engram-alpha#4050 S2 draft 5, issue comment 6387983396 (seed pinned to draft 4, issue comment 6385972287)",
         "seed_hex": args.seed_hex,
         "seed": int(args.seed_hex, 16),
         "window": [WINDOW_START, WINDOW_END],
@@ -488,7 +504,7 @@ def cmd_render(args) -> int:
             raise Refusal(f"{p} already exists; refusing to overwrite")
     items = _load_items(out_dir, Path(args.db), splits, planted, key)
     seed_hex = key["seed_hex"]
-    items.sort(key=lambda i: sort_hash(seed_hex, i["id"]))
+    items.sort(key=lambda i: order_hash(seed_hex, i["id"]))  # presentation order, not the selection key
     text1, text2, item_map, masked_total = [_HEADER1], [_HEADER2], {}, 0
     for num, it in enumerate(items, 1):
         body1, masked = _render_item(num, it, pass2=False, scrubber=scrubber)
@@ -496,7 +512,7 @@ def cmd_render(args) -> int:
         text1.append(body1)
         text2.append(body2)
         masked_total += masked
-        entry = {"id": it["id"], "clauses": len(it["clauses"])}
+        entry = {"id": it["id"], "clauses": len(it["clauses"]), "order_hash": order_hash(seed_hex, it["id"])}
         if it["kind"] != "real":
             entry["kind"] = it["kind"]
         item_map[str(num)] = entry
@@ -505,6 +521,8 @@ def cmd_render(args) -> int:
     _create_new(p2_path, s2, 0o666)
     key["scrub"] = scrubber.spec()
     key["render_draft" if args.draft else "render"] = {
+        "order_key": ORDER_KEY_DESCRIPTION,
+        "order_salt": ORDER_SALT,
         "items": item_map,
         "masked_id_tokens": masked_total,
         "planted_included": bool(planted),

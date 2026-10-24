@@ -1,5 +1,5 @@
 """Cells for tools/s2_clause_sheet.py (engram-alpha#4050 S2) -- the clause-check
-sheet builder for the signed S2 pre-registration (draft 4).
+sheet builder for the signed S2 pre-registration (draft 5).
 
 Contract-first: these cells were written before the tool. Every cell builds its
 own small graph on a copy of a REAL schema (created once through the real
@@ -421,11 +421,17 @@ def test_s10e_key_has_roster_sha_and_counts_but_no_names(monkeypatch, tool):
 
 
 # --------------------------------------------------------------------------- S11
-def test_s11_item_order_follows_sort_rule(monkeypatch, tool):
+def _oh(i):
+    """Presentation hash, recomputed here with a literal salt, independent of the tool's helper."""
+    return hashlib.sha256((SEED + "order" + i).encode("utf-8")).hexdigest()
+
+
+# Removed-test: tests/test_s2_clause_sheet_4050.py::test_s11_item_order_follows_sort_rule — renamed to test_s11_item_order_follows_presentation_rule; draft 5 replaced the selection key with the salted presentation key for item order.
+def test_s11_item_order_follows_presentation_rule(monkeypatch, tool):
     db, out = _built(monkeypatch, tool, n=4)
     assert _render(tool, db, out, _splits(out), _planted()) == 0
     ids = [c["node_id"] for c in _claims(out)] + ["zp_9001", "zp_9002", "zp_9003", "zp_9004"]
-    expected = sorted(ids, key=_h)
+    expected = sorted(ids, key=_oh)
     key = _key(out)
     order = [key["render"]["items"][str(n)]["id"] for n in range(1, len(ids) + 1)]
     assert order == expected
@@ -670,3 +676,76 @@ def test_s18b_seed_defaults_to_signed_value(monkeypatch, tool):
     assert tool.main(["select", "--db", str(db), "--out-dir", str(out), "--build-commit", "abc1234"]) == 0
     assert _key(out)["seed_hex"] == "d638538e"
     assert [c["node_id"] for c in _claims(out)] == sorted([r["id"] for r in rows], key=_h)[:10]
+
+
+# --------------------------------------------------------------------------- S19 (draft 5, change-log entry 14)
+# Presentation order: a separately salted key, so planted items do not sit at the end.
+def _order_fixture(monkeypatch, tool):
+    """40 real (10 per bin) + 4 planted whose ids all sort AFTER every real id under the selection key."""
+    sims = (0.1, 0.3, 0.5, 0.7)
+    rows = [dict(id=f"zz_{1 + i:04d}", sim=sims[i // 10]) for i in range(40)]
+    real = [r["id"] for r in rows]
+    top = max(_h(i) for i in real)
+    planted = _planted()
+    for p in planted:
+        k = 0
+        while True:  # deterministic search: first suffix whose selection hash beats every real hash
+            cand = f"planted-{p['kind']}-{k}"
+            if _h(cand) > top:
+                break
+            k += 1
+        p["planted_id"] = cand
+    db = _setup(monkeypatch, tool, rows)
+    out = _out()
+    assert _select(tool, db, out) == 0
+    return db, out, real, planted
+
+
+def test_s19a_planted_not_all_last_and_numbering_is_salted_sort(monkeypatch, tool):
+    db, out, real, planted = _order_fixture(monkeypatch, tool)
+    assert sorted(c["node_id"] for c in _claims(out)) == sorted(real)
+    pids = [p["planted_id"] for p in planted]
+    allids = real + pids
+    # precondition: under the OLD (selection) rule all four planted items would be the last four
+    old = sorted(allids, key=_h)
+    assert set(old[-4:]) == set(pids)
+    assert _render(tool, db, out, _splits(out), planted) == 0
+    items = _key(out)["render"]["items"]
+    order = [items[str(n)]["id"] for n in range(1, 45)]
+    assert order == sorted(allids, key=_oh)
+    assert set(order[-4:]) != set(pids)
+    assert order != old
+
+
+def test_s19b_salted_key_differs_from_selection_key(monkeypatch, tool):
+    db, out, real, planted = _order_fixture(monkeypatch, tool)
+    for i in real + [p["planted_id"] for p in planted]:
+        assert _oh(i) != _h(i)
+
+
+def test_s19c_select_output_unchanged(monkeypatch, tool):
+    sims = (0.1, 0.3, 0.5, 0.7)
+    rows = [dict(id=f"zz_{100 + i:04d}", sim=sims[b]) for b in range(4) for i in range(b * 20, b * 20 + 14)]
+    db = _setup(monkeypatch, tool, rows)
+    out = _out()
+    assert _select(tool, db, out) == 0
+    golden = []  # computed here from the selection rule alone: 10 smallest sha256(seed_hex || id) per bin
+    for b in range(4):
+        ids = [r["id"] for r in rows if r["sim"] == sims[b]]
+        golden += [(i, f"B{b + 1}", _h(i)) for i in sorted(ids, key=_h)[:10]]
+    assert [c["node_id"] for c in _claims(out)] == [g[0] for g in golden]
+    assert [(i["node_id"], i["bin"], i["sort_hash"]) for i in _key(out)["items"]] == golden
+
+
+def test_s19d_key_records_presentation_rule(monkeypatch, tool):
+    db, out, real, planted = _order_fixture(monkeypatch, tool)
+    assert _render(tool, db, out, _splits(out), planted) == 0
+    render = _key(out)["render"]
+    assert render["order_key"] == "sha256(seed_hex || 'order' || id)"
+    assert render["order_salt"] == "order"
+    assert len(render["items"]) == 44
+    for n, entry in render["items"].items():
+        assert entry["order_hash"] == _oh(entry["id"])
+    hashes = [render["items"][str(n)]["order_hash"] for n in range(1, 45)]
+    assert hashes == sorted(hashes)
+    assert tool.ORDER_SALT == "order" and tool.SEED_HEX == SEED
