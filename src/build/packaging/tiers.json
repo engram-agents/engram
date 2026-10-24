@@ -502,6 +502,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/install.sh",
+      "tier": "essential"
+    },
+    {
       "path": "tools/dream_lottery.py",
       "tier": "essential"
     },

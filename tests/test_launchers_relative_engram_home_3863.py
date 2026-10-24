@@ -323,6 +323,7 @@ PROBES = {
     "src/engram/tools/operator-setup-viz.sh": Probe(prep=_mk, evidence=_log, env_proof=True),
     "src/engram/tools/install-local-marketplace.sh": Probe(
         prep=_mk, args=("--skip-build", "--skip-add", "--allow-untagged"), evidence=_log, env_proof=True),
+    "src/engram/tools/install.sh": Probe(prep=_mk, evidence=_log, env_proof=True),
     "src/engram/tools/uninstall-local-marketplace.sh": Probe(
         prep=_mk_marketplace, args=("--dry-run", "--skip-cli"), evidence=_stdout),
     "src/engram/tools/engram-fix-git-backup.sh": Probe(prep=_mk, args=("--dry-run",), evidence=_all),

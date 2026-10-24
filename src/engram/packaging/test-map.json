@@ -728,6 +728,12 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/install.sh",
+      "test_globs": [
+        "tests/test_install_sh_4097.py"
+      ]
+    },
+    {
       "path_prefix_or_glob": "tools/operator-setup-viz.sh",
       "test_globs": [
         "tests/test_engine_phase3.py"
