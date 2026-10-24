@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -61,6 +62,9 @@ import pytest
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+# Absolute path to the script for subprocess-based tests (argparse exit-2 cases).
+COHORT_DISPATCH = os.path.join(PROJECT_ROOT, "tools", "cohort_dispatch.py")
 
 from tools.cohort_dispatch import main as dispatch_main  # noqa: E402
 from tools.cohort_dispatch import _parse_agent_output, _build_initial_prompt, _build_retry_prompt  # noqa: E402
@@ -1649,7 +1653,7 @@ def test_prepare_ids_file_refuses_foreign_owned_file(tmp_path, monkeypatch, caps
 
 
 def test_prepare_expect_total_matching_succeeds():
-    """--expect-total equal to the real (post-dedup) id count -> succeeds,
+    """--fresh-total/--backfill-total matching the real (post-dedup) id count -> succeeds,
     chunks written as normal."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
@@ -1663,7 +1667,8 @@ def test_prepare_expect_total_matching_succeeds():
             "--out", str(out_dir),
             "--chunk-size", "15",
             "--db", str(db_path),
-            "--expect-total", "30",
+            "--fresh-total", "30",
+            "--backfill-total", "0",
         ])
         assert exit_code == 0, f"prepare exited {exit_code}"
 
@@ -1677,8 +1682,8 @@ def test_prepare_expect_total_matching_succeeds():
 
 
 def test_prepare_expect_total_mismatch_fails_and_writes_nothing(capsys):
-    """--expect-total mismatching the real id count -> non-zero exit, error
-    names both numbers, and NO chunk directory or payload/manifest file is
+    """--fresh-total/--backfill-total mismatching the real id count -> non-zero exit,
+    error names both numbers, and NO chunk directory or payload/manifest file is
     created (no-partial-state property)."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
@@ -1692,13 +1697,14 @@ def test_prepare_expect_total_mismatch_fails_and_writes_nothing(capsys):
             "--out", str(out_dir),
             "--chunk-size", "15",
             "--db", str(db_path),
-            "--expect-total", "45",
+            "--fresh-total", "45",
+            "--backfill-total", "0",
         ])
-        assert exit_code != 0, "expect-total mismatch must exit non-zero"
+        assert exit_code != 0, "population-total mismatch must exit non-zero"
 
         # No-partial-state: nothing at all should be written to out_dir.
         assert not out_dir.exists() or not any(out_dir.iterdir()), (
-            f"out_dir must be empty/absent on expect-total mismatch, found: "
+            f"out_dir must be empty/absent on population-total mismatch, found: "
             f"{list(out_dir.iterdir()) if out_dir.exists() else None}"
         )
         assert not (out_dir / "manifest.json").exists()
@@ -1707,7 +1713,7 @@ def test_prepare_expect_total_mismatch_fails_and_writes_nothing(capsys):
         captured = capsys.readouterr()
         result = json.loads(captured.out)
         assert result["passed"] is False
-        assert result["errors"][0]["check"] == "expect_total"
+        assert result["errors"][0]["check"] == "population_total"
         assert result["errors"][0]["received"] == 30
         assert result["errors"][0]["expected"] == 45
         error_text = result["errors"][0]["error"]
@@ -1764,7 +1770,7 @@ def test_prepare_expect_total_hint_appears_only_when_received_is_exactly_100():
     import io
     import contextlib
 
-    def _capture_prepare(node_ids, db_path, out_dir, expect_total):
+    def _capture_prepare(node_ids, db_path, out_dir, fresh_total):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = dispatch_main([
@@ -1772,7 +1778,8 @@ def test_prepare_expect_total_hint_appears_only_when_received_is_exactly_100():
                 "--ids", ",".join(node_ids),
                 "--out", str(out_dir),
                 "--db", str(db_path),
-                "--expect-total", str(expect_total),
+                "--fresh-total", str(fresh_total),
+                "--backfill-total", "0",
             ])
         return code, buf.getvalue()
 
@@ -1815,3 +1822,389 @@ def test_prepare_expect_total_hint_appears_only_when_received_is_exactly_100():
         assert "engram_list" not in out_c, (
             "hint must NOT appear when expected < received, even at 100"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: prepare empty-cohort proven-zero path [closes #3928]
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_empty_cohort_ids_inline_exits_zero():
+    """prepare --ids "" --fresh-total 0 --backfill-total 0 exits 0 (proven-zero path)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        exit_code = _run(["prepare", "--ids", "", "--out", str(out_dir), "--fresh-total", "0", "--backfill-total", "0"])
+        assert exit_code == 0, f"expected exit 0, got {exit_code}"
+
+
+def test_prepare_empty_cohort_ids_file_exits_zero():
+    """prepare --ids-file <empty-file> --fresh-total 0 --backfill-total 0 exits 0."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        empty_file = tmp_dir / "empty_ids.txt"
+        empty_file.write_text("")
+        out_dir = tmp_dir / "out"
+        exit_code = _run([
+            "prepare", "--ids-file", str(empty_file), "--out", str(out_dir), "--fresh-total", "0", "--backfill-total", "0"
+        ])
+        assert exit_code == 0, f"expected exit 0, got {exit_code}"
+
+
+def test_prepare_empty_cohort_stdin_exits_zero():
+    """prepare (stdin empty) --fresh-total 0 --backfill-total 0 exits 0."""
+    import io
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO("")
+        try:
+            # No --ids or --ids-file → reads from stdin
+            exit_code = _run(["prepare", "--out", str(out_dir), "--fresh-total", "0", "--backfill-total", "0"])
+        finally:
+            sys.stdin = old_stdin
+        assert exit_code == 0, f"expected exit 0, got {exit_code}"
+
+
+def test_prepare_empty_cohort_manifest_shape():
+    """Empty-cohort manifest has the exact expected shape."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        exit_code = _run(["prepare", "--ids", "", "--out", str(out_dir), "--fresh-total", "0", "--backfill-total", "0"])
+        assert exit_code == 0
+
+        manifest_path = out_dir / "manifest.json"
+        assert manifest_path.exists(), "manifest.json must be written"
+        manifest = json.loads(manifest_path.read_text())
+
+        assert manifest["empty_cohort"] is True
+        assert manifest["total_nodes"] == 0
+        assert manifest["total_chunks"] == 0
+        assert manifest["chunks"] == []
+        assert manifest["attempt_count"] == 0
+        assert manifest["out_dir"] == str(out_dir)
+
+
+def test_prepare_empty_cohort_stdout_is_json(capsys):
+    """stdout of empty-cohort prepare is valid JSON containing empty_cohort: true."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        exit_code = _run(["prepare", "--ids", "", "--out", str(out_dir), "--fresh-total", "0", "--backfill-total", "0"])
+        assert exit_code == 0
+
+        captured = capsys.readouterr()
+        parsed = json.loads(captured.out)
+        assert parsed["empty_cohort"] is True
+        assert parsed["total_nodes"] == 0
+        assert parsed["chunks"] == []
+
+
+def test_prepare_empty_cohort_stale_artifact_untouched():
+    """A stale final_payload.json in out_dir is not consumed or removed on proven-zero path."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        out_dir.mkdir(parents=True)
+
+        # Plant a stale artifact from a hypothetical prior run.
+        stale = out_dir / "final_payload.json"
+        stale_content = json.dumps({"summaries": [], "stale": True})
+        stale.write_text(stale_content)
+
+        exit_code = _run(["prepare", "--ids", "", "--out", str(out_dir), "--fresh-total", "0", "--backfill-total", "0"])
+        assert exit_code == 0, f"expected exit 0, got {exit_code}"
+
+        # manifest.json written, stale file byte-identical (not consumed).
+        assert (out_dir / "manifest.json").exists()
+        assert stale.read_text() == stale_content, "stale final_payload.json must not be modified"
+
+
+# Tests 7 and 8 confirm unchanged behavior — these should PASS even before the
+# implementation (they guard against regression of pre-existing error paths).
+
+def test_prepare_empty_cohort_no_population_totals_still_errors():
+    """--ids "" without --fresh-total/--backfill-total → exit 1, 'no node IDs' error unchanged."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        exit_code = _run(["prepare", "--ids", "", "--out", str(out_dir)])
+        assert exit_code != 0, "omitting population totals with empty ids must still error"
+
+
+def test_prepare_empty_cohort_nonzero_fresh_total_still_errors():
+    """--ids "" --fresh-total 5 --backfill-total 0 → exit 1, mismatch (received 0, expected 5)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        exit_code = _run(["prepare", "--ids", "", "--out", str(out_dir), "--fresh-total", "5", "--backfill-total", "0"])
+        assert exit_code != 0, "--fresh-total 5 with empty ids must still error (mismatch)"
+
+
+def test_prepare_empty_cohort_nonempty_ids_zero_totals_is_mismatch():
+    """--ids 'ob_0001' --fresh-total 0 --backfill-total 0 → mismatch error (received 1, expected 0)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = ["ob_0001"]
+        db_path = _make_sqlite_db(node_ids, tmp_dir)
+        out_dir = tmp_dir / "out"
+
+        exit_code = _run([
+            "prepare",
+            "--ids", "ob_0001",
+            "--out", str(out_dir),
+            "--db", str(db_path),
+            "--fresh-total", "0",
+            "--backfill-total", "0",
+        ])
+        assert exit_code != 0, "non-empty ids + zero totals must exit non-zero (mismatch)"
+
+
+def test_verify_in_empty_cohort_manifest_exits_zero():
+    """verify-in on a dir containing only the empty-cohort manifest exits 0.
+    The sleep orchestrator skips verify-in on this path, but the behavior must
+    be well-defined for defensive correctness."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        # First produce the empty-cohort manifest via prepare.
+        prep_rc = _run(["prepare", "--ids", "", "--out", str(out_dir), "--fresh-total", "0", "--backfill-total", "0"])
+        assert prep_rc == 0, "prepare must succeed first"
+
+        # verify-in on the empty manifest — 0 chunks, nothing to check.
+        exit_code = _run(["verify-in", "--out", str(out_dir)])
+        assert exit_code == 0, f"verify-in on zero-chunk manifest must exit 0, got {exit_code}"
+
+
+# ---------------------------------------------------------------------------
+# CONTRACT TESTS: --fresh-total / --backfill-total split [r2, closes #3928]
+# Red-first verified before implementation; discriminating mutations run
+# after commit (see handoff).
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_empty_cohort_one_population_missing_exits_two(tmp_path):
+    """Only --fresh-total 0, no --backfill-total: pair gate fires (exit 2)."""
+    out = tmp_path / "cohort"
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "prepare", "--out", str(out),
+         "--ids", "", "--fresh-total", "0"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "requires" in result.stderr
+
+
+def test_prepare_empty_cohort_other_population_missing_exits_two(tmp_path):
+    """Only --backfill-total 0, no --fresh-total: pair gate fires (exit 2)."""
+    out = tmp_path / "cohort"
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "prepare", "--out", str(out),
+         "--ids", "", "--backfill-total", "0"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "requires" in result.stderr
+
+
+def test_prepare_empty_cohort_invalid_total_exits_nonzero(tmp_path):
+    """--fresh-total "" must be refused loudly by argparse (type=int rejects non-integer)."""
+    out = tmp_path / "cohort"
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "prepare", "--out", str(out),
+         "--ids", "", "--fresh-total", "", "--backfill-total", "0"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0  # argparse exits 2; proven-zero must NOT fire
+    assert "empty_cohort" not in result.stdout
+
+
+def test_prepare_expect_total_disagrees_exits_two(tmp_path):
+    """--expect-total disagreeing with fresh + min(backfill, 60) exits 2."""
+    out = tmp_path / "cohort"
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "prepare", "--out", str(out),
+         "--ids", "ob_0001,ob_0002", "--fresh-total", "1", "--backfill-total", "1",
+         "--expect-total", "99"],  # disagrees with 1 + min(1, 60) = 2
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "disagrees" in result.stderr.lower() or "expect-total" in result.stderr.lower()
+
+
+def test_validate_empty_cohort_manifest_exits_zero(tmp_path):
+    """validate on a marked empty-cohort manifest exits 0 (positive proof of completion)."""
+    out = tmp_path / "cohort"
+    out.mkdir()
+    manifest = {
+        "empty_cohort": True,
+        "total_nodes": 0,
+        "total_chunks": 0,
+        "chunk_size": 15,
+        "out_dir": str(out),
+        "attempt_count": 0,
+        "chunks": [],
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest))
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "validate", "--out", str(out)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0
+
+
+def test_validate_unmarked_zero_chunk_manifest_exits_two(tmp_path):
+    """validate on a zero-chunk manifest WITHOUT empty_cohort marker exits 2 (pipeline error)."""
+    out = tmp_path / "cohort"
+    out.mkdir()
+    # Ordinary manifest with zero chunks but no empty_cohort flag
+    manifest = {
+        "total_nodes": 0,
+        "total_chunks": 0,
+        "chunk_size": 15,
+        "out_dir": str(out),
+        "attempt_count": 0,
+        "chunks": [],
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest))
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "validate", "--out", str(out)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: contract gaps addressed in PR #4130 round 3
+# (Gap 1: expect-total on skip path; Gap 2: pair enforcement; Gap 3: validate
+#  marker consistency)
+# Red-first verified before implementation; discriminating mutations run
+# after commit (see handoff).
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_expect_total_disagrees_on_skip_path_exits_two(tmp_path):
+    """--expect-total that disagrees with 0+0=0 must exit 2 even on the skip path."""
+    out_dir = tmp_path / "out"
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "prepare",
+         "--ids", "",
+         "--out", str(out_dir),
+         "--fresh-total", "0",
+         "--backfill-total", "0",
+         "--expect-total", "5",
+         "--db", str(tmp_path / "dummy.db")],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2, (
+        f"--expect-total 5 on proven-zero path should exit 2, not {result.returncode}: {result.stderr}"
+    )
+
+
+def test_prepare_only_fresh_total_exits_two(tmp_path):
+    """--fresh-total without --backfill-total must exit 2."""
+    out_dir = tmp_path / "out"
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "prepare",
+         "--ids", "ob_0001,ob_0002",
+         "--out", str(out_dir),
+         "--fresh-total", "2",
+         "--db", str(tmp_path / "dummy.db")],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2, (
+        f"--fresh-total without --backfill-total should exit 2, not {result.returncode}: {result.stderr}"
+    )
+
+
+def test_prepare_only_backfill_total_exits_two(tmp_path):
+    """--backfill-total without --fresh-total must exit 2."""
+    out_dir = tmp_path / "out"
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "prepare",
+         "--ids", "ob_0001,ob_0002",
+         "--out", str(out_dir),
+         "--backfill-total", "2",
+         "--db", str(tmp_path / "dummy.db")],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2, (
+        f"--backfill-total without --fresh-total should exit 2, not {result.returncode}: {result.stderr}"
+    )
+
+
+def test_prepare_expect_total_without_pair_exits_two(tmp_path):
+    """--expect-total without --fresh-total/--backfill-total must exit 2."""
+    out_dir = tmp_path / "out"
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "prepare",
+         "--ids", "ob_0001,ob_0002",
+         "--out", str(out_dir),
+         "--expect-total", "2",
+         "--db", str(tmp_path / "dummy.db")],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2, (
+        f"--expect-total without pair should exit 2, not {result.returncode}: {result.stderr}"
+    )
+
+
+def test_validate_marker_with_chunk_exits_two(tmp_path):
+    """empty_cohort: true with a non-empty chunks list must exit 2."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    manifest = {
+        "empty_cohort": True,
+        "total_nodes": 1,
+        "total_chunks": 1,
+        "chunks": [{"chunk_index": 0, "node_count": 1, "node_ids": ["ob_0001"],
+                    "chunk_dir": str(out_dir / "chunk-0"),
+                    "payload_path": str(out_dir / "chunk-0" / "payload.json")}],
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest))
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "validate", "--out", str(out_dir)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2, (
+        f"empty_cohort: true with chunks should exit 2, not {result.returncode}: {result.stderr}"
+    )
+
+
+def test_validate_marker_with_nonzero_total_nodes_exits_two(tmp_path):
+    """empty_cohort: true with chunks=[] but total_nodes=3 must exit 2.
+    Pins the total_nodes half of the consistency check independently."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    manifest = {
+        "empty_cohort": True,
+        "total_nodes": 3,
+        "total_chunks": 0,
+        "chunks": [],
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest))
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "validate", "--out", str(out_dir)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2, (
+        f"empty_cohort: true with total_nodes=3 should exit 2, not {result.returncode}: {result.stderr}"
+    )
+
+
+def test_prepare_mismatch_gate_uses_capped_backfill_total(tmp_path):
+    """Cap boundary: backfill_total=120 > 60 with exactly 60 IDs passed must
+    NOT trigger a mismatch — the gate compares against min(backfill, 60), not
+    the raw count. Regression for the R2 spec bug (uncapped formula)."""
+    # 60 backfill IDs — what the skill passes after capping BACKFILL_TOTAL_MATCHED=120
+    node_ids = [f"ob_{str(i).zfill(4)}" for i in range(1, 61)]
+    db_path = _make_sqlite_db(node_ids, tmp_path)
+    out_dir = tmp_path / "out"
+    result = subprocess.run(
+        [sys.executable, COHORT_DISPATCH, "prepare",
+         "--ids", ",".join(node_ids),
+         "--out", str(out_dir),
+         "--fresh-total", "0",
+         "--backfill-total", "120",  # raw matched count; cap produces 60 IDs
+         "--db", str(db_path)],
+        capture_output=True, text=True,
+    )
+    # 0 + min(120, 60) = 60 == len(node_ids) → no false mismatch
+    assert result.returncode == 0, (
+        f"backfill_total=120 with 60 IDs should not trigger mismatch gate "
+        f"(0 + min(120,60)=60): {result.stderr}"
+    )

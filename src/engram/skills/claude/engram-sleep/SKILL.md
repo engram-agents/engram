@@ -705,25 +705,25 @@ which nothing else in this step tells you to compare. Under the old 50-node cap 
 never bind and this was safe to leave unsaid — **removing the cap is what made the default
 dangerous**, which is the kind of dependency a cap change carries invisibly.
 
-**Then hand the expected total to `prepare --expect-total` — do not merely eyeball it.** Reading the
-number back is vigilance and gets skipped; passing it makes the pipeline itself refuse a truncated
-cohort. `prepare` compares it against the resolved id count and, on mismatch, exits non-zero having
-written NOTHING (no chunk dirs, no payloads, no manifest), so there is no half-prepared cohort to
-mistake for a good one. It also names the likely cause when the received count is exactly 100.
+**Pass the raw counts from both `engram_list` calls directly to `prepare --fresh-total` and
+`--backfill-total` — do not merely eyeball them.** The tool compares the two counts against the
+resolved id count and, on mismatch, exits non-zero having written NOTHING (no chunk dirs, no
+payloads, no manifest), so there is no half-prepared cohort to mistake for a good one. It also
+names the likely cause when the received count is exactly 100. The cap (`BACKFILL < 60`) no longer
+lives in the shell — `prepare` receives the raw counts and applies the proven-zero check internally.
 
-⚠ **There are TWO `engram_list` calls feeding ONE cohort, so `--expect-total` is NOT either call's
-`total_matched` on its own.** Compute it:
+⚠ **Pass the RAW `total_matched` values — do not pre-compute a sum or apply the cap in the shell.**
+The previous pattern computed:
 
 ```
 COHORT_TOTAL = fresh_total_matched + min(backfill_total_matched, 60)
 ```
 
-Both wrong readings fail the same way and fail LOUDLY-BUT-FALSELY, which is the dangerous kind —
-a gate that cries wolf nightly gets worked around, and then you have neither the gate nor the
-vigilance it replaced. Passing the fresh call's `total_matched` alone under-counts by the whole
-backfill. Summing both RAW over-counts whenever the real backlog exceeds its 60 cap — which, at the
-backlog sizes measured above, is the normal case and not an edge one. The `min()` is doing the work,
-and it is exact only because the two queries partition on `PREV_SLEEP` rather than overlap.
+and passed `--expect-total "$COHORT_TOTAL"`. If `BACKFILL_TOTAL_MATCHED` was unset or empty,
+bash arithmetic silently produced 0, triggering the proven-zero skip on a case the ruling keeps
+loud. Passing the two raw values separately lets `prepare` enforce "both counts must be explicitly
+provided" — an unset variable produces `--backfill-total ""` which argparse rejects loudly (exit 2,
+`invalid int value: ''`) rather than silently treating as zero.
 
 **The fresh cohort is UNCAPPED — take every matching node since the last sleep, however many there are.**
 Then top up from the older backlog, capped at **60**:
@@ -767,21 +767,22 @@ check), where it can be diffed and re-read:
 
 ```bash
 COHORT_IDS="ob_XXXX,ob_YYYY,..."  # comma-separated list from the step above
-# Truncation gate. NOT either call's total_matched alone — see the formula above.
-# Fill these two in from the two engram_list calls you just made:
+# Truncation gate. Pass the raw total_matched values from each engram_list call.
+# prepare enforces that both are present; an unset variable fails loudly (argparse
+# rejects "" for type=int with exit 2) rather than silently becoming 0.
 FRESH_TOTAL_MATCHED=<total_matched from the FRESH call (created_at >= PREV_SLEEP)>
 BACKFILL_TOTAL_MATCHED=<total_matched from the BACKFILL call (created_at < PREV_SLEEP)>
-COHORT_TOTAL=$(( FRESH_TOTAL_MATCHED + (BACKFILL_TOTAL_MATCHED < 60 ? BACKFILL_TOTAL_MATCHED : 60) ))
 COHORT_DIR="$(pwd)/.claude/agent-scratch/dream-cohort-$(date +%Y-%m-%d)"  # ABSOLUTE — Step 7.5 hands
 # this path to engram_set_recall_summaries, which runs in the MCP server's own
 # long-lived process (a different cwd than this shell); a relative path there
 # would resolve against the wrong directory.
 
 python3 -m tools.cohort_dispatch prepare \
+  --fresh-total "$FRESH_TOTAL_MATCHED" \
+  --backfill-total "$BACKFILL_TOTAL_MATCHED" \
   --ids "$COHORT_IDS" \
   --out "$COHORT_DIR" \
-  --chunk-size 15 \
-  --expect-total "$COHORT_TOTAL"
+  --chunk-size 15
 ```
 
 The store is `${ENGRAM_HOME:-$HOME/.engram}/knowledge.db` (the tool resolves the home itself, one definition shared with the other owner-aware tools); pass `--db` only to read a different file.
@@ -805,6 +806,8 @@ No per-chunk `prompt.md` is written. The dispatcher constructs a short prompt in
 > `cohort_dispatch prepare` also refuses to read an `--ids-file` it does not
 > own (owner-uid check), so a foreign-owned file fails loudly instead of
 > being silently ingested.
+
+**If `prepare` exits 0 with `"empty_cohort": true` in the manifest: skip the remainder of Step 5 and all batch-summary fairies in Step 6b.** There are no nodes to summarize — the cohort is proven empty (the caller passed `--fresh-total 0 --backfill-total 0` as the explicit proof both populations are empty). Set `EMPTY_COHORT=true` (a local variable or note) to propagate the skip through Steps 6b and 7.5. Log `"0 applied (empty cohort — proven-zero; summary stages skipped)"` in the dream record's cohort section. Then continue directly to Step 6a (lottery draw). Do NOT run verify-in; do NOT dispatch batch-summary fairies.
 
 **Run cohort_dispatch verify-in** to pre-flight the cohort before dispatch:
 
@@ -861,7 +864,7 @@ Prompt template for each `{N}` in `types_to_run` (substitute `{N}`, `{CATEGORY_N
 
 Single `Agent`-tool message with all of Step 6b's calls plus the batch-summary-fairies below, each `run_in_background=true`.
 
-**Batch-summary fairies** — one `subagent_type="engram-batch-summary-fairy"` per chunk from the manifest (4 chunks for a 50-node cohort at chunk-size=15; **the count now scales with the cohort and is no longer bounded by a 50-node cap**, so read it off the manifest rather than assuming a small number). **This is the one place uncapping changes FAN-OUT rather than just volume** — the chunk count is the fairy count. It stays bounded because the fresh half is limited by a single day's writing and the backfill half is capped at 60. **Order of magnitude, REASONED FROM two measured points rather than observed across nights** — 2026-09-10 produced ~77 nodes and a 53-node fresh cohort, so a heavy night plus a full backfill is roughly 140 nodes ≈ 10 chunks. **Numeric trip-wire, so the trigger is not your in-the-moment comfort: if `prepare` returns MORE THAN 12 CHUNKS (>180 nodes), stop and raise it with Lei before dispatching.** Do not silently trim the cohort to get under it — trimming is the failure this uncapping exists to remove, and a genuine >12-chunk night is information about the backlog, not a dispatch problem to be hidden. For each chunk, construct a short dispatch prompt inline using the paths from the manifest. Example:
+**Batch-summary fairies** — one `subagent_type="engram-batch-summary-fairy"` per chunk from the manifest (4 chunks for a 50-node cohort at chunk-size=15; **the count now scales with the cohort and is no longer bounded by a 50-node cap**, so read it off the manifest rather than assuming a small number). **This is the one place uncapping changes FAN-OUT rather than just volume** — the chunk count is the fairy count. It stays bounded because the fresh half is limited by a single day's writing and the backfill half is capped at 60. **Order of magnitude, REASONED FROM two measured points rather than observed across nights** — 2026-09-10 produced ~77 nodes and a 53-node fresh cohort, so a heavy night plus a full backfill is roughly 140 nodes ≈ 10 chunks. **Numeric trip-wire, so the trigger is not your in-the-moment comfort: if `prepare` returns MORE THAN 12 CHUNKS (>180 nodes), stop and raise it with Lei before dispatching.** Do not silently trim the cohort to get under it — trimming is the failure this uncapping exists to remove, and a genuine >12-chunk night is information about the backlog, not a dispatch problem to be hidden. For each chunk, construct a short dispatch prompt inline using the paths from the manifest. **Skip this entire block when `EMPTY_COHORT=true`** — there are no chunks in the manifest. Example:
 
 ```
 Read your input payload from: <chunk_dir>/payload.json
@@ -990,7 +993,7 @@ This is the **wait-then-spawn pattern** using filesystem-as-channel. Claude Code
 
 ### Step 7.5 — Apply the batch-summary payload directly (before spawning the dream master)
 
-**Skip this step if the recall-summary substrate is not deployed.** If batch-summary fairies were skipped in Step 5 (no `recall_summary` column or no `engram_set_recall_summaries` tool), `final_payload.json` will not exist — do not attempt to apply it; proceed directly to Step 8. **This skip applies only when the batch-summary step never ran.** If `validate` or `incorporate` exited 2, you are on the Exit 2 branch above (STOP, record the error, no Step 7.5) — an absent `final_payload.json` after an exit 2 is never "substrate not deployed".
+**Skip this step if the recall-summary substrate is not deployed OR if `EMPTY_COHORT=true`.** If batch-summary fairies were skipped in Step 5 (no `recall_summary` column or no `engram_set_recall_summaries` tool), `final_payload.json` will not exist — do not attempt to apply it; proceed directly to Step 8. If `EMPTY_COHORT=true` (proven-zero cohort), also skip regardless of whether a stale `final_payload.json` exists in `COHORT_DIR` — a stale artifact from a prior run must never be consumed on the empty-cohort path. **This skip applies only when the batch-summary step never ran.** If `validate` or `incorporate` exited 2, you are on the Exit 2 branch above (STOP, record the error, no Step 7.5) — an absent `final_payload.json` after an exit 2 is never "substrate not deployed".
 
 ```bash
 # Guard: substrate check (parallel to Step 5's substrate-absent skip)
