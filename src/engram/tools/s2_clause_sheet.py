@@ -473,15 +473,20 @@ def _render_item(num: int, it: dict, pass2: bool, scrubber: Scrubber) -> tuple[s
     return "".join(parts), masked
 
 
+_NOTES_SENTENCE = ("When you have labelled every clause, you may add a final line `## Notes` at the very end "
+                   "and write free notes below it. Use it to note any node that a hook injected into your "
+                   "context and that bore on a label. Nothing below that line is read as a label or flag. "
+                   "A line like that anywhere before the last clause stops the return from being scored, "
+                   "so write notes only at the very end.")
 _HEADER1 = ("# Clause-check sheet, pass 1\n\n"
             "For each clause, write one label after `Label:`: CARRIED (the quote by itself states it), "
             "NOT (the quote does not state it), or UNCLEAR. Label from the text shown only. "
             "Label the clauses as given; a free note on a split you think is wrong goes after `Flag`. "
-            "Node ids are masked as [id].\n\n")
+            "Node ids are masked as [id]. " + _NOTES_SENTENCE + "\n\n")
 _HEADER2 = ("# Clause-check sheet, pass 2\n\n"
             "Same items and clauses, with the author's interpretation added. You may mark a pass-1 NOT as "
             "NOT, STATED IN INTERPRETATION after `Label:`; the clause stays NOT. Node ids, agent names and "
-            "GitHub handles in the interpretation are replaced by placeholders.\n\n")
+            "GitHub handles in the interpretation are replaced by placeholders. " + _NOTES_SENTENCE + "\n\n")
 
 
 def cmd_render(args) -> int:

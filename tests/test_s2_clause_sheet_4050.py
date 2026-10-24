@@ -749,3 +749,37 @@ def test_s19d_key_records_presentation_rule(monkeypatch, tool):
     hashes = [render["items"][str(n)]["order_hash"] for n in range(1, 45)]
     assert hashes == sorted(hashes)
     assert tool.ORDER_SALT == "order" and tool.SEED_HEX == SEED
+
+
+# --------------------------------------------------------------------------- S20: notes instruction
+NOTES_SENTENCE = ("When you have labelled every clause, you may add a final line `## Notes` at the very end "
+                  "and write free notes below it. Use it to note any node that a hook injected into your "
+                  "context and that bore on a label. Nothing below that line is read as a label or flag. "
+                  "A line like that anywhere before the last clause stops the return from being scored, "
+                  "so write notes only at the very end.")
+
+
+def test_s20a_headers_carry_notes_instruction(tool):
+    for header in (tool._HEADER1, tool._HEADER2):
+        assert NOTES_SENTENCE in header
+        assert "`## Notes`" in header and "injected" in header
+
+
+def test_s20b_draft_and_final_renders_carry_it_without_a_notes_line(monkeypatch, tool):
+    import re
+    # The scorer's literal Notes-heading pattern (PR #4152 head 27d99850), not imported.
+    scorer_notes = re.compile(r"^#{0,6}\s*notes\s*:?$", re.IGNORECASE)
+    for planted_line in ("## Notes", "Notes:", "# notes"):
+        assert scorer_notes.match(planted_line.strip()), planted_line
+    db, out = _built(monkeypatch, tool)
+    sp = _splits(out)
+    assert _render(tool, db, out, sp, draft=True) == 0
+    assert _render(tool, db, out, sp, _planted()) == 0
+    names = ["sheet-pass1.DRAFT.md", "sheet-pass2.DRAFT.md", "sheet-pass1.md", "sheet-pass2.md"]
+    for name in names:
+        text = (out / name).read_text()
+        assert NOTES_SENTENCE in text, name
+        assert "injected" in text and "`## Notes`" in text, name
+        assert not re.search(r"^## Notes", text, re.IGNORECASE | re.MULTILINE), name
+        hits = [ln for ln in text.splitlines() if scorer_notes.match(ln.strip())]
+        assert hits == [], (name, hits)
