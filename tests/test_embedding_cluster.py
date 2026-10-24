@@ -63,7 +63,7 @@ def _seed_observation(server, claim: str) -> str:
     result = json.loads(server.engram_add_observation(json.dumps({
         "url": "https://example.com/test",
         "title": "Test",
-        "quoted_text": claim,
+        "quoted_text": claim + " in the cited source",
         "interpretation": claim,
         "claim": claim,
         "quote_type": "editorial",

@@ -71,7 +71,7 @@ def _ob(obs, qt):
     _SEQ[0] += 1
     r = json.loads(obs._add_observation_impl(
         url=f"https://example.com/s3531-{_SEQ[0]}", title=f"S{_SEQ[0]}",
-        quoted_text=f"Claim {_SEQ[0]}.", interpretation="i",
+        quoted_text=f"Claim {_SEQ[0]}. in the cited source", interpretation="i",
         claim=f"Claim {_SEQ[0]}.", quote_type=qt))
     assert "error" not in r, r
     return r["observation_id"]

@@ -93,7 +93,7 @@ def test_axiom_with_context():
     ob = client.call("engram_add_observation", {
         "url": "https://example.com/test",
         "title": "Test",
-        "quoted_text": "Context.",
+        "quoted_text": "Context. in the cited source",
         "interpretation": "Background.",
         "claim": "Some background context",
         "quote_type": "hard_data",
@@ -175,7 +175,7 @@ def test_definition_not_claim_bearing():
     ob = client.call("engram_add_observation", {
         "url": "https://example.com/test",
         "title": "Test",
-        "quoted_text": "Data.",
+        "quoted_text": "Data. in the cited source",
         "interpretation": "Test.",
         "claim": "Some claim",
         "quote_type": "hard_data",
@@ -200,7 +200,7 @@ def test_definition_via_context_ids():
     ob = client.call("engram_add_observation", {
         "url": "https://example.com/test",
         "title": "Test",
-        "quoted_text": "Data.",
+        "quoted_text": "Data. in the cited source",
         "interpretation": "Test.",
         "claim": "Observations are claim-bearing",
         "quote_type": "hard_data",
@@ -343,7 +343,7 @@ def test_conjecture_invalid_outcome():
     ob = client.call("engram_add_observation", {
         "url": "https://example.com/test",
         "title": "Test",
-        "quoted_text": "Data.",
+        "quoted_text": "Data. in the cited source",
         "interpretation": "Test.",
         "claim": "Supporting claim",
         "quote_type": "hard_data",

@@ -60,7 +60,7 @@ def _seed_observation(server, claim="Test claim."):
     _URL_SEQ[0] += 1
     payload = {
         "url": f"https://example.com/a{_URL_SEQ[0]}", "title": f"A{_URL_SEQ[0]}",
-        "quoted_text": claim,
+        "quoted_text": claim + " in the cited source",
         "interpretation": f"Interp: {claim}",
         "claim": claim,
         "quote_type": "attributed_analysis",

@@ -61,7 +61,7 @@ def test_observation_positive_control_reports_created_and_is_durable():
     payload = {
         "url": "https://example.com/durability-obs",
         "title": "Durability control",
-        "quoted_text": "X says Y",
+        "quoted_text": "X says Y in the cited source",
         "interpretation": "X claims Y",
         "claim": "Y is true according to X",
         "quote_type": "attributed_analysis",
@@ -130,7 +130,7 @@ def test_observation_fault_injected_readback_miss_reports_failed_not_durable(mon
 
     payload = {
         "evidence_id": evidence_id,
-        "quoted_text": "X says Y",
+        "quoted_text": "X says Y in the cited source",
         "interpretation": "X claims Y",
         "claim": "Y is true according to X (fault-injected)",
         "quote_type": "attributed_analysis",
@@ -283,7 +283,7 @@ def test_observation_indeterminate_is_distinguishable(monkeypatch):
     )
     payload = {
         "evidence_id": evidence_id,
-        "quoted_text": "X says Y",
+        "quoted_text": "X says Y in the cited source",
         "interpretation": "X claims Y",
         "claim": "Y is true according to X (indeterminate-injected)",
         "quote_type": "attributed_analysis",
@@ -417,7 +417,7 @@ def _make_observation(server, tag):
     payload = {
         "url": f"https://example.com/durability-sweep-{tag}",
         "title": f"Durability sweep support ({tag})",
-        "quoted_text": "X says Y",
+        "quoted_text": "X says Y in the cited source",
         "interpretation": "X claims Y",
         "claim": f"Y is true according to X ({tag})",
         "quote_type": "attributed_analysis",

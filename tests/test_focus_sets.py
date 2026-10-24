@@ -115,7 +115,7 @@ def seed_observations(client, count=5):
         r = client.call("engram_add_observation", {
             "url": f"https://example.com/{letter}",
             "title": letter.upper(),
-            "quoted_text": f"quote {letter}",
+            "quoted_text": f"quote {letter} in the cited source",
             "interpretation": "seed",
             "claim": f"claim {letter}",
             "quote_type": "hard_data",

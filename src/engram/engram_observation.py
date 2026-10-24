@@ -129,6 +129,11 @@ NXDOMAIN_ERRNOS = {
 # import time — same pattern as _LINEAGE_RE in engram_core.
 _STABLE_ID_RE = re.compile(r"^pn_\d+$|^[a-z][a-z0-9-]*:.+$")
 
+# Write-time quote floor (#4134, part of #4050): a quote under this many
+# STRIPPED CHARACTERS is a receipt, not evidence anyone can scan. Refused unless
+# it is the whole source unit (see _short_quote_error). Read at call time.
+MIN_QUOTE_CHARS = 10
+
 
 # ---------------------------------------------------------------------------
 # A-local helpers
@@ -1035,6 +1040,141 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
     return msg
 
 
+def _message_texts(obj) -> list:
+    """Decoded text of one transcript record: the text content of a user or
+    assistant message (a plain string, or its text blocks joined by a newline),
+    plus each text block on its own. Empty list for a record with no text."""
+    if not isinstance(obj, dict):
+        return []
+    # Only a user or assistant message is a unit; queue-operation, system,
+    # summary and any other record type is not a turn.
+    msg = obj.get("message") if isinstance(obj.get("message"), dict) else None
+    if msg is not None:
+        role = msg.get("role")
+        if role is None:
+            role = obj.get("type")
+    else:
+        role = obj.get("type")
+    if role not in ("user", "assistant"):
+        return []
+    body = msg if msg is not None else obj
+    content = body.get("content", body.get("text"))
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        blocks = [b["text"] for b in content
+                  if isinstance(b, dict) and b.get("type") == "text"
+                  and isinstance(b.get("text"), str)]
+        if len(blocks) > 1:
+            return ["\n".join(blocks)] + blocks
+        return blocks
+    return []
+
+
+def _source_units(file_path: str):
+    """The whole units of a readable file source, decoded: one entry per
+    message text for a .jsonl transcript, one per line for any other file.
+    None when the file cannot be read (the caller fails closed)."""
+    if not os.path.isabs(file_path) or not os.path.isfile(file_path):
+        return None
+    try:
+        content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if not file_path.endswith(".jsonl"):
+        return content.splitlines()
+    units = []
+    for raw in content.splitlines():
+        try:
+            units.extend(_message_texts(json.loads(raw)))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return units
+
+
+def _unit_window(unit: str, quote: str, limit: int = 300) -> str:
+    """The unit, cut to about `limit` characters around the quote with an
+    ellipsis on each cut side."""
+    if len(unit) <= limit:
+        return unit
+    at = unit.find(quote)
+    if at < 0:
+        return unit[:limit] + "…"
+    start = max(0, min(at - (limit - len(quote)) // 2, len(unit) - limit))
+    end = min(len(unit), start + limit)
+    return ("…" if start > 0 else "") + unit[start:end] + ("…" if end < len(unit) else "")
+
+
+def _short_quote_error(url: str, quoted_text: str) -> Optional[str]:
+    """The write-time quote floor (#4134, part of #4050).
+
+    Returns None when the stripped quote has at least MIN_QUOTE_CHARS
+    characters, or when it equals one whole unit of the source (a line of a
+    file; the whole text of one message of a .jsonl transcript). Otherwise the
+    error text. Runs AFTER _verify_quote_in_source, so for a readable file the
+    quote is known to be in it. Matching mirrors the verbatim check's tolerance
+    (exact, then the equivalence normalization) on DECODED units, which also
+    covers both JSON escape styles. A source whose text cannot be read (an
+    https URL, which is never fetched; a file that cannot be located) fails
+    closed: the exception cannot be checked, so the refusal stands.
+    """
+    quote = (quoted_text or "").strip()
+    floor = MIN_QUOTE_CHARS
+    if len(quote) >= floor:
+        return None
+    head = (
+        f"Quote too short: {len(quote)} characters after stripping; the minimum "
+        f"is {floor} unless the quote is the whole source line or message."
+    )
+    core_remedy = (
+        "quote enough of that line (or sentence) that it tells something on its "
+        "own"
+    )
+    remedy = f"Fix: {core_remedy}; the evidence node keeps the full context."
+    units = _source_units(url[7:]) if url.startswith("file://") else None
+    if units is None:
+        return (
+            f"{head} The source text was not available at write time (an https "
+            "URL is never fetched, or the file could not be read), so the "
+            "whole-line exception cannot be checked and no containing line is "
+            f"shown. Fix: {core_remedy}, or snapshot the source and cite the "
+            "file:// copy; the evidence node keeps the full context."
+        )
+    if quote:
+        norm_quote = _normalize_for_equivalence(quote)
+        for unit in units:
+            # An empty or blank unit never matches, and a quote that is empty
+            # after normalization (e.g. only a zero-width space) is never a
+            # whole utterance.
+            if not norm_quote or not unit.strip():
+                continue
+            if unit.strip() == quote or _normalize_for_equivalence(unit) == norm_quote:
+                return None  # the whole utterance
+        containing = next((u for u in units if quote in u), None)
+        if containing is None:
+            containing = next(
+                (u for u in units if norm_quote and norm_quote in _normalize_for_equivalence(u)),
+                None)
+    else:
+        containing = None
+    if containing is None:
+        if url.endswith(".jsonl"):
+            return (
+                f"{head} The containing message could not be shown. In a "
+                "transcript only user and assistant message text counts as a "
+                "whole unit (tool output and system records do not); quote the "
+                "surrounding message text instead. "
+                f"{remedy}"
+            )
+        return f"{head} The containing line could not be shown. {remedy}"
+    return (
+        f"{head} The quote is inside this "
+        f"{'message' if url.endswith('.jsonl') else 'line'}:\n"
+        f"  {_unit_window(containing, quote)}\n"
+        f"Suggested wider quote: that text. {remedy}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # A-family impls
 # ---------------------------------------------------------------------------
@@ -1491,6 +1631,9 @@ def _preflight_item_checks(url: str, quoted_text: str, *, content_hash: str = ""
     quote_error = _verify_quote_in_source(url, quoted_text)
     if quote_error:
         return json.dumps({"error": quote_error}), None
+    short_error = _short_quote_error(url, quoted_text)
+    if short_error:
+        return json.dumps({"error": short_error}), None
     ver = _capture_file_version(
         url, content_hash=content_hash, git_sha=git_sha,
         source_repo=source_repo, repo_path=repo_path)
@@ -1819,6 +1962,13 @@ def _add_observation_impl(
         if _pre_err:
             return _pre_err
         _pre_quote_checked = True
+    elif not evidence_id and url:
+        # Non-file url: the source is never read, so the floor fails closed.
+        # Decided HERE, before the evidence write below, so a refusal leaves
+        # no orphan evidence row (the file:// preflight does the same).
+        _short_err = _short_quote_error(url, quoted_text)
+        if _short_err:
+            return json.dumps({"error": _short_err})
 
     _yellow_forward = None
     if not evidence_id and url:
@@ -1893,6 +2043,9 @@ def _add_observation_impl(
             quote_error = _verify_quote_in_source(ev_url, quoted_text)
             if quote_error:
                 return json.dumps({"error": quote_error})
+            short_error = _short_quote_error(ev_url, quoted_text)
+            if short_error:
+                return json.dumps({"error": short_error})
 
         # Capture per-observation file version (the evidence-block refactor derivation). For file:// URLs
         # in a git repo: enforce committed-before-cite + record the specific

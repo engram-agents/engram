@@ -198,7 +198,7 @@ def test_rewrite_then_supersede_leaves_zero_orphans():
 
     a_id = _add_observation(
         obs, claim=f"A claim about {dropped_token} migration patterns.",
-        quoted_text="q", url="https://example.com/fts2742-a1",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-a1",
     )
     assert _fts_hit_count(dropped_token) == 1
 
@@ -221,7 +221,7 @@ def test_rewrite_then_supersede_leaves_zero_orphans():
     # "orphaned" failure that had nothing to do with the trigger under test.
     b_id = _add_observation(
         obs, claim="Superseder claim about an entirely separate topic.",
-        quoted_text="q", url="https://example.com/fts2742-b1",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-b1",
     )
     sup = json.loads(rev._supersede_impl(
         a_id, b_id, supersede_reason="FTS rewrite-resync test 1 — supersede after rewrite",
@@ -253,7 +253,7 @@ def test_rewrite_then_retract_leaves_zero_orphans():
 
     a_id = _add_observation(
         obs, claim=f"A claim about {dropped_token} migration patterns.",
-        quoted_text="q", url="https://example.com/fts2742-a2",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-a2",
     )
     assert _fts_hit_count(dropped_token) == 1
 
@@ -299,7 +299,7 @@ def test_rewrite_alone_keeps_index_in_step():
 
     a_id = _add_observation(
         obs, claim=f"A claim about {dropped_token} migration patterns.",
-        quoted_text="q", url="https://example.com/fts2742-a3",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-a3",
     )
     rowid_a = _get_node_rowid(a_id)
     assert rowid_a in _fts_match_rowids(dropped_token)
@@ -354,7 +354,7 @@ def test_recall_summary_tightening_triggers_resync():
     a_id = _add_observation(
         obs,
         claim="A claim about migration patterns, unrelated to the summary text below.",
-        quoted_text="q", url="https://example.com/fts2742-tighten",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-tighten",
     )
     assert _fts_hit_count(dropped_token) == 0
 
@@ -423,7 +423,7 @@ def test_composed_supersede_and_rewrite_in_one_statement_does_not_double_delete(
     token = "fts2742composedsupersede_orangutan"
     a_id = _add_observation(
         obs, claim=f"A claim about {token} for the composition test.",
-        quoted_text="q", url="https://example.com/fts2742-composed",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-composed",
     )
 
     conn = sqlite3.connect(_db_path())
@@ -466,7 +466,7 @@ def test_mutation_control_removing_the_new_is_current_guard_causes_the_double_de
     token = "fts2742mutationguard_narwhal"
     a_id = _add_observation(
         obs, claim=f"A claim about {token} for the mutation-control test.",
-        quoted_text="q", url="https://example.com/fts2742-mutation",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-mutation",
     )
 
     conn = sqlite3.connect(_db_path())
@@ -550,11 +550,11 @@ def test_composed_restore_and_rewrite_in_one_statement_does_not_raise():
     token = "fts2742restorerewrite_pangolin"
     a_id = _add_observation(
         obs, claim=f"A claim about {token} for the restore-composition test.",
-        quoted_text="q", url="https://example.com/fts2742-restore",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-restore",
     )
     b_id = _add_observation(
         obs, claim="Superseder claim about an entirely separate topic.",
-        quoted_text="q", url="https://example.com/fts2742-restore-b",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-restore-b",
     )
     sup = json.loads(rev._supersede_impl(
         a_id, b_id, supersede_reason="FTS rewrite-resync test 4b — setup for restore composition",
@@ -602,11 +602,11 @@ def test_mutation_control_removing_the_old_is_current_guard_causes_the_double_de
     token = "fts2742mutationguard_okapi"
     a_id = _add_observation(
         obs, claim=f"A claim about {token} for the OLD.is_current mutation-control test.",
-        quoted_text="q", url="https://example.com/fts2742-mutation-old",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-mutation-old",
     )
     b_id = _add_observation(
         obs, claim="Superseder claim about an entirely separate topic.",
-        quoted_text="q", url="https://example.com/fts2742-mutation-old-b",
+        quoted_text="q in the cited source", url="https://example.com/fts2742-mutation-old-b",
     )
     sup = json.loads(rev._supersede_impl(
         a_id, b_id, supersede_reason="FTS rewrite-resync mutation-control test — setup for restore composition",

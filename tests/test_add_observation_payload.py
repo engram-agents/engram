@@ -54,7 +54,7 @@ def test_payload_json_creates_observation():
     payload = {
         "url": "https://example.com/article",
         "title": "Example",
-        "quoted_text": "X says Y",
+        "quoted_text": "X says Y in the cited source",
         "interpretation": "X claims that Y is true",
         "claim": "Y is true according to X",
         "quote_type": "attributed_analysis",
@@ -84,7 +84,7 @@ def test_payload_json_non_object_rejected():
 def test_payload_json_unknown_field_rejected():
     server = fresh_server()
     r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "q", "interpretation": "i", "claim": "c",
+        "quoted_text": "q in the cited source", "interpretation": "i", "claim": "c",
         "quote_type": "hard_data", "url": "https://x.com", "title": "T",
         "made_up_field": "value",
     })))
@@ -107,7 +107,7 @@ def test_payload_json_missing_required():
 def test_payload_json_partial_missing():
     server = fresh_server()
     r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "q",
+        "quoted_text": "q in the cited source",
         "interpretation": "i",
         # claim + quote_type missing
         "url": "https://x.com",
@@ -123,7 +123,7 @@ def test_payload_json_partial_missing():
 def test_payload_json_invalid_quote_type():
     server = fresh_server()
     r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "q", "interpretation": "i", "claim": "c",
+        "quoted_text": "q in the cited source", "interpretation": "i", "claim": "c",
         "quote_type": "fabricated_type",
         "url": "https://x.com", "title": "T",
     })))
@@ -133,7 +133,7 @@ def test_payload_json_invalid_quote_type():
 def test_payload_json_invalid_source_class():
     server = fresh_server()
     r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "q", "interpretation": "i", "claim": "c",
+        "quoted_text": "q in the cited source", "interpretation": "i", "claim": "c",
         "quote_type": "hard_data",
         "url": "https://x.com", "title": "T",
         "source_class": "made_up_class",
@@ -150,7 +150,7 @@ def test_payload_json_explicit_empty_source_class_still_rejected():
     default; an explicit empty string is a caller error, not an omission."""
     server = fresh_server()
     r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "q", "interpretation": "i", "claim": "c",
+        "quoted_text": "q in the cited source", "interpretation": "i", "claim": "c",
         "quote_type": "hard_data",
         "url": "https://x.com", "title": "T",
         "source_class": "",
@@ -169,7 +169,7 @@ def test_payload_json_missing_evidence_source():
     """Neither url nor evidence_id provided → impl returns error."""
     server = fresh_server()
     r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "q", "interpretation": "i", "claim": "c",
+        "quoted_text": "q in the cited source", "interpretation": "i", "claim": "c",
         "quote_type": "hard_data",
         # No url, no evidence_id
     })))
@@ -250,7 +250,7 @@ def test_source_repo_accepted_as_known_field():
     """source_repo and repo_path are in _ADD_OBSERVATION_FIELDS — must not be rejected as unknown."""
     server = fresh_server()
     r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "q", "interpretation": "i", "claim": "c",
+        "quoted_text": "q in the cited source", "interpretation": "i", "claim": "c",
         "quote_type": "hard_data",
         "url": "https://example.com/doc",
         "title": "T",
@@ -481,7 +481,7 @@ def test_session_id_missing_marker():
     """Unknown session_id (no marker file on disk) -> clear error, no node."""
     server = fresh_server()
     payload = {
-        "quoted_text": "q",
+        "quoted_text": "q in the cited source",
         "interpretation": "i",
         "claim": "c",
         "session_id": "no-such-session-id-exists",
@@ -505,7 +505,7 @@ def test_session_id_path_traversal_rejected():
 
     for bad_session_id in ("../../etc/passwd", "foo/bar", "..\\..\\windows"):
         payload = {
-            "quoted_text": "q",
+            "quoted_text": "q in the cited source",
             "interpretation": "i",
             "claim": "c",
             "session_id": bad_session_id,
@@ -531,7 +531,7 @@ def test_session_id_precedence_conflict_with_url():
     server = fresh_server()
     session_id = "abc123-def456-conflict"
     payload = {
-        "quoted_text": "q",
+        "quoted_text": "q in the cited source",
         "interpretation": "i",
         "claim": "c",
         "quote_type": "hard_data",
@@ -561,7 +561,7 @@ def test_url_and_evidence_id_paths_unaffected_by_session_id():
 
     # url+title path: quote_type omitted -> still a hard required-field error.
     r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "q", "interpretation": "i", "claim": "c",
+        "quoted_text": "q in the cited source", "interpretation": "i", "claim": "c",
         "url": "https://example.com/no-quote-type",
         "title": "T",
     })))
@@ -569,7 +569,7 @@ def test_url_and_evidence_id_paths_unaffected_by_session_id():
 
     # url+title path: quote_type provided -> created exactly as before.
     r2 = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "X says Y", "interpretation": "X claims that Y is true",
+        "quoted_text": "X says Y in the cited source", "interpretation": "X claims that Y is true",
         "claim": "Y is true according to X",
         "quote_type": "attributed_analysis",
         "url": "https://example.com/regression-url",
@@ -584,7 +584,7 @@ def test_url_and_evidence_id_paths_unaffected_by_session_id():
     # still required and still enforced.
     ev_id = r2["evidence_id"]
     r3 = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "X says Y", "interpretation": "Second interpretation",
+        "quoted_text": "X says Y in the cited source", "interpretation": "Second interpretation",
         "claim": "A second claim citing the same evidence",
         "evidence_id": ev_id,
         # quote_type omitted on purpose
@@ -592,7 +592,7 @@ def test_url_and_evidence_id_paths_unaffected_by_session_id():
     assert "error" in r3 and "Missing required fields" in r3["error"] and "quote_type" in r3["error"], r3
 
     r4 = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "quoted_text": "X says Y", "interpretation": "Second interpretation",
+        "quoted_text": "X says Y in the cited source", "interpretation": "Second interpretation",
         "claim": "A second claim citing the same evidence",
         "evidence_id": ev_id,
         "quote_type": "hard_data",

@@ -184,6 +184,16 @@ an exact, verbatim substring of the evidence source — no paraphrase, no
 summary, no fabrication. The server enforces this and will reject a
 non-matching quote.
 
+**Length floor: 10 characters.** After stripping spaces, a quote shorter than
+10 characters is refused, because a fragment that short is a receipt, not
+evidence anyone can scan. The one exception: the quote is the whole source
+line (file) or the whole text of one message (session transcript). The error
+shows the line or message that contains your quote; quote enough of it that it
+tells something on its own. The evidence node keeps the full context. If the
+source text cannot be read at write time (an `https://` URL is never fetched),
+the refusal stands, because the exception cannot be checked: snapshot the
+source and cite the `file://` copy.
+
 Before calling `engram_add_observation`, verify the quote exists in the
 source file:
 

@@ -82,7 +82,7 @@ def _seed_ob(obs, claim="Test claim.", url="https://example.com/src",
     r = json.loads(obs._add_observation_impl(
         url=url,
         title="Source",
-        quoted_text=claim,
+        quoted_text=claim + " in the cited source",
         interpretation=f"Interpretation: {claim}",
         claim=claim,
         quote_type=quote_type,

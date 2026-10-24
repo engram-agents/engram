@@ -78,7 +78,7 @@ def _ob(g, claim, quote_type="attributed_analysis"):
     g.seq[0] += 1
     r = json.loads(g.obs._add_observation_impl(
         url=f"https://example.com/s4075-{g.seq[0]}", title=f"Source {g.seq[0]}",
-        quoted_text=claim, interpretation=f"Interpretation: {claim}", claim=claim,
+        quoted_text=claim + " in the cited source", interpretation=f"Interpretation: {claim}", claim=claim,
         quote_type=quote_type,
     ))
     assert "error" not in r, r

@@ -67,7 +67,7 @@ def _ob(server, claim="A source claim."):
     _SEQ[0] += 1
     r = json.loads(server._add_observation_impl(
         url=f"https://example.com/s{_SEQ[0]}", title=f"S{_SEQ[0]}",
-        quoted_text=claim, interpretation=f"I: {claim}", claim=f"{claim} {_SEQ[0]}",
+        quoted_text=claim + " in the cited source", interpretation=f"I: {claim}", claim=f"{claim} {_SEQ[0]}",
         quote_type="hard_data"))
     assert "observation_id" in r, r
     return r["observation_id"]

@@ -166,7 +166,7 @@ def _ob(m, claim=None):
     _URL_SEQ[0] += 1
     i = _URL_SEQ[0]
     r = json.loads(m["engram_observation"]._add_observation_impl(
-        url=f"https://example.com/n{i}", title=f"N{i}", quoted_text=f"quote {i}",
+        url=f"https://example.com/n{i}", title=f"N{i}", quoted_text=f"quote {i} in the cited source",
         interpretation=f"interp {i}", claim=claim or f"prereq claim {i}", quote_type="hard_data"))
     assert "observation_id" in r, r
     return r["observation_id"]
@@ -195,7 +195,7 @@ def _setup_evidence(m):
     reached with no tool-layer pre-check in front of it (the trigger alone is the guard)."""
     _URL_SEQ[0] += 1
     r = json.loads(m["engram_observation"]._add_observation_impl(
-        url=f"https://example.com/ev{_URL_SEQ[0]}", title="Ev", quoted_text="q", interpretation="i",
+        url=f"https://example.com/ev{_URL_SEQ[0]}", title="Ev", quoted_text="q in the cited source", interpretation="i",
         claim=f"evidence prereq {_URL_SEQ[0]}", quote_type="hard_data"))
     assert "evidence_id" in r, r
     return {"ev": r["evidence_id"]}
@@ -226,7 +226,7 @@ def _setup_cornerstone(m):
 
 WRITERS = {
     "_add_observation_impl": (_setup_evidence, lambda m, c, t: m["engram_observation"]._add_observation_impl(
-        evidence_id=c["ev"], quoted_text="a quote", interpretation="interp", claim=t, quote_type="hard_data")),
+        evidence_id=c["ev"], quoted_text="a quote in the cited source", interpretation="interp", claim=t, quote_type="hard_data")),
     "_create_derivation": (_setup_ob, lambda m, c, t: m["engram_derive"]._derive_impl(
         claim=t, supporting_ids=c["ob"], logical_chain="because", reasoning_type="deductive_modus_ponens")),
     "_contradict_impl": (_setup_two_obs, lambda m, c, t: m["engram_derive"]._contradict_impl(
@@ -324,7 +324,7 @@ def test_cell1o_observation_by_url_leaves_no_orphan_evidence_node(core, field):
     kwargs[field] = "bad" + NUL + "text"
     before = _table_counts(core)
     err, _ = _outcome(lambda: m["engram_observation"]._add_observation_impl(
-        url="https://example.com/orphan-check", title="Orphan", quoted_text="a quote",
+        url="https://example.com/orphan-check", title="Orphan", quoted_text="a quote in the cited source",
         interpretation="interp", quote_type="hard_data", **kwargs))
     assert err is not None and "U+0000" in err, err
     assert _delta(before, _table_counts(core)) == {}
@@ -334,7 +334,7 @@ def test_cell2o_control_observation_by_url_with_clean_text_writes_evidence_and_o
     m = _mods()
     before = _table_counts(core)
     err, _ = _outcome(lambda: m["engram_observation"]._add_observation_impl(
-        url="https://example.com/orphan-control", title="Orphan", quoted_text="a quote",
+        url="https://example.com/orphan-control", title="Orphan", quoted_text="a quote in the cited source",
         interpretation="interp", claim="a clean claim", quote_type="hard_data"))
     assert err is None, err
     assert _table_counts(core)["nodes"] == before["nodes"] + 2  # evidence + observation
@@ -351,7 +351,7 @@ RS_WRITERS = {
 }
 RS_CALLS = {
     "_add_observation_impl": lambda m, c, t: m["engram_observation"]._add_observation_impl(
-        evidence_id=c["ev"], quoted_text="a quote", interpretation="interp",
+        evidence_id=c["ev"], quoted_text="a quote in the cited source", interpretation="interp",
         claim="a clean claim", quote_type="hard_data", recall_summary=t),
     "_create_derivation": lambda m, c, t: m["engram_derive"]._derive_impl(
         claim="a clean derived claim", supporting_ids=c["ob"], logical_chain="because",

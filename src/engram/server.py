@@ -1793,7 +1793,9 @@ def engram_add_observation(payload_json: str) -> str:
     error.
 
     The quote must be a VERBATIM substring of the source. This is checked
-    server-side on every path, session_id included, and fails loud.
+    server-side on every path, session_id included, and fails loud. A quote
+    under 10 characters (stripped) is refused unless it is the whole source
+    line or the whole message; an unreadable source (https URL) always refuses.
 
     Ephemeral sources (forum threads, web pages, local files not committed to a
     repo) must be archived with engram-snapshot first and cited by the file://

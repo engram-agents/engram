@@ -240,7 +240,7 @@ def test_feeling_rejected_in_contradict():
         "trigger": "Test.",
     })
     obs = client.call("engram_add_observation", {
-        "quoted_text": "Test",
+        "quoted_text": "Test in the cited source",
         "interpretation": "Test",
         "claim": "A claim",
         "quote_type": "hard_data",

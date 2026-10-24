@@ -332,7 +332,7 @@ def _ob(obs):
     _SEQ[0] += 1
     r = json.loads(obs._add_observation_impl(
         url=f"https://example.com/s3210-{_SEQ[0]}", title=f"S{_SEQ[0]}",
-        quoted_text="Base.", interpretation="Base.", claim="Base observation.",
+        quoted_text="Base. in the cited source", interpretation="Base.", claim="Base observation.",
         quote_type="official_statement"))
     assert "error" not in r, r
     return r["observation_id"]
@@ -441,7 +441,7 @@ def _retype(server, s, t, old, new):
 def _obs(server, claim, n):
     r = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "url": f"https://example.com/r3210-{n}", "title": "T",
-        "quoted_text": "X says Y.", "interpretation": "X claims Y.",
+        "quoted_text": "X says Y. in the cited source", "interpretation": "X claims Y.",
         "claim": claim, "quote_type": "hard_data"})))
     assert "error" not in r, r
     return r["observation_id"]

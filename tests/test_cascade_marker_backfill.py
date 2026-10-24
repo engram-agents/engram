@@ -72,7 +72,7 @@ def _mods():
 def _mk_obs(obs, claim):
     r = json.loads(obs._add_observation_impl(
         url="https://example.com/t", title="T", claim=claim,
-        quoted_text=claim, interpretation=f"obs: {claim}",
+        quoted_text=claim + " in the cited source", interpretation=f"obs: {claim}",
         quote_type="hard_data",
     ))
     assert "observation_id" in r, r

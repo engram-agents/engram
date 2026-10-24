@@ -76,7 +76,7 @@ def _seed_ob(obs, claim="Test claim.", quote_type="attributed_analysis"):
     r = json.loads(obs._add_observation_impl(
         url=f"https://example.com/src{_URL_SEQ[0]}",
         title=f"Source {_URL_SEQ[0]}",
-        quoted_text=claim,
+        quoted_text=claim + " in the cited source",
         interpretation=f"Interpretation: {claim}",
         claim=claim,
         quote_type=quote_type,

@@ -662,7 +662,7 @@ def test_retracted_target_rejected_by_is_current_guard():
     # Create a second observation to use as source (person can't be retracted easily)
     obs2_id = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "url": "https://example.com/b", "title": "B",
-        "quoted_text": "B says C.", "interpretation": "B claims C.", "claim": "C.",
+        "quoted_text": "B says C. in the cited source", "interpretation": "B claims C.", "claim": "C.",
         "quote_type": "attributed_analysis",
     })))["observation_id"]
     _retract_node(server, obs_id)
@@ -681,7 +681,7 @@ def test_superseded_source_rejected_by_is_current_guard():
     person_id, obs_id = _seed_self_anchor_and_obs(server)
     obs2_id = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "url": "https://example.com/b", "title": "B",
-        "quoted_text": "B says C.", "interpretation": "B claims C.", "claim": "C.",
+        "quoted_text": "B says C. in the cited source", "interpretation": "B claims C.", "claim": "C.",
         "quote_type": "attributed_analysis",
     })))["observation_id"]
     _supersede_node(server, obs_id, obs2_id)
@@ -700,12 +700,12 @@ def test_superseded_target_rejected_by_is_current_guard():
     person_id, obs_id = _seed_self_anchor_and_obs(server)
     obs2_id = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "url": "https://example.com/b", "title": "B",
-        "quoted_text": "B says C.", "interpretation": "B claims C.", "claim": "C.",
+        "quoted_text": "B says C. in the cited source", "interpretation": "B claims C.", "claim": "C.",
         "quote_type": "attributed_analysis",
     })))["observation_id"]
     obs3_id = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "url": "https://example.com/c", "title": "C",
-        "quoted_text": "C says D.", "interpretation": "C claims D.", "claim": "D.",
+        "quoted_text": "C says D. in the cited source", "interpretation": "C claims D.", "claim": "D.",
         "quote_type": "attributed_analysis",
     })))["observation_id"]
     _supersede_node(server, obs_id, obs2_id)

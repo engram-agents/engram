@@ -193,7 +193,7 @@ def test_retract_invalid_error_type():
     r = client.call("engram_add_observation", {
         "url": "https://example.com/a",
         "title": "A",
-        "quoted_text": "Data.",
+        "quoted_text": "Data. in the cited source",
         "interpretation": "Test.",
         "claim": "Test",
         "quote_type": "hard_data",
@@ -349,7 +349,7 @@ def test_reflect_shows_tainted_and_retracted():
     r = client.call("engram_add_observation", {
         "url": "https://example.com/a",
         "title": "Source",
-        "quoted_text": "Fact.",
+        "quoted_text": "Fact. in the cited source",
         "interpretation": "Test.",
         "claim": "A claim to retract for reflect test",
         "quote_type": "hard_data",
