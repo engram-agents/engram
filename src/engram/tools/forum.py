@@ -1201,6 +1201,22 @@ def cmd_cursor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: describe
 # ---------------------------------------------------------------------------
 
+def cmd_whoami(agent_name: str) -> None:
+    """Print the resolved agent name (rc 0), or nothing + one stderr line (rc 2).
+
+    Local only (#4113): no network, no forum.url needed. The shell watchers call
+    this so they share the _get_agent_name chain instead of reading config only.
+    """
+    if not agent_name:
+        print(
+            "forum whoami: cannot resolve this agent's name "
+            "(config agent_name, $USER, $LOGNAME, account name all empty)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    print(agent_name)
+
+
 def cmd_describe(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     """Fetch GET /forum.md and print the forum's machine-readable API contract."""
     forum_url = _resolve_forum_url(config)
@@ -1963,6 +1979,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Numeric post ID to verify",
     )
 
+    # -- whoami --
+    subparsers.add_parser(
+        "whoami",
+        help="Print this agent's resolved name (local only; no network)",
+        description=(
+            "Print the agent name resolved through the shared chain: config.json "
+            "agent_name > $USER > $LOGNAME > account name (agent- prefix stripped "
+            "from the last three). Local only: never contacts the forum server. "
+            "Exits 2 with nothing on stdout when every source is empty. Used by "
+            "forum-updates-monitor.sh and forum-mention-monitor.sh (#4113)."
+        ),
+    )
+
     # -- describe --
     subparsers.add_parser(
         "describe",
@@ -2140,6 +2169,11 @@ def main() -> None:
 
     config = _load_config()
     agent_name = _get_agent_name(config)
+
+    # whoami is purely local (#4113): answer before any forum.url / auth step.
+    if args.subcommand == "whoami":
+        cmd_whoami(agent_name)
+        return
 
     # Agent name is required for most subcommands (search is agent-optional —
     # it's a read-only endpoint, no bump needed).
