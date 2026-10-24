@@ -83,6 +83,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import errno
 import importlib.util
 import io
 import json
@@ -92,6 +93,7 @@ import platform
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2340,6 +2342,53 @@ def _check_store_arg(path: Path) -> Optional[str]:
     return None
 
 
+#: The errnos `pathlib.Path.is_file()` swallows, answering False; every other OSError propagates out of it.
+#: Measured on this seat's Python 3.12.3 against `pathlib._IGNORED_ERRNOS` (ENOENT, ENOTDIR, EBADF, ELOOP), and
+#: spelled out here rather than imported because that symbol is private.  `_classify_real_store` uses it to keep
+#: the pre-#4009 message for every errno, so the fix is a no-op on 3.12 except for the interpreter that never had
+#: the bug, and only the 3.14 answer changes.
+_IS_FILE_IGNORED_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
+def _classify_real_store(path: Path) -> Optional[str]:
+    """The `--real-store` precheck (#4009): None when `path` is a usable regular file, else the exact one-line
+    message the CLI refuses with.  It classifies with `os.stat` (which follows symlinks, as `Path.is_file()`
+    did) and consults the EXCEPTION TYPE only -- it never calls `Path.is_file()`, whose answer differs by
+    interpreter: 3.12 raises PermissionError on an unsearchable parent while 3.14 returns False, so a check
+    built on result-or-raise would refuse 3.12 with the classifier line and 3.14 with "is not a file".
+
+      OSError in _IS_FILE_IGNORED_ERRNOS (ENOENT, ENOTDIR,
+        EBADF, ELOOP -- a missing path, a non-directory
+        parent, a dangling symlink, a symlink loop)      the existing "is not a file ... Name one with" line
+      any other OSError (EACCES from an unsearchable
+        parent, ENAMETOOLONG, EIO, ESTALE, ...)          the classifier's message (`EACCES: Permission denied`)
+      stat ok, not S_ISREG (FIFO, directory, ...)        the same "is not a file" line
+      stat ok, S_ISREG                                   None -- the run proceeds to make_test_store
+
+    The errno boundary is `Path.is_file()`'s own: it swallowed exactly those four and raised for the rest, so
+    this classification reproduces the pre-#4009 message for every errno while answering the same way on every
+    interpreter.  `os.stat` follows symlinks, as `is_file()` did.
+    """
+    not_a_file = (f"engramd_a6_latency: error -- the real-store source {path} is not a file; the real-store "
+                  "copy is the GATE cell. Name one with --real-store PATH (or --no-real-store for a synthetic-only "
+                  "run, which is never a pass).")
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        # `Path.is_file()` IGNORED exactly _IS_FILE_IGNORED_ERRNOS (it answered False) and RAISED every other
+        # OSError.  Mirror that boundary rather than "any OSError": then this fix changes behaviour on NO
+        # interpreter, including for the errnos it never ignored -- ENAMETOOLONG, EIO, ESTALE -- which keep the
+        # classifier's "cannot check …; fix the path" line instead of degrading to "is not a file".  EACCES is
+        # an OSError (a PermissionError) and is NOT in the ignored set, so it also lands in the classifier
+        # branch: that is the 3.14 case this fix exists for.
+        if exc.errno in _IS_FILE_IGNORED_ERRNOS:
+            return not_a_file
+        return f"engramd_a6_latency: error -- {_check_store_arg(path) or f'cannot check {path}'}"
+    if not stat.S_ISREG(st.st_mode):
+        return not_a_file
+    return None
+
+
 def _is_live_store(path: Path, home: Optional[Path] = None) -> bool:
     """`home` is this seat's resolved ENGRAM_HOME; omitted, it is resolved here (a relative value raises ValueError,
     which main() has already turned into its refusal before it gets this far)."""
@@ -2439,16 +2488,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         cells = [("synthetic", None)]
         if not args.no_real_store:
             real_src = args.real_store or (home / "knowledge.db")
-            try:
-                real_is_file = real_src.is_file()
-            except OSError:   # an unsearchable parent: is_file() raises PermissionError on 3.12 (#3962)
-                print(f"engramd_a6_latency: error -- {_check_store_arg(real_src) or f'cannot check {real_src}'}",
-                      file=sys.stderr)
-                return 2
-            if not real_is_file:
-                print(f"engramd_a6_latency: error -- the real-store source {real_src} is not a file; the real-store "
-                      "copy is the GATE cell. Name one with --real-store PATH (or --no-real-store for a synthetic-only "
-                      "run, which is never a pass).", file=sys.stderr)
+            real_problem = _classify_real_store(real_src)
+            if real_problem is not None:
+                print(real_problem, file=sys.stderr)
                 return 2
             real_home = make_test_store(source=real_src)   # a consistent read-only backup copy; the source is only read
             cells.append(("real-store", real_home / "knowledge.db"))
