@@ -32,12 +32,24 @@ from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-ENGRAM_HOME = Path(
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
-DEFERENCE_LOG = ENGRAM_HOME / "deference-detector.log"
-KNOWLEDGE_DB = ENGRAM_HOME / "knowledge.db"
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863 step 3c-iii; the rulings:
+# engram_home_resolver's docstring). The repo root (the parent of this file's directory) is appended, never inserted
+# at [0] (#2565, #4054).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
+# A RELATIVE ENGRAM_HOME must not raise at import: the refusal is recorded, the constants stay None, and main()
+# refuses at its first action (one stderr line naming the value, exit 2).
+try:
+    ENGRAM_HOME = owner_read.engram_home()
+    _HOME_REFUSAL = None
+except ValueError as _exc:
+    ENGRAM_HOME = None
+    _HOME_REFUSAL = str(_exc)
+DEFERENCE_LOG = ENGRAM_HOME / "deference-detector.log" if ENGRAM_HOME is not None else None
+KNOWLEDGE_DB = ENGRAM_HOME / "knowledge.db" if ENGRAM_HOME is not None else None
 
 
 def trajectory_metrics() -> dict:
@@ -198,6 +210,10 @@ def main() -> int:
     p.add_argument("--since", type=str, default=None, help="Filter to entries on/after this ISO date.")
     p.add_argument("--json", action="store_true", help="Emit structured JSON report.")
     args = p.parse_args()
+
+    if _HOME_REFUSAL is not None:
+        print(f"borges_session_eval: {_HOME_REFUSAL}", file=sys.stderr)
+        return 2
 
     since = None
     if args.since:

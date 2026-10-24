@@ -404,6 +404,18 @@ def test_the_real_baseline_names_no_pinned_resolver_and_no_test_file(gate):
     assert not [rel for rel in base if "/tests/" in rel or rel.rsplit("/", 1)[-1].startswith("test_")]
 
 
+def test_the_real_baseline_is_empty_a_regrow_is_a_red_cell_not_a_shrink_only_pass(gate):
+    """#3863 step 3c-iii took the last four sites out, so the committed baseline is `{}`. The gate stays a shrink-only
+    ratchet (a base-relative `grew` check needs it), but a baseline that is non-empty again means a raw read was
+    BASELINED instead of fixed, and Borges asked that this read as a red cell: the rule is that no ENGRAM_HOME read
+    in src/ or tools/ is raw outside the pinned resolver files (borges_session_eval.py in release-minus-set.txt
+    included; the gate does not skip it). A deliberate exception edits this cell and says why in the PR."""
+    doc = json.loads((REPO / gate.BASELINE_REL).read_text())
+    assert doc["baseline"] == {}, (
+        "tools/raw_home_read_baseline.json must stay `\"baseline\": {}` (#3863 step 3c-iii): route the new read "
+        f"through the shared resolver instead of baselining it; got {doc['baseline']}")
+
+
 def test_the_cli_prints_the_baseline_site_count(gate, capsys):
     assert gate.main(["--root", str(REPO)]) == 0
     out = capsys.readouterr().out

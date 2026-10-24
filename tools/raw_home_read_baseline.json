@@ -4,12 +4,7 @@
     "src/",
     "tools/"
   ],
-  "baseline": {
-    "tools/borges_session_eval.py": 1,
-    "tools/engramd_a6_latency.py": 1,
-    "tools/home_path_gate.py": 1,
-    "tools/perf/bench_in_turn_recall.py": 1
-  },
+  "baseline": {},
   "allowlist": {
     "src/engram/tools/_owner_read.py": {
       "class": "resolver",

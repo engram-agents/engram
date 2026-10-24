@@ -552,7 +552,9 @@ def make_test_store(nodes: int = 5000, people: int = 5, source: Optional[Path] =
     _ensure_src_importable()
     import engram_core
 
-    old = os.environ.get("ENGRAM_HOME")
+    # #3863 step 3c-iii: this is a save/restore around a test block, not a resolution. Snapshot the WHOLE environment
+    # and restore exactly that, so every key the block touches comes back and an ABSENT ENGRAM_HOME stays absent.
+    saved_env = dict(os.environ)
     os.environ["ENGRAM_HOME"] = str(home)
     try:
         conn = sqlite3.connect(str(db))
@@ -580,10 +582,8 @@ def make_test_store(nodes: int = 5000, people: int = 5, source: Optional[Path] =
         conn.commit()
         conn.close()
     finally:
-        if old is None:
-            os.environ.pop("ENGRAM_HOME", None)
-        else:
-            os.environ["ENGRAM_HOME"] = old
+        os.environ.clear()
+        os.environ.update(saved_env)
     return home
 
 

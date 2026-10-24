@@ -132,7 +132,9 @@ class _DaemonQueryCounter:
 
 
 def _load_hook(engram_home: str):
-    old = os.environ.get("ENGRAM_HOME")
+    # #3863 step 3c-iii: a save/restore around loading the hook, not a resolution: snapshot the WHOLE environment
+    # and restore exactly that (the hook's import may set other keys; an ABSENT ENGRAM_HOME stays absent).
+    saved_env = dict(os.environ)
     os.environ["ENGRAM_HOME"] = engram_home
     try:
         spec = importlib.util.spec_from_file_location("bench_tripwire_hook", HOOK_PATH)
@@ -140,10 +142,8 @@ def _load_hook(engram_home: str):
         spec.loader.exec_module(mod)
         return mod
     finally:
-        if old is None:
-            os.environ.pop("ENGRAM_HOME", None)
-        else:
-            os.environ["ENGRAM_HOME"] = old
+        os.environ.clear()
+        os.environ.update(saved_env)
 
 
 def _percentile(vals: list[float], pct: float) -> float:

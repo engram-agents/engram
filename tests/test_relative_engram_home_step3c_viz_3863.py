@@ -282,3 +282,22 @@ def test_asymmetry_version_info_is_import_safe_agents_is_not(layout, flat_root, 
     bad = _run("import PKG.agents", layout, flat_root, home, cwd, ENGRAM_HOME=REL)
     assert ok.returncode == 0, ok.stderr
     assert bad.returncode != 0 and "ValueError" in bad.stderr
+
+
+# ------------------------------------------------------------------------------------------------ viz.workbench
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_workbench_entry_refuses_a_relative_value_and_creates_nothing(layout, flat_root, world):
+    """Sol's cell from the #4128 review. `python -m viz.workbench` is the entry point that viz/agents.py ALONE
+    guards (`python -m engram.viz.server` already dies earlier, in engram_core). Before #4128 it exited 0 on
+    ENGRAM_HOME=rel/x; it must now exit non-zero with the ValueError naming the value, in all three layouts, and
+    leave nothing under the cwd or the home. `--help` makes the old (raw-read) behaviour a clean exit 0 instead of
+    a server that never returns, so a regression is a red cell and not a hang."""
+    home, cwd = world
+    before = _snap(layout, flat_root, home, cwd)
+    extra, prefix, cwd_over = _layout(layout, flat_root)
+    r = subprocess.run([sys.executable, "-m", f"{prefix}.workbench", "--help"], cwd=str(cwd_over or cwd),
+                       env=_env(home, extra, ENGRAM_HOME=REL), capture_output=True, text=True, timeout=120)
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "ValueError" in r.stderr and "'rel/x'" in r.stderr, r.stderr
+    assert _snap(layout, flat_root, home, cwd) == before

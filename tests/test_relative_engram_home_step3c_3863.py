@@ -18,6 +18,8 @@ Contract, one parametrised cell per tool x case, so a tool that accepts the rela
   over   an explicit override (--engram-home, --db, --db-path, --ledger, --real-store) never reads the variable, so a
          relative ENGRAM_HOME beside it is not refused. Exception, stated and pinned: propose-generalizes-migration
          imports engram_core, which itself refuses a relative home at import, so the tool refuses even beside --db.
+Step 3c-iii adds one more cell, `borges` (tools/borges_session_eval.py, a persona tool in release-minus-set.txt that
+the gate deliberately does not skip): an import-time constant like rc-upgrade-verify, with a CLI main().
 The HOME of every run is a temporary directory, so a tool cannot touch the real home; the real home is not listed.
 
 engramd_a6_latency has two home reads behind its own entry paths, each reached without a build or a layout child:
@@ -204,6 +206,16 @@ def _check_ws4(r, H, ctx):
         "flagged (head_named_in_span): 0\n"), r.stdout
 
 
+# -- borges_session_eval.py (step 3c-iii): no knowledge.db -> the report carries its own "not found" line, exit 0
+def _check_borges(r, H, ctx):
+    assert r.returncode == 0, (r.returncode, r.stderr)
+    assert r.stderr == ""
+    lines = r.stdout.splitlines()
+    assert lines[0] == "=== Borges session-eval report ===", r.stdout
+    assert f"  ERROR: knowledge.db not found at {H}/knowledge.db" in lines, r.stdout
+    assert "  T1 deference-rate: unavailable: PR #31 not yet deployed" in lines, r.stdout
+
+
 # name -> dict(path or module, argv, plant, check, prefix, extra env, stdin, home_for_store)
 CELLS = {
     "backfill": dict(path="engram-backfill-special-moment-edges.py", argv=lambda c: ["--dry-run"], plant=_mk,
@@ -226,6 +238,8 @@ CELLS = {
                     check=_check_harness, prefix="recall_measurement_harness: "),
     "rra": dict(path="recall_repetition_analysis.py", argv=lambda c: [], plant=_plant_rra, check=_check_rra,
                 prefix="recall_repetition_analysis: "),
+    "borges": dict(path="borges_session_eval.py", argv=lambda c: [], plant=_mk, check=_check_borges,
+                   prefix="borges_session_eval: "),
     "ws4": dict(module="tools.ws4.extract_spans",
                 argv=lambda c: ["--date", "2026-09-28", "--out", str(c["inputs"] / "ws4-out")], plant=_plant_ws4,
                 check=_check_ws4, prefix="extract_spans: "),

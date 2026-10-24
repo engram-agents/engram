@@ -65,7 +65,9 @@ THE ENGRAM_HOME-DERIVED VENV CLASS (`engram_home_derived_venv`, #3863 6c). The v
 is NOT under the ENGRAM home, so a line that builds it from the home is wrong even
 though it names ENGRAM_HOME: `${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3`,
 `${ENGRAM_HOME}/venv/...`, `$ENGRAM_HOME/venv/...`, `engram_home() / "venv"`,
-`os.path.join(ENGRAM_HOME, "venv/bin/python3")`, `Path(os.environ["ENGRAM_HOME"]) / "venv"`.
+`os.path.join(ENGRAM_HOME, "venv/bin/python3")`, and a Path built from the environment's ENGRAM_HOME value
+followed by `/ "venv"` (the same shape with the variable read inline; spelled out in words here so this
+docstring does not itself read as a raw read to tools/raw_home_read_gate.py).
 Such a line is a violation in its own class and is NOT rescued by the clean-token
 rule (the ENGRAM_HOME on it is the defect). Detected by ENGRAM_HOME_VENV_RE on the
 line AFTER the home-anchored venv forms are masked, so a line that names ENGRAM_HOME
