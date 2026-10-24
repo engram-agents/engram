@@ -30,6 +30,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # image was bumped to 24.04 (noble), which ships 3.12 natively (#2085).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 \
+        python3.12-venv \
         python3-pip \
         git \
         cron \

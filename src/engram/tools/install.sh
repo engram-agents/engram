@@ -9,7 +9,13 @@
 # USAGE:
 #   bash tools/install.sh [--tier essential|convenience|dev] [--multi-agent | --single-agent]
 #                         [--recall-service | --no-recall-service] [--viz-service]
-#                         [--forum-url <url>] [--install-claude-code] [--yes] [--help]
+#                         [--forum-url <url>] [--install-claude-code] [--yes]
+#                         [--sandbox-untagged] [--help]
+#
+# KNOWN GAP, step 1 never fetches: its deployable-tag guard reads the origin/* refs the checkout
+# already has. A checkout with stale origin/* refs (for example a shallow `git clone --branch vX`)
+# is refused at step 1, although step 5 does a bounded fetch and might have passed. Remedy:
+# `git fetch --tags origin`, then re-run.
 #
 # Bash 3.2 compatible (macOS). No interactive prompt except the one CLAUDE.md question in
 # step 6 (a tty, no --yes, an existing ~/.claude/CLAUDE.md and no backup yet).
@@ -76,7 +82,11 @@ Options:
   --install-claude-code run Claude Code's native installer if `claude` is missing
                         (off by default; --yes never implies it)
   --yes                 non-interactive: answer the CLAUDE.md question "back up and replace"
-  --help                show this help and exit
+  --sandbox-untagged    SANDBOX RIGS ONLY, not a release: build from an untagged commit or a
+                        branch (passes --allow-untagged and --allow-branch to step 5) and print
+                        "SANDBOX BUILD (not a release): <HEAD sha>" in step 1 and at the end.
+                        Never implied by --yes or any other flag or variable
+  --help               show this help and exit
 EOF
 }
 
@@ -91,6 +101,7 @@ VIZ_SERVICE=0
 FORUM_URL=""
 INSTALL_CLAUDE_CODE="$DEFAULT_INSTALL_CLAUDE_CODE"
 ASSUME_YES=0
+SANDBOX_UNTAGGED=0
 
 _arg_error() { printf 'install.sh: %s (see --help)\n' "$*" >&2; exit 2; }
 
@@ -112,6 +123,7 @@ while [ $# -gt 0 ]; do
     --forum-url=*) FORUM_URL="${1#--forum-url=}"; shift ;;
     --install-claude-code) INSTALL_CLAUDE_CODE=1; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
+    --sandbox-untagged) SANDBOX_UNTAGGED=1; shift ;;
     *) _arg_error "unknown argument: $1" ;;
   esac
 done
@@ -312,7 +324,8 @@ begin_step 1 "preflight"
 command -v python3 >/dev/null 2>&1 \
   || fail "python3 not found on PATH" "install Python $MIN_PYTHON or newer (with the venv module) and re-run"
 python3 -c 'import sys; sys.exit(0 if sys.version_info[:3] >= (3, 10, 7) else 1)' \
-  || fail "python3 is older than $MIN_PYTHON ($(python3 --version 2>&1))" "install Python $MIN_PYTHON or newer and re-run (3.10.0-3.10.6 are not supported)"
+  || fail "python3 is older than $MIN_PYTHON ($(python3 --version 2>&1))" "install Python $MIN_PYTHON or newer and re-run (3.10.0-3.10.6 are not supported)$(
+    [ "$(uname -s 2>/dev/null)" != "Darwin" ] || printf '; on macOS: brew install python@3.12')"
 python3 -c 'import venv, ensurepip' >/dev/null 2>&1 \
   || fail "python3 has no venv/ensurepip module" "install it (Debian/Ubuntu: apt install python3-venv) and re-run"
 command -v git >/dev/null 2>&1 \
@@ -337,6 +350,27 @@ if [ -z "$REPO_ROOT" ]; then
 fi
 [ -f "$REPO_ROOT/requirements/requirements.txt" ] \
   || fail "requirements/requirements.txt missing under $REPO_ROOT" "run this script from a complete engram checkout"
+
+# L1: refuse here what install-local-marketplace.sh's step-5 guard would refuse, before the venv
+# and pip are spent. Same rule, same code: src/build/engine/deploy_tag.py deployable_tag_at
+# (a v*/deploy/* tag on HEAD, HEAD an ancestor of origin/dev or origin/main). It never fetches,
+# so it reads the refs this checkout already has. --sandbox-untagged skips it.
+if [ "$SANDBOX_UNTAGGED" != "1" ]; then
+  _rc=0
+  _deploy_tag="$(PYTHONPATH="$REPO_ROOT" python3 -c 'import sys
+try:
+    from src.build.engine.deploy_tag import deployable_tag_at as f
+except ImportError:
+    sys.exit(3)
+print(f(sys.argv[1]) or "")' "$REPO_ROOT" 2>/dev/null)" || _rc=$?
+  [ "$_rc" -ne 3 ] \
+    || fail "src/build/engine/deploy_tag.py is missing under $REPO_ROOT, so the deployable-tag rule cannot be checked" "run this script from a complete engram checkout"
+  if [ "$_rc" -ne 0 ] || [ -z "$_deploy_tag" ]; then
+    _head_short="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    _branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+    fail "HEAD $_head_short (branch $_branch) is not a deployable tag merged into origin/dev or origin/main; step 5 would refuse it" "check out a deployable tag (v* or deploy/*; git fetch --tags origin first if your tags are stale) and re-run; --sandbox-untagged is for a test rig only, not a release"
+  fi
+fi
 
 mkdir -p "$CLAUDE_HOME" 2>/dev/null && [ -w "$CLAUDE_HOME" ] \
   || fail "$CLAUDE_HOME is not writable" "fix its ownership or permissions (chown/chmod) and re-run"
@@ -364,6 +398,12 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/engram-install.XXXXXX")" \
   || fail "could not create a scratch directory under ${TMPDIR:-/tmp}" "set TMPDIR to a writable directory and re-run"
 # Where the step logs are copied if this run fails (named in the FAIL lines; see _on_exit).
 LOG_SAVE_DIR="$ENGRAM_HOME/install-logs/$(date -u +%Y%m%dT%H%M%SZ)"
+# Only the explicit flag sets this; no variable or config does.
+SANDBOX_BANNER=""
+if [ "$SANDBOX_UNTAGGED" = "1" ]; then
+  SANDBOX_BANNER="SANDBOX BUILD (not a release): $(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo 'unknown (no commit)')"
+  printf '%s\n' "$SANDBOX_BANNER"
+fi
 step_ok
 
 # ── Step 2: Claude Code ──────────────────────────────────────────────────────────────────────
@@ -440,7 +480,10 @@ begin_step 5 "build, assemble and register the marketplace"
 [ -f "$TOOLS_DIR/install-local-marketplace.sh" ] \
   || fail "install-local-marketplace.sh not found beside this script ($TOOLS_DIR)" "run this script from a complete engram checkout"
 printf '[step 5] running install-local-marketplace.sh (its output follows)\n'
-bash "$TOOLS_DIR/install-local-marketplace.sh" \
+_market_flags=""
+[ "$SANDBOX_UNTAGGED" != "1" ] || _market_flags="--allow-untagged --allow-branch"
+# shellcheck disable=SC2086  # intentional word splitting of the two fixed flags
+bash "$TOOLS_DIR/install-local-marketplace.sh" $_market_flags \
   || fail "install-local-marketplace.sh exited non-zero" "read its output above (a tag or branch guard, the model pre-warm and pip are the usual causes) and re-run"
 [ -f "$PLUGIN_ROOT/bootstrap.py" ] \
   || fail "the marketplace was assembled but $PLUGIN_ROOT/bootstrap.py is missing" "re-run the build; if it persists the plugin build is broken"
@@ -622,3 +665,4 @@ ENGRAM is installed. What you do next:
   2. If Claude Code asks you to sign in, run:  /login
   3. The first session starts by itself and walks you through the naming dialogue.
 EOF
+[ -z "$SANDBOX_BANNER" ] || printf '\n%s\n' "$SANDBOX_BANNER"

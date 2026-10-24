@@ -1521,6 +1521,12 @@ cmd_spawn() {
     # Matches the historical pattern for agent-borges + agent-mneme.
     local bootstrap_args=("$newborn_tag" "--runtime" "$runtime" "--home-mode" "0750")
     [[ -n "$alpha_source" ]] && bootstrap_args+=("--alpha-source" "$alpha_source")
+    # agent-bootstrap now runs tools/install.sh as the newborn (#4097). agentctl spawn had no
+    # tier of its own, so it names one: `dev` (the multi-agent hosts' working tier).
+    # --multi-agent: spawn always builds a multi-agent seat. --forum-url is passed only when
+    # the operator gave one (agentctl has no other source of a host forum URL).
+    bootstrap_args+=("--tier" "dev" "--multi-agent")
+    [[ $forum_url_given -eq 1 ]] && bootstrap_args+=("--forum-url" "$forum_url")
 
     # Delegate substrate setup. agent-bootstrap prints its own next-steps
     # block; we add a spawn-specific finalize-name reminder below.
@@ -1559,16 +1565,12 @@ The newborn is at $user_name. To complete the birth:
   1. Enter the newborn's bash login shell:
        agentctl bash $newborn_tag
 
-  2. Inside that shell, install Claude Code in the new agent's account.
-       (Follow the current Claude Code install instructions for the platform.)
+  2. Start Claude Code and log in (Claude Code and ENGRAM were installed
+     during spawn, in the newborn's own home):
+       claude                 # then /login at the first prompt
 
-  3. In the first session, ask the agent to install ENGRAM from the
-     plugin marketplace:
-       claude                 # At the first prompt, ask the agent to install
-                              # ENGRAM from the plugin marketplace, then exit.
-                              # On the next session start (after ENGRAM installs),
-                              # the SessionStart hook fires engram-first-session
-                              # → agent generates 3 candidate names → you pick.
+  3. The naming dialogue: the SessionStart hook fires engram-first-session;
+     the agent generates 3 candidate names; you pick collaboratively.
 
   4. From the operator's shell (NOT inside the newborn shell), finalize the rename:
        sudo agentctl finalize-name $newborn_tag <chosen-name>

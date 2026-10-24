@@ -85,6 +85,7 @@ class Sandbox:
         (self.repo / "requirements" / "requirements-dev.txt").write_text("fakedevpkg\n")
         _write(self.tools_src / "install-local-marketplace.sh", """#!/usr/bin/env bash
 echo "marketplace" >> "$CALLS_LOG"
+echo "market-args $*" >> "$CALLS_LOG"
 python3 -c 'import json, os; d = json.load(open(os.path.join(os.environ["ENGRAM_HOME"], "config.json"))); open(os.environ["CALLS_LOG"], "a").write("market-config tier=%s multi_agent=%s\\n" % (d.get("install_tier"), str(d.get("multi_agent")).lower()))'
 [ "${FAKE_MARKET_RC:-0}" = "0" ] || exit "$FAKE_MARKET_RC"
 dest="$ENGRAM_HOME/marketplace/plugins/engram"
@@ -96,7 +97,19 @@ open(os.environ["CALLS_LOG"], "a").write("selfcheck " + " ".join(sys.argv[1:]) +
 print("SELFCHECK fake")
 sys.exit(int(os.environ.get("FAKE_SELFCHECK_RC", "0")))
 """)
-        subprocess.run(["git", "init", "-q", str(self.repo)], check=True, env=self._git_env())
+        # L1 (round 3): step 1 refuses a HEAD that is not a deployable tag merged into origin/dev
+        # or origin/main, using the repo's own src/build/engine/deploy_tag.py. The fixture ships
+        # that one file, then commits, tags v0.0.1 and points refs/remotes/origin/dev at it: the
+        # default Sandbox is a deployable-tag checkout, so only the L1 cells change that.
+        eng = self.repo / "src" / "build" / "engine"
+        eng.mkdir(parents=True)
+        (eng / "__init__.py").write_text("")
+        shutil.copy(REPO_ROOT / "src" / "build" / "engine" / "deploy_tag.py", eng / "deploy_tag.py")
+        genv = {**self._git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+        for cmd in (["init", "-q", "-b", "dev"], ["add", "-A"], ["commit", "-q", "-m", "base"],
+                    ["tag", "v0.0.1"], ["update-ref", "refs/remotes/origin/dev", "HEAD"]):
+            subprocess.run(["git", "-C", str(self.repo), *cmd], check=True, env=genv)
 
     @staticmethod
     def _git_env():
@@ -231,6 +244,22 @@ exec "$REAL_PY" "$@"
         )
         proc.all = proc.stdout + proc.stderr
         return proc
+
+    def git(self, *args):
+        genv = {**self._git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+        return subprocess.run(["git", "-C", str(self.repo), *args], check=True, env=genv,
+                              capture_output=True, text=True).stdout.strip()
+
+    def commit_on_branch(self, branch, tag=None):
+        """A new commit on ``branch`` (not merged into origin/dev); optionally tagged."""
+        self.git("checkout", "-q", "-b", branch)
+        (self.repo / "feature.txt").write_text(branch)
+        self.git("add", "feature.txt")
+        self.git("commit", "-q", "-m", branch)
+        if tag:
+            self.git("tag", tag)
+        return self.git("rev-parse", "HEAD")
 
     def call_lines(self):
         return self.calls.read_text().splitlines()
@@ -801,3 +830,13 @@ def test_live_claude_md_symlink_still_has_its_target_bytes_backed_up(sb):
     assert r.returncode == 0, r.all
     backup = sb.claude_home / "CLAUDE.md.pre-engram"
     assert backup.read_bytes() == original and not backup.is_symlink()
+
+
+def test_header_states_the_step_1_no_fetch_gap():
+    """fold2 item 6 (PR #4123): step 1 never fetches, so stale origin/* refs are refused there.
+    The installer's header comment is its install doc; it must say so and name the remedy."""
+    head = REAL_INSTALL_SH.read_text().split("set -euo pipefail", 1)[0]
+    assert "step 1 never fetches" in head
+    assert "stale" in head and "origin/*" in head
+    assert "--branch" in head and "shallow" in head
+    assert "git fetch --tags origin" in head

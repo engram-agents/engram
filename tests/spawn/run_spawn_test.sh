@@ -3,14 +3,14 @@
 #
 # Phases:
 #   1. agentctl spawn → creates agent-newborn-<timestamp>; assert substrate
-#   2. install.sh as newborn → materialize ENGRAM; assert post-install state
+#   2. (install.sh already ran inside spawn, as the newborn) assert post-install state
 #   3. agentctl finalize-name → rename newborn to a chosen name; assert rename
 #
 # Exit codes:
 #   0 — all phases passed
 #   1 — agentctl spawn or its bootstrap failed
 #   2 — newborn substrate verification failed
-#   3 — newborn install.sh failed
+#   3 — (unused since #4097: install.sh runs inside spawn; its failure is exit 1)
 #   4 — install.sh succeeded but verification found missing artifacts
 #   5 — finalize-name failed or post-rename state is wrong
 
@@ -35,6 +35,18 @@ echo
 # wherever --alpha-source was set.
 cp -r "$ALPHA_DIR" /tmp/alpha
 ALPHA_SOURCE=/tmp/alpha
+# agent-bootstrap clones this source as the newborn and checks out the newest deployable
+# tag that is an ancestor of origin/dev (never the branch head). Give the copy a fresh
+# one-commit history on branch dev with such a tag.
+rm -rf /tmp/alpha/.git
+git -C /tmp/alpha init -q -b dev
+git -C /tmp/alpha add -A
+git -C /tmp/alpha -c user.name=spawn-test -c user.email=spawn-test@example.invalid commit -q -m "spawn-test fixture"
+git -C /tmp/alpha tag v0.0.0-spawntest
+# The newborn clones a root-owned source: agent-bootstrap trusts that one .git for the clone
+# command alone (a scoped GIT_CONFIG_GLOBAL temp file), so the fixture adds NO safe.directory
+# entry: a global one here would mask the very path under test.
+chmod -R a+rX /tmp/alpha
 
 # ---------------------------------------------------------------------
 # Phase 1: agentctl spawn
@@ -115,13 +127,23 @@ echo "Phase 1 verification — ~/.engram directory default ACL (step 5.7):"
 # ~/.engram must exist after spawn (agent-bootstrap mkdir -p's it for the ACL step).
 assert_dir "$NEWBORN_HOME/.engram"
 
-# config.json must NOT exist at this point — the server creates it on first run.
-# A pre-existing stub would pre-empt server.py's default_config initialisation.
-if [[ -f "$NEWBORN_HOME/.engram/config.json" ]]; then
-    echo "FAIL: config.json exists before install.sh — bootstrap must not write a stub." >&2
+# agent-bootstrap itself writes no config.json stub; tools/install.sh (run by agent-bootstrap
+# as the newborn, #4097) creates it. So after spawn it exists and the clone sits on a tag.
+assert_dir "$NEWBORN_HOME/engram-alpha"
+if [ "$(sudo -u "$NEWBORN_USER" -H git -C "$NEWBORN_HOME/engram-alpha" describe --tags --exact-match HEAD)" != "v0.0.0-spawntest" ]; then
+    echo "FAIL: the newborn's clone is not on the deployable tag v0.0.0-spawntest" >&2
     exit 2
 fi
-echo "  ✓ no config.json stub written (server.py will create it on first run)"
+echo "  ✓ newborn clone is on a deployable tag (never the branch head)"
+# No claude symlink into another agent's home or a system path (the old section 5.5).
+if [ -L "$NEWBORN_HOME/.local/bin/claude" ]; then
+    case "$(readlink "$NEWBORN_HOME/.local/bin/claude")" in
+        /home/agent-*|/usr/local/*|/opt/claude/*)
+            echo "FAIL: newborn's claude points outside its own install: $(readlink "$NEWBORN_HOME/.local/bin/claude")" >&2
+            exit 2 ;;
+    esac
+fi
+echo "  ✓ no claude symlink into another home"
 
 # Synthetic ACL tests: exercise the three behavioral paths of step 5.7.
 # The spawn test runs as root with SUDO_USER unset (Docker CMD), so the
@@ -206,14 +228,11 @@ echo "========================================================="
 echo "  Phase 2: install.sh as $NEWBORN_USER"
 echo "========================================================="
 
-# The newborn's ~/.runtime/install.sh wraps alpha's install.sh. Run it
-# under the newborn's uid via sudo (sudo present in the image; the operator's
-# sudoers config doesn't apply here since we're running in a container).
-if ! sudo -u "$NEWBORN_USER" -H bash -lc 'bash ~/.runtime/install.sh'; then
-    echo
-    echo "FAIL: newborn's install.sh exited non-zero." >&2
-    exit 3
-fi
+# tools/install.sh already ran inside Phase 1: agent-bootstrap runs it AS the newborn after
+# creating the substrate (#4097), and agentctl spawn exits non-zero if it failed (exit 1
+# above). Nothing is run here; this phase only verifies the result. (Exit 3 is now
+# unused. The artifact list below predates install.sh and is UNVERIFIED against it: run
+# the container once and reconcile.)
 
 echo
 echo "Phase 2 verification — post-install state under $NEWBORN_HOME:"
