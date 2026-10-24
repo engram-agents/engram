@@ -2318,14 +2318,21 @@ def format_table(result: Dict) -> str:
 
 # --- CLI -------------------------------------------------------------------------
 
+def _load_owner_read():
+    """The shared owner-read helper (tools/_owner_read.py), the ONE ENGRAM_HOME definition (#3863). The repo root is
+    appended to sys.path (never inserted, #2565) so `tools` resolves as it does under pytest."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.append(str(REPO_ROOT))
+    from tools import _owner_read as owner_read
+    return owner_read
+
+
 def _check_store_arg(path: Path) -> Optional[str]:
     """The `--store` precheck (#3962): None for a usable store, else the classifier's one-line message.  It runs
     BEFORE `_is_live_store` (whose `Path.resolve()` raises on a symlink loop) and before any build, layout child or
     temp dir; a FIFO would otherwise hang the child's `mode=ro` connect.  The repo root is appended to sys.path
     (never inserted, #2565) so `tools` resolves as it does under pytest."""
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.append(str(REPO_ROOT))
-    from tools import _owner_read as owner_read
+    owner_read = _load_owner_read()
     try:
         owner_read.check_store_path(path)
     except (FileNotFoundError, owner_read.StoreUnusable) as exc:
@@ -2333,9 +2340,12 @@ def _check_store_arg(path: Path) -> Optional[str]:
     return None
 
 
-def _is_live_store(path: Path) -> bool:
-    live = {Path(os.environ.get("ENGRAM_HOME") or (Path.home() / ".engram")) / "knowledge.db",
-            Path.home() / ".engram" / "knowledge.db"}
+def _is_live_store(path: Path, home: Optional[Path] = None) -> bool:
+    """`home` is this seat's resolved ENGRAM_HOME; omitted, it is resolved here (a relative value raises ValueError,
+    which main() has already turned into its refusal before it gets this far)."""
+    if home is None:
+        home = _load_owner_read().engram_home()
+    live = {home / "knowledge.db", Path.home() / ".engram" / "knowledge.db"}
     target = path.resolve()
     return any(target == p.resolve() for p in live)
 
@@ -2395,6 +2405,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.error("--real-store and --no-real-store are mutually exclusive")
     if args.layout_child:
         return _layout_child(args.layout_child, args.child_kwargs)
+    # The two entry paths that read ENGRAM_HOME: --store (is it this seat's live store?) and --hook surface without
+    # --real-store (the real-store source defaults to the home's store). A RELATIVE value is refused here, before any
+    # other action of the run (#3863); a run that reads neither path never consults the variable.
+    home = None
+    if args.store is not None or (args.hook == "surface" and not args.no_real_store and not args.real_store):
+        try:
+            home = _load_owner_read().engram_home()
+        except ValueError as exc:
+            print(f"engramd_a6_latency: error -- {exc}", file=sys.stderr)
+            return 2
     if args.n < N_FLOOR:
         print(f"engramd_a6_latency: error -- N must be >= {N_FLOOR} (got {args.n})", file=sys.stderr)
         return 2
@@ -2403,7 +2423,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if store_problem is not None:
             print(f"engramd_a6_latency: error -- {store_problem}", file=sys.stderr)
             return 2
-    if args.store is not None and _is_live_store(args.store):
+    if args.store is not None and _is_live_store(args.store, home):
         print(f"engramd_a6_latency: error -- {args.store} is this seat's live store; "
               "refusing. Pass a COPY of a test store.", file=sys.stderr)
         return 2
@@ -2418,8 +2438,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.hook == "surface":
         cells = [("synthetic", None)]
         if not args.no_real_store:
-            real_src = args.real_store or (Path(os.environ.get("ENGRAM_HOME") or (Path.home() / ".engram"))
-                                           / "knowledge.db")
+            real_src = args.real_store or (home / "knowledge.db")
             try:
                 real_is_file = real_src.is_file()
             except OSError:   # an unsearchable parent: is_file() raises PermissionError on 3.12 (#3962)

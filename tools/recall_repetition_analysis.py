@@ -31,7 +31,15 @@ import json
 import os
 import sqlite3
 import statistics
+import sys
 from collections import defaultdict, Counter
+
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). The repo root (the parent of this
+# file's directory) is appended, never inserted at [0] (#2565, #4054).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
 
 WINDOWS = [1, 3, 5, 10]
 
@@ -50,8 +58,9 @@ FULL_TIER_SLOTS = 6         # 3 specials + 3 top_claims, per format_nudge()
 def _default_db_path() -> str:
     """Resolve the index.db path: $ENGRAM_HOME/logs/index.db, falling back to
     ~/.engram/logs/index.db when ENGRAM_HOME is unset (matches the hook's own
-    _resolve_engram_home() precedent)."""
-    engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+    _resolve_engram_home() precedent). The home goes through the one resolver (#3863): a RELATIVE ENGRAM_HOME raises
+    ValueError naming it (main() turns that into a one-line refusal, exit 2)."""
+    engram_home = str(owner_read.engram_home())
     return os.path.join(engram_home, "logs", "index.db")
 
 
@@ -132,7 +141,11 @@ def main():
              "~/.engram/logs/index.db if ENGRAM_HOME is unset).",
     )
     args = parser.parse_args()
-    db_path = args.db_path or _default_db_path()
+    try:
+        db_path = args.db_path or _default_db_path()
+    except ValueError as exc:  # a relative ENGRAM_HOME: refused before any database is opened
+        print(f"recall_repetition_analysis: {exc}", file=sys.stderr)
+        return 2
 
     by_session = load_events(db_path)
     n_sessions = len(by_session)
@@ -180,4 +193,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -122,13 +122,25 @@ for _candidate in (_HERE.parent / "src" / "engram", _HERE.parent):
             sys.path.append(str(_candidate))
         break
 
-import engram_core as core  # noqa: E402
-
-# The store-path classifier (#3962). Repo-root tools/_owner_read.py is a symlink into src/engram/tools/; the repo
-# root is appended (never insert(0), #2565) so `tools` resolves the same way it does under pytest.
+# The store-path classifier (#3962) and the ONE ENGRAM_HOME definition (#3863). Repo-root tools/_owner_read.py is a
+# symlink into src/engram/tools/; the repo root is appended (never insert(0), #2565) so `tools` resolves the same way
+# it does under pytest.
 if str(_HERE.parent) not in sys.path:
     sys.path.append(str(_HERE.parent))
 from tools import _owner_read as owner_read  # noqa: E402
+
+# engram_core refuses a RELATIVE ENGRAM_HOME at import (#3863 step 2), which would be a traceback here. Resolve the
+# home first: on a refusal the import is skipped (core is None, `--help` and an importing test keep working) and
+# main() refuses in one line before any other action. Unset or absolute: the import is exactly what it was.
+try:
+    owner_read.engram_home()
+    _HOME_REFUSAL = None
+except ValueError as _exc:
+    _HOME_REFUSAL = str(_exc)
+if _HOME_REFUSAL is None:
+    import engram_core as core  # noqa: E402
+else:
+    core = None
 
 
 # --- tiers ------------------------------------------------------------------
@@ -668,8 +680,7 @@ def _render_candidate(cand, summaries):
 # --- cli --------------------------------------------------------------------
 
 def default_db_path() -> Path:
-    home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
-    return Path(home) / "knowledge.db"
+    return owner_read.default_db_path()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -693,6 +704,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if _HOME_REFUSAL is not None:  # even beside --db: engram_core, which this tool imports, needs a valid home
+        print(f"propose-generalizes-migration: {_HOME_REFUSAL}", file=sys.stderr)
+        return 2
     db_path = Path(args.db).expanduser() if args.db else default_db_path()
 
     try:

@@ -52,7 +52,19 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SRC_ENGRAM = PROJECT_ROOT / "src" / "engram"
 HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-lesson-tripwire-hook.py"
 
-DEFAULT_ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). The repo root is appended, never
+# inserted at [0] (#2565, #4054). A RELATIVE ENGRAM_HOME must not raise at import (`--help` and an importing test
+# keep working): the refusal is recorded, DEFAULT_ENGRAM_HOME is None, and main() refuses before any other action.
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+from tools import _owner_read as owner_read  # noqa: E402
+
+try:
+    DEFAULT_ENGRAM_HOME = str(owner_read.engram_home())
+    _HOME_REFUSAL = None
+except ValueError as _exc:
+    DEFAULT_ENGRAM_HOME = None
+    _HOME_REFUSAL = str(_exc)
 
 # Realistic match_target strings -- rich prose shaped like real MCP tool_input
 # payloads (claim/interpretation text), NOT short generic CLI commands.
@@ -285,6 +297,9 @@ def main(argv=None) -> None:
     )
     p.add_argument("--json-out")
     args = p.parse_args(argv)
+    if args.engram_home is None:  # only a refused ENGRAM_HOME leaves the default None; an explicit --engram-home wins
+        print(f"bench_in_turn_recall: {_HOME_REFUSAL}", file=sys.stderr)
+        sys.exit(2)
 
     levels = [int(x) for x in args.concurrency.split(",")]
     report = run(args.engram_home, args.n_calls, levels,

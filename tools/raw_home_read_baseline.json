@@ -8,16 +8,9 @@
     "src/engram/viz/agents.py": 2,
     "src/engram/viz/version_info.py": 1,
     "tools/borges_session_eval.py": 1,
-    "tools/engram-backfill-special-moment-edges.py": 1,
-    "tools/engramd_a6_latency.py": 3,
+    "tools/engramd_a6_latency.py": 1,
     "tools/home_path_gate.py": 1,
-    "tools/perf/bench_in_turn_recall.py": 2,
-    "tools/probes/mods-recall/novel_terms.py": 1,
-    "tools/propose-generalizes-migration.py": 1,
-    "tools/rc-upgrade-verify.py": 1,
-    "tools/recall_measurement_harness.py": 1,
-    "tools/recall_repetition_analysis.py": 1,
-    "tools/ws4/extract_spans.py": 1
+    "tools/perf/bench_in_turn_recall.py": 1
   },
   "allowlist": {
     "src/engram/tools/_owner_read.py": {

@@ -35,9 +35,15 @@ Progress and the final edge count are reported to stderr.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
+
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). The repo root is appended, never
+# inserted at [0] (#2565, #4054): src/engram at the front of sys.path would outrank the repo-root tools/ package.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +168,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--engram-home",
-        default=os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"),
+        default=None,  # resolved after parsing, so building the parser (--help) never raises on a relative value
         help="Path to the ENGRAM data directory (default: $ENGRAM_HOME or ~/.engram)",
     )
     parser.add_argument(
@@ -172,6 +178,12 @@ def main() -> int:
         help="Report how many edges would be created without writing anything.",
     )
     args = parser.parse_args()
+    if args.engram_home is None:
+        try:
+            args.engram_home = str(owner_read.engram_home())
+        except ValueError as exc:  # a relative ENGRAM_HOME: refused before anything is opened or written
+            print(f"engram-backfill-special-moment-edges: {exc}", file=sys.stderr)
+            return 2
     engram_home = Path(args.engram_home).expanduser().resolve()
     run_backfill(engram_home, dry_run=args.dry_run)
     return 0
