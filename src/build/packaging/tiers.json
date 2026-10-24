@@ -534,6 +534,11 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/s2_clause_sheet.py",
+      "tier": "dev",
+      "note": "engram-alpha#4050 S2: single-purpose clause-check sheet builder for the team's pre-registered blind study; a team study tool, not a user tool. Dev tier, and kept out of the public release by release-minus-set.txt. Its scrub roster is supplied by the seat at run time and is never committed."
+    },
+    {
       "path": "tools/weakest_load_bearing.py",
       "tier": "convenience"
     },

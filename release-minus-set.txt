@@ -17,6 +17,12 @@ tools/telegram_bot.py
 tools/_telegram_api.py
 tools/borges_session_eval.py
 
+# --- Team study tools (single-purpose, built for one pre-registered study; not a
+#     user tool). Dev tier in tiers.json. The path is repo-root-relative, so it
+#     carries the src/engram/ source root. Its test file lives under tests/, which
+#     is already excluded wholesale below. ---
+src/engram/tools/s2_clause_sheet.py
+
 # --- Dev test suite (lives in the private engram-alpha; the public repo is a
 #     user-facing release snapshot). Also avoids publishing leak-detection test
 #     fixtures that intentionally embed scanner patterns, which would otherwise

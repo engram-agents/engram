@@ -381,6 +381,14 @@
       "note": "engram-alpha#4050 S1: read-only survey. The cells load it by path and run it as a subprocess (invisible to the layer-1 import graph); it also reuses anchoring_report's population query and read-only open, so that tool's cells ride along."
     },
     {
+      "path_prefix_or_glob": "tools/s2_clause_sheet.py",
+      "test_globs": [
+        "tests/test_s2_clause_sheet_4050.py",
+        "tests/test_quote_quality_survey_4050.py"
+      ],
+      "note": "engram-alpha#4050 S2: clause-check sheet builder. The cells load it by path (invisible to the layer-1 import graph); it reuses quote_quality_survey's helpers by import, so that tool's cells ride along."
+    },
+    {
       "path_prefix_or_glob": "tools/weakest_load_bearing.py",
       "test_globs": [
         "tests/test_weakest_load_bearing.py",
