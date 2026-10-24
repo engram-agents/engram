@@ -144,9 +144,10 @@ def _sys_path_collision_guard():
     yield
 
 
-# #4023 / #4029 -- modules that left `sys.path[0]` inside src/engram. HARD since
-# #4029: the module-scope fixture below raises at that module's teardown, naming
-# it, after restoring `sys.path` exactly. The name is also collected here and
+# #4023 / #4029 -- modules that leaked into `sys.path`: `sys.path[0]` changed to
+# an entry inside src/engram, or (since #4093) a new src/engram entry at any
+# position. HARD since #4029: the module-scope fixture below raises at that
+# module's teardown, naming it, after restoring `sys.path` exactly. The name is also collected here and
 # printed as ONE line at session end by `pytest_terminal_summary` (only when N > 0,
 # so a clean run prints nothing). The way to be clean is the shared window in
 # tests/_hook_load_window.py (fixtures `isolate_hook_loads` /
@@ -158,6 +159,9 @@ def _sys_path_collision_guard():
 # differs), nor (b) a module that re-inserts an entry another module already left
 # in front -- which is also why a many-module run names far fewer modules than
 # running each alone. The result is a lower bound on polluters, not an inventory.
+# CLOSED (#4093): (c) a leak behind a non-`src` front entry (a tmp runtime dir in
+# front, the leaked `src/engram/...` entry further back) is now caught by the
+# new-entry rule in `_path_leak_problem`; (a) and (b) above remain.
 # Import-time attribution is NOT part of #4029 (it needs a collection-time hook).
 # Single-process only: this repo does not use xdist (not in pytest.ini or any
 # CI config); under xdist each worker would hold its own set and the controller
@@ -166,15 +170,33 @@ _PATH_LEAKS: set = set()
 
 
 def _path_leak_problem(path_before):
-    """`sys.path[0]` now inside `src/engram` and different from what it was at
-    the module's setup, else None. A leak made before setup (import time) or a
-    re-insert of the entry already in front is NOT reported."""
+    """A problem message when EITHER rule fires, else None (#4093):
+      1. `sys.path[0]` is now inside `src/engram` and differs from what it was at
+         the module's setup;
+      2. `sys.path` holds an entry inside `src/engram` (abspath == SRC_ENGRAM or
+         under SRC_ENGRAM + os.sep) whose abspath was not anywhere in
+         `path_before`, at any position.
+    Both firing give ONE message naming both. A leak made before setup (import
+    time), a re-insert of an entry already present at setup, an entry outside
+    `src/engram`, and `<repo>/src/engram_other` are NOT reported."""
+    parts = []
     front = sys.path[0] if sys.path else None
     before = path_before[0] if path_before else None
     if (front is not None and front != before
             and os.path.abspath(front).startswith(SRC_ENGRAM)):
-        return f"sys.path[0] now points inside src/engram ({front!r}); it was {before!r}"
-    return None
+        parts.append(f"sys.path[0] now points inside src/engram ({front!r}); it was {before!r}")
+
+    def _inside(paths):
+        return {a for a in (os.path.abspath(p) for p in paths if isinstance(p, str))
+                if a == SRC_ENGRAM or a.startswith(SRC_ENGRAM + os.sep)}
+
+    new = sorted(_inside(sys.path) - _inside(path_before))
+    if new:
+        shown = ", ".join(repr(p) for p in new[:3])
+        more = "" if len(new) <= 3 else ", ..."
+        parts.append(f"sys.path gained {len(new)} new src/engram "
+                     f"entr{'y' if len(new) == 1 else 'ies'} ({shown}{more})")
+    return "; ".join(parts) if parts else None
 
 
 def _tools_problem(module_name, tools_before):
@@ -200,8 +222,9 @@ def _polluter_side_state_check(request):
     """#4023 / #4029: name a polluter at its OWN module. Records `sys.path` and the
     cached `tools` at module setup. At teardown, BOTH halves are hard errors naming
     the module (a teardown error on its last test, attributable per module): a
-    `tools` eviction/replacement, and a `sys.path[0]` leak into src/engram made
-    after setup (see the coverage limits above `_PATH_LEAKS`). State is restored
+    `tools` eviction/replacement, and a `sys.path` leak into src/engram made
+    after setup (the `[0]` rule, or a new src/engram entry at any position; see
+    the coverage limits above `_PATH_LEAKS`). State is restored
     EXACTLY first -- `tools` / `tools.*` (entries added since are dropped, captured
     ones put back) and `sys.path` (to its setup list) -- and only then raised, so
     the error names the polluter without cascading into later modules. Both
