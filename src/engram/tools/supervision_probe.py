@@ -231,7 +231,8 @@ def seat_name(engram_home: Path) -> str:
     forum.py's network-client dependencies for a one-line lookup.
     """
     config = _load_config(engram_home)
-    name = str(config.get("agent_name", "")).strip()
+    _v = config.get("agent_name")  # #4137: null / non-string -> "" (never the name "None")
+    name = _v.strip() if isinstance(_v, str) else ""
     if name:
         return name
 

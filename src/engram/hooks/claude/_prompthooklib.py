@@ -289,7 +289,8 @@ def get_agent_name(
     """
     if config is None:
         config = load_config(engram_home)
-    name = config.get("agent_name", "").strip()
+    _v = config.get("agent_name")  # #4137: null / non-string -> ""
+    name = _v.strip() if isinstance(_v, str) else ""
     if name:
         return name
 

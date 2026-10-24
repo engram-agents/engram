@@ -1573,8 +1573,9 @@ def update_counterparts_from_registry(
             if not isinstance(record, dict):
                 continue
 
-            peer_name = record.get("agent_name", "").strip()
-            peer_hostname = record.get("hostname", "").strip()
+            _n, _h = record.get("agent_name"), record.get("hostname")  # #4137: null / non-string -> ""
+            peer_name = _n.strip() if isinstance(_n, str) else ""
+            peer_hostname = _h.strip() if isinstance(_h, str) else ""
 
             # Must have both name and hostname
             if not peer_name or not peer_hostname:
@@ -1656,8 +1657,9 @@ def peer_topology_block(agent_name: str) -> str:
             except (OSError, json.JSONDecodeError, ValueError):
                 continue
 
-            peer_name = record.get("agent_name", "").strip()
-            hostname = record.get("hostname", "").strip()
+            _n, _h = record.get("agent_name"), record.get("hostname")  # #4137: null / non-string -> ""
+            peer_name = _n.strip() if isinstance(_n, str) else ""
+            hostname = _h.strip() if isinstance(_h, str) else ""
             if not peer_name or not hostname or peer_name.lower() == agent_name.lower():
                 continue
 
@@ -3855,7 +3857,8 @@ def _main_impl() -> None:
         _config_path = os.path.join(ENGRAM_HOME, "config.json")
         with open_regular_text(_config_path) as _cf:
             _cfg = json.load(_cf)
-        _agent_name = _cfg.get("agent_name", "").strip()
+        _v = _cfg.get("agent_name")  # #4137: null / non-string -> ""
+        _agent_name = _v.strip() if isinstance(_v, str) else ""
         if _agent_name:
             write_agent_registration(_agent_name)
             update_counterparts_from_registry(_agent_name, _config_path, AGENT_REGISTRY_DIR)

@@ -91,7 +91,8 @@ def _load_config() -> dict:
 
 
 def _get_agent_name(config: dict) -> str:
-    name = config.get("agent_name", "").strip()
+    _v = config.get("agent_name")  # #4137: null / non-string -> ""
+    name = _v.strip() if isinstance(_v, str) else ""
     if name:
         return name
     for envvar in ("USER", "LOGNAME"):

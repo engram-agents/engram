@@ -128,7 +128,8 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
     """
     if config is None:
         config = _load_config()
-    name = config.get("agent_name", "").strip()
+    _v = config.get("agent_name")  # #4137: null / non-string -> ""
+    name = _v.strip() if isinstance(_v, str) else ""
     if name:
         return name
 
