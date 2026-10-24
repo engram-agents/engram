@@ -811,3 +811,63 @@ load-bearing requirement (the guard must distinguish a fresh start from a
 continuation, and anchor on the filesystem marker rather than on
 compaction-destroyed recollection); #486 (the specialized skills now reference
 this SSoT for the guard rather than each carrying their own).
+
+---
+
+## Tick rule (Quiet Wake Check — known-return waits)
+
+**Canonical text — CLAUDE.md template and the Practices Handbook will carry only
+a pointer here (umwelt pointer pending). Change thresholds here, not in those surfaces.**
+
+A heartbeat tick during a **known-return wait** (a `waiting_on` declaration
+with `return_by` in the future) follows the threshold **N =
+`_WAITING_ON_NEAR_ZONE_MINUTES` (~10 minutes)**:
+
+- **`return_by` within N of now** — wait is almost over; hook is quiet, no
+  block. A systemMessage advisory is fine. Counter keeps counting.
+- **`return_by` more than N away, first trigger** — long wait; hook emits
+  exactly **one** block: "a wait longer than one study unit earns one bounded
+  study unit." After that block the once-only flag is set and the hook is quiet
+  until `return_by`.
+- **`return_by` more than N away, flag set** — quiet (systemMessage advisory);
+  counter keeps counting and resets normally.
+
+A wait with no `return_by`, or one whose `return_by` has passed, is not a
+known-return wait — the normal Quiet Wake Check demand applies. A Monitor
+expiry or re-arm is a WAKE, not a tick; inside a known-return wait it is quiet
+too. Parallel background lanes may fill a long wait; the bound is foreground
+threads.
+
+### Declaring a bounded wait
+
+Write a `waiting_on` field into `~/.engram/loop-mode.json` (under `$ENGRAM_HOME`, default `~/.engram`) when starting a bounded wait:
+
+    {
+      "waiting_on": {
+        "description": "coder-fairy for PR #4044",
+        "return_by": "2026-10-22T10:30:00Z"
+      }
+    }
+
+Remove the field (or set it to null) when the result arrives. The loop-arm
+Stop hook reads it on each turn and applies the tick rule above; the counter
+keeps counting and resets the same way.
+
+Convenience snippet — update in place atomically:
+
+    rb=$(date -u -v+15M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+         || date -u -d'+15 minutes' +%Y-%m-%dT%H:%M:%SZ) \
+      && python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" \
+           waiting_on '{"description":"describe the wait","return_by":"'"$rb"'"}'
+
+Clear when done:
+
+    python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" \
+      waiting_on null
+
+**Write `waiting_on` when:** dispatching a coder-fairy, waiting for CI,
+waiting for a short known-duration Monitor expiry.
+
+**Omit for** open-ended waits (a counterpart deliberating, the user's
+response) — unknown-return waits are genuinely not bounded waits and the
+normal check applies.

@@ -681,6 +681,36 @@ def _pacer_is_schedule_wakeup(loop_marker_path: str) -> bool:
     return pacer.strip().lower() == _SCHEDULE_WAKEUP_PACER
 
 
+def _read_waiting_on(loop_marker_path: str) -> tuple[str, str] | None:
+    """Return (description, return_by_str) if the loop marker carries an
+    active (not yet expired) waiting_on declaration; None otherwise.
+
+    Active = present, description is a non-empty string, return_by parses
+    as a future ISO-8601 timestamp. Any exception → None (never raises).
+    """
+    try:
+        with open_regular_text(loop_marker_path, encoding="utf-8") as f:
+            marker = json.load(f)
+        wo = marker.get("waiting_on")
+        if not isinstance(wo, dict):
+            return None
+        desc = wo.get("description")
+        rb_str = wo.get("return_by")
+        if not isinstance(desc, str) or not desc.strip():
+            return None
+        if not isinstance(rb_str, str) or not rb_str.strip():
+            return None
+        rb = datetime.fromisoformat(rb_str.replace("Z", "+00:00"))
+        if rb.tzinfo is None:
+            rb = rb.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if rb <= now:
+            return None
+        return desc.strip(), rb_str.strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _tool_use_prompt_text(block: dict) -> str:
     """Extract the `prompt` input parameter's text from a tool_use block.
 
@@ -811,6 +841,10 @@ def _delta_has_arm_confirmation(transcript_path: str) -> bool:
 # Consecutive quiet wakes before the nudge fires.
 QUIET_TICKS_THRESHOLD = 2
 
+# Within N: quiet, no block (systemMessage advisory fine).
+# Beyond N, first trigger: one study-unit block, then quiet until return_by.
+_WAITING_ON_NEAR_ZONE_MINUTES = 10
+
 # A REVIEWED constant: adding a verb is a deliberate change (a contract cell
 # pins the exact membership). Plain harness tools, plus umwelt's MCP READ verbs
 # (matched by the part after the last `__`, on an umwelt server only -- see
@@ -834,6 +868,21 @@ _QUIET_NUDGE_TEXT = (
     "`python3 tools/study_queue.py` once it exists (alpha #3919 M3); until "
     "then read the latest dream report's `For the awake seat` section "
     "(`~/.engram/history/dream/`, most recent file).]"
+)
+
+_QUIET_ADVISORY_TEXT = (
+    "[Tick Rule — known-return wait: {n} quiet wake(s) while waiting for "
+    "\"{desc}\" (return by {rb_str}). Inside a declared bounded wait, quiet "
+    "wakes are expected — this is advisory, not a demand. Counter reset. "
+    "Full tick rule: engram-loop skill.]"
+)
+
+_QUIET_STUDY_UNIT_TEXT = (
+    "[Tick Rule — study unit: waiting for \"{desc}\" (return by {rb_str}). "
+    "This wait is longer than one study unit. Take one bounded study unit "
+    "— one target, one method, one written ENGRAM result — before the "
+    "quiet hold begins. After this unit the hook is quiet until return_by. "
+    "Full tick rule: engram-loop skill.]"
 )
 
 _BASH_PIPE_SINKS = frozenset({"head", "tail", "wc", "grep", "sort", "uniq", "cut"})
@@ -1355,8 +1404,26 @@ def _read_quiet_ticks(transcript_path: str) -> int:
     return 0
 
 
-def _write_quiet_ticks(transcript_path: str, ticks: int) -> None:
-    data = {"transcript_path": transcript_path, "quiet_ticks": ticks}
+def _read_waiting_on_block_rb(transcript_path: str) -> str | None:
+    """Return the return_by string for which the once-only study-unit block has
+    already fired, or None if it hasn't fired yet for this transcript."""
+    try:
+        with open_regular_text(_QUIET_WAKE_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("transcript_path") != transcript_path:
+            return None
+        rb = data.get("waiting_on_block_rb")
+        return rb if isinstance(rb, str) and not isinstance(rb, bool) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _write_quiet_ticks(
+    transcript_path: str, ticks: int, waiting_on_block_rb: str | None = None
+) -> None:
+    data: dict = {"transcript_path": transcript_path, "quiet_ticks": ticks}
+    if waiting_on_block_rb is not None:
+        data["waiting_on_block_rb"] = waiting_on_block_rb
     if _atomic_write_json is not None:
         _atomic_write_json(_QUIET_WAKE_STATE_FILE, data, encoding="utf-8")
         return
@@ -1374,19 +1441,54 @@ def _write_quiet_ticks(transcript_path: str, ticks: int) -> None:
         raise
 
 
-def _quiet_wake_step(transcript_path: str, can_nudge: bool) -> int | None:
-    """Classify this turn, update + persist the counter. Returns the tick count
-    the nudge should name when a quiet-wake nudge is due AND may be emitted
-    (`can_nudge`: the arm-check nudge is not itself firing this turn), else None.
-    On a due nudge the stored count resets to 0. Additive: never raises."""
+def _quiet_wake_step(
+    transcript_path: str, can_nudge: bool
+) -> tuple[str, bool] | None:
+    """Classify this turn, update + persist the counter.
+
+    Returns (reason, is_block) when a nudge is due AND can_nudge; else None.
+    is_block=True → emit decision:block; False → emit systemMessage only.
+
+    Waiting-on zones (threshold N = _WAITING_ON_NEAR_ZONE_MINUTES):
+    - No active waiting_on → demand (block=True).
+    - return_by within N → advisory systemMessage (block=False).
+    - return_by beyond N, once-only not yet fired → study-unit block (block=True),
+      records the fired flag alongside quiet_ticks.
+    - return_by beyond N, flag set → advisory systemMessage (block=False).
+    Counter increments and resets identically in all cases. Additive: never raises.
+    """
     try:
         delta = _read_turn_delta(transcript_path)
         if delta is None:
             return None  # unreadable: leave the counter alone
         ticks = _read_quiet_ticks(transcript_path) + 1 if _delta_is_quiet_wake(delta) else 0
         due = ticks >= QUIET_TICKS_THRESHOLD and can_nudge
-        _write_quiet_ticks(transcript_path, 0 if due else ticks)
-        return ticks if due else None
+        block_rb = _read_waiting_on_block_rb(transcript_path)
+        if not due:
+            _write_quiet_ticks(transcript_path, ticks, block_rb)
+            return None
+        wo = _read_waiting_on(LOOP_MARKER_PATH)
+        if wo is not None:
+            desc, rb_str = wo
+            rb = datetime.fromisoformat(rb_str.replace("Z", "+00:00"))
+            if rb.tzinfo is None:
+                rb = rb.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if rb - now <= timedelta(minutes=_WAITING_ON_NEAR_ZONE_MINUTES):
+                # Within N: quiet, advisory as systemMessage only
+                _write_quiet_ticks(transcript_path, 0, block_rb)
+                return _QUIET_ADVISORY_TEXT.format(n=ticks, desc=desc, rb_str=rb_str), False
+            # Beyond N: check once-only flag
+            if block_rb == rb_str:
+                # Already fired: advisory as systemMessage, preserve flag
+                _write_quiet_ticks(transcript_path, 0, rb_str)
+                return _QUIET_ADVISORY_TEXT.format(n=ticks, desc=desc, rb_str=rb_str), False
+            # First time beyond N: study-unit block, set flag
+            _write_quiet_ticks(transcript_path, 0, rb_str)
+            return _QUIET_STUDY_UNIT_TEXT.format(desc=desc, rb_str=rb_str), True
+        # No active waiting_on: normal demand, clear any stale flag
+        _write_quiet_ticks(transcript_path, 0)
+        return _QUIET_NUDGE_TEXT.format(n=ticks), True
     except Exception:  # noqa: BLE001
         return None
 
@@ -1535,13 +1637,17 @@ def main() -> None:
     # alpha #3919 M2: runs BEFORE the confirmed-early-return (a quiet turn
     # normally DOES contain the re-arm) and BEFORE the offset write (it reads
     # the same delta). It never emits when the arm-check nudge is firing.
-    quiet_due = _quiet_wake_step(transcript_path, can_nudge=confirmed)
+    quiet_result = _quiet_wake_step(transcript_path, can_nudge=confirmed)
 
     if confirmed:
         if _STOPHOOKLIB_OK:
             _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
-        if quiet_due is not None:
-            print(json.dumps({"decision": "block", "reason": _QUIET_NUDGE_TEXT.format(n=quiet_due)}))
+        if quiet_result is not None:
+            reason, is_block = quiet_result
+            if is_block:
+                print(json.dumps({"decision": "block", "reason": reason}))
+            else:
+                print(json.dumps({"systemMessage": reason}))
         return
 
     # Single, lib-independent emission path (2026-08-12 blocking-decision
