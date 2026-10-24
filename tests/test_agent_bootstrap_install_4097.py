@@ -783,8 +783,10 @@ class TestFold2SignalTrap:
         src = make_source(tmp_path, tags={"v0.1.0": "c2"})
         env["GIT_CLONE_SLEEP"] = "2"
         script = f'set -u\nsource "{BOOTSTRAP}"\n' + install_body(home, src)
+        # POSIX: a non-interactive shell cannot trap a signal ignored at its start, so reset it in the child
         proc = subprocess.Popen(["bash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, env=env, start_new_session=True)
+                                text=True, env=env, start_new_session=True,
+                                preexec_fn=lambda: signal.signal(sig, signal.SIG_DFL))
         started = tmp_path / "git.log.clone-started"
         deadline = time.time() + 30
         while not started.exists() and time.time() < deadline:
