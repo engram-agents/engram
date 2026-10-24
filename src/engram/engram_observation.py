@@ -70,6 +70,7 @@ import errno
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -82,6 +83,7 @@ from urllib.parse import urlparse
 
 import engram_core as core
 from engram_anchoring import anchor as _anchor_claim
+from engram_anchoring import LOW_QUOTE_CLAIM_SIMILARITY
 from engram_anchoring import quote_claim_similarity as _quote_claim_similarity
 from engram_log_emitter import Emitter, emit_if_initialized
 
@@ -1431,6 +1433,19 @@ def _build_anchoring_advisory(
                 "quote — widen the quote, move the fact to `interpretation`, or "
                 "downgrade quote_type. Advisory only (#2602 facet 2)."
             )
+        # Strictly below the floor, and only for a real measurement: a None
+        # similarity (embedder unavailable) must never read as a low one.
+        low_similarity = similarity is not None and similarity < LOW_QUOTE_CLAIM_SIMILARITY
+        if low_similarity:
+            # Floor, not round: {:.2f} would show 0.1996 as "0.20 is below 0.2".
+            shown_similarity = math.floor(similarity * 100) / 100
+            advisory["low_similarity_hint"] = (
+                f"quote-claim similarity {shown_similarity:.2f} is below "
+                f"{LOW_QUOTE_CLAIM_SIMILARITY:g}: the quote may not carry this "
+                "claim. Widen the quote, narrow the claim to what the quote says, "
+                "or move the rest into a derivation with its own premises. "
+                "Advisory only (#4050)."
+            )
 
         _log_anchoring_advisory({
             "ts": core._now(),
@@ -1447,6 +1462,7 @@ def _build_anchoring_advisory(
             "interp_len": len(interpretation or ""),
             "body_to_quote_ratio": body_to_quote_ratio,
             "quote_claim_similarity": similarity,
+            "low_similarity": low_similarity,
         })
         return advisory
     except Exception as exc:  # noqa: BLE001 — advisory must never fail a write
