@@ -1567,6 +1567,40 @@ def test_main_real_store_source_can_be_named_and_a_missing_one_is_exit_2(tool, t
     assert "real-store" in capsys.readouterr().err
 
 
+def test_a_symlink_to_a_regular_file_is_an_accepted_real_store_source(tool, tmp_path, monkeypatch):
+    """`os.stat` follows symlinks, exactly as the pre-#4131 `Path.is_file()` did: a symlink to a regular file is a
+    usable `--real-store` source. Mutation: `os.stat` -> `os.lstat` inside `_classify_real_store` -> red (the
+    helper assert above fires: `_classify_real_store(link)` answers the not-a-file line, so it is not None --
+    `main()` is never reached); the call-site cell stays green."""
+    db = _make_db(tmp_path / "store")
+    link = _symlink_to(db, tmp_path)
+    assert tool._classify_real_store(link) is None
+    _patch_cli(tool, monkeypatch, [])
+    assert tool.main(["--hook", "surface", "--real-store", str(link)]) == 0
+
+
+def test_the_real_store_call_site_never_consults_path_is_file(tool, tmp_path, monkeypatch, capsys):
+    """The call site goes through `_classify_real_store` on any interpreter: `Path.is_file` answering False for
+    the real-store source alone is never consulted, so the run completes. Mutation: re-inline the pre-#4131
+    `if not real_src.is_file(): ... return 2` at the call site -> red here even on 3.12 (every helper mutant
+    stays green); the symlink cell stays green."""
+    src = _make_db(tmp_path / "store")
+    _patch_cli(tool, monkeypatch, [])
+    original = Path.is_file
+
+    def pinned(self):
+        return False if self == src else original(self)
+
+    calls = []
+    orig_classify = tool._classify_real_store
+    monkeypatch.setattr(tool, "_classify_real_store",
+                        lambda p: (calls.append(p), orig_classify(p))[1])
+    monkeypatch.setattr(Path, "is_file", pinned)
+    assert tool.main(["--hook", "surface", "--real-store", str(src)]) == 0
+    assert calls == [src]        # routes through the helper, not a re-inlined existence probe
+    assert "is not a file" not in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("argv", [
     ["--hook", "surface", "--exclusion", "on"],
     ["--hook", "surface", "--store", "x.db"],
