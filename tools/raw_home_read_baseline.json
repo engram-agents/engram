@@ -5,8 +5,6 @@
     "tools/"
   ],
   "baseline": {
-    "src/engram/viz/agents.py": 2,
-    "src/engram/viz/version_info.py": 1,
     "tools/borges_session_eval.py": 1,
     "tools/engramd_a6_latency.py": 1,
     "tools/home_path_gate.py": 1,

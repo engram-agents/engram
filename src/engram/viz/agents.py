@@ -28,12 +28,20 @@ from urllib.parse import parse_qs
 
 from .data.sqlite_ro import connect_ro
 
+try:  # flat runtime module: installed plugin / src/engram on sys.path (the sqlite_ro.py pair; #3863 step 3c-i)
+    from engram_home_resolver import engram_home, engram_home_or_none
+except ImportError:  # source checkout with only `src` on PYTHONPATH: same file, package-qualified
+    from engram.engram_home_resolver import engram_home, engram_home_or_none
+
 # Renamed from the original "viz_server.discover" to match this module's
 # new home -- a diagnostic-only name (log filtering), not part of the
 # byte-identical served-output contract this PR's acceptance gates check.
 _disc_log = logging.getLogger("viz.agents.discover")
 
-_ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+# #3863 step 3c-i (the rulings: engram_home_resolver's docstring): viz is a process entry point, so a RELATIVE
+# ENGRAM_HOME raises ValueError here, at import, naming the value (no wrapper; not an ImportError, so the fallback
+# import above does not swallow it).
+_ENGRAM_HOME = str(engram_home())
 DEFAULT_DB = str(Path(_ENGRAM_HOME) / "knowledge.db")
 DEFAULT_PORT = 5001
 
@@ -68,8 +76,10 @@ def _own_agent_name() -> str:
     raises — callers treat a blank return as "own agent unknown, fall back".
     """
     try:
-        engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-        config_path = os.path.join(engram_home, "config.json")
+        home = engram_home_or_none()  # #3863 step 3c-i: a refused (relative) value -> own agent unknown
+        if home is None:
+            return ""
+        config_path = os.path.join(str(home), "config.json")
         with open(config_path) as f:
             cfg = json.load(f)
         name = cfg.get("agent_name", "")
