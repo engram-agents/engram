@@ -59,35 +59,47 @@ class ConfigUnreadableError(ValueError):
         )
 
 
-def _create_temp(target: Path):
-    """Create a fresh temp file beside ``target`` with mode 0o666 (so umask or
-    the directory's default ACL decides, as for any new file)."""
+def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = True) -> None:
+    """Atomically replace ``path`` with ``text`` (#4013).  The one shared
+    mode- and group-preserving writer: an existing file keeps its permission
+    bits and, where permitted, its group; a new file gets what ``write_text``
+    would give it (umask or the directory's default ACL).  By default a symlink
+    is followed (the link stays, its target changes).  With
+    ``follow_symlinks=False`` the path itself is replaced: a symlink (live or
+    dangling) is swapped for a regular file, what it pointed at is never
+    touched or created, and mode and group are copied only from an existing
+    REGULAR file, never from a link's target.  Pass ``follow_symlinks=False`` for any path under a
+    directory other users can write (a planted link would otherwise redirect the write); the default
+    True exists for paths the caller owns and links on purpose, such as config.json via
+    ``write_config_json``.  Needs write access to the containing directory (same-UID
+    callers).  On any error the temp file is removed and the error re-raised;
+    ``path`` is never left partial.  Kept AST-identical with
+    ``hooks/claude/_hooklib.atomic_write_text`` (tests/test_atomic_writer_modes_4013.py)."""
+    target = os.path.realpath(path) if follow_symlinks else os.path.abspath(path)
+    try:
+        st = os.stat(target) if follow_symlinks else os.lstat(target)
+    except OSError:
+        st = None
+    copy_mode = st is not None and (follow_symlinks or stat.S_ISREG(st.st_mode))
+    # An existing file's staging copy starts private (0600) and gets the old mode
+    # only after the payload is written; a new file or a replaced link keeps the
+    # umask / default-ACL policy of a plain open().
+    create_mode = 0o600 if copy_mode else 0o666
     for _ in range(8):
-        tmp = target.parent / f"{target.name}.{secrets.token_hex(8)}.tmp"
+        tmp = f"{target}.{secrets.token_hex(8)}.tmp"
         try:
-            return os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666), tmp
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, create_mode)
+            break
         except FileExistsError:
             continue
-    raise FileExistsError(f"could not create a unique temp file beside {target}")
-
-
-def write_config_json(path, data) -> None:
-    """Atomically replace ``path`` with ``data`` as JSON (indent=2, trailing
-    newline).  An existing file keeps its permission bits and, where permitted,
-    its group; a new file gets what
-    ``write_text`` would give it.  A symlink is followed.  Needs write access
-    to the containing directory (same-UID callers).  On any error the temp
-    file is removed and the error re-raised; ``path`` is never left partial."""
-    target = Path(os.path.realpath(path))
-    payload = json.dumps(data, indent=2) + "\n"
-    fd, tmp = _create_temp(target)
+    else:
+        raise FileExistsError(f"could not create a unique temp file beside {target}")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
+        with os.fdopen(fd, "w", encoding=encoding) as fh:
+            fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-            if target.exists():
-                st = os.stat(target)
+            if copy_mode:
                 try:
                     # Before fchmod: chown can clear mode bits on some systems.
                     os.fchown(fh.fileno(), -1, st.st_gid)
@@ -101,6 +113,13 @@ def write_config_json(path, data) -> None:
         except OSError:
             pass
         raise
+
+
+def write_config_json(path, data) -> None:
+    """Atomically replace ``path`` with ``data`` as JSON (indent=2, trailing
+    newline) through ``atomic_write_text``: mode and group of an existing file
+    are kept, a symlink is followed, the temp is removed on error."""
+    atomic_write_text(path, json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 def read_config_json(path, *, attempts: int = 3, delay: float = 0.05) -> dict:

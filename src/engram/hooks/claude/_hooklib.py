@@ -52,9 +52,9 @@ from __future__ import annotations
 import functools
 import json
 import os
+import secrets
 import stat
 import sys
-import tempfile
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -87,6 +87,26 @@ def engram_home_or_exit() -> Path:
         # must see the same absolute home, not a literal `~` directory under the cwd.
         os.environ["ENGRAM_HOME"] = str(home)
     return home
+
+
+def bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
 
 
 def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
@@ -330,14 +350,70 @@ def is_own_server_py_running(engram_home: str) -> bool:
         return False
 
 
-def atomic_write_json(path, data, *, indent=None, encoding=None):
-    """Write JSON atomically: build in a temp file in the SAME directory,
-    then os.replace() over the destination.
+def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = True) -> None:
+    """Atomically replace ``path`` with ``text`` (#4013).  The one shared
+    mode- and group-preserving writer: an existing file keeps its permission
+    bits and, where permitted, its group; a new file gets what ``write_text``
+    would give it (umask or the directory's default ACL).  By default a symlink
+    is followed (the link stays, its target changes).  With
+    ``follow_symlinks=False`` the path itself is replaced: a symlink (live or
+    dangling) is swapped for a regular file, what it pointed at is never
+    touched or created, and mode and group are copied only from an existing
+    REGULAR file, never from a link's target.  Pass ``follow_symlinks=False`` for any path under a
+    directory other users can write (a planted link would otherwise redirect the write); the default
+    True exists for paths the caller owns and links on purpose, such as config.json via
+    ``write_config_json``.  Needs write access to the containing directory (same-UID
+    callers).  On any error the temp file is removed and the error re-raised;
+    ``path`` is never left partial.  Duplicated here because this module must
+    stay self-contained; kept AST-identical with
+    ``engram_config_io.atomic_write_text`` (tests/test_atomic_writer_modes_4013.py)."""
+    target = os.path.realpath(path) if follow_symlinks else os.path.abspath(path)
+    try:
+        st = os.stat(target) if follow_symlinks else os.lstat(target)
+    except OSError:
+        st = None
+    copy_mode = st is not None and (follow_symlinks or stat.S_ISREG(st.st_mode))
+    # An existing file's staging copy starts private (0600) and gets the old mode
+    # only after the payload is written; a new file or a replaced link keeps the
+    # umask / default-ACL policy of a plain open().
+    create_mode = 0o600 if copy_mode else 0o666
+    for _ in range(8):
+        tmp = f"{target}.{secrets.token_hex(8)}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, create_mode)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError(f"could not create a unique temp file beside {target}")
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+            if copy_mode:
+                try:
+                    # Before fchmod: chown can clear mode bits on some systems.
+                    os.fchown(fh.fileno(), -1, st.st_gid)
+                except PermissionError:
+                    pass  # not a member of that group: the new inode keeps its own
+                os.fchmod(fh.fileno(), stat.S_IMODE(st.st_mode))
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks=False):
+    """Write JSON atomically through `atomic_write_text`: build the content in a
+    temp file in the SAME directory, fsync it, then os.replace() it over the
+    destination.
 
     **Writing JSON state in a hook.** Hook state files are written
-    atomically: build the content in a temp file in the same directory, then
-    os.replace() it over the destination. Use this helper; do not hand-roll
-    it.
+    atomically. Use this helper; do not hand-roll it.
 
     Why: hooks in `src/engram/hooks/claude/` run under a 5s harness timeout
     and are killed on overrun, so a plain truncate-and-write can leave a
@@ -350,11 +426,16 @@ def atomic_write_json(path, data, *, indent=None, encoding=None):
     Same-directory temp matters: os.replace() is only atomic within one
     filesystem.
 
-    Mode note: because os.replace() swaps in the temp file's inode, this
-    also changes the destination file's mode to 0600 (mkstemp's default)
-    regardless of what mode it had before -- for every call site, not only
-    the two excluded below. This is why those two exclusions exist, not a
-    coincidental detail about one of them.
+    Mode and link behaviour (#4013): an existing destination keeps its
+    permission bits and, where permitted, its group; a new file gets what a
+    plain open() gets (umask / the directory's default ACL), not 0600.
+
+    A symlink at ``path`` is REPLACED, never written through (the pre-#4013
+    behaviour; ``follow_symlinks=False`` is this helper's default). Hook state
+    lives in directories other users can write, so a planted link must not
+    redirect the write onto a file the hook's user can write. A mode and group
+    are copied only from an existing regular file. Pass ``follow_symlinks=True``
+    only for a path the caller itself owns and links on purpose.
 
     Fails loud: exceptions propagate to the caller. Each hook already has
     its own `except Exception: pass` discipline and its own view of what a
@@ -362,35 +443,26 @@ def atomic_write_json(path, data, *, indent=None, encoding=None):
     FAILED write indistinguishable from a successful one, which is the
     exact class of silence this whole convention exists to prevent.
 
-    On any exception during the write, the temp file is cleaned up before
-    re-raising; the destination is never touched until the temp write has
-    fully succeeded.
+    On any exception during the write (including KeyboardInterrupt) the temp
+    file is removed before re-raising; the destination is never touched until
+    the temp write has fully succeeded.
 
-    `indent` and `encoding` are passed straight through to `json.dump` /
-    the temp file's `open` mode respectively -- extend the signature to fit
-    a call site's real need (e.g. an existing `encoding="utf-8"` write)
-    rather than working around a mismatch with a post-write patch.
+    `indent` is passed to `json.dumps`; `encoding` is passed to
+    `atomic_write_text`, which opens the temp file with it (None, the default
+    here, means the locale default, as a bare open() would). Extend the
+    signature to fit a call site's real need rather than working around a
+    mismatch with a post-write patch.
 
     NOT for every write in this codebase. Two documented exceptions exist
     and must NOT be converted to this helper (see docs/DEVELOPMENT.md /
     the module docstrings at their call sites for why):
       - src/engram/viz/data/config.py's write_config_key() (os.replace()
         there would strip the agent's ownership of its own config -- #372).
-      - forum/coordination/store_file.py (needs 0644, not mkstemp's 0600,
-        because the store is read by other agents).
+      - forum/coordination/store_file.py (fixed 0644 by design; it sets its
+        own mode rather than keeping the existing file's).
     """
-    d = os.path.dirname(path) or "."
-    fd, tmp_path = tempfile.mkstemp(dir=d, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding=encoding) as f:
-            json.dump(data, f, indent=indent)
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, json.dumps(data, indent=indent), encoding=encoding,
+                      follow_symlinks=follow_symlinks)
 
 
 # ---------------------------------------------------------------------------
