@@ -66,9 +66,7 @@ Contract (stated by the spec; written before the fix):
       argument, returned, looped over). The helper pin checks connect_regular_ro's
       declared `uri_params` default and its inner call shape, not a reassignment
       of `uri_params` inside the helper body; and it accepts a mode=rw default,
-      like every other site, so it does not mean "must be ro". KNOWN RESIDUAL, not closed
-      here: connect_regular_ro does not quote the path, so a '#' (or '?') in the
-      path drops mode=ro and creates an empty db; tracked in engram-alpha#4171.
+      like every other site, so it does not mean "must be ro".
 
 Each server cell runs in a child process so module state (the cached timing
 connection, the once-per-path schema trigger) is exactly what a real MCP
@@ -376,9 +374,10 @@ _KNOWLEDGE_NAMES = {"db_path", "DB_PATH", "KNOWLEDGE_DB_PATH", "ENGRAM_DB_PATH",
 ALLOWED_CONNECTS = {
     "claude/_hooklib.py:connect_regular_ro": (
         "knowledge.db (caller-supplied)",
-        "the helper itself: it builds f'file:{db_path}?{uri_params}' with uri_params defaulting to "
-        "mode=ro; each CALLER is checked at its own call site by this scan",
-        'f"file:{db_path}?{uri_params}"',
+        "the helper itself: it builds Path(db_path).absolute().as_uri() + '?' + uri_params (the path "
+        "percent-quoted, #4171) with uri_params defaulting to mode=ro; each CALLER is checked at its own "
+        "call site by this scan",
+        'Path(db_path).absolute().as_uri() + "?" + uri_params',
     ),
     "claude/engram-session-start-hook.py:_check_json1": (
         ":memory: (a capability probe; an injectable factory defaulting to sqlite3.connect)",
@@ -788,7 +787,7 @@ def test_c7_round2_stale_entries_are_detected(tmp_path):
 # --- C7 round 3, item 1: pin connect_regular_ro's own default (the helper is listed, so the scan skips it) ---
 
 _HELPER_FILE = HOOKS_ROOT / "claude" / "_hooklib.py"
-_HELPER_FIRST_ARG = 'f"file:{db_path}?{uri_params}"'
+_HELPER_FIRST_ARG = 'Path(db_path).absolute().as_uri() + "?" + uri_params'
 
 
 def _helper_problems(src):
@@ -827,8 +826,10 @@ def test_c7_round3_connect_regular_ro_default_is_pinned():
 @pytest.mark.parametrize("old,new", [
     ('uri_params="mode=ro"', 'uri_params="mode=rwc"'),
     ('uri_params="mode=ro"', 'uri_params=None'),
-    ('f"file:{db_path}?{uri_params}", uri=True, **connect_kwargs)', 'f"file:{db_path}?{uri_params}", **connect_kwargs)'),
-    ('f"file:{db_path}?{uri_params}", uri=True, **connect_kwargs)', 'f"file:{db_path}", uri=True, **connect_kwargs)'),
+    ('uri=True, **connect_kwargs)', '**connect_kwargs)'),
+    ('Path(db_path).absolute().as_uri() + "?" + uri_params', 'Path(db_path).absolute().as_uri()'),
+    ('Path(db_path).absolute().as_uri() + "?" + uri_params', 'f"file:{db_path}?{uri_params}"'),
+    ('Path(db_path).absolute().as_uri() + "?" + uri_params', 'Path(db_path).as_uri() + "?" + uri_params'),
 ])
 def test_c7_round3_helper_mutations_are_caught(old, new):
     src = _HELPER_FILE.read_text()

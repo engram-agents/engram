@@ -339,7 +339,13 @@ site("surface_main_idf_gate", "engram-surface-hook.py",
      "    pass\n"
      "finally:\n"
      "    sys.stdout = _o\n"
-     "result = [bool(buf.getvalue().strip()), [c[0].replace(P['eh'], '<EH>') for c in CALLS if c[0].startswith('file:') and '.engram' in c[0] and 'mode=ro' in c[0]]]",
+     # Parity is behavioural: compare the file path + query the URI names, not its
+     # spelling (`file:/p?q` at dev, `file:///p?q` from Path.as_uri() since #4171).
+     "import urllib.parse as _up\n"
+     "def _norm(u):\n"
+     "    s = _up.urlsplit(u)\n"
+     "    return _up.unquote(s.path) + '?' + s.query\n"
+     "result = [bool(buf.getvalue().strip()), [_norm(c[0]).replace(P['eh'], '<EH>') for c in CALLS if c[0].startswith('file:') and '.engram' in c[0] and 'mode=ro' in c[0]]]",
      regular=lambda r: r[0] is True and len(r[1]) >= 1,
      **_bad(lambda r: r[0] is True and r[1] == []))
 
@@ -521,7 +527,7 @@ def test_helper_passes_kwargs_and_uri_params_through_untouched(tmp_path):
         "mod.connect_regular_ro(P['db'], timeout=0.2).close()\n"
         "mod.connect_regular_ro(P['db'], uri_params='mode=ro&immutable=1').close()\n"
         "result = CALLS\n"), "regular")
-    uri = "file:" + str(Path(tmp_path) / "home" / ".engram" / "knowledge.db")
+    uri = (Path(tmp_path) / "home" / ".engram" / "knowledge.db").absolute().as_uri()
     assert r == [[uri + "?mode=ro", {"uri": True}],
                  [uri + "?mode=ro", {"uri": True, "timeout": 0.2}],
                  [uri + "?mode=ro&immutable=1", {"uri": True}]], r

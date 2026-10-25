@@ -1285,7 +1285,7 @@ def _not_regular_db_error_cls():
 
 
 def connect_regular_ro(db_path, uri_params="mode=ro", **connect_kwargs):
-    """`sqlite3.connect(f"file:{db_path}?{uri_params}", uri=True, **kwargs)`
+    """`sqlite3.connect(<file: URI of db_path>?{uri_params}, uri=True, **kwargs)`
     that refuses a non-regular file instead of blocking on it (#3628).
 
     A `mode=ro` connect to a FIFO hangs (measured: > 5 s), so a hook under a
@@ -1298,6 +1298,16 @@ def connect_regular_ro(db_path, uri_params="mode=ro", **connect_kwargs):
     keyword arguments (timeout=...) pass through untouched; a timeout bounds
     lock waits, not a FIFO open, so it is not part of this defence.
     `uri_params` is the URI query, e.g. "mode=ro&immutable=1".
+
+    The path is made absolute and percent-quoted
+    (`Path(db_path).absolute().as_uri()`), so a '#', '?' or '%' in it cannot
+    be read as URI syntax (#4171): unquoted, '#' began the URI fragment, the
+    path was truncated, mode=ro was dropped and the connect succeeded onto a
+    DIFFERENT database, creating it if absent; and an unquoted '%23' was
+    decoded to '#', so a path under 'a%23b/' opened and READ the real
+    sibling store under 'a#b/' (measured, Zephyr on #4174). A relative db_path is made
+    absolute against the cwd at call time (every in-repo caller passes an
+    absolute path).
 
     Residual, NOT closed here. #3577 states it: "The pair is check-then-act:
     measured by two people independently, with the file regular at the `stat`
@@ -1315,7 +1325,8 @@ def connect_regular_ro(db_path, uri_params="mode=ro", **connect_kwargs):
     if st is not None and not stat.S_ISREG(st.st_mode):
         raise _not_regular_db_error_cls()(f"not a regular file: {db_path}")
     return sqlite3.connect(
-        f"file:{db_path}?{uri_params}", uri=True, **connect_kwargs)
+        Path(db_path).absolute().as_uri() + "?" + uri_params,
+        uri=True, **connect_kwargs)
 
 
 def session_started_at(session_id):
