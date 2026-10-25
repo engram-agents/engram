@@ -1720,7 +1720,7 @@ def _advance_person_moment_cursor(person_id: str, from_cursor: int) -> bool:
         return False
     conn = None
     try:
-        conn = sqlite3.connect(KNOWLEDGE_DB_PATH, timeout=2.0)
+        conn = sqlite3.connect(Path(KNOWLEDGE_DB_PATH).absolute().as_uri() + "?mode=rw", uri=True, timeout=2.0)
         result = _advance_moment_cursor(conn, person_id, from_cursor)
         conn.commit()
         return bool(result.get("applied"))

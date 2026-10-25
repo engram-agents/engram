@@ -44,7 +44,7 @@ import sys
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json, emit_context
+from _hooklib import atomic_write_json, connect_regular_ro, emit_context
 from _hooklib import import_owner_flags as _hooklib_import_owner_flags
 # #3628: the config / sticky-marker reads are non-blocking and regular-file-only.
 from _hooklib import open_regular_text
@@ -90,7 +90,7 @@ def get_person_nodes() -> list[dict]:
     if not os.path.exists(DB_PATH):
         return []
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_regular_ro(DB_PATH)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(_PERSON_NODES_SQL).fetchall()
         conn.close()
