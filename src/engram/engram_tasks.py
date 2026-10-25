@@ -431,6 +431,21 @@ def _add_task_impl(
         conn.close()
 
 
+def _changed_concurrently(conn, kind: str, node_id: str) -> str:
+    """Roll back and build the #4178 refusal for a guarded metadata write
+    whose row no longer matches what this call read (metadata, plus the
+    state column each guard names: status for update_task, is_current for
+    the goal tools). update_task's guard does not see a concurrent
+    supersede, which changes only is_current."""
+    conn.rollback()
+    return json.dumps({
+        "error": f"{kind} '{node_id}' changed while this call was running "
+                 f"(another write got there first). Nothing was changed. "
+                 f"Re-read the node and retry.",
+        "refusal": "changed_concurrently",
+    })
+
+
 def _update_task_impl(
     task_id: str = "",
     new_status: str = "",
@@ -515,11 +530,22 @@ def _update_task_impl(
                 "at": core._now(),
             })
 
-        conn.execute(
+        # #4178: guarded write. The task was read at the top of this call and
+        # no write transaction was open then (the first DML is this UPDATE), so
+        # another writer could have changed it since. `metadata IS ?` is bound
+        # to the RAW column value read, not a re-serialized dict. `status IS ?`
+        # mirrors the tool's own state input: old_status feeds status_history
+        # and the edit_history transition, so a status change underneath us
+        # makes both wrong. (No is_current clause: this tool never checked it.)
+        _guarded = conn.execute(
             """UPDATE nodes SET status = ?, importance_base = ?,
-               importance_score = ?, metadata = ? WHERE id = ?""",
-            (new_status, new_base, new_score, json.dumps(meta), task_id),
+               importance_score = ?, metadata = ?
+               WHERE id = ? AND status IS ? AND metadata IS ?""",
+            (new_status, new_base, new_score, json.dumps(meta), task_id,
+             old_status, task["metadata"]),
         )
+        if _guarded.rowcount != 1:
+            return _changed_concurrently(conn, "Task", task_id)
 
         # Log status change to edit_history
         turn = core._get_current_turn()
@@ -884,10 +910,16 @@ def _deactivate_goal_impl(
         else:
             meta.pop("deactivation_reason", None)
 
-        conn.execute(
-            "UPDATE nodes SET metadata = ? WHERE id = ?",
-            (json.dumps(meta), goal_id),
+        # #4178: guarded write. The goal row was read above with no write
+        # transaction open; `metadata IS ?` is bound to the RAW column value
+        # read, and `is_current = 1` mirrors this tool's own is_current check.
+        _guarded = conn.execute(
+            "UPDATE nodes SET metadata = ? "
+            "WHERE id = ? AND is_current = 1 AND metadata IS ?",
+            (json.dumps(meta), goal_id, row["metadata"]),
         )
+        if _guarded.rowcount != 1:
+            return _changed_concurrently(conn, "Goal", goal_id)
         conn.commit()
         return json.dumps({
             "status": "deactivated",
@@ -949,10 +981,16 @@ def _activate_goal_impl(
             meta.pop("reactivation_reason", None)
         meta.pop("deactivation_reason", None)
 
-        conn.execute(
-            "UPDATE nodes SET metadata = ? WHERE id = ?",
-            (json.dumps(meta), goal_id),
+        # #4178: guarded write. The goal row was read above with no write
+        # transaction open; `metadata IS ?` is bound to the RAW column value
+        # read, and `is_current = 1` mirrors this tool's own is_current check.
+        _guarded = conn.execute(
+            "UPDATE nodes SET metadata = ? "
+            "WHERE id = ? AND is_current = 1 AND metadata IS ?",
+            (json.dumps(meta), goal_id, row["metadata"]),
         )
+        if _guarded.rowcount != 1:
+            return _changed_concurrently(conn, "Goal", goal_id)
         conn.commit()
         return json.dumps({
             "status": "activated",
