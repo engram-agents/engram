@@ -1503,6 +1503,104 @@ def test_build_initial_prompt_is_short():
     assert fake_payload_path in prompt, "Prompt must reference the input payload path"
     assert fake_output_path in prompt, "Prompt must reference the output path"
 
+    # With stats: still short, stats block present
+    prompt_with_stats = _build_initial_prompt(
+        fake_payload_path, fake_output_path,
+        fresh_total=77, backfill_matched=200, backfill_taken=45,
+    )
+    assert len(prompt_with_stats) < 1000, (
+        f"prompt with stats is {len(prompt_with_stats)} chars — expected < 1000"
+    )
+    assert "77" in prompt_with_stats, "fresh_total must appear in prompt"
+    assert "200" in prompt_with_stats, "backfill_matched must appear in prompt"
+    assert "45" in prompt_with_stats, "backfill_taken must appear in prompt"
+
+    # Without stats: stats block must be absent
+    assert "Cohort context" not in prompt, "Stats block must be absent without stats params"
+
+
+# ---------------------------------------------------------------------------
+# Test 27b: manifest stats fields written by prepare
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_writes_stats_to_manifest(tmp_path):
+    """prepare writes fresh_total/backfill_total/backfill_taken to manifest when flags passed.
+
+    Test 27b — contracts:
+      1. fresh_total/backfill_total echoed from flags
+      2. backfill_taken == min(backfill_total, 60)
+    """
+    node_ids = [f"ob_{str(i).zfill(4)}" for i in range(1, 4)]  # 3 fresh nodes
+    db_path = _make_sqlite_db(node_ids, tmp_path)
+
+    # Sub-case 1: --fresh-total 3 --backfill-total 0 → backfill_taken == 0
+    out_dir = tmp_path / "out_a"
+    exit_code = _run([
+        "prepare",
+        "--ids", ",".join(node_ids),
+        "--out", str(out_dir),
+        "--db", str(db_path),
+        "--fresh-total", "3",
+        "--backfill-total", "0",
+    ])
+    assert exit_code == 0, f"prepare exited {exit_code}"
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["fresh_total"] == 3
+    assert manifest["backfill_total"] == 0
+    assert manifest["backfill_taken"] == 0
+
+    # Sub-case 2: --fresh-total 3 --backfill-total 80 → backfill_taken == 60 (capped).
+    # Need 3 + min(80, 60) = 63 total IDs to pass the population check.
+    # Create 60 additional IDs (they won't be in the DB — a warning fires but prepare
+    # still writes the manifest with the real nodes).
+    backfill_ids = [f"ob_{str(i).zfill(4)}" for i in range(4, 64)]  # 60 extra IDs
+    all_ids = node_ids + backfill_ids  # 63 total
+    db63_dir = tmp_path / "db63"
+    db63_dir.mkdir()
+    db_path_63 = _make_sqlite_db(all_ids, db63_dir)
+    out_dir_b = tmp_path / "out_b"
+    exit_code = _run([
+        "prepare",
+        "--ids", ",".join(all_ids),
+        "--out", str(out_dir_b),
+        "--db", str(db_path_63),
+        "--fresh-total", "3",
+        "--backfill-total", "80",
+    ])
+    assert exit_code == 0, f"prepare exited {exit_code}"
+    manifest = json.loads((out_dir_b / "manifest.json").read_text())
+    assert manifest["fresh_total"] == 3
+    assert manifest["backfill_total"] == 80
+    assert manifest["backfill_taken"] == 60, (
+        f"backfill_taken must be min(80, 60) = 60, got {manifest['backfill_taken']}"
+    )
+
+
+def test_prepare_manifest_stats_none_when_flags_absent(tmp_path):
+    """manifest stats fields are None when --fresh-total/--backfill-total not passed."""
+    node_ids = [f"ob_{str(i).zfill(4)}" for i in range(1, 4)]  # 3 nodes
+    db_path = _make_sqlite_db(node_ids, tmp_path)
+    out_dir = tmp_path / "out"
+
+    exit_code = _run([
+        "prepare",
+        "--ids", ",".join(node_ids),
+        "--out", str(out_dir),
+        "--db", str(db_path),
+    ])
+    assert exit_code == 0, f"prepare exited {exit_code}"
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["fresh_total"] is None, (
+        f"fresh_total must be None when --fresh-total not passed, got {manifest['fresh_total']!r}"
+    )
+    assert manifest["backfill_total"] is None, (
+        f"backfill_total must be None when --backfill-total not passed, got {manifest['backfill_total']!r}"
+    )
+    assert manifest["backfill_taken"] is None, (
+        f"backfill_taken must be None when --backfill-total not passed, got {manifest['backfill_taken']!r}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Test 28: retry prompt size regression
@@ -1882,6 +1980,9 @@ def test_prepare_empty_cohort_manifest_shape():
         assert manifest["chunks"] == []
         assert manifest["attempt_count"] == 0
         assert manifest["out_dir"] == str(out_dir)
+        assert manifest["fresh_total"] == 0
+        assert manifest["backfill_total"] == 0
+        assert manifest["backfill_taken"] == 0
 
 
 def test_prepare_empty_cohort_stdout_is_json(capsys):

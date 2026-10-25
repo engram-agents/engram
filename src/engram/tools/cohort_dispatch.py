@@ -314,7 +314,14 @@ def _build_payload_entry(node: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _build_initial_prompt(payload_path: str, output_path: str) -> str:
+def _build_initial_prompt(
+    payload_path: str,
+    output_path: str,
+    *,
+    fresh_total: int | None = None,
+    backfill_matched: int | None = None,
+    backfill_taken: int | None = None,
+) -> str:
     """Build the short dispatch prompt for a fresh batch-summary-fairy.
 
     The prompt names the input payload file to Read and the output file to
@@ -322,9 +329,15 @@ def _build_initial_prompt(payload_path: str, output_path: str) -> str:
     live in the fairy's agent spec (engram-batch-summary-fairy.md) — this
     prompt does NOT duplicate them.
 
-    Size: ~200 tokens regardless of cohort/payload size (no inline payload).
+    When all three stats params are provided (non-None), a ## Cohort context
+    block is appended showing fresh_total, backfill_matched, and backfill_taken,
+    making the cap-binding status visible at dispatch time (engram-alpha#2981).
+    When any is None the block is omitted — callers that don't pass stats get
+    the old prompt unchanged (backward-compat).
+
+    Size: ≤1000 chars regardless of cohort/payload size (no inline payload).
     """
-    return textwrap.dedent(f"""\
+    base = textwrap.dedent(f"""\
         You are dispatched as `engram-batch-summary-fairy`.
 
         1. Read your input payload from: {payload_path}
@@ -335,6 +348,26 @@ def _build_initial_prompt(payload_path: str, output_path: str) -> str:
         The output must be a single JSON object: {{"items": [...]}}
         Write it to the output path above. Return a brief confirmation naming
         both paths when done.
+    """)
+    if fresh_total is None or backfill_matched is None or backfill_taken is None:
+        return base
+    return textwrap.dedent(f"""\
+        You are dispatched as `engram-batch-summary-fairy`.
+
+        1. Read your input payload from: {payload_path}
+        2. Follow all rules in your agent spec (engram-batch-summary-fairy.md) to generate
+           recall_summary + recall_keywords for each node in the payload.
+        3. Write your output JSON to: {output_path}
+
+        The output must be a single JSON object: {{"items": [...]}}
+        Write it to the output path above.
+
+        ## Cohort context (for your awareness — no action required)
+        - Today's new nodes (fresh, since last sleep): {fresh_total}
+        - Backfill pool (matched in backlog query): {backfill_matched}
+        - Backfill taken (capped at 60): {backfill_taken}
+
+        Return a brief confirmation naming both paths when done.
     """)
 
 
@@ -481,6 +514,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             "chunk_size": args.chunk_size,
             "out_dir": str(out_dir),
             "attempt_count": 0,
+            "fresh_total": args.fresh_total,          # 0 on this path
+            "backfill_total": args.backfill_total,    # 0 on this path
+            "backfill_taken": (
+                None
+                if args.backfill_total is None
+                else min(args.backfill_total, 60)
+            ),
             "chunks": [],
         }
         manifest_path = out_dir / "manifest.json"
@@ -619,6 +659,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "chunk_size": chunk_size,
         "out_dir": str(out_dir),
         "attempt_count": 0,
+        "fresh_total": args.fresh_total,          # None when --fresh-total not passed
+        "backfill_total": args.backfill_total,    # None when --backfill-total not passed
+        "backfill_taken": (
+            None
+            if args.backfill_total is None
+            else min(args.backfill_total, 60)
+        ),
         "chunks": manifest_chunks,
     }
     manifest_path = out_dir / "manifest.json"

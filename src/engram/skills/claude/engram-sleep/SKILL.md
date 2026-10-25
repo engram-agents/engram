@@ -872,7 +872,7 @@ Follow all rules in your agent spec (engram-batch-summary-fairy.md).
 Write your output JSON to: <chunk_dir>/agent_output.json
 ```
 
-Use `_build_initial_prompt(payload_path, output_path)` from `tools/cohort_dispatch.py` to generate the prompt (returns ~200 tokens regardless of cohort size). The fairy Reads the payload file, produces the summaries, and Writes the output to the given path. Do NOT embed payload content inline in the dispatch prompt.
+Use `_build_initial_prompt(payload_path, output_path, fresh_total=manifest["fresh_total"], backfill_matched=manifest["backfill_total"], backfill_taken=manifest["backfill_taken"])` from `tools/cohort_dispatch.py` to generate the prompt. Pass all three stats from the manifest — when the stats are present (non-None), the prompt includes a `## Cohort context` block showing fresh_total, backfill_matched, and backfill_taken, making the cap-binding status visible at dispatch time (engram-alpha#2981). Prompt is still ≤1000 chars regardless of cohort size. The fairy Reads the payload file, produces the summaries, and Writes the output to the given path. Do NOT embed payload content inline in the dispatch prompt.
 
 All fairies fire in parallel with `run_in_background=true`; the harness fires a task-notification when each completes.
 
