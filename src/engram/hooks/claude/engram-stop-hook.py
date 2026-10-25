@@ -297,6 +297,7 @@ _DEFAULT_PROSE_THRESHOLD = 400
 _ENGRAM_WRITE_VERBS = frozenset({
     "add_observation",
     "add_observation_batch",
+    "requote",
     "derive",
     "add_conjecture",
     "ask",

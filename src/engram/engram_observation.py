@@ -73,10 +73,13 @@ import logging
 import math
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
+import tempfile
 from datetime import date
+from datetime import datetime as _datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -2800,3 +2803,354 @@ def _add_observation_batch_impl(
             pass
 
     return json.dumps(core._strip_agent_facing(batch_result))
+
+
+# ---------------------------------------------------------------------------
+# engram_requote (#4135, part of #4050)
+# ---------------------------------------------------------------------------
+
+_REQUOTE_OBSERVATION_TYPES = ("observation_factual", "observation_predictive")
+
+
+def _requote_refusal(code: str, message: str) -> str:
+    return json.dumps({"error": message, "refusal": code})
+
+
+def _requote_parse_time(value) -> "Optional[_datetime]":
+    """An ISO-8601 stamp as an AWARE datetime, or None when it is missing,
+    unparseable, or carries no UTC offset (a naive stamp is never guessed)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = _datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _requote_archive_named(file_path: str) -> bool:
+    """True when the file lives under the evidence-archive root and its name
+    stem is a 64-char sha256 hex string, i.e. the archive CLAIMS to be named
+    by its hash. `_content_addressed_archive_hash` returns "" both for such a
+    file whose bytes no longer match its name and for a file that is not an
+    archive file at all; this tells the two apart."""
+    try:
+        archive_root = os.path.realpath(EVIDENCE_ARCHIVE_ROOT)
+        real = os.path.realpath(file_path)
+        if os.path.commonpath([archive_root, real]) != archive_root:
+            return False
+    except (OSError, ValueError):
+        return False
+    stem = os.path.basename(real).split(".", 1)[0]
+    return len(stem) == 64 and all(c in "0123456789abcdef" for c in stem)
+
+
+def _requote_row_has_quote(raw_line: str, quote: str, file_path: str) -> bool:
+    """Whether one transcript row holds the quote, by the verbatim check's
+    tolerance (escaped raw match, then normalized match on decoded text)."""
+    if _escape_for_source(quote, file_path) in raw_line:
+        return True
+    if json.dumps(quote, ensure_ascii=True)[1:-1] in raw_line:
+        return True
+    want = _normalize_for_equivalence(_decode_from_source(quote, file_path))
+    if not want:
+        return False
+    try:
+        texts = _message_texts(json.loads(raw_line))
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return any(want in _normalize_for_equivalence(t) for t in texts)
+
+
+def _requote_bounded_transcript(file_path: str, created_at: str, old_quote: str):
+    """The transcript rows the observation could have seen (rule c1).
+
+    Returns (kept_raw_bytes, info, None) or (None, None, (code, message)).
+    Timestamp bound when both sides are usable (the observation's created_at
+    parses to an aware datetime AND at least one row carries a parseable aware
+    timestamp): a row is kept when its `timestamp` is at or before created_at,
+    and a row with no usable timestamp is kept while it sits before the first
+    row stamped LATER than created_at. From that row on, every row is dropped,
+    stamped or not (an unstamped row after it may have been written later).
+    Otherwise a row-order bound: rows up to and including the first
+    row that holds the observation's own (old) quote.
+    """
+    with open(file_path, "rb") as fh:
+        raw_lines = fh.read().splitlines(keepends=True)
+    decoded = [ln.decode("utf-8", errors="replace") for ln in raw_lines]
+    bound = _requote_parse_time(created_at)
+    stamps = []
+    for text in decoded:
+        stamp = None
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                stamp = _requote_parse_time(obj.get("timestamp"))
+        except (json.JSONDecodeError, ValueError):
+            pass
+        stamps.append(stamp)
+    if bound is not None and any(s is not None for s in stamps):
+        kept = []
+        for ln, s in zip(raw_lines, stamps):
+            if s is not None and s > bound:
+                break  # the cut: this row and every row after it, stamped or not
+            kept.append(ln)
+        info = {"version_check": "transcript_bounded", "bound": created_at,
+                "bound_kind": "timestamp"}
+        return b"".join(kept), info, None
+    for idx, text in enumerate(decoded):
+        if _requote_row_has_quote(text, old_quote, file_path):
+            info = {"version_check": "transcript_bounded",
+                    "bound": f"row {idx + 1}", "bound_kind": "row_order"}
+            return b"".join(raw_lines[: idx + 1]), info, None
+    return None, None, (
+        "evidence_changed",
+        f"The transcript '{file_path}' has no usable timestamps to bound the "
+        "check, and the observation's current quote is no longer found in it, "
+        "so no row-order bound can be set. Nothing was changed.",
+    )
+
+
+_REQUOTE_OWN_REPO_NOTE = (
+    " engram_requote reads the revision from the evidence file's own git repo, so "
+    "a node cited with source_repo/repo_path (a file outside the repo that holds "
+    "the git_sha) cannot be requoted.")
+
+
+def _requote_archive_tampered(file_path: str) -> Optional[str]:
+    """The refusal JSON when `file_path` is an evidence-archive file named by
+    its sha256 whose bytes no longer hash to that name; else None."""
+    if _requote_archive_named(file_path) and not _content_addressed_archive_hash(file_path):
+        return _requote_refusal(
+            "evidence_changed",
+            f"'{file_path}' is an evidence-archive file named by its hash, but "
+            "its bytes no longer hash to that name.")
+    return None
+
+
+def _requote_git_revision_bytes(file_path: str, git_sha: str):
+    """`git show <git_sha>:<path>` for the repo that holds the file. Returns
+    (bytes, None) or (None, error_text)."""
+    real = os.path.realpath(file_path)
+    try:
+        top = subprocess.run(
+            [core.GIT_EXE, "rev-parse", "--show-toplevel"], cwd=os.path.dirname(real),
+            capture_output=True, text=True, timeout=core.GIT_TIMEOUT)
+        if top.returncode != 0:
+            return None, (f"git revision {git_sha} of '{file_path}' cannot be read: "
+                          "the file is not inside a git repository." + _REQUOTE_OWN_REPO_NOTE)
+        root = os.path.realpath(top.stdout.strip())
+        rel = os.path.relpath(real, root)
+        shown = subprocess.run(
+            [core.GIT_EXE, "show", f"{git_sha}:{rel}"], cwd=root,
+            capture_output=True, timeout=core.GIT_TIMEOUT)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return None, (f"git revision {git_sha} of '{file_path}' cannot be read: "
+                      f"{type(exc).__name__}.")
+    if shown.returncode != 0:
+        detail = (shown.stderr or b"").decode("utf-8", errors="replace").strip()[:200]
+        return None, (f"git revision {git_sha} of '{rel}' (file '{file_path}') cannot "
+                      f"be read: {detail or 'git show failed'}." + _REQUOTE_OWN_REPO_NOTE)
+    return shown.stdout, None
+
+
+def _requote_impl(
+    node_id: str = "",
+    new_quoted_text: str = "",
+    reason: str = "",
+    by_session: Optional[str] = None,
+) -> str:
+    """engram_requote: replace an observation's quoted_text in place, checked
+    against the SAME evidence the observation cites (#4135, part of #4050).
+
+    Every refusal is {"error": text, "refusal": code} and changes nothing.
+    Order: fields, node is a current observation, identical quote, evidence
+    retrievable, version rule, verbatim, floor, move, similarity, write.
+    The write is guarded on the node still holding the quote and metadata read
+    at the start; if not, refusal `changed_concurrently`.
+    A node cited with source_repo/repo_path cannot be requoted: the git
+    revision is read from the evidence file's own repo.
+    """
+    for fname, fval in (("node_id", node_id), ("new_quoted_text", new_quoted_text),
+                        ("reason", reason)):
+        if not isinstance(fval, str) or not fval.strip():
+            return json.dumps({"error": f"{fname} is required and must be a non-blank string."})
+
+    conn = core._get_db()
+    tmpdir = None
+    try:
+        row = conn.execute(
+            "SELECT id, type, claim, quoted_text, interpretation, quote_type, confidence, "
+            "metadata, evidence_id, is_current, status, created_at FROM nodes WHERE id = ?",
+            (node_id,)).fetchone()
+        if row is None or row["type"] not in _REQUOTE_OBSERVATION_TYPES:
+            what = "does not exist" if row is None else f"is a {row['type']}"
+            return _requote_refusal(
+                "not_observation",
+                f"'{node_id}' {what}, not an observation. engram_requote only fixes "
+                "the quote of an observation.")
+        if not row["is_current"] or row["status"] == "retracted":
+            state = "retracted" if row["status"] == "retracted" else "superseded"
+            return _requote_refusal(
+                "not_current",
+                f"'{node_id}' is {state}; only a current observation can be requoted.")
+        old_quote = row["quoted_text"] or ""
+        if new_quoted_text == old_quote:
+            return _requote_refusal(
+                "identical_quote",
+                f"The new quote is identical to the stored quote of '{node_id}'.")
+
+        ev = conn.execute(
+            "SELECT id, source_url FROM nodes WHERE id = ? AND type = 'evidence'",
+            (row["evidence_id"],)).fetchone()
+        ev_label = row["evidence_id"] or "(none)"
+        ev_url = (ev["source_url"] or "") if ev else ""
+        if ev is None or not ev_url.startswith("file://"):
+            return _requote_refusal(
+                "evidence_unretrievable",
+                f"Evidence '{ev_label}' has source URL '{ev_url}', which cannot be "
+                "re-read: only file:// evidence is retrievable (web pages are never "
+                "fetched). The quote cannot be checked against the same evidence.")
+        file_path = ev_url[7:]
+        if not os.path.isabs(file_path) or not os.path.isfile(file_path):
+            return _requote_refusal(
+                "evidence_unretrievable",
+                f"Evidence '{ev_label}': the file '{file_path}' is missing or not a "
+                "regular file, so the quote cannot be checked against it.")
+
+        meta, meta_warning = core._metadata_dict_for_write(
+            row["metadata"], node_id, "engram_requote")
+        git_sha = meta.get("git_sha") or ""
+        content_hash = meta.get("content_hash") or ""
+        check_path = file_path
+        version_info: dict
+        if git_sha:
+            data, err = _requote_git_revision_bytes(file_path, git_sha)
+            if err:
+                return _requote_refusal("evidence_unretrievable", err)
+            tmpdir = tempfile.mkdtemp(prefix="engram_requote_")
+            check_path = os.path.join(tmpdir, os.path.basename(file_path))
+            with open(check_path, "wb") as fh:
+                fh.write(data)
+            version_info = {"git_sha": git_sha}
+        elif content_hash:
+            with open(file_path, "rb") as fh:
+                today = hashlib.sha256(fh.read()).hexdigest()
+            if today != content_hash:
+                return _requote_refusal(
+                    "evidence_changed",
+                    f"'{file_path}' no longer matches the content the observation "
+                    f"cited (recorded content_hash {content_hash}, now {today}).")
+            version_info = {"content_hash": content_hash}
+        elif file_path.endswith(".jsonl"):
+            tampered = _requote_archive_tampered(file_path)
+            if tampered:
+                return tampered
+            kept, version_info, bad = _requote_bounded_transcript(
+                file_path, row["created_at"], old_quote)
+            if bad:
+                return _requote_refusal(*bad)
+            tmpdir = tempfile.mkdtemp(prefix="engram_requote_")
+            check_path = os.path.join(tmpdir, os.path.basename(file_path))
+            with open(check_path, "wb") as fh:
+                fh.write(kept)
+        elif _requote_archive_named(file_path):
+            tampered = _requote_archive_tampered(file_path)
+            if tampered:
+                return tampered
+            version_info = {"version_check": "hash_name"}
+        else:
+            version_info = {"version_check": "none"}
+
+        check_url = f"file://{check_path}"
+        verbatim_error = _verify_quote_in_source(check_url, new_quoted_text)
+        if verbatim_error:
+            return _requote_refusal("not_in_source", verbatim_error)
+        short_error = _short_quote_error(check_url, new_quoted_text)
+        if short_error:
+            return _requote_refusal("quote_too_short", short_error)
+
+        # EXPAND when the old quote, decoded and normalized the way the
+        # verbatim gate does, sits inside the new quote; else SWITCH.
+        new_norm = _normalize_for_equivalence(new_quoted_text)
+        old_forms = {
+            _normalize_for_equivalence(_decode_from_source(old_quote, file_path)),
+            _normalize_for_equivalence(old_quote),
+        }
+        move = "EXPAND" if any(f and f in new_norm for f in old_forms) else "SWITCH"
+
+        claim = row["claim"] or ""
+        sim_old, why_old = _quote_claim_similarity(old_quote, claim)
+        sim_new, why_new = _quote_claim_similarity(new_quoted_text, claim)
+        if sim_old is None or sim_new is None:
+            return _requote_refusal(
+                "similarity_unavailable",
+                "Quote-claim similarity is unavailable "
+                f"({why_old or why_new or 'no reason given'}), so the tool cannot show "
+                "the new quote carries the claim at least as well. Nothing was changed.")
+        if sim_new < sim_old:
+            return _requote_refusal(
+                "similarity_decreased",
+                f"{move} lowers quote-claim similarity from {sim_old:.4f} to "
+                f"{sim_new:.4f}; a requote may not make the quote carry the claim "
+                "less well. Nothing was changed.")
+
+        history = meta.get("quote_history")
+        if history is None:
+            history = []
+        if not isinstance(history, list):
+            return json.dumps({"error": f"'{node_id}' metadata.quote_history is not a list; "
+                                        "nothing was changed."})
+        history.append({
+            "old_quote": old_quote,
+            "new_quote": new_quoted_text,
+            "move": move,
+            "reason": reason,
+            "at": core._now(),
+            "by_session": by_session,
+            "similarity_before": sim_old,
+            "similarity_after": sim_new,
+        })
+        meta["quote_history"] = history
+        try:
+            # Guarded write: only if the node is still exactly what this call
+            # read at the top (the similarity step above can be slow).
+            cur = conn.execute(
+                "UPDATE nodes SET quoted_text = ?, metadata = ? "
+                "WHERE id = ? AND is_current = 1 AND COALESCE(status, '') != 'retracted' "
+                "AND quoted_text IS ? AND metadata IS ?",
+                (new_quoted_text, json.dumps(meta), node_id,
+                 row["quoted_text"], row["metadata"]))
+            if cur.rowcount != 1:
+                conn.rollback()
+                return _requote_refusal(
+                    "changed_concurrently",
+                    f"'{node_id}' changed while this call was running (another "
+                    "requote, a retract or a supersede got there first). Nothing was "
+                    "changed. Re-read the node and retry.")
+            core._log_edit(conn, "requoted", node_id, row["type"], {
+                "move": move, "reason": reason, "old_quote": old_quote,
+                "new_quote": new_quoted_text, "similarity_before": sim_old,
+                "similarity_after": sim_new, **version_info,
+            })
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 — all-or-nothing write
+            conn.rollback()
+            return json.dumps({"error": f"Requote failed; nothing was changed: "
+                                        f"{type(exc).__name__}: {exc}"})
+
+        result = {"status": "requoted", "node_id": node_id, "move": move, **version_info,
+                  "similarity_before": sim_old, "similarity_after": sim_new}
+        if meta_warning:
+            result["warnings"] = [meta_warning]
+        result["anchoring_advisory"] = _build_anchoring_advisory(
+            node_id, claim, new_quoted_text, row["interpretation"] or "",
+            row["quote_type"], str(meta.get("source_class", "")), row["confidence"])
+        return json.dumps(result)
+    finally:
+        conn.close()
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)

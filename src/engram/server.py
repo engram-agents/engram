@@ -1885,6 +1885,87 @@ def engram_add_observation(payload_json: str) -> str:
 # Compat forwarder above in wave-9 compat block.
 
 
+# Legitimate field names for the engram_requote payload. `evidence_id` is
+# deliberately NOT here: the tool never takes an evidence node from the caller.
+_REQUOTE_FIELDS = frozenset({"node_id", "new_quoted_text", "reason"})
+
+
+@mcp.tool(
+    name="engram_requote",
+    capability=(
+        "Fixes ONE observation's quoted_text in place against the SAME evidence "
+        "(EXPAND or SWITCH; never lowers quote-claim similarity). Cannot change "
+        "the evidence, claim or confidence; for those, supersede."
+    ),
+    annotations={
+        "title": "Fix an Observation's Quote in Place",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_requote(payload_json: str) -> str:
+    """Replace a current observation's quote with a better one from the SAME
+    evidence. The node keeps its id, claim, interpretation, confidence, edges
+    and evidence; only quoted_text changes, and the change is recorded in
+    metadata.quote_history and as one edit_history row (action "requoted").
+    Same evidence only; this tool never switches evidence.
+
+    Pass all fields as one JSON object string in payload_json:
+        node_id (str, required): the observation to fix.
+        new_quoted_text (str, required): the replacement quote.
+        reason (str, required): why the old quote was wrong or too thin.
+    Any other field (evidence_id included) is refused.
+
+    The tool picks the move; the caller cannot. EXPAND: the old quote sits
+    inside the new one (compared the way the verbatim gate compares: decoded,
+    then normalized). SWITCH: it does not. Both moves must keep the quote-claim
+    similarity from falling.
+
+    The new quote is checked against the evidence AS THE OBSERVATION CITED IT:
+    the git revision recorded on the node; else the recorded content_hash (the
+    file must still match); else, for a session transcript, only the rows
+    stamped at or before the node's created_at (version_check
+    "transcript_bounded"); else an evidence-archive file must still hash to its
+    name ("hash_name"); else today's file ("none"). Then the add-time rules
+    apply: verbatim in the source and the minimum-length floor. The git
+    revision is read from the evidence file's own repo, so a node cited with
+    source_repo/repo_path (a file outside the repo holding the git_sha) cannot
+    be requoted (evidence_unretrievable).
+
+    Every refusal returns {"error": ..., "refusal": <code>} and changes
+    nothing. Codes: not_observation, not_current, identical_quote,
+    evidence_unretrievable, evidence_changed, not_in_source, quote_too_short,
+    similarity_unavailable, similarity_decreased, changed_concurrently (the
+    node changed during the call; re-read and retry). A missing or blank field
+    returns a plain {"error": ...}.
+
+    Returns on success: {"status": "requoted", "node_id", "move",
+    "version_check" | "git_sha" | "content_hash", "similarity_before",
+    "similarity_after", "anchoring_advisory"}.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+
+    unknown = set(params.keys()) - _REQUOTE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_REQUOTE_FIELDS)}"
+        })
+
+    # Same session-id source engram_retract stamps; None when the server has none.
+    by_session = (
+        os.environ.get("CLAUDE_SESSION_ID")
+        or os.environ.get("ANTHROPIC_SESSION_ID")
+        or None
+    )
+    return _attach_walguard_banner(
+        _observation_mod._requote_impl(**params, by_session=by_session))
+
+
 # ---- Batch ingestion tools ----
 
 

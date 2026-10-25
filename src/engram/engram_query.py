@@ -1216,6 +1216,10 @@ def _build_inspect_recall_view(
     # (false) leaves no key.
     if _meta.get("support_lost"):
         node_recall["support_lost"] = True
+    # quote_history: written by engram_requote (#4135); a quote was changed in
+    # place, so recall must show what it was. Only when non-empty.
+    if _meta.get("quote_history"):
+        node_recall["quote_history"] = _meta["quote_history"]
     if node.get("type") == "derivation" and "warrant" in _meta and _meta["warrant"]:
         node_recall["warrant"] = _meta["warrant"]
     if node.get("type") == "person":
