@@ -2,15 +2,24 @@
 """s2_clause_sheet -- clause-check sheet builder (engram-alpha#4050 S2).
 
 Implements the S2 pre-registration, draft 5 (issue comment 6387983396; change-log
-entry 14, presentation order). The seed stays pinned to draft 4's value
+entry 14, presentation order; entry 15, secret per-sheet salt, issue comment
+6390535527). The seed stays pinned to draft 4's value
 (SEED_HEX d638538e, from issue comment 6385972287) so the sample does not move.
 The pre-registration is the contract: where this file and that text disagree,
 that text wins. This tool only builds the sheets. It changes no write path, no
 floor, no refusal.
 
-Presentation order (draft 5): render numbers all items, real and planted, by
-sha256(seed_hex || 'order' || id) ascending (ORDER_SALT = "order"). The
-selection sort key, swaps and the re-split set keep sha256(seed_hex || id).
+Presentation order (draft 5, entry 15): render numbers all items, real and planted, by
+sha256(seed_hex || 'order' || sheet_salt || id) ascending, hex digest compared as a
+string (ORDER_SALT = "order"). sheet_salt is a secret 16-character lowercase hex
+string per sheet, from os.urandom(8).hex() on the operator's side. It is committed
+publicly as sha256(sheet_salt) (UTF-8 of the 16-char string) before pass 1 and
+revealed only after all four return hashes for that sheet (both judges, both
+passes) are posted (change-log entry 16, issue comment 6390564047). This tool
+never reveals it. It appears only in the private
+key.json, never in either sheet. key.json must stay private: besides the salt it
+holds every item's order_hash, which gives the presentation order away. The selection sort key, swaps, the re-split set,
+splits, planted text and roster keep sha256(seed_hex || id).
 
 Subcommands
     select --db PATH --out-dir DIR [--seed-hex HEX8] [--build-commit SHA]
@@ -26,7 +35,11 @@ Subcommands
         the same bin's sort order, and refresh screen.md. The reason is stored
         in key.json only. Refused once any sheet (final or DRAFT) exists.
     render --db PATH --out-dir DIR --splits splits.json --planted planted.json
-           --scrub-roster roster.json [--draft]
+           --scrub-roster roster.json --sheet-salt HEX16 [--draft]
+        --sheet-salt is required for every render (--draft included) and must be
+        exactly 16 characters of [0-9a-f]; otherwise the render is refused before
+        any sheet is written. render prints sheet_salt_sha256=<hex> to stderr, never
+        the salt.
         Build sheet-pass1.md and sheet-pass2.md and extend key.json with the
         item map, clause counts, sheet hashes and the scrub regexes. The names
         and handles to scrub are NOT in this file: --scrub-roster is a local
@@ -84,7 +97,7 @@ SEED_HEX = "d638538e"
 
 # Presentation-order salt (draft 5, change-log entry 14): the five ASCII letters.
 ORDER_SALT = "order"
-ORDER_KEY_DESCRIPTION = "sha256(seed_hex || 'order' || id)"
+ORDER_KEY_DESCRIPTION = "sha256(seed_hex || 'order' || sheet_salt || id)"
 
 # Pinned by the pre-registration ("Sample"): not a flag.
 WINDOW_START = "2026-10-10T15:00:00Z"
@@ -175,9 +188,20 @@ def sort_hash(seed_hex: str, ident: str) -> str:
     return hashlib.sha256((seed_hex + ident).encode("utf-8")).hexdigest()
 
 
-def order_hash(seed_hex: str, ident: str) -> str:
-    """Presentation key: sha256(seed_hex || ORDER_SALT || id), hex digest, compared as a string."""
-    return hashlib.sha256((seed_hex + ORDER_SALT + ident).encode("utf-8")).hexdigest()
+SHEET_SALT_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def order_hash(seed_hex: str, ident: str, sheet_salt: str) -> str:
+    """Presentation key: sha256(seed_hex || ORDER_SALT || sheet_salt || id), hex digest, compared as a string."""
+    return hashlib.sha256((seed_hex + ORDER_SALT + sheet_salt + ident).encode("utf-8")).hexdigest()
+
+
+def _check_sheet_salt(value) -> str:
+    # fullmatch, not match: "$" would accept a trailing newline.
+    if not isinstance(value, str) or not SHEET_SALT_RE.fullmatch(value):
+        raise Refusal("--sheet-salt is required for every render and must be exactly 16 lowercase hex "
+                      "characters [0-9a-f] (change-log entry 15; generate with os.urandom(8).hex())")
+    return value
 
 
 def bin_of(sim: float) -> str:
@@ -314,7 +338,7 @@ def cmd_select(args) -> int:
                           "claim": c["claim"], "quote": c["quote"], "interpretation": c["interpretation"]})
     key = {
         "tool_version": TOOL_VERSION,
-        "preregistration": "engram-alpha#4050 S2 draft 5, issue comment 6387983396 (seed pinned to draft 4, issue comment 6385972287)",
+        "preregistration": "engram-alpha#4050 S2 draft 5, issue comment 6387983396, change-log entry 15, issue comment 6390535527 (seed pinned to draft 4, issue comment 6385972287)",
         "seed_hex": args.seed_hex,
         "seed": int(args.seed_hex, 16),
         "window": [WINDOW_START, WINDOW_END],
@@ -490,6 +514,8 @@ _HEADER2 = ("# Clause-check sheet, pass 2\n\n"
 
 
 def cmd_render(args) -> int:
+    sheet_salt = _check_sheet_salt(args.sheet_salt)  # first: refuse before reading or writing anything
+    salt_sha256 = hashlib.sha256(sheet_salt.encode("utf-8")).hexdigest()
     out_dir = Path(args.out_dir)
     scrubber = load_scrubber(args.scrub_roster)
     key_path = out_dir / "key.json"
@@ -509,7 +535,7 @@ def cmd_render(args) -> int:
             raise Refusal(f"{p} already exists; refusing to overwrite")
     items = _load_items(out_dir, Path(args.db), splits, planted, key)
     seed_hex = key["seed_hex"]
-    items.sort(key=lambda i: order_hash(seed_hex, i["id"]))  # presentation order, not the selection key
+    items.sort(key=lambda i: order_hash(seed_hex, i["id"], sheet_salt))  # presentation order, not the selection key
     text1, text2, item_map, masked_total = [_HEADER1], [_HEADER2], {}, 0
     for num, it in enumerate(items, 1):
         body1, masked = _render_item(num, it, pass2=False, scrubber=scrubber)
@@ -517,7 +543,7 @@ def cmd_render(args) -> int:
         text1.append(body1)
         text2.append(body2)
         masked_total += masked
-        entry = {"id": it["id"], "clauses": len(it["clauses"]), "order_hash": order_hash(seed_hex, it["id"])}
+        entry = {"id": it["id"], "clauses": len(it["clauses"]), "order_hash": order_hash(seed_hex, it["id"], sheet_salt)}
         if it["kind"] != "real":
             entry["kind"] = it["kind"]
         item_map[str(num)] = entry
@@ -528,6 +554,8 @@ def cmd_render(args) -> int:
     key["render_draft" if args.draft else "render"] = {
         "order_key": ORDER_KEY_DESCRIPTION,
         "order_salt": ORDER_SALT,
+        "sheet_salt": sheet_salt,
+        "sheet_salt_sha256": salt_sha256,
         "items": item_map,
         "masked_id_tokens": masked_total,
         "planted_included": bool(planted),
@@ -536,6 +564,7 @@ def cmd_render(args) -> int:
     }
     _rewrite_private(key_path, _dump(key))
     print(f"rendered {len(items)} items; masked_id_tokens={masked_total}", file=sys.stderr)
+    print(f"sheet_salt_sha256={salt_sha256}", file=sys.stderr)
     if args.draft:
         print("DRAFT: written under .DRAFT.md names; not the final sheet.", file=sys.stderr)
     return 0
@@ -565,6 +594,8 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("--planted", default=None)
     # Required, but checked in load_scrubber so a missing flag refuses (exit 2) like every other refusal.
     r.add_argument("--scrub-roster", default=None)
+    # Required for every render, checked in cmd_render so a missing flag refuses (exit 2) like every other refusal.
+    r.add_argument("--sheet-salt", default=None)
     r.add_argument("--draft", action="store_true")
     return ap
 

@@ -295,6 +295,8 @@ def _planted(interp="planted interp"):
 ROSTER = {"names": ["Quillon", "Marrowby", "Tesselby"],
           "handles": ["quillon-bot", "marrowby-dev"]}
 _DEFAULT = object()
+SALT = "0123456789abcdef"  # fixed 16-hex sheet salt (change-log entry 15) for fixtures
+SALT_B = "fedcba9876543210"
 
 
 def _write_roster(out, roster):
@@ -303,8 +305,12 @@ def _write_roster(out, roster):
     return p
 
 
-def _render(tool, db, out, splits, planted=None, draft=False, roster=_DEFAULT):
+def _render(tool, db, out, splits, planted=None, draft=False, roster=_DEFAULT, salt=_DEFAULT):
     argv = ["render", "--db", str(db), "--out-dir", str(out), "--splits", str(splits)]
+    if salt is _DEFAULT:
+        salt = SALT
+    if salt is not None:
+        argv += ["--sheet-salt", salt]
     if roster is _DEFAULT:
         roster = ROSTER
     if roster is not None:
@@ -421,9 +427,9 @@ def test_s10e_key_has_roster_sha_and_counts_but_no_names(monkeypatch, tool):
 
 
 # --------------------------------------------------------------------------- S11
-def _oh(i):
-    """Presentation hash, recomputed here with a literal salt, independent of the tool's helper."""
-    return hashlib.sha256((SEED + "order" + i).encode("utf-8")).hexdigest()
+def _oh(i, salt=SALT):
+    """Presentation hash, recomputed here with a literal key, independent of the tool's helper."""
+    return hashlib.sha256((SEED + "order" + salt + i).encode("utf-8")).hexdigest()
 
 
 # Removed-test: tests/test_s2_clause_sheet_4050.py::test_s11_item_order_follows_sort_rule — renamed to test_s11_item_order_follows_presentation_rule; draft 5 replaced the selection key with the salted presentation key for item order.
@@ -741,8 +747,10 @@ def test_s19d_key_records_presentation_rule(monkeypatch, tool):
     db, out, real, planted = _order_fixture(monkeypatch, tool)
     assert _render(tool, db, out, _splits(out), planted) == 0
     render = _key(out)["render"]
-    assert render["order_key"] == "sha256(seed_hex || 'order' || id)"
+    assert render["order_key"] == "sha256(seed_hex || 'order' || sheet_salt || id)"
     assert render["order_salt"] == "order"
+    assert render["sheet_salt"] == SALT
+    assert render["sheet_salt_sha256"] == hashlib.sha256(SALT.encode("utf-8")).hexdigest()
     assert len(render["items"]) == 44
     for n, entry in render["items"].items():
         assert entry["order_hash"] == _oh(entry["id"])
@@ -783,3 +791,98 @@ def test_s20b_draft_and_final_renders_carry_it_without_a_notes_line(monkeypatch,
         assert not re.search(r"^## Notes", text, re.IGNORECASE | re.MULTILINE), name
         hits = [ln for ln in text.splitlines() if scorer_notes.match(ln.strip())]
         assert hits == [], (name, hits)
+
+
+# --------------------------------------------------------------------------- S21: secret per-sheet salt (entry 15)
+def test_s21a_final_render_without_salt_refuses_before_writing(monkeypatch, tool):
+    db, out = _built(monkeypatch, tool)
+    assert _render(tool, db, out, _splits(out), _planted(), salt=None) == 2
+    assert not (out / "sheet-pass1.md").exists()
+    assert not (out / "sheet-pass2.md").exists()
+    assert "render" not in _key(out)
+
+
+def test_s21b_refusal_message_names_requirement_and_entry(monkeypatch, tool, capsys):
+    db, out = _built(monkeypatch, tool)
+    assert _render(tool, db, out, _splits(out), _planted(), salt=None) == 2
+    err = capsys.readouterr().err
+    assert "--sheet-salt" in err and "16" in err and "entry 15" in err
+
+
+@pytest.mark.parametrize("bad", ["0123456789abcde", "0123456789abcdef0", "0123456789ABCDEF", "0123456789abcdeg",
+                                 "", "0123456789abcde\n", "0123456789abcdef\n"])
+def test_s21c_bad_salts_refuse(monkeypatch, tool, bad):
+    db, out = _built(monkeypatch, tool)
+    assert _render(tool, db, out, _splits(out), _planted(), salt=bad) == 2
+    assert not (out / "sheet-pass1.md").exists()
+    assert not (out / "sheet-pass2.md").exists()
+
+
+def test_s21d_order_follows_salted_sort_and_salts_differ(monkeypatch, tool):
+    orders = {}
+    for salt in (SALT, SALT_B):
+        db, out, real, planted = _order_fixture(monkeypatch, tool)
+        assert _render(tool, db, out, _splits(out), planted, salt=salt) == 0
+        allids = real + [p["planted_id"] for p in planted]
+        items = _key(out)["render"]["items"]
+        orders[salt] = [items[str(n)]["id"] for n in range(1, 45)]
+        assert orders[salt] == sorted(allids, key=lambda i: _oh(i, salt))
+    assert orders[SALT] != orders[SALT_B]
+
+
+def test_s21e_salt_and_its_hash_not_in_either_sheet(monkeypatch, tool):
+    db, out = _built(monkeypatch, tool)
+    assert _render(tool, db, out, _splits(out), _planted()) == 0
+    digest = hashlib.sha256(SALT.encode("utf-8")).hexdigest()
+    for f in ("sheet-pass1.md", "sheet-pass2.md"):
+        text = (out / f).read_text()
+        assert SALT not in text and digest not in text, f
+
+
+def test_s21f_stderr_prints_commitment_never_the_salt(monkeypatch, tool, capsys):
+    db, out = _built(monkeypatch, tool)
+    assert _render(tool, db, out, _splits(out), _planted()) == 0
+    cap = capsys.readouterr()
+    err = cap.err
+    assert f"sheet_salt_sha256={hashlib.sha256(SALT.encode('utf-8')).hexdigest()}" in err
+    assert SALT not in err
+    assert cap.out == ""  # nothing on stdout at all, so the salt cannot leak there
+
+
+def test_s21g_draft_render_without_salt_also_refuses_before_writing(monkeypatch, tool):
+    db, out = _built(monkeypatch, tool)
+    assert _render(tool, db, out, _splits(out), draft=True, salt=None) == 2
+    assert not (out / "sheet-pass1.DRAFT.md").exists()
+    assert not (out / "sheet-pass2.DRAFT.md").exists()
+    assert "render_draft" not in _key(out)
+
+
+def test_s21h_draft_render_with_salt_records_it(monkeypatch, tool):
+    db, out = _built(monkeypatch, tool)
+    assert _render(tool, db, out, _splits(out), draft=True) == 0
+    rec = _key(out)["render_draft"]
+    assert rec["sheet_salt"] == SALT
+    assert rec["sheet_salt_sha256"] == hashlib.sha256(SALT.encode("utf-8")).hexdigest()
+
+
+def test_s21i_order_key_bytes_pinned_fixed_widths_id_last_no_delimiter(monkeypatch, tool):
+    # Pinned layout: sha256 over the UTF-8 (= ASCII) bytes of seed_hex(8) + "order" + sheet_salt(16) + id.
+    assert len(SEED) == 8 and len(SALT) == 16
+    db, out, real, planted = _order_fixture(monkeypatch, tool)
+    assert _render(tool, db, out, _splits(out), planted) == 0
+    items = _key(out)["render"]["items"]
+    for n in range(1, 45):
+        ident = items[str(n)]["id"]
+        string = SEED + "order" + SALT + ident
+        assert string.startswith(SEED + "order" + SALT) and string.endswith(ident)
+        assert items[str(n)]["order_hash"] == hashlib.sha256(string.encode("utf-8")).hexdigest()
+    order = [items[str(n)]["id"] for n in range(1, 45)]
+    assert order == sorted(real + [p["planted_id"] for p in planted],
+                           key=lambda i: hashlib.sha256((SEED + "order" + SALT + i).encode("utf-8")).hexdigest())
+
+
+def test_s21j_commitment_is_sha256_of_the_16_ascii_salt_characters(monkeypatch, tool):
+    db, out = _built(monkeypatch, tool)
+    assert _render(tool, db, out, _splits(out), _planted()) == 0
+    assert len(SALT) == 16 and SALT.isascii()
+    assert _key(out)["render"]["sheet_salt_sha256"] == hashlib.sha256(SALT.encode("ascii")).hexdigest()

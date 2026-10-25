@@ -137,7 +137,8 @@ def _build_sheet(monkeypatch, prefix, planted_prefix, render_seed_hex=None):
         (out / "key.json").write_text(json.dumps(key))
     assert sheet_tool.main(["render", "--db", str(db), "--out-dir", str(out),
                             "--splits", str(out / "splits.json"), "--planted", str(out / "planted.json"),
-                            "--scrub-roster", str(out / "roster.json")]) == 0
+                            "--scrub-roster", str(out / "roster.json"),
+                            "--sheet-salt", "0123456789abcdef"]) == 0  # entry 15: render requires a salt
     if render_seed_hex:  # restore the signed seed in the key (the scorer pins it)
         key = json.loads((out / "key.json").read_text())
         key["seed_hex"] = sheet_tool.SEED_HEX
