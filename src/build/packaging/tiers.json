@@ -670,10 +670,6 @@
       "tier": "convenience"
     },
     {
-      "path": "tools/_common.py",
-      "tier": "convenience"
-    },
-    {
       "path": "tools/engram-pkg",
       "tier": "convenience"
     },
@@ -1591,6 +1587,10 @@
     {
       "path": "tools/_channel.py",
       "reason": "#2857 step 2: its only live importer is tools/telegram_bot.py, already excluded above as persona-specific integration not part of generic ENGRAM install. Shipping _channel.py as a mechanism ships a module whose sole live consumer is never installed; kept in the repo (not deleted) because telegram_bot.py still uses it."
+    },
+    {
+      "path": "tools/_common.py",
+      "reason": "#3863 step 3d: its only importer anywhere in the tree is tools/telegram_bot.py, already excluded above as persona-specific integration not part of generic ENGRAM install. Shipping _common.py as a mechanism ships a module whose sole live consumer is never installed; kept in the repo (not deleted) because telegram_bot.py still uses it."
     },
     {
       "path": "templates/agents.json.example",
