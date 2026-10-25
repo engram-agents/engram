@@ -3693,15 +3693,17 @@ class TestCiStateDedup:
         assert result[0]["conclusion"] == "SUCCESS"
 
     def test_dedupe_null_completed_at_loses_to_finished(self, baton):
-        # In-progress re-run (null completedAt) should not displace a finished run,
-        # regardless of which ordering they appear in the list.
+        # #2437/#4165: the test id is kept, the pinned behaviour is inverted. An
+        # in-progress re-run (null completedAt) IS the current entry for its
+        # name and must survive the dedupe, in either list order, so the
+        # pending pass can see it. (The old rule discarded it.)
         checks_finished_first = [
             {"name": "ci", "conclusion": "SUCCESS", "completedAt": "2026-06-24T12:00:00Z"},
             {"name": "ci", "conclusion": None, "completedAt": None},
         ]
         result = baton._dedupe_checks_by_latest(checks_finished_first)
         assert len(result) == 1
-        assert result[0]["conclusion"] == "SUCCESS"
+        assert result[0]["conclusion"] is None
 
         checks_null_first = [
             {"name": "ci", "conclusion": None, "completedAt": None},
@@ -3709,7 +3711,7 @@ class TestCiStateDedup:
         ]
         result = baton._dedupe_checks_by_latest(checks_null_first)
         assert len(result) == 1
-        assert result[0]["conclusion"] == "SUCCESS"
+        assert result[0]["conclusion"] is None
 
     def test_dedupe_preserves_distinct_names(self, baton):
         checks = [
@@ -5430,13 +5432,18 @@ class TestFlipMaintainerRoleGate:
         """Control: flip to the registered COLLEAGUE ("sol", the baton's
         colleague: field) is the review-stage "please review" signal, not a
         merge-readiness claim -- this must NOT trigger CI/approval checks,
-        even with CI red and no approval mocked. A regression here would
-        break the exact pattern this team uses on every PR, all day
-        ("baton flip PR-N <colleague>" as the first review-request flip)."""
+        even with no approval mocked. A regression here would break the
+        exact pattern this team uses on every PR, all day ("baton flip PR-N
+        <colleague>" as the first review-request flip).
+
+        #4165: the review-request flip now reads CI (a red tip is refused;
+        see test_baton_flip_review_request_ci_4165.py), so this control is
+        narrowed to what still holds: with CI green the flip goes through and
+        the merge-only approval/colleague gates are not consulted."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
 
         def _fake_ci_state(pr_num, repo=None):
-            raise AssertionError("_pr_ci_state must not be called for a flip to the registered colleague")
+            return ("green", "all checks passed")
 
         def _fake_approval_state(pr_num, repo=None):
             raise AssertionError("_pr_approval_state must not be called for a flip to the registered colleague")

@@ -510,24 +510,53 @@ def _dedupe_checks_by_latest(checks: list) -> list:
     cross-SHA case (measured 2026-08-30; this docstring claimed one until
     then).
 
-    ISO-8601 completedAt strings compare correctly as plain strings
-    (lexicographic == chronological).  A null/missing completedAt (check
-    still in progress) sorts before any finished timestamp, so an in-progress
-    re-run correctly loses to the completed previous run of the same name —
-    the pending state is then caught by the pending-pass below.
+    An UNFINISHED run (status not COMPLETED: IN_PROGRESS / QUEUED / PENDING, or
+    a status-context in the PENDING state) is the current entry for its name
+    and always wins, whatever else is in the rollup (#2437).  The old rule
+    ranked by completedAt alone, so an in-flight re-run lost to a finished run
+    of the same name and was discarded before the pending pass: a finished
+    SUCCESS + in-flight re-run read GREEN, and a finished CANCELLED/FAILURE +
+    in-flight re-run read RED.  completedAt cannot be used to detect an
+    unfinished run: it may be null, "", or the Go zero value
+    "0001-01-01T00:00:00Z" (a truthy string), depending on the gh version.
+    Among FINISHED runs of one name the latest completedAt wins (ISO-8601
+    strings compare correctly as plain strings).
 
-    Edge case: if two runs for the same name both have completedAt=None
-    (both in-progress), the first one seen is kept.  In practice both would
-    be in-progress and the pending-pass catches them regardless of which wins.
+    Edge case: if two runs of one name are both unfinished, the first one seen
+    is kept; the pending pass reports pending whichever wins.
     """
     latest: dict = {}
     for check in checks:
         name = check.get("name") or check.get("context") or ""
-        completed_at = check.get("completedAt") or ""
         existing = latest.get(name)
-        if existing is None or completed_at > (existing.get("completedAt") or ""):
+        if existing is None:
+            latest[name] = check
+            continue
+        if _is_unfinished(existing):
+            continue
+        if _is_unfinished(check) or (check.get("completedAt") or "") > (
+            existing.get("completedAt") or ""
+        ):
             latest[name] = check
     return list(latest.values())
+
+
+def _is_unfinished(check: dict) -> bool:
+    """True when a rollup entry is a run that has not finished (#2437).
+
+    Keys on status, never on completedAt.  A check-run carries `status`
+    (COMPLETED or not); a status-context carries `state` instead.  An entry with
+    neither status, state nor conclusion has not started, which the pending
+    pass also reports as pending.  A status-context in state EXPECTED counts as
+    finished here and is not caught by the pending pass (pre-existing).
+    """
+    status = (check.get("status") or "").upper()
+    if status:
+        return status != "COMPLETED"
+    state = (check.get("state") or "").upper()
+    if state:
+        return state in _CI_PENDING_STATUSES
+    return not (check.get("conclusion") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -777,11 +806,16 @@ def _ci_state_from_rollup_output(result) -> tuple:
         return ("unknown", "statusCheckRollup missing or not a list")
 
     if not checks:
-        # No checks registered — treat as green
-        return ("green", "no checks registered")
+        # Seconds after a push the new head has no check runs registered yet;
+        # nothing has checked this tip, so it is not green (#4165). Sits after
+        # the CLEAN check above, which stays sufficient on its own.
+        return ("pending", "no checks registered on the head yet")
 
     # Dedupe: keep only the latest run per check name so a superseded same-SHA
-    # run (e.g. a CANCELLED one the concurrency group killed) can't false-block (#1366).
+    # run (e.g. a CANCELLED one the concurrency group killed) can't false-block
+    # (#1366).  An unfinished run is the current entry for its name and beats any
+    # finished one, so a live re-run is never discarded before the pending pass
+    # below (#2437).
     checks = _dedupe_checks_by_latest(checks)
 
     for check in checks:
@@ -817,7 +851,7 @@ def _pr_ci_state(pr_number: str, repo: str) -> tuple:
     """Query GitHub CI state for a pull request via `gh`.
 
     Returns (state, detail) where state is one of:
-      "green"   — all checks passed (or no checks registered)
+      "green"   — all checks passed (an empty rollup is pending, not green)
       "red"     — at least one check failed
       "pending" — no failure, but at least one check still running
       "unknown" — could not obtain a verdict (degraded; advisory only)

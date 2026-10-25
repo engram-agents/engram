@@ -549,9 +549,11 @@ carried it until 2026-08-30:
    across-SHAs case, because a superseded SHA's runs are not in the rollup to begin with.
 4. **Use the rollup only to find WHICH check to read when the state is not CLEAN** —
    and dedupe to the latest run per check name before judging, where *latest* means
-   most recently **completed**: `_dedupe_checks_by_latest()` compares `completedAt`,
-   and ordering by `startedAt` instead picks a different winner whenever one run starts
-   earlier but finishes later. `gh run list --branch <branch> --json
+   an **unfinished** run (status not `COMPLETED`) is the latest for its name, else the
+   most recently **completed**: `_dedupe_checks_by_latest()` keys on status first (never
+   on `completedAt`'s emptiness: an in-flight run can carry null, `""` or the Go zero
+   value) and then compares `completedAt` among finished runs; ordering by `startedAt`
+   instead picks a different winner whenever one run starts earlier but finishes later. `gh run list --branch <branch> --json
    name,headSha,conclusion,updatedAt` in time order is the direct way to see which run
    is the current one — that command exposes no `completedAt`, but on a finished run
    its `updatedAt` is ≈ the completion time (measured ~1s later, on five runs).

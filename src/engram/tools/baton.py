@@ -795,8 +795,11 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         )
         sys.exit(EXIT_VALIDATION)
 
-    # CI-green guard (#685): run only when flipping a PR-baton to the pool
-    # sentinel (the "presenting for merge" signal per #51 protocol).
+    # CI-green guard (#685, #4165): reads CI on two flips of a PR-baton: the
+    # flip to the pool sentinel / maintainer (the "presenting for merge" signal
+    # per #51 protocol; red and pending refuse, plus the approval gates) and the
+    # flip TO the registered colleague (the "please review" signal; only red
+    # refuses). Any other flip reads no CI.
     # .strip().lower() is intentional case-normalization — the github: field is
     # user-authored YAML and may be mixed-case; matching _pool_sentinel()'s lowering.
     #
@@ -859,28 +862,9 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         _pr_num = _parsed_anchor[2]
         _pr_repo = _parsed_anchor[1]
         _ci_state, _ci_detail = _pr_ci_state(_pr_num, repo=_pr_repo)
-        if _ci_state in ("red", "pending"):
-            if _flip_force:
-                print(
-                    f"warning: --force — flipping despite CI {_ci_state} "
-                    f"on PR #{_pr_num} ({_ci_detail})",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    f"baton flip: CI is {_ci_state} on PR #{_pr_num} "
-                    f"(the current tip is not merge-ready). "
-                    "Re-flip when checks are green, or pass --force to override.",
-                    file=sys.stderr,
-                )
-                sys.exit(EXIT_VALIDATION)
-        elif _ci_state == "unknown":
-            print(
-                f"warning: could not verify CI state for PR #{_pr_num} "
-                f"({_ci_detail}) — proceeding anyway",
-                file=sys.stderr,
-            )
-        # green: proceed silently
+        reason += _flip_ci_gate(
+            _ci_state, _ci_detail, _pr_num, force=_flip_force, pending_refuses=True,
+        )
 
         # Post-approval re-check guard (#1002): companion to the CI-green
         # guard above. Even with CI green on the current tip, a commit
@@ -958,6 +942,24 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
                 file=sys.stderr,
             )
         # fresh: proceed silently
+
+    elif _pr_anchor_match and _is_review_request_flip(to_agent, _current_holder, _colleague_name):
+        # #4165: the author -> colleague "please review" flip reads CI too, so a
+        # red tip does not reach the reviewer. Not the merge signal: pending
+        # never refuses, and an unqualified anchor warns instead of refusing.
+        if _parsed_anchor[1] is None:
+            print(
+                f"warning: '{project_id}' has no repo-qualified github anchor "
+                f"-- CI cannot be verified for PR #{_parsed_anchor[2]}; "
+                "proceeding anyway",
+                file=sys.stderr,
+            )
+        else:
+            _ci_state, _ci_detail = _pr_ci_state(_parsed_anchor[2], repo=_parsed_anchor[1])
+            reason += _flip_ci_gate(
+                _ci_state, _ci_detail, _parsed_anchor[2],
+                force=_flip_force, pending_refuses=False,
+            )
 
     # #3039 U2a: compute the phase this flip should result in (or the
     # legacy-conversion phase to stamp on a still-legacy baton), on the SAME
@@ -1348,6 +1350,85 @@ def _is_maintainer_flip(
     if author and to_agent == author:
         return False
     return True
+
+
+def _is_review_request_flip(
+    to_agent: str,
+    current_holder: str,
+    colleague_name: str,
+) -> bool:
+    """True when flipping the baton to `to_agent` is the "please review" signal
+    (#4165): the flip TO the registered colleague, by anyone other than the
+    colleague -- the author, but equally a maintainer handing the PR back for
+    re-review (a red tip wastes that read just the same; pinned by #4176). The
+    exact case `_is_maintainer_flip` exempts, so the two are disjoint. A self-flip, the colleague's return flip to the author, and a
+    baton with no registered colleague are not review requests.
+    """
+    return bool(
+        colleague_name
+        and to_agent == colleague_name
+        and to_agent != current_holder
+    )
+
+
+def _flip_ci_gate(
+    ci_state: str,
+    ci_detail: str,
+    pr_num: str,
+    *,
+    force: bool,
+    pending_refuses: bool,
+) -> str:
+    """Shared red/pending/unknown handling for the two CI-reading flips (#4165).
+
+    `pending_refuses=True` is the merge-signal flip (to the maintainer): red and
+    pending both refuse. `False` is the review-request flip: only red refuses,
+    pending warns loudly (right after a push pending is the normal state).
+    `--force` overrides a refusal.
+
+    Exits EXIT_VALIDATION on refusal. Returns a suffix for the flip's turn-log
+    reason: empty unless `--force` overrode a red/pending verdict, in which case
+    it names the state and the check, so the override is recorded in the stored
+    baton and not only printed. The suffix carries no double quotes (the reason
+    is stored inside a quoted frontmatter value).
+    """
+    safe_detail = (ci_detail or "").replace('"', "'").replace("\n", " ")
+    if ci_state == "red" or (ci_state == "pending" and pending_refuses):
+        if force:
+            print(
+                f"warning: --force — flipping despite CI {ci_state} "
+                f"on PR #{pr_num} ({ci_detail})",
+                file=sys.stderr,
+            )
+            return f" [forced past CI {ci_state}: {safe_detail}]"
+        if pending_refuses:
+            print(
+                f"baton flip: CI is {ci_state} on PR #{pr_num} "
+                f"(the current tip is not merge-ready). "
+                "Re-flip when checks are green, or pass --force to override.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"baton flip: CI is {ci_state} on PR #{pr_num} ({ci_detail}); "
+                "the current tip is not ready for review. Fix the failing "
+                "check and re-flip, or pass --force to override.",
+                file=sys.stderr,
+            )
+        sys.exit(EXIT_VALIDATION)
+    if ci_state == "pending":
+        print(
+            f"warning: CI is pending on PR #{pr_num} ({ci_detail}) — "
+            "proceeding; the colleague should read CI before reviewing",
+            file=sys.stderr,
+        )
+    elif ci_state == "unknown":
+        print(
+            f"warning: could not verify CI state for PR #{pr_num} "
+            f"({ci_detail}) — proceeding anyway",
+            file=sys.stderr,
+        )
+    return ""
 
 
 def _is_pr_shaped(project_id: str, github: str) -> bool:

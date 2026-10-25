@@ -310,7 +310,7 @@ rollup. (`DIRTY` is a merge conflict and must be resolved whatever CI says.)
 1. **`CLEAN` is the verdict — stop there.** GitHub computes it from the latest run per check.
 2. **The rollup does NOT dedupe.** A stale `FAILURE`/`CANCELLED` from a superseded same-SHA run sits beside the current `SUCCESS`; requiring every entry to be `SUCCESS` false-blocks a green PR.
 3. **Two runs of one check can land on the SAME SHA** (the workflow fires on `edited` as well as `synchronize`). The dedupe is load-bearing within one SHA only.
-4. **Use the rollup only to find WHICH check to read**, deduped to the latest run per check name, where *latest* = most recently **completed** (`completedAt`, not `startedAt`). `gh run list --branch <branch> --json name,headSha,conclusion,updatedAt` shows the current run. But see rule 3 of "Merge-seat test rules" below: a cancelled newest same-SHA run still blocks the merge; rerun it.
+4. **Use the rollup only to find WHICH check to read**, deduped to the latest run per check name, where *latest* = an unfinished run (status not `COMPLETED`) if the name has one, else the most recently **completed** (`completedAt`, not `startedAt`). `gh run list --branch <branch> --json name,headSha,conclusion,updatedAt` shows the current run. But see rule 3 of "Merge-seat test rules" below: a cancelled newest same-SHA run still blocks the merge; rerun it.
 5. **`UNKNOWN` is not red** — it is computed asynchronously. Treat it as *pending* (hold, re-check next tick), never as a failure.
 
 Reference implementation: `_pr_ci_state()` and `_dedupe_checks_by_latest()` in
