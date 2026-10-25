@@ -244,7 +244,20 @@ def test_c2a_variant_verdicts_table_missing_reads_not_aggregated(tmp_dir):
     conn.close()
 
     line = v.summary_line(db_path)
-    assert line == "telemetry: not aggregated (records.db missing)", line
+    assert "verdicts table absent" in line, line
+    assert "records.db missing" not in line, line
+    _assert_no_zero_verdict_counts(line)
+
+
+def test_c2a_variant_verdicts_table_empty_reads_not_aggregated(tmp_dir):
+    """File exists with a real verdicts table (via _make_db) but zero rows.
+    MAX(window) returns NULL -- fresh/empty store. Must NOT say
+    "records.db missing" (records.db is present and verdicts was found)."""
+    db_path = _make_db(tmp_dir)  # verdicts table created, zero rows
+
+    line = v.summary_line(db_path)
+    assert "verdicts table empty" in line, line
+    assert "records.db missing" not in line, line
     _assert_no_zero_verdict_counts(line)
 
 

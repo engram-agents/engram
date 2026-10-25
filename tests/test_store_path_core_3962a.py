@@ -40,6 +40,7 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "engram"
 GUARD_S = 10
 
 NOT_AGGREGATED = "telemetry: not aggregated (records.db missing)"
+NO_VERDICTS_TABLE = "telemetry: not aggregated (verdicts table absent)"
 
 KINDS = ["enoent", "chmod000", "enotdir", "loop", "dangling", "fifo", "dir", "link_to_store", "store"]
 REFUSED = ["chmod000", "enotdir", "loop", "dangling", "fifo", "dir"]
@@ -291,8 +292,8 @@ def test_summary_line_raises_the_classifier_exception_for_an_unusable_path(kind,
 
 @pytest.mark.parametrize("kind", OPENABLE)
 def test_summary_line_on_a_real_store_and_a_link_is_unchanged(kind, plant):
-    # a bare sqlite file has no verdicts table: today's answer, reached through a normal open
-    assert _child(_SUMMARY, plant(kind)) == {"returned": NOT_AGGREGATED}
+    # a bare sqlite file has no verdicts table: returns the distinct "verdicts table absent" text
+    assert _child(_SUMMARY, plant(kind)) == {"returned": NO_VERDICTS_TABLE}
 
 
 def test_engram_stats_diagnose_says_unavailable_for_an_unusable_telemetry_path():

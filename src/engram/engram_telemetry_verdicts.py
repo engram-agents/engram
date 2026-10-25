@@ -554,6 +554,12 @@ _SUMMARY_NAMED_VERDICTS: list[str] = [
 ]
 
 _SUMMARY_NOT_AGGREGATED_MISSING = "telemetry: not aggregated (records.db missing)"
+_SUMMARY_NOT_AGGREGATED_NO_VERDICTS_TABLE = (
+    "telemetry: not aggregated (verdicts table absent)"
+)
+_SUMMARY_NOT_AGGREGATED_NO_VERDICTS = (
+    "telemetry: not aggregated (verdicts table empty)"
+)
 _SUMMARY_NOT_AGGREGATED_NO_INGEST_TIMESTAMP = (
     "telemetry: not aggregated (ingest timestamp unavailable)"
 )
@@ -629,7 +635,7 @@ def summary_line(db_path, window: Optional[str] = None) -> str:
             return _SUMMARY_NOT_AGGREGATED_MISSING
 
         if not _summary_table_exists(conn, "verdicts"):
-            return _SUMMARY_NOT_AGGREGATED_MISSING
+            return _SUMMARY_NOT_AGGREGATED_NO_VERDICTS_TABLE
 
         if window is not None:
             _validate_window(window)  # ValueError propagates -- caller bug
@@ -638,9 +644,8 @@ def summary_line(db_path, window: Optional[str] = None) -> str:
             row = conn.execute("SELECT MAX(window) FROM verdicts").fetchone()
             resolved_window = row[0] if row else None
             if resolved_window is None:
-                # Table exists but carries zero rows at all -- fresh/empty
-                # store, same as "nothing has aggregated yet".
-                return _SUMMARY_NOT_AGGREGATED_MISSING
+                # Table exists but carries zero rows at all -- fresh/empty store.
+                return _SUMMARY_NOT_AGGREGATED_NO_VERDICTS
 
         last_ingest_raw: Optional[str] = None
         if _summary_table_exists(conn, "ingest_offsets"):
