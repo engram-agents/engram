@@ -3711,6 +3711,10 @@ def _retract_impl(
 
     Returns:
         JSON with retraction details, tainted downstream nodes, and optional replacement.
+
+    The retract write is guarded (#4166): it only lands if the node is still
+    current, not retracted, and its metadata is byte-identical to what this
+    call read; otherwise nothing changes and refusal `changed_concurrently`.
     """
     if not node_id or not node_id.strip():
         return json.dumps({"error": "node_id is required and cannot be empty."})
@@ -4018,10 +4022,26 @@ def _retract_impl(
         if initiation_ref:
             retract_meta["initiation_ref"] = initiation_ref
 
-        conn.execute(
-            "UPDATE nodes SET status = 'retracted', is_current = 0, metadata = ? WHERE id = ?",
-            (json.dumps(retract_meta), node_id),
+        # #4166: guarded write. The node was read at the top of this call and
+        # no write transaction was open then (sqlite3 opens its transaction at
+        # the first DML, which is this UPDATE), so another writer could have
+        # changed it since. `metadata IS ?` is bound to the RAW column value
+        # read, not a re-serialized dict; if the node is no longer exactly what
+        # was read (or is no longer live), refuse rather than overwrite.
+        _guarded = conn.execute(
+            "UPDATE nodes SET status = 'retracted', is_current = 0, metadata = ? "
+            "WHERE id = ? AND is_current = 1 AND COALESCE(status, '') != 'retracted' "
+            "AND metadata IS ?",
+            (json.dumps(retract_meta), node_id, node["metadata"]),
         )
+        if _guarded.rowcount != 1:
+            conn.rollback()
+            return json.dumps({
+                "error": f"Node '{node_id}' changed while this call was running "
+                         f"(another write got there first). Nothing was changed. "
+                         f"Re-read the node and retry.",
+                "refusal": "changed_concurrently",
+            })
 
         # 1b. If retracted node was a resolution, reopen the resolved target.
         # A resolution creates a 'resolves' edge from the derivation to the

@@ -1698,6 +1698,11 @@ def _add_observation_impl(
     public payload schema. Kept callable with named kwargs for in-server
     callers (engram_add_observation_batch, engram_retract replacement path).
 
+    The evidence-node metadata passthrough write is guarded (#4166): it only
+    lands if the evidence row's metadata is byte-identical to what this call
+    read; otherwise the whole call rolls back with refusal
+    `changed_concurrently`.
+
     NOTE on source_class default: the signature default is None (sentinel for
     "caller truly omitted it"), not "external" — this lets the session_id path
     apply its own ergonomic default (user_stated) only when the caller truly
@@ -2394,10 +2399,24 @@ def _add_observation_impl(
                 ev["metadata"], evidence_id, "engram_add_observation")
             if _ev_replaced_warning:
                 result["warnings"] = result.get("warnings", []) + [_ev_replaced_warning]
-            conn.execute(
-                "UPDATE nodes SET metadata = ? WHERE id = ?",
-                (json.dumps(_ev_metadata), evidence_id),
+            # #4166: guarded write. The evidence row was read at the top of
+            # this call, before this connection's first DML (the id
+            # allocation), so another writer could have changed it since.
+            # `metadata IS ?` is bound to the RAW column value read; on a
+            # mismatch roll back the whole call (the observation insert too)
+            # and refuse.
+            _ev_guarded = conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ? AND metadata IS ?",
+                (json.dumps(_ev_metadata), evidence_id, ev["metadata"]),
             )
+            if _ev_guarded.rowcount != 1:
+                conn.rollback()
+                return json.dumps({
+                    "error": f"Evidence node '{evidence_id}' changed while this "
+                             f"call was running (another write got there first). "
+                             f"Nothing was changed. Re-read the node and retry.",
+                    "refusal": "changed_concurrently",
+                })
         if _evidence_type_conflict:
             result["evidence_type_conflict"] = _evidence_type_conflict
         if _original_url_conflict:
