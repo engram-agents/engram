@@ -361,7 +361,8 @@ seat can run it and any other seat can check that it ran.
     SHA, this gate's items 1–3 with times and oids, **the base SHA the scratch run
     used and that it still held at the press** (items 4 and 8), **which suite ran and
     on which platform** (Aleph), the counts read from the saved output, the mutation and its
-    red set, any fairy-cap note, and the read-back of every closed issue (the
+    red set, any fairy-cap note, any load flake that rule 4 of *Merge-seat test rules*
+    cleared (its issue and controls), and the read-back of every closed issue (the
     post-merge completeness read of CLAUDE.md § PR — issue closure). The commander
     samples merge records at day-end; a record missing an item is the finding,
     whatever the merge's outcome.
@@ -558,7 +559,10 @@ carried it until 2026-08-30:
    is the current one — that command exposes no `completedAt`, but on a finished run
    its `updatedAt` is ≈ the completion time (measured ~1s later, on five runs).
    This dedupe is the test verdict, but see rule 3 of "Merge-seat test rules" below: a
-   cancelled newest same-SHA run still blocks the merge; rerun it.
+   cancelled same-SHA run can still block the merge; rerun it. Which gate reads which:
+   this dedupe answers the readiness question (is the newest run of each check green)
+   for the flip and merge-signal gates. The press step answers GitHub's merge-gate
+   question (did every run on this head succeed) with the strict read of rule 5.
 5. **`UNKNOWN` is not red — measured, not reasoned.** `mergeStateStatus` is computed
    asynchronously and only for open PRs. It has been observed reading `UNKNOWN` twice a
    minute apart on a PR that was genuinely fine, then `CLEAN` minutes later, then
@@ -607,9 +611,10 @@ merging does not clean the rollup and the evidence stays checkable.*
 
 ### Merge-seat test rules (added 2026-10-06, #3479)
 
-Three rules for the seat that runs tests before merging. They sit with the CI-green
-gate above because they answer the same question from the other side: CI-green says
-the PR's checks passed; these say what the seat's own run must be and how to read it.
+Five rules for the seat that runs tests before merging and then presses. They sit with
+the CI-green gate above because they answer the same question from the other side:
+CI-green says the PR's checks passed; these say what the seat's own run must be, how
+to read it, and what the press step itself must check.
 
 **1. The seat's own test run is on a SCRATCH MERGE of the base tip plus the PR head,
 never on the head alone.** The run answers *does the base work after this lands*. A
@@ -642,7 +647,7 @@ the seat that broke it, and must not be held against the PR. To tell the two apa
 
 **3. A cancelled same-SHA run can block the merge even when another run passed.**
 Observed: a required status check can read as not-satisfied — the PR stays `BLOCKED`
-and the merge is refused — when the newest run of that check on the head SHA was
+and the merge is refused — when a run of that check on the head SHA was
 `CANCELLED`, even though another run on the same SHA passed. `gh run rerun <the
 cancelled run id>` cleared it. Never argue from the deduplication above ("another run
 passed, so the gate is satisfied"); rerun the cancelled run.
@@ -650,10 +655,11 @@ passed, so the gate is satisfied"); rerun the cancelled run.
 The cause seen, on alpha #3489 only: two `pull_request` runs on the same SHA were
 created in the same second, after a push and a PR-body edit seconds apart, and
 concurrency cancelled one. On #3476 we know only that the newest same-SHA run was
-cancelled by concurrency; what triggered the second run is not known. The
-explanation that fits is that GitHub keys the required check on the newest same-SHA
-run, not the most recently completed one. That is the merge seat's reading from two
-measurements, no documentation; the fact and the remedy above are as measured.
+cancelled by concurrency; what triggered the second run is not known. Which run
+GitHub keys a required check on is not known either. "The newest same-SHA run" fits
+#3476 but not #3489, where by `started_at` the cancelled run started five seconds
+before the success and the PR still read `BLOCKED`. There is no documentation; the
+fact and the remedy above are as measured.
 Untested advice: edit the PR body before pushing, or wait for the push's run to start.
 
 *Evidence:* two measurements, 2026-10-06.
@@ -664,6 +670,133 @@ gave `CLEAN` as soon as it completed.
 (2) alpha #3489, ~17:13–17:20Z: read `BLOCKED | pr-checks:CANCELLED, pr-checks:SUCCESS`
 (two runs on the same SHA, started in the same second by a push and a body edit);
 `gh run rerun` of the cancelled run gave `CLEAN | SUCCESS, SUCCESS`.
+
+**4. A red that only the whole run produces is a load flake, not a PR red** (Kepler,
+2026-10-25; condition four added on Luria's review). It applies when all four hold:
+- no PR in the run touches the failing test's file, any file that test runs (a
+  subprocess target, for one), or the modules the failing cell exercises;
+- the cell is green on the base alone;
+- the cell is green on the merged tree alone, with the failing cell run by itself on
+  each tree at least three times;
+- the cell is green when co-run in one process with each PR's added or changed test
+  files, conftest and fixture files included, one PR at a time (seconds per PR).
+
+The fourth condition catches a PR whose new test leaves process state behind (a
+leaked thread, a patched module, a changed working directory). The untouched cell
+then fails only when it shares a process with that test. It passes alone on every
+tree, so conditions two and three cannot see it. Luria measured that shape with a
+stand-in: the untouched cell passed alone 3 of 3 times, and the PR's file passed
+alone, but run together in one process the cell went red.
+
+The first condition is about the code the cell exercises, not only about test files.
+A PR that makes a module slower or racier while leaving its tests untouched can
+produce a red that only appears under load. Three quiet runs will not reproduce
+that, so the rule does not clear it.
+
+Then the red counts against no PR in the run. File it as an issue, cite it and the
+controls in every merge record of the run, and press. A red that reproduces on the
+merged tree alone still stops the press.
+
+Filing is the obligation. The remedy is to fix the cell, not to get into the habit of
+rerunning: a timing cell that cannot hold under whole-suite load is a defect of the
+cell.
+
+Rule 2 does not decide this case, which is why the rule exists. Rule 2 tells the
+base's reds from the PR's by comparing the same cell on the base and on the merge.
+Here the cell is green on both trees alone and red only inside the whole run, so what
+differs is the population and the load, not the tree. Rule 2's own test, whether the
+base would be red in that same whole run, costs another full run and need not
+reproduce.
+
+*Evidence:* the batch of #4179, #4174 and #4176 on dev `b1d4c83c`, 2026-10-25. The
+run on tree `e6a8ecb3` gave 1 failed and 26806 passed. The red was
+`test_sys_path_hygiene_2923[writers-then-stage]`, which runs the stage profiler's
+injected-delay `[request_read]` timing cell: a rise of −0.007 ms against a floor of
+1.6 ms. The controls:
+- the same cell passed when the run executed it directly;
+- the sibling parametrization passed in the same run;
+- the cell `[writers-then-stage]` alone passed 3 of 3 times on the base and 3 of 3
+  times on `e6a8ecb3`;
+- none of the three PRs touches the owner, the client or the profiler, which are the
+  modules the cell exercises.
+
+The presses went ahead and the red was filed as #4180. That ruling predates the fourth
+condition: its controls did not include a co-run, so under this rule as written the
+same red would need one before the presses. Its cause later proved
+deterministic: an injected sleep before the wrapped call overlaps a late peer and
+adds nothing. The fix to the cell is #4183.
+
+**5. The press step gates on CI; it never prints past a pending state.** A press
+follows a base move: the previous press in a batch, or another seat's merge. GitHub
+recomputes `mergeStateStatus` asynchronously, so at that moment it commonly reads
+`UNKNOWN`. Under the CI-green gate above, `UNKNOWN` means pending, never a value to
+echo and press past.
+
+In the same command as the press, the step:
+- (a) asserts the base is the SHA the run was built on, or the previous step's merge
+  commit;
+- (b) polls until `mergeStateStatus` reads `CLEAN`, or until a read of every run of
+  the repo's required check on the head (on engram-alpha's `dev` ruleset that check
+  is `pr-checks`) prints `success`. The poll is bounded at five minutes. Past that
+  ceiling the press refuses and names the last state it read;
+- (c) after the press, asserts that the base's tree equals the tree the run predicted
+  for that step.
+
+```
+gh api 'repos/<owner>/<repo>/commits/<head-sha>/check-runs?filter=all&per_page=100' --jq '
+  if .total_count > 100 then "too-many"
+  else ([.check_runs[] | select(.name == "pr-checks")]
+    | if length == 0 then "none"
+      elif any(.status != "completed") then "pending"
+      elif all(.conclusion == "success") then "success"
+      else "not-all-success" end) end'
+```
+
+The read prints `success` only when every run of the check on the head finished
+successfully. Anything else means wait for `CLEAN`. If the PR stays `BLOCKED` on a
+cancelled run, rerun that run (rule 3) and then wait for `CLEAN`. The read itself
+keeps printing `not-all-success` after a rerun, because `filter=all` still lists the
+cancelled run beside the rerun's success; #3489's head reads that way today. So the
+read is a way through only when it prints `success`, and `CLEAN` is the way through
+otherwise. Four details matter:
+- **`filter=all`.** The API's default, `filter=latest`, can omit a cancelled run.
+  On alpha #3489's head it returned two `pr-checks` runs of the three.
+- **One page, guarded.** `per_page=100` counts check runs of every name on the commit,
+  so past 100 a non-success run of the required check could sit unseen on page 2. The
+  read prints `too-many` there, and the seat waits for `CLEAN`.
+- **No ordering by time.** GitHub's keying of a required check on a SHA with several
+  runs is not known (rule 3). On #3489 the `CANCELLED` run started five seconds
+  before the `SUCCESS`, and the PR was still `BLOCKED`. Picking the newest run by
+  `started_at` would have printed `success` there, and by `completed_at` it drops an
+  unfinished run (the #2437 false green that #4176 fixed in baton's dedupe). So the
+  read takes no newest run at all.
+- **Deliberately stricter than the CI-green dedupe.** A stale red beside a newer
+  success on the same SHA (#2410, #2419) reads `not-all-success` here, while the
+  CI-green gate reads it green. At the press that costs only a wait: such PRs read
+  `CLEAN`, and `CLEAN` is the other way through (b).
+
+**How this fits the CI-green gate's `UNKNOWN` item.** The CI-green gate says `UNKNOWN`
+is pending: hold and re-check. (b) is that re-check. It reads the underlying check
+runs, the same evidence the rollup summarises (and stricter: no dedupe), instead of a
+field GitHub has not recomputed, so it does not press past an unread state. `UNKNOWN` also covers mergeability (conflicts,
+approvals). The read does not check those; the press command itself does, because
+GitHub refuses a merge that the branch rules block.
+
+*Evidence:* #4092 (2026-10-23) and #4182 (2026-10-25) were each pressed on a printed
+`UNKNOWN` with no gate, four minutes and three seconds respectively after the base
+moved. Their check runs were read
+green only afterwards. Batch F (#4185 and #4187, 2026-10-25) was pressed with a gate,
+but one that sorted by `completed_at`, which drops an unfinished run (none existed).
+
+*The read, measured before writing it down (2026-10-25):*
+- **Real heads:** #4183's head (one success) prints `success`. #4185's head (success
+  plus cancelled) prints `not-all-success`. Its pre-press re-read showed `CLEAN`, but
+  the press step itself gated on a newest-run read, the read this rule replaces. #3489's head
+  (cancelled 17:13:08Z, success 17:13:13Z, success rerun 17:17:17Z) prints
+  `not-all-success`.
+- **Synthetic run lists:** no runs prints `none`. Success plus in-progress, and queued
+  alone, print `pending`. Cancelled then success, in either order, prints
+  `not-all-success`, as do stale failure plus success, and skipped.
 
 ### A workflow fix merged into the base does not reach an open PR until it has a new head commit
 
