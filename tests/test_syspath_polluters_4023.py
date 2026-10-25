@@ -81,6 +81,10 @@ def pytest_sessionfinish(session, exitstatus):
 
 def _env(extra=None):
     env = dict(os.environ)
+    # #4163 round 6: the A6 polluters are `@isolated` (tests/_a6_isolated.py) -- unmarked, they
+    # re-run in a grandchild and the probed process is never touched, so C1 / C3 go vacuous.
+    # The marker makes the body run in THIS subprocess, which is the one the cells watch.
+    env["A6_ISOLATED_CHILD"] = "1"
     env.update(extra or {})
     return env
 

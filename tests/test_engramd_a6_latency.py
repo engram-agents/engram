@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from _a6_isolated import a6_fork_default_deny, isolated  # noqa: F401  (autouse: fork default-deny, #4163)
+
 from _owner_platform import requires_linux_kernel, requires_linux_owner
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -93,6 +95,7 @@ def test_launcher_argv_carries_the_owner_marker_and_the_process_is_real(tool):
     assert handle.proc.poll() is not None
 
 
+@isolated
 @requires_linux_owner
 @requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_every_arm_has_a_same_run_baseline_and_both_percentiles(smoke):
@@ -105,6 +108,7 @@ def test_every_arm_has_a_same_run_baseline_and_both_percentiles(smoke):
             assert 0 < r["p50_ms"] <= r["p99_ms"]
 
 
+@isolated
 @requires_linux_owner
 @requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_the_owner_arm_returns_the_same_people_as_the_baseline_arm(smoke):
@@ -115,6 +119,7 @@ def test_the_owner_arm_returns_the_same_people_as_the_baseline_arm(smoke):
     assert smoke["owner_pid"] != os.getpid()
 
 
+@isolated
 @requires_linux_owner
 @requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_the_table_names_host_python_and_sqlite_build(tool, smoke):
@@ -173,12 +178,21 @@ def _fake_launch(tool, monkeypatch):
     # process the open counter never sees. Its handler threads are therefore exempt from the
     # (all-threads) counter, else its own store reads would be charged to the hook.
     real_handle = FakeOwner._handle
+    real_serve = FakeOwner._serve
 
     def exempt_handle(self, conn):
         tool.exempt_this_thread_from_open_counting()
+        tool.exempt_this_thread_from_fork_guard()
         return real_handle(self, conn)
 
+    def exempt_serve(self):
+        # the same trust, for the same reason, on the fork guard (#3740): the contended arm forks its client
+        # processes, and the in-process fake owner's accept + handler threads are not part of the measured code
+        tool.exempt_this_thread_from_fork_guard()
+        return real_serve(self)
+
     monkeypatch.setattr(FakeOwner, "_handle", exempt_handle)
+    monkeypatch.setattr(FakeOwner, "_serve", exempt_serve)
     monkeypatch.setattr(tool, "launch_owner", launch)
     monkeypatch.setattr(tool, "_fadvise_cold", lambda db: None)  # posix_fadvise is Linux-only
 
@@ -223,6 +237,7 @@ def test_stop_selector_keeps_the_n_floor_and_the_live_store_refusal(tool, tmp_pa
     assert "live" in capsys.readouterr().err.lower()
 
 
+@isolated
 def test_stop_measurement_compares_the_raw_count_and_names_the_build_on_any_host(tool, monkeypatch):
     """The stop wiring end to end against the fake owner: every arm has a same-run
     baseline with both percentiles; the owner count equals the direct count (305 =
@@ -244,6 +259,7 @@ def test_stop_measurement_compares_the_raw_count_and_names_the_build_on_any_host
     assert "305 current nodes" in table and "not gates" in table
 
 
+@isolated
 def test_stop_measurement_goes_red_when_the_owner_count_is_off_by_one(tool, monkeypatch):
     """The measurement must be able to fail: shift the owner's count by one in flight
     and `answers_match` is False. Mutation: compare only the decisions (305 vs 306 are
@@ -261,6 +277,7 @@ def test_stop_measurement_goes_red_when_the_owner_count_is_off_by_one(tool, monk
     assert tool.measure(n=20, nodes=300, warmup=5, hook="stop")["answers_match"] is False
 
 
+@isolated
 def test_default_measurement_output_shape_is_unchanged_for_user_identity(tool, monkeypatch):
     """The user-identity result keeps its keys and its table its wording (the
     existing live smoke tests read them). Mutation: rename `people_match` /
@@ -274,6 +291,7 @@ def test_default_measurement_output_shape_is_unchanged_for_user_identity(tool, m
     assert "owner rows == baseline rows: True" in table and "person rows" in table
 
 
+@isolated
 @requires_linux_owner
 @requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_stop_measurement_against_a_real_owner(tool):
@@ -758,6 +776,7 @@ def test_layout_carries_the_tripwire_hook_and_roundtrips_it(tool, tmp_path):
 
 # -- a real (reduced-N) run of the arm -------------------------------------------------------
 
+@isolated
 @pytest.mark.parametrize("exclusion", [False, True])
 def test_the_tripwire_arm_reports_every_result_key_and_the_fire_reaches_every_site(tool, tripwire_runs, exclusion):
     """Reduced-N fake-owner run, exclusion off and on. Every key is present with its type;
@@ -779,6 +798,7 @@ def test_the_tripwire_arm_reports_every_result_key_and_the_fire_reaches_every_si
     assert (tool.u8_contract_violations(r) == []) == (not exclusion or r["opens_flag_on"] == 0)
 
 
+@isolated
 def test_the_owner_path_opens_the_store_zero_times_with_exclusion_off_and_the_counter_can_see_an_open(tripwire_runs):
     """The gate quantity, exclusion OFF: owner path (flag ON) makes zero direct opens of the
     store copy. Baseline path (flag OFF): more than zero -- the positive control that the
@@ -789,6 +809,7 @@ def test_the_owner_path_opens_the_store_zero_times_with_exclusion_off_and_the_co
     assert tripwire_runs[False]["opens_flag_off"] > 0 and tripwire_runs[True]["opens_flag_off"] > 0
 
 
+@isolated
 def test_u8_exclusion_on_owner_path_opens_the_store_zero_times(tripwire_runs):
     """THE LIVE U8 GATE CELL (U8 #3710 is on dev): flag ON, exclusion ON, in-context probe live, a fire that reaches
     the in-turn recall -> ZERO direct opens of the store copy. Mutation: leave the exclusion
@@ -798,6 +819,7 @@ def test_u8_exclusion_on_owner_path_opens_the_store_zero_times(tripwire_runs):
     assert r["opens_flag_on"] == 0
 
 
+@isolated
 def test_exclusion_on_creates_the_probe_dir_under_the_hooks_home_and_exclusion_off_does_not(tripwire_runs):
     """`probe_dir_live` is the fact observed during the owner-path fires, not an echo of the
     switch. Mutation: never create the probe dir when exclusion is ON -> red."""
@@ -805,6 +827,7 @@ def test_exclusion_on_creates_the_probe_dir_under_the_hooks_home_and_exclusion_o
     assert tripwire_runs[False]["probe_dir_live"] is False
 
 
+@isolated
 def test_the_table_for_the_tripwire_arm_names_the_u8_quantities_and_keeps_the_caveats(tool, tripwire_runs):
     """Mutation: omit exclusion state, probe_dir_live, recall_reached, stdout_match or either
     open count, or drop the ratio columns / caveats block -> red."""
@@ -817,6 +840,7 @@ def test_the_table_for_the_tripwire_arm_names_the_u8_quantities_and_keeps_the_ca
     assert "exclusion: on" in low and "exclusion: off" in tool.format_table(tripwire_runs[False]).lower()
 
 
+@isolated
 def test_home_and_streams_are_restored_after_a_tripwire_run(tool, tripwire_runs):
     """The arm points HOME at a scratch dir for the fire (HOME is what the hook process sees; the probe dir itself sits under the scratch ENGRAM_HOME);
     the process's HOME and streams come back. Mutation: leave HOME or a stream proxy
@@ -829,6 +853,7 @@ def test_home_and_streams_are_restored_after_a_tripwire_run(tool, tripwire_runs)
 
 # -- the NEGATIVE cell: a hook that opens the store directly on the flag-on path ----------------
 
+@isolated
 def test_a_hook_that_opens_the_store_directly_on_the_flag_on_path_is_caught(tool, tmp_path, monkeypatch, capsys):
     """The control for the whole gate. A variant of the hook whose load_tripwires opens
     knowledge.db itself even with the flag ON makes opens_flag_on > 0 and the run exit 3.
@@ -864,6 +889,7 @@ def test_a_hook_that_opens_the_store_directly_on_the_flag_on_path_is_caught(tool
 
 # -- a REAL owner process, and the INSTALLED layout ----------------------------------------------
 
+@isolated
 @requires_linux_owner
 def test_the_tripwire_arm_against_a_real_owner_process(tool, monkeypatch):
     """The same fire against a REAL engramd_owner process (a separate pid). The page-cache
@@ -917,6 +943,7 @@ def test_the_parent_walk_probe_leaves_path_usable_for_class_level_calls(tool, mo
     assert hl.Path("/x") == pathlib.Path("/x")
 
 
+@isolated
 def test_exclusion_on_reports_that_the_exclusion_engaged(tripwire_runs):
     """`exclusion_engaged`: with exclusion ON the exclusion resolver was built (non-None) and
     the probe's route ledger was written during the fire; False when exclusion is OFF.
@@ -1128,7 +1155,7 @@ def test_surface_is_a_hook_the_flag_has_one_name_and_the_default_stays_user_iden
     """Mutation: leave `surface` out of HOOKS, rename the flag constant, or change the default hook -> red."""
     assert "surface" in tool.HOOKS and tool.HOOKS[0] == "user-identity"
     assert tool.SURFACE_FLAG_KEY == "surface_reads_via_owner"
-    assert tool.SURFACE_EXPECTED_SQLITE == "3.53.0"
+    assert not hasattr(tool, "SURFACE_EXPECTED_SQLITE"), "the build is a per-seat axis; the tool presumes none (#3740)"
     assert tool.SURFACE_HOOK_PATH.name == "engram-surface-hook.py"
 
 
@@ -1225,6 +1252,7 @@ def test_main_exits_4_with_a_clear_stderr_line_when_the_hook_lacks_the_flag(tool
 
 # -- one full fire, flag OFF vs ON, the daemon stubbed identically ------------------------------------------
 
+@isolated
 def test_the_surface_arm_fires_main_on_both_paths_and_reports_the_tripwire_result_shape(tool, surface_run):
     """Same result shape downstream readers parse: rows (arm x path, six rows), answers_match, answer_size,
     env, owner_pid ... plus the surface keys. Mutation: drop an arm, a key, or return the rows unlabelled -> red."""
@@ -1240,6 +1268,7 @@ def test_the_surface_arm_fires_main_on_both_paths_and_reports_the_tripwire_resul
     assert r["env"]["sqlite"] == sqlite3.sqlite_version
 
 
+@isolated
 def test_the_recall_daemon_is_stubbed_identically_on_both_paths(tool, surface_run):
     """The mini hook's real `query_daemon` raises; the arm only gets a number if BOTH paths run with the stub, and
     the stub's text appears in both fires' (equal) stdout. Mutation: stub only one path, or stub neither -> the
@@ -1250,6 +1279,7 @@ def test_the_recall_daemon_is_stubbed_identically_on_both_paths(tool, surface_ru
     assert surface_run["answer_size"] > 0
 
 
+@isolated
 def test_per_fire_state_is_reset_so_the_paths_stay_comparable(tool, surface_run):
     """The mini hook prints a per-fire counter it persists in ENGRAM_HOME (as the real hook's prompt counter does).
     With N fires the paths only keep printing equal bytes if state is cleared between fires. Mutation: skip the
@@ -1257,6 +1287,7 @@ def test_per_fire_state_is_reset_so_the_paths_stay_comparable(tool, surface_run)
     assert surface_run["stdout_match"] is True
 
 
+@isolated
 def test_the_flag_off_path_opens_the_store_and_the_flag_on_path_only_the_named_remainder(tool, surface_run):
     """OFF counts both opens (the read and the person-moment cursor); ON keeps exactly the cursor write, which the
     allow-list attributes by frame (`_advance_person_moment_cursor`, the #3821 row-8 remainder), so it is NOT a
@@ -1266,6 +1297,7 @@ def test_the_flag_off_path_opens_the_store_and_the_flag_on_path_only_the_named_r
     assert surface_run["open_violations"] == []
 
 
+@isolated
 def test_a_flag_on_path_that_still_reads_directly_is_a_violation_naming_the_reader(tool, tmp_path, monkeypatch):
     """The control: an un-migrated read on the flag-ON path (`_read_nodes` ignores the flag) opens the store and is
     reported with its frame; surface_contract_violations carries it. Mutation: allow every ON open -> red."""
@@ -1276,6 +1308,7 @@ def test_a_flag_on_path_that_still_reads_directly_is_a_violation_naming_the_read
     assert any("_read_nodes" in v for v in tool.surface_contract_violations(r))
 
 
+@isolated
 def test_the_arm_never_touches_the_process_home_streams_or_environment(tool, tmp_path, monkeypatch, surface_run):
     """HOME / streams / ENGRAM_HOME come back after a surface run. Mutation: skip a cleanup -> red."""
     assert "a6-" not in os.environ.get("HOME", "")
@@ -1362,7 +1395,7 @@ def _rows(ratio, contended=0.9, cold=0.9):
     return out
 
 
-def _cell(layout, cell, ratio, sqlite="3.53.0", **kw):
+def _cell(layout, cell, ratio, sqlite="3.99.1", **kw):
     r = dict(_surface_clear(), layout=layout, layout_root="/r", parent_walk_calls=0, store_cell=cell,
              rows=_rows(ratio, **kw), answers_match=True,
              env={"platform": "x", "cpus": 1, "python": "3.12", "sqlite": sqlite})
@@ -1410,13 +1443,21 @@ def test_a_present_gate_cell_is_no_gate_violation(tool):
     assert tool.surface_gate_violations([_cell("installed", "real-store", 1.5)]) == []
 
 
-def test_the_sqlite_build_is_named_and_a_non_expected_build_is_flagged(tool):
-    """3.53.0 is expected; another build is named in the verdict as the build axis, never silently passed.
-    Mutation: drop the version from the verdict, or flag the expected build -> red."""
-    ok = tool.surface_gate([_cell("installed", "real-store", 0.9, sqlite="3.53.0")])["verdict"]
-    other = tool.surface_gate([_cell("installed", "real-store", 0.9, sqlite="3.45.1")])["verdict"]
-    assert "3.53.0" in ok and "expected" not in ok.lower()
-    assert "3.45.1" in other and "expected 3.53.0" in other
+@pytest.mark.parametrize("build", ["3.45.1", "3.99.1", "3.53.0"])
+def test_the_verdict_names_the_runs_own_build_and_presumes_no_other(tool, build):
+    """The verdict names the build the RUN used and states the per-seat scope (factual half only, R10); no
+    fixed 'expected' build appears, for any build including the one the fleet happens to run today.
+    Mutation: reintroduce a hard-coded build in the verdict (e.g. the constant or an 'expected X' comparison)
+    -> the other builds' verdicts name the wrong build / carry 'expected' -> red."""
+    v = tool.surface_gate([_cell("installed", "real-store", 0.9, sqlite=build)])["verdict"]
+    assert f"SQLite {build}" in v
+    assert "expected" not in v.lower() and "production" not in v.lower()
+    for other in {"3.45.1", "3.99.1", "3.53.0"} - {build}:
+        assert other not in v
+    flat = " ".join(v.split())
+    assert "only for a seat whose venv links that build" in flat
+    # the flip rule is ruled for the tripwire flag alone (R10): the surface verdict carries the factual half only
+    assert "flips only" not in flat and "Kepler" not in flat and "fleet-wide flip" not in flat
 
 
 def test_an_arm_the_owner_loses_is_a_finding_and_contended_and_cold_are_owed(tool):
@@ -1654,6 +1695,7 @@ def test_format_layouts_labels_the_cell_and_leaves_cell_less_results_unchanged(t
     assert "gate" in both.split("real-store", 1)[1].lower()
 
 
+@isolated
 def test_surface_table_names_the_hook_and_the_stub_caveat_and_the_cell(tool, surface_run):
     """Mutation: print the surface arm with the user-identity wording -> red."""
     text = tool.format_table(surface_run)
