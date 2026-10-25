@@ -1469,6 +1469,20 @@ _LESSON_MUTABLE_FIELDS = frozenset({
 _LESSON_CACHE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge"})
 
 
+def _changed_concurrently(conn, kind: str, node_id: str) -> str:
+    """Roll back and build the #4178 refusal for a guarded metadata write
+    whose row no longer matches what this call read (metadata, plus
+    is_current: the state this tool itself checks). Module-local on purpose:
+    each module owning a guarded write carries its own copy."""
+    conn.rollback()
+    return json.dumps({
+        "error": f"{kind} '{node_id}' changed while this call was running "
+                 f"(another write got there first). Nothing was changed. "
+                 f"Re-read the node and retry.",
+        "refusal": "changed_concurrently",
+    })
+
+
 def _update_lesson_impl(
     node_id: str = "",
     updates: dict = None,
@@ -1658,10 +1672,18 @@ def _update_lesson_impl(
             # prose_bypass_exercised contract (#1864, #1826).
             meta["bypass_prose_check"] = True
 
-        conn.execute(
-            "UPDATE nodes SET metadata = ? WHERE id = ?",
-            (json.dumps(meta), node_id.strip()),
+        # #4178: guarded write. The lesson row was read at the top of this call
+        # and no write transaction was open then (this UPDATE is the first
+        # DML), so another writer could have changed it since. `metadata IS ?`
+        # is bound to the RAW column value read, not a re-serialized dict;
+        # `is_current = 1` mirrors this tool's own is_current check.
+        _guarded = conn.execute(
+            "UPDATE nodes SET metadata = ? "
+            "WHERE id = ? AND is_current = 1 AND metadata IS ?",
+            (json.dumps(meta), node_id.strip(), row["metadata"]),
         )
+        if _guarded.rowcount != 1:
+            return _changed_concurrently(conn, "Lesson", node_id.strip())
 
         core._log_edit(conn, "lesson_field_updated", node_id.strip(), "lesson", {
             "updated_fields": updated_fields,
@@ -1737,6 +1759,7 @@ def _register_exemplar_impl(
         return json.dumps({"error": "target_id is required and cannot be empty."})
     if not exemplar_id or not exemplar_id.strip():
         return json.dumps({"error": "exemplar_id is required and cannot be empty."})
+    discharge_skipped = False  # #4178: set when the guarded discharge found a changed row
     conn = core._get_db()
     try:
         target_row = conn.execute(
@@ -1822,13 +1845,27 @@ def _register_exemplar_impl(
         target_meta = core._metadata_dict(target_row["metadata"])
         if target_meta.get("support_lost") and exemplar_count > 0:
             target_meta.pop("support_lost", None)
-            conn.execute(
-                "UPDATE nodes SET metadata = ? WHERE id = ?",
-                (json.dumps(target_meta), target_id),
+            # #4178: guarded write. target_row was read at the top of the call,
+            # BEFORE the edge INSERT; the commit above ENDED that transaction,
+            # so this UPDATE opens a new one against metadata that may be
+            # stale. `metadata IS ?` is bound to the RAW column value read
+            # (not target_meta re-dumped); `is_current = 1` mirrors this
+            # tool's own is_current check. The edge is already committed, so
+            # a mismatch cannot refuse the call: it skips this convenience
+            # discharge (the reflect recompute is the load-bearing one) and
+            # says so in the response instead of overwriting newer metadata.
+            _guarded = conn.execute(
+                "UPDATE nodes SET metadata = ? "
+                "WHERE id = ? AND is_current = 1 AND metadata IS ?",
+                (json.dumps(target_meta), target_id, target_row["metadata"]),
             )
-            core._log_edit(conn, "support_lost_cleared", target_id, target_row["type"],
-                      {"trigger": exemplar_id})
-            conn.commit()
+            if _guarded.rowcount != 1:
+                conn.rollback()
+                discharge_skipped = True
+            else:
+                core._log_edit(conn, "support_lost_cleared", target_id,
+                               target_row["type"], {"trigger": exemplar_id})
+                conn.commit()
     finally:
         conn.close()
 
@@ -1844,6 +1881,8 @@ def _register_exemplar_impl(
         "target_claim": target_row["claim"],
         "exemplar_count": exemplar_count,
     }
+    if discharge_skipped:
+        result["support_lost_discharge"] = "skipped_changed_concurrently"
 
     # Tripwire cache refresh — each target type has its own hot-path cache
     # scanned by the surface hook (#1691: cornerstone anchors join lessons).

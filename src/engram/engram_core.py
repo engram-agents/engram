@@ -10324,6 +10324,10 @@ def _apply_support_state(conn: sqlite3.Connection, node_id: str, node_type: str,
       - live_count > 0 and flagged -> clear the flag, log
         'support_lost_cleared'; returns "cleared".
       - otherwise nothing is written; returns None.
+      - the write is guarded (#4178, `_write_support_metadata`): if the row
+        changed since the caller read `metadata_raw`, nothing is written or
+        logged and "changed_concurrently" is returned (callers treat it as
+        neither marked nor cleared).
 
     Whether a never-supported node should be marked is the CALLER's call (the
     detector only runs on a node that had an edge; reflect checks the ever
@@ -10344,8 +10348,8 @@ def _apply_support_state(conn: sqlite3.Connection, node_id: str, node_type: str,
         if replaced and warnings_out is not None:
             warnings_out.append(replaced)
         meta["support_lost"] = True
-        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?",
-                     (json.dumps(meta), node_id))
+        if not _write_support_metadata(conn, node_id, meta, metadata_raw):
+            return "changed_concurrently"
         _log_edit(conn, "support_lost", node_id, node_type, details)
         return "marked"
     if live_count > 0 and flagged:
@@ -10353,11 +10357,38 @@ def _apply_support_state(conn: sqlite3.Connection, node_id: str, node_type: str,
         if replaced and warnings_out is not None:
             warnings_out.append(replaced)
         meta.pop("support_lost", None)
-        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?",
-                     (json.dumps(meta), node_id))
+        if not _write_support_metadata(conn, node_id, meta, metadata_raw):
+            return "changed_concurrently"
         _log_edit(conn, "support_lost_cleared", node_id, node_type, details)
         return "cleared"
     return None
+
+
+def _write_support_metadata(conn: sqlite3.Connection, node_id: str, meta: dict,
+                            metadata_raw) -> bool:
+    """The guarded metadata write of `_apply_support_state` (#4178).
+
+    ``metadata_raw`` is the RAW column value the caller read for this node;
+    ``metadata IS ?`` binds it as read (NOT a re-serialized dict), so a node
+    whose stored JSON is spelled differently from `json.dumps` still matches
+    and only a real change since the read does not. ``is_current = 1`` is the
+    state both callers filter on (retract/supersede checks it; reflect selects
+    on it). Returns False, writing nothing, when the row no longer matches.
+    The helper cannot roll back (its caller owns the transaction and a loop of
+    other rows), so it reports instead: "changed_concurrently" is the outcome
+    the callers already treat as neither marked nor cleared, and one line goes
+    to stderr (stdout is the MCP channel). The state-based recompute in
+    engram_reflect re-evaluates the node on its next run."""
+    cur = conn.execute(
+        "UPDATE nodes SET metadata = ? "
+        "WHERE id = ? AND is_current = 1 AND metadata IS ?",
+        (json.dumps(meta), node_id, metadata_raw),
+    )
+    if cur.rowcount == 1:
+        return True
+    print(f"engram: node {node_id} changed while its support_lost state was "
+          f"being updated; skipped, not overwritten (#4178)", file=sys.stderr)
+    return False
 
 
 def _current_successor(conn, node_id: str) -> "str | None":
