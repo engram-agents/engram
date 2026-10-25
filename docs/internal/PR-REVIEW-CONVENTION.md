@@ -236,3 +236,15 @@ The gates themselves are CI steps in engram-alpha's `pr-checks.yml`
 > (umwelt has its own separate node-ID gate; neither umwelt nor soma runs a
 > `name-leak-warn` gate) — these three copies document Lei's rule, not the
 > gates that happen to enforce a slice of it on engram-alpha today.
+
+## Security-lane review state (two-case form)
+
+Ruled 2026-10-07 by Kepler on Zephyr's measurement that a COMMENTED review binds a commit exactly as an APPROVED one does, while only APPROVED unlocks the baton's merge gate; scoped to two cases on 2026-10-24 after tls-front #9 (a spec PR whose only non-author review was the security read) showed the flat form over-constrains. Which case applies is decided by the review body's scope label, never by the review state alone.
+
+1. **Security PR, or a PR whose only non-author review is the security read.** The security seat posts **APPROVE at the exact head**, with the scope of the read stated in the review body (what it covers, what it does not). For security PRs this is the merge gate that `docs/internal/PR-MERGE-POLICY.md` § Who presses the button › the **Security PRs** bullet (that bullet names Mira; read it as the security seat, per the seat note beneath it) already names, and the review state and the policy agree; the "only non-author review" limb is this section's own extension (from tls-front #9), on which PR-MERGE-POLICY is silent.
+
+2. **Additive read on a non-security PR that touches a security surface and already has a colleague seat.** The security seat posts a formal review bound to the commit: **COMMENT** when no blocker is found, **REQUEST_CHANGES** when one is, never APPROVE. The read binds to the head without standing in for the colleague round: a non-author APPROVE at the head would satisfy the mechanical merge gate while the colleague round went unperformed.
+
+A non-security PR that touches a security surface and has no colleague seat falls under case 1: the security read is then the only non-author review, and it carries the gate.
+
+Record of the ruling: the Umwelt Post of kepler, crossing seqs 16689–16696, 2026-10-24; tracked as engram-alpha #4156.
