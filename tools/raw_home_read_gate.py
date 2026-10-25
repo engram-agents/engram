@@ -37,9 +37,18 @@ KNOWN BOUNDS (an instrument with edges, not a proof):
     whitespace before the paren (`os.environ.get ("ENGRAM_HOME")`), `os.environ.copy().get("ENGRAM_HOME")`,
     `dict(os.environ)["ENGRAM_HOME"]`, a keyword argument (`os.getenv(key="ENGRAM_HOME")`), a literal built
     by concatenation (`"ENGRAM_" "HOME"`, `"ENGRAM_" + "HOME"`) and `os.environb`.
-  * Only tracked `.py` files are scanned, so a Python tool with no extension is invisible. Real case:
-    src/engram/tools/engram-pkg/engram-pkg (line ~1199 reads ENGRAM_HOME raw) is an unbaselined read the
-    gate cannot see.
+  * Only tracked `.py` files are scanned, so an extensionless Python tool is invisible. This is a real blind
+    spot, left open on purpose: #3863 ruled "no shebang branch" because there are zero live instances, so a
+    new branch could only be tested on a synthetic case. AS OF c996fba6 the blind spot is EMPTY. Six tracked,
+    non-symlink, extensionless files under src/ and tools/ start with `#!`: src/engram/.githooks/pre-push,
+    src/engram/tools/engram-pkg/engram-pkg, src/engram/tools/engram-snapshot (Python), tools/agent-bootstrap,
+    tools/agentctl, tools/agentctl-mac (bash). None reads ENGRAM_HOME raw: engram-pkg (its only os.environ
+    reads are ENGRAM_PKG and ENGRAM_BOOTSTRAP) and engram-snapshot go through the shared tools resolver,
+    pre-push has no ENGRAM_HOME/environ/getenv, and the bash scripts are not Python, so out of this gate's
+    scope. That list is a dated measurement, NOT enforced: a new extensionless Python tool would not trip
+    anything. Regenerate it with (the filter tests the BASENAME for a dot, not the whole path, or
+    src/engram/.githooks/pre-push is skipped):
+      git ls-files -s src tools | awk '$1!="120000"{print $4}' | while read f; do case "${f##*/}" in *.*) ;; *) [ "$(head -c2 "$f")" = '#!' ] && echo "$f";; esac; done
   * So "stops the number of sites growing" holds for tracked non-test `.py` files and the spellings the
     pattern matches. It does not hold for the spellings above or for extensionless files.
 
