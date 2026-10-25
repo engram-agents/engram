@@ -62,6 +62,14 @@ def _launch(tmp_path: Path, *, common: str | None = None, per_agent: str | None 
     return proc, child, common_file
 
 
+def _env_stderr(proc):
+    """Stderr lines about boot-env, ignoring the launcher's always-on cwd line
+    and trust preflight (#4170; covered by test_launch_cwd_trust_4170.py)."""
+    return [ln for ln in proc.stderr.splitlines()
+            if ln and not ln.startswith("boot cwd:")
+            and not ln.startswith("ERROR: Claude Code has not trusted")]
+
+
 def test_per_agent_value_wins_over_common(tmp_path):
     proc, child, _ = _launch(tmp_path, common="SHARED_VAR=common\n", per_agent="SHARED_VAR=agent\n")
     assert proc.returncode == 0, proc.stderr
@@ -79,7 +87,7 @@ def test_common_only_value_is_exported_to_child(tmp_path):
 def test_absent_common_file_is_silent(tmp_path):
     proc, child, _ = _launch(tmp_path, common=None, per_agent="OTHER=1\n")
     assert proc.returncode == 0, proc.stderr
-    assert proc.stderr == ""
+    assert _env_stderr(proc) == []
     assert "OTHER=1" in child
 
 
@@ -89,7 +97,7 @@ def test_unreadable_common_file_warns_once_and_per_agent_still_sourced(tmp_path)
                                        per_agent="OTHER=1\n", common_mode=0o000)
     common_file.chmod(0o644)
     assert proc.returncode == 0, proc.stderr
-    err = [l for l in proc.stderr.splitlines() if l]
+    err = _env_stderr(proc)
     assert len(err) == 1 and "WARNING" in err[0] and str(common_file) in err[0]
     assert "OTHER=1" in child
     assert "COMMON_ONLY=yes" not in child

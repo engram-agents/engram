@@ -61,11 +61,30 @@ sessions.
    sudo install -m 0755 tools/agentctl /usr/local/bin/agentctl
    ```
 
-   Optional per-agent session cwd: drop an absolute path into
-   `~/.engram/boot-cwd` (one line) in the agent's home; default is `~/umwelt`
-   when it exists, else `$HOME`. Name a directory the harness already trusts:
-   with Claude Code, a `$HOME` cwd can stall an unattended boot on the trust
-   dialog (observed once, #4170).
+   Session cwd, resolved at launch time from `$HOME` (nothing is written at
+   rename time): (1) the first line of `~/.engram/boot-cwd` if it names an
+   existing directory wins, even if untrusted; (2) else the first existing
+   directory among `$HOME/engram-alpha`, `$HOME/umwelt`, `$HOME` that Claude
+   Code has trusted (same read-only check as the preflight below); (3) else,
+   if none is trusted, the first existing one in that order, plus the
+   `ERROR:`. When trust cannot be verified (`CLAUDE_CONFIG_DIR` set, or no
+   `python3`) every candidate counts as untrusted, so rule 3 applies. The
+   boot-cwd line is normalised first (trailing CR, surrounding whitespace and
+   one trailing `/` are stripped; relative paths are not resolved). Every
+   launch prints one stderr line `boot cwd: <dir> (from <arm>)`, where
+   `<arm>` says why: `boot-cwd`, `$HOME/umwelt, first trusted`, or
+   `$HOME/engram-alpha, none trusted`.
+
+   Trust preflight: Claude Code stalls on its "trust this folder?" dialog in a
+   directory it has not seen (observed once, ~3 h, #4170). The launcher reads
+   `~/.claude.json` (read-only; it never writes or creates it) and, if the
+   chosen cwd lacks `projects.<dir>.hasTrustDialogAccepted: true`, prints an
+   `ERROR:` line to stderr naming the directory. A missing, unreadable or
+   unparseable file, or a missing `python3`, counts as untrusted. If
+   `CLAUDE_CONFIG_DIR` is set (after `boot-env`), trust cannot be verified from
+   `~/.claude.json`, so the launcher prints an `ERROR:` naming it. It is a
+   warning, not a refusal: the session still launches. One-time fix:
+   `tmux attach -t agent-<name>` and accept the dialog.
 
    Per-agent overrides are harness-specific: use
    `~/.engram/boot-charge-claude.md` or `~/.engram/boot-charge-codex.md`.
