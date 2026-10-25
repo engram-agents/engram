@@ -340,6 +340,22 @@ _PERSON_IMMUTABLE_FIELDS = frozenset({
 _SPECIAL_MOMENTS_CAP = 100
 
 
+def _changed_concurrently(conn: sqlite3.Connection, node_id: str) -> str:
+    """Roll back and build the #4178 refusal for a guarded metadata write.
+
+    Used when a guarded `UPDATE nodes SET metadata = ? ... AND metadata IS ?`
+    matched no row: the node changed (or stopped being current) between this
+    call's read and its write. Same shape as the #4166 refusal.
+    """
+    conn.rollback()
+    return json.dumps({
+        "error": f"Node '{node_id}' changed while this call was running "
+                 f"(another write got there first). Nothing was changed. "
+                 f"Re-read the node and retry.",
+        "refusal": "changed_concurrently",
+    })
+
+
 def _update_person_impl(
     node_id: str = "",
     updates: dict = None,
@@ -481,12 +497,24 @@ def _update_person_impl(
 
         # Persist metadata update (no new node, same node_id). No column-sync
         # branch for trust_tier — it can never appear in `updates` here.
-        update_sql = "UPDATE nodes SET metadata = ?"
-        update_params: list = [json.dumps(meta)]
-
-        update_sql += " WHERE id = ?"
-        update_params.append(node_id.strip())
-        conn.execute(update_sql, update_params)
+        #
+        # #4178: guarded write. No write transaction was open at the read
+        # above (sqlite3 opens one at the first DML, which is this UPDATE), so
+        # another writer could have changed the node since. `metadata IS ?` is
+        # bound to the RAW column value read, not a re-serialized dict; if the
+        # node is no longer exactly what was read (or is no longer current),
+        # refuse rather than overwrite. Runs before _log_edit and the cascade,
+        # so a refusal leaves nothing behind. No `status` clause, on purpose:
+        # every retract path sets is_current = 0 together with status =
+        # 'retracted' (and rewrites metadata), so is_current = 1 already
+        # excludes a retracted person.
+        _guarded = conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ? "
+            "AND is_current = 1 AND metadata IS ?",
+            (json.dumps(meta), node_id.strip(), row["metadata"]),
+        )
+        if _guarded.rowcount != 1:
+            return _changed_concurrently(conn, node_id.strip())
 
         core._log_edit(conn, "person_field_updated", node_id.strip(), "person", {
             "updated_fields": updated_fields,
@@ -494,6 +522,11 @@ def _update_person_impl(
         })
 
         # Emit field-value-changed cascade flags to all nodes that cite this person.
+        # #4178: the citing-node read-then-write below is EXEMPT from the
+        # guard only because the guarded UPDATE above opened this
+        # connection's write transaction and nothing commits before the
+        # loop; do not move a commit above it, and do not copy this
+        # unguarded shape to a site without an open write transaction.
         # Coarse-emit: node-scoped — any node with a cites, about, or
         # derives_from edge to this person gets flagged. Carries field +
         # prior_value in each flag entry. The review_required/dismissible
@@ -669,10 +702,15 @@ def _add_special_moment_impl(
         moments.append(new_entry)
         meta["special_moments"] = moments
 
-        conn.execute(
-            "UPDATE nodes SET metadata = ? WHERE id = ?",
-            (json.dumps(meta), person_id.strip()),
+        # #4178: guarded write (same reasoning as engram_update_person: no
+        # transaction was open at the read; bind the RAW value read).
+        _guarded = conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ? "
+            "AND is_current = 1 AND metadata IS ?",
+            (json.dumps(meta), person_id.strip(), pn_row["metadata"]),
         )
+        if _guarded.rowcount != 1:
+            return _changed_concurrently(conn, person_id.strip())
         core._log_edit(conn, "special_moment_added", person_id.strip(), "person", {
             "anchor_node_id": node_id.strip(),
         })
@@ -904,10 +942,15 @@ def _set_person_lineage_impl(target_pn: str = "", model_id: str = "") -> str:
         meta["model_family"] = parsed["family"]
         meta["model_version"] = parsed["version"]
 
-        conn.execute(
-            "UPDATE nodes SET metadata=? WHERE id=?",
-            (json.dumps(meta), row["id"]),
+        # #4178: guarded write (no transaction was open at either read form
+        # above; bind the RAW value read).
+        _guarded = conn.execute(
+            "UPDATE nodes SET metadata=? WHERE id=? "
+            "AND is_current=1 AND metadata IS ?",
+            (json.dumps(meta), row["id"], row["metadata"]),
         )
+        if _guarded.rowcount != 1:
+            return _changed_concurrently(conn, row["id"])
         conn.commit()
 
         return json.dumps({
