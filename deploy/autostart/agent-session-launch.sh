@@ -115,7 +115,7 @@ if [[ -r "$BOOT_CWD_FILE" ]]; then
     if [[ -d "$cwd_candidate" ]]; then
         cd_target="$cwd_candidate"
     else
-        echo "WARNING: boot-cwd '$cwd_candidate' is not a directory; falling back to \$HOME" >&2
+        echo "WARNING: boot-cwd '$cwd_candidate' is not a directory; falling back to '$cd_target'" >&2
     fi
 fi
 

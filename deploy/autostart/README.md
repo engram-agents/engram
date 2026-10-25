@@ -62,7 +62,10 @@ sessions.
    ```
 
    Optional per-agent session cwd: drop an absolute path into
-   `~/.engram/boot-cwd` (one line) in the agent's home; default is `$HOME`.
+   `~/.engram/boot-cwd` (one line) in the agent's home; default is `~/umwelt`
+   when it exists, else `$HOME`. Name a directory the harness already trusts:
+   with Claude Code, a `$HOME` cwd can stall an unattended boot on the trust
+   dialog (observed once, #4170).
 
    Per-agent overrides are harness-specific: use
    `~/.engram/boot-charge-claude.md` or `~/.engram/boot-charge-codex.md`.
