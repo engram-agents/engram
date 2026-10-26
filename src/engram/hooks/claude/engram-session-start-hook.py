@@ -1564,6 +1564,10 @@ def update_counterparts_from_registry(
     Stale entries (older than PEER_STALE_HOURS from ia.py, mirrored here as 24h)
     are excluded — same policy as ia.py's scan_peers().
 
+    Invariant (#4145): a non-string ``registered_at`` on one record (number,
+    list, dict, bool) is treated as missing — the peer is included
+    conservatively — and never aborts the update for the other records.
+
     Fail-soft: any exception is silently caught, identical to
     write_agent_registration.  Never raises.  The gate:
     - shared-fs root must exist (same as write_agent_registration).
@@ -1613,7 +1617,8 @@ def update_counterparts_from_registry(
 
             # Skip stale entries
             registered_at_str = record.get("registered_at")
-            if registered_at_str:
+            # #4145: a non-string registered_at is treated as missing (include conservatively).
+            if registered_at_str and isinstance(registered_at_str, str):
                 try:
                     registered_dt = datetime.fromisoformat(
                         registered_at_str.replace("Z", "+00:00")
@@ -1662,6 +1667,11 @@ def peer_topology_block(agent_name: str) -> str:
     so agents walk in knowing which peers are ia/baton-reachable vs forum-only.
     Returns "" when the registry is absent (single-agent install), empty, or on
     any error — never blocks session start.
+
+    Invariant (#4145): a malformed registry record (wrong top-level JSON type,
+    or a wrong-typed ``registered_at``) is skipped, or treated per the
+    fail-open timestamp rule (a non-string ``registered_at`` counts as missing,
+    so the peer is live). It never hides the other peers.
     """
     if not agent_name:
         return ""  # can't exclude self reliably without knowing our own name
@@ -1683,6 +1693,9 @@ def peer_topology_block(agent_name: str) -> str:
             except (OSError, json.JSONDecodeError, ValueError):
                 continue
 
+            if not isinstance(record, dict):  # #4145: list / string / number record -> skip it, not every peer
+                continue
+
             _n, _h = record.get("agent_name"), record.get("hostname")  # #4137: null / non-string -> ""
             peer_name = _n.strip() if isinstance(_n, str) else ""
             hostname = _h.strip() if isinstance(_h, str) else ""
@@ -1691,7 +1704,8 @@ def peer_topology_block(agent_name: str) -> str:
 
             # Skip stale entries (peer not active).
             reg_at = record.get("registered_at")
-            if reg_at:  # no registered_at → treat as live (fail-open: missing timestamp ≠ stale)
+            # #4145: a non-string registered_at is treated as missing (fail-open), never parsed.
+            if reg_at and isinstance(reg_at, str):  # no registered_at → treat as live (fail-open: missing timestamp ≠ stale)
                 try:
                     reg_dt = datetime.fromisoformat(reg_at.replace("Z", "+00:00"))
                     if (now - reg_dt) > stale_delta:

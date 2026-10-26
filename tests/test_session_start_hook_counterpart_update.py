@@ -291,3 +291,37 @@ class TestUpdateCounterpartsFromRegistry:
 
         result = json.loads(config_path.read_text())
         assert result["counterparts"] == ["ariadne", "mira", "zephyr"]
+
+
+class TestNonStringRegisteredAt4145:
+    """#4145: a non-string registered_at is treated as missing (included
+    conservatively) and never aborts the update for the other records."""
+
+    @pytest.mark.parametrize("bad", [12345, ["x"], {"a": 1}, True])
+    def test_non_string_registered_at_does_not_abort_update(
+        self, tmp_path, monkeypatch, bad
+    ):
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+
+        registry_dir = tmp_path / "agents-shared" / "agents"
+        registry_dir.mkdir(parents=True)
+
+        config_path = _make_config(engram_home, ["old-peer"])
+
+        record = {
+            "agent_name": "badts",
+            "hostname": OWN_HOSTNAME,
+            "pid": 1,
+            "registered_at": bad,
+        }
+        (registry_dir / "badts.json").write_text(json.dumps(record), encoding="utf-8")
+        _write_registry_entry(registry_dir, "goodpeer", OWN_HOSTNAME)
+
+        mod.update_counterparts_from_registry(
+            "sol", str(config_path), str(registry_dir)
+        )
+
+        result = json.loads(config_path.read_text())
+        assert sorted(result["counterparts"]) == ["badts", "goodpeer"]
