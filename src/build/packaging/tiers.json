@@ -538,6 +538,11 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/s2_clause_check.py",
+      "tier": "dev",
+      "note": "engram-alpha#4201 (S2 next step, part of #4050): evaluation harness for an automated clause check against the S2 labels, with per-fold freeze manifests; a team study tool, not a user tool. Dev tier, and kept out of the public release by release-minus-set.txt. Reads local study inputs that are never committed."
+    },
+    {
       "path": "tools/s2_clause_sheet.py",
       "tier": "dev",
       "note": "engram-alpha#4050 S2: single-purpose clause-check sheet builder for the team's pre-registered blind study; a team study tool, not a user tool. Dev tier, and kept out of the public release by release-minus-set.txt. Its scrub roster is supplied by the seat at run time and is never committed."

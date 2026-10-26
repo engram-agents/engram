@@ -397,6 +397,15 @@
       "note": "engram-alpha#4050 S2: scoring script. The cells load it by path (invisible to the layer-1 import graph); their fixtures are built by running s2_clause_sheet, so that tool's cells ride along."
     },
     {
+      "path_prefix_or_glob": "tools/s2_clause_check.py",
+      "test_globs": [
+        "tests/test_s2_clause_check_4201.py",
+        "tests/test_s2_score_4050.py",
+        "tests/test_engram_anchoring.py"
+      ],
+      "note": "engram-alpha#4201 S2 phase 1: clause-check harness. The cells load it by path (invisible to the layer-1 import graph); it imports s2_score (loaded by path) and engram_anchoring, so their cells ride along."
+    },
+    {
       "path_prefix_or_glob": "tools/weakest_load_bearing.py",
       "test_globs": [
         "tests/test_weakest_load_bearing.py",
