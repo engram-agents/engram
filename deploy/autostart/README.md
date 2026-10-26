@@ -85,6 +85,14 @@ sessions.
    `~/.claude.json`, so the launcher prints an `ERROR:` naming it. It is a
    warning, not a refusal: the session still launches. One-time fix:
    `tmux attach -t agent-<name>` and accept the dialog.
+   Measured once (n=1, 10-26): the trust flag for `$HOME` stayed false
+   after a clean exit and restart; prefer a `boot-cwd` naming an
+   already-trusted project.
+   A seat that sets `CLAUDE_CONFIG_DIR` on purpose (in `boot-env`, the host-common
+   boot-env file, or its inherited environment) gets that `ERROR:` on every launch, even when the
+   directory is trusted. The launcher never reads `$CLAUDE_CONFIG_DIR`'s own
+   config, because its layout is unverified. So the line is expected there,
+   not a fault.
 
    Per-agent overrides are harness-specific: use
    `~/.engram/boot-charge-claude.md` or `~/.engram/boot-charge-codex.md`.

@@ -44,6 +44,13 @@ T8     CLAUDE_CONFIG_DIR set and non-empty (after boot-env is sourced): Claude
        The preflight FAILS CLOSED: ERROR naming the dir and the one-time fix,
        even when $HOME/.claude.json says trusted. It never reads
        $CLAUDE_CONFIG_DIR/.claude.json (layout unverified; guessing = silent pass).
+T8c    the same check reads CLAUDE_CONFIG_DIR as set ONLY in the per-agent
+       ~/.engram/boot-env (not in the process env): same ERROR, rc 0, launched,
+       ~/.claude.json untouched.
+T8d    likewise when set ONLY in the host-common file (AGENT_BOOT_ENV_COMMON).
+T8e    the process env sets CLAUDE_CONFIG_DIR but the per-agent boot-env
+       `unset`s it (boot-env sourced after, and wins): NO ERROR. The check sees
+       the value as it stands after BOTH files, not a pre-source snapshot.
 T9/T10 pins (already green before round 2): trust requires `is True`, so
        `1` and the string "true" both read as untrusted.
 L6-L8  the first line of boot-cwd is normalised before the -d test: trailing
@@ -73,10 +80,21 @@ def _stub(path: Path, body: str) -> None:
 
 
 def _launch(tmp_path: Path, *, dirs=(), boot_cwd=None, claude_json=None, no_python=False,
-            extra_env=None, boot_cwd_raw=None):
-    """claude_json: None (absent), str (raw content) or dict (json-dumped)."""
+            extra_env=None, boot_cwd_raw=None, boot_env=None, boot_env_common=None):
+    """claude_json: None (absent), str (raw content) or dict (json-dumped).
+
+    boot_env / boot_env_common: file content for $HOME/.engram/boot-env and for
+    the host-common file named by AGENT_BOOT_ENV_COMMON (@HOME@ is substituted).
+    Left as None, neither file is created (the common path stays nonexistent).
+    """
     home = tmp_path / "home"
     (home / ".engram").mkdir(parents=True)
+    if boot_env is not None:
+        (home / ".engram" / "boot-env").write_text(boot_env.replace("@HOME@", str(home)),
+                                                   encoding="utf-8")
+    if boot_env_common is not None:
+        (tmp_path / "none").write_text(boot_env_common.replace("@HOME@", str(home)),
+                                       encoding="utf-8")
     for d in dirs:
         (home / d).mkdir(parents=True, exist_ok=True)
     if boot_cwd is not None:
@@ -243,6 +261,42 @@ def test_T8_claude_config_dir_fails_closed(tmp_path):
     assert f"{home}/cfg" in errs[0]
     assert "tmux attach -t agent-zed" in errs[0]
     assert "accept" in errs[0]
+    assert proc.returncode == 0 and argv is not None
+    assert before == after
+
+
+def _assert_t8_error(proc, home, argv, before, after):
+    errs = _errors(proc)
+    assert len(errs) == 1, proc.stderr
+    assert "CLAUDE_CONFIG_DIR" in errs[0]
+    assert f"{home}/cfg" in errs[0]
+    assert proc.returncode == 0 and argv is not None
+    assert before == after
+
+
+def test_T8c_claude_config_dir_from_per_agent_boot_env(tmp_path):
+    """Invariant: trust check reads CLAUDE_CONFIG_DIR AFTER ~/.engram/boot-env is sourced."""
+    proc, home, argv, before, after = _launch(
+        tmp_path, dirs=("engram-alpha", "cfg"), claude_json=_trusted(),
+        boot_env="CLAUDE_CONFIG_DIR=@HOME@/cfg\n")
+    _assert_t8_error(proc, home, argv, before, after)
+
+
+def test_T8d_claude_config_dir_from_host_common_boot_env(tmp_path):
+    """Invariant: trust check reads CLAUDE_CONFIG_DIR AFTER the host-common file is sourced."""
+    proc, home, argv, before, after = _launch(
+        tmp_path, dirs=("engram-alpha", "cfg"), claude_json=_trusted(),
+        boot_env_common="CLAUDE_CONFIG_DIR=@HOME@/cfg\n")
+    _assert_t8_error(proc, home, argv, before, after)
+
+
+def test_T8e_boot_env_unset_overrides_process_env(tmp_path):
+    """Invariant: the check uses the value after boot-env, so a per-agent `unset` beats the inherited env."""
+    proc, home, argv, before, after = _launch(
+        tmp_path, dirs=("engram-alpha", "cfg"), claude_json=_trusted(),
+        extra_env={"CLAUDE_CONFIG_DIR": "@HOME@/cfg"},
+        boot_env="unset CLAUDE_CONFIG_DIR\n")
+    assert _errors(proc) == [], proc.stderr
     assert proc.returncode == 0 and argv is not None
     assert before == after
 
