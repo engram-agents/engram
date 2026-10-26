@@ -830,3 +830,105 @@ never gave on that commit. As a seat rule on top of it (Kepler, stated and appli
 #4003, 2026-10-21: a fresh review object, never the re-pointed one), the merge seat
 checks that an approving review's `submitted_at` is later than the `update-branch` merge
 commit.
+
+### Batched whole-suite gate (Kepler's interim of 2026-10-24/25; proposed as standing, pending Lei's read)
+
+**Status.** Kepler ruled this as an interim on 2026-10-24 (crossing 16285), first for five
+PRs, then for that whole day (16406). He ruled it again on 2026-10-25, for that day (that crossing's seq is not located here). His condition for it
+to outlive those days is that it lands here, in a PR Lei reads.
+
+**Why.** The merge seat's own run is the whole `tests/` directory on a scratch merge (rule 1
+of *Merge-seat test rules*). On the seat's Linux host that took 55–67 minutes on those two
+days (26,257 to 26,888 cells passed, 367 skipped), so a serial seat presses about one PR an
+hour. A batch shares one whole run
+among several PRs.
+
+**What it gives up.** This section is a bounded exception to rule 1 of *Merge-seat test rules*
+("does the base work after this lands"): that question is answered only for the last PR in
+the batch. Two costs follow. First, the trees between presses: each press lands a tree nobody
+ran, and the run tested only the final one. Second, one red PR holds its batch-mates: on
+2026-10-25 a red in one PR's tests sent the whole batch back, and the other PRs waited for
+a re-run they would not have needed serially. A semantic clash between two PRs is still caught, because the
+final tree contains both. In Kepler's words: "the thing that must stay tested is the tree
+that persists; what your batch leaves untested is the intermediate trees for the minutes
+between presses."
+
+**The six conditions, as ruled** (crossing 16285, verbatim except one elided internal reference,
+marked `[...]`, and one bracketed note):
+
+> (1) scope exactly as you measured: the five after #4053 with pairwise-disjoint file sets,
+> plus #4134 stacked on #4136 pressed through gh stack merge in order [sic: #4134 is an issue,
+> and that batch held no stacked PR]; any PR whose file set
+> is not disjoint drops to serial. (2) Each PR keeps its own full gate (fairy record,
+> non-author approval on the exact head, CI green on that head, role check). (3) ONE whole run
+> on a scratch of current dev plus all heads merged in press order; the run id and the final
+> tree sha go in each merge comment. (4) Press the five inside one announced window: post 'dev
+> moving, N presses, until HH:MMZ' in the Office before the first press and ask no seat to run
+> on dev during it ([...]); after each press assert dev's tree equals
+> the cumulative scratch tree at that step, as you proposed; the window closes with a one-line
+> read-back that the final dev tree equals the tested tree. (5) Any red in the batch run that
+> plain dev lacks sends the implicated PRs back to serial, as you proposed. (6) If the final
+> tree assertion fails at any step, stop pressing and run that landing tree alone.
+
+**The standing form.** The same six conditions, read as follows:
+- **Condition 1, for any batch rather than those five PRs:** the PRs' file sets are pairwise
+  disjoint, a stacked PR is pressed through `gh stack merge` in order, and any PR that is not
+  disjoint goes serial.
+- **Condition 3:** each merge comment names the tested tree, the run's counts and its
+  duration. No record on those two days carried anything called a run id.
+- **Condition 5, as practised:** the implicated PR leaves the batch, and the others
+  re-batch without it. The implicated PR may join a later batch once fixed. On 2026-10-25
+  the red PR rejoined batch C after its fix, while the batch's other two PRs re-ran in
+  batch B.
+- **More than one seat may press one batch.** Each press still asserts its own step tree,
+  and the seat that presses posts that PR's record. In batch D′ the merge seat pressed two
+  PRs, and the commander pressed the third (the merge seat's own PR) as the other merge seat.
+- **Condition 5's one exception is rule 4 of *Merge-seat test rules*.** A red that only the
+  whole run produces and that meets rule 4's four conditions is a load flake. The seat
+  applies those conditions itself, files the flake, records it and its controls in every
+  merge record of the run, and presses; no separate ruling is needed. It is not a red that
+  sends PRs back. This is
+  how the 2026-10-25 batch D′ was pressed; it ran before rule 4's co-run condition existed.
+
+Four additions, each from a slip or a decision on those two days:
+
+- **An unapproved PR stays out of a batch.** Its red would hold PRs that are ready (decided on
+  2026-10-25; Kepler concurred).
+- **The merge record is posted on each PR before its press.** It names the batch, the run and
+  the step tree. On those two days this held only from 2026-10-25's batch D′ on (7 of the 25
+  PRs). The other 18 records were posted after their presses: by up to two minutes on
+  2026-10-24, about 30 seconds for batch B, and up to about four minutes for batch C.
+- **The window post is made mechanical, not remembered.** (a) The step that prepares the presses
+  prints the window line, so posting it is a paste. (b) The press step refuses when no window
+  post is recorded for the batch. Condition 4 is the only condition aimed at seats outside the
+  pipeline, so nothing inside the pipeline notices when it is skipped.
+- **The press step follows rule 5 of *Merge-seat test rules*.** It gates on CI and does not
+  press on a printed pending state (the CI-green gate's `UNKNOWN` item, made a press rule).
+
+**The record, two days, one seat (Borges).**
+
+| day | batches pressed | PRs pressed | reds |
+|---|---|---|---|
+| 2026-10-24 | 3 (5, 3, 3 PRs) | 11 | none |
+| 2026-10-25 | 5 (4, 3, 3, 2, 2 PRs) | 14 (13 by Borges, one by Kepler) | see below |
+
+- **Predicted trees:** every one of the 24 presses Borges made landed on its predicted step tree.
+  There were no divergences, so condition 6 never fired.
+- **The 2026-10-25 reds:**
+  - One further batch went red and stopped before any press. All its failures were in one PR's
+    own defect, which only a whole-suite run shows; a serial whole run would have caught it equally.
+  - One pressed batch carried one red, in a timing cell in a file no PR touched. Kepler ruled it
+    a load flake after four controls, and it is filed as #4180.
+- **Throughput:** 25 PRs took 10 started whole runs instead of 25: 8 led to presses, 1 went
+  red, and 1 (batch D on 2026-10-25, ruled in crossing 17180) was stopped at about 55% and
+  re-batched as D′ (crossing 17206), to avoid a base race with a newly ready stacked PR.
+- **Misses:**
+  - Condition 4's window post was made for the three 2026-10-24 batches (Office crossings
+    16322 with read-back 16323, 16535 and 16572). No post is on record for the five 2026-10-25
+    batches; addressed messages to the commander and the authors stood in for it, which is not
+    the condition.
+  - The merge record came after the press for 18 of the 25 PRs (see the additions above).
+  - One batch press (#4182) went through on a printed `UNKNOWN` merge state. Its CI was read
+    green only afterwards.
+- **Not checked:** the trees between presses were not run, by design. Whether dev's own
+  scheduled runs over those windows were green was not checked.
