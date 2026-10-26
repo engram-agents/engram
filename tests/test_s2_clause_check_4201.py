@@ -10,9 +10,11 @@ tool (plain arithmetic or brute force), or are hand-computed constants.
 """
 
 import atexit
+import builtins
 import copy
 import hashlib
 import importlib.util
+import io
 import itertools
 import json
 import os
@@ -1357,3 +1359,1159 @@ def test_run_report_carries_the_embedding_model(cc, monkeypatch):
     assert rep["embedding_model"] == "synthetic-model-a"
     head = "\n".join((out / "report.md").read_text().splitlines()[:6])
     assert "synthetic-model-a" in head
+
+
+# =========================================================================== #4201 phase 3a
+# The deterministic clause splitter (B), its measurement harness (split-eval) and the end-to-end mode
+# (run --clauses split). Design-owner ruling: #4201 comment 6424929510. Synthetic fixtures only.
+
+# ---- splitter: rule (a), sentences
+def test_splitter_version_and_manifest_pin(cc):
+    assert cc.SPLITTER_VERSION == "B1"
+    root, manifest = _freeze_and_study(cc)
+    assert json.loads(manifest.read_text())["splitter_version"] == "B1"
+
+
+def test_rule_a_sentence_boundaries_split(cc):
+    assert cc.split_claim("The suite ran. The build passed.") == ["The suite ran", "The build passed"]
+    assert cc.split_claim("Did the suite run? The build passed!") == ["Did the suite run", "The build passed"]
+    assert cc.split_claim("Quillon merged the branch; Marrowby approved it") == [
+        "Quillon merged the branch", "Marrowby approved it"]
+
+
+def test_rule_a_a_number_is_not_a_boundary(cc):
+    assert cc.split_claim("the rate was 3.5 percent in the run") == ["the rate was 3.5 percent in the run"]
+    assert cc.split_claim("The run took 3.5 hours. It passed.") == ["The run took 3.5 hours", "It passed"]
+
+
+@pytest.mark.parametrize("text", [
+    "reviewers (e.g. Quillon) approved it",
+    "it holds, i.e. the cache is warm",
+    "the cache vs. the queue was slower",
+    "see cf. the earlier note for details",
+])
+def test_rule_a_an_abbreviation_is_not_a_boundary(cc, text):
+    assert cc.split_claim(text) == [text]
+
+
+def test_rule_a_a_code_span_is_not_split(cc):
+    assert cc.split_claim("`a. b; c` was logged") == ["`a. b; c` was logged"]
+    assert cc.split_claim("the line `x. y` ran. Then it stopped.") == ["the line `x. y` ran", "Then it stopped"]
+
+
+# ---- splitter: rule (b), coordination
+def test_rule_b_verb_on_both_sides_splits(cc):
+    assert cc.split_claim("Quillon merged the branch as hotfix and Marrowby approved it") == [
+        "Quillon merged the branch as hotfix", "Marrowby approved it"]
+    assert cc.split_claim("the suite passed, and the build failed") == ["the suite passed", "the build failed"]
+    assert cc.split_claim("the suite passed but the build failed") == ["the suite passed", "the build failed"]
+
+
+def test_rule_b_hard_token_on_both_sides_splits(cc):
+    assert cc.split_claim("build 4812 and ticket #123") == ["build 4812", "ticket #123"]
+
+
+def test_rule_b_no_verb_or_hard_token_on_one_side_does_not_split(cc):
+    assert cc.split_claim("the queue and the cache were drained") == ["the queue and the cache were drained"]
+    assert cc.split_claim("tests ran against build 4812 and docs") == ["tests ran against build 4812 and docs"]
+    assert cc.split_claim("bread and butter") == ["bread and butter"]
+
+
+def test_rule_b_a_connector_inside_a_code_span_is_not_split(cc):
+    assert cc.split_claim("the line `x was set and y was read` ran") == ["the line `x was set and y was read` ran"]
+
+
+def test_rule_b_a_list_keeps_a_verbless_item_with_its_neighbour(cc):
+    # the middle piece has no verb or hard token, so it merges into the piece before it
+    assert cc.split_claim("Quillon ran the suite and the cache and Marrowby approved it") == [
+        "Quillon ran the suite and the cache", "Marrowby approved it"]
+
+
+# ---- splitter: rule (c), trailing qualifier clauses
+@pytest.mark.parametrize("intro", ["after", "because", "so that", "which"])
+def test_rule_c_qualifier_splits_when_both_sides_have_three_content_stems(cc, intro):
+    left = "Quillon merged the hotfix branch"
+    right = f"{intro} reviewers finished careful inspection"
+    assert cc.split_claim(f"{left} {right}") == [left, right]
+
+
+@pytest.mark.parametrize("intro", ["after", "because", "so that", "which"])
+def test_rule_c_a_short_side_blocks_the_split(cc, intro):
+    short_right = f"Quillon merged the hotfix branch {intro} review"
+    short_left = f"merged {intro} reviewers finished careful inspection"
+    assert cc.split_claim(short_right) == [short_right]
+    assert cc.split_claim(short_left) == [short_left]
+
+
+# ---- splitter: rule (d), strip and drop empties
+def test_rule_d_strips_punctuation_and_drops_empty_pieces(cc):
+    assert cc.split_claim("  ...The suite ran,  ") == ["The suite ran"]
+    assert cc.split_claim("The suite ran.; ; The build passed.") == ["The suite ran", "The build passed"]
+    assert cc.split_claim("") == []
+    assert cc.split_claim("...") == []
+
+
+def test_split_claim_is_deterministic_and_makes_no_call(cc, monkeypatch):
+    # no model, no network: the embedder is stubbed away in the fixture and must stay unreached
+    text = "Quillon merged the hotfix branch after reviewers finished careful inspection. Marrowby approved it"
+    first = cc.split_claim(text)
+    assert cc.split_claim(text) == first
+    assert len(first) == 3
+
+
+# ---- claims input
+def _add_claims(root, per_sheet, drop_key_for=None):
+    """Write a claims.json beside each sheet and point the config at it (the list shape s2_clause_sheet
+    `select` writes: [{"node_id", "claim"}])."""
+    cfg = json.loads((root / "config.json").read_text())
+    for si, (sh, claims) in enumerate(zip(cfg["sheets"], per_sheet)):
+        p = root / f"sheet{si}" / "claims.json"
+        p.write_text(json.dumps([{"node_id": i, "claim": c} for i, c in claims.items()]))
+        if drop_key_for != si:
+            sh["claims"] = str(p)
+    (root / "config.json").write_text(json.dumps(cfg))
+
+
+E2E_CLAIMS_ONE = {"s1-a": "Quillon merged the branch. The branch merged on 2026-10-02",
+                  "s1-b": "the suite ran 4812 cells and Marrowby approved the cells",
+                  "s1-c": "the queue was drained"}
+E2E_CLAIMS_TWO = {"s2-a": "the fix landed in #123. the fix landed in #124",
+                  "s2-b": "bravo delta were mentioned together",
+                  "s2-c": "the cache was cleared. zebra yak"}
+
+
+def _e2e_root():
+    root = _write_study([SHEET_ONE, SHEET_TWO])
+    _add_claims(root, [E2E_CLAIMS_ONE, E2E_CLAIMS_TWO])
+    return root
+
+
+THETA = 0.46        # the shipped value: the gated end-to-end column evaluates M1 here and never tunes it
+
+
+def _freeze_split(cc, root, fold=1, exclude=None, prior=None, theta=THETA):
+    manifest = root / f"FREEZE_SPLIT{next(_COUNTER)}.json"
+    argv = ["freeze", "--out", str(manifest), "--commit", "abc1234", "--fold", str(fold),
+            "--clauses", "split", "--config", str(root / "config.json")]
+    if theta is not None:
+        argv += ["--theta", str(theta)]
+    if exclude:
+        argv += ["--exclude", str(exclude)]
+    if prior:
+        argv += ["--prior-report", str(prior)]
+    assert cc.main(argv) == 0
+    return manifest
+
+
+def _run_split(cc, root, manifest, out_name="out_split", fold=1, exclude=None, clauses="split", theta=THETA):
+    out = root / out_name
+    argv = ["run", "--config", str(root / "config.json"), "--hashes", str(root / "hashes.json"),
+            "--freeze", str(manifest), "--out-dir", str(out), "--commit", "abc1234", "--fold", str(fold),
+            "--clauses", clauses]
+    if theta is not None and clauses == "split":
+        argv += ["--theta", str(theta)]
+    if exclude:
+        argv += ["--exclude", str(exclude)]
+    return cc.main(argv), out
+
+
+def test_load_claims_joins_by_node_id_and_reports_the_sha(cc):
+    root = _e2e_root()
+    sheets = cc.load_study(root / "config.json", root / "hashes.json")
+    claims = cc.load_claims(root / "config.json", sheets)
+    assert claims["sheet_one"] == E2E_CLAIMS_ONE
+    assert claims["sheet_two"] == E2E_CLAIMS_TWO
+
+
+def test_load_claims_refuses_a_sheet_with_no_claims_path_and_names_it(cc):
+    root = _write_study([SHEET_ONE, SHEET_TWO])
+    _add_claims(root, [E2E_CLAIMS_ONE, E2E_CLAIMS_TWO], drop_key_for=1)
+    sheets = cc.load_study(root / "config.json", root / "hashes.json")
+    with pytest.raises(cc.Refusal, match="sheet_two"):
+        cc.load_claims(root / "config.json", sheets)
+
+
+def test_load_claims_refuses_missing_and_extra_ids_and_lists_them(cc):
+    root = _write_study([SHEET_ONE, SHEET_TWO])
+    short = dict(E2E_CLAIMS_ONE)
+    del short["s1-b"]
+    short["zz-extra"] = "an invented node"
+    _add_claims(root, [short, E2E_CLAIMS_TWO])
+    sheets = cc.load_study(root / "config.json", root / "hashes.json")
+    with pytest.raises(cc.Refusal) as ei:
+        cc.load_claims(root / "config.json", sheets)
+    msg = str(ei.value)
+    assert "sheet_one" in msg and "s1-b" in msg and "zz-extra" in msg
+
+
+def test_load_claims_refuses_a_planted_id_and_a_duplicate(cc):
+    root = _write_study([SHEET_ONE, SHEET_TWO])
+    with_planted = dict(E2E_CLAIMS_ONE)
+    with_planted["plant-P1"] = "planted claims are not claims of real items"
+    _add_claims(root, [with_planted, E2E_CLAIMS_TWO])
+    sheets = cc.load_study(root / "config.json", root / "hashes.json")
+    with pytest.raises(cc.Refusal, match="plant-P1"):
+        cc.load_claims(root / "config.json", sheets)
+    root2 = _write_study([SHEET_ONE, SHEET_TWO])
+    _add_claims(root2, [E2E_CLAIMS_ONE, E2E_CLAIMS_TWO])
+    p = root2 / "sheet0" / "claims.json"
+    rows = json.loads(p.read_text())
+    rows.append({"node_id": "s1-a", "claim": "a second claim for the same node"})
+    p.write_text(json.dumps(rows))
+    sheets2 = cc.load_study(root2 / "config.json", root2 / "hashes.json")
+    with pytest.raises(cc.Refusal, match="s1-a"):
+        cc.load_claims(root2 / "config.json", sheets2)
+
+
+# ---- split-eval: a synthetic two-sheet fixture with known answers
+SEED_HEX = "d638538e"
+# kind -> (claim, frozen clauses); matched = the counts agree
+_SE_KINDS = {
+    "two": ("Alpha ran. Bravo ran.", ["Alpha ran", "Bravo ran"]),          # agree, jaccard 1, 1
+    "one": ("Delta ran", ["Delta ran"]),                                    # agree, jaccard 1
+    "mis": ("Echo ran", ["Echo ran", "Foxtrot ran"]),                       # count disagrees
+    "near": ("Delta ran quickly", ["Delta ran"]),                           # agree, jaccard 2/3
+    "far": ("Golf hotel india", ["Juliet kilo lima"]),                      # agree, jaccard 0
+}
+_SE_AGREE = {"two", "one", "near", "far"}
+_SE_J = {"two": [1.0, 1.0], "one": [1.0], "near": [2 / 3], "far": [0.0]}
+_SE_KINDS_ONE = ["two", "one", "mis", "near", "far", "two", "one", "mis", "two", "one", "near", "mis"]
+_SE_KINDS_TWO = ["mis", "mis", "one", "far", "two", "near", "mis", "one", "far", "two", "one", "two"]
+
+
+def _se_ids(prefix):
+    return [f"{prefix}{i:02d}" for i in range(1, 13)]
+
+
+def _se_study(kinds_one=None, kinds_two=None):
+    kinds = [kinds_one or _SE_KINDS_ONE, kinds_two or _SE_KINDS_TWO]
+    real, claims = [], []
+    for prefix, ks in zip(("qa", "qb"), kinds):
+        items, cl = [], {}
+        for iid, k in zip(_se_ids(prefix), ks):
+            claim, frozen = _SE_KINDS[k]
+            items.append((iid, "a synthetic quote", [(c, "NOT", "NOT") for c in frozen]))
+            cl[iid] = claim
+        real.append(items)
+        claims.append(cl)
+    root = _write_study(real)
+    _add_claims(root, claims)
+    return root, kinds
+
+
+def _first_ten(ids):
+    """Independent re-derivation of the stage-1 selection: the first 10 by sha256(seed_hex || id)."""
+    return sorted(ids, key=lambda i: hashlib.sha256((SEED_HEX + i).encode("utf-8")).hexdigest())[:10]
+
+
+def _se_item_number(root, si, iid):
+    key = json.loads((root / f"sheet{si}" / "key.json").read_text())
+    return next(int(n) for n, v in key["render"]["items"].items() if v["id"] == iid)
+
+
+def _split_eval(cc, root, bar, out_name="se_out"):
+    out = root / out_name
+    rc = cc.main(["split-eval", "--config", str(root / "config.json"), "--bar", json.dumps(bar),
+                  "--out-dir", str(out)])
+    return rc, out
+
+
+def _se_expected(kinds, ids):
+    agree = [k in _SE_AGREE for k in kinds]
+    ft = set(_first_ten(ids))
+    ft_agree = [a for a, i in zip(agree, ids) if i in ft]
+    js = [j for k in kinds if k in _SE_AGREE for j in _SE_J[k]]
+    return {"n": len(ids), "agree": sum(agree), "rate": sum(agree) / len(ids),
+            "ft_n": len(ft_agree), "ft_agree": sum(ft_agree), "ft_rate": sum(ft_agree) / len(ft_agree),
+            "pairs": len(js), "mean_j": sum(js) / len(js), "share": sum(1 for j in js if j >= 0.5) / len(js)}
+
+
+def test_split_eval_count_agreement_and_boundary_jaccard_match_the_known_answers(cc):
+    root, kinds = _se_study()
+    rc, out = _split_eval(cc, root, {"sheet_one": 0.0, "sheet_two": 0.0})
+    assert rc == 0
+    rep = json.loads((out / "report-split.json").read_text())
+    for name, ks, prefix in (("sheet_one", kinds[0], "qa"), ("sheet_two", kinds[1], "qb")):
+        want = _se_expected(ks, _se_ids(prefix))
+        got = rep["sheets"][name]
+        assert got["n_items"] == want["n"] == 12
+        assert got["count_agree"] == want["agree"]
+        assert got["count_agree_rate"] == pytest.approx(want["rate"])
+        assert got["boundary"]["n_pairs"] == want["pairs"]
+        assert got["boundary"]["mean_jaccard"] == pytest.approx(want["mean_j"])
+        assert got["boundary"]["share_ge_0_5"] == pytest.approx(want["share"])
+    pooled_agree = sum(_se_expected(k, _se_ids(p))["agree"] for k, p in ((kinds[0], "qa"), (kinds[1], "qb")))
+    assert rep["pooled"]["count_agree"] == pooled_agree
+    assert rep["pooled"]["n_items"] == 24
+    assert rep["pooled"]["count_agree_rate"] == pytest.approx(pooled_agree / 24)
+    assert (out / "report-split.md").read_text().strip()
+
+
+def test_split_eval_first_ten_uses_the_sort_rule(cc):
+    root, kinds = _se_study()
+    ids_one = _se_ids("qa")
+    assert _first_ten(ids_one) != ids_one[:10]           # the control: the sort rule is not id order
+    rc, out = _split_eval(cc, root, {"sheet_one": 0.0, "sheet_two": 0.0})
+    rep = json.loads((out / "report-split.json").read_text())
+    for si, (name, ks, prefix) in enumerate((("sheet_one", kinds[0], "qa"), ("sheet_two", kinds[1], "qb"))):
+        want = _se_expected(ks, _se_ids(prefix))
+        ft = rep["sheets"][name]["first_ten"]
+        assert ft["items"] == sorted(_se_item_number(root, si, i) for i in _first_ten(_se_ids(prefix)))
+        assert ft["n"] == want["ft_n"] == 10
+        assert ft["count_agree"] == want["ft_agree"]
+        assert ft["count_agree_rate"] == pytest.approx(want["ft_rate"])
+    # at least one sheet's first-ten rate differs from its all-items rate, so a wrong selection would show
+    assert any(rep["sheets"][n]["first_ten"]["count_agree_rate"] != rep["sheets"][n]["count_agree_rate"]
+               for n in ("sheet_one", "sheet_two"))
+
+
+def test_split_eval_sort_hash_is_the_sheet_builders(cc):
+    spec = importlib.util.spec_from_file_location(f"s2_clause_sheet_{next(_COUNTER)}", _TOOLS / "s2_clause_sheet.py")
+    sheet_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sheet_mod)
+    for ident in ("qa01", "qb07", "zz-9"):
+        assert cc._sort_hash(SEED_HEX, ident) == sheet_mod.sort_hash(SEED_HEX, ident)
+
+
+def test_split_eval_bar_passes_and_fails_per_sheet(cc):
+    root, kinds = _se_study()
+    r1 = _se_expected(kinds[0], _se_ids("qa"))["rate"]
+    r2 = _se_expected(kinds[1], _se_ids("qb"))["rate"]
+    rc, out = _split_eval(cc, root, {"sheet_one": r1, "sheet_two": r2}, "se_pass")     # at the bar passes
+    assert rc == 0
+    rep = json.loads((out / "report-split.json").read_text())
+    assert rep["sheets"]["sheet_one"]["pass"] is True and rep["sheets"]["sheet_two"]["pass"] is True
+    assert rep["verdict"]["pass"] is True
+    rc, out = _split_eval(cc, root, {"sheet_one": r1, "sheet_two": r2 + 0.01}, "se_fail")
+    rep = json.loads((out / "report-split.json").read_text())
+    assert rep["sheets"]["sheet_one"]["pass"] is True and rep["sheets"]["sheet_two"]["pass"] is False
+    assert rep["verdict"]["pass"] is False
+    assert rep["bar"] == {"sheet_one": r1, "sheet_two": r2 + 0.01}
+    assert "FAIL" in (out / "report-split.md").read_text()
+
+
+@pytest.mark.parametrize("bar", [{"sheet_one": 0.5}, {"sheet_one": 0.5, "sheet_two": 0.6, "extra": 0.1},
+                                 {"sheet_one": "high", "sheet_two": 0.6}, {"sheet_one": 1.5, "sheet_two": 0.6},
+                                 [0.5, 0.6]])
+def test_split_eval_refuses_a_malformed_bar_and_writes_nothing(cc, bar):
+    root, _kinds = _se_study()
+    rc, out = _split_eval(cc, root, bar)
+    assert rc == 2 and not out.exists()
+
+
+def test_split_eval_refuses_when_a_sheet_has_no_claims_and_does_not_overwrite(cc, capsys):
+    root = _write_study([SHEET_ONE, SHEET_TWO])
+    _add_claims(root, [E2E_CLAIMS_ONE, E2E_CLAIMS_TWO], drop_key_for=0)
+    rc, out = _split_eval(cc, root, {"sheet_one": 0.5, "sheet_two": 0.5})
+    assert rc == 2 and not out.exists()
+    assert "sheet_one" in capsys.readouterr().err
+    root2, _k = _se_study()
+    rc, out2 = _split_eval(cc, root2, {"sheet_one": 0.0, "sheet_two": 0.0})
+    assert rc == 0
+    before = (out2 / "report-split.json").read_text()
+    rc, _ = _split_eval(cc, root2, {"sheet_one": 0.9, "sheet_two": 0.9})
+    assert rc == 2
+    assert (out2 / "report-split.json").read_text() == before
+
+
+def _record_opened_paths(monkeypatch):
+    """Record every path opened through the ways the tool reads files (builtins.open, io.open, Path.open,
+    Path.read_bytes, Path.read_text), resolved, so a return is recognised by its full path and not by how a
+    fixture happens to name it."""
+    opened = []
+    real_open, real_io_open = builtins.open, io.open
+    real_popen, real_rb, real_rt = Path.open, Path.read_bytes, Path.read_text
+
+    def note(p):
+        if isinstance(p, (str, bytes, os.PathLike)):
+            opened.append(os.path.realpath(os.fsdecode(p)))
+
+    def w_open(f, *a, **k):
+        note(f)
+        return real_open(f, *a, **k)
+
+    def w_io_open(f, *a, **k):
+        note(f)
+        return real_io_open(f, *a, **k)
+
+    def w_popen(self, *a, **k):
+        note(self)
+        return real_popen(self, *a, **k)
+
+    def w_rb(self):
+        note(self)
+        return real_rb(self)
+
+    def w_rt(self, *a, **k):
+        note(self)
+        return real_rt(self, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", w_open)
+    monkeypatch.setattr(io, "open", w_io_open)
+    monkeypatch.setattr(Path, "open", w_popen)
+    monkeypatch.setattr(Path, "read_bytes", w_rb)
+    monkeypatch.setattr(Path, "read_text", w_rt)
+    return opened
+
+
+def _return_paths_in(root):
+    cfg = json.loads((root / "config.json").read_text())
+    paths = [p for sh in cfg["sheets"] for judge in sh["returns"].values() for p in judge.values()]
+    assert len(paths) == 8 and all(os.path.isabs(p) for p in paths)
+    return {os.path.realpath(p) for p in paths}
+
+
+def test_split_eval_never_calls_the_label_loaders_or_reads_a_return(cc, monkeypatch):
+    root, _kinds = _se_study()
+    returns = _return_paths_in(root)                  # every return the config lists, by full path
+    calls = []
+    for owner, name in (("cc", "load_study"), ("cc", "build_report"), ("_s2", "parse_return"), ("_s2", "_labels_of"),
+                        ("_s2", "_check_structure")):
+        mod = cc if owner == "cc" else cc._s2
+        orig = getattr(mod, name)
+
+        def wrapper(*a, _orig=orig, _name=name, **k):
+            calls.append(_name)
+            return _orig(*a, **k)
+        monkeypatch.setattr(mod, name, wrapper)
+    opened = _record_opened_paths(monkeypatch)
+    rc, out = _split_eval(cc, root, {"sheet_one": 0.0, "sheet_two": 0.0})
+    assert rc == 0
+    assert calls == []
+    assert any(p.endswith("key.json") for p in opened)         # the spy can see reads (positive control)
+    assert not (returns & set(opened))                         # no judge's return was opened, by full path
+
+
+def test_the_open_spy_sees_a_return_read_under_any_name(cc, monkeypatch):
+    # positive control for the structural spy: a return read through each reader is recorded by full path,
+    # whatever the file is called, so "no return opened" above cannot be an artefact of the fixture's naming
+    root, _kinds = _se_study()
+    returns = sorted(_return_paths_in(root))
+    opened = _record_opened_paths(monkeypatch)
+    Path(returns[0]).read_bytes()
+    Path(returns[1]).read_text()
+    with open(returns[2]) as fh:
+        fh.read()
+    with Path(returns[3]).open() as fh:
+        fh.read()
+    assert set(returns[:4]) <= set(opened)
+
+
+# ---- end to end: label mapping
+def _frozen_recs(cc, specs):
+    """specs: [(clause, labelA, labelB)] for one item -> records with k = 1.."""
+    return [cc.make_record(1, k, "a quote", c, a, b) for k, (c, a, b) in enumerate(specs, 1)]
+
+
+def test_map_split_clauses_inherits_the_label_of_the_highest_jaccard_clause(cc):
+    frozen = _frozen_recs(cc, [("alpha bravo delta", "CARRIED", "CARRIED"), ("gamma kilo lima", "NOT", "NOT")])
+    mapped, none = cc.map_split_clauses(1, "a quote", ["alpha bravo", "gamma kilo"], frozen)
+    assert none == 0
+    assert [(r["clause"], r["consensus"], r["mapped_ks"]) for r in mapped] == [
+        ("alpha bravo", "STATED", [1]), ("gamma kilo", "NOT", [2])]
+    assert mapped[0]["a"] == "CARRIED" and mapped[0]["b"] == "CARRIED"
+    # the best clause wins even when a weaker one overlaps too
+    mapped2, _ = cc.map_split_clauses(1, "q", ["alpha bravo gamma"], frozen)
+    assert mapped2[0]["mapped_ks"] == [1] and mapped2[0]["consensus"] == "STATED"
+
+
+def test_map_split_clauses_a_tie_is_not(cc):
+    # 'alpha gamma' overlaps clause 1 and clause 2 by one word each (jaccard .25 and .25)
+    tie_mixed = _frozen_recs(cc, [("alpha bravo delta", "CARRIED", "CARRIED"), ("gamma kilo lima", "NOT", "NOT")])
+    mapped, none = cc.map_split_clauses(1, "q", ["alpha gamma"], tie_mixed)
+    assert none == 0
+    assert mapped[0]["consensus"] == "NOT" and mapped[0]["mapped_ks"] == [1, 2]
+    tie_stated = _frozen_recs(cc, [("alpha bravo delta", "CARRIED", "CARRIED"), ("gamma kilo lima", "CARRIED", "CARRIED")])
+    mapped2, _ = cc.map_split_clauses(1, "q", ["alpha gamma"], tie_stated)
+    assert mapped2[0]["consensus"] == "NOT"                # a tie is NOT even between two STATED clauses
+
+
+def test_map_split_clauses_zero_jaccard_is_none_and_is_not_a_record(cc):
+    frozen = _frozen_recs(cc, [("alpha bravo delta", "CARRIED", "CARRIED")])
+    mapped, none = cc.map_split_clauses(1, "q", ["alpha bravo", "zebra yak", "papa quebec"], frozen)
+    assert none == 2
+    assert [r["clause"] for r in mapped] == ["alpha bravo"]
+
+
+# ---- end to end: run --clauses split
+def test_run_split_reports_mapping_rates_and_none_counts(cc):
+    root = _e2e_root()
+    man = _freeze_split(cc, root)
+    rc, out = _run_split(cc, root, man)
+    assert rc == 0
+    rep = json.loads((out / "report.json").read_text())
+    mp = rep["end_to_end"]["mapping"]
+    assert mp["sheet_one"] == {"split_clauses": 5, "mapped": 5, "none": 0, "mapping_rate": 1.0, "ties_total": 0,
+                               "ties_stated_stated": 0, "frozen_clauses": 6, "frozen_unmapped": 1,
+                               "items_empty_split": 0, "claims_over_cap": 0}
+    assert mp["sheet_two"] == {"split_clauses": 5, "mapped": 4, "none": 1, "mapping_rate": 0.8, "ties_total": 2,
+                               "ties_stated_stated": 0, "frozen_clauses": 6, "frozen_unmapped": 2,
+                               "items_empty_split": 0, "claims_over_cap": 0}
+    assert rep["clauses_mode"] == "split" and rep["splitter_version"] == "B1"
+
+
+def test_run_split_scores_on_the_split_clauses_and_leaves_none_out(cc):
+    root = _e2e_root()
+    man = _freeze_split(cc, root)
+    rc, out = _run_split(cc, root, man)
+    rep = json.loads((out / "report.json").read_text())
+    e2e = rep["end_to_end"]["gated"]["folds"][0]
+    assert (e2e["tune_sheet"], e2e["test_sheet"]) == ("sheet_one", "sheet_two")
+    # sheet_two split clauses and the frozen clause each maps to (computed by hand in this cell):
+    #   s2-a: both split clauses have the same content stems as BOTH frozen clauses (#123 / #124 are not
+    #   words), so each is a tie -> NOT     s2-b: 'bravo delta were mentioned together' -> c2 STATED
+    #   s2-c: 'the cache was cleared' -> c1 NOT, 'zebra yak' -> NONE (left out)
+    assert e2e["test"]["consensus_counts"] == {"NOT": 3, "STATED": 1, "BAND": 0}
+    frozen = rep["folds"][0]                              # the frozen-split numbers sit beside them
+    assert frozen["test"]["consensus_counts"] == {"NOT": 2, "STATED": 2, "BAND": 2}
+    assert set(e2e["test"]["methods"]) == {"B0", "B1", "B2", "M1"}
+    md = (out / "report.md").read_text()
+    assert "End-to-end" in md
+    assert md.index("## Fold 1") < md.index("End-to-end")
+    assert "mapping rate" in md.lower()
+
+
+def test_run_split_exclusion_applies_by_mapping(cc):
+    root = _e2e_root()
+    # sheet_two item 4 is s2-b; its one split clause maps to frozen clause 2, which the list excludes
+    excl = _write_excl(root, [{"sheet": "sheet_two", "item": 4, "clauses": [2]}])
+    man = _freeze_split(cc, root, exclude=excl)
+    rc, out = _run_split(cc, root, man, exclude=excl)
+    assert rc == 0
+    rep = json.loads((out / "report.json").read_text())
+    e2e = rep["end_to_end"]["gated"]["folds"][0]
+    assert e2e["exclusion"]["removed_total"] == 1
+    assert e2e["test"]["consensus_counts"] == {"NOT": 3, "STATED": 0, "BAND": 0}
+    assert rep["folds"][0]["exclusion"]["removed_total"] == 1       # the frozen clause is removed there too
+
+
+def test_run_split_a_none_clause_is_never_removed_by_an_exclusion(cc):
+    root = _e2e_root()
+    excl = _write_excl(root, [{"sheet": "sheet_two", "item": 5, "clauses": "all"}])   # s2-c, two split clauses
+    man = _freeze_split(cc, root, exclude=excl)
+    rc, out = _run_split(cc, root, man, exclude=excl)
+    rep = json.loads((out / "report.json").read_text())
+    e2e = rep["end_to_end"]["gated"]["folds"][0]
+    assert e2e["exclusion"]["removed_total"] == 1                    # only the mapped clause; NONE was never in
+    assert rep["end_to_end"]["mapping"]["sheet_two"]["none"] == 1
+
+
+# ---- end to end: the manifest pins the mode, the splitter and the claims
+def test_split_manifest_records_mode_splitter_and_claims_sha(cc):
+    root = _e2e_root()
+    m = json.loads(_freeze_split(cc, root).read_text())
+    assert m["clauses_mode"] == "split" and m["splitter_version"] == "B1"
+    want = {n: hashlib.sha256((root / f"sheet{i}" / "claims.json").read_bytes()).hexdigest()
+            for i, n in enumerate(("sheet_one", "sheet_two"))}
+    assert m["claims_sha256"] == want
+    frozen_root, frozen_man = _freeze_and_study(cc)
+    fm = json.loads(frozen_man.read_text())
+    assert (fm["clauses_mode"], fm["splitter_version"], fm["claims_sha256"]) == ("frozen", "B1", None)
+
+
+def test_run_split_reports_the_claims_sha_in_inputs(cc):
+    root = _e2e_root()
+    rc, out = _run_split(cc, root, _freeze_split(cc, root))
+    rep = json.loads((out / "report.json").read_text())
+    for i, n in enumerate(("sheet_one", "sheet_two")):
+        assert rep["inputs"][f"{n}/claims"] == hashlib.sha256((root / f"sheet{i}" / "claims.json").read_bytes()).hexdigest()
+    assert rep["freeze"]["clauses_mode"] == "split"
+
+
+@pytest.mark.parametrize("field,value", [("splitter_version", "B0"), ("clauses_mode", "frozen"),
+                                         ("claims_sha256", {"sheet_one": "0" * 64, "sheet_two": "1" * 64})])
+def test_run_split_refuses_when_a_pinned_field_differs_before_any_label_is_read(cc, monkeypatch, field, value):
+    root = _e2e_root()
+    man = _freeze_split(cc, root)
+    m = json.loads(man.read_text())
+    m[field] = value
+    bad = root / f"BAD_{field}.json"
+    bad.write_text(json.dumps(m))
+    calls = _record_label_readers(cc, monkeypatch)
+    rc, out = _run_split(cc, root, bad)
+    assert rc == 2 and not out.exists()
+    assert calls == []
+
+
+def test_run_split_refuses_when_the_claims_changed_after_the_freeze(cc):
+    root = _e2e_root()
+    man = _freeze_split(cc, root)
+    p = root / "sheet0" / "claims.json"
+    rows = json.loads(p.read_text())
+    rows[0]["claim"] = rows[0]["claim"] + " and more"
+    p.write_text(json.dumps(rows))
+    rc, out = _run_split(cc, root, man)
+    assert rc == 2 and not out.exists()
+
+
+def test_run_refuses_a_mode_mismatch_in_both_directions(cc):
+    root = _e2e_root()
+    split_man = _freeze_split(cc, root)
+    rc, out = _run_split(cc, root, split_man, out_name="o1", clauses="frozen")
+    assert rc == 2 and not out.exists()
+    _r, frozen_man = _freeze_and_study(cc, root=root)
+    rc, out = _run_split(cc, root, frozen_man, out_name="o2", clauses="split")
+    assert rc == 2 and not out.exists()
+
+
+def test_run_split_with_a_sheet_lacking_claims_refuses_naming_the_sheet(cc, capsys):
+    root = _write_study([SHEET_ONE, SHEET_TWO])
+    _add_claims(root, [E2E_CLAIMS_ONE, E2E_CLAIMS_TWO], drop_key_for=1)
+    argv = ["freeze", "--out", str(root / "F.json"), "--commit", "abc1234", "--fold", "1", "--clauses", "split",
+            "--config", str(root / "config.json"), "--theta", str(THETA)]
+    assert cc.main(argv) == 2
+    assert "sheet_two" in capsys.readouterr().err
+    assert not (root / "F.json").exists()
+
+
+def test_freeze_split_without_a_config_refuses(cc):
+    root = _write_study([SHEET_ONE, SHEET_TWO])
+    assert cc.main(["freeze", "--out", str(root / "F.json"), "--commit", "abc1234", "--fold", "1",
+                    "--clauses", "split"]) == 2
+    assert not (root / "F.json").exists()
+
+
+def test_fold_2_split_freeze_compares_the_mode_and_claims(cc):
+    root = _e2e_root()
+    man1 = _freeze_split(cc, root)
+    rc, out1 = _run_split(cc, root, man1, out_name="f1")
+    assert rc == 0
+    man2 = _freeze_split(cc, root, fold=2, prior=out1 / "report.json")
+    m2 = json.loads(man2.read_text())
+    assert m2["code_changed_since_fold1"] is False and m2["changed_fields_since_fold1"] == []
+    rc, out2 = _run_split(cc, root, man2, out_name="f2", fold=2)
+    assert rc == 0
+
+
+# ---- round 2: the gated column is a fixed theta; the method check re-tunes beside it
+def _spy_tune(cc, monkeypatch):
+    """Record every call to tune() as (predict function name, number of dev records)."""
+    calls = []
+    orig = cc.tune
+
+    def spy(dev_records, predict):
+        calls.append((predict.__name__, len(dev_records)))
+        return orig(dev_records, predict)
+    monkeypatch.setattr(cc, "tune", spy)
+    return calls
+
+
+def _eval_sheets_of(cc, root):
+    sheets = cc.load_study(root / "config.json", root / "hashes.json")
+    eval_sheets, _stats = cc.split_sheets(sheets, cc.load_claims(root / "config.json", sheets))
+    return sheets, eval_sheets
+
+
+def test_the_gated_column_never_tunes_m1_and_the_method_check_does(cc, monkeypatch):
+    root = _e2e_root()
+    sheets, eval_sheets = _eval_sheets_of(cc, root)
+    calls = _spy_tune(cc, monkeypatch)
+    rep = cc.build_report(sheets, fold=1, eval_sheets=eval_sheets, fixed_theta=0.5)
+    names = [c[0] for c in calls]
+    # fold 1 tunes on sheet_one's split clauses: M1 once (the method check only), B2 once (the baseline)
+    assert names.count("p_m1") == 1 and names.count("p_b2") == 1
+    assert calls[names.index("p_m1")][1] == len(eval_sheets[0]["records"])
+    gated = rep["folds"][0]
+    assert gated["tuned"]["M1"]["value"] == 0.5 and gated["tuned"]["M1"]["fixed"] is True
+    assert gated["test"]["methods"]["M1"]["parameter_value"] == 0.5
+    mc = rep["method_check_folds"][0]
+    assert set(mc["test"]["methods"]) == {"M1"}
+    assert mc["test"]["methods"]["M1"]["parameter_value"] == mc["tuned"]["M1"]["value"]
+
+
+def test_the_method_check_value_differs_from_the_fixed_theta_when_the_dev_fold_says_so(cc):
+    # a control for the cell above: the two columns really are different columns on this fixture
+    root = _e2e_root()
+    sheets, eval_sheets = _eval_sheets_of(cc, root)
+    rep = cc.build_report(sheets, fold=1, eval_sheets=eval_sheets, fixed_theta=0.99)
+    assert rep["folds"][0]["tuned"]["M1"]["value"] == 0.99
+    assert rep["method_check_folds"][0]["tuned"]["M1"]["value"] != 0.99
+
+
+def test_run_split_reports_both_columns_and_the_retuned_vs_fixed_line(cc, monkeypatch):
+    root = _e2e_root()
+    man = _freeze_split(cc, root)
+    calls = _spy_tune(cc, monkeypatch)
+    rc, out = _run_split(cc, root, man)
+    assert rc == 0
+    names = [c[0] for c in calls]
+    assert names.count("p_m1") == 2 and names.count("p_b2") == 2      # the frozen pass + (method check | gated B2)
+    rep = json.loads((out / "report.json").read_text())
+    e = rep["end_to_end"]
+    assert e["gated"]["column"] == "fixed_theta" and e["gated"]["theta"] == THETA
+    assert e["method_check"]["gated"] is False
+    g, m = e["gated"]["folds"][0], e["method_check"]["folds"][0]
+    assert g["tuned"]["M1"]["value"] == THETA and g["test"]["methods"]["M1"]["parameter_value"] == THETA
+    assert set(g["test"]["methods"]) == {"B0", "B1", "B2", "M1"} and set(m["test"]["methods"]) == {"M1"}
+    md = (out / "report.md").read_text()
+    gi, mi = md.index("## End-to-end, GATED column"), md.index("## End-to-end, method check (UNGATED)")
+    assert md.index("## Fold 1") < gi < mi
+    assert f"re-tuned theta per fold vs fixed: {m['tuned']['M1']['value']} vs {THETA}" in md
+
+
+def test_split_report_labels_the_frozen_section_and_the_gated_heading(cc):
+    root = _e2e_root()
+    man = _freeze_split(cc, root)
+    rc, out = _run_split(cc, root, man)
+    assert rc == 0
+    md = (out / "report.md").read_text()
+    label = md.index("## Frozen human-split clauses (reference only, NOT the gate")
+    assert label < md.index("## Fold 1")
+    gated = [ln for ln in md.splitlines() if ln.startswith("## End-to-end, GATED column")]
+    assert len(gated) == 1 and "GATED" in gated[0] and f"theta fixed at {THETA}" in gated[0]
+    # frozen mode: no such label
+    froot, fman = _freeze_and_study(cc)
+    rc, fout = _run(cc, froot, fman)
+    assert rc == 0
+    assert "reference only" not in (fout / "report.md").read_text()
+
+
+def test_run_split_theta_is_required_and_refused_in_frozen_mode(cc):
+    root = _e2e_root()
+    man = _freeze_split(cc, root)
+    rc, out = _run_split(cc, root, man, theta=None)
+    assert rc == 2 and not out.exists()
+    assert cc.main(["freeze", "--out", str(root / "F_NT.json"), "--commit", "abc1234", "--fold", "1",
+                    "--clauses", "split", "--config", str(root / "config.json")]) == 2
+    assert not (root / "F_NT.json").exists()
+    # frozen mode has no theta to fix: giving one is refused rather than ignored
+    _r, fman = _freeze_and_study(cc, root=root)
+    assert cc.main(["run", "--config", str(root / "config.json"), "--hashes", str(root / "hashes.json"),
+                    "--freeze", str(fman), "--out-dir", str(root / "o_ft"), "--commit", "abc1234", "--fold", "1",
+                    "--theta", "0.46"]) == 2
+    assert not (root / "o_ft").exists()
+    assert cc.main(["freeze", "--out", str(root / "F_FT.json"), "--commit", "abc1234", "--fold", "1",
+                    "--theta", "0.46"]) == 2
+    assert not (root / "F_FT.json").exists()
+
+
+@pytest.mark.parametrize("bad", ["1.5", "-0.1", "nan", "inf"])
+def test_theta_outside_zero_one_is_refused(cc, bad):
+    root = _e2e_root()
+    assert cc.main(["freeze", "--out", str(root / "F_BAD.json"), "--commit", "abc1234", "--fold", "1",
+                    "--clauses", "split", "--config", str(root / "config.json"), "--theta", bad]) == 2
+    assert not (root / "F_BAD.json").exists()
+
+
+def test_split_manifest_records_fixed_theta_and_the_gate_column(cc):
+    root = _e2e_root()
+    m = json.loads(_freeze_split(cc, root).read_text())
+    assert m["fixed_theta"] == THETA and m["gate_column"] == "fixed_theta"
+    _r, frozen_man = _freeze_and_study(cc)
+    fm = json.loads(frozen_man.read_text())
+    assert (fm["fixed_theta"], fm["gate_column"]) == (None, None)
+    rc, out = _run_split(cc, root, _freeze_split(cc, root))
+    rep = json.loads((out / "report.json").read_text())
+    assert rep["freeze"]["fixed_theta"] == THETA and rep["freeze"]["gate_column"] == "fixed_theta"
+
+
+def test_run_split_refuses_a_theta_that_differs_from_the_manifest_before_any_label_is_read(cc, monkeypatch):
+    root = _e2e_root()
+    man = _freeze_split(cc, root)                                  # frozen at 0.46
+    calls = _record_label_readers(cc, monkeypatch)
+    rc, out = _run_split(cc, root, man, theta=0.5)
+    assert rc == 2 and not out.exists()
+    assert calls == []
+    # positive control: the same freeze with the matching theta does read the labels
+    rc, out = _run_split(cc, root, man, theta=THETA, out_name="ok_theta")
+    assert rc == 0 and calls.count("load_study") == 1
+
+
+def test_run_split_refuses_a_manifest_whose_fixed_theta_was_edited(cc, monkeypatch):
+    root = _e2e_root()
+    man = _freeze_split(cc, root)
+    m = json.loads(man.read_text())
+    m["fixed_theta"] = 0.5                                          # the manifest was edited, not the command
+    bad = root / "BAD_THETA.json"
+    bad.write_text(json.dumps(m))
+    calls = _record_label_readers(cc, monkeypatch)
+    rc, out = _run_split(cc, root, bad)
+    assert rc == 2 and not out.exists() and calls == []
+
+
+def test_fold_2_split_freeze_flags_a_changed_fixed_theta(cc):
+    root = _e2e_root()
+    man1 = _freeze_split(cc, root)
+    rc, out1 = _run_split(cc, root, man1, out_name="f1t")
+    assert rc == 0
+    man2 = _freeze_split(cc, root, fold=2, prior=out1 / "report.json", theta=0.5)
+    m2 = json.loads(man2.read_text())
+    assert m2["code_changed_since_fold1"] is True and m2["changed_fields_since_fold1"] == ["fixed_theta"]
+    rc, out2 = _run_split(cc, root, man2, out_name="f2t", fold=2, theta=0.5)
+    assert rc == 0
+    assert json.loads((out2 / "report.json").read_text())["changed_fields_since_fold1"] == ["fixed_theta"]
+
+
+# ---- round 2: tie, coverage and exclusion-through-a-tie reporting
+def _hand_sheet(cc, name, items):
+    """items: {item number: (node id, [(clause, labelA, labelB)])} -> a sheet shaped like load_study's."""
+    recs = []
+    for n, (_iid, cls) in items.items():
+        recs += [cc.make_record(n, k, "a quote", c, a, b) for k, (c, a, b) in enumerate(cls, 1)]
+    return {"name": name, "records": recs, "ids": {n: iid for n, (iid, _c) in items.items()}}
+
+
+def test_a_stated_stated_tie_counts_in_both_tie_numbers_and_a_not_stated_tie_only_in_total(cc):
+    both = _hand_sheet(cc, "sx", {
+        1: ("n1", [("alpha bravo delta", "CARRIED", "CARRIED"), ("gamma kilo lima", "CARRIED", "CARRIED")]),
+        2: ("n2", [("mike november oscar", "CARRIED", "CARRIED"), ("papa quebec romeo", "NOT", "NOT")])})
+    _evs, stats = cc.split_sheets([both], {"sx": {"n1": "alpha gamma", "n2": "mike papa"}})
+    assert stats["sx"]["ties_total"] == 2 and stats["sx"]["ties_stated_stated"] == 1
+    only_mixed = _hand_sheet(cc, "sy", {2: ("n2", [("mike november oscar", "CARRIED", "CARRIED"),
+                                                   ("papa quebec romeo", "NOT", "NOT")])})
+    _evs, st2 = cc.split_sheets([only_mixed], {"sy": {"n2": "mike papa"}})
+    assert st2["sy"]["ties_total"] == 1 and st2["sy"]["ties_stated_stated"] == 0
+    only_ss = _hand_sheet(cc, "sz", {1: ("n1", [("alpha bravo delta", "CARRIED", "CARRIED"),
+                                                ("gamma kilo lima", "CARRIED", "CARRIED")])})
+    _evs, st3 = cc.split_sheets([only_ss], {"sz": {"n1": "alpha gamma"}})
+    assert st3["sz"]["ties_total"] == 1 and st3["sz"]["ties_stated_stated"] == 1
+
+
+def test_a_tie_where_the_judges_disagree_is_not_a_stated_stated_tie(cc):
+    # consensus BAND (one judge NOT) is not STATED: the rule did not move a STATED consensus label away
+    sheet = _hand_sheet(cc, "sx", {1: ("n1", [("alpha bravo delta", "CARRIED", "CARRIED"),
+                                              ("gamma kilo lima", "CARRIED", "NOT")])})
+    _evs, stats = cc.split_sheets([sheet], {"sx": {"n1": "alpha gamma"}})
+    assert stats["sx"]["ties_total"] == 1 and stats["sx"]["ties_stated_stated"] == 0
+
+
+def test_coverage_counts_frozen_clauses_no_split_clause_maps_to_and_empty_splits(cc):
+    sheet = _hand_sheet(cc, "sx", {
+        1: ("n1", [("alpha bravo delta", "CARRIED", "CARRIED"), ("gamma kilo lima", "NOT", "NOT")]),
+        2: ("n2", [("mike november oscar", "CARRIED", "CARRIED")]),
+        3: ("n3", [("papa quebec romeo", "NOT", "NOT"), ("sierra tango uniform", "NOT", "NOT")])})
+    # item 1: one split clause covers clause 1 only (clause 2 is never chosen); item 2 maps; item 3 splits to nothing
+    claims = {"sx": {"n1": "alpha bravo", "n2": "mike november", "n3": "."}}
+    assert cc.split_claim(".") == []
+    _evs, stats = cc.split_sheets([sheet], claims)
+    st = stats["sx"]
+    assert st["frozen_clauses"] == 5
+    assert st["frozen_unmapped"] == 3          # item 1 clause 2, item 3 clauses 1 and 2
+    assert st["items_empty_split"] == 1
+    assert st["split_clauses"] == 2 and st["mapped"] == 2
+
+
+def test_a_frozen_clause_chosen_only_through_a_tie_is_not_unmapped(cc):
+    sheet = _hand_sheet(cc, "sx", {1: ("n1", [("alpha bravo delta", "CARRIED", "CARRIED"),
+                                              ("gamma kilo lima", "NOT", "NOT")])})
+    _evs, stats = cc.split_sheets([sheet], {"sx": {"n1": "alpha gamma"}})
+    assert stats["sx"]["frozen_unmapped"] == 0
+
+
+def test_run_split_report_md_shows_ties_and_coverage_beside_the_mapping_rate(cc):
+    root = _e2e_root()
+    rc, out = _run_split(cc, root, _freeze_split(cc, root))
+    md = (out / "report.md").read_text()
+    line = next(ln for ln in md.splitlines() if ln.startswith("- sheet_two: split clauses"))
+    for part in ("ties total 2", "STATED-STATED ties 0", "frozen clauses never mapped to 2 of 6",
+                 "items with an empty split 0"):
+        assert part in line
+
+
+def test_exclusion_removes_a_split_clause_tied_to_an_excluded_clause_that_is_not_the_lowest(cc):
+    frozen = _frozen_recs(cc, [("alpha bravo delta", "CARRIED", "CARRIED"), ("gamma kilo lima", "CARRIED", "CARRIED")])
+    mapped, _none = cc.map_split_clauses(1, "q", ["alpha gamma"], frozen)
+    assert mapped[0]["mapped_ks"] == [1, 2] and mapped[0]["k"] == 1       # tied; the lowest is clause 1
+    sheet = {"name": "sx", "records": mapped}
+    kept, rows = cc.apply_exclusions_mapped(sheet, [{"sheet": "sx", "item": 1, "clauses": [2]}])
+    assert kept == [] and rows[0]["removed"] == 1                         # clause 2 is excluded, not the lowest
+    kept1, _ = cc.apply_exclusions_mapped(sheet, [{"sheet": "sx", "item": 1, "clauses": [1]}])
+    assert kept1 == []                                                     # and the lowest too
+    kept3, _ = cc.apply_exclusions_mapped(sheet, [{"sheet": "sx", "item": 1, "clauses": [3]}])
+    assert len(kept3) == 1                                                 # an unrelated clause removes nothing
+
+
+# ---- frozen mode is unchanged
+# Computed from the tool as merged in #4204 (2e5ff406) on the same synthetic fixture, before this change:
+# sha256 of json.dumps(report["folds"], sort_keys=True), and of the report.md text before "## Inputs"
+# without its "engram-alpha commit:" line (the commit, freeze hash and seat model are not fold content).
+GOLDEN_FROZEN_FOLDS_SHA = "ce0c1e6c7d4971719da183ba32aedcbddf8b45c0c18ed31966ec1d21f88e94f7"
+GOLDEN_FROZEN_MD_SHA = "2209a9eb47ddea7ae7fd4e5310053b5b0ad61a4ebea40c52e4c41636701bba78"
+GOLDEN_FROZEN_REPORT_KEYS = ['ci_method', 'columns', 'embedding_model', 'engram_alpha_commit', 'fold', 'folds', 'freeze',
+                             'freeze_sha256', 'inputs', 'mask_counts', 'note', 'report_version', 'resamples', 'seed',
+                             'sheet_order', 'tool_version']
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_frozen_mode_output_is_byte_identical_to_dev(cc, explicit):
+    root = _write_study([SHEET_ONE, SHEET_TWO])
+    _r, man = _freeze_and_study(cc, root=root)
+    if explicit:
+        rc, out = _run_split(cc, root, man, clauses="frozen")
+    else:
+        rc, out = _run(cc, root, man)
+    assert rc == 0
+    rep = json.loads((out / "report.json").read_text())
+    assert sorted(rep) == GOLDEN_FROZEN_REPORT_KEYS
+    assert hashlib.sha256(json.dumps(rep["folds"], sort_keys=True).encode()).hexdigest() == GOLDEN_FROZEN_FOLDS_SHA
+    md = (out / "report.md").read_text()
+    lines = [ln for ln in md.split("## Inputs")[0].splitlines() if not ln.startswith("engram-alpha commit:")]
+    assert hashlib.sha256("\n".join(lines).encode()).hexdigest() == GOLDEN_FROZEN_MD_SHA
+
+
+# ---- advise
+def test_advise_splits_the_claim_when_no_clauses_are_given(cc):
+    quote = "Quillon merged the branch after review"
+    claim = "Quillon merged the branch. Marrowby reviewed it"
+    out = cc.advise(quote, theta=1.0, claim=claim)
+    assert out["of"] == 2
+    assert [c["text"] for c in out["clauses"]] == ["Marrowby reviewed it"]
+    assert out["clauses"][0]["n"] == 2
+    assert cc.advise(quote, None, 1.0, claim) == out
+    given = cc.advise(quote, ["Quillon merged the branch"], 1.0, claim)       # explicit clauses win
+    assert given["of"] == 1 and given["not_stated"] == 0
+
+
+def test_advise_needs_clauses_or_a_claim(cc):
+    with pytest.raises(ValueError):
+        cc.advise("a quote", theta=1.0)
+    with pytest.raises(ValueError):
+        cc.advise("a quote", ["a clause"])        # theta has no silent default
+
+
+# =========================================================================== round 4 (#4216 colleague findings)
+# Finding 1: jaccard of two EMPTY stem sets is 0.0, so a stopword-only split clause maps to NONE.
+# Finding 2: split_claim is bounded (SPLIT_MAX_CHARS, reported as claims_over_cap), rule (c) is iterative,
+# rule (b) is linear, and below the cap the output is exactly what it was.
+
+def test_jaccard_of_two_empty_stem_sets_is_zero_not_one(cc):
+    assert cc.jaccard(set(), set()) == 0.0
+    assert cc.jaccard({"alpha"}, set()) == 0.0 and cc.jaccard(set(), {"alpha"}) == 0.0
+    assert cc.jaccard({"alpha", "bravo"}, {"alpha", "delta"}) == pytest.approx(1 / 3)
+    assert cc.jaccard({"alpha"}, {"alpha"}) == 1.0
+
+
+def test_a_stopword_only_split_clause_maps_to_none_even_beside_a_stopword_only_frozen_clause(cc):
+    # both clause texts are all stopwords, so both stem sets are empty: no evidence of overlap, so NONE,
+    # never a label inherited from the frozen clause that happens to be empty too
+    assert cc._stem_set("that were this") == set() == cc._stem_set("the was and")
+    frozen = _frozen_recs(cc, [("the was and", "CARRIED", "CARRIED"), ("alpha bravo delta", "NOT", "NOT")])
+    mapped, none = cc.map_split_clauses(1, "q", ["that were this"], frozen)
+    assert mapped == [] and none == 1
+
+
+def test_a_stopword_only_claim_is_counted_as_none_in_the_mapping_stats_and_leaves_no_record(cc):
+    sheet = _hand_sheet(cc, "sx", {1: ("n1", [("the was and", "CARRIED", "CARRIED"),
+                                              ("alpha bravo delta", "NOT", "NOT")])})
+    assert cc.split_claim("that were this") == ["that were this"]
+    evs, stats = cc.split_sheets([sheet], {"sx": {"n1": "that were this"}})
+    st = stats["sx"]
+    assert (st["split_clauses"], st["mapped"], st["none"], st["mapping_rate"]) == (1, 0, 1, 0.0)
+    assert evs[0]["records"] == []
+    assert st["frozen_unmapped"] == 2
+
+
+# ---- the input cap
+def test_split_max_chars_is_a_documented_constant(cc):
+    assert cc.SPLIT_MAX_CHARS == 20000
+    assert "SPLIT_MAX_CHARS" in cc.split_claim.__doc__
+
+
+def test_a_claim_over_the_cap_is_not_split_and_one_at_the_cap_is(cc):
+    unit = "The suite ran. "
+    at_cap = (unit * (cc.SPLIT_MAX_CHARS // len(unit) + 1))[:cc.SPLIT_MAX_CHARS]
+    assert len(at_cap) == cc.SPLIT_MAX_CHARS
+    assert len(cc.split_claim(at_cap)) > 1                                  # at the cap: split as ever
+    over = at_cap + "x"
+    assert len(over) == cc.SPLIT_MAX_CHARS + 1
+    assert cc.split_claim(over) == [over.strip(cc.SPLIT_STRIP)]              # over it: one piece, rule (d) only
+
+
+def test_an_over_cap_claim_is_still_stripped_and_a_blank_one_is_empty(cc, monkeypatch):
+    monkeypatch.setattr(cc, "SPLIT_MAX_CHARS", 20)
+    assert cc.split_claim("  The suite ran. The build passed. ") == ["The suite ran. The build passed"]
+    assert cc.split_claim(" " * 30) == []
+
+
+def test_over_the_cap_is_counted_in_the_mapping_stats(cc, monkeypatch):
+    monkeypatch.setattr(cc, "SPLIT_MAX_CHARS", 30)
+    root = _e2e_root()
+    want = {"sheet_one": sum(len(c) > 30 for c in E2E_CLAIMS_ONE.values()),
+            "sheet_two": sum(len(c) > 30 for c in E2E_CLAIMS_TWO.values())}
+    assert want["sheet_one"] > 0 and want["sheet_two"] > 0
+    man = _freeze_split(cc, root)
+    rc, out = _run_split(cc, root, man)
+    assert rc == 0
+    rep = json.loads((out / "report.json").read_text())
+    got = {n: st["claims_over_cap"] for n, st in rep["end_to_end"]["mapping"].items()}
+    assert got == want
+    md = (out / "report.md").read_text()
+    line = next(ln for ln in md.splitlines() if ln.startswith("- sheet_two: split clauses"))
+    assert f"claims over the split cap {want['sheet_two']}" in line
+
+
+def test_the_study_shaped_fixture_has_no_claim_over_the_cap(cc):
+    root = _e2e_root()
+    rc, out = _run_split(cc, root, _freeze_split(cc, root))
+    rep = json.loads((out / "report.json").read_text())
+    assert [st["claims_over_cap"] for st in rep["end_to_end"]["mapping"].values()] == [0, 0]
+
+
+def test_split_eval_reports_claims_over_cap_per_sheet_and_pooled(cc, monkeypatch):
+    monkeypatch.setattr(cc, "SPLIT_MAX_CHARS", 15)
+    root, kinds = _se_study()
+    rc, out = _split_eval(cc, root, {"sheet_one": 0.0, "sheet_two": 0.0})
+    assert rc == 0
+    rep = json.loads((out / "report-split.json").read_text())
+    want = [sum(len(_SE_KINDS[k][0]) > 15 for k in ks) for ks in kinds]
+    assert min(want) > 0
+    assert [rep["sheets"]["sheet_one"]["claims_over_cap"], rep["sheets"]["sheet_two"]["claims_over_cap"]] == want
+    assert rep["pooled"]["claims_over_cap"] == sum(want)
+    assert "claims over the split cap" in (out / "report-split.md").read_text()
+
+
+def test_split_eval_reports_zero_over_cap_on_the_ordinary_fixture(cc):
+    root, _kinds = _se_study()
+    rc, out = _split_eval(cc, root, {"sheet_one": 0.0, "sheet_two": 0.0})
+    rep = json.loads((out / "report-split.json").read_text())
+    assert rep["sheets"]["sheet_one"]["claims_over_cap"] == 0 == rep["pooled"]["claims_over_cap"]
+
+
+# ---- robustness: no recursion, no quadratic blow-up (the cap is lifted so the loops themselves are tested)
+def test_a_chain_of_a_thousand_qualifiers_returns_without_recursion_error(cc, monkeypatch):
+    monkeypatch.setattr(cc, "SPLIT_MAX_CHARS", 10 ** 7, raising=False)    # raising=False: red for the right reason
+    claim = "Quillon merged the hotfix branch" + " after alpha bravo delta" * 1000
+    pieces = cc.split_claim(claim)                       # RecursionError before the rule became iterative
+    assert len(pieces) == 1001
+    assert pieces[0] == "Quillon merged the hotfix branch"
+    assert set(pieces[1:]) == {"after alpha bravo delta"}
+
+
+def test_thirty_thousand_verbless_and_characters_split_in_well_under_a_second(cc, monkeypatch):
+    import time
+    monkeypatch.setattr(cc, "SPLIT_MAX_CHARS", 10 ** 7, raising=False)
+    claim = "cache and " * 3000                          # 30,000 chars, no verb-like word and no hard token
+    t0 = time.perf_counter()
+    pieces = cc.split_claim(claim)
+    took = time.perf_counter() - t0
+    assert len(claim) == 30000 and len(pieces) == 1      # nothing can stand as a clause, so no cut
+    assert took < 1.0, f"took {took:.2f}s"               # ~5 s before; a generous bound (it runs in ~0.1 s)
+
+
+# ---- the output under the cap is exactly what it was: an independent copy of the round-3 splitter (B1)
+def _ref_in_spans(pos, spans):
+    return any(a <= pos < b for a, b in spans)
+
+
+def _ref_split_claim(cc, text):
+    """The splitter as it stood at 40ecb3fb (recursive rule (c), left side rescanned in rule (b)), copied
+    here so the cell compares today's code with it. Uses only unchanged helpers from the tool."""
+    spans_of = lambda t: [(m.start(), m.end()) for m in re.finditer(r"`[^`]*`", t)]
+
+    def ends_abbr(t, dot):
+        head = t[: dot + 1].lower()
+        for ab in cc.SPLIT_ABBREVIATIONS:
+            if head.endswith(ab):
+                before = head[: len(head) - len(ab)]
+                if not before or not before[-1].isalnum():
+                    return True
+        return False
+
+    def sentences(t):
+        spans, pieces, start = spans_of(t), [], 0
+        for m in cc.SPLIT_BREAK_RE.finditer(t):
+            i = m.start()
+            if _ref_in_spans(i, spans) or (t[i] == "." and ends_abbr(t, i)):
+                continue
+            pieces.append(t[start:i])
+            start = m.end()
+        pieces.append(t[start:])
+        return pieces
+
+    def like(side):
+        for w in cc._WORD_RE.findall(cc.normalize(side)):
+            if w in cc.SPLIT_VERB_FORMS or cc.stem(w) in cc._SPLIT_VERB_STEMS:
+                return True
+        return bool(cc._hard_tokens_with_class(side))
+
+    def coordination(sentence):
+        spans = spans_of(sentence)
+        cuts = [(m.start(), m.end()) for m in cc.SPLIT_COORD_RE.finditer(sentence)
+                if not _ref_in_spans(m.start(), spans)]
+        pieces, piece_start = [], 0
+        for idx, (a, b) in enumerate(cuts):
+            right_end = cuts[idx + 1][0] if idx + 1 < len(cuts) else len(sentence)
+            if like(sentence[piece_start:a]) and like(sentence[b:right_end]):
+                pieces.append(sentence[piece_start:a])
+                piece_start = b
+        pieces.append(sentence[piece_start:])
+        return pieces
+
+    def n_stems(t):
+        return len(cc._content_stems(cc.normalize(t)))
+
+    def qualifiers(piece):
+        spans = spans_of(piece)
+        at = sorted(m.start() for intro in cc.SPLIT_QUALIFIERS
+                    for m in re.finditer(re.escape(intro), piece) if not _ref_in_spans(m.start(), spans))
+        for pos in at:
+            left, right = piece[:pos], piece[pos + 1:]
+            if n_stems(left) >= cc.SPLIT_MIN_STEMS and n_stems(right) >= cc.SPLIT_MIN_STEMS:
+                return [left] + qualifiers(right)
+        return [piece]
+
+    out = []
+    for sentence in sentences(text or ""):
+        for piece in coordination(sentence):
+            out.extend(qualifiers(piece))
+    return [p for p in (x.strip(cc.SPLIT_STRIP) for x in out) if p]
+
+
+# every input the splitter cells above feed it, plus the claims of the e2e and split-eval fixtures
+_PIN_FIXED = [
+    "The suite ran. The build passed.", "Did the suite run? The build passed!",
+    "Quillon merged the branch; Marrowby approved it", "the rate was 3.5 percent in the run",
+    "The run took 3.5 hours. It passed.", "reviewers (e.g. Quillon) approved it",
+    "it holds, i.e. the cache is warm", "the cache vs. the queue was slower",
+    "see cf. the earlier note for details", "`a. b; c` was logged", "the line `x. y` ran. Then it stopped.",
+    "Quillon merged the branch as hotfix and Marrowby approved it", "the suite passed, and the build failed",
+    "the suite passed but the build failed", "build 4812 and ticket #123",
+    "the queue and the cache were drained", "tests ran against build 4812 and docs", "bread and butter",
+    "the line `x was set and y was read` ran", "Quillon ran the suite and the cache and Marrowby approved it",
+    "Quillon merged the hotfix branch after reviewers finished careful inspection",
+    "Quillon merged the hotfix branch because reviewers finished careful inspection",
+    "Quillon merged the hotfix branch so that reviewers finished careful inspection",
+    "Quillon merged the hotfix branch which reviewers finished careful inspection",
+    "Quillon merged the hotfix branch after review", "merged after reviewers finished careful inspection",
+    "  ...The suite ran,  ", "The suite ran.; ; The build passed.", "", "...", ".", "   ",
+    "Quillon merged the hotfix branch after reviewers finished careful inspection. Marrowby approved it",
+    "approx. three hosts ran it, and e.g. two of them passed", "x and y", "a, and b, but c",
+    *E2E_CLAIMS_ONE.values(), *E2E_CLAIMS_TWO.values(), *(c for c, _f in _SE_KINDS.values()),
+    "`unclosed code span and the suite ran",
+    "the suite ran `a and b` and the build passed after Marrowby reviewed the change",
+    "Alpha ran and Bravo ran and Charlie ran after Delta finished the careful audit because Echo asked",
+]
+
+_PIN_WORDS = ("Quillon Marrowby the hotfix branch suite build cache queue reviewers inspection careful change "
+              "merged approved ran passed failed drained cleared landed reported was were is has bread butter "
+              "alpha bravo delta zebra yak 4812 #123 2026-10-02 " + NODE_SHAPED + " `code and span` `x. y` e.g. i.e. vs. 3.5 "
+              "and and but after because which").split()
+_PIN_MARKS = (" ", " ", " ", " ", ", ", ", and ", " and ", " but ", ". ", "; ", "! ", "? ", " after ",
+              " because ", " so that ", " which ", ",", "\n")
+
+
+def _generated_claims(n=240, seed=4216):
+    import random
+    rng = random.Random(seed)
+    out = []
+    for _ in range(n):
+        parts = []
+        for _w in range(rng.randint(1, 60)):
+            parts.append(rng.choice(_PIN_WORDS))
+            parts.append(rng.choice(_PIN_MARKS))
+        out.append("".join(parts))
+    return out
+
+
+def test_split_claim_output_under_the_cap_is_identical_to_the_round_3_splitter(cc):
+    corpus = _PIN_FIXED + _generated_claims()
+    assert len(corpus) >= 260 and all(len(t) <= cc.SPLIT_MAX_CHARS for t in corpus)
+    assert any(len(cc.split_claim(t)) > 2 for t in corpus)      # the corpus does exercise the rules
+    for text in corpus:
+        assert cc.split_claim(text) == _ref_split_claim(cc, text), text
+
+
+def test_the_pin_catches_a_wrong_rule_b(cc, monkeypatch):
+    # control: a splitter that kept only the sentence-level cut would differ from the reference on this corpus
+    monkeypatch.setattr(cc, "_split_coordination", lambda sentence: [sentence])
+    assert any(cc.split_claim(t) != _ref_split_claim(cc, t) for t in _PIN_FIXED)
