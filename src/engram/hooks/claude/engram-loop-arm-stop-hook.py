@@ -125,6 +125,41 @@ unchanged; `_NUDGE_TEXT` carries a pointer to the batched shape so an
 agent nudged mid-conversation doesn't swallow its next reply. Measured
 on 2.1.235, not asserted universal.
 
+alpha #4193 -- the reply gate (#4104) also consults the Stop payload's
+`last_assistant_message`. The hook can fire before the final assistant record is
+flushed, so a turn that really ended on rendered text can show a delta ending on an
+earlier tool_use, and the transcript-only gate false-blocks (forcing a duplicate reply).
+FIELD SEMANTICS ARE UNVERIFIED: no payload was measured for a swallowed reply (text then
+a trailing tool_use in one message). It may be the concatenation of all the final
+message's text blocks (R-flat) or only its final text block (R-final); either way it can
+be non-empty on a swallowed turn, so "non-empty means rendered" is NOT the rule. The
+contract holds under both readings. Let P = the payload field when it is a str with
+non-whitespace content, else None; compare whitespace-normalised:
+  1. P present and NOT found in the delta's assistant text -> the text is not flushed
+     yet -> treat the reply as rendered (no reply-gate block).
+  2. P present and found there (normalised P is a substring of the joined text blocks of
+     the final message, OR that message's last text block is a suffix of P, OR P is a
+     substring of the joined assistant text of the whole turn since the human prompt) while the transcript still says the turn does not end on text -> STILL
+     block (swallowed reply).
+  3. P absent / non-str / empty / whitespace -> exactly the transcript-only path.
+The override is consulted only when the transcript path already says `has_human and not
+reply_rendered`, so it can only turn a block into no-block. "Found" looks only at the FINAL
+MESSAGE: the assistant records after the last human prompt whose message.id equals the
+last assistant record's id. Identity, not adjacency: with parallel tool calls one API
+message is written one block per record with tool_results between them (measured in a
+real transcript), so a swallowed reply's text can sit before several tool_results. Text
+of an earlier message (a different id) does not count. A last record with no usable id
+falls back to its adjacent run of assistant records. The reverse clause is a suffix test, not a substring test, so a short earlier
+preamble ("Ok") cannot make a longer payload ("Ok, here is the answer") look found.
+Text equal to the payload (e.g. "Done." then a tool call, payload "Done.") is
+indistinguishable from a swallowed reply and keeps the block; so is a P equal to text
+already flushed earlier in the turn. That covers a SECOND unverified reading of the field:
+the last text produced in the turn (not the final message's text), which on a swallowed
+reply followed by a tool-only message would otherwise look like flush lag. A real flush-lag
+reply is unflushed, so it appears nowhere in the delta and still gets the override. Each such gate decision appends one line to
+`$ENGRAM_HOME/loop-arm-reply-gate.log` (no payload text, bounded, fail-silent) so the
+real field semantics can be read off live traffic.
+
 Fire condition -- for Claude, emit the normal nudge iff ALL of:
   (a) `~/.engram/loop-mode.json` (under $ENGRAM_HOME) exists (never nag a non-loop session), AND
   (b) its `pacer` field identifies a `scheduleWakeup`-paced loop (see
@@ -1284,6 +1319,118 @@ def _delta_reply_state(delta_bytes: bytes) -> tuple[bool, bool]:
     return (True, _reply_rendered(records, idx))
 
 
+def _norm_ws(s: str) -> str:
+    return " ".join(s.split())
+
+
+def _payload_gate_facts(delta_bytes: bytes, payload_norm: str | None) -> tuple[bool, bool] | None:
+    """(payload_found_in_delta, delta_ends_on_tool_use) for the #4193 override, or
+    None when the delta cannot be read (the caller then keeps the block). Only the
+    FINAL MESSAGE counts (identified by message.id, see below); text of an earlier
+    message, before an intervening tool_result, is not the final message."""
+    records = _strict_records(delta_bytes)
+    if records is None:
+        return None
+    idx = _human_prompt_index(records)
+    if idx is None:
+        return None
+    # The final message = the assistant records after the prompt that share the LAST
+    # assistant record's message.id, wherever non-assistant records (tool_results of
+    # parallel calls) sit between them. No usable id: that record's adjacent run.
+    last = None
+    for i in range(len(records) - 1, idx, -1):
+        if records[i].get("type") == "assistant":
+            last = i
+            break
+    chosen = []
+    if last is not None:
+        msg = records[last].get("message")
+        mid = msg.get("id") if isinstance(msg, dict) else None
+        if isinstance(mid, str) and mid:
+            for rec in records[idx + 1:last + 1]:
+                m = rec.get("message")
+                if rec.get("type") == "assistant" and isinstance(m, dict) and m.get("id") == mid:
+                    chosen.append(rec)
+        else:
+            start = last
+            while start > idx + 1 and records[start - 1].get("type") == "assistant":
+                start -= 1
+            chosen = records[start:last + 1]
+    texts = []
+    last_type = None
+    for rec in chosen:
+        message = rec.get("message")
+        content = message.get("content", []) if isinstance(message, dict) else []
+        if not isinstance(content, list):
+            continue
+        for block in _walk_content_blocks(content):
+            last_type = block.get("type")
+            body = block.get("text")
+            if last_type == "text" and isinstance(body, str) and body.strip():
+                texts.append(_norm_ws(body))
+    # Feeds only the log line, never the decision.
+    ends_on_tool = last_type == "tool_use"
+    found = bool(payload_norm and texts
+                 and (payload_norm in _norm_ws(" ".join(texts)) or payload_norm.endswith(texts[-1])))
+    # Also found when P is text ALREADY flushed anywhere in this turn: an unflushed final
+    # reply appears nowhere in the delta, so such a P cannot be it (a "last text produced in
+    # the turn" reading of the field must not silence a swallowed reply).
+    if payload_norm and not found:
+        turn_texts = []
+        for rec in records[idx + 1:]:
+            m = rec.get("message")
+            c = m.get("content", []) if rec.get("type") == "assistant" and isinstance(m, dict) else []
+            if isinstance(c, list):
+                turn_texts.extend(_norm_ws(b["text"]) for b in _walk_content_blocks(c)
+                                  if b.get("type") == "text" and isinstance(b.get("text"), str)
+                                  and b["text"].strip())
+        found = payload_norm in _norm_ws(" ".join(turn_texts))
+    return (found, ends_on_tool)
+
+
+_REPLY_GATE_LOG = os.path.join(ENGRAM_HOME, "loop-arm-reply-gate.log")
+_REPLY_GATE_LOG_MAX_BYTES = 64 * 1024
+_REPLY_GATE_LOG_KEEP_LINES = 200
+
+
+def _reply_gate_fd(flags: int) -> int:
+    """A non-blocking fd on the log that must be a regular file (never hangs on a FIFO)."""
+    fd = os.open(_REPLY_GATE_LOG, flags | os.O_NONBLOCK, 0o666)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError("not a regular file: %s" % (_REPLY_GATE_LOG,))
+    return fd
+
+
+def _log_reply_gate(session_id: str, payload_len: int | None, facts: tuple[bool, bool] | None,
+                    decision: str) -> None:
+    """alpha #4193: one diagnostic line per reply-gate decision. Never logs payload
+    text; fail-silent (a logging error must never change the decision)."""
+    try:
+        found, ends_on_tool = facts if facts is not None else (False, False)
+        line = "%s session=%s payload_len=%s found=%s ends_tool_use=%s decision=%s\n" % (
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            re.sub(r"\s+", "_", session_id)[:80],
+            "absent" if payload_len is None else payload_len,
+            "y" if found else "n", "y" if ends_on_tool else "n", decision)
+        data = line.encode("utf-8")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        try:
+            if os.path.getsize(_REPLY_GATE_LOG) > _REPLY_GATE_LOG_MAX_BYTES:
+                fd = _reply_gate_fd(os.O_RDONLY)
+                with os.fdopen(fd, "rb") as f:
+                    kept = f.read().splitlines(keepends=True)[-_REPLY_GATE_LOG_KEEP_LINES:]
+                data = b"".join(kept) + data
+                flags = os.O_WRONLY | os.O_TRUNC
+        except OSError:
+            pass
+        fd = _reply_gate_fd(flags)
+        with os.fdopen(fd, "ab" if flags & os.O_APPEND else "wb") as f:
+            f.write(data)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _parse_iso_utc(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -1546,6 +1693,7 @@ def main() -> None:
 
     session_id = "unknown"
     transcript_path = ""
+    payload_text = None
     try:
         raw = sys.stdin.read()
         if raw:
@@ -1565,6 +1713,10 @@ def main() -> None:
             tp = payload.get("transcript_path")
             if isinstance(tp, str) and tp:
                 transcript_path = tp
+            # alpha #4193: usable only when a str with non-whitespace content.
+            lam = payload.get("last_assistant_message")
+            if isinstance(lam, str) and lam.strip():
+                payload_text = lam
     except Exception:
         return
 
@@ -1605,12 +1757,31 @@ def main() -> None:
     # A human prompt whose turn does not END on assistant text means the reply
     # was swallowed (e.g. a trailing arm): block, ahead of the arm check.
     has_human = reply_rendered = False
+    _delta = None
     try:
         _delta = _read_turn_delta(transcript_path)
         if _delta is not None:
             has_human, reply_rendered = _delta_reply_state(_delta)
     except Exception:  # noqa: BLE001
         has_human = reply_rendered = False
+
+    # alpha #4193: the transcript can lag the final record (flush lag). A payload
+    # `last_assistant_message` that is NOT in the delta means the text is not flushed
+    # yet: treat the reply as rendered. Found in the delta (swallowed) keeps the block.
+    if has_human and not reply_rendered:
+        _facts = None
+        _norm = _norm_ws(payload_text) if payload_text is not None else None
+        # _facts None is believed unreachable while has_human is true (_delta_reply_state parses
+        # the same bytes); kept as fail-keep-the-block.
+        try:
+            _facts = _payload_gate_facts(_delta, _norm) if _delta is not None else None
+        except Exception:  # noqa: BLE001
+            _facts = None
+        _override = _norm is not None and _facts is not None and not _facts[0]
+        _log_reply_gate(session_id, None if payload_text is None else len(payload_text), _facts,
+                        "override-rendered" if _override else "block")
+        if _override:
+            reply_rendered = True
 
     if has_human and not reply_rendered:
         _quiet_wake_step(transcript_path, can_nudge=False)  # keep the counter honest
