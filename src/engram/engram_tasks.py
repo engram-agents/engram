@@ -457,6 +457,10 @@ def _update_task_impl(
         new_status: One of: "planned", "active", "done", "blocked".
         note: Optional note about the status change (stored in metadata).
 
+    Refuses a task that is not current (retracted or superseded) with
+    `refusal: not_current` up front; the guarded UPDATE also carries
+    `is_current = 1`, so a concurrent supersede refuses as `changed_concurrently`.
+
     Returns:
         JSON with updated task state and new importance values.
     """
@@ -475,6 +479,16 @@ def _update_task_impl(
             return json.dumps({"error": f"Task '{task_id}' not found."})
         if task["type"] != "task":
             return json.dumps({"error": f"'{task_id}' is not a task node (type: {task['type']})."})
+        # #4186: a retracted or superseded task is history, not work to update.
+        # Two separate conditions on purpose: a retracted row has both, a
+        # superseded row only is_current = 0, and a status='retracted' row that
+        # is still is_current = 1 must refuse too.
+        if not task["is_current"] or task["status"] == "retracted":
+            return json.dumps({
+                "error": (f"Task '{task_id}' is not current (retracted or "
+                          f"superseded); nothing was changed."),
+                "refusal": "not_current",
+            })
 
         old_status = task["status"]
         # #3413: this function ALWAYS re-dumps `meta`, so a non-object blob is
@@ -521,11 +535,14 @@ def _update_task_impl(
         # to the RAW column value read, not a re-serialized dict. `status IS ?`
         # mirrors the tool's own state input: old_status feeds status_history
         # and the edit_history transition, so a status change underneath us
-        # makes both wrong. (No is_current clause: this tool never checked it.)
+        # makes both wrong. #4186: `is_current = 1` is in the guard too, so a
+        # supersede that lands after the up-front not_current check (only
+        # is_current flips) refuses as changed_concurrently instead of
+        # writing through to a non-current row.
         _guarded = conn.execute(
             """UPDATE nodes SET status = ?, importance_base = ?,
                importance_score = ?, metadata = ?
-               WHERE id = ? AND status IS ? AND metadata IS ?""",
+               WHERE id = ? AND is_current = 1 AND status IS ? AND metadata IS ?""",
             (new_status, new_base, new_score, json.dumps(meta), task_id,
              old_status, task["metadata"]),
         )
