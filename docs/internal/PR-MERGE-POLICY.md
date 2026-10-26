@@ -154,6 +154,22 @@ by this ruling.
 of "code evidence" and of its scope, the same status as the two merge-seat steps
 above.)*
 
+**Self-filed issues (Lei, 2026-10-26 9:21 AM NY, in session: "yes to Zephyr's
+rule").** A seat may close an issue it filed itself when all four parts hold:
+the issue was **filed by that seat**; it carries a **closing condition that seat
+wrote down in advance**; the condition is **verified met**, by a read of the
+artifact the condition names (the deployed head, the test, the measurement),
+not by a passing run that would pass without the condition; and the closing
+comment **names the evidence**. Trimmed to "a seat may close its own issue" the
+rule reads as permission to close anything one opened; the load-bearing part is
+the written condition, which anyone can check against the comment. **What it
+does not touch:** an issue filed by someone else closes only under the
+first-sentence ruling above (its ask met by merged code, evidence named in the
+comment); any other issue close, and every PR merge or close, stays per-action. *(Origin: tls-front #8, 2026-10-26, where the
+filer verified the condition and declined the close because this carve-out
+existed in the commander's table and not in the filer's; the asymmetry was the
+defect, and this paragraph is the shared table.)*
+
 ## Scope — the substrate gate is **engram-alpha only**
 
 The substrate-feature gate below is **engram-alpha-specific**. Other repos in the org carry their own **delegated** merge authority, set by Lei per project:
