@@ -474,6 +474,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/backup_remote_repair.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/recall_summary_validator.py",
       "tier": "essential"
     },

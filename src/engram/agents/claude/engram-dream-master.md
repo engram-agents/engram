@@ -625,6 +625,8 @@ in `engram-sleep/SKILL.md`).
 
 (Create the directory with `mkdir -p "${ENGRAM_HOME:-$HOME/.engram}"/history/dream` if it doesn't exist.)
 
+**Never rewrite git history inside `$ENGRAM_HOME` (engram-alpha#4205).** Never run `git commit --amend`, `git reset`, or `git rebase` there: the snapshot worker has already committed and pushed the turn-advance commit by the time you finish the record, so an amend leaves the off-disk remote on the old commit and every later push is refused. After `engram_advance_turn`, commit the finalized dream record (placeholders filled) as a NEW commit (`git commit -m "dream <date>: record finalized"`). An installed `reference-transaction` hook refuses a rewrite of a pushed commit.
+
 Format:
 
 ```markdown

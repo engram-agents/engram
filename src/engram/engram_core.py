@@ -2835,6 +2835,202 @@ def _push_head_ensuring_upstream() -> subprocess.CompletedProcess:
     return _git("push", "-u", "origin", "HEAD")
 
 
+# ── Off-disk backup push status (#4205) ────────────────────────────────────
+# The snapshot worker records the outcome of EVERY push attempt here so a refused
+# push (a diverged remote) is readable by the SessionStart hook, engram_checkpoint
+# and engram_diagnose instead of dying in the worker's stderr.
+BACKUP_PUSH_STATUS_NAME = "backup-push-status.json"
+_BACKUP_PUSH_STDERR_CAP = 300
+_BACKUP_PUSH_FLARE_AGE_SECS = 24 * 3600
+
+
+def _classify_push(returncode: int, stderr: str, has_remote: bool) -> str:
+    """-> "ok" | "refused" | "rejected-size" | "error" | "no-remote" for one push attempt.
+
+    rejected-size = the host refused an oversize blob (GH001); only a history
+    edit fixes it, which is never automatic.
+
+    refused = the remote turned the push away because histories diverged
+    (non-fast-forward / [rejected] / fetch first). no-remote = nothing to push
+    to. Anything else non-zero is "error" (network, auth, a remote hook)."""
+    if returncode == 0:
+        return "ok"
+    low = (stderr or "").lower()
+    if "gh001" in low or "exceeds github's file size limit" in low:
+        return "rejected-size"
+    if "non-fast-forward" in low or "[rejected]" in low or "fetch first" in low:
+        return "refused"
+    if not has_remote or "no configured push destination" in low:
+        return "no-remote"
+    return "error"
+
+
+def _ahead_behind() -> tuple:
+    """-> (ahead, behind) vs the upstream, or (None, None) when there is none."""
+    r = _git("rev-list", "--left-right", "--count", "HEAD...@{u}")
+    if r.returncode != 0:
+        return (None, None)
+    try:
+        a, b = r.stdout.split()
+        return (int(a), int(b))
+    except ValueError:
+        return (None, None)
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_backup_push_status(*, result: str, stderr: str, commit_sha, ahead, behind,
+                              rewrite_guard=None) -> None:
+    """Atomically write DATA_DIR/backup-push-status.json (tmp + os.replace, 0600).
+
+    last_success_utc is stamped on "ok" and otherwise carried over from the previous
+    file (null if never / the previous file is unreadable). Never raises: a status
+    write must not fail the snapshot job it reports on."""
+    path = Path(DATA_DIR) / BACKUP_PUSH_STATUS_NAME
+    try:
+        now = _utc_stamp()
+        last_success = None
+        if result == "ok":
+            last_success = now
+        else:
+            try:
+                prev = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(prev, dict) and isinstance(prev.get("last_success_utc"), str):
+                    last_success = prev["last_success_utc"]
+            except (OSError, ValueError):
+                pass
+        if rewrite_guard is None:
+            rewrite_guard = _install_rewrite_guard()
+        doc = {
+            "last_attempt_utc": now,
+            "last_success_utc": last_success,
+            "last_commit_sha": commit_sha,
+            "result": result,
+            "stderr_tail": "" if result == "ok" else (stderr or "").strip()[-_BACKUP_PUSH_STDERR_CAP:],
+            "ahead": ahead,
+            "behind": behind,
+            "rewrite_guard": rewrite_guard,
+        }
+        tmp = path.with_name("." + path.name + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(doc, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001 -- best-effort by contract
+        import sys
+        print(f"[engram] backup push status write failed: {e}", file=sys.stderr)
+
+
+def _backup_push_view():
+    """The status file as the readers want it: None when absent; a dict with
+    result/last_success_utc/last_attempt_utc/ahead/behind otherwise; result
+    "unreadable" (other fields None) when the file is malformed."""
+    path = Path(DATA_DIR) / BACKUP_PUSH_STATUS_NAME
+    if not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError):
+        return {"result": "unreadable", "last_success_utc": None, "last_attempt_utc": None,
+                "ahead": None, "behind": None}
+    return {k: doc.get(k) for k in ("result", "last_success_utc", "last_attempt_utc", "ahead", "behind")}
+
+
+def _backup_push_flare(view) -> bool:
+    """True when the off-disk backup needs a human: result != ok for 24 h or never
+    succeeded, or the remote is ahead of us (behind > 0)."""
+    if not view or view.get("result") in (None, "no-remote"):
+        return False  # no remote is a configuration state, not a failure
+    if view["result"] == "unreadable":
+        return True
+    behind = view.get("behind")
+    if isinstance(behind, int) and behind > 0:
+        return True
+    if view["result"] == "ok":
+        return False
+    last = view.get("last_success_utc")
+    if not last:
+        return True
+    try:
+        ts = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - ts).total_seconds() > _BACKUP_PUSH_FLARE_AGE_SECS
+
+
+# ── History-rewrite guard (#4205) ──────────────────────────────────────────
+# A pushed commit that is later amended/reset/rebased leaves the remote on the old
+# commit, and every later push is refused for good. The reference-transaction hook
+# (git >= 2.28) refuses that rewrite mechanically; rewriting UNPUSHED commits stays free.
+_REWRITE_GUARD_MIN_GIT = (2, 28)
+_REWRITE_GUARD_MARKER = b"# engram: refuse to rewrite a pushed commit (#4205)"
+REWRITE_GUARD_SCRIPT = r"""#!/bin/sh
+# engram: refuse to rewrite a pushed commit (#4205). Managed file: _init_git rewrites it.
+[ "$1" = "prepared" ] || exit 0
+while read -r old new ref; do
+  case "$ref" in refs/heads/*) ;; *) continue ;; esac
+  case "$old" in *[!0]*) ;; *) continue ;; esac
+  case "$new" in *[!0]*) ;; *) continue ;; esac
+  [ "$old" = "$new" ] && continue
+  git merge-base --is-ancestor "$old" "$new" 2>/dev/null && continue
+  [ -n "$(git for-each-ref --count=1 --contains "$old" refs/remotes/origin/ 2>/dev/null)" ] || continue
+  branch=${ref#refs/heads/}
+  if [ "$ENGRAM_ALLOW_HISTORY_REWRITE" = "1" ]; then
+    home=$(cd "$(git rev-parse --git-dir)/.." && pwd)
+    printf '%s %s %s -> %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$branch" "$old" "$new" >> "$home/backup-rewrite.log"
+    continue
+  fi
+  short=$(printf '%s' "$old" | cut -c1-8)
+  echo "engram: refusing to rewrite pushed commit $short on $branch; make a new commit (set ENGRAM_ALLOW_HISTORY_REWRITE=1 for a deliberate repair)" >&2
+  exit 1
+done
+exit 0
+"""
+
+
+def _git_version():
+    """-> (major, minor, patch) of the installed git, or None if unparseable."""
+    r = _git("--version")
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", r.stdout or "") if r.returncode == 0 else None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+def _install_rewrite_guard() -> str:
+    """Idempotently install the reference-transaction hook; -> the status-file
+    rewrite_guard value: "installed" | "unsupported" | "opt-out" | "foreign-hook" (an
+    existing hook without our marker is left alone). Never raises."""
+    try:
+        ver = _git_version()
+        if ver is None or ver[:2] < _REWRITE_GUARD_MIN_GIT:
+            return "unsupported"
+        r = _git("rev-parse", "--git-path", "hooks")
+        if r.returncode != 0 or not r.stdout.strip():
+            return "unsupported"
+        hooks = Path(r.stdout.strip())
+        if not hooks.is_absolute():
+            hooks = Path(DATA_DIR) / hooks
+        hook = hooks / "reference-transaction"
+        want = REWRITE_GUARD_SCRIPT.encode("utf-8")
+        if hook.is_file() and _REWRITE_GUARD_MARKER not in hook.read_bytes():
+            return "foreign-hook"  # someone else's hook: never overwrite it
+        if not (hook.is_file() and hook.read_bytes() == want and os.access(hook, os.X_OK)):
+            hooks.mkdir(parents=True, exist_ok=True)
+            tmp = hook.with_name(hook.name + ".tmp")
+            tmp.write_bytes(want)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, hook)
+        return "opt-out" if os.environ.get("ENGRAM_ALLOW_HISTORY_REWRITE") == "1" else "installed"
+    except Exception as e:  # noqa: BLE001 -- startup must not fail on a guard install
+        import sys
+        print(f"[engram] rewrite guard install failed: {e}", file=sys.stderr)
+        return "unsupported"
+
+
 def _init_git():
     """Initialize git repo. Called once at startup with a generous timeout.
 
@@ -2863,6 +3059,7 @@ def _init_git():
     git_dir = DATA_DIR / ".git"
     if git_dir.exists():
         _git_available = True
+        _install_rewrite_guard()  # #4205: idempotent; heals a missing/edited hook
         return
     # Use a longer timeout for init (first-run can be slow on Windows)
     saved_timeout = GIT_TIMEOUT
@@ -2873,6 +3070,7 @@ def _init_git():
             _git("config", "user.email", "engram@local")
             _git("config", "user.name", "KG Memory")
             _git_available = True
+            _install_rewrite_guard()  # #4205
         else:
             import sys
             print(f"[engram] git init failed, version control disabled: {r.stderr}", file=sys.stderr)
@@ -2901,6 +3099,12 @@ ENGRAM_GITIGNORE_PATTERNS = [
     "claude-projects-archive/",
     "session-logs-archive/",
     "session_log.md",
+    # #4205: key material and dated backup copies must never ride into the off-disk
+    # remote (a tracked secrets/ dir and two 157 MB knowledge.db.bak-<date> blobs
+    # were found on fleet seats).
+    "secrets/",
+    "*api-key*",
+    "*.bak-*",
 ]
 
 

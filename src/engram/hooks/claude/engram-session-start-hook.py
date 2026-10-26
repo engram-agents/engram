@@ -740,6 +740,32 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
         return True, None  # advisory — never block session start
 
 
+def _backup_push_health_line(engram_home: str):
+    """One bounded line when the snapshot worker's last off-disk push was not ok (#4205).
+
+    Reads $ENGRAM_HOME/backup-push-status.json. Missing file or result "ok" -> None
+    (a pre-fix seat is not a false alarm). A malformed file is loud, not fatal."""
+    path = os.path.join(engram_home, "backup-push-status.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+        if not isinstance(st, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError):
+        return "⚠️  ENGRAM off-disk backup: status file unreadable"
+    result = st.get("result")
+    if result in ("ok", "no-remote"):  # no remote is a configuration state, not a failure
+        return None
+    since = st.get("last_success_utc") or "never"
+    tail = " ".join(str(st.get("stderr_tail") or "").split())[-120:]
+    return (
+        f"⚠️  ENGRAM off-disk backup: {str(result)[:20]} since {str(since)[:30]}; "
+        f"ahead {st.get('ahead')} behind {st.get('behind')}; {tail}"
+    )
+
+
 def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
     """Check whether knowledge.sql is reasonably current relative to knowledge.db.
 
@@ -4119,6 +4145,9 @@ def _main_impl() -> None:
             f"ℹ️  ENGRAM substrate health: MCP server up (marker stale "
             f"(PID {_mcp_stale_pid} no longer running); live server found)."
         )
+    _bp_line = _backup_push_health_line(ENGRAM_HOME)  # #4205: one bounded line, same emitter
+    if _bp_line:
+        _health_lines.append(_bp_line)
     _health_text = "\n".join(_health_lines)
 
     if source == "startup":

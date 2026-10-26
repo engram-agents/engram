@@ -3167,6 +3167,16 @@ def engram_checkpoint(payload_json: str) -> str:
         )
     except Exception:
         result_dict["warm_briefing"] = None
+    # Off-disk backup push state (#4205): a refused push must not read as all-clear
+    # next to the "knowledge.db backup" line. Null when the worker never wrote one.
+    try:
+        _bp = core._backup_push_view()
+        result_dict["backup_push"] = (
+            None if _bp is None
+            else {k: _bp[k] for k in ("result", "last_success_utc", "ahead", "behind")}
+        )
+    except Exception:
+        result_dict["backup_push"] = None
     banner = _walguard_degraded_banner()
     if banner:
         result_dict["_walguard_warning"] = banner
@@ -3999,6 +4009,15 @@ def engram_diagnose() -> str:
           pairs that exceeded thresholds in the 7-day window — may be >
           worst_hours_shown if more than 10 buckets are flagged. See
           the cornerstone-evolution derivation/the cornerstone-evolution derivation/the cornerstone-frame-evolution open question for context.
+
+        - backup_push (#4205): ALWAYS present.
+          {result, last_success_utc, last_attempt_utc, ahead, behind, flare}
+          read from $ENGRAM_HOME/backup-push-status.json (written by the snapshot
+          worker after every push to the off-disk remote). result is "ok" |
+          "refused" | "rejected-size" | "error" | "no-remote" | "unreadable", or null when the file
+          does not exist yet. flare is true when result != ok and the last
+          success is older than 24 h (or never), or when behind > 0.
+          Repair a refused remote with tools/backup_remote_repair.py.
 
         - metadata_quarantine (#3425): ALWAYS present, 0 included.
           {entity_kind, count, live_invalid_count, sample_ids, flare}.

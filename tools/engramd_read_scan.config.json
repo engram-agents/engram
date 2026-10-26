@@ -335,6 +335,7 @@
   "hooks/claude/engram-session-start-hook.py:_dead_marker_pid",
   "hooks/claude/engram-session-start-hook.py:_is_any_server_py_running",
   "hooks/claude/engram-session-start-hook.py:_check_mcp_write_tool_marker",
+  "hooks/claude/engram-session-start-hook.py:_backup_push_health_line",
   "hooks/claude/engram-session-start-hook.py:_check_backup_staleness",
   "hooks/claude/engram-session-start-hook.py:_check_embedding_restore_flag",
   "hooks/claude/engram-session-start-hook.py:_viz_supervision_layer",

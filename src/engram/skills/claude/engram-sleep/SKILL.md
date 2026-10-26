@@ -489,6 +489,10 @@ instead.
 `${ENGRAM_HOME:-$HOME/.engram}/` loss takes it). The per-nap git auto-push is the off-disk layer.
 The three layers are complementary along those axes.
 
+**Off-disk push state is not part of "knowledge.db backup".** The snapshot worker records every push to the off-disk remote in `${ENGRAM_HOME:-$HOME/.engram}/backup-push-status.json`; `engram_checkpoint` carries it as `backup_push` and `engram_diagnose` flares it. If it reads anything but `ok`, the off-disk layer is NOT working: do not report the backup as all-clear. To inspect or repair a diverged remote (explicit, refuses by default): `python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/backup_remote_repair.py" --status` (or `--repair`).
+
+**Never `git commit --amend`, `git reset`, or `git rebase` inside `${ENGRAM_HOME:-$HOME/.engram}/`** (engram-alpha#4205): the worker pushes each snapshot commit, so a rewrite diverges the remote for good. Make a new commit instead — e.g. the finalized dream record after `engram_advance_turn` is committed as `git commit -m "dream <date>: record finalized"`, never an amend. An installed `reference-transaction` hook refuses a rewrite of a pushed commit.
+
 ### Step 4.6 — Back up main session logs (skip subagents/)
 
 Run the session-log backup tool and **capture the result for the sleep summary**.

@@ -957,6 +957,15 @@ def _diagnose_impl() -> str:
             "flare": _mq_count > 0 or _mq_live > 0,
         }
 
+        # ── Off-disk backup push (#4205) ───────────────────────────────────
+        # The snapshot worker's last push outcome. Always present; result None
+        # means no status file yet (a pre-fix seat or a never-pushed install).
+        _bp = core._backup_push_view() or {
+            "result": None, "last_success_utc": None, "last_attempt_utc": None,
+            "ahead": None, "behind": None,
+        }
+        metrics["backup_push"] = {**_bp, "flare": core._backup_push_flare(_bp)}
+
         # ── Text NUL guard (#3765) ─────────────────────────────────────────
         # Nodes whose claim or recall_summary holds a U+0000 RIGHT NOW (rows that
         # predate migration rung 9, a restore of an old dump, or a dropped guard).

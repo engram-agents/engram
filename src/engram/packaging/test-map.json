@@ -429,6 +429,13 @@
       "note": "engram-alpha#2652 (tools-7): the one-row read goes through tools/_owner_read.py behind engramd.inspect_raw_reads_via_owner (flag OFF opens the store mode=ro). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the registered read template also ties it to tests/test_engramd_read_scan.py."
     },
     {
+      "path_prefix_or_glob": "tools/backup_remote_repair.py",
+      "test_globs": [
+        "tests/test_backup_remote_repair_4205.py"
+      ],
+      "note": "#4205: explicit repair verb for a diverged off-disk backup remote. The test runs the file as a subprocess, invisible to the layer-1 import graph. No store reads, so no registered read template."
+    },
+    {
       "path_prefix_or_glob": "tools/dream_pickup.py",
       "test_globs": [
         "tests/test_dream_pickup_3919.py",
