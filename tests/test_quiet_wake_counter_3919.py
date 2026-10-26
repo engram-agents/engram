@@ -473,7 +473,10 @@ def test_quiet_turn_without_rearm_emits_arm_nudge_only_and_counts(tmp_path):
 def test_arm_nudge_text_unchanged_when_counter_runs(tmp_path, hook):
     s = Seat(tmp_path)
     out = s.quiet(rearm=False)
-    assert _decision(out)["reason"] == hook._NUDGE_TEXT
+    # #4139: the arm nudge's loop_prompt sentence now depends on the marker;
+    # this cell pins that the quiet counter leaves the nudge exactly as the
+    # hook's own selector would build it for this marker.
+    assert _decision(out)["reason"] == hook._nudge_text_for_marker(str(s.home / "loop-mode.json"))
 
 
 def test_stop_hook_active_leaves_counter_untouched(tmp_path):

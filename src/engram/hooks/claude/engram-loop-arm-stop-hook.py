@@ -646,15 +646,25 @@ def _is_managed_codex_runtime() -> bool:
     return bool(os.environ.get("CODEX_PLUGIN_ROOT", "").strip())
 
 
-_NUDGE_TEXT = (
+_NUDGE_HEAD = (
     "[Loop Arm Check: a loop marker is active and this turn shows no "
     "verified re-arm (ScheduleWakeup + CronList in the same parallel block). "
     "Arm now — read `cadence_seconds` from the marker (it is already in your "
     "context) and batch `ScheduleWakeup(delay=cadence_seconds)` and `CronList` "
     "in ONE parallel block — the ONLY documented arm shape; a solo "
     "`ScheduleWakeup` without a `CronList` sibling in the same parallel block "
-    "IS the defect (#4007). Use this file's own `loop_prompt` field verbatim "
-    "for the ScheduleWakeup prompt — never paraphrase. The CronList result is "
+    "IS the defect (#4007). "
+)
+# INVARIANT (#4139): the nudge never names a marker field that the marker
+# doesn't have. This sentence is only emitted when the marker carries a
+# non-empty-str `loop_prompt`; otherwise _nudge_text_for_marker swaps in the
+# helper-pointing sentence instead.
+_NUDGE_LOOP_PROMPT_FIELD_SENTENCE = (
+    "Use this file's own `loop_prompt` field verbatim "
+    "for the ScheduleWakeup prompt — never paraphrase. "
+)
+_NUDGE_TAIL = (
+    "The CronList result is "
     "your verify step: confirm the prompt leads with "
     f"{_LOOP_WAKE_MARKER}. "
     "Arming is idempotent: a redundant arm replaces, never stacks. If your "
@@ -664,6 +674,46 @@ _NUDGE_TEXT = (
     "(engram-loop Step 2 item 3, #2098). If a reply already rendered this "
     "turn, arm now and add nothing after.]"
 )
+_NUDGE_TEXT = _NUDGE_HEAD + _NUDGE_LOOP_PROMPT_FIELD_SENTENCE + _NUDGE_TAIL
+
+
+def _loop_prompt_helper_path() -> str:
+    """The printed path of tools/loop_prompt.py: the directory the import
+    resolution above actually found (`_LP_TOOLS_DIR`), else the sh-form
+    fallback (already quoted) -- same policy as the comment above
+    `_LOOP_PROMPT_FALLBACK_PATH`. No new path logic."""
+    if _LP_TOOLS_DIR is not None:
+        return '"' + str(Path(_LP_TOOLS_DIR) / "loop_prompt.py") + '"'
+    return _LOOP_PROMPT_FALLBACK_PATH
+
+
+def _marker_has_loop_prompt(loop_marker_path: str) -> bool:
+    """True iff the marker parses and carries a non-empty str `loop_prompt`.
+    Unreadable / unparseable / non-dict marker -> False (never raises)."""
+    try:
+        with open_regular_text(loop_marker_path, encoding="utf-8") as f:
+            marker = json.load(f)
+        lp = marker.get("loop_prompt")
+        return isinstance(lp, str) and bool(lp)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _nudge_text_for_marker(loop_marker_path: str) -> str:
+    """Choose the arm-nudge text so it never names a marker field the marker
+    lacks (#4139). C1: non-empty str `loop_prompt` -> `_NUDGE_TEXT`, byte
+    for byte. C2/C3: anything else (absent, null, "", non-string, unreadable
+    or unparseable marker) -> the helper-pointing sentence."""
+    if _marker_has_loop_prompt(loop_marker_path):
+        return _NUDGE_TEXT
+    return (
+        _NUDGE_HEAD
+        + "This marker has no `loop_prompt` field: build the prompt with "
+        + f"`echo '<your loop stub>' | python3 {_loop_prompt_helper_path()}` "
+        + "(never hand-write it). "
+        + _NUDGE_TAIL
+    )
+
 
 _CODEX_PACER_NUDGE_TEXT = (
     "[Loop Arm Check: managed Codex is active but this loop marker says "
@@ -1827,7 +1877,7 @@ def main() -> None:
     # design fact 4); additionalContext alone is not even a documented
     # Stop-hook field. No fallback/primary split to keep in sync: this
     # print statement is the only emit channel, lib available or not.
-    print(json.dumps({"decision": "block", "reason": _NUDGE_TEXT}))
+    print(json.dumps({"decision": "block", "reason": _nudge_text_for_marker(LOOP_MARKER_PATH)}))
     if _STOPHOOKLIB_OK:
         _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
     # Lib unavailable -- no offset state to write without it, so skip that
