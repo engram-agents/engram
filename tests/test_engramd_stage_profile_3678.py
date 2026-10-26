@@ -45,6 +45,8 @@ TOOL_PATH = REPO_ROOT / "tools" / "engramd_stage_profile.py"
 INJECT_S = 0.002
 INJECTED_RISE_MIN_MS = 1.6     # the named stage must rise by at least this much
 OTHER_STAGE_RISE_MAX_MS = 0.4  # every other stage must rise by less than this
+# #4183: an injected stage delay must also reach the CLIENT's end-to-end timer.
+INJECTED_E2E_RISE_MIN_MS = 1.6
 
 
 def _load_tool():
@@ -507,6 +509,28 @@ def test_an_injected_delay_lands_in_its_own_stage_and_no_other(tool, store, plai
     assert rise[target] >= INJECTED_RISE_MIN_MS, (target, rise[target])
     leaked = {s: r for s, r in rise.items() if s != target and r >= OTHER_STAGE_RISE_MAX_MS}
     assert not leaked, (target, leaked)
+
+
+@pytest.mark.timing
+@requires_linux_owner
+@pytest.mark.parametrize("target", _INJECTABLE)
+def test_an_injected_delay_is_visible_end_to_end(tool, store, plain, target):
+    """#4183: the stage check above judges the stage's own span, so a sleep that
+    lands after the client already has its reply (the owner's last action,
+    `response_send`, when slept after the call) still raised the stage and left
+    end-to-end flat, with the remainder driven negative. Every injectable stage's
+    delay must raise end-to-end p50 by at least INJECTED_E2E_RISE_MIN_MS.
+    Mutation: sleep `response_send` after its call -> red for that stage only.
+
+    Limit: it catches a post-call sleep that lands after the owner's last action
+    (the `response_send` class) but is blind to a wrongly pre-call stage whose peer
+    is not waiting inside the call; pre-call absorption (the `request_read` class)
+    is caught by the #4180 cells in tests/test_stage_profile_inject_additive_4180.py.
+    (Measured: adding `response_encode` to `_PRECALL_INJECT_STAGES` reddens nothing.)
+    """
+    out = tool.profile(n=30, home=store, warmup=5, inject={target: INJECT_S})
+    rise = out["end_to_end"]["p50_ms"] - plain["end_to_end"]["p50_ms"]
+    assert rise >= INJECTED_E2E_RISE_MIN_MS, (target, rise)
 
 
 # The test's OWN map from a real function to the stage it must be reported under.

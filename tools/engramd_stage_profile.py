@@ -99,8 +99,18 @@ INJECTABLE_STAGES = CLIENT_STAGES + OWNER_STAGES
 # A delay inside the end-to-end timer but outside every stage: it exists only to
 # prove end-to-end is timed on its own and the remainder is real.
 UNNAMED_GAP = "unnamed_gap"
+# #4183: owner stages whose injected delay sleeps BEFORE the wrapped call. Every
+# other owner stage sleeps after it (#4180: a late peer would absorb a pre-call
+# sleep). `response_send` is the exception: `sendall` is the owner's last action
+# before close and its "peer" is the kernel buffer, so nothing waits inside it
+# and a post-call sleep would land after the client already has its reply,
+# invisible to end-to-end.
+_PRECALL_INJECT_STAGES = frozenset({"response_send"})
 
 
+# No `_inject_into_function` target is a last action: its targets are `module:attr`
+# functions all upstream of the reply, and `sendall` is wrapped on `_TimedConn`,
+# not reachable as a target.
 def _inject_into_function(modules: Dict[str, object], target: str, delay: float) -> None:
     """Patch a delay INTO a real callable named "module:attr[.attr]", underneath
     any stage wrapper (call this before the wrappers go on). It is the
@@ -116,8 +126,11 @@ def _inject_into_function(modules: Dict[str, object], target: str, delay: float)
     real = getattr(obj, parts[-1])
 
     def delayed(*a, **k):
+        # #4180: after the call, so a late peer cannot absorb the delay (on an
+        # exception no delay is added, for simplicity).
+        result = real(*a, **k)
         time.sleep(delay)
-        return real(*a, **k)
+        return result
     setattr(obj, parts[-1], delayed)
 
 
@@ -167,6 +180,7 @@ class _Clock:
 
     def wrap(self, name: str, fn, inject: Dict[str, float]):
         delay = inject.get(name, 0.0)
+        precall = name in _PRECALL_INJECT_STAGES
         clock = self
 
         def timed(*args, **kwargs):
@@ -177,9 +191,16 @@ class _Clock:
             recs.append([name, time.monotonic(), None, stack[-1] if stack else None])
             stack.append(idx)
             try:
-                if delay:
+                if delay and precall:
                     time.sleep(delay)
-                return fn(*args, **kwargs)
+                result = fn(*args, **kwargs)
+                # #4180: sleep AFTER the call, inside the span. A sleep before it
+                # runs in parallel with a late peer (request_read waits on the
+                # client) and adds nothing. On an exception no delay is added,
+                # for simplicity. Exception: _PRECALL_INJECT_STAGES (#4183).
+                if delay and not precall:
+                    time.sleep(delay)
+                return result
             finally:
                 stack.pop()
                 recs[idx][2] = time.monotonic()
@@ -431,6 +452,10 @@ class _ClientTimer:
         def timed(*a, **k):
             t0 = time.monotonic()
             try:
+                # Stays PRE-call (#4180): client stages have no waiting peer
+                # inside the wrapped call, so a post-call sleep would only push
+                # the delay into the next stage (measured: request_send
+                # post-call leaks ~1.8 ms into response_delivery).
                 if delay:
                     time.sleep(delay)
                 return fn(*a, **k)
