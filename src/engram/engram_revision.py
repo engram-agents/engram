@@ -4035,13 +4035,7 @@ def _retract_impl(
             (json.dumps(retract_meta), node_id, node["metadata"]),
         )
         if _guarded.rowcount != 1:
-            conn.rollback()
-            return json.dumps({
-                "error": f"Node '{node_id}' changed while this call was running "
-                         f"(another write got there first). Nothing was changed. "
-                         f"Re-read the node and retry.",
-                "refusal": "changed_concurrently",
-            })
+            return core.changed_concurrently_refusal(conn, "Node", node_id)
 
         # 1b. If retracted node was a resolution, reopen the resolved target.
         # A resolution creates a 'resolves' edge from the derivation to the

@@ -340,22 +340,6 @@ _PERSON_IMMUTABLE_FIELDS = frozenset({
 _SPECIAL_MOMENTS_CAP = 100
 
 
-def _changed_concurrently(conn: sqlite3.Connection, node_id: str) -> str:
-    """Roll back and build the #4178 refusal for a guarded metadata write.
-
-    Used when a guarded `UPDATE nodes SET metadata = ? ... AND metadata IS ?`
-    matched no row: the node changed (or stopped being current) between this
-    call's read and its write. Same shape as the #4166 refusal.
-    """
-    conn.rollback()
-    return json.dumps({
-        "error": f"Node '{node_id}' changed while this call was running "
-                 f"(another write got there first). Nothing was changed. "
-                 f"Re-read the node and retry.",
-        "refusal": "changed_concurrently",
-    })
-
-
 def _update_person_impl(
     node_id: str = "",
     updates: dict = None,
@@ -514,7 +498,7 @@ def _update_person_impl(
             (json.dumps(meta), node_id.strip(), row["metadata"]),
         )
         if _guarded.rowcount != 1:
-            return _changed_concurrently(conn, node_id.strip())
+            return core.changed_concurrently_refusal(conn, "Node", node_id.strip())
 
         core._log_edit(conn, "person_field_updated", node_id.strip(), "person", {
             "updated_fields": updated_fields,
@@ -710,7 +694,7 @@ def _add_special_moment_impl(
             (json.dumps(meta), person_id.strip(), pn_row["metadata"]),
         )
         if _guarded.rowcount != 1:
-            return _changed_concurrently(conn, person_id.strip())
+            return core.changed_concurrently_refusal(conn, "Node", person_id.strip())
         core._log_edit(conn, "special_moment_added", person_id.strip(), "person", {
             "anchor_node_id": node_id.strip(),
         })
@@ -950,7 +934,7 @@ def _set_person_lineage_impl(target_pn: str = "", model_id: str = "") -> str:
             (json.dumps(meta), row["id"], row["metadata"]),
         )
         if _guarded.rowcount != 1:
-            return _changed_concurrently(conn, row["id"])
+            return core.changed_concurrently_refusal(conn, "Node", row["id"])
         conn.commit()
 
         return json.dumps({

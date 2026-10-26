@@ -2410,13 +2410,8 @@ def _add_observation_impl(
                 (json.dumps(_ev_metadata), evidence_id, ev["metadata"]),
             )
             if _ev_guarded.rowcount != 1:
-                conn.rollback()
-                return json.dumps({
-                    "error": f"Evidence node '{evidence_id}' changed while this "
-                             f"call was running (another write got there first). "
-                             f"Nothing was changed. Re-read the node and retry.",
-                    "refusal": "changed_concurrently",
-                })
+                return core.changed_concurrently_refusal(
+                    conn, "Evidence node", evidence_id)
         if _evidence_type_conflict:
             result["evidence_type_conflict"] = _evidence_type_conflict
         if _original_url_conflict:
@@ -3144,12 +3139,11 @@ def _requote_impl(
                 (new_quoted_text, json.dumps(meta), node_id,
                  row["quoted_text"], row["metadata"]))
             if cur.rowcount != 1:
-                conn.rollback()
-                return _requote_refusal(
-                    "changed_concurrently",
-                    f"'{node_id}' changed while this call was running (another "
-                    "requote, a retract or a supersede got there first). Nothing was "
-                    "changed. Re-read the node and retry.")
+                return core.changed_concurrently_refusal(
+                    conn, "", node_id,
+                    message=f"'{node_id}' changed while this call was running (another "
+                            "requote, a retract or a supersede got there first). Nothing was "
+                            "changed. Re-read the node and retry.")
             core._log_edit(conn, "requoted", node_id, row["type"], {
                 "move": move, "reason": reason, "old_quote": old_quote,
                 "new_quote": new_quoted_text, "similarity_before": sim_old,

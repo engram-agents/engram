@@ -1469,20 +1469,6 @@ _LESSON_MUTABLE_FIELDS = frozenset({
 _LESSON_CACHE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge"})
 
 
-def _changed_concurrently(conn, kind: str, node_id: str) -> str:
-    """Roll back and build the #4178 refusal for a guarded metadata write
-    whose row no longer matches what this call read (metadata, plus
-    is_current: the state this tool itself checks). Module-local on purpose:
-    each module owning a guarded write carries its own copy."""
-    conn.rollback()
-    return json.dumps({
-        "error": f"{kind} '{node_id}' changed while this call was running "
-                 f"(another write got there first). Nothing was changed. "
-                 f"Re-read the node and retry.",
-        "refusal": "changed_concurrently",
-    })
-
-
 def _update_lesson_impl(
     node_id: str = "",
     updates: dict = None,
@@ -1683,7 +1669,7 @@ def _update_lesson_impl(
             (json.dumps(meta), node_id.strip(), row["metadata"]),
         )
         if _guarded.rowcount != 1:
-            return _changed_concurrently(conn, "Lesson", node_id.strip())
+            return core.changed_concurrently_refusal(conn, "Lesson", node_id.strip())
 
         core._log_edit(conn, "lesson_field_updated", node_id.strip(), "lesson", {
             "updated_fields": updated_fields,

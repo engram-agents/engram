@@ -6854,6 +6854,31 @@ def _metadata_dict(raw) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def changed_concurrently_refusal(conn, kind: str, node_id: str, *,
+                                 message: "Optional[str]" = None) -> str:
+    """Roll back and build the `changed_concurrently` refusal (#4166/#4178).
+
+    The one place this refusal is constructed. Used when a guarded write
+    (`UPDATE ... AND metadata IS ?`) matched no row: the node changed between
+    this call's read and its write. Rolls back `conn` (the whole call is
+    all-or-nothing), then returns the JSON refusal.
+
+    The error reads "<kind> '<node_id>' changed while this call was running
+    ...". Callers keep their historical wording by choosing `kind` ("Node",
+    "Task", "Goal", "Lesson", "Evidence node"); a caller whose message differs
+    in more than the kind (requote names its own racing writers) passes the
+    full text as `message`, used verbatim.
+    """
+    conn.rollback()
+    return json.dumps({
+        "error": message if message is not None else (
+            f"{kind} '{node_id}' changed while this call was running "
+            f"(another write got there first). Nothing was changed. "
+            f"Re-read the node and retry."),
+        "refusal": "changed_concurrently",
+    })
+
+
 def _metadata_dict_for_write(raw, node_id, tool) -> "tuple[dict, Optional[str]]":
     """Write-side twin of `_metadata_dict` (#3413): returns (dict, warning).
 
