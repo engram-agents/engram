@@ -720,6 +720,11 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/merge_batch.py",
+      "tier": "dev",
+      "note": "the merge seat's batched press (scratch merge, whole-suite record, window, press with mechanical gates); merge-seat tooling for this repo, needs gh and a team workflow, so dev tier."
+    },
+    {
       "path": "tools/forum.py",
       "tier": "convenience"
     },

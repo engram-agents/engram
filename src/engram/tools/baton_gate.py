@@ -559,6 +559,74 @@ def _is_unfinished(check: dict) -> bool:
     return not (check.get("conclusion") or "")
 
 
+# GitHub lists at most this many check-runs per page; a head with more runs
+# than one page holds cannot be judged from one page.
+_CHECK_RUNS_PAGE_SIZE = 100
+
+
+def _strict_required_check_state(payload: dict, check_name: str) -> tuple:
+    """The strict read of one named check on one head: ``(state, detail)``.
+
+    `payload` is the JSON of ``GET repos/<o>/<r>/commits/<sha>/check-runs
+    ?filter=all&per_page=100``.  This answers GitHub's merge gate at the press
+    (did EVERY run of the required check on this head succeed), which is a
+    different question from `_dedupe_checks_by_latest`'s (is the newest run
+    green).  A cancelled same-SHA run blocks the merge even when another run of
+    the same name passed, so nothing here is ordered by time or deduped.
+
+    state:
+      "too-many"        total_count exceeds one page; the page cannot be trusted
+      "none"            no run is named `check_name`
+      "pending"         some such run is unfinished (`_is_unfinished`)
+      "success"         every such run concluded success (case-insensitive)
+      "not-all-success" otherwise
+      "unknown"         the payload is not a check-runs object, or its total_count
+                        is absent or not an integer (fails closed)
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("check_runs"), list):
+        return ("unknown", "payload is not a check-runs object")
+    total = payload.get("total_count")
+    if not isinstance(total, int) or isinstance(total, bool):
+        return ("unknown", "total_count is absent or not an integer; one page cannot be trusted")
+    if total > _CHECK_RUNS_PAGE_SIZE:
+        return ("too-many", f"total_count {total} exceeds one page of {_CHECK_RUNS_PAGE_SIZE}")
+    runs = [r for r in payload["check_runs"]
+            if isinstance(r, dict) and r.get("name") == check_name]
+    if not runs:
+        return ("none", f"no run named {check_name!r}")
+    unfinished = [r for r in runs if _is_unfinished(r)]
+    if unfinished:
+        return ("pending", "unfinished: " + ", ".join(
+            f"run {r.get('id')} ({r.get('status') or 'no status'})" for r in unfinished))
+    bad = [r for r in runs if (r.get("conclusion") or "").lower() != "success"]
+    if bad:
+        return ("not-all-success", "not success: " + ", ".join(
+            f"run {r.get('id')} ({r.get('conclusion')})" for r in bad))
+    return ("success", f"all {len(runs)} run(s) of {check_name!r} succeeded")
+
+
+def _head_check_runs(repo: str, sha: str) -> dict:
+    """Fetch the check-runs of one head commit (one page, ``filter=all``).
+
+    Goes through `_gh_read_json`, so the service identity applies and a refusal
+    comes back before any spawn.  Never raises: on any failure the dict is
+    ``{"error": <scrubbed reason>}``, which `_strict_required_check_state` reads
+    as "unknown" (never as a pass).
+    """
+    if not _repo_slug_is_valid(repo):
+        return {"error": "repo is not a plain owner/name slug"}
+    if not (isinstance(sha, str) and _HEAD_OID_RE.fullmatch(sha)):
+        return {"error": "sha is not a 40-hex commit id"}
+    body, why = _gh_read_json(
+        ["api", f"repos/{repo}/commits/{sha}/check-runs"
+                f"?filter=all&per_page={_CHECK_RUNS_PAGE_SIZE}"])
+    if why is not None:
+        return {"error": why}
+    if not isinstance(body, dict):
+        return {"error": "gh returned JSON that is not an object"}
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Service GitHub identity (#3283).
 #
