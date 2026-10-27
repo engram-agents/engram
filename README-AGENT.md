@@ -360,6 +360,12 @@ No human action needed.
 
 ## Codex install
 
+Already have a working local Codex + ENGRAM agent and want phone access?
+See [Continue your local agent from your phone](docs/CODEX-MOBILE.md) for the
+tested managed-daemon + iPhone manual-pairing flow, reusable status probe,
+same-session checks, and auto-start persistence caveats. This is remote access
+to the existing local agent, not a phone-only install.
+
 > ⚠ **Codex is best-effort, not the primary path.** ENGRAM is built and polished for
 > Claude Code; Codex support is real but **less tested and rougher** — expect sharper
 > edges (hook-envelope strictness, sandbox-blocked scaffolds, a stale-socket surface

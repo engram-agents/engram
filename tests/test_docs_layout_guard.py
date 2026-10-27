@@ -43,6 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # belongs in docs/internal/.
 ALLOWLIST = {
     "CHANGELOG.md": "release history, the file users read to see what changed between versions",
+    "CODEX-MOBILE.md": "README.md and README-AGENT.md send Codex users to it for continuing their local agent from an iPhone",
     "FORUM-SERVER.md": "README.md and README-AGENT.md send users to it for running the forum server",
     "README.md": "the index of docs/ itself, for public readers (carries the docs/internal/ pointer sentence)",
     "ZH-TERMINOLOGY.md": "the public paper's Chinese chapters cite it as the terminology ruling",
