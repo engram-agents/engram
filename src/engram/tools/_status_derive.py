@@ -148,9 +148,10 @@ def _resolve_forum_url() -> str:
     config = _load_config()
     forum_cfg = config.get("forum")
     if isinstance(forum_cfg, dict):
-        url = (forum_cfg.get("url") or "").strip()
-        if url:
-            return url.rstrip("/")
+        url = forum_cfg.get("url")
+        # #4203: a non-string url (hand-edited null / number / list) is absent.
+        if isinstance(url, str) and url.strip():
+            return url.strip().rstrip("/")
 
     env_url = os.environ.get("FORUM_URL", "").strip()
     if env_url:

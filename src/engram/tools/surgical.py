@@ -111,7 +111,11 @@ def _get_current_turn() -> int:
     config_path = DATA_DIR / "config.json"
     if config_path.exists():
         config = json.loads(config_path.read_text())
-        return config.get("memory", {}).get("current_turn", 0)
+        # #4203: hand-edited config; a non-dict config / memory or a non-int
+        # (bool included) current_turn is the missing-key default.
+        memory = config.get("memory") if isinstance(config, dict) else None
+        turn = memory.get("current_turn", 0) if isinstance(memory, dict) else 0
+        return turn if isinstance(turn, int) and not isinstance(turn, bool) else 0
     return 0
 
 

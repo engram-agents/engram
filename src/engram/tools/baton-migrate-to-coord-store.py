@@ -46,7 +46,7 @@ from typing import Optional
 # Bootstrap: ensure forum_api is importable from tools/
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from forum_api import ForumClient, ForumHttpError, ForumNetworkError, engram_home
+from forum_api import ForumClient, ForumHttpError, ForumNetworkError, engram_home, forum_url_from_config
 
 # ---------------------------------------------------------------------------
 # Frontmatter parsing (mirrors baton.py / coordination/markdown.py)
@@ -249,12 +249,9 @@ def main() -> None:
             projects_dir = Path(forum_home) / "projects"
 
     # Resolve forum URL
-    forum_url = (
-        args.forum_url
-        or (config.get("forum") or {}).get("url")
-        or os.environ.get("FORUM_URL")
-        or "http://localhost:5002"
-    )
+    # #4203: forum_api.forum_url_from_config is the same config -> $FORUM_URL -> default
+    # chain, with the type guards (a hand-edited non-dict forum / non-string url is absent).
+    forum_url = args.forum_url or forum_url_from_config(config)
 
     # Resolve agent name
     agent = (args.agent or _get_agent_name(config) or "baton-migrator").strip().lower()
