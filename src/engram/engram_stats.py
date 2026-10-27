@@ -534,6 +534,40 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
 # ---------------------------------------------------------------------------
 
 
+_BACKUP_ARCHIVE_FLARE_BYTES = 1 << 30  # 1 GiB of local SQL archive (#4208)
+
+
+def _backup_archive_view() -> dict:
+    """engram_diagnose's always-present `backup_archive` key (#4208). Never raises: a failure
+    is reported in-band as {"error": "<class>: <msg>"} so the key is never absent."""
+    try:
+        home = Path(core.DATA_DIR)
+        bk = home / "db-backup"
+        sql = sorted(bk.glob("knowledge-*.sql")) if bk.is_dir() else []
+        bdir = bk / "binary"
+        binaries = (
+            sorted(p for p in bdir.glob("*.db") if core.BACKUP_BINARY_RE.match(p.name))
+            if bdir.is_dir() else []
+        )
+        dates = sorted(
+            m.group(1) for m in (core.BACKUP_ARCHIVE_RE.match(p.name) for p in sql) if m
+        )
+        sql_bytes = sum(p.stat().st_size for p in sql)
+        tracked = len(core._tracked_binary_paths(home))
+        return {
+            "sql_count": len(sql),
+            "sql_bytes": sql_bytes,
+            "binary_count": len(binaries),
+            "binary_bytes": sum(p.stat().st_size for p in binaries),
+            "tracked_backup_count": tracked,
+            "oldest": dates[0] if dates else None,
+            "newest": dates[-1] if dates else None,
+            "flare": sql_bytes > _BACKUP_ARCHIVE_FLARE_BYTES or tracked > 0,
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 def _diagnose_impl() -> str:
     """Impl for engram_diagnose — callable for in-server callers.
 
@@ -965,6 +999,10 @@ def _diagnose_impl() -> str:
             "ahead": None, "behind": None,
         }
         metrics["backup_push"] = {**_bp, "flare": core._backup_push_flare(_bp)}
+
+        # ── Local SQL/binary backup archive (#4208) ────────────────────────
+        # Always present; on any failure {"error": ...} in-band, never absent.
+        metrics["backup_archive"] = _backup_archive_view()
 
         # ── Text NUL guard (#3765) ─────────────────────────────────────────
         # Nodes whose claim or recall_summary holds a U+0000 RIGHT NOW (rows that

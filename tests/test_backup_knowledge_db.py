@@ -260,6 +260,10 @@ class TestRetainPruning(unittest.TestCase):
 
 class TestRetainZeroKeepsAll(unittest.TestCase):
     def test_retain_zero_never_deletes(self):
+        """Explicit --retain 0 keeps its pre-#4208 meaning (keep all); only the ABSENT flag
+        selects the default policy. 20 distinct dated dailies + a very old archive: the default
+        policy WOULD prune 2026-01-02 (not newest-14, not a month anchor), so this goes red if
+        an explicit 0 ever means "default" again."""
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "knowledge.db")
             out_dir = os.path.join(tmp, "db-backup")
@@ -267,14 +271,15 @@ class TestRetainZeroKeepsAll(unittest.TestCase):
             _build_minimal_db(db)
 
             today = datetime.date.today()
-
-            # Create a very old archive.
             old_date = (today - datetime.timedelta(days=3650)).isoformat()
             old_archive = os.path.join(out_dir, f"knowledge-{old_date}.sql")
             with open(old_archive, "w") as f:
                 f.write("-- very old archive\n")
+            dailies = _daily_names("2026-01-01", 20)
+            for n in dailies:
+                with open(os.path.join(out_dir, n), "w") as f:
+                    f.write("-- archive\n")
 
-            # --retain 0 is the default; pass explicitly to be clear.
             rc = backup_knowledge_db.main([
                 "--db", db,
                 "--out-dir", out_dir,
@@ -282,8 +287,12 @@ class TestRetainZeroKeepsAll(unittest.TestCase):
             ])
 
             self.assertEqual(rc, 0)
-            # Old archive must survive.
-            self.assertTrue(os.path.exists(old_archive), "retain=0 must not delete any archive")
+            self.assertTrue(os.path.exists(old_archive), "explicit --retain 0 must not delete any archive")
+            for n in dailies:
+                self.assertTrue(
+                    os.path.exists(os.path.join(out_dir, n)),
+                    f"explicit --retain 0 means keep all, but {n} was pruned (default policy applied?)",
+                )
 
 
 class TestDryRun(unittest.TestCase):
@@ -927,6 +936,503 @@ class TestOptionalTablesMissingDegradesGracefully(unittest.TestCase):
                 os.path.exists(suffixed),
                 "edges table appearing with real content must force a real backup, not a false skip",
             )
+
+
+# ---------------------------------------------------------------------------
+# #4208 -- default retention, binary rollback copies, untracking.
+# Written BEFORE the implementation (contract-first). Cells are named for the
+# contract item they pin (C1..C4 of the spec).
+# ---------------------------------------------------------------------------
+import pathlib  # noqa: E402
+import subprocess  # noqa: E402
+from unittest import mock  # noqa: E402
+
+
+def _touch_archives(out_dir: str, names) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    for n in names:
+        with open(os.path.join(out_dir, n), "w") as f:
+            f.write("-- archive\n")
+
+
+def _daily_names(start: str, count: int) -> list:
+    d0 = datetime.date.fromisoformat(start)
+    return [f"knowledge-{(d0 + datetime.timedelta(days=i)).isoformat()}.sql" for i in range(count)]
+
+
+def _sql_set(out_dir: str) -> set:
+    return {n for n in os.listdir(out_dir) if n.endswith(".sql")}
+
+
+def _run_main(argv):
+    buf = io.StringIO()
+    err = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+        rc = backup_knowledge_db.main(argv)
+    return rc, buf.getvalue(), err.getvalue()
+
+
+class TestDefaultRetention4208(unittest.TestCase):
+    """C1: 14 newest dailies + the first archive of each calendar month."""
+
+    def _run(self, out_dir, extra=()):
+        # Drive the dispatch helper directly so the cell does not depend on a db
+        # or on today's date (the default policy is filename-date based).
+        args = backup_knowledge_db._parse_args(["--out-dir", out_dir, *extra])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            backup_knowledge_db._apply_retention(out_dir, args)
+        return buf.getvalue()
+
+    def test_c1a_20_dailies_keep_14_newest_plus_monthly_anchor(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            names = _daily_names("2026-09-20", 20)  # 09-20 .. 10-09
+            _touch_archives(out_dir, names)
+            self._run(out_dir)
+            expected = set(names[-14:]) | {"knowledge-2026-09-20.sql"}
+            self.assertEqual(_sql_set(out_dir), expected)
+            # 10-01 is October's anchor and is also inside the newest 14.
+            self.assertIn("knowledge-2026-10-01.sql", _sql_set(out_dir))
+
+    def test_c1a2_lone_old_archive_is_its_months_anchor_and_kept(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            names = _daily_names("2026-10-01", 14) + ["knowledge-2026-08-17.sql", "knowledge-2026-08-18.sql"]
+            _touch_archives(out_dir, names)
+            self._run(out_dir)
+            self.assertIn("knowledge-2026-08-17.sql", _sql_set(out_dir))      # August anchor
+            self.assertNotIn("knowledge-2026-08-18.sql", _sql_set(out_dir))   # not anchor, not newest 14
+
+    def test_c1b_same_day_suffix_prunes_with_its_day(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            names = _daily_names("2026-09-20", 20) + ["knowledge-2026-09-21-2.sql"]
+            _touch_archives(out_dir, names)
+            self._run(out_dir)
+            left = _sql_set(out_dir)
+            self.assertNotIn("knowledge-2026-09-21.sql", left)
+            self.assertNotIn("knowledge-2026-09-21-2.sql", left)
+
+    def test_c1b2_same_day_suffix_is_kept_with_its_day(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            names = _daily_names("2026-09-20", 20) + ["knowledge-2026-09-20-2.sql", "knowledge-2026-10-09-2.sql"]
+            _touch_archives(out_dir, names)
+            self._run(out_dir)
+            left = _sql_set(out_dir)
+            self.assertIn("knowledge-2026-09-20-2.sql", left)   # anchor day: all its files kept
+            self.assertIn("knowledge-2026-10-09-2.sql", left)   # newest day
+
+    def test_c1c_keep_all_prunes_nothing(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            names = _daily_names("2026-09-20", 20)
+            _touch_archives(out_dir, names)
+            self._run(out_dir, ["--keep-all"])
+            self.assertEqual(_sql_set(out_dir), set(names))
+
+    def test_c1d_prune_days_override_prunes_by_cutoff_only_even_a_monthly_anchor(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            today = datetime.date.today()
+            old = (today - datetime.timedelta(days=10)).isoformat()   # lone => an anchor by default
+            new = (today - datetime.timedelta(days=1)).isoformat()
+            _touch_archives(out_dir, [f"knowledge-{old}.sql", f"knowledge-{new}.sql"])
+            self._run(out_dir, ["--prune-days", "3"])
+            self.assertEqual(_sql_set(out_dir), {f"knowledge-{new}.sql"})
+
+    def test_c1e_dry_run_prints_each_path_and_removes_nothing(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            names = _daily_names("2026-09-20", 20)
+            _touch_archives(out_dir, names)
+            out = self._run(out_dir, ["--dry-run"])
+            self.assertEqual(_sql_set(out_dir), set(names))
+            would = {
+                os.path.basename(l.split("would prune:", 1)[1].strip())
+                for l in out.splitlines() if l.startswith("[dry-run] would prune:")
+            }
+            self.assertEqual(would, set(names[1:6]))  # 09-21 .. 09-25
+
+    def test_c1f_keep_all_with_prune_days_is_a_usage_error_naming_both(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            backup_knowledge_db._parse_args(["--keep-all", "--prune-days", "3"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--keep-all", err.getvalue())
+        self.assertIn("--prune-days", err.getvalue())
+
+    def test_c1f2_keep_all_with_prune_days_zero_is_not_an_error_and_prunes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "knowledge.db")
+            out_dir = os.path.join(tmp, "db-backup")
+            _build_minimal_db(db)
+            names = _daily_names("2026-01-01", 20)
+            _touch_archives(out_dir, names)
+            rc, _, err = _run_main(
+                ["--db", db, "--out-dir", out_dir, "--no-binary", "--keep-all", "--prune-days", "0"]
+            )
+            self.assertEqual(rc, 0, err)
+            self.assertTrue(set(names) <= _sql_set(out_dir))
+
+    def test_c1g2_absent_flag_parses_to_none(self):
+        self.assertIsNone(backup_knowledge_db._parse_args([]).retain)
+        self.assertEqual(backup_knowledge_db._parse_args(["--retain", "0"]).retain, 0)
+
+    def test_c1g_retain_and_prune_days_are_the_same_flag(self):
+        a = backup_knowledge_db._parse_args(["--retain", "5"])
+        b = backup_knowledge_db._parse_args(["--prune-days", "5"])
+        self.assertEqual((a.retain, b.retain), (5, 5))
+
+    def test_c1h_non_archive_files_and_watermark_are_never_touched(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            extras = [".watermark.json", "notes.sql", "knowledge-latest.sql"]
+            _touch_archives(out_dir, _daily_names("2026-09-20", 20) + extras)
+            self._run(out_dir)
+            left = set(os.listdir(out_dir))
+            for keep in extras:
+                self.assertIn(keep, left)
+
+    def test_c1i_main_applies_default_retention_after_a_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "knowledge.db")
+            out_dir = os.path.join(tmp, "db-backup")
+            _build_minimal_db(db)
+            _touch_archives(out_dir, _daily_names("2026-01-01", 20))
+            rc, _, _ = _run_main(["--db", db, "--out-dir", out_dir, "--no-binary"])
+            self.assertEqual(rc, 0)
+            left = _sql_set(out_dir)
+            self.assertIn("knowledge-2026-01-01.sql", left)       # anchor
+            self.assertNotIn("knowledge-2026-01-02.sql", left)    # pruned
+            self.assertIn(f"knowledge-{_today()}.sql", left)
+
+
+def _binary_files(out_dir: str) -> list:
+    d = os.path.join(out_dir, "binary")
+    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+
+class TestBinaryRollbackCopies4208(unittest.TestCase):
+    """C2: db-backup/binary/knowledge-<ISO-UTC>.db, newest 2 kept."""
+
+    def _setup(self, tmp):
+        db = os.path.join(tmp, "knowledge.db")
+        out_dir = os.path.join(tmp, "db-backup")
+        _build_minimal_db(db)
+        return db, out_dir
+
+    def test_c2a_three_writes_leave_the_two_newest_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, out_dir = self._setup(tmp)
+            written = []
+            for _ in range(3):
+                rc, out, _ = _run_main(["--db", db, "--out-dir", out_dir, "--force"])
+                self.assertEqual(rc, 0)
+                lines = [l for l in out.splitlines() if l.startswith("binary copy written: ")]
+                self.assertEqual(len(lines), 1)
+                written.append(os.path.basename(lines[0].split(": ", 1)[1]))
+            self.assertEqual(len(set(written)), 3)
+            self.assertEqual(written, sorted(written))
+            self.assertEqual(_binary_files(out_dir), written[-2:])
+            for n in written:
+                self.assertRegex(n, r"^knowledge-\d{4}-\d{2}-\d{2}T\d{6}Z\.db$")
+
+    def test_c2a2_rotation_prints_pruned_binary_and_leaves_foreign_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, out_dir = self._setup(tmp)
+            bdir = os.path.join(out_dir, "binary")
+            os.makedirs(bdir)
+            for n in ("knowledge-2020-01-01T000000Z.db", "knowledge-2020-01-02T000000Z.db", "notes.txt"):
+                open(os.path.join(bdir, n), "w").close()
+            rc, out, _ = _run_main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc, 0)
+            left = _binary_files(out_dir)
+            self.assertNotIn("knowledge-2020-01-01T000000Z.db", left)
+            self.assertIn("knowledge-2020-01-02T000000Z.db", left)
+            self.assertIn("notes.txt", left)
+            self.assertIn("pruned binary: ", out)
+
+    def test_c2b_no_binary_writes_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, out_dir = self._setup(tmp)
+            rc, out, _ = _run_main(["--db", db, "--out-dir", out_dir, "--no-binary"])
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(os.path.join(out_dir, "binary")))
+            self.assertNotIn("binary copy", out)
+
+    def test_c2b2_no_binary_also_skips_its_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, out_dir = self._setup(tmp)
+            bdir = os.path.join(out_dir, "binary")
+            os.makedirs(bdir)
+            names = [f"knowledge-2020-01-0{i}T000000Z.db" for i in (1, 2, 3)]
+            for n in names:
+                open(os.path.join(bdir, n), "w").close()
+            _run_main(["--db", db, "--out-dir", out_dir, "--no-binary"])
+            self.assertEqual(_binary_files(out_dir), names)
+
+    def test_c2c_content_skip_writes_none_and_prunes_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, out_dir = self._setup(tmp)
+            rc, _, _ = _run_main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc, 0)
+            bdir = os.path.join(out_dir, "binary")
+            open(os.path.join(bdir, "knowledge-2020-01-01T000000Z.db"), "w").close()
+            before = _binary_files(out_dir)  # 2 files; a skip run must not touch them
+            self.assertEqual(len(before), 2)
+            rc, out, _ = _run_main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc, 0)
+            self.assertIn("skipping", out)
+            self.assertEqual(_binary_files(out_dir), before)
+            self.assertNotIn("binary copy written", out)
+
+    def test_c2c2_content_skip_does_not_rotate_an_oversized_binary_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, out_dir = self._setup(tmp)
+            _run_main(["--db", db, "--out-dir", out_dir, "--no-binary"])
+            bdir = os.path.join(out_dir, "binary")
+            os.makedirs(bdir)
+            names = [f"knowledge-2020-01-0{i}T000000Z.db" for i in (1, 2, 3)]
+            for n in names:
+                open(os.path.join(bdir, n), "w").close()
+            rc, out, _ = _run_main(["--db", db, "--out-dir", out_dir])
+            self.assertIn("skipping", out)
+            self.assertEqual(_binary_files(out_dir), names)
+
+    def test_c2d_copy_opens_as_sqlite_with_same_node_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, out_dir = self._setup(tmp)
+            _insert_row(db, "ob_2", "2026-01-02T00:00:00Z")
+            rc, _, _ = _run_main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc, 0)
+            (name,) = _binary_files(out_dir)
+            conn = sqlite3.connect(os.path.join(out_dir, "binary", name))
+            try:
+                n_copy = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(n_copy, 2)
+
+    def test_c2e_binary_dir_is_0700(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, out_dir = self._setup(tmp)
+            _run_main(["--db", db, "--out-dir", out_dir])
+            mode = os.stat(os.path.join(out_dir, "binary")).st_mode & 0o777
+            self.assertEqual(mode, 0o700)
+
+    def test_c2f_dry_run_prints_would_write_and_touches_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, out_dir = self._setup(tmp)
+            bdir = os.path.join(out_dir, "binary")
+            os.makedirs(bdir)
+            names = [f"knowledge-2020-01-0{i}T000000Z.db" for i in (1, 2, 3)]
+            for n in names:
+                open(os.path.join(bdir, n), "w").close()
+            rc, out, _ = _run_main(["--db", db, "--out-dir", out_dir, "--dry-run"])
+            self.assertEqual(rc, 0)
+            self.assertIn("[dry-run] would write binary copy: ", out)
+            self.assertEqual(_binary_files(out_dir), names)
+
+    def test_c2g_owner_path_writes_binary_copy(self):
+        """Owner path (flag ON): the copy comes from the owner snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db, out_dir = self._setup(tmp)
+
+            def fake_snapshot(spec, dest):
+                import shutil as _sh
+                _sh.copyfile(db, str(dest))
+                return dest
+
+            with mock.patch.object(backup_knowledge_db.owner_read, "flag_applies", return_value=True), \
+                 mock.patch.object(backup_knowledge_db.owner_read, "snapshot", side_effect=fake_snapshot):
+                rc, out, _ = _run_main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(_binary_files(out_dir)), 1)
+
+
+def _git(cwd, *args):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    assert r.returncode == 0, f"git {args}: {r.stderr}"
+    return r.stdout
+
+
+def _tracked_repo(home: str) -> None:
+    _git(home, "init", "-q")
+    _git(home, "config", "user.email", "t@example.invalid")
+    _git(home, "config", "user.name", "t")
+    os.makedirs(os.path.join(home, "backups"))
+    for rel in ("knowledge.db.2026-08-03-0045", "backups/old.db", "knowledge.sql", "x.bak-2026-09-09"):
+        with open(os.path.join(home, rel), "w") as f:
+            f.write("data\n")
+    _git(home, "add", "-f", ".")
+    _git(home, "commit", "-q", "-m", "base")
+
+
+class TestUntrackIgnoredBinaries4208(unittest.TestCase):
+    def test_c4a_untracks_binaries_keeps_sql_and_files_on_disk(self):
+        with tempfile.TemporaryDirectory() as home:
+            _tracked_repo(home)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                got = backup_knowledge_db._untrack_ignored_binaries(pathlib.Path(home), False)
+            self.assertEqual(
+                sorted(got),
+                ["backups/old.db", "knowledge.db.2026-08-03-0045", "x.bak-2026-09-09"],
+            )
+            self.assertEqual(_git(home, "ls-files").split(), ["knowledge.sql"])
+            for rel in ("knowledge.db.2026-08-03-0045", "backups/old.db", "knowledge.sql", "x.bak-2026-09-09"):
+                self.assertTrue(os.path.exists(os.path.join(home, rel)), rel)
+            self.assertEqual(buf.getvalue().count("untracked (stays on disk, no longer pushed): "), 3)
+
+    def test_c4b_dry_run_leaves_the_index_unchanged(self):
+        with tempfile.TemporaryDirectory() as home:
+            _tracked_repo(home)
+            before = _git(home, "ls-files")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                backup_knowledge_db._untrack_ignored_binaries(pathlib.Path(home), True)
+            self.assertEqual(_git(home, "ls-files"), before)
+            self.assertIn("[dry-run] would untrack:", buf.getvalue())
+
+    def test_c4c_non_repo_returns_empty_and_prints_skip(self):
+        with tempfile.TemporaryDirectory() as home:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                got = backup_knowledge_db._untrack_ignored_binaries(pathlib.Path(home), False)
+            self.assertEqual(got, [])
+            self.assertIn(f"untrack: {home} is not a git repo, skipped", buf.getvalue())
+
+    def test_c4d_main_untracks_via_engram_home_after_a_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            os.makedirs(home)
+            _tracked_repo(home)
+            db = os.path.join(tmp, "src.sqlite")
+            _build_minimal_db(db)
+            out_dir = os.path.join(tmp, "out")
+            with mock.patch.object(backup_knowledge_db.owner_read, "engram_home",
+                                   return_value=pathlib.Path(home)):
+                rc, out, _ = _run_main(["--db", db, "--out-dir", out_dir, "--no-binary"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(_git(home, "ls-files").split(), ["knowledge.sql"])
+            self.assertTrue(os.path.exists(os.path.join(home, "backups", "old.db")))
+
+    def test_c5_tracked_binary_paths_is_read_only_and_matches_untrack(self):
+        with tempfile.TemporaryDirectory() as home:
+            _tracked_repo(home)
+            before = _git(home, "ls-files")
+            import engram_core
+            got = engram_core._tracked_binary_paths(pathlib.Path(home))
+            self.assertEqual(
+                sorted(got),
+                ["backups/old.db", "knowledge.db.2026-08-03-0045", "x.bak-2026-09-09"],
+            )
+            self.assertEqual(_git(home, "ls-files"), before)
+
+
+class TestRound3Fixes4208(unittest.TestCase):
+    def test_r3_1_negative_retain_is_usage_error_and_deletes_nothing(self):
+        for flag in ("--retain", "--prune-days"):
+            with tempfile.TemporaryDirectory() as tmp:
+                db = os.path.join(tmp, "k.db")
+                out_dir = os.path.join(tmp, "out")
+                _build_minimal_db(db)
+                names = ["knowledge-2020-01-01.sql", "knowledge-2020-02-01.sql", "knowledge-2020-03-01.sql"]
+                _touch_archives(out_dir, names)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    backup_knowledge_db.main(["--db", db, "--out-dir", out_dir, flag, "-5"])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("must be 0 or a positive number of days (got -5)", err.getvalue())
+                self.assertEqual(_sql_set(out_dir), set(names))
+
+    def test_r3_2_untrack_uses_engram_core_git_exe_and_timeout(self):
+        import engram_core
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".git"))
+            calls = []
+
+            def fake_run(cmd, **kw):
+                calls.append((cmd, kw))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with mock.patch.object(engram_core, "GIT_EXE", "/fake/bin/git-xyz"), \
+                 mock.patch.object(engram_core, "GIT_TIMEOUT", 7), \
+                 mock.patch.object(engram_core, "_tracked_binary_paths", return_value=["a.db.1"]), \
+                 mock.patch.object(backup_knowledge_db.subprocess, "run", side_effect=fake_run), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                backup_knowledge_db._untrack_ignored_binaries(pathlib.Path(home), False)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0][0], "/fake/bin/git-xyz")
+            self.assertEqual(calls[0][1]["timeout"], 7)
+
+    def test_r3_3_basename_globs_root_anchored_prefixes(self):
+        import engram_core
+        with tempfile.TemporaryDirectory() as home:
+            _git(home, "init", "-q")
+            _git(home, "config", "user.email", "t@example.invalid")
+            _git(home, "config", "user.name", "t")
+            rels = ("my.db.d/readme.txt", "sub/dir/knowledge.db.2026-08-03-0045", "nested/backups/old.db",
+                    "backups/root.db", "db-backup/z.sql")
+            for rel in rels:
+                os.makedirs(os.path.dirname(os.path.join(home, rel)), exist_ok=True)
+                with open(os.path.join(home, rel), "w") as f:
+                    f.write("d\n")
+            _git(home, "add", "-f", ".")
+            got = sorted(engram_core._tracked_binary_paths(pathlib.Path(home)))
+            self.assertEqual(got, ["backups/root.db", "db-backup/z.sql",
+                                   "sub/dir/knowledge.db.2026-08-03-0045"])
+
+    def test_r3_4_stray_tmp_swept_before_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "k.db")
+            out_dir = os.path.join(tmp, "out")
+            _build_minimal_db(db)
+            bdir = os.path.join(out_dir, "binary")
+            os.makedirs(bdir)
+            stray = os.path.join(bdir, ".knowledge-2020-01-01T000000Z.db.tmp")
+            keep = os.path.join(bdir, "notes.txt")
+            for f in (stray, keep):
+                open(f, "w").write("x")
+            backup_knowledge_db._write_binary_copy(out_dir, db)
+            self.assertFalse(os.path.exists(stray))
+            self.assertTrue(os.path.exists(keep))
+            self.assertEqual(len([n for n in os.listdir(bdir) if n.endswith(".db")]), 1)
+
+
+    def test_r4_1_untrack_stops_after_first_git_timeout(self):
+        import engram_core
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".git"))
+            calls = []
+
+            def fake_run(cmd, **kw):
+                calls.append(cmd)
+                raise subprocess.TimeoutExpired(cmd, 1)
+
+            err = io.StringIO()
+            with mock.patch.object(engram_core, "_tracked_binary_paths",
+                                   return_value=["a.db.1", "b.db.2", "c.db.3"]), \
+                 mock.patch.object(backup_knowledge_db.subprocess, "run", side_effect=fake_run), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                got = backup_knowledge_db._untrack_ignored_binaries(pathlib.Path(home), False)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(got, [])
+            self.assertIn("a.db.1", err.getvalue())
+            self.assertIn("remaining paths are skipped this run", err.getvalue())
+
+    def test_r4_1b_timeout_does_not_change_backup_exit(self):
+        import engram_core
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            os.makedirs(os.path.join(home, ".git"))
+            db = os.path.join(tmp, "src.sqlite")
+            _build_minimal_db(db)
+            out_dir = os.path.join(tmp, "out")
+
+            def fake_run(cmd, **kw):
+                raise subprocess.TimeoutExpired(cmd, 1)
+
+            with mock.patch.object(backup_knowledge_db.owner_read, "engram_home",
+                                   return_value=pathlib.Path(home)), \
+                 mock.patch.object(engram_core, "_tracked_binary_paths", return_value=["a.db.1", "b.db.2"]), \
+                 mock.patch.object(backup_knowledge_db.subprocess, "run", side_effect=fake_run):
+                rc, _, _ = _run_main(["--db", db, "--out-dir", out_dir, "--no-binary"])
+            self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

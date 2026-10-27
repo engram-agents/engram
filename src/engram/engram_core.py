@@ -3105,7 +3105,60 @@ ENGRAM_GITIGNORE_PATTERNS = [
     "secrets/",
     "*api-key*",
     "*.bak-*",
+    # #4208: hand-made binary copies (backups/, dated knowledge.db.<suffix>) and the
+    # rotating rollback copies the backup tool writes must never be staged.
+    "backups/",
+    "*.db.*",
+    "db-backup/binary/",
 ]
+
+
+# #4208: tracked paths the backup run untracks (never deletes): binary copies that
+# slipped past an older .gitignore. Read-only helper shared by the backup tool
+# (which untracks them) and engram_diagnose (which counts them).
+# Deliberate: the directory prefixes are anchored at the home ROOT only. The gitignore line
+# `backups/` ignores at any depth, but the untracker only touches the home-root copies, which is
+# where every known instance lives (a nested/backups/old.db is NOT matched). The two globs match
+# the path's BASENAME, so my.db.d/readme.txt (basename readme.txt) is not matched, sub/dir/knowledge.db.<stamp>
+# is, and so is a basename like x.db.md (it matches *.db.*) -- the gitignore line's own semantics.
+_TRACKED_BINARY_PREFIXES = ("backups/", "db-backup/")
+# The backup tool's file-name shapes (#4208), defined once: tools/backup_knowledge_db.py (rotation)
+# and engram_stats (engram_diagnose) both import them, so the two cannot drift.
+BACKUP_ARCHIVE_RE = re.compile(r"^knowledge-(\d{4}-\d{2}-\d{2})(-\d+)?\.sql$")
+BACKUP_BINARY_RE = re.compile(r"^knowledge-\d{4}-\d{2}-\d{2}T\d{6}Z\.db$")
+_TRACKED_BINARY_GLOBS = ("*.db.*", "*.bak-*")
+
+
+def _tracked_binary_paths(engram_home: "Path") -> list:
+    """Paths git tracks under *engram_home* that match backups/**, db-backup/**, *.db.* or *.bak-*.
+
+    Read-only (`git ls-files -z`). Returns [] when *engram_home* is not a git repo.
+    Raises RuntimeError when git fails inside a repo, so a caller that reports on it
+    (engram_diagnose) shows the failure instead of a false zero.
+    """
+    import fnmatch
+    home = Path(engram_home)
+    if not (home / ".git").exists():
+        return []
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        r = subprocess.run(
+            [GIT_EXE, "-C", str(home), "ls-files", "-z"],
+            capture_output=True, timeout=GIT_TIMEOUT, env=env,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        raise RuntimeError(f"git ls-files failed in {home}: {type(exc).__name__}: {exc}") from exc
+    if r.returncode != 0:
+        raise RuntimeError(f"git ls-files failed in {home}: {r.stderr.decode('utf-8', 'replace').strip()}")
+    out = []
+    for raw in r.stdout.split(b"\0"):
+        if not raw:
+            continue
+        p = raw.decode("utf-8", "surrogateescape")
+        if p.startswith(_TRACKED_BINARY_PREFIXES) or any(fnmatch.fnmatchcase(p.rsplit("/", 1)[-1], g) for g in _TRACKED_BINARY_GLOBS):
+            out.append(p)
+    return out
 
 
 def _ensure_engram_gitignore(data_dir: "Path") -> None:

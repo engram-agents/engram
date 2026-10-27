@@ -4019,6 +4019,17 @@ def engram_diagnose() -> str:
           success is older than 24 h (or never), or when behind > 0.
           Repair a refused remote with tools/backup_remote_repair.py.
 
+        - backup_archive (#4208): ALWAYS present.
+          {sql_count, sql_bytes, binary_count, binary_bytes, tracked_backup_count,
+          oldest, newest, flare} computed from $ENGRAM_HOME/db-backup/ (sql_* over
+          knowledge-*.sql, binary_* over binary/*.db; oldest/newest = the YYYY-MM-DD of
+          the oldest/newest archive, null when none). tracked_backup_count = paths
+          git tracks under the home that match any of the untrack globs (backups/**,
+          db-backup/**, *.db.*, *.bak-*), text or binary (a *.bak-* TEXT file counts), that
+          the backup run would untrack. flare is true when sql_bytes > 1 GiB or
+          tracked_backup_count > 0. On any failure the key is {"error": "<class>: <msg>"},
+          never absent.
+
         - metadata_quarantine (#3425): ALWAYS present, 0 included.
           {entity_kind, count, live_invalid_count, sample_ids, flare}.
           count = ROWS in the metadata_quarantine table (migration rung 7

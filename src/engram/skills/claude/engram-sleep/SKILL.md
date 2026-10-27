@@ -454,7 +454,7 @@ venv, so invoke via venv Python:
 
 ```bash
 backup_out=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \
-    [--retain 90] 2>&1)   # prune archives older than 90 days; omit to keep all
+    [--retain 90] 2>&1)   # optional override (= --prune-days): cutoff-only prune; omit for the default retention (table below)
 backup_rc=$?
 if [ $backup_rc -eq 0 ]; then
     backup_status="✓ backup OK"
@@ -488,6 +488,16 @@ instead.
 (survives `.git` corruption, works without git) but **not off-disk** (a full
 `${ENGRAM_HOME:-$HOME/.engram}/` loss takes it). The per-nap git auto-push is the off-disk layer.
 The three layers are complementary along those axes.
+
+**Three layers, three retentions (#4208).** The serialized SQL dump is the single source of truth; binary copies are for quick rollback only.
+
+| Layer | Where | Retention |
+|---|---|---|
+| SQL in git | `knowledge.sql`, carried by the snapshot worker's push | Source of truth; unbounded by design |
+| Local SQL archive | `db-backup/knowledge-<date>.sql` | Newest 14 days plus the first archive of each month; `--keep-all` / `--prune-days N` override |
+| Binary rollback | `db-backup/binary/` | 2 most recent, written by the backup tool after each SQL write (`--no-binary` skips) |
+
+Binary copies that git already tracks (`backups/**`, `db-backup/**`, `*.db.*`, `*.bak-*`) are untracked, not deleted, by the backup run; the next commit carries the removal.
 
 **Off-disk push state is not part of "knowledge.db backup".** The snapshot worker records every push to the off-disk remote in `${ENGRAM_HOME:-$HOME/.engram}/backup-push-status.json`; `engram_checkpoint` carries it as `backup_push` and `engram_diagnose` flares it. If it reads anything but `ok`, the off-disk layer is NOT working: do not report the backup as all-clear. To inspect or repair a diverged remote (explicit, refuses by default): `python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/backup_remote_repair.py" --status` (or `--repair`).
 

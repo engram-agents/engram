@@ -233,6 +233,17 @@ def test_fresh_home_gitignore_ignores_secrets_and_dated_baks(tmp_path, monkeypat
     assert r.returncode == 1  # the backup set stays tracked
 
 
+def test_fresh_home_gitignore_ignores_4208_backup_copies(tmp_path, monkeypatch):
+    """#4208: backups/, dated *.db.<suffix> copies and db-backup/binary/ never get staged."""
+    import engram_core
+    h = init_repo(tmp_path / "fresh4208")
+    monkeypatch.setattr(engram_core, "DATA_DIR", h)
+    engram_core._ensure_engram_gitignore(h)
+    for name in ("backups/x.db", "knowledge.db.2026-08-03-0045", "db-backup/binary/knowledge-x.db"):
+        r = subprocess.run(["git", "check-ignore", "-q", name], cwd=h)
+        assert r.returncode == 0, f"{name} is not ignored"
+
+
 def test_existing_gitignore_gains_new_patterns_and_keeps_negations(tmp_path, monkeypatch):
     import engram_core
     h = init_repo(tmp_path / "old")
@@ -451,6 +462,69 @@ def test_diagnose_backup_push_unreadable_file_flares():
     assert bp["result"] == "unreadable" and bp["flare"] is True
 
 
+def _diagnose_archive():
+    return json.loads(fresh_server_diag.engram_diagnose())["backup_archive"]
+
+
+def test_diagnose_backup_archive_counts_and_dates_4208():
+    global fresh_server_diag
+    fresh_server_diag = fresh_server()
+    bk = Path(TEST_DIR) / "db-backup"
+    (bk / "binary").mkdir(parents=True)
+    for n, size in (("knowledge-2026-09-01.sql", 10), ("knowledge-2026-10-05.sql", 20),
+                    ("knowledge-2026-10-05-2.sql", 30)):
+        (bk / n).write_bytes(b"x" * size)
+    (bk / "binary" / "knowledge-2026-10-05T010203Z.db").write_bytes(b"y" * 7)
+    ba = _diagnose_archive()
+    assert ba == {
+        "sql_count": 3, "sql_bytes": 60, "binary_count": 1, "binary_bytes": 7,
+        "tracked_backup_count": 0, "oldest": "2026-09-01", "newest": "2026-10-05", "flare": False,
+    }
+
+
+def test_diagnose_backup_archive_empty_dir_zeros_and_nulls_4208():
+    global fresh_server_diag
+    fresh_server_diag = fresh_server()
+    ba = _diagnose_archive()
+    assert ba == {
+        "sql_count": 0, "sql_bytes": 0, "binary_count": 0, "binary_bytes": 0,
+        "tracked_backup_count": 0, "oldest": None, "newest": None, "flare": False,
+    }
+
+
+def test_diagnose_backup_archive_tracked_binary_flares_4208():
+    global fresh_server_diag
+    fresh_server_diag = fresh_server()
+    h = init_repo(Path(TEST_DIR))
+    (h / "knowledge.db.2026-08-03-0045").write_bytes(b"z")
+    sh(h, "add", "-f", "knowledge.db.2026-08-03-0045")
+    ba = _diagnose_archive()
+    assert ba["tracked_backup_count"] == 1 and ba["flare"] is True
+    assert "tracked_binary_count" not in ba
+
+
+def test_diagnose_backup_archive_error_shape_never_absent_4208(monkeypatch):
+    global fresh_server_diag
+    fresh_server_diag = fresh_server()
+    import engram_core
+
+    def boom(_home):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(engram_core, "_tracked_binary_paths", boom)
+    ba = _diagnose_archive()
+    assert ba == {"error": "RuntimeError: nope"}
+
+
+def test_diagnose_impl_itself_carries_backup_archive_4208():
+    """R2-2: the key is built in engram_stats._diagnose_impl, not in a server.py wrapper."""
+    import engram_stats
+    fresh_server()
+    out = json.loads(engram_stats._diagnose_impl())
+    assert "backup_archive" in out
+    assert "backup_push" in out
+
+
 def test_diagnose_no_remote_reported_but_never_flares():
     """An install without a remote is a configuration state, not a failure."""
     bp = diagnose_with(result="no-remote", last_success_utc=None, ahead=None, behind=None)
@@ -493,3 +567,15 @@ def test_add_failure_leaves_status_byte_identical(home):
     r = commit_via_worker(home, "2")
     assert r["git_committed"] is False and "add failed" in r["reason"]
     assert (home / STATUS_NAME).read_bytes() == before
+
+
+def test_diagnose_binary_count_uses_rotation_regex_4208():
+    """R3-5: a foreign other.db in binary/ is not counted."""
+    global fresh_server_diag
+    fresh_server_diag = fresh_server()
+    bk = Path(TEST_DIR) / "db-backup"
+    (bk / "binary").mkdir(parents=True)
+    (bk / "binary" / "knowledge-2026-10-05T010203Z.db").write_bytes(b"y" * 7)
+    (bk / "binary" / "other.db").write_bytes(b"z" * 100)
+    ba = _diagnose_archive()
+    assert ba["binary_count"] == 1 and ba["binary_bytes"] == 7

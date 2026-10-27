@@ -19,9 +19,24 @@ enough — see #2235 review, below). A same-day file that predates the
 current DB state, has no matching watermark, or whose named archive was
 deleted, is never trusted as "already covers this state" and a fresh
 archive is written instead. Pass --force to always take a real backup
-regardless of the watermark. Optionally prunes archives older than DAYS
-days (suffixed archives prune by the same date as their unsuffixed
-sibling).
+regardless of the watermark.
+
+Retention (#4208). The serialized SQL dump is the single source of truth; binary
+copies are for quick rollback only. By DEFAULT the tool keeps the newest 14 daily
+archives plus the first archive of each calendar month (a monthly anchor) and prunes
+the rest. The default policy is date-of-filename based (never mtime, never today's
+date): "newest 14" counts distinct dates among the archives present, and a suffixed
+same-day archive (-2, -3, ...) is kept or pruned together with its day. --prune-days N
+(alias of --retain N) is an OVERRIDE: when N > 0 it prunes strictly by the date cutoff
+(no 14-day / anchor policy). --keep-all prunes nothing (combining it with --prune-days N > 0
+is a usage error). An EXPLICIT --retain 0 / --prune-days 0 keeps its pre-#4208 meaning
+(keep all, like --keep-all; so --keep-all --prune-days 0 is not an error); only the ABSENT flag
+selects the default policy. After a successful SQL write (not on a content-skip, not on
+--dry-run) one consistent binary copy is written to db-backup/binary/knowledge-<ISO-UTC>.db
+and only the 2 most recent are kept (--no-binary skips the copy and its rotation).
+Every run then untracks (git rm --cached, files stay on disk) any binary copy git already
+tracks under the home -- backups/**, db-backup/**, *.db.*, *.bak-* -- so it stops being
+pushed off-disk; the next nap/sleep commit carries the removal.
 
 Watermark coverage is deliberately partial, not a full-database fingerprint
 — know its blind spots before trusting a "skipping" line:
@@ -81,7 +96,7 @@ orphan outlives a flag turned back OFF. The uid check cannot be pinned by a test
 single-uid seat (ownership cannot be faked without root).
 
 Usage:
-    python3 backup_knowledge_db.py [--db PATH] [--out-dir DIR] [--retain DAYS] [--dry-run] [--force]
+    python3 backup_knowledge_db.py [--db PATH] [--out-dir DIR] [--retain|--prune-days DAYS | --keep-all] [--dry-run] [--force] [--no-binary]
 """
 
 from __future__ import annotations
@@ -95,6 +110,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -112,7 +128,12 @@ from tools import _owner_read as owner_read  # noqa: E402
 
 
 _WATERMARK_FILENAME = ".watermark.json"
-_ARCHIVE_RE = re.compile(r"^knowledge-(\d{4}-\d{2}-\d{2})(-\d+)?\.sql$")
+
+# --- retention + binary copies (#4208) ---------------------------------------
+_KEEP_DAILY = 14
+_BINARY_DIRNAME = "binary"
+_BINARY_KEEP = 2
+_BINARY_STAMP_FMT = "%Y-%m-%dT%H%M%SZ"
 
 # --- owner snapshot (#3872) --------------------------------------------------
 OWNER_FLAG_KEY = "backup_reads_via_owner"
@@ -147,18 +168,35 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--db",
         default=str(owner_read.default_db_path()),
-        help="Source database path (default: $ENGRAM_HOME/knowledge.db).",
+        help="Source database path (default: $ENGRAM_HOME/knowledge.db). Does not move the "
+        "untracking step, which always acts on $ENGRAM_HOME.",
     )
     p.add_argument(
         "--out-dir",
         default=str(owner_read.engram_home() / "db-backup"),
-        help="Destination directory for dated archives (default: $ENGRAM_HOME/db-backup).",
+        help="Destination directory for dated archives (default: $ENGRAM_HOME/db-backup). "
+        "Does not move the untracking step, which always acts on $ENGRAM_HOME.",
     )
     p.add_argument(
         "--retain",
+        "--prune-days",
+        dest="retain",
         type=int,
-        default=0,
-        help="If > 0, prune .sql archives older than DAYS days. Default: 0 (keep all).",
+        default=None,
+        help="OVERRIDE: if > 0, prune .sql archives older than DAYS days and nothing else "
+        "(no 14-day / monthly-anchor policy). An explicit 0 keeps all archives (as before "
+        "#4208). Flag absent = the default policy (newest 14 daily archives + the first "
+        "archive of each month).",
+    )
+    p.add_argument(
+        "--keep-all",
+        action="store_true",
+        help="Prune no .sql archive (the pre-#4208 behaviour). Cannot be combined with --prune-days.",
+    )
+    p.add_argument(
+        "--no-binary",
+        action="store_true",
+        help="Skip the rollback binary copy in <out-dir>/binary/ (and its rotation).",
     )
     p.add_argument(
         "--dry-run",
@@ -171,7 +209,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip the watermark comparison and always perform a real backup "
         "(still suffix-on-collision if today's archive already exists).",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.retain is not None and args.retain < 0:
+        p.error(f"--prune-days/--retain must be 0 or a positive number of days (got {args.retain})")
+    if args.keep_all and args.retain is not None and args.retain > 0:
+        p.error("--keep-all and --prune-days (--retain) are mutually exclusive")
+    return args
 
 
 def _prune_old_archives(out_dir: str, retain_days: int, dry_run: bool) -> None:
@@ -181,11 +224,12 @@ def _prune_old_archives(out_dir: str, retain_days: int, dry_run: bool) -> None:
     the SAME date as its unsuffixed sibling -- the suffix is not a date
     component, just a same-day collision counter.
     """
+    import engram_core  # lazy: owns the archive-name regex
     cutoff = datetime.date.today() - datetime.timedelta(days=retain_days)
     pattern = os.path.join(out_dir, "knowledge-*.sql")
     for path in sorted(glob.glob(pattern)):
         fname = os.path.basename(path)
-        m = _ARCHIVE_RE.match(fname)
+        m = engram_core.BACKUP_ARCHIVE_RE.match(fname)
         if not m:
             # Filename doesn't match expected pattern — skip.
             continue
@@ -199,6 +243,165 @@ def _prune_old_archives(out_dir: str, retain_days: int, dry_run: bool) -> None:
             else:
                 os.unlink(path)
                 print(f"pruned: {path}")
+
+
+def _prune_default_policy(out_dir: str, dry_run: bool) -> None:
+    """Default retention (#4208): keep the newest _KEEP_DAILY distinct archive dates plus the
+    first (earliest-dated) archive date of each calendar month; prune everything else.
+
+    Date-of-filename based: "newest 14" and "first of the month" are computed from the dates
+    in the archive names relative to each other, never from mtime or today's date. Every file
+    of a kept day (suffixed -2, -3 ... included) is kept; every file of a pruned day is pruned.
+    Names that do not match engram_core.BACKUP_ARCHIVE_RE are never touched.
+    """
+    import engram_core  # lazy: owns the archive-name regex
+    by_date: dict = {}
+    for path in glob.glob(os.path.join(out_dir, "knowledge-*.sql")):
+        m = engram_core.BACKUP_ARCHIVE_RE.match(os.path.basename(path))
+        if not m:
+            continue
+        try:
+            d = datetime.date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        by_date.setdefault(d, []).append(path)
+    dates = sorted(by_date)
+    keep = set(dates[-_KEEP_DAILY:])
+    first_of_month: dict = {}
+    for d in dates:  # ascending: the first date seen per (year, month) is its anchor
+        first_of_month.setdefault((d.year, d.month), d)
+    keep.update(first_of_month.values())
+    for d in dates:
+        if d in keep:
+            continue
+        for path in sorted(by_date[d]):
+            if dry_run:
+                print(f"[dry-run] would prune: {path}")
+            else:
+                os.unlink(path)
+                print(f"pruned: {path}")
+
+
+def _apply_retention(out_dir: str, args: argparse.Namespace) -> None:
+    """The one retention dispatch (#4208), run wherever pruning ran before: --keep-all prunes
+    nothing; an explicit --prune-days/--retain 0 also keeps all; N > 0 prunes strictly by date
+    cutoff; flag absent (None) -> the default policy (newest 14 + monthly anchors)."""
+    if args.keep_all or args.retain == 0:
+        return
+    if args.retain is not None:
+        _prune_old_archives(out_dir, args.retain, args.dry_run)
+    else:
+        _prune_default_policy(out_dir, args.dry_run)
+
+
+def _untrack_ignored_binaries(engram_home: Path, dry_run: bool) -> list:
+    """Untrack (git rm --cached; the file stays on disk) every binary copy git tracks under
+    *engram_home*: backups/**, db-backup/**, *.db.*, *.bak-*. Returns the untracked paths.
+
+    Always acts on *engram_home* (the caller passes $ENGRAM_HOME), whatever --db / --out-dir say:
+    a run pointed at a sandbox --db or --out-dir still untracks in the real home.
+
+    Does not commit -- the next nap/sleep commit carries the removal. Never raises: a git
+    failure prints one warning to stderr and returns what was untracked so far.
+    """
+    import engram_core  # lazy: the CLI's other paths never need it
+
+    home = Path(engram_home)
+    if not (home / ".git").exists():
+        print(f"untrack: {home} is not a git repo, skipped")
+        return []
+    try:
+        paths = engram_core._tracked_binary_paths(home)
+    except Exception as exc:
+        print(f"warning: untrack skipped: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return []
+    done: list = []
+    for path in paths:
+        if dry_run:
+            print(f"[dry-run] would untrack: {path}")
+            done.append(path)
+            continue
+        try:
+            r = subprocess.run(
+                [engram_core.GIT_EXE, "--literal-pathspecs", "-C", str(home), "rm", "--cached", "--quiet", "--", path],
+                capture_output=True, text=True, timeout=engram_core.GIT_TIMEOUT,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Stop issuing calls: a SIGKILLed git can leave .git/index.lock behind, which
+            # the next run or commit will report; more calls would only pile onto a stuck repo.
+            print(f"warning: git rm --cached timed out for {path} ({exc}); "
+                  "remaining paths are skipped this run", file=sys.stderr)
+            break
+        except OSError as exc:
+            print(f"warning: git rm --cached failed for {path}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            continue
+        if r.returncode != 0:
+            print(f"warning: git rm --cached failed for {path}: {r.stderr.strip()}", file=sys.stderr)
+            continue
+        print(f"untracked (stays on disk, no longer pushed): {path}")
+        done.append(path)
+    return done
+
+
+def _housekeeping(out_dir: str, args: argparse.Namespace) -> None:
+    """Retention, then untracking tracked binary copies (once per run)."""
+    _apply_retention(out_dir, args)
+    _untrack_ignored_binaries(owner_read.engram_home(), args.dry_run)
+
+
+def _binary_dir(out_dir: str) -> str:
+    return os.path.join(out_dir, _BINARY_DIRNAME)
+
+
+def _next_binary_path(out_dir: str) -> str:
+    """binary/knowledge-<ISO-UTC>.db for now; if that name is taken (two writes inside one
+    second), step forward one second until free so names stay unique and sort by time."""
+    t = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    bdir = _binary_dir(out_dir)
+    while True:
+        cand = os.path.join(bdir, f"knowledge-{t.strftime(_BINARY_STAMP_FMT)}.db")
+        if not os.path.exists(cand):
+            return cand
+        t += datetime.timedelta(seconds=1)
+
+
+def _write_binary_copy(out_dir: str, source_path: str) -> None:
+    """One consistent binary copy of *source_path* (sqlite backup API: WAL-safe hot copy), then
+    rotate to the _BINARY_KEEP newest. A failure warns on stderr and never fails the run: the
+    SQL archive, the single source of truth, is already written."""
+    import engram_core  # lazy: owns the binary-name regex
+    bdir = _binary_dir(out_dir)
+    target = _next_binary_path(out_dir)
+    tmp_path = None
+    try:
+        os.makedirs(bdir, mode=0o700, exist_ok=True)
+        os.chmod(bdir, 0o700)
+        for stray in glob.glob(os.path.join(glob.escape(bdir), ".knowledge-*.db.tmp")):
+            os.unlink(stray)  # a kill between tmp creation and os.replace leaves one forever
+        tmp_path = os.path.join(bdir, "." + os.path.basename(target) + ".tmp")
+        src = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+        try:
+            dst = sqlite3.connect(tmp_path)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        os.replace(tmp_path, target)
+        tmp_path = None
+    except Exception as exc:
+        print(f"warning: binary copy failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        return
+    print(f"binary copy written: {target}")
+    names = sorted(n for n in os.listdir(bdir) if engram_core.BACKUP_BINARY_RE.match(n))
+    for n in names[:-_BINARY_KEEP]:
+        victim = os.path.join(bdir, n)
+        os.unlink(victim)
+        print(f"pruned binary: {victim}")
 
 
 def _sweep_stale_owner_tmpdirs(out_dir: str, dry_run: bool, now: float | None = None) -> None:
@@ -423,8 +626,9 @@ def _main_via_owner(args: argparse.Namespace, spec: "owner_read.OwnerReadSpec", 
                 f"[dry-run] would snapshot via the engramd owner and write backup: {target_path} "
                 "(a dry run takes no snapshot, so it cannot tell whether the backup would be skipped)"
             )
-            if args.retain > 0:
-                _prune_old_archives(out_dir, args.retain, args.dry_run)
+            if not args.no_binary:
+                print(f"[dry-run] would write binary copy: {_next_binary_path(out_dir)}")
+            _housekeeping(out_dir, args)
             return 0
 
         os.makedirs(out_dir, exist_ok=True)
@@ -524,9 +728,8 @@ def _skip_or_backup(
                     f"{fmt(live_watermark['history_max_timestamp'])}) — matches "
                     f"{out_dir}/{persisted_watermark.get('archive')}, skipping"
                 )
-                # Still run retention pruning even when skipping the backup.
-                if args.retain > 0:
-                    _prune_old_archives(out_dir, args.retain, args.dry_run)
+                # Still run retention pruning even when skipping the backup (no binary copy).
+                _housekeeping(out_dir, args)
                 return 0
             print(
                 f"watermark matches the last successful backup, but its archive "
@@ -538,8 +741,9 @@ def _skip_or_backup(
 
     if args.dry_run:
         print(f"[dry-run] would write backup: {target_path}")
-        if args.retain > 0:
-            _prune_old_archives(out_dir, args.retain, args.dry_run)
+        if not args.no_binary:
+            print(f"[dry-run] would write binary copy: {_next_binary_path(out_dir)}")
+        _housekeeping(out_dir, args)
         return 0
 
     # Perform the backup.
@@ -557,9 +761,11 @@ def _skip_or_backup(
     # Persist the watermark this backup actually covers.
     _write_watermark(out_dir, live_watermark, os.path.basename(target_path))
 
-    # Retention pruning.
-    if args.retain > 0:
-        _prune_old_archives(out_dir, args.retain, args.dry_run)
+    # Rollback binary copy (owner path: from the owner snapshot; direct path: a hot copy of the
+    # live store), then retention + untracking.
+    if not args.no_binary:
+        _write_binary_copy(out_dir, source_path)
+    _housekeeping(out_dir, args)
 
     return 0
 
