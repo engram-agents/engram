@@ -1597,7 +1597,7 @@ def update_counterparts_from_registry(
             try:
                 text = read_regular_text(json_file, encoding="utf-8")
                 record = json.loads(text)
-            except (OSError, json.JSONDecodeError, ValueError):
+            except (OSError, json.JSONDecodeError, ValueError, RecursionError):
                 continue  # skip malformed/unreadable files
 
             if not isinstance(record, dict):
@@ -1690,7 +1690,7 @@ def peer_topology_block(agent_name: str) -> str:
         for json_file in sorted(registry_path.glob("*.json")):
             try:
                 record = json.loads(read_regular_text(json_file, encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, ValueError):
+            except (OSError, json.JSONDecodeError, ValueError, RecursionError):
                 continue
 
             if not isinstance(record, dict):  # #4145: list / string / number record -> skip it, not every peer
@@ -1708,6 +1708,8 @@ def peer_topology_block(agent_name: str) -> str:
             if reg_at and isinstance(reg_at, str):  # no registered_at → treat as live (fail-open: missing timestamp ≠ stale)
                 try:
                     reg_dt = datetime.fromisoformat(reg_at.replace("Z", "+00:00"))
+                    if reg_dt.tzinfo is None:  # #4211: naive = UTC, same as update_counterparts_from_registry
+                        reg_dt = reg_dt.replace(tzinfo=timezone.utc)
                     if (now - reg_dt) > stale_delta:
                         continue
                 except (ValueError, TypeError):
