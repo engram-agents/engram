@@ -84,9 +84,13 @@ def _load_config() -> dict:
     config_path = engram_home() / "config.json"
     if config_path.exists():
         try:
-            return json.loads(config_path.read_text())
+            parsed = json.loads(config_path.read_text())
         except (json.JSONDecodeError, OSError):
             pass
+        else:
+            # #4229: a non-dict top level (hand-edited) is treated as no config.
+            if isinstance(parsed, dict):
+                return parsed
     return {}
 
 

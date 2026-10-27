@@ -456,7 +456,13 @@ def _load_drowsiness_thresholds(mode: str) -> dict:
             config = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         return defaults
-    display_block = (config.get("drowsiness_display") or {}).get(mode) or {}
+    # #4229: a non-dict top level or `drowsiness_display` means the defaults.
+    if not isinstance(config, dict):
+        return defaults
+    display_root = config.get("drowsiness_display") or {}
+    if not isinstance(display_root, dict):
+        return defaults
+    display_block = display_root.get(mode) or {}
     if not isinstance(display_block, dict):
         return defaults
     return {

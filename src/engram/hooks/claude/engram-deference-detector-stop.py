@@ -183,7 +183,9 @@ def _cooldown_minutes() -> float:
     try:
         with open_regular_text(CONFIG_PATH) as f:
             cfg = json.load(f)
-        val = cfg.get("deference_detector", {}).get("cooldown_minutes")
+        # #4229: a non-dict top level or `deference_detector` means the default.
+        block = cfg.get("deference_detector", {}) if isinstance(cfg, dict) else {}
+        val = block.get("cooldown_minutes") if isinstance(block, dict) else None
         if isinstance(val, (int, float)) and val >= 0:
             return float(val)
     except (OSError, ValueError, json.JSONDecodeError):
