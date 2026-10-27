@@ -575,7 +575,8 @@ carried it until 2026-08-30:
    is the current one — that command exposes no `completedAt`, but on a finished run
    its `updatedAt` is ≈ the completion time (measured ~1s later, on five runs).
    This dedupe is the test verdict, but see rule 3 of "Merge-seat test rules" below: a
-   cancelled same-SHA run can still block the merge; rerun it. Which gate reads which:
+   cancelled same-SHA run can still block the merge; rerun it (or, if the PR body or title
+   changed since that run, trigger a fresh run instead: rule 3). Which gate reads which:
    this dedupe answers the readiness question (is the newest run of each check green)
    for the flip and merge-signal gates. The press step answers GitHub's merge-gate
    question (did every run on this head succeed) with the strict read of rule 5.
@@ -666,7 +667,8 @@ Observed: a required status check can read as not-satisfied — the PR stays `BL
 and the merge is refused — when a run of that check on the head SHA was
 `CANCELLED`, even though another run on the same SHA passed. `gh run rerun <the
 cancelled run id>` cleared it. Never argue from the deduplication above ("another run
-passed, so the gate is satisfied"); rerun the cancelled run.
+passed, so the gate is satisfied"); rerun the cancelled run, unless the PR body or
+title changed since it (next paragraph).
 
 The cause seen, on alpha #3489 only: two `pull_request` runs on the same SHA were
 created in the same second, after a push and a PR-body edit seconds apart, and
@@ -686,6 +688,20 @@ gave `CLEAN` as soon as it completed.
 (2) alpha #3489, ~17:13–17:20Z: read `BLOCKED | pr-checks:CANCELLED, pr-checks:SUCCESS`
 (two runs on the same SHA, started in the same second by a push and a body edit);
 `gh run rerun` of the cancelled run gave `CLEAN | SUCCESS, SUCCESS`.
+
+**A rerun replays the original event, payload included.** `gh run rerun` re-executes
+the workflow against the event that created the run, with the PR body and title as
+they were at that moment, not as they are now (measured; recorded in the `edited`
+comment of `.github/workflows/pr-checks.yml`). So when the body or title has changed
+since the cancelled run, do not rerun it. Trigger a fresh run instead (an `edited`
+event, or a push), and read that run. For a body change: fetch the current body
+(`gh pr view <N> --json body -q .body > <file>`) and re-submit it with `gh pr edit <N>
+--body-file <file>`. For a title-only change, a title edit or a push. A red on a body or title step in a rerun made after such a change is an
+artifact of the stale payload, not a PR defect, and must not be read as a blocker.
+
+*Evidence:* alpha #4232, 2026-10-27 (Halley's measurement). The author fixed a
+body-text close trap after the run was cancelled; the rerun checked the old body and
+turned the body-trap step red while the live body was clean (#4235).
 
 **4. A red that only the whole run produces is a load flake, not a PR red** (Kepler,
 2026-10-25; condition four added on Luria's review). It applies when all four hold:
@@ -770,7 +786,8 @@ gh api 'repos/<owner>/<repo>/commits/<head-sha>/check-runs?filter=all&per_page=1
 
 The read prints `success` only when every run of the check on the head finished
 successfully. Anything else means wait for `CLEAN`. If the PR stays `BLOCKED` on a
-cancelled run, rerun that run (rule 3) and then wait for `CLEAN`. The read itself
+cancelled run, rerun that run (rule 3; a fresh run instead if the body or title changed
+since it) and then wait for `CLEAN`. The read itself
 keeps printing `not-all-success` after a rerun, because `filter=all` still lists the
 cancelled run beside the rerun's success; #3489's head reads that way today. So the
 read is a way through only when it prints `success`, and `CLEAN` is the way through
