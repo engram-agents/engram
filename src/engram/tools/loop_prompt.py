@@ -23,6 +23,11 @@ CLI (compose with shell tools):
 
     echo "Loop tick — checking new work." | python -m engram.tools.loop_prompt
 
+CLI — default heartbeat stub (#4223): prints exactly what
+``echo "<DEFAULT_STUB>" | python3 loop_prompt.py`` prints, without reading stdin:
+
+    python3 loop_prompt.py --default-stub
+
 CLI — re-arm delay (#3005, #4007):
 
     delay=$(python3 loop_prompt.py --rearm-delay --wake-kind other)
@@ -204,6 +209,13 @@ _MIN_DELAY_SECONDS: int = 60
 DEFAULT_CADENCE_SECONDS: int = 900
 
 CADENCE_CONFIG_FIELD: str = "loop.heartbeat_cadence_seconds"
+
+# The ONE owner of the default heartbeat stub text (#4223).  The boot charges and the loop-arm
+# hook name ``--default-stub`` instead of carrying a copy, so the text cannot drift.
+DEFAULT_STUB: str = (
+    "Heartbeat wake: check crossings and forum items addressed to me, read my loop marker, "
+    "do any planned item; otherwise re-arm at cadence_seconds from my loop marker."
+)
 
 def default_marker_path() -> str:
     """Default marker path: ``loop-mode.json`` under the ENGRAM home (Step 0 of the engram-loop
@@ -552,7 +564,17 @@ def _main() -> None:
         help="Print the configured heartbeat cadence in seconds as a bare integer "
              "(config field loop.heartbeat_cadence_seconds, team default 900).",
     )
+    mode.add_argument(
+        "--default-stub",
+        dest="default_stub",
+        action="store_true",
+        help="Print the marked default heartbeat stub (DEFAULT_STUB) and exit; reads no stdin.",
+    )
     args = parser.parse_args()
+
+    if args.default_stub:
+        print(format_loop_prompt(DEFAULT_STUB + "\n"), end="")
+        sys.exit(0)
 
     if args.cadence:
         sys.stdout.write(f"{configured_cadence_seconds()}\n")

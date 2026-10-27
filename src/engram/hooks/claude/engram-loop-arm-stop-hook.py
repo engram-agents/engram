@@ -709,7 +709,9 @@ def _nudge_text_for_marker(loop_marker_path: str) -> str:
     return (
         _NUDGE_HEAD
         + "This marker has no `loop_prompt` field: build the prompt with "
-        + f"`echo '<your loop stub>' | python3 {_loop_prompt_helper_path()}` "
+        + f"`python3 {_loop_prompt_helper_path()} --default-stub` for a heartbeat loop "
+        + "(for any other loop kind, build it from one line saying what that wake does, "
+        + f"e.g. `echo '<one line saying what this wake does>' | python3 {_loop_prompt_helper_path()}`) "
         + "(never hand-write it). "
         + _NUDGE_TAIL
     )

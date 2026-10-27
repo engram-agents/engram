@@ -27,7 +27,11 @@ from tests.test_loop_arm_stop_hook import (
 pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
 
 _OLD_SENTENCE = "Use this file's own `loop_prompt` field verbatim for the ScheduleWakeup prompt"
-_NEW_SENTENCE = "This marker has no `loop_prompt` field: build the prompt with `echo '<your loop stub>' | python3 "
+_NEW_SENTENCE = "This marker has no `loop_prompt` field: build the prompt with `python3 "
+# #4223 round 2 (Luria item 1): --default-stub for a heartbeat loop, framed as an example; any
+# other kind builds the prompt from one line saying what that wake does.
+_STUB_FLAG = " --default-stub`"
+_OTHER_KIND_EXAMPLE = "e.g. `echo '<one line saying what this wake does>' | python3 "
 
 
 def _run_nudge(tmp_path: Path, marker_text: str) -> tuple[str, int]:
@@ -93,6 +97,8 @@ def test_c2_missing_or_bad_loop_prompt_points_at_helper(tmp_path, extra):
     assert "Loop Arm Check" in reason
     assert "this file's own `loop_prompt` field" not in reason
     assert _NEW_SENTENCE in reason
+    assert _STUB_FLAG in reason and _OTHER_KIND_EXAMPLE in reason
+    assert "Heartbeat wake" not in reason
     assert "loop_prompt.py" in reason
     # rest of the nudge stays identical
     assert "batch `ScheduleWakeup(delay=cadence_seconds)` and `CronList`" in reason
@@ -120,3 +126,4 @@ def test_c3_selector_on_unreadable_marker_is_c2_and_never_raises(tmp_path):
         text = mod._nudge_text_for_marker(path)
         assert "this file's own `loop_prompt` field" not in text
         assert _NEW_SENTENCE in text
+        assert _STUB_FLAG in text and _OTHER_KIND_EXAMPLE in text
