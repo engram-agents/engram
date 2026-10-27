@@ -234,6 +234,7 @@ timer or module constant in its place.
 
 from __future__ import annotations
 
+import bisect
 import copy
 import errno
 import hashlib
@@ -257,6 +258,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import engram_home_resolver
@@ -2457,6 +2459,351 @@ def _use_reward_param_refusal(params) -> "dict | None":
     return None
 
 
+# ---------------------------------------------------------------------------
+# #4234 (part of #3740): per-day read-lock wait counters.
+#
+# The owner serialises client reads on `_client_read_lock`; seats deciding whether to route
+# lesson-tripwire reads through the owner pay that cost only when reads actually queue. These
+# counters measure how often they do, per request family, in a bounded per-UTC-day rollup
+# (`lockwait-YYYY-MM-DD.json` in the run dir) read by tools/engramd_lockwait_report.py.
+#
+# Zero cost on the reply path: the request thread only increments a handful of in-memory
+# integers under a tiny private lock. The file is written by a background daemon thread (at
+# most once a minute) and on stop(); never by a request thread.
+# ---------------------------------------------------------------------------
+
+#: A read that waited longer than this many ms in the acquire is a "waited read".
+LOCKWAIT_WAITED_THRESHOLD_MS = 1.0
+#: Fixed upper edges (ms) of the waited-read histogram; a value goes in the first bucket whose edge is >= it.
+LOCKWAIT_BUCKET_EDGES_MS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, math.inf)
+#: Seconds between background flushes of the rollup file.
+LOCKWAIT_FLUSH_INTERVAL_S = 60.0
+LOCKWAIT_SCHEMA = 1
+LOCKWAIT_OTHER_FAMILY = "other"
+#: The fixed site-file -> family table. Any file not listed maps to its stem with `-` replaced by `_`.
+LOCKWAIT_FAMILY_BY_FILE = {
+    "engram-lesson-tripwire-hook.py": "tripwire",
+    "engram-surface-hook.py": "surface",
+    "engram-session-start-hook.py": "session_start",
+    "engram_idf.py": "idf",
+}
+
+
+def _lockwait_edge_key(edge) -> str:
+    return "inf" if edge == math.inf else str(int(edge))
+
+
+LOCKWAIT_EDGE_KEYS = tuple(_lockwait_edge_key(e) for e in LOCKWAIT_BUCKET_EDGES_MS)
+
+
+def lockwait_family_for_sites(sites) -> str:
+    """The family of one template from its `sites` (`path:function` strings): each site's file basename
+    mapped through LOCKWAIT_FAMILY_BY_FILE (else the stem, `-` -> `_`); several distinct families
+    are joined with `+` in sorted order, never guessed between."""
+    families = set()
+    for site in sites:
+        path = str(site).rsplit(":", 1)[0].replace("\\", "/")
+        base = path.rsplit("/", 1)[-1]
+        family = LOCKWAIT_FAMILY_BY_FILE.get(base)
+        if family is None:
+            family = os.path.splitext(base)[0].replace("-", "_")
+        if family:
+            families.add(family)
+    return "+".join(sorted(families)) if families else LOCKWAIT_OTHER_FAMILY
+
+
+def lockwait_family_map(templates) -> "dict[str, str]":
+    """template key (sha256 of the SQL) -> family, from the committed template entries."""
+    out: dict = {}
+    for entry in templates or ():
+        if not isinstance(entry, dict):
+            continue
+        key, sites = entry.get("key"), entry.get("sites")
+        if isinstance(key, str) and isinstance(sites, list):
+            out[key] = lockwait_family_for_sites(sites)
+    return out
+
+
+def lockwait_family_for_sql(family_map, sql) -> str:
+    """The family of a `read` request: map[template_key(sql)], else `other` (unknown SQL, non-str,
+    unencodable, or no map)."""
+    if not family_map or not isinstance(sql, str):
+        return LOCKWAIT_OTHER_FAMILY
+    try:
+        key = rr.template_key(sql)
+    except UnicodeEncodeError:
+        return LOCKWAIT_OTHER_FAMILY
+    return family_map.get(key, LOCKWAIT_OTHER_FAMILY)
+
+
+def lockwait_bucket_index(wait_ms: float) -> int:
+    """Index of the first bucket whose upper edge is >= wait_ms."""
+    return bisect.bisect_left(LOCKWAIT_BUCKET_EDGES_MS, wait_ms)
+
+
+def lockwait_p95(counts):
+    """Upper edge of the bucket holding the 95th percentile (nearest-rank, ceil(0.95 n)) of the
+    waited reads in `counts` (one count per bucket); None when there are none."""
+    n = sum(counts)
+    if n <= 0:
+        return None
+    rank = (95 * n + 99) // 100
+    running = 0
+    for edge, count in zip(LOCKWAIT_BUCKET_EDGES_MS, counts):
+        running += count
+        if running >= rank:
+            return edge
+    return LOCKWAIT_BUCKET_EDGES_MS[-1]
+
+
+def _lockwait_utc_date() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _lockwait_new_family() -> dict:
+    return {"reads": 0, "waited_reads": 0, "wait_ms_sum": 0.0, "timed_out": 0, "no_time_before_acquire": 0,
+            "hist": [0] * len(LOCKWAIT_BUCKET_EDGES_MS)}
+
+
+def _lockwait_p95_for_doc(p95) -> object:
+    """JSON has no Infinity: the +inf bucket's edge is the string "inf"; a finite edge is an integer."""
+    return None if p95 is None else ("inf" if p95 == math.inf else int(p95))
+
+
+def _lockwait_family_to_doc(fam: dict) -> dict:
+    p95 = lockwait_p95(fam["hist"])
+    return {
+        "reads": fam["reads"], "waited_reads": fam["waited_reads"], "wait_ms_sum": round(fam["wait_ms_sum"], 3),
+        "timed_out": fam["timed_out"], "no_time_before_acquire": fam["no_time_before_acquire"],
+        "wait_hist": dict(zip(LOCKWAIT_EDGE_KEYS, fam["hist"])),
+        "wait_ms_p95": _lockwait_p95_for_doc(p95),
+    }
+
+
+def _lockwait_family_from_doc(doc) -> dict:
+    """Parse one family out of a rollup file; raises ValueError on any shape problem."""
+    if not isinstance(doc, dict):
+        raise ValueError("family entry is not an object")
+    fam = _lockwait_new_family()
+    for name in ("reads", "waited_reads", "timed_out", "no_time_before_acquire"):
+        value = doc.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} is not a non-negative integer")
+        fam[name] = value
+    total = doc.get("wait_ms_sum")
+    if not isinstance(total, (int, float)) or isinstance(total, bool) or total < 0:
+        raise ValueError("wait_ms_sum is not a non-negative number")
+    fam["wait_ms_sum"] = float(total)
+    hist = doc.get("wait_hist")
+    if not isinstance(hist, dict) or set(hist) != set(LOCKWAIT_EDGE_KEYS):
+        raise ValueError("wait_hist does not carry exactly the fixed bucket edges")
+    for i, key in enumerate(LOCKWAIT_EDGE_KEYS):
+        value = hist[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("wait_hist holds a non-integer count")
+        fam["hist"][i] = value
+    return fam
+
+
+class _LockwaitCounters:
+    """Per-UTC-day, per-family read-lock wait counters and their rollup file (#4234).
+
+    `record()` is the only method a request thread calls: it takes the private `_lock` (never
+    `_client_read_lock` or `_owner_lock`) and bumps integers. Everything that touches the file
+    (`flush`, the baseline merge) runs on the background thread or in stop()."""
+
+    def __init__(self, run_dir) -> None:
+        self._run_dir = Path(run_dir)
+        self._family_map: dict = {}
+        self._lock = threading.Lock()        # guards _days / _baselined only
+        self._flush_lock = threading.Lock()  # serialises flushes (thread vs stop)
+        self._days: dict = {}                # "YYYY-MM-DD" -> {family: counters}
+        self._baselined: set = set()
+        self._stop = threading.Event()
+        self._thread: "threading.Thread | None" = None
+        self._log = logging.getLogger("engramd_owner")
+
+    # -- request thread ---------------------------------------------------
+
+    def set_family_map(self, family_map) -> None:
+        self._family_map = dict(family_map or {})
+
+    def family_for_sql(self, sql) -> str:
+        return lockwait_family_for_sql(self._family_map, sql)
+
+    def record(self, family: str, outcome: str, wait_ms: float = 0.0) -> None:
+        """outcome: 'acquired' | 'timed_out' | 'no_time'. The histogram and `wait_ms_sum` cover
+        waited reads only (wait_ms > LOCKWAIT_WAITED_THRESHOLD_MS)."""
+        day = _lockwait_utc_date()
+        with self._lock:
+            fams = self._days.setdefault(day, {})
+            fam = fams.get(family)
+            if fam is None:
+                fam = fams[family] = _lockwait_new_family()
+            if outcome == "no_time":
+                fam["no_time_before_acquire"] += 1
+                return
+            fam["reads"] += 1
+            if outcome == "timed_out":
+                fam["timed_out"] += 1
+            if wait_ms > LOCKWAIT_WAITED_THRESHOLD_MS:
+                fam["waited_reads"] += 1
+                fam["wait_ms_sum"] += wait_ms
+                fam["hist"][lockwait_bucket_index(wait_ms)] += 1
+
+    # -- background thread / stop() ----------------------------------------
+
+    def start(self, interval: float) -> None:
+        """Merge today's existing file (so a corrupt one is set aside at start), then start the
+        daemon flush thread. Never raises."""
+        try:
+            self._baseline(_lockwait_utc_date())
+        except Exception as exc:  # noqa: BLE001 -- a rollup problem never stops the owner
+            self._log.warning("lockwait baseline failed (%s: %s); counting from zero", type(exc).__name__, exc)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, args=(interval,), name="engramd-lockwait-flush", daemon=True)
+        self._thread.start()
+
+    def _loop(self, interval: float) -> None:
+        while not self._stop.wait(interval):
+            self._flush_quietly()
+
+    def stop(self) -> None:
+        """Stop the flush thread and write a final flush. Never raises."""
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=10.0)
+        self._flush_quietly()
+        # A record arriving after this final flush is dropped on purpose: these are rate counters, and
+        # one lost increment at shutdown is not worth an extra flush.
+
+    def _flush_quietly(self) -> None:
+        try:
+            self.flush()
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("lockwait flush failed (%s: %s)", type(exc).__name__, exc)
+
+    def _path(self, day: str) -> Path:
+        return self._run_dir / f"lockwait-{day}.json"
+
+    def _read_existing(self, day: str) -> "dict | None":
+        """The parsed families of an existing valid file for `day`, or None (absent). A file that does
+        not parse, has another schema or other bucket edges is renamed aside (`.corrupt-<ts>`) and
+        None is returned: counting starts at zero."""
+        path = self._path(day)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            self._log.warning("lockwait file %s unreadable (%s); counting from zero", path, exc)
+            return None
+        try:
+            doc = json.loads(text)
+            if not isinstance(doc, dict) or doc.get("schema") != LOCKWAIT_SCHEMA:
+                raise ValueError("schema is not %d" % LOCKWAIT_SCHEMA)
+            if doc.get("bucket_edges_ms") != [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, "inf"]:
+                raise ValueError("other bucket edges")
+            families = doc.get("families")
+            if not isinstance(families, dict):
+                raise ValueError("families is not an object")
+            return {name: _lockwait_family_from_doc(entry) for name, entry in families.items()}
+        except ValueError as exc:  # json.JSONDecodeError is a ValueError
+            aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+            try:
+                os.replace(path, aside)
+            except OSError as rename_exc:
+                self._log.warning("lockwait file %s is unusable (%s) and could not be set aside (%s)", path, exc, rename_exc)
+                return None
+            self._log.warning("lockwait file %s is unusable (%s); renamed to %s, counting from zero", path, exc, aside.name)
+            return None
+
+    def _baseline(self, day: str) -> None:
+        """Merge by addition the file already on disk for `day` into memory (once per day)."""
+        with self._lock:
+            if day in self._baselined:
+                return
+        existing = self._read_existing(day)
+        with self._lock:
+            if day in self._baselined:
+                return
+            self._baselined.add(day)
+            if existing:
+                fams = self._days.setdefault(day, {})
+                for name, old in existing.items():
+                    fam = fams.get(name)
+                    if fam is None:
+                        fams[name] = old
+                        continue
+                    for key in ("reads", "waited_reads", "timed_out", "no_time_before_acquire", "wait_ms_sum"):
+                        fam[key] += old[key]
+                    fam["hist"] = [a + b for a, b in zip(fam["hist"], old["hist"])]
+
+    def flush(self) -> None:
+        """Write every date held in memory (atomic replace, mode 0600); drop a past date once its
+        file is written. Runs on the flush thread / stop(), never on a request thread."""
+        with self._flush_lock:
+            with self._lock:
+                days = list(self._days)
+            for day in days:
+                self._baseline(day)
+            today = _lockwait_utc_date()
+            # The snapshot copy holds the counters' private lock briefly: the one point where the flush
+            # thread can make a request thread wait. Bounded: O(families x buckets).
+            with self._lock:
+                snapshot = {day: {name: {**fam, "hist": list(fam["hist"])} for name, fam in fams.items()}
+                            for day, fams in self._days.items()}
+            for day, fams in sorted(snapshot.items()):
+                if not fams:
+                    continue
+                self._write_day(day, fams)
+                if day < today:
+                    with self._lock:
+                        if self._days.get(day) == fams:  # unchanged since the snapshot
+                            del self._days[day]
+                            self._baselined.discard(day)
+
+    def _write_day(self, day: str, fams: dict) -> None:
+        doc = {
+            "schema": LOCKWAIT_SCHEMA,
+            "date": day,
+            "bucket_edges_ms": [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, "inf"],
+            "families": {name: _lockwait_family_to_doc(fam) for name, fam in sorted(fams.items())},
+        }
+        fd, tmp = tempfile.mkstemp(prefix=f".lockwait-{day}.", suffix=".tmp", dir=str(self._run_dir))  # mode 0600
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self._path(day))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def _load_lockwait_family_map() -> dict:
+    """key -> family from the committed template file. The loaded `rr.Registry` keeps only key -> sql
+    (`sites` is build-time provenance it drops), so the file is read again here, located the same
+    way `_load_read_registry` locates it. Any problem -> {} (every read then counts under `other`)."""
+    path = _find_read_templates_path()
+    if path is None:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return lockwait_family_map(data.get("templates", []))
+    except (OSError, ValueError, AttributeError) as exc:
+        logging.getLogger("engramd_owner").warning(
+            "lockwait family map unavailable (%s: %s); reads count under %r", type(exc).__name__, exc,
+            LOCKWAIT_OTHER_FAMILY)
+        return {}
+
+
 class EngramdOwner:
     """The owner process skeleton -- one per seat, sole PROCESS holding
     `knowledge.db` open within this build's scope (handshake + `ping` +
@@ -2548,6 +2895,9 @@ class EngramdOwner:
         # `_owner_lock`: a long snapshot holds that one, and a read must not
         # queue behind it (nor may a read ever take the owner-internal path).
         self._client_read_lock = threading.Lock()
+        # #4234: per-day read-lock wait counters; the file I/O happens on a background thread, never here.
+        self._lockwait = _LockwaitCounters(self.socket_path.parent)
+        self._lockwait_log_failed = False
         self._shutdown = threading.Event()
         self._bound_socket = False
         # #4068: set as the first thing start() does and never reset: one object, one lifetime.
@@ -2892,6 +3242,8 @@ class EngramdOwner:
             signal.signal(signal.SIGINT, self._handle_signal)
 
         self._shutdown.clear()
+        self._lockwait.set_family_map(_load_lockwait_family_map())  # #4234: before the first read can arrive
+        self._lockwait.start(LOCKWAIT_FLUSH_INTERVAL_S)
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
 
@@ -3448,6 +3800,7 @@ class EngramdOwner:
         self._shutdown.set()
         if self._accept_thread is not None:
             self._accept_thread.join(timeout=self.accept_poll_interval + 2.0)
+        self._lockwait.stop()  # #4234: final rollup flush; never raises
         # Release every idle handler (#3678); a busy one exits after its request, when it
         # sees _shutdown in _next_connection(). The tokens go in under the same lock that
         # zeroes `_idle`: a handler whose idle timeout fires in between then finds a token
@@ -4744,7 +5097,8 @@ class EngramdOwner:
         # A non-list `args` is passed through as-is: the template list's own check
         # refuses it as `invalid_parameter` (one source of refusal reasons).
         failure, outcome = self._run_client_read(
-            deadline, lambda execution_deadline: gate.execute(sql, args, deadline=execution_deadline)
+            deadline, lambda execution_deadline: gate.execute(sql, args, deadline=execution_deadline),
+            family=lambda: self._lockwait.family_for_sql(sql),
         )
         if failure is not None:
             return failure
@@ -4754,8 +5108,23 @@ class EngramdOwner:
         reply, _counted = _render_read_rows(outcome)
         return reply
 
-    def _run_client_read(self, deadline: float, run) -> "tuple[dict | None, object]":
-        """The lock / deadline / error tail shared by `read` and `df`.
+    def _lockwait_record(self, family, outcome: str, wait_ms: float = 0.0) -> None:
+        """#4234: bump the read-lock wait counters. Never raises into a request: a counter problem is
+        logged once and the read goes on. `family` may be a zero-arg callable, resolved here (after the
+        lock is released) so the template-key hash is not paid while a queued read waits."""
+        try:
+            if callable(family):
+                family = family()
+            self._lockwait.record(family, outcome, wait_ms)
+        except Exception as exc:  # noqa: BLE001
+            if not self._lockwait_log_failed:
+                self._lockwait_log_failed = True
+                logging.getLogger("engramd_owner").warning(
+                    "lockwait counter failed (%s: %s); reads are unaffected", type(exc).__name__, exc)
+
+    def _run_client_read(self, deadline: float, run, family=LOCKWAIT_OTHER_FAMILY) -> "tuple[dict | None, object]":
+        """The lock / deadline / error tail shared by four methods:
+        `read`, `df`, `chain` and `confidence_by_type`.
         -> (failure_reply, outcome): `failure_reply` is a rejection dict (no time
         left, deadline abort, or a SQLite error) and `outcome` is then None;
         otherwise `failure_reply` is None and `outcome` is whatever
@@ -4763,10 +5132,16 @@ class EngramdOwner:
         `self._client_read_lock`."""
         execution_deadline = deadline - READ_RESPONSE_RESERVE
         remaining = execution_deadline - time.monotonic()
-        if remaining <= 0 or not self._client_read_lock.acquire(timeout=remaining):
-            return self._read_deadline_rejection(
-                "no execution time was left inside the request deadline (after reserving time to deliver the response)"
-            ), None
+        no_time_detail = "no execution time was left inside the request deadline (after reserving time to deliver the response)"
+        if remaining <= 0:
+            self._lockwait_record(family, "no_time")  # rejected BEFORE the acquire: no lock wait happened (#4234)
+            return self._read_deadline_rejection(no_time_detail), None
+        wait_started = time.monotonic()
+        acquired = self._client_read_lock.acquire(timeout=remaining)
+        wait_ms = (time.monotonic() - wait_started) * 1000.0  # #4234: the acquire itself, nothing else
+        if not acquired:
+            self._lockwait_record(family, "timed_out", wait_ms)
+            return self._read_deadline_rejection(no_time_detail), None
         try:
             try:
                 return None, run(execution_deadline)
@@ -4782,6 +5157,10 @@ class EngramdOwner:
                 return self._read_failed(exc), None
         finally:
             self._client_read_lock.release()
+            # #4234: runs on the request thread AFTER the lock release and BEFORE the reply is sent. The
+            # family resolution (a sha256 of the SQL, for `read`) and the integer increments are CPU-only,
+            # no I/O: near-zero cost on the request path, not zero.
+            self._lockwait_record(family, "acquired", wait_ms)
 
     def _handle_df(self, params: dict, deadline: float) -> dict:
         """The typed `df` method (U6b, #3665): document frequencies for a list of
@@ -4830,7 +5209,7 @@ class EngramdOwner:
                 }
             return gate.execute_typed(DF_SQL, (json.dumps(terms),), deadline=execution_deadline)
 
-        failure, outcome = self._run_client_read(deadline, run)
+        failure, outcome = self._run_client_read(deadline, run, family="df")
         if failure is not None:
             return failure
         if isinstance(outcome, dict):
@@ -4886,7 +5265,7 @@ class EngramdOwner:
             return gate.run_chain(node_id, depth, deadline=execution_deadline)
 
         try:
-            failure, outcome = self._run_client_read(deadline, run)
+            failure, outcome = self._run_client_read(deadline, run, family="chain")
         except ImportError as exc:  # engram_core vanished between the import above and the walk
             return self._chain_runtime_unavailable(exc)
         if failure is not None:
@@ -4952,7 +5331,7 @@ class EngramdOwner:
             return gate.run_confidence_by_type(modes, deadline=execution_deadline)
 
         try:
-            failure, outcome = self._run_client_read(deadline, run)
+            failure, outcome = self._run_client_read(deadline, run, family="confidence_by_type")
         except ImportError as exc:  # the runtime vanished between the import above and the read
             return self._cbt_runtime_unavailable(exc)
         if failure is not None:

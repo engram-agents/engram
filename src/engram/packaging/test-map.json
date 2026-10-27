@@ -500,6 +500,13 @@
       "note": "engram-alpha#3197 (U4d): loaded by tests/test_engramd_a6_latency.py via importlib (file path), so it is invisible to the layer-1 import graph."
     },
     {
+      "path_prefix_or_glob": "tools/engramd_lockwait_report.py",
+      "test_globs": [
+        "tests/test_engramd_lockwait_4234.py"
+      ],
+      "note": "engram-alpha#4234: loaded by tests/test_engramd_lockwait_4234.py via importlib (file path), so it is invisible to the layer-1 import graph."
+    },
+    {
       "path_prefix_or_glob": "tools/engramd_stage_profile.py",
       "test_globs": [
         "tests/test_engramd_stage_profile_3678.py",

@@ -880,6 +880,12 @@
       "note": "engram-alpha#3197 (U4d, part of #2652): the A6 latency-delta measurement -- the user-identity hook's person-node read, old path vs through a REAL engramd_owner process, same run/store/N, with contended and cold-cache arms. A measurement owed in the PR body, not a CI gate; ENGRAM-development tooling, real file under repo-root tools/, so 'source' is set explicitly."
     },
     {
+      "path": "tools/engramd_lockwait_report.py",
+      "tier": "dev",
+      "source": "tools/engramd_lockwait_report.py",
+      "note": "engram-alpha#4234 (part of #3740): the read-only report on the engramd owner's per-day read-lock wait counters (lockwait-YYYY-MM-DD.json in the run dir) -- per-family reads / waited_reads / p95, and waited/reads for the tripwire family and its joins. ENGRAM-development tooling, real file under repo-root tools/, so 'source' is set explicitly."
+    },
+    {
       "path": "tools/engramd_stage_profile.py",
       "tier": "dev",
       "source": "tools/engramd_stage_profile.py",
