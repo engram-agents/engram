@@ -587,15 +587,43 @@ def build_report(sheets, sim_fn=None, resamples: int = _s2.RESAMPLES, fold=None,
 # The deterministic clause splitter (B): no model, no network (#4201 phase 3a)
 # ---------------------------------------------------------------------------
 
-SPLITTER_VERSION = "B1"
+SPLITTER_VERSION = "B2"
 SPLIT_ABBREVIATIONS = ("e.g.", "i.e.", "vs.", "cf.", "approx.")
 SPLIT_BREAK_RE = re.compile(r"[.;!?]\s+")
-SPLIT_COORD_RE = re.compile(r",? (?:and|but) ")
-SPLIT_QUALIFIERS = (" after ", " because ", " so that ", " which ")
+# Rule (b), colons: a ':' followed by whitespace; the text since the previous colon cut needs at least
+# SPLIT_COLON_LEFT_STEMS content stems and the text after the colon at least SPLIT_COLON_RIGHT_STEMS.
+SPLIT_COLON_RE = re.compile(r":\s+")
+SPLIT_COLON_LEFT_STEMS = 1
+SPLIT_COLON_RIGHT_STEMS = 2
+# Rule (c), parentheticals: a '( ... )' with no parenthesis inside, lifted out when its inner text has at
+# least SPLIT_PAREN_MIN_STEMS content stems.
+SPLIT_PAREN_RE = re.compile(r"\(([^()]*)\)")
+SPLIT_PAREN_MIN_STEMS = 3
+# Rule (d), commas: ', ' at parenthesis depth 0 outside code spans; the text since the previous comma cut and
+# the chunk after this comma (up to the next ', ') each need at least SPLIT_COMMA_MIN_STEMS content stems.
+SPLIT_COMMA = ", "
+SPLIT_COMMA_MIN_STEMS = 1
+# Rule (e), coordination: the connectors, tried in this order at each position (no connector is a prefix of
+# another, and a ', and ' that starts one character before the ' and ' inside it wins as the leftmost match).
+# Each side needs SPLIT_COORD_MIN_STEMS content stems and must be clause-like: B1's _clause_like, or a word of
+# at least SPLIT_ED_MIN_CHARS characters ending in SPLIT_ED_SUFFIX. Rule (d) runs first and already cuts at a
+# depth-0 ', ' between stemmed sides, so the comma connectors here fire only where (d) was blocked (inside a
+# parenthesis, or a side with no content stem); after a (d) cut the right piece keeps its leading 'and' (a
+# stopword, so counts and stem metrics are unchanged). That order is intended (#4201 option 2, B2 design).
+SPLIT_COORD_CONNECTORS = (", whereas ", ", while ", ", and ", ", then ", ", but ", ", yet ", ", so ",
+                          " and ", " but ")
+SPLIT_COORD_RE = re.compile("|".join(re.escape(c) for c in SPLIT_COORD_CONNECTORS))
+SPLIT_COORD_MIN_STEMS = 1
+SPLIT_ED_MIN_CHARS = 5
+SPLIT_ED_SUFFIX = "ed"
+# Rule (f), qualifiers. Two introducers can match at the same position (' so that ' and ' so '): the cut
+# position is the same either way, and _next_qualifier_cut visits each position once.
+SPLIT_QUALIFIERS = (" after ", " because ", " so that ", " which ", " while ", " when ", " before ", " since ",
+                    " until ", " with ", " so ")
 SPLIT_MIN_STEMS = 3
 SPLIT_STRIP = " \t\r\n.,;:!?-–—"
 # Input cap (round 4): a claim longer than this many characters is NOT split. split_claim returns it as one
-# piece (rule (d) only), and the split-eval and end-to-end reports count such claims as ``claims_over_cap``
+# piece (rule (h) only), and the split-eval and end-to-end reports count such claims as ``claims_over_cap``
 # (computed by over_split_cap, so there is no module-level state to reset). The study's claims are far
 # shorter; the cap exists so one pasted log can never make the splitter slow, and 0 is the expected count.
 SPLIT_MAX_CHARS = 20000
@@ -655,35 +683,6 @@ def _clause_like(side: str) -> bool:
     return bool(_hard_tokens_with_class(side))
 
 
-def _split_coordination(sentence: str) -> list[str]:
-    """Rule (b). Linear: the sentence is cut into chunks at the candidate connectors and each chunk's
-    verb-like / hard-token flag is computed once, on demand. The left side of a candidate is the text since
-    the last cut taken, which may hold several chunks that were kept together; it can stand as a clause
-    exactly when one of those chunks can (a connector adds neither a verb-like token nor a hard token)."""
-    spans = _code_spans(sentence)
-    cuts = [(m.start(), m.end()) for m in SPLIT_COORD_RE.finditer(sentence) if not _in_spans(m.start(), spans)]
-    if not cuts:
-        return [sentence]
-    chunk_start = [0] + [b for _a, b in cuts]
-    chunk_end = [a for a, _b in cuts] + [len(sentence)]
-    flags: dict = {}
-
-    def like(i: int) -> bool:
-        if i not in flags:
-            flags[i] = _clause_like(sentence[chunk_start[i]:chunk_end[i]])
-        return flags[i]
-
-    pieces, piece_start, left_ok = [], 0, False
-    for idx, (a, b) in enumerate(cuts):
-        left_ok = left_ok or like(idx)
-        if left_ok and like(idx + 1):
-            pieces.append(sentence[piece_start:a])
-            piece_start = b
-            left_ok = True                  # the next left side starts at chunk idx + 1, which can stand
-    pieces.append(sentence[piece_start:])
-    return pieces
-
-
 def _add_stems(text: str, seen: set, limit: int | None = None) -> bool:
     """Add the distinct content stems of text to ``seen`` (the stems _content_stems would give). With a
     limit, stop as soon as len(seen) reaches it. Returns whether len(seen) >= limit (False without one)."""
@@ -693,6 +692,163 @@ def _add_stems(text: str, seen: set, limit: int | None = None) -> bool:
             if limit is not None and len(seen) >= limit:
                 return True
     return limit is not None and len(seen) >= limit
+
+
+def _has_stems(text: str, n: int) -> bool:
+    """Whether text has at least n distinct content stems (nstems(text) >= n)."""
+    return n <= 0 or _add_stems(text, set(), n)
+
+
+def _span_mask(text: str) -> bytearray:
+    """One byte per character of text: 1 inside a backtick code span, else 0 (O(1) lookups, whatever the
+    number of spans)."""
+    mask = bytearray(len(text))
+    for a, b in _code_spans(text):
+        mask[a:b] = b"\x01" * (b - a)
+    return mask
+
+
+def _split_colons(sentence: str) -> list[str]:
+    """Rule (b). Linear: the sentence is read once, segment by segment (every segment boundary is a colon
+    followed by whitespace, so no word is split and the stems of a segment add up exactly). The right side of
+    a colon is everything after it up to the end of the sentence; its stem count only shrinks along the
+    sentence, so it is computed once, backwards."""
+    mask = _span_mask(sentence)
+    colons = [m for m in SPLIT_COLON_RE.finditer(sentence) if not mask[m.start()]]
+    if not colons:
+        return [sentence]
+    right_ok = [False] * len(colons)
+    seen: set = set()
+    for i in range(len(colons) - 1, -1, -1):
+        if len(seen) < SPLIT_COLON_RIGHT_STEMS:
+            end = colons[i + 1].start() if i + 1 < len(colons) else len(sentence)
+            _add_stems(sentence[colons[i].end():end], seen, SPLIT_COLON_RIGHT_STEMS)
+        right_ok[i] = len(seen) >= SPLIT_COLON_RIGHT_STEMS
+    pieces, piece_start, done, left_ok = [], 0, 0, False
+    for i, m in enumerate(colons):
+        if not left_ok:
+            left_ok = _has_stems(sentence[done:m.start()], SPLIT_COLON_LEFT_STEMS)
+        done = m.end()
+        if left_ok and right_ok[i]:
+            pieces.append(sentence[piece_start:m.start()])
+            piece_start, left_ok = m.end(), False
+    pieces.append(sentence[piece_start:])
+    return pieces
+
+
+def _split_parentheticals(piece: str) -> list[str]:
+    """Rule (c). A parenthesis inside a backtick code span is not a parenthesis (it is masked before the
+    regex runs; the text cut out is taken from the original). Each ( ... ) with no parenthesis inside and at
+    least SPLIT_PAREN_MIN_STEMS content stems is replaced in the host by one space and comes back as its own
+    piece after the host, left to right. Linear: one regex pass, and each inner text is read once."""
+    if "(" not in piece:
+        return [piece]
+    mask = _span_mask(piece)
+    masked = piece
+    if any(mask):
+        masked = "".join("_" if (mask[i] and ch in "()") else ch for i, ch in enumerate(piece))
+    host, inners, last = [], [], 0
+    for m in SPLIT_PAREN_RE.finditer(masked):
+        inner = piece[m.start() + 1:m.end() - 1]
+        if _has_stems(inner, SPLIT_PAREN_MIN_STEMS):
+            host.append(piece[last:m.start()])
+            host.append(" ")
+            inners.append(inner)
+            last = m.end()
+    if not inners:
+        return [piece]
+    host.append(piece[last:])
+    return ["".join(host)] + inners
+
+
+def _split_commas(piece: str) -> list[str]:
+    """Rule (d). Linear: the piece is cut into chunks at every ', ' and each chunk's has-a-stem flag is
+    computed once, on demand. A comma is a cut candidate when it is outside code spans and at parenthesis
+    depth 0 (parentheses in code spans are not counted; the depth never goes below 0). The left side is the
+    text since the previous cut (it has a stem exactly when one of its chunks has); the right side is the next
+    chunk."""
+    commas = [m.start() for m in re.finditer(re.escape(SPLIT_COMMA), piece)]
+    if not commas:
+        return [piece]
+    mask = _span_mask(piece)
+    depths, depth, j = [], 0, 0
+    for pos, ch in enumerate(piece):
+        if not mask[pos]:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+        if pos == commas[j]:
+            depths.append(depth)
+            j += 1
+            if j == len(commas):
+                break
+    chunk_start = [0] + [c + len(SPLIT_COMMA) for c in commas]
+    chunk_end = commas + [len(piece)]
+    flags: dict = {}
+
+    def has(i: int) -> bool:
+        if i not in flags:
+            flags[i] = _has_stems(piece[chunk_start[i]:chunk_end[i]], SPLIT_COMMA_MIN_STEMS)
+        return flags[i]
+
+    pieces, piece_start, left_ok = [], 0, False
+    for i, c in enumerate(commas):
+        left_ok = left_ok or has(i)
+        if depths[i] == 0 and not mask[c] and left_ok and has(i + 1):
+            pieces.append(piece[piece_start:c])
+            piece_start, left_ok = c + len(SPLIT_COMMA), False
+    pieces.append(piece[piece_start:])
+    return pieces
+
+
+def _has_ed_word(side: str) -> bool:
+    """Rule (e)'s extra clause-like arm: a word of SPLIT_ED_MIN_CHARS or more characters ending in
+    SPLIT_ED_SUFFIX (a rough past-tense test; B1's verb list misses most past-tense verbs)."""
+    return any(len(w) >= SPLIT_ED_MIN_CHARS and w.endswith(SPLIT_ED_SUFFIX)
+               for w in _WORD_RE.findall(normalize(side)))
+
+
+def _coord_clause_like(side: str) -> bool:
+    """Rule (e)'s clause test: B1's _clause_like, or a word of 5+ characters ending in 'ed'."""
+    return _clause_like(side) or _has_ed_word(side)
+
+
+def _split_coordination(piece: str) -> list[str]:
+    """Rule (e). Linear: the piece is cut into chunks at the candidate connectors and each chunk's clause-like
+    and has-a-stem flags are computed once, on demand. The left side of a candidate is the text since the last
+    cut taken, which may hold several chunks that were kept together; it can stand as a clause (and has a
+    stem) exactly when one of those chunks can (a connector adds neither a verb-like token, an 'ed' word, a
+    hard token nor a stem)."""
+    mask = _span_mask(piece)
+    cuts = [(m.start(), m.end()) for m in SPLIT_COORD_RE.finditer(piece) if not mask[m.start()]]
+    if not cuts:
+        return [piece]
+    chunk_start = [0] + [b for _a, b in cuts]
+    chunk_end = [a for a, _b in cuts] + [len(piece)]
+    like_flags: dict = {}
+    stem_flags: dict = {}
+
+    def like(i: int) -> bool:
+        if i not in like_flags:
+            like_flags[i] = _coord_clause_like(piece[chunk_start[i]:chunk_end[i]])
+        return like_flags[i]
+
+    def has(i: int) -> bool:
+        if i not in stem_flags:
+            stem_flags[i] = _has_stems(piece[chunk_start[i]:chunk_end[i]], SPLIT_COORD_MIN_STEMS)
+        return stem_flags[i]
+
+    pieces, piece_start, left_like, left_has = [], 0, False, False
+    for idx, (a, b) in enumerate(cuts):
+        left_like = left_like or like(idx)
+        left_has = left_has or has(idx)
+        if left_like and left_has and like(idx + 1) and has(idx + 1):
+            pieces.append(piece[piece_start:a])
+            piece_start = b
+            left_like = left_has = True     # the next left side starts at chunk idx + 1, which can stand
+    pieces.append(piece[piece_start:])
+    return pieces
 
 
 def _next_qualifier_cut(piece: str):
@@ -705,10 +861,11 @@ def _next_qualifier_cut(piece: str):
     found = heapq.merge(*(
         (m.start() for m in re.finditer(re.escape(intro), piece)) for intro in SPLIT_QUALIFIERS))
     left_stems: set = set()
-    done = 0
+    done, last = 0, -1
     for pos in found:
-        if _in_spans(pos, spans):
-            continue
+        if pos == last or _in_spans(pos, spans):       # two introducers at one position (' so that ' / ' so ')
+            continue                                   # are one candidate: the cut position is the same
+        last = pos
         _add_stems(piece[done:pos], left_stems)
         done = pos
         if len(left_stems) < SPLIT_MIN_STEMS:
@@ -718,7 +875,7 @@ def _next_qualifier_cut(piece: str):
 
 
 def _split_qualifiers(piece: str) -> list[str]:
-    """Rule (c), iteratively (a long chain of qualifiers must not recurse): cut at the first qualifier that
+    """Rule (f), iteratively (a long chain of qualifiers must not recurse): cut at the first qualifier that
     qualifies, then repeat on the right-hand text, whose code spans are found afresh."""
     out: list[str] = []
     while True:
@@ -744,25 +901,50 @@ def split_claim(text: str) -> list[str]:
         backtick code span or after an abbreviation in SPLIT_ABBREVIATIONS. A number such as 3.5 has no
         whitespace after its dot, so it is never a break.
         'The run took 3.5 hours. It passed.' -> 'The run took 3.5 hours' | 'It passed'
-    (b) Coordination inside a sentence: split on ', and ', ' and ', ' but ' (and ', but ') only when
-        BOTH sides can stand as a clause: each has a verb-like token (SPLIT_VERB_FORMS, or a stem in
-        SPLIT_VERB_LEMMAS) or a hard token (engram_anchoring: a number of 3+ digits, #ref, date, sha, node
-        id). A side with neither is kept with its neighbour. Not inside a code span. The verb list is
-        small on purpose, so a clause whose only verb is missing from it is not split.
-        'Quillon merged the branch and Marrowby approved it' -> 'Quillon merged the branch' | 'Marrowby approved it'
+    (b) Colons: inside a sentence, cut at a ':' followed by whitespace (not in a code span) when the text
+        since the previous colon cut has at least 1 content stem and the text after the colon has at least 2.
+        The colon and its whitespace are dropped. 'Quillon recorded the outcome: the suite passed cleanly'
+            -> 'Quillon recorded the outcome' | 'the suite passed cleanly'
+        'Quillon recorded the outcome: passed' stays whole (one stem on the right).
+    (c) Parentheticals: each '( ... )' with no parenthesis inside it (parentheses in code spans do not
+        count) whose inner text has at least SPLIT_PAREN_MIN_STEMS (3) content stems is taken out of its
+        host (replaced by one space) and comes back as its own piece right after the host, left to right.
+        One with fewer stems stays in the host. Each resulting piece goes on through (d), (e), (f).
+        'Quillon merged the branch (reviewers finished careful inspection)'
+            -> 'Quillon merged the branch' | 'reviewers finished careful inspection'
+        'merged the branch (see notes)' stays whole (two stems).
+    (d) Commas: cut at ', ' outside code spans and at parenthesis depth 0 (counted from the start of the
+        piece, never below 0) when the text since the previous comma cut and the chunk after this comma (up
+        to the next ', ' or the end) each have at least 1 content stem. The comma is dropped; a ', and' leaves
+        its 'and' on the right piece, because this rule runs before (e).
+        'Quillon ran the suite, Marrowby approved it' -> 'Quillon ran the suite' | 'Marrowby approved it'
+        'Quillon ran, x' stays whole (no stem after the comma).
+    (e) Coordination: cut at one of SPLIT_COORD_CONNECTORS (', whereas ', ', while ', ', and ', ', then ',
+        ', but ', ', yet ', ', so ', ' and ', ' but '; not inside a code span) when BOTH sides can stand as a
+        clause and each has at least 1 content stem. A side can stand as a clause if it has a verb-like
+        token (SPLIT_VERB_FORMS, or a stem in SPLIT_VERB_LEMMAS), a hard token (engram_anchoring: a number of
+        3+ digits, #ref, date, sha, node id), or a word of 5+ characters ending in 'ed'. The left side is
+        the text since the previous cut, the right side runs to the next connector. The connector is dropped.
+        The verb list is small on purpose; the 'ed' arm catches some of what it misses.
+        'Quillon cleared the queue and Marrowby drained everything'
+            -> 'Quillon cleared the queue' | 'Marrowby drained everything'
         'bread and butter' -> one clause
-    (c) Trailing qualifiers: split before ' after ', ' because ', ' so that ', ' which ' only when the text
-        on each side has at least SPLIT_MIN_STEMS (3) distinct content stems. The introducer stays with the
-        right-hand clause. 'merged after review' stays whole: one side is too short to be its own assertion.
+    (f) Trailing qualifiers: split before ' after ', ' because ', ' so that ', ' which ', ' while ', ' when ',
+        ' before ', ' since ', ' until ', ' with ', ' so ' only when the text on each side has at least
+        SPLIT_MIN_STEMS (3) distinct content stems. The introducer stays with the right-hand clause. ' so
+        that ' and ' so ' match at the same position, so they are one cut. 'merged after review' stays whole:
+        one side is too short to be its own assertion.
         'Quillon merged the hotfix branch after reviewers finished careful inspection'
             -> 'Quillon merged the hotfix branch' | 'after reviewers finished careful inspection'
-    (d) Strip whitespace and . , ; : ! ? - from both ends of each piece (SPLIT_STRIP) and drop empty
+    (h) Strip whitespace and . , ; : ! ? - from both ends of each piece (SPLIT_STRIP) and drop empty
         pieces. '  ...The suite ran,  ' -> 'The suite ran'
+    (There is no rule (g); the letters match the pre-registered rule list.)
 
     Input cap: a text longer than SPLIT_MAX_CHARS characters is not split at all; it comes back as the one
-    piece (rule (d) applied). over_split_cap(text) says which claims that happened to, and the reports count
-    them as claims_over_cap. Rule (b) is linear in the sentence and rule (c) is iterative (no recursion), so
-    below the cap the cost stays small whatever the shape of the text.
+    piece (rule (h) applied). over_split_cap(text) says which claims that happened to, and the reports count
+    them as claims_over_cap. Rules (b) to (e) are each linear in their text and rule (f) is iterative (no
+    recursion), so below the cap the cost stays small whatever the shape of the text. split_claim never
+    raises on a str and every piece it returns is non-empty.
 
     Returns [] when nothing is left."""
     text = text or ""
@@ -770,8 +952,11 @@ def split_claim(text: str) -> list[str]:
         return [p for p in [text.strip(SPLIT_STRIP)] if p]
     out: list[str] = []
     for sentence in _split_sentences(text):
-        for piece in _split_coordination(sentence):
-            out.extend(_split_qualifiers(piece))
+        for colon_piece in _split_colons(sentence):
+            for paren_piece in _split_parentheticals(colon_piece):
+                for comma_piece in _split_commas(paren_piece):
+                    for piece in _split_coordination(comma_piece):
+                        out.extend(_split_qualifiers(piece))
     return [p for p in (x.strip(SPLIT_STRIP) for x in out) if p]
 
 

@@ -1365,11 +1365,13 @@ def test_run_report_carries_the_embedding_model(cc, monkeypatch):
 # The deterministic clause splitter (B), its measurement harness (split-eval) and the end-to-end mode
 # (run --clauses split). Design-owner ruling: #4201 comment 6424929510. Synthetic fixtures only.
 
+# Removed-test: tests/test_s2_clause_check_4201.py::test_split_claim_output_under_the_cap_is_identical_to_the_round_3_splitter — B1 is replaced by B2 (#4201); its output pin and the independent B1 copy it used are replaced by test_split_claim_output_matches_the_b2_golden (end of file)
+# Removed-test: tests/test_s2_clause_check_4201.py::test_the_pin_catches_a_wrong_rule_b — the control of that B1 pin; replaced by test_the_b2_golden_catches_a_missing_rule (end of file, one case per rule)
 # ---- splitter: rule (a), sentences
 def test_splitter_version_and_manifest_pin(cc):
-    assert cc.SPLITTER_VERSION == "B1"
+    assert cc.SPLITTER_VERSION == "B2"
     root, manifest = _freeze_and_study(cc)
-    assert json.loads(manifest.read_text())["splitter_version"] == "B1"
+    assert json.loads(manifest.read_text())["splitter_version"] == "B2"
 
 
 def test_rule_a_sentence_boundaries_split(cc):
@@ -1386,12 +1388,16 @@ def test_rule_a_a_number_is_not_a_boundary(cc):
 
 @pytest.mark.parametrize("text", [
     "reviewers (e.g. Quillon) approved it",
-    "it holds, i.e. the cache is warm",
+    "it holds i.e. the cache is warm",     # B2: with a comma before 'i.e.' rule (d) cuts there (cell below)
     "the cache vs. the queue was slower",
     "see cf. the earlier note for details",
 ])
 def test_rule_a_an_abbreviation_is_not_a_boundary(cc, text):
     assert cc.split_claim(text) == [text]
+
+
+def test_rule_a_an_abbreviation_is_not_a_sentence_boundary_but_the_comma_before_it_is_cut_by_rule_d(cc):
+    assert cc.split_claim("it holds, i.e. the cache is warm") == ["it holds", "i.e. the cache is warm"]
 
 
 def test_rule_a_a_code_span_is_not_split(cc):
@@ -1403,7 +1409,8 @@ def test_rule_a_a_code_span_is_not_split(cc):
 def test_rule_b_verb_on_both_sides_splits(cc):
     assert cc.split_claim("Quillon merged the branch as hotfix and Marrowby approved it") == [
         "Quillon merged the branch as hotfix", "Marrowby approved it"]
-    assert cc.split_claim("the suite passed, and the build failed") == ["the suite passed", "the build failed"]
+    # B2: rule (d) cuts at the comma first and leaves the 'and' on the right piece (it was dropped under B1)
+    assert cc.split_claim("the suite passed, and the build failed") == ["the suite passed", "and the build failed"]
     assert cc.split_claim("the suite passed but the build failed") == ["the suite passed", "the build failed"]
 
 
@@ -1847,7 +1854,7 @@ def test_run_split_reports_mapping_rates_and_none_counts(cc):
     assert mp["sheet_two"] == {"split_clauses": 5, "mapped": 4, "none": 1, "mapping_rate": 0.8, "ties_total": 2,
                                "ties_stated_stated": 0, "frozen_clauses": 6, "frozen_unmapped": 2,
                                "items_empty_split": 0, "claims_over_cap": 0}
-    assert rep["clauses_mode"] == "split" and rep["splitter_version"] == "B1"
+    assert rep["clauses_mode"] == "split" and rep["splitter_version"] == "B2"
 
 
 def test_run_split_scores_on_the_split_clauses_and_leaves_none_out(cc):
@@ -1900,13 +1907,13 @@ def test_run_split_a_none_clause_is_never_removed_by_an_exclusion(cc):
 def test_split_manifest_records_mode_splitter_and_claims_sha(cc):
     root = _e2e_root()
     m = json.loads(_freeze_split(cc, root).read_text())
-    assert m["clauses_mode"] == "split" and m["splitter_version"] == "B1"
+    assert m["clauses_mode"] == "split" and m["splitter_version"] == "B2"
     want = {n: hashlib.sha256((root / f"sheet{i}" / "claims.json").read_bytes()).hexdigest()
             for i, n in enumerate(("sheet_one", "sheet_two"))}
     assert m["claims_sha256"] == want
     frozen_root, frozen_man = _freeze_and_study(cc)
     fm = json.loads(frozen_man.read_text())
-    assert (fm["clauses_mode"], fm["splitter_version"], fm["claims_sha256"]) == ("frozen", "B1", None)
+    assert (fm["clauses_mode"], fm["splitter_version"], fm["claims_sha256"]) == ("frozen", "B2", None)
 
 
 def test_run_split_reports_the_claims_sha_in_inputs(cc):
@@ -2388,74 +2395,6 @@ def test_thirty_thousand_verbless_and_characters_split_in_well_under_a_second(cc
     assert took < 1.0, f"took {took:.2f}s"               # ~5 s before; a generous bound (it runs in ~0.1 s)
 
 
-# ---- the output under the cap is exactly what it was: an independent copy of the round-3 splitter (B1)
-def _ref_in_spans(pos, spans):
-    return any(a <= pos < b for a, b in spans)
-
-
-def _ref_split_claim(cc, text):
-    """The splitter as it stood at 40ecb3fb (recursive rule (c), left side rescanned in rule (b)), copied
-    here so the cell compares today's code with it. Uses only unchanged helpers from the tool."""
-    spans_of = lambda t: [(m.start(), m.end()) for m in re.finditer(r"`[^`]*`", t)]
-
-    def ends_abbr(t, dot):
-        head = t[: dot + 1].lower()
-        for ab in cc.SPLIT_ABBREVIATIONS:
-            if head.endswith(ab):
-                before = head[: len(head) - len(ab)]
-                if not before or not before[-1].isalnum():
-                    return True
-        return False
-
-    def sentences(t):
-        spans, pieces, start = spans_of(t), [], 0
-        for m in cc.SPLIT_BREAK_RE.finditer(t):
-            i = m.start()
-            if _ref_in_spans(i, spans) or (t[i] == "." and ends_abbr(t, i)):
-                continue
-            pieces.append(t[start:i])
-            start = m.end()
-        pieces.append(t[start:])
-        return pieces
-
-    def like(side):
-        for w in cc._WORD_RE.findall(cc.normalize(side)):
-            if w in cc.SPLIT_VERB_FORMS or cc.stem(w) in cc._SPLIT_VERB_STEMS:
-                return True
-        return bool(cc._hard_tokens_with_class(side))
-
-    def coordination(sentence):
-        spans = spans_of(sentence)
-        cuts = [(m.start(), m.end()) for m in cc.SPLIT_COORD_RE.finditer(sentence)
-                if not _ref_in_spans(m.start(), spans)]
-        pieces, piece_start = [], 0
-        for idx, (a, b) in enumerate(cuts):
-            right_end = cuts[idx + 1][0] if idx + 1 < len(cuts) else len(sentence)
-            if like(sentence[piece_start:a]) and like(sentence[b:right_end]):
-                pieces.append(sentence[piece_start:a])
-                piece_start = b
-        pieces.append(sentence[piece_start:])
-        return pieces
-
-    def n_stems(t):
-        return len(cc._content_stems(cc.normalize(t)))
-
-    def qualifiers(piece):
-        spans = spans_of(piece)
-        at = sorted(m.start() for intro in cc.SPLIT_QUALIFIERS
-                    for m in re.finditer(re.escape(intro), piece) if not _ref_in_spans(m.start(), spans))
-        for pos in at:
-            left, right = piece[:pos], piece[pos + 1:]
-            if n_stems(left) >= cc.SPLIT_MIN_STEMS and n_stems(right) >= cc.SPLIT_MIN_STEMS:
-                return [left] + qualifiers(right)
-        return [piece]
-
-    out = []
-    for sentence in sentences(text or ""):
-        for piece in coordination(sentence):
-            out.extend(qualifiers(piece))
-    return [p for p in (x.strip(cc.SPLIT_STRIP) for x in out) if p]
-
 
 # every input the splitter cells above feed it, plus the claims of the e2e and split-eval fixtures
 _PIN_FIXED = [
@@ -2503,15 +2442,272 @@ def _generated_claims(n=240, seed=4216):
     return out
 
 
-def test_split_claim_output_under_the_cap_is_identical_to_the_round_3_splitter(cc):
-    corpus = _PIN_FIXED + _generated_claims()
+
+# =========================================================================== #4201 splitter B2
+# The finer, atomic-proposition splitter (option 2 of #4201). Rules in order: (a) sentences, (b) colons,
+# (c) parentheticals, (d) commas, (e) coordination, (f) qualifiers, (h) strip (there is no (g)). The cells
+# below pin each rule with an invented claim and a near-miss that must NOT be cut. Synthetic claims only.
+
+def test_b2_splitter_version_is_pinned(cc):
+    assert cc.SPLITTER_VERSION == "B2"
+
+
+# ---- rule (b), colons
+def test_b2_rule_b_colon_cuts_with_a_stem_on_the_left_and_two_on_the_right(cc):
+    assert cc.split_claim("Quillon recorded the outcome: the suite passed cleanly") == [
+        "Quillon recorded the outcome", "the suite passed cleanly"]
+    assert cc.split_claim("Quillon noted: alpha beta: gamma delta") == ["Quillon noted", "alpha beta", "gamma delta"]
+
+
+@pytest.mark.parametrize("text", [
+    "Quillon recorded the outcome: passed",          # the right side has one stem
+    "A: the suite passed cleanly",                   # the left side has no stem
+    "Quillon logged 12:30 suite passed cleanly",     # the colon is not followed by whitespace
+    "the line `x: y z w` was logged",                # the colon is inside a code span
+])
+def test_b2_rule_b_colon_near_misses_are_not_cut(cc, text):
+    assert cc.split_claim(text) == [text]
+
+
+def test_b2_rule_b_the_left_side_is_the_text_since_the_previous_colon_cut(cc):
+    # the second colon has only 'x' (no stem) since the first cut, so it is not cut
+    assert cc.split_claim("Quillon noted: x: alpha beta") == ["Quillon noted", "x: alpha beta"]
+
+
+# ---- rule (c), parentheticals
+def test_b2_rule_c_a_parenthetical_with_three_stems_is_lifted_out_after_its_host(cc):
+    assert cc.split_claim("Quillon merged the hotfix branch (reviewers finished careful inspection)") == [
+        "Quillon merged the hotfix branch", "reviewers finished careful inspection"]
+    # the parenthetical is replaced by ONE space: the spaces on both sides of it stay
+    assert cc.split_claim("Quillon merged the branch (reviewers finished careful inspection) yesterday") == [
+        "Quillon merged the branch   yesterday", "reviewers finished careful inspection"]
+
+
+def test_b2_rule_c_inner_pieces_come_in_left_to_right_order_after_the_host(cc):
+    text = "Alpha ran (reviewers finished careful inspection) and (Bravo checked deployment logs carefully) overnight"
+    assert cc.split_claim(text) == ["Alpha ran   and   overnight", "reviewers finished careful inspection",
+                                    "Bravo checked deployment logs carefully"]
+
+
+@pytest.mark.parametrize("text", [
+    "Quillon merged the branch (see notes) yesterday",                    # two stems: stays in the host
+    "Quillon merged (the hotfix branch reviewers finished",               # no closing parenthesis
+    "Quillon logged `f(alpha beta gamma)` today",                         # the parentheses are in a code span
+])
+def test_b2_rule_c_near_misses_are_not_lifted(cc, text):
+    assert cc.split_claim(text) == [text]
+
+
+def test_b2_rule_c_only_a_parenthetical_without_nested_parentheses_is_lifted(cc):
+    assert cc.split_claim("Quillon merged (the hotfix (reviewers finished careful inspection) branch)") == [
+        "Quillon merged (the hotfix   branch)", "reviewers finished careful inspection"]
+
+
+def test_b2_rule_c_parentheses_inside_a_code_span_are_not_parentheses(cc):
+    # judgment call (see the handoff): the paren pair around the text is found even though a code span in it holds '(' ')'
+    assert cc.split_claim("Quillon merged the branch (reviewers finished `f(x)` careful inspection) yesterday") == [
+        "Quillon merged the branch   yesterday", "reviewers finished `f(x)` careful inspection"]
+
+
+# ---- rule (d), commas
+def test_b2_rule_d_comma_cuts_when_both_neighbouring_chunks_have_a_stem(cc):
+    assert cc.split_claim(
+        "Quillon merged the hotfix branch, Marrowby reviewed deployment logs, Delta checked rollout") == [
+        "Quillon merged the hotfix branch", "Marrowby reviewed deployment logs", "Delta checked rollout"]
+    assert cc.split_claim("the list was alpha, 42, beta") == ["the list was alpha, 42", "beta"]
+
+
+@pytest.mark.parametrize("text", [
+    "Quillon ran, x",                                           # the chunk after the comma has no stem
+    "x, alpha beta",                                            # the text before the comma has no stem
+    "Quillon merged the branch (alpha, beta) quickly",          # the comma is at parenthesis depth 1
+    "( Quillon ran the suite, Marrowby approved it",            # an unclosed parenthesis keeps the depth at 1
+    "the line `a, b` ran",                                      # the comma is inside a code span
+])
+def test_b2_rule_d_comma_near_misses_are_not_cut(cc, text):
+    assert cc.split_claim(text) == [text]
+
+
+def test_b2_rule_d_the_depth_never_goes_below_zero(cc):
+    assert cc.split_claim(") Quillon ran, Marrowby approved it") == [") Quillon ran", "Marrowby approved it"]
+
+
+def test_b2_rule_d_runs_before_rule_e_so_a_comma_and_keeps_its_and(cc):
+    # (d) drops the comma and leaves 'and' on the right piece; rule (e)'s ', and ' only fires where (d) is blocked
+    assert cc.split_claim("the suite passed, and the build failed") == ["the suite passed", "and the build failed"]
+
+
+# ---- rule (e), coordination
+def test_b2_rule_e_coordination_cuts_when_both_sides_are_clause_like(cc):
+    assert cc.split_claim("Quillon merged the branch and Marrowby approved it") == [
+        "Quillon merged the branch", "Marrowby approved it"]
+    assert cc.split_claim("Quillon merged the branch but Marrowby approved it") == [
+        "Quillon merged the branch", "Marrowby approved it"]
+
+
+def test_b2_rule_e_a_word_of_five_chars_ending_in_ed_makes_a_side_clause_like(cc):
+    # no verb-list word and no hard token on either side: B1 would keep this whole
+    assert cc.split_claim("Quillon cleared the queue and Marrowby drained everything") == [
+        "Quillon cleared the queue", "Marrowby drained everything"]
+    assert cc.split_claim("Quillon cleared the queue and Marrowby drained everything but Delta tidied backlog") == [
+        "Quillon cleared the queue", "Marrowby drained everything", "Delta tidied backlog"]
+
+
+@pytest.mark.parametrize("text", [
+    "bread and butter",
+    "Quillon fed the cats and Marrowby fed the dogs",             # 'fed' is too short to count
+    "Quillon used the tool and Marrowby used the cache",          # 'used' has four characters
+    "Quillon merged the branch and #123",                         # clause-like by the hard token, but no stem
+    "Quillon merged the branch and quickly",                      # the right side is not clause-like
+])
+def test_b2_rule_e_near_misses_are_not_cut(cc, text):
+    assert cc.split_claim(text) == [text]
+
+
+@pytest.mark.parametrize("connector", [", whereas ", ", while ", ", then ", ", and ", ", but ", ", yet ", ", so "])
+def test_b2_rule_e_comma_connectors_fire_where_rule_d_is_blocked_by_depth(cc, connector):
+    # inside an unclosed parenthesis (depth 1) rule (d) cannot cut, so the connector does
+    assert cc.split_claim(f"(Quillon ran the suite{connector}Marrowby approved it") == [
+        "(Quillon ran the suite", "Marrowby approved it"]
+
+
+# ---- rule (f), qualifiers
+B2_QUALIFIERS = ["after", "because", "so that", "which", "while", "when", "before", "since", "until", "with", "so"]
+
+
+def test_b2_rule_f_qualifier_list_is_the_extended_one(cc):
+    assert cc.SPLIT_QUALIFIERS == tuple(f" {w} " for w in B2_QUALIFIERS)
+
+
+@pytest.mark.parametrize("intro", B2_QUALIFIERS)
+def test_b2_rule_f_each_introducer_splits_when_both_sides_have_three_stems(cc, intro):
+    left = "Quillon merged the hotfix branch"
+    right = f"{intro} reviewers finished careful inspection"
+    assert cc.split_claim(f"{left} {right}") == [left, right]
+
+
+@pytest.mark.parametrize("intro", B2_QUALIFIERS)
+def test_b2_rule_f_a_short_side_blocks_each_introducer(cc, intro):
+    short_right = f"Quillon merged the hotfix branch {intro} review"
+    short_left = f"merged {intro} reviewers finished careful inspection"
+    assert cc.split_claim(short_right) == [short_right]
+    assert cc.split_claim(short_left) == [short_left]
+
+
+def test_b2_rule_f_so_that_and_so_cut_at_the_same_single_position(cc):
+    # ' so that ' and ' so ' both match at the same position: one cut, 'so that' stays whole on the right
+    assert cc.split_claim("Quillon merged the hotfix branch so that reviewers finished careful inspection") == [
+        "Quillon merged the hotfix branch", "so that reviewers finished careful inspection"]
+
+
+# ---- rule order, (a) -> (f) in one claim
+def test_b2_rules_apply_in_order_a_to_f(cc):
+    text = ("Quillon recorded the outcome: the hotfix branch merged (reviewers finished careful inspection), "
+            "Marrowby approved the rollout and Delta cleared the queue after reviewers finished careful inspection. "
+            "It passed.")
+    assert cc.split_claim(text) == [
+        "Quillon recorded the outcome",                    # (a) sentence 1, (b) colon
+        "the hotfix branch merged",                        # (c) host, (d) comma
+        "Marrowby approved the rollout",                   # (e) ' and '
+        "Delta cleared the queue",                         # (f) ' after '
+        "after reviewers finished careful inspection",
+        "reviewers finished careful inspection",           # (c) inner, after every piece of its host
+        "It passed",                                       # (a) sentence 2, (h) strip
+    ]
+
+
+# ---- robustness
+_B2_PATHOLOGICAL = [
+    "", " ", "(", ")", "((((", "))))(", "`", "``", "` `", "```", ":", ": ", ": :", ":: ::", ", ", ",,,, ", ", , , ",
+    " and ", ", and , but , so ", "(a b c", "a b c)", "( ) ( )", ")(", "`(` x `)` y", "\x00", "…", "\n\n",
+    "and and and", " after after ", "so that so that", ". . . .", "`unclosed (alpha beta gamma",
+    "(alpha beta gamma `)` delta)", "((alpha beta gamma))", "a" * 5000, "́​", "：全角 コ",
+    "x: " * 300, "(a b c) " * 300, "a, " * 300, "x and " * 300, " with " * 300, ": (", "(:", "), (", "(,)",
+]
+
+
+@pytest.mark.parametrize("text", _B2_PATHOLOGICAL)
+def test_b2_split_claim_never_raises_and_returns_non_empty_strings(cc, text):
+    out = cc.split_claim(text)
+    assert isinstance(out, list) and all(isinstance(p, str) and p for p in out)
+    assert cc.split_claim(text) == out
+
+
+def test_b2_nested_looking_parentheticals_and_commas_finish_under_a_second(cc, monkeypatch):
+    import time
+    monkeypatch.setattr(cc, "SPLIT_MAX_CHARS", 10 ** 7, raising=False)
+    claim = " ".join(["(a (b) c)"] * 2000) + ", x" * 2000
+    t0 = time.perf_counter()
+    pieces = cc.split_claim(claim)
+    took = time.perf_counter() - t0
+    assert len(pieces) >= 1 and took < 1.0, f"took {took:.2f}s"
+
+
+def test_b2_every_rule_is_linear_on_a_long_claim_that_it_does_cut(cc, monkeypatch):
+    import time
+    monkeypatch.setattr(cc, "SPLIT_MAX_CHARS", 10 ** 7, raising=False)
+    unit = "Quillon noted: alpha beta (reviewers finished careful inspection), Marrowby cleared the queue and Delta drained everything after reviewers finished careful inspection. "
+    claim = unit * 400
+    t0 = time.perf_counter()
+    pieces = cc.split_claim(claim)
+    took = time.perf_counter() - t0
+    assert len(pieces) == 400 * 6 and took < 1.0, f"{len(pieces)} pieces, took {took:.2f}s"
+
+
+# ---- the B2 golden: the output on a fixed corpus (cell inputs + generated claims), pinned by hash
+# (corpus size, sha256 of the JSON of every output). Regenerated from the implementation only AFTER every rule
+# cell above was green; the rule cells, not this hash, say what the rules are.
+GOLDEN_B2_CORPUS = (386, "7789db3eac7db9f9fac44a04f399acd6afa3f60239b9c71dc79be9868c6250a8")
+
+# the inputs of the B2 rule cells above (the B1-era inputs are in _PIN_FIXED), so the golden covers every rule
+_B2_PIN_EXTRA = [
+    "Quillon recorded the outcome: the suite passed cleanly", "Quillon noted: alpha beta: gamma delta",
+    "Quillon recorded the outcome: passed", "A: the suite passed cleanly", "Quillon logged 12:30 suite passed cleanly",
+    "the line `x: y z w` was logged", "Quillon noted: x: alpha beta",
+    "Quillon merged the hotfix branch (reviewers finished careful inspection)",
+    "Quillon merged the branch (reviewers finished careful inspection) yesterday",
+    "Alpha ran (reviewers finished careful inspection) and (Bravo checked deployment logs carefully) overnight",
+    "Quillon merged the branch (see notes) yesterday", "Quillon merged (the hotfix branch reviewers finished",
+    "Quillon logged `f(alpha beta gamma)` today",
+    "Quillon merged (the hotfix (reviewers finished careful inspection) branch)",
+    "Quillon merged the branch (reviewers finished `f(x)` careful inspection) yesterday",
+    "Quillon merged the hotfix branch, Marrowby reviewed deployment logs, Delta checked rollout",
+    "the list was alpha, 42, beta", "Quillon ran, x", "x, alpha beta", "Quillon merged the branch (alpha, beta) quickly",
+    "( Quillon ran the suite, Marrowby approved it", "the line `a, b` ran", ") Quillon ran, Marrowby approved it",
+    "Quillon merged the branch and Marrowby approved it", "Quillon merged the branch but Marrowby approved it",
+    "Quillon cleared the queue and Marrowby drained everything",
+    "Quillon cleared the queue and Marrowby drained everything but Delta tidied backlog",
+    "Quillon fed the cats and Marrowby fed the dogs", "Quillon used the tool and Marrowby used the cache",
+    "Quillon merged the branch and #123", "Quillon merged the branch and quickly",
+    *(f"(Quillon ran the suite{c}Marrowby approved it"
+      for c in (", whereas ", ", while ", ", then ", ", and ", ", but ", ", yet ", ", so ")),
+    *(f"Quillon merged the hotfix branch {w} reviewers finished careful inspection"
+      for w in ("after", "because", "so that", "which", "while", "when", "before", "since", "until", "with", "so")),
+    "Quillon recorded the outcome: the hotfix branch merged (reviewers finished careful inspection), "
+    "Marrowby approved the rollout and Delta cleared the queue after reviewers finished careful inspection. It passed.",
+    *_B2_PATHOLOGICAL,
+]
+
+
+def _b2_golden_corpus():
+    return _PIN_FIXED + _B2_PIN_EXTRA + _generated_claims()
+
+
+def _b2_outputs_digest(split):
+    got = [split(t) for t in _b2_golden_corpus()]
+    return len(got), hashlib.sha256(json.dumps(got, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def test_split_claim_output_matches_the_b2_golden(cc):
+    corpus = _b2_golden_corpus()
     assert len(corpus) >= 260 and all(len(t) <= cc.SPLIT_MAX_CHARS for t in corpus)
     assert any(len(cc.split_claim(t)) > 2 for t in corpus)      # the corpus does exercise the rules
-    for text in corpus:
-        assert cc.split_claim(text) == _ref_split_claim(cc, text), text
+    assert _b2_outputs_digest(cc.split_claim) == GOLDEN_B2_CORPUS
 
 
-def test_the_pin_catches_a_wrong_rule_b(cc, monkeypatch):
-    # control: a splitter that kept only the sentence-level cut would differ from the reference on this corpus
-    monkeypatch.setattr(cc, "_split_coordination", lambda sentence: [sentence])
-    assert any(cc.split_claim(t) != _ref_split_claim(cc, t) for t in _PIN_FIXED)
+@pytest.mark.parametrize("rule", ["_split_colons", "_split_parentheticals", "_split_commas", "_split_coordination",
+                                  "_split_qualifiers"])
+def test_the_b2_golden_catches_a_missing_rule(cc, monkeypatch, rule):
+    # control: with one rule turned into a no-op the corpus output differs, so the golden does exercise every rule
+    monkeypatch.setattr(cc, rule, lambda piece: [piece])
+    assert _b2_outputs_digest(cc.split_claim) != GOLDEN_B2_CORPUS
