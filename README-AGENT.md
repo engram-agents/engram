@@ -360,9 +360,10 @@ No human action needed.
 
 ## Codex install
 
-Already have a working local Codex + ENGRAM agent and want phone access?
-See [Continue your local agent from your phone](docs/CODEX-MOBILE.md) for the
-tested managed-daemon + iPhone manual-pairing flow, reusable status probe,
+Already have a working local Codex + ENGRAM agent and want remote access?
+See [Continue your local agent from an iPhone or Windows](docs/CODEX-MOBILE.md) for the
+tested managed-daemon + iPhone manual-pairing flow, Windows client steps,
+reusable status probe,
 same-session checks, and auto-start persistence caveats. This is remote access
 to the existing local agent, not a phone-only install.
 
