@@ -269,10 +269,10 @@ def _pid_cmdline_status(pid: int) -> tuple[str, str]:
 
     `ww` (BSD-style "wide, wide" -- unlimited output width) is REQUIRED,
     not cosmetic: without it, `ps` truncates `args=` to whatever width it
-    detects (falls back to a hardcoded 80 columns when it has no
-    controlling terminal to query -- exactly the case for a `ps` subprocess
-    spawned from a supervisor that itself has none, e.g. under a test
-    runner or a detached/daemonized process). Measured live in this
+    detects (the measured trigger on Linux is an exported $COLUMNS --
+    pytest-xdist workers export COLUMNS=80, #4227; the no-tty fallback to a
+    hardcoded 80 columns is not observed on Linux procps and is unmeasured
+    on macOS). Measured live in this
     worktree: without `ww`, a genuine monitor-supervisor.py instance's own
     cmdline (script path alone is 92 characters here) was silently cut to
     80 chars before ever reaching "monitor-supervisor.py" in argv, so
@@ -281,10 +281,12 @@ def _pid_cmdline_status(pid: int) -> tuple[str, str]:
     (SIGKILL recovery + single-instance) whenever the install path is long
     enough. Root-caused via `tests/test_monitor_supervisor.py`'s own
     `test_single_instance_two_starts`, which failed ONLY under `pytest`
-    (no controlling terminal) and passed when driven as a standalone
-    script attached to a real tty -- i.e. it is not a `pytest`-only quirk,
-    it is "no controlling terminal", which `pytest` merely happens to be
-    the common instance of on this host.
+    and passed when driven as a standalone script attached to a real tty.
+    The original reading was "no controlling terminal"; #4227 later
+    measured on Linux procps that a ps with no tty and COLUMNS unset
+    prints full width, while an exported COLUMNS truncates (pytest-xdist
+    workers export COLUMNS=80), so the trigger for that original run is
+    not established.
     """
     try:
         out = subprocess.run(

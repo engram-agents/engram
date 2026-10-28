@@ -278,7 +278,8 @@ URL="$BASE/api/agent/$SELF/mentions?kind=at_mention"   # #1040: at_mention only 
 # in the "process gone" branch — dead and SILENT, byte-identical to "checked,
 # found no duplicates." Mirrors umwelt-bell.py's `_is_bell_process` fix
 # (umwelt #205): when /proc is absent, fall back to the portable
-# `ps -p <pid> -o args=`. That fallback is WEAKER than the /proc read and is
+# `ps -ww -p <pid> -o args=` (#4227: without -ww, args= truncates to an
+# exported $COLUMNS). That fallback is WEAKER than the /proc read and is
 # reported as such: `ps -o args=` returns a space-JOINED string, not true
 # NUL-separated argv, so a wrapper whose script path sits inside a single
 # quoted argument (e.g. `bash -c "... forum-mention-monitor.sh ..."`) can

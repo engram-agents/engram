@@ -575,5 +575,63 @@ def test_ps_fallback_negative_decoy_not_reported(tmp_path, script_name):
         _terminate(decoy)
 
 
+# ---------------------------------------------------------------------------
+# 5. #4227: `ps -p P -o args=` truncates to $COLUMNS (pytest-xdist workers
+#    export COLUMNS=80). The ps fallback must read the full argv (`ps ww`).
+# ---------------------------------------------------------------------------
+
+
+def _ps_args_truncated_at_20(pid: int, script_name: str) -> bool:
+    """Precondition probe: on this host, does `COLUMNS=20 ps -p <pid> -o args=`
+    lose the script token? False means ps ignores COLUMNS here."""
+    env = dict(os.environ, COLUMNS="20")
+    out = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "args="], capture_output=True, text=True, env=env, timeout=5
+    ).stdout
+    return script_name not in out
+
+
+@pytest.mark.parametrize("script_name", _FORUM_SCRIPTS_ONLY)
+def test_ps_fallback_genuine_duplicate_reported_under_narrow_columns_4227(tmp_path, script_name):
+    """K1: ps fallback forced AND COLUMNS=20 in the monitor's env -- a genuine
+    duplicate must still be reported with the rc=3 WEAK-match wording.
+
+    K1 does not distinguish `-w` (procps: 132 columns) from `-ww` unless the
+    checkout path exceeds 132 chars; the full-width claim is owned by K2 and the
+    two sibling cells in tests/test_ps_fallback_width_4227.py, whose
+    tmp_path-based paths are long."""
+    meta = _SCRIPTS[script_name]
+    purpose = _unique_purpose("psfallbackcols")
+    port = _free_port()
+    home_a = _make_home(tmp_path, "dup-instance", port)
+    home_b = _make_home(tmp_path, "primary", port)
+    proc_dir = _empty_proc_dir(tmp_path, "cols")
+    extra_env = {"ENGRAM_PROC_DIR": str(proc_dir), "COLUMNS": "20"}
+    assert len(str(meta["path"].parent)) > 20, "script path must exceed the 20 columns"
+
+    dup_proc, dup_reader = _start_monitor(meta["path"], home_a, purpose, extra_env)
+    try:
+        time.sleep(_START_STAGGER)
+        assert dup_proc.poll() is None, "the prior instance exited before it could be detected"
+        if not _ps_args_truncated_at_20(dup_proc.pid, script_name):
+            pytest.skip("ps on this host ignores $COLUMNS; the #4227 precondition cannot be met")
+
+        primary, reader = _start_monitor(meta["path"], home_b, purpose, extra_env)
+        try:
+            time.sleep(_DETECT_WINDOW)
+            reported = [l for l in reader.lines if str(dup_proc.pid) in l]
+            assert reported, (
+                f"genuine duplicate pid {dup_proc.pid} was never reported under "
+                f"COLUMNS=20 via the ps fallback. stdout: {reader.lines!r}"
+            )
+            assert any("WEAK match" in l for l in reported), (
+                f"fallback report should carry the rc=3 weaker-match wording: {reported!r}"
+            )
+        finally:
+            _terminate(primary)
+    finally:
+        _terminate(dup_proc)
+
+
 if __name__ == "__main__":
     sys.exit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-v"]))

@@ -269,7 +269,7 @@ def _real_argv(pid: int) -> Optional[list]:
         except OSError:
             return None
         return [p for p in raw.decode("utf-8", "replace").split("\0") if p] or None
-    out = _ps(["-o", "args=", "-p", str(pid)])
+    out = _ps(["-ww", "-o", "args=", "-p", str(pid)])  # -ww: args= truncates to $COLUMNS otherwise (#4227)
     if not out:
         return None
     try:

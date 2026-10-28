@@ -2427,7 +2427,7 @@ def attempt_delivery(
 def proc_cmdline(pid: int) -> tuple[str, str]:
     try:
         out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "args="],
+            ["ps", "-ww", "-p", str(pid), "-o", "args="],  # -ww: args= truncates to $COLUMNS otherwise (#4227)
             capture_output=True,
             text=True,
             timeout=5,

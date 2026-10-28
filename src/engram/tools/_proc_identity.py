@@ -35,7 +35,9 @@ not be silently folded into it -- callers must warn, not silently skip.
 and land in the "process gone" branch -- dead and SILENT, byte-identical to
 "checked, found no duplicates." Mirrors umwelt-bell.py's `_is_bell_process`
 fix (umwelt #205): when /proc is absent, fall back to the portable
-`ps -p <pid> -o args=`. That fallback is WEAKER than the /proc read and is
+`ps -ww -p <pid> -o args=` (`-ww`, not plain `ps -p`: procps truncates `args=`
+to an exported $COLUMNS, and pytest-xdist workers export COLUMNS=80, which cut
+the script token off a long install path -- #4227). That fallback is WEAKER than the /proc read and is
 reported as such: `ps -o args=` returns a space-JOINED string, not true
 NUL-separated argv, so a wrapper whose script path sits inside a single
 quoted argument (e.g. `bash -c "... forum-mention-monitor.sh ..."`) can
@@ -121,7 +123,7 @@ def check_process_identity(pid: str, script: str) -> tuple[int, str]:
     # No /proc (macOS): portable fallback, mirrors umwelt-bell.py.
     try:
         r = subprocess.run(
-            ["ps", "-p", pid, "-o", "args="],
+            ["ps", "-ww", "-p", pid, "-o", "args="],
             capture_output=True,
             text=True,
             timeout=5,
