@@ -90,7 +90,10 @@ def test_repair_refuses_on_secret_hit(amended):
 
 
 @pytest.mark.parametrize("secret", [
-    "sk-ant-usr-" + base64.urlsafe_b64encode(os.urandom(68)).decode().rstrip("=")[:90],
+    pytest.param(
+        "sk-ant-usr-" + base64.urlsafe_b64encode(os.urandom(68)).decode().rstrip("=")[:90],
+        id="sk-ant-usr-random",
+    ),
     "sk-ant-api03-" + "A" * 24,
     "github_pat_" + "B" * 24,
     "AKIA" + "C" * 16,
