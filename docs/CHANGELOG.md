@@ -9,7 +9,30 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
-### Added
+## [v0.5.5] - 2026-10-28
+
+This release is everything on `dev` that is not in v0.5.4. The range
+`v0.5.4-rc1..dev` held 142 non-merge commits at `9afb1f43` when this section was
+drafted on 2026-10-28. By the paths they change, 107 touch code or other shipped
+paths, 15 touch only documentation files (`docs/` or `*.md`), 15 only tests, and
+5 only documentation files and tests. Five of those 20 documentation commits
+change shipped text under `src/` (the CLAUDE.md template, an agent spec and a
+skill); they are itemized below, under their own heading. A sixth, #4195,
+changes only `deploy/autostart/README.md` and tests, and `tiers.json` lists
+`deploy/autostart/` as `repo_only`, not part of the install tiers. Four of the PRs in that
+range (#3984, #4018, #4024, #4031) are already in the v0.5.4 section and are not
+repeated here. The entries below cover the other PRs that touch code, grouped by
+theme. The other documentation-only and tests-only commits, and one refactor
+with no behaviour change (#4192), are not itemized, except the Codex guide under
+Documentation.
+Nine commits merged after the drafting pin. Four are code PRs (#4243, #4230,
+#4252, #4248), one changes shipped text under `src/` (#4251) and one changes
+`README-AGENT.md` (#4246); those six are itemized. The other three are not:
+#4244 changes only a test, #4247 adds comment lines to the header of
+`tools/install.sh` and changes no behaviour, and the last changes a rule in the
+repo's `CLAUDE.md` and in `docs/internal/GH-STACK.md`.
+
+### Substrate: graph integrity and the cascade
 
 - **A contradiction can be marked `resolved` through the cascade (#4075, PR
   #4088).** `engram_cascade_resolve` has a fourth kind, `resolved`, valid on
@@ -23,8 +46,6 @@ with an `-alpha` suffix during the alpha phase.
   reports such a contradiction as ready for resolution, and the compact
   snapshot lists the successor under `Conflicts`.
 
-### Changed
-
 - **Schema version 10 (#4075, PR #4088).** Migration rung 10 rebuilds
   `cascade_markers` so its `resolution_kind` check admits `resolved`, keeping
   every row and the id counter, in one transaction with the usual pre-migration
@@ -33,17 +54,1266 @@ with an `-alpha` suffix during the alpha phase.
   the one changed `weakest_load_bearing` read with `unregistered_template`
   and asks for the restart.
 
-- **The heartbeat cadence is a config field, team default 900s (Lei, 2026-10-23).**
-  `loop.heartbeat_cadence_seconds` in `$ENGRAM_HOME/config.json`, resolved by
-  `loop_prompt.py` (`--cadence` prints it; `--rearm-delay` falls back to it when the
-  marker carries no valid `cadence_seconds`). The Claude boot charges and the two loop
-  skills read it instead of a hardcoded 1800 (30 minutes).
+- **`engram_reflect` now sets `support_lost` from a node's state, not only
+  clears it (#3782, PR #4003).** Before, the flag was set only when a retract
+  or supersede settled. Reflect's recount read only nodes that already carried
+  the flag, so a cornerstone or lesson whose support reached zero without that
+  step running stayed unflagged, and the flag-only dream scan could not see it.
+  Reflect now checks every current cornerstone and lesson. A node with no live
+  support that had support before is marked. A node that never had support is
+  left alone. Clearing a stale flag works as before. The report gains a
+  `support_lost_marked` list and a summary count for the nodes marked in this
+  run. A newly marked node is also in `support_lost_nodes`, so the same run's
+  recommended actions and count include it. The mark and clear rule is now one
+  function, shared by reflect and the retract/supersede step.
+
+- **A cascade ancestor walk that runs out of budget no longer looks like a
+  finished walk (#2339, PR #4006).** The upstream walk has a budget of 4096
+  dequeues. When the budget ran out, the walk returned its partial set as if
+  it were complete. For the question "is any cascade-ancestor still pending",
+  that could list a node on the frontier as ready while an unreached ancestor
+  was still pending. The answer now has three states: blocked, clear, or
+  unknown because the walk was cut short. `engram_cascade_frontier` lists a
+  node only when the state is clear, and its response carries
+  `cascade_walk_truncated` when a walk was cut short.
+  `engram_cascade_resolve` refuses an unknown node: it says the walk hit its
+  node budget and that whether an ancestor is pending is unknown, carries
+  `cascade_walk_truncated`, and does not point at the frontier. The auto-resolve
+  pass leaves such a node pending. A walk that ends with only already-visited
+  nodes still queued counts as complete. Walks that stay best-effort (the
+  candidate listing and the observation-leaf trace used for standpoint
+  aggregation) still return a partial set, now flagged incomplete or with one
+  stderr line.
+
+- **Superseding a node that resolved a question, contradiction or goal tension
+  now recomputes that target (#3586, PR #4002).** Before, the target kept
+  reading `resolved`, with a `resolved_by` that named a non-current node.
+  Retract already handled this; supersede did not. `engram_supersede` now
+  recomputes every target the old node resolved. With no live resolver, the
+  target goes back to `open` with no resolver. Otherwise `resolved_by` points at
+  the live resolver with the highest confidence, and the status is `resolved` or
+  `partially_resolved` by the resolution threshold (prediction and conjecture
+  targets only move the pointer). The old `resolves` edge stays as audit trail
+  and is not carried to the successor, because whether the successor answers the
+  target is a judgement. The response gains `resolution_targets` and a
+  `resolution_hint` that names `engram_resolve` for the case where the successor
+  does answer it. A startup pass now does the same recompute for targets that
+  already name no live resolver. It touches only current targets that have at
+  least one `resolves` edge (or whose `resolved_by` names a non-live node),
+  prints one stderr line when it changed anything, and logs each change as a
+  `resolution_recomputed` edit_history row that lists the supersede-chain head
+  of each stale resolver in `stale_resolver_successors`. It does not re-wire a
+  target to a successor; that stays a judgement call. Retract now also writes a
+  `resolution_recomputed` row per changed target.
+
+- **The DAG acyclicity rule now counts current nodes and current edges only
+  (#3542, #2952, PR #4010).** Non-current nodes and their edges are provenance,
+  not live structure. One reader, `engram_core.dag_edge_set`, now defines the
+  edge set: an edge counts only when both endpoints are current. The audit in
+  `engram_diagnose` (`dag_conformance`) and the cycle guards on edge writes and
+  on the cascade use it, so supersede chains are no longer resolved before
+  looking for a cycle. A cycle that exists only once supersede chains are
+  resolved is not dropped silently: it is reported on a separate informational
+  line, `frozen_closed_components` with an example path, which never changes the
+  verdict. The per-family stats now report `dropped_non_current` (edges with a
+  non-current endpoint) in place of the two older dropped-edge counts.
+  `engram_retype_edge` onto a non-current endpoint is no longer refused on cycle
+  grounds. The cascade's own upstream walk is unchanged: it still sees through a
+  superseded intermediate node, because it is a provenance walk and not a cycle
+  check. A new test, `tests/test_edge_liveness_ssot_3542.py`, fails when a DAG
+  or cascade edge is read outside `dag_edge_set`; it cannot see a read whose
+  relation set arrives only as a runtime parameter. This changes what the
+  substrate audit counts.
+
+- **An embedded NUL in a node's `claim` or `recall_summary` is now refused by
+  the database (#3765, PR #4087).** Migration rung 9 creates two triggers,
+  `nodes_text_nul_guard_insert` and `nodes_text_nul_guard_update`. An INSERT
+  with a U+0000 byte in either column is refused with `nodes.claim and
+  nodes.recall_summary must not contain U+0000 (NUL)`, whatever the storage
+  type. An UPDATE is refused when it changes a column into a value that holds a
+  NUL. A column that is not changed is not checked, so a legacy row that already
+  holds a NUL can still be retracted and get its other column written. The
+  consequence is that an identical rewrite of a NUL value passes as a no-op; the
+  repair is to supersede, or to write clean text into the column that holds the
+  NUL. The rung counts existing NUL rows and prints one stderr line if the count
+  is not zero. It never alters them. `engram_diagnose` gains an always-present
+  `text_nul_guard` key (live count, up to 10 sample ids, `flare` when the count
+  is not zero). `engram_add_observation` also checks the claim and
+  recall_summary before it creates evidence from a URL, with the same message,
+  so a refused call does not leave a new evidence node behind.
+
+- **A node's first `confidence_history` entry now has one key shape for every
+  node type (#3994, PR #3997).** Axioms and conjectures wrote
+  `{"confidence", "reason", "timestamp"}`; observations and derivations wrote
+  `value`. Axioms and conjectures now write `{"timestamp", "value", "reason"}`
+  too. There is no migration: stored rows keep the key they were written
+  with, and a reader of `confidence_history` outside the engine must accept
+  both keys for older axiom and conjecture rows.
+
+### Substrate: guards on concurrent writes to `nodes.metadata`
+
+- **`engram_retract` and the `engram_add_observation` evidence passthrough now
+  refuse when the node changed between their read and their write (#4166, PR
+  #4179).** Both read `nodes.metadata`, changed it in Python and wrote it
+  back, so a second writer in between could be overwritten. The UPDATE now
+  carries `metadata IS ?` bound to the raw value that was read. If no row
+  matches, the call rolls back and returns `{"error": ..., "refusal":
+  "changed_concurrently"}`. For retract the guard also requires the node to be
+  current and not retracted. In the passthrough, the whole call rolls back,
+  including the observation insert, and the evidence node that was created
+  earlier on its own connection stays. This fixes a code shape found by
+  reading the code; the PR does not report an observed lost write on these two
+  tools. Two other read-then-write sites in the same functions (the paired
+  prediction in retract, the self-anchor transfer in supersede) were left as
+  they are, because a write transaction is already open at the read.
+
+- **The remaining `nodes.metadata` read-then-write sites carry the same guard
+  (#4178, PR #4184, PR #4185, PR #4187).** Three modules, one slice each, the
+  same `metadata IS ?` idiom plus the state check each tool already made, and a
+  `changed_concurrently` refusal that rolls the call back:
+  - person tools: `engram_update_person`, `engram_add_special_moment`,
+    `engram_set_person_lineage` (PR #4184). The guard runs before the edit log
+    and the cascade onto citing nodes, so a refusal leaves no flags and no
+    log row.
+  - task and goal tools: `engram_update_task`, `engram_deactivate_goal`,
+    `engram_activate_goal` (PR #4185). `engram_update_task` also guards on its
+    status read.
+  - `engram_update_lesson`; the support-lost discharge inside
+    `engram_register_exemplar`; and the support-state write shared by retract,
+    supersede and reflect (PR #4187). The discharge cannot refuse, because the
+    exemplar edge is already committed. On a lost race it skips only the
+    discharge and returns `support_lost_discharge:
+    "skipped_changed_concurrently"` with the normal `created` status. The
+    shared support-state write cannot roll back, because its caller owns the
+    transaction. On a lost race it writes nothing, prints one stderr line, and
+    its caller counts the node as neither marked nor cleared; the next reflect
+    recomputes it.
+  `tools/surgical.py` `metadata_patch` is exempt by design: it takes the
+  store-maintenance lock, which the engramd owner holds for its whole life. As with PR #4179,
+  this fixes a code shape found by reading, not an observed incident.
+  `tools/surgical.py` is Developer tier.
+
+- **`engram_update_task` refuses a task that is not current (#4186, PR
+  #4196).** On a retracted or superseded task it now returns `{"error": "Task
+  '<id>' is not current (retracted or superseded); nothing was changed.",
+  "refusal": "not_current"}` and writes nothing, not even an edit_history row.
+  Before, it wrote through to the non-current row. The guarded UPDATE from PR
+  #4185 now also requires `is_current = 1`, so a supersede that lands between
+  the read and the write refuses as `changed_concurrently`. The dream master's
+  spec now says, at both its `engram_update_task` call sites, that on an
+  `error` it does not retry, logs `<tk_id>: update_task refused: <error text>`
+  in the dream record, and continues. That last part is an instruction to an
+  LLM agent; a test pins the text, not a run.
+
+### Config files with a wrong-type value
+
+- **A null or non-string `agent_name` in `config.json` no longer crashes tools
+  and hooks or becomes the name "None" (#4137, PR #4144).** `.get("agent_name",
+  "")` only covers a missing key, so `"agent_name": null` raised on `.strip()`.
+  Each site now treats a missing, null or non-string value as an empty name, so
+  its existing fallback runs (the environment chain, or skipping that record).
+  Sites fixed: `forum.py`, `ia.py`, `baton.py`, `baton-migrate-to-coord-store.py`,
+  `engram-snapshot`, `_prompthooklib.py` and the session-start hook's config
+  read. `supervision_probe.py` used `str(...)` and turned a null into the name
+  "None"; it now gives an empty name. In the session-start hook, one bad peer
+  record used to make the peer-topology block come back empty, hiding every
+  peer, and to skip the counterpart config write; a bad record is now skipped
+  by itself.
+
+- **`tripwire` and three URL and turn readers treat wrong-type config values
+  as absent; `tripwire` refuses a config that is not a JSON object (#4146,
+  #4203, PR #4202, PR #4228).** In `tools/tripwire.py`, `_infer_approver` read
+  `self_lineage`, `agent_name` and `peer` with no type check. A null or
+  non-string lineage raised `TypeError`, a list or dict holding `"opus"` was
+  treated as opus, and a non-string `agent_name` or `peer` such as `42` was
+  returned as the approver login. Now a non-string lineage counts as empty and
+  falls through to "cannot infer approver", and a non-string name or peer counts
+  as missing. When `self_lineage` is present but not a string, the "cannot
+  infer" message shows the raw value, for example `self_lineage=42 (must be a
+  string)`. `tripwire` also refuses a config whose top level is not an object
+  (list, string, number, boolean or null): it prints `tripwire: config top level
+  is not a JSON object (got <type>) at <path>` and exits 2, like its
+  missing-file and parse-error cases. The forum URL resolution in
+  `_status_derive.py`, `forum_api.py` and `baton-migrate-to-coord-store.py` now
+  treats a `forum` value that is not an object, or a `url` that is not a
+  non-blank string, as absent, and falls through to `$FORUM_URL` and then
+  `http://localhost:5002`. `tools/surgical.py` `_get_current_turn` returns 0 for
+  a non-object config, a non-object `memory`, or a `current_turn` that is not an
+  integer (a boolean counts as not an integer). `tools/surgical.py` is Developer
+  tier.
+
+- **Three more config reads treat a wrong-type value as absent (#4229, PR
+  #4232).** `baton-migrate-to-coord-store.py` `_load_config` returns an empty
+  config when the parsed file is not an object. The deference detector's
+  cooldown reader returns its default of 10 minutes when the top level or the
+  `deference_detector` block is not an object. The drowsiness display reader in
+  `context_tracker.py` returns the mode's default thresholds when the top level
+  or the `drowsiness_display` block is not an object. These sites already used
+  defaults for an unreadable config, so a wrong-type config now does the same,
+  and nothing new is printed.
+
+### Backup
+
+- **A refused off-disk push is now loud, pushed history cannot be rewritten,
+  and there is an explicit repair tool (#4205, PR #4209).** The snapshot worker
+  computed the push result and dropped it, so a refused push (after the dream
+  master amended an already-pushed commit, or after a host refused a large
+  blob) could stay silent for weeks. Now:
+  - `$ENGRAM_HOME/backup-push-status.json` is written after every push
+    attempt. `result` is one of `ok`, `refused`, `rejected-size`, `error`,
+    `no-remote`. It keeps `last_success_utc` across failures and records ahead
+    and behind counts.
+  - The session-start hook prints one bounded warning line when `result` is
+    anything except `ok` or `no-remote`. A missing file prints nothing; a
+    malformed file prints "status file unreadable". `engram_checkpoint`
+    returns `backup_push`, and `engram_diagnose` returns `backup_push` with a
+    `flare` (true when the file is unreadable, when the remote is ahead of the
+    local branch, or when the last result is not `ok` and the last success is
+    over 24 hours old or absent).
+  - Opening the data directory's git repo installs a `reference-transaction`
+    hook that refuses an amend, reset or rebase of a local branch commit that
+    is also reachable from `origin/*`. The message names the fix: make a new
+    commit. Rewriting unpushed commits is allowed.
+    `ENGRAM_ALLOW_HISTORY_REWRITE=1` turns the refusal off and appends a line
+    to `backup-rewrite.log`. The hook
+    needs git 2.28 or later (older git records `unsupported`), and an existing
+    `reference-transaction` hook that is not ENGRAM's is left alone. Branch deletion is not refused.
+  - `tools/backup_remote_repair.py --status` prints the status file and the
+    local ahead and behind counts. `--repair` force-pushes with
+    `--force-with-lease` only after these checks pass: a secret-pattern scan
+    that must first match the seat's own `secrets/*` files (exit 5 when it does
+    not), no secret in the tracked tree (exit 2), no tracked blob over
+    100,000,000 bytes anywhere in history (exit 4, changeable with
+    `--max-blob-bytes`), every remote-only commit being a same-message twin of a
+    local one (exit 3), and no secret in the added lines of the not-yet-pushed
+    commits, so a key committed and then deleted still refuses (exit 2). It
+    never rewrites history, and nothing runs it automatically.
+  - The canonical `.gitignore` gains `secrets/`, `*api-key*` and `*.bak-*`.
+    The dream master spec and the sleep skill now say the finalized dream
+    record is a new commit, never an amend.
+
+- **Backups are retained under a stated policy: 14 daily SQL archives plus
+  monthly anchors, and two binary rollback copies (#4208, PR #4222).** The SQL
+  dump is the single source of truth; binary copies are for quick rollback.
+  `tools/backup_knowledge_db.py` now keeps, by default, the newest 14
+  archive dates (by file-name date) plus the first archive of each calendar
+  month, and prunes the rest. `--prune-days N` (alias `--retain`) still prunes
+  strictly by a date cutoff and replaces the default policy; `--keep-all` and an
+  explicit `--retain 0` keep everything; `--keep-all` with `--prune-days N`
+  above 0 is a usage error. After each SQL write the tool writes one
+  consistent binary copy to `db-backup/binary/knowledge-<UTC time>.db` and
+  keeps the 2 newest (`--no-binary` skips this). Each run also untracks, with
+  `git rm --cached` and never deleting the file, binary copies that git already
+  tracks under `backups/`, `db-backup/`, `*.db.*` or `*.bak-*`. The canonical
+  `.gitignore` gains `backups/`, `*.db.*` and `db-backup/binary/`. When the
+  `.gitignore` is missing any canonical line, ENGRAM rewrites it to the
+  canonical lines and keeps only hand-added `!` negation lines.
+  `engram_diagnose` gains an always-present `backup_archive` key with
+  `sql_count`, `sql_bytes`, `binary_count`, `binary_bytes`,
+  `tracked_backup_count`, `oldest`, `newest` and `flare` (true above 1 GiB of
+  SQL archives or when any backup file is tracked; `{"error": ...}` if the
+  read fails). Not covered: rewriting a seat's history to drop blobs that were
+  already pushed.
+
+### Write tools: quote advisories, a quote floor and `engram_requote`
+
+- **Observation writes add `low_similarity_hint` when the quote barely matches
+  the claim (part of #4050, PR #4136).** The `anchoring_advisory` of every
+  observation write already carried `quote_claim_similarity`. When that value
+  is below 0.2 (`LOW_QUOTE_CLAIM_SIMILARITY`, strictly below), the advisory
+  also carries `low_similarity_hint`, which says the quote may not carry the
+  claim and suggests widening the quote, narrowing the claim, or moving the
+  rest into a derivation with its own premises. It applies to every quote type
+  and source class, and sits beside the existing `hint` for `hard_data`. It is
+  absent when the similarity is missing (the embedder cannot run), so a missing
+  measurement never reads as a low one. It is advisory only: nothing is
+  refused and no confidence changes. Batch writes carry it per item. Each row
+  of `anchoring_advisory.jsonl` gains a `low_similarity` boolean.
+
+- **`engram_add_observation` refuses a quote under 10 characters unless it is
+  the whole source line or message (#4134, part of #4050, PR #4142).** The
+  floor is `MIN_QUOTE_CHARS = 10`, counted in characters after stripping. A
+  shorter quote is refused and no node is created. The error names the floor
+  and the measured length and shows the containing line or message as a wider
+  quote to use. A short quote is allowed when it equals one whole unit of the
+  source: one line for a file, or one user or assistant message for a `.jsonl`
+  session transcript (tool output, system records and other record types do not
+  count). The check runs after the verbatim check, on the file preflight, the
+  `evidence_id` path and each batch item. A source whose text cannot be read at
+  write time, such as an `https` URL, fails closed: the refusal stands, and the
+  error suggests snapshotting the source and citing the `file://` copy. For a
+  non-file URL the floor is checked before the evidence write, so a refusal
+  leaves no orphan evidence row, and a short quote on a bad URL now gets the
+  length error first.
+
+- **`engram_requote` fixes an observation's quote in place, against the same
+  evidence only (#4135, part of #4050, PR #4164).** New tool, payload `node_id`,
+  `new_quoted_text`, `reason`; any other field, `evidence_id` included, is
+  refused. It works on a current observation whose evidence is a `file://` copy
+  it can read, and checks the new quote against the evidence as the
+  observation cited it: the recorded `git_sha`, else the recorded
+  `content_hash` (the file must still match), else for a transcript only the
+  rows stamped at or before the node's `created_at`, else a hash-named archive
+  file must still hash to its name, else today's file. Then the verbatim check
+  and the 10-character floor apply. The tool picks the move: EXPAND when the old
+  quote, normalized, sits inside the new one, otherwise SWITCH. Quote-claim
+  similarity must not fall for either move, and the call refuses if the
+  embedder is unavailable. On success it updates `quoted_text`, appends
+  `metadata.quote_history` and writes one `requoted` edit_history row; the
+  claim, confidence, edges and evidence are untouched, and it does not
+  supersede or cascade. Every refusal is `{"error", "refusal": <code>}` and
+  changes nothing: `not_observation`, `not_current`, `identical_quote`,
+  `evidence_unretrievable`, `evidence_changed`, `not_in_source`,
+  `quote_too_short`, `similarity_unavailable`, `similarity_decreased`,
+  `changed_concurrently`. Evidence that is not a `file://` file, and a node
+  cited with `source_repo` or `repo_path`, cannot be requoted
+  (`evidence_unretrievable`). `engram_inspect`'s recall view shows
+  `quote_history`.
+
+### Lessons, tripwire and sleep
+
+- **The lesson-tripwire cluster block truncates the first lesson's nudge
+  instead of cutting it whole (#3955, part of #3911, PR #3979).** When many
+  lessons fire on one tool call, the cluster block lists one line per lesson
+  and then the first lesson's full nudge. If they did not fit the hook's
+  budget, the nudge was dropped whole while the header still said "full text of
+  the first below". Now the nudge is cut from its end to the longest prefix
+  that fits, followed by one marker line that points at the overflow file,
+  which holds every full nudge. The header says what is true: "full text of the
+  first below", "first nudge truncated below", or "first nudge not shown" when
+  not even a prefix of at least 40 characters fits (then the one-line entries
+  win). The
+  cut is at an arbitrary character, not a line boundary.
+
+- **`tools/lesson-pattern-audit.py` now ships, and sleep refreshes the
+  lesson-fire ranks (#3941, part of #3911, PR #3980).** The tripwire hook
+  orders co-firing lessons by how rarely each fires, reading
+  `$ENGRAM_HOME/lesson-fire-ranks.json`, and stops trusting that file after
+  7 days. Nothing refreshed it, because the tool that writes it
+  (`--write-ranks`) was not shipped. It is now in the Essential tier (its
+  earlier "maintainer-run" classification is reversed), and `engram-sleep` has
+  a new Step 3.95 that runs it. The step records one status line in the day's
+  history: ranks written, nothing to replay, or a loud `lesson-ranks FAILED
+  (exit N)` line. A failure never aborts sleep. With no transcripts to replay,
+  or no tripwire hook installed (the hook is Convenience tier, so an
+  Essential-only install lacks it), `--write-ranks` exits 0, says so, and
+  leaves an existing rank file as it is. A hook that is present but fails to
+  load, or a relative ENGRAM home path, exits non-zero. The tool finds the hook
+  in its own plugin tree only (`$CLAUDE_PLUGIN_ROOT/hooks`, then the tool
+  directory's parent), never in an ancestor directory. The store is read through
+  the shared owner-read helper behind the config flag
+  `engramd.lesson_pattern_audit_reads_via_owner`, which is off unless set to
+  true.
+
+- **Dream category 9 reads the shipped coverage instrument (#2879, PR #4243).**
+  The dream-fairy spec's category 9 (cornerstone auto-load coverage gaps) had no
+  output-contract section, and its method listed cornerstones with
+  `engram_list`, which returns no tags. It now calls `engram_diagnose()` and
+  takes `cornerstone_coverage` as the count of record: the gaps are exactly
+  `cornerstone_coverage.uncovered_list`, and the fairy states the instrument's
+  scope (a cornerstone counts as covered when its ID appears in either surface,
+  or when its tag appears in `~/.claude/CLAUDE.md` only). A missing result, an
+  `error`, or an empty `surfaces_checked` is reported as an instrument failure,
+  never as "all covered". The report format gains a `## Category 9` section
+  whose denominator line is required even when there are no gaps. On a seat that
+  uses the local marketplace, agent specs load from the plugin cache, so it
+  picks this up after `/plugin marketplace update` and `/reload-plugins`.
+
+### Smaller fixes
+
+- **The telemetry summary line in `engram_diagnose` names the real cause when
+  `records.db` exists but has no data (#4126, PR #4168).** `records.db` with no
+  `verdicts` table now reads `telemetry: not aggregated (verdicts table
+  absent)`, and a `verdicts` table with no rows reads `... (verdicts table
+  empty)`. Both used to read `(records.db missing)`, which is now returned only
+  when the file cannot be opened. Not changed: who runs `compute_verdicts`.
+
+- **The batch-summary fairy's spawn prompt can carry the cohort counts (#2981,
+  PR #4162).** `_build_initial_prompt` in `tools/cohort_dispatch.py` takes
+  optional `fresh_total`, `backfill_matched` and `backfill_taken`. When all
+  three are given, the prompt adds a `## Cohort context` block with the three
+  counts (the backfill line is labelled "capped at 60"). When any is missing the
+  prompt is the old one. The prepare step writes `fresh_total`,
+  `backfill_total` and `backfill_taken` (`min(backfill_total, 60)`, or null when
+  `--backfill-total` was not passed) to the manifest, including the manifest of
+  an empty cohort, and the sleep skill's dispatch call passes them. The
+  60-node cap itself is unchanged.
+
+### The engramd owner: store-maintenance lock and start-up refusals
+
+- **Offline repair tools and the engramd owner now exclude each other through
+  one store-maintenance lock (#3882, PR #4037; refusal text, #4056, PR #4082).**
+  Before, "offline" for a repair tool was a word in its docstring. Now the lock
+  is a directory beside the store, `<db>.maint.lockdir`, built from the existing
+  setup-lock code with the lock path, wait policy and holder role as parameters.
+  The owner takes it without waiting, before its schema check, and holds it for
+  its whole life; it releases it after closing both store connections, and a
+  crash releases it through the kernel. Six tools take it before their first
+  open of the store and hold it until they exit, report and dry-run paths
+  included: `surgical`, `cites_step3`, `ack_recompute_sweep` (all three
+  Developer tier) and the three one-shot `migrate_*` tools (not shipped in the
+  installed plugin). If the lock is held, a tool refuses before touching the
+  store and prints the stop and start commands for the owner; five of the tools
+  exit 6, `cites_step3` exits 2. A report such as `migrate_person_nodes`
+  therefore cannot run while an owner is live: stop the owner first. If the
+  owner finds the lock held, its exit code follows the holder: another owner
+  gives 1 (unchanged), any other or unreadable holder gives the new exit 6,
+  which the service units retry with back-off. An unusable lock directory gives
+  exit 4, which systemd does not restart (a planted symlink, a non-directory, a
+  foreign owner, a mode that cannot be tightened, permission denied, a read-only
+  filesystem, or any unrecognised error). A short fixed set of resource errors
+  (`EMFILE`, `ENFILE`, `ENOSPC`, `ENOLCK`, and `EAGAIN` on create or open) gives
+  exit 6 instead, because a retry can clear them. The refusal text follows the
+  real cause: for a permission or creation failure a tool says to run against a
+  copy of the store in a writable directory; for a planted path it says to fix
+  or remove that path; a missing parent directory (`ENOENT`) is called unknown,
+  names the errno and suggests no remedy. The owner is never told to copy the
+  live store. Both unit templates and `start-engramd-owner.sh` now name exit 6.
+  On macOS, `start-engramd-owner.sh` also refuses to launch the owner when
+  `knowledge.db.maint.lockdir` is a symlink or not a directory. The lock
+  excludes the owner only: with the server flags off, the MCP server still
+  writes to the store directly.
+
+- **A failing cleanup after a failed owner start no longer hides the start
+  error or frees the lock (#4073, PR #4074).** If `_cleanup()` raised inside
+  the failure handler of `EngramdOwner.start()`, the cleanup error replaced
+  the error that caused the failed start. Now the cleanup error is logged as
+  one warning, the maintenance lock is kept (a store connection may still be
+  open, and the process exit drops it), and the original start error is
+  raised. A cleanup that succeeds behaves as before.
+
+- **An `EngramdOwner` object can be started once; a second `start()` raises
+  `OwnerRestartRefused` (part of #4068, PR #4081).** The second call is
+  refused before it takes a lock, opens a connection, binds a socket or
+  writes a pidfile, whether the first start succeeded, was stopped or failed.
+  This is a caller error, not an operator-facing refusal, so it has no exit
+  code. The owner's `main()` starts once and ends the process on a failed
+  start, so the normal service path does not restart an object. To start
+  again, build a new `EngramdOwner`.
+
+- **Pidfile cleanup removes the file only when it is confirmed to be ours; an
+  unwritable pidfile is a named refusal (#4068, PR #4102).** Before, the owner's
+  and the surface daemon's cleanup also unlinked a pidfile whose content was
+  garbage, empty or unreadable. A late cleanup from an older process could
+  therefore remove a new process's file; this was found by reading the code, not
+  reproduced end to end. Now one shared function,
+  `engram_pidfile.classify_own_pidfile`, returns one of five states (ours,
+  absent, unknown, not-regular, hard-linked). Cleanup unlinks only when the
+  content is an integer equal to its own pid. Every state except ours and absent
+  logs one warning naming the path and the reason, so a pidfile that names
+  another pid is still left in place and now also logs a warning. A pidfile the
+  owner cannot write now stops it with `OwnerPidfileNotWritable`, exit 4, from
+  `--preflight` and from `start`, where it used to be a traceback and a restart
+  every throttle interval. The surface daemon prints one named line, waits out
+  its refusal back-off, and exits 77 (`EXIT_PIDFILE_UNWRITABLE`).
+
+- **The owner counts how long reads wait for its read lock, per day and per
+  request family, and a report tool prints the result (part of #4234, PR
+  #4237).** For `read`, `df`, `chain` and `confidence_by_type` requests, the
+  owner measures the wait to acquire its client read lock. A read that waited
+  more than 1.0 ms counts as waited and goes into a histogram with fixed upper
+  edges of 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000 and 2000 ms plus an open
+  last bucket, so counts add across an owner restart. Timed-out reads and reads
+  rejected before the acquire are counted separately. A `read` is filed under a
+  family taken from the file that holds its SQL template (`tripwire`, `surface`,
+  `session_start`, `idf`, otherwise the file name); a template used from several
+  families is filed under the sorted join (for example `idf+tripwire`), and
+  unknown SQL under `other`. The owner writes `lockwait-YYYY-MM-DD.json` (UTC
+  day) into its run directory. A background thread flushes at most once a
+  minute. The counters run whenever the owner runs; there is no config switch
+  for them. `tools/engramd_lockwait_report.py --days N [--run-dir DIR]`
+  (Developer tier, read-only) prints a per-day, per-family table and a
+  `waited/reads` line for `tripwire` and each family whose name contains
+  `tripwire`.
+
+### Opening `knowledge.db`: modes and quoting
+
+- **No tool call or hook creates `knowledge.db` before bootstrap runs (part
+  of #4107, PR #4114 and PR #4172).** On a fresh home, one failed first tool
+  call (for example `engram_stats`) left behind `knowledge.db` with `-shm` and
+  `-wal`, holding only the `tool_timing` table. The empty file then passed the
+  missing-file check, and `bootstrap.py` refused with "knowledge.db already
+  exists". The cause was the tool-timing connection, which opened the path
+  with a plain `sqlite3.connect`. It now opens `file:<path>?mode=rw`, which
+  fails when the file is absent, so timing for that one call is skipped and the
+  next call retries. The same change is applied to the utility-credit Stop
+  hook (`bump_utility`) and, in PR #4172, to the surface hook's person-moment
+  cursor advance, which a later review found. The user-identity hook's read
+  now goes through `connect_regular_ro`. A new test scans every
+  connect it can see under `src/engram/hooks/` and fails on a connect that can
+  resolve to `knowledge.db` without a `mode=ro` or `mode=rw` URI, and on any
+  other database that is not listed with the reason creating it is intended.
+  Bound: this covers the connects that scan sees, not every way a process could
+  open the file.
+
+- **`connect_regular_ro` percent-quotes its path, so a `#` in the path no
+  longer opens a different database (#4171, PR #4174).** The helper built
+  `file:<path>?mode=ro` without quoting. A `#` starts the URI fragment, so the
+  path was cut there, `mode=ro` was lost, and the connect succeeded onto a
+  different database, creating it if absent. A path under a directory such as
+  `a%23b` was decoded to `a#b` and could read a real sibling store. The helper
+  now builds the URI with `Path(db_path).absolute().as_uri()`, so `#`, `?` and
+  `%` are quoted. A relative path is made absolute against the current
+  directory at call time. The check that a path is not a FIFO is unchanged.
+
+- **`bootstrap.py` opens an existing store read-only when it counts nodes
+  (part of #2652, PR #4032).** With `FORCE=1` or `FORCE_RESEED_EMPTY=1` over an
+  existing `knowledge.db`, bootstrap counts nodes once with `COUNT(*)`. That
+  open was read-write; it is now `mode=ro` with `timeout=0` kept. The main
+  file and the `-wal` are left unchanged. On a cleanly closed WAL store SQLite
+  may still create a `-shm` file, which is an index and holds no data. The
+  count does not use `immutable=1`, because that would say no other writer
+  exists. The function no longer creates a missing file: a path that does not
+  exist now stops with a "cannot read" error and nothing is created (the
+  only caller passes a path that exists). The same PR adds a closed-set check
+  to the migration ledger checker `tools/check_2652_ledger.py` (Developer
+  tier): a ledger row marked `direct-by-design` must name the phase
+  `pre-owner` or `exclusive-maintenance`.
+
+### Tools that read one owner snapshot (behind flags, default off)
+
+- **`engram-pkg scope-export` can read one engramd owner snapshot instead of
+  the live store (part of #2652, PR #4022).** The setting is
+  `engramd.scope_export_reads_via_owner` in `config.json`. It is off unless
+  the value is the boolean `true`. When it is on and the source is this home's
+  store, the tool asks the owner for one snapshot, opens that copy
+  read-only and runs the provenance closure on it unchanged, so the closure
+  cannot straddle a write. The copy sits in a private directory
+  `.engram-pkg-owner-*` (mode 0700) inside `ENGRAM_HOME`, never inside `--out`,
+  and is removed when the run ends, including when the closure stops the run.
+  If the owner cannot answer, or the answer is not a readable store, the tool
+  exits non-zero, names the flag, writes no package and does not fall back to
+  the live store. With the flag off, the tool behaves as before. Every run, on
+  both paths, first removes `.engram-pkg-owner-*` directories in `ENGRAM_HOME`
+  that are older than 6 hours, are real directories and belong to the current
+  user; a failure of that sweep prints a warning and never fails the run.
+
+- **`tools/engram-fix-git-backup.sh` can read one owner snapshot instead of
+  the live store (part of #2652, PR #4028).** The setting is
+  `engramd.fix_git_backup_reads_via_owner`; it is off unless the value is the
+  boolean `true` in `$ENGRAM_HOME/config.json`. When it is on, the script asks
+  the owner for one snapshot written directly to
+  `$HOME/.engram-db-safety-<timestamp>.db`. That one copy is used for the step
+  1 safety check, the step 3 dump and the step 4 verify, so the live store is
+  not opened. The old comparison of live and copy node counts would compare
+  the copy with itself, so it is replaced by two checks on the copy:
+  `PRAGMA quick_check` returns exactly `ok`, and the `nodes` table is not
+  empty. If the owner call fails, the script stops before step 2, names the
+  flag, and says a file at the snapshot path may be incomplete and must not be
+  trusted; it never falls back to the live store. `--dry-run` makes no owner
+  call. With the flag off, the commands are the ones the script ran before.
+  Known limit, unchanged: on the flag-off path the live node count is read
+  after the backup and can mismatch if a write lands in between.
+
+### Dream pickup and the study queue
+
+- **`study_queue` honours the awake seat's `## Morning pickup` lines
+  (#4000, part of #3919, PR #3977 and PR #4008).** `tools/study_queue.py`
+  lists the items of the latest dream record that the awake seat has not
+  handled. It now also reads the record's last `## Morning pickup` section,
+  the one `tools/dream_pickup.py` writes. A line `pN. picked up ...` removes
+  awake-seat item N from the list. A line `pN. skipped (reason)` keeps the
+  item and adds `[skipped: reason]` to its `why` text, so the awake seat can
+  decide whether to revisit it. (PR #3977 first hid skipped items too; PR #4008
+  changed that.) The older rule still applies: a `do now` or `file` line in
+  the `## Sleep-end triage` section hides the item. Only well-formed lines
+  count: `picked up` needs text after it and `skipped` needs a reason. A line
+  inside a fenced block, under another heading, or in a quoted copy of an
+  earlier pickup section changes nothing. Open-for-tomorrow bullets have no
+  pickup lines and are unchanged. When in doubt the item is shown. The new
+  `read_pickup_dispositions` function in `dream_pickup.py` does the reading.
+
+### `cohort_dispatch`
+
+- **`cohort_dispatch prepare` and `verify-in` name an unusable regular-file
+  store instead of printing a traceback (#3963, PR #3991).** A store path that
+  is a regular file but not a usable database (a text file, an SQLite file with
+  no `nodes` table, a file with mode 000) passes the store-path check and then
+  failed inside SQLite. With `engramd.cohort_dispatch_reads_via_owner` off (its
+  default), `prepare` now prints `error: cannot read the store <path>: <sqlite
+  message>` and exits 1, writing no artifact. `verify-in` records one failure,
+  `db_access`, with `cannot read the store <path>: ...`, so `passed` is false
+  and there are no per-node "not found" errors. An unusable store is never read
+  as an empty answer. Only `sqlite3.Error` is caught at that one read; other
+  errors still propagate. The owner-read path was not changed or run.
+
+- **`cohort_dispatch prepare` accepts a proven empty cohort (#3928, PR
+  #4130).** Passing `--fresh-total 0 --backfill-total 0` with an empty id list
+  now exits 0 and writes a `manifest.json` with `empty_cohort: true`, no
+  chunks and zero nodes, where it used to exit 1 with "no node IDs provided".
+  Both counts are required: giving only one exits 2, and a missing count is
+  never read as 0. `--ids ""` is now an explicit empty list instead of falling
+  through to stdin. The optional `--expect-total` must equal `fresh +
+  min(backfill, 60)` (backfill is capped at 60 in `prepare`) or `prepare`
+  exits 2 naming both numbers. `cohort_dispatch validate` exits 0 on a
+  manifest marked `empty_cohort: true` (it exits 2 if that manifest also lists
+  chunks or a node count above zero), while a zero-chunk manifest without the
+  mark still exits 2. The `engram-sleep` skill passes the two raw counts to
+  `prepare` and skips the verify-in and batch-summary steps when the cohort is
+  empty.
+
+### Developer tier: latency and profile tools
+
+- **`engramd_a6_latency.py --real-store` classifies the path with `os.stat`,
+  so Python 3.14 gives the same answer as 3.12 (#4009, PR #4131).**
+  (Developer tier.) With an unsearchable parent directory, `Path.is_file()`
+  raises `PermissionError` on 3.12 but returns False on 3.14, so on 3.14 the
+  tool printed "is not a file" and never reached its classifier line naming
+  `EACCES`. The tool now calls `os.stat` and looks only at the error. The four
+  errnos `is_file()` ignored (`ENOENT`, `ENOTDIR`, `EBADF`, `ELOOP`) and a
+  stat result that is not a regular file keep the "is not a file" line; any
+  other `OSError` (for example `EACCES`, `ENAMETOOLONG`, `EIO`) prints the
+  classifier message. Both exit 2. Behaviour on 3.12 is unchanged. Only this
+  one check was changed.
+
+- **The A6 latency tool's contended arm runs its two clients as processes,
+  not threads (part of #3740, PR #4163).** (Developer tier.) Two threads share
+  one GIL, which gave the owner path relief while it waited on its socket and
+  slowed the baseline path, so the threaded arm understated the owner's
+  contended cost. For the function-level hooks (user-identity, stop, tripwire,
+  surface) the arm now forks the clients after warm-up,
+  and runs the phases baseline, owner, owner, baseline. A path's row pools its
+  two phases. Results carry `contended_clients: "process"` and a
+  `contended_overlap` fraction per path, both reported and not gated; older
+  results have no such key. The session-start contended arm (already separate
+  processes), the sequential gate, the cold-cache arm and any hook are
+  unchanged. The tool also stops comparing the SQLite build to a fixed
+  expected one and names the build the run used, as a per-seat property.
+
+- **Stage-profile owner-side injected delays sleep after the wrapped call, so
+  a late client cannot absorb them (#4180, PR #4183).** (Developer tier.)
+  `tools/engramd_stage_profile.py` used to sleep before calling the wrapped
+  function. When the client was late by more than the delay, the sleep ran in
+  parallel with the lateness and added nothing, which made one injected-delay
+  test fail once in a whole-suite run. The owner stage clock and
+  `_inject_into_function` now call the function first and sleep afterwards,
+  inside the timed span; if the call raises, no delay is added. `response_send`
+  is the one owner stage that still sleeps first, because `sendall` is the
+  owner's last action. Client stages stay pre-call, and `thread_handoff` is
+  unchanged. This affects only the injected delays used to test the profiler,
+  not real profiles.
+
+### Heartbeat loop and the loop-arm Stop hook
+
+- **The heartbeat cadence is a config field, team default 900s (Lei, 2026-10-23;
+  PR #4105).** It was a runtime constant of 1800 seconds, repeated in prose on
+  several surfaces. `loop.heartbeat_cadence_seconds` in `$ENGRAM_HOME/config.json`
+  now sets it. When the field is absent the default is 900 (15 minutes). A value
+  that is not a positive integer, or is under 60, is ignored: the default is used
+  and one line naming the field goes to stderr. A missing `config.json` or `loop`
+  key is silent. `python3 tools/loop_prompt.py --cadence` prints the resolved value
+  as a bare integer, and `--rearm-delay` uses it when the loop marker has no valid
+  `cadence_seconds` (a valid marker value still wins). The Claude boot charges and
+  the `engram-loop` and `engram-collaborating-loop` skills point at `--cadence`
+  instead of a fixed number. A seat gets the new default after its plugin is
+  rebuilt.
+
+- **The heartbeat is a sliding window again (#4007, PR #4016).** The v0.5.3
+  change that re-armed a heartbeat at the preserved deadline (PR #3724) is
+  reverted. Every wake now re-arms at the full `cadence_seconds`, and
+  `loop_prompt.py --rearm-delay` never writes `next_due_at` to the marker. The
+  loop-arm Stop hook counts an arm as confirmed only when `ScheduleWakeup` and
+  `CronList` are in the same parallel block (the same assistant message); a solo
+  `ScheduleWakeup` is the case the hook nudges about. The nudge text, the
+  `engram-loop` skill and both Claude boot charges describe this batched arm. The
+  `engram-school-day` skill still carries the old `--rearm-delay` arm path.
+
+- **One helper writes the loop marker, so the marker keeps its mode and group and
+  no `jq` is needed (#4025, PR #4055).** The two hand recipes in the `engram-loop`
+  skill replaced the marker through a new file with `mktemp`, `jq` and `mv`. That
+  resets the file to mode 0600 and drops a default-ACL group entry, so a second
+  account reading the marker loses access, and it fails on a seat without `jq`.
+  The recipes now call `tools/loop_marker_set.py KEY JSON-VALUE`, or
+  `loop_marker_set.py --string KEY TEXT` for free text. It changes one top-level
+  key, keeps the other keys in order, and never creates a marker. It exits 1 with
+  one stderr line, leaving the file untouched, when the marker is missing,
+  unparseable or not a JSON object, or when the value does not parse; on success
+  it prints `loop_marker_set: <KEY> set`. Convenience tier. Read-modify-write is
+  not locked.
+
+- **A reply to a human is no longer swallowed when a loop turn ends on a tool
+  call (part of #4104, #4193, PRs #4106 and #4197).** Only a turn's final text
+  renders. With a loop marker present, if the turn answers a real human prompt
+  and does not end on assistant text, the loop-arm Stop hook blocks once with
+  `[Reply Delivery Check: ...]`, telling the seat to write the reply as the turn's
+  final text with no tool call after it. On a human-answering turn that did render
+  its reply, the hook no longer forces a re-arm while a wake is still pending. A
+  wake is pending when the latest loop-wake `ScheduleWakeup` in the transcript is
+  due more than 90 seconds from now and no later loop-wake record has consumed
+  it; the hook reads at most the last 4 MiB of the transcript, and anything it
+  cannot read or parse counts as "not pending". Because the hook can run before
+  the final assistant record is flushed, the gate also reads
+  `last_assistant_message` from the Stop payload: if that text is not yet in the
+  transcript, the gate does not block. Each gate decision appends one line (no
+  message text) to `$ENGRAM_HOME/loop-arm-reply-gate.log`, trimmed to the last 200
+  lines once it passes 64 KB. A seat needs the plugin rebuilt for the new hook.
+
+- **The loop-arm nudge only names `loop_prompt` when the marker has one (#4139,
+  #4225, PRs #4215 and #4223).** The nudge always told the seat to use the marker's
+  `loop_prompt` field, but a marker written by the Claude boot charge had none.
+  When the marker has a non-empty string `loop_prompt`, the nudge is unchanged.
+  Otherwise (absent, null, empty, not a string, or an unreadable marker) it says
+  the marker has no `loop_prompt` and points at `loop_prompt.py --default-stub`
+  for a heartbeat loop. The default heartbeat stub text now has one owner,
+  `DEFAULT_STUB` in `loop_prompt.py`, and `--default-stub` prints the marked prompt
+  without reading stdin. Both Claude boot charges now write `loop_prompt` into the
+  marker with `loop_marker_set.py --string`, and fail with a message telling the
+  seat to rebuild the plugin when `--default-stub` is missing. A test fails if the
+  stub text appears under `src/` or `deploy/` outside `loop_prompt.py`.
+
+- **The Quiet Wake Check eases off during a declared wait (#4044, PR #4053).** A
+  seat can write `waiting_on` into the loop marker:
+  `{"description": "...", "return_by": "<ISO-8601 time>"}`. While `return_by` is in
+  the future, quiet wakes no longer get the demanding Quiet Wake Check once the
+  counter reaches its threshold. If `return_by` is within 10 minutes, the hook sends
+  an advisory `systemMessage` and resets the counter. If it is further out, the
+  hook blocks once with a study-unit instruction per `return_by` value, then sends
+  the advisory text. A missing, malformed or past `waiting_on` falls back to the
+  old demand text. The tick rule is in the `engram-loop` skill.
+
+### Boot charges and autostart
+
+- **A host-common boot environment file is sourced before the per-seat one (PR
+  #3971).** `boot-env.common` holds settings shared by every seat on a host, such
+  as `CLAUDE_CODE_PLUGIN_DIRS`. It is read immediately before `~/.engram/boot-env`,
+  so a seat's own value wins. The default path is
+  `/home/agents-shared/autostart/boot-env.common` on Linux and
+  `/Users/Shared/autostart/boot-env.common` on macOS; `AGENT_BOOT_ENV_COMMON` in the
+  inherited environment overrides it. It is sourced in
+  `deploy/autostart/agent-session-launch.sh`, `deploy/autostart/macos/clio-wake-launch.sh`
+  and the prologue of every `agentctl session`. A missing file is normal and
+  silent. Nothing ships at that path: the operator creates it, and its directory
+  must be searchable by the seats.
+
+- **Autostart picks a boot directory that Claude Code already trusts, and warns
+  when none is (part of #4170, PRs #4173 and #4182).** A freshly renamed seat has
+  neither `~/.engram/boot-cwd` nor `~/umwelt`, and used to launch in `$HOME`, where
+  Claude Code waited on a "trust this folder?" dialog nobody saw. At launch, the
+  Linux launcher now uses an existing `~/.engram/boot-cwd` first, even if
+  untrusted. Otherwise it takes the first existing directory among
+  `$HOME/engram-alpha`, `$HOME/umwelt` and `$HOME` that `~/.claude.json` records as
+  trusted (`projects.<dir>.hasTrustDialogAccepted` is `true`), or, if none is
+  trusted, the first existing one in that order. Every launch prints
+  `boot cwd: <dir> (from <reason>)`. When the chosen directory is not recorded as
+  trusted, a loud `ERROR:` line names the directory and the fix (`tmux attach -t
+  agent-<name>`, then accept the dialog). When trust cannot be verified
+  (`CLAUDE_CONFIG_DIR` is set, or `python3` is missing), every directory counts as
+  untrusted. The session still launches, and the launcher never writes
+  `~/.claude.json`. The macOS wake launcher is not changed. These changes reach a
+  seat at the next autostart redeploy.
+
+### Installer
+
+- **The installer fails loudly on an unreadable checkout and treats a missing
+  `config.json` as a fresh install (#4099, #4100, PR #4108).** In
+  `install-local-marketplace.sh`, a failing `git rev-parse` on the checkout (for
+  example "dubious ownership" on a checkout owned by another user) used to exit
+  with status 128 and no output. It now exits 1, prints its message and git's own
+  stderr, and for "dubious ownership" prints the `git config --global --add
+  safe.directory '<path>'` command with the path git named. In the tier-aware venv
+  step, a missing `$ENGRAM_HOME/config.json` now uses the fresh-install default
+  (tier `convenience`, single-agent) and logs one line. A `config.json` that is
+  present but malformed still stops the install with exit 1.
+
+- **The installer pre-warms the embedding model, and a new self-check reports PASS
+  or FAIL per step (#4103, PR #4109).** After the runtime packages are installed,
+  `install-local-marketplace.sh` loads the embedding model once through the
+  runtime's own code, so the MCP server does not die at its first start on a model
+  that was never downloaded. A failure sets the installer's failure flag, so the
+  exit is non-zero, and the message names the model, the cache directory tried and a
+  remedy. New `tools/install_selfcheck.py` (Essential tier) prints one `PASS`,
+  `FAIL <name>: <what> - <remedy>` or `SKIP` line per check, then `SELFCHECK PASS
+  n/n` or `SELFCHECK FAIL k/n failed`. It exits 0 only when no check fails; a check
+  that crashes is reported as a FAIL. `--phase installed` (the default) and
+  `--phase pre-first-session` run common checks (Python version, venv imports, model
+  cached, plugin tree, deployed version, marketplace registered, plugin enabled, and
+  an MCP `initialize` handshake with a 60-second wait) plus phase checks. `--json`
+  prints one JSON object.
+
+- **`tools/install.sh` is the scripted fresh install (part of #4097, PR
+  #4116).** Essential tier. It runs 10 steps in order and prints `[step N]
+  <name> ... ok` for each, or stops with `FAIL: [step N] <name>: <what> -
+  <remedy>` and a non-zero exit. The steps are: preflight, Claude Code,
+  `config.json`, the venv, build and register the marketplace (it calls
+  `install-local-marketplace.sh`), bootstrap, plugin install and enable,
+  services, the self-check, and done. Preflight needs Python 3.10.7 or later
+  with `venv`, git, `claude` (unless `--install-claude-code` is given), a
+  writable `~/.claude` and `ENGRAM_HOME`, and a
+  checkout git can read. Options: `--tier`, `--multi-agent` or `--single-agent`,
+  `--recall-service` or `--no-recall-service`, `--viz-service`, `--forum-url`,
+  `--install-claude-code`, `--yes`. The Claude Code native installer runs only
+  with `--install-claude-code` and only if `claude` is missing; `--yes` never
+  implies it. The recall service is installed by default. When bootstrap runs,
+  an existing `~/.claude/CLAUDE.md` is copied once to `CLAUDE.md.pre-engram`
+  (never over an earlier backup) and then replaced; if no backup exists yet, the
+  script asks first when stdin and stdout are terminals and `--yes` is not
+  given, and otherwise makes the backup without asking; if a backup already
+  exists it is kept and the file is replaced without asking. The upgrade path
+  for an installed seat stays `install-local-marketplace.sh`.
+
+- **`--sandbox-untagged` on `install.sh` is for test rigs only (part of #4097, PR
+  #4123).** It builds from an untagged commit or a branch, prints `SANDBOX BUILD
+  (not a release): <sha>` at the start and the end, and is never implied by `--yes`.
+  Step 1 of `install.sh` now also refuses a checkout whose HEAD is not a deployable
+  tag, using the same check as step 5, so the refusal comes before the venv and pip.
+
+- **New agents are installed through `install.sh`, as themselves (part of #4097, PR
+  #4123).** `tools/agent-bootstrap` no longer builds a venv or links another agent's
+  `claude` into the new agent's home. After it creates the user, home and shell
+  setup, it clones `ALPHA_SOURCE` into `~agent-NAME/engram-alpha` as the new agent,
+  checks out the newest deployable tag (the same rule as
+  `install-local-marketplace.sh`) and runs `tools/install.sh --install-claude-code
+  --yes` there. Git trust applies to that one clone only, through a throwaway
+  `GIT_CONFIG_GLOBAL` file. If the tag has no `tools/install.sh`, agent-bootstrap
+  stops before running anything and says so. New flags: `--tier`, `--multi-agent`,
+  `--forum-url`, `--no-install` (the old substrate-only flow) and
+  `--sandbox-build-ref <ref>` (a test rig; cannot be combined with `--no-install`).
+  The installed `/usr/local/sbin/agent-bootstrap` needs a root reinstall to pick
+  this up.
+
+- **`setup-surface-daemon-service.sh` waits for `bootout`, retries `bootstrap`, and
+  refuses unknown arguments (#3939, PR #4064).** On macOS the script ran `launchctl
+  bootout` and then `launchctl bootstrap` at once; `bootout` can return before
+  launchd has removed the service, so `bootstrap` could fail with `5: Input/output
+  error` and leave no owner running. After `bootout`, the script now polls
+  `launchctl print gui/<uid>/<label>` until the service is gone (up to 10 seconds,
+  every 0.2 seconds). A `bootstrap` failure other than 125 is retried, 5 attempts in
+  all, 1 second apart; after the last failure it exits with launchctl's last code and
+  one stderr message naming the label, the attempts and the manual command. Exit 125
+  keeps its old message and exit 3. Timing can be set with
+  `ENGRAM_SETUP_LAUNCHD_WAIT_S`, `ENGRAM_SETUP_LAUNCHD_POLL_S` and
+  `ENGRAM_SETUP_LAUNCHD_RETRY_S`. `-h` or `--help` prints usage and exits 0 without
+  writing anything; any other argument exits 2 naming it, before anything is written.
+
+- **`README-AGENT.md` points to `tools/install.sh` (part of #4097, PR #4246).**
+  A paragraph beside the agent-driven install names the scripted path. It starts
+  from a checkout of a `v*` or `deploy/*` tag that the clone can see is merged
+  into `origin/dev` or `origin/main`; a shallow `git clone --branch` can be
+  refused at step 1, and the refusal message names the fix. `bash
+  tools/install.sh` does the Phase 0 and 1 work, including `claude plugin
+  install` and `enable`, so no slash commands are needed, and it installs
+  Claude Code only with `--install-claude-code`.
+
+### Session start and forum watchers
+
+- **One malformed record in the agent registry no longer hides every peer (#4145,
+  #4211, PRs #4210 and #4224).** The session-start hook reads the shared agent
+  registry in two loops: `peer_topology_block` (the peer line) and
+  `update_counterparts_from_registry` (the `counterparts` list in `config.json`). A
+  registry file holding a JSON list, string or number made the peer line empty for
+  all peers. A truthy non-string `registered_at` (a number, list, object or `true`)
+  did the same, and in the counterparts loop it skipped the whole write, leaving a
+  stale `counterparts` list with no report. Such a record is now skipped alone, and a
+  non-string `registered_at` counts as missing, so the peer is included. A registry
+  file nested deeply enough to raise `RecursionError` in `json.loads` is also skipped
+  alone. A `registered_at` without a time zone is now read as UTC in both loops;
+  before, the same record could be stale in one loop and live in the other.
+
+- **The forum watchers resolve the agent name from `forum.py whoami` and refuse
+  loudly when it is empty (#4113, PR #4132).** `forum-updates-monitor.sh` and
+  `forum-mention-monitor.sh` read `agent_name` from `config.json` only. On a seat
+  with none, they polled with an empty `agent=`, the server answered 400, and the
+  watcher stayed alive but deaf. New `forum.py whoami` is local only (no network).
+  It prints the name from the usual chain (config `agent_name`, then `$USER`,
+  `$LOGNAME`, the account name, with an `agent-` prefix removed), or prints nothing
+  and exits 2 if all are empty. The watchers use it. When the name did not come from
+  config, a watcher prints one line saying which name it is polling as. If every
+  source is empty, or `whoami` fails (for example an older `forum.py` without it),
+  the watcher prints one warning and exits 2 before any request. The watchers and
+  `forum.py` must be updated together by a plugin rebuild.
+
+- **The forum server loads its embedding model on CPU by default, with a thread
+  cap (part of #3898, PR #4230).** This is `src/forum/embeddings.py`, in the
+  forum service, which is deployed separately from the plugin (`tiers.json`
+  excludes `src/forum/` from the install tiers). It mirrors the ENGRAM-side
+  change in #3905. `FORUM_EMBEDDING_DEVICE` is read at load time: unset or empty
+  means `cpu`, `cuda` and `cuda:N` are accepted, and any other value (matching
+  is exact and case-sensitive) refuses the load with a named
+  `ForumEmbeddingConfigError`, so the forum falls back to FTS/LIKE search and
+  prints the reason on stderr. `FORUM_EMBEDDING_CPU_THREADS` is the torch
+  thread cap, applied once per successful load and only when the loaded model is
+  on CPU. Unset means 4; a value that is not an integer from 1 to 1024 prints
+  one stderr line and uses 4. The v0.5.3 note that the forum loader picks its own
+  device no longer holds.
+
+- **Three process tools read a command line with `ps -ww` (closes #4227 via PR
+  #4248).** On Linux, `ps -o args=` cuts its output to an exported `$COLUMNS`,
+  and pytest-xdist workers export `COLUMNS=80`, so the script name could be cut
+  off a long install path. `_proc_identity.py` (its `ps` fallback),
+  `check_stale_processes.py` and `codex-umwelt-wake.py` now pass `-ww`.
+  Comments in `monitor-supervisor.py` and the two forum monitor scripts were
+  updated to match, and the old note that the cause was a missing controlling
+  terminal now says what was measured: an exported `$COLUMNS` truncates, and a
+  `ps` with no terminal and `COLUMNS` unset prints the full width.
+
+### Baton and merge seat
+
+- **A baton flip to the colleague now reads CI, and an unchecked tip is no longer
+  called green (#4165, #2437, PR #4176).** `baton flip` read CI only on the flip to
+  the maintainer. A flip that asks the registered colleague to review (any flip to
+  the colleague from another holder) now reads it too. A red tip refuses, naming the
+  failing check, unless `--force` is passed. Pending and unknown warn and proceed. A
+  PR anchor without an owner and repository warns "cannot verify" and proceeds.
+  Return flips, self-flips and non-PR batons read no CI. `--force` on either gated
+  flip is now recorded in the turn log as `[forced past CI <state>: <detail>]`. In
+  `baton_gate`, a tip with an empty check rollup and a merge state other than CLEAN
+  is now pending, not green, and an unfinished run is treated as that check name's
+  current entry, so a finished SUCCESS beside an in-flight rerun reads pending. A
+  `CLEAN` merge state alone is still enough to read green.
+
+- **`merge_batch`, a batched press tool for the merge seat (PR #4191).** Developer
+  tier. `tools/merge_batch.py` keeps one JSON state file per batch, with subcommands
+  `build`, `record-run`, `window`, `press` and `status`. `build` makes a scratch
+  merge of the base plus each PR head in order in a fresh repo and records the tree
+  after each step; a conflict stops it. `record-run` records the whole-suite JUnit
+  result, only on the final step's tree. `window` prints the announcement line.
+  `press` merges the steps in order and refuses, for each step, unless: a window seq
+  is recorded and the window has not ended; the recorded run is green (a red run
+  needs `--accept-red <ruling reference>`, which is recorded); the base is at the
+  expected commit; the PR head is the recorded head; a non-author APPROVED review
+  exists on that exact head; the PR is not a gh-stack member; and, within `--ceiling`
+  seconds (default 300), the merge state is `CLEAN` or the strict CI read says
+  `success`. It never presses on `UNKNOWN` or pending. It merges with
+  `--match-head-commit`, then checks the new commit's parent and tree against the
+  record, and stops the batch on a mismatch. The strict CI read is a new function in
+  `baton_gate.py` that reads every run of the required check on the head and returns
+  `success` only if all succeeded.
+
+### Store paths and long-lived processes
+
+- **A new tool tells you which long-lived ENGRAM process still runs pre-deploy
+  code (#3938, PR #3970).** An upgrade restarts only the MCP server. The engramd
+  owner and the surface daemon keep running the code they started with, and the
+  existing checks only ask whether they are alive.
+  `tools/check_stale_processes.py` prints one line each for the owner, the
+  surface daemon and the MCP server, then one summary line (so fewer than four
+  lines means the tool broke). Each process is `FRESH`, `STALE`, `NOT_RUNNING`
+  or `UNVERIFIED`. A process counts as stale if either its start time or its
+  pidfile's modification time is earlier than `deployed_at` in
+  `$ENGRAM_HOME/.deployed-version`. The second clock is there because a host
+  suspend followed by a time sync can move the first one. Exit codes: 0 all
+  fresh; 1 any stale; 3 none stale but something is not running or unverified (a
+  missing pidfile is never clean); 2 no usable `deployed_at`; 4 the tool itself
+  broke. `--informational` prints the same lines and always exits 0.
+  `install-local-marketplace.sh` runs it that way after it writes
+  `.deployed-version`, so it lists what needs a restart and never fails the
+  install. The `engram-upgrade` skill runs the gate form after its restart
+  steps, and `engram-health-exam` runs it beside its process check. Limit: the
+  MCP line covers only the server named in `mcp-tools-ready.json` (the most
+  recent session's); other sessions' servers are not checked.
+
+- **A store path that is a FIFO, a directory or a broken link is refused
+  before it is opened (part of #3962, PRs #3988, #3973, #3989).** One
+  classifier, `check_store_path`, now looks at the path without opening it. It
+  returns for a regular file (or a link to one), raises the usual not-found
+  error for a path that is absent, and otherwise raises "cannot check the store"
+  or "not a regular file". The message names the path and says to fix the path,
+  not to create a store there. There is one copy in the core module
+  `engram_regular_io` and one in `tools/_owner_read.py`; a test pins them
+  identical. Each caller maps the three results to its own existing behaviour.
+  Callers in this change: the viz read-only connect (raises
+  `sqlite3.OperationalError`), the health series export (returns an `error` dict
+  with `reason: unreadable`), the telemetry summary line (raises, which
+  `engram_stats` reports as "unavailable"), the engramd owner,
+  `backup_knowledge_db` (flag off), `cites_step3`, `engram-pkg scope-export` and
+  `render`, and the dev tools `propose-generalizes-migration.py`,
+  `engramd_a6_latency.py --store`, `engramd_stage_profile.py --store`,
+  `perf/trace_from_telemetry.py`, `probes/mods-recall/novel_terms.py` and
+  `ws4/hook_bridge.py`. Two behaviour changes to know. In `cites_step3`, a store
+  whose parent directory cannot be searched, or that is a directory, used to end
+  in an `ERROR:` line with exit 1; it is now a `REFUSED:` line with exit 2, the
+  tool's code for a failed precondition. Not covered: a regular file that is not
+  a SQLite database still fails inside SQLite.
+
+- **A sibling-file lookup no longer climbs above its own plugin tree (#3983, PR
+  #3986).** Several shipped files find a companion runtime file by walking up
+  from `__file__` with no stop. In a tier-filtered build that omits the file,
+  the walk could pass the plugin root and load a stale copy from an ancestor
+  directory; a leftover `~/.engram/` is an ancestor of the installed plugin.
+  Each such walk now stops at the file's own tree root: the nearest ancestor
+  that holds `engram_core.py` (the installed plugin root, or `src/engram/` in a
+  source checkout). A lookup that finds nothing inside that range treats the
+  file as absent, as before. If no `engram_core.py` exists above, only the file's
+  own directory and its parent are searched. `CLAUDE_PLUGIN_ROOT` is still
+  tried first. The change touches, among others, `check_stale_processes.py`,
+  `monitor-supervisor.py`, `codex-umwelt-wake.py`, `engram-sign.py`,
+  `reconcile_lesson_demotions.py`, `engramd_owner.py`, the viz stats and config
+  readers, `_hooklib.resolve_tools_dir` (through a new `bounded_parents`), the
+  surface hook, and the hooks that look up `loop_prompt.py` (deference
+  detector, time bar, loop-arm stop hook). `cites_step3.py` looks for
+  `engram_core.py` itself, so it searches a fixed window of its own directory
+  plus its parent.
+
+### ENGRAM_HOME: a relative value is refused
+
+- **A relative `ENGRAM_HOME` is now refused where the code finds ENGRAM's home
+  (part of #3863, PRs #4034, #4039, #4065, #4076, #4128).** A relative value
+  resolves against each process's own working directory, so an owner, hooks and
+  the MCP server of one seat could land in different homes. Each layer now
+  resolves the home through one function with the same rule: unset or empty
+  means `~/.engram`, a leading `~` is expanded, and a relative value is refused
+  with a message that names the value (`ENGRAM_HOME must be an absolute path,
+  got '...'`). What "refused" looks like depends on the process. `engram_core`
+  raises `ValueError` at import, so the MCP server and the tools that import it
+  fail at start; the engramd owner raises it too (even `--help` ends in a
+  traceback), as does `viz/agents.py` at import. A hook prints one stderr line,
+  writes nothing and exits 0. Command-line tools such as `compact-request` exit
+  2 with one line; `engram-snapshot`, `engram-pkg scope-export` and the build
+  engine's `doctor` exit 1. An empty `ENGRAM_HOME` now means the default home,
+  and `~/x` is expanded. `tools/install.sh` and `install-local-marketplace.sh`
+  refuse a relative value themselves, with the same message and exit 2. Not
+  covered: the other shell launchers, and any reader that did not use the raw
+  form this entry's gate looks for (see the next entry).
+
+- **Repo-root dev tools resolve `ENGRAM_HOME` through the shared function and
+  refuse a relative value (part of #3863, PRs #4122, #4150, #4160).** These are
+  the maintenance tools under `tools/`. A relative value exits 2 with one stderr
+  line, before the tool opens or writes anything:
+  `recall_repetition_analysis.py` is one example. Empty means the default home
+  and `~/x` expands, as in the entry above. `tools/_common.engram_home()`
+  delegates to the shared function, so for `telegram_bot.py` an unset
+  `ENGRAM_HOME` now falls back to `~/.engram` and a relative value is refused.
+  `tools/_common.py` also moved to the `excluded` list in `tiers.json`, because
+  its only importer is `telegram_bot.py`, which is already excluded, so it no
+  longer ships in any install tier.
+
+- **A gate stops new raw reads of `ENGRAM_HOME`, and its baseline is now empty
+  (part of #3863, PRs #4034, #4150, #4169).** `tools/raw_home_read_gate.py`
+  (Developer tier) runs in `pr-checks`, stdlib only, no pytest. It fails when a
+  tracked non-test `.py` file under `src/` or `tools/` reads `ENGRAM_HOME` with
+  `os.environ[...]`, `os.environ.get(...)` or `os.getenv(...)` outside eleven
+  pinned resolver files. Each pinned file carries a copy of one resolver body,
+  and a test checks those copies are identical. Existing sites were a per-file
+  baseline in `tools/raw_home_read_baseline.json` that could only shrink;
+  `--base-sha` made a new entry or a higher count fail. At the start of the
+  series that baseline held 52 sites in 42 files. At this release it is empty,
+  and `python3 tools/raw_home_read_gate.py --report` prints `# 0 file(s), 0
+  site(s)`. So any new raw read in the scanned files now fails the gate. Limits,
+  stated in the gate's own docstring: the unit is one physical line (a call
+  split across lines is invisible), aliased or concatenated spellings are not
+  matched, pinned files are exempt as whole files, and extensionless Python
+  tools are not scanned.
+
+- **The home-path gate's baseline is now empty (part of #3863, PR #4020).**
+  `tools/home_path_gate.py` (Developer tier) fails on a hard-coded ENGRAM home
+  path such as `~/.engram` in the source. Its baseline held 10 such lines in 4
+  files; it is now empty, so the gate denies by default. Fixes that users can
+  see: `engram-snapshot` now takes its home from the shared resolver, so a
+  relative `ENGRAM_HOME` prints `engram-snapshot: ENGRAM_HOME must be an
+  absolute path, got '...'` and exits 1, and `~` is expanded. The build engine's
+  upgrade flow builds the printed `cat .../.deployed-version` hint from the home
+  it already computed, and `_substrate_health_instruction` now requires the home
+  as an argument. `templates/agents.json.example` uses the placeholder
+  `/path/to/ENGRAM_HOME/knowledge.db` instead of a real user's path. Left alone
+  on purpose: the single-line `ENGRAM_HOME` fallbacks inside `_hooklib.py` (the
+  pinned resolver copy).
+
+### Developer tooling and CI
+
+- **A runner for colleague test reads on a Mac: `seat-run.sh` (#3974, #3990, PRs
+  #3985, #3992, #3995).** Developer tier. `src/engram/tools/seat-run.sh --pr N
+  | --ref REF [--keep] -- <pytest args>` runs the named test files of a PR
+  head or ref in a scratch worktree, which it removes on exit, failure, INT,
+  TERM and HUP. It is written for bash 3.2. The output starts with
+  the host, bash, python and pytest versions, the ref and head sha, and each
+  pytest argument on its own line. It refuses Python older than 3.10 or a
+  missing pytest (exit 2), refuses a fused `-o k=v` argument (exit 6), checks
+  that each `-o key=value` actually landed (exit 6 if not), refuses a named file
+  that collects zero tests (exit 5), and prints `FILE <path> passed= failed=
+  skipped= errors=` per file without folding skipped into passed. A run that
+  prints no parsable summary fails closed with exit 1. Other exit codes are 0
+  (all named files green) and 2 (tooling refusal or usage error). A positional
+  that is absolute, contains `..`, or starts with `@` is refused (exit 2); a
+  path-valued option that points outside the ref only prints a `WARN`. A
+  relative `ENGRAM_HOME` is refused first, with exit 2 and one stderr line; a leading `~` is
+  expanded against `$HOME` and re-exported, so the pytest child sees the
+  expanded path, as the header now says.
+
+- **`pr-checks` now also runs on GitHub's merge queue for `dev` (#4058, PR
+  #4060).** The workflow listens for the `merge_group` event
+  (`checks_requested`), so the required check can report on a queued merge.
+  One early step, `resolve base ref`, sets `BASE_REF` for all the diffing
+  steps: `origin/<base branch>` on a pull request, the queue's `base_sha` on a
+  queue run; any other event, or a base that is not a commit in the clone,
+  fails loudly. The old inline `github.base_ref` uses are gone from the
+  steps. Five steps that read the pull-request payload (anti-dup,
+  pr-body-close-keyword, and the three name-leak-warn steps) are skipped on a
+  queue run; the tree-level gates run on both events. `test-id-set-check` runs
+  on both: on a queue run it reads the removed-test markers from the queued
+  pull requests' bodies, after a loud check that every commit subject in the
+  range ends in `(#N)`. This only changes the workflow. Whether the queue is on
+  is a repository ruleset setting.
+
+- **CI installs CPU-only torch, and one guard fails a CUDA install (#4004, PR
+  #4005).** The CI install steps ran `pip install -r
+  requirements/requirements-dev.txt` alone, which pulled the CUDA torch stack
+  (`nvidia-*` wheels and `triton`) that `requirements/requirements-lock.txt`
+  says to avoid. The stub-affected-tests step of `pr-checks.yml`, `tests.yml`
+  and `affected-tests.yml` now run `pip install torch --index-url
+  https://download.pytorch.org/whl/cpu` first; the dev requirements then
+  install from PyPI only and find torch already satisfied. `nightly.yml`
+  already used this shape. `tools/check_no_cuda_wheels.py` ends each of those
+  four install steps: it exits 1 with an `::error::` line if any `nvidia-*` or
+  `triton` distribution is installed (names are normalised, so `nvidia_...`
+  matches too), and exits 2 if `pip list` itself fails. It is listed under
+  `excluded` in `tiers.json`: CI-only, not shipped in any install tier.
+
+- **The public snapshot no longer carries internal docs: everything about
+  building ENGRAM moved to `docs/internal/` (#4080, PRs #4083, #4077).** `docs/`
+  at the top level now holds only documents that a shipped surface sends users
+  or their agents to. Design notes, specs, research, the merge policy, review
+  conventions, CI cost notes and the release procedure are under
+  `docs/internal/` (for example `docs/internal/RELEASING.md`,
+  `docs/internal/PR-MERGE-POLICY.md`), moved with `git mv` and with all
+  references in code, tests, workflows and `CLAUDE.md` updated. One entry,
+  `docs/internal/`, in `release-minus-set.txt` keeps the whole tree out of the
+  public snapshot; it replaced the per-path entries that PR #4077 had added for
+  a first set of team-process docs. A new `docs/README.md` explains the split.
+  `docs/CHANGELOG.md` is unchanged, so older entries keep the paths that were
+  true then. A `pr-checks` step (`docs-layout-guard`,
+  `tests/test_docs_layout_guard.py`) fails when a new file appears directly
+  under `docs/` unless it is on an allowlist where every entry has a reason, and
+  it runs the release-cutover tool's own matcher over the tracked files to check
+  the minus-set has no stale entry. The guard does not look inside
+  `docs/handbook/` or `docs/assets/`. Code comments that cite
+  `docs/internal/...` point at notes that the public snapshot does not carry.
+
+- **The mapping for the CLAUDE.md prune check moved next to its checker (PR
+  #4078).** Developer tier. `docs/claude-md-moves.json` is now
+  `tools/claude_md_moves.json`, beside `tools/claude_md_moves_check.py`, which
+  reads it from that path (`MAPPING`). The file content is unchanged.
+  `tiers.json` lists the data file as `dev` with the checker.
+
+### Signing with non-Claude models
+
+- **`engram_sign` can read the model of a Codex session and recognise four
+  non-Claude model ids (part of #3922, PR #3942; part of #3976, PR #3987).**
+  For a Codex transcript the model is `payload.model` of the newest record
+  whose top-level `type` is `turn_context`. If that record has no usable model
+  the signer refuses; it does not fall back to an older turn. A transcript that
+  holds both Claude model evidence and a `turn_context` record is refused as
+  "mixed-harness". Lineage for non-Claude ids comes from an exact-id table,
+  `_NON_CLAUDE_MODEL_TABLE` in `engram_trust.py`, which has four rows at this
+  release: `gpt-6.1-sol` (`openai:gpt`), `deepseek-flash` (`deepseek:flash`,
+  no version), and `deepseek-v4.1-flash` and `deepseek-v4.1-flash:cloud`
+  (both `deepseek:flash`, version 4.1). There is no prefix or pattern rule, so
+  any other id still maps to nothing. In the fallback that reads assistant
+  rows, the signer skips only rows whose model is blank, not a string, or
+  `<synthetic>`; if the first remaining id is neither `claude-` nor in the
+  table, it refuses. The signature is a claim about the newest turn in a local,
+  editable transcript: declared provenance, not proof. Both issues are still
+  open; signing on a real Codex seat is checked after deploy (PR #3942).
+
+- **The `engram_sign` line gets a final segment, the project site (PR
+  #4252).** After `<primary_user>'s agent` the line now ends with a site, which
+  is `engram-agents.org` unless `signature_site` in `config.json` sets another
+  string. A `signature_site` of `""` or only whitespace leaves the segment out,
+  so the line ends where it did before. A `signature_site` that is not a string
+  makes the signer refuse and name that field. The result also carries a `site`
+  field, and the `engram_sign` capability text and `tool_capability_index.txt`
+  now say "project site".
+
+### Quote-quality survey and S2 study tools
+
+These tools belong to the quote-quality study in #4050 and its follow-up
+#4201, which are not finished. They measure and build study sheets. They do
+not change any write path, floor or refusal. This release reports no study
+result.
+
+- **`tools/quote_quality_survey.py` measures observation quotes read-only and
+  can export a blind judging sheet (part of #4050, PRs #4061, #4072, #4086;
+  closes #4066, #4085).** Convenience tier. It opens a copy of a graph with
+  `mode=ro` and prints distributions of quote length and of quote-to-claim and
+  quote-to-interpretation similarity, by quote type, source class and month.
+  With `--judging-sheet` and `--judging-key` it draws a seeded sample (default
+  seed 4050, 5 per similarity bin plus 5 from a pre-registered "terse
+  measurement" group) and writes a sheet without the node ids, plus a separate
+  key file. `--exclude-source-class` removes nodes from the sample only; it is
+  not a privacy screen. `--swap` re-draws an item, `--sheet-part-bytes` splits
+  the sheet into parts of at most that size, and `--score-sheet` scores filled
+  sheets. It does not decide whether a low similarity means a bad quote; that
+  is what the judging is for. PR #4086 made it read node metadata through the
+  shared `_metadata_dict` helper, which turned a red drift-guard test green.
+
+- **`tools/s2_clause_sheet.py`, `tools/s2_score.py` and
+  `tools/s2_clause_check.py` are team study tools for the S2 clause-check study
+  (part of #4050, PRs #4140, #4147, #4152, #4153, #4155; part of #4201, PRs
+  #4204, #4216, #4226).** Developer tier, and `release-minus-set.txt` keeps them
+  out of the public release; they are not user tools, and no other file under
+  `src/engram` names them (they only name one another). The first builds the
+  blind sheets the judges fill in. The second scores the returned sheets. The
+  third is an evaluation harness for an automated clause check with a rule-based
+  clause splitter; its `advise` function is not connected to any hook or sleep
+  path. The splitter was designed by reading the same study items it was first
+  tried on, so its numbers on those items decide nothing; a fresh hand-split set
+  is the test.
+
+### Shipped templates, agent specs and skills
+
+- **The shipped CLAUDE.md template is shorter (part of #3322, PR #3873; PRs
+  #4207 and #4217).** `src/engram/templates/template.CLAUDE.md`, which new
+  installs render into their CLAUDE.md, went from 38,415 to 28,941 bytes between
+  v0.5.4 and this release, and the files under
+  `src/engram/templates/components/` went from 41,943 to 32,469 bytes in total.
+  PR #3873 is round 1 of the tightening. PR #4207 added a self-filed issue close
+  carve-out to the shared authority table, and PR #4217 put the shipped
+  Destructive row back to its generic per-action sentence; the Destructive row
+  is unchanged from v0.5.4. The byte figures are read at `dev` after PR #4251
+  (next entry), which added 1,330 bytes to each.
+
+- **The shipped CLAUDE.md template gains a "Reach beyond training" section (PR
+  #4251).** Seven lines are added to both
+  `src/engram/templates/template.CLAUDE.md` and
+  `src/engram/templates/components/engram-read-discipline.md`, so new installs
+  render them into their CLAUDE.md. The section tells the agent to use its tools
+  (web search, a fetch, the repository, the API) for knowledge past its
+  training cutoff and for the current state of anything that moves, and to say
+  that something postdates its training only after that reach has failed. It
+  says to re-check a fact the agent already holds before the fact carries weight
+  in shipped work. It says a fetched page is a claim: weigh its source (who,
+  when, primary or relay, measured or asserted), archive it with
+  `engram-snapshot`, and file it as an observation at the `quote_type` it earns.
+  It says to cite, in shipped work, the source of a key claim taken from
+  outside. An existing `~/.claude/CLAUDE.md` is not changed.
+
+- **The person-node dream-fairy spec documents a `P2` ledger key (#3965, PR
+  #3998).** `engram-person-node-fairy.md` now describes `P2:<author key>`,
+  beside `P1:<canonical person>` and `P3:<dangling pn_ id>`, for a personless
+  recurring author: its `count_at_ruling` is the number of stamped nodes for
+  that author key, and `declined` is the expected common case. The v0.5.4 spec
+  had no `P2` key. A P1 entry's `count_at_ruling` now counts only the stamps
+  under its non-canonical variants (the v0.5.4 wording did not say so), and the
+  one line about the ledger in the dream-master spec was changed to match. On a
+  seat that uses the local marketplace, agent specs load from the plugin cache,
+  so it picks this up after `/plugin marketplace update` and `/reload-plugins`.
+
+- **The `engram-upgrade` skill states its Step 5.5 figures as changed lines (PR
+  #3981).** The example for the rc1 to rc2 range now reads "owner 1441 changed
+  lines, +1432/-9; surface daemon 37, +17/-20", so the first figure is additions
+  plus deletions, not added lines.
+
+### Documentation
+
+- **A tested guide for continuing a local Codex agent from an iPhone or a
+  Windows desktop client (PRs #4238, #4239).** `docs/CODEX-MOBILE.md` connects
+  an iPhone or a Windows desktop client to an existing local Codex session on a
+  Linux host. ENGRAM and its tools stay on that host, and each client is another
+  way to talk to the same agent. It is not a phone-only install, a fresh
+  Windows-host install or a Codex Cloud task. The guide records one test on
+  2026-10-27 (Linux host, Codex CLI and managed app-server 0.164.0, iOS ChatGPT
+  1.2026.286): a phone message reached the existing terminal conversation and
+  the reply came back to the phone. The Windows client steps are human-reported,
+  and the guide marks the CLI Remote Control path as experimental. Not tested: a
+  fresh-user install, Android, other host platforms, minimum supported versions,
+  and persistence through a cold boot. `README.md`, `README-AGENT.md` and
+  `docs/README.md` link to it.
 
 ## [v0.5.4] - 2026-10-21
 
 A patch release. The reason for it is one v0.5.3 feature: agent-decided
 compaction at the nap boundary. Everything else merged on `dev` since v0.5.3
-ships in v0.6.0.
+ships in v0.6.0. [Added with v0.5.5: this did not hold. The changes merged on
+`dev` after v0.5.4-rc1 ship in v0.5.5, not in v0.6.0.]
 
 ### Fixed
 
