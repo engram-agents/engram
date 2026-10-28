@@ -17,6 +17,10 @@
 # is refused at step 1, although step 5 does a bounded fetch and might have passed. Remedy:
 # `git fetch --tags origin`, then re-run.
 #
+# TRYING IT ON A LIVE SEAT: scratch HOME, --no-recall-service (services are per user, not per HOME),
+# CLAUDE_HOME and CLAUDE_CONFIG_DIR unset. ENGRAM_HOME alone leaves the venv (~/.engram/venv, by
+# design, #3863), ~/.claude/CLAUDE.md and the plugin config live. Untagged tip: --sandbox-untagged.
+#
 # Bash 3.2 compatible (macOS). No interactive prompt except the one CLAUDE.md question in
 # step 6 (a tty, no --yes, an existing ~/.claude/CLAUDE.md and no backup yet).
 
