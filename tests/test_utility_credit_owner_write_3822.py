@@ -39,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -71,6 +72,9 @@ FLAG = "utility_credit_writes_via_owner"
 # Ids that the hook's regex (2 letters, underscore, >=4 digits) finds in prose.
 TEXT = "credit ob_0001 and ob_0002 then again ob_0002, plus ob_0099 (no row), ob_0004 and ob_0005."
 MENTIONED = ["ob_0001", "ob_0002", "ob_0099", "ob_0004", "ob_0005"]  # first-occurrence order, deduped
+
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
 
 
 # --- scratch fixtures -------------------------------------------------------------------------
@@ -206,7 +210,11 @@ class StoreOpenCounter:
 
         def counting(database, *a, **k):
             try:
-                target = os.path.realpath(os.fspath(database))
+                raw = os.fspath(database)
+                if isinstance(raw, str) and raw.startswith("file:"):
+                    # a URI open (e.g. the hook's non-creating mode=rw open, #4107) names the same file
+                    raw = urllib.parse.unquote(urllib.parse.urlsplit(raw).path)
+                target = os.path.realpath(raw)
             except TypeError:
                 target = ""
             if target.startswith(counter.store) and threading.current_thread() is threading.main_thread():

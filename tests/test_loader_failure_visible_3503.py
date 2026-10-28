@@ -51,6 +51,9 @@ if _SRC_ENGRAM not in sys.path:
 
 HOOK_PATH = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-lesson-tripwire-hook.py"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, str(path))

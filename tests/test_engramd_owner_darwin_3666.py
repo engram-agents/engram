@@ -1,6 +1,6 @@
 """Darwin arm of the engramd owner's permission layer -- issue #3666.
 
-Contract (docs/2652-security-slice-design.md §2.1, §2.2, §2.5; build spec v1.1
+Contract (docs/internal/2652-security-slice-design.md §2.1, §2.2, §2.5; build spec v1.1
 on #3666). Every cell runs on a REAL Mac; none simulates Darwin by patching
 `platform.system` alone (#3375). The whole file skips off Darwin, so Linux CI
 is unaffected -- the Linux arm keeps its own cells in test_engramd_owner.py.

@@ -38,6 +38,9 @@ PRESENCE_MODULE_PATH = _TOOLS_DIR / "presence.py"
 SD_MODULE_PATH = _TOOLS_DIR / "_status_derive.py"
 CLI_PATH = _TOOLS_DIR / "engram-mode.py"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_presence():
     """Load presence as a fresh module instance (avoids sys.modules caching)."""

@@ -19,6 +19,8 @@ Usage:
 Available stripped fields:
     embedding          384-float JSON array (cosine similarity target)
     confidence_history List of {timestamp, value, reason} dicts
+                       (first entries written before #3994 for conjectures
+                       and axioms use the key `confidence` instead of `value`)
     content_hash       SHA-256 of the source file content (file:// obs only)
     git_sha            Git commit SHA when the file was read (file:// obs only)
     parsed_metadata    Full parsed metadata dict (superset of metadata string)
@@ -59,7 +61,13 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools import _owner_read as owner_read  # noqa: E402
 
-DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
+# The ENGRAM home has ONE definition: owner_read.engram_home() (#3863). A relative value must not raise at import
+# (the importing tests and `--help` still work): _get_row refuses it (live, one stderr line, exit 2) before any
+# read, and until then the constants point below a file (/dev/null), where nothing can be opened or created.
+try:
+    DATA_DIR = owner_read.engram_home()
+except ValueError:
+    DATA_DIR = Path("/dev/null/engram-home-refused")
 DB_PATH = DATA_DIR / "knowledge.db"
 
 # Columns that exist as top-level fields in the nodes table.

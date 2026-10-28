@@ -516,7 +516,7 @@ def test_stage1_suggestion_fires_on_cjk_alias():
 
     obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "claim": "我和王伟讨论了这个设计",
-        "quoted_text": "王伟讨论了这个设计",
+        "quoted_text": "王伟讨论了这个设计 in the cited source",
         "interpretation": "discussed the design with Wang Wei",
         "quote_type": "personal_communication",
         "url": "https://example.com/test-evidence",
@@ -528,7 +528,7 @@ def test_stage1_suggestion_fires_on_cjk_alias():
 
     obs2 = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "claim": "我见到了Wei昨天",
-        "quoted_text": "见到了Wei昨天",
+        "quoted_text": "见到了Wei昨天 in the cited source",
         "interpretation": "saw Wei yesterday",
         "quote_type": "personal_communication",
         "url": "https://example.com/test-evidence-2",
@@ -623,7 +623,7 @@ def test_special_moments_below_cap_succeeds_normally():
     for i in range(5):
         obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
             "claim": f"Moment {i+1} for BelowCapTest",
-            "quoted_text": f"moment {i+1}",
+            "quoted_text": f"moment {i+1} in the cited source",
             "interpretation": "a special event",
             "quote_type": "hard_data",
             "url": "https://example.com/test-evidence",
@@ -678,7 +678,7 @@ def test_special_moments_at_cap_fails_loudly_no_eviction(monkeypatch):
     for i in range(3):
         obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
             "claim": f"Moment {i+1} for AtCapTest",
-            "quoted_text": f"moment {i+1}",
+            "quoted_text": f"moment {i+1} in the cited source",
             "interpretation": "a special event",
             "quote_type": "hard_data",
             "url": "https://example.com/test-evidence",
@@ -708,7 +708,7 @@ def test_special_moments_at_cap_fails_loudly_no_eviction(monkeypatch):
     # 4th moment — at cap (3), must fail loud, no eviction.
     obs4 = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "claim": "Moment 4 for AtCapTest",
-        "quoted_text": "moment 4",
+        "quoted_text": "moment 4 in the cited source",
         "interpretation": "another special event",
         "quote_type": "hard_data",
         "url": "https://example.com/test-evidence",
@@ -961,7 +961,7 @@ def test_add_special_moment_tool_cap_and_rotation_spot_check():
     for i in range(3):
         obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
             "claim": f"Moment {i+1}",
-            "quoted_text": f"moment {i+1}",
+            "quoted_text": f"moment {i+1} in the cited source",
             "interpretation": "a special event",
             "quote_type": "hard_data",
             "url": "https://example.com/test-evidence",

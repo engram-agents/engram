@@ -740,6 +740,32 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
         return True, None  # advisory — never block session start
 
 
+def _backup_push_health_line(engram_home: str):
+    """One bounded line when the snapshot worker's last off-disk push was not ok (#4205).
+
+    Reads $ENGRAM_HOME/backup-push-status.json. Missing file or result "ok" -> None
+    (a pre-fix seat is not a false alarm). A malformed file is loud, not fatal."""
+    path = os.path.join(engram_home, "backup-push-status.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+        if not isinstance(st, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError):
+        return "⚠️  ENGRAM off-disk backup: status file unreadable"
+    result = st.get("result")
+    if result in ("ok", "no-remote"):  # no remote is a configuration state, not a failure
+        return None
+    since = st.get("last_success_utc") or "never"
+    tail = " ".join(str(st.get("stderr_tail") or "").split())[-120:]
+    return (
+        f"⚠️  ENGRAM off-disk backup: {str(result)[:20]} since {str(since)[:30]}; "
+        f"ahead {st.get('ahead')} behind {st.get('behind')}; {tail}"
+    )
+
+
 def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
     """Check whether knowledge.sql is reasonably current relative to knowledge.db.
 
@@ -1538,6 +1564,10 @@ def update_counterparts_from_registry(
     Stale entries (older than PEER_STALE_HOURS from ia.py, mirrored here as 24h)
     are excluded — same policy as ia.py's scan_peers().
 
+    Invariant (#4145): a non-string ``registered_at`` on one record (number,
+    list, dict, bool) is treated as missing — the peer is included
+    conservatively — and never aborts the update for the other records.
+
     Fail-soft: any exception is silently caught, identical to
     write_agent_registration.  Never raises.  The gate:
     - shared-fs root must exist (same as write_agent_registration).
@@ -1567,14 +1597,15 @@ def update_counterparts_from_registry(
             try:
                 text = read_regular_text(json_file, encoding="utf-8")
                 record = json.loads(text)
-            except (OSError, json.JSONDecodeError, ValueError):
+            except (OSError, json.JSONDecodeError, ValueError, RecursionError):
                 continue  # skip malformed/unreadable files
 
             if not isinstance(record, dict):
                 continue
 
-            peer_name = record.get("agent_name", "").strip()
-            peer_hostname = record.get("hostname", "").strip()
+            _n, _h = record.get("agent_name"), record.get("hostname")  # #4137: null / non-string -> ""
+            peer_name = _n.strip() if isinstance(_n, str) else ""
+            peer_hostname = _h.strip() if isinstance(_h, str) else ""
 
             # Must have both name and hostname
             if not peer_name or not peer_hostname:
@@ -1586,7 +1617,8 @@ def update_counterparts_from_registry(
 
             # Skip stale entries
             registered_at_str = record.get("registered_at")
-            if registered_at_str:
+            # #4145: a non-string registered_at is treated as missing (include conservatively).
+            if registered_at_str and isinstance(registered_at_str, str):
                 try:
                     registered_dt = datetime.fromisoformat(
                         registered_at_str.replace("Z", "+00:00")
@@ -1635,6 +1667,11 @@ def peer_topology_block(agent_name: str) -> str:
     so agents walk in knowing which peers are ia/baton-reachable vs forum-only.
     Returns "" when the registry is absent (single-agent install), empty, or on
     any error — never blocks session start.
+
+    Invariant (#4145): a malformed registry record (wrong top-level JSON type,
+    or a wrong-typed ``registered_at``) is skipped, or treated per the
+    fail-open timestamp rule (a non-string ``registered_at`` counts as missing,
+    so the peer is live). It never hides the other peers.
     """
     if not agent_name:
         return ""  # can't exclude self reliably without knowing our own name
@@ -1653,19 +1690,26 @@ def peer_topology_block(agent_name: str) -> str:
         for json_file in sorted(registry_path.glob("*.json")):
             try:
                 record = json.loads(read_regular_text(json_file, encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, ValueError):
+            except (OSError, json.JSONDecodeError, ValueError, RecursionError):
                 continue
 
-            peer_name = record.get("agent_name", "").strip()
-            hostname = record.get("hostname", "").strip()
+            if not isinstance(record, dict):  # #4145: list / string / number record -> skip it, not every peer
+                continue
+
+            _n, _h = record.get("agent_name"), record.get("hostname")  # #4137: null / non-string -> ""
+            peer_name = _n.strip() if isinstance(_n, str) else ""
+            hostname = _h.strip() if isinstance(_h, str) else ""
             if not peer_name or not hostname or peer_name.lower() == agent_name.lower():
                 continue
 
             # Skip stale entries (peer not active).
             reg_at = record.get("registered_at")
-            if reg_at:  # no registered_at → treat as live (fail-open: missing timestamp ≠ stale)
+            # #4145: a non-string registered_at is treated as missing (fail-open), never parsed.
+            if reg_at and isinstance(reg_at, str):  # no registered_at → treat as live (fail-open: missing timestamp ≠ stale)
                 try:
                     reg_dt = datetime.fromisoformat(reg_at.replace("Z", "+00:00"))
+                    if reg_dt.tzinfo is None:  # #4211: naive = UTC, same as update_counterparts_from_registry
+                        reg_dt = reg_dt.replace(tzinfo=timezone.utc)
                     if (now - reg_dt) > stale_delta:
                         continue
                 except (ValueError, TypeError):
@@ -3855,7 +3899,8 @@ def _main_impl() -> None:
         _config_path = os.path.join(ENGRAM_HOME, "config.json")
         with open_regular_text(_config_path) as _cf:
             _cfg = json.load(_cf)
-        _agent_name = _cfg.get("agent_name", "").strip()
+        _v = _cfg.get("agent_name")  # #4137: null / non-string -> ""
+        _agent_name = _v.strip() if isinstance(_v, str) else ""
         if _agent_name:
             write_agent_registration(_agent_name)
             update_counterparts_from_registry(_agent_name, _config_path, AGENT_REGISTRY_DIR)
@@ -4116,6 +4161,9 @@ def _main_impl() -> None:
             f"ℹ️  ENGRAM substrate health: MCP server up (marker stale "
             f"(PID {_mcp_stale_pid} no longer running); live server found)."
         )
+    _bp_line = _backup_push_health_line(ENGRAM_HOME)  # #4205: one bounded line, same emitter
+    if _bp_line:
+        _health_lines.append(_bp_line)
     _health_text = "\n".join(_health_lines)
 
     if source == "startup":
@@ -4752,7 +4800,7 @@ def _main_impl() -> None:
     #
     # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
     # its own try/except so an INIT_FAILED outcome is recordable and
-    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # distinct from an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md
     # §1/§5) -- the session_id/transcript_path extraction below is data
     # prep, not construction, so it sits outside the narrowed try.
     _session_id = hook_input.get("session_id", "unknown") or "unknown"

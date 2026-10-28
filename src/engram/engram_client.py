@@ -26,6 +26,8 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+import engram_home_resolver
+
 
 # ---------------------------------------------------------------------------
 # Multi-agent mode helpers
@@ -37,8 +39,8 @@ def _load_engram_config() -> dict:
     Returns an empty dict if the file is absent or unparseable. Callers
     use .get() with defaults so missing keys degrade gracefully.
     """
-    engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
-    config_path = Path(engram_home) / "config.json"
+    # #3863 step 3a: a RELATIVE ENGRAM_HOME is refused (ValueError naming it), never anchored to the cwd.
+    config_path = engram_home_resolver.engram_home() / "config.json"
     if config_path.exists():
         try:
             return json.loads(config_path.read_text())
@@ -364,7 +366,8 @@ class EngramClient:
         """Initialize the client.
 
         Args:
-            db_dir: Path to the database directory. Defaults to ~/.engram ($ENGRAM_HOME).
+            db_dir: Path to the database directory (absolute or `~`-prefixed: a relative one raises
+                    ValueError, because it becomes ENGRAM_HOME). Defaults to ~/.engram ($ENGRAM_HOME).
                     Use different paths for isolated eval runs.
             server_module_path: Path to the directory containing server.py.
                                 If empty, assumes server.py is importable.
@@ -383,6 +386,9 @@ class EngramClient:
 
         # Override the data directory before importing server
         resolved_dir = str(Path(db_dir).expanduser()) if db_dir else None
+        if resolved_dir and not os.path.isabs(resolved_dir):
+            # #3863 step 3a: db_dir becomes ENGRAM_HOME below, so a RELATIVE one is refused, not cwd-anchored.
+            raise ValueError("ENGRAM_HOME must be an absolute path, got %r (from db_dir)" % (db_dir,))
         if resolved_dir:
             os.environ["ENGRAM_HOME"] = resolved_dir
 

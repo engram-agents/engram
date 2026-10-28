@@ -339,7 +339,13 @@ site("surface_main_idf_gate", "engram-surface-hook.py",
      "    pass\n"
      "finally:\n"
      "    sys.stdout = _o\n"
-     "result = [bool(buf.getvalue().strip()), [c[0].replace(P['eh'], '<EH>') for c in CALLS if c[0].startswith('file:') and '.engram' in c[0] and 'mode=ro' in c[0]]]",
+     # Parity is behavioural: compare the file path + query the URI names, not its
+     # spelling (`file:/p?q` at dev, `file:///p?q` from Path.as_uri() since #4171).
+     "import urllib.parse as _up\n"
+     "def _norm(u):\n"
+     "    s = _up.urlsplit(u)\n"
+     "    return _up.unquote(s.path) + '?' + s.query\n"
+     "result = [bool(buf.getvalue().strip()), [_norm(c[0]).replace(P['eh'], '<EH>') for c in CALLS if c[0].startswith('file:') and '.engram' in c[0] and 'mode=ro' in c[0]]]",
      regular=lambda r: r[0] is True and len(r[1]) >= 1,
      **_bad(lambda r: r[0] is True and r[1] == []))
 
@@ -521,7 +527,7 @@ def test_helper_passes_kwargs_and_uri_params_through_untouched(tmp_path):
         "mod.connect_regular_ro(P['db'], timeout=0.2).close()\n"
         "mod.connect_regular_ro(P['db'], uri_params='mode=ro&immutable=1').close()\n"
         "result = CALLS\n"), "regular")
-    uri = "file:" + str(Path(tmp_path) / "home" / ".engram" / "knowledge.db")
+    uri = (Path(tmp_path) / "home" / ".engram" / "knowledge.db").absolute().as_uri()
     assert r == [[uri + "?mode=ro", {"uri": True}],
                  [uri + "?mode=ro", {"uri": True, "timeout": 0.2}],
                  [uri + "?mode=ro&immutable=1", {"uri": True}]], r
@@ -614,25 +620,30 @@ def test_daemon_cleanup_non_regular_pid_path_is_left_alone(tmp_path, kind):
 @pytest.mark.parametrize("text,gone", [
     ("OWN", True),          # names this process -> unlinked (needs the live pid)
     ("999999999\n", False),  # names another process -> kept
-    ("garbage", True),      # unparseable -> treated as nothing to protect
+    ("garbage", False),     # #4068: unparseable is NOT confirmed identity -> kept
+    ("", False),            # #4068: the ftruncate/O_TRUNC-then-write window -> kept
 ])
-def test_daemon_cleanup_regular_file_outcomes_are_unchanged(tmp_path, text, gone):
+def test_daemon_cleanup_unlinks_only_on_confirmed_identity(tmp_path, text, gone):
+    """Mutation: restore the garbage-to-unlink fallback -> the garbage and
+    empty rows redden."""
     ctx = Ctx(tmp_path)
     code = ("open(os.path.join(P['eh'], 'recall-daemon.pid'), 'w').write("
             + ("str(os.getpid())" if text == "OWN" else repr(text)) + ")\n" + _CLEANUP)
     result, err = run_child(HOOK_DIR, DAEMON, ctx.paths(), code, ctx.env())
     assert result == [0, None if gone else "reg"], result
-    assert not _stderr_lines(err)
+    # one warning for every kept file; the own-pid unlink is silent
+    assert len(_stderr_lines(err, "leaving it in place")) == (0 if gone else 1), err
 
 
 @pytest.mark.skipif(IS_ROOT, reason="mode 000 does not stop root")
-def test_daemon_cleanup_unreadable_regular_pidfile_is_still_unlinked(tmp_path):
-    """A regular pidfile that cannot be READ keeps the dev path: OSError ->
-    still_ours True -> unlinked (the narrow non-regular branch does not act)."""
+def test_daemon_cleanup_unreadable_regular_pidfile_is_left_with_a_warning(tmp_path):
+    """#4068: a regular pidfile that cannot be READ is not confirmed ours, so
+    it is kept (it used to be unlinked by the open-failure fallback)."""
     ctx = Ctx(tmp_path)
     _dplant(ctx.eh / "recall-daemon.pid", "regular000", text="1")
     result, err = run_child(HOOK_DIR, DAEMON, ctx.paths(), _CLEANUP, ctx.env())
-    assert result == [0, None] and not _stderr_lines(err), (result, err)
+    assert result == [0, "reg"], (result, err)
+    assert len(_stderr_lines(err, "leaving it in place")) == 1, err
 
 
 _WRITE_PID = (
@@ -661,13 +672,67 @@ def test_daemon_pid_write_regular_file(tmp_path):
 
 
 @pytest.mark.skipif(IS_ROOT, reason="mode 000 does not stop root")
-def test_daemon_pid_write_regular_file_permission_error_propagates(tmp_path):
-    """No handler on dev: a PermissionError on a REGULAR pidfile propagated out of
-    main(). It must still propagate, not be swallowed by the new narrow branch."""
+def test_daemon_pid_write_regular_file_permission_error_is_one_named_line_and_exit_77(tmp_path):
+    """#4068 point 4: a PermissionError on a REGULAR pidfile used to propagate
+    as a traceback out of main(). It is now one named stderr line (path and
+    remedy), the refusal back-off, then EXIT_PIDFILE_UNWRITABLE (77). Mutation:
+    drop the mapping -> PermissionError escapes and this cell reddens."""
     ctx = Ctx(tmp_path)
     _dplant(ctx.eh / "recall-daemon.pid", "regular000", text="1")
-    result, err = run_child(HOOK_DIR, DAEMON, ctx.paths(), _WRITE_PID, ctx.env())
-    assert result[0] == "raised:PermissionError" and not _stderr_lines(err), (result, err)
+    code = ("try:\n"
+            "    mod._write_pidfile(); result = ['returned']\n"
+            "except SystemExit as e:\n"
+            "    result = ['exit', e.code]\n")
+    env = dict(ctx.env(), ENGRAM_DAEMON_REFUSAL_BACKOFF_S="0.01")
+    result, err = run_child(HOOK_DIR, DAEMON, ctx.paths(), code, env)
+    assert result == ["exit", 77], (result, err)
+    named = [l for l in err.splitlines() if "recall-daemon.pid" in l]
+    assert len(named) == 1 and "writable" in named[0] and "remove" in named[0], err
+    assert "Traceback" not in err
+
+
+_SPY_EXIT = ("events = []\n"
+             "mod._wait_refusal_backoff = lambda s: events.append(['backoff', s])\n"
+             "try:\n"
+             "    mod._write_pidfile(); events.append(['returned'])\n"
+             "except SystemExit as e:\n"
+             "    events.append(['exit', e.code])\n"
+             "result = events\n")
+
+
+@pytest.mark.skipif(IS_ROOT, reason="mode 000 does not stop root")
+def test_daemon_unwritable_pidfile_backs_off_once_before_the_exit(tmp_path):
+    """#4068 round 2: the back-off is the hot-loop guard under Restart=always /
+    KeepAlive, so pin it: called exactly once, with the configured seconds,
+    BEFORE the exit 77. Mutation: delete the `_wait_refusal_backoff(...)` call
+    from `_write_pidfile` -> the events list has no 'backoff' and this reddens."""
+    ctx = Ctx(tmp_path)
+    _dplant(ctx.eh / "recall-daemon.pid", "regular000", text="1")
+    env = dict(ctx.env(), ENGRAM_DAEMON_REFUSAL_BACKOFF_S="0.25")
+    result, err = run_child(HOOK_DIR, DAEMON, ctx.paths(), _SPY_EXIT, env)
+    assert result == [["backoff", 0.25], ["exit", 77]], (result, err)
+
+
+@pytest.mark.skipif(IS_ROOT, reason="mode 500 does not stop root")
+def test_daemon_absent_pidfile_in_unwritable_dir_names_the_directory_and_exits_77(tmp_path):
+    """#4068 round 2: EACCES on the write also happens when the pidfile does NOT
+    exist and its directory is not writable. The line must say so (not "exists
+    but"), keep exit 77 and keep the back-off. Mutation: use the exists-case
+    text for both -> the wording asserts redden."""
+    ctx = Ctx(tmp_path)
+    os.chmod(ctx.eh, 0o500)
+    try:
+        env = dict(ctx.env(), ENGRAM_DAEMON_REFUSAL_BACKOFF_S="0.25")
+        result, err = run_child(HOOK_DIR, DAEMON, ctx.paths(), _SPY_EXIT, env)
+    finally:
+        os.chmod(ctx.eh, 0o700)
+    assert result == [["backoff", 0.25], ["exit", 77]], (result, err)
+    named = [l for l in err.splitlines() if "recall-daemon.pid" in l]
+    assert len(named) == 1, err
+    assert "exists but" not in named[0]
+    assert "directory" in named[0] and str(ctx.eh) in named[0], named[0]
+    assert "writable by the user that runs the daemon" in named[0], named[0]
+    assert "Traceback" not in err
 
 
 # --------------------------------------------------------------------------

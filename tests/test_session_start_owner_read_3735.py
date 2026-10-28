@@ -1,7 +1,7 @@
 """Contract tests for U9 (#3735, part of #2652): engram-session-start-hook.py reads the
 store through the engramd owner behind `engramd.session_start_reads_via_owner` (default OFF).
 
-Written BEFORE the implementation (docs/CONTRACT-FIRST-TESTS.md). Design seat: Borges; ruling on
+Written BEFORE the implementation (docs/internal/CONTRACT-FIRST-TESTS.md). Design seat: Borges; ruling on
 the calibration block: option A (issue comment on #3735). Modelled on U6b's
 tests/test_tripwire_owner_read_3665.py and U8's tests/test_focused_ids_owner_3710.py.
 

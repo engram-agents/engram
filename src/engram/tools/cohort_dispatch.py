@@ -54,6 +54,7 @@ import argparse
 import functools
 import json
 import os
+import sqlite3
 import sys
 import textwrap
 import traceback
@@ -313,7 +314,14 @@ def _build_payload_entry(node: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _build_initial_prompt(payload_path: str, output_path: str) -> str:
+def _build_initial_prompt(
+    payload_path: str,
+    output_path: str,
+    *,
+    fresh_total: int | None = None,
+    backfill_matched: int | None = None,
+    backfill_taken: int | None = None,
+) -> str:
     """Build the short dispatch prompt for a fresh batch-summary-fairy.
 
     The prompt names the input payload file to Read and the output file to
@@ -321,9 +329,15 @@ def _build_initial_prompt(payload_path: str, output_path: str) -> str:
     live in the fairy's agent spec (engram-batch-summary-fairy.md) — this
     prompt does NOT duplicate them.
 
-    Size: ~200 tokens regardless of cohort/payload size (no inline payload).
+    When all three stats params are provided (non-None), a ## Cohort context
+    block is appended showing fresh_total, backfill_matched, and backfill_taken,
+    making the cap-binding status visible at dispatch time (engram-alpha#2981).
+    When any is None the block is omitted — callers that don't pass stats get
+    the old prompt unchanged (backward-compat).
+
+    Size: ≤1000 chars regardless of cohort/payload size (no inline payload).
     """
-    return textwrap.dedent(f"""\
+    base = textwrap.dedent(f"""\
         You are dispatched as `engram-batch-summary-fairy`.
 
         1. Read your input payload from: {payload_path}
@@ -334,6 +348,26 @@ def _build_initial_prompt(payload_path: str, output_path: str) -> str:
         The output must be a single JSON object: {{"items": [...]}}
         Write it to the output path above. Return a brief confirmation naming
         both paths when done.
+    """)
+    if fresh_total is None or backfill_matched is None or backfill_taken is None:
+        return base
+    return textwrap.dedent(f"""\
+        You are dispatched as `engram-batch-summary-fairy`.
+
+        1. Read your input payload from: {payload_path}
+        2. Follow all rules in your agent spec (engram-batch-summary-fairy.md) to generate
+           recall_summary + recall_keywords for each node in the payload.
+        3. Write your output JSON to: {output_path}
+
+        The output must be a single JSON object: {{"items": [...]}}
+        Write it to the output path above.
+
+        ## Cohort context (for your awareness — no action required)
+        - Today's new nodes (fresh, since last sleep): {fresh_total}
+        - Backfill pool (matched in backlog query): {backfill_matched}
+        - Backfill taken (capped at 60): {backfill_taken}
+
+        Return a brief confirmation naming both paths when done.
     """)
 
 
@@ -398,19 +432,32 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     at dispatch time using paths from the manifest.
     Exit code: 0.
 
-    Optional --expect-total N (mechanical truncation gate): the caller
-    (typically the engram-sleep skill) may pass the exact node count it
-    expects, e.g. from engram_list's total_matched field. Once the id list
-    is resolved (post-dedup), if len(ids) != N, prepare fails loudly instead
-    of silently chunking a truncated cohort — engram_list defaults to
-    limit=100, and a caller that forgets `unlimited: true` gets back exactly
-    100 ids even when more nodes match. Omitting --expect-total leaves
-    behavior byte-identical to before this flag existed. On mismatch,
-    nothing is written (no chunk dirs, no payload files, no manifest.json).
+    Optional --fresh-total N / --backfill-total M (mechanical truncation gate):
+    the caller (typically the engram-sleep skill) may pass the raw node counts
+    from the two engram_list queries that built the cohort. Both must be
+    provided together; once the id list is resolved (post-dedup), if
+    len(ids) != N + M, prepare fails loudly instead of silently chunking a
+    truncated cohort. Omitting both leaves behavior byte-identical to before
+    these flags existed. On mismatch, nothing is written (no chunk dirs, no
+    payload files, no manifest.json).
+
+    --fresh-total 0 --backfill-total 0 with an empty id list is the proven-zero
+    path: both populations are confirmed empty, so prepare exits 0 with an
+    empty_cohort: true manifest rather than the usual "no node IDs" error.
+
+    Optional --expect-total N (consistency check): when ALL THREE of
+    --fresh-total, --backfill-total, and --expect-total are given, prepare
+    verifies that --expect-total equals fresh + min(backfill, 60). A mismatch
+    exits 2 immediately so a caller that pre-computes the capped total cannot
+    silently disagree with the raw counts. Omit --expect-total to skip this
+    check.
     """
     # Resolve node IDs
     node_ids: list[str]
-    if args.ids:
+    if args.ids is not None:
+        # `--ids ""` is an explicit "empty list" signal, not a fall-through to
+        # stdin.  Check `is not None` rather than truthiness so a caller that
+        # passes an empty string is not silently redirected to stdin.
         node_ids = [i.strip() for i in args.ids.split(",") if i.strip()]
     elif args.ids_file:
         ids_path = Path(args.ids_file)
@@ -422,6 +469,64 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     else:
         # Read from stdin
         node_ids = [ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip()]
+
+    # Pair gate: --fresh-total and --backfill-total must be provided together.
+    if (args.fresh_total is None) != (args.backfill_total is None):
+        present = "--fresh-total" if args.fresh_total is not None else "--backfill-total"
+        missing = "--backfill-total" if args.fresh_total is not None else "--fresh-total"
+        print(
+            f"error: {present} requires {missing} — "
+            "both population counts must be provided together",
+            file=sys.stderr,
+        )
+        return 2
+    if args.expect_total is not None and args.fresh_total is None:
+        print(
+            "error: --expect-total requires --fresh-total and --backfill-total",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Proven-zero path: --fresh-total 0 --backfill-total 0 with genuinely
+    # empty IDs is a confirmed empty cohort, not an error — the caller
+    # verified both populations are empty. Emit a marker manifest and exit 0.
+    if (
+        args.fresh_total is not None
+        and args.backfill_total is not None
+        and args.fresh_total == 0
+        and args.backfill_total == 0
+        and not node_ids
+    ):
+        # Consistency check applies even on the skip path.
+        if args.expect_total is not None and args.expect_total != 0:
+            print(
+                f"error: --expect-total {args.expect_total} disagrees with "
+                f"computed total 0 (fresh=0 + min(backfill=0, 60))",
+                file=sys.stderr,
+            )
+            return 2
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "empty_cohort": True,
+            "total_nodes": 0,
+            "total_chunks": 0,
+            "chunk_size": args.chunk_size,
+            "out_dir": str(out_dir),
+            "attempt_count": 0,
+            "fresh_total": args.fresh_total,          # 0 on this path
+            "backfill_total": args.backfill_total,    # 0 on this path
+            "backfill_taken": (
+                None
+                if args.backfill_total is None
+                else min(args.backfill_total, 60)
+            ),
+            "chunks": [],
+        }
+        manifest_path = out_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        print(json.dumps(manifest, indent=2))
+        return 0
 
     if not node_ids:
         print("error: no node IDs provided (use --ids, --ids-file, or stdin)", file=sys.stderr)
@@ -438,24 +543,32 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         )
     node_ids = deduped
 
-    # Optional mechanical gate: --expect-total lets the caller
-    # assert the id count it resolved is the count it actually meant to send.
+    # Mechanical truncation gate: fail loudly if the id list doesn't match
+    # the expected total when both population counts are provided.
     # Checked here — post-dedup, the earliest point at which "the final id
     # list" actually exists — and BEFORE any DB fetch or filesystem write, so
     # a mismatch leaves nothing behind to clean up.
-    if args.expect_total is not None and len(node_ids) != args.expect_total:
+    # The backfill half is capped at 60 before IDs are collected, so compare
+    # against the capped total (fresh + min(backfill, 60)) — not the raw sum.
+    if (
+        args.fresh_total is not None
+        and args.backfill_total is not None
+        and len(node_ids) != args.fresh_total + min(args.backfill_total, 60)
+    ):
         received = len(node_ids)
-        expected = args.expect_total
+        expected = args.fresh_total + min(args.backfill_total, 60)
         message = (
-            f"received {received} id(s) but expected {expected} (--expect-total)"
+            f"received {received} id(s) but expected {expected}"
+            f" (--fresh-total {args.fresh_total}"
+            f" + min(--backfill-total {args.backfill_total}, 60))"
         )
         if received == 100 and expected > received:
             message += (
                 ". Received count is exactly 100 -- the most likely cause is "
                 "an engram_list call that omitted `unlimited: true` and "
                 "silently truncated at its default limit of 100. Re-run "
-                "engram_list with unlimited: true and pass total_matched as "
-                "--expect-total."
+                "engram_list with unlimited: true and pass the raw counts as "
+                "--fresh-total and --backfill-total."
             )
         result = {
             "passed": False,
@@ -463,7 +576,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             "errors": [
                 {
                     "chunk": "all",
-                    "check": "expect_total",
+                    "check": "population_total",
                     "error": message,
                     "received": received,
                     "expected": expected,
@@ -473,12 +586,36 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2))
         return 1
 
+    # Consistency check: when --expect-total is also provided, verify it
+    # agrees with fresh + min(backfill, 60). A disagreement means the caller's
+    # pre-computed capped total is out of sync with the raw counts — exit 2
+    # loudly rather than silently proceeding with a mismatched expectation.
+    if (
+        args.fresh_total is not None
+        and args.backfill_total is not None
+        and args.expect_total is not None
+    ):
+        capped = args.fresh_total + min(args.backfill_total, 60)
+        if args.expect_total != capped:
+            print(
+                f"error: --expect-total {args.expect_total} disagrees with "
+                f"computed total {capped} "
+                f"(fresh={args.fresh_total} + min(backfill={args.backfill_total}, 60))",
+                file=sys.stderr,
+            )
+            return 2
+
     db_path = Path(args.db)
     try:
         nodes = _fetch_nodes(db_path, node_ids)
     except (FileNotFoundError, owner_read.StoreUnusable) as exc:
         # No traceback (#3960). 1 is prepare's error code here (no artifact is written before this point).
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as exc:
+        # #3963: a regular file that is not a usable store (text file, no `nodes` table, mode 000) passes
+        # `check_store_path` and fails inside SQLite. One named line, no traceback, no artifact written.
+        print(f"error: cannot read the store {db_path}: {exc}", file=sys.stderr)
         return 1
 
     if not nodes:
@@ -522,6 +659,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "chunk_size": chunk_size,
         "out_dir": str(out_dir),
         "attempt_count": 0,
+        "fresh_total": args.fresh_total,          # None when --fresh-total not passed
+        "backfill_total": args.backfill_total,    # None when --backfill-total not passed
+        "backfill_taken": (
+            None
+            if args.backfill_total is None
+            else min(args.backfill_total, 60)
+        ),
         "chunks": manifest_chunks,
     }
     manifest_path = out_dir / "manifest.json"
@@ -736,6 +880,15 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
                 "chunk": "all",
                 "check": "db_access",
                 "error": str(exc),
+            })
+            db_nodes = None
+        except sqlite3.Error as exc:
+            # #3963: a regular file that is not a usable store. The same ONE named failure, and no answer
+            # (None), never an empty one: the per-node "not found in DB" checks below only run on a real answer.
+            errors.append({
+                "chunk": "all",
+                "check": "db_access",
+                "error": f"cannot read the store {db_path}: {exc}",
             })
             db_nodes = None
 
@@ -1082,6 +1235,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
     manifest_sent: Optional[dict[Path, list[dict]]] = None
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
+        # Empty-cohort manifests carry positive proof of completion — no
+        # chunks to validate, so return 0 immediately rather than treating
+        # zero chunk dirs as a pipeline error.
+        if manifest.get("empty_cohort") is True:
+            if manifest.get("chunks") != [] or manifest.get("total_nodes") != 0:
+                print(
+                    "error: manifest has empty_cohort: true but chunks or "
+                    "total_nodes is inconsistent",
+                    file=sys.stderr,
+                )
+                return 2
+            return 0
         chunk_dirs = [Path(c["chunk_dir"]) for c in manifest["chunks"]]
         # Build a lookup: node_id → original payload entry
         _payload_lookup: dict[str, dict] = {}
@@ -1600,14 +1765,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to ENGRAM SQLite database (default: $ENGRAM_HOME/knowledge.db)",
     )
     p_prepare.add_argument(
+        "--fresh-total",
+        type=int,
+        default=None,
+        help=(
+            "Fresh (today's-new) node count from the count stage. "
+            "Must be provided together with --backfill-total. "
+            "argparse rejects an empty or non-integer value loudly."
+        ),
+    )
+    p_prepare.add_argument(
+        "--backfill-total",
+        type=int,
+        default=None,
+        help=(
+            "Backfill (legacy) node count from the count stage (before cap). "
+            "Must be provided together with --fresh-total. "
+            "argparse rejects an empty or non-integer value loudly."
+        ),
+    )
+    p_prepare.add_argument(
         "--expect-total",
         type=int,
         default=None,
         help=(
-            "Expected resolved id count (e.g. engram_list's total_matched). "
-            "If the post-dedup id count doesn't match, prepare fails loudly "
-            "instead of chunking a silently truncated cohort. Omit for "
-            "unchanged (pre-existing) behavior."
+            "Optional consistency check: when provided alongside --fresh-total "
+            "and --backfill-total, prepare verifies this equals "
+            "fresh + min(backfill, 60) and exits 2 on disagreement. "
+            "Omit to skip the check."
         ),
     )
 

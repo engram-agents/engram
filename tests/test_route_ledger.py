@@ -46,6 +46,10 @@ SIGNALS = (
     "match_type", "recall_turn", "created_at", "in_context",
 )
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored);
+# module scope: later tests rely on the loaded engram_* modules staying imported (a fresh import re-prints the sqlite-vec notice).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads_module")
+
 
 def _ids(*nums):
     # built, never spelled: the repo's no-new-shipped-node-ids gate scans tests too

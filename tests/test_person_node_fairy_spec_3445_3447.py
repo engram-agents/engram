@@ -382,3 +382,62 @@ def test_master_does_not_prune_rekeyed_entry_and_carries_ruling_over():
     assert re.search(
         r"writing the entry under the new key.*removing the old one", s)
     assert "so the ruling is not lost" in s
+
+
+# ---- #3965: P1 count rule, reader-computes-like-writer, P2 key shape ---------
+
+P1_COUNT_RULE = (
+    "For a P1 entry, `count_at_ruling` is the number of stamps whose author "
+    "key is in the entry's `variants` and is NOT the canonical key, where the "
+    "canonical key is the `pn_` id or, when there is none, the most-stamped key."
+)
+READER_LIKE_WRITER = (
+    "You compute the current N for a P1 entry exactly as the writer computes "
+    "`count_at_ruling` (stamps under the entry's non-canonical variants only), "
+    "so growth means a new mis-keyed stamp."
+)
+P2_COUNT_RULE = (
+    "A P2 key is `P2:<author key>`, and its `count_at_ruling` is the number "
+    "of stamped nodes for that author key."
+)
+
+
+def test_p1_count_rule_excludes_the_canonical_key_with_fallback_in_one_sentence():
+    assert P1_COUNT_RULE in _ledger_section()
+
+
+def test_reader_computes_the_p1_count_exactly_as_the_writer_does():
+    assert READER_LIKE_WRITER in _ledger_section()
+
+
+def test_p2_key_shape_and_count_definition():
+    ledger = _ledger_section()
+    assert P2_COUNT_RULE in ledger
+    assert ("`declined` is the expected common case, for example a cited "
+            "outside author") in ledger
+    assert ("A ledgered P2 is listed under `## Known, awaiting ruling` "
+            "instead of being re-reported.") in ledger
+
+
+def test_master_ledger_bullet_agrees_with_p1_p2_count_rules():
+    master = _master_flat()
+    bullet = _bullet(master, "**Category 10 person-node findings",
+                     "never leave it half-edited.")
+    assert '"P2:<author key>"' in bullet
+    assert ("recording `count_at_ruling` as it stands now, counted by the "
+            "fairy spec's rule for that key's category (for P1, only stamps "
+            "under non-canonical variants)") in bullet
+
+
+def test_stored_variants_include_the_canonical_key_so_are_not_the_counted_set():
+    # Reviewer round 1 (#3998): this sentence had no pin; flipping
+    # "includes" to "excludes" left the file green.
+    assert ("The stored `variants` list includes the canonical key, so it is "
+            "not the counted set by itself.") in _ledger_section()
+
+
+def test_p3_count_is_stamped_nodes_pointing_at_the_dangling_id():
+    # Reviewer round 1 (#3998): P3 counts stamped NODES, not stamps; the
+    # restated rule had no pin.
+    assert ("A P3 entry's `count_at_ruling` is the number of stamped nodes "
+            "whose stamp points at the dangling `pn_` id.") in _ledger_section()

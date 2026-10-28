@@ -38,6 +38,9 @@ PRIOR = {
 _needs_fifo = pytest.mark.skipif(
     not hasattr(os, "mkfifo"), reason="os.mkfifo is not available on this platform")
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):

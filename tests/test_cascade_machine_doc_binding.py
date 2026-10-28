@@ -359,9 +359,9 @@ def test_can_it_fail_control():
     # dropping a real member, and confirm the parsed set no longer equals
     # engram_revision._CASCADE_RESOLUTION_KINDS.
     mutated_section_2 = section_text.replace(
-        "resolution kinds are exactly: `acknowledged`, `retracted`,\n"
+        "resolution kinds are exactly: `acknowledged`, `resolved`, `retracted`,\n"
         "  `superseded` (`_CASCADE_RESOLUTION_KINDS`).",
-        "resolution kinds are exactly: `acknowledged`, `retracted`\n"
+        "resolution kinds are exactly: `acknowledged`, `resolved`, `retracted`\n"
         "  (`_CASCADE_RESOLUTION_KINDS`).",
         1,
     )

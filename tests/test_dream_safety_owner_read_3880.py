@@ -756,7 +756,7 @@ def test_c5_every_cli_command_in_a_spec_uses_the_canonical_home_expression(spec)
 
 # ---- C6: the ledger -----------------------------------------------------------------------------------
 
-LEDGER = REPO_ROOT / "docs" / "2652-migration-ledger.md"
+LEDGER = REPO_ROOT / "docs" / "internal" / "2652-migration-ledger.md"
 
 
 def _section_2b() -> str:
@@ -1020,12 +1020,13 @@ def _template_counts():
 
 def test_round1_c6_section_3_header_counts_equal_the_registry():
     non_tools, total, tools = _template_counts()
-    m = re.search(r"(\d+) template entries; (\d+) with the (\w+) `tools/` templates", LEDGER.read_text())
+    m = re.search(r"(\d+) template entries; (\d+) with the ([\w-]+) `tools/` templates", LEDGER.read_text())
     assert m, "the Section 3 header sentence"
     assert (int(m.group(1)), int(m.group(2))) == (non_tools, total), (m.group(0), non_tools, total, tools)
     words = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
              "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
-             "nineteen": 19, "twenty": 20}
+             "nineteen": 19, "twenty": 20, "twenty-one": 21, "twenty-two": 22, "twenty-three": 23,
+             "twenty-four": 24, "twenty-five": 25}
     assert words[m.group(3)] == tools
 
 

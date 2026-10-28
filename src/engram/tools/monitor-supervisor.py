@@ -135,6 +135,29 @@ import time
 from pathlib import Path
 
 
+# Inline copy by ordering choice, not constraint: importing tools._owner_read first would append the package root to
+# sys.path, so the first `import engram_regular_io` could succeed from there and skip the CLAUDE_PLUGIN_ROOT-first lookup.
+# Pinned identical to every other copy by tests/test_bounded_sibling_lookups_3983.py.
+def _bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 def _find_helper_dir() -> Path | None:
     """The directory holding engram_regular_io.py: CLAUDE_PLUGIN_ROOT first,
     then a walk of this file's parents (the installed plugin has the helper at
@@ -145,7 +168,7 @@ def _find_helper_dir() -> Path | None:
     if root:
         cands.append(Path(root))
     here = Path(__file__).resolve()
-    for p in (here.parent, *here.parents):
+    for p in _bounded_parents(here):  # own tree only, never above its root (#3983)
         cands.append(p)
         cands.append(p / "src" / "engram")
     for c in cands:
@@ -246,10 +269,10 @@ def _pid_cmdline_status(pid: int) -> tuple[str, str]:
 
     `ww` (BSD-style "wide, wide" -- unlimited output width) is REQUIRED,
     not cosmetic: without it, `ps` truncates `args=` to whatever width it
-    detects (falls back to a hardcoded 80 columns when it has no
-    controlling terminal to query -- exactly the case for a `ps` subprocess
-    spawned from a supervisor that itself has none, e.g. under a test
-    runner or a detached/daemonized process). Measured live in this
+    detects (the measured trigger on Linux is an exported $COLUMNS --
+    pytest-xdist workers export COLUMNS=80, #4227; the no-tty fallback to a
+    hardcoded 80 columns is not observed on Linux procps and is unmeasured
+    on macOS). Measured live in this
     worktree: without `ww`, a genuine monitor-supervisor.py instance's own
     cmdline (script path alone is 92 characters here) was silently cut to
     80 chars before ever reaching "monitor-supervisor.py" in argv, so
@@ -258,10 +281,12 @@ def _pid_cmdline_status(pid: int) -> tuple[str, str]:
     (SIGKILL recovery + single-instance) whenever the install path is long
     enough. Root-caused via `tests/test_monitor_supervisor.py`'s own
     `test_single_instance_two_starts`, which failed ONLY under `pytest`
-    (no controlling terminal) and passed when driven as a standalone
-    script attached to a real tty -- i.e. it is not a `pytest`-only quirk,
-    it is "no controlling terminal", which `pytest` merely happens to be
-    the common instance of on this host.
+    and passed when driven as a standalone script attached to a real tty.
+    The original reading was "no controlling terminal"; #4227 later
+    measured on Linux procps that a ps with no tty and COLUMNS unset
+    prints full width, while an exported COLUMNS truncates (pytest-xdist
+    workers export COLUMNS=80), so the trigger for that original run is
+    not established.
     """
     try:
         out = subprocess.run(

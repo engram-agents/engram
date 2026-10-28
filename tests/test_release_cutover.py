@@ -1105,7 +1105,7 @@ class TestFinalSummaryRemainingSteps:
     def test_push_summary_prints_remaining_block(self, tmp_path):
         out = self._run(tmp_path, push=True)
         assert ('REMAINING — the release is NOT done until these are live '
-                '(docs/RELEASING.md, "Announcing" + "Tell the public"):') in out
+                '(docs/internal/RELEASING.md, "Announcing" + "Tell the public"):') in out
         assert ("  [ ] Website Versions entry, en + zh, live at "
                 "https://engram-agents.org/versions  "
                 "(owner: Ariadne; Zephyr may do zh)") in out
@@ -1126,7 +1126,7 @@ class TestFinalSummaryRemainingSteps:
     def test_local_summary_prints_one_line_note_not_block(self, tmp_path):
         out = self._run(tmp_path, push=False)
         assert ('  After --push, three public steps remain (Releases entry, '
-                'website entry, newsletter); see docs/RELEASING.md '
+                'website entry, newsletter); see docs/internal/RELEASING.md '
                 '"Announcing" + "Tell the public".') in out
         assert "three public steps remain" in out
         assert "REMAINING" not in out

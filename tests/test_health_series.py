@@ -4,7 +4,7 @@ anchor resolution (D1), ``ingest`` idempotence, the declarations gate
 (D4.1), ``rebuild`` (single-diff form), ``detect_engine_build``, the
 never-imports-engram_core-at-top guard, and the CLI running as a script.
 
-Design of record: ``docs/health-series-design.md`` (design v1 sections 0-10
+Design of record: ``docs/internal/health-series-design.md`` (design v1 sections 0-10
 plus deltas D1-D5; see that module's docstring for the PR A/B/C slicing).
 
 Fixture strategy: each test builds a scratch ``~/.engram``-shaped git repo

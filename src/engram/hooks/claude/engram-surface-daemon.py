@@ -356,30 +356,27 @@ def cleanup(*args):
     longer sufficient, on its own, to unlink the socket.
     """
     _shutdown.set()
-    still_ours = False
-    try:
-        with open_regular_text(PID_PATH) as f:
-            still_ours = int(f.read().strip()) == os.getpid()
-    except (OSError, ValueError):
-        # No pidfile, or unreadable/garbage content -- nothing to protect
-        # for the PIDFILE, proceed with removing IT (matches the prior
-        # unconditional behavior for this case). Says nothing about the
-        # socket -- see _bound_socket above.
-        still_ours = True
-        # #3628: a FIFO/directory at PID_PATH is NOT a file this process wrote,
-        # so it is never unlinked: log once, leave it, keep going.
-        if _is_non_regular(PID_PATH):
-            still_ours = False
-            print(
-                f"[engram-daemon] {PID_PATH} is not a regular file; "
-                f"leaving it in place.",
-                file=sys.stderr,
-            )
-    if still_ours:
+    # The identity rule is ONE place, engram_pidfile.classify_own_pidfile,
+    # shared with the engramd owner's cleanup (#4068): unlink only when the
+    # content is this pid. Garbage, empty (an O_TRUNC-then-write window),
+    # unreadable, another pid, non-regular and hard-linked are all left alone
+    # with one stderr line. Says nothing about the socket -- see _bound_socket.
+    if _PIDFILE_DIR not in sys.path:
+        sys.path.insert(0, _PIDFILE_DIR)
+    import engram_pidfile
+
+    status, reason = engram_pidfile.classify_own_pidfile(PID_PATH)
+    if status == engram_pidfile.PIDFILE_OURS:
         try:
             os.unlink(PID_PATH)
         except FileNotFoundError:
             pass
+    elif status != engram_pidfile.PIDFILE_ABSENT:
+        print(
+            f"[engram-daemon] pidfile {PID_PATH} {reason}; "
+            f"leaving it in place.",
+            file=sys.stderr,
+        )
     if _bound_socket:
         try:
             os.unlink(SOCKET_PATH)
@@ -414,6 +411,14 @@ def _recorded_pid_is_alive() -> bool:
 # not prove the path unheld". Never 0: exit 0 tells a supervisor all is well.
 EXIT_SOCKET_HELD = 75       # another live process holds SOCKET_PATH
 EXIT_SOCKET_UNPROVEN = 76   # could not prove SOCKET_PATH is unheld (fail closed)
+# #4068: a pidfile this user cannot write, or cannot create (sysexits 77 = EX_NOPERM).
+# Deliberately NOT a no-retry code, unlike the engramd owner's exit 4 for the
+# same condition: this daemon's unit files restart it unconditionally
+# (Restart=always / KeepAlive true) and have no per-exit-code exclusion, by
+# design (see the REFUSAL_BACKOFF_S comment below). So it backs off in-process
+# like the two refusals above and keeps retrying about once a minute, which
+# self-heals the moment someone fixes the file's mode or removes it.
+EXIT_PIDFILE_UNWRITABLE = 77
 
 # #3361: a refusal waits this long BEFORE exiting. Under systemd
 # (Restart=always) and launchd (KeepAlive true) an immediate exit would
@@ -621,19 +626,54 @@ def _write_pidfile():
     """Write this process's pid to PID_PATH. #3628: a FIFO/directory already at
     PID_PATH is logged once and the daemon runs without a pidfile (no crash, no
     hang); any other OSError -- e.g. a PermissionError on a regular file --
-    propagates exactly as it did before."""
+    propagates exactly as it did before, except (#4068) EACCES/EPERM on the
+    pidfile (it exists and is not writable, or it is absent and its directory
+    is not writable): one named stderr line saying which, the refusal back-off, then
+    EXIT_PIDFILE_UNWRITABLE, instead of a traceback."""
     os.makedirs(os.path.dirname(PID_PATH), exist_ok=True)
     try:
         with open_regular_text_write(PID_PATH) as f:
             f.write(str(os.getpid()))
-    except OSError:
-        if not _is_non_regular(PID_PATH):
+    except OSError as exc:
+        if _is_non_regular(PID_PATH):
+            print(
+                f"[engram-daemon] {PID_PATH} is not a regular file; "
+                f"running without a pidfile.",
+                file=sys.stderr,
+            )
+            return
+        if not isinstance(exc, PermissionError):  # EACCES / EPERM
             raise
+        # One lstat at the point of the error: EACCES/EPERM means either the
+        # pidfile exists and its mode refuses us, or it does not exist and its
+        # DIRECTORY is not writable. Say the true one.
+        absent = "does not exist"
+        try:
+            os.lstat(PID_PATH)
+            pid_exists = True
+        except OSError as lstat_exc:
+            pid_exists = False
+            if not isinstance(lstat_exc, FileNotFoundError):
+                # Not plainly absent (e.g. a directory that cannot be searched).
+                absent = "does not exist or cannot be checked"
+        if pid_exists:
+            detail = (
+                f"the pidfile {PID_PATH} exists but this user cannot write it. "
+                f"Make it writable by the user that runs the daemon, or remove it"
+            )
+        else:
+            pid_dir = os.path.dirname(PID_PATH) or "."
+            detail = (
+                f"the pidfile {PID_PATH} {absent} and its directory {pid_dir} is "
+                f"not writable by this user. Make {pid_dir} writable by the user that "
+                f"runs the daemon"
+            )
         print(
-            f"[engram-daemon] {PID_PATH} is not a regular file; "
-            f"running without a pidfile.",
+            f"[engram-daemon] refusing to start: {detail} (exit {EXIT_PIDFILE_UNWRITABLE})",
             file=sys.stderr,
         )
+        _wait_refusal_backoff(_refusal_backoff_s())
+        sys.exit(EXIT_PIDFILE_UNWRITABLE)
 
 
 def main():

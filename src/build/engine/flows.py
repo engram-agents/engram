@@ -37,7 +37,7 @@ Ctx contract for upgrade flow
 ------------------------------
 Callers must provide a dict (or dict-subclass) with at least:
 
-  engram_home: str          path to ~/.engram  (or fake equivalent in tests)
+  engram_home: str          path to $ENGRAM_HOME  (or fake equivalent in tests)
   source_dir: str           path to engram-alpha repo root
   target_sha: str           the git commit SHA to upgrade to
   ack_changeset: bool       True once the agent has reviewed the changeset
@@ -58,6 +58,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from .deploy_tag import refresh_and_check_deployable_tag_at
@@ -84,6 +85,19 @@ def _substrate_marker_path(engram_home: str) -> str:
     return os.path.join(engram_home, _SUBSTRATE_MARKER_FILENAME)
 
 
+def engram_home() -> Path:
+    """The build engine's ENGRAM_HOME resolution (#3863 6c): $ENGRAM_HOME (default ~/.engram) when set and
+    non-empty, expanded and absolute; a RELATIVE value is refused (ValueError naming it). A copy of the
+    canonical src/engram/tools/_owner_read.engram_home() body, pinned AST-identical by
+    tests/test_engram_home_parity_3863.py (the build engine ships as tools/engine and does not import
+    from src/engram, so it is its own self-contained layer)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
+
+
 def _read_substrate_marker(engram_home: str) -> "dict | None":
     """Read the degraded-substrate marker if present; return None when absent.
 
@@ -105,7 +119,7 @@ def _read_substrate_marker(engram_home: str) -> "dict | None":
         return {"reason": "(marker present but unreadable)", "dump_sha": None, "detected_at": None}
 
 
-def _substrate_health_instruction(marker: "dict | None", engram_home: str = "") -> str:
+def _substrate_health_instruction(marker: "dict | None", engram_home: str) -> str:
     """Build the operator instruction string for the substrate-health step.
 
     Called unconditionally at construction time; when the marker is absent,
@@ -114,7 +128,7 @@ def _substrate_health_instruction(marker: "dict | None", engram_home: str = "") 
     documented restore path.  Tolerates missing fields.
 
     ``engram_home`` is used to render the exact rm path in the instruction.
-    Falls back to the ``~/.engram`` literal when not provided.
+    Required: there is no literal fallback.
     """
     reason = "(unknown)" if not marker else (marker.get("reason") or "(unknown)")
     ts = "" if not marker else (marker.get("detected_at") or "")
@@ -126,7 +140,7 @@ def _substrate_health_instruction(marker: "dict | None", engram_home: str = "") 
     # resolution; the check/verify lambdas always use ctx["engram_home"] and
     # will correctly reflect a different runtime engram_home if --ctx-file
     # changes it.  This is the "cheapest fix" per the colleague suggestion.
-    marker_path = _substrate_marker_path(engram_home) if engram_home else "~/.engram/.substrate-degraded.json"
+    marker_path = _substrate_marker_path(engram_home)
 
     ts_line = f"\n  Detected at:  {ts}" if ts else ""
     return (
@@ -151,7 +165,7 @@ def _substrate_health_instruction(marker: "dict | None", engram_home: str = "") 
 
 
 def _read_deployed_version(engram_home: str) -> dict[str, str]:
-    """Parse ~/.engram/.deployed-version into a dict of key=value pairs."""
+    """Parse $ENGRAM_HOME/.deployed-version into a dict of key=value pairs."""
     path = os.path.join(engram_home, ".deployed-version")
     if not os.path.isfile(path):
         return {}
@@ -213,7 +227,7 @@ def _build_manifest_path(ctx: dict[str, Any]) -> str:
 
 
 def _load_engram_config(ctx: dict[str, Any]) -> dict[str, Any]:
-    """Load ~/.engram/config.json; return empty dict if missing."""
+    """Load $ENGRAM_HOME/config.json; return empty dict if missing."""
     path = os.path.join(ctx["engram_home"], "config.json")
     if not os.path.isfile(path):
         return {}
@@ -269,12 +283,10 @@ def upgrade_flow() -> list[Step]:
     # Resolve engram_home the same way the CLI does (_build_ctx_from_env), so
     # that the substrate-health instruction embeds the live marker content.
     # We cannot use ctx here (not yet constructed), so fall back to the env var
-    # or the default ~/.engram — the same resolution _build_ctx_from_env uses.
+    # or the ENGRAM_HOME default — the same resolution _build_ctx_from_env uses.
     # Tests override this by passing a fake engram_home in ctx; the check/verify
     # lambdas inside the step always use ctx["engram_home"], so fake dirs work.
-    _default_engram_home = os.environ.get(
-        "ENGRAM_HOME", os.path.expanduser("~/.engram")
-    )
+    _default_engram_home = str(engram_home())  # a RELATIVE env value raises ValueError (#3863 6c)
 
     return [
         # ── Step substrate-health [operator] ─────────────────────────────
@@ -437,7 +449,7 @@ def upgrade_flow() -> list[Step]:
             instruction=(
                 "Please verify the upgrade via the plugin MCP:\n"
                 "  Call engram_stats and confirm it returns your real node count.\n"
-                "  Also confirm: cat ~/.engram/.deployed-version  (SHA must match target)\n"
+                f"  Also confirm: cat {os.path.join(_default_engram_home, '.deployed-version')}  (SHA must match target)\n"
                 "Then set ctx['_stats_verified'] = True and re-run."
             ),
         ),

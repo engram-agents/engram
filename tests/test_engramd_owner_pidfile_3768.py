@@ -382,15 +382,22 @@ def test_no_pidfile_is_created_regular_with_the_pid_and_write_text_mode(home):
 
 
 @pytest.mark.skipif(os.getuid() == 0, reason="root ignores file modes: no EACCES to provoke")
-def test_other_oserror_propagates_unchanged_not_as_the_named_refusal(home):
-    """Mutation: map EVERY OSError to the named refusal -> this cell reddens
-    (EACCES must surface as PermissionError, exactly as before)."""
+def test_unwritable_pidfile_is_the_named_refusal_not_a_bare_permission_error(home):
+    """#4068 point 4: replaces the old "EACCES propagates as PermissionError"
+    cell, which pinned the traceback-and-respawn shape #3709 names. Pins the
+    end-to-end refusal through start(): an unwritable pidfile surfaces as the
+    named OwnerPidfileNotWritable, never a bare PermissionError. start()'s own
+    preflight (check 4) refuses first here, so this cell does NOT pin the
+    `_write_pidfile` PermissionError mapping; the race cell
+    `test_cell3c_race_pidfile_unwritable_after_the_preflight_still_exits_4`
+    in test_engramd_owner_pidfile_identity_4068.py does."""
     _pidfile(home).write_text("1")
     os.chmod(_pidfile(home), 0o444)
     owner = eo.EngramdOwner(home, request_deadline=0.6)
     try:
-        with pytest.raises(PermissionError):
+        with pytest.raises(eo.OwnerPidfileNotWritable) as ei:
             owner.start(install_signal_handlers=False)
+        assert str(_pidfile(home)) in str(ei.value)
     finally:
         os.chmod(_pidfile(home), 0o644)
         owner.stop()

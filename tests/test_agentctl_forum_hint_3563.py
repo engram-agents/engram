@@ -520,16 +520,12 @@ The newborn is at agent-newborn-TS. To complete the birth:
   1. Enter the newborn's bash login shell:
        agentctl bash newborn-TS
 
-  2. Inside that shell, install Claude Code in the new agent's account.
-       (Follow the current Claude Code install instructions for the platform.)
+  2. Start Claude Code and log in (Claude Code and ENGRAM were installed
+     during spawn, in the newborn's own home):
+       claude                 # then /login at the first prompt
 
-  3. In the first session, ask the agent to install ENGRAM from the
-     plugin marketplace:
-       claude                 # At the first prompt, ask the agent to install
-                              # ENGRAM from the plugin marketplace, then exit.
-                              # On the next session start (after ENGRAM installs),
-                              # the SessionStart hook fires engram-first-session
-                              # → agent generates 3 candidate names → you pick.
+  3. The naming dialogue: the SessionStart hook fires engram-first-session;
+     the agent generates 3 candidate names; you pick collaboratively.
 
   4. From the operator's shell (NOT inside the newborn shell), finalize the rename:
        sudo agentctl finalize-name newborn-TS <chosen-name>

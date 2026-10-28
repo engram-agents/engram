@@ -23,14 +23,14 @@ Exit codes:
 | 0 | All three phases passed |
 | 1 | `agentctl spawn` or its bootstrap step failed |
 | 2 | Newborn substrate verification failed |
-| 3 | Newborn's install.sh exited non-zero |
+| 3 | (unused since #4097; an install.sh failure now fails Phase 1 with exit 1) |
 | 4 | Install completed but post-install assertions failed |
 | 5 | `agentctl finalize-name` failed or post-rename state is wrong |
 
 ## Phases
 
 1. **`agentctl spawn --runtime claude`** — creates `agent-newborn-<UTC-timestamp>` user with home dir, `.bashrc`, `~/.runtime/start.sh`, `~/.runtime/install.sh`. Asserted via Linux user/group lookup + file-presence checks.
-2. **install.sh as the newborn** — the newborn runs `bash ~/.runtime/install.sh`, which chains to alpha's `install.sh`. Asserted via the same post-install file checks as `tests/install/` plus seed-graph node count + placeholder retention. Cron is opt-in (default-off as of 2026-05-15) so the harness invocation skips it naturally.
+2. **install.sh as the newborn** — since #4097 `agent-bootstrap` itself clones the alpha source into the newborn's home as the newborn, checks out the newest deployable tag, and runs `tools/install.sh --install-claude-code --yes` during Phase 1; Phase 2 only verifies the result (the artifact list is not yet reconciled with install.sh: run the container once and reconcile). The harness gives its copy of the tree a one-commit `dev` history with a `v0.0.0-spawntest` tag, because the tag guard refuses an untagged head. Cron is opt-in (default-off as of 2026-05-15) so the harness skips it naturally.
 3. **`agentctl finalize-name <newborn-tag> testbot`** — renames the user/group/home; verifies the old name is gone and the new name has the `finalize-name-complete.json` marker.
 
 ## What this harness does NOT cover

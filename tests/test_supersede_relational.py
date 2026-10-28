@@ -35,7 +35,7 @@ def _mk_observation(claim: str, quote_type: str = "attributed_analysis") -> str:
         domain="example.com",
         source_date="2026-04-24",
         claim=claim,
-        quoted_text=claim,
+        quoted_text=claim + " in the cited source",
         interpretation=f"Test observation: {claim}",
         quote_type=quote_type,
     ))

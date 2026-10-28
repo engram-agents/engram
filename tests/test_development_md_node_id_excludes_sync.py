@@ -1,4 +1,4 @@
-"""Drift guard for docs/DEVELOPMENT.md's hand-copied node-ID EXCLUDES snippet.
+"""Drift guard for docs/internal/DEVELOPMENT.md's hand-copied node-ID EXCLUDES snippet.
 
 engram-alpha#2626: the local pre-push check snippet in DEVELOPMENT.md's
 "Enforcement" section is a hand-maintained copy of the EXCLUDES array in
@@ -22,7 +22,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "pr-checks.yml"
-DEV_MD_PATH = REPO_ROOT / "docs" / "DEVELOPMENT.md"
+DEV_MD_PATH = REPO_ROOT / "docs" / "internal" / "DEVELOPMENT.md"
 
 _EXCLUDE_RE = re.compile(r":\(exclude\)([^\s'\"]+)")
 
@@ -103,7 +103,7 @@ def test_development_md_excludes_match_live_workflow():
     extra_in_docs = dev_md_excludes - workflow_excludes
 
     assert not missing_from_docs and not extra_in_docs, (
-        "docs/DEVELOPMENT.md's local pre-push check snippet has drifted from "
+        "docs/internal/DEVELOPMENT.md's local pre-push check snippet has drifted from "
         "the live .github/workflows/pr-checks.yml EXCLUDES array.\n"
         f"  Missing from DEVELOPMENT.md (present in the live gate): {sorted(missing_from_docs) or None}\n"
         f"  Extra in DEVELOPMENT.md (not in the live gate): {sorted(extra_in_docs) or None}\n"

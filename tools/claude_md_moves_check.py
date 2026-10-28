@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Nothing-lost check for blocks moved out of CLAUDE.md into docs/ (#3322).
+"""Nothing-lost check for blocks moved out of CLAUDE.md into docs/internal/ (#3322).
 
-Reads docs/claude-md-moves.json: {"moves": [{"from_section", "to_doc",
+Reads tools/claude_md_moves.json: {"moves": [{"from_section", "to_doc",
 "first_sentence", "last_sentence"}, ...]}. For each moved block, its first and
 last sentence must appear exactly once in the named doc and zero times in
 CLAUDE.md. Stdlib only. Exit 0 = clean, 1 = violations.
@@ -14,7 +14,7 @@ import json
 import sys
 from pathlib import Path
 
-MAPPING = "docs/claude-md-moves.json"
+MAPPING = "tools/claude_md_moves.json"
 KEYS = ("from_section", "to_doc", "first_sentence", "last_sentence")
 
 

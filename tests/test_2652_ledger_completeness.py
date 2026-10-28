@@ -1,4 +1,4 @@
-"""Completeness guard for docs/2652-migration-ledger.md [part of #2652].
+"""Completeness guard for docs/internal/2652-migration-ledger.md [part of #2652].
 
 The ledger lists every `sqlite3.connect(` line in tracked `src/engram`, one
 Section-2 row per line. tools/check_2652_ledger.py compares, PER FILE, the
@@ -16,7 +16,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 TOOL = REPO / "tools" / "check_2652_ledger.py"
 
-STATES = ("owner", "direct", "behind-flag", "flag-on", "retired")
+STATES = ("owner", "direct", "direct-by-design", "behind-flag", "flag-on", "retired")
 OOS = "out of scope"
 TABLE_HEAD = (
     "| # | site (function) | kind | target | access | component | state | A6 delta | macOS |\n"
@@ -53,7 +53,9 @@ def _row(n, spec, state="direct", kind="call", target="live store"):
 def _tally(states):
     c = {k: 0 for k in STATES + (OOS,)}
     for s in states:
-        c[s] = c.get(s, 0) + 1
+        # A `direct-by-design: <phase>` cell tallies under the bare state name.
+        key = s.split(":")[0]
+        c[key] = c.get(key, 0) + 1
     return c
 
 
@@ -128,8 +130,8 @@ def _make_repo(tmp_path, files, rows, untracked=None, ledger_text=None):
         p = tmp_path / "src" / "engram" / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
-    (tmp_path / "docs").mkdir()
-    (tmp_path / "docs" / "2652-migration-ledger.md").write_text(
+    (tmp_path / "docs" / "internal").mkdir(parents=True)
+    (tmp_path / "docs" / "internal" / "2652-migration-ledger.md").write_text(
         ledger_text if ledger_text is not None else _ledger(rows), encoding="utf-8"
     )
     _git(tmp_path, "add", "-A")
@@ -164,7 +166,7 @@ def test_clause2_added_connect_without_row_fails_naming_file_and_counts(tmp_path
     assert r.returncode == 1
     assert "a.py: ledger 1 rows, tree 2 lines" in r.stdout
     assert "b.py" not in r.stdout.split("add/remove")[0]
-    assert "add/remove a Section-2 row in docs/2652-migration-ledger.md" in r.stdout
+    assert "add/remove a Section-2 row in docs/internal/2652-migration-ledger.md" in r.stdout
 
 
 def test_clause3_row_for_file_without_connect_fails(tmp_path):
@@ -256,8 +258,8 @@ def test_clause8_section3_row_naming_a_file_is_not_counted(tmp_path):
 
 
 def test_clause9_outside_a_checkout_exits_1_with_one_line(tmp_path):
-    (tmp_path / "docs").mkdir()
-    (tmp_path / "docs" / "2652-migration-ledger.md").write_text(
+    (tmp_path / "docs" / "internal").mkdir(parents=True)
+    (tmp_path / "docs" / "internal" / "2652-migration-ledger.md").write_text(
         _ledger([C("a.py", 1)]), encoding="utf-8"
     )
     r = _run(tmp_path)
@@ -917,3 +919,85 @@ def test_sa_every_occurrence_of_a_shared_anchor_must_be_a_connect_line(tmp_path)
     r = _cites_run(tmp_path, {"a.py": src}, [("a.py", "f()", "c = sqlite3.connect")] * 2)
     assert r.returncode == 1
     assert "rows 1, 2: a.py f(): anchor line has no sqlite3.connect(: `c = sqlite3.connect`" in r.stdout
+
+
+# ---- direct-by-design: a live-store state with a CLOSED phase set (#2652 tools-11) ----
+
+
+def _dbd_run(tmp_path, state):
+    return _run_ledger(tmp_path, _ledger([C("a.py", 1)], states=[state]))
+
+
+def test_l1_direct_by_design_pre_owner_passes(tmp_path):
+    r = _dbd_run(tmp_path, "direct-by-design: pre-owner")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_l1b_direct_by_design_exclusive_maintenance_passes(tmp_path):
+    r = _dbd_run(tmp_path, "direct-by-design: exclusive-maintenance")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_l1c_direct_by_design_without_a_phase_fails_naming_the_row(tmp_path):
+    files = {"a.py": L(1, 2)}
+    rows = [C("a.py", 1), C("a.py", 2)]
+    text = _ledger(rows, states=["direct", "direct-by-design"])
+    r = _run(_make_repo(tmp_path, files, [], ledger_text=text))
+    assert r.returncode == 1
+    assert "row 2: direct-by-design needs a phase" in r.stdout
+    assert "pre-owner" in r.stdout and "exclusive-maintenance" in r.stdout
+    assert "row 1:" not in r.stdout
+
+
+def test_l1d_direct_by_design_with_a_phase_outside_the_set_fails_naming_the_row(tmp_path):
+    r = _dbd_run(tmp_path, "direct-by-design: slower")
+    assert r.returncode == 1
+    assert "row 1: direct-by-design needs a phase" in r.stdout
+    assert "'slower'" in r.stdout
+
+
+def test_l1e_phase_near_misses_fail_naming_the_row(tmp_path):
+    # The phase set is closed and matched exactly: case variants, prefixes,
+    # extra words and trailing annotations never pass as a member.
+    near = (
+        "direct-by-design: Pre-Owner",
+        "direct-by-design: pre-owner-ish",
+        "direct-by-design: pre-owner, slower",
+        "direct-by-design: pre-owner (bootstrap)",
+    )
+    for n, bad in enumerate(near):
+        r = _dbd_run(tmp_path / f"case{n}", bad)
+        assert r.returncode == 1, bad + r.stdout
+        assert "row 1: direct-by-design needs a phase" in r.stdout, bad
+        assert f"(got '{bad.split(':', 1)[1].strip()}')" in r.stdout, bad
+
+
+def test_l1g_whitespace_around_the_colon_is_not_significant(tmp_path):
+    # Deliberate: the phase is `.strip()`ped, like every other cell the guard
+    # reads, so `direct-by-design:pre-owner` (no space) is the member `pre-owner`.
+    r = _dbd_run(tmp_path, "direct-by-design:pre-owner")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_l1f_direct_by_design_is_its_own_state_in_both_section1_lines(tmp_path):
+    files = {"a.py": L(1, 2)}
+    rows = [C("a.py", 1), C("a.py", 2)]
+    states = ["direct", "direct-by-design: pre-owner"]
+    text = _ledger(rows, states=states)
+    # The generated lines carry it as its own entry, and the live total counts it.
+    assert "**direct-by-design 1**" in text
+    assert "direct-by-design 1 ·" in text
+    assert "State of the 2 live-store lines" in text
+    assert _run(_make_repo(tmp_path / "ok", files, [], ledger_text=text)).returncode == 0
+    # A stale count in either place is reported against that place.
+    c = _tally(states)
+    c["direct-by-design"] = 0
+    bad_state = _ledger(rows, states=states, state_line=_state_line(c))
+    r = _run(_make_repo(tmp_path / "s", files, [], ledger_text=bad_state))
+    assert r.returncode == 1
+    assert "section 1 state line: direct-by-design says 0, rows give 1" in r.stdout
+    assert "summary sentence" not in r.stdout
+    bad_sum = _ledger(rows, states=states, summary=_summary_line(c))
+    r = _run(_make_repo(tmp_path / "m", files, [], ledger_text=bad_sum))
+    assert r.returncode == 1
+    assert "section 1 summary sentence: direct-by-design says 0, rows give 1" in r.stdout

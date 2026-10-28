@@ -292,7 +292,7 @@ def test_nonexistent_file_rejected():
     r = client.call("engram_add_observation", {
         "url": "file:///nonexistent/path/fakefile.txt",
         "title": "Nonexistent file",
-        "quoted_text": "Quote.",
+        "quoted_text": "Quote. in the cited source",
         "interpretation": "Test.",
         "claim": "Test claim",
         "quote_type": "hard_data",
@@ -307,19 +307,19 @@ def test_valid_file_url_accepted():
     client = fresh_client()
     # Use the archived SKILL.md — a committed file in our repo that we haven't modified
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    skill_file = os.path.join(repo_root, "docs", "archive", "SKILL.md")
+    skill_file = os.path.join(repo_root, "docs", "internal", "archive", "SKILL.md")
     # Verify the file is clean (no uncommitted changes) — skip test if not
-    status = subprocess.run(["git", "status", "--porcelain", "--", "docs/archive/SKILL.md"],
+    status = subprocess.run(["git", "status", "--porcelain", "--", "docs/internal/archive/SKILL.md"],
                             cwd=repo_root, capture_output=True, text=True)
     if status.stdout.strip():
         import pytest
-        pytest.skip("docs/archive/SKILL.md has uncommitted changes")
+        pytest.skip("docs/internal/archive/SKILL.md has uncommitted changes")
     r = client.call("engram_add_observation", {
         "url": f"file://{skill_file}",
         "title": "SKILL.md agent protocol (archived)",
         "quoted_text": "# SKILL.md — ENGRAM Agent Protocol",
         "interpretation": "The archived SKILL.md file exists and is committed.",
-        "claim": "docs/archive/SKILL.md exists and is committed in the repo",
+        "claim": "docs/internal/archive/SKILL.md exists and is committed in the repo",
         "quote_type": "hard_data",
         "source_class": "introspective",
     })
@@ -2167,7 +2167,7 @@ def test_b5_batch_results_keep_input_index_order_3399():
         items = [_batch_item("Not in the file zero.", 0),
                  _batch_item(_BATCH_GOOD, 1),
                  "not an object",
-                 {"quoted_text": "only this"},
+                 {"quoted_text": "only this in the cited source"},
                  _batch_item("Not in the file four.", 4)]
         r = _batch_cite(client, items, **_batch_url(repo))
         assert r["total"] == 5 and r["created"] == 1, r
@@ -2186,7 +2186,7 @@ def test_b5b_batch_no_valid_items_writes_nothing_3399():
     try:
         client = fresh_client()
         ev = _count_evidence()
-        r = _batch_cite(client, ["x", {"quoted_text": "only"}], **_batch_url(repo))
+        r = _batch_cite(client, ["x", {"quoted_text": "only in the cited source"}], **_batch_url(repo))
         assert r["created"] == 0 and [x["index"] for x in r["results"]] == [0, 1], r
         assert _count_evidence() == ev, "a batch with no valid item wrote an evidence row"
     finally:
@@ -2419,7 +2419,7 @@ _URL_REJECTIONS = [
 
 def _single_cite_url(client, url, title="Url-level rejection"):
     return client.call("engram_add_observation", {
-        "url": url, "title": title, "quoted_text": "q", "interpretation": "i",
+        "url": url, "title": title, "quoted_text": "q in the cited source", "interpretation": "i",
         "claim": "Url-level rejection single path", "quote_type": "hard_data",
     })
 

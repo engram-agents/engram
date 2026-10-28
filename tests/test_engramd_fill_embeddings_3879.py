@@ -368,7 +368,8 @@ def test_importing_the_owner_does_not_import_core_or_backup_and_works_in_the_fla
     flat.mkdir()
     src = Path(_SRC_ENGRAM)
     for name in ["engramd_owner.py", "engramd_client.py", "engramd_read_registry.py", "engram_pidfile.py", "engram_walguard.py",
-                 "engram_regular_io.py", "engram_restamp.py", "engram_config_io.py", "engram_moment_cursor.py"]:
+                 "engram_regular_io.py", "engram_restamp.py", "engram_config_io.py", "engram_moment_cursor.py",
+                 "engram_home_resolver.py"]:
         shutil.copy2(src / name, flat / name)
     other = tmp_path / "elsewhere"
     other.mkdir()

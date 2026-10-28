@@ -40,6 +40,10 @@ DAEMON_DIR = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 DAEMON_PY_PATH = DAEMON_DIR / "engram-surface-daemon.py"
 START_SCRIPT_PATH = DAEMON_DIR / "start-engram-daemon.sh"
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_daemon_module():
     """Load engram-surface-daemon as a fresh module instance (mirrors

@@ -33,6 +33,9 @@ _HOOK_PATH = (
 )
 _OWN_HOSTNAME = socket.gethostname()
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_hook_module(monkeypatch, engram_home: Path, registry_dir: Path):
     """Load the session-start hook as a module with test overrides."""
@@ -189,3 +192,45 @@ class TestPeerTopologyBlock:
         mod = _load_hook_module(monkeypatch, engram_home, registry_dir)
         result = mod.peer_topology_block("sol")
         assert "borges" in result  # good entry still appears
+
+    @pytest.mark.parametrize("bad_body", ["[1, 2]", '"just a string"', "12345"])
+    def test_non_dict_record_skipped_other_peers_survive(
+        self, tmp_path, monkeypatch, bad_body
+    ):
+        """P1 (#4145): a registry file whose JSON is not an object is skipped.
+
+        "aaa-bad.json" sorts BEFORE the good record, so an unguarded
+        record.get() would raise and the broad except would hide every peer.
+        """
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        registry_dir = tmp_path / "agents-shared" / "agents"
+        registry_dir.mkdir(parents=True)
+        (registry_dir / "aaa-bad.json").write_text(bad_body)
+        (registry_dir / "borges.json").write_text(_reg_json("borges", _OWN_HOSTNAME))
+
+        mod = _load_hook_module(monkeypatch, engram_home, registry_dir)
+        assert "co-host (ia/baton): borges" in mod.peer_topology_block("sol")
+
+    @pytest.mark.parametrize("bad_reg_at", [12345, ["x"], {"a": 1}, True])
+    def test_non_string_registered_at_treated_as_missing(
+        self, tmp_path, monkeypatch, bad_reg_at
+    ):
+        """P2 (#4145 sibling): a non-string registered_at is treated like a
+        missing timestamp (fail-open, peer is live) and hides no other peer.
+        """
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        registry_dir = tmp_path / "agents-shared" / "agents"
+        registry_dir.mkdir(parents=True)
+        (registry_dir / "aaa.json").write_text(json.dumps({
+            "agent_name": "aaa",
+            "hostname": _OWN_HOSTNAME,
+            "registered_at": bad_reg_at,
+        }))
+        (registry_dir / "luria.json").write_text(_reg_json("luria", "other-machine"))
+
+        mod = _load_hook_module(monkeypatch, engram_home, registry_dir)
+        result = mod.peer_topology_block("sol")
+        assert "co-host (ia/baton): aaa" in result
+        assert "cross-host (forum): luria" in result

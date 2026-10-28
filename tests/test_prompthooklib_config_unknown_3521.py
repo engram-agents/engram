@@ -47,6 +47,9 @@ STAMP_KEY = {
 STAMP_NAME = "probe-unknown-notice.json"
 SIBLINGS = ["_hooklib.py", "_prompthooklib.py", "_harness.py"]
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_lib():
     spec = importlib.util.spec_from_file_location("_prompthooklib_under_test", PROMPTHOOKLIB)

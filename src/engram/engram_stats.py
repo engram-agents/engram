@@ -534,6 +534,40 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
 # ---------------------------------------------------------------------------
 
 
+_BACKUP_ARCHIVE_FLARE_BYTES = 1 << 30  # 1 GiB of local SQL archive (#4208)
+
+
+def _backup_archive_view() -> dict:
+    """engram_diagnose's always-present `backup_archive` key (#4208). Never raises: a failure
+    is reported in-band as {"error": "<class>: <msg>"} so the key is never absent."""
+    try:
+        home = Path(core.DATA_DIR)
+        bk = home / "db-backup"
+        sql = sorted(bk.glob("knowledge-*.sql")) if bk.is_dir() else []
+        bdir = bk / "binary"
+        binaries = (
+            sorted(p for p in bdir.glob("*.db") if core.BACKUP_BINARY_RE.match(p.name))
+            if bdir.is_dir() else []
+        )
+        dates = sorted(
+            m.group(1) for m in (core.BACKUP_ARCHIVE_RE.match(p.name) for p in sql) if m
+        )
+        sql_bytes = sum(p.stat().st_size for p in sql)
+        tracked = len(core._tracked_binary_paths(home))
+        return {
+            "sql_count": len(sql),
+            "sql_bytes": sql_bytes,
+            "binary_count": len(binaries),
+            "binary_bytes": sum(p.stat().st_size for p in binaries),
+            "tracked_backup_count": tracked,
+            "oldest": dates[0] if dates else None,
+            "newest": dates[-1] if dates else None,
+            "flare": sql_bytes > _BACKUP_ARCHIVE_FLARE_BYTES or tracked > 0,
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 def _diagnose_impl() -> str:
     """Impl for engram_diagnose — callable for in-server callers.
 
@@ -955,6 +989,42 @@ def _diagnose_impl() -> str:
             "live_invalid_count": _mq_live,
             "sample_ids": _mq_ids,
             "flare": _mq_count > 0 or _mq_live > 0,
+        }
+
+        # ── Off-disk backup push (#4205) ───────────────────────────────────
+        # The snapshot worker's last push outcome. Always present; result None
+        # means no status file yet (a pre-fix seat or a never-pushed install).
+        _bp = core._backup_push_view() or {
+            "result": None, "last_success_utc": None, "last_attempt_utc": None,
+            "ahead": None, "behind": None,
+        }
+        metrics["backup_push"] = {**_bp, "flare": core._backup_push_flare(_bp)}
+
+        # ── Local SQL/binary backup archive (#4208) ────────────────────────
+        # Always present; on any failure {"error": ...} in-band, never absent.
+        metrics["backup_archive"] = _backup_archive_view()
+
+        # ── Text NUL guard (#3765) ─────────────────────────────────────────
+        # Nodes whose claim or recall_summary holds a U+0000 RIGHT NOW (rows that
+        # predate migration rung 9, a restore of an old dump, or a dropped guard).
+        # The rung COUNTS and never alters them, so this live count is the only
+        # place they stay visible. Always present, 0 included; non-zero => flare.
+        # ONE pass: the count and the sample come from the same statement. It fetches
+        # every matching id (short strings): zero rows on a clean store, bounded by the
+        # number of corrupt rows otherwise.
+        _nul_all = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT id FROM nodes WHERE {core._TEXT_NUL_ROW_WHERE} ORDER BY id"
+            ).fetchall()
+        ]
+        _nul_live = len(_nul_all)
+        _nul_ids = _nul_all[:10]
+        metrics["text_nul_guard"] = {
+            "entity_kind": "node",
+            "live_count": _nul_live,
+            "sample_ids": _nul_ids,
+            "flare": _nul_live > 0,
         }
 
         # ── Agent Experience ─────────────────────────────────────────────

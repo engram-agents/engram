@@ -34,6 +34,9 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _HOOK_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_hook_module(monkeypatch, engram_home: Path):
     monkeypatch.setenv("ENGRAM_HOME", str(engram_home))

@@ -144,6 +144,155 @@ def _sys_path_collision_guard():
     yield
 
 
+# #4023 / #4029 -- modules that leaked into `sys.path`: `sys.path[0]` changed to
+# an entry inside src/engram, or (since #4093) a new src/engram entry at any
+# position. HARD since #4029: the module-scope fixture below raises at that
+# module's teardown, naming it, after restoring `sys.path` exactly. The name is also collected here and
+# printed as ONE line at session end by `pytest_terminal_summary` (only when N > 0,
+# so a clean run prints nothing). The way to be clean is the shared window in
+# tests/_hook_load_window.py (fixtures `isolate_hook_loads` /
+# `isolate_hook_loads_module` below) around an in-process hook or tools load.
+# WHAT THE CHECK COVERS: only leaks made AFTER a module's setup (the module-scope
+# fixture compares against `sys.path` at that point). It does NOT attribute (a) a
+# module that leaks at IMPORT time (during collection, before any module fixture
+# runs: the entry is already in front when the fixture snapshots, so nothing
+# differs), nor (b) a module that re-inserts an entry another module already left
+# in front -- which is also why a many-module run names far fewer modules than
+# running each alone. The result is a lower bound on polluters, not an inventory.
+# CLOSED (#4093): (c) a leak behind a non-`src` front entry (a tmp runtime dir in
+# front, the leaked `src/engram/...` entry further back) is now caught by the
+# new-entry rule in `_path_leak_problem`; (a) and (b) above remain.
+# Import-time attribution is NOT part of #4029 (it needs a collection-time hook).
+# Single-process only: this repo does not use xdist (not in pytest.ini or any
+# CI config); under xdist each worker would hold its own set and the controller
+# would print nothing.
+_PATH_LEAKS: set = set()
+
+
+def _path_leak_problem(path_before):
+    """A problem message when EITHER rule fires, else None (#4093):
+      1. `sys.path[0]` is now inside `src/engram` and differs from what it was at
+         the module's setup;
+      2. `sys.path` holds an entry inside `src/engram` (abspath == SRC_ENGRAM or
+         under SRC_ENGRAM + os.sep) whose abspath was not anywhere in
+         `path_before`, at any position.
+    Both firing give ONE message naming both. A leak made before setup (import
+    time), a re-insert of an entry already present at setup, an entry outside
+    `src/engram`, and `<repo>/src/engram_other` are NOT reported."""
+    parts = []
+    front = sys.path[0] if sys.path else None
+    before = path_before[0] if path_before else None
+    if (front is not None and front != before
+            and os.path.abspath(front).startswith(SRC_ENGRAM)):
+        parts.append(f"sys.path[0] now points inside src/engram ({front!r}); it was {before!r}")
+
+    def _inside(paths):
+        return {a for a in (os.path.abspath(p) for p in paths if isinstance(p, str))
+                if a == SRC_ENGRAM or a.startswith(SRC_ENGRAM + os.sep)}
+
+    new = sorted(_inside(sys.path) - _inside(path_before))
+    if new:
+        shown = ", ".join(repr(p) for p in new[:3])
+        more = "" if len(new) <= 3 else ", ..."
+        parts.append(f"sys.path gained {len(new)} new src/engram "
+                     f"entr{'y' if len(new) == 1 else 'ies'} ({shown}{more})")
+    return "; ".join(parts) if parts else None
+
+
+def _tools_problem(module_name, tools_before):
+    """The `tools` half: the cached `tools` evicted or replaced (identity, not
+    equality) relative to module setup -- only when one was cached then."""
+    if tools_before is None or sys.modules.get("tools") is tools_before:
+        return None
+    now = sys.modules.get("tools")
+    what = ("evicted from sys.modules" if now is None
+            else f"replaced (now {getattr(now, '__file__', None)!r})")
+    return (
+        f"test module {module_name!r} leaked process state (#4023): the cached "
+        f"`tools` package was {what}. The #2565 guard trusts a cached `tools` "
+        "and scans sys.path only when none is cached, so an eviction lets a "
+        "leaked sys.path entry resolve `tools` to src/engram/tools and fails "
+        "an unrelated later module. Restore sys.modules in this module (a "
+        "module-scope fixture that snapshots and restores)."
+    )
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _polluter_side_state_check(request):
+    """#4023 / #4029: name a polluter at its OWN module. Records `sys.path` and the
+    cached `tools` at module setup. At teardown, BOTH halves are hard errors naming
+    the module (a teardown error on its last test, attributable per module): a
+    `tools` eviction/replacement, and a `sys.path` leak into src/engram made
+    after setup (the `[0]` rule, or a new src/engram entry at any position; see
+    the coverage limits above `_PATH_LEAKS`). State is restored
+    EXACTLY first -- `tools` / `tools.*` (entries added since are dropped, captured
+    ones put back) and `sys.path` (to its setup list) -- and only then raised, so
+    the error names the polluter without cascading into later modules. Both
+    problems in one module raise ONE error. The #2565 guard above fires at the
+    VICTIM, which can be far from the polluter."""
+    path_before = list(sys.path)
+    tools_before = sys.modules.get("tools")
+    tools_snapshot = {k: v for k, v in sys.modules.items()
+                      if k == "tools" or k.startswith("tools.")}
+    yield
+    name = request.module.__name__
+    path_message = _path_leak_problem(path_before)
+    if path_message is not None:
+        _PATH_LEAKS.add(name)
+    tools_message = _tools_problem(name, tools_before)
+    if path_message is None and tools_message is None:
+        return
+    # Restore EXACTLY, THEN raise: drop every tools / tools.* key added
+    # after setup (a stale copy from the polluted window must not survive
+    # for a later `import tools.X`), then put the setup entries back; and put
+    # sys.path back to its setup list, in place.
+    for key in [k for k in sys.modules
+                if (k == "tools" or k.startswith("tools.")) and k not in tools_snapshot]:
+        del sys.modules[key]
+    sys.modules.update(tools_snapshot)
+    sys.path[:] = path_before
+    problems = []
+    if path_message is not None:
+        problems.append(
+            f"test module {name!r} leaked process state (#4029): {path_message}. "
+            "An in-process load of a hook or src/engram/tools module runs its "
+            "module-level sys.path.insert in the pytest process; open the shared "
+            "window around it (fixtures `isolate_hook_loads` / "
+            "`isolate_hook_loads_module`, tests/_hook_load_window.py).")
+    if tools_message is not None:
+        problems.append(tools_message)
+    raise RuntimeError(" ".join(problems))
+
+
+@pytest.fixture
+def isolate_hook_loads():
+    """#4029: function-scope window around whatever a test loads in process (a hook,
+    a src/engram/tools module): `sys.path` and the src/engram + `tools*` entries of
+    `sys.modules` are put back when the test ends. See tests/_hook_load_window.py."""
+    from _hook_load_window import hook_load_window
+    with hook_load_window():
+        yield
+
+
+@pytest.fixture(scope="module")
+def isolate_hook_loads_module():
+    """#4029: module-scope form of `isolate_hook_loads`, for a module whose later
+    tests rely on the loaded module staying imported. Restores when the module ends."""
+    from _hook_load_window import hook_load_window
+    with hook_load_window():
+        yield
+
+
+def pytest_terminal_summary(terminalreporter) -> None:
+    """One line, only when N > 0, names sorted (a clean run prints nothing). Covers
+    post-setup leaks only (see `_PATH_LEAKS`). Printed by the terminal reporter, so `-p no:terminal`
+    prints nothing."""
+    if _PATH_LEAKS:
+        terminalreporter.write_line(
+            f"#4023 sys.path[0] leaks: {len(_PATH_LEAKS)} module(s): "
+            + ", ".join(sorted(_PATH_LEAKS)))
+
+
 def pytest_collectstart(collector) -> None:
     """Runs BEFORE a module is imported/collected -- catches a collision
     left over from an earlier file's own top-level sys.path mistake

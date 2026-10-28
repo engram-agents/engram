@@ -46,6 +46,10 @@ HOOK_PATH = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-lesson-t
 RECONCILE_PATH = REPO_ROOT / "tools" / "reconcile_lesson_demotions.py"
 TEMPLATES_PATH = REPO_ROOT / "src" / "engram" / "engramd_read_templates.json"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored);
+# module scope: the load happens in module-scope fixtures or at import, which a function-scope window does not cover.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads_module")
+
 
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, str(path))

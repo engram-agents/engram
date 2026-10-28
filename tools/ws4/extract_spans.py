@@ -67,6 +67,7 @@ import os
 import sys
 from pathlib import Path
 
+from .. import _owner_read as owner_read  # the ONE ENGRAM_HOME definition (#3863); a package-relative import, like .constants
 from .constants import MAX_K_SWEEP, REDACT_CHAIN, SAMPLE_N, SAMPLE_SEED
 from .ledger import (
     append_jsonl,
@@ -90,8 +91,9 @@ ADJUDICATION_ARMS = {"chain", "control"}
 
 
 def default_ledger_path() -> str:
-    engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-    return str(Path(engram_home) / "tripwire-fire-ledger.jsonl")
+    """$ENGRAM_HOME/tripwire-fire-ledger.jsonl through the one resolver (#3863): a RELATIVE ENGRAM_HOME raises
+    ValueError naming it (main() turns that into a one-line refusal, exit 2)."""
+    return str(owner_read.engram_home() / "tripwire-fire-ledger.jsonl")
 
 
 def extract_one(row: dict, k: int, redact_chain: bool = REDACT_CHAIN):
@@ -333,7 +335,11 @@ def main(argv=None) -> int:
     )
     args = parser.parse_args(argv)
 
-    ledger_path = args.ledger or default_ledger_path()
+    try:
+        ledger_path = args.ledger or default_ledger_path()
+    except ValueError as exc:  # a relative ENGRAM_HOME: refused before the output directory or any file is touched
+        print(f"extract_spans: {exc}", file=sys.stderr)
+        return 2
     report = run(
         args.date, args.k, args.out, ledger_path,
         sample_n=args.sample, sample_seed=args.sample_seed,

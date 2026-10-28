@@ -1271,6 +1271,7 @@ def test_skew_an_older_owner_without_use_reward_answers_unknown_operation_typed(
 _FLAT_MODULES = [
     "engramd_owner.py", "engramd_client.py", "engramd_read_registry.py", "engram_pidfile.py", "engram_walguard.py",
     "engram_regular_io.py", "engram_restamp.py", "engram_config_io.py", "engram_moment_cursor.py",
+    "engram_home_resolver.py",  # #3863 step 2: engramd_client and engramd_owner import it
 ]
 
 
@@ -1505,7 +1506,7 @@ def test_displacement_detected_only_after_the_lock_wait_is_rejected_and_nothing_
 
 
 def test_ledger_section_6_states_the_readback_limits_and_the_authorizer_supersede():
-    text = (Path(__file__).resolve().parent.parent / "docs" / "2652-migration-ledger.md").read_text(encoding="utf-8")
+    text = (Path(__file__).resolve().parent.parent / "docs" / "internal" / "2652-migration-ledger.md").read_text(encoding="utf-8")
     sec = text[text.index("## 6. Owner writes"):]
     for needle in ("CANNOT detect", "CAN detect", "supersedes", "no-swapping", "fails closed", "backup()", "write did not land"):
         assert needle in sec, needle
@@ -1649,7 +1650,7 @@ def test_a_SystemExit_in_the_post_commit_re_read_is_recorded_then_propagates_and
 
 def test_write_docstring_and_ledger_say_determinate_only_up_to_the_commit_and_carry_the_client_timeout_obligation():
     assert "up to the COMMIT" in ec.write.__doc__
-    text = (Path(__file__).resolve().parent.parent / "docs" / "2652-migration-ledger.md").read_text(encoding="utf-8")
+    text = (Path(__file__).resolve().parent.parent / "docs" / "internal" / "2652-migration-ledger.md").read_text(encoding="utf-8")
     sec = text[text.index("## 6. Owner writes"):]
     assert "up to the COMMIT" in sec
     assert "request deadline, never to the client's own timeout" in sec and "OWNER_WRITE_CLIENT_TIMEOUT" in sec

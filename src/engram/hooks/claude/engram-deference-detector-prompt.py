@@ -44,7 +44,7 @@ DEFERENCE_COOLDOWN_PATH = os.path.join(ENGRAM_HOME, "deference-cooldown-at.txt")
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import resolve_runtime_dir, emit_context
+from _hooklib import resolve_runtime_dir, emit_context, bounded_parents
 # #3628: every marker read and the cooldown write are non-blocking and regular-file-only.
 from _hooklib import open_regular_text, open_regular_text_write
 from _harness import detect_harness, get_harness_budgets
@@ -94,7 +94,8 @@ _lp_candidates = []
 _lp_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
 if _lp_plugin_root:
     _lp_candidates.append(Path(_lp_plugin_root) / "tools")
-for _lp_parent in Path(__file__).resolve().parents:
+# Own tree only: up to and including the tree root, never above it (#3983).
+for _lp_parent in bounded_parents(Path(__file__).resolve()):
     _lp_candidates.append(_lp_parent / "tools")
 # (c / "loop_prompt.py").exists() raises OSError -- not False -- on an
 # unreadable candidate directory, and this whole block runs at bare
@@ -167,7 +168,7 @@ def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int, std
 
     alpha #2574 WS3: construction (import + Emitter.init) is narrowed to its
     own try/except so an INIT_FAILED outcome is recordable and distinct from
-    an ordinary DROPPED emit (docs/2574-telemetry-design.md §1/§5) -- the
+    an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md §1/§5) -- the
     previous single wide try made a failure after a successful emit
     indistinguishable from a construction failure.
     """
@@ -208,7 +209,7 @@ def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int, std
 
 def main() -> None:
     # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
-    # return in this function (docs/2574-telemetry-design.md §1 NEGATIVE
+    # return in this function (docs/internal/2574-telemetry-design.md §1 NEGATIVE
     # EVIDENCE / TRIGGER ENTRY).
     write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
 

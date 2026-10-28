@@ -102,6 +102,12 @@ from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import patch
 
+import pytest
+
+# #4093: each hook load runs the hook's module-level sys.path.insert; the shared window
+# (#4029) puts sys.path and the src/engram modules back after each test.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _HOOKLIB_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "_hooklib.py"
 _HOOKLIB_SRC = _HOOKLIB_PATH.read_text()

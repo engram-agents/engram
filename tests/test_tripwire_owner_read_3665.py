@@ -76,6 +76,9 @@ FULL_CMD = "echo tripwirepat zebrafoo " + LONG_WORDS
 BLOCK_CMD = "echo tripwirepat blockpat zebrafoo"
 DAEMON_RESULT = {"match_count": 1, "top_claims": [{"id": "ob_0001", "recall_summary": "stub recall line"}]}
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # --- fixtures / helpers --------------------------------------------------------------
 
@@ -328,7 +331,7 @@ def sql_set_of(sites) -> set:
 
 
 CHAIN_SITES = ("engram_core.py:generalization_chain", "engram_core.py:_resolve_to_current",
-               "engram_core.py:_current_successor")
+               "engram_core.py:_current_successor", "engram_core.py:dag_edge_set")
 # #3740 Cut A: with the flag ON the chain walk travels as ONE typed `chain` request per hit
 # (recorded by `statement_of` at method level as "chain"); the per-hop statements of CHAIN_SITES
 # are sent only by the direct path.
@@ -755,6 +758,205 @@ def differing(levels: dict) -> set:
     return {k for k, (a, b) in levels.items() if a != b}
 
 
+_FD_MAX = 2000
+_FD_CLIP = 200
+_FD_LINE = 480
+
+
+def _fd_clip(v) -> str:
+    r = repr(v)
+    return r if len(r) <= _FD_CLIP else r[:_FD_CLIP] + "…"
+
+
+def _fd_keys(keys) -> str:
+    ks = sorted(keys, key=repr)
+    shown = ", ".join(repr(k) for k in ks[:10])
+    return shown + (f", …+{len(ks) - 10}" if len(ks) > 10 else "")
+
+
+def _fd_walk(old, new, path: str = "") -> tuple:
+    """Return (path, description) of the first difference of two unequal values."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        only_old = [k for k in old if k not in new]
+        only_new = [k for k in new if k not in old]
+        if only_old or only_new:
+            parts = []
+            if only_old:
+                parts.append(f"old-only keys: {_fd_keys(only_old)}")
+            if only_new:
+                parts.append(f"new-only keys: {_fd_keys(only_new)}")
+            return path, "; ".join(parts)
+        for k in sorted(old, key=repr):
+            if old[k] != new[k]:
+                return _fd_walk(old[k], new[k], f"{path}[{k!r}]")
+    if isinstance(old, (list, tuple)) and isinstance(new, (list, tuple)):
+        n = min(len(old), len(new))
+        for i in range(n):
+            if old[i] != new[i]:
+                p, d = _fd_walk(old[i], new[i], f"{path}[{i}]")
+                if len(old) != len(new):
+                    d += f" (also len old={len(old)} new={len(new)})"
+                return p, d
+        if len(old) == len(new):
+            # every compared element is equal and the lengths match: only the container differs
+            return path, f"type old={type(old).__name__} new={type(new).__name__}"
+        return path, f"len old={len(old)} new={len(new)}; first extra index {n}"
+    if isinstance(old, (str, bytes)) and type(old) is type(new):
+        off = next(
+            (i for i, (a, b) in enumerate(zip(old, new)) if a != b),
+            min(len(old), len(new)),
+        )
+        lo, hi = max(0, off - 40), off + 40
+        return path, (
+            f"first differing offset {off} (len old={len(old)} new={len(new)}): "
+            f"old={old[lo:hi]!r} new={new[lo:hi]!r}"
+        )
+    return path, (
+        f"old={_fd_clip(old)} ({type(old).__name__}) "
+        f"new={_fd_clip(new)} ({type(new).__name__})"
+    )
+
+
+def first_difference(levels: dict) -> str:
+    """Assertion message naming WHERE each differing level first differs (#4117).
+
+    One line per differing level, sorted by level name. Bounded to 2000 chars;
+    never raises (a diagnostic must not mask the real failure).
+    """
+    lines = []
+    for name in sorted(levels):
+        old, new = levels[name]
+        try:
+            if old == new:
+                continue
+            path, desc = _fd_walk(old, new)
+            line = f"{name}: {path + ': ' if path else ''}{desc}"
+        except Exception as exc:
+            line = f"{name}: <first_difference failed: {type(exc).__name__}>"
+        # per-line bound: one huge early level must not crowd out later levels
+        lines.append(line if len(line) <= _FD_LINE else line[: _FD_LINE - 1] + "…")
+    msg = "\n".join(lines)
+    return msg if len(msg) <= _FD_MAX else msg[: _FD_MAX - 1] + "…"
+
+
+def test_first_difference_identical_is_empty():
+    levels = {"stdout": ("a", "a"), "state": ({"k": [1]}, {"k": [1]})}
+    assert first_difference(levels) == ""
+
+
+def test_first_difference_names_new_only_key():
+    levels = {"state": ({"a.txt": "1"}, {"a.txt": "1", "x.txt": "2"})}
+    msg = first_difference(levels)
+    assert msg.startswith("state: ")
+    assert "new-only keys: 'x.txt'" in msg
+
+
+def test_first_difference_descends_path_into_jsonl_rows():
+    old = [{"mode": "a"}, {"mode": "b"}, {"mode": "c"}]
+    new = [{"mode": "a"}, {"mode": "b"}, {"mode": "Z"}]
+    msg = first_difference({"state": ({"ledger.jsonl": old}, {"ledger.jsonl": new})})
+    assert "state: ['ledger.jsonl'][2]['mode']: " in msg
+    assert "old='c' new='Z'" in msg
+
+
+def test_first_difference_string_offset_and_window():
+    old = "a" * 100 + "X" + "b" * 399
+    new = "a" * 100 + "Y" + "b" * 399
+    msg = first_difference({"stdout": (old, new)})
+    assert "offset 100" in msg
+    assert repr(old[60:140]) in msg and repr(new[60:140]) in msg
+    assert repr(old) not in msg
+
+
+def test_first_difference_output_is_bounded():
+    old = {f"k{i:04d}.txt": "a" * 10_000 for i in range(1000)}
+    new = {f"k{i:04d}.txt": "b" * 10_000 for i in range(1000)}
+    msg = first_difference({"state": (old, new), "stdout": ("x" * 50_000, "y" * 50_000)})
+    assert 0 < len(msg) <= 2000
+
+
+def test_first_difference_mismatched_types_do_not_raise():
+    msg = first_difference({"state": (None, [])})
+    assert "NoneType" in msg and "list" in msg
+
+
+def test_first_difference_names_first_dict_key_not_a_later_one():
+    old = {"a.txt": "1", "b.txt": "1"}
+    new = {"a.txt": "2", "b.txt": "2"}
+    msg = first_difference({"state": (old, new)})
+    assert "state: ['a.txt']: " in msg
+    assert "['b.txt']" not in msg
+
+
+def test_first_difference_names_first_list_index_not_a_later_one():
+    old = [0, 1, 2, 3, 4]
+    new = [0, 9, 2, 3, 8]
+    msg = first_difference({"raw": (old, new)})
+    assert "raw: [1]: " in msg
+    assert "[4]" not in msg
+
+
+def test_first_difference_names_first_string_offset_not_a_later_one():
+    old = "a" * 10 + "X" + "b" * 289 + "X" + "c" * 50
+    new = "a" * 10 + "Y" + "b" * 289 + "Y" + "c" * 50
+    msg = first_difference({"stdout": (old, new)})
+    assert "offset 10 " in msg
+    assert "offset 300" not in msg
+
+
+def test_first_difference_truncates_long_key_list():
+    old = {f"k{i:02d}": 1 for i in range(13)}
+    msg = first_difference({"state": (old, {})})
+    assert "old-only keys: 'k00'" in msg
+    assert "'k09'" in msg and "'k10'" not in msg
+    assert "…+3" in msg
+
+
+def test_first_difference_bytes_offset_and_repr_excerpt():
+    old = b"abc" + b"\x00" + b"def"
+    new = b"abc" + b"\x01" + b"def"
+    msg = first_difference({"stdout": (old, new)})
+    assert "first differing offset 3" in msg
+    assert f"old={old!r}" in msg and f"new={new!r}" in msg
+
+
+def test_first_difference_names_first_extra_index_when_one_list_is_a_prefix():
+    msg = first_difference({"raw": ([1, 2], [1, 2, 3, 4])})
+    assert "first extra index 2" in msg
+    assert "len old=2 new=4" in msg
+
+
+def test_first_difference_reports_list_vs_tuple_type_not_a_phantom_length():
+    msg = first_difference({"raw": ([1, 2], (1, 2))})
+    assert "type old=list new=tuple" in msg
+    assert "extra index" not in msg
+    nested = first_difference({"state": ({"f": [1]}, {"f": (1,)})})
+    assert "state: ['f']: type old=list new=tuple" in nested
+
+
+def test_first_difference_per_line_bound_keeps_later_levels_visible():
+    k = "x" * 5000
+    levels = {
+        "raw": ({k: "a"}, {k: "b"}),
+        "state": ("s1", "s2"),
+        "stderr": ("e1", "e2"),
+        "stdout": ("o1", "o2"),
+    }
+    msg = first_difference(levels)
+    assert len(msg) <= 2000
+    assert all(f"{n}: " in msg for n in levels)
+    assert max(len(line) for line in msg.split("\n")) <= 480
+
+
+def test_first_difference_levels_in_sorted_order():
+    for levels in (
+        {"state": ("a", "b"), "stdout": ("c", "d")},
+        {"stdout": ("c", "d"), "state": ("a", "b")},
+    ):
+        msg = first_difference(levels)
+        assert msg.index("state: ") < msg.index("stdout: ")
+
+
 @pytest.mark.parametrize("owner_kind", OWNER_KINDS)
 @pytest.mark.parametrize("name,cmd", C1_COMMANDS, ids=[c[0] for c in C1_COMMANDS])
 def test_c1_owner_and_direct_agree_on_rows_stdout_and_state(name, cmd, owner_kind, home, monkeypatch):
@@ -767,7 +969,7 @@ def test_c1_owner_and_direct_agree_on_rows_stdout_and_state(name, cmd, owner_kin
     monkeypatch.setattr(engram_idf, "IDF_BATCH_TERMS", 40)
     make_store(home)
     levels, answers = _levels(home, monkeypatch, cmd, owner_kind)
-    assert differing(levels) == set(), {k: v for k, v in levels.items() if v[0] != v[1]}
+    assert differing(levels) == set(), first_difference(levels)
     assert len(answers) >= 3, "the owner was never asked: the harness would pass vacuously"
     if name == "tripwire+chain+prevention+recall":
         assert "Nudge for tripwire one" in levels["stdout"][1] and "OLD NUDGE" not in levels["stdout"][1]
@@ -806,7 +1008,7 @@ def test_c1_vocab_table_absent_flag_on_is_byte_identical_to_flag_off(owner_kind,
 
     monkeypatch.setattr(ec, "read", spy)
     levels, _answers = _levels(home, monkeypatch, FULL_CMD, owner_kind)
-    assert differing(levels) == set(), {k: v for k, v in levels.items() if v[0] != v[1]}
+    assert differing(levels) == set(), first_difference(levels)
     out_off, out_on = levels["stdout"]
     assert "Nudge for tripwire one" in out_on and "Nudge for tripwire one" in out_off
     for text in (out_on, levels["stderr"][1]):
@@ -1697,7 +1899,13 @@ def test_chain_a_fire_with_two_hits_sends_exactly_two_chain_requests_and_no_per_
     sent_sql = {s for m, s, _a in seen_m if m == "read"}
     assert not sent_sql & per_hop, sorted(sent_sql & per_hop)
     for needle in ("SELECT id, type FROM nodes WHERE id = ?", "SELECT is_current FROM nodes WHERE id = ?",
-                   "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
+                   # #3542: the parent read is dag_edge_set's live/target template
+                   ("SELECT e.source_id AS source_id, e.target_id AS target_id, "
+                    "e.relation AS relation FROM edges e JOIN nodes s ON s.id = e.source_id "
+                    "JOIN nodes t ON t.id = e.target_id WHERE e.relation IN "
+                    "(SELECT value FROM json_each(?)) AND (s.is_current = 1 AND s.status != "
+                    "'retracted') AND (t.is_current = 1 AND t.status != 'retracted') AND "
+                    "e.target_id = ? ORDER BY e.source_id, e.target_id, e.relation"),
                    "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
                    "SELECT id, claim FROM nodes WHERE id IN (SELECT value FROM json_each(?))"):
         assert needle in per_hop, needle  # the list above really is the old per-hop set

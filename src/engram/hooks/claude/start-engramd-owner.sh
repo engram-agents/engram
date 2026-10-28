@@ -194,6 +194,40 @@ _report() {
     fi
 }
 
+# Where a sibling runtime file may be looked for (#3983): this script's own directory, then each
+# parent up to and INCLUDING its tree root, never above it. The tree root is the nearest directory
+# holding engram_core.py (the installed plugin root and src/engram/ both do). Walking on to "/" would
+# let a tier-filtered build that omits the file pick up a stale copy from an ancestor (a scatter-era
+# ENGRAM home folder (ENGRAM_HOME) is an ancestor of the plugin root). With no engram_core.py above, only the own directory
+# and its parent are offered. One directory per line, nearest first. bash 3.2-safe: no arrays, no bash 4.
+_bounded_dirs() {
+    local start d
+    start="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")"
+    d="$start"
+    while [ -n "$d" ] && [ "$d" != "." ]; do
+        if [ -f "$d/engram_core.py" ]; then
+            d="$start"
+            while :; do
+                printf '%s\n' "$d"
+                if [ -f "$d/engram_core.py" ]; then
+                    return 0
+                fi
+                d="$(dirname "$d")"
+            done
+        fi
+        if [ "$d" = "/" ]; then
+            break
+        fi
+        d="$(dirname "$d")"
+    done
+    printf '%s\n' "$start"
+    d="$(dirname "$start")"
+    if [ "$d" != "$start" ]; then
+        printf '%s\n' "$d"
+    fi
+    return 0
+}
+
 # The I/O helper is a sibling of this script (hooks/ when flattened, hooks/claude/ in source).
 _find_io_helper() {
     local d f="_engramd_owner_hook_io.py"
@@ -201,8 +235,7 @@ _find_io_helper() {
         printf '%s' "$CLAUDE_PLUGIN_ROOT/hooks/$f"
         return 0
     fi
-    d="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")"
-    while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+    while IFS= read -r d; do
         if [ -f "$d/$f" ]; then
             printf '%s' "$d/$f"
             return 0
@@ -211,8 +244,9 @@ _find_io_helper() {
             printf '%s' "$d/hooks/$f"
             return 0
         fi
-        d="$(dirname "$d")"
-    done
+    done <<EOF
+$(_bounded_dirs)
+EOF
     return 1
 }
 
@@ -222,14 +256,14 @@ _find_plugin_root() {
         printf '%s' "$CLAUDE_PLUGIN_ROOT"
         return 0
     fi
-    d="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")"
-    while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+    while IFS= read -r d; do
         if [ -f "$d/engramd_owner_flags.py" ]; then
             printf '%s' "$d"
             return 0
         fi
-        d="$(dirname "$d")"
-    done
+    done <<EOF
+$(_bounded_dirs)
+EOF
     return 1
 }
 
@@ -300,6 +334,19 @@ case "$_verdict" in
         ;;
     *)
         _report "ENGRAM owner not launched (could not check engramd.pid; ambiguous). ENGRAM_HOME=$ENGRAM_HOME"
+        exit 0
+        ;;
+esac
+
+# ---- 3b. the store-maintenance lock directory is usable (#3882) -----------------------
+# The owner exits 4 on a planted symlink / non-directory / foreign-owned `knowledge.db.maint.lockdir`
+# and systemd does not restart 4, but launchd restarts every non-zero exit: only this refusal, before
+# anything is launched, stops that loop. One lstat in the helper; it never creates the directory (the
+# owner does). `ambiguous:` claims nothing and proceeds: the owner refuses by itself, closed.
+_maintlock="$("$PYTHON_BIN" "$IO_PY" maintlock "$ENGRAM_HOME" 2>/dev/null)"
+case "$_maintlock" in
+    bad:*)
+        _report "ENGRAM owner not launched: the store-maintenance lock directory $ENGRAM_HOME/knowledge.db.maint.lockdir is not a real directory owned by this user (${_maintlock#bad:}); the owner would refuse it (exit 4). Remove or fix that path, then start a session again. Launching nothing. ENGRAM_HOME=$ENGRAM_HOME"
         exit 0
         ;;
 esac
@@ -532,8 +579,9 @@ else
             0) printf '%s' "clean stop" ;;
             1) printf '%s' "another owner holds this seat" ;;
             3) printf '%s' "the owner shut down on a displaced substrate" ;;
-            4) printf '%s' "a planted non-regular path (fix the path, then reset-failed)" ;;
+            4) printf '%s' "a planted non-regular path, or an unusable store-maintenance lock directory (fix the path, then reset-failed)" ;;
             5) printf '%s' "the store is behind this code's schema (the first migration has not run)" ;;
+            6) printf '%s' "a store-maintenance tool (or another holder) holds the store; the owner retries once it has exited" ;;
             *) printf '%s' "unrecognized exit status" ;;
         esac
     }

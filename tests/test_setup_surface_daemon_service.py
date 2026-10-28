@@ -68,6 +68,9 @@ def _make_env(stub_dir: str, fake_home: str, fake_engram_home: str,
         "ENGRAM_HOME": fake_engram_home,
         # #3519 item 1: these cells run from temp dirs / worktrees.
         "ENGRAM_SETUP_ALLOW_PATH": "1",
+        # #3939: keep the launchctl wait/retry fast
+        "ENGRAM_SETUP_LAUNCHD_POLL_S": "0.01", "ENGRAM_SETUP_LAUNCHD_RETRY_S": "0.01",
+        "ENGRAM_SETUP_LAUNCHD_WAIT_S": "1",
     }
     # Always clear ENGRAM_HOOKS_DIR from inherited env unless caller sets it
     env.pop("ENGRAM_HOOKS_DIR", None)
@@ -113,6 +116,7 @@ class TestOSDetection(unittest.TestCase):
         body = textwrap.dedent(f"""\
             #!/usr/bin/env bash
             echo "$@" >> "{log}"
+            if [ "$1" = print ]; then exit 113; fi
             exit 0
             """)
         _write_stub(stub_dir, "launchctl", body)

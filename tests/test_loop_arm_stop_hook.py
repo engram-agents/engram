@@ -47,6 +47,10 @@ HOOKS_DIR = Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude"
 HOOK_PATH = HOOKS_DIR / "engram-loop-arm-stop-hook.py"
 PYTHON = sys.executable
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _make_stop_payload(
     transcript_path: str,
@@ -161,6 +165,43 @@ def _tool_use_record(tool_id: str, name: str, input_: dict | None = None) -> str
     )
 
 
+def _tool_use_record_with_msg_id(
+    tool_id: str, name: str, msg_id: str, input_: dict | None = None
+) -> str:
+    """Assistant record with a single tool_use block AND a message.id —
+    the real Claude Code transcript shape for one call in a parallel block."""
+    return json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "id": msg_id,
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": name,
+                        "input": input_ if input_ is not None else {},
+                    }
+                ],
+            },
+        },
+        separators=(",", ":"),
+    )
+
+
+def _batched_arm_records(
+    sw_tool_id: str, cronlist_tool_id: str, prompt: str, msg_id: str
+) -> tuple[str, str]:
+    """Two records sharing `msg_id` — the real Claude Code shape for a
+    parallel ScheduleWakeup + CronList call.  Returns (sw_line, cl_line)
+    suitable for passing to _append_lines."""
+    sw = _tool_use_record_with_msg_id(
+        sw_tool_id, "ScheduleWakeup", msg_id, {"prompt": prompt}
+    )
+    cl = _tool_use_record_with_msg_id(cronlist_tool_id, "CronList", msg_id, {})
+    return sw, cl
+
+
 def _tool_result_record(tool_id: str, text: str) -> str:
     """Build a compact-JSON user-role record with a single tool_result
     block, correlated to `tool_id` via `tool_use_id` -- used only for the
@@ -249,8 +290,10 @@ def test_suppresses_given_schedulewakeup_call_with_marker(tmp_path):
 
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    call = _schedule_wakeup_call("toolu_test_swu", _REAL_LOOP_PROMPT)
-    _append_lines(transcript, call)
+    sw, cl = _batched_arm_records(
+        "toolu_test_swu", "toolu_test_swu_cl", _REAL_LOOP_PROMPT, "msg_test_arm_1"
+    )
+    _append_lines(transcript, sw, cl)
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
@@ -277,8 +320,10 @@ def test_suppresses_given_html_escaped_marker(tmp_path):
     escaped_prompt = html.escape("<loop-wake>") + "\nLoop tick."
     assert "&lt;loop-wake&gt;" in escaped_prompt  # sanity on the fixture itself
 
-    call = _schedule_wakeup_call("toolu_test_escaped", escaped_prompt)
-    _append_lines(transcript, call)
+    sw, cl = _batched_arm_records(
+        "toolu_test_escaped", "toolu_test_escaped_cl", escaped_prompt, "msg_test_arm_2"
+    )
+    _append_lines(transcript, sw, cl)
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
@@ -604,12 +649,14 @@ def test_tool_use_in_earlier_delta_does_not_bleed_into_later_turn(tmp_path):
 
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    # Turn 1's delta: a confirming ScheduleWakeup call.
-    call = _schedule_wakeup_call("toolu_split", _REAL_LOOP_PROMPT)
-    _append_lines(transcript, call)
+    # Turn 1's delta: a confirming batched arm (SW + CronList, same message.id).
+    sw, cl = _batched_arm_records(
+        "toolu_split_sw", "toolu_split_cl", _REAL_LOOP_PROMPT, "msg_split_arm"
+    )
+    _append_lines(transcript, sw, cl)
     stdout1, rc1 = _run_hook(_make_stop_payload(str(transcript)), engram_home)
     assert rc1 == 0
-    assert stdout1 == "", f"Turn 1 with a confirming call must suppress; got={stdout1!r}"
+    assert stdout1 == "", f"Turn 1 with a confirming batched arm must suppress; got={stdout1!r}"
 
     # Turn 2's delta: no new ScheduleWakeup call, just prose. Turn 1's
     # call must not bleed forward and suppress this turn too.
@@ -672,7 +719,7 @@ def test_colocated_claude_profile_wins_over_stale_codex_plugin_root(tmp_path):
     assert rc == 0
     parsed = json.loads(stdout)
     assert parsed["decision"] == "block"
-    assert "Arm now — ScheduleWakeup" in parsed["reason"]
+    assert "ScheduleWakeup(delay=cadence_seconds)" in parsed["reason"]
     assert "managed Codex" not in parsed["reason"]
 
 
@@ -819,8 +866,11 @@ def test_first_fire_on_fresh_transcript_with_confirmation_already_present_suppre
     _write_loop_marker(engram_home)
     transcript = tmp_path / "transcript.jsonl"
 
-    call = _schedule_wakeup_call("toolu_test_firstfire", _REAL_LOOP_PROMPT)
-    transcript.write_text(call + "\n", encoding="utf-8")
+    sw, cl = _batched_arm_records(
+        "toolu_test_firstfire_sw", "toolu_test_firstfire_cl",
+        _REAL_LOOP_PROMPT, "msg_firstfire_arm"
+    )
+    transcript.write_text(sw + "\n" + cl + "\n", encoding="utf-8")
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
@@ -845,12 +895,15 @@ def test_delta_isolation_prior_confirmation_does_not_bleed_into_later_turn(tmp_p
     # Fire 1: establish state.
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    # Turn 1: confirmed, marker-carrying ScheduleWakeup call in the delta.
-    call = _schedule_wakeup_call("toolu_test_turn1", _REAL_LOOP_PROMPT)
-    _append_lines(transcript, call)
+    # Turn 1: confirmed via batched arm — SW + CronList, same message.id.
+    sw, cl = _batched_arm_records(
+        "toolu_test_turn1_sw", "toolu_test_turn1_cl",
+        _REAL_LOOP_PROMPT, "msg_turn1_arm"
+    )
+    _append_lines(transcript, sw, cl)
     stdout1, rc1 = _run_hook(_make_stop_payload(str(transcript)), engram_home)
     assert rc1 == 0
-    assert stdout1 == "", f"Turn 1 with confirmation must suppress; got={stdout1!r}"
+    assert stdout1 == "", f"Turn 1 with batched arm must suppress; got={stdout1!r}"
 
     # Turn 2: no new confirmation, just prose.
     _append_lines(

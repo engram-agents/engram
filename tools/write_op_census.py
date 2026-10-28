@@ -2,7 +2,7 @@
 """tools/write_op_census.py — call-path write-operation census generator
 (#3095, phase-1 build unit U2 of the #2652 EngramManager migration).
 
-Design context: docs/2652-engrammanager-design.md §3.1 ("The phase-1
+Design context: docs/internal/2652-engrammanager-design.md §3.1 ("The phase-1
 waypoint, and its asymmetry") and §7 ("Open, and whose call each one is").
 §3.1 records that three honest hand-walks of a single call path
 (`create_node(derivation)`) by two people produced three different answers —

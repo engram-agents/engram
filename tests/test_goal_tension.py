@@ -137,7 +137,7 @@ def test_non_goal_rejected():
     client = fresh_client()
     g1, _ = _two_goals(client)
     obs = client.call("engram_add_observation", {
-        "quoted_text": "Test",
+        "quoted_text": "Test in the cited source",
         "interpretation": "Test",
         "claim": "A claim",
         "quote_type": "hard_data",
@@ -210,7 +210,7 @@ def test_tension_rejected_in_contradict():
         "description": "Test tension",
     })
     obs = client.call("engram_add_observation", {
-        "quoted_text": "Test",
+        "quoted_text": "Test in the cited source",
         "interpretation": "Test",
         "claim": "A claim",
         "quote_type": "hard_data",
@@ -297,7 +297,7 @@ def test_resolved_tension_not_in_reflect():
         "description": "Test tension",
     })
     obs = client.call("engram_add_observation", {
-        "quoted_text": "Test",
+        "quoted_text": "Test in the cited source",
         "interpretation": "Test",
         "claim": "Resolution support",
         "quote_type": "hard_data",

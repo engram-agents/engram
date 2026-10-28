@@ -66,6 +66,28 @@ from pathlib import Path
 from typing import Any
 
 
+# Inline copy, not an import: this helper has to find the runtime root BEFORE any sibling module can be imported (the `tools` import of #3863 comes later, below).
+# Pinned identical to every other copy by tests/test_bounded_sibling_lookups_3983.py.
+def _bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 def _find_helper_dir() -> Path | None:
     """The directory holding engram_regular_io.py: CLAUDE_PLUGIN_ROOT first,
     then a walk of this file's parents (the installed plugin has the helper at
@@ -76,7 +98,7 @@ def _find_helper_dir() -> Path | None:
     if root:
         cands.append(Path(root))
     here = Path(__file__).resolve()
-    for p in (here.parent, *here.parents):
+    for p in _bounded_parents(here):  # own tree only, never above its root (#3983)
         cands.append(p)
         cands.append(p / "src" / "engram")
     for c in cands:
@@ -111,7 +133,27 @@ from engram_regular_io import (
 
 from websockets.sync.client import connect as ws_connect
 
-ENGRAM_HOME = Path(os.environ.get("ENGRAM_HOME", Path.home() / ".engram"))
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863); `tools` sits beside this file's
+# directory in BOTH layouts (src/engram/ and the deployed plugin root). This is a long-lived daemon: a RELATIVE
+# ENGRAM_HOME must not raise at import (`--help` and the importing tests still work), so the refusal is recorded
+# here and main() acts on it before ANY other step (before binding, spawning or writing); the home is then a
+# poison path under a file (nothing can be created below /dev/null) so no code path can use it by accident.
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+try:
+    from tools import _owner_read as owner_read  # noqa: E402
+except ImportError:
+    print("codex-umwelt-wake: cannot import tools/_owner_read (the ENGRAM-home definition; the install looks "
+          "partial); set CLAUDE_PLUGIN_ROOT or reinstall", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    ENGRAM_HOME = owner_read.engram_home()
+    _HOME_REFUSAL = None
+except ValueError as _home_exc:
+    _HOME_REFUSAL = str(_home_exc)
+    ENGRAM_HOME = Path("/dev/null/engram-home-refused")
 DEFAULT_STATE_DIR = ENGRAM_HOME / "codex-wake"
 DEFAULT_APP_SERVER = os.environ.get("CODEX_APP_SERVER", "unix://")
 DEFAULT_INTERVAL = float(os.environ.get("CODEX_UMWELT_WAKE_INTERVAL", "2.0"))
@@ -2385,7 +2427,7 @@ def attempt_delivery(
 def proc_cmdline(pid: int) -> tuple[str, str]:
     try:
         out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "args="],
+            ["ps", "-ww", "-p", str(pid), "-o", "args="],  # -ww: args= truncates to $COLUMNS otherwise (#4227)
             capture_output=True,
             text=True,
             timeout=5,
@@ -2882,6 +2924,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if _HOME_REFUSAL is not None:  # a relative ENGRAM_HOME: refuse every subcommand before doing anything (#3863)
+        print(f"codex-umwelt-wake: {_HOME_REFUSAL}", file=sys.stderr)
+        return 2
     return int(args.func(args))
 
 

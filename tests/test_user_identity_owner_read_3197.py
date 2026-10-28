@@ -48,6 +48,10 @@ _HOOK_PATH = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-user-id
 import engramd_client as ec  # noqa: E402
 import engramd_owner as eo  # noqa: E402
 
+# #4093: each hook load runs the hook's module-level sys.path.insert; the shared window
+# (#4029) puts sys.path and the src/engram modules back after each test.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 FLAG_KEY = "user_identity_reads_via_owner"
 
 
@@ -647,6 +651,8 @@ def test_s2_flattened_deployed_layout_resolves_engramd_client_and_reads_through_
     # #3707: engramd_client imports engram_pidfile; #3768: engram_pidfile imports engram_regular_io; the build ships all at the plugin root (tiers.json, essential).
     shutil.copy(Path(_SRC_ENGRAM) / "engram_pidfile.py", root / "engram_pidfile.py")
     shutil.copy(Path(_SRC_ENGRAM) / "engram_regular_io.py", root / "engram_regular_io.py")
+    # #3863 step 2: engramd_client imports the runtime ENGRAM_HOME resolver, shipped at the plugin root.
+    shutil.copy(Path(_SRC_ENGRAM) / "engram_home_resolver.py", root / "engram_home_resolver.py")
     env = {k: v for k, v in os.environ.items()
            if k not in ("CLAUDE_PLUGIN_ROOT", "ENGRAM_RUNTIME_DIR", "PYTHONPATH")}
     env["ENGRAM_HOME"] = str(home)

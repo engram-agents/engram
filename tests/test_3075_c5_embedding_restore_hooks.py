@@ -37,6 +37,10 @@ _SESSION_START_HOOK_PATH = (
     PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
 )
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_surface_hook_module():
     sys.modules.pop("engram_surface_hook", None)

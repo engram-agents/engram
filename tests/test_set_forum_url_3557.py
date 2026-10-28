@@ -72,6 +72,9 @@ URL = "http://localhost:5002"
 _HERMETIC_HOME = tempfile.mkdtemp(prefix="set-forum-url-home-")
 atexit.register(shutil.rmtree, _HERMETIC_HOME, ignore_errors=True)
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _hermetic_env(**extra):
     env = dict(os.environ)
@@ -690,6 +693,10 @@ class TestS8Installer:
         tool_dir = src / "src" / "engram" / "tools"
         tool_dir.mkdir(parents=True)
         (tool_dir / "set_forum_url.py").write_text(TOOL.read_text())
+        # #3863 step 3b: the tool resolves the home through its sibling tools/_owner_read.py, so a checkout-shaped
+        # tools/ dir carries it (and the package marker) beside the tool.
+        for sibling in ("__init__.py", "_owner_read.py"):
+            (tool_dir / sibling).write_text((TOOL.parent / sibling).read_text())
         _write(tmp_path / "config.json", {"forum": {"url": "http://other:5002"}})
         before = (tmp_path / "config.json").read_bytes()
         script = (

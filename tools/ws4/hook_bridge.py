@@ -18,6 +18,8 @@ import re
 import sqlite3
 from pathlib import Path
 
+from .. import _owner_read as owner_read  # the store-path classifier (#3962); `tools` is this package's parent
+
 _HOOK_MODULE_NAME = "ws4_lesson_tripwire_hook_bridge"
 _hook_module_cache = None
 
@@ -86,6 +88,7 @@ def load_situation_patterns(db_path, hook_path: "Path | None" = None) -> dict:
     module = load_hook_module(hook_path)
     query = module._QUERY
     try:
+        owner_read.check_store_path(db_path)  # #3962: only removes the FIFO hang; every class still answers {}
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
         try:
             rows = conn.execute(query).fetchall()

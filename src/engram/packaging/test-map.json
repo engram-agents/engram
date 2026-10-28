@@ -217,7 +217,8 @@
         "tests/test_stop_hook_maturity_gate.py",
         "tests/test_stop_hook_prose_gate.py",
         "tests/test_stop_hook_owner_read_3664.py",
-        "tests/test_codex_hook_envelopes.py"
+        "tests/test_codex_hook_envelopes.py",
+        "tests/test_sys_path_hygiene_2923.py"
       ],
       "note": "engram-alpha#3664 (U6a): test_stop_hook_owner_read_3664.py added -- the flagged owner-read path's differential harness (C1), flag-off (C0/C2), owner-down (C3), timeout-budget (C4), flattened-layout (C5) and launcher-gate (C6) cells; the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
@@ -358,12 +359,51 @@
       "note": "standalone stdlib CLI (not import-reachable); dedicated test plants each enumerated hard-coded-home spelling in scratch git repos (line-level: the token on another line does not rescue) and checks the schema-2 baseline rules (new violator, count above/below, stale, dangling, growth vs a base commit, classed allowlist, schema 1 on the head); the only real-tree test asserts the ratchet is green (#3863)"
     },
     {
+      "path_prefix_or_glob": "tools/raw_home_read_gate.py",
+      "test_globs": ["tests/test_raw_home_read_gate_3863.py", "tests/test_engram_home_parity_3863.py"],
+      "note": "standalone stdlib CLI (not import-reachable); #3863 step 1 round 2. The dedicated test loads it by path and plants raw ENGRAM_HOME reads in scratch git repos (new site, above/below baseline, growth vs a base commit, the five pinned resolver files exempt, tests/docs/markdown/symlinks not scanned, abspath/resolve lines still red), and pins the pr-checks step and the tiers entries. The parity test pins the five resolver files the gate exempts."
+    },
+    {
       "path_prefix_or_glob": "tools/cohort_dispatch.py",
       "test_globs": [
         "tests/test_cohort_dispatch.py",
         "tests/test_cohort_owner_read_3862.py",
-        "tests/test_store_path_precheck_3960.py"
+        "tests/test_store_path_precheck_3960.py",
+        "tests/test_cohort_dispatch_unusable_regular_store_3963.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/quote_quality_survey.py",
+      "test_globs": [
+        "tests/test_quote_quality_survey_4050.py",
+        "tests/test_anchoring_report.py"
+      ],
+      "note": "engram-alpha#4050 S1: read-only survey. The cells load it by path and run it as a subprocess (invisible to the layer-1 import graph); it also reuses anchoring_report's population query and read-only open, so that tool's cells ride along."
+    },
+    {
+      "path_prefix_or_glob": "tools/s2_clause_sheet.py",
+      "test_globs": [
+        "tests/test_s2_clause_sheet_4050.py",
+        "tests/test_quote_quality_survey_4050.py"
+      ],
+      "note": "engram-alpha#4050 S2: clause-check sheet builder. The cells load it by path (invisible to the layer-1 import graph); it reuses quote_quality_survey's helpers by import, so that tool's cells ride along."
+    },
+    {
+      "path_prefix_or_glob": "tools/s2_score.py",
+      "test_globs": [
+        "tests/test_s2_score_4050.py",
+        "tests/test_s2_clause_sheet_4050.py"
+      ],
+      "note": "engram-alpha#4050 S2: scoring script. The cells load it by path (invisible to the layer-1 import graph); their fixtures are built by running s2_clause_sheet, so that tool's cells ride along."
+    },
+    {
+      "path_prefix_or_glob": "tools/s2_clause_check.py",
+      "test_globs": [
+        "tests/test_s2_clause_check_4201.py",
+        "tests/test_s2_score_4050.py",
+        "tests/test_engram_anchoring.py"
+      ],
+      "note": "engram-alpha#4201 S2 phase 1: clause-check harness. The cells load it by path (invisible to the layer-1 import graph); it imports s2_score (loaded by path) and engram_anchoring, so their cells ride along."
     },
     {
       "path_prefix_or_glob": "tools/weakest_load_bearing.py",
@@ -372,6 +412,13 @@
         "tests/test_store_path_precheck_3960.py"
       ],
       "note": "engram-alpha#3921: the ranking core and its owner-read entry layer (flag weakest_load_bearing_reads_via_owner). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the seven registered read templates also tie it to tests/test_engramd_read_scan.py."
+    },
+    {
+      "path_prefix_or_glob": "tools/check_stale_processes.py",
+      "test_globs": [
+        "tests/test_check_stale_processes_3938.py"
+      ],
+      "note": "engram-alpha#3938: the stale long-lived process gate. The test loads the file by path (spec_from_file_location) and runs it as a subprocess for the FIFO cells, invisible to the layer-1 import graph."
     },
     {
       "path_prefix_or_glob": "tools/study_queue.py",
@@ -391,9 +438,17 @@
       "note": "engram-alpha#2652 (tools-7): the one-row read goes through tools/_owner_read.py behind engramd.inspect_raw_reads_via_owner (flag OFF opens the store mode=ro). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the registered read template also ties it to tests/test_engramd_read_scan.py."
     },
     {
+      "path_prefix_or_glob": "tools/backup_remote_repair.py",
+      "test_globs": [
+        "tests/test_backup_remote_repair_4205.py"
+      ],
+      "note": "#4205: explicit repair verb for a diverged off-disk backup remote. The test runs the file as a subprocess, invisible to the layer-1 import graph. No store reads, so no registered read template."
+    },
+    {
       "path_prefix_or_glob": "tools/dream_pickup.py",
       "test_globs": [
-        "tests/test_dream_pickup_3919.py"
+        "tests/test_dream_pickup_3919.py",
+        "tests/test_study_queue.py"
       ],
       "note": "#3919 M6: the seat-side writer of the dream record's Morning pickup section. The test runs the file as a subprocess (and loads it by path), invisible to the layer-1 import graph. No store reads, so no registered read template."
     },
@@ -424,7 +479,8 @@
       "path_prefix_or_glob": "tools/backup_knowledge_db.py",
       "test_globs": [
         "tests/test_backup_knowledge_db.py",
-        "tests/test_backup_owner_snapshot_3872.py"
+        "tests/test_backup_owner_snapshot_3872.py",
+        "tests/test_store_path_precheck_3962b.py"
       ],
       "note": "engram-alpha#3872 (U15): flag ON (engramd.backup_reads_via_owner) reads one owner snapshot; flag OFF is test_backup_knowledge_db.py unedited."
     },
@@ -438,14 +494,24 @@
     {
       "path_prefix_or_glob": "tools/engramd_a6_latency.py",
       "test_globs": [
-        "tests/test_engramd_a6_latency.py"
+        "tests/test_engramd_a6_latency.py",
+        "tests/test_store_path_precheck_3962c.py"
       ],
       "note": "engram-alpha#3197 (U4d): loaded by tests/test_engramd_a6_latency.py via importlib (file path), so it is invisible to the layer-1 import graph."
     },
     {
+      "path_prefix_or_glob": "tools/engramd_lockwait_report.py",
+      "test_globs": [
+        "tests/test_engramd_lockwait_4234.py"
+      ],
+      "note": "engram-alpha#4234: loaded by tests/test_engramd_lockwait_4234.py via importlib (file path), so it is invisible to the layer-1 import graph."
+    },
+    {
       "path_prefix_or_glob": "tools/engramd_stage_profile.py",
       "test_globs": [
-        "tests/test_engramd_stage_profile_3678.py"
+        "tests/test_engramd_stage_profile_3678.py",
+        "tests/test_store_path_precheck_3962c.py",
+        "tests/test_sys_path_hygiene_2923.py"
       ],
       "note": "engram-alpha#3678 (U7): loaded by tests/test_engramd_stage_profile_3678.py via importlib (file path), so it is invisible to the layer-1 import graph."
     },
@@ -462,6 +528,16 @@
         "tests/test_config_schema.py",
         "tests/test_3898_embedding_device.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/lesson-pattern-audit.py",
+      "test_globs": [
+        "tests/test_lesson_pattern_audit.py",
+        "tests/test_lesson_pattern_audit_shipped_3941.py",
+        "tests/test_lesson_pattern_audit_owner_read_3941.py",
+        "tests/test_lesson_pattern_audit_sleep_step_3941.py"
+      ],
+      "note": "engram-alpha#3941: the tool ships (essential; its recurring caller is engram-sleep) and reads the store through the owner-read helper (flag lesson_pattern_audit_reads_via_owner), and engram-sleep Step 3.95 runs it (the sleep-step test extracts and runs that block). The tests load it by path and run it as a subprocess, invisible to the layer-1 import graph; the registered read template also ties it to tests/test_engramd_read_scan.py."
     },
     {
       "path_prefix_or_glob": "tools/engram-regenerate-embeddings.py",
@@ -488,6 +564,14 @@
         "tests/test_tools_engram_home_3863.py"
       ],
       "note": "engram-alpha#3005: the loop wake-prompt builder and, from round 1, the --rearm-delay helper (the single writer of next_due_at). It had no entry before round 2 (pre-existing gap). It is a tools/ file with no repo-root symlink yet, so _shipped_path_candidates de-prefixes a change to src/engram/tools/loop_prompt.py to this bare path."
+    },
+    {
+      "path_prefix_or_glob": "tools/loop_marker_set.py",
+      "test_globs": [
+        "tests/test_loop_marker_set_4025.py",
+        "tests/test_prose_home_sweep_3863.py"
+      ],
+      "note": "engram-alpha#4025: the one writer of a loop-marker key (the engram-loop skill's cadence and state recipes call it), built on engram_config_io.atomic_write_text so the marker keeps its mode and group. test_prose_home_sweep_3863.py runs the skill's recipes as printed against it. It is a tools/ file with no repo-root symlink yet, so _shipped_path_candidates de-prefixes a change to src/engram/tools/loop_marker_set.py to this bare path."
     },
     {
       "path_prefix_or_glob": "tools/_status_derive.py",
@@ -559,7 +643,8 @@
     {
       "path_prefix_or_glob": "tools/perf/*.py",
       "test_globs": [
-        "tests/test_replay_bench.py"
+        "tests/test_replay_bench.py",
+        "tests/test_store_path_precheck_3962c.py"
       ],
       "note": "tools/perf/ is the first subdirectory under tools/ \u2014 _discover_repo_modules() only globs tools/*.py non-recursively, so modules here aren't registered as repo module stems and the test file's bare `import replay_bench`/`import trace_from_telemetry` (via manual sys.path insertion, not `from tools.perf.X import`) never lands in the import graph either. Without this entry, an edit to either file gets a fast-CI subset that silently omits its own test, with no fail-open backstop (found by the reviewer-fairy on PR #1676)."
     },
@@ -644,8 +729,19 @@
     {
       "path_prefix_or_glob": "tools/cites_step3.py",
       "test_globs": [
-        "tests/test_cites_step3_2243.py"
+        "tests/test_cites_step3_2243.py",
+        "tests/test_store_path_precheck_3962b.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/engram-pkg/engram-pkg",
+      "test_globs": [
+        "tests/test_engram_pkg_render.py",
+        "tests/test_scope_export.py",
+        "tests/test_engram_pkg_json_payload.py",
+        "tests/test_store_path_precheck_3962b.py"
+      ],
+      "note": "engram-alpha#3962 PR-B: scope-export and render classify the store path with tools/_owner_read.check_store_path before opening it."
     },
     {
       "path_prefix_or_glob": "tools/build-plugin.sh",
@@ -662,6 +758,18 @@
       "path_prefix_or_glob": "tools/install-local-marketplace.sh",
       "test_globs": [
         "tests/test_install_local_marketplace.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/install_selfcheck.py",
+      "test_globs": [
+        "tests/test_install_selfcheck.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/install.sh",
+      "test_globs": [
+        "tests/test_install_sh_4097.py"
       ]
     },
     {
@@ -709,6 +817,13 @@
       "note": "engram-alpha#3863 PR 3b: LOG_DIR and PYTHON resolve from ENGRAM_HOME (the assignments are extracted and evaluated; the CI sim is never run). Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
     },
     {
+      "path_prefix_or_glob": "tools/seat-run.sh",
+      "test_globs": [
+        "tests/test_seat_run_tool.py"
+      ],
+      "note": "engram-alpha#3974: contract cells C1-C8 run the script under /bin/bash against scratch git repos. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
       "path_prefix_or_glob": "tools/run-all-tests.sh",
       "test_globs": [
         "tests/test_shell_engram_home_3863.py"
@@ -721,6 +836,15 @@
         "tests/test_shell_engram_home_3863.py"
       ],
       "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; guard asserts the file names ENGRAM_HOME and holds no .engram string outside a docstring. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "engram_home_resolver.py",
+      "test_globs": [
+        "tests/test_engram_home_parity_3863.py",
+        "tests/test_relative_engram_home_step2_3863.py",
+        "tests/test_raw_home_read_gate_3863.py"
+      ],
+      "note": "engram-alpha#3863 step 2: the runtime-layer ENGRAM_HOME resolver. Pinned AST-identical to the canonical body by the parity test (the LAYERS table loads it by path, so the layer-1 import graph cannot see that edge); the step-2 test is its behaviour; the gate test pins it as an exempt resolver."
     },
     {
       "path_prefix_or_glob": "engram_tasks.py",

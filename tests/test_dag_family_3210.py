@@ -60,7 +60,8 @@ def _mem():
     conn.row_factory = sqlite3.Row
     conn.execute(
         "CREATE TABLE nodes (id TEXT PRIMARY KEY, type TEXT NOT NULL, "
-        "is_current INTEGER DEFAULT 1, superseded_by TEXT, created_at TEXT)"
+        "is_current INTEGER DEFAULT 1, status TEXT DEFAULT 'active', "
+        "superseded_by TEXT, created_at TEXT)"
     )
     conn.execute(
         "CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -331,7 +332,7 @@ def _ob(obs):
     _SEQ[0] += 1
     r = json.loads(obs._add_observation_impl(
         url=f"https://example.com/s3210-{_SEQ[0]}", title=f"S{_SEQ[0]}",
-        quoted_text="Base.", interpretation="Base.", claim="Base observation.",
+        quoted_text="Base. in the cited source", interpretation="Base.", claim="Base observation.",
         quote_type="official_statement"))
     assert "error" not in r, r
     return r["observation_id"]
@@ -440,7 +441,7 @@ def _retype(server, s, t, old, new):
 def _obs(server, claim, n):
     r = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "url": f"https://example.com/r3210-{n}", "title": "T",
-        "quoted_text": "X says Y.", "interpretation": "X claims Y.",
+        "quoted_text": "X says Y. in the cited source", "interpretation": "X claims Y.",
         "claim": claim, "quote_type": "hard_data"})))
     assert "error" not in r, r
     return r["observation_id"]
@@ -507,9 +508,11 @@ def test_population_counts_report_dropped_edges():
     _e(conn, "n", "o", "derives_from")       # resolves to n -> n: manufactured
     _e(conn, "n", "dead", "derives_from")    # dead-ended chain
     g = dagconf.check_dag_conformance(conn)["families"]["grounding"]
+    # #3542: the gate counts current edges only -- both edges touch a
+    # non-current endpoint (o superseded, dead retired), so both are dropped as
+    # provenance; the resolution-specific counters no longer exist on the gate.
     assert g["raw_edges"] == 2 and g["edges"] == 0, g
-    assert g["dropped_manufactured_self_loops"] == 1, g
-    assert g["dropped_dead_ended"] == 1, g
+    assert g["dropped_non_current"] == 2, g
 
 
 # ---------------------------------------------------------------------------

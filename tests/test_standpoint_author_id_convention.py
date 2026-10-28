@@ -78,7 +78,7 @@ def _make_observation(server, standpoint_author_id=None):
     payload = {
         "url": "https://example.com/article",
         "title": "Example Article",
-        "quoted_text": "X says Y",
+        "quoted_text": "X says Y in the cited source",
         "interpretation": "X claims that Y is true",
         "claim": "Y is true according to X",
         "quote_type": "attributed_analysis",

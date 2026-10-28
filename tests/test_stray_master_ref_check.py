@@ -209,12 +209,12 @@ def test_scope_excludes_docs(tmp_path):
     (tmp_path / ".github" / "workflows").mkdir(parents=True)
     (tmp_path / "src" / "engram" / "tools").mkdir(parents=True)
     (tmp_path / "src" / "forum" / "deploy").mkdir(parents=True)
-    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "internal").mkdir(parents=True)
 
     (tmp_path / ".github" / "workflows" / "x.yml").write_text("branches: [master]\n")
     (tmp_path / "src" / "engram" / "tools" / "x.sh").write_text("git checkout master\n")
     (tmp_path / "src" / "forum" / "deploy" / "x.sh").write_text("git checkout master\n")
-    (tmp_path / "docs" / "RELEASING.md").write_text("dev->master history, master, master\n")
+    (tmp_path / "docs" / "internal" / "RELEASING.md").write_text("dev->master history, master, master\n")
 
     found = find_target_files(tmp_path)
     rels = sorted(str(f.relative_to(tmp_path)) for f in found)

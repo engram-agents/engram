@@ -10,7 +10,7 @@ only thing that speaks its wire protocol, and even that isn't wired to any
 real caller yet -- see `tests/test_engramd_owner.py` for the fixtures that
 exercise this module directly, standing in for the not-yet-built callers.
 
-Full design context: docs/2652-engrammanager-design.md SS3 ("The ownership
+Full design context: docs/internal/2652-engrammanager-design.md SS3 ("The ownership
 shape") and SS5 ("Rider 2 -- what a caller sees when the owner is down").
 
 ## What this deliberately is NOT (out of scope for this build)
@@ -21,7 +21,7 @@ shape") and SS5 ("Rider 2 -- what a caller sees when the owner is down").
 - Typed writes of any kind -- no manager, no domain engines, no cascade.
   (Historical U3 scope. #3822 / U11 added the owner's first write, the typed
   `use_reward` op: see "The owner's first write" below `_use_reward_param_refusal`
-  and docs/2652-migration-ledger.md section 6. Still no generic write verb.)
+  and docs/internal/2652-migration-ledger.md section 6. Still no generic write verb.)
 - Wiring any real caller (hooks, the MCP server, viz, ...) to this owner.
   It exists standalone.
 
@@ -32,7 +32,7 @@ shape (newline-delimited JSON over AF_UNIX/SOCK_STREAM; two response
 states, `ok`/`rejected` -- `unavailable` is purely the CLIENT's own
 conclusion and is never sent by this module). This module calls
 `engramd_client.check_contract_version()` directly on every request rather
-than reimplementing version comparison (docs/2652-engrammanager-design.md
+than reimplementing version comparison (docs/internal/2652-engrammanager-design.md
 SS5.3), and reuses `engramd_client.CONTRACT_VERSION` and
 `engramd_client.DEFAULT_SOCKET_NAME` as the single shared source of truth
 for those values -- see "Socket path resolution" below for why this
@@ -93,7 +93,7 @@ duplicated here as a second string literal.
 
 Contract item 8 requires an end-to-end deadline per request, measured from
 ACCEPT, not per-recv -- the mirror image of the bug U1's own round 5 fixed
-client-side (docs/2652-engrammanager-design.md SS5.1: "a per-operation
+client-side (docs/internal/2652-engrammanager-design.md SS5.1: "a per-operation
 timeout restarts on every byte, so a peer that trickles data never trips
 it"). `_read_request_line()` below computes `deadline` once per
 connection (at accept) and recomputes `remaining = deadline -
@@ -164,7 +164,7 @@ takes this lock -- must then fail/hang).
 
 ## Two connections, not one (#2652 Phase-1 Unit 4b, issue #3195)
 
-Per Mira's ruling in revision 5 of docs/2652-security-slice-design.md SS3.1
+Per Mira's ruling in revision 5 of docs/internal/2652-security-slice-design.md SS3.1
 ("(b), two connections inside the one owner process"), this module holds
 TWO sqlite3 connections against the same `store_path`, never one:
 
@@ -181,7 +181,7 @@ TWO sqlite3 connections against the same `store_path`, never one:
   -- that this authorizer exists "for testability" -- which Mira's
   review of PR #3221 measured false: removing the `set_authorizer` call
   entirely leaves every test green. See
-  docs/2652-security-slice-design.md SS3.1 revision 6.)
+  docs/internal/2652-security-slice-design.md SS3.1 revision 6.)
 - `self._client_read_conn` -- the permanently restrictive connection.
   Its authorizer (`_client_read_authorizer` below) is the measured
   baseline floor (SS3.1, SS4) and is set ONCE at connection-open time in
@@ -234,6 +234,7 @@ timer or module constant in its place.
 
 from __future__ import annotations
 
+import bisect
 import copy
 import errno
 import hashlib
@@ -257,15 +258,25 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 
+import engram_home_resolver
 import engram_pidfile
 import engram_moment_cursor as emc
 import engram_restamp as er
 import engram_walguard
 import engramd_client as ec
 import engramd_read_registry as rr
-from engram_regular_io import NotRegularFile, describe_file_kind, read_regular_text, write_pidfile
+from engram_regular_io import (
+    NotRegularFile,
+    StoreNotAStore,
+    StoreUncheckable,
+    check_store_path,
+    describe_file_kind,
+    read_regular_text,
+    write_pidfile,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -286,8 +297,12 @@ EXIT_DISPLACED = 3
 
 # #3768, #3753: exit status of an owner that REFUSED TO START because its pidfile path
 # or its store path exists and is not a regular file (FIFO, symlink, directory,
-# socket, device, ...). Retrying cannot fix a planted path, so the unit does not
-# restart it. For the pidfile it is its own code, not the surface daemon's
+# socket, device, ...), or (#3882) the store-maintenance lock directory
+# (`<store>.maint.lockdir`) is unusable: a planted symlink or non-directory, a foreign
+# owner, a mode that cannot be tightened, permission denied or a read-only filesystem creating it, or
+# any other unrecognised error (fail closed; the message names the errno). A resource error
+# (EMFILE, ENFILE, ENOSPC, ENOLCK, EAGAIN on create/open) is NOT this: it is exit 6.
+# Retrying cannot fix a planted path, so the unit does not restart it. For the pidfile it is its own code, not the surface daemon's
 # run-without-pidfile fallback: the owner's pidfile carries liveness, so an owner
 # without one reads as down while it holds the socket. main() returns it (nothing
 # was bound or left behind).
@@ -303,6 +318,16 @@ EXIT_PATH_NOT_REGULAR = 4
 # code must not share a value with the interpreter's own failure codes (1 and 2); 1 stays
 # only as OwnerAlreadyRunning's historic code (main() returns the literal).
 EXIT_STORE_BEHIND_SCHEMA = 5
+# #3882 (U19 of #2652): exit status of an owner that refused to start because the store-maintenance
+# lock (`<store>.maint.lockdir`) is held by something other than an owner: an offline repair tool is
+# running against the store, or the lock directory hit a transient resource error (the retryable errno
+# set in engram_core); a lock directory that is unusable for a cause a retry cannot clear is exit 4, above. Distinct from
+# 0/1/3/4/5 so a supervisor and the log can tell it apart. Non-zero and not in RestartPreventExitStatus, so
+# Restart=on-failure / launchd retry it with back-off: the repair ends, the lock drops, the owner starts.
+# A held lock whose holder file says `owner` is OwnerAlreadyRunning (exit 1) instead; a holder that has
+# the lock but has not written its holder file yet reads as unreadable and gets 6, and the retry then
+# sees the role (the flock stays the only exclusion; the file only chooses the message and the code).
+EXIT_STORE_MAINTENANCE = 6
 
 # #3240 item 2: methods that never touch the store and so are exempt from the
 # displacement self-check. Every OTHER registered method is guarded by
@@ -513,7 +538,7 @@ CHAIN_RESULT_MAX_BYTES = MAX_READ_RESPONSE_BYTES
 
 # #3741: the typed `confidence_by_type` method. At most this many modes per request (the
 # four window modes of engram_stats); a longer list is REFUSED by name, never clamped
-# (docs/2652-security-slice-design.md section 3.6, typed-op input bounds).
+# (docs/internal/2652-security-slice-design.md section 3.6, typed-op input bounds).
 CBT_MAX_MODES = 4
 # The mode names (equal to engram_stats.STATS_MODES; a cell pins the equality). Held here so
 # validation, which runs before any runtime import, needs no import.
@@ -639,6 +664,15 @@ class OwnerAlreadyRunning(RuntimeError):
     `_bind_socket_or_raise()` below."""
 
 
+class OwnerRestartRefused(RuntimeError):
+    """Raised by EngramdOwner.start() on an object whose start() has already run (#4068): one object, one
+    lifetime, whether that start finished, was stopped, or raised partway. A CALLER error (a programming
+    mistake), deliberately NOT in `_REFUSAL_EXIT`: it is not an operator-facing environment condition,
+    main() never restarts an owner, and an exit code for it would hand an operator a condition they
+    cannot fix. Raised before anything is touched (no lock, connection, socket or pidfile). To start
+    again, build a new EngramdOwner."""
+
+
 class OwnerPermissionUnsupported(RuntimeError):
     """Raised by EngramdOwner.start() when this seat's platform/tooling
     cannot support the socket permission layer (#3194, design doc §2.2's
@@ -682,6 +716,17 @@ class OwnerPidfileNotRegular(RuntimeError):
     code (EXIT_PATH_NOT_REGULAR), because the owner cannot fall back to
     running without a pidfile: the pidfile carries its liveness, and an owner
     without one reads as down while it holds the socket."""
+
+
+class OwnerPidfileNotWritable(RuntimeError):
+    """Raised by EngramdOwner.start() (and `--preflight`) when the pidfile
+    path (<ENGRAM_HOME>/engramd.pid) holds a regular file this user cannot
+    write, or holds nothing and its directory is not writable (#4068):
+    typically a pidfile left behind by another user, or one whose mode was
+    changed. Exit EXIT_PATH_NOT_REGULAR (4), not retried, for
+    the same reason as OwnerPidfileNotRegular: retrying cannot fix it, and an
+    uncaught PermissionError here was a traceback and a respawn every
+    throttle interval (#3709). The text names the path and the remedy."""
 
 
 class OwnerSocketPathTooLong(RuntimeError):
@@ -754,6 +799,24 @@ class OwnerStoreBehindSchema(RuntimeError):
     unchanged)."""
 
 
+class OwnerStoreMaintenance(RuntimeError):
+    """Raised by EngramdOwner.start() when the store-maintenance lock (#3882) is held by something other
+    than an owner (an offline repair tool; or its holder file is unreadable), or (round 3) when taking the
+    lock hit a retryable resource errno (engram_core.STORE_MAINT_RETRYABLE_ERRNOS; the message names it).
+    Raised before the store is probed, so nothing is created, bound or written. main() maps it to EXIT_STORE_MAINTENANCE (6), which
+    the supervisor retries with back-off. A distinct class from OwnerAlreadyRunning (another OWNER holds
+    the store) and from OwnerStoreLockDirUnusable (the lock directory itself cannot be used)."""
+
+
+class OwnerStoreLockDirUnusable(RuntimeError):
+    """Raised by EngramdOwner.start() when the store-maintenance lock directory (`<store>.maint.lockdir`)
+    cannot be used for a cause a retry cannot clear: a planted symlink or non-directory at the name, a
+    foreign owner, a mode that cannot be tightened, permission denied or a read-only filesystem creating
+    it, or any other unrecognised error (the message names the errno). A retryable resource errno is
+    OwnerStoreMaintenance (6) instead. Nothing is held; retrying cannot fix these. main() maps it to EXIT_PATH_NOT_REGULAR (4), which the unit does not restart; the
+    message carries the lock directory's path. A held lock is OwnerStoreMaintenance (6) instead."""
+
+
 class OwnerStorePathNotRegular(RuntimeError):
     """Raised when the store path (<ENGRAM_HOME>/knowledge.db) exists and is not
     a regular file (#3753): a FIFO (a read-only open would wait for a writer
@@ -778,18 +841,22 @@ def _refuse_non_regular_store(store_path) -> None:
     #3785). The ONE store-path predicate: `_connect_store_ro` (start) and
     `check_start_refusals` (`--preflight`) both call it.
 
-    `os.stat` FOLLOWS symlinks and does not block on a FIFO: a symlink to a regular file is
-    accepted, a symlink to a FIFO is refused. A missing or unstattable path passes (it is not
-    a blocking object; the caller reports it). Pure: one stat, no mutation."""
+    Classified by the core `check_store_path` (#3962): `lstat` then `stat`, which FOLLOWS
+    symlinks and does not block on a FIFO. A symlink to a regular file is accepted, a symlink
+    to a FIFO is refused. A missing or uncheckable path (an unsearchable parent, ENOTDIR, a
+    dangling link, a symlink loop) passes (it is not a blocking object; the caller reports it).
+    There is no `resolve()`: on Python <= 3.12 it raised RuntimeError on a symlink loop, which
+    escaped as a traceback at owner start; a loop now passes like every other uncheckable path
+    (as it already did on 3.14). Pure: no mutation."""
     try:
-        st = os.stat(Path(store_path).resolve())
-    except OSError:
-        return
-    if not stat.S_ISREG(st.st_mode):
+        check_store_path(store_path)
+    except StoreNotAStore as exc:
         raise OwnerStorePathNotRegular(
-            f"the store path {store_path} is not a regular file (it is a {_file_kind(st.st_mode)}); "
+            f"the store path {store_path} is not a regular file (it is a {_file_kind(exc.st_mode)}); "
             f"refusing to open it: a read-only open of a FIFO would block forever"
-        )
+        ) from None
+    except (FileNotFoundError, StoreUncheckable):
+        return
 
 
 def _connect_store_ro(store_path) -> "sqlite3.Connection":
@@ -803,7 +870,7 @@ def _connect_store_ro(store_path) -> "sqlite3.Connection":
     open here was read-write, which fails at once on a FIFO). A missing path is left to
     the caller's own 'no knowledge.db' branch (sqlite then fails fast on it)."""
     _refuse_non_regular_store(store_path)
-    return sqlite3.connect(Path(store_path).resolve().as_uri() + "?mode=ro", uri=True)
+    return sqlite3.connect(Path(store_path).absolute().as_uri() + "?mode=ro", uri=True)
 
 
 def _require_store_schema_current(store_path) -> None:
@@ -961,24 +1028,24 @@ class _FinalizeOutcome:
 
 
 def _resolve_engram_home(engram_home: str | Path | None) -> Path:
-    """Always returns an ABSOLUTE path (#3152 item 2, mirroring
-    engram-surface-daemon.py's own gh#2695 hardening -- see that module's
-    `_resolve_engram_home()` docstring). A relative ENGRAM_HOME from two
-    different launch CWDs would otherwise bind two different sockets --
-    "one owner per seat" (contract item 1) fails silently, since the
-    liveness/staleness check in start() compares socket PATHS, not
-    resolved identities.
+    """Returns an ABSOLUTE path (#3152 item 2, mirroring engram-surface-daemon.py's own gh#2695 hardening --
+    see that module's `_resolve_engram_home()` docstring), by two different rules (#3863 step 2):
 
-    `os.path.abspath()`, not `Path.resolve()`, deliberately -- same
-    reasoning as the surface daemon: it makes the path absolute relative
-    to cwd WITHOUT resolving symlinks. An intermediate symlinked
-    ENGRAM_HOME component keeps resolving the way it always has; using
-    `.resolve()` would be a second, unrelated behavior change (following
-    symlinks) bundled into this fix."""
+      * the ENVIRONMENT branch (`engram_home` is None) REFUSES a RELATIVE ENGRAM_HOME: it raises ValueError
+        naming the value, via engram_home_resolver.engram_home(). A relative value from two different launch
+        CWDs would bind two different sockets -- "one owner per seat" (contract item 1) fails silently, since
+        the liveness/staleness check in start() compares socket PATHS, not resolved identities -- and
+        anchoring it at the cwd (abspath) still gives two sockets, so refusal is the only fix;
+      * the EXPLICIT-ARGUMENT branch is a programmatic caller's own path and is unchanged: it is made
+        absolute against the cwd with `os.path.abspath()`, not `Path.resolve()`, deliberately (it does NOT
+        resolve symlinks, so an intermediate symlinked ENGRAM_HOME component keeps resolving the way it always
+        has; `.resolve()` would be a second, unrelated behavior change)."""
     if engram_home is not None:
         return Path(os.path.abspath(str(engram_home)))
-    raw = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-    return Path(os.path.abspath(raw))
+    # #3863 step 2 (the rulings: engram_home_resolver's docstring): the env branch REFUSES a relative value (a
+    # ValueError naming it) instead of anchoring it at the cwd: "one owner per seat" is met only by refusal,
+    # since abspath still gives two sockets for two launch cwds.
+    return engram_home_resolver.engram_home()
 
 
 def _rejected_wire(rejected: ec.Rejected) -> dict:
@@ -998,7 +1065,7 @@ def _rejected_wire(rejected: ec.Rejected) -> dict:
 
 # ---------------------------------------------------------------------------
 # The client-read connection's authorizer floor (#2652 Phase-1 Unit 4b,
-# issue #3195) -- docs/2652-security-slice-design.md SS3.1, SS4.
+# issue #3195) -- docs/internal/2652-security-slice-design.md SS3.1, SS4.
 # ---------------------------------------------------------------------------
 
 # Baseline allowlist, DERIVED by measurement rather than copied verbatim
@@ -1044,7 +1111,7 @@ CLIENT_READ_PRAGMA_ALLOWLIST = frozenset({"user_version", "data_version"})
 def _client_read_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
     """The restrictive floor -- set ONCE on `_client_read_conn` at
     connection-open time in `start()` and NEVER swapped, toggled, or reset
-    for any operation (docs/2652-security-slice-design.md SS3.1, Mira's
+    for any operation (docs/internal/2652-security-slice-design.md SS3.1, Mira's
     revision-5 ruling: "no authorizer swapping"). Allows the measured
     baseline read action set; denies everything else, with two explicit,
     measured exceptions for PRAGMA and TRANSACTION below."""
@@ -1052,7 +1119,7 @@ def _client_read_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
         return sqlite3.SQLITE_OK
 
     if action_code == sqlite3.SQLITE_PRAGMA:
-        # P16 (docs/2652-security-slice-design.md SS4, quoted in the fairy
+        # P16 (docs/internal/2652-security-slice-design.md SS4, quoted in the fairy
         # spec): a naive "allow by name at arg1" lets a PRAGMA WRITE
         # through, because arg1 carries the pragma's NAME for both a read
         # and a write -- only arg2 (the assigned value) distinguishes
@@ -1073,7 +1140,7 @@ def _client_read_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
         # with the owner-internal connection allowing SQLITE_TRANSACTION
         # for snapshot()'s BEGIN DEFERRED read-mark -- that read-mark
         # never existed on this build's snapshot() RPC; see
-        # docs/2652-security-slice-design.md SS3.1 revision 6.)
+        # docs/internal/2652-security-slice-design.md SS3.1 revision 6.)
         return sqlite3.SQLITE_DENY
 
     return sqlite3.SQLITE_DENY
@@ -1095,7 +1162,7 @@ def _owner_internal_authorizer(action_code, arg1, arg2, db_name, trigger_or_view
     docstring claimed the opposite -- that this authorizer was needed to
     make test 17 falsifiable -- which was true only under the design
     doc's now-retracted BEGIN/READ/COMMIT requirement; see
-    docs/2652-security-slice-design.md SS3.1 revision 6.)"""
+    docs/internal/2652-security-slice-design.md SS3.1 revision 6.)"""
     return sqlite3.SQLITE_OK
 
 
@@ -1143,7 +1210,7 @@ def _arm_read_deadline(
     stored timer or a module constant: this is designed to accept
     whatever deadline the eventual client-dispatch path passes in (U4a's
     end-to-end request deadline, issue #3194 / PR #3201, once wired --
-    see docs/2652-security-slice-design.md SS4's own wording: "the
+    see docs/internal/2652-security-slice-design.md SS4's own wording: "the
     progress_handler must stop against the SAME request deadline, passed
     in -- not an independent timer or constant"). No caller exists yet in
     this build (no operation in `_dispatch()` reaches `_client_read_conn`
@@ -1165,12 +1232,34 @@ def _arm_read_deadline(
 READ_TEMPLATES_FILENAME = "engramd_read_templates.json"
 
 
+# Inline copy, not an import: no existing tree-root module can host it (engram_core is imported lazily on purpose, see _engram_core), and a new one is a new shippable for one caller.
+# Pinned identical to every other copy by tests/test_bounded_sibling_lookups_3983.py.
+def _bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 def _find_read_templates_path() -> "Path | None":
     """Locate the committed template list WITHOUT assuming the source
     layout (project CLAUDE.md, "Plugin build restructures code paths"):
     the file BESIDE this module first, then `$CLAUDE_PLUGIN_ROOT`, then the
-    nearest ancestor of this module that actually contains the file -- never
-    a fixed `parents[N]`. The data file ships beside the module in both the
+    nearest ancestor of this module that actually contains the file, stopping
+    at this module's own tree root (#3983) -- never a fixed `parents[N]`. The data file ships beside the module in both the
     source and the flattened plugin layouts, so a stale CLAUDE_PLUGIN_ROOT
     must not override it. None if it cannot be found (the registry is then
     EMPTY: everything refused)."""
@@ -1183,7 +1272,7 @@ def _find_read_templates_path() -> "Path | None":
         if cand.is_file():
             return cand
     here = Path(__file__).resolve()
-    for d in here.parents:
+    for d in _bounded_parents(here):  # own tree only, never above its root (#3983)
         cand = d / READ_TEMPLATES_FILENAME
         if cand.is_file():
             return cand
@@ -1793,7 +1882,7 @@ def _acl_leftovers(entries: list[str]) -> list[str]:
 # The owner's first write: the typed `use_reward` op (#3822, U11 of #2652, Stage A)
 # ---------------------------------------------------------------------------
 #
-# docs/2652-engrammanager-design.md SS3.1 (typed writes, never a generic write_sql) and SS5.4
+# docs/internal/2652-engrammanager-design.md SS3.1 (typed writes, never a generic write_sql) and SS5.4
 # (read-back acknowledgement + idempotency key). The client supplies ONLY {node_ids, action,
 # request_id}: no alpha, no config path, no value. alpha is owner-side
 # (`engram_restamp.USE_ALPHA[action]`); the memory config is the OWNER'S OWN
@@ -1828,13 +1917,14 @@ OWNER_WRITE_LOCK_WAIT = 1.0
 USE_REWARD_MONOTONE_FLOOR = 0.99  # ids at or above this utility are exempt from the monotone read-back invariant
 USE_REWARD_BUSY_RETRY_SLEEP = 0.02  # seconds between attempts while a direct writer holds the store's write lock
 
-# The triggers on `nodes` in the real schema, MEASURED (7), pinned against sqlite_master by a test: a newly
+# The triggers on `nodes` in the real schema, MEASURED (9), pinned against sqlite_master by a test: a newly
 # added trigger fails that cell loudly. None of them fires on UPDATE of utility_score / importance_score /
 # recall_turn (each is AFTER INSERT / AFTER DELETE / BEFORE UPDATE OF metadata / AFTER UPDATE OF status,
 # is_current, claim-and-text columns), so the set whose statements the op admits BY NAME is empty.
 USE_REWARD_NODES_TRIGGERS_PINNED = frozenset({
     "nodes_fts_insert", "nodes_fts_delete", "nodes_retract_remove_from_fts", "nodes_fts_supersede_remove",
     "nodes_fts_rewrite_resync", "nodes_metadata_json_guard_insert", "nodes_metadata_json_guard_update",
+    "nodes_text_nul_guard_insert", "nodes_text_nul_guard_update",  # #3765
 })
 USE_REWARD_ADMITTED_TRIGGERS: frozenset = frozenset()
 
@@ -2002,7 +2092,7 @@ FILL_EMBEDDINGS_MAX_ITEMS = 50  # per call; enforced before any SQL
 FILL_EMBEDDINGS_DIM = 384
 FILL_EMBEDDINGS_VEC_SAVEPOINT = "engram_fill_vec"  # the vec mirror's own SAVEPOINT: a vec failure never poisons the fill
 
-# MEASURED (authorizer-recorded over real runs on the real schema, which carries the seven pinned `nodes` triggers):
+# MEASURED (authorizer-recorded over real runs on the real schema, which carries the nine pinned `nodes` triggers):
 # NO trigger or view fires on `UPDATE nodes SET embedding` (every trigger on `nodes` is on metadata / status /
 # is_current / claim-and-text columns), and none fires during the FTS rebuild or the restore-flag writes (the finish op
 # never writes `nodes`). So the set of triggers whose statements either op admits BY NAME is empty, pinned against
@@ -2369,11 +2459,356 @@ def _use_reward_param_refusal(params) -> "dict | None":
     return None
 
 
+# ---------------------------------------------------------------------------
+# #4234 (part of #3740): per-day read-lock wait counters.
+#
+# The owner serialises client reads on `_client_read_lock`; seats deciding whether to route
+# lesson-tripwire reads through the owner pay that cost only when reads actually queue. These
+# counters measure how often they do, per request family, in a bounded per-UTC-day rollup
+# (`lockwait-YYYY-MM-DD.json` in the run dir) read by tools/engramd_lockwait_report.py.
+#
+# Zero cost on the reply path: the request thread only increments a handful of in-memory
+# integers under a tiny private lock. The file is written by a background daemon thread (at
+# most once a minute) and on stop(); never by a request thread.
+# ---------------------------------------------------------------------------
+
+#: A read that waited longer than this many ms in the acquire is a "waited read".
+LOCKWAIT_WAITED_THRESHOLD_MS = 1.0
+#: Fixed upper edges (ms) of the waited-read histogram; a value goes in the first bucket whose edge is >= it.
+LOCKWAIT_BUCKET_EDGES_MS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, math.inf)
+#: Seconds between background flushes of the rollup file.
+LOCKWAIT_FLUSH_INTERVAL_S = 60.0
+LOCKWAIT_SCHEMA = 1
+LOCKWAIT_OTHER_FAMILY = "other"
+#: The fixed site-file -> family table. Any file not listed maps to its stem with `-` replaced by `_`.
+LOCKWAIT_FAMILY_BY_FILE = {
+    "engram-lesson-tripwire-hook.py": "tripwire",
+    "engram-surface-hook.py": "surface",
+    "engram-session-start-hook.py": "session_start",
+    "engram_idf.py": "idf",
+}
+
+
+def _lockwait_edge_key(edge) -> str:
+    return "inf" if edge == math.inf else str(int(edge))
+
+
+LOCKWAIT_EDGE_KEYS = tuple(_lockwait_edge_key(e) for e in LOCKWAIT_BUCKET_EDGES_MS)
+
+
+def lockwait_family_for_sites(sites) -> str:
+    """The family of one template from its `sites` (`path:function` strings): each site's file basename
+    mapped through LOCKWAIT_FAMILY_BY_FILE (else the stem, `-` -> `_`); several distinct families
+    are joined with `+` in sorted order, never guessed between."""
+    families = set()
+    for site in sites:
+        path = str(site).rsplit(":", 1)[0].replace("\\", "/")
+        base = path.rsplit("/", 1)[-1]
+        family = LOCKWAIT_FAMILY_BY_FILE.get(base)
+        if family is None:
+            family = os.path.splitext(base)[0].replace("-", "_")
+        if family:
+            families.add(family)
+    return "+".join(sorted(families)) if families else LOCKWAIT_OTHER_FAMILY
+
+
+def lockwait_family_map(templates) -> "dict[str, str]":
+    """template key (sha256 of the SQL) -> family, from the committed template entries."""
+    out: dict = {}
+    for entry in templates or ():
+        if not isinstance(entry, dict):
+            continue
+        key, sites = entry.get("key"), entry.get("sites")
+        if isinstance(key, str) and isinstance(sites, list):
+            out[key] = lockwait_family_for_sites(sites)
+    return out
+
+
+def lockwait_family_for_sql(family_map, sql) -> str:
+    """The family of a `read` request: map[template_key(sql)], else `other` (unknown SQL, non-str,
+    unencodable, or no map)."""
+    if not family_map or not isinstance(sql, str):
+        return LOCKWAIT_OTHER_FAMILY
+    try:
+        key = rr.template_key(sql)
+    except UnicodeEncodeError:
+        return LOCKWAIT_OTHER_FAMILY
+    return family_map.get(key, LOCKWAIT_OTHER_FAMILY)
+
+
+def lockwait_bucket_index(wait_ms: float) -> int:
+    """Index of the first bucket whose upper edge is >= wait_ms."""
+    return bisect.bisect_left(LOCKWAIT_BUCKET_EDGES_MS, wait_ms)
+
+
+def lockwait_p95(counts):
+    """Upper edge of the bucket holding the 95th percentile (nearest-rank, ceil(0.95 n)) of the
+    waited reads in `counts` (one count per bucket); None when there are none."""
+    n = sum(counts)
+    if n <= 0:
+        return None
+    rank = (95 * n + 99) // 100
+    running = 0
+    for edge, count in zip(LOCKWAIT_BUCKET_EDGES_MS, counts):
+        running += count
+        if running >= rank:
+            return edge
+    return LOCKWAIT_BUCKET_EDGES_MS[-1]
+
+
+def _lockwait_utc_date() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _lockwait_new_family() -> dict:
+    return {"reads": 0, "waited_reads": 0, "wait_ms_sum": 0.0, "timed_out": 0, "no_time_before_acquire": 0,
+            "hist": [0] * len(LOCKWAIT_BUCKET_EDGES_MS)}
+
+
+def _lockwait_p95_for_doc(p95) -> object:
+    """JSON has no Infinity: the +inf bucket's edge is the string "inf"; a finite edge is an integer."""
+    return None if p95 is None else ("inf" if p95 == math.inf else int(p95))
+
+
+def _lockwait_family_to_doc(fam: dict) -> dict:
+    p95 = lockwait_p95(fam["hist"])
+    return {
+        "reads": fam["reads"], "waited_reads": fam["waited_reads"], "wait_ms_sum": round(fam["wait_ms_sum"], 3),
+        "timed_out": fam["timed_out"], "no_time_before_acquire": fam["no_time_before_acquire"],
+        "wait_hist": dict(zip(LOCKWAIT_EDGE_KEYS, fam["hist"])),
+        "wait_ms_p95": _lockwait_p95_for_doc(p95),
+    }
+
+
+def _lockwait_family_from_doc(doc) -> dict:
+    """Parse one family out of a rollup file; raises ValueError on any shape problem."""
+    if not isinstance(doc, dict):
+        raise ValueError("family entry is not an object")
+    fam = _lockwait_new_family()
+    for name in ("reads", "waited_reads", "timed_out", "no_time_before_acquire"):
+        value = doc.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} is not a non-negative integer")
+        fam[name] = value
+    total = doc.get("wait_ms_sum")
+    if not isinstance(total, (int, float)) or isinstance(total, bool) or total < 0:
+        raise ValueError("wait_ms_sum is not a non-negative number")
+    fam["wait_ms_sum"] = float(total)
+    hist = doc.get("wait_hist")
+    if not isinstance(hist, dict) or set(hist) != set(LOCKWAIT_EDGE_KEYS):
+        raise ValueError("wait_hist does not carry exactly the fixed bucket edges")
+    for i, key in enumerate(LOCKWAIT_EDGE_KEYS):
+        value = hist[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("wait_hist holds a non-integer count")
+        fam["hist"][i] = value
+    return fam
+
+
+class _LockwaitCounters:
+    """Per-UTC-day, per-family read-lock wait counters and their rollup file (#4234).
+
+    `record()` is the only method a request thread calls: it takes the private `_lock` (never
+    `_client_read_lock` or `_owner_lock`) and bumps integers. Everything that touches the file
+    (`flush`, the baseline merge) runs on the background thread or in stop()."""
+
+    def __init__(self, run_dir) -> None:
+        self._run_dir = Path(run_dir)
+        self._family_map: dict = {}
+        self._lock = threading.Lock()        # guards _days / _baselined only
+        self._flush_lock = threading.Lock()  # serialises flushes (thread vs stop)
+        self._days: dict = {}                # "YYYY-MM-DD" -> {family: counters}
+        self._baselined: set = set()
+        self._stop = threading.Event()
+        self._thread: "threading.Thread | None" = None
+        self._log = logging.getLogger("engramd_owner")
+
+    # -- request thread ---------------------------------------------------
+
+    def set_family_map(self, family_map) -> None:
+        self._family_map = dict(family_map or {})
+
+    def family_for_sql(self, sql) -> str:
+        return lockwait_family_for_sql(self._family_map, sql)
+
+    def record(self, family: str, outcome: str, wait_ms: float = 0.0) -> None:
+        """outcome: 'acquired' | 'timed_out' | 'no_time'. The histogram and `wait_ms_sum` cover
+        waited reads only (wait_ms > LOCKWAIT_WAITED_THRESHOLD_MS)."""
+        day = _lockwait_utc_date()
+        with self._lock:
+            fams = self._days.setdefault(day, {})
+            fam = fams.get(family)
+            if fam is None:
+                fam = fams[family] = _lockwait_new_family()
+            if outcome == "no_time":
+                fam["no_time_before_acquire"] += 1
+                return
+            fam["reads"] += 1
+            if outcome == "timed_out":
+                fam["timed_out"] += 1
+            if wait_ms > LOCKWAIT_WAITED_THRESHOLD_MS:
+                fam["waited_reads"] += 1
+                fam["wait_ms_sum"] += wait_ms
+                fam["hist"][lockwait_bucket_index(wait_ms)] += 1
+
+    # -- background thread / stop() ----------------------------------------
+
+    def start(self, interval: float) -> None:
+        """Merge today's existing file (so a corrupt one is set aside at start), then start the
+        daemon flush thread. Never raises."""
+        try:
+            self._baseline(_lockwait_utc_date())
+        except Exception as exc:  # noqa: BLE001 -- a rollup problem never stops the owner
+            self._log.warning("lockwait baseline failed (%s: %s); counting from zero", type(exc).__name__, exc)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, args=(interval,), name="engramd-lockwait-flush", daemon=True)
+        self._thread.start()
+
+    def _loop(self, interval: float) -> None:
+        while not self._stop.wait(interval):
+            self._flush_quietly()
+
+    def stop(self) -> None:
+        """Stop the flush thread and write a final flush. Never raises."""
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=10.0)
+        self._flush_quietly()
+        # A record arriving after this final flush is dropped on purpose: these are rate counters, and
+        # one lost increment at shutdown is not worth an extra flush.
+
+    def _flush_quietly(self) -> None:
+        try:
+            self.flush()
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("lockwait flush failed (%s: %s)", type(exc).__name__, exc)
+
+    def _path(self, day: str) -> Path:
+        return self._run_dir / f"lockwait-{day}.json"
+
+    def _read_existing(self, day: str) -> "dict | None":
+        """The parsed families of an existing valid file for `day`, or None (absent). A file that does
+        not parse, has another schema or other bucket edges is renamed aside (`.corrupt-<ts>`) and
+        None is returned: counting starts at zero."""
+        path = self._path(day)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            self._log.warning("lockwait file %s unreadable (%s); counting from zero", path, exc)
+            return None
+        try:
+            doc = json.loads(text)
+            if not isinstance(doc, dict) or doc.get("schema") != LOCKWAIT_SCHEMA:
+                raise ValueError("schema is not %d" % LOCKWAIT_SCHEMA)
+            if doc.get("bucket_edges_ms") != [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, "inf"]:
+                raise ValueError("other bucket edges")
+            families = doc.get("families")
+            if not isinstance(families, dict):
+                raise ValueError("families is not an object")
+            return {name: _lockwait_family_from_doc(entry) for name, entry in families.items()}
+        except ValueError as exc:  # json.JSONDecodeError is a ValueError
+            aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+            try:
+                os.replace(path, aside)
+            except OSError as rename_exc:
+                self._log.warning("lockwait file %s is unusable (%s) and could not be set aside (%s)", path, exc, rename_exc)
+                return None
+            self._log.warning("lockwait file %s is unusable (%s); renamed to %s, counting from zero", path, exc, aside.name)
+            return None
+
+    def _baseline(self, day: str) -> None:
+        """Merge by addition the file already on disk for `day` into memory (once per day)."""
+        with self._lock:
+            if day in self._baselined:
+                return
+        existing = self._read_existing(day)
+        with self._lock:
+            if day in self._baselined:
+                return
+            self._baselined.add(day)
+            if existing:
+                fams = self._days.setdefault(day, {})
+                for name, old in existing.items():
+                    fam = fams.get(name)
+                    if fam is None:
+                        fams[name] = old
+                        continue
+                    for key in ("reads", "waited_reads", "timed_out", "no_time_before_acquire", "wait_ms_sum"):
+                        fam[key] += old[key]
+                    fam["hist"] = [a + b for a, b in zip(fam["hist"], old["hist"])]
+
+    def flush(self) -> None:
+        """Write every date held in memory (atomic replace, mode 0600); drop a past date once its
+        file is written. Runs on the flush thread / stop(), never on a request thread."""
+        with self._flush_lock:
+            with self._lock:
+                days = list(self._days)
+            for day in days:
+                self._baseline(day)
+            today = _lockwait_utc_date()
+            # The snapshot copy holds the counters' private lock briefly: the one point where the flush
+            # thread can make a request thread wait. Bounded: O(families x buckets).
+            with self._lock:
+                snapshot = {day: {name: {**fam, "hist": list(fam["hist"])} for name, fam in fams.items()}
+                            for day, fams in self._days.items()}
+            for day, fams in sorted(snapshot.items()):
+                if not fams:
+                    continue
+                self._write_day(day, fams)
+                if day < today:
+                    with self._lock:
+                        if self._days.get(day) == fams:  # unchanged since the snapshot
+                            del self._days[day]
+                            self._baselined.discard(day)
+
+    def _write_day(self, day: str, fams: dict) -> None:
+        doc = {
+            "schema": LOCKWAIT_SCHEMA,
+            "date": day,
+            "bucket_edges_ms": [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, "inf"],
+            "families": {name: _lockwait_family_to_doc(fam) for name, fam in sorted(fams.items())},
+        }
+        fd, tmp = tempfile.mkstemp(prefix=f".lockwait-{day}.", suffix=".tmp", dir=str(self._run_dir))  # mode 0600
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self._path(day))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def _load_lockwait_family_map() -> dict:
+    """key -> family from the committed template file. The loaded `rr.Registry` keeps only key -> sql
+    (`sites` is build-time provenance it drops), so the file is read again here, located the same
+    way `_load_read_registry` locates it. Any problem -> {} (every read then counts under `other`)."""
+    path = _find_read_templates_path()
+    if path is None:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return lockwait_family_map(data.get("templates", []))
+    except (OSError, ValueError, AttributeError) as exc:
+        logging.getLogger("engramd_owner").warning(
+            "lockwait family map unavailable (%s: %s); reads count under %r", type(exc).__name__, exc,
+            LOCKWAIT_OTHER_FAMILY)
+        return {}
+
+
 class EngramdOwner:
     """The owner process skeleton -- one per seat, sole PROCESS holding
     `knowledge.db` open within this build's scope (handshake + `ping` +
     `snapshot()` only). Per Mira's revision-5 ruling
-    (docs/2652-security-slice-design.md SS3.1), this process holds TWO
+    (docs/internal/2652-security-slice-design.md SS3.1), this process holds TWO
     connections against that one store, never one: `_owner_conn`
     (permissive, owner-internal -- serves `snapshot()`) and
     `_client_read_conn` (the permanently restrictive floor -- see the
@@ -2460,8 +2895,15 @@ class EngramdOwner:
         # `_owner_lock`: a long snapshot holds that one, and a read must not
         # queue behind it (nor may a read ever take the owner-internal path).
         self._client_read_lock = threading.Lock()
+        # #4234: per-day read-lock wait counters; the file I/O happens on a background thread, never here.
+        self._lockwait = _LockwaitCounters(self.socket_path.parent)
+        self._lockwait_log_failed = False
         self._shutdown = threading.Event()
         self._bound_socket = False
+        # #4068: set as the first thing start() does and never reset: one object, one lifetime.
+        self._start_called = False
+        # #3882: the fd of the store-maintenance flock, held from start() to the end of _cleanup().
+        self._maint_lock_fd: int | None = None
         self._accept_thread: threading.Thread | None = None
         # #3194 round 5: bounds concurrent finalize (fsync + os.replace)
         # work across every snapshot() call this owner serves -- shared
@@ -2516,7 +2958,120 @@ class EngramdOwner:
     # -- lifecycle ------------------------------------------------------
 
     def start(self, *, install_signal_handlers: bool = True) -> None:
-        """Bind the socket, open the store, and begin serving in a
+        """Bind the socket, open the store, and begin serving in a background thread. Returns once the
+        accept loop is running. The ordered refusals and their exceptions are documented on
+        `_start_inner`. #3882: the first thing past the pure refusals is the store-maintenance lock,
+        held for this owner's whole lifetime; a start that fails after taking it releases it on the way
+        out, and `stop()` releases it after both connections are closed. A start that fails AFTER the store
+        connections are open closes them first (through `_cleanup()`, the same path `stop()` takes: it only
+        removes a socket this owner bound and a pidfile that does not name another process) and only then
+        releases the lock: the lock is never released while an owner connection is open. A failure before any
+        connection exists just releases, as before."""
+        # #4068: one object, one lifetime. FIRST, before any other work, and never reset, so a start() that
+        # raised partway still counts and a second call is refused having touched nothing.
+        if self._start_called:
+            raise OwnerRestartRefused(
+                "start() was already called on this EngramdOwner object (it finished, was stopped, or "
+                "failed); an owner object has one lifetime. Build a new EngramdOwner to start again"
+            )
+        self._start_called = True
+        try:
+            self._start_inner(install_signal_handlers=install_signal_handlers)
+        except BaseException:
+            had_connections = self._owner_conn is not None or self._client_read_conn is not None
+            cleanup_failed = False
+            if had_connections:
+                try:
+                    self._cleanup()  # closes both connections, then releases the lock itself (unless displaced)
+                except Exception as cleanup_exc:
+                    # #4073: a failing cleanup must not replace the start error, and must NOT release the lock:
+                    # a connection may still be open, so holding is the safe side (main()'s exit drops it).
+                    # The cleanup error is logged, not chained; the ORIGINAL exception is re-raised below
+                    # (a bare `raise` here would re-raise the cleanup error instead).
+                    cleanup_failed = True
+                    logging.getLogger("engramd_owner").warning(
+                        "cleanup after a failed start itself failed (%s: %s); the maintenance lock stays held "
+                        "until this process exits", type(cleanup_exc).__name__, cleanup_exc)
+            if cleanup_failed:
+                raise
+            if not self._displaced:
+                # A displaced owner never releases here, on any path (including the pidfile refusal, where
+                # _cleanup() has already parked the connections and nulled the attributes): its connections
+                # stay OPEN, so its lock stays held with them and the kernel drops it when main() ends the
+                # process with os._exit. Every other path releases here, idempotently.
+                self._release_maint_lock()
+            raise
+
+    def _take_maint_lock(self) -> None:
+        """#3882: take the store-maintenance flock for THIS owner's own store (`self.store_path`, never
+        the DB_PATH of engram_core, which this process points at its home), non-blocking. A held lock
+        reads the holder file: role `owner` -> OwnerAlreadyRunning (exit 1, unchanged); anything else or
+        unreadable -> OwnerStoreMaintenance (exit 6). A lock directory that cannot be used at all ->
+        OwnerStoreLockDirUnusable (exit 4). Nothing is created, bound or written in any case.
+
+        Idempotent (a held fd is kept). Two deliberate gaps, both fail-through to the checks that follow:
+        a store path that does not exist yet is not locked (there is nothing to maintain, and creating
+        the lock directory would break the schema gate's "a refusal creates nothing" for an absent
+        store; start() takes the lock again right after the gate in case the store appeared between
+        the two), and an engram_core that cannot be imported is left to the schema gate, which refuses
+        it by name."""
+        if self._maint_lock_fd is not None:
+            return
+        try:
+            import engram_core
+        except ImportError:
+            return  # _require_store_schema_current reports it (OwnerStoreBehindSchema)
+        if not os.path.lexists(self.store_path):
+            return
+        try:
+            fd = engram_core.acquire_store_maint_lock(str(self.store_path), engram_core.STORE_MAINT_OWNER_ROLE)
+        except engram_core.StoreMaintLockHeld as exc:
+            if exc.holder_role == engram_core.STORE_MAINT_OWNER_ROLE:
+                raise OwnerAlreadyRunning(
+                    f"refusing to start: another owner holds the store (pid {exc.holder_pid or 'unknown'}, "
+                    f"{exc.lock_path}); it is unaffected and nothing was created or bound"
+                ) from exc
+            raise OwnerStoreMaintenance(
+                f"refusing to start: {exc}; nothing was created or bound. The supervisor retries with "
+                f"back-off; the owner starts once that process has exited"
+            ) from exc
+        except engram_core.StoreMaintLockUnusable as exc:
+            if exc.retryable:  # a resource limit (engram_core.STORE_MAINT_RETRYABLE_ERRNOS): a retry can clear it
+                raise OwnerStoreMaintenance(
+                    f"refusing to start: {exc}; nothing was created or bound. "
+                    f"{engram_core.store_maint_cause_text(exc.kind)}. The supervisor retries with back-off"
+                ) from exc
+            # The cause sentence is engram_core's one mapping (shared with the offline tools); the remedy is
+            # the owner's own: it serves the live store, so it is never told to copy it.
+            remedy = {
+                "planted": " Fix or remove that path, then start the owner again.",
+                "permission": " Make that directory (or the directory that holds it) writable by this "
+                              "account, then start the owner again.",
+            }.get(exc.kind, "")
+            raise OwnerStoreLockDirUnusable(
+                f"refusing to start: {exc}; nothing was created or bound. "
+                f"{engram_core.store_maint_cause_text(exc.kind)}.{remedy}"
+            ) from exc
+        self._maint_lock_fd = fd
+
+    def _release_maint_lock(self) -> None:
+        """Release the maintenance flock if this owner holds it (idempotent). Called by stop()/_cleanup()
+        AFTER both store connections are closed, and by start() on a failed start."""
+        fd, self._maint_lock_fd = self._maint_lock_fd, None
+        if fd is None:
+            return
+        try:
+            import engram_core
+
+            engram_core.release_store_maint_lock(fd)
+        except Exception:
+            try:
+                os.close(fd)  # the kernel drops the flock with the fd either way
+            except OSError:
+                pass
+
+    def _start_inner(self, *, install_signal_handlers: bool = True) -> None:
+        """The body of start(): bind the socket, open the store, and begin serving in a
         background thread. Returns once the accept loop is running.
 
         Raises OwnerAlreadyRunning if a confirmably-live owner already
@@ -2579,6 +3134,12 @@ class EngramdOwner:
             os.environ, _read_install_tier(self.engram_home)
         )
 
+        # #3882: the store-maintenance lock comes FIRST among everything that touches the store, before
+        # the schema probe below, so an owner never probes a store an offline repair is in the middle
+        # of changing. Held for this owner's whole lifetime (released in _cleanup(), after both
+        # connections close; the kernel releases it if this process dies).
+        self._take_maint_lock()
+
         # #3753: refuse a store that is behind this code's schema (or absent) BEFORE the
         # first filesystem mutation (the mkdir below) and so before any connect() to it:
         # a read-only probe, so a refusal creates no knowledge.db and no run/ (a WAL-mode
@@ -2587,6 +3148,9 @@ class EngramdOwner:
         # dynamic flag), which touch nothing, and ahead of the live-owner check below:
         # a second launch against a behind store is told about the store, not the seat.
         _require_store_schema_current(self.store_path)
+        # The store passed the gate, so it exists: if it did not when the lock was first tried (it was
+        # created in between), take the lock now, before anything below opens it.
+        self._take_maint_lock()
 
         self.engram_home.mkdir(parents=True, exist_ok=True)
 
@@ -2616,7 +3180,7 @@ class EngramdOwner:
         self._check_stale_socket_or_raise()
 
         # One process, TWO open connections on the store (design doc SS3;
-        # docs/2652-security-slice-design.md SS3.1) -- opened once here
+        # docs/internal/2652-security-slice-design.md SS3.1) -- opened once here
         # and held for this owner's lifetime; snapshot() backs up FROM
         # the owner-internal connection object (contract item 5). No
         # domain-engine/manager machinery sits on top of either in this
@@ -2678,6 +3242,8 @@ class EngramdOwner:
             signal.signal(signal.SIGINT, self._handle_signal)
 
         self._shutdown.clear()
+        self._lockwait.set_family_map(_load_lockwait_family_map())  # #4234: before the first read can arrive
+        self._lockwait.start(LOCKWAIT_FLUSH_INTERVAL_S)
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
 
@@ -2696,6 +3262,34 @@ class EngramdOwner:
             f"nothing was bound. Remove it and start again"
         )
 
+    def _pidfile_not_writable_text(self) -> str:
+        """The refusal text for EACCES/EPERM on the pidfile write. True in both
+        cases the errno covers (#4068), decided by one `lstat` of the path at
+        the point of the error: the pidfile exists (the file's mode is the
+        problem), or it does not and its DIRECTORY is not writable."""
+        try:
+            os.lstat(self.pid_path)
+        except OSError as lstat_exc:
+            directory = os.path.dirname(str(self.pid_path)) or "."
+            # ENOENT: the pidfile is plainly absent. Any other lstat failure (e.g. a
+            # directory that cannot be searched) means we could not check, so say so.
+            absent = (
+                "does not exist"
+                if isinstance(lstat_exc, FileNotFoundError)
+                else "does not exist or cannot be checked"
+            )
+            return (
+                f"refusing to start: the pidfile {self.pid_path} {absent} and its "
+                f"directory {directory} is not writable by this user, so it cannot be "
+                f"created; nothing was bound. Make {directory} writable by the user that "
+                f"runs the owner"
+            )
+        return (
+            f"refusing to start: the pidfile {self.pid_path} exists but this user cannot "
+            f"write it; nothing was bound. Make it writable by the user that runs the "
+            f"owner, or remove it"
+        )
+
     def _write_pidfile(self) -> None:
         """Write this process's pid to the pidfile (#3768). The write
         sequence (O_NOFOLLOW, O_NONBLOCK, no O_TRUNC, fstat regular-and-
@@ -2707,12 +3301,17 @@ class EngramdOwner:
         A refusal (`NotRegularFile`) becomes OwnerPidfileNotRegular after
         releasing what start() already acquired (the socket and both store
         connections; the accept thread does not exist yet). Any other
-        OSError propagates unchanged."""
+        OSError propagates unchanged, except EACCES/EPERM (#4068): an existing
+        pidfile this user cannot write becomes OwnerPidfileNotWritable, with
+        the same cleanup first."""
         try:
             write_pidfile(self.pid_path, str(os.getpid()).encode("ascii"))
         except NotRegularFile as exc:
             self._cleanup()
             raise OwnerPidfileNotRegular(self._pidfile_refusal_text(exc.st_mode, exc.nlink)) from exc
+        except PermissionError as exc:  # EACCES and EPERM
+            self._cleanup()
+            raise OwnerPidfileNotWritable(self._pidfile_not_writable_text()) from exc
 
     def _load_read_registry(self, dynamic: bool) -> "rr.Registry":
         """Load the committed template list, classifying each template
@@ -2768,6 +3367,22 @@ class EngramdOwner:
            fresh start and passes, which is what makes this safe before mkdir.
            The race between this check and the write is closed in
            `_write_pidfile`, which keeps its own checks.
+           #4068: a regular pidfile this user cannot write (`os.access`,
+           pure) is refused by name too, `OwnerPidfileNotWritable`, same exit.
+           #4068: an ABSENT pidfile whose directory this user cannot write or
+           search (`os.access(W_OK | X_OK)`, the predicate the write meets) is
+           refused too, but ONLY where start() would actually reach the pidfile
+           write: `_refuse_absent_pidfile_in_unwritable_dir` walks the refusals
+           start() makes first (setlimit, dynamic flag, maintenance lock
+           directory, store schema gate) and lets each keep its own name, so the
+           no-store layout still gets `OwnerStoreBehindSchema` from both paths.
+           Why preflight must match start() here: launchd restarts every
+           non-zero exit, refusals included, every ThrottleInterval, so a
+           preflight that passes where start() then exits 4 loops forever.
+           The parity rule (preflight raises the exception class start() raises,
+           or both pass) is pinned per layout by
+           tests/test_engramd_owner_pidfile_identity_4068.py, cell 3f; the order is
+           mirrored by hand, and that cell is what catches the next drift.
         5. #3785: the store path (<ENGRAM_HOME>/knowledge.db), when it exists,
            must be a regular file: a FIFO, directory, socket or device is
            refused by name (`OwnerStorePathNotRegular`, exit 4 from `main()`),
@@ -2797,7 +3412,49 @@ class EngramdOwner:
         if pid_stat is not None and (not stat.S_ISREG(pid_stat.st_mode) or pid_stat.st_nlink > 1):
             raise OwnerPidfileNotRegular(
                 self._pidfile_refusal_text(pid_stat.st_mode, pid_stat.st_nlink))
+        # #4068: an existing regular pidfile this user cannot write is refused by
+        # name too (the write would meet EACCES). `os.access(W_OK)` is access(2): it
+        # opens nothing, so it cannot create, truncate or block; pure like the lstat.
+        if pid_stat is not None and not os.access(self.pid_path, os.W_OK):
+            raise OwnerPidfileNotWritable(self._pidfile_not_writable_text())
         _refuse_non_regular_store(self.store_path)
+        if pid_stat is None:
+            self._refuse_absent_pidfile_in_unwritable_dir()
+
+    def _refuse_absent_pidfile_in_unwritable_dir(self) -> None:
+        """#4068: the absent-pidfile arm of `check_start_refusals`. No-op unless the
+        pidfile's directory exists and this user cannot write and search it
+        (`os.access(W_OK | X_OK)`: pure, the predicate `_write_pidfile` meets). When it
+        is, start() would exit 4 at the pidfile write, so preflight must refuse
+        too -- but only after the refusals start() makes BEFORE that write, in start()'s
+        order, so each keeps its own name: setlimit, the dynamic-template flag, the
+        maintenance lock directory (cannot be created in this directory), then the store
+        schema gate (the only non-pure step: a read-only probe, run only on this already-
+        failing path). A refusal the live process can still hit but preflight cannot see
+        (another owner holding the lock) is left to start(), as before. So is a planted
+        lock path (a symlink or a foreign-owned directory): start() refuses it under its
+        own name, and it is not mirrored here."""
+        directory = os.path.dirname(str(self.pid_path)) or "."
+        if not os.path.isdir(directory) or os.access(directory, os.W_OK | os.X_OK):
+            return
+        _require_sqlite_setlimit()
+        rr.resolve_dynamic_flag(os.environ, _read_install_tier(self.engram_home))
+        if os.path.lexists(self.store_path):
+            try:
+                import engram_core
+            except ImportError:
+                engram_core = None  # the schema gate below refuses it by name
+            if engram_core is not None:
+                lock_path = engram_core.store_maint_lock_path(str(self.store_path))
+                if not os.path.lexists(lock_path):
+                    raise OwnerStoreLockDirUnusable(
+                        f"refusing to start: the maintenance lock directory {lock_path} does not "
+                        f"exist and its directory {directory} is not writable by this user, so it "
+                        f"cannot be created; nothing was created or bound. Make {directory} writable "
+                        f"by this account, then start the owner again."
+                    )
+        _require_store_schema_current(self.store_path)
+        raise OwnerPidfileNotWritable(self._pidfile_not_writable_text())
 
     def _check_platform_support(self) -> None:
         """Refuse to start rather than silently degrade the permission
@@ -3143,6 +3800,7 @@ class EngramdOwner:
         self._shutdown.set()
         if self._accept_thread is not None:
             self._accept_thread.join(timeout=self.accept_poll_interval + 2.0)
+        self._lockwait.stop()  # #4234: final rollup flush; never raises
         # Release every idle handler (#3678); a busy one exits after its request, when it
         # sees _shutdown in _next_connection(). The tokens go in under the same lock that
         # zeroes `_idle`: a handler whose idle timeout fires in between then finds a token
@@ -3160,70 +3818,21 @@ class EngramdOwner:
                 self._server.close()
             except OSError:
                 pass
-        # PID_PATH: removed only if it still names THIS process -- mirrors
-        # engram-surface-daemon.py's cleanup(): guards against a delayed
-        # signal firing after a newer instance already wrote its own fresh
-        # pidfile (which would otherwise delete the NEW instance's pidfile
-        # out from under it).
-        #
-        # #3768: this read decides whether to UNLINK, so it refuses symlinks
-        # and non-regular files (O_NOFOLLOW, O_NONBLOCK, then fstat): a FIFO
-        # must not hang it and must not be unlinked, a symlink is not ours.
-        still_ours = False
-        not_regular_kind = None
-        hard_links = None
-        try:
-            fd = os.open(self.pid_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-        except OSError as exc:
-            if exc.errno == errno.ELOOP:
-                not_regular_kind = "symlink"
-            else:
-                # No pidfile, or unreadable -- nothing to protect, proceed
-                # with removing it (matches the surface daemon's identical
-                # fallback) -- unless the path is something other than a
-                # regular file that open() merely failed on (e.g. a
-                # socket-type file: ENXIO on Linux, EOPNOTSUPP on macOS),
-                # which is not ours to unlink.
-                still_ours = True
-                try:
-                    lmode = os.lstat(self.pid_path).st_mode
-                except OSError:
-                    pass
-                else:
-                    if not stat.S_ISREG(lmode):
-                        still_ours = False
-                        not_regular_kind = self._kind_of_mode(lmode)
-        else:
-            try:
-                fst = os.fstat(fd)
-                mode = fst.st_mode
-                if not stat.S_ISREG(mode):
-                    not_regular_kind = self._kind_of_mode(mode)
-                elif fst.st_nlink > 1:
-                    # hard-linked: another name shares this inode, not ours
-                    hard_links = fst.st_nlink
-                else:
-                    try:
-                        with os.fdopen(fd, closefd=False) as f:
-                            still_ours = int(f.read().strip()) == os.getpid()
-                    except (OSError, ValueError):
-                        # garbage/unreadable content: same fallback as above
-                        still_ours = True
-            finally:
-                os.close(fd)
-        if not_regular_kind is not None:
-            logging.getLogger("engramd_owner").warning(
-                "pidfile %s is a %s, not a regular file; leaving it alone",
-                self.pid_path, not_regular_kind)
-        if hard_links is not None:
-            logging.getLogger("engramd_owner").warning(
-                "pidfile %s has %d hard links; leaving it alone",
-                self.pid_path, hard_links)
-        if still_ours:
+        # PID_PATH: unlinked ONLY on confirmed identity (content == this pid),
+        # by the one rule in engram_pidfile.classify_own_pidfile, shared with
+        # the surface daemon's cleanup (#4068): a delayed signal after a newer
+        # instance wrote its own pidfile, an empty file caught mid-write, an
+        # unreadable or garbage file, a symlink, a FIFO or a hard link are all
+        # left alone, and each says so once.
+        status, reason = engram_pidfile.classify_own_pidfile(self.pid_path)
+        if status == engram_pidfile.PIDFILE_OURS:
             try:
                 self.pid_path.unlink()
             except FileNotFoundError:
                 pass
+        elif status != engram_pidfile.PIDFILE_ABSENT:
+            logging.getLogger("engramd_owner").warning(
+                "pidfile %s %s; leaving it alone", self.pid_path, reason)
         # SOCKET_PATH: removed only if THIS process actually bound it
         # (_bound_socket) -- independent of pidfile identity, same
         # reasoning as engram-surface-daemon.py's #2713 fix: a pidfile-
@@ -3279,6 +3888,15 @@ class EngramdOwner:
                     pass
                 self._client_read_conn = None
         self._client_read_gate = None
+        # #3882: the maintenance lock goes LAST -- after both connections are closed, so a repair tool that
+        # takes it next never meets an open owner connection. NOT on a displaced substrate: there the two
+        # connections are parked still OPEN, so the lock stays held with them and the kernel drops the flock
+        # when main() ends the process with os._exit(EXIT_DISPLACED). (_cleanup() is also called before
+        # raising, by the pidfile refusal in _write_pidfile and by start()'s failure handler once connections
+        # are open; in both, start()'s handler releases the lock only when the owner is NOT displaced.) An embedder or test that calls stop() on a displaced owner and keeps
+        # running holds the lock until the process exits, so the next repair tool refuses until then.
+        if not self._displaced:
+            self._release_maint_lock()
 
     def wait_forever(self) -> None:
         """Block the calling thread until shutdown (a signal, or .stop()
@@ -3624,7 +4242,7 @@ class EngramdOwner:
             # one of the 10 numbered contract items (which name the READ
             # side), but a direct extension of the same "one deadline per
             # request, end to end, on both sides of the socket" principle
-            # (docs/2652-engrammanager-design.md SS5.1) -- flagged in the
+            # (docs/internal/2652-engrammanager-design.md SS5.1) -- flagged in the
             # fairy handoff. This is ALSO the mechanism by which a
             # deadline-aborted snapshot's own {"status": "rejected", ...}
             # wire dict USED to never reach the wire (round 5: it was
@@ -4479,7 +5097,8 @@ class EngramdOwner:
         # A non-list `args` is passed through as-is: the template list's own check
         # refuses it as `invalid_parameter` (one source of refusal reasons).
         failure, outcome = self._run_client_read(
-            deadline, lambda execution_deadline: gate.execute(sql, args, deadline=execution_deadline)
+            deadline, lambda execution_deadline: gate.execute(sql, args, deadline=execution_deadline),
+            family=lambda: self._lockwait.family_for_sql(sql),
         )
         if failure is not None:
             return failure
@@ -4489,8 +5108,23 @@ class EngramdOwner:
         reply, _counted = _render_read_rows(outcome)
         return reply
 
-    def _run_client_read(self, deadline: float, run) -> "tuple[dict | None, object]":
-        """The lock / deadline / error tail shared by `read` and `df`.
+    def _lockwait_record(self, family, outcome: str, wait_ms: float = 0.0) -> None:
+        """#4234: bump the read-lock wait counters. Never raises into a request: a counter problem is
+        logged once and the read goes on. `family` may be a zero-arg callable, resolved here (after the
+        lock is released) so the template-key hash is not paid while a queued read waits."""
+        try:
+            if callable(family):
+                family = family()
+            self._lockwait.record(family, outcome, wait_ms)
+        except Exception as exc:  # noqa: BLE001
+            if not self._lockwait_log_failed:
+                self._lockwait_log_failed = True
+                logging.getLogger("engramd_owner").warning(
+                    "lockwait counter failed (%s: %s); reads are unaffected", type(exc).__name__, exc)
+
+    def _run_client_read(self, deadline: float, run, family=LOCKWAIT_OTHER_FAMILY) -> "tuple[dict | None, object]":
+        """The lock / deadline / error tail shared by four methods:
+        `read`, `df`, `chain` and `confidence_by_type`.
         -> (failure_reply, outcome): `failure_reply` is a rejection dict (no time
         left, deadline abort, or a SQLite error) and `outcome` is then None;
         otherwise `failure_reply` is None and `outcome` is whatever
@@ -4498,10 +5132,16 @@ class EngramdOwner:
         `self._client_read_lock`."""
         execution_deadline = deadline - READ_RESPONSE_RESERVE
         remaining = execution_deadline - time.monotonic()
-        if remaining <= 0 or not self._client_read_lock.acquire(timeout=remaining):
-            return self._read_deadline_rejection(
-                "no execution time was left inside the request deadline (after reserving time to deliver the response)"
-            ), None
+        no_time_detail = "no execution time was left inside the request deadline (after reserving time to deliver the response)"
+        if remaining <= 0:
+            self._lockwait_record(family, "no_time")  # rejected BEFORE the acquire: no lock wait happened (#4234)
+            return self._read_deadline_rejection(no_time_detail), None
+        wait_started = time.monotonic()
+        acquired = self._client_read_lock.acquire(timeout=remaining)
+        wait_ms = (time.monotonic() - wait_started) * 1000.0  # #4234: the acquire itself, nothing else
+        if not acquired:
+            self._lockwait_record(family, "timed_out", wait_ms)
+            return self._read_deadline_rejection(no_time_detail), None
         try:
             try:
                 return None, run(execution_deadline)
@@ -4517,6 +5157,10 @@ class EngramdOwner:
                 return self._read_failed(exc), None
         finally:
             self._client_read_lock.release()
+            # #4234: runs on the request thread AFTER the lock release and BEFORE the reply is sent. The
+            # family resolution (a sha256 of the SQL, for `read`) and the integer increments are CPU-only,
+            # no I/O: near-zero cost on the request path, not zero.
+            self._lockwait_record(family, "acquired", wait_ms)
 
     def _handle_df(self, params: dict, deadline: float) -> dict:
         """The typed `df` method (U6b, #3665): document frequencies for a list of
@@ -4565,7 +5209,7 @@ class EngramdOwner:
                 }
             return gate.execute_typed(DF_SQL, (json.dumps(terms),), deadline=execution_deadline)
 
-        failure, outcome = self._run_client_read(deadline, run)
+        failure, outcome = self._run_client_read(deadline, run, family="df")
         if failure is not None:
             return failure
         if isinstance(outcome, dict):
@@ -4621,7 +5265,7 @@ class EngramdOwner:
             return gate.run_chain(node_id, depth, deadline=execution_deadline)
 
         try:
-            failure, outcome = self._run_client_read(deadline, run)
+            failure, outcome = self._run_client_read(deadline, run, family="chain")
         except ImportError as exc:  # engram_core vanished between the import above and the walk
             return self._chain_runtime_unavailable(exc)
         if failure is not None:
@@ -4687,7 +5331,7 @@ class EngramdOwner:
             return gate.run_confidence_by_type(modes, deadline=execution_deadline)
 
         try:
-            failure, outcome = self._run_client_read(deadline, run)
+            failure, outcome = self._run_client_read(deadline, run, family="confidence_by_type")
         except ImportError as exc:  # the runtime vanished between the import above and the read
             return self._cbt_runtime_unavailable(exc)
         if failure is not None:
@@ -4718,7 +5362,7 @@ class EngramdOwner:
         """Contract item 5: writes a quiesced, consistent copy of the
         store to a caller-named destination path, using SQLite's backup
         API (sqlite3.Connection.backup(), stdlib) FROM the owner-internal
-        connection (`_owner_conn` -- docs/2652-security-slice-design.md
+        connection (`_owner_conn` -- docs/internal/2652-security-slice-design.md
         SS3.1: snapshot() runs on the owner-internal path, never the
         client-read one). A client-facing service, not a manager
         mechanism -- no domain-engine machinery here, just a direct
@@ -5239,8 +5883,8 @@ class EngramdOwner:
 # planted pidfile 1, start() gave it 4). Looked up with isinstance, in order; none of these
 # classes subclasses another (all are direct RuntimeError subclasses), so the order carries no
 # meaning today, but a future subclass must be listed BEFORE its base. `--preflight` only ever
-# raises the classes `check_start_refusals` raises; OwnerAlreadyRunning, OwnerAclNotStripped and
-# OwnerStoreBehindSchema are start()-only.
+# raises the classes `check_start_refusals` raises; OwnerAlreadyRunning, OwnerAclNotStripped,
+# OwnerStoreBehindSchema, OwnerStoreMaintenance and OwnerStoreLockDirUnusable are start()-only.
 # Owner* classes deliberately absent (OwnerStalePathUnsafe, OwnerPeerCredentialsMalformed,
 # OwnerPythonTooOld) are not mapped and propagate.
 _REFUSAL_EXIT: tuple[tuple[type[RuntimeError], int], ...] = (
@@ -5250,10 +5894,15 @@ _REFUSAL_EXIT: tuple[tuple[type[RuntimeError], int], ...] = (
     (OwnerAclNotStripped, 1),
     (OwnerPermissionUnsupported, 1),
     (OwnerPidfileNotRegular, EXIT_PATH_NOT_REGULAR),  # retrying cannot fix a planted path
+    (OwnerPidfileNotWritable, EXIT_PATH_NOT_REGULAR),  # #4068: nor an unwritable one
     (OwnerStorePathNotRegular, EXIT_PATH_NOT_REGULAR),
     # Its own code (not 1, not os._exit): non-zero, so the supervisor retries while the first
     # migration finishes.
     (OwnerStoreBehindSchema, EXIT_STORE_BEHIND_SCHEMA),
+    # #3882: its own code, retried with back-off while an offline repair holds the store.
+    (OwnerStoreMaintenance, EXIT_STORE_MAINTENANCE),
+    # #3882: an unusable lock directory is a planted path, the class exit 4 already names; not retried.
+    (OwnerStoreLockDirUnusable, EXIT_PATH_NOT_REGULAR),
 )
 
 

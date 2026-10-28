@@ -1,5 +1,5 @@
 """engramd_read_registry -- the tier-1 read-template registry (U4c, #3196,
-part of #2652; design docs/2652-security-slice-design.md SS3.2-3.5, SS5, SS7).
+part of #2652; design docs/internal/2652-security-slice-design.md SS3.2-3.5, SS5, SS7).
 
 Stdlib only. The owner admits a client read iff the EXACT BYTES of its SQL
 equal a template registered at build time. Everything else is refused, not

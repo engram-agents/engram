@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """tools/engramd_read_scan.py -- build-time read-template scanner (U4c, #3196,
-part of #2652; design docs/2652-security-slice-design.md SS3.2-3.5).
+part of #2652; design docs/internal/2652-security-slice-design.md SS3.2-3.5).
 
 Walks the call graph from declared hook roots and classifies every
 ``.execute*`` call it reaches. The output is the committed template list

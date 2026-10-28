@@ -9,7 +9,7 @@ WS1 spec: an implementation-ready spec handed to the coder-fairy for this
 build (part of engram-alpha#2574, epic #2013) -- its "Tests to write"
 section is the checklist this file implements one-for-one. Not committed
 anywhere durable; the design doc below is the citable source of record.
-Design doc: docs/2574-telemetry-design.md.
+Design doc: docs/internal/2574-telemetry-design.md.
 
 Fixture strategy: each test points ``ENGRAM_HOME`` at a fresh scratch temp
 directory (mirrors tests/test_log_emitter.py's own EmitterTestBase pattern)

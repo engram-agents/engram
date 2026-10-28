@@ -445,7 +445,11 @@ def test_c7_old_darwin_no_launchctl_cell_is_stopped_by_the_guard(
     env = {**os.environ, "PATH": path, "HOME": str(fake_home), "ENGRAM_HOME": str(engram_home),
            # #3519 item 1: the script's own ephemeral-path refusal would fire first
            # (temp/worktree daemon path); this cell tests the SHIM, so allow it.
-           "ENGRAM_SETUP_ALLOW_PATH": "1"}
+           "ENGRAM_SETUP_ALLOW_PATH": "1",
+           # #3939: the spy answers `print` 0 (service "still loaded") and the shim refuses bootstrap, which
+           # the installer now waits for / retries; keep both short so the cell stays inside its timeout
+           "ENGRAM_SETUP_LAUNCHD_POLL_S": "0.01", "ENGRAM_SETUP_LAUNCHD_WAIT_S": "0.05",
+           "ENGRAM_SETUP_LAUNCHD_RETRY_S": "0.01"}
     r = subprocess.run(["bash", str(SETUP_SCRIPT)], capture_output=True, text=True, env=env, timeout=10)
 
     out = r.stdout + r.stderr

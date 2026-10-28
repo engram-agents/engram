@@ -9,6 +9,10 @@
 # Usage:
 #   tools/setup-surface-daemon-service.sh
 #   tools/setup-surface-daemon-service.sh --owner     # the engramd OWNER (#3663 Linux, #3709 macOS)
+#   tools/setup-surface-daemon-service.sh --help      # print the usage, change nothing
+# Options: --owner, --allow-path (below), -h/--help. Any OTHER argument exits 2 naming it, before
+# anything is written or any systemctl/launchctl call (#3939; it used to be ignored, so `--help`
+# ran a real install).
 #
 # --owner installs the engramd owner (engramd_owner.py) instead. One supervisor entry per
 # ENGRAM_HOME, not per user, named with <id> = first 8 hex chars of sha256 over the
@@ -35,11 +39,22 @@
 # The ephemeral-path refusal below applies to engramd_owner.py's physical path in this
 # mode. Without --owner the behaviour is exactly what it always was.
 #
+# macOS bootout/bootstrap race (#3939): `launchctl bootout` returns before launchd has finished
+# removing the service, so an immediate `bootstrap` can fail "5: Input/output error". After the
+# bootout this script polls `launchctl print gui/<uid>/<label>` until it fails (the service is gone),
+# bounded; at the deadline it still tries bootstrap. A bootstrap failure other than 125 is retried
+# (5 attempts in all); after the last one the script exits with launchctl's last rc and one stderr
+# message naming the label, the attempts, launchctl's text and the manual `launchctl bootstrap` command.
+# Timing overrides (seconds, a plain decimal; anything else falls back to the default; tests set tiny values):
+#   ENGRAM_SETUP_LAUNCHD_WAIT_S  total time to wait for the service to go away   (default 10)
+#   ENGRAM_SETUP_LAUNCHD_POLL_S  pause between `launchctl print` polls           (default 0.2)
+#   ENGRAM_SETUP_LAUNCHD_RETRY_S pause between bootstrap attempts                (default 1)
+#
 # Exit codes: 0 done; 1 an error (missing tool or template, a preflight refusal); 2 a refused
-# value (unsupported character, `..`, ephemeral path); 3 (#3780, Darwin) launchd has no GUI
+# value (unsupported character, `..`, ephemeral path) or an unknown argument; 3 (#3780, Darwin) launchd has no GUI
 # domain for this uid (`launchctl bootstrap gui/<uid>` exits 125: no GUI login session). The
 # plist WAS written but is not active now; whether launchd loads it at this account's next GUI
-# login has not been measured. Any other launchctl bootstrap failure exits with launchctl's own rc.
+# login has not been measured. Any other launchctl bootstrap failure (after the retries above) exits with launchctl's own last rc.
 #
 # --owner refuses any ENGRAM_HOME with a `..` path component (exit 2, before anything is written):
 # mkdir and cd/pwd -P read `..` after a symlink differently. Names like `a..b` are fine.
@@ -99,16 +114,42 @@ if [ -n "${ENGRAM_HOME-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Arguments — the only option is --allow-path; anything else is ignored, as it
-# always was.
+# Arguments -- --allow-path, --owner, -h/--help. Anything else exits 2 naming it, before anything is
+# written or any service-manager call (#3939; it used to be ignored, which made `--help` run a real
+# install). `--help` anywhere prints the usage and exits 0 (also before an unknown argument is judged).
 # ---------------------------------------------------------------------------
+_usage() {
+    cat <<'USAGE_EOF'
+Usage: setup-surface-daemon-service.sh [--owner] [--allow-path]
+       setup-surface-daemon-service.sh -h | --help
+
+Installs the ENGRAM surface daemon as a persistent OS service (systemd user service on Linux,
+LaunchAgent on macOS).
+
+  --owner       install the engramd OWNER service (one per ENGRAM_HOME) instead
+  --allow-path  proceed although the daemon path is under a temp root or an agent worktree
+                (same as ENGRAM_SETUP_ALLOW_PATH=1)
+  -h, --help    print this usage and exit 0, changing nothing
+
+Any other argument exits 2 before anything is written.
+USAGE_EOF
+}
 ALLOW_PATH=0
 OWNER_MODE=0
+for _arg in "$@"; do
+    if [[ "$_arg" == "-h" || "$_arg" == "--help" ]]; then
+        _usage
+        exit 0
+    fi
+done
 for _arg in "$@"; do
     if [[ "$_arg" == "--allow-path" ]]; then
         ALLOW_PATH=1
     elif [[ "$_arg" == "--owner" ]]; then
         OWNER_MODE=1
+    else
+        echo "ERROR: unknown argument: $_arg (see --help). Nothing was written." >&2
+        exit 2
     fi
 done
 if [[ "${ENGRAM_SETUP_ALLOW_PATH:-}" == "1" ]]; then
@@ -598,8 +639,39 @@ elif [[ "$OS" == "Darwin" ]]; then
     # Modern bootstrap/bootout API (macOS 10.11+); load/unload are Apple-deprecated.
     # bootout targets the service by domain/label; bootstrap takes the plist path.
     launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
+    # bootout returns BEFORE launchd has finished removing the service (#3939): an immediate bootstrap
+    # can fail "5: Input/output error". Wait until `print` fails (service gone), bounded; at the
+    # deadline still go on to bootstrap. Durations are plain decimals (seconds), held as whole ms.
+    _to_ms() {  # <value> <default-ms> -> whole ms on stdout; a non-decimal value gives the default
+        local v="$1" ip fp
+        if [[ ! "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then echo "$2"; return 0; fi
+        ip="${v%%.*}"
+        fp=""
+        [[ "$v" == *.* ]] && fp="${v#*.}"
+        fp="${fp}000"
+        echo $(( 10#$ip * 1000 + 10#${fp:0:3} ))
+    }
+    _wait_ms="$(_to_ms "${ENGRAM_SETUP_LAUNCHD_WAIT_S:-10}" 10000)"
+    _poll_ms="$(_to_ms "${ENGRAM_SETUP_LAUNCHD_POLL_S:-0.2}" 200)"
+    _retry_s="${ENGRAM_SETUP_LAUNCHD_RETRY_S:-1}"
+    [[ "$_retry_s" =~ ^[0-9]+(\.[0-9]+)?$ ]] || _retry_s=1
+    _poll_s="${ENGRAM_SETUP_LAUNCHD_POLL_S:-0.2}"
+    [[ "$_poll_s" =~ ^[0-9]+(\.[0-9]+)?$ ]] || _poll_s=0.2
+    (( _poll_ms >= 1 )) || _poll_ms=1
+    _max_polls=$(( _wait_ms / _poll_ms ))
+    _still_loaded=0
+    _i=0
+    while launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; do
+        if (( _i >= _max_polls )); then
+            _still_loaded=1
+            break
+        fi
+        _i=$(( _i + 1 ))
+        sleep "$_poll_s"
+    done
     # rc 125 from bootstrap into gui/<uid> = no launchd GUI domain for this uid (no GUI login
-    # session, #3780). Named, with its own exit code (3); any other failure keeps launchctl's rc.
+    # session, #3780). Named, with its own exit code (3); any other failure is retried (#3939), then
+    # exits with launchctl's last rc.
     # The installer keys on rc 125 alone: bootstrap's stderr for this case was not captured verbatim
     # (unlike `print`, where the parser also requires the "Domain does not support specified action"
     # text). An rc of 125 from `bootstrap gui/<uid>` is treated as no GUI domain.
@@ -608,13 +680,36 @@ elif [[ "$OS" == "Darwin" ]]; then
     _svc_subject="The surface daemon"
     [[ "$OWNER_MODE" == "1" ]] && _svc_subject="The owner"
     _NO_GUI_DOMAIN_MSG="ERROR: launchd has no GUI domain for uid $(id -u) (no GUI login session). $PLIST_DEST was written but is not active now; whether launchd loads it at this account's next GUI login has not been measured. $_svc_subject is not supervised on this seat."
+    _BOOTSTRAP_MAX=5
     _bootstrap_rc=0
-    launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST" || _bootstrap_rc=$?
-    if [[ "$_bootstrap_rc" == "125" ]]; then
-        echo "$_NO_GUI_DOMAIN_MSG" >&2
-        exit 3
-    elif [[ "$_bootstrap_rc" != "0" ]]; then
-        exit "$_bootstrap_rc"
+    _bootstrap_err=""
+    _attempt=0
+    exec 4>&1   # launchctl's stdout stays on ours; only its stderr is captured (for the final message)
+    while :; do
+        _attempt=$(( _attempt + 1 ))
+        _bootstrap_rc=0
+        _bootstrap_err="$(launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST" 2>&1 1>&4)" || _bootstrap_rc=$?
+        if [[ "$_bootstrap_rc" == "0" ]]; then
+            break
+        fi
+        if [[ "$_bootstrap_rc" == "125" ]]; then
+            [[ -n "$_bootstrap_err" ]] && printf '%s\n' "$_bootstrap_err" >&2
+            echo "$_NO_GUI_DOMAIN_MSG" >&2
+            exit 3
+        fi
+        if (( _attempt >= _BOOTSTRAP_MAX )); then
+            [[ -n "$_bootstrap_err" ]] && printf '%s\n' "$_bootstrap_err" >&2
+            _loaded_note=""
+            [[ "$_still_loaded" == "1" ]] && _loaded_note=" The service was still loaded when the wait for bootout ended, so launchd had not finished removing the old one."
+            echo "ERROR: launchctl bootstrap of $PLIST_LABEL failed on all $_BOOTSTRAP_MAX attempts (last rc $_bootstrap_rc; last launchctl message: ${_bootstrap_err:-<none>}).$_loaded_note $PLIST_DEST was written but the service is NOT loaded. Recover by hand with:" >&2
+            echo "  launchctl bootstrap gui/$(id -u) $PLIST_DEST" >&2
+            exit "$_bootstrap_rc"
+        fi
+        sleep "$_retry_s"
+    done
+    exec 4>&-
+    if (( _attempt > 1 )); then
+        echo "  launchctl bootstrap succeeded on attempt $_attempt of $_BOOTSTRAP_MAX"
     fi
     echo "  Loaded."
 

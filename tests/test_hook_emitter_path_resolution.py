@@ -141,6 +141,8 @@ def plugin_root(tmp_path) -> Path:
 
     shutil.copy(EMITTER_SRC, root / "engram_log_emitter.py")
     shutil.copy(REGULAR_IO_SRC, root / "engram_regular_io.py")
+    # #3863 step 2: the emitter imports the runtime ENGRAM_HOME resolver, shipped at the plugin root.
+    shutil.copy(REPO_ROOT / "src" / "engram" / "engram_home_resolver.py", root / "engram_home_resolver.py")
     for name, content in _STUB_MODULES.items():
         (root / name).write_text(content)
 

@@ -5,10 +5,10 @@ instructions live in the user-level CLAUDE.md.
 
 **Convention for this file (#3322).** A section states the rule, its one-line
 origin (date + who ruled), and a pointer to where the evidence lives. Dated
-measurement history lives in `docs/`, not here. Budget: at most 75,000 bytes
+measurement history lives in `docs/internal/`, not here. Budget: at most 75,000 bytes
 today (CI step `claude-md-budget`; 40,000 is the round-2 target of #3322, reached by
 tightening rule wording, not by moving more); moved blocks are listed in
-`docs/claude-md-moves.json` and checked by `tools/claude_md_moves_check.py`.
+`tools/claude_md_moves.json` and checked by `tools/claude_md_moves_check.py`.
 
 ## MCP tool parameter style
 
@@ -35,7 +35,7 @@ the unified payload_json signature as of 2026-05-27.
   cuts; routine PRs do NOT target main. **A release cut = opening a formal
   PR from `dev` → `main`** — this fires the full CI gate (`tests.yml` full
   suite + `pr-checks`), the thorough pre-release
-  validation. See `docs/RELEASING.md`.
+  validation. See `docs/internal/RELEASING.md`.
 - **CI cost model (#1597):** dev PRs run only the cheap combined `pr-checks`
   (static scrubs). The **full pytest suite does NOT run
   on dev PRs** — at agent-PR velocity it's too expensive; run **affected-tests
@@ -50,7 +50,7 @@ the unified payload_json signature as of 2026-05-27.
   exactly like affected-tests above. If a future change genuinely needs a hosted
   macOS runner, it is Lei's call, opened as a question with the per-run cost
   stated — never added inside a fix PR. (Billing measurement:
-  `docs/CI-COST-MODEL.md`.)
+  `docs/internal/CI-COST-MODEL.md`.)
 - **Whole-minute billing (Lei, 2026-10-03).** GitHub bills CI in whole minutes rounded up, so an addition that keeps the whole pr-checks run under one minute costs nothing extra.
 - Verify before specifying a PR base: `gh repo view --json defaultBranchRef`
   returns `dev`, and recent merged PRs (`gh pr list --state merged --json baseRefName`)
@@ -134,7 +134,7 @@ statement and the check live in different artifacts, and only one of them runs.
 comes back or is reported" was never asserted. Review is a weak instrument
 against a missing assertion (there is no wrong line to look at), so the check
 belongs in the test suite. The case and its qualifications:
-`docs/CONTRACT-FIRST-TESTS.md`.
+`docs/internal/CONTRACT-FIRST-TESTS.md`.
 
 **Scope — where it applies:**
 
@@ -170,7 +170,7 @@ test discriminates.
 
 Instances of a non-discriminating control, in the review threads of #2614 and
 #2721 (not in what those PRs were about — say so when citing them), are in
-`docs/CONTRACT-FIRST-TESTS.md`. The stronger control is a mutation where **the
+`docs/internal/CONTRACT-FIRST-TESTS.md`. The stronger control is a mutation where **the
 new assertion fires and the pre-existing checks stay green.**
 
 **Adoption status: adopted (Lei, 2026-09-30, in session, verbatim: "let's keep the
@@ -179,7 +179,7 @@ contract tests convention").** The trial ran on one case, #3045's fix, merged as
 
 The one trial case (#3235) found both a defect the tests caught and two they did
 not. **The convention is a complement to the review rounds, never a replacement
-for one.** That is n=1; the narrative is in `docs/CONTRACT-FIRST-TESTS.md`.
+for one.** That is n=1; the narrative is in `docs/internal/CONTRACT-FIRST-TESTS.md`.
 
 ## Plugin build restructures code paths — never rely on the `src/` layout
 
@@ -198,8 +198,16 @@ resolves to *a* path, just the wrong one.
 
 - **Do:** resolve via `$CLAUDE_PLUGIN_ROOT` first (reliably set when hooks/tools
   run — `hooks.json` invokes every hook as `${CLAUDE_PLUGIN_ROOT}/...`), then fall
-  back to a **walk-parents search for the actual target file** (the nearest
-  ancestor dir that contains what you need), never a fixed `parents[N]`. See
+  back to a **walk-parents search for the actual target file, stopping at the
+  file's own tree root** (the nearest ancestor containing `engram_core.py`: the
+  plugin root installed, `src/engram/` in source); never search above it, or a
+  tier-filtered build can match a stale copy in an ancestor (#3983). Never a
+  fixed `parents[N]` (the one exception: a file looking for `engram_core.py`
+  itself uses a fixed window of its own directory and its parent). The defect is
+  any upward walk, in any spelling: `.parents` however used (`roots.extend(...)`
+  counts), a `.parent`/`dirname` loop, in Python or shell (`start-engramd-owner.sh`
+  had two). A new one fails `tests/test_no_unbounded_upward_walks_3983.py`
+  unless bounded or classified there. See
   `engram-baton-prompt-hook.py` / `engram-forum-prompt-hook.py` for the pattern.
 - **Verify against the DEPLOYED tree, not just `src/`.** This bug class is
   invisible to CI and unit tests — they run in the `src/` layout, where the
@@ -245,7 +253,7 @@ a REAL prompt, and read which copy logged; `CLAUDE_PLUGIN_ROOT` read from
 
 *Undocumented upstream — re-verify after any Claude Code version bump.
 Measurements (2026-06-28, #1639, #1892, #3265) and the full system model:
-[`docs/claude-code-plugin-system.md`](docs/claude-code-plugin-system.md).*
+[`docs/internal/claude-code-plugin-system.md`](docs/internal/claude-code-plugin-system.md).*
 
 ## Hook injection budget — every `additionalContext` block must be bounded
 
@@ -267,7 +275,12 @@ Once a PR is merge-ready (next section), **who merges it** depends on what it
 changes: **substrate-concept features → Lei reads the PR first**, unless the PR
 implements a design he already read (Lei, 2026-09-27 — then the team merges
 after a written conformance check); **fixes + non-substrate → the team merges
-after peer review**. This gate is
+after peer review**, and since 2026-10-22 the **project owner presses their own
+converged PR** under the policy's written *Owner merge* gate (Lei, in session: the
+colleague's recorded run on the exact head is the test gate; the owner's scratch
+merge on the current base and the base-SHA assertion stay; CI is the floor, since
+`pr-checks` runs only a fixed set of guard test files on `dev` PRs, never the full
+suite). This gate is
 **engram-alpha-only** — other repos (umwelt, soma) carry their own delegated
 authority. During an explicit Lei-absence day-grant, a settled substrate PR may
 be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
@@ -275,7 +288,7 @@ be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
 This is a pointer, not the policy. The single source of truth — the full rule,
 the substrate/non-substrate discriminator, per-project scope, the day-grant
 carve-out, examples, gray-area calls, and the baton turn-target corollary — lives
-in **[`docs/PR-MERGE-POLICY.md`](docs/PR-MERGE-POLICY.md)**. Read it there; don't
+in **[`docs/internal/PR-MERGE-POLICY.md`](docs/internal/PR-MERGE-POLICY.md)**. Read it there; don't
 re-derive the rule from this summary.
 
 ## PR merge-readiness — CI-green gate (both modes)
@@ -297,7 +310,7 @@ rollup. (`DIRTY` is a merge conflict and must be resolved whatever CI says.)
 1. **`CLEAN` is the verdict — stop there.** GitHub computes it from the latest run per check.
 2. **The rollup does NOT dedupe.** A stale `FAILURE`/`CANCELLED` from a superseded same-SHA run sits beside the current `SUCCESS`; requiring every entry to be `SUCCESS` false-blocks a green PR.
 3. **Two runs of one check can land on the SAME SHA** (the workflow fires on `edited` as well as `synchronize`). The dedupe is load-bearing within one SHA only.
-4. **Use the rollup only to find WHICH check to read**, deduped to the latest run per check name, where *latest* = most recently **completed** (`completedAt`, not `startedAt`). `gh run list --branch <branch> --json name,headSha,conclusion,updatedAt` shows the current run. But see rule 3 of "Merge-seat test rules" below: a cancelled newest same-SHA run still blocks the merge; rerun it.
+4. **Use the rollup only to find WHICH check to read**, deduped to the latest run per check name, where *latest* = an unfinished run (status not `COMPLETED`) if the name has one, else the most recently **completed** (`completedAt`, not `startedAt`). `gh run list --branch <branch> --json name,headSha,conclusion,updatedAt` shows the current run. But see rule 3 of "Merge-seat test rules" below: a cancelled same-SHA run can still block the merge; rerun it, unless the PR body or title changed since that run, in which case a rerun replays the old payload, so trigger a fresh run instead.
 5. **`UNKNOWN` is not red** — it is computed asynchronously. Treat it as *pending* (hold, re-check next tick), never as a failure.
 
 Reference implementation: `_pr_ci_state()` and `_dedupe_checks_by_latest()` in
@@ -314,13 +327,16 @@ CI-green must hold on the tip the maintainer would actually merge.
 
 **The merge seat's own test run** is on a scratch merge of the base tip plus the PR
 head, never the head alone; a scratch-merge failure counts against the PR only if
-that cell is green on the base alone (or the PR adds it); and a `CANCELLED` newest same-SHA run can
-block the merge even when another run passed — rerun it. Commands and evidence:
-`docs/PR-MERGE-POLICY.md` § "Merge-seat test rules".
+that cell is green on the base alone (or the PR adds it); and a `CANCELLED` same-SHA run can
+block the merge even when another run passed — rerun it (a fresh run instead if the PR body or title changed since that run). A red only the whole run produces
+(green on base and merged tree alone, in a file no PR touches) is a filed load flake, not a
+PR red; and the press step never presses on a printed `UNKNOWN`: it waits for `CLEAN` or reads
+every run of the required check on the head. Commands and evidence:
+`docs/internal/PR-MERGE-POLICY.md` § "Merge-seat test rules".
 
 *Origin: converged-but-red PRs reached "ready" framing twice (CI was not
 checked); amended 2026-08-30 after superseded same-SHA runs (#2410, #2419) read
-as not-green. Measurements: `docs/PR-MERGE-POLICY.md` § "PR merge-readiness —
+as not-green. Measurements: `docs/internal/PR-MERGE-POLICY.md` § "PR merge-readiness —
 CI-green gate (both modes)".*
 
 ## PR review convention (multi-agent mode)
@@ -385,12 +401,12 @@ enters the maintainer's merge queue:
    this directly, after the colleague-fairy-delegation lapse incident).
 
 **The merge gate itself**, operationalizing Lei's same ruling: a non-author
-peer APPROVE whose commit **is** the PR's current `headRefOid`, plus CI green
-on that same head. A new commit after approval needs a **fresh** peer review
+peer APPROVE of the PR's current head (what counts: "Approvals after a layer"
+below), plus CI green on that same head. A new commit after approval needs a **fresh** peer review
 and approval — the peer simply looks again (the `dev` ruleset already
 enforces this mechanically: dismiss-on-push + last-push approval) — never a
 fairy re-check or a diff-equivalence argument standing in for it. The merge
-seat still compares the approval's commit to the head directly rather than
+seat still checks the approval against the head directly rather than
 trusting `reviewDecision` alone: a manual force-push on this repo has been
 seen to keep a stale approval alive on a *different* PR (#2338, a manual
 force-push, explicitly NOT gh-stack's auto-rebase — see "Stacked PRs" below
@@ -535,12 +551,12 @@ exists to fix: a condition has no firing moment, and nobody watches for it.
 
 **A quiet week is not confirmation.** A preventive gate's successes are invisible
 by construction, so read the falsifier log — engram-alpha's
-`docs/conclusion-warrant-falsifier-log.md` — not the silence. It records cases
+`docs/internal/conclusion-warrant-falsifier-log.md` — not the silence. It records cases
 only, has no denominator, and can never confirm.
 
 *Evidence, the preventive-vs-additive argument, and the SET / OBJECT / AXIS
 diagnostic aid (n=4, one agent's carving, not a taxonomy): engram-alpha's
-`docs/PR-REVIEW-CONVENTION.md` § Conclusion warrant.*
+`docs/internal/PR-REVIEW-CONVENTION.md` § Conclusion warrant.*
 
 *(Author-side counterpart, already minted separately and deliberately not
 restated here: an error site the author can NAME in writing is the author's own
@@ -552,7 +568,7 @@ or the two prose copies drift.)*
 > pass. This copy is the condensed form (#3323); the umwelt and soma copies still
 > carry the long text until their sibling PRs land, after which the RULE portion
 > is byte-identical across all three again and each points at engram-alpha's
-> `docs/PR-REVIEW-CONVENTION.md` for the history and argument. The gate itself
+> `docs/internal/PR-REVIEW-CONVENTION.md` for the history and argument. The gate itself
 > lives in exactly one place (`engram-pr-reviewer.md`'s output contract), so
 > these three copies document one mechanism, never three copies of it.
 
@@ -595,8 +611,8 @@ record directly (`gh pr view <N> --comments`, or the REST fallback documented
 below if that command's `gh` version is affected) — **never infer it from a
 colleague approval being present.** A colleague approval is evidence the
 colleague pass happened; it is not evidence the fairy pass happened first, or
-at all. (2) The actual merge gate — a non-author peer APPROVE whose commit
-**is** the current `headRefOid`, plus CI green on that head.
+at all. (2) The actual merge gate — a non-author peer APPROVE of the
+current head ("Approvals after a layer" says what counts), plus CI green on it.
 
 **Check both surfaces, and read them whole.** Fairy rounds in this repo post as
 **comments**; a round transcribed by a colleague sits in a **review body**.
@@ -634,7 +650,7 @@ Two traps inside "conclusive", both of which have bitten:
   output are identical.
 
 *Narratives (umwelt#559, dsh-engram#41, umwelt#721, #2656) and the two wrong drafts
-of this rule: `docs/PR-REVIEW-CONVENTION.md` § The order is a rule.*
+of this rule: `docs/internal/PR-REVIEW-CONVENTION.md` § The order is a rule.*
 
 ### Stacked PRs (`gh-stack`) — the merge verb changes, and nothing in training knows it
 
@@ -678,9 +694,12 @@ knows it exists unless a surface carries it; this section is that surface (Lei,
   approval is dismissed on push depends on the base branch's
   `dismiss_stale_reviews_on_push` — **necessary on the evidence, not
   demonstrably sufficient**, so never treat it as a rule that predicts the
-  outcome. After every layer, read the approval back off `pulls/<N>/reviews` and
-  **compare its `commit_id` to the PR's current `headRefOid`**; never trust
-  `reviewDecision` alone. (On engram-alpha the setting is `true` on `dev`,
+  outcome. After every layer, read the approval back off `pulls/<N>/reviews`: it
+  counts only if its `commit_id` is the PR's current `headRefOid` AND its
+  `submitted_at` is not earlier than that commit's committer date.
+  **`commit_id == headRefOid` alone is never sufficient**: GitHub can re-point live
+  approvals onto newer heads (engram-alpha#2267). Otherwise get a fresh approval
+  (source of truth: engram-alpha `docs/internal/PR-MERGE-POLICY.md`, gate item 2). Never trust `reviewDecision` alone. (On engram-alpha the setting is `true` on `dev`,
   `false` on `main`.)
 - **Read branch protection via `rules/branches/<b>`, never
   `branches/<b>/protection`.** The classic endpoint answers by caller permission
@@ -689,7 +708,7 @@ knows it exists unless a surface carries it; this section is that surface (Lei,
   it discriminates nothing.
 
 *Evidence for every rule above (the dated measurements, the dismissal cases, the
-numbering sweep): engram-alpha's `docs/GH-STACK.md`.*
+numbering sweep): engram-alpha's `docs/internal/GH-STACK.md`.*
 
 > **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`** (Lei,
 > 2026-08-29: whichever repo a session starts from must load it), with no
@@ -706,7 +725,7 @@ numbering sweep): engram-alpha's `docs/GH-STACK.md`.*
 > (umwelt#816) — **do not read this note as "already synced across all
 > three"; it is synced once all three of this PR / soma#60 / umwelt#816
 > have merged.** The evidence behind this section — every dated measurement — now lives in
-> engram-alpha's `docs/GH-STACK.md`, and the sibling copies point there.
+> engram-alpha's `docs/internal/GH-STACK.md`, and the sibling copies point there.
 
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 
@@ -761,7 +780,7 @@ where a list read cannot see it (umwelt#561). Hence a title marker and a prompt
 close, not another comment.
 
 *The #1320 / #1415 case, the umwelt#561 story, and the version bisection:
-`docs/PR-REVIEW-CONVENTION.md` § PR inheritance.*
+`docs/internal/PR-REVIEW-CONVENTION.md` § PR inheritance.*
 
 > **Duplicated by hand in umwelt's `CLAUDE.md`**, with no generator or test binding
 > them — each file loads only with its own project. Change one, change the other in the
@@ -789,7 +808,9 @@ baton file, shown by `baton show`). That is **necessary, not sufficient**: the C
 above still applies at merge time; `baton merge` itself requires the turn to be at a
 maintainer-role holder (the pool sentinel, or a named agent who is neither the colleague nor
 the author) and does **not** read `phase` at all, so checking the phase (`baton show`) before
-`baton merge` is a rule for whoever sits at the merge seat, not something the tool enforces;
+`baton merge` is a rule for whoever sits at the merge seat, not something the tool enforces
+(an owner pressing their own PR under *Owner merge* cannot run `baton merge` at all, since
+the turn is theirs; they record the press with `baton close PR-N --status merged`);
 and a flip does not move the phase back out of `merge` — a PR the maintainer hands back to
 the author for rework keeps `phase: merge`, so a turn at the author means *not ready*
 whatever the phase says. `turn` stays the whose-move cursor: `baton advance`
@@ -857,7 +878,7 @@ since the multi-agent coordination work started in 2026-05.
 `name-leak-warn` **advises, never blocks** because it cannot itself tell a
 citation from a leak, so it asks the seat to decide. Umwelt and soma run no
 `name-leak-warn` gate — a merge seat there applies Lei's rule by reading the PR.
-(Rationale: engram-alpha's `docs/PR-REVIEW-CONVENTION.md` § Attribution convention.)
+(Rationale: engram-alpha's `docs/internal/PR-REVIEW-CONVENTION.md` § Attribution convention.)
 
 **For the merge seat:** an advisory `name-leak-warn` hit on a **bare agent handle** is never, by itself, grounds to hold a PR — not because the gate has ruled (it explicitly hasn't; see above), but because Lei's 2026-08-15 ruling already has, for this one case. The seat's job on a hit is first to identify *which* name matched — the gate reports one pattern per line and does not name the category, so a line with several candidate names does not tell you which one tripped it — and only then apply this rule to a bare agent handle specifically. Scrubbing a colleague's attribution under a self-invented "cite the PR, not the person" habit is the exact over-application this section exists to name.
 
@@ -866,7 +887,7 @@ citation from a leak, so it asks the seat to decide. Umwelt and soma run no
 > pass. The gates themselves are CI steps in engram-alpha's `pr-checks.yml` (umwelt has
 > its own separate node-ID gate; neither umwelt nor soma runs a `name-leak-warn`
 > gate); these three copies document Lei's rule, not the gates, and the evidence
-> behind it now lives in engram-alpha's `docs/PR-REVIEW-CONVENTION.md`, to which
+> behind it now lives in engram-alpha's `docs/internal/PR-REVIEW-CONVENTION.md`, to which
 > the sibling copies point.
 
 ## Project-as-bunch coordination (multi-agent mode)
@@ -1137,4 +1158,4 @@ sees a non-`closes` form, flag as a blocker and ask the author to rewrite.
 
 *Measurements and incidents behind these checks (the 2026-05-31 anchor, the
 backtick and fence tests, the query-lag timings, the commit-message exposure,
-umwelt#674/#632): `docs/PR-ISSUE-CLOSURE.md`.*
+umwelt#674/#632): `docs/internal/PR-ISSUE-CLOSURE.md`.*

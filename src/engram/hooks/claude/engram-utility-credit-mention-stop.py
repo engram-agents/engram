@@ -387,7 +387,10 @@ def bump_utility(
         _log(f"bump_utility: owner flag helper failed ({_code(_OWNER_FLAGS_FAILURE)}); using the direct path")
     if engram_restamp is None:
         raise RuntimeError(f"engram_restamp unavailable ({_RESTAMP_IMPORT_ERROR})")
-    conn = sqlite3.connect(db_path, timeout=5.0)
+    # #4107: NON-CREATING open (mode=rw fails with OperationalError when the file is absent). A plain
+    # connect would create an empty knowledge.db on a fresh home that mentions a node id before
+    # bootstrap has run, and bootstrap.py then refuses. The failure is logged by the caller.
+    conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=rw", uri=True, timeout=5.0)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         if restamp:
@@ -551,7 +554,7 @@ def _with_state_lock(lock_path, fn):
     are separate subprocesses invoked by Claude Code, hooks do not import each
     other, and engram_core.py may not be imported by a hook, so there is no
     shared import surface today, and a new shared module for ~15 lines isn't
-    worth the engineering (see spec docs/specs/1720-principle-state-write-race.md).
+    worth the engineering (see spec docs/internal/specs/1720-principle-state-write-race.md).
     If any copy changes, change the other two; tests/test_utility_state_lock_3658.py
     pins all three AST-identical (docstring dropped).
     """
@@ -619,7 +622,7 @@ def _emit_enactment(
 
     alpha #2574 WS3: construction (import + Emitter.init) is narrowed to its
     own try/except so an INIT_FAILED outcome is recordable and distinct
-    from an ordinary DROPPED emit (docs/2574-telemetry-design.md §1/§5) --
+    from an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md §1/§5) --
     this is the design doc's own decisive/measured site for the TIME axis
     (§1's NEGATIVE EVIDENCE discussion): this function's entire body is the
     emit, so `reached` cannot be counted here at all -- it belongs to the
@@ -852,7 +855,7 @@ def main() -> None:
 
     # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
     # its own try/except so an INIT_FAILED outcome is recordable and
-    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # distinct from an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md
     # §1/§5).
     emitter = None
     try:

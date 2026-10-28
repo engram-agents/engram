@@ -115,10 +115,10 @@ class Graph:
             "status, created_at) VALUES (?,?,?,?,?,?)",
             (node_id, event, root, "supersede", status, "2026-01-02T00:00:00"))
 
-    def contradict(self, target, status="active", cid=None):
+    def contradict(self, target, status="active", cid=None, rel="contradicts"):
         cid = cid or f"ct_{target}"
         self.node(cid, ntype="contradiction", conf=None, status=status)
-        self.edge(cid, target, "contradicts")
+        self.edge(cid, target, rel)
         return cid
 
     def filler(self):
@@ -253,6 +253,24 @@ def test_f2_partially_resolved_contradiction_still_contests(g):
     g.dependents("half", 3)
     g.contradict("half", status="partially_resolved")
     assert g.row("half")["weakness_reason"] == "contested"
+
+
+def test_f3_a_successor_reached_only_through_acknowledged_contradicts_is_contested(g):
+    """#4075: the live successor of a superseded side is contested (weakness 1.0, reason
+    'contested') when the only edge to it from an unsettled contradiction is
+    `acknowledged_contradicts`; once that contradiction is settled the override is gone.
+    Mutant: revert `_CONTESTED_SQL` to `relation = 'contradicts'` only."""
+    g.filler()
+    g.node("successor", conf=0.9)
+    g.dependents("successor", 3)
+    g.contradict("successor", rel="acknowledged_contradicts")
+    assert "successor" in g.ids(5)
+    r = g.row("successor")
+    assert r["weakness"] == 1.0 and r["weakness_reason"] == "contested"
+    g.conn.execute("UPDATE nodes SET status = 'resolved' WHERE id = 'ct_successor'")
+    g.commit()
+    r2 = g.row("successor")
+    assert r2["weakness"] == pytest.approx(0.1) and r2["weakness_reason"] is None
 
 
 # (g) transitive + dedup

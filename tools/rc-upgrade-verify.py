@@ -9,6 +9,13 @@ Never touches your live DB. Never touches another seat's graph.
 """
 import json, os, shutil, sqlite3, subprocess, sys, tempfile
 
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). The repo root (the parent of this
+# file's directory) is appended, never inserted at [0] (#2565, #4054).
+_TOOLS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _TOOLS_ROOT not in sys.path:
+    sys.path.append(_TOOLS_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
 def _first(cands, what):
     """Seat-portable path resolution. Ariadne caught a hardcoded interpreter
     here that was right on MY seat and absent on hers — the same shape as the
@@ -25,18 +32,27 @@ def _first(cands, what):
              f"\nSet the matching env var and re-run "
              f"(ENGRAM_HOME / ENGRAM_REPO / ENGRAM_PY).")
 
-ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
-REPO = _first([os.environ.get("ENGRAM_REPO"),
-               os.path.expanduser("~/engram-alpha"),
-               os.path.expanduser("~/src/engram-alpha"),
-               os.path.expanduser("~/GitHub/engram-alpha")], "the engram-alpha checkout")
-LIVE = _first([os.path.join(ENGRAM_HOME, "knowledge.db")], "your knowledge.db")
-PY   = _first([os.environ.get("ENGRAM_PY"),
-               os.path.join(os.path.expanduser("~"), ".engram", "venv", "bin", "python3"),
-               os.path.join(REPO, ".venv/bin/python3"),
-               os.path.join(REPO, "venv/bin/python3")], "a python3 with the repo deps")
-
-BASELINE = os.path.join(ENGRAM_HOME, "rc1-baseline.json")
+# A RELATIVE ENGRAM_HOME must not raise at import: the refusal is recorded, nothing below probes or touches
+# anything, and main() refuses at its first action (one stderr line, exit 2).
+try:
+    ENGRAM_HOME = str(owner_read.engram_home())
+    _HOME_REFUSAL = None
+except ValueError as _exc:
+    ENGRAM_HOME = None
+    _HOME_REFUSAL = str(_exc)
+if _HOME_REFUSAL is None:
+    REPO = _first([os.environ.get("ENGRAM_REPO"),
+                   os.path.expanduser("~/engram-alpha"),
+                   os.path.expanduser("~/src/engram-alpha"),
+                   os.path.expanduser("~/GitHub/engram-alpha")], "the engram-alpha checkout")
+    LIVE = _first([os.path.join(ENGRAM_HOME, "knowledge.db")], "your knowledge.db")
+    PY   = _first([os.environ.get("ENGRAM_PY"),
+                   os.path.join(os.path.expanduser("~"), ".engram", "venv", "bin", "python3"),
+                   os.path.join(REPO, ".venv/bin/python3"),
+                   os.path.join(REPO, "venv/bin/python3")], "a python3 with the repo deps")
+    BASELINE = os.path.join(ENGRAM_HOME, "rc1-baseline.json")
+else:
+    REPO = LIVE = PY = BASELINE = None
 
 def bank(nodes, entries, events, by_op, anomalies, gate_past):
     """Write this seat's OWN baseline where a post-upgrade check can read it.
@@ -153,6 +169,9 @@ def precount(db):
     return len(nodes), entries, len(roots), by_op
 
 def main():
+    if _HOME_REFUSAL is not None:
+        print(f"rc-upgrade-verify: {_HOME_REFUSAL}", file=sys.stderr)
+        sys.exit(2)
     print(f"USING: repo={REPO}\n       python={PY}\n       graph={LIVE}")
     tmp = tempfile.mkdtemp(prefix="engram_2411_verify_")
     try:

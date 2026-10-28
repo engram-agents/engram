@@ -4,7 +4,7 @@
     {
       "name": "agent-a",
       "label": "Agent A (Claude)",
-      "db": "/home/agent-alice/.engram/knowledge.db"
+      "db": "/path/to/ENGRAM_HOME/knowledge.db"
     },
     {
       "name": "agent-b",

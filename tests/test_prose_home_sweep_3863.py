@@ -452,12 +452,15 @@ def block_where(rel, predicate):
 
 
 MARKER_BLOCKS = {
-    "school-day printf JSON": (SCHOOL_SKILL, lambda b: b.startswith("printf '%s\\n' '{\"FIRST_ACTION\"")),
+    "school-day printf JSON": (SCHOOL_SKILL, lambda b: "printf '%s\\n' '{\"FIRST_ACTION\"" in b),
     "loop heredoc JSON": (LOOP_SKILL, lambda b: "/loop-mode.json <<JSON" in b),
 }
-EDIT_BLOCKS = {  # edit an existing marker with jq
-    "loop jq cadence edit": (LOOP_SKILL, lambda b: "cadence_seconds = $c" in b),
-    "loop jq state edit": (LOOP_SKILL, lambda b: "jq --arg s" in b),
+# Edit an existing marker through tools/loop_marker_set.py (#4025; the recipes were mktemp + jq + mv).
+# The dict keys keep their old "jq" wording: they are parametrize ids, and renaming them would
+# remove two test ids from the suite.
+EDIT_BLOCKS = {
+    "loop jq cadence edit": (LOOP_SKILL, lambda b: "loop_marker_set.py" in b and "cadence_seconds 3300" in b),
+    "loop jq state edit": (LOOP_SKILL, lambda b: "loop_marker_set.py" in b and "--string state" in b),
 }
 SCRATCH_BLOCK = (META_SKILL, lambda b: "<< 'SCRATCH'" in b)
 # Blocks that need systemd/Codex to run; they are only syntax-checked here.
@@ -479,6 +482,7 @@ def run_block(script, tmp_path, mode, extra_env=None):
     cwd.mkdir()
     env = {k: v for k, v in os.environ.items() if k not in ("ENGRAM_HOME", "CLAUDE_PLUGIN_ROOT")}
     env["HOME"] = str(user_home)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"  # macOS python3 otherwise writes ~/Library/Caches/com.apple.python under the temp HOME
     env.update(extra_env or {})
     if mode == "default":
         home = user_home / ".engram"
@@ -500,7 +504,9 @@ MODES = ["default", "custom-with-space"]
 @pytest.mark.parametrize("name", list(MARKER_BLOCKS))
 def test_marker_block_writes_valid_json_with_the_real_absolute_path(tmp_path, name, mode):
     rel, pred = MARKER_BLOCKS[name]
-    r, home = run_block(block_where(rel, pred), tmp_path, mode)
+    # the loop heredoc reads the cadence through loop_prompt.py --cadence, so it needs the tools tree
+    extra = {"CLAUDE_PLUGIN_ROOT": str(REPO / SRC)} if rel == LOOP_SKILL else None
+    r, home = run_block(block_where(rel, pred), tmp_path, mode, extra_env=extra)
     assert r.returncode == 0, r.stderr
     marker = home / "loop-mode.json"
     assert marker.is_file(), f"{name}: nothing written to {marker}"
@@ -509,33 +515,92 @@ def test_marker_block_writes_valid_json_with_the_real_absolute_path(tmp_path, na
     assert not leaked, f"{name}: a string field holds an unexpanded shell expression: {leaked}"
     if name.startswith("school"):
         assert f"Read {home}/loop-mode.json for" in data["loop_prompt"], data["loop_prompt"][:200]
-    assert f"{home}/marketplace/plugins/engram/tools/loop_prompt.py" in data["FIRST_ACTION"]
+    if name.startswith("school"):
+        assert f"{home}/marketplace/plugins/engram/tools/loop_prompt.py" in data["FIRST_ACTION"]
+    else:
+        # after #4007 the loop heredoc arms directly at cadence_seconds; no helper path in FIRST_ACTION
+        assert "cadence_seconds" in data["FIRST_ACTION"], data["FIRST_ACTION"][:200]
+
+
+def _old_plugin_root(tmp_path, body):
+    """A plugin root whose tools/loop_prompt.py is `body` (a seat on an older plugin)."""
+    root = tmp_path / "oldplugin"
+    (root / "tools").mkdir(parents=True)
+    (root / "tools" / "loop_prompt.py").write_text(body, encoding="utf-8")
+    return root
+
+
+_LOOKUP_FAILURES = {
+    "tool_missing": None,
+    "old_tool_without_cadence_flag": "import sys\nsys.stderr.write('error: unrecognized arguments: --cadence\\n')\nsys.exit(2)\n",
+    "old_tool_exits_zero_prints_nothing": "pass\n",
+    "tool_prints_non_integer": "print('<loop-wake> old prompt')\n",
+    "tool_prints_zero": "print(0)\n",
+}
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("failure", list(_LOOKUP_FAILURES))
+@pytest.mark.parametrize("name", list(MARKER_BLOCKS))
+def test_marker_block_cadence_lookup_failure_falls_back_loudly_to_valid_json(tmp_path, name, failure, mode):
+    """A failed cadence lookup (older plugin, missing tool) must not write `"cadence_seconds": ,`."""
+    rel, pred = MARKER_BLOCKS[name]
+    body = _LOOKUP_FAILURES[failure]
+    root = _old_plugin_root(tmp_path, body) if body is not None else tmp_path / "no-such-plugin"
+    r, home = run_block(block_where(rel, pred), tmp_path, mode, extra_env={"CLAUDE_PLUGIN_ROOT": str(root)})
+    assert r.returncode == 0, r.stderr
+    data = json.loads((home / "loop-mode.json").read_text(encoding="utf-8"))
+    assert data["cadence_seconds"] == 900 and type(data["cadence_seconds"]) is int, data
+    fallback = [ln for ln in r.stderr.splitlines() if "900" in ln and "fall" in ln.lower()]
+    assert len(fallback) == 1, r.stderr
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("name", list(MARKER_BLOCKS))
+def test_marker_block_follows_the_configured_cadence(tmp_path, name, mode):
+    rel, pred = MARKER_BLOCKS[name]
+    seed = (
+        'mkdir -p "${ENGRAM_HOME:-$HOME/.engram}" && '
+        "printf '%s' '{\"loop\":{\"heartbeat_cadence_seconds\":1200}}' > \"${ENGRAM_HOME:-$HOME/.engram}\"/config.json\n"
+    )
+    r, home = run_block(seed + block_where(rel, pred), tmp_path, mode,
+                        extra_env={"CLAUDE_PLUGIN_ROOT": str(REPO / SRC)})
+    assert r.returncode == 0, r.stderr
+    data = json.loads((home / "loop-mode.json").read_text(encoding="utf-8"))
+    assert data["cadence_seconds"] == 1200, data
+    assert r.stderr == ""
 
 
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("name", list(EDIT_BLOCKS))
 def test_marker_edit_blocks_work_in_the_chosen_home(tmp_path, name, mode):
-    if shutil.which("jq") is None:
-        pytest.skip("jq is not installed")
     rel, pred = EDIT_BLOCKS[name]
-    r, home = run_block(SEED_MARKER + block_where(rel, pred), tmp_path, mode)
+    r, home = run_block(SEED_MARKER + block_where(rel, pred), tmp_path, mode,
+                        extra_env={"CLAUDE_PLUGIN_ROOT": str(REPO / SRC)})
     assert r.returncode == 0, r.stderr
     data = json.loads((home / "loop-mode.json").read_text())
     assert data["cadence_seconds"] == 3300 or data["state"] == "<new state>", data
-    assert sorted(os.listdir(home)) == ["loop-mode.json"], os.listdir(home)  # tmp file was moved
+    assert sorted(os.listdir(home)) == ["loop-mode.json"], os.listdir(home)  # no temp file left
 
 
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("name", list(EDIT_BLOCKS))
 def test_marker_edit_blocks_path_handling_with_a_passthrough_jq(tmp_path, name, mode):
-    """Path handling only (mktemp, redirect, mv), for a machine without jq: `jq` is a
-    shell function that copies its last argument (the marker file) to stdout."""
+    """The recipes need no jq (#4025): with a `jq` on PATH that always fails they still run
+    and still change their key. (Before #4025 this test stubbed jq as a passthrough, to check
+    the mktemp / redirect / mv path handling on a machine without jq.)"""
     rel, pred = EDIT_BLOCKS[name]
-    stub = 'jq() { local f; for f in "$@"; do :; done; cat "$f"; }\n'
-    r, home = run_block(stub + SEED_MARKER + block_where(rel, pred), tmp_path, mode)
+    bindir = tmp_path / "failing-jq-bin"
+    bindir.mkdir()
+    jq = bindir / "jq"
+    jq.write_text("#!/bin/sh\necho 'jq must not be called' >&2\nexit 97\n")
+    jq.chmod(0o755)
+    env = {"CLAUDE_PLUGIN_ROOT": str(REPO / SRC), "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+    r, home = run_block(SEED_MARKER + block_where(rel, pred), tmp_path, mode, extra_env=env)
     assert r.returncode == 0, r.stderr
-    assert json.loads((home / "loop-mode.json").read_text())["state"] == "old"
-    assert sorted(os.listdir(home)) == ["loop-mode.json"], os.listdir(home)  # tmp file was moved
+    data = json.loads((home / "loop-mode.json").read_text())
+    assert data["cadence_seconds"] == 3300 or data["state"] == "<new state>", data
+    assert sorted(os.listdir(home)) == ["loop-mode.json"], os.listdir(home)  # no temp file left
 
 
 @pytest.mark.parametrize("mode", MODES)

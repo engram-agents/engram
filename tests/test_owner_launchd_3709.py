@@ -38,6 +38,7 @@ import pytest
 
 # Reuse the #3663 harness by import (tests/ is on sys.path; the module imports cleanly).
 from test_owner_launcher_3663 import (  # noqa: E402
+    _TINY_LAUNCHD_ENV,
     FLAG_ON,
     HOOK,
     HOOK_IO,
@@ -91,6 +92,9 @@ FIXTURES = REPO / "tests" / "fixtures" / "launchctl_3709"
 UID = os.getuid()
 OWNER_RUN_TIMEOUT = 8.0  # a preflight must exit by itself; an owner that is SERVING never does
 IS_DARWIN = sys.platform == "darwin"
+
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +157,7 @@ class DSandbox(Sandbox):
         Every call is still recorded; every other verb exits 0.  No real launchctl is involved."""
         _stub(self.stubs, "launchctl",
               f'#!/usr/bin/env bash\necho "$@" >> "{self.launchlog}"\n'
+              f'if [ "$1" = print ]; then exit 113; fi\n'   # #3939: "gone", so the post-bootout wait ends at once
               f'if [ "$1" = bootstrap ]; then echo "Bootstrap failed: {rc}" >&2; exit {rc}; fi\nexit 0\n')
 
     def run_env(self, *args: str, engram_home: str, drop: tuple = (), extra: dict | None = None,
@@ -164,6 +169,7 @@ class DSandbox(Sandbox):
         env["HOME"] = str(self.home)
         env["PATH"] = f"{self.stubs}:{os.environ['PATH']}"
         env["ENGRAM_HOME"] = engram_home
+        env.update(_TINY_LAUNCHD_ENV)   # #3939
         env.update(extra or {})
         return subprocess.run([bash, str(self.installer), *args, "--allow-path"], capture_output=True,
                               encoding="utf-8", errors="replace", env=env, cwd=str(self.tmp))
@@ -428,10 +434,16 @@ def test_k2_rendered_plist_passes_plutil_lint(tmp_path):
 def test_k2_install_makes_exactly_bootout_then_bootstrap(tmp_path):
     installed = _install(tmp_path)
     sb, home, plist, _d = installed
-    assert sb.launchctl_calls() == [
+    calls = sb.launchctl_calls()
+    # #3939: the installer waits for the service to be gone between the two (`print` polls)
+    assert [c for c in calls if c[0] != "print"] == [
         ["bootout", f"gui/{UID}/{label_for(home)}"],
         ["bootstrap", f"gui/{UID}", str(plist)],
-    ], sb.launchctl_calls()
+    ], calls
+    verbs = [c[0] for c in calls]
+    for i, v in enumerate(verbs):
+        if v == "print":
+            assert verbs.index("bootout") < i < verbs.index("bootstrap"), verbs
 
 
 @pytest.mark.parametrize("char", ["<", ">"])
@@ -996,13 +1008,16 @@ def test_a4_installer_on_any_other_bootstrap_failure_keeps_launchctls_rc(tmp_pat
     sb, home, r = _fail_bootstrap_with(tmp_path, 5)
     assert r.returncode == 5, (r.returncode, r.stdout, r.stderr)
     assert "no GUI domain" not in r.stderr, r.stderr
+    # #3939: retried (5 attempts in all) and the last attempt is reported loudly, with the manual command
+    assert [c[0] for c in sb.launchctl_calls()].count("bootstrap") == 5, sb.launchctl_calls()
+    assert "failed on all 5 attempts" in r.stderr and "Bootstrap failed: 5" in r.stderr, r.stderr
 
 
 def test_a4_installer_on_bootstrap_0_is_unchanged(tmp_path):
     sb, home, r = _fail_bootstrap_with(tmp_path, 0)
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     assert "Loaded." in r.stdout and "no GUI domain" not in r.stderr
-    assert [c[0] for c in sb.launchctl_calls()] == ["bootout", "bootstrap"]
+    assert [c[0] for c in sb.launchctl_calls() if c[0] != "print"] == ["bootout", "bootstrap"]   # #3939: `print` polls aside
 
 
 def test_a4_the_surface_daemon_path_shares_the_bootstrap_and_gets_the_same_handling_in_generic_words(tmp_path):

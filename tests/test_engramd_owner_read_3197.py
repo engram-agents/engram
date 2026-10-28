@@ -230,7 +230,7 @@ def test_o4_method_table_has_read_and_no_registration_verb(real_owner):
 def test_o5_bytes_cell_is_rejected_unsupported_value_type(home):
     """D2. Mutation: encode bytes (hex/base64/latin-1), or drop the cell, or
     let json.dumps raise -> red. The first person's `claim` is a BLOB."""
-    make_real_store(home, people=[("pn_0001", b"\x00\xffblob", "c", json.dumps({"name": "A"}))])
+    make_real_store(home, people=[("pn_0001", b"\xffblob", "c", json.dumps({"name": "A"}))])
     owner = eo.EngramdOwner(home, request_deadline=0.6)
     owner.start(install_signal_handlers=False)
     try:

@@ -18,6 +18,10 @@ from unittest.mock import MagicMock
 _HOOK = (Path(__file__).resolve().parents[1] / "src" / "engram" / "hooks" / "claude"
          / "engram-session-start-hook.py")
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_hook(engram_home, monkeypatch):
     monkeypatch.setenv("ENGRAM_HOME", str(engram_home))

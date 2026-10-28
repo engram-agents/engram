@@ -3,7 +3,7 @@
 Written BEFORE the implementation (contract-first; project CLAUDE.md,
 "Contract-first tests"). The contract is the R1-R13 refusal contract posted
 on #3196 (Sol, 2026-10-01) as answered by the design owner (2026-10-02);
-design source docs/2652-security-slice-design.md SS3.2-3.5, SS5. This file
+design source docs/internal/2652-security-slice-design.md SS3.2-3.5, SS5. This file
 covers the runtime/registration half (R1-R9, R12 loader). The build-time
 scanner half (R10-R12 drift gate, R13) lives in test_engramd_read_scan.py.
 

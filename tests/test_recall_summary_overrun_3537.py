@@ -258,9 +258,9 @@ def test_over_target_still_flags_needs_tightening_and_creates_node():
 def test_batch_items_carry_key_per_item():
     srv = fresh_server()
     observations = [
-        {"quoted_text": "bq1", "interpretation": "bi1", "claim": "batch over",
+        {"quoted_text": "bq1 in the cited source", "interpretation": "bi1", "claim": "batch over",
          "quote_type": "personal_communication", "recall_summary": "b" * 150},
-        {"quoted_text": "bq2", "interpretation": "bi2", "claim": "batch under",
+        {"quoted_text": "bq2 in the cited source", "interpretation": "bi2", "claim": "batch under",
          "quote_type": "personal_communication", "recall_summary": "b" * 100},
     ]
     r = json.loads(srv.engram_add_observation_batch(payload_json=json.dumps({

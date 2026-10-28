@@ -45,6 +45,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _HOOK_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
 _REAL_ARTIFACT_PATH = _REPO_ROOT / "src" / "engram" / "tool_capability_index.txt"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_session_start_module(engram_home: Path):
     """Load the Claude session-start hook with ENGRAM_HOME set.

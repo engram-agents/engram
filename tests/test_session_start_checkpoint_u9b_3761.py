@@ -63,6 +63,7 @@ from test_session_start_owner_read_3735 import (  # noqa: F401 -- fixtures and h
     stub_modules,
 )
 
+import engram_core  # noqa: E402
 import engramd_client as ec  # noqa: E402
 import engramd_read_registry as rr  # noqa: E402
 
@@ -76,6 +77,9 @@ CAP = 200
 # ---------------------------------------------------------------------------------------
 OLD_SQL = ("SELECT id, type, claim, recall_summary, created_at, is_current, status FROM nodes "
            "WHERE created_at >= ? ORDER BY created_at ASC")
+
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
 
 
 def old_block(mod, home: Path, injected_through: str) -> str:
@@ -643,14 +647,34 @@ def test_a_failing_statement_degrades_to_empty_with_one_recorded_failure(which, 
 
 # =======================================================================================
 # Characterization: embedded NUL in a claim (a KNOWN divergence, pinned as current behaviour)
+# The NUL rows are LEGACY rows: written before rung 9's guard (#3765 / #4087) existed. The guard
+# refuses new NULs and never alters existing ones, so the fixture inserts them PAST the trigger.
 # =======================================================================================
 
 def _nul_store(home: Path, normal: int, nuls: list[str]) -> None:
-    """`normal` ordinary claims n00000.., then the NUL claims after them by created_at."""
+    """`normal` ordinary claims n00000.., then the NUL claims after them by created_at.
+
+    The NUL claims are LEGACY rows (written before rung 9's guard): the normal rows go in with the
+    guard ACTIVE, then the two guard triggers are dropped on this throwaway store and the NUL rows
+    are inserted past them. Loud, not silent: the trigger names must exist before the drop and be
+    gone after it, so a renamed or missing trigger fails the cell with a clear message."""
+    names = set(engram_core._TEXT_NUL_GUARD_TRIGGER_NAMES)
     db = build_empty_store(home)
     conn = sqlite3.connect(str(db))
+
+    def _guard_triggers() -> set[str]:
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN (%s)"
+            % ",".join("?" * len(names)), tuple(names))}
+
     for i in range(normal):
         ins(conn, f"n{i:05d}", f"claim number {i}", None, ts(i))
+    assert _guard_triggers() == names, (
+        f"fixture precondition: expected exactly the rung-9 guard triggers {sorted(names)} on the "
+        f"fresh store, found {sorted(_guard_triggers())}; the guard's shape changed")
+    for name in sorted(names):
+        conn.execute(f'DROP TRIGGER "{name}"')
+    assert _guard_triggers() == set(), "fixture: guard triggers still present after DROP"
     for k, claim in enumerate(nuls):
         ins(conn, f"x{k:05d}", claim, None, ts(normal + k))
     conn.commit()
@@ -658,7 +682,8 @@ def _nul_store(home: Path, normal: int, nuls: list[str]) -> None:
 
 
 def test_embedded_nul_claim_characterization_old_and_new_differ_under_the_cap(home, monkeypatch):
-    """CHARACTERIZATION, not a claim of equality. Known divergence: SQLite text functions stop at
+    """CHARACTERIZATION, not a claim of equality. The NUL rows are LEGACY rows (written before
+    rung 9's guard), inserted past the trigger by `_nul_store`. Known divergence: SQLite text functions stop at
     the first NUL, Python does not. The design seat decides accept-vs-fix. If this cell goes red the
     behaviour changed, and the PR body / ledger statement about NUL must change with it.
 
@@ -688,7 +713,8 @@ def test_embedded_nul_claim_characterization_old_and_new_differ_under_the_cap(ho
 
 
 def test_embedded_nul_claim_characterization_nul_rows_past_the_cap_are_invisible(home, monkeypatch):
-    """CHARACTERIZATION. Known divergence (see the sibling cell): the design seat decides
+    """CHARACTERIZATION. The NUL rows are LEGACY rows (written before rung 9's guard), inserted
+    past the trigger by `_nul_store`. Known divergence (see the sibling cell): the design seat decides
     accept-vs-fix; if this cell goes red the behaviour changed and the PR body / ledger statement
     about NUL must change with it.
 

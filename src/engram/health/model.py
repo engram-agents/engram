@@ -182,7 +182,7 @@ SIGNALS: dict[str, Callable[[sqlite3.Connection], float | _Unavailable]] = {
 # longer literally ONE shared curve object for all six admitted metrics.
 #
 # [engram-alpha#2905 PR-A, 2026-09-13] TWO MORE curves joined the registry
-# from the 2026-09-13 Lei+Kepler curves session (see docs/design/
+# from the 2026-09-13 Lei+Kepler curves session (see docs/internal/design/
 # health-v1-curves-session-2026-09-13.md): BADNESS_PENDING_PREMISE_CURVE
 # ("badness_pending_premise") and GOODNESS_COVERAGE_CURVE
 # ("goodness_coverage"). The four-metric "goodness_default" statement two

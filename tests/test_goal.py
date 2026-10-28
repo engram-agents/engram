@@ -160,7 +160,7 @@ def test_goal_accepted_as_context():
         "motivation": "Context test",
     })
     obs = client.call("engram_add_observation", {
-        "quoted_text": "Test data",
+        "quoted_text": "Test data in the cited source",
         "interpretation": "For testing",
         "claim": "A real claim for premise",
         "quote_type": "hard_data",
@@ -186,7 +186,7 @@ def test_goal_rejected_in_contradict():
         "motivation": "Test",
     })
     obs = client.call("engram_add_observation", {
-        "quoted_text": "Test",
+        "quoted_text": "Test in the cited source",
         "interpretation": "Test",
         "claim": "A claim",
         "quote_type": "hard_data",

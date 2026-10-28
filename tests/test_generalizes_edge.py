@@ -373,6 +373,7 @@ def _new_conn():
             id TEXT PRIMARY KEY,
             type TEXT NOT NULL,
             is_current INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'active',
             superseded_by TEXT,
             claim TEXT,
             recall_summary TEXT,
@@ -407,9 +408,13 @@ def _add_edge(conn, source_id, target_id, relation):
     )
 
 
-def test_chain_superseded_rung_resolves_to_current():
-    """Chain walks through a superseded node and returns the CURRENT
-    version (the #1195 508-vs-162-vs-143 hazard the epic's design names)."""
+def test_chain_does_not_surface_or_resolve_a_superseded_rung():
+    """#3542 (Lei, 2026-10-21; was test_chain_superseded_rung_resolves_to_current).
+    The chain is a cycle judge, so it walks LIVE edges only and resolves nothing:
+    the edge from the superseded cs_OLD is provenance. ls_X is its own head, and
+    neither the retired cs_OLD nor its successor cs_NEW is reached. (Carrying the
+    edge to the successor, as engram_outgrow_cornerstone does, is what puts the
+    current version into the chain.)"""
     server = fresh_server()
     core = server.core
     conn = _new_conn()
@@ -419,19 +424,22 @@ def test_chain_superseded_rung_resolves_to_current():
     _add_edge(conn, "cs_OLD", "ls_X", "generalizes")
 
     chain = core.generalization_chain(conn, "ls_X")
-    assert "cs_NEW" in chain["heads"], chain
-    assert "cs_OLD" not in chain["nodes"], chain
-    assert chain["nodes"]["ls_X"]["parents"] == ["cs_NEW"], chain
+    assert chain["heads"] == ["ls_X"], chain
+    assert set(chain["nodes"]) == {"ls_X"}, chain
+    assert chain["nodes"]["ls_X"]["parents"] == [], chain
+
+    # control: the same edge carried onto the live successor IS in the chain
+    _add_edge(conn, "cs_NEW", "ls_X", "generalizes")
+    carried = core.generalization_chain(conn, "ls_X")
+    assert carried["heads"] == ["cs_NEW"] and "cs_OLD" not in carried["nodes"], carried
 
 
-def test_mutation_check_resolve_to_current_actually_resolves():
-    """Mutation-verify the supersede-resolution step: temporarily neutralize
-    core._resolve_to_current to identity (never follow the supersedes
-    chain) and confirm the SAME fixture that
-    test_chain_superseded_rung_resolves_to_current expects to resolve to
-    cs_NEW instead surfaces the stale cs_OLD -- proving the original test
-    exercises real resolution, not a coincidence of the fixture shape.
-    """
+def test_mutation_check_chain_live_template_is_what_hides_the_superseded_rung():
+    """Mutation-verify the liveness step (was
+    test_mutation_check_resolve_to_current_actually_resolves, which neutralised a
+    resolver the chain no longer calls). Swap the chain's live/target SQL template
+    for the all-stored one and the SAME fixture surfaces the retired cs_OLD as a
+    head; restore and it is hidden again."""
     server = fresh_server()
     core_mod = sys.modules["engram_core"]
     conn = _new_conn()
@@ -440,21 +448,18 @@ def test_mutation_check_resolve_to_current_actually_resolves():
     _add_node(conn, "ls_X", node_type="lesson")
     _add_edge(conn, "cs_OLD", "ls_X", "generalizes")
 
-    original = core_mod._resolve_to_current
+    original = core_mod._DAG_EDGES_LIVE_TARGET_SQL
     try:
-        core_mod._resolve_to_current = lambda c, nid: nid  # identity: never resolves
+        core_mod._DAG_EDGES_LIVE_TARGET_SQL = core_mod._DAG_EDGES_ALL_STORED_TARGET_SQL
         chain = core_mod.generalization_chain(conn, "ls_X")
         assert "cs_OLD" in chain["heads"], (
-            "mutation check did not reproduce the stale-surface bug -- "
-            f"resolution may not be the actual fixer: {chain}"
+            "mutation did not reproduce the stale-surface bug -- liveness may not "
+            f"be what hides it: {chain}"
         )
-        assert "cs_NEW" not in chain["nodes"], chain
     finally:
-        core_mod._resolve_to_current = original
+        core_mod._DAG_EDGES_LIVE_TARGET_SQL = original
 
-    # Restore verified: the real resolution surfaces cs_NEW again.
-    chain2 = core_mod.generalization_chain(conn, "ls_X")
-    assert "cs_NEW" in chain2["heads"], chain2
+    assert core_mod.generalization_chain(conn, "ls_X")["heads"] == ["ls_X"]
 
 
 def test_chain_multiple_parents_returns_both_heads():
@@ -926,81 +931,90 @@ def test_chain_hydration_is_two_queries_regardless_of_chain_size():
 # `heads: []` + `truncated: False` -- indistinguishable from a clean result.
 
 
-def test_cycle_guard_sees_through_a_generically_superseded_endpoint():
-    """The #2812 blocker, at fixture level.
+def _path_only_through_a_non_current_node_fixture(dead_is_current=0):
+    """ls_C --generalizes--> cs_A --generalizes--> ls_B, where cs_A is
+    superseded the way the GENERIC tool leaves it (is_current=0 +
+    superseded_by, edges NOT carried). Writing ls_B generalizes ls_C would close
+    ls_C -> cs_A -> ls_B -> ls_C -- but only THROUGH cs_A.
 
-    cs_A generalizes ls_B. cs_A is then superseded to cs_A2 the way the
-    GENERIC tool leaves it: is_current=0 + superseded_by, edge NOT carried.
-    Adding ls_B generalizes cs_A2 would close a cycle in the RESOLVED graph
-    (cs_A2 -> ls_B -> cs_A2), so the guard must refuse it.
+    Three readings of that fixture, and the cells below pin each:
+      * resolving cs_A onto cs_A2 (the pre-#3542 guard): the path is
+        ls_C -> cs_A2 -> ls_B, so the write is refused;
+      * counting cs_A as the live node it is not (liveness filter off): the
+        raw path exists, so the write is refused;
+      * current edges only (#3542): both edges touch the non-current cs_A, so
+        neither counts and the write is admitted.
+    With ``dead_is_current=1`` cs_A is a live node and the SAME edges are a live
+    cycle."""
+    conn = _new_conn()
+    _add_node(conn, "cs_A", is_current=dead_is_current,
+              superseded_by="cs_A2" if not dead_is_current else None)
+    _add_node(conn, "cs_A2", is_current=1)
+    _add_node(conn, "ls_B", node_type="lesson")
+    _add_node(conn, "ls_C", node_type="lesson")
+    _add_edge(conn, "ls_C", "cs_A", "generalizes")
+    _add_edge(conn, "cs_A", "ls_B", "generalizes")
+    return conn
 
-    Under the pre-fix current-only filter the guard saw no outgoing edge
-    from cs_A2 at all and returned None -- the edge was created.
-    """
+
+def test_cycle_guard_admits_a_path_that_exists_only_through_a_non_current_node():
+    """#3542 (Lei, 2026-10-21): the write guard walks CURRENT edges only, so a
+    path through a superseded node is provenance and the write is admitted --
+    where the #2812 guard resolved cs_A onto cs_A2 and refused it. What decides
+    this is liveness: the control (same edges, cs_A live) is refused."""
     server = fresh_server()
     core = server.core
-    conn = _new_conn()
-    _add_node(conn, "cs_A", is_current=0, superseded_by="cs_A2")
-    _add_node(conn, "cs_A2", is_current=1)
-    _add_node(conn, "ls_B", node_type="lesson")
-    _add_edge(conn, "cs_A", "ls_B", "generalizes")  # stale, uncarried
-
-    path = core._generalizes_cycle_path(conn, "ls_B", "cs_A2")
-    assert path is not None, (
-        "guard did not see the cycle through the superseded endpoint -- "
-        "this is the #2812 blocker"
-    )
-    assert "ls_B" in path and "cs_A2" in path, path
+    conn = _path_only_through_a_non_current_node_fixture(dead_is_current=0)
+    assert core._generalizes_cycle_path(conn, "ls_B", "ls_C") is None
+    live = _path_only_through_a_non_current_node_fixture(dead_is_current=1)
+    cyc = core._generalizes_cycle_path(live, "ls_B", "ls_C")
+    assert cyc is not None and cyc[0] == cyc[-1] == "ls_B", cyc
+    assert "cs_A" in cyc, cyc
 
 
-def test_mutation_check_cycle_guard_resolution_is_what_finds_it():
-    """Neutralize resolution to identity and confirm the guard goes BLIND
-    to the same fixture -- proving the resolve step is what closes the hole
-    rather than some incidental property of the fixture.
-    """
+def test_cycle_guard_liveness_predicate_is_what_admits_the_provenance_path():
+    """Neutralise the liveness template the guard reads (``_DAG_EDGES_LIVE_ALL_SQL``
+    -> the all-stored one) and the guard goes blind to the distinction: it now refuses the provenance path.
+    Proves the admit in the sibling cell comes from liveness, not from some
+    incidental property of the fixture, and that no resolution step is involved
+    (the resolver is left untouched here)."""
     core_mod = sys.modules["engram_core"]
-    conn = _new_conn()
-    _add_node(conn, "cs_A", is_current=0, superseded_by="cs_A2")
-    _add_node(conn, "cs_A2", is_current=1)
-    _add_node(conn, "ls_B", node_type="lesson")
-    _add_edge(conn, "cs_A", "ls_B", "generalizes")
-
-    original = core_mod._resolve_to_current
+    conn = _path_only_through_a_non_current_node_fixture(dead_is_current=0)
+    original = core_mod._DAG_EDGES_LIVE_ALL_SQL
     try:
-        core_mod._resolve_to_current = lambda c, nid: nid  # never resolves
-        blind = core_mod._generalizes_cycle_path(conn, "ls_B", "cs_A2")
-        assert blind is None, (
-            "mutation did not reproduce the blindness -- resolution may not "
-            f"be the mechanism actually closing this hole: {blind}"
-        )
+        # the live template swapped for the all-stored one: every edge counts
+        core_mod._DAG_EDGES_LIVE_ALL_SQL = core_mod._DAG_EDGES_ALL_STORED_ALL_SQL
+        blind = core_mod._generalizes_cycle_path(conn, "ls_B", "ls_C")
+        assert blind is not None and "cs_A" in blind, (
+            f"with liveness neutralised the provenance path must be refused: {blind}")
     finally:
-        core_mod._resolve_to_current = original
-
-    assert core_mod._generalizes_cycle_path(conn, "ls_B", "cs_A2") is not None
+        core_mod._DAG_EDGES_LIVE_ALL_SQL = original
+    assert core_mod._generalizes_cycle_path(conn, "ls_B", "ls_C") is None
 
 
 def test_chain_reports_cycle_detected_rather_than_a_benign_empty_heads():
-    """A cycle in the resolved graph must be reported, not rendered as a
+    """A cycle among CURRENT nodes must be reported, not rendered as a
     well-formed walk with no heads.
 
     WS2 consumes this return shape; `heads: []` with `truncated: False` is
     structurally impossible in a valid DAG, so it needs its own signal
-    rather than looking exactly like a clean result.
+    rather than looking exactly like a clean result. (#3542: the cycle is now
+    judged over current edges only; one that closes only through a superseded
+    node is NOT a cycle, pinned in test_dag_current_only_3542.py C8.)
     """
     server = fresh_server()
     core = server.core
     conn = _new_conn()
-    _add_node(conn, "cs_A", is_current=0, superseded_by="cs_A2")
     _add_node(conn, "cs_A2", is_current=1)
     _add_node(conn, "ls_B", node_type="lesson")
-    _add_edge(conn, "cs_A", "ls_B", "generalizes")   # resolves to cs_A2 -> ls_B
-    _add_edge(conn, "ls_B", "cs_A2", "generalizes")  # ls_B -> cs_A2 : cycle
+    _add_edge(conn, "cs_A2", "ls_B", "generalizes")  # cs_A2 -> ls_B
+    _add_edge(conn, "ls_B", "cs_A2", "generalizes")  # ls_B -> cs_A2 : live cycle
 
     chain = core.generalization_chain(conn, "ls_B")
     assert chain["heads"] == [], chain
     assert chain["truncated"] is False, chain
     assert chain["cycle_detected"] is True, (
-        "a resolved-graph cycle rendered as a benign complete walk", chain
+        "a live cycle rendered as a benign complete walk", chain
     )
 
 

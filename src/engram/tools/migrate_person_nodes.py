@@ -371,7 +371,18 @@ def main():
         print("Use --db PATH to specify the correct path.", file=sys.stderr)
         sys.exit(1)
 
-    run_report(args.db)
+    # #3882: an offline repair tool. The report is read-only but still opens the live store, so ALL of its
+    # opens go under the one store-maintenance lock, taken before the first, held to the end of the run:
+    # a report cannot run while an owner is live (stop the owner first; the refusal says how).
+    # Imported here, not at module level: importing this tool opens nothing.
+    import engram_core as core
+    lock_fd = core.acquire_store_maint_lock_or_report(args.db, "migrate_person_nodes")
+    if lock_fd is None:
+        sys.exit(core.STORE_MAINT_REFUSED_EXIT)
+    try:
+        run_report(args.db)
+    finally:
+        core.release_store_maint_lock(lock_fd)
 
 
 if __name__ == "__main__":

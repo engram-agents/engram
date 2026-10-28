@@ -53,6 +53,28 @@ except ImportError:
     _Indexer = None  # type: ignore[assignment]
 
 
+# Inline copy, not an import: viz/data modules import only the viz package; no tree-root module is guaranteed on sys.path (see the guarded engram_log_indexer import).
+# Pinned identical to every other copy by tests/test_bounded_sibling_lookups_3983.py.
+def _bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 def _find_indexer_dir(start: Path) -> Path | None:
     """Walk upward from *start* to find the nearest ancestor directory that
     itself contains ``engram_log_indexer.py`` -- the directory to report in
@@ -76,7 +98,7 @@ def _find_indexer_dir(start: Path) -> Path | None:
     the original would give if run from an unexpected location, never
     raises.
     """
-    for candidate in [start, *start.parents]:
+    for candidate in _bounded_parents(start):  # own tree only (#3983)
         try:
             found = (candidate / "engram_log_indexer.py").is_file()
         except OSError:

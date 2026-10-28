@@ -7,7 +7,7 @@ protocol and ships a client that speaks it; `tests/test_engramd_client.py`
 builds a small fake socket server as its own test fixture, since no real
 owner exists to test against.
 
-Full design context: docs/2652-engrammanager-design.md SS5 (Rider 2 -- what
+Full design context: docs/internal/2652-engrammanager-design.md SS5 (Rider 2 -- what
 a caller sees when the owner is down).
 
 NAMING NOTE (read before reaching for a familiar-looking name): this module
@@ -69,6 +69,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import engram_home_resolver
 import engram_pidfile
 
 # ---------------------------------------------------------------------------
@@ -78,7 +79,7 @@ import engram_pidfile
 # MAJOR.MINOR -- this client's own wire-contract version (the owner reuses it:
 # engramd_owner takes ec.CONTRACT_VERSION, so there is exactly one copy).
 # "1.1" (U4d, #3197): the owner gained the client-facing `read` method -- an
-# added method is a MINOR change (docs/2652-engrammanager-design.md SS5.3).
+# added method is a MINOR change (docs/internal/2652-engrammanager-design.md SS5.3).
 # "1.2" (U11, #3822): the owner gained its first WRITE, the typed `use_reward` method -- again an added
 # method, so MINOR (`check_contract_version` tolerates minor skew; an older owner answers a
 # `use_reward` call with Rejected(unknown_operation), which the caller must treat as loud).
@@ -102,7 +103,7 @@ DEFAULT_SOCKET_NAME = "engramd.sock"  # distinct from the existing recall-daemon
 # it needs its own dedicated, ACL-stripped, 0700 directory. Borges's
 # ruling on issue #3194: keep the shipped socket FILENAME
 # (DEFAULT_SOCKET_NAME) and move only its parent directory -- the property
-# §2.1 of docs/2652-security-slice-design.md asks for is the directory,
+# §2.1 of docs/internal/2652-security-slice-design.md asks for is the directory,
 # not the name.
 SOCKET_DIR_NAME = "run"
 # The owner's pidfile name (relative to $ENGRAM_HOME) and the argv substring of
@@ -176,7 +177,7 @@ MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB -- generous for a JSON control-p
 # any of the above risks accidentally making an error result look like
 # "empty-but-present" data to a caller who does `if result:` instead of an
 # isinstance() check -- exactly the manufactured-null failure mode
-# docs/2652-engrammanager-design.md SS5.1 forbids. Leave this section alone.
+# docs/internal/2652-engrammanager-design.md SS5.1 forbids. Leave this section alone.
 
 
 @dataclass(frozen=True)
@@ -272,7 +273,7 @@ EngramdResult = Ok | Unavailable | Rejected
 # ---------------------------------------------------------------------------
 #
 # This is the SHIPPED policy -- U3's real owner process calls this on every
-# incoming request (docs/2652-engrammanager-design.md SS5). It must live
+# incoming request (docs/internal/2652-engrammanager-design.md SS5). It must live
 # here, not only reimplemented inside a test fixture, or no possible change
 # to this module could ever be caught by a version-policy test (round-5
 # should-fix 2 -- before this function existed, the version comparison
@@ -335,8 +336,9 @@ def _resolve_socket_path(socket_path: Path | None) -> Path:
     src/engram/hooks/claude/engram-lesson-tripwire-hook.py:77)."""
     if socket_path is not None:
         return socket_path
-    engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-    return socket_path_for_home(Path(engram_home))
+    # #3863 step 2: a process entry point, so a RELATIVE ENGRAM_HOME raises ValueError (the rulings:
+    # engram_home_resolver's docstring).
+    return socket_path_for_home(engram_home_resolver.engram_home())
 
 
 def socket_path_for_home(home: Path) -> Path:
@@ -476,7 +478,7 @@ def _unavailable(
     *, socket_path: str, bound: float, detail: str, request_id: str | None, reason: str
 ) -> Unavailable:
     """Build an Unavailable result carrying concrete, actionable recovery
-    guidance in the response payload itself (docs/2652-engrammanager-design.md
+    guidance in the response payload itself (docs/internal/2652-engrammanager-design.md
     SS5.5: guidance travels in the payload, not a log line, and the two kinds
     -- agent-actionable vs. human-only -- are distinguishable without parsing
     prose). `reason` is REQUIRED (no default): it is set by what the site
@@ -617,7 +619,7 @@ def _arm_timeout_or_unavailable(
     sendall(), and each iteration of the recv() loop -- so a slowly-
     trickling owner cannot make the total call take an unbounded multiple
     of `bound` the way a single settimeout(bound) set once at entry would
-    (round-5 should-fix 1; docs/2652-engrammanager-design.md SS5.1).
+    (round-5 should-fix 1; docs/internal/2652-engrammanager-design.md SS5.1).
     Recomputing `remaining` between ops alone, without re-arming
     settimeout() with that exact value each time, would under-specify and
     can still overshoot -- both steps are required together."""
@@ -700,7 +702,7 @@ def _call(
     to EACH blocking call independently (connect/sendall/each recv), so a
     fixed settimeout(timeout) set once at the top lets a slowly-trickling
     owner make the total call take an unbounded multiple of the requested
-    bound (docs/2652-engrammanager-design.md SS5.1 -- "a hang is
+    bound (docs/internal/2652-engrammanager-design.md SS5.1 -- "a hang is
     indistinguishable from a slow graph"; round-5 should-fix 1). Instead,
     `deadline` is computed once, and `_arm_timeout_or_unavailable()` is
     called before EVERY blocking op to recompute the remaining budget and
@@ -994,6 +996,9 @@ def read(
     without a request_id' true (the other half is write()'s own guarantee
     below).
 
+    Raises ValueError (naming the value) when socket_path=None and ENGRAM_HOME is RELATIVE: the
+    default socket path is resolved from the environment (#3863 step 2), and nothing else here raises.
+
     `snapshot()` (there is no separate wrapper: it is `read("snapshot",
     {"dest_path": ...})`): an `Unavailable` result -- a dropped connection --
     must be read as INDETERMINATE, never as "nothing happened" and never as
@@ -1039,7 +1044,10 @@ def write(
     attempt) or freshly generated (uuid4, as a string) otherwise. The
     request_id used is echoed back on EVERY returned result type (Ok,
     Unavailable, AND Rejected) so a caller that got Unavailable can retry
-    by passing that same id back in."""
+    by passing that same id back in.
+
+    Raises ValueError (naming the value) when socket_path=None and ENGRAM_HOME is RELATIVE (#3863 step 2),
+    before any request_id is minted or any byte is sent."""
     rid = request_id or str(uuid.uuid4())
     return _call(
         method,

@@ -37,6 +37,10 @@ from unittest.mock import patch
 
 import pytest
 
+# #4091: the hook loads below run its module-level sys.path.insert; the shared window
+# (#4029) puts sys.path and the src/engram modules back after each test.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 HOOK_DIR = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude"
 _SURFACE_PATH = HOOK_DIR / "engram-surface-hook.py"

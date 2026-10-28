@@ -44,6 +44,9 @@ FIXTURE_PKG_BASE = tempfile.mkdtemp(prefix="engram_scope_export_pkg_")
 atexit.register(lambda: shutil.rmtree(FIXTURE_HOME, ignore_errors=True))
 atexit.register(lambda: shutil.rmtree(FIXTURE_PKG_BASE, ignore_errors=True))
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # ---------------------------------------------------------------------------
 # Helpers: build a minimal fixture graph in FIXTURE_HOME

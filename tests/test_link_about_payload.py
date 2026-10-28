@@ -200,7 +200,7 @@ def test_superseded_node_id_rejected_by_is_current_guard():
     _, obs_id = _seed_self_anchor_and_obs(server)
     obs2_id = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "url": "https://example.com/b", "title": "B",
-        "quoted_text": "B says C.", "interpretation": "B claims C.", "claim": "C.",
+        "quoted_text": "B says C. in the cited source", "interpretation": "B claims C.", "claim": "C.",
         "quote_type": "attributed_analysis",
     })))["observation_id"]
     _supersede_node(server, obs_id, obs2_id)

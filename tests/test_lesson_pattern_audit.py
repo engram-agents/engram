@@ -41,6 +41,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TOOL_PATH = PROJECT_ROOT / "tools" / "lesson-pattern-audit.py"
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _import_audit():
     spec = importlib.util.spec_from_file_location("lesson_pattern_audit", TOOL_PATH)
@@ -540,12 +544,14 @@ class TestWriteRanks(unittest.TestCase):
         names = sorted(p.name for p in self.tmp.iterdir())
         self.assertEqual(names, sorted(["knowledge.db", "s1.jsonl", "ranks.json"]))
 
-    def test_empty_inventory_exits_2_and_writes_nothing(self):
-        err = io.StringIO()
+    def test_empty_inventory_exits_0_says_so_and_writes_nothing(self):
+        # alpha#3941: a recurring caller (engram-sleep) must not read "no transcripts" as a failure, and an
+        # empty rank file would read as "every lesson is rare".
+        err, out = io.StringIO(), io.StringIO()
         code = _audit.run_write_ranks(db_path=str(self.db), transcript_glob=str(self.tmp / "none*.jsonl"),
-                                      path=str(self.out), out=io.StringIO(), err=err)
-        self.assertEqual(code, 2)
-        self.assertIn("empty inventory", err.getvalue())
+                                      path=str(self.out), out=out, err=err)
+        self.assertEqual(code, 0)
+        self.assertIn("no transcripts found", out.getvalue())
         self.assertFalse(self.out.exists())
 
     def test_cli_flag_with_explicit_path(self):

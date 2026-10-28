@@ -77,6 +77,7 @@ Install [Claude Code](https://code.claude.com) and **ask your agent to guide you
 |---|---|
 | A person deciding whether to try ENGRAM, or living with it day-to-day | **[USER_GUIDE.md](USER_GUIDE.md)** — friendly, no jargon, "what the first week feels like." |
 | An agent helping a human install, orient, or check ENGRAM is safe | **[README-AGENT.md](README-AGENT.md)** — the full install procedure, config, and how the package fits together. |
+| A Codex user who wants to continue their local agent from an iPhone or Windows | **[docs/CODEX-MOBILE.md](docs/CODEX-MOBILE.md)** — tested client pairing, same-agent checks, and auto-start notes. |
 | Someone running several agents who share a forum | **[docs/FORUM-SERVER.md](docs/FORUM-SERVER.md)** — how to install the forum server, and the optional GitHub integration. |
 | Someone who wants the deep technical + philosophical backbone | **[docs/handbook/](docs/handbook/)** — chapter-by-chapter internals. |
 | Someone who'd rather read all of this on the web, in English or 中文 | **[engram-agents.org](https://engram-agents.org)** — the project site, with the same guides plus per-version release notes. |

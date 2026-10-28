@@ -46,7 +46,7 @@ from typing import Optional
 # Bootstrap: ensure forum_api is importable from tools/
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from forum_api import ForumClient, ForumHttpError, ForumNetworkError
+from forum_api import ForumClient, ForumHttpError, ForumNetworkError, engram_home, forum_url_from_config
 
 # ---------------------------------------------------------------------------
 # Frontmatter parsing (mirrors baton.py / coordination/markdown.py)
@@ -79,21 +79,24 @@ def _parse_participants(participants_str: str) -> list:
 # Config helpers (same as baton.py)
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-
-
 def _load_config() -> dict:
-    config_path = Path(ENGRAM_HOME) / "config.json"
+    # forum_api.engram_home() is the ONE resolution (#3863): ValueError on a relative ENGRAM_HOME (main refuses).
+    config_path = engram_home() / "config.json"
     if config_path.exists():
         try:
-            return json.loads(config_path.read_text())
+            parsed = json.loads(config_path.read_text())
         except (json.JSONDecodeError, OSError):
             pass
+        else:
+            # #4229: a non-dict top level (hand-edited) is treated as no config.
+            if isinstance(parsed, dict):
+                return parsed
     return {}
 
 
 def _get_agent_name(config: dict) -> str:
-    name = config.get("agent_name", "").strip()
+    _v = config.get("agent_name")  # #4137: null / non-string -> ""
+    name = _v.strip() if isinstance(_v, str) else ""
     if name:
         return name
     for envvar in ("USER", "LOGNAME"):
@@ -232,7 +235,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = _load_config()
+    try:
+        config = _load_config()
+    except ValueError as exc:  # a relative ENGRAM_HOME: refused before anything is read or POSTed (#3863)
+        print(f"baton-migrate: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     # Resolve projects-dir
     if args.projects_dir:
@@ -246,12 +253,9 @@ def main() -> None:
             projects_dir = Path(forum_home) / "projects"
 
     # Resolve forum URL
-    forum_url = (
-        args.forum_url
-        or (config.get("forum") or {}).get("url")
-        or os.environ.get("FORUM_URL")
-        or "http://localhost:5002"
-    )
+    # #4203: forum_api.forum_url_from_config is the same config -> $FORUM_URL -> default
+    # chain, with the type guards (a hand-edited non-dict forum / non-string url is absent).
+    forum_url = args.forum_url or forum_url_from_config(config)
 
     # Resolve agent name
     agent = (args.agent or _get_agent_name(config) or "baton-migrator").strip().lower()

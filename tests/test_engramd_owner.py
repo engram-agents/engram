@@ -6,7 +6,7 @@ on knowledge.db, speaking U1's already-built wire contract
 (src/engram/engramd_client.py) -- handshake (contract-version check on
 every request) + `ping` + `snapshot()`. **No domain operations of any
 kind** (no create_node, no retract) -- those are out of scope for this
-build; see docs/2652-engrammanager-design.md SS3 and SS5, and the U3 fairy
+build; see docs/internal/2652-engrammanager-design.md SS3 and SS5, and the U3 fairy
 spec, for the full reasoning this file's tests are checked against.
 
 The 10 numbered contract items below are issue #3096's body PLUS its
@@ -54,7 +54,7 @@ the actual mutated-run pytest output):
 Tests 11-18 below are #3194 (P1-U4a, "the owner socket permission layer" --
 0700 dir, peer credentials, stale-socket safety, end-to-end deadline),
 which builds on top of this file's original 10. See
-docs/2652-security-slice-design.md SS2 for the full design and SS5 for its
+docs/internal/2652-security-slice-design.md SS2 for the full design and SS5 for its
 own numbered test list (tests 1-5 and 20 there map onto tests 11-18 here;
 the mapping is noted per test below):
 
@@ -858,35 +858,34 @@ def test_silent_peer_is_dropped_within_deadline_and_owner_stays_up(owner_running
 
 
 # ---------------------------------------------------------------------------
-# Test 17 -- _resolve_engram_home() returns an absolute path (#3152 item
-# 2). Two different launch CWDs with the SAME relative ENGRAM_HOME string
-# resolve to the identical absolute path.
+# Test 17 -- a RELATIVE ENGRAM_HOME is REFUSED (#3863 step 2; was: returns an
+# absolute path, #3152 item 2). Borges's step-2 rulings on #3863, 2026-10-21:
+# the owner's goal, one owner per seat, is met only by refusal -- abspath still
+# gives two sockets for two launch cwds, so cwd-anchoring is NOT an exception.
+# Two launchers with the SAME relative string both fail, naming the value, and
+# nothing is bound or created under either cwd.
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_engram_home_returns_absolute_path_across_cwds(tmp_path, monkeypatch):
-    # launcher-a and launcher-b are SIBLING directories under a shared
-    # parent, so the SAME relative string "../engramhome" reaches the
-    # SAME absolute target from either one -- this is the realistic case
-    # #3152 item 2 names: two launchers at the same depth relative to a
-    # shared seat home, each launched from a different CWD.
+def test_resolve_engram_home_refuses_a_relative_value_across_cwds(tmp_path, monkeypatch):
     launcher_a = tmp_path / "launcher-a"
     launcher_b = tmp_path / "launcher-b"
     launcher_a.mkdir()
     launcher_b.mkdir()
-    expected_target = Path(os.path.abspath(str(tmp_path / "engramhome")))
 
     monkeypatch.setenv("ENGRAM_HOME", "../engramhome")
 
-    monkeypatch.chdir(launcher_a)
-    resolved_a = eo._resolve_engram_home(None)
+    for launcher in (launcher_a, launcher_b):
+        monkeypatch.chdir(launcher)
+        with pytest.raises(ValueError) as e:
+            eo._resolve_engram_home(None)
+        assert "../engramhome" in str(e.value)
+        # the owner itself refuses at construction: no socket path is ever derived, so nothing can be bound
+        with pytest.raises(ValueError):
+            eo.EngramdOwner()
 
-    monkeypatch.chdir(launcher_b)
-    resolved_b = eo._resolve_engram_home(None)
-
-    assert resolved_a.is_absolute()
-    assert resolved_b.is_absolute()
-    assert resolved_a == resolved_b == expected_target
+    assert not (tmp_path / "engramhome").exists()
+    assert list(launcher_a.iterdir()) == [] and list(launcher_b.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -2482,7 +2481,7 @@ def test_snapshot_runs_on_owner_internal_path_and_error_is_not_swallowed(engram_
          swallow the error (e.g. `except sqlite3.Error: pass`, falling
          through to the success response) -- this test must go red.
       3. The client-read connection's authorizer is never touched by a
-         snapshot() call (docs/2652-security-slice-design.md SS3.1: "no
+         snapshot() call (docs/internal/2652-security-slice-design.md SS3.1: "no
          authorizer swapping").
     """
     store_path = engram_home / eo.DEFAULT_STORE_NAME

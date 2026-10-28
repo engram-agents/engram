@@ -42,6 +42,9 @@ import pytest
 
 _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_snapshot(
     engram_home: Path,

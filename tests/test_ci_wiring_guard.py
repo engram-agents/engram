@@ -58,11 +58,11 @@ TESTS_YML = WORKFLOWS_DIR / "tests.yml"
 # A reason must be a non-empty string; a path that is no longer tracked is a
 # stale entry and fails the guard (dead entries must not accumulate).
 EXEMPT: dict[str, str] = {
-    "docs/archive/test_migrate_db_trust_tier.py": (
-        "archived, retired one-off migration test kept for history under docs/archive/"
+    "docs/internal/archive/test_migrate_db_trust_tier.py": (
+        "archived, retired one-off migration test kept for history under docs/internal/archive/"
     ),
-    "docs/archive/test_migrate_trust_tier_self_backfill.py": (
-        "archived, retired one-off migration test kept for history under docs/archive/"
+    "docs/internal/archive/test_migrate_trust_tier_self_backfill.py": (
+        "archived, retired one-off migration test kept for history under docs/internal/archive/"
     ),
 }
 

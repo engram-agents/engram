@@ -80,13 +80,23 @@ def _load_config() -> dict:
     """Load config.json from the ENGRAM home (or ENGRAM_CONFIG_PATH env var)."""
     p = _get_config_path()
     try:
-        return json.loads(p.read_text())
+        data = json.loads(p.read_text())
     except FileNotFoundError:
         print(f"tripwire: config not found at {p}", file=sys.stderr)
         sys.exit(EXIT_ERROR)
     except json.JSONDecodeError as e:
         print(f"tripwire: config parse error: {e}", file=sys.stderr)
         sys.exit(EXIT_ERROR)
+    # #4203: a non-dict top level (list / str / number / bool / null) is an
+    # invalid config: refuse like a missing or unparseable one.
+    if not isinstance(data, dict):
+        print(
+            f"tripwire: config top level is not a JSON object "
+            f"(got {type(data).__name__}) at {p}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_ERROR)
+    return data
 
 
 def _infer_approver(config: dict) -> str:
@@ -94,11 +104,17 @@ def _infer_approver(config: dict) -> str:
 
     opus   → agent_name (self-check: Opus verifies their own review had traces)
     sonnet → peer field (Sonnet verifies the peer's review had traces)
+
+    Invariant (#4146), for a dict ``config``: returns a non-empty ``str`` or exits
+    with EXIT_ERROR and a stderr message. Never raises anything else, never returns a non-string:
+    config.json is hand-edited, so a null / number / list value is treated as
+    missing (a non-string lineage falls through to the "cannot infer" exit).
     """
-    lineage = config.get("self_lineage", "")
+    raw_lineage = config.get("self_lineage", "")
+    lineage = raw_lineage if isinstance(raw_lineage, str) else ""
     if "opus" in lineage:
         name = config.get("agent_name")
-        if not name:
+        if not isinstance(name, str) or not name:
             print(
                 "tripwire: config missing 'agent_name' (needed for opus self-check); "
                 "supply --approver explicitly",
@@ -108,7 +124,7 @@ def _infer_approver(config: dict) -> str:
         return name
     if "sonnet" in lineage:
         peer = config.get("peer")
-        if not peer:
+        if not isinstance(peer, str) or not peer:
             print(
                 "tripwire: config has self_lineage containing 'sonnet' but no 'peer' field; "
                 "supply --approver explicitly",
@@ -116,8 +132,11 @@ def _infer_approver(config: dict) -> str:
             )
             sys.exit(EXIT_ERROR)
         return peer
+    shown = (f"{raw_lineage!r} (must be a string)"
+             if "self_lineage" in config and not isinstance(raw_lineage, str)
+             else repr(lineage))
     print(
-        f"tripwire: cannot infer approver from self_lineage={lineage!r}; "
+        f"tripwire: cannot infer approver from self_lineage={shown}; "
         "supply --approver explicitly",
         file=sys.stderr,
     )

@@ -63,6 +63,13 @@ if _TOOLS_DIR not in sys.path:
 
 import recall_repetition_analysis as rra  # noqa: E402  (reuse, do not reimplement)
 
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). The repo root is APPENDED, never
+# inserted at [0] (#2565, #4054): the insert(0) of _TOOLS_DIR above is the pre-existing one.
+_REPO_ROOT = os.path.dirname(_TOOLS_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
 
 def _add_engram_idf_to_path() -> None:
     """Put engram_idf.py on sys.path so the harness shares the canonical
@@ -118,10 +125,11 @@ DEFAULT_STOPLIST = JUNK_STOPLIST
 
 def resolve_engram_home(explicit: Optional[str]) -> str:
     """CLI arg > $ENGRAM_HOME env > ~/.engram default (matches
-    recall_repetition_analysis.py's _default_db_path() precedent)."""
+    recall_repetition_analysis.py's _default_db_path() precedent). The env/default branch goes through the one
+    resolver (#3863): a RELATIVE ENGRAM_HOME raises ValueError naming it (main() refuses before calling this)."""
     if explicit:
         return os.path.expanduser(explicit)
-    return os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+    return str(owner_read.engram_home())
 
 
 def resolve_seat_label(engram_home: str, explicit: Optional[str]) -> str:
@@ -1093,6 +1101,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "run before/after slices + deltas.",
     )
     args = parser.parse_args(argv)
+
+    if not args.engram_home:
+        try:
+            owner_read.engram_home()
+        except ValueError as exc:  # a relative ENGRAM_HOME: refused before any path is derived or any file is read
+            print(f"recall_measurement_harness: {exc}", file=sys.stderr)
+            return 2
 
     if args.split_at:
         try:

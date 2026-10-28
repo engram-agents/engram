@@ -109,6 +109,22 @@ date -u +%Y-%m-%dT%H:%M:%SZ > "$HOME/.engram/wake-checker-heartbeat"
 # Per-agent environment file (optional), same seam as the Linux side's
 # boot-env: ~/.engram/boot-env, sourced first so the whole
 # tmux -> agentctl -> claude chain inherits it.
+# A HOST-COMMON file (/Users/Shared/autostart/boot-env.common, override via
+# AGENT_BOOT_ENV_COMMON in the inherited environment) is sourced immediately
+# BEFORE it, so a seat's own boot-env wins. Absent is silent; present-but-
+# unreadable is one WARNING line in $LOG and the launch continues; a sourcing
+# failure aborts (set -e) exactly like a broken per-agent file.
+BOOT_ENV_COMMON_FILE="${AGENT_BOOT_ENV_COMMON:-/Users/Shared/autostart/boot-env.common}"
+if [[ -e "$BOOT_ENV_COMMON_FILE" ]]; then
+    if [[ -r "$BOOT_ENV_COMMON_FILE" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "$BOOT_ENV_COMMON_FILE"
+        set +a
+    else
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] WARNING: host-common boot-env '$BOOT_ENV_COMMON_FILE' exists but is not readable; launching without it" >> "$LOG"
+    fi
+fi
 BOOT_ENV_FILE="$HOME/.engram/boot-env"
 if [[ -r "$BOOT_ENV_FILE" ]]; then
     set -a

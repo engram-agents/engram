@@ -41,6 +41,9 @@ DECAY = 1.014
 BASE = 0.8
 SENTINEL_TURN = -7
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _make_db(path: Path, rows) -> None:
     conn = sqlite3.connect(str(path))

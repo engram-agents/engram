@@ -28,7 +28,7 @@ from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCAN_LEAKS = REPO_ROOT / "src" / "engram" / "tools" / "scan-leaks.py"
-EXAMPLE_CONFIG = REPO_ROOT / "docs" / ".scan-leaks-local.json.example"
+EXAMPLE_CONFIG = REPO_ROOT / "docs" / "internal" / ".scan-leaks-local.json.example"
 
 # append (not insert(0)) -- scan-leaks.py is loaded below by explicit file
 # path via importlib, so this dir doesn't need to win any name resolution;

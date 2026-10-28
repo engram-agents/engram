@@ -110,6 +110,9 @@ def rig(tmp_path):
             "HOME": str(home),
             "ENGRAM_HOME": str(home / ".engram"),
             "ENGRAM_HOOKS_DIR": str(hooks_dir),
+            # #3939: the spy answers every launchctl verb 0, so the post-bootout wait would run its
+            # full window; keep it short
+            "ENGRAM_SETUP_LAUNCHD_POLL_S": "0.01", "ENGRAM_SETUP_LAUNCHD_WAIT_S": "0.05",
         }
         for k in ("ENGRAM_SETUP_ALLOW_PATH", *unset):
             env.pop(k, None)

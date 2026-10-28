@@ -11,8 +11,12 @@ Sources, in priority order (a candidate list; the first N after de-duplication b
 1. dream     the latest dream report ($ENGRAM_HOME/history/dream/YYYY-MM-DD*.md, by name without .md,
              last): the numbered items of ``## For the awake seat`` and the bullets of
              ``## Open for tomorrow`` that the ``## Sleep-end triage (parent)`` section has
-             not HANDLED (a disposition starting ``do now`` or ``file``).  ``defer``, or no
-             triage line at all, keeps the item.
+             not HANDLED.  An item is handled when its triage disposition starts ``do now`` or
+             ``file``, OR when the record's last ``## Morning pickup`` section (written by
+             tools/dream_pickup.py) carries ``pN. picked up ...`` for awake-seat item N (hides it),
+             or ``pN. skipped (...)`` (surfaces it with reason annotated in ``why``).  ``defer``,
+             or neither source naming the
+             item, keeps it.  Open-for-tomorrow bullets have no pickup lines.
 2. weakest-belief   the top entry of ``weakest_load_bearing.read_ranking(db, n=1)`` (imported,
              not reimplemented; ITS owner-read flag governs that read).
 3. question  current, non-retracted ``question`` nodes whose status is ``open`` or
@@ -84,6 +88,7 @@ def _load_sibling(name: str):
 
 
 wlb = _load_sibling("weakest_load_bearing")
+dream_pickup = _load_sibling("dream_pickup")  # the writer's own section scan: one definition of "the Morning pickup section"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -178,7 +183,6 @@ _NUMBERED_RE = re.compile(r"^(\d+)\.\s+(.*)$")
 _BULLET_RE = re.compile(r"^[-*]\s+(.*)$")
 _TRIAGE_RE = re.compile(r"^(o?)(\d+)\.\s*(.*)$")
 
-
 def _sections(text: str) -> dict:
     """heading prefix key -> list of lines.  A heading is matched by PREFIX, so a parenthetical
     suffix ('## Sleep-end triage (parent)', '## Open for tomorrow (carried)') still lands."""
@@ -242,6 +246,7 @@ def _handled(disposition) -> bool:
     return disposition is not None and (disposition.startswith("do now") or disposition.startswith("file"))
 
 
+
 def _dream_ref(text: str, report: str, tag: str) -> str:
     ids = _node_ids(text)
     return ",".join(ids) if ids else f"history/dream/{report}#{tag}"
@@ -253,16 +258,24 @@ def parse_dream_report(text: str, report_name: str) -> list:
     date = report_name[:-3] if report_name.endswith(".md") else report_name
     sections = _sections(text)
     triage = _triage(sections.get("triage", []))
+    pickup = dream_pickup.read_pickup_dispositions(text)
     out = []
     numbered = _items(sections.get("awake", []), _NUMBERED_RE)
     for pos, (num, body) in enumerate(numbered, 1):
         n = int(num) if num is not None else pos
         if _handled(triage.get(("", n))):
             continue
+        disposition = pickup.get(n)
+        if disposition and disposition[0] == "picked_up":
+            continue          # already handled — drop from queue
+        if disposition and disposition[0] == "skipped":
+            why_text = f"dream report {date} [skipped: {disposition[1]}]: {body}"
+        else:
+            why_text = f"dream report {date}: {body}"
         out.append({
             "source": "dream",
             "ref": _dream_ref(body, report_name, str(n)),
-            "why": _clip(f"dream report {date}: {body}"),
+            "why": _clip(why_text),
         })
     bullets = _items(sections.get("open", []), _BULLET_RE)
     for pos, (_n, body) in enumerate(bullets, 1):

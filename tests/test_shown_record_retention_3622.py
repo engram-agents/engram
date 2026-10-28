@@ -38,6 +38,9 @@ import _hooklib  # noqa: E402
 DAY = 86400
 SESSION = "sess-retention-1"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 @pytest.fixture(autouse=True)
 def _home(tmp_path, monkeypatch):

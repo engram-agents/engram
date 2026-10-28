@@ -365,7 +365,28 @@ def _commit_snapshot_files(mode: str, message: str) -> dict:
     # missing, so `git status -sb` can report backlog instead of staying silent (#2046).
     push = engram_core._push_head_ensuring_upstream()
     result["remote_push"] = "success" if push.returncode == 0 else f"failed: {push.stderr.strip()[:200]}"
+    _record_push_status(engram_core, push, result["commit_sha"])
     return result
+
+
+def _record_push_status(engram_core, push, commit_sha) -> None:
+    """Persist this push attempt to backup-push-status.json (#4205) so a refused
+    push is readable by SessionStart / checkpoint / diagnose, not only in this
+    worker's stderr. Best-effort: never raises, never changes the job outcome."""
+    try:
+        remotes = engram_core._git("remote")
+        has_remote = not (remotes.returncode == 0 and not remotes.stdout.strip())
+        result = engram_core._classify_push(push.returncode, push.stderr or "", has_remote)
+        if result == "refused":
+            # Refresh the tracking ref so `behind` reflects the diverged remote.
+            engram_core._git("fetch", "origin")
+        ahead, behind = engram_core._ahead_behind() if result != "no-remote" else (None, None)
+        engram_core._write_backup_push_status(
+            result=result, stderr=push.stderr or "", commit_sha=commit_sha,
+            ahead=ahead, behind=behind,
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"could not record backup push status: {e}")
 
 
 def _regenerate_derived_files(snapshot_path: Path) -> None:

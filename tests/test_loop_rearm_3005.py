@@ -74,10 +74,13 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+import os
 
 LP_PATH = (
     Path(__file__).parent.parent / "src" / "engram" / "tools" / "loop_prompt.py"
@@ -85,6 +88,16 @@ LP_PATH = (
 _spec = importlib.util.spec_from_file_location("loop_prompt_rearm_test", LP_PATH)
 lp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(lp)
+
+# Load the stop hook module for _delta_matches_arm_confirmation tests
+_HOOK_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "src" / "engram" / "hooks" / "claude" / "engram-loop-arm-stop-hook.py"
+)
+_hook_spec = importlib.util.spec_from_file_location("loop_arm_stop_hook_4007", _HOOK_PATH)
+_hook_mod = importlib.util.module_from_spec(_hook_spec)
+_hook_spec.loader.exec_module(_hook_mod)
+_delta_matches_arm_confirmation = _hook_mod._delta_matches_arm_confirmation
 
 NOW = datetime(2026, 10, 12, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -94,144 +107,149 @@ NOW = datetime(2026, 10, 12, 12, 0, 0, tzinfo=timezone.utc)
 # ---------------------------------------------------------------------------
 
 # (id, marker, is_heartbeat, default_cadence, expected(delay, next_due_at, write, reason))
+#
+# #4007 sliding-window contract: ALL rows now return delay=cadence,
+# write_next_due_at=False, reason="sliding_window".  `is_heartbeat` is
+# retained in the signature but ignored.  `next_due_at` = now + cadence,
+# computed but never written.
 CASES = [
-    # -- R1 heartbeat -------------------------------------------------------
+    # -- R1 heartbeat (is_heartbeat=True, now ignored) ----------------------
     (
         "R1_heartbeat_full_cadence",
         {"cadence_seconds": 1800},
         True,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "heartbeat"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R1b_heartbeat_ignores_existing_due",
         {"cadence_seconds": 1800, "next_due_at": "2026-10-12T12:05:00Z"},
         True,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "heartbeat"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R1c_heartbeat_default_cadence_when_absent",
         {},
         True,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "heartbeat"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
-    # -- R2 non-heartbeat, due in the FUTURE (preserved) --------------------
+    # -- R2 non-heartbeat, next_due_at in future (now: always cadence) -------
     (
-        "R2_future_preserved",
+        "R2_future_now_cadence",
         {"cadence_seconds": 1800, "next_due_at": "2026-10-12T12:10:00Z"},
         False,
         1800,
-        (600, "2026-10-12T12:10:00Z", False, "preserved"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
-        "R2b_future_under_clamp",
+        "R2b_future_under_old_clamp",
         {"cadence_seconds": 1800, "next_due_at": "2026-10-12T12:00:45Z"},
         False,
         1800,
-        (60, "2026-10-12T12:00:45Z", False, "preserved"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R2c_boundary_exactly_60",
         {"cadence_seconds": 1800, "next_due_at": "2026-10-12T12:01:00Z"},
         False,
         1800,
-        (60, "2026-10-12T12:01:00Z", False, "preserved"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R2d_boundary_exactly_61",
         {"cadence_seconds": 1800, "next_due_at": "2026-10-12T12:01:01Z"},
         False,
         1800,
-        (61, "2026-10-12T12:01:01Z", False, "preserved"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
-        "R2e_boundary_exactly_59_clamps_to_60",
+        "R2e_boundary_exactly_59",
         {"cadence_seconds": 1800, "next_due_at": "2026-10-12T12:00:59Z"},
         False,
         1800,
-        (60, "2026-10-12T12:00:59Z", False, "preserved"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
-        "R2f_preserved_ignores_cadence",
+        "R2f_uses_marker_cadence_not_remaining",
         {"cadence_seconds": 900, "next_due_at": "2026-10-12T13:00:00Z"},
         False,
         1800,
-        (3600, "2026-10-12T13:00:00Z", False, "preserved"),
+        (900, "2026-10-12T12:15:00Z", False, "sliding_window"),
     ),
-    # -- R3 non-heartbeat, due already PAST (clamp, preserved) --------------
+    # -- R3 non-heartbeat, next_due_at in past (now: always cadence) ---------
     (
-        "R3_past_clamps_to_60",
+        "R3_past_now_cadence",
         {"cadence_seconds": 1800, "next_due_at": "2026-10-12T11:59:00Z"},
         False,
         1800,
-        (60, "2026-10-12T11:59:00Z", False, "preserved"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
-        "R3b_past_long_ago_clamps_to_60",
+        "R3b_past_long_ago_now_cadence",
         {"cadence_seconds": 1800, "next_due_at": "2026-10-12T11:00:00Z"},
         False,
         1800,
-        (60, "2026-10-12T11:00:00Z", False, "preserved"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
-    # -- R4 non-heartbeat, key ABSENT ---------------------------------------
+    # -- R4 non-heartbeat, key ABSENT (now: cadence, no write) ---------------
     (
         "R4_absent_key_uses_marker_cadence",
         {"cadence_seconds": 900},
         False,
         1800,
-        (900, "2026-10-12T12:15:00Z", True, "migrated_absent"),
+        (900, "2026-10-12T12:15:00Z", False, "sliding_window"),
     ),
     (
         "R4b_absent_key_uses_default_cadence",
         {},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_absent"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
-    # -- R5 non-heartbeat, key present but CORRUPT --------------------------
+    # -- R5 non-heartbeat, key present but CORRUPT (now: cadence, no write) --
     (
         "R5_unparseable_string",
         {"cadence_seconds": 1800, "next_due_at": "not-a-timestamp"},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_invalid"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R5b_naive_datetime_string",
         {"cadence_seconds": 1800, "next_due_at": "2026-10-12T12:10:00"},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_invalid"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R5c_empty_string",
         {"cadence_seconds": 1800, "next_due_at": ""},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_invalid"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R5d_non_str_int",
         {"cadence_seconds": 1800, "next_due_at": 12345},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_invalid"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R5e_null_value",
         {"cadence_seconds": 1800, "next_due_at": None},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_invalid"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R5f_corrupt_uses_marker_cadence",
         {"cadence_seconds": 900, "next_due_at": "garbage"},
         False,
         1800,
-        (900, "2026-10-12T12:15:00Z", True, "migrated_invalid"),
+        (900, "2026-10-12T12:15:00Z", False, "sliding_window"),
     ),
     # -- R6 cadence_seconds missing / non-int / <= 0 -> default_cadence -----
     (
@@ -239,70 +257,70 @@ CASES = [
         {"kind": "heartbeat"},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_absent"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R6b_cadence_non_int_str",
         {"cadence_seconds": "1800"},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_absent"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R6c_cadence_zero",
         {"cadence_seconds": 0},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_absent"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R6d_cadence_negative",
         {"cadence_seconds": -5},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_absent"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R6e_cadence_float",
         {"cadence_seconds": 1800.0},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_absent"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R6f_cadence_none",
         {"cadence_seconds": None},
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_absent"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R6g_non_int_cadence_falls_back_to_custom_default",
         {"cadence_seconds": "oops"},
         False,
         600,
-        (600, "2026-10-12T12:10:00Z", True, "migrated_absent"),
+        (600, "2026-10-12T12:10:00Z", False, "sliding_window"),
     ),
     (
         "R6h_heartbeat_uses_custom_default",
         {},
         True,
         600,
-        (600, "2026-10-12T12:10:00Z", True, "heartbeat"),
+        (600, "2026-10-12T12:10:00Z", False, "sliding_window"),
     ),
     (
         "R6i_heartbeat_zero_cadence_uses_custom_default",
         {"cadence_seconds": 0},
         True,
         600,
-        (600, "2026-10-12T12:10:00Z", True, "heartbeat"),
+        (600, "2026-10-12T12:10:00Z", False, "sliding_window"),
     ),
     (
         "R6j_absent_key_uses_custom_default",
         {},
         False,
         600,
-        (600, "2026-10-12T12:10:00Z", True, "migrated_absent"),
+        (600, "2026-10-12T12:10:00Z", False, "sliding_window"),
     ),
     # -- R7 marker None / not a mapping -------------------------------------
     (
@@ -310,28 +328,28 @@ CASES = [
         None,
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_absent"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R7b_marker_list_non_heartbeat",
         ["not", "a", "mapping"],
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_absent"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R7c_marker_string_non_heartbeat",
         "just a string",
         False,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "migrated_absent"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
     (
         "R7d_marker_none_heartbeat",
         None,
         True,
         1800,
-        (1800, "2026-10-12T12:30:00Z", True, "heartbeat"),
+        (1800, "2026-10-12T12:30:00Z", False, "sliding_window"),
     ),
 ]
 
@@ -359,14 +377,11 @@ def test_compute_rearm_contract_cell(
     assert decision.reason == exp_reason, f"{case_id}: reason"
 
 
-def test_r2_byte_identity_of_preserved_value():
-    """R2: the preserved `next_due_at` is returned as the SAME string.
+def test_sliding_window_ignores_next_due_at():
+    """#4007: next_due_at in the marker is always ignored — delay is cadence.
 
-    A re-format (parse -> strftime) is a silent rewrite, so the input here is
-    a valid, aware ISO-8601 instant written with an explicit `+00:00` offset
-    rather than the canonical `Z` tail: a re-format to the canonical shape
-    would change the bytes and must fail this test.  (Canonical-`Z` inputs
-    cannot discriminate, because a re-format of a canonical value is a no-op.)
+    Replaces the old R2 byte-identity test; 'preserved' semantics no longer
+    exist.
     """
     raw = "2026-10-12T12:10:00+00:00"
     decision = lp.compute_rearm(
@@ -374,24 +389,31 @@ def test_r2_byte_identity_of_preserved_value():
         now=NOW,
         is_heartbeat=False,
     )
-    assert decision.reason == "preserved"
-    assert decision.next_due_at == raw
-    assert decision.next_due_at is raw or decision.next_due_at == raw
+    assert decision.reason == "sliding_window"
+    assert decision.delay_seconds == 1800
     assert decision.write_next_due_at is False
+    # Result next_due_at is the computed arm time, not the preserved raw value.
+    assert decision.next_due_at == "2026-10-12T12:30:00Z"
 
 
-def test_r4_and_r5_are_distinguishable():
-    """An absent key (pre-upgrade marker) and a corrupt key (real error) must
-    not collapse to the same reason — R4 writes the field once, R5 flags a
-    corruption.  If they collapse, a corrupt value is indistinguishble from a
-    pre-upgrade marker and the migration notice never fires."""
+def test_all_non_heartbeat_paths_return_sliding_window():
+    """#4007: absent, corrupt, and future next_due_at all return the same
+    reason — the old migrated_absent/migrated_invalid/preserved reasons no
+    longer exist."""
     absent = lp.compute_rearm({}, now=NOW, is_heartbeat=False)
     corrupt = lp.compute_rearm(
         {"next_due_at": "garbage"}, now=NOW, is_heartbeat=False
     )
-    assert absent.reason == "migrated_absent"
-    assert corrupt.reason == "migrated_invalid"
-    assert absent.reason != corrupt.reason
+    future = lp.compute_rearm(
+        {"cadence_seconds": 1800, "next_due_at": "2026-10-12T13:00:00Z"},
+        now=NOW, is_heartbeat=False,
+    )
+    assert absent.reason == "sliding_window"
+    assert corrupt.reason == "sliding_window"
+    assert future.reason == "sliding_window"
+    assert absent.write_next_due_at is False
+    assert corrupt.write_next_due_at is False
+    assert future.write_next_due_at is False
 
 
 def test_r8_naive_now_raises():
@@ -424,12 +446,17 @@ def test_compute_rearm_does_not_read_the_clock():
 # CLI helpers
 # ---------------------------------------------------------------------------
 
+_EMPTY_HOME = tempfile.mkdtemp(prefix="engram-home-3005-")  # no config.json: the unconfigured team default
+
+
 def _run(*args, stdin=None):
+    # Hermetic: the fallback cadence reads $ENGRAM_HOME/config.json, never the seat's real one.
     return subprocess.run(
         [sys.executable, str(LP_PATH), *args],
         capture_output=True,
         text=True,
         input=stdin,
+        env=dict(os.environ, ENGRAM_HOME=_EMPTY_HOME),
     )
 
 
@@ -462,8 +489,8 @@ def test_cli_stdout_is_bare_int(tmp_path):
     assert res.stdout.count("\n") <= 1
 
 
-def test_cli_preserved_stdout_int_and_no_stderr(tmp_path):
-    """A preserved call prints the remaining seconds and is silent on stderr."""
+def test_cli_non_heartbeat_prints_cadence_not_remaining(tmp_path):
+    """#4007: a non-heartbeat call prints cadence_seconds, not remaining time."""
     due = datetime.now(timezone.utc) + timedelta(seconds=600)
     marker = tmp_path / "loop-mode.json"
     _write_marker(
@@ -476,9 +503,7 @@ def test_cli_preserved_stdout_int_and_no_stderr(tmp_path):
     res = _run("--rearm-delay", "--wake-kind", "other", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
     assert res.stderr == ""
-    delay = int(res.stdout.strip())
-    # ~600s remaining, allowing a few seconds of drift across the subprocess.
-    assert 580 <= delay <= 600, delay
+    assert res.stdout.strip() == "1800"
 
 
 def test_cli_heartbeat_prints_cadence(tmp_path):
@@ -511,9 +536,8 @@ def test_cli_preserved_leaves_marker_byte_identical(tmp_path):
     assert _sha(marker) == before
 
 
-def test_cli_heartbeat_writes_exactly_one_new_key(tmp_path):
-    """A heartbeat call adds exactly one key (`next_due_at`) and changes no
-    other key's value."""
+def test_cli_heartbeat_never_writes_marker(tmp_path):
+    """#4007: heartbeat call prints cadence but does NOT write next_due_at."""
     original = {
         "FIRST_ACTION": "read me",
         "activated": "2026-10-12T12:00:00Z",
@@ -522,58 +546,54 @@ def test_cli_heartbeat_writes_exactly_one_new_key(tmp_path):
     }
     marker = tmp_path / "loop-mode.json"
     _write_marker(marker, original)
+    before = _sha(marker)
 
     res = _run("--rearm-delay", "--wake-kind", "heartbeat", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
-
-    after = json.loads(marker.read_text(encoding="utf-8"))
-    assert set(after) - set(original) == {"next_due_at"}
-    assert "next_due_at" not in original
-    for key, value in original.items():
-        assert after[key] == value, key
-    # the written value is a canonical Z timestamp
-    assert re.fullmatch(
-        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", after["next_due_at"]
-    ), after["next_due_at"]
+    assert res.stdout.strip() == "1800"
+    # Marker is byte-identical — nothing written
+    assert _sha(marker) == before
 
 
-def test_cli_migration_writes_next_due_at_once(tmp_path):
-    """An absent key is the migration path: it IS written (write-once), so the
-    next non-heartbeat wake preserves rather than migrating again."""
+def test_cli_non_heartbeat_never_writes_marker(tmp_path):
+    """#4007: non-heartbeat call prints cadence but does NOT write next_due_at."""
     original = {"cadence_seconds": 900}
     marker = tmp_path / "loop-mode.json"
     _write_marker(marker, original)
+    before = _sha(marker)
 
     res = _run("--rearm-delay", "--wake-kind", "other", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
-    after = json.loads(marker.read_text(encoding="utf-8"))
-    assert set(after) - set(original) == {"next_due_at"}
+    assert res.stdout.strip() == "900"
+    assert _sha(marker) == before
 
 
 # ---------------------------------------------------------------------------
-# CLI — the migration notice goes to stderr, never stdout
+# CLI — stderr behavior (#4007: migration notices gone; invalid cadence stays)
 # ---------------------------------------------------------------------------
 
-def test_cli_migration_notice_on_stderr_not_stdout(tmp_path):
+def test_cli_absent_next_due_at_is_silent_on_stderr(tmp_path):
+    """#4007: absent next_due_at is silent on stderr — no migration notice."""
     marker = tmp_path / "loop-mode.json"
     _write_marker(marker, {"cadence_seconds": 1800})
     res = _run("--rearm-delay", "--wake-kind", "other", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
-    assert re.fullmatch(r"-?\d+", res.stdout.strip()), repr(res.stdout)
-    assert res.stderr.strip() != ""
-    assert res.stderr.count("\n") <= 1, res.stderr
+    assert res.stdout.strip() == "1800"
+    assert res.stderr == ""
 
 
-def test_cli_invalid_notice_on_stderr_not_stdout(tmp_path):
+def test_cli_corrupt_next_due_at_is_silent_on_stderr(tmp_path):
+    """#4007: corrupt next_due_at is silent on stderr — no migration notice."""
     marker = tmp_path / "loop-mode.json"
     _write_marker(marker, {"cadence_seconds": 1800, "next_due_at": "garbage"})
     res = _run("--rearm-delay", "--wake-kind", "other", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
-    assert re.fullmatch(r"-?\d+", res.stdout.strip()), repr(res.stdout)
-    assert res.stderr.strip() != ""
+    assert res.stdout.strip() == "1800"
+    assert res.stderr == ""
 
 
-def test_cli_preserved_is_silent_on_stderr(tmp_path):
+def test_cli_all_cases_silent_on_stderr(tmp_path):
+    """#4007: all ordinary arms are silent on stderr (no migration notices)."""
     due = datetime.now(timezone.utc) + timedelta(seconds=600)
     marker = tmp_path / "loop-mode.json"
     _write_marker(
@@ -690,7 +710,7 @@ def test_cli_bad_cadence_is_loud_and_arms_default(
     marker = _write_cadence_marker(tmp_path, json_literal)
     res = _run("--rearm-delay", "--wake-kind", "heartbeat", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
-    assert res.stdout.strip() == "1800", res.stdout           # default armed
+    assert res.stdout.strip() == "900", res.stdout            # team default armed
     assert res.stderr.strip() != "", (
         f"{case_id}: a present-but-invalid cadence was SILENT on stderr"
     )
@@ -715,21 +735,20 @@ def test_cli_absent_cadence_stays_silent(tmp_path):
     _write_marker(marker, {"kind": "heartbeat"})   # no cadence_seconds
     res = _run("--rearm-delay", "--wake-kind", "heartbeat", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
-    assert res.stdout.strip() == "1800"
+    assert res.stdout.strip() == "900"
     assert res.stderr == ""
 
 
-def test_cli_bad_cadence_notice_fires_alongside_the_migration_notice(tmp_path):
-    """The cadence notice is about a DIFFERENT field than the migration
-    notice, so an invalid cadence on a pre-upgrade marker prints BOTH — under
-    distinct reason tokens.  (Name avoids the token literal, same
-    self-confirming-path trap as the cell above.)"""
+def test_cli_bad_cadence_notice_fires_without_migration_notice(tmp_path):
+    """#4007: invalid cadence still prints the cadence notice, but the
+    migration notice is gone.  Only one notice fires, under a single reason
+    token."""
     marker = _write_cadence_marker(tmp_path, '"3300"')   # no next_due_at
     res = _run("--rearm-delay", "--wake-kind", "other", "--marker", str(marker))
     assert res.returncode == 0, res.stderr
-    assert res.stdout.strip() == "1800"
+    assert res.stdout.strip() == "900"
     assert "loop_prompt: invalid_cadence:" in res.stderr, res.stderr
-    assert "loop_prompt: migrated_absent:" in res.stderr, res.stderr
+    assert "loop_prompt: migrated_absent:" not in res.stderr, res.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -806,34 +825,29 @@ _SCHOOL_DAY_SKILL = "claude/engram-school-day/SKILL.md"
 SKILL_DOC_CASES = [
     # Sweep: no skill doc may carry a full-cadence arm instruction.
     ("sweep_no_full_cadence_arm_instruction", "sweep", None, None),
-    # Positive cells: the fix (and its wake-kind classification) is actually
-    # present, so the sweep is not satisfiable by gutting the skill.
+    # Positive cells: the #4007 batched-arm instruction is actually present,
+    # so the sweep is not satisfiable by gutting the skill.
     #
-    # Each wake-kind needle is a CLAUSE of the classification sentence
-    # (engram-loop Step 2 item 3c), NOT the bare token: `heartbeat`/`other`
-    # occur 23/13 times in the doc, so a bare-token needle would survive a
-    # mutation that deleted the classification entirely.  Keying on the
-    # clause makes that deletion redden the cell.  (The helper's CLI form
-    # `--wake-kind heartbeat|other` is NOT used here: it lives only in the
-    # Step 1 `FIRST_ACTION` field, so a cell keyed on it would stay green
-    # under this mutation — it would encode a *mention*, not the class.)
+    # Each needle is a CLAUSE of the arm instruction, not a bare token:
+    # common words like "ScheduleWakeup" appear throughout the doc, so a
+    # clause-level needle fails only when the instruction itself is gone.
     (
-        "engram_loop_routes_through_rearm_delay",
+        "engram_loop_batched_arm_only_documented_shape",
         "contains",
         _ENGRAM_LOOP_SKILL,
-        "--rearm-delay",
+        "ONLY documented arm shape",
     ),
     (
-        "engram_loop_states_wake_kind_heartbeat",
+        "engram_loop_solo_sw_is_defect",
         "contains",
         _ENGRAM_LOOP_SKILL,
-        "is the **`heartbeat`**",
+        "solo `ScheduleWakeup` IS the defect",
     ),
     (
-        "engram_loop_states_wake_kind_other",
+        "engram_loop_sliding_window_stated",
         "contains",
         _ENGRAM_LOOP_SKILL,
-        "is `other`.**",
+        "sliding window, #4007",
     ),
     (
         "engram_school_day_routes_through_rearm_delay",
@@ -936,30 +950,30 @@ def test_sweep_reports_a_banned_phrase_under_a_deploy_root(tmp_path):
 # full cadence: the #3005 push, delivered by the safety net itself.  This cell
 # reddens if the nudge stops routing its delay through the helper.
 
-_HOOK_PATH = (
-    REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-loop-arm-stop-hook.py"
-)
-
-
-def test_stop_hook_nudge_routes_the_arm_through_the_helper_delay():
-    """The nudge must name the helper's `--rearm-delay --wake-kind other`, not
-    a bare full-cadence arm.  A nudge-driven arm is an `other` wake — the
-    agent is arming at the end of an ordinary turn, not on a heartbeat wake."""
+def test_stop_hook_nudge_states_batched_arm_shape():
+    """#4007: the nudge must describe the batched-arm shape (ScheduleWakeup +
+    CronList in one parallel block) and flag solo ScheduleWakeup as the defect.
+    It no longer references --rearm-delay or --wake-kind."""
     spec = importlib.util.spec_from_file_location(
         "loop_arm_hook_carrier_test", _HOOK_PATH
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     text = mod._NUDGE_TEXT
-    assert "--rearm-delay" in text, (
-        "the Stop-hook nudge no longer routes the arm through the helper's "
-        f"delay — a bare arm on an `other` wake is the #3005 push. text={text!r}"
+    assert "cadence_seconds" in text, (
+        f"nudge must tell the agent to read cadence_seconds. text={text!r}"
     )
-    assert "--wake-kind other" in text, (
-        f"the nudge must name the `other` wake kind. text={text!r}"
+    assert "CronList" in text, (
+        f"nudge must name CronList as required in the batched arm. text={text!r}"
+    )
+    assert "solo" in text.lower() or "defect" in text.lower(), (
+        f"nudge must label solo ScheduleWakeup as a defect. text={text!r}"
+    )
+    assert "--rearm-delay" not in text, (
+        f"nudge must not reference removed --rearm-delay flag. text={text!r}"
     )
     assert "at this loop's cadence" not in text, (
-        f"the nudge still carries a bare full-cadence arm. text={text!r}"
+        f"nudge must not carry the old bare full-cadence arm phrase. text={text!r}"
     )
 
 
@@ -981,26 +995,23 @@ def test_bool_cadence_is_rejected_not_read_as_one():
         heartbeat = lp.compute_rearm(
             {"cadence_seconds": value}, now=NOW, is_heartbeat=True
         )
-        assert heartbeat.delay_seconds == 1800, (
+        assert heartbeat.delay_seconds == 900, (
             f"cadence_seconds={value!r} (a bool) must fall back to the "
-            f"default 1800, not be read as the int {int(value)}"
+            f"default 900, not be read as the int {int(value)}"
         )
         # And on the migration path the default is armed too.
         migrated = lp.compute_rearm(
             {"cadence_seconds": value}, now=NOW, is_heartbeat=False
         )
-        assert migrated.delay_seconds == 1800, migrated.delay_seconds
+        assert migrated.delay_seconds == 900, migrated.delay_seconds
 
 
-def test_cli_wake_kind_defaults_to_other_preserve(tmp_path):
-    """With NO `--wake-kind`, the CLI must default to `other` (PRESERVE).
+def test_cli_wake_kind_defaults_to_cadence(tmp_path):
+    """#4007: with NO `--wake-kind`, the CLI returns cadence_seconds regardless.
 
-    From the code path, `other` is the safe default: a forgotten flag then
-    costs a PRESERVED deadline (harmless — the loop continues toward its
-    original due moment), whereas a `heartbeat` default would RESET the
-    deadline to the full cadence on every flag-less re-arm — the #3005 push
-    reintroduced.  Changing the default reddens this cell (delay becomes 1800
-    and the marker is rewritten)."""
+    Both `heartbeat` and `other` now return the full cadence (sliding window),
+    so the default is benign either way — but it must still return the cadence
+    and must not write the marker."""
     due = datetime.now(timezone.utc) + timedelta(seconds=600)
     marker = tmp_path / "loop-mode.json"
     _write_marker(
@@ -1010,13 +1021,11 @@ def test_cli_wake_kind_defaults_to_other_preserve(tmp_path):
     before = _sha(marker)
     res = _run("--rearm-delay", "--marker", str(marker))   # NO --wake-kind
     assert res.returncode == 0, res.stderr
-    delay = int(res.stdout.strip())
-    assert 580 <= delay <= 600, (
-        f"default must be `other` (remaining delay ~600s), got {delay}"
+    assert res.stdout.strip() == "1800", (
+        f"default wake-kind must return full cadence 1800, got {res.stdout.strip()!r}"
     )
     assert _sha(marker) == before, (
-        "default must be `other` (PRESERVE) — the marker was rewritten, so "
-        "the default behaved as `heartbeat`"
+        "the marker must not be written regardless of wake-kind default"
     )
 
 
@@ -1109,17 +1118,11 @@ def _assert_path_resolves(path: str, carrier: str, command: str) -> None:
     )
 
 
-def test_stop_hook_nudge_prints_a_command_that_resolves():
-    """The nudge's printed command must name a path that RESOLVES.
-
-    The hook ALREADY resolves the helper's real location at import time — it
-    has to, to import `LOOP_WAKE_MARKER` and land it in `_LP_TOOLS_DIR` — so
-    it must print the path it RESOLVED rather than a static guess (fold-4
-    contract §1).  That is layout-agnostic: correct in the source checkout AND
-    in the deployed plugin bundle, whereas a hardcoded guess is correct in at
-    most one of them.
-
-    Goes red if the nudge reverts to a bare `tools/loop_prompt.py`.
+def test_stop_hook_nudge_has_no_helper_command(tmp_path):
+    """#4007: the nudge must NOT contain a backticked loop_prompt.py helper
+    command — the batched-arm shape needs no helper call, so a surviving
+    backtick command would be stale instructions the agent would erroneously
+    run.
     """
     spec = importlib.util.spec_from_file_location(
         "loop_arm_hook_command_carrier_test", _HOOK_PATH
@@ -1128,56 +1131,31 @@ def test_stop_hook_nudge_prints_a_command_that_resolves():
     spec.loader.exec_module(mod)
 
     match = _LOOP_PROMPT_BACKTICK_RE.search(mod._NUDGE_TEXT)
-    assert match, (
-        "the nudge no longer prints a backticked helper command at all: "
-        f"{mod._NUDGE_TEXT!r}"
-    )
-    path = _assert_printed_command_runs_as_printed(
-        match.group(1), "engram-loop-arm-stop-hook.py _NUDGE_TEXT"
+    assert not match, (
+        "#4007: the nudge must not contain a backticked loop_prompt.py command; "
+        f"found: {match.group(0)!r} in nudge {mod._NUDGE_TEXT!r}"
     )
 
-    # Contract §1: when import-time resolution SUCCEEDED, the printed command
-    # names the path it resolved — not a static guess.  (Skipped when
-    # resolution failed, where contract §2's default form is the correct
-    # output and `_assert_printed_command_runs_as_printed` has already
-    # checked it.)
-    if mod._LP_TOOLS_DIR is not None:
-        resolved = str(mod._LP_TOOLS_DIR / "loop_prompt.py")
-        assert path == resolved, (
-            f"the hook resolved the helper to {resolved!r} but printed "
-            f"{path!r} — print the path you resolved, not a guess"
-        )
 
-
-def test_engram_loop_step_2_item_3c_prints_a_command_that_resolves():
-    """Step 2 item 3c's fenced command must name a path that RESOLVES.
-
-    Extracted from the skill's fenced block, never retyped.  Goes red if it
-    reverts to the bare `"$CLAUDE_PLUGIN_ROOT/…"` form, which expands to
-    `/tools/loop_prompt.py` on a seat where the variable is unset (measured:
-    absent in an agent's Bash env, login shell included).
+def test_engram_loop_step_2_item_3c_has_no_helper_command():
+    """#4007: Step 2 item 3c must NOT contain a fenced `python3 … loop_prompt.py
+    --rearm-delay …` command line — the batched-arm shape needs no helper call.
+    A surviving fenced command would be stale instructions the agent runs
+    instead of the documented batched arm.
     """
     text = (SKILLS_ROOT / _ENGRAM_LOOP_SKILL).read_text(encoding="utf-8")
     match = _LOOP_PROMPT_FENCED_LINE_RE.search(text)
-    assert match, (
-        "engram-loop Step 2 item 3c no longer prints a `python3 … "
-        "loop_prompt.py --rearm-delay …` command line"
-    )
-    _assert_printed_command_runs_as_printed(
-        match.group(0), "engram-loop/SKILL.md Step 2 item 3c"
+    assert not match, (
+        "#4007: engram-loop SKILL.md must not contain a fenced `python3 … "
+        "loop_prompt.py --rearm-delay …` command line; "
+        f"found: {match.group(0)!r}"
     )
 
 
-def test_stop_hook_command_falls_back_to_the_default_form(monkeypatch):
-    """Contract §2: with import-time resolution FAILED (`_LP_TOOLS_DIR is
-    None`), the printed command carries the `${CLAUDE_PLUGIN_ROOT:-…}` sh form
-    — never a bare relative path (§1 item 3, "in either branch").
-
-    The two carrier pins above exercise only the RESOLVED branch, because in a
-    source checkout resolution always succeeds; this branch is reachable on a
-    seat where it does not, where a malformed fallback would ship the very
-    defect this fold fixes — a printed command that does not run.  Exercises
-    the builder `_NUDGE_TEXT` interpolates.
+def test_stop_hook_has_no_rearm_command_function():
+    """#4007: `_loop_prompt_rearm_command()` was removed from the stop hook
+    because the nudge no longer prints a helper command.  This cell fails if
+    the function is re-introduced.
     """
     spec = importlib.util.spec_from_file_location(
         "loop_arm_hook_fallback_carrier_test", _HOOK_PATH
@@ -1185,14 +1163,9 @@ def test_stop_hook_command_falls_back_to_the_default_form(monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    monkeypatch.setattr(mod, "_LP_TOOLS_DIR", None)
-    command = mod._loop_prompt_rearm_command()
-    path = _assert_printed_command_runs_as_printed(
-        command, "engram-loop-arm-stop-hook.py (resolution failed)"
-    )
-    assert not path.startswith("/"), (
-        "with resolution failed the command must use the sh form, not an "
-        f"absolute path; got {command!r}"
+    assert not hasattr(mod, "_loop_prompt_rearm_command"), (
+        "#4007: _loop_prompt_rearm_command() was removed but is still present "
+        "in the stop hook"
     )
 
 
@@ -1224,19 +1197,16 @@ def test_stop_hook_command_falls_back_to_the_default_form(monkeypatch):
 DELAY_HELPER_TOKEN = "--rearm-delay"
 DELAY_SWEEP_ROOTS = (SKILLS_ROOT, REPO_ROOT / "deploy" / "autostart")
 
-# The seven sites known at fold-4 time, each named by an anchor that survives
-# line-number drift.  Named AND asserted, so the sweep cannot pass vacuously —
-# an expected set that can go empty passes forever and reads identical to
-# success.  This list is the anti-vacuity floor, not an allowlist: a BROKEN
-# site reddens the property check whether or not it is registered here.
+# After #4007: engram-loop/SKILL.md, boot-charge-*.md, and the stop-hook nudge
+# no longer carry `--rearm-delay`.  The school-day skill was out of this PR's
+# scope; it still uses the old helper path and is the only remaining site.
+#
+# Named AND asserted so the sweep cannot pass vacuously — an expected set that
+# can go empty passes forever and reads identical to success.  This list is the
+# anti-vacuity floor, not an allowlist: a BROKEN site reddens the property
+# check whether or not it is registered here.
 EXPECTED_DELAY_HELPER_SITES = (
-    ("engram-loop-arm-stop-hook.py", "Arm now — ScheduleWakeup"),
-    ("engram-loop/SKILL.md", '"FIRST_ACTION"'),
-    ("engram-loop/SKILL.md", "creates it on the"),
-    ("engram-loop/SKILL.md", "--rearm-delay --wake-kind <KIND>"),
     ("engram-school-day/SKILL.md", '"FIRST_ACTION"'),
-    ("boot-charge-default-claude.md", "--rearm-delay --wake-kind heartbeat"),
-    ("boot-charge-quiet-claude.md", "--rearm-delay --wake-kind heartbeat"),
 )
 
 
@@ -1277,13 +1247,16 @@ def _delay_helper_sites():
     )
     hook = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(hook)
-    sites.append(
-        (
-            "engram-loop-arm-stop-hook.py",
-            "engram-loop-arm-stop-hook.py:_NUDGE_TEXT (what it prints)",
-            hook._NUDGE_TEXT,
+    # Only include the nudge text if it actually contains the delay token
+    # (#4007: the nudge no longer prints the helper command, so no site here).
+    if DELAY_HELPER_TOKEN in hook._NUDGE_TEXT:
+        sites.append(
+            (
+                "engram-loop-arm-stop-hook.py",
+                "engram-loop-arm-stop-hook.py:_NUDGE_TEXT (what it prints)",
+                hook._NUDGE_TEXT,
+            )
         )
-    )
     return sites
 
 
@@ -1325,3 +1298,113 @@ def test_every_printed_delay_helper_command_resolves():
             f"the sweep did not find the expected `{DELAY_HELPER_TOKEN}` site "
             f"in {carrier} carrying {anchor!r} — found: {labels}"
         )
+
+
+# ---------------------------------------------------------------------------
+# alpha #4007: sliding-window contract cells
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_delta():
+    def _make(content_blocks):
+        record = {"type": "assistant", "message": {"content": content_blocks}}
+        return (json.dumps(record) + "\n").encode()
+    return _make
+
+
+@pytest.fixture
+def make_batched_delta():
+    """Build a delta in the REAL Claude Code transcript shape: two assistant
+    records sharing the same `message.id`, one ScheduleWakeup and one CronList
+    — the parallel-block form that real batched arms produce."""
+    def _make(sw_input: dict, cronlist_input: dict | None = None) -> bytes:
+        msg_id = "msg_test_batched_arm"
+        sw_rec = {
+            "type": "assistant",
+            "message": {
+                "id": msg_id,
+                "content": [
+                    {"type": "tool_use", "name": "ScheduleWakeup", "input": sw_input},
+                ],
+            },
+        }
+        cl_rec = {
+            "type": "assistant",
+            "message": {
+                "id": msg_id,
+                "content": [
+                    {"type": "tool_use", "name": "CronList",
+                     "input": cronlist_input if cronlist_input is not None else {}},
+                ],
+            },
+        }
+        return (json.dumps(sw_rec) + "\n" + json.dumps(cl_rec) + "\n").encode()
+    return _make
+
+
+def test_4007_a_non_heartbeat_yields_cadence():
+    """Contract cell 1: non-heartbeat wake -> delay == cadence_seconds."""
+    marker = {"cadence_seconds": 1800, "next_due_at": "9999-12-31T00:00:00Z"}
+    result = lp.compute_rearm(marker, now=NOW, is_heartbeat=False)
+    assert result.delay_seconds == 1800
+    assert result.write_next_due_at is False
+
+
+def test_4007_b_solo_arm_trips(make_delta):
+    """Contract cell 2: solo ScheduleWakeup (no CronList sibling) -> confirmed=False."""
+    delta = make_delta([
+        {"type": "tool_use", "name": "ScheduleWakeup",
+         "input": {"prompt": "<loop-wake>\nloop stub", "delaySeconds": 1800}},
+    ])
+    assert _delta_matches_arm_confirmation(delta) is False
+
+
+def test_4007_c_batched_passes(make_batched_delta):
+    """Contract cell 3: real transcript shape — two records sharing message.id,
+    one ScheduleWakeup + one CronList -> confirmed=True."""
+    delta = make_batched_delta(
+        {"prompt": "<loop-wake>\nloop stub", "delaySeconds": 1800}
+    )
+    assert _delta_matches_arm_confirmation(delta) is True
+
+
+def test_4007_c2_different_message_ids_still_trips():
+    """Contract cell 3b: SW and CronList in separate message.id groups -> confirmed=False.
+    Tests the real distinct-parallel-block boundary (real transcripts use distinct
+    message.ids for calls made in different turns)."""
+    sw_rec = json.dumps({
+        "type": "assistant",
+        "message": {
+            "id": "msg_group_a",
+            "content": [
+                {"type": "tool_use", "name": "ScheduleWakeup",
+                 "input": {"prompt": "<loop-wake>\nloop stub", "delaySeconds": 1800}},
+            ],
+        },
+    })
+    cl_rec = json.dumps({
+        "type": "assistant",
+        "message": {
+            "id": "msg_group_b",
+            "content": [
+                {"type": "tool_use", "name": "CronList", "input": {}},
+            ],
+        },
+    })
+    delta = (sw_rec + "\n" + cl_rec + "\n").encode()
+    assert _delta_matches_arm_confirmation(delta) is False
+
+
+def test_4007_d_skill_step2_item3_batched():
+    """Contract cell 4: SKILL.md Step 2 item 3 has the two-call block and no solo-arm example."""
+    skill_path = os.path.join(
+        os.path.dirname(__file__), "..", "src", "engram", "skills", "claude",
+        "engram-loop", "SKILL.md"
+    )
+    text = open(skill_path, encoding="utf-8").read()
+    # Must contain reference to both tools in the arm step
+    assert "ScheduleWakeup" in text
+    assert "CronList" in text
+    # Must NOT contain the old solo-arm instruction (the helper call)
+    assert "--rearm-delay --wake-kind" not in text

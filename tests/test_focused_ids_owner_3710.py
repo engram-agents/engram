@@ -2,7 +2,7 @@
 the caller's connection, closing U6b's flag-ON zero-opens hole when in-context exclusion
 is ON.
 
-Written BEFORE the implementation (docs/CONTRACT-FIRST-TESTS.md). Design seat: Borges.
+Written BEFORE the implementation (docs/internal/CONTRACT-FIRST-TESTS.md). Design seat: Borges.
 
 The contract:
 

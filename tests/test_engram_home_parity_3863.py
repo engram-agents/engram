@@ -5,11 +5,15 @@ AST-identical to the canonical body, `tools/_owner_read.engram_home()`, exactly 
 I/O helpers. Layers: tools (the canonical), hooks (`_hooklib.py`, which must stay self-contained),
 prompt hooks (`_prompthooklib.py`, which must keep running when `_hooklib` cannot import), and the
 shared-bin flat copies (`forum_api.py`: ia and forum run as copies in /home/agents-shared/bin with
-only that module beside them, so they cannot import `_owner_read`).
+only that module beside them, so they cannot import `_owner_read`), and (#3863 6c) the build engine
+(`src/build/engine/flows.py`, which ships as tools/engine and does not import from src/engram): five layers.
 
-  (a) TEXTUAL: the function body (docstring dropped) is AST-identical in all three files.
-  (b) BEHAVIOURAL: one cell set over all three: env set, unset, empty (= unset), relative
+  (a) TEXTUAL: the function body (docstring dropped) is AST-identical in all five files.
+  (b) BEHAVIOURAL: one cell set over all five layers: env set, unset, empty (= unset), relative
       (-> refused, naming the value), tilde (-> expanded).
+  (c) IDENTICAL REFUSAL (#3863 step 1): one relative value fed to every refusing entry point
+      (the five resolvers, the engine's ctx and upgrade_flow, the engine CLI line, engram-snapshot's line)
+      gets the same refusal text.
 """
 
 from __future__ import annotations
@@ -29,6 +33,13 @@ LAYERS = {
     "hooks": SRC / "hooks" / "claude" / "_hooklib.py",
     "prompt-hooks": SRC / "hooks" / "claude" / "_prompthooklib.py",
     "shared-bin": SRC / "tools" / "forum_api.py",
+    # #3863 6c: the build engine is its own self-contained layer (src/build/engine ships as tools/engine and
+    # does not import from src/engram), so it carries one pinned copy, in flows.py (cli.py imports it from there).
+    "build-engine": REPO / "src" / "build" / "engine" / "flows.py",
+    # #3863 step 2: the runtime layer (the flat modules engram_core, the owner/client, the server and the
+    # hook-imported emitter/store/indexer import) is one shared module, not a copy per module.
+    # Ruling: Borges's step-2 rulings on #3863, 2026-10-21.
+    "runtime": SRC / "engram_home_resolver.py",
 }
 
 
@@ -62,7 +73,11 @@ def test_p2_bodies_are_ast_identical_to_the_canonical():
 
 def _load(layer: str):
     path = LAYERS[layer]
-    name = f"_p3863_{layer.replace('-', '_')}"
+    if layer == "build-engine":
+        # flows.py uses package-relative imports, so it cannot be exec'd by path; import it as the package
+        # tests/conftest.py already aliases (tools.engine), the way the engine's own tests do.
+        return importlib.import_module("tools.engine.flows")
+    name = f"_p3863_{layer.replace('-', '_')}"  # the runtime layer is a flat module with no sibling imports
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
@@ -125,3 +140,225 @@ def test_b4_tilde_is_expanded(layer, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("ENGRAM_HOME", "~/elsewhere")
     assert _load(layer).engram_home() == tmp_path / "elsewhere"
+
+
+# ---------------------------------------------------------------------------
+# The identical-refusal cell (#3863 step 1, round 2). Ruling:
+# Borges's ruling on #3863, 2026-10-21.
+#
+# ONE relative value goes to EVERY refusing entry point and each must refuse with the SAME text, naming
+# the value. Only the surrounding stderr prefix (a per-entry-point constant below) is normalised away; the
+# prefix is asserted too, so a path that drops or invents a prefix is also red. Each entry point is its own
+# parametrised cell, so a path that accepts the relative value reddens ONLY its own cell.
+# ---------------------------------------------------------------------------
+
+REFUSED_VALUE = "rel/dir"
+REFUSAL_TEXT = "ENGRAM_HOME must be an absolute path, got 'rel/dir'"  # the one text, pinned verbatim
+_ENGINE = "[engine] ERROR: "
+
+
+def _refusal_resolver(layer):
+    def run(monkeypatch, tmp_path, capsys):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("ENGRAM_HOME", raising=False)
+        mod = _load(layer)  # load first: _hooklib resolves the home at import (and exits 0 on a refused one)
+        monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
+        with pytest.raises(ValueError) as e:
+            mod.engram_home()
+        return "", str(e.value)
+    return run
+
+
+def _refusal_runtime_or_none(monkeypatch, tmp_path, capsys):
+    """The hook-imported modules' variant: engram_home_or_none() never raises, prints ONE stderr line
+    carrying the same refusal text, and returns None."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ENGRAM_HOME", raising=False)
+    mod = _load("runtime")
+    monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
+    capsys.readouterr()
+    assert mod.engram_home_or_none() is None
+    assert mod.engram_home_or_none() is None
+    lines = [l for l in capsys.readouterr().err.splitlines() if l.strip()]
+    assert len(lines) == 1, lines
+    return "engram_home_resolver: ", lines[0].removesuffix("; writes disabled in this process")
+
+
+def _refusal_cli_ctx(monkeypatch, tmp_path, capsys):
+    from tools.engine import cli
+    monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
+    with pytest.raises(ValueError) as e:
+        cli._build_ctx_from_env()
+    return "", str(e.value)
+
+
+def _refusal_upgrade_flow(monkeypatch, tmp_path, capsys):
+    from tools.engine import flows
+    monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
+    with pytest.raises(ValueError) as e:
+        flows.upgrade_flow()
+    return "", str(e.value)
+
+
+def _refusal_cli_main(monkeypatch, tmp_path, capsys):
+    from tools.engine import cli
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
+    assert cli.main(["plan", "upgrade"]) == 1
+    err = capsys.readouterr().err
+    lines = [l for l in err.splitlines() if l.strip()]
+    assert len(lines) == 1, err
+    return _ENGINE, lines[0]
+
+
+def _refusal_snapshot(monkeypatch, tmp_path, capsys):
+    import subprocess
+    env = {**os.environ, "ENGRAM_HOME": REFUSED_VALUE}
+    r = subprocess.run([sys.executable, str(SRC / "tools" / "engram-snapshot"), "--help"],
+                       cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    lines = [l for l in r.stderr.splitlines() if l.strip()]
+    assert len(lines) == 1, r.stderr
+    return "engram-snapshot: ", lines[0]
+
+
+REFUSING_ENTRY_POINTS = {
+    "tools._owner_read.engram_home": _refusal_resolver("tools"),
+    "hooks._hooklib.engram_home": _refusal_resolver("hooks"),
+    "prompt-hooks._prompthooklib.engram_home": _refusal_resolver("prompt-hooks"),
+    "shared-bin.forum_api.engram_home": _refusal_resolver("shared-bin"),
+    "build-engine.flows.engram_home": _refusal_resolver("build-engine"),
+    "runtime.engram_home_resolver.engram_home": _refusal_resolver("runtime"),
+    "runtime.engram_home_resolver.engram_home_or_none (stderr line)": _refusal_runtime_or_none,
+    "build-engine.cli._build_ctx_from_env": _refusal_cli_ctx,
+    "build-engine.flows.upgrade_flow": _refusal_upgrade_flow,
+    "build-engine.cli.main (stderr line)": _refusal_cli_main,
+    "engram-snapshot (stderr line)": _refusal_snapshot,
+}
+
+
+@pytest.mark.parametrize("entry", list(REFUSING_ENTRY_POINTS))
+def test_r1_every_refusing_entry_point_gives_the_identical_refusal(entry, monkeypatch, tmp_path, capsys):
+    """Mutation (run in the round-2 report): make ONE path accept the relative value -> only that entry's
+    cell is red, every other cell stays green."""
+    prefix, text = REFUSING_ENTRY_POINTS[entry](monkeypatch, tmp_path, capsys)
+    assert text.startswith(prefix), (entry, text)
+    assert text[len(prefix):] == REFUSAL_TEXT, (entry, text)
+    assert REFUSED_VALUE in text[len(prefix):]
+
+
+def test_r2_the_cell_covers_every_layer_in_the_parity_table():
+    covered = {name.split(".")[0] for name in REFUSING_ENTRY_POINTS}
+    assert set(LAYERS) <= covered, set(LAYERS) - covered
+
+
+# ---------------------------------------------------------------------------
+# #3863 step 3a: the four inline-guard hooks each carry a VERBATIM pinned copy of the canonical body.
+# Ruling: Borges's rulings on #3863, 2026-10-21 (a standalone installed script carries a verbatim pinned copy).
+# These hooks cannot be exec'd for the behavioural cells (they run work at import), so the function is lifted
+# out of the file by AST and exec'd in a bare namespace.
+# ---------------------------------------------------------------------------
+
+STANDALONE_HOOKS = {
+    "tripwire": SRC / "hooks" / "claude" / "engram-lesson-tripwire-hook.py",
+    "loop-arm-stop": SRC / "hooks" / "claude" / "engram-loop-arm-stop-hook.py",
+    "stale-tree-warn": SRC / "hooks" / "claude" / "engram-stale-tree-warn-hook.py",
+    "time-bar": SRC / "hooks" / "claude" / "engram-time-bar-hook.py",
+}
+
+
+# #3863 step 3b: tools/baton_gate.py is loaded by path by the forum server (`cp -L` of only that file) and imported by
+# bare name by tools/baton.py, so it cannot import `tools._owner_read` and carries the same verbatim copy.
+STANDALONE_PINNED = {**STANDALONE_HOOKS, "baton-gate": SRC / "tools" / "baton_gate.py"}
+
+
+def _lifted(path: Path):
+    fn = _func(path)
+    ns = {"os": os, "Path": Path}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), str(path), "exec"), ns)
+    return ns["engram_home"]
+
+
+@pytest.mark.parametrize("hook", list(STANDALONE_PINNED))
+def test_s1_a_standalone_hook_copy_is_ast_identical_to_the_canonical(hook):
+    canon = _dump_without_docstring(_func(LAYERS["tools"]))
+    assert _dump_without_docstring(_func(STANDALONE_PINNED[hook])) == canon, f"{hook} drifted"
+
+
+@pytest.mark.parametrize("hook", list(STANDALONE_PINNED))
+def test_s2_a_standalone_hook_copy_behaves_like_the_canonical(hook, monkeypatch, tmp_path):
+    fn = _lifted(STANDALONE_PINNED[hook])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ENGRAM_HOME", raising=False)
+    assert fn() == tmp_path / ".engram"
+    monkeypatch.setenv("ENGRAM_HOME", "")
+    assert fn() == tmp_path / ".engram"
+    monkeypatch.setenv("ENGRAM_HOME", "~/e")
+    assert fn() == tmp_path / "e"
+    monkeypatch.setenv("ENGRAM_HOME", str(tmp_path / "a" / ".." / "b"))
+    assert fn() == tmp_path / "b"
+    monkeypatch.setenv("ENGRAM_HOME", "rel/dir")
+    with pytest.raises(ValueError) as e:
+        fn()
+    assert str(e.value) == REFUSAL_TEXT
+
+
+def test_s3_the_standalone_hooks_are_pinned_in_the_gate_allowlist():
+    spec = importlib.util.spec_from_file_location("_gate_for_step3a", REPO / "tools" / "raw_home_read_gate.py")
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    for path in STANDALONE_PINNED.values():
+        assert str(path.relative_to(REPO)) in gate.PINNED_RESOLVERS, path
+
+
+# ---------------------------------------------------------------------------
+# #3863 step 3b (the colleague pass on #4065, measured): the gate exempts a pinned file WHOLE, so a planted raw
+# `os.environ.get("ENGRAM_HOME")` elsewhere in one of the standalone files would pass the gate. One cell per
+# standalone pinned file pins the raw-read lines OUTSIDE its `engram_home` body to exactly the ones it has today,
+# enumerated with the gate's OWN detector (raw_home_read_gate.line_is_raw_read), never hand-picked.
+# ---------------------------------------------------------------------------
+
+_PRESENCE_TEST = 'if os.environ.get("ENGRAM_HOME"):'  # each hook asks "is it set?" before it normalises the value
+EXPECTED_OUTSIDE_RAW_READS = {
+    "tripwire": [_PRESENCE_TEST],
+    "loop-arm-stop": [_PRESENCE_TEST],
+    "stale-tree-warn": [_PRESENCE_TEST],
+    "time-bar": [_PRESENCE_TEST],
+    "baton-gate": [],  # the pinned copy is the only raw read in the file
+}
+
+
+def _gate_module():
+    spec = importlib.util.spec_from_file_location("_gate_for_step3b", REPO / "tools" / "raw_home_read_gate.py")
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    return gate
+
+
+def _raw_reads_outside_engram_home(text: str) -> list:
+    gate = _gate_module()
+    fn = next(n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and n.name == "engram_home")
+    return [line.strip() for n, line in enumerate(text.split("\n"), 1)
+            if gate.line_is_raw_read(line) and not (fn.lineno <= n <= fn.end_lineno)]
+
+
+def test_s4_the_table_covers_every_standalone_pinned_file():
+    assert set(EXPECTED_OUTSIDE_RAW_READS) == set(STANDALONE_PINNED)
+
+
+@pytest.mark.parametrize("hook", list(STANDALONE_PINNED))
+def test_s4_a_standalone_pinned_file_has_no_raw_read_outside_its_resolver_but_the_known_ones(hook):
+    """Mutation (run in the PR report): plant `os.environ.get("ENGRAM_HOME")` in one of these files -> only that
+    file's cell is red."""
+    found = _raw_reads_outside_engram_home(STANDALONE_PINNED[hook].read_text(encoding="utf-8"))
+    assert found == EXPECTED_OUTSIDE_RAW_READS[hook], (hook, found)
+
+
+@pytest.mark.parametrize("hook", list(STANDALONE_PINNED))
+def test_s5_a_planted_raw_read_is_seen_by_the_detector_the_cell_uses(hook):
+    """The cell above must be able to fail: plant one extra raw read in a copy of THIS file's text and the detector
+    reports exactly that one extra line, after the known ones."""
+    text = STANDALONE_PINNED[hook].read_text(encoding="utf-8")
+    planted = '_planted = os.environ.get("ENGRAM_HOME")'
+    found = _raw_reads_outside_engram_home(text + "\n\n" + planted + "\n")
+    assert found == EXPECTED_OUTSIDE_RAW_READS[hook] + [planted], (hook, found)

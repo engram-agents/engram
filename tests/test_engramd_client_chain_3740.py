@@ -226,7 +226,7 @@ def test_the_shim_over_a_real_owner_equals_the_direct_function(home):
             rejected = exc
     finally:
         owner.stop()
-    assert got == direct_chain(db, "ls_s", 4) and "cs_new" in got["nodes"]
+    assert got == direct_chain(db, "ls_s", 4) and set(got["nodes"]) == {"ls_s"}  # #3542: live edges only
     assert rejected is not None and rejected.kind == "rejected"
     assert rejected.result.reason == "chain_node_id_empty"
 

@@ -59,10 +59,11 @@ import errno
 import logging
 import os
 import platform
+import stat
 import struct
 from pathlib import Path
 
-from engram_regular_io import open_regular_text
+from engram_regular_io import describe_file_kind, open_regular_text
 
 # Clock skew / tick-rounding slack between the pidfile's mtime and the
 # process start time derived from /proc (btime has 1 s resolution, starttime
@@ -298,6 +299,71 @@ def _read_process_cmdline_darwin(pid: int) -> str | None:
     if not parts[0]:
         return None
     return b" ".join(parts[:argc]).decode("utf-8", "replace")
+
+
+# --- Cleanup identity (#4068 point 4) -------------------------------------
+# The ONE rule both the engramd owner's and the surface daemon's cleanup
+# unlink a pidfile on. Before this, each kept a hand-mirrored copy whose
+# fallbacks treated garbage, empty (the truncate-then-write window) and
+# unreadable content as "ours" and unlinked it.
+PIDFILE_OURS = "ours"
+PIDFILE_ABSENT = "absent"
+PIDFILE_UNKNOWN = "unknown"
+PIDFILE_NOT_REGULAR = "not-regular"
+PIDFILE_HARD_LINKED = "hard-linked"
+
+
+def classify_own_pidfile(pid_path) -> tuple[str, str]:
+    """(status, reason) for the pidfile at `pid_path`, from THIS process's view.
+
+    status is one of PIDFILE_OURS / ABSENT / UNKNOWN / NOT_REGULAR /
+    HARD_LINKED. A cleanup unlinks ONLY on OURS: content that parses as an int
+    equal to `os.getpid()`. `reason` is a short phrase that completes
+    "pidfile <path> <reason>" for the warning every status but OURS and ABSENT
+    deserves; it is "" for those two.
+
+    Opens O_RDONLY|O_NONBLOCK|O_NOFOLLOW, then fstat: a symlink is not
+    followed, a FIFO does not block. ENOENT is ABSENT. Anything else that
+    keeps the path from being read is UNKNOWN, as are empty, garbage and
+    another pid's content: none of them is confirmed identity, and the unlink
+    is the destructive side."""
+    try:
+        fd = os.open(pid_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return PIDFILE_ABSENT, ""
+        if exc.errno == errno.ELOOP:
+            return PIDFILE_NOT_REGULAR, "is not a regular file (symlink)"
+        # e.g. EACCES, or ENXIO/EOPNOTSUPP on a socket-type file: look at what
+        # is there without opening it.
+        try:
+            lmode = os.lstat(pid_path).st_mode
+        except OSError:
+            return PIDFILE_UNKNOWN, f"cannot be opened ({exc.strerror or exc.errno})"
+        if not stat.S_ISREG(lmode):
+            return PIDFILE_NOT_REGULAR, f"is not a regular file ({describe_file_kind(lmode)})"
+        return PIDFILE_UNKNOWN, f"cannot be read ({exc.strerror or exc.errno})"
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            return PIDFILE_NOT_REGULAR, f"is not a regular file ({describe_file_kind(fst.st_mode)})"
+        if fst.st_nlink > 1:
+            return PIDFILE_HARD_LINKED, f"has {fst.st_nlink} hard links"
+        try:
+            raw = os.read(fd, 64)
+        except OSError as exc:
+            return PIDFILE_UNKNOWN, f"cannot be read ({exc.strerror or exc.errno})"
+    finally:
+        os.close(fd)
+    text = raw.decode("ascii", "replace").strip()
+    try:
+        pid = int(text)
+    except ValueError:
+        return PIDFILE_UNKNOWN, ("is empty (a write may be in progress)" if not text
+                                 else "holds content that is not a pid")
+    if pid == os.getpid():
+        return PIDFILE_OURS, ""
+    return PIDFILE_UNKNOWN, f"names pid {pid}, not this process (pid {os.getpid()})"
 
 
 def recorded_pid_is_alive(pid_path, program_marker: str | None = None) -> bool:

@@ -21,6 +21,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+# #4093: each hook load runs the hook's module-level sys.path.insert. The two classes
+# below load the hook in setUpClass, which runs BEFORE any function-scope fixture, and
+# their tests keep using that loaded module, so the window is module scope (#4029).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads_module")
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 

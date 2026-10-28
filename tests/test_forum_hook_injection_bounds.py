@@ -43,6 +43,10 @@ _HOOK_PATH = (
 )
 _HARNESS_PATH = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "_harness.py"
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_hook():
     """Load the forum prompt hook as a fresh module (hyphenated filename,

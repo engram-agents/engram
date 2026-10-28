@@ -6,7 +6,7 @@ computed ONCE on the host) with a small set of prebuilt Docker images, runs the
 selected test suite inside each image, and aggregates a per-environment result
 table. Exits nonzero if ANY environment fails OR any image is excluded for
 staleness — silent-skip is the exact failure class this harness exists to kill
-(design: docs/864-multi-env-harness-design.md §3/§4).
+(design: docs/internal/864-multi-env-harness-design.md §3/§4).
 
 It does NOT invent test selection (that is run_touched_tests.py's job) and it
 does NOT replace the full-suite convergence gate — it makes the *fast* path
@@ -71,7 +71,7 @@ class EnvSpec:
 
 # P0 set — every 1a axis with a real incident history gets one ON and one OFF
 # cell; the two incident-bearing interaction pairs (vec×install-mode,
-# locale×platform) get dedicated cells. (docs/864-multi-env-harness-design.md §2)
+# locale×platform) get dedicated cells. (docs/internal/864-multi-env-harness-design.md §2)
 P0_ENVS: list[EnvSpec] = [
     EnvSpec(
         name="full-default",

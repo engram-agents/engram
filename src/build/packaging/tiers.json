@@ -15,7 +15,7 @@
     "dynamic_dispatch_exclusions": [
       {
         "file": "engram_client.py",
-        "line": 496,
+        "line": 502,
         "reason": "Test/SDK harness (ClientHarness.call) invokes already-terminal @mcp.tool dispatch targets by name via a dict built from getattr(server, name); walk correctness is unaffected because dispatch targets are the walk's own stopping point, not an intermediate hop toward one."
       },
       {
@@ -32,7 +32,7 @@
       },
       {
         "file": "tools/codex-umwelt-wake.py",
-        "line": 684,
+        "line": 726,
         "reason": "Codex RPC notification-drain dispatch (getattr(rpc, 'drain_buffered_notifications', None)); this file contains zero emit()/emit_if_initialized() calls and is not on any site's backward-walk path.",
         "zero_emit_file": true
       }
@@ -224,6 +224,11 @@
       "tier": "essential"
     },
     {
+      "path": "engram_home_resolver.py",
+      "tier": "essential",
+      "note": "#3863 step 2: the ONE runtime-layer ENGRAM_HOME resolver (refuses a relative value). Imported by engram_core at import, so essential. Pinned AST-identical to tools/_owner_read.engram_home() by tests/test_engram_home_parity_3863.py."
+    },
+    {
       "path": "engram_confidence.py",
       "tier": "essential"
     },
@@ -243,7 +248,7 @@
       "path": "engram_log_emitter.py",
       "tier": "essential",
       "telemetry": [],
-      "note": "telemetry: [] is correct, not merely default: this file's own emit_if_initialized() call at :281 (line drifted from :260 by WS3's additive `site` param on emit()/_emit_inner() -- see telemetry_manifest_gate.py's TRANSPORT_EXCLUSION_LINENO) IS the transport (`return emitter.emit(...)`), excluded from the section-4a declarable population as a consumer of itself, per docs/2574-telemetry-design.md section 1 DECLARED."
+      "note": "telemetry: [] is correct, not merely default: this file's own emit_if_initialized() call at :281 (line drifted from :260 by WS3's additive `site` param on emit()/_emit_inner() -- see telemetry_manifest_gate.py's TRANSPORT_EXCLUSION_LINENO) IS the transport (`return emitter.emit(...)`), excluded from the section-4a declarable population as a consumer of itself, per docs/internal/2574-telemetry-design.md section 1 DECLARED."
     },
     {
       "path": "engram_restamp.py",
@@ -277,7 +282,7 @@
     {
       "path": "engram_telemetry_store.py",
       "tier": "convenience",
-      "note": "engram-alpha#2574 WS1 (epic #2013's telemetry redesign): the per-process JSONL writer (write_telemetry_record) + records.db aggregator (open_store/ingest). Tiered convenience (T2), not essential, per this PR's own judgment call (the WS1 spec left the exact tier to the implementer, flagged for review): this is observability/participation tooling -- which hooks/tools actually fired, not the core write/read/consolidation path. Removing it degrades UX (loses the telemetry participation signal) but breaks nothing epistemic-identity-critical, matching CLAUDE.md's Install-tiers T2 definition. Sits alongside the T1-tagged engram_log_emitter.py (a different, older system -- the two-level session event log, load-bearing for the drowsiness meter/continuity) without inheriting its tier. UPDATED by WS5 (server-side wiring): five T1/essential files (server.py, engram_derive.py, engram_observation.py, engram_query.py, engram_revision.py) now import this module -- but each does so via a guarded `try/except ImportError`-style import with a no-op stub fallback (`write_telemetry_record(...) -> False`), never a plain top-level import, specifically so this file's own T2 tier is preserved without those five files silently breaking on an Essential-only build that excludes it (tests/test_tiers_manifest.py::test_import_dep_tier_consistency enforces the absence of a HARD dependency; the guarded-import shape is what keeps the dependency soft). This is the concrete mechanism behind docs/2574-telemetry-design.md §8's 'telemetry gates nothing T1.'"
+      "note": "engram-alpha#2574 WS1 (epic #2013's telemetry redesign): the per-process JSONL writer (write_telemetry_record) + records.db aggregator (open_store/ingest). Tiered convenience (T2), not essential, per this PR's own judgment call (the WS1 spec left the exact tier to the implementer, flagged for review): this is observability/participation tooling -- which hooks/tools actually fired, not the core write/read/consolidation path. Removing it degrades UX (loses the telemetry participation signal) but breaks nothing epistemic-identity-critical, matching CLAUDE.md's Install-tiers T2 definition. Sits alongside the T1-tagged engram_log_emitter.py (a different, older system -- the two-level session event log, load-bearing for the drowsiness meter/continuity) without inheriting its tier. UPDATED by WS5 (server-side wiring): five T1/essential files (server.py, engram_derive.py, engram_observation.py, engram_query.py, engram_revision.py) now import this module -- but each does so via a guarded `try/except ImportError`-style import with a no-op stub fallback (`write_telemetry_record(...) -> False`), never a plain top-level import, specifically so this file's own T2 tier is preserved without those five files silently breaking on an Essential-only build that excludes it (tests/test_tiers_manifest.py::test_import_dep_tier_consistency enforces the absence of a HARD dependency; the guarded-import shape is what keeps the dependency soft). This is the concrete mechanism behind docs/internal/2574-telemetry-design.md §8's 'telemetry gates nothing T1.'"
     },
     {
       "path": "engram_telemetry_verdicts.py",
@@ -469,6 +474,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/backup_remote_repair.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/recall_summary_validator.py",
       "tier": "essential"
     },
@@ -490,6 +499,14 @@
     },
     {
       "path": "tools/_owner_read.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/install_selfcheck.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/install.sh",
       "tier": "essential"
     },
     {
@@ -517,11 +534,34 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/quote_quality_survey.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/s2_clause_check.py",
+      "tier": "dev",
+      "note": "engram-alpha#4201 (S2 next step, part of #4050): evaluation harness for an automated clause check against the S2 labels, with per-fold freeze manifests; a team study tool, not a user tool. Dev tier, and kept out of the public release by release-minus-set.txt. Reads local study inputs that are never committed."
+    },
+    {
+      "path": "tools/s2_clause_sheet.py",
+      "tier": "dev",
+      "note": "engram-alpha#4050 S2: single-purpose clause-check sheet builder for the team's pre-registered blind study; a team study tool, not a user tool. Dev tier, and kept out of the public release by release-minus-set.txt. Its scrub roster is supplied by the seat at run time and is never committed."
+    },
+    {
+      "path": "tools/s2_score.py",
+      "tier": "dev",
+      "note": "engram-alpha#4050 S2: single-purpose scorer for the team's pre-registered blind study (hash-first, planted controls first); a team study tool, not a user tool. Dev tier, and kept out of the public release by release-minus-set.txt. Reads local sheets, keys and returns that are never committed."
+    },
+    {
       "path": "tools/weakest_load_bearing.py",
       "tier": "convenience"
     },
     {
       "path": "tools/study_queue.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/check_stale_processes.py",
       "tier": "convenience"
     },
     {
@@ -571,6 +611,11 @@
       "note": "Local diff-coverage helper (#2774) -- reports coverage of only the lines the current branch changes vs origin/dev, via diff-cover fed a coverage.xml from an affected-tests run. Dev tooling (T3): a developer convenience for local PR iteration, not part of any install path a shipped agent relies on. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/coverage-diff.sh) would wrongly flag this as dangling (same pattern as tools/rc-upgrade-verify.py's entry above)."
     },
     {
+      "path": "tools/seat-run.sh",
+      "tier": "dev",
+      "note": "engram-alpha#3974: Mac-safe test runner for colleague reads (scratch worktree, header naming the seat's configuration, -o flag read-back, zero-test guard, per-file results). ENGRAM-development tooling (T3); a developer convenience for review seats, never relied on by an installed agent."
+    },
+    {
       "path": "tools/recall_harness",
       "tier": "dev",
       "source": "tools/recall_harness",
@@ -594,6 +639,10 @@
     },
     {
       "path": "tools/engram-regenerate-embeddings.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/lesson-pattern-audit.py",
       "tier": "essential"
     },
     {
@@ -627,10 +676,6 @@
     },
     {
       "path": "tools/compute_task_time.py",
-      "tier": "convenience"
-    },
-    {
-      "path": "tools/_common.py",
       "tier": "convenience"
     },
     {
@@ -684,6 +729,11 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/merge_batch.py",
+      "tier": "dev",
+      "note": "the merge seat's batched press (scratch merge, whole-suite record, window, press with mechanical gates); merge-seat tooling for this repo, needs gh and a team workflow, so dev tier."
+    },
+    {
       "path": "tools/forum.py",
       "tier": "convenience"
     },
@@ -713,6 +763,10 @@
     },
     {
       "path": "tools/loop_prompt.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/loop_marker_set.py",
       "tier": "convenience"
     },
     {
@@ -763,13 +817,19 @@
       "path": "tools/claude_md_moves_check.py",
       "tier": "dev",
       "source": "tools/claude_md_moves_check.py",
-      "note": "nothing-lost check for the CLAUDE.md prune (#3322): reads docs/claude-md-moves.json and asserts each moved block's first and last sentence appears exactly once in its target doc and zero times in CLAUDE.md. Developer tier (T3): a repo-maintenance gate for ENGRAM development, run by tests/test_claude_md_moves.py in pr-checks; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/recall_repetition_analysis.py."
+      "note": "nothing-lost check for the CLAUDE.md prune (#3322): reads tools/claude_md_moves.json and asserts each moved block's first and last sentence appears exactly once in its target doc and zero times in CLAUDE.md. Developer tier (T3): a repo-maintenance gate for ENGRAM development, run by tests/test_claude_md_moves.py in pr-checks; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/recall_repetition_analysis.py."
+    },
+    {
+      "path": "tools/claude_md_moves.json",
+      "tier": "dev",
+      "source": "tools/claude_md_moves.json",
+      "note": "#3322: the mapping of blocks moved out of CLAUDE.md, read by tools/claude_md_moves_check.py. Tiered with the gate it feeds (dev, T3): one inseparable unit. Real data file directly under repo-root tools/, so 'source' is set explicitly."
     },
     {
       "path": "tools/check_2652_ledger.py",
       "tier": "dev",
       "source": "tools/check_2652_ledger.py",
-      "note": "completeness guard for docs/2652-migration-ledger.md (#2652): per-file count of Section-2 rows vs sqlite3.connect( lines in tracked src/engram. Developer tier (T3): a repo-maintenance gate run by pr-checks; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/claude_md_moves_check.py."
+      "note": "completeness guard for docs/internal/2652-migration-ledger.md (#2652): per-file count of Section-2 rows vs sqlite3.connect( lines in tracked src/engram. Developer tier (T3): a repo-maintenance gate run by pr-checks; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/claude_md_moves_check.py."
     },
     {
       "path": "tools/home_path_gate.py",
@@ -782,6 +842,18 @@
       "tier": "dev",
       "source": "tools/home_path_baseline.json",
       "note": "engram-alpha#3863 (PR 1): the checked-in baseline + (empty) allowlist read by tools/home_path_gate.py. Tiered with the gate it feeds (dev, T3): one inseparable unit. Real data file directly under repo-root tools/, so 'source' is set explicitly."
+    },
+    {
+      "path": "tools/raw_home_read_gate.py",
+      "tier": "dev",
+      "source": "tools/raw_home_read_gate.py",
+      "note": "engram-alpha#3863 (step 1, round 2): the pr-checks gate that fails on a NEW raw ENGRAM_HOME environment read (environ get, subscript or getenv) in tracked src/ and tools/ .py files outside the five pinned resolver files; today's sites sit in tools/raw_home_read_baseline.json, which may only shrink. Developer tier (T3): a repo-maintenance gate for ENGRAM development, run by pr-checks over the source tree; no install ever needs it, same reasoning as tools/home_path_gate.py. Real file directly under repo-root tools/, so 'source' is set explicitly."
+    },
+    {
+      "path": "tools/raw_home_read_baseline.json",
+      "tier": "dev",
+      "source": "tools/raw_home_read_baseline.json",
+      "note": "engram-alpha#3863 (step 1, round 2): the checked-in per-file baseline + pinned-resolver allowlist read by tools/raw_home_read_gate.py. Tiered with the gate it feeds (dev, T3): one inseparable unit. Real data file directly under repo-root tools/, so 'source' is set explicitly."
     },
     {
       "path": "tools/recall_repetition_analysis.py",
@@ -806,6 +878,12 @@
       "tier": "dev",
       "source": "tools/engramd_a6_latency.py",
       "note": "engram-alpha#3197 (U4d, part of #2652): the A6 latency-delta measurement -- the user-identity hook's person-node read, old path vs through a REAL engramd_owner process, same run/store/N, with contended and cold-cache arms. A measurement owed in the PR body, not a CI gate; ENGRAM-development tooling, real file under repo-root tools/, so 'source' is set explicitly."
+    },
+    {
+      "path": "tools/engramd_lockwait_report.py",
+      "tier": "dev",
+      "source": "tools/engramd_lockwait_report.py",
+      "note": "engram-alpha#4234 (part of #3740): the read-only report on the engramd owner's per-day read-lock wait counters (lockwait-YYYY-MM-DD.json in the run dir) -- per-family reads / waited_reads / p95, and waited/reads for the tripwire family and its joins. ENGRAM-development tooling, real file under repo-root tools/, so 'source' is set explicitly."
     },
     {
       "path": "tools/engramd_stage_profile.py",
@@ -1495,10 +1573,6 @@
       "reason": "one-shot dry-run guide: extracts typed fields from legacy free-form person node prose; produces a human-review report, never auto-applies; not a recurring shipped mechanism"
     },
     {
-      "path": "tools/lesson-pattern-audit.py",
-      "reason": "maintainer-run functional audit of lesson situation_patterns against real transcript traffic (issue #2018); diagnostic tool run manually against an agent's own home directory to sanity-check pattern coverage, not a recurring shipped mechanism any install needs to run"
-    },
-    {
       "path": "tools/engram-backfill-special-moment-edges.py",
       "reason": "one-shot data-integrity repair: creates the missing 'about' edges every special_moments[].node_id should have had, for nodes written before this backfill existed (issue #1948); idempotent and safe to re-run, but not a recurring shipped mechanism any install needs to run regularly"
     },
@@ -1533,6 +1607,10 @@
     {
       "path": "tools/_channel.py",
       "reason": "#2857 step 2: its only live importer is tools/telegram_bot.py, already excluded above as persona-specific integration not part of generic ENGRAM install. Shipping _channel.py as a mechanism ships a module whose sole live consumer is never installed; kept in the repo (not deleted) because telegram_bot.py still uses it."
+    },
+    {
+      "path": "tools/_common.py",
+      "reason": "#3863 step 3d: its only importer anywhere in the tree is tools/telegram_bot.py, already excluded above as persona-specific integration not part of generic ENGRAM install. Shipping _common.py as a mechanism ships a module whose sole live consumer is never installed; kept in the repo (not deleted) because telegram_bot.py still uses it."
     },
     {
       "path": "templates/agents.json.example",
@@ -1641,7 +1719,7 @@
       "reason": "operator upgrade guides — developer/operator reference documentation, not shipped in the plugin bundle"
     },
     {
-      "path": "docs/inter-agent/",
+      "path": "docs/internal/inter-agent/",
       "reason": "inter-agent protocol design documents — developer reference, not shipped in the plugin bundle (moved from root in Phase 4 of #1093)"
     },
     {
@@ -1653,11 +1731,11 @@
       "reason": "README for the agents/claude directory — documentation only, not a shippable agent file (build-plugin.sh copies *.md files excluding README.md)"
     },
     {
-      "path": "docs/cycle/",
+      "path": "docs/internal/cycle/",
       "reason": "epistemic research cycle design documents and artifacts (CHARTER, CHRONICLE, charter-inputs, mira-package, standpoint design) — in-development research material, not shipped in the plugin bundle (moved from root in Phase 4 of #1093)"
     },
     {
-      "path": "docs/archive/",
+      "path": "docs/internal/archive/",
       "reason": "historical one-time migration artifacts preserved for reference — ran during early development and are not shipped in any install tier (moved from root in Phase 4 of #1093)"
     },
     {

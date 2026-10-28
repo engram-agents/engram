@@ -38,6 +38,10 @@ SIGNAL_NAMES = ["similarity", "importance_score", "utility",
 # signal name -> row key it is read from
 _ROW_KEY = {"utility": "utility_score"}
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _fresh_server():
     if os.path.exists(TEST_DIR):

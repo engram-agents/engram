@@ -159,6 +159,7 @@ class ProbeSeat(Seat):
     def __init__(self, tmp_path: Path, os_name: str = "Linux", owner: str = "absent"):
         super().__init__(tmp_path, os_name=os_name)
         shutil.copy(CLIENT_PY, self.plugin / "engramd_client.py")
+        shutil.copy(SRC / "engram_home_resolver.py", self.plugin / "engram_home_resolver.py")  # #3863 step 2: the client imports it
         self._short = Path(tempfile.mkdtemp(prefix="osp3736-"))
         self.eh = self._short / "eh"
         self.eh.mkdir()

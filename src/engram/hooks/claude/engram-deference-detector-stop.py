@@ -183,7 +183,9 @@ def _cooldown_minutes() -> float:
     try:
         with open_regular_text(CONFIG_PATH) as f:
             cfg = json.load(f)
-        val = cfg.get("deference_detector", {}).get("cooldown_minutes")
+        # #4229: a non-dict top level or `deference_detector` means the default.
+        block = cfg.get("deference_detector", {}) if isinstance(cfg, dict) else {}
+        val = block.get("cooldown_minutes") if isinstance(block, dict) else None
         if isinstance(val, (int, float)) and val >= 0:
             return float(val)
     except (OSError, ValueError, json.JSONDecodeError):
@@ -353,7 +355,7 @@ def _emit_hook_fire(session_id: str | None, transcript_path: str | None, duratio
 
     alpha #2574 WS3: construction (import + Emitter.init) is narrowed to its
     own try/except so an INIT_FAILED outcome is recordable and distinct from
-    an ordinary DROPPED emit (docs/2574-telemetry-design.md §1/§5).
+    an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md §1/§5).
     """
     _emitter = None
     try:

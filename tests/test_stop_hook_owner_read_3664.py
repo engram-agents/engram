@@ -64,6 +64,9 @@ COUNT_SQL = "SELECT count(*) FROM nodes WHERE is_current = 1"
 THRESHOLD = 10
 NUDGE_PREFIX = "[ENGRAM Write Check:"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # --- fixtures / helpers --------------------------------------------------------
 
@@ -843,7 +846,8 @@ def test_c5_flattened_deployed_layout_resolves_both_runtime_modules_and_reads_th
     for name in ("engram-stop-hook.py", "_hooklib.py", "_stophooklib.py"):
         shutil.copy(_HOOKS_SRC / name, root / "hooks" / name)
     # #3707: engramd_client imports engram_pidfile; #3768: engram_pidfile imports engram_regular_io; the build ships all at the plugin root (tiers.json, essential).
-    for name in ("engramd_client.py", "engramd_owner_flags.py", "engram_pidfile.py", "engram_regular_io.py"):
+    for name in ("engramd_client.py", "engramd_owner_flags.py", "engram_pidfile.py", "engram_regular_io.py",
+                 "engram_home_resolver.py"):  # #3863 step 2: engramd_client imports the runtime resolver
         shutil.copy(Path(_SRC_ENGRAM) / name, root / name)
     transcript = home / "t.jsonl"
     transcript.write_text("{}\n")

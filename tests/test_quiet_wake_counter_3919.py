@@ -22,6 +22,7 @@ ENGRAM_HOME (same fixtures as tests/test_loop_arm_stop_hook.py).
 
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import json
 import os
@@ -38,10 +39,16 @@ from test_loop_arm_stop_hook import (  # noqa: E402
     _run_hook,
     _schedule_wakeup_call,
     _tool_use_record,
+    _tool_use_record_with_msg_id,
+    _batched_arm_records,
     _write_loop_marker,
 )
 
 STATE_NAME = ".quiet-wake-counter.json"
+
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored);
+# module scope: the load happens in module-scope fixtures or at import, which a function-scope window does not cover.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads_module")
 
 
 # ---------------------------------------------------------------------------
@@ -364,11 +371,13 @@ class Seat:
     def quiet(self, *, rearm=True):
         lines = [WAKE, _tu("mcp__umwelt__whats_new")]
         if rearm:
-            lines.append(REARM)
+            sw, cl = _batched_arm_records("t_sw", "t_cl", _REAL_LOOP_PROMPT, "msg_quiet_rearm")
+            lines.extend([sw, cl])
         return self.fire(*lines)
 
     def busy(self):
-        return self.fire(WAKE, _tu("mcp__umwelt__send_crossing", {"to": "x"}), REARM)
+        sw, cl = _batched_arm_records("t_sw", "t_cl", _REAL_LOOP_PROMPT, "msg_busy_rearm")
+        return self.fire(WAKE, _tu("mcp__umwelt__send_crossing", {"to": "x"}), sw, cl)
 
 
 def _decision(out: str):
@@ -425,7 +434,8 @@ def test_different_transcript_path_resets(tmp_path):
     s.quiet()
     other = tmp_path / "other.jsonl"
     other.write_text("")
-    assert s.fire(WAKE, _tu("mcp__umwelt__whats_new"), REARM, transcript=other) == ""
+    sw, cl = _batched_arm_records("t_sw", "t_cl", _REAL_LOOP_PROMPT, "msg_other_rearm")
+    assert s.fire(WAKE, _tu("mcp__umwelt__whats_new"), sw, cl, transcript=other) == ""
     assert s.ticks() == 1  # restarted from 0 on the new transcript, not 2
     assert json.loads(s.state_path.read_text())["transcript_path"] == str(other)
 
@@ -463,7 +473,10 @@ def test_quiet_turn_without_rearm_emits_arm_nudge_only_and_counts(tmp_path):
 def test_arm_nudge_text_unchanged_when_counter_runs(tmp_path, hook):
     s = Seat(tmp_path)
     out = s.quiet(rearm=False)
-    assert _decision(out)["reason"] == hook._NUDGE_TEXT
+    # #4139: the arm nudge's loop_prompt sentence now depends on the marker;
+    # this cell pins that the quiet counter leaves the nudge exactly as the
+    # hook's own selector would build it for this marker.
+    assert _decision(out)["reason"] == hook._nudge_text_for_marker(str(s.home / "loop-mode.json"))
 
 
 def test_stop_hook_active_leaves_counter_untouched(tmp_path):
@@ -499,7 +512,12 @@ def test_unwritable_state_path_never_breaks_hook(tmp_path):
 def test_human_turn_resets_via_subprocess(tmp_path):
     s = Seat(tmp_path)
     s.quiet()
-    assert s.fire(HUMAN, REARM) == ""
+    sw, cl = _batched_arm_records("t_sw", "t_cl", _REAL_LOOP_PROMPT, "msg_human_rearm")
+    # #4104: a human turn must END on assistant text (a trailing arm swallows the reply and the
+    # reply gate blocks it), so the reply follows the arm as the turn's final text.
+    reply = json.dumps({"type": "assistant", "message": {"id": "msg_reply", "content": [
+        {"type": "text", "text": "the test fails on the stale fixture"}]}})
+    assert s.fire(HUMAN, sw, cl, reply) == ""
     assert s.ticks() == 0
 
 
@@ -672,3 +690,264 @@ def test_round2_fringe_read_only_passes_are_closed(hook, cmd):
 @pytest.mark.parametrize("cmd", ["date", "date +%s", "date -u +%Y-%m-%dT%H:%M:%SZ", "gh pr view 5", "git diff HEAD~1"])
 def test_round2_control_ordinary_forms_stay_accepted(hook, cmd):
     assert hook._bash_is_read_only(cmd), cmd
+
+
+# ---------------------------------------------------------------------------
+# helpers for waiting_on tests
+# ---------------------------------------------------------------------------
+
+def _marker_with_waiting_on(tmp_path: Path, description: str, return_by: str) -> str:
+    """Write a scheduleWakeup loop-mode.json with a waiting_on declaration."""
+    p = tmp_path / "loop-mode-wo.json"
+    p.write_text(json.dumps({
+        "kind": "heartbeat",
+        "pacer": "scheduleWakeup",
+        "cadence_seconds": 1800,
+        "waiting_on": {"description": description, "return_by": return_by},
+    }), encoding="utf-8")
+    return str(p)
+
+
+def _future_ts() -> str:
+    # Clearly within N (_WAITING_ON_NEAR_ZONE_MINUTES, ~10 min) — advisory zone.
+    return (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _near_zone_ts() -> str:
+    # Just within N (9 min) — pins _WAITING_ON_NEAR_ZONE_MINUTES ≤ 9 would break this.
+    return (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=9)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _just_beyond_zone_ts() -> str:
+    # Just beyond N (11 min) — pins _WAITING_ON_NEAR_ZONE_MINUTES ≥ 11 would break this.
+    return (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=11)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _far_future_ts() -> str:
+    # Clearly beyond N — study-unit block zone on first trigger.
+    return (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _past_ts() -> str:
+    return (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# _read_waiting_on contract
+# ---------------------------------------------------------------------------
+
+def test_read_waiting_on_future_returns_pair(hook, tmp_path):
+    p = _marker_with_waiting_on(tmp_path, "coder-fairy #4044", _future_ts())
+    result = hook._read_waiting_on(p)
+    assert result is not None
+    desc, rb = result
+    assert desc == "coder-fairy #4044"
+    assert "T" in rb  # ISO form preserved
+
+def test_read_waiting_on_past_returns_none(hook, tmp_path):
+    p = _marker_with_waiting_on(tmp_path, "expired wait", _past_ts())
+    assert hook._read_waiting_on(p) is None
+
+def test_read_waiting_on_absent_returns_none(hook, tmp_path):
+    p = tmp_path / "marker.json"
+    p.write_text('{"kind": "heartbeat", "pacer": "scheduleWakeup"}', encoding="utf-8")
+    assert hook._read_waiting_on(str(p)) is None
+
+def test_read_waiting_on_not_dict_returns_none(hook, tmp_path):
+    p = tmp_path / "marker.json"
+    p.write_text('{"waiting_on": "not-a-dict"}', encoding="utf-8")
+    assert hook._read_waiting_on(str(p)) is None
+
+def test_read_waiting_on_missing_description_returns_none(hook, tmp_path):
+    p = tmp_path / "marker.json"
+    p.write_text(
+        json.dumps({"waiting_on": {"return_by": _future_ts()}}), encoding="utf-8"
+    )
+    assert hook._read_waiting_on(str(p)) is None
+
+def test_read_waiting_on_bad_timestamp_returns_none(hook, tmp_path):
+    p = tmp_path / "marker.json"
+    p.write_text(
+        '{"waiting_on": {"description": "x", "return_by": "not-a-date"}}',
+        encoding="utf-8",
+    )
+    assert hook._read_waiting_on(str(p)) is None
+
+def test_read_waiting_on_missing_file_returns_none(hook, tmp_path):
+    assert hook._read_waiting_on(str(tmp_path / "nonexistent.json")) is None
+
+
+# ---------------------------------------------------------------------------
+# advisory text contract
+# ---------------------------------------------------------------------------
+
+def test_advisory_text_shape(hook):
+    t = hook._QUIET_ADVISORY_TEXT
+    assert len(t) < 600
+    assert "{n}" in t and "{desc}" in t and "{rb_str}" in t
+    # Must NOT contain demand keywords — that would make it a demand, not advisory
+    assert "study_queue" not in t
+    assert "owner" not in t.lower()
+    # Must reference the tick rule (case-insensitive)
+    assert "tick" in t.lower()
+    # Must be distinct from the demand text and study-unit text
+    assert t != hook._QUIET_NUDGE_TEXT
+    assert t != hook._QUIET_STUDY_UNIT_TEXT
+    # Must not contain real node IDs
+    import re
+    assert not re.search(r"\b[a-z]{2}_\d{4}\b", t)
+
+
+def test_study_unit_text_shape(hook):
+    t = hook._QUIET_STUDY_UNIT_TEXT
+    assert len(t) < 600
+    assert "{desc}" in t and "{rb_str}" in t
+    # Must reference "study unit" so _is_study_unit_nudge can detect it
+    assert "study unit" in t.lower()
+    # Must reference the tick rule
+    assert "tick" in t.lower()
+    # Must not contain the demand's marker keyword
+    assert "study_queue" not in t
+    # Must be distinct from both advisory and demand
+    assert t != hook._QUIET_ADVISORY_TEXT
+    assert t != hook._QUIET_NUDGE_TEXT
+    # Must not contain real node IDs
+    import re
+    assert not re.search(r"\b[a-z]{2}_\d{4}\b", t)
+
+
+def test_read_waiting_on_far_future_returns_pair(hook, tmp_path):
+    """Far-future return_by is now active (no horizon filter in _read_waiting_on)."""
+    p = _marker_with_waiting_on(tmp_path, "long-running CI", _far_future_ts())
+    result = hook._read_waiting_on(p)
+    assert result is not None
+    desc, rb = result
+    assert desc == "long-running CI"
+
+
+# ---------------------------------------------------------------------------
+# waiting_on interaction: Seat with waiting_on in marker
+# ---------------------------------------------------------------------------
+
+class SeatWithWaiting(Seat):
+    """Seat whose loop-mode.json carries a future waiting_on declaration."""
+
+    def __init__(self, tmp_path: Path, return_by: str | None = None):
+        super().__init__(tmp_path)
+        rb = return_by or _future_ts()
+        marker_path = self.home / "loop-mode.json"
+        data = json.loads(marker_path.read_text(encoding="utf-8"))
+        data["waiting_on"] = {"description": "test-fairy", "return_by": rb}
+        marker_path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _is_advisory_nudge(out: str) -> bool:
+    d = _decision(out)
+    return (
+        bool(d)
+        and "systemMessage" in d
+        and "decision" not in d
+        and "tick" in d.get("systemMessage", "").lower()
+    )
+
+
+def _is_study_unit_nudge(out: str) -> bool:
+    d = _decision(out)
+    return bool(d) and d.get("decision") == "block" and "study unit" in d.get("reason", "").lower()
+
+
+def test_waiting_on_active_two_quiet_emits_advisory_not_demand(tmp_path):
+    """Within N: nudge fires advisory as systemMessage (no block) after threshold."""
+    s = SeatWithWaiting(tmp_path)
+    assert s.quiet() == ""            # tick 1, no nudge
+    out = s.quiet()                   # tick 2, nudge due
+    assert _is_advisory_nudge(out), f"expected advisory systemMessage, got: {out!r}"
+    assert not _is_quiet_nudge(out), f"must NOT be a demand nudge, got: {out!r}"
+    assert not _is_study_unit_nudge(out), f"must NOT be a study-unit block, got: {out!r}"
+    msg = _decision(out)["systemMessage"]
+    assert "test-fairy" in msg        # description threaded through
+
+
+def test_waiting_on_expired_two_quiet_emits_demand(tmp_path):
+    """With expired waiting_on (return_by in past), demand fires as normal."""
+    s = SeatWithWaiting(tmp_path, return_by=_past_ts())
+    assert s.quiet() == ""
+    out = s.quiet()
+    assert _is_quiet_nudge(out), f"expected demand nudge, got: {out!r}"
+    assert not _is_advisory_nudge(out)
+
+
+def test_waiting_on_counter_still_increments(tmp_path):
+    """Counter increments even inside a known-return wait."""
+    s = SeatWithWaiting(tmp_path)
+    assert s.quiet() == ""
+    assert s.ticks() == 1            # incremented despite waiting_on
+
+
+def test_waiting_on_counter_resets_after_advisory(tmp_path):
+    """Counter resets to 0 after an advisory nudge fires."""
+    s = SeatWithWaiting(tmp_path)
+    s.quiet()
+    s.quiet()                        # advisory fires here, resets counter
+    assert s.ticks() == 0
+
+
+def test_waiting_on_beyond_n_first_trigger_emits_study_unit_block(tmp_path):
+    """Beyond N: first trigger emits the once-only study-unit block (not demand)."""
+    s = SeatWithWaiting(tmp_path, return_by=_far_future_ts())
+    assert s.quiet() == ""
+    out = s.quiet()
+    assert _is_study_unit_nudge(out), f"expected study-unit block, got: {out!r}"
+    assert not _is_quiet_nudge(out), f"must NOT be a demand nudge, got: {out!r}"
+    assert not _is_advisory_nudge(out), f"must NOT be an advisory systemMessage, got: {out!r}"
+    reason = _decision(out)["reason"]
+    assert "test-fairy" in reason     # description threaded through
+
+
+def test_waiting_on_beyond_n_once_only_then_advisory(tmp_path):
+    """Beyond N: after the once-only block fires, subsequent triggers give advisory."""
+    s = SeatWithWaiting(tmp_path, return_by=_far_future_ts())
+    s.quiet()           # tick 1
+    out1 = s.quiet()    # tick 2: once-only fires
+    assert _is_study_unit_nudge(out1)
+    s.quiet()           # tick 1 (counter reset)
+    out2 = s.quiet()    # tick 2: advisory (no second block)
+    assert _is_advisory_nudge(out2), f"expected advisory after flag set, got: {out2!r}"
+    assert not _is_study_unit_nudge(out2), f"block must NOT fire twice, got: {out2!r}"
+
+
+def test_waiting_on_9min_emits_advisory(tmp_path):
+    """return_by at now+9 min is within N (~10) — advisory, never study-unit block.
+
+    Pins _WAITING_ON_NEAR_ZONE_MINUTES: if it were mutated to >= 11 this cell
+    stays green (still within zone); mutating it to <= 8 would move 9 min outside
+    the zone and turn this red. The 11-min companion below is the load-bearing pin.
+    """
+    s = SeatWithWaiting(tmp_path, return_by=_near_zone_ts())
+    s.quiet()
+    out = s.quiet()
+    assert _is_advisory_nudge(out), f"9-min wait: expected advisory, got: {out!r}"
+    assert not _is_study_unit_nudge(out), f"9-min wait: must NOT be study-unit block"
+
+
+def test_waiting_on_11min_emits_study_unit_block(tmp_path):
+    """return_by at now+11 min is beyond N (~10) — study-unit block on first trigger.
+
+    Pins _WAITING_ON_NEAR_ZONE_MINUTES: mutating it to >= 11 would keep 11 min
+    inside the near zone and emit an advisory instead, turning this red.
+    """
+    s = SeatWithWaiting(tmp_path, return_by=_just_beyond_zone_ts())
+    s.quiet()
+    out = s.quiet()
+    assert _is_study_unit_nudge(out), f"11-min wait: expected study-unit block, got: {out!r}"
+    assert not _is_advisory_nudge(out), f"11-min wait: must NOT be advisory"

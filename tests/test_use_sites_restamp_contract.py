@@ -60,6 +60,9 @@ NO_RESTAMP = ["inspect", "subgraph", "unfocus", "no_such_action_xyz"]
 
 _SET = SPEC_RESTAMP | set(getattr(_collect_time_restamp, "RESTAMP_ACTIONS", ()))
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def fresh_server():
     if os.path.exists(TEST_DIR):

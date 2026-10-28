@@ -102,6 +102,7 @@ CREATE TABLE nodes (
     type          TEXT NOT NULL,
     claim         TEXT,
     is_current    INTEGER DEFAULT 1,
+    status        TEXT DEFAULT 'active',
     superseded_by TEXT,
     recall_summary TEXT
 );

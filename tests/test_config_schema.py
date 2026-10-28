@@ -32,6 +32,10 @@ import engram_core  # noqa: E402 — must follow sys.path setup
 
 from tools.config_schema import SCHEMA  # noqa: E402
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _schema_by_key() -> dict[str, dict]:
     """Return SCHEMA indexed by key for O(1) lookup."""

@@ -17,6 +17,7 @@ Checkpoint/backup layers (both written in _commit_snapshot on every nap):
   large, not line-diff friendly).
 """
 
+import errno
 import functools
 import hashlib
 import json
@@ -41,6 +42,7 @@ from urllib.parse import urlparse
 import engram_restamp as _restamp  # noqa: E402
 import engram_config_io as _config_io  # noqa: E402
 import engram_regular_io as _regular_io  # noqa: E402
+import engram_home_resolver as _home_resolver  # noqa: E402  (#3863 step 2)
 from engram_confidence import (  # noqa: E402
     CONFIDENCE_MAP,
     PREDICTIVE_CONFIDENCE_CAP,
@@ -479,7 +481,10 @@ _embedder = EmbeddingManager()
 DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 
-DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
+# #3863 step 2 (the rulings: engram_home_resolver's docstring): engram_core is a process entry point, so a
+# RELATIVE ENGRAM_HOME fails this import with a ValueError naming the value (the MCP server and every CLI that
+# imports it fail loudly). _configure_paths(data_dir) below is unchanged for explicit redirect callers.
+DATA_DIR = _home_resolver.engram_home()
 
 
 DB_PATH = DATA_DIR / "knowledge.db"
@@ -579,6 +584,35 @@ _SETUP_LOCK_POLL_S = 0.05
 SETUP_WAIT_HOOK = "hook"
 SETUP_WAIT_SERVER = "server"
 
+# ── #3882 (U19 of #2652): the store-MAINTENANCE lock ────────────────────────
+# The same primitive under a second name: `<db>.maint.lockdir`. The engramd owner holds it for its whole
+# lifetime, and each offline repair tool (the exclusive-maintenance class of the 2652 ledger) holds it for
+# its whole run, so the two exclude each other: "offline" is enforced, not a word in a docstring. It is
+# taken NON-BLOCKING (one attempt plus the inode recheck, no wait loop): a held lock is the answer.
+# The holder file inside the directory carries "<pid> <role>\n", role = `owner` or the tool's name. It is
+# informational ONLY (it picks the refusal's message and exit code); the flock is the sole exclusion.
+# Its typed errors subclass StoreMaintLockError, NOT DbSetupLockError, so a handler written for the setup
+# lock never swallows a maintenance refusal.
+STORE_MAINT_LOCK_SUFFIX = ".maint.lockdir"
+STORE_MAINT_OWNER_ROLE = "owner"
+# The exit status of a tool (and of the owner, as EXIT_STORE_MAINTENANCE) refused by a held maintenance
+# lock. Not 0, 1 or 2; the owner's supervisor retries it with back-off while a repair runs.
+STORE_MAINT_REFUSED_EXIT = 6
+# The OSError numbers that mean "a retry can clear this", for a maintenance lock directory that could not
+# be created, opened or flocked. The owner (exit 6, the supervisor retries with back-off) and the offline
+# tools (a "transient, retry later" refusal) both read THIS set, through StoreMaintLockUnusable.retryable;
+# nothing else spells it. Resource limits only. EAGAIN is here for the create/open path; at flock EAGAIN
+# means "held" (BlockingIOError) and never reaches the unusable path at all.
+STORE_MAINT_RETRYABLE_ERRNOS = frozenset({
+    errno.EMFILE, errno.ENFILE, errno.ENOSPC, errno.ENOLCK, errno.EAGAIN,
+})
+# A permission or creation failure the operator works around with a writable copy of the store: permission
+# denied, a read-only filesystem. (Used for the refusal's remedy only.) ENOENT is NOT here: a missing
+# parent directory means the store the remedy would copy is not there either, so it is "unknown" (the
+# errno is named, no remedy is guessed). EACCES and EPERM are further split by
+# _classify_store_maint_unusable: when the lock path itself is a directory we cannot use, it is "planted".
+STORE_MAINT_PERMISSION_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+
 
 class DbSetupLockError(RuntimeError):
     """Base for the setup-lock failures. The setup did NOT run."""
@@ -596,15 +630,48 @@ class DbSetupLockUnusable(DbSetupLockError):
     """The lock directory could not be opened, validated or flocked; setup refused to run unlocked."""
 
 
-def _read_setup_lock_holder_pid(dir_fd: int) -> str:
-    """Best-effort holder pid, from the `holder` file inside the lock directory
-    (opened relative to the directory fd we hold). Informational only -- never
-    liveness and never exclusion (the flock on the directory is the truth).
+class StoreMaintLockError(RuntimeError):
+    """Base for the store-maintenance lock failures (#3882). The caller did NOT touch the store."""
 
-    Never blocks: O_NONBLOCK, so a FIFO planted at that name cannot stall the
-    waiter, and a non-regular file is not read at all. "unknown" on ANY
-    failure (absent, unreadable, garbage, not a regular file).
-    """
+
+class StoreMaintLockHeld(StoreMaintLockError):
+    """The maintenance lock is held by another process. `holder_pid` / `holder_role` come from the
+    informational holder file (None when it is absent, unreadable or malformed); `lock_path` is the lock
+    directory."""
+
+    def __init__(self, message, *, lock_path, holder_pid=None, holder_role=None):
+        super().__init__(message)
+        self.lock_path = lock_path
+        self.holder_pid = holder_pid
+        self.holder_role = holder_role
+
+
+class StoreMaintLockUnusable(StoreMaintLockError):
+    """The maintenance lock directory could not be opened, validated or flocked; the caller refused to
+    touch the store without it. `kind` says whether a retry can clear it: "retryable" (an errno in
+    STORE_MAINT_RETRYABLE_ERRNOS), or one a retry cannot fix -- "planted" (a symlink, a non-directory, a
+    foreign owner, a mode that cannot be tightened, or a directory of ours that refused the open for want
+    of owner rwx), "permission" (permission denied, read-only filesystem) or "unknown" (any other error,
+    a missing parent directory included, failed closed). `errno_code` is the
+    OSError's errno when it had one."""
+
+    def __init__(self, message, *, kind="unknown", errno_code=None):
+        super().__init__(message)
+        self.kind = kind
+        self.errno_code = errno_code
+
+    @property
+    def retryable(self) -> bool:
+        return self.kind == "retryable"
+
+
+def _read_lock_holder_words(dir_fd: int):
+    """The whitespace-split words of the `holder` file inside the lock directory (opened relative to the
+    directory fd we hold), or None on ANY failure (absent, unreadable, not a regular file). Informational
+    only -- never liveness and never exclusion (the flock on the directory is the truth).
+
+    Never blocks: O_NONBLOCK, so a FIFO planted at that name cannot stall the waiter, and a non-regular
+    file is not read at all. Shared by the setup lock (pid word) and the maintenance lock (pid + role)."""
     fd = None
     try:
         import stat as _stat
@@ -615,13 +682,10 @@ def _read_setup_lock_holder_pid(dir_fd: int) -> str:
             dir_fd=dir_fd,
         )
         if not _stat.S_ISREG(os.fstat(fd).st_mode):
-            return "unknown"
-        parts = os.read(fd, 64).decode("ascii", "replace").split()
-        if parts and parts[0].isascii() and parts[0].isdigit():
-            return parts[0]
-        return "unknown"
+            return None
+        return os.read(fd, 64).decode("ascii", "replace").split()
     except Exception:
-        return "unknown"
+        return None
     finally:
         if fd is not None:
             try:
@@ -630,7 +694,28 @@ def _read_setup_lock_holder_pid(dir_fd: int) -> str:
                 pass
 
 
-def _open_db_setup_lock_dir(lock_path: str) -> int:
+def _read_setup_lock_holder_pid(dir_fd: int) -> str:
+    """Best-effort holder pid, from the `holder` file inside the lock directory.
+    Informational only -- never liveness and never exclusion (the flock on the
+    directory is the truth). "unknown" on ANY failure (absent, unreadable,
+    garbage, not a regular file)."""
+    parts = _read_lock_holder_words(dir_fd)
+    if parts and parts[0].isascii() and parts[0].isdigit():
+        return parts[0]
+    return "unknown"
+
+
+def _setup_lock_unusable(lock_path: str, exc: BaseException, stage: str) -> "DbSetupLockUnusable":
+    """The setup lock's typed error and its exact wording. `stage` is "use" (open/validate/import) or
+    "flock" (the flock call itself)."""
+    verb = "flock" if stage == "flock" else "use"
+    return DbSetupLockUnusable(
+        f"cannot {verb} setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
+        f"refusing to run the one-time DB setup without it"
+    )
+
+
+def _open_db_setup_lock_dir(lock_path: str, unusable=None) -> int:
     """Create (if absent) + open + validate the setup lock DIRECTORY; return the
     open fd (not yet flocked).
 
@@ -642,8 +727,9 @@ def _open_db_setup_lock_dir(lock_path: str) -> int:
     The owner check compares against the EFFECTIVE uid, so a lock directory
     owned by another account is refused even when running as root.
 
-    Every failure raises DbSetupLockUnusable naming the path. Called again by
-    _acquire_db_setup_lock when the post-flock inode recheck finds the name no
+    Every failure raises DbSetupLockUnusable naming the path (#3882: or, for another lock built on this
+    primitive, the typed error `unusable(lock_path, exc, "use")` returns). Called again by
+    _acquire_lock_dir when the post-flock inode recheck finds the name no
     longer refers to the locked directory (#3791).
     """
     fd = None
@@ -694,10 +780,7 @@ def _open_db_setup_lock_dir(lock_path: str) -> int:
                 os.close(fd)
             except Exception:
                 pass
-        raise DbSetupLockUnusable(
-            f"cannot use setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
-            f"refusing to run the one-time DB setup without it"
-        ) from exc
+        raise (unusable or _setup_lock_unusable)(lock_path, exc, "use") from exc
     return fd
 
 
@@ -712,45 +795,33 @@ def _lock_fd_names_path(fd: int, lock_path: str) -> bool:
     return (st.st_dev, st.st_ino) == (cur.st_dev, cur.st_ino)
 
 
-def _acquire_db_setup_lock(setup_wait: str) -> int:
-    """Take the exclusive cross-process setup lock; return the open fd.
+class _LockPolicy(NamedTuple):
+    """What differs between the locks built on `_acquire_lock_dir`: the wait budget, the typed errors and
+    their wording, how the holder is read and what it writes, and whether a waiter logs. The mechanics (the
+    0700 directory, LOCK_EX|LOCK_NB, the inode recheck, the retry inside the deadline) are shared."""
 
-    The caller MUST pass the fd to _release_db_setup_lock in a finally. Raises
-    DbSetupLockBusy / DbSetupLockTimeout / DbSetupLockUnusable (all
-    DbSetupLockError) and NEVER degrades to running unlocked -- deliberately
-    NOT _with_state_lock's degrade-to-unlocked path: proceeding without the
-    lock IS the race this lock exists to close.
-    """
-    if setup_wait == SETUP_WAIT_HOOK:
-        wait_s, is_hook = SETUP_LOCK_HOOK_WAIT_S, True
-    elif setup_wait == SETUP_WAIT_SERVER:
-        wait_s, is_hook = SETUP_LOCK_SERVER_WAIT_S, False
-    else:
-        raise ValueError(
-            f"setup_wait must be {SETUP_WAIT_HOOK!r} or {SETUP_WAIT_SERVER!r}, got {setup_wait!r}"
-        )
-    lock_path = str(DB_PATH) + SETUP_LOCK_SUFFIX
+    wait_s: float
+    error_base: type            # re-raised as is (its subclasses are the policy's typed errors)
+    unusable: object            # (lock_path, exc, stage) -> exception; stage "use" | "flock"
+    read_holder: object         # (dir_fd) -> opaque holder, handed to expired / log_wait
+    expired: object             # (lock_path, holder) -> exception, raised when wait_s runs out
+    log_wait: object            # (lock_path, holder) -> None, or None for a lock that never logs
+    holder_payload: bytes       # written into `holder` once the flock is held
+
+
+def _acquire_lock_dir(lock_path: str, policy: _LockPolicy) -> int:
+    """The ONE implementation of the directory flock (#3791, generalised in place by #3882): create/open/
+    validate the 0700 lock directory at `lock_path`, take LOCK_EX|LOCK_NB, recheck the inode, retry inside
+    `policy.wait_s`, then write the holder file. Returns the open fd; the caller MUST release it. Raises
+    the policy's typed errors and NEVER degrades to running unlocked -- deliberately NOT
+    _with_state_lock's degrade-to-unlocked path: proceeding without the lock IS the race it closes."""
     try:
         import fcntl
     except Exception as exc:
-        raise DbSetupLockUnusable(
-            f"cannot use setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
-            f"refusing to run the one-time DB setup without it"
-        ) from exc
-    fd = _open_db_setup_lock_dir(lock_path)
-    deadline = time.monotonic() + wait_s
+        raise policy.unusable(lock_path, exc, "use") from exc
+    fd = _open_db_setup_lock_dir(lock_path, policy.unusable)
+    deadline = time.monotonic() + policy.wait_s
     next_log = 0.0
-
-    def _expired(holder):
-        if is_hook:
-            return DbSetupLockBusy(
-                f"ENGRAM is upgrading its store in another process (pid {holder}); "
-                f"memory blocks skipped this time"
-            )
-        return DbSetupLockTimeout(
-            f"timed out after {wait_s}s waiting for setup lock {lock_path} held by "
-            f"pid {holder}; the store was left untouched"
-        )
 
     try:
         while True:
@@ -774,46 +845,87 @@ def _acquire_db_setup_lock(setup_wait: str) -> int:
                 if _lock_fd_names_path(fd, lock_path):
                     break
                 if time.monotonic() >= deadline:
-                    raise _expired(_read_setup_lock_holder_pid(fd))
+                    raise policy.expired(lock_path, policy.read_holder(fd))
                 os.close(fd)
                 fd = None
                 time.sleep(min(_SETUP_LOCK_POLL_S, max(deadline - time.monotonic(), 0.001)))
-                fd = _open_db_setup_lock_dir(lock_path)
+                fd = _open_db_setup_lock_dir(lock_path, policy.unusable)
                 continue
             now = time.monotonic()
-            holder = _read_setup_lock_holder_pid(fd)
+            holder = policy.read_holder(fd)
             if now >= deadline:
-                raise _expired(holder)
-            if not is_hook and now >= next_log:
-                print(
-                    f"[engram] waiting for setup lock held by pid {holder} ({lock_path})",
-                    file=sys.stderr,
-                )
+                raise policy.expired(lock_path, holder)
+            if policy.log_wait is not None and now >= next_log:
+                policy.log_wait(lock_path, holder)
                 next_log = now + SETUP_LOCK_LOG_INTERVAL_S
             time.sleep(min(_SETUP_LOCK_POLL_S, max(deadline - now, 0.001)))
-    except DbSetupLockError:
+    except policy.error_base:
         if fd is not None:
             os.close(fd)
         raise
     except Exception as exc:
         if fd is not None:
             os.close(fd)
-        raise DbSetupLockUnusable(
-            f"cannot flock setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
-            f"refusing to run the one-time DB setup without it"
-        ) from exc
-    # Holder pid: informational only (both wait messages name it). Written only
+        raise policy.unusable(lock_path, exc, "flock") from exc
+    # Holder: informational only (the wait / refusal messages name it). Written only
     # now that the flock is HELD, so a waiter can never overwrite the holder's
     # file. A strict regular-file write (refuses FIFO / symlink / hard link);
-    # any failure just leaves the pid unknown to waiters.
+    # any failure just leaves the holder unknown to waiters.
     try:
         _regular_io.write_pidfile(
             os.path.join(lock_path, SETUP_LOCK_HOLDER_NAME),
-            f"{os.getpid()}\n".encode("ascii"),
+            policy.holder_payload,
         )
     except Exception:
         pass
     return fd
+
+
+def _acquire_db_setup_lock(setup_wait: str) -> int:
+    """Take the exclusive cross-process setup lock; return the open fd.
+
+    The caller MUST pass the fd to _release_db_setup_lock in a finally. Raises
+    DbSetupLockBusy / DbSetupLockTimeout / DbSetupLockUnusable (all
+    DbSetupLockError) and NEVER degrades to running unlocked -- deliberately
+    NOT _with_state_lock's degrade-to-unlocked path: proceeding without the
+    lock IS the race this lock exists to close.
+    """
+    if setup_wait == SETUP_WAIT_HOOK:
+        wait_s, is_hook = SETUP_LOCK_HOOK_WAIT_S, True
+    elif setup_wait == SETUP_WAIT_SERVER:
+        wait_s, is_hook = SETUP_LOCK_SERVER_WAIT_S, False
+    else:
+        raise ValueError(
+            f"setup_wait must be {SETUP_WAIT_HOOK!r} or {SETUP_WAIT_SERVER!r}, got {setup_wait!r}"
+        )
+    lock_path = str(DB_PATH) + SETUP_LOCK_SUFFIX
+
+    def _expired(lock_path, holder):
+        if is_hook:
+            return DbSetupLockBusy(
+                f"ENGRAM is upgrading its store in another process (pid {holder}); "
+                f"memory blocks skipped this time"
+            )
+        return DbSetupLockTimeout(
+            f"timed out after {wait_s}s waiting for setup lock {lock_path} held by "
+            f"pid {holder}; the store was left untouched"
+        )
+
+    def _log_wait(lock_path, holder):
+        print(
+            f"[engram] waiting for setup lock held by pid {holder} ({lock_path})",
+            file=sys.stderr,
+        )
+
+    return _acquire_lock_dir(lock_path, _LockPolicy(
+        wait_s=wait_s,
+        error_base=DbSetupLockError,
+        unusable=_setup_lock_unusable,
+        read_holder=_read_setup_lock_holder_pid,
+        expired=_expired,
+        log_wait=None if is_hook else _log_wait,
+        holder_payload=f"{os.getpid()}\n".encode("ascii"),
+    ))
 
 
 def _release_db_setup_lock(fd: int) -> None:
@@ -826,6 +938,227 @@ def _release_db_setup_lock(fd: int) -> None:
         os.close(fd)
     except Exception:
         pass
+
+
+# ── #3882: the store-maintenance lock, built on the primitive above ─────────
+
+_STORE_MAINT_ROLE_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def store_maint_lock_path(db_path) -> str:
+    """The maintenance lock directory for the store at `db_path`: `<db>.maint.lockdir`. Derived from the
+    PATH THE CALLER OPENS, never from engram_core.DB_PATH (the owner re-points that at its home)."""
+    return str(db_path) + STORE_MAINT_LOCK_SUFFIX
+
+
+def _read_store_maint_holder(dir_fd: int):
+    """(pid, role) from the holder file, each None when absent, unreadable or malformed. Informational:
+    it chooses a refusal's message and exit code, and is never exclusion. A role that is not a short
+    plain word is treated as unreadable, so nothing odd reaches a terminal or a decision."""
+    words = _read_lock_holder_words(dir_fd)
+    if not words:
+        return (None, None)
+    pid = words[0] if words[0].isascii() and words[0].isdigit() else None
+    role = words[1] if len(words) >= 2 and _STORE_MAINT_ROLE_RE.fullmatch(words[1]) else None
+    return (pid, role)
+
+
+def _lock_path_is_unusable_dir(lock_path) -> bool:
+    """True iff `lock_path` exists, is a directory (lstat: a symlink is not one) and either belongs to
+    another uid or lacks full owner rwx. Any failure of lstat itself, an absent path, or an own directory
+    with full owner rwx is False. Reads only; never changes a mode."""
+    import stat as _stat
+
+    if lock_path is None:
+        return False
+    try:
+        st = os.lstat(lock_path)
+    except OSError:
+        return False
+    return _stat.S_ISDIR(st.st_mode) and (
+        st.st_uid != os.geteuid() or (st.st_mode & _stat.S_IRWXU) != _stat.S_IRWXU
+    )
+
+
+def _classify_store_maint_unusable(exc: BaseException, lock_path=None):
+    """(kind, errno_code) for the error that made the lock directory unusable. An OSError WITH an errno came
+    from the system: a resource limit is retryable, a permission or read-only failure is "permission", any
+    other (ENOENT included) is "unknown" (fail closed). EACCES and EPERM are "planted" instead when the lock
+    path itself is a directory this account cannot use (_lock_path_is_unusable_dir); a path that is absent
+    (the usual case: the parent is not writable) or cannot be examined stays "permission". An OSError
+    WITHOUT an errno is one the primitive raised itself for a path it refuses (symlink, not a directory,
+    foreign owner, mode): "planted". Anything else (a failed fcntl import) is "unknown"."""
+    if not isinstance(exc, OSError):
+        return ("unknown", None)
+    code = exc.errno
+    if code is None:
+        return ("planted", None)
+    if code in STORE_MAINT_RETRYABLE_ERRNOS:
+        return ("retryable", code)
+    if code in (errno.EACCES, errno.EPERM) and _lock_path_is_unusable_dir(lock_path):
+        return ("planted", code)
+    if code in STORE_MAINT_PERMISSION_ERRNOS:
+        return ("permission", code)
+    return ("unknown", code)
+
+
+def _store_maint_unusable(lock_path: str, exc: BaseException, stage: str) -> "StoreMaintLockUnusable":
+    verb = "flock" if stage == "flock" else "use"
+    kind, code = _classify_store_maint_unusable(exc, lock_path)
+    named = f" [{errno.errorcode.get(code, code)}]" if code is not None else ""
+    return StoreMaintLockUnusable(
+        f"cannot {verb} store-maintenance lock directory {lock_path}: {type(exc).__name__}: {exc}{named}; "
+        f"refusing to touch the store without it",
+        kind=kind, errno_code=code,
+    )
+
+
+def _store_maint_held(lock_path: str, holder) -> "StoreMaintLockHeld":
+    pid, role = holder
+    if pid is None and role is None:
+        who = "another process (its holder file is absent or unreadable)"
+    else:
+        who = f"pid {pid or 'unknown'}" + (f" ({role})" if role else "")
+    return StoreMaintLockHeld(
+        f"the store is held for maintenance: lock {lock_path} is held by {who}",
+        lock_path=lock_path, holder_pid=pid, holder_role=role,
+    )
+
+
+def acquire_store_maint_lock(db_path, role: str) -> int:
+    """Take the exclusive store-maintenance lock for the store at `db_path`; return the open fd.
+
+    NON-BLOCKING: one attempt plus the inode recheck, never a wait loop. A held lock raises
+    StoreMaintLockHeld (holder pid and role from the informational holder file); an unusable lock
+    directory raises StoreMaintLockUnusable. The caller MUST release the fd (release_store_maint_lock)
+    or hold it to process exit: the kernel drops the flock when the holder dies, so a crash leaves no
+    stale lock. `role` is `owner` or the tool's name; it is written as "<pid> <role>\n" into the holder
+    file, for messages only."""
+    if not _STORE_MAINT_ROLE_RE.fullmatch(role or ""):
+        role = re.sub(r"[^A-Za-z0-9_.-]", "_", role or "")[:64] or "tool"
+    return _acquire_lock_dir(store_maint_lock_path(db_path), _LockPolicy(
+        wait_s=0,
+        error_base=StoreMaintLockError,
+        unusable=_store_maint_unusable,
+        read_holder=_read_store_maint_holder,
+        expired=_store_maint_held,
+        log_wait=None,
+        holder_payload=f"{os.getpid()} {role}\n".encode("ascii"),
+    ))
+
+
+def release_store_maint_lock(fd: int) -> None:
+    """Release a lock taken by acquire_store_maint_lock (the one release the setup lock uses too)."""
+    _release_db_setup_lock(fd)
+
+
+def _owner_service_commands(db_path):
+    """(stop, start) shell commands for THIS seat's owner, built from the strings the repo already uses:
+    Linux `engramd-owner-<key>.service` under `systemctl --user`, macOS the launchd label
+    `com.engram.engramd-owner.<key>` with `setup-surface-daemon-service.sh --owner` (its bootout +
+    bootstrap is the start). `<key>` is the one derivation, tools/engramd-owner-home-key.sh."""
+    import platform
+    import shlex
+
+    q = shlex.quote
+    tools = Path(__file__).resolve().parent / "tools"
+    home = str(Path(db_path).resolve().parent)
+    key = "$(bash %s %s)" % (q(str(tools / "engramd-owner-home-key.sh")), q(home))
+    if platform.system() == "Darwin":
+        return (
+            "launchctl bootout gui/$(id -u)/com.engram.engramd-owner." + key,
+            "bash %s --owner" % q(str(tools / "setup-surface-daemon-service.sh")),
+        )
+    unit = '"engramd-owner-%s.service"' % key
+    return ("systemctl --user stop " + unit, "systemctl --user start " + unit)
+
+
+# The ONE mapping from an unusable lock directory's kind to the sentence that says what is wrong. The
+# offline tools (store_maint_refusal_text) and the owner (engramd_owner, OwnerStoreLockDirUnusable) both read
+# it through store_maint_cause_text; the REMEDY stays per audience, because the owner serves the live store
+# and must never be told to copy it.
+# Each sentence has no final full stop: a caller closes it, or joins it to a clause of its own with ";".
+STORE_MAINT_CAUSE = {
+    "planted": "The lock path cannot be used as the lock directory: it is a symlink, not a directory, or a "
+               "directory with another owner or without full owner permissions",
+    "permission": "This account cannot create or open the lock directory (permission denied, or a read-only "
+                  "filesystem)",
+    "unknown": "The cause above is not one that is recognised, so no remedy is suggested",
+    "retryable": "This looks transient (a resource limit, not a planted path)",
+}
+
+
+def store_maint_cause_text(kind: str) -> str:
+    """The cause sentence for a StoreMaintLockUnusable `kind` (see STORE_MAINT_CAUSE)."""
+    return STORE_MAINT_CAUSE[kind]
+
+
+def store_maint_refusal_text(exc: "StoreMaintLockError", db_path=None) -> str:
+    """The text a refused tool prints: what held the lock, that nothing was touched, and how to proceed.
+    When the holder is an owner (or unknown), the platform's command to stop the owner and the one to
+    start it again afterwards; when it is another maintenance tool, wait for it.
+
+    A lock directory that cannot be used at all (StoreMaintLockUnusable) is a different problem: no
+    owner is involved, so the text names the directory and the cause (the exception's own message, which
+    names the errno), says nothing was touched, and keys the remedy on the cause: a resource limit
+    (retryable) is transient, retry later; a permission or creation failure (denied, read-only) gets a
+    copy of the store (with any -wal and -shm) to run against; a planted path (symlink, non-directory,
+    foreign owner, mode, an own directory without owner rwx) gets "fix or remove that path"; an
+    unrecognised error (a missing parent directory included) gets no guessed remedy. The sentence that
+    names the cause comes from store_maint_cause_text, which the owner shares. No stop/start owner
+    commands."""
+    if isinstance(exc, StoreMaintLockUnusable) and exc.retryable:
+        return "\n".join([
+            str(exc),
+            store_maint_cause_text("retryable") + "; this tool touched nothing. "
+            "Retry later: no path needs fixing.",
+        ])
+    if isinstance(exc, StoreMaintLockUnusable) and exc.kind == "planted":
+        return "\n".join([
+            str(exc),
+            store_maint_cause_text("planted") + ".",
+            "This tool needs a usable lock directory beside the store; it touched nothing.",
+            "Fix or remove that path, then run again.",
+        ])
+    if isinstance(exc, StoreMaintLockUnusable) and exc.kind == "unknown":
+        # Neither remedy is known to apply: name the cause (the message carries the errno) and stop.
+        return "\n".join([
+            str(exc),
+            "This tool needs a usable lock directory beside the store; it touched nothing. "
+            + store_maint_cause_text("unknown") + ".",
+        ])
+    if isinstance(exc, StoreMaintLockUnusable):  # kind "permission": cannot create the lock where it must live
+        return "\n".join([
+            str(exc),
+            store_maint_cause_text("permission") + ".",
+            "This tool needs a writable directory beside the store for its lock; it touched nothing.",
+            "To report on a read-only copy, copy the store, with any -wal and -shm files, to a writable "
+            "directory and run against the copy.",
+        ])
+    lines = [
+        str(exc),
+        "This tool needs the store with no owner and no other repair running; it touched nothing.",
+    ]
+    role = getattr(exc, "holder_role", None)
+    if role is not None and role != STORE_MAINT_OWNER_ROLE:
+        lines.append(f"Another maintenance tool ({role}) holds the store. Wait for it to finish, then run this again.")
+    elif isinstance(exc, StoreMaintLockHeld) and db_path is not None:
+        stop, start = _owner_service_commands(db_path)
+        lines.append("To proceed: stop the owner, run this tool again, then start the owner:")
+        lines.append("  stop:  " + stop)
+        lines.append("  start: " + start)
+    return "\n".join(lines)
+
+
+def acquire_store_maint_lock_or_report(db_path, role: str, *, file=None):
+    """The tools' entry point: the lock's fd, or None after printing store_maint_refusal_text to `file`
+    (default stderr). A tool that gets None exits STORE_MAINT_REFUSED_EXIT without touching the store."""
+    try:
+        return acquire_store_maint_lock(db_path, role)
+    except StoreMaintLockError as exc:
+        print("REFUSED: " + store_maint_refusal_text(exc, db_path),
+              file=file if file is not None else sys.stderr)
+        return None
 
 
 def _configure_paths(data_dir: str | Path) -> None:
@@ -1276,6 +1609,17 @@ VALID_RELATIONS = {
                      # Deliberately backwards in creation time (see its
                      # EDGE_CLASSIFICATIONS entry) — never hand-addable; minted
                      # by the cascade-resolution machinery once #2349 lands.
+    "acknowledged_contradicts",  # #4075: the contradiction counterpart of
+                     # acknowledged_derives_from. When a contradiction's side was
+                     # SUPERSEDED and the agent acknowledges that the contradiction
+                     # still stands, the machine records `ct --acknowledged_contradicts-->
+                     # <live successor of that side>`, so a LATER revision of the
+                     # successor marks the contradiction again (the original
+                     # `contradicts` edge points at a now non-current node and would no
+                     # longer be walked). Written only by engram_cascade_resolve; never
+                     # agent-supplied. Contradictions are non-claim-bearing, so this edge
+                     # is NOT a cascade relation: it is read by the parallel
+                     # contradicts-edge walk (_affected_contradiction_ids), nowhere else.
     "generalizes",  # #2753 epic, WS1: general -> specific abstraction edge
                      # (source is the more general node, target the more
                      # specific one it generalizes). Allowed endpoints:
@@ -1403,6 +1747,22 @@ EDGE_CLASSIFICATIONS = {
         "removable": False,     # cascade-bearing, mirrors derives_from.
         "addable_after_creation": False,
         "provenance": True,
+    },
+    "acknowledged_contradicts": {
+        # #4075: `ct --acknowledged_contradicts--> successor` is written when the
+        # contradiction is acknowledged AFTER one of its sides was superseded; the
+        # contradiction exists BEFORE the successor, so the edge always inverts
+        # creation order: temporal_causal=False, by design (mirrors
+        # acknowledged_derives_from). Unlike that relation it is NOT cascade-bearing
+        # and not in a DAG family: a contradiction is non-claim-bearing and has no
+        # premises, the edge points at a CONTESTED claim rather than a premise, and
+        # `contradicts` (its sibling) is exempt on the same grounds.
+        "cascade": False,
+        "temporal_causal": False,
+        "dag_family": None,
+        "removable": False,     # structural commitment, mirrors contradicts.
+        "addable_after_creation": False,    # minted by engram_cascade_resolve only.
+        "provenance": False,
     },
     "exemplifies": {
         "cascade": False,
@@ -1727,6 +2087,7 @@ EDGE_TIERS: dict[str, str] = {
                                     # supported_by, which it is split out of.
     # relational tier: symmetric / cross-temporal; temporal_causal=False expected
     "contradicts":  "relational",
+    "acknowledged_contradicts": "relational",   # #4075: same stance as contradicts, cross-temporal; temporal_causal=False matches the tier
     "tensions":     "relational",
     "about":        "relational",
     "resolves":     "relational",   # epistemic-stance edge: a resolution closes a question/contradiction (pairs with contradicts), not a realization/membership
@@ -1810,8 +2171,120 @@ def dag_family_relations(family: str) -> "frozenset[str]":
 
 
 # ---------------------------------------------------------------------------
+# The FIXED SQL templates behind ``dag_edge_set`` (#3542, owner-read registry).
+#
+# Six, one per live_only {True, False} x filter {none, source_id, target_id}; a
+# source_id AND target_id together is refused (no caller needs it). They are
+# string LITERALS, not built at import time, because the build-time read scanner
+# (tools/engramd_read_scan.py, #3196) admits only a call-site literal or a
+# module-level string Constant and the owner process executes only the templates
+# it registered: a ``.format()``-built constant is a scanner ``variable``
+# failure. The relation set is a bound parameter (``json_each(?)``, the #3324
+# form), never string-built. The liveness clause is NOT a second definition:
+# tests/test_edge_liveness_ssot_3542.py pins every live template, character for
+# character, to what ``_CURRENT_EDGE_PREDICATE`` generates, so editing either
+# side alone reddens it. Regenerate the registry with the scanner after any edit
+# here (src/engram/engramd_read_templates.json).
+# ---------------------------------------------------------------------------
+_DAG_EDGES_LIVE_ALL_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.'
+    'id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND '
+    "(s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t"
+    ".status != 'retracted') ORDER BY e.source_id, e.target_id, e.relation"
+)
+_DAG_EDGES_LIVE_SOURCE_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.'
+    'id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND '
+    "(s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t"
+    ".status != 'retracted') AND e.source_id = ? ORDER BY e.source_id, e.target"
+    '_id, e.relation'
+)
+_DAG_EDGES_LIVE_TARGET_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.'
+    'id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND '
+    "(s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t"
+    ".status != 'retracted') AND e.target_id = ? ORDER BY e.source_id, e.target"
+    '_id, e.relation'
+)
+_DAG_EDGES_ALL_STORED_ALL_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) '
+    'ORDER BY e.source_id, e.target_id, e.relation'
+)
+_DAG_EDGES_ALL_STORED_SOURCE_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) '
+    'AND e.source_id = ? ORDER BY e.source_id, e.target_id, e.relation'
+)
+_DAG_EDGES_ALL_STORED_TARGET_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) '
+    'AND e.target_id = ? ORDER BY e.source_id, e.target_id, e.relation'
+)
+
+
+def dag_edge_set(
+    conn: sqlite3.Connection, relations: "Iterable[str] | None" = None, *,
+    live_only: bool = True, source_id: "str | None" = None,
+    target_id: "str | None" = None,
+) -> "list[tuple[str, str, str]]":
+    """THE ONE definition of the DAG-relation edge set of a graph (#3542, Lei
+    2026-10-21: "ONE definition, no drift ever"). Returns ``(source_id,
+    target_id, relation)`` triples, deterministically ordered, for every edge on
+    ``relations`` (default ``DAG_RELATIONS``; callers pass a family, or
+    ``CASCADE_RELATIONS`` for a cascade walk), optionally narrowed to one
+    ``source_id`` and/or ``target_id`` (the per-node step of a walk).
+
+    ``live_only=True`` (the default, and what every cycle JUDGE and every
+    liveness-bounded walk uses: the downstream cascade, ``_cascade_reaches``):
+    only LIVE STRUCTURE -- an edge counts iff BOTH raw endpoints are live
+    (``_CURRENT_EDGE_PREDICATE``). Non-current nodes and their edges are
+    provenance, not structure. No resolution through supersede chains.
+
+    ``live_only=False``: the provenance-inclusive set (every stored edge on the
+    relations, whatever its endpoints). Used (a) by the informational
+    frozen-closed line of ``check_dag_conformance`` so both numbers come from one
+    function, (b) by the first hop of a cascade from a node that has JUST stopped
+    being live (a retract / supersede root, whose own edges are by construction
+    provenance), and (c) by readers whose SUBJECT is the provenance itself (the
+    supersedes chain, an acknowledged-dead premise, the stored premise list of a
+    recompute), and (d) by provenance traversals whose subject is the ancestor
+    chain (``_walk_cascade_upstream``: terminates by its visited set and budget,
+    not by liveness). A cycle judge or a liveness-bounded walk must not use it.
+
+    Every reader calls this; none restates the endpoint filter. The drift guard
+    tests/test_edge_liveness_ssot_3542.py enforces that."""
+    rels = sorted(DAG_RELATIONS if relations is None else relations)
+    if not rels:
+        return []
+    if source_id is not None and target_id is not None:
+        raise ValueError("dag_edge_set: pass source_id or target_id, not both")
+    rels_json = json.dumps(rels)
+    # One execute call per template, each naming its module constant directly:
+    # the read scanner resolves only a bare module-level literal at a call site.
+    if live_only:
+        if source_id is not None:
+            rows = conn.execute(_DAG_EDGES_LIVE_SOURCE_SQL, (rels_json, source_id))
+        elif target_id is not None:
+            rows = conn.execute(_DAG_EDGES_LIVE_TARGET_SQL, (rels_json, target_id))
+        else:
+            rows = conn.execute(_DAG_EDGES_LIVE_ALL_SQL, (rels_json,))
+    else:
+        if source_id is not None:
+            rows = conn.execute(_DAG_EDGES_ALL_STORED_SOURCE_SQL, (rels_json, source_id))
+        elif target_id is not None:
+            rows = conn.execute(_DAG_EDGES_ALL_STORED_TARGET_SQL, (rels_json, target_id))
+        else:
+            rows = conn.execute(_DAG_EDGES_ALL_STORED_ALL_SQL, (rels_json,))
+    return [(r[0], r[1], r[2]) for r in rows.fetchall()]
+
+
+# ---------------------------------------------------------------------------
 # engram_retype_edge's allowed-move table (issue #2265, epic #2252).
-# docs/2265-2347-edge-correction-design.md sec.2: "a re-type may only move an
+# docs/internal/2265-2347-edge-correction-design.md sec.2: "a re-type may only move an
 # edge to a relation that claims LESS" -- supported_by/derives_from/cites are
 # all provenance-bearing; about/exemplifies are not. Any move not in this
 # table is refused, including every move in the opposite (stronger)
@@ -1854,10 +2327,9 @@ RETYPE_ALLOWED_MOVES: "dict[tuple[str, str], tuple[str, ...] | None]" = {
 
 def _dag_cycle_path(
     conn: sqlite3.Connection, relation: str, source_id: str, target_id: str,
-    *, resolve: bool = True,
 ) -> "list[str] | None":
     """Would inserting ``source_id --relation--> target_id`` close a cycle
-    among LIVE edges of ``relation``'s acyclicity FAMILY? Returns the cycle
+    among CURRENT edges of ``relation``'s acyclicity FAMILY? Returns the cycle
     (list of node ids, first == last) if so, else None. A relation with no
     family (``dag_family is None``) has no walk: always None.
 
@@ -1875,77 +2347,44 @@ def _dag_cycle_path(
     BATCH audit over the same families; this is the TARGETED check that stops
     a cycle landing in the first place.
 
-    BFS from ``target_id`` over existing edges of the family (source->target):
-    if ``source_id`` is reachable FROM ``target_id``, the candidate edge would
-    close ``target_id -> ... -> source_id -> target_id``.
+    #3542 (Lei, 2026-10-21): the walk ranges over CURRENT nodes and CURRENT
+    edges only (``_CURRENT_EDGE_PREDICATE``: both RAW endpoints live), the same
+    predicate the gate uses, so the guard and the audit judge one graph. Nothing
+    is resolved through supersede chains. If either endpoint of the edge being
+    written is itself non-current, the edge is provenance and cannot close a
+    live cycle: None, no refusal on cycle grounds (other guards are unchanged).
+    This removes the earlier ``resolve=True`` chain resolution (#2812/#2813): a
+    cycle that closes only through a superseded node is a frozen-closed
+    component, reported informationally by the audit, never a refusal.
 
-    ``resolve`` (default True) puts every endpoint through the supersedes
-    chain, as the ``generalizes`` guard and the conformance audit do. The
-    acknowledgement writer passes ``resolve=False`` -- it keeps the raw-edge
-    semantics of the cascade guard it sits beside (``_cascade_reaches``); see
-    its call site for why.
+    BFS from ``target_id`` over existing current edges of the family
+    (source->target): if ``source_id`` is reachable FROM ``target_id``, the
+    candidate edge would close ``target_id -> ... -> source_id -> target_id``.
     """
     family = EDGE_CLASSIFICATIONS.get(relation, {}).get("dag_family")
     if family is None:
         return None
+    if not _edge_is_current(conn, source_id, target_id):
+        return None  # provenance: cannot close a live cycle
     if source_id == target_id:
         return [source_id, target_id]
-    relations = sorted(dag_family_relations(family))
-    placeholders = ",".join("?" * len(relations))
-
-    # Walk the RESOLVED graph -- every edge's endpoints put through
-    # _resolve_to_current, exactly as generalization_chain resolves them on
-    # the read side (and as engram_dag_conformance resolves them).
-    #
-    # The earlier shape filtered on `s.is_current = 1 AND t.is_current = 1`
-    # instead, and that was a real hole (found in #2812 review). An edge
-    # whose endpoint is superseded through the GENERIC engram_supersede --
-    # which carries no generalizes edges, and is the ONLY supersede path
-    # that exists for lesson/axiom/goal, engram_outgrow_cornerstone being
-    # cornerstone-only -- became invisible HERE while the read-side walk
-    # still traversed it via resolution. So the guard would pass an edge
-    # that generalization_chain then rendered as a live cycle, and rendered
-    # it as `heads: []` + `truncated: False`, which is indistinguishable
-    # from a clean complete walk. Guard and walk must see the same graph or
-    # one can admit exactly what the other reports.
-    _resolved: "dict[str, str | None]" = {}
-
-    def _res(nid: str) -> "str | None":
-        if not resolve:
-            return nid
-        if nid not in _resolved:
-            _resolved[nid] = _resolve_to_current(conn, nid)
-        return _resolved[nid]
+    relations = dag_family_relations(family)
 
     adjacency: "dict[str, set]" = {}
-    for row in conn.execute(
-        f"SELECT source_id, target_id FROM edges "
-        f"WHERE relation IN ({placeholders})",
-        tuple(relations),
-    ):
-        r_src = _res(row["source_id"])
-        r_tgt = _res(row["target_id"])
-        if r_src is None or r_tgt is None:
-            continue  # dead-ended chain: no live node to attribute the edge to
-        adjacency.setdefault(r_src, set()).add(r_tgt)
+    for sid, tid, _rel in dag_edge_set(conn, relations, live_only=True):
+        adjacency.setdefault(sid, set()).add(tid)
 
-    start = _res(target_id) or target_id
-    goal = _res(source_id) or source_id
-    if start == goal:
-        # target resolves onto source itself -- a self-cycle once written
-        return [source_id, target_id]
-
-    parent: "dict[str, str | None]" = {start: None}
-    queue = [start]
+    parent: "dict[str, str | None]" = {target_id: None}
+    queue = [target_id]
     while queue:
         current = queue.pop(0)
-        if current == goal:
+        if current == source_id:
             path = []
             node = current
             while node is not None:
                 path.append(node)
                 node = parent[node]
-            path.reverse()  # (resolved) target -> ... -> source
+            path.reverse()  # target -> ... -> source
             return [source_id] + path
         for nxt in sorted(adjacency.get(current, ())):
             if nxt not in parent:
@@ -1958,7 +2397,7 @@ def _generalizes_cycle_path(
     conn: sqlite3.Connection, source_id: str, target_id: str
 ) -> "list[str] | None":
     """Would inserting ``source_id --generalizes--> target_id`` close a
-    cycle among LIVE ``generalizes`` edges? Returns the cycle (list of node
+    cycle among CURRENT ``generalizes`` edges? Returns the cycle (list of node
     ids, first == last) if so, else None.
 
     #2753 epic WS1 (D1): the write-time cycle guard, called from every
@@ -1966,9 +2405,9 @@ def _generalizes_cycle_path(
     ``generalized_by`` mint-time wiring on ``engram_add_lesson``/
     ``engram_add_cornerstone``). #3210: now a thin caller of
     ``_dag_cycle_path`` -- ``generalizes`` is the sole member of the
-    ``abstraction`` family, so the walk is the same ``generalizes``-only,
-    resolve-through-supersedes walk as before (#2812/#2813), but the walked
-    set is read from ``EDGE_CLASSIFICATIONS`` rather than hard-coded.
+    ``abstraction`` family, so the walk is the ``generalizes``-only walk, over
+    current edges only (#3542; it no longer resolves through supersedes), and
+    the walked set is read from ``EDGE_CLASSIFICATIONS`` rather than hard-coded.
     Deliberately NOT walked over the grounding family: see ``_dag_cycle_path``.
     """
     return _dag_cycle_path(conn, "generalizes", source_id, target_id)
@@ -2141,45 +2580,40 @@ def generalization_chain(
             frontier.append(resolved)
             roots.append(resolved)
 
+    # #3542 (reviewer round 1 on #4010): this walk is a cycle JUDGE
+    # (``cycle_detected`` below, consumed by both surface hooks), so it reads
+    # the parent edges through the one edge-set definition, over CURRENT edges
+    # only (``live_only=True``: both raw endpoints live) and resolves nothing
+    # through supersede chains. A cycle that closes only through a superseded
+    # node is provenance: the gate and the write guard call it clean, and so
+    # must this. Resolution survives ONLY at the entry point (the start node
+    # and the exemplifies/instantiates roots above, so a caller holding a
+    # retired id still starts from its current successor); everything the walk
+    # reaches after that is a raw live node, so resolution can never be what
+    # produces ``cycle_detected``. A node with no live parent edge is a head
+    # (a parent that was retracted or superseded is simply not an edge).
     depth = 0
     while frontier and depth < max_depth:
         next_frontier: "list[str]" = []
         for current in frontier:
-            parent_edges = conn.execute(
-                "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
-                (current,),
-            ).fetchall()
-            if not parent_edges:
+            parent_ids = sorted({
+                src for src, _t, _r in dag_edge_set(
+                    conn, ("generalizes",), live_only=True, target_id=current)
+            })
+            if not parent_ids:
                 if current not in heads:
                     heads.append(current)
                 continue
-            # A head is a node with no LIVE parent -- not merely one with no
-            # parent-edge ROWS. A node whose every generalizes parent
-            # dead-ends (retracted with no replacement, so
-            # _resolve_to_current returns None) has no live parent and is a
-            # head by the same definition, reached by a different route.
-            # Before #2812 round 2 such a node was neither appended to heads
-            # nor connected to anything: the walk fell out of both branches
-            # silently, and the cycle_detected inference added in that round
-            # then fired on it -- a false positive on a graph with no cycle.
-            resolved_any_parent = False
-            for pe in parent_edges:
-                raw_parent = pe[0]  # SELECT source_id
-                resolved_parent = _resolve_to_current(conn, raw_parent)
-                if resolved_parent is None:
-                    continue
-                resolved_any_parent = True
-                if resolved_parent not in nodes[current]["parents"]:
-                    nodes[current]["parents"].append(resolved_parent)
-                if resolved_parent not in nodes:
-                    nodes[resolved_parent] = {
-                        "original_id": raw_parent,
+            for parent in parent_ids:
+                if parent not in nodes[current]["parents"]:
+                    nodes[current]["parents"].append(parent)
+                if parent not in nodes:
+                    nodes[parent] = {
+                        "original_id": parent,
                         "parents": [],
                         "depth": depth + 1,
                     }
-                    next_frontier.append(resolved_parent)
-            if not resolved_any_parent and current not in heads:
-                heads.append(current)
+                    next_frontier.append(parent)
         frontier = next_frontier
         depth += 1
 
@@ -2401,6 +2835,202 @@ def _push_head_ensuring_upstream() -> subprocess.CompletedProcess:
     return _git("push", "-u", "origin", "HEAD")
 
 
+# ── Off-disk backup push status (#4205) ────────────────────────────────────
+# The snapshot worker records the outcome of EVERY push attempt here so a refused
+# push (a diverged remote) is readable by the SessionStart hook, engram_checkpoint
+# and engram_diagnose instead of dying in the worker's stderr.
+BACKUP_PUSH_STATUS_NAME = "backup-push-status.json"
+_BACKUP_PUSH_STDERR_CAP = 300
+_BACKUP_PUSH_FLARE_AGE_SECS = 24 * 3600
+
+
+def _classify_push(returncode: int, stderr: str, has_remote: bool) -> str:
+    """-> "ok" | "refused" | "rejected-size" | "error" | "no-remote" for one push attempt.
+
+    rejected-size = the host refused an oversize blob (GH001); only a history
+    edit fixes it, which is never automatic.
+
+    refused = the remote turned the push away because histories diverged
+    (non-fast-forward / [rejected] / fetch first). no-remote = nothing to push
+    to. Anything else non-zero is "error" (network, auth, a remote hook)."""
+    if returncode == 0:
+        return "ok"
+    low = (stderr or "").lower()
+    if "gh001" in low or "exceeds github's file size limit" in low:
+        return "rejected-size"
+    if "non-fast-forward" in low or "[rejected]" in low or "fetch first" in low:
+        return "refused"
+    if not has_remote or "no configured push destination" in low:
+        return "no-remote"
+    return "error"
+
+
+def _ahead_behind() -> tuple:
+    """-> (ahead, behind) vs the upstream, or (None, None) when there is none."""
+    r = _git("rev-list", "--left-right", "--count", "HEAD...@{u}")
+    if r.returncode != 0:
+        return (None, None)
+    try:
+        a, b = r.stdout.split()
+        return (int(a), int(b))
+    except ValueError:
+        return (None, None)
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_backup_push_status(*, result: str, stderr: str, commit_sha, ahead, behind,
+                              rewrite_guard=None) -> None:
+    """Atomically write DATA_DIR/backup-push-status.json (tmp + os.replace, 0600).
+
+    last_success_utc is stamped on "ok" and otherwise carried over from the previous
+    file (null if never / the previous file is unreadable). Never raises: a status
+    write must not fail the snapshot job it reports on."""
+    path = Path(DATA_DIR) / BACKUP_PUSH_STATUS_NAME
+    try:
+        now = _utc_stamp()
+        last_success = None
+        if result == "ok":
+            last_success = now
+        else:
+            try:
+                prev = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(prev, dict) and isinstance(prev.get("last_success_utc"), str):
+                    last_success = prev["last_success_utc"]
+            except (OSError, ValueError):
+                pass
+        if rewrite_guard is None:
+            rewrite_guard = _install_rewrite_guard()
+        doc = {
+            "last_attempt_utc": now,
+            "last_success_utc": last_success,
+            "last_commit_sha": commit_sha,
+            "result": result,
+            "stderr_tail": "" if result == "ok" else (stderr or "").strip()[-_BACKUP_PUSH_STDERR_CAP:],
+            "ahead": ahead,
+            "behind": behind,
+            "rewrite_guard": rewrite_guard,
+        }
+        tmp = path.with_name("." + path.name + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(doc, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001 -- best-effort by contract
+        import sys
+        print(f"[engram] backup push status write failed: {e}", file=sys.stderr)
+
+
+def _backup_push_view():
+    """The status file as the readers want it: None when absent; a dict with
+    result/last_success_utc/last_attempt_utc/ahead/behind otherwise; result
+    "unreadable" (other fields None) when the file is malformed."""
+    path = Path(DATA_DIR) / BACKUP_PUSH_STATUS_NAME
+    if not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError):
+        return {"result": "unreadable", "last_success_utc": None, "last_attempt_utc": None,
+                "ahead": None, "behind": None}
+    return {k: doc.get(k) for k in ("result", "last_success_utc", "last_attempt_utc", "ahead", "behind")}
+
+
+def _backup_push_flare(view) -> bool:
+    """True when the off-disk backup needs a human: result != ok for 24 h or never
+    succeeded, or the remote is ahead of us (behind > 0)."""
+    if not view or view.get("result") in (None, "no-remote"):
+        return False  # no remote is a configuration state, not a failure
+    if view["result"] == "unreadable":
+        return True
+    behind = view.get("behind")
+    if isinstance(behind, int) and behind > 0:
+        return True
+    if view["result"] == "ok":
+        return False
+    last = view.get("last_success_utc")
+    if not last:
+        return True
+    try:
+        ts = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - ts).total_seconds() > _BACKUP_PUSH_FLARE_AGE_SECS
+
+
+# ── History-rewrite guard (#4205) ──────────────────────────────────────────
+# A pushed commit that is later amended/reset/rebased leaves the remote on the old
+# commit, and every later push is refused for good. The reference-transaction hook
+# (git >= 2.28) refuses that rewrite mechanically; rewriting UNPUSHED commits stays free.
+_REWRITE_GUARD_MIN_GIT = (2, 28)
+_REWRITE_GUARD_MARKER = b"# engram: refuse to rewrite a pushed commit (#4205)"
+REWRITE_GUARD_SCRIPT = r"""#!/bin/sh
+# engram: refuse to rewrite a pushed commit (#4205). Managed file: _init_git rewrites it.
+[ "$1" = "prepared" ] || exit 0
+while read -r old new ref; do
+  case "$ref" in refs/heads/*) ;; *) continue ;; esac
+  case "$old" in *[!0]*) ;; *) continue ;; esac
+  case "$new" in *[!0]*) ;; *) continue ;; esac
+  [ "$old" = "$new" ] && continue
+  git merge-base --is-ancestor "$old" "$new" 2>/dev/null && continue
+  [ -n "$(git for-each-ref --count=1 --contains "$old" refs/remotes/origin/ 2>/dev/null)" ] || continue
+  branch=${ref#refs/heads/}
+  if [ "$ENGRAM_ALLOW_HISTORY_REWRITE" = "1" ]; then
+    home=$(cd "$(git rev-parse --git-dir)/.." && pwd)
+    printf '%s %s %s -> %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$branch" "$old" "$new" >> "$home/backup-rewrite.log"
+    continue
+  fi
+  short=$(printf '%s' "$old" | cut -c1-8)
+  echo "engram: refusing to rewrite pushed commit $short on $branch; make a new commit (set ENGRAM_ALLOW_HISTORY_REWRITE=1 for a deliberate repair)" >&2
+  exit 1
+done
+exit 0
+"""
+
+
+def _git_version():
+    """-> (major, minor, patch) of the installed git, or None if unparseable."""
+    r = _git("--version")
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", r.stdout or "") if r.returncode == 0 else None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+def _install_rewrite_guard() -> str:
+    """Idempotently install the reference-transaction hook; -> the status-file
+    rewrite_guard value: "installed" | "unsupported" | "opt-out" | "foreign-hook" (an
+    existing hook without our marker is left alone). Never raises."""
+    try:
+        ver = _git_version()
+        if ver is None or ver[:2] < _REWRITE_GUARD_MIN_GIT:
+            return "unsupported"
+        r = _git("rev-parse", "--git-path", "hooks")
+        if r.returncode != 0 or not r.stdout.strip():
+            return "unsupported"
+        hooks = Path(r.stdout.strip())
+        if not hooks.is_absolute():
+            hooks = Path(DATA_DIR) / hooks
+        hook = hooks / "reference-transaction"
+        want = REWRITE_GUARD_SCRIPT.encode("utf-8")
+        if hook.is_file() and _REWRITE_GUARD_MARKER not in hook.read_bytes():
+            return "foreign-hook"  # someone else's hook: never overwrite it
+        if not (hook.is_file() and hook.read_bytes() == want and os.access(hook, os.X_OK)):
+            hooks.mkdir(parents=True, exist_ok=True)
+            tmp = hook.with_name(hook.name + ".tmp")
+            tmp.write_bytes(want)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, hook)
+        return "opt-out" if os.environ.get("ENGRAM_ALLOW_HISTORY_REWRITE") == "1" else "installed"
+    except Exception as e:  # noqa: BLE001 -- startup must not fail on a guard install
+        import sys
+        print(f"[engram] rewrite guard install failed: {e}", file=sys.stderr)
+        return "unsupported"
+
+
 def _init_git():
     """Initialize git repo. Called once at startup with a generous timeout.
 
@@ -2429,6 +3059,7 @@ def _init_git():
     git_dir = DATA_DIR / ".git"
     if git_dir.exists():
         _git_available = True
+        _install_rewrite_guard()  # #4205: idempotent; heals a missing/edited hook
         return
     # Use a longer timeout for init (first-run can be slow on Windows)
     saved_timeout = GIT_TIMEOUT
@@ -2439,11 +3070,95 @@ def _init_git():
             _git("config", "user.email", "engram@local")
             _git("config", "user.name", "KG Memory")
             _git_available = True
+            _install_rewrite_guard()  # #4205
         else:
             import sys
             print(f"[engram] git init failed, version control disabled: {r.stderr}", file=sys.stderr)
     finally:
         GIT_TIMEOUT = saved_timeout
+
+
+# The canonical .gitignore lines for an ENGRAM_HOME (see _ensure_engram_gitignore for the rationale of each).
+# Public: tests and tools import it rather than keep a copy.
+ENGRAM_GITIGNORE_PATTERNS = [
+    "*.db",
+    "*.db-shm",
+    "*.db-wal",
+    "*.db-journal",
+    "*?mode=*",
+    "*.bak",
+    "*.bak.*",
+    "config.json.bak*",
+    "*.backfill-snapshot-*",
+    "*.log",
+    "marketplace/",
+    "venv/",
+    "__pycache__/",
+    "*.pyc",
+    "db-backup/",
+    "claude-projects-archive/",
+    "session-logs-archive/",
+    "session_log.md",
+    # #4205: key material and dated backup copies must never ride into the off-disk
+    # remote (a tracked secrets/ dir and two 157 MB knowledge.db.bak-<date> blobs
+    # were found on fleet seats).
+    "secrets/",
+    "*api-key*",
+    "*.bak-*",
+    # #4208: hand-made binary copies (backups/, dated knowledge.db.<suffix>) and the
+    # rotating rollback copies the backup tool writes must never be staged.
+    "backups/",
+    "*.db.*",
+    "db-backup/binary/",
+]
+
+
+# #4208: tracked paths the backup run untracks (never deletes): binary copies that
+# slipped past an older .gitignore. Read-only helper shared by the backup tool
+# (which untracks them) and engram_diagnose (which counts them).
+# Deliberate: the directory prefixes are anchored at the home ROOT only. The gitignore line
+# `backups/` ignores at any depth, but the untracker only touches the home-root copies, which is
+# where every known instance lives (a nested/backups/old.db is NOT matched). The two globs match
+# the path's BASENAME, so my.db.d/readme.txt (basename readme.txt) is not matched, sub/dir/knowledge.db.<stamp>
+# is, and so is a basename like x.db.md (it matches *.db.*) -- the gitignore line's own semantics.
+_TRACKED_BINARY_PREFIXES = ("backups/", "db-backup/")
+# The backup tool's file-name shapes (#4208), defined once: tools/backup_knowledge_db.py (rotation)
+# and engram_stats (engram_diagnose) both import them, so the two cannot drift.
+BACKUP_ARCHIVE_RE = re.compile(r"^knowledge-(\d{4}-\d{2}-\d{2})(-\d+)?\.sql$")
+BACKUP_BINARY_RE = re.compile(r"^knowledge-\d{4}-\d{2}-\d{2}T\d{6}Z\.db$")
+_TRACKED_BINARY_GLOBS = ("*.db.*", "*.bak-*")
+
+
+def _tracked_binary_paths(engram_home: "Path") -> list:
+    """Paths git tracks under *engram_home* that match backups/**, db-backup/**, *.db.* or *.bak-*.
+
+    Read-only (`git ls-files -z`). Returns [] when *engram_home* is not a git repo.
+    Raises RuntimeError when git fails inside a repo, so a caller that reports on it
+    (engram_diagnose) shows the failure instead of a false zero.
+    """
+    import fnmatch
+    home = Path(engram_home)
+    if not (home / ".git").exists():
+        return []
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        r = subprocess.run(
+            [GIT_EXE, "-C", str(home), "ls-files", "-z"],
+            capture_output=True, timeout=GIT_TIMEOUT, env=env,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        raise RuntimeError(f"git ls-files failed in {home}: {type(exc).__name__}: {exc}") from exc
+    if r.returncode != 0:
+        raise RuntimeError(f"git ls-files failed in {home}: {r.stderr.decode('utf-8', 'replace').strip()}")
+    out = []
+    for raw in r.stdout.split(b"\0"):
+        if not raw:
+            continue
+        p = raw.decode("utf-8", "surrogateescape")
+        if p.startswith(_TRACKED_BINARY_PREFIXES) or any(fnmatch.fnmatchcase(p.rsplit("/", 1)[-1], g) for g in _TRACKED_BINARY_GLOBS):
+            out.append(p)
+    return out
 
 
 def _ensure_engram_gitignore(data_dir: "Path") -> None:
@@ -2498,7 +3213,7 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
     diary/diary.db negation — NOT in this canonical list, investigated 2026-08-15:
     at least one deployed .gitignore hand-adds `!diary/diary.db` (a 32K static
     derived store _commit_snapshot stages alongside the diary entries) to un-ignore
-    it against the *.db rule above. That negation is NOT part of _GITIGNORE_PATTERNS
+    it against the *.db rule above. That negation is NOT part of ENGRAM_GITIGNORE_PATTERNS
     and was never meant to be canonical — see the comment on that negation for why
     (a structural fix in _commit_snapshot's own staging, landed separately, makes
     the negation no longer load-bearing: gitignored files are filtered out of
@@ -2512,35 +3227,15 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
     `!`-prefixed lines across a rewrite (see above) closes that gap generically rather
     than hardcoding this one filename.
     """
-    _GITIGNORE_PATTERNS = [
-        "*.db",
-        "*.db-shm",
-        "*.db-wal",
-        "*.db-journal",
-        "*?mode=*",
-        "*.bak",
-        "*.bak.*",
-        "config.json.bak*",
-        "*.backfill-snapshot-*",
-        "*.log",
-        "marketplace/",
-        "venv/",
-        "__pycache__/",
-        "*.pyc",
-        "db-backup/",
-        "claude-projects-archive/",
-        "session-logs-archive/",
-        "session_log.md",
-    ]
     gitignore_path = data_dir / ".gitignore"
-    canonical = "\n".join(_GITIGNORE_PATTERNS) + "\n"
+    canonical = "\n".join(ENGRAM_GITIGNORE_PATTERNS) + "\n"
     try:
         existing = ""
         if gitignore_path.exists():
             existing = gitignore_path.read_text(encoding="utf-8")
             # Check if ALL required patterns are present (exact-line match)
             existing_lines = {l.strip() for l in existing.splitlines()}
-            if all(p in existing_lines for p in _GITIGNORE_PATTERNS):
+            if all(p in existing_lines for p in ENGRAM_GITIGNORE_PATTERNS):
                 return  # Already complete — leave it alone
         # Preserve any hand-added negation lines (e.g. `!diary/diary.db`) that
         # aren't already part of the canonical set — a wholesale overwrite would
@@ -2548,7 +3243,7 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
         # hand. See the diary/diary.db note above.
         negations = [
             l.strip() for l in existing.splitlines()
-            if l.strip().startswith("!") and l.strip() not in _GITIGNORE_PATTERNS
+            if l.strip().startswith("!") and l.strip() not in ENGRAM_GITIGNORE_PATTERNS
         ]
         content = canonical
         if negations:
@@ -2566,7 +3261,7 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
                 file=sys.stderr,
             )
         gitignore_path.write_text(content, encoding="utf-8")
-        _untrack_gitignored_paths(data_dir, _GITIGNORE_PATTERNS)
+        _untrack_gitignored_paths(data_dir, ENGRAM_GITIGNORE_PATTERNS)
     except OSError:
         pass  # Best-effort — if we can't write it, git init still proceeds
 
@@ -2865,6 +3560,49 @@ def _backfill_vec_nodes(conn: sqlite3.Connection) -> int:
     return inserted
 
 
+# ONE source for "this node is live" (#3586): current and not retracted. Every
+# resolution-state query (best resolver, reconciler, resolve self-heal) goes
+# through this template, formatted with the table alias, so the notion cannot
+# drift between them. tests/test_supersede_resolution_recompute_3586.py pins it.
+_LIVE_NODE_PREDICATE = "{a}.is_current = 1 AND {a}.status != 'retracted'"
+
+
+def _is_live_node(conn: sqlite3.Connection, node_id) -> bool:
+    """True iff node_id names a live node (see _LIVE_NODE_PREDICATE)."""
+    if node_id is None:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM nodes n WHERE n.id = ? AND "
+        + _LIVE_NODE_PREDICATE.format(a="n"),
+        (node_id,),
+    ).fetchone() is not None
+
+
+# ONE source for "this edge counts for acyclicity" (#3542, Lei 2026-10-21): the
+# DAG requirement ranges over CURRENT nodes and CURRENT edges only; a non-current
+# node and its edges are provenance, not live structure. An edge counts iff BOTH
+# RAW endpoints are live (``_LIVE_NODE_PREDICATE`` on source and target; retracted
+# is already non-current). NO resolution through supersede chains when judging a
+# cycle. Format with the aliases of the source and target node rows, e.g.
+# ``_CURRENT_EDGE_PREDICATE.format(s="s", t="t")`` over ``edges e JOIN nodes s ON
+# s.id = e.source_id JOIN nodes t ON t.id = e.target_id``.
+#
+# This predicate is applied in ONE place, ``dag_edge_set`` (next to
+# EDGE_CLASSIFICATIONS above), and every reader of DAG / cascade edges calls that
+# function instead of restating the filter; tests/test_edge_liveness_ssot_3542.py
+# sweeps ``src/engram`` and fails on a second definition or a raw DAG-edge read
+# outside its reviewed allowlist.
+_CURRENT_EDGE_PREDICATE = (
+    "(" + _LIVE_NODE_PREDICATE.format(a="{s}") + ") AND ("
+    + _LIVE_NODE_PREDICATE.format(a="{t}") + ")"
+)
+
+
+def _edge_is_current(conn: sqlite3.Connection, source_id, target_id) -> bool:
+    """True iff both raw endpoints of an edge are live (``_CURRENT_EDGE_PREDICATE``)."""
+    return _is_live_node(conn, source_id) and _is_live_node(conn, target_id)
+
+
 def _best_resolver_for(conn: sqlite3.Connection, target_id: str):
     """Return the argmax-confidence current, non-retracted resolver for target_id.
 
@@ -2881,7 +3619,7 @@ def _best_resolver_for(conn: sqlite3.Connection, target_id: str):
         """SELECT n.id, n.confidence FROM edges e
            JOIN nodes n ON e.source_id = n.id
            WHERE e.target_id = ? AND e.relation = 'resolves'
-           AND n.is_current = 1 AND n.status != 'retracted'
+           AND """ + _LIVE_NODE_PREDICATE.format(a="n") + """
            ORDER BY n.confidence DESC LIMIT 1""",
         (target_id,),
     ).fetchone()
@@ -2927,6 +3665,173 @@ def _backfill_resolved_by(conn: sqlite3.Connection) -> int:
     return updated
 
 
+# Types whose resolution status is a categorical outcome (supported / refuted /
+# confirmed ...), not a confidence projection. The recompute never rewrites
+# their status except to reopen them when no live resolver remains.
+_CATEGORICAL_RESOLUTION_TYPES = ("prediction", "conjecture")
+
+
+_SUCCESSOR_WALK_CAP = 50
+
+
+def _stale_resolver_successors(conn: sqlite3.Connection, target_id: str) -> list:
+    """For each NON-live resolver with a `resolves` edge into target_id, the
+    head of its superseded_by chain when that head is current (#3586).
+
+    Surfaced so a re-wire is one look instead of a hunt; never acted on (no
+    resolves edge is carried: whether the successor answers the target is a
+    judgement). Stops on a cycle, a dead end (no superseded_by) or after
+    _SUCCESSOR_WALK_CAP hops; those resolvers contribute nothing.
+    """
+    stale = conn.execute(
+        "SELECT DISTINCT e.source_id FROM edges e JOIN nodes n ON e.source_id = n.id "
+        "WHERE e.target_id = ? AND e.relation = 'resolves' AND NOT ("
+        + _LIVE_NODE_PREDICATE.format(a="n") + ") ORDER BY e.source_id",
+        (target_id,),
+    ).fetchall()
+    heads: list = []
+    for r in stale:
+        seen = {r["source_id"]}
+        cur = r["source_id"]
+        for _ in range(_SUCCESSOR_WALK_CAP):
+            row = conn.execute(
+                "SELECT superseded_by, is_current FROM nodes WHERE id = ?", (cur,)
+            ).fetchone()
+            if row is None:
+                break
+            if row["is_current"] and cur != r["source_id"]:
+                if cur not in heads:
+                    heads.append(cur)
+                break
+            nxt = row["superseded_by"]
+            if not nxt or nxt in seen:
+                break
+            seen.add(nxt)
+            cur = nxt
+    return heads
+
+
+def _recompute_resolution_target(conn: sqlite3.Connection, target_id: str,
+                                 threshold: float, cause: str = "") -> dict:
+    """Recompute ONE target's resolution state from its LIVE resolvers (#3586).
+
+    Single source of truth for "what is this target's resolution state right
+    now". A live resolver is the source of a ``resolves`` edge into the target
+    satisfying ``_LIVE_NODE_PREDICATE`` (``_best_resolver_for``).
+    Used by retract (step 1b), supersede, and the startup reconciler.
+
+      - no live resolver            -> status 'open', resolved_by NULL ("reopened")
+      - live resolvers, ordinary    -> resolved_by = argmax-confidence resolver;
+                                       status 'resolved' if its confidence (NULL
+                                       counts as 0.0) >= threshold, else
+                                       'partially_resolved' ("repointed")
+      - live resolvers, categorical -> only resolved_by moves; status untouched
+      - already consistent, or the target is not current -> writes nothing
+                                       ("unchanged")
+
+    Does NOT commit; the caller owns the transaction. Logs one
+    ``resolution_recomputed`` edit_history row (before/after status and
+    resolved_by, ``cause`` and ``stale_resolver_successors``) when it changes anything.
+    """
+    row = conn.execute(
+        "SELECT id, type, claim, status, resolved_by, is_current, recall_summary "
+        "FROM nodes WHERE id = ?",
+        (target_id,),
+    ).fetchone()
+    if row is None:
+        return {"id": target_id, "type": "unknown", "claim": "",
+                "action": "unchanged", "before_status": None,
+                "after_status": None, "before_resolved_by": None,
+                "after_resolved_by": None, "stale_resolver_successors": []}
+    before_status = row["status"]
+    before_rb = row["resolved_by"]
+    after_status, after_rb = before_status, before_rb
+    if row["is_current"]:
+        best = _best_resolver_for(conn, target_id)
+        if best is None:
+            after_status, after_rb = "open", None
+        else:
+            after_rb = best["id"]
+            if row["type"] not in _CATEGORICAL_RESOLUTION_TYPES:
+                conf = best["confidence"] if best["confidence"] is not None else 0.0
+                after_status = "resolved" if conf >= threshold else "partially_resolved"
+    successors: list = []
+    if (after_status, after_rb) == (before_status, before_rb):
+        action = "unchanged"
+    else:
+        successors = _stale_resolver_successors(conn, target_id)
+        action = "reopened" if (after_status == "open" and after_rb is None) else "repointed"
+        # #1777 (as _resolve_impl): a recall_summary written for the old
+        # status is now stale, so flag it for the batch-summary fairy. Only on
+        # a STATUS change; a pointer-only move leaves the summary valid.
+        # A target with no summary is left as it was (summary_missing tracks it).
+        if after_status != before_status and row["recall_summary"]:
+            conn.execute(
+                "UPDATE nodes SET status = ?, resolved_by = ?, needs_tightening = 1 "
+                "WHERE id = ?", (after_status, after_rb, target_id))
+        else:
+            conn.execute(
+                "UPDATE nodes SET status = ?, resolved_by = ? WHERE id = ?",
+                (after_status, after_rb, target_id))
+        _log_edit(conn, "resolution_recomputed", target_id, row["type"], {
+            "before_status": before_status, "after_status": after_status,
+            "before_resolved_by": before_rb, "after_resolved_by": after_rb,
+            "cause": cause,
+            "stale_resolver_successors": successors,
+        })
+    return {"id": target_id, "type": row["type"], "claim": row["claim"],
+            "action": action, "before_status": before_status,
+            "after_status": after_status, "before_resolved_by": before_rb,
+            "after_resolved_by": after_rb,
+            "stale_resolver_successors": successors}
+
+
+def _reconcile_resolution_targets(conn: sqlite3.Connection) -> list:
+    """Startup pass (#3586): recompute every current target whose resolution
+    state names no live resolver. Idempotent; returns the helper results that
+    changed something. Commits only if it changed something.
+
+    Candidates (current targets only):
+      (a) resolved_by is non-NULL and does not name a live node;
+      (b) status resolved / partially_resolved, a non-categorical resolvable
+          type, at least one `resolves` edge (from any node: a target that
+          never had one is a different defect, not #3586's) and no live
+          resolver (covers resolved_by NULL);
+      (c) categorical with a non-live resolved_by (subsumed by (a)).
+    """
+    live = ("SELECT 1 FROM edges e JOIN nodes n ON e.source_id = n.id "
+            "WHERE e.target_id = t.id AND e.relation = 'resolves' AND "
+            + _LIVE_NODE_PREDICATE.format(a="n"))
+    any_edge = ("SELECT 1 FROM edges e WHERE e.target_id = t.id "
+                "AND e.relation = 'resolves'")
+    live_pointer = ("SELECT 1 FROM nodes r WHERE r.id = t.resolved_by AND "
+                    + _LIVE_NODE_PREDICATE.format(a="r"))
+    rows = conn.execute(
+        f"""SELECT t.id FROM nodes t
+            WHERE t.is_current = 1 AND (
+              (t.resolved_by IS NOT NULL AND NOT EXISTS ({live_pointer}))
+              OR
+              (t.status IN ('resolved', 'partially_resolved')
+               AND t.type IN ('question', 'contradiction', 'goal_tension')
+               AND EXISTS ({any_edge}) AND NOT EXISTS ({live}))
+            )
+            ORDER BY t.id""",
+    ).fetchall()
+    if not rows:
+        return []
+    config = _config_io.read_config_json(CONFIG_PATH)
+    threshold = config.get("resolution_confidence_threshold", DEFAULT_RESOLUTION_THRESHOLD)
+    changed = []
+    for r in rows:
+        res = _recompute_resolution_target(
+            conn, r["id"], threshold, cause="startup_reconcile")
+        if res["action"] != "unchanged":
+            changed.append(res)
+    if changed:
+        conn.commit()
+    return changed
+
+
 def _load_vec_extension(conn: sqlite3.Connection) -> bool:
     """Load the sqlite-vec extension on a connection. Returns True on success.
 
@@ -2964,7 +3869,7 @@ def _db_missing_message() -> str:
     DATA_DIR/knowledge.db. The plugin packaging has no installer-script step,
     so this is the user's signal that engram-first-session needs to bootstrap.
     """
-    engram_home_env = os.environ.get("ENGRAM_HOME", "<unset; default ~/.engram>")
+    engram_home_env = str(DATA_DIR)  # the resolved home (display only; no raw env read, #3863 step 2)
     return (
         f"ENGRAM cannot start: knowledge.db not found at {DB_PATH}\n\n"
         "This usually means one of:\n"
@@ -3476,6 +4381,109 @@ def _ensure_metadata_json_guard_triggers(conn: sqlite3.Connection) -> None:
     )
 
 
+# ── #3765: nodes.claim / nodes.recall_summary must not contain U+0000 ──────
+# A NUL embedded in node text is corrupt input: any consumer that treats the
+# value as a C string stops at it. It is a WRITE-path defect with many writers
+# (16 INSERT sites plus the recall_summary UPDATE), so the guard is ONE pair
+# of BEFORE triggers at the database, copied from the #3425 metadata guard
+# above, not one check per writer. REJECT, never strip: stripping would
+# store text the caller never wrote. The test is byte-level
+# (`instr(CAST(.. AS BLOB), x'00')`) because a TEXT instr can stop at the NUL
+# on some builds.
+# The UPDATE trigger is `UPDATE OF claim, recall_summary` and checks a column
+# only when that column CHANGES (NEW IS NOT OLD). The guard refuses WRITING a
+# NUL; it does not freeze a row that already holds one. So a legacy NUL row can
+# still be retracted / rescored, get its other column written (the batch-summary
+# fairy's recall_summary UPDATE on a row whose CLAIM holds a NUL), and an
+# identical rewrite of a NUL value passes as a no-op: nothing new is written.
+# The repair is to supersede, or to write clean text into the column that holds
+# the NUL. A plain BEFORE UPDATE would make such a row impossible to retract.
+# Created at migration rung TEXT_NUL_GUARD_RUNG and re-ensured on every start at
+# user_version >= that rung (CREATE TRIGGER IF NOT EXISTS). Neither trigger's
+# SQL mentions nodes_fts, so engram_backup's FTS-trigger drop plan leaves them
+# in a dump. Existing NUL rows are COUNTED and reported, never altered.
+# RENUMBERING: a second change may want the same rung; whichever merges second
+# edits THREE places: this constant, the literal `PRAGMA user_version = N` in
+# the rung (the repo's LATEST_SCHEMA_VERSION oracle test parses that literal),
+# and LATEST_SCHEMA_VERSION. A test ties the first two together.
+TEXT_NUL_GUARD_RUNG = 9
+_TEXT_NUL_GUARD_MSG = "nodes.claim and nodes.recall_summary must not contain U+0000 (NUL)"
+_TEXT_NUL_GUARD_TRIGGER_NAMES = (
+    "nodes_text_nul_guard_insert",
+    "nodes_text_nul_guard_update",
+)
+_TEXT_NUL_GUARD_WHEN = (
+    "instr(CAST(NEW.claim AS BLOB), x'00') > 0 "
+    "OR instr(CAST(NEW.recall_summary AS BLOB), x'00') > 0"
+)
+
+# The UPDATE trigger's WHEN: a column is checked only when it changes (see the comment above).
+# The INSERT trigger keeps _TEXT_NUL_GUARD_WHEN; _text_has_nul is the twin of THAT one only.
+_TEXT_NUL_GUARD_UPDATE_WHEN = (
+    "(NEW.claim IS NOT OLD.claim "
+    "AND instr(CAST(NEW.claim AS BLOB), x'00') > 0) "
+    "OR (NEW.recall_summary IS NOT OLD.recall_summary "
+    "AND instr(CAST(NEW.recall_summary AS BLOB), x'00') > 0)"
+)
+
+
+def _text_has_nul(*values) -> bool:
+    """The Python twin of _TEXT_NUL_GUARD_WHEN, for a tool-layer pre-check that must
+    refuse before an earlier commit (the one rule, spelled once per language; a test
+    evaluates the WHEN text itself against this over a corpus). True if any value is
+    a str containing U+0000 or a bytes/bytearray containing a zero byte; None and
+    every other type are False."""
+    for v in values:
+        if isinstance(v, str):
+            if "\x00" in v:
+                return True
+        elif isinstance(v, (bytes, bytearray)):
+            if b"\x00" in v:
+                return True
+    return False
+
+
+def _ensure_text_nul_guard_triggers(conn: sqlite3.Connection) -> None:
+    """Create the two NUL write-guard triggers on nodes (idempotent)."""
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS nodes_text_nul_guard_insert
+        BEFORE INSERT ON nodes
+        WHEN {_TEXT_NUL_GUARD_WHEN}
+        BEGIN
+            SELECT RAISE(ABORT, '{_TEXT_NUL_GUARD_MSG}');
+        END
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS nodes_text_nul_guard_update
+        BEFORE UPDATE OF claim, recall_summary ON nodes
+        WHEN {_TEXT_NUL_GUARD_UPDATE_WHEN}
+        BEGIN
+            SELECT RAISE(ABORT, '{_TEXT_NUL_GUARD_MSG}');
+        END
+        """
+    )
+
+
+# The ROW form of the rule (columns unprefixed), for the rung's count and engram_diagnose. The
+# trigger's NEW.-prefixed _TEXT_NUL_GUARD_WHEN is a different expression and stays its own constant.
+_TEXT_NUL_ROW_WHERE = (
+    "instr(CAST(claim AS BLOB), x'00') > 0 "
+    "OR instr(CAST(recall_summary AS BLOB), x'00') > 0"
+)
+
+
+def _count_text_nul_rows(conn: sqlite3.Connection) -> int:
+    """Number of nodes whose claim or recall_summary holds a NUL right now.
+    A COUNT only (the rung never alters existing text). Keep the COUNT(id) form: the
+    connection proxy in test_2181 matches the star form of this query by substring."""
+    return conn.execute(
+        f"SELECT COUNT(id) FROM nodes WHERE {_TEXT_NUL_ROW_WHERE}"
+    ).fetchone()[0]
+
+
 def _quarantine_invalid_metadata(conn: sqlite3.Connection) -> int:
     """Copy every invalid-JSON nodes.metadata blob to metadata_quarantine,
     then NULL it on the node. Returns the number of rows quarantined. Does
@@ -3707,7 +4715,133 @@ def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
 # pre-migration backup, and engramd_owner's start() gate refuses a store whose
 # user_version is below it (read through this module attribute at call time, never
 # copied). Adding a rung means bumping this single line.
-LATEST_SCHEMA_VERSION = 8
+LATEST_SCHEMA_VERSION = 10
+
+
+# Migration rung of #4075 (the fourth cascade resolution kind). A renumber edits THREE places, as for
+# TEXT_NUL_GUARD_RUNG above: this constant, the literal `PRAGMA user_version = N` in the rung, and
+# LATEST_SCHEMA_VERSION; tests/test_cascade_resolved_kind_4075.py ties them together.
+CASCADE_RESOLVED_KIND_RUNG = 10
+
+
+# #4075 (schema v10): the cascade_markers table with its fourth resolution kind. SQLite cannot
+# alter a CHECK, so migration rung 10 renames the old table aside and creates THIS one under the
+# canonical name. It must stay textually in step with the CREATE TABLE IF NOT EXISTS in
+# _init_db's script (a fresh store gets that one, a migrated store gets this one);
+# tests/test_cascade_resolved_kind_4075.py compares the two structurally.
+_CASCADE_MARKERS_V10_DDL = """CREATE TABLE cascade_markers (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id                 TEXT NOT NULL REFERENCES nodes(id),
+    cascade_event           TEXT NOT NULL,
+    root_node               TEXT NOT NULL,
+    root_op                 TEXT NOT NULL CHECK (root_op IN ('retract', 'supersede')),
+    status                  TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved')),
+    resolution_kind         TEXT CHECK (resolution_kind IN ('superseded', 'acknowledged', 'retracted', 'resolved') OR resolution_kind IS NULL),
+    resolution_replacement_id TEXT,
+    created_at              TEXT NOT NULL,
+    resolved_at             TEXT,
+    backfill_provenance     TEXT CHECK (backfill_provenance IN ('recovered', 'migration_time') OR backfill_provenance IS NULL),
+    backfill_anomaly        INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(node_id, cascade_event)
+)"""
+_CASCADE_MARKERS_V10_COLUMNS = (
+    "id", "node_id", "cascade_event", "root_node", "root_op", "status", "resolution_kind",
+    "resolution_replacement_id", "created_at", "resolved_at", "backfill_provenance",
+    "backfill_anomaly",
+)
+_CASCADE_MARKERS_INDEX_NAMES = (
+    "idx_cascade_markers_node", "idx_cascade_markers_node_status", "idx_cascade_markers_event",
+)
+_CASCADE_MARKERS_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_cascade_markers_node ON cascade_markers(node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cascade_markers_node_status ON cascade_markers(node_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_cascade_markers_event ON cascade_markers(cascade_event)",
+)
+
+
+def _rebuild_cascade_markers_for_resolved_kind(conn: sqlite3.Connection, bump_version) -> None:
+    """Migration rung 10 body (#4075; the number is CASCADE_RESOLVED_KIND_RUNG): give `cascade_markers` its fourth resolution kind
+    ('resolved') and bump the schema version, atomically.
+
+    `bump_version` is a zero-argument callable that executes the `PRAGMA user_version = 10`
+    write. The CALLER passes it so the literal stays in `_run_db_one_time_setup`, where
+    test_2181_latest_schema_version_constant_matches_max_rung_target reads every rung's
+    target; it runs INSIDE the rebuild's transaction, so the version only advances with the
+    table.
+
+    A table that already carries the kind (a store the ladder just created, or one this rung
+    already rebuilt) gets only the version bump, so running it twice is a no-op. Otherwise the
+    old table is renamed aside, the v10 table is created under the canonical name, every row is
+    copied (ids and AUTOINCREMENT counter included), the copy is counted against the source,
+    and only then is the old table dropped. One transaction: a fault anywhere rolls the whole
+    rebuild back, leaves user_version at its old value (9 or below), and the rung retries on the next start.
+
+    Refuses (raises sqlite3.DatabaseError, which the caller reports as a FAILED, retryable
+    rung) when the old table has a column this rung does not know: dropping it silently would
+    lose data. `foreign_keys` is switched off around the rebuild, as SQLite's own procedure for
+    table rebuilds prescribes, so a marker whose node row is gone (hand surgery) is carried
+    over as it is rather than failing the copy.
+    """
+    conn.commit()
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='cascade_markers'"
+    ).fetchone()
+    if row is None:
+        raise sqlite3.DatabaseError("cascade_markers table is missing; cannot migrate to v10")
+    if "'retracted', 'resolved')" in " ".join((row[0] or "").split()):
+        bump_version()
+        conn.commit()
+        return
+    old_cols = [r[1] for r in conn.execute("PRAGMA table_info(cascade_markers)").fetchall()]
+    unknown = [c for c in old_cols if c not in _CASCADE_MARKERS_V10_COLUMNS]
+    if unknown:
+        raise sqlite3.DatabaseError(
+            f"cascade_markers has column(s) {unknown} that the v10 rebuild does not carry; "
+            f"refusing to drop data"
+        )
+    cols = ", ".join(c for c in _CASCADE_MARKERS_V10_COLUMNS if c in old_cols)
+    fk_was_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    if fk_was_on:
+        conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for name in _CASCADE_MARKERS_INDEX_NAMES:
+                conn.execute(f"DROP INDEX IF EXISTS {name}")
+            conn.execute("ALTER TABLE cascade_markers RENAME TO cascade_markers_prev")
+            conn.execute(_CASCADE_MARKERS_V10_DDL)
+            conn.execute(
+                f"INSERT INTO cascade_markers ({cols}) SELECT {cols} FROM cascade_markers_prev ORDER BY id"
+            )
+            n_old = conn.execute("SELECT COUNT(*) FROM cascade_markers_prev").fetchone()[0]
+            n_new = conn.execute("SELECT COUNT(*) FROM cascade_markers").fetchone()[0]
+            if n_old != n_new:
+                raise sqlite3.DatabaseError(
+                    f"cascade_markers rebuild copied {n_new} of {n_old} rows; rolled back"
+                )
+            seq = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'cascade_markers_prev'"
+            ).fetchone()
+            if seq is not None:
+                if conn.execute(
+                    "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'cascade_markers'",
+                    (seq[0],),
+                ).rowcount == 0:
+                    conn.execute(
+                        "INSERT INTO sqlite_sequence (name, seq) VALUES ('cascade_markers', ?)",
+                        (seq[0],),
+                    )
+            conn.execute("DROP TABLE cascade_markers_prev")
+            for stmt in _CASCADE_MARKERS_INDEX_SQL:
+                conn.execute(stmt)
+            bump_version()
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        if fk_was_on:
+            conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
@@ -3864,7 +4998,11 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
             root_node               TEXT NOT NULL,
             root_op                 TEXT NOT NULL CHECK (root_op IN ('retract', 'supersede')),
             status                  TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved')),
-            resolution_kind         TEXT CHECK (resolution_kind IN ('superseded', 'acknowledged', 'retracted') OR resolution_kind IS NULL),
+            -- 'resolved' (#4075, schema v10) is valid on CONTRADICTION nodes only: the
+            -- contradiction was settled by a side's revision. The kind set lives in
+            -- engram_revision._CASCADE_RESOLUTION_KINDS; migration rung 10 rebuilds an
+            -- older table to this exact CHECK (SQLite cannot alter one in place).
+            resolution_kind         TEXT CHECK (resolution_kind IN ('superseded', 'acknowledged', 'retracted', 'resolved') OR resolution_kind IS NULL),
             resolution_replacement_id TEXT,
             created_at              TEXT NOT NULL,
             resolved_at             TEXT,
@@ -5224,6 +6362,60 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 file=sys.stderr,
             )
 
+    # Migration version 9 (#3765; the number is TEXT_NUL_GUARD_RUNG): nodes.claim /
+    # nodes.recall_summary must not contain U+0000. A COUNT first (never an
+    # alteration: stripping would store text the caller never wrote), then the
+    # CREATE TRIGGERs, then the version bump. NOT one transaction: in Python's
+    # sqlite3 a CREATE TRIGGER and a PRAGMA run in autocommit (the COUNT is a
+    # SELECT and opens none), so a failure does not roll the triggers back.
+    # What makes it safe: the triggers are CREATE ... IF NOT EXISTS and the rung
+    # retries while user_version is still the previous one, so a crash between
+    # the trigger creation and the PRAGMA re-runs harmlessly on the next start.
+    # The count is reported, not fixed: one stderr line when non-zero, and
+    # engram_diagnose reports the live count.
+    if _rung_ready(conn, TEXT_NUL_GUARD_RUNG, _pre_migration_backup_ok):
+        try:
+            _nul_count = _count_text_nul_rows(conn)
+            _ensure_text_nul_guard_triggers(conn)
+            conn.execute("PRAGMA user_version = 9")
+            conn.commit()
+            if _nul_count:
+                print(
+                    f"[_run_db_one_time_setup] migration {TEXT_NUL_GUARD_RUNG} (#3765): "
+                    f"{_nul_count} node(s) already hold a U+0000 in claim or "
+                    "recall_summary; left unchanged (the write guard now "
+                    "refuses new ones). engram_diagnose reports the live count.",
+                    file=sys.stderr,
+                )
+        except sqlite3.DatabaseError as _migration9_err:
+            conn.rollback()
+            print(
+                f"[_run_db_one_time_setup] migration {TEXT_NUL_GUARD_RUNG} (#3765 NUL write guard) "
+                "FAILED, will retry on next "
+                f"startup: {_migration9_err!r}",
+                file=sys.stderr,
+            )
+
+    # Migration version 10 (#4075; the number is CASCADE_RESOLVED_KIND_RUNG): the fourth cascade resolution kind, 'resolved', valid on
+    # contradiction nodes. cascade_markers.resolution_kind is schema-constrained and SQLite cannot
+    # alter a CHECK, so this rung rebuilds the table preserving every row (see
+    # _rebuild_cascade_markers_for_resolved_kind). On failure the version stays where it was and the rung
+    # retries on the next start; the pre-migration backup gate (_rung_ready) applies as for every
+    # rung. No backfill: existing stores gain the kind from the next resolution on.
+    if _rung_ready(conn, CASCADE_RESOLVED_KIND_RUNG, _pre_migration_backup_ok):
+        try:
+            _rebuild_cascade_markers_for_resolved_kind(
+                conn, lambda: conn.execute("PRAGMA user_version = 10")
+            )
+        except sqlite3.DatabaseError as _migration10_err:
+            conn.rollback()
+            print(
+                f"[_run_db_one_time_setup] migration {CASCADE_RESOLVED_KIND_RUNG} (#4075 cascade_markers "
+                "'resolved' kind) FAILED, will retry on next "
+                f"startup: {_migration10_err!r}",
+                file=sys.stderr,
+            )
+
     # #2732 (A): a rung that landed leaves its new index (or any DDL) with no
     # planner statistics, and the next plain `PRAGMA optimize` -- which every
     # checkpoint runs -- then re-analyzes that WHOLE table under SQLite's
@@ -5274,6 +6466,21 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
             print(
                 "[_run_db_one_time_setup] created_at index self-heal "
                 f"FAILED: {_cai_err!r}",
+                file=sys.stderr,
+            )
+
+    # Self-heal (#3765): at user_version >= the NUL-guard rung the two triggers
+    # must exist. Re-created every startup (IF NOT EXISTS) so a hand edit or a
+    # restore heals. Gated on the LIVE version, so it never papers over a failed
+    # rung (the rung itself owns that retry).
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= TEXT_NUL_GUARD_RUNG:
+        try:
+            _ensure_text_nul_guard_triggers(conn)
+            conn.commit()
+        except sqlite3.DatabaseError as _nul_err:
+            print(
+                "[_run_db_one_time_setup] NUL guard self-heal (#3765) "
+                f"FAILED: {_nul_err!r}",
                 file=sys.stderr,
             )
 
@@ -5353,6 +6560,15 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # resolved before the resolved_by column was written. Idempotent — guarded
     # by the NULL check inside _backfill_resolved_by (skips immediately if 0 rows).
     _backfill_resolved_by(conn)
+
+    # #3586: bring resolution state back in line with LIVE resolvers (targets
+    # whose only resolver was superseded). Runs AFTER the NULL backfill above.
+    # One stderr line (never stdout: MCP stdio) when it changed anything.
+    _reconciled = _reconcile_resolution_targets(conn)
+    if _reconciled:
+        print(f"[engram] reconciled {len(_reconciled)} resolution target(s) "
+              f"left without a live resolver (see engram_history mode=edits, "
+              f"action resolution_recomputed)", file=sys.stderr)
 
     # Backfill focus_state singleton row if missing. active_set_name stays
     # NULL until the first engram_focus_load / engram_focus_save call.
@@ -5689,6 +6905,31 @@ def _metadata_dict(raw) -> dict:
     except (ValueError, TypeError, RecursionError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def changed_concurrently_refusal(conn, kind: str, node_id: str, *,
+                                 message: "Optional[str]" = None) -> str:
+    """Roll back and build the `changed_concurrently` refusal (#4166/#4178).
+
+    The one place this refusal is constructed. Used when a guarded write
+    (`UPDATE ... AND metadata IS ?`) matched no row: the node changed between
+    this call's read and its write. Rolls back `conn` (the whole call is
+    all-or-nothing), then returns the JSON refusal.
+
+    The error reads "<kind> '<node_id>' changed while this call was running
+    ...". Callers keep their historical wording by choosing `kind` ("Node",
+    "Task", "Goal", "Lesson", "Evidence node"); a caller whose message differs
+    in more than the kind (requote names its own racing writers) passes the
+    full text as `message`, used verbatim.
+    """
+    conn.rollback()
+    return json.dumps({
+        "error": message if message is not None else (
+            f"{kind} '{node_id}' changed while this call was running "
+            f"(another write got there first). Nothing was changed. "
+            f"Re-read the node and retry."),
+        "refusal": "changed_concurrently",
+    })
 
 
 def _metadata_dict_for_write(raw, node_id, tool) -> "tuple[dict, Optional[str]]":
@@ -8429,7 +9670,8 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 lines.append(f"### {n['id']} [{status_tag}]")
                 lines.append(f"Description: {n['claim']}")
                 edges = conn.execute(
-                    "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'contradicts'",
+                    "SELECT target_id FROM edges WHERE source_id = ? "
+                    "AND relation IN ('contradicts', 'acknowledged_contradicts') ORDER BY id",
                     (n["id"],),
                 ).fetchall()
                 for e in edges:
@@ -9303,7 +10545,8 @@ def _strip_agent_facing(obj: object) -> object:
     return obj
 
 
-def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type: str) -> int:
+def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type: str,
+                          live_only: bool = True) -> int:
     """Count live exemplars supporting a cornerstone or lesson.
 
     Live = source/target node with is_current=1.
@@ -9316,14 +10559,21 @@ def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type:
         - Count outgoing `supported_by` edges where target.is_current=1
           (the pre-PR-#431 cornerstone exemplar wiring pattern, kept by
           Lei's 2026-05-28 design call: coexisting schemas, both counted).
+
+    ``live_only=False`` (#3782) counts the SAME edges without the currency
+    filter: how many support edges the node has EVER had (to a node that still
+    exists), so "support was lost" can be told from "never had any". One
+    function parametrized, not two, so the relation set cannot drift between
+    the live count and the ever count.
     """
+    currency = "AND n.is_current = 1" if live_only else ""
     exemplifies_live = conn.execute(
-        """SELECT COUNT(*) AS c
+        f"""SELECT COUNT(*) AS c
            FROM edges e
            JOIN nodes n ON n.id = e.source_id
            WHERE e.target_id = ?
              AND e.relation = 'exemplifies'
-             AND n.is_current = 1""",
+             {currency}""",
         (target_id,),
     ).fetchone()["c"]
 
@@ -9331,16 +10581,96 @@ def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type:
         return exemplifies_live
 
     supported_by_live = conn.execute(
-        """SELECT COUNT(*) AS c
+        f"""SELECT COUNT(*) AS c
            FROM edges e
            JOIN nodes n ON n.id = e.target_id
            WHERE e.source_id = ?
              AND e.relation = 'supported_by'
-             AND n.is_current = 1""",
+             {currency}""",
         (target_id,),
     ).fetchone()["c"]
 
     return exemplifies_live + supported_by_live
+
+
+def _apply_support_state(conn: sqlite3.Connection, node_id: str, node_type: str,
+                         metadata_raw, live_count: int, *, trigger: str, tool: str,
+                         warnings_out: "list | None" = None,
+                         flagged: "bool | None" = None,
+                         details_extra: "dict | None" = None) -> "str | None":
+    """The ONE rule that writes `metadata.support_lost` (#3782).
+
+    Given a current cornerstone/lesson's live-support count:
+      - live_count == 0 and not flagged -> mark: set the flag, log
+        'support_lost'; returns "marked".
+      - live_count > 0 and flagged -> clear the flag, log
+        'support_lost_cleared'; returns "cleared".
+      - otherwise nothing is written; returns None.
+      - the write is guarded (#4178, `_write_support_metadata`): if the row
+        changed since the caller read `metadata_raw`, nothing is written or
+        logged and "changed_concurrently" is returned (callers treat it as
+        neither marked nor cleared).
+
+    Whether a never-supported node should be marked is the CALLER's call (the
+    detector only runs on a node that had an edge; reflect checks the ever
+    count). The caller commits.
+
+    ``flagged`` defaults to the parsed metadata's `support_lost`; reflect
+    passes its SQL-text pre-filter verdict so a non-object blob that merely
+    CONTAINS the marker text is still discharged as before (#3413).
+    ``trigger`` lands in the edit row; ``details_extra`` adds keys to it.
+    ``warnings_out`` collects the #3413 replaced-blob warning text.
+    """
+    if flagged is None:
+        flagged = bool(_metadata_dict(metadata_raw).get("support_lost"))
+    details = dict(details_extra or {})
+    details["trigger"] = trigger
+    if live_count == 0 and not flagged:
+        meta, replaced = _metadata_dict_for_write(metadata_raw, node_id, tool)
+        if replaced and warnings_out is not None:
+            warnings_out.append(replaced)
+        meta["support_lost"] = True
+        if not _write_support_metadata(conn, node_id, meta, metadata_raw):
+            return "changed_concurrently"
+        _log_edit(conn, "support_lost", node_id, node_type, details)
+        return "marked"
+    if live_count > 0 and flagged:
+        meta, replaced = _metadata_dict_for_write(metadata_raw, node_id, tool)
+        if replaced and warnings_out is not None:
+            warnings_out.append(replaced)
+        meta.pop("support_lost", None)
+        if not _write_support_metadata(conn, node_id, meta, metadata_raw):
+            return "changed_concurrently"
+        _log_edit(conn, "support_lost_cleared", node_id, node_type, details)
+        return "cleared"
+    return None
+
+
+def _write_support_metadata(conn: sqlite3.Connection, node_id: str, meta: dict,
+                            metadata_raw) -> bool:
+    """The guarded metadata write of `_apply_support_state` (#4178).
+
+    ``metadata_raw`` is the RAW column value the caller read for this node;
+    ``metadata IS ?`` binds it as read (NOT a re-serialized dict), so a node
+    whose stored JSON is spelled differently from `json.dumps` still matches
+    and only a real change since the read does not. ``is_current = 1`` is the
+    state both callers filter on (retract/supersede checks it; reflect selects
+    on it). Returns False, writing nothing, when the row no longer matches.
+    The helper cannot roll back (its caller owns the transaction and a loop of
+    other rows), so it reports instead: "changed_concurrently" is the outcome
+    the callers already treat as neither marked nor cleared, and one line goes
+    to stderr (stdout is the MCP channel). The state-based recompute in
+    engram_reflect re-evaluates the node on its next run."""
+    cur = conn.execute(
+        "UPDATE nodes SET metadata = ? "
+        "WHERE id = ? AND is_current = 1 AND metadata IS ?",
+        (json.dumps(meta), node_id, metadata_raw),
+    )
+    if cur.rowcount == 1:
+        return True
+    print(f"engram: node {node_id} changed while its support_lost state was "
+          f"being updated; skipped, not overwritten (#4178)", file=sys.stderr)
+    return False
 
 
 def _current_successor(conn, node_id: str) -> "str | None":
@@ -9955,9 +11285,11 @@ def _acknowledged_superseded_premises(conn: sqlite3.Connection,
     back, so mutually-superseding ack targets never drop each other and the
     premise set is never emptied by a cycle.
     """
-    acked = [r["target_id"] for r in conn.execute(
-        "SELECT target_id FROM edges WHERE source_id = ? "
-        "AND relation = 'acknowledged_derives_from'", (node_id,)).fetchall()]
+    # live_only=False: an acknowledged premise is by definition one whose
+    # replacement exists, so it is usually non-current (#3542).
+    acked = [t for _s, t, _r in dag_edge_set(
+        conn, ("acknowledged_derives_from",), live_only=False,
+        source_id=node_id)]
     if not acked:
         return set()
     memo: dict = {}
@@ -9971,19 +11303,20 @@ def _acknowledged_superseded_premises(conn: sqlite3.Connection,
         frontier = [start]
         while frontier:
             cur = frontier.pop()
-            for r in conn.execute(
-                    "SELECT target_id FROM edges WHERE source_id = ? "
-                    "AND relation = 'supersedes'", (cur,)).fetchall():
-                if r["target_id"] not in found:
-                    found.add(r["target_id"])
-                    frontier.append(r["target_id"])
+            # live_only=False: the supersedes chain IS provenance -- its
+            # targets are non-current by definition (#3542).
+            for _s, tgt, _r in dag_edge_set(
+                    conn, ("supersedes",), live_only=False, source_id=cur):
+                if tgt not in found:
+                    found.add(tgt)
+                    frontier.append(tgt)
         memo[start] = found
         return found
 
-    _rels = sorted(CASCADE_RELATIONS)
-    targets = {r["target_id"] for r in conn.execute(
-        f"SELECT target_id FROM edges WHERE source_id = ? AND relation IN "
-        f"({','.join('?' for _ in _rels)})", (node_id, *_rels)).fetchall()}
+    # live_only=False: the premise whose replacement was acknowledged is by
+    # definition non-current; this reader's subject is that dead premise (#3542).
+    targets = {t for _s, t, _r in dag_edge_set(
+        conn, CASCADE_RELATIONS, live_only=False, source_id=node_id)}
     dropped: set = set()
     for a in acked:
         for x in _ancestors(a) & targets:
@@ -10003,17 +11336,14 @@ def _recompute_premise_ids(conn: sqlite3.Connection, node_id: str) -> list:
     and tools/surgical.py::_compute_confidence_for_node so the two copies of
     the confidence arithmetic cannot disagree about which premises count.
     """
-    _rels = sorted(CASCADE_RELATIONS)
     _superseded = _acknowledged_superseded_premises(conn, node_id)
+    # live_only=False: a recompute reads every stored premise edge (a premise
+    # that went non-current still carries its confidence; #3531 owns which are
+    # excluded). Not a cycle judgement or a reachability walk (#3542).
     return [
-        r["target_id"] for r in conn.execute(
-            f"SELECT DISTINCT target_id FROM edges "
-            f"WHERE source_id = ? AND relation IN "
-            f"({','.join('?' for _ in _rels)}) "
-            f"ORDER BY target_id",
-            (node_id, *_rels),
-        ).fetchall()
-        if r["target_id"] not in _superseded
+        t for t in sorted({t for _s, t, _r in dag_edge_set(
+            conn, CASCADE_RELATIONS, live_only=False, source_id=node_id)})
+        if t not in _superseded
     ]
 
 
@@ -10381,7 +11711,7 @@ def _with_state_lock(lock_path, fn):
     scripts, each a separate subprocess invoked by Claude Code). Hooks do not
     import each other and may not import this module, so there is no shared
     import surface today, and a new shared module for ~15 lines isn't worth
-    the engineering (see spec docs/specs/1720-principle-state-write-race.md).
+    the engineering (see spec docs/internal/specs/1720-principle-state-write-race.md).
     If any copy changes, change the other two; tests/test_utility_state_lock_3658.py
     pins all three AST-identical (docstring dropped).
     """
@@ -10461,7 +11791,7 @@ def _reset_principle_enactments(principle_id: str) -> None:
     TORN READS, not a concurrent hook-side read-modify-write silently
     dropping whichever side loses (last-writer-wins on the whole file). Same
     TOCTOU class #1709 fixed with flock, but blocking rather than
-    non-blocking-suppress -- see docs/specs/1720-principle-state-write-race.md
+    non-blocking-suppress -- see docs/internal/specs/1720-principle-state-write-race.md
     "Why NOT #1709's non-blocking-suppress pattern" for why this path can't
     use #1709's shape (this call site is not on the render-decision path, so
     blocking briefly here is safe).
@@ -10554,7 +11884,8 @@ def _open_contradiction_ids(conn: sqlite3.Connection, node_id: str) -> list:
     rows = conn.execute(
         """SELECT DISTINCT ct.id FROM edges e
            JOIN nodes ct ON ct.id = e.source_id
-           WHERE e.target_id = ? AND e.relation = 'contradicts'
+           WHERE e.target_id = ?
+             AND e.relation IN ('contradicts', 'acknowledged_contradicts')
              AND ct.type = 'contradiction' AND ct.is_current = 1
              AND ct.status = 'active'
            ORDER BY ct.id""",
@@ -10583,12 +11914,12 @@ def _direct_premise_ids(conn: sqlite3.Connection, node_id: str) -> list:
     are engram_revision.py's `_immediate_cause`, `_dead_premises`,
     `_cascade_frontier_node_summary`, and `_cascade_affected_premises`.
     """
-    rows = conn.execute(
-        f"SELECT target_id FROM edges WHERE source_id = ? "
-        f"AND relation IN ({_CITATION_SUPPORT_RELATION_PLACEHOLDERS})",
-        (node_id, *_CITATION_SUPPORT_RELATIONS_SORTED),
-    ).fetchall()
-    return [r["target_id"] for r in rows]
+    # live_only=False: a node's stored premises include the dead ones (that is
+    # what `_dead_premises` and the cascade frontier read); one definition of
+    # the edge set, no liveness filter here (#3542). All three relations are in
+    # the grounding family.
+    return [t for _s, t, _r in dag_edge_set(
+        conn, CITATION_SUPPORT_RELATIONS, live_only=False, source_id=node_id)]
 
 
 def _pending_markers_for_node(conn: sqlite3.Connection, node_id: str) -> list:
@@ -11113,15 +12444,41 @@ def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int
         # Follow citation edges backward. #2252 Stage 1.0b: walked-relation
         # set DERIVED from PROVENANCE_RELATIONS (the `provenance` flag in
         # EDGE_CLASSIFICATIONS) instead of hardcoded.
-        edges = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? "
-            f"AND relation IN ({_PROVENANCE_RELATION_PLACEHOLDERS})",
-            (current, *_PROVENANCE_RELATIONS_SORTED),
-        ).fetchall()
-        for e in edges:
-            queue.append(e["target_id"])
+        # live_only=False (#3542): a provenance traversal toward the evidence
+        # roots, not a cycle judge; it terminates by its visited set and budget.
+        for _src, tgt, _rel in dag_edge_set(
+                conn, _PROVENANCE_RELATIONS_SORTED, live_only=False,
+                source_id=current):
+            queue.append(tgt)
 
     return roots
+
+
+# Default node budget for the cascade walks (see _walk_cascade_upstream).
+_CASCADE_WALK_DEFAULT_BUDGET = 4096
+
+
+class CascadeWalkTruncated(Exception):
+    """Raised by ``_walk_cascade_upstream(strict=True)`` when the per-dequeue
+    budget ran out while nodes were still queued (#2339): the walk did NOT
+    reach every ancestor, so its result is not a complete ancestor set.
+
+    ``visited``: nodes dequeued before the budget ran out.
+    ``remaining_queue``: queued entries not yet visited at that point.
+    """
+
+    def __init__(self, visited: int, remaining_queue: int, budget: int = 0,
+                 partial: set | None = None):
+        self.visited = visited
+        self.remaining_queue = remaining_queue
+        self.budget = budget
+        # What the walk collected before it was cut off — for a caller that
+        # must still answer best-effort, flagged incomplete. Never a result.
+        self.partial = set(partial) if partial is not None else set()
+        super().__init__(
+            f"cascade upstream walk truncated: budget {budget} exhausted after "
+            f"{visited} node(s) with {remaining_queue} still queued"
+        )
 
 
 def _walk_cascade_upstream(
@@ -11130,7 +12487,8 @@ def _walk_cascade_upstream(
     *,
     collect_if,
     descend_if,
-    max_depth: int = 4096,
+    max_depth: int = _CASCADE_WALK_DEFAULT_BUDGET,
+    strict: bool = False,
 ) -> set:
     """Shared upstream (premise-direction) walk over ``CASCADE_RELATIONS``:
     follows each visited node's own outgoing cascade edges back toward its
@@ -11175,10 +12533,22 @@ def _walk_cascade_upstream(
     Python list is O(n) per dequeue. Fine at leaf-trace scale; worth
     revisiting (indexed deque, batched node lookups) if slice-3's
     ``ancestors(X)`` runs hot over large subgraphs.
+
+    **``max_depth`` is a node budget, not a depth limit, and exhausting it is
+    not the same as finishing (#2339).** Exhaustion = the budget ran out
+    while the queue still held a node NOT yet visited; a walk whose queue is
+    empty, or holds only already-visited duplicates (a diamond's second path
+    to a node), when the budget hits 0 is complete. A caller whose correctness needs
+    the COMPLETE set (``engram_revision._cascade_blocked``) passes
+    ``strict=True`` and gets ``CascadeWalkTruncated`` instead of a quietly
+    understated set. ``strict=False`` (the default, best-effort consumers)
+    keeps the historical return value but writes one line to stderr (never
+    stdout: MCP stdio) so the truncation is at least visible.
     """
     visited: set = set()
     queue = [node_id]
     collected: set = set()
+    budget = max_depth
 
     while queue and max_depth > 0:
         max_depth -= 1
@@ -11196,13 +12566,31 @@ def _walk_cascade_upstream(
         if not descend_if(node):
             continue
 
-        edges = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? "
-            f"AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
-            (current, *_CASCADE_RELATIONS_SORTED),
-        ).fetchall()
-        for e in edges:
-            queue.append(e["target_id"])
+        # live_only=False (#3542 ruling): this is a provenance traversal, not
+        # a cycle judge. The cascade frontier must see a pending ancestor
+        # through a superseded intermediate (test_cascade_frontier::
+        # test_transitive_catches_out_of_order_...). It terminates by its
+        # visited set and budget (#2339), not by liveness.
+        for _src, tgt, _rel in dag_edge_set(
+                conn, _CASCADE_RELATIONS_SORTED, live_only=False,
+                source_id=current):
+            queue.append(tgt)
+
+    # Truncated iff the budget is out AND the queue still holds a node never
+    # visited. Entries that are already-visited duplicates (a diamond's
+    # second path to a node) are a complete walk, not a truncated one.
+    unvisited_left = sum(1 for q in queue if q not in visited)
+    if unvisited_left:
+        if strict:
+            raise CascadeWalkTruncated(
+                len(visited), unvisited_left, budget, partial=collected
+            )
+        print(
+            f"[_walk_cascade_upstream] WARNING: node budget {budget} exhausted "
+            f"after {len(visited)} node(s) with {unvisited_left} unvisited still queued; "
+            f"the returned set is incomplete (#2339)",
+            file=sys.stderr,
+        )
 
     return collected
 
@@ -11323,23 +12711,31 @@ def model_id_to_lineage(model_id: str) -> str:
     family, compare against ``self_lineage``"): the gate stays a discipline,
     this helper only reads. Built on ``engram_trust._parse_model_id`` (not a
     second parser): a ``[...]`` suffix such as ``claude-opus-4-7[1m]`` is
-    stripped first, the parser must report a provider and a ``claude-`` family,
-    and the result must satisfy ``_LINEAGE_RE``. Fail-closed like
+    stripped first, the parser must report a provider and either a ``claude-``
+    family or an exact id in ``engram_trust._NON_CLAUDE_MODEL_TABLE`` (#3922,
+    e.g. ``gpt-6.1-sol`` -> ``openai:gpt``; no prefix/regex rule), and the
+    result must satisfy ``_LINEAGE_RE``. Fail-closed like
     ``_self_lineage()``: anything else is ``""``, never a guess.
     """
     if not isinstance(model_id, str):
         return ""
     # Lazy import: engram_trust imports engram_core at module level.
-    from engram_trust import _parse_model_id
+    from engram_trust import _NON_CLAUDE_MODEL_TABLE, _parse_model_id
 
     mid = re.sub(r"\[[^\]]*\]\s*$", "", model_id.strip()).strip()
     if not mid:
         return ""
     parsed = _parse_model_id(mid)
     family = parsed.get("family", "")
-    if not parsed.get("provider") or not family.startswith("claude-"):
+    if not parsed.get("provider"):
         return ""
-    value = f"{parsed['provider']}:{family[len('claude-'):]}"
+    if mid in _NON_CLAUDE_MODEL_TABLE:
+        # #3922: explicit supported-model table; family is already bare.
+        value = f"{parsed['provider']}:{family}"
+    elif family.startswith("claude-"):
+        value = f"{parsed['provider']}:{family[len('claude-'):]}"
+    else:
+        return ""
     return value if _LINEAGE_RE.fullmatch(value) else ""
 
 

@@ -1,5 +1,5 @@
 """Tests for WS3 (alpha #2574 epic #2013, issue #2574's hook-side telemetry
-resolver) -- docs/2574-telemetry-design.md §9 tests 1 and 3b, plus the gate
+resolver) -- docs/internal/2574-telemetry-design.md §9 tests 1 and 3b, plus the gate
 round-trip.
 
 Covers two structurally distinct targets, per the WS3 spec:
@@ -42,6 +42,9 @@ if str(SRC_ROOT) not in sys.path:
 
 import engram_log_emitter  # noqa: E402 -- shared module the hooks late-import Emitter from
 from tools import telemetry_manifest_gate  # noqa: E402
+
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
 
 
 # ---------------------------------------------------------------------------

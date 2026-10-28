@@ -50,6 +50,9 @@ STARTED = "2026-10-09T00:00:00+00:00"
 OLD = "2026-10-01T00:00:00+00:00"
 BUDGET = 9500  # claude-code's hard budget (_harness.HARNESS_BUDGETS)
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _ids(*nums, prefix="ob"):
     # built, never spelled: the repo's no-new-shipped-node-ids gate scans tests too

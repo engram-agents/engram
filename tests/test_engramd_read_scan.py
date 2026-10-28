@@ -495,14 +495,16 @@ _LINE_KEY = _re.compile(r":\d+$")
 # #3919 (M3): the study queue's three statements, tools/study_queue.py (reached from the root
 # `store_candidates`: the question/conjecture nodes, the live-node brief, the pending cascade nodes).
 # #2652 (tools-7): the one-row read of tools/inspect_raw.py:read_row (f37b0a78...).
+# #3941 (tools-8): the one current-lessons read of tools/lesson-pattern-audit.py:read_lesson_rows (1ce567fd...).
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "1ce567fd44516865b873f2446cffb547b5b6a78bd6525662a91c6fcb49b8790a",
     "1f0642346288d91dd8ece6a13066919a24df7fdc305f365332735f83a606fbc5",
     "4c297eed21620600e0366ba8d26aa74d052af13f9b2b449fbd82152edc7a21ff",
     "dff01272150b1be18634be6118c7082e02eede13b65b66e6ec90a90426db3213",
     "f37b0a7800a2cb0456683cb63b498d14c88d078aca4833d23107444d433c443d",
     "b3a2d1ab2b1a718bce83ce77bb8362f0b59d94677d8c9026e49a1e957ca06e97",
     "05bd2f3941a89717b037e9d113acd015bd2dec4851c13fb120af5d781e56fedc",
-    "c4c336fb9802f92e244bed1ab36b75acd83db33fc04a07015a3e9c344893a1d7",
+    "df2a043a09fecd8f84e186a0ad064e0f1ce209a75d7731f103dc47458eb405dd",
     "52fbda88135f730c72dd9b99a25b49a5bdca690ec6afd99d44f0110251a3974c",
     "5ae1d203ba0fc1fe6c359dffc2ee37c0be6d4b33cab8f8a8da24108c79c70d84",
     "0268e1aaf4c8ab7eb47f1f2727d2d8785bb56d5c155c532dd27e0c367894507e",
@@ -526,7 +528,14 @@ _FROZEN_TEMPLATE_KEYS = frozenset({
     "4795866d2d19b5085970ad79dd2705359930118747cd19d1ec6eb405627befb9",
     "49ac1236d8081aa987ee1eafa9b3f4f10e48249f3f4c29446b8be5c73bd20412",
     "5961b023ce8247394b6d859ca4d0959c3ae34d2e9be481a8fd726899c795ef8e",
-    "5ca245030193bc0e9811e8af365843b66ab4c4d999bbf2d13b79eabc0df37ee8",
+    # #3542: dag_edge_set's six fixed templates (live_only x filter); replaces the
+    # generalization_chain parent read 5ca24503... (now the live/target template).
+    "22897ccbda600c30894be5229ec07d812a7eac2d88169d52051096157f505cd3",
+    "48a7753209f6ac179505f3ac955bf00ed42a4b55c16b0fbe6aef1a81c710f4c4",
+    "63284cb7557117ca4923d3cf3f77dfaeaffa7b6dc889937f86890b9b38dbc198",
+    "85980984a9c48cb2fcc9b9b4f1e4495a5cec0a9818f6f95212bf9c503825779e",
+    "937e74dc33b2fc633f14c8dac8e35b4205852ef048846787374d3195a81f6d35",
+    "ca8b4ed636fff6ff5a852689b4eb0bfe6bbc730f98931ab0d6ef69285651d0a2",
     "6b93753474b01e7fc71620df964ee442e9b3b6a7c9d679d00c1b24c29c65b76e",
     "6fccf1c54a61e35899981e3f084277c3dbe091705d6609ab3abb46e73972551b",
     "9f6da2c7f988f5d2d40b7cdf6afe3d1fef5abb993b47a72b16fe9070cc0c3c05",

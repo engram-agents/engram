@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """tools/engramd_a6_latency.py -- the A6 latency-delta measurement for U4d
-(#3197, part of #2652; docs/2652-engrammanager-design.md SS6.1).
+(#3197, part of #2652; docs/internal/2652-engrammanager-design.md SS6.1).
 
 Measures the user-identity hook's person-node read two ways, in ONE run, on ONE
 store copy, on one host, at the same N:
@@ -17,15 +17,18 @@ live store (a --store that resolves to it is refused), never an echo server.
 Arms (each reports its OWN same-arm baseline; none is a gate, an arm where the
 owner loses is reported, not omitted):
   sequential   one client, warm, calls interleaved baseline/owner per iteration
-  contended    two client threads at once, each path measured separately
+  contended    two clients at once, each path measured separately. The function-level hooks fork two client
+               PROCESSES per phase (#3740: threads would share one GIL, real hook fires do not); the
+               phases run baseline, owner, owner, baseline and a path's row pools its two
   cold-cache   OS page cache for the store evicted (posix_fadvise DONTNEED)
                before every call. NOTE: the owner's own in-process SQLite page
                cache cannot be evicted by a client, so for the owner path this
                arm measures the held connection's benefit as much as "cold".
 
 Caveats printed with the table: function-level timings exclude interpreter
-start and imports (one per hook invocation either way); the contended arm's two
-client threads share one GIL, which affects both paths equally; the ratio does
+start and imports (one per hook invocation either way); the contended arm's clients
+are separate processes, as real hook fires are (before #3740 they were two threads sharing one GIL, which
+understated the owner's contended cost; function-level hook results without a `contended_clients` key are from that arm; session-start was never threaded); the ratio does
 not survive across SQLite builds (the doc shows this), so the build is named.
 
     python tools/engramd_a6_latency.py [--n 300] [--nodes 5000] [--people 5]
@@ -75,7 +78,7 @@ both modes: True = allow-list = opens with a frame in `engram_client.py` and the
 If no open is attributed to the calibration path on either path the arm RAISES (ArmBlind, "exclusion
 never engaged") instead of passing; so it does when a reader is not reached on a path, or a WARM fire
 prints a `waited N ms` notice. The gate cell is the INSTALLED layout's sequential p50 owner/baseline
-<= 1.0 on the production build; the contended and cold-cache arms and the COLD row (owner launched in
+<= 1.0 on the build the run used (named in its output: the build is a per-seat axis, #3740); the contended and cold-cache arms and the COLD row (owner launched in
 the same instant as the hook, --n-cold fires) are reported. Exit 3 on a contract violation.
 """
 from __future__ import annotations
@@ -83,6 +86,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import errno
 import importlib.util
 import io
 import json
@@ -90,8 +94,11 @@ import math
 import os
 import platform
 import re
+import select
 import shutil
+import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -99,6 +106,7 @@ import threading
 import time
 import traceback
 import uuid
+import weakref
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
 from typing import Callable, Dict, List, Optional
@@ -172,6 +180,7 @@ RUNTIME_FILES = {
     "engram_config_io.py": "src/engram/engram_config_io.py",
     "engram_pidfile.py": "src/engram/engram_pidfile.py",
     "engram_regular_io.py": "src/engram/engram_regular_io.py",
+    "engram_home_resolver.py": "src/engram/engram_home_resolver.py",  # #3863 step 2: engram_core, the client and the owner import it
     "engram_restamp.py": "src/engram/engram_restamp.py",
     # #3856: the shared person-moment cursor advance. The surface hook imports it at module level (and engramd_owner
     # imports it), so a fire in the installed layout loads it; without this entry the closure cell would flag it.
@@ -549,7 +558,9 @@ def make_test_store(nodes: int = 5000, people: int = 5, source: Optional[Path] =
     _ensure_src_importable()
     import engram_core
 
-    old = os.environ.get("ENGRAM_HOME")
+    # #3863 step 3c-iii: this is a save/restore around a test block, not a resolution. Snapshot the WHOLE environment
+    # and restore exactly that, so every key the block touches comes back and an ABSENT ENGRAM_HOME stays absent.
+    saved_env = dict(os.environ)
     os.environ["ENGRAM_HOME"] = str(home)
     try:
         conn = sqlite3.connect(str(db))
@@ -577,10 +588,8 @@ def make_test_store(nodes: int = 5000, people: int = 5, source: Optional[Path] =
         conn.commit()
         conn.close()
     finally:
-        if old is None:
-            os.environ.pop("ENGRAM_HOME", None)
-        else:
-            os.environ["ENGRAM_HOME"] = old
+        os.environ.clear()
+        os.environ.update(saved_env)
     return home
 
 
@@ -787,10 +796,19 @@ class _TripwireFire:
     def __init__(self, shared: _TripwireShared, name: str, config_path: Path) -> None:
         self.shared, self.name, self.config_path = shared, name, config_path
         self._local = threading.local()
+        self._process_tag: Optional[str] = None
         self.modules: List[object] = []
 
     def _tag(self) -> str:
-        return f"{self.name}-{threading.get_ident()}"
+        return f"{self.name}-{self._process_tag or threading.get_ident()}"
+
+    def rebind_for_process(self) -> None:
+        """Called by a forked contended-arm client BEFORE `prepare()` (#3740): a fresh thread-local (the parent's
+        loaded module and session are not this process's) and a tag that carries this process's pid, so its state,
+        ledger, prevention-ledger and probe paths and its session id differ from every sibling's and the parent's."""
+        self._local = threading.local()
+        self._process_tag = f"p{os.getpid()}"
+        self.modules = []
 
     def prepare(self):
         inst = getattr(self._local, "mod", None)
@@ -1619,13 +1637,12 @@ def _cold_row(rig: SessionStartRig, home: Path, n_cold: int, state: Dict) -> Dic
 # in-hook server runtime, the #3741 class), so no path pays a daemon or a fallback. Honest because the daemon is not
 # an owner read and sits on neither path's store access; a common cost removed makes the owner/baseline ratio LARGER.
 #
-# THE GATE CELL. The design's A6 gate is one warm-cache delta (docs/2652-engrammanager-design.md SS6.1), and the store
+# THE GATE CELL. The design's A6 gate is one warm-cache delta (docs/internal/2652-engrammanager-design.md SS6.1), and the store
 # axis flipped it on two hooks (the stop hook, #3675; the tripwire, #3740: 0.94x on a synthetic store, 1.03-1.04x on a
 # real copy). So the arm measures TWO cells -- a synthetic store and a COPY of a real store -- and the verdict is the
 # REAL-STORE cell on the INSTALLED layout; a synthetic-only result is never a pass (surface_gate).
 
 SURFACE_FLAG_KEY = "surface_reads_via_owner"
-SURFACE_EXPECTED_SQLITE = "3.53.0"          # the plugin venv's build the gate is stated for (SS6.1 axes); named, never assumed
 SURFACE_SESSION_ID = "a6-surface-session"
 SURFACE_PROMPT = "what is the plan for the engram owner reads today please"
 SURFACE_RECALL_NEEDLE = "[ENGRAM Recall:"   # the recall block the stub's answer renders into
@@ -1708,17 +1725,40 @@ class _SurfaceFire:
     def __init__(self, shared: _SurfaceShared, name: str, config_path: Path) -> None:
         self.shared, self.name, self.config_path = shared, name, config_path
         self._local = threading.local()
+        self._process_tag: Optional[str] = None
         self.modules: List[object] = []
+
+    def _tag(self) -> str:
+        return f"{self.name}-{self._process_tag or threading.get_ident()}"
+
+    def rebind_for_process(self) -> None:
+        """As `_TripwireFire.rebind_for_process` (#3740): a fresh thread-local and a pid-bearing tag for a forked
+        contended-arm client, so its session id differs from every sibling's and the parent's."""
+        self._local = threading.local()
+        self._process_tag = f"p{os.getpid()}"
+        self.modules = []
 
     def prepare(self):
         inst = getattr(self._local, "mod", None)
         if inst is None:
-            sh, tag = self.shared, f"{self.name}-{threading.get_ident()}"
+            sh, tag = self.shared, self._tag()
             mod = load_hook(sh.home, sh.hook_path, f"engram_surface_hook_a6_{tag}")
             _require_surface_flag(mod, sh.hook_path)
             mod.CONFIG_PATH = str(self.config_path)
             mod.query_daemon = lambda prompt, top_k=10, embed_query=None: STUB_DAEMON_RESULT   # the SAME stub on both paths
             sid = f"{SURFACE_SESSION_ID}-{tag}"   # one session per (path, thread): concurrent fires must not share state
+            self._local.state_dir = None
+            if self._process_tag is not None:
+                # a forked contended client (#3740): the per-fire state the hook READS (the prompt counter, the
+                # write-reminder marker and the surfaced-recency ledger) lives in this client's own directory, so a
+                # sibling's reset cannot delete it mid-fire. The write-only logs and pid-keyed telemetry stay
+                # where the hook puts them.
+                state_dir = sh.home / "a6-client-state" / tag
+                state_dir.mkdir(parents=True, exist_ok=True)
+                mod.COUNTER_PATH = str(state_dir / "prompt-counter.json")
+                mod.WRITE_REMINDER_PATH = str(state_dir / "write-reminder.json")
+                mod._surface_ledger_path = lambda: str(state_dir / "surface-ledger.json")
+                self._local.state_dir = state_dir
             self._local.payload = json.dumps({"session_id": sid, "transcript_path": "", "prompt": SURFACE_PROMPT})
             self._local.mod = inst = mod
             self.modules.append(mod)
@@ -1726,7 +1766,15 @@ class _SurfaceFire:
 
     def reset(self) -> None:
         self.prepare()
-        self.shared.clear_fire_state()
+        state_dir = self._local.state_dir
+        if state_dir is None:
+            self.shared.clear_fire_state()   # the parent's own fires: home-wide, as before
+            return
+        for p in state_dir.iterdir():   # a forked client clears ONLY its own state
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
 
     def __call__(self) -> str:
         mod, sh = self.prepare(), self.shared
@@ -1874,6 +1922,38 @@ def _is_gate_cell(r: Dict) -> bool:
     return r.get("layout") == GATE_LAYOUT and r.get("store_cell") == GATE_CELL
 
 
+TRIPWIRE_FLIP_RULE = (
+    "For `engramd.lesson_tripwire_reads_via_owner`: a seat flips only when (a) the installed-layout A6 tripwire "
+    "gate cell, on its OWN SQLite build with its OWN exclusion setting, reads sequential p50 owner/baseline <= 1.0 "
+    "in three runs, and (b) the process-level contended arm has been measured on that build and is reported beside "
+    "it, with the production overlap frequency still unmeasured. No fleet-wide flip; the flag's default stays OFF "
+    "(Kepler, #3740, 2026-10-25).")
+
+
+def per_seat_scope(sqlite_v: str, exclusion: Optional[bool] = None, flip_rule: bool = False,
+                   decides: bool = True) -> str:
+    """The factual sentence every verdict and gate line carries: the build (and, for the tripwire, the exclusion
+    setting) the run ACTUALLY used. The build is a per-seat axis, never a fleet constant; nothing here presumes
+    any one build. `decides=True` (the installed-layout block, the only cell that can decide) adds who the cell
+    decides for; `decides=False` (the SOURCE-checkout block, "a development-time number, NOT production") states
+    the run only and carries neither that clause nor the flip rule. `flip_rule=True` appends TRIPWIRE_FLIP_RULE,
+    which is Kepler's written 2026-10-25 ruling for the ONE flag `engramd.lesson_tripwire_reads_via_owner` and
+    nothing else: the user-identity, stop, surface and session-start flags have their own gates, and no flip rule
+    has been ruled for them, so only the tripwire's installed-layout output passes it. Pure."""
+    run = f"SQLite {sqlite_v}" + ("" if exclusion is None else f" with exclusion {'ON' if exclusion else 'OFF'}")
+    if not decides:
+        return f"This run: {run}."
+    seat = "a seat whose venv links that build" + ("" if exclusion is None else " and runs that exclusion setting")
+    text = f"This run: {run}. It decides only for {seat}."
+    return f"{text} {TRIPWIRE_FLIP_RULE}" if flip_rule else text
+
+
+def _decides(result: Dict) -> bool:
+    """True only for a result measured on the INSTALLED layout: the layout the block is for, read off the result
+    itself (set by `measure_in_layout`), never a global. A result with no layout decides for no seat."""
+    return result.get("layout") == GATE_LAYOUT
+
+
 def surface_gate(results: List[Dict]) -> Dict:
     """The A6 verdict for `--hook surface`. The GATE CELL is the REAL-STORE copy on the INSTALLED layout, sequential
     p50 owner/baseline <= 1.0. No other cell can decide it: a result without that cell is `NOT A PASS` whatever the
@@ -1909,11 +1989,9 @@ def surface_gate(results: List[Dict]) -> Dict:
                 "verdict": "SURFACE A6 VERDICT -- NO GATE CELL: the gate cell has no sequential rows. NOT A PASS."}
     passes = ratio <= 1.0
     sqlite_v = (gate.get("env") or {}).get("sqlite", "?")
-    build = (f"SQLite {sqlite_v}" if sqlite_v == SURFACE_EXPECTED_SQLITE else
-             f"SQLite {sqlite_v} (expected {SURFACE_EXPECTED_SQLITE}: the build is an axis, this verdict is for "
-             f"{sqlite_v} only)")
     verdict = (f"SURFACE A6 VERDICT -- GATE CELL = real-store copy, {GATE_LAYOUT} layout: sequential p50 "
-               f"owner/baseline = {ratio:.2f}x -> {'PASS (<= 1.0)' if passes else 'FAIL (> 1.0)'}; {build}.")
+               f"owner/baseline = {ratio:.2f}x -> {'PASS (<= 1.0)' if passes else 'FAIL (> 1.0)'}. "
+               f"{per_seat_scope(sqlite_v)}")
     if others:
         verdict += f" Reported, NOT the gate: {others}."
     return {"gate_cell_present": True, "passes": passes, "ratio": ratio, "verdict": verdict,
@@ -1962,6 +2040,223 @@ def _timed(fn: Callable[[], object], before: Optional[Callable[[], None]] = None
     t0 = time.perf_counter_ns()
     fn()
     return (time.perf_counter_ns() - t0) / 1e6
+
+
+# --- the contended arm: client PROCESSES (#3740) ------------------------------------------------
+#
+# Real hook fires are separate processes. The earlier arm drove two THREADS in one process, so both paths
+# shared one GIL; for the tripwire hook that slowed the baseline and hid the owner's real contended cost
+# (measured 2026-10-25: threads 1.10x, separate processes 1.42x). A phase now forks `clients` children behind a
+# start barrier; each times its own loop and returns the samples through a file in a per-phase temp dir.
+
+CONTENDED_CLIENTS = 2
+CONTENDED_PHASE_ORDER = ("baseline", "owner", "owner", "baseline")   # alternating: phase order is not an owner effect
+CONTENDED_TIMEOUT_S = 300.0
+_TRACEBACK_TAIL_LINES = 15
+
+
+_FORK_EXEMPT: "weakref.WeakSet[threading.Thread]" = weakref.WeakSet()
+
+
+def exempt_this_thread_from_fork_guard() -> None:
+    """Mark the CALLING thread as trusted to be alive while the contended arm forks, the fork-guard twin of
+    `exempt_this_thread_from_open_counting`. The one user is the tests' in-process fake owner (its accept and
+    handler threads); the real owner is a separate process. The guard stays in the path and names exactly
+    which threads are trusted; it is never switched off. Forking a parent that still has an exempted thread
+    alive can hang a child on a lock that thread held at fork time; in tests that is bounded by the phase's
+    `timeout_s` and fails loud. The registry is weak, so an exemption ends with its thread."""
+    _FORK_EXEMPT.add(threading.current_thread())
+
+
+def _contended_fork_guard() -> None:
+    """Refuse to fork unless it is safe: a multi-threaded parent is unsafe to fork (and macOS warns), and a
+    forked child's store opens never reach an open-counting window of the parent (today the windows live inside
+    the binders' sanity checks, never across the contended arm). Any live thread other than the main thread
+    that has not exempted itself (`exempt_this_thread_from_fork_guard`) refuses the fork."""
+    strangers = [t for t in threading.enumerate() if t is not threading.main_thread() and t not in _FORK_EXEMPT]
+    if strangers:
+        raise RuntimeError(f"refusing to fork the contended clients from a multi-threaded process "
+                           f"({len(strangers)} non-exempt threads alive: {[t.name for t in strangers]})")
+    if _ACTIVE_WINDOWS:
+        raise RuntimeError("refusing to fork the contended clients inside an open-counting window: a child's "
+                           "opens would never reach the count")
+
+
+def _contended_child(fn: Callable[[], object], reset: Optional[Callable[[], None]], n: int, k: int,
+                     tmp: str, ready_w: int, go_r: int) -> None:
+    """The body of ONE forked client; never returns (ends with os._exit, 0 on success, 1 on error, in a
+    `finally`, so the parent's atexit handlers and cleanups never run here). Writes nothing to fd 1."""
+    code = 1
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)   # the layout child's LAST stdout line is parsed as JSON: nothing may reach fd 1
+        sys.stdout = open(os.devnull, "w")   # ...nor a Python-level stream that is not fd 1 itself
+        rebind = getattr(fn, "rebind_for_process", None)
+        if rebind is not None:
+            rebind()          # a process-unique tag BEFORE prepare() loads this process's module
+        prepare = getattr(fn, "prepare", None)
+        if prepare is not None:
+            prepare()
+        if reset is not None:
+            reset()
+        fn()                  # one untimed fire: the first call of a process pays for imports
+        os.write(ready_w, b"r")
+        if os.read(go_r, 1) != b"g":
+            raise RuntimeError("the start barrier was abandoned by the parent")
+        lat: List[float] = []
+        t0 = time.monotonic()
+        for _ in range(n):
+            lat.append(_timed(fn, before=reset))
+        t1 = time.monotonic()
+        part = os.path.join(tmp, f"client-{k}.json.part")
+        with open(part, "w") as f:
+            json.dump({"lat": lat, "t0": t0, "t1": t1}, f)
+        os.replace(part, os.path.join(tmp, f"client-{k}.json"))
+        code = 0
+    except BaseException:
+        try:
+            with open(os.path.join(tmp, f"client-{k}.err"), "w") as f:
+                f.write(traceback.format_exc())
+        except BaseException:
+            pass
+    finally:
+        os._exit(code)
+
+
+def _describe_exit(status: int) -> str:
+    code = os.waitstatus_to_exitcode(status)
+    return f"was killed by signal {-code}" if code < 0 else f"exited with code {code}"
+
+
+def _contended_phase(fn: Callable[[], object], reset: Optional[Callable[[], None]], n: int,
+                     clients: int = CONTENDED_CLIENTS, timeout_s: float = CONTENDED_TIMEOUT_S,
+                     spans: Optional[List] = None) -> List[float]:
+    """One contended phase of ONE path: fork `clients` child processes, each timing `n` fires of `fn` (after
+    `reset`, untimed). Returns exactly `clients * n` samples or raises RuntimeError. A child first finishes its
+    untimed preparation (rebind_for_process / prepare / reset / one fire) and only when EVERY child has, the
+    parent releases them together (ready pipe + go pipe), so the clients really overlap. If `spans` is a list,
+    each child's (start, end) of its timed loop (time.monotonic, comparable across processes) is appended."""
+    if n < 1 or clients < 1:
+        raise ValueError("a contended phase needs n >= 1 and clients >= 1")
+    _contended_fork_guard()
+    tmp = tempfile.mkdtemp(prefix="a6-contended-")
+    ready_r, ready_w = os.pipe()
+    go_r, go_w = os.pipe()
+    pids: List[int] = []
+    status: Dict[int, int] = {}
+    deadline = time.monotonic() + timeout_s
+
+    def poll_children() -> None:
+        for pid in pids:
+            if pid not in status:
+                got, st = os.waitpid(pid, os.WNOHANG)
+                if got:
+                    status[pid] = st
+
+    def kill_and_reap() -> None:
+        for pid in pids:
+            if pid not in status:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        for pid in pids:
+            if pid not in status:
+                _, status[pid] = os.waitpid(pid, 0)
+
+    def child_error(k: int) -> str:
+        try:
+            tail = Path(tmp, f"client-{k}.err").read_text().strip().splitlines()[-_TRACEBACK_TAIL_LINES:]
+        except OSError:
+            return ""
+        return "\n" + "\n".join(tail)
+
+    def fail_on_bad_child() -> None:
+        for k, pid in enumerate(pids):
+            if pid in status and status[pid] != 0:
+                raise RuntimeError(f"contended client {k} (pid {pid}) {_describe_exit(status[pid])}"
+                                   + child_error(k))
+
+    try:
+        for k in range(clients):
+            pid = os.fork()
+            if pid == 0:
+                os.close(ready_r)
+                os.close(go_w)
+                _contended_child(fn, reset, n, k, tmp, ready_w, go_r)   # never returns
+            pids.append(pid)
+        # barrier: wait for every child's untimed preparation, watching for early deaths and the deadline
+        ready = 0
+        while ready < clients:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"contended phase timed out after {timeout_s} s while the clients were "
+                                   f"preparing ({ready}/{clients} ready)")
+            r, _, _ = select.select([ready_r], [], [], 0.05)
+            if r:
+                ready += len(os.read(ready_r, clients))
+            poll_children()
+            fail_on_bad_child()
+            if status and ready < clients:
+                raise RuntimeError("a contended client exited before the start barrier")
+        os.write(go_w, b"g" * clients)
+        # bounded wait for the timed loops
+        while len(status) < clients:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"contended phase timed out after {timeout_s} s "
+                                   f"({len(status)}/{clients} clients finished)")
+            poll_children()
+            fail_on_bad_child()
+            time.sleep(0.01)
+        out: List[float] = []
+        for k, pid in enumerate(pids):
+            res = Path(tmp, f"client-{k}.json")
+            if not res.is_file():
+                raise RuntimeError(f"contended client {k} (pid {pid}) exited 0 but wrote no result" + child_error(k))
+            data = json.loads(res.read_text())
+            if len(data["lat"]) != n:
+                raise RuntimeError(f"contended client {k} (pid {pid}) wrote {len(data['lat'])} of {n} samples")
+            out.extend(float(x) for x in data["lat"])
+            if spans is not None:
+                spans.append((data["t0"], data["t1"]))
+        return out
+    finally:
+        kill_and_reap()   # a no-op once every child is reaped; on any error or timeout: SIGKILL, reap, no zombie
+        for fd in (ready_r, ready_w, go_r, go_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _spans_overlap(spans: List) -> bool:
+    """True when EVERY pair of (start, end) spans overlaps, i.e. they share a common instant (for intervals the
+    two are the same statement). Touching spans do not overlap; no spans is not an overlap."""
+    return bool(spans) and max(s for s, _ in spans) < min(e for _, e in spans)
+
+
+def _contended_rows(baseline: Callable[[], object], owner: Callable[[], object],
+                    resets: Dict[int, Optional[Callable[[], None]]], n: int):
+    """The contended arm of a function-level hook: phases baseline, owner, owner, baseline, each `clients`
+    processes x ceil(n/2) timed fires, and a path's row pools its two phases (n=300 -> 600 samples per path).
+    Returns (rows, overlap): overlap maps each path to the FRACTION of its phases whose clients all overlapped in
+    time. It is reported, never gated: a phase that did not overlap raises nothing. It says whether the clients'
+    timed loops overlapped in time in THIS run; it is NOT the production overlap frequency."""
+    fns = {"baseline": baseline, "owner": owner}
+    per_client = math.ceil(n / 2)
+    pooled: Dict[str, List[float]] = {"baseline": [], "owner": []}
+    overlapped: Dict[str, List[bool]] = {"baseline": [], "owner": []}
+    for path in CONTENDED_PHASE_ORDER:
+        fn = fns[path]
+        spans: List = []
+        pooled[path] += _contended_phase(fn, resets[id(fn)], per_client, CONTENDED_CLIENTS, spans=spans)
+        overlapped[path].append(_spans_overlap(spans))
+    for path, lat in pooled.items():
+        owed = CONTENDED_CLIENTS * per_client * CONTENDED_PHASE_ORDER.count(path)   # per path: an unbalanced order stays correct
+        if len(lat) != owed:
+            raise RuntimeError(f"contended {path} holds {len(lat)} samples, owes {owed}")
+    rows = [_summarise("contended", path, pooled[path]) for path in ("baseline", "owner")]
+    return rows, {path: sum(flags) / len(flags) for path, flags in overlapped.items()}
 
 
 def _owner_command_line(pid: int) -> bytes:
@@ -2062,8 +2357,14 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
             o.append(_timed(owner, before=resets[id(owner)]))
         rows += [_summarise("sequential", "baseline", b), _summarise("sequential", "owner", o)]
 
-        # contended: two client threads at once, each path measured on its own
-        for path, fn in (("baseline", baseline), ("owner", owner)):
+        # contended: two clients at once, each path measured on its own. The function-level hooks fork client
+        # PROCESSES (#3740: two threads share one GIL, which real hook fires do not). The session-start arm already
+        # times fresh processes and keeps its thread-driven loop below, unchanged.
+        contended_overlap: Optional[Dict[str, float]] = None
+        if hook != "session-start":
+            contended_rows, contended_overlap = _contended_rows(baseline, owner, resets, n)
+            rows += contended_rows
+        for path, fn in (("baseline", baseline), ("owner", owner)) if hook == "session-start" else ():
             lat: List[float] = []
             lock = threading.Lock()
             barrier = threading.Barrier(2)
@@ -2131,6 +2432,9 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
             "cold_cache_evicts": _can_evict_page_cache(),
             "answers_match": answers_match, "answer_size": answer_size, **extra,
             "owner_pid": owner_pid,
+            # how the contended arm's clients ran; every number posted before #3740 was threads (no key)
+            **({"contended_clients": "process", "contended_overlap": contended_overlap}
+               if hook != "session-start" else {}),
             "owner_cmdline": owner_cmdline, "node_count": node_count,
             "owner_argv": owner_argv, "journal_mode": journal_mode,
             "db_bytes": db.stat().st_size,
@@ -2199,7 +2503,8 @@ def _session_start_header_lines(result: Dict) -> List[str]:
         f"readers reached OFF {len(result['readers_reached_off'])}/{len(SS_READERS)}, "
         f"ON {len(result['readers_reached_on'])}/{len(SS_READERS)}",
         f"GATE cell -- sequential p50 owner/baseline = {ratio:.3f}x "
-        f"({'<= 1.0: PASS' if ratio <= 1.0 else '> 1.0: FAIL'}; the merge seat's number is the production build's)",
+        f"({'<= 1.0: PASS' if ratio <= 1.0 else '> 1.0: FAIL'}). "
+        + per_seat_scope(result["env"]["sqlite"], decides=_decides(result)),
     ]
     if cold:
         lines.append(
@@ -2225,7 +2530,9 @@ def format_table(result: Dict) -> str:
            else f"{result['answer_size']} stdout bytes per fire" if (tripwire or session_start or surface)
            else f"{result['people_count']} person rows")
         + f" | N={result['n']} per path per arm "
-        f"(contended: 2 threads x N) after {result['warmup']} warm-up calls",
+        + ("(contended: 2 client threads, each firing a fresh process, x N)" if session_start
+           else "(contended: 2 client processes x ceil(N/2) fires x 2 alternating phases)")
+        + f" after {result['warmup']} warm-up calls",
         f"Real owner: pid {result['owner_pid']}, cmdline `{result['owner_cmdline'].strip()}`; "
         + ("owner count and muted decision == baseline: " if stop
            else "owner stdout == baseline stdout: " if (tripwire or surface)
@@ -2254,6 +2561,13 @@ def format_table(result: Dict) -> str:
             p50x = p99x = "-"
         lines.append(f"| {r['arm']} | {r['path']} | {r['p50_ms']:.3f} | {r['p99_ms']:.3f} | "
                      f"{r['mean_ms']:.3f} | {p50x} | {p99x} |")
+    overlap = result.get("contended_overlap") or {}
+    if any(v < 1.0 for v in overlap.values()):
+        lines += ["", "NOTE: the contended clients did not overlap in every phase (fraction of phases whose clients "
+                      "all overlapped: " + ", ".join(f"{p} {v:.2f}" for p, v in overlap.items())
+                  + "); reported, not gated. This reports only whether the contended clients' timed loops "
+                    "overlapped in time in THIS run; it is NOT the production overlap frequency. "
+                    "Read the contended rows with that in mind."]
     lines += [
         "",
         ("Notes: every value is the wall time of one FRESH process (interpreter start and imports INCLUDED; "
@@ -2261,7 +2575,7 @@ def format_table(result: Dict) -> str:
          "only; the owner's in-process SQLite cache stays warm. Ratios do not survive across SQLite builds."
          if session_start else
          "Notes: function-level timings (interpreter start and imports excluded; one per hook invocation "
-         "on either path). Contended threads share one GIL (both paths alike). Cold-cache evicts the OS "
+         "on either path). Contended clients are separate processes, as real hook fires are. Cold-cache evicts the OS "
          "page cache only; the owner's in-process SQLite cache stays warm. Ratios do not survive across "
          "SQLite builds. Owner path includes the per-call runtime-dir resolution and client round trip."),
     ]
@@ -2275,7 +2589,10 @@ def format_table(result: Dict) -> str:
             "store-read sites executing (baseline = engramd.lesson_tripwire_reads_via_owner OFF, direct "
             "opens; owner = flag ON, a real owner). The recall daemon's answer is a fixed stub at "
             "`_query_recall_daemon`, identical on both paths. Per-fire state files are reset between "
-            "fires (untimed). The contended arm runs a separate hook module per thread. "
+            "fires (untimed). The contended arm runs a separate hook module per process; the loader-notice stamp "
+            "and the lesson-ranks file stay shared across clients on purpose (two concurrent production fires "
+            "share those seat-wide files too); recall/probe sanity flags cover the warm-up, sequential and "
+            "cold-cache fires only. "
             "opens_flag_* count DIRECT opens of the store copy during one fire.")
     if surface:
         lines.append(
@@ -2283,9 +2600,9 @@ def format_table(result: Dict) -> str:
             f"(baseline = engramd.{SURFACE_FLAG_KEY} OFF, direct opens; owner = flag ON, a real owner). The recall "
             "daemon's answer is a fixed stub at `query_daemon`, identical on both paths, so neither path takes the "
             "in-hook FTS fallback. Per-fire state files are cleared between fires (untimed). The contended arm runs a "
-            "separate hook module per thread. opens_flag_* count DIRECT opens of the store copy during one fire; the "
-            "flag-ON allow-list is the person-moment cursor write (the named remainder) and nothing else. GATE (the "
-            f"merge seat runs it on the production build, SQLite {SURFACE_EXPECTED_SQLITE}): the REAL-STORE copy on "
+            "separate hook module per process, each with its own per-fire state directory; recall/probe sanity "
+            "flags cover the warm-up, sequential and cold-cache fires only. opens_flag_* count DIRECT opens of the store copy during one fire; the "
+            "flag-ON allow-list is the person-moment cursor write (the named remainder) and nothing else. GATE: the REAL-STORE copy on "
             "the INSTALLED layout, sequential p50 owner/baseline <= 1.0; a synthetic store is reported but never "
             "decides. The contended and cold-cache arms are owed measurements, reported not gated; an arm the owner "
             "loses is a stated finding.")
@@ -2303,8 +2620,7 @@ def format_table(result: Dict) -> str:
             f"#3741 migrated it); now CALIBRATION_STILL_OPENS={CALIBRATION_STILL_OPENS}, so the allow-list is "
             "empty and the gate is opens_flag_on == 0; flag-OFF calibration opens are counted, never gated "
             "on their value. The COLD row is reported, not a gate: the owner launcher and the hook start in the "
-            "same instant, with the wait read from the hook's own notice. GATE (the merge seat runs it on the "
-            "production build): sequential p50 owner/baseline <= 1.0; every other row is reported.")
+            "same instant, with the wait read from the hook's own notice. GATE: sequential p50 owner/baseline <= 1.0; every other row is reported.")
     if stop:
         lines.append(
             "Stop hook (U6a, #3664): both paths are timed through the hook's own `_maturity_muted()` "
@@ -2312,14 +2628,89 @@ def format_table(result: Dict) -> str:
             "engramd_client.read); the threshold read is common to both. The gate is the "
             "sequential arm only; the contended and cold-cache arms are reported, not gates, and "
             "their Linux-seat numbers are owed in the PR body.")
+    # the build (and the tripwire's exclusion setting) THIS run used, and who it decides for: one sentence, one source
+    lines.append(per_seat_scope(env["sqlite"], result["exclusion"] if tripwire else None, flip_rule=tripwire,
+                                decides=_decides(result)))
     return "\n".join(lines)
 
 
 # --- CLI -------------------------------------------------------------------------
 
-def _is_live_store(path: Path) -> bool:
-    live = {Path(os.environ.get("ENGRAM_HOME") or (Path.home() / ".engram")) / "knowledge.db",
-            Path.home() / ".engram" / "knowledge.db"}
+def _load_owner_read():
+    """The shared owner-read helper (tools/_owner_read.py), the ONE ENGRAM_HOME definition (#3863). The repo root is
+    appended to sys.path (never inserted, #2565) so `tools` resolves as it does under pytest."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.append(str(REPO_ROOT))
+    from tools import _owner_read as owner_read
+    return owner_read
+
+
+def _check_store_arg(path: Path) -> Optional[str]:
+    """The `--store` precheck (#3962): None for a usable store, else the classifier's one-line message.  It runs
+    BEFORE `_is_live_store` (whose `Path.resolve()` raises on a symlink loop) and before any build, layout child or
+    temp dir; a FIFO would otherwise hang the child's `mode=ro` connect.  The repo root is appended to sys.path
+    (never inserted, #2565) so `tools` resolves as it does under pytest."""
+    owner_read = _load_owner_read()
+    try:
+        owner_read.check_store_path(path)
+    except (FileNotFoundError, owner_read.StoreUnusable) as exc:
+        return str(exc)
+    return None
+
+
+#: The errnos `pathlib.Path.is_file()` swallows, answering False; every other OSError propagates out of it.
+#: Measured on this seat's Python 3.12.3 against `pathlib._IGNORED_ERRNOS` (ENOENT, ENOTDIR, EBADF, ELOOP), and
+#: spelled out here rather than imported because that symbol is private.  `_classify_real_store` uses it to keep
+#: the pre-#4009 message for every errno, so the fix is a no-op on 3.12 except for the interpreter that never had
+#: the bug, and only the 3.14 answer changes.
+_IS_FILE_IGNORED_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
+def _classify_real_store(path: Path) -> Optional[str]:
+    """The `--real-store` precheck (#4009): None when `path` is a usable regular file, else the exact one-line
+    message the CLI refuses with.  It classifies with `os.stat` (which follows symlinks, as `Path.is_file()`
+    did) and consults the EXCEPTION TYPE only -- it never calls `Path.is_file()`, whose answer differs by
+    interpreter: 3.12 raises PermissionError on an unsearchable parent while 3.14 returns False, so a check
+    built on result-or-raise would refuse 3.12 with the classifier line and 3.14 with "is not a file".
+
+      OSError in _IS_FILE_IGNORED_ERRNOS (ENOENT, ENOTDIR,
+        EBADF, ELOOP -- a missing path, a non-directory
+        parent, a dangling symlink, a symlink loop)      the existing "is not a file ... Name one with" line
+      any other OSError (EACCES from an unsearchable
+        parent, ENAMETOOLONG, EIO, ESTALE, ...)          the classifier's message (`EACCES: Permission denied`)
+      stat ok, not S_ISREG (FIFO, directory, ...)        the same "is not a file" line
+      stat ok, S_ISREG                                   None -- the run proceeds to make_test_store
+
+    The errno boundary is `Path.is_file()`'s own: it swallowed exactly those four and raised for the rest, so
+    this classification reproduces the pre-#4009 message for every errno while answering the same way on every
+    interpreter.  `os.stat` follows symlinks, as `is_file()` did.
+    """
+    not_a_file = (f"engramd_a6_latency: error -- the real-store source {path} is not a file; the real-store "
+                  "copy is the GATE cell. Name one with --real-store PATH (or --no-real-store for a synthetic-only "
+                  "run, which is never a pass).")
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        # `Path.is_file()` IGNORED exactly _IS_FILE_IGNORED_ERRNOS (it answered False) and RAISED every other
+        # OSError.  Mirror that boundary rather than "any OSError": then this fix changes behaviour on NO
+        # interpreter, including for the errnos it never ignored -- ENAMETOOLONG, EIO, ESTALE -- which keep the
+        # classifier's "cannot check …; fix the path" line instead of degrading to "is not a file".  EACCES is
+        # an OSError (a PermissionError) and is NOT in the ignored set, so it also lands in the classifier
+        # branch: that is the 3.14 case this fix exists for.
+        if exc.errno in _IS_FILE_IGNORED_ERRNOS:
+            return not_a_file
+        return f"engramd_a6_latency: error -- {_check_store_arg(path) or f'cannot check {path}'}"
+    if not stat.S_ISREG(st.st_mode):
+        return not_a_file
+    return None
+
+
+def _is_live_store(path: Path, home: Optional[Path] = None) -> bool:
+    """`home` is this seat's resolved ENGRAM_HOME; omitted, it is resolved here (a relative value raises ValueError,
+    which main() has already turned into its refusal before it gets this far)."""
+    if home is None:
+        home = _load_owner_read().engram_home()
+    live = {home / "knowledge.db", Path.home() / ".engram" / "knowledge.db"}
     target = path.resolve()
     return any(target == p.resolve() for p in live)
 
@@ -2379,10 +2770,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.error("--real-store and --no-real-store are mutually exclusive")
     if args.layout_child:
         return _layout_child(args.layout_child, args.child_kwargs)
+    # The two entry paths that read ENGRAM_HOME: --store (is it this seat's live store?) and --hook surface without
+    # --real-store (the real-store source defaults to the home's store). A RELATIVE value is refused here, before any
+    # other action of the run (#3863); a run that reads neither path never consults the variable.
+    home = None
+    if args.store is not None or (args.hook == "surface" and not args.no_real_store and not args.real_store):
+        try:
+            home = _load_owner_read().engram_home()
+        except ValueError as exc:
+            print(f"engramd_a6_latency: error -- {exc}", file=sys.stderr)
+            return 2
     if args.n < N_FLOOR:
         print(f"engramd_a6_latency: error -- N must be >= {N_FLOOR} (got {args.n})", file=sys.stderr)
         return 2
-    if args.store is not None and _is_live_store(args.store):
+    if args.store is not None:
+        store_problem = _check_store_arg(args.store)
+        if store_problem is not None:
+            print(f"engramd_a6_latency: error -- {store_problem}", file=sys.stderr)
+            return 2
+    if args.store is not None and _is_live_store(args.store, home):
         print(f"engramd_a6_latency: error -- {args.store} is this seat's live store; "
               "refusing. Pass a COPY of a test store.", file=sys.stderr)
         return 2
@@ -2397,12 +2803,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.hook == "surface":
         cells = [("synthetic", None)]
         if not args.no_real_store:
-            real_src = args.real_store or (Path(os.environ.get("ENGRAM_HOME") or (Path.home() / ".engram"))
-                                           / "knowledge.db")
-            if not real_src.is_file():
-                print(f"engramd_a6_latency: error -- the real-store source {real_src} is not a file; the real-store "
-                      "copy is the GATE cell. Name one with --real-store PATH (or --no-real-store for a synthetic-only "
-                      "run, which is never a pass).", file=sys.stderr)
+            real_src = args.real_store or (home / "knowledge.db")
+            real_problem = _classify_real_store(real_src)
+            if real_problem is not None:
+                print(real_problem, file=sys.stderr)
                 return 2
             real_home = make_test_store(source=real_src)   # a consistent read-only backup copy; the source is only read
             cells.append(("real-store", real_home / "knowledge.db"))

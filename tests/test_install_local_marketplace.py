@@ -19,13 +19,36 @@ DEPLOY_TAG_INIT = REPO_ROOT / "src" / "build" / "engine" / "__init__.py"
 DEPLOY_TAG_MODULE = REPO_ROOT / "src" / "build" / "engine" / "deploy_tag.py"
 
 
+def _login_home_path(tmp_path):
+    """Where a test's login HOME lives (not created). The one place the formula is written."""
+    # a SIBLING of ENGRAM_HOME: some tests need ENGRAM_HOME itself to not exist yet
+    return tmp_path.parent / (tmp_path.name + "-login-home")
+
+
 def _login_home(tmp_path):
     """A temp login HOME. The venv is always $HOME/.engram/venv, whatever ENGRAM_HOME is
     (Borges' ruling on #3863), so the installer must never see the real HOME's venv."""
-    # a SIBLING of ENGRAM_HOME: some tests need ENGRAM_HOME itself to not exist yet
-    home = tmp_path.parent / (tmp_path.name + "-login-home")
+    home = _login_home_path(tmp_path)
     home.mkdir(parents=True, exist_ok=True)
     return home
+
+
+def _login_home_guard(tmp_path):
+    """Remove the sibling login home before and after a test (#3966).
+
+    The sibling is not pytest's, so pytest never deletes it. Under
+    `-o tmp_path_retention_policy=failed` a passing test's tmp_path IS deleted and its number
+    reused by the next test whose name truncates to the same prefix, while the old sibling
+    survives holding .engram/venv/bin, and the next _fake_venv() mkdir raises FileExistsError.
+    """
+    shutil.rmtree(_login_home_path(tmp_path), ignore_errors=True)
+    yield
+    shutil.rmtree(_login_home_path(tmp_path), ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_login_home(tmp_path):
+    yield from _login_home_guard(tmp_path)
 
 
 def _env(tmp_path, **overrides):
@@ -2158,3 +2181,460 @@ def test_install_local_marketplace_looks_for_the_venv_under_home_not_under_engra
     assert f"Provisioning venv at {_login_home(tmp_path)}/.engram/venv" in result.stdout
     assert "-m pip install --quiet -r" in real_log.read_text()
     assert not decoy_log.exists(), "the installer used a venv under ENGRAM_HOME"
+
+
+# --- login-home isolation (#3966) -------------------------------------------------------
+# These cells drive _login_home_guard() directly instead of leaning on two tests running one
+# after the other: test order is not stable under pytest-xdist, and a cell that only fails
+# when a particular earlier test happened to run first is not a control. Driving the guard
+# by hand plants the stale sibling itself, so the result is the same on every run.
+
+
+def _plant_stale_venv(tmp_path):
+    stale = _login_home_path(tmp_path) / ".engram" / "venv" / "bin"
+    stale.mkdir(parents=True)
+    (stale / "python").write_text("stale")
+    return stale
+
+
+def test_login_home_guard_removes_a_stale_sibling_before_the_body(tmp_path):
+    """Pre-clean half: a sibling left by an earlier test that held this same tmp_path number
+    (tmp_path_retention_policy=failed deletes passing tmp_paths but not their siblings)."""
+    stale = _plant_stale_venv(tmp_path)
+    guard = _login_home_guard(tmp_path)
+    next(guard)  # the point where the test body would run
+    assert not stale.exists()
+    assert not _login_home_path(tmp_path).exists()
+    guard.close()
+
+
+def test_login_home_guard_removes_the_sibling_after_the_body(tmp_path):
+    """Post-clean half: what the body created must not outlive the test."""
+    guard = _login_home_guard(tmp_path)
+    next(guard)
+    stale = _plant_stale_venv(tmp_path)  # what a _fake_venv caller leaves behind
+    with pytest.raises(StopIteration):
+        next(guard)
+    assert not stale.exists()
+    assert not _login_home_path(tmp_path).exists()
+
+
+def test_login_home_guard_is_wired_as_an_autouse_fixture(request):
+    assert "_isolate_login_home" in request.fixturenames
+
+
+def test_fake_venv_mkdir_stays_strict(tmp_path):
+    """_fake_venv must keep failing loudly on a leaked venv, not paper over it (#3966)."""
+    log = tmp_path / "log"
+    _fake_venv(tmp_path, log)
+    with pytest.raises(FileExistsError):
+        _fake_venv(tmp_path, log)
+
+
+def test_installer_runs_the_stale_process_check_informationally_after_the_version_stamp():
+    """#3938.  Grep-level structural cell (it does not run the installer): the stale-process block
+    exists after the `.deployed-version` write, runs the tool with --informational inside an `if !`
+    guard so a non-zero exit (a broken tool is exit 4) cannot abort the install under `set -e`
+    (the pipeline is the guard's condition, and pipefail is on), and finds the tool through the
+    script's own location rather than a fixed path."""
+    text = INSTALLER.read_text()
+    stamp = text.index('> "$ENGRAM_HOME/.deployed-version"')
+    block_start = text.index("check_stale_processes.py", stamp)
+    assert block_start > stamp
+    assert re.search(r"^set -euo pipefail$", text, re.M)
+    assert re.search(r'^_stale_tool="\$\(dirname "\$_self"\)/check_stale_processes\.py"$', text, re.M)
+    assert text.index('_stale_tool="$(dirname "$_self")') > stamp
+    run = [ln for ln in text[stamp:].splitlines() if 'python3 "$_stale_tool"' in ln]
+    assert len(run) == 1, run
+    assert run[0].lstrip().startswith("if ! ")
+    assert "--informational" in run[0]
+    assert 'WARNING: check_stale_processes.py could not run' in text[stamp:]
+
+
+# ── #4099: an unreadable checkout fails loudly, never silently ───────────────
+#
+# `REPO_ROOT="$(git ... rev-parse --show-toplevel 2>/dev/null)"` used to exit the
+# script under `set -e` with git's own status (128) and NO output when git refused
+# the checkout (e.g. "detected dubious ownership"), before the guard on the next
+# line could print anything.
+
+_DUBIOUS_TEXT = (
+    "fatal: detected dubious ownership in repository at '{path}'\n"
+    "To add an exception for this directory, call:\n\n"
+    "\tgit config --global --add safe.directory {path}\n"
+)
+
+
+def _fake_git_failing_toplevel(tmp_path, stderr_text, *, exit_code=128):
+    """A `git` shim that fails `rev-parse --show-toplevel` and passes everything else
+    to the real git. Returns the PATH value to run the installer under."""
+    real_git = shutil.which("git")
+    shim_dir = tmp_path / "fake-git-bin"
+    shim_dir.mkdir()
+    text_file = tmp_path / "fake-git-stderr.txt"
+    text_file.write_text(stderr_text)
+    shim = shim_dir / "git"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do\n'
+        '  if [ "$a" = "--show-toplevel" ]; then\n'
+        f'    cat "{text_file}" >&2\n'
+        f"    exit {exit_code}\n"
+        "  fi\n"
+        "done\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
+def _run_with_failing_toplevel(tmp_path, stderr_text):
+    repo = _make_scratch_repo(tmp_path)
+    engram_home = tmp_path / "engram-home"
+    path = _fake_git_failing_toplevel(tmp_path, stderr_text.replace("{path}", str(repo)))
+    result = _run_scratch_installer(
+        repo, engram_home, extra_env={"PATH": path},
+        extra_args=("--allow-branch", "--allow-untagged"),
+    )
+    return repo, result
+
+
+def test_unresolvable_repo_root_exits_one_with_message(tmp_path):
+    """C1: git failing on --show-toplevel exits 1 (not 128) with a loud stderr line."""
+    _, result = _run_with_failing_toplevel(tmp_path, _DUBIOUS_TEXT)
+
+    assert result.returncode == 1, (result.returncode, result.stderr)
+    assert "could not resolve repo root" in result.stderr
+
+
+def test_unresolvable_repo_root_carries_git_stderr_and_safe_directory_remedy(tmp_path):
+    """C2: git's own stderr is shown, and a dubious-ownership refusal names the remedy
+    with the actual checkout path."""
+    repo, result = _run_with_failing_toplevel(tmp_path, _DUBIOUS_TEXT)
+
+    assert "detected dubious ownership" in result.stderr  # git's text, not swallowed
+    assert f"git config --global --add safe.directory '{repo}'" in result.stderr
+
+
+def test_unresolvable_repo_root_without_dubious_ownership_has_no_remedy(tmp_path):
+    """C2 (negative): a different git failure still gets git's text and exit 1, but is
+    not told to run a safe.directory command that would not help."""
+    _, result = _run_with_failing_toplevel(tmp_path, "fatal: some other git failure\n")
+
+    assert result.returncode == 1
+    assert "could not resolve repo root" in result.stderr
+    assert "some other git failure" in result.stderr
+    assert "safe.directory" not in result.stderr
+
+
+def test_resolvable_repo_root_is_unchanged(tmp_path):
+    """C3: with a working git, the repo root resolves and the install proceeds past it."""
+    repo = _make_scratch_repo(tmp_path)
+    result = _run_scratch_installer(
+        repo, tmp_path / "engram-home", extra_args=("--allow-branch", "--allow-untagged")
+    )
+
+    assert "could not resolve repo root" not in result.stderr
+    assert "safe.directory" not in result.stderr
+
+
+# ── #4100: a missing config.json is the fresh-install default, a broken one fails ──
+
+
+def _run_skip_build_no_check(tmp_path):
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    return subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+
+def test_venv_block_missing_config_json_uses_fresh_install_default(tmp_path):
+    """C4: venv present + no config.json -> convenience / single-agent, one log line,
+    no exit 1 from this block, and the block reached pip with the default tier."""
+    assert not (tmp_path / "config.json").exists()
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_skip_build_no_check(tmp_path)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "failed to parse" not in result.stderr
+    notes = [ln for ln in result.stdout.splitlines() if "does not exist yet" in ln]
+    assert len(notes) == 1, result.stdout
+    assert "config.json" in notes[0] and "fresh-install default" in notes[0]
+    assert "Provisioning venv at" in result.stdout
+    assert "tier: convenience" in result.stdout
+    calls = log_file.read_text()
+    assert "requirements/requirements.txt" in calls
+    assert "requirements-dev.txt" not in calls  # not tier dev
+    assert "src/forum/requirements.txt" not in calls  # not multi-agent
+
+
+@pytest.mark.parametrize("content", ["{not valid json", "", json.dumps({"install_tier": 0})])
+def test_venv_block_malformed_config_json_still_fails_loud(tmp_path, content):
+    """C5: a present-but-broken config.json still exits 1 with the existing message
+    (the #2951/#2965 contract is not weakened by C4)."""
+    (tmp_path / "config.json").write_text(content)
+    _fake_venv(tmp_path, tmp_path / "venv-calls.log")
+
+    result = _run_skip_build_no_check(tmp_path)
+
+    assert result.returncode == 1
+    assert "failed to parse" in result.stderr
+    assert "does not exist yet" not in result.stdout
+
+
+def test_venv_block_config_json_is_directory_still_fails_loud(tmp_path):
+    """C5b: a config.json that is a DIRECTORY is present, not missing: the
+    fresh-install default applies only when nothing exists at the path."""
+    (tmp_path / "config.json").mkdir()
+    _fake_venv(tmp_path, tmp_path / "venv-calls.log")
+
+    result = _run_skip_build_no_check(tmp_path)
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "failed to parse" in result.stderr
+    assert "does not exist yet" not in result.stdout
+
+
+def test_venv_block_config_json_dangling_symlink_still_fails_loud(tmp_path):
+    """C5c: a DANGLING symlink config.json is present (a link exists), not missing."""
+    (tmp_path / "config.json").symlink_to(tmp_path / "no-such-target.json")
+    assert not (tmp_path / "config.json").exists()
+    _fake_venv(tmp_path, tmp_path / "venv-calls.log")
+
+    result = _run_skip_build_no_check(tmp_path)
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "failed to parse" in result.stderr
+    assert "does not exist yet" not in result.stdout
+
+
+def test_venv_block_absent_venv_with_missing_config_is_skipped(tmp_path):
+    """C6: no venv -> the block is skipped (no note, no provisioning), as before."""
+    assert not (tmp_path / "config.json").exists()
+
+    result = _run_skip_build_no_check(tmp_path)
+
+    assert result.returncode == 0
+    assert "Provisioning venv at" not in result.stdout
+    assert "does not exist yet" not in result.stdout
+
+
+# ── #4103: the tier-aware venv block pre-warms the embedding model ───────────
+#
+# Contract (slice 2 spec, A1-A6). The pre-warm calls the RUNTIME's own load path
+# from the just-assembled plugin tree (engram_core._embedder._load_model; model name
+# from engram_core._get_embedding_config), decides "already cached" with the server's
+# own predicate (server._embedding_cache_status), and never carries a model string of
+# its own. These cells run the real snippet under a real python against a FAKE plugin
+# tree (fake server.py / engram_core.py), so no network and no real model.
+
+_FAKE_SERVER_PY = '''\
+import os
+def _cache_root():
+    return os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+def _embedding_cache_status(model_name):
+    return os.path.exists(os.path.join(_cache_root(), "cached-" + model_name.replace("/", "_")))
+def _looks_like_local_model_path(model_name):
+    return os.path.isabs(model_name) or model_name.count("/") > 1
+'''
+
+_FAKE_CORE_PY = '''\
+import json, os
+DEFAULT_EMBEDDING_MODEL = "fake-default-model"
+def _get_embedding_config():
+    path = os.path.join(os.environ["ENGRAM_HOME"], "config.json")
+    try:
+        with open(path) as f:
+            return json.load(f).get("embedding", {"model": DEFAULT_EMBEDDING_MODEL})
+    except OSError:
+        return {"model": DEFAULT_EMBEDDING_MODEL}
+class _Embedder:
+    def __init__(self):
+        self._model = None
+    def _load_model(self, model_name):
+        with open(os.environ["FAKE_LOAD_LOG"], "a") as f:
+            f.write(model_name + "\\n")
+        if os.environ.get("FAKE_DOWNLOAD_FAIL"):
+            return
+        if os.environ.get("FAKE_LOAD_NOFILL"):
+            # the loader "succeeds" but fills a cache the server's predicate does not read
+            self._model = object()
+            return
+        root = os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        os.makedirs(root, exist_ok=True)
+        open(os.path.join(root, "cached-" + model_name.replace("/", "_")), "w").close()
+        self._model = object()
+_embedder = _Embedder()
+'''
+
+
+def _prewarm_venv(tmp_path, log_file, *, pip_rc=0):
+    """A venv python for the pre-warm cells: pip calls are logged no-ops (exit pip_rc);
+    anything else (the pre-warm snippet) runs under the real interpreter, stdin and all."""
+    venv_bin = _login_home(tmp_path) / ".engram" / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    fake_py = venv_bin / "python"
+    fake_py.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{log_file}"\n'
+        f'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then exit {pip_rc}; fi\n'
+        f'exec "{sys.executable}" "$@"\n'
+    )
+    fake_py.chmod(0o755)
+    return fake_py
+
+
+def _run_prewarm(tmp_path, *, config=None, env_extra=None, pip_rc=0, with_venv=True):
+    """Run the installer (--skip-build) against a fake plugin tree that carries the fake
+    server/core. Returns (CompletedProcess, load_log Path)."""
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    (build_root / "server.py").write_text(_FAKE_SERVER_PY)
+    (build_root / "engram_core.py").write_text(_FAKE_CORE_PY)
+    (tmp_path / "config.json").write_text(
+        json.dumps(config if config is not None else {"install_tier": "convenience"})
+    )
+    calls = tmp_path / "venv-calls.log"
+    load_log = tmp_path / "load.log"
+    if with_venv:
+        _prewarm_venv(tmp_path, calls, pip_rc=pip_rc)
+    extra = {"FAKE_LOAD_LOG": load_log, "HF_HOME": tmp_path / "hf-home"}
+    extra.update(env_extra or {})
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root, **extra),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    return result, load_log
+
+
+def _prewarm_lines(result):
+    return [ln for ln in (result.stdout + result.stderr).splitlines() if "pre-warm:" in ln]
+
+
+def test_prewarm_already_cached_logs_one_line_and_does_not_download(tmp_path):
+    """A2: cached by the server's predicate -> one 'already cached' line, no load call."""
+    hf = tmp_path / "hf-home"
+    hf.mkdir()
+    (hf / "cached-fake-default-model").write_text("")
+
+    result, load_log = _run_prewarm(tmp_path)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    lines = _prewarm_lines(result)
+    assert len(lines) == 1 and "pre-warm: fake-default-model already cached" in lines[0], lines
+    assert str(hf / "hub") in lines[0], lines  # the cache dir the check used is printed
+    assert not load_log.exists(), "a cached model must not be loaded/downloaded again"
+
+
+def test_prewarm_cache_dir_in_the_lines_follows_hf_hub_cache_first(tmp_path):
+    """The printed cache dir uses the precedence HF_HUB_CACHE > HF_HOME/hub."""
+    hub = tmp_path / "explicit-hub"
+    result, _ = _run_prewarm(tmp_path, env_extra={"HF_HUB_CACHE": hub})
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    lines = _prewarm_lines(result)
+    assert len(lines) == 1 and "downloaded to " + str(hub) in lines[0], lines
+    assert str(tmp_path / "hf-home" / "hub") not in lines[0], lines
+
+
+def test_prewarm_downloads_through_the_runtime_load_path_when_not_cached(tmp_path):
+    """A3 success: not cached -> the runtime's _load_model is called with the model name
+    from the runtime's own config reader (A1: the installer carries no model string)."""
+    result, load_log = _run_prewarm(
+        tmp_path, config={"install_tier": "convenience", "embedding": {"model": "org/custom-model"}}
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert load_log.read_text().splitlines() == ["org/custom-model"]
+    lines = _prewarm_lines(result)
+    assert len(lines) == 1 and "pre-warm: org/custom-model" in lines[0], lines
+
+
+def test_prewarm_falls_back_to_the_runtime_default_model_when_config_names_none(tmp_path):
+    """A1: with no embedding.model in config the name is the runtime's DEFAULT, not an installer literal."""
+    result, load_log = _run_prewarm(tmp_path)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert load_log.read_text().splitlines() == ["fake-default-model"]
+
+
+def test_prewarm_failure_exits_nonzero_naming_model_cache_dir_and_remedy(tmp_path):
+    """A3 failure: offline / HF error -> install exits non-zero (via _venv_fail), message
+    names the model, the cache dir it tried, and the exact one-line remedy."""
+    result, _ = _run_prewarm(tmp_path, env_extra={"FAKE_DOWNLOAD_FAIL": "1"})
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "fake-default-model" in out
+    assert str(tmp_path / "hf-home") in out  # the cache dir it tried (HF_HOME honoured)
+    assert "SentenceTransformer('fake-default-model')" in out  # the remedy command
+    assert str(_login_home(tmp_path) / ".engram" / "venv" / "bin" / "python") in out
+    assert "ERROR: venv runtime-requirements provisioning failed" in out  # the _venv_fail trap ran
+
+
+def test_prewarm_fails_when_the_model_loaded_but_the_server_predicate_is_still_false(tmp_path):
+    """The success test is the SERVER's predicate after the load, not the loader's own
+    _model: a load that fills a cache the server does not read (e.g. SENTENCE_TRANSFORMERS_HOME)
+    exits non-zero with the same failure message plus a sentence saying so."""
+    result, load_log = _run_prewarm(tmp_path, env_extra={"FAKE_LOAD_NOFILL": "1"})
+
+    out = result.stdout + result.stderr
+    assert load_log.exists(), "the loader must have been called"
+    assert result.returncode != 0, out
+    assert "downloaded to" not in out, out
+    assert "fake-default-model" in out
+    assert str(tmp_path / "hf-home") in out  # the cache dir tried
+    assert "SentenceTransformer('fake-default-model')" in out  # the remedy
+    assert "loaded but is not where the server looks" in out
+    assert "ERROR: venv runtime-requirements provisioning failed" in out  # the _venv_fail trap ran
+
+
+def test_prewarm_honours_hf_home_and_fills_the_cache_the_server_will_read(tmp_path):
+    """A4: HF_HOME is passed through untouched; the cache it fills is the one the predicate reads."""
+    custom = tmp_path / "shared-hf"
+    result, _ = _run_prewarm(tmp_path, env_extra={"HF_HOME": custom})
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert (custom / "cached-fake-default-model").exists()
+    assert not (_login_home(tmp_path) / ".cache").exists()
+
+
+def test_prewarm_never_downloads_a_local_path_model_that_does_not_exist(tmp_path):
+    """A5: a path-shaped model name is never downloaded; a missing path fails with a message saying so."""
+    missing = str(tmp_path / "no" / "such" / "model-dir")
+    result, load_log = _run_prewarm(
+        tmp_path, config={"install_tier": "convenience", "embedding": {"model": missing}}
+    )
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert missing in out and "does not exist" in out
+    assert not load_log.exists(), "a local path must never reach the download path"
+
+
+def test_prewarm_is_skipped_when_the_venv_is_absent(tmp_path):
+    """A6: no venv -> the block is skipped as before; no pre-warm line, exit 0."""
+    result, load_log = _run_prewarm(tmp_path, with_venv=False)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert _prewarm_lines(result) == []
+    assert not load_log.exists()
+
+
+def test_prewarm_does_not_run_after_a_failed_runtime_pip_install(tmp_path):
+    """The pre-warm runs only AFTER the runtime pip install succeeds."""
+    result, load_log = _run_prewarm(tmp_path, pip_rc=1)
+
+    assert result.returncode != 0
+    assert _prewarm_lines(result) == []
+    assert not load_log.exists()

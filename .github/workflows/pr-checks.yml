@@ -89,6 +89,19 @@ on:
     # intermediate round can drop a test id and nothing re-counts until the
     # stack bottom retargets. Do not re-add a base filter without re-reading
     # that issue; the stacked case is the one these gates most need to cover.
+  # The dev merge queue builds a temporary `merge_group` ref from the queued
+  # PRs and waits for the required check (`pr-checks`) to report on it; a
+  # workflow without this trigger never reports there and the queue waits
+  # forever. Five PR-payload-only steps skip on this event (anti-dup,
+  # pr-body-close-keyword, the three name-leak-warn steps: they read the PR
+  # payload, which a queue ref does not carry); every tree-level gate runs on
+  # both. test-id-set-check runs on both too: on the queue it aggregates the
+  # Removed-test markers from the queued PRs' bodies via --gh-repo, and fails
+  # loud on a commit without a (#N) suffix. Whether the queue's temporary ref
+  # carries (#N) squash subjects is unverified until the first real queue run;
+  # the loud check is what makes that run informative.
+  merge_group:
+    types: [checks_requested]
 
 # One in-flight run per PR (#2361 review). `edited` raises trigger frequency --
 # every title or body edit now starts a run -- which widens a pre-existing race
@@ -97,6 +110,8 @@ on:
 # Cancelling the superseded run also stops paying for scrub results nobody reads.
 # NOT cancel-in-progress on the merge queue's behalf -- this keys on the PR ref,
 # so it cannot cancel a run belonging to a different PR.
+# merge_group runs have no pull_request.number and key on their own ref, which
+# is unique per merge group.
 concurrency:
   group: pr-checks-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -123,6 +138,30 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # One base ref for every diffing step. A pull_request run diffs against
+      # origin/<base branch>; a merge_group run has no github.base_ref (empty),
+      # its base is the commit the queue built the temporary ref on top of
+      # (merge_group.base_sha). fetch-depth: 0 above fetches full history of
+      # all branches, so that SHA is already in the clone (it is an ancestor
+      # of the merge-group head on the target branch).
+      - name: resolve base ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request) BASE_REF="origin/$PR_BASE_REF" ;;
+            merge_group)  BASE_REF="$MG_BASE_SHA" ;;
+            *) echo "::error::pr-checks: unsupported event '$EVENT_NAME' (no base ref rule)"; exit 1 ;;
+          esac
+          if ! git cat-file -e "${BASE_REF}^{commit}"; then
+            echo "::error::pr-checks: base ref '$BASE_REF' is not a commit in this clone"
+            exit 1
+          fi
+          echo "BASE_REF=$BASE_REF" >> "$GITHUB_ENV"
+          echo "pr-checks diffs against $BASE_REF ($EVENT_NAME)"
+
       # ── 1. anti-dup ────────────────────────────────────────────────────
       # (from anti-dup-check.yml)
       # Issue #1433 — mechanical gate against duplicate-effort PRs.
@@ -141,8 +180,9 @@ jobs:
       #
       # Uses body-text grep (same as trap-check): GitHub's closingIssuesReferences
       # GraphQL field is dormant on stacked/non-default-base PRs.
+      # skipped on merge_group: reads the PR payload, which the queue ref does not carry; the gate already ran on the PR's own head
       - name: anti-dup — check target issues for already-closed or competing open PRs
-        if: success() || failure()
+        if: github.event_name == 'pull_request' && (success() || failure())
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -221,7 +261,7 @@ jobs:
       - name: no-new-shipped-node-ids — fail on newly-added concrete ENGRAM node IDs in shipped files
         if: success() || failure()
         run: |
-          BASE_REF="origin/${{ github.base_ref }}"
+          BASE_REF="${{ env.BASE_REF }}"
           # The pattern follows engram_ids.py's documented broad shape:
           # every TYPE_PREFIX in server.py is exactly two lowercase letters,
           # so `[a-z]{2}_\d{4,}` catches every current type AND future types
@@ -255,7 +295,7 @@ jobs:
           #   paper_draft/, active-work/ — ephemeral drafting/scratch
           #     surfaces; any node-ID text there is a working note for the
           #     author's own session, not a citation offered to a reader.
-          #   docs/cycle/ — self-improvement-cycle process docs (charter,
+          #   docs/internal/cycle/ — self-improvement-cycle process docs (charter,
           #     chronicle, review packages, dream-pass protocol). These are
           #     process artifacts whose whole value IS author-graph
           #     provenance — the record of which claim drove which decision —
@@ -263,10 +303,12 @@ jobs:
           #     against) the graph the docs were written from. A dangling ID
           #     here is expected background for that audience, not a hollow
           #     citation offered to an uninformed reader.
-          #   docs/handbook/ — dev-internal developer handbook (accuracy-pass
-          #     reference docs assembled by agents auditing the substrate
-          #     against their own graph, with observation- and derivation-
-          #     level provenance citations throughout, e.g. 03-hooks.md).
+          #   docs/handbook/ — developer handbook (public: the READMEs link
+          #     it; excluded from this gate by a pre-existing choice, tracked
+          #     in issue #4084). Accuracy-pass reference docs assembled by
+          #     agents auditing the substrate against their own graph, with
+          #     observation- and derivation-level provenance citations
+          #     throughout, e.g. 03-hooks.md.
           #     Same reasoning as cycle/: the IDs are load-bearing provenance
           #     for a reader who holds the graph, not a citation offered to a
           #     general shared-repo reader.
@@ -289,7 +331,7 @@ jobs:
             ':(exclude)src/forum/tests/'
             ':(exclude)paper_draft/'
             ':(exclude)active-work/'
-            ':(exclude)docs/cycle/'
+            ':(exclude)docs/internal/cycle/'
             ':(exclude)docs/handbook/'
             ':(exclude)README.md'
             ':(exclude)docs/CHANGELOG.md'
@@ -315,7 +357,7 @@ jobs:
           if [ -n "$VIOLATIONS" ]; then
             echo "::error::New concrete ENGRAM node IDs introduced in alpha-released files."
             echo ""
-            echo "Issue #51 policy (DEVELOPMENT.md §Shipped files): concrete node"
+            echo "Issue #51 policy (docs/internal/DEVELOPMENT.md §Shipped files): concrete node"
             echo "IDs (regex: ${PATTERN}) reference the developer's graph, which"
             echo "doesn't exist in any user's install. Substitute with concept"
             echo "words; cite by claim, not by ID."
@@ -350,8 +392,9 @@ jobs:
       # dormant ([]) on non-default-base/stacked PRs and would pass them vacuously
       # (verified on a stacked-PR review); the body regex works at creation time
       # regardless of base.
+      # skipped on merge_group: reads the PR payload, which the queue ref does not carry; the gate already ran on the PR's own head
       - name: pr-body-close-keyword — fail on off-target close-keyword in the PR body
-        if: success() || failure()
+        if: github.event_name == 'pull_request' && (success() || failure())
         env:
           # Title + body passed via env, NOT inline ${{ }} in run:, to avoid
           # shell injection from author-controlled content.
@@ -507,9 +550,10 @@ jobs:
       # Example:
       #   \bAlice Example\b
       #   \bagentname-nick\b
+      # skipped on merge_group: reads the PR payload, which the queue ref does not carry; the gate already ran on the PR's own head
       - name: name-leak-warn — check for name-leak roster secret
         id: roster-check
-        if: success() || failure()
+        if: github.event_name == 'pull_request' && (success() || failure())
         run: |
           if [ -z "$NAME_LEAK_ROSTER" ]; then
             echo "NAME_LEAK_ROSTER not configured — name-leak warn-gate skipped" \
@@ -521,12 +565,13 @@ jobs:
         env:
           NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
 
+      # skipped on merge_group: reads the PR payload, which the queue ref does not carry; the gate already ran on the PR's own head
       - name: name-leak-warn — compute diff and scan for name mentions
-        if: (success() || failure()) && steps.roster-check.outputs.skip == 'false'
+        if: github.event_name == 'pull_request' && ((success() || failure()) && steps.roster-check.outputs.skip == 'false')
         id: scan
         continue-on-error: true
         run: |
-          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+          git diff ${{ env.BASE_REF }}...HEAD > /tmp/pr.diff
 
           echo "$NAME_LEAK_ROSTER" > /tmp/roster.txt
 
@@ -546,8 +591,9 @@ jobs:
         env:
           NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
 
+      # skipped on merge_group: reads the PR payload, which the queue ref does not carry; the gate already ran on the PR's own head
       - name: name-leak-warn — post or update PR comment
-        if: (success() || failure()) && steps.roster-check.outputs.skip == 'false'
+        if: github.event_name == 'pull_request' && ((success() || failure()) && steps.roster-check.outputs.skip == 'false')
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -586,7 +632,7 @@ jobs:
             BODY="${MARKER}
           ### Name-leak warn-gate: no matches on current tip
 
-          No personal/agent name mentions found in the diff against \`${{ github.base_ref }}\`.
+          No personal/agent name mentions found in the diff against \`${{ env.BASE_REF }}\`.
 
           *This is an advisory comment only — it does not block merge.*"
           fi
@@ -714,6 +760,27 @@ jobs:
           "tests/test_engramd_read_scan.py::test_r10_roots_config_covers_every_hook_function_and_no_module_level_execute_site"
           "tests/test_engramd_read_scan.py::test_r12_committed_file_equals_a_fresh_scan_of_the_real_tree"
 
+      - name: "invariant-checks — edge-liveness single source: template pins + drift guard (#3542)"
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        env:
+          ENGRAM_HOME: ${{ runner.temp }}/engram-home-edge-liveness
+        # dag_edge_set's six SQL templates are string LITERALS (the owner read
+        # registry's scanner admits nothing built at import time), so three of
+        # them restate the live-node predicate by necessity. The only thing that
+        # keeps them equal to _CURRENT_EDGE_PREDICATE is
+        # test_each_dag_edge_template_equals_what_the_one_predicate_generates.
+        # Edit the predicate alone and the literals and the committed registry do
+        # NOT change, so read-scan r12 above stays green: without this step that
+        # pin would first run at the dev->main release (dev PRs run only this
+        # workflow). The whole drift-guard file runs because the pin lives in it
+        # next to the guard that flags a second definition or a raw DAG-edge read,
+        # plus #3586's one-source check of the live-node text. Measured in a
+        # fresh venv with ONLY pytest installed: 19 tests in ~2.5 s wall.
+        run: >-
+          python3 -m pytest -q
+          tests/test_edge_liveness_ssot_3542.py
+          "tests/test_supersede_resolution_recompute_3586.py::test_live_node_predicate_has_one_source"
+
       - name: invariant-checks — forum-service process-spawn ratchet (#3518)
         if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Enumerates every process spawn on the forum service's executable surface
@@ -762,13 +829,13 @@ jobs:
         if: success() || failure()
         # CLAUDE.md loads into every session started from this repo, and had grown
         # to ~115 KB of mostly dated measurement history. Rules stay in CLAUDE.md;
-        # evidence lives in docs/. One `wc` — stdlib, well inside the under-one-
+        # evidence lives in docs/internal/. One `wc` — stdlib, well inside the under-one-
         # minute cost rule (Branching convention). The nothing-lost half of the
-        # contract is tests/test_claude_md_moves.py (docs/claude-md-moves.json).
+        # contract is tests/test_claude_md_moves.py (tools/claude_md_moves.json).
         run: |
           size="$(wc -c < CLAUDE.md)"
           if [ "$size" -gt 75000 ]; then
-            echo "::error::CLAUDE.md is $size bytes; the budget is 75000 (round 1 of #3322; round 2 lowers it to 40000). Move dated measurement history to docs/ (rules stay) and list the move in docs/claude-md-moves.json."
+            echo "::error::CLAUDE.md is $size bytes; the budget is 75000 (round 1 of #3322; round 2 lowers it to 40000). Move dated measurement history to docs/internal/ (rules stay) and list the move in tools/claude_md_moves.json."
             exit 1
           fi
           echo "CLAUDE.md is $size bytes (budget 75000)."
@@ -878,13 +945,13 @@ jobs:
       # check here names the cause in the log.) Relies on
       # this job's shared `actions/checkout@v4` step having `fetch-depth: 0`
       # (set at the top of this file) so the three-dot diff against
-      # origin/${{ github.base_ref }} has the base history to diff against.
+      # ${{ env.BASE_REF }} has the base history to diff against.
       - name: capidx-gate — check whether the diff touches capability-index-affected paths
         id: capidx-gate
         if: success() || failure()
         run: |
           set +e
-          CHANGED=$(git diff --no-renames --name-only "origin/${{ github.base_ref }}...HEAD")
+          CHANGED=$(git diff --no-renames --name-only "${{ env.BASE_REF }}...HEAD")
           STATUS=$?
           set -e
           if [ "$STATUS" -ne 0 ]; then
@@ -931,7 +998,14 @@ jobs:
       # (SKILL.md retired, all 4 tests unconditionally skipped) — wiring a
       # step that runs, does nothing, and can never fail would read as
       # coverage that isn't there.
-      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency, claude-md-moves, prev-release-hooks-gate
+      # docs-layout-guard: a new file directly under docs/ must be on the
+      # allowlist in tests/test_docs_layout_guard.py (a shipped surface sends
+      # readers to it), else it belongs in docs/internal/, which the one
+      # docs/internal/ line in release-minus-set.txt keeps out of the public
+      # snapshot. Pure stdlib (git ls-files + the cutover tool's own matcher),
+      # well under a second. Without this line the guard would gate nothing:
+      # dev PRs do not run tests/.
+      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency, claude-md-moves, prev-release-hooks-gate, docs-layout-guard
         if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: |
           python3 -m pytest \
@@ -942,10 +1016,11 @@ jobs:
             tests/test_build_plugin_hooks_consistency.py \
             tests/test_claude_md_moves.py \
             tests/test_prev_release_hooks_gate.py \
+            tests/test_docs_layout_guard.py \
             -q
 
       # ── 7c-1. 2652 migration-ledger completeness (#2652) ──────────────────
-      # docs/2652-migration-ledger.md lists every `sqlite3.connect(` line in
+      # docs/internal/2652-migration-ledger.md lists every `sqlite3.connect(` line in
       # tracked src/engram, one Section-2 row each. Dev PRs do not run the
       # pytest suite, so a test alone would not gate them: this runs the
       # stdlib-only check directly (git + python, ~0.1s). Three checks: per-file
@@ -1025,11 +1100,30 @@ jobs:
       - name: home-path gate — fail on a new hard-coded ENGRAM home path (baseline may only shrink)
         if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: |
-          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          BASE_SHA=$(git merge-base "${{ env.BASE_REF }}" HEAD)
           rc=0
           python3 tools/home_path_gate.py --base-sha "$BASE_SHA" || rc=1
           python3 -m pytest tests/test_home_path_gate.py tests/test_skill_home_paths_3863.py tests/test_walguard_home_path_3863.py tests/test_tools_engram_home_3863.py tests/test_shell_engram_home_3863.py -q || rc=1
           exit $rc
+
+      # ── raw-read gate (#3863 step 1) ─────────────────────────────────────
+      # A relative ENGRAM_HOME resolves against each process's own cwd, so the one
+      # resolver (five pinned copies, AST-identical, refusing a relative value) is
+      # the only place the variable may be read raw. This step fails on a raw read
+      # (os.environ get/subscript, os.getenv) of ENGRAM_HOME in a tracked non-test,
+      # non-docs .py file under src/ or tools/, outside those five files. Today's
+      # sites sit in tools/raw_home_read_baseline.json as per-file counts that may
+      # only shrink; a fixed site is reported "shrinkable" and does not fail, and
+      # --base-sha makes a new entry or a higher count red. BLOCKING, stdlib only:
+      # one file listing plus a regex pass, well under a second, and NO pytest here
+      # (the gate's tests run in the full suite and locally), so it adds no billed
+      # minute. Ruling: Borges's ruling on #3863, 2026-10-21.
+      # tests/test_raw_home_read_gate_3863.py pins this step.
+      - name: raw ENGRAM_HOME read gate — fail on a new raw read outside the pinned resolvers (baseline may only shrink)
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
+        run: |
+          BASE_SHA=$(git merge-base "${{ env.BASE_REF }}" HEAD)
+          python3 tools/raw_home_read_gate.py --base-sha "$BASE_SHA"
 
       # ── 7d. cascade behaviour acceptance (playbox) ──────────────────────
       # The #2013 cascade machine is accepted by BEHAVIOUR: tests/cascade_
@@ -1079,18 +1173,60 @@ jobs:
       # <reason>` accounts for a legitimate deletion; see
       # tools/test_id_set_check.py's module docstring for the full marker
       # syntax and the accounting rules.
+      # Runs on BOTH events (it is half tree-level: base tree's test-id set vs
+      # head tree's). On merge_group the combined tree can lose a test that
+      # neither queued PR loses alone (PR A adds a test to tests/test_f.py, PR B
+      # deletes test_f.py with Removed-test markers for the ids F held when B was
+      # written), so skipping it there would miss the joint break. The queue ref
+      # carries no PR body, so the markers come from the queued PRs' own bodies:
+      # with --gh-repo the tool walks base..head for squash subjects ending in
+      # `(#N)` and fetches each PR's body (#3117). The tool skips a commit with
+      # no `(#N)` suffix silently, so the merge_group arm checks every subject
+      # first and fails loud. Whether the queue's temporary ref carries `(#N)`
+      # subjects is unverified until the first real queue run; the loud check is
+      # what makes that run informative.
       - name: test-id-set-check — fail on a shrinking test-id set without a Removed-test marker
         if: success() || failure()
         env:
-          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BODY: ${{ github.event_name == 'pull_request' && github.event.pull_request.body || '' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
-          printf '%s' "$PR_BODY" > /tmp/pr_body.txt
-          python3 tools/test_id_set_check.py \
-            --base "$BASE_SHA" --head HEAD \
-            --pr-body-file /tmp/pr_body.txt \
-            --gh-repo ${{ github.repository }}
+          BASE_SHA=$(git merge-base "${{ env.BASE_REF }}" HEAD)
+          case "$EVENT_NAME" in
+            pull_request)
+              printf '%s' "$PR_BODY" > /tmp/pr_body.txt
+              python3 tools/test_id_set_check.py \
+                --base "$BASE_SHA" --head HEAD \
+                --pr-body-file /tmp/pr_body.txt \
+                --gh-repo ${{ github.repository }}
+              ;;
+            merge_group)
+              # Capture first: a process substitution's exit status is
+              # invisible to `set -e`, so a failed `git log` would run the loop
+              # zero times and skip the (#N) check silently.
+              log=$(git log --format='%h%x09%s' "$BASE_SHA..HEAD") || { echo "::error::test-id-set-check: git log $BASE_SHA..HEAD failed; cannot check queue subjects"; exit 1; }
+              missing=0
+              while IFS=$'\t' read -r sha subject; do
+                [ -z "$sha" ] && continue
+                if ! [[ $subject =~ \(#[0-9]+\)[[:space:]]*$ ]]; then
+                  echo "::error::test-id-set-check: commit $sha '$subject' carries no (#N) suffix; cannot aggregate its PR's Removed-test markers on the merge queue"
+                  missing=1
+                fi
+              done <<<"$log"
+              if [ "$missing" -ne 0 ]; then
+                exit 1
+              fi
+              python3 tools/test_id_set_check.py \
+                --base "$BASE_SHA" --head HEAD \
+                --gh-repo "$GH_REPO"
+              ;;
+            *)
+              echo "::error::test-id-set-check: unsupported event '$EVENT_NAME'"
+              exit 1
+              ;;
+          esac
 
       # ── 8b. test-id-set-check-unit-tests ────────────────────────────────
       # #2950/#2959 — reviewer-fairy round 2: step 8 above runs the TOOL
@@ -1158,7 +1294,7 @@ jobs:
         id: hooks-diff-check
         if: success() || failure()
         run: |
-          BASE_REF="origin/${{ github.base_ref }}"
+          BASE_REF="${{ env.BASE_REF }}"
           # --no-renames: --name-only collapses a detected rename to the
           # destination path alone. A hook file moved OUT of
           # src/engram/hooks/ while being modified (hooks.json untouched)
@@ -1230,7 +1366,7 @@ jobs:
       - name: team-practice-drift-gate — checkout team-practice
         id: team-practice-checkout
         if: success() || failure()
-        continue-on-error: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+        continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         uses: actions/checkout@v4
         with:
           repository: engram-agents/team-practice
@@ -1265,7 +1401,7 @@ jobs:
       - name: team-practice-drift-gate — advisory notice (checkout unavailable)
         if: (success() || failure()) && steps.team-practice-checkout.outcome != 'success'
         run: |
-          if [ "${{ github.event.pull_request.head.repo.full_name != github.repository }}" = "true" ]; then
+          if [ "${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}" = "true" ]; then
             echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice from this fork PR (fork PRs cannot carry this repo's secrets by design). CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811."
           else
             echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice, and this is NOT a fork PR — that means the secret was deleted, renamed, or mis-scoped. CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811."
@@ -1295,7 +1431,7 @@ jobs:
         if: success() || failure()
         run: |
           set +e
-          python3 tools/check_stubbed_signatures.py --base "origin/${{ github.base_ref }}" > /tmp/stub_affected_tests.txt
+          python3 tools/check_stubbed_signatures.py --base "${{ env.BASE_REF }}" > /tmp/stub_affected_tests.txt
           STATUS=$?
           set -e
           if [ "$STATUS" -ne 0 ]; then

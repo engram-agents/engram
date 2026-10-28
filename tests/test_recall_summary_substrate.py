@@ -44,6 +44,9 @@ sys.path.insert(0, PROJECT_ROOT)
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_recall_summary_substrate_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def fresh_server():
     """Create a clean server module instance in a temp sandbox directory."""

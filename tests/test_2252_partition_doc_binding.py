@@ -1,9 +1,9 @@
-"""#2277 — bind docs/specs/2252-cb-ncb-partition.md's enumerated node-type
+"""#2277 — bind docs/internal/specs/2252-cb-ncb-partition.md's enumerated node-type
 membership claims to the actual `CLAIM_BEARING_TYPES` / `VALID_NODE_TYPES`
 constants in src/engram/engram_core.py.
 
 Why this test exists: the CB/NCB partition ratification doc
-(docs/specs/2252-cb-ncb-partition.md, #2252's W0 workstream) enumerates its
+(docs/internal/specs/2252-cb-ncb-partition.md, #2252's W0 workstream) enumerates its
 membership lists BY HAND, in prose. Nothing mechanically binds those prose
 claims to the constants they describe, so when the underlying source
 changes, the doc can silently drift with no test signal. This already
@@ -101,13 +101,13 @@ import engram_core  # noqa: E402 — top-level import for AST-visible selection 
 
 
 # ---------------------------------------------------------------------------
-# Parse the doc's own enumerated lists (docs/specs/2252-cb-ncb-partition.md,
+# Parse the doc's own enumerated lists (docs/internal/specs/2252-cb-ncb-partition.md,
 # "## Membership" section) at test time, rather than pinning a hand-
 # transcribed Python literal — see the module docstring's "Round-1
 # correction" for why this is load-bearing, not a style preference.
 # ---------------------------------------------------------------------------
 
-_DOC_PATH = Path(__file__).resolve().parent.parent / "docs" / "specs" / "2252-cb-ncb-partition.md"
+_DOC_PATH = Path(__file__).resolve().parent.parent / "docs" / "internal" / "specs" / "2252-cb-ncb-partition.md"
 
 
 def _parse_doc_type_list(doc_text, label):
@@ -150,7 +150,7 @@ def _parse_doc_type_list(doc_text, label):
     types = frozenset(re.findall(r"`([a-zA-Z_][a-zA-Z0-9_-]*)`", body))
     if len(types) != claimed_count:
         raise AssertionError(
-            f"docs/specs/2252-cb-ncb-partition.md's own '{label} types "
+            f"docs/internal/specs/2252-cb-ncb-partition.md's own '{label} types "
             f"({claimed_count}...)' parenthetical claims {claimed_count} "
             f"members, but {len(types)} backtick-quoted type names were "
             f"parsed from that sentence: {sorted(types)}. The doc's count "
@@ -166,7 +166,7 @@ DOC_NCB_TYPES, _DOC_NCB_CLAIMED_COUNT = _parse_doc_type_list(_DOC_TEXT, "NCB")
 
 
 def test_cb_types_equals_doc_enumeration():
-    """Pins docs/specs/2252-cb-ncb-partition.md's "CB types (6, current)"
+    """Pins docs/internal/specs/2252-cb-ncb-partition.md's "CB types (6, current)"
     line to engram_core.CLAIM_BEARING_TYPES.
 
     If this fails, the fix is almost always "update the doc to match the new
@@ -176,7 +176,7 @@ def test_cb_types_equals_doc_enumeration():
     assert engram_core.CLAIM_BEARING_TYPES == DOC_CB_TYPES, (
         "engram_core.CLAIM_BEARING_TYPES "
         f"({sorted(engram_core.CLAIM_BEARING_TYPES)}) no longer matches "
-        "docs/specs/2252-cb-ncb-partition.md's 'CB types (6, current)' "
+        "docs/internal/specs/2252-cb-ncb-partition.md's 'CB types (6, current)' "
         f"enumeration ({sorted(DOC_CB_TYPES)}). Update the doc's membership "
         "section to match — unless this is a deliberate CB-type addition or "
         "removal, in which case update the doc AND this test together."
@@ -185,7 +185,7 @@ def test_cb_types_equals_doc_enumeration():
 
 def test_trust_signal_still_missing_from_valid_node_types():
     """Regression guard for issue #2203's gap, which
-    docs/specs/2252-cb-ncb-partition.md's membership section leans on
+    docs/internal/specs/2252-cb-ncb-partition.md's membership section leans on
     explicitly: `trust_signal` is a real NCB type that does NOT appear in
     `VALID_NODE_TYPES` at all, so a naive 'NCB = VALID_NODE_TYPES minus
     CLAIM_BEARING_TYPES' derivation misses it entirely (exactly the mistake
@@ -193,18 +193,18 @@ def test_trust_signal_still_missing_from_valid_node_types():
 
     If this assertion fails, #2203's gap has closed — flip this assertion
     (don't delete it) and update
-    docs/specs/2252-cb-ncb-partition.md's 'trust_signal is NOT in
+    docs/internal/specs/2252-cb-ncb-partition.md's 'trust_signal is NOT in
     VALID_NODE_TYPES' claim to match.
     """
     assert "trust_signal" not in engram_core.VALID_NODE_TYPES, (
         "trust_signal now appears in VALID_NODE_TYPES — issue #2203's gap "
-        "may have closed; docs/specs/2252-cb-ncb-partition.md's 'trust_signal "
+        "may have closed; docs/internal/specs/2252-cb-ncb-partition.md's 'trust_signal "
         "is NOT in VALID_NODE_TYPES' claim and this test both need updating"
     )
 
 
 def test_ncb_types_equals_doc_enumeration_not_naive_derivation():
-    """Pins docs/specs/2252-cb-ncb-partition.md's "NCB types (13)" line to
+    """Pins docs/internal/specs/2252-cb-ncb-partition.md's "NCB types (13)" line to
     (VALID_NODE_TYPES - CLAIM_BEARING_TYPES) | {"trust_signal"} — NOT to a
     naive VALID_NODE_TYPES - CLAIM_BEARING_TYPES derivation, which the doc
     itself warns misses trust_signal entirely (see the test above)."""
@@ -212,7 +212,7 @@ def test_ncb_types_equals_doc_enumeration_not_naive_derivation():
         engram_core.VALID_NODE_TYPES - engram_core.CLAIM_BEARING_TYPES
     ) | {"trust_signal"}
     assert DOC_NCB_TYPES == derived_ncb, (
-        "docs/specs/2252-cb-ncb-partition.md's 'NCB types (13)' enumeration "
+        "docs/internal/specs/2252-cb-ncb-partition.md's 'NCB types (13)' enumeration "
         f"({sorted(DOC_NCB_TYPES)}) no longer equals "
         "(VALID_NODE_TYPES - CLAIM_BEARING_TYPES) | {'trust_signal'} "
         f"({sorted(derived_ncb)}). Update the doc's membership section to "
@@ -221,7 +221,7 @@ def test_ncb_types_equals_doc_enumeration_not_naive_derivation():
         "together."
     )
     assert len(DOC_NCB_TYPES) == 13, (
-        "docs/specs/2252-cb-ncb-partition.md's own 'NCB types (13)' count "
+        "docs/internal/specs/2252-cb-ncb-partition.md's own 'NCB types (13)' count "
         f"claim no longer matches this test's pinned list ({len(DOC_NCB_TYPES)} "
         "members) — the doc's count needs updating"
     )
@@ -239,13 +239,13 @@ def test_valid_node_types_fully_partitioned():
         "engram_core.VALID_NODE_TYPES "
         f"({sorted(engram_core.VALID_NODE_TYPES)}) is no longer fully "
         "partitioned by CLAIM_BEARING_TYPES union "
-        "docs/specs/2252-cb-ncb-partition.md's NCB list (minus trust_signal) "
+        "docs/internal/specs/2252-cb-ncb-partition.md's NCB list (minus trust_signal) "
         f"({sorted(engram_core.CLAIM_BEARING_TYPES | (DOC_NCB_TYPES - {'trust_signal'}))}) "
         "— some node type is uncategorized by the doc's membership lists"
     )
     assert engram_core.CLAIM_BEARING_TYPES.isdisjoint(DOC_NCB_TYPES), (
         "engram_core.CLAIM_BEARING_TYPES and "
-        "docs/specs/2252-cb-ncb-partition.md's NCB list overlap — a node "
+        "docs/internal/specs/2252-cb-ncb-partition.md's NCB list overlap — a node "
         "type is claimed as both CB and NCB, which violates the doc's own "
         "partition definition"
     )
@@ -268,7 +268,7 @@ _EDGE_TABLE_ROW_RE = re.compile(
 
 
 def _parse_doc_edge_table(doc_text):
-    """Parse docs/specs/2252-cb-ncb-partition.md's "## The edge partition"
+    """Parse docs/internal/specs/2252-cb-ncb-partition.md's "## The edge partition"
     table into {relation: {"cascade": bool, "provenance": bool,
     "temporal_causal": bool, "removable": bool}}.
 
@@ -363,7 +363,7 @@ def test_edge_table_relations_match_edge_classifications_keys():
     doc_relations = frozenset(DOC_EDGE_TABLE)
     code_relations = frozenset(engram_core.EDGE_CLASSIFICATIONS)
     assert doc_relations == code_relations, (
-        "docs/specs/2252-cb-ncb-partition.md's edge-partition table "
+        "docs/internal/specs/2252-cb-ncb-partition.md's edge-partition table "
         f"relations ({sorted(doc_relations)}) no longer match "
         f"engram_core.EDGE_CLASSIFICATIONS's keys ({sorted(code_relations)}) "
         f"— missing from doc: {sorted(code_relations - doc_relations)}; "
@@ -402,7 +402,7 @@ def test_edge_table_flags_match_edge_classifications():
                     f"EDGE_CLASSIFICATIONS says {code_flags[column]}"
                 )
     assert not mismatches, (
-        "docs/specs/2252-cb-ncb-partition.md's edge-partition table "
+        "docs/internal/specs/2252-cb-ncb-partition.md's edge-partition table "
         "disagrees with engram_core.EDGE_CLASSIFICATIONS on "
         f"{len(mismatches)} cell(s):\n"
         + "\n".join(f"  - {m}" for m in mismatches)

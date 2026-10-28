@@ -16,7 +16,7 @@ SSoT for three concerns genuinely duplicated, byte-for-byte, across hooks:
    atomic_write_json below. Hooks run under a 5s harness timeout and are
    killed on overrun, and are also fail-soft by design, so a torn write is
    read as an absent file and the hook silently reseeds rather than erroring.
-   See docs/DEVELOPMENT.md's "Writing JSON state in a hook" section for the
+   See docs/internal/DEVELOPMENT.md's "Writing JSON state in a hook" section for the
    full convention text.
 
 Why this exists (CLAUDE.md "Plugin build restructures code paths"): the
@@ -112,8 +112,9 @@ def bounded_parents(here):
 def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
     """Resolve `tools/` across both build topologies and add it to sys.path.
 
-    Prefers `$CLAUDE_PLUGIN_ROOT/tools` when set, else walks ALL parent
-    directories of this file (never a fixed-depth `parents[N]` -- see module
+    Prefers `$CLAUDE_PLUGIN_ROOT/tools` when set, else walks the parent
+    directories of this file from its own up to and including its tree root,
+    never above it (#3983; never a fixed-depth `parents[N]` -- see module
     docstring) and takes the first `tools/` candidate that actually contains
     `marker_filename`. This file (`_hooklib.py`) lives in the SAME directory
     as the hooks that call it in both topologies (source: `hooks/claude/`;
@@ -130,7 +131,8 @@ def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
     if plugin_root:
         candidates.append(Path(plugin_root) / "tools")
-    for parent in Path(__file__).resolve().parents:
+    # Own tree only: up to and including the tree root, never above it (#3983).
+    for parent in bounded_parents(Path(__file__).resolve()):
         candidates.append(parent / "tools")
 
     tools_dir = next(
@@ -454,7 +456,7 @@ def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks
     mismatch with a post-write patch.
 
     NOT for every write in this codebase. Two documented exceptions exist
-    and must NOT be converted to this helper (see docs/DEVELOPMENT.md /
+    and must NOT be converted to this helper (see docs/internal/DEVELOPMENT.md /
     the module docstrings at their call sites for why):
       - src/engram/viz/data/config.py's write_config_key() (os.replace()
         there would strip the agent's ownership of its own config -- #372).
@@ -1010,7 +1012,7 @@ def emit_context(
 #   <probeDir>/<session_id>/routes/<route>.jsonl
 #
 # probeDir rule (mirrors the mod's default: config.ts DEFAULTS.probeDir
-# '~/.engram/probe/mods-recall', resolved by record.ts defaultProbeDir against
+# '$ENGRAM_HOME/probe/mods-recall', resolved by record.ts defaultProbeDir against
 # ENGRAM_HOME when that is set): `<engram_home()>/probe/mods-recall`, via the
 # layer's engram_home(). The mod and this hook must name the same directory,
 # or the hook records nothing for a probe that is live (alpha #3863, 6b; the
@@ -1283,7 +1285,7 @@ def _not_regular_db_error_cls():
 
 
 def connect_regular_ro(db_path, uri_params="mode=ro", **connect_kwargs):
-    """`sqlite3.connect(f"file:{db_path}?{uri_params}", uri=True, **kwargs)`
+    """`sqlite3.connect(<file: URI of db_path>?{uri_params}, uri=True, **kwargs)`
     that refuses a non-regular file instead of blocking on it (#3628).
 
     A `mode=ro` connect to a FIFO hangs (measured: > 5 s), so a hook under a
@@ -1296,6 +1298,16 @@ def connect_regular_ro(db_path, uri_params="mode=ro", **connect_kwargs):
     keyword arguments (timeout=...) pass through untouched; a timeout bounds
     lock waits, not a FIFO open, so it is not part of this defence.
     `uri_params` is the URI query, e.g. "mode=ro&immutable=1".
+
+    The path is made absolute and percent-quoted
+    (`Path(db_path).absolute().as_uri()`), so a '#', '?' or '%' in it cannot
+    be read as URI syntax (#4171): unquoted, '#' began the URI fragment, the
+    path was truncated, mode=ro was dropped and the connect succeeded onto a
+    DIFFERENT database, creating it if absent; and an unquoted '%23' was
+    decoded to '#', so a path under 'a%23b/' opened and READ the real
+    sibling store under 'a#b/' (measured, Zephyr on #4174). A relative db_path is made
+    absolute against the cwd at call time (every in-repo caller passes an
+    absolute path).
 
     Residual, NOT closed here. #3577 states it: "The pair is check-then-act:
     measured by two people independently, with the file regular at the `stat`
@@ -1313,7 +1325,8 @@ def connect_regular_ro(db_path, uri_params="mode=ro", **connect_kwargs):
     if st is not None and not stat.S_ISREG(st.st_mode):
         raise _not_regular_db_error_cls()(f"not a regular file: {db_path}")
     return sqlite3.connect(
-        f"file:{db_path}?{uri_params}", uri=True, **connect_kwargs)
+        Path(db_path).absolute().as_uri() + "?" + uri_params,
+        uri=True, **connect_kwargs)
 
 
 def session_started_at(session_id):

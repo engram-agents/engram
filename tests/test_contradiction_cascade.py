@@ -74,7 +74,7 @@ def _mk_obs(obs, claim: str, quote_type: str = "hard_data") -> str:
         url="https://example.com/test",
         title="Test source",
         claim=claim,
-        quoted_text=claim,
+        quoted_text=claim + " in the cited source",
         interpretation=f"Test observation: {claim}",
         quote_type=quote_type,
     ))

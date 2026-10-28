@@ -26,11 +26,11 @@ CLI = REPO_ROOT / "src" / "engram" / "tools" / "engram-sign.py"
 VERSION = "0.5.2-dev.20261004230859.dc232478d"
 HAPPY_LINE = (
     f"\U0001fa90 Kepler Somnium · Fable 5.1 (claude-fable-5-1) · "
-    f"ENGRAM {VERSION} · Lei Shi's agent"
+    f"ENGRAM {VERSION} · Lei Shi's agent · engram-agents.org"
 )
 ID_ONLY_LINE = (
     f"\U0001fa90 Kepler Somnium · claude-fable-5-1 · "
-    f"ENGRAM {VERSION} · Lei Shi's agent"
+    f"ENGRAM {VERSION} · Lei Shi's agent · engram-agents.org"
 )
 
 CONFIG = {
@@ -448,6 +448,25 @@ def test_model_id_to_lineage(mid, expected):
     assert engram_core.model_id_to_lineage(mid) == expected
 
 
+# #3922: explicit exact-id table of supported non-Claude models; the success
+# control lives in the SAME table as the refuse rows.
+@pytest.mark.parametrize("mid,expected", [
+    ("gpt-6.1-sol", "openai:gpt"),
+    ("gpt-6.1-sol ", "openai:gpt"),         # trimmed -> accepted
+    ("gpt-6.1-sol[1m]", "openai:gpt"),      # existing [...] suffix strip
+    ("gpt-9999", ""),
+    ("o5-preview", ""),
+    ("gpt-6.1-soltypo", ""),
+    ("GPT-6.1-SOL", ""),
+    ("", ""),
+    ("   ", ""),
+    (None, ""),
+    (61, ""),
+])
+def test_model_id_to_lineage_non_claude_table(mid, expected):
+    assert engram_core.model_id_to_lineage(mid) == expected
+
+
 # ---------------------------------------------------------------- MCP tool
 
 def _fresh_server(td):
@@ -489,3 +508,52 @@ def test_mcp_tool_bad_payload(env):
     server = _fresh_server(str(env.data))
     out = json.loads(server.engram_sign("not json"))
     assert "error" in out
+
+
+# ------------------------------------------------- signature_site (contract)
+# Contract: key ABSENT -> PROJECT_SITE; non-empty string -> that string, stripped;
+# "" / whitespace -> segment OMITTED; any non-string type -> REFUSE
+# field="signature_site" naming config.json and the type found.
+
+def test_site_absent_defaults_to_project_site(env):
+    r = _build(env)
+    assert r.ok is True
+    assert r.line.endswith(" · engram-agents.org")
+    assert r.parts["site"] == "engram-agents.org"
+
+
+def test_site_override_string(env):
+    _set_config(env, signature_site="example.org")
+    r = _build(env)
+    assert r.ok is True
+    assert r.line.endswith(" · example.org")
+    assert "engram-agents.org" not in r.line
+    assert r.parts["site"] == "example.org"
+
+
+def test_site_override_is_stripped(env):
+    _set_config(env, signature_site="  example.org  ")
+    r = _build(env)
+    assert r.ok is True
+    assert r.line.endswith("'s agent · example.org")
+    assert r.parts["site"] == "example.org"
+
+
+@pytest.mark.parametrize("val", ["", "   "])
+def test_site_empty_omits_segment(env, val):
+    _set_config(env, signature_site=val)
+    r = _build(env)
+    assert r.ok is True
+    assert r.line.endswith("'s agent")
+    assert not r.line.endswith(sig.SEP)
+    assert r.parts["site"] == ""
+
+
+@pytest.mark.parametrize("val", [42, None, True, ["a"], {"a": 1}])
+def test_site_wrong_type_refuses(env, val):
+    _set_config(env, signature_site=val)
+    r = _build(env)
+    assert r.ok is False
+    assert r.field == "signature_site"
+    assert "config.json" in r.reason
+    assert type(val).__name__ in r.reason

@@ -127,7 +127,9 @@ Usage: forum-mention-monitor.sh [--purpose <key>]
                    stream) and lets the agent decide whether to `kill <pid>`
                    by hand.
 
-Resolves SELF (URL-encoded) and forum BASE URL from ${ENGRAM_HOME:-$HOME/.engram}/config.json.
+Resolves SELF (URL-encoded) via `forum.py whoami` (config.json agent_name > $USER >
+$LOGNAME > account name, agent- prefix stripped; exits 2 with one line if all are empty;
+prints one "polling as" line when config.json has no agent_name) and the forum BASE URL from ${ENGRAM_HOME:-$HOME/.engram}/config.json.
 URL resolution order: config.json forum.url > $FORUM_URL > http://localhost:5002
 
 Seeds on first successful poll (retries until forum is reachable). Never
@@ -166,7 +168,63 @@ esac
 # ---------------------------------------------------------------------------
 # resolve identity + forum URL
 # ---------------------------------------------------------------------------
-SELF="$(python3 -c 'import json,sys,urllib.parse;print(urllib.parse.quote(json.load(open(sys.argv[1])).get("agent_name",""),safe=""))' "${ENGRAM_HOME:-$HOME/.engram}/config.json")"
+# #4113: SELF comes from forum.py's `whoami` (config agent_name > $USER > $LOGNAME >
+# account name, agent- prefix stripped), not config.json alone. forum.py sits beside
+# this script. An empty name is refused loudly: a watcher polling with agent= empty is
+# alive but deaf (server answers 400), and the supervisor would still read PASS.
+_whoami_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")"
+# A failure that is NOT whoami's own all-empty refusal (python crash, an older
+# forum.py without `whoami`) must not be blamed on empty sources, so on failure only,
+# run whoami again to read its stderr and rc. The retry also keeps its stdout: if the
+# first failure was transient and the retry succeeds, adopt that name (no refusal).
+SELF_RAW="$(python3 "$_whoami_dir/forum.py" whoami 2>/dev/null)" || SELF_RAW=""
+_who_err=""
+_who_rc=0
+if [ -z "$SELF_RAW" ]; then
+    _who_errf="$(mktemp 2>/dev/null)" || _who_errf=""
+    if [ -n "$_who_errf" ]; then
+        SELF_RAW="$(python3 "$_whoami_dir/forum.py" whoami 2>"$_who_errf")" || _who_rc=$?
+        _who_err="$(cat "$_who_errf" 2>/dev/null)" || _who_err=""
+        rm -f "$_who_errf"
+    else
+        _who_err="$(python3 "$_whoami_dir/forum.py" whoami 2>&1 >/dev/null)" || _who_rc=$?
+    fi
+    [ "$_who_rc" -eq 0 ] || SELF_RAW=""
+fi
+if [ -z "$SELF_RAW" ]; then
+    case "$_who_err" in
+        *"all empty"*)
+            echo "⚠️  forum-mention-monitor.sh: cannot resolve this agent's name (config agent_name, \$USER, \$LOGNAME, account name all empty) — not polling; set \"agent_name\" in ${ENGRAM_HOME:-$HOME/.engram}/config.json"
+            ;;
+        *)
+            _who_reason=""
+            while IFS= read -r _who_l; do
+                _who_l="${_who_l#"${_who_l%%[![:space:]]*}"}"
+                _who_l="${_who_l%"${_who_l##*[![:space:]]}"}"
+                [ -n "$_who_l" ] && _who_reason="$_who_l"
+            done <<EOF_WHO
+$_who_err
+EOF_WHO
+            [ -n "$_who_reason" ] || _who_reason="rc=$_who_rc"
+            echo "⚠️  forum-mention-monitor.sh: cannot resolve this agent's name (forum.py whoami failed: $_who_reason) — not polling; check that forum.py beside this script is current"
+            ;;
+    esac
+    return 2 2>/dev/null || exit 2
+fi
+# #4113 (round 3): when config.json has no agent_name the name was DERIVED from the OS
+# account, which on a seat sharing a human's account is a silent wrong identity (the
+# server answers 200 for any valid name). Say so once, before polling starts.
+_cfg_path="${ENGRAM_HOME:-$HOME/.engram}/config.json"
+_cfg_name="$(python3 -c 'import json,sys
+try:
+    n = json.load(open(sys.argv[1])).get("agent_name")
+except Exception:
+    n = None
+print(n.strip() if isinstance(n, str) else "")' "$_cfg_path" 2>/dev/null)" || _cfg_name=""
+if [ -z "$_cfg_name" ]; then
+    echo "ℹ️  forum-mention-monitor.sh: polling as '$SELF_RAW' (no agent_name in $_cfg_path; derived from \$USER/\$LOGNAME/account name) — set \"agent_name\" there to pin it"
+fi
+SELF="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$SELF_RAW")"
 BASE="$(python3 -c 'import json,os,sys
 c=json.load(open(sys.argv[1]))
 print(((c.get("forum") or {}).get("url") or os.environ.get("FORUM_URL") or "http://localhost:5002").rstrip("/"))' "${ENGRAM_HOME:-$HOME/.engram}/config.json")"
@@ -220,7 +278,8 @@ URL="$BASE/api/agent/$SELF/mentions?kind=at_mention"   # #1040: at_mention only 
 # in the "process gone" branch — dead and SILENT, byte-identical to "checked,
 # found no duplicates." Mirrors umwelt-bell.py's `_is_bell_process` fix
 # (umwelt #205): when /proc is absent, fall back to the portable
-# `ps -p <pid> -o args=`. That fallback is WEAKER than the /proc read and is
+# `ps -ww -p <pid> -o args=` (#4227: without -ww, args= truncates to an
+# exported $COLUMNS). That fallback is WEAKER than the /proc read and is
 # reported as such: `ps -o args=` returns a space-JOINED string, not true
 # NUL-separated argv, so a wrapper whose script path sits inside a single
 # quoted argument (e.g. `bash -c "... forum-mention-monitor.sh ..."`) can

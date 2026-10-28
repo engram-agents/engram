@@ -139,7 +139,9 @@ except Exception:
     # its src/engram) that actually holds it -- never a fixed parents[N].
     _not_search_excluded_sql = None
     try:
-        for _parent in Path(__file__).resolve().parents:
+        from _hooklib import bounded_parents as _bounded_parents
+        # Own tree only: up to and including the tree root, never above it (#3983).
+        for _parent in _bounded_parents(Path(__file__).resolve()):
             for _cand in (_parent, _parent / "src" / "engram"):
                 if (_cand / "engram_search_rules.py").exists():
                     sys.path.insert(0, str(_cand))
@@ -153,7 +155,7 @@ except Exception:
 # alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
 # manifest_id) for engram.telemetry.reached -- see main()'s first line. All
 # three of this file's emit sites share this one `main` dispatch target
-# (docs/2574-telemetry-design.md §1: "engram-surface-hook.py's three sites
+# (docs/internal/2574-telemetry-design.md §1: "engram-surface-hook.py's three sites
 # share main, so one reached covers all three").
 _MAIN_MANIFEST_ID = "hooks/claude/engram-surface-hook.py:main"
 _SURFACE_FIRE_SITE = "surface-hook.surface_fire"
@@ -1314,7 +1316,7 @@ def _append_surface_ledger_entry(
     """Append this prompt's actually-rendered node ids to the surfaced ledger
     for session_id, then prune. Best-effort / fail-open throughout — the
     ledger is an advisory cache; any I/O or parse failure here must never
-    break the hook. See docs/recall-triggering-blueprint.md §3-P1.
+    break the hook. See docs/internal/recall-triggering-blueprint.md §3-P1.
 
     prompt_embedding, suppressed_echo_ids, decay_events (#257 recs 1+2,
     thread #266): all optional and omitted from the entry entirely when
@@ -1489,7 +1491,7 @@ def _classify_suppression(count: int, m: int) -> str:
 # documented here as judgment calls (see PR body for the full writeup):
 #
 # 1. Fixed bucket key, not the session's own entry. The general per-node
-#    ledger above is deliberately session-scoped (docs/recall-triggering-
+#    ledger above is deliberately session-scoped (docs/internal/recall-triggering-
 #    blueprint.md §3-P1) because the HOOK is the only surface that writes to
 #    it. The moment cooldown must ALSO be visible to engram_query and
 #    engram_inspect (render-contract requirement: "a moment rendered via
@@ -1718,7 +1720,7 @@ def _advance_person_moment_cursor(person_id: str, from_cursor: int) -> bool:
         return False
     conn = None
     try:
-        conn = sqlite3.connect(KNOWLEDGE_DB_PATH, timeout=2.0)
+        conn = sqlite3.connect(Path(KNOWLEDGE_DB_PATH).absolute().as_uri() + "?mode=rw", uri=True, timeout=2.0)
         result = _advance_moment_cursor(conn, person_id, from_cursor)
         conn.commit()
         return bool(result.get("applied"))
@@ -2746,7 +2748,7 @@ def format_nudge(
     trailing k prompts for this session demote to Others-tier or suppress
     entirely — render-layer only, matching/ranking are untouched. This
     function owns the ledger read (to compute tiers) AND the ledger write (to
-    record what was actually rendered) — see docs/recall-triggering-blueprint.md
+    record what was actually rendered) — see docs/internal/recall-triggering-blueprint.md
     §3-P1 for the design.
 
     Injection budget (recall-triggering blueprint §3-P4, issue #1692):
@@ -3809,7 +3811,7 @@ def _with_state_lock(lock_path, fn):
     are separate subprocesses invoked by Claude Code, hooks do not import each
     other, and engram_core.py may not be imported by a hook, so there is no
     shared import surface today, and a new shared module for ~15 lines isn't
-    worth the engineering (see spec docs/specs/1720-principle-state-write-race.md).
+    worth the engineering (see spec docs/internal/specs/1720-principle-state-write-race.md).
     If any copy changes, change the other two; tests/test_utility_state_lock_3658.py
     pins all three AST-identical (docstring dropped).
     """
@@ -4368,7 +4370,7 @@ def _main_impl():
     #
     # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
     # its own try/except so an INIT_FAILED outcome is recordable and
-    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # distinct from an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md
     # §1/§5) -- the matched-ids extraction below is data prep, not
     # construction, so it sits outside the narrowed try.
     _emitter = None
@@ -4451,7 +4453,7 @@ def _main_impl():
         # alpha #2574 WS3: construction (import + Emitter.init) is narrowed
         # to its own try/except so an INIT_FAILED outcome is recordable and
         # distinct from an ordinary DROPPED emit
-        # (docs/2574-telemetry-design.md §1/§5). This is the decisive case
+        # (docs/internal/2574-telemetry-design.md §1/§5). This is the decisive case
         # §1 names: the `for _kind, _pid, _entry, _mid in _principle_rendered`
         # unpack used to sit INSIDE the same wide try as construction, so an
         # unpack ValueError after a successful emit reported INIT-FAILED for
@@ -4776,7 +4778,7 @@ def _main_impl():
         # alpha #2574 WS3: construction (import + Emitter.init) is narrowed
         # to its own try/except so an INIT_FAILED outcome is recordable and
         # distinct from an ordinary DROPPED emit
-        # (docs/2574-telemetry-design.md §1/§5).
+        # (docs/internal/2574-telemetry-design.md §1/§5).
         _emitter2 = None
         try:
             from engram_log_emitter import Emitter

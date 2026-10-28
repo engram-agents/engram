@@ -839,7 +839,7 @@ def test_import_dep_tier_consistency():
 # ---------------------------------------------------------------------------
 # Telemetry manifest gate (issue #2574, workstream WS2 — §4a)
 #
-# See docs/2574-telemetry-design.md §1 (PARTICIPATION DEFINITION) and §4a
+# See docs/internal/2574-telemetry-design.md §1 (PARTICIPATION DEFINITION) and §4a
 # (the registry) for the design. tools/telemetry_manifest_gate.py holds the
 # extraction/walk/scan logic these tests exercise; see its own module
 # docstring and `--self-test` for the synthetic positive/negative fixtures
@@ -870,7 +870,7 @@ def test_telemetry_key_required_on_emitting_mechanisms():
     assert not missing, (
         "packaging/tiers.json is missing a `telemetry` key for these "
         "emitting mechanism paths (add `telemetry: []` or per-call-site "
-        "records — see docs/2574-telemetry-design.md §4a):\n"
+        "records — see docs/internal/2574-telemetry-design.md §4a):\n"
         + "\n".join(f"  {p}" for p in missing)
     )
 

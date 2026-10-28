@@ -44,6 +44,10 @@ sys.path.append(str(SRC_ENGRAM))  # #2565: append, not insert(0)
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_cornerstone_anchor_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def fresh_server():
     if os.path.exists(TEST_DIR):

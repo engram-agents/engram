@@ -172,7 +172,7 @@ def test_s2_migration_rung_leaves_full_stats_and_new_index_row(env):
     core._run_db_one_time_setup(c)
     c.commit()
     try:
-        assert c.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert c.execute("PRAGMA user_version").fetchone()[0] == core.LATEST_SCHEMA_VERSION
         assert _stat(c, "idx_nodes_created_at") is not None, "no stat1 row for the rung's new index"
         assert int(_stat(c, "idx_nodes_current").split()[0]) == N_ROWS
         assert int(_stat(c, "idx_nodes_current").split()[1]) == N_ROWS // 2

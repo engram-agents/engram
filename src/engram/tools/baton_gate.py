@@ -90,6 +90,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+
+def engram_home() -> Path:
+    """The ENGRAM home for this standalone module: $ENGRAM_HOME (default ~/.engram) when set and
+    non-empty, expanded and absolute; a RELATIVE value is refused (ValueError naming it). A copy of
+    tools/_owner_read.engram_home() (the canonical body): the forum server loads ONLY this file by path
+    (`cp -L` into $APP/tools/, server._load_baton_gate()) and tools/baton.py imports it by bare name, so it
+    cannot import `tools._owner_read`. tests/test_engram_home_parity_3863.py pins the copy AST-identical."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
+
+
+# `_resolve_pool_sentinel` below takes a parameter named `engram_home`, which shadows the function above.
+_resolve_engram_home = engram_home
+
 # ---------------------------------------------------------------------------
 # GitHub anchor parsing (moved verbatim from tools/baton.py; #2884)
 # ---------------------------------------------------------------------------
@@ -289,7 +306,15 @@ def _resolve_pool_sentinel(engram_home: Optional[str] = None) -> str:
     if _POOL_SENTINEL_CACHE:
         return _POOL_SENTINEL_CACHE[0]
 
-    home = engram_home or os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+    if engram_home:
+        home = engram_home  # an explicit argument wins, as before (never read from the environment)
+    else:
+        try:
+            home = _resolve_engram_home()
+        except ValueError as exc:
+            # A relative ENGRAM_HOME resolves against the calling process's cwd: refuse it. The forum server's
+            # handlers map PoolSentinelUnresolved to a fail-closed 422; a bare ValueError would be a 500 (#3863).
+            raise PoolSentinelUnresolved(f"cannot determine pool sentinel: {exc}") from exc
     try:
         config_path = Path(home) / "config.json"
         pu = json.loads(config_path.read_text()).get("primary_user")
@@ -485,24 +510,121 @@ def _dedupe_checks_by_latest(checks: list) -> list:
     cross-SHA case (measured 2026-08-30; this docstring claimed one until
     then).
 
-    ISO-8601 completedAt strings compare correctly as plain strings
-    (lexicographic == chronological).  A null/missing completedAt (check
-    still in progress) sorts before any finished timestamp, so an in-progress
-    re-run correctly loses to the completed previous run of the same name —
-    the pending state is then caught by the pending-pass below.
+    An UNFINISHED run (status not COMPLETED: IN_PROGRESS / QUEUED / PENDING, or
+    a status-context in the PENDING state) is the current entry for its name
+    and always wins, whatever else is in the rollup (#2437).  The old rule
+    ranked by completedAt alone, so an in-flight re-run lost to a finished run
+    of the same name and was discarded before the pending pass: a finished
+    SUCCESS + in-flight re-run read GREEN, and a finished CANCELLED/FAILURE +
+    in-flight re-run read RED.  completedAt cannot be used to detect an
+    unfinished run: it may be null, "", or the Go zero value
+    "0001-01-01T00:00:00Z" (a truthy string), depending on the gh version.
+    Among FINISHED runs of one name the latest completedAt wins (ISO-8601
+    strings compare correctly as plain strings).
 
-    Edge case: if two runs for the same name both have completedAt=None
-    (both in-progress), the first one seen is kept.  In practice both would
-    be in-progress and the pending-pass catches them regardless of which wins.
+    Edge case: if two runs of one name are both unfinished, the first one seen
+    is kept; the pending pass reports pending whichever wins.
     """
     latest: dict = {}
     for check in checks:
         name = check.get("name") or check.get("context") or ""
-        completed_at = check.get("completedAt") or ""
         existing = latest.get(name)
-        if existing is None or completed_at > (existing.get("completedAt") or ""):
+        if existing is None:
+            latest[name] = check
+            continue
+        if _is_unfinished(existing):
+            continue
+        if _is_unfinished(check) or (check.get("completedAt") or "") > (
+            existing.get("completedAt") or ""
+        ):
             latest[name] = check
     return list(latest.values())
+
+
+def _is_unfinished(check: dict) -> bool:
+    """True when a rollup entry is a run that has not finished (#2437).
+
+    Keys on status, never on completedAt.  A check-run carries `status`
+    (COMPLETED or not); a status-context carries `state` instead.  An entry with
+    neither status, state nor conclusion has not started, which the pending
+    pass also reports as pending.  A status-context in state EXPECTED counts as
+    finished here and is not caught by the pending pass (pre-existing).
+    """
+    status = (check.get("status") or "").upper()
+    if status:
+        return status != "COMPLETED"
+    state = (check.get("state") or "").upper()
+    if state:
+        return state in _CI_PENDING_STATUSES
+    return not (check.get("conclusion") or "")
+
+
+# GitHub lists at most this many check-runs per page; a head with more runs
+# than one page holds cannot be judged from one page.
+_CHECK_RUNS_PAGE_SIZE = 100
+
+
+def _strict_required_check_state(payload: dict, check_name: str) -> tuple:
+    """The strict read of one named check on one head: ``(state, detail)``.
+
+    `payload` is the JSON of ``GET repos/<o>/<r>/commits/<sha>/check-runs
+    ?filter=all&per_page=100``.  This answers GitHub's merge gate at the press
+    (did EVERY run of the required check on this head succeed), which is a
+    different question from `_dedupe_checks_by_latest`'s (is the newest run
+    green).  A cancelled same-SHA run blocks the merge even when another run of
+    the same name passed, so nothing here is ordered by time or deduped.
+
+    state:
+      "too-many"        total_count exceeds one page; the page cannot be trusted
+      "none"            no run is named `check_name`
+      "pending"         some such run is unfinished (`_is_unfinished`)
+      "success"         every such run concluded success (case-insensitive)
+      "not-all-success" otherwise
+      "unknown"         the payload is not a check-runs object, or its total_count
+                        is absent or not an integer (fails closed)
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("check_runs"), list):
+        return ("unknown", "payload is not a check-runs object")
+    total = payload.get("total_count")
+    if not isinstance(total, int) or isinstance(total, bool):
+        return ("unknown", "total_count is absent or not an integer; one page cannot be trusted")
+    if total > _CHECK_RUNS_PAGE_SIZE:
+        return ("too-many", f"total_count {total} exceeds one page of {_CHECK_RUNS_PAGE_SIZE}")
+    runs = [r for r in payload["check_runs"]
+            if isinstance(r, dict) and r.get("name") == check_name]
+    if not runs:
+        return ("none", f"no run named {check_name!r}")
+    unfinished = [r for r in runs if _is_unfinished(r)]
+    if unfinished:
+        return ("pending", "unfinished: " + ", ".join(
+            f"run {r.get('id')} ({r.get('status') or 'no status'})" for r in unfinished))
+    bad = [r for r in runs if (r.get("conclusion") or "").lower() != "success"]
+    if bad:
+        return ("not-all-success", "not success: " + ", ".join(
+            f"run {r.get('id')} ({r.get('conclusion')})" for r in bad))
+    return ("success", f"all {len(runs)} run(s) of {check_name!r} succeeded")
+
+
+def _head_check_runs(repo: str, sha: str) -> dict:
+    """Fetch the check-runs of one head commit (one page, ``filter=all``).
+
+    Goes through `_gh_read_json`, so the service identity applies and a refusal
+    comes back before any spawn.  Never raises: on any failure the dict is
+    ``{"error": <scrubbed reason>}``, which `_strict_required_check_state` reads
+    as "unknown" (never as a pass).
+    """
+    if not _repo_slug_is_valid(repo):
+        return {"error": "repo is not a plain owner/name slug"}
+    if not (isinstance(sha, str) and _HEAD_OID_RE.fullmatch(sha)):
+        return {"error": "sha is not a 40-hex commit id"}
+    body, why = _gh_read_json(
+        ["api", f"repos/{repo}/commits/{sha}/check-runs"
+                f"?filter=all&per_page={_CHECK_RUNS_PAGE_SIZE}"])
+    if why is not None:
+        return {"error": why}
+    if not isinstance(body, dict):
+        return {"error": "gh returned JSON that is not an object"}
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -752,11 +874,16 @@ def _ci_state_from_rollup_output(result) -> tuple:
         return ("unknown", "statusCheckRollup missing or not a list")
 
     if not checks:
-        # No checks registered — treat as green
-        return ("green", "no checks registered")
+        # Seconds after a push the new head has no check runs registered yet;
+        # nothing has checked this tip, so it is not green (#4165). Sits after
+        # the CLEAN check above, which stays sufficient on its own.
+        return ("pending", "no checks registered on the head yet")
 
     # Dedupe: keep only the latest run per check name so a superseded same-SHA
-    # run (e.g. a CANCELLED one the concurrency group killed) can't false-block (#1366).
+    # run (e.g. a CANCELLED one the concurrency group killed) can't false-block
+    # (#1366).  An unfinished run is the current entry for its name and beats any
+    # finished one, so a live re-run is never discarded before the pending pass
+    # below (#2437).
     checks = _dedupe_checks_by_latest(checks)
 
     for check in checks:
@@ -792,7 +919,7 @@ def _pr_ci_state(pr_number: str, repo: str) -> tuple:
     """Query GitHub CI state for a pull request via `gh`.
 
     Returns (state, detail) where state is one of:
-      "green"   — all checks passed (or no checks registered)
+      "green"   — all checks passed (an empty rollup is pending, not green)
       "red"     — at least one check failed
       "pending" — no failure, but at least one check still running
       "unknown" — could not obtain a verdict (degraded; advisory only)

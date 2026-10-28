@@ -38,6 +38,9 @@ WARN_HOOK_PATH = (
 
 _LOAD_COUNTER = 0
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_module(path: Path):
     """Import a hyphenated hook file as a fresh, uniquely-named module instance."""

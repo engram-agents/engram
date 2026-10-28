@@ -48,7 +48,7 @@ def _new_conn():
     conn.execute(
         """CREATE TABLE nodes (
             id TEXT PRIMARY KEY, type TEXT NOT NULL, is_current INTEGER DEFAULT 1,
-            superseded_by TEXT, claim TEXT, recall_summary TEXT, created_at TEXT
+            status TEXT DEFAULT 'active', superseded_by TEXT, claim TEXT, recall_summary TEXT, created_at TEXT
         )"""
     )
     conn.execute(

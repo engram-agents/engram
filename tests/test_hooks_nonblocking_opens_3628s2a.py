@@ -66,6 +66,9 @@ print("RESULT:" + json.dumps(ns["result"]))
 
 _ENV_DROP = ("ENGRAM_RUNTIME_DIR", "CLAUDE_PLUGIN_ROOT", "CODEX_PLUGIN_ROOT", "PYTHONPATH")
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 class Ctx:
     def __init__(self, tmp: Path, kind: str, hook_file: str):
@@ -813,7 +816,9 @@ _HELPER_DEFS = {
     "_hooklib.py": {"_open_regular_fd", "open_regular_text", "open_regular_text_write",
                     "open_regular_text_append", "write_route_ledger",
                     "append_shown_record", "atomic_write_text"},
-    "engram-loop-arm-stop-hook.py": {"open_regular_text"},
+    # _reply_gate_fd (#4193): the reply-gate log's own hardened open (O_NONBLOCK + fstat S_ISREG,
+    # a non-regular target raises before anything is read or written).
+    "engram-loop-arm-stop-hook.py": {"open_regular_text", "_reply_gate_fd"},
     # #3658: the utility hook's byte-identical copy of the state-lock helper (its one
     # os.open is the O_CREAT lock-file open; the surface hook is allowed the same one
     # by test_surface_hook_nonblocking_opens_3628s2c.py, "the state lock").

@@ -48,8 +48,11 @@ START_CODES = {
     "OwnerAclNotStripped": 1,
     "OwnerPermissionUnsupported": 1,
     "OwnerPidfileNotRegular": 4,
+    "OwnerPidfileNotWritable": 4,  # #4068: an existing pidfile this user cannot write; not retried
     "OwnerStorePathNotRegular": 4,
     "OwnerStoreBehindSchema": 5,
+    "OwnerStoreMaintenance": 6,  # #3882: the store-maintenance lock is held by a repair tool
+    "OwnerStoreLockDirUnusable": 4,  # #3882: the lock directory is a planted path; not retried
 }
 # What check_start_refusals() (so --preflight) can raise: read off the method and the two
 # helpers it calls (_check_platform_support, _check_darwin_home_not_tcc_protected).
@@ -58,10 +61,12 @@ PREFLIGHT_RAISES = [
     "OwnerHomeTccProtected",
     "OwnerPermissionUnsupported",
     "OwnerPidfileNotRegular",
+    "OwnerPidfileNotWritable",
     "OwnerStorePathNotRegular",
 ]
 # Owner* RuntimeErrors that are NOT start() refusals main() maps: they propagate today.
-UNMAPPED = {"OwnerStalePathUnsafe", "OwnerPeerCredentialsMalformed", "OwnerPythonTooOld"}
+# OwnerRestartRefused (#4068) is a caller error (a second start() on one object), deliberately unmapped.
+UNMAPPED = {"OwnerStalePathUnsafe", "OwnerPeerCredentialsMalformed", "OwnerPythonTooOld", "OwnerRestartRefused"}
 
 
 @pytest.fixture
@@ -104,7 +109,7 @@ def test_start_code_is_pinned(name, home, monkeypatch, capsys):
 
 
 def test_exit_constants_are_the_values_the_pins_assume():
-    assert (eo.EXIT_PATH_NOT_REGULAR, eo.EXIT_STORE_BEHIND_SCHEMA) == (4, 5)
+    assert (eo.EXIT_PATH_NOT_REGULAR, eo.EXIT_STORE_BEHIND_SCHEMA, eo.EXIT_STORE_MAINTENANCE) == (4, 5, 6)
 
 
 def _table():

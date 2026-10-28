@@ -9,6 +9,20 @@ Env gate:
     FORUM_NO_EMBEDDINGS=1  — disables the embedding layer entirely (test mode;
                              mirrors ENGRAM_NO_EMBEDDINGS in server.py:108).
 
+Model placement (mirrors #3905 / #3898 on the ENGRAM side; read at LOAD time):
+    FORUM_EMBEDDING_DEVICE=cpu|cuda|cuda:N
+                           — device the model loads on. Unset or empty means
+                             "cpu". Matching is exact and case-sensitive (no
+                             stripping); any other value refuses the load with a
+                             named ForumEmbeddingConfigError, so the forum
+                             degrades to FTS/LIKE and says why on stderr.
+    FORUM_EMBEDDING_CPU_THREADS=N
+                           — torch intra-op thread cap applied once per
+                             successful load, only when the loaded model is on
+                             CPU. Unset means 4; an invalid value (not an
+                             integer from 1 to 1024) prints one stderr line and
+                             uses 4.
+
 Public API
 ----------
 available() -> bool
@@ -48,6 +62,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import struct
 import sys
 from typing import Any
@@ -109,6 +124,77 @@ EMBEDDING_DIM = 384
 _model: Any = None  # SentenceTransformer | None
 
 
+class ForumEmbeddingConfigError(ValueError):
+    """FORUM_EMBEDDING_DEVICE holds a value that is not cpu | cuda | cuda:N."""
+
+
+_DEVICE_RE = re.compile(r"^(cpu|cuda(:[0-9]+)?)$")
+_DEFAULT_CPU_THREADS = 4
+_MAX_CPU_THREADS = 1024
+
+
+def _embedding_device() -> str:
+    """Resolve FORUM_EMBEDDING_DEVICE at load time (unset or empty -> "cpu").
+
+    Exact, case-sensitive match; no stripping. Raises ForumEmbeddingConfigError
+    for anything else.
+    """
+    value = os.environ.get("FORUM_EMBEDDING_DEVICE", "")
+    if value == "":
+        return "cpu"
+    if not _DEVICE_RE.fullmatch(value):
+        raise ForumEmbeddingConfigError(
+            f"FORUM_EMBEDDING_DEVICE={value!r} is not valid; allowed: "
+            f"'cpu', 'cuda', or 'cuda:N' (N digits), exact and case-sensitive"
+        )
+    return value
+
+
+def _embedding_cpu_threads() -> int:
+    """Resolve FORUM_EMBEDDING_CPU_THREADS at load time (unset -> 4).
+
+    Accepts ASCII digits only, 1 to 4 characters, with value 1.._MAX_CPU_THREADS
+    (1024). Anything else does not refuse (thread count is a performance knob)
+    and never raises: one stderr line, then the default. The length check comes
+    before int(), so int() never sees a long string (CPython 3.12 raises
+    ValueError past 4300 digits). Mirrors engram_core._embedding_device_settings.
+    """
+    raw = os.environ.get("FORUM_EMBEDDING_CPU_THREADS")
+    if raw is None:
+        return _DEFAULT_CPU_THREADS
+    if re.fullmatch(r"[0-9]{1,4}", raw) and 1 <= int(raw) <= _MAX_CPU_THREADS:
+        return int(raw)
+    shown = repr(raw[:40])
+    note = f" (value truncated; length {len(raw)})" if len(raw) > 40 else ""
+    print(
+        f"[forum] FORUM_EMBEDDING_CPU_THREADS={shown} is not an integer from "
+        f"1 to {_MAX_CPU_THREADS}{note}; using {_DEFAULT_CPU_THREADS}",
+        file=sys.stderr,
+    )
+    return _DEFAULT_CPU_THREADS
+
+
+def _cap_cpu_threads(model: Any, threads: int) -> None:
+    """Apply torch.set_num_threads(threads) iff the LOADED model is on CPU.
+
+    Duplicate of engram_core._cap_cpu_threads (the original; forum does not
+    import engram_core). A model that reports no device is left alone.
+    """
+    dev = getattr(model, "device", None)
+    if dev is None:
+        dev = getattr(getattr(model, "model", None), "device", None)
+    if dev is None:
+        return
+    dev_type = getattr(dev, "type", None) or str(dev).split(":")[0]
+    if dev_type != "cpu":
+        return
+    try:
+        import torch  # noqa: WPS433
+        torch.set_num_threads(threads)
+    except Exception:
+        pass
+
+
 def _get_model() -> Any:
     """Return the loaded model singleton, loading it on first call.
 
@@ -129,13 +215,17 @@ def _get_model() -> Any:
         return None
     if _model is None:
         try:
+            dev = _embedding_device()
+            threads = _embedding_cpu_threads()
             try:
                 # #1762: offline-first load. A cached model loads with ZERO
                 # HuggingFace Hub network traffic -- no online etag-check,
                 # so the ~83s stall (HF Hub slow/unreachable) cannot happen
                 # on the common warm-cache path (every forum app startup
                 # after the first successful load).
-                _model = _SentenceTransformer(FORUM_EMBEDDING_MODEL, local_files_only=True)
+                _model = _SentenceTransformer(
+                    FORUM_EMBEDDING_MODEL, local_files_only=True, device=dev
+                )
             except Exception:
                 # Cache-miss: this install does NOT pre-download the
                 # embedder model as a discrete install step (verified --
@@ -150,7 +240,8 @@ def _get_model() -> Any:
                     f"loads are offline.",
                     file=sys.stderr,
                 )
-                _model = _SentenceTransformer(FORUM_EMBEDDING_MODEL)
+                _model = _SentenceTransformer(FORUM_EMBEDDING_MODEL, device=dev)
+            _cap_cpu_threads(_model, threads)
         except Exception as exc:
             print(
                 f"[forum] Failed to load embedding model '{FORUM_EMBEDDING_MODEL}': {exc}",

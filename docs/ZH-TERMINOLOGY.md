@@ -130,7 +130,7 @@ distinction is the reason:
   about to render a term. Four hand-copies of a lookup would drift, and drift is
   the exact failure this doc exists to prevent.
 
-**And `docs/PR-MERGE-POLICY.md` is the precedent for this choice, not a
+**And `docs/internal/PR-MERGE-POLICY.md` is the precedent for this choice, not a
 counterexample** — an earlier draft of this section wrongly named it as
 hand-duplicated. It is not hand-duplicated into any sibling repo (confirmed by
 API: 404 in both `umwelt` and `soma`), and this repo's `CLAUDE.md` calls it

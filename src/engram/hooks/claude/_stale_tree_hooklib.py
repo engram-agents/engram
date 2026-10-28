@@ -43,7 +43,7 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 # #3628: the config read is non-blocking and regular-file-only.
-from _hooklib import open_regular_text
+from _hooklib import engram_home as _resolve_engram_home, open_regular_text
 
 
 def load_watch_list(engram_home: Optional[str] = None) -> list[dict]:
@@ -55,14 +55,19 @@ def load_watch_list(engram_home: Optional[str] = None) -> list[dict]:
     individually (one malformed entry does not invalidate the rest of the
     list).
 
-    engram_home defaults to $ENGRAM_HOME or ~/.engram -- the identical
+    engram_home defaults to $ENGRAM_HOME or ~/.engram (a RELATIVE $ENGRAM_HOME is refused: []) -- the identical
     formula each hook already computes for its own module-level
     ENGRAM_HOME constant. Both hooks pass their own ENGRAM_HOME explicitly
     (read at call time, not import time) so per-hook test monkeypatching of
     `mod.ENGRAM_HOME` keeps working exactly as before this extraction.
     """
     if engram_home is None:
-        engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+        try:
+            engram_home = str(_resolve_engram_home())
+        except ValueError:
+            # #3863 step 3a: a RELATIVE ENGRAM_HOME is refused; this module's own failure convention
+            # ("[] on any read/parse/shape problem -- never raises") applies.
+            return []
 
     config_path = os.path.join(engram_home, "config.json")
     try:

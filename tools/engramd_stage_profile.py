@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """tools/engramd_stage_profile.py -- the U7 stage profiler for the engramd owner
-round trip (#3678, part of #2652; docs/2652-engrammanager-design.md SS6.1).
+round trip (#3678, part of #2652; docs/internal/2652-engrammanager-design.md SS6.1).
 
 It ATTRIBUTES the time of one `engramd_client.read("read", ...)` across named
 stages. It does not set the level: the wrappers it installs cost time of their
@@ -39,7 +39,8 @@ that moves or renames a stage.
 
     python tools/engramd_stage_profile.py [--n 1000] [--nodes 5000] [--warmup 50]
                                           [--store PATH] [--hook stop|user-identity]
-Exit 0 ok; 2 bad input (N below the 1000 floor, or --store is the live store).
+Exit 0 ok; 2 bad input (N below the 1000 floor, --store is the live store, or --store is missing /
+unusable: a FIFO, directory, symlink loop or unsearchable parent; refused before any build or temp dir).
 """
 from __future__ import annotations
 
@@ -98,8 +99,18 @@ INJECTABLE_STAGES = CLIENT_STAGES + OWNER_STAGES
 # A delay inside the end-to-end timer but outside every stage: it exists only to
 # prove end-to-end is timed on its own and the remainder is real.
 UNNAMED_GAP = "unnamed_gap"
+# #4183: owner stages whose injected delay sleeps BEFORE the wrapped call. Every
+# other owner stage sleeps after it (#4180: a late peer would absorb a pre-call
+# sleep). `response_send` is the exception: `sendall` is the owner's last action
+# before close and its "peer" is the kernel buffer, so nothing waits inside it
+# and a post-call sleep would land after the client already has its reply,
+# invisible to end-to-end.
+_PRECALL_INJECT_STAGES = frozenset({"response_send"})
 
 
+# No `_inject_into_function` target is a last action: its targets are `module:attr`
+# functions all upstream of the reply, and `sendall` is wrapped on `_TimedConn`,
+# not reachable as a target.
 def _inject_into_function(modules: Dict[str, object], target: str, delay: float) -> None:
     """Patch a delay INTO a real callable named "module:attr[.attr]", underneath
     any stage wrapper (call this before the wrappers go on). It is the
@@ -115,8 +126,11 @@ def _inject_into_function(modules: Dict[str, object], target: str, delay: float)
     real = getattr(obj, parts[-1])
 
     def delayed(*a, **k):
+        # #4180: after the call, so a late peer cannot absorb the delay (on an
+        # exception no delay is added, for simplicity).
+        result = real(*a, **k)
         time.sleep(delay)
-        return real(*a, **k)
+        return result
     setattr(obj, parts[-1], delayed)
 
 
@@ -166,6 +180,7 @@ class _Clock:
 
     def wrap(self, name: str, fn, inject: Dict[str, float]):
         delay = inject.get(name, 0.0)
+        precall = name in _PRECALL_INJECT_STAGES
         clock = self
 
         def timed(*args, **kwargs):
@@ -176,9 +191,16 @@ class _Clock:
             recs.append([name, time.monotonic(), None, stack[-1] if stack else None])
             stack.append(idx)
             try:
-                if delay:
+                if delay and precall:
                     time.sleep(delay)
-                return fn(*args, **kwargs)
+                result = fn(*args, **kwargs)
+                # #4180: sleep AFTER the call, inside the span. A sleep before it
+                # runs in parallel with a late peer (request_read waits on the
+                # client) and adds nothing. On an exception no delay is added,
+                # for simplicity. Exception: _PRECALL_INJECT_STAGES (#4183).
+                if delay and not precall:
+                    time.sleep(delay)
+                return result
             finally:
                 stack.pop()
                 recs[idx][2] = time.monotonic()
@@ -430,6 +452,10 @@ class _ClientTimer:
         def timed(*a, **k):
             t0 = time.monotonic()
             try:
+                # Stays PRE-call (#4180): client stages have no waiting peer
+                # inside the wrapped call, so a post-call sleep would only push
+                # the delay into the next stage (measured: request_send
+                # post-call leaks ~1.8 ms into response_delivery).
                 if delay:
                     time.sleep(delay)
                 return fn(*a, **k)
@@ -733,6 +759,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.n < N_FLOOR:
         print(f"--n must be >= {N_FLOOR} (#3678)", file=sys.stderr)
         return 2
+    if a.store is not None:
+        # #3962: classify the path BEFORE `_is_live_store` (its resolve() raises on a symlink loop) and before
+        # make_test_store (a FIFO hangs its mode=ro connect; a missing path leaves a temp dir). Reuses a6's helper.
+        store_problem = _load_a6()._check_store_arg(a.store)
+        if store_problem is not None:
+            print(f"refusing: {store_problem}", file=sys.stderr)
+            return 2
     if a.store is not None and _load_a6()._is_live_store(a.store):
         print(f"refusing: {a.store} is this seat's live store; pass a copy", file=sys.stderr)
         return 2

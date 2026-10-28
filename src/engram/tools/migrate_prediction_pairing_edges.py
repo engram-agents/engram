@@ -199,7 +199,17 @@ def main():
         print("Use --db PATH to specify the correct path.", file=sys.stderr)
         sys.exit(1)
 
-    run_migration(args.db, dry_run=not args.apply)
+    # #3882: an offline repair tool. ALL of its opens (the dry run included) go under the one
+    # store-maintenance lock, taken before the first and held to the end of the run, so an owner and this
+    # tool exclude each other. Imported here, not at module level: importing this tool opens nothing.
+    import engram_core as core
+    lock_fd = core.acquire_store_maint_lock_or_report(args.db, "migrate_prediction_pairing_edges")
+    if lock_fd is None:
+        sys.exit(core.STORE_MAINT_REFUSED_EXIT)
+    try:
+        run_migration(args.db, dry_run=not args.apply)
+    finally:
+        core.release_store_maint_lock(lock_fd)
 
 
 if __name__ == "__main__":

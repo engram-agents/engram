@@ -23,10 +23,24 @@
       ]
     },
     {
+      "key": "1ce567fd44516865b873f2446cffb547b5b6a78bd6525662a91c6fcb49b8790a",
+      "sql": "select id,claim,metadata from nodes where type='lesson' and is_current=1",
+      "sites": [
+        "tools/lesson-pattern-audit.py:read_lesson_rows"
+      ]
+    },
+    {
       "key": "1f0642346288d91dd8ece6a13066919a24df7fdc305f365332735f83a606fbc5",
       "sql": "SELECT id, type, claim, confidence, recall_turn, status FROM nodes WHERE is_current = 1 AND COALESCE(status, '') != 'retracted' AND type IN (SELECT value FROM json_each(?))",
       "sites": [
         "tools/study_queue.py:store_candidates"
+      ]
+    },
+    {
+      "key": "22897ccbda600c30894be5229ec07d812a7eac2d88169d52051096157f505cd3",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
       ]
     },
     {
@@ -62,6 +76,13 @@
       "sql": "SELECT id, type FROM nodes WHERE id = ?",
       "sites": [
         "engram_core.py:generalization_chain"
+      ]
+    },
+    {
+      "key": "48a7753209f6ac179505f3ac955bf00ed42a4b55c16b0fbe6aef1a81c710f4c4",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND (s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t.status != 'retracted') AND e.source_id = ? ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
       ]
     },
     {
@@ -101,13 +122,6 @@
       ]
     },
     {
-      "key": "5ca245030193bc0e9811e8af365843b66ab4c4d999bbf2d13b79eabc0df37ee8",
-      "sql": "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
-      "sites": [
-        "engram_core.py:generalization_chain"
-      ]
-    },
-    {
       "key": "5d20068d948c7f26fbda3c1aba1bb024044429ca0fa87a888ebcf0e3bfbe8c1d",
       "sql": "SELECT source_url, source_title FROM nodes WHERE id = ?",
       "sites": [
@@ -119,6 +133,13 @@
       "sql": "SELECT id FROM nodes WHERE is_current=1 AND embedding IS NULL ORDER BY id",
       "sites": [
         "tools/engram-regenerate-embeddings.py:_owner_null_ids"
+      ]
+    },
+    {
+      "key": "63284cb7557117ca4923d3cf3f77dfaeaffa7b6dc889937f86890b9b38dbc198",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) AND e.source_id = ? ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
       ]
     },
     {
@@ -144,6 +165,13 @@
       ]
     },
     {
+      "key": "85980984a9c48cb2fcc9b9b4f1e4495a5cec0a9818f6f95212bf9c503825779e",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) AND e.target_id = ? ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
+      ]
+    },
+    {
       "key": "8fd6a2adcab8ffb85efcf1e3b22c7433632f94a0d820c60cf37d4ba22ebd154e",
       "sql": "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at",
       "sites": [
@@ -155,6 +183,13 @@
       "sql": "SELECT id, type, substr(trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000'), 1, 100), recall_summary, created_at, is_current, status FROM nodes WHERE created_at >= ? AND (trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '' OR trim(coalesce(recall_summary, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '') ORDER BY created_at ASC, rowid ASC LIMIT 200",
       "sites": [
         "hooks/claude/engram-session-start-hook.py:session_checkpoint_block"
+      ]
+    },
+    {
+      "key": "937e74dc33b2fc633f14c8dac8e35b4205852ef048846787374d3195a81f6d35",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND (s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t.status != 'retracted') AND e.target_id = ? ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
       ]
     },
     {
@@ -214,17 +249,17 @@
       ]
     },
     {
-      "key": "c4c336fb9802f92e244bed1ab36b75acd83db33fc04a07015a3e9c344893a1d7",
-      "sql": "SELECT DISTINCT e.target_id FROM edges e JOIN nodes ct ON ct.id = e.source_id WHERE e.relation = 'contradicts' AND ct.type = 'contradiction' AND ct.is_current = 1 AND ct.status IN (SELECT value FROM json_each(?))",
-      "sites": [
-        "tools/weakest_load_bearing.py:_contested_ids"
-      ]
-    },
-    {
       "key": "c7ebb686c91c35f89f5bff3b5f1e3b9a746e2568d35a35899fc868a0d8d99223",
       "sql": "SELECT id, claim, logical_chain, metadata FROM nodes WHERE type = 'person' AND is_current = 1",
       "sites": [
         "hooks/claude/engram-user-identity-hook.py:get_person_nodes"
+      ]
+    },
+    {
+      "key": "ca8b4ed636fff6ff5a852689b4eb0bfe6bbc730f98931ab0d6ef69285651d0a2",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND (s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t.status != 'retracted') ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
       ]
     },
     {
@@ -275,6 +310,13 @@
       "sql": "\nSELECT\n    id,\n    COALESCE(\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.anchor_line'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.surfacing_nudge'),\n        claim\n    ) AS nudge,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.match_scope')  AS match_scope,\n    recall_summary,\n    claim\nFROM nodes\nWHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''\n",
       "sites": [
         "hooks/claude/engram-lesson-tripwire-hook.py:load_tripwires"
+      ]
+    },
+    {
+      "key": "df2a043a09fecd8f84e186a0ad064e0f1ce209a75d7731f103dc47458eb405dd",
+      "sql": "SELECT DISTINCT e.target_id FROM edges e JOIN nodes ct ON ct.id = e.source_id WHERE e.relation IN ('contradicts', 'acknowledged_contradicts') AND ct.type = 'contradiction' AND ct.is_current = 1 AND ct.status IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/weakest_load_bearing.py:_contested_ids"
       ]
     },
     {
@@ -338,11 +380,11 @@
   "declared_out_of_scope": [
     {
       "site": "hooks/claude/engram-session-start-hook.py:_check_json1",
-      "reason": "JSON1 probe, exactly 1 site, on a FRESH in-memory sqlite connection (#3327): never touches the owner-held knowledge.db, so it is not a client read of the store; out of scope per docs/2652-security-slice-design.md SS3.5 (reads of a store other than the owner's)"
+      "reason": "JSON1 probe, exactly 1 site, on a FRESH in-memory sqlite connection (#3327): never touches the owner-held knowledge.db, so it is not a client read of the store; out of scope per docs/internal/2652-security-slice-design.md SS3.5 (reads of a store other than the owner's)"
     },
     {
       "site": "hooks/claude/engram-surface-hook.py:_query_attached_packs",
-      "reason": "package-DB read, exactly 1 site (nodes_fts on pack[\"path\"], an attached pack archive opened mode=ro&immutable=1, not the owner-held store); out of scope per docs/2652-security-slice-design.md SS3.5"
+      "reason": "package-DB read, exactly 1 site (nodes_fts on pack[\"path\"], an attached pack archive opened mode=ro&immutable=1, not the owner-held store); out of scope per docs/internal/2652-security-slice-design.md SS3.5"
     }
   ]
 }

@@ -61,7 +61,7 @@ def _open_readonly(db_path: Path) -> sqlite3.Connection:
 
 def _fetch_population(conn: sqlite3.Connection, quote_type: str | None) -> list[sqlite3.Row]:
     query = (
-        "SELECT id, quote_type, confidence, claim, quoted_text, interpretation "
+        "SELECT id, quote_type, confidence, claim, quoted_text, interpretation, metadata, created_at "
         "FROM nodes WHERE type IN (?, ?) AND is_current = 1"
     )
     params: list = list(_POPULATION_TYPES)

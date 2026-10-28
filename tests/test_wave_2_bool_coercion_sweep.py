@@ -48,7 +48,7 @@ def _add_observation(server, claim="x claim", url="https://example.com/test", is
     payload = {
         "url": url,
         "title": "Test source",
-        "quoted_text": claim,
+        "quoted_text": claim + " in the cited source",
         "interpretation": f"Interpretation: {claim}",
         "claim": claim,
         "quote_type": "hard_data",
@@ -109,14 +109,14 @@ class TestObservationIsPredictiveBool:
         server = fresh_server()
         observations = [
             {
-                "quoted_text": "ok obs",
+                "quoted_text": "ok obs in the cited source",
                 "interpretation": "valid",
                 "claim": "valid claim",
                 "quote_type": "hard_data",
                 "is_predictive": False,  # actual bool — should succeed
             },
             {
-                "quoted_text": "bad obs",
+                "quoted_text": "bad obs in the cited source",
                 "interpretation": "string-bool",
                 "claim": "bad claim",
                 "quote_type": "hard_data",
