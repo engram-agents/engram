@@ -25,17 +25,11 @@ SLEEP_MD = REPO / "src/engram/skills/claude/engram-sleep/SKILL.md"
 LOTTERY_PY = REPO / "tools/dream_lottery.py"
 
 # Categories with no "## Category N —" output-contract section, each with its
-# OWN reason. Split deliberately: an earlier revision lumped both under
-# "owned by other agents", which is true of 10 and FALSE of 9 — category 9 IS
-# this fairy's scan (it has a scan item, and the spec's own header line reads
-# "numbered 1–9, 11 and 12"), it simply never got a section. Filing them under
-# one false reason encoded a real pre-existing gap as intentional, which is
-# worse than having no exemption at all.
+# OWN reason. Category 9 used to be listed here as a pre-existing gap
+# (engram-alpha#2879); it now has its section and is enforced like the rest.
+# Never re-add an entry for a category this fairy scans: filing a real gap as
+# intentional is worse than having no exemption at all.
 NO_OUTPUT_CONTRACT_SECTION = {
-    9: "PRE-EXISTING GAP, not intentional: category 9 (coverage-gaps) is "
-       "dispatched to this fairy and has a scan item, but no output-contract "
-       "section. Predates this file; tracked as engram-alpha#2879. Do not read "
-       "this entry as approval.",
     10: "Owned by engram-person-node-fairy in the shared lottery namespace — "
         "correctly absent from THIS agent's spec.",
 }
@@ -233,3 +227,109 @@ def test_every_lottery_category_has_a_dispatch_table_row():
         f"dispatch-table slug mismatch {wrong} (table, lottery) -- the gate may "
         f"be anchored on a stale copy of the table rather than the live one"
     )
+
+
+# --- Category 9 contract (engram-alpha#2879) --------------------------------
+
+def _category_9_output_section() -> str:
+    """Text of the '## Category 9 —' section, up to the next '## ' heading."""
+    text = FAIRY_MD.read_text(encoding="utf-8")
+    m = re.search(r"^## Category 9 — .*?(?=^## )", text, re.M | re.S)
+    assert m, f"{FAIRY_MD.name} has no '## Category 9 —' output-contract section"
+    return m.group(0)
+
+
+def _scan_item_9() -> str:
+    """Text of scan item 9, up to scan item 11."""
+    text = FAIRY_MD.read_text(encoding="utf-8")
+    m = re.search(r"^9\. \*\*Cornerstone auto-load.*?(?=^11\. \*\*)", text, re.M | re.S)
+    assert m, "scan item 9 not found (or item 11 no longer follows it)"
+    return m.group(0)
+
+
+def test_cat9_section_names_the_count_of_record():
+    sec = _category_9_output_section()
+    assert "cornerstone_coverage" in sec
+    assert "engram_diagnose" in sec
+
+
+def test_cat9_c1_denominator_line_required_even_with_no_gaps():
+    sec = _category_9_output_section()
+    assert "count of record (engram_diagnose.cornerstone_coverage):" in sec
+    assert "<covered>/<total> covered, <uncovered> uncovered; surfaces_checked:" in sec
+    assert "REQUIRED" in sec and "even when" in sec
+
+
+def test_cat9_c2_gap_lines_come_only_from_uncovered_list():
+    sec = _category_9_output_section()
+    assert "uncovered_list" in sec
+    assert "(verified)" in sec
+    assert "suggested action: add an anchor for cs_XXXX on an auto-load surface" in sec
+
+
+def test_cat9_c3_instrument_failure_is_reported_as_failure():
+    sec = _category_9_output_section()
+    assert "instrument failed: <error or 'key missing'>" in sec
+    assert "NO gaps" in sec
+    assert "never" in sec and "all covered" in sec
+
+
+def test_cat9_c3_section_forbids_substituting_a_self_computed_count():
+    # Exact phrase, so a rewrite that keeps the words "never"/"all covered"
+    # but turns the ban into a fallback instruction still goes red.
+    assert "never substitute a self-computed count" in _category_9_output_section()
+
+
+def test_cat9_c3_item_forbids_substituting_a_count_of_your_own():
+    assert "never substitute a count of your own" in _scan_item_9()
+
+
+def test_cat9_c3_no_fallback_instruction_in_section_or_item():
+    # Negative assertion: the plausible-wrong rewrite is "if diagnose fails, fall
+    # back to grepping the surfaces yourself" (PR #4243 round-1 review).
+    for name, text in (("section", _category_9_output_section()), ("item 9", _scan_item_9())):
+        low = text.lower()
+        assert "fall back" not in low, f"cat-9 {name} tells the fairy to fall back"
+        assert "fallback" not in low, f"cat-9 {name} tells the fairy to fall back"
+
+
+def test_cat9_c3_empty_surfaces_checked_is_an_instrument_failure():
+    # An empty surfaces_checked means no surface file was read, so every
+    # cornerstone lands in uncovered_list with no `error` key (#2879).
+    for name, text in (("section", _category_9_output_section()), ("item 9", _scan_item_9())):
+        # The condition phrase itself, not any mention: the section also names
+        # the case in its output-template parenthetical, which must not mask a
+        # deleted condition.
+        assert "or has an empty `surfaces_checked`" in text, (
+            f"cat-9 {name} does not name the empty-surfaces_checked failure case"
+        )
+
+
+def test_cat9_c4_no_slot_for_a_second_count():
+    sec = _category_9_output_section().lower()
+    assert "no second count" in sec
+
+
+def test_cat9_c4_section_has_no_grep():
+    assert "grep" not in _category_9_output_section().lower()
+
+
+def test_cat9_c4_item_only_mentions_grep_in_the_forbidding_sentence():
+    item = _scan_item_9()
+    forbid = "do not re-derive coverage by grepping the surfaces yourself"
+    assert forbid in item
+    assert "grep" not in item.replace(forbid, "").lower()
+    assert "```" not in item  # no fenced bash block to run
+
+
+def test_cat9_item_states_null_tag_renders_as_empty_string():
+    item = _scan_item_9()
+    assert 'tag: ""' in item
+    assert "not null" in item
+
+
+def test_cat9_scan_item_uses_diagnose_not_engram_list_or_grep():
+    item = _scan_item_9()
+    assert "engram_diagnose" in item
+    assert "engram_list(node_type='cornerstone')" not in item
+    assert "grep -l" not in item
