@@ -43,7 +43,7 @@ from test_engram_signature import (  # noqa: E402,F401
 SOL = "gpt-6.1-sol"
 CODEX_LINE = (
     f"\U0001fa90 Kepler Somnium · {SOL} · "
-    f"ENGRAM {VERSION} · Lei Shi's agent"
+    f"ENGRAM {VERSION} · Lei Shi's agent · engram-agents.org"
 )
 
 # REAL record (redacted values only), see module docstring.

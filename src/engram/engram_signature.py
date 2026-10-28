@@ -4,11 +4,14 @@ One function, ``build_signature``, shared by the ``engram_sign`` MCP tool
 (``server.py``) and the ``tools/engram-sign.py`` CLI. It emits ONE predictable
 line that an agent appends to every external communication:
 
-    <emoji> <Full Name> . <marketing name> (<model id>) . ENGRAM <version> . <primary_user>'s agent
+    <emoji> <Full Name> . <marketing name> (<model id>) . ENGRAM <version> . <primary_user>'s agent . <site>
 
 (the separator is U+00B7 MIDDLE DOT). When the harness reports no marketing
 name, the middle part is just ``<model id>``. When the deployed build is
 tagged and clean, the version renders as ``ENGRAM <version> (<alpha_tag>)``.
+The final ``<site>`` segment is the project website (default ``PROJECT_SITE``),
+so a reader of an externally posted signature can find where to get ENGRAM; it
+is omitted when ``signature_site`` is set to the empty string.
 
 Every field is read mechanically, none is typed from memory, and an unreadable
 field is a REFUSAL naming the field and how to fix it -- never a placeholder
@@ -19,6 +22,7 @@ Field sources:
   emoji / name / human / lineage  <data_dir>/config.json:
                                   signature_emoji, display_name, primary_user,
                                   self_lineage
+  site                            config.json signature_site, else PROJECT_SITE
   model                           the session transcript: newest JSONL row with
                                   attachment.type == "model"
                                   (attachment.identity.modelId + marketingName);
@@ -68,6 +72,21 @@ from pathlib import Path
 
 SEP = " · "
 
+# The project's own public address. A constant is honest here: it is identical
+# for every install and shipped by the project, so it is not a per-seat fact and
+# not a read that can fail.
+#
+# Optional config override ``signature_site`` in config.json. CONTRACT:
+#   - key ABSENT            -> PROJECT_SITE (a true optional: the default is the
+#                              project's address, not a hidden failed read)
+#   - non-empty string      -> that string, verbatim after .strip()
+#   - "" / whitespace only  -> segment OMITTED; the line ends at "<user>'s agent"
+#   - any non-string type   -> REFUSE (field="signature_site"). House rule: a
+#     wrong-type value is an unreadable field, not an absent one. This
+#     deliberately differs from the config reads in #4232 (wrong-type as
+#     absent); do not "fix" it toward #4232.
+PROJECT_SITE = "engram-agents.org"
+
 
 @dataclass
 class SignatureResult:
@@ -104,6 +123,19 @@ def _cfg_str(cfg: dict, key: str, data_dir: Path) -> str:
         raise _Refusal(
             key, f"{key} is missing or empty: set {key} in "
                  f"{data_dir / 'config.json'}")
+    return v.strip()
+
+
+def _cfg_site(cfg: dict, data_dir: Path) -> str:
+    """The site segment ("" = omitted). See the PROJECT_SITE contract."""
+    if "signature_site" not in cfg:
+        return PROJECT_SITE
+    v = cfg["signature_site"]
+    if not isinstance(v, str):
+        raise _Refusal(
+            "signature_site",
+            f"signature_site in {data_dir / 'config.json'} must be a string "
+            f"(or removed), found {type(v).__name__}")
     return v.strip()
 
 
@@ -352,6 +384,7 @@ def build_signature(data_dir: Path, session_id: str | None = None,
         name = _cfg_str(cfg, "display_name", data_dir)
         human = _cfg_str(cfg, "primary_user", data_dir)
         lineage = _cfg_str(cfg, "self_lineage", data_dir)
+        site = _cfg_site(cfg, data_dir)
 
         marker = _find_marker(data_dir, session_id)
         tp = marker.get("transcript_path")
@@ -390,10 +423,13 @@ def build_signature(data_dir: Path, session_id: str | None = None,
 
     model_part = f"{marketing} ({model_id})" if marketing else model_id
     ver_part = f"ENGRAM {version}" + (f" ({tag})" if tag else "")
-    line = SEP.join([f"{emoji} {name}", model_part, ver_part,
-                     f"{human}'s agent"])
+    segs = [f"{emoji} {name}", model_part, ver_part, f"{human}'s agent"]
+    if site:
+        segs.append(site)
+    line = SEP.join(segs)
     return SignatureResult(ok=True, line=line, parts={
         "emoji": emoji, "display_name": name, "model_id": model_id,
         "marketing_name": marketing, "family": measured,
         "version": version, "alpha_tag": tag, "primary_user": human,
+        "site": site,
     })

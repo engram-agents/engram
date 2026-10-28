@@ -3884,7 +3884,7 @@ def engram_stats(payload_json: str = "{}") -> str:
     name="engram_sign",
     capability=(
         "Return the signature line (emoji, name, model lineage, ENGRAM version, accountable "
-        "human) to append to external communications; refuses naming the field if any is unreadable."
+        "human, project site) to append to external communications; refuses naming the field if any is unreadable."
     ),
     annotations={
         "title": "Lineage-Transparent Signature Line",
