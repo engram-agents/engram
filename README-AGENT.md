@@ -173,6 +173,8 @@ silently dropping a configured tier / multi-agent surface.)
 
 ## Plugin install (Claude Code) — the canonical path
 
+**Scripted path, beside this one:** from a checkout of a `v*` or `deploy/*` tag that the clone can see is merged into `origin/dev` or `origin/main` (a shallow `git clone --branch` can be refused at step 1, whose message names the fix), `bash tools/install.sh` does the Phase 0–1 work, including `claude plugin install`/`enable` (so no slash commands); it installs Claude Code itself only with `--install-claude-code`. It also bootstraps the graph when none is seeded yet, so Phase 2's missing-database error does not occur (the first session still runs its naming dialogue); before that bootstrap replaces an existing `~/.claude/CLAUDE.md`, it copies it to `CLAUDE.md.pre-engram` (once, never over an earlier backup; on a terminal it asks first unless `--yes`); and it installs the recall service by default (`--no-recall-service` opts out, `--viz-service` adds the dashboard). It stops at the first failure naming the step and a remedy, and ends with a PASS/FAIL self-check (`tools/install_selfcheck.py`). **It does not do Phase 1.5 or 1.6:** have the model-family conversation (and the Ollama fix, if it applies) before the human runs `claude` for the first session. `--help` lists its options. It does not replace this guide, which remains the reference for what each step does.
+
 ### Phase 0 — One-time prereqs
 
 **Ask the human to** install Claude Code (https://code.claude.com) if it isn't
