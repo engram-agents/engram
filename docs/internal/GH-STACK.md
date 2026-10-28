@@ -125,8 +125,9 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   predicts the outcome.
 
   **The operational instruction is unchanged and firmer for the
-  re-attribution: compare the approval's `commit_id` to the PR's current
-  `headRefOid` after every layer, and never predict whether a dismissal
+  re-attribution: after every layer, an approval counts only if its `commit_id`
+  is the PR's current `headRefOid` AND its `submitted_at` is not earlier than that
+  commit's committer date (`commit_id` alone can be re-pointed, #2267), and never predict whether a dismissal
   will occur** — the predictor is per-branch configuration, which a merge
   seat is usually not holding in mind, and it is a *different repo's*
   configuration whenever you move between repos. Verify that configuration
@@ -301,7 +302,18 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   not excluded, and if true it would make liveness itself the predicting
   property this paragraph says nothing is known to be. What would decide it: a
   live, never-dismissed approval whose `commit_id` does NOT move, or a
-  dismissed review whose `commit_id` DOES move. We have neither. Read
+  dismissed review whose `commit_id` DOES move. **The first now exists
+  (2026-10-27, engram-alpha #4239):** after a gh-stack auto-rebase onto a
+  patch-identical head (`7b3b59eb` → `851f697f`, patch-id `18d35264`), Borges's
+  approval stayed `APPROVED`, was never dismissed, and kept `commit_id
+  7b3b59eb`. The same operation on umwelt#1142 and #1144 that morning re-pointed
+  the approvals. So liveness plus patch identity does not predict migration,
+  and what separates the two is unmeasured (the rulesets differ, and so does
+  the pushing seat). Cases so far, by outcome: re-pointed #2338 (08-29), #3181
+  (09-27), #3273 (10-01), umwelt#1142/#1144 (10-27); dismissed #2189 (09-02),
+  #2814 (09-11), #4174 (10-25); kept #4239 (10-27). Measurements: #2267 comment
+  6468903610. The second (a dismissed review whose `commit_id` moves) is still
+  unseen. Read
   `.commit.committer.date`, NOT `.commit.author.date` — a rebase preserves the
   author date and stamps a fresh committer date, and `990de705`'s author date
   (2026-08-28T21:47:22Z, three minutes before the review) points the wrong way.

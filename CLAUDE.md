@@ -401,12 +401,12 @@ enters the maintainer's merge queue:
    this directly, after the colleague-fairy-delegation lapse incident).
 
 **The merge gate itself**, operationalizing Lei's same ruling: a non-author
-peer APPROVE whose commit **is** the PR's current `headRefOid`, plus CI green
-on that same head. A new commit after approval needs a **fresh** peer review
+peer APPROVE of the PR's current head (what counts: "Approvals after a layer"
+below), plus CI green on that same head. A new commit after approval needs a **fresh** peer review
 and approval — the peer simply looks again (the `dev` ruleset already
 enforces this mechanically: dismiss-on-push + last-push approval) — never a
 fairy re-check or a diff-equivalence argument standing in for it. The merge
-seat still compares the approval's commit to the head directly rather than
+seat still checks the approval against the head directly rather than
 trusting `reviewDecision` alone: a manual force-push on this repo has been
 seen to keep a stale approval alive on a *different* PR (#2338, a manual
 force-push, explicitly NOT gh-stack's auto-rebase — see "Stacked PRs" below
@@ -611,8 +611,8 @@ record directly (`gh pr view <N> --comments`, or the REST fallback documented
 below if that command's `gh` version is affected) — **never infer it from a
 colleague approval being present.** A colleague approval is evidence the
 colleague pass happened; it is not evidence the fairy pass happened first, or
-at all. (2) The actual merge gate — a non-author peer APPROVE whose commit
-**is** the current `headRefOid`, plus CI green on that head.
+at all. (2) The actual merge gate — a non-author peer APPROVE of the
+current head ("Approvals after a layer" says what counts), plus CI green on it.
 
 **Check both surfaces, and read them whole.** Fairy rounds in this repo post as
 **comments**; a round transcribed by a colleague sits in a **review body**.
@@ -694,9 +694,12 @@ knows it exists unless a surface carries it; this section is that surface (Lei,
   approval is dismissed on push depends on the base branch's
   `dismiss_stale_reviews_on_push` — **necessary on the evidence, not
   demonstrably sufficient**, so never treat it as a rule that predicts the
-  outcome. After every layer, read the approval back off `pulls/<N>/reviews` and
-  **compare its `commit_id` to the PR's current `headRefOid`**; never trust
-  `reviewDecision` alone. (On engram-alpha the setting is `true` on `dev`,
+  outcome. After every layer, read the approval back off `pulls/<N>/reviews`: it
+  counts only if its `commit_id` is the PR's current `headRefOid` AND its
+  `submitted_at` is not earlier than that commit's committer date.
+  **`commit_id == headRefOid` alone is never sufficient**: GitHub can re-point live
+  approvals onto newer heads (engram-alpha#2267). Otherwise get a fresh approval
+  (source of truth: engram-alpha `docs/internal/PR-MERGE-POLICY.md`, gate item 2). Never trust `reviewDecision` alone. (On engram-alpha the setting is `true` on `dev`,
   `false` on `main`.)
 - **Read branch protection via `rules/branches/<b>`, never
   `branches/<b>/protection`.** The classic endpoint answers by caller permission
