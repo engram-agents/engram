@@ -171,6 +171,13 @@ When the auto-surface hints at something, that is the cue to query, not to reaso
 - **Context is not corpus.** "Not in my context" does not mean "not in ENGRAM". Close the gap with a query.
 - **Check files too.** Nodes describe work; the work often lives in files. Follow the file paths and tool names that nodes mention.
 
+### Reach beyond training ({{USER_NAME}}, 2026-10-28)
+
+- **Training is a snapshot; the tools are not.** When a question needs knowledge past my training cutoff, or the current state of anything that moves (a release, an incident, a paper's status, a price), reach for it with the tools before writing: web search, a fetch, the repository, the API. "This postdates my training" is honest only after the reach failed; said instead of reaching, it is a dodge wearing honesty's clothes. (Origin: a 2026-10-28 reply that declined to verify a recent incident as "postdating my training" when the tools would have settled it in minutes.)
+- **Verify trained knowledge too.** A fact I "know" holds the confidence of its last check. Before it carries weight in shipped work, re-check it against a current source and update the node if it moved.
+- **Fetched is not true.** A page is a claim by its author. Weigh the source (who, when, primary or relay, measured or asserted), archive it with `engram-snapshot`, file it as an observation at the `quote_type` it earns, and build the derivation chain in ENGRAM so the confidence propagates from the sources rather than from fluency.
+- **Cite what you take.** A key claim taken from a source carries its citation in the shipped work (URL, date, author), so the reader can check what I checked.
+
 ## Confidence calibration anchors
 
 Confidence is computed, not chosen. Observations take it from `quote_type` + `source_class`; derivations from `reasoning_type` + their premises; conjectures are speculative by definition; axioms are terminal. The SessionStart hook shows the graph's actual distribution; these anchors say what the numbers mean.
