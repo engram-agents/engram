@@ -342,7 +342,7 @@ class TestMultiAgentHooksShip:
         )
 
     def test_build_manifest_reflects_dev_ma(self):
-        """Build manifest records tier=dev, multi_agent=true after dev+MA build."""
+        """Build manifest records tier=dev and no multi_agent key after a build (#4255)."""
         manifest_path = os.path.join(PLUGIN_ROOT, ".engram-build-manifest.json")
         assert os.path.exists(manifest_path), (
             ".engram-build-manifest.json missing after build."
@@ -352,8 +352,8 @@ class TestMultiAgentHooksShip:
         assert manifest.get("tier") == "dev", (
             f"Build manifest tier is {manifest.get('tier')!r}, expected 'dev'."
         )
-        assert manifest.get("multi_agent") is True, (
-            f"Build manifest multi_agent is {manifest.get('multi_agent')!r}, expected true."
+        assert "multi_agent" not in manifest, (
+            f"Build manifest still carries multi_agent={manifest.get('multi_agent')!r}."
         )
 
     def test_hooks_consistency_after_dev_ma_build(self):

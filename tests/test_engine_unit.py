@@ -47,7 +47,7 @@ class TestSelectShippables:
 
     def test_essential_only_returns_essential_entries(self):
         """Essential tier: only entries tagged essential should be returned."""
-        result = self.select_shippables(self.manifest, "essential", multi_agent=False)
+        result = self.select_shippables(self.manifest, "essential")
         paths = {e["path"] for e in result}
         # All returned entries must be tagged essential
         for entry in result:
@@ -61,7 +61,7 @@ class TestSelectShippables:
 
     def test_essential_excludes_convenience_entries(self):
         """Essential tier must NOT include convenience-tier entries."""
-        result = self.select_shippables(self.manifest, "essential", multi_agent=False)
+        result = self.select_shippables(self.manifest, "essential")
         paths = {e["path"] for e in result}
         # Known convenience entry must be absent
         assert "skills/claude/engram-loop" not in paths
@@ -69,8 +69,8 @@ class TestSelectShippables:
 
     def test_convenience_is_superset_of_essential(self):
         """Convenience set must include everything essential ships."""
-        essential = {e["path"] for e in self.select_shippables(self.manifest, "essential", False)}
-        convenience = {e["path"] for e in self.select_shippables(self.manifest, "convenience", False)}
+        essential = {e["path"] for e in self.select_shippables(self.manifest, "essential")}
+        convenience = {e["path"] for e in self.select_shippables(self.manifest, "convenience")}
         missing = essential - convenience
         assert not missing, (
             f"convenience set is not a superset of essential: {sorted(missing)}"
@@ -78,8 +78,8 @@ class TestSelectShippables:
 
     def test_dev_is_superset_of_convenience(self):
         """Dev set (no MA) must include everything convenience (no MA) ships."""
-        conv = {e["path"] for e in self.select_shippables(self.manifest, "convenience", False)}
-        dev = {e["path"] for e in self.select_shippables(self.manifest, "dev", False)}
+        conv = {e["path"] for e in self.select_shippables(self.manifest, "convenience")}
+        dev = {e["path"] for e in self.select_shippables(self.manifest, "dev")}
         missing = conv - dev
         assert not missing, (
             f"dev set is not a superset of convenience: {sorted(missing)}"
@@ -87,14 +87,14 @@ class TestSelectShippables:
 
     def test_dev_tier_ships_dev_entries(self):
         """Dev tier must include entries tagged dev."""
-        result = self.select_shippables(self.manifest, "dev", multi_agent=False)
+        result = self.select_shippables(self.manifest, "dev")
         paths = {e["path"] for e in result}
         assert "tools/scan-leaks.py" in paths
         assert "tools/surgical.py" in paths
 
     def test_dev_entries_absent_at_convenience(self):
         """Dev-tagged entries must not ship at convenience tier."""
-        result = self.select_shippables(self.manifest, "convenience", multi_agent=False)
+        result = self.select_shippables(self.manifest, "convenience")
         paths = {e["path"] for e in result}
         assert "tools/scan-leaks.py" not in paths
         assert "tools/surgical.py" not in paths
@@ -103,7 +103,7 @@ class TestSelectShippables:
         """Entries in manifest['excluded'] are not in mechanisms[] and never returned."""
         from tools.engine.manifest import select_shippables
         excluded_paths = {e["path"] for e in self.manifest.get("excluded", [])}
-        result = self.select_shippables(self.manifest, "dev", multi_agent=True)
+        result = self.select_shippables(self.manifest, "dev")
         returned_paths = {e["path"] for e in result}
         overlap = excluded_paths & returned_paths
         assert not overlap, (
@@ -112,7 +112,7 @@ class TestSelectShippables:
 
     def test_preserves_manifest_order(self):
         """select_shippables returns entries in manifest order (same as mechanisms[])."""
-        result = self.select_shippables(self.manifest, "dev", multi_agent=True)
+        result = self.select_shippables(self.manifest, "dev")
         # All result paths must appear in the same relative order as in mechanisms[]
         mechanism_paths = [e["path"] for e in self.manifest["mechanisms"]]
         result_paths = [e["path"] for e in result]

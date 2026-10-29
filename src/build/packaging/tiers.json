@@ -5,9 +5,6 @@
     "convenience",
     "dev"
   ],
-  "axes": {
-    "multi_agent": "orthogonal flag — composes with any depth tier"
-  },
   "default_tier": "convenience",
   "source_root": "src/engram",
   "telemetry": {

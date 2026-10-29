@@ -120,7 +120,6 @@ class TestReconciliationFiresOnGap:
                 repo_root=REPO_ROOT,
                 plugin_root=bundle_dir,
                 tier="essential",
-                multi_agent=False,
                 manifest=augmented,
             )
 
@@ -150,7 +149,6 @@ class TestReconciliationFiresOnGap:
                 repo_root=REPO_ROOT,
                 plugin_root=bundle_dir,
                 tier="essential",
-                multi_agent=False,
                 manifest=augmented,
             )
 
@@ -191,7 +189,6 @@ class TestReconciliationFiresOnGap:
                 repo_root=REPO_ROOT,
                 plugin_root=bundle_dir,
                 tier="essential",
-                multi_agent=False,
                 manifest=augmented,
             )
 
@@ -248,7 +245,6 @@ class TestReconciliationPassesOnFullCoverage:
             repo_root=REPO_ROOT,
             plugin_root=bundle_dir,
             tier=tier,
-            multi_agent=True,
             manifest=manifest,
         )
         return manifest, tier, bundle_dir, copied_paths
@@ -271,7 +267,7 @@ class TestReconciliationPassesOnFullCoverage:
         from tools.engine.build import select_shippables_with_identity, _build_ship_set
 
         manifest, tier, bundle_dir, copied_paths = convenience_ma_build
-        shipped_entries = select_shippables_with_identity(manifest, tier, True, "self")
+        shipped_entries = select_shippables_with_identity(manifest, tier, "self")
         ship_set = _build_ship_set(shipped_entries)
 
         missing = ship_set - set(copied_paths)
@@ -306,7 +302,6 @@ class TestReconciliationPassesOnFullCoverageAtDevTier:
             repo_root=REPO_ROOT,
             plugin_root=bundle_dir,
             tier=tier,
-            multi_agent=True,
             manifest=manifest,
         )
         return manifest, tier, bundle_dir, copied_paths
@@ -326,7 +321,7 @@ class TestReconciliationPassesOnFullCoverageAtDevTier:
         from tools.engine.build import select_shippables_with_identity, _build_ship_set
 
         manifest, tier, bundle_dir, copied_paths = dev_ma_build
-        shipped_entries = select_shippables_with_identity(manifest, tier, True, "self")
+        shipped_entries = select_shippables_with_identity(manifest, tier, "self")
         ship_set = _build_ship_set(shipped_entries)
 
         missing = ship_set - set(copied_paths)
@@ -406,12 +401,11 @@ class TestLegitimateExtrasDoNotTriggerFalsePositive:
             repo_root=REPO_ROOT,
             plugin_root=bundle_dir,
             tier=tier,
-            multi_agent=False,
             manifest=manifest,
             target="claude-code",
         )
 
-        shipped_entries = select_shippables_with_identity(manifest, tier, False, "self")
+        shipped_entries = select_shippables_with_identity(manifest, tier, "self")
         ship_set = _build_ship_set(shipped_entries)
 
         # At least one of the known extras must actually show up in

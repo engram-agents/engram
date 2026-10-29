@@ -7,7 +7,7 @@
 # silently. `install-local-marketplace.sh` stays the UPGRADE path and is CALLED by step 5.
 #
 # USAGE:
-#   bash tools/install.sh [--tier essential|convenience|dev] [--multi-agent | --single-agent]
+#   bash tools/install.sh [--tier essential|convenience|dev]
 #                         [--recall-service | --no-recall-service] [--viz-service]
 #                         [--forum-url <url>] [--install-claude-code] [--yes]
 #                         [--sandbox-untagged] [--help]
@@ -75,14 +75,10 @@ failure. To UPGRADE an installed seat use tools/install-local-marketplace.sh ins
 Options:
   --tier T              essential | convenience | dev (default convenience on a fresh config;
                         an existing config.json's install_tier is KEPT when this is absent)
-  --multi-agent         build the multi-agent topology (forum, letters, batons); an existing
-                        config.json's multi_agent is KEPT when neither this nor --single-agent
-                        is given
-  --single-agent        set multi_agent to false (switch a multi-agent seat back)
   --recall-service      install the persistent recall service (default)
   --no-recall-service   do not install it
   --viz-service         install the viz dashboard service (Linux only; a no-op line on macOS)
-  --forum-url URL       write forum.url into config.json (multi-agent hosts)
+  --forum-url URL       write forum.url into config.json
   --install-claude-code run Claude Code's native installer if `claude` is missing
                         (off by default; --yes never implies it)
   --yes                 non-interactive: answer the CLAUDE.md question "back up and replace"
@@ -96,9 +92,8 @@ EOF
 
 # ── Arguments ────────────────────────────────────────────────────────────────────────────────
 # Absent means "keep what config.json holds, else the default" (step 3 resolves both). The
-# effective values are TIER and MA_EFFECTIVE after step 3.
+# effective value is TIER after step 3.
 TIER_ARG=""
-MA_ARG=""
 TIER="$DEFAULT_TIER"
 RECALL_SERVICE="$DEFAULT_RECALL_SERVICE"
 VIZ_SERVICE=0
@@ -109,6 +104,15 @@ SANDBOX_UNTAGGED=0
 
 _arg_error() { printf 'install.sh: %s (see --help)\n' "$*" >&2; exit 2; }
 
+# Retired flags (#4255): accepted and ignored; one stderr line per distinct flag given.
+_RETIRED_SEEN=" "
+_retired_flag() {
+  case "$_RETIRED_SEEN" in
+    *" $1 "*) ;;
+    *) printf '%s is retired and has no effect (#4255)\n' "$1" >&2; _RETIRED_SEEN="$_RETIRED_SEEN$1 " ;;
+  esac
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h) usage; exit 0 ;;
@@ -116,8 +120,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || _arg_error "--tier requires a value: essential, convenience or dev"
       TIER_ARG="$2"; shift 2 ;;
     --tier=*) TIER_ARG="${1#--tier=}"; shift ;;
-    --multi-agent) MA_ARG="true"; shift ;;
-    --single-agent) MA_ARG="false"; shift ;;
+    --multi-agent|--single-agent) _retired_flag "$1"; shift ;;
     --recall-service) RECALL_SERVICE=1; shift ;;
     --no-recall-service) RECALL_SERVICE=0; shift ;;
     --viz-service) VIZ_SERVICE=1; shift ;;
@@ -214,7 +217,7 @@ LOG_SAVE_DIR=""
 # bash 3.2 mis-parses) ────────────────────────────────────────────────────────────────────────
 read -r -d '' PY_CONFIG <<'PY' || true
 import json, os, sys
-path, tier_arg, ma_arg, default_tier = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+path, tier_arg, default_tier = sys.argv[1], sys.argv[2], sys.argv[3]
 TIERS = ("essential", "convenience", "dev")
 if os.path.lexists(path):
     try:
@@ -236,30 +239,21 @@ elif isinstance(d.get("install_tier"), str) and d["install_tier"] in TIERS:
     tier = d["install_tier"]
 else:
     tier = default_tier
-if ma_arg:
-    ma = ma_arg == "true"
-elif isinstance(d.get("multi_agent"), bool):
-    ma = d["multi_agent"]
-else:
-    ma = False
 def show(v):
     return v if isinstance(v, str) else json.dumps(v)
 notes = []
 if "install_tier" in d and d["install_tier"] != tier:
     notes.append("config: install_tier %s -> %s" % (show(d["install_tier"]), tier))
-if "multi_agent" in d and d["multi_agent"] is not ma:
-    notes.append("config: multi_agent %s -> %s" % (show(d["multi_agent"]), json.dumps(ma)))
-changed = (d.get("install_tier") != tier) or (d.get("multi_agent") is not ma)
-# First output line: "<status> <tier> <multi_agent>"; any further lines are change notes.
+changed = d.get("install_tier") != tier
+# First output line: "<status> <tier>"; any further lines are change notes.
 def out(status):
-    print("%s %s %s" % (status, tier, "true" if ma else "false"))
+    print("%s %s" % (status, tier))
     for n in notes:
         print(n)
 if existed and not changed:
     out("unchanged")
     sys.exit(0)
 d["install_tier"] = tier
-d["multi_agent"] = ma
 # Written in place (not temp file + rename): that keeps the file's mode, owner and ACL, which a
 # rename resets. The file is a few hundred bytes, written from a dict already held in memory.
 # Other keys keep their values and their order; the formatting is normalized (indent=2).
@@ -438,17 +432,17 @@ fi
 
 # ── Step 3: config.json ──────────────────────────────────────────────────────────────────────
 begin_step 3 "config.json"
-if ! _cfg_out="$(python3 -c "$PY_CONFIG" "$CONFIG_PATH" "$TIER_ARG" "$MA_ARG" "$DEFAULT_TIER")"; then
+if ! _cfg_out="$(python3 -c "$PY_CONFIG" "$CONFIG_PATH" "$TIER_ARG" "$DEFAULT_TIER")"; then
   fail "${_cfg_out#ERR }" "fix or remove $CONFIG_PATH by hand and re-run (this installer never overwrites a config it cannot parse)"
 fi
-# Line 1 is "<status> <tier> <multi_agent>" (the EFFECTIVE values: kept, changed or default);
+# Line 1 is "<status> <tier>" (the EFFECTIVE value: kept, changed or default);
 # later lines are "config: <key> <old> -> <new>" for every stored value this run changes.
 _cfg_head="$(printf '%s\n' "$_cfg_out" | sed -n '1p')"
-read -r _cfg_status TIER _ma <<EOF
+read -r _cfg_status TIER <<EOF
 $_cfg_head
 EOF
 printf '%s\n' "$_cfg_out" | sed '1d'
-step_ok "$CONFIG_PATH $_cfg_status: install_tier=$TIER multi_agent=$_ma; other keys keep their values and order"
+step_ok "$CONFIG_PATH $_cfg_status: install_tier=$TIER; other keys keep their values and order"
 
 # ── Step 4: venv ─────────────────────────────────────────────────────────────────────────────
 begin_step 4 "venv"
@@ -477,7 +471,7 @@ fi
 step_ok "$VENV_DIR, requirements installed (tier $TIER)"
 
 # ── Step 5: build, assemble, register the marketplace ────────────────────────────────────────
-# install-local-marketplace.sh reads install_tier / multi_agent from config.json (step 3),
+# install-local-marketplace.sh reads install_tier from config.json (step 3),
 # builds the plugin, assembles the marketplace, pre-warms the embedding model after pip, and
 # registers the marketplace. Its non-zero exit is this step's FAIL. Its output is not filtered.
 begin_step 5 "build, assemble and register the marketplace"
@@ -640,7 +634,7 @@ fi
 
 if [ -n "$FORUM_URL" ]; then
   [ -f "$PLUGIN_ROOT/tools/set_forum_url.py" ] \
-    || fail "set_forum_url.py missing from $PLUGIN_ROOT/tools" "rebuild with --multi-agent, or set forum.url in $CONFIG_PATH by hand"
+    || fail "set_forum_url.py missing from $PLUGIN_ROOT/tools" "rebuild at tier convenience or dev, or set forum.url in $CONFIG_PATH by hand"
   "$VENV_PY" "$PLUGIN_ROOT/tools/set_forum_url.py" "$FORUM_URL" --config "$CONFIG_PATH" \
     || fail "set_forum_url.py refused $FORUM_URL" "read its message above; it names what is wrong with the URL or the config"
   _svc_add "forum.url set"

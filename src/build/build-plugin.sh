@@ -6,7 +6,6 @@
 # OUTPUT: build/plugin/ (default) or the path specified by --output.
 # Flag-compatible with the previous bash implementation:
 #   --tier <essential|convenience|dev>   depth tier (default: manifest default)
-#   --multi-agent                         include multi-agent-gated mechanisms
 #   --output <DIR>                        override output directory
 #   --help / -h                           show help and exit
 #

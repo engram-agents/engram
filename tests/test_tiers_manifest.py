@@ -527,17 +527,17 @@ def test_valid_tier_values():
     )
 
 
-def test_multi_agent_flag_is_bool_when_present():
-    """mechanisms[].multi_agent, when present, must be a JSON boolean."""
-    manifest = _load_manifest()
-    bad: list[str] = []
-    for entry in manifest["mechanisms"]:
-        if "multi_agent" in entry:
-            if not isinstance(entry["multi_agent"], bool):
-                bad.append(entry["path"])
+def test_no_entry_carries_the_retired_multi_agent_key():
+    """The --multi-agent axis is retired (#4255): no entry in any bucket may carry the key.
 
+    The key would silently do nothing, so the gate refuses it. The loader refuses it too
+    (tests/test_retired_multi_agent_axis_4255.py exercises that on fixture manifests).
+    """
+    from tools.engine.manifest import retired_axis_entries
+
+    bad = retired_axis_entries(_load_manifest())
     assert not bad, (
-        f"packaging/tiers.json entries with non-boolean multi_agent field:\n"
+        "packaging/tiers.json entries carrying the retired multi_agent key:\n"
         + "\n".join(f"  {p}" for p in sorted(bad))
     )
 
@@ -748,7 +748,7 @@ def _resolve_import_candidates(node: "ast.Import | ast.ImportFrom", importer_pat
 
 def _find_tier_violations(mechanisms: list[dict], src_root: str) -> list[str]:
     """Scan every Python mechanism's top-level imports and return a list of
-    tier/multi_agent inconsistency violation strings (empty = clean).
+    tier inconsistency violation strings (empty = clean).
 
     Factored out of ``test_import_dep_tier_consistency`` (engram-alpha#2549)
     so a synthetic-manifest falsifier test can call the exact same scan
@@ -800,18 +800,11 @@ def _find_tier_violations(mechanisms: list[dict], src_root: str) -> list[str]:
                         f"importee ships at a higher tier; importer will ship without it"
                     )
 
-                # Violation 2: importee is multi_agent-only but importer ships single-agent
-                if importee.get("multi_agent") is True and entry.get("multi_agent") is not True:
-                    violations.append(
-                        f"MULTI_AGENT: {path!r} (multi_agent not set → ships single-agent) "
-                        f"imports {importee_path!r} (multi_agent=True → single-agent build drops it)"
-                    )
-
     return violations
 
 
 def test_import_dep_tier_consistency():
-    """If A ships at (tier, topology) T and imports B, B must also ship at T.
+    """If A ships at tier T and imports B, B must also ship at T.
 
     Prevents the #1087/#1088 class: an importer shipping in contexts where
     the importee doesn't, causing ImportError at runtime.

@@ -1,7 +1,7 @@
 """tools.engine.cli — command-line entry point for the ENGRAM build engine.
 
 Usage:
-    python3 -m tools.engine.cli build [--tier T] [--multi-agent] [--output DIR]
+    python3 -m tools.engine.cli build [--tier T] [--output DIR]
                                       [--target <claude-code|codex>]
                                       [--identity <self|foreign>]
                                       [--engram-home PATH]
@@ -22,7 +22,6 @@ Exit codes for `run`:
 
 Flag-compatible with tools/build-plugin.sh (build subcommand):
     --tier <essential|convenience|dev>   depth tier (default: manifest's default_tier)
-    --multi-agent                         include multi-agent-gated mechanisms
     --output <DIR>                        output directory (default: build/plugin)
     --target <claude-code|codex>          platform target (default: claude-code)
     --identity <self|foreign>             identity scope (default: self)
@@ -72,7 +71,14 @@ def build_command(args: list[str]) -> int:
         add_help=False,
     )
     parser.add_argument("--tier", default=None, metavar="TIER")
-    parser.add_argument("--multi-agent", dest="multi_agent", action="store_true")
+    # Retired (#4255): accepted and ignored, announced once per distinct flag below.
+    parser.add_argument(
+        "--multi-agent",
+        dest="retired_flags",
+        action="append_const",
+        const="--multi-agent",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--output",
         default=None,
@@ -114,6 +120,9 @@ def build_command(args: list[str]) -> int:
 
     parsed, unknown = parser.parse_known_args(args)
 
+    for flag in dict.fromkeys(parsed.retired_flags or []):
+        print(f"{flag} is retired and has no effect (#4255)", file=sys.stderr)
+
     if unknown:
         print(
             f"[build-plugin] ERROR: Unknown argument(s): {' '.join(unknown)}. "
@@ -125,7 +134,7 @@ def build_command(args: list[str]) -> int:
     if parsed.help:
         print(
             "Usage: python3 -m tools.engine.cli build "
-            "[--tier <essential|convenience|dev>] [--multi-agent] [--output DIR]\n"
+            "[--tier <essential|convenience|dev>] [--output DIR]\n"
             "       [--target <claude-code|codex>] [--identity <self|foreign>]\n"
             "       [--engram-home PATH]\n"
             "\n"
@@ -135,8 +144,6 @@ def build_command(args: list[str]) -> int:
             "  --tier <tier>       Depth tier to build: essential, convenience, or dev.\n"
             "                      Default: the manifest's default_tier (convenience).\n"
             "                      Cumulative: dev includes convenience includes essential.\n"
-            "  --multi-agent       Include multi-agent-gated mechanisms (baton, letter, forum\n"
-            "                      coordination hooks, inter-agent tools). Off by default.\n"
             "  --output <DIR>      Output directory. Default: build/plugin\n"
             "  --target <TARGET>   Platform target: claude-code (default) or codex.\n"
             "  --identity <scope>  Identity scope: self (default) or foreign.\n"
@@ -263,14 +270,11 @@ def build_command(args: list[str]) -> int:
 
     plugin_root = parsed.output if parsed.output else os.path.join(repo_root, "build", "plugin")
 
-    multi_agent: bool = parsed.multi_agent
-
     try:
         build_plugin(
             repo_root=repo_root,
             plugin_root=plugin_root,
             tier=tier,
-            multi_agent=multi_agent,
             manifest=manifest,
             target=parsed.target,
             identity=parsed.identity,

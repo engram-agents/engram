@@ -288,7 +288,6 @@ def bake_platform_json(plugin_root: str, profile: dict[str, Any]) -> None:
 def select_shippables_with_identity(
     manifest: dict[str, Any],
     tier: str,
-    multi_agent: bool,
     identity: str,
 ) -> list[dict[str, Any]]:
     """Return shippable entries, filtering identity_coupled when identity=foreign.
@@ -296,13 +295,13 @@ def select_shippables_with_identity(
     Extends select_shippables with the identity axis:
       - identity=self (default): no additional filtering (today's behavior).
       - identity=foreign: drops any entry with identity_coupled=true, regardless
-        of tier or multi_agent.
+        of tier.
 
     Parameters
     ----------
     manifest:
         Parsed tiers.json dict.
-    tier, multi_agent:
+    tier:
         Passed through to select_shippables.
     identity:
         "self" or "foreign".
@@ -312,7 +311,7 @@ def select_shippables_with_identity(
     list[dict]
         Filtered shippable entries.
     """
-    entries = select_shippables(manifest, tier, multi_agent)
+    entries = select_shippables(manifest, tier)
     if identity == "foreign":
         entries = [e for e in entries if not e.get("identity_coupled")]
     return entries
@@ -967,7 +966,6 @@ def build_plugin(
     repo_root: str,
     plugin_root: str,
     tier: str,
-    multi_agent: bool,
     manifest: dict[str, Any] | None = None,
     target: str = "claude-code",
     identity: str = "self",
@@ -989,8 +987,6 @@ def build_plugin(
         Absolute path to the output plugin directory.
     tier:
         Depth tier (e.g. "convenience").
-    multi_agent:
-        Whether to include multi-agent-gated mechanisms.
     manifest:
         Pre-loaded manifest dict (optional; loaded from repo_root if None).
     target:
@@ -1035,17 +1031,15 @@ def build_plugin(
 
     chosen_rank_str = tier
     tier_rank_val = {"essential": 0, "convenience": 1, "dev": 2}.get(tier, -1)
-    ma_str = "yes" if multi_agent else "no"
 
     _log(
         f"Tier: {tier} (rank={tier_rank_val}), "
-        f"multi-agent: {ma_str}, "
         f"target: {target}, "
         f"identity: {identity}"
     )
 
     # Build shipping set (with identity axis filtering)
-    shipped_entries = select_shippables_with_identity(manifest, tier, multi_agent, identity)
+    shipped_entries = select_shippables_with_identity(manifest, tier, identity)
     ship_set = _build_ship_set(shipped_entries)
     entries_by_path = _entries_by_path(shipped_entries)
 
@@ -1129,10 +1123,7 @@ def build_plugin(
     _log("Copying hooks → plugin hooks/ (manifest-filtered)")
     os.makedirs(os.path.join(plugin_root, "hooks"), exist_ok=True)
 
-    _log(
-        f"Filtering hooks.json for tier={tier} "
-        f"multi-agent={'yes' if multi_agent else 'no'}"
-    )
+    _log(f"Filtering hooks.json for tier={tier}")
 
     # Read source hooks.json
     src_hooks_path = os.path.join(repo_root, source_root, "hooks", "hooks.json")
@@ -1387,7 +1378,6 @@ def build_plugin(
 
     build_manifest: dict[str, Any] = {
         "tier": tier,
-        "multi_agent": multi_agent,
         "target": target,
         "identity": identity,
         "shipped_paths": copied_paths,
@@ -1419,7 +1409,7 @@ def build_plugin(
 
     _log("")
     _log(f"Plugin tree assembled at: {plugin_root}")
-    _log(f"  tier={tier}  multi_agent={'true' if multi_agent else 'false'}")
+    _log(f"  tier={tier}")
     _log("")
     _log("Contents:")
     # Enumerate tree, skipping __pycache__ and .pyc — mirrors build-plugin.sh
@@ -1449,7 +1439,6 @@ def build_plugin(
 def write_build_manifest(
     plugin_root: str,
     tier: str,
-    multi_agent: bool,
     shipped_paths: list[str],
     target: str = "claude-code",
     identity: str = "self",
@@ -1457,7 +1446,6 @@ def write_build_manifest(
     """Write .engram-build-manifest.json to plugin root."""
     manifest: dict[str, Any] = {
         "tier": tier,
-        "multi_agent": multi_agent,
         "target": target,
         "identity": identity,
         "shipped_paths": shipped_paths,

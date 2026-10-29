@@ -193,14 +193,14 @@ def test_install_local_marketplace_builds_codex_target(tmp_path):
     )
 
     assert "target: codex" in result.stdout
-    assert "multi-agent: yes, target: codex" in result.stdout
+    assert not _AXIS_LOG.search(result.stdout)
 
     plugin_root = tmp_path / "marketplace" / "plugins" / "engram"
     assert json.loads((plugin_root / "platform.json").read_text())["platform"] == "codex"
     assert (plugin_root / ".codex-plugin" / "plugin.json").exists()
     manifest = json.loads((plugin_root / ".engram-build-manifest.json").read_text())
     assert manifest["target"] == "codex"
-    assert manifest["multi_agent"] is True
+    assert "multi_agent" not in manifest
     assert manifest["tier"] == "dev"
 
 
@@ -225,12 +225,12 @@ def test_install_local_marketplace_builds_without_jq_on_path(tmp_path):
     )
 
     assert "target: codex" in result.stdout
-    assert "multi-agent: yes, target: codex" in result.stdout
+    assert not _AXIS_LOG.search(result.stdout)
 
     plugin_root = tmp_path / "marketplace" / "plugins" / "engram"
     manifest = json.loads((plugin_root / ".engram-build-manifest.json").read_text())
     assert manifest["target"] == "codex"
-    assert manifest["multi_agent"] is True
+    assert "multi_agent" not in manifest
     assert manifest["tier"] == "dev"
 
 
@@ -345,11 +345,10 @@ def test_install_local_marketplace_fails_loud_on_wrong_typed_install_tier(tmp_pa
     assert "install_tier must be a string" in result.stderr
 
 
-def test_install_local_marketplace_fails_loud_on_wrong_typed_multi_agent(tmp_path):
-    """engram-alpha#2965: multi_agent's sibling case -- a string "true" (a
-    plausible hand-edit typo) must fail loud rather than silently resolve
-    to false and drop the forum package requirements with no signal.
-    Pre-#2965, this exact config exited 0 as if multi_agent were absent."""
+def test_install_local_marketplace_ignores_wrong_typed_multi_agent(tmp_path):
+    """#4255: the installer reads neither multi_agent nor mode any more, so the
+    #2965 fail-loud on a wrong-typed multi_agent (a string "true") is gone with
+    the key: the install proceeds. install_tier keeps its own type check."""
     (tmp_path / "config.json").write_text(json.dumps({"multi_agent": "true"}))
 
     result = subprocess.run(
@@ -361,9 +360,8 @@ def test_install_local_marketplace_fails_loud_on_wrong_typed_multi_agent(tmp_pat
         stderr=subprocess.PIPE,
     )
 
-    assert result.returncode != 0
-    assert result.stderr.strip() != ""
-    assert "multi_agent must be a boolean" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "multi_agent" not in result.stderr
 
 
 def test_install_local_marketplace_accepts_equals_target_form(tmp_path):
@@ -812,12 +810,9 @@ def test_install_local_marketplace_provisions_venv_convenience_tier_runtime_only
     assert "requirements/requirements-dev.txt" not in calls
 
 
-def test_install_local_marketplace_multi_agent_convenience_tier_installs_forum_reqs(tmp_path):
-    """A multi-agent seat gets src/forum/requirements.txt installed into its
-    venv independent of depth tier (#2944) — the forum/coordination package
-    composes with any depth tier via the orthogonal --multi-agent flag, so a
-    convenience-tier multi-agent seat must still get forum deps, not just
-    dev-tier ones."""
+def test_install_local_marketplace_convenience_tier_skips_forum_reqs_even_with_multi_agent_key(tmp_path):
+    """#4255: forum requirements install exactly at the dev tier. A convenience-tier
+    seat whose config still says multi_agent: true no longer gets them (#2944 did)."""
     (tmp_path / "config.json").write_text(
         json.dumps({"install_tier": "convenience", "multi_agent": True})
     )
@@ -828,17 +823,15 @@ def test_install_local_marketplace_multi_agent_convenience_tier_installs_forum_r
 
     assert "Provisioning venv at" in result.stdout
     assert "tier: convenience" in result.stdout
-    assert "Multi-agent: installing forum package dependencies" in result.stdout
+    assert "installing forum package dependencies" not in result.stdout
     calls = log_file.read_text()
     assert "requirements/requirements.txt" in calls
     assert "requirements/requirements-dev.txt" not in calls
-    assert "src/forum/requirements.txt" in calls
+    assert "src/forum/requirements.txt" not in calls
 
 
-def test_install_local_marketplace_multi_agent_via_mode_installs_forum_reqs(tmp_path):
-    """The mode=="multi" spelling (not just multi_agent==true) must also
-    trigger the forum-requirements install — same boolean logic as the
-    earlier jq-based multi-agent read elsewhere in this script."""
+def test_install_local_marketplace_mode_multi_does_not_install_forum_reqs_below_dev(tmp_path):
+    """#4255: the mode=="multi" spelling is not read either."""
     (tmp_path / "config.json").write_text(
         json.dumps({"install_tier": "convenience", "mode": "multi"})
     )
@@ -847,15 +840,14 @@ def test_install_local_marketplace_multi_agent_via_mode_installs_forum_reqs(tmp_
 
     result = _run_installer_skip_build(tmp_path, env_extra={})
 
-    assert "Multi-agent: installing forum package dependencies" in result.stdout
+    assert "installing forum package dependencies" not in result.stdout
     calls = log_file.read_text()
-    assert "src/forum/requirements.txt" in calls
+    assert "src/forum/requirements.txt" not in calls
 
 
-def test_install_local_marketplace_non_multi_agent_skips_forum_reqs(tmp_path):
-    """A non-multi-agent seat (even at dev tier) does NOT get forum
-    requirements installed — the forum package is only needed by seats that
-    actually run the forum/coordination tooling."""
+def test_install_local_marketplace_dev_tier_installs_forum_reqs_without_any_key(tmp_path):
+    """#4255: the dev tier gets the forum test dependencies whatever the config says
+    about the retired multi_agent axis (it used to need multi_agent: true)."""
     (tmp_path / "config.json").write_text(json.dumps({"install_tier": "dev"}))
     log_file = tmp_path / "venv-calls.log"
     _fake_venv(tmp_path, log_file)
@@ -863,15 +855,14 @@ def test_install_local_marketplace_non_multi_agent_skips_forum_reqs(tmp_path):
     result = _run_installer_skip_build(tmp_path, env_extra={})
 
     assert "Dev tier: installing test dependencies" in result.stdout
-    assert "Multi-agent: installing forum package dependencies" not in result.stdout
+    assert "Dev tier: installing forum package dependencies" in result.stdout
     calls = log_file.read_text()
-    assert "src/forum/requirements.txt" not in calls
+    assert "src/forum/requirements.txt" in calls
 
 
 def test_install_local_marketplace_multi_agent_dev_tier_installs_both(tmp_path):
-    """Multi-agent + dev tier is a THIRD independent conditional, not nested
-    inside the dev-tier block — both requirements-dev.txt AND
-    src/forum/requirements.txt must install together."""
+    """Dev tier with the old multi_agent key still present: both requirements-dev.txt
+    AND src/forum/requirements.txt install together."""
     (tmp_path / "config.json").write_text(
         json.dumps({"install_tier": "dev", "multi_agent": True})
     )
@@ -881,7 +872,7 @@ def test_install_local_marketplace_multi_agent_dev_tier_installs_both(tmp_path):
     result = _run_installer_skip_build(tmp_path, env_extra={})
 
     assert "Dev tier: installing test dependencies" in result.stdout
-    assert "Multi-agent: installing forum package dependencies" in result.stdout
+    assert "Dev tier: installing forum package dependencies" in result.stdout
     calls = log_file.read_text()
     assert "requirements/requirements-dev.txt" in calls
     assert "src/forum/requirements.txt" in calls
@@ -1028,11 +1019,9 @@ def test_install_local_marketplace_skip_build_fails_loud_on_wrong_typed_install_
     assert "install_tier must be a string" in result.stderr
 
 
-def test_install_local_marketplace_skip_build_fails_loud_on_wrong_typed_multi_agent(tmp_path):
-    """engram-alpha#2965: the --skip-build path's separate _eff_multi_agent
-    read has the identical gap -- multi_agent: 1 (an int, not a bool) must
-    fail loud rather than silently resolve to false and skip the forum
-    package requirements install with no signal."""
+def test_install_local_marketplace_skip_build_ignores_wrong_typed_multi_agent(tmp_path):
+    """#4255: the --skip-build path no longer reads multi_agent either, so
+    multi_agent: 1 (an int, not a bool) is not an error (it was, under #2965)."""
     (tmp_path / "config.json").write_text(json.dumps({"multi_agent": 1}))
     log_file = tmp_path / "venv-calls.log"
     _fake_venv(tmp_path, log_file)
@@ -1047,14 +1036,13 @@ def test_install_local_marketplace_skip_build_fails_loud_on_wrong_typed_multi_ag
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
     )
 
-    assert result.returncode != 0
-    assert result.stderr.strip() != ""
-    assert "multi_agent must be a boolean" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "multi_agent" not in result.stderr
 
 
 def test_install_local_marketplace_warns_on_missing_forum_requirements(tmp_path):
-    """engram-alpha#2951 (Kepler's fold-in): a multi-agent seat whose
-    src/forum/requirements.txt is missing must get a WARN naming the gap,
+    """engram-alpha#2951 (Kepler's fold-in): a dev-tier seat (multi-agent until #4255)
+    whose src/forum/requirements.txt is missing must get a WARN naming the gap,
     not a silent no-op -- unlike the install-failed case (which already
     WARNs), a missing file previously produced zero log output.
 
@@ -1069,9 +1057,7 @@ def test_install_local_marketplace_warns_on_missing_forum_requirements(tmp_path)
     )
     parked_forum_req = tmp_path / "requirements.txt.parked"
 
-    (tmp_path / "config.json").write_text(
-        json.dumps({"install_tier": "convenience", "multi_agent": True})
-    )
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "dev"}))
     log_file = tmp_path / "venv-calls.log"
     _fake_venv(tmp_path, log_file)
 
@@ -1105,7 +1091,7 @@ def test_install_local_marketplace_skip_build_omitted_keys_default_cleanly(tmp_p
 
     assert result.returncode == 0
     assert "tier: convenience" in result.stdout
-    assert "Multi-agent: installing forum package dependencies" not in result.stdout
+    assert "installing forum package dependencies" not in result.stdout
     calls = log_file.read_text()
     assert "src/forum/requirements.txt" not in calls
 
@@ -2638,3 +2624,141 @@ def test_prewarm_does_not_run_after_a_failed_runtime_pip_install(tmp_path):
     assert result.returncode != 0
     assert _prewarm_lines(result) == []
     assert not load_log.exists()
+
+
+# ═══ #4255 slice 1 (S1.8): the installer reads neither multi_agent nor mode ════════════════════
+# Forum requirements install exactly when the tier is dev, whatever either key says.
+# The shipped file listing in the build log still names template.CLAUDE.multi-agent.md (slice 3),
+# so look for the axis as a setting (`multi-agent: yes`, `multi_agent=true`, `--multi-agent`), not a word.
+_AXIS_LOG = re.compile(r"multi[-_]agent\s*[:=]|--multi-agent", re.I)
+_AXIS_KEYS = {
+    "no-key": {},
+    "multi_agent-true": {"multi_agent": True},
+    "multi_agent-false": {"multi_agent": False},
+    "mode-multi": {"mode": "multi"},
+    "wrong-typed": {"multi_agent": "yes"},
+}
+
+
+@pytest.mark.parametrize("keys", list(_AXIS_KEYS.values()), ids=list(_AXIS_KEYS))
+@pytest.mark.parametrize("tier", ["essential", "convenience", "dev"])
+def test_forum_requirements_install_exactly_at_dev_tier_whatever_the_keys_say(tier, keys, tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": tier, **keys}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={"LC_ALL": "C"})
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    calls = log_file.read_text()
+    assert ("src/forum/requirements.txt" in calls) == (tier == "dev"), calls
+    assert ("installing forum package dependencies" in result.stdout) == (tier == "dev")
+    assert not _AXIS_LOG.search(result.stdout + result.stderr)
+
+
+def test_forum_requirements_failure_at_dev_tier_warns_and_continues_like_the_dev_requirements(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "dev"}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file, exit_code=1)
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code", "--skip-build", "--skip-add",
+         "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=_skip_build_root(tmp_path)),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode != 0  # the failed RUNTIME install is what flags the exit
+    assert "WARN: venv dev-requirements install failed" in result.stdout
+    assert "WARN: venv forum-requirements install failed" in result.stdout
+
+
+def _skip_build_root(tmp_path):
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    return build_root
+
+
+def test_no_venv_means_no_forum_requirements_even_at_dev_tier_with_the_old_keys(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "dev", "multi_agent": True}))
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert result.returncode == 0
+    assert "Provisioning venv at" not in result.stdout
+    assert "forum package" not in result.stdout.lower()
+
+
+@pytest.mark.parametrize("value", ["true", 1, [], {"x": 1}])
+def test_a_wrong_typed_multi_agent_no_longer_fails_the_install(value, tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "convenience", "multi_agent": value}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert result.returncode == 0
+    assert "multi_agent" not in result.stderr
+    assert "src/forum/requirements.txt" not in log_file.read_text()
+
+
+def test_missing_forum_requirements_file_at_dev_tier_warns_naming_the_tier(tmp_path):
+    real_forum_req = REPO_ROOT / "src" / "forum" / "requirements.txt"
+    parked = tmp_path / "requirements.txt.parked"
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "dev"}))
+    _fake_venv(tmp_path, tmp_path / "venv-calls.log")
+
+    shutil.move(str(real_forum_req), str(parked))
+    try:
+        result = _run_installer_skip_build(tmp_path, env_extra={})
+    finally:
+        shutil.move(str(parked), str(real_forum_req))
+
+    warn = [ln for ln in result.stdout.splitlines() if ln.startswith("[install-local-marketplace] WARN") and "forum" in ln]
+    assert len(warn) == 1, result.stdout
+    assert "dev tier" in warn[0] and "not found" in warn[0]
+    assert "multi-agent" not in warn[0].lower()
+
+
+def test_missing_forum_requirements_file_below_dev_tier_is_silent_even_with_the_old_key(tmp_path):
+    real_forum_req = REPO_ROOT / "src" / "forum" / "requirements.txt"
+    parked = tmp_path / "requirements.txt.parked"
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "convenience", "multi_agent": True}))
+    _fake_venv(tmp_path, tmp_path / "venv-calls.log")
+
+    shutil.move(str(real_forum_req), str(parked))
+    try:
+        result = _run_installer_skip_build(tmp_path, env_extra={})
+    finally:
+        shutil.move(str(parked), str(real_forum_req))
+
+    assert not [ln for ln in result.stdout.splitlines() if "WARN" in ln and "forum" in ln]
+
+
+@pytest.mark.parametrize("keys", [{}, {"multi_agent": True}, {"mode": "multi", "multi_agent": False}],
+                         ids=["no-key", "multi_agent-true", "mode-and-false"])
+def test_full_install_leaves_config_json_byte_identical_and_builds_without_the_flag(keys, tmp_path):
+    raw = json.dumps({"install_tier": "dev", **keys}, indent=2) + "\n"
+    (tmp_path / "config.json").write_text(raw)
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT, env=_env(tmp_path, LC_ALL="C"),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+    )
+
+    assert (tmp_path / "config.json").read_text() == raw
+    assert not _AXIS_LOG.search(result.stdout + result.stderr)
+    manifest = json.loads((tmp_path / "marketplace" / "plugins" / "engram" / ".engram-build-manifest.json").read_text())
+    assert "multi_agent" not in manifest and manifest["tier"] == "dev"
+
+
+def test_fresh_install_default_message_does_not_name_the_axis(tmp_path):
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert [ln for ln in result.stdout.splitlines() if "fresh-install default" in ln]
+    assert "single-agent" not in result.stdout

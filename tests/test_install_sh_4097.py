@@ -14,7 +14,7 @@ Contract (from the slice-4 spec):
     later step runs
   * DB state: absent -> bootstrap plain; 0-node file -> FORCE_RESEED_EMPTY=1 and the line says
     so; non-empty -> not called, node count printed
-  * config.json: only install_tier and multi_agent are written; every other key survives
+  * config.json: only install_tier is written; every other key survives (multi_agent is retired, #4255)
   * CLAUDE.md: existing + no backup -> backup with the original bytes; backup present -> left
     byte-identical
   * --yes alone never runs the Claude Code installer; --install-claude-code does
@@ -24,6 +24,7 @@ Contract (from the slice-4 spec):
 import json
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -86,7 +87,7 @@ class Sandbox:
         _write(self.tools_src / "install-local-marketplace.sh", """#!/usr/bin/env bash
 echo "marketplace" >> "$CALLS_LOG"
 echo "market-args $*" >> "$CALLS_LOG"
-python3 -c 'import json, os; d = json.load(open(os.path.join(os.environ["ENGRAM_HOME"], "config.json"))); open(os.environ["CALLS_LOG"], "a").write("market-config tier=%s multi_agent=%s\\n" % (d.get("install_tier"), str(d.get("multi_agent")).lower()))'
+python3 -c 'import json, os; d = json.load(open(os.path.join(os.environ["ENGRAM_HOME"], "config.json"))); open(os.environ["CALLS_LOG"], "a").write("market-config tier=%s\\n" % d.get("install_tier"))'
 [ "${FAKE_MARKET_RC:-0}" = "0" ] || exit "$FAKE_MARKET_RC"
 dest="$ENGRAM_HOME/marketplace/plugins/engram"
 rm -rf "$dest"; mkdir -p "$dest"
@@ -460,7 +461,7 @@ def test_unreadable_db_fails_step_6_instead_of_guessing(sb):
     assert not sb.calls_starting("bootstrap")
 
 
-# ── Cell 4: config.json keeps every key but its two ────────────────────────────────────────
+# ── Cell 4: config.json keeps every key but install_tier ────────────────────────────────────────
 def test_config_with_self_lineage_and_other_keys_survives_unchanged(sb):
     sb.engram.mkdir(parents=True, exist_ok=True)
     original = {
@@ -471,10 +472,10 @@ def test_config_with_self_lineage_and_other_keys_survives_unchanged(sb):
         "unrelated": ["a", {"b": 1}],
     }
     (sb.engram / "config.json").write_text(json.dumps(original, indent=2) + "\n")
-    r = sb.run("--yes", "--tier", "convenience", "--single-agent")
+    r = sb.run("--yes", "--tier", "convenience")
     assert r.returncode == 0, r.all
     after = json.loads((sb.engram / "config.json").read_text())
-    assert after["install_tier"] == "convenience" and after["multi_agent"] is False
+    assert after["install_tier"] == "convenience" and after["multi_agent"] is True
     for key in ("self_lineage", "cadence", "unrelated"):
         assert after[key] == original[key]
     before_lines = (json.dumps(original, indent=2) + "\n").splitlines()
@@ -495,10 +496,10 @@ def test_config_already_matching_is_not_rewritten(sb):
     assert (sb.engram / "config.json").read_text() == raw
 
 
-def test_config_created_when_absent_with_the_two_keys(sb):
-    r = sb.run("--yes", "--multi-agent")
+def test_config_created_when_absent_with_install_tier_only(sb):
+    r = sb.run("--yes", "--multi-agent")  # retired flag: accepted, no effect (#4255)
     assert r.returncode == 0, r.all
-    assert json.loads((sb.engram / "config.json").read_text()) == {"install_tier": "convenience", "multi_agent": True}
+    assert json.loads((sb.engram / "config.json").read_text()) == {"install_tier": "convenience"}
 
 
 # ── Cell 5: CLAUDE.md backup ───────────────────────────────────────────────────────────────
@@ -646,7 +647,7 @@ def test_bad_arguments_exit_2_and_run_nothing(sb):
 def test_help_exits_zero_and_lists_every_flag(sb):
     r = sb.run("--help")
     assert r.returncode == 0
-    for flag in ("--tier", "--multi-agent", "--recall-service", "--no-recall-service", "--viz-service",
+    for flag in ("--tier", "--recall-service", "--no-recall-service", "--viz-service",
                  "--forum-url", "--install-claude-code", "--yes", "--help"):
         assert flag in r.stdout
     assert sb.call_lines() == []
@@ -686,7 +687,7 @@ def test_step7_fails_when_install_and_enable_exit_zero_but_list_shows_not_enable
     assert not sb.calls_starting("recall") and not sb.calls_starting("selfcheck")
 
 
-# ── 2. A re-run without --tier / --multi-agent keeps the stored choices ────────────────────
+# ── 2. A re-run without --tier keeps the stored choices ────────────────────
 def _write_config(sb, **kw):
     sb.engram.mkdir(parents=True, exist_ok=True)
     (sb.engram / "config.json").write_text(json.dumps(kw, indent=2) + "\n")
@@ -699,7 +700,7 @@ def test_rerun_without_flags_keeps_stored_tier_and_multi_agent_and_step5_gets_th
     after = json.loads((sb.engram / "config.json").read_text())
     assert after["install_tier"] == "dev" and after["multi_agent"] is True
     assert after["self_lineage"] == "anthropic:opus"
-    assert sb.calls_starting("market-config") == ["market-config tier=dev multi_agent=true"]
+    assert sb.calls_starting("market-config") == ["market-config tier=dev"]
     assert len(sb.calls_starting("pip")) == 2  # dev tier still adds requirements-dev
     assert "config: install_tier" not in r.all and "config: multi_agent" not in r.all  # nothing changed
 
@@ -713,37 +714,37 @@ def test_tier_flag_that_changes_a_stored_value_prints_one_change_line(sb):
     assert "config: multi_agent" not in r.all  # untouched
     after = json.loads((sb.engram / "config.json").read_text())
     assert after["install_tier"] == "essential" and after["multi_agent"] is True
-    assert sb.calls_starting("market-config") == ["market-config tier=essential multi_agent=true"]
+    assert sb.calls_starting("market-config") == ["market-config tier=essential"]
 
 
-def test_single_agent_flag_switches_a_multi_agent_seat_back_and_says_so(sb):
+def test_single_agent_flag_no_longer_switches_a_multi_agent_seat_back(sb):
     _write_config(sb, install_tier="convenience", multi_agent=True)
     r = sb.run("--yes", "--single-agent")
     assert r.returncode == 0, r.all
-    assert [l for l in r.stdout.splitlines() if l.startswith("config: multi_agent")] == \
-        ["config: multi_agent true -> false"]
-    assert json.loads((sb.engram / "config.json").read_text())["multi_agent"] is False
-    assert sb.calls_starting("market-config") == ["market-config tier=convenience multi_agent=false"]
+    assert not [l for l in r.stdout.splitlines() if l.startswith("config: multi_agent")]
+    assert json.loads((sb.engram / "config.json").read_text())["multi_agent"] is True
+    assert sb.calls_starting("market-config") == ["market-config tier=convenience"]
 
 
-def test_multi_agent_flag_on_a_single_agent_config_prints_the_change(sb):
+def test_multi_agent_flag_on_a_single_agent_config_changes_nothing(sb):
     _write_config(sb, install_tier="convenience", multi_agent=False)
     r = sb.run("--yes", "--multi-agent")
     assert r.returncode == 0, r.all
-    assert "config: multi_agent false -> true" in r.stdout.splitlines()
+    assert "config: multi_agent" not in r.all
+    assert json.loads((sb.engram / "config.json").read_text())["multi_agent"] is False
 
 
 def test_fresh_config_gets_the_defaults_and_prints_no_change_line(sb):
     r = sb.run("--yes")
     assert r.returncode == 0, r.all
-    assert json.loads((sb.engram / "config.json").read_text()) == {"install_tier": "convenience", "multi_agent": False}
+    assert json.loads((sb.engram / "config.json").read_text()) == {"install_tier": "convenience"}
     assert "config: install_tier" not in r.all and "config: multi_agent" not in r.all
-    assert sb.calls_starting("market-config") == ["market-config tier=convenience multi_agent=false"]
+    assert sb.calls_starting("market-config") == ["market-config tier=convenience"]
 
 
-def test_help_documents_single_agent_and_the_keep_rule(sb):
+def test_help_documents_the_keep_rule(sb):
     r = sb.run("--help")
-    assert r.returncode == 0 and "--single-agent" in r.stdout
+    assert r.returncode == 0 and "--single-agent" not in r.stdout
     assert "kept" in r.stdout.lower()
 
 
@@ -840,3 +841,157 @@ def test_header_states_the_step_1_no_fetch_gap():
     assert "stale" in head and "origin/*" in head
     assert "--branch" in head and "shallow" in head
     assert "git fetch --tags origin" in head
+
+
+# ═══ #4255 slice 1: the --multi-agent / --single-agent axis is retired ═════════════════════════
+# Contract: S1.1 (both flags are accepted and ignored: same exit status, exactly one stderr line
+# naming the flag given, identical config.json), S1.7 (install.sh never writes, rewrites or deletes
+# `multi_agent`; the PASS line and the :643 hint drop the axis).
+def _retired(flag):
+    return "%s is retired and has no effect (#4255)" % flag
+
+
+def _twin(tmp_path):
+    return Sandbox(tmp_path / "plain"), Sandbox(tmp_path / "flagged")
+
+
+@pytest.mark.parametrize("flag", ["--multi-agent", "--single-agent"])
+def test_retired_flag_is_ignored_with_one_stderr_line_and_the_same_config(flag, tmp_path):
+    plain, flagged = _twin(tmp_path)
+    a = plain.run("--yes", env={"LC_ALL": "C"})
+    b = flagged.run("--yes", flag, env={"LC_ALL": "C"})
+    assert a.returncode == b.returncode == 0, a.all + b.all
+    assert b.stderr.splitlines().count(_retired(flag)) == 1, b.stderr
+    assert [l for l in b.stderr.splitlines() if "retired" in l] == [_retired(flag)]
+    assert [l for l in a.stderr.splitlines() if "retired" in l] == []
+    assert (flagged.engram / "config.json").read_bytes() == (plain.engram / "config.json").read_bytes()
+    strip = lambda t: [l for l in t.splitlines() if not l.startswith("[step 1]")]
+    # Step 4 prints install-logs/<UTC timestamp to the second>/pip.log, and the two runs are
+    # sequential: unmasked, the cell fails whenever they straddle a second boundary (#4260 round 1).
+    norm = lambda root, t: [re.sub(r"\d{8}T\d{6}Z", "TS", l.replace(str(root), "ROOT")) for l in strip(t)]
+    assert norm(flagged.root, b.stdout) == norm(plain.root, a.stdout)
+
+
+def test_both_flags_and_repeats_print_one_line_per_distinct_flag(tmp_path):
+    sb2 = Sandbox(tmp_path / "x")
+    r = sb2.run("--yes", "--multi-agent", "--single-agent", "--multi-agent")
+    assert r.returncode == 0, r.all
+    got = [l for l in r.stderr.splitlines() if "retired" in l]
+    assert sorted(got) == sorted([_retired("--multi-agent"), _retired("--single-agent")]), r.stderr
+    assert got[0] == _retired("--multi-agent")  # first-given order
+
+
+@pytest.mark.parametrize("flag", ["--multi-agent", "--single-agent"])
+def test_retired_flag_does_not_change_the_exit_status_of_a_refusal(flag, tmp_path):
+    plain, flagged = _twin(tmp_path)
+    for s in (plain, flagged):
+        s.engram.mkdir(parents=True, exist_ok=True)
+        (s.engram / "config.json").write_text("{not json")
+    a = plain.run("--yes")
+    b = flagged.run("--yes", flag)
+    assert a.returncode == b.returncode != 0
+    assert "FAIL: [step 3]" in a.stderr and "FAIL: [step 3]" in b.stderr
+    assert b.stderr.splitlines().count(_retired(flag)) == 1
+    assert (flagged.engram / "config.json").read_text() == "{not json"  # refusal leaves it byte-identical
+
+
+def test_retired_flag_with_a_failing_pip_fails_the_same_way(tmp_path):
+    plain, flagged = _twin(tmp_path)
+    a = plain.run("--yes", env={"FAKE_PIP_RC": "1"})
+    b = flagged.run("--yes", "--multi-agent", env={"FAKE_PIP_RC": "1"})
+    assert a.returncode == b.returncode != 0
+    assert "FAIL: [step 4]" in a.stderr and "FAIL: [step 4]" in b.stderr
+
+
+def test_help_does_not_list_either_retired_flag(sb):
+    r = sb.run("--help")
+    assert r.returncode == 0
+    assert "multi-agent" not in r.stdout.lower() and "single-agent" not in r.stdout.lower()
+    assert "multi_agent" not in r.stdout
+    head = REAL_INSTALL_SH.read_text().split("set -euo pipefail", 1)[0]
+    assert "multi-agent" not in head and "single-agent" not in head
+
+
+def test_retired_flag_from_an_empty_cwd_by_absolute_path(sb):
+    r = sb.run("--yes", "--multi-agent")  # Sandbox.run already runs from sb.root, not the repo
+    assert r.returncode == 0, r.all
+    assert Path(sb.root) != REPO_ROOT and r.stderr.splitlines().count(_retired("--multi-agent")) == 1
+
+
+@pytest.mark.parametrize("mask", [0o077, 0o002])
+def test_config_file_mode_is_the_same_with_and_without_the_retired_flag(mask, tmp_path):
+    plain, flagged = _twin(tmp_path)
+    old = os.umask(mask)
+    try:
+        assert plain.run("--yes").returncode == 0
+        assert flagged.run("--yes", "--multi-agent").returncode == 0
+    finally:
+        os.umask(old)
+    mode = lambda s: (s.engram / "config.json").stat().st_mode & 0o777
+    assert mode(plain) == mode(flagged) == (0o666 & ~mask)
+
+
+def test_fresh_config_has_install_tier_only(sb):
+    r = sb.run("--yes")
+    assert r.returncode == 0, r.all
+    assert json.loads((sb.engram / "config.json").read_text()) == {"install_tier": "convenience"}
+
+
+@pytest.mark.parametrize("flags", [(), ("--multi-agent",), ("--single-agent",)])
+def test_existing_multi_agent_and_mode_keys_stay_byte_identical(flags, sb):
+    raw = ('{\n  "self_lineage": "anthropic:opus",\n  "install_tier": "convenience",\n'
+           '  "multi_agent": true,\n  "mode": "multi",\n  "other": [1, 2]\n}\n')
+    sb.engram.mkdir(parents=True, exist_ok=True)
+    (sb.engram / "config.json").write_text(raw)
+    r = sb.run("--yes", *flags)
+    assert r.returncode == 0, r.all
+    assert (sb.engram / "config.json").read_text() == raw  # nothing changed, nothing rewritten
+
+
+@pytest.mark.parametrize("flags", [(), ("--multi-agent",), ("--single-agent",)])
+def test_a_tier_change_rewrites_the_file_but_not_the_two_keys(flags, sb):
+    raw = ('{\n  "install_tier": "dev",\n  "multi_agent": true,\n  "mode": "multi",\n'
+           '  "unrelated": {"a": 1}\n}\n')
+    sb.engram.mkdir(parents=True, exist_ok=True)
+    (sb.engram / "config.json").write_text(raw)
+    r = sb.run("--yes", "--tier", "essential", *flags)
+    assert r.returncode == 0, r.all
+    text = (sb.engram / "config.json").read_text()
+    assert '  "multi_agent": true,\n' in text and '  "mode": "multi"' in text
+    assert list(json.loads(text)) == ["install_tier", "multi_agent", "mode", "unrelated"]
+    assert "config: install_tier dev -> essential" in r.stdout.splitlines()
+    assert "config: multi_agent" not in r.all
+
+
+def test_a_stored_non_bool_multi_agent_is_also_left_alone(sb):
+    raw = '{"install_tier": "convenience", "multi_agent": "yes", "mode": 7}'
+    sb.engram.mkdir(parents=True, exist_ok=True)
+    (sb.engram / "config.json").write_text(raw)
+    r = sb.run("--yes", "--tier", "dev")
+    assert r.returncode == 0, r.all
+    after = json.loads((sb.engram / "config.json").read_text())
+    assert after["multi_agent"] == "yes" and after["mode"] == 7 and after["install_tier"] == "dev"
+
+
+@pytest.mark.parametrize("flags", [(), ("--multi-agent",), ("--single-agent",)])
+def test_an_existing_config_without_multi_agent_is_not_rewritten_nor_given_the_key(flags, sb):
+    raw = '{"self_lineage":   "anthropic:opus",   "install_tier": "convenience"}'
+    sb.engram.mkdir(parents=True, exist_ok=True)
+    (sb.engram / "config.json").write_text(raw)
+    r = sb.run("--yes", *flags)
+    assert r.returncode == 0, r.all
+    assert (sb.engram / "config.json").read_text() == raw  # byte-identical: no key added, no reformat
+
+
+def test_pass_line_for_step_3_does_not_print_multi_agent(sb):
+    r = sb.run("--yes")
+    line = [l for l in r.stdout.splitlines() if l.startswith("[step 3]") and " ... ok" in l]
+    assert line and "multi_agent" not in line[0] and "install_tier=convenience" in line[0], r.stdout
+
+
+def test_forum_url_hint_names_the_tier_not_the_retired_flag(sb):
+    (sb.plugin_src / "tools" / "set_forum_url.py").unlink()
+    r = sb.run("--yes", "--forum-url", "http://forum.lan:5002")
+    assert r.returncode != 0 and "FAIL: [step 8]" in r.stderr, r.all
+    assert "--multi-agent" not in r.stderr
+    assert "convenience or dev" in r.stderr

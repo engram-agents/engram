@@ -20,7 +20,7 @@ Steps map 1-to-1 with the skill's numbered sections:
                                    REQUIRES explicit ctx.ack_changeset = True to continue
   marketplace-rebuilt     Step 2:  calls Phase-1 build_plugin(); PRECONDITION: branch==dev or main
                                    (unless ctx.allow_branch — guard per #794)
-  flags-match-config      Step 3:  tier + multi_agent in built manifest match config.json
+  flags-match-config      Step 3:  tier in built manifest matches config.json
   plugin-marketplace-update  Step 4: [operator] /plugin marketplace update engram-local
                                      (requires substrate-health + flags-match-config)
   plugin-upgrade          Step 5:  [operator] /plugin → Installed → engram plugin entry → Update now
@@ -617,7 +617,7 @@ def _apply_marketplace_rebuilt(ctx: dict[str, Any]) -> None:
             "(Guard per #794: shipping a PR/feature branch is almost always a mistake.)"
         )
 
-    # Load config.json for tier + multi_agent
+    # Load config.json for tier
     config = _load_engram_config(ctx)
     tier = config.get("install_tier")
     if not tier:
@@ -625,7 +625,6 @@ def _apply_marketplace_rebuilt(ctx: dict[str, Any]) -> None:
             "install_tier unset in config.json — set it (essential|convenience|dev) "
             "before upgrading; see #707"
         )
-    multi_agent = bool(config.get("multi_agent")) or config.get("mode") == "multi"
 
     # #3092 deploy-tag guard: refuse an untagged (or unmerged-tag) commit
     # unless allow_untagged is set. Mirrors install-local-marketplace.sh's
@@ -660,13 +659,12 @@ def _apply_marketplace_rebuilt(ctx: dict[str, Any]) -> None:
         repo_root=source_dir,
         plugin_root=plugin_root,
         tier=tier,
-        multi_agent=multi_agent,
         manifest=manifest,
     )
 
 
 def _check_flags_match_config(ctx: dict[str, Any]) -> bool:
-    """True if built manifest tier+multi_agent matches config.json.
+    """True if built manifest tier matches config.json.
 
     On mismatch, stores a human-readable delta in ``ctx["_last_failure_detail"]``
     so the executor can surface it in the FAILED reason.
@@ -682,17 +680,14 @@ def _check_flags_match_config(ctx: dict[str, Any]) -> bool:
 
     config = _load_engram_config(ctx)
     expected_tier = config.get("install_tier") or "convenience"
-    expected_ma = bool(config.get("multi_agent")) or config.get("mode") == "multi"
 
     built_tier = bm.get("tier")
-    built_ma = bool(bm.get("multi_agent"))
 
-    if built_tier == expected_tier and built_ma == expected_ma:
+    if built_tier == expected_tier:
         return True
 
     ctx["_last_failure_detail"] = (
-        f"built tier={built_tier} multi_agent={built_ma} "
-        f"but config.json says tier={expected_tier} multi_agent={expected_ma}"
+        f"built tier={built_tier} but config.json says tier={expected_tier}"
     )
     return False
 

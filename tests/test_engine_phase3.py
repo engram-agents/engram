@@ -464,43 +464,41 @@ class TestIdentityAxis:
     def test_foreign_set_excludes_identity_coupled(self):
         """Foreign set = tier_set minus identity_coupled entries.
 
-        For any tier+MA config, the foreign set must NOT include any
+        For any tier, the foreign set must NOT include any
         identity_coupled entries.
         """
         from tools.engine.build import select_shippables_with_identity
         manifest = _load_manifest()
         for tier in ("essential", "convenience", "dev"):
-            for ma in (False, True):
-                foreign = select_shippables_with_identity(manifest, tier, ma, "foreign")
-                foreign_paths = {e["path"] for e in foreign}
-                ic_in_foreign = [
-                    e["path"]
-                    for e in foreign
-                    if e.get("identity_coupled")
-                ]
-                assert not ic_in_foreign, (
-                    f"Foreign set for tier={tier!r} ma={ma} still contains "
-                    f"identity_coupled entries: {ic_in_foreign}"
-                )
+            foreign = select_shippables_with_identity(manifest, tier, "foreign")
+            foreign_paths = {e["path"] for e in foreign}
+            ic_in_foreign = [
+                e["path"]
+                for e in foreign
+                if e.get("identity_coupled")
+            ]
+            assert not ic_in_foreign, (
+                f"Foreign set for tier={tier!r} still contains "
+                f"identity_coupled entries: {ic_in_foreign}"
+            )
 
     def test_foreign_set_is_subset_of_self_set(self):
-        """Foreign set is always a subset of self set (same tier, same MA)."""
+        """Foreign set is always a subset of self set (same tier)."""
         from tools.engine.build import select_shippables_with_identity
         manifest = _load_manifest()
         for tier in ("essential", "convenience", "dev"):
-            for ma in (False, True):
-                self_set = {
-                    e["path"]
-                    for e in select_shippables_with_identity(manifest, tier, ma, "self")
-                }
-                foreign_set = {
-                    e["path"]
-                    for e in select_shippables_with_identity(manifest, tier, ma, "foreign")
-                }
-                assert foreign_set.issubset(self_set), (
-                    f"Foreign set is NOT a subset of self set for tier={tier!r} ma={ma}: "
-                    f"extra in foreign = {sorted(foreign_set - self_set)}"
-                )
+            self_set = {
+                e["path"]
+                for e in select_shippables_with_identity(manifest, tier, "self")
+            }
+            foreign_set = {
+                e["path"]
+                for e in select_shippables_with_identity(manifest, tier, "foreign")
+            }
+            assert foreign_set.issubset(self_set), (
+                f"Foreign set is NOT a subset of self set for tier={tier!r}: "
+                f"extra in foreign = {sorted(foreign_set - self_set)}"
+            )
 
     def test_identity_coupled_hooks_absent_from_foreign(self):
         """Known identity-coupled hooks are absent from foreign convenience build."""
@@ -508,7 +506,7 @@ class TestIdentityAxis:
         manifest = _load_manifest()
         foreign_paths = {
             e["path"]
-            for e in select_shippables_with_identity(manifest, "convenience", True, "foreign")
+            for e in select_shippables_with_identity(manifest, "convenience", "foreign")
         }
         identity_coupled_hooks = [
             "hooks/claude/engram-baton-prompt-hook.py",
@@ -518,21 +516,21 @@ class TestIdentityAxis:
         ]
         for hook in identity_coupled_hooks:
             assert hook not in foreign_paths, (
-                f"identity_coupled hook {hook!r} found in foreign convenience+MA set"
+                f"identity_coupled hook {hook!r} found in foreign convenience set"
             )
 
     def test_self_set_includes_identity_coupled(self):
-        """Self set (convenience+MA) does include identity-coupled hooks."""
+        """Self set (convenience) does include identity-coupled hooks."""
         from tools.engine.build import select_shippables_with_identity
         manifest = _load_manifest()
         self_paths = {
             e["path"]
-            for e in select_shippables_with_identity(manifest, "convenience", True, "self")
+            for e in select_shippables_with_identity(manifest, "convenience", "self")
         }
         # At least some identity-coupled hooks should be in the self set
-        # (those that are tier-eligible for convenience+MA)
+        # (those that are tier-eligible for convenience)
         assert "hooks/claude/engram-baton-prompt-hook.py" in self_paths, (
-            "engram-baton-prompt-hook.py should be in self+convenience+MA set"
+            "engram-baton-prompt-hook.py should be in self+convenience set"
         )
 
     def test_planted_leak_fails_foreign_build(self, tmp_path):
@@ -633,7 +631,6 @@ class TestIdentityAxis:
             repo_root=REPO_ROOT,
             plugin_root=bundle_dir,
             tier=tier,
-            multi_agent=False,
             manifest=manifest,
             target="codex",
             identity="foreign",
@@ -665,7 +662,6 @@ class TestIdentityAxis:
             repo_root=REPO_ROOT,
             plugin_root=bundle_dir,
             tier=tier,
-            multi_agent=False,
             manifest=manifest,
             target="codex",
             identity="foreign",
@@ -978,7 +974,6 @@ class TestRootFileManifestDerivation:
             repo_root=REPO_ROOT,
             plugin_root=bundle_dir,
             tier=tier,
-            multi_agent=False,
             manifest=manifest,
         )
 
@@ -1000,7 +995,6 @@ class TestRootFileManifestDerivation:
             repo_root=REPO_ROOT,
             plugin_root=bundle_dir,
             tier=tier,
-            multi_agent=False,
             manifest=manifest,
         )
 
@@ -1025,11 +1019,10 @@ class TestRootFileManifestDerivation:
             repo_root=REPO_ROOT,
             plugin_root=bundle_dir,
             tier=tier,
-            multi_agent=True,
             manifest=manifest,
         )
 
-        shipped = select_shippables(manifest, tier, multi_agent=True)
+        shipped = select_shippables(manifest, tier)
         root_paths = [e["path"] for e in shipped if "/" not in e["path"]]
         missing = [p for p in root_paths if not os.path.isfile(os.path.join(bundle_dir, p))]
         assert not missing, (

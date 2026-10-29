@@ -663,21 +663,21 @@ class TestTemplateGate:
 
 
 class TestFlagsMatchConfigFailureDetail:
-    """flags-match-config FAILED reason surfaces the tier+MA delta, not just
+    """flags-match-config FAILED reason surfaces the tier delta, not just
     the generic 'verify() returned False after apply()' string."""
 
     def test_failed_reason_includes_delta(self, tmp_path):
-        """When built manifest tier/MA differ from config.json, the FAILED
+        """When the built manifest tier differs from config.json, the FAILED
         reason must include both the built values and the expected values."""
         _, _, ctx = _make_fake_env(str(tmp_path))
         ctx["ack_changeset"] = True
         ctx["_template_gate_done"] = True
 
-        # Make config.json claim dev/True while the built manifest says
-        # convenience/False — a clear mismatch.
+        # Make config.json claim dev while the built manifest says
+        # convenience — a clear mismatch.
         config_path = os.path.join(ctx["engram_home"], "config.json")
         with open(config_path, "w") as f:
-            json.dump({"install_tier": "dev", "multi_agent": True}, f)
+            json.dump({"install_tier": "dev"}, f)
 
         steps = upgrade_flow()
         result = run_flow(steps, ctx)
@@ -688,7 +688,7 @@ class TestFlagsMatchConfigFailureDetail:
         assert "built" in result.reason
         assert "convenience" in result.reason   # built tier
         assert "dev" in result.reason           # expected tier
-        assert "multi_agent" in result.reason   # the delta axis
+        assert "multi_agent" not in result.reason   # tier is the only axis (#4255)
 
     def test_matching_flags_no_failure(self, tmp_path):
         """When built manifest matches config.json exactly, the step is satisfied

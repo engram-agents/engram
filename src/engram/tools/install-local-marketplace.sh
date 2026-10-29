@@ -308,10 +308,10 @@ PLUGIN_SRC="${ENGRAM_BUILD_DIR:-$REPO_ROOT/build/plugin}"
 # Build the plugin tree unless --skip-build was passed.
 #
 # When called standalone (no --skip-build), read $ENGRAM_HOME/config.json for
-# {multi_agent, install_tier} and pass the matching flags to build-plugin.sh.
+# install_tier and pass the matching flag to build-plugin.sh.
 # This mirrors the build_flags pattern in migrate-to-plugin.sh (step2_install_plugin)
 # and makes this script self-sufficient: any caller gets a config-correct build
-# rather than a silent single-agent/convenience default.
+# rather than a silent convenience default.
 #
 # When called with --skip-build (e.g., from migrate-to-plugin.sh after it has
 # already run build-plugin.sh with the correct flags), the existing build/plugin/
@@ -323,20 +323,13 @@ else
   build_flags=()
   _cfg="$ENGRAM_HOME/config.json"
   if [[ -f "$_cfg" ]]; then
-    # Read multi_agent/install_tier via python3, not jq (#2955) — python3 is
+    # Read install_tier via python3, not jq (#2955) — python3 is
     # already a hard requirement of this script (see the config-persist block
     # below), so there is nothing left to require a system jq binary for.
-    # One python3 invocation reads both fields from a single parse (cheaper
-    # than two separate calls, and keeps the pair atomically consistent) and
-    # prints them as two stdout lines. This is a DELIBERATE style choice
-    # against the later _eff_tier/_eff_multi_agent block (~line 497 below),
-    # which makes two separate python3 -c calls — that shape predates this
-    # fix and is unrelated pre-existing code (its own silent-exception-swallow
-    # anti-pattern is tracked separately under #2951; not the model to follow
-    # here). On ANY parse error this block prints a clear message to stderr
-    # and exits non-zero — the same fail-loud contract the old jq path got
-    # for free from `set -e`, just with a cleaner message than a raw
-    # traceback.
+    # The value is printed as one stdout line. On ANY parse error this block
+    # prints a clear message to stderr and exits non-zero — the same
+    # fail-loud contract the old jq path got for free from `set -e`, just
+    # with a cleaner message than a raw traceback.
     # PORTABILITY LANDMINE (#2979): bash 3.2 (macOS's system bash) requires an
     # EVEN total count of literal ' characters across this heredoc's body when
     # the heredoc is nested in a $(...) command substitution like this one --
@@ -344,7 +337,7 @@ else
     # bash 3.2's naive quote-balance scan for the substitution's closing paren
     # and produces a spurious syntax error dozens of lines later. Count single
     # quotes before adding/editing any comment or string inside this heredoc.
-    if ! _ma_tier_out="$(python3 - "$_cfg" <<'PY'
+    if ! _tier_out="$(python3 - "$_cfg" <<'PY'
 import json, sys
 path = sys.argv[1]
 try:
@@ -355,15 +348,11 @@ try:
     # #2965: the TOP LEVEL was type-checked above; the VALUES were not, so a
     # well-formed config with a wrong-typed value (install_tier: 0, an int
     # whose str() is non-empty) silently passed the `-z` fallback check
-    # further down and dropped dev/forum requirements with no signal --
+    # further down and dropped dev requirements with no signal --
     # exactly the outcome issue #2951 says absence should never
     # produce. Reject a present-but-wrong-typed value the same fail-loud way
     # a malformed file is already rejected, rather than let it degrade to a
-    # convenience/single-agent default.
-    ma_raw = d.get("multi_agent")
-    if ma_raw is not None and not isinstance(ma_raw, bool):
-        raise ValueError(f"multi_agent must be a boolean (or null/absent), got {type(ma_raw).__name__}: {ma_raw!r}")
-    ma = "true" if (ma_raw is True or d.get("mode") == "multi") else "false"
+    # convenience default.
     # Match jq install_tier // empty semantics: only null/missing falls back
     # to empty -- an already-empty-string value passes through as itself.
     tier = d.get("install_tier")
@@ -371,16 +360,14 @@ try:
         raise ValueError(f"install_tier must be a string (or null/absent/false), got {type(tier).__name__}: {tier!r}")
     if tier is None or tier is False:
         tier = ""
-    # Reviewer catch (#2958, Mira): this block hands ma/tier to bash as two
-    # stdout lines, split via `sed -n '1p'`/`sed -n '2p'` (see below) --
+    # Reviewer catch (#2958, Mira): this block hands tier to bash as a
+    # stdout line, split via `sed -n '1p'` (see below) --
     # unlike the old single-jq-argument path, a value containing an embedded
     # newline is silently split across MULTIPLE lines and the sed split then
     # truncates it to just its first line, with everything after the
     # newline dropped from the pipeline with no error. Reject it here
-    # instead, matching the fail-loud contract already used above. `ma` is always
-    # "true"/"false" (derived above, never copied from user input) so it can
-    # never contain a newline -- only `tier`, a raw string straight out of
-    # config.json, is at risk.
+    # instead, matching the fail-loud contract already used above. `tier` is
+    # a raw string straight out of config.json, so it is the value at risk.
     if "\n" in tier:
         raise ValueError(
             "install_tier must not contain a newline "
@@ -396,17 +383,12 @@ except Exception as e:
     # SAME message, matching the safety property this whole block exists for.
     print(f"[install-local-marketplace] ERROR: failed to parse {path}: {e}", file=sys.stderr)
     sys.exit(1)
-print(ma)
 print(tier)
 PY
     )"; then
       exit 1
     fi
-    # Split the two stdout lines without readarray/mapfile -- unavailable
-    # on bash 3.2 (macOS's system /usr/bin/env bash target).
-    _ma="$(printf '%s\n' "$_ma_tier_out" | sed -n '1p')"
-    _tier="$(printf '%s\n' "$_ma_tier_out" | sed -n '2p')"
-    [[ "$_ma" == "true" ]] && build_flags+=("--multi-agent")
+    _tier="$(printf '%s\n' "$_tier_out" | sed -n '1p')"
     [[ -n "$_tier" ]] && build_flags+=("--tier" "$_tier")
   fi
   build_flags+=("--target" "$TARGET")
@@ -530,14 +512,14 @@ else
 fi
 
 # ── Persist install choices to config.json (bug 4, #1244) ────────────────────
-# Write install_tier and multi_agent back to config.json so the next upgrade
+# Write install_tier back to config.json so the next upgrade
 # can read them without the user needing to re-specify explicit flags.
 # Only runs in the non-skip-build path: --skip-build callers managed their own
 # flags and their choices are not visible here.
 if [[ $SKIP_BUILD -eq 0 ]] && [[ -n "${_cfg:-}" ]] && [[ -f "${_cfg}" ]] && command -v python3 &>/dev/null; then
-  python3 - "${_cfg}" "${_tier:-}" "${_ma:-false}" <<'PY'
+  python3 - "${_cfg}" "${_tier:-}" <<'PY'
 import json, sys
-path, tier, ma = sys.argv[1], sys.argv[2], sys.argv[3]
+path, tier = sys.argv[1], sys.argv[2]
 try:
     with open(path) as f:
         d = json.load(f)
@@ -547,15 +529,11 @@ changed = False
 if tier and d.get('install_tier') != tier:
     d['install_tier'] = tier
     changed = True
-new_ma = ma == 'true'
-if d.get('multi_agent') is not new_ma:
-    d['multi_agent'] = new_ma
-    changed = True
 if changed:
     with open(path, 'w') as f:
         json.dump(d, f, indent=2)
         f.write('\n')
-    print(f"[install-local-marketplace] config.json updated: install_tier={tier or 'unset'} multi_agent={ma}")
+    print(f"[install-local-marketplace] config.json updated: install_tier={tier or 'unset'}")
 PY
 fi
 
@@ -674,10 +652,10 @@ PY
 
 if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
   # #2951: these two reads used to swallow ANY parse failure and silently
-  # resolve to convenience/not-multi-agent, dropping the dev/forum
+  # resolve to convenience, dropping the dev/forum
   # requirements with no signal. Fail loud instead, matching the
-  # _ma_tier_out block's contract above (#2955/#2958) -- absence of the
-  # value means "something is wrong", never "single-agent convenience".
+  # _tier_out block's contract above (#2955/#2958) -- absence of the
+  # value means "something is wrong", never "convenience".
   # A well-formed config that simply omits install_tier (or has it as
   # null) still resolves to empty string here, exactly like the sibling
   # block, so the existing `[[ -z ... ]] && _eff_tier="convenience"` line
@@ -692,9 +670,8 @@ if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
   # PRESENT file goes through the fail-loud reads below, so #2951/#2965's
   # "a parse/type failure is never silently the default" is unchanged.
   if [[ ! -e "$ENGRAM_HOME/config.json" && ! -L "$ENGRAM_HOME/config.json" ]]; then
-    log "$ENGRAM_HOME/config.json does not exist yet (fresh install): using the fresh-install default (tier convenience, single-agent) for venv provisioning"
+    log "$ENGRAM_HOME/config.json does not exist yet (fresh install): using the fresh-install default (tier convenience) for venv provisioning"
     _eff_tier="convenience"
-    _eff_multi_agent="false"
   else
   if ! _eff_tier="$(python3 -c "import json,sys
 path = sys.argv[1]
@@ -719,33 +696,6 @@ print(tier)
     exit 1
   fi
   [[ -z "$_eff_tier" ]] && _eff_tier="convenience"
-  # Independent of tier (#2944): is this seat multi-agent? Same boolean logic
-  # as the earlier jq-based read above (multi_agent==true OR mode=="multi"),
-  # reimplemented via python3 here to match this later block's jq-optional
-  # style (this block already doesn't assume jq is present). Same #2951
-  # fail-loud contract as _eff_tier above -- absence of multi_agent/mode
-  # keys is a legitimate "false", only a parse/type failure errors.
-  if ! _eff_multi_agent="$(python3 -c "import json,sys
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        d = json.load(f)
-    if not isinstance(d, dict):
-        raise ValueError('expected a JSON object at the top level, got ' + type(d).__name__)
-    _ma_raw = d.get('multi_agent')
-    # #2965: reject a present-but-wrong-typed value (e.g. the string 'true',
-    # or 1) instead of letting it silently resolve to false and drop the
-    # forum package requirements with no signal.
-    if _ma_raw is not None and not isinstance(_ma_raw, bool):
-        raise ValueError('multi_agent must be a boolean (or null/absent), got ' + type(_ma_raw).__name__ + ': ' + repr(_ma_raw))
-    print('true' if (_ma_raw is True or d.get('mode') == 'multi') else 'false')
-except Exception as e:
-    print('[install-local-marketplace] ERROR: failed to parse ' + path + ': ' + str(e), file=sys.stderr)
-    sys.exit(1)
-" "$ENGRAM_HOME/config.json")"; then
-    exit 1
-  fi
-  [[ -z "$_eff_multi_agent" ]] && _eff_multi_agent="false"
   fi
   _runtime_req="$REPO_ROOT/requirements/requirements.txt"
   if [[ -f "$_runtime_req" ]]; then
@@ -776,10 +726,10 @@ except Exception as e:
         || log "WARN: venv dev-requirements install failed (continuing; server still runs)"
     fi
   fi
-  if [[ "$_eff_multi_agent" == "true" ]]; then
+  if [[ "$_eff_tier" == "dev" ]]; then
     _forum_req="$REPO_ROOT/src/forum/requirements.txt"
     if [[ -f "$_forum_req" ]]; then
-      log "Multi-agent: installing forum package dependencies into $HOME/.engram/venv"
+      log "Dev tier: installing forum package dependencies into $HOME/.engram/venv"
       # A failed FORUM-requirements install (Flask, bleach, beautifulsoup4,
       # html5lib, markdown-it-py, sentence-transformers, huggingface_hub,
       # sqlite-vec) only affects local forum-test collection (src/forum/tests/)
@@ -793,9 +743,9 @@ except Exception as e:
       # #2951 (Kepler, folded into the same rc2 item): a missing forum-
       # requirements file used to silently no-op with zero log output,
       # unlike the install-failed case above which does WARN. A
-      # multi-agent seat with no forum requirements file is a real gap
-      # (forum tooling silently unavailable), so surface it the same way.
-      log "WARN: multi-agent seat but $_forum_req not found -- forum/coordination package dependencies were not installed (continuing; server still runs, forum tooling may be unavailable)"
+      # dev-tier seat with no forum requirements file is a real gap
+      # (forum tests silently unrunnable), so surface it the same way.
+      log "WARN: dev tier but $_forum_req not found -- forum/coordination package dependencies were not installed (continuing; server still runs, forum tooling may be unavailable)"
     fi
   fi
 fi

@@ -58,7 +58,7 @@ exactly once.
 | `repo_only` | repo-side only, never shipped (e.g. the test suite) — carries a `reason` |
 | `build_inputs` | consumed by the build itself rather than shipped as-is |
 
-A `mechanisms` entry is `{path, tier}` plus optional `multi_agent`, `source`,
+A `mechanisms` entry is `{path, tier}` plus optional `source`,
 `note`, `identity_coupled`, `reason`.
 
 **`path` is the BUNDLE DESTINATION; `source` is the REPO ORIGIN.** They coincide
@@ -98,7 +98,6 @@ source→dest remap.
 
 - **Depth tier** — `essential` ⊂ `convenience` ⊂ `dev`, **cumulative**: choosing
   one ships it and everything below. `default_tier` is `convenience`.
-- **`multi_agent`** — an orthogonal topology flag, composes with any depth tier.
 - **`identity_coupled`** — entries dropped from foreign bundles regardless of tier.
 
 `source_root` is `src/engram`; manifest paths are relative to it.
@@ -106,7 +105,7 @@ source→dest remap.
 ## Invoking it
 
 ```
-src/build/build-plugin.sh --tier dev [--multi-agent]
+src/build/build-plugin.sh --tier dev
 ```
 
 which delegates to `python3 -m tools.engine.cli build`. **Invoke through the
@@ -150,13 +149,10 @@ is the thing most likely to surprise you.
 There is **no cmake-style declared dependency graph**, and deliberately so.
 Instead `tests/test_tiers_manifest.py::test_import_dep_tier_consistency`
 AST-parses every Python mechanism, resolves its imports to manifest paths, and
-asserts two monotonicity properties:
+asserts one monotonicity property: an importee may not ship at a **higher** tier
+than its importer.
 
-1. an importee may not ship at a **higher** tier than its importer;
-2. a `multi_agent`-only importee may not be imported by something that ships
-   single-agent.
-
-Both prevent one runtime class: an importer present where its importee is not,
+It prevents one runtime class: an importer present where its importee is not,
 i.e. `ImportError` in a narrower install.
 
 **Derived beats declared here** — nobody maintains a list, so it cannot go stale.

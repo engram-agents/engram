@@ -5,13 +5,11 @@ Pure Python 3 stdlib; ZERO imports from ENGRAM runtime modules.
 Axis model
 ----------
 tier       : depth tier — cumulative (essential ⊂ convenience ⊂ dev)
-multi_agent: orthogonal flag — composes with any depth tier
 
 select_shippables() is the canonical predicate, mirroring build-plugin.sh's
 ships() function.  The predicate is:
 
     ships(m) := rank(m.tier) <= rank(chosen_tier)
-                AND (m.multi_agent != true OR multi_agent_chosen)
 
 where rank(essential)=0, rank(convenience)=1, rank(dev)=2.
 """
@@ -58,7 +56,8 @@ def load_manifest(manifest_path: str) -> dict[str, Any]:
     FileNotFoundError
         If the file does not exist.
     ValueError
-        If required top-level fields are missing or tier values are invalid.
+        If required top-level fields are missing, tier values are invalid, or an
+        entry carries the retired ``multi_agent`` key (#4255).
     json.JSONDecodeError
         If the file is not valid JSON.
     """
@@ -92,7 +91,27 @@ def load_manifest(manifest_path: str) -> dict[str, Any]:
             + "\n".join(invalid)
         )
 
+    retired = retired_axis_entries(data)
+    if retired:
+        raise ValueError(
+            "packaging/tiers.json entries carry the retired 'multi_agent' key (#4255); "
+            "the axis is gone and the key would silently do nothing. Delete it from:\n"
+            + "\n".join(f"  {p!r}" for p in retired)
+        )
+
     return data
+
+
+def retired_axis_entries(manifest: dict[str, Any]) -> list[str]:
+    """Return the path of every entry (in any bucket) that carries a ``multi_agent`` key."""
+    found: list[str] = []
+    for bucket in manifest.values():
+        if not isinstance(bucket, list):
+            continue
+        for entry in bucket:
+            if isinstance(entry, dict) and "multi_agent" in entry:
+                found.append(str(entry.get("path", "<no path>")))
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -140,13 +159,11 @@ def resolve_tier(manifest: dict[str, Any], tier_arg: str | None) -> str:
 def select_shippables(
     manifest: dict[str, Any],
     tier: str,
-    multi_agent: bool,
 ) -> list[dict[str, Any]]:
-    """Return the list of mechanism entries that ship under (tier, multi_agent).
+    """Return the list of mechanism entries that ship under ``tier``.
 
     Predicate (mirrors build-plugin.sh):
         ships(m) := rank(m.tier) <= rank(chosen_tier)
-                    AND (m.multi_agent != true OR multi_agent_chosen)
 
     Parameters
     ----------
@@ -154,22 +171,18 @@ def select_shippables(
         Parsed tiers.json dict (from load_manifest).
     tier:
         The chosen depth tier string (e.g. "convenience").
-    multi_agent:
-        Whether --multi-agent was requested.
 
     Returns
     -------
     list[dict]
-        Mechanism entries (with "path", "tier", and optional "multi_agent" keys)
-        that satisfy the predicate, in manifest order.
+        Mechanism entries (with "path" and "tier" keys) that satisfy the
+        predicate, in manifest order.
     """
     chosen_rank = TIER_RANKS.get(tier, 2)
     result: list[dict[str, Any]] = []
     for entry in manifest["mechanisms"]:
         entry_rank = TIER_RANKS.get(entry.get("tier", "dev"), 2)
         if entry_rank > chosen_rank:
-            continue
-        if entry.get("multi_agent") is True and not multi_agent:
             continue
         result.append(entry)
     return result
