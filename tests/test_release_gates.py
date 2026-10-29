@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -889,3 +890,123 @@ class TestG4aNodeIdBurnDown:
         (tmp_path / "forum" / "app.py").write_text("# gg_0005 shipped\n")
         res = run_G4a(str(tmp_path))
         assert "1" in res["metric"], res
+
+
+# ---------------------------------------------------------------------------
+# plugin.json version must have the newest docs/CHANGELOG.md section (#4253)
+# ---------------------------------------------------------------------------
+
+_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+# Pinned released-section heading format, e.g. "## [v0.5.5] - 2026-10-28".
+# "## [Unreleased]" deliberately does not match.
+_CHANGELOG_HEADING_RE = re.compile(
+    r"^## \[v(\d+\.\d+\.\d+)\] - \d{4}-\d{2}-\d{2}\s*$", re.MULTILINE
+)
+
+
+def _check_version_vs_changelog(version: str, changelog_text: str) -> list[str]:
+    """Return problems tying ``version`` to ``changelog_text`` (empty = ok)."""
+    if not _VERSION_RE.match(version):
+        return [f"version {version!r} is not plain X.Y.Z (e.g. 0.5.5)"]
+    headings = _CHANGELOG_HEADING_RE.findall(changelog_text)
+    if not headings:
+        return [
+            "no CHANGELOG heading matched the pinned heading format "
+            "'## [vX.Y.Z] - YYYY-MM-DD': the heading format changed, or "
+            "the file is wrong"
+        ]
+    if version not in headings:
+        return [f"no CHANGELOG section for v{version}"]
+    if headings[0] != version:
+        return [
+            f"plugin.json version {version} is not the newest CHANGELOG "
+            f"section (newest is v{headings[0]})"
+        ]
+    return []
+
+
+_CL_SHAPED = (
+    "# Changelog\n\n"
+    "## [Unreleased]\n\n"
+    "## [v0.5.5] - 2026-10-28\n\n- x\n\n"
+    "## [v0.5.4] - 2026-10-21\n\n- y\n"
+)
+# Same shape, but the absent version appears in PROSE: rule 3 must need a real
+# heading match, not a substring hit anywhere in the text.
+_CL_SHAPED_WITH_PROSE = (
+    "# Changelog\n\n"
+    "## [v0.5.5] - 2026-10-28\n\n- see 0.5.6 plans\n\n"
+    "## [v0.5.4] - 2026-10-21\n\n- y\n"
+)
+
+
+class TestPluginVersionHasChangelogSection(unittest.TestCase):
+    """Contract of _check_version_vs_changelog (empty list = ok).
+
+    1. version must be plain X.Y.Z.
+    2. released headings are pinned to ``## [vX.Y.Z] - YYYY-MM-DD``; zero
+       matches means the format changed (never a silent pass).
+    3. the version must appear among the matched headings.
+    4. the FIRST matched heading must equal the version.
+
+    Property: the plugin.json version bump and its CHANGELOG section must land
+    in ONE commit (as v0.5.0..v0.5.5 did). Split across two PRs, this test is
+    red between them, caught by nightly.yml or the dev->main PR, not by
+    pr-checks.
+    """
+
+    def test_matching_version_has_no_problems(self):
+        self.assertEqual(_check_version_vs_changelog("0.5.5", _CL_SHAPED), [])
+
+    def test_version_without_section_is_a_problem(self):
+        probs = _check_version_vs_changelog("0.5.6", _CL_SHAPED_WITH_PROSE)
+        self.assertEqual(len(probs), 1, probs)
+        self.assertIn("no CHANGELOG section for v0.5.6", probs[0])
+
+    def test_headings_without_the_date_tail_are_a_format_problem(self):
+        for heading in ("## [v0.5.5]", "## [v0.5.5] - TBD"):
+            with self.subTest(heading=heading):
+                text = f"# Changelog\n\n{heading}\n\n- x\n"
+                probs = _check_version_vs_changelog("0.5.5", text)
+                self.assertEqual(len(probs), 1, probs)
+                self.assertIn("heading format", probs[0])
+                self.assertNotIn("no CHANGELOG section", probs[0])
+
+    def test_version_with_old_section_is_not_newest(self):
+        probs = _check_version_vs_changelog("0.5.4", _CL_SHAPED)
+        self.assertEqual(len(probs), 1, probs)
+        self.assertIn("0.5.4", probs[0])
+        self.assertIn("0.5.5", probs[0])
+        self.assertNotIn("no CHANGELOG section", probs[0])
+
+    def test_changed_heading_format_is_a_format_problem(self):
+        text = "# Changelog\n\n## v0.5.5 (2026-10-28)\n\n## v0.5.4 (2026-10-21)\n"
+        probs = _check_version_vs_changelog("0.5.5", text)
+        self.assertEqual(len(probs), 1, probs)
+        self.assertIn("heading format", probs[0])
+        self.assertNotIn("no CHANGELOG section", probs[0])
+
+    def test_suffixed_version_is_a_version_format_problem(self):
+        probs = _check_version_vs_changelog("0.5.5-rc1", _CL_SHAPED)
+        self.assertTrue(probs)
+        self.assertIn("0.5.5-rc1", probs[0])
+        self.assertIn("X.Y.Z", probs[0])
+
+    def test_unreleased_does_not_count_as_newest(self):
+        # [Unreleased] sits above v0.5.5 and must not be taken as the newest.
+        self.assertEqual(_check_version_vs_changelog("0.5.5", _CL_SHAPED), [])
+        only_unreleased = "## [Unreleased]\n\n- z\n"
+        probs = _check_version_vs_changelog("0.5.5", only_unreleased)
+        self.assertEqual(len(probs), 1, probs)
+        self.assertIn("heading format", probs[0])
+
+    def test_real_files_agree(self):
+        manifest = json.loads(
+            (PROJECT_ROOT / "plugin.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("version", manifest, "plugin.json has no 'version' key")
+        version = manifest["version"]
+        changelog = (PROJECT_ROOT / "docs" / "CHANGELOG.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(_check_version_vs_changelog(version, changelog), [])
