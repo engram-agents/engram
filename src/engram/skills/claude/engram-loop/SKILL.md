@@ -780,7 +780,7 @@ With the marker present, the hook tells you the right thing; the discipline is:
 
 `engram-curiosity-loop` (breadth-first research), `engram-meta-loop` (autonomous
 top-level), `engram-deep-research` (depth-first), `engram-school-day` (fixed
-curriculum), and `engram-collaborating-loop` (multi-agent Monitor-wake +
+curriculum), and `engram-collaborating-loop` (counterpart Monitor-wake +
 relaxed-heartbeat coordination) are KINDS of self-paced loop. **The loop
 FORMALITY — the marker
 lifecycle (Steps 0–3) and the loop-mode drowsiness behavior (Step 4) — lives
@@ -799,7 +799,7 @@ migration question (#507) is closed; the remaining duplication is the
 school-day-specific marker handling, not a cadence gap.
 
 Use `engram-loop` directly for a loop that doesn't fit a specialized one (e.g. a
-directed multi-agent work-loop); pick the most specific skill when one fits, and
+directed work-loop with a counterpart); pick the most specific skill when one fits, and
 fall back to `engram-loop` otherwise.
 
 **Provenance:** #483 (the convention-gap that motivated a first-class owner);

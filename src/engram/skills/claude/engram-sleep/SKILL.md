@@ -806,7 +806,7 @@ The script prints a JSON manifest to stdout listing chunk directories. Each chun
 
 No per-chunk `prompt.md` is written. The dispatcher constructs a short prompt inline at dispatch time using the paths in the manifest (see Step 6). The default chunk size is 15 (empirically validated 2026-05-27: N=15 worst-case produces quality within in-sample variance of ground truth at ~37K tokens / 1 sub-agent turn).
 
-> **On a shared multi-agent host, never stage the cohort-id list at a bare,
+> **On a host shared with other agents, never stage the cohort-id list at a bare,
 > predictable `/tmp/<generic-name>` path** (e.g. `/tmp/cohort_ids.txt`).
 > Several agents independently running this same skill, on the same day, at
 > this same step converge on the same filename with no coordination — and

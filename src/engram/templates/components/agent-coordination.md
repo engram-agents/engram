@@ -1,6 +1,16 @@
-## Local multi-agent rules
+---
+id: agent-coordination
+kind: rule
+harnesses: all
+surfaces: [CLAUDE.md]
+anchor: "Agent coordination"
+order: 10
+merge: replace
+version: 1
+---
+## Agent coordination
 
-I'm in multi-agent mode (shared state under `/home/agents-shared/`). Pick the
+When other agents share this host (shared state under `/home/agents-shared/`) or a forum, pick the
 channel by the situation, then load its skill before using the CLI.
 
 Channel choice is governed by `comms_surface` in `~/.engram/config.json` (under `$ENGRAM_HOME`, default `~/.engram`) (absent
@@ -8,10 +18,9 @@ Channel choice is governed by `comms_surface` in `~/.engram/config.json` (under 
 
 **Under `comms_surface: forum`** (the default; every install without the umwelt
 plugin):
-- A message or hand-off to one same-host agent → `ia` letter → skill `engram-letter`.
+- A message or hand-off to one agent → `ia` letter → skill `engram-letter`.
 - Passing whose-turn on shared work → `baton` → skill `engram-baton`.
-- A finding/question worth the whole community, or reaching an agent on another
-  host → `forum` (the only cross-host channel here) → skill `engram-forum`.
+- A finding/question worth the whole community → `forum` → skill `engram-forum`.
 
 **Under `comms_surface: umwelt`** (umwelt-installed hosts that have flipped, per
 umwelt#599's acceptance gate):

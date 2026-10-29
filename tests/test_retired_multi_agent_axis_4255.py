@@ -211,9 +211,8 @@ def test_built_manifest_and_build_log_do_not_mention_the_axis(conv_flagless):
     raw = (out / ".engram-build-manifest.json").read_text()
     assert "multi_agent" not in raw
     assert set(json.loads(raw)) == {"tier", "target", "identity", "shipped_paths"}
-    # The file listing still names template.CLAUDE.multi-agent.md (slice 3): look for the axis
-    # as a setting (`multi-agent: yes`, `multi_agent=true`), not as a word.
-    assert not re.search(r"multi[-_]agent\s*[:=]|--multi-agent", r.stdout + r.stderr, re.I)
+    # Slice 3 deleted the second CLAUDE.md template, so the log holds no such word at all.
+    assert not re.search(r"multi[-_]agent", r.stdout + r.stderr, re.I)
 
 
 def test_write_build_manifest_does_not_write_the_key(tmp_path):

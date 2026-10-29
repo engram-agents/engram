@@ -851,8 +851,8 @@ still had the pre-#4005 `dev` commit as parent, and a REST read of the PR did no
 it. After `gh pr update-branch`, the runs started at about 14:41Z used the new step and
 passed. The merge-ref reads were live and cannot be reconstructed now.
 
-**Approvals after `update-branch`.** CLAUDE.md § "PR review convention (multi-agent
-mode)", paragraph "The merge gate itself", says a new commit after approval needs a fresh
+**Approvals after `update-branch`.** CLAUDE.md § "PR review convention (when the PR
+has a colleague)", paragraph "The merge gate itself", says a new commit after approval needs a fresh
 peer review and approval, and that the `dev` ruleset enforces this mechanically
 (dismiss-on-push + last-push approval). At the `update-branch` step on those PRs the
 ruleset did NOT dismiss the approvals; it re-pointed them to the new head, so the

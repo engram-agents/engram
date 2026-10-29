@@ -83,10 +83,10 @@ ships it plus everything below):
   recall-measurement harness, leak scanners, DB-surgery tools, the surface-drift
   hooks, baselines.
 
-**Orthogonal axis — `--multi-agent`** (a topology flag, not a depth tier; composes
-with any depth tier): inter-agent letters / turn-state batons / the shared forum —
-their CLIs, prompt-hooks, coordination skills, and the multi-agent CLAUDE.md
-template.
+**Agent coordination is not a tier or a flag** (#4255): inter-agent letters /
+turn-state batons / the shared forum — their CLIs, prompt-hooks and skills, and
+the CLAUDE.md template's "Agent coordination" section — are tagged in the manifest
+like everything else.
 
 **Two load-bearing rules:**
 
@@ -99,7 +99,7 @@ template.
 2. **Every shippable is tagged exactly once in the manifest.** The tier map **is**
    the single source of truth at `src/build/packaging/tiers.json`, and
    `build-plugin.sh --tier` filters through it at **build time** (the
-   agent-led install reads the README, prompts the user for tier + multi-agent, and
+   agent-led install reads the README, prompts the user for the tier, and
    builds accordingly — no post-install pruning). **CI fails the build if any
    shippable path is untiered or any manifest entry is dangling** — so "added a
    skill, forgot to tier it" cannot drift past review. This is a mechanical gate,
@@ -291,11 +291,11 @@ carve-out, examples, gray-area calls, and the baton turn-target corollary — li
 in **[`docs/internal/PR-MERGE-POLICY.md`](docs/internal/PR-MERGE-POLICY.md)**. Read it there; don't
 re-derive the rule from this summary.
 
-## PR merge-readiness — CI-green gate (both modes)
+## PR merge-readiness — CI-green gate
 
 A PR is merge-ready only when it is **review-converged AND CI-green on the
-current tip** — in single-agent and multi-agent mode alike. (Multi-agent: it
-gates the `baton flip → <maintainer>` below; single-agent: it gates surfacing the
+current tip**, with or without a colleague. (With a colleague: it
+gates the `baton flip → <maintainer>` below; without one: it gates surfacing the
 PR as ready.) Before presenting a PR as merge-ready:
 
 ```
@@ -339,11 +339,10 @@ checked); amended 2026-08-30 after superseded same-SHA runs (#2410, #2419) read
 as not-green. Measurements: `docs/internal/PR-MERGE-POLICY.md` § "PR merge-readiness —
 CI-green gate (both modes)".*
 
-## PR review convention (multi-agent mode)
+## PR review convention (when the PR has a colleague)
 
-When this host runs **multiple ENGRAM agents** (e.g. Ariadne + Borges) — i.e. a
-counterpart agent is active and the shared `/home/agents-shared/inter-agent/`
-channel exists — PR review is **reciprocal**: an agent's own PRs get a colleague
+When a counterpart ENGRAM agent is active (e.g. Ariadne + Borges) and the shared
+`/home/agents-shared/inter-agent/` channel exists, PR review is **reciprocal**: an agent's own PRs get a colleague
 fresh-eye from the counterpart agent, not only from the agent's own
 reviewer-fairy.
 
@@ -352,7 +351,7 @@ enters the maintainer's merge queue:
 
 1. **Reviewer-fairy** (`engram-pr-reviewer`) — iterate to convergence (APPROVE)
    *before the PR goes to the peer* — catches mechanical / contract / scope
-   issues. (Applies in single-agent mode too.) **This is the author's own
+   issues. (Applies with no counterpart too.) **This is the author's own
    pre-peer self-check, not a re-run gate on every later push** (Lei,
    2026-09-13 20:54 EDT, in-session, verbatim: "before going out for peer
    review, the fairy review is like 'double checking it on your own' ... no
@@ -729,7 +728,7 @@ numbering sweep): engram-alpha's `docs/internal/GH-STACK.md`.*
 
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 
-Three parts of one rule (Lei, 2026-08-14). Applies in single-agent mode too — checking
+Three parts of one rule (Lei, 2026-08-14). Applies on a seat with no co-resident agent too — checking
 open PRs guards against your own stale branch from a prior session, not just a
 counterpart's work. All three exist because **a list read and a thread read are
 different operations, and only the list read scales**: nobody opens ten comment
@@ -791,7 +790,7 @@ close, not another comment.
 
 Open a PR-baton **at PR creation**, for **every** PR — bunch-driven OR standalone:
 `baton init PR-N --title "<short>" --participants <self>,<counterpart>,<maintainer> --turn <self> --status in-progress --colleague <counterpart> --repo <owner>/<repo>`.
-Use `--colleague <name>` to identify the expected colleague reviewer — this adds them to participants (dedup) and enables the colleague gate: `baton flip PR-N <maintainer>` will be rejected if no non-author APPROVED review exists. Without `--colleague` (and without a third participant), the gate falls back to warn-only (single-agent mode).
+Use `--colleague <name>` to identify the expected colleague reviewer — this adds them to participants (dedup) and enables the colleague gate: `baton flip PR-N <maintainer>` will be rejected if no non-author APPROVED review exists. Without `--colleague` (and without a third participant), the gate falls back to warn-only (a baton with no colleague).
 Then flip it as the turn actually passes along the review pipeline:
 
 - reviewer-fairy converged → `baton flip PR-N <counterpart> "fairy-converged; colleague please"`
@@ -800,7 +799,7 @@ Then flip it as the turn actually passes along the review pipeline:
   "COMMENTED with considerations" verdict does **not** (that misread is the whole origin).
 - counterpart **approved** → `baton advance PR-N` (or the same hand-off as `baton flip PR-N <maintainer> "colleague-APPROVED; ready for merge"`; on a colleague-bearing PR baton the server runs one strict gate for both and refuses unless GitHub shows an APPROVED review on the current head by the colleague's mapped login)
 
-*(Single-agent mode — no counterpart: skip the colleague flip; after the reviewer-fairy
+*(No counterpart, so no colleague: skip the colleague flip; after the reviewer-fairy
 converges and your own second-layer pass is clean, flip straight to the maintainer.)*
 
 **A PR is merge-ready ONLY when its baton phase = `merge`** (the `phase:` line of the
@@ -832,20 +831,20 @@ is **not** ready, no matter how long it has sat. Symmetrically: never leave a
 colleague-converged PR without running the advance — otherwise its readiness is
 invisible, and a colleague verdict that is actually "COMMENTED with considerations" (not an
 approval) can be misread as ready. **Fallback — read `turn` as before (turn = the
-maintainer, reached via an explicit colleague approval or, single-agent, your own converged
+maintainer, reached via an explicit colleague approval or, with no counterpart, your own converged
 second-layer pass) — in these known cases (a list of what has been found, not a proof that
 it is exhaustive):** the baton carries no `phase:` line (a legacy file); or it has no
-`colleague` (single-agent mode keeps the old weak gate); or the host's forum server predates
+`colleague` (a baton with no colleague keeps the old weak gate); or the host's forum server predates
 the U2b gate (#3284), until it is redeployed.
 
-**Single-agent mode:** no counterpart exists, so the colleague layer collapses
+**On a seat with no co-resident agent and no counterpart:** the colleague layer collapses
 to reviewer-fairy + the author's own second-layer eye + the maintainer. Don't
 block on a colleague review that has no one to perform it; the
 not-fairy-delegatable constraint above is moot when there is no counterpart to
 delegate to.
 
-**Single-agent on host with cross-host forum peers:** if you are a single agent
-on your machine but have peers reachable via the LAN forum (e.g. Borges and
+**No co-resident agent, but cross-host forum peers:** if no other agent shares
+your machine but you have peers reachable via the LAN forum (e.g. Borges and
 Ariadne on a different host), **mention the relevant peer on the forum after any
 GitHub activity that requires their reaction** — posting a review, requesting a
 review, commenting with findings, approving, or responding to a review. The
@@ -855,12 +854,12 @@ post or reply is enough — the forum-mention Monitor delivers it within ~30s.
 Without this, a review or request sits unacknowledged until the peer's next
 scheduled wakeup.
 
-**Why project-local** (not user-level): the single-vs-multi-agent switch is hard
+**Why project-local** (not user-level): whether a counterpart exists is hard
 to encode in always-loaded identity rules.
 
 **Origin:** a self-review lapse traced to this reciprocal step being
 unwritten in the workflow doc; the hierarchy itself has been practiced
-since the multi-agent coordination work started in 2026-05.
+since agent coordination work started in 2026-05.
 
 ## Attribution convention — Lei's functional-vs-marker test (alpha#2270)
 
@@ -890,9 +889,9 @@ citation from a leak, so it asks the seat to decide. Umwelt and soma run no
 > behind it now lives in engram-alpha's `docs/internal/PR-REVIEW-CONVENTION.md`, to which
 > the sibling copies point.
 
-## Project-as-bunch coordination (multi-agent mode)
+## Project-as-bunch coordination (with a counterpart agent)
 
-When this host runs **multiple ENGRAM agents** (e.g. Ariadne + Borges), open
+When a counterpart ENGRAM agent shares the work (e.g. Ariadne + Borges), open
 issues are organized into **bunches** — topic- or defect-class-coherent units
 of work — each backed by **both** a baton file (turn-state) and a GitHub
 Project (item-list + status tally). Two layers, separate verbs:
@@ -982,7 +981,7 @@ files / functions).
   substantive discoveries (cross-PR catches, completeness yields). The system
   needs both — pure-baton/no-letters kills the discovery channel.
 
-### Single-agent mode
+### With no counterpart
 
 No counterpart → no claim contention. The Project layer remains useful as an
 organizing structure for defect-classes, but the `claim` / `release` ritual is
@@ -1011,7 +1010,7 @@ maintainer.
 - Companion letter skill (verdicts + discoveries channel): `engram-letter`.
 
 **Why project-local** (not user-level): same reasoning as the PR review
-convention above — multi-agent coordination tooling is project-specific, not
+convention above — agent coordination tooling is project-specific, not
 identity-level discipline.
 
 ## PR — issue closure

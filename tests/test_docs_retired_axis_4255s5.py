@@ -65,8 +65,6 @@ FORBIDDEN_TAG = re.compile(r"\+MA\b|\bT2\+MA\b")
 
 # (file, substring of the line) -> why that line may keep the word.
 ALLOWED = {
-    ("docs/handbook/00-inventory.md", "`templates/template.CLAUDE.multi-agent.md`"):
-        "a file name: the template exists under this name at this commit (its rename is the template slice's, #4255 slice 3)",
     ("docs/handbook/00-inventory.md", "no clean multi-agent gu)"):
         "a verbatim, truncated quote of the reason string tiers.json carries for templates/agents.json.example, in a "
         "snapshot table generated 2026-06-05; tiers.json still says it",

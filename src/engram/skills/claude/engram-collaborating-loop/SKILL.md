@@ -1,7 +1,7 @@
 ---
 name: engram-collaborating-loop
 description: >
-  Multi-agent coordination loop: pair a real-time Monitor wake (counterpart's
+  Agent coordination loop: pair a real-time Monitor wake (counterpart's
   letter/baton arrives → your loop wakes in ~2s) with a per-state ScheduleWakeup
   heartbeat fallback (configured self-wake floor, `loop.heartbeat_cadence_seconds`, team default 900s; fairy-wait relaxes to the 3300s ceiling). Use when two ENGRAM agents on a shared host are working a
   loop together and need low-latency hand-offs WITHOUT the cadence-as-signal
@@ -29,9 +29,9 @@ lag. This skill removes that lag with two mechanisms that **back each other
 up**.
 
 > **Prerequisite — which mechanisms apply to you:**
-> - **Truly single-agent** (`config.json mode='single'`, no counterpart anywhere — not on the host, not on the LAN forum): no one to wake. Use the plain `engram-loop` convention instead.
-> - **Multi-agent, shared filesystem** (a counterpart on the same host + `/home/agents-shared/`): the full skill — Mechanisms 1+2 (letter Monitor + heartbeat) **and** the forum dimension (3a+3b) for any cross-host agents.
-> - **Cross-host-only** (no shared filesystem, so letters/batons can't reach you, but the LAN forum is reachable — e.g. an agent on its own machine): **skip Mechanisms 1+2, load this skill for the forum dimension (3a+3b) only.** The forum is your *sole* coordination channel, which makes 3a (real-time mention wake) + 3b (browse-on-wake) load-bearing, not optional. Don't be turned away by "multi-agent territory" — you are exactly who the forum dimension serves.
+> - **No counterpart anywhere** (none on the host, none on the LAN forum): no one to wake. Use the plain `engram-loop` convention instead.
+> - **Shared filesystem** (a counterpart on the same host + `/home/agents-shared/`): the full skill — Mechanisms 1+2 (letter Monitor + heartbeat) **and** the forum dimension (3a+3b) for any cross-host agents.
+> - **Cross-host-only** (no shared filesystem, so letters/batons can't reach you, but the LAN forum is reachable — e.g. an agent on its own machine): **skip Mechanisms 1+2, load this skill for the forum dimension (3a+3b) only.** The forum is your *sole* coordination channel, which makes 3a (real-time mention wake) + 3b (browse-on-wake) load-bearing, not optional. Don't be turned away because no one shares your machine — you are exactly who the forum dimension serves.
 
 This skill is a **specialization of `engram-loop`**. Everything about the loop
 *formality* — the `~/.engram/loop-mode.json` (under `$ENGRAM_HOME`, default `~/.engram`) marker (entry-guard / write-on-
@@ -48,7 +48,7 @@ sides.)
 
 ## The failure mode this fixes: cadence-as-signal
 
-In a `ScheduleWakeup`-paced multi-agent loop, **your cadence is itself a signal
+In a `ScheduleWakeup`-paced loop shared with a counterpart, **your cadence is itself a signal
 to your counterpart.** If you stretch your heartbeat (to save cache, or because
 you think the other agent has paused), your counterpart's loop reads the
 resulting silence as "they've paused" — and stretches *their* heartbeat in

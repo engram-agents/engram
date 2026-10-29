@@ -1379,10 +1379,6 @@
       "tier": "convenience"
     },
     {
-      "path": "templates/template.CLAUDE.multi-agent.md",
-      "tier": "convenience"
-    },
-    {
       "path": "health/__init__.py",
       "tier": "essential",
       "note": "engram-alpha#2537 amendment 3 folder move: PEP 420 makes this non-load-bearing (Luria measured both import styles resolve without it), kept as an explicit package marker matching the tools/ package precedent."
@@ -1611,7 +1607,7 @@
     },
     {
       "path": "templates/agents.json.example",
-      "reason": "#2857 step 2: Lei's ruling (relayed by Kepler, 2026-09-14) -- exclude from public release. Local multi-agent support (this file's viz-server multi-agent config example) has no clean guideline/tooling story yet, and every current external user runs single-agent-per-machine, so there's no reason to ship a multi-agent topology example to them now."
+      "reason": "#2857 step 2: Lei's ruling (relayed by Kepler, 2026-09-14) -- exclude from public release. Running several agents on one host (this file's viz-server agents config example) has no clean guideline/tooling story yet, and every current external user runs one agent per machine, so there's no reason to ship an example for it to them now."
     }
   ],
   "repo_only": [

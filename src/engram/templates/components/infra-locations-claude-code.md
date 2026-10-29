@@ -23,3 +23,4 @@ version: 2
 | Warm briefing | `{{ENGRAM_HOME}}/warm-briefing.md` |
 | Private diary | `{{ENGRAM_HOME}}/diary/` |
 | Per-session marker | `{{ENGRAM_HOME}}/sessions/<session_id>.json`, written by the SessionStart hook, one per session. Hooks take `session_id` and `transcript_path` from their stdin payload first; this file is the fallback. To cite the current session, use the `transcript_path` SessionStart injects. |
+

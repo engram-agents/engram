@@ -524,16 +524,12 @@ def _apply_changeset_reviewed(ctx: dict[str, Any]) -> None:
 
         # Check whether a CLAUDE.md template changed (path from Phase 1 #1093;
         # root compat symlink removed in Phase 4; renamed from CLAUDE.md.template).
-        # The multi-agent template is a per-seat CLAUDE.md carrier too — a gate
-        # watching only the single-agent file is blind to multi-agent rule
-        # changes like #2019 slice B (colleague catch on PR #2117).
+        # The agent-coordination rules live in template.CLAUDE.md itself (#4255), so
+        # this one file is the whole per-seat CLAUDE.md carrier.
         files = _files_in_range(source_dir, deployed_sha, target_sha)
         ctx["_template_changed"] = any(
             t in files
-            for t in (
-                "src/engram/templates/template.CLAUDE.md",
-                "src/engram/templates/template.CLAUDE.multi-agent.md",
-            )
+            for t in ("src/engram/templates/template.CLAUDE.md",)
         )
         ctx["_changed_files"] = files
 

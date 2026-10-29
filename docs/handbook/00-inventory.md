@@ -235,7 +235,6 @@
 | file | ship | tier/reason | mechanism | status |
 |---|---|---|---|---|
 | `templates/template.AGENTS.md` | shipped | essential | _?_ | _unswept_ |
-| `templates/template.CLAUDE.multi-agent.md` | shipped | convenience | _?_ | _unswept_ |
 | `templates/template.CLAUDE.md` | shipped | essential | _?_ | _unswept_ |
 | `templates/agents.json.example` | excluded | — (#2857 step 2: Lei's ruling, no clean multi-agent gu) | _?_ | _unswept_ |
 | `templates/compact-instructions.md` | shipped | essential (Codex-only, #2067) | _?_ | _unswept_ |

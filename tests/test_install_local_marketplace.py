@@ -2628,7 +2628,7 @@ def test_prewarm_does_not_run_after_a_failed_runtime_pip_install(tmp_path):
 
 # ═══ #4255 slice 1 (S1.8): the installer reads neither multi_agent nor mode ════════════════════
 # Forum requirements install exactly when the tier is dev, whatever either key says.
-# The shipped file listing in the build log still names template.CLAUDE.multi-agent.md (slice 3),
+# The shipped file listing in the build log used to name the second CLAUDE.md template (slice 3),
 # so look for the axis as a setting (`multi-agent: yes`, `multi_agent=true`, `--multi-agent`), not a word.
 _AXIS_LOG = re.compile(r"multi[-_]agent\s*[:=]|--multi-agent", re.I)
 _AXIS_KEYS = {

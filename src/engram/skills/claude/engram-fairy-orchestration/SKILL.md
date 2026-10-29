@@ -23,7 +23,7 @@ Fairies are contractors, not colleagues. The spec is the contract. A fairy has n
     ```
     Exit 0 (CLEAR) → safe to proceed. Exit 1 (DUPLICATE RISK) → review the listed hits before dispatching. Exit 3 (UNKNOWN) → gh unavailable; fall back to manual check. The script handles both checks — open PRs via `gh` and in-flight baton files — and uses an exact-token match so `#100` does not falsely hit when you search for `#1006`.
   - Skipping this is the failure mode that produced PR-517 (issue #486) on 2026-05-30 — a duplicate of the counterpart's PR-502, which had already converged. Same lines, guaranteed merge conflict. The pre-check would have caught it in 5 seconds.
-  - Single-agent mode: the script notes "baton check skipped" when `/home/agents-shared/forum/projects/` is absent; the PR check still runs.
+  - On a seat with no co-resident agent: the script notes "baton check skipped" when `/home/agents-shared/forum/projects/` is absent; the PR check still runs.
 - **Self-contained prompt.** Include repo path, branch baseline, template commit/PR to read, scope, validation step. Inline (don't link to) any node IDs or context-laden references the fairy needs.
 - **Hard scope bounds.** Explicit "DO NOT modify X" for adjacent surfaces. Anti-patterns enumerated. Stop conditions named.
 - **State the CONTRACT when the spec covers a function that has one** — a named invariant, a failure contract, what it must report when an input is missing or malformed. The coder-fairy's contract-first step gates on the spec TEXT, so **an unstated contract is an unimplemented one**, and the handoff reports the skip as clean. *(engram-alpha convention, adopted 2026-09-30 after one trial case; see the project `CLAUDE.md`, "Contract-first tests".)*
@@ -46,7 +46,7 @@ Fairies are contractors, not colleagues. The spec is the contract. A fairy has n
 - **Post-creation handoff** (AFTER `gh pr create` returns the PR number — the **dispatching agent** runs this, not the fairy; fairies don't have shared-projects access). Open a baton for the PR — this is the channel by which the counterpart and the user see your PR is in flight; skipping it means the auto-pull hook can't surface the work.
     - `baton init PR-N --title "<short>" --participants <list> --turn <next-actor> --status in-progress --repo <owner>/<repo>`
     - See the `engram-baton` skill (§"PR layer — `flip`") for the full PR-cursor lifecycle.
-    - Single-agent mode: the baton is still useful as a per-PR cursor through fairy → maintainer, but the multi-agent coord surface is absent.
+    - On a seat with no co-resident agent: the baton is still useful as a per-PR cursor through fairy → maintainer, but there is no counterpart to hand off to.
 
 ---
 

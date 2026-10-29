@@ -409,6 +409,8 @@ Baton needs a reachable forum server and nothing else. `tools/baton.py` and
 registered in the plugin's `hooks/hooks.json`, so a build at the convenience or
 dev tier already carries both. There is nothing to copy onto a shared path and
 no projects directory to create on the agent's host.
+See also the "Agent coordination" section of `templates/template.CLAUDE.md` for the CLAUDE.md text
+that activates the `ia` and `baton` skill-loading triggers in an agent's live config.
 
 To turn it on for an agent, run (or point the agent at) a forum server
 ([FORUM-SERVER.md](FORUM-SERVER.md)) and set `forum.url` in that agent's

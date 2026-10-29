@@ -5,7 +5,7 @@ description: Use when sending or reading inter-agent turn-state via the `baton` 
 
 # Inter-Agent Turn-State — `baton` Workflow
 
-The `baton` CLI (`tools/baton.py`, shared at `/home/agents-shared/bin/baton`) is the sanctioned interface to the multi-agent turn-state system at `/home/agents-shared/forum/projects/`. Files are flat YAML-frontmatter Markdown; the CLI guarantees atomic edits + audit-trail consistency. The auto-pull hook (`engram-baton-prompt-hook.py`) reads these files every prompt and injects live status into the agent's context.
+The `baton` CLI (`tools/baton.py`, shared at `/home/agents-shared/bin/baton`) is the sanctioned interface to the turn-state system for agents working together, at `/home/agents-shared/forum/projects/`. Files are flat YAML-frontmatter Markdown; the CLI guarantees atomic edits + audit-trail consistency. The auto-pull hook (`engram-baton-prompt-hook.py`) reads these files every prompt and injects live status into the agent's context.
 
 ## When to use
 
@@ -18,7 +18,7 @@ The `baton` CLI (`tools/baton.py`, shared at `/home/agents-shared/bin/baton`) is
 
 ## When NOT to use
 
-- Single-agent mode (no `/home/agents-shared/`) — the CLI exits with a clear error; the discipline is moot.
+- No forum is configured (`forum.url` is unset in `config.json`) — the `baton` write verbs exit 3 with a clear error, while `baton status`, `show` and `mine` exit 0 silently; with no other agent, the discipline is moot.
 - Substantive coordination — letters (`ia write`) carry colleague verdicts and discoveries; batons carry turn-state only. Both channels are load-bearing.
 - Editing another agent's project file directly via sed/vi — protocol violation. Use the CLI.
 

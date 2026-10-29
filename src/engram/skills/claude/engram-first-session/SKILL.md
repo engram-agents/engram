@@ -395,7 +395,7 @@ On decline: tell the user: "No problem. You can start the viz server manually an
 
 ## Step 5.7 — Forum connection (optional)
 
-Hooks and CLIs treat a non-empty string `forum.url` in `~/.engram/config.json` (under `$ENGRAM_HOME`) as "forum configured", and nothing infers it. This is the only step that can ask the user for it. It is optional, and it is asked on every install, single-agent too (a single-host agent can have a forum).
+Hooks and CLIs treat a non-empty string `forum.url` in `~/.engram/config.json` (under `$ENGRAM_HOME`) as "forum configured", and nothing infers it. This is the only step that can ask the user for it. It is optional, and it is asked on every install, including a seat with no co-resident agent (such a seat can still have a forum).
 
 **Asked once.** Run the block below FIRST with no answer file (no `forum-url.answer`, see "Passing the answer" below). If it prints `set_forum_url.py is not installed here (no forum components on this install): skip this step`, this install has no forum components: SKIP the question, do not ask it, and move on (you may mention that a forum can be connected later by installing the convenience tier). In that case the operator's hint (below) is NOT offered, because the tool that would apply it is not there; the hint is left where it is. Otherwise, if `forum.url` is already set (identity-resolve mode, a re-run, an operator that set it), it prints the value it found, says it is already set, and you SKIP the question: tell the user what is set and move on. (If an operator's hint was still lying around, the block also removes it and prints `stale forum-url.hint removed`; nothing for you to do.) If it prints that the key is not set, ask the question.
 
@@ -594,9 +594,9 @@ A lost or duplicated anchor is not cosmetic: `engram-sleep` Step 3's erase keys 
 ### Step 6 — Claude target (TARGET=claude)
 
 1. Read `~/.claude/CLAUDE.md` and `~/.engram/warm-briefing.md` (under `$ENGRAM_HOME`, default `~/.engram`).
-2. **Counterpart agent prompt**: ask the user one short question — *"Will this agent have a peer counterpart agent (e.g., a separate uid running ENGRAM with cross-channel coordination), or is this a single-agent install?"* Most installs are single-agent. Substitute accordingly:
-   - Single-agent: substitute `{{COUNTERPART_NAME}}` → the literal string `(no counterpart)`.
-   - Multi-agent: substitute → the counterpart's chosen name (which the user states; the counterpart will run its own first-session separately).
+2. **Counterpart agent prompt**: ask the user one short question — *"Will this agent have a peer counterpart agent (e.g., a separate uid running ENGRAM with cross-channel coordination), or will it work alone?"* Most installs work alone. Substitute accordingly:
+   - No counterpart: substitute `{{COUNTERPART_NAME}}` → the literal string `(no counterpart)`.
+   - A counterpart: substitute → the counterpart's chosen name (which the user states; the counterpart will run its own first-session separately).
 3. Substitute the rest:
    - `{{AGENT_NAME}}` → the chosen agent name
    - `{{USER_NAME}}` → the user's name

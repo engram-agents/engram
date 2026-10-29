@@ -122,13 +122,13 @@ TARGET=claude-code   # or: TARGET=codex in Codex sessions
 bash tools/install-local-marketplace.sh --target "$TARGET"
 ```
 
-This single script is the whole agent-side upgrade: it **reads your `config.json`** (`multi_agent`, `install_tier`) and **builds the plugin with those flags** plus the explicit host target (via `tools/build-plugin.sh`), then re-assembles `${ENGRAM_HOME:-$HOME/.engram}/marketplace/` from the fresh `build/plugin/`. For Codex, it also runs `codex plugin add engram@engram-local` when `codex` is on PATH. Idempotent — safe to re-run.
+This single script is the whole agent-side upgrade: it **reads your `config.json`** (`install_tier`) and **builds the plugin at that tier** plus the explicit host target (via `tools/build-plugin.sh`), then re-assembles `${ENGRAM_HOME:-$HOME/.engram}/marketplace/` from the fresh `build/plugin/`. For Codex, it also runs `codex plugin add engram@engram-local` when `codex` is on PATH. Idempotent — safe to re-run.
 
 **Watch the build log for the feature-set lines** — this is where a silent mis-build would happen:
-- The tier/multi-agent line must match your install (e.g. `Tier: dev …, multi-agent: yes`). A multi-agent install that builds single-agent **silently drops** baton/letters/forum surfaces (#704 class).
+- The tier line must match your install (e.g. `Tier: dev (rank=2), target: claude-code, …`). A dev-tier install that builds at a lower tier **silently drops** the dev surfaces (#704 class).
 - If your `install_tier` is null/unset, the build falls back to the manifest default (`convenience`) — a dev-tier install would silently lose its dev tools (#707). Set `install_tier` in `${ENGRAM_HOME:-$HOME/.engram}/config.json` before building if it's unset.
 
-**Checkpoint**: script exited 0 + marketplace re-assembled + the logged target/tier/multi-agent flags match the host and `${ENGRAM_HOME:-$HOME/.engram}/config.json` + `platform.json` in the marketplace has the intended target + the `Version marker refreshed` line shows the new `alpha_sha` (the script maintains `${ENGRAM_HOME:-$HOME/.engram}/.deployed-version` so Steps 2 and 7 stay anchored).
+**Checkpoint**: script exited 0 + marketplace re-assembled + the logged target and tier match the host and `${ENGRAM_HOME:-$HOME/.engram}/config.json` + `platform.json` in the marketplace has the intended target + the `Version marker refreshed` line shows the new `alpha_sha` (the script maintains `${ENGRAM_HOME:-$HOME/.engram}/.deployed-version` so Steps 2 and 7 stay anchored).
 
 ---
 
@@ -380,7 +380,7 @@ python3 "$SOURCE_DIR/tools/check-claude-md-drift.py" --repo "$SOURCE_DIR" --head
 
 `--head` is the seat's DEPLOYED commit (`alpha_sha`), not the origin tip: the check asks what the template the seat actually deployed carries, and an origin tip may carry template changes the seat has not deployed yet, which would be reported as missing.
 
-Add `--multi-agent` to also check `template.CLAUDE.multi-agent.md` as its own paragraph set; hand-merged seats often reword or re-head those paragraphs, so expect false "missing" there.
+The "Agent coordination" section lives in `template.CLAUDE.md`, so this run checks it too. A seat that hand-merged the retired second template file may see it reported "missing" where it reworded or re-headed those paragraphs; judge each line. The old opt-in flag is retired and ignored.
 
 - Inverse-merge template-side additions that are identity- or discipline-forming into the live file; **preserve agent-local customizations** (the template is the floor, not the ceiling).
 - Mechanical change → just copy. Judgment-laden (new discipline, conflicts with local content) → surface the diff to the user and decide together.

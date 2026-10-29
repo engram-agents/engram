@@ -318,7 +318,7 @@ def _line_of(block: str, blocks=None) -> int:
     return rendered.splitlines().index(first) + 1
 
 
-def _live_repo(tmp_path: Path, template: str, multi: str | None = None) -> Path:
+def _live_repo(tmp_path: Path, template: str) -> Path:
     repo = tmp_path / "live_repo"
     repo.mkdir()
     _git(repo, "init")
@@ -327,8 +327,6 @@ def _live_repo(tmp_path: Path, template: str, multi: str | None = None) -> Path:
     d = repo / "src" / "engram" / "templates"
     d.mkdir(parents=True)
     (d / "template.CLAUDE.md").write_text(template, encoding="utf-8")
-    if multi is not None:
-        (d / "template.CLAUDE.multi-agent.md").write_text(multi, encoding="utf-8")
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "live fixture")
     return repo
@@ -602,8 +600,9 @@ class TestLiveArgumentErrors:
         proc = subprocess.run([sys.executable, str(CLI_PATH), "--help"],
                               capture_output=True, text=True, timeout=15)
         for flag in ("--live", "--user-name", "--agent-name", "--self-node-id",
-                     "--engram-home", "--seed-manifest", "--multi-agent"):
+                     "--engram-home", "--seed-manifest"):
             assert flag in proc.stdout, flag
+        assert "--multi-agent" not in proc.stdout     # retired (#4255): accepted, not listed
 
 
 class TestLiveDriftGuard:
@@ -631,52 +630,8 @@ class TestLiveDriftGuard:
             assert never not in known
 
 
-_MA = ("## Local multi-agent rules\n\nUse the ia letter for one agent.\n\n"
-       "### Reciprocal PR review\n\nMy PRs need a colleague review before merge.\n")
-
-
-class TestLiveMultiAgent:
-    def _mk(self, tmp_path, live_text, multi=_MA):
-        repo = _live_repo(tmp_path, "\n\n".join(_BLOCKS) + "\n", multi=multi)
-        live = tmp_path / "l.md"
-        live.write_text(_rendered() + "\n" + live_text, encoding="utf-8")
-        return repo, live
-
-    def test_default_never_reads_multi_agent_file(self, tmp_path):
-        repo, live = self._mk(tmp_path, "")
-        rc, out, err = _run_live(repo, live)
-        assert rc == 0, (out, err)
-        assert _summary(out) == (7, 0)
-        assert "multi-agent" not in out
-
-    def test_flag_adds_paragraphs_and_reports_own_line_numbers(self, tmp_path):
-        repo, live = self._mk(tmp_path, "")
-        rc, out, err = _run_live(repo, live, "--multi-agent")
-        assert rc == 1, (out, err)
-        assert "Use the ia letter for one agent." in out
-        assert "template.CLAUDE.multi-agent.md" in out
-        assert "line 3" in out          # relative to the multi-agent file
-        assert _summary(out)[1] == 2
-
-    def test_same_text_under_different_heading_passes(self, tmp_path):
-        live_text = ("### Internal agent coordination\n\nUse the ia letter for one agent.\n\n"
-                     "My PRs need a colleague review before merge.\n")
-        repo, live = self._mk(tmp_path, live_text)
-        rc, out, err = _run_live(repo, live, "--multi-agent")
-        assert rc == 0, (out, err)
-
-    def test_reworded_text_is_missing(self, tmp_path):
-        live_text = ("### X\n\nUse the ia letter for a single agent.\n\n"
-                     "My PRs need a colleague review before merge.\n")
-        repo, live = self._mk(tmp_path, live_text)
-        rc, out, _ = _run_live(repo, live, "--multi-agent")
-        assert rc == 1
-        assert _summary(out)[1] == 1
-
-    def test_flag_without_file_at_ref_exit_2(self, tmp_path):
-        repo, live = self._mk(tmp_path, "", multi=None)
-        rc, out, err = _run_live(repo, live, "--multi-agent")
-        assert rc == 2 and err.strip()
+# The retired --multi-agent flag and the folded "Agent coordination" section are covered by
+# tests/test_retired_multi_agent_axis_4255s3.py (C2).
 
 
 # ===========================================================================
@@ -823,19 +778,18 @@ def boom(*a, **k):
     print('simulated git plumbing failure', file=sys.stderr)
     raise SystemExit(3)
 mod._git_show = boom
-ns = argparse.Namespace(head='HEAD', live=sys.argv[3], seed_manifest=None, multi_agent=%s,
+ns = argparse.Namespace(head='HEAD', live=sys.argv[3], seed_manifest=None,
                         user_name='u', agent_name='a', self_node_id='pn_1', engram_home='/h')
 sys.exit(mod.run_live(ns, Path(sys.argv[2])))
 """
 
 
 class TestLiveGitFailureIsExit2:
-    @pytest.mark.parametrize("multi", [False, True])
-    def test_git_plumbing_failure_maps_to_2(self, lv, multi):
+    def test_git_plumbing_failure_maps_to_2(self, lv):
         repo, live = lv
         _git(repo, "show", "HEAD:src/engram/templates/template.CLAUDE.md")   # repo is sane
         proc = subprocess.run(
-            [sys.executable, "-c", _GIT_FAIL_SNIPPET % multi, str(CLI_PATH), str(repo), str(live)],
+            [sys.executable, "-c", _GIT_FAIL_SNIPPET, str(CLI_PATH), str(repo), str(live)],
             capture_output=True, text=True, timeout=30)
         assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
         assert "missing" not in proc.stdout

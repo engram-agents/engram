@@ -116,4 +116,4 @@ This fires only when the graph already contains ≥2 distinct lineage values (a 
 
 **Omit them** (or set only `standpoint_author_id`) when filing your own direct observations — "I ran this test," "I read this file and it says…". Your own standpoint is implicit.
 
-**Always set `standpoint_lineage`** when the claim's producer is an AI agent of known lineage — this is the most load-bearing axis for multi-agent derivations. Format: `provider:family` (e.g. `anthropic:opus`, `openai:gpt4`).
+**Always set `standpoint_lineage`** when the claim's producer is an AI agent of known lineage — this is the most load-bearing axis for derivations that mix claims from several agents. Format: `provider:family` (e.g. `anthropic:opus`, `openai:gpt4`).

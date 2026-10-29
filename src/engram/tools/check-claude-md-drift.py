@@ -27,7 +27,7 @@ Mode 2 — live-file presence check (engram-alpha#3604):
 
     python tools/check-claude-md-drift.py --repo <SRC_DIR> --head <REF> --live <FILE> \\
         --user-name N --agent-name N --self-node-id pn_NNNN --engram-home DIR \\
-        [--seed-manifest $ENGRAM_HOME/seed-manifest.json] [--seed-id KEY=VALUE ...] [--multi-agent]
+        [--seed-manifest $ENGRAM_HOME/seed-manifest.json] [--seed-id KEY=VALUE ...]
 
 Arguments
 ---------
@@ -52,7 +52,9 @@ Arguments
           for --engram-home.  Needed when an early seat's manifest lacks an id the
           current template uses.
 --multi-agent
-          Mode 2, OPT-IN: also check template.CLAUDE.multi-agent.md (see below).
+          Retired by #4255: accepted, has no effect, prints one stderr line.  The
+          "Agent coordination" section lives in template.CLAUDE.md now and is
+          checked by the default run.  Not listed in --help.
 
 Exit codes
 ----------
@@ -133,12 +135,10 @@ rewrites) and the output does not say which kind a line is.  If a seat that
 rewords more finds it too noisy, the options are a per-seat accepted-deviations
 list or a fuzzy match for lightly reworded units; neither is built.
 
-Multi-agent.  There is no code path that renders template.CLAUDE.multi-agent.md
-into a seat's file; operators hand-merge it.  So ``--multi-agent`` (off by
-default) checks it as its OWN paragraph set, with line numbers relative to THAT
-file, makes no claim about where the paragraphs sit in the live file, and skips
-its heading units.  Hand-merged seats often reword or re-head these
-paragraphs, so expect false "missing" here; the default run is the low-noise one.
+Agent coordination.  The section that used to live in a second template file
+is part of template.CLAUDE.md, so the default run checks it like every other
+paragraph.  A seat that hand-merged the old file may have reworded or re-headed
+its paragraphs; expect "missing" lines there and let a human judge them.
 
 Source files checked
 --------------------
@@ -270,7 +270,6 @@ _PLACEHOLDER_RE = re.compile(r"\{\{[A-Za-z0-9_]+\}\}")
 _HEADING_RE = re.compile(r"^#{1,6}(\s|$)")
 _LIST_RE = re.compile(r"^\s*([-*+]|\d+[.)])\s")
 _FENCE_RE = re.compile(r"^(\s*)(```|~~~)")
-_MULTI_FILE = "template.CLAUDE.multi-agent.md"
 _MAIN_FILE = "template.CLAUDE.md"
 _TRUNC = 100
 
@@ -531,11 +530,6 @@ def run_live(args: argparse.Namespace, repo: Path) -> int:
         if not rendered.strip():
             raise _LiveError(f"empty render of {_MAIN_FILE} at {args.head}")
         sets = [(_MAIN_FILE, rendered, False)]
-        if args.multi_agent:
-            raw = _git_show(repo, args.head, _MULTI_FILE)
-            if raw is None or not raw.strip():
-                raise _LiveError(f"--multi-agent: {_MULTI_FILE} absent or empty at {args.head}")
-            sets.append((_MULTI_FILE, _substitute(raw, subs), True))
 
         results = [(label, *_check_set(label, text, live_norm, skip, homes))
                    for label, text, skip in sets]
@@ -608,12 +602,12 @@ def main() -> int:
                              "the value is everything after the first '='; an explicit flag such as "
                              "--user-name beats a --seed-id of the same placeholder. Use it when an early seat's manifest "
                              "lacks an id the current template needs.")
-    parser.add_argument("--multi-agent", action="store_true",
-                        help="Mode 2, opt-in: also check template.CLAUDE.multi-agent.md as its OWN "
-                             "paragraph set (line numbers relative to that file, headings skipped, no "
-                             "claim about where they sit in the live file). Hand-merged seats often "
-                             "reword or re-head these paragraphs, so expect false 'missing' here.")
+    # Retired by #4255: accepted, no effect. Hidden from --help.
+    parser.add_argument("--multi-agent", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.multi_agent:
+        print("--multi-agent is retired and has no effect: the Agent coordination section "
+              "is checked by default; see #4255", file=sys.stderr)
 
     if args.live is not None:
         if args.base is not None:

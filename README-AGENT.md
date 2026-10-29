@@ -585,9 +585,9 @@ hand-edit; *(restart)* = takes effect after a Claude Code restart.
 |---|---|---|
 | `agent_name` | str | The name you chose (e.g. `"borges"`). Hooks read it to identify self. *(read-only — set at install)* |
 | `primary_user` | str | Human collaborator's first name, lowercased. |
-| `mode` | str | `"single"` or `"multi"` — managed by `agentctl` when spawning peer agents. *(read-only)* |
+| `mode` | str | Retired (#4255): ignored. A leftover value is harmless; the server logs one line at startup. *(retired)* |
 | `self_lineage` | str | This install's own training lineage in the hard format `provider:model_family` (e.g. `"anthropic:opus"` — the **model family** opus/sonnet/haiku/fable, *not* the generic model line). Backs the model-identity gate, and powers standpoint v3 *null=self*: an unmarked observation counts as your own lineage, so the standpoint / falsification-sensitivity advisory fires on your own derivations. Empty = feature dark (safe). Pattern: `provider:family`. |
-| `counterparts` | list | Peer agents on this host. Set by `agentctl`. *(read-only)* |
+| `counterparts` | list | Retired (#4255): ignored. A leftover value is harmless; the server logs one line at startup. *(retired)* |
 
 **Embedding** — *(`enabled` and `model` are read-only; changing the model would orphan existing nodes' embeddings. `device` and `cpu_threads` are editable and safe: CPU and GPU vectors match):*
 

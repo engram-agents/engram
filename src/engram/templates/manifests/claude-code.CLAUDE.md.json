@@ -23,6 +23,7 @@
     { "id": "fairy-regression-tests", "anchor": "Parallelization and Delegation" },
     { "id": "engram-reference", "anchor": "ENGRAM Reference" },
     { "id": "session-start-reading", "anchor": "Session Start Reading" },
-    { "id": "infra-locations-claude-code", "anchor": "Infrastructure Locations" }
+    { "id": "infra-locations-claude-code", "anchor": "Infrastructure Locations" },
+    { "id": "agent-coordination", "anchor": "Agent coordination" }
   ]
 }
