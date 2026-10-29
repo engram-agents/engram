@@ -20,6 +20,12 @@ Subcommands (the shell switches on what they print; they never raise, and exit 0
       a planted special file can neither block the open nor reach it. If engram_pidfile
       cannot be imported the answer is `ambiguous:<why>` (never `none`: the shell then
       launches nothing).
+  maintlock <home>             -> ok | bad:<why> | ambiguous:<why>
+      #3882: the store-maintenance lock directory `<home>/knowledge.db.maint.lockdir`. The owner
+      exits 4 on an unusable one (launchd restarts that, so the hook refuses first, as it does for a
+      non-regular engramd.pid). `bad:` = it exists and is a symlink, not a directory, or owned by
+      another uid. Absent is `ok` (the owner creates it; this never does). One lstat, nothing opened,
+      so a planted special file cannot block it. Any other stat failure is `ambiguous:` and claims nothing.
   launchd_state <label>        -> running | registered:<state>:<last exit or none> | notfound
                                   | no_gui_domain | ambiguous:<why>
       Runs `launchctl print gui/<uid>/<label>` under a Python-side timeout
@@ -157,6 +163,25 @@ def live(home: str) -> str:
     return "alive" if pid is not None else "none"
 
 
+def maintlock(home: str) -> str:
+    """ok | bad:<why> | ambiguous:<why> for `<home>/knowledge.db.maint.lockdir` (see the module docstring).
+    Never creates, opens or modifies anything."""
+    path = os.path.join(home, "knowledge.db.maint.lockdir")
+    try:
+        st = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "ok"
+    except OSError as exc:
+        return f"ambiguous:lstat failed ({type(exc).__name__})"
+    if stat.S_ISLNK(st.st_mode):
+        return "bad:a symbolic link"
+    if not stat.S_ISDIR(st.st_mode):
+        return "bad:not a real directory"
+    if st.st_uid != os.geteuid():
+        return f"bad:owned by uid {st.st_uid}, not uid {os.geteuid()}"
+    return "ok"
+
+
 def _probe_why(ec, result) -> str:
     """One short ASCII token for a ping that did not come back healthy: the client's own
     Unavailable reason code (`down`, `timeout`, `protocol`, `busy`, `busy_or_stuck`, `local`,
@@ -212,7 +237,9 @@ def serving(home: str) -> str:
             result = ec.read(
                 "ping", {}, timeout=min(remaining, PROBE_CALL_BOUND_SECONDS), socket_path=sock
             )
-        except Exception as exc:  # `read` is raise-free by construction; this is the belt
+        # `read` is raise-free by construction EXCEPT a ValueError for a relative ENGRAM_HOME when
+        # socket_path=None (#3863 step 2); `sock` is passed here, so that path is not reachable. This is the belt.
+        except Exception as exc:
             return f"ambiguous:engramd_client raised ({type(exc).__name__})"
         if isinstance(result, ec.Ok):
             return "serving"
@@ -349,6 +376,8 @@ def main(argv: list) -> int:
         cmd = argv[1]
         if cmd == "live" and len(argv) == 3:
             print(live(argv[2]))
+        elif cmd == "maintlock" and len(argv) == 3:
+            print(maintlock(argv[2]))
         elif cmd == "launchd_state" and len(argv) == 3:
             print(launchd_state(argv[2]))
         elif cmd == "serving" and len(argv) == 3:

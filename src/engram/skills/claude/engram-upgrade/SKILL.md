@@ -194,7 +194,7 @@ If anything looks wrong after reconnecting (missing nodes, a query that used to 
 
 ## Step 5.5 — Restart the long-lived daemons (agent-run)
 
-`/reload-plugins` and the `/mcp` reconnect do **not** restart the two long-lived processes, which keep running the code they started with: the **surface daemon** (`hooks/engram-surface-daemon.py`) and, on a seat that has one, the **engramd owner** (`engramd_owner.py`). A seat that stops at Step 5 has new hooks talking to an old daemon. The rc1 → rc2 range changed both (owner +1441 lines, surface daemon 37). Both restarts are yours to run and touch only this seat's own processes. **Scope:** Claude seats on the local directory marketplace. A Codex seat's plugin lives in the Codex cache, so the paths below do not apply there, and this step does not cover Codex.
+`/reload-plugins` and the `/mcp` reconnect do **not** restart the two long-lived processes, which keep running the code they started with: the **surface daemon** (`hooks/engram-surface-daemon.py`) and, on a seat that has one, the **engramd owner** (`engramd_owner.py`). A seat that stops at Step 5 has new hooks talking to an old daemon. The rc1 → rc2 range changed both (owner 1441 changed lines, +1432/-9; surface daemon 37, +17/-20). Both restarts are yours to run and touch only this seat's own processes. **Scope:** Claude seats on the local directory marketplace. A Codex seat's plugin lives in the Codex cache, so the paths below do not apply there, and this step does not cover Codex.
 
 *Evidence behind this step, so you know what was run:* on 2026-10-19 the surface-daemon unit path (the born-before-rebuild check, the user-unit restart and its verification) was measured on a unit-supervised Linux seat, and the hook-launched surface branch (save the pid, TERM, wait, run the launcher by hand) was measured once on a second Linux seat (WSL2, no unit, no owner), which is where the bind delay in the verify step below was found. macOS and every owner command were NOT run (neither seat has an owner); they come from the setup script's own header and the rc2 release notes. Treat those as unverified until you have seen them work.
 
@@ -284,9 +284,21 @@ Read from the owner's code and the hook's header, not run: the owner removes its
 
 Verify: for a unit (b1), `MainPID` changed and `engramd.pid` matches it; for a hook-launched owner (b2), the pid now in `engramd.pid` differs from `$OLD`; in both cases `engramd-owner.log` has a new `listening on ... (pid N)` line.
 
-> **The setup script ignores flags it does not know.** `tools/setup-surface-daemon-service.sh` recognizes only `--owner` and `--allow-path`; any other argument, including `--help`, is silently skipped and the **default action runs** (re-renders the surface-daemon unit and enables and starts it). Measured 2026-10-19: calling it with `--help` to read the usage did exactly that. Read the usage from the header comment instead (`sed -n 1,60p`).
+> **The setup script rejects flags it does not know, and has a help mode (alpha #3939).** `tools/setup-surface-daemon-service.sh` recognizes `--owner`, `--allow-path` and `-h`/`--help`; `--help` prints the usage and exits 0 having changed nothing, and any other argument exits 2 naming it before anything is written. (A script from before #3939 silently skipped unknown flags and ran its **default action** — re-rendered the surface-daemon unit and enabled and started it; measured 2026-10-19 with `--help`. On a seat still running such a script, read the usage from the header comment instead: `sed -n 1,60p`.)
 
-**Checkpoint**: the surface daemon's pid is newer than the rebuild and matches `recall-daemon.pid`; the owner is restarted and verified, or confirmed absent by the check above (not assumed).
+### (c) Gate: no long-lived process may predate the deploy (#3938)
+
+Steps (a) and (b) are written steps, and a written step can be skipped. This one fails when they were. Run the gate in GATE mode (no `--informational`) and treat a non-zero exit as a FAIL of the upgrade:
+
+```bash
+python3 "${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/tools/check_stale_processes.py"; echo "exit $?"
+```
+
+It prints one line per process (owner, surface-daemon, mcp-server) and a summary: four lines, always. Each process is `FRESH` (started at or after `deployed_at`), `STALE` (started before it; the line carries the restart command), `NOT_RUNNING` or `UNVERIFIED`. Exit 0 means every process is FRESH; **1** means a STALE one (restart it by (a), (b) or the `/mcp` reconnect of Step 5, then run the gate again); **3** means nothing is STALE but some process is `NOT_RUNNING` or `UNVERIFIED`; **2** means `.deployed-version` could not be read, so nothing was judged. A missing pidfile is never reported as clean.
+
+Exit 3 is the expected answer on a seat that legitimately has no engramd owner: the `owner:` line says `NOT_RUNNING` and (b) above confirmed there is none. Accept that one line, and only that line, after you have run (b)'s check; any other `NOT_RUNNING` or `UNVERIFIED` line is a FAIL to look into (a recycled pid shows as `UNVERIFIED`). The `mcp-server` line covers only the server named in `mcp-tools-ready.json` (the most recent session's); other concurrent sessions' servers are not checked. The tool compares two clocks, the process start time and the pidfile's mtime, and calls a process STALE if either is before `deployed_at`; the install script prints the same lines right after Step 3 with `--informational`, where every process reads STALE by construction.
+
+**Checkpoint**: the surface daemon's pid is newer than the rebuild and matches `recall-daemon.pid`; the owner is restarted and verified, or confirmed absent by the check above (not assumed); and the gate in (c) exits 0 (or 3 with only the owner line `NOT_RUNNING` on a seat confirmed to have none).
 
 ---
 
@@ -520,7 +532,7 @@ Do **not** cite `file://<ENGRAM home>/.deployed-version` directly unless it is c
 - **Building without checking the feature-set flags.** A wrong-flag build *succeeds* and silently drops surfaces (#704/#707 class). The Step 3 checkpoint exists for this.
 - **Re-bootstrapping (`FORCE=1`) to "refresh" anything.** `FORCE=1` (and `FORCE_RESEED_EMPTY=1`) now **refuse on a non-empty DB** — they are not bypass paths for live graphs. Never the upgrade path; a true fresh start requires manually deleting `knowledge.db` first.
 - **Killing the MCP subprocess to "restart" it.** User-restart only.
-- **Stopping at Step 5 and calling the upgrade done.** The reload trio leaves the surface daemon (and an owner, if the seat has one) running the old code; Step 5.5 is what restarts them. And do not probe `tools/setup-surface-daemon-service.sh` with `--help`: it has no help mode and runs its default action.
+- **Stopping at Step 5 and calling the upgrade done.** The reload trio leaves the surface daemon (and an owner, if the seat has one) running the old code; Step 5.5 is what restarts them. `tools/setup-surface-daemon-service.sh --help` is safe on a script with #3939 (usage, exit 0, nothing written) but runs the default action on an older one: check the header comment for `--help` before probing.
 - **Reaching for the retired scatter path** (`tools/deploy.sh` rsync into the ENGRAM home folder) on a plugin install — it does not serve the plugin layout and will not update the running plugin.
 
 ---

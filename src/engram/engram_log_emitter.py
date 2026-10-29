@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from engram_home_resolver import engram_home_or_none
 from engram_regular_io import open_regular_text, open_regular_text_append
 
 # Module-level singleton — first init() call wins; subsequent calls return
@@ -96,19 +97,28 @@ class Emitter:
         session_id: str,
         transcript_path: str,
         initial_turn: Optional[int],
-        logs_dir: Path,
+        logs_dir: Optional[Path],
     ) -> None:
+        # #3863 step 2 (the rulings: engram_home_resolver's docstring): this module is imported by hooks, so it
+        # NEVER raises on a relative ENGRAM_HOME. `logs_dir=None` is the DISABLED emitter (init() builds it when
+        # the home is refused): no directory, no file, every emit() returns None.
+        self._disabled = logs_dir is None
+        if logs_dir is None:
+            logs_dir = Path(os.devnull)
         self.session_id = session_id
         self.transcript_path = transcript_path
         self.logs_dir = logs_dir
         self.sessions_dir = logs_dir / "sessions"
         self._bound_context: dict[str, Any] = {}
         self._write_lock = threading.Lock()
-        self._engram_home = Path(os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram"))
-        try:
-            self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            self._stderr(f"could not create sessions dir {self.sessions_dir}: {exc}")
+        self._engram_home = engram_home_or_none()
+        if self._engram_home is None:
+            self._disabled = True  # a refused home disables writes even if a logs_dir was passed
+        if not self._disabled:
+            try:
+                self.sessions_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self._stderr(f"could not create sessions dir {self.sessions_dir}: {exc}")
         # Seed turn cache. If caller passed an explicit initial_turn, honor
         # it; otherwise read from knowledge.db. Either way set cache time so
         # subsequent emits within TTL skip the db hit. Per DESIGN.md §5.
@@ -135,8 +145,9 @@ class Emitter:
         with _INIT_LOCK:
             if _EMITTER_INSTANCE is None:
                 if logs_dir is None:
-                    engram_home = Path(os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram"))
-                    logs_dir = engram_home / "logs"
+                    engram_home = engram_home_or_none()
+                    # None (a refused relative home) builds the disabled emitter: logs_dir stays None
+                    logs_dir = None if engram_home is None else engram_home / "logs"
                 _EMITTER_INSTANCE = cls(
                     session_id=session_id,
                     transcript_path=transcript_path,
@@ -182,7 +193,7 @@ class Emitter:
         ``None``, no behavior change for any existing caller that omits it.
         It exists so ``tools/telemetry_manifest_gate.py``'s AST scan (which
         looks for a ``site="..."`` keyword literal at `emit`/
-        `emit_if_initialized` call sites, per docs/2574-telemetry-design.md
+        `emit_if_initialized` call sites, per docs/internal/2574-telemetry-design.md
         §1/§4a) can find it directly at the call. It is NOT threaded into
         this module's own L1/L2 session-log JSONL schema (a different, older
         system — see this module's own docstring); a caller that wants the
@@ -190,6 +201,8 @@ class Emitter:
         ``engram_telemetry_store.write_telemetry_record(manifest_id=site,
         ...)``, which is WS3's job, not this module's.
         """
+        if self._disabled:
+            return None
         try:
             return self._emit_inner(event_type, level, data, tool_use_id, parent_uuid, site)
         except Exception as exc:
@@ -313,6 +326,8 @@ class Emitter:
         server.py:_get_current_turn — config.json is the canonical source of
         truth for the turn counter, NOT the nodes table). Returns None on
         any failure."""
+        if self._engram_home is None:
+            return None
         try:
             config_path = self._engram_home / "config.json"
             if not config_path.exists():

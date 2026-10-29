@@ -34,7 +34,7 @@ One row per affected node per cascade event, in the `cascade_markers` table:
 ```sql
 node_id, cascade_event, root_node, root_op,
 status                     CHECK (status IN ('pending','resolved')),
-resolution_kind            CHECK (resolution_kind IN ('superseded','acknowledged','retracted') OR NULL),
+resolution_kind            CHECK (resolution_kind IN ('superseded','acknowledged','retracted','resolved') OR NULL),
 resolution_replacement_id,
 created_at, resolved_at,
 UNIQUE(node_id, cascade_event)
@@ -164,14 +164,17 @@ at test time instead of silently inheriting a branch.
 
 ## 5. Adjudication — the agent decides, every time
 
-`engram_cascade_resolve(node_id, resolution_kind, replacement_id?, note?)`,
-with `resolution_kind ∈ {retracted, superseded, acknowledged}`:
+`engram_cascade_resolve(node_id, resolution_kind, replacement_id?, resolving_node_id?, note?)`,
+with `resolution_kind ∈ {retracted, superseded, acknowledged, resolved}`
+(`resolved` is valid on contradiction nodes only, and is the only kind that takes
+`resolving_node_id`; §14):
 
 | choice | when | machine then |
 |---|---|---|
 | `retracted` | the argument is broken | delegates to the retract core; records; marks resolved |
 | `superseded` | the claim survives on remaining premises; the replacement **already exists** (pure-wire: the verb never creates nodes) | delegates to the supersede core; records `replacement_id`; marks resolved |
 | `acknowledged` | the delta provably does not touch this claim | writes the acknowledgement edges (§8); recomputes confidence; marks resolved; **no new node, node stays current** |
+| `resolved` | **contradictions only:** a side was retracted or superseded and the contradiction is thereby settled; the caller names the settling node | delegates to the resolve core (`resolves` edge, status by the resolver's confidence); records the resolver in `resolution_replacement_id`; marks resolved (§14) |
 
 Design decisions with teeth:
 
@@ -412,6 +415,8 @@ eligible(node) = {retracted, superseded}                 if any affected direct 
 — computed inside the resolve verb (enforcement) and rendered in the frontier
 packet (presentation), never persisted, never client-computed.
 
+(This formula is for derivations. A contradiction's eligible set depends on the root op of its pending events and adds the `resolved` kind; see section 14.)
+
 The `use_stale=True` force-through on `engram_derive` is **retired, not
 preserved**. It existed only because there was no cheap resolution route for
 a node whose premises all still hold; the acknowledgement path is that route,
@@ -500,8 +505,9 @@ test):
   bullet's first draft listed it anyway, from a pre-Stage-1.3
   understanding — caught by the binding test's author before the test
   existed, which is this section's whole argument made empirical.)
-- The resolution kinds are exactly: `acknowledged`, `retracted`,
-  `superseded` (`_CASCADE_RESOLUTION_KINDS`).
+- The resolution kinds are exactly: `acknowledged`, `resolved`, `retracted`,
+  `superseded` (`_CASCADE_RESOLUTION_KINDS`). (`resolved` is valid on
+  contradiction nodes only; see §14.)
 - `acknowledged_derives_from` carries `cascade: True`,
   `temporal_causal: False`, `dag_family: grounding` in `EDGE_CLASSIFICATIONS`.
 - The marker status domain is exactly `pending`, `resolved`, and the
@@ -510,3 +516,40 @@ test):
 *Agent-facing procedure lives in the skills (`engram-revise`,
 `engram-resolve-cascade`) and the dream-master spec; this document is the
 design record those surfaces point at.*
+
+## 14. Contradictions: the sides are the legs, and the fourth kind `resolved` (#4075)
+
+Lei's ruling (2026-10-22): **a contradiction is a special derivation whose two
+premises contradict each other**, so its marker resolves in the same spirit as a
+derivation's, and the contradiction's *sides* play the part of premises.
+
+- **Eligibility reads the sides.** A contradiction has no
+  `CITATION_SUPPORT_RELATIONS` premises; the revised side is named by each
+  pending marker's `root_node` / `root_op`. A **retracted** side withdraws
+  `acknowledged` (`acknowledge_blocked_by` names the side). A **superseded**
+  side keeps all four kinds open and the agent judges. With several pending
+  events on one contradiction, `acknowledged` is withdrawn if **any** event's
+  root op is a retract (invariant 8: over-surface, never pick one). Derivation
+  eligibility is untouched.
+- **`resolved` is contradiction-only** and means "this contradiction is properly
+  settled by the side being retracted or superseded." The caller names the
+  settling node (`resolving_node_id`; no auto-pick, #229's pure-wire rule): a
+  current claim-bearing node that is a current side, or the **live** successor /
+  replacement of a revised side (the supersede / retract chain walked to its
+  live end, never one hop). The status write is `_resolve_impl`'s: one resolve
+  core (the `resolves` edge, `resolved` / `partially_resolved` by the resolver's
+  confidence). The marker is stamped `resolved` with the resolver in
+  `resolution_replacement_id`.
+- **The other kinds never touch the contradiction's resolution status** (active /
+  partially_resolved / resolved; a `retracted` marker's retract still retracts the node, as
+  any retract does). `acknowledged`
+  says only "I checked; the contradiction stays the same."
+- **`acknowledged_contradicts`.** Acknowledging a contradiction whose side was
+  superseded writes `ct --acknowledged_contradicts--> <live successor of that
+  side>` (mirrors `acknowledged_derives_from`; `temporal_causal: False`, no
+  cascade, no DAG family), so a later revision of the successor marks the
+  contradiction again. The original `contradicts` edge stays as provenance.
+- **Schema.** `resolved` needed a CHECK change, which SQLite cannot do in place:
+  migration rung 10 rebuilds `cascade_markers` preserving every row, and
+  `LATEST_SCHEMA_VERSION` is 10. No backfill: existing stores gain the kind from
+  their next resolution on.

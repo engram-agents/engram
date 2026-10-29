@@ -40,7 +40,7 @@ from engram_log_emitter import Emitter, emit_if_initialized
 # Essential-only build (tests/test_tiers_manifest.py's
 # test_import_dep_tier_consistency enforces exactly this). Guarded import +
 # no-op stub keeps this module's own tool functions gating-nothing-T1
-# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+# (docs/internal/2574-telemetry-design.md §8) even if the store ships without it.
 try:
     from engram_telemetry_store import write_telemetry_record
 except Exception:  # pragma: no cover -- import-failure fallback
@@ -301,7 +301,7 @@ def _derive_impl(
         if block is not None:
             # --- engram.tool.engram_call event — blocked path (DESIGN.md §4.2) ---
             # alpha #2574 WS5: site attestation + outcome recording +
-            # protection (docs/2574-telemetry-design.md §1/§4/§5). A new,
+            # protection (docs/internal/2574-telemetry-design.md §1/§4/§5). A new,
             # narrowly-scoped try/except around this new code only --
             # emit_if_initialized() never raises (its own contract) and
             # write_telemetry_record() never raises (WS1's contract), so

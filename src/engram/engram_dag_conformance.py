@@ -7,12 +7,24 @@ check over an unrelated relation set is a different property with a
 different owner, and belongs in its own module for the same reason #2300's
 checker doesn't also check CASCADE_RELATIONS taint propagation.
 
-THE PROPERTY THIS MODULE PROTECTS: no live edge among the relations of one
+THE PROPERTY THIS MODULE PROTECTS: no CURRENT edge among the relations of one
 acyclicity FAMILY (``dag_family`` in ``core.EDGE_CLASSIFICATIONS``, #3210:
 ``grounding`` and ``abstraction``; the union of both is ``core.DAG_RELATIONS``)
-forms a cycle when walked over the graph's CURRENT nodes — each edge's endpoints
-resolved through the supersedes chain to their current node (#2813), not
-merely nodes/edges that happen to already carry ``is_current = 1`` raw.
+forms a cycle. An edge is current iff BOTH of its RAW endpoints are live
+(``core._CURRENT_EDGE_PREDICATE``, built from the one node-liveness predicate).
+
+#3542 (Lei, 2026-10-21) CURRENT-ONLY, with no resolution: the DAG requirement
+ranges over current nodes and current edges only; a non-current node and its
+edges are provenance, not live structure. Until #3542 this audit resolved each
+endpoint through the supersedes chain to its current successor (#2813), and so
+reported "frozen-closed" cycles -- cycles that exist only because a superseded
+node's edges were re-attributed to its successor, which no current edge forms
+and which no remediation can clear (the history is immutable). That resolved
+walk is kept as ``_resolved_dag_edges`` and feeds ONE informational field,
+``frozen_closed_components``; it never touches the gate (``cycle_count`` /
+``cycle_found`` / ``cycles``) or any health verdict. The older text below about
+resolving endpoints (``_resolve_current``) describes that retained informational
+walk; the gate itself no longer resolves.
 
 Why this needs a real walk, not the timestamp comparison every other
 dag-flag consumer uses (``_supersede_impl``, ``_add_edge_impl``'s generic
@@ -34,30 +46,13 @@ on a reachability walker that exists only on an unmerged branch (#2349); see
 that issue for the write-time guard. This module does not need it and does
 not wait for it.
 
-CURRENT-ONLY (Lei, 2026-08-28 ruling on #2300 Defect 2) — but the MECHANISM
-here diverges from engram_conformance.py's own CURRENT-ONLY invariants as of
-#2813, and it is a DERIVATION from the same ruling, not an exception to it.
-``_invariant_1`` there states its reason plainly: "both endpoints filtered to
-``is_current = 1``. The remediation for a violation IS superseding or
-retracting the offending node, so a non-current endpoint must not keep
-counting — otherwise the fix could never move this diagnostic." That reason
-is sound for a partition invariant, where superseding the offending node
-genuinely IS the fix.
-
-It inverts for a DAG cycle. Superseding a node inside a cycle is NOT the
-remediation — the cycle survives through the node's current successor, so
-dropping the superseded endpoint at the SQL level does not let a real
-violation clear; it makes the audit blind to a cycle that only appears once
-you resolve that endpoint (the exact bug #2813 fixes; write-time twin:
-``core._generalizes_cycle_path``, found in #2812's review). So this module
-resolves each edge's endpoints through the supersedes chain to their current
-successor before walking (``_live_dag_edges``'s ``_resolve_current`` helper)
-rather than filtering raw ``is_current = 1`` — an edge is only dropped when
-that chain dead-ends with no live node to attribute it to (e.g. a retracted
-node with no replacement), never merely because one endpoint is superseded.
-Same ruling, same CURRENT-ONLY policy, applied to a case where the stated
-reason for the mechanism points the opposite way — don't assume the two
-modules resolve edges identically just because both are "CURRENT-ONLY."
+History of the #2813 resolve-through-supersedes mechanism (superseded by
+#3542 for the gate, kept for the informational field): an earlier CURRENT-ONLY
+reading (Lei, 2026-08-28, #2300 Defect 2) filtered raw ``is_current = 1``; #2813
+argued that inverts for a DAG cycle (superseding a node inside a cycle is not
+the remediation, because the cycle survives through its successor) and
+resolved endpoints instead. Lei's 2026-10-21 ruling settles it the other way:
+a cycle that survives only through a superseded node is provenance.
 
 WHAT THE CYCLE REPORT IS, EXACTLY: one cycle per DFS back edge in each family
 (at least one per cyclic component). It is NOT an enumeration of all
@@ -137,47 +132,44 @@ def _live_dag_edges(
     conn: sqlite3.Connection, relations: "frozenset[str] | None" = None,
     stats: "dict | None" = None,
 ) -> "list[tuple[str, str]]":
-    """(source_id, target_id) for every live edge on a DAG-family relation
+    """(source_id, target_id) for every CURRENT edge on a DAG-family relation
     (all of ``core.DAG_RELATIONS``, or just ``relations`` when given -- #3210
-    walks one family at a time),
-    with both endpoints resolved through the supersedes chain to their
-    CURRENT node.
+    walks one family at a time). THE GATE'S EDGE SET (#3542).
 
-    Derived from ``core.DAG_RELATIONS`` at call time, never hand-enumerated —
-    same discipline as engram_conformance.py's cb/ncb/cascade derivations.
-
-    #2813: an earlier version filtered ``s.is_current = 1 AND t.is_current =
-    1`` at the SQL level instead — any edge touching a superseded endpoint
-    vanished from the walk entirely rather than being resolved onto that
-    endpoint's current successor, so the batch cycle audit was blind to a
-    cycle that only appears once you resolve a superseded endpoint to its
-    current replacement. Now: select every edge on a dag relation with no
-    currency filter at the SQL level, then resolve each endpoint in Python
-    via ``_resolve_current``; an edge is dropped only when a resolution
-    dead-ends with no live node to attribute it to (e.g. a retracted node
-    with no replacement) — the same "dead-ended chain" reasoning
-    ``core._generalizes_cycle_path`` uses for its own resolve-then-walk.
-
-    #2943 (round 3): an edge whose RESOLVED endpoints collapse to the same
-    node is dropped ONLY when its RAW endpoints did not already — i.e. only
-    when resolution itself manufactured the self-loop, never when a genuine
-    raw self-edge already existed in the table. See the module-level comment
-    above `_resolve_current`'s call sites for the full reasoning (a colleague's
-    live-graph review caught round 2's blanket drop as too broad). This
-    replaces the round-1 relation-based `_HISTORY_RELATIONS` carve-out
-    entirely; every dag edge now resolves through the chain uniformly.
+    Read through ``core.dag_edge_set(live_only=True)`` -- the one definition of
+    which edges count: both raw endpoints live, no resolution through supersede
+    chains, no re-attribution of a superseded endpoint's edges to its successor.
+    Edges with a non-current endpoint are provenance and not counted
+    (``stats["dropped_non_current"]``). A genuine raw self-edge on a current node
+    (#2943) is kept: it is a real one-node cycle.
     """
-    relations = sorted(core.DAG_RELATIONS if relations is None else relations)
-    if not relations:
-        return []
-    placeholders = ",".join("?" * len(relations))
-    rows = conn.execute(
-        f"""SELECT source_id AS sid, target_id AS tid
-            FROM edges
-            WHERE relation IN ({placeholders})""",
-        tuple(relations),
-    ).fetchall()
+    live = core.dag_edge_set(conn, relations, live_only=True)
+    edges = sorted({(s, t) for s, t, _r in live})
+    if stats is not None:
+        # #3210 rider: the population the walk ranged over, so a clean result
+        # says what was checked rather than a bare zero.
+        raw = core.dag_edge_set(conn, relations, live_only=False)
+        stats["raw_edges"] = len(raw)
+        stats["edges"] = len(edges)
+        stats["nodes"] = len({n for e in edges for n in e})
+        stats["dropped_non_current"] = len(raw) - len(live)
+    return edges
 
+
+def _resolved_dag_edges(
+    conn: sqlite3.Connection, relations: "frozenset[str] | None" = None,
+) -> "list[tuple[str, str]]":
+    """INFORMATIONAL ONLY (#3542): the pre-#3542 resolved graph. Never the gate.
+
+    Starts from ``core.dag_edge_set(live_only=False)`` -- the same function the
+    gate reads, filter off -- then puts both endpoints of each edge through the
+    supersedes chain (``_resolve_current``) to their CURRENT successor (#2813).
+    An edge is dropped only when a chain dead-ends with no live node to attribute
+    it to. #2943: an edge whose RESOLVED endpoints collapse to one node is
+    dropped only when its RAW endpoints did not already -- resolution
+    manufactured that self-loop (a node that both ``derives_from`` and
+    ``supersedes`` its predecessor); a genuine raw self-edge is kept.
+    """
     _resolved: "dict[str, str | None]" = {}
 
     def _res(nid: str) -> "str | None":
@@ -186,27 +178,13 @@ def _live_dag_edges(
         return _resolved[nid]
 
     edges: "set[tuple[str, str]]" = set()
-    dead_ended = 0
-    manufactured = 0
-    for row in rows:
-        raw_sid, raw_tid = row["sid"], row["tid"]
-        r_sid = _res(raw_sid)
-        r_tid = _res(raw_tid)
+    for raw_sid, raw_tid, _rel in core.dag_edge_set(conn, relations, live_only=False):
+        r_sid, r_tid = _res(raw_sid), _res(raw_tid)
         if r_sid is None or r_tid is None:
-            dead_ended += 1
             continue  # dead-ended chain: no live node to attribute the edge to
         if r_sid == r_tid and raw_sid != raw_tid:
-            manufactured += 1
             continue  # resolution MANUFACTURED this self-loop -- not a real cycle
         edges.add((r_sid, r_tid))
-    if stats is not None:
-        # #3210 rider: the population the walk ranged over, so a clean result
-        # says what was checked rather than a bare zero.
-        stats["raw_edges"] = len(rows)
-        stats["edges"] = len(edges)
-        stats["nodes"] = len({n for e in edges for n in e})
-        stats["dropped_dead_ended"] = dead_ended
-        stats["dropped_manufactured_self_loops"] = manufactured
     return sorted(edges)
 
 
@@ -325,6 +303,90 @@ def _find_all_cycles(edges: "list[tuple[str, str]]") -> "list[list[str]]":
     return cycles
 
 
+def _cyclic_sccs(edges: "list[tuple[str, str]]") -> "list[set[str]]":
+    """Strongly connected components of ``edges`` that contain a cycle (size
+    >= 2, or a single node with a self-edge). Iterative Tarjan (no recursion
+    limit on a long chain), deterministic order."""
+    adjacency: "dict[str, list[str]]" = {}
+    self_loops: "set[str]" = set()
+    for src, tgt in edges:
+        adjacency.setdefault(src, []).append(tgt)
+        adjacency.setdefault(tgt, [])
+        if src == tgt:
+            self_loops.add(src)
+    for k in adjacency:
+        adjacency[k] = sorted(set(adjacency[k]))
+    index: "dict[str, int]" = {}
+    low: "dict[str, int]" = {}
+    on_stack: "set[str]" = set()
+    stack: "list[str]" = []
+    out: "list[set[str]]" = []
+    counter = 0
+    for root in sorted(adjacency):
+        if root in index:
+            continue
+        work = [(root, iter(adjacency[root]))]
+        index[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        while work:
+            node, it = work[-1]
+            advanced = False
+            for nxt in it:
+                if nxt not in index:
+                    index[nxt] = low[nxt] = counter
+                    counter += 1
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, iter(adjacency[nxt])))
+                    advanced = True
+                    break
+                if nxt in on_stack:
+                    low[node] = min(low[node], index[nxt])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == index[node]:
+                comp: "set[str]" = set()
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    comp.add(w)
+                    if w == node:
+                        break
+                if len(comp) > 1 or node in self_loops:
+                    out.append(comp)
+    return out
+
+
+def _frozen_closed_components(
+    current_edges: "list[tuple[str, str]]",
+    resolved_edges: "list[tuple[str, str]]",
+) -> "list[list[str]]":
+    """INFORMATIONAL (#3542): cycles of the RESOLVED graph that the current-only
+    gate does not see. One entry per cyclic strongly connected component of
+    ``resolved_edges`` whose sub-graph of CURRENT edges (restricted to that
+    component's nodes) is acyclic -- the component closes only through
+    re-attributed edges of superseded nodes. A component that already contains a
+    current cycle belongs to the gate and is not listed. Each entry is an
+    example cycle path (first == last) through the component."""
+    current = set(current_edges)
+    out: "list[list[str]]" = []
+    for comp in _cyclic_sccs(resolved_edges):
+        inside_current = [e for e in current if e[0] in comp and e[1] in comp]
+        if _find_all_cycles(inside_current):
+            continue
+        inside_resolved = [e for e in resolved_edges
+                           if e[0] in comp and e[1] in comp]
+        cyc = _find_cycle(sorted(inside_resolved))
+        out.append(cyc or sorted(comp))
+    return out
+
+
 # Output bound (#3210 review): the ``cycles`` list is cut at this many entries
 # per family; ``cycle_count`` stays the full number.
 MAX_CYCLES_PER_FAMILY = 20
@@ -357,12 +419,20 @@ def check_dag_conformance(conn: sqlite3.Connection) -> dict:
         empty list. (Legacy key.)
       - ``families``: per-family measurement population (#3210 rider): for
         each family ``relations`` / ``relation_count`` walked, ``nodes`` and
-        ``edges`` the walk ranged over AFTER resolving through supersedes,
-        ``raw_edges`` before, ``dropped_dead_ended`` and
-        ``dropped_manufactured_self_loops`` (edges the resolution removed),
-        ``cycle_count`` and a one-line ``summary`` (e.g. "grounding: 8
-        relations, N nodes, M edges, 0 cycles") so a clean result states what
-        was checked.
+        ``edges`` the walk ranged over (CURRENT edges only, #3542),
+        ``raw_edges`` before, ``dropped_non_current`` (edges with a
+        non-current endpoint: provenance, not counted), ``cycle_count`` and a
+        one-line ``summary`` (e.g. "grounding: 8 relations, N nodes, M edges, 0
+        cycles") so a clean result states what was checked; plus the
+        informational ``frozen_closed_components`` for that family.
+      - ``frozen_closed_components`` (#3542, INFORMATIONAL, never a verdict):
+        the number of cyclic components that appear in the pre-#3542 RESOLVED
+        graph (superseded endpoints re-attributed to their successors) but NOT
+        among current edges, so they are not on the gate; and
+        ``frozen_closed_example_path`` the first such component's cycle path
+        (empty list when none). Reported so the old finding is never silently
+        dropped; it does not move ``cycle_found`` / ``cycle_count`` / ``cycles``
+        or any health verdict.
       - ``dag_relation_count``: how many relations were walked, so a caller
         can tell "clean" from "walked nothing" (e.g. if DAG_RELATIONS were
         ever accidentally emptied). (Legacy key.)
@@ -374,6 +444,7 @@ def check_dag_conformance(conn: sqlite3.Connection) -> dict:
     """
     cycles: list[dict] = []
     families: dict[str, dict] = {}
+    frozen_paths: list[list[str]] = []
     for family in core.DAG_FAMILIES:
         # Intersect with core.DAG_RELATIONS: the audit's walked set stays
         # bounded by that constant (tests monkeypatch it to prove the walk
@@ -382,6 +453,9 @@ def check_dag_conformance(conn: sqlite3.Connection) -> dict:
         stats: dict = {}
         edges = _live_dag_edges(conn, walked, stats)
         found = _find_all_cycles(edges)
+        frozen = _frozen_closed_components(
+            edges, _resolved_dag_edges(conn, walked))
+        frozen_paths.extend(frozen)
         for path in found[:MAX_CYCLES_PER_FAMILY]:
             cycles.append({"family": family, "path": path})
         families[family] = {
@@ -390,11 +464,10 @@ def check_dag_conformance(conn: sqlite3.Connection) -> dict:
             "nodes": stats.get("nodes", 0),
             "edges": stats.get("edges", 0),
             "raw_edges": stats.get("raw_edges", 0),
-            "dropped_dead_ended": stats.get("dropped_dead_ended", 0),
-            "dropped_manufactured_self_loops": stats.get(
-                "dropped_manufactured_self_loops", 0),
+            "dropped_non_current": stats.get("dropped_non_current", 0),
             "cycle_count": len(found),
             "cycles_truncated": len(found) > MAX_CYCLES_PER_FAMILY,
+            "frozen_closed_components": len(frozen),
         }
         families[family]["summary"] = (
             f"{family}: {len(walked)} relations, {families[family]['nodes']} "
@@ -408,5 +481,7 @@ def check_dag_conformance(conn: sqlite3.Connection) -> dict:
         "cycles_truncated": any(
             f["cycles_truncated"] for f in families.values()),
         "families": families,
+        "frozen_closed_components": len(frozen_paths),
+        "frozen_closed_example_path": frozen_paths[0] if frozen_paths else [],
         "dag_relation_count": len(core.DAG_RELATIONS),
     }

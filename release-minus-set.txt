@@ -17,6 +17,14 @@ tools/telegram_bot.py
 tools/_telegram_api.py
 tools/borges_session_eval.py
 
+# --- Team study tools (single-purpose, built for one pre-registered study; not a
+#     user tool). Dev tier in tiers.json. The path is repo-root-relative, so it
+#     carries the src/engram/ source root. Its test file lives under tests/, which
+#     is already excluded wholesale below. ---
+src/engram/tools/s2_clause_check.py
+src/engram/tools/s2_clause_sheet.py
+src/engram/tools/s2_score.py
+
 # --- Dev test suite (lives in the private engram-alpha; the public repo is a
 #     user-facing release snapshot). Also avoids publishing leak-detection test
 #     fixtures that intentionally embed scanner patterns, which would otherwise
@@ -41,11 +49,13 @@ tests/
 #     any-depth semantics for unanchored directory entries (#2516). ---
 /deploy/
 
-# --- Dev-process docs (the procedures for DEVELOPING and RELEASING ENGRAM, run
-#     from engram-alpha/dev; a public release USER never cuts a release or contributes
-#     from the snapshot, so these are dev-internal and stay in the private repo). ---
-docs/RELEASING.md
-docs/DEVELOPMENT.md
-
-# v0.5.0 cut (2026-09-02): internal fleet runbook naming a superseded rc tag; no public reader (Ariadne, roster scan)
-docs/rc-upgrade-runbook.md
+# --- Internal docs: everything about BUILDING ENGRAM (design notes, specs,
+#     research, team process and merge policy, the release procedure). docs/ keeps
+#     only the docs that a shipped surface sends users or their agents to;
+#     tests/test_docs_layout_guard.py holds that allowlist, with the reason for each
+#     file. One directory entry replaces the old per-file lines, so a new internal
+#     doc needs no edit here. (Chosen 2026-10-22 for Seed 3, the public docs root
+#     cleanup.) The entry is root-anchored because it contains a slash that is not
+#     trailing. Old docs/CHANGELOG.md entries still name the paths that were true
+#     then; those are history, not links. ---
+docs/internal/

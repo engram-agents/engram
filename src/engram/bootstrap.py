@@ -50,7 +50,14 @@ def _now_iso() -> str:
 
 ALPHA_DIR = Path(os.environ["ALPHA_DIR"])
 TEMPLATES_DIR = Path(os.environ["ALPHA_TEMPLATES_DIR"])
-ENGRAM_HOME = Path(os.environ["ENGRAM_HOME"])
+# ENGRAM_HOME is REQUIRED here (unset stays a KeyError, as before). #3863 step 3a: this is an entry point, so a
+# RELATIVE value raises ValueError naming it (the resolver sits beside this file in both layouts), never cwd-anchored.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import engram_home_resolver  # noqa: E402
+
+if "ENGRAM_HOME" not in os.environ:
+    raise KeyError("ENGRAM_HOME")
+ENGRAM_HOME = engram_home_resolver.engram_home()
 TARGET = os.environ.get("TARGET", "claude").lower()
 
 if TARGET not in ("claude", "codex"):
@@ -400,10 +407,16 @@ def _db_node_count(db_path: Path) -> int:
     Raises SystemExit on connection-level failures (PermissionError, locked DB,
     etc.) so FORCE=1 / FORCE_RESEED_EMPTY=1 refuse rather than silently
     treating an unreadable DB as empty and proceeding to seed live data.
+
+    Opens the store read-only (`mode=ro`): bootstrap runs before any owner can
+    exist and only counts rows. On a cleanly closed WAL store SQLite may still
+    create a `-shm` (a shared-memory index, not data); the main file and the
+    `-wal` are left unchanged. `immutable=1` is deliberately not used: it tells
+    SQLite no other writer exists, which is false whenever a seat is live.
     """
     import sqlite3
     try:
-        conn = sqlite3.connect(str(db_path), timeout=0)
+        conn = sqlite3.connect(f"{Path(db_path).absolute().as_uri()}?mode=ro", uri=True, timeout=0)
         try:
             row = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
             return row[0] if row else 0

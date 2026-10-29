@@ -29,14 +29,29 @@ MIN_IDF_RATIO = 0.7  # tripwire hook _in_turn_config() default, line 1066
 DEFAULT_TOP_K = 8
 
 
+def _load_owner_read():
+    """The shared owner-read helper (tools/_owner_read.py), the ONE ENGRAM_HOME definition (#3863). The repo root is
+    found by name (the nearest ancestor holding tools/_owner_read.py, never a fixed parents[N]) and appended, never
+    inserted (#2565)."""
+    here = Path(__file__).resolve()
+    repo_root = next((d for d in here.parents if (d / "tools" / "_owner_read.py").is_file()), None)
+    if repo_root is None:
+        raise SystemExit(f"novel_terms: cannot find tools/_owner_read.py above {here} (run it from the engram-alpha "
+                         "checkout)")
+    if str(repo_root) not in sys.path:
+        sys.path.append(str(repo_root))
+    from tools import _owner_read as owner_read
+    return owner_read
+
+
 def default_db() -> Path:
-    """$ENGRAM_HOME/knowledge.db when ENGRAM_HOME is set, else ~/.engram/knowledge.db.
+    """$ENGRAM_HOME/knowledge.db when ENGRAM_HOME is set and non-empty, else ~/.engram/knowledge.db, through the one
+    resolver (a RELATIVE value raises ValueError naming it; main() turns that into its refusal).
 
     A seat with a non-default ENGRAM_HOME must not silently measure arm E against
     another graph; the resolved path is printed in the output (`db`).
     """
-    home = os.environ.get("ENGRAM_HOME")
-    return (Path(home) if home else Path.home() / ".engram") / "knowledge.db"
+    return _load_owner_read().engram_home() / "knowledge.db"
 
 
 def _has_idf(directory: Path) -> Path | None:
@@ -90,7 +105,19 @@ def save_seen(state: Path, seen: set[str]) -> None:
         raise
 
 
+def check_db(db: Path) -> None:
+    """Refuse an unusable --db with one line and exit 1 (#3962), before anything opens it: a FIFO would hang the
+    `mode=ro` connect. The repo root is found by name (the nearest ancestor holding tools/_owner_read.py, never a
+    fixed parents[N]) and appended, never inserted (#2565)."""
+    owner_read = _load_owner_read()
+    try:
+        owner_read.check_store_path(db)
+    except (FileNotFoundError, owner_read.StoreUnusable) as exc:
+        raise SystemExit(f"novel_terms: {exc}") from None
+
+
 def extract(text: str, db: Path, top_k: int) -> list[str]:
+    check_db(db)
     sys.path.insert(0, str(resolve_runtime_dir()))
     from engram_idf import JUNK_STOPLIST, STOPWORDS, extract_keywords  # noqa: E402
 
@@ -110,10 +137,16 @@ def extract(text: str, db: Path, top_k: int) -> list[str]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--state", required=True, help="novel-terms-seen.json for this probe session")
-    parser.add_argument("--db", default=str(default_db()),
+    parser.add_argument("--db", default=None,  # resolved after parsing, so building the parser never raises
                         help="default: $ENGRAM_HOME/knowledge.db, else ~/.engram/knowledge.db")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     args = parser.parse_args(argv)
+    if args.db is None:
+        try:
+            args.db = str(default_db())
+        except ValueError as exc:  # a relative ENGRAM_HOME: refused before stdin, the state file or the graph is touched
+            print(f"novel_terms: {exc}", file=sys.stderr)
+            return 2
 
     state = Path(args.state)
     terms = extract(sys.stdin.read(), Path(args.db), args.top_k)

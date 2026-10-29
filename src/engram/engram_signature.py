@@ -4,11 +4,14 @@ One function, ``build_signature``, shared by the ``engram_sign`` MCP tool
 (``server.py``) and the ``tools/engram-sign.py`` CLI. It emits ONE predictable
 line that an agent appends to every external communication:
 
-    <emoji> <Full Name> . <marketing name> (<model id>) . ENGRAM <version> . <primary_user>'s agent
+    <emoji> <Full Name> . <marketing name> (<model id>) . ENGRAM <version> . <primary_user>'s agent . <site>
 
 (the separator is U+00B7 MIDDLE DOT). When the harness reports no marketing
 name, the middle part is just ``<model id>``. When the deployed build is
 tagged and clean, the version renders as ``ENGRAM <version> (<alpha_tag>)``.
+The final ``<site>`` segment is the project website (default ``PROJECT_SITE``),
+so a reader of an externally posted signature can find where to get ENGRAM; it
+is omitted when ``signature_site`` is set to the empty string.
 
 Every field is read mechanically, none is typed from memory, and an unreadable
 field is a REFUSAL naming the field and how to fix it -- never a placeholder
@@ -19,11 +22,20 @@ Field sources:
   emoji / name / human / lineage  <data_dir>/config.json:
                                   signature_emoji, display_name, primary_user,
                                   self_lineage
+  site                            config.json signature_site, else PROJECT_SITE
   model                           the session transcript: newest JSONL row with
                                   attachment.type == "model"
                                   (attachment.identity.modelId + marketingName);
                                   fallback: newest row with message.model
-                                  (id only)
+                                  (id only).  Codex rollout (#3922): the newest
+                                  top-level type == "turn_context" record's
+                                  payload.model (id only; no nested model key
+                                  is read).  Claude + Codex evidence in one
+                                  transcript refuses ("mixed-harness").
+                                  This is a TURN claim: the newest turn record
+                                  of the bound transcript, not a statement
+                                  about the whole session (true of the Claude
+                                  path too).
   family check                    engram_core.model_id_to_lineage(model id)
                                   must equal self_lineage
   version                         <plugin root>/plugin.json "version"; plus
@@ -46,6 +58,9 @@ Plugin root: ``CLAUDE_PLUGIN_ROOT`` when set, else the nearest parent of this
 file holding BOTH ``plugin.json`` and ``server.py`` (never a fixed
 ``parents[N]``: the plugin build flattens the source layout, see CLAUDE.md).
 A source checkout has no ``plugin.json``, so it refuses -- accepted.
+
+Trust model: the transcript is a local file the user can edit, so the signature
+is DECLARED provenance, not attestation or cryptographic proof.
 """
 
 from __future__ import annotations
@@ -56,6 +71,21 @@ from dataclasses import dataclass, field as _dc_field
 from pathlib import Path
 
 SEP = " · "
+
+# The project's own public address. A constant is honest here: it is identical
+# for every install and shipped by the project, so it is not a per-seat fact and
+# not a read that can fail.
+#
+# Optional config override ``signature_site`` in config.json. CONTRACT:
+#   - key ABSENT            -> PROJECT_SITE (a true optional: the default is the
+#                              project's address, not a hidden failed read)
+#   - non-empty string      -> that string, verbatim after .strip()
+#   - "" / whitespace only  -> segment OMITTED; the line ends at "<user>'s agent"
+#   - any non-string type   -> REFUSE (field="signature_site"). House rule: a
+#     wrong-type value is an unreadable field, not an absent one. This
+#     deliberately differs from the config reads in #4232 (wrong-type as
+#     absent); do not "fix" it toward #4232.
+PROJECT_SITE = "engram-agents.org"
 
 
 @dataclass
@@ -93,6 +123,19 @@ def _cfg_str(cfg: dict, key: str, data_dir: Path) -> str:
         raise _Refusal(
             key, f"{key} is missing or empty: set {key} in "
                  f"{data_dir / 'config.json'}")
+    return v.strip()
+
+
+def _cfg_site(cfg: dict, data_dir: Path) -> str:
+    """The site segment ("" = omitted). See the PROJECT_SITE contract."""
+    if "signature_site" not in cfg:
+        return PROJECT_SITE
+    v = cfg["signature_site"]
+    if not isinstance(v, str):
+        raise _Refusal(
+            "signature_site",
+            f"signature_site in {data_dir / 'config.json'} must be a string "
+            f"(or removed), found {type(v).__name__}")
     return v.strip()
 
 
@@ -136,9 +179,48 @@ def _find_marker(data_dir: Path, session_id: str | None) -> dict:
     return marker
 
 
+def _has_claude_source(rows: list) -> bool:
+    """True when any row is a Claude model source (the two shapes the Claude
+    path reads): an attachment model row with a non-blank ``identity.modelId``,
+    or a ``message.model`` starting ``claude-``."""
+    for r in rows:
+        att = r.get("attachment")
+        if isinstance(att, dict) and att.get("type") == "model":
+            ident = att.get("identity")
+            mid = ident.get("modelId") if isinstance(ident, dict) else None
+            if isinstance(mid, str) and mid.strip():
+                return True
+        msg = r.get("message")
+        mid = msg.get("model") if isinstance(msg, dict) else None
+        if isinstance(mid, str) and mid.strip().startswith("claude-"):
+            return True
+    return False
+
+
+def _lineage_of(model_id: str) -> str:
+    import engram_core as core
+    return core.model_id_to_lineage(model_id)
+
+
 def _read_model(transcript: Path) -> tuple[str, str | None]:
-    """(model_id, marketing_name|None) from the newest model attachment row,
-    else the newest assistant ``message.model`` (marketing name None)."""
+    """(model_id, marketing_name|None) for the bound transcript.
+
+    Claude transcripts: the newest model attachment row, else the newest
+    assistant ``message.model`` (marketing name None).  Codex rollouts (#3922):
+    the newest top-level ``type == "turn_context"`` record's ``payload.model``
+    (marketing name None); ONLY that key is read -- never
+    ``payload.collaboration_mode.settings.model`` or any other nested ``model``
+    -- and a newest turn_context record with no usable model REFUSES rather
+    than falling back to an older turn.  A transcript holding BOTH a Claude
+    source and a Codex turn_context refuses ("mixed-harness"); no format is
+    preferred.
+
+    This is a TURN claim, not a session claim: the evidence is the newest turn
+    record of the bound transcript (a pre-existing property of the Claude path
+    too -- the newest attachment/assistant row), not a statement that the whole
+    session ran on that model.  The transcript is a user-editable local file;
+    the result is declared provenance, not attestation.
+    """
     try:
         raw = transcript.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
@@ -151,6 +233,23 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
             continue
         if isinstance(r, dict):
             rows.append(r)
+    turns = [r for r in rows if r.get("type") == "turn_context"]
+    if turns:
+        if _has_claude_source(rows):
+            raise _Refusal(
+                "model",
+                f"transcript {transcript} holds both Claude model evidence and "
+                "Codex turn_context records (mixed-harness): cannot determine "
+                "the running model, refusing rather than ranking the sources")
+        payload = turns[-1].get("payload")
+        mid = payload.get("model") if isinstance(payload, dict) else None
+        if isinstance(mid, str) and mid.strip():
+            return mid.strip(), None
+        raise _Refusal(
+            "model",
+            f"the newest turn_context record in {transcript} has no usable "
+            "payload.model (missing, non-string or blank): refusing rather "
+            "than falling back to an older turn or a nested model key")
     # Primary: harness model attachment (id + marketing name).
     for r in reversed(rows):
         att = r.get("attachment")
@@ -161,18 +260,38 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
                 name = ident.get("marketingName")
                 name = name.strip() if isinstance(name, str) else ""
                 return mid.strip(), (name or None)
-    # Fallback: newest assistant row's message.model (id only).  Rows whose id
-    # does not start with "claude-" (e.g. a harness-synthetic "<synthetic>"
-    # row) are skipped HERE ONLY, so an older real assistant row is used
-    # instead of refusing a healthy seat.  The attachment pass above does not
-    # skip: that row is the harness's own identity statement, so a synthetic
-    # id there would be a real anomaly worth refusing.
+    # Fallback: newest assistant row's message.model (id only).  Walk newest to
+    # oldest and skip ONLY a non-string, blank or exactly "<synthetic>" (the
+    # harness's own placeholder) model; the first remaining id is the running
+    # model and decides.  An unmapped real id refuses -- an older row never
+    # signs for a model that is no longer running.  The attachment pass above
+    # does not skip: that row is the harness's own identity statement, so a
+    # synthetic id there would be a real anomaly worth refusing.
+    saw_assistant = False
     for r in reversed(rows):
         msg = r.get("message")
+        if isinstance(msg, dict) and "model" in msg:
+            saw_assistant = True
         mid = msg.get("model") if isinstance(msg, dict) else None
-        if (isinstance(mid, str) and mid.strip()
-                and mid.strip().startswith("claude-")):
-            return mid.strip(), None
+        if not isinstance(mid, str):
+            continue
+        mid = mid.strip()
+        if not mid or mid == "<synthetic>":
+            continue
+        if mid.startswith("claude-") or _lineage_of(mid):
+            return mid, None
+        raise _Refusal(
+            "model",
+            f"the newest assistant row with a usable model id in {transcript} "
+            f"has model id {mid!r}, "
+            "which does not map to a lineage: refusing rather than signing "
+            "with an older row's model")
+    if saw_assistant:
+        raise _Refusal(
+            "model",
+            f"every assistant row in {transcript} has a placeholder, blank or "
+            "non-string model (no usable model id): cannot determine the "
+            "running model")
     raise _Refusal(
         "model",
         f"transcript {transcript} has neither a model attachment row nor an "
@@ -181,12 +300,34 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
 
 # --------------------------------------------------------------- version
 
+# Inline copy, not an import: this is a stdlib-only leaf module that server.py and the tools import, so it
+# cannot depend on a sibling helper. Pinned identical to every other copy by tests/test_bounded_sibling_lookups_3983.py.
+def _bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 def _find_plugin_root() -> Path:
     env = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
     if env:
         return Path(env)
     here = Path(__file__).resolve()
-    for d in here.parents:
+    for d in _bounded_parents(here):
         try:
             if (d / "plugin.json").is_file() and (d / "server.py").is_file():
                 return d
@@ -243,6 +384,7 @@ def build_signature(data_dir: Path, session_id: str | None = None,
         name = _cfg_str(cfg, "display_name", data_dir)
         human = _cfg_str(cfg, "primary_user", data_dir)
         lineage = _cfg_str(cfg, "self_lineage", data_dir)
+        site = _cfg_site(cfg, data_dir)
 
         marker = _find_marker(data_dir, session_id)
         tp = marker.get("transcript_path")
@@ -281,10 +423,13 @@ def build_signature(data_dir: Path, session_id: str | None = None,
 
     model_part = f"{marketing} ({model_id})" if marketing else model_id
     ver_part = f"ENGRAM {version}" + (f" ({tag})" if tag else "")
-    line = SEP.join([f"{emoji} {name}", model_part, ver_part,
-                     f"{human}'s agent"])
+    segs = [f"{emoji} {name}", model_part, ver_part, f"{human}'s agent"]
+    if site:
+        segs.append(site)
+    line = SEP.join(segs)
     return SignatureResult(ok=True, line=line, parts={
         "emoji": emoji, "display_name": name, "model_id": model_id,
         "marketing_name": marketing, "family": measured,
         "version": version, "alpha_tag": tag, "primary_user": human,
+        "site": site,
     })

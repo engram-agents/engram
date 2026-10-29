@@ -19,7 +19,8 @@ Personal-name and user-specific patterns are loaded at runtime from
 absent the scanner runs committed structural patterns only and prints one
 advisory line.
 
-See docs/.scan-leaks-local.json.example for the config shape.
+See docs/internal/.scan-leaks-local.json.example (kept in the development
+repository, not in the public release) for the config shape.
 
 Allowlist:
   - LICENSE (copyright lines are intentional)

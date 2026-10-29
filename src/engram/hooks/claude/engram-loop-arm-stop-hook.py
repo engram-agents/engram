@@ -125,6 +125,41 @@ unchanged; `_NUDGE_TEXT` carries a pointer to the batched shape so an
 agent nudged mid-conversation doesn't swallow its next reply. Measured
 on 2.1.235, not asserted universal.
 
+alpha #4193 -- the reply gate (#4104) also consults the Stop payload's
+`last_assistant_message`. The hook can fire before the final assistant record is
+flushed, so a turn that really ended on rendered text can show a delta ending on an
+earlier tool_use, and the transcript-only gate false-blocks (forcing a duplicate reply).
+FIELD SEMANTICS ARE UNVERIFIED: no payload was measured for a swallowed reply (text then
+a trailing tool_use in one message). It may be the concatenation of all the final
+message's text blocks (R-flat) or only its final text block (R-final); either way it can
+be non-empty on a swallowed turn, so "non-empty means rendered" is NOT the rule. The
+contract holds under both readings. Let P = the payload field when it is a str with
+non-whitespace content, else None; compare whitespace-normalised:
+  1. P present and NOT found in the delta's assistant text -> the text is not flushed
+     yet -> treat the reply as rendered (no reply-gate block).
+  2. P present and found there (normalised P is a substring of the joined text blocks of
+     the final message, OR that message's last text block is a suffix of P, OR P is a
+     substring of the joined assistant text of the whole turn since the human prompt) while the transcript still says the turn does not end on text -> STILL
+     block (swallowed reply).
+  3. P absent / non-str / empty / whitespace -> exactly the transcript-only path.
+The override is consulted only when the transcript path already says `has_human and not
+reply_rendered`, so it can only turn a block into no-block. "Found" looks only at the FINAL
+MESSAGE: the assistant records after the last human prompt whose message.id equals the
+last assistant record's id. Identity, not adjacency: with parallel tool calls one API
+message is written one block per record with tool_results between them (measured in a
+real transcript), so a swallowed reply's text can sit before several tool_results. Text
+of an earlier message (a different id) does not count. A last record with no usable id
+falls back to its adjacent run of assistant records. The reverse clause is a suffix test, not a substring test, so a short earlier
+preamble ("Ok") cannot make a longer payload ("Ok, here is the answer") look found.
+Text equal to the payload (e.g. "Done." then a tool call, payload "Done.") is
+indistinguishable from a swallowed reply and keeps the block; so is a P equal to text
+already flushed earlier in the turn. That covers a SECOND unverified reading of the field:
+the last text produced in the turn (not the final message's text), which on a swallowed
+reply followed by a tool-only message would otherwise look like flush lag. A real flush-lag
+reply is unflushed, so it appears nowhere in the delta and still gets the override. Each such gate decision appends one line to
+`$ENGRAM_HOME/loop-arm-reply-gate.log` (no payload text, bounded, fail-silent) so the
+real field semantics can be read off live traffic.
+
 Fire condition -- for Claude, emit the normal nudge iff ALL of:
   (a) `~/.engram/loop-mode.json` (under $ENGRAM_HOME) exists (never nag a non-loop session), AND
   (b) its `pacer` field identifies a `scheduleWakeup`-paced loop (see
@@ -308,22 +343,32 @@ import shlex
 import stat
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b): it would resolve against this process's cwd, a
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b, step 3a): it would resolve against this process's cwd, a
 # different home than the daemon's or the server's. Fail open: one stderr line, nothing written, exit 0.
-# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import.)
-_ENGRAM_HOME_RAW = os.environ.get("ENGRAM_HOME") or ""
-if _ENGRAM_HOME_RAW and not os.path.isabs(os.path.expanduser(_ENGRAM_HOME_RAW)):
-    sys.stderr.write("engram hook: ENGRAM_HOME must be an absolute path, got %r; doing nothing\n" % (_ENGRAM_HOME_RAW,))
-    sys.exit(0)
-if _ENGRAM_HOME_RAW:
-    os.environ["ENGRAM_HOME"] = os.path.abspath(os.path.expanduser(_ENGRAM_HOME_RAW))  # `~/x` -> absolute for every raw reader
+# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import. engram_home() is a
+# VERBATIM copy of tools/_owner_read.engram_home(), pinned by tests/test_engram_home_parity_3863.py.)
+def engram_home() -> Path:
+    """The ENGRAM home: $ENGRAM_HOME (default ~/.engram) when set and non-empty, expanded and absolute;
+    a RELATIVE value is refused (ValueError naming it). Verbatim pinned copy (see the comment above)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or os.path.expanduser("~/.engram")
-)
+
+try:
+    _ENGRAM_HOME_PATH = engram_home()
+except ValueError as _exc:
+    sys.stderr.write("engram hook: %s; doing nothing\n" % (_exc,))
+    sys.exit(0)
+if os.environ.get("ENGRAM_HOME"):
+    os.environ["ENGRAM_HOME"] = str(_ENGRAM_HOME_PATH)  # `~/x` -> absolute for every raw reader
+
+ENGRAM_HOME = str(_ENGRAM_HOME_PATH)
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 
 # This hook's OWN byte-offset state file -- never shared with
@@ -469,11 +514,34 @@ except Exception:
 
 _LOOP_WAKE_MARKER_FALLBACK: str = "<loop-wake>"
 
+# Inline copy, not _hooklib's: every _hooklib import in this hook is guarded, so it cannot be assumed here.
+# Pinned identical to every other copy by tests/test_bounded_sibling_lookups_3983.py.
+def _bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 _lp_candidates = []
 _lp_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
 if _lp_plugin_root:
     _lp_candidates.append(Path(_lp_plugin_root) / "tools")
-for _lp_parent in Path(__file__).resolve().parents:
+# Own tree only: up to and including the tree root, never above it (#3983).
+for _lp_parent in _bounded_parents(Path(__file__).resolve()):
     _lp_candidates.append(_lp_parent / "tools")
 # (c / "loop_prompt.py").exists() raises OSError -- not False -- on an
 # unreadable candidate directory, and this whole block runs at bare
@@ -522,20 +590,6 @@ _LOOP_PROMPT_FALLBACK_PATH = (
     '"${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}'
     '/tools/loop_prompt.py"'
 )
-
-
-def _loop_prompt_rearm_command() -> str:
-    """The `loop_prompt.py --rearm-delay` command the nudge prints.
-
-    Names the path RESOLVED at import when resolution succeeded, so the
-    printed command is correct in whichever layout this hook runs from;
-    falls back to the `${CLAUDE_PLUGIN_ROOT:-…}` sh form otherwise.
-    """
-    if _LP_TOOLS_DIR is not None:
-        helper = f'"{_LP_TOOLS_DIR / "loop_prompt.py"}"'
-    else:
-        helper = _LOOP_PROMPT_FALLBACK_PATH
-    return f"python3 {helper} --rearm-delay --wake-kind other"
 
 
 # The wake-arming tool's name(s), as they appear in a tool_use block's
@@ -592,24 +646,76 @@ def _is_managed_codex_runtime() -> bool:
     return bool(os.environ.get("CODEX_PLUGIN_ROOT", "").strip())
 
 
-_NUDGE_TEXT = (
+_NUDGE_HEAD = (
     "[Loop Arm Check: a loop marker is active and this turn shows no "
-    "ScheduleWakeup call. Arm now — ScheduleWakeup with this file's "
-    "loop_prompt copied verbatim — after asking the helper for this turn's "
-    f"delay: run `{_loop_prompt_rearm_command()}` and "
-    "pass the integer it prints to ScheduleWakeup (a nudge-driven arm "
-    "PRESERVES the deadline; do NOT arm the bare full cadence — that pushes "
-    "the due moment out, #3005). Then run CronList to verify the armed "
-    "prompt leads with "
-    f"{_LOOP_WAKE_MARKER}. CronList alone never satisfies this check, only "
-    "verifies after the real arming action. Arming is idempotent: a "
-    "redundant arm replaces, never stacks. If your NEXT turn will carry a "
-    "user-facing reply: batch the arm with a sibling tool call in one "
-    "parallel block and put the reply after it as the turn's final text — "
-    "a solo arm ends the turn, a trailing arm swallows the reply (engram-"
-    "loop Step 2 item 3, #2098). If a reply already rendered this turn, "
-    "arm now and add nothing after.]"
+    "verified re-arm (ScheduleWakeup + CronList in the same parallel block). "
+    "Arm now — read `cadence_seconds` from the marker (it is already in your "
+    "context) and batch `ScheduleWakeup(delay=cadence_seconds)` and `CronList` "
+    "in ONE parallel block — the ONLY documented arm shape; a solo "
+    "`ScheduleWakeup` without a `CronList` sibling in the same parallel block "
+    "IS the defect (#4007). "
 )
+# INVARIANT (#4139): the nudge never names a marker field that the marker
+# doesn't have. This sentence is only emitted when the marker carries a
+# non-empty-str `loop_prompt`; otherwise _nudge_text_for_marker swaps in the
+# helper-pointing sentence instead.
+_NUDGE_LOOP_PROMPT_FIELD_SENTENCE = (
+    "Use this file's own `loop_prompt` field verbatim "
+    "for the ScheduleWakeup prompt — never paraphrase. "
+)
+_NUDGE_TAIL = (
+    "The CronList result is "
+    "your verify step: confirm the prompt leads with "
+    f"{_LOOP_WAKE_MARKER}. "
+    "Arming is idempotent: a redundant arm replaces, never stacks. If your "
+    "NEXT turn will carry a user-facing reply: batch the arm with a sibling "
+    "tool call in one parallel block and put the reply after it as the turn's "
+    "final text — a solo arm ends the turn, a trailing arm swallows the reply "
+    "(engram-loop Step 2 item 3, #2098). If a reply already rendered this "
+    "turn, arm now and add nothing after.]"
+)
+_NUDGE_TEXT = _NUDGE_HEAD + _NUDGE_LOOP_PROMPT_FIELD_SENTENCE + _NUDGE_TAIL
+
+
+def _loop_prompt_helper_path() -> str:
+    """The printed path of tools/loop_prompt.py: the directory the import
+    resolution above actually found (`_LP_TOOLS_DIR`), else the sh-form
+    fallback (already quoted) -- same policy as the comment above
+    `_LOOP_PROMPT_FALLBACK_PATH`. No new path logic."""
+    if _LP_TOOLS_DIR is not None:
+        return '"' + str(Path(_LP_TOOLS_DIR) / "loop_prompt.py") + '"'
+    return _LOOP_PROMPT_FALLBACK_PATH
+
+
+def _marker_has_loop_prompt(loop_marker_path: str) -> bool:
+    """True iff the marker parses and carries a non-empty str `loop_prompt`.
+    Unreadable / unparseable / non-dict marker -> False (never raises)."""
+    try:
+        with open_regular_text(loop_marker_path, encoding="utf-8") as f:
+            marker = json.load(f)
+        lp = marker.get("loop_prompt")
+        return isinstance(lp, str) and bool(lp)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _nudge_text_for_marker(loop_marker_path: str) -> str:
+    """Choose the arm-nudge text so it never names a marker field the marker
+    lacks (#4139). C1: non-empty str `loop_prompt` -> `_NUDGE_TEXT`, byte
+    for byte. C2/C3: anything else (absent, null, "", non-string, unreadable
+    or unparseable marker) -> the helper-pointing sentence."""
+    if _marker_has_loop_prompt(loop_marker_path):
+        return _NUDGE_TEXT
+    return (
+        _NUDGE_HEAD
+        + "This marker has no `loop_prompt` field: build the prompt with "
+        + f"`python3 {_loop_prompt_helper_path()} --default-stub` for a heartbeat loop "
+        + "(for any other loop kind, build it from one line saying what that wake does, "
+        + f"e.g. `echo '<one line saying what this wake does>' | python3 {_loop_prompt_helper_path()}`) "
+        + "(never hand-write it). "
+        + _NUDGE_TAIL
+    )
+
 
 _CODEX_PACER_NUDGE_TEXT = (
     "[Loop Arm Check: managed Codex is active but this loop marker says "
@@ -617,6 +723,21 @@ _CODEX_PACER_NUDGE_TEXT = (
     "managed codex-umwelt-wake.py bridge and this agent's systemd heartbeat "
     "timer, then correct the marker to pacer systemd before continuing.]"
 )
+
+
+# alpha #4104: a human's reply is swallowed when the turn ends on a tool call
+# (only a turn's FINAL assistant text renders). Deliberately says nothing about
+# arming: this block must never push the agent back into a trailing arm.
+_REPLY_NOT_RENDERED_TEXT = (
+    "[Reply Delivery Check: your reply to the human was not rendered, because "
+    "this turn ends on a tool call and only a turn's final text renders. Write "
+    "the reply now as the turn's final text, with no tool call after it.]"
+)
+
+# Wake-pending: a wake due further out than this is "pending" (#4104).
+_WAKE_PENDING_MIN_SECONDS = 90
+# Wake-pending: tail-scan bound for the transcript file.
+_WAKE_PENDING_TAIL_BYTES = 4 * 1024 * 1024
 
 
 def _pacer_is_schedule_wakeup(loop_marker_path: str) -> bool:
@@ -647,6 +768,36 @@ def _pacer_is_schedule_wakeup(loop_marker_path: str) -> bool:
     return pacer.strip().lower() == _SCHEDULE_WAKEUP_PACER
 
 
+def _read_waiting_on(loop_marker_path: str) -> tuple[str, str] | None:
+    """Return (description, return_by_str) if the loop marker carries an
+    active (not yet expired) waiting_on declaration; None otherwise.
+
+    Active = present, description is a non-empty string, return_by parses
+    as a future ISO-8601 timestamp. Any exception → None (never raises).
+    """
+    try:
+        with open_regular_text(loop_marker_path, encoding="utf-8") as f:
+            marker = json.load(f)
+        wo = marker.get("waiting_on")
+        if not isinstance(wo, dict):
+            return None
+        desc = wo.get("description")
+        rb_str = wo.get("return_by")
+        if not isinstance(desc, str) or not desc.strip():
+            return None
+        if not isinstance(rb_str, str) or not rb_str.strip():
+            return None
+        rb = datetime.fromisoformat(rb_str.replace("Z", "+00:00"))
+        if rb.tzinfo is None:
+            rb = rb.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if rb <= now:
+            return None
+        return desc.strip(), rb_str.strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _tool_use_prompt_text(block: dict) -> str:
     """Extract the `prompt` input parameter's text from a tool_use block.
 
@@ -665,43 +816,56 @@ def _tool_use_prompt_text(block: dict) -> str:
 
 
 def _delta_matches_arm_confirmation(delta_bytes: bytes) -> bool:
-    """Scan the delta's tool_use blocks for a ScheduleWakeup call whose
-    `input.prompt` carries the loop-wake marker.
+    """Scan the delta for a batched arm: ScheduleWakeup + CronList in ONE
+    parallel block (same message.id group of consecutive assistant records).
 
-    A `tool_use` block counts as confirmation iff ALL of:
-      1. Its `name` is in `_WAKE_ARMING_TOOL_NAMES` (i.e. "ScheduleWakeup").
-      2. Its (HTML-unescaped, per #1649) `input.prompt` text contains the
-         literal `<loop-wake>` marker.
-    Unlike the old CronList-result gate, a tool_use block carries its own
-    `name` directly -- no tool_use_id correlation to a separate result is
-    needed, because the call itself IS the evidence (its mere presence in
-    this turn's delta proves ScheduleWakeup was invoked THIS turn, which is
-    exactly the "armed from now" fact #1973 needs and a CronList result can
-    never prove: a job armed an hour ago and one armed this second are
-    byte-identical in CronList output). If no tool_use block in the delta
-    satisfies both conditions, the nudge fires.
+    Real Claude Code parallel blocks: each tool_use is written as its own
+    assistant record sharing the same `message.id`. Confirmed iff some
+    message.id group contains BOTH a loop-wake ScheduleWakeup AND a CronList.
+
+    Records without a `message.id` are treated as isolated singleton groups
+    (backward compat with synthetic fixtures that write multiple tool_use
+    blocks in one record's content array — the single-record shape with both
+    SW and CronList in the same content still confirms correctly).
+
+    A solo ScheduleWakeup (no CronList in its group) is the defect (#4007).
     """
     if not delta_bytes:
         return False
     records, _any_record_parsed = _parse_jsonl_records(delta_bytes)
+
+    # groups: group_key -> {"has_sw": bool, "has_cronlist": bool}
+    groups: dict[object, dict[str, bool]] = {}
+    _unique_counter = 0
+
     for rec in records:
         if rec.get("type") != "assistant":
             continue
-        content = rec.get("message", {}).get("content", [])
+        msg = rec.get("message", {})
+        content = msg.get("content", [])
         if not isinstance(content, list):
             continue
+        msg_id = msg.get("id")
+        if msg_id is None:
+            _unique_counter += 1
+            group_key: object = f"_solo_{_unique_counter}"
+        else:
+            group_key = msg_id
+
+        if group_key not in groups:
+            groups[group_key] = {"has_sw": False, "has_cronlist": False}
+
         for block in _walk_content_blocks(content):
             if block.get("type") != "tool_use":
                 continue
-            if block.get("name") not in _WAKE_ARMING_TOOL_NAMES:
-                continue  # not a ScheduleWakeup call -> doesn't confirm
-            text = _tool_use_prompt_text(block)
-            if not text:
-                continue
-            unescaped = html.unescape(text)
-            if _LOOP_WAKE_MARKER in unescaped:
-                return True
-    return False
+            if block.get("name") in _WAKE_ARMING_TOOL_NAMES:
+                text = _tool_use_prompt_text(block)
+                if text and _LOOP_WAKE_MARKER in html.unescape(text):
+                    groups[group_key]["has_sw"] = True
+            elif block.get("name") == "CronList":
+                groups[group_key]["has_cronlist"] = True
+
+    return any(g["has_sw"] and g["has_cronlist"] for g in groups.values())
 
 
 def _delta_has_arm_confirmation(transcript_path: str) -> bool:
@@ -764,6 +928,10 @@ def _delta_has_arm_confirmation(transcript_path: str) -> bool:
 # Consecutive quiet wakes before the nudge fires.
 QUIET_TICKS_THRESHOLD = 2
 
+# Within N: quiet, no block (systemMessage advisory fine).
+# Beyond N, first trigger: one study-unit block, then quiet until return_by.
+_WAITING_ON_NEAR_ZONE_MINUTES = 10
+
 # A REVIEWED constant: adding a verb is a deliberate change (a contract cell
 # pins the exact membership). Plain harness tools, plus umwelt's MCP READ verbs
 # (matched by the part after the last `__`, on an umwelt server only -- see
@@ -789,6 +957,21 @@ _QUIET_NUDGE_TEXT = (
     "(`~/.engram/history/dream/`, most recent file).]"
 )
 
+_QUIET_ADVISORY_TEXT = (
+    "[Tick Rule — known-return wait: {n} quiet wake(s) while waiting for "
+    "\"{desc}\" (return by {rb_str}). Inside a declared bounded wait, quiet "
+    "wakes are expected — this is advisory, not a demand. Counter reset. "
+    "Full tick rule: engram-loop skill.]"
+)
+
+_QUIET_STUDY_UNIT_TEXT = (
+    "[Tick Rule — study unit: waiting for \"{desc}\" (return by {rb_str}). "
+    "This wait is longer than one study unit. Take one bounded study unit "
+    "— one target, one method, one written ENGRAM result — before the "
+    "quiet hold begins. After this unit the hook is quiet until return_by. "
+    "Full tick rule: engram-loop skill.]"
+)
+
 _BASH_PIPE_SINKS = frozenset({"head", "tail", "wc", "grep", "sort", "uniq", "cut"})
 _BASH_PLAIN_READERS = frozenset({"pgrep", "ps", "ls", "cat", "head", "tail", "wc", "grep", "pwd"})
 _BASH_GH_READ_VERBS = frozenset({"view", "list", "checks", "status"})
@@ -796,9 +979,9 @@ _BASH_GH_API_WRITE_SHORT = ("-X", "-f", "-F")  # also matched attached, e.g. -XP
 _BASH_GH_API_WRITE_LONG = ("--method", "--field", "--raw-field", "--input")
 _BASH_GIT_READ_VERBS = frozenset({"status", "log", "diff", "show", "rev-parse"})  # `fetch` has its own rule
 _BASH_GIT_BRANCH_FLAGS = frozenset({"-a", "-r", "-v", "-vv", "--all", "--remotes", "--verbose", "--list", "-l", "--show-current"})
-# The re-arm helper the loop skill and the nudge itself prescribe: it prints a delay and stamps the
-# loop marker's next_due_at, so it is an ARM action, and a heartbeat turn that calls it is quiet.
-# Whole-command match only, so `python3 loop_prompt.py --rearm-delay; rm x` does not pass.
+# The re-arm helper (--rearm-delay flag): prints cadence_seconds and is an ARM action, so a
+# heartbeat turn that calls it is quiet. Whole-command match only.
+# Nudge no longer prescribes the helper (#4007 — arm reads cadence_seconds directly).
 _LOOP_PROMPT_HELPER_RE = re.compile(
     r"(?:(?P<w>[A-Za-z_]\w*=\$\()|)"
     r"python3?\s+[\"']?(?:[\w./~$-]*/)?loop_prompt\.py[\"']?\s+--rearm-delay"
@@ -1071,6 +1254,337 @@ def _read_turn_delta(transcript_path: str) -> bytes | None:
         return None
 
 
+def _strict_records(delta_bytes: bytes) -> list | None:
+    """Records of a delta, or None unless EVERY non-blank line parses (the
+    strictness `_delta_is_quiet_wake` applies; the #4104 reply gate fails
+    toward today's behaviour on anything less)."""
+    if not delta_bytes or not delta_bytes.strip():
+        return None
+    records, any_parsed = _parse_jsonl_records(delta_bytes)
+    if not any_parsed or not records:
+        return None
+    nonblank = [ln for ln in delta_bytes.decode("utf-8", errors="replace").split("\n") if ln.strip()]
+    if len(records) != len(nonblank):
+        return None
+    return records
+
+
+# Local to _human_prompt_index (deliberately NOT in _NOT_A_TRIGGER_PREFIXES:
+# other consumers keep today's behaviour).
+# Injected user text with no provenance fields: a skill expansion, and the
+# compact-request post-compaction context (tools/compact-request.py).
+_INJECTED_TEXT_PREFIXES = (
+    "Base directory for this skill:",
+    "# Post-compaction context",
+)
+
+
+def _record_fields_say_not_human(rec: dict) -> bool:
+    """True when a user record's own provenance fields mark it as injected.
+
+    Real Claude Code user records carry `origin` / `promptSource` /
+    `turnOrigin` / `isMeta` (a typed prompt: origin.kind "human", promptSource
+    "typed", turnOrigin "human"; skill expansions and Stop-hook feedback are
+    isMeta). These are EXCLUSIONS only, applied when a field is present; old
+    transcripts and synthetic fixtures without them keep the text rules."""
+    if rec.get("isMeta") is True:
+        return True
+    origin = rec.get("origin")
+    if isinstance(origin, dict):
+        kind = origin.get("kind")
+        if isinstance(kind, str) and kind != "human":
+            return True
+    turn_origin = rec.get("turnOrigin")
+    if isinstance(turn_origin, str) and turn_origin != "human":
+        return True
+    return rec.get("promptSource") == "system"
+
+
+def _human_prompt_index(records: list) -> int | None:
+    """Index of the LAST user record that is a genuine human prompt: has text
+    that is not Stop-hook feedback / a compaction summary, carries no
+    `<loop-wake>` marker and no `<task-notification>` (after HTML-unescape).
+    A later wake / task-notification record clears an earlier human prompt;
+    so does a record that merely QUOTES the marker inside a human prompt (fails
+    toward today's behaviour; rare, accepted). Stop-hook feedback, compaction
+    summaries and skill expansions never clear."""
+    found = None
+    for i, rec in enumerate(records):
+        text = _record_user_text(rec)
+        if text is None or not text.strip():
+            continue
+        if text.lstrip().startswith(_NOT_A_TRIGGER_PREFIXES):
+            continue
+        # Skill expansions / post-compaction context are injected text that may
+        # quote the marker (the engram-loop skill does): not human, and must not
+        # clear a human prompt either.
+        if text.lstrip().startswith(_INJECTED_TEXT_PREFIXES) or rec.get("turnCompanion") is True:
+            continue
+        unescaped = html.unescape(text)
+        if _LOOP_WAKE_MARKER in unescaped or "<task-notification>" in unescaped:
+            # A wake / task notification after the human prompt starts a new
+            # turn: the turn being ended is not the human's. Checked BEFORE the
+            # field exclusions because real wake records are isMeta too.
+            found = None
+            continue
+        if _record_fields_say_not_human(rec):
+            continue
+        found = i
+    return found
+
+
+def _reply_rendered(records: list, after: int) -> bool:
+    """True iff, after record index `after`, the LAST assistant record carries
+    non-empty text and no tool_use follows that text (an earlier tool_use is
+    fine: the text must be last)."""
+    last = None
+    for rec in records[after + 1:]:
+        if rec.get("type") == "assistant":
+            last = rec
+    if last is None:
+        return False
+    message = last.get("message")
+    content = message.get("content", []) if isinstance(message, dict) else []
+    if not isinstance(content, list):
+        return False
+    text_seen = False
+    for block in _walk_content_blocks(content):
+        btype = block.get("type")
+        if btype == "text":
+            body = block.get("text")
+            if isinstance(body, str) and body.strip():
+                text_seen = True
+        elif btype == "tool_use":
+            text_seen = False  # a tool call after the text: the text is not final
+    return text_seen
+
+
+def _delta_reply_state(delta_bytes: bytes) -> tuple[bool, bool]:
+    """(has_human_prompt, reply_rendered) for a turn delta. (False, False) when
+    the delta cannot be parsed strictly or holds no human prompt."""
+    records = _strict_records(delta_bytes)
+    if records is None:
+        return (False, False)
+    idx = _human_prompt_index(records)
+    if idx is None:
+        return (False, False)
+    return (True, _reply_rendered(records, idx))
+
+
+def _norm_ws(s: str) -> str:
+    return " ".join(s.split())
+
+
+def _payload_gate_facts(delta_bytes: bytes, payload_norm: str | None) -> tuple[bool, bool] | None:
+    """(payload_found_in_delta, delta_ends_on_tool_use) for the #4193 override, or
+    None when the delta cannot be read (the caller then keeps the block). Only the
+    FINAL MESSAGE counts (identified by message.id, see below); text of an earlier
+    message, before an intervening tool_result, is not the final message."""
+    records = _strict_records(delta_bytes)
+    if records is None:
+        return None
+    idx = _human_prompt_index(records)
+    if idx is None:
+        return None
+    # The final message = the assistant records after the prompt that share the LAST
+    # assistant record's message.id, wherever non-assistant records (tool_results of
+    # parallel calls) sit between them. No usable id: that record's adjacent run.
+    last = None
+    for i in range(len(records) - 1, idx, -1):
+        if records[i].get("type") == "assistant":
+            last = i
+            break
+    chosen = []
+    if last is not None:
+        msg = records[last].get("message")
+        mid = msg.get("id") if isinstance(msg, dict) else None
+        if isinstance(mid, str) and mid:
+            for rec in records[idx + 1:last + 1]:
+                m = rec.get("message")
+                if rec.get("type") == "assistant" and isinstance(m, dict) and m.get("id") == mid:
+                    chosen.append(rec)
+        else:
+            start = last
+            while start > idx + 1 and records[start - 1].get("type") == "assistant":
+                start -= 1
+            chosen = records[start:last + 1]
+    texts = []
+    last_type = None
+    for rec in chosen:
+        message = rec.get("message")
+        content = message.get("content", []) if isinstance(message, dict) else []
+        if not isinstance(content, list):
+            continue
+        for block in _walk_content_blocks(content):
+            last_type = block.get("type")
+            body = block.get("text")
+            if last_type == "text" and isinstance(body, str) and body.strip():
+                texts.append(_norm_ws(body))
+    # Feeds only the log line, never the decision.
+    ends_on_tool = last_type == "tool_use"
+    found = bool(payload_norm and texts
+                 and (payload_norm in _norm_ws(" ".join(texts)) or payload_norm.endswith(texts[-1])))
+    # Also found when P is text ALREADY flushed anywhere in this turn: an unflushed final
+    # reply appears nowhere in the delta, so such a P cannot be it (a "last text produced in
+    # the turn" reading of the field must not silence a swallowed reply).
+    if payload_norm and not found:
+        turn_texts = []
+        for rec in records[idx + 1:]:
+            m = rec.get("message")
+            c = m.get("content", []) if rec.get("type") == "assistant" and isinstance(m, dict) else []
+            if isinstance(c, list):
+                turn_texts.extend(_norm_ws(b["text"]) for b in _walk_content_blocks(c)
+                                  if b.get("type") == "text" and isinstance(b.get("text"), str)
+                                  and b["text"].strip())
+        found = payload_norm in _norm_ws(" ".join(turn_texts))
+    return (found, ends_on_tool)
+
+
+_REPLY_GATE_LOG = os.path.join(ENGRAM_HOME, "loop-arm-reply-gate.log")
+_REPLY_GATE_LOG_MAX_BYTES = 64 * 1024
+_REPLY_GATE_LOG_KEEP_LINES = 200
+
+
+def _reply_gate_fd(flags: int) -> int:
+    """A non-blocking fd on the log that must be a regular file (never hangs on a FIFO)."""
+    fd = os.open(_REPLY_GATE_LOG, flags | os.O_NONBLOCK, 0o666)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError("not a regular file: %s" % (_REPLY_GATE_LOG,))
+    return fd
+
+
+def _log_reply_gate(session_id: str, payload_len: int | None, facts: tuple[bool, bool] | None,
+                    decision: str) -> None:
+    """alpha #4193: one diagnostic line per reply-gate decision. Never logs payload
+    text; fail-silent (a logging error must never change the decision)."""
+    try:
+        found, ends_on_tool = facts if facts is not None else (False, False)
+        line = "%s session=%s payload_len=%s found=%s ends_tool_use=%s decision=%s\n" % (
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            re.sub(r"\s+", "_", session_id)[:80],
+            "absent" if payload_len is None else payload_len,
+            "y" if found else "n", "y" if ends_on_tool else "n", decision)
+        data = line.encode("utf-8")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        try:
+            if os.path.getsize(_REPLY_GATE_LOG) > _REPLY_GATE_LOG_MAX_BYTES:
+                fd = _reply_gate_fd(os.O_RDONLY)
+                with os.fdopen(fd, "rb") as f:
+                    kept = f.read().splitlines(keepends=True)[-_REPLY_GATE_LOG_KEEP_LINES:]
+                data = b"".join(kept) + data
+                flags = os.O_WRONLY | os.O_TRUNC
+        except OSError:
+            pass
+        fd = _reply_gate_fd(flags)
+        with os.fdopen(fd, "ab" if flags & os.O_APPEND else "wb") as f:
+            f.write(data)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _parse_iso_utc(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    v = value.strip()
+    if v.endswith(("Z", "z")):
+        v = v[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _now_utc() -> datetime:
+    """Current UTC time. ENGRAM_LOOP_ARM_NOW_ISO (ISO-8601) overrides it when
+    set: a TEST SEAM for the wake-pending cells, nothing else reads it."""
+    raw = os.environ.get("ENGRAM_LOOP_ARM_NOW_ISO")
+    if raw:
+        parsed = _parse_iso_utc(raw)
+        if parsed is not None:
+            return parsed
+    return datetime.now(timezone.utc)
+
+
+def _read_transcript_tail(transcript_path: str) -> bytes | None:
+    """At most the last 4 MiB of the file; when truncated, the first (possibly
+    partial) line is dropped. None when unreadable."""
+    try:
+        size = os.path.getsize(transcript_path)
+        # non-blocking, regular-file-only open (#3628); bytes via its .buffer
+        with open_regular_text(transcript_path) as tf:
+            f = tf.buffer
+            if size > _WAKE_PENDING_TAIL_BYTES:
+                f.seek(size - _WAKE_PENDING_TAIL_BYTES)
+                data = f.read(_WAKE_PENDING_TAIL_BYTES)
+                nl = data.find(b"\n")
+                return b"" if nl < 0 else data[nl + 1:]
+            return f.read()
+    except OSError:
+        return None
+
+
+def _loop_wake_arm_blocks(rec: dict) -> list:
+    """The loop-wake ScheduleWakeup tool_use blocks of one assistant record."""
+    if rec.get("type") != "assistant":
+        return []
+    message = rec.get("message")
+    content = message.get("content", []) if isinstance(message, dict) else []
+    if not isinstance(content, list):
+        return []
+    out = []
+    for block in _walk_content_blocks(content):
+        if block.get("type") == "tool_use" and block.get("name") in _WAKE_ARMING_TOOL_NAMES:
+            prompt = _tool_use_prompt_text(block)
+            if prompt and _LOOP_WAKE_MARKER in html.unescape(prompt):
+                out.append(block)
+    return out
+
+
+def _wake_pending(transcript_path: str, now: datetime) -> bool:
+    """True iff the LATEST assistant loop-wake ScheduleWakeup in the transcript
+    (tail-bounded) is due more than 90 s after `now` and no later user text
+    record carries the marker (a fired wake consumes it). A missing/invalid
+    timestamp or delaySeconds, an unreadable file, or no such arm -> False
+    (fail toward today's forced-arm behaviour)."""
+    if not transcript_path:
+        return False
+    data = _read_transcript_tail(transcript_path)
+    if not data:
+        return False
+    records, _parsed = _parse_jsonl_records(data)
+    arm_idx = None
+    for i, rec in enumerate(records):
+        if _loop_wake_arm_blocks(rec):
+            arm_idx = i
+    if arm_idx is None:
+        return False
+    arm = records[arm_idx]
+    armed_at = _parse_iso_utc(arm.get("timestamp"))
+    if armed_at is None:
+        return False
+    delay = None
+    for block in _loop_wake_arm_blocks(arm):
+        d = block["input"].get("delaySeconds")
+        if isinstance(d, (int, float)) and not isinstance(d, bool):
+            delay = d
+    if delay is None:
+        return False
+    for rec in records[arm_idx + 1:]:
+        text = _record_user_text(rec)
+        # Stop-hook feedback / compaction summaries quote the marker; they are
+        # not a fired wake (same exclusion as the human-prompt definition).
+        if text is None or text.lstrip().startswith(_NOT_A_TRIGGER_PREFIXES):
+            continue
+        if _LOOP_WAKE_MARKER in html.unescape(text):
+            return False
+    due = armed_at + timedelta(seconds=delay)
+    return (due - now).total_seconds() > _WAKE_PENDING_MIN_SECONDS
+
+
 def _read_quiet_ticks(transcript_path: str) -> int:
     """Stored count for THIS transcript; missing/corrupt/other-transcript -> 0."""
     try:
@@ -1089,8 +1603,26 @@ def _read_quiet_ticks(transcript_path: str) -> int:
     return 0
 
 
-def _write_quiet_ticks(transcript_path: str, ticks: int) -> None:
-    data = {"transcript_path": transcript_path, "quiet_ticks": ticks}
+def _read_waiting_on_block_rb(transcript_path: str) -> str | None:
+    """Return the return_by string for which the once-only study-unit block has
+    already fired, or None if it hasn't fired yet for this transcript."""
+    try:
+        with open_regular_text(_QUIET_WAKE_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("transcript_path") != transcript_path:
+            return None
+        rb = data.get("waiting_on_block_rb")
+        return rb if isinstance(rb, str) and not isinstance(rb, bool) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _write_quiet_ticks(
+    transcript_path: str, ticks: int, waiting_on_block_rb: str | None = None
+) -> None:
+    data: dict = {"transcript_path": transcript_path, "quiet_ticks": ticks}
+    if waiting_on_block_rb is not None:
+        data["waiting_on_block_rb"] = waiting_on_block_rb
     if _atomic_write_json is not None:
         _atomic_write_json(_QUIET_WAKE_STATE_FILE, data, encoding="utf-8")
         return
@@ -1108,21 +1640,100 @@ def _write_quiet_ticks(transcript_path: str, ticks: int) -> None:
         raise
 
 
-def _quiet_wake_step(transcript_path: str, can_nudge: bool) -> int | None:
-    """Classify this turn, update + persist the counter. Returns the tick count
-    the nudge should name when a quiet-wake nudge is due AND may be emitted
-    (`can_nudge`: the arm-check nudge is not itself firing this turn), else None.
-    On a due nudge the stored count resets to 0. Additive: never raises."""
+def _quiet_wake_step(
+    transcript_path: str, can_nudge: bool
+) -> tuple[str, bool] | None:
+    """Classify this turn, update + persist the counter.
+
+    Returns (reason, is_block) when a nudge is due AND can_nudge; else None.
+    is_block=True → emit decision:block; False → emit systemMessage only.
+
+    Waiting-on zones (threshold N = _WAITING_ON_NEAR_ZONE_MINUTES):
+    - No active waiting_on → demand (block=True).
+    - return_by within N → advisory systemMessage (block=False).
+    - return_by beyond N, once-only not yet fired → study-unit block (block=True),
+      records the fired flag alongside quiet_ticks.
+    - return_by beyond N, flag set → advisory systemMessage (block=False).
+    Counter increments and resets identically in all cases. Additive: never raises.
+    """
     try:
         delta = _read_turn_delta(transcript_path)
         if delta is None:
             return None  # unreadable: leave the counter alone
         ticks = _read_quiet_ticks(transcript_path) + 1 if _delta_is_quiet_wake(delta) else 0
         due = ticks >= QUIET_TICKS_THRESHOLD and can_nudge
-        _write_quiet_ticks(transcript_path, 0 if due else ticks)
-        return ticks if due else None
+        block_rb = _read_waiting_on_block_rb(transcript_path)
+        if not due:
+            _write_quiet_ticks(transcript_path, ticks, block_rb)
+            return None
+        wo = _read_waiting_on(LOOP_MARKER_PATH)
+        if wo is not None:
+            desc, rb_str = wo
+            rb = datetime.fromisoformat(rb_str.replace("Z", "+00:00"))
+            if rb.tzinfo is None:
+                rb = rb.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if rb - now <= timedelta(minutes=_WAITING_ON_NEAR_ZONE_MINUTES):
+                # Within N: quiet, advisory as systemMessage only
+                _write_quiet_ticks(transcript_path, 0, block_rb)
+                return _QUIET_ADVISORY_TEXT.format(n=ticks, desc=desc, rb_str=rb_str), False
+            # Beyond N: check once-only flag
+            if block_rb == rb_str:
+                # Already fired: advisory as systemMessage, preserve flag
+                _write_quiet_ticks(transcript_path, 0, rb_str)
+                return _QUIET_ADVISORY_TEXT.format(n=ticks, desc=desc, rb_str=rb_str), False
+            # First time beyond N: study-unit block, set flag
+            _write_quiet_ticks(transcript_path, 0, rb_str)
+            return _QUIET_STUDY_UNIT_TEXT.format(desc=desc, rb_str=rb_str), True
+        # No active waiting_on: normal demand, clear any stale flag
+        _write_quiet_ticks(transcript_path, 0)
+        return _QUIET_NUDGE_TEXT.format(n=ticks), True
     except Exception:  # noqa: BLE001
         return None
+
+
+def _emit_hook_fire(session_id: str, transcript_path: str, _t0: float) -> None:
+    """Emit the engram.hook.fire event (shared by the nudge and reply-gate paths)."""
+    _duration_ms = int((time.perf_counter() - _t0) * 1000)
+
+    # Emit engram.hook.fire event, matching the sibling Stop hooks'
+    # observability convention. Failure must not break the hook.
+    #
+    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
+    # its own try/except so an INIT_FAILED outcome is recordable and
+    # distinct from an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md
+    # §1/§5).
+    _emitter = None
+    try:
+        from engram_log_emitter import Emitter
+        _emitter = Emitter.init(
+            session_id=session_id,
+            transcript_path=transcript_path,
+        )
+    except Exception:
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "init_failed"},
+        )
+
+    if _emitter is not None:
+        _uid = _emitter.emit(
+            event_type="engram.hook.fire",
+            level=1,
+            data={
+                "hook_name": "engram-loop-arm-stop-hook",
+                "hook_type": "Stop",
+                "duration_ms": _duration_ms,
+                "exit_code": 0,
+            },
+            site="loop-arm-stop-hook.hook_fire",
+        )
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "delivered" if _uid is not None else "dropped"},
+        )
 
 
 def main() -> None:
@@ -1134,6 +1745,7 @@ def main() -> None:
 
     session_id = "unknown"
     transcript_path = ""
+    payload_text = None
     try:
         raw = sys.stdin.read()
         if raw:
@@ -1153,6 +1765,10 @@ def main() -> None:
             tp = payload.get("transcript_path")
             if isinstance(tp, str) and tp:
                 transcript_path = tp
+            # alpha #4193: usable only when a str with non-whitespace content.
+            lam = payload.get("last_assistant_message")
+            if isinstance(lam, str) and lam.strip():
+                payload_text = lam
     except Exception:
         return
 
@@ -1189,16 +1805,72 @@ def main() -> None:
     except Exception:  # noqa: BLE001
         confirmed = False  # fail-open: nudge fires
 
+    # alpha #4104: reply-delivery gate. Decided from the transcript delta only.
+    # A human prompt whose turn does not END on assistant text means the reply
+    # was swallowed (e.g. a trailing arm): block, ahead of the arm check.
+    has_human = reply_rendered = False
+    _delta = None
+    try:
+        _delta = _read_turn_delta(transcript_path)
+        if _delta is not None:
+            has_human, reply_rendered = _delta_reply_state(_delta)
+    except Exception:  # noqa: BLE001
+        has_human = reply_rendered = False
+
+    # alpha #4193: the transcript can lag the final record (flush lag). A payload
+    # `last_assistant_message` that is NOT in the delta means the text is not flushed
+    # yet: treat the reply as rendered. Found in the delta (swallowed) keeps the block.
+    if has_human and not reply_rendered:
+        _facts = None
+        _norm = _norm_ws(payload_text) if payload_text is not None else None
+        # _facts None is believed unreachable while has_human is true (_delta_reply_state parses
+        # the same bytes); kept as fail-keep-the-block.
+        try:
+            _facts = _payload_gate_facts(_delta, _norm) if _delta is not None else None
+        except Exception:  # noqa: BLE001
+            _facts = None
+        _override = _norm is not None and _facts is not None and not _facts[0]
+        _log_reply_gate(session_id, None if payload_text is None else len(payload_text), _facts,
+                        "override-rendered" if _override else "block")
+        if _override:
+            reply_rendered = True
+
+    if has_human and not reply_rendered:
+        _quiet_wake_step(transcript_path, can_nudge=False)  # keep the counter honest
+        print(json.dumps({"decision": "block", "reason": _REPLY_NOT_RENDERED_TEXT}))
+        if _STOPHOOKLIB_OK:
+            _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+        _emit_hook_fire(session_id, transcript_path, _t0)
+        return
+
+    # A human-answering turn whose reply rendered, with a wake still pending:
+    # the heartbeat is already covered, so no forced arm.
+    if has_human and not confirmed:
+        pending = False
+        try:
+            pending = _wake_pending(transcript_path, _now_utc())
+        except Exception:  # noqa: BLE001
+            pending = False
+        if pending:
+            _quiet_wake_step(transcript_path, can_nudge=False)
+            if _STOPHOOKLIB_OK:
+                _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+            return
+
     # alpha #3919 M2: runs BEFORE the confirmed-early-return (a quiet turn
     # normally DOES contain the re-arm) and BEFORE the offset write (it reads
     # the same delta). It never emits when the arm-check nudge is firing.
-    quiet_due = _quiet_wake_step(transcript_path, can_nudge=confirmed)
+    quiet_result = _quiet_wake_step(transcript_path, can_nudge=confirmed)
 
     if confirmed:
         if _STOPHOOKLIB_OK:
             _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
-        if quiet_due is not None:
-            print(json.dumps({"decision": "block", "reason": _QUIET_NUDGE_TEXT.format(n=quiet_due)}))
+        if quiet_result is not None:
+            reason, is_block = quiet_result
+            if is_block:
+                print(json.dumps({"decision": "block", "reason": reason}))
+            else:
+                print(json.dumps({"systemMessage": reason}))
         return
 
     # Single, lib-independent emission path (2026-08-12 blocking-decision
@@ -1207,53 +1879,13 @@ def main() -> None:
     # design fact 4); additionalContext alone is not even a documented
     # Stop-hook field. No fallback/primary split to keep in sync: this
     # print statement is the only emit channel, lib available or not.
-    print(json.dumps({"decision": "block", "reason": _NUDGE_TEXT}))
+    print(json.dumps({"decision": "block", "reason": _nudge_text_for_marker(LOOP_MARKER_PATH)}))
     if _STOPHOOKLIB_OK:
         _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
     # Lib unavailable -- no offset state to write without it, so skip that
     # bookkeeping (nothing else to do with it); the nudge above still fired.
 
-    _duration_ms = int((time.perf_counter() - _t0) * 1000)
-
-    # Emit engram.hook.fire event, matching the sibling Stop hooks'
-    # observability convention. Failure must not break the hook.
-    #
-    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
-    # its own try/except so an INIT_FAILED outcome is recordable and
-    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
-    # §1/§5).
-    _emitter = None
-    try:
-        from engram_log_emitter import Emitter
-        _emitter = Emitter.init(
-            session_id=session_id,
-            transcript_path=transcript_path,
-        )
-    except Exception:
-        write_telemetry_record(
-            manifest_id=_HOOK_FIRE_SITE,
-            event_type="engram.hook.fire",
-            fields={"outcome": "init_failed"},
-        )
-
-    if _emitter is not None:
-        _uid = _emitter.emit(
-            event_type="engram.hook.fire",
-            level=1,
-            data={
-                "hook_name": "engram-loop-arm-stop-hook",
-                "hook_type": "Stop",
-                "duration_ms": _duration_ms,
-                "exit_code": 0,
-            },
-            site="loop-arm-stop-hook.hook_fire",
-        )
-        write_telemetry_record(
-            manifest_id=_HOOK_FIRE_SITE,
-            event_type="engram.hook.fire",
-            fields={"outcome": "delivered" if _uid is not None else "dropped"},
-        )
-
+    _emit_hook_fire(session_id, transcript_path, _t0)
 
 if __name__ == "__main__":
     main()

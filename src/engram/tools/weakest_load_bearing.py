@@ -14,7 +14,9 @@ load(X)     number of DISTINCT, TRANSITIVE, CURRENT dependents of X.  D depends 
             each dependent once; cycles are guarded; a retracted or non-current
             node neither counts nor conducts.
 weakness(X) 1 - confidence, EXCEPT 1.0 when X is
-              contested  -- target of a ``contradicts`` edge from a current
+              contested  -- target of a ``contradicts`` or ``acknowledged_contradicts``
+                            (#4075: the edge to a superseded side's live successor)
+                            edge from a current
                             contradiction node whose status is still unsettled
                             (``engram_core.UNSETTLED_CONTRADICTION_STATUSES``:
                             'active' or 'partially_resolved'; 'resolved' is
@@ -108,7 +110,8 @@ _PREMISE_EDGES_SQL = (
 )
 _CONTESTED_SQL = (
     "SELECT DISTINCT e.target_id FROM edges e JOIN nodes ct ON ct.id = e.source_id "
-    "WHERE e.relation = 'contradicts' AND ct.type = 'contradiction' AND ct.is_current = 1 "
+    "WHERE e.relation IN ('contradicts', 'acknowledged_contradicts') "
+    "AND ct.type = 'contradiction' AND ct.is_current = 1 "
     "AND ct.status IN (SELECT value FROM json_each(?))"
 )
 _PENDING_MARKERS_SQL = (

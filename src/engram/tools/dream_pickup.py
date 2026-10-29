@@ -32,6 +32,15 @@ import stat
 import sys
 import tempfile
 import time
+from pathlib import Path
+
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). `tools` is found one directory above
+# this file in BOTH layouts (src/engram/ and the deployed plugin root). Appended, not inserted: an in-process load
+# (a test) must not leave src/engram at sys.path[0] (#4029).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
 
 _HEADING_RE = re.compile(r"^##\s+(.*?)\s*$")
 _NUMBERED_RE = re.compile(r"^(\d+)\.\s+(.*)$")
@@ -91,6 +100,48 @@ def _scan(lines: list):
     if pickup_at is not None and pickup_end is None:
         pickup_end = len(lines)
     return seen_awake, numbers, pickup_at, pickup_end
+
+
+def read_pickup_dispositions(text: str) -> dict:
+    """Return {N: ("picked_up", line) | ("skipped", reason)} for every pN. line
+    in the LAST ``## Morning pickup`` section after ``## For the awake seat``.
+    Returns {} when no such section exists or no pN. lines are found.
+    Lines inside fenced blocks are quoted text and are not pickup entries.
+    Only fully-formed lines are recognised: ``picked up`` requires non-empty
+    text after the verb; ``skipped`` requires a non-empty reason.  Unrecognised
+    lines are silently ignored (never hide an item)."""
+    lines = text.splitlines(keepends=True)
+    _, _numbers, pickup_at, pickup_end = _scan(lines)
+    if pickup_at is None:
+        return {}
+    result = {}
+    in_fence = False
+    for raw in lines[pickup_at + 1 : pickup_end]:
+        line = raw.rstrip("\r\n")
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _PICKUP_LINE_RE.match(raw)
+        if not m:
+            continue
+        n = int(m.group(1))
+        rest = raw[m.end():].strip()
+        if rest.lower().startswith("picked up"):
+            after = rest[len("picked up"):].strip()
+            if not after:  # nothing recorded after the verb — not a valid line
+                continue
+            result[n] = ("picked_up", rest)
+        elif rest.lower().startswith("skipped"):
+            # format: "skipped (reason)" or "skipped reason"
+            reason_m = re.match(r"skipped\s*\(([^)]+)\)", rest, re.IGNORECASE)
+            reason = reason_m.group(1) if reason_m else rest[len("skipped"):].strip().lstrip("(").rstrip(")")
+            if not reason:  # empty or missing reason — not a valid line
+                continue
+            result[n] = ("skipped", reason)
+        # else: unrecognised format — ignored, never hides an item
+    return result
 
 
 def _apply(text: str, n: int, new_line: str) -> str:
@@ -232,7 +283,10 @@ def main(argv=None) -> int:
         if args.record:
             path = args.record
         else:
-            home = args.home or os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
+            try:
+                home = args.home or str(owner_read.engram_home())  # --home stays raw and explicit; the env goes through the resolver
+            except ValueError as exc:  # a relative ENGRAM_HOME: refused, nothing read or written
+                raise Refusal(str(exc))
             path = _latest(home)
         if not os.path.isfile(path):
             raise Refusal(f"not a record file: {path}")

@@ -16,6 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+# src/engram (or the plugin root) holds the `tools` package. telegram_bot.py imports this module flat
+# (`from _common import ...`, only its own directory on sys.path), so the package root is added here.
+_ENGRAM_DIR = str(Path(__file__).resolve().parent.parent)
+if _ENGRAM_DIR not in sys.path:
+    sys.path.append(_ENGRAM_DIR)
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863 step 3d).
+from tools import _owner_read as owner_read  # noqa: E402
+
 
 def env(key: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
     """Read env var with optional default + required-check."""
@@ -27,7 +35,8 @@ def env(key: str, default: Optional[str] = None, required: bool = False) -> Opti
 
 
 def engram_home() -> Path:
-    return Path(env("ENGRAM_HOME", required=True)).expanduser()
+    """The shared resolver: unset/empty -> the default home, `~` expanded, a relative value refused (ValueError)."""
+    return owner_read.engram_home()
 
 
 def channel_dir() -> Path:

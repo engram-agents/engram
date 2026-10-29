@@ -481,12 +481,24 @@ def _update_person_impl(
 
         # Persist metadata update (no new node, same node_id). No column-sync
         # branch for trust_tier — it can never appear in `updates` here.
-        update_sql = "UPDATE nodes SET metadata = ?"
-        update_params: list = [json.dumps(meta)]
-
-        update_sql += " WHERE id = ?"
-        update_params.append(node_id.strip())
-        conn.execute(update_sql, update_params)
+        #
+        # #4178: guarded write. No write transaction was open at the read
+        # above (sqlite3 opens one at the first DML, which is this UPDATE), so
+        # another writer could have changed the node since. `metadata IS ?` is
+        # bound to the RAW column value read, not a re-serialized dict; if the
+        # node is no longer exactly what was read (or is no longer current),
+        # refuse rather than overwrite. Runs before _log_edit and the cascade,
+        # so a refusal leaves nothing behind. No `status` clause, on purpose:
+        # every retract path sets is_current = 0 together with status =
+        # 'retracted' (and rewrites metadata), so is_current = 1 already
+        # excludes a retracted person.
+        _guarded = conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ? "
+            "AND is_current = 1 AND metadata IS ?",
+            (json.dumps(meta), node_id.strip(), row["metadata"]),
+        )
+        if _guarded.rowcount != 1:
+            return core.changed_concurrently_refusal(conn, "Node", node_id.strip())
 
         core._log_edit(conn, "person_field_updated", node_id.strip(), "person", {
             "updated_fields": updated_fields,
@@ -494,6 +506,11 @@ def _update_person_impl(
         })
 
         # Emit field-value-changed cascade flags to all nodes that cite this person.
+        # #4178: the citing-node read-then-write below is EXEMPT from the
+        # guard only because the guarded UPDATE above opened this
+        # connection's write transaction and nothing commits before the
+        # loop; do not move a commit above it, and do not copy this
+        # unguarded shape to a site without an open write transaction.
         # Coarse-emit: node-scoped — any node with a cites, about, or
         # derives_from edge to this person gets flagged. Carries field +
         # prior_value in each flag entry. The review_required/dismissible
@@ -669,10 +686,15 @@ def _add_special_moment_impl(
         moments.append(new_entry)
         meta["special_moments"] = moments
 
-        conn.execute(
-            "UPDATE nodes SET metadata = ? WHERE id = ?",
-            (json.dumps(meta), person_id.strip()),
+        # #4178: guarded write (same reasoning as engram_update_person: no
+        # transaction was open at the read; bind the RAW value read).
+        _guarded = conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ? "
+            "AND is_current = 1 AND metadata IS ?",
+            (json.dumps(meta), person_id.strip(), pn_row["metadata"]),
         )
+        if _guarded.rowcount != 1:
+            return core.changed_concurrently_refusal(conn, "Node", person_id.strip())
         core._log_edit(conn, "special_moment_added", person_id.strip(), "person", {
             "anchor_node_id": node_id.strip(),
         })
@@ -789,6 +811,25 @@ def _backfill_special_moment_about_edges(conn: sqlite3.Connection) -> int:
 # Person lineage impl
 # ---------------------------------------------------------------------------
 
+# #3922: the supported non-Claude model list.  Exact id -> (provider, family,
+# version).  This table IS the supported-model list: to support another model,
+# add one row with its exact id (no prefix or regex rule exists or may be added)
+# and its provider/family/version.  Adding a row is a reviewed change: it lets
+# a seat running that model sign as ``provider:family`` (engram_sign).
+# The three deepseek rows were added for the DeepSeek seat (part of #3976), not
+# as a rule: they are the ids measured across 56 of that seat's transcripts
+# (attachment ids ``deepseek-flash[1m]`` and ``deepseek-v4.1-flash:cloud[1m]``,
+# assistant ids ``deepseek-flash`` and ``deepseek-v4.1-flash``; the ``[1m]``
+# suffix is stripped before lookup).  ``deepseek-flash`` carries no version
+# component, so its version is "" -- never a guessed value.
+_NON_CLAUDE_MODEL_TABLE: dict[str, tuple[str, str, str]] = {
+    "gpt-6.1-sol": ("openai", "gpt", "6.1"),
+    "deepseek-flash": ("deepseek", "flash", ""),
+    "deepseek-v4.1-flash": ("deepseek", "flash", "4.1"),
+    "deepseek-v4.1-flash:cloud": ("deepseek", "flash", "4.1"),
+}
+
+
 def _parse_model_id(model_id: str) -> dict:
     """Parse a model ID string into provider, family, and version.
 
@@ -796,6 +837,9 @@ def _parse_model_id(model_id: str) -> dict:
       "claude-sonnet-4-6"      → provider=anthropic, family=claude-sonnet, version=4.6
       "claude-opus-4-8"        → provider=anthropic, family=claude-opus,   version=4.8
       "claude-haiku-4-5-20251001" → provider=anthropic, family=claude-haiku, version=4.5
+
+    Ids listed in ``_NON_CLAUDE_MODEL_TABLE`` (exact match) return the table's
+    provider/family/version, e.g. "gpt-6.1-sol" → openai / gpt / 6.1.
 
     For unrecognised formats, provider and version are empty; family=model_id.
 
@@ -805,6 +849,10 @@ def _parse_model_id(model_id: str) -> dict:
     Only pass IDs that match the {family}-{major}-{minor} scheme.
     """
     mid = model_id.strip()
+    entry = _NON_CLAUDE_MODEL_TABLE.get(mid)
+    if entry is not None:
+        provider, family, version = entry
+        return {"provider": provider, "family": family, "version": version}
     if not mid.startswith("claude-"):
         return {"provider": "", "family": mid, "version": ""}
 
@@ -878,10 +926,15 @@ def _set_person_lineage_impl(target_pn: str = "", model_id: str = "") -> str:
         meta["model_family"] = parsed["family"]
         meta["model_version"] = parsed["version"]
 
-        conn.execute(
-            "UPDATE nodes SET metadata=? WHERE id=?",
-            (json.dumps(meta), row["id"]),
+        # #4178: guarded write (no transaction was open at either read form
+        # above; bind the RAW value read).
+        _guarded = conn.execute(
+            "UPDATE nodes SET metadata=? WHERE id=? "
+            "AND is_current=1 AND metadata IS ?",
+            (json.dumps(meta), row["id"], row["metadata"]),
         )
+        if _guarded.rowcount != 1:
+            return core.changed_concurrently_refusal(conn, "Node", row["id"])
         conn.commit()
 
         return json.dumps({

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a synthetic-but-realistic MCP replay trace from a target ENGRAM graph.
 
-Part of the replay-bench harness (blueprint §6, docs/perf/optimization-blueprint.md,
+Part of the replay-bench harness (blueprint §6, docs/internal/perf/optimization-blueprint.md,
 umbrella #1668). Produces a JSONL trace of `{"tool_name": ..., "params": {...},
 "ts": ...}` calls that `replay_bench.py` replays against a sandboxed copy of the
 same graph.
@@ -22,7 +22,7 @@ trace. Real node IDs are structural identifiers (safe to reuse); real claim/quot
 text is never touched. Only `id` and `type` are selected from the `nodes` table.
 
 v1 tool scope (READ_TOOLS below) is deliberately read-only — see
-docs/perf/optimization-blueprint.md §1: reads are ~10x the cost of writes in the
+docs/internal/perf/optimization-blueprint.md §1: reads are ~10x the cost of writes in the
 current telemetry, so that's where today's perf story lives. Write-tool payload
 synthesis (engram_add_observation, engram_derive, ...) is out of scope for v1 —
 fabricating a realistic claim/quote is a different, harder problem.
@@ -34,6 +34,13 @@ import random
 import sqlite3
 import sys
 from pathlib import Path
+
+# The store-path classifier (#3962). Repo-root tools/_owner_read.py is a symlink into src/engram/tools/; the repo
+# root (two parents up from tools/perf/) is appended, never inserted at 0 (#2565).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
+from tools import _owner_read as owner_read  # noqa: E402
 
 # The read-heavy tools that are both the actual perf story (per the blueprint's
 # telemetry table) and have an honest, content-anonymized synthesis path.
@@ -86,9 +93,13 @@ def _load_call_mix(db_path: Path, tools=READ_TOOLS) -> list[str]:
     by (timestamp, id) to approximate the real call sequence.
 
     Returns [] if knowledge.db, the tool_timing table, or any matching rows
-    are missing — the caller falls back to a uniform distribution.
+    are missing — the caller falls back to a uniform distribution.  A store
+    that exists but is unusable (FIFO, directory, loop, unsearchable parent)
+    is NOT missing: owner_read.StoreUnusable propagates (#3962).
     """
-    if not db_path.exists():
+    try:
+        owner_read.check_store_path(db_path)
+    except FileNotFoundError:
         return []
     conn = _connect_ro(db_path)
     try:
@@ -110,9 +121,12 @@ def _sample_node_ids(db_path: Path, limit: int = 2000) -> tuple[list[str], list[
 
     Only `id` and `type` columns are read — never claim/quoted_text/interpretation
     (content-anonymization requirement). Returns ([], []) if knowledge.db or the
-    nodes table is missing.
+    nodes table is missing.  An unusable store raises owner_read.StoreUnusable
+    (#3962), never the empty answer.
     """
-    if not db_path.exists():
+    try:
+        owner_read.check_store_path(db_path)
+    except FileNotFoundError:
         return [], []
     conn = _connect_ro(db_path)
     try:
@@ -238,7 +252,12 @@ def main(argv=None) -> None:
                          help="Optional RNG seed for reproducible synthesis.")
     args = parser.parse_args(argv)
 
-    n = generate_trace(args.data_dir, args.out, n_calls=args.n_calls, seed=args.seed)
+    try:
+        n = generate_trace(args.data_dir, args.out, n_calls=args.n_calls, seed=args.seed)
+    except owner_read.StoreUnusable as exc:
+        # An unusable store must not look like an empty one: no trace is written (#3960 rule).
+        print(f"[trace_from_telemetry] {exc}", file=sys.stderr)
+        raise SystemExit(1)
     print(f"[trace_from_telemetry] Wrote {n} calls to {args.out}", file=sys.stderr)
 
 

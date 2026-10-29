@@ -1,7 +1,7 @@
 """engram_telemetry_verdicts.py — §1 VERDICTS block, the READ side (issue
 #3136, epic #2574 WS7).
 
-Design doc: docs/2574-telemetry-design.md §1 (the "THE PARTICIPATION
+Design doc: docs/internal/2574-telemetry-design.md §1 (the "THE PARTICIPATION
 DEFINITION" block). Per issue #3136: "The spec is §1 itself. Implement the
 VERDICTS block as written and do not paraphrase it here or in code comments.
 Quote its conditions or cite the section." `_VERDICT_CONDITIONS` below quotes
@@ -58,6 +58,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import engram_home_resolver
+from engram_regular_io import check_store_path
 from engram_telemetry_store import open_store
 
 __all__ = ["compute_verdicts", "brute_force_verdicts", "summary_line"]
@@ -69,7 +71,7 @@ _WINDOW_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # ---------------------------------------------------------------------------
 # §1 VERDICTS -- quoted condition-for-condition from
-# docs/2574-telemetry-design.md §1's own predicate block (the "after round
+# docs/internal/2574-telemetry-design.md §1's own predicate block (the "after round
 # 10" version, brute-force-verified there: unmatched=0, multi-match=0 over
 # {0,1,2}^5). Do not paraphrase; if that block ever changes, update the
 # conditions below to match it line-for-line and re-run
@@ -133,14 +135,14 @@ def _classify(R: int, D: int, X: int, N: int, I: int, thr: float) -> str:
         shape = "unmatched" if not matches else f"multi-matched {matches}"
         raise ValueError(
             f"§1 VERDICTS table {shape} for (R={R}, D={D}, X={X}, N={N}, I={I}, thr={thr}) "
-            f"-- see docs/2574-telemetry-design.md §1's own brute-force block and "
+            f"-- see docs/internal/2574-telemetry-design.md §1's own brute-force block and "
             f"this module's `brute_force_verdicts`"
         )
     return matches[0]
 
 
 def brute_force_verdicts(thr: float, domain=(0, 1, 2), conditions=None) -> dict:
-    """§12's brute-force control (docs/2574-telemetry-design.md §1's own
+    """§12's brute-force control (docs/internal/2574-telemetry-design.md §1's own
     "THIS LIST IS NOT REVIEWED AS PROSE ANY MORE" block), reusable rather
     than a one-off script: range every (R,D,X,N,I) over `domain`^5 (243
     states for the doc's own {0,1,2} domain) and report `unmatched` (zero
@@ -552,6 +554,12 @@ _SUMMARY_NAMED_VERDICTS: list[str] = [
 ]
 
 _SUMMARY_NOT_AGGREGATED_MISSING = "telemetry: not aggregated (records.db missing)"
+_SUMMARY_NOT_AGGREGATED_NO_VERDICTS_TABLE = (
+    "telemetry: not aggregated (verdicts table absent)"
+)
+_SUMMARY_NOT_AGGREGATED_NO_VERDICTS = (
+    "telemetry: not aggregated (verdicts table empty)"
+)
 _SUMMARY_NOT_AGGREGATED_NO_INGEST_TIMESTAMP = (
     "telemetry: not aggregated (ingest timestamp unavailable)"
 )
@@ -605,7 +613,11 @@ def summary_line(db_path, window: Optional[str] = None) -> str:
     of zero counts.
 
     Never writes anything; always closes the connection it opens
-    (try/finally). May raise (a malformed `window`, or an unexpected sqlite
+    (try/finally). A path that is not a usable store (#3962: unsearchable,
+    a symlink loop, a dangling link, a FIFO, a directory) raises the
+    classifier's `StoreUnusable` rather than reading "not aggregated"; a
+    plainly missing path still reads "not aggregated". May raise (a malformed
+    `window`, or an unexpected sqlite
     error) -- callers that need a never-raises guarantee wrap the call
     themselves (see engram_stats.py's `_diagnose_impl`, which converts any
     exception here into a `"telemetry: unavailable (...)"` string).
@@ -613,12 +625,17 @@ def summary_line(db_path, window: Optional[str] = None) -> str:
     conn: Optional[sqlite3.Connection] = None
     try:
         try:
+            check_store_path(db_path)
+        except FileNotFoundError:
+            pass  # a missing store falls through to the connect below: it stays "not aggregated"
+        # (a StoreUnusable propagates: an unusable path is "unavailable" to the caller, not "not aggregated")
+        try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         except sqlite3.OperationalError:
             return _SUMMARY_NOT_AGGREGATED_MISSING
 
         if not _summary_table_exists(conn, "verdicts"):
-            return _SUMMARY_NOT_AGGREGATED_MISSING
+            return _SUMMARY_NOT_AGGREGATED_NO_VERDICTS_TABLE
 
         if window is not None:
             _validate_window(window)  # ValueError propagates -- caller bug
@@ -627,9 +644,8 @@ def summary_line(db_path, window: Optional[str] = None) -> str:
             row = conn.execute("SELECT MAX(window) FROM verdicts").fetchone()
             resolved_window = row[0] if row else None
             if resolved_window is None:
-                # Table exists but carries zero rows at all -- fresh/empty
-                # store, same as "nothing has aggregated yet".
-                return _SUMMARY_NOT_AGGREGATED_MISSING
+                # Table exists but carries zero rows at all -- fresh/empty store.
+                return _SUMMARY_NOT_AGGREGATED_NO_VERDICTS
 
         last_ingest_raw: Optional[str] = None
         if _summary_table_exists(conn, "ingest_offsets"):
@@ -709,7 +725,9 @@ def _default_data_dir() -> Path:
     ENGRAM_HOME directly, no engram_core import (this module stays outside
     the #2652 one-owner boundary telemetry is a stated exception to, same as
     its sibling store module)."""
-    return Path(os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram"))
+    # #3863 step 2: reached from the MCP server (engram_stats), so it is an entry point: a RELATIVE ENGRAM_HOME
+    # raises ValueError (the rulings: engram_home_resolver's docstring).
+    return engram_home_resolver.engram_home()
 
 
 def _default_db_path() -> Path:

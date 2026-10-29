@@ -97,11 +97,13 @@ def forum_url_from_config(config: Dict[str, Any]) -> str:
     single definition that the module imports will replace both once the thick
     CLIs flip thin.
     """
-    return (
-        (config.get("forum") or {}).get("url")
-        or os.environ.get("FORUM_URL")
-        or "http://localhost:5002"
-    )
+    forum = config.get("forum")
+    url = forum.get("url") if isinstance(forum, dict) else None
+    # #4203: config.json is hand-edited; a non-dict ``forum`` or a non-string /
+    # blank ``url`` is treated as absent, never raised on.
+    if isinstance(url, str) and url.strip():
+        return url
+    return os.environ.get("FORUM_URL") or "http://localhost:5002"
 
 
 # ---------------------------------------------------------------------------

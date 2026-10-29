@@ -88,6 +88,13 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **status-candidate**: PROD-PRESUMED (wave-3 migration, less frequently called than singleton)
 - **tests**: test_cascade_semantics.py
 
+**2a. engram_requote** — Fix one observation's quote in place, against the same evidence only (never switches evidence).
+- **contract**: `{node_id, new_quoted_text, reason}`; all required, no other field (`evidence_id` is refused)
+- **guards**: current observation; evidence re-read at the version the node cited (git revision, content_hash, timestamp-bounded transcript, hash-named archive); verbatim + length floor; EXPAND or SWITCH chosen by the tool; quote-claim similarity may not fall. Refusals are `{error, refusal}` and change nothing. The write is guarded: if the node changes during the call, `changed_concurrently`. The git revision is read from the evidence file's own repo, so a node cited with `source_repo`/`repo_path` (a file outside the repo holding the sha) cannot be requoted.
+- **readOnlyHint**: False
+- **status-candidate**: new (#4135)
+- **tests**: test_requote_4135.py
+
 ### Structural Node Types (Claim-Bearing)
 
 **3. engram_add_axiom** — Foundational design commitment.

@@ -82,10 +82,14 @@ plugin marker as if it were live code provenance.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:  # flat runtime module: installed plugin / src/engram on sys.path (the sqlite_ro.py pair; #3863 step 3c-i)
+    from engram_home_resolver import engram_home_or_none
+except ImportError:  # source checkout with only `src` on PYTHONPATH: same file, package-qualified
+    from engram.engram_home_resolver import engram_home_or_none
 
 # Short timeout -- this runs once at startup, but must never hang a server
 # boot on a wedged git subprocess (e.g. an unreachable network filesystem).
@@ -393,10 +397,13 @@ def read_deployed_version(engram_home: "str | Path | None" = None) -> dict[str, 
     both ``footer.py`` and ``server.py``'s ``/api/version`` startup capture
     share one reader instead of two independent copies.
     """
-    home = (
-        Path(engram_home) if engram_home is not None
-        else Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
-    )
+    if engram_home is not None:
+        home = Path(engram_home)
+    else:
+        resolved = engram_home_or_none()  # #3863 step 3c-i: a refused (relative) value -> {}
+        if resolved is None:
+            return {}
+        home = resolved
     path = home / ".deployed-version"
     out: dict[str, str] = {}
     try:

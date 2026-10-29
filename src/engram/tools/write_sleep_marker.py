@@ -24,6 +24,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). `tools` is found one directory above
+# this file in BOTH layouts (src/engram/ and the deployed plugin root). Appended, not inserted: an in-process load
+# (a test) must not leave src/engram at sys.path[0] (#4029).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
 
 def main() -> int:
     if len(sys.argv) != 4:
@@ -43,7 +51,11 @@ def main() -> int:
     # Path(__file__).resolve() would follow symlinks (tools/ is a symlink in
     # plugin topology) and land in the plugin root, not the data home. ENGRAM_HOME
     # env override remains for sandbox / multi-agent testing.
-    engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+    try:
+        engram_home = str(owner_read.engram_home())
+    except ValueError as exc:  # a RELATIVE ENGRAM_HOME: refused before anything is created
+        print(f"write_sleep_marker: {exc}", file=sys.stderr)
+        return 2
     sessions_dir = os.path.join(engram_home, "sessions")
     marker_path = os.path.join(sessions_dir, "last-sleep-success.json")
 

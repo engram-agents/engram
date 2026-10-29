@@ -44,7 +44,7 @@ from engram_log_emitter import Emitter, emit_if_initialized
 # Essential-only build (tests/test_tiers_manifest.py's
 # test_import_dep_tier_consistency enforces exactly this). Guarded import +
 # no-op stub keeps this module's own tool functions gating-nothing-T1
-# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+# (docs/internal/2574-telemetry-design.md §8) even if the store ships without it.
 try:
     from engram_telemetry_store import write_telemetry_record
 except Exception:  # pragma: no cover -- import-failure fallback
@@ -76,6 +76,8 @@ _LOGICAL_SUBSTRATE_RELATIONS = frozenset({
                      # logical/epistemic weight, so classified alongside it.
     "supersedes",
     "contradicts",
+    "acknowledged_contradicts",  # #4075: a contradiction's side edge to a superseded
+                     # side's live successor — same weight as `contradicts`.
     "resolves",
     "retracts",
     "exemplifies",
@@ -181,6 +183,42 @@ def _pattern_telemetry_log(pattern_name: str, preset: str,
         pass
 
 
+_ACK_TARGETS_SQL = (
+    "SELECT target_id FROM edges WHERE source_id = ? "
+    "AND relation = 'acknowledged_contradicts' ORDER BY target_id"
+)
+_NODE_IS_CURRENT_SQL = "SELECT is_current FROM nodes WHERE id = ?"
+_ACK_CHAIN_HOP_CAP = 64
+
+
+def _side_stands_in_by_acknowledgement(conn, ct_id: str, side_id: str) -> bool:
+    """True when `ct_id` has an `acknowledged_contradicts` edge to a CURRENT node that revises
+    `side_id`: `side_id` is reached from that node down `supersedes` / `retracts` edges
+    (`new --supersedes--> old`, `replacement --retracts--> old`), any number of hops. The walk
+    reads the chain through `core.dag_edge_set` (provenance-inclusive: the chain IS the
+    subject), with a visited set and a hop cap."""
+    for (target,) in conn.execute(_ACK_TARGETS_SQL, (ct_id,)).fetchall():
+        live = conn.execute(_NODE_IS_CURRENT_SQL, (target,)).fetchone()
+        if live is None or live[0] != 1:
+            continue
+        seen, frontier = {target}, [target]
+        for _ in range(_ACK_CHAIN_HOP_CAP):
+            nxt = []
+            for cur in frontier:
+                for _src, old, _rel in core.dag_edge_set(
+                    conn, ("supersedes", "retracts"), live_only=False, source_id=cur
+                ):
+                    if old == side_id:
+                        return True
+                    if old not in seen:
+                        seen.add(old)
+                        nxt.append(old)
+            if not nxt:
+                break
+            frontier = nxt
+    return False
+
+
 def _pattern_contradiction_obsolescence_ready(
     conn, preset_params: dict, **_filters
 ) -> list[dict]:
@@ -233,8 +271,12 @@ def _pattern_contradiction_obsolescence_ready(
         if not side_a or not side_b:
             continue
 
-        a_obsolete = side_a[2] == 0
-        b_obsolete = side_b[2] == 0
+        # #4075: a side superseded (or retracted with a replacement) and then ACKNOWLEDGED has its
+        # live successor recorded as `ct --acknowledged_contradicts--> successor`. That successor
+        # stands in for the side, so the side is not obsolete for this scan: the contradiction is
+        # not "ripe for resolution by obsolescence", it is a live disagreement again.
+        a_obsolete = side_a[2] == 0 and not _side_stands_in_by_acknowledgement(conn, ct_id, side_a_id)
+        b_obsolete = side_b[2] == 0 and not _side_stands_in_by_acknowledgement(conn, ct_id, side_b_id)
         if a_obsolete and not b_obsolete:
             score = 1.0
             obsolete_side, surviving_side = "a", "b"
@@ -1076,7 +1118,7 @@ def _build_inspect_recall_view(
         # exact inversion of the direction this PR's own commit asserts.
     })
     _LATERAL_RELATIONS = frozenset({
-        "contradicts", "tensions", "exemplifies", "retracts"
+        "contradicts", "acknowledged_contradicts", "tensions", "exemplifies", "retracts"
     })
 
     for nb in logical:
@@ -1174,6 +1216,10 @@ def _build_inspect_recall_view(
     # (false) leaves no key.
     if _meta.get("support_lost"):
         node_recall["support_lost"] = True
+    # quote_history: written by engram_requote (#4135); a quote was changed in
+    # place, so recall must show what it was. Only when non-empty.
+    if _meta.get("quote_history"):
+        node_recall["quote_history"] = _meta["quote_history"]
     if node.get("type") == "derivation" and "warrant" in _meta and _meta["warrant"]:
         node_recall["warrant"] = _meta["warrant"]
     if node.get("type") == "person":
@@ -2077,7 +2123,7 @@ def _search_nodes(
 # and server.py's own comment on the emitter states the MCP server process
 # has no single session_id binding) — the DEFAULT_SUPPRESSION_K/M scoped
 # per-session ledger the general per-node suppression already uses (see
-# docs/recall-triggering-blueprint.md §3-P1) cannot be reused verbatim for
+# docs/internal/recall-triggering-blueprint.md §3-P1) cannot be reused verbatim for
 # these two surfaces, so a dedicated non-session-scoped bucket key is used
 # instead, deliberately shared across ALL sessions/surfaces rather than
 # keyed per-session.
@@ -3011,7 +3057,7 @@ def _query_impl(
         # source_class_filter is not a parameter of engram_query (only type
         # filter exists); emitted as None. Noted in phase-3 F1 handoff.
         # alpha #2574 WS5: site attestation + outcome recording +
-        # protection (docs/2574-telemetry-design.md §1/§4/§5) -- new,
+        # protection (docs/internal/2574-telemetry-design.md §1/§4/§5) -- new,
         # narrowly-scoped try/except; see engram_derive.py's _derive_impl
         # blocked-path site for the full rationale. This function's own
         # try/finally has no except, so an uncaught raise here would

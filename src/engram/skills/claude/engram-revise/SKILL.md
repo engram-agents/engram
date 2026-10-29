@@ -132,12 +132,12 @@ user before acting.
 
 A retract or supersede taints/stales downstream dependents. Clearing that is a
 **separate** workflow with one entry point — the full procedure, the three
-adjudication shapes, and worked examples are the single source of truth in
+adjudication shapes (plus a fourth, `resolved`, for contradictions only), and worked examples are the single source of truth in
 **[engram-resolve-cascade](../engram-resolve-cascade/SKILL.md)**. In one line:
 
 > **Read the frontier (`engram_cascade_frontier`), then adjudicate each
 > eligible node with `engram_cascade_resolve` — retracted, superseded, or
-> acknowledged.**
+> acknowledged (or `resolved`, on a contradiction only).**
 
 ⛔ **Never clear a marker by surgery.** Do not edit a marked node in place, and
 do not use `tools/surgical.py` or raw `knowledge.db` edits to delete a

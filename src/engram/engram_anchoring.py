@@ -179,6 +179,11 @@ def anchor(claim: str, quoted_text: str) -> AnchoringResult:
     )
 
 
+# Below this quote-claim cosine similarity the write-time anchoring advisory
+# adds `low_similarity_hint` (#4050 part a). Advisory only; one spelling.
+LOW_QUOTE_CLAIM_SIMILARITY = 0.2
+
+
 def quote_claim_similarity(quoted_text: str, claim: str) -> "tuple[Optional[float], Optional[str]]":
     """cosine(embed(quoted_text), embed(claim)) via the server's own
     embedder + config (engram-alpha#2602 facet 2). Returns (similarity,

@@ -36,17 +36,33 @@ and matches the tool surface other agents (e.g., Mneme) will use.
 
 import argparse
 import collections
+import contextlib
 import datetime
 import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # engram-alpha/
+
+
+def _load_owner_read():
+    """The shared store-path classifier, imported where it is used (scope-export, render) and not at module
+    top, so a foreign `tools` package earlier on sys.path cannot break the other subcommands at startup.
+    append (not insert(0)) -- #2565: REPO_ROOT at sys.path POSITION 0 would outrank the repo-root tools/ package."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.append(str(REPO_ROOT))
+    from tools import _owner_read
+    return _owner_read
+
 
 # Canonical ENGRAM node types — kept here as a static list (mirrors the server's
 # type vocabulary). Used as argparse `choices` for --node-type so a typo errors
@@ -1063,6 +1079,102 @@ def _populate_package_db(pkg_db_path: Path, nodes: dict, edges: list[dict]) -> N
     conn.close()
 
 
+# --- owner snapshot (#2652 tools-9) -------------------------------------------------------------------
+# Behind `engramd.scope_export_reads_via_owner` (default OFF) scope-export never opens the live store: it asks
+# the engramd owner for ONE quiesced copy and runs the closure on that. One snapshot (not owner read
+# templates): the closure uses sqlite3.Row, its SELECTs are not registered templates, the BFS makes one call
+# per node, and successive owner reads share no point in time.
+OWNER_FLAG_KEY = "scope_export_reads_via_owner"
+# The temp dir lives in ENGRAM_HOME: --out becomes a package that may be shared, and a full store copy must
+# never sit inside it, even briefly (and not in the system tmp dir either: shared hosts).
+_OWNER_TMP_PREFIX = ".engram-pkg-owner-"
+# The name stays covered by a pattern of engram_core.ENGRAM_GITIGNORE_PATTERNS ("*.db"): ENGRAM_HOME is a git
+# repo on seats with the git backup. Pinned by test_scope_export_owner_snapshot_2652.py (S6b).
+_OWNER_SNAPSHOT_NAME = "knowledge.db"
+# A JUDGEMENT, not a measurement: one run (snapshot <= 35 s + a closure) takes on the order of a minute, so 6 h
+# cannot catch a live run. It is the bound that protects a CONCURRENT run's temp dir from the sweep.
+_OWNER_TMP_STALE_SECONDS = 6 * 3600
+
+
+class ScopeExportOwnerError(RuntimeError):
+    """The owner could not give scope-export its snapshot (flag ON). Raised, never answered from a direct read
+    of the live store: a package that silently came from somewhere else, or from a half-written snapshot, is
+    the failure this exists to prevent."""
+
+
+def _owner_spec():
+    owner_read = _load_owner_read()
+    return owner_read.OwnerReadSpec(
+        flag_key=OWNER_FLAG_KEY,
+        error_cls=ScopeExportOwnerError,
+        home=owner_read.engram_home(),
+        never_empty="Did not fall back to reading the live store directly: no package was written.",
+    )
+
+
+def _sweep_stale_owner_tmpdirs(home, now=None) -> None:
+    """Remove `.engram-pkg-owner-*` temp dirs a killed run left in ENGRAM_HOME (each is a full store copy).
+
+    Prefix-exact, age-bound (_OWNER_TMP_STALE_SECONDS), real dirs owned by this uid only. Never raises: any
+    failure prints one warning line to stderr and returns.
+    """
+    try:
+        home = str(home)
+        if not os.path.isdir(home):
+            return
+        if now is None:
+            now = time.time()
+        uid = os.getuid()
+        try:
+            with os.scandir(home) as it:
+                entries = list(it)
+        except OSError:
+            # ENGRAM_HOME itself cannot be listed: nothing in it can be reached, and the store-path check
+            # (flag OFF) or the snapshot's own mkdtemp (flag ON) reports that, once, in its own words.
+            return
+        for entry in entries:
+            if not entry.name.startswith(_OWNER_TMP_PREFIX):
+                continue
+            path = os.path.join(home, entry.name)
+            st = os.lstat(path)
+            if not stat.S_ISDIR(st.st_mode):
+                continue
+            if st.st_uid != uid:
+                continue
+            if not now - st.st_mtime > _OWNER_TMP_STALE_SECONDS:
+                continue
+            shutil.rmtree(path)
+            print(f"removed stale owner temp dir: {path} (age {(now - st.st_mtime) / 3600:.0f}h)")
+    except Exception as exc:
+        print(f"warning: stale owner temp-dir sweep failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+def _tmpdir_failure(spec, exc) -> str:
+    return (
+        f"could not create the private temp dir for the owner snapshot in {spec.home} "
+        f"({type(exc).__name__}: {exc}); nothing was written. Not reading the store directly. "
+        f"Fix the permissions of that directory, or set engramd.{OWNER_FLAG_KEY} to false."
+    )
+
+
+@contextlib.contextmanager
+def _owner_snapshot(owner_read, spec):
+    """The flag-ON path: ONE owner snapshot in a 0700 temp dir inside ENGRAM_HOME. Yields the snapshot's path;
+    the temp dir is removed on every exit (a SystemExit from the closure passes through `finally`)."""
+    try:
+        tmpdir = tempfile.mkdtemp(prefix=_OWNER_TMP_PREFIX, dir=str(spec.home))
+    except OSError as exc:
+        raise ScopeExportOwnerError(_tmpdir_failure(spec, exc)) from exc
+    try:
+        try:
+            os.chmod(tmpdir, 0o700)
+        except OSError as exc:
+            raise ScopeExportOwnerError(_tmpdir_failure(spec, exc)) from exc
+        yield owner_read.snapshot(spec, Path(os.path.abspath(tmpdir)) / _OWNER_SNAPSHOT_NAME)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def cmd_scope_export(args):
     """Export a provenance closure as a scoped engram-package + sidecar manifest.
 
@@ -1082,30 +1194,66 @@ def cmd_scope_export(args):
 
     out_path = Path(args.out).expanduser().resolve()
 
-    # Locate the source DB (agent's personal graph, read-only).
-    source_home = Path(
-        os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
-    ).expanduser().resolve()
+    # Locate the source DB (agent's personal graph, read-only). The ONE shared resolver: a RELATIVE
+    # $ENGRAM_HOME is refused (never anchored to the cwd), flag ON or OFF, before anything is read or created.
+    owner_read = _load_owner_read()
+    try:
+        spec = _owner_spec()
+    except ValueError as exc:
+        sys.exit(f"ERROR: scope-export: {exc}")
+    source_home = spec.home.resolve()
     source_db = source_home / "knowledge.db"
-    if not source_db.exists():
-        sys.exit(
-            f"ERROR: scope-export: source graph not found at {source_db}. "
-            f"Set $ENGRAM_HOME to point at your ENGRAM data directory."
-        )
+
+    # Before the flag branch: an orphan outlives a flag turned back OFF. Before any mkdtemp: the run's
+    # own temp dir can never be swept mid-run.
+    _sweep_stale_owner_tmpdirs(spec.home)
 
     max_nodes = args.max_nodes if args.max_nodes is not None else _SCOPE_EXPORT_DEFAULT_MAX_NODES
     max_edges = args.max_edges if args.max_edges is not None else _SCOPE_EXPORT_DEFAULT_MAX_EDGES
 
-    # (a) Compute provenance closure from the source DB (read-only).
-    print(f"scope-export: computing closure from {source_db} ...")
-    source_conn = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
-    source_conn.row_factory = sqlite3.Row
+    use_owner = owner_read.flag_applies(spec, source_db)
     try:
-        nodes, edges = _compute_provenance_closure(
-            source_conn, root_ids, max_nodes, max_edges
-        )
-    finally:
-        source_conn.close()
+        with contextlib.ExitStack() as stack:
+            if use_owner:
+                # Flag ON and the source is this home's store: the owner path. It checks no file and opens
+                # no store; the one connect below is handed the owner's snapshot copy.
+                print(f"scope-export: computing closure from an engramd owner snapshot of {source_db} ...")
+                read_db = stack.enter_context(_owner_snapshot(owner_read, spec))
+            else:
+                try:
+                    owner_read.check_store_path(source_db)
+                except FileNotFoundError:
+                    sys.exit(
+                        f"ERROR: scope-export: source graph not found at {source_db}. "
+                        f"Set $ENGRAM_HOME to point at your ENGRAM data directory."
+                    )
+                except owner_read.StoreUnusable as exc:
+                    sys.exit(f"ERROR: scope-export: {exc}")
+                print(f"scope-export: computing closure from {source_db} ...")
+                read_db = source_db
+
+            # (a) Compute provenance closure from the source DB (read-only).
+            source_conn = None
+            try:
+                source_conn = sqlite3.connect(f"file:{read_db}?mode=ro", uri=True)
+                source_conn.row_factory = sqlite3.Row
+                nodes, edges = _compute_provenance_closure(
+                    source_conn, root_ids, max_nodes, max_edges
+                )
+            except sqlite3.Error as exc:
+                if not use_owner:
+                    raise
+                # An OK answer over a file that is not a readable store: an error, never a fallback.
+                raise ScopeExportOwnerError(
+                    f"the engramd owner snapshot could not be read ({type(exc).__name__}: {exc}); nothing "
+                    f"was written. Not reading the store directly. Check the owner build, or set "
+                    f"engramd.{OWNER_FLAG_KEY} to false."
+                ) from exc
+            finally:
+                if source_conn is not None:
+                    source_conn.close()
+    except ScopeExportOwnerError as exc:
+        sys.exit(f"ERROR: scope-export: {exc}")
 
     # (b) Closure-completeness invariant (spec §3a).
     _assert_closure_completeness(nodes, edges)
@@ -1307,6 +1455,15 @@ def cmd_render(args):
     non-zero and writes nothing.
     """
     pkg_path = resolve_pkg(args)
+    owner_read = _load_owner_read()
+    # #3962: `_check_stale_build` stats <pkg>/knowledge.db and raises on an unsearchable path, so classify first.
+    # A missing store falls through: the not-found message keeps its place in render's validation order.
+    try:
+        owner_read.check_store_path(pkg_path / "knowledge.db")
+    except FileNotFoundError:
+        pass
+    except owner_read.StoreUnusable as exc:
+        sys.exit(f"ERROR: render: {exc}")
     _check_stale_build(pkg_path)
 
     # ------------------------------------------------------------------ #
@@ -1382,8 +1539,12 @@ def cmd_render(args):
     # 4. Strict validation                                                 #
     # ------------------------------------------------------------------ #
     pkg_db = pkg_path / "knowledge.db"
-    if not pkg_db.exists():
+    try:
+        owner_read.check_store_path(pkg_db)
+    except FileNotFoundError:
         sys.exit(f"ERROR: render: package DB not found at {pkg_db}. Run `engram-pkg build` first.")
+    except owner_read.StoreUnusable as exc:
+        sys.exit(f"ERROR: render: {exc}")
 
     # Single read pass — open one connection and read every manifest node once.
     # The result is reused for both validation (4c) and the render cache (step 6),

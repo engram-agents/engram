@@ -420,7 +420,7 @@
 |---|---|---|---|---|
 | `tools/__init__.py` | shipped | essential | _?_ | _unswept_ |
 | `tools/_channel.py` | excluded | — (#2857 step 2: only live importer is tools/telegram_) | _?_ | _unswept_ |
-| `tools/_common.py` | shipped | convenience | _?_ | _unswept_ |
+| `tools/_common.py` | excluded | — (#3863 step 3d: only live importer is tools/telegram_bot.py, itself excluded) | _?_ | _unswept_ |
 | `tools/_telegram_api.py` | excluded | — (Telegram-specific transport helper; persona-specif) | _?_ | _unswept_ |
 | `tools/agent-bootstrap` | excluded | — (operator-level host administration script for mult) | _?_ | _unswept_ |
 | `tools/agentctl` | excluded | — (Lei's day-to-day admin CLI for co-located AI agent) | _?_ | _unswept_ |

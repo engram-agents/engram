@@ -47,7 +47,7 @@ from engram_log_emitter import Emitter, emit_if_initialized  # noqa: E402
 # breaking an Essential-only build
 # (tests/test_tiers_manifest.py::test_import_dep_tier_consistency enforces
 # exactly this). Guarded import + no-op stub keeps every MCP tool call
-# gating-nothing-T1 (docs/2574-telemetry-design.md §8) even if the store
+# gating-nothing-T1 (docs/internal/2574-telemetry-design.md §8) even if the store
 # ships without it -- same pattern as the four engram_*.py impl modules
 # this workstream also touches (engram_derive.py, engram_observation.py,
 # engram_query.py, engram_revision.py).
@@ -1222,7 +1222,20 @@ def _get_timing_conn() -> sqlite3.Connection:
         except Exception:
             pass
 
-    conn = sqlite3.connect(resolved_path, check_same_thread=False)
+    # #4107: NON-CREATING open. A plain sqlite3.connect creates a missing file,
+    # and this runs from the finally-block of every tool call -- including a
+    # first call that just failed because _get_db() refused the absent
+    # knowledge.db. The empty file it left behind then passed the daemon's
+    # missing-file guard, ran the full one-time setup on a 0-node store, and
+    # made bootstrap.py refuse. Only bootstrap creates knowledge.db; here an
+    # absent file raises sqlite3.OperationalError, which _record_tool_timing
+    # swallows (timing for that call is skipped) and nothing is cached, so the
+    # next call retries once the file exists.
+    conn = sqlite3.connect(
+        Path(resolved_path).absolute().as_uri() + "?mode=rw",
+        uri=True,
+        check_same_thread=False,
+    )
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     # #1685 (blueprint H6 follow-up to #1672/#1684): apply the same
@@ -1780,7 +1793,9 @@ def engram_add_observation(payload_json: str) -> str:
     error.
 
     The quote must be a VERBATIM substring of the source. This is checked
-    server-side on every path, session_id included, and fails loud.
+    server-side on every path, session_id included, and fails loud. A quote
+    under 10 characters (stripped) is refused unless it is the whole source
+    line or the whole message; an unreadable source (https URL) always refuses.
 
     Ephemeral sources (forum threads, web pages, local files not committed to a
     repo) must be archived with engram-snapshot first and cited by the file://
@@ -1848,7 +1863,7 @@ def engram_add_observation(payload_json: str) -> str:
         On payload-parsing failure, returns {"error": "..."} with no node created.
     """
     # alpha #2574 WS5: `reached` -- unconditional, before any argument
-    # validation/guard/early-return, per docs/2574-telemetry-design.md §1's
+    # validation/guard/early-return, per docs/internal/2574-telemetry-design.md §1's
     # TRIGGER ENTRY / NEGATIVE EVIDENCE. write_telemetry_record() never
     # raises (WS1's contract) so this needs no protective try.
     write_telemetry_record(manifest_id="server.py:engram_add_observation", event_type="engram.telemetry.reached", fields={})
@@ -1868,6 +1883,87 @@ def engram_add_observation(payload_json: str) -> str:
 
 # _add_observation_impl body moved to engram_observation.py (family A, #872 wave 9).
 # Compat forwarder above in wave-9 compat block.
+
+
+# Legitimate field names for the engram_requote payload. `evidence_id` is
+# deliberately NOT here: the tool never takes an evidence node from the caller.
+_REQUOTE_FIELDS = frozenset({"node_id", "new_quoted_text", "reason"})
+
+
+@mcp.tool(
+    name="engram_requote",
+    capability=(
+        "Fixes ONE observation's quoted_text in place against the SAME evidence "
+        "(EXPAND or SWITCH; never lowers quote-claim similarity). Cannot change "
+        "the evidence, claim or confidence; for those, supersede."
+    ),
+    annotations={
+        "title": "Fix an Observation's Quote in Place",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_requote(payload_json: str) -> str:
+    """Replace a current observation's quote with a better one from the SAME
+    evidence. The node keeps its id, claim, interpretation, confidence, edges
+    and evidence; only quoted_text changes, and the change is recorded in
+    metadata.quote_history and as one edit_history row (action "requoted").
+    Same evidence only; this tool never switches evidence.
+
+    Pass all fields as one JSON object string in payload_json:
+        node_id (str, required): the observation to fix.
+        new_quoted_text (str, required): the replacement quote.
+        reason (str, required): why the old quote was wrong or too thin.
+    Any other field (evidence_id included) is refused.
+
+    The tool picks the move; the caller cannot. EXPAND: the old quote sits
+    inside the new one (compared the way the verbatim gate compares: decoded,
+    then normalized). SWITCH: it does not. Both moves must keep the quote-claim
+    similarity from falling.
+
+    The new quote is checked against the evidence AS THE OBSERVATION CITED IT:
+    the git revision recorded on the node; else the recorded content_hash (the
+    file must still match); else, for a session transcript, only the rows
+    stamped at or before the node's created_at (version_check
+    "transcript_bounded"); else an evidence-archive file must still hash to its
+    name ("hash_name"); else today's file ("none"). Then the add-time rules
+    apply: verbatim in the source and the minimum-length floor. The git
+    revision is read from the evidence file's own repo, so a node cited with
+    source_repo/repo_path (a file outside the repo holding the git_sha) cannot
+    be requoted (evidence_unretrievable).
+
+    Every refusal returns {"error": ..., "refusal": <code>} and changes
+    nothing. Codes: not_observation, not_current, identical_quote,
+    evidence_unretrievable, evidence_changed, not_in_source, quote_too_short,
+    similarity_unavailable, similarity_decreased, changed_concurrently (the
+    node changed during the call; re-read and retry). A missing or blank field
+    returns a plain {"error": ...}.
+
+    Returns on success: {"status": "requoted", "node_id", "move",
+    "version_check" | "git_sha" | "content_hash", "similarity_before",
+    "similarity_after", "anchoring_advisory"}.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+
+    unknown = set(params.keys()) - _REQUOTE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_REQUOTE_FIELDS)}"
+        })
+
+    # Same session-id source engram_retract stamps; None when the server has none.
+    by_session = (
+        os.environ.get("CLAUDE_SESSION_ID")
+        or os.environ.get("ANTHROPIC_SESSION_ID")
+        or None
+    )
+    return _attach_walguard_banner(
+        _observation_mod._requote_impl(**params, by_session=by_session))
 
 
 # ---- Batch ingestion tools ----
@@ -2596,6 +2692,12 @@ def engram_cascade_frontier(payload_json: str) -> str:
             presence is the signal. A mode-B sweep (frontier -> resolve,
             looped) MUST NOT treat a response carrying this field as a
             completed/clean sweep.
+          cascade_walk_truncated (str, both modes): present ONLY when the
+            ancestor walk behind a frontier blocked-check ran out of node
+            budget (#2339) — those nodes are withheld from the frontier
+            (treated as blocked, since a pending ancestor cannot be ruled
+            out), so the frontier may be SHORT. ABSENT on the healthy path.
+            A mode-B sweep MUST NOT treat a response carrying it as complete.
         On payload-parsing failure or unknown node_id, returns
         {"error": "..."}.
 
@@ -2664,7 +2766,7 @@ def engram_cascade_frontier(payload_json: str) -> str:
 # it could silently disarm the cascade on an ordinary revision.
 _CASCADE_RESOLVE_FIELDS = frozenset({
     "node_id", "resolution_kind", "replacement_id", "note", "error_type",
-    "replacement_absent_because", "replacement_absent_note",
+    "replacement_absent_because", "replacement_absent_note", "resolving_node_id",
 })
 
 
@@ -2673,8 +2775,9 @@ _CASCADE_RESOLVE_FIELDS = frozenset({
     capability=(
         "Record your adjudication of ONE cascade-marked node that is on the "
         "frontier: retract it, supersede it with an already-created "
-        "replacement, or acknowledge that the upstream change does not touch "
-        "its claim. Stamps the decision on ALL that node's pending markers, "
+        "replacement, acknowledge that the upstream change does not touch "
+        "its claim, or (contradictions only) mark it resolved by the revision "
+        "of one of its sides. Stamps the decision on ALL that node's pending markers, "
         "recomputes confidence transitively, and auto-resolves any dependent "
         "the decision renders trivial. Never creates a node."
     ),
@@ -2695,11 +2798,27 @@ def engram_cascade_resolve(payload_json: str) -> str:
     the blocking ancestors named — its eligible shapes are a function of how
     ALL its premises resolve, so they are not knowable until they have.
 
-    THE THREE SHAPES (#2013 §4):
+    THE THREE SHAPES (#2013 §4), plus a FOURTH for contradictions only:
       retracted    — the argument is broken.
       superseded   — the claim survives on the remaining premises, and you
                      have ALREADY created the replacement node.
       acknowledged — the upstream delta provably does not touch this claim.
+      resolved     — CONTRADICTIONS ONLY (#4075): the contradiction is
+                     properly settled by one of its sides having been
+                     retracted or superseded. Name the settling node in
+                     `resolving_node_id`. Every other node type refuses it.
+
+    A CONTRADICTION is a special derivation whose two premises contradict
+    each other, so its SIDES are its legs: a retracted side withdraws
+    'acknowledged' (acknowledge_blocked_by names the side); a superseded side
+    keeps all four open and you judge. With several pending events on one
+    contradiction, 'acknowledged' is withdrawn if ANY event retracted a side.
+    'acknowledged' / 'retracted' / 'superseded' never change the
+    contradiction's RESOLUTION status (active / partially_resolved / resolved;
+    a retract still retracts it, as any retract does); only 'resolved' does, through engram_resolve's own
+    core (a `resolves` edge, status `resolved` or `partially_resolved` by the
+    resolver's confidence, idempotent) — the marker records the resolver in
+    `resolution_replacement_id`.
 
     'acknowledged' is available IFF no affected direct premise resolved as
     retracted. Supersede and acknowledge both permit it; only retract forbids
@@ -2724,6 +2843,13 @@ def engram_cascade_resolve(payload_json: str) -> str:
     the repair window, so without the edge nothing would re-read this node if
     the replacement is itself superseded later.
 
+    Acknowledging a CONTRADICTION whose side was superseded writes the same
+    kind of edge, `acknowledged_contradicts`, from the contradiction to the
+    LIVE successor of that side (the supersede / retract chain walked to its
+    live end, never one hop). The original `contradicts` edge stays as
+    provenance; the new edge is what makes a later revision of the successor
+    mark the contradiction again.
+
     THE DERIVATION CASCADE DOES NOT RE-FIRE. No claim-bearing node is marked
     by this resolution, whatever shape you choose, so nothing downstream
     acquires a second marker to adjudicate. If you want a fresh derivation
@@ -2744,14 +2870,22 @@ def engram_cascade_resolve(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             node_id (str, REQUIRED): the frontier node you are adjudicating.
             resolution_kind (str, REQUIRED): one of "retracted",
-                "superseded", "acknowledged".
+                "superseded", "acknowledged", or "resolved" (contradictions
+                only, #4075).
             replacement_id (str): REQUIRED iff resolution_kind is
                 "superseded"; PERMITTED (not required by itself) when
                 resolution_kind is "retracted" — #2613: a retraction reached
                 through the frontier can name a successor when one
                 demonstrably exists, the normal case in a sweep. Refused for
-                "acknowledged". Must already exist — this tool never creates
-                it.
+                "acknowledged" and for "resolved" (use resolving_node_id).
+                Must already exist — this tool never creates it.
+            resolving_node_id (str): REQUIRED iff resolution_kind is
+                "resolved"; refused for every other kind (#4075). The node
+                that settles the contradiction: claim-bearing, current, and
+                either a current side of this contradiction (the side that
+                stands) or the LIVE successor/replacement of a revised side.
+                Anything else is refused with the reason, and a refusal
+                changes nothing. The server never picks it for you.
             replacement_absent_because (str): only meaningful when
                 resolution_kind is "retracted". #2613: a replacement
                 decision is required-always on the retract path — supply
@@ -2778,14 +2912,18 @@ def engram_cascade_resolve(payload_json: str) -> str:
         changed, skipped, passes} — plus convergence_warning if the
         recompute could not settle, which should be unreachable and most
         likely means a CASCADE_RELATIONS cycle), auto_resolved_trivial,
-        acknowledgement_edges, note (a human-readable summary, always
-        present, null when empty),
+        acknowledgement_edges, acknowledgement_unlinked_sides (present only
+        when a superseded side of a contradiction got no
+        `acknowledged_contradicts` edge: its chain has no live end, or the
+        live end is already a side; each entry says which and why),
+        resolving_node_id (only for "resolved"), note (a human-readable
+        summary, always present, null when empty),
         marked_contradictions (contradiction nodes
         this resolution marked for review), contradiction_cascade_event (the
         dedicated event id they were marked under, or null when the node has
         no contradictions), re_cascade (an explanation of what did and
-        did not propagate), and — only when resolution_kind is `superseded`
-        or `retracted` — delegated_to + delegated_result, naming the verb
+        did not propagate), and — only when resolution_kind is `superseded`,
+        `retracted` or `resolved` — delegated_to + delegated_result, naming the verb
         this resolution handed off to and what it returned. The #3625
         bears_on hint keys (`bears_on_hints`, `bears_on_hint_prompt`,
         `bears_on_hint_error`) arrive NESTED under `delegated_result`, never
@@ -3029,6 +3167,16 @@ def engram_checkpoint(payload_json: str) -> str:
         )
     except Exception:
         result_dict["warm_briefing"] = None
+    # Off-disk backup push state (#4205): a refused push must not read as all-clear
+    # next to the "knowledge.db backup" line. Null when the worker never wrote one.
+    try:
+        _bp = core._backup_push_view()
+        result_dict["backup_push"] = (
+            None if _bp is None
+            else {k: _bp[k] for k in ("result", "last_success_utc", "ahead", "behind")}
+        )
+    except Exception:
+        result_dict["backup_push"] = None
     banner = _walguard_degraded_banner()
     if banner:
         result_dict["_walguard_warning"] = banner
@@ -3736,7 +3884,7 @@ def engram_stats(payload_json: str = "{}") -> str:
     name="engram_sign",
     capability=(
         "Return the signature line (emoji, name, model lineage, ENGRAM version, accountable "
-        "human) to append to external communications; refuses naming the field if any is unreadable."
+        "human, project site) to append to external communications; refuses naming the field if any is unreadable."
     ),
     annotations={
         "title": "Lineage-Transparent Signature Line",
@@ -3861,6 +4009,26 @@ def engram_diagnose() -> str:
           pairs that exceeded thresholds in the 7-day window — may be >
           worst_hours_shown if more than 10 buckets are flagged. See
           the cornerstone-evolution derivation/the cornerstone-evolution derivation/the cornerstone-frame-evolution open question for context.
+
+        - backup_push (#4205): ALWAYS present.
+          {result, last_success_utc, last_attempt_utc, ahead, behind, flare}
+          read from $ENGRAM_HOME/backup-push-status.json (written by the snapshot
+          worker after every push to the off-disk remote). result is "ok" |
+          "refused" | "rejected-size" | "error" | "no-remote" | "unreadable", or null when the file
+          does not exist yet. flare is true when result != ok and the last
+          success is older than 24 h (or never), or when behind > 0.
+          Repair a refused remote with tools/backup_remote_repair.py.
+
+        - backup_archive (#4208): ALWAYS present.
+          {sql_count, sql_bytes, binary_count, binary_bytes, tracked_backup_count,
+          oldest, newest, flare} computed from $ENGRAM_HOME/db-backup/ (sql_* over
+          knowledge-*.sql, binary_* over binary/*.db; oldest/newest = the YYYY-MM-DD of
+          the oldest/newest archive, null when none). tracked_backup_count = paths
+          git tracks under the home that match any of the untrack globs (backups/**,
+          db-backup/**, *.db.*, *.bak-*), text or binary (a *.bak-* TEXT file counts), that
+          the backup run would untrack. flare is true when sql_bytes > 1 GiB or
+          tracked_backup_count > 0. On any failure the key is {"error": "<class>: <msg>"},
+          never absent.
 
         - metadata_quarantine (#3425): ALWAYS present, 0 included.
           {entity_kind, count, live_invalid_count, sample_ids, flare}.
@@ -5508,7 +5676,7 @@ _RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_rela
 # DESIGN INTENT — engram_retype_edge
 # -----------------------------------
 # Corrects a provably-wrong edge by making it WEAKER, never stronger (issue
-# #2265, design doc docs/2265-2347-edge-correction-design.md sec.2). Neither
+# #2265, design doc docs/internal/2265-2347-edge-correction-design.md sec.2). Neither
 # engram_remove_edge nor engram_add_edge can do this: supported_by,
 # derives_from and cites are all removable=False/addable_after_creation=False,
 # so today the only routes are ad-hoc SQL (banned) or engram-surgical (dev
@@ -6687,7 +6855,7 @@ def engram_derive(payload_json: str) -> str:
     # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
     # full rationale. This target is reached from BOTH of engram_derive.py's
     # _derive_impl sites (:283 blocked-path, :365 success-path -- see
-    # docs/2574-telemetry-design.md §1's OUTCOME/dispatch-target paragraph);
+    # docs/internal/2574-telemetry-design.md §1's OUTCOME/dispatch-target paragraph);
     # this single `reached` write covers both.
     write_telemetry_record(manifest_id="server.py:engram_derive", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
@@ -7165,7 +7333,7 @@ _RETRACT_FIELDS = frozenset({
 # reason nothing replaces the claim). Mutually exclusive; exactly one
 # required. The obligation attaches to the retraction EVENT (edit_history),
 # not just the optional `retracts` edge, so it is checkable even when no
-# replacement exists. See docs/2613-retraction-replacement-contract.md.
+# replacement exists. See docs/internal/2613-retraction-replacement-contract.md.
 #
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
@@ -8564,6 +8732,14 @@ def _embedding_startup_gate() -> None:
     ).start()
 
 
+def _mcp_ready_marker_path() -> str:
+    """The marker path under the resolved ENGRAM_HOME. Raises ValueError on a relative value (#3863 step 2;
+    the server process has already failed at the engram_core import, so this is the same rule, not a second
+    gate). `_write_mcp_ready_marker` swallows it: a relative value never becomes a file under the cwd."""
+    import engram_home_resolver
+    return os.path.join(str(engram_home_resolver.engram_home()), "mcp-tools-ready.json")
+
+
 def _write_mcp_ready_marker() -> None:
     """Write ~/.engram/mcp-tools-ready.json ($ENGRAM_HOME) before mcp.run().
 
@@ -8580,8 +8756,7 @@ def _write_mcp_ready_marker() -> None:
     try:
         import datetime
         # Canonical pattern: $ENGRAM_HOME > ~/.engram (matches engram_core.DATA_DIR).
-        engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
-        marker_path = os.path.join(engram_home, "mcp-tools-ready.json")
+        marker_path = _mcp_ready_marker_path()
         data = {
             "pid": os.getpid(),
             "registered_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -8620,7 +8795,7 @@ if __name__ == "__main__":
     # deferred to): initialize the server-side telemetry emitter singleton,
     # so the 9 engram.tool.engram_call emit_if_initialized() sites in
     # engram_derive.py/engram_observation.py/engram_query.py/engram_revision.py
-    # stop being permanently NO_EMITTER (docs/2574-telemetry-design.md §0.1).
+    # stop being permanently NO_EMITTER (docs/internal/2574-telemetry-design.md §0.1).
     # Best-effort, same shape as the snapshot worker start above and the
     # embedding gate below: a failure here must never block server boot
     # (§8 "telemetry gates nothing T1" -- server.py is the literal T1 MCP

@@ -98,9 +98,10 @@ from tools import _owner_read as owner_read  # noqa: E402
 #     uncaught FileNotFoundError on every single invocation (Ariadne's
 #     review of PR-2621).
 # Same _hooklib.resolve_tools_dir precedent (hooks/claude/_hooklib.py):
-# prefer $CLAUDE_PLUGIN_ROOT when set, else walk ALL parent directories of
-# this file (never a fixed-depth parents[N]), checking both the flattened
-# and un-flattened relative path under each candidate root.
+# prefer $CLAUDE_PLUGIN_ROOT when set, else walk this file's directories up to
+# and including its tree root (#3983; never a fixed-depth parents[N]),
+# checking both the flattened and un-flattened relative path under each
+# candidate root.
 _HOOK_RELATIVE_PATHS = (
     "hooks/claude/engram-lesson-tripwire-hook.py",
     "hooks/engram-lesson-tripwire-hook.py",
@@ -116,7 +117,7 @@ def _resolve_hook_path() -> Path | None:
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
     if plugin_root:
         roots.append(Path(plugin_root))
-    roots.extend(Path(__file__).resolve().parents)
+    roots.extend(owner_read.bounded_parents(Path(__file__).resolve()))  # own tree only (#3983)
     for root in roots:
         for rel in _HOOK_RELATIVE_PATHS:
             candidate = root / rel

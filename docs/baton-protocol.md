@@ -115,6 +115,38 @@ line.
 - `TO` must be in `participants` or be `lei`.
 - Refuses if the project is `merged` or `cancelled`.
 - Write is atomic: tmp file + `os.rename` (no locking needed at our scale).
+- **CI gates (PR batons with a `github: pr/...` anchor).** Two flips read the
+  PR head's CI; every other flip (self-flip, the colleague's return flip to the
+  author, any flip on a non-PR baton) reads none.
+  - *Review request* (#4165) — a flip TO the registered `colleague` by anyone
+    other than the colleague (the author, or a maintainer handing it back for
+    re-review): `red`
+    refuses (`EXIT_VALIDATION`, stderr names the failing check, baton
+    unchanged); `pending` and `unknown` proceed with a stderr warning (the
+    colleague should read CI before reviewing; pending is the normal state right
+    after a push); `green` proceeds silently. An unqualified `pr/<N>` anchor
+    warns that CI cannot be verified and proceeds.
+  - *Merge signal* — the flip to the merge seat: `red` and `pending` both
+    refuse; an unqualified anchor refuses. It also runs the approval-freshness
+    and colleague-approval gates; the review-request flip does not.
+  - `--force` overrides a refusal on either flip, and the override is recorded
+    in the turn-log line (`[forced past CI <state>: <check detail>]` is appended
+    to the reason), not only printed.
+  - How CI is read: `mergeStateStatus: CLEAN` is green on its own. Otherwise
+    the rollup is deduped to one entry per check name: an unfinished run
+    (status not `COMPLETED`) is that name's current entry, else the most
+    recently completed run (so a stale same-SHA failure beside a newer success
+    is not red, and an in-flight re-run is never discarded). An **empty rollup
+    is `pending`** ("no checks registered on the head yet"), not green: right
+    after a push nothing has checked the new head. The empty rollup is read
+    only when `mergeStateStatus` is not `CLEAN` (`UNKNOWN`, `DIRTY`, `DRAFT`,
+    `BLOCKED`, `BEHIND`, ...). There it is pending, so in a repo with no CI the
+    merge-signal (maintainer) flip, `baton merge` and `baton advance` hold until
+    GitHub reports `CLEAN`, while the review-request flip warns and proceeds
+    (pending never refuses there). That matches the repo's rule that
+    `UNKNOWN` is pending (hold and re-check), and it stops a conflicted (`DIRTY`)
+    PR with no checks from reading green. Measured 2026-10-25: engram-paper,
+    engram-paper-public and local-model-lab have 0 workflows.
 
 ```bash
 baton flip PR-425 ariadne "round-3 fix pushed (d81d091); awaiting re-review"

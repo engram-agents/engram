@@ -113,7 +113,7 @@ Imported by runtime processes (hooks, server, sleep cycle scripts). Never invoke
 |---|---|---|
 | `tools/__init__.py` | Python package init (required for intra-tools imports) | T1 |
 | `tools/_channel.py` | `telegram_bot.py` (message channel abstraction) | excluded (#2857 step 2 — sole live importer, `telegram_bot.py`, is itself excluded) |
-| `tools/_common.py` | hooks, session tooling (shared utilities) | T2 |
+| `tools/_common.py` | `telegram_bot.py` (shared helpers) | excluded (#3863 step 3d — sole live importer, `telegram_bot.py`, is itself excluded) |
 | `tools/cohort_dispatch.py` | `engram-sleep` Phase B (batch-summary fairy dispatch) | T1 |
 | `tools/dream_master_batch.py` | `engram-sleep` Phase B (dream-master cohort) | T1 |
 | `tools/recall_summary_payload.py` | summary-fairy, server (payload builder) | T1 |

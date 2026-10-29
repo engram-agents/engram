@@ -10,7 +10,7 @@ and simply had no event to hear on the release branch.
 
 Deliberately scoped to surfaces where the name is load-bearing, not free
 prose — docs/** and CHANGELOG.md commonly (and correctly) narrate `master` as
-history (e.g. docs/RELEASING.md's account of the 2026-07-02 dev->master
+history (e.g. docs/internal/RELEASING.md's account of the 2026-07-02 dev->master
 reconciliation). A naive repo-wide grep would drown the real signal in that
 legitimate noise, which is how the third stray instance survived unnoticed.
 

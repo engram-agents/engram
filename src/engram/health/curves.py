@@ -470,7 +470,7 @@ denominator's premises pending" as effectively-blocked derivation (an
 anchor knot, not a reachable point on most graphs — see the provenance
 string for the reachable-range caveat). Knots are intuition for v1, to be
 calibrated from real accumulation events in a later version (the curves
-session doc, ``docs/design/health-v1-curves-session-2026-09-13.md``, has
+session doc, ``docs/internal/design/health-v1-curves-session-2026-09-13.md``, has
 the full method and the first real calibration event on record).
 
 NOT the same curve as ``BADNESS_DEFAULT_CURVE`` — this is a genuinely

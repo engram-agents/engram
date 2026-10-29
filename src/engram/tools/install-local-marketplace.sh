@@ -174,8 +174,30 @@ case "$TARGET" in
 esac
 
 _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
-REPO_ROOT="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>/dev/null)"
-[ -n "$REPO_ROOT" ] || { echo "install-local-marketplace: ERROR — could not resolve repo root via git" >&2; exit 1; }
+# #4099: a bare `VAR="$(cmd)"` carries cmd's exit status, so under `set -e` a
+# failing git (e.g. 128 "detected dubious ownership" on a checkout owned by
+# another user) would exit the script HERE, silently, before the guard below
+# could print anything. Test the assignment in an `if` so the guard is
+# reachable; on failure re-run git once to capture its own words (no temp file).
+_git_root_err=""
+if ! REPO_ROOT="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>/dev/null)"; then
+  REPO_ROOT=""
+  _git_root_err="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>&1 || true)"
+fi
+if [ -z "$REPO_ROOT" ]; then
+  echo "install-local-marketplace: ERROR — could not resolve repo root via git" >&2
+  [ -z "$_git_root_err" ] || printf '%s\n' "$_git_root_err" >&2
+  case "$_git_root_err" in
+    *"dubious ownership"*)
+      # git names the exact path it refused; fall back to the script's directory.
+      _unsafe_path="$(printf '%s\n' "$_git_root_err" | sed -n "s/.*repository at '\([^']*\)'.*/\1/p" | sed -n '1p')"
+      [ -n "$_unsafe_path" ] || _unsafe_path="$(dirname "$_self")"
+      echo "install-local-marketplace: this checkout is owned by another user. To trust it, run:" >&2
+      echo "    git config --global --add safe.directory '$_unsafe_path'" >&2
+      ;;
+  esac
+  exit 1
+fi
 if [[ ! -f "$REPO_ROOT/src/engram/server.py" ]]; then
   die "Must be run from the repo root (expected src/engram/server.py at $REPO_ROOT/src/engram/server.py)"
 fi
@@ -491,6 +513,22 @@ fi
 } > "$ENGRAM_HOME/.deployed-version"
 log "Version marker refreshed: $ENGRAM_HOME/.deployed-version (alpha_sha=$ALPHA_SHA)"
 
+# ── Stale long-lived processes (#3938) ───────────────────────────────────────
+# The install restarts nothing: the engramd owner and the surface daemon keep running the code they
+# started with. Right after an install every running process is older than the deploy BY
+# CONSTRUCTION, so this is informational (exit 0 always) and can never fail the install; the gate
+# that fails is check_stale_processes.py without --informational, run by the engram-upgrade skill
+# after the restarts. A missing or crashing tool costs one warning line.
+_stale_tool="$(dirname "$_self")/check_stale_processes.py"
+if [[ -f "$_stale_tool" ]] && command -v python3 &>/dev/null; then
+  log "Long-lived processes that still run pre-deploy code (restart each one named STALE; see the engram-upgrade skill):"
+  if ! ENGRAM_HOME="$ENGRAM_HOME" python3 "$_stale_tool" --informational 2>&1 | sed 's/^/[install-local-marketplace]   /'; then
+    log "WARNING: check_stale_processes.py could not run; restart the engramd owner and the surface daemon by hand (engram-upgrade skill)."
+  fi
+else
+  log "WARNING: check_stale_processes.py not found beside this script; restart the engramd owner and the surface daemon by hand (engram-upgrade skill)."
+fi
+
 # ── Persist install choices to config.json (bug 4, #1244) ────────────────────
 # Write install_tier and multi_agent back to config.json so the next upgrade
 # can read them without the user needing to re-specify explicit flags.
@@ -541,6 +579,99 @@ fi
 # for --skip-build callers too: a venv kept in sync is independent of whether
 # this run rebuilt the plugin tree.
 _ENGRAM_VENV_PY="$HOME/.engram/venv/bin/python"
+
+# #4103: pre-warm the embedding model so the MCP server does not die at its first
+# start (server.py refuses to start with the model uncached). Everything model-
+# related comes from the runtime in the plugin tree just assembled, never from a
+# string here: the model name from engram_core._get_embedding_config (falling back
+# to its DEFAULT_EMBEDDING_MODEL), "already cached" from server._embedding_cache_status
+# (the server's own startup predicate), the download through
+# engram_core._embedder._load_model (same kwargs as the server), and success is
+# reported only if that same predicate is True AFTER the load. HF_HOME and
+# HF_HUB_CACHE pass through untouched; this runs as the installing user, so the
+# cache it fills is the one the server will read. A path-shaped model name is never
+# downloaded. Any failure sets _venv_fail so every exit path exits non-zero.
+# The snippet is a plain stdin heredoc (not $(...)-nested), so the #2979 quote-parity
+# landmine does not apply to it.
+_prewarm_embedding_model() {
+  local _plugin_dir="$MARKETPLACE_ROOT/plugins/engram"
+  local _rc=0
+  ENGRAM_HOME="$ENGRAM_HOME" "$_ENGRAM_VENV_PY" - "$_plugin_dir" "$_ENGRAM_VENV_PY" <<'PY' || _rc=$?
+import os
+import sys
+
+plugin_dir, venv_py = sys.argv[1], sys.argv[2]
+TAG = "[install-local-marketplace] "
+
+
+def say(msg):
+    print(TAG + msg, flush=True)
+
+
+def cache_dir():
+    for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if os.environ.get(var):
+            return os.environ[var]
+    if os.environ.get("HF_HOME"):
+        return os.path.join(os.environ["HF_HOME"], "hub")
+    try:
+        from huggingface_hub import constants
+        return str(constants.HF_HUB_CACHE)
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+
+
+def remedy(model):
+    return (
+        venv_py + " -c "
+        + chr(34) + "from sentence_transformers import SentenceTransformer; "
+        + "SentenceTransformer(" + repr(model) + ")" + chr(34)
+    )
+
+
+sys.path.insert(0, plugin_dir)
+try:
+    import engram_core as core
+    import server
+except Exception as exc:
+    say("ERROR: pre-warm cannot import the runtime from " + plugin_dir + ": "
+        + type(exc).__name__ + ": " + str(exc))
+    say("       The venv may be missing runtime packages; re-run this installer after fixing the pip output above.")
+    sys.exit(3)
+
+model = core._get_embedding_config().get("model", core.DEFAULT_EMBEDDING_MODEL)
+
+if server._embedding_cache_status(model):
+    say("pre-warm: " + model + " already cached under " + cache_dir())
+    sys.exit(0)
+
+if server._looks_like_local_model_path(model):
+    say("ERROR: pre-warm: embedding model path " + model + " does not exist or is not a usable model directory;")
+    say("       a path is never downloaded. Fix embedding.model in config.json (an absolute path with modules.json or config.json).")
+    sys.exit(4)
+
+say("embedding model " + model + " is not cached under " + cache_dir() + "; downloading once")
+core._embedder._load_model(model)
+if core._embedder._model is None:
+    say("ERROR: pre-warm: could not download embedding model " + model + " (cache dir tried: " + cache_dir() + ").")
+    say("       The MCP server will not start until it is cached. With network access, run:")
+    say("         " + remedy(model))
+    sys.exit(5)
+# The loader succeeding is not the server's start-up test: re-ask the server's own predicate.
+if not server._embedding_cache_status(model):
+    say("ERROR: pre-warm: could not download embedding model " + model + " (cache dir tried: " + cache_dir() + ").")
+    say("       The model loaded but is not where the server looks (for example SENTENCE_TRANSFORMERS_HOME is set),")
+    say("       so the MCP server would still refuse to start. Unset it, or fill the server's cache with:")
+    say("         " + remedy(model))
+    sys.exit(5)
+say("pre-warm: " + model + " downloaded to " + cache_dir())
+PY
+  if [[ $_rc -ne 0 ]]; then
+    log "WARN: embedding model pre-warm failed (continuing install; will exit non-zero)"
+    _venv_fail=1
+  fi
+}
+
 if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
   # #2951: these two reads used to swallow ANY parse failure and silently
   # resolve to convenience/not-multi-agent, dropping the dev/forum
@@ -555,6 +686,16 @@ if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
   # calls (not merged into one heredoc like the _ma_tier_out block) --
   # deliberate minimal-diff scope: this fix makes the existing two calls
   # fail loud, it does not restructure them.
+  # #4100: a MISSING config.json is the fresh-install default (the earlier
+  # build-flag read treats it the same way), not a parse failure -- a
+  # bootstrap-spawned seat has this venv before any config exists. Only a
+  # PRESENT file goes through the fail-loud reads below, so #2951/#2965's
+  # "a parse/type failure is never silently the default" is unchanged.
+  if [[ ! -e "$ENGRAM_HOME/config.json" && ! -L "$ENGRAM_HOME/config.json" ]]; then
+    log "$ENGRAM_HOME/config.json does not exist yet (fresh install): using the fresh-install default (tier convenience, single-agent) for venv provisioning"
+    _eff_tier="convenience"
+    _eff_multi_agent="false"
+  else
   if ! _eff_tier="$(python3 -c "import json,sys
 path = sys.argv[1]
 try:
@@ -605,6 +746,7 @@ except Exception as e:
     exit 1
   fi
   [[ -z "$_eff_multi_agent" ]] && _eff_multi_agent="false"
+  fi
   _runtime_req="$REPO_ROOT/requirements/requirements.txt"
   if [[ -f "$_runtime_req" ]]; then
     log "Provisioning venv at $HOME/.engram/venv (tier: $_eff_tier)"
@@ -614,8 +756,13 @@ except Exception as e:
     # are already assembled) but flag it so the script exits non-zero at the
     # end — unattended/cron upgrades key on exit code and would otherwise
     # report success over a broken server (Lei, 2026-08-10).
-    "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_runtime_req" \
-      || { log "WARN: venv runtime-requirements install failed (continuing install; will exit non-zero)"; _venv_fail=1; }
+    if "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_runtime_req"; then
+      # Only after the runtime packages are in (#4103): pre-warm the embedding model.
+      _prewarm_embedding_model
+    else
+      log "WARN: venv runtime-requirements install failed (continuing install; will exit non-zero)"
+      _venv_fail=1
+    fi
   fi
   if [[ "$_eff_tier" == "dev" ]]; then
     _dev_req="$REPO_ROOT/requirements/requirements-dev.txt"

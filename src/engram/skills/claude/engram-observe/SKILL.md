@@ -184,6 +184,16 @@ an exact, verbatim substring of the evidence source — no paraphrase, no
 summary, no fabrication. The server enforces this and will reject a
 non-matching quote.
 
+**Length floor: 10 characters.** After stripping spaces, a quote shorter than
+10 characters is refused, because a fragment that short is a receipt, not
+evidence anyone can scan. The one exception: the quote is the whole source
+line (file) or the whole text of one message (session transcript). The error
+shows the line or message that contains your quote; quote enough of it that it
+tells something on its own. The evidence node keeps the full context. If the
+source text cannot be read at write time (an `https://` URL is never fetched),
+the refusal stands, because the exception cannot be checked: snapshot the
+source and cite the `file://` copy.
+
 Before calling `engram_add_observation`, verify the quote exists in the
 source file:
 
@@ -313,7 +323,10 @@ third is also named in the description of each write tool that returns it:
   widen the quote, move the fact to `interpretation`, or downgrade the quote type. Advisory only —
   it never refuses a write or changes a confidence. This is advisory-only **until #2602 facet 3**;
   facet 3 (the refusal behavior) is still out of scope for what's shipped today, so treat this as
-  conditional rather than a permanent guarantee.
+  conditional rather than a permanent guarantee. Separately, when the quote-claim similarity is
+  below 0.2 the advisory also carries `low_similarity_hint` (any quote type; it can sit beside
+  `hint`): the quote may not carry the claim, so widen the quote, narrow the claim, or move the
+  rest into a derivation. Advisory only, and never set when the similarity could not be measured.
 - **`predictive_hint`** — appears when `predicted_event`/`resolution_timeframe` were passed without
   `is_predictive`. Advisory only; suppressed whenever `is_predictive` is true.
 - **`recall_summary_overrun`** — appears only when the stripped `recall_summary` is over the 140

@@ -134,13 +134,97 @@ log "DB_PATH     : $DB_PATH"
 log "DRY_RUN     : $([[ $DRY_RUN -eq 1 ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
+# Owner snapshot flag (#2652 tools-10)
+# ---------------------------------------------------------------------------
+# engramd.fix_git_backup_reads_via_owner (default OFF), read ONLY through the shared resolver
+# (_owner_read.flag_applies: $ENGRAM_HOME/config.json, never ~/.engram unless that IS $ENGRAM_HOME). ON: the
+# live knowledge.db is never opened. ONE engramd owner snapshot is written straight to $SAFETY_SNAPSHOT and
+# feeds the safety check, the dump (step 3) and the verify (step 4). OFF: exactly the commands below, as
+# before this flag existed. An absent or malformed config reads OFF silently; a flag that cannot be read at
+# all reads OFF with one stderr line (the shared resolver's own behaviour).
+OWNER_FLAG_KEY="fix_git_backup_reads_via_owner"
+OWNER_FLAG_DOTTED="engramd.$OWNER_FLAG_KEY"
+TOOLS_DIR="$(dirname "$(readlink -f "$0")")"
+OWNER_PY='import sys
+# insert(0), never append: under `python -c` sys.path[0] is the cwd, which must not outrank the real helper.
+sys.path.insert(0, sys.argv[1])
+def build():
+    from pathlib import Path
+    import _owner_read as o
+    class SnapshotError(Exception):
+        pass
+    spec = o.OwnerReadSpec(
+        flag_key="fix_git_backup_reads_via_owner",
+        error_cls=SnapshotError,
+        home=o.engram_home(),
+        never_empty="Did not fall back to reading the live store directly: no safety snapshot was taken.",
+    )
+    return o, spec, SnapshotError, Path
+if sys.argv[2] == "flag":
+    try:
+        o, spec, _err, Path = build()
+        print("1" if o.flag_applies(spec, Path(sys.argv[3])) else "0")
+    except (Exception, SystemExit) as exc:
+        # One stable line, class name only (the flag_applies convention); the outcome is OFF.
+        cls = "".join(ch if ch.isprintable() else "?" for ch in type(exc).__name__)[:80]
+        sys.stderr.write("engramd.fix_git_backup_reads_via_owner: flag read failed (" + cls + "); reading as OFF\n")
+        print("0")
+else:
+    o, spec, SnapshotError, Path = build()
+    try:
+        o.snapshot(spec, Path(sys.argv[3]))
+    except SnapshotError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(3)'
+OWNER_FLAG=$(ENGRAM_HOME="$ENGRAM_HOME" "$PY" -c "$OWNER_PY" "$TOOLS_DIR" flag "$DB_PATH") || OWNER_FLAG=0
+[[ "$OWNER_FLAG" == "1" ]] || OWNER_FLAG=0
+# The file steps 3 and 4 read: the live store, or (flag ON) the one quiesced snapshot.
+DUMP_SRC="$DB_PATH"
+
+# ---------------------------------------------------------------------------
 # Step 1: Out-of-tree safety snapshot
 # ---------------------------------------------------------------------------
 SAFETY_SNAPSHOT="$HOME/.engram-db-safety-$TS.db"
 log ""
 log "Step 1: Creating safety snapshot at $SAFETY_SNAPSHOT"
 
-if [[ $DRY_RUN -eq 1 ]]; then
+if [[ $OWNER_FLAG -eq 1 ]]; then
+    # Flag ON: the live store is not opened. The owner stages the copy next to dest, fsyncs and renames it
+    # into place, so it is asked for the final operator path directly (no temp dir, no move).
+    DUMP_SRC="$SAFETY_SNAPSHOT"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "  [DRY-RUN] would ask the engramd owner for a snapshot at $SAFETY_SNAPSHOT ($OWNER_FLAG_DOTTED is on; the live store is not opened)"
+        echo "  [DRY-RUN] would verify the snapshot: PRAGMA quick_check returns ok and SELECT count(*) FROM nodes > 0"
+    else
+        if ! SNAP_ERR=$(ENGRAM_HOME="$ENGRAM_HOME" "$PY" -c "$OWNER_PY" "$TOOLS_DIR" snapshot "$SAFETY_SNAPSHOT" 2>&1); then
+            die "$OWNER_FLAG_DOTTED is on and the engramd owner snapshot failed: $SNAP_ERR -- A file may exist at $SAFETY_SNAPSHOT; if it does it may or may not be complete and must not be trusted. The live store was not read and nothing after step 1 ran — aborting"
+        fi
+        log "  $OWNER_FLAG_DOTTED is on: the live comparison is dropped (the owner quiesces the copy, so a live count could only race concurrent writes); checking the copy itself"
+        if ! SNAP_CHECK=$("$PY" -c "
+import sqlite3, sys
+from pathlib import Path
+stage = 'PRAGMA quick_check'
+try:
+    conn = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + '?mode=ro', uri=True)
+    rows = conn.execute('PRAGMA quick_check').fetchall()
+    if rows != [('ok',)]:
+        print('PRAGMA quick_check did not return exactly ok: ' + '; '.join(str(r[0]) for r in rows[:5]))
+        sys.exit(1)
+    stage = 'SELECT count(*) FROM nodes'
+    n = conn.execute('SELECT count(*) FROM nodes').fetchone()[0]
+except sqlite3.Error as exc:
+    print(stage + ' failed on the snapshot: ' + type(exc).__name__ + ': ' + str(exc))
+    sys.exit(1)
+if n <= 0:
+    print('the snapshot holds no nodes (SELECT count(*) FROM nodes = ' + str(n) + ')')
+    sys.exit(1)
+print(n)
+" "$SAFETY_SNAPSHOT" 2>&1); then
+            die "Safety snapshot at $SAFETY_SNAPSHOT failed its checks: $SNAP_CHECK — aborting before step 2"
+        fi
+        log "  Safety snapshot verified: quick_check ok, $SNAP_CHECK nodes"
+    fi
+elif [[ $DRY_RUN -eq 1 ]]; then
     echo "  [DRY-RUN] would run: $PY -c 'import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()' $DB_PATH $SAFETY_SNAPSHOT"
     echo "  [DRY-RUN] would verify: node count in snapshot matches live DB"
 else
@@ -198,9 +282,9 @@ log "Step 3: Generating embedding-stripped knowledge.sql"
 SQL_PATH="$ENGRAM_HOME/knowledge.sql"
 
 if [[ $DRY_RUN -eq 1 ]]; then
-    echo "  [DRY-RUN] would run: $PY $ENGRAM_BACKUP dump $DB_PATH $SQL_PATH"
+    echo "  [DRY-RUN] would run: $PY $ENGRAM_BACKUP dump $DUMP_SRC $SQL_PATH"
 else
-    "$PY" "$ENGRAM_BACKUP" dump "$DB_PATH" "$SQL_PATH"
+    "$PY" "$ENGRAM_BACKUP" dump "$DUMP_SRC" "$SQL_PATH"
 
     SQL_SIZE=$(du -sh "$SQL_PATH" 2>/dev/null | awk '{print $1}' || echo "unknown")
     log "  knowledge.sql generated: $SQL_SIZE"
@@ -213,9 +297,9 @@ log ""
 log "Step 4: Verifying lossless rebuild from stripped dump"
 
 if [[ $DRY_RUN -eq 1 ]]; then
-    echo "  [DRY-RUN] would run: $PY $ENGRAM_BACKUP verify $DB_PATH"
+    echo "  [DRY-RUN] would run: $PY $ENGRAM_BACKUP verify $DUMP_SRC"
 else
-    "$PY" "$ENGRAM_BACKUP" verify "$DB_PATH"
+    "$PY" "$ENGRAM_BACKUP" verify "$DUMP_SRC"
     log "  PASS: lossless round-trip verified by engram_backup.verify_roundtrip"
 fi
 

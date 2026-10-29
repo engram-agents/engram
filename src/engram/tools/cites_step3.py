@@ -103,8 +103,8 @@ The DAG audit gates every phase. It aborts the run (exit 3, status
 non-trivial strongly connected component of one family's graph after the phase
 and on none before it (a genuinely new cyclic component). The components are
 computed by this tool from the graph itself, over the same edges the audit walks
-(each family's relations, endpoints resolved through the supersedes chain to
-their current node), so neither rule reads the audit's cycle listing and the
+(each family's relations, current edges only since #3542: both raw endpoints live,
+no supersedes-chain resolution), so neither rule reads the audit's cycle listing and the
 listing's cap (MAX_CYCLES_PER_FAMILY, 20 per family) does not matter. The run
 does NOT abort because the listed back-edge path differs while the count did not
 rise and every node was already cyclic: the audit lists one cycle per DFS back
@@ -149,6 +149,10 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
+# append (not insert(0)) -- #2565: src/engram at sys.path POSITION 0 would outrank the repo-root tools/ package.
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from tools import _owner_read as owner_read  # noqa: E402
+
 LABELS = ("correct-about", "mis-filed-premise", "other-relation", "unforeseen", "cannot-judge")
 PHASES = ("a", "b", "c", "d", "e", "f")
 STRUCTURAL_SOURCES = ("feeling_report", "question")
@@ -188,6 +192,20 @@ class HelpShown(Exception):
     """--help was printed; a clean exit (0), not a refusal."""
 
 
+# #3882: the store-maintenance lock this run holds ({"core": engram_core, "fd": int}, or empty). Taken by
+# _main before its first store open (the `mode=ro` report path, the label check, the backup and the
+# --apply writes all go under it), released by main()'s finally so a caller that runs main() twice in one
+# process never meets its own earlier lock; a killed process drops it through the kernel.
+_MAINT_LOCK: dict = {}
+
+
+def _release_maint_lock():
+    held = dict(_MAINT_LOCK)
+    _MAINT_LOCK.clear()
+    if held:
+        held["core"].release_store_maint_lock(held["fd"])
+
+
 def _ro_uri(path):
     """A read-only SQLite URI for `path`, with `#`, `?`, `%` and spaces escaped."""
     return f"file:{urllib.parse.quote(str(path))}?mode=ro"
@@ -197,13 +215,21 @@ def _ro_uri(path):
 # engine loading
 # ---------------------------------------------------------------------------
 
+def _own_tree_window(here):
+    """Directories to search for engram_core.py (#3983): this file's own directory
+    and its parent, nothing above.  engram_core.py is the tree-root marker itself,
+    so it cannot bound its own search; tools/ sits directly under the tree root in
+    the installed plugin and in src/engram/ alike, so the root IS the parent."""
+    return list(here.parents)[:2]
+
+
 def _find_engine_dir() -> Path:
     cands = []
     root = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if root:
         cands.append(Path(root))
     here = Path(__file__).resolve()
-    for p in (here.parent, *here.parents):
+    for p in _own_tree_window(here):  # own tree only, never above its root (#3983)
         cands.append(p)
         cands.append(p / "src" / "engram")
     for c in cands:
@@ -700,7 +726,7 @@ class Run:
             cyclic = {}
             for fam in self.core.DAG_FAMILIES:
                 # the audit's own scope: the family's relations within DAG_RELATIONS,
-                # endpoints resolved through the supersedes chain to current nodes
+                # current edges only (#3542): both raw endpoints live, no resolution
                 walked = self.core.dag_family_relations(fam) & self.core.DAG_RELATIONS
                 cyclic[fam] = frozenset(cyclic_nodes(self.dagc._live_dag_edges(conn, walked)))
         finally:
@@ -1421,7 +1447,10 @@ def _main(argv):
     rep = validate_report(_read_json(args.report, "report"))
     labels = validate_labels(_read_json(args.labels, "labels")) if args.labels else None
 
-    home = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")).expanduser().resolve()
+    try:
+        home = owner_read.engram_home().resolve()  # a RELATIVE ENGRAM_HOME is refused (alpha #3863)
+    except ValueError as exc:
+        raise Refusal(str(exc))
     cfg = _read_json(home / "config.json", "config")
     agent, lineage = cfg.get("agent_name"), cfg.get("self_lineage")
     _need(agent and lineage, f"config.json at {home} lacks agent_name / self_lineage")
@@ -1429,7 +1458,15 @@ def _main(argv):
           f"report is for seat {rep['seat']!r} but this graph's agent_name is {agent!r}: own graph only")
     _need(rep["lineage"] == lineage,
           f"report lineage {rep['lineage']!r} differs from this graph's self_lineage {lineage!r}: own graph only")
-    _need((home / "knowledge.db").exists(), f"no knowledge.db under {home}")
+    # #3962: classify the store path without opening it (a `mode=ro` open of a FIFO blocks on macOS, and
+    # `exists()` calls a loop, a dangling link and an unsearchable parent "missing"). Every `_ro_uri` connect below
+    # reads `core.DB_PATH` (= this path after `_configure_paths(home)`) or a file this run made itself.
+    try:
+        owner_read.check_store_path(home / "knowledge.db")
+    except FileNotFoundError:
+        raise Refusal(f"no knowledge.db under {home}")
+    except owner_read.StoreUnusable as exc:
+        raise Refusal(str(exc))
 
     if args.apply:
         _need(labels is not None, "--apply requires --labels")
@@ -1451,6 +1488,14 @@ def _main(argv):
 
     core, cornerstone, dagc = _load_engine()
     core._configure_paths(home)
+
+    # #3882: an offline repair tool. The lock comes BEFORE the first open of the store, and every open
+    # below (the labels check, the backup, the run's own connections) sits under it. A held lock (an owner
+    # is running, or another repair) refuses here, before the store is touched.
+    try:
+        _MAINT_LOCK.update(core=core, fd=core.acquire_store_maint_lock(str(core.DB_PATH), "cites_step3"))
+    except core.StoreMaintLockError as exc:
+        raise Refusal(core.store_maint_refusal_text(exc, core.DB_PATH))
 
     if labels is not None:
         conn = sqlite3.connect(_ro_uri(core.DB_PATH), uri=True)
@@ -1549,6 +1594,8 @@ def main(argv=None) -> int:
     except Exception as exc:  # unexpected
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+    finally:
+        _release_maint_lock()
 
 
 if __name__ == "__main__":

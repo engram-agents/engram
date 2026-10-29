@@ -53,6 +53,7 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
 2. **Contradictions ripe for resolution.** `engram_query_pattern(pattern_name='contradiction_obsolescence_ready')` as primary; or inline: `engram_list(node_type='contradiction')` filtered by `status IN ('active', 'partially_resolved')` AND `is_current=1` (`open` is question vocabulary and never a contradiction status; a contradiction's live status is `active` — filtering on `open` returns 0 rows on a live graph, #3355). For each `ct_XXXX`, inspect both contradicting sides + check `engram_inspect(ct_XXXX)`'s `warnings.stale_by` and `warnings.tainted_by` (cascade state moved off `metadata.stale_by`/`metadata.tainted_by` into a `cascade_markers` table — the `warnings` shape on the inspect response is the current surface, same key names as before, richer entry shape: `stale_by` entries carry `{superseded_id, replaced_by_id, superseded_at}`, `tainted_by` entries carry `{retracted_id, retracted_claim_excerpt, retracted_at, retraction_reason_excerpt}`). **Three sub-flows** under the issue #229 substrate redesign — surface each with the appropriate scaffolding:
    - **Stale-by-premise (one side superseded)** — `warnings.stale_by` non-empty. The supersede may have already substantively resolved the conflict (case 1: new node altered the conflicting claim → suggest parent wire `engram_resolve(target_id=ct_XXXX, resolving_node_id=<replaced_by_id from the warnings entry>)` directly) OR preserved it (case 2: new node kept the conflicting claim → suggest parent create new contradiction + supersede old ct → new ct). Per the supersede no-drop discipline, case 3 (orthogonal drop) cannot arise.
    - **Tainted-by (one side retracted)** — `warnings.tainted_by` non-empty. The retracted side was never valid; the contradiction itself may need closure. Suggest parent: compose a derivation noting the retraction + wire it as resolver, OR if a `replacement_id` observation was named, treat as stale-by-premise case 2.
+   - **Marked contradictions** (either warning) are adjudicated by the parent's cascade sweep with `engram_cascade_resolve`; a fourth kind, `resolved` (contradictions only, with `resolving_node_id`), settles the contradiction by a side's revision (#4075). Suggest it only as a candidate; you do not resolve.
    - **Open with no `warnings` key at all** — standard contradiction-resolution path. Parent composes a resolving derivation citing root-anchor nodes (NOT prior weak resolutions — chain dilution is the canonical chain-dilution-resolution-saga failure mode) then wires via `engram_resolve`.
 
    Full decision tree lives in the `engram-contradiction-resolution` skill — reference it in your report so the parent can follow the canonical steps.
@@ -138,25 +139,23 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
 
    **Important `gh` guard:** Only repo-qualified `owner/repo#N` references are ever checked, and every `gh` call carries `--repo` from the reference. A bare `#N` is never a closure candidate and never produces a suggestion, not even a conservative one. You MAY mention a bare `#N` you noticed in a task claim as an ambiguous reference in your report prose (a note that the task cites an unqualified number), but never as a `task_closures` suggestion and never checked against `gh`. Forum post IDs, GitHub Projects IDs, and arbitrary numbers collide with real PR/issue numbers in whichever repo the cwd happens to be; the qualified-only pattern is what keeps them out.
 
-9. **Cornerstone auto-load surface coverage gaps.** No server-side pattern — compose inline using `Bash` + read-only MCP tools.
+9. **Cornerstone auto-load surface coverage gaps.** Read the shipped instrument — `engram_diagnose`'s `cornerstone_coverage` — with read-only MCP tools.
 
    **Why this matters:** A cornerstone's one job is to be recalled at the moment it's needed. Per the warm-briefing design (issue #61), warm-briefing IS the surfacing mechanism — a cornerstone you have to look up has already failed. The gap class: a `cs_*` node is active in ENGRAM but has zero entries in either of the two auto-load surfaces (`~/.engram/warm-briefing.md` (under `$ENGRAM_HOME`, default `~/.engram`) and `~/.claude/CLAUDE.md`). This is mechanically checkable and should never require vigilance. (Origin: several mid-May cornerstones had no delivery channel for weeks; coverage drifted because anchor-section sync was vigilance-based, issue #931.)
 
-   **Inline methodology:**
+   **Methodology:**
 
-   1. Enumerate all active cornerstones: `engram_list(node_type='cornerstone')` — `is_current=1` is applied by default and is what excludes retired ones (see category 7 on why a `status='active'` filter adds nothing).
-   2. For each cornerstone `cs_XXXX`, grep both surfaces for the node ID and the cornerstone's handle (tag):
-      ```bash
-      grep -l "cs_XXXX\|<handle>" "${ENGRAM_HOME:-$HOME/.engram}"/warm-briefing.md ~/.claude/CLAUDE.md 2>/dev/null
-      ```
-      A match in either file = covered. No match in either = coverage gap.
-   3. Collect uncovered cornerstones. If the list is empty, note "all cornerstones covered" — do not manufacture findings.
+   1. Call `engram_diagnose()` and read its `cornerstone_coverage` object. This is the **count of record**. Do not compute an alternative count, and do not re-derive coverage by grepping the surfaces yourself.
+   2. The gaps are exactly `cornerstone_coverage.uncovered_list` (each entry carries `id`, `tag`, `title`; an entry with no tag carries `tag: ""` — an empty string, not null — and that is not evidence that cornerstones lack tags). For each, fetch claim + tag via `engram_inspect` for the snapshot.
+   3. State the instrument's scope in the report: a cornerstone counts as covered when its `cs_` ID appears in either surface, or its tag appears (word-bounded) in `~/.claude/CLAUDE.md` only — tag matching does not apply to warm-briefing — over the surfaces listed in `cornerstone_coverage.surfaces_checked`.
+   4. Empty `uncovered_list` → "all cornerstones covered" (with the denominator line). Do not manufacture findings.
+   5. If `cornerstone_coverage` is missing, carries `error`, or has an empty `surfaces_checked` (no surface file was read, so every cornerstone would otherwise look uncovered), the instrument failed: report that as a failure, list no gaps, and never substitute a count of your own.
 
-   **Output per gap:** include `node_id`, `node_snapshot` (claim + tag), and suggestion text. Confidence: `verified` (the grep result is a structural fact, not a heuristic).
+   **Output per gap:** include `node_id`, `node_snapshot` (claim + tag), and suggestion text. Confidence: `verified` (the instrument's result is a structural fact, not a heuristic).
 
-   **Read-only tools used:** `engram_list` (cornerstone enumeration), `Bash` (grep auto-load surfaces), `engram_inspect` (fetch claim + tag for the snapshot).
+   **Read-only tools used:** `engram_diagnose` (count of record), `engram_inspect` (fetch claim + tag for the snapshot).
 
-   Suggest action: "Add warm-briefing anchor entry for `cs_XXXX` (handle: `<tag>`) — no auto-load surface coverage found." Dream-master surfaces these as human-action items (warm-briefing edits are not ENGRAM writes); Clio acts on them in the next session.
+   Suggest action: "Add an anchor entry for `cs_XXXX` (handle: `<tag>`) on an auto-load surface — no coverage found." Dream-master surfaces these as human-action items (warm-briefing edits are not ENGRAM writes); the awake seat acts on them.
 
 11. **Cornerstones/lessons with `support_lost`.** No server-side pattern — compose inline using read-only MCP tools.
 
@@ -364,6 +363,13 @@ Use this format:
 ## Category 8 — Open tasks with stale external references
 - [tk_XXXX] (verified) status=<active|planned|blocked> — claim references owner/repo#N (<pr MERGED|issue CLOSED> as of <date>; always repo-qualified, never a bare `#N`; an unmerged `pr CLOSED` is never listed here) — suggested action: close task and mark done — external reference owner/repo#N <state>.
 ... or "None this scan."
+
+## Category 9 — Cornerstone auto-load surface coverage gaps
+- count of record (engram_diagnose.cornerstone_coverage): <covered>/<total> covered, <uncovered> uncovered; surfaces_checked: <list>  ← REQUIRED, include even when there are no gaps
+- [cs_XXXX] (verified) tag: <tag> — <one-line claim> — suggested action: add an anchor for cs_XXXX on an auto-load surface (warm-briefing; CLAUDE.md is discuss-first with the user)
+  <!-- Gap lines come ONLY from `cornerstone_coverage.uncovered_list`. Scope to state: ID in either surface, tag in CLAUDE.md only. There is no second count: no slot for a coverage number you computed yourself (an improvised count over-counted ~6x on another seat). -->
+... or "None this scan." — **the denominator line is still required**.
+- If `cornerstone_coverage` is missing, carries `error`, or has an empty `surfaces_checked` (no surface was read): `instrument failed: <error or 'key missing'>` (for an empty `surfaces_checked`, write `instrument failed: surfaces_checked empty`) and list NO gaps. Never write "all covered" in that case, and never substitute a self-computed count.
 
 ## Category 11 — Cornerstones/lessons with support_lost
 - [cs_XXXX or ls_XXXX] (pattern-match) claim: <one-line> — candidate exemplars: <ob_or_dv_id>, <ob_or_dv_id> (<one-line why each fits>) — suggested action: dream-master rewires via `engram_register_exemplar` per the `engram-support-lost` skill.

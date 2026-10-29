@@ -39,15 +39,27 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b): it would resolve against this process's cwd, a
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b, step 3a): it would resolve against this process's cwd, a
 # different home than the daemon's or the server's. Fail open: one stderr line, nothing written, exit 0.
-# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import.)
-_ENGRAM_HOME_RAW = os.environ.get("ENGRAM_HOME") or ""
-if _ENGRAM_HOME_RAW and not os.path.isabs(os.path.expanduser(_ENGRAM_HOME_RAW)):
-    sys.stderr.write("engram hook: ENGRAM_HOME must be an absolute path, got %r; doing nothing\n" % (_ENGRAM_HOME_RAW,))
+# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import. engram_home() is a
+# VERBATIM copy of tools/_owner_read.engram_home(), pinned by tests/test_engram_home_parity_3863.py.)
+def engram_home() -> Path:
+    """The ENGRAM home: $ENGRAM_HOME (default ~/.engram) when set and non-empty, expanded and absolute;
+    a RELATIVE value is refused (ValueError naming it). Verbatim pinned copy (see the comment above)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
+
+
+try:
+    _ENGRAM_HOME_PATH = engram_home()
+except ValueError as _exc:
+    sys.stderr.write("engram hook: %s; doing nothing\n" % (_exc,))
     sys.exit(0)
-if _ENGRAM_HOME_RAW:
-    os.environ["ENGRAM_HOME"] = os.path.abspath(os.path.expanduser(_ENGRAM_HOME_RAW))  # `~/x` -> absolute for every raw reader
+if os.environ.get("ENGRAM_HOME"):
+    os.environ["ENGRAM_HOME"] = str(_ENGRAM_HOME_PATH)  # `~/x` -> absolute for every raw reader
 
 # #3628: every read and write here is non-blocking and regular-file-only. This
 # file's own directory is sys.path[0] when run as a script; insert it so test
@@ -55,14 +67,14 @@ if _ENGRAM_HOME_RAW:
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import read_regular_text, open_regular_text_write
+from _hooklib import read_regular_text, open_regular_text_write, bounded_parents
 
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None
 
-ENGRAM_DIR = Path(os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram"))
+ENGRAM_DIR = _ENGRAM_HOME_PATH
 SESSIONS_DIR = ENGRAM_DIR / "sessions"
 LAST_USER_MSG = ENGRAM_DIR / "last-user-msg.json"
 LAST_USER_ACTIVITY = ENGRAM_DIR / "last-user-activity"
@@ -92,7 +104,8 @@ _lp_candidates = []
 _lp_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
 if _lp_plugin_root:
     _lp_candidates.append(Path(_lp_plugin_root) / "tools")
-for _lp_parent in Path(__file__).resolve().parents:
+# Own tree only: up to and including the tree root, never above it (#3983).
+for _lp_parent in bounded_parents(Path(__file__).resolve()):
     _lp_candidates.append(_lp_parent / "tools")
 # (c / "loop_prompt.py").exists() raises OSError -- not False -- on an
 # unreadable candidate directory, and this whole block runs at bare

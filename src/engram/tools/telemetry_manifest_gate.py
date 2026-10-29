@@ -2,7 +2,7 @@
 """telemetry_manifest_gate.py — §4a manifest gate for the telemetry redesign
 (issue #2574, workstream WS2).
 
-Design: docs/2574-telemetry-design.md — read §1 (PARTICIPATION DEFINITION)
+Design: docs/internal/2574-telemetry-design.md — read §1 (PARTICIPATION DEFINITION)
 and §4a (the registry) before touching this file. This module is WS2's
 deliverable; it does NOT wire any real `site=` kwargs into emit call sites
 (that is WS3's job) and does NOT touch the telemetry store (WS1) or consumer
@@ -34,7 +34,7 @@ whole real tree, so both verdicts are trivially empty. That is EXPECTED, not a
 loophole — `--self-test` proves the extraction logic is live (it plants a
 positive fixture and asserts the gate actually catches it), rather than green
 by vacuous truth. See the module docstring's own warning in
-docs/2574-telemetry-design.md's Validation section: "a scanner that reports
+docs/internal/2574-telemetry-design.md's Validation section: "a scanner that reports
 clean is indistinguishable from one whose patterns never matched anything."
 
 BACKWARD CALL-GRAPH WALK (§1, "The fix is to DERIVE it")
@@ -156,7 +156,7 @@ TRANSPORT_EXCLUSION_FILE = "engram_log_emitter.py"
 # AST scan can find a `site="..."` literal directly at THAT call, not only
 # at Emitter.emit()) shifted it again, from :281 to :287. Re-verify with
 # `--report` after any future engram_log_emitter.py edit -- this is exactly
-# the stale-line-number failure mode docs/2574-telemetry-design.md §1 warns
+# the stale-line-number failure mode docs/internal/2574-telemetry-design.md §1 warns
 # against, one level down in this gate's own exclusion constant rather than
 # in a manifest_id.
 TRANSPORT_EXCLUSION_LINENO = 287

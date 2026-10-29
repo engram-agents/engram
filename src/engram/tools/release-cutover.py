@@ -625,13 +625,13 @@ def main():
         print(f"  target tag   : {args.version} @ {tag_sha}")
         print()
         if args.push:
-            print("REMAINING \u2014 the release is NOT done until these are live (docs/RELEASING.md, \"Announcing\" + \"Tell the public\"):")
+            print("REMAINING \u2014 the release is NOT done until these are live (docs/internal/RELEASING.md, \"Announcing\" + \"Tell the public\"):")
             print("  [ ] Releases entry: gh release create <tag> --repo engram-agents/engram --notes-file <CHANGELOG section>  (owner: the seat that ran --push; a tag push does NOT create it)")
             print("  [ ] Website Versions entry, en + zh, live at https://engram-agents.org/versions  (owner: Ariadne; Zephyr may do zh)")
             print("  [ ] Newsletter sent to ENGRAM Communications (Buttondown), linking the live Versions entry and the Releases page  (owner: Ariadne)")
             print("Report the version as released only after all three; Releases entry first, then website, then newsletter.")
         else:
-            print("  After --push, three public steps remain (Releases entry, website entry, newsletter); see docs/RELEASING.md \"Announcing\" + \"Tell the public\".")
+            print("  After --push, three public steps remain (Releases entry, website entry, newsletter); see docs/internal/RELEASING.md \"Announcing\" + \"Tell the public\".")
         print()
         print("CAVEAT: scan-leaks is necessary-but-not-sufficient — it catches the configured")
         print("roster patterns and committed structural patterns. Extensionless files are skipped.")

@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "scan_prefixes": [
+    "src/",
+    "tools/"
+  ],
+  "baseline": {},
+  "allowlist": {
+    "src/engram/tools/_owner_read.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/_hooklib.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/_prompthooklib.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/tools/forum_api.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/build/engine/flows.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/engram_home_resolver.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/engram-lesson-tripwire-hook.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/engram-loop-arm-stop-hook.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/engram-stale-tree-warn-hook.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/engram-time-bar-hook.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/tools/baton_gate.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    }
+  }
+}
