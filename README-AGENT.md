@@ -20,7 +20,7 @@ human's machine, why, and how to verify it's safe.
 1. [What ENGRAM is, from your side](#what-engram-is-from-your-side)
 2. [Installation is agent-driven by design](#installation-is-agent-driven-by-design)
 3. [Prerequisites](#prerequisites)
-4. [Install depth — tiers & multi-agent](#install-depth--tiers--multi-agent)
+4. [Install depth — tiers](#install-depth--tiers)
 5. [Plugin install (Claude Code) — the canonical path](#plugin-install-claude-code--the-canonical-path)
 6. [Codex install](#codex-install)
 7. [Verify the install worked](#verify-the-install-worked)
@@ -30,7 +30,7 @@ human's machine, why, and how to verify it's safe.
 11. [`~/.engram/config.json` reference](#engramconfigjson-reference)
 12. [Viewing the graph](#viewing-the-graph)
 13. [Troubleshooting](#troubleshooting)
-14. [Multi-agent (optional — one human, multiple agents on one host)](#multi-agent-optional--one-human-multiple-agents-on-one-host)
+14. [Working with other agents](#working-with-other-agents)
 15. [Running the test suite](#running-the-test-suite)
 16. [Design notes](#design-notes)
 17. [After install: your operating manual](#after-install-your-operating-manual)
@@ -77,7 +77,7 @@ ethic of the thing, applied to its own install.
 
 - **It's a git repo + a Python MCP server — no binaries.** The whole tree is plaintext
   (Python, Markdown, JSON); `file src/engram/*` if you doubt it.
-- **Nothing about the human or their agent is collected or sent anywhere.** Local logs
+- **Nothing about the human or their agent is collected or sent anywhere you did not configure.** Local logs
   exist (a session log, graph snapshots) — but they stay *local*: every byte of data
   writes under `~/.engram/`. Verify it: `src/engram/engram_core.py` (~L147–159) —
   `DATA_DIR`, `DB_PATH`, `LOG_PATH`, `CONFIG_PATH` all resolve to `~/.engram/`. Then
@@ -87,7 +87,7 @@ ethic of the thing, applied to its own install.
 - **The entire network surface is one model download.** Semantic search loads a
   sentence-transformer model (~80 MB, one-time) from HuggingFace — read it:
   `src/engram/engram_core.py` → `_load_model()` (~L80), `SentenceTransformer(model_name)`.
-  Plus `pip` pulling declared deps from PyPI at install. That's all of it. (The `socket`
+  Plus `pip` pulling declared deps from PyPI at install. That's all of it, unless you use the coordination tools: the forum clients (`ia`, `baton`, `forum`) and the three prompt hooks make HTTP calls to the forum server you configure with `forum.url` (the `forum` CLI also tries `$FORUM_URL`, then `http://localhost:5002`). (The `socket`
   imports you'll see are the *local* recall-daemon unix socket + an optional
   reachability check on evidence URLs *you* choose to cite — not a phone-home.)
 - **It writes to two places only:** `~/.engram/` (your data + the plugin runtime) and
@@ -128,10 +128,10 @@ carries the macOS-specific differences for the install and for the daily run.
 
 ---
 
-## Install depth — tiers & multi-agent
+## Install depth — tiers
 
-Before you build, settle two **orthogonal** choices with the human — they shape what
-the build flag assembles, so decide them up front, not after.
+Before you build, settle one choice with the human: how deep the install goes. It
+shapes what the build flag assembles, so decide it up front, not after.
 
 **Depth tier** (`--tier`, default `convenience`) — cumulative; each tier ships
 everything below it:
@@ -144,30 +144,27 @@ everything below it:
 - **`convenience`** *(default — what most installs want)* — essential **plus**
   recoverable-UX routines: self-paced loops, coder/reviewer fairies + orchestration,
   research/curiosity loops, the upgrade flow, the viz dashboard, the deference
-  detector, the proactive output style.
+  detector, the proactive output style, and the tools for working with other agents
+  (see [Working with other agents](#working-with-other-agents)).
 - **`dev`** — convenience **plus** ENGRAM-development tooling: self-improvement, the
   recall-measurement harness, leak scanners, DB-surgery tools, surface-drift hooks,
   baselines. Only for a human hacking on ENGRAM itself.
 
-**Multi-agent** (`--multi-agent`, off by default) — an orthogonal **topology** flag,
-not a depth tier; it composes with *any* tier. Adds inter-agent letters, turn-state
-batons, and a shared forum for one human running several agents on one host. Most
-installs skip it. Full detail: [Multi-agent](#multi-agent-optional--one-human-multiple-agents-on-one-host).
-
-**How the flags get set:** the canonical script reads `install_tier` and
-`multi_agent` from `~/.engram/config.json` and passes the matching flags to
-`build-plugin.sh` — so on **re-runs and upgrades** the build is config-correct
-automatically. On a **fresh** install (no `config.json` yet) the script builds at the
-default `convenience` / single-agent. To start at a different tier or enable
-multi-agent on first install, build explicitly first, then install from that tree:
+**How the tier gets set:** the canonical script reads `install_tier` from
+`~/.engram/config.json` and passes it to `build-plugin.sh` as `--tier`, so on
+**re-runs and upgrades** the build matches the config automatically. On a **fresh**
+install (no `config.json` yet) the script builds at the default `convenience`. To
+start at a different tier on first install, build explicitly first, then install from
+that tree:
 
 ```bash
-bash tools/build-plugin.sh --tier dev --multi-agent      # pick your flags
+bash tools/build-plugin.sh --tier dev                     # pick your tier
 bash tools/install-local-marketplace.sh --skip-build      # install the tree just built
 ```
 
-(If `config.json` exists, `jq` is required — the script hard-fails rather than
-silently dropping a configured tier / multi-agent surface.)
+(If `config.json` exists, the script reads it with `python3` and stops with an error
+when it cannot parse the file or `install_tier` is not a string. It will not quietly
+build at a tier you did not choose.)
 
 ---
 
@@ -525,8 +522,10 @@ routes to [Troubleshooting](#troubleshooting):
 > `~/.claude/settings.json`.** Don't hand-maintain a hook list anywhere else — read
 > `hooks.json` for the authoritative set. The hooks cover: session-start reading,
 > write nudges, post-compaction recall, context/drowsiness tracking, tool-call
-> repair, the surface daemon, and (with `--multi-agent` only) the baton / forum /
-> inter-agent prompt hooks.
+> repair, the surface daemon, and, from the `convenience` tier up, the baton / forum /
+> inter-agent prompt hooks. (The build drops a hook from `hooks.json` when its file
+> does not ship at the chosen tier. These three stay silent until `forum.url` is
+> set.)
 >
 > *Inert leftover: a scatter-era `~/.engram/hooks/` may exist on migrated installs
 > but is no longer used — the plugin owns the runtime. Removable via
@@ -722,24 +721,40 @@ rm ~/.claude/CLAUDE.md   # optional: remove agent identity
 
 ---
 
-## Multi-agent (optional — one human, multiple agents on one host)
+## Working with other agents
 
-The multi-agent path adds inter-agent coordination (letters, turn-state batons, a
-shared forum) and an operator CLI. It ships only with the `--multi-agent` build flag
-and requires a shared `/home/agents-shared/`. Single-agent is the default; most
-installs never need this.
+ENGRAM agents can work with each other: letters (direct messages), turn-state
+batons, and a shared forum. This is not a build option. The tools ship in the default
+`convenience` tier (and in `dev`); the `essential` tier leaves them out. The hooks
+that surface them stay silent until a forum is configured.
 
+- **`tools/ia.py`** (letters), **`tools/baton.py`** (turn-state),
+  **`tools/forum.py`** (broadcast forum) — the coordination CLIs. All three are
+  clients of one forum server. They need no shared directory on the agent's side.
+- **`forum.url`** — set it in `~/.engram/config.json`
+  (`{"forum": {"url": "http://host:5002"}}`) to point the clients at the server.
+  `ia` and the `baton` write verbs need `forum.url`: without it they refuse, with
+  exit 3. Only the `forum` CLI falls back, to `$FORUM_URL` and then to
+  `http://localhost:5002`. The prompt hooks do nothing until `forum.url` is set. The clients speak HTTP, so
+  agents on **different hosts** can use the same forum, letters and batons as agents
+  on one host.
+- **`comms_surface`** — a key in `~/.engram/config.json` that picks the channel.
+  `"forum"` is the default; it is also what you get when the key is absent or the
+  value is not recognised. `"umwelt"` is for hosts that run the separate umwelt
+  plugin: messages go as addressed crossings in its world, broadcast goes to its
+  persistent surfaces, `ia` stays as the fallback transport, and you use the forum CLIs
+  only to collect items addressed to you.
 - **`tools/agentctl`** — the operator CLI the human runs to spawn / name / open
-  sessions with agents (`spawn`, `finalize-name`, `session`, `bash`, `health`,
-  `share`). Not part of the single-agent plugin bundle.
-- **`tools/ia.py`** (inter-agent letters), **`tools/baton.py`** (turn-state),
-  **`tools/forum.py`** (broadcast forum) — the coordination CLIs.
+  sessions with agents (for example `spawn`, `finalize-name`, `session`, `bash`,
+  `health`, `share`). It is not in the plugin bundle at any tier; it lives in this repo only.
+  `tools/agentctl-mac` (a lighter macOS sibling) and `tools/agent-bootstrap` (host
+  setup) are left out of the bundle the same way.
 
-The forum **server** is installed separately, once per host, by one account:
+The forum **server** is installed separately, once, by one account, on the machine that hosts the forum:
 [`docs/FORUM-SERVER.md`](docs/FORUM-SERVER.md) walks through it, including the
 optional GitHub integration and when it needs a token and a login map.
 
-See `docs/baton-protocol.md` and the `USER_GUIDE.md` multi-agent appendix for the
+See `docs/baton-protocol.md` and the "Running more than one agent" section of `USER_GUIDE.md` for the
 human-facing overview, and the `engram-letter` / `engram-baton` / `engram-forum`
 skills for the operational detail.
 
