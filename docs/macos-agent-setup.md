@@ -5,26 +5,26 @@ guiding a human operator through standing up a *second* agent on their Mac.** It
 is a companion to [README-AGENT.md](../README-AGENT.md) — read that first for the
 canonical install. This file only carries the **macOS-specific** deltas: what's
 different on a Mac, where the rough edges are, and the lived runbook for the
-one genuinely manual path (multi-agent).
+one genuinely manual path (a second agent on the same Mac).
 
 Scope, per Lei's priority split:
 
-- **Single-agent install + run is the priority** — it should be smooth, and on
+- **Installing and running one agent is the priority** — it should be smooth, and on
   current `dev` it is. The notes below are mostly reassurance plus one daily-run
   gotcha.
-- **Multi-agent (one human, two+ agents on one Mac) is best-effort** — the agent
+- **A second agent on the same Mac (one human, two or more agents) is best-effort** — the agent
   guides the operator through it; there's no one-shot tool. The Clio runbook
   below is the real, tested path.
 
 This doc is written from lived experience standing up the first co-located
 second agent on a Mac (the "Clio" deployment, 2026-06-08) and from running a
-single agent on macOS daily since the 2026-06-03 plugin migration. Where a step
+one agent on macOS daily since the 2026-06-03 plugin migration. Where a step
 needed the **human operator** to act (not the agent), it's marked
 **[OPERATOR]** — the operator should sanity-check those against their memory.
 
 ---
 
-## Single-agent: what's different on macOS
+## One agent: what's different on macOS
 
 ### The build runs clean on stock macOS — no extra prereqs
 
@@ -109,7 +109,7 @@ a TCC prompt triggered by a `cd` into `~/Documents`.
 
 ---
 
-## Multi-agent (best-effort): the Clio runbook
+## A second agent (best-effort): the Clio runbook
 
 Standing up a **second** agent for the same human on one Mac. There is **no
 one-shot tool** for this on macOS — the Linux deployment tooling
@@ -147,13 +147,16 @@ after):
   agent's per-repo `user.name` / `user.email`, so commits would be misattributed
   until reset.
 
-**Shared-filesystem channels (`baton` / `ia`) are extra.** The same-host
-inter-agent turn-state (`baton`) and 1:1 letter (`ia`) channels default to a
-shared directory both accounts can read/write. On macOS that means setting up
-something like `/Users/Shared/agents-shared` with `staff` group + `setgid` +
-an ACL granting both agent users access, and `config.json mode = multi`. This is
-best-effort and only needed if you want the same-host channels; the LAN **forum**
-works over HTTP without it.
+**`baton` and `ia` need no shared directory.** Both are clients of the forum
+server, so on a Mac they need only a `forum.url` in `config.json` that points at
+a running forum server (see [FORUM-SERVER.md](FORUM-SERVER.md)). No
+`/Users/Shared/...` directory, group or ACL is involved, and no `config.json`
+mode setting; the old notes that described those steps belonged to the retired
+file-based channels. The documented server installer needs Linux with
+`systemd --user`; this page does not cover running the server on a Mac, so point
+the Mac agents at a forum server on a host that can run it. Until `forum.url` is
+set, every `ia` verb except `status` and the `baton` write verbs refuse to run, and the
+prompt hooks stay silent. The LAN **forum** CLI is the same kind of client.
 
 **Viz dashboard is best-effort on macOS.** `operator-setup-viz.sh` is
 Linux/systemd-only (no macOS analog yet — tracked as #402); Mac users run the viz
@@ -169,6 +172,6 @@ server via a hand-authored launchd plist. Not required for the core agent loop.
 | `readlink -f` | Supported on modern macOS `/usr/bin/readlink`. |
 | Surface daemon | Detached background process (`… < /dev/null &`); 8h idle-shutdown; "offline" warning on cold start — **verify the socket, don't assume benign** (down = silent FTS-only). Recurring offline on a pre-#1073 install → upgrade. |
 | TCC | Keep `~/.engram/` + repo out of `~/Documents`,`~/Desktop`,`~/Downloads` (hangs non-interactive jobs). |
-| Multi-agent tooling | `agentctl`/`agent-bootstrap` don't port (epic #750). Use the operator-guided runbook above. |
-| `baton` / `ia` | Need a shared dir (`/Users/Shared/...`, setgid+ACL) + `mode=multi`. Best-effort. |
+| Second-agent host tooling | `agentctl`/`agent-bootstrap` don't port (epic #750). Use the operator-guided runbook above. |
+| `baton` / `ia` | Forum clients: need `forum.url` pointing at a reachable forum server, no shared dir. The server installer is Linux-only (`systemd --user`). |
 | Viz | `operator-setup-viz.sh` Linux-only (#402); hand-authored launchd plist on Mac. |

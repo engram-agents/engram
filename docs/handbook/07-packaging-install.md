@@ -25,11 +25,11 @@
 
 ## Manifest (src/build/packaging/tiers.json, schema v1)
 
-125 tiered mechanisms (62 essential / 50 convenience / 13 dev; cumulative ⊂-model) + 12 multi_agent-flagged + 4 identity-coupled (dropped for `--identity foreign`) + 17 excluded-with-reason (persona tools, operator tools, superseded hook, CI test files). Plus the two whole-tree buckets #991 added: `repo_only[]` (23 — tracked non-shippables: tests/CI/docs/root) + `build_inputs[]` (5 — build/install inputs). **Zero dangling entries** (all tiered paths exist). Coverage: now whole-tree default-deny — every git-tracked file must carry exactly one declared role (see §CI gates).
+125 tiered mechanisms (62 essential / 50 convenience / 13 dev; cumulative ⊂-model) + 4 identity-coupled (dropped for `--identity foreign`); the separate flag axis that once marked some mechanisms is retired (#4255), so the depth tier is the only filter + 17 excluded-with-reason (persona tools, operator tools, superseded hook, CI test files). Plus the two whole-tree buckets #991 added: `repo_only[]` (23 — tracked non-shippables: tests/CI/docs/root) + `build_inputs[]` (5 — build/install inputs). **Zero dangling entries** (all tiered paths exist). Coverage: now whole-tree default-deny — every git-tracked file must carry exactly one declared role (see §CI gates).
 
 ## Build engine (tools/engine/ + build-plugin.sh wrapper)
 
-Phase 1 (manifest load → tier+flag filter → copy to build/plugin/) · Phase 2 (hooks.json generation, reference resolution) · Phase 3 (platform profiles, --target claude-code|codex, --identity self|foreign with leak-scan). Files: manifest.py (load/validate/resolve: ships(m) := rank(tier) ≤ rank(chosen) AND (¬multi_agent OR chosen)) · build.py (transforms + codex emitters) · steps.py (convergent step-DAG for flows) · cli.py (build/plan/run/doctor). PROD-VERIFIED: graduated via golden-equivalence (#793), legacy bash retired. Codex target: implemented, **untested** (no codex-target test — L4 finding).
+Phase 1 (manifest load → tier filter → copy to build/plugin/) · Phase 2 (hooks.json generation, reference resolution) · Phase 3 (platform profiles, --target claude-code|codex, --identity self|foreign with leak-scan). Files: manifest.py (load/validate/resolve: ships(m) := rank(tier) ≤ rank(chosen)) · build.py (transforms + codex emitters) · steps.py (convergent step-DAG for flows) · cli.py (build/plan/run/doctor). PROD-VERIFIED: graduated via golden-equivalence (#793), legacy bash retired. Codex target: implemented, **untested** (no codex-target test — L4 finding).
 
 ## Platform profiles (src/build/packaging/platforms/)
 
@@ -37,14 +37,14 @@ claude-code.json (identity_doc CLAUDE.md, .mcp.json, hook envelope text-ok) · c
 
 ## Installers
 
-- **install-local-marketplace.sh** — builds (if needed) + assembles `$ENGRAM_HOME/marketplace/` + registers; reads config.json {install_tier, multi_agent} (the #704/#707 silent-misbuild fixes). PROD-VERIFIED (used for every upgrade incl. today's).
+- **install-local-marketplace.sh** — builds (if needed) + assembles `$ENGRAM_HOME/marketplace/` + registers; reads config.json {install_tier} (the #704/#707 silent-misbuild fixes; it no longer reads or writes the retired flag key, #4255). PROD-VERIFIED (used for every upgrade incl. today's).
 - **migrate-to-plugin.sh** — one-time scatter→plugin: preflight → backup-first → plugin surfaces (+PAUSE /plugin install) → scatter removal → knowledge.db integrity assert → (+PAUSE MCP restart) → --verify. Data allowlist NEVER deleted. #713 idempotency fixes in. PROD-VERIFIED (4 installs migrated).
 - **install-gemini.sh** — RETIRED by #865 (removed from tree 2026-06-06).
 - tests/install/run_install_test.sh — de-personalization grep gate on shipped agent specs.
 
 ## Templates (templates/)
 
-9 shipped+tiered: template.CLAUDE.md (essential; placeholder-rendered identity floor) + multi-agent variant · template.warm-briefing.md · config.json.example (schema v2) · template.AGENTS.md (codex) · compact-instructions (Codex-only as of #2067 — feeds `codex-compact-prompt.md` / `experimental_compact_prompt_file`; no longer folded into template.CLAUDE.md, see docs/compaction-continuity.md) · 3 systemd units (surface-daemon, viz-user, viz). **UPDATE (#2857 step 2, 2026-09-14):** agents.json.example moved from shipped+tiered to `excluded[]` — Lei's ruling: local multi-agent support has no clean guideline/tooling story yet, and every current external user runs single-agent-per-machine. (3 templates for the external-cron heartbeat system were retired by #957 — see §6.2 of 03-hooks.md.) Templates verified current — no retired-scatter references found (the #783/#787 settings.hooks.json.template defect class is resolved; that file is gone). The 3 gemini-cli templates (integrations/gemini-cli/) were RETIRED by #865 alongside the lane.
+9 shipped+tiered: template.CLAUDE.md (essential; placeholder-rendered identity floor) + a variant for hosts that run several agents · template.warm-briefing.md · config.json.example (schema v2) · template.AGENTS.md (codex) · compact-instructions (Codex-only as of #2067 — feeds `codex-compact-prompt.md` / `experimental_compact_prompt_file`; no longer folded into template.CLAUDE.md, see docs/compaction-continuity.md) · 3 systemd units (surface-daemon, viz-user, viz). **UPDATE (#2857 step 2, 2026-09-14):** agents.json.example moved from shipped+tiered to `excluded[]` — Lei's ruling: running several agents on one machine has no clean guideline/tooling story yet, and every current external user runs one agent per machine. (3 templates for the external-cron heartbeat system were retired by #957 — see §6.2 of 03-hooks.md.) Templates verified current — no retired-scatter references found (the #783/#787 settings.hooks.json.template defect class is resolved; that file is gone). The 3 gemini-cli templates (integrations/gemini-cli/) were RETIRED by #865 alongside the lane.
 
 ## CI gates (.github/workflows/)
 

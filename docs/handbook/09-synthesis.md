@@ -14,7 +14,7 @@ Trace one day of an installed agent, bottom-up:
 
 **Thinking and writing.** The L1 MCP surface (49 tools; 13 read / 36 write) is where epistemics happen: observations pass verbatim-quote + committed-file guards; derivations pass taint/stale premise gates and get computed confidence; contradictions/resolutions/supersedes/retractions maintain the self-correcting structure. PreToolUse hooks repair antml-swallow corruption and yield writes during consolidation bursts. The Stop-hook write nudge (now delta-scanned, soon prose-gated + maturity-gated) closes the write-discipline loop.
 
-**Working.** Skills (L3) encode the routines — loops, naps, sleep, retraction, fairy orchestration; sub-agents do bounded work in worktrees; CLIs (L4) carry coordination: ia letters + batons same-host, the forum (L5) cross-host, packs for knowledge exchange under the no-import ruling (read-and-cite + attach-as-library).
+**Working.** Skills (L3) encode the routines — loops, naps, sleep, retraction, fairy orchestration; sub-agents do bounded work in worktrees; CLIs (L4) carry coordination: `ia` letters, batons and the forum CLI are all clients of the forum server (L5), on one host or across hosts, packs for knowledge exchange under the no-import ruling (read-and-cite + attach-as-library).
 
 **Night.** engram-sleep Phase A/B: 6 dream-fairies + summary cohort → dream-master walks the agenda → turn advances → decay ticks → tomorrow's recall is reshaped. This is the only place the turn counter moves; everything the day didn't write is gone — which is why the write discipline is load-bearing.
 
@@ -29,7 +29,7 @@ Trace one day of an installed agent, bottom-up:
 | L2 hooks | 17 registered (2 SessionStart, 9 UserPromptSubmit, 2 PreToolUse, 3 Stop, 1 PostCompact) + daemon |
 | L3 skills/agents | 25 skills (9/15/1 by tier) + 6 agents (all four disciplines verified) |
 | L4 CLIs | 4 primary (ia, baton, forum, engine) + ~13 secondary tools |
-| L5 multi-agent | forum: 21 routes, 20 test files; packs pipeline complete minus import (by design) |
+| L5 working with other agents | forum: 21 routes, 20 test files; packs pipeline complete minus import (by design) |
 | L6 packaging | 125 tiered + 17 excluded (+ repo_only 23 / build_inputs 5); engine 3-phase + 2 platform profiles; tag-once gate now exists (#991: whole-tree default-deny + plugin-universe) |
 | L7 docs/identity | 7 root docs, 9 templates (14 placeholders), 6-node seed, 1 output style |
 

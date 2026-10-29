@@ -671,9 +671,9 @@ class TestFlipIsTheSameGate:
         assert world.flip(to=AUTHOR, agent=SEAT, reason="needs a fix").status_code == 201
         assert world.flip(to=SEAT, agent=AUTHOR, reason="fixed").status_code == 201
 
-    def test_single_agent_baton_without_colleague_keeps_the_old_flip_gate(self, world):
+    def test_baton_without_colleague_keeps_the_old_flip_gate(self, world):
         # No colleague => no peer phase to cross; flip-to-maintainer is the
-        # unchanged warn-and-proceed single-agent path. `advance` itself refuses.
+        # unchanged warn-and-proceed no-colleague path. `advance` itself refuses.
         world.gh.reviews = []
         world.seed(colleague=None, participants=(AUTHOR,), turn=AUTHOR, phase="fairy")
         assert world.flip(to=SENTINEL, agent=AUTHOR, reason="ready").status_code == 201

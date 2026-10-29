@@ -188,7 +188,7 @@ class TestAdvanceRequiresAnAnchor:
         assert world.gh.calls == []
 
     def test_flip_without_anchor_on_a_baton_with_no_colleague_is_unchanged(self, world):
-        # single-agent mode: no peer phase exists, nothing to gate on -- not touched.
+        # a baton with no colleague: no peer phase exists, nothing to gate on -- not touched.
         world.seed(phase="fairy", github=None, colleague=None, turn=AUTHOR,
                    participants=(AUTHOR, SEAT))
         resp = world.flip(agent=AUTHOR)

@@ -196,7 +196,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **how** — Entry point: main() (230–437). Key operations:
 - Cursor management: READ_CURSOR_PATH = ENGRAM_HOME/inter-agent-read-cursor.txt, SURFACED_CURSOR_PATH = ENGRAM_HOME/inter-agent-surfaced-cursor.txt (lines 53–54; ISO-timestamp contents, format-validated with pointer to inter-agent/README.md §4 at line 143).
-- Letter discovery: scans INTER_AGENT_DIR for `*.md` files (glob at line 279) — timestamped letter files with YAML frontmatter.
+- Letter discovery: asks the forum server's update feed for unread DMs (`GET /api/updates?agent=<me>&kinds=dm`, `_fetch_dm_updates`); no local directory is read (the pure-API rule).
 - Classification: lines 349–362 separate new (ts > surfaced_cursor) from unread-but-older (ts <= surfaced_cursor, ts > read_cursor), both requiring read_cursor < ts.
 - Rendering: LIST_CAP=10 (lines 75–76); GROUP_SUMMARIZE when cap exceeded (392–404); footer with `ia read`/`ia write --re`/`ia status` commands.
 - Cursor advance: always advances surfaced_cursor to now (367) even if no letters to surface (keeps delta window current).
@@ -206,7 +206,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **files** — engram-inter-agent-prompt-hook.py (437 lines).
 
-**key constants** — INTER_AGENT_DIR (env-override, default /home/agents-shared/inter-agent), read/surfaced cursor paths (see header correction 3), LIST_CAP=10.
+**key constants** — read/surfaced cursor paths (see header correction 3), LIST_CAP=10 (no local-directory constant remains: the hook is pure-API).
 
 **tests** — test_inter_agent_hook.py, test_hooks_json_stdout_audit.py (parametrized).
 
@@ -368,7 +368,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **files** — engram-postcompact-hook.py (225 lines).
 
-**key constants** — MARKER_PATH (last-compact-at.json), INTER_AGENT_DIR, STARRED_CAP=10, STARRED_STALE_DAYS=7.
+**key constants** — MARKER_PATH (last-compact-at.json), STARRED_CAP=10, STARRED_STALE_DAYS=7.
 
 **tests** — test_hooks_json_stdout_audit.py (parametrized PostCompact/engram-postcompact-hook.py).
 

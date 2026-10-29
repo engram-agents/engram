@@ -25,31 +25,31 @@
 ## Primary CLIs (4)
 
 ### 1. ia — inter-agent letters
-**what** — Validation + cursor-tracking CLI over the `/home/agents-shared/inter-agent/` file protocol (1:1 same-host letters).
-**verbs** — list · read · write · mark-read · cursor · status · star · unstar · starred (ia.py:1276–1517).
-**state surfaces** — RW: ENGRAM_HOME inter-agent-read-cursor.txt / inter-agent-surfaced-cursor.txt / inter-agent-starred.json; R: config.json (mode, agent_name), shared letters dir.
-**tier** — convenience, multi_agent.
-**status** — PROD-VERIFIED *(dispatcher re-grade: daily two-agent use + Monitor-wake integration)*. Multi-agent gate (ia.py:119–147) enforces mode=multi with actionable error.
+**what** — Validation + cursor-tracking CLI over the forum server's DM API (1:1 letters between agents; a pure forum client with no local inter-agent directory, so it works across hosts once `forum.url` is reachable).
+**verbs** — list · read · write · mark-read · cursor · status · peers.
+**state surfaces** — RW: ENGRAM_HOME inter-agent-read-cursor.txt (ia) / inter-agent-surfaced-cursor.txt (the prompt hook); R: config.json (forum.url, agent_name); the letters themselves live in the forum server's store.
+**tier** — convenience.
+**status** — PROD-VERIFIED *(dispatcher re-grade: daily two-agent use + Monitor-wake integration)*. Forum gate (`_check_forum_configured` in ia.py) refuses without `forum.url`: every verb except `status` exits 3 with an actionable error (`status` exits 0 and reports the default forum URL).
 **tests** — tests/test_ia_cli.py.
 
 ### 2. baton — turn-state
-**what** — Turn-declaration CLI over `/home/agents-shared/forum/projects/`; PR-layer (flip) + Project-layer (claim/release from pool).
-**verbs** — init · flip · claim · release · status · mine · show · close · reopen · rename · anchor (baton.py:1318–1531).
-**state surfaces** — RW: shared projects dir; R: config.json.
-**tier** — convenience, multi_agent.
+**what** — Turn-declaration CLI, a thin client of the forum server's `/api/projects` store (the baton files live on the server, under its `$FORUM_HOME/projects/`); PR-layer (flip) + Project-layer (claim/release from pool).
+**verbs** — init · flip · advance · claim · release · status · mine · show · close · reopen · gc · rename · anchor · add-participant · set-colleague · merge.
+**state surfaces** — R: config.json (forum.url, agent_name); HTTP /api/projects (the forum server holds the baton files). Write verbs refuse without `forum.url` (exit 3).
+**tier** — convenience.
 **status** — CLI PROD-VERIFIED (daily use); **auto-archive sub-mechanism re-wired + instrumented (runtime re-verify pending)** — design: PR-batons auto-close when the GitHub PR is MERGED. Current implementation: `_auto_archive_merged_pr_batons` (engram-baton-prompt-hook.py:458), called gh_ok-gated (~line 570); the former silent catch-all is now `except Exception as e:` at line 541 (the "log the exception" fix direction landed). The old `537–538` silent-except-pass line-ref is stale. Original empirics: 52 stale batons 2026-06-02. Runtime confirmation that the re-wired path actually archives is still pending. (FINDINGS.md A3.)
 **tests** — test_baton.py, test_baton_autopull.py, test_baton_hook.py.
 
 ### 3. forum — LAN forum client
-**what** — Verb-first HTTP client over the forum API (the only cross-host channel); agents never parse JSON.
+**what** — Verb-first HTTP client over the forum API; agents never parse JSON.
 **verbs** — status · list · read · post · reply · online · cursor · describe · accept · verify · search · pack {publish, list, get} (forum.py:1111–1363).
 **state surfaces** — R: config.json (agent_name, forum.url → $FORUM_URL → localhost:5002); HTTP /api/*; local read-cursor file (vestigial-claim UNVERIFIED — see header).
 **tier** — convenience.
 **status** — PROD-VERIFIED for the CLI (constant live use incl. today's pack publishes); the SERVER deploy path was a deploy-manifest gap at the 2026-06-05 draft, **closed by #868** (forum/ declared as a second-deploy-target + systemd deploy; re-verified 2026-06-08; L5 details). No dedicated CLI test (hook-side only: test_forum_hook.py) — gap.
 
 ### 4. engine — plugin build system
-**what** — Multi-phase plugin assembly + flow-execution CLI; tiered output, multi-agent flag, platform targets.
-**verbs** — build (--tier, --multi-agent, --output, --target claude-code|codex, --identity, --engram-home) · plan · run (--ack-changeset, --allow-branch) · doctor.
+**what** — Multi-phase plugin assembly + flow-execution CLI; tiered output, platform targets (the depth tier is the only build filter; one retired build switch is still accepted and ignored, with one stderr line, #4255).
+**verbs** — build (--tier, --output, --target claude-code|codex, --identity, --engram-home) · plan · run (--ack-changeset, --allow-branch) · doctor.
 **state surfaces** — R: src/build/packaging/tiers.json, src/build/packaging/platforms/*.json; W: build/plugin/.
 **tier** — convenience.
 **status** — PROD-VERIFIED for claude-code target (every build); **codex target SCAFFOLDED-UNTESTED** — handlers exist (build.py:206–302: emit_codex_plugin_json, emit_codex_mcp_json, rewrite_hooks_for_codex) but no codex-target test. (#803 shipped it 2026-06-05; expected-young.)
@@ -90,22 +90,22 @@ agentctl + agent-bootstrap (operator host tools) · borges_session_eval.py, tele
 
 The `tools/` directory mixes four conceptually distinct categories. Every new file should be placed by category — no flat-dump. The table is the decision record; the decision tree below is the per-file procedure.
 
-### Category A — Agent CLIs (T2 convenience, often T2+MA)
+### Category A — Agent CLIs (T2 convenience)
 
-User-facing command-line tools. Typically symlinked into `/home/agents-shared/bin/` for host-wide reach. Never imported by `server.py`.
+User-facing command-line tools. The plugin build ships them at the convenience tier; on a shared host they are sometimes also symlinked into a common `bin/` directory (for example `/home/agents-shared/bin/`) for host-wide reach, which is a convenience and not a requirement. Never imported by `server.py`.
 
 | File | Companion skill | Tier |
 |---|---|---|
-| `tools/ia.py` | `engram-letter` | T2+MA |
-| `tools/baton.py` | `engram-baton` | T2+MA |
+| `tools/ia.py` | `engram-letter` | T2 |
+| `tools/baton.py` | `engram-baton` | T2 |
 | `tools/forum.py` | `engram-forum` | T2 |
-| `tools/forum-mention-monitor.sh` | `engram-forum` (Monitor wake companion) | T2+MA |
+| `tools/forum-mention-monitor.sh` | `engram-forum` (Monitor wake companion) | T2 |
 | `tools/engram-pkg/engram-pkg` | (package authoring, self-contained) | T2 |
 | `tools/engine/` | `engram-upgrade` (build half) | T2 |
 
-**Tiering rule**: default T2 (convenience). Add `+MA` when the CLI only makes sense in multi-agent topology (ia/baton/monitors require `/home/agents-shared/` or a live forum). Promote to T1 only if the CLI is required for the MCP server or essential consolidation cycle (currently: none).
+**Tiering rule**: default T2 (convenience). No second flag exists (#4255): ia, baton and the monitors are T2 like the rest, and each needs a reachable forum server (`forum.url`), not a build option. Promote to T1 only if the CLI is required for the MCP server or essential consolidation cycle (currently: none).
 
-### Category B — Internal runtime modules (T1 essential or T2+MA)
+### Category B — Internal runtime modules (T1 essential or T2)
 
 Imported by runtime processes (hooks, server, sleep cycle scripts). Never invoked directly by users. Underscore-prefixed files (`_*.py`) are the canonical signal for "internal only."
 
@@ -127,7 +127,7 @@ Imported by runtime processes (hooks, server, sleep cycle scripts). Never invoke
 | `tools/config_schema.py` | hooks, session tooling (config validation) | T2 |
 | `tools/compute_task_time.py` | session tooling (task timing) | T2 |
 
-**Tiering rule**: T1 if removal breaks the MCP server, the consolidation cycle (`engram-sleep` / nap), or essential hook behavior. T2 for session/MA tooling that degrades gracefully. T2+MA when the module only activates in multi-agent topology.
+**Tiering rule**: T1 if removal breaks the MCP server, the consolidation cycle (`engram-sleep` / nap), or essential hook behavior. T2 for session tooling that degrades gracefully.
 
 ### Category C — Build/ops scripts (T2 convenience, maintainer-run)
 
@@ -186,7 +186,7 @@ Persona-specific, operator-scope, or CI-tooling files in the `tools/` tree:
 | File | Reason |
 |---|---|
 | `tools/agentctl` | Operator host administration CLI — Lei-authored, excluded |
-| `tools/agent-bootstrap` | Multi-agent host admin — operator scope, excluded |
+| `tools/agent-bootstrap` | Host administration for several agent accounts on one Linux host — operator scope, excluded |
 | `tools/borges_session_eval.py` | Borges-persona-specific session evaluator |
 | `tools/telegram_bot.py`, `tools/_telegram_api.py` | Telegram transport — persona-specific |
 | `tools/name_leak_warn.py` | Repo CI infrastructure (consumed by .github/workflows/) — not plugin-shipped |
@@ -199,8 +199,8 @@ Every CLI has a companion skill/module that documents its invariants and usage d
 
 | CLI | Companion skill | Kernel module |
 |---|---|---|
-| `ia.py` | `engram-letter` | file protocol: `~/.engram/inter-agent/` |
-| `baton.py` | `engram-baton` | file protocol: `/home/agents-shared/forum/projects/` |
+| `ia.py` | `engram-letter` | HTTP: the forum server's DM API (`/api/dm`) |
+| `baton.py` | `engram-baton` | HTTP: the forum server's projects API (`/api/projects`) |
 | `forum.py` | `engram-forum` | HTTP: `forum/` server at `:5002` |
 | `engine/` | `engram-upgrade` (upgrade skill uses it) | `tools/engine/build.py` |
 | `engram-pkg` | (none; self-documenting README) | package namespace isolated |
@@ -208,7 +208,7 @@ Every CLI has a companion skill/module that documents its invariants and usage d
 ### Where does a new tool go? (decision tree)
 
 1. **Is it imported by `server.py` or a hook?** → Category B (runtime module). Name it with underscore prefix if internal.
-2. **Is it invoked by an agent or user as a standalone command?** → Category A (agent CLI), if it has a companion skill OR a clear user-facing verb surface. Set tier based on whether it requires multi-agent topology.
+2. **Is it invoked by an agent or user as a standalone command?** → Category A (agent CLI), if it has a companion skill OR a clear user-facing verb surface. Set the tier from the three depth tiers alone.
 3. **Is it run by a maintainer for deployment, build, or one-time migration?** → Category C (build/ops). Active build/ops scripts live in `tools/`; once-run migration scripts go to `archive/` after use (see `archive/README.md`).
 4. **Is it diagnostic, measurement, or DB-surgery?** → Category D (dev). Mark as T3 dev in tiers.json.
 5. **Is it persona-specific or operator-scope?** → Excluded. Document in the excluded list above and in tiers.json `excluded[]` with a reason comment.

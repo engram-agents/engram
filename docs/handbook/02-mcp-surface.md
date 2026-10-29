@@ -419,7 +419,7 @@ Pre-compaction checkpoint (no turn advance).
 | PROD-PRESUMED | 5 | add_observation_batch, lesson_register_incident (compat shim — deprecation candidate), add_trust_signal, set_trust_tier (harness-gated approval flow), scan_emergence |
 | all other statuses | 0 | no zombies claimed at this layer — see header discount |
 
-**Top observability risks (fairy-ranked)**: scan_emergence (no downstream-action closure), set_trust_tier (approval flow unexercised single-agent), add_trust_signal (no feedback loop on signal influence), lesson_register_incident (compat shim), reflect (no finding-closure tracking).
+**Top observability risks (fairy-ranked)**: scan_emergence (no downstream-action closure), set_trust_tier (approval flow unexercised with one agent), add_trust_signal (no feedback loop on signal influence), lesson_register_incident (compat shim), reflect (no finding-closure tracking).
 
 | Metric | Value |
 |--------|-------|

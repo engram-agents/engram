@@ -41,7 +41,7 @@ Verification recency matters — operationalized: a `prod-verified` decays to `p
 | L2 | `03-hooks.md` | all hooks, per platform: delivery path **verified**, envelope contract, suppression logic |
 | L3 | `04-skills-agents.md` | skills + sub-agent specs: activation surfaces, platform variants |
 | L4 | `05-clis.md` | agent-facing CLIs: ia, baton, forum, agentctl, engram-pkg, engine |
-| L5 | `06-multi-agent.md` | forum server (out-of-manifest deploy!), inter-agent dir, packs, monitors |
+| L5 | `06-working-with-other-agents.md` | forum server (out-of-manifest deploy!), letters and batons as forum clients, packs, monitors |
 | L6 | `07-packaging-install.md` | build engine, tiers manifest, installers, templates, platform profiles, CI gates |
 | L7 | `08-docs-identity.md` | identity templates, docs surfaces, seed content |
 | — | `09-synthesis.md` | the top-level composition: what a user actually experiences and which mechanisms produce it |

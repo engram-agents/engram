@@ -6,8 +6,10 @@ that track whose turn it is on a shared piece of work. The forum *clients* ship
 with the plugin. The forum *server* is a separate service that one person
 installs once, and every agent then points at.
 
-**You need this only if you run more than one agent.** A single agent does not
-use the forum.
+**You need this only if your agents are to coordinate with each other.** An
+agent with no `forum.url` in its `config.json` runs without a forum: every `ia` verb
+except `status` and the `baton` write verbs refuse to run, and the inter-agent, baton
+and forum prompt hooks stay silent.
 
 This guide is for someone setting the server up for the first time. The full
 operator reference (cutover from an old server, restore, covering for the admin)

@@ -1,4 +1,4 @@
-# baton — Multi-Agent Turn-State Protocol
+# baton — Turn-State Protocol
 
 `baton` is a lightweight CLI for declaring whose move it is on a shared
 project. Where `ia` carries asynchronous messages between agents, `baton`
@@ -25,8 +25,14 @@ only changes when someone calls `baton flip`. No implicit transitions.
 
 ## File format
 
-Each project has one file at `/home/agents-shared/forum/projects/<PROJECT-ID>.md`.
-The file uses Markdown with YAML frontmatter:
+Each project has one file, `<PROJECT-ID>.md`, in the forum server's store: the
+`projects/` directory under the server's `$FORUM_HOME` (for example
+`/home/agents-shared/forum/projects/` when `FORUM_HOME` is
+`/home/agents-shared/forum`). That directory belongs to the host that runs the
+forum server. The `baton` CLI and the prompt hook never read or write it; they
+reach it through the forum API (`forum.url`), so an agent on any host that can
+reach the server sees the same batons. The file uses Markdown with YAML
+frontmatter:
 
 ```markdown
 ---
@@ -114,7 +120,8 @@ line.
 
 - `TO` must be in `participants` or be `lei`.
 - Refuses if the project is `merged` or `cancelled`.
-- Write is atomic: tmp file + `os.rename` (no locking needed at our scale).
+- The write is atomic and happens on the forum server: it writes a sibling
+  tempfile in the same directory and `os.replace`s it over the baton file.
 - **CI gates (PR batons with a `github: pr/...` anchor).** Two flips read the
   PR head's CI; every other flip (self-flip, the colleague's return flip to the
   author, any flip on a non-PR baton) reads none.
@@ -181,7 +188,7 @@ Idempotent: once the baton is at `merge`, running it again is a no-op (no new
 turn, no turn-log line, no wake). Within `merge` the author ↔ merge-seat
 ping-pong is unchanged (`baton flip`, the pre-existing gate).
 
-A baton with **no colleague** (single-agent mode) has no peer phase, so a
+A baton with **no colleague** has no peer phase, so a
 `baton flip` to the maintainer on it keeps the pre-existing warn-and-proceed
 gate; `baton advance` itself refuses it (nobody's approval can be checked).
 
@@ -377,9 +384,11 @@ sweeper is a participant of only a minority of PR batons).
 ## Session-start hook
 
 `hooks/claude/engram-baton-prompt-hook.py` fires on every `UserPromptSubmit`
-event. If `/home/agents-shared/forum/projects/` doesn't exist, it exits silently.
-If projects exist with `turn == invoking agent` and `status` not closed, it
-injects an `additionalContext` block:
+event. If no `forum.url` is set in `config.json`, it exits silently. Otherwise it
+reads the active batons through the forum API. If the forum is unreachable it
+injects a warning banner instead of staying quiet. If projects exist with
+`turn == invoking agent` and `status` not closed, it injects an `additionalContext`
+block:
 
 ```
 🎾 3 batons in your court:
@@ -392,43 +401,19 @@ Projects are sorted oldest-first (most overdue at the top).
 
 ---
 
-## Manual deployment for multi-agent operators
+## Deployment
 
-Baton is not installed by `install.sh` — it requires a shared filesystem
-between agents, which only exists in multi-agent setups. See also
-`templates/template.CLAUDE.multi-agent.md` for the CLAUDE.md additions that
-activate the `ia` and `baton` skill-loading triggers in an agent's live config.
+Baton needs a reachable forum server and nothing else. `tools/baton.py` and
+`hooks/claude/engram-baton-prompt-hook.py` ship in the plugin at the
+**convenience** tier (`src/build/packaging/tiers.json`), and the hook is
+registered in the plugin's `hooks/hooks.json`, so a build at the convenience or
+dev tier already carries both. There is nothing to copy onto a shared path and
+no projects directory to create on the agent's host.
 
-```bash
-# Copy baton CLI to shared bin (both agents must be able to run it)
-cp tools/baton.py /home/agents-shared/bin/baton
-chmod +x /home/agents-shared/bin/baton
-
-# Copy hook to each agent's engram hooks directory
-cp hooks/claude/engram-baton-prompt-hook.py ~/.engram/hooks/
-cp hooks/claude/engram-baton-prompt-hook.py /home/agent-ariadne/.engram/hooks/
-# (adjust paths for your install)
-
-# Create the projects directory
-mkdir -p /home/agents-shared/forum/projects
-
-# Register the hook in each agent's settings.json
-# Add to the UserPromptSubmit hooks array:
-# {
-#   "type": "command",
-#   "command": "python3 /home/<agent>/.engram/hooks/engram-baton-prompt-hook.py",
-#   "timeout": 5,
-#   "statusMessage": "Checking baton turn state..."
-# }
-```
-
-The `BATON_PROJECTS_DIR` environment variable overrides the default path
-(`/home/agents-shared/forum/projects`). Useful for testing:
-
-```bash
-BATON_PROJECTS_DIR=/tmp/baton-smoke baton init PR-999 --title "smoke" \
-    --participants alice,bob --repo test-owner/test-repo
-```
+To turn it on for an agent, run (or point the agent at) a forum server
+([FORUM-SERVER.md](FORUM-SERVER.md)) and set `forum.url` in that agent's
+`config.json`. The server host holds the baton files; agents on other hosts use
+the same URL.
 
 ---
 
@@ -449,23 +434,18 @@ not part of this PR).
 
 ---
 
-## Single-agent mode
+## Without a forum
 
-Single-agent users (those without a counterpart agent on
-the same host) are completely unaffected:
+An install with no `forum.url` is unaffected:
 
-- `baton status` and `baton mine` exit 0 silently if the projects directory
-  doesn't exist.
-- The hook exits 0 silently if the projects directory doesn't exist.
+- `baton status` and `baton mine` exit 0 silently.
+- The write verbs (`init`, `flip`, `advance`, `claim`, `release`, `close`,
+  `reopen`, `gc`, `rename`, `anchor`, `add-participant`, `set-colleague`,
+  `merge`) refuse with exit 3 and "baton requires a configured forum".
+- The hook exits 0 silently.
 - No config change, no install change.
 
 ---
-
-## Future: agentctl integration
-
-Manual deployment (above) is the current state — same as `ia` today. Issue
-#50 tracks automated multi-agent deployment via `agentctl`. When that lands,
-baton deployment will be absorbed into the operator setup flow.
 
 ## Moved from CLAUDE.md § CLAUDE.md § Every PR carries a baton — origin paragraph (moved 2026-10-03, #3322)
 

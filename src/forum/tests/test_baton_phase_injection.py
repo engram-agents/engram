@@ -314,7 +314,7 @@ class TestLegitimateCliShapesStillWork:
         assert world.fields(PR)[0]["phase"] == "merge"
         assert world.log_lines("phase stamped: 'merge'", PR)
 
-    def test_single_agent_maintainer_flip_still_writes_merge_through_the_weak_gate(self, world):
+    def test_no_colleague_maintainer_flip_still_writes_merge_through_the_weak_gate(self, world):
         # No colleague => no peer phase; the unchanged weak gate (CI green) is the
         # judge and the CLI's transition_phase=merge is honoured because the SERVER
         # derives the same transition from the baton itself.
@@ -325,7 +325,7 @@ class TestLegitimateCliShapesStillWork:
         assert resp.status_code == 201, resp.get_json()
         assert world.fields(PR)[0]["phase"] == "merge"
 
-    def test_single_agent_merge_claim_on_a_non_maintainer_flip_is_refused(self, world):
+    def test_no_colleague_merge_claim_on_a_non_maintainer_flip_is_refused(self, world):
         world.seed(PR, colleague=None, participants=(AUTHOR, OTHER), turn=AUTHOR, phase="fairy")
         resp = world.client.post(f"/api/projects/{PR}/flip", json={
             "agent": AUTHOR, "to_agent": OTHER, "reason": "hand over", "transition_phase": "merge"})

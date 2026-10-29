@@ -65,8 +65,8 @@ is precisely the coverage bound that made the `*.sh` glob a defect.
 | **viz setup** | `operator-setup-viz.sh` | `operator-setup-viz.sh` — **supported since #1550 (2026-08-03)**, `uname -s` → Darwin branch renders a LaunchAgent plist | **first-hand**: the Darwin branch is present in the shipped script and in the `v0.3.2-rc1` tag |
 | **`readlink -f`** | supported | supported on modern macOS | Linux: **first-hand**. macOS: **doc-sourced** |
 | **TCC (privacy prompts)** | n/a | keep `~/.engram/` and the repo **out of** `~/Documents`, `~/Desktop`, `~/Downloads` — a non-interactive job hangs on the consent prompt | **doc-sourced** |
-| **Multi-agent tooling** (`agentctl`, `agent-bootstrap`) | works | does not port (epic #750) — use the operator runbook | **doc-sourced** |
-| **Shared dir for `baton`/`ia`** | `/home/agents-shared/` | `/Users/Shared/…`, setgid + ACL; best-effort | **doc-sourced** |
+| **Second-agent host tooling** (`agentctl`, `agent-bootstrap`) | works | does not port (epic #750) — use the operator runbook | **doc-sourced** |
+| **Forum for `baton`/`ia`** | clients need `forum.url`; the server installer needs `systemd --user` | clients need `forum.url`; no Mac server install is documented, point at a Linux host's server | **doc-sourced** (`docs/FORUM-SERVER.md`; the `forum.url` gate is read from `ia.py` / `baton.py`, not run on a Mac) |
 | **Audio (soma / voice)** | **WSL2 has no native sink** — route via `PULSE_SERVER=unix:/mnt/wslg/PulseServer`; plain `aplay`/default `pactl` find nothing | untested | WSL2: **first-hand** |
 
 **Why bash 3.2 is the sharpest row.** It is the only one that fails *silently at

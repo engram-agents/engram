@@ -711,7 +711,7 @@ def _check_flip_gate(
     resolved server-side, is ``peer`` -- or is ``fairy``/legacy-unset on a
     baton that HAS a colleague (a colleague means a peer phase exists; it
     cannot be skipped by flipping straight to the merge seat). A baton with no
-    colleague (single-agent mode) has no peer phase and keeps the unchanged
+    colleague has no peer phase and keeps the unchanged
     weak gate; so does every flip within ``merge`` (author <-> merge seat
     ping-pong).
     """
@@ -746,8 +746,8 @@ def _check_flip_gate(
         # merge seat has no PR behind it for the weak path to verify (nothing to
         # parse, so it used to wave the flip through). Classify it exactly like the
         # anchored case below and hand it to the strict gate, whose first check
-        # refuses a missing anchor. A baton with no colleague (single-agent mode,
-        # no peer phase) and anything that is not PR-shaped are unchanged.
+        # refuses a missing anchor. A baton with no colleague (so no peer
+        # phase) and anything that is not PR-shaped are unchanged.
         gate = _load_baton_gate()
         if gate is None:
             return None
@@ -911,11 +911,11 @@ def _check_flip_gate(
                 "to the maintainer.",
                 422,
             )
-        # Single-agent mode: no counterpart to perform the review — warn
+        # A baton with no colleague: nobody to perform the review — warn
         # and proceed, matching cmd_flip.
         logger.warning(
-            "flip gate: no colleague approval on PR #%s (no colleague "
-            "participant — single-agent mode; skipping colleague gate)",
+            "flip gate: no colleague approval on PR #%s "
+            "(no colleague participant; skipping colleague gate)",
             pr_num,
         )
     elif approval_state == "unknown":
@@ -1300,8 +1300,8 @@ def _flip_phase_inputs(route: str, pid: str, store, to_agent: str,
     :func:`_check_flip_gate` ("does this flip go down the strict peer -> merge
     path?") MUST classify a flip identically. This function is only reached when
     the strict path did NOT take the flip; the ``merge`` it expects from
-    ``fairy`` / legacy-unset exists for a baton with NO colleague (single-agent
-    mode) and for a flip within ``merge`` -- with a colleague, ``_check_flip_gate``
+    ``fairy`` / legacy-unset exists for a baton with NO colleague
+    and for a flip within ``merge`` -- with a colleague, ``_check_flip_gate``
     must already have sent those flips down the strict path.
     ``test_baton_gate_parity.py`` drives both over a grid and fails on drift.
     """

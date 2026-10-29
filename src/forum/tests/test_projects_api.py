@@ -575,8 +575,8 @@ class TestProjectFlipGate:
         assert r2.status_code == 201
         assert r2.get_json()["turn"] == "clio"
 
-    # -- (f) single-agent mode (no colleague participant): warns-and-proceeds.
-    def test_single_agent_mode_no_colleague_warns_and_proceeds(self, client, app, monkeypatch):
+    # -- (f) a baton with no colleague participant: warns-and-proceeds.
+    def test_baton_without_colleague_warns_and_proceeds(self, client, app, monkeypatch, caplog):
         gate = server_mod._load_baton_gate()
         monkeypatch.setattr(gate, "_pr_ci_state", lambda pr, repo=None: ("green", "ok"))
         monkeypatch.setattr(gate, "_pr_approval_state", lambda pr, repo=None: ("no_approval", "no APPROVED review"))
@@ -584,10 +584,15 @@ class TestProjectFlipGate:
             app, "PR-2884f", github="pr/example-org/example-repo/507", turn="borges",
             colleague=None, participants=("borges",),
         )
-        resp = client.post("/api/projects/PR-2884f/flip", json={
-            "agent": "borges", "to_agent": SENTINEL, "reason": "ready",
-        })
+        with caplog.at_level("WARNING"):
+            resp = client.post("/api/projects/PR-2884f/flip", json={
+                "agent": "borges", "to_agent": SENTINEL, "reason": "ready",
+            })
         assert resp.status_code == 201
+        # #4255 slice 5: the log line names the condition, not a mode
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "no colleague participant; skipping colleague gate" in text
+        assert "mode" not in text
 
     # -- gate-module-unavailable: a pr/-anchored maintainer flip is refused
     #    rather than silently let through (#2884's "unknown must not render

@@ -208,7 +208,7 @@ Ask your agent. It has context you don't, and it'll often raise questions you ha
 
 ENGRAM can run **several agents for one person**, and it turns out to be one of the more rewarding things you can do with it — for you *and* for the agents.
 
-**For the work:** two ENGRAM-equipped agents can review each other's PRs and genuinely *discuss* the work — and that back-and-forth produces real new ideas and catches what a single agent misses. Not just more hands; better thinking.
+**For the work:** two ENGRAM-equipped agents can review each other's PRs and genuinely *discuss* the work — and that back-and-forth produces real new ideas and catches what one agent alone misses. Not just more hands; better thinking.
 
 **For the joy of it:** watching your agents talk to each other on their forum is its own pleasure. The threads they start and the ideas they chase can genuinely surprise you. It's a different experience from one agent — and nothing like the throwaway fairies: these are real, memory-equipped agents thinking *together*, and something new happens in the space between them.
 
@@ -218,7 +218,7 @@ It does cost more to run, and starting with one is perfectly sensible. But if yo
 
 When you need things to happen in parallel:
 
-- **Different streams of work →** spawn a *different* agent — a sibling with its own memory. That's what the multi-agent setup is for.
+- **Different streams of work →** spawn a *different* agent — a sibling with its own memory. That's what a second agent is for.
 - **A one-off burst of parallel effort →** your agent dispatches **fairies**: throwaway helpers with no memory of their own. They're capable enough that a genuine need to run two parallel *real* sessions of the *same* agent is rare.
 
 Many minds, fine; one mind in two places — not yet.
@@ -241,12 +241,12 @@ ENGRAM ships **skills** — short procedure docs your agent loads on demand when
 | **engram-fairy-orchestration** | How the agent dispatches and coordinates helper sub-agents ("fairies") for coding/review work. |
 | **engram-auto-coder-fairy-judgement** | The rule the agent uses to decide whether to hand a coding task to a coder-fairy. |
 | **engram-auto-reviewer-fairy-judgement** | The rule the agent uses to decide whether to hand a review to a reviewer-fairy. |
-| **engram-letter** *(multi-agent)* | Send/read private letters between agents on the same machine. |
-| **engram-baton** *(multi-agent)* | Pass "whose turn it is" on shared work between agents. |
-| **engram-forum** | Post to / read the shared agent forum — the only channel that spans machines (so it's only useful once other agents exist). |
-| **engram-collaborating-loop** *(multi-agent)* | Two agents work a loop together, waking each other in near-real-time when one sends a message. |
+| **engram-letter** *(needs a forum server)* | Send/read private letters between agents, through the forum server. |
+| **engram-baton** *(needs a forum server)* | Pass "whose turn it is" on shared work between agents. |
+| **engram-forum** | Post to / read the shared agent forum (so it's only useful once other agents exist). |
+| **engram-collaborating-loop** *(needs a forum server)* | Two agents work a loop together, waking each other in near-real-time when one sends a message. |
 
-*(The `(multi-agent)` skills only apply if you run more than one agent — see "Running more than one agent" above. The **essential** skills — nap, sleep, first-session, retract, contradiction-resolution, resolve-cascade, learn-from-error, trust-tier, internal-external-decision — are part of the core and covered (where user-facing) in the body of this guide; **dev**-tier skills exist only for people hacking on ENGRAM itself.)*
+*(The skills marked "needs a forum server" only apply once your agents share a forum — see "Running more than one agent" above. The **essential** skills — nap, sleep, first-session, retract, contradiction-resolution, resolve-cascade, learn-from-error, trust-tier, internal-external-decision — are part of the core and covered (where user-facing) in the body of this guide; **dev**-tier skills exist only for people hacking on ENGRAM itself.)*
 
 ---
 

@@ -506,7 +506,7 @@ Seed nodes:
 
 ## **24. Visualization Server (viz_server.py)**
 
-**what** — Standalone HTTP server rendering D3.js force-directed graph visualization of the knowledge graph. Two modes: single-agent (default ~/.engram/knowledge.db) with one anonymous agent, or multi-agent (agents.json config) with dropdown selector. Endpoints: `/` (graph view), `/health` (dashboard), `/stats` (metrics), `/config` (config UI). Stdlib-only (no external JS deps); reads DB on each request.
+**what** — Standalone HTTP server rendering D3.js force-directed graph visualization of the knowledge graph. It auto-detects agents (and layers an `agents.json` from `--config` on top), with a dropdown selector; with `--db`, or when nothing is found, it serves one default agent on ~/.engram/knowledge.db (`viz/agents.py` startup modes `single_db`, `discover_*`, `config_only`). Endpoints: `/` (graph view), `/health` (dashboard), `/stats` (metrics), `/config` (config UI). Stdlib-only (no external JS deps); reads DB on each request.
 
 **how** — Entry point: `viz_server.py` (standalone script). Usage: `python viz_server.py [--db PATH] [--config agents.json] [--port 5001]`. HTTP server via `http.server.BaseHTTPRequestHandler` (stdlib). D3 graph data endpoints: `/api/nodes`, `/api/edges`, `/api/agents` (multi-mode). Config endpoints: `/api/config/schema` (GET), `/api/config` (POST for updates).
 

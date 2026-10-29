@@ -1,6 +1,6 @@
 # 00 — Complete File Inventory
 
-*Generated 2026-06-05 from dev tip; every file in the repo, its ship status per `src/build/packaging/tiers.json`, and its mechanism assignment (filled during the sweep). Regenerate mechanically (generation script: see PR #856 thread; tools/ home pending); never hand-edit counts. The handbook's own files are not indexed.*
+*Generated 2026-06-05 from dev tip; every file in the repo, its ship status per `src/build/packaging/tiers.json`, and its mechanism assignment (filled during the sweep). Regenerate mechanically (generation script: see PR #856 thread; tools/ home pending); never hand-edit counts. The handbook's own files are not indexed. (#4255: the tier column no longer carries the suffix it once had for the retired build flag; every mechanism ships by its depth tier alone.)*
 
 
 **Census** (2026-06-05 snapshot; Gemini CLI lane files removed by #865 2026-06-06): 385 files · 121 shipped (tier-mapped) · 9 manifest-excluded (tracked, deliberately not shipped) · 204 dev-only · 13 repo-only (outside build-plugin.sh universe, repo-clone-only by design) · 33 forum-deploy (manifest-excluded, ships via forum deploy path, issue #868) · 4 zombie-suspect (remaining after #865 removed 30 gemini-lane zombie-suspects) · 1 unmapped ⚠ (in-universe gap, needs adjudication)
@@ -156,13 +156,13 @@
 |---|---|---|---|---|
 | `hooks/claude/context_tracker.py` | shipped | essential | _?_ | _unswept_ |
 | `hooks/claude/context_tracker_hook.py` | excluded | — (superseded by hooks/claude/context_tracker.py (Iss) | _?_ | _unswept_ |
-| `hooks/claude/engram-baton-prompt-hook.py` | shipped | convenience+MA | _?_ | _unswept_ |
+| `hooks/claude/engram-baton-prompt-hook.py` | shipped | convenience | _?_ | _unswept_ |
 | `hooks/claude/engram-deference-detector-prompt.py` | shipped | convenience | _?_ | _unswept_ |
 | `hooks/claude/engram-deference-detector-stop.py` | shipped | convenience | _?_ | _unswept_ |
 | `hooks/claude/engram-end-of-day-hook.py` | shipped | convenience | _?_ | _unswept_ |
 | `hooks/claude/engram-forum-prompt-hook.py` | shipped | convenience | _?_ | _unswept_ |
 | `hooks/claude/engram-github-notifications-hook.py` | shipped | convenience | _?_ | _unswept_ |
-| `hooks/claude/engram-inter-agent-prompt-hook.py` | shipped | convenience+MA | _?_ | _unswept_ |
+| `hooks/claude/engram-inter-agent-prompt-hook.py` | shipped | convenience | _?_ | _unswept_ |
 | `hooks/claude/engram-postcompact-hook.py` | shipped | essential | _?_ | _unswept_ |
 | `hooks/claude/engram-session-start-hook.py` | shipped | essential | _?_ | _unswept_ |
 | `hooks/claude/engram-stop-hook.py` | shipped | essential | _?_ | _unswept_ |
@@ -206,8 +206,8 @@
 |---|---|---|---|---|
 | `skills/claude/engram-auto-coder-fairy-judgement/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-auto-reviewer-fairy-judgement/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
-| `skills/claude/engram-baton/SKILL.md` | shipped | convenience+MA | _?_ | _unswept_ |
-| `skills/claude/engram-collaborating-loop/SKILL.md` | shipped | convenience+MA | _?_ | _unswept_ |
+| `skills/claude/engram-baton/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
+| `skills/claude/engram-collaborating-loop/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-contradiction-resolution/SKILL.md` | shipped | essential | _?_ | _unswept_ |
 | `skills/claude/engram-curiosity-loop/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-deep-research/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
@@ -215,7 +215,7 @@
 | `skills/claude/engram-first-session/SKILL.md` | shipped | essential | _?_ | _unswept_ |
 | `skills/claude/engram-forum/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-learn-from-error/SKILL.md` | shipped | essential | _?_ | _unswept_ |
-| `skills/claude/engram-letter/SKILL.md` | shipped | convenience+MA | _?_ | _unswept_ |
+| `skills/claude/engram-letter/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-loop-diagnose/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-loop/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-meta-loop/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
@@ -235,7 +235,7 @@
 | file | ship | tier/reason | mechanism | status |
 |---|---|---|---|---|
 | `templates/template.AGENTS.md` | shipped | essential | _?_ | _unswept_ |
-| `templates/template.CLAUDE.multi-agent.md` | shipped | convenience+MA | _?_ | _unswept_ |
+| `templates/template.CLAUDE.multi-agent.md` | shipped | convenience | _?_ | _unswept_ |
 | `templates/template.CLAUDE.md` | shipped | essential | _?_ | _unswept_ |
 | `templates/agents.json.example` | excluded | — (#2857 step 2: Lei's ruling, no clean multi-agent gu) | _?_ | _unswept_ |
 | `templates/compact-instructions.md` | shipped | essential (Codex-only, #2067) | _?_ | _unswept_ |
@@ -425,7 +425,7 @@
 | `tools/agent-bootstrap` | excluded | — (operator-level host administration script for mult) | _?_ | _unswept_ |
 | `tools/agentctl` | excluded | — (Lei's day-to-day admin CLI for co-located AI agent) | _?_ | _unswept_ |
 | `tools/antml_repair_baseline.py` | shipped | dev | _?_ | _unswept_ |
-| `tools/baton.py` | shipped | convenience+MA | _?_ | _unswept_ |
+| `tools/baton.py` | shipped | convenience | _?_ | _unswept_ |
 | `tools/borges_session_eval.py` | excluded | — (Borges-persona-specific session quality evaluator;) | _?_ | _unswept_ |
 | `tools/build-plugin.sh` | shipped | convenience | _?_ | _unswept_ |
 | `tools/cohort_dispatch.py` | shipped | essential | _?_ | _unswept_ |
@@ -439,7 +439,7 @@
 | `tools/forum_backfill_embeddings.py` | forum-deploy | — | _?_ | _unswept_ |
 | `tools/forum_backup.py` | shipped | convenience | _?_ | _unswept_ |
 | `tools/forum_regen_derived.py` | forum-deploy | — | _?_ | _unswept_ |
-| `tools/ia.py` | shipped | convenience+MA | _?_ | _unswept_ |
+| `tools/ia.py` | shipped | convenience | _?_ | _unswept_ |
 | `tools/inspect_raw.py` | shipped | essential | _?_ | _unswept_ |
 | `tools/install-local-marketplace.sh` | shipped | convenience | _?_ | _unswept_ |
 | `tools/migrate-backup.sh` | shipped | convenience | _?_ | _unswept_ |
