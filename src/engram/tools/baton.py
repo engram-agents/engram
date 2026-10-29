@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""baton — Multi-Agent Turn-State CLI
+"""baton — Turn-State CLI
 
 A thin CLI wrapping the baton file protocol at
 /home/agents-shared/forum/projects/. Provides explicit turn declarations for
@@ -442,7 +442,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # The colleague argument makes the colleague-gate enforceable at flip time:
     # if a colleague participant is present, `baton flip PR-N <sentinel>` with
     # no APPROVED review will be rejected. Without it, the gate falls back to
-    # single-agent (warn-only) mode.
+    # warn-only behaviour (no colleague to gate on).
     colleague_name = getattr(args, "colleague", None)
     if colleague_name:
         colleague_name = colleague_name.strip().lower()
@@ -872,7 +872,7 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         # a tip nobody approved — reject the flip until re-review (or
         # --force). no_approval is now handled by the colleague-gate below
         # (#1267): it rejects when a colleague participant is present, and
-        # warns-only in single-agent mode (no colleague to perform the review).
+        # warns-only when the baton has no colleague (no one to perform the review).
         _ap_state, _ap_detail = _pr_approval_state(_pr_num, repo=_pr_repo)
         if _ap_state == "stale":
             if _flip_force:
@@ -899,7 +899,7 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             # GitHub blocks self-approval, so "an APPROVED review exists" ≡
             # "a non-author approved."  If no approval exists and a colleague
             # is expected, reject the flip (enforce).  If no colleague is in
-            # the participants list (single-agent mode / no counterpart), warn
+            # the participants list (a baton with no colleague / no counterpart), warn
             # and proceed — per CLAUDE.md the colleague layer collapses when no
             # counterpart exists ("don't block on a colleague review that has
             # no one to perform it").  _current_holder was hoisted above
@@ -928,11 +928,11 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
                     )
                     sys.exit(EXIT_VALIDATION)
             else:
-                # Single-agent mode: no counterpart to perform the review.
+                # No colleague on this baton: no counterpart to perform the review.
                 # Warn and proceed — don't block on a review with no one to do it.
                 print(
                     f"warning: no colleague approval on PR #{_pr_num} "
-                    "(no colleague participant — single-agent mode; skipping colleague gate)",
+                    "(no colleague participant; skipping colleague gate)",
                     file=sys.stderr,
                 )
         elif _ap_state == "unknown":
@@ -1911,7 +1911,7 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str, client:
 
 def cmd_status(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     if not _is_forum_configured(config):
-        # Single-agent or not deployed — silent exit per spec
+        # No forum configured — silent exit per spec
         sys.exit(EXIT_OK)
 
     resp = _api_get(client, "/api/projects", params={"active_only": "true"})
@@ -1970,7 +1970,7 @@ def cmd_mine(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 
 def cmd_show(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     if not _is_forum_configured(config):
-        # Single-agent or not deployed — silent exit per spec
+        # No forum configured — silent exit per spec
         sys.exit(EXIT_OK)
 
     project_id = args.project_id
@@ -3013,7 +3013,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="baton",
         description=(
-            "Multi-agent turn-state CLI — declare whose move it is on a "
+            "Turn-state CLI — declare whose move it is on a "
             "shared project via explicit baton files."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3081,8 +3081,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Name the expected colleague reviewer. Added to participants (dedup) "
             "and noted in the baton body. Enables the colleague-gate at flip time: "
             "baton flip PR-N <sentinel> will be rejected if no non-author APPROVED "
-            "review exists. Without this, the gate falls back to single-agent "
-            "(warn-only) mode if no colleague appears in --participants."
+            "review exists. Without this, the gate only warns (it does not block) "
+            "if no colleague appears in --participants."
         ),
     )
 

@@ -50,7 +50,7 @@ def main() -> int:
     # Default to ~/.engram (ENGRAM_HOME overrides) regardless of where this script is installed.
     # Path(__file__).resolve() would follow symlinks (tools/ is a symlink in
     # plugin topology) and land in the plugin root, not the data home. ENGRAM_HOME
-    # env override remains for sandbox / multi-agent testing.
+    # env override remains for sandbox / shared-host testing.
     try:
         engram_home = str(owner_read.engram_home())
     except ValueError as exc:  # a RELATIVE ENGRAM_HOME: refused before anything is created

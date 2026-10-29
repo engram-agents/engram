@@ -67,7 +67,7 @@
 #   - launchctl must be present (standard on any macOS install).
 #   - Config file: $ENGRAM_HOME/viz-agents.json (single-operator path; the
 #     launchd plist points here, not /etc/engram-viz/). Create this separately
-#     before the service can serve multi-agent mode.
+#     before the service can serve any agent.
 
 set -euo pipefail
 
@@ -332,7 +332,7 @@ if [[ "$OS" == "Linux" ]]; then
   echo "        sudo loginctl enable-linger $USER"
   echo
   echo "  Config file expected at: /etc/engram-viz/agents.json"
-  echo "  (Create this as root before the service can serve multi-agent mode.)"
+  echo "  (Create this as root before the service can serve any agent.)"
 
 # ===========================================================================
 # macOS: LaunchAgent
@@ -409,7 +409,7 @@ elif [[ "$OS" == "Darwin" ]]; then
   echo "                         $ENGRAM_HOME/viz-server.err"
   echo
   echo "  Config file expected at: $VIZ_CONFIG"
-  echo "  (Create this before the service can serve multi-agent mode.)"
+  echo "  (Create this before the service can serve any agent.)"
 
 # ===========================================================================
 # Unsupported OS

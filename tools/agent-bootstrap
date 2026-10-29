@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # agent-bootstrap — root-only one-time substrate setup for a new co-located
-# AI agent on a multi-agent host.
+# AI agent on a shared host.
 #
 # Substrate role: this script creates the kernel-isolation bits (uid + group + home
 # perms + community-dir membership + a runtime-specific `~/.runtime/start.sh` adapter)
@@ -18,7 +18,7 @@
 # Usage:
 #   sudo agent-bootstrap NAME --runtime RT [--home-mode 0700]
 #                             [--alpha-source PATH]
-#                             [--tier essential|convenience|dev] [--multi-agent]
+#                             [--tier essential|convenience|dev]
 #                             [--forum-url URL] [--no-install]
 #
 #   NAME           short identifier ("borges", "newborn-20260505083012", ...).
@@ -50,7 +50,6 @@
 #                  before anything is created.
 #   --tier         passed to install.sh (essential|convenience|dev). Absent: install.sh's
 #                  own default applies.
-#   --multi-agent  passed to install.sh.
 #   --forum-url    passed to install.sh.
 #   --sandbox-build-ref REF
 #                  SANDBOX RIGS ONLY, not a release: skip the deployable-tag pick and check
@@ -69,7 +68,7 @@
 #
 # Spawn-flow context:
 #   `agentctl spawn` invokes this script with NAME=newborn-<timestamp>, passing
-#   `--tier dev --multi-agent` (and --forum-url when given) then prints its own
+#   `--tier dev` (and --forum-url when given) then prints its own
 #   follow-up. The operator then logs in (`/login`), runs `claude` for the naming
 #   dialogue, and completes the rename via
 #   `agentctl finalize-name newborn-<timestamp> <chosen>`.
@@ -84,7 +83,7 @@ ab_option_like_ref_msg() {
     echo "agent-bootstrap: --sandbox-build-ref '$SANDBOX_REF' looks like an option, not a ref." >&2
 }
 
-# ab_parse_args "$@": sets NAME RUNTIME HOME_MODE ALPHA_SOURCE TIER MULTI_AGENT FORUM_URL
+# ab_parse_args "$@": sets NAME RUNTIME HOME_MODE ALPHA_SOURCE TIER FORUM_URL
 # NO_INSTALL. Exits 2 on a bad or missing argument. Does not need root.
 ab_parse_args() {
     NAME=""
@@ -92,7 +91,7 @@ ab_parse_args() {
     HOME_MODE="0700"
     ALPHA_SOURCE=""
     TIER=""
-    MULTI_AGENT=0
+    RETIRED_NOTED=0
     FORUM_URL=""
     NO_INSTALL=0
     SANDBOX_REF=""
@@ -102,7 +101,7 @@ ab_parse_args() {
             --home-mode)    HOME_MODE="${2:?--home-mode requires a value}"; shift 2 ;;
             --alpha-source) ALPHA_SOURCE="${2:?--alpha-source requires a value}"; shift 2 ;;
             --tier)         TIER="${2:?--tier requires a value}"; shift 2 ;;
-            --multi-agent)  MULTI_AGENT=1; shift ;;
+            --multi-agent)  if [[ "$RETIRED_NOTED" == "0" ]]; then echo "--multi-agent is retired and has no effect (#4255)" >&2; RETIRED_NOTED=1; fi; shift ;;
             --forum-url)    FORUM_URL="${2:?--forum-url requires a value}"; shift 2 ;;
             --no-install)   NO_INSTALL=1; shift ;;
             --sandbox-build-ref) SANDBOX_REF="${2:?--sandbox-build-ref requires a value}"
@@ -318,7 +317,6 @@ ab_clone_and_install() {
     local -a iargs=(--install-claude-code --yes)
     if [[ -n "${SANDBOX_REF:-}" ]]; then iargs+=(--sandbox-untagged); fi
     if [[ -n "$TIER" ]]; then iargs+=(--tier "$TIER"); fi
-    if [[ "$MULTI_AGENT" == "1" ]]; then iargs+=(--multi-agent); fi
     if [[ -n "$FORUM_URL" ]]; then iargs+=(--forum-url "$FORUM_URL"); fi
 
     echo "Running tools/install.sh as $USER_NAME..."

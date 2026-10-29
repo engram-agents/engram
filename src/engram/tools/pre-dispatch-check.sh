@@ -17,9 +17,9 @@
 #   2  usage error — missing or invalid argument
 #   3  UNKNOWN — gh unavailable; fall back to manual check
 #
-# Multi-agent mode: if /home/agents-shared/forum/projects/ exists (or
+# Baton check: if /home/agents-shared/forum/projects/ exists (or
 # $BATON_PROJECTS_DIR), baton files are scanned for exact-token matches
-# (#NN).  Dir absent → single-agent mode, baton check skipped.
+# (#NN).  Dir absent → baton check skipped.
 
 set -u
 # NOT -e: we capture gh failures explicitly rather than dying on them.
@@ -104,7 +104,7 @@ if [ $PY_EXIT -ne 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Check (b): baton files — multi-agent mode only
+# Check (b): baton files — only where the baton directory exists
 # ---------------------------------------------------------------------------
 BATON_HITS=""
 BATON_NOTE=""
@@ -125,7 +125,7 @@ if [ -d "$BATON_DIR" ]; then
           done
     )
 else
-    BATON_NOTE="single-agent: baton check skipped (${BATON_DIR} not found)"
+    BATON_NOTE="baton check skipped (${BATON_DIR} not found)"
 fi
 
 # ---------------------------------------------------------------------------

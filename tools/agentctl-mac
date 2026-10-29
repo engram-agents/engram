@@ -3,7 +3,7 @@
 # agentctl-mac — lightweight macOS sibling of tools/agentctl's `session` and
 # `attach` subcommands.
 #
-# tools/agentctl is an operator's admin tool for a multi-agent LINUX host:
+# tools/agentctl is an operator's admin tool for a LINUX host shared by several agents:
 # per-agent "agent-<name>" Linux users, sudo user-switching, ACL sharing,
 # spawn/finalize-name lifecycle. None of that exists (or is needed) on a Mac
 # running exactly one agent — there is no separate Linux user to switch to,
@@ -44,7 +44,7 @@
 # Added 2026-07-30 (Lei's request) after the venv-python/hooks.json
 # Mac-install bugs (#1831) surfaced the broader "our tooling assumes Linux"
 # gap. Scope is deliberately narrow: `session` and `attach` only. No
-# health/share/spawn — those are multi-agent-Linux-host concepts with no Mac
+# health/share/spawn — those are shared-Linux-host concepts with no Mac
 # equivalent yet.
 #
 # Usage:
@@ -86,7 +86,7 @@
 #   sessions. Multiple matches attach to the most-recently-started one,
 #   printing the others (never silently discarded) to stderr first.
 #
-# NOT supported here (all Linux-multi-agent-host concepts with no Mac
+# NOT supported here (all concepts of a Linux host shared by several agents, with no Mac
 # equivalent in this script's scope): --as-self, --no-share, --local are all
 # recognized so none of them silently leak to the platform binary (which
 # would reject them as unknown flags) -- but they're handled two different
@@ -290,7 +290,7 @@ while [[ $# -gt 0 ]]; do
             shift ;;
         --as-self|--no-share)
             # Recognized and silently absorbed -- true no-ops on a
-            # single-agent Mac (see header). Without this case they'd fall
+            # Mac with one agent (see header). Without this case they'd fall
             # through to the default branch below and get forwarded verbatim
             # to the platform binary, which would reject them as unknown
             # flags -- the opposite of "harmless no-op" (found by reviewer-
@@ -333,7 +333,7 @@ fi
 
 # Platform-detection ladder, reused from tools/agentctl (no sudo, no
 # namerefs -- verified to run fine under bash 3.2; the as_self=1 branch is
-# exactly what a single-agent Mac always is).
+# exactly what a Mac with one agent always is).
 PLATFORM="$(bash "$AGENTCTL_LINUX" __detect-platform-as-self "$PLATFORM")"
 
 # Alias expansion, reused from tools/agentctl (also nameref-free, also

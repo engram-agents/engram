@@ -9,13 +9,13 @@ is driven with a fake ``sudo`` on PATH, real ``git`` against a throwaway local r
   B1  no venv/pip in agent-bootstrap (the .bashrc auto-activation block is KEPT)
   B2  no code path creates a ``claude`` symlink
   B3  install.sh runs as the newborn via ``sudo -u agent-NAME -H``, with the pass-through flags,
-      never --allow-untagged / --allow-branch; arg parse accepts --tier/--multi-agent/
-      --forum-url/--no-install
+      never --allow-untagged / --allow-branch; arg parse accepts --tier/--forum-url/--no-install
+      (--multi-agent is retired: #4255 slice 4, tests/test_tools_retired_axis_4255s4.py)
   B4  the clone lands on the newest deployable tag that is an ancestor of origin/dev; none -> FAIL.
       The clone alone runs with GIT_CONFIG_GLOBAL -> a temp file holding exactly one
       safe.directory entry for the source's .git, removed after the clone (round 2)
   B5  install.sh's exit code is agent-bootstrap's; the user/home are left in place, said so
-  B6  agentctl spawn passes --tier dev --multi-agent (and --forum-url when it was given)
+  B6  agentctl spawn passes --tier dev (and --forum-url when it was given)
   B7  finalize-name step 2d repairs the shape a native install leaves
   B8  next-steps block
 """
@@ -221,7 +221,7 @@ def run_lib(env: dict, body: str) -> subprocess.CompletedProcess:
 
 def install_body(home: Path, src: Path, extra: str = "") -> str:
     return (f'USER_NAME="agent-nb"; USER_HOME="{home}"; ALPHA_SOURCE="{src}"\n'
-            f'TIER=""; MULTI_AGENT=0; FORUM_URL=""\n{extra}\n'
+            f'TIER=""; FORUM_URL=""\n{extra}\n'
             'rc=0; ab_clone_and_install || rc=$?; echo "RC=$rc"; echo "TAG=${CLONE_TAG:-}"')
 
 
@@ -245,17 +245,17 @@ def test_lib_only_mode_creates_nothing_and_is_not_root_gated(tmp_path):
 class TestB3RunsAsNewborn:
     def test_arg_parse_passthrough_flags(self, tmp_path):
         env, _ = make_env(tmp_path)
-        proc = run_lib(env, 'ab_parse_args nb --runtime claude --tier dev --multi-agent '
+        proc = run_lib(env, 'ab_parse_args nb --runtime claude --tier dev '
                             '--forum-url http://f.example:5002 --no-install\n'
-                            'echo "N=$NAME T=$TIER M=$MULTI_AGENT F=$FORUM_URL I=$NO_INSTALL"')
+                            'echo "N=$NAME T=$TIER F=$FORUM_URL I=$NO_INSTALL"')
         assert proc.returncode == 0, proc.stderr
-        assert "N=nb T=dev M=1 F=http://f.example:5002 I=1" in proc.stdout
+        assert "N=nb T=dev F=http://f.example:5002 I=1" in proc.stdout
 
     def test_arg_parse_defaults_install_on_and_flags_empty(self, tmp_path):
         env, _ = make_env(tmp_path)
         proc = run_lib(env, 'ab_parse_args nb --runtime claude\n'
-                            'echo "T=[$TIER] M=$MULTI_AGENT F=[$FORUM_URL] I=$NO_INSTALL"')
-        assert "T=[] M=0 F=[] I=0" in proc.stdout, proc.stderr
+                            'echo "T=[$TIER] F=[$FORUM_URL] I=$NO_INSTALL"')
+        assert "T=[] F=[] I=0" in proc.stdout, proc.stderr
 
     def test_arg_parse_rejects_bad_tier(self, tmp_path):
         env, _ = make_env(tmp_path)
@@ -267,7 +267,7 @@ class TestB3RunsAsNewborn:
         env, home = make_env(tmp_path)
         src = make_source(tmp_path, tags={"v0.1.0": "c2"})
         proc = run_lib(env, install_body(
-            home, src, 'TIER=dev; MULTI_AGENT=1; FORUM_URL=http://f.example:5002'))
+            home, src, 'TIER=dev; FORUM_URL=http://f.example:5002'))
         assert _rc(proc) == 0, proc.stdout + proc.stderr
         sudo_lines = (tmp_path / "sudo.log").read_text().splitlines()
         assert sudo_lines, "nothing ran through sudo"
@@ -278,7 +278,7 @@ class TestB3RunsAsNewborn:
         call = install_calls[0]
         assert f"HOME={home}" in call
         assert "--install-claude-code --yes" in call
-        assert "--tier dev" in call and "--multi-agent" in call
+        assert "--tier dev" in call and "--multi-agent" not in call
         assert "--forum-url http://f.example:5002" in call
         assert "--allow-untagged" not in call and "--allow-branch" not in call
         log = (tmp_path / "install.log").read_text()
@@ -292,7 +292,7 @@ class TestB3RunsAsNewborn:
         proc = run_lib(env, install_body(home, src))
         assert _rc(proc) == 0, proc.stdout + proc.stderr
         call = [ln for ln in (tmp_path / "sudo.log").read_text().splitlines() if "install.sh" in ln][0]
-        for flag in ("--tier", "--multi-agent", "--forum-url"):
+        for flag in ("--tier", "--forum-url"):
             assert flag not in call
 
     def test_no_override_flags_and_no_persistent_git_trust_anywhere_in_script(self):
@@ -586,7 +586,7 @@ class TestB6AgentctlSpawnPassThrough:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         called = _read(state, "bootstrap-called")
         assert called is not None
-        assert " --tier dev" in called and " --multi-agent" in called
+        assert " --tier dev" in called and "--multi-agent" not in called
         assert "--forum-url" not in called
         assert "--no-install" not in called
 
@@ -595,7 +595,7 @@ class TestB6AgentctlSpawnPassThrough:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         called = _read(state, "bootstrap-called")
         assert "--forum-url http://forum.example:5002" in called
-        assert " --tier dev" in called and " --multi-agent" in called
+        assert " --tier dev" in called and "--multi-agent" not in called
 
 
 # ---------------------------------------------------------------------------------------------
@@ -661,7 +661,7 @@ RESOLVE = 'NO_INSTALL=0; declare -F ab_preflight_source >/dev/null && { ab_prefl
 
 def resolved_body(home: Path, source_text: str, extra: str = "") -> str:
     return (f'USER_NAME="agent-nb"; USER_HOME="{home}"; ALPHA_SOURCE="{source_text}"\n'
-            f'TIER=""; MULTI_AGENT=0; FORUM_URL=""\n{extra}\n{RESOLVE}\n'
+            f'TIER=""; FORUM_URL=""\n{extra}\n{RESOLVE}\n'
             'rc=0; ab_clone_and_install || rc=$?; echo "RC=$rc"; echo "TAG=${CLONE_TAG:-}"')
 
 

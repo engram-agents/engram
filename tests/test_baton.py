@@ -2017,7 +2017,7 @@ class TestClaim:
         assert _authored_help_strings(parser) == {
             'prog': 'baton',
             'usage': None,
-            'description': 'Multi-agent turn-state CLI — declare whose move it is on a shared project via explicit baton files.',
+            'description': 'Turn-state CLI — declare whose move it is on a shared project via explicit baton files.',
             'epilog': 'Protocol docs: docs/baton-protocol.md\n',
             'subparsers:metavar': 'subcommand',
             'subparsers:help': None,
@@ -7424,8 +7424,24 @@ class TestFlipColleagueApprovalGate:
 
         client.post.assert_called_once()
         err = capsys.readouterr().err
-        assert "single-agent mode" in err
+        assert "no colleague participant" in err
+        assert "skipping colleague gate" in err
         assert "warning" in err.lower()
+
+    def test_no_colleague_warning_wording_4255(self, monkeypatch, capsys):
+        """#4255 slice 4: the warning names the fact (no colleague participant), not a mode.
+        The whole line is pinned, so the old 'single-agent mode' wording cannot return."""
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        client, args = _flip_to_sentinel(
+            "PR-302", 302, participants="[borges]", turn="borges",
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        err = capsys.readouterr().err
+        assert ("warning: no colleague approval on PR #302 "
+                "(no colleague participant; skipping colleague gate)") in err, err
+        assert "single-agent" not in err and "mode" not in err.lower()
 
     def test_fresh_approval_with_colleague_proceeds_silently(self, monkeypatch, capsys):
         _pin_gate_states(monkeypatch, approval=("fresh", "approval covers tip"))

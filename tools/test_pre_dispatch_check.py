@@ -9,7 +9,7 @@ Coverage:
   6. no argument → exit 2 (usage)
   7. invalid argument → exit 2
   8. '#NN' prefix stripped correctly (leading '#' accepted)
-  9. baton dir absent → single-agent note in CLEAR output
+  9. baton dir absent → "baton check skipped" note in CLEAR output
  10. baton file hit → exit 1 with DUPLICATE RISK + baton filename
  11. baton dir present but no matching files → exit 0 (clear)
 
@@ -196,13 +196,14 @@ def test_gh_failure_exit_3(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_baton_dir_absent_note(tmp_path):
-    """Non-existent baton dir → CLEAR with single-agent note."""
+    """Non-existent baton dir → CLEAR with the 'baton check skipped' note (#4255: it no longer says single-agent)."""
     bin_dir = _make_gh_shim(tmp_path, payload=[])
     absent_dir = tmp_path / "does-not-exist"
     result = _run(["500"], gh_bin_dir=bin_dir, baton_dir=absent_dir)
     assert result.returncode == 0
     assert "CLEAR" in result.stdout
-    assert "single-agent" in result.stdout
+    assert f"baton check skipped ({absent_dir} not found)" in result.stdout
+    assert "single-agent" not in result.stdout
 
 
 def test_baton_hit_exit_1(tmp_path):

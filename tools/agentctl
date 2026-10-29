@@ -9,14 +9,14 @@
 #   health   session   bash
 # Added v0.1 (broker — share/unshare/share-status):
 #   share    unshare    share-status
-# Added v0.3 (spawn flow — multi-agent newborn lifecycle, v0.1 minimum):
+# Added v0.3 (spawn flow — shared-host newborn lifecycle, v0.1 minimum):
 #   spawn    finalize-name
 #
 # os-harness-check: linux-only  (bash 4.3+ namerefs/mapfile/case-mod are
 #   intentional here and MUST NOT be "portability-fixed" — see the macOS note
 #   directly below. The macOS path is tools/agentctl-mac, which IS scanned.)
 #
-# macOS: this tool assumes a multi-agent Linux host (per-agent "agent-<name>"
+# macOS: this tool assumes a Linux host with several agents (per-agent "agent-<name>"
 # users, sudo user-switch, ACL sharing) and does not run there. For a Mac
 # host running exactly one agent, see the sibling tools/agentctl-mac — a
 # lightweight `session`-only wrapper that reuses this script's tested
@@ -1511,21 +1511,21 @@ cmd_spawn() {
     echo
 
     # Multi-tenant defaults: agentctl spawn always creates an agent
-    # destined for a multi-agent host (that's the whole point of agentctl).
+    # destined for a host shared with other agents (that's the whole point of agentctl).
     # Override agent-bootstrap's solo-safe defaults:
     #   --home-mode 0750: group-traversable so the operator + peer agents in
     #                     `agents` can `cd` into the new home.
     # The post-bootstrap chgrp below sets the home's group to `agents`
-    # so the 0750 group-bit actually grants traversal to multi-agent
-    # peers (otherwise the group is the per-user group, no peer access).
+    # so the 0750 group-bit actually grants traversal to the other
+    # agents (otherwise the group is the per-user group, no peer access).
     # Matches the historical pattern for agent-borges + agent-mneme.
     local bootstrap_args=("$newborn_tag" "--runtime" "$runtime" "--home-mode" "0750")
     [[ -n "$alpha_source" ]] && bootstrap_args+=("--alpha-source" "$alpha_source")
     # agent-bootstrap now runs tools/install.sh as the newborn (#4097). agentctl spawn had no
-    # tier of its own, so it names one: `dev` (the multi-agent hosts' working tier).
-    # --multi-agent: spawn always builds a multi-agent seat. --forum-url is passed only when
-    # the operator gave one (agentctl has no other source of a host forum URL).
-    bootstrap_args+=("--tier" "dev" "--multi-agent")
+    # tier of its own, so it names one: `dev` (the shared hosts' working tier).
+    # --forum-url is passed only when the operator gave one (agentctl has no other source of a
+    # host forum URL).
+    bootstrap_args+=("--tier" "dev")
     [[ $forum_url_given -eq 1 ]] && bootstrap_args+=("--forum-url" "$forum_url")
 
     # Delegate substrate setup. agent-bootstrap prints its own next-steps
@@ -2216,7 +2216,7 @@ DONE
 
 # ---------- v0.1 broker: share / unshare / share-status ----------
 #
-# Mechanism: POSIX ACLs (setfacl/getfacl). Multi-agent compatible (each agent
+# Mechanism: POSIX ACLs (setfacl/getfacl). Compatible with several agents (each agent
 # has its own ACL entry on the path), TTL-revocable, audit-logged. State lives
 # at $SHARED_ROOT/share-state/<agent>.json; audit at $SHARED_ROOT/audit/share-log.
 
@@ -2620,7 +2620,7 @@ cmd__parse_session_flags() {
 # Exercises _session_platform's no-sudo (as_self=1) branch directly, with no
 # user arg needed (unused on that branch — see _session_platform's own
 # comment). No real agent user, no sudo. This is the exact seam
-# tools/agentctl-mac (the macOS sibling — single-agent-per-machine, no Linux
+# tools/agentctl-mac (the macOS sibling — one agent per machine, no Linux
 # user to switch to, so it always runs "as self") reuses instead of
 # duplicating the baked-profile/binary-heuristic ladder.
 cmd__detect_platform_as_self() {

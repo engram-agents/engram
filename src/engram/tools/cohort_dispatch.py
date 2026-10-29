@@ -133,7 +133,7 @@ class ForeignOwnedFileError(RuntimeError):
     """Raised when a scratch file communicated between steps is owned by a
     different uid than the current process.
 
-    On a shared multi-agent host, a fixed/predictable scratch path (bare
+    On a host shared with other agents, a fixed/predictable scratch path (bare
     `/tmp/<generic-name>`) can be written by one agent, denied to a second
     (mode 644 -> write forbidden, read permitted), and then silently *read*
     by that second agent -- feeding one agent's node-ID cohort into another
