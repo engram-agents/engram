@@ -12,7 +12,7 @@
     "dynamic_dispatch_exclusions": [
       {
         "file": "engram_client.py",
-        "line": 502,
+        "line": 484,
         "reason": "Test/SDK harness (ClientHarness.call) invokes already-terminal @mcp.tool dispatch targets by name via a dict built from getattr(server, name); walk correctness is unaffected because dispatch targets are the walk's own stopping point, not an intermediate hop toward one."
       },
       {

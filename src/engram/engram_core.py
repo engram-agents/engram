@@ -1299,8 +1299,6 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
                         "current_turn": 0,
                         "tier2_max_nodes": 2000,
                     },
-                    "mode": "single",
-                    "counterparts": [],
                 })
 
             _ensure_data_dir()
@@ -3454,15 +3452,6 @@ def _ensure_data_dir():
             # Changes take effect immediately (read per-decision, restart_required=False).
             "coder_fairy_policy": "auto",
             "reviewer_fairy_policy": "auto",
-            # Inter-agent mode gate (inter-agent-comms-v1 PR 1).
-            # Default: single. Flipped to "multi" by agentctl finalize-name
-            # when a second agent is spawned on the same host (PR 2).
-            # Consumers: engram_client.is_multi_agent_mode(),
-            #            engram_client.get_counterparts().
-            # Single-agent users see no behavior change — these fields
-            # are only read by multi-agent code paths.
-            "mode": "single",
-            "counterparts": [],
         }
         _config_io.write_config_json(CONFIG_PATH, default_config)
 

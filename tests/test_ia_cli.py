@@ -220,7 +220,7 @@ class TestSmoke:
         )
         assert rc == 0
         assert "ariadne" in stdout
-        assert "single" in stdout
+        assert "mode:" not in stdout  # #4255 slice 2: ia status no longer prints mode
 
 
 # ===========================================================================
@@ -298,7 +298,8 @@ class TestModeGate:
             env_overrides={"FORUM_URL": "http://localhost:1"},
         )
         assert rc == EXIT_OK
-        assert "single" in stdout
+        assert "forum:" in stdout
+        assert "mode:" not in stdout  # #4255 slice 2: ia status no longer prints mode
 
     def test_missing_config_treated_as_single(self, engram_home):
         """No config.json → no forum configured → exit 3 for DM commands."""
@@ -944,7 +945,7 @@ class TestStatus:
         captured = capsys.readouterr()
         data = json.loads(captured.out)
         assert data["agent"] == "ariadne"
-        assert data["mode"] == "multi"
+        assert "mode" not in data  # #4255 slice 2: ia status no longer reads or prints mode
         assert "read_cursor" in data
         assert "dm_threads" in data
 

@@ -49,17 +49,6 @@ def _load_engram_config() -> dict:
     return {}
 
 
-def is_multi_agent_mode() -> bool:
-    """True if this install is configured for multi-agent operation.
-
-    Default: False (single-agent). Multi-mode is opt-in, set by
-    agentctl spawn when this host hosts 2+ agents (PR 2 of the
-    inter-agent-comms-v1 cohort).
-    """
-    config = _load_engram_config()
-    return config.get("mode", "single") == "multi"
-
-
 def is_forum_configured() -> bool:
     """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
@@ -72,13 +61,6 @@ def is_forum_configured() -> bool:
     forum_cfg = config.get("forum") if isinstance(config, dict) else None
     url = forum_cfg.get("url") if isinstance(forum_cfg, dict) else None
     return isinstance(url, str) and bool(url.strip())
-
-
-def get_counterparts() -> list[str]:
-    """List of peer agent names on this host. Empty in single mode."""
-    config = _load_engram_config()
-    result = config.get("counterparts", [])
-    return result if isinstance(result, list) else []
 
 
 # ---------------------------------------------------------------------------

@@ -505,16 +505,16 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
             if _manifest_path.exists():
                 try:
                     _manifest = json.loads(_manifest_path.read_text(encoding="utf-8"))
-                    for _field in ("tier", "multi_agent", "shipped_at"):
+                    for _field in ("tier", "shipped_at"):
                         if _field in _manifest:
                             ver[_field] = _manifest[_field]
                 except Exception:
                     ver["build_manifest_error"] = "unreadable"
-            # config.json identity fields (agent_name, multi_agent) — fill gaps
+            # config.json identity fields (agent_name) — fill gaps
             if core.CONFIG_PATH.exists():
                 try:
                     _cfg = core._config_io.read_config_json(core.CONFIG_PATH)
-                    for _field in ("agent_name", "multi_agent"):
+                    for _field in ("agent_name",):
                         if _field in _cfg and _field not in ver:
                             ver[_field] = _cfg[_field]
                 except Exception:

@@ -536,8 +536,7 @@ def cmd_cursor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    """Quick health check: agent name, mode, DM threads, unread count."""
-    mode = config.get("mode", "single")
+    """Quick health check: agent name, DM threads, unread count."""
     forum_url = getattr(args, "forum_url", None) or forum_url_from_config(config)
     cursor = _read_cursor_int(READ_CURSOR_PATH)
 
@@ -565,7 +564,6 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     if args.format == "json":
         output = {
             "agent": agent_name or "(unknown)",
-            "mode": mode,
             "forum_url": forum_url,
             "read_cursor": cursor,
             "dm_threads": thread_count,
@@ -579,7 +577,6 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     unread_str = str(unread_count) if unread_count is not None else "(unreachable)"
 
     print(f"agent:        {agent_name or '(unknown)'}")
-    print(f"mode:         {mode}")
     print(f"forum:        {forum_url}")
     print(f"read cursor:  {cursor}")
     print(f"DM threads:   {thread_str}")
@@ -770,9 +767,9 @@ def build_parser() -> argparse.ArgumentParser:
     # -- status --
     p_status = subparsers.add_parser(
         "status",
-        help="Quick health check (agent name, mode, DM threads, unread count)",
+        help="Quick health check (agent name, DM threads, unread count)",
         description=(
-            "Show a summary of DM state: agent identity, mode, forum URL, "
+            "Show a summary of DM state: agent identity, forum URL, "
             "read cursor, DM thread count, and unread message count."
         ),
     )
@@ -818,7 +815,7 @@ def main() -> None:
     config = _load_config()
 
     # All DM commands require a configured forum.
-    # status is exempt: it's a diagnostic utility that shows current mode.
+    # status is exempt: it's a diagnostic utility.
     _FORUM_GATE_EXEMPT = {"status"}
     if args.subcommand not in _FORUM_GATE_EXEMPT:
         _check_forum_configured(config)

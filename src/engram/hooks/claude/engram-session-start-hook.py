@@ -1549,116 +1549,6 @@ def write_agent_registration(
 PEER_STALE_HOURS = 24  # mirror ia.py's default
 
 
-def update_counterparts_from_registry(
-    agent_name: str,
-    config_path: str,
-    registry_dir: str = AGENT_REGISTRY_DIR,
-) -> None:
-    """Update config.json's counterparts list from the live agent registry.
-
-    Replaces the manually-maintained counterparts list with ground truth derived
-    from the shared registry.  Co-host peers (same hostname as the current agent)
-    are the ones reachable via ia/baton and therefore the meaningful counterpart
-    set.  Cross-host peers are excluded.
-
-    Stale entries (older than PEER_STALE_HOURS from ia.py, mirrored here as 24h)
-    are excluded — same policy as ia.py's scan_peers().
-
-    Invariant (#4145): a non-string ``registered_at`` on one record (number,
-    list, dict, bool) is treated as missing — the peer is included
-    conservatively — and never aborts the update for the other records.
-
-    Fail-soft: any exception is silently caught, identical to
-    write_agent_registration.  Never raises.  The gate:
-    - shared-fs root must exist (same as write_agent_registration).
-    - config.json must be readable and writable.
-    - registry_dir must be a directory.
-    If any of those fail, silently returns.
-
-    Write is atomic: temp file in same directory as config.json + os.replace.
-
-    Args:
-        agent_name   : This agent's own name (used to exclude self from peers).
-        config_path  : Absolute path to config.json.
-        registry_dir : Path to the agent registry directory.
-                       Override in tests via AGENTS_SHARED_DIR env.
-    """
-    try:
-        registry_path = Path(registry_dir)
-        if not registry_path.is_dir():
-            return
-
-        own_hostname = socket.gethostname()
-        now = datetime.now(timezone.utc)
-        stale_delta_seconds = PEER_STALE_HOURS * 3600
-
-        co_host_names: list[str] = []
-        for json_file in sorted(registry_path.glob("*.json")):
-            try:
-                text = read_regular_text(json_file, encoding="utf-8")
-                record = json.loads(text)
-            except (OSError, json.JSONDecodeError, ValueError, RecursionError):
-                continue  # skip malformed/unreadable files
-
-            if not isinstance(record, dict):
-                continue
-
-            _n, _h = record.get("agent_name"), record.get("hostname")  # #4137: null / non-string -> ""
-            peer_name = _n.strip() if isinstance(_n, str) else ""
-            peer_hostname = _h.strip() if isinstance(_h, str) else ""
-
-            # Must have both name and hostname
-            if not peer_name or not peer_hostname:
-                continue
-
-            # Exclude self
-            if peer_name.lower() == agent_name.lower():
-                continue
-
-            # Skip stale entries
-            registered_at_str = record.get("registered_at")
-            # #4145: a non-string registered_at is treated as missing (include conservatively).
-            if registered_at_str and isinstance(registered_at_str, str):
-                try:
-                    registered_dt = datetime.fromisoformat(
-                        registered_at_str.replace("Z", "+00:00")
-                    )
-                    if registered_dt.tzinfo is None:
-                        registered_dt = registered_dt.replace(tzinfo=timezone.utc)
-                    age_seconds = (now - registered_dt).total_seconds()
-                    if age_seconds > stale_delta_seconds:
-                        continue  # stale — skip
-                except (ValueError, TypeError):
-                    pass  # can't parse age — include conservatively
-
-            # Co-host only: same hostname as this agent
-            if peer_hostname != own_hostname:
-                continue
-
-            co_host_names.append(peer_name)
-
-        co_host_names.sort()
-
-        # If the registry has entries but we found zero co-host peers, the registry
-        # is likely in a transient state (simultaneous restarts filtering all entries
-        # as stale).  Skip the write to avoid blanking the counterparts list spuriously.
-        # If the registry is genuinely empty (no .json files), fall through and clear.
-        if not co_host_names and any(registry_path.glob("*.json")):
-            return
-
-        # Read current config.json
-        with open_regular_text(config_path, encoding="utf-8") as f:
-            config = json.load(f)
-
-        config["counterparts"] = co_host_names
-
-        # Atomic write, mode- and group-preserving (#4013), same bytes as before (indent=2 + newline).
-        atomic_write_text(config_path, json.dumps(config, indent=2) + "\n", encoding="utf-8", follow_symlinks=False)
-    except Exception:
-        # Fail-soft: never raise from a multi-agent convenience side-effect.
-        pass
-
-
 def peer_topology_block(agent_name: str) -> str:
     """Return a one-line co-host / cross-host peer summary for startup context.
 
@@ -1708,7 +1598,7 @@ def peer_topology_block(agent_name: str) -> str:
             if reg_at and isinstance(reg_at, str):  # no registered_at → treat as live (fail-open: missing timestamp ≠ stale)
                 try:
                     reg_dt = datetime.fromisoformat(reg_at.replace("Z", "+00:00"))
-                    if reg_dt.tzinfo is None:  # #4211: naive = UTC, same as update_counterparts_from_registry
+                    if reg_dt.tzinfo is None:  # #4211: naive = UTC
                         reg_dt = reg_dt.replace(tzinfo=timezone.utc)
                     if (now - reg_dt) > stale_delta:
                         continue
@@ -3903,7 +3793,6 @@ def _main_impl() -> None:
         _agent_name = _v.strip() if isinstance(_v, str) else ""
         if _agent_name:
             write_agent_registration(_agent_name)
-            update_counterparts_from_registry(_agent_name, _config_path, AGENT_REGISTRY_DIR)
     except Exception:
         pass  # fail-soft: never break SessionStart for registration
 

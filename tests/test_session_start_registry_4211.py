@@ -1,11 +1,13 @@
-"""#4211: session-start registry loops (peer_topology_block and
-update_counterparts_from_registry).
+"""#4211: the session-start registry loop (peer_topology_block).
 
 Contract:
   C1: a registry file whose JSON parse raises RecursionError is skipped like
-      any other unparseable file in BOTH loops; the good peers still show.
-  C2: a naive ``registered_at`` is read as UTC in BOTH loops (naive old ->
-      stale in both, naive recent -> live in both).
+      any other unparseable file; the good peers still show.
+  C2: a naive ``registered_at`` is read as UTC (naive old -> stale, naive
+      recent -> live).
+
+(#4255 slice 2 retired the second loop, update_counterparts_from_registry, and
+its cells; what is left is the peer_topology_block half of each contract.)
 """
 
 import importlib.util
@@ -42,9 +44,7 @@ def _load(monkeypatch, tmp_path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     config_path = engram_home / "config.json"
-    config_path.write_text(
-        json.dumps({"agent_name": "sol", "counterparts": []}), encoding="utf-8"
-    )
+    config_path.write_text(json.dumps({"agent_name": "sol"}), encoding="utf-8")
     return mod, registry_dir, config_path
 
 
@@ -72,13 +72,6 @@ def _write_deep(registry_dir):
     (registry_dir / "deep.json").write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
 
 
-def _run_both(mod, registry_dir, config_path):
-    topo = mod.peer_topology_block("sol")
-    mod.update_counterparts_from_registry("sol", str(config_path), str(registry_dir))
-    counterparts = json.loads(config_path.read_text())["counterparts"]
-    return topo, counterparts
-
-
 def test_recursion_error_file_topology_keeps_good_peer(tmp_path, monkeypatch):
     mod, reg, _cfg = _load(monkeypatch, tmp_path)
     _write_deep(reg)
@@ -86,36 +79,25 @@ def test_recursion_error_file_topology_keeps_good_peer(tmp_path, monkeypatch):
     assert "goodpeer" in mod.peer_topology_block("sol")
 
 
-def test_recursion_error_file_counterparts_keeps_good_peer(tmp_path, monkeypatch):
-    mod, reg, cfg = _load(monkeypatch, tmp_path)
-    _write_deep(reg)
-    _write(reg, "goodpeer", _aware_now())
-    mod.update_counterparts_from_registry("sol", str(cfg), str(reg))
-    assert json.loads(cfg.read_text())["counterparts"] == ["goodpeer"]
-
-
-def test_naive_old_timestamp_stale_in_both_loops(tmp_path, monkeypatch):
+def test_naive_old_timestamp_stale(tmp_path, monkeypatch):
     mod, reg, cfg = _load(monkeypatch, tmp_path)
     _write(reg, "naiveold", _naive_utc(timedelta(days=30)))
     _write(reg, "goodpeer", _aware_now())
-    topo, counterparts = _run_both(mod, reg, cfg)
+    topo = mod.peer_topology_block("sol")
     assert "naiveold" not in topo and "goodpeer" in topo
-    assert counterparts == ["goodpeer"]
 
 
-def test_naive_recent_timestamp_live_in_both_loops(tmp_path, monkeypatch):
+def test_naive_recent_timestamp_live(tmp_path, monkeypatch):
     mod, reg, cfg = _load(monkeypatch, tmp_path)
     _write(reg, "naivenew", _naive_utc(timedelta(seconds=5)))
-    topo, counterparts = _run_both(mod, reg, cfg)
-    assert "naivenew" in topo
-    assert counterparts == ["naivenew"]
+    assert "naivenew" in mod.peer_topology_block("sol")
 
 
 def test_naive_20h_is_live_read_as_utc_not_local(tmp_path, monkeypatch):
     """Discriminates naive-as-UTC from naive-as-local: 20 h is live as UTC, ~29 h (stale) as UTC+9 local.
 
     Cell authored by the merge seat (Borges) on #4224: the 5 s / 30 d cells above
-    pin that both loops agree, but no offset under 14 h moves either across the
+    pin both ends, but no offset under 14 h moves either across the
     24 h threshold, so a read-as-local mutant stayed green under three TZs.
     """
     import time
@@ -123,9 +105,7 @@ def test_naive_20h_is_live_read_as_utc_not_local(tmp_path, monkeypatch):
     try:
         mod, reg, cfg = _load(monkeypatch, tmp_path)
         _write(reg, "naive20h", _naive_utc(timedelta(hours=20)))
-        topo, counterparts = _run_both(mod, reg, cfg)
-        assert "naive20h" in topo
-        assert counterparts == ["naive20h"]
+        assert "naive20h" in mod.peer_topology_block("sol")
     finally:
         # undo() restores TZ exactly as it was (set or unset); tzset() applies it,
         # so later tests in this process don't run under Asia/Tokyo (Borges, #4224).

@@ -161,19 +161,6 @@ def test_peer_topology_bad_record_is_skipped_not_fatal(rec, tmp_path, monkeypatc
     assert "ghost" not in out and "None" not in out
 
 
-@pytest.mark.parametrize("rec", BAD_RECORDS, ids=BAD_RECORD_IDS)
-def test_counterparts_update_bad_record_is_skipped_not_fatal(rec, tmp_path, monkeypatch):
-    shared, reg = _registry(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    cfg = home / "config.json"
-    cfg.write_text(json.dumps({"agent_name": "me"}))
-    hook = _load_hook(monkeypatch, home, shared)
-    _write_peers(reg, rec)
-    hook.update_counterparts_from_registry("me", str(cfg), str(reg))
-    assert json.loads(cfg.read_text()).get("counterparts") == ["goodpeer"]
-
-
 @pytest.mark.parametrize("bad", [None, 42], ids=["null", "int"])
 def test_session_start_registration_bad_name_registers_nothing(bad, tmp_path):
     """Subprocess run of the hook. NOTE: the registration block sits inside a try/except, so

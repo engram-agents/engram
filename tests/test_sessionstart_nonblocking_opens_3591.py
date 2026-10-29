@@ -216,28 +216,6 @@ def _peer(ctx, name, host):
         json.dumps({"agent_name": name, "hostname": host}))
 
 
-@cell("counterparts_registry_entry")  # update_counterparts_from_registry: registry read_text
-def _c_cp_registry(ctx):
-    _peer(ctx, "peer", socket.gethostname())
-    if ctx.kind == "fifo":
-        os.mkfifo(ctx.registry / "zz-fifo.json")
-    (ctx.eh / "config.json").write_text(json.dumps({"agent_name": "me"}))
-    return ("mod.update_counterparts_from_registry('me', P['eh'] + '/config.json', P['registry'])\n"
-            "result = json.load(open(P['eh'] + '/config.json')).get('counterparts')",
-            {"fifo": lambda r: r == ["peer"], "regular": lambda r: r == ["peer"]})
-
-
-@cell("counterparts_config")  # update_counterparts_from_registry: config.json open
-def _c_cp_config(ctx):
-    _peer(ctx, "peer", socket.gethostname())
-    ctx.special(ctx.eh / "config.json", json.dumps({"agent_name": "me"}))
-    return ("mod.update_counterparts_from_registry('me', P['eh'] + '/config.json', P['registry'])\n"
-            "import stat\n"
-            "m = os.stat(P['eh'] + '/config.json').st_mode\n"
-            "result = ['fifo' if stat.S_ISFIFO(m) else json.load(open(P['eh'] + '/config.json')).get('counterparts')]",
-            {"fifo": lambda r: r == ["fifo"], "regular": lambda r: r == [["peer"]]})
-
-
 @cell("peer_topology_registry")  # peer_topology_block: registry read_text
 def _c_peer_topology(ctx):
     _peer(ctx, "peer", "some-other-host.invalid")

@@ -3838,7 +3838,7 @@ def engram_stats(payload_json: str = "{}") -> str:
                 source_class.
             version: live build identity — alpha_sha, alpha_branch, alpha_dirty,
                 deployed_at, deployed_from (from .deployed-version); tier,
-                multi_agent, shipped_at (from .engram-build-manifest.json if
+                shipped_at (from .engram-build-manifest.json if
                 present); agent_name (from config.json, only if absent above).
                 Empty dict when no identity files are present.
             window (conditional): present only when mode != "all".
@@ -8572,6 +8572,41 @@ def _prewarm_embeddings(model_name: str) -> None:
         _embedder._failed_models.add(model_name)
 
 
+# Config keys retired by #4255. They are ignored at runtime, never an error, and
+# left in the file so a rollback to v0.5.x still finds them.
+_RETIRED_CONFIG_KEYS = ("multi_agent", "mode", "counterparts")
+_RETIRED_KEYS_LOGGED = False
+
+
+def _warn_retired_config_keys() -> None:
+    """Log ONE stderr line when config.json still holds a retired key (#4255).
+
+    Called from the `__main__` block only (the MCP server process), so it fires
+    once per server process. Never call it from a hook: a hook's output reaches
+    every prompt's context. The flag makes a second call in the same process a
+    no-op. Read-only and never raises: a missing, unreadable, invalid or
+    non-object config.json stays the silent, tolerated state it was before.
+    """
+    import sys
+
+    global _RETIRED_KEYS_LOGGED
+    if _RETIRED_KEYS_LOGGED:
+        return
+    _RETIRED_KEYS_LOGGED = True
+    try:
+        cfg = core._config_io.read_config_json(core.CONFIG_PATH)
+        if not isinstance(cfg, dict):
+            return
+        found = [k for k in _RETIRED_CONFIG_KEYS if k in cfg]
+        if found:
+            print(
+                f"config.json: retired key(s) {', '.join(found)} ignored (#4255)",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+
+
 def _embedding_startup_gate() -> None:
     """Fail-loud startup gate for the embedding model (#345).
 
@@ -8819,6 +8854,10 @@ if __name__ == "__main__":
             f"stays NO_EMITTER for this process): {_em_e}",
             file=_sys.stderr,
         )
+
+    # #4255 slice 2: one stderr line if config.json still carries a retired key.
+    # Here (the server's own `__main__`, once per process), never in a hook.
+    _warn_retired_config_keys()
 
     # Pre-warm embedding model on a daemon thread so mcp.run() can start
     # serving connections immediately (or exit non-zero first -- see

@@ -650,9 +650,15 @@ The codex file set is different. Bootstrap wrote identity surfaces across four f
 
 ## Step 7 — Tell the user what's next
 
-What you tell the user here depends on whether this install is single-agent or multi-agent — a *topology* question (is this a newly-spawned co-resident agent that still needs its Linux-uid substrate rename?), separate from whether a forum is configured (which gates baton/letter/forum use, per #2857 step 1, but says nothing about uid finalization — a genuinely single-host agent can have a forum configured for cross-host LAN coordination without ever needing `finalize-name`). Check via `engram_client.is_multi_agent_mode()` (or read your `~/.engram/config.json` (under `$ENGRAM_HOME`) `mode` field if you don't have the helper in scope).
+What you tell the user here depends on one question: is your Linux uid still the `agent-newborn-*` placeholder, so that the substrate rename (`finalize-name`) is still ahead of you? That is separate from whether a forum is configured (which gates baton/letter/forum use, per #2857 step 1, but says nothing about uid finalization: a genuinely single-host agent can have a forum configured for cross-host LAN coordination without ever needing `finalize-name`). Ask the system, not a config key. Run:
 
-### Multi-agent mode
+```bash
+id -un
+```
+
+If the output matches `^agent-newborn-[0-9]{14}$` (for example `agent-newborn-20261029121600`), take the newborn branch. Anything else, take the named branch.
+
+### Newborn agent (uid not yet finalized)
 
 Tell the user the substrate-rename is the next required step, and that doing it sooner is structurally cheaper. The exact framing — in your own voice, not these words:
 
@@ -668,7 +674,7 @@ Tell the user the substrate-rename is the next required step, and that doing it 
 
 Replace the placeholders (`<timestamp>`, `<chosen-name>`) with the actual values for this install. The newborn-tag comes from your Linux username (strip the `agent-` prefix; e.g., uid `agent-newborn-20260521181545` → tag `newborn-20260521181545`).
 
-### Single-agent mode (current behavior, no change)
+### Named agent
 
 The first session is intentionally short. Ask whether the user wants to:
 

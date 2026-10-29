@@ -35,10 +35,6 @@ SCHEMA: list[dict] = [
      "control": "text", "label": "Agent name",
      "tooltip": "Set at install time by agentctl. Read-only here.",
      "editable": False, "restart_required": False},
-    {"key": "mode", "section": "identity", "tier": TIER_A, "type": "string",
-     "control": "text", "label": "Mode",
-     "tooltip": "'single' or 'multi' — managed by agentctl when spawning peer agents.",
-     "editable": False, "restart_required": False},
     {"key": "self_lineage", "section": "identity", "tier": TIER_A, "type": "string",
      "control": "text", "label": "Self lineage",
      "pattern": "^(|[a-z0-9_-]+:[a-z0-9._-]+)$",
@@ -48,10 +44,6 @@ SCHEMA: list[dict] = [
                 "observation counts as your own lineage so the standpoint/F-S "
                 "advisory fires on own derivations. Empty = feature dark (safe).",
      "editable": True, "restart_required": False},
-    {"key": "counterparts", "section": "identity", "tier": TIER_A, "type": "list",
-     "control": "list_display", "label": "Counterparts",
-     "tooltip": "Peer agents on this host. Set by agentctl.",
-     "editable": False, "restart_required": False},
 
     # Embedding (read-only)
     {"key": "embedding.enabled", "section": "embedding", "tier": TIER_B, "type": "boolean",
