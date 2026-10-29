@@ -8,7 +8,7 @@
 # Usage:
 #   forum-mention-monitor.sh [--purpose <key>]
 #
-# Multi-agent hosts may symlink this into /home/agents-shared/bin/ alongside
+# Hosts shared by several agents may symlink this into /home/agents-shared/bin/ alongside
 # ia/baton/forum (same convention; no install step creates the symlink — it is
 # a manual host-operator action today).
 #

@@ -9,8 +9,8 @@ SSoT for three concerns genuinely duplicated, byte-for-byte, across hooks:
    below. Extracted after PR #1839's colleague review found the
    surface hook had copied session-start hook's already-broken unscoped
    `pgrep -f server.py` verbatim, doubling the blast radius of a bug that
-   made the liveness probe permanently report healthy on any multi-agent
-   host: the bare "server.py" substring matches every agent's server process
+   made the liveness probe permanently report healthy on any host
+   shared by several agents: the bare "server.py" substring matches every agent's server process
    (and any unrelated *_server.py), not just this agent's own.
 3. Atomic JSON state writes for hook state files (gh#2035) -- see
    atomic_write_json below. Hooks run under a 5s harness timeout and are
@@ -298,7 +298,7 @@ def resolve_own_server_py_path(engram_home: str) -> str:
     Never returns a bare "server.py" -- an unscoped pgrep -f server.py
     matches every process whose command line contains that substring
     anywhere, including every OTHER agent's server.py on a shared
-    multi-agent host (and unrelated *_server.py files by substring). See
+    host shared by several agents (and unrelated *_server.py files by substring). See
     is_own_server_py_running's docstring for the regression this fixes.
     """
     hook_dir = os.path.dirname(os.path.abspath(__file__))
@@ -318,7 +318,7 @@ def is_own_server_py_running(engram_home: str) -> bool:
     Scoped `pgrep -f <resolved-path>` match against
     resolve_own_server_py_path's result -- never a bare "server.py"
     substring. The unscoped form was PR #1839's colleague-review blocker:
-    on a shared multi-agent host, `pgrep -f server.py` matches
+    on a host shared by several agents, `pgrep -f server.py` matches
     every agent's own server.py (and any unrelated *_server.py, e.g. a
     viz_server.py, by substring), so the probe was permanently True
     regardless of whether THIS agent's own server was actually alive --

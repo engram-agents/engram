@@ -674,7 +674,7 @@ def _is_any_server_py_running() -> bool:
     alive. Delegates to the shared, path-scoped _hooklib.is_own_server_py_running
     (see its docstring for the unscoped-pgrep regression this replaced --
     PR #1839's colleague review) -- an unscoped `pgrep -f server.py`
-    matches every agent's own server process on a shared multi-agent host,
+    matches every agent's own server process on a host shared by several agents,
     permanently reporting healthy. Best-effort: returns False on any error,
     including a failed _hooklib import, so the caller degrades to the
     conservative (unhealthy) path rather than a false positive.
@@ -1507,7 +1507,7 @@ def write_agent_registration(
     Writes atomically via temp-file + os.replace so concurrent agents never
     read a partial JSON. Creates the registry dir (group-writable, setgid) if
     it does not exist. Fails silently if the shared filesystem is absent or
-    unwritable — this is a multi-agent-only convenience, not a blocker.
+    unwritable — this only matters when /home/agents-shared/ exists, and is a convenience, not a blocker.
 
     File path: <registry_dir>/<agent_name>.json
     Content   : {"agent_name": ..., "hostname": ..., "pid": ..., "registered_at": <ISO UTC>}
@@ -1542,7 +1542,7 @@ def write_agent_registration(
         # Atomic write, mode- and group-preserving (#4013): peers read the registry through group.
         atomic_write_json(dest, record)
     except Exception:
-        # Fail-soft: never raise from a multi-agent convenience side-effect.
+        # Fail-soft: never raise from a convenience side-effect.
         pass
 
 
@@ -1555,7 +1555,7 @@ def peer_topology_block(agent_name: str) -> str:
     Reads the shared agent registry (same dir as write_agent_registration writes
     to) and classifies each live peer by hostname. Injected only on fresh-startup
     so agents walk in knowing which peers are ia/baton-reachable vs forum-only.
-    Returns "" when the registry is absent (single-agent install), empty, or on
+    Returns "" when the registry is absent (no /home/agents-shared/), empty, or on
     any error — never blocks session start.
 
     Invariant (#4145): a malformed registry record (wrong top-level JSON type,
@@ -3779,7 +3779,7 @@ def _main_impl() -> None:
     _EFFECTIVE_SESSION_ROLE = marker.get("role", SESSION_ROLE) if marker else SESSION_ROLE
     write_baseline(use_compact_boundary=True)
 
-    # ── Agent registration (multi-agent only) ─────────────────────────────────
+    # ── Agent registration (only when /home/agents-shared/ exists) ────────────
     # Write/refresh the agent's registration file in the shared registry so
     # peers can discover co-host vs cross-host topology. Fail-soft: the shared
     # filesystem may not exist (single-host install), and write_agent_registration

@@ -6,7 +6,7 @@
   fetch('/api/agents').then(function(r) { return r.json(); }).then(function(data) {
     var agents = data.agents || [];
     var defaultAgent = data.default || (agents[0] && agents[0].name);
-    if (agents.length <= 1) return;  // single-agent mode: keep selector hidden
+    if (agents.length <= 1) return;  // only one agent: keep the selector hidden
 
     var currentAgent = new URL(window.location.href).searchParams.get('agent');
     if (!currentAgent || !agents.find(function(a) { return a.name === currentAgent; })) {

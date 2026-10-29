@@ -12785,8 +12785,8 @@ def _graph_lineage_count(conn: sqlite3.Connection) -> int:
     remedy ("add cross-lineage support") is only available when a
     cross-lineage premise is actually citable, which the gate reads from
     GRAPH STATE, not install topology/config — a solo install that records
-    cross-lineage-sourced observations has earned the ⚠; a multi-agent
-    monoculture house has not. Self-adjusting: the first recorded
+    cross-lineage-sourced observations has earned the ⚠; a graph whose
+    recorded claims all share one lineage has not. Self-adjusting: the first recorded
     cross-lineage claim flips the axis live.
     """
     # Two filters ENFORCE the docstring's "citable claim-bearing premise" domain

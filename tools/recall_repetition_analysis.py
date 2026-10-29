@@ -20,7 +20,7 @@ Usage:
     python3 tools/recall_repetition_analysis.py --db-path /path/to/index.db
 
 Relocated from a scratch analysis script into tools/ (issue #1689) so it's
-reproducible across installs -- the original hardcoded a single agent's
+reproducible across installs -- the original hardcoded one agent's
 $ENGRAM_HOME; this version resolves the DB path portably (CLI arg >
 $ENGRAM_HOME env var > ~/.engram default), matching the resolution pattern
 already used elsewhere in tools/ (e.g. the ENGRAM_HOME env-var convention in

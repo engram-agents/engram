@@ -61,9 +61,9 @@ equivalent, across the hooks that used it prior to extraction):
     follows the engram_home-parameter pattern this function reuses.
 
 NOT extracted (deliberately, per this slice's hard scope bounds): HTTP
-stacks (ForumClient vs urllib), the multi-agent/forum-configured gates
-(_is_multi_agent_mode vs _is_forum_configured -- left exactly as-is in
-each hook), forum's own _get_forum_url (stack-specific, not unified with
+stacks (ForumClient vs urllib), the forum-configured gate
+(_is_forum_configured -- left exactly as-is in each hook), forum's own
+_get_forum_url (stack-specific, not unified with
 forum_api.forum_url_from_config), cursor files, the status-publish POST,
 and the baton auto-archive pass.
 

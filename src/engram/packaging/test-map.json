@@ -1064,7 +1064,7 @@
   "unmapped": [
     {
       "path": "tools/_channel.py",
-      "reason": "Internal multi-agent transport helper; no dedicated test file. Changes covered by ia.py test suite indirectly."
+      "reason": "Internal transport helper for letters between agents; no dedicated test file. Changes covered by ia.py test suite indirectly."
     },
     {
       "path": "tools/_common.py",

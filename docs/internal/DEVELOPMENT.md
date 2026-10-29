@@ -214,7 +214,7 @@ of work.
 Either way, **delete the feature branch after merge**. Long-lived feature
 branches accumulate the same divergence problem they were meant to avoid.
 
-## PR review and multi-agent collaboration
+## PR review and collaboration between agents
 
 When more than one contributor agent is active (Borges + Mneme + future
 spawned agents), each agent reviews the others' PRs:
@@ -487,7 +487,7 @@ the copy logic that reads the manifest.
 
 The manifest has four sections:
 
-- **`mechanisms[]`** — shippable artifacts with tier + multi-agent assignments.
+- **`mechanisms[]`** — shippable artifacts with tier assignments.
   Every new file destined for the plugin goes here.
 - **`excluded[]`** — files that exist in candidate directories but are
   intentionally NOT shipped via `build-plugin.sh`. Examples: the `forum/`

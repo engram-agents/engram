@@ -207,7 +207,7 @@ forum thread #189.
 - **Shipped a `server.py` change?** → rebuild, then `/mcp` reconnect (or restart).
 - **Added/removed a hook (touched `hooks.json`)?** → rebuild, then `/reload-plugins` (measured for an addition, #1892, and a removal, #3265); full restart only if a registration demonstrably doesn't take effect.
   `install-local-marketplace.sh` prints a `⚠️ HOOK REGISTRATION CHANGED` banner.
-- **Multi-agent shared CLIs changed?** → refresh `/home/agents-shared/bin/*`
+- **Shared CLIs (on a host that shares them) changed?** → refresh `/home/agents-shared/bin/*`
   separately (they are copies, not the plugin tree).
 - **After any Claude Code version bump** → re-verify §4/§5 via §8; this behavior is
   undocumented and could change upstream.

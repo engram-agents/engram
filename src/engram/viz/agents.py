@@ -107,7 +107,7 @@ def _pick_default(agents: dict) -> str:
 
 
 def _load_config(path: str) -> tuple[dict, str]:
-    """Parse a multi-agent config JSON. Returns (agents_dict, default_name).
+    """Parse a config JSON that lists several agents' graphs. Returns (agents_dict, default_name).
 
     Schema (see active-work/viz-server-multi-agent-2026-05-04.md):
       {"agents": [{"name": str, "db": str, "label": str (optional)}, ...],
@@ -448,7 +448,7 @@ def configure_agents_from_args(args) -> None:
     global AGENTS, DEFAULT_AGENT, _AGENT_STARTUP_MODE, _AGENT_STARTUP_CONFIG, _AGENT_CACHE_TS
 
     if args.db:
-        # Explicit --db always forces single-agent mode (unchanged behavior).
+        # Explicit --db always means the one agent at that path (unchanged behavior).
         db = os.path.expanduser(args.db)
         if os.path.isdir(db):
             db = os.path.join(db, "knowledge.db")
@@ -481,7 +481,7 @@ def configure_agents_from_args(args) -> None:
             DEFAULT_AGENT = _pick_default(AGENTS)
             _AGENT_STARTUP_MODE = "discover_only"
         else:
-            # Nothing discovered and no config — fall back to single-agent default.
+            # Nothing discovered and no config — fall back to the one-agent default.
             db = DEFAULT_DB
             AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
             DEFAULT_AGENT = "default"

@@ -44,7 +44,7 @@ plain ``<link rel="stylesheet" href="/static/base.css">`` /
 ``<script src="/static/nav.js"></script>`` tag baked directly into the
 template file itself -- static, page-independent, no substitution needed.
 ``_NAV_SCRIPT`` is kept as an importable constant purely because several
-regression tests assert against its content directly (the single-agent-mode
+regression tests assert against its content directly (the one-agent
 guard, the wrapper-display-value regression guard -- see
 ``test_viz_server_select_control.py``); it is NOT used to bake any page.
 """
@@ -130,7 +130,7 @@ def _render_nav(active_tab: str, agent: str | None = None,
     Includes tab links (active tab bold, built via ``urls.url_for`` so each
     one carries *agent* through when given) and the global agent-selector
     dropdown. The dropdown is hidden until the shared nav script (served
-    from ``/static/nav.js``) populates it (single-agent mode keeps it
+    from ``/static/nav.js``) populates it (with only one agent it stays
     hidden permanently).
 
     active_tab: one of {"graph", "health", "stats", "config", "moments"}.

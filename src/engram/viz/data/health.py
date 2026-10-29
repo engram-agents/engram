@@ -27,7 +27,7 @@ def get_health_data(db_path: str) -> dict:
     if not os.path.exists(db_path):
         return {"error": f"Database not found: {db_path}"}
     try:
-        # Read-only via mode=ro; multi-agent peer-DB safety is enforced by
+        # Read-only via mode=ro; peer-DB safety (several agents' graphs on one host) is enforced by
         # OS file permissions (owner UID writes; group=agents reads), not by
         # this URI flag. The previous `immutable=1` was dropped (#184) because
         # it caused the reader to ignore -wal entirely → silent staleness.

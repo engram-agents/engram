@@ -30,7 +30,7 @@ import engram_home_resolver
 
 
 # ---------------------------------------------------------------------------
-# Multi-agent mode helpers
+# Config and forum-configured helpers
 # ---------------------------------------------------------------------------
 
 def _load_engram_config() -> dict:

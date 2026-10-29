@@ -1,5 +1,5 @@
 [Unit]
-Description=ENGRAM Visualization Server (multi-agent, user session)
+Description=ENGRAM Visualization Server (user session)
 
 [Service]
 Type=simple

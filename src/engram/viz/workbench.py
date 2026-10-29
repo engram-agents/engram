@@ -423,7 +423,7 @@ def main():
     parser.add_argument("--port", type=int, default=_DEFAULT_PORT,
                         help=f"Port to listen on (default: {_DEFAULT_PORT})")
     parser.add_argument("--db", default=None,
-                        help="Single-agent mode: register one anonymous "
+                        help="Show one graph: register one anonymous "
                              "'default' agent at PATH (a knowledge.db file or "
                              f"a directory containing one). Default: {viz_agents.DEFAULT_DB}")
     parser.add_argument("--config", default=None,

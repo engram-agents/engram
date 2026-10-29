@@ -277,7 +277,7 @@ def build_installed_layout(out_dir: Path) -> Layout:
     untagged commit are exactly what a PR measurement builds."""
     out_dir = Path(out_dir)
     proc = subprocess.run(
-        ["bash", str(BUILD_SCRIPT), "--tier", "dev", "--multi-agent",
+        ["bash", str(BUILD_SCRIPT), "--tier", "dev",
          "--allow-branch", "--allow-untagged", "--output", str(out_dir)],
         cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=600)
     if proc.returncode != 0:

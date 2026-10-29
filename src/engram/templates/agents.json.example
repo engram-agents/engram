@@ -1,5 +1,5 @@
 {
-  "_comment": "Multi-agent viz_server config. Used by `viz_server.py --config <this file>`. The viz process needs read access to each listed knowledge.db — the recommended pattern is a shared `agents` POSIX group that owns each agent's $ENGRAM_HOME. Lives at ~/.config/engram-viz/agents.json or /etc/engram-viz/agents.json for systemd-managed installs. The default agent loads when ?agent= is omitted.",
+  "_comment": "Viz server config for several agents' graphs. Used by `viz_server.py --config <this file>`. The viz process needs read access to each listed knowledge.db — the recommended pattern is a shared `agents` POSIX group that owns each agent's $ENGRAM_HOME. Lives at ~/.config/engram-viz/agents.json or /etc/engram-viz/agents.json for systemd-managed installs. The default agent loads when ?agent= is omitted.",
   "agents": [
     {
       "name": "agent-a",

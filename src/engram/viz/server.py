@@ -9,20 +9,20 @@ browser. Stdlib-only. Three operating modes:
 
 * Auto-detect (default — no flags): scan accessible /home/* dirs + running
   user's home for .engram*/ folders ($ENGRAM_HOME's default is one); read agent_name from each config.json.
-  If nothing found, falls back to the single-agent default (``DEFAULT_DB`` in viz/agents.py:
+  If nothing found, falls back to the one-agent default (``DEFAULT_DB`` in viz/agents.py:
   knowledge.db under $ENGRAM_HOME, default ~/.engram, resolved once when viz/agents.py is
   imported, see engram-alpha#3863; agent_name lookup in viz/agents.py reads it too).
   An optional --config layered on top overrides labels/default/exclude and can
   add agents that weren't auto-detected (back-compat with explicit-db entries).
-* Single-agent (--db PATH): register one anonymous 'default' agent at PATH
+* One agent (--db PATH): register one anonymous 'default' agent at PATH
   (a knowledge.db file or a directory containing one).
 * Explicit-only (--no-autodetect [--config PATH]): skip auto-discovery; use
-  only the explicit config or the single-agent default.
+  only the explicit config or the one-agent default.
 
 Usage (module invocation — see the INVOCATION NOTE below for why this is
 the shape this file expects, not direct script execution):
     python -m viz.server                                 # auto-detect (new default)
-    python -m viz.server --db /path/to/knowledge.db      # single-agent custom
+    python -m viz.server --db /path/to/knowledge.db      # one agent, custom path
     python -m viz.server --config /path/to/agents.json   # auto-detect + override
     python -m viz.server --no-autodetect --config agents.json  # explicit-only
 
@@ -47,7 +47,7 @@ and the systemd/launchd templates, which already set
 ``WorkingDirectory``/cwd to the plugin root for exactly this reason.
 
 Deployment / restart model (operator-launched, not agent-managed):
-    In a multi-agent install this server is normally started by the OPERATOR
+    Where several agents' graphs are served, this server is normally started by the OPERATOR
     (a privileged user with read access to every agent's ENGRAM data directory)
     via a small launch script or command — NOT by an individual agent, whose
     user typically lacks the cross-agent read access that auto-detect and
@@ -450,7 +450,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/health/v2":
             # health-v2 SSoT panel (engram-alpha#2518) -- backend loader
             # only; the detail-view frontend that consumes this endpoint is
-            # a separate, not-yet-landed PR. Single-agent only (no /fleet
+            # a separate, not-yet-landed PR. One agent only (no /fleet
             # here -- reading OTHER agents' snapshot directories needs a
             # separate cross-UID permission design, out of scope for this
             # slice).
@@ -691,7 +691,7 @@ def main():
     parser.add_argument("--port", type=int, default=viz_agents.DEFAULT_PORT,
                         help=f"Port to listen on (default: {viz_agents.DEFAULT_PORT})")
     parser.add_argument("--db", default=None,
-                        help="Single-agent mode: register one anonymous "
+                        help="Show one graph: register one anonymous "
                              "'default' agent at PATH (a knowledge.db file or "
                              f"a directory containing one). Default: {viz_agents.DEFAULT_DB}")
     parser.add_argument("--config", default=None,

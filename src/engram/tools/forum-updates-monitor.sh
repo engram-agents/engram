@@ -14,7 +14,7 @@
 # Usage:
 #   forum-updates-monitor.sh [--purpose <key>] [--kinds dm,baton]
 #
-# Multi-agent hosts may symlink this into /home/agents-shared/bin/ alongside
+# Hosts shared by several agents may symlink this into /home/agents-shared/bin/ alongside
 # ia/baton/forum (same convention; symlinking is a manual host-operator action).
 #
 # Discipline notes (load-bearing — do not remove; mirror forum-mention-monitor):

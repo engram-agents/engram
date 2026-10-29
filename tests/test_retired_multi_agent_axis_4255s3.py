@@ -347,3 +347,16 @@ def test_baton_skill_says_which_verbs_need_a_forum_url():
     text = (SKILLS / "engram-baton" / "SKILL.md").read_text(encoding="utf-8")
     assert "the `baton` write verbs exit 3" in text
     assert "`baton status`, `show` and `mine` exit 0" in text
+
+
+# ── C9b: the two facts Luria's mutants on #4269 left green (folded in slice 7) ──────────────────────────
+def test_letter_skill_pins_the_exact_no_forum_url_sentence():
+    text = (SKILLS / "engram-letter" / "SKILL.md").read_text(encoding="utf-8")
+    assert ('Every `ia` verb except `ia status` exits 3 with "ia requires a configured forum"; '
+            '`ia status` still exits 0') in text
+
+
+def test_agents_json_example_reason_names_who_relayed_the_ruling():
+    data = json.loads(TIERS_JSON.read_text(encoding="utf-8"))
+    entry = next(e for e in data["excluded"] if e["path"] == "templates/agents.json.example")
+    assert "relayed by Kepler, 2026-09-14" in entry["reason"]

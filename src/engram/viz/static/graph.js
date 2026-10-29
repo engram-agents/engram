@@ -166,14 +166,14 @@ const LEGIBLE_SMALL_GRAPH = 80;
 // Subsequent re-renders (toggle/search/type-filter) reuse the cached newNodeIds
 // — _whatsNewInitialised guards against recomputing on auto-refresh.
 function initWhatsNew(nodes) {
-  // Per-agent localStorage key. In single-agent mode currentAgent() is null
+  // Per-agent localStorage key. With only one agent, currentAgent() is null
   // (loadAgents() leaves the ?agent= param unset when there's only one agent),
   // so we fall back to '__default__' — a clearly-synthetic sentinel that won't
   // collide with a real agent name. Intentional consequence: if the install
   // later adds a second agent, that agent's visit-history starts fresh under
-  // its real name (first-visit semantics: no highlights on the first multi-agent
-  // visit). We deliberately do NOT carry the '__default__' history forward —
-  // a one-time "everything looks new" pass on the multi-agent transition is an
+  // its real name (first-visit semantics: no highlights on the first visit
+  // after a second agent appears). We deliberately do NOT carry the '__default__' history forward —
+  // a one-time "everything looks new" pass when a second agent appears is an
   // acceptable cost versus mis-attributing one agent's history to another.
   const agentName = currentAgent() || '__default__';
   const lsKey = 'engram-viz-lastvisit-' + agentName;
@@ -1424,7 +1424,7 @@ function buildSidebar() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Multi-agent helpers
+// Helpers for several agents' graphs
 // ═══════════════════════════════════════════════════════════════════
 
 function currentAgent() {
@@ -1520,7 +1520,7 @@ async function loadAgents() {
     const agents = data.agents || [];
     const defaultAgent = data.default || (agents[0] && agents[0].name);
     if (agents.length <= 1) {
-      // Single-agent mode — no URL param or dropdown needed.
+      // Only one agent — no URL param or dropdown needed.
     } else {
       let current = currentAgent();
       if (!current || !agents.find(a => a.name === current)) {

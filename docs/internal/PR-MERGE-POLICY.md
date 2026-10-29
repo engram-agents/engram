@@ -511,6 +511,8 @@ The 2026-06-24 v0.1.3 merge wave merged #1399 — a retraction-initiation proven
 
 *Verbatim; moved, not edited. CLAUDE.md keeps the rule and a pointer here.*
 
+*Note (2026-10-29, #4255): the coordination-topology wording in the quoted text below was retired; the live rule is CLAUDE.md § PR merge-readiness — CI-green gate.*
+
 Merge-readiness has **two** gates, not one: a PR is merge-ready only when it is
 **review-converged AND CI-green on the current tip.** This is a property of the PR,
 not of the coordination topology — it holds identically in single-agent and

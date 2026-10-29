@@ -747,7 +747,7 @@ def _is_any_server_py_running() -> "bool | None":
     alive. Delegates to the shared, path-scoped _hooklib.is_own_server_py_running
     (see its docstring for the unscoped-pgrep regression this replaced --
     PR #1839's colleague review) -- an unscoped `pgrep -f server.py`
-    matches every agent's own server process on a shared multi-agent host,
+    matches every agent's own server process on a host shared by several agents,
     permanently reporting healthy. Before #3521 this returned False on ANY
     error (pgrep missing / timed out / errored), conflating "could not look"
     with "no server running"; it now returns None for those, via the

@@ -567,7 +567,7 @@ def get_health_v2_series(agent_name: str, version: "str | None" = None, signal: 
 
 
 class _InFlightLiveBuild:
-    """One in-flight ``get_health_v2_live_data`` build for a single agent --
+    """One in-flight ``get_health_v2_live_data`` build for one agent --
     the per-agent single-flight unit (contract item 4: N concurrent
     requests for the SAME agent while a build is running must trigger
     exactly ONE build and all reuse its result; a request arriving AFTER
@@ -680,9 +680,9 @@ def _build_live_health_v2_payload(agent_name: str, db_path: str) -> dict:
     )
 
     try:
-        # Read-only via mode=ro -- same multi-agent peer-DB safety pattern
+        # Read-only via mode=ro -- same peer-DB safety pattern
         # viz/data/health.py's get_health_data already uses (comment there:
-        # "multi-agent peer-DB safety is enforced by OS file permissions
+        # "peer-DB safety (several agents' graphs on one host) is enforced by OS file permissions
         # ... not by this URI flag").
         conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row

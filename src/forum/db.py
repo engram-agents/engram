@@ -567,7 +567,7 @@ def _resolve_status(
     window_minutes: int,
     stale_factor: int = 2,
 ) -> dict[str, Any]:
-    """Compute the display-status dict for a single agent row.
+    """Compute the display-status dict for one agent row.
 
     ``row`` must expose positional columns in the order:
         last_seen_at, status_state, status_activity, status_queue,
