@@ -210,6 +210,8 @@ gh pr create --base dev --head docs/changelog-vMAJOR.MINOR.PATCH \
   --title "docs: CHANGELOG + version bump for vMAJOR.MINOR.PATCH"
 ```
 
+**A test enforces this pairing.** `TestPluginVersionHasChangelogSection` in `tests/test_release_gates.py` (#4259) fails unless `plugin.json`'s version is plain `X.Y.Z` and equals the newest `## [vX.Y.Z] - YYYY-MM-DD` heading in `docs/CHANGELOG.md`. If the bump and the section land in separate PRs, `dev` is red between them: the nightly full-suite run or the dev→main release PR catches it. `pr-checks` does not run this file for a version-bump or CHANGELOG-only change.
+
 Get this PR reviewed and merged into `dev` through the normal review path
 (reviewer-fairy / colleague, per `CLAUDE.md`) before proceeding to step 4.
 
