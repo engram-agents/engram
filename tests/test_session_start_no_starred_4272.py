@@ -244,11 +244,20 @@ def test_6_no_other_file_names_the_dead_function_constants_or_file():
     assert hits == [], hits
 
 
-def test_5_handbook_line_count_for_the_postcompact_hook_is_the_real_one():
-    """Luria's colleague read of #4276: the handbook said '165 lines' while the hook, after the docstring
-    sentence added here, is 166. A count in prose goes stale unnoticed; if this fails after you edit
-    engram-postcompact-hook.py, update the '(N lines)' in docs/handbook/03-hooks.md section 5."""
-    sec = _section(HANDBOOK.read_text(encoding="utf-8"), 5)
-    m = re.search(r"engram-postcompact-hook\.py \((\d+) lines\)", sec)
-    assert m, "section 5 no longer states the hook's line count: drop this cell"
-    assert int(m.group(1)) == len(POSTCOMPACT.read_text(encoding="utf-8").splitlines())
+LINE_COUNT = re.compile(
+    r"(?<![\w.-])~?\d[\d,._]*k?\s*-?\s*(?:[A-Za-z]+[- ]){0,2}(?:lines?|loc|sloc)\b", re.I)
+
+
+def test_5_handbook_files_lines_state_no_line_counts():
+    """Luria's read of #4276 found one stale '(N lines)' on the hooks page; measuring the page then showed
+    15 of the 16 matchable counts on its 'files' lines stale (the session-start hook: 968 stated, thousands
+    real). A count nobody maintains is worse than none, so the 'files' lines name the files and no count.
+    Dated history elsewhere on the page ('the 71-line pre-#844 version') is a statement about a past state
+    and is not covered. A number (with an optional k or thousands mark) followed by up to two words and
+    'line', 'lines', 'LOC' or 'SLOC', in any case, is a count: '(166 lines)', '166 lines', '(166 Lines)',
+    '(1.2k lines)', '(166 non-blank lines)', '(166 LoC)', '166-line'. A range such as 'lines 1-136' puts the
+    word first and is a different statement. The number must not be glued to a file name ('hook2-line.py')."""
+    text = HANDBOOK.read_text(encoding="utf-8")
+    bad = [ln for ln in text.splitlines()
+           if ln.startswith("**files**") and LINE_COUNT.search(ln)]
+    assert bad == [], bad

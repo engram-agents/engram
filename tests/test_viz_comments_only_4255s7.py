@@ -342,3 +342,39 @@ def test_b_js_an_escaped_quote_inside_a_string_inside_a_template_expression_does
     a = "var s = `x${ 'a\\'b' }y`; var n = 1; // note one\n"
     assert semantic_change("a.js", a, a.replace("note one", "a different remark")) is None
     assert semantic_change("a.js", a, a.replace("var n = 1;", "var n = 2;")) is not None
+
+
+# ── Luria's read of #4277: an unterminated literal is literal text to the end of the file ──
+# `_skip_template` and `_skip_braces` return len(src) when nothing closes the literal. If either returned
+# its start instead, the rest of the file would be scanned as code and a `//` inside it read as a comment.
+# Each shape below is invalid JavaScript, so no real viz file has one; the cells pin the scanner's contract
+# (an unterminated literal swallows the rest), one per place a "return n" lives. The two ${ } shapes carry a
+# later backtick on purpose: without it, returning the start instead of the end is observationally the same.
+# The two string shapes put the comment on a LATER line: a scanner that ended an unterminated string at the end of
+# its line (which real JavaScript does) would otherwise look identical to one that swallows the rest, because the
+# only text after the string was on the same line.
+
+@pytest.mark.parametrize("src", [
+    "var s = `abc // note one\n",                    # template never closed
+    "var s = `a${ b\n` ; // note one\n",             # ${ } never closed; a later backtick must not close it
+    "var s = `a${ 'x\n}` ; // note one\n",           # string inside ${ } never closed; a "}" and a backtick follow on the next line
+    "var s = 'abc\nvar t = 1; // note one\n",        # plain string never closed; the comment is on the NEXT line
+])
+def test_b_js_an_unterminated_literal_swallows_the_rest_as_literal_text(src):
+    assert semantic_change("a.js", src, src.replace("note one", "a different remark")) is not None, (
+        "the text after an unterminated literal is part of the literal, so rewording it is a change")
+
+
+def test_b_js_an_escaped_quote_in_a_plain_string_does_not_end_it():
+    # a scanner with no escape handling for a plain string ends it at the escaped quote and reads on as code
+    a = "var s = 'a\\'b'; // note one\n"
+    assert semantic_change("a.js", a, a.replace("note one", "a different remark")) is None
+    assert semantic_change("a.js", a, a.replace("a\\'b", "a\\'c")) is not None
+
+
+def test_b_js_an_unterminated_block_comment_swallows_the_rest_as_comment():
+    # the neighbour of the unterminated-literal contract: nothing closes `/*`, so the rest of the file is comment
+    a = "var n = 1;\n/* never closed\nvar t = 2; // note\n"
+    assert semantic_change("a.js", a, a.replace("never closed", "still open")) is None
+    assert semantic_change("a.js", a, a.replace("var t = 2;", "var t = 3;")) is None
+    assert semantic_change("a.js", a, a.replace("var n = 1;", "var n = 2;")) is not None

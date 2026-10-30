@@ -67,7 +67,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (test_session_start_hook_calibration.py, test_session_start_hook_auto_sleep_cron.py, test_session_start_hook_mcp_health.py all passing; covers startup cold-start and compact/resume paths separately; PR #800+ verified marker per-session isolation fix #140).
 
-**files** — engram-session-start-hook.py (968 lines), context_tracker.py (library), engram_log_emitter.py (for event logging).
+**files** — engram-session-start-hook.py, context_tracker.py (library), engram_log_emitter.py (for event logging).
 
 **key constants** — SLEEP_DEBT_HOURS_THRESHOLD=28, SLEEP_DEBT_MIN_NODES_THRESHOLD=10, SLEEP_BASELINE_NODE_THRESHOLD=100, PIECE_C_WINDOW="2 days ago", PIECE_C_MAX_LINES=20, PIECE_C_MAX_LINE_CHARS=140, SEVEN_DAYS=604800, DEFAULT_PURPOSES dict (role → fallback purpose), INTER_AGENT_DIR="/home/agents-shared/inter-agent" (env-override).
 
@@ -94,7 +94,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (PR #824 fixed plain-text regression; test_codex_hook_envelopes.py TestTimeBarHookEnvelope validates envelope + content; test_time_bar_hook.py specific tests).
 
-**files** — engram-time-bar-hook.py (166 lines).
+**files** — engram-time-bar-hook.py.
 
 **key constants** — DEFAULT_TZ="America/Los_Angeles", SESSIONS_DIR, LAST_USER_MSG, CONFIG paths (all resolved via Path.home() + .engram).
 
@@ -114,7 +114,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (test_codex_hook_envelopes.py::TestUserIdentityHookEnvelope lines 218–357 validates both no-op and sticky paths with synthetic DB setup; PR #824 fixed bare-additionalContext regression).
 
-**files** — engram-user-identity-hook.py (159 lines).
+**files** — engram-user-identity-hook.py.
 
 **key constants** — DB_PATH, CURRENT_USER_PATH, CONFIG_PATH (all in ENGRAM_HOME).
 
@@ -139,7 +139,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (test_engram_surface_hook_idf_gate.py validates IDF-gating for short prompts; test_engram_surface_hook_critical_warning.py validates MCP-offline warning; test_hooks_json_stdout_audit.py parametrized coverage; daemon runs stably in production).
 
-**files** — engram-surface-hook.py (847 lines), engram-surface-daemon.py (daemon), context_tracker.py (library).
+**files** — engram-surface-hook.py, engram-surface-daemon.py (daemon), context_tracker.py (library).
 
 **key constants** — SOCKET_PATH, COUNTER_PATH, WRITE_REMINDER_PATH, REPAIR_MARKER_PATH, FEELING_NUDGE_MARKER, WARM_BRIEFING_PATH, ERROR_PATTERNS_PATH, ERROR_INCIDENTS_PATH, KNOWLEDGE_DB_PATH, NAP_WARN_THRESHOLD=20, NAP_URGENT_THRESHOLD=25, DEFAULT_SHORT_PROMPT_THRESHOLD_CHARS=100, DEFAULT_PREV_RESPONSE_TAIL_CHARS=500, DEFAULT_IDF_GATE_MIN_IDF=4.0, DEFAULT_IDF_GATE_SHORT_PROMPT_FLOOR_CHARS=40, DEFAULT_IDF_GATE_ENABLED=True, SURFACE_TOP_K (default 5).
 
@@ -161,7 +161,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (test_hooks_json_stdout_audit.py parametrized coverage; works with engram-deference-detector-stop.py).
 
-**files** — engram-deference-detector-prompt.py (157 lines).
+**files** — engram-deference-detector-prompt.py.
 
 **key constants** — DEFERENCE_MARKER_PATH (~/.engram/deference-detected.json), LOOP_MARKER_PATH (~/.engram/loop-mode.json).
 
@@ -181,7 +181,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (test_end_of_day_hook.py specific tests; test_hooks_json_stdout_audit.py parametrized). *(Dispatcher note for the accuracy pass: known false-positive shape — the EOD regex matches quoted/incidental occurrences of trigger phrases inside injected content, observed live 2026-06-05.)*
 
-**files** — engram-end-of-day-hook.py (137 lines).
+**files** — engram-end-of-day-hook.py.
 
 **key constants** — SLEEP_MARKER (last-sleep-success.json), SLEEP_SUPPRESSION_HOURS=4, EOD_PATTERNS (compiled regex list).
 
@@ -203,7 +203,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (test_inter_agent_hook.py specific tests; test_hooks_json_stdout_audit.py parametrized; cursor discipline prevents re-fire spam).
 
-**files** — engram-inter-agent-prompt-hook.py (437 lines).
+**files** — engram-inter-agent-prompt-hook.py.
 
 **key constants** — read/surfaced cursor paths (see header correction 3), LIST_CAP=10 (no local-directory constant remains: the hook is pure-API).
 
@@ -225,7 +225,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (test_baton_hook.py specific tests; auto-archive logic tested; test_hooks_json_stdout_audit.py parametrized). *(Dispatcher note: the inventory's seeded zombie table carries "baton auto-archive REGRESSED" from prior session evidence — reconcile these two claims during the accuracy pass.)*
 
-**files** — engram-baton-prompt-hook.py (577 lines).
+**files** — engram-baton-prompt-hook.py.
 
 **key constants** — BATON_PROJECTS_DIR, HOOK_CACHE_PATH (~/.engram/baton-prompt-hook-cache.json), _GH_TIMEOUT=5s, _PR_ID_RE=r'^PR-\d+$'.
 
@@ -246,7 +246,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (test_hooks_json_stdout_audit.py parametrized; config-driven priority tested in ad-hoc manual cases).
 
-**files** — engram-github-notifications-hook.py (580 lines).
+**files** — engram-github-notifications-hook.py.
 
 **key constants** — SURFACED_CURSOR_PATH, FLAT_RENDER_CAP=15, COLLABORATOR_RENDER_CAP=8, PEER_RENDER_CAP=5, NOTIFICATION_RENDER_CAP=50.
 
@@ -268,7 +268,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (test_forum_hook.py specific tests; stale-fallback logic tested; test_hooks_json_stdout_audit.py parametrized; #847 same-second-window limitation pinned by test).
 
-**files** — engram-forum-prompt-hook.py (410 lines).
+**files** — engram-forum-prompt-hook.py.
 
 **key constants** — Forum URL (config.json forum.url → $FORUM_URL → localhost:5002), SURFACED_CURSOR_PATH, HOOK_CACHE_PATH, SERVER_TIMEOUT_SEC=5.
 
@@ -292,7 +292,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (live-verified on three installs 2026-06-05 post-#844: tool-bearing fire emits, contentless ack silent; test_codex_hook_envelopes.py::TestStopHookEnvelope; test_stop_hook_idle_suppression.py). Pending in review queue: #846 adds a maturity gate (total mute at ≥300 current nodes — scaffolding-fades principle).
 
-**files** — hooks/claude/engram-stop-hook.py (205 lines).
+**files** — hooks/claude/engram-stop-hook.py.
 
 **key constants** — _NUDGE_STATE_FILE (ENGRAM_HOME/.write-nudge-last-fire.json), _TOOL_USE_MARKER (b'"type":"tool_use"').
 
@@ -316,7 +316,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (marker-relay design: log + marker only, surfaced next turn by the prompt companion — intentional, not the #824 silent-failure shape; test_hooks_json_stdout_audit.py parametrized; telemetry via deference_baseline.py log analysis).
 
-**files** — engram-deference-detector-stop.py (400 lines).
+**files** — engram-deference-detector-stop.py.
 
 **key constants** — DEFERENCE_MARKER_PATH, LOG_PATH, LOOP_MARKER_PATH (loop-mode.json, checked to suppress in autonomous), _PHRASE_RULES, _INTENT_RULES.
 
@@ -340,7 +340,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (DB-write + log design, no model-visible output by design; test_hooks_json_stdout_audit.py parametrized; #792/#805 isolated the test suite's ENGRAM_HOME surface). **LIVE VERIFIED (2026-06-09, ob_2389)**: controlled end-to-end test moved dv_0073 utility_score 0.0→0.1 on exact α=0.10 Q-update — confirms DB write path fully operational after week-long silent non-enrollment (ob_2237/2238 closed).
 
-**files** — engram-utility-credit-mention-stop.py (~600 lines); shared logic in engram_restamp.py (`use_reward`, `bump_utility`, `USE_ALPHA`, `RESTAMP_ACTIONS`).
+**files** — engram-utility-credit-mention-stop.py; shared logic in engram_restamp.py (`use_reward`, `bump_utility`, `USE_ALPHA`, `RESTAMP_ACTIONS`).
 
 **key constants** — KNOWLEDGE_DB, LOG_PATH, CONFIG_PATH, `_ACTION="mention"` (the hook's key in the shared `engram_restamp.USE_ALPHA` / `RESTAMP_ACTIONS`).
 
@@ -362,7 +362,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **status-candidate** — **PROD-VERIFIED** (test_hooks_json_stdout_audit.py parametrized; compact-boundary marker fix (#207) verified in context_tracker test suite).
 
-**files** — engram-postcompact-hook.py (166 lines).
+**files** — engram-postcompact-hook.py.
 
 **key constants** — MARKER_PATH (last-compact-at.json), `_MAIN_MANIFEST_ID`, `_HOOK_FIRE_SITE`.
 
@@ -414,7 +414,7 @@ after v0.5.2; do not remove it earlier as dead code.
 
 **status-candidate** — **PROD-VERIFIED** (harness hook invocation works; daemon startup is non-blocking by design; daemon health probed later by surface-hook when socket actually needed).
 
-**files** — start-engram-daemon.sh (50 lines).
+**files** — start-engram-daemon.sh.
 
 **key constants** — SOCKET_PATH, PID_PATH, DAEMON_SCRIPT, LOG_PATH, timeout 2s (socket test), max 10s wait for socket.
 
@@ -435,7 +435,7 @@ after v0.5.2; do not remove it earlier as dead code.
 
 **status-candidate** — **PROD-PRESUMED** (runs stably; exercised every prompt; no known regressions; implicit testing via surface-hook + daemon availability checks; no explicit daemon unit tests — flagged in coverage gaps).
 
-**files** — engram-surface-daemon.py (204 lines).
+**files** — engram-surface-daemon.py.
 
 **key constants** — IDLE_TIMEOUT=28800s (8 hours), SOCKET_PATH, PID_PATH.
 
@@ -457,7 +457,7 @@ after v0.5.2; do not remove it earlier as dead code.
 
 **status-candidate** — **PROD-VERIFIED** (used in every prompt via surface-hook nap-warning; empirical threshold tuning underway; PR #207 refactored to stateless design).
 
-**files** — context_tracker.py (516 lines).
+**files** — context_tracker.py.
 
 **key constants** — TAIL_SCAN_BYTES=5000000 (5MB tail scan), HARDCODED_FALLBACK_CEILING=152000 (200k mode floor), drowsiness thresholds (calm/<60%, drowsy/60–85%, urgent/>85%, varies by mode).
 
@@ -473,7 +473,7 @@ after v0.5.2; do not remove it earlier as dead code.
 
 **status-candidate** — **DORMANT** (not registered; functionality absorbed into engram-surface-hook.py; retained for back-compat or historical reference — adjudicate retire-vs-keep).
 
-**files** — context_tracker_hook.py (43 lines).
+**files** — context_tracker_hook.py.
 
 **key constants** — None.
 
