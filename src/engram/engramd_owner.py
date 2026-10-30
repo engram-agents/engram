@@ -2952,6 +2952,10 @@ class EngramdOwner:
         self._bound_socket = False
         # #4068: set as the first thing start() does and never reset: one object, one lifetime.
         self._start_called = False
+        # #4282: a SIGTERM/SIGINT that arrives while start() runs is only RECORDED (_handle_signal), and
+        # start() runs stop() itself once it has finished; see start().
+        self._starting = False
+        self._stop_requested = threading.Event()
         # #3882: the fd of the store-maintenance flock, held from start() to the end of _cleanup().
         self._maint_lock_fd: int | None = None
         self._accept_thread: threading.Thread | None = None
@@ -3016,7 +3020,19 @@ class EngramdOwner:
         connections are open closes them first (through `_cleanup()`, the same path `stop()` takes: it only
         removes a socket this owner bound and a pidfile that does not name another process) and only then
         releases the lock: the lock is never released while an owner connection is open. A failure before any
-        connection exists just releases, as before."""
+        connection exists just releases, as before.
+
+        #4282: with `install_signal_handlers=True` the SIGTERM/SIGINT handlers go in FIRST, before the lock
+        file, the bind or the pidfile exist, and defer: a signal that arrives before start() returns is only
+        recorded, and start() then runs stop() once, so the owner comes up and goes down cleanly instead of
+        stop() racing a half-started owner. `main()` checks `_stop_requested` and does not announce a
+        listening owner in that case. A signal recorded during a start that then FAILS is dropped: the
+        process leaves through the refusal path with that refusal's exit code, the previous handlers
+        restored. The trade, stated: a signal that lands during a failed start's CLEANUP is also only
+        recorded, so that cleanup cannot be interrupted by SIGTERM/SIGINT; a cleanup that hangs (for
+        example on `_owner_lock`, held across an in-flight snapshot's backup) needs SIGKILL, which
+        leaves the socket behind. A bounded lock wait would avoid that at the cost of the
+        never-close-under-a-backup guarantee, so it is not taken."""
         # #4068: one object, one lifetime. FIRST, before any other work, and never reset, so a start() that
         # raised partway still counts and a second call is refused having touched nothing.
         if self._start_called:
@@ -3025,32 +3041,67 @@ class EngramdOwner:
                 "failed); an owner object has one lifetime. Build a new EngramdOwner to start again"
             )
         self._start_called = True
+        # #4282: the DEFERRING handler goes in before the first externally visible artifact (the maintenance
+        # lock file, the bind, the pidfile), so there is no window in which a signal takes the default kill
+        # (no cleanup) or runs stop() against a half-started owner. While `_starting` is up the handler only
+        # records the request; the end of this method runs the one stop().
+        self._starting = True
+        previous_handlers: list = []
         try:
+            if install_signal_handlers:
+                for signum in (signal.SIGTERM, signal.SIGINT):
+                    previous_handlers.append((signum, signal.signal(signum, self._handle_signal)))
             self._start_inner(install_signal_handlers=install_signal_handlers)
         except BaseException:
-            had_connections = self._owner_conn is not None or self._client_read_conn is not None
-            cleanup_failed = False
-            if had_connections:
-                try:
-                    self._cleanup()  # closes both connections, then releases the lock itself (unless displaced)
-                except Exception as cleanup_exc:
-                    # #4073: a failing cleanup must not replace the start error, and must NOT release the lock:
-                    # a connection may still be open, so holding is the safe side (main()'s exit drops it).
-                    # The cleanup error is logged, not chained; the ORIGINAL exception is re-raised below
-                    # (a bare `raise` here would re-raise the cleanup error instead).
-                    cleanup_failed = True
-                    logging.getLogger("engramd_owner").warning(
-                        "cleanup after a failed start itself failed (%s: %s); the maintenance lock stays held "
-                        "until this process exits", type(cleanup_exc).__name__, cleanup_exc)
-            if cleanup_failed:
+            # #4282: the deferring handler stays installed THROUGH the failure cleanup (a signal now is only
+            # recorded, then dropped with the failed start), so a SIGTERM cannot kill the process mid-cleanup.
+            # The previous handlers go back, and `_starting` drops, only in the `finally`, after the cleanup.
+            try:
+                had_connections = self._owner_conn is not None or self._client_read_conn is not None
+                cleanup_failed = False
+                if had_connections:
+                    try:
+                        self._cleanup()  # closes both connections, then releases the lock itself (unless displaced)
+                    except Exception as cleanup_exc:
+                        # #4073: a failing cleanup must not replace the start error, and must NOT release the lock:
+                        # a connection may still be open, so holding is the safe side (main()'s exit drops it).
+                        # The cleanup error is logged, not chained; the ORIGINAL exception is re-raised below
+                        # (a bare `raise` here would re-raise the cleanup error instead).
+                        cleanup_failed = True
+                        logging.getLogger("engramd_owner").warning(
+                            "cleanup after a failed start itself failed (%s: %s); the maintenance lock stays held "
+                            "until this process exits", type(cleanup_exc).__name__, cleanup_exc)
+                if cleanup_failed:
+                    raise
+                if not self._displaced:
+                    # A displaced owner never releases here, on any path (including the pidfile refusal, where
+                    # _cleanup() has already parked the connections and nulled the attributes): its connections
+                    # stay OPEN, so its lock stays held with them and the kernel drops it when main() ends the
+                    # process with os._exit. Every other path releases here, idempotently.
+                    self._release_maint_lock()
                 raise
-            if not self._displaced:
-                # A displaced owner never releases here, on any path (including the pidfile refusal, where
-                # _cleanup() has already parked the connections and nulled the attributes): its connections
-                # stay OPEN, so its lock stays held with them and the kernel drops it when main() ends the
-                # process with os._exit. Every other path releases here, idempotently.
-                self._release_maint_lock()
-            raise
+            finally:
+                for signum, previous in previous_handlers:
+                    # A failed start leaves the process as it found it; the owner is not serving. The handlers
+                    # go back BEFORE `_starting` drops, so no signal in between can run stop() on the failed owner.
+                    try:
+                        signal.signal(signum, previous)
+                    except (ValueError, TypeError, OSError):
+                        pass
+                self._starting = False
+        # #4282: a request recorded while starting runs the one stop() with `_starting` STILL up, so a second
+        # signal that lands during that stop() is only recorded again, never a second stop() (C1). The flag
+        # is never cleared on this path: the owner is going down and wait_forever() returns at once.
+        if self._stop_requested.is_set():
+            self.stop()
+            return
+        # No request yet: from here a signal runs stop() directly again. Clear the flag, THEN look once more:
+        # a handler runs to completion between two bytecodes of this thread, so a signal in the gap between
+        # the check above and the clear was recorded (seen here), and one after the clear already ran stop()
+        # with nothing recorded. Either way one signal runs stop() exactly once.
+        self._starting = False
+        if self._stop_requested.is_set():
+            self.stop()
 
     def _take_maint_lock(self) -> None:
         """#3882: take the store-maintenance flock for THIS owner's own store (`self.store_path`, never
@@ -3287,10 +3338,7 @@ class EngramdOwner:
 
         self._write_pidfile()
 
-        if install_signal_handlers:
-            signal.signal(signal.SIGTERM, self._handle_signal)
-            signal.signal(signal.SIGINT, self._handle_signal)
-
+        # #4282: the signal handlers are installed in start(), before anything above is created.
         self._shutdown.clear()
         self._lockwait.set_family_map(_load_lockwait_family_map())  # #4234: before the first read can arrive
         self._lockwait.start(LOCKWAIT_FLUSH_INTERVAL_S)
@@ -3839,6 +3887,10 @@ class EngramdOwner:
             raise
 
     def _handle_signal(self, signum, frame) -> None:
+        # #4282: while start() runs, only record the request; start() runs the one stop() when it is done.
+        if self._starting:
+            self._stop_requested.set()
+            return
         self.stop()
 
     def stop(self) -> None:
@@ -6117,7 +6169,8 @@ def main(argv: list[str] | None = None) -> int:
     except refusals as exc:
         print(f"[engramd] {exc}", file=sys.stderr)
         return _refusal_exit_code(exc)
-    print(f"[engramd] listening on {owner.socket_path} (pid {os.getpid()})", file=sys.stderr)
+    if not owner._stop_requested.is_set():  # #4282: start() already ran the pending stop; not listening
+        print(f"[engramd] listening on {owner.socket_path} (pid {os.getpid()})", file=sys.stderr)
     owner.wait_forever()
     # Reading _displaced right after wait_forever() is safe because stop()
     # (and so _cleanup(), which can set the flag) runs in the signal handler
