@@ -13,6 +13,7 @@
     { "id": "generative-curiosity", "anchor": "Generative curiosity" },
     { "id": "loop-mode-core", "anchor": "Loop-mode policy (self-wake / autonomous cron fires)" },
     { "id": "loop-mode-arm-claude-code", "anchor": "Loop-mode policy (self-wake / autonomous cron fires)" },
+    { "id": "plan-by-results", "anchor": "Plan by results, not by dates" },
     { "id": "model-identity-gate", "anchor": "Model Identity Gate" },
     { "id": "engram-write-discipline", "anchor": "ENGRAM Write Discipline" },
     { "id": "cross-surface-persistence", "anchor": "Cross-Surface Persistence (identity-forming content)" },
