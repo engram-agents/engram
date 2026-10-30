@@ -20,7 +20,8 @@ additionalContext at all (confirmed against CC docs, forum #241, 2026-07-09)
 silently discarded by the harness every time. The live focus list now
 renders at SessionStart instead (source=="compact" fires there too — see
 engram-session-start-hook.py, #1732); starred letters were already covered
-there unconditionally and never needed to move.
+there unconditionally and never needed to move. (That starred-letters block was later
+deleted as dead, #4272.)
 """
 import json
 import os

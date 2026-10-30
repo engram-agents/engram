@@ -1454,8 +1454,6 @@ def format_calibration_block(conf_all: dict, conf_7d: dict, current_turn: int) -
 
 # Inter-agent dir (mirrors ia.py convention)
 INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
-STARRED_CAP = 10
-STARRED_STALE_DAYS = 7  # soft TTL for staleness nudge (nudge only, never auto-drop)
 FOCUS_LIST_CAP = 15  # mirrors engram_focus.FOCUS_LIST_CAP (write-side enforced cap)
 
 # #127 r2 (tier names updated #127 r3): in-hook sub-cap for the focus block
@@ -2015,78 +2013,6 @@ def saved_focus_sets_block(engram_home: str) -> str:
         return ""
 
 
-def starred_block(engram_home: str) -> str:
-    """Render starred inter-agent letters as concise pointers.
-
-    One line per entry: ⭐ [<from>] "<title>" — ia read <filename>
-    Stars older than STARRED_STALE_DAYS get a trailing nudge: ⚠ stale Nd — unstar if resolved
-    Reads from/title from snapshot fields stored at star-time — does NOT re-open or re-parse
-    the source letter. If the source letter was deleted, still renders from the snapshot.
-    Returns empty string when the list is empty, the file is missing, or any
-    read error occurs. Never raises — hook must not block session start.
-    """
-    try:
-        starred_path = os.path.join(engram_home, "inter-agent-starred.json")
-        try:
-            raw = read_regular_text(starred_path, encoding="utf-8")
-            entries = json.loads(raw)
-            if not isinstance(entries, list):
-                return ""
-        except (OSError, json.JSONDecodeError, ValueError):
-            return ""
-
-        if not entries:
-            return ""
-
-        now = datetime.now(timezone.utc)
-        lines = []
-        skipped = 0
-        for entry in entries:
-            filename = entry.get("filename", "").strip()
-            if not filename:
-                skipped += 1
-                continue
-
-            # Read from/title from snapshot; graceful fallback for old entries lacking snapshot fields
-            from_agent = (entry.get("from") or "").strip() or "unknown"
-            title = (entry.get("title") or "").strip() or "(no title)"
-            note = entry.get("note", "").strip()
-            note_part = f" — {note}" if note else ""
-
-            # Staleness nudge: compute age from starred_at
-            stale_part = ""
-            starred_at_str = entry.get("starred_at", "")
-            if starred_at_str:
-                try:
-                    starred_dt = datetime.strptime(starred_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                    age_days = (now - starred_dt).days
-                    if age_days >= STARRED_STALE_DAYS:
-                        stale_part = f"  ⚠ stale {age_days}d — unstar if resolved"
-                except ValueError:
-                    pass
-
-            lines.append(f"  ⭐ [{from_agent}] \"{title}\" — ia read {filename}{note_part}{stale_part}")
-
-        if not lines:
-            return ""
-
-        total = len(lines)
-        display_lines = lines[:STARRED_CAP]
-        remaining = total - len(display_lines)
-        header = f"⭐ {total} starred letter(s) — key cross-session context, re-read if relevant:"
-        block_lines = [header] + display_lines
-        if remaining > 0:
-            block_lines.append(f"  ... +{remaining} more (ia starred to see all)")
-        if skipped > 0:
-            block_lines.append(
-                f"  (note: {skipped} starred entry/entries skipped (missing filename field))"
-            )
-        return "\n".join(block_lines)
-    except Exception:
-        # Hook discipline: never surface starred-block errors at session start.
-        return ""
-
-
 # Cap for the per-session node-injection block (#2026 WS1). This is a SAFETY
 # NET for a pathological window (e.g. injected_through stuck at a very old value
 # after a long-unused session), NOT a budget control -- so it must sit clear
@@ -2197,7 +2123,7 @@ def session_checkpoint_block(engram_home: str, injected_through: str | None) -> 
     nap, and only strictly AFTER this function's return value has been
     appended to additionalContext — is documented on write_marker(), which
     owns the field. This function is a PURE READ of it: it never writes the
-    marker file itself, matching focus_block()/starred_block()'s discipline
+    marker file itself, matching focus_block()'s discipline
     (pure read, fail-soft, returns "" on anything unexpected, never raises
     — hook must never block session start).
 
@@ -2567,7 +2493,7 @@ def _resolve_tool_capability_index_path() -> str:
     The artifact is checked-in repo content that travels with server.py, not
     engram_home data — so resolution mirrors _resolve_mcp_server_path's
     colocation-first strategy rather than the engram_home-based lookups the
-    focus/starred blocks use. It ships as a ROOT-LEVEL file directly beside
+    focus block uses. It ships as a ROOT-LEVEL file directly beside
     server.py (not in a generated/ subdirectory) — build.py's plugin copier
     only has prefix-specific sections for tools/, templates/, hooks/,
     skills/, agents/, and output-styles/; a generated/ subdirectory would
@@ -4158,26 +4084,13 @@ def _main_impl() -> None:
     except Exception:
         pass
 
-    # ── Starred letters surface (cheap: local read) ────────────────────────
-    # Inject starred-letter pointers at both fresh-session (startup) and
-    # post-compaction (compact/resume) so load-bearing cross-session agreements
-    # survive the experiential reset. Pointer-not-injection: one line each,
-    # NOT full content. Silent skip on any failure — hook must not block
-    # session start.
-    try:
-        _starred = starred_block(ENGRAM_HOME)
-        if _starred:
-            _blocks.append((_P_REST, _starred))
-    except Exception:
-        pass
-
     if source != "startup":
         # History-arc injection (#2026 WS2) — pure filesystem read, does NOT
         # depend on `marker` (unlike the WS1 checkpoint block below), so it
         # is called unconditionally within this branch. Gated on
         # `source != "startup"` explicitly (pulled out of the source
         # if/else's `else:` arm by #2150, so it can be positioned after the
-        # focus/saved-sets/starred blocks — the SIZE-axis fix — while
+        # focus/saved-sets blocks — the SIZE-axis fix — while
         # keeping the exact same non-startup-only rendering condition it
         # always had). Rendered adjacent to WS1's checkpoint block by design
         # (no shared header — see history_arc_block()'s docstring); both
@@ -4238,8 +4151,8 @@ def _main_impl() -> None:
     # PRIORITY decision, not a cosmetic one.
     #
     # Emission order now serves TWO failure modes, not one. Both are covered
-    # below; neither is a special case of the other, and — because focus,
-    # saved-sets, and starred all sit on the cheap side of BOTH axes — there is
+    # below; neither is a special case of the other, and — because focus
+    # and saved-sets both sit on the cheap side of BOTH axes — there is
     # no trade between them to make:
     #
     #   1. TIMEOUT KILL (#1819, original) — cheap before expensive. A timeout
@@ -4271,7 +4184,7 @@ def _main_impl() -> None:
     # LAST.
     #
     # Rule (axis 2, SIZE): among the cheap-on-axis-1 blocks, the one that MUST
-    # survive a truncating reader (focus, saved-sets, starred) is appended
+    # survive a truncating reader (focus, saved-sets) is appended
     # BEFORE the one that is a convenience even when complete (the history arc
     # + session checkpoint) — see main()'s emission order, changed #2150.
     # Ordering here is now a free, secondary mitigation on this axis (a
@@ -4351,7 +4264,6 @@ def _main_impl() -> None:
     #                                DATE every number you add here. The
     #                                stale figure above read as current for
     #                                three weeks because it carried no date.
-    #     starred_block()            local DB read
     #     calibration block          0.61s warm  (~79% of the hook's warm total
     #                                of 0.81s; dominated by EngramClient()
     #                                construction, which pulls in the server

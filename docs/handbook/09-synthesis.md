@@ -8,7 +8,7 @@
 
 Trace one day of an installed agent, bottom-up:
 
-**Session start.** The harness fires SessionStart (L2): `start-engram-daemon.sh` ensures the embedding daemon, `engram-session-start-hook.py` injects warm-briefing pointer + calibration anchors + sleep-debt + starred letters + fairy policies. The identity the agent wakes into was rendered once at install from the L7 templates (CLAUDE.md from template + seed-node IDs; warm-briefing accumulating since). The graph it wakes onto is the L0 substrate (knowledge.db: nodes/edges/sequences/FTS/vec, WAL, importance decay, homeostatic tiers).
+**Session start.** The harness fires SessionStart (L2): `start-engram-daemon.sh` ensures the embedding daemon, `engram-session-start-hook.py` injects warm-briefing pointer + calibration anchors + sleep-debt + fairy policies. The identity the agent wakes into was rendered once at install from the L7 templates (CLAUDE.md from template + seed-node IDs; warm-briefing accumulating since). The graph it wakes onto is the L0 substrate (knowledge.db: nodes/edges/sequences/FTS/vec, WAL, importance decay, homeostatic tiers).
 
 **Every prompt.** Nine UserPromptSubmit hooks (L2) compose the ambient context: time bar → identity detection → ENGRAM recall (daemon semantic + FTS fallback; recall_summary/keyword chips — the author-curated recognition surface) → deference alerts → EOD detection → letters → batons → GitHub notifications → forum mentions. This is the "memory feels ambient" experience: ~10–15 nodes of lossy recognition signal, teaching the agent when to reach for deliberate recall.
 

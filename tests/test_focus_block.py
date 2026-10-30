@@ -40,7 +40,7 @@ pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
 
 
 # ---------------------------------------------------------------------------
-# Module-load helper (mirrors tests/test_starred_block.py's pattern)
+# Module-load helper
 # ---------------------------------------------------------------------------
 
 def _load_session_start_module(engram_home: Path):

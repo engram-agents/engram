@@ -206,9 +206,9 @@ class TestOversizedInputStaysBounded:
         mod._check_viz_server_health = lambda home: ("not-configured", None)
         mod._check_embedding_restore_flag = lambda home: (True, None)
 
-        # Nine independently-monkeypatchable P3 blocks (7 startup-only +
-        # saved-sets + starred), each ~7,000 chars with a distinguishing
-        # marker -- 63,000 chars total, well past #127's 9,500-char budget,
+        # Eight independently-monkeypatchable P3 blocks (7 startup-only +
+        # saved-sets), each ~7,000 chars with a distinguishing
+        # marker -- 56,000 chars total, well past #127's 9,500-char budget,
         # but no SINGLE block here exceeds the budget alone (that edge case
         # is TestOversizedSingleP1Block below, not this fixture).
         block_names = [
@@ -221,7 +221,6 @@ class TestOversizedInputStaysBounded:
         mod.peer_topology_block = lambda agent_name: "MARK-PEER-" + ("x" * 7000)
         mod.piece_c_git_log = lambda session_id: "MARK-PIECEC-" + ("x" * 7000)
         mod.saved_focus_sets_block = lambda home: "MARK-SAVEDSETS-" + ("x" * 7000)
-        mod.starred_block = lambda home: "MARK-STARRED-" + ("x" * 7000)
 
         with _mock_no_engram_client():
             result = _run_hook_main(mod, {
@@ -259,11 +258,11 @@ class TestOversizedInputStaysBounded:
             "MARK-SLEEP_STATUS_BLOCK-", "MARK-AUTO_SLEEP_CRON_BLOCK-",
             "MARK-FAIRY_POLICY_BLOCK-", "MARK-FORUM_MONITOR_BLOCK-",
             "MARK-FORUM_UPDATES_MONITOR_BLOCK-", "MARK-PEER-", "MARK-PIECEC-",
-            "MARK-SAVEDSETS-", "MARK-STARRED-",
+            "MARK-SAVEDSETS-",
         ]
         cut_markers = [m for m in all_markers if m not in ctx]
         assert cut_markers, (
-            "fixture assumption: with 63,000 chars across 9 blocks under a "
+            "fixture assumption: with 56,000 chars across 8 blocks under a "
             "9,500-char budget, at least one block must be cut -- if this "
             "fails, the fixture no longer forces a real cut"
         )
@@ -455,7 +454,6 @@ class TestRealSeatShape:
         mod.focus_block = lambda home: huge_focus
         mod.history_arc_block = lambda home: "MARK-ARC-" + ("a" * 4_500)  # ~4.5K, matches the spec's "day arc"
         mod.saved_focus_sets_block = lambda home: "MARK-SAVEDSETS-" + ("s" * 100)
-        mod.starred_block = lambda home: "MARK-STARRED-" + ("t" * 100)
         huge_tool_caps = "MARK-TOOLCAPS-" + ("c" * 11_000)  # ~11K, matches the spec's tool-caps figure
         mod.tool_capability_index_block = lambda: huge_tool_caps
         # #3217: realistic ~800-char short-tool-caps stub (owner's own
@@ -489,7 +487,6 @@ class TestRealSeatShape:
         assert "A compaction just completed" in ctx
         assert "MARK-ARC-" in ctx
         assert "MARK-SAVEDSETS-" in ctx
-        assert "MARK-STARRED-" in ctx
         # Mutation control (b)'s own named target: calibration specifically
         # must be inline. If tool-caps is moved back ahead of calibration
         # (mutation (b)), this line goes red.
@@ -583,7 +580,7 @@ class TestFocusFloor:
         # budget on its own.
         moderate_focus = _synthetic_focus_block(40)  # a few thousand chars
         mod.focus_block = lambda home: moderate_focus
-        mod.starred_block = lambda home: "MARK-HUGE-OTHER-" + ("z" * 20_000)
+        mod.saved_focus_sets_block = lambda home: "MARK-HUGE-OTHER-" + ("z" * 20_000)
 
         with _mock_no_engram_client():
             result = _run_hook_main(mod, {
@@ -649,7 +646,6 @@ class TestHeadWindowRealSeatShape:
         mod.focus_block = lambda home: huge_focus
         mod.history_arc_block = lambda home: "MARK-ARC-" + ("a" * 4_500)
         mod.saved_focus_sets_block = lambda home: "MARK-SAVEDSETS-" + ("s" * 100)
-        mod.starred_block = lambda home: "MARK-STARRED-" + ("t" * 100)
         huge_tool_caps = "MARK-TOOLCAPS-" + ("c" * 11_000)
         mod.tool_capability_index_block = lambda: huge_tool_caps
         # #3217: realistic ~800-char short-tool-caps stub, same as
@@ -717,7 +713,6 @@ class TestUnmeasuredFloorRealSeatShape:
         mod.focus_block = lambda home: huge_focus
         mod.history_arc_block = lambda home: "MARK-ARC-" + ("a" * 4_500)
         mod.saved_focus_sets_block = lambda home: "MARK-SAVEDSETS-" + ("s" * 100)
-        mod.starred_block = lambda home: "MARK-STARRED-" + ("t" * 100)
         huge_tool_caps = "MARK-TOOLCAPS-" + ("c" * 11_000)
         mod.tool_capability_index_block = lambda: huge_tool_caps
         # #3217: realistic ~800-char short-tool-caps stub, same as

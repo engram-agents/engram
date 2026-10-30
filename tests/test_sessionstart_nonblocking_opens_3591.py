@@ -226,14 +226,6 @@ def _c_peer_topology(ctx):
              "regular": lambda r: "cross-host (forum): peer" in r})
 
 
-@cell("starred_block_file")  # starred_block: inter-agent-starred.json read_text
-def _c_starred(ctx):
-    ctx.special(ctx.eh / "inter-agent-starred.json", json.dumps(
-        [{"filename": "a.md", "from": "x", "title": "t"}]))
-    return ("result = mod.starred_block(P['eh'])",
-            {"fifo": lambda r: r == "", "regular": lambda r: "ia read a.md" in r})
-
-
 @cell("history_arc_filter")  # history_arc_block: isfile() already filters a FIFO (control)
 def _c_history_filter(ctx):
     ctx.special(ctx.eh / "history" / "2026-10-01.md", "hello arc")
@@ -426,8 +418,7 @@ def _run_script(ctx: Ctx, timeout=40):
 @pytest.mark.parametrize("kind", ["fifo", "regular"])
 def test_main_with_hook_only_paths(tmp_path, kind):
     ctx = Ctx(tmp_path, kind)
-    for rel in ("mcp-tools-ready.json", "inter-agent-starred.json",
-                "sessions/last-sleep-success.json"):
+    for rel in ("mcp-tools-ready.json", "sessions/last-sleep-success.json"):
         ctx.special(ctx.eh / rel, "{}")
     ctx.special(ctx.home / ".engram-finalize-pending.json", "{}")
     _peer(ctx, "peer", "h.invalid")

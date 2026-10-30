@@ -241,7 +241,7 @@ def test_focus_block_precedes_history_arc(tmp_path, engram_home, source):
 def test_history_arc_absent_on_startup_focus_present(tmp_path, engram_home):
     """#2150's control-flow change: history_arc_block() was pulled out of the
     source if/else's `else:` arm into its own `if source != "startup":`
-    block so it could be repositioned after focus/saved-sets/starred. This
+    block so it could be repositioned after focus/saved-sets. This
     pins that the non-startup-only gating survived the move — without it, a
     future edit could silently restore history on startup and nothing here
     would fail."""

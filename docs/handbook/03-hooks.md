@@ -51,14 +51,13 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 ## **2. SessionStart Hook — engram-session-start-hook.py**
 
-**what** — Session initialization: writes per-session marker (~/.engram/sessions/<session_id>.json), resets context-tracker baseline, clears sticky user identity, and injects a warm briefing block with optional history/git log (startup only). Also surfaces calibration anchors (per-type confidence quantiles), starred inter-agent letters, and sleep-debt banners. Silent skip on any non-critical failure — hook must never block session start.
+**what** — Session initialization: writes per-session marker (~/.engram/sessions/<session_id>.json), resets context-tracker baseline, clears sticky user identity, and injects a warm briefing block with optional history/git log (startup only). Also surfaces calibration anchors (per-type confidence quantiles) and sleep-debt banners. Silent skip on any non-critical failure — hook must never block session start.
 
 **how** — Entry point: main() (line 756). Key operations:
 - `write_marker()` (398–436): writes per-session marker with session_id, transcript_path, cwd, started_at, role.
 - `write_baseline()` (45): context_tracker import to reset per-session JSONL baseline.
 - `piece_c_git_log()` (439–477): collects commits from PIECE_C_REPOS (ENGRAM_HOME + optional extra repos) over PIECE_C_WINDOW (2 days). Limits to PIECE_C_MAX_LINES=20 per repo.
 - `sleep_status_block()` (480–562): reads LAST_SLEEP_MARKER_PATH, computes hours-since-sleep, surfaces banner if stale (>SLEEP_DEBT_HOURS_THRESHOLD=28h) or marker missing on established DB (>SLEEP_BASELINE_NODE_THRESHOLD=100 nodes) — but stays silent even when stale if nodes_since < SLEEP_DEBT_MIN_NODES_THRESHOLD=10 (quiet day, no catch-up needed).
-- `starred_block()` (244–312): renders inter-agent-starred.json as one-line pointers with staleness nudges (STARRED_STALE_DAYS=7).
 - `format_calibration_block()` (134–234): formats 6–10 line calibration anchor from engram_stats (all-time + 7-turn rolling) with per-type quantile rows.
 - `auto_sleep_cron_block()` (565–668): emits cron-registration nudge when cadence.auto_sleep_enabled=true; parses HH:MM time from config.json and computes jitter (hashlib-derived, 0–9 minutes) for clock-spread.
 - `fairy_policy_block()` (671–753): emits coder_fairy_policy and reviewer_fairy_policy mode lines (explicit/always/auto) from config.json.
@@ -70,7 +69,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **files** — engram-session-start-hook.py (968 lines), context_tracker.py (library), engram_log_emitter.py (for event logging).
 
-**key constants** — STARRED_CAP=10, STARRED_STALE_DAYS=7, SLEEP_DEBT_HOURS_THRESHOLD=28, SLEEP_DEBT_MIN_NODES_THRESHOLD=10, SLEEP_BASELINE_NODE_THRESHOLD=100, PIECE_C_WINDOW="2 days ago", PIECE_C_MAX_LINES=20, PIECE_C_MAX_LINE_CHARS=140, SEVEN_DAYS=604800, DEFAULT_PURPOSES dict (role → fallback purpose), INTER_AGENT_DIR="/home/agents-shared/inter-agent" (env-override).
+**key constants** — SLEEP_DEBT_HOURS_THRESHOLD=28, SLEEP_DEBT_MIN_NODES_THRESHOLD=10, SLEEP_BASELINE_NODE_THRESHOLD=100, PIECE_C_WINDOW="2 days ago", PIECE_C_MAX_LINES=20, PIECE_C_MAX_LINE_CHARS=140, SEVEN_DAYS=604800, DEFAULT_PURPOSES dict (role → fallback purpose), INTER_AGENT_DIR="/home/agents-shared/inter-agent" (env-override).
 
 **tests** — test_session_start_hook_calibration.py (format_calibration_block with per-type stats), test_session_start_hook_auto_sleep_cron.py (cron expr generation + jitter), test_session_start_hook_mcp_health.py (pgrep probe resilience), test_hooks_json_stdout_audit.py (JSON envelope), test_codex_hook_envelopes.py (nested envelope shape), test_sleep_status_block.py (quiet-day node-count guard: below/at-threshold, fail-open on query error).
 
@@ -351,24 +350,21 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 ## **5. PostCompact Hook — engram-postcompact-hook.py**
 
-**what** — Post-compaction marker + starred-letter surface. Writes last-compact-at.json (jsonl_path + byte_offset + timestamp) so context_tracker can measure post-compact token usage correctly. Also surfaces starred inter-agent letters (same starred_block() as session-start) as additionalContext so cross-session agreements survive the experiential reset a compaction represents. **NOTE (2026-06-09, ob_2267 confirmed)**: compact_boundary JSONL entries have RETURNED (verified 3 events in session ba178948 on 2026-06-09, each with full compactMetadata). The context_tracker's Path 2 fallback (scan backward for compact_boundary) is viable again for sessions where compact_boundary is within TAIL_SCAN_BYTES (5MB) of JSONL end. The last-compact-at.json marker is now an efficiency hedge + correctness backstop for large sessions where compact_boundary falls outside the scan window — no longer the sole correctness source.
+**what** — Post-compaction marker only. Writes last-compact-at.json (jsonl_path + byte_offset + timestamp) so context_tracker can measure post-compact token usage correctly, then fires an `engram.hook.fire` event. It emits **no additionalContext**: PostCompact is a side-effects-only hook event and cannot inject context (confirmed against the Claude Code docs, forum #241, 2026-07-09), so the focus list that an earlier design (#1655/#1710) tried to print from here is rendered at SessionStart instead, where `source=="compact"` fires too (#1732). **NOTE (2026-06-09, ob_2267 confirmed)**: compact_boundary JSONL entries have RETURNED (verified 3 events in session ba178948 on 2026-06-09, each with full compactMetadata). The context_tracker's Path 2 fallback (scan backward for compact_boundary) is viable again for sessions where compact_boundary is within TAIL_SCAN_BYTES (5MB) of JSONL end. The last-compact-at.json marker is now an efficiency hedge + correctness backstop for large sessions where compact_boundary falls outside the scan window — no longer the sole correctness source.
 
-**how** — Entry point: main() (142–225). Key operations:
-- Marker write: lines 163–185. Gets current JSONL byte_offset via os.path.getsize(), writes {"jsonl_path", "byte_offset", "timestamp"}. **LOAD-BEARING** — context_tracker numerator anchor; removing without replacement causes 100%-drowsy-on-fresh-compaction bug.
-- Context-tracker reset: write_baseline() (192–195). **VESTIGIAL** — confirmed no-op in stateless tracker; safe to strip.
-- Starred-letters surface: starred_block() (39–108, identical to session-start) renders pointers. Output: hookSpecificOutput/PostCompact/additionalContext (211–218) only if context_lines present.
-- Event logging: _emit_hook_fire() (117–139) always fired.
+**how** — Entry point: main(). Key operations:
+- Reads session_id and transcript_path from the stdin payload (issue #140: race-free per-session resolution); uses transcript_path when it exists, else `find_active_jsonl(session_id)`. If there is no JSONL to mark, it is a defensive no-op (still fires the event).
+- Marker write: os.path.getsize() of that JSONL becomes byte_offset; `atomic_write_json(MARKER_PATH, {"jsonl_path", "byte_offset", "timestamp"})`; an OSError is swallowed. The marker is the context_tracker numerator anchor.
+- Event logging: `_emit_hook_fire()` always fires (also on the no-op paths), with a participation telemetry record for the outcome (delivered, dropped, init_failed).
+- The old `write_baseline()` call and the old additionalContext printing are gone; the hook prints nothing to stdout.
 
-**[2026-06-09 AI #2 analysis — Luria]** Three-function audit:
-1. **byte_offset marker**: ~~LOAD-BEARING~~ → **EFFICIENCY HEDGE** (updated 2026-06-09, AI #2 augment). compact_boundary IS back in live traces (ob_2267 + live verification 2026-06-09: 3 events in session ba178948 with full compactMetadata). context_tracker Path 2 fallback is viable for most sessions. Marker remains useful for: (a) efficiency (direct byte-seek vs. tail scan), (b) correctness backstop when session JSONL grows large enough that compact_boundary falls outside TAIL_SCAN_BYTES (5MB) window. Folding to SessionStart(source=compact) is still feasible — requires Lei's sign-off.
-2. **write_baseline()**: VESTIGIAL. No-op in stateless tracker. Safe to strip (confirmed in hook body comment + context_tracker.py).
-3. **Starred-letters additionalContext**: DELIVERY UNCERTAIN. The JSON envelope IS well-formed (proper hookSpecificOutput/PostCompact/additionalContext structure, lines 211–218). However ob_0069/ob_0070 claim PostCompact cannot inject additionalContext — those nodes predate the #824 envelope fix and may be stale. A live compaction trace is needed to confirm delivery. If delivery is confirmed → eliminable by folding into SessionStart(compact). If delivery is NOT confirmed → starred-letters must move to SessionStart(compact) regardless; PostCompact collapses to single side-effect (byte_offset marker only), strongly favoring elimination.
+**[2026-06-09 AI #2 analysis — Luria]** The byte_offset marker was audited as LOAD-BEARING and then downgraded to an **efficiency hedge** (compact_boundary is back in live traces): it still saves a tail scan and backstops sessions whose compact_boundary lies outside the TAIL_SCAN_BYTES window. The other two functions in that audit (write_baseline, the additionalContext surface) no longer exist in this hook.
 
-**status-candidate** — **PROD-VERIFIED** (test_hooks_json_stdout_audit.py parametrized; compact-boundary marker fix (#207) verified in context_tracker test suite). *Elimination investigation pending live compaction trace + Lei sign-off.*
+**status-candidate** — **PROD-VERIFIED** (test_hooks_json_stdout_audit.py parametrized; compact-boundary marker fix (#207) verified in context_tracker test suite).
 
-**files** — engram-postcompact-hook.py (225 lines).
+**files** — engram-postcompact-hook.py (166 lines).
 
-**key constants** — MARKER_PATH (last-compact-at.json), STARRED_CAP=10, STARRED_STALE_DAYS=7.
+**key constants** — MARKER_PATH (last-compact-at.json), `_MAIN_MANIFEST_ID`, `_HOOK_FIRE_SITE`.
 
 **tests** — test_hooks_json_stdout_audit.py (parametrized PostCompact/engram-postcompact-hook.py).
 

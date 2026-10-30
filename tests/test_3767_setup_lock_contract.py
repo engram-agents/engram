@@ -1256,7 +1256,6 @@ mod.piece_c_git_log = lambda sid: ""
 mod.forum_monitor_block = lambda: ""
 mod.forum_updates_monitor_block = lambda: ""
 mod.peer_topology_block = lambda a: ""
-mod.starred_block = lambda h: ""
 sys.stdin = io.StringIO(json.dumps({"session_id": "s1", "transcript_path": "t.jsonl", "source": "startup"}))
 try:
     mod.main()

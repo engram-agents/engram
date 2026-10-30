@@ -253,7 +253,6 @@ def quiet(mod):
     mod.forum_monitor_block = lambda: ""
     mod.forum_updates_monitor_block = lambda: ""
     mod.peer_topology_block = lambda a: ""
-    mod.starred_block = lambda h: ""
     return mod
 
 
@@ -598,7 +597,6 @@ mod.piece_c_git_log = lambda sid: ""
 mod.forum_monitor_block = lambda: ""
 mod.forum_updates_monitor_block = lambda: ""
 mod.peer_topology_block = lambda a: ""
-mod.starred_block = lambda h: ""
 for k, v in scen.get("module_attrs", {}).items():
     setattr(mod, k, v)
 if scen.get("stub_calibration", True) and hasattr(mod, "_import_engramd_client"):  # the oracle hook has none

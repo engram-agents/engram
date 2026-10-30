@@ -360,7 +360,6 @@
   "hooks/claude/engram-session-start-hook.py:_focus_cut_marker",
   "hooks/claude/engram-session-start-hook.py:_truncate_focus_block",
   "hooks/claude/engram-session-start-hook.py:saved_focus_sets_block",
-  "hooks/claude/engram-session-start-hook.py:starred_block",
   "hooks/claude/engram-session-start-hook.py:_liveness_tag",
   "hooks/claude/engram-session-start-hook.py:session_checkpoint_block",
   "hooks/claude/engram-session-start-hook.py:_history_arc_header",
