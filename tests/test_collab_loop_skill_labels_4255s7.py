@@ -155,3 +155,20 @@ def test_step_2_pins_what_the_supervisor_does_to_a_prior_instance_and_what_the_f
 def test_mechanism_1_pins_the_monitor_timeout_it_tells_an_agent_to_pass():
     m1 = _mechanism_1()
     assert "`timeout_ms: 1800000`" in m1 and "`expires in 30m`" in m1
+
+
+def test_step_2_note_pins_that_a_suspected_duplicate_is_warned_about_and_never_killed():
+    """Luria's suggestion on #4274: the Step 2 note on the updates Monitor's robustness repeats the warn-only
+    rule in its own words, and 'then killed' left every cell green. The fact (read from
+    forum-updates-monitor.sh): a suspected duplicate is warned about, never killed."""
+    step2 = " ".join(TEXT[TEXT.index("## Step 2"):TEXT.index("## Step 3")].replace("\n>", " ").split())
+    assert "a suspected duplicate is WARNED about (pid + cmdline), never killed (#1933)" in step2
+    assert "then killed" not in step2
+
+
+def test_step_2_pins_that_a_duplicate_is_hand_killed_only_when_genuinely_stale():
+    """Reviewer round 1 on #4277: the other half of the same bullet. The monitors WARN and never kill, so
+    the skill tells the agent to hand-kill a reported pid, and only if it is genuinely stale."""
+    step2 = " ".join(TEXT[TEXT.index("## Step 2"):TEXT.index("## Step 3")].replace("\n>", " ").split())
+    assert "hand-`kill <pid>` it if it is genuinely stale (#1933)" in step2
+    assert "auto-kill" not in step2 and "kills it automatically" not in step2

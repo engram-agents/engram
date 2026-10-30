@@ -51,6 +51,48 @@ def strip_docstrings_ast(source: str) -> str:
     return ast.dump(tree, include_attributes=False)
 
 
+def _skip_braces(src: str, j: int) -> int:
+    """Index just past the `}` that closes a template `${`, whose body starts at j (strings, templates and
+    nested braces inside the expression are skipped whole)."""
+    n, depth = len(src), 1
+    while j < n:
+        c = src[j]
+        if c in "'\"":
+            j += 1
+            while j < n and src[j] != c:
+                j += 2 if src[j] == "\\" else 1
+            j += 1
+            continue
+        if c == "`":
+            j = _skip_template(src, j) + 1
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return n
+
+
+def _skip_template(src: str, i: int) -> int:
+    """Index of the backtick that closes the template literal opened at src[i] (len(src) when unterminated).
+    A `${ ... }` expression may itself hold strings, braces and further template literals."""
+    n, j = len(src), i + 1
+    while j < n:
+        c = src[j]
+        if c == "\\":
+            j += 2
+        elif c == "`":
+            return j
+        elif c == "$" and src[j + 1:j + 2] == "{":
+            j = _skip_braces(src, j + 2)
+        else:
+            j += 1
+    return n
+
+
 def strip_js_comments(src: str) -> str:
     """Remove // and /* */ comments, keeping strings, template literals and regex literals; collapse whitespace
     OUTSIDE those literals only (the amount of whitespace inside a string is part of the string)."""
@@ -72,8 +114,11 @@ def strip_js_comments(src: str) -> str:
             continue
         if c in "'\"`":
             q, j = c, i + 1
-            while j < n and src[j] != q:
-                j += 2 if src[j] == "\\" else 1
+            if c == "`":
+                j = _skip_template(src, i)
+            else:
+                while j < n and src[j] != q:
+                    j += 2 if src[j] == "\\" else 1
             out.append("\x00")
             lits.append(src[i:j + 1])
             i, prev_sig = j + 1, q
@@ -246,3 +291,54 @@ def test_b_js_whitespace_inside_a_string_literal_is_code():
 def test_b_js_whitespace_outside_strings_and_comments_still_does_not_count():
     a = "var k = 'a b';\nif (x) { go(); }\n"
     assert semantic_change("a.js", a, a.replace("var k =", "var   k  =").replace("{ go(); }", "{\n  go();\n}")) is None
+
+
+# ── Luria's suggestion 1 on #4274: a template literal that contains a template literal ──
+# The stripper used to end a template at the first inner backtick, so the `//` inside the INNER
+# literal read as a comment and hid the rest of the line, code included.
+
+NESTED = "var s = `a${ `b//c` }d`; var n = 1;\n"
+
+
+def test_b_js_code_after_a_nested_template_literal_is_code():
+    assert semantic_change("a.js", NESTED, NESTED.replace("var n = 1;", "var n = 2;")) is not None
+
+
+def test_b_js_a_backtick_inside_a_string_inside_a_template_expression_does_not_end_the_template():
+    # The old scanner ended the template at that backtick, opened a string at the next quote and swallowed
+    # the rest of the file as one literal: a reworded trailing comment then read as a code change.
+    a = "var s = `x${ '`' }y`; var n = 1; // note one\n"
+    assert semantic_change("a.js", a, a.replace("note one", "a different remark")) is None
+    assert semantic_change("a.js", a, a.replace("var n = 1;", "var n = 2;")) is not None
+
+
+def test_b_js_a_comment_after_a_nested_template_literal_is_still_a_comment():
+    a = "var s = `a${ `b//c` }d`; // note one\n"
+    assert semantic_change("a.js", a, a.replace("note one", "a different remark")) is None
+
+
+def test_b_js_braces_and_strings_inside_a_template_expression_still_scan():
+    a = "var s = `x${ f({a: '}'}) }y`; var n = 1;\n"
+    assert semantic_change("a.js", a, a.replace("var n = 1;", "var n = 2;")) is not None
+    assert semantic_change("a.js", a, a.replace("var n = 1;", "var   n = 1;")) is None
+
+
+def test_b_js_nested_braces_in_a_template_expression_are_counted():
+    """`{k: 1}` closes a brace of its own: the `}` after it must not end the `${ }`, or the backtick in the
+    string that follows would end the template and the rest of the line would be mis-scanned."""
+    a = "var s = `a${ {k: 1}, '`' }b`; var n = 1; // note one\n"
+    assert semantic_change("a.js", a, a.replace("note one", "a different remark")) is None
+    assert semantic_change("a.js", a, a.replace("var n = 1;", "var n = 2;")) is not None
+
+
+# ── Reviewer round 1 on #4277: pin the escape handling (a scanner without it passed every cell) ──
+
+def test_b_js_an_escaped_backtick_does_not_end_a_template_literal():
+    a = "var s = `a\\`b//c`; var n = 1;\n"
+    assert semantic_change("a.js", a, a.replace("var n = 1;", "var n = 2;")) is not None
+
+
+def test_b_js_an_escaped_quote_inside_a_string_inside_a_template_expression_does_not_end_the_string():
+    a = "var s = `x${ 'a\\'b' }y`; var n = 1; // note one\n"
+    assert semantic_change("a.js", a, a.replace("note one", "a different remark")) is None
+    assert semantic_change("a.js", a, a.replace("var n = 1;", "var n = 2;")) is not None
