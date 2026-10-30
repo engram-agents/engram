@@ -65,11 +65,20 @@ def _make_hook_input(prompt: str = "hello, what's next?") -> str:
     return json.dumps({"prompt": prompt})
 
 
-def _run_main_capture(hook, hook_input_json: str) -> str:
+def _failing_spawner(daemon_script):
+    """Default spawner for these tests: raises, so no test here ever launches the
+    real start-engram-daemon.sh, and the CRITICAL text stays under test (#4261)."""
+    raise OSError("test: relaunch spawn disabled")
+
+
+def _run_main_capture(hook, hook_input_json: str, spawner=None) -> str:
     """Run hook.main() with mocked stdin; return the captured stdout text.
 
-    Patches query_daemon → None (daemon offline) and query_fts_fallback → {}
-    so the CRITICAL warning fires and the rest of main() degrades gracefully.
+    Patches query_daemon -> None (daemon offline) and query_fts_fallback -> {}
+    so the daemon-down branch fires and the rest of main() degrades gracefully.
+    #4261: the branch now spawns start-engram-daemon.sh; `spawner` replaces the
+    hook's `_spawn_daemon_relaunch` (default: one that raises OSError, so the
+    CRITICAL text fires and nothing real is ever launched).
     Catches SystemExit(0) which main() always raises on success.
     Returns the raw text printed to stdout.
     """
@@ -77,6 +86,7 @@ def _run_main_capture(hook, hook_input_json: str) -> str:
 
     with patch.object(hook, "query_daemon", return_value=None), \
          patch.object(hook, "query_fts_fallback", return_value={}), \
+         patch.object(hook, "_spawn_daemon_relaunch", spawner or _failing_spawner), \
          patch("sys.stdin", io.StringIO(hook_input_json)), \
          patch("sys.stdout", output_buf):
         try:
@@ -85,6 +95,11 @@ def _run_main_capture(hook, hook_input_json: str) -> str:
             pass
 
     return output_buf.getvalue()
+
+
+def _context_of(raw_output: str) -> str:
+    assert raw_output.strip(), "main() produced no stdout"
+    return json.loads(raw_output.strip()).get("hookSpecificOutput", {}).get("additionalContext", "")
 
 
 # ---------------------------------------------------------------------------
@@ -364,31 +379,107 @@ class TestIdleShutdownTombstone(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_idle_shutdown_tombstone_gives_soft_not_critical(self):
-        """Offline + recent tombstone → SOFT idle-shutdown message, NOT CRITICAL."""
+        """Offline + recent tombstone + spawn ok -> SOFT idle-shutdown message, NOT CRITICAL."""
         import time
-        # Write a fresh idle-shutdown tombstone
         tombstone_path = os.path.join(self.tmp, "daemon-idle-shutdown")
         with open(tombstone_path, "w") as f:
             f.write(str(int(time.time())))
 
-        raw_output = _run_main_capture(self.hook, _make_hook_input())
-        self.assertTrue(raw_output.strip(), "main() produced no stdout")
-        response = json.loads(raw_output.strip())
-        additional_context = (
-            response
-            .get("hookSpecificOutput", {})
-            .get("additionalContext", "")
-        )
-        self.assertIn(
-            "idle-shutdown",
-            additional_context,
-            "SOFT idle-shutdown message must appear when tombstone is present and recent",
-        )
-        self.assertNotIn(
-            "⚠️ ENGRAM CRITICAL",
-            additional_context,
-            "CRITICAL warning must NOT fire when idle-shutdown tombstone is present and recent",
-        )
+        calls = []
+        ctx = _context_of(_run_main_capture(
+            self.hook, _make_hook_input(), spawner=lambda script: calls.append(script)))
+        self.assertIn("idle shutdown", ctx)
+        self.assertNotIn("⚠️ ENGRAM CRITICAL", ctx)
+
+    def test_cell1_tombstone_spawns_once_and_text_is_honest(self):
+        """#4261 cell 1: spawner called exactly once with the launcher path; the text
+        says a relaunch was REQUESTED and no longer promises an automatic restart."""
+        import time
+        with open(os.path.join(self.tmp, "daemon-idle-shutdown"), "w") as f:
+            f.write(str(int(time.time())))
+        calls = []
+        ctx = _context_of(_run_main_capture(
+            self.hook, _make_hook_input(), spawner=lambda script: calls.append(script)))
+        self.assertEqual(len(calls), 1, "spawner must be called exactly once")
+        self.assertTrue(calls[0].endswith("start-engram-daemon.sh"), calls)
+        self.assertIn("relaunch was requested", ctx)
+        self.assertIn("surface daemon did not answer this prompt (idle shutdown recorded)", ctx)
+        self.assertNotIn("surface daemon was down", ctx)
+        self.assertNotIn("restarting automatically", ctx)
+        self.assertNotIn("No action needed", ctx)
+
+    def test_cell2_spawn_raises_oserror_gives_critical_with_failure_note(self):
+        """#4261 cell 2: a raising spawner never escapes; CRITICAL + the failure note."""
+        import time
+        with open(os.path.join(self.tmp, "daemon-idle-shutdown"), "w") as f:
+            f.write(str(int(time.time())))
+
+        def boom(script):
+            raise OSError("no exec")
+
+        ctx = _context_of(_run_main_capture(self.hook, _make_hook_input(), spawner=boom))
+        self.assertIn("⚠️ ENGRAM CRITICAL", ctx)
+        self.assertIn("Automatic relaunch failed: OSError.", ctx)
+        self.assertNotIn("relaunch was requested", ctx)
+        self.assertNotIn("restarting automatically", ctx)
+
+    def test_cell3_inside_warmup_window_does_not_spawn(self):
+        """#4261 cell 3: stamp 2 s old -> warm-up text, spawner NOT called."""
+        import time
+        with open(os.path.join(self.tmp, "daemon-launch-attempt"), "w") as f:
+            f.write(str(int(time.time()) - 2))
+        calls = []
+        ctx = _context_of(_run_main_capture(
+            self.hook, _make_hook_input(), spawner=lambda script: calls.append(script)))
+        self.assertEqual(calls, [])
+        self.assertIn("warming up", ctx)
+
+    def test_cell4_no_tombstone_spawns_and_says_not_running(self):
+        """#4261 cell 4: no tombstone, no attempt -> spawn, 'no idle-shutdown record', not 'idle shutdown recorded'."""
+        calls = []
+        ctx = _context_of(_run_main_capture(
+            self.hook, _make_hook_input(), spawner=lambda script: calls.append(script)))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("relaunch was requested", ctx)
+        self.assertIn("surface daemon did not answer this prompt (no idle-shutdown record)", ctx)
+        self.assertNotIn("surface daemon was down", ctx)
+        self.assertNotIn("idle shutdown recorded", ctx)
+        self.assertNotIn("restarting automatically", ctx)
+        self.assertNotIn("No action needed", ctx)
+
+
+class TestSpawnDaemonRelaunch(unittest.TestCase):
+    """#4261: the real spawner is detached, fire-and-forget, and bash-launched."""
+
+    def test_spawner_is_detached_with_no_stdio_and_no_wait(self):
+        tmp = tempfile.mkdtemp(prefix="engram_spawner_test_")
+        try:
+            hook = _load_hook_module(tmp)
+            with patch("subprocess.Popen") as popen:
+                hook._spawn_daemon_relaunch("/x/start-engram-daemon.sh")
+            popen.assert_called_once()
+            args, kwargs = popen.call_args
+            self.assertEqual(args[0], ["bash", "/x/start-engram-daemon.sh"])
+            self.assertIs(kwargs.get("start_new_session"), True)
+            self.assertIs(kwargs.get("close_fds"), True)
+            import subprocess
+            for stream in ("stdin", "stdout", "stderr"):
+                self.assertIs(kwargs.get(stream), subprocess.DEVNULL, stream)
+            popen.return_value.wait.assert_not_called()
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_conftest_refuses_the_real_launcher_spawn(self):
+        """The autouse guard turns an unstubbed spawn into OSError (not a launch)."""
+        tmp = tempfile.mkdtemp(prefix="engram_spawner_guard_test_")
+        try:
+            hook = _load_hook_module(tmp)
+            with self.assertRaises(OSError):
+                hook._spawn_daemon_relaunch("/x/start-engram-daemon.sh")
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestCriticalWhenTombstoneAbsent(unittest.TestCase):

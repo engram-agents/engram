@@ -1065,6 +1065,24 @@ def _resolve_warmup_window() -> int:
 
 _DAEMON_WARMUP_WINDOW_SECONDS = _resolve_warmup_window()
 
+
+def _spawn_daemon_relaunch(daemon_script: str) -> None:
+    """Fire-and-forget launch of start-engram-daemon.sh (#4261).
+
+    Detached (own session, no stdio, no wait) so the prompt is never blocked and
+    the launcher outlives this hook process. Same shape as the owner launch in
+    _engramd_owner_hook_io.launch. Raises on spawn failure; the caller catches
+    it and says so in the prompt text. The launcher's own outcome is unknowable
+    here: it may defer to a supervisor or refuse on an unknown socket holder.
+    Module-level so tests can replace it.
+    """
+    import subprocess
+    subprocess.Popen(
+        ["bash", daemon_script],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True, close_fds=True,
+    )
+
 # Attached-pack surfacing quota — max results pulled across all packs combined.
 _PACK_SURFACE_QUOTA = 3
 
@@ -4550,7 +4568,7 @@ def _main_impl():
             )
         else:
             # Check for idle-shutdown tombstone (#1260): daemon exited as intended
-            # after idle-timeout — self-recovering startup condition, not a crash.
+            # after idle-timeout. The tombstone changes only the wording below.
             _idle_tombstone = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
             _is_idle_shutdown = False
             try:
@@ -4561,12 +4579,30 @@ def _main_impl():
                     _is_idle_shutdown = True
             except Exception:
                 pass
-            if _is_idle_shutdown:
+            # #4261: nothing relaunches an idle-shutdown daemon between
+            # SessionStarts (a long-open session never sees one), so this hook
+            # requests a relaunch itself: detached, fire-and-forget, never
+            # raising into the prompt. No second stamp file: the launcher stamps
+            # daemon-launch-attempt only when it actually launches, and the
+            # warm-up check above then suppresses re-spawns for the window. On a
+            # SUPERVISED seat whose daemon is down the launcher declines and
+            # writes no stamp, so this hook spawns it once per prompt until the
+            # supervisor brings the daemon back. That is acceptable: the
+            # launcher no-ops there.
+            _spawn_error = None
+            try:
+                _spawn_daemon_relaunch(daemon_script)
+            except Exception as _spawn_exc:
+                _spawn_error = type(_spawn_exc).__name__
+            if _spawn_error is None:
+                _why = "idle shutdown recorded" if _is_idle_shutdown else "no idle-shutdown record"
                 head_blocks.append(
-                    f"[ENGRAM: surface daemon was idle-shutdown (idle timeout) — "
-                    f"restarting automatically, semantic recall resumes in a few "
-                    f"seconds. No action needed unless this persists past the next "
-                    f"prompt. Recovery if it persists: bash {daemon_script}]"
+                    f"[ENGRAM: surface daemon did not answer this prompt ({_why}); a relaunch was "
+                    f"requested on this prompt (the launcher defers to a "
+                    f"supervisor if one owns the daemon). Semantic recall should "
+                    f"resume within a few prompts; lexical-only until then. If "
+                    f"this line repeats past the next few prompts: "
+                    f"bash {daemon_script}]"
                 )
             else:
                 head_blocks.append(
@@ -4578,7 +4614,7 @@ def _main_impl():
                     f"cold-start race: something on this machine is conflicting with "
                     f"the daemon (port already bound, permissions, or resource "
                     f"limits) — investigate the root cause before continuing, don't "
-                    f"just re-launch.]"
+                    f"just re-launch. Automatic relaunch failed: {_spawn_error}.]"
                 )
 
     # MCP write-tool liveness check — deferred from SessionStart to here

@@ -520,6 +520,29 @@ def _owner_gate_sees_current_store(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _surface_hook_never_relaunches_for_real(monkeypatch):
+    """#4261: the surface hook's daemon-down branch now spawns start-engram-daemon.sh
+    (detached: `["bash", <script>]`, stdout=DEVNULL, start_new_session=True). Any test
+    that drives hook.main() with the daemon down would otherwise launch the REAL
+    launcher. That spawn is refused here with OSError, which the hook turns into its
+    CRITICAL text (the pre-#4261 behaviour those tests were written against). Tests of
+    the spawn itself inject `_spawn_daemon_relaunch`. Narrow on purpose: tests that run
+    the launcher themselves (capture_output / no new session) are untouched.
+    Reach: in-process only; a hook run as a child process is not covered."""
+    real_popen = subprocess.Popen
+
+    class _GuardedPopen(real_popen):
+        def __init__(self, args, *a, **kw):
+            if (kw.get("start_new_session") and kw.get("stdout") is subprocess.DEVNULL
+                    and isinstance(args, (list, tuple)) and len(args) == 2
+                    and str(args[1]).endswith("start-engram-daemon.sh")):
+                raise OSError("tests/conftest.py: real launcher spawn refused (#4261)")
+            super().__init__(args, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", _GuardedPopen)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_git_config_leak(monkeypatch, tmp_path):
     """#2126: no `git` subprocess spawned by a test may read or write the real
     user's global/system git config.

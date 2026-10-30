@@ -864,6 +864,51 @@ def _make_timeout_stub(bin_dir: Path) -> bool:
     return True
 
 
+def _make_fake_uname(bin_dir: Path, system: str) -> None:
+    """Fake `uname` printing `system` (for `uname -s`), PATH-prepended (#4261)."""
+    path = bin_dir / "uname"
+    path.write_text(f"#!/bin/bash\necho {system}\n")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _make_fake_launchctl(
+    bin_dir: Path, *, rc: int = 0, stdout_text: str = "", sleep_seconds: float = 0,
+    user_rc: int | None = None, user_stdout_text: str = "", user_sleep_seconds: float = 0,
+) -> None:
+    """Fake `launchctl`, answering PER DOMAIN. `rc`/`stdout_text`/`sleep_seconds`
+    answer `launchctl print gui/<uid>/com.engram.surface-daemon`; `user_rc`/
+    `user_stdout_text`/`user_sleep_seconds` answer the `user/<uid>/...` form
+    (`user_rc=None`: the user domain is not expected to be asked -- it exits 98
+    so an unexpected query is visible). A `sleep_seconds` sleeps first (the
+    wedged-launchd case). Exits 99 for any other argv."""
+    textfile = bin_dir / "launchctl.out"
+    textfile.write_text(stdout_text)
+    user_textfile = bin_dir / "launchctl.user.out"
+    user_textfile.write_text(user_stdout_text)
+    path = bin_dir / "launchctl"
+    user_branch = (
+        (f"sleep {user_sleep_seconds}\n" if user_sleep_seconds else "")
+        + f'cat "{user_textfile}"\n' + f"exit {user_rc}\n"
+        if user_rc is not None
+        else 'echo "unexpected user-domain query: $*" >&2\nexit 98\n'
+    )
+    path.write_text(
+        "#!/bin/bash\n"
+        'case "$1" in print) ;; *) echo "bad argv: $*" >&2; exit 99 ;; esac\n'
+        'case "$2" in\n'
+        "  gui/*/com.engram.surface-daemon)\n"
+        + (f"    sleep {sleep_seconds}\n" if sleep_seconds else "")
+        + f'    cat "{textfile}"\n'
+        + f"    exit {rc} ;;\n"
+        "  user/*/com.engram.surface-daemon)\n"
+        + user_branch
+        + "    ;;\n"
+        '  *) echo "bad argv: $*" >&2; exit 99 ;;\n'
+        "esac\n"
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
 def _make_fake_systemctl(
     bin_dir: Path, *, mode: str,
     load_state: str = "", active_state: str = "", sub_state: str = "",
@@ -944,6 +989,11 @@ def _make_fake_systemctl(
     else:
         raise ValueError(mode)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    # #4261: the supervisor check now has a Darwin/launchctl branch AHEAD of the
+    # systemctl one, gated on `uname -s`. A fake systemctl stands in for a
+    # systemd host, so pin `uname` to Linux or this fake would be bypassed (and
+    # the real launchctl consulted) when these tests run on a Mac.
+    _make_fake_uname(bin_dir, "Linux")
     if mode != "sleep":
         # "sleep" is the wedged-bus fake: it needs a REAL timeout to bound
         # it, so no stub is installed for it (#3333).
@@ -3253,6 +3303,316 @@ class TestPreUnit4FrozenBaselineSanity(unittest.TestCase):
         self.assertIsNotNone(live_match)
         self.assertIsNotNone(pre_unit4_match)
         self.assertEqual(live_match.group(1), pre_unit4_match.group(1))
+
+
+# ---------------------------------------------------------------------------
+# #4261: Darwin launchctl branch of _supervisor_registered_state.
+#
+# `launchctl print` output nests `state = active` lines (coalitions) under the
+# job's own top-level `state = running`; only the job's own FIRST-level line
+# (one leading tab) may decide registered-active vs registered-failing.
+# ---------------------------------------------------------------------------
+
+_LAUNCHCTL_RUNNING_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "darwin_check"
+    / "launchctl_print_surface_daemon_running.txt"
+)
+_FIXTURE_HOME = "/Users/seat/.engram"
+
+
+def _launchctl_fixture(*, home: str = _FIXTURE_HOME, top_state: str = "running",
+                       drop_env_line: bool = False) -> str:
+    text = _LAUNCHCTL_RUNNING_FIXTURE.read_text()
+    assert "\n\tstate = running\n" in text and f"\t\tENGRAM_HOME => {_FIXTURE_HOME}\n" in text, (
+        "fixture shape changed")
+    text = text.replace("\n\tstate = running\n", f"\n\tstate = {top_state}\n", 1)
+    if drop_env_line:
+        text = text.replace(f"\t\tENGRAM_HOME => {_FIXTURE_HOME}\n", "", 1)
+    else:
+        text = text.replace(f"ENGRAM_HOME => {_FIXTURE_HOME}", f"ENGRAM_HOME => {home}", 1)
+    return text
+
+
+def _run_darwin_supervisor_function(
+    *, rc: int = 0, stdout_text: str = "", engram_home: str = _FIXTURE_HOME,
+    sleep_seconds: float = 0, subprocess_timeout: float = 20.0,
+    user_rc: int | None = None, user_stdout_text: str = "", user_sleep_seconds: float = 0,
+) -> tuple[str, float]:
+    """Run the REAL `_supervisor_registered_state` with a fake Darwin `uname`
+    and a fake `launchctl`. Returns (state, wall seconds)."""
+    script_text = START_SCRIPT_PATH.read_text()
+    # The bounded launchctl helper is a top-level function (the hooks stdout
+    # audit cannot parse nested ones), so extract it alongside.
+    func_text = (
+        _extract_bash_function(script_text, "_launchctl_print_bounded")
+        + "\n"
+        + _extract_bash_function(script_text, "_supervisor_registered_state")
+    )
+    with tempfile.TemporaryDirectory() as td:
+        bin_dir = Path(td)
+        _make_fake_uname(bin_dir, "Darwin")
+        _make_fake_launchctl(
+            bin_dir, rc=rc, stdout_text=stdout_text, sleep_seconds=sleep_seconds,
+            user_rc=user_rc, user_stdout_text=user_stdout_text,
+            user_sleep_seconds=user_sleep_seconds)
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
+        env["ENGRAM_HOME"] = engram_home
+        started = time.time()
+        result = subprocess.run(
+            [shutil.which("bash") or "/bin/bash", "-c", func_text + "\n_supervisor_registered_state"],
+            capture_output=True, text=True, timeout=subprocess_timeout, env=env,
+        )
+        elapsed = time.time() - started
+        assert result.returncode == 0, f"function invocation failed: {result.stderr}"
+        return result.stdout.strip(), elapsed
+
+
+class TestSupervisorRegisteredStateDarwinLaunchctl(unittest.TestCase):
+    def test_running_job_with_matching_home_is_registered_active(self):
+        state, _ = _run_darwin_supervisor_function(stdout_text=_launchctl_fixture())
+        self.assertEqual(state, "registered-active")
+
+    def test_rc_113_is_not_registered(self):
+        state, _ = _run_darwin_supervisor_function(
+            rc=113, stdout_text="Could not find service \"com.engram.surface-daemon\" in domain for user gui: 501\n")
+        self.assertEqual(state, "not-registered")
+
+    def test_home_mismatch_is_unavailable(self):
+        state, _ = _run_darwin_supervisor_function(
+            stdout_text=_launchctl_fixture(home="/private/tmp/some-leaked-test-home"))
+        self.assertEqual(state, "unavailable")
+
+    def test_missing_home_line_is_unavailable(self):
+        state, _ = _run_darwin_supervisor_function(
+            stdout_text=_launchctl_fixture(drop_env_line=True))
+        self.assertEqual(state, "unavailable")
+
+    def test_not_running_top_level_state_is_registered_failing(self):
+        """Nested coalition lines still read `state = active`; only the job's
+        own top-level line (`not running`) may decide. An any-line match fails."""
+        text = _launchctl_fixture(top_state="not running")
+        self.assertIn("\t\tstate = active\n", text)  # the trap is really present
+        state, _ = _run_darwin_supervisor_function(stdout_text=text)
+        self.assertEqual(state, "registered-failing")
+
+    def test_spawn_scheduled_top_level_state_is_registered_failing(self):
+        state, _ = _run_darwin_supervisor_function(
+            stdout_text=_launchctl_fixture(top_state="spawn scheduled"))
+        self.assertEqual(state, "registered-failing")
+
+    def test_no_top_level_state_line_is_registered_failing(self):
+        """Our home, rc 0, but NO first-level `state = ` line (nested `state = active`
+        lines remain): the job's own state is unknown, so registered-failing (no launch)."""
+        lines = _LAUNCHCTL_RUNNING_FIXTURE.read_text().splitlines(keepends=True)
+        self.assertEqual(lines[4], "\tstate = running\n")  # line 5, the first-level line
+        text = "".join(lines[:4] + lines[5:])
+        self.assertIn("\t\tstate = active\n", text)  # the nested trap is really present
+        self.assertNotIn("\n\tstate = ", text)
+        state, _ = _run_darwin_supervisor_function(stdout_text=text)
+        self.assertEqual(state, "registered-failing")
+
+    def test_job_home_with_trailing_slash_is_ours(self):
+        """F1 (a): compare physical paths; a trailing slash is not a different home."""
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            state, _ = _run_darwin_supervisor_function(
+                stdout_text=_launchctl_fixture(home=f"{home}/"), engram_home=str(home))
+        self.assertEqual(state, "registered-active")
+
+    def test_job_home_symlink_to_our_home_is_ours(self):
+        """F1 (b): a symlinked spelling of our home resolves to the same physical dir."""
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            link = Path(td) / "link"
+            link.symlink_to(home)
+            state, _ = _run_darwin_supervisor_function(
+                stdout_text=_launchctl_fixture(home=str(link)), engram_home=str(home))
+        self.assertEqual(state, "registered-active")
+
+    def test_job_home_different_existing_dir_is_unavailable(self):
+        """F1 (c): two real, different directories stay foreign."""
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            other = Path(td) / "other"
+            home.mkdir()
+            other.mkdir()
+            state, _ = _run_darwin_supervisor_function(
+                stdout_text=_launchctl_fixture(home=str(other)), engram_home=str(home))
+        self.assertEqual(state, "unavailable")
+
+    def test_other_rc_is_unavailable(self):
+        state, _ = _run_darwin_supervisor_function(rc=1, stdout_text=_launchctl_fixture())
+        self.assertEqual(state, "unavailable")
+
+    def test_wedged_launchctl_times_out_to_unavailable_quickly(self):
+        state, elapsed = _run_darwin_supervisor_function(
+            stdout_text=_launchctl_fixture(), sleep_seconds=30)
+        self.assertEqual(state, "unavailable")
+        self.assertLess(elapsed, 8.0, "the launchctl call must be bounded, not wait out the fake's sleep")
+
+    # rc 125 = no GUI launchd domain for this uid (measured on a real seat,
+    # 10-30; the installer treats it the same way): consult the user domain.
+    def test_gui_125_user_113_is_not_registered(self):
+        state, _ = _run_darwin_supervisor_function(rc=125, user_rc=113)
+        self.assertEqual(state, "not-registered")
+
+    def test_gui_125_user_125_is_not_registered(self):
+        state, _ = _run_darwin_supervisor_function(rc=125, user_rc=125)
+        self.assertEqual(state, "not-registered")
+
+    def test_gui_125_user_running_our_home_is_registered_active(self):
+        state, _ = _run_darwin_supervisor_function(
+            rc=125, user_rc=0, user_stdout_text=_launchctl_fixture())
+        self.assertEqual(state, "registered-active")
+
+    def test_gui_125_user_not_running_our_home_is_registered_failing(self):
+        state, _ = _run_darwin_supervisor_function(
+            rc=125, user_rc=0, user_stdout_text=_launchctl_fixture(top_state="not running"))
+        self.assertEqual(state, "registered-failing")
+
+    def test_gui_125_user_foreign_home_is_unavailable(self):
+        state, _ = _run_darwin_supervisor_function(
+            rc=125, user_rc=0,
+            user_stdout_text=_launchctl_fixture(home="/private/tmp/some-leaked-test-home"))
+        self.assertEqual(state, "unavailable")
+
+    def test_gui_125_user_missing_home_line_is_unavailable(self):
+        state, _ = _run_darwin_supervisor_function(
+            rc=125, user_rc=0, user_stdout_text=_launchctl_fixture(drop_env_line=True))
+        self.assertEqual(state, "unavailable")
+
+    def test_gui_125_user_other_rc_is_unavailable(self):
+        state, _ = _run_darwin_supervisor_function(rc=125, user_rc=5)
+        self.assertEqual(state, "unavailable")
+
+    def test_gui_125_user_wedged_is_unavailable_quickly(self):
+        state, elapsed = _run_darwin_supervisor_function(
+            rc=125, user_rc=113, user_sleep_seconds=30)
+        self.assertEqual(state, "unavailable")
+        self.assertLess(elapsed, 8.0, "the user-domain call must be bounded too")
+
+    def test_gui_other_rc_never_consults_user_domain(self):
+        """Only rc 125 falls through: a gui rc 5 stays unavailable even though a
+        (fake) user domain would say not-registered."""
+        state, _ = _run_darwin_supervisor_function(rc=5, user_rc=113)
+        self.assertEqual(state, "unavailable")
+
+
+class _DarwinLauncherBase(_ProbeBranchFixture):
+    """Full-script runs on a fake Darwin host (fake uname + launchctl, no systemctl)."""
+
+    FAKE_SYSTEMCTL_MODE = None
+    LAUNCHCTL_RC = 0
+    USER_RC = None
+
+    def launchctl_text(self) -> str:
+        return ""
+
+    def user_launchctl_text(self) -> str:
+        return ""
+
+    def setUp(self):
+        super().setUp()
+        self._darwin_dir = self.tmp / "fakebin-darwin"
+        self._darwin_dir.mkdir()
+        _make_fake_uname(self._darwin_dir, "Darwin")
+        _make_fake_launchctl(
+            self._darwin_dir, rc=self.LAUNCHCTL_RC, stdout_text=self.launchctl_text(),
+            user_rc=self.USER_RC, user_stdout_text=self.user_launchctl_text())
+
+    def _run(self, timeout: float = 15.0, extra_env: dict | None = None):
+        env = {"PATH": f"{self._darwin_dir}:{os.environ.get('PATH', '')}"}
+        env.update(extra_env or {})
+        return super()._run(timeout=timeout, extra_env=env)
+
+
+class TestDarwinLauncherSupervisedHealthy(_DarwinLauncherBase):
+    def launchctl_text(self):
+        return _launchctl_fixture(home=str(self.engram_home))
+
+    def test_running_matching_job_is_supervised_healthy_and_does_not_launch(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertIn("SUPERVISED_HEALTHY", content)
+        self.assertNotIn("UNSUPERVISED", content)
+        self.assertTrue(self._wait_briefly_for_no_relaunch())
+        self.assertFalse((self.engram_home / "daemon-launch-attempt").exists())
+
+
+class TestDarwinLauncherForeignHome(_DarwinLauncherBase):
+    def launchctl_text(self):
+        return _launchctl_fixture(home="/private/tmp/some-leaked-test-home")
+
+    def test_job_with_other_home_is_unavailable_and_does_not_launch(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertIn("unavailable", content)
+        self.assertNotIn("SUPERVISED_HEALTHY", content)
+        self.assertNotIn("UNSUPERVISED", content)
+        self.assertTrue(self._wait_briefly_for_no_relaunch())
+
+
+class TestDarwinLauncherNotRegistered(_DarwinLauncherBase):
+    LAUNCHCTL_RC = 113
+
+    def launchctl_text(self):
+        return "Could not find service in domain\n"
+
+    def test_rc_113_launches_as_unsupervised(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("UNSUPERVISED", "\n".join(self._log_lines()))
+        self.assertTrue(self._wait_for_relaunch_marker(), "no job registered: the launcher must launch")
+        self.assertTrue((self.engram_home / "daemon-launch-attempt").exists())
+
+
+class TestDarwinLauncherRegisteredFailing(_DarwinLauncherBase):
+    def launchctl_text(self):
+        return _launchctl_fixture(home=str(self.engram_home), top_state="not running")
+
+    def test_not_running_job_is_supervised_failing_and_does_not_launch(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertIn("SUPERVISED_FAILING", content)
+        self.assertNotIn("UNSUPERVISED", content)
+        self.assertTrue(self._wait_briefly_for_no_relaunch())
+
+
+class TestDarwinLauncherNoGuiDomainUserNotRegistered(_DarwinLauncherBase):
+    """gui rc 125 (no GUI launchd domain), user domain has no such job: launch."""
+    LAUNCHCTL_RC = 125
+    USER_RC = 113
+
+    def test_launches_as_unsupervised(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("UNSUPERVISED", "\n".join(self._log_lines()))
+        self.assertTrue(self._wait_for_relaunch_marker(), "no job in either domain: the launcher must launch")
+        self.assertTrue((self.engram_home / "daemon-launch-attempt").exists())
+
+
+class TestDarwinLauncherNoGuiDomainUserRunningOurs(_DarwinLauncherBase):
+    """gui rc 125, a hand-installed user-domain job of ours is running: never fight it."""
+    LAUNCHCTL_RC = 125
+    USER_RC = 0
+
+    def user_launchctl_text(self):
+        return _launchctl_fixture(home=str(self.engram_home))
+
+    def test_does_not_launch(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertIn("SUPERVISED_HEALTHY", content)
+        self.assertNotIn("UNSUPERVISED", content)
+        self.assertTrue(self._wait_briefly_for_no_relaunch())
+        self.assertFalse((self.engram_home / "daemon-launch-attempt").exists())
 
 
 if __name__ == "__main__":

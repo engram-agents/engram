@@ -14,6 +14,10 @@ Files:
 - `lsof_child_pid65876_fd0-2.txt` -- `lsof -n -P -a -p 65876 -d 0-2 -F pftdn`
   (the forum-updates child; no real captures exist for the other two children).
 - `platform_versions.txt` -- `sw_vers -productVersion` and `lsof -v`.
+- `launchctl_print_surface_daemon_running.txt` -- `launchctl print gui/<uid>/com.engram.surface-daemon`
+  for a running launchd job (#4261; captured 2026-10-30 on a macOS seat). It feeds the
+  Darwin `_supervisor_registered_state` cells in `tests/test_start_daemon_probe_branch_logging.py`.
+  Only substitution 1 below applies to it.
 
 The ONLY substitutions applied to the captures:
 

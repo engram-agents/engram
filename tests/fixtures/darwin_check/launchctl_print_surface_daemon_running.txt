@@ -1,0 +1,74 @@
+gui/501/com.engram.surface-daemon = {
+	active count = 1
+	path = /Users/seat/Library/LaunchAgents/com.engram.surface-daemon.plist
+	type = LaunchAgent
+	state = running
+
+	program = /Users/seat/.engram/venv/bin/python3
+	arguments = {
+		/Users/seat/.engram/venv/bin/python3
+		/Users/seat/.engram/marketplace/plugins/engram/hooks/engram-surface-daemon.py
+		/Users/seat/.engram
+	}
+
+	stdout path = /Users/seat/.engram/surface-daemon.log
+	stderr path = /Users/seat/.engram/surface-daemon.log
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.hWamZ0wj7B/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		ENGRAM_DAEMON_IDLE_TIMEOUT => 0
+		ENGRAM_HOME => /Users/seat/.engram
+		XPC_SERVICE_NAME => com.engram.surface-daemon
+	}
+
+	domain = gui/501 [100024]
+	asid = 100024
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 39827
+	immediate reason = speculative
+	forks = 1
+	execs = 2
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	checked allocations = 0 (queried = 1)
+	checked allocations reason = no host
+	checked allocations flags = 0x0
+	last exit code = (never exited)
+
+	resource coalition = {
+		ID = 51400
+		type = resource
+		state = active
+		active count = 1
+		name = com.engram.surface-daemon
+	}
+
+	jetsam coalition = {
+		ID = 51401
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.engram.surface-daemon
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+
+	properties = keepalive | runatload | inferred program
+}

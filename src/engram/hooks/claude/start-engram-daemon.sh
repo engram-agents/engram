@@ -30,15 +30,33 @@
 # logs "healthy" and exits 0 immediately, no supervision check needed
 # since nothing is wrong.
 #
-# Supervisor-registration check is Linux-only (systemd --user) for this
-# fold. A Darwin equivalent (`launchctl print gui/$(id -u)/...`) is a
-# named follow-up, not implemented here. On a host with no `systemctl` at
-# all (including Darwin), `_supervisor_registered_state` below returns
-# "not-registered" (reviewer-fairy suggestion 2, PR #2700 round 1) --
+# Supervisor-registration check: systemd --user on Linux, launchd on Darwin
+# (#4261). On Darwin (`uname -s` = Darwin, `launchctl` present) the check runs
+# `launchctl print gui/$(id -u)/com.engram.surface-daemon` and maps it:
+#   rc 113 (no such job)                      -> not-registered (launch)
+#   rc 125 (no GUI launchd domain for this uid; measured on a real seat 10-30,
+#     and the installer treats it the same way)
+#                                             -> ask user/$(id -u)/<label> the
+#       same way: rc 0 -> the rc-0 rows below (a hand-installed user-domain
+#       job is never fought, a foreign one never trusted); rc 113 or 125 ->
+#       not-registered (launch); any other rc, or no answer -> unavailable
+#   rc 0, job's ENGRAM_HOME is not ours or
+#     not stated                              -> unavailable (loud, no launch:
+#       a stale job with this label pointing at another home must never be
+#       trusted as ours, and never fought)
+#   rc 0, our home, top-level `state = running` -> registered-active
+#   rc 0, our home, any other top-level state   -> registered-failing
+#   any other rc, or no answer within 2 s     -> unavailable
+# Only the job's own first-level `state =` line counts; coalition blocks
+# deeper in the output carry their own `state = active` lines.
+#
+# On a host with neither launchctl (on Darwin) nor `systemctl`,
+# `_supervisor_registered_state` below returns "not-registered"
+# (reviewer-fairy suggestion 2, PR #2700 round 1) --
 # structurally cannot-have-a-unit is a DEFINITE fact, not the same kind
 # of uncertainty as a systemd host's bus being wedged or ambiguous, so it
 # is treated the same as any Linux seat with no unit installed: launch,
-# same as UNSUPERVISED today. This is narrower than "no launchctl
+# same as UNSUPERVISED today. This is narrower than "no supervisor
 # support" sounds -- it only changes what happens when systemctl is
 # entirely absent; a systemd host whose call fails or answers
 # ambiguously still reads "unavailable" (report loudly, no launch),
@@ -52,8 +70,10 @@
 #      `launchctl print gui/$(id -u)/com.engram.surface-daemon`; compare
 #      ProgramArguments with the real daemon path. A job pointing at a deleted
 #      worktree or a temp ENGRAM_HOME is a zombie:
-#      `launchctl bootout gui/$(id -u)/com.engram.surface-daemon`. (This script
-#      never reads launchd: its supervisor check is Linux-only.)
+#      `launchctl bootout gui/$(id -u)/com.engram.surface-daemon`. (On Darwin
+#      this script reads the same job through `launchctl print`: a job whose
+#      ENGRAM_HOME differs from this script's is reported "unavailable" and
+#      nothing is launched -- see the header above.)
 #   3. SIGTERM the orphaned holder: `kill <pid>`.
 #   4. Run this script.
 #   5. Confirm $ENGRAM_HOME/recall-daemon.sock and recall-daemon.pid exist.
@@ -226,6 +246,39 @@ _cgroup_supervision_state() {
     fi
 }
 
+# #4261: one bounded `launchctl print <target>` for _supervisor_registered_state
+# below (Darwin only). Top level, not nested inside that function: the hooks
+# stdout audit (tests/test_hooks_json_stdout_audit.py) cannot parse nested
+# function bodies. Sets lc_rc (the exit status, or "timeout" if there was no
+# answer within the bound) and lc_out in the CALLER's scope -- the caller
+# declares them `local`, and bash's dynamic scoping makes this assignment land
+# on those locals. Writes nothing to stdout (launchctl's output goes to a file).
+# Called twice by the caller (gui domain, then user domain on rc 125).
+_launchctl_print_bounded() {
+    local lc_file lc_pid lc_i
+    lc_rc=""
+    lc_out=""
+    lc_file="$(mktemp 2>/dev/null)" || { lc_rc="timeout"; return; }
+    launchctl print "$1" >"$lc_file" 2>&1 </dev/null &
+    lc_pid=$!
+    lc_i=0
+    while kill -0 "$lc_pid" 2>/dev/null && [ "$lc_i" -lt 20 ]; do
+        sleep 0.1
+        lc_i=$((lc_i + 1))
+    done
+    if kill -0 "$lc_pid" 2>/dev/null; then
+        kill "$lc_pid" 2>/dev/null
+        { wait "$lc_pid"; } 2>/dev/null
+        rm -f "$lc_file"
+        lc_rc="timeout"    # no answer within the bound -- never a guess
+        return
+    fi
+    { wait "$lc_pid"; } 2>/dev/null
+    lc_rc=$?
+    lc_out="$(cat "$lc_file" 2>/dev/null)"
+    rm -f "$lc_file"
+}
+
 # #2652 phase-0 unit 4 fold (Kepler's required addition, forum message
 # "Unit 4 scoping: accepted + one required addition (four-state branch;
 # UNSUPERVISED still launches)"): is a supervisor UNIT REGISTERED for this
@@ -233,8 +286,8 @@ _cgroup_supervision_state() {
 # right now. Answers Aleph's crash-looping case: a registered-but-failing
 # supervisor has NO process, so _cgroup_supervision_state above (which
 # needs a live pid) cannot see it; this reads the supervisor's OWN state
-# instead. Linux-only (systemd --user) -- see this file's header comment
-# for the Darwin scope note.
+# instead. systemd --user on Linux; launchd on Darwin (#4261) -- see this
+# file's header comment.
 _supervisor_registered_state() {
     # Prints one of: registered-active / registered-failing /
     # not-registered / unavailable. Reads LoadState/ActiveState/SubState
@@ -269,6 +322,71 @@ _supervisor_registered_state() {
     # to "the command does not exist at all" -- it does NOT touch any
     # case where systemctl exists but the call fails or answers
     # ambiguously (those remain unavailable, below, unchanged).
+    # #4261: Darwin. A Mac has no systemctl, so the "no systemctl ->
+    # not-registered" answer below would launch a competing daemon next to a
+    # launchd job (or next to a stale job we must not trust). Ask launchd.
+    # rc 125 from the gui domain = no GUI launchd domain for this uid (measured
+    # on a real seat 10-30; matches the installer's own rc-125 handling), so the
+    # user domain is consulted too -- refusing to launch there would mean the
+    # daemon never comes back on such a seat.
+    # Output and rc are captured UNPIPED (the exit status is checked, as for
+    # systemctl below). macOS has no `timeout`, so the call is bounded by
+    # running it in the background, polling, and killing it after 2 s; its
+    # output goes to a file, so a killed or still-running launchctl cannot
+    # hold this function's stdout open.
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
+        local label="com.engram.surface-daemon"
+        local lc_rc lc_out job_home job_state uid_n
+        uid_n="$(id -u)"
+        _launchctl_print_bounded "gui/${uid_n}/${label}"
+        if [ "$lc_rc" = "125" ]; then
+            # rc 125 = this uid has NO GUI launchd domain (e.g. another user
+            # holds the console; measured on a real seat 10-30, and the
+            # installer treats rc 125 the same way). No GUI job can exist, so
+            # ask the user domain before deciding.
+            _launchctl_print_bounded "user/${uid_n}/${label}"
+            if [ "$lc_rc" = "113" ] || [ "$lc_rc" = "125" ]; then
+                echo "not-registered"   # no job in either domain -- launch
+                return
+            fi
+        elif [ "$lc_rc" = "113" ]; then
+            echo "not-registered"   # measured on macOS: print of a missing label -> rc 113
+            return
+        fi
+        if [ "$lc_rc" != "0" ]; then
+            echo "unavailable"      # any other rc, or no answer in time
+            return
+        fi
+        # The job must be OURS: a stale job with this label (e.g. leaked by a
+        # test) can point at another ENGRAM_HOME. Never trust it, never fight
+        # it. No stated home at all is just as untrustworthy.
+        job_home="$(printf '%s\n' "$lc_out" | sed -n 's/^[[:space:]]*ENGRAM_HOME => //p' | head -n 1)"
+        if [ -z "$job_home" ]; then
+            echo "unavailable"
+            return
+        fi
+        # Compare PHYSICAL paths (/var vs /private/var, a trailing slash, a
+        # symlinked home are all the same home). A side that is not an existing
+        # directory falls back to its raw string, trailing slashes stripped.
+        local job_home_n our_home_n
+        job_home_n="$(cd "$job_home" 2>/dev/null && pwd -P)" || job_home_n=""
+        [ -n "$job_home_n" ] || { job_home_n="$job_home"; while [ "${#job_home_n}" -gt 1 ] && [ "${job_home_n%/}" != "$job_home_n" ]; do job_home_n="${job_home_n%/}"; done; }
+        our_home_n="$(cd "$ENGRAM_HOME" 2>/dev/null && pwd -P)" || our_home_n=""
+        [ -n "$our_home_n" ] || { our_home_n="$ENGRAM_HOME"; while [ "${#our_home_n}" -gt 1 ] && [ "${our_home_n%/}" != "$our_home_n" ]; do our_home_n="${our_home_n%/}"; done; }
+        if [ "$job_home_n" != "$our_home_n" ]; then
+            echo "unavailable"
+            return
+        fi
+        # Only the job's own first-level line (exactly one leading tab):
+        # nested coalition blocks have their own `state = active`.
+        job_state="$(printf '%s\n' "$lc_out" | sed -n "s/^$(printf '\t')state = //p" | head -n 1)"
+        if [ "$job_state" = "running" ]; then
+            echo "registered-active"
+        else
+            echo "registered-failing"
+        fi
+        return
+    fi
     if ! command -v systemctl >/dev/null 2>&1; then
         echo "not-registered"
         return
@@ -451,7 +569,7 @@ case "$_supervisor_state" in
         if [ "$_systemctl_present" -eq 1 ]; then
             _log_supervision "UNSUPERVISED -- no supervisor unit is registered for engram-surface-daemon.service; running the reap+launch sequence directly, as before. Install a supervisor unit: tools/setup-surface-daemon-service.sh"
         else
-            _log_supervision "UNSUPERVISED (no systemctl on this host -- treating as unsupervised, launching) -- this host cannot have a systemd unit at all (Darwin, or any non-systemd host); running the reap+launch sequence directly, as before. A Darwin launchctl-based supervision check is a named follow-up, not this fold."
+            _log_supervision "UNSUPERVISED (no systemctl on this host -- treating as unsupervised, launching) -- this host cannot have a systemd unit at all (a non-systemd host, or a Darwin host where launchctl found no job); running the reap+launch sequence directly, as before."
         fi
 
         # #2652 phase-0 unit 1 (fold onto unit 1, colleague-review finding,

@@ -461,6 +461,7 @@
   "hooks/claude/engram-surface-hook.py:_probe_unknown_notice",
   "hooks/claude/engram-surface-hook.py:get_user_name",
   "hooks/claude/engram-surface-hook.py:_resolve_warmup_window",
+  "hooks/claude/engram-surface-hook.py:_spawn_daemon_relaunch",
   "hooks/claude/engram-surface-hook.py:_get_auto_surface_config",
   "hooks/claude/engram-surface-hook.py:_get_suppression_config",
   "hooks/claude/engram-surface-hook.py:_get_echo_guard_config",
