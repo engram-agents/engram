@@ -335,7 +335,11 @@ def test_fifo_planted_while_running_stop_neither_hangs_nor_unlinks_it(home):
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-    assert proc.returncode == 0
+    # #4282: this cell flakes with returncode 1 on Linux; say why when it does.
+    # The tail is kept: the owner's startup lines come first, its exit path last.
+    assert proc.returncode == 0, (
+        f"owner exited {proc.returncode} after SIGTERM; stderr tail={proc.stderr.read()[-4000:]!r}"
+    )
     assert os.path.lexists(_pidfile(home)) and stat.S_ISFIFO(os.lstat(_pidfile(home)).st_mode), (
         "the FIFO is not ours to unlink"
     )
