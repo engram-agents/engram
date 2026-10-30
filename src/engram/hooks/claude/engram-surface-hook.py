@@ -58,7 +58,7 @@ from _hooklib import (
 from _hooklib import open_regular_text, open_regular_text_write
 # #3628: every mode=ro sqlite connect refuses a FIFO / directory (raising a
 # sqlite3.OperationalError + OSError) instead of hanging.
-from _hooklib import connect_regular_ro
+from _hooklib import connect_regular_ro, owner_bound_elapsed_text
 # U10 (#3821): the flag helper's lazy importer, shared with the other owner-backed hooks.
 from _hooklib import import_owner_flags as _hooklib_import_owner_flags
 from _harness import detect_harness, get_harness_budgets
@@ -464,6 +464,7 @@ def _owner_conn():
     run = _OWNER_RUN
     if run["conn"] is None:
         ec = _owner_client()
+        run["t0"] = time.monotonic()  # #4271: the fire's owner budget starts where its connection does
         run["conn"] = ec.OwnerReadConnection(
             total_budget=OWNER_FIRE_BUDGET_S, per_call_timeout=OWNER_READ_TIMEOUT_S)
     return run["conn"]
@@ -508,7 +509,15 @@ def _record_owner_failure(site: str, exc: BaseException) -> bool:
         else:
             kind, result = exc.kind, getattr(exc, "result", None)
             cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else None
-        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause}
+        # #4271: the fire's owner time when the FIRST failure was recorded (None: no connection yet).
+        elapsed_ms = None
+        try:
+            if run.get("t0") is not None:
+                elapsed_ms = int(round((time.monotonic() - run["t0"]) * 1000))
+        except Exception:
+            elapsed_ms = None
+        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause,
+                          "elapsed_ms": elapsed_ms}
     return True
 
 
@@ -520,9 +529,14 @@ def _sanitize_owner_text(text, limit: int) -> str:
         return "<unprintable>"[:limit]
 
 
+def _owner_bound_elapsed_text(f: dict) -> str:
+    """#4271: thin call into the one shared formatter, with this hook's own fire budget."""
+    return owner_bound_elapsed_text(f.get("result"), f.get("elapsed_ms"), OWNER_FIRE_BUDGET_S)
+
+
 def _owner_failure_text(run: dict) -> str:
     """The ONE loud line for a recorded owner failure: the failing site, the failure kind (and
-    the Unavailable/Rejected reason code), every degraded block, and the remedy. It says the
+    the Unavailable/Rejected reason code, the read's bound and the fire elapsed), every degraded block, and the remedy. It says the
     reads could NOT be read -- the failed read is not an empty answer. Bounded; dynamic text is
     control-character-free; never SQL text, row data or an exception message."""
     f = run["failure"]
@@ -535,7 +549,7 @@ def _owner_failure_text(run: dict) -> str:
     blocks = ", ".join(_OWNER_BLOCK_NAMES.get(s, s) for s in run["degraded"])
     line = (
         f"⚠️  ENGRAM UNAVAILABLE: the engramd owner read failed at "
-        f"{_sanitize_owner_text(f['site'], 60)} ({_sanitize_owner_text(f['kind'], 40)}{detail}). "
+        f"{_sanitize_owner_text(f['site'], 60)} ({_sanitize_owner_text(f['kind'], 40)}{detail}{_owner_bound_elapsed_text(f)}). "
         f"This prompt's {blocks} could NOT be read (the read failed; it is NOT empty). "
         f"Do not open knowledge.db directly to work around this. "
         f"To read the store directly meanwhile, set engramd.surface_reads_via_owner to false "
@@ -603,7 +617,8 @@ def _write_owner_stderr_lines() -> None:
         if run is not None and run.get("failure") is not None:
             f = run["failure"]
             sys.stderr.write(
-                f"engram-surface-hook: owner read failed: {f['kind']} at {f['site']}\n"[:300])
+                f"engram-surface-hook: owner read failed: {f['kind']} at {f['site']}"
+                f"{_owner_bound_elapsed_text(f)}\n"[:300])
         wf = run.get("write_failure") if run is not None else None
         if wf is not None:
             sys.stderr.write(f"engram-surface-hook: owner write failed: {wf['kind']}\n"[:300])

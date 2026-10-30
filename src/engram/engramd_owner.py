@@ -583,6 +583,53 @@ MAX_REFUSAL_DRAINS = 8
 PEER_REFUSAL_LOG_WINDOW = 60  # seconds
 PEER_REFUSAL_LOG_MAX_UIDS = 64
 
+# Failed requests (#4271). Every request that does not end in a delivered, non-rejected reply logs ONE
+# WARNING (route, cause, elapsed): before this a client-side "reason: timeout" left the owner log with
+# nothing to say. Rate-limited per (route, cause) by the SAME limiter the peer refusals use: a lazy
+# window of REQUEST_FAILURE_LOG_WINDOW seconds, at most REQUEST_FAILURE_LOG_MAX_KEYS keys (oldest evicted).
+# The closed cause set: request_unread, malformed_request, deadline_before_send, send_failed:<OSError class>,
+# rejected:<sanitized reason>, handler_error:<exception class> (an exception raised outside _dispatch and
+# not yet logged; logged at ERROR with its traceback, not WARNING). A request whose method raised
+# unexpectedly logs its one ERROR instead (same limiter). The ONE sanctioned case of two records for one
+# request: an exception escaping AFTER the request already has a record logs a second, labelled ERROR,
+# `secondary exception after this request's failure record` (key (route, "secondary:<Class>")).
+REQUEST_FAILURE_LOG_WINDOW = 60  # seconds
+REQUEST_FAILURE_LOG_MAX_KEYS = 64
+_REQUEST_FAILURE_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f]")
+_REQUEST_FAILURE_TEXT_LIMIT = 40
+
+
+def _request_failure_text(value) -> str:
+    """Each control character -> one space, then cut to 40 characters. Used for the route and for a
+    rejection's reason, both of which a client can influence."""
+    return _REQUEST_FAILURE_CONTROL_RE.sub(" ", str(value))[:_REQUEST_FAILURE_TEXT_LIMIT]
+
+
+class _KeyedRateLimiter:
+    """The ONE lazy-window limiter behind the owner's bounded WARNINGs (#3845 peer refusals, #4271
+    failed requests): per key, the first event of a window is admitted, later ones inside the window are
+    counted, and the first admitted event after the window learns the count it missed. No timer, so a burst
+    followed by silence never prints its count. At most `max_keys` keys are tracked, oldest window
+    evicted. `table` maps key -> [window_start, suppressed]."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.table: dict = {}
+
+    def admit(self, key, now: float, window: float, max_keys: int):
+        """None = suppressed (counted). Else the number suppressed in the previous window (0 if none)."""
+        with self._lock:
+            entry = self.table.get(key)
+            if entry is not None and now - entry[0] < window:
+                entry[1] += 1
+                return None
+            carried = entry[1] if entry is not None else 0
+            self.table.pop(key, None)  # re-insert last: order = window start
+            while len(self.table) >= max_keys:
+                del self.table[next(iter(self.table))]
+            self.table[key] = [now, 0]
+            return carried
+
 # Accept backlog (#3680). listen(5) let a burst of ~6+ simultaneous hook processes
 # overflow the kernel's accept queue: the client's connect() failed at once with EAGAIN
 # although the owner was healthy. The kernel caps this at net.core.somaxconn (Linux) /
@@ -2861,8 +2908,11 @@ class EngramdOwner:
         self._jobs: "queue.SimpleQueue" = queue.SimpleQueue()
         self._worker_seq = itertools.count(1)
         # Peer-refusal log limiter (#3845): peer uid -> [window_start, suppressed].
-        self._peer_refusal_lock = threading.Lock()
-        self._peer_refusal_log: dict = {}
+        self._peer_refusal_limiter = _KeyedRateLimiter()
+        self._peer_refusal_log = self._peer_refusal_limiter.table
+        # Failed-request log limiter (#4271): the same class, keyed (route, cause).
+        self._request_failure_limiter = _KeyedRateLimiter()
+        self._request_failure_log = self._request_failure_limiter.table
         # Refusal drains in flight (#3845); the lock is never held across I/O.
         self._refusal_drains_lock = threading.Lock()
         self._refusal_drains = 0
@@ -4056,17 +4106,10 @@ class EngramdOwner:
         count."""
         peer_uid, own_uid = self._refused_peer_uids(conn)
         reason = rejection.get("reason")
-        now = time.monotonic()
-        with self._peer_refusal_lock:
-            entry = self._peer_refusal_log.get(peer_uid)
-            if entry is not None and now - entry[0] < PEER_REFUSAL_LOG_WINDOW:
-                entry[1] += 1
-                return
-            carried = entry[1] if entry is not None else 0
-            self._peer_refusal_log.pop(peer_uid, None)  # re-insert last: order = window start
-            while len(self._peer_refusal_log) >= PEER_REFUSAL_LOG_MAX_UIDS:
-                del self._peer_refusal_log[next(iter(self._peer_refusal_log))]
-            self._peer_refusal_log[peer_uid] = [now, 0]
+        carried = self._peer_refusal_limiter.admit(
+            peer_uid, time.monotonic(), PEER_REFUSAL_LOG_WINDOW, PEER_REFUSAL_LOG_MAX_UIDS)
+        if carried is None:
+            return
         tail = f"; {carried} suppressed in the previous window" if carried else ""
         try:
             logging.getLogger("engramd_owner").warning(
@@ -4075,6 +4118,75 @@ class EngramdOwner:
                 peer_uid, own_uid, reason, peer_uid, PEER_REFUSAL_LOG_WINDOW, tail)
         except Exception:
             pass  # a raising logging.Filter must never cost the peer its typed rejection or the drain
+
+    def _emit_failure_record(self, key: tuple, level: int, msg: str, args_for, *,
+                             exc_info: bool = False) -> None:
+        """The one body behind the failed-request logs (#4271): admit `key` through
+        `self._request_failure_limiter` (REQUEST_FAILURE_LOG_WINDOW / _MAX_KEYS), append the
+        suppressed-count tail to `msg` (a trailing "%s") and to the args, log at `level` on logger
+        "engramd_owner", and swallow anything that goes wrong. `args_for(now)` builds the format
+        args from the same monotonic `now` the limiter was given, inside the guard, so building them
+        cannot raise either. Call it from the `except` block when `exc_info` is True. Never raises:
+        a failing log layer must not cost the client its reply, the drain or the close."""
+        try:
+            now = time.monotonic()
+            carried = self._request_failure_limiter.admit(
+                key, now, REQUEST_FAILURE_LOG_WINDOW, REQUEST_FAILURE_LOG_MAX_KEYS)
+            if carried is None:
+                return
+            tail = f"; {carried} suppressed in the previous window" if carried else ""
+            logging.getLogger("engramd_owner").log(
+                level, msg + "%s", *args_for(now), tail, exc_info=exc_info)
+        except Exception:
+            pass
+
+    def _log_request_failure(self, route: str, cause: str, accept_time: float, deadline: float) -> None:
+        """One bounded WARNING per (route, cause) per window for a request that did not end in a delivered,
+        non-rejected reply (#4271). Names the route (the method only), the cause (a closed set) and the
+        elapsed ms against the deadline ms; never params, SQL, args, row data, request_id or a response
+        body. Never raises (see `_emit_failure_record`)."""
+        self._emit_failure_record(
+            (route, cause), logging.WARNING,
+            "request failed: route %s, cause %s, elapsed %d ms of a %d ms deadline",
+            lambda now: (route, cause, int(round((now - accept_time) * 1000)),
+                         int(round((deadline - accept_time) * 1000))))
+
+    def _log_handler_exception(self, route: str, exc_class: str, accept_time: float, deadline: float,
+                               secondary: bool) -> None:
+        """The outer guard's ONE ERROR (with traceback, so call it from the `except` block) for an
+        exception that escaped the request handling (#4271 round 4). `secondary` False: the request's
+        single record, `request failed: route, cause handler_error:<Class>, elapsed ...`, rate-limited per
+        (route, "handler_error:<Class>"). `secondary` True: a record already exists, so this is a second,
+        independent defect: `secondary exception after this request's failure record`, rate-limited per
+        (route, "secondary:<Class>"). Same limiter and suppressed-count tail as the other request-failure
+        logs. Never raises."""
+        cause = "handler_error:" + exc_class
+        if secondary:
+            self._emit_failure_record(
+                (route, "secondary:" + exc_class), logging.ERROR,
+                "secondary exception after this request's failure record: route %s, cause %s",
+                lambda now: (route, cause), exc_info=True)
+        else:
+            self._emit_failure_record(
+                (route, cause), logging.ERROR,
+                "request failed: route %s, cause %s, elapsed %d ms of a %d ms deadline",
+                lambda now: (route, cause, int(round((now - accept_time) * 1000)),
+                             int(round((deadline - accept_time) * 1000))), exc_info=True)
+
+    def _log_unexpected_exception(self, route: str) -> None:
+        """The ONE ERROR (with traceback) for a request whose method raised unexpectedly (#4271 round 3):
+        the sanitized route and the exception class, rate-limited per
+        (route, "unexpected_exception:<Class>") by the same limiter as the failed-request WARNINGs, so a
+        different bug on the same route inside the window is not suppressed by the first. The class is
+        read from `sys.exc_info()` (call this from the `except` block): the same source `exc_info=True`
+        reads for the traceback, so the named class and the traceback cannot disagree, and the signature
+        and call site stay as they were. Never raises."""
+        exc_type = sys.exc_info()[0]
+        exc_class = exc_type.__name__ if exc_type is not None else "unknown"
+        self._emit_failure_record(
+            (route, "unexpected_exception:" + exc_class), logging.ERROR,
+            "unexpected exception in method %s (%s)",
+            lambda now: (route, exc_class), exc_info=True)
 
     def _take_refusal_drain_slot(self) -> bool:
         """Non-blocking: True if a drain slot was free (and is now taken)."""
@@ -4171,6 +4283,23 @@ class EngramdOwner:
         # base `self.request_deadline`.
         accept_time = time.monotonic()
         deadline = accept_time + self.request_deadline
+        # the method once it parsed as a str (#4271); read by fail() at call time. A request that parsed
+        # with a non-str `method` keeps `<unparsed>` on purpose: there is no method name to report.
+        route = "<unparsed>"
+        # #4271: True once this request has a record (fail(), or the unexpected-exception .error()).
+        # Every later exit, and the outer handler_error guard below, logs only while it is False.
+        already_logged = False
+
+        def fail(cause: str) -> None:
+            # #4271: one WARNING per failed request. `_log_request_failure` never raises; the guard
+            # also covers a replaced or broken method, so logging can never change the wire.
+            nonlocal already_logged
+            already_logged = True
+            try:
+                self._log_request_failure(route, cause, accept_time, deadline)
+            except Exception:
+                pass
+
         try:
             rejection = self._check_peer_credentials(conn)
             if rejection is not None:
@@ -4196,14 +4325,21 @@ class EngramdOwner:
                             finally:
                                 self._release_refusal_drain_slot()
                 return
-            line = self._read_request_line(conn, deadline)
+            framing: dict = {}
+            line = self._read_request_line(conn, deadline, framing)
             if line is None:
-                return  # deadline exceeded, oversized, malformed framing, or peer closed -- drop silently
+                # deadline exceeded, oversized, malformed framing, or peer closed -- drop (nothing sent).
+                # A peer that closed having sent ZERO bytes (a connect-and-close) is not a failed request.
+                if not framing.get("closed_empty"):
+                    fail("request_unread")
+                return
             try:
                 request = json.loads(line.decode("utf-8").strip())
             except (json.JSONDecodeError, UnicodeDecodeError):
+                fail("malformed_request")
                 return  # malformed request -- drop; a U1 client sees Unavailable, not a hang
             if not isinstance(request, dict):
+                fail("malformed_request")
                 return
             # Round 2 (#3194): the deadline is method-aware, chosen once
             # the method is parsed, but still anchored to accept_time --
@@ -4215,6 +4351,8 @@ class EngramdOwner:
             # "Per-request deadline, round 2" section for the full
             # mechanism and its justification.
             method = request.get("method")
+            if isinstance(method, str):
+                route = _request_failure_text(method)
             if method == "snapshot":
                 deadline = accept_time + self.snapshot_request_deadline
             try:
@@ -4227,8 +4365,9 @@ class EngramdOwner:
                 # closed socket, read it as Unavailable and told the agent to
                 # restart a healthy owner. `Exception`, not BaseException:
                 # SystemExit / KeyboardInterrupt still propagate.
-                logging.getLogger("engramd_owner").error(
-                    "unexpected exception in method %r", request.get("method"), exc_info=True)
+                # #4271: the sanitized route and the shared limiter, never the raw client-supplied method.
+                already_logged = True
+                self._log_unexpected_exception(route)
                 response = {
                     "status": "rejected",
                     "reason": "internal_error",
@@ -4256,6 +4395,8 @@ class EngramdOwner:
             # == indeterminate.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if not already_logged:
+                    fail("deadline_before_send")
                 return
             conn.settimeout(remaining)
             # A `read` reply arrives pre-rendered from its size-checked fragments
@@ -4265,17 +4406,46 @@ class EngramdOwner:
                 text = json.dumps(response)
             try:
                 conn.sendall((text + "\n").encode("utf-8"))
-            except OSError:
-                pass
+            except OSError as exc:
+                # A client that already timed out produces this; the owner's log was silent.
+                if not already_logged:
+                    fail(f"send_failed:{type(exc).__name__}")
+            else:
+                # Delivered. Only a `rejected` reply is a failed request (never the body, only its reason).
+                if not already_logged:
+                    try:
+                        rejected = response.get("status") == "rejected"
+                        reason = response.get("reason") if rejected else None
+                    except Exception:
+                        rejected, reason = False, None
+                    if rejected:
+                        fail("rejected:" + _request_failure_text(reason))
+        except Exception as exc:
+            # #4271: an exception raised outside _dispatch (json.loads RecursionError on deeply nested
+            # input, json.dumps on an unserializable response, conn.settimeout, _read_request_line, ...)
+            # is an owner bug and leaves exactly ONE ERROR record (with its traceback): cause
+            # `handler_error:<ClassName>`. This guard is the single record, so it RETURNS rather than
+            # re-raising (re-raising would add _worker's own ERROR: two records for one request).
+            # When this request already has a record, the escape is a second, independent defect: it
+            # gets one labelled "secondary exception" ERROR instead of vanishing. The wire, the drain
+            # and the close (the finally below) are untouched; _worker stays the last resort for what
+            # this guard cannot see (e.g. an exception raised by the close).
+            self._log_handler_exception(route, type(exc).__name__, accept_time, deadline, already_logged)
+            return
         finally:
             conn.close()
 
-    def _read_request_line(self, conn: socket.socket, deadline: float) -> bytes | None:
+    def _read_request_line(self, conn: socket.socket, deadline: float,
+                           framing: dict | None = None) -> bytes | None:
         """Accumulate bytes until a '\\n'-terminated line completes, the
         deadline passes, the request exceeds max_request_bytes, or the
         peer closes. Returns None for every non-success case (the caller
         drops the connection without responding); returns the raw line
-        bytes (including the trailing newline) on success."""
+        bytes (including the trailing newline) on success.
+
+        `framing` (#4271), when given, gets `closed_empty = True` iff the peer closed
+        (EOF or a connection error) having sent ZERO bytes: a connect-and-close, which
+        the caller does not count as a failed request."""
         data = b""
         while True:
             remaining = deadline - time.monotonic()
@@ -4287,8 +4457,12 @@ class EngramdOwner:
             except socket.timeout:
                 return None
             except OSError:
+                if framing is not None and not data:
+                    framing["closed_empty"] = True
                 return None
             if not chunk:
+                if framing is not None and not data:
+                    framing["closed_empty"] = True
                 return None  # peer closed
             data += chunk
             if len(data) > self.max_request_bytes:

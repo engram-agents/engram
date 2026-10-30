@@ -59,6 +59,8 @@ if _SRC_ENGRAM not in sys.path:
 _HOOKS_SRC = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 _HOOK_PATH = _HOOKS_SRC / "engram-surface-hook.py"
 BASE_REF = "ae55c31a"  # origin/dev the U10 branch was cut from (the unmodified hook)
+# (#4271: the owner stderr line may end with `, bound N ms` and/or `; failed E ms into the B ms fire budget`)
+OWNER_LINE_TAIL = r"(?:, bound \d+ ms)?(?:; failed \d+ ms into the \d+ ms fire budget)?"
 
 import engramd_client as ec  # noqa: E402
 import engram_core  # noqa: E402
@@ -993,7 +995,7 @@ def test_c3_a_full_fire_with_the_owner_down_renders_owner_unavailable_text_and_n
     assert "saved focus-set 'dormant-hit'" not in ctx and "↑ principle" not in ctx and "NOT FULLY RESTORED" not in ctx
     assert ctx.count("could NOT be read") == 1, ctx
     # (the embedding probe's own pre-existing UNKNOWN stderr line also carries the words)
-    lines = re.findall(r"^engram-surface-hook: owner read failed: (\w+) at (\w+)$", run.stderr, re.M)
+    lines = re.findall(r"^engram-surface-hook: owner read failed: (\w+) at (\w+)" + OWNER_LINE_TAIL + "$", run.stderr, re.M)
     assert len(lines) == 1 and lines[0][0] == expected_kind(kind), run.stderr
     assert "boom-3821" not in run.stdout + run.stderr
 
@@ -1024,7 +1026,7 @@ def test_c3_the_notice_is_rate_limited_per_window_and_the_stamp_follows_the_prin
     assert NOTICE_KEY in stamp
     second = run_main(load_hook(home, monkeypatch))
     assert "could NOT be read" in first.ctx and "could NOT be read" not in second.ctx
-    assert re.search(r"^engram-surface-hook: owner read failed: \w+ at \w+$", second.stderr, re.M)
+    assert re.search(r"^engram-surface-hook: owner read failed: \w+ at \w+" + OWNER_LINE_TAIL + "$", second.stderr, re.M)
 
 
 # =========================================================================================
@@ -1598,7 +1600,7 @@ def test_focused_ids_template_refusal_is_recorded_once_and_the_fire_still_works(
     with FakeOwner(home):
         run = run_main(mod)
     assert run.exc == "SystemExit(0)", run.exc
-    lines = re.findall(r"^engram-surface-hook: owner read failed: (\w+) at (\w+)$", run.stderr, re.M)
+    lines = re.findall(r"^engram-surface-hook: owner read failed: (\w+) at (\w+)" + OWNER_LINE_TAIL + "$", run.stderr, re.M)
     assert lines == [("rejected", "_focused_ids")], (lines, run.stderr)
     assert "focused summary two" in run.ctx and "saved focus-set 'dormant-hit'" in run.ctx, run.ctx
 

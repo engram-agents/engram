@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import os
 import secrets
 import stat
@@ -2272,3 +2273,32 @@ def marker_recall_query(text):
         return ("marked", "\n".join(cleaned))
     except Exception:
         return ("none", text)
+
+
+def owner_bound_ms(result):
+    """#4271: the timeout a failed owner read actually had, in whole ms, from `Unavailable.bound`
+    (min(per-call, what remained of the fire budget)); None unless it is a finite number.
+    Never raises."""
+    try:
+        bound = getattr(result, "bound", None)
+        if isinstance(bound, (int, float)) and not isinstance(bound, bool) and math.isfinite(bound):
+            return int(round(bound * 1000))
+    except Exception:
+        pass
+    return None
+
+
+def owner_bound_elapsed_text(result, elapsed_ms, budget_s) -> str:
+    """#4271: the ONE formatter behind the three hooks' owner-failure lines (each passes its own fire
+    budget). `, bound N ms` (only with a finite numeric `result.bound`) then `; failed E ms into the
+    B ms fire budget` (only when `elapsed_ms` is an int, i.e. the fire's elapsed is known). Never raises."""
+    text = ""
+    try:
+        bound_ms = owner_bound_ms(result)
+        if bound_ms is not None:
+            text += f", bound {bound_ms} ms"
+        if isinstance(elapsed_ms, int) and not isinstance(elapsed_ms, bool):
+            text += f"; failed {elapsed_ms} ms into the {int(budget_s * 1000)} ms fire budget"
+    except Exception:
+        return ""
+    return text

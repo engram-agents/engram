@@ -95,7 +95,10 @@ FOUR_S6 = ("_check_embedding_restore_flag", "focus_block", "saved_focus_sets_blo
 CHECKPOINT_FROM = "2026-10-12T00:00:00Z"
 NOTICE_PHRASE = "engramd owner read failed"
 # the owner line on stderr (the embedding probe's own pre-existing UNKNOWN line also carries the words)
-OWNER_STDERR_RE = re.compile(r"^engram-session-start-hook: owner read failed: (\w+) at (\w+)$", re.M)
+# (#4271: the line may end with `, bound N ms` and/or `; failed E ms into the B ms fire budget`)
+OWNER_STDERR_RE = re.compile(
+    r"^engram-session-start-hook: owner read failed: (\w+) at (\w+)"
+    r"(?:, bound \d+ ms)?(?:; failed \d+ ms into the \d+ ms fire budget)?$", re.M)
 WAIT_PHRASE = "was not ready at the first read"
 UNAVAILABLE_REASONS_NO_WAIT = ["timeout", "protocol", "busy", "busy_or_stuck", "local", "internal", "contract_version"]
 

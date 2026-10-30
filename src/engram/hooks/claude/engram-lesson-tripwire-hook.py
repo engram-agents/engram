@@ -135,7 +135,7 @@ from _hooklib import (
 )
 # #3628: every mode=ro sqlite connect goes through this (refuses a FIFO or
 # directory instead of hanging; raises a sqlite3.OperationalError + OSError).
-from _hooklib import connect_regular_ro
+from _hooklib import connect_regular_ro, owner_bound_ms, owner_bound_elapsed_text
 # #3521 row 9: a crash reaching main()'s outer handler must not look like
 # "no lesson matched" (see the handler at the bottom of main()).
 from _hooklib import (
@@ -259,6 +259,7 @@ def _owner_conn():
             ec = _import_engramd_client()
         except (Exception, SystemExit) as exc:  # noqa: BLE001 -- any import failure is an owner failure; KeyboardInterrupt is not caught
             raise _ClientImportFailure(type(exc).__name__) from exc
+        run["t0"] = time.monotonic()  # #4271: the fire's owner time starts where its connection does
         run["conn"] = ec.OwnerReadConnection(
             total_budget=OWNER_FIRE_BUDGET_S, per_call_timeout=OWNER_READ_TIMEOUT_S)
     return run["conn"]
@@ -297,7 +298,15 @@ def _record_owner_failure(site: str, exc: BaseException) -> bool:
         else:
             kind, result = exc.kind, getattr(exc, "result", None)
             cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else None
-        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause}
+        # #4271: the fire's owner time when the FIRST failure was recorded (None: no connection yet).
+        elapsed_ms = None
+        try:
+            if run.get("t0") is not None:
+                elapsed_ms = int(round((time.monotonic() - run["t0"]) * 1000))
+        except Exception:
+            elapsed_ms = None
+        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause,
+                          "elapsed_ms": elapsed_ms}
     return True
 
 # ---------------------------------------------------------------------------
@@ -489,6 +498,11 @@ def _notice_lines(title: str, items) -> str:
         f"    - {_sanitize_exc_text(str(i), 200)}" for i in items)
 
 
+def _owner_bound_elapsed_text(failure: dict) -> str:
+    """#4271: thin call into the one shared formatter, with this hook's own fire budget."""
+    return owner_bound_elapsed_text(failure.get("result"), failure.get("elapsed_ms"), OWNER_FIRE_BUDGET_S)
+
+
 def _owner_failure_notice(failure: dict) -> str:
     """The loud text for one recorded owner failure. Never raises beyond what the caller
     guards; bounded to _OWNER_NOTICE_CAP characters."""
@@ -496,7 +510,7 @@ def _owner_failure_notice(failure: dict) -> str:
     cause = _sanitize_exc_text(str(failure.get("cause") or ""), 80)
     head = (
         f"[lesson-tripwire] ENGRAM UNAVAILABLE: tripwires and lessons {COULD_NOT_READ} this fire "
-        f"(the engramd owner read failed at {site}: {kind}). "
+        f"(the engramd owner read failed at {site}: {kind}{_owner_bound_elapsed_text(failure)}). "
         'This is NOT "no tripwires matched": the check could not run, so a tripwire or a '
         "blocking lesson may have been missed. No tool call was blocked."
     )
@@ -504,9 +518,12 @@ def _owner_failure_notice(failure: dict) -> str:
     agent = list(_OWNER_AGENT_BASE)
     human = []
     if kind == "unavailable" and result is not None:
-        lines.append(
-            f"  Socket: {_sanitize_exc_text(str(result.socket_path), 200)} "
-            f"(bound {OWNER_READ_TIMEOUT_S}s per read, {OWNER_FIRE_BUDGET_S}s per fire)")
+        # #4271: the read's ACTUAL bound when the result carries one; the configured per-read figure is
+        # only an upper limit (the last reads of a fire get what remains), so say so when it is all we have.
+        bound_ms = owner_bound_ms(failure.get("result"))
+        limits = (f"bound {bound_ms} ms on this read, {OWNER_FIRE_BUDGET_S}s per fire" if bound_ms is not None
+                  else f"configured: {OWNER_READ_TIMEOUT_S}s per read, {OWNER_FIRE_BUDGET_S}s per fire")
+        lines.append(f"  Socket: {_sanitize_exc_text(str(result.socket_path), 200)} ({limits})")
         agent += list(result.agent_steps)
         human += list(result.human_steps)
     elif kind == "rejected" and result is not None:
@@ -567,7 +584,8 @@ def _write_owner_stderr_lines() -> None:
         if run is not None and run.get("failure") is not None:
             f = run["failure"]
             sys.stderr.write(
-                f"engram-lesson-tripwire-hook: owner read failed: {f['kind']} at {f['site']}\n"[:300])
+                f"engram-lesson-tripwire-hook: owner read failed: {f['kind']} at {f['site']}"
+                f"{_owner_bound_elapsed_text(f)}\n"[:300])
         sys.stderr.flush()
     except Exception:
         pass

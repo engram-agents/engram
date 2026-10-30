@@ -425,7 +425,10 @@ def test_g_tripwire_flag_on_a_focused_template_refusal_is_recorded_once_and_the_
     with FakeOwner(home):
         run = run_main(mod)
     assert run.exc == "SystemExit(0)", run.exc
-    lines = re.findall(r"^engram-lesson-tripwire-hook: owner read failed: (\w+) at (\w+)$", run.stderr, re.M)
+    # (#4271: the line may end with `, bound N ms` and/or `; failed E ms into the B ms fire budget`)
+    lines = re.findall(
+        r"^engram-lesson-tripwire-hook: owner read failed: (\w+) at (\w+)"
+        r"(?:, bound \d+ ms)?(?:; failed \d+ ms into the \d+ ms fire budget)?$", run.stderr, re.M)
     assert lines == [("rejected", "focused_ids")], (lines, run.stderr)
     assert "Nudge for tripwire one" in run.ctx, run.ctx
 

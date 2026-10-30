@@ -78,7 +78,7 @@ from _hooklib import prune_shown_records
 from _hooklib import open_regular_text, open_regular_text_write, read_regular_text
 # #3628: every mode=ro sqlite connect refuses a FIFO / directory (raising a
 # sqlite3.OperationalError + OSError) instead of hanging.
-from _hooklib import connect_regular_ro
+from _hooklib import connect_regular_ro, owner_bound_elapsed_text
 # #3521: shared advisory-probe `unknown` rendering (once per session here, so
 # only the stderr line + the one injected line are used; no rate-limit stamp).
 from _hooklib import probe_unknown_line, write_probe_unknown_stderr
@@ -274,7 +274,15 @@ def _record_owner_failure(site: str, exc: BaseException) -> bool:
         else:
             kind, result = exc.kind, getattr(exc, "result", None)
             cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else None
-        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause}
+        # #4271: the fire's owner time when the FIRST failure was recorded (None: no start time).
+        elapsed_ms = None
+        try:
+            if run.get("t0") is not None:
+                elapsed_ms = int(round((_mono() - run["t0"]) * 1000))
+        except Exception:
+            elapsed_ms = None
+        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause,
+                          "elapsed_ms": elapsed_ms}
     return True
 
 
@@ -373,9 +381,14 @@ def _sanitize_owner_text(text, limit: int) -> str:
         return "<unprintable>"[:limit]
 
 
+def _owner_bound_elapsed_text(f: dict) -> str:
+    """#4271: thin call into the one shared formatter, with this hook's own fire budget."""
+    return owner_bound_elapsed_text(f.get("result"), f.get("elapsed_ms"), OWNER_FIRE_BUDGET_S)
+
+
 def _owner_failure_text(run: dict) -> str:
     """The ONE health line for a recorded owner failure: failing site, failure kind (and the
-    Unavailable/Rejected reason code), the wait in ms when one ran, and every degraded block.
+    Unavailable/Rejected reason code, the read's bound and the fire elapsed), the wait in ms when one ran, and every degraded block.
     Bounded; dynamic text is control-character-free; never SQL text, row data or a message."""
     f = run["failure"]
     detail = ""
@@ -401,7 +414,7 @@ def _owner_failure_text(run: dict) -> str:
         remedy = "The owner predates confidence_by_type; restart the owner."
     line = (
         f"⚠️  ENGRAM substrate health: engramd owner read failed at "
-        f"{_sanitize_owner_text(f['site'], 60)} ({_sanitize_owner_text(f['kind'], 40)}{detail}){waited}. "
+        f"{_sanitize_owner_text(f['site'], 60)} ({_sanitize_owner_text(f['kind'], 40)}{detail}{_owner_bound_elapsed_text(f)}){waited}. "
         f"Missing this fire (the read failed; it is NOT empty): {blocks}. "
         + remedy
     )
@@ -449,7 +462,8 @@ def _write_owner_stderr_lines() -> None:
             f = run["failure"]
             sys.stderr.write(
                 f"engram-session-start-hook: owner read failed: "
-                f"{_sanitize_owner_text(f['kind'], 40)} at {_sanitize_owner_text(f['site'], 60)}\n"[:300])
+                f"{_sanitize_owner_text(f['kind'], 40)} at {_sanitize_owner_text(f['site'], 60)}"
+                f"{_owner_bound_elapsed_text(f)}\n"[:300])
         sys.stderr.flush()
     except Exception:
         pass
