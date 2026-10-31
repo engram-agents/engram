@@ -456,6 +456,9 @@ MODE_AWARE = {
     "src/engram/tools/dream_pickup.py": "copies the old mode onto the temp",
     "src/engram/tools/engram-pkg/engram-pkg": "explicit chmod 0o644 on both outputs",
     "src/engram/tools/lesson-pattern-audit.py": "old mode (0o640 new) and best-effort ACL",
+    "tools/engramd_batch_a_acceptance.py": (
+        "explicit chmod 0o644 on the --report output; a report path inside the live ENGRAM home is refused"
+    ),
 }
 
 # Private on purpose: only the owner reads it, and the file says so.
