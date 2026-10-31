@@ -498,7 +498,13 @@ _LINE_KEY = _re.compile(r":\d+$")
 # #3941 (tools-8): the one current-lessons read of tools/lesson-pattern-audit.py:read_lesson_rows (1ce567fd...).
 # #3881 (U18): the two keyset-paged population reads of tools/anchoring_report.py:_fetch_population (ba3586db...
 # for the whole population, df28d1de... for one quote_type), shared with tools/quote_quality_survey.py.
+# #4118: the install self-check's three graph reads, tools/install_selfcheck.py:_read_counts (the per-type node
+# count 25c988d6..., the edge count e5aee287...) and :_read_present_ids (the seed ids present, the registry's
+# json_each form, cce0379e...).
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "25c988d6449b53650b086cf16e62444881dde4258eefc476a78f1b701e23f857",
+    "e5aee28773313230ff17dbfd6c63e0aa5c529e4b37742f8789dd577915695c22",
+    "cce0379e6be90389fc1b92611982267d65296a8ddf93d705cbc28dc27ebbf82f",
     "ba3586db7f6b6d1748f208efb0ab977b3dfa9122512dd19897d94718cb28f2c5",
     "df28d1de6b2da5efd52c33a73cd80c6bc9ca74b95046e0893c5e40694f9234f6",
     "1ce567fd44516865b873f2446cffb547b5b6a78bd6525662a91c6fcb49b8790a",

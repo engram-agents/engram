@@ -44,6 +44,13 @@
       ]
     },
     {
+      "key": "25c988d6449b53650b086cf16e62444881dde4258eefc476a78f1b701e23f857",
+      "sql": "SELECT type, COUNT(*) FROM nodes GROUP BY type",
+      "sites": [
+        "tools/install_selfcheck.py:_read_counts"
+      ]
+    },
+    {
       "key": "2743db24b60c27d0ad4e70e440219d2904a12aa08d4fdca11760b8445b3fdc9c",
       "sql": "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
       "sites": [
@@ -270,6 +277,13 @@
       ]
     },
     {
+      "key": "cce0379e6be90389fc1b92611982267d65296a8ddf93d705cbc28dc27ebbf82f",
+      "sql": "SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/install_selfcheck.py:_read_present_ids"
+      ]
+    },
+    {
       "key": "cefc616a2876d56a7b84ead98f75fa894f5a3678510f4d5c5bbac0b78061feb8",
       "sql": "SELECT count(*) FROM nodes WHERE is_current = 1",
       "sites": [
@@ -345,6 +359,13 @@
       "sql": "SELECT name, node_ids, description, created_at FROM focus_sets ORDER BY name ASC",
       "sites": [
         "hooks/claude/engram-session-start-hook.py:saved_focus_sets_block"
+      ]
+    },
+    {
+      "key": "e5aee28773313230ff17dbfd6c63e0aa5c529e4b37742f8789dd577915695c22",
+      "sql": "SELECT COUNT(*) FROM edges",
+      "sites": [
+        "tools/install_selfcheck.py:_read_counts"
       ]
     },
     {

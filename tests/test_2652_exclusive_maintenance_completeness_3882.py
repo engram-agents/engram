@@ -48,7 +48,6 @@ OPENER_ATTRS = ("connect", "_get_db")
 # Tools whose live-store rows are still plain `direct` today, with the reason they are allowed to be.
 KNOWN_DIRECT = {
     "anchoring_report.py": "read-only report; its own unit moves it onto the owner path",
-    "install_selfcheck.py": "read-only install diagnostic (counts and seed ids, mode=ro); moves onto the owner path in its own #2652 unit",
 }
 
 

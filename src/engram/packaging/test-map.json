@@ -796,7 +796,8 @@
     {
       "path_prefix_or_glob": "tools/install_selfcheck.py",
       "test_globs": [
-        "tests/test_install_selfcheck.py"
+        "tests/test_install_selfcheck.py",
+        "tests/test_install_selfcheck_owner_read_4118.py"
       ]
     },
     {

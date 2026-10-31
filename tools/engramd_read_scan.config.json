@@ -612,7 +612,9 @@
   "tools/study_queue.py:store_candidates",
   "tools/lesson-pattern-audit.py:read_lesson_rows",
   "tools/inspect_raw.py:read_row",
-  "tools/anchoring_report.py:_fetch_population"
+  "tools/anchoring_report.py:_fetch_population",
+  "tools/install_selfcheck.py:_read_counts",
+  "tools/install_selfcheck.py:_read_present_ids"
  ],
  "exclusions": [
   {

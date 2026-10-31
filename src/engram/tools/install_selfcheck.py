@@ -103,6 +103,7 @@ class Ctx:
         self.plugin_dir = self.engram_home / "marketplace" / "plugins" / "engram"
         self.db_path = self.engram_home / "knowledge.db"
         self.claude_md = self.claude_home / "CLAUDE.md"
+        self.graph_decision = None  # the graph path, decided ONCE per run (see _graph_decision)
 
 
 def resolve_engram_home():
@@ -480,20 +481,127 @@ def _handshake(ctx):
 
 # ── 9: graph and identity, by phase ──────────────────────────────────────────
 
+FLAG_KEY = "install_selfcheck_reads_via_owner"
+GRAPH_CHECKS = ("seed-graph", "graph-opens", "seed-ids-present")
+
+
+class SelfcheckOwnerReadError(Exception):
+    """An owner read this tool needed failed. Carries the helper's own wording (what the owner answered
+    and what to do about it)."""
+
+
+def _owner_read():
+    pkg_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if pkg_root not in sys.path:
+        sys.path.append(pkg_root)
+    from tools import _owner_read  # noqa: E402
+    return _owner_read
+
+
+def _spec(ctx):
+    return _owner_read().OwnerReadSpec(
+        flag_key=FLAG_KEY, error_cls=SelfcheckOwnerReadError, home=ctx.engram_home,
+        never_empty="An unreadable graph is a FAIL in this self-check, never an empty or a zero-node graph.")
+
+
+def _graph_decision(ctx):
+    """How THIS run reads the graph, decided once and cached on ctx, so every graph check of a run takes
+    the same path (#4118). Returns {"mode": "direct"|"owner"|"refused", "label": ..., "error": ...}.
+
+    * flag OFF (or the flag's store is not this home's): the direct `mode=ro` open, as before.
+    * flag ON and the owner answers a ping: every graph read goes through the owner, none through a
+      direct open.
+    * flag ON and the ping is Unavailable with reason `down` (nothing is listening): the ruled fallback,
+      the direct `mode=ro` open. This is the installer re-run before any session, when no owner runs.
+    * flag ON and anything else (the owner is present but refuses, times out, is busy or answers garbage):
+      REFUSED. The graph checks FAIL naming the owner's answer; no direct open beside a live owner.
+
+    An owner that has not yet bound its socket (mid-startup) reads as `down`, so for that moment the
+    tool takes the direct read-only path. That is inside the ruling ("no live owner") and it only reads.
+    """
+    if ctx.graph_decision is not None:
+        return ctx.graph_decision
+    ctx.graph_decision = _decide_graph_path(ctx)
+    return ctx.graph_decision
+
+
+def _decide_graph_path(ctx):
+    direct_off = {"mode": "direct", "label": "direct (flag off)", "error": None}
+    try:
+        owner_read = _owner_read()
+        spec = _spec(ctx)
+        if not owner_read.flag_applies(spec, ctx.db_path):
+            return direct_off
+    except Exception as exc:  # noqa: BLE001 -- the flag's state unknown reads as OFF, as the helper does
+        sys.stderr.write("engramd.%s: could not read the flag (%s)\n" % (FLAG_KEY, type(exc).__name__))
+        return direct_off
+    refusal_remedy = "this check never opens the store directly beside a live owner"
+    try:
+        client = owner_read.import_runtime("engramd_client")
+        result = client.read("ping", {}, timeout=spec.per_call, socket_path=client.socket_path_for_home(spec.home))
+    except (Exception, SystemExit) as exc:  # client.read does not raise by contract; belt
+        return {"mode": "refused", "label": "refused (owner ping failed)", "error": (
+            "engramd.%s is on but the owner could not be pinged (%s: %s)" % (FLAG_KEY, type(exc).__name__, exc),
+            refusal_remedy)}
+    if isinstance(result, client.Ok):
+        return {"mode": "owner", "label": "owner", "error": None}
+    if isinstance(result, client.Unavailable) and result.reason == "down":
+        return {"mode": "direct", "label": "direct (no live owner: down)", "error": None}
+    return {"mode": "refused", "label": "refused (owner unhealthy)",
+            "error": (str(owner_read.failure(spec, client, result)), refusal_remedy)}
+
+
 def _open_ro(ctx):
     uri = "file:%s?mode=ro" % quote(str(ctx.db_path))
     return sqlite3.connect(uri, uri=True, timeout=5)
 
 
+# The graph statements. Each is a literal at its execute call so the read-template scanner registers it
+# (tools/engramd_read_scan.config.json roots these two functions); both paths use the same statements.
+def _read_counts(con):
+    """(type_counts, edges) from one connection (direct or the owner's read shim)."""
+    by_type = dict(con.execute("SELECT type, COUNT(*) FROM nodes GROUP BY type").fetchall())
+    edges = con.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+    return by_type, edges
+
+
+def _read_present_ids(con, ids):
+    """The subset of `ids` that exist as nodes (the ids travel as ONE JSON array, so the arity is fixed)."""
+    rows = con.execute("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(list(ids)),))
+    return {r[0] for r in rows.fetchall()}
+
+
+def _read_present_ids_direct(con, ids):
+    """The direct-path twin of _read_present_ids, with the statement the tool always used (one placeholder per
+    id), so a flag-OFF run is unchanged and needs no JSON1 in the local SQLite. It is not a scanner root: the
+    owner is never sent this statement, only the registered json_each form above."""
+    ids = list(ids)
+    marks = ",".join("?" * len(ids))
+    return {r[0] for r in con.execute("SELECT id FROM nodes WHERE id IN (%s)" % marks, ids)}
+
+
 def _read_graph(ctx):
     """Returns ((type_counts, total_nodes, edges, con), None) or (None, (what, remedy))."""
-    if not ctx.db_path.is_file():
-        return None, ("%s does not exist" % ctx.db_path, "run bootstrap.py (fresh install) or restore the graph")
+    decision = _graph_decision(ctx)
+    if decision["mode"] == "refused":
+        return None, decision["error"]
     con = None
     try:
-        con = _open_ro(ctx)
-        by_type = dict(con.execute("SELECT type, COUNT(*) FROM nodes GROUP BY type").fetchall())
-        edges = con.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        if decision["mode"] == "owner":
+            con = _owner_read().open_reader(_spec(ctx), ctx.db_path, use_owner=True)
+        else:
+            if not ctx.db_path.is_file():
+                return None, ("%s does not exist" % ctx.db_path, "run bootstrap.py (fresh install) or restore the graph")
+            if decision["label"] != "direct (flag off)":
+                _owner_read().check_store_path(ctx.db_path)  # a FIFO is refused here, never opened
+            con = _open_ro(ctx)
+        by_type, edges = _read_counts(con)
+    except SelfcheckOwnerReadError as exc:
+        if con is not None:
+            con.close()
+        return None, (str(exc), "this check never opens the store directly beside a live owner")
+    except (_owner_read().StoreUnusable, FileNotFoundError) as exc:
+        return None, (str(exc), "fix the store path")
     except sqlite3.Error as exc:
         if con is not None:
             con.close()
@@ -573,8 +681,14 @@ def check_seed_ids_present(ctx):
         return _fail(*err)
     _, _, _, con = got
     try:
-        marks = ",".join("?" * len(ids))
-        present = {r[0] for r in con.execute("SELECT id FROM nodes WHERE id IN (%s)" % marks, ids)}
+        if _graph_decision(ctx)["mode"] == "owner":
+            present = _read_present_ids(con, ids)
+        else:
+            present = _read_present_ids_direct(con, ids)
+    except SelfcheckOwnerReadError as exc:
+        return _fail(str(exc), "this check never opens the store directly beside a live owner")
+    except sqlite3.Error as exc:
+        return _fail("%s could not be read: %s" % (ctx.db_path, exc), "restore the graph from backup")
     finally:
         con.close()
     missing = [i for i in ids if i not in present]
@@ -623,13 +737,21 @@ PHASE_CHECKS = {
 def run_checks(checks, ctx):
     """Run each (name, fn) in order. A check that raises is a FAIL naming the exception."""
     results = []
+    noted = False
     for name, fn in checks:
         try:
             status, detail = fn(ctx)
         except Exception as exc:  # noqa: BLE001 -- a crashing check must report, never crash the run
             status, detail = FAIL, "check crashed: %s: %s — report this as a bug in install_selfcheck.py" % (
                 type(exc).__name__, exc)
-        results.append({"name": name, "status": status, "detail": detail})
+        result = {"name": name, "status": status, "detail": detail}
+        if name in GRAPH_CHECKS:
+            label = ctx.graph_decision["label"] if ctx.graph_decision else None
+            result["path"] = label
+            if label and not noted:  # the first graph check of the run carries the note in its text
+                noted = True
+                result["detail"] = ("%s (path: %s)" % (detail, label)) if detail else "(path: %s)" % label
+        results.append(result)
     return results
 
 

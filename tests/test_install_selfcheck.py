@@ -898,7 +898,9 @@ def test_json_output_is_one_object_with_name_status_detail(seat):
     assert doc["result"] == "FAIL"
     assert [c["name"] for c in doc["checks"]] == ALL_INSTALLED
     for c in doc["checks"]:
-        assert set(c) == {"name", "status", "detail"}
+        # the three graph checks also carry the additive "path" field (#4118); no other check does
+        assert set(c) - {"path"} == {"name", "status", "detail"}
+        assert ("path" in c) == (c["name"] in ("graph-opens", "seed-ids-present"))
         assert c["status"] in ("PASS", "FAIL", "SKIP")
     bad = [c for c in doc["checks"] if c["status"] == "FAIL"]
     assert [c["name"] for c in bad] == ["deployed-version"]

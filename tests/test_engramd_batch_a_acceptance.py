@@ -597,6 +597,16 @@ BATCH_B_HOOK_FLAGS = {
     "utility_credit_writes_via_owner",    # engram-utility-credit-mention-stop.py
 }
 
+# Flags carried by shipped tools that are deliberately NOT in any batch, one entry each with its reason.
+# Not BATCH_B_HOOK_FLAGS (that set is the per-prompt hooks). An entry needs a non-empty reason and must
+# still be carried by the tree (stale check in cell17b).
+NOT_BATCHED_FLAGS = {
+    "install_selfcheck_reads_via_owner": (
+        "install-time diagnostic, not on any hook path; its ON output differs from OFF by design (it names "
+        "the path taken and FAILs on an unhealthy owner); flips as its own one-flag step after #4118 lands"
+    ),
+}
+
 
 def _flag_decl():
     """A flag key is DECLARED by an `OWNER_FLAG_KEY = "x"` style assignment (tools, hooks, the shell script),
@@ -628,10 +638,22 @@ def test_cell17b_the_shipped_table_is_the_flags_the_shipped_tools_carry_minus_ba
                '"""docs: engramd.planted_e_via_owner"""\n')
     assert sorted(_flag_decl().findall(planted)) == [f"planted_{c}_via_owner" for c in "abcd"]
     assert BATCH_B_HOOK_FLAGS <= set(carried), "a Batch B exclusion that no hook carries any more is stale"
+    assert set(NOT_BATCHED_FLAGS) <= set(carried), "a not-batched entry that no tool carries any more is stale"
     table = {e["flag"] for e in script.TOOLS}
-    assert set(carried) - BATCH_B_HOOK_FLAGS == table, (
-        f"in the tree but not the table: {sorted(set(carried) - BATCH_B_HOOK_FLAGS - table)}; "
-        f"in the table but not carried: {sorted(table - (set(carried) - BATCH_B_HOOK_FLAGS))}")
+    unbatched = set(carried) - BATCH_B_HOOK_FLAGS - set(NOT_BATCHED_FLAGS)
+    assert unbatched == table, (
+        f"in the tree but not the table: {sorted(unbatched - table)}; "
+        f"in the table but not carried: {sorted(table - unbatched)}")
+
+
+def test_cell17d_every_not_batched_flag_has_a_reason_and_is_disjoint_from_the_other_sets(script):
+    """A not-batched flag is a named exception, so it must say why, and it must not also sit in Batch B or in
+    the table (one home per flag). Turns red under: an empty reason, or a flag listed in two places."""
+    for flag, reason in NOT_BATCHED_FLAGS.items():
+        assert isinstance(reason, str) and reason.strip(), f"{flag} needs a reason"
+    table = {e["flag"] for e in script.TOOLS}
+    assert not set(NOT_BATCHED_FLAGS) & BATCH_B_HOOK_FLAGS
+    assert not set(NOT_BATCHED_FLAGS) & table
 
 
 def test_cell17c_the_anchoring_report_and_the_survey_are_two_rows_on_one_flag_with_the_survey_pinned(script):
