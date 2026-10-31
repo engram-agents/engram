@@ -77,7 +77,7 @@ will find the design under-built for a job it is not doing.
 
 **Platform: Darwin 25.6.0 (arm64), CPython 3.12.10, SQLite 3.49.1.** One seat. Where a finding is
 platform-specific it says so; where the Linux arm is **unmeasured by me**, §7 records that as an
-open item rather than letting a documented-behaviour claim pass as a measurement. *(Green on the
+open item rather than letting a documented-behaviour claim pass as a measurement. *(As-built, 2026-10-31: the peer-credential cross-uid rejection is now measured on both Linux and Darwin; see §6 and §7. Other platform-specific findings keep their own status.)* *(Green on the
 wrong platform is not evidence — and this slice is where it bites hardest, since the fleet runs both.)*
 
 | # | probe | result |
@@ -397,6 +397,8 @@ the census (§3.2) plus the owner's own operations, and every action it denies m
 caller that swallows the denial. `SQLITE_TRANSACTION` is the first known member; I do not claim it is
 the last, and §7 records that the derivation is owed rather than done.
 
+*(As-built, 2026-10-31: the allowlist is built and the swallow check is done; see §3.7 and §7.)*
+
 **Which connection serves `snapshot()` — ANSWERED in revision 5 by Mira's ruling on the connection
 question, then corrected again in revision 6 on the snapshot() contract itself (below).** History,
 read as history rather than a still-standing claim: revision 2 said the write connection, "because
@@ -450,6 +452,9 @@ on `knowledge.db`"*, and two connections are two handles. Revision 3 read that a
 called the reading "mine, and the part I am least sure of". Mira's ruling adopts the same reading, so it
 is no longer mine alone — but the parent's words still say *handle*, and **that document is not this
 slice's to edit.** §7 flags the clarification to its owner rather than resolving it by editing here.
+
+*(As-built, 2026-10-31: the parent's wording was changed by `4bf1f164` (#3198); the paragraph above is
+kept as history. See §7.)*
 
 Because (a) is rejected, revision 3's mandatory test for it (*after a read raises, a write still
 succeeds*) is retired. It is replaced by the property (b) actually depends on — **client SQL cannot reach
@@ -727,7 +732,7 @@ registry *and* had no deadline (§4's fifth attack), each section assuming the o
 Two things sit alongside the safe set rather than inside it:
 
 - **Per-site sanitisation stays**, and `engram_filter.py` already does it for `LIKE`. It is defence in
-  depth, not the boundary — and §7 records that three other sites do it incompatibly.
+  depth, not the boundary — and §7 records that three other sites do it incompatibly. *(As-built, 2026-10-31: the owner admits no FTS5 read, so these sanitizers stay outside this slice; §7, FTS5 row.)*
 - **The template registry authorises the STATEMENT only** and does not vouch for what a parameter does
   inside it. That division is unchanged; what changed is that the placeholder positions are now
   themselves part of what registration checks.
@@ -774,12 +779,107 @@ authorises an FTS5 expression, given that **three divergent sanitizers already s
 open question while three incompatible answers are already in the tree is worse than not raising it,
 and revision 2 named none of them.
 
+*(As-built, 2026-10-31: closed by deny. The registry refuses every virtual-table read, so no FTS5
+expression reaches an owner-side policy. See §7, first row. The paragraph above is kept as history.)*
+
 Row-level / per-caller result scoping remains out of scope, and is a *different* limitation from the
 one above — revision 1 conflated the two.
 
 ### 3.6 Typed-op input bounds
 
 **Typed-op input bounds.** An owner op may **clamp** an out-of-range input only when it is an upper bound on magnitude **and the reply already reports what the clamp cut off**: the chain op's `max_depth` above `CHAIN_MAX_DEPTH_CAP` qualifies, because any cut it causes comes back as `truncated: true`. Every other out-of-range input is **refused by name**, before any statement: a wrong type, a negative value, an unknown enum member, a duplicate, and **any over-limit list**, because clamping a list silently drops an item the caller asked for and nothing in the reply says so. A new op that wants to clamp names the reply field that reports the cut; if it can't, it refuses.
+
+### 3.7 The authorizer swallow sweep (as-built, 2026-10-31, #3097)
+
+This is in §3, not §5, because it discharges the §3.1 obligation: check every action the authorizer denies for a caller that swallows the denial. §7 points here.
+
+**What it is.** A read-only analysis of dev `b7f963f3`. No code was changed. It follows a denial from the authorizer to every caller of the client-read path. It asks one question per caller: does the caller surface the denial, or turn it into an empty or default answer? The owner leg (3.7.2) was also run once, in a scratch script that is not committed. Each caller was read in the code at the cited line. No caller was run against a live owner in this pass.
+
+**Terms.** The *client-read path* is the four owner methods that run on `_client_read_conn`: `read`, `df`, `chain` and `confidence_by_type` (method table `src/engram/engramd_owner.py:2981-2986`; handlers `:5294`, `:5391`, `:5446`, `:5521`). `ping` touches no store (`:4583`). `snapshot` runs on `_owner_conn` (`:5587`, `.backup()` at `:5873`). Neither is on the client-read path.
+
+**3.7.1 What the authorizer denies.** `_client_read_authorizer`, `src/engram/engramd_owner.py:1158-1193`:
+
+| condition | answer | pointer |
+|---|---|---|
+| action `SELECT`, `READ` or `FUNCTION` | OK | `:1132-1138`, `:1165-1166` |
+| `PRAGMA` with a value (arg2 is not None), a write form | DENY | `:1177-1178` |
+| `PRAGMA` with no value, name `user_version` or `data_version` | OK | `:1155`, `:1179-1180` |
+| `PRAGMA` with no value, any other name | DENY | `:1181` |
+| `TRANSACTION` | DENY | `:1183-1191` |
+| every other action code (the writes, the DDL, `ATTACH`, `DETACH`, `SAVEPOINT`, `RECURSIVE`, and the rest) | DENY, by the final default | `:1193` |
+
+The function never returns `SQLITE_IGNORE`. Measured: action codes 0 to 39, six argument shapes, no result other than OK or DENY. This matters because IGNORE would turn a denied column read into NULL inside the owner. On this seat an IGNORE authorizer made `select a from t` return `[(None,)]`. The owner leg cannot do that. The codes in the last row are not each tested; the default `return sqlite3.SQLITE_DENY` is what denies them.
+
+**3.7.2 How a denial travels.**
+
+1. `_client_read_authorizer` returns DENY. SQLite does not prepare the statement.
+2. Python raises `sqlite3.DatabaseError`, message "not authorized", `sqlite_errorcode` 23 (`SQLITE_AUTH`). It is not an `OperationalError`.
+3. `_ClientReadGate._execute_admitted` (`:1689-1702`) lets it through and clears the progress handler in its `finally`. `_ClientReadGate.execute` (`:1583-1612`) converts only an `OperationalError` with `sqlite_errorcode == 1` into a `Rejected`; this error is neither, so it propagates. `execute_typed` (`:1614`), `run_chain` (`:1630`) and `run_confidence_by_type` (`:1667`) catch nothing.
+4. `EngramdOwner._run_client_read` (`:5351-5389`) catches it at `except sqlite3.Error` (`:5382`). An `OperationalError` would be caught at `:5374` and end in the same place, unless it is an interrupt.
+5. `_read_failed` (`:5577-5585`) logs a warning in the owner log and returns `{"status": "rejected", "reason": "read_failed", "detail": "DatabaseError: not authorized", "remedy": ...}`.
+6. The handler returns that dict as the reply: `_handle_read` `:5329-5330`, `_handle_df` `:5439-5440`, `_handle_chain` `:5497-5498`, `_handle_confidence_by_type` `:5563-5564`.
+7. On the client, `engramd_client._call_mapped` (`src/engram/engramd_client.py:965-972`) maps `status == "rejected"` to `Rejected(reason="read_failed", ...)`.
+8. The shim `OwnerReadConnection` raises `OwnerReadError("rejected", result)`: `execute` `:1225`, `generalization_chain` `:1262`, `confidence_by_type` `:1297`. A hook that calls `ec.read("read", ...)` itself gets the `Rejected` object.
+
+**Owner-side result: no path was found where a denial becomes an empty row set or an ok-with-nothing.** Evidence, measured in a scratch script on this seat (macOS arm64, Python 3.12.10, SQLite 3.49.1). It ran the real `_client_read_authorizer`, `_ClientReadGate._execute_admitted` and `EngramdOwner._run_client_read`:
+
+| statement through the owner tail | answer |
+|---|---|
+| `insert`, `pragma user_version=5`, `pragma journal_mode`, `begin`, `create table`, `attach database` | each: `rejected`, `read_failed`, detail `DatabaseError: not authorized` |
+| `pragma user_version`, `select id from nodes` | rows, no failure |
+
+The typed walks add no catch of their own. `generalization_chain` (`src/engram/engram_core.py:2437-2730`), `_resolve_to_current` (`:2414`), `_current_successor` (`:10665`), `dag_edge_set` (`:2227`), `confidence_by_type` and `_confidence_by_type` (`src/engram/engram_stats.py:133`, `:98`) were read; none has a `try` around its SQL. Not read: `core._get_current_turn()`, called in `run_confidence_by_type` (`:1685`); it reads `config.json`, not the store.
+
+Two limits. Other Python and SQLite builds were not run. And **no committed test feeds an authorizer DENY through `_run_client_read`** (a grep of `tests/` for "not authorized" and "prohibited" found two unrelated hits). The committed cells feed other SQLite errors through the same tail: `tests/test_engramd_owner_read_3197.py::test_o7_oversized_cell_is_a_loud_rejection_not_a_dropped_connection` (`:313`, a `DataError`) and `tests/test_engramd_chain_3740.py::test_chain_sqlite_errors_map_to_their_named_reasons` (`:810`). The gap is named here. Filling it is a code change, outside this doc-only pass.
+
+**3.7.3 How the callers were enumerated.** Run at the repo root on dev `b7f963f3`. Counts are lines, then files; they include docstring and comment mentions.
+
+```
+git grep -n -E 'OwnerReadConnection' -- src tools                    # 15 lines, 7 files
+git grep -n -E '(ec|client|engramd_client)\.read\(' -- src tools     # 12 lines, 8 files
+git grep -n -E 'open_reader\(' -- src tools                          # 14 lines, 10 files
+git grep -l -E 'engramd_client' -- src tools                         # 20 files
+git grep -n -E '_via_owner' -- src tools                             # 127 lines, 29 files
+git grep -n -E 'owner_read\.(ping|snapshot|write)\(' -- src tools    # 14 lines
+git grep -n -E '(ec|client|engramd_client)\.write\(' -- src tools    # 3 lines
+git grep -n -E "\"method\": *\"(read|df|chain|confidence_by_type)\"|'method': *'(read|df|chain|confidence_by_type)'" -- src tools   # 0 lines
+git grep -l AF_UNIX -- src tools                                     # 8 files
+```
+
+How each was used. `OwnerReadConnection` finds the shim and its users. `.read(` finds direct calls: of the 12 lines, 6 are `ping`, 1 is `snapshot`, 3 are docstrings, and 2 send `read` (`engram-stop-hook.py:574`, `engram-user-identity-hook.py:227`). `open_reader(` finds the tool opener and its nine callers. The 20 files that mention `engramd_client` are the superset of files that can talk to the owner. Each is the owner itself (`engramd_owner.py`), is in a row below, is in the exclusion list, or has no hit in the first three greps. The last group is five files that only name the module (`src/build/packaging/tiers.json`, `engram_home_resolver.py`, `engram_pidfile.py`, `hooks/claude/_hooklib.py`, `tools/engramd_read_scan.config.json`); they were grepped, not read through. The `_via_owner` names map flags to files: the read flags are the `*_reads_via_owner` keys, `regen_embeddings_via_owner` covers one tool's reads and writes, and `*_writes_via_owner` are writes. The raw-method grep looks for a client that writes the request itself and so bypasses the shim: none (0 lines; the same pattern finds raw requests in `tests/`, so it can match). Of the 8 `AF_UNIX` files, two are the owner and its client. The other six talk to the recall daemon (`engram-lesson-tripwire-hook.py`, `engram-surface-hook.py`, `engram-surface-daemon.py`, `start-engram-daemon.sh`), the Codex app server (`codex-umwelt-wake.py`), or only name the socket in a comment (`tools/engramd_stage_profile.py`). None sends a client read to the owner.
+
+**3.7.4 The table.** Every denial reaches every caller as the same answer: `Rejected(reason="read_failed")`, because all four methods end in `_run_client_read` (3.7.2). So there is one row per caller, not one per denial. The callers do not branch on the reason, with these exceptions, each stated in its row: `tools/_owner_read.py` words its message by reason; `_check_db_liveness` in the surface hook reads two reasons; `OwnerReadConnection.execute` reads one reason of `df`.
+
+| caller (file:function:line) | what it does with a non-Ok answer | verdict |
+|---|---|---|
+| `src/engram/engramd_client.py` `OwnerReadConnection.execute` `:1178-1226`, `.generalization_chain` `:1228-1263`, `.confidence_by_type` `:1265-1298` | Raises `OwnerReadError` for Unavailable, Rejected, an unusable answer, a client crash and an exhausted budget. Two empty cursors exist. One is sent when no valid `df` term is left, with no round trip (`:1197-1198`). The other is `df` + `vocab_table_absent` (`:1219-1224`); the owner sets that reason only when `sqlite_master` has no row for the vocab table (`engramd_owner.py:5417-5427`), a fact about the store, not a denial. A denial of that `sqlite_master` read would be `read_failed` and would raise. | SURFACES |
+| `src/engram/tools/_owner_read.py` `_OwnerReader.execute` `:256-260`, `failure` `:181-217` | Turns every `OwnerReadError` into the tool's own typed error, with reason, detail and remedy. `ping` (`:224-242`) and `snapshot` (`:355-430`) are not on this path. | SURFACES |
+| `src/engram/engram_idf.py` `extract_keywords` `:231-315`, `idf` `:187-228` | No `try` around its statements; the error passes up. | SURFACES |
+| `src/engram/tools/anchoring_report.py` `_fetch_population` `:188` (handlers `:205-209`), `main` `:343-371` | The typed error is a `RuntimeError`, so the `except sqlite3.Error` at `:205` does not take it. `main` prints `ERROR: ...` to stderr and returns `OWNER_READ_FAILED_EXIT`. Nothing is printed before every page is in. | SURFACES |
+| `src/engram/tools/quote_quality_survey.py` `main` `:775-791` (uses the reader above) | Prints one stderr line, exits 3. | SURFACES |
+| `src/engram/tools/cohort_dispatch.py` `_fetch_nodes` `:200-227`; `cmd_prepare` `:610`; `main` `:1843-1848`; `cmd_verify_in` `:875-893` | `prepare`: `CohortOwnerReadError` is not caught in `cmd_prepare`; `main` prints `error: ...` and returns 1. `verify-in`: recorded as a `db_access` error with `db_nodes = None`; the run ends `passed: False` and returns 1 (`:966-969`). | SURFACES |
+| `src/engram/tools/dream_master_batch.py` `_with_reader` `:726-741`, `main` `:760-777` | `except Exception`: one `<Class>: <message>` line on stderr, nothing on stdout, returns 1. | SURFACES |
+| `src/engram/tools/engram-regenerate-embeddings.py` readers `:335-377`, `_owner_run` `:474`, `_backfill_via_owner` `:462-471` | `RegenOwnerError` goes to `_owner_fail`, exit 3. | SURFACES |
+| `src/engram/tools/inspect_raw.py` `read_row` `:148-210`, `_get_row` `:213-236` | With the owner on, a `sqlite3.Error` is re-raised, not wrapped; the typed error reaches `_get_row`, which prints it and exits `OWNER_READ_FAILED_EXIT`. | SURFACES |
+| `src/engram/tools/lesson-pattern-audit.py` `read_lesson_rows` `:206-228`; callers `run_audit` `:316`, `run_view_comparison` `:397`, `run_write_ranks` `:516`; `main` `:608-613` | One stderr line, returns 1. Nothing is written: every store read comes before the rank file is touched. | SURFACES |
+| `src/engram/tools/reconcile_lesson_demotions.py` `find_candidates` `:257-336`, `main` `:338-352` | `ReconcileError` becomes `{"error": ..., "candidates": null}` on stdout and `sys.exit(1)`. | SURFACES |
+| `src/engram/tools/study_queue.py` `read_store_candidates` `:397-423`, `_weakest_candidates` `:426`, `build_queue` `:444`, `main` `:534-554` | `except Exception`: stderr, returns 1. | SURFACES |
+| `src/engram/tools/weakest_load_bearing.py` `read_ranking` `:408-443`, `main` `:469-478` | Same shape: stderr, returns 1. | SURFACES |
+| `src/engram/hooks/claude/engram-stop-hook.py` `_read_count_via_owner` `:542-662` (Rejected branch `:609-635`), `_maturity_muted` `:673-753`, `main` `:1034-1037`, `_report_owner_failure` `:979-990` | Raises `_OwnerReadFailure`; `main` emits a `block` decision with reason, remedy and steps. If `stop_hook_active` is true it writes one stderr line instead ("already reported in this stop chain"), by the #3664 ruling. It never returns 0 or "not muted" for a failure. | SURFACES (rate-limited: once per stop chain, by the #3664 ruling) |
+| `src/engram/hooks/claude/engram-user-identity-hook.py` `read_people_via_owner` `:198-279` (Rejected branch `:268-279`), `main` `:429-432` | Returns `(None, response)`; `main` emits the response. Never an empty list for a failure (`:199-202`). Emitted on every prompt. | SURFACES |
+| `src/engram/hooks/claude/engram-lesson-tripwire-hook.py` six sites: `load_tripwires` `:610-649`; `render_triggered_principles` `:982` (handler `:1151-1154`); `load_prevention_lessons` `:1434-1455`; `check_in_turn_recall` `:2049` (handler `:2242-2247`); focused-ids reads via `_focused_read_conn` `:268-280` and `_hooklib._focused_ids` `:1750-1795` (wiring `:2303-2316`, `:2347-2351`) | Each site returns its own empty result (`[]` or `""`) and records the first failure. `main` adds one notice at the head of the block (`_pending_owner_notice` `:556-573`), at most once per 1800 s (`probe_notice_due`, `_hooklib.py:2154`; `PROBE_NOTICE_WINDOW_SECONDS`, `:2085`). Every run writes a stderr line (`_write_owner_stderr_lines` `:576-591`). The hook's header says the empty result is "never presented as 'no tripwires matched'" (`:169-174`). An empty `load_prevention_lessons` leaves the deny gate fail-open (`:1438-1439`). | SURFACES, rate-limited (3.7.5) |
+| `src/engram/hooks/claude/engram-surface-hook.py` `_check_db_liveness` `:655`, `_check_embedding_restore_flag` `:866`, `_dormant_focus_set_candidates` `:1971`, `_render_triggered_principles_section` `:2081`, `_should_prepend` `:2460` (call `:4346-4366`), focused-ids wiring `:4767-4774`, `:4914-4916` | Same pattern: degraded result, failure recorded, one notice per window (`_owner_failure_text` `:537`, `_pending_owner_notice` `:561-584`), stderr line every run (`_write_owner_stderr_lines` `:609-625`). The restore flag reads as unknown (`None`), not healthy (`:944-962`). `_check_db_liveness` treats a `read_failed` as healthy only when its detail contains `no such table: embedding_restore_state` (`:701-702`); a denial's detail is `DatabaseError: not authorized` (3.7.2), so it does not match. | SURFACES, rate-limited (3.7.5) |
+| `src/engram/hooks/claude/engram-session-start-hook.py` `_check_backup_staleness` `:783` (read `:808-824`), `_check_embedding_restore_flag` `:858`, `focus_block` `:1684`, `saved_focus_sets_block` `:1930`, `session_checkpoint_block` `:2116`, `sleep_status_block` `:3068`, calibration in `main` `:4351-4391` | Same pattern; one notice per window (`_pending_owner_health` `:431-451`), stderr line every run (`_write_owner_stderr_lines` `:453-468`). `_check_backup_staleness` turns a failed count into `_count = 0` and returns `(True, None)`, i.e. no backup warning, with the failure recorded (`:823-824`). The cold-start retry (`_owner_read` `:357-372`) applies to `Unavailable` only. | SURFACES, rate-limited (3.7.5) |
+
+Not on the client-read path, so not rows: `tools/backup_knowledge_db.py` (`ping` `:621`, `snapshot` `:638`), `src/engram/tools/engram-pkg/engram-pkg` (`snapshot` `:1173`), `src/engram/tools/engram-fix-git-backup.sh` (`snapshot` through inline Python, `:150-176`); the `ping` probes (`hooks/claude/_engramd_owner_hook_io.py:237`, `engram-session-start-hook.py:335`, `engram-surface-hook.py:637`, `tools/engramd_a6_latency.py:628`, `tools/engramd_stage_profile.py:358`); the owner writes (`engram-utility-credit-mention-stop.py:290`, `engram-surface-hook.py:381`, `tools/_owner_read.py` `write` `:433`). `tools/engramd_a6_latency.py` and `tools/engramd_stage_profile.py` drive the hooks above and add no caller. `tools/engramd_lockwait_report.py` reads files, not the socket. No verdict is FALLS-BACK-BY-DESIGN: no caller falls back to a direct read on a refusal; the flag-off path is a separate configuration, chosen by the operator.
+
+**3.7.5 Swallowing callers found.** None that hides a denial without a trace: every caller either raises, prints, exits non-zero, emits a visible block, or records the failure and shows it at least once. Four callers are quiet on stdout for a repeat: the three hooks below, inside their 1800 s window, and the stop hook, after its first block in a stop chain. The commands in 3.7.3 are the evidence for the enumeration.
+
+One class needs a plain statement, because the test is "turns the denial into an empty or default answer". Three hooks (tripwire, surface, session-start) do that for the failing site, by design: the site returns its empty or fallback result, the first failure is recorded, and the fire shows a notice. That notice is limited to one per 1800 s window on stdout. **What the window means:** inside 1800 s a repeated denial is silent on stdout, and present on stderr (every run) and in the owner log's warning (`_read_failed`, 3.7.2); the hook's own failure record lives in memory for that one fire only. So inside the window stdout alone looks like "nothing matched" or "nothing to report", and a hook's stderr is not what the agent reads. The notice itself names the result as missing, not empty. The surface hook's wording (`_owner_failure_text`, `engram-surface-hook.py:537`): "This prompt's <blocks> could NOT be read (the read failed; it is NOT empty). Do not open knowledge.db directly to work around this." The hook headers state the degrade-and-notify behaviour as intended (tripwire `:169-174`; surface `:214-219`; session-start `:113-116`). **Ruled SURFACES (rate-limited)** by the design seat (Borges, 2026-10-31, in a Workshop world crossing, not on GitHub): every denial is recorded and printed to stderr on every run; the agent notice says missing, not empty; repeating it on every fire would break the #2863 injection budget; and the tripwire deny gate's fail-open on an empty prevention-lesson read is a separate, deliberate choice that the notice states.
+
+A latent form: `_hooklib._focused_ids` (`:1750-1795`) returns `(set(), False)` and says nothing when called with an owner `read_conn` and no `on_failure`. Every present caller passes one (`engram-lesson-tripwire-hook.py:2313`, `:2351`; `engram-surface-hook.py:4774`, `:4916`), so nothing swallows today. A second latent form: `engram_core._sanitize_fts_query` (`engram_core.py:7058-7062`) wraps `extract_keywords(conn, ...)` in `except Exception` and falls back to the legacy sanitizer with no record. Its callers (`engram_core.py:11021`, `engram_query.py:1757`) pass server-side direct connections, never an owner connection, so it does not swallow an owner denial today.
+
+**Not checked.** A live end-to-end run of each caller against a refusing owner. Other Python and SQLite versions. Callers outside `src/` and `tools/`. The flag-off paths (they do not reach the owner). Whether the 1800 s window is the right figure.
 
 ---
 
@@ -944,7 +1044,7 @@ Contract-first — each test names the mutation that must turn it red.
     set" worry is enforced by construction instead of asserted in prose.
 16. **An FTS5 `MATCH` parameter is not authorised by a tier-1 template alone** — whichever mechanism
     §7's open question settles on, the test is that `secret_notes: …` cannot be smuggled through a
-    template registered for `public_notes`. (P14.)
+    template registered for `public_notes`. (P14.) *(As-built, 2026-10-31: settled as deny; the registry refuses the template outright, `tests/test_engramd_read_registry.py::test_16_fts5_match_template_is_refused_registration`.)*
 17. **⚠ Rewritten in revision 6 (Borges's ruling, engram-alpha#3221) — the owner RPC never issues a
     `BEGIN`/`SELECT`/`COMMIT` and `backup()` never consults an authorizer, so a `SQLITE_TRANSACTION`
     denial cannot be the mutation.** `snapshot()` [the owner RPC] runs on the owner-internal path,
@@ -1002,6 +1102,8 @@ are entangled and the design was not built.
 revision 5, said the cross-uid rejection test "has not been run". That stopped being true when the
 build landed. What runs, and what it can and cannot show:
 
+**Updated 2026-10-31 (#3097):** the Darwin real-socket control has now run too (last bullet below). No control in this section is still unrun.
+
 - **The CI cell.** `tests/test_engramd_owner.py::test_peer_uid_mismatch_is_rejected` (added by
   PR #3201 as an unconditional skip; made to run where `sudo -n` works by PR #3421, closing #3197)
   connects a real foreign peer, **uid 0 via passwordless `sudo`**, after a same-uid control that is
@@ -1037,13 +1139,24 @@ build landed. What runs, and what it can and cannot show:
   with the request unread, so a client that sends first and then reads to EOF receives the typed
   refusal and then a `ConnectionResetError` on its next read (the shipped client stops at the newline
   and is unaffected); and the owner logs no line on a refusal.
-- **Real socket, any foreign peer, Darwin: not run.** The author's Mac has a second account (Clio's);
-  a probe from her own session waits for the user's go-ahead (#3097).
+- **Real socket, non-root foreign peer, Darwin: REJECTED, twice (2026-10-17, recorded on #3097).** Peer
+  side: Clio, on a second account on the same Mac, with the shipped `engramd_client` from dev `c3222d97`
+  (peer uid 504, macOS 26.6.2 arm64, Python 3.12.10; #3097 comment 6227179714). Owner side and control:
+  Aleph (owner uid 501, plugin v0.5.3-rc1 `engramd_owner.py`, a throwaway home under `/tmp` holding a
+  private copy of the store; comment 6227186043). The home and `run/` were set to 0711 and the socket to
+  0777, so file permissions are not what refused. The peer got `Rejected(reason='peer_identity',
+  detail="connecting uid 504 is not this owner's uid 501")`, on the shipped client and on a raw
+  send-first probe (20 of 20 clean in both runs: the typed line, then EOF, no reset). Nothing was served.
+  Control: the owner's own uid was served (`Ok`, `contract_version 1.1`) before and after the peer
+  runs, and the owner pid did not change. A non-root peer is refused only by the mismatch rule, so
+  this is the discriminating control for the Darwin arm. The owner wrote no refusal line to its stderr,
+  as on Linux (#3845). **Limits:** one pair of accounts, one macOS version, one machine, loopback, a
+  throwaway owner. The run does not speak to the ACL cross-user connect effect of §2.1: the permissions were opened by hand.
 
 The rest of this section is revision 5's reasoning, kept because it is still the reason the parse
-form (§2.2) and test 2 matter. Read its present tense as Darwin-only: the second-uid control it asks
-for ran on Linux on 2026-10-16 (above), and "until one runs" below now applies to the Darwin arm
-alone.
+form (§2.2) and test 2 matter. Read its present tense as history: the second-uid control it asks for
+has run on both arms, Linux on 2026-10-16 and Darwin on 2026-10-17 (above), so "until one runs"
+below no longer describes either arm.
 
 P2 returned `uid=501` and the process's own uid is 501 — consistent with reading the peer *and* with
 reading ourselves. P4 exercises the **option** axis; P3 shows the **level** axis is the one that fails
@@ -1067,24 +1180,31 @@ important thing the review produced.
 
 ## 7. Open, and whose call each one is
 
+**As-built pass, 2026-10-31 (#3097).** Each row below was re-read against dev `b7f963f3`, in code and tests, not against merged-PR titles. A row says what is true there, with a pointer. "Not checked" means not checked. The earlier text of this section (the revision 5 and 6 state) is in git history; §9 records this pass. Where a row still needs someone's call, the row says whose.
+
 | question | state |
 |---|---|
-| **How an FTS5 `MATCH` parameter is authorised** (§3.5) | **The safe-set half is DECIDED in revision 5** — a template touching a virtual table has no implicit safety. **Still open, and still a blocker: which owner-side policy authorises an FTS5 expression** — on a different site than revision 3 said. Three divergent sanitizers ship — `engram_core.py:4724` and `:4772`, `viz/data/graph.py:39-45` which does **not** quote, and `engram-surface-hook.py:1549`. Any answer has to reconcile those or declare which wins; revision 2 named none of them. The load-bearing site is **`viz/data/graph.py:54`** — caller-supplied `db_path`, live store, HTTP query string, non-quoting sanitizer. The hook site is a **package**-DB read and is out of scope per the parent's table at `:849`; revision 3 had these the wrong way round. |
-| **Which connection serves `snapshot()`** (§3.1) | **Answered in revision 5 (Mira).** An owner-internal serialized/quiesced path, not the client-read path; preserves `BEGIN`/`READ`/`COMMIT`, fails loudly, never toggles the client-read authorizer. The concrete lifecycle is owed to §5 test 17. |
-| **One connection with a swapped authorizer, or two in the one owner process** (§3.1) | **DECIDED — (b), Mira's ruling.** Client-read connection permanently restrictive; no authorizer swapping. |
-| **The parent's "only open handle" wording** (§3.1) | `docs/internal/2652-engrammanager-design.md:677` literally says one handle; (b) is two. Read as process-scoped by both author and reviewer — but **the words need clarifying by that document's owner**, and this slice does not edit it. |
-| **vec0 detection at registration** (§3.5) | The rule is decided. Detection is measured for FTS5 (author, Darwin) and for vec0 on one runtime (Mira: Linux, SQLite 3.45.1, sqlite-vec 0.1.9 — direct, alias and view all surface). Not established for every module or platform. The schema route is authoritative; the token-match backstop can miss quoting or view indirection, so it is not a never-under-deny guarantee, and incomplete classification fails closed. |
-| **How incomplete classification is DETECTED** (§3.5) | Owed by U4, and it must be **measured**, not asserted. "Fails closed" is only as good as the check that notices a classification is incomplete; the build must show a template whose reads the audit cannot fully account for, and show that registration denies it. (Mira, at approval.) |
-| **Two new budgets with no number** (§4) | `SQLITE_LIMIT_LENGTH` and the end-to-end request deadline — including its per-method variant for `snapshot` — both need values chosen against the owner contract (§8). |
-| **Tier 2 is DEFERRED, not designed** (§3.2) | U4's reached reads that are not literals are the two variable-arity `IN` f-strings, which are tier-1 `json_each` cases (§3.2, corrected after #3196), so tier 2 is off its path. Outline only; it gets specified by the unit that needs it. Deferring it is deliberate — revision 2 specified it speculatively and that was the larger error of the two in §3.2. |
-| **The authorizer's action allowlist is an OBLIGATION, not a finished list** (§3.1) | Owed by U4: derive it from the census plus the owner's operations, and check every denied action for a caller that swallows the denial. `SQLITE_TRANSACTION` is the first known member, not the last. |
-| **The Linux peer-credential arm is UNMEASURED by me** (§2.2) | **Partly measured by the reviewer in revision 5** — a same-uid `SO_PEERCRED` read, 12 bytes, correct decode (§6). ~~The foreign-uid rejection is measured by no one.~~ **Corrected 2026-10-16:** a uid-0 foreign peer is rejected in CI and was rejected live on 09-29 (§6), but uid 0 cannot discriminate the mismatch rule; a manufactured non-root credential is rejected in a unit cell on each arm, and a real-socket non-root foreign peer was rejected on Linux on 2026-10-16 (§6). Darwin's real-socket arm is still unrun. Documented is not measured — the whole of §1 exists because that distinction has cost this fleet real rounds. |
-| **Cross-uid rejection control** (§6) | **Updated 2026-10-16:** a uid-0 real-socket control runs in CI (`test_peer_uid_mismatch_is_rejected`) and ran live on 09-29, but uid 0 cannot discriminate the mismatch rule (§6). The mismatch rule is unit-tested on both arms with a manufactured non-root foreign credential (§6). Real-socket non-root foreign peer on Linux: **rejected** (uid 1008 against a uid-1002 owner, 2026-10-16, #3097; §6). Real-socket foreign peer on Darwin: not run; waits for the user's go-ahead. |
-| **The 37 unclassifiable census sites** (§3.2) | Unresolved by a call-site instrument. Each must be classified by hand or by a call-path walk before tier 1's registry is called complete. |
+| **How an FTS5 `MATCH` parameter is authorised** (§3.5) | **DECIDED in code: deny. No longer open, no longer a blocker.** The registry refuses any template that reads a virtual table or a shadow table of one (R5). Its docstring calls this "this unit's answer to design SS7's open FTS5 policy" (`src/engram/engramd_read_registry.py:38-40`). Cells: `tests/test_engramd_read_registry.py::test_16_fts5_match_template_is_refused_registration` (`:306`), `::test_21_fts5_equality_template_is_refused_registration` (`:298`), `::test_21_fts5_shadow_table_read_is_refused` (`:313`). No owner-side FTS expression policy exists, because no FTS read is admitted through the owner. Run in this pass: `tests/test_engramd_read_registry.py` and `tests/test_engramd_read_scan.py`, 257 passed (macOS arm64, Python 3.12.10, SQLite 3.49.1, one seat). **Residual, stated and not solved here:** the viz search still runs an FTS5 `MATCH` on a live store directly: `src/engram/viz/data/graph.py:53-61` (`MATCH ?` at `:56`), through `src/engram/viz/data/sqlite_ro.py:21` `connect_ro`. Its sanitizer (`graph.py:41-49`) strips non-word characters and appends `*`; it does not quote. That is the migration ledger's row 76, state `direct`, "no owner path planned yet" (`docs/internal/2652-migration-ledger.md:121`). It is the ledger's business, not this slice's. The old row named two more sanitizers; by function name they now sit at `src/engram/engram_core.py:7041` (`_sanitize_fts_query`) and `:7089` (`_sanitize_fts_query_legacy`), not re-audited. The hook's FTS site reads attached pack DBs (`src/engram/hooks/claude/engram-surface-hook.py:2286-2319`, opened `immutable=1`), out of scope, unchanged. |
+| **Which connection serves `snapshot()`** (§3.1) | **Built.** `_handle_snapshot` (`src/engram/engramd_owner.py:5587`) copies with `self._owner_conn.backup(...)` (`:5873`) under `_owner_lock`. Client SQL never reaches `_owner_conn`. The module docstring records the measured fact that `Connection.backup()` never consults an authorizer, on either side (`:197-214`). So `_owner_internal_authorizer` (`:1196`, permissive) has no test that can fail (`:176-184`). |
+| **One connection with a swapped authorizer, or two in the one owner process** (§3.1) | **Built as (b): two connections.** `start()` opens `_owner_conn` (`engramd_owner.py:3296-3301`, permissive authorizer) and `_client_read_conn` (`:3308-3310`). The second one's authorizer `_client_read_authorizer` and its `SQLITE_LIMIT_LENGTH` are set there, once; the only other `set_authorizer` calls in the file are on `_owner_conn` (`:3301`, `:4737`, `:4757`). `_ClientReadGate` (`:1559`) holds only `_client_read_conn` (`:3319-3321`). The four client read methods run on it through `_run_client_read` (`:5351`); `snapshot` runs on `_owner_conn`. |
+| **The parent's "only open handle" wording** (§3.1) | **Resolved in the parent.** Commit `4bf1f164` (#3198) replaced "holding the only open handle on `knowledge.db`" with "in the one process that holds `knowledge.db` open; that process may hold more than one connection, and does" (now `docs/internal/2652-engrammanager-design.md:681`). Checked with `git show 4bf1f164` and a read of that line. §3.1 below still quotes the old wording, as history. The same phrase survives in the owner module docstring (`engramd_owner.py:3`, "holds the only open handle on `knowledge.db`"); it reads as process-scoped and was not edited here (doc-only pass). |
+| **Budgets** (§4, §8) | **Numbered in code.** `CLIENT_READ_LIMIT_LENGTH = 2_000_000` (`engramd_owner.py:1242`; its comment: about 94 times the largest value measured on a real store, 21,272 bytes of `metadata`). `DEFAULT_REQUEST_DEADLINE = 5.0` s (`:368`). `SNAPSHOT_REQUEST_DEADLINE = 30.0` s (`:379`; its comment: a 48.62 MB store backed up in 0.0758 s). `PROGRESS_HANDLER_INSTRUCTION_COUNT = 1000` (`:1231`; its comment: candidates 100, 500 and 1000 aborted within microseconds of the deadline alike, and 1000 has the lowest check overhead). The progress handler has no deadline of its own: it stops against the request deadline passed in (`_arm_read_deadline`, `:1245`), which for all four client-read methods is the request deadline minus `READ_RESPONSE_RESERVE` (applied in the shared `_run_client_read`), 0.25 s (`:474`, `:5359`). **The 5.0 s default is CHOSEN, not measured.** Its comment says only "generous enough" (`:363-367`). Known headroom, from Borges's first-hand run: a whole SessionStart hook fire through the owner, as a fresh process with imports, sequential p99 109.710 ms (A6 S-syn run 6r, 2026-10-31: synthetic 5,010-node store, dev `558eb46f`, installed layout, SQLite 3.53.0, Python 3.14.4, Linux/WSL2, N=300; raw table in #3735 comment 6544788213). One request is part of that fire, so the figure **bounds a request from above. It is not a per-request distribution, and no per-request distribution was measured.** Against 5.0 s that is about 45 times (5000 / 109.7). The p99 was first cited from #3735 comment 6543471311, which prints ratios only; its public source is the raw table in 6544788213, posted for this citation, and the ruling's pointer was corrected in place. Client side: every hook bounds one read below 5.0 s (tripwire, session-start and surface 1.0 s; user-identity 1.5 s; stop 2.5 s: `OWNER_READ_TIMEOUT_S` in each hook), so a hook gives up before the owner's deadline. Tools allow 10 s per call and 60 s per run (`src/engram/tools/_owner_read.py:56-57`), so they can receive the owner's own deadline answer. No new issue unless someone needs to tighten the default (ruling item 3). |
+| **vec0 detection at registration** (§3.5) | **The rule is decided and shipped.** Placement is checked against `sqlite_master`, not against a module name; a virtual table or a shadow table is refused (`engramd_read_registry.py:30-40`, R5 and R6b). Measured: FTS5 (the author, Darwin; and the registry cells above, this pass). vec0 only on one runtime (Mira, Linux, SQLite 3.45.1, sqlite-vec 0.1.9: direct, alias and view all surface; §3.5). **Not re-measured in this pass:** no cell in `tests/test_engramd_read_registry.py` or `tests/test_engramd_read_scan.py` mentions vec0 (a grep for `vec0` finds 0 hits; the same grep finds 7 in `src/engram/engram_core.py`), and this seat has no `sqlite_vec` module. Not established for every module or platform. The token-match backstop can miss quoting or view indirection, so it makes no never-under-deny claim. Incomplete classification fails closed (next row). |
+| **How incomplete classification is DETECTED** (§3.5) | **Built at two layers, with cells that go red.** Registry: an attached-database read, a temp-table read, an unknown table and an empty table name are unplaceable and refused (`tests/test_engramd_read_registry.py::test_r6b_attached_database_read_is_unplaceable` `:344`, `::test_r6b_temp_table_read_is_unplaceable` `:351`, `::test_r6b_unknown_table_cannot_be_placed` `:357`, `::test_r6b_empty_table_name_read_is_unplaceable` `:389`); a parameter-count disagreement fails closed (`::test_r6a_parameter_count_disagreement_fails_closed` `:333`). Scanner: any reached site it cannot classify is a failure, the CLI exits 1 and writes nothing, and a failed run does not overwrite the committed file (`tools/engramd_read_scan.py:23-37`, R10; `tests/test_engramd_read_scan.py::test_r10_cli_exit_nonzero_and_no_file_written_on_failure` `:224`, `::test_r10_cli_failure_does_not_clobber_an_existing_committed_file` `:234`). Re-run in this pass: both test files, 257 passed. **Limit, from the scanner's own docstring (`:39-49`):** the root set is prescribed, not checked; a read site that no declared root reaches is not scanned at all. |
+| **Tier 2 is DEFERRED, not designed** (§3.2) | **Still deferred.** No tier-2 mechanism exists: a case-insensitive grep for `tier.?2` in `engramd_read_registry.py`, `engramd_owner.py` and `tools/engramd_read_scan.py` finds 0 hits (the same grep finds it in this document). The two variable-arity `IN` f-strings the old row named are now the fixed `json_each` form (#3324; `src/engram/engram_core.py:2701-2715`), and the scanner treats an f-string or a variable as a failure (R10). The real-tree drift gate `tests/test_engramd_read_scan.py::test_r12_committed_file_equals_a_fresh_scan_of_the_real_tree` (`:345`) passes in this pass. So no site reached from the declared roots has needed tier 2. Same limit as above: the roots are prescribed. |
+| **The authorizer's action allowlist** (§3.1) | **Derived, and swept: see §3.7.** The allowlist is `CLIENT_READ_ALWAYS_ALLOWED_ACTIONS` = `SELECT`, `READ`, `FUNCTION`, plus read-form `PRAGMA user_version` and `PRAGMA data_version`; every other action, `TRANSACTION` included, is DENY (`engramd_owner.py:1132-1193`). It was measured on a representative `SELECT` against the real schema (`:1114-1131`) and widened once, for `data_version`, by a measured ruling (#3665; `:1140-1155`). The authorizer never returns IGNORE. §3.7 traces a denial to the client and lists every caller of the client-read path. Result: no caller turns a denial into an empty or default answer without a trace; four are quiet on stdout for a repeat (§3.7.5). Three hooks degrade the failing site and show a rate-limited notice; the design seat ruled them SURFACES (rate-limited) (§3.7.5). |
+| **The Linux peer-credential arm** (§2.2) | **Measured.** A same-uid `SO_PEERCRED` read, 12 bytes, correct decode (revision 5, Mira; §6). A uid-0 foreign peer is rejected in CI (`tests/test_engramd_owner.py::test_peer_uid_mismatch_is_rejected` `:723`) and was rejected live on 2026-09-29, but uid 0 cannot tell the mismatch rule from the uid-0 clause (§6). A real-socket **non-root** foreign peer was rejected on Linux on 2026-10-16 (uid 1008 against a uid-1002 owner; #3097; §6). |
+| **Cross-uid rejection control** (§6) | **Measured on both platforms.** Linux: real socket, non-root foreign peer, rejected, 2026-10-16. Darwin: real socket, non-root foreign peer, rejected twice, 2026-10-17 (peer side #3097 comment 6227179714; owner side and control comment 6227186043). The mismatch rule is also unit-tested on both arms with a manufactured non-root credential (`tests/test_engramd_owner_displacement_3240.py::test_snapshot_dest_rights_premise_peer_uid_equals_owner`; `tests/test_engramd_owner_darwin_3666.py::test_peercred_uid_mismatch_is_rejected_peer_identity` `:427`). Limits on the Darwin result: one pair of accounts, one macOS version, one machine, loopback, a throwaway owner (§6). |
+| **The 37 unclassifiable census sites** (§3.2) | **No longer the gate.** The scanner walks the declared roots and fails the build on any reached site it cannot classify. `tools/engramd_read_scan.config.json` holds 612 roots and 2 exclusions (counted with `json.load` in this pass). A site that no root reaches is not classified, by design (see the Known holes above). The 37 is the historical P17 count at dev `5001800654bc` (§1). The census was not re-run, and the 37 sites were not classified one by one. |
 | Row-level / per-caller result scoping | Out of scope, named in §3.5 so it is not read as covered. |
 | Supervision per platform | Already Kepler's, already open in the parent §7. Untouched here. |
 
 ## 8. What is NOT done
+
+*(As-built note, 2026-10-31.)* This list was written at design time. Only the budgets bullet was
+re-audited in the as-built pass. The others are design-time text: code now exists (U4a to U4d and the
+units after them), and the scanner of the third bullet is built (`tools/engramd_read_scan.py`). The
+A6 session-start cells (#3735) measure a whole hook fire, not the registry lookup of the second bullet.
 
 - No code. This is the design; U4 is the build.
 - No measurement of the registry's cost on the hook path. §6.1's A6 criterion applies to the first
@@ -1092,13 +1212,26 @@ important thing the review produced.
 - The build-time scanner is specified as an obligation (§3.3) and not designed. It has the same shape
   as #3095's call-path walk and should reuse it rather than grow a second instrument with its own
   blind spots — and #3095's walk is also what could classify §3.2's 37 unclassifiable sites.
-- **Three budgets have no number** — the `progress_handler` deadline, `SQLITE_LIMIT_LENGTH`, and the
-  end-to-end request deadline (including its per-method variant for `snapshot`). Each needs measuring
-  against real reads and real frames, not choosing.
+- **Budgets: numbered in code; one is chosen, not measured.** *(As-built, 2026-10-31; this bullet said
+  "three budgets have no number".)* `SQLITE_LIMIT_LENGTH` is 2,000,000 (measured against a real store),
+  the `progress_handler` stops against the request deadline (its tick is 1000 VM instructions, measured),
+  and the end-to-end request deadline is 5.0 s, with 30.0 s for `snapshot`. The 30 s figure carries a
+  measured backup time. The 5.0 s default is **chosen**, with a known upper bound on one request
+  (whole-fire p99 109.7 ms) and **no per-request distribution measured**. Numbers and pointers: §7,
+  "Budgets".
 
 ## 9. What changed, revision by revision, and who found it
 
 Recorded because a reader should be able to see which parts survived attack.
+
+### Follow-up — §7 to as-built, and the authorizer swallow sweep (Aleph, #3097)
+
+| § | change | found by |
+|---|---|---|
+| §7, §8 | **Every §7 row re-read against dev `b7f963f3` and rewritten to what is true there, with a pointer.** The FTS5 blocker is DECIDED (deny, by the registry's R5). The connection and `snapshot()` rows are built, the parent's "only open handle" wording is gone (`4bf1f164`), the four budgets are numbered (the 5.0 s default is **chosen, not measured**; whole-fire p99 109.7 ms bounds one request from above, no per-request distribution measured), the 37 census sites are no longer the gate (the scanner fails closed over 612 declared roots), and tier 2 is still deferred. §8's "three budgets have no number" bullet now says so. | Aleph (audit, #3097 comment 6544409645) found the five stale rows; Borges (ruling, comment 6544421809) set the 5.0 s wording and kept the sweep in this pass |
+| §6, §7 | **The Darwin real-socket cross-uid control is recorded as run.** Rejected twice on 2026-10-17 (#3097 comments 6227179714 and 6227186043). Every "not run" / "unrun" for the Darwin arm in §6 and §7 is fixed. | Aleph (audit); Clio and Aleph (the run) |
+| §3.7 (new), §7 | **The authorizer swallow sweep.** What `_client_read_authorizer` denies; how a denial travels to the client (`DatabaseError` "not authorized" to `Rejected(read_failed)`, never an empty row set); every caller of the client-read path, enumerated with the grep commands and counts, one row each. No caller silently turns a denial into an empty or default answer. One residual is named: three hooks degrade the failing site and show a notice at most once per 1800 s (§3.7.5). A gap is named too: no committed test feeds an authorizer DENY through `_run_client_read`. | Aleph (audit: no evidence of the sweep was found); Borges (ruling: the sweep stays in this issue) |
+| §3.1, §3.5 | One-line as-built notes after the parent-wording paragraph, the allowlist paragraph and the FTS5 "still open" paragraph, so those passages are not read as current. Their text is unchanged. | Aleph |
 
 ### Follow-up — Darwin arm build notes (Aleph, #3666)
 
