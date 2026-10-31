@@ -57,7 +57,11 @@ menu or settings `pluginConfigs`): `enabled`, `topK` (1..20), `minQueryChars` (o
 rather than guess a path). An invalid value logs a line and falls back to the default
 for that key only.
 
-The thinking / narration / tool-argument comparison runs with `arms=thinking_full,narration_full,tool_input`.
+The thinking / narration / tool-argument comparison runs with `arms=thinking_full,narration_full,tool_input` and
+`maxRatingChars=2400`: with three arms the default 1200 already drops the node summaries from the rating request
+(a 1-step, 5-ids-per-arm request is 1439 characters with summaries (a fixture figure: synthetic summaries of 14 words clipped to 8 words and
+8-character ids; real summaries differ)), and a rater who sees bare ids cannot judge them.
+The default stays 1200; the pilot only sets the existing option on every pilot seat.
 `thinking_full` reads the step's thinking only and is skipped `no-thinking` when it is blank (it never falls back to
 the answer text); `narration_full` reads the answer text only, skipped `no-narration` when blank and `terminal` on a
 step with no tool call. Every text-keyed arm result records `source` (`thinking` or `visible`), and
@@ -81,11 +85,51 @@ python3 probe_eval.py --golden <dir>/golden --test <dir>/test \
 ```
 
 `convert_ratings.py` writes one test RRU per (step, arm), one golden per rated step
-(relevance 2 = `good`, 0 = `noise`, 1 = surfaced but unmarked; a rated id no arm
+(relevance 2 = `good`, 0 = `noise`, 0 = `in_context`, 1 = surfaced but unmarked; a rated id no arm
 surfaced is kept with `notes: "unsurfaced"` so recall@k sees the miss), and the
 unblinded pair verdicts. It prints a completeness summary and exits non-zero rather
 than drop a step silently. `probe_eval.py` reuses `tools/recall_harness` (metrics,
 golden loader, RRU dataclasses) unchanged and prints one row per arm.
+
+Both reports print one `WARNING: arm <arm> mixes querySource ...` line when a PROXY arm (`thinking_full`,
+`thinking_tail`, `extract_model`, `novel_terms`, `narration_full`) has scored units (golden present, status ok) with more than one
+distinct `querySource`: its single row then pools scores of different query materials, so group by `querySource`
+before comparing. A unit with no `querySource` (route units) is ignored. Mixed sources among skipped, errored or unrated units are not
+reported: those units contribute no score. `tool_input` never warns: its material
+is the tool arguments whatever `querySource` says. The fleet report prints the lines under section 2, per
+input (`[seat:date]`) and then pooled (`[pooled]`). The pilot arms `thinking_full` (no fallback) and `narration_full` (answer text only) cannot mix by construction;
+`thinking_tail`, `extract_model` and `novel_terms` carry the step's `querySource`, which `auto` resolves per step,
+so they can mix, and the warning then fires correctly.
+A report with no mixed proxy arm is byte-identical to one without the warning.
+
+## The rater's `in_context` mark
+
+The rate tool takes three exclusive marks per shown id: `good` (worth reading at that
+step), `noise` (would have cost attention) and `in_context` ("already in my context
+window when it was shown; would not have helped whatever its relevance"); an id left
+out is neutral. An id in two of the three lists is refused by the tool naming the field
+path of the second occurrence, and by the converter naming turn, step, ids and the two
+lists; the same id twice in ONE list is accepted as before. **Name collision, in one
+sentence:** `in_context` here is the RATER's mark written to the ratings file, whereas
+`inContext` (and the route ledger's `in_context` candidate signal) is the AUTOMATIC flag
+the mod sets from the conversation text, and `recompute_in_context.py` writes a sidecar
+for that automatic flag only; the two are independent and neither reads the other.
+
+Every NEW ratings file carries an `in_context` array in each step (`[]` when none); the
+key's presence is how the converter knows the label was offered. A ratings step without
+the key converts to the same golden as before. For a step that has the key, the golden's
+`context` also holds `inContextIds` (sorted) and `labelsOffered: true`. `probe_eval.py`
+treats an `in_context` id as grade 0, so it never counts as good in p@5, and reports per
+arm the share of SHOWN ids marked `in_context`, pooled over the steps whose golden offered
+the label (n = shown ids). A step without `labelsOffered` is excluded, and an arm with no
+such step, or no shown id, reads `—`, never 0. When a unit has no `shownIds` (the step was left out of the rating request, or was rated from
+the files), the share falls back to the arm's ranked ids as the denominator, which biases it downward whenever steps
+are omitted; read the n. The report prints this table only when some
+golden offers the label, so a report over older goldens is byte-identical; the fleet report
+adds section 7 under the same condition. The request length is still capped by
+`maxRatingChars`; the new legend costs about 127 characters (default cap 1200, the pilot's
+three arms, 1 step, 5 ids per arm: 547 characters before, 674 after, ids kept, summaries
+already dropped at that size).
 
 ## Things to know before you read the numbers
 

@@ -248,6 +248,12 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
     if in_context_sidecar is not None:
         sidecar_index = _load_sidecar(in_context_sidecar, {a[len(_ROUTE_PREFIX):] for a in by_arm
                                                            if a.startswith(_ROUTE_PREFIX)})
+    # the rater's `in_context` mark (NOT the automatic inContext flag above): {query_id: the ids marked}
+    # for the goldens whose ratings step OFFERED the label; an older golden is absent here, so it is
+    # excluded from the share, never counted as 0.
+    marked_ids = {qid: set(g.metadata["context"].get("inContextIds") or [])
+                  for qid, g in goldens.items()
+                  if isinstance(g.metadata.get("context"), dict) and g.metadata["context"].get("labelsOffered") is True}
     matched = unmatched = 0
     arms: dict[str, dict] = {}
     for arm in sorted(set(by_arm) | set(excluded_status)):
@@ -265,6 +271,15 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
         unshown = sum(1 for qid, i in all_ids if unshown_ids.get(qid) and i in unshown_ids[qid])
         flag = lambda key: (sum(1 for n in topk if (n.signals or {}).get(key)) / len(topk)) if topk else None  # noqa: E731
         per_step = [_top_flags(r, sidecar_index) for r in rrus]
+        label_shown = label_marked = label_steps = 0
+        for r in rrus:
+            if r.query_id not in marked_ids:
+                continue
+            shown = r.metadata.get("shownIds")
+            seen = [n.id for n in r.ranked_nodes] if shown is None else list(shown)  # no shown-list: the rater saw all
+            label_steps += 1
+            label_shown += len(seen)
+            label_marked += sum(1 for i in seen if i in marked_ids[r.query_id])
         known = [f for flags, _ in per_step for f in flags if f is not None]
         matched += sum(1 for _, m in per_step if m is True)
         unmatched += sum(1 for _, m in per_step if m is False)
@@ -283,9 +298,14 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
             "by_query_source": dict(sorted(Counter(
                 str(r.metadata.get("querySource")) for r in rrus).items())),
             "unshown_rate": (unshown / len(all_ids)) if all_ids else None,
+            "proxy_sources": dict(sorted(Counter(
+                str(r.metadata["querySource"]) for r in rrus if r.metadata.get("querySource") is not None).items())),
             "in_context_rate": (sum(known) / len(known)) if known else None,
             "in_context_n": sum(1 for flags, _ in per_step if any(f is not None for f in flags)),
             "principle_rate": flag("principle"),
+            "rater_in_context_share": (label_marked / label_shown) if label_shown else None,
+            "rater_in_context_n": label_shown,
+            "rater_in_context_steps": label_steps,  # label-offering steps behind the share; the thin-evidence gate counts these
         }
 
     pairs: dict[tuple[str, str], dict[str, int]] = {}
@@ -310,6 +330,7 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
 
     return {"shown_only": shown_only, "arms": arms, "pairs": pairs, "misses": misses, "unrated": unrated,
             "n_goldens": len(goldens), "n_test_rrus": len(test_rrus),
+            "labels_offered": bool(marked_ids),
             "steps_skipped_by_reason": _skipped_by_reason(test_dir),
             "in_context_source": "hook" if sidecar_index is None else "offline sidecar",
             "sidecar_matched": matched, "sidecar_unmatched": unmatched}
@@ -518,6 +539,9 @@ def render_report(result: dict) -> str:
             f"{_fmt(s['median_ms'], '.0f')} | {_fmt(s['p90_ms'], '.0f')} | "
             f"{_fmt(s['median_ms_over_step'])} | {_fmt(s['unshown_rate'])} | {', '.join(f'{k}: {v}' for k, v in s['by_query_source'].items()) or '-'} | {_fmt(s['in_context_rate'])} | "
             f"{_fmt(s['principle_rate'])} |")
+    warned = mixed_source_warnings({arm: s["proxy_sources"] for arm, s in result["arms"].items()})
+    if warned:
+        lines += [""] + warned
     lines += ["", "Latency excluded (value absent): " + (", ".join(
         f"{arm}: ms {s['ms_excluded']}, msOverStep {s['ms_over_step_excluded']}"
         for arm, s in result["arms"].items()) or "none"),
@@ -538,7 +562,42 @@ def render_report(result: dict) -> str:
         lines.append("none")
     lines += ["", "## Unrated steps (no golden; not scored)", ""]
     lines += [f"- {qid}" for qid in result["unrated"]] or ["none"]
+    if result.get("labels_offered"):
+        lines += ["", "## Rater in_context share (shown ids the rater marked in_context; not the automatic inContext flag)", "",
+                  "Pooled over the rated steps whose ratings offered the label; a step rated before the label existed "
+                  "is excluded, and `—` means no such step or no shown id.", "",
+                  "| arm | in_context share | n shown ids |", "|---|---|---|"]
+        lines += [f"| {arm} | {_share(s['rater_in_context_share'])} | {s['rater_in_context_n']} |"
+                  for arm, s in result["arms"].items()]
     return "\n".join(lines) + "\n"
+
+
+def _share(value) -> str:
+    return "—" if value is None else format(value, ".3f")
+
+
+# The arms whose query is a PROXY for the step's material: the same arm name can be keyed on thinking
+# on one seat and on the answer text on another, so a pooled score may mix two query materials.
+# `tool_input` is deliberately absent (its material is the tool arguments whatever querySource says),
+# and so is every route arm. New data cannot mix by construction; the warning is for old inputs.
+PROXY_ARMS = ("thinking_full", "thinking_tail", "extract_model", "novel_terms", "narration_full")
+
+
+def mixed_source_warnings(sources_by_arm: dict, prefix: str = "") -> list[str]:
+    """One WARNING line per proxy arm whose units carry more than one distinct non-null querySource.
+
+    sources_by_arm: {arm: {querySource: unit count}} with None / absent sources already left out.
+    Arms come in sorted order, sources alphabetically, with a final " and " before the last one."""
+    out = []
+    for arm in sorted(sources_by_arm):
+        counts = sources_by_arm[arm]
+        if arm not in PROXY_ARMS or len(counts) < 2:
+            continue
+        parts = [f"{src} ({counts[src]})" for src in sorted(counts)]
+        joined = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+        out.append(f"{prefix}WARNING: arm {arm} mixes querySource {joined}: its scores pool different query "
+                   "materials; group by querySource before comparing.")
+    return out
 
 
 def _write_private(path: Path, text: str) -> None:

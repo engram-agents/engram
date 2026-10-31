@@ -47,7 +47,12 @@ from pathlib import Path
 
 # good -> 2, noise -> 0, surfaced-but-unmarked -> 1. Module-level so the
 # contract test's control can swap a value and watch the mapping test go red.
-RELEVANCE = {"good": 2, "noise": 0, "neutral": 1}
+# in_context is the RATER's exclusive mark "already in my context window when it was shown;
+# would not have helped whatever its relevance" -> 0, like noise. It is NOT the automatic
+# candidate flag `inContext` the mod's step.ts sets from the conversation text.
+RELEVANCE = {"good": 2, "noise": 0, "in_context": 0, "neutral": 1}
+# The three rating lists, in the order a duplicate is looked for (one mark per id).
+MARK_LISTS = ("good", "noise", "in_context")
 
 VERDICTS = ("better", "same", "worse")
 
@@ -320,9 +325,13 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
             _die(f"convert_ratings: turn {turn} has a rating (step {index}) but no "
                  f"requests/{turn}.json; a rated turn must have its request")
         good, noise = list(entry.get("good") or []), list(entry.get("noise") or [])
-        both = sorted(set(good) & set(noise))
-        if both:
-            _die(f"convert_ratings: turn {turn} step {index} rates {both} as both good and noise")
+        in_context = list(entry.get("in_context") or [])
+        by_list = {"good": good, "noise": noise, "in_context": in_context}
+        for i, first in enumerate(MARK_LISTS):
+            for second in MARK_LISTS[i + 1:]:
+                both = sorted(set(by_list[first]) & set(by_list[second]))
+                if both:
+                    _die(f"convert_ratings: turn {turn} step {index} rates {both} as both {first} and {second}")
         blind = step.get("armBlind") or {}
         for letter, verdict in (entry.get("pair") or {}).items():
             if letter not in blind:
@@ -342,7 +351,10 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
                      f"letter {other!r} in armBlind, which has {sorted(blind)}")
             pairs_rows.append({"turnId": turn, "index": index, "armA": blind[letter],
                                "armB": blind[other], "verdict": verdict})
-        rated_with_arms[(turn, index)] = {"good": good, "noise": noise}
+        marks = {"good": good, "noise": noise}
+        if "in_context" in entry:  # the key's presence = the label was offered in the request
+            marks["in_context"] = in_context
+        rated_with_arms[(turn, index)] = marks
 
     steps_with_arms = {k: s for k, s in steps.items() if has_arms(s)}
     scored = {k: s for k, s in steps.items() if has_arms(s) or k in route_steps}
@@ -450,20 +462,24 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
         # nothing is marked.
         shown_ids = (None if not isinstance(shown_by_letter, dict)
                      else {i for ids in shown_by_letter.values() for i in ids})
-        extra = [i for i in marks["good"] + marks["noise"] if i not in surfaced]
+        in_context_ids = marks.get("in_context", [])
+        extra = [i for i in marks["good"] + marks["noise"] + in_context_ids if i not in surfaced]
         rows = []
         for node_id in surfaced + extra:
             if node_id in marks["good"]:
                 rel = RELEVANCE["good"]
             elif node_id in marks["noise"]:
                 rel = RELEVANCE["noise"]
+            elif node_id in in_context_ids:
+                rel = RELEVANCE["in_context"]
             else:
                 rel = RELEVANCE["neutral"]
             row = {"id": node_id, "grading": {"relevance": rel}}
             if node_id in extra:
                 row["notes"] = "unsurfaced"
             elif (shown_ids is not None and node_id not in shown_ids
-                  and node_id not in marks["good"] and node_id not in marks["noise"]):
+                  and node_id not in marks["good"] and node_id not in marks["noise"]
+                  and node_id not in in_context_ids):
                 # surfaced but never shown and never rated: unrated, not neutral.
                 # relevance stays 1 so harness semantics are unchanged by default.
                 row["notes"] = "unshown"
@@ -479,6 +495,10 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
             "context": {"turnId": turn, "shown": (requests.get(turn) or {}).get("shown", {}).get(str(index))},
             "ranked_candidates": rows,
         }
+        if "in_context" in marks:
+            # the golden loader keeps `context` as metadata["context"]; probe_eval reads the label from there
+            golden["context"]["inContextIds"] = sorted(set(in_context_ids))
+            golden["context"]["labelsOffered"] = True
         _write_private(out / "golden" / f"q_{qid}.json", json.dumps(golden))
         goldens_written += 1
 

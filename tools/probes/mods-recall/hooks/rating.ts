@@ -29,6 +29,13 @@ export const RATE_TOOL = 'mcp__engram-probe__rate'
 export const NODE_ID = /^[a-z]{2}_\d{4,}$/
 const VERDICTS = ['better', 'same', 'worse'] as const
 
+/**
+ * The rater's wording for the exclusive `in_context` mark. NOT the automatic candidate flag
+ * `inContext` (step.ts annotateCandidates, from a regex over the conversation): this is the
+ * rater's own mark, written to the ratings file.
+ */
+export const IN_CONTEXT_WORDING = 'already in my context window when it was shown; would not have helped whatever its relevance'
+
 /** How long turn.complete waits for the last step's arms (inside the 10 s hook budget). */
 export const WAIT_PENDING_MS = 5000
 
@@ -81,8 +88,8 @@ export function buildRequest(args: {
   const newestFirst = [...args.digests].sort((a, b) => b.index - a.index)
   const head = [
     `${REQUEST_MARKER}${turnId.slice(0, 8)}] Rate what thinking-recall surfaced this turn — one call:`,
-    `${RATE_TOOL}({"turnId":"${turnId}","steps":[{"index":N,"good":[ids],"noise":[ids],"pair":{"A":"better|same|worse"}}]})`,
-    'good = worth reading at that step · noise = would have cost attention · unmarked = neutral · pair: optional, compare A vs B',
+    `${RATE_TOOL}({"turnId":"${turnId}","steps":[{"index":N,"good":[ids],"noise":[ids],"in_context":[ids],"pair":{"A":"better|same|worse"}}]})`,
+    `good = worth reading at that step · noise = would have cost attention · in_context = ${IN_CONTEXT_WORDING} · unmarked = neutral · pair: optional, compare A vs B`,
   ]
   const render = (n: number, level: (shownCount: number) => Level) => {
     const chosen = newestFirst.slice(0, n)
@@ -330,7 +337,7 @@ export function turnCompleteHook(probe: Probe) {
 
 export const RATE_DESCRIPTION =
   'Rate what the engram-probe recall arms surfaced, in ONE call, when a "[engram-probe · turn …]" request appears. ' +
-  'For each step: good = node ids worth reading at that step; noise = ids that would have cost attention; ids you leave out are neutral. ' +
+  'For each step: good = node ids worth reading at that step; noise = ids that would have cost attention; in_context = ids ' + IN_CONTEXT_WORDING + '; an id takes at most one of the three marks; ids you leave out are neutral. ' +
   'Optional pair: pair {"A": "better"} compares A against B (verdicts better, same, worse); only A or B. ' +
   'An id is two lowercase letters, an underscore and 4+ digits, as listed in the request. Answer once per turn; never call it otherwise.'
 
@@ -346,6 +353,7 @@ export const RATE_SCHEMA = {
           index: { type: 'integer' },
           good: { type: 'array', items: { type: 'string' }, default: [] },
           noise: { type: 'array', items: { type: 'string' }, default: [] },
+          in_context: { type: 'array', items: { type: 'string' }, default: [] },
           pair: {
             type: 'object',
             properties: {
@@ -366,6 +374,7 @@ export type RatedStep = {
   index: number
   good: string[]
   noise: string[]
+  in_context: string[]
   pair?: Record<string, 'better' | 'same' | 'worse'>
 }
 
@@ -407,7 +416,20 @@ export function parseRating(input: Record<string, unknown>): RateParse {
     if (!Array.isArray(good)) return good
     const noise = idList(s.noise, `${at}.noise`)
     if (!Array.isArray(noise)) return noise
-    const step: RatedStep = { index: s.index, good, noise }
+    const inContext = idList(s.in_context, `${at}.in_context`)
+    if (!Array.isArray(inContext)) return inContext
+    // EXCLUSIVE: one mark per id. The error names the field path of the SECOND occurrence (later list wins).
+    const marked: [string, string[]][] = [['good', good], ['noise', noise], ['in_context', inContext]]
+    for (let k = 1; k < marked.length; k++) {
+      const [name, ids] = marked[k]!
+      for (let j = 0; j < ids.length; j++) {
+        const earlier = marked.slice(0, k).find(([, list]) => list.includes(ids[j]!))
+        if (earlier !== undefined) {
+          return bad(`${at}.${name}[${j}]`, `${JSON.stringify(ids[j])} is also in ${earlier[0]} (an id takes one mark: good, noise or in_context)`)
+        }
+      }
+    }
+    const step: RatedStep = { index: s.index, good, noise, in_context: inContext }
     if (s.pair !== undefined) {
       if (s.pair === null || typeof s.pair !== 'object' || Array.isArray(s.pair)) {
         return bad(`${at}.pair`, 'must be an object like {"A":"better"}')

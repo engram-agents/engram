@@ -17,7 +17,8 @@ named in a "best arm" line; (2) the querySource split per arm and column;
 (3) the route signal sweep, per route two tables with their populations named: 3a pooled
 over EVERY input, 3b pooled over the inputs with no null similarity (excluded inputs and null
 rows counted, never dropped silently); the sweep never runs --shown-only;
-(4) pair verdicts pooled; (5) caveats rendered from each input's own data.
+(4) pair verdicts pooled; (5) caveats rendered from each input's own data; (6) the automatic inContext rate,
+only when some flag is known; (7) the rater's `in_context` share per arm, only when some input offered the label.
 
 Output is deterministic: columns sort by (date, seat), rows by arm name, so the
 same inputs in any CLI order give the same bytes.
@@ -187,6 +188,20 @@ def _query_source_cell(s) -> str:
     return ", ".join(f"{'none' if k == 'None' else k}: {v}" for k, v in s["by_query_source"].items())
 
 
+def _mixed_source_lines(inputs) -> list[str]:
+    """The mixed-querySource warnings (probe_eval's wording): per input in input order, each led by its
+    `[seat:date] `, then pooled over all inputs, led by `[pooled] `. Proxy arms only (see probe_eval)."""
+    lines, pooled = [], {}
+    for x in inputs:
+        per_arm = {arm: s["proxy_sources"] for arm, s in x["result"]["arms"].items()}
+        lines += _PE.mixed_source_warnings(per_arm, prefix=f"[{x['col']}] ")
+        for arm, counts in per_arm.items():
+            into = pooled.setdefault(arm, {})
+            for src, n in counts.items():
+                into[src] = into.get(src, 0) + n
+    return lines + _PE.mixed_source_warnings(pooled, prefix="[pooled] ")
+
+
 def _route_nulls(rows) -> int:
     """Null-similarity candidates an input's route recorded. probe_eval reports 0 on its as-recorded row
     by its own semantics, so the count is read off the floor rows (identical on every floor)."""
@@ -265,6 +280,9 @@ def render(inputs: list[dict], shown_only: bool) -> str:
 
     lines += ["", "## 2. querySource split (steps per arm; the day-2 numbers differ by seat because of it)", ""]
     lines += _table(inputs, arms, lambda s: _query_source_cell(s))
+    warned = _mixed_source_lines(inputs)
+    if warned:
+        lines += [""] + warned
 
     lines += ["", "## 3. Signal sweep (route arms; p@5 pooled over inputs, two populations per route)", "",
               "The sweep scores the full recorded candidates; it never runs with --shown-only, "
@@ -335,7 +353,33 @@ def render(inputs: list[dict], shown_only: bool) -> str:
             else "ledger/hook value for route rows · inContext for arm rows"))
     if has_known_in_context(inputs):
         lines += _render_in_context(inputs, arms)
+    if any(x["result"].get("labels_offered") for x in inputs):
+        lines += _render_rater_share(inputs, arms)
     return "\n".join(lines) + "\n"
+
+
+def _render_rater_share(inputs, arms) -> list[str]:
+    """The rater's exclusive `in_context` mark (NOT section 6's automatic inContext flag), present only when
+    some input offered the label. An input whose goldens never offered it reads the em dash, never 0."""
+    def cell(s):
+        if s is None:
+            return "-"
+        if s["rater_in_context_share"] is None:
+            return "—"
+        # thin evidence is counted in STEPS (as MIN_N is everywhere else), not in shown ids: about 5 ids per arm
+        # per step would make a cell look plain at two steps
+        text = _num(s["rater_in_context_share"], ".3f")
+        n = f"{s['rater_in_context_n']} ids, {s['rater_in_context_steps']} steps"
+        return f"({text}) ({n})" if s["rater_in_context_steps"] < MIN_N else f"{text} ({n})"
+
+    lines = ["", "## 7. in_context share per arm per seat:date (cell = share (n shown ids, n steps))", "",
+             "The rater's own `in_context` mark (\"already in my context window when it was shown; would not have "
+             "helped whatever its relevance\"): shown ids marked in_context over shown ids, pooled over the steps "
+             f"whose ratings offered the label. A cell over fewer than {MIN_N} steps shows its value in parentheses too. "
+             "`—` = no step offered the label, or no id was shown; `-` = the input has no such arm. "
+             "This is not section 6's automatic inContext flag.", ""]
+    lines += _table(inputs, arms, cell)
+    return lines
 
 
 def has_known_in_context(inputs) -> bool:

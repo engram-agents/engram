@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { REQUEST_MARKER, buildRequest, parseRating } from './rating.ts'
+import { RATE_DESCRIPTION, RATE_SCHEMA, REQUEST_MARKER, buildRequest, parseRating } from './rating.ts'
 import {
   COMPLETE,
   LONG_THINKING,
@@ -8,6 +8,7 @@ import {
   OB,
   appended,
   blankStepChunks,
+  candidateRow,
   PROBE_ROOT,
   START,
   TURN,
@@ -15,6 +16,7 @@ import {
   drain,
   engineStep,
   flush,
+  nid,
   rig,
   stepFile,
 } from './kit.ts'
@@ -202,7 +204,7 @@ test('T6 rate: a valid call writes one ratings file and answers rated 1 step(s)'
   expect(file.turnId).toBe(TURN)
   expect(file.sessionId).toBe('sess-1')
   expect(file.ratedBy).toBe('test-model')
-  expect(file.steps).toEqual(GOOD.steps)
+  expect(file.steps).toEqual([{ ...GOOD.steps[0], in_context: [] }]) // the in_context key is always written (an old call without it gets [])
   expect(file.unknownSteps).toBeUndefined()
 })
 
@@ -281,7 +283,7 @@ test('T7b a rate handler that throws is caught: the call falls through to the en
 
 test('parseRating accepts the documented shape and normalises defaults', async () => {
   const parsed = parseRating({ turnId: TURN, steps: [{ index: 2 }] })
-  expect(parsed).toEqual({ ok: true, turnId: TURN, steps: [{ index: 2, good: [], noise: [] }] })
+  expect(parsed).toEqual({ ok: true, turnId: TURN, steps: [{ index: 2, good: [], noise: [], in_context: [] }] })
 })
 
 test('buildRequest leads with REQUEST_MARKER (step.ts skips rows containing it)', async () => {
@@ -371,4 +373,170 @@ test('B9 pilot arms: the request lists letters for exactly those three arms, and
   const row = stepFile(seen, TURN, 0)!
   expect(Object.keys(row.armBlind).sort()).toEqual(['A', 'B', 'C'])
   expect([...Object.values(row.armBlind)].sort()).toEqual(['narration_full', 'thinking_full', 'tool_input'])
+})
+
+// ------------------------------------------------------------------ the in_context mark (rater label)
+// NOT the automatic candidate flag `inContext` (step.ts annotateCandidates): this is a RATER's mark.
+
+const RATER_WORDING = 'already in my context window when it was shown; would not have helped whatever its relevance'
+const AA = nid('ob', 4101)
+const BB = nid('ob', 4102)
+const CC = nid('ob', 4103)
+
+test('label C1 parse: in_context is accepted, defaults to [], an old call parses unchanged, malformed shapes name the field path', async () => {
+  const withMark = parseRating({ turnId: TURN, steps: [{ index: 1, good: [AA], noise: [BB], in_context: [CC] }] })
+  expect(withMark).toEqual({ ok: true, turnId: TURN, steps: [{ index: 1, good: [AA], noise: [BB], in_context: [CC] }] })
+  // defaults to []
+  const without = parseRating({ turnId: TURN, steps: [{ index: 1, good: [AA], noise: [BB] }] })
+  expect(without).toEqual({ ok: true, turnId: TURN, steps: [{ index: 1, good: [AA], noise: [BB], in_context: [] }] })
+  // an old call (with a pair) parses exactly as before: same good, noise and pair, plus the empty list
+  const old = parseRating({ turnId: TURN, steps: [{ index: 0, good: [OB], noise: [LX], pair: { A: 'better' } }] }) as any
+  expect(old.steps[0].good).toEqual([OB])
+  expect(old.steps[0].noise).toEqual([LX])
+  expect(old.steps[0].pair).toEqual({ A: 'better' })
+  expect(Object.keys(old.steps[0]).sort()).toEqual(['good', 'in_context', 'index', 'noise', 'pair'])
+  const bad: [unknown, string][] = [
+    ['not-an-array', 'steps[0].in_context'],
+    [{ 0: AA }, 'steps[0].in_context'],
+    [[5], 'steps[0].in_context[0]'],
+    [[AA, 7], 'steps[0].in_context[1]'],
+    [['not-an-id'], 'steps[0].in_context[0]'],
+  ]
+  for (const [value, field] of bad) {
+    const parsed = parseRating({ turnId: TURN, steps: [{ index: 0, in_context: value }] }) as any
+    expect(parsed.ok).toBe(false)
+    expect(parsed.field).toBe(field)
+  }
+})
+
+test('label C2 exclusive: an id in two or more of good / noise / in_context is denied naming the path and the id, writing nothing', async ($, on) => {
+  const { seen } = await oneStep($, on)
+  const before = seen.writes.size
+  const cases: [Record<string, unknown>, string][] = [
+    [{ good: [AA], in_context: [AA] }, 'steps[0].in_context[0]'],
+    [{ noise: [AA], in_context: [BB, AA] }, 'steps[0].in_context[1]'],
+    [{ good: [AA], noise: [AA] }, 'steps[0].noise[0]'],
+    [{ good: [AA], noise: [AA], in_context: [AA] }, 'steps[0].noise[0]'], // all three: the first second-occurrence wins
+  ]
+  for (const [marks, field] of cases) {
+    const parsed = parseRating({ turnId: TURN, steps: [{ index: 0, ...marks }] }) as any
+    expect(parsed.ok).toBe(false)
+    expect(parsed.field).toBe(field)
+    expect(parsed.why).toContain(AA)
+    const res = await callRate($, { turnId: TURN, steps: [{ index: 0, ...marks }] })
+    expect(typeof res.deny).toBe('string')
+    expect(res.deny).toContain(field)
+    expect(res.deny).toContain(AA)
+  }
+  // a second step is named by its own index
+  const second = await callRate($, { turnId: TURN, steps: [{ index: 0, good: [AA] }, { index: 1, noise: [BB], in_context: [BB] }] })
+  expect(second.deny).toContain('steps[1].in_context[0]')
+  expect(seen.writes.size).toBe(before) // nothing written, not even for the valid first step
+})
+
+test('label C2b the same id twice in ONE list is still accepted (today unchanged) and written as given', async ($, on) => {
+  const { seen } = await oneStep($, on)
+  const res = await callRate($, { turnId: TURN, steps: [{ index: 0, in_context: [AA, AA] }] })
+  expect(res.deny).toBeUndefined()
+  const path = [...seen.writes.keys()].find(k => k.includes('/ratings/'))!
+  expect(JSON.parse(seen.writes.get(path)!).steps[0].in_context).toEqual([AA, AA])
+})
+
+test('label C3 schema: RATE_SCHEMA carries in_context with the same shape as good, and the description says what it means', async () => {
+  const props = (RATE_SCHEMA as any).properties.steps.items.properties
+  expect(props.in_context).toEqual(props.good)
+  expect(props.in_context).toEqual({ type: 'array', items: { type: 'string' }, default: [] })
+  expect((RATE_SCHEMA as any).properties.steps.items.required).toEqual(['index'])
+  expect(RATE_DESCRIPTION).toContain('in_context')
+  expect(RATE_DESCRIPTION).toContain(RATER_WORDING)
+})
+
+test('label C4 request: shows the in_context call shape and the rater wording, leads with the marker, ends with the empty marker, never exceeds the cap', async () => {
+  const letters = ['A', 'B', 'C', 'D', 'E']
+  const built = buildRequest({ turnId: TURN, digests: [digest(3, 1)], letters, topK: 5, maxChars: 1200, dir: PROBE_ROOT })
+  expect(built.text).toContain('"in_context":[ids]')
+  expect(built.text).toContain(`in_context = ${RATER_WORDING}`)
+  expect(built.text).toContain('good = worth reading at that step · noise = would have cost attention')
+  expect(built.text).toContain('unmarked = neutral')
+  expect(built.text.startsWith(REQUEST_MARKER)).toBe(true)
+  expect(built.text.endsWith(`\n${EMPTY_ENGRAM_MARKER}`)).toBe(true)
+  for (const maxChars of [1200, 900, 700, 600, 450, 300, 120, 40]) {
+    for (const steps of [1, 2, 3, 8]) {
+      for (const perArm of [1, 3, 5]) {
+        const r = buildRequest({ turnId: TURN, digests: Array.from({ length: steps }, (_, i) => digest(i + 3, perArm)), letters, topK: 5, maxChars, dir: PROBE_ROOT })
+        expect(r.text.length <= maxChars).toBe(true)
+        expect(r.text.startsWith(REQUEST_MARKER)).toBe(true)
+        if (maxChars >= 700) expect(r.text).toContain(RATER_WORDING) // the legend survives while the cap leaves room for it
+        if (maxChars >= REQUEST_MARKER.length + EMPTY_ENGRAM_MARKER.length + 1) expect(r.text.endsWith(EMPTY_ENGRAM_MARKER)).toBe(true)
+      }
+    }
+  }
+})
+
+test('L5 pilot arms (3 letters), 1 step, 5 ids per arm, default cap 1200: every arm keeps all five ids and the request is not cut', async () => {
+  const built = buildRequest({ turnId: TURN, digests: [digest(3, 5)], letters: ['A', 'B', 'C'], topK: 5, maxChars: 1200, dir: PROBE_ROOT })
+  expect(built.text.length <= 1200).toBe(true)
+  expect(built.omittedSteps).toBe(0)
+  const d = digest(3, 5).byLetter
+  expect(built.shown['3']).toEqual({ A: d.A!.map(c => c.id), B: d.B!.map(c => c.id), C: d.C!.map(c => c.id) })
+  expect(built.text).toContain(RATER_WORDING)
+  expect(built.text.endsWith(`\n${EMPTY_ENGRAM_MARKER}`)).toBe(true)
+})
+
+test('label C5 tool: a valid call with in_context ids writes the ratings file with the key; a call without it writes []', async ($, on) => {
+  const { seen } = await oneStep($, on)
+  const res = await callRate($, { turnId: TURN, steps: [{ index: 0, good: [OB], in_context: [AA, BB] }] })
+  expect(res.deny).toBeUndefined()
+  expect(res.result).toBe(`rated 1 step(s) for turn ${TURN.slice(0, 8)}`) // the answer is as before
+  const files = [...seen.writes.keys()].filter(k => k.includes('/ratings/'))
+  expect(files.length).toBe(1)
+  expect(JSON.parse(seen.writes.get(files[0]!)!).steps).toEqual([{ index: 0, good: [OB], noise: [], in_context: [AA, BB] }])
+})
+
+test('label C5b tool: a call without in_context still writes the key, as an empty list', async ($, on) => {
+  const { seen } = await oneStep($, on)
+  const res = await callRate($, { turnId: TURN, steps: [{ index: 0, good: [OB] }, { index: 1 }] })
+  expect(res.deny).toBeUndefined()
+  const path = [...seen.writes.keys()].find(k => k.includes('/ratings/'))!
+  const steps = JSON.parse(seen.writes.get(path)!).steps
+  expect(steps.length).toBe(2)
+  for (const s of steps) expect(s.in_context).toEqual([])
+})
+
+// ------------------------------------------------------------------ L5b: the cap option reaches the request
+
+test('L5b precondition: with the default cap the natural request is longer than 300 characters (so the next cell is not vacuous)', async ($, on) => {
+  const { seen } = await oneStep($, on)
+  await $.turn.complete(COMPLETE)
+  expect(appended(seen)[0]!.content[0]!.text.length).toBeGreaterThan(300)
+})
+
+test('L5b the option maxRatingChars reaches the request: with 300 the appended row is at most 300 characters, led and ended by the markers', { options: { maxRatingChars: 300 } }, async ($, on) => {
+  const { seen } = await oneStep($, on)
+  await $.turn.complete(COMPLETE)
+  expect(appended(seen).length).toBe(1)
+  const text = appended(seen)[0]!.content[0]!.text
+  expect(text.length <= 300).toBe(true)
+  expect(text.startsWith(REQUEST_MARKER)).toBe(true)
+  expect(text.endsWith(EMPTY_ENGRAM_MARKER)).toBe(true)
+  expect(requestFile(seen)!.chars).toBe(text.length)
+})
+
+// ------------------------------------------------------------------ W6: the pilot's config line
+
+test('W6 pilot config: arms thinking_full,narration_full,tool_input with maxRatingChars 2400, one step, 5 ids per arm with summaries: the request keeps the node summaries, is longer than the default cap and at most 2400', { options: { arms: 'thinking_full,narration_full,tool_input', topK: 5, maxRatingChars: 2400 } }, async ($, on) => {
+  const ids = Array.from({ length: 5 }, (_, i) => nid('ob', 4400 + i))
+  const summary = Array.from({ length: 14 }, (_, i) => `w6word${i}`).join(' ')
+  const recall = (query: string) => ({ query, results: ids.map(id => candidateRow(id, { recall_summary: summary })) })
+  const { seen } = await oneStep($, on, { recall })
+  await $.turn.complete(COMPLETE)
+  expect(appended(seen).length).toBe(1)
+  const text = appended(seen)[0]!.content[0]!.text
+  for (const letter of ['A', 'B', 'C']) expect(text).toContain(`${letter}: `)
+  for (const id of ids) expect(text).toContain(id) // every id kept
+  expect(text).toContain('w6word0 w6word1') // the node summaries are kept, not cut to ids only
+  expect(text.length).toBeGreaterThan(1200) // it needed the larger cap: the default 1200 would have dropped the summaries
+  expect(text.length <= 2400).toBe(true)
+  expect(text.startsWith(REQUEST_MARKER)).toBe(true)
+  expect(text.endsWith(EMPTY_ENGRAM_MARKER)).toBe(true)
 })

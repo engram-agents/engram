@@ -32,7 +32,7 @@
     "querySource": {
       "type": "string",
       "title": "Query material",
-      "description": "thinking | visible (the proxy arms thinking_tail, extract_model and novel_terms use the answer text only; arm D keeps the tool arguments) | auto (thinking when long enough, else visible). thinking_full and narration_full ignore it: they always read the thinking and the answer text.",
+      "description": "thinking | visible (the proxy arms thinking_tail, extract_model and novel_terms use the answer text only; arm D keeps the tool arguments) | auto (thinking when long enough, else visible). thinking_full and narration_full ignore it: thinking_full always reads the thinking only, narration_full always reads the answer text only.",
       "default": "auto",
       "options": [
         "thinking",
