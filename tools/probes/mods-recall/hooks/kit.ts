@@ -29,6 +29,8 @@ export type RigOptions = {
   recall?: (query: string) => Promise<unknown> | unknown
   /** `$.fs.write` throws when set */
   failWrites?: boolean
+  /** the test's `session.append` hook refuses the row (`{ deny }`) when set; default: it relays the row and the engine keeps it. Either way the row is recorded in `seen.appends` */
+  appendRejects?: boolean
   /** extra rows `$.session.messages()` answers */
   messages?: { role: 'user' | 'assistant'; text: string; toolUses: never[] }[]
   /** `$.process.run` stdout; default: one novel term */
@@ -77,10 +79,17 @@ export function rig(on: On, options: RigOptions = {}) {
     completePrompts: [] as string[],
     processCalls: [] as { argv: readonly string[]; stdin?: string }[],
     registered: [] as unknown[],
+    /** every row a plugin's `$.session.append` delivered to the bottom hook, accepted or not */
+    appends: [] as AppendedRow[],
   }
 
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('turn.complete', async (_$, e) => ({ text: e.answer }))
+  on('session.append', async (_$, e, next) => {
+    seen.appends.push({ type: e.message.type, content: e.message.content as AppendedRow['content'] })
+    if (options.appendRejects) return { deny: 'append refused by the test' }
+    return next(e)
+  })
   on('session.id', async () => ({ value: SESSION }))
   on('session.model', async () => {
     // session.start also reads the model; only throw once the session is up
@@ -220,16 +229,21 @@ export async function flush(clock: { settle: () => Promise<void> }) {
 }
 
 /**
- * The kit has no conversation store beneath the hooks, and a plugin's own
- * `$.session.append` never reaches a test hook on that event, so an append in a
- * test REJECTS ("no implementation"). The probe logs every failed append, with
- * the row text, to the debug channel (one line per attempt); the test reads the
- * attempts back from there. The kit can therefore COUNT and READ the rows the
- * probe appends, but never see one succeed.
+ * The rows the probe appended to the conversation, whatever the kit does with
+ * them. `rig` registers a bottom `session.append` hook that records every row a
+ * plugin's `$.session.append` delivers (`seen.appends`), then accepts it, or
+ * answers `{ deny }` (a refused append) when the rig has `appendRejects`; a hook that throws is skipped by the kit and the row is kept, so no test can make the append throw. From Claude Code 2.1.311 the kit
+ * delivers the call to that hook, so the rows are read from there. A kit that
+ * never delivered it (the 2.1.289 kit, as the earlier cell comments recorded it; not re-run) made the append reject; the probe logs each
+ * failed append with the row text (`rating request append ...; row=<json>`),
+ * so with no recorded row the rows are read back from those log lines. The
+ * hook's record wins when present: a rejected row is both recorded and logged,
+ * and must count once. The function only reads, so two calls agree.
  */
 export type AppendedRow = { type: string; content: { type: string; text: string }[] }
 
-export function appended(seen: { logs: string[] }): AppendedRow[] {
+export function appended(seen: { logs: string[]; appends: AppendedRow[] }): AppendedRow[] {
+  if (seen.appends.length > 0) return [...seen.appends]
   return seen.logs
     .filter(l => l.includes('rating request append'))
     .map(l => {

@@ -119,9 +119,13 @@ golden loader, RRU dataclasses) unchanged and prints one row per arm.
   as the hook that holds it, never across an import. So `$` never leaves
   `hooks/register.ts`: `makeIo($)` there wraps the calls the probe makes in plain
   functions (an `Io`), and the other modules take that.
-- The test kit (`claude plugin test`) has no conversation store: an append made by
-  the mod rejects there, and the probe logs each failed append with its row text.
-  The tests read the attempts back from that log; they cannot see an append succeed.
+- The test kit (`claude plugin test`) hands a plugin's `$.session.append` to the bottom
+  `session.append` hook the rig registers (Claude Code 2.1.311 and later), which records
+  the row and accepts it, or answers `{ deny }` when a test asks (a test hook that throws is
+  skipped and the row is kept). `appended(seen)` reads the rows
+  from that record; on a kit that never delivered the call (the 2.1.289 kit, as the cells recorded it on 2026-10-09;
+  not re-run since) the append rejected,
+  and it falls back to the row text the probe logs for each failed append.
 - Tests build node-id-shaped strings at run time (`kit.ts` `nid`) because the
   repo's `no-new-shipped-node-ids` gate scans `tools/`.
 

@@ -91,12 +91,19 @@ test('T5 enabled=false', { options: { enabled: false } }, async ($, on) => {
   expect(r.seen.recallCalls.length).toBe(0)
 })
 
-test('an append that rejects: the turn result is unchanged and the failure is logged', async ($, on) => {
-  const { seen } = await oneStep($, on) // no store beneath the hooks: the append rejects
+// The kit cannot make a plugin's `$.session.append` THROW: a test hook that throws is skipped
+// and the engine keeps the row. It can make the append come back refused (`appendRejects` in
+// the rig answers `{ deny }`), which is the failure this cell covers. The `rejected` log branch
+// in rating.ts (an append that throws) is therefore not reachable from a test on Claude Code
+// 2.1.311 or later; it was covered only on the older kit, where (per the cell's earlier comment,
+// not re-run) the append rejected.
+test('an append that is refused: the turn result is unchanged, the failure is logged, the requests file says appended false', async ($, on) => {
+  const { seen } = await oneStep($, on, { appendRejects: true })
   const done = await $.turn.complete(COMPLETE)
   expect(done.text).toBe('done')
-  expect(appended(seen).length).toBe(1)
-  expect(seen.logs.filter(l => l.includes('append rejected')).length).toBe(1)
+  expect(appended(seen).length).toBe(1) // the attempt reached the kit exactly once
+  expect(seen.logs.filter(l => l.includes('append refused')).length).toBe(1)
+  expect(requestFile(seen)!.appended).toBe(false)
 })
 
 // ------------------------------------------------------------------ the cap (pure)
@@ -293,7 +300,7 @@ test('requests file records the turn-end wait: nothing pending -> waitedMs 0, pe
   expect(req.waitedMs).toBe(0)
   expect(req.pendingAtComplete).toBe(0)
   expect(req.pendingTimedOut).toBeUndefined()
-  expect(req.appended).toBe(false) // the kit has no store: the append rejects
+  expect(req.appended).toBe(true) // the bottom session.append accepts the row: it landed
 })
 
 test('requests file records a job still running at turn end (waited, not timed out)', async ($, on) => {
