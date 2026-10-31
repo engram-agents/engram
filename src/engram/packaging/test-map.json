@@ -372,10 +372,20 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/anchoring_report.py",
+      "test_globs": [
+        "tests/test_anchoring_report.py",
+        "tests/test_anchoring_report_owner_3881.py",
+        "tests/test_quote_quality_survey_4050.py"
+      ],
+      "note": "engram-alpha#3881 (U18 of #2652): the population is read in id-ordered pages through tools/_owner_read.py behind engramd.anchoring_report_reads_via_owner (flag OFF opens the store mode=ro). The cells load it by path and run it as a subprocess, invisible to the layer-1 import graph; the registered read templates also tie it to tests/test_engramd_read_scan.py. The survey and (through it) s2_clause_sheet borrow its openers, so their cells ride along."
+    },
+    {
       "path_prefix_or_glob": "tools/quote_quality_survey.py",
       "test_globs": [
         "tests/test_quote_quality_survey_4050.py",
-        "tests/test_anchoring_report.py"
+        "tests/test_anchoring_report.py",
+        "tests/test_anchoring_report_owner_3881.py"
       ],
       "note": "engram-alpha#4050 S1: read-only survey. The cells load it by path and run it as a subprocess (invisible to the layer-1 import graph); it also reuses anchoring_report's population query and read-only open, so that tool's cells ride along."
     },
@@ -469,6 +479,7 @@
         "tests/test_backup_owner_snapshot_3872.py",
         "tests/test_regen_embeddings_owner_3879.py",
         "tests/test_inspect_raw_owner_2652.py",
+        "tests/test_anchoring_report_owner_3881.py",
         "tests/test_tools_engram_home_3863.py",
         "tests/test_store_path_precheck_3960.py"
       ],

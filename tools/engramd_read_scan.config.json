@@ -610,7 +610,8 @@
   "tools/weakest_load_bearing.py:rank",
   "tools/study_queue.py:store_candidates",
   "tools/lesson-pattern-audit.py:read_lesson_rows",
-  "tools/inspect_raw.py:read_row"
+  "tools/inspect_raw.py:read_row",
+  "tools/anchoring_report.py:_fetch_population"
  ],
  "exclusions": [
   {

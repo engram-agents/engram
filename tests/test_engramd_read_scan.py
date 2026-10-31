@@ -496,7 +496,11 @@ _LINE_KEY = _re.compile(r":\d+$")
 # `store_candidates`: the question/conjecture nodes, the live-node brief, the pending cascade nodes).
 # #2652 (tools-7): the one-row read of tools/inspect_raw.py:read_row (f37b0a78...).
 # #3941 (tools-8): the one current-lessons read of tools/lesson-pattern-audit.py:read_lesson_rows (1ce567fd...).
+# #3881 (U18): the two keyset-paged population reads of tools/anchoring_report.py:_fetch_population (ba3586db...
+# for the whole population, df28d1de... for one quote_type), shared with tools/quote_quality_survey.py.
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "ba3586db7f6b6d1748f208efb0ab977b3dfa9122512dd19897d94718cb28f2c5",
+    "df28d1de6b2da5efd52c33a73cd80c6bc9ca74b95046e0893c5e40694f9234f6",
     "1ce567fd44516865b873f2446cffb547b5b6a78bd6525662a91c6fcb49b8790a",
     "1f0642346288d91dd8ece6a13066919a24df7fdc305f365332735f83a606fbc5",
     "4c297eed21620600e0366ba8d26aa74d052af13f9b2b449fbd82152edc7a21ff",

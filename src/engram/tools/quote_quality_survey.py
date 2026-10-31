@@ -16,7 +16,15 @@ Usage:
         [--score-sheet FILLED.md [FILLED2.md ...] --judging-key KEY.json]
 
     --db PATH        knowledge.db; default ENGRAM_HOME/knowledge.db (same
-                     discovery and the same mode=ro open as anchoring_report).
+                     discovery and the same read as anchoring_report: the
+                     population comes in id-ordered pages through the shared
+                     owner-read helper, behind the flag
+                     engramd.anchoring_report_reads_via_owner, default OFF;
+                     flag OFF it is a mode=ro open. Flag ON with the owner
+                     down, refusing or answering malformed: nothing on stdout,
+                     one stderr line, exit 3. Exit 3 is also what
+                     --score-sheet returns when some answers were not read;
+                     the two modes never share a run.)
     --seed N         RNG seed for the judging draw (default 4050).
     --judging-sheet  With --judging-key: draw the blind sample and write the
                      sheet (item number, quote, interpretation, claim ONLY)
@@ -73,8 +81,10 @@ import engram_core as core  # noqa: E402
 _spec = importlib.util.spec_from_file_location("_anchoring_report_for_survey", _HERE / "anchoring_report.py")
 _anchoring_report = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_anchoring_report)
-_open_readonly = _anchoring_report._open_readonly
+_open_readonly = _anchoring_report._open_readonly  # direct-only; tools/s2_clause_sheet.py borrows it from here
+_open_population_reader = _anchoring_report._open_population_reader
 _fetch_population = _anchoring_report._fetch_population
+_PopulationReadError = _anchoring_report.AnchoringReportOwnerReadError
 
 TOOL_VERSION = "1"
 DEFAULT_SEED = 4050
@@ -762,12 +772,25 @@ def main(argv: list[str] | None = None) -> int:
                          "(remove the link or give a real path)")
 
     db_path = Path(args.db) if args.db else (core.DATA_DIR / "knowledge.db")
-    conn = _open_readonly(db_path)
+    # The population is read in id-ordered pages through the owner-read helper (the same function and the same
+    # flag as anchoring_report). A failure prints nothing on stdout, one stderr line, and exits 3.
     try:
-        rows = _fetch_population(conn, None)
-        records = build_records(rows)
-    finally:
-        conn.close()
+        conn = _open_population_reader(db_path)
+        try:
+            rows = _fetch_population(conn, None)
+        finally:
+            conn.close()
+    except FileNotFoundError:
+        print(f"ERROR: DB not found at {db_path}", file=sys.stderr)
+        return 1
+    except (_anchoring_report.owner_read.StoreUnusable, _anchoring_report.sqlite3.Error) as exc:
+        print(f"ERROR: AnchoringReportOwnerReadError: the store at {db_path} could not be read ("
+              f"{' '.join(str(exc).split())}); fix the path or the store.", file=sys.stderr)
+        return 3
+    except _PopulationReadError as exc:
+        print(f"ERROR: {type(exc).__name__}: {' '.join(str(exc).split())}", file=sys.stderr)
+        return 3
+    records = build_records(rows)
 
     excluded = set(args.exclude_source_class)
 

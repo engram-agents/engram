@@ -242,6 +242,13 @@
       ]
     },
     {
+      "key": "ba3586db7f6b6d1748f208efb0ab977b3dfa9122512dd19897d94718cb28f2c5",
+      "sql": "SELECT id, quote_type, confidence, claim, quoted_text, interpretation, metadata, created_at FROM nodes WHERE type IN ('observation_factual', 'observation_predictive') AND is_current = 1 AND id > ? ORDER BY id LIMIT 200",
+      "sites": [
+        "tools/anchoring_report.py:_fetch_population"
+      ]
+    },
+    {
       "key": "bca59f0784091d50dfa65e9ee9d35288defe5503524b0e43437bb701e1dc7e80",
       "sql": "\nSELECT\n    id,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type')    AS prevention_type,\n    COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'), claim) AS nudge\nFROM nodes\nWHERE type = 'lesson'\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type') IN ('shadow', 'blocking')\n",
       "sites": [
@@ -310,6 +317,13 @@
       "sql": "\nSELECT\n    id,\n    COALESCE(\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.anchor_line'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.surfacing_nudge'),\n        claim\n    ) AS nudge,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.match_scope')  AS match_scope,\n    recall_summary,\n    claim\nFROM nodes\nWHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''\n",
       "sites": [
         "hooks/claude/engram-lesson-tripwire-hook.py:load_tripwires"
+      ]
+    },
+    {
+      "key": "df28d1de6b2da5efd52c33a73cd80c6bc9ca74b95046e0893c5e40694f9234f6",
+      "sql": "SELECT id, quote_type, confidence, claim, quoted_text, interpretation, metadata, created_at FROM nodes WHERE type IN ('observation_factual', 'observation_predictive') AND is_current = 1 AND quote_type = ? AND id > ? ORDER BY id LIMIT 200",
+      "sites": [
+        "tools/anchoring_report.py:_fetch_population"
       ]
     },
     {
