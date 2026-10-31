@@ -38,8 +38,8 @@
 #   1. Resolves PLUGIN_ENGRAM_DIR from this script's own real path.
 #   2. Detects the Python interpreter (prefers plugin venv ~/.engram/venv;
 #      falls back to system python3 if import gate passes).
-#   3. Runs an import-verification gate: refuses to install unless the canonical
-#      health-score formula and config schema can be imported with the chosen
+#   3. Runs an import-verification gate: refuses to install unless the health
+#      engine (`health.engine`) and config schema can be imported with the chosen
 #      python + PLUGIN_ENGRAM_DIR on sys.path. Makes a silently-degraded viz
 #      structurally impossible to install. The import gate runs on BOTH OSes
 #      before OS detection, so a bad plugin bundle is rejected early regardless
@@ -148,19 +148,34 @@ fi
 # Import-verification gate — find the first candidate that passes.
 # This gate runs on BOTH OSes before any OS-specific install steps.
 PYTHON_BIN=""
+GATE_FAILURES=""
 for candidate in "${PYTHON_CANDIDATES[@]}"; do
-  if ENGRAM_DIR="$PLUGIN_ENGRAM_DIR" "$candidate" -c "import sys, os; sys.path.insert(0, os.environ['ENGRAM_DIR']); from engram_stats import _compute_health_score; from tools.config_schema import SCHEMA" 2>/dev/null; then
+  # Capture the candidate's stderr (stdout is discarded) so a failed gate can
+  # name the real error instead of hiding it (engram-alpha#4154). The gate checks
+  # what the viz server actually reaches: the health engine (`from health import
+  # engine`, as viz/data/health.py does) and tools.config_schema.
+  if gate_err="$(ENGRAM_DIR="$PLUGIN_ENGRAM_DIR" "$candidate" -c "import sys, os; sys.path.insert(0, os.environ['ENGRAM_DIR']); from health import engine; from tools.config_schema import SCHEMA" 2>&1 >/dev/null)"; then
     PYTHON_BIN="$candidate"
     break
   fi
+  # Last non-empty stderr line (bash 3.2 safe: no mapfile, no tail dependency).
+  gate_last=""
+  while IFS= read -r gate_line; do
+    if [[ -n "${gate_line//[[:space:]]/}" ]]; then
+      gate_last="$gate_line"
+    fi
+  done <<< "$gate_err"
+  GATE_FAILURES="${GATE_FAILURES}         ${candidate}: ${gate_last:-<no error output>}"$'\n'
 done
 
 if [[ -z "$PYTHON_BIN" ]]; then
-  echo "ERROR: viz cannot import the canonical health-score formula with any available python." >&2
+  echo "ERROR: viz cannot import the health engine and tools.config_schema with any available python." >&2
   echo "       Tried: ${PYTHON_CANDIDATES[*]}" >&2
+  echo "       Last error per candidate:" >&2
+  printf '%s' "$GATE_FAILURES" >&2
   echo "       Refusing to install a viz that would show a wrong/zero score." >&2
   echo "       Check that the plugin venv has the engram deps:" >&2
-  echo "         $PLUGIN_VENV_PYTHON -c \"import engram_stats\"" >&2
+  echo "         $PLUGIN_VENV_PYTHON -c \"from health import engine\"" >&2
   exit 1
 fi
 

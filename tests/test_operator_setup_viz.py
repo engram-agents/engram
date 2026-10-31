@@ -11,7 +11,7 @@ Covers (per spec):
       ~/.config/systemd/user/engram-viz-user.service with all {{...}}
       placeholders substituted (no residual {{...}}).
   (e) Import gate failure: script exits non-zero and refuses to install when
-      python cannot import the health-score formula.
+      python cannot import the health engine or tools.config_schema.
   (f) Darwin rendered plist carries exactly the label com.engram.viz-server.
   (g) Missing launchctl on macOS → exits non-zero with a clear message.
   (h) Missing systemctl on Linux → exits non-zero with a clear message.
@@ -31,9 +31,11 @@ PATH — no real OS service manager is invoked.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import stat
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -572,7 +574,7 @@ class TestLinuxBranch(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 class TestImportGate(unittest.TestCase):
-    """Import gate must block install when python cannot import the formula."""
+    """Import gate must block install when python cannot import the health engine."""
 
     def test_import_gate_failure_blocks_install(self):
         """When python exits 1 (import fails), the script must exit non-zero."""
@@ -611,6 +613,149 @@ class TestImportGate(unittest.TestCase):
                 "ERROR",
                 combined,
                 "Import gate failure must print an ERROR message",
+            )
+
+    def test_script_does_not_mention_retired_health_score_symbol(self):
+        """The gate must not import `_compute_health_score` (retired by #2957)."""
+        text = SETUP_SCRIPT.read_text()
+        self.assertNotIn("_compute_health_score", text)
+
+    @staticmethod
+    def _gate_snippet():
+        text = SETUP_SCRIPT.read_text()
+        m = re.search(r'"\$candidate" -c "([^"]+)"', text)
+        assert m is not None, "could not find the gate's `-c` snippet in the script"
+        return m.group(1)
+
+    @staticmethod
+    def _snippet_modules(snippet):
+        """Module names the snippet imports: each X and X's first dotted component."""
+        names = set()
+        for stmt in snippet.split(";"):
+            stmt = stmt.strip()
+            fm = re.match(r"from\s+([\w.]+)\s+import\b", stmt)
+            im = re.match(r"import\s+(.+)$", stmt)
+            if fm:
+                found = [fm.group(1)]
+            elif im:
+                found = [part.split(" as ")[0].strip() for part in im.group(1).split(",")]
+            else:
+                continue
+            for name in found:
+                names.add(name)
+                names.add(name.split(".")[0])
+        return names
+
+    @staticmethod
+    def _skip_reason(last, snippet_modules):
+        """Return a skip reason, or None when the failure must be a hard FAIL.
+
+        Skippable: the py3.9 annotation TypeError, and a ModuleNotFoundError for a
+        module the snippet does NOT name (a third-party dependency). A missing
+        module the snippet itself imports (a rename or move) and
+        `cannot import name` are the #4154 defect class and never skip.
+        """
+        if "cannot import name" in last:
+            return None
+        if last.startswith("TypeError: unsupported operand"):
+            return last
+        mm = re.match(r"ModuleNotFoundError: No module named '([^']+)'", last)
+        if mm:
+            missing = mm.group(1)
+            if missing in snippet_modules or missing.split(".")[0] in snippet_modules:
+                return None
+            return last
+        return None
+
+    def test_gate_snippet_names_health_and_config_schema(self):
+        """Dropping either import from the gate must go red (the gate is not a smoke test)."""
+        snippet = self._gate_snippet()
+        self.assertRegex(snippet, r"\bfrom\s+health\s+import\b")
+        self.assertRegex(snippet, r"\bfrom\s+tools\.config_schema\s+import\b")
+
+    def test_skip_reason_policy(self):
+        """A module the snippet imports never skips; an unrelated third-party one does."""
+        mods = self._snippet_modules(self._gate_snippet())
+        self.assertIn("health", mods)
+        self.assertIn("tools.config_schema", mods)
+        self.assertIn("tools", mods)
+        self.assertIsNone(self._skip_reason("ModuleNotFoundError: No module named 'healthx'", {"healthx"}))
+        self.assertIsNone(self._skip_reason("ModuleNotFoundError: No module named 'tools.config_schema'", mods))
+        self.assertIsNone(self._skip_reason("ModuleNotFoundError: No module named 'health.engine'", mods))
+        self.assertIsNone(self._skip_reason("ImportError: cannot import name 'x' from 'health'", mods))
+        self.assertIsNotNone(self._skip_reason("ModuleNotFoundError: No module named 'yaml'", mods))
+        self.assertIsNotNone(self._skip_reason("TypeError: unsupported operand type(s) for |", mods))
+
+    def test_gate_snippet_imports_for_real(self):
+        """Run the gate's own `-c` snippet under a real interpreter against src/engram.
+
+        The stub-python tests above never ran the real import, which is how the
+        gate shipped importing a symbol that no longer existed (#4154).
+        """
+        snippet = self._gate_snippet()
+        env = {**os.environ, "ENGRAM_DIR": str(REPO_ROOT / "src" / "engram")}
+        result = subprocess.run(
+            [sys.executable, "-c", snippet],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if result.returncode != 0:
+            last = (result.stderr.strip().splitlines() or [""])[-1]
+            reason = self._skip_reason(last, self._snippet_modules(snippet))
+            if reason is not None:
+                self.skipTest(
+                    f"test interpreter cannot import the tree for an unrelated reason: {reason}"
+                )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"gate snippet failed under {sys.executable}:\n{result.stderr}",
+        )
+
+    def test_import_gate_failure_surfaces_real_error(self):
+        """The candidate's real last stderr line must reach the operator (C2)."""
+        with tempfile.TemporaryDirectory() as stub_dir, \
+             tempfile.TemporaryDirectory() as fake_home:
+
+            stub_path = Path(stub_dir)
+            _write_stub(
+                stub_path,
+                "python3",
+                "#!/usr/bin/env bash\necho 'ImportError: boom' >&2\nexit 1\n",
+            )
+            _write_stub(stub_path, "uname", '#!/usr/bin/env bash\necho "Darwin"\n')
+            _write_stub(stub_path, "launchctl", "#!/usr/bin/env bash\nexit 0\n")
+
+            plugin_engram_dir = Path(fake_home) / "plugin" / "engram"
+            _make_fake_plugin(plugin_engram_dir)
+
+            patched = Path(fake_home) / "setup_patched.sh"
+            _make_patched_script(str(plugin_engram_dir), patched)
+
+            fake_engram_home = Path(fake_home) / ".engram"
+            fake_engram_home.mkdir(parents=True, exist_ok=True)
+            env = _make_env(stub_dir, fake_home, engram_home=str(fake_engram_home))
+            result = subprocess.run(
+                ["bash", str(patched)],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            combined = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, combined)
+            self.assertIn("boom", combined)
+            self.assertNotIn("health-score formula", combined)
+            self.assertFalse(
+                (Path(fake_home) / "Library" / "LaunchAgents"
+                 / "com.engram.viz-server.plist").exists(),
+                "no plist may be written when the gate fails",
+            )
+            self.assertFalse(
+                (Path(fake_home) / ".config" / "systemd" / "user"
+                 / "engram-viz-user.service").exists(),
+                "no unit may be written when the gate fails",
             )
 
     def test_import_gate_failure_blocks_install_linux(self):
