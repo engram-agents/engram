@@ -6,6 +6,7 @@ export const ALL_ARMS = [
   'extract_model',
   'tool_input',
   'novel_terms',
+  'narration_full',
 ] as const
 export const QUERY_SOURCES = ['thinking', 'visible', 'auto'] as const
 export type QuerySource = (typeof QUERY_SOURCES)[number]
@@ -29,7 +30,8 @@ export const DEFAULTS: Config = {
   topK: 5,
   minQueryChars: 0,
   querySource: 'auto',
-  arms: [...ALL_ARMS],
+  // The five legacy arms, as plugin.json declares. narration_full is opt-in (the pilot is config only).
+  arms: ['thinking_full', 'thinking_tail', 'extract_model', 'tool_input', 'novel_terms'],
   extractModel: 'haiku',
   extractTimeoutMs: 6000,
   maxRatingChars: 1200,

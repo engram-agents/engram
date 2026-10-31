@@ -242,6 +242,10 @@ async function stepJob(job: StepJob): Promise<void> {
       material: proxyMaterial,
       extractInput,
       toolArgs: job.toolArgs,
+      thinking,
+      answerText,
+      hasToolCall: obs.tools.length > 0,
+      querySource: useThinking ? 'thinking' : 'visible',
       sessionId: probe.sessionId,
     })
     annotateCandidates(arms, ids)

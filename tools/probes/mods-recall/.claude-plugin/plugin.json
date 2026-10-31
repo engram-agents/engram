@@ -32,7 +32,7 @@
     "querySource": {
       "type": "string",
       "title": "Query material",
-      "description": "thinking | visible (proxy arms use the answer text only; arm D keeps the tool arguments) | auto (thinking when long enough, else visible).",
+      "description": "thinking | visible (the proxy arms thinking_tail, extract_model and novel_terms use the answer text only; arm D keeps the tool arguments) | auto (thinking when long enough, else visible). thinking_full and narration_full ignore it: they always read the thinking and the answer text.",
       "default": "auto",
       "options": [
         "thinking",
@@ -43,7 +43,7 @@
     "arms": {
       "type": "string",
       "title": "Arms",
-      "description": "Comma list of arms to run.",
+      "description": "Comma list of arms to run: thinking_full (thinking only), narration_full (answer text only), thinking_tail, extract_model, tool_input, novel_terms. The thinking / narration / tool-argument pilot is thinking_full,narration_full,tool_input.",
       "default": "thinking_full,thinking_tail,extract_model,tool_input,novel_terms"
     },
     "extractModel": {

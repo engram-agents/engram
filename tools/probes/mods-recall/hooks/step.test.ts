@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { DEFAULTS } from './config.ts'
+import { ALL_ARMS as CONFIG_ARMS, DEFAULTS, parseConfig } from './config.ts'
 import { newProbe, writeUnderRoot, type Io } from './record.ts'
 import {
   COMPLETE,
@@ -413,6 +413,9 @@ test('envelope: the direct shape still works and says so', async ($, on) => {
   expect(arm.envelope).toBe('direct')
 })
 
+// the legacy default arms plus narration_full, for cells that assert the answer-text channel
+const WITH_NARRATION = { arms: [...CONFIG_ARMS].join(',') }
+
 // ---- query material (live finding): some lineages emit thinking blocks with no text
 const VISIBLE_ANSWER = 'Visible working text. '.repeat(20) // 440 chars
 const visibleChunks = (thinking: string) => [
@@ -423,7 +426,8 @@ const visibleChunks = (thinking: string) => [
   { kind: 'stop' as const, stopReason: 'tool_use' as const, usage: null },
 ]
 
-test('zero-thinking step with 600+ chars of answer and tool args: A/B/C/E use the answer text only, D the tool arguments', async ($, on) => {
+// changed by design: thinking_full never falls back to answer text (design owner, engram-alpha#3549)
+test('zero-thinking step with 600+ chars of answer and tool args: thinking_full skips no-thinking, narration_full uses the answer text only, D the tool arguments', { options: WITH_NARRATION }, async ($, on) => {
   const { clock, seen } = rig(on)
   engineStep(on, visibleChunks(''))
   await $.session.start(START)
@@ -435,8 +439,9 @@ test('zero-thinking step with 600+ chars of answer and tool args: A/B/C/E use th
   expect(row.thinkingChars).toBe(0)
   expect(row.visibleChars).toBeGreaterThan(600)
   expect(row.proxyChars).toBe(VISIBLE_ANSWER.length)
-  expect(row.arms.thinking_full.query).toContain('Visible working text.')
-  expect(row.arms.thinking_full.query).not.toContain('/aaaa') // tool arguments are arm D's material only
+  expect(row.arms.thinking_full.skipped).toBe('no-thinking')
+  expect(row.arms.narration_full.query).toContain('Visible working text.')
+  expect(row.arms.narration_full.query).not.toContain('/aaaa') // tool arguments are arm D's material only
   expect(row.arms.tool_input.query).toContain('/aaaa') // arm D unchanged
   expect(seen.recallCalls.length).toBeGreaterThan(0)
 })
@@ -557,7 +562,8 @@ const BIG_ARGS = '{"command":"' + 'b'.repeat(700) + '"}'
 const TOOL_ARGS_TEXT = 'ZZ_TOOL_ARG_ZZ'
 const LONG_ANSWER = 'The probe should measure recall against the visible answer text. '.repeat(12) // ~770 chars
 
-test('T-N1 visible mode, empty answer text, tool arguments only: D alone runs; A/B/C/E skip short-proxy-material; one recall, zero complete', async ($, on) => {
+// changed by design: thinking_full never falls back to answer text (design owner, engram-alpha#3549)
+test('T-N1 visible mode, empty answer text, tool arguments only: D alone runs; B/C/E skip short-proxy-material and A skips no-thinking; one recall, zero complete', async ($, on) => {
   const { clock, seen } = rig(on)
   engineStep(on, [
     { kind: 'tool', index: 0, id: 'toolu_1', name: 'Bash' },
@@ -572,7 +578,9 @@ test('T-N1 visible mode, empty answer text, tool arguments only: D alone runs; A
   expect(row.terminal).toBe(false)
   expect(row.querySource).toBe('visible')
   expect(row.proxyChars).toBe(0)
-  for (const name of ['thinking_full', 'thinking_tail', 'extract_model', 'novel_terms']) {
+  expect(row.arms.thinking_full.skipped).toBe('no-thinking')
+  expect(row.arms.thinking_full.candidates).toBeUndefined()
+  for (const name of ['thinking_tail', 'extract_model', 'novel_terms']) {
     expect(row.arms[name].skipped).toBe('short-proxy-material')
     expect(row.arms[name].candidates).toBeUndefined()
   }
@@ -637,7 +645,8 @@ test('T-N3 thinking mode, zero tool calls: not terminal; A/B/C/E run, D skips no
   expect(row.proxyChars).toBe(LONG_THINKING.length)
 })
 
-test('T-N4 visible mode, answer + tool arguments: A queries the answer only, D the arguments only, C prompt has the answer only', async ($, on) => {
+// changed by design: thinking_full never falls back to answer text (design owner, engram-alpha#3549)
+test('T-N4 visible mode, answer + tool arguments: thinking_full skips no-thinking, narration_full queries the answer only, D the arguments only, C prompt has the answer only', { options: WITH_NARRATION }, async ($, on) => {
   const { clock, seen } = rig(on)
   const args = `{"command":"${TOOL_ARGS_TEXT}"}`
   engineStep(on, [
@@ -651,8 +660,9 @@ test('T-N4 visible mode, answer + tool arguments: A queries the answer only, D t
   await flush(clock)
   const row = stepFile(seen, TURN, 0)!
   expect(row.terminal).toBe(false)
-  expect(row.arms.thinking_full.query).toBe(LONG_ANSWER)
-  expect(row.arms.thinking_full.query).not.toContain(TOOL_ARGS_TEXT)
+  expect(row.arms.thinking_full.skipped).toBe('no-thinking')
+  expect(row.arms.narration_full.query).toBe(LONG_ANSWER)
+  expect(row.arms.narration_full.query).not.toContain(TOOL_ARGS_TEXT)
   expect(row.arms.tool_input.query).toBe(args)
   expect(seen.completePrompts.length).toBe(1)
   expect(seen.completePrompts[0]).toContain(LONG_ANSWER.slice(0, 80))
@@ -702,7 +712,8 @@ const autoChunks = (thinking: string, narration: string) => [
   { kind: 'stop' as const, stopReason: 'tool_use' as const, usage: null },
 ]
 
-test('C1 auto, floor 0, EMPTY thinking: falls back to the visible narration as proxy material', { options: { querySource: 'auto', minQueryChars: 0 } }, async ($, on) => {
+// changed by design: thinking_full never falls back to answer text (design owner, engram-alpha#3549)
+test('C1 auto, floor 0, EMPTY thinking: the visible narration is the proxy material; narration_full carries it, thinking_full is skipped', { options: { ...WITH_NARRATION, querySource: 'auto', minQueryChars: 0 } }, async ($, on) => {
   const { clock, seen } = rig(on)
   engineStep(on, autoChunks('', NARRATION))
   await $.session.start(START)
@@ -712,7 +723,8 @@ test('C1 auto, floor 0, EMPTY thinking: falls back to the visible narration as p
   expect(NARRATION.length).toBe(300)
   expect(row.querySource).toBe('visible')
   expect(row.proxyChars).toBe(NARRATION.length)
-  expect(row.arms.thinking_full.query).toContain('Checking the narration channel.')
+  expect(row.arms.narration_full.query).toContain('Checking the narration channel.')
+  expect(row.arms.thinking_full.skipped).toBe('no-thinking')
 })
 
 test('C2 auto, floor 0, whitespace-only thinking: still visible (the trim is load-bearing)', { options: { querySource: 'auto', minQueryChars: 0 } }, async ($, on) => {
@@ -753,4 +765,227 @@ test('C4 auto, floor 200, 150-char thinking, 500-char narration: the floor still
 // 2026-10-06: JSON import and node:fs import are both refused). Keep the two in step by hand.
 test('C5 DEFAULTS.minQueryChars is 0 (plugin.json userConfig default is 0 too: not checkable from here)', async () => {
   expect(DEFAULTS.minQueryChars).toBe(0)
+})
+
+// ---- #3549 arms: narration_full, thinking_full keyed on THINKING only, `source` on every text-keyed arm
+const PILOT = 'thinking_full,narration_full,tool_input'
+const THINK_S = 'THINKING_SENTINEL_5c1d'
+const ANSWER_S = 'ANSWER_SENTINEL_9e2b'
+const TOOL_S = 'TOOLARG_SENTINEL_3a7f'
+const thinkingText = `${THINK_S} ` + 'Weighing how the recall should be keyed. '.repeat(8)
+const answerText = `${ANSWER_S} ` + 'Now reading the file to check the design. '.repeat(8)
+const pilotChunks = (o: { thinking?: string; answer?: string; tool?: boolean }) => [
+  ...(o.thinking ? [{ kind: 'thinking' as const, index: 0, text: o.thinking }] : []),
+  ...(o.answer ? [{ kind: 'text' as const, index: 1, text: o.answer }] : []),
+  ...(o.tool === false
+    ? []
+    : [
+        { kind: 'tool' as const, index: 2, id: 'toolu_1', name: 'Bash' },
+        { kind: 'input' as const, index: 2, json: `{"command":"${TOOL_S}"}` },
+      ]),
+  { kind: 'stop' as const, stopReason: (o.tool === false ? 'end_turn' : 'tool_use') as 'end_turn' | 'tool_use', usage: null },
+]
+
+async function pilotStep(on: any, $: any, chunks: any[], rigOptions = {}) {
+  const r = rig(on, rigOptions)
+  engineStep(on, chunks)
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(r.clock)
+  return { ...r, row: stepFile(r.seen, TURN, 0)! }
+}
+
+test('B1 config: the pilot arm list parses to exactly those three in order; an unknown arm is ignored and logged; narration_full is known', async () => {
+  expect((CONFIG_ARMS as readonly string[]).includes('narration_full')).toBe(true)
+  const logs: string[] = []
+  const cfg = parseConfig({ arms: PILOT } as any, l => logs.push(l))
+  expect(cfg.arms).toEqual(['thinking_full', 'narration_full', 'tool_input'])
+  expect(logs).toEqual([])
+  const logs2: string[] = []
+  const cfg2 = parseConfig({ arms: 'narration_full,bogus_arm' } as any, l => logs2.push(l))
+  expect(cfg2.arms).toEqual(['narration_full'])
+  expect(logs2.some(l => l.includes('unknown arm') && l.includes('bogus_arm'))).toBe(true)
+})
+
+for (const querySource of ['auto', 'visible', 'thinking'] as const) {
+  test(`B2 both channels (querySource ${querySource}): thinking_full reads the thinking only, narration_full the answer only, sources recorded`, { options: { arms: PILOT, querySource } }, async ($, on) => {
+    const { row, seen } = await pilotStep(on, $, pilotChunks({ thinking: thinkingText, answer: answerText }))
+    const t = row.arms.thinking_full
+    const n = row.arms.narration_full
+    expect(t.query).toContain(THINK_S)
+    expect(t.query).not.toContain(ANSWER_S)
+    expect(n.query).toContain(ANSWER_S)
+    expect(n.query).not.toContain(THINK_S)
+    expect(t.source).toBe('thinking')
+    expect(n.source).toBe('visible')
+    expect(row.arms.tool_input.source).toBeUndefined()
+    expect(row.arms.tool_input.query).toContain(TOOL_S)
+    expect(Object.keys(row.arms).sort()).toEqual(['narration_full', 'thinking_full', 'tool_input'])
+    expect(seen.completeCalls).toBe(0)
+    expect(seen.processCalls.length).toBe(0)
+  })
+
+  test(`B3 no fallback (querySource ${querySource}): empty thinking -> thinking_full skips no-thinking, narration_full runs`, { options: { arms: PILOT, querySource } }, async ($, on) => {
+    const { row, seen } = await pilotStep(on, $, pilotChunks({ answer: answerText }))
+    expect(row.arms.thinking_full.skipped).toBe('no-thinking')
+    expect(row.arms.thinking_full.query).toBeUndefined()
+    expect(row.arms.thinking_full.candidates).toBeUndefined()
+    expect(row.arms.narration_full.skipped).toBeUndefined()
+    expect(row.arms.narration_full.query).toContain(ANSWER_S)
+    expect(row.arms.narration_full.source).toBe('visible')
+    // one recall for narration_full, one for tool_input: none for thinking_full
+    expect(seen.recallCalls.length).toBe(2)
+  })
+}
+
+test('B3b whitespace-only thinking is blank: no-thinking, never the answer text', { options: { arms: PILOT } }, async ($, on) => {
+  const { row } = await pilotStep(on, $, pilotChunks({ thinking: '  \n ', answer: answerText }))
+  expect(row.arms.thinking_full.skipped).toBe('no-thinking')
+  expect(row.arms.narration_full.query).toContain(ANSWER_S)
+})
+
+test('B4 terminal: no tool call + thinking + answer -> thinking_full runs, narration_full skips terminal, row not terminal', { options: { arms: PILOT } }, async ($, on) => {
+  const { row, seen } = await pilotStep(on, $, pilotChunks({ thinking: thinkingText, answer: answerText, tool: false }))
+  expect(row.querySource).toBe('thinking')
+  expect(row.skipped).toBeUndefined()
+  expect(row.terminal).toBe(false)
+  expect(row.arms.thinking_full.query).toContain(THINK_S)
+  expect(row.arms.narration_full.skipped).toBe('terminal')
+  expect(row.arms.narration_full.query).toBeUndefined()
+  expect(row.arms.tool_input.skipped).toBe('no-tool-call')
+  expect(seen.recallCalls.length).toBe(1)
+})
+
+test('B4b no tool call + empty thinking + answer: the step-level terminal skip is unchanged', { options: { arms: PILOT } }, async ($, on) => {
+  const { row, seen } = await pilotStep(on, $, pilotChunks({ answer: answerText, tool: false }))
+  expect(row.skipped).toBe('terminal')
+  expect(row.terminal).toBe(true)
+  expect(row.arms).toBeUndefined()
+  expect(seen.recallCalls.length).toBe(0)
+})
+
+test('B5 model boundary (pilot arms + extract_model): a tool-argument string reaches exactly one recall call, never narration_full, thinking_full or the side model', { options: { arms: PILOT + ',extract_model' } }, async ($, on) => {
+  const { row, seen } = await pilotStep(on, $, pilotChunks({ thinking: thinkingText, answer: answerText }))
+  expect(row.arms.narration_full.query).not.toContain(TOOL_S)
+  expect(row.arms.thinking_full.query).not.toContain(TOOL_S)
+  expect(row.arms.tool_input.query).toContain(TOOL_S)
+  expect(seen.completePrompts.length).toBe(1)
+  expect(seen.completePrompts[0]).not.toContain(TOOL_S)
+  const withSentinel = seen.recallCalls.filter(c => String(c.args.payload_json).includes(TOOL_S))
+  expect(withSentinel.length).toBe(1)
+  expect(JSON.parse(String(withSentinel[0]!.args.payload_json)).query).toBe(row.arms.tool_input.query)
+})
+
+test('B5b model boundary, answer-only step (no thinking): narration_full carries no tool argument', { options: { arms: PILOT, querySource: 'visible' } }, async ($, on) => {
+  const { row, seen } = await pilotStep(on, $, pilotChunks({ answer: answerText }))
+  expect(row.arms.narration_full.query).toContain(ANSWER_S)
+  expect(row.arms.narration_full.query).not.toContain(TOOL_S)
+  expect(seen.recallCalls.filter(c => String(c.args.payload_json).includes(TOOL_S)).length).toBe(1)
+})
+
+test('B6 short material, pilot arms: empty thinking, empty answer, no tool arguments -> short-material, no arm, no call', { options: { arms: PILOT } }, async ($, on) => {
+  const { row, seen } = await pilotStep(on, $, [
+    { kind: 'tool', index: 0, id: 'toolu_1', name: 'Bash' },
+    { kind: 'stop', stopReason: 'tool_use', usage: null },
+  ])
+  expect(row.skipped).toBe('short-material')
+  expect(row.arms).toBeUndefined()
+  expect(seen.recallCalls.length).toBe(0)
+})
+
+test('B7a minQueryChars: short thinking -> thinking_full short-proxy-material while a long narration still runs', { options: { arms: PILOT, minQueryChars: 200, querySource: 'visible' } }, async ($, on) => {
+  const { row } = await pilotStep(on, $, pilotChunks({ thinking: `${THINK_S} short`, answer: answerText }))
+  expect(row.arms.thinking_full.skipped).toBe('short-proxy-material')
+  expect(row.arms.narration_full.query).toContain(ANSWER_S)
+})
+
+test('B7b minQueryChars: short narration -> narration_full short-proxy-material while a long thinking still runs', { options: { arms: PILOT, minQueryChars: 200 } }, async ($, on) => {
+  const { row } = await pilotStep(on, $, pilotChunks({ thinking: thinkingText, answer: `${ANSWER_S} short` }))
+  expect(row.arms.narration_full.skipped).toBe('short-proxy-material')
+  expect(row.arms.thinking_full.query).toContain(THINK_S)
+})
+
+test('B7c an empty narration is no-narration, not short-proxy-material', { options: { arms: PILOT } }, async ($, on) => {
+  const { row } = await pilotStep(on, $, pilotChunks({ thinking: thinkingText }))
+  expect(row.arms.narration_full.skipped).toBe('no-narration')
+  expect(row.arms.thinking_full.query).toContain(THINK_S)
+})
+
+test('B7d both text arms clip to the last 6000 chars and say so', { options: { arms: PILOT } }, async ($, on) => {
+  const { row } = await pilotStep(on, $, pilotChunks({ thinking: 'T'.repeat(7000), answer: 'N'.repeat(7000) }))
+  for (const name of ['thinking_full', 'narration_full']) {
+    expect(row.arms[name].clipped).toBe(true)
+    expect(row.arms[name].query.length).toBe(6000)
+  }
+})
+
+test('F1 narration_full skip order: terminal comes before no-narration (no tool call + blank answer + long thinking)', { options: { arms: PILOT } }, async ($, on) => {
+  const { row } = await pilotStep(on, $, [
+    { kind: 'thinking', index: 0, text: thinkingText },
+    { kind: 'text', index: 1, text: '   ' },
+    { kind: 'stop', stopReason: 'end_turn', usage: null },
+  ])
+  expect(row.querySource).toBe('thinking')
+  expect(row.terminal).toBe(false)
+  expect(row.arms.thinking_full.query).toContain(THINK_S)
+  expect(row.arms.narration_full.skipped).toBe('terminal')
+})
+
+test('F2a a SKIPPED text-keyed arm result still carries its source', { options: { arms: PILOT } }, async ($, on) => {
+  // no thinking, answer + tool call, visible: thinking_full skips no-thinking
+  const a = await pilotStep(on, $, pilotChunks({ answer: answerText }))
+  expect(a.row.arms.thinking_full.skipped).toBe('no-thinking')
+  expect(a.row.arms.thinking_full.source).toBe('thinking')
+})
+
+test('F2a2 a SKIPPED narration_full (terminal) still carries source visible', { options: { arms: PILOT } }, async ($, on) => {
+  const { row } = await pilotStep(on, $, pilotChunks({ thinking: thinkingText, answer: answerText, tool: false }))
+  expect(row.arms.narration_full.skipped).toBe('terminal')
+  expect(row.arms.narration_full.source).toBe('visible')
+})
+
+test('F2b an ERRORED text-keyed arm result still carries its source', { options: { arms: PILOT } }, async ($, on) => {
+  const { row } = await pilotStep(on, $, pilotChunks({ thinking: thinkingText, answer: answerText }), {
+    recall: (query: string) => (query.includes(THINK_S) || query.includes(ANSWER_S) ? { error: 'bad payload' } : undefined),
+  })
+  expect(row.arms.thinking_full.error).toContain('bad payload')
+  expect(row.arms.thinking_full.source).toBe('thinking')
+  expect(row.arms.narration_full.error).toContain('bad payload')
+  expect(row.arms.narration_full.source).toBe('visible')
+})
+
+for (const [label, json] of [['no input block text', undefined], ['input {}', '{}']] as const) {
+  test(`F3 a tool call with EMPTY arguments (${label}) is still a tool call: narration_full is not terminal`, { options: { arms: PILOT, querySource: 'visible' } }, async ($, on) => {
+    const { row } = await pilotStep(on, $, [
+      { kind: 'text', index: 0, text: answerText },
+      { kind: 'tool', index: 1, id: 'toolu_1', name: 'Bash' },
+      ...(json === undefined ? [] : [{ kind: 'input' as const, index: 1, json }]),
+      { kind: 'stop', stopReason: 'tool_use', usage: null },
+    ])
+    expect(row.toolCalls).toEqual([{ name: 'Bash' }])
+    expect(row.arms.narration_full.skipped).toBeUndefined()
+    expect(row.arms.narration_full.query).toContain(ANSWER_S)
+  })
+}
+
+test('B8 legacy arms keep their material and carry the step querySource as source', { options: { arms: 'thinking_tail,extract_model,novel_terms', querySource: 'visible' } }, async ($, on) => {
+  const { row } = await pilotStep(on, $, pilotChunks({ thinking: thinkingText, answer: answerText }))
+  expect(row.querySource).toBe('visible')
+  for (const name of ['thinking_tail', 'extract_model', 'novel_terms']) {
+    expect(row.arms[name].source).toBe('visible')
+  }
+  expect(row.arms.thinking_tail.query).not.toContain(THINK_S)
+  expect(row.arms.thinking_tail.query).toContain('design')
+})
+
+test('B8b legacy arms in thinking mode carry source thinking', { options: { arms: 'thinking_tail,extract_model,novel_terms' } }, async ($, on) => {
+  const { row } = await pilotStep(on, $, pilotChunks({ thinking: thinkingText, answer: answerText }))
+  expect(row.querySource).toBe('thinking')
+  for (const name of ['thinking_tail', 'extract_model', 'novel_terms']) {
+    expect(row.arms[name].source).toBe('thinking')
+  }
+})
+
+test('B1b DEFAULTS.arms is exactly the five legacy arms, in order: the pilot is config only (plugin.json default is pinned to the same list in tests/test_probe_arms_narration_full.py)', async () => {
+  expect([...DEFAULTS.arms]).toEqual(['thinking_full', 'thinking_tail', 'extract_model', 'tool_input', 'novel_terms'])
 })

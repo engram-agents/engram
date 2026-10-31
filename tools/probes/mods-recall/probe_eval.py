@@ -60,7 +60,7 @@ from tools.recall_harness.rru import RankedNode, RankingResultUnit  # noqa: E402
 
 _QUERY_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
-_KNOWN_ARMS = ("thinking_full", "thinking_tail", "extract_model", "tool_input", "novel_terms",
+_KNOWN_ARMS = ("thinking_full", "thinking_tail", "extract_model", "tool_input", "novel_terms", "narration_full",
                "route:prompt_surface", "route:tool_recall")
 
 TOP_K = 5  # the "top-k" the inContext / principle rates are read over (= p@5's k)

@@ -11,6 +11,12 @@ export type ArmResult = {
   /** not an error: the arm had nothing to ask (no tool call, no novel terms) */
   skipped?: string
   clipped?: boolean
+  /**
+   * Which text a text-keyed arm read: 'thinking' or 'visible' (the vocabulary of the step's
+   * `querySource`). thinking_full is always 'thinking', narration_full always 'visible'; the
+   * legacy proxy arms carry the step's querySource. tool_input carries none.
+   */
+  source?: 'thinking' | 'visible'
   /** how the engram_query text was framed: unwrapped result string, or direct */
   envelope?: 'result-string' | 'direct'
   extract?: {
@@ -47,6 +53,14 @@ export type ArmCtx = {
   extractInput: string
   /** every tool block's arguments JSON text, one entry per tool call */
   toolArgs: string[]
+  /** the step's thinking text, joined (thinking_full's only material) */
+  thinking: string
+  /** the step's answer text only, never tool arguments (narration_full's only material) */
+  answerText: string
+  /** the step made at least one tool call (narration_full skips 'terminal' without one) */
+  hasToolCall: boolean
+  /** which text `material` is: the step's querySource (what the legacy proxy arms read) */
+  querySource: 'thinking' | 'visible'
   sessionId: string
 }
 
@@ -56,6 +70,8 @@ export const EXTRACT_TAIL_CHARS = 3000
 export const TOOL_INPUT_CLIP = 2000
 export const DETAIL_CLIP = 400
 export const SHORT_PROXY = 'short-proxy-material'
+export const NO_THINKING = 'no-thinking'
+export const NO_NARRATION = 'no-narration'
 
 /** Cut to DETAIL_CLIP chars, with a trailing ellipsis when cut. */
 function clipDetail(text: string): string {
@@ -119,11 +135,30 @@ async function retrieveArm(
   return { arm, query, candidates: value?.candidates ?? [], envelope: value?.envelope, ms, ...extra }
 }
 
+/** The last FULL_CLIP chars of a text, and whether it was cut. */
+function clipFull(text: string): { query: string; clipped: boolean } {
+  const clipped = text.length > FULL_CLIP
+  return { query: clipped ? text.slice(-FULL_CLIP) : text, clipped }
+}
+
+/** Keyed on the step's THINKING only, whatever `querySource` says; never falls back to the answer text. */
 async function armThinkingFull(ctx: ArmCtx): Promise<ArmResult> {
-  if (proxyTooShort(ctx)) return { arm: 'thinking_full', ms: 0, skipped: SHORT_PROXY }
-  const clipped = ctx.material.length > FULL_CLIP
-  const query = clipped ? ctx.material.slice(-FULL_CLIP) : ctx.material
+  if (ctx.thinking.trim().length === 0) return { arm: 'thinking_full', ms: 0, skipped: NO_THINKING }
+  if (ctx.thinking.length < ctx.cfg.minQueryChars) return { arm: 'thinking_full', ms: 0, skipped: SHORT_PROXY }
+  const { query, clipped } = clipFull(ctx.thinking)
   return retrieveArm(ctx, 'thinking_full', query, { clipped })
+}
+
+/**
+ * Keyed on the step's ANSWER text only (the visible narration), whatever `querySource` says.
+ * A step with no tool call is terminal: recall after the final answer cannot help.
+ */
+async function armNarrationFull(ctx: ArmCtx): Promise<ArmResult> {
+  if (!ctx.hasToolCall) return { arm: 'narration_full', ms: 0, skipped: 'terminal' }
+  if (ctx.answerText.trim().length === 0) return { arm: 'narration_full', ms: 0, skipped: NO_NARRATION }
+  if (ctx.answerText.length < ctx.cfg.minQueryChars) return { arm: 'narration_full', ms: 0, skipped: SHORT_PROXY }
+  const { query, clipped } = clipFull(ctx.answerText)
+  return retrieveArm(ctx, 'narration_full', query, { clipped })
 }
 
 async function armThinkingTail(ctx: ArmCtx): Promise<ArmResult> {
@@ -238,6 +273,15 @@ const RUNNERS: Record<ArmName, (ctx: ArmCtx) => Promise<ArmResult>> = {
   extract_model: armExtractModel,
   tool_input: armToolInput,
   novel_terms: armNovelTerms,
+  narration_full: armNarrationFull,
+}
+
+/** The text a text-keyed arm read; undefined for tool_input (it reads tool arguments, not text). */
+function sourceOf(name: ArmName, ctx: ArmCtx): 'thinking' | 'visible' | undefined {
+  if (name === 'thinking_full') return 'thinking'
+  if (name === 'narration_full') return 'visible'
+  if (name === 'tool_input') return undefined
+  return ctx.querySource
 }
 
 /**
@@ -257,5 +301,9 @@ export async function runArms(ctx: ArmCtx): Promise<Record<string, ArmResult>> {
       out[name] = { arm: name, ms: 0, error: `arm threw: ${String(s.reason).slice(0, 160)}` }
     }
   })
+  for (const name of arms) {
+    const source = sourceOf(name, ctx)
+    if (source !== undefined && out[name] !== undefined) out[name].source = source
+  }
   return out
 }

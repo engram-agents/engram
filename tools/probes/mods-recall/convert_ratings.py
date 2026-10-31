@@ -55,7 +55,7 @@ VERDICTS = ("better", "same", "worse")
 # anything is written. SAFE_ID duplicates hooks/record.ts SAFE_ID, the source of
 # truth (the mod only ever writes ids that match it); keep the two in step.
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
-KNOWN_ARMS = ("thinking_full", "thinking_tail", "extract_model", "tool_input", "novel_terms")
+KNOWN_ARMS = ("thinking_full", "thinking_tail", "extract_model", "tool_input", "novel_terms", "narration_full")
 # The live routes the mod joins from its ledger (hooks/route.ts ROUTES): metadata.arm is "route:<name>".
 ROUTE_NAMES = ("prompt_surface", "tool_recall")
 BLIND_LETTER = re.compile(r"^[A-Z]$")
@@ -405,9 +405,10 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
                     "msOverStep": _ms_over_step(ms, step.get("stepMs")),
                     "stepMs": _num(step.get("stepMs")),
                     "model": step.get("model"),
-                    # which material the arm's query was built from, per step: arms
-                    # A/B/C/E differ by step, so pooled scores would mix sources
-                    "querySource": step.get("querySource"),
+                    # which material the arm's query was built from: the arm's own
+                    # `source` when it recorded one (thinking_full and narration_full
+                    # always do), else the step's value (old step files, tool_input)
+                    "querySource": arm["source"] if arm.get("source") is not None else step.get("querySource"),
                     "visibleChars": step.get("visibleChars"),
                     "envelope": arm.get("envelope"),
                     "sessionId": step.get("sessionId", session.name),

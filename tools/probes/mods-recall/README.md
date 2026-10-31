@@ -14,11 +14,12 @@ Per model step (main loop only; subagent steps are skipped):
 
 1. `turn.step` is observed, never changed. Every chunk is yielded as received, in
    order, and the result is returned as received.
-2. After the step, off the turn's critical path (`$.clock.after(0, …)`), five
+2. After the step, off the turn's critical path (`$.clock.after(0, …)`), up to six
    retrieval **arms** run concurrently over the step, each through the same
    `engram_query` call (`return_debug: true`), so the comparison is about the
    QUERY, not the backend:
-   - `thinking_full` — the last 6000 chars of the step's proxy material (see "Query material")
+   - `thinking_full` — the last 6000 chars of the step's THINKING text only (see "Query material")
+   - `narration_full` — the last 6000 chars of the step's answer text only (its visible narration)
    - `thinking_tail` — its last 3 sentences (else the last 400 chars)
    - `extract_model` — a small model names 3 noun phrases the proxy material assumes
    - `tool_input` — the step's tool-call arguments (the control: today's PreToolUse channel)
@@ -55,6 +56,13 @@ menu or settings `pluginConfigs`): `enabled`, `topK` (1..20), `minQueryChars` (o
 (default `~/.engram/probe/mods-recall`; if `HOME` is unset the probe disables itself
 rather than guess a path). An invalid value logs a line and falls back to the default
 for that key only.
+
+The thinking / narration / tool-argument comparison runs with `arms=thinking_full,narration_full,tool_input`.
+`thinking_full` reads the step's thinking only and is skipped `no-thinking` when it is blank (it never falls back to
+the answer text); `narration_full` reads the answer text only, skipped `no-narration` when blank and `terminal` on a
+step with no tool call. Every text-keyed arm result records `source` (`thinking` or `visible`), and
+`convert_ratings.py` copies it into the unit's `querySource`. Step rows from before this change keyed `thinking_full`
+on the answer text on seats where thinking is hidden (`querySource: visible`), so those rows measured narration.
 
 Arm E reads the graph at `$ENGRAM_HOME/knowledge.db` when `ENGRAM_HOME` is set, else
 `~/.engram/knowledge.db` (read-only); the arm result's `db` field records which file
@@ -135,10 +143,10 @@ Only arm C (`extract_model`) sends text to a side model. Its input is the proxy
 material: the thinking text (thinking mode) or the step's answer text (visible mode).
 Raw tool-call arguments never reach arm C's side model, and since the proxy material
 never contains tool arguments in either mode, that guarantee now holds by construction
-(it was already tested; the test was widened: A/B/E now assert the sentinel is absent, and exactly one recall call, D's, carries it). Arm D's query (the tool arguments) goes
+(it was already tested; the test was widened: A/B/E now assert the sentinel is absent, and exactly one recall call, D's, carries it; `narration_full` and `thinking_full` are covered by the pilot-arm sentinel cells B5 and B5b). Arm D's query (the tool arguments) goes
 to the ENGRAM MCP server the probe discovered by tool-name prefix (the code does not
 verify that server is local) and is written to the local step files (the disclosure
-above); arms A, B and E now see only the proxy material, whose arm E helper runs as a
+above); arms A, B and E (and `narration_full`) now see only the proxy material or the answer text, whose arm E helper runs as a
 local python process on stdin. Step rows record `extractChars`, the length of what arm C
 was given (equal to `proxyChars`). Arm C is not called for a blank or short input.
 
@@ -166,10 +174,10 @@ Two materials per step, never mixed:
 
 - **Proxy material** (`proxyChars` on the row): the thinking text when the source is
   `thinking`, else the step's answer text ONLY (no tool-call arguments). The arms that
-  stand in for "what the agent was thinking" query it: A `thinking_full` (its last 6000
-  chars), B `thinking_tail` (its last 3 sentences), C `extract_model` (a side model's 3
+  stand in for "what the agent was thinking" query it: B `thinking_tail` (its last 3 sentences), C `extract_model` (a side model's 3
   noun phrases), E `novel_terms` (its high-IDF unseen terms). In thinking mode that is
-  the thinking; in visible mode it is the answer text.
+  the thinking; in visible mode it is the answer text. `thinking_full` and `narration_full`
+  do not use it: the first always reads the thinking, the second always the answer text.
 - **Tool arguments**: arm D `tool_input` queries the tool calls' arguments JSON (head
   2000 chars) in every mode. It is the control, and it is the only arm that sees them.
 

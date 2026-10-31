@@ -102,6 +102,7 @@ test('an append that is refused: the turn result is unchanged, the failure is lo
   const done = await $.turn.complete(COMPLETE)
   expect(done.text).toBe('done')
   expect(appended(seen).length).toBe(1) // the attempt reached the kit exactly once
+  expect(seen.appends.length).toBe(1) // the rig itself recorded the refused row (appended() would otherwise fall back to the log)
   expect(seen.logs.filter(l => l.includes('append refused')).length).toBe(1)
   expect(requestFile(seen)!.appended).toBe(false)
 })
@@ -358,4 +359,16 @@ test('R1 the request row ends with the empty ENGRAM marker, also when cut to a t
     if (maxChars >= REQUEST_MARKER.length) expect(cut.text.startsWith(REQUEST_MARKER)).toBe(true)
     if (maxChars >= threshold) expect(cut.text.endsWith(EMPTY_ENGRAM_MARKER)).toBe(true)
   }
+})
+
+test('B9 pilot arms: the request lists letters for exactly those three arms, and the letter map is in the step row', { options: { arms: 'thinking_full,narration_full,tool_input' } }, async ($, on) => {
+  const { seen } = await oneStep($, on)
+  await $.turn.complete(COMPLETE)
+  expect(appended(seen).length).toBe(1)
+  const text = appended(seen)[0]!.content[0]!.text
+  for (const letter of ['A', 'B', 'C']) expect(text).toContain(`${letter}: `)
+  for (const letter of ['D', 'E']) expect(text).not.toContain(`${letter}: `)
+  const row = stepFile(seen, TURN, 0)!
+  expect(Object.keys(row.armBlind).sort()).toEqual(['A', 'B', 'C'])
+  expect([...Object.values(row.armBlind)].sort()).toEqual(['narration_full', 'thinking_full', 'tool_input'])
 })
