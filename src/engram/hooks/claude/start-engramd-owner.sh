@@ -790,6 +790,10 @@ _alive() {
 # (_HEAD_CLIP), so the parts the contract promises -- flags, recovery, the readers' fate -- come first
 # and are short, and the path-bearing detail (the failure reason, ENGRAM_HOME) comes last. No path
 # appears twice and no log path is repeated: a long home must not push the promises into the middle.
+# The no-retry fact ("no supervisor will retry") is in the HEAD's opening words for the same reason: the
+# Flags ON list grows with every ON flag, so anything placed after it (such as the correction inside
+# $1) lands in the clipped middle at 3+ flags while the owner's own "the supervisor will retry" survives
+# in the tail. It is true for every caller on this path: no launchd GUI domain means nothing to retry.
 _launch_failed() {
     local _names _fate
     if [ "${_nogui:-0}" -ne 1 ]; then
@@ -804,7 +808,7 @@ _launch_failed() {
         *,stop_reads_via_owner,*) _fate="The stop hook blocks every stop until an owner answers." ;;
         *) _fate="The flagged readers have no owner until one answers." ;;
     esac
-    _report "OWNER REFUSED: no launchd GUI domain. Flags ON: ${_names:-unreadable}. Fix: set them false in config.json, or log in to a GUI session. $_fate Owner launch failed: $1. ENGRAM_HOME=$ENGRAM_HOME"
+    _report "OWNER REFUSED: no launchd GUI domain, so no supervisor will retry. Flags ON: ${_names:-unreadable}. Fix: set them false in config.json, or log in to a GUI session. $_fate Owner launch failed: $1. ENGRAM_HOME=$ENGRAM_HOME"
 }
 
 if [ ! -f "$OWNER_PY" ]; then
@@ -815,9 +819,12 @@ fi
 # argv is `<python> <plugin root>/engramd_owner.py`: it carries `engramd_owner`, which
 # engram_pidfile's program-identity guard looks for. The helper starts it detached (own
 # session, stdin /dev/null); its output is appended to the log under ENGRAM_HOME when that is a
-# regular file, else discarded. Prints `<pid> log` | `<pid> nolog` | `fail`.
+# regular file, else discarded. Prints `<pid> log <offset>` | `<pid> nolog` | `fail`; <offset> (#3775) is
+# the log's size at launch, so a later `refusal_since` counts only the bytes THIS launch appended.
 _launch="$("$PYTHON_BIN" "$IO_PY" launch "$ENGRAM_HOME" "$PYTHON_BIN" "$OWNER_PY" 2>/dev/null)"
+_off=""
 case "$_launch" in
+    [0-9]*" log "[0-9]*) _pid="${_launch%% *}"; _off="${_launch##* }"; _log_note="Log: $LOG_PATH" ;;
     [0-9]*" log") _pid="${_launch%% *}"; _log_note="Log: $LOG_PATH" ;;
     [0-9]*" nolog") _pid="${_launch%% *}"; _log_note="The log is unavailable (not a regular file): owner output discarded" ;;
     *)
@@ -881,6 +888,23 @@ if [ "$_ok" -eq 1 ]; then
         _report "UNSUPERVISED: engramd_owner launched (pid $_pid); no supervisor reachable ($_sup). ENGRAM_HOME=$ENGRAM_HOME. $_log_note"
     fi
 else
-    _launch_failed "the process exited within a second" "$_log_note"
+    # #3775: the launch died. Quote the owner's OWN last line from the bytes this launch appended (the
+    # helper opens the log; bash never does), never a reason guessed from an exit code this detached launch
+    # cannot see. Nothing appended (or no offset: a `nolog` launch) -> today's wording, unchanged. The
+    # owner's text may itself say "the supervisor will retry"; on THIS path no supervisor is reachable,
+    # so the wrapper says so BEFORE the quote: report() clips the middle of a long message, and with a
+    # long ENGRAM_HOME the correction must not be the part that is clipped away while the owner's
+    # clause survives. The quoted line is only "its last line": the filter takes the last `[engramd] `
+    # line that is not `listening on`, which may be a shutdown notice, so the hook does not call it a
+    # refusal (and does not classify the owner's text).
+    _reason=""
+    if [ -n "$_off" ]; then
+        _reason="$("$PYTHON_BIN" "$IO_PY" refusal_since "$ENGRAM_HOME" "$_off" 2>/dev/null)"
+    fi
+    if [ -n "$_reason" ]; then
+        _launch_failed "it exited within a second. No supervisor will retry here; start a new session once the cause is fixed. Its last line: $_reason" "$_log_note"
+    else
+        _launch_failed "the process exited within a second" "$_log_note"
+    fi
 fi
 exit 0

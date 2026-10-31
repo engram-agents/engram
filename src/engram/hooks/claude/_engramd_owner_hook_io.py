@@ -47,10 +47,19 @@ Subcommands (the shell switches on what they print; they never raise, and exit 0
       `_hooklib.emit_context` under the harness budget (trailer first). The injected
       head is the message with its middle clipped when long, so a very long ENGRAM_HOME
       cannot blow the budget; the diagnosis words lead every message.
-  launch <home> <python> <owner.py>  -> `<pid> log` | `<pid> nolog` | `fail`
+  launch <home> <python> <owner.py>  -> `<pid> log <offset>` | `<pid> nolog` | `fail`
       Starts the owner detached (own session, stdin /dev/null, ENGRAM_HOME in the env),
       its output appended to `<home>/engramd-owner.log` when that is a regular file,
-      else discarded (/dev/null).
+      else discarded (/dev/null). `<offset>` (#3775) is the log's size, read off the
+      append handle just before the owner is started: every byte this launch writes lands
+      at or after it.
+  refusal_since <home> <offset>  -> the owner's own last line (not a `listening on`), or nothing
+      #3775: the LAST line at or after byte `<offset>` of `<home>/engramd-owner.log` that
+      starts with `[engramd] ` and is not a `listening on` line, prefix stripped, one clean
+      line, clipped to REFUSAL_CLIP_CHARS. The read goes through `open_regular_text` (never
+      blocks on a FIFO) and stops REFUSAL_READ_CAP_BYTES past the offset. A missing /
+      non-regular / unreadable log, a bad offset, or no matching line prints nothing. Reads
+      only: nothing is written, and no reason is ever inferred from an exit code.
 """
 
 from __future__ import annotations
@@ -353,10 +362,43 @@ def report(home: str, message: str) -> None:
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
 
+# #3775: the owner's own last line, read back from what THIS launch appended to the log.
+REFUSAL_READ_CAP_BYTES = 64 * 1024  # bytes read past the launch offset; its reason is written first, and short
+REFUSAL_CLIP_CHARS = 400            # the quoted line is clipped to this many characters
+_OWNER_PREFIX = "[engramd] "
+_OWNER_LISTENING = "[engramd] listening on "  # the success line, never a reason
+
+
+def refusal_since(home: str, offset: str) -> str:
+    """The owner's own last `[engramd] ` line at/after byte `offset` of the log, or "" (see the module docstring).
+    Never raises, never blocks (the open is the #3628 non-blocking regular-file helper), reads at most
+    REFUSAL_READ_CAP_BYTES. Only a line that STARTS with `[engramd] ` counts: the hook's own report lines
+    carry a timestamp first, and the owner's tracebacks and library noise do not carry the prefix."""
+    try:
+        start = int(offset)
+        if start < 0:
+            return ""
+        with open_regular_text(os.path.join(home, "engramd-owner.log"), encoding="utf-8") as f:
+            f.buffer.seek(start)
+            data = f.buffer.read(REFUSAL_READ_CAP_BYTES)
+    except (OSError, ValueError):
+        return ""
+    for line in reversed(data.decode("utf-8", errors="replace").splitlines()):
+        if line.startswith(_OWNER_PREFIX) and not line.startswith(_OWNER_LISTENING):
+            text = " ".join("".join(c if c.isprintable() else " " for c in line[len(_OWNER_PREFIX):]).split())
+            text = text.rstrip(". ")  # the wrapper supplies the sentence's own full stop
+            if len(text) > REFUSAL_CLIP_CHARS:
+                text = text[: REFUSAL_CLIP_CHARS - 1].rstrip() + "\u2026"
+            return text
+    return ""
+
+
 def launch(home: str, python_bin: str, owner_py: str) -> str:
     log_state = "log"
+    offset = 0
     try:
         log = open_regular_text_append(os.path.join(home, "engramd-owner.log"), encoding="utf-8")
+        offset = os.fstat(log.fileno()).st_size  # before Popen: this launch's bytes all land at/after it
     except OSError:
         log, log_state = open(os.devnull, "a"), "nolog"
     try:
@@ -368,7 +410,7 @@ def launch(home: str, python_bin: str, owner_py: str) -> str:
         return "fail"
     finally:
         log.close()
-    return f"{proc.pid} {log_state}"
+    return f"{proc.pid} log {offset}" if log_state == "log" else f"{proc.pid} nolog"
 
 
 def main(argv: list) -> int:
@@ -386,6 +428,8 @@ def main(argv: list) -> int:
             report(argv[2], argv[3])
         elif cmd == "launch" and len(argv) == 5:
             print(launch(argv[2], argv[3], argv[4]))
+        elif cmd == "refusal_since" and len(argv) == 4:
+            print(refusal_since(argv[2], argv[3]))
     except Exception:
         pass
     return 0

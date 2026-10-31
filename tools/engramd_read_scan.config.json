@@ -89,6 +89,7 @@
   "hooks/claude/_engramd_owner_hook_io.py:_append_log",
   "hooks/claude/_engramd_owner_hook_io.py:report",
   "hooks/claude/_engramd_owner_hook_io.py:launch",
+  "hooks/claude/_engramd_owner_hook_io.py:refusal_since",
   "hooks/claude/_engramd_owner_hook_io.py:main",
   "hooks/claude/_engramd_owner_hook_io.py:_import_pidfile",
   "hooks/claude/_engramd_owner_hook_io.py:_import_sibling",
