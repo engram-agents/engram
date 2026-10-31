@@ -18,6 +18,7 @@ Fixture pattern: same fresh_server() shape as test_recall_summary_write_time.py.
 from __future__ import annotations
 
 import atexit
+import errno
 import json
 import os
 import shutil
@@ -28,15 +29,27 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TEST_DIR = tempfile.mkdtemp(prefix="engram_test_recall_summary_overrun_3537_")
-atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
+# Every fresh_server() call allocates a NEW dir (#4292): nothing is removed
+# before use, so a failed removal of an old dir cannot fail a cell, and a
+# leftover file in an old dir cannot reach the next store.
+TEST_DIR = None
+_DIRS: list = []
+
+
+def _cleanup_dirs():
+    for p in list(_DIRS):
+        shutil.rmtree(p, ignore_errors=True)
+
+
+atexit.register(_cleanup_dirs)
 
 KEY = "recall_summary_overrun"
 
 
 def fresh_server():
-    if os.path.exists(TEST_DIR):
-        shutil.rmtree(TEST_DIR)
+    global TEST_DIR
+    TEST_DIR = tempfile.mkdtemp(prefix="engram_test_recall_summary_overrun_3537_")
+    _DIRS.append(TEST_DIR)
     for key in list(sys.modules):
         if key == "server" or key.startswith("engram_"):
             del sys.modules[key]
@@ -272,3 +285,83 @@ def test_batch_items_carry_key_per_item():
     res = sorted(r["results"], key=lambda x: x["index"])
     assert res[0][KEY] == _expected(150)
     assert KEY not in res[1]
+
+
+# --- 7. fixture: fresh_server allocates a new temp dir per call (#4292) -------
+
+def _data_dir(srv) -> str:
+    return str(srv.core.DATA_DIR)
+
+
+def _fake_rmtree_factory(real, fail_for=None):
+    """rmtree stand-in: raises ENOTEMPTY (for every path, or only fail_for)
+    unless the caller passed ignore_errors=True, in which case it swallows."""
+    def fake(path, ignore_errors=False, *a, **kw):
+        if fail_for is None or str(path) == str(fail_for):
+            if ignore_errors:
+                return None
+            raise OSError(errno.ENOTEMPTY, "Directory not empty", str(path))
+        return real(path, ignore_errors=ignore_errors, *a, **kw)
+    return fake
+
+
+def test_fixture_two_calls_use_two_distinct_dirs():
+    srv1 = fresh_server()
+    d1 = TEST_DIR
+    srv2 = fresh_server()
+    d2 = TEST_DIR
+    assert d1 != d2
+    assert os.path.isdir(d1) and os.path.isdir(d2)
+    assert _data_dir(srv2) == d2
+
+
+def test_fixture_survives_unremovable_predecessor(monkeypatch):
+    monkeypatch.setattr(shutil, "rmtree", _fake_rmtree_factory(shutil.rmtree))
+    srv = fresh_server()
+    r, _ = _w_observation(srv, "x")
+    assert r.get("status") == "created", r
+
+
+def test_fixture_new_dir_has_no_stale_files():
+    srv1 = fresh_server()
+    baseline = _node_count(srv1)
+    _w_observation(srv1, "x")  # dirty the first store too
+    open(os.path.join(TEST_DIR, "stale-marker"), "w").close()
+    srv2 = fresh_server()
+    assert not os.path.exists(os.path.join(TEST_DIR, "stale-marker"))
+    assert _node_count(srv2) == baseline
+
+
+def test_fixture_cleanup_removes_every_dir_and_tolerates_failure(monkeypatch):
+    fresh_server()
+    fresh_server()
+    mine = list(_DIRS)
+    try:
+        assert TEST_DIR in mine and len(mine) >= 2
+        assert all(os.path.isdir(p) for p in mine)
+        # The FIRST removal fails: a cleanup that gives up at the first
+        # failure would leave every later dir behind.
+        survivor = mine[0]
+        monkeypatch.setattr(
+            shutil, "rmtree", _fake_rmtree_factory(shutil.rmtree, fail_for=survivor)
+        )
+        _cleanup_dirs()  # must not raise although one removal fails
+        assert os.path.isdir(survivor)  # proves the failure path was exercised
+        assert not any(os.path.exists(p) for p in mine[1:])
+        monkeypatch.undo()
+        _cleanup_dirs()
+        assert not any(os.path.exists(p) for p in mine)
+    finally:
+        monkeypatch.undo()
+        for p in mine:
+            shutil.rmtree(p, ignore_errors=True)
+
+
+def test_fixture_cleanup_is_registered_with_atexit(monkeypatch):
+    import importlib.util
+    registered = []
+    monkeypatch.setattr(atexit, "register", lambda fn, *a, **k: registered.append(fn))
+    spec = importlib.util.spec_from_file_location("_probe_3537", __file__)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod._cleanup_dirs in registered
