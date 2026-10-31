@@ -883,6 +883,17 @@
       "note": "engram-alpha#4234 (part of #3740): the read-only report on the engramd owner's per-day read-lock wait counters (lockwait-YYYY-MM-DD.json in the run dir) -- per-family reads / waited_reads / p95, and waited/reads for the tripwire family and its joins. ENGRAM-development tooling, real file under repo-root tools/, so 'source' is set explicitly."
     },
     {
+      "path": "tools/metricgate_adapter.py",
+      "tier": "dev",
+      "note": "The ONE import site of the metricgate library (engram-agents/metricgate v0.1.0, optional): have_metricgate / require_metricgate / append_run_record / judge_cell for the dev-tier measurement tools (the A6 latency tool, the lock-wait report). Real file under src/engram/tools/ with a repo-root tools/ link beside tools/_owner_read.py, so the dev tools import it as tools.metricgate_adapter. ENGRAM-development tooling; never ships to a user install."
+    },
+    {
+      "path": "tools/gates",
+      "tier": "dev",
+      "source": "tools/gates",
+      "note": "The pre-registered A6 gate files a6-<hook>.json (output of metricgate preregister, each carrying its gate_sha256), one per hook with an A6 arm. ENGRAM-development data read by tools/engramd_a6_latency.py --gate. Real directory directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly (same pattern as tools/probes)."
+    },
+    {
       "path": "tools/engramd_stage_profile.py",
       "tier": "dev",
       "source": "tools/engramd_stage_profile.py",

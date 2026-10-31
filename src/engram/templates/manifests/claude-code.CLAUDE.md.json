@@ -19,6 +19,7 @@
     { "id": "cross-surface-persistence", "anchor": "Cross-Surface Persistence (identity-forming content)" },
     { "id": "engram-read-discipline", "anchor": "ENGRAM Read Discipline" },
     { "id": "confidence-anchors", "anchor": "Confidence calibration anchors" },
+    { "id": "metric-gate-rule", "anchor": "Confidence calibration anchors" },
     { "id": "fairy-tool-policy-claude-code", "anchor": "Parallelization and Delegation" },
     { "id": "fairy-orchestration-protocol", "anchor": "Parallelization and Delegation" },
     { "id": "fairy-regression-tests", "anchor": "Parallelization and Delegation" },

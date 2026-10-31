@@ -20,13 +20,23 @@ The default run dir is `<ENGRAM_HOME>/run`, resolved as the other engramd tools 
 
 Exit 0 on success, and also when there are no lockwait files ("no lockwait files in <dir>"); exit 2
 on a bad argument or a malformed file, with the file and the reason named on stderr.
+
+With `--gate` the report also reads B2 (#3740) as a RATE through an interval, never a point against a line:
+for each day and family, and for the window total, a line `B2 <family>: waited/reads = k/n, Wilson 90%
+[lo%, hi%] -> <verdict>`. The verdict is `PASS` when the interval's UPPER bound is <= 1% and timed_out is 0;
+otherwise `NOT MET (upper bound x.xx% > 1%)` and/or `NOT MET (timed_out = k)`; a family with no reads is
+`NO DATA`. `wilson_interval` mirrors metricgate's `rate_ci(k, n, level, method="wilson")` locally (stdlib
+only, tested against scipy's `binomtest(...).proportion_ci(method="wilson")`), so this dev-tier report has no
+metricgate dependency for B2. Without `--gate` the output is unchanged.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
+from statistics import NormalDist
 from typing import Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -112,6 +122,63 @@ def render_day(date: str, families: Dict[str, dict]) -> List[str]:
     return lines
 
 
+B2_UPPER_BOUND = 0.01   # B2: the waited/reads rate's interval must sit at or under 1%
+B2_LEVEL = 0.90         # the two one-sided tests at alpha 0.05 are a 90% two-sided interval (R2)
+
+
+def wilson_interval(k: int, n: int, level: float = B2_LEVEL) -> Tuple[float, float]:
+    """The Wilson score interval for k successes in n trials, as (low, high) proportions. Mirrors metricgate's
+    `rate_ci(..., method="wilson")`. n == 0 has no interval: ValueError."""
+    if n <= 0:
+        raise ValueError("a Wilson interval needs at least one read")
+    z = NormalDist().inv_cdf((1.0 + level) / 2.0)
+    p = k / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2.0 * n)) / denom
+    half = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def b2_verdict(waited: int, reads: int, timed_out: int) -> str:
+    """The B2 verdict: PASS when the interval's upper bound is <= 1% and timed_out == 0; else NOT MET naming
+    what failed (both reasons when both fail); NO DATA for a family with no reads."""
+    if reads == 0:
+        return "NO DATA (reads = 0)"
+    _lo, hi = wilson_interval(waited, reads)
+    why = []
+    if hi > B2_UPPER_BOUND:
+        why.append(f"upper bound {100.0 * hi:.2f}% > 1%")
+    if timed_out != 0:
+        why.append(f"timed_out = {timed_out}")
+    return "PASS" if not why else "NOT MET (" + "; ".join(why) + ")"
+
+
+def b2_line(name: str, waited: int, reads: int, timed_out: int) -> str:
+    head = f"B2 {name}: waited/reads = {waited}/{reads}"
+    if reads == 0:
+        return f"{head} -> {b2_verdict(waited, reads, timed_out)}"
+    lo, hi = wilson_interval(waited, reads)
+    return (f"{head}, Wilson {int(round(B2_LEVEL * 100))}% [{100.0 * lo:.2f}%, {100.0 * hi:.2f}%] "
+            f"-> {b2_verdict(waited, reads, timed_out)}")
+
+
+def render_b2(families: Dict[str, dict], all_label: Optional[str] = None) -> List[str]:
+    """One B2 line per family (sorted); with `all_label`, one more line for the total over every family."""
+    lines = [b2_line(name, e["waited_reads"], e["reads"], e["timed_out"]) for name, e in sorted(families.items())]
+    if all_label is not None:
+        lines.append(b2_line(all_label, sum(e["waited_reads"] for e in families.values()),
+                             sum(e["reads"] for e in families.values()),
+                             sum(e["timed_out"] for e in families.values())))
+    return lines
+
+
+def _add_into(total: Dict[str, dict], families: Dict[str, dict]) -> None:
+    for name, e in families.items():
+        t = total.setdefault(name, {"reads": 0, "waited_reads": 0, "timed_out": 0})
+        for field in ("reads", "waited_reads", "timed_out"):
+            t[field] += e[field]
+
+
 def _positive_int(text: str) -> int:
     try:
         value = int(text)
@@ -127,6 +194,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--days", type=_positive_int, required=True, metavar="N", help="the last N UTC days present")
     p.add_argument("--run-dir", type=Path, default=None, metavar="DIR",
                    help="the directory holding the lockwait-*.json files (default: the owner's run dir)")
+    p.add_argument("--gate", action="store_true",
+                   help="also print the B2 rate through a Wilson 90%% interval and its verdict, per day and "
+                        "family and for the window total")
     args = p.parse_args(argv)
     if args.run_dir is not None:
         run_dir = args.run_dir
@@ -141,14 +211,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"no lockwait files in {run_dir}")
         return 0
     out: List[str] = []
-    for path in files[-args.days:]:
+    window: Dict[str, dict] = {}
+    shown = files[-args.days:]
+    for path in shown:
         try:
             date, families = parse_file(path)
         except MalformedFile as exc:
             print(f"engramd_lockwait_report: error -- {path.name}: {exc}", file=sys.stderr)
             return 2
         out.extend(render_day(date, families))
+        if args.gate:
+            out.extend(render_b2(families))
+            _add_into(window, families)
         out.append("")
+    if args.gate:
+        out.append(f"== window total ({len(shown)} day{'s' if len(shown) != 1 else ''}) ==")
+        out.extend(render_b2(window, all_label="all families"))
     print("\n".join(out).rstrip())
     return 0
 

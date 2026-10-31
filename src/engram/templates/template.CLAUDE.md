@@ -213,6 +213,8 @@ Confidence is computed, not chosen. Observations take it from `quote_type` + `so
 
 **If a returned number feels wrong, fix the inputs, not the number:** usually the wrong `reasoning_type` or a weak or mis-cited premise. That friction is the calibration working.
 
+A metric gate is an interval against a pre-registered band, never a point against a line.
+
 ## Parallelization and Delegation
 
 ### Tool policy — the standing request that keeps delegation possible

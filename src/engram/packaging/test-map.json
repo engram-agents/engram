@@ -512,9 +512,25 @@
     {
       "path_prefix_or_glob": "tools/engramd_lockwait_report.py",
       "test_globs": [
-        "tests/test_engramd_lockwait_4234.py"
+        "tests/test_engramd_lockwait_4234.py",
+        "tests/test_lockwait_report_gate_metricgate.py"
       ],
       "note": "engram-alpha#4234: loaded by tests/test_engramd_lockwait_4234.py via importlib (file path), so it is invisible to the layer-1 import graph."
+    },
+    {
+      "path_prefix_or_glob": "tools/metricgate_adapter.py",
+      "test_globs": [
+        "tests/test_metricgate_adapter.py",
+        "tests/test_a6_metricgate_emitter_metricgate.py"
+      ],
+      "note": "metricgate adoption: loaded by tests/test_metricgate_adapter.py via importlib (file path), so it is invisible to the layer-1 import graph."
+    },
+    {
+      "path_prefix_or_glob": "tools/gates/",
+      "test_globs": [
+        "tests/test_metricgate_gate_files.py"
+      ],
+      "note": "metricgate adoption: JSON data files read by path, so they are invisible to the layer-1 import graph."
     },
     {
       "path_prefix_or_glob": "tools/engramd_stage_profile.py",

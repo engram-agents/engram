@@ -1,0 +1,23 @@
+{
+  "alpha": 0.05,
+  "block_bound": 0.1,
+  "deciders": {
+    "trade_off": "the lane's design owner (Borges for EngramManager); Lei informed"
+  },
+  "design": "paired interleaved baseline/owner per iteration inside one run; runs are the unit",
+  "direction": "lower_is_better",
+  "gate_sha256": "6c75242ad733c7522d07628ac4d41b7e76fe99baaa6fc0e91d441a22b639cc39",
+  "instrument": "tools/engramd_a6_latency.py --hook stop --n 300",
+  "instrument_version": "b7f963f3ebee70311fd0cf5c87b797d0f4f1d6b6",
+  "margin": 0.03,
+  "metric": "sequential p50 per run (ms), owner path vs baseline path",
+  "metricgate_version": "0.1.0",
+  "n_planned": 6,
+  "paired": true,
+  "population": "installed layout, real-store copy, one (SQLite build, exclusion setting) cell per JSONL pair; the cell is named in the JSONL file name",
+  "registered_at": "2026-10-31T14:45:22Z",
+  "scale": "log_ratio",
+  "unit": "ms",
+  "unit_of_analysis": "run",
+  "verdict_rule": "B1 (engram-alpha#3740): PASS when the 90% CI upper bound of the owner/baseline sequential-p50 ratio is <= 1.03 at the planned n (6 runs); TRADE_OFF when the ratio estimate is <= 10% above 1 (<= 1.10) and the upper bound is above 1.03, decided by the lane's design owner with the structural or safety gain named in writing, Lei informed; BLOCK when the ratio estimate is beyond 1.10. Absolute rider: 0.5 ms per fire. metricgate v0.1 has no absolute-margin field, so the 0.5 ms is a guardrail read by the design owner from the report's estimate, not computed by the gate."
+}

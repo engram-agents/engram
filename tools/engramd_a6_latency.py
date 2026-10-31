@@ -1922,6 +1922,10 @@ def _is_gate_cell(r: Dict) -> bool:
     return r.get("layout") == GATE_LAYOUT and r.get("store_cell") == GATE_CELL
 
 
+# The point ratio is information; the gate is the metricgate interval against the pre-registered gate.json
+# (docs/internal/METRIC-GATE-POLICY.md R2). `passes` stays in the result dicts for compatibility.
+POINT_RATIO_LABEL = "point ratio (not the gate; the gate is the metricgate interval against gate.json)"
+
 TRIPWIRE_FLIP_RULE = (
     "For `engramd.lesson_tripwire_reads_via_owner`: a seat flips only when (a) the installed-layout A6 tripwire "
     "gate cell, on its OWN SQLite build with its OWN exclusion setting, reads sequential p50 owner/baseline <= 1.0 "
@@ -1981,21 +1985,22 @@ def surface_gate(results: List[Dict]) -> Dict:
                    "(the store axis flipped the tripwire's gate, #3740).")
         if others:
             verdict += f" Reported, not the gate: {others}."
-        return {"gate_cell_present": False, "passes": False, "ratio": None, "verdict": verdict,
-                "findings": findings, "owed": owed}
+        return {"gate_cell_present": False, "passes": False, "gate_is_metricgate": True, "ratio": None,
+                "verdict": verdict, "findings": findings, "owed": owed}
     ratio = _arm_ratios(gate).get("sequential")
     if ratio is None:
-        return {"gate_cell_present": False, "passes": False, "ratio": None, "findings": findings, "owed": owed,
+        return {"gate_cell_present": False, "passes": False, "gate_is_metricgate": True, "ratio": None,
+                "findings": findings, "owed": owed,
                 "verdict": "SURFACE A6 VERDICT -- NO GATE CELL: the gate cell has no sequential rows. NOT A PASS."}
     passes = ratio <= 1.0
     sqlite_v = (gate.get("env") or {}).get("sqlite", "?")
     verdict = (f"SURFACE A6 VERDICT -- GATE CELL = real-store copy, {GATE_LAYOUT} layout: sequential p50 "
-               f"owner/baseline = {ratio:.2f}x -> {'PASS (<= 1.0)' if passes else 'FAIL (> 1.0)'}. "
+               f"owner/baseline = {ratio:.2f}x -> {POINT_RATIO_LABEL}: {'PASS (<= 1.0)' if passes else 'FAIL (> 1.0)'}. "
                f"{per_seat_scope(sqlite_v)}")
     if others:
         verdict += f" Reported, NOT the gate: {others}."
-    return {"gate_cell_present": True, "passes": passes, "ratio": ratio, "verdict": verdict,
-            "findings": findings, "owed": owed}
+    return {"gate_cell_present": True, "passes": passes, "gate_is_metricgate": True, "ratio": ratio,
+            "verdict": verdict, "findings": findings, "owed": owed}
 
 
 def surface_gate_violations(results: List[Dict]) -> List[str]:
@@ -2503,7 +2508,7 @@ def _session_start_header_lines(result: Dict) -> List[str]:
         f"readers reached OFF {len(result['readers_reached_off'])}/{len(SS_READERS)}, "
         f"ON {len(result['readers_reached_on'])}/{len(SS_READERS)}",
         f"GATE cell -- sequential p50 owner/baseline = {ratio:.3f}x "
-        f"({'<= 1.0: PASS' if ratio <= 1.0 else '> 1.0: FAIL'}). "
+        f"-> {POINT_RATIO_LABEL}: ({'<= 1.0: PASS' if ratio <= 1.0 else '> 1.0: FAIL'}). "
         + per_seat_scope(result["env"]["sqlite"], decides=_decides(result)),
     ]
     if cold:
@@ -2645,6 +2650,289 @@ def _load_owner_read():
     return owner_read
 
 
+# --- metricgate run records and the gate verdict (docs/internal/METRIC-GATE-POLICY.md) ----------------------------
+
+def _load_adapter():
+    """The ONE import site of the metricgate library (tools/metricgate_adapter.py); this tool never imports
+    metricgate itself. The repo root is appended to sys.path (never inserted, #2565) so `tools` resolves as it
+    does under pytest."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.append(str(REPO_ROOT))
+    from tools import metricgate_adapter
+    return metricgate_adapter
+
+
+def _run_context() -> tuple:
+    """(host, build, load) for a run record: the hostname, the commit of the tree under test (the installed
+    layout was built from it and checked byte-for-byte against it; `+dirty` when tracked files differ), and the
+    1-minute load average as text, read at the END of the run (so it includes the tool's own load). Raises RuntimeError when one cannot be read: a record never gets a made-up
+    value, the run is simply not emitted."""
+    import socket
+    git = ["git", "-C", str(REPO_ROOT)]
+    try:
+        head = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
+        dirty = subprocess.run(git + ["status", "--porcelain", "--untracked-files=no"], capture_output=True,
+                               text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"cannot read the tree's commit ({exc})")
+    if head.returncode != 0 or not head.stdout.strip() or dirty.returncode != 0:
+        raise RuntimeError("cannot read the tree's commit (git rev-parse HEAD failed)")
+    build = head.stdout.strip() + ("+dirty" if dirty.stdout.strip() else "")
+    try:
+        load = f"{os.getloadavg()[0]:.2f}"
+    except (OSError, AttributeError) as exc:
+        raise RuntimeError(f"cannot read the load average ({exc})")
+    return socket.gethostname(), build, load
+
+
+def _gate_result(results: List[Dict], hook: str, store_is_copy: bool) -> tuple:
+    """-> (result, None) for the GATE cell, else (None, reason). The gate cell is the installed layout on the
+    real-store copy: for `surface` the cell named `real-store`; for the other hooks the installed result, which
+    is the registered population only when `--store` named a COPY of a real store (a synthetic store must not
+    land in a file the gate registers as the real-store cell)."""
+    installed = [r for r in results if r.get("layout") == GATE_LAYOUT]
+    if not installed:
+        return None, f"no result on the {GATE_LAYOUT} layout (--layout source measures the checkout, never the gate cell)"
+    if hook == "surface":
+        cells = [r for r in installed if r.get("store_cell") == GATE_CELL]
+        if not cells:
+            return None, f"no {GATE_CELL} cell on the {GATE_LAYOUT} layout"
+        return cells[0], None
+    if not store_is_copy:
+        return None, ("this run used a synthetic store, but the gate registers the real-store copy cell: "
+                      "pass --store with a COPY of a real store")
+    return installed[0], None
+
+
+def _sequential_p50s(result: Dict) -> tuple:
+    """-> ((baseline_ms, owner_ms), None) read from the result's own sequential rows (the rows the table is built
+    from; `p50_ms` is _summarise's key), else (None, reason). Never recomputed."""
+    by = {(r.get("arm"), r.get("path")): r for r in result.get("rows") or []}
+    got = []
+    for path in ("baseline", "owner"):
+        row = by.get(("sequential", path))
+        if row is None or not isinstance(row.get("p50_ms"), (int, float)):
+            return None, f"the gate cell has no sequential {path} p50 row"
+        got.append(float(row["p50_ms"]))
+    return (got[0], got[1]), None
+
+
+def _gate_run_id(end: "datetime.datetime", build: str, hook: str, sqlite_v: str, excl: str) -> str:
+    """`<ts compact>-<first 8 hex of the sha256 over build|hook|sqlite_version|exclusion>`: the run's id in its
+    records AND in its attempts-ledger line (one run, one id)."""
+    import hashlib
+    digest = hashlib.sha256("|".join([build, hook, str(sqlite_v), excl]).encode("utf-8")).hexdigest()[:8]
+    return f"{end.astimezone(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{digest}"
+
+
+def emit_gate_runs(results: List[Dict], *, hook: str, exclusion: bool, store_is_copy: bool, out_dir: Path,
+                   end: "datetime.datetime", host: str, build: str, load: str) -> tuple:
+    """Append the run records of the GATE cell's SEQUENTIAL arm: two records with ONE run_id, one per path, to
+    `out_dir/a6-<hook>-<sqlite_version>-excl<on|off>-<baseline|owner>.jsonl`. stat = that path's sequential p50
+    (ms) as read from the result rows; ts = `end` (UTC); run_id = `<ts compact>-<first 8 hex of the sha256 over
+    build|hook|sqlite_version|exclusion>`. -> (paths, None), or ([], reason) when there is nothing to emit
+    (nothing is written and `out_dir` is not created)."""
+    gate, why = _gate_result(results, hook, store_is_copy)
+    if gate is None:
+        return [], why
+    p50s, why = _sequential_p50s(gate)
+    if p50s is None:
+        return [], why
+    sqlite_v = (gate.get("env") or {}).get("sqlite")
+    if not sqlite_v:
+        return [], "the gate cell's env block carries no sqlite version"
+    adapter = _load_adapter()
+    end = end.astimezone(datetime.timezone.utc)
+    ts = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+    excl = "on" if exclusion else "off"
+    run_id = _gate_run_id(end, build, hook, sqlite_v, excl)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for path_name, stat_ms in zip(("baseline", "owner"), p50s):
+        f = out_dir / f"a6-{hook}-{sqlite_v}-excl{excl}-{path_name}.jsonl"
+        adapter.append_run_record(f, run_id=run_id, ts=ts, stat=stat_ms, host=host, build=build, load=load)
+        paths.append(f)
+    return paths, None
+
+
+def hook_contract_violations(hook: str, results: List[Dict]) -> List[str]:
+    """The per-hook contract checks of a run, in ONE place: main() prints them after the table (exit 3) and the
+    emit step refuses on them (R11: a run that breaks its hook's contract is not a latency sample, correctness
+    before any number). A new per-hook check is added here and reaches both. Each line carries its layout (and,
+    for surface, its store cell) as a prefix. `answers_match` is not part of this list: for tripwire,
+    session-start and surface a differing stdout is already a stdout_match violation, and main() reads the
+    rest through its exit 1."""
+    out: List[str] = []
+    if hook == "surface":
+        out += [f"[{r.get('layout', '?')} layout, {r.get('store_cell', '?')} cell] {v}"
+                for r in results for v in surface_contract_violations(r)]
+        out += surface_gate_violations(results)
+    elif hook == "tripwire":
+        out += [f"[{r.get('layout', '?')} layout] {v}" for r in results for v in u8_contract_violations(r)]
+    elif hook == "session-start":
+        out += [f"[{r.get('layout', '?')} layout] {v}" for r in results for v in ss_contract_violations(r)]
+    return out
+
+
+def metricgate_epilogue(results: List[Dict], *, hook: str, exclusion: bool, store_is_copy: bool,
+                        emit_dir: Optional[Path], gate_path: Optional[Path], end: Optional["datetime.datetime"] = None,
+                        context: Optional[tuple] = None) -> None:
+    """The `--emit-runs` / `--gate` step, run once after the table is printed. Neither flag: prints nothing.
+    `--emit-runs`: appends the gate cell's records; when there is nothing to emit (source layout,
+    --no-real-store, contract violations, an unreadable context) ONE stderr line says why. `--gate` (needs
+    --emit-runs): with the library importable, prints the metricgate report under `metricgate verdict (R12)`;
+    absent, ONE stderr line from MetricgateMissing and the stdout is left as it was."""
+    if emit_dir is None:
+        return
+    adapter = _load_adapter()
+    when = end if end is not None else datetime.datetime.now(datetime.timezone.utc)
+    excl = "on" if exclusion else "off"
+    # A contract break is the cell's verdict (the ledger), so it is told apart from "this run has no gate cell":
+    # for --hook surface the absent gate cell is also one of the hook's contract violations (exit 3), but it is
+    # recorded under its own reason (source_layout / no_real_store_cell), never as a broken contract.
+    absent = surface_gate_violations(results) if hook == "surface" else []
+    bad = [f"[{r.get('layout', '?')} layout] answers_match is not true" for r in results
+           if not r.get("answers_match")] + [v for v in hook_contract_violations(hook, results) if v not in absent]
+    ctx_error = None
+    try:
+        host, build, load = context if context is not None else _run_context()
+    except RuntimeError as exc:
+        ctx_error = exc
+        host, build, load = _fallback_context()
+    sqlite_v = _cell_sqlite(results, hook, store_is_copy)
+    code, why = _emission_refusal(results, hook, store_is_copy)
+    if bad:
+        reason = f"{CONTRACT_VIOLATION_REASON}: {bad[0]}"
+        message = (f"the run broke its contract ({bad[0]}"
+                   f"{'; +%d more' % (len(bad) - 1) if len(bad) > 1 else ''})")
+    elif ctx_error is not None:
+        reason, message = "unreadable_context", str(ctx_error)
+    else:
+        reason, message = code, why
+    run_id = _gate_run_id(when, build, hook, sqlite_v, excl)
+    ledger = attempts_ledger_path(emit_dir, hook, sqlite_v, exclusion)
+    # The ledger line comes FIRST and whether or not the records follow: a refused run is still a run on the
+    # cell. A cell whose ledger cannot be written has no record, so nothing is emitted.
+    failure = _append_attempt(adapter, ledger, run_id=run_id, end=when, emitted=reason is None, reason=reason,
+                              host=host, build=build)
+    if failure is not None:
+        print(f"engramd_a6_latency: --emit-runs: nothing emitted, the attempts ledger {ledger} cannot be "
+              f"written ({failure})", file=sys.stderr)
+        return
+    paths = []
+    if reason is not None:
+        print(f"engramd_a6_latency: --emit-runs: nothing emitted, {message}", file=sys.stderr)
+    else:
+        paths, why = emit_gate_runs(results, hook=hook, exclusion=exclusion, store_is_copy=store_is_copy,
+                                    out_dir=emit_dir, end=when, host=host, build=build, load=load)
+        if not paths:
+            print(f"engramd_a6_latency: --emit-runs: nothing emitted, {why}", file=sys.stderr)
+    if gate_path is None:
+        return
+    try:
+        violated = bool(adapter.contract_violations(adapter.read_attempts(ledger)))
+    except (OSError, ValueError) as exc:
+        print(f"engramd_a6_latency: --gate: cannot read the attempts ledger {ledger}: {exc}", file=sys.stderr)
+        return
+    if not violated:
+        if not paths:
+            return   # this run added no record: nothing new to judge
+        if not adapter.have_metricgate():   # the MetricgateMissing message: one line, names the install
+            print(f"engramd_a6_latency: --gate: {adapter.MISSING_MESSAGE}", file=sys.stderr)
+            return
+    baseline = Path(emit_dir) / f"a6-{hook}-{sqlite_v}-excl{excl}-baseline.jsonl"
+    owner = Path(emit_dir) / f"a6-{hook}-{sqlite_v}-excl{excl}-owner.jsonl"
+    try:   # a contract break in the ledger is NO_VERDICT from the ledger alone (no library, no record file)
+        verdict, markdown = adapter.judge_cell(gate_path, baseline, owner, attempts_path=ledger)
+    except (OSError, ValueError) as exc:   # an unreadable gate, a bad record file, unpaired run ids
+        print(f"engramd_a6_latency: --gate: cannot read the cell against {gate_path}: {exc}", file=sys.stderr)
+        return
+    print(f"\nmetricgate verdict (R12): {verdict}\n\n{markdown}")
+
+
+CONTRACT_VIOLATION_REASON = "contract_violation"
+
+
+def attempts_ledger_path(out_dir: Path, hook: str, sqlite_v: str, exclusion: bool) -> Path:
+    """`out_dir/a6-<hook>-<sqlite>-excl<on|off>-attempts.jsonl`: the cell's attempts ledger, beside its records."""
+    return Path(out_dir) / f"a6-{hook}-{sqlite_v}-excl{'on' if exclusion else 'off'}-attempts.jsonl"
+
+
+def _fallback_context() -> tuple:
+    """(host, build, load) for a LEDGER line when the run context is unreadable: the hostname and the build
+    `unknown`. Never used for a run record."""
+    import socket
+    return socket.gethostname(), "unknown", ""
+
+
+def _cell_sqlite(results: List[Dict], hook: str, store_is_copy: bool) -> str:
+    """The SQLite version that names the cell: the gate cell's env block, else any result's, else this
+    interpreter's (the layout child runs under the same interpreter, so the same library)."""
+    gate, _ = _gate_result(results, hook, store_is_copy)
+    for r in ([gate] if gate is not None else []) + list(results):
+        v = (r.get("env") or {}).get("sqlite")
+        if v:
+            return str(v)
+    return sqlite3.sqlite_version
+
+
+def _emission_refusal(results: List[Dict], hook: str, store_is_copy: bool) -> tuple:
+    """-> (None, None) when the gate cell can be emitted, else (ledger reason code, one-line why): `source_layout`
+    (no installed result), `no_real_store_cell` (--hook surface without the real-store cell), `synthetic_store`
+    (another hook measured on a synthetic store), else `no_sequential_p50` / `no_sqlite_version` (the cell's rows
+    or env block lack what the record needs). Mirrors `_gate_result` and `emit_gate_runs`' own refusals."""
+    gate, why = _gate_result(results, hook, store_is_copy)
+    if gate is None:
+        if not any(r.get("layout") == GATE_LAYOUT for r in results):
+            return "source_layout", why
+        return ("no_real_store_cell" if hook == "surface" else "synthetic_store"), why
+    p50s, why = _sequential_p50s(gate)
+    if p50s is None:
+        return "no_sequential_p50", why
+    if not (gate.get("env") or {}).get("sqlite"):
+        return "no_sqlite_version", "the gate cell's env block carries no sqlite version"
+    return None, None
+
+
+def _append_attempt(adapter, ledger: Path, *, run_id: str, end: "datetime.datetime", emitted: bool,
+                    reason: Optional[str], host: str, build: str) -> Optional[str]:
+    """Append one ledger line (creating the directory). -> None, or the OSError text when it cannot be written."""
+    ts = end.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        Path(ledger).parent.mkdir(parents=True, exist_ok=True)
+        adapter.append_attempt(ledger, run_id=run_id, ts=ts, emitted=emitted, reason=reason, host=host,
+                               build=build)
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def record_layout_timeout(emit_dir: Path, *, hook: str, exclusion: bool,
+                          end: Optional["datetime.datetime"] = None, context: Optional[tuple] = None,
+                          sqlite_version: Optional[str] = None) -> bool:
+    """The ledger line of a run the layout timeout killed: it never reaches the epilogue, so main()'s timeout
+    handler calls this (`reason: layout_timeout`). The cell's SQLite version is this interpreter's (no result
+    came back to name it). An unreadable context falls back as in the epilogue. -> True when written, else one
+    stderr line and False (the timeout's own exit code is unchanged)."""
+    adapter = _load_adapter()
+    when = end if end is not None else datetime.datetime.now(datetime.timezone.utc)
+    try:
+        host, build, _load = context if context is not None else _run_context()
+    except RuntimeError:
+        host, build, _load = _fallback_context()
+    sqlite_v = sqlite_version or sqlite3.sqlite_version
+    ledger = attempts_ledger_path(emit_dir, hook, sqlite_v, exclusion)
+    run_id = _gate_run_id(when, build, hook, sqlite_v, "on" if exclusion else "off")
+    failure = _append_attempt(adapter, ledger, run_id=run_id, end=when, emitted=False, reason="layout_timeout",
+                              host=host, build=build)
+    if failure is not None:
+        print(f"engramd_a6_latency: --emit-runs: the layout timeout could not be recorded, the attempts ledger "
+              f"{ledger} cannot be written ({failure})", file=sys.stderr)
+        return False
+    return True
+
+
 def _check_store_arg(path: Path) -> Optional[str]:
     """The `--store` precheck (#3962): None for a usable store, else the classifier's one-line message.  It runs
     BEFORE `_is_live_store` (whose `Path.resolve()` raises on a symlink loop) and before any build, layout child or
@@ -2756,6 +3044,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--layout-timeout", type=_positive_int, default=DEFAULT_LAYOUT_TIMEOUT, metavar="SECONDS",
                    help=f"per-layout child time limit in seconds, an int > 0 (default {DEFAULT_LAYOUT_TIMEOUT}); "
                         "the session-start arm on a large store can need more")
+    p.add_argument("--emit-runs", type=Path, default=None, metavar="DIR",
+                   help="after a completed run, append the gate cell's sequential p50 as two run records (one "
+                        "per path, one run_id) to DIR/a6-<hook>-<sqlite>-excl<on|off>-<baseline|owner>.jsonl, "
+                        "for metricgate (docs/internal/METRIC-GATE-POLICY.md). Use one fresh directory per "
+                        "announced cell (one build, one SQLite build, one exclusion setting, one planned n): "
+                        "appending a 7th run to a planned-6 cell makes the cell NO_VERDICT by design. Nothing is "
+                        "emitted for --layout source, --no-real-store, or a run that broke its contract; one "
+                        "stderr line says so")
+    p.add_argument("--gate", type=Path, default=None, metavar="GATE.json",
+                   help="(needs --emit-runs) read the emitted cell against this pre-registered gate "
+                        "(tools/gates/a6-<hook>.json) and print the metricgate report under the table; "
+                        "without the library, one stderr line names the install and the output is unchanged")
     p.add_argument("--_layout-child", dest="layout_child", default=None, help=argparse.SUPPRESS)
     p.add_argument("--_kwargs", dest="child_kwargs", default="{}", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
@@ -2768,6 +3068,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "name the copy source with --real-store")
     if args.real_store is not None and args.no_real_store:
         p.error("--real-store and --no-real-store are mutually exclusive")
+    if args.gate is not None and args.emit_runs is None:
+        p.error("--gate reads the records --emit-runs just wrote: pass --emit-runs DIR with it")
     if args.layout_child:
         return _layout_child(args.layout_child, args.child_kwargs)
     # The two entry paths that read ENGRAM_HOME: --store (is it this seat's live store?) and --hook surface without
@@ -2834,6 +3136,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(f"engramd_a6_latency: error -- layout '{name}' exceeded --layout-timeout "
                           f"{args.layout_timeout}s (session-start on a large store can need more; "
                           "pass --layout-timeout)", file=sys.stderr)
+                    if args.emit_runs is not None:   # the killed run never reaches the epilogue: record it here
+                        record_layout_timeout(args.emit_runs, hook=args.hook, exclusion=(args.exclusion == "on"))
                     return EXIT_LAYOUT_TIMEOUT
                 except (ArmBlind, LayoutViolation) as exc:
                     print(f"engramd_a6_latency: BLIND ARM ({type(exc).__name__}) -- no number produced: "
@@ -2843,24 +3147,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         if real_home is not None:
             shutil.rmtree(real_home, ignore_errors=True)
     print(format_layouts(results))
+    metricgate_epilogue(results, hook=args.hook, exclusion=(args.exclusion == "on"),
+                        store_is_copy=args.store is not None, emit_dir=args.emit_runs, gate_path=args.gate)
     if args.hook == "surface":
         gate = surface_gate(results)
         print("\n" + "\n".join([gate["verdict"], *gate["findings"], *gate["owed"]]))
-        violations = [f"[{r.get('layout', '?')} layout, {r.get('store_cell', '?')} cell] {v}"
-                      for r in results for v in surface_contract_violations(r)] + surface_gate_violations(results)
-        if violations:
-            print("\nSurface contract violations:\n" + "\n".join(f"  - {v}" for v in violations))
-            return 3
-    if args.hook == "tripwire":
-        violations = [f"[{r.get('layout', '?')} layout] {v}" for r in results for v in u8_contract_violations(r)]
-        if violations:
-            print("\nU8 contract violations:\n" + "\n".join(f"  - {v}" for v in violations))
-            return 3
-    if args.hook == "session-start":
-        violations = [f"[{r.get('layout', '?')} layout] {v}" for r in results for v in ss_contract_violations(r)]
-        if violations:
-            print("\nSession-start contract violations:\n" + "\n".join(f"  - {v}" for v in violations))
-            return 3
+    violations = hook_contract_violations(args.hook, results)
+    if violations:
+        heading = {"surface": "Surface", "tripwire": "U8", "session-start": "Session-start"}[args.hook]
+        print(f"\n{heading} contract violations:\n" + "\n".join(f"  - {v}" for v in violations))
+        return 3
     # (so exit 1 never occurs for --hook tripwire, session-start or surface: a differing stdout -- answers_match
     # False -- is a stdout_match violation and has already returned 3 above)
     return 0 if all(r["answers_match"] for r in results) else 1
