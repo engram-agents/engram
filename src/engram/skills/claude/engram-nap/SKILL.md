@@ -102,10 +102,10 @@ printed line never asserts more than the note itself actually knows
 Run the worktree garbage-collector to remove orphaned coder/reviewer-fairy worktrees whose PRs have merged or closed:
 
 ```bash
-python tools/worktree-gc.py --apply
+"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py --apply
 ```
 
-Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), and never touches the main checkout. Dry-run mode (`python tools/worktree-gc.py` without `--apply`) is available to preview the plan first. Idempotent — a second run on a clean state is a no-op.
+Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), and never touches the main checkout. Dry-run mode (`"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py` without `--apply`) is available to preview the plan first. Idempotent — a second run on a clean state is a no-op.
 
 Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present (pre-T2 install or worktree GC not yet shipped).
 
@@ -255,10 +255,10 @@ If the nap fired because a compaction warning is active, explicitly say: "Ready 
 Last, after Step 5b and the focus rotation (Step 7): the context the tool assembles carries the focus list and the warm-briefing arc, so both must be final. This step only leaves a request; the `engram-compaction` mod, if the person has installed it (it is on by default once installed; `enabled: false` turns it off), acts on it at the end of the answered turn that runs this step, so end the turn normally and do not tell the person it will compact "next turn". With the mod off the request is never read (the files stay on disk; an unconsumed request ages out after 30 minutes).
 
 - **A loop marker exists** (`~/.engram/loop-mode.json`, under `$ENGRAM_HOME`, default `~/.engram`): run the tool, no question.
-- **No loop marker:** ask first, once — "Compact now? The nap just persisted everything." — and run the tool only on yes. On a no, run `python tools/compact-request.py --clear`, and check that it exits 0. Exit 4 means a file could not be removed, and stderr names it; if it names the old request, that request can still compact, so say so once. Never retry in a loop.
+- **No loop marker:** ask first, once — "Compact now? The nap just persisted everything." — and run the tool only on yes. On a no, run `"$HOME/.engram/venv/bin/python3" tools/compact-request.py --clear`, and check that it exits 0. Exit 4 means a file could not be removed, and stderr names it; if it names the old request, that request can still compact, so say so once. Never retry in a loop.
 
 ```bash
-python tools/compact-request.py --session <your session id> --backup-ok <true|false>
+"$HOME/.engram/venv/bin/python3" tools/compact-request.py --session <your session id> --backup-ok <true|false>
 ```
 
 `--backup-ok` is the Step 3 verdict (`true` only on `✓ backup ok`); it is optional, and when you omit it the tool reads the verdict the checkpoint recorded. Under a loop marker you may add `--wake-armed-at HH:MMZ --wake-for HH:MMZ` (the armed ScheduleWakeup's times) so the post-compaction context names them. The tool refuses (exit 3) when the backup failed or the warm briefing is not in order (one anchor, a non-empty arc, written since the checkpoint), and says which check on stderr; say so once and move on. Exit 4 means nothing was written; say that too. Never retry in a loop.

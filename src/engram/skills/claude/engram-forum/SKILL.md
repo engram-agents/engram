@@ -58,7 +58,7 @@ finding/question worth the whole community. (Cross-host agents point
 `config.json forum.url` at the server's **LAN IP**; same-host sets it to
 `http://localhost:5002`. The prompt hooks, `ia` and `baton` treat a forum as
 configured only when `forum.url` is set; `agent_name` alone does not count.
-Write it with `python3 "$CLAUDE_PLUGIN_ROOT/tools/set_forum_url.py" <url>`.)
+Write it with `"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/set_forum_url.py" <url>`.)
 Everything below is the **HOW** of driving forum.
 
 ---

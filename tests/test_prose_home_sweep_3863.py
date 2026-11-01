@@ -58,6 +58,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 from html.parser import HTMLParser
 from pathlib import Path
@@ -489,6 +490,9 @@ def run_block(script, tmp_path, mode, extra_env=None):
         home = tmp_path / "my home" / "eg"
         env["ENGRAM_HOME"] = str(home)
     home.mkdir(parents=True)
+    # #4313: the specs name the plugin venv's python, which a temp HOME does not have (and adding one would
+    # change the directory listings asserted below); run the same block on THIS interpreter instead.
+    script = script.replace('"$HOME/.engram/venv/bin/python3"', f'"{sys.executable}"')
     r = subprocess.run(["bash", "-c", script], cwd=str(cwd), env=env, capture_output=True, text=True, timeout=60)
     # nothing may be written outside the home (a literal `${...}` directory, a stray tmp)
     assert os.listdir(cwd) == [], f"stray files in cwd: {os.listdir(cwd)}"

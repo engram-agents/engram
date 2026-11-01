@@ -291,7 +291,7 @@ Verify: for a unit (b1), `MainPID` changed and `engramd.pid` matches it; for a h
 Steps (a) and (b) are written steps, and a written step can be skipped. This one fails when they were. Run the gate in GATE mode (no `--informational`) and treat a non-zero exit as a FAIL of the upgrade:
 
 ```bash
-python3 "${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/tools/check_stale_processes.py"; echo "exit $?"
+"$HOME/.engram/venv/bin/python3" "${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/tools/check_stale_processes.py"; echo "exit $?"
 ```
 
 It prints one line per process (owner, surface-daemon, mcp-server) and a summary: four lines, always. Each process is `FRESH` (started at or after `deployed_at`), `STALE` (started before it; the line carries the restart command), `NOT_RUNNING` or `UNVERIFIED`. Exit 0 means every process is FRESH; **1** means a STALE one (restart it by (a), (b) or the `/mcp` reconnect of Step 5, then run the gate again); **3** means nothing is STALE but some process is `NOT_RUNNING` or `UNVERIFIED`; **2** means `.deployed-version` could not be read, so nothing was judged. A missing pidfile is never reported as clean.
@@ -324,7 +324,7 @@ systemctl --user restart engram-viz-user.service && echo "viz restarted" || echo
 
 **If not a systemd service** (manual-start install, or macOS): the old process is still running. Tell the user:
 > The viz server is serving pre-upgrade code. Kill the old process and restart:
-> `pkill -f viz.server; cd "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}" && python3 -m viz.server &`
+> `pkill -f viz.server; cd "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}" && "$HOME/.engram/venv/bin/python3" -m viz.server &`
 
 Verify the server is live with new code after the restart:
 ```bash
@@ -355,7 +355,7 @@ DEPLOYED=$(cat "${ENGRAM_HOME:-$HOME/.engram}"/.upgrade-pre-sha 2>/dev/null) || 
 [[ -z "$DEPLOYED" ]] && { echo "ERROR: ${ENGRAM_HOME:-$HOME/.engram}/.upgrade-pre-sha is empty — re-run Step 2 (check that .deployed-version has a valid alpha_sha= line)."; exit 1; }
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
 # Claude — compare rendered output between the deployed commit and current upstream branch:
-python "$SOURCE_DIR/tools/check-claude-md-drift.py" \
+"$HOME/.engram/venv/bin/python3" "$SOURCE_DIR/tools/check-claude-md-drift.py" \
     --repo "$SOURCE_DIR" \
     --base "$DEPLOYED" \
     --head "origin/$UPSTREAM_BRANCH"
@@ -371,8 +371,8 @@ diff "$SOURCE_DIR"/src/engram/templates/template.AGENTS.md /path/to/live/AGENTS.
 SOURCE_DIR=$(grep '^deployed_from=' "${ENGRAM_HOME:-$HOME/.engram}"/.deployed-version | cut -d= -f2-)
 HEAD_REF=$(grep '^alpha_sha=' "${ENGRAM_HOME:-$HOME/.engram}"/.deployed-version | cut -d= -f2-)
 # Needs a deploy whose tool has --live (engram-alpha#3604). An older tool does not say so: it fails with "the following arguments are required: --base".
-python3 "$SOURCE_DIR/tools/check-claude-md-drift.py" --help 2>&1 | grep -q -- '--live' || echo "STOP: the deployed check-claude-md-drift.py predates --live; rebuild from a tag that carries #3604 first"
-python3 "$SOURCE_DIR/tools/check-claude-md-drift.py" --repo "$SOURCE_DIR" --head "$HEAD_REF" \
+"$HOME/.engram/venv/bin/python3" "$SOURCE_DIR/tools/check-claude-md-drift.py" --help 2>&1 | grep -q -- '--live' || echo "STOP: the deployed check-claude-md-drift.py predates --live; rebuild from a tag that carries #3604 first"
+"$HOME/.engram/venv/bin/python3" "$SOURCE_DIR/tools/check-claude-md-drift.py" --repo "$SOURCE_DIR" --head "$HEAD_REF" \
     --live ~/.claude/CLAUDE.md --user-name "<your user>" --agent-name "<your name>" \
     --self-node-id "<your pn_ id>" --engram-home "${ENGRAM_HOME:-$HOME/.engram}" --seed-manifest "${ENGRAM_HOME:-$HOME/.engram}"/seed-manifest.json
 # Exit 0 = nothing missing; exit 1 = MISSING lines (merge or consciously decline each); exit 2 = input/render error (never read as "0 missing").

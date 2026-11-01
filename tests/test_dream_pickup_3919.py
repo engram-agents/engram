@@ -391,7 +391,7 @@ def test_the_texts_name_the_right_invocation_and_the_quoting_rule():
     root = Path(__file__).resolve().parent.parent / "src" / "engram"
     skill = (root / "skills" / "claude" / "engram-sleep" / "SKILL.md").read_text(encoding="utf-8")
     master = (root / "agents" / "claude" / "engram-dream-master.md").read_text(encoding="utf-8")
-    assert '"$CLAUDE_PLUGIN_ROOT/tools/dream_pickup.py"' in skill and "quote the text" in skill
+    assert '/tools/dream_pickup.py"' in skill and '"${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}' in skill and "quote the text" in skill
     assert "last `## Morning pickup` section" in skill
     assert "WITHOUT its `## Morning pickup` heading" in master and "WITHOUT the `.md` extension" in master
 

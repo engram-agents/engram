@@ -202,9 +202,9 @@ update it when you transition between states.
 > ```
 >
 > **On a Claude seat (Linux or macOS) that has `~/.umwelt/config.json`, arm ONE supervised Monitor instead of these two
-> (engram-alpha #3311):** `python3 <plugin>/tools/monitor-supervisor.py` runs
+> (engram-alpha #3311):** `"$HOME/.engram/venv/bin/python3" <plugin>/tools/monitor-supervisor.py` runs
 > both forum monitors *and* the umwelt bell as children, so one expiry and one
-> re-arm replace three. Verify with `python3 <plugin>/tools/monitor-supervisor.py
+> re-arm replace three. Verify with `"$HOME/.engram/venv/bin/python3" <plugin>/tools/monitor-supervisor.py
 > --check`: it prints five lines and exits 0 only when every child is alive, writes
 > into the supervisor's pipe, and the supervisor's stdout is a socket. If the supervisor
 > exits at arm (it needs `agent`/`world_url` from that config for its bell) or `--check`

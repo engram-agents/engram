@@ -174,7 +174,7 @@ fi
 `pgrep` only shows the daemon is alive, not that it runs the current code. Run the staleness gate beside it (#3938); it compares the start time of the engramd owner, the surface daemon and the MCP server with `deployed_at`:
 
 ```bash
-python3 "${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/tools/check_stale_processes.py"; echo "exit $?"
+"$HOME/.engram/venv/bin/python3" "${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/tools/check_stale_processes.py"; echo "exit $?"
 ```
 
 **FAIL:** exit 1 (a `STALE` line: that process started before the last deploy and still runs the old code), or exit 2 (`.deployed-version` unreadable, nothing judged). Remediation: the restart steps in the `engram-upgrade` skill, Step 5.5, then run the gate again. Exit 3 (no STALE, but a process is `NOT_RUNNING` or `UNVERIFIED`) is a FAIL unless the only such line is `owner: NOT_RUNNING` on a seat that has no engramd owner, as confirmed by the `engram-upgrade` skill's Step 5.5(b) check (accept that line only after running it; do not accept it on assertion). A missing pidfile is never read as clean.
@@ -200,7 +200,7 @@ bash "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/hooks/start-engr
 that changed the embedding model.
 ```bash
 # Re-generate embeddings (takes a few minutes on a large graph):
-python3 "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/tools/engram-regenerate-embeddings.py
+"$HOME/.engram/venv/bin/python3" "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/tools/engram-regenerate-embeddings.py
 ```
 
 ---
@@ -334,7 +334,7 @@ systemctl --user status engram-viz-user.service 2>/dev/null || echo "no systemd 
 # Manual start (viz/server.py uses relative imports -- must run as a
 # module with the plugin engram dir as the working directory, not as a
 # direct script path):
-cd "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram && python3 -m viz.server &
+cd "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram && "$HOME/.engram/venv/bin/python3" -m viz.server &
 ```
 
 ---
@@ -379,7 +379,7 @@ Skip unless you run from a developer source checkout with `tools/selftest.py` av
 
 ```bash
 cd <engram-alpha-repo>
-python3 tools/selftest.py --smoke 2>&1 | tail -20
+"$HOME/.engram/venv/bin/python3" tools/selftest.py --smoke 2>&1 | tail -20
 ```
 
 **PASS:** all tests pass.

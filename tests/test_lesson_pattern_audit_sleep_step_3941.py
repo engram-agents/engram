@@ -28,7 +28,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SLEEP_SKILL = REPO_ROOT / "src" / "engram" / "skills" / "claude" / "engram-sleep" / "SKILL.md"
-TOOL_TOKEN = '"$CLAUDE_PLUGIN_ROOT/tools/lesson-pattern-audit.py"'
+TOOL_TOKEN = ('"${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}'
+              '/tools/lesson-pattern-audit.py"')  # #4313: the fallback-expansion root
 
 
 def _skill() -> str:

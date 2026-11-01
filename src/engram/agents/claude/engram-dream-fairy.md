@@ -309,7 +309,7 @@ needs to see), emit `"key_neighbors": []` rather than omitting the field.
   MCP write and skips diverged findings — so accuracy at snapshot time is
   sufficient; you do not need to re-inspect at report-writing time.
 - **Never open `knowledge.db` yourself.**  The dream-master reads the guard's
-  current state through one CLI, `python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/dream_master_batch.py" safety-row <node_id>`
+  current state through one CLI, `"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/dream_master_batch.py" safety-row <node_id>`
   (it prints one JSON object, or `null` for a missing node).  You never run it
   and never connect to the store: use `engram_inspect` for everything you read.
 

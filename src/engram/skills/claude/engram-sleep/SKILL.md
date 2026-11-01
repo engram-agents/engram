@@ -194,7 +194,7 @@ Common missed-node types:
 
 At the end of sleep, the day is over. The warm-briefing's "From this session" section is per-context-window state managed by naps (see `engram-nap` §5b for the in-sync-with-current-CW rule). At sleep-end, the next day starts fresh — erase the section content. Next morning's first nap will create a new in-sync block.
 
-**Action:** the tool is `"$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/erase_session_block.py"` — this is THE way to do the erase (#3141). **LOOK first, then run:** read the section below the last `## From this session` anchor (or run the tool with `--dry-run` and read its `removed N chars / K lines` summary), apply the drift-STOP check below, and only THEN run the tool for real. The tool implements the four steps below by character offset and asserts the byte-identity post-condition before writing. Exit codes: **0** = done, or already bare (no change); **3** = drift-STOP — surface to the user, do NOT erase; **2** or **4** = stop and report. Exit 3 and an exit 4 from a pre-write post-condition leave the file untouched; exit 2 (IO error) and an exit 4 from the read-back check MAY have written, so read stderr ("original bytes restored" vs "NOT restored") and check the file before doing anything else. **Exit 0 means the byte-identity and structural checks passed — it does NOT mean no user words sit in or below the section:** the tool only detects ATX `#`/`##` headings (a best-effort proxy), so the prose clause of the drift-STOP stays your own judgement. If the tool is absent, do it by hand as follows (the by-hand offset rule is the fallback), locating the target **mechanically**, not by reading `${ENGRAM_HOME:-$HOME/.engram}/warm-briefing.md`:
+**Action:** the tool is `"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/erase_session_block.py"` — this is THE way to do the erase (#3141). **LOOK first, then run:** read the section below the last `## From this session` anchor (or run the tool with `--dry-run` and read its `removed N chars / K lines` summary), apply the drift-STOP check below, and only THEN run the tool for real. The tool implements the four steps below by character offset and asserts the byte-identity post-condition before writing. Exit codes: **0** = done, or already bare (no change); **3** = drift-STOP — surface to the user, do NOT erase; **2** or **4** = stop and report. Exit 3 and an exit 4 from a pre-write post-condition leave the file untouched; exit 2 (IO error) and an exit 4 from the read-back check MAY have written, so read stderr ("original bytes restored" vs "NOT restored") and check the file before doing anything else. **Exit 0 means the byte-identity and structural checks passed — it does NOT mean no user words sit in or below the section:** the tool only detects ATX `#`/`##` headings (a best-effort proxy), so the prose clause of the drift-STOP stays your own judgement. If the tool is absent, do it by hand as follows (the by-hand offset rule is the fallback), locating the target **mechanically**, not by reading `${ENGRAM_HOME:-$HOME/.engram}/warm-briefing.md`:
 
 1. Find every line matching the anchored regex `^## From this session` — **line-anchored, never a substring search.** A mid-line or quoted occurrence is prose, not the heading, and must never match.
 2. Take the **LAST** such line. Not the first. If the file has drifted so the phrase appears more than once, the last one is the real section; an earlier one sits inside the user's preserved notes.
@@ -239,7 +239,7 @@ Two things get torn down here, and **only the second was ever gated on the first
 # Substitute the transcript_path value SessionStart injected into your
 # context -- this is not a literal shell variable that will be set when
 # this line runs verbatim.
-python3 tools/enumerate_armed_monitors.py "$TRANSCRIPT_PATH"
+"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/enumerate_armed_monitors.py" "$TRANSCRIPT_PATH"
 ```
 
 `$TRANSCRIPT_PATH` above is a placeholder for the current session's own transcript path (`SessionStart` injects this into context) — substitute the actual value, don't run the line as a literal shell variable reference. The script parses the transcript by record and tool name — never a raw text grep — specifically to avoid two measured self-contamination modes: an ENGRAM node whose `quoted_text` cites a prior arm line reading as a new arm, and the enumeration command's own printed output (from an earlier run this session) reading as a new arm on a later run. See the script's own docstring for the full mechanism. `TaskStop` each returned task_id — over-collection is harmless: most ids from earlier in a long session have already expired on their own, and `TaskStop` against an expired id simply fails.
@@ -275,10 +275,10 @@ rm -f "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json
 Run the worktree garbage-collector once per day to remove worktrees whose PRs have merged or closed:
 
 ```bash
-python tools/worktree-gc.py --apply
+"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py --apply
 ```
 
-Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), and never touches the main checkout. Dry-run mode (`python tools/worktree-gc.py` without `--apply`) is available if you want to preview the plan first. Idempotent — a second run on a clean state is a no-op.
+Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), and never touches the main checkout. Dry-run mode (`"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py` without `--apply`) is available if you want to preview the plan first. Idempotent — a second run on a clean state is a no-op.
 
 Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present (pre-T2 install or worktree GC not yet shipped).
 
@@ -286,10 +286,10 @@ Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present 
 
 alpha#1944's blocking-lesson auto-demotion is a **read-time lease, not a durable write**: `engram-lesson-tripwire-hook.py` computes a blocking lesson's *effective* `prevention_type` from the prevention ledger at match time (advisory once it has crossed `overrides` overrides within `window_days`), but never rewrites the lesson's own stored `prevention_type` — deliberately, since the hook has no `engram_core`/`engram_epistemic` import and the no-raw-DB-edits rule keeps audit-trail logging (field_traces, edit_history, turn stamp) inside `engram_update_lesson`, the module that owns it. Left alone, a demoted lesson stays stored as `"blocking"` indefinitely.
 
-Run the read-only detector once per sleep, from the repo root:
+Run the read-only detector once per sleep (the path does not depend on the working directory, and the venv interpreter is needed because the system `python3` may be too old for `engramd_client`, #4313):
 
 ```bash
-python3 tools/reconcile_lesson_demotions.py
+"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/reconcile_lesson_demotions.py"
 ```
 
 Output is JSON: `{"candidates": [{"lesson_id", "override_count", "threshold", "window_days", "reason"}, ...]}` on success (exit 0). The script performs no writes — it reads the prevention ledger and each candidate's *current* stored `prevention_type` read-only, and only reports a lesson whose lease is **still hot right now** (a fresh override recount, not the ledger entry's stale timestamp). A lesson whose overrides have aged out of the window is correctly NOT reported — the read-time hook would resume blocking on it today, so a durable demotion now would be stricter than the lease itself currently demands.
@@ -316,7 +316,7 @@ Run the tool with `--json` via the engram venv python and the plugin path (same 
 
 ```bash
 embed_backfill_stderr=$(mktemp)
-embed_backfill_json=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/engram-regenerate-embeddings.py" --json 2>"$embed_backfill_stderr")
+embed_backfill_json=$("$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/engram-regenerate-embeddings.py" --json 2>"$embed_backfill_stderr")
 embed_backfill_rc=$?
 if [ $embed_backfill_rc -eq 0 ] && [ -n "$embed_backfill_json" ]; then
     EMBED_BEFORE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['before_null'])" "$embed_backfill_json")
@@ -363,7 +363,7 @@ Same invocation shape as Step 3.9. stderr is captured to a `mktemp` file (never 
 lesson_ranks_tmp="${ENGRAM_HOME:-$HOME/.engram}/tmp"
 mkdir -p "${TMPDIR:-$lesson_ranks_tmp}"
 lesson_ranks_stderr=$(mktemp "${TMPDIR:-$lesson_ranks_tmp}/lesson-ranks-XXXXXX")
-lesson_ranks_out=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/lesson-pattern-audit.py" --write-ranks 2>"$lesson_ranks_stderr")
+lesson_ranks_out=$("$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/lesson-pattern-audit.py" --write-ranks 2>"$lesson_ranks_stderr")
 lesson_ranks_rc=$?
 if [ $lesson_ranks_rc -eq 0 ]; then
     case "$lesson_ranks_out" in
@@ -453,7 +453,7 @@ Uses `engram_backup.dump_stripped` (WAL-safe, no CLI dependency).
 venv, so invoke via venv Python:
 
 ```bash
-backup_out=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \
+backup_out=$("$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/backup_knowledge_db.py" \
     [--retain 90] 2>&1)   # optional override (= --prune-days): cutoff-only prune; omit for the default retention (table below)
 backup_rc=$?
 if [ $backup_rc -eq 0 ]; then
@@ -499,7 +499,7 @@ The three layers are complementary along those axes.
 
 Binary copies that git already tracks (`backups/**`, `db-backup/**`, `*.db.*`, `*.bak-*`) are untracked, not deleted, by the backup run; the next commit carries the removal.
 
-**Off-disk push state is not part of "knowledge.db backup".** The snapshot worker records every push to the off-disk remote in `${ENGRAM_HOME:-$HOME/.engram}/backup-push-status.json`; `engram_checkpoint` carries it as `backup_push` and `engram_diagnose` flares it. If it reads anything but `ok`, the off-disk layer is NOT working: do not report the backup as all-clear. To inspect or repair a diverged remote (explicit, refuses by default): `python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/backup_remote_repair.py" --status` (or `--repair`).
+**Off-disk push state is not part of "knowledge.db backup".** The snapshot worker records every push to the off-disk remote in `${ENGRAM_HOME:-$HOME/.engram}/backup-push-status.json`; `engram_checkpoint` carries it as `backup_push` and `engram_diagnose` flares it. If it reads anything but `ok`, the off-disk layer is NOT working: do not report the backup as all-clear. To inspect or repair a diverged remote (explicit, refuses by default): `"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/backup_remote_repair.py" --status` (or `--repair`).
 
 **Never `git commit --amend`, `git reset`, or `git rebase` inside `${ENGRAM_HOME:-$HOME/.engram}/`** (engram-alpha#4205): the worker pushes each snapshot commit, so a rewrite diverges the remote for good. Make a new commit instead — e.g. the finalized dream record after `engram_advance_turn` is committed as `git commit -m "dream <date>: record finalized"`, never an amend. An installed `reference-transaction` hook refuses a rewrite of a pushed commit.
 
@@ -513,7 +513,7 @@ are ephemeral fairy transcripts that are never cited.
 
 ```bash
 session_backup_out=$("$HOME/.engram/venv/bin/python3" \
-    "$CLAUDE_PLUGIN_ROOT/tools/backup_session_logs.py" \
+    "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/backup_session_logs.py" \
     [--retain 365] 2>&1)   # prune archive entries older than 365 days; omit to keep all
 session_backup_rc=$?
 if [ $session_backup_rc -eq 0 ]; then
@@ -554,7 +554,7 @@ disaster-recovery and migration-safety.
 
 ```bash
 claude_backup_out=$("$HOME/.engram/venv/bin/python3" \
-    "$CLAUDE_PLUGIN_ROOT/tools/backup_claude_projects.py" \
+    "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/backup_claude_projects.py" \
     2>&1)
 claude_backup_rc=$?
 if [ $claude_backup_rc -eq 0 ]; then
@@ -765,7 +765,7 @@ particular should stay small by design, and a growing one is worth investigating
 
 **Run cohort_dispatch prepare** to chunk the cohort and write per-chunk payload files.
 
-Run this step from the repo root — `cohort_dispatch` is invoked via `python3 -m tools.cohort_dispatch`, which requires cwd = the repo root.
+Run this step from the repo root — `cohort_dispatch` is invoked via `"$HOME/.engram/venv/bin/python3" -m tools.cohort_dispatch`, which requires cwd = the repo root.
 
 **Pass the cohort IDs inline via `--ids` when the list is small enough to read
 in one glance** (roughly the historical 50-id shape), so there is no intermediate
@@ -791,7 +791,7 @@ COHORT_DIR="$(pwd)/.claude/agent-scratch/dream-cohort-$(date +%Y-%m-%d)"  # ABSO
 # long-lived process (a different cwd than this shell); a relative path there
 # would resolve against the wrong directory.
 
-python3 -m tools.cohort_dispatch prepare \
+"$HOME/.engram/venv/bin/python3" -m tools.cohort_dispatch prepare \
   --fresh-total "$FRESH_TOTAL_MATCHED" \
   --backfill-total "$BACKFILL_TOTAL_MATCHED" \
   --ids "$COHORT_IDS" \
@@ -826,7 +826,7 @@ No per-chunk `prompt.md` is written. The dispatcher constructs a short prompt in
 **Run cohort_dispatch verify-in** to pre-flight the cohort before dispatch:
 
 ```bash
-python3 -m tools.cohort_dispatch verify-in \
+"$HOME/.engram/venv/bin/python3" -m tools.cohort_dispatch verify-in \
   --out "$COHORT_DIR"
 # Exit code 0 → all checks pass; proceed to Step 6.
 # Exit code 1 → structured JSON error to stdout listing which chunk/check failed.
@@ -913,7 +913,7 @@ Use the model family of the fairy's assigned runtime. If the fairy's model famil
 **After all batch-summary fairy outputs are written, run validate:**
 
 ```bash
-python3 -m tools.cohort_dispatch validate --out "$COHORT_DIR"
+"$HOME/.engram/venv/bin/python3" -m tools.cohort_dispatch validate --out "$COHORT_DIR"
 # Exit code 0 → no failures; final_payload.json written automatically (ids the fairy returned that were never sent are discarded, listed on stderr + as `unexpected` in the summary); proceed to Step 8.
 # Exit code 1 → failures present; retry_payload.json written; continue retry loop below.
 # Exit code 2 → pipeline/validate error; neither file written; STOP (see the Exit 2 branch below).
@@ -956,7 +956,7 @@ The fairy Reads `retry_payload.json` (nodes with `previous_error` fields) and Wr
 **Shell step 2 — incorporate and loop:**
 
 ```bash
-python3 -m tools.cohort_dispatch incorporate \
+"$HOME/.engram/venv/bin/python3" -m tools.cohort_dispatch incorporate \
   --retry-output "$RETRY_OUTPUT" \
   --out "$COHORT_DIR"
 # When still-failing items remain: writes retry_payload.json → loop continues.
@@ -981,7 +981,7 @@ If `retry_payload.json` still exists after the loop (failures survive the single
 3. Write your output to `$COHORT_DIR/agent_residual_output.json` as `{"items": [{node_id, recall_summary, recall_keywords}, ...]}`.
 4. Run incorporate:
    ```bash
-   python3 -m tools.cohort_dispatch incorporate \
+   "$HOME/.engram/venv/bin/python3" -m tools.cohort_dispatch incorporate \
      --retry-output "$COHORT_DIR/agent_residual_output.json" \
      --out "$COHORT_DIR"
    ```
@@ -1133,7 +1133,7 @@ Append the dispositions to the dream record as a new final section `## Sleep-end
 
 **Partial return.** If the master returned partial and the `## For the awake seat` block is ABSENT, append the section with one line `master returned partial — block absent; triaged from the fairy reports instead:` followed by any dispositions. Step 9.5 triages only what the fairy reports already contain; it runs no master step. Anything unfinished still goes to the next cohort via the "Don't retry an interrupted dream" guardrail below.
 
-**Morning pickup (a different thing from the triage above).** The triage lines are the parent's sleep-end disposition. The pickup is the NEXT morning's account of what was actually done with each head (the at most 3 items under `## For the awake seat`). The awake seat, not the parent and not a reader tool, appends it to the dream record at its first routine-board tick, one head at a time, with `"$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/dream_pickup.py" --pick N "<what was done>"` or `--skip N "<reason>"` (quote the text; `--home` overrides the seat's home, `${ENGRAM_HOME:-$HOME/.engram}`). The tool edits the latest record's last `## Morning pickup` section, one line per head (`p1`, `p2`, `p3`), in one of two forms:
+**Morning pickup (a different thing from the triage above).** The triage lines are the parent's sleep-end disposition. The pickup is the NEXT morning's account of what was actually done with each head (the at most 3 items under `## For the awake seat`). The awake seat, not the parent and not a reader tool, appends it to the dream record at its first routine-board tick, one head at a time, with `"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/dream_pickup.py" --pick N "<what was done>"` or `--skip N "<reason>"` (quote the text; `--home` overrides the seat's home, `${ENGRAM_HOME:-$HOME/.engram}`). The tool edits the latest record's last `## Morning pickup` section, one line per head (`p1`, `p2`, `p3`), in one of two forms:
 
 ```
 p1. picked up <what was done>

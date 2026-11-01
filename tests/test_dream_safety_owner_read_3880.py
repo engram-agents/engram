@@ -1080,9 +1080,10 @@ _NESTED_TOOL = ('"${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplac
 
 
 def printed_commands(text: str) -> list[str]:
-    """Every `python3 ...dream_master_batch.py` command, however quoted (or not): from `python3` to the tool
-    name on one line, plus one closing quote if present."""
-    return re.findall(r"python3\s+[^\n]*?dream_master_batch\.py[\"']?", text)
+    """Every `python3 ...dream_master_batch.py` command, however quoted (or not): from `python3` (bare, or the
+    venv interpreter's closing-quoted form, #4313) to the tool name on one line, plus one closing quote if
+    present. The match starts at `python3`, so it is the same slice whichever interpreter path precedes it."""
+    return re.findall(r"python3\"?\s+[^\n]*?dream_master_batch\.py[\"']?", text)
 
 
 @pytest.mark.parametrize("planted", [
@@ -1092,12 +1093,12 @@ def printed_commands(text: str) -> list[str]:
 ])
 def test_round2_control_an_unquoted_or_differently_quoted_command_is_flagged(planted):
     cmds = printed_commands(f"run `{planted}` now\n")
-    assert len(cmds) == 1 and cmds != ["python3 " + _NESTED_TOOL], cmds
+    assert len(cmds) == 1 and cmds != ["python3\" " + _NESTED_TOOL], cmds
 
 
 def test_round2_control_the_canonical_nested_command_is_not_flagged():
-    cmds = printed_commands(f"run `python3 {_NESTED_TOOL} safety-row x` now\n")
-    assert cmds == ["python3 " + _NESTED_TOOL]
+    cmds = printed_commands(f"run `\"$HOME/.engram/venv/bin/python3\" {_NESTED_TOOL} safety-row x` now\n")
+    assert cmds == ["python3\" " + _NESTED_TOOL]
 
 
 @pytest.mark.parametrize("spec", sorted(SPECS))
@@ -1108,7 +1109,7 @@ def test_round2_every_printed_command_honours_claude_plugin_root_with_the_canoni
     text = SPECS[spec].read_text(encoding="utf-8")
     cmds = printed_commands(text)
     assert cmds, spec
-    assert all(c == "python3 " + _NESTED_TOOL for c in cmds), cmds
+    assert all(c == "python3\" " + _NESTED_TOOL for c in cmds), cmds
 
 
 @pytest.mark.parametrize("plugin_root_set", [False, True], ids=["root_unset", "root_set"])

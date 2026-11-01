@@ -77,7 +77,7 @@ cat > /tmp/arm-codex-loop.sh <<'BASH'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 : "${CURRENT_THREAD:?}" "${END_AT:?}" "${LOOP_KIND:?}" "${TOPIC:?}" "${INSTRUCTIONS:?}" "${STATE:?}"
-CADENCE_SECONDS=${CADENCE_SECONDS:-$(python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --cadence)}
+CADENCE_SECONDS=${CADENCE_SECONDS:-$("$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --cadence)}
 root="${ENGRAM_HOME:-$HOME/.engram}/codex-wake/loop-host-state"
 pending="${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json.pending"
 marker="${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json"
@@ -142,7 +142,7 @@ chmod +x /tmp/arm-codex-loop.sh
 
 CURRENT_THREAD='<Active session id>' END_AT='<ISO-8601 UTC bound>' \
 LOOP_KIND='<kind>' TOPIC='<topic>' INSTRUCTIONS='<instructions>' STATE='<state>' \
-CADENCE_SECONDS="$(python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --cadence)" /tmp/arm-codex-loop.sh
+CADENCE_SECONDS="$("$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --cadence)" /tmp/arm-codex-loop.sh
 ```
 
 If the user named only a cadence and not an end time, use today's documented
@@ -238,8 +238,8 @@ decides whether you write the marker or check it:
   the loop body:
 
   ```bash
-  "$CLAUDE_PLUGIN_ROOT/tools/engram-loop-gate.py"          # prints "defer <N>" or "proceed"
-  "$CLAUDE_PLUGIN_ROOT/tools/engram-loop-gate.py" --json   # adds the reason — read it when deferred
+  "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/engram-loop-gate.py"          # prints "defer <N>" or "proceed"
+  "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/engram-loop-gate.py" --json   # adds the reason — read it when deferred
   ```
 
   - **`proceed`** → no present/focused user → continue to Step 1.5 → Step 2 as normal.
@@ -321,7 +321,7 @@ pending-work — not just an "I'm looping" flag:
 ```bash
 # Cadence FIRST, into a variable: a failed lookup (older plugin without --cadence, missing tool)
 # must never leave `"cadence_seconds": ,` in the marker -- it falls back to 900, loudly.
-CADENCE_SECONDS="$(python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --cadence </dev/null)" || CADENCE_SECONDS=""
+CADENCE_SECONDS="$("$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --cadence </dev/null)" || CADENCE_SECONDS=""
 case "$CADENCE_SECONDS" in ''|*[!0-9]*|0*) echo "loop_prompt.py --cadence failed or printed a non-positive-integer (${CADENCE_SECONDS:-nothing}) -- falling back to 900" >&2; CADENCE_SECONDS=900;; esac
 cat > "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json <<JSON
 {
@@ -452,7 +452,7 @@ cannot be stale.)*
        `"3300"` would be a string (item 3b says why that matters):
 
        ```bash
-       python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" cadence_seconds 3300
+       "$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" cadence_seconds 3300
        ```
    (b) The loop is watching a long-period external signal the user has named
        (a CI run, a deploy ETA, a remote queue) — and the cadence matches
@@ -475,7 +475,7 @@ cannot be stale.)*
    stale wake-queue" is the same lapse class as self-selecting a longer
    cadence: never agent-side, never an idle-state optimization.
 
-   **Arm loop-wakes via `format_loop_prompt`, never a raw prompt string.** When arming a ScheduleWakeup for a loop, run `$CLAUDE_PLUGIN_ROOT/tools/loop_prompt.py` on your core message (e.g. `echo "<core>" | python3 "$CLAUDE_PLUGIN_ROOT/tools/loop_prompt.py"`, or call `format_loop_prompt(core)`) and pass ITS output as the ScheduleWakeup `prompt`. This prepends the `<loop-wake>` SSoT marker so the time-bar hook classifies the wake as non-human — otherwise the loop stamps itself as user-activity and self-suspends (#1592). The marker is added by the tool, never hand-typed.
+   **Arm loop-wakes via `format_loop_prompt`, never a raw prompt string.** When arming a ScheduleWakeup for a loop, run `${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py` on your core message (e.g. `echo "<core>" | "$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py"`, or call `format_loop_prompt(core)`) and pass ITS output as the ScheduleWakeup `prompt`. This prepends the `<loop-wake>` SSoT marker so the time-bar hook classifies the wake as non-human — otherwise the loop stamps itself as user-activity and self-suspends (#1592). The marker is added by the tool, never hand-typed.
 
    **Check-before-arm is gone — removed 2026-08-12 (#1973, #1987). Do NOT
    restore it.** This step used to read: `CronList` first, and if a pending
@@ -569,7 +569,7 @@ cannot be stale.)*
       HANDOFF; the wake prompt is just a pointer.
 
       ```bash
-      python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" --string state "<new state>"
+      "$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" --string state "<new state>"
       ```
 
       The helper changes only that one key (every other key keeps its value
@@ -857,12 +857,12 @@ Convenience snippet — update in place atomically:
 
     rb=$(date -u -v+15M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
          || date -u -d'+15 minutes' +%Y-%m-%dT%H:%M:%SZ) \
-      && python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" \
+      && "$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" \
            waiting_on '{"description":"describe the wait","return_by":"'"$rb"'"}'
 
 Clear when done:
 
-    python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" \
+    "$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" \
       waiting_on null
 
 **Write `waiting_on` when:** dispatching a coder-fairy, waiting for CI,

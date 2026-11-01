@@ -29,12 +29,12 @@ FIXED_LINES = {
         'PY="$HOME/.engram/venv/bin/python"',
     ],
     "skills/claude/engram-sleep/SKILL.md": [
-        '"$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/erase_session_block.py"',
+        '"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/erase_session_block.py"',
         'session_backup_out=$("$HOME/.engram/venv/bin/python3" \\',
         'claude_backup_out=$("$HOME/.engram/venv/bin/python3" \\',
         '"$HOME/.engram/venv/bin/python3" -m tools.dream_lottery draw \\',
-        'embed_backfill_json=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/engram-regenerate-embeddings.py"',
-        'backup_out=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \\',
+        'embed_backfill_json=$("$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/engram-regenerate-embeddings.py"',
+        'backup_out=$("$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/backup_knowledge_db.py" \\',
     ],
     "tools/fairy_report.py": [
         '"$HOME/.engram/venv/bin/python3" tools/fairy_report.py --task <task-id> [--session <id>]',

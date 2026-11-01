@@ -354,6 +354,11 @@ def test_h11_recipes_run_as_printed(tmp_path, layout):
     else:  # CLAUDE_PLUGIN_ROOT unset: the recipe's own fallback expression must find the tree
         _flatten(home / "marketplace" / "plugins" / "engram")
     (tmp_path / "user").mkdir()
+    # #4313: the recipes name the plugin venv's python under the login HOME; a wrapper onto THIS interpreter
+    venv_py = tmp_path / "user" / ".engram" / "venv" / "bin" / "python3"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    venv_py.chmod(venv_py.stat().st_mode | stat.S_IXUSR)
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     expect = dict(SEED)

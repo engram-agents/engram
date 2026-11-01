@@ -704,10 +704,14 @@ def _venv_python_wrapper(login_home: Path) -> None:
     exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
 
 
+# #4313: the spec's path root is the fallback expansion (CLAUDE_PLUGIN_ROOT is unset in an agent's Bash)
+_PLUGIN_ROOT_EXPR = "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}"
+
+
 def phase_a_status(home: Path, fake_home: Path, tool_path: str) -> str:
     """Run the Step 3.9 shell block verbatim (tool path substituted when replaying) and return
     $embed_backfill_status."""
-    block = step_3_9_block().replace('"$CLAUDE_PLUGIN_ROOT/tools/engram-regenerate-embeddings.py"',
+    block = step_3_9_block().replace('"'+_PLUGIN_ROOT_EXPR+'/tools/engram-regenerate-embeddings.py"',
                                     f'"{tool_path}"')
     env = dict(os.environ, ENGRAM_HOME=str(home), HOME=str(fake_home), CLAUDE_PLUGIN_ROOT=str(SRC_ENGRAM))
     done = subprocess.run(["bash", "-c", block + '\nprintf "%s" "$embed_backfill_status"'],
