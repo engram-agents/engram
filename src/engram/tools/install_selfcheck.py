@@ -59,6 +59,7 @@ Stdlib only; Python 3.9+ (macOS /usr/bin/python3 is 3.9); Linux and macOS.
 """
 
 import argparse
+import errno
 import json
 import os
 import queue
@@ -66,6 +67,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -122,6 +124,53 @@ def _fail(what, remedy):
     return FAIL, "%s — %s" % (what, remedy)
 
 
+# ── "absent" versus "could not be checked" (#4299) ───────────────────────────
+#
+# `Path.is_file()` / `Path.exists()` raised PermissionError for a path under an unreadable directory up to
+# Python 3.12; 3.14 answers False for it, the same as for a missing path, so a check built on them reports an
+# existing-but-unreadable file as "does not exist", with a remedy written for a missing file. These helpers
+# classify with `os.stat` and branch on the errno only, so every interpreter gives the same answer. The
+# boundary is the one tools/engramd_batch_a_acceptance.py uses (copied, not imported: it is another tool's
+# private helper): the errnos pathlib used to swallow mean "absent"; any other OSError means "could not be
+# checked", and the caller reports it as a FAIL naming the error.
+
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
+def _stat_or_absent(path):
+    """os.stat(path) (follows symlinks), or None when the path is absent. Any other OSError propagates."""
+    try:
+        return os.stat(path)
+    except OSError as exc:
+        if exc.errno in _ABSENT_ERRNOS:
+            return None
+        raise
+
+
+def _is_file(path):
+    """True for a regular file. False for an absent path AND for one that exists but is not a regular file (a
+    directory, a FIFO), as `Path.is_file()` always answered. OSError (could not be checked) propagates."""
+    st = _stat_or_absent(path)
+    return st is not None and stat.S_ISREG(st.st_mode)
+
+
+def _exists(path):
+    """True when anything is there (as `Path.exists()`). OSError (could not be checked) propagates."""
+    return _stat_or_absent(path) is not None
+
+
+def _uncheckable_parts(path, exc):
+    """(what, remedy) for a path that could not be checked: names the error, never says "does not exist",
+    never points at bootstrap, restore or re-install."""
+    name = errno.errorcode.get(exc.errno, "errno %s" % exc.errno) if exc.errno is not None else type(exc).__name__
+    what = "%s could not be checked: %s (%s)" % (path, exc.strerror or exc, name)
+    return what, "check the permissions on %s and on every directory above it" % path
+
+
+def _uncheckable(path, exc):
+    return _fail(*_uncheckable_parts(path, exc))
+
+
 def _tail(text, n=3, width=300):
     lines = [ln for ln in (text or "").strip().splitlines() if ln.strip()]
     return " | ".join(lines[-n:])[-width:]
@@ -139,11 +188,22 @@ def _venv_missing(ctx):
                  "create it: python3 -m venv ~/.engram/venv && ~/.engram/venv/bin/python -m pip install -r requirements/requirements.txt")
 
 
+def _venv_problem(ctx):
+    """None when the venv python is there; else the FAIL for it: absent, or could not be checked."""
+    try:
+        if _exists(ctx.venv_py):
+            return None
+    except OSError as exc:
+        return _uncheckable(ctx.venv_py, exc)
+    return _venv_missing(ctx)
+
+
 # ── 1-3: the venv ────────────────────────────────────────────────────────────
 
 def check_python(ctx):
-    if not ctx.venv_py.exists():
-        return _venv_missing(ctx)
+    problem = _venv_problem(ctx)
+    if problem:
+        return problem
     proc = _run_venv(ctx, "import sys; print('.'.join(str(p) for p in sys.version_info[:3]))")
     out = proc.stdout.strip()
     try:
@@ -158,8 +218,9 @@ def check_python(ctx):
 
 
 def check_venv_imports(ctx):
-    if not ctx.venv_py.exists():
-        return _venv_missing(ctx)
+    problem = _venv_problem(ctx)
+    if problem:
+        return problem
     proc = _run_venv(ctx, "import fastmcp, sentence_transformers")
     if proc.returncode != 0:
         return _fail("the venv cannot import fastmcp and sentence_transformers: %s" % _tail(proc.stderr, n=1),
@@ -194,8 +255,9 @@ print("CACHED" if server._embedding_cache_status(model) else "MISSING")
 def check_model_cached(ctx):
     if os.environ.get("ENGRAM_NO_EMBEDDINGS"):
         return SKIP, "ENGRAM_NO_EMBEDDINGS is set: this seat runs deliberately without embeddings"
-    if not ctx.venv_py.exists():
-        return _venv_missing(ctx)
+    problem = _venv_problem(ctx)
+    if problem:
+        return problem
     proc = _run_venv(ctx, _MODEL_SNIPPET, str(ctx.plugin_dir))
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
     if proc.returncode != 0 or len(lines) < 3:
@@ -213,7 +275,11 @@ def check_model_cached(ctx):
 
 def check_plugin_tree(ctx):
     path = ctx.plugin_dir / "plugin.json"
-    if not path.is_file():
+    try:
+        present = _is_file(path)
+    except OSError as exc:
+        return _uncheckable(path, exc)
+    if not present:
         return _fail("%s does not exist" % path, "re-run tools/install-local-marketplace.sh")
     try:
         data = json.loads(path.read_text())
@@ -226,7 +292,11 @@ def check_plugin_tree(ctx):
 
 def check_deployed_version(ctx):
     path = ctx.engram_home / ".deployed-version"
-    if not path.is_file():
+    try:
+        present = _is_file(path)
+    except OSError as exc:
+        return _uncheckable(path, exc)
+    if not present:
         return _fail("%s does not exist" % path, "re-run tools/install-local-marketplace.sh")
     for line in path.read_text().splitlines():
         if line.startswith("alpha_sha="):
@@ -336,12 +406,15 @@ def _live_marker_pid(marker):
 
 
 def _snapshot_marker(marker):
-    """(bytes, atime_ns, mtime_ns) of the marker, None if it is absent."""
+    """(bytes, atime_ns, mtime_ns) of the marker, None if it is absent (the _ABSENT_ERRNOS). Any other
+    OSError propagates: the marker's state is unknown, and the caller must not go on to start a server."""
     try:
         data = marker.read_bytes()
         st = marker.stat()
-    except FileNotFoundError:
-        return None
+    except OSError as exc:
+        if exc.errno in _ABSENT_ERRNOS:
+            return None
+        raise
     return data, st.st_atime_ns, st.st_mtime_ns
 
 
@@ -371,7 +444,11 @@ def check_mcp_handshake(ctx):
     live = _live_marker_pid(marker)
     if live is not None:
         return SKIP, "a live MCP server (pid %d) is serving this home; its own startup is the evidence" % live
-    snap = _snapshot_marker(marker)
+    try:
+        snap = _snapshot_marker(marker)
+    except OSError as exc:
+        # unknown marker state: report it and start nothing (a FAIL naming the error, never "absent")
+        return _uncheckable(marker, exc)
     try:
         status, detail = _handshake(ctx)
     finally:
@@ -384,7 +461,11 @@ def check_mcp_handshake(ctx):
 
 def _handshake(ctx):
     mcp_path = ctx.plugin_dir / ".mcp.json"
-    if not mcp_path.is_file():
+    try:
+        present = _is_file(mcp_path)
+    except OSError as exc:
+        return _uncheckable(mcp_path, exc)
+    if not present:
         return _fail("%s does not exist" % mcp_path, "re-run tools/install-local-marketplace.sh")
     try:
         servers = json.loads(mcp_path.read_text())["mcpServers"]
@@ -590,7 +671,11 @@ def _read_graph(ctx):
         if decision["mode"] == "owner":
             con = _owner_read().open_reader(_spec(ctx), ctx.db_path, use_owner=True)
         else:
-            if not ctx.db_path.is_file():
+            try:
+                present = _is_file(ctx.db_path)
+            except OSError as exc:
+                return None, _uncheckable_parts(ctx.db_path, exc)
+            if not present:
                 return None, ("%s does not exist" % ctx.db_path, "run bootstrap.py (fresh install) or restore the graph")
             if decision["label"] != "direct (flag off)":
                 _owner_read().check_store_path(ctx.db_path)  # a FIFO is refused here, never opened
@@ -631,20 +716,31 @@ def check_seed_graph(ctx):
 
 def check_first_run_pending(ctx):
     path = ctx.engram_home / "first-run-pending"
-    if not path.is_file():
+    try:
+        present = _is_file(path)
+    except OSError as exc:
+        return _uncheckable(path, exc)
+    if not present:
         return _fail("%s does not exist" % path,
                      "bootstrap.py arms it; if the first session already ran, use --phase installed")
     return PASS, ""
 
 
 def _claude_md_tokens(ctx):
-    if not ctx.claude_md.is_file():
-        return None
-    return sorted(set(TOKEN_RE.findall(ctx.claude_md.read_text(errors="replace"))))
+    """Returns (tokens, None), (None, None) when CLAUDE.md is absent, or (None, fail) when it could not be checked."""
+    try:
+        present = _is_file(ctx.claude_md)
+    except OSError as exc:
+        return None, _uncheckable(ctx.claude_md, exc)
+    if not present:
+        return None, None
+    return sorted(set(TOKEN_RE.findall(ctx.claude_md.read_text(errors="replace")))), None
 
 
 def check_claude_md_rendered(ctx):
-    tokens = _claude_md_tokens(ctx)
+    tokens, unchecked = _claude_md_tokens(ctx)
+    if unchecked:
+        return unchecked
     if tokens is None:
         return _fail("%s does not exist" % ctx.claude_md, "run bootstrap.py to render it from the template")
     bad = [t for t in tokens if t not in FIRST_SESSION_TOKENS]
@@ -668,7 +764,11 @@ def check_graph_opens(ctx):
 
 def check_seed_ids_present(ctx):
     path = ctx.engram_home / "seed-manifest.json"
-    if not path.is_file():
+    try:
+        present = _is_file(path)
+    except OSError as exc:
+        return _uncheckable(path, exc)
+    if not present:
         return _fail("%s does not exist" % path, "run bootstrap.py, which writes it")
     try:
         ids = [v for v in json.loads(path.read_text())["seed_ids"].values() if isinstance(v, str)]
@@ -698,7 +798,9 @@ def check_seed_ids_present(ctx):
 
 
 def check_claude_md_present(ctx):
-    tokens = _claude_md_tokens(ctx)
+    tokens, unchecked = _claude_md_tokens(ctx)
+    if unchecked:
+        return unchecked
     if tokens is None:
         return _fail("%s does not exist" % ctx.claude_md, "run bootstrap.py to render it from the template")
     bad = [t for t in tokens if t not in FIRST_SESSION_TOKENS]
