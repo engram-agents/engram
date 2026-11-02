@@ -96,6 +96,22 @@ don't conflate them:
 > becomes a *rare and real* signal worth investigating, not background noise.
 > Until then: verify the socket, and upgrade if you're on a pre-#1073 install.
 
+### Stock macOS python3 is 3.9.6: get 3.10.7+ before the venv
+
+The built-in `python3` on the Macs we checked is 3.9.6, below the 3.10.7 floor, so
+the Phase 0 `python3 -m venv ~/.engram/venv` would build the venv on a too-old
+interpreter. Get a newer one first, using either route, then build the venv at
+`~/.engram/venv` with it:
+
+```bash
+# Pick ONE of these two lines (not both):
+brew install python@3.12 && python3.12 -m venv ~/.engram/venv   # Homebrew
+# uv venv --seed --python 3.12 ~/.engram/venv                   # uv (--seed: pip in the venv)
+```
+
+What was and was not measured for each route is stated in `README-AGENT.md`
+Prerequisites (the Homebrew line is a seat's practice, not a fresh-Mac test).
+
 ### Keep ENGRAM data and the repo out of TCC-protected folders
 
 macOS TCC (Transparency, Consent & Control) throws a permission prompt the first

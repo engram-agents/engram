@@ -115,6 +115,25 @@ plus `tools/` (CLIs, at repo root), `src/forum/` (the forum service), and
   The engramd owner (a default-off, Linux-only component) additionally requires
   Python 3.11+: it bounds result size with `sqlite3.Connection.setlimit`, and
   refuses to start with a named error on older interpreters.
+  - On the Macs we checked, the built-in `python3` reports 3.9.6, which is too old
+    (run `python3 --version` to see yours). Two routes to a newer Python:
+    - Homebrew, if `brew` is present: `brew install python@3.12`, then use
+      `python3.12`. This is what the maintainer's Mac seat uses to build its venv;
+      it was not tested on a fresh Mac.
+    - `uv`: `uv venv --seed --python 3.12 ~/.engram/venv`. `--seed` is needed: without
+      it the venv has no `pip`, and the `pip install` in Phase 0 would run against
+      whatever `pip` is on PATH (or fail if there is none: stock macOS may have
+      only `pip3`). Measured 2026-11-02 on one Mac whose `uv` came from
+      Homebrew, with `--python-preference only-managed` and uv's install and cache
+      directories redirected to a temp directory: uv downloaded CPython 3.12.14, the
+      venv reported Python 3.12.14, and `--seed` gave it `pip` 26.2.2 (no sudo was
+      used). Without `--python-preference only-managed`, uv on that Mac used the
+      Homebrew 3.12.13 that was already installed and downloaded nothing. Installing
+      `uv` itself on a Mac without Homebrew (the project's standalone installer,
+      https://docs.astral.sh/uv/) was not measured here, nor the recommended command
+      with uv's default preference on a Mac that has no 3.12 installed (it then
+      relies on uv downloading Python itself; the measured run forced that with
+      `--python-preference only-managed`).
 - **git**.
 - An existing **Claude Code** installation (the MCP client that talks to the server).
 - Writable `~/.claude/` and `~/.engram/`.
@@ -180,8 +199,16 @@ agent can run inside it. Then they start a session and ask you to continue.
 
 **You:** create the venv at the canonical path and install the deps:
 
+**First, check the interpreter.** `python3 --version` must report 3.10.7 or newer.
+If it does not (stock macOS reports 3.9.6), pick a route from Prerequisites and use
+that interpreter instead of the `python3 -m venv` line below (the commented
+alternatives in the block). The venv must still end up at `~/.engram/venv`.
+
 ```bash
+python3 --version   # must report 3.10.7 or newer; if not, swap the next line for one below
 python3 -m venv ~/.engram/venv
+# python3.12 -m venv ~/.engram/venv              # Homebrew route
+# uv venv --seed --python 3.12 ~/.engram/venv    # uv route; --seed puts pip in the venv
 source ~/.engram/venv/bin/activate
 pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements/requirements.txt
 ```
