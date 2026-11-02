@@ -52,6 +52,7 @@ sequential, no branching:
   Step 8 — Spawn the dream master with the full report bundle
   Step 9 — Receive the dream master's final return and relay to the user
   Step 9.5 — Triage the dream's awake-seat findings (do / file / defer) and append the dispositions to the dream record
+  Step 9.75 — Arm the away-night morning wake (LAST act; only when the host flag says tonight is an away night)
 
 The dream master owns the heavy consolidation (engram_reflect, agenda
 walk, supersedes/resolves/promotes, engram_advance_turn, dream record).
@@ -1149,11 +1150,30 @@ git -C "${ENGRAM_HOME:-$HOME/.engram}" add history/dream/YYYY-MM-DD.md
 git -C "${ENGRAM_HOME:-$HOME/.engram}" commit -m "dream YYYY-MM-DD: sleep-end triage"
 ```
 
-Log one line in today's history file: `sleep-end triage: N items — D do-now, F filed, X deferred`. Then stop. The session is over.
+Log one line in today's history file: `sleep-end triage: N items — D do-now, F filed, X deferred`. Then go to Step 9.75 (the last act); after it, stop. The session is over.
 
 **Bounded exception to "Why Phase A is pre-turn-advance" (below).** Step 9.5's do-now writes land after `engram_advance_turn`, the case that section calls "artificially placed in the next cohort". Accepted deliberately and bounded: a do-now write acts on a dream finding, not on the just-ended cohort, so it belongs to the next cohort by content, not by accident. A morning read would file them in the same turn.
 
 **Why here.** The parent that spawned the master is the only guaranteed reader of its return, in context and awake; the master cannot act on its own findings (it files no observations and dispatches nothing). A morning read of the same block is kept as a backstop check (`session-start-reading`), not the primary path (alpha #3403).
+
+### Step 9.75 — Arm the away-night morning wake (LAST act)
+
+Runs after the dream master has returned and Step 9.5 triage, as the very last act of the sleep. When the host is left on overnight (the family is away), the 08:15 autostart does not fire next day, and Step 3.5 has already stopped every Monitor and removed `loop-mode.json`, so without this step nothing wakes the seat. The host flag `away-night.json` (in the shared dir) says whether tonight is such a night. `night_of` is the EVENING date of the night the host stays up (Friday night = Friday's date, even if the flag is written after midnight); before 06:00 only yesterday counts as tonight.
+
+```bash
+"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/away_night_wake.py"
+```
+
+The tool prints exactly one JSON object (`status`, `cron`, `prompt`, `fire_at`, `final_line`) and never calls CronCreate itself. Act on `status`:
+
+- **`none`** (no flag, or the flag is for another night): if `final_line` is empty (no flag), produce no extra output; if it is non-empty (a valid flag for another night), print it as the sleep's final line.
+- **`arm`**: call `CronCreate` with `cron` from the JSON, `prompt` from the JSON, and `recurring: false`; then call `CronList` and look for the job in its result; if the job is absent, that is also `AWAY-NIGHT WAKE NOT ARMED: job missing after CronCreate`. The final line of the sleep names the job id CronCreate reported and the run time the tool reported (`final_line`). Do NOT also arm a ScheduleWakeup or write a loop marker; sleep ended the loop.
+- **The command itself failing** (missing venv python, missing `away_night_wake.py` such as in a tier-filtered build, or stdout that is not one parseable JSON object): `AWAY-NIGHT WAKE NOT ARMED: tool did not run`. Note that `status` `error` exits 2 with the JSON on stdout; that is the normal `error` path, not a crash, so read the JSON and do not retry.
+- **`error`**, or `CronCreate` unavailable in this session, or `CronCreate` refusing: say so loudly on the final line, `AWAY-NIGHT WAKE NOT ARMED: <reason>` (for `error`, use the JSON's `final_line`). Never fail silent; a missed wake leaves the seat dark all day.
+
+**Why the prompt is the boot charge and not a loop-wake:** after sleep the loop marker is gone, so a markerless `<loop-wake>` would be read as a stale misfire, whereas the boot charge re-enters the loop and re-arms everything.
+
+A night-watch seat (the lab lead on a GPU night) does not run sleep that night; nothing to do there. Codex seats arm through their own managed bridge, not this step.
 
 ---
 

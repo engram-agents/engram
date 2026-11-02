@@ -783,6 +783,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/away_night_wake.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/grant_viz_operator_acl.py",
       "tier": "convenience"
     },
