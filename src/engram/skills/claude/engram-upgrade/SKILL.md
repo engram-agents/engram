@@ -198,6 +198,8 @@ If anything looks wrong after reconnecting (missing nodes, a query that used to 
 
 *Evidence behind this step, so you know what was run:* on 2026-10-19 the surface-daemon unit path (the born-before-rebuild check, the user-unit restart and its verification) was measured on a unit-supervised Linux seat, and the hook-launched surface branch (save the pid, TERM, wait, run the launcher by hand) was measured once on a second Linux seat (WSL2, no unit, no owner), which is where the bind delay in the verify step below was found. macOS and every owner command were NOT run (neither seat has an owner); they come from the setup script's own header and the rc2 release notes. Treat those as unverified until you have seen them work.
 
+**One-time re-run after the deploy that carries #4305.** The surface daemon's supervisor name is now keyed on the seat's ENGRAM home folder (`engram-surface-daemon-<key>.service` on Linux, `com.engram.surface-daemon.<key>` on macOS). Each seat that runs the daemon under a unit or LaunchAgent re-runs `tools/setup-surface-daemon-service.sh` once after that deploy; it stops and removes the old fixed-name unit or job (on macOS, boots out the old fixed label) only when that old job's own ENGRAM home folder is this seat's home, and leaves another home's job alone. Until the re-run, `tools/supervision_probe.py` reads `supervisor=none` for the daemon on that seat, although the hook still trusts the old job for its own home and starts no second daemon, so that reading lasts exactly one deploy.
+
 ### (a) Surface daemon
 
 First see whether it predates the rebuild. Use `etimes`, never `lstart` (see Step 8). `etimes` and the arithmetic below are Linux-only; on macOS read `ps -o etime=` as Step 8 describes:
@@ -212,11 +214,13 @@ echo "rebuild marker: $(grep '^deployed_at=' "$H"/.deployed-version)"   # Linux:
 
 Born before `deployed_at` means it runs the old code. Then restart it the way it is supervised:
 
-- **A user unit exists, on Linux** (`systemctl --user cat engram-surface-daemon.service` answers): restart the unit. Do not kill the pid; the supervisor owns it. If `systemctl --user` answers `Failed to connect to bus: No medium found` in your shell, set the runtime dir first (it was needed in the agent's shell where this was measured, so expect to need it in an agent shell):
+- **A user unit exists, on Linux** (the unit is named for the home: `engram-surface-daemon-<key>.service`, `<key>` from `tools/engramd-owner-home-key.sh <home>`; `systemctl --user cat "$UNIT"` answers, `UNIT` as set below; a seat set up before #4305 may still have the old fixed-name unit, which setup replaces when you re-run it): restart the unit. Do not kill the pid; the supervisor owns it. If `systemctl --user` answers `Failed to connect to bus: No medium found` in your shell, set the runtime dir first (it was needed in the agent's shell where this was measured, so expect to need it in an agent shell):
 
   ```bash
   export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-  systemctl --user restart engram-surface-daemon.service
+  H="${ENGRAM_HOME:-$HOME/.engram}"
+  UNIT="engram-surface-daemon-$(bash "$H/marketplace/plugins/engram/tools/engramd-owner-home-key.sh" "$H").service"
+  systemctl --user restart "$UNIT"
   ```
 
 - **No unit** (hook-launched, on Linux or on macOS without the LaunchAgent; the pid is in `recall-daemon.pid`): TERM that pid, wait until it is gone, then run the deployed launcher by hand. On a healthy daemon `start-engram-daemon.sh` only reports, so skipping the TERM leaves the old code running. Save the pid first: the daemon removes `recall-daemon.pid` when it handles the TERM, so the file cannot tell you when it has exited:
@@ -231,14 +235,14 @@ Born before `deployed_at` means it runs the old code. Then restart it the way it
 
   The launcher locates its sibling files itself; it does not read `CLAUDE_PLUGIN_ROOT`. Read from its branches, not run: when the service manager cannot be queried at all it launches nothing, so if the launcher prints that and no new pid appears, the daemon is down; fix the manager (the `XDG_RUNTIME_DIR` note above) and start the unit.
 
-- **macOS** (the LaunchAgent `com.engram.surface-daemon`, which launchd supervises): `launchctl kickstart -k "gui/$(id -u)/com.engram.surface-daemon"`. Label read from the setup script; this command was not run.
+- **macOS** (the LaunchAgent `com.engram.surface-daemon.<key>`, which launchd supervises; `<key>` from `tools/engramd-owner-home-key.sh <home>`): `launchctl kickstart -k "gui/$(id -u)/com.engram.surface-daemon.$(bash "$H/marketplace/plugins/engram/tools/engramd-owner-home-key.sh" "$H")"` with `H` as above. Label read from the setup script; this command was not run.
 
 Verify, do not assume: the new pid differs from the old one, `recall-daemon.pid` holds it, `recall-daemon.sock` is fresh, and the log has a new `Listening on ... (PID N)` line. **Poll before you read.** The launcher returns before the daemon has loaded its model and bound its socket: measured on one seat, the pid file and the socket both appeared 1 to 4 s after the launcher exited, so a read straight after it prints `No such file` and looks like a dead daemon. A missing pid file or socket in the first seconds means still loading; treat it as down only after the poll times out, and do not relaunch on that evidence:
 
 ```bash
 H="${ENGRAM_HOME:-$HOME/.engram}"
 for i in $(seq 1 30); do [ -S "$H"/recall-daemon.sock ] && [ -s "$H"/recall-daemon.pid ] && break; sleep 1; done
-systemctl --user show engram-surface-daemon.service -p MainPID,ActiveEnterTimestamp,NRestarts   # unit case
+systemctl --user show "$UNIT" -p MainPID,ActiveEnterTimestamp,NRestarts   # unit case (UNIT as set in the restart step)
 cat "$H"/recall-daemon.pid; ls -l "$H"/recall-daemon.sock; tail -3 "$H"/surface-daemon.log
 ```
 

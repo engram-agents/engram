@@ -97,7 +97,7 @@ import pytest
 # scenarios below need a deterministic way to force the UNSUPERVISED
 # state regardless of this host's own ambient systemctl behavior.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_start_daemon_probe_branch_logging import _make_fake_systemctl  # noqa: E402
+from test_start_daemon_probe_branch_logging import _install_home_key_helper, _make_fake_systemctl  # noqa: E402
 
 # #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
 pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
@@ -838,6 +838,7 @@ class _SocketGuardFixture(unittest.TestCase):
         script_text = source_text.replace("{{PYTHON}}", sys.executable)
         if self.RACE_HOOK:
             script_text = _patch_in_race_hook(script_text)
+        _install_home_key_helper(self.tmp)   # #4305
         self.script = hooks_dir / "start-engram-daemon.sh"
         self.script.write_text(script_text)
         self.script.chmod(self.script.stat().st_mode | stat.S_IXUSR)

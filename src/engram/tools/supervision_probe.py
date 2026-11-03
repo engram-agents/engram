@@ -142,7 +142,8 @@ against and correctly reads `UNKNOWN`, not `FAIL` -- `UNKNOWN` here means
 
 Named here, as the issue requires, rather than faked with a ppid read.
 `launchctl print gui/<uid>/<label>` is checked for a well-known label
-(`com.engram.surface-daemon` for the daemon; this repo does not yet define
+(`com.engram.surface-daemon.<key>` for the daemon, keyed on the seat's ENGRAM_HOME by
+`tools/engramd-owner-home-key.sh` (#4305); this repo does not yet define
 one for the MCP server, since no LaunchAgent template exists for it --
 `_MCP_SERVER_LAUNCHD_LABEL` below is a placeholder pending that follow-up).
 PASS requires the label to be registered AND the pid it reports to match the
@@ -183,6 +184,7 @@ import argparse
 import json
 import os
 import pwd
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -198,13 +200,45 @@ from tools import _owner_read as owner_read  # noqa: E402
 
 _START_TOLERANCE_SECONDS = 5.0
 _SESSION_CGROUP_MARKER = "agent-session@"
-_DAEMON_LAUNCHD_LABEL = "com.engram.surface-daemon"
+# #4305 / #2702: the surface daemon's supervisor names are KEYED on the seat's ENGRAM_HOME, with the
+# key from the ONE helper (tools/engramd-owner-home-key.sh, a sibling of this file in both the source
+# and the deployed tree: `tools/` is not flattened by the build).  The two helpers below are what used
+# to be the fixed module constants.
+_HOME_KEY_SH = Path(__file__).resolve().parent / "engramd-owner-home-key.sh"
+
+
+def _home_key(engram_home) -> Optional[str]:
+    """The 8-hex key of `engram_home` from the shared helper, or None if it cannot be computed
+    (no helper, the home does not exist, no sha tool, no answer in time)."""
+    try:
+        result = subprocess.run(
+            ["bash", str(_HOME_KEY_SH), str(engram_home)], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    key = result.stdout.strip()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{8}", key):
+        return None
+    return key
+
+
+def daemon_launchd_label(engram_home) -> Optional[str]:
+    """`com.engram.surface-daemon.<key>` for this home (None if the key cannot be computed)."""
+    key = _home_key(engram_home)
+    return None if key is None else f"com.engram.surface-daemon.{key}"
+
+
+def daemon_systemd_unit(engram_home) -> Optional[str]:
+    """`engram-surface-daemon-<key>.service` for this home (None if the key cannot be computed)."""
+    key = _home_key(engram_home)
+    return None if key is None else f"engram-surface-daemon-{key}.service"
+
+
 # Placeholder: no LaunchAgent template exists for the MCP server yet (only
 # the surface daemon and the viz server have one in this repo today). Left
 # named, not silently omitted, so a future template lands with an obvious
 # place to wire it in.
 _MCP_SERVER_LAUNCHD_LABEL: Optional[str] = None
-_DAEMON_SYSTEMD_UNIT = "engram-surface-daemon.service"
 # Same placeholder reasoning as the launchd label above.
 _MCP_SERVER_SYSTEMD_UNIT: Optional[str] = None
 
@@ -635,7 +669,7 @@ def probe_one(seat: str, check: ProcessCheck, *, proc_root: str = "/proc") -> tu
     # Append :<why> whenever there IS a why -- consistent across FAIL and
     # ERROR, not special-cased per status. A diagnostic tool's whole point is
     # naming what went wrong; a FAIL that discards its own reason (e.g. "not
-    # registered under com.engram.surface-daemon", "registered but no live
+    # registered under com.engram.surface-daemon.<key>", "registered but no live
     # pid") forces a reader back into the source to learn what the not-found
     # variant already prints inline. (The not-found pid=none branch above
     # constructs its own line directly rather than through this formatter --
@@ -683,8 +717,8 @@ def main(argv: list[str]) -> int:
         ProcessCheck(
             name="daemon",
             pattern=resolve_daemon_script_path(engram_home),
-            systemd_unit=_DAEMON_SYSTEMD_UNIT,
-            launchd_label=_DAEMON_LAUNCHD_LABEL,
+            systemd_unit=daemon_systemd_unit(engram_home),
+            launchd_label=daemon_launchd_label(engram_home),
         ),
         ProcessCheck(
             name="mcp-server",

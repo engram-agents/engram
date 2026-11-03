@@ -106,6 +106,22 @@ def test_c1_launchctl_mutating_subcommand_refused(service_manager_shim_dir, tmp_
     assert _calls(log) == [], "the tool behind the shim must not be run"
 
 
+@pytest.mark.parametrize("label", [
+    "com.engram.surface-daemon",             # the legacy fixed label (#3519's origin)
+    "com.engram.surface-daemon.0123abcd",    # the keyed shape (#4305)
+    "com.engram.engramd-owner.0123abcd",
+])
+@pytest.mark.parametrize("sub", ["bootstrap", "bootout", "kickstart"])
+def test_c1_keyed_and_legacy_surface_labels_are_both_refused(service_manager_shim_dir, tmp_path, sub, label):
+    """#4305: the guard is keyed on the TOOL and the verb, never on a label, so renaming the surface
+    daemon's label to the keyed shape leaves the production-label protection intact. Pinned here so a
+    future label-matching 'optimisation' of the shim cannot silently drop one of the two shapes."""
+    log = _make_fake(tmp_path / "fake", "launchctl")
+    r = _run_shim(service_manager_shim_dir, "launchctl", [sub, f"gui/501/{label}"], behind=tmp_path / "fake")
+    _assert_refused(r, "launchctl")
+    assert _calls(log) == []
+
+
 def test_c1_launchctl_no_subcommand_refused(service_manager_shim_dir, tmp_path):
     log = _make_fake(tmp_path / "fake", "launchctl")
     r = _run_shim(service_manager_shim_dir, "launchctl", [], behind=tmp_path / "fake")

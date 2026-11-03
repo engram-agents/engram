@@ -665,7 +665,7 @@
     {
       "path": "tools/engramd-owner-home-key.sh",
       "tier": "essential",
-      "note": "engram-alpha#3709: the one derivation of the per-ENGRAM_HOME key shared by setup-surface-daemon-service.sh --owner and hooks/start-engramd-owner.sh. Essential because the essential-tier hook sources it."
+      "note": "engram-alpha#3709, #4305: the one derivation of the per-ENGRAM_HOME key, shared by setup-surface-daemon-service.sh (owner and surface modes), hooks/start-engramd-owner.sh, hooks/start-engram-daemon.sh, tools/supervision_probe.py and tools/check_stale_processes.py. Essential because the essential-tier hooks source it."
     },
     {
       "path": "tools/config_schema.py",

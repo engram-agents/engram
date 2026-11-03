@@ -3,6 +3,13 @@ Description=ENGRAM surface daemon (semantic recall)
 
 [Service]
 Type=simple
+# #4305: do not start (and so do not restart-loop) once ENGRAM_HOME is gone. ExecCondition is
+# re-run before EVERY start, automatic restarts included; a failed one leaves the unit inactive
+# with no further restarts. Not ConditionPathExists: it is not re-checked on an automatic
+# restart (measured, systemd 255.4), so it does not stop a restart loop. `test -d`, not -e:
+# the home must be a directory. ExecCondition needs systemd >= 243 (man page: "Added in
+# version 243"); that is this template's floor.
+ExecCondition=/usr/bin/test -d {{ENGRAM_HOME}}
 # #2652 phase-0 unit 3: the trailing ENGRAM_HOME argv is unused by the
 # script itself (ENGRAM_HOME is still resolved from the Environment= line
 # below) -- it exists solely so start-engram-daemon.sh's `pgrep -f`-based
@@ -16,11 +23,12 @@ Environment=ENGRAM_HOME={{ENGRAM_HOME}}
 Environment=ENGRAM_DAEMON_IDLE_TIMEOUT=0
 Restart=always
 RestartSec=5s
-# `append:` log-routing requires systemd >= 240 (2018-10-03).
-# Pre-v240 systemd (Ubuntu 18.04 ships 237) would fail to parse this unit.
+# `append:` log-routing requires systemd >= 240 (2018-10-03); the unit's overall floor is
+# 243 (ExecCondition above), which already covers it.
+# Pre-v243 systemd (Ubuntu 18.04 ships 237) would fail to parse this unit.
 # Practical floor is fine — engram-alpha's Python 3.10+ floor already
 # excludes 18.04 (3.10 not in main repos). Switch to `StandardOutput=journal`
-# if a pre-v240 target ever needs support.
+# if a pre-v243 target ever needs support (and drop ExecCondition).
 StandardOutput=append:{{ENGRAM_HOME}}/surface-daemon.log
 StandardError=append:{{ENGRAM_HOME}}/surface-daemon.log
 

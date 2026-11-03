@@ -25,8 +25,13 @@ import pytest
 
 from test_owner_launchd_3709 import DSandbox, UID, label_for
 from test_owner_launcher_3663 import _stub
+from test_surface_label_keyed_4305 import key_of
 
-SURFACE_LABEL = "com.engram.surface-daemon"
+# #4305: the surface daemon's label is keyed on the home, like the owner's. The script now also asks
+# `launchctl print` about the OLD fixed label once (the legacy-transition check, answered "not found" here);
+# that one read-only call is filtered out of what these cells count, so they still pin the KEYED label's
+# bootout / print-poll / bootstrap sequence exactly as before.
+LEGACY_SURFACE_LABEL = "com.engram.surface-daemon"
 TINY = {"ENGRAM_SETUP_LAUNCHD_POLL_S": "0.01", "ENGRAM_SETUP_LAUNCHD_RETRY_S": "0.01",
         "ENGRAM_SETUP_LAUNCHD_WAIT_S": "2"}
 
@@ -48,6 +53,7 @@ echo "$@" >> "{self.sb.launchlog}"
 bump() {{ f="{cnt}/$1"; n=$(cat "$f" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$f"; echo "$n"; }}
 case "$1" in
   print)
+    case "$2" in */{LEGACY_SURFACE_LABEL}) echo "Could not find service" >&2; exit 113 ;; esac
     n=$(bump print)
     if [ "$n" -le {print_present} ]; then echo "service = {{ state = running }}"; exit 0; fi
     echo "Could not find service" >&2; exit 113 ;;
@@ -61,7 +67,7 @@ exit 0
 
     @property
     def label(self) -> str:
-        return label_for(self.home) if self.mode == "owner" else SURFACE_LABEL
+        return label_for(self.home) if self.mode == "owner" else f"{LEGACY_SURFACE_LABEL}.{key_of(self.home)}"
 
     @property
     def plist(self):
@@ -73,7 +79,11 @@ exit 0
         return self.sb.run_env(*a, engram_home=str(self.home), extra=env)
 
     def verbs(self) -> list:
-        return [c[0] for c in self.sb.launchctl_calls()]
+        return [c[0] for c in self.calls()]
+
+    def calls(self) -> list:
+        return [c for c in self.sb.launchctl_calls()
+                if not (c[0] == "print" and c[1].endswith("/" + LEGACY_SURFACE_LABEL))]
 
 
 @pytest.fixture(params=["owner", "plain"])
@@ -88,8 +98,8 @@ def test_a_bootstrap_waits_until_print_reports_the_service_gone(tmp_path, mode):
     r = rig.run()
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     # 3 "present" answers, the 4th reports gone, and only THEN bootstrap
-    assert rig.verbs() == ["bootout", "print", "print", "print", "print", "bootstrap"], rig.sb.launchctl_calls()
-    printed = [c for c in rig.sb.launchctl_calls() if c[0] == "print"]
+    assert rig.verbs() == ["bootout", "print", "print", "print", "print", "bootstrap"], rig.calls()
+    printed = [c for c in rig.calls() if c[0] == "print"]
     assert all(c == ["print", f"gui/{UID}/{rig.label}"] for c in printed), printed
 
 
@@ -99,7 +109,7 @@ def test_b_two_failures_then_success_is_rc0_with_three_attempts_and_the_attempt_
     rig = Rig(tmp_path, mode, boot_fail_first=2)
     r = rig.run()
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-    assert rig.verbs().count("bootstrap") == 3, rig.sb.launchctl_calls()
+    assert rig.verbs().count("bootstrap") == 3, rig.calls()
     assert "launchctl bootstrap succeeded on attempt 3 of 5" in [ln.strip() for ln in r.stdout.splitlines()], r.stdout
     assert "Loaded." in r.stdout
 
@@ -117,7 +127,7 @@ def test_c_always_rc5_exits_5_after_five_attempts_with_the_loud_message(tmp_path
     rig = Rig(tmp_path, mode, boot_fail_first=999, boot_rc=5)
     r = rig.run()
     assert r.returncode == 5, (r.returncode, r.stdout, r.stderr)
-    assert rig.verbs().count("bootstrap") == 5, rig.sb.launchctl_calls()
+    assert rig.verbs().count("bootstrap") == 5, rig.calls()
     assert "Loaded." not in r.stdout and "Setup complete" not in r.stdout
     assert rig.label in r.stderr, r.stderr
     assert "5 attempts" in r.stderr, r.stderr
@@ -140,7 +150,7 @@ def test_d_rc125_is_the_existing_exit3_message_with_exactly_one_bootstrap(tmp_pa
     r = rig.run()
     subject = "The owner" if mode == "owner" else "The surface daemon"
     assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
-    assert rig.verbs().count("bootstrap") == 1, rig.sb.launchctl_calls()
+    assert rig.verbs().count("bootstrap") == 1, rig.calls()
     # the lines recorded from the pre-fix script (stub stderr first, then the named message), verbatim
     err = r.stderr.splitlines()
     assert err[-2:] == [

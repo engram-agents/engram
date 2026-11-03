@@ -122,6 +122,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_DIR = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 START_SCRIPT_PATH = DAEMON_DIR / "start-engram-daemon.sh"
+_HOME_KEY_SH = REPO_ROOT / "src" / "engram" / "tools" / "engramd-owner-home-key.sh"  # #4305
 
 _TIMESTAMP_RE = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
 _CGROUP_STATES = ("supervised", "unsupervised", "unavailable")
@@ -834,6 +835,32 @@ def _extract_bash_function(script_text: str, func_name: str) -> str:
     return m.group(0)
 
 
+# #4305: `_supervisor_registered_state` is KEYED on the home (`_surface_key`, set by the script's main
+# flow) and delegates to top-level helpers; the isolated runs below extract them all from the real script.
+_SURFACE_KEY_FOR_TESTS = "0123abcd"
+_SUPERVISOR_HELPERS_LINUX = (
+    "_legacy_surface_unit", "_legacy_surface_label", "_same_physical_home", "_env_engram_home",
+    "_linux_unit_probe",
+)
+_SUPERVISOR_HELPERS_DARWIN = (
+    "_legacy_surface_unit", "_legacy_surface_label", "_same_physical_home", "_launchctl_print_bounded",
+    "_darwin_job_state",
+)
+
+
+def _extract_supervisor_functions(script_text: str, *, darwin: bool) -> str:
+    names = (_SUPERVISOR_HELPERS_DARWIN if darwin else _SUPERVISOR_HELPERS_LINUX) + ("_supervisor_registered_state",)
+    return "\n".join(_extract_bash_function(script_text, n) for n in names)
+
+
+def _install_home_key_helper(tmp: Path) -> None:
+    """#4305: the hook keys the supervisor name with tools/engramd-owner-home-key.sh, found in <dir of the
+    hook>/../tools/ (no engram_core.py in these tmp trees, so only the own dir and its parent are searched).
+    Every test that copies the hook into <tmp>/hooks/ calls this so the copy can find the helper."""
+    (tmp / "tools").mkdir(exist_ok=True)
+    shutil.copy(_HOME_KEY_SH, tmp / "tools" / _HOME_KEY_SH.name)
+
+
 # #3333: GNU `timeout` is absent on stock macOS. The script's supervisor
 # check runs `timeout 3 systemctl --user show ...` (behind `command -v
 # systemctl`, which only the fake systemctl satisfies here), so on such a
@@ -876,7 +903,7 @@ def _make_fake_launchctl(
     user_rc: int | None = None, user_stdout_text: str = "", user_sleep_seconds: float = 0,
 ) -> None:
     """Fake `launchctl`, answering PER DOMAIN. `rc`/`stdout_text`/`sleep_seconds`
-    answer `launchctl print gui/<uid>/com.engram.surface-daemon`; `user_rc`/
+    answer `launchctl print gui/<uid>/com.engram.surface-daemon.<key>`; `user_rc`/
     `user_stdout_text`/`user_sleep_seconds` answer the `user/<uid>/...` form
     (`user_rc=None`: the user domain is not expected to be asked -- it exits 98
     so an unexpected query is visible). A `sleep_seconds` sleeps first (the
@@ -896,13 +923,16 @@ def _make_fake_launchctl(
         "#!/bin/bash\n"
         'case "$1" in print) ;; *) echo "bad argv: $*" >&2; exit 99 ;; esac\n'
         'case "$2" in\n'
-        "  gui/*/com.engram.surface-daemon)\n"
+        # #4305: the KEYED label answers; the legacy fixed label is "not found" (rc 113)
+        "  gui/*/com.engram.surface-daemon.*)\n"
         + (f"    sleep {sleep_seconds}\n" if sleep_seconds else "")
         + f'    cat "{textfile}"\n'
         + f"    exit {rc} ;;\n"
-        "  user/*/com.engram.surface-daemon)\n"
+        "  user/*/com.engram.surface-daemon.*)\n"
         + user_branch
         + "    ;;\n"
+        "  gui/*/com.engram.surface-daemon|user/*/com.engram.surface-daemon)\n"
+        "    echo 'Could not find service' >&2; exit 113 ;;\n"
         '  *) echo "bad argv: $*" >&2; exit 99 ;;\n'
         "esac\n"
     )
@@ -1070,7 +1100,7 @@ def _run_supervisor_function(
     branch deterministically instead of depending on which uids happen to
     have logind sessions on whatever host runs this test.
     """
-    func_text = _extract_bash_function(START_SCRIPT_PATH.read_text(), "_supervisor_registered_state")
+    func_text = _extract_supervisor_functions(START_SCRIPT_PATH.read_text(), darwin=False)
     if strip_xdg_guard:
         # Falsification (merge-seat HOLD, Kepler, PR #2700): remove the
         # guard-default block entirely, reproducing the pre-fix function
@@ -1106,15 +1136,10 @@ def _run_supervisor_function(
         # Falsification (reviewer-fairy suggestion 1): remove the
         # `timeout 3` wrapper, restoring the pre-fix unbounded systemctl
         # invocation.
-        target = (
-            'out="$(timeout 3 systemctl --user show engram-surface-daemon.service '
-            '-p LoadState,ActiveState,SubState 2>&1)"'
-        )
+        # #4305: the call now lives in _linux_unit_probe, keyed by the unit name it is given.
+        target = 'out="$(timeout 3 systemctl --user show "$unit" -p "$props" 2>&1)"'
         assert target in func_text, "timeout-wrapper target snippet not found -- function shape changed"
-        replacement = (
-            'out="$(systemctl --user show engram-surface-daemon.service '
-            '-p LoadState,ActiveState,SubState 2>&1)"'
-        )
+        replacement = 'out="$(systemctl --user show "$unit" -p "$props" 2>&1)"'
         func_text = func_text.replace(target, replacement)
 
     assert not (xdg_runtime_dir_unset and xdg_runtime_dir is not None), (
@@ -1124,6 +1149,8 @@ def _run_supervisor_function(
     with tempfile.TemporaryDirectory() as td:
         bin_dir = Path(td)
         env = dict(os.environ)
+        env["_surface_key"] = _SURFACE_KEY_FOR_TESTS      # #4305: exported, read by the extracted function
+        env["ENGRAM_HOME"] = td
         if xdg_runtime_dir_unset:
             env.pop("XDG_RUNTIME_DIR", None)
         elif xdg_runtime_dir is not None:
@@ -1238,6 +1265,9 @@ class _ProbeBranchFixture(unittest.TestCase):
         script_text = source_text.replace("{{PYTHON}}", sys.executable)
         if self.PATCH_OUT_2666:
             script_text = _patch_out_bare_except_2666(script_text)
+        # #4305: the hook finds the home-key helper at <parent of its dir>/tools/ (no engram_core.py here,
+        # so only its own directory and its parent are searched).
+        _install_home_key_helper(self.tmp)
         self.script = hooks_dir / "start-engram-daemon.sh"
         self.script.write_text(script_text)
         self.script.chmod(self.script.stat().st_mode | stat.S_IXUSR)
@@ -3343,11 +3373,7 @@ def _run_darwin_supervisor_function(
     script_text = START_SCRIPT_PATH.read_text()
     # The bounded launchctl helper is a top-level function (the hooks stdout
     # audit cannot parse nested ones), so extract it alongside.
-    func_text = (
-        _extract_bash_function(script_text, "_launchctl_print_bounded")
-        + "\n"
-        + _extract_bash_function(script_text, "_supervisor_registered_state")
-    )
+    func_text = _extract_supervisor_functions(script_text, darwin=True)
     with tempfile.TemporaryDirectory() as td:
         bin_dir = Path(td)
         _make_fake_uname(bin_dir, "Darwin")
@@ -3358,6 +3384,7 @@ def _run_darwin_supervisor_function(
         env = dict(os.environ)
         env["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
         env["ENGRAM_HOME"] = engram_home
+        env["_surface_key"] = _SURFACE_KEY_FOR_TESTS      # #4305
         started = time.time()
         result = subprocess.run(
             [shutil.which("bash") or "/bin/bash", "-c", func_text + "\n_supervisor_registered_state"],
@@ -3375,7 +3402,7 @@ class TestSupervisorRegisteredStateDarwinLaunchctl(unittest.TestCase):
 
     def test_rc_113_is_not_registered(self):
         state, _ = _run_darwin_supervisor_function(
-            rc=113, stdout_text="Could not find service \"com.engram.surface-daemon\" in domain for user gui: 501\n")
+            rc=113, stdout_text="Could not find service \"com.engram.surface-daemon.0123abcd\" in domain for user gui: 501\n")
         self.assertEqual(state, "not-registered")
 
     def test_home_mismatch_is_unavailable(self):

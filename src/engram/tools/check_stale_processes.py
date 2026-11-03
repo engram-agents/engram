@@ -351,10 +351,14 @@ def _restart_command(name: str, pid: int, home: Path, root: Path, system: str) -
         start = q(str(root / "hooks" / "start-engram-daemon.sh"))
         manual = "kill -TERM %d, wait for exit, then CLAUDE_PLUGIN_ROOT=%s bash %s </dev/null" % (
             pid, q(str(root)), start)
-        if darwin:  # label is a fixed literal in setup-surface-daemon-service.sh (PLIST_LABEL)
-            return ("launchctl kickstart -k gui/$(id -u)/com.engram.surface-daemon (if it runs under "
-                    "launchd); else " + manual)
-        return "systemctl --user restart engram-surface-daemon.service (if it runs under a unit); else " + manual
+        # #4305: the unit / label is keyed on the home by the ONE helper, called in the printed command
+        # exactly as the owner branch above calls it.
+        key = q(str(root / "tools" / "engramd-owner-home-key.sh"))
+        if darwin:  # label = com.engram.surface-daemon.<key> (setup-surface-daemon-service.sh, PLIST_LABEL)
+            return ("launchctl kickstart -k gui/$(id -u)/com.engram.surface-daemon.$(bash %s %s) (if it runs under "
+                    "launchd); else %s" % (key, q(str(home)), manual))
+        return ("systemctl --user restart \"engram-surface-daemon-$(bash %s %s).service\" (if it runs under a unit); else %s"
+                % (key, q(str(home)), manual))
     return "end the Claude Code session that owns it and start a new one, or /mcp reconnect"
 
 

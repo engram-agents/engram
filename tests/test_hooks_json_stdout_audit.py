@@ -316,6 +316,15 @@ SHELL_STDOUT_RETURN_HELPERS: dict[str, set[str]] = {
         # $(_supervisor_registered_state) -- reads whether a supervisor
         # unit is registered at all; stdout is the return value.
         "_supervisor_registered_state",
+        # #4305: the helpers _supervisor_registered_state delegates to; each is called ONLY as
+        # $(...) (the call-site test below enforces that) and prints its answer.
+        "_surface_home_key",
+        "_bounded_dirs",
+        "_env_engram_home",
+        "_linux_unit_probe",
+        "_darwin_job_state",
+        "_legacy_surface_unit",
+        "_legacy_surface_label",
     },
 }
 

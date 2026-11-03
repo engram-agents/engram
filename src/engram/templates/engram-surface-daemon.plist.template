@@ -4,7 +4,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.engram.surface-daemon</string>
+    <string>{{LABEL}}</string>
 
     <!-- #2652 phase-0 unit 3: the trailing ENGRAM_HOME argv is unused by
          the script itself (ENGRAM_HOME is still resolved from
@@ -34,8 +34,24 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- #4305: keep the job alive only while ENGRAM_HOME exists, so a deleted home
+         (a temp home) cannot respawn the daemon forever (the #3519 shape). While the
+         home exists a crash is restarted as before. Measured once on a Mac (2026-11-03, a trivial
+         sleep job, kill -9): restarted while the home exists, not respawned once the home is
+         deleted, started again when the home is recreated; deleting the home does not stop a job
+         that is already running. launchd.plist(5) calls path-based monitoring inherently
+         race-prone and lossy and says to avoid it, so read this as a best-effort stop, not a
+         guarantee. The fallback if it misbehaves is the owner's shape (SuccessfulExit false +
+         ThrottleInterval) plus a daemon exit 0 on a missing home. This is the ONE place the
+         choice lives. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>PathState</key>
+        <dict>
+            <key>{{ENGRAM_HOME}}</key>
+            <true/>
+        </dict>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>{{ENGRAM_HOME}}/surface-daemon.log</string>

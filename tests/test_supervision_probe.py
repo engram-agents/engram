@@ -189,7 +189,7 @@ class TestProbeOnePidResolutionShapes:
         monkeypatch.setattr(
             subprocess, "run", lambda *a, **k: _FakeCompletedProcess(1, "")
         )
-        check = sp.ProcessCheck("daemon", "/nonexistent", "engram-surface-daemon.service", "com.engram.surface-daemon")
+        check = sp.ProcessCheck("daemon", "/nonexistent", "engram-surface-daemon-0123abcd.service", "com.engram.surface-daemon.0123abcd")
         line, is_ok = sp.probe_one("testseat", check, proc_root=str(synthetic_proc))
         assert "pid=none" in line
         assert "cgroup=FAIL:not-found" in line
@@ -199,7 +199,7 @@ class TestProbeOnePidResolutionShapes:
         monkeypatch.setattr(
             subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0, "111\n222\n")
         )
-        check = sp.ProcessCheck("daemon", "/nonexistent", "engram-surface-daemon.service", "com.engram.surface-daemon")
+        check = sp.ProcessCheck("daemon", "/nonexistent", "engram-surface-daemon-0123abcd.service", "com.engram.surface-daemon.0123abcd")
         line, is_ok = sp.probe_one("testseat", check, proc_root=str(synthetic_proc))
         assert "pid=ambiguous" in line
         assert "111" not in line
@@ -244,7 +244,7 @@ class TestProbeOneFoundPath:
                 systemctl_stdout="LoadState=not-found\nActiveState=inactive\nActiveEnterTimestampMonotonic=0\n",
             ),
         )
-        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon.service", "com.engram.surface-daemon")
+        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon-0123abcd.service", "com.engram.surface-daemon.0123abcd")
         line, is_ok = sp.probe_one("testseat", check, proc_root=str(synthetic_proc))
         assert line == "testseat daemon pid=4242 cgroup=PASS start=UNKNOWN supervisor=none"
         assert is_ok is True
@@ -256,7 +256,7 @@ class TestProbeOneFoundPath:
             "run",
             _dispatch_by_command(pgrep_pid="4242", grep_rc=0),  # FAIL: marker present
         )
-        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon.service", "com.engram.surface-daemon")
+        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon-0123abcd.service", "com.engram.surface-daemon.0123abcd")
         line, is_ok = sp.probe_one("testseat", check, proc_root=str(synthetic_proc))
         assert "cgroup=FAIL" in line
         assert "cgroup=FAIL:" not in line  # plain FAIL (not the not-found variant) carries no suffix
@@ -276,7 +276,7 @@ class TestProbeOneFoundPath:
                 systemctl_stdout="LoadState=not-found\nActiveState=inactive\nActiveEnterTimestampMonotonic=0\n",
             ),
         )
-        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon.service", "com.engram.surface-daemon")
+        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon-0123abcd.service", "com.engram.surface-daemon.0123abcd")
         line, _ = sp.probe_one("testseat", check, proc_root=str(synthetic_proc))
         assert "supervisor=none" in line
 
@@ -291,9 +291,9 @@ class TestProbeOneFoundPath:
                 systemctl_stdout="LoadState=loaded\nActiveState=active\nActiveEnterTimestampMonotonic=100000000\n",
             ),
         )
-        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon.service", "com.engram.surface-daemon")
+        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon-0123abcd.service", "com.engram.surface-daemon.0123abcd")
         line, _ = sp.probe_one("testseat", check, proc_root=str(synthetic_proc))
-        assert "supervisor=engram-surface-daemon.service" in line
+        assert "supervisor=engram-surface-daemon-0123abcd.service" in line
 
     def test_darwin_pass_reports_ok(self, monkeypatch, tmp_path):
         no_proc_root = tmp_path / "no-proc-here"
@@ -302,12 +302,12 @@ class TestProbeOneFoundPath:
             "run",
             _dispatch_by_command(
                 pgrep_pid="4242",
-                launchctl_stdout="gui/501/com.engram.surface-daemon = {\n\tpid = 4242\n}\n",
+                launchctl_stdout="gui/501/com.engram.surface-daemon.0123abcd = {\n\tpid = 4242\n}\n",
             ),
         )
-        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon.service", "com.engram.surface-daemon")
+        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon-0123abcd.service", "com.engram.surface-daemon.0123abcd")
         line, is_ok = sp.probe_one("testseat", check, proc_root=str(no_proc_root))
-        assert line == "testseat daemon pid=4242 cgroup=PASS start=UNKNOWN supervisor=com.engram.surface-daemon"
+        assert line == "testseat daemon pid=4242 cgroup=PASS start=UNKNOWN supervisor=com.engram.surface-daemon.0123abcd"
         assert is_ok is True
 
     def test_darwin_no_registration_fails(self, monkeypatch, tmp_path):
@@ -317,9 +317,9 @@ class TestProbeOneFoundPath:
             "run",
             _dispatch_by_command(pgrep_pid="4242", launchctl_rc=113, launchctl_stdout=""),
         )
-        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon.service", "com.engram.surface-daemon")
+        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon-0123abcd.service", "com.engram.surface-daemon.0123abcd")
         line, is_ok = sp.probe_one("testseat", check, proc_root=str(no_proc_root))
-        assert "cgroup=FAIL:not registered under com.engram.surface-daemon" in line
+        assert "cgroup=FAIL:not registered under com.engram.surface-daemon.0123abcd" in line
         assert "supervisor=none" in line
         assert is_ok is False
 
@@ -339,7 +339,7 @@ class TestProbeOneFoundPath:
                 systemctl_stdout="LoadState=loaded\nActiveState=active\nActiveEnterTimestampMonotonic=999999999999\n",
             ),
         )
-        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon.service", "com.engram.surface-daemon")
+        check = sp.ProcessCheck("daemon", "/some/daemon.py", "engram-surface-daemon-0123abcd.service", "com.engram.surface-daemon.0123abcd")
         line, is_ok = sp.probe_one("testseat", check, proc_root=str(synthetic_proc))
         assert "cgroup=PASS" in line
         assert "start=MOVED" in line

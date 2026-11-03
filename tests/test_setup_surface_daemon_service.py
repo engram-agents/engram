@@ -1,8 +1,8 @@
 """Tests for tools/setup-surface-daemon-service.sh OS-detection logic.
 
 Covers (per spec):
-  (a) Linux branch targets ~/.config/systemd/user/engram-surface-daemon.service.
-  (b) Darwin branch targets ~/Library/LaunchAgents/com.engram.surface-daemon.plist.
+  (a) Linux branch targets ~/.config/systemd/user/engram-surface-daemon-<key>.service (#4305: keyed on ENGRAM_HOME).
+  (b) Darwin branch targets ~/Library/LaunchAgents/com.engram.surface-daemon.<key>.plist.
   (c) Linux branch invokes systemctl --user (mocked — no real systemctl called).
   (d) Darwin branch invokes launchctl bootstrap/bootout (modern API; mocked — no real launchctl called).
   (e) Missing systemctl on Linux → script exits non-zero with a clear message.
@@ -40,6 +40,24 @@ def _write_stub(directory: Path, name: str, content: str) -> Path:
     return p
 
 
+HOME_KEY_SH = REPO_ROOT / "src" / "engram" / "tools" / "engramd-owner-home-key.sh"
+
+
+def _key(engram_home) -> str:
+    """The 8-hex key of a home, from the ONE helper (#4305)."""
+    r = subprocess.run(["bash", str(HOME_KEY_SH), str(engram_home)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _unit_name(fake_home) -> str:
+    return f"engram-surface-daemon-{_key(Path(fake_home) / '.engram')}.service"
+
+
+def _label_name(fake_home) -> str:
+    return f"com.engram.surface-daemon.{_key(Path(fake_home) / '.engram')}"
+
+
 def _make_patched_script(plugin_root: str, dest: Path) -> None:
     """Write a copy of SETUP_SCRIPT with PLUGIN_ROOT hard-coded to plugin_root."""
     original = SETUP_SCRIPT.read_text()
@@ -56,6 +74,8 @@ def _make_patched_script(plugin_root: str, dest: Path) -> None:
     )
     patched = original.replace(target, f'PLUGIN_ROOT="{plugin_root}"')
     dest.write_text(patched)
+    # #4305: surface mode keys its names with the helper that sits next to the script
+    shutil.copy(HOME_KEY_SH, dest.parent / HOME_KEY_SH.name)
     dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
@@ -180,7 +200,7 @@ class TestOSDetection(unittest.TestCase):
             )
 
             # Check the unit file landed in the right place
-            expected_service = Path(fake_home) / ".config" / "systemd" / "user" / "engram-surface-daemon.service"
+            expected_service = Path(fake_home) / ".config" / "systemd" / "user" / _unit_name(fake_home)
             self.assertTrue(
                 expected_service.exists(),
                 f"Linux branch must write unit to {expected_service}; got:\n{result.stdout}\n{result.stderr}",
@@ -201,12 +221,12 @@ class TestOSDetection(unittest.TestCase):
             )
             calls = log_path.read_text()
             self.assertIn("--user", calls, "systemctl must be called with --user")
-            self.assertIn("engram-surface-daemon.service", calls)
+            self.assertIn(_unit_name(fake_home), calls)
             # The recording stub logs one `"$@"` line per call.  The real enable
             # call must be present as a whole line: the `--user daemon-reload`
             # line alone satisfies the substring checks above.
             self.assertIn(
-                "--user enable --now engram-surface-daemon.service",
+                f"--user enable --now {_unit_name(fake_home)}",
                 calls.splitlines(),
                 f"systemctl must be called exactly as `--user enable --now <unit>`; calls:\n{calls}",
             )
@@ -226,7 +246,7 @@ class TestOSDetection(unittest.TestCase):
                 f"Real installer must succeed on Darwin;\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
 
-            plist_label = "com.engram.surface-daemon"
+            plist_label = _label_name(fake_home)
             plist_dest = Path(fake_home) / "Library" / "LaunchAgents" / f"{plist_label}.plist"
 
             # Check the plist landed in the right place
@@ -251,7 +271,7 @@ class TestOSDetection(unittest.TestCase):
             calls = log_path.read_text()
             self.assertIn("bootstrap", calls, "launchctl must be called with 'bootstrap' (modern API)")
             self.assertIn("bootout", calls, "launchctl must be called with 'bootout' (modern cleanup)")
-            self.assertIn("com.engram.surface-daemon", calls)
+            self.assertIn(_label_name(fake_home), calls)
             # Whole-line pins on the real calls (the stub logs one `"$@"` line per
             # call); substrings above would also match a wrong-domain call.
             uid = os.getuid()
@@ -277,7 +297,7 @@ class TestOSDetection(unittest.TestCase):
                 result.returncode, 0,
                 f"Real installer must succeed on Linux;\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            service_out = Path(fake_home) / ".config" / "systemd" / "user" / "engram-surface-daemon.service"
+            service_out = Path(fake_home) / ".config" / "systemd" / "user" / _unit_name(fake_home)
             content = service_out.read_text()
             self.assertIn(
                 "ENGRAM_DAEMON_IDLE_TIMEOUT=0",
@@ -302,7 +322,7 @@ class TestOSDetection(unittest.TestCase):
                 result.returncode, 0,
                 f"Real installer must succeed on Darwin;\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            plist_out = Path(fake_home) / "Library" / "LaunchAgents" / "com.engram.surface-daemon.plist"
+            plist_out = Path(fake_home) / "Library" / "LaunchAgents" / f"{_label_name(fake_home)}.plist"
             content = plist_out.read_text()
             self.assertIn(
                 "ENGRAM_DAEMON_IDLE_TIMEOUT",
@@ -315,7 +335,7 @@ class TestOSDetection(unittest.TestCase):
                 "Rendered plist must set ENGRAM_DAEMON_IDLE_TIMEOUT to 0",
             )
             self.assertIn(
-                "com.engram.surface-daemon",
+                _label_name(fake_home),
                 content,
                 "Rendered plist must contain the service label",
             )
@@ -503,7 +523,7 @@ class TestHooksDirResolution(unittest.TestCase):
             # Rendered unit must reference the flat hooks/ daemon path
             service_dest = (
                 Path(fake_home) / ".config" / "systemd" / "user"
-                / "engram-surface-daemon.service"
+                / _unit_name(fake_home)
             )
             self.assertTrue(service_dest.exists(), f"Rendered unit must exist at {service_dest}")
             unit_content = service_dest.read_text()
@@ -574,7 +594,7 @@ class TestHooksDirResolution(unittest.TestCase):
             # Rendered unit must reference hooks/claude/ path
             service_dest = (
                 Path(fake_home) / ".config" / "systemd" / "user"
-                / "engram-surface-daemon.service"
+                / _unit_name(fake_home)
             )
             self.assertTrue(service_dest.exists(), f"Rendered unit must exist at {service_dest}")
             unit_content = service_dest.read_text()
@@ -639,7 +659,7 @@ class TestHooksDirResolution(unittest.TestCase):
             # Rendered unit must reference the override path
             service_dest = (
                 Path(fake_home) / ".config" / "systemd" / "user"
-                / "engram-surface-daemon.service"
+                / _unit_name(fake_home)
             )
             self.assertTrue(service_dest.exists(), f"Rendered unit must exist at {service_dest}")
             unit_content = service_dest.read_text()

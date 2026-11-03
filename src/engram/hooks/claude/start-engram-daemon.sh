@@ -32,7 +32,7 @@
 #
 # Supervisor-registration check: systemd --user on Linux, launchd on Darwin
 # (#4261). On Darwin (`uname -s` = Darwin, `launchctl` present) the check runs
-# `launchctl print gui/$(id -u)/com.engram.surface-daemon` and maps it:
+# `launchctl print gui/$(id -u)/com.engram.surface-daemon.<key>` and maps it:
 #   rc 113 (no such job)                      -> not-registered (launch)
 #   rc 125 (no GUI launchd domain for this uid; measured on a real seat 10-30,
 #     and the installer treats it the same way)
@@ -49,6 +49,16 @@
 #   any other rc, or no answer within 2 s     -> unavailable
 # Only the job's own first-level `state =` line counts; coalition blocks
 # deeper in the output carry their own `state = active` lines.
+#
+# #4305 / #2702: the unit / label is KEYED on ENGRAM_HOME -- engram-surface-daemon-<key>.service on
+# Linux, com.engram.surface-daemon.<key> on Darwin -- <key> from the ONE helper
+# tools/engramd-owner-home-key.sh (found via $CLAUDE_PLUGIN_ROOT, else a walk-parents search bounded
+# at the tree root, never a fixed parents[N]). The keyed name is asked FIRST and its answer stands.
+# If it is not found, the old FIXED-name unit / job (the legacy-transition code, _legacy_surface_*)
+# counts as registered-for-me ONLY IF its own ENGRAM_HOME is this hook's home (physical-path
+# comparison); a legacy job for ANOTHER home reads not-registered (that home has its own keyed name
+# now); one whose ENGRAM_HOME cannot be read, or a call that fails, reads unavailable. If the key
+# itself cannot be computed the answer is unavailable (never not-registered): no launch.
 #
 # On a host with neither launchctl (on Darwin) nor `systemctl`,
 # `_supervisor_registered_state` below returns "not-registered"
@@ -67,13 +77,14 @@
 #   1. `pgrep -fl engram-surface-daemon.py`, then `lsof -p <pid> | grep unix`:
 #      does the live process hold a socket whose path no longer exists?
 #   2. `launchctl list | grep engram` and
-#      `launchctl print gui/$(id -u)/com.engram.surface-daemon`; compare
+#      `launchctl print gui/$(id -u)/com.engram.surface-daemon.<key>`; compare
 #      ProgramArguments with the real daemon path. A job pointing at a deleted
 #      worktree or a temp ENGRAM_HOME is a zombie:
-#      `launchctl bootout gui/$(id -u)/com.engram.surface-daemon`. (On Darwin
-#      this script reads the same job through `launchctl print`: a job whose
-#      ENGRAM_HOME differs from this script's is reported "unavailable" and
-#      nothing is launched -- see the header above.)
+#      `launchctl bootout gui/$(id -u)/com.engram.surface-daemon.<key>`. (On Darwin
+#      this script reads the same job through `launchctl print`: a keyed-label job
+#      whose ENGRAM_HOME differs from this script's is reported "unavailable" and
+#      nothing is launched; an OLD fixed-label job for another home reads
+#      not-registered, since that home has its own keyed name -- see the header above.)
 #   3. SIGTERM the orphaned holder: `kill <pid>`.
 #   4. Run this script.
 #   5. Confirm $ENGRAM_HOME/recall-daemon.sock and recall-daemon.pid exist.
@@ -279,6 +290,174 @@ _launchctl_print_bounded() {
     rm -f "$lc_file"
 }
 
+# #4305: the fixed supervisor names of the pre-keyed install. They exist ONLY in these two
+# functions (the legacy-transition code); tests/test_surface_label_keyed_4305.py::test_G1 fails on
+# any other literal.
+_legacy_surface_unit() {
+    printf '%s' 'engram-surface-daemon.service'
+}
+_legacy_surface_label() {
+    printf '%s' 'com.engram.surface-daemon'
+}
+
+# Where a sibling runtime file may be looked for (#3983): this script's own directory, then each
+# parent up to and INCLUDING its tree root, never above it. The tree root is the nearest directory
+# holding engram_core.py (the installed plugin root and src/engram/ both do). Walking on to "/" would
+# let a tier-filtered build that omits the file pick up a stale copy from an ancestor (a scatter-era
+# ENGRAM home folder is an ancestor of the plugin root). With no engram_core.py above, only the own
+# directory and its parent are offered. One directory per line, nearest first. bash 3.2-safe: no
+# arrays. The same function start-engramd-owner.sh carries (tests/test_no_unbounded_upward_walks_3983.py
+# accepts an upward walk only inside a function of this name).
+_bounded_dirs() {
+    local start d
+    start="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")"
+    d="$start"
+    while [ -n "$d" ] && [ "$d" != "." ]; do
+        if [ -f "$d/engram_core.py" ]; then
+            d="$start"
+            while :; do
+                printf '%s\n' "$d"
+                if [ -f "$d/engram_core.py" ]; then
+                    return 0
+                fi
+                d="$(dirname "$d")"
+            done
+        fi
+        if [ "$d" = "/" ]; then
+            break
+        fi
+        d="$(dirname "$d")"
+    done
+    printf '%s\n' "$start"
+    d="$(dirname "$start")"
+    if [ "$d" != "$start" ]; then
+        printf '%s\n' "$d"
+    fi
+    return 0
+}
+
+# #4305: print this home's 8-hex key from the ONE helper (tools/engramd-owner-home-key.sh); print
+# nothing if it cannot be found or computed. The helper is looked up via $CLAUDE_PLUGIN_ROOT first,
+# then in each directory _bounded_dirs offers (hooks/claude/ in source, hooks/ when flattened: never a
+# fixed parents[N]), as <dir>/tools/engramd-owner-home-key.sh.
+_surface_home_key() {
+    local f="tools/engramd-owner-home-key.sh" d found="" key=""
+    if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "$CLAUDE_PLUGIN_ROOT/$f" ]; then
+        found="$CLAUDE_PLUGIN_ROOT/$f"
+    else
+        while IFS= read -r d; do
+            if [ -f "$d/$f" ]; then
+                found="$d/$f"
+                break
+            fi
+        done <<EOF
+$(_bounded_dirs)
+EOF
+    fi
+    [ -n "$found" ] || return 0
+    # shellcheck source=/dev/null
+    . "$found" 2>/dev/null || return 0
+    key="$(engramd_owner_home_key "$ENGRAM_HOME" 2>/dev/null)" || return 0
+    printf '%s' "$key"
+}
+
+# #4305: 0 if the two paths are the SAME home. PHYSICAL paths are compared (/var vs /private/var, a
+# trailing slash and a symlinked home are all the same home); a side that is not an existing
+# directory falls back to its raw string, trailing slashes stripped. (The comparison #4261 wrote for
+# the Darwin branch, now shared by both platforms and by the legacy checks.)
+_same_physical_home() {
+    local a_n b_n
+    a_n="$(cd "$1" 2>/dev/null && pwd -P)" || a_n=""
+    [ -n "$a_n" ] || { a_n="$1"; while [ "${#a_n}" -gt 1 ] && [ "${a_n%/}" != "$a_n" ]; do a_n="${a_n%/}"; done; }
+    b_n="$(cd "$2" 2>/dev/null && pwd -P)" || b_n=""
+    [ -n "$b_n" ] || { b_n="$2"; while [ "${#b_n}" -gt 1 ] && [ "${b_n%/}" != "$b_n" ]; do b_n="${b_n%/}"; done; }
+    [ "$a_n" = "$b_n" ]
+}
+
+# #4305: the ENGRAM_HOME inside a `systemctl show -p Environment` value (space-separated
+# assignments; a quoted assignment is read to its closing quote). Prints nothing if there is none.
+_env_engram_home() {
+    local v="$1" before rest
+    case "$v" in *ENGRAM_HOME=*) ;; *) return 0 ;; esac
+    before="${v%%ENGRAM_HOME=*}"
+    rest="${v#*ENGRAM_HOME=}"
+    case "$before" in
+        *\") printf '%s' "${rest%%\"*}" ;;
+        *) printf '%s' "${rest%% *}" ;;
+    esac
+}
+
+# #4305: one `systemctl --user show` of <unit> (bounded by `timeout 3`, unpiped, rc checked).
+# Prints unavailable | not-found | loaded:<ActiveState>:<Environment value, only if $2 = env>.
+_linux_unit_probe() {
+    local unit="$1" props="LoadState,ActiveState,SubState" out rc load_state active_state env_val=""
+    [ "${2:-}" = "env" ] && props="$props,Environment"
+    out="$(timeout 3 systemctl --user show "$unit" -p "$props" 2>&1)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "unavailable"
+        return
+    fi
+    load_state="$(printf '%s\n' "$out" | sed -n 's/^LoadState=//p')"
+    if [ -z "$load_state" ]; then
+        # rc=0 but no LoadState= line at all -- an ambiguous/unparseable reply shape, NOT the
+        # well-formed "not-found" answer. Never collapse this into not-registered.
+        echo "unavailable"
+        return
+    fi
+    if [ "$load_state" = "not-found" ]; then
+        echo "not-found"
+        return
+    fi
+    active_state="$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')"
+    [ "${2:-}" = "env" ] && env_val="$(printf '%s\n' "$out" | sed -n 's/^Environment=//p' | head -n 1)"
+    echo "loaded:${active_state}:${env_val}"
+}
+
+# #4305: one launchd job, by label. Prints not-found | unavailable | foreign | registered-active |
+# registered-failing. `foreign` = a job with this label whose ENGRAM_HOME is another home. Same
+# reading as #4261: gui domain, then the user domain on rc 125 (no GUI launchd domain for this uid).
+# Sets lc_rc / lc_out through _launchctl_print_bounded's dynamic scope.
+_darwin_job_state() {
+    local label="$1" lc_rc lc_out job_home job_state uid_n
+    uid_n="$(id -u)"
+    _launchctl_print_bounded "gui/${uid_n}/${label}"
+    if [ "$lc_rc" = "125" ]; then
+        # rc 125 = this uid has NO GUI launchd domain (measured on a real seat 10-30, and the
+        # installer treats rc 125 the same way). No GUI job can exist: ask the user domain.
+        _launchctl_print_bounded "user/${uid_n}/${label}"
+        if [ "$lc_rc" = "113" ] || [ "$lc_rc" = "125" ]; then
+            echo "not-found"      # no job in either domain
+            return
+        fi
+    elif [ "$lc_rc" = "113" ]; then
+        echo "not-found"          # measured on macOS: print of a missing label -> rc 113
+        return
+    fi
+    if [ "$lc_rc" != "0" ]; then
+        echo "unavailable"        # any other rc, or no answer in time
+        return
+    fi
+    # No stated home at all is untrustworthy: never trust it, never fight it.
+    job_home="$(printf '%s\n' "$lc_out" | sed -n 's/^[[:space:]]*ENGRAM_HOME => //p' | head -n 1)"
+    if [ -z "$job_home" ]; then
+        echo "unavailable"
+        return
+    fi
+    if ! _same_physical_home "$job_home" "$ENGRAM_HOME"; then
+        echo "foreign"
+        return
+    fi
+    # Only the job's own first-level line (exactly one leading tab):
+    # nested coalition blocks have their own `state = active`.
+    job_state="$(printf '%s\n' "$lc_out" | sed -n "s/^$(printf '\t')state = //p" | head -n 1)"
+    if [ "$job_state" = "running" ]; then
+        echo "registered-active"
+    else
+        echo "registered-failing"
+    fi
+}
+
 # #2652 phase-0 unit 4 fold (Kepler's required addition, forum message
 # "Unit 4 scoping: accepted + one required addition (four-state branch;
 # UNSUPERVISED still launches)"): is a supervisor UNIT REGISTERED for this
@@ -335,56 +514,23 @@ _supervisor_registered_state() {
     # output goes to a file, so a killed or still-running launchctl cannot
     # hold this function's stdout open.
     if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
-        local label="com.engram.surface-daemon"
-        local lc_rc lc_out job_home job_state uid_n
-        uid_n="$(id -u)"
-        _launchctl_print_bounded "gui/${uid_n}/${label}"
-        if [ "$lc_rc" = "125" ]; then
-            # rc 125 = this uid has NO GUI launchd domain (e.g. another user
-            # holds the console; measured on a real seat 10-30, and the
-            # installer treats rc 125 the same way). No GUI job can exist, so
-            # ask the user domain before deciding.
-            _launchctl_print_bounded "user/${uid_n}/${label}"
-            if [ "$lc_rc" = "113" ] || [ "$lc_rc" = "125" ]; then
-                echo "not-registered"   # no job in either domain -- launch
-                return
-            fi
-        elif [ "$lc_rc" = "113" ]; then
-            echo "not-registered"   # measured on macOS: print of a missing label -> rc 113
-            return
-        fi
-        if [ "$lc_rc" != "0" ]; then
-            echo "unavailable"      # any other rc, or no answer in time
-            return
-        fi
-        # The job must be OURS: a stale job with this label (e.g. leaked by a
-        # test) can point at another ENGRAM_HOME. Never trust it, never fight
-        # it. No stated home at all is just as untrustworthy.
-        job_home="$(printf '%s\n' "$lc_out" | sed -n 's/^[[:space:]]*ENGRAM_HOME => //p' | head -n 1)"
-        if [ -z "$job_home" ]; then
+        local keyed_state legacy_state
+        # #4305: no key, no answer -- unavailable, never not-registered (no launch).
+        if [ -z "${_surface_key:-}" ]; then
             echo "unavailable"
             return
         fi
-        # Compare PHYSICAL paths (/var vs /private/var, a trailing slash, a
-        # symlinked home are all the same home). A side that is not an existing
-        # directory falls back to its raw string, trailing slashes stripped.
-        local job_home_n our_home_n
-        job_home_n="$(cd "$job_home" 2>/dev/null && pwd -P)" || job_home_n=""
-        [ -n "$job_home_n" ] || { job_home_n="$job_home"; while [ "${#job_home_n}" -gt 1 ] && [ "${job_home_n%/}" != "$job_home_n" ]; do job_home_n="${job_home_n%/}"; done; }
-        our_home_n="$(cd "$ENGRAM_HOME" 2>/dev/null && pwd -P)" || our_home_n=""
-        [ -n "$our_home_n" ] || { our_home_n="$ENGRAM_HOME"; while [ "${#our_home_n}" -gt 1 ] && [ "${our_home_n%/}" != "$our_home_n" ]; do our_home_n="${our_home_n%/}"; done; }
-        if [ "$job_home_n" != "$our_home_n" ]; then
-            echo "unavailable"
-            return
-        fi
-        # Only the job's own first-level line (exactly one leading tab):
-        # nested coalition blocks have their own `state = active`.
-        job_state="$(printf '%s\n' "$lc_out" | sed -n "s/^$(printf '\t')state = //p" | head -n 1)"
-        if [ "$job_state" = "running" ]; then
-            echo "registered-active"
-        else
-            echo "registered-failing"
-        fi
+        keyed_state="$(_darwin_job_state "com.engram.surface-daemon.${_surface_key}")"
+        case "$keyed_state" in
+            not-found) ;;                              # fall through to the legacy fixed label
+            foreign) echo "unavailable"; return ;;     # a keyed label with another home's job: never trust, never fight
+            *) echo "$keyed_state"; return ;;          # the keyed answer stands
+        esac
+        legacy_state="$(_darwin_job_state "$(_legacy_surface_label)")"
+        case "$legacy_state" in
+            not-found|foreign) echo "not-registered" ;;   # nothing of mine (a foreign legacy job concerns only that home)
+            *) echo "$legacy_state" ;;                    # mine (active/failing), or unavailable
+        esac
         return
     fi
     if ! command -v systemctl >/dev/null 2>&1; then
@@ -456,30 +602,42 @@ _supervisor_registered_state() {
     # below: it falls into the same nonzero-exit "unavailable" branch as
     # any other failure -- it's just another way this check couldn't get
     # a clean answer, never a fifth state.
-    out="$(timeout 3 systemctl --user show engram-surface-daemon.service -p LoadState,ActiveState,SubState 2>&1)"
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
+    # #4305: the KEYED unit first; its answer stands. (rc != 0, or empty / ambiguous output, is
+    # "unavailable" -- NEVER "not-registered": a dead bus and an absent unit must not read the same.)
+    local keyed legacy legacy_home
+    if [ -z "${_surface_key:-}" ]; then
         echo "unavailable"
         return
     fi
-    load_state="$(printf '%s\n' "$out" | sed -n 's/^LoadState=//p')"
-    if [ -z "$load_state" ]; then
-        # rc=0 but no LoadState= line at all -- an ambiguous/unparseable
-        # reply shape, NOT the well-formed "not-found" answer. Never
-        # collapse this into not-registered.
-        echo "unavailable"
+    keyed="$(_linux_unit_probe "engram-surface-daemon-${_surface_key}.service")"
+    case "$keyed" in
+        unavailable) echo "unavailable"; return ;;
+        not-found) ;;
+        loaded:active:*) echo "registered-active"; return ;;
+        loaded:*) echo "registered-failing"; return ;;
+        *) echo "unavailable"; return ;;
+    esac
+    # Not found: the old fixed-name unit counts ONLY if its own Environment= ENGRAM_HOME is this home.
+    legacy="$(_linux_unit_probe "$(_legacy_surface_unit)" env)"
+    case "$legacy" in
+        unavailable) echo "unavailable"; return ;;
+        not-found) echo "not-registered"; return ;;
+        loaded:*) ;;
+        *) echo "unavailable"; return ;;
+    esac
+    legacy_home="$(_env_engram_home "${legacy#loaded:*:}")"
+    if [ -z "$legacy_home" ]; then
+        echo "unavailable"          # a legacy unit whose home cannot be read: never not-registered
         return
     fi
-    if [ "$load_state" = "not-found" ]; then
-        echo "not-registered"
+    if ! _same_physical_home "$legacy_home" "$ENGRAM_HOME"; then
+        echo "not-registered"      # another home's legacy unit concerns only that home
         return
     fi
-    active_state="$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')"
-    if [ "$active_state" = "active" ]; then
-        echo "registered-active"
-    else
-        echo "registered-failing"
-    fi
+    case "$legacy" in
+        loaded:active:*) echo "registered-active" ;;
+        *) echo "registered-failing" ;;
+    esac
 }
 
 # Check daemon liveness and report. Branch 4 (healthy) remains a true
@@ -540,6 +698,14 @@ fi
 # this daemon needs attention. #2652 phase-0 unit 4 fold: before doing
 # anything about that, determine whether a supervisor unit is registered
 # for it, and branch four ways.
+# #4305: the supervisor name is KEYED on this home. _supervisor_registered_state reads _surface_key
+# (empty = the key could not be computed -> unavailable); the log lines name the keyed unit / label.
+_surface_key="$(_surface_home_key)"
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+    _surface_sup_name="com.engram.surface-daemon.${_surface_key:-<no-key>}"
+else
+    _surface_sup_name="engram-surface-daemon-${_surface_key:-<no-key>}.service"
+fi
 _supervisor_state="$(_supervisor_registered_state)"
 
 # Reviewer-fairy suggestion 2 (round 1, PR #2700): _supervisor_registered_state
@@ -560,14 +726,14 @@ fi
 
 case "$_supervisor_state" in
     registered-active)
-        _log_supervision "SUPERVISED_HEALTHY -- engram-surface-daemon.service is registered and active; trusting the supervisor's own restart policy, no reap/relaunch/rm"
+        _log_supervision "SUPERVISED_HEALTHY -- ${_surface_sup_name} (or the old fixed-name job for this home) is registered and active; trusting the supervisor's own restart policy, no reap/relaunch/rm"
         ;;
     registered-failing)
-        _log_supervision "SUPERVISED_FAILING -- engram-surface-daemon.service is registered but NOT active; refusing to launch a competing process (never fight a real supervisor). Investigate: systemctl --user status engram-surface-daemon.service"
+        _log_supervision "SUPERVISED_FAILING -- ${_surface_sup_name} (or the old fixed-name job for this home) is registered but NOT active; refusing to launch a competing process (never fight a real supervisor). Investigate: systemctl --user status ${_surface_sup_name} (Linux) / launchctl print gui/$(id -u)/${_surface_sup_name} (macOS)"
         ;;
     not-registered)
         if [ "$_systemctl_present" -eq 1 ]; then
-            _log_supervision "UNSUPERVISED -- no supervisor unit is registered for engram-surface-daemon.service; running the reap+launch sequence directly, as before. Install a supervisor unit: tools/setup-surface-daemon-service.sh"
+            _log_supervision "UNSUPERVISED -- no supervisor unit is registered for ${_surface_sup_name} (nor an old fixed-name job for this home); running the reap+launch sequence directly, as before. Install a supervisor unit: tools/setup-surface-daemon-service.sh"
         else
             _log_supervision "UNSUPERVISED (no systemctl on this host -- treating as unsupervised, launching) -- this host cannot have a systemd unit at all (a non-systemd host, or a Darwin host where launchctl found no job); running the reap+launch sequence directly, as before."
         fi
@@ -959,7 +1125,7 @@ sys.exit(0)
         # Per Kepler: "a missing daemon is loud and recoverable, a
         # duplicate was the silent WAL loss" -- when in doubt, do not risk
         # creating a second holder.
-        _log_supervision "unavailable -- could not determine whether a supervisor unit is registered for engram-surface-daemon.service; refusing to launch (a missing daemon is loud and recoverable; a duplicate risks silent WAL loss)"
+        _log_supervision "unavailable -- could not determine whether a supervisor unit is registered for ${_surface_sup_name}; refusing to launch (a missing daemon is loud and recoverable; a duplicate risks silent WAL loss)"
         ;;
 esac
 

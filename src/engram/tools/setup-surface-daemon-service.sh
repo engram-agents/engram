@@ -65,6 +65,19 @@
 #   Darwin → renders engram-surface-daemon.plist.template and installs it as a
 #             LaunchAgent (~/Library/LaunchAgents/).
 #
+# Surface-daemon supervisor names are KEYED on ENGRAM_HOME (#4305, #2702), with the same <id> the
+# owner uses (tools/engramd-owner-home-key.sh, the ONE derivation):
+#   Linux  → engram-surface-daemon-<id>.service      Darwin → com.engram.surface-daemon.<id>
+# so two ENGRAM_HOMEs under one OS user no longer share (and replace) one job. ENGRAM_HOME is
+# created if missing (the key needs an existing directory).
+# Upgrade from the old FIXED name (the legacy-transition code, _legacy_surface_*): the old unit /
+# job is stopped and removed BEFORE the keyed one is started, and ONLY if its own ENGRAM_HOME is
+# this home (physical-path comparison); another home's old job is left alone and named on one
+# line; an old job whose ENGRAM_HOME cannot be read is left alone and named on one line.
+# Stop condition for a deleted home: the unit carries ExecCondition=/usr/bin/test -d <home>
+# in [Service] (re-run before every restart; ConditionPathExists is not; systemd >= 243); the plist's
+# KeepAlive is {PathState: {<home>: true}} (measured once on a Mac, best-effort; see the template).
+#
 # Idempotent: re-running re-renders the unit/plist and re-enables the service.
 # Fails loudly if systemctl (Linux) or launchctl (macOS) is absent.
 #
@@ -192,6 +205,27 @@ _pinned_into() {
 _resolve_self() { readlink -f "$1" 2>/dev/null || echo "$1"; }
 _cd_pwd() { cd "$1" && pwd; }
 _sys_python() { python3 -c 'import sys; print(sys.executable)' 2>/dev/null || echo ""; }
+
+# The fixed supervisor names of the pre-#4305 install. They exist ONLY here (the legacy-transition
+# code); tests/test_surface_label_keyed_4305.py::test_G1 fails on any other literal.
+_legacy_surface_unit() {
+    printf '%s' 'engram-surface-daemon.service'
+}
+_legacy_surface_label() {
+    printf '%s' 'com.engram.surface-daemon'
+}
+
+# _home_norm_into <path> <varname>: the physical path of <path> if it is a directory, else the
+# raw string with trailing slashes stripped. Assigned to the variable NAMED by $2 (the capture runs
+# under this function's own LC_ALL=C: bash 3.2 mangles multibyte captures otherwise, #3794).
+_home_norm_into() {
+    local LC_ALL=C _hn_in="${1-}" _hn_name="${2-}" _hn_out
+    _hn_out="$(cd "$_hn_in" 2>/dev/null && pwd -P)" || {
+        _hn_out="$_hn_in"
+        while [[ "${#_hn_out}" -gt 1 && "$_hn_out" == */ ]]; do _hn_out="${_hn_out%/}"; done
+    }
+    printf -v "$_hn_name" '%s' "$_hn_out"
+}
 
 # ---------------------------------------------------------------------------
 # Resolve script location and repo root (template source)
@@ -532,6 +566,27 @@ fi
 echo "  ENGRAM_HOME:   $ENGRAM_HOME"
 echo
 
+# #4305: surface mode keys its unit / label on the home too. Called from each OS branch AFTER the
+# service-manager tool check (so a host without systemctl / launchctl still fails first, and with its
+# own message). Absolute first (the helper needs an absolute path), created if missing (the key needs
+# an existing directory; the hook does the same). Sets _home_id.
+_surface_compute_home_id() {
+    [[ "$ENGRAM_HOME" == /* ]] || ENGRAM_HOME="$PWD/$ENGRAM_HOME"
+    while [[ "$ENGRAM_HOME" != "/" && "$ENGRAM_HOME" == */ ]]; do ENGRAM_HOME="${ENGRAM_HOME%/}"; done
+    mkdir -p "$ENGRAM_HOME"
+    _home_key_sh="$_script_dir/engramd-owner-home-key.sh"
+    if [[ ! -f "$_home_key_sh" ]]; then
+        echo "ERROR: home-key helper not found: $_home_key_sh" >&2
+        exit 1
+    fi
+    # shellcheck source=engramd-owner-home-key.sh
+    source "$_home_key_sh"
+    _home_id="$(engramd_owner_home_key "$ENGRAM_HOME")" || {
+        echo "ERROR: cannot key the unit name / label on ENGRAM_HOME." >&2
+        exit 1
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Linux: systemd user service
 # ---------------------------------------------------------------------------
@@ -543,9 +598,10 @@ if [[ "$OS" == "Linux" ]]; then
         echo "         $PYTHON_BIN $DAEMON_PY" >&2
         exit 1
     fi
+    [[ "$OWNER_MODE" == "1" ]] || _surface_compute_home_id
 
     SERVICE_TEMPLATE="$TEMPLATE_DIR/engram-surface-daemon.service.template"
-    SERVICE_NAME="engram-surface-daemon.service"
+    SERVICE_NAME="engram-surface-daemon-$_home_id.service"
     SERVICE_LOG_NAME="surface-daemon.log"
     if [[ "$OWNER_MODE" == "1" ]]; then
         SERVICE_TEMPLATE="$TEMPLATE_DIR/engramd-owner.service.template"
@@ -560,6 +616,33 @@ if [[ "$OS" == "Linux" ]]; then
     SERVICE_DEST="$HOME/.config/systemd/user/$SERVICE_NAME"
     _pinned_into _service_dir dirname "$SERVICE_DEST"
     mkdir -p "$_service_dir"
+
+    # Legacy transition (#4305): the old fixed-name unit goes BEFORE the keyed one starts, so at no
+    # point do two supervised jobs run this home's daemon. Only if it is THIS home's (its own
+    # Environment=ENGRAM_HOME= line, compared by physical path); never disable what is not confirmed ours.
+    if [[ "$OWNER_MODE" != "1" ]]; then
+        _legacy_name="$(_legacy_surface_unit)"
+        _legacy_file="$_service_dir/$_legacy_name"
+        if [[ -f "$_legacy_file" ]]; then
+            _legacy_home="$(sed -n 's/^Environment=ENGRAM_HOME=//p' "$_legacy_file" | head -n 1 || true)"
+            if [[ -z "$_legacy_home" ]]; then
+                echo "  Left alone: $_legacy_file (old fixed-name unit): could not read its ENGRAM_HOME, so it was not removed."
+            else
+                _home_norm_into "$_legacy_home" _legacy_home_n
+                _home_norm_into "$ENGRAM_HOME" _our_home_n
+                if [[ "$_legacy_home_n" == "$_our_home_n" ]]; then
+                    echo "  Removing the old fixed-name unit $_legacy_name (ENGRAM_HOME=$_legacy_home is this home) before starting the keyed one"
+                    systemctl --user disable --now "$_legacy_name" || {
+                        echo "ERROR: could not stop and disable $_legacy_name; not starting $SERVICE_NAME next to it (two daemons for one home)." >&2
+                        exit 1
+                    }
+                    rm -f "$_legacy_file"
+                else
+                    echo "  Left alone: $_legacy_file (old fixed-name unit) belongs to ENGRAM_HOME=$_legacy_home, not this home."
+                fi
+            fi
+        fi
+    fi
 
     echo "Step 1: Rendering systemd unit → $SERVICE_DEST"
     if [[ "$OWNER_MODE" == "1" ]]; then
@@ -601,9 +684,10 @@ elif [[ "$OS" == "Darwin" ]]; then
         echo "         $PYTHON_BIN $DAEMON_PY" >&2
         exit 1
     fi
+    [[ "$OWNER_MODE" == "1" ]] || _surface_compute_home_id
 
     PLIST_TEMPLATE="$TEMPLATE_DIR/engram-surface-daemon.plist.template"
-    PLIST_LABEL="com.engram.surface-daemon"
+    PLIST_LABEL="com.engram.surface-daemon.$_home_id"
     PLIST_LOG_NAME="surface-daemon.log"
     if [[ "$OWNER_MODE" == "1" ]]; then
         PLIST_TEMPLATE="$TEMPLATE_DIR/engramd-owner.plist.template"
@@ -630,6 +714,7 @@ elif [[ "$OS" == "Darwin" ]]; then
         LC_ALL=C sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
             -e "s|{{ENGRAM_HOOKS_DIR}}|$HOOKS_DIR|g" \
             -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
+            -e "s|{{LABEL}}|$PLIST_LABEL|g" \
             "$PLIST_TEMPLATE" > "$PLIST_DEST"
     fi
     echo "  done."
@@ -638,10 +723,6 @@ elif [[ "$OS" == "Darwin" ]]; then
     echo "Step 2: Loading via launchctl"
     # Modern bootstrap/bootout API (macOS 10.11+); load/unload are Apple-deprecated.
     # bootout targets the service by domain/label; bootstrap takes the plist path.
-    launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
-    # bootout returns BEFORE launchd has finished removing the service (#3939): an immediate bootstrap
-    # can fail "5: Input/output error". Wait until `print` fails (service gone), bounded; at the
-    # deadline still go on to bootstrap. Durations are plain decimals (seconds), held as whole ms.
     _to_ms() {  # <value> <default-ms> -> whole ms on stdout; a non-decimal value gives the default
         local v="$1" ip fp
         if [[ ! "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then echo "$2"; return 0; fi
@@ -659,6 +740,51 @@ elif [[ "$OS" == "Darwin" ]]; then
     [[ "$_poll_s" =~ ^[0-9]+(\.[0-9]+)?$ ]] || _poll_s=0.2
     (( _poll_ms >= 1 )) || _poll_ms=1
     _max_polls=$(( _wait_ms / _poll_ms ))
+    # Legacy transition (#4305): the old fixed-label job goes BEFORE the keyed one is bootstrapped, so
+    # at no point do two supervised jobs run this home's daemon. Only if its ENGRAM_HOME is THIS home
+    # (physical-path comparison); never bootout what is not confirmed ours. The home is read from the
+    # loaded job (`launchctl print`, the same `ENGRAM_HOME =>` line the hook reads), else from the plist
+    # file when no job is loaded.
+    if [[ "$OWNER_MODE" != "1" ]]; then
+        _legacy_name="$(_legacy_surface_label)"
+        _legacy_plist="$AGENTS_DIR/$_legacy_name.plist"
+        _legacy_loaded=0
+        _legacy_home=""
+        if _legacy_out="$(launchctl print "gui/$(id -u)/$_legacy_name" 2>/dev/null)"; then
+            _legacy_loaded=1
+            _legacy_home="$(printf '%s\n' "$_legacy_out" | sed -n 's/^[[:space:]]*ENGRAM_HOME => //p' | head -n 1 || true)"
+        elif [[ -f "$_legacy_plist" ]]; then
+            _legacy_home="$(grep -A1 '<key>ENGRAM_HOME</key>' "$_legacy_plist" | sed -n 's|.*<string>\(.*\)</string>.*|\1|p' | head -n 1 || true)"
+        fi
+        if [[ "$_legacy_loaded" == "1" || -f "$_legacy_plist" ]]; then
+            if [[ -z "$_legacy_home" ]]; then
+                echo "  Left alone: the old fixed-label job $_legacy_name: could not read its ENGRAM_HOME, so it was not removed."
+            else
+                _home_norm_into "$_legacy_home" _legacy_home_n
+                _home_norm_into "$ENGRAM_HOME" _our_home_n
+                if [[ "$_legacy_home_n" == "$_our_home_n" ]]; then
+                    echo "  Removing the old fixed-label job $_legacy_name (ENGRAM_HOME=$_legacy_home is this home) before loading the keyed one"
+                    launchctl bootout "gui/$(id -u)/$_legacy_name" 2>/dev/null || true
+                    _li=0
+                    while launchctl print "gui/$(id -u)/$_legacy_name" >/dev/null 2>&1; do
+                        if (( _li >= _max_polls )); then
+                            echo "ERROR: the old fixed-label job $_legacy_name is still loaded after bootout; not loading $PLIST_LABEL next to it (two daemons for one home)." >&2
+                            exit 1
+                        fi
+                        _li=$(( _li + 1 ))
+                        sleep "$_poll_s"
+                    done
+                    rm -f "$_legacy_plist"
+                else
+                    echo "  Left alone: the old fixed-label job $_legacy_name belongs to ENGRAM_HOME=$_legacy_home, not this home."
+                fi
+            fi
+        fi
+    fi
+    launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
+    # bootout returns BEFORE launchd has finished removing the service (#3939): an immediate bootstrap
+    # can fail "5: Input/output error". Wait until `print` fails (service gone), bounded; at the
+    # deadline still go on to bootstrap. Durations are plain decimals (seconds), held as whole ms.
     _still_loaded=0
     _i=0
     while launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; do

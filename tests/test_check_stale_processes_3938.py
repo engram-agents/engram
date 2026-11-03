@@ -545,8 +545,9 @@ def test_linux_lines_unchanged(tool, home, tmp_path):
     root = tmp_path / "plugin"
     lines, _ = tool.run_check(home, False, _readers(tool, _stale_all()), root=root, system="Linux")
     assert "&& systemctl --user restart \"engramd-owner-$(bash " in lines[0]
-    assert ("systemctl --user restart engram-surface-daemon.service (if it runs under a unit); "
-            "else kill -TERM %d" % DAEMON_PID) in lines[1]
+    # #4305: the unit is keyed on the home by the ONE helper, called in the printed command
+    assert ("systemctl --user restart \"engram-surface-daemon-$(bash %s/tools/engramd-owner-home-key.sh %s).service\""
+            " (if it runs under a unit); else kill -TERM %d" % (root, home, DAEMON_PID)) in lines[1]
     assert "launchctl" not in "\n".join(lines)
 
 
@@ -556,7 +557,8 @@ def test_darwin_lines_have_no_systemctl(tool, home, tmp_path):
     assert "systemctl" not in "\n".join(lines)
     assert "setup-surface-daemon-service.sh --owner" in lines[0]
     assert "&&" not in lines[0]
-    assert "launchctl kickstart -k gui/$(id -u)/com.engram.surface-daemon" in lines[1]
+    assert ("launchctl kickstart -k gui/$(id -u)/com.engram.surface-daemon.$(bash %s/tools/engramd-owner-home-key.sh %s)"
+            % (root, home)) in lines[1]
     assert "kill -TERM %d" % DAEMON_PID in lines[1]
     assert ("CLAUDE_PLUGIN_ROOT=%s bash %s/hooks/start-engram-daemon.sh </dev/null" % (root, root)) in lines[1]
 

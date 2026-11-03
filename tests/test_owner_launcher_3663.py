@@ -390,7 +390,9 @@ def test_c8_default_mode_renders_the_same_surface_daemon_unit(sb):
     home = sb.tmp / "seat-a"
     r = sb.run(engram_home=str(home))
     assert r.returncode == 0, (r.stdout, r.stderr)
-    out = (sb.unit_dir / "engram-surface-daemon.service").read_text(encoding="utf-8")
+    # #4305: the surface unit is keyed on the home, like the owner's
+    unit_name = f"engram-surface-daemon-{_expected_id(_physical(home))}.service"
+    out = (sb.unit_dir / unit_name).read_text(encoding="utf-8")
     hooks_dir = sb.plugin / "hooks" / "claude"
     py = subprocess.run(["python3", "-c", "import sys; print(sys.executable)"],
                         capture_output=True, encoding="utf-8", errors="replace", env={**os.environ, "HOME": str(sb.home),
@@ -401,8 +403,8 @@ def test_c8_default_mode_renders_the_same_surface_daemon_unit(sb):
     assert out == expected
     assert sb.systemctl_calls() == [
         ["--user", "daemon-reload"],
-        ["--user", "enable", "--now", "engram-surface-daemon.service"],
-        ["--user", "is-active", "engram-surface-daemon.service"],
+        ["--user", "enable", "--now", unit_name],
+        ["--user", "is-active", unit_name],
     ]
     assert sb.owner_units() == []
 

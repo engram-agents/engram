@@ -33,7 +33,7 @@ from pathlib import Path
 # `unavailable` and would otherwise make the reap loop unreachable for a
 # reason unrelated to what these tests are actually about).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_start_daemon_probe_branch_logging import _make_fake_systemctl  # noqa: E402
+from test_start_daemon_probe_branch_logging import _install_home_key_helper, _make_fake_systemctl  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_DIR = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
@@ -159,6 +159,7 @@ class TestReapBeforeStart(unittest.TestCase):
         )
 
         script_text = START_SCRIPT_PATH.read_text().replace("{{PYTHON}}", sys.executable)
+        _install_home_key_helper(self.tmp)   # #4305
         self.script = hooks_dir / "start-engram-daemon.sh"
         self.script.write_text(script_text)
         self.script.chmod(self.script.stat().st_mode | stat.S_IXUSR)
