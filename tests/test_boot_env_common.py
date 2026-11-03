@@ -55,6 +55,10 @@ def _launch(tmp_path: Path, *, common: str | None = None, per_agent: str | None 
         "HOME": str(home),
         "PATH": f"{bin_dir}:/usr/bin:/bin",
         "AGENT_BOOT_ENV_COMMON": str(common_file),
+        # Pinned so the launcher's #4328 runtime-env block is a no-op (a set,
+        # non-empty value is never touched) and never reads the host's /run/user.
+        "XDG_RUNTIME_DIR": "/nonexistent-xdg",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent-xdg/bus",
     }
     proc = subprocess.run(["/bin/bash", str(script), "zed"], env=env,
                           capture_output=True, text=True, timeout=30)

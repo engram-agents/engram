@@ -128,7 +128,11 @@ def _launch(tmp_path: Path, *, dirs=(), boot_cwd=None, claude_json=None, no_pyth
     else:
         path = f"{bin_dir}:/usr/bin:/bin"
     env = {"HOME": str(home), "PATH": path,
-           "AGENT_BOOT_ENV_COMMON": str(tmp_path / "none")}
+           "AGENT_BOOT_ENV_COMMON": str(tmp_path / "none"),
+           # Pinned so the launcher's #4328 runtime-env block is a no-op and never
+           # reads the host's /run/user (no WARNING in these stderr assertions).
+           "XDG_RUNTIME_DIR": "/nonexistent-xdg",
+           "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent-xdg/bus"}
     env.update({k: v.replace("@HOME@", str(home)) for k, v in (extra_env or {}).items()})
     proc = subprocess.run(["/bin/bash", str(script), "zed"], env=env,
                           capture_output=True, text=True, timeout=30)

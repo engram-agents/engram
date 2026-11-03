@@ -112,6 +112,17 @@ sessions.
    `ANTHROPIC_*`/Ollama variables — normally set in `.bash_profile`, which
    nothing in the boot chain reads). Keep it owned by the agent (`0640`).
 
+   Linux user-session variables (#4328): after both boot-env files are
+   sourced, the launcher fills `XDG_RUNTIME_DIR` (to `/run/user/<uid>`, when
+   that is a directory owned by the agent's uid) and then
+   `DBUS_SESSION_BUS_ADDRESS` (to `unix:path=$XDG_RUNTIME_DIR/bus`, when that
+   is a socket), each only when unset or empty, so `systemctl --user` works in
+   the session. A value already set and non-empty (boot-env, host-common file,
+   inherited) is never overridden. If something is missing, the variable stays
+   unset, ONE stderr line starting `WARNING: autostart session env:` names it,
+   and the launch continues. `AGENT_RUN_USER_BASE` (default `/run/user`) is a
+   test seam; production never sets it.
+
    Optional host-common environment: a second file, sourced immediately
    BEFORE the per-agent `boot-env`, carries settings common to every seat on
    the host (first planned use: a `CLAUDE_CODE_PLUGIN_DIRS=...` line).

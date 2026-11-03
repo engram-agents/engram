@@ -83,6 +83,43 @@ if [[ -r "$BOOT_ENV_FILE" ]]; then
     set +a
 fi
 
+# User-session runtime environment (#4328). The systemd unit starts with a clean
+# environment (same mechanism as the PATH prepend below) and tmux inherits THIS
+# script's environment, so every session in the chain started without
+# XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS, and `systemctl --user` failed
+# with "Failed to connect to bus: No medium found" in every tool shell although
+# the user bus socket /run/user/<uid>/bus exists and works. Fill both here, AFTER
+# both boot-env files, so anything a seat or the host set (non-empty) always wins
+# and is never overridden; an EMPTY value counts as unset. The DBUS address is
+# derived from the LIVE XDG_RUNTIME_DIR (whatever it is by now), not the default.
+# A missing piece leaves the variable unset and prints ONE stderr WARNING; it
+# never aborts the launch. AGENT_RUN_USER_BASE (default /run/user) is a test seam.
+_run_uid="$(id -u 2>/dev/null || true)"
+_run_dir="${AGENT_RUN_USER_BASE:-/run/user}/$_run_uid"
+if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    _run_owner=""
+    if [[ -n "$_run_uid" && -d "$_run_dir" ]]; then
+        _run_owner="$(stat -c %u "$_run_dir" 2>/dev/null || true)"
+    fi
+    if [[ -z "$_run_uid" ]]; then
+        echo "WARNING: autostart session env: XDG_RUNTIME_DIR not set: could not determine the uid ('id -u' failed); 'systemctl --user' will not work in the session" >&2
+    elif [[ ! -d "$_run_dir" ]]; then
+        echo "WARNING: autostart session env: XDG_RUNTIME_DIR not set: '$_run_dir' is not a directory; 'systemctl --user' will not work in the session" >&2
+    elif [[ "$_run_owner" != "$_run_uid" ]]; then
+        echo "WARNING: autostart session env: XDG_RUNTIME_DIR not set: '$_run_dir' is owned by uid '${_run_owner:-unknown}', not uid '$_run_uid'" >&2
+    else
+        export XDG_RUNTIME_DIR="$_run_dir"
+    fi
+fi
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    if [[ -S "$XDG_RUNTIME_DIR/bus" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+    else
+        echo "WARNING: autostart session env: DBUS_SESSION_BUS_ADDRESS not set: '$XDG_RUNTIME_DIR/bus' is not a socket; 'systemctl --user' will not work in the session" >&2
+    fi
+fi
+unset _run_uid _run_dir _run_owner
+
 # The runner chooses the charge AFTER agentctl detects the platform as this
 # agent. Passing only the installed directory is intentional: a generic
 # legacy override cannot be allowed to select Claude-only instructions before
