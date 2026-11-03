@@ -371,6 +371,12 @@ seat can run it and any other seat can check that it ran.
    (release cut, hotfix, reconcile) and a `main`→`dev` reconcile merge as a **merge
    commit** (`docs/internal/RELEASING.md`); every other PR into `dev` squashes; a member of a
    linked stack merges with `gh stack merge` (plain `gh pr merge` is refused there).
+   On a repo with no `dev` branch (local-model-lab and gpu-broker, both read
+   2026-11-03), every PR targets `main` and merges as a **squash**. The merge-commit
+   rule above is engram-alpha's rule for release cuts, hotfixes and reconciles; it
+   does not apply there. Both of those repos set `squash_merge_commit_message` to
+   `COMMIT_MESSAGES`, so the branch's commit messages ride into the squash and the
+   close-keyword read covers them (CLAUDE.md § PR — issue closure, check 3).
 9. **On umwelt, merge does not promote** (Ariadne): prod promotion stays a separate,
    tested-first step by the deploy seat.
 10. **The merge record, posted on the PR as the merge comment, names:** the merge
