@@ -95,7 +95,15 @@ def resolve_pkg(args):
     if not pkg:
         sys.exit("ERROR: --pkg required (or set $ENGRAM_PKG). Point at an engram-package directory.")
     pkg_path = Path(pkg).expanduser().resolve()
-    if not pkg_path.is_dir():
+    # #3972: `is_dir()` raises when a directory on the path cannot be searched. Only "no such entry" means
+    # "not a directory"; any other errno is "cannot check", reported as such.
+    try:
+        st = os.stat(pkg_path)
+    except (FileNotFoundError, NotADirectoryError):
+        sys.exit(f"ERROR: {pkg_path} is not a directory.")
+    except OSError as exc:
+        sys.exit(f"ERROR: cannot check the package directory {pkg_path}: {exc.strerror or exc}")
+    if not stat.S_ISDIR(st.st_mode):
         sys.exit(f"ERROR: {pkg_path} is not a directory.")
     return pkg_path
 
@@ -116,7 +124,15 @@ def _check_stale_build(pkg_path, auto_build=False):
     """
     db = pkg_path / "knowledge.db"
     sql = pkg_path / "knowledge.sql"
-    if not (db.exists() and sql.exists()):
+    # #3972: `exists()` raises when the package directory cannot be searched. A plain stat, not the _owner_read
+    # classifier: list/query/inspect/stats come through here and must not import `tools` (see _load_owner_read).
+    try:
+        os.stat(db)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        sys.exit(f"ERROR: cannot check the store {db}: {exc.strerror or exc}")
+    if not sql.exists():
         return
     if sql.stat().st_mtime <= db.stat().st_mtime + _STALE_SLACK_SECS:
         return

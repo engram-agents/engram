@@ -779,9 +779,10 @@
         "tests/test_engram_pkg_render.py",
         "tests/test_scope_export.py",
         "tests/test_engram_pkg_json_payload.py",
-        "tests/test_store_path_precheck_3962b.py"
+        "tests/test_store_path_precheck_3962b.py",
+        "tests/test_engram_pkg_unsearchable_3972.py"
       ],
-      "note": "engram-alpha#3962 PR-B: scope-export and render classify the store path with tools/_owner_read.check_store_path before opening it."
+      "note": "engram-alpha#3962 PR-B: scope-export and render classify the store path with tools/_owner_read.check_store_path before opening it. engram-alpha#3972: resolve_pkg and _check_stale_build report an unsearchable path as an ERROR line, not a traceback."
     },
     {
       "path_prefix_or_glob": "tools/build-plugin.sh",
