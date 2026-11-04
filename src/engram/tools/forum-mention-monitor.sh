@@ -420,7 +420,7 @@ _ENGAGED_WINDOW=360
 # this predicate now gates the seed's arm-time warning, and the whole point of
 # that warning is that a monitor which cannot report is worse than a noisy one.
 # Getting there needs the validation below rather than the `|| _age=999999`
-# fallback the poll loop still carries, which cannot fire: under `set -u` a
+# fallback the poll loop used to carry, which could not fire: under `set -u` a
 # non-numeric stamp makes the arithmetic expansion itself fail, so `_age` is
 # never assigned at all. Measured on #3111 — a stamp reading `garbage` gives
 # `unbound variable`, rc=1, and the monitor EXITS, silently and permanently;
@@ -430,9 +430,10 @@ _ENGAGED_WINDOW=360
 # is not all-digits (empty, float, whitespace, `garbage`) and `10#` forces base
 # 10 so a zero-padded stamp cannot trip "value too great for base".
 #
-# The poll loop below keeps its own inline copy unchanged (#3062's code is
-# deliberately untouched here, and its reachability is not what changed) — if
-# either is ever changed, change both. Unifying the two is the follow-up.
+# The seed path and the poll loop now share this one predicate (#3120). The poll
+# loop kept the broken inline copy after #3111 and a malformed stamp could still
+# kill it mid-run; calling `_engaged` there makes the validation apply on every
+# cycle, and there is no second copy left to keep in step.
 _engaged() {
     [ -f "$LAST_USER_ACTIVITY" ] || return 1
     local _stamp _age
@@ -717,12 +718,8 @@ while true; do
     # (#1077 part 2). When the user is actively conversing, waking the agent
     # mid-turn adds noise. Mentions accumulate as unseen; the monitor emits
     # them once the engaged window expires (default 6 min of user inactivity).
-    if [ -f "$LAST_USER_ACTIVITY" ]; then
-        _stamp="$(cat "$LAST_USER_ACTIVITY" 2>/dev/null || echo 0)"
-        _age=$(( $(date +%s) - ${_stamp:-0} )) || _age=999999
-        if [ "$_age" -ge 0 ] && [ "$_age" -le "$_ENGAGED_WINDOW" ]; then
-            continue
-        fi
+    if _engaged; then
+        continue
     fi
     # Forum unreachable -> curl --fail returns non-zero -> skip the cycle,
     # PRESERVE $SEEN (the fix for the seed-clobber flood, #743) AND the

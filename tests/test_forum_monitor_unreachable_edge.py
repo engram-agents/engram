@@ -1110,5 +1110,175 @@ def test_mention_poll_announces_unreachable_on_a_stalled_response(
         f"curl is hanging past the poll cycle instead of being bounded by "
         f"--max-time (full output so far: {proc.lines!r})"
     )
+
+
+# ===========================================================================
+# #3120 — the POLL loop's engaged check. #3111 gave the seed a validated
+# `_engaged()`; the poll loop kept an inline copy whose `|| _age=999999`
+# fallback cannot fire under `set -u`. A malformed stamp therefore killed the
+# monitor on its first poll cycle (`garbage`: "unbound variable", rc=1) or
+# aborted the enclosing `if` (`1790369339.5`, `0999`). Cell (j) only reaches
+# the seed, which is why the poll loop stayed broken. These cells get PAST a
+# successful seed and into the poll loop.
+# ===========================================================================
+
+_POLL_EVENT_SENDER = "poll3120sender"
+_UPDATES_EVENT = json.dumps({
+    "as_of": 7096,
+    "updates": [{"seq": 7096, "kind": "dm", "sender": _POLL_EVENT_SENDER,
+                 "body": "after the seed"}],
+})
+_MENTIONS_EVENT = json.dumps({
+    "mentions": [{"post_id": 9001, "thread_id": 77, "thread_title": "poll3120"}],
+})
+
+_MALFORMED_STAMPS = [
+    pytest.param("garbage\n", id="garbage"),
+    pytest.param("1790369339.5\n", id="float"),
+    pytest.param("0999\n", id="zero-padded"),
+]
+
+
+def _updates_event_lines(lines: list[str]) -> list[str]:
+    return [l for l in lines if _POLL_EVENT_SENDER in l]
+
+
+def _mention_event_lines(lines: list[str]) -> list[str]:
+    return [l for l in lines if "new @-mention" in l]
+
+
+def _updates_poll_server(serve):
+    """Request #1 is the seed (a quiet 7095 watermark); every later request
+    serves a real event, repeated, so the poll loop has something to emit."""
+    return serve([(200, _UPDATES_QUIET), (200, _UPDATES_EVENT)])
+
+
+def _mention_poll_server(serve):
+    return serve([(200, _MENTIONS_QUIET), (200, _MENTIONS_EVENT)])
+
+
+@pytest.mark.parametrize("stamp", _MALFORMED_STAMPS)
+def test_updates_poll_loop_malformed_stamp_reads_as_not_engaged(
+    serve, run_updates, stamp
+):
+    """#3120: past the seed, a malformed stamp is NOT engaged — the monitor
+    stays alive across several poll cycles and the event still flows."""
+    server = _updates_poll_server(serve)
+    proc, cursor = run_updates(server.port, stamp_text=stamp)
+
+    assert _wait_until(lambda: _updates_event_lines(proc.lines), timeout=8.0), (
+        f"a malformed poll-loop stamp suppressed or killed the monitor "
+        f"(alive={proc.alive}, stdout: {proc.lines!r}, stderr: {proc.errs!r})"
+    )
+    _wait_for_requests(server, server.request_count + 2)
+    assert proc.alive, (
+        f"the monitor DIED in the poll loop on a malformed stamp "
+        f"(stderr: {proc.errs!r}, stdout: {proc.lines!r})"
+    )
+
+
+@pytest.mark.parametrize("stamp", _MALFORMED_STAMPS)
+def test_mention_poll_loop_malformed_stamp_reads_as_not_engaged(
+    serve, run_mention, stamp
+):
+    """#3120, mention twin. The flush is coalesced (1s in the fixture), hence
+    the wider wait."""
+    server = _mention_poll_server(serve)
+    proc, seen = run_mention(server.port, stamp_text=stamp)
+
+    assert _wait_until(lambda: _mention_event_lines(proc.lines), timeout=10.0), (
+        f"a malformed poll-loop stamp suppressed or killed the monitor "
+        f"(alive={proc.alive}, stdout: {proc.lines!r}, stderr: {proc.errs!r})"
+    )
+    _wait_for_requests(server, server.request_count + 2)
+    assert proc.alive, (
+        f"the monitor DIED in the poll loop on a malformed stamp "
+        f"(stderr: {proc.errs!r}, stdout: {proc.lines!r})"
+    )
+
+
+def test_updates_poll_loop_fresh_stamp_suppresses_then_old_stamp_releases(
+    serve, run_updates, tmp_path
+):
+    """#3120 control: the refactor must not change engaged behaviour. A fresh
+    stamp keeps the poll loop silent (the cursor proves the seed completed);
+    the event only flows once the stamp is aged in place."""
+    server = _updates_poll_server(serve)
+    proc, cursor = run_updates(server.port, engaged_age=0)
+
+    assert _wait_for_content(cursor, "7095"), "never seeded"
+    time.sleep(1.0)  # ~5 poll cycles at _POLL
+    assert _updates_event_lines(proc.lines) == [], (
+        f"an engaged poll loop emitted: {proc.lines!r}"
+    )
+    assert proc.alive
+
+    _set_activity_age(tmp_path, 10_000)
+    assert _wait_until(lambda: _updates_event_lines(proc.lines), timeout=8.0), (
+        f"the event never flowed after the stamp aged out: {proc.lines!r}"
+    )
+
+
+def test_mention_poll_loop_fresh_stamp_suppresses_then_old_stamp_releases(
+    serve, run_mention, tmp_path
+):
+    """#3120 control, mention twin."""
+    server = _mention_poll_server(serve)
+    proc, seen = run_mention(server.port, engaged_age=0)
+
+    assert _wait_until(lambda: seen.is_file()), "never seeded"
+    # Longer than the fixture's 1 s coalesce window plus a few polls: at 1.0 s a
+    # never-engaged monitor had not flushed yet, so this cell could not tell
+    # suppressed from not-yet-emitted (reviewer round 1 on #4342, measured).
+    time.sleep(3.0)
+    assert _mention_event_lines(proc.lines) == [], (
+        f"an engaged poll loop emitted: {proc.lines!r}"
+    )
+    assert proc.alive
+
+    _set_activity_age(tmp_path, 10_000)
+    assert _wait_until(lambda: _mention_event_lines(proc.lines), timeout=10.0), (
+        f"the event never flowed after the stamp aged out: {proc.lines!r}"
+    )
+
+
+def test_updates_poll_loop_old_stamp_lets_events_through(serve, run_updates):
+    """#3120 control: a valid but old stamp is not engaged from the start."""
+    server = _updates_poll_server(serve)
+    proc, _cursor = run_updates(server.port, engaged_age=10_000)
+    assert _wait_until(lambda: _updates_event_lines(proc.lines), timeout=8.0), (
+        f"an old stamp suppressed events: {proc.lines!r}"
+    )
+
+
+def test_mention_poll_loop_old_stamp_lets_events_through(serve, run_mention):
+    """#3120 control, mention twin."""
+    server = _mention_poll_server(serve)
+    proc, _seen = run_mention(server.port, engaged_age=10_000)
+    assert _wait_until(lambda: _mention_event_lines(proc.lines), timeout=10.0), (
+        f"an old stamp suppressed events: {proc.lines!r}"
+    )
+
+
+def test_updates_poll_loop_future_stamp_is_not_engaged(serve, run_updates):
+    """#3120: a stamp 10,000 s in the FUTURE (clock skew, hand edit) must not read
+    as engaged forever; the `-ge 0` half of `_engaged` is what stops it (Clio's
+    colleague read: that half had no poll-loop cell)."""
+    server = _updates_poll_server(serve)
+    proc, _cursor = run_updates(server.port, engaged_age=-10_000)
+    assert _wait_until(lambda: _updates_event_lines(proc.lines), timeout=8.0), (
+        f"a future stamp suppressed events: {proc.lines!r}"
+    )
+
+
+def test_mention_poll_loop_future_stamp_is_not_engaged(serve, run_mention):
+    """#3120: future-stamp twin for the mention monitor."""
+    server = _mention_poll_server(serve)
+    proc, _seen = run_mention(server.port, engaged_age=-10_000)
+    assert _wait_until(lambda: _mention_event_lines(proc.lines), timeout=10.0), (
+        f"a future stamp suppressed events: {proc.lines!r}"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-v"]))
