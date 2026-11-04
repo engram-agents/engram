@@ -1,3 +1,13 @@
+"""Gates every shipped skill doc (src/engram/skills/**/*.md) for shell-snippet hygiene.
+
+Covers pgrep scoping, zsh-tied loop variables and exit-status handling across
+the whole population, plus a test-map check that every winning skill-doc entry
+runs this gate. It also keeps a few health-exam-specific checks (the selftest
+smoke flag, the planted pgrep snippet runs, the Step 0 resolver). Add new
+skill-doc shell rules here rather than in a second file, so the population gate
+does not fork into half-gates.
+"""
+
 import fnmatch
 import glob
 import json
@@ -438,7 +448,7 @@ def test_non_invocations_are_not_counted_as_pgrep_invocations(line: str) -> None
 # must still be satisfied by a third narrow entry added tomorrow. A hardcoded
 # `== 2` would pass for exactly the change that breaks it.
 TEST_MAP_JSON = REPO_ROOT / "src" / "engram" / "packaging" / "test-map.json"
-THIS_GATE = "tests/test_health_exam_skill.py"
+THIS_GATE = "tests/test_skill_docs_shell_hygiene.py"
 
 
 def _shipped_path_candidates(changed_file: str) -> tuple[str, ...]:

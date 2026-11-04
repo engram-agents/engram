@@ -71,8 +71,8 @@ short "could this match the invoker / a co-tenant?" answer):
   #3032. An inventory scoped by artifact type is blind exactly where a
   DIFFERENT artifact type carries the same idiom, and is worse than no
   inventory there, because its existence reads as coverage. So the gate added
-  in tests/test_health_exam_skill.py deliberately does not enumerate the three
-  repaired lines: it walks `src/engram/skills/**/*.md` as a POPULATION
+  in tests/test_skill_docs_shell_hygiene.py deliberately does not enumerate
+  the three repaired lines: it walks `src/engram/skills/**/*.md` as a POPULATION
   (parametrized per doc, plus a non-vacuity guard that fails if the glob stops
   resolving or the docs stop invoking pgrep), asserting that no shipped skill
   doc -- present or future -- carries a pgrep invocation that lacks `-u`, uses
