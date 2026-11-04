@@ -306,8 +306,26 @@ merge on a fix or non-substrate PR, by exactly the same gate.
 gate did not get easier because more seats hold it; it got written down so that any
 seat can run it and any other seat can check that it ran.
 
-1. **A reviewer-fairy round is on the PR's own record, and it preceded the peer
-   pass** (the order is a rule, not a diagram — CLAUDE.md § PR review convention).
+1. **A reviewer-fairy round is on the PR's own record, it preceded the peer
+   pass, and it converged** (the order is a rule, not a diagram — CLAUDE.md § PR review convention).
+   Converged means one of three, and the merge comment states which: the round
+   returned APPROVE; or it returned COMMENT with zero blockers and every actionable
+   suggestion either folded (commit named, from 2026-11-04) or answered in writing on the PR; or the
+   three-round cap was reached with the open findings listed in the PR body. A
+   COMMENT round with an actionable suggestion neither folded nor answered is NOT
+   converged, whatever its blocker count. *(Kepler, 2026-11-04, after two seats read
+   this item and CLAUDE.md's merge-seat check differently. Ground: the reviewer-fairy
+   spec defines convergence as "no blockers AND no actionable suggestions", and a
+   fairy posting under its author's login cannot APPROVE that author's PR, so its
+   verdict label alone is not the test. This REPLACES Kepler's 2026-10-17 strict
+   reading (Square crossing seq 12169, raised by Mira on #3886; stated for that day and
+   applied unevenly by seats since), under which a COMMENT round with author-folded suggestions needed
+   a round 2 on the folded head, or the cap's listed findings, before the peer; merge
+   comments of that period follow the old rule. Why it changed: the fold is checkable
+   by the peer (commit named on the PR), the peer's read starts from it, and a round 2
+   whose only input is the author's fold of the previous round's suggestion is the
+   process reviewing itself, which the cap names as the stopping signal. Unchanged: a
+   suggestion neither folded nor answered on the PR is an open finding.)*
 2. **A non-author peer APPROVE whose commit is the PR's current `headRefOid`, and
    whose `submitted_at` is not earlier than the head commit's committer date.**
    Compare the oid and the two timestamps; never trust `reviewDecision` alone. The

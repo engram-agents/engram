@@ -349,7 +349,7 @@ reviewer-fairy.
 The **"colleague converged"** gate is two layers, both required before a PR
 enters the maintainer's merge queue:
 
-1. **Reviewer-fairy** (`engram-pr-reviewer`) — iterate to convergence (APPROVE)
+1. **Reviewer-fairy** (`engram-pr-reviewer`) — iterate to convergence (PR-MERGE-POLICY gate 1)
    *before the PR goes to the peer* — catches mechanical / contract / scope
    issues. (Applies with no counterpart too.) **This is the author's own
    pre-peer self-check, not a re-run gate on every later push** (Lei,
@@ -383,7 +383,7 @@ enters the maintainer's merge queue:
    recalled. One duty added when this was written into the repo on
    2026-09-26, not part of the forum ruling: the merge seat records in its
    merge comment when a PR merged under the cap. **This cap qualifies
-   "iterate to convergence" above and the "reached APPROVE" clause of the
+   "iterate to convergence" above and the "converged" clause of the
    merge seat's mechanical check below:** a PR whose third round still
    returns REQUEST_CHANGES goes to the peer with its open findings listed,
    and that list is the round's stopping point.
@@ -601,9 +601,9 @@ tip that no longer matches what was reviewed. Parallelism here is not an
 efficiency gain; it is coordination chaos with the appearance of speed.
 
 **Mechanical check at the merge seat.** Before merging, confirm two separate
-things. (1) A reviewer-fairy round *exists and reached APPROVE before the PR
-was sent to the peer, or reached the three-round cap with its open findings
-listed in the PR body* (item 1's cap, above) (per "The colleague converged gate" above — the fairy
+things. (1) A reviewer-fairy round *preceded the peer and converged: APPROVE;
+COMMENT, no blockers, each actionable suggestion folded (commit named) or
+answered on the PR; or item 1's cap; the merge comment says which* (PR-MERGE-POLICY gate 1) (per "The colleague converged gate" above — the fairy
 round need not match the tip being merged; a later commit folding peer
 feedback does not un-converge it) by reading the PR's own review/comment
 record directly (`gh pr view <N> --comments`, or the REST fallback documented
@@ -618,7 +618,7 @@ current head ("Approvals after a layer" says what counts), plus CI green on it.
 `pulls/<N>/reviews` alone, `issues/<N>/comments` alone, and `--json
 reviewDecision` each miss one of them — hit both endpoints, or use
 `gh pr view <N> --comments` (when your `gh` version works; see "PR inheritance"
-below). Never infer the fairy round from a colleague approval being present.
+below).
 
 **A CAPPED read of the RIGHT surface fails exactly like querying the wrong one:**
 
