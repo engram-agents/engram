@@ -55,7 +55,8 @@ RestartSec=10s
 # version below 254.
 RestartSteps=5
 RestartMaxDelaySec=300s
-# `append:` log routing requires systemd >= 240 (same floor as the surface daemon unit).
+# `append:` log routing requires systemd >= 240. This unit has no ExecCondition, so 240 is its
+# floor (the surface daemon unit's is 243, because of its ExecCondition).
 StandardOutput=append:{{ENGRAM_HOME}}/engramd-owner.log
 StandardError=append:{{ENGRAM_HOME}}/engramd-owner.log
 
