@@ -566,6 +566,53 @@ fi
 echo "  ENGRAM_HOME:   $ENGRAM_HOME"
 echo
 
+# #4336: surface mode renders ENGRAM_HOME with the same sed as --owner but had no refusal. What it
+# cannot carry differs by platform (measured on the real templates), so this is NOT _owner_bad_char:
+# the unit is read by systemd (whitespace splits, `%` and `$` expand, quotes are interpreted), while
+# the plist puts the value in its own XML <string>, where a space, `%`, `$`, quotes and `}}` render
+# intact today and refusing them would break a setup that works. Each class is tested on its own
+# (never one first-match `case`), so an allowed class cannot mask a refused one later in the value.
+# Prints the class name; returns 1 when the value is fine.
+_surface_home_bad_char() {
+    local LC_ALL=C _prefix
+    if [[ "$1" == *[[:cntrl:]]* ]]; then
+        _prefix="${1%%[[:cntrl:]]*}"
+        printf 'control byte 0x%02X' "'${1:${#_prefix}:1}"
+        return 0
+    fi
+    # both platforms: sed expands `&`, eats `\`, aborts on `|`; a `{{` is re-substituted by a later -e
+    if [[ "$1" == *'&'* ]]; then printf 'ampersand'; return 0; fi
+    if [[ "$1" == *'\'* ]]; then printf 'backslash'; return 0; fi
+    if [[ "$1" == *'|'* ]]; then printf 'pipe'; return 0; fi
+    if [[ "$1" == *'{{'* ]]; then printf 'open-brace-pair'; return 0; fi
+    if [[ "$OS" == "Darwin" ]]; then
+        # the plist is XML: `<` breaks it, `>` is refused as on the --owner path
+        if [[ "$1" == *'<'* ]]; then printf 'less-than'; return 0; fi
+        if [[ "$1" == *'>'* ]]; then printf 'greater-than'; return 0; fi
+    else
+        if [[ "$1" == *' '* ]]; then printf 'space'; return 0; fi
+        if [[ "$1" == *'%'* ]]; then printf 'percent'; return 0; fi
+        if [[ "$1" == *'"'* ]]; then printf 'double-quote'; return 0; fi
+        if [[ "$1" == *"'"* ]]; then printf 'single-quote'; return 0; fi
+        if [[ "$1" == *'$'* ]]; then printf 'dollar'; return 0; fi
+        if [[ "$1" == *'}}'* ]]; then printf 'close-brace-pair'; return 0; fi
+    fi
+    return 1
+}
+_surface_refuse_if_bad_home() {
+    # $1 = the absolute ENGRAM_HOME; runs before anything is created
+    local _name _what
+    if _name="$(_surface_home_bad_char "$1")"; then
+        case "$_name" in
+            "control byte "*) _what="$_name" ;;
+            a*|e*|i*|o*|u*) _what="an $_name character" ;;
+            *) _what="a $_name character" ;;
+        esac
+        echo "ERROR: ENGRAM_HOME contains $_what ($(printf '%q' "$1")); the unit or plist would be rendered or read wrongly. No unit or plist was written or loaded and nothing was created." >&2
+        exit 2
+    fi
+}
+
 # #4305: surface mode keys its unit / label on the home too. Called from each OS branch AFTER the
 # service-manager tool check (so a host without systemctl / launchctl still fails first, and with its
 # own message). Absolute first (the helper needs an absolute path), created if missing (the key needs
@@ -573,6 +620,7 @@ echo
 _surface_compute_home_id() {
     [[ "$ENGRAM_HOME" == /* ]] || ENGRAM_HOME="$PWD/$ENGRAM_HOME"
     while [[ "$ENGRAM_HOME" != "/" && "$ENGRAM_HOME" == */ ]]; do ENGRAM_HOME="${ENGRAM_HOME%/}"; done
+    _surface_refuse_if_bad_home "$ENGRAM_HOME"
     mkdir -p "$ENGRAM_HOME"
     _home_key_sh="$_script_dir/engramd-owner-home-key.sh"
     if [[ ! -f "$_home_key_sh" ]]; then

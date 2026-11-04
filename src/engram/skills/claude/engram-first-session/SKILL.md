@@ -343,7 +343,7 @@ SETUP="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/tools/setup-surface-daemon-serv
 bash "$SETUP"
 ```
 
-The script takes no arguments, detects the OS via `uname -s` (Linux → systemd user service, Darwin → launchd LaunchAgent), installs the right unit, and is idempotent. Surface its output to the user plainly. If the script exits non-zero because `systemctl` or `launchctl` is absent on the user's setup, tell them: "The persistent service isn't available on this setup — your system doesn't have the required service manager. The per-session default will be used instead, which is fine; recall still works." This is not a fatal first-session error; continue.
+The script takes no arguments, detects the OS via `uname -s` (Linux → systemd user service, Darwin → launchd LaunchAgent), installs the right unit, and is idempotent. Surface its output to the user plainly. If the script exits non-zero because `systemctl` or `launchctl` is absent on the user's setup, tell them: "The persistent service isn't available on this setup — your system doesn't have the required service manager. The per-session default will be used instead, which is fine; recall still works." This is not a fatal first-session error; continue. A non-zero exit whose `ERROR:` line says `ENGRAM_HOME` contains an unsupported character is a different case: relay that line and ask for a home path without it, rather than saying the service manager is missing.
 
 When the service is successfully installed, the SessionStart hook detects the running daemon and no-ops automatically — no double-launch, no config flag needed. The service's existence is self-evident to the hook.
 

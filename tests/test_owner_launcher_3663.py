@@ -1367,8 +1367,12 @@ def test_i1_control_an_ordinary_home_renders_and_environment_equals_the_input_by
     assert f"ENGRAM_HOME={home}" in parse_unit(unit.read_text(encoding="utf-8"))["Service"]["Environment"]
 
 
-def test_i1_default_mode_still_accepts_what_it_always_accepted(sb):
-    """No --owner: the bad-character refusal does not apply (default mode is unchanged)."""
+def test_i1_default_mode_still_accepts_what_it_always_accepted(tmp_path):
+    """No --owner: the OWNER's bad-character refusal does not apply. Default mode has its own, narrower
+    refusal per platform (#4336, tests/test_setup_surface_home_refusal_4336.py); on macOS it still
+    accepts a space, which the plist carries intact and which --owner refuses. (On Linux a space is
+    refused in default mode too since #4336, so this cell runs the Darwin branch through the fake uname.)"""
+    sb = Sandbox(tmp_path, os_name="Darwin")
     r = sb.run(engram_home=str(sb.tmp / "has space"))
     assert r.returncode == 0, (r.stdout, r.stderr)
 
