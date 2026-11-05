@@ -1764,6 +1764,88 @@ def test_3e_config_report_follows_transitions(work):
         _kill(proc)
 
 
+def _await_state_refusal(work, timeout=8.0):
+    """Make state.json a FIFO and wait for the watcher's state-refusal log line.
+
+    The live watcher ends every cycle with a tmp + os.replace write of state.json
+    (#4362).  A FIFO planted after a cycle's read and before that cycle's replace is
+    renamed over by a regular file, and the refusal never happens.  So whenever
+    state.json is not a FIFO (regular, or absent) it is planted again.  A plant is
+    clobbered only by the one cycle already in flight, and the cycle after it reads
+    the new state first; the loop is bounded by `timeout`, and running out fails
+    with the plant count."""
+    path = work / "state.json"
+    plants = 0
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any("idling, will recheck" in ln for ln in _log_lines(work)):
+            return plants
+        try:
+            is_fifo = stat.S_ISFIFO(os.lstat(path).st_mode)
+        except FileNotFoundError:
+            is_fifo = False
+        if not is_fifo:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            try:
+                os.mkfifo(path)
+                plants += 1
+            except FileExistsError:
+                pass  # the watcher's replace landed between our unlink and mkfifo
+        time.sleep(0.1)
+    pytest.fail(f"state FIFO planted {plants} times, the watcher never logged its "
+                f"refusal within {timeout}s")
+
+
+def test_3f_await_state_refusal_fails_distinctly_with_the_plant_count(work):
+    """3f helper: when the refusal is never logged (here nothing logs, and a thread
+    keeps renaming a regular file over state.json), the helper re-plants and then
+    fails with 'state FIFO planted N times, the watcher never logged its refusal
+    within Ts' with N >= 2, not the generic '... not reached within ...' text.
+    Mutations: no re-plant (N stays <= 1); a generic _await timeout message."""
+    import threading
+    stop = threading.Event()
+
+    def clobber():
+        i = 0
+        while not stop.is_set():
+            i += 1
+            tmp = work / f"state.json.clobber{i}"
+            tmp.write_text("{}")
+            os.replace(tmp, work / "state.json")
+            time.sleep(0.05)
+
+    t = threading.Thread(target=clobber, daemon=True)
+    t.start()
+    try:
+        with pytest.raises(pytest.fail.Exception) as ei:
+            _await_state_refusal(work, timeout=1.5)
+    finally:
+        stop.set()
+        t.join()
+    msg = str(ei.value)
+    assert "never logged its refusal within 1.5s" in msg, msg
+    assert "not reached within" not in msg, msg
+    n = int(msg.split("state FIFO planted ")[1].split(" times")[0])
+    assert n >= 2, msg
+
+
+def test_3f_await_state_refusal_plants_once_when_nothing_clobbers(work):
+    """3f helper, the no-masking property: a watcher that never refuses leaves the
+    FIFO in place, so the helper plants it exactly once and fails with
+    'state FIFO planted 1 times', never a larger N.  Here nothing runs and nothing
+    writes state.json, so nothing logs a refusal and nothing clobbers the plant.
+    Mutations: re-plant on every poll (N grows past 1); never plant (N == 0)."""
+    with pytest.raises(pytest.fail.Exception) as ei:
+        _await_state_refusal(work, timeout=1.0)
+    msg = str(ei.value)
+    assert "state FIFO planted 1 times" in msg, msg
+    assert "never logged its refusal within 1.0s" in msg, msg
+    assert stat.S_ISFIFO(os.lstat(work / "state.json").st_mode)
+
+
 def test_3f_config_and_state_refusals_do_not_suppress_each_other(work):
     """3f: config FIFO reported first, THEN the state file becomes a FIFO: the state
     refusal is reported too; and the other way round (state refused first, repaired,
@@ -1773,11 +1855,7 @@ def test_3f_config_and_state_refusals_do_not_suppress_each_other(work):
     proc = _spawn(work, _config_args(cfg))
     try:
         _await(lambda: _cfg_reports(work), what="config report")
-        if (work / "state.json").exists():
-            os.unlink(work / "state.json")
-        os.mkfifo(work / "state.json")
-        _await(lambda: [ln for ln in _log_lines(work) if "idling, will recheck" in ln],
-               what="state report after the config report")
+        _await_state_refusal(work)
     finally:
         _kill(proc)
 
