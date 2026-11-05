@@ -307,7 +307,7 @@ engram_update_lesson(payload_json=json.dumps({
 }))
 ```
 
-Empty `candidates` list is the common case (most cycles) — no lesson has ever crossed the lease threshold. Log the outcome (count reconciled, or "none this cycle") in today's history file alongside the other Phase A milestones. This step runs in Phase A, by the awake parent, not the dream master. Not because the dream master lacks the tool access — its own spec grants `tools: *` and it already calls `engram_update_lesson`-adjacent tools (supersede, retract, derive, resolve, contradict, update_task) — but because it needs no fairy investigation and no consolidation judgment, only a mechanical read-then-write, and inserting an unreviewed new step into that dense, heavily-negotiated spec is a cost this task doesn't need to pay.
+Empty `candidates` list is the common case (most cycles) — no lesson has ever crossed the lease threshold. Log the outcome (count reconciled, or "none this cycle") in today's history file alongside the other Phase A milestones. This step runs in Phase A, by the awake parent, not the dream master. Not because the dream master lacks the tool access — its own spec's enumerated `tools:` list includes `engram_update_lesson`, and it already calls `engram_update_lesson`-adjacent tools (supersede, retract, derive, resolve, contradict, update_task) — but because it needs no fairy investigation and no consolidation judgment, only a mechanical read-then-write, and inserting an unreviewed new step into that dense, heavily-negotiated spec is a cost this task doesn't need to pay.
 
 ### Step 3.9 — Embedding backfill (engram-alpha#345 PR1 part (c))
 

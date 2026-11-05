@@ -406,10 +406,13 @@ class TestCodexAgentEmission:
             "engram_list_focused",
         }
 
-    def test_codex_agent_full_tool_spec_inherits_full_mcp(self, codex_convenience_bundle):
-        """Dream master has tools:* and inherits full ENGRAM read/write MCP."""
+    def test_codex_dream_master_has_an_engram_allowlist_not_a_blanket_grant(self, codex_convenience_bundle):
+        """Dream master lists its ENGRAM tools (engram-alpha#4323), so Codex emits a plugin MCP
+        allowlist for them and no top-level ``mcp_servers`` table (the clearing used by fairies
+        with no ENGRAM entry). The exact name set is pinned in test_dream_master_tools_list_4323.py."""
         master = self._read_agent(codex_convenience_bundle, "engram-dream-master")
         assert "mcp_servers" not in master
+        assert master["plugins"]["engram@engram-local"]["mcp_servers"]["engram"]["enabled_tools"]
 
 
 class TestCodexEmissionWithEngramHome:

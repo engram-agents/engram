@@ -649,8 +649,9 @@ def _emit_codex_agent_toml(
     # clear MCP servers so a parent session's ENGRAM write tools do not leak in.
     # For fairies with explicit ENGRAM MCP entries, preserve the whitelist as
     # a Codex MCP allowlist instead of inheriting the whole server.  This keeps
-    # read-only dream/summary fairies read-only while still allowing the
-    # dream-master's ``tools: *`` spec to inherit full read/write access.
+    # read-only dream/summary fairies read-only while the dream-master's
+    # enumerated list carries its write tools (engram-alpha#4323; it was
+    # ``tools: *`` before). Other MCP servers are NOT cleared here.
     engram_tools = _engram_mcp_tool_names(tools)
     if tools != "*" and not engram_tools:
         lines.append("mcp_servers = {}")
