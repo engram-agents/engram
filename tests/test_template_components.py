@@ -160,3 +160,56 @@ def test_write_more_bullet_line_identical_across_sources():
         assert len(matches) == 1, p.name
         lines.add(matches[0])
     assert len(lines) == 1, "write-more bullet differs between sources"
+
+
+# --- External-communication kinds: component and D6 skill section must agree ---
+#
+# The "sign every external communication" rule lists four kinds of message in
+# two shipped places (the trust-tier-pointer component and the D6 section of
+# the engram-trust-tier skill). Nothing else binds the two lists, so this test
+# does: each kind's identifying phrase must appear in BOTH.
+
+EXTERNAL_COMMS_PHRASES = [
+    "an issue or comment in a repository that neither your primary user nor an "
+    "`our_side` collaborator works in",
+    "an email to an external person",
+    "a letter to a non-`our_side` agent",
+    "any public post",
+]
+TRUST_TIER_POINTER_PATH = (
+    REPO_ROOT / "src" / "engram" / "templates" / "components" / "trust-tier-pointer.md"
+)
+TRUST_TIER_SKILL_PATH = (
+    REPO_ROOT / "src" / "engram" / "skills" / "claude" / "engram-trust-tier" / "SKILL.md"
+)
+
+
+def _d6_section(text):
+    """Text from the line starting '### D6' up to the next '## ' or '### ' line."""
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("### D6")), None)
+    assert start is not None, (
+        "the '### D6' heading is missing from engram-trust-tier/SKILL.md; "
+        "cannot check the external-communication list against it"
+    )
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].startswith("## ") or lines[i].startswith("### "):
+            end = i
+            break
+    return "\n".join(lines[start:end])
+
+
+@pytest.mark.parametrize("phrase", EXTERNAL_COMMS_PHRASES)
+def test_external_comms_phrase_in_component_and_d6_section(phrase):
+    pointer = TRUST_TIER_POINTER_PATH.read_text(encoding="utf-8")
+    d6 = _d6_section(TRUST_TIER_SKILL_PATH.read_text(encoding="utf-8"))
+    missing = []
+    if phrase not in pointer:
+        missing.append("components/trust-tier-pointer.md")
+    if phrase not in d6:
+        missing.append("engram-trust-tier/SKILL.md (D6 section)")
+    assert not missing, (
+        f"external-communication phrase {phrase!r} is missing from: "
+        f"{', '.join(missing)} -- the two lists have drifted apart"
+    )
