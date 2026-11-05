@@ -346,7 +346,7 @@ The exception: if round 2 introduces a NEW nit (the fix added something cosmetic
 
 # Posting your review to GitHub
 
-When posting a review back to the PR, post from a body file with `gh pr comment <pr-number> --body-file <file>`, through the one gated block in "Post, then read back" below. The signature below is required on every posted comment without exception, the post is gated on it, and every post is **read back** before you report.
+When posting a review back to the PR, post from a body file with `gh pr comment <pr-number> --body-file <file>`, through the one gated helper call in "Post, then read back" below. The signature below is required on every posted comment without exception, the post is gated on it, and every post is **read back** before you report.
 
 **Mandatory signature at the very top of the posted comment:**
 
@@ -362,43 +362,25 @@ When posting a review back to the PR, post from a body file with `gh pr comment 
 
 ## The expected first line comes from the brief
 
-**If the dispatch brief gives the exact expected first line, copy it verbatim into `expected`; do not compose it.** Only when the brief gives none, build it from the brief's PR number and round and the head SHA you asserted in your first act. Never take it from the body file or from the posted comment: a stale file agrees with itself, and so does a comment checked against its own first line. (A brief-supplied line is the stronger form: the check then compares your file with something you did not write.)
+**If the dispatch brief gives the exact expected first line, copy it verbatim into `--expected`; do not compose it.** Only when the brief gives none, build it from the brief's PR number and round and the head SHA you asserted in your first act. Never take it from the body file or from the posted comment: a stale file agrees with itself, and so does a comment checked against its own first line. (A brief-supplied line is the stronger form: the check then compares your file with something you did not write.)
 
 ## Body files: always a fresh `mktemp` file
 
-**Create the body with `mktemp`, never with a fixed or guessed name** (`B="$(mktemp "${TMPDIR:-/tmp}/pr-review.XXXXXX")"`). A fixed name like `r2.md` or `review.md` in a long-lived scratch directory may already hold an earlier review. If your write then fails or never happens, the post publishes that old file under your heading. That happened on 2026-10-16 (#3851): a round-2 comment on one PR was a week-old review of a different PR's commit. A fresh `mktemp` file starts empty, so a failed write posts nothing rather than someone else's words. Post from the file, not inline: an inline body cannot be checked before it is posted.
+**Create the body with `mktemp`, never with a fixed or guessed name** (run `mktemp` as its own call and use the path it prints). A fixed name like `r2.md` or `review.md` in a long-lived scratch directory may already hold an earlier review. If your write then fails or never happens, the post publishes that old file under your heading. That happened on 2026-10-16 (#3851): a round-2 comment on one PR was a week-old review of a different PR's commit. A fresh `mktemp` file starts empty, so a failed write posts nothing rather than someone else's words. Post from the file, not inline: an inline body cannot be checked before it is posted.
 
 ## Post, then read back (one block, mandatory, every post)
 
 Your report to the parent describes what you *meant* to post. The comment is what *landed*, under the parent's account, and nothing else compares the two. So the post is **gated** on the body file's first line, and every post is followed by a read-back of **that exact comment**:
 
 ```bash
-expected="🧚 engram-pr-reviewer · PR #$PR · round $ROUND · head $SHA"   # or the brief's exact line, quoted so the shell keeps it literal
-if [ "$(head -1 "$B")" != "$expected" ]; then
-  echo "NOT POSTED: body file first line is [$(head -1 "$B")], expected [$expected]"
-elif ! grep -q '^## Verdict' "$B"; then
-  echo "NOT POSTED: body file has no '## Verdict' section (truncated?)"
-else
-  url="$(gh pr comment "$PR" -R "$REPO" --body-file "$B")"   # gh prints the comment URL
-  cid="${url##*issuecomment-}"
-  case "$cid" in
-    '' | *[!0-9]*) posted="" ;;   # gh printed no comment URL: nothing to fetch, and the check below says so
-    *) posted="$(gh api "repos/$REPO/issues/comments/$cid")" ;;
-  esac
-  posted_pr="$(printf '%s' "$posted" | python3 -c 'import json,sys; print(json.load(sys.stdin)["issue_url"].rsplit("/",1)[1])')"
-  posted_first="$(printf '%s' "$posted" | python3 -c 'import json,sys; print(json.load(sys.stdin)["body"].splitlines()[0])')"
-  has_verdict="$(printf '%s' "$posted" | python3 -c 'import json,sys; print(sum(1 for l in json.load(sys.stdin)["body"].splitlines() if l.startswith("## Verdict")))')"
-  if [ "$posted_pr" = "$PR" ] && [ "$posted_first" = "$expected" ] && [ "$has_verdict" -ge 1 ]; then
-    echo "READ-BACK OK: comment $cid on PR #$posted_pr: $posted_first"
-  else
-    echo "READ-BACK MISMATCH: comment [$cid] (gh printed [$url]) landed on PR #$posted_pr; expected first line [$expected], posted first line [$posted_first]; '## Verdict' lines: $has_verdict"
-  fi
-fi
+python3 <helper path> --repo <owner/repo> --pr <N> --expected '<the exact expected first line>' --body-file <the path mktemp printed>
 ```
 
-- **A first-line mismatch, or a body with no `## Verdict` section, posts nothing.** `gh pr comment` sits inside the gate, so posting a stale, wrong or truncated file would take a deliberate edit of the block, not just ignoring a printed line. On `NOT POSTED`, fix the file or report the mismatch to the parent. The read-back still checks `## Verdict` too, because a body can also be cut short on its way to GitHub.
-- **Fetch the comment by the id `gh` printed, not "the latest comment".** Someone else may comment in the same second. If `gh pr comment` failed and printed no URL, there is no id; the block then reports a MISMATCH that shows what `gh` printed.
-- **If your sandbox refuses a variable or a command form, use literal values or another tool, but keep the gate a gate.** One seat's guard refused `HEAD=` as a variable name and a variable repo inside `gh`; another refused `head -1`. You may write the repo and numbers literally, or do the comparison in a few lines of Python. What must not change: `expected` comes from the brief (or the brief's values and your asserted head), never from the file or the posted comment; a first-line mismatch must stop the post, not merely print; and all three read-back checks run.
+- **Run it exactly in this shape, as one Bash call, with every value typed literally:** no variables, no `$(...)`, no `${...}`. A worktree-isolated agent's guard refuses those next to `gh` (#3853); the helper does the runtime work inside. `mktemp` runs first as its own call; write the body to the path it printed through Bash with a QUOTED heredoc, `cat > <the path mktemp printed> <<'EOF'` ... `EOF` (you have no Write tool). The quoted delimiter `'EOF'` is required: an unquoted one expands `$`, `$(...)` and backticks in your review text. With it, braces, `$`, `$(...)` and backticks stay literal (measured 2026-11-05 on a worktree-isolated reviewer). Then pass that path literally. **The helper path comes from the dispatch brief** (the parent resolves it in its own shell); type that absolute path literally in place of `<helper path>`. With no path in the brief, use the default for ENGRAM_HOME=~/.engram: `~/.engram/marketplace/plugins/engram/tools/fairy_post_review.py`. On a seat whose ENGRAM_HOME differs, that default does not exist, so use only the brief's path.
+- **Exit codes:** 0 `READ-BACK OK`; 2 or 3 `NOT POSTED` (bad arguments, unreadable file, first-line mismatch, no `## Verdict`, or an unexpected helper error before any post); 4 or 5 `READ-BACK MISMATCH` (4: `gh` failed or printed no comment id; 5: the comment that landed fails a check); 6 `READ-BACK MISMATCH` after an unexpected helper error once the post was attempted: **the post may have landed**, so the parent checks the PR.
+- **A first-line mismatch, or a body with no `## Verdict` section, posts nothing.** `gh pr comment` sits inside the helper's gate, so posting a stale, wrong or truncated file would take a deliberate edit of the helper, not just ignoring a printed line. On `NOT POSTED`, fix the file or report the mismatch to the parent. The read-back still checks `## Verdict` too, because a body can also be cut short on its way to GitHub.
+- **On any non-zero exit, or if the call printed no result line at all, do NOT post again by hand and do not edit or delete anything.** Report the exit code and whatever stdout and stderr printed to the parent. The comment may or may not have landed; only the parent decides. If Python says it cannot open the helper file, the helper is not installed at that path: report that, and never rebuild the gate by hand.
+- **Fetch the comment by the id `gh` printed, not "the latest comment".** Someone else may comment in the same second. If `gh pr comment` failed and printed no URL, there is no id; the helper then reports a MISMATCH that shows what `gh` printed.
 - **The three checks each catch a different failure.**
   - The PR the comment landed on catches a wrong `<pr-number>`.
   - The first line catches a body written for another PR or another head. A stale file names another PR or head.

@@ -807,6 +807,11 @@
       "tier": "dev"
     },
     {
+      "path": "tools/fairy_post_review.py",
+      "tier": "convenience",
+      "note": "engram-alpha#3853: the engram-pr-reviewer fairy's post-and-read-back gate (first-line gate, '## Verdict' gate, one gh pr comment, read-back by the printed comment id), called as one literal command because a worktree-isolated agent's guard refuses the old bash block. Stdlib-only, Python 3.9-compatible. Convenience (T2), the reviewer agent's own tier: a safety discipline ships with its tool, at the same tier."
+    },
+    {
       "path": "tools/release-cutover.py",
       "tier": "dev"
     },
