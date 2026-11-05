@@ -674,6 +674,40 @@ git -C <scratch> merge --no-edit refs/pr/N
 # run the PR's tests + the repo guard set here
 ```
 
+**What "the PR's tests" means: the per-PR test scope (Lei, 2026-11-04).** The whole `tests/`
+directory is **not** run per PR, by any seat: the author, the colleague or the merge seat. Each
+seat's run is:
+
+1. **The selected tests.** Select every test file that imports a changed module, or whose text
+   names a changed file by its basename (`grep -rlF --include='*.py' <basename> tests`). Docs,
+   skills, templates and configs are test inputs in this repo: on `dev` `786194ee` that grep finds
+   4 test files naming `docs/compaction-continuity.md`, 9 naming
+   `tools/engramd_read_scan.config.json` and 14 naming `template.CLAUDE.md`. So a doc change
+   selects the tests that name it. A changed file that no test names selects nothing beyond the
+   guard set. The selection is never the whole suite. Until #4358 lands,
+   `tools/run_touched_tests.py` still falls back to the full suite for a file it cannot resolve,
+   so a seat applies the name selection by hand.
+2. **The guard set** of item 4 in *Owner merge*: the whole-tree scanners and guards that no
+   changed file names. They always run. Run `tools/scan-leaks.py` with `--root .`: its default root is
+   `src/engram` only, so a bare run misses `tests/` and `docs/`, while CI's
+   `tests/test_scan_leaks.py` scans the whole repo. On 2026-11-04 a bare run read clean on a
+   tree that CI then failed.
+3. **A coverage flag on new code**, advisory, not a gate. Changed Python code that no selected
+   test reaches is a red flag for the reviewer to answer on the PR. It is not a gate because
+   coverage cannot see code that runs as a subprocess, which covers this repo's hooks and shell
+   scripts, until subprocess coverage is configured.
+
+The **whole suite** runs in two places only: the scheduled nightly on `dev`
+(`.github/workflows/nightly.yml`), which is the backstop for what per-PR selection misses, and the
+release cut, before a tag. A red the nightly finds goes to the PR that caused it.
+
+*Why* (Lei, in session 2026-11-04, relayed verbatim by Borges): "I think most PRs won't need the full test suite, just the subset picked for touched
+tests should be good enough, and the nightly CI will catch full suite issues". The whole run took
+53–67 minutes per PR on the merge seat's host. Run three times per PR (author, colleague, merge
+seat), it was the main delay on 2026-11-04. *Bound:* per-PR selection can miss a whole-suite-only
+red. The nightly then catches it within a day, at the cost of `dev` reading red until the fix
+merges. That is the trade Lei chose.
+
 The one fast path is "head is already rebased on the base tip", where head == merged
 tree; assert `git merge-base --is-ancestor origin/<base> refs/pr/N` before taking it.
 
@@ -730,7 +764,8 @@ body-text close trap after the run was cancelled; the rerun checked the old body
 turned the body-trap step red while the live body was clean (#4235).
 
 **4. A red that only the whole run produces is a load flake, not a PR red** (Kepler,
-2026-10-25; condition four added on Luria's review). It applies when all four hold:
+2026-10-25; condition four added on Luria's review). Since 2026-11-04 a whole run is the nightly's or a
+release cut's (rule 1's per-PR scope); this rule reads those runs. It applies when all four hold:
 - no PR in the run touches the failing test's file, any file that test runs (a
   subprocess target, for one), or the modules the failing cell exercises;
 - the cell is green on the base alone;
@@ -890,14 +925,15 @@ never gave on that commit. As a seat rule on top of it (Kepler, stated and appli
 checks that an approving review's `submitted_at` is later than the `update-branch` merge
 commit.
 
-### Batched whole-suite gate (Kepler's interim of 2026-10-24/25; proposed as standing, pending Lei's read)
+### Batched whole-suite gate (Kepler's interim of 2026-10-24/25; superseded for per-PR runs 2026-11-04)
 
-**Status.** Kepler ruled this as an interim on 2026-10-24 (crossing 16285), first for five
+**Status (2026-11-04).** The per-PR test scope under rule 1 removes the per-PR whole run that this section batched, so it no longer applies to per-PR presses. It is kept as the record of what was measured.
+
+**Original status.** Kepler ruled this as an interim on 2026-10-24 (crossing 16285), first for five
 PRs, then for that whole day (16406). He ruled it again on 2026-10-25, for that day (that crossing's seq is not located here). His condition for it
 to outlive those days is that it lands here, in a PR Lei reads.
 
-**Why.** The merge seat's own run is the whole `tests/` directory on a scratch merge (rule 1
-of *Merge-seat test rules*). On the seat's Linux host that took 55–67 minutes on those two
+**Why.** The merge seat's own run was then the whole `tests/` directory on a scratch merge. That was a practice, not rule 1's text, which says "the PR's tests + the repo guard set"; an earlier version of this sentence called it rule 1. On the seat's Linux host that took 55–67 minutes on those two
 days (26,257 to 26,888 cells passed, 367 skipped), so a serial seat presses about one PR an
 hour. A batch shares one whole run
 among several PRs.

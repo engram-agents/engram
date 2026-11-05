@@ -39,8 +39,8 @@ the unified payload_json signature as of 2026-05-27.
 - **CI cost model (#1597):** dev PRs run only the cheap combined `pr-checks`
   (static scrubs). The **full pytest suite does NOT run
   on dev PRs** — at agent-PR velocity it's too expensive; run **affected-tests
-  locally** and paste the result in your review. The full suite runs once, on
-  the dev→main release PR (above). `affected-tests.yml` is `workflow_dispatch`
+  locally** and paste the result in your review. The full suite runs nightly on
+  `dev` (`nightly.yml`) and on the dev→main release PR (above). `affected-tests.yml` is `workflow_dispatch`
   only.
 - **No macOS runners in CI — ever (Lei, 2026-09-28).** A `runs-on: macos-*` job
   bills at **ten times** the Linux minute rate, and `pr-checks` fires on every

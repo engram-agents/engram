@@ -671,8 +671,9 @@ or recalled.
   reads this to remember what was in each version. When reconciling with
   `main`'s hotfix sections, **union** — never drop a side.
 - **Don't tag while CI is red.** A tag points at a specific SHA; if that
-  SHA's tests fail, users hit broken state. The full suite runs *only* on the
-  release PR, so this is the one place it's checked — take it seriously.
+  SHA's tests fail, users hit broken state. In CI the full suite runs on the
+  release PR and in the nightly on `dev`; the release PR's run is the one that gates
+  a tag — take it seriously.
 - **Don't trust the fix-PR's green as full-suite green.** A `dev` fix PR runs
   only `pr-checks`; run the affected tests locally, and let the release PR's
   re-run be the full-suite verification.
