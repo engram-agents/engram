@@ -602,6 +602,21 @@ def _resolve_with_trace(path: str) -> "tuple[str, list[str]]":
     return resolved, links
 
 
+def _hash_mismatch_error(supplied: str, computed: str) -> Optional[str]:
+    """Return an error message if a caller-supplied content_hash (stripped,
+    compared case-insensitively) differs from the computed sha256; else None.
+    An empty / whitespace-only supplied value means "none supplied" (#2222)."""
+    supplied = (supplied or "").strip()
+    if supplied and supplied.lower() != computed:
+        return (
+            f"The supplied content_hash '{supplied}' does not match the file's "
+            f"bytes: the sha256 of the file is '{computed}'. The server computes "
+            "the hash itself for a file:// source; omit content_hash or pass the "
+            "computed value."
+        )
+    return None
+
+
 def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", source_repo: str = "", repo_path: str = "") -> dict:
     """Validate a file:// URL is citable and capture its version state.
 
@@ -620,6 +635,11 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
         content_hash (sha256 of working-tree file) and git_sha (HEAD if not
         provided). If git_sha was provided, verifies the file exists at that
         revision; returns error if not.
+      - The sha256 is always computed from the file's bytes (committed path
+        and content-addressed archive path). A caller-supplied content_hash
+        is compared with it, case-insensitively; a mismatch returns an error
+        naming both values (#2222). On equality the computed lower-case value
+        is returned.
 
     Returns a dict with keys:
       - ok (bool): True if validation passed
@@ -834,6 +854,9 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
     # other file:// citation keeps the committed-before-cite guard unchanged.
     ca_hash = _content_addressed_archive_hash(file_path)
     if ca_hash:
+        mismatch = _hash_mismatch_error(content_hash, ca_hash)
+        if mismatch:
+            return _reject(mismatch)
         return {"ok": True, "error": None, "content_hash": ca_hash, "git_sha": ""}
 
     repo_root_result = _file_git("rev-parse", "--show-toplevel")
@@ -888,9 +911,11 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
                 "Commit the file first, then retry with the new git SHA."
             )
 
-    if not content_hash:
-        with open(abs_file, "rb") as f:
-            content_hash = hashlib.sha256(f.read()).hexdigest()
+    # Always hash the bytes; a caller-supplied value is only checked against it
+    # (#2222). The comparison runs after the git_sha checks below so every
+    # refusal that precedes it keeps its own reason.
+    with open(abs_file, "rb") as f:
+        computed_hash = hashlib.sha256(f.read()).hexdigest()
 
     if not git_sha:
         head_result = _file_git("rev-parse", "HEAD")
@@ -932,7 +957,11 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
                         "that contains every symlink the cited path goes through."
                     )
 
-    return {"ok": True, "error": None, "content_hash": content_hash, "git_sha": git_sha}
+    mismatch = _hash_mismatch_error(content_hash, computed_hash)
+    if mismatch:
+        return _reject(mismatch)
+
+    return {"ok": True, "error": None, "content_hash": computed_hash, "git_sha": git_sha}
 
 
 def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:

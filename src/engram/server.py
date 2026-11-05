@@ -1837,7 +1837,7 @@ def engram_add_observation(payload_json: str) -> str:
             predicted_event (str, optional): Required if is_predictive. The event being predicted.
             resolution_timeframe (str, optional): Optional timeframe for when the prediction should be resolvable.
             source_class (str, optional): Epistemic origin — 'external' (default; 'user_stated' when session_id is the source and source_class is omitted), 'introspective' (×0.95 confidence discount), or 'user_stated'.
-            content_hash (str, optional): SHA-256 hash of file content (for file-based evidence).
+            content_hash (str, optional): SHA-256 hash of file content (for file-based evidence). On a committed (git) or evidence-archive file:// source the server computes the hash itself; a supplied value must match the file's bytes (case-insensitive) or the call is refused; on a cross-repo citation (source_repo + repo_path) the bytes hashed are the cited file at the URL, not the repo_path copy git checks. Elsewhere (a non-file URL, or a file outside any git repo) a supplied value is not stored (#2222).
             git_sha (str, optional): Git commit SHA when the file was read (for file-based evidence).
             standpoint_author_id (str, optional): Persistent cross-session entity ID for who
                 produced the source claim (the "who observes" axis). Use the pn_* node ID for an
@@ -2065,7 +2065,7 @@ def engram_add_observation_batch(payload_json: str) -> str:
             domain (str, optional): Auto-extracted from URL if omitted.
             source_date (str, optional): ISO date (e.g. '2026-03-20').
             evidence_id (str, optional): ID of existing evidence node.
-            content_hash (str, optional): SHA-256 of file content (file evidence).
+            content_hash (str, optional): SHA-256 of file content (file evidence). On a committed (git) or evidence-archive file:// source the server computes the hash itself; a supplied value must match the file's bytes (case-insensitive) or the call is refused; on a cross-repo citation (source_repo + repo_path) the bytes hashed are the cited file at the URL, not the repo_path copy git checks. Elsewhere (a non-file URL, or a file outside any git repo) a supplied value is not stored (#2222).
             git_sha (str, optional): Git commit SHA (file evidence).
 
     Returns:
