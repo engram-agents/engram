@@ -1189,6 +1189,148 @@ def test_cornerstone_candidate_ignores_non_current_citers():
     assert row["recent_citation_count"] == 4 and row["citation_count"] == 4
 
 
+
+# ── cornerstone_candidate: outgoing-anchor exclusion (#3912, #4194, #3806) ─
+#
+# Contract: a current obs/dv is excluded if EITHER (1) a current cornerstone has
+# an edge pointing at it (any relation; the cells above), OR (2) its OWN outgoing
+# edge, relation in ANCHOR_OUT_RELATIONS, points at a current node whose type is
+# in ANCHOR_TARGET_TYPES. Every cell below runs an unanchored control with the
+# same citation profile and asserts it present, so an empty result cannot pass.
+
+
+def _cc_make_anchor(kind):
+    """Create a current anchor node of `kind` whose own supporting evidence is a
+    throwaway node (never the candidate, or the INCOMING rule would do the
+    excluding and the cell would test nothing). Returns the anchor id."""
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    throwaway = _add_observation(obs, f"throwaway support for {kind} anchor")
+    if kind == "cornerstone":
+        r = json.loads(cst._add_cornerstone_impl(
+            tag=f"test-anchor-out-{kind}", title="Anchor for outgoing-edge fixture",
+            new_frame="A durable operating principle for this test",
+            prior_frame="No such principle yet",
+            triggering_experience="Fixture needs an anchor",
+            supporting_ids=throwaway,
+        ))
+        assert "cornerstone_id" in r, r
+        return r["cornerstone_id"]
+    if kind == "lesson":
+        r = json.loads(epi._add_lesson_impl(
+            claim="If a fixture needs a lesson, then create one",
+            incident_ids=throwaway, scaffolding_nudge="n",
+            logical_chain="lc", situation_pattern="sp",
+        ))
+        assert "lesson_id" in r, r
+        return r["lesson_id"]
+    if kind == "axiom":
+        r = json.loads(epi._add_axiom_impl(
+            claim="A fixture axiom for the outgoing-anchor cells", basis="Test basis",
+        ))
+        assert "axiom_id" in r, r
+        return r["axiom_id"]
+    if kind == "goal":
+        r = json.loads(tsk._add_goal_impl(
+            claim="A fixture goal for the outgoing-anchor cells", motivation="Test motivation",
+        ))
+        assert "goal_id" in r, r
+        return r["goal_id"]
+    raise AssertionError(kind)
+
+
+def _cc_outgoing_edge(core, source, target, relation):
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?,?,?,?)",
+            (source, target, relation, _days_ago_iso(1)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _cc_outgoing_pair(core, obs, kind, relation):
+    """(candidate, control, anchor): identical citation profile; only the
+    candidate carries its own outgoing `relation` edge to the `kind` anchor."""
+    anchor = _cc_make_anchor(kind)
+    cand = _cc_node(obs, core, "Candidate with its own outgoing edge", 30)
+    _cc_cite(obs, core, cand, [1, 2, 3, 4, 5, 6])
+    control = _cc_node(obs, core, "Unanchored control, same profile", 30)
+    _cc_cite(obs, core, control, [1, 2, 3, 4, 5, 6])
+    _cc_outgoing_edge(core, cand, anchor, relation)
+    return cand, control, anchor
+
+
+@pytest.mark.parametrize("relation,kind", [
+    ("exemplifies", "cornerstone"),
+    ("exemplifies", "lesson"),
+    ("instantiates", "cornerstone"),
+    ("instantiates", "axiom"),
+    ("serves", "cornerstone"),
+    ("about", "cornerstone"),
+    ("about", "lesson"),
+])
+def test_cornerstone_candidate_c1_outgoing_anchor_excluded(relation, kind):
+    """C1: own outgoing anchor edge to a current cornerstone/lesson/axiom -> excluded."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    cand, control, _anchor = _cc_outgoing_pair(core, obs, kind, relation)
+    ids = [c["id"] for c in _cc_run(qry, core)]
+    assert control in ids
+    assert cand not in ids
+
+
+def test_cornerstone_candidate_c2_non_current_anchor_does_not_exclude():
+    """C2: the same edge to a cornerstone that is no longer current does not exclude."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    cand, control, anchor = _cc_outgoing_pair(core, obs, "cornerstone", "exemplifies")
+    conn = core._get_db()
+    try:
+        conn.execute("UPDATE nodes SET is_current=0, status='superseded' WHERE id=?", (anchor,))
+        conn.commit()
+    finally:
+        conn.close()
+    ids = [c["id"] for c in _cc_run(qry, core)]
+    assert control in ids
+    assert cand in ids
+
+
+def test_cornerstone_candidate_c3_non_anchor_relation_does_not_exclude():
+    """C3: an outgoing `tensions` edge (disagreement, not membership) does not exclude."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    cand, control, _anchor = _cc_outgoing_pair(core, obs, "cornerstone", "tensions")
+    ids = [c["id"] for c in _cc_run(qry, core)]
+    assert control in ids
+    assert cand in ids
+
+
+def test_cornerstone_candidate_c4_non_anchor_target_type_does_not_exclude():
+    """C4: an outgoing `serves` edge to a goal (not cornerstone/lesson/axiom) does not exclude."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    cand, control, _anchor = _cc_outgoing_pair(core, obs, "goal", "serves")
+    ids = [c["id"] for c in _cc_run(qry, core)]
+    assert control in ids
+    assert cand in ids
+
+
+@pytest.mark.parametrize("relation", ["derives_from", "cites", "supported_by"])
+def test_cornerstone_candidate_c5_outgoing_citation_edge_does_not_exclude(relation):
+    """C5: an outgoing citation edge (resting on a pattern) to a current cornerstone
+    is not an anchor: only ANCHOR_OUT_RELATIONS anchor. The edge runs FROM the
+    candidate, so it is not a citation OF the candidate (citations count edges whose
+    target is the candidate) and its recent-citation profile stays the control's."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    cand, control, _anchor = _cc_outgoing_pair(core, obs, "cornerstone", relation)
+    ids = [c["id"] for c in _cc_run(qry, core)]
+    assert control in ids
+    assert cand in ids
+
+
 # ── open_question_answerable + recent_resolution_echo ─────────────────────
 
 def test_open_question_answerable_dispatches_cleanly():

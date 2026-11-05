@@ -606,6 +606,13 @@ def _pattern_stale_load_bearing(
     return candidates[:top_k]
 
 
+# Outgoing-anchor rule of _pattern_cornerstone_candidate (#3912, #4194, #3806):
+# a candidate whose OWN edge, with one of these relations, points at a current
+# node of one of these types is already anchored to an identity pattern.
+ANCHOR_OUT_RELATIONS = ("about", "serves", "exemplifies", "instantiates")
+ANCHOR_TARGET_TYPES = ("cornerstone", "lesson", "axiom")
+
+
 def _pattern_cornerstone_candidate(
     conn, preset_params: dict, **_filters
 ) -> list[dict]:
@@ -642,13 +649,23 @@ def _pattern_cornerstone_candidate(
     Order (deterministic): recent DESC, lifetime DESC, created_at DESC, id ASC.
     `score` is the recent count (kept for consumers).
 
-    A node already wired to an existing cornerstone (any incoming edge whose
-    source is a current cornerstone — e.g. a cornerstone's own `supported_by`
-    edge to its supporting evidence) is excluded outright, not merely
-    down-scored: it is evidence *for* an existing cornerstone, not itself a
-    candidate for a new one, and counting that edge toward its own citation
-    count would double-count the very relationship that disqualifies it
-    (#1913).
+    A node already anchored to an existing identity pattern is excluded
+    outright, not merely down-scored, in EITHER direction (#1913, #3912,
+    #4194):
+      - incoming: any edge whose source is a current cornerstone (e.g. a
+        cornerstone's own `supported_by` edge to its supporting evidence),
+        whatever the relation;
+      - outgoing: the candidate's OWN edge, with relation in
+        ANCHOR_OUT_RELATIONS (about / serves / exemplifies / instantiates),
+        whose target is a current node of type in ANCHOR_TARGET_TYPES
+        (cornerstone / lesson / axiom).
+    Such a node is evidence *for* an existing pattern, not itself a candidate
+    for a new one, and counting the anchoring edge toward its own citation
+    count would double-count the very relationship that disqualifies it.
+    An outgoing citation edge (`derives_from` / `cites` / `supported_by`) from
+    the candidate to a cornerstone is deliberately NOT an anchor and does not
+    exclude: resting on a pattern is not membership in it; only
+    ANCHOR_OUT_RELATIONS anchor.
 
     The recency comparison is done on SQLite `datetime()` of both sides, not on
     raw strings: `edges.created_at` is written as `...ffffff+00:00` in
@@ -675,6 +692,16 @@ def _pattern_cornerstone_candidate(
     # tallies. "Wired to a cornerstone" is what matters, not by which
     # relation — a future edge type sourced from a cornerstone should
     # disqualify too without needing this list updated in lockstep.
+    #
+    # The OUTGOING exclusion (#3912, #4194) is deliberately relation-SPECIFIC,
+    # unlike the incoming one: an outgoing `tensions` or `cites` edge to a
+    # cornerstone is disagreement or citation, not membership, so it must not
+    # disqualify. ANCHOR_OUT_RELATIONS are the aboutness and exemplar/instance
+    # relations the exemplar and lesson tools write. Lessons and axioms count
+    # as targets alongside cornerstones: a node that exemplifies a lesson or
+    # instantiates an axiom is evidence for an existing identity pattern, not
+    # a candidate for a new one. The target must be current: an edge to a
+    # superseded or retracted anchor anchors nothing.
     #
     # #2255 colleague-review fix: the relation set in the JOIN below is a THIRD,
     # deliberately distinct relation set from core.CITATION_SUPPORT_RELATIONS
@@ -712,6 +739,13 @@ def _pattern_cornerstone_candidate(
     # This is a known artifact of the additive migration, not an
     # oversight — it resolves when W3 retires the stale `supported_by`
     # pairing edges.
+    # Anchor lists are bound as named parameters, never interpolated as literals.
+    anchor_params = {
+        **{f"anchor_rel{i}": r for i, r in enumerate(ANCHOR_OUT_RELATIONS)},
+        **{f"anchor_type{i}": t for i, t in enumerate(ANCHOR_TARGET_TYPES)},
+    }
+    anchor_rel_ph = ", ".join(f":anchor_rel{i}" for i in range(len(ANCHOR_OUT_RELATIONS)))
+    anchor_type_ph = ", ".join(f":anchor_type{i}" for i in range(len(ANCHOR_TARGET_TYPES)))
     rows = conn.execute(
         "SELECT n.id, n.type, n.claim, n.importance_base, n.recall_count, "
         "       COUNT(DISTINCT e.source_id) AS lifetime_cites, "
@@ -728,11 +762,18 @@ def _pattern_cornerstone_candidate(
         "    SELECT 1 FROM edges a JOIN nodes c ON a.source_id = c.id "
         "    WHERE a.target_id = n.id AND c.type='cornerstone' AND c.is_current=1"
         ") "
+        "AND NOT EXISTS ("
+        "    SELECT 1 FROM edges o JOIN nodes t ON o.target_id = t.id "
+        "    WHERE o.source_id = n.id AND t.is_current = 1 "
+        f"    AND o.relation IN ({anchor_rel_ph}) "
+        f"    AND t.type IN ({anchor_type_ph})"
+        ") "
         "GROUP BY n.id "
         "HAVING recent_cites >= :min_recent "
         "ORDER BY recent_cites DESC, lifetime_cites DESC, n.created_at DESC, n.id ASC "
         "LIMIT :top_k",
-        {"cutoff": cutoff, "min_recent": min_recent_citations, "top_k": top_k},
+        {"cutoff": cutoff, "min_recent": min_recent_citations, "top_k": top_k,
+         **anchor_params},
     ).fetchall()
 
     candidates: list[dict] = []
