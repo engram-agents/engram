@@ -119,7 +119,7 @@ if [ "$1" = clone ] && [ -n "${GIT_CLONE_SLEEP-}" ]; then
 fi
 if [ "$1" = clone ] && [ -n "${GIT_CONFIG_GLOBAL-}" ]; then
   cp "$GIT_CONFIG_GLOBAL" "$GIT_LOG.cfg"
-  echo "file=$(stat -c %a "$GIT_CONFIG_GLOBAL") dir=$(stat -c %a "$(dirname "$GIT_CONFIG_GLOBAL")")" > "$GIT_LOG.modes"
+  echo "file=$(stat -c %a "$GIT_CONFIG_GLOBAL" 2>/dev/null || stat -f %Lp "$GIT_CONFIG_GLOBAL") dir=$(stat -c %a "$(dirname "$GIT_CONFIG_GLOBAL")" 2>/dev/null || stat -f %Lp "$(dirname "$GIT_CONFIG_GLOBAL")")" > "$GIT_LOG.modes"
   echo "$GIT_CONFIG_GLOBAL" > "$GIT_LOG.path"
 fi
 exec REALGIT "$@"
@@ -798,6 +798,38 @@ class TestFold2SignalTrap:
         assert list((tmp_path / "tmpd").iterdir()) == [], out + err
         assert proc.returncode == code, (proc.returncode, out, err)
         assert not (tmp_path / "install.log").exists(), "install.sh must not run after a signal"
+
+    def test_trust_dir_is_created_under_tmpdir_and_gone_after(self, tmp_path):
+        """#4281: BSD mktemp with no template ignores TMPDIR (macOS uses its per-user temp dir), so the trust dir
+        must be made from an explicit ${TMPDIR:-/tmp} template. Mutation: bare `mktemp -d` -> red on macOS."""
+        env, home = make_env(tmp_path)
+        src = make_source(tmp_path, tags={"v0.1.0": "c2"})
+        env["GIT_CLONE_SLEEP"] = "2"
+        script = f'set -u\nsource "{BOOTSTRAP}"\n' + install_body(home, src)
+        proc = subprocess.Popen(["bash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env, start_new_session=True)
+        started = tmp_path / "git.log.clone-started"
+        deadline = time.time() + 30
+        while not started.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert started.exists(), "fake clone never started"
+        during = [p.name for p in (tmp_path / "tmpd").iterdir()]
+        out, err = proc.communicate(timeout=60)
+        assert len(during) == 1 and during[0].startswith("agent-bootstrap."), (during, out + err)
+        assert list((tmp_path / "tmpd").iterdir()) == [], out + err
+
+    def test_trust_dir_falls_back_to_tmp_when_tmpdir_is_unset(self, tmp_path):
+        """#4281 (colleague review): the ${TMPDIR:-/tmp} fallback matters when TMPDIR is absent, e.g. under sudo,
+        which resets the environment. Mutation: `${TMPDIR}` with no fallback -> red here only."""
+        env, home = make_env(tmp_path)
+        env.pop("TMPDIR")
+        src = make_source(tmp_path, tags={"v0.1.0": "c2"})
+        proc = run_lib(env, install_body(home, src))
+        assert _rc(proc) == 0, proc.stdout + proc.stderr
+        used = (tmp_path / "git.log.path").read_text().strip()
+        assert used.startswith("/tmp/agent-bootstrap."), used
+        assert not Path(used).exists(), f"trust file outlived the clone: {used}"
+        assert not Path(used).parent.exists(), f"trust dir outlived the clone: {Path(used).parent}"
 
     def test_traps_are_cleared_after_the_clone(self, tmp_path):
         env, home = make_env(tmp_path)

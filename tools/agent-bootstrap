@@ -251,7 +251,7 @@ ab_clone_and_install() {
     local srcgit="$ALPHA_SOURCE/.git" cfgdir cfg esc
     CLONE_TAG=""
     echo "Cloning $ALPHA_SOURCE -> $clone (as $USER_NAME)..."
-    cfgdir="$(mktemp -d)" || { echo "agent-bootstrap: mktemp failed" >&2; ab_left_in_place_note; return 1; }
+    cfgdir="$(mktemp -d "${TMPDIR:-/tmp}/agent-bootstrap.XXXXXX")" || { echo "agent-bootstrap: mktemp failed" >&2; ab_left_in_place_note; return 1; }
     # Remove the trust dir on EXIT and on INT/TERM too (a signal mid-clone must not leave it);
     # INT/TERM then exit with the conventional 128+signal. Cleared right after the explicit rm.
     trap 'rm -rf -- "$cfgdir"' EXIT

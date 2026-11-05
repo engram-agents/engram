@@ -140,14 +140,77 @@ def _check_novel(r, H, ctx):
     assert r.stderr == f"novel_terms: ENGRAM database not found: {H}/knowledge.db\n", r.stderr
 
 
+_VEC_ADVISORY = "[engram] sqlite-vec unavailable"
+
+
+def _without_vec_advisory(stderr):
+    """Drop the ONE sqlite-vec advisory an interpreter without sqlite-vec prints (engram_core import), and only when
+    it is the first line. Any other extra line is kept, so the exact compare still fails on it. (#4281)"""
+    first, sep, rest = stderr.partition("\n")
+    return rest if sep and first.startswith(_VEC_ADVISORY) else stderr
+
+
 # -- propose-generalizes-migration.py: no knowledge.db -> its refusal, exit 2, no report written
+# The only checker exposed to the advisory: it is the only tool here that imports engram_core. The other checkers
+# passed on a no-sqlite-vec interpreter in the #4281 run, so they are left as they were.
 def _check_propose(r, H, ctx):
     assert r.returncode == 2, (r.returncode, r.stderr)
     assert r.stdout == ""
-    assert r.stderr == (f"ENGRAM database not found: {H}/knowledge.db\n"
-                        "Refusing to emit a report — an empty report and an unreadable database must not look "
-                        "alike.\n"), r.stderr
+    assert _without_vec_advisory(r.stderr) == (
+        f"ENGRAM database not found: {H}/knowledge.db\n"
+        "Refusing to emit a report — an empty report and an unreadable database must not look alike.\n"), r.stderr
     assert not (ctx["inputs"] / "report.md").exists()
+
+
+_PROPOSE_BODY = ("ENGRAM database not found: {H}/knowledge.db\n"
+                 "Refusing to emit a report — an empty report and an unreadable database must not look alike.\n")
+
+
+@pytest.mark.parametrize("prefix_line, passes", [
+    ("", True),
+    (_VEC_ADVISORY + " — semantic search is on the slow O(N) pure-Python cosine fallback; install it\n", True),
+    ("[engram] some other warning\n", False),
+    ("Traceback (most recent call last):\n", False),
+])
+def test_propose_checker_strips_only_the_sqlite_vec_advisory_first_line(prefix_line, passes, tmp_path):
+    """The #4281 strip is narrow: the advisory as the FIRST line is dropped; any other extra first line still fails
+    the exact compare. Mutation: drop ANY first line -> the two passes=False rows go red."""
+    from types import SimpleNamespace
+    H = tmp_path / "h"
+    r = SimpleNamespace(returncode=2, stdout="", stderr=prefix_line + _PROPOSE_BODY.format(H=H))
+    ctx = {"inputs": tmp_path / "inputs"}
+    if passes:
+        _check_propose(r, H, ctx)
+    else:
+        with pytest.raises(AssertionError):
+            _check_propose(r, H, ctx)
+
+
+def test_the_vec_advisory_prefix_matches_the_message_engram_core_prints():
+    """Pin _VEC_ADVISORY to the source of the advisory, so a reworded message fails here by name rather than
+    silently turning the strip into a no-op. (#4281 review)"""
+    src = (Path(__file__).resolve().parents[1] / "src" / "engram" / "engram_core.py").read_text(encoding="utf-8")
+    assert _VEC_ADVISORY in src, "engram_core's sqlite-vec advisory no longer starts with _VEC_ADVISORY"
+
+
+def test_propose_checker_keeps_an_advisory_that_follows_the_body(tmp_path):
+    """Only a FIRST-line advisory is dropped: one after the body, with nothing else extra, still fails.
+    Mutation: strip the advisory wherever it appears -> red here only. (#4281 colleague review)"""
+    from types import SimpleNamespace
+    H = tmp_path / "h"
+    r = SimpleNamespace(returncode=2, stdout="",
+                        stderr=_PROPOSE_BODY.format(H=H) + _VEC_ADVISORY + " — x\n")
+    with pytest.raises(AssertionError):
+        _check_propose(r, H, {"inputs": tmp_path / "inputs"})
+
+
+def test_propose_checker_keeps_the_advisory_when_it_is_not_the_first_line(tmp_path):
+    from types import SimpleNamespace
+    H = tmp_path / "h"
+    body = _PROPOSE_BODY.format(H=H)
+    r = SimpleNamespace(returncode=2, stdout="", stderr="[engram] other\n" + _VEC_ADVISORY + " — x\n" + body)
+    with pytest.raises(AssertionError):
+        _check_propose(r, H, {"inputs": tmp_path / "inputs"})
 
 
 # -- rc-upgrade-verify.py: it runs main() at import; no knowledge.db -> _first() names the path it tried, exit 1
