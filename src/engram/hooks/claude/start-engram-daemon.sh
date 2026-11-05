@@ -147,6 +147,15 @@ SOCKET_PATH="$ENGRAM_HOME/recall-daemon.sock"
 PID_PATH="$ENGRAM_HOME/recall-daemon.pid"
 DAEMON_SCRIPT="$(dirname "$0")/engram-surface-daemon.py"
 LOG_PATH="$ENGRAM_HOME/surface-daemon.log"
+# #4375: opening a FIFO for writing with no reader blocks forever, so a FIFO
+# at the log path would hang every append below (and the detached daemon
+# launch redirect). If the path exists but is not a plain regular file (or is
+# a symlink), send every log write to /dev/null. A missing log stays as is.
+if [ -e "$LOG_PATH" ] || [ -L "$LOG_PATH" ]; then
+    if [ -L "$LOG_PATH" ] || [ ! -f "$LOG_PATH" ]; then
+        LOG_PATH=/dev/null
+    fi
+fi
 
 # #2652 phase-0 unit 1: log which liveness-probe branch this invocation
 # took, so a restart can later be traced to "silent death" vs. "pidfile-
@@ -1122,7 +1131,13 @@ sys.exit(0)
             # Stamp the launch attempt so the per-turn surface hook can tell a
             # cold-start warmup (recent stamp → SOFT "warming up") from a
             # genuinely down daemon (stale/absent stamp → CRITICAL).
-            date +%s > "$ENGRAM_HOME/daemon-launch-attempt" 2>/dev/null || true
+            # #4375: write the stamp only to an absent path or a regular
+            # file; a FIFO would block forever and a symlink would be written
+            # through. Otherwise skip silently.
+            if [ ! -L "$ENGRAM_HOME/daemon-launch-attempt" ] && \
+               { [ ! -e "$ENGRAM_HOME/daemon-launch-attempt" ] || [ -f "$ENGRAM_HOME/daemon-launch-attempt" ]; }; then
+                date +%s > "$ENGRAM_HOME/daemon-launch-attempt" 2>/dev/null || true
+            fi
         fi
         ;;
     *)

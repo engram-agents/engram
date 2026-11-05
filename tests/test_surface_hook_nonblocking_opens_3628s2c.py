@@ -32,6 +32,9 @@ from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _launcher_survivors as _survivors  # noqa: E402
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # SURFACE_3628S2C_HOOK_DIR lets the regular-file propagation cells be pointed at
 # another tree (e.g. an extracted origin/dev hooks dir) to prove they pass there.
@@ -738,6 +741,28 @@ def _run_main(ctx: Ctx, stdin: dict, timeout=45):
                               timeout=timeout, env=ctx.env())
     except subprocess.TimeoutExpired:
         pytest.fail(f"surface hook main() blocked for more than {timeout}s (kind={ctx.kind})")
+
+
+@pytest.fixture(autouse=True)
+def _no_launcher_survives_the_test(tmp_path):
+    """#4375: the surface hook's relaunch spawns a detached start-engram-daemon.sh. When a FIFO sat at
+    the launcher's stamp path it blocked forever, four permanent processes per run. After every cell in
+    this file no launcher whose environment names the cell's temp home may be alive (a brief grace for a
+    launcher that is merely finishing)."""
+    yield
+    import time as _t
+
+    deadline = _t.monotonic() + 15
+    left = _survivors.surviving_launchers(str(tmp_path))
+    while left and _t.monotonic() < deadline:
+        _t.sleep(0.5)
+        left = _survivors.surviving_launchers(str(tmp_path))
+    for pid in left:  # never leave them behind, even when the assertion fails
+        try:
+            os.kill(int(pid), 9)
+        except OSError:
+            pass
+    assert left == [], f"start-engram-daemon.sh survived the test (pids {left}); see #4375"
 
 
 def _stdin(ctx):

@@ -98,6 +98,7 @@ import pytest
 # state regardless of this host's own ambient systemctl behavior.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_start_daemon_probe_branch_logging import _install_home_key_helper, _make_fake_systemctl  # noqa: E402
+import _launcher_survivors  # noqa: E402  (#4375: the one survivor listing, nonzero-ps-proof)
 
 # #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
 pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
@@ -1682,6 +1683,94 @@ class TestFrozenBaselineSanity(unittest.TestCase):
 # These cells carry NO GNU/Linux skip: they run on whatever host has a
 # usable identity + holder method, i.e. on Darwin too.
 # ===========================================================================
+
+
+# ===========================================================================
+# #4375 -- a FIFO planted at $ENGRAM_HOME/daemon-launch-attempt hung the
+# launcher forever. The last thing the launcher does is `date +%s > <stamp>`;
+# opening a FIFO for writing with no reader blocks, so the launcher (and its
+# subshell) never exited: four processes per run of the surface hook's FIFO
+# cells, measured on a Mac. The same hazard class #3628 closed for the hooks
+# and the daemon; a launcher that hangs on every prompt would pile up.
+# ===========================================================================
+
+
+class TestLauncherStampOnAFifo4375(_ForceUnsupervisedMixin, _SocketGuardFixture):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self._no_launcher_of_this_home_survives)
+
+    def _no_launcher_of_this_home_survives(self):
+        """Reviewer-fairy round 1 on #4386 (suggestion 3): under the stamp mutant these cells left two
+        launchers behind and nothing said so. Any start-engram-daemon.sh whose environment names this
+        cell's home is killed, and its existence fails the cell."""
+        left = _launcher_survivors.surviving_launchers(str(self.engram_home))
+        for pid in left:
+            try:
+                os.kill(int(pid), 9)
+            except OSError:
+                pass
+        self.assertEqual(left, [], f"a launcher of this cell's home survived (pids {left}); see #4375")
+
+    def _stamp(self):
+        return self.engram_home / "daemon-launch-attempt"
+
+    def test_a_fifo_at_the_stamp_path_does_not_hang_the_launcher(self):
+        os.mkfifo(self._stamp())
+        try:
+            result = self._run(timeout=20.0)
+        except subprocess.TimeoutExpired:
+            self.fail("the launcher hung opening a FIFO at daemon-launch-attempt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_fifo_is_left_alone_and_no_stamp_is_written_through_it(self):
+        os.mkfifo(self._stamp())
+        try:
+            self._run(timeout=20.0)
+        except subprocess.TimeoutExpired:
+            self.fail("the launcher hung opening a FIFO at daemon-launch-attempt")
+        self.assertTrue(stat.S_ISFIFO(self._stamp().lstat().st_mode), "the FIFO must not be replaced")
+
+    def test_a_fifo_at_the_log_path_does_not_hang_the_launcher_either(self):
+        """The class, not the instance: every append to $LOG_PATH opens it for writing too."""
+        if self.log_path.exists():
+            self.log_path.unlink()
+        os.mkfifo(self.log_path)
+        try:
+            result = self._run(timeout=20.0)
+        except subprocess.TimeoutExpired:
+            self.fail("the launcher hung opening a FIFO at surface-daemon.log")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_symlink_at_the_log_path_is_not_appended_through(self):
+        """Reviewer-fairy round 1 on #4386 (suggestion 1): nothing tested the symlink arm of the log
+        guard; weakening `[ -L ]` left every cell green. A symlink to a regular file is the shape that
+        shows it, because `[ ! -f ]` alone would follow the link."""
+        target = self.engram_home.parent / "log-target"
+        target.write_text("keep")
+        if self.log_path.exists() or self.log_path.is_symlink():
+            self.log_path.unlink()
+        os.symlink(str(target), str(self.log_path))
+        self._run(timeout=20.0)
+        self.assertEqual(target.read_text(), "keep")
+
+    def test_control_a_regular_stamp_is_still_written(self):
+        result = self._run(timeout=20.0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self._stamp().is_file())
+        self.assertRegex(self._stamp().read_text().strip(), r"^[0-9]+$")
+
+    def test_control_a_stale_regular_stamp_is_refreshed(self):
+        self._stamp().write_text("1")
+        self._run(timeout=20.0)
+        self.assertNotEqual(self._stamp().read_text().strip(), "1")
+
+    def test_a_symlink_at_the_stamp_path_is_not_written_through(self):
+        target = self.tmp_path / "elsewhere" if hasattr(self, "tmp_path") else self.engram_home.parent / "elsewhere"
+        target.write_text("keep")
+        os.symlink(str(target), str(self._stamp()))
+        self._run(timeout=20.0)
+        self.assertEqual(target.read_text(), "keep")
 
 
 class TestSocketGuardPortableContract(_ForceUnsupervisedMixin, _SocketGuardFixture):
