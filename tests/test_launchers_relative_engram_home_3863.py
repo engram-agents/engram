@@ -25,6 +25,7 @@ empty treated as relative.
 import hashlib
 import itertools
 import os
+import platform
 import re
 import stat
 import subprocess
@@ -311,6 +312,21 @@ def _all(r, scr):
     return r.stdout + r.stderr + scr.calls()
 
 
+def _service_manager():
+    """The service-manager command the surface script calls on THIS host (it reads `uname -s`, which the
+    harness does not stub)."""
+    return "launchctl" if platform.system() == "Darwin" else "systemctl"
+
+
+def _svc_log(r, scr):
+    """Only the log lines the SCRIPT made to the service manager. The `python3` stub also writes a line to
+    the log (its discovery probe), so the whole log proves nothing about home handling (#4349)."""
+    prefix = _service_manager() + " "
+    return "".join(ln + "\n" for ln in scr.calls().splitlines() if ln.startswith(prefix))
+
+
+SURFACE = "src/engram/tools/setup-surface-daemon-service.sh"
+
 PROBES = {
     "src/engram/hooks/claude/start-engram-daemon.sh": Probe(prep=_mk, evidence=_log, env_proof=True, stdin=SESSION_PAYLOAD),
     "src/engram/hooks/claude/start-engramd-owner.sh": Probe(prep=_mk, evidence=_log, env_proof=True, stdin=SESSION_PAYLOAD),
@@ -319,7 +335,10 @@ PROBES = {
     "src/engram/tools/engramd-owner-home-key.sh": Probe(
         prep=_mk, evidence=_all,
         cmd=lambda s: ["bash", "-c", '. "$1"; printf "%s\\n" "$ENGRAM_HOME"; engramd_owner_home_key "$ENGRAM_HOME"', "_", s]),
-    "src/engram/tools/setup-surface-daemon-service.sh": Probe(prep=_mk, evidence=_log, env_proof=True),
+    # login_prep=_venv_stub: without the venv python the script's discovery runs the `python3` stub, gets an empty
+    # string and exits 1 before any home handling (#4349). --allow-path: the #3519 ephemeral-path refusal runs
+    # before the OS branch and fires when the repo under test sits in a temp root or `.claude/worktrees/`.
+    SURFACE: Probe(prep=_mk, args=("--allow-path",), login_prep=_venv_stub, evidence=_svc_log, env_proof=True),
     "src/engram/tools/operator-setup-viz.sh": Probe(prep=_mk, evidence=_log, env_proof=True),
     "src/engram/tools/install-local-marketplace.sh": Probe(
         prep=_mk, args=("--skip-build", "--skip-add", "--allow-untagged"), evidence=_log, env_proof=True),
@@ -364,7 +383,7 @@ def test_L2_an_absolute_engram_home_proceeds_past_the_guard(rel, tmp_path):
     home = tmp_path / "abs" / "store"
     r = _probe_run(rel, scr, str(home), home)
     ev = _past_the_guard(rel, scr, r)
-    if rel.endswith("clear-stale-engram-daemon.sh") or PROBES[rel].evidence in (_log, _all) or "uninstall" in rel:
+    if rel.endswith("clear-stale-engram-daemon.sh") or PROBES[rel].evidence in (_log, _all, _svc_log) or "uninstall" in rel:
         assert str(home) in ev, ev[:400]
 
 
@@ -372,8 +391,32 @@ def test_L2_an_absolute_engram_home_proceeds_past_the_guard(rel, tmp_path):
 def test_L2_an_absolute_engram_home_containing_a_space_is_not_refused(rel, tmp_path):
     scr = Scratch(tmp_path)
     home = tmp_path / "x y" / "store"
+    if rel == SURFACE:
+        return _surface_space_cell(scr, home)
     r = _probe_run(rel, scr, str(home), home)
     _past_the_guard(rel, scr, r)
+
+
+def _surface_space_cell(scr, home):
+    """The surface script allows a space in ENGRAM_HOME on Darwin (the plist carries it) and refuses it on
+    Linux (#4336: systemd splits on whitespace). The expectation follows the host the script will read."""
+    pr = PROBES[SURFACE]
+    pr.prep(home)
+    if pr.login_prep:
+        pr.login_prep(scr.home)
+    before = scr.snapshot()
+    r = run(scr, SURFACE, str(home), pr.args)
+    if platform.system() == "Darwin":
+        ev = _past_the_guard(SURFACE, scr, r)
+        assert "launchctl " in ev, ev[:400]
+        assert r.returncode == 0, (r.returncode, r.stderr[-300:])
+        return
+    # count the ERROR line by prefix: --allow-path adds a WARN line on stderr when the repo sits in a temp root
+    lines = [ln for ln in r.stderr.splitlines() if ln.startswith("ERROR:")]
+    assert r.returncode == 2, (r.returncode, r.stderr[-300:])
+    assert len(lines) == 1 and "ENGRAM_HOME contains a space character" in lines[0], r.stderr[-400:]
+    assert _svc_log(r, scr) == "", "a service-manager call ran before the refusal: " + scr.calls()[:300]
+    assert scr.snapshot() == before, "the refusal wrote something under HOME or cwd"
 
 
 @pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
@@ -402,7 +445,7 @@ def test_L4_a_leading_tilde_expands_to_HOME_and_is_accepted(rel, raw, tmp_path):
     pr = PROBES[rel]
     if pr.env_proof:
         # a child process (the recording stub) saw the EXPANDED value in its environment
-        assert ("EH=%s" % home) in scr.calls(), scr.calls()[:400]
+        assert ("EH=%s" % home) in ev, ev[:400]
         assert "EH=~" not in scr.calls()
     elif pr.evidence in (_stdout, _stderr, _all) and "monitor" not in rel and "forum-service" not in rel:
         assert str(home) in ev, ev[:400]
