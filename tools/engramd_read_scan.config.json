@@ -510,6 +510,8 @@
   "hooks/claude/engram-surface-hook.py:check_write_reminder",
   "hooks/claude/engram-surface-hook.py:check_feeling_nudge_marker",
   "hooks/claude/engram-surface-hook.py:check_repair_marker",
+  "hooks/claude/engram-surface-hook.py:check_nap_backstop_refusal",
+  "hooks/claude/engram-surface-hook.py:mark_nap_backstop_refusal_surfaced",
   "hooks/claude/engram-surface-hook.py:check_warm_briefing",
   "hooks/claude/engram-surface-hook.py:check_error_patterns",
   "hooks/claude/engram-surface-hook.py:check_principle_triggers",

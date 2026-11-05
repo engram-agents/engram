@@ -3598,6 +3598,68 @@ def check_feeling_nudge_marker() -> str:
     )
 
 
+def check_nap_backstop_refusal(session_id=None) -> tuple:
+    """(line, pair) when the Stop-hook backstop's last attempt to request compaction failed (#4350), else ("", None).
+
+    The backstop (engram-nap-compact-backstop-stop.py) records every attempt in
+    ``compact/backstop-last.json``; its stderr never reaches the agent, so a refused request
+    (e.g. a warm briefing older than the checkpoint) used to go unseen. This reads that record and,
+    for outcome refused/error/timeout, returns the line for the (checkpoint_at, briefing_mtime_ns)
+    pair it describes, unless ``compact/backstop-surfaced.json`` already holds that pair. A record
+    with a non-empty ``session_id`` different from `session_id` is another session's: no line.
+    It WRITES NOTHING: the stamp is ``mark_nap_backstop_refusal_surfaced(pair)``, which main() calls
+    only after emit_context rendered a context that holds the line. Any read or parse failure is
+    silent: this never raises.
+    """
+    try:
+        compact_dir = os.path.join(ENGRAM_HOME, "compact")
+        with open_regular_text(os.path.join(compact_dir, "backstop-last.json"), encoding="utf-8") as f:
+            last = json.load(f)
+        if not isinstance(last, dict) or last.get("outcome") not in ("refused", "error", "timeout"):
+            return "", None
+        record_session = last.get("session_id")
+        if isinstance(record_session, str) and record_session and record_session != session_id:
+            return "", None
+        pair = [last.get("checkpoint_at"), last.get("briefing_mtime_ns")]
+        if not isinstance(pair[0], str) or not pair[0]:
+            return "", None
+        try:
+            with open_regular_text(os.path.join(compact_dir, "backstop-surfaced.json"), encoding="utf-8") as f:
+                seen = json.load(f)
+        except (OSError, ValueError):
+            seen = None
+        if isinstance(seen, dict) and [seen.get("checkpoint_at"), seen.get("briefing_mtime_ns")] == pair:
+            return "", None
+        reason = last.get("reason")
+        reason = " ".join(reason.split())[:300] if isinstance(reason, str) and reason.strip() else "the request was not written"
+        return (
+            f"[Nap compaction not requested: {reason}. Fix it and nap again (the engram-nap skill); "
+            "the context will fill until auto-compaction otherwise.]"
+        ), pair
+    except Exception:  # noqa: BLE001 - a prompt hook never fails on an advisory line
+        return "", None
+
+
+def mark_nap_backstop_refusal_surfaced(pair) -> None:
+    """Remember `pair` (from check_nap_backstop_refusal) in ``compact/backstop-surfaced.json``.
+
+    Written with engram_config_io.write_config_json, the backstop's own writer. Call it only once the
+    line was really shown. A failed write means the line may repeat on the next prompt, never be lost.
+    Never raises.
+    """
+    try:
+        runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_config_io.py")
+        if runtime_dir not in sys.path:
+            sys.path.insert(0, runtime_dir)
+        from engram_config_io import write_config_json
+        write_config_json(
+            os.path.join(ENGRAM_HOME, "compact", "backstop-surfaced.json"),
+            {"checkpoint_at": pair[0], "briefing_mtime_ns": pair[1]},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def check_repair_marker() -> str:
     """Check if the PreToolUse repair hook fixed a malformed tool call."""
     # OSError handling on the read: see check_write_reminder.
@@ -4867,6 +4929,12 @@ def _main_impl():
     if repair_notice:
         body_blocks.append(repair_notice)
 
+    # Nap-compaction backstop refusal (#4350): once per refused attempt, in the HEAD (the part
+    # emit_context keeps first). The stamp is written after the render, only if the line is in it.
+    nap_refusal, nap_refusal_pair = check_nap_backstop_refusal(hook_input.get("session_id"))
+    if nap_refusal:
+        head_blocks.append(nap_refusal)
+
     # Feeling-nudge (post-compact wake-up). Read-only — does NOT clear the
     # marker; only engram_report_feeling clears it.
     feeling_nudge = check_feeling_nudge_marker()
@@ -4939,6 +5007,11 @@ def _main_impl():
     _kept_blocks: list = []
     response = _assemble_response(head_blocks, body_blocks, _kept_blocks)
     print(json.dumps(response if response else {}))
+    # #4350: stamp the refusal pair only now, and only if the rendered context really holds the line
+    # (emit_context reports kept BODY indices only, so the head is checked on the output itself: the
+    # line is one line, and the head is trimmed at line boundaries).
+    if nap_refusal and nap_refusal in str(response.get("hookSpecificOutput", {}).get("additionalContext", "")):
+        mark_nap_backstop_refusal_surfaced(nap_refusal_pair)
     # #3621: the ALL-OR-NOTHING shown record, written only now that the response
     # was printed (a print that raised never reaches this). The fire's shown ids
     # are recorded only if the recall block (body index `_nudge_index`) was

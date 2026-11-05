@@ -20,7 +20,7 @@ Cells:
       (with the request gone: only backstop-last can say so)
   B3  a refusal is recorded and not retried; a new briefing write re-arms it
   B4  config ``compaction.nap_backstop`` false -> no run;  B4b config absent -> runs
-  B5  no loop marker -> no run
+  B5  no loop marker -> runs all the same (#4350 dropped the loop gate; was: no run)
   B6  a request since the checkpoint -> no run (pending: by requested_at; consumed tombstone: by mtime);
       older -> runs
   B10 the record's session differs from the Stop payload's -> no run; a null record session -> runs
@@ -368,11 +368,13 @@ def test_b4c_only_a_literal_false_turns_it_off(config_text, tmp_path, stub_plugi
 # B5 / B6 / B7 / B8 / B9
 # ---------------------------------------------------------------------------
 
-def test_b5_no_loop_marker_means_no_run(tmp_path, stub_plugin):
+def test_b5_no_loop_marker_still_runs(tmp_path, stub_plugin):
+    """#4350 (Lei, 2026-11-04): compaction after a passing nap is the default in every session. This cell
+    used to assert that no loop marker meant no run; the loop-mode.json gate is gone."""
     home = make_home(tmp_path, loop=False)
     done = stop(home, stub_plugin)
     assert done.returncode == 0
-    assert stub_calls(home) == []
+    assert stub_calls(home) == [["--session", SESSION]]
 
 
 @pytest.mark.parametrize("consumed", [False, True], ids=["pending", "consumed"])
@@ -476,7 +478,8 @@ def test_b7_stdin_without_session_id_means_no_run_and_one_stderr_line(tmp_path, 
 
 
 def test_b7b_missing_session_id_is_silent_when_nothing_was_due(tmp_path, stub_plugin):
-    home = make_home(tmp_path, loop=False)
+    home = make_home(tmp_path)
+    _write_json(home / "config.json", {"compaction": {"nap_backstop": False}})  # nothing due (was: no loop marker, #4350)
     done = stop(home, stub_plugin, session_id=None)
     assert done.returncode == 0 and done.stderr.strip() == ""
 

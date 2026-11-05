@@ -254,8 +254,8 @@ If the nap fired because a compaction warning is active, explicitly say: "Ready 
 
 Last, after Step 5b and the focus rotation (Step 7): the context the tool assembles carries the focus list and the warm-briefing arc, so both must be final. This step only leaves a request; the `engram-compaction` mod, if the person has installed it (it is on by default once installed; `enabled: false` turns it off), acts on it at the end of the answered turn that runs this step, so end the turn normally and do not tell the person it will compact "next turn". With the mod off the request is never read (the files stay on disk; an unconsumed request ages out after 30 minutes).
 
-- **A loop marker exists** (`~/.engram/loop-mode.json`, under `$ENGRAM_HOME`, default `~/.engram`): run the tool, no question.
-- **No loop marker:** ask first, once — "Compact now? The nap just persisted everything." — and run the tool only on yes. On a no, run `"$HOME/.engram/venv/bin/python3" tools/compact-request.py --clear`, and check that it exits 0. Exit 4 means a file could not be removed, and stderr names it; if it names the old request, that request can still compact, so say so once. Never retry in a loop.
+- If `compaction.nap_backstop` is `false` in `~/.engram/config.json` (under `$ENGRAM_HOME`, default `~/.engram`; absent or any other value means on), skip this step and say in that turn's reply that compaction after a nap is switched off.
+- Otherwise run the tool, with no question, in every session (loop or not). The Stop-hook backstop reads the same switch, so one setting governs both paths.
 
 ```bash
 "$HOME/.engram/venv/bin/python3" tools/compact-request.py --session <your session id> --backup-ok <true|false>

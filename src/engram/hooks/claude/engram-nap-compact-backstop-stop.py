@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Stop hook: the mechanical backstop for the nap skill's last step (#4012, part of #3640).
+"""Stop hook: the mechanical backstop for the nap skill's last step (#4012, #4350, part of #3640).
 
 The engram-nap skill ends by running ``tools/compact-request.py`` (Step 9), which leaves the request
 the compaction mod acts on. That step is prose an agent can skip. Lei, 2026-10-21: "make it
 mechanical instead of needing your cognitive remember, like a step in a skill" -- and a hook is
 "easier to turn this feature on and off". This hook runs the same tool when the evidence of a
-finished nap exists and the skill path did not run.
+finished nap exists and the skill path did not run. It runs in EVERY session, loop or not (Lei,
+2026-11-04: "I'd like the auto-after-nap-compaction to be a default feature and power users can opt
+out", #4350): the one opt-out is the switch in condition 1, which the skill's Step 9 reads too.
 
 It runs ``compact-request.py --session <stdin session_id>`` (no ``--backup-ok``, so the checkpoint's
 own record ``compact/last-checkpoint.json`` supplies the verdict) only when ALL of these hold:
 
   1. the switch is on: ``$ENGRAM_HOME/config.json`` -> ``compaction.nap_backstop``; an absent or
      unreadable config is ON, only a literal ``false`` is OFF;
-  2. ``$ENGRAM_HOME/loop-mode.json`` exists (outside a loop the skill asks the person first);
-  3. ``compact/last-checkpoint.json`` is a record with a parseable ``checkpoint_at`` that is later
+  2. ``compact/last-checkpoint.json`` is a record with a parseable ``checkpoint_at`` that is later
      than ``last-compact-at.json``'s ``timestamp`` (a missing compact record counts as older);
-  4. no request for this checkpoint exists. A pending ``compact/request.json`` counts when its
+  3. no request for this checkpoint exists. A pending ``compact/request.json`` counts when its
      ``requested_at`` is at or after ``checkpoint_at``; the mod's consumed tombstone
      (``{consumed, request_id}``) carries no time, so it counts when the file's mtime is at or after
      ``checkpoint_at``. ``compact-request.py`` removes any older request before it writes, so a
@@ -23,11 +24,11 @@ own record ``compact/last-checkpoint.json`` supplies the verdict) only when ALL 
      PostCompact has stamped ``last-compact-at.json`` yet, and when a compaction was vetoed and
      PostCompact never stamps (the skill path already ran, or the backstop did). A request file
      that does not parse reads as absent, as the mod reads it;
-  5. this exact (``checkpoint_at``, warm-briefing mtime) pair is not the one in
+  4. this exact (``checkpoint_at``, warm-briefing mtime) pair is not the one in
      ``compact/backstop-last.json``. Every attempt, success or refusal, is recorded there, so a
      refusal is not retried on every turn; a new checkpoint or a new briefing write re-arms it;
-  6. the stdin payload carries a ``session_id`` (checked last, so a Stop with nothing due is silent);
-  7. the record's ``session_id`` and the payload's are not two different non-empty strings (a
+  5. the stdin payload carries a ``session_id`` (checked last, so a Stop with nothing due is silent);
+  6. the record's ``session_id`` and the payload's are not two different non-empty strings (a
      shared ENGRAM_HOME must not compact a session that did not nap); if either is null or empty
      the guard does not apply.
 
@@ -39,8 +40,11 @@ Output: NOTHING on stdout on any path (a Stop hook's only sanctioned stdout is `
 which would force another turn; ``tests/test_hooks_json_stdout_audit.py`` forbids
 ``hookSpecificOutput`` for Stop). On success the outcome is in ``compact/backstop-last.json`` plus ONE
 stderr line, ``nap backstop: compaction requested``; the compaction itself is the visible effect. On a
-refusal, timeout or error, ONE stderr line naming the exit code and the tool's first stderr line.
-It ALWAYS exits 0 and never blocks the turn.
+refusal, timeout or error, ONE stderr line naming the exit code and the tool's first stderr line, and
+the record also carries ``reason`` (that first stderr line, or a short fixed string for a timeout or
+error, at most 300 characters; a success records none). Stderr is not shown to the agent, so the
+UserPromptSubmit surface hook reads that record on the next prompt and says so once per refused
+attempt (#4350). It ALWAYS exits 0 and never blocks the turn.
 
 ``compact-request.py`` is found via ``$CLAUDE_PLUGIN_ROOT/tools/`` first, then by walking this
 file's own tree (``_hooklib.bounded_parents``, never above the tree root, #3983) for
@@ -151,19 +155,24 @@ def _briefing_mtime_ns() -> int | None:
         return None
 
 
-def _record_attempt(checkpoint_at: str, mtime_ns, outcome: str, exit_code) -> None:
+REASON_MAX_CHARS = 300
+
+
+def _record_attempt(checkpoint_at: str, mtime_ns, outcome: str, exit_code, reason: str | None = None,
+                    session_id: str | None = None) -> None:
+    record = {
+        "checkpoint_at": checkpoint_at,
+        "briefing_mtime_ns": mtime_ns,
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "session_id": session_id,  # the Stop payload's session, so the surface hook shows it to that session only
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if reason:
+        record["reason"] = reason[:REASON_MAX_CHARS]
     try:
         os.makedirs(COMPACT_DIR, exist_ok=True)
-        write_config_json(
-            os.path.join(COMPACT_DIR, "backstop-last.json"),
-            {
-                "checkpoint_at": checkpoint_at,
-                "briefing_mtime_ns": mtime_ns,
-                "outcome": outcome,
-                "exit_code": exit_code,
-                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            },
-        )
+        write_config_json(os.path.join(COMPACT_DIR, "backstop-last.json"), record)
     except Exception as exc:  # noqa: BLE001
         _say("could not record the attempt: %s: %s" % (type(exc).__name__, exc))
 
@@ -188,8 +197,6 @@ def _due():
     """(checkpoint_at, briefing_mtime_ns, record_session_id) when every condition but the stdin
     session_id holds, else None."""
     if not _switch_on():
-        return None
-    if not os.path.exists(os.path.join(ENGRAM_HOME, "loop-mode.json")):
         return None
     record = _read_json(os.path.join(COMPACT_DIR, "last-checkpoint.json"))
     if not isinstance(record, dict):
@@ -228,7 +235,7 @@ def main() -> None:
     tool = _find_tool()
     if tool is None:
         _say("%s not found under CLAUDE_PLUGIN_ROOT/tools or any parent's tools/" % (TOOL_NAME,))
-        _record_attempt(checkpoint_at, mtime_ns, "error", None)
+        _record_attempt(checkpoint_at, mtime_ns, "error", None, "%s not found" % (TOOL_NAME,), session_id=session_id)
         return
     try:
         done = subprocess.run(
@@ -237,19 +244,20 @@ def main() -> None:
         )
     except subprocess.TimeoutExpired:
         _say("%s timed out after %ds" % (TOOL_NAME, TOOL_TIMEOUT_SECONDS))
-        _record_attempt(checkpoint_at, mtime_ns, "timeout", None)
+        _record_attempt(checkpoint_at, mtime_ns, "timeout", None, "%s timed out after %ds" % (TOOL_NAME, TOOL_TIMEOUT_SECONDS), session_id=session_id)
         return
     except OSError as exc:
         _say("could not run %s: %s" % (TOOL_NAME, exc))
-        _record_attempt(checkpoint_at, mtime_ns, "error", None)
+        _record_attempt(checkpoint_at, mtime_ns, "error", None, "could not run %s" % (TOOL_NAME,), session_id=session_id)
         return
     if done.returncode == 0:
-        _record_attempt(checkpoint_at, mtime_ns, "written", 0)
+        _record_attempt(checkpoint_at, mtime_ns, "written", 0, session_id=session_id)
         sys.stderr.write(SUCCESS_LINE + "\n")
         return
     first = next((ln.strip() for ln in done.stderr.splitlines() if ln.strip()), "")
     _say("%s exited %d: %s" % (TOOL_NAME, done.returncode, first))
-    _record_attempt(checkpoint_at, mtime_ns, "refused" if done.returncode == 3 else "error", done.returncode)
+    _record_attempt(checkpoint_at, mtime_ns, "refused" if done.returncode == 3 else "error", done.returncode,
+                    first or "%s exited %d" % (TOOL_NAME, done.returncode), session_id=session_id)
 
 
 if __name__ == "__main__":
