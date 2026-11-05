@@ -5,11 +5,13 @@
 #
 # Why it exists: the surface daemon's startup gate (#3361, exit 75 HELD / exit
 # 76 UNPROVEN) refuses to unlink recall-daemon.sock unless it can POSITIVELY
-# show nobody holds it. On macOS there is no /proc/net/unix, so a crash-stale
-# socket (SIGKILL, OOM, power loss) cannot be told apart from a live holder
-# owned by another user, and the daemon keeps refusing. No heuristic may decide
-# "stale" automatically (an own-uid socket whose only live reference is an fd
-# queued via SCM_RIGHTS looks exactly like a dead one to lsof). This verb is
+# show nobody holds it. Since the daemon takes a lifetime lock (alpha #4374), a
+# crash-stale socket (SIGKILL, OOM, power loss) on macOS is cleared by the
+# daemon itself whenever the lock is usable and no other same-uid daemon process
+# is listed. This verb remains for an UNUSABLE lock directory, and for a holder
+# that does not take the lock (an older daemon). No heuristic may decide
+# "stale" automatically there (an own-uid socket whose only live reference is an
+# fd queued via SCM_RIGHTS looks exactly like a dead one to lsof). This verb is
 # the human's deliberate decision to clear it.
 #
 # What it does: unlinks the daemon's socket and pidfile -- exactly those two

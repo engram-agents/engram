@@ -330,8 +330,106 @@ def test_T8_no_launch_path_or_unit_references_the_script():
     for t in targets:
         text = t.read_text(errors="replace")
         if "clear-stale" in text or SCRIPT.name in text:
-            offenders.append(str(t.relative_to(REPO_ROOT)))
+            if t.name in _MAY_NAME_THE_VERB_IN_A_MESSAGE:
+                offenders += _verb_uses_that_are_not_a_printed_remedy(t, text)
+            else:
+                offenders.append(str(t.relative_to(REPO_ROOT)))
     assert offenders == []
+
+
+# #4374 rider 2 (Kepler, accepted on the issue): the daemon's exit-76 lines and the launcher's refusal line
+# NAME this verb as the remedy a human runs. What this contract forbids is INVOCATION from the launch path,
+# not a printed sentence, so those two files may mention it, and only as the text of a message: in the
+# daemon every string that carries the name is an argument of print(); in the launcher every line that
+# carries it is a _log_socket_guard line. Any other mention, in these files or any other, still fails.
+_MAY_NAME_THE_VERB_IN_A_MESSAGE = {"engram-surface-daemon.py", "start-engram-daemon.sh"}
+
+
+def _verb_uses_that_are_not_a_printed_remedy(path, text):
+    return _verb_uses(str(path.relative_to(REPO_ROOT)), path.suffix, text)
+
+
+_LOG_LINE = re.compile(r'^\s*_log_socket_guard "([^"]*)"\s*$')
+
+
+def _verb_uses(rel, suffix, text):
+    """Every place `text` (a launcher .sh or the daemon .py) names the verb other than as a printed
+    remedy. Kepler's condition on #4376 (comment 6670881651): the first version admitted anything on a
+    _log_socket_guard line and anything under a print(...) subtree, so four INVOCATIONS passed.
+      launcher: a line carrying the name must be exactly one `_log_socket_guard "<single quoted
+                argument>"`: no second command, no inner quote, no command substitution in the argument.
+      daemon:   the string constant must sit inside print(...) with NO other Call between the print and
+                the string (an f-string or a concatenation is fine; a subprocess.run(...) or
+                os.system(...) argument is not).
+    """
+    bad = []
+    if suffix == ".sh":
+        for n, line in enumerate(text.splitlines(), 1):
+            if "clear-stale" not in line and SCRIPT.name not in line:
+                continue
+            m = _LOG_LINE.match(line)
+            if not m or "$(" in m.group(1) or "`" in m.group(1):
+                bad.append(f"{rel}:{n}")
+        return bad
+    import ast
+
+    tree = ast.parse(text)
+    parent = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if "clear-stale" in node.value or SCRIPT.name in node.value:
+                cur, ok = parent.get(node), False
+                while cur is not None:
+                    if isinstance(cur, ast.Call):
+                        ok = getattr(cur.func, "id", None) == "print"
+                        break  # the FIRST enclosing Call decides: it must be print itself
+                    cur = parent.get(cur)
+                if not ok:
+                    bad.append(f"{rel}:{node.lineno}")
+    return bad
+
+
+_V = "clear-stale-engram-daemon.sh"
+
+
+@pytest.mark.parametrize("line", [
+    f'_log_socket_guard "refused; a human runs {_V} --yes"',
+    f'    _log_socket_guard "refusing to remove ${{SOCKET_PATH}} -- ${{_why}}. run {_V} --yes, then re-run"',
+])
+def test_T8b_honest_launcher_remedy_is_allowed(line):
+    assert _verb_uses("x.sh", ".sh", line + "\n") == []
+
+
+@pytest.mark.parametrize("line", [
+    f'"$DIR/{_V}" --yes',
+    f'_log_socket_guard "stale socket" && "$DIR/{_V}" --yes',
+    f'_log_socket_guard "$("$DIR/{_V}" --yes 2>&1)"',
+    f'_log_socket_guard "x $({_V} --yes)"',
+    f'_log_socket_guard "x `{_V} --yes`"',
+    f'_log_socket_guard "stale" ; {_V} --yes',
+    f'_log_socket_guard "stale" | {_V}',
+])
+def test_T8b_launcher_invocations_are_refused(line):
+    assert _verb_uses("x.sh", ".sh", line + "\n") != []
+
+
+def test_T8b_honest_daemon_remedy_is_allowed():
+    src = f'print("run {_V} --yes")\nprint(f"a {{x}} human runs {_V} --yes", file=sys.stderr)\n'
+    assert _verb_uses("x.py", ".py", src) == []
+
+
+@pytest.mark.parametrize("src", [
+    f'X = "{_V}"\n',
+    f'print(subprocess.run(["{_V}", "--yes"]))\n',
+    f'print("rc", os.system("{_V} --yes"))\n',
+    f'subprocess.run(["{_V}", "--yes"])\n',
+    f'print(len("{_V}"))\n',
+])
+def test_T8b_daemon_invocations_and_plain_mentions_are_refused(src):
+    assert _verb_uses("x.py", ".py", src) != []
 
 
 def test_T9_print_paths_prints_two_paths_touches_nothing(home):

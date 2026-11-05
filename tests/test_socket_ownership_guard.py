@@ -1017,9 +1017,16 @@ class TestOrphanedSocketAllowsDelete(_ForceUnsupervisedMixin, _SocketGuardFixtur
         content = "\n".join(self._log_lines())
 
         if not _HAS_PROC:
-            # No /proc: the guard is refuse-only (lsof rc 1 is UNKNOWN).
+            # No /proc: the launcher deletes nothing on lsof rc 1 (UNKNOWN) and
+            # launches the daemon, whose lifetime-lock gate decides (#4374 D5).
             self.assertTrue(self.socket_path.exists())
-            self.assertIn("socket-guard: refusing", content)
+            self.assertIn("socket-guard: NOT removing", content)
+            self.assertIn("launching the daemon", content)
+            self.assertNotIn("NOT launching", content)
+            self.assertTrue(
+                self._wait_for_relaunch_marker(),
+                "the launcher must launch the daemon on lsof rc 1 (its gate decides)\n" + content,
+            )
             return
         self.assertNotIn("socket-guard", content)
         self.assertTrue(self._wait_for_relaunch_marker())
@@ -1055,11 +1062,18 @@ class TestHeldByKilledPidAllowsDelete(_ForceUnsupervisedMixin, _SocketGuardFixtu
         self.assertRegex(content, re.compile(r"reap matched 1 stale process\(es\):"))
         if not _HAS_PROC:
             # No /proc: real lsof reports rc 1 after the holder exits, which
-            # is UNKNOWN -> refuse-only (the exempt-and-removed path is
-            # covered with a shim in the C6 cells).
+            # is UNKNOWN -> nothing deleted, daemon launched, its lock-backed
+            # gate decides (#4374 D5; the exempt-and-removed path is covered
+            # with a shim in the C6 cells).
             self.holder.wait(timeout=3)
             self.assertTrue(self.socket_path.exists())
-            self.assertIn("socket-guard: refusing", content)
+            self.assertIn("socket-guard: NOT removing", content)
+            self.assertIn("launching the daemon", content)
+            self.assertNotIn("NOT launching", content)
+            self.assertTrue(
+                self._wait_for_relaunch_marker(),
+                "the launcher must launch the daemon on lsof rc 1 (its gate decides)\n" + content,
+            )
             return
         self.assertNotIn("socket-guard", content)
         self.assertTrue(self._wait_for_relaunch_marker())
@@ -1336,9 +1350,16 @@ class TestRaceDetectionBlocksEvenWithoutALiveHolder(_ForceUnsupervisedMixin, _So
         content = "\n".join(self._log_lines())
 
         if not _HAS_PROC:
-            # No /proc: refuse-only guard keeps the orphan.
+            # No /proc: the launcher keeps the orphan (lsof rc 1 is UNKNOWN)
+            # and launches the daemon, whose lock-backed gate decides (#4374 D5).
             self.assertTrue(self.socket_path.exists())
-            self.assertIn("socket-guard: refusing", content)
+            self.assertIn("socket-guard: NOT removing", content)
+            self.assertIn("launching the daemon", content)
+            self.assertNotIn("NOT launching", content)
+            self.assertTrue(
+                self._wait_for_relaunch_marker(),
+                "the launcher must launch the daemon on lsof rc 1 (its gate decides)\n" + content,
+            )
             return
         self.assertNotIn("socket-guard", content)
         self.assertFalse(self.socket_path.exists())
@@ -1793,7 +1814,12 @@ class TestSocketGuardPortableContract(_ForceUnsupervisedMixin, _SocketGuardFixtu
     # CONTRACT (revised): on the no-/proc (lsof) branch lsof rc 1 is UNKNOWN,
     # never "orphan" (incomplete searches also exit 1; a connect() probe
     # cannot prove absence). Removal needs rc 0 with every pid a reap-killed
-    # pid that has exited. Orphan cleanup is unavailable there: refuse.
+    # pid that has exited. The launcher still never DELETES on rc 1 (#4374 D5),
+    # but it no longer refuses to LAUNCH: it launches the daemon without
+    # deleting anything and the daemon's lifetime-lock gate decides (a lock
+    # held elsewhere -> that daemon exits 0; HELD -> it refuses; the lock
+    # proves a stale socket unheld -> it unlinks). rc 0 with an unmatched pid
+    # is still a positive holder: refuse and do not launch.
     def _install_lsof(self, *, stderr_text="", rc=1, stdout_text=""):
         shim = self._fake_systemctl_dir / "lsof"
         lines = ["#!/bin/sh"]
@@ -1818,7 +1844,7 @@ class TestSocketGuardPortableContract(_ForceUnsupervisedMixin, _SocketGuardFixtu
         self.assertEqual(result.returncode, 0, result.stderr)
         content = "\n".join(self._log_lines())
         self._assert_kept(content)
-        self.assertIn("socket-guard: refusing", content)
+        self._assert_launched_without_deleting(content)
         self.assertIsNone(holder.poll())
         self.assertTrue(self._socket_still_functional())
 
@@ -1830,21 +1856,48 @@ class TestSocketGuardPortableContract(_ForceUnsupervisedMixin, _SocketGuardFixtu
         self.assertEqual(result.returncode, 0, result.stderr)
         content = "\n".join(self._log_lines())
         self._assert_kept(content)
-        self.assertIn("socket-guard: refusing", content)
+        self._assert_launched_without_deleting(content)
         self.assertIsNone(holder.poll())
         self.assertTrue(self._socket_still_functional())
 
     @_NO_PROC
-    def test_c5_iii_lsof_rc1_empty_both_genuine_orphan_is_kept_with_reason(self):
-        # Deliberately retires "orphan removed on no-/proc hosts".
+    def test_c5_iii_lsof_rc1_empty_both_genuine_orphan_is_kept_and_daemon_launched(self):
+        # Still retires "orphan removed by the LAUNCHER on no-/proc hosts"; the
+        # removal, when it is proven safe, is the daemon's (lifetime lock, #4374).
         self._orphan()
         self._install_lsof()
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stderr)
         content = "\n".join(self._log_lines())
         self._assert_kept(content)
-        self.assertIn("socket-guard: refusing", content)
+        self._assert_launched_without_deleting(content)
         self.assertIn("lsof exited 1", content)
+
+    @_NO_PROC
+    def test_c5_iv_lsof_rc0_with_an_unmatched_holder_still_refuses_and_does_not_launch(self):
+        """The control: a POSITIVE holder is never handed to the daemon."""
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        self._install_lsof(stdout_text=str(holder.pid), rc=0)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+        self.assertIn("NOT launching", content)
+        # #4374 rider 2: the refusal names the human-invoked remedy, not just "by hand".
+        self.assertIn("clear-stale-engram-daemon.sh --yes", content)
+        self.assertFalse(self._wait_for_relaunch_marker(timeout=2.0))
+        self.assertIsNone(holder.poll())
+
+    def _assert_launched_without_deleting(self, content):
+        """#4374 D5: rc 1 deletes nothing and launches the daemon, one named line."""
+        self.assertIn("socket-guard: NOT removing", content)
+        self.assertIn("launching the daemon", content)
+        self.assertNotIn("NOT launching", content)
+        self.assertTrue(
+            self._wait_for_relaunch_marker(),
+            "the launcher must launch the daemon on lsof rc 1 (its gate decides)\n" + content,
+        )
 
     # -- C6: a signaled pid is exempt only once it has actually exited -----
     def _reap_in_background(self, proc):

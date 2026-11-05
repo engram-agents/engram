@@ -874,6 +874,7 @@ case "$_supervisor_state" in
 
         _socket_post_stat="$(_stat_identity "$SOCKET_PATH")"
         _allow_socket_rm=1
+        _launch_unknown=0
         _refusal_reason=""
         if [ -z "$_socket_post_stat" ] && { [ -e "$SOCKET_PATH" ] || [ -L "$SOCKET_PATH" ]; }; then
             # (C1) the path IS on disk but no stat dialect could read its
@@ -1003,17 +1004,16 @@ def lsof_main():
     if r.returncode == 1:
         # rc 1 is UNKNOWN, never "orphan": lsof also exits 1 on a failed or
         # incomplete search (a holder it cannot inspect), -t can hide the
-        # warning, and no independent probe can prove absence (a socket
-        # bound but not yet listening refuses connect() and may listen
-        # later). Without positive evidence this branch only authorizes
-        # removal when every reported holder is a reap-killed pid that has
-        # exited (below). Orphan cleanup is therefore unavailable here: on
-        # hosts with no /proc the guard is refuse-only, and a refusal means
-        # the hook does NOT launch (C8): a launched daemon's own startup
-        # gate could steal the socket from a holder lsof could not see
-        # (#3361).
-        print('lsof exited 1 (no holder reported, but that is not proof of absence: its search may have been incomplete) -- refusing to delete without positive evidence of who holds the socket')
-        sys.exit(1)
+        # warning, and no independent probe can prove absence. So this
+        # branch deletes nothing. It exits 2 (#4374), a code distinct from
+        # every refusal: UNKNOWN, delete nothing but launch. The shell
+        # then launches the daemon, whose lifetime-lock gate decides: a
+        # live daemon holds the lock (the new one exits 0), a dead one's
+        # lock is gone (the stale socket is proven unheld and removed), and
+        # a non-daemon holder lsof could not see is still caught by the
+        # daemon's own HELD check where it can be seen (#3361).
+        print('lsof exited 1 (no holder reported, but that is not proof of absence: its search may have been incomplete) -- deleting nothing')
+        sys.exit(2)
     for pid in pids:
         if pid in killed_pids:
             # Exempt only once it has actually exited.
@@ -1075,7 +1075,13 @@ for inode in inodes:
 sys.exit(0)
 " $_stale_pids)"
             _holder_rc=$?
-            if [ "$_holder_rc" -ne 0 ]; then
+            if [ "$_holder_rc" -eq 2 ]; then
+                # (#4374 D5) lsof rc 1: UNKNOWN. Delete nothing, but launch:
+                # the daemon's lifetime-lock gate decides.
+                _allow_socket_rm=0
+                _launch_unknown=1
+                _log_socket_guard "NOT removing ${SOCKET_PATH} (lsof exited 1: no holder reported, which is not proof of absence); launching the daemon so its lifetime-lock gate decides"
+            elif [ "$_holder_rc" -ne 0 ]; then
                 _allow_socket_rm=0
                 _refusal_reason="$(_flatten_holder_text "${_holder_output:-holder check exited rc=${_holder_rc} with no output}")"
             fi
@@ -1090,7 +1096,7 @@ sys.exit(0)
               # #2687's reviewer findings for the original reproduction.
         fi
 
-        if [ "$_allow_socket_rm" -ne 1 ]; then
+        if [ "$_allow_socket_rm" -ne 1 ] && [ "$_launch_unknown" -ne 1 ]; then
             # (C8) UNKNOWN OWNER, any branch: do NOT launch and do NOT
             # stamp a launch attempt. A launched daemon's own startup gate
             # (engram-surface-daemon.py: socket exists and recorded pid not
@@ -1098,7 +1104,7 @@ sys.exit(0)
             # A missing daemon is loud and recoverable; a duplicate risks
             # silent WAL loss. Exactly one loud line, naming the holder
             # (when known) and the restore path.
-            _log_socket_guard "refusing to remove ${SOCKET_PATH} and NOT launching a daemon -- ${_refusal_reason}. A missing daemon is loud and recoverable; a duplicate risks silent WAL loss. To restore: stop that process or remove the socket by hand, then re-run the hook"
+            _log_socket_guard "refusing to remove ${SOCKET_PATH} and NOT launching a daemon -- ${_refusal_reason}. A missing daemon is loud and recoverable; a duplicate risks silent WAL loss. To restore: stop that process, or a human can clear it by hand with clear-stale-engram-daemon.sh --yes (human-invoked only), then re-run the hook"
         else
             # Start daemon in background. The trailing $ENGRAM_HOME argv is
             # unused by the script (ENGRAM_HOME is still resolved from the env

@@ -460,6 +460,8 @@
   "hooks/claude/engram-surface-daemon.py:_pids_holding_inode",
   "hooks/claude/engram-surface-daemon.py:_holder_cwds",
   "hooks/claude/engram-surface-daemon.py:_socket_holder_state",
+  "hooks/claude/engram-surface-daemon.py:_ps_listing_text",
+  "hooks/claude/engram-surface-daemon.py:_ps_enumeration",
   "hooks/claude/engram-surface-daemon.py:main",
   "hooks/claude/engram-surface-hook.py:_resolve_engram_home",
   "hooks/claude/engram-surface-hook.py:_check_db_liveness",

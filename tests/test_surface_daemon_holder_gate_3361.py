@@ -80,10 +80,16 @@ class _TmpMixin:
         self.tmp = Path(os.path.realpath(tempfile.mkdtemp(prefix="g3361", dir="/tmp")))
         self.addCleanup(shutil.rmtree, str(self.tmp), True)
         self.mod = _load_daemon_module()
+        # #4374 D3': keep the gate cell independent of the host's processes (a live
+        # same-uid daemon on the seat would read as a HOLD).
+        self.mod._ps_listing_text = lambda: (
+            "    1     0 /sbin/launchd\n%6d %5d python\n" % (os.getpid(), os.getuid())
+        )
         self.sock = str(self.tmp / "d.sock")
         self.pid = str(self.tmp / "d.pid")
         self.mod.SOCKET_PATH = self.sock
         self.mod.PID_PATH = self.pid
+        self.mod.LOCK_PATH = str(self.tmp / "d.lockdir")  # #4374: never the real home's lock
         self.procs: list[subprocess.Popen] = []
         self.addCleanup(self._reap)
         # A refusal waits a backoff before exiting (default 60 s). These cells
@@ -392,14 +398,17 @@ class TestH1bRowClassification(_TmpMixin, unittest.TestCase):
         self.assertEqual(state, "HELD")
 
     # C11 -- gate level, driven by the fake proc files (helper not stubbed)
-    def _gate_over_fake_proc(self):
+    def _gate_over_fake_proc(self, allow_unlink=False):
         real = self.mod._socket_holder_state
         wrapped = lambda p: real(  # noqa: E731
             p, proc_net_unix=str(self.fx), proc_root=str(self.proc)
         )
         Path(self.sock).write_text("")
         before = self._write_dead_pidfile()
-        unlink = unittest.mock.Mock(side_effect=AssertionError("unlink called"))
+        if allow_unlink:
+            unlink = unittest.mock.Mock(wraps=os.unlink)
+        else:
+            unlink = unittest.mock.Mock(side_effect=AssertionError("unlink called"))
         with unittest.mock.patch.object(self.mod, "_socket_holder_state", wrapped):
             with unittest.mock.patch("os.unlink", unlink):
                 code, err = self._run_gate()
@@ -426,9 +435,21 @@ class TestH1bRowClassification(_TmpMixin, unittest.TestCase):
 
     def test_c11_gate_refuses_unresolvable_relative_bind_unproven(self):
         self.fx.write_text(_HEADER + _row("d.sock", "16"))
-        code, err, before = self._gate_over_fake_proc()
-        self.assertEqual(code, self.mod.EXIT_SOCKET_UNPROVEN, err)
-        self.assertTrue(os.path.exists(self.sock))
+        # The arm is decided by main()'s own /proc/net/unix test (#4374), not by
+        # the fake proc fixture: the helper answers UNKNOWN either way.
+        if os.path.exists("/proc/net/unix"):
+            code, err, before = self._gate_over_fake_proc()
+            self.assertEqual(code, self.mod.EXIT_SOCKET_UNPROVEN, err)
+            self.assertTrue(os.path.exists(self.sock))
+        else:
+            # #4374: no /proc host, UNKNOWN is resolved by the lifetime lock:
+            # gate passes, stale socket unlinked, lock held. (Bound: a daemon of
+            # this version is excluded by the lock; any other holder of this
+            # path is out of model -- Borges R1/R2.)
+            code, err, before = self._gate_over_fake_proc(allow_unlink=True)
+            self.assertIsNone(code, err)
+            self.assertFalse(os.path.exists(self.sock))
+            self.assertIsNotNone(self.mod._lock_fd, "the lifetime lock is held")
         self.assertEqual(Path(self.pid).read_bytes(), before)
 
     def test_c11_gate_same_spelling_control_is_held(self):
@@ -498,6 +519,9 @@ class TestGateStubbed(_TmpMixin, unittest.TestCase):
         with unittest.mock.patch.object(self.mod, "_socket_holder_state", helper, create=True):
             if result[0] == "FREE" or (
                 result[0] == "HELD" and list(result[1]) == [os.getpid()]
+            ) or (
+                # #4374: with no /proc main() resolves UNKNOWN to FREE (lock held)
+                result[0] == "UNKNOWN" and not os.path.exists("/proc/net/unix")
             ):
                 with unittest.mock.patch("os.unlink", wraps=os.unlink) as ul:
                     code, err = self._run_gate()
@@ -544,11 +568,21 @@ class TestGateStubbed(_TmpMixin, unittest.TestCase):
         self._touch_socket_file()
         before = self._write_dead_pidfile()
         code, err = self._gate_with_helper(("UNKNOWN", []))
-        self._assert_refusal(code, err, before)
-        self.assertIn("could not prove", err)
-        self.assertIn("by hand", err)
-        self.assertEqual(code, self.mod.EXIT_SOCKET_UNPROVEN)
-        self.assertNotIn(code, (0, 1))
+        # The arm is main()'s own os.path.exists("/proc/net/unix"), not the stub.
+        if os.path.exists("/proc/net/unix"):
+            self._assert_refusal(code, err, before)
+            self.assertIn("could not prove", err)
+            self.assertIn("by hand", err)
+            self.assertEqual(code, self.mod.EXIT_SOCKET_UNPROVEN)
+            self.assertNotIn(code, (0, 1))
+        else:
+            # #4374: no /proc, lifetime lock held: UNKNOWN := FREE. The gate
+            # passes silently, unlinks the stale socket, keeps the pidfile.
+            self.assertIsNone(code, err)
+            self.assertEqual(err, "")
+            self.assertFalse(os.path.exists(self.sock))
+            self.assertEqual(Path(self.pid).read_bytes(), before)
+            self.assertIsNotNone(self.mod._lock_fd, "the lifetime lock is held")
 
     def test_self_pid_only_holder_does_not_refuse(self):
         # Defensive filter: HELD with only our own pid falls through to the
@@ -680,17 +714,23 @@ class TestRealHolders(_TmpMixin, unittest.TestCase):
         code, err = self._run_gate()
         if HAS_PROC_NET_UNIX:
             self.assertEqual(code, self.mod.EXIT_SOCKET_HELD, err)
+            self.assertTrue(os.path.exists(real_sock))
         else:
             # Measured on macOS: lsof does NOT resolve a symlinked directory
             # component (rc 1 for the symlink spelling), so the helper says
-            # UNKNOWN. That is not a solved case; it stays fail-closed
-            # (refusal, no steal), which is all this pins.
-            self.assertEqual(code, self.mod.EXIT_SOCKET_UNPROVEN, err)
-        self.assertTrue(os.path.exists(real_sock))
+            # UNKNOWN. #4374 contract on a no-/proc host: the lifetime lock
+            # resolves UNKNOWN to FREE, so the gate passes and unlinks the
+            # path. Bound: lsof-by-path cannot see a live holder bound through
+            # a symlinked parent or relative path; a daemon of this version is
+            # excluded by the lock, any other holder is out of model (Borges
+            # R1/R2, #4374). So the foreign holder's socket IS unlinked here.
+            self.assertIsNone(code, err)
+            self.assertFalse(os.path.exists(real_sock))
+            self.assertIsNotNone(self.mod._lock_fd, "the lifetime lock is held")
         self.assertEqual(Path(self.pid).read_bytes(), before)
         self.assertIsNone(holder.poll())
 
-    def _mira_case(self, bind_spelling):
+    def _mira_case(self, bind_spelling, unproven_passes=False):
         """Mira's #3490 probe shape: holder is a real separate process,
         already listening; the gate is given the REAL pathname. bind_spelling
         is 'same' | 'alias' (bound through a symlinked parent) | 'relative'
@@ -724,6 +764,19 @@ class TestRealHolders(_TmpMixin, unittest.TestCase):
         self.assertEqual(holder.stdout.readline().strip(), "ready")
         before = self._write_dead_pidfile()
         code, err = self._run_gate()
+        if unproven_passes:
+            # #4374, no-/proc host, alias/relative bind: the helper says UNKNOWN
+            # and the lifetime lock resolves it to FREE: gate passes, the
+            # socket path is unlinked, lock held. Bound: lsof-by-path cannot
+            # see a live holder bound through a symlinked parent or relative
+            # path; a daemon of this version is excluded by the lock, any other
+            # holder is out of model (Borges R1/R2, #4374).
+            self.assertIsNone(code, err)
+            self.assertFalse(os.path.exists(gatepath))
+            self.assertIsNotNone(self.mod._lock_fd, "the lifetime lock is held")
+            self.assertEqual(Path(self.pid).read_bytes(), before)
+            self.assertIsNone(holder.poll())
+            return code, err
         # Never past the gate, socket and pidfile untouched, holder alive.
         self.assertIsNotNone(code, "gate must not continue: " + err)
         self.assertTrue(os.path.exists(gatepath))
@@ -736,20 +789,22 @@ class TestRealHolders(_TmpMixin, unittest.TestCase):
         self.assertEqual(code, self.mod.EXIT_SOCKET_HELD)
 
     def test_mira_reverse_alias_real_holder_is_refused(self):
-        code, _ = self._mira_case("alias")
         if HAS_PROC_NET_UNIX:
+            code, _ = self._mira_case("alias")
             self.assertEqual(code, self.mod.EXIT_SOCKET_HELD)
         else:
-            # lsof host: HELD or UNKNOWN are both fail-closed; FREE is
-            # impossible on this branch.
-            self.assertIn(code, (self.mod.EXIT_SOCKET_HELD, self.mod.EXIT_SOCKET_UNPROVEN))
+            # #4374 contract (see _mira_case): lsof is blind to the alias.
+            code, _ = self._mira_case("alias", unproven_passes=True)
+            self.assertIsNone(code)
 
     def test_mira_relative_bind_real_holder_is_refused(self):
-        code, _ = self._mira_case("relative")
         if HAS_PROC_NET_UNIX:
+            code, _ = self._mira_case("relative")
             self.assertEqual(code, self.mod.EXIT_SOCKET_HELD)
         else:
-            self.assertIn(code, (self.mod.EXIT_SOCKET_HELD, self.mod.EXIT_SOCKET_UNPROVEN))
+            # #4374 contract (see _mira_case): lsof is blind to the relative bind.
+            code, _ = self._mira_case("relative", unproven_passes=True)
+            self.assertIsNone(code)
 
     def test_h9_real_stale_orphan_platform_correct_outcome(self):
         """A socket file left by a process that exited (nobody bound).
@@ -772,9 +827,12 @@ class TestRealHolders(_TmpMixin, unittest.TestCase):
             self.assertIsNone(code, err)
             self.assertFalse(os.path.exists(self.sock))
         else:
-            self.assertEqual(code, self.mod.EXIT_SOCKET_UNPROVEN, err)
-            self.assertTrue(os.path.exists(self.sock))
-            self.assertIn("could not prove", err)
+            # #4374: lsof rc 1 is still UNKNOWN from the helper, but main()'s
+            # lifetime lock now resolves it: lock held + pid dead + not HELD
+            # is FREE, so the gate passes and the stale socket is unlinked.
+            self.assertIsNone(code, err)
+            self.assertFalse(os.path.exists(self.sock))
+            self.assertIsNotNone(self.mod._lock_fd, "the lifetime lock is held")
         self.assertEqual(Path(self.pid).read_bytes(), before)
 
 

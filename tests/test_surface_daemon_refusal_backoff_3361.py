@@ -78,9 +78,15 @@ class _Base:
         self.tmp = Path(os.path.realpath(tempfile.mkdtemp(prefix="b3361", dir="/tmp")))
         self.addCleanup(shutil.rmtree, str(self.tmp), True)
         self.mod = _load_daemon_module()
+        # #4374 D3': keep the gate cell independent of the host's processes (a live
+        # same-uid daemon on the seat would read as a HOLD).
+        self.mod._ps_listing_text = lambda: (
+            "    1     0 /sbin/launchd\n%6d %5d python\n" % (os.getpid(), os.getuid())
+        )
         self.sock = str(self.tmp / "recall-daemon.sock")
         self.pid = str(self.tmp / "recall-daemon.pid")
         self.mod.SOCKET_PATH = self.sock
+        self.mod.LOCK_PATH = str(self.tmp / "d.lockdir")  # #4374: never the real home's lock
         self.mod.PID_PATH = self.pid
         self.procs: list[subprocess.Popen] = []
         self.addCleanup(self._reap)
@@ -144,9 +150,27 @@ class _InProcess(_Base):
         self.err = io.StringIO()
         code = None
         helper = unittest.mock.Mock(return_value=state)
+        # #4374: a cell may drive main() more than once in this one process; a
+        # real second daemon is a second process, so drop the lock the previous
+        # run took (else the second run exits 0 on "another process holds the
+        # daemon lock" before it reaches the gate).
+        self._drop_lock()
+        self.addCleanup(self._drop_lock)
         with contextlib.ExitStack() as stack:
             stack.enter_context(unittest.mock.patch.dict(sys.modules, {"engram_client": fake}))
             stack.enter_context(contextlib.redirect_stderr(self.err))
+            # #4374: UNKNOWN is refused only on a host WITH /proc (a no-/proc host
+            # resolves it to FREE via the lifetime lock; that arm is pinned in
+            # test_surface_daemon_holder_gate_3361.py::test_h4_unknown_refuses).
+            # These cells pin the refusal contract (exit 76, line, backoff), so
+            # steer main()'s own arm check to the /proc arm on every host.
+            _real_exists = os.path.exists
+            stack.enter_context(
+                unittest.mock.patch(
+                    "os.path.exists",
+                    lambda p: True if p == "/proc/net/unix" else _real_exists(p),
+                )
+            )
             stack.enter_context(
                 unittest.mock.patch.object(self.mod, "_socket_holder_state", helper, create=True)
             )
@@ -160,6 +184,12 @@ class _InProcess(_Base):
             except SystemExit as exc:
                 code = exc.code
         return code, self.err.getvalue()
+
+    def _drop_lock(self):
+        fd = getattr(self.mod, "_lock_fd", None)
+        if fd is not None:
+            os.close(fd)
+            self.mod._lock_fd = None
 
     def _refuse(self, state, env_value=None):
         """Drive a refusal; return (code, err, wait_calls, err_at_each_call)."""

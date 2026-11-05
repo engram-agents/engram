@@ -70,8 +70,14 @@ class TestSocketUnlinkGatedOnBindOwnership(unittest.TestCase):
         self.addCleanup(self._tmp_dir_obj.cleanup)
         self.tmp = Path(self._tmp_dir_obj.name)
         self.mod = _load_daemon_module()
+        # #4374 D3': keep the gate cell independent of the host's processes (a live
+        # same-uid daemon on the seat would read as a HOLD).
+        self.mod._ps_listing_text = lambda: (
+            "    1     0 /sbin/launchd\n%6d %5d python\n" % (os.getpid(), os.getuid())
+        )
         self.mod.PID_PATH = str(self.tmp / "recall-daemon.pid")
         self.mod.SOCKET_PATH = str(self.tmp / "recall-daemon.sock")
+        self.mod.LOCK_PATH = str(self.tmp / "d.lockdir")  # #4374: never the real home's lock
         # A fresh module load already defaults _bound_socket to False, but
         # state it explicitly -- every assertion below depends on it.
         self.mod._bound_socket = False
@@ -165,8 +171,14 @@ class TestBackOffPathNeverBindsSocket(unittest.TestCase):
         self.addCleanup(self._tmp_dir_obj.cleanup)
         self.tmp = Path(self._tmp_dir_obj.name)
         self.mod = _load_daemon_module()
+        # #4374 D3': keep the gate cell independent of the host's processes (a live
+        # same-uid daemon on the seat would read as a HOLD).
+        self.mod._ps_listing_text = lambda: (
+            "    1     0 /sbin/launchd\n%6d %5d python\n" % (os.getpid(), os.getuid())
+        )
         self.mod.PID_PATH = str(self.tmp / "recall-daemon.pid")
         self.mod.SOCKET_PATH = str(self.tmp / "recall-daemon.sock")
+        self.mod.LOCK_PATH = str(self.tmp / "d.lockdir")  # #4374: never the real home's lock
 
     def test_back_off_branch_never_sets_bound_socket(self):
         # A confirmably-alive "prior" instance -- use this very test
@@ -206,8 +218,14 @@ class TestBindFailureDoesNotClaimOwnership(unittest.TestCase):
         self.addCleanup(self._tmp_dir_obj.cleanup)
         self.tmp = Path(self._tmp_dir_obj.name)
         self.mod = _load_daemon_module()
+        # #4374 D3': keep the gate cell independent of the host's processes (a live
+        # same-uid daemon on the seat would read as a HOLD).
+        self.mod._ps_listing_text = lambda: (
+            "    1     0 /sbin/launchd\n%6d %5d python\n" % (os.getpid(), os.getuid())
+        )
         self.mod.PID_PATH = str(self.tmp / "recall-daemon.pid")
         self.mod.SOCKET_PATH = str(self.tmp / "recall-daemon.sock")
+        self.mod.LOCK_PATH = str(self.tmp / "d.lockdir")  # #4374: never the real home's lock
 
         # Stub out engram_client so main() doesn't try to load a real
         # embedding model. Registered in sys.modules BEFORE main() runs

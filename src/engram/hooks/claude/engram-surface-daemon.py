@@ -204,6 +204,15 @@ from _hooklib import open_regular_text, open_regular_text_write
 PROJECT_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
 _PIDFILE_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_pidfile.py")
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
+# #4374: the daemon's lifetime lock (a 0700 directory, flock'ed). It is what lets the
+# startup gate prove a stale socket unheld on a host with no /proc (macOS), where the
+# holder helper can only answer UNKNOWN. Never deleted by anything.
+LOCK_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.lockdir")
+# Module global: the fd stays open for the process life. It is non-inheritable (PEP 446
+# default; never set inheritable=True), so the lock is released when the last fd to the
+# open file description closes, which coincides with the holder's death only when no
+# other process inherited it.
+_lock_fd = None
 PID_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.pid")
 # argv substring of a live daemon (its script name): the program-identity
 # guard in engram_pidfile (#3240).
@@ -532,6 +541,24 @@ def _socket_holder_state(socket_path, proc_net_unix="/proc/net/unix", proc_root=
       is UNKNOWN. `-U` is deliberately NOT passed: with a path argument lsof
       ORs the selections and would list every unix-socket holder on the host.
 
+    #4374: UNKNOWN on a host with no /proc is now resolved by main()'s lifetime
+    lock (LOCK_PATH), not by this helper: with the lock held, main() treats an
+    UNKNOWN state as FREE. This helper's return values are unchanged, and the
+    lock never overrides HELD.
+
+    FREE means no participating holder: no process that this helper can see
+    (or, with no /proc, that lsof names) holds the path. It is not a proof
+    that no process anywhere holds it; main() adds the lifetime lock and the
+    same-uid ps enumeration (D3') for the rest.
+
+    Width of the no-/proc conversion (Borges, #4374 comment 6667817196): with no /proc, UNKNOWN covers lsof
+    rc 1 and also lsof missing, erroring or timing out. main() converts all of them to FREE once the lock is
+    ours, and that is accepted as built: FREE there rests on three positive facts (our lock, a dead recorded
+    pid, a listing that contains our own pid and no other daemon process), none of which depends on why lsof
+    answered UNKNOWN. A missing lsof stays a refusal while the lock is NOT ours.
+
+    Ordering: the lock authorises, positive holder identification vetoes (a veto), an unusable lock refuses.
+
     A connect() attempt is never proof of absence: a socket that is bound but
     not listening answers ECONNREFUSED and is still a live holder.
     """
@@ -622,6 +649,63 @@ def _socket_holder_state(socket_path, proc_net_unix="/proc/net/unix", proc_root=
     return ("HELD", pids)
 
 
+_PS_TIMEOUT_S = 5
+_PS_ROW_RE = None
+_DAEMON_SCRIPT_NAME = "engram-surface-daemon.py"
+
+
+def _ps_listing_text():
+    """Same-host process listing text (`ps -axo pid=,uid=,command=`) for the D3' veto (#4374).
+
+    A module-level seam so tests can substitute it. RAISES on any failure (OSError, SubprocessError
+    including a timeout, a nonzero return code): a failed read must never look like an empty listing.
+
+    `-ww` asks for unlimited width: a narrowed listing hides the daemon row and fails toward FREE."""
+    import subprocess
+
+    r = subprocess.run(
+        ["ps", "-ww", "-axo", "pid=,uid=,command="],
+        capture_output=True,
+        timeout=_PS_TIMEOUT_S,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"ps exited {r.returncode}")
+    out = r.stdout or ""
+    # Bytes + errors="replace": one process anywhere with invalid UTF-8 in its argv must not blind the listing.
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", errors="replace")
+    return out
+
+
+def _ps_enumeration():
+    """Parse the listing into [(pid, uid, command)], or raise ValueError saying why it cannot be trusted.
+
+    Any non-empty line that does not parse, an empty listing, or a listing that lacks OUR OWN pid (any uid)
+    means the enumeration is not established (#4374 D3')."""
+    import re
+
+    global _PS_ROW_RE
+    if _PS_ROW_RE is None:
+        _PS_ROW_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(.+)$")
+    try:
+        text = _ps_listing_text()
+    except Exception as exc:
+        raise ValueError(f"the process listing could not be read ({type(exc).__name__}: {exc})") from exc
+    rows = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        m = _PS_ROW_RE.match(line)
+        if not m:
+            raise ValueError(f"the process listing has an unparseable line: {line[:80]!r}")
+        rows.append((int(m.group(1)), int(m.group(2)), m.group(3)))
+    if not rows:
+        raise ValueError("the process listing is empty")
+    if os.getpid() not in {r[0] for r in rows}:
+        raise ValueError("the process listing does not contain this process, so it is not a full listing")
+    return rows
+
+
 def _write_pidfile():
     """Write this process's pid to PID_PATH. #3628: a FIFO/directory already at
     PID_PATH is logged once and the daemon runs without a pidfile (no crash, no
@@ -677,7 +761,37 @@ def _write_pidfile():
 
 
 def main():
-    global _client, _bound_socket
+    global _client, _bound_socket, _lock_fd
+
+    # #4374 D1: the lifetime lock is the FIRST act, before the socket gate and also
+    # when no socket exists. Non-blocking; held for the process life in _lock_fd.
+    # The gate never runs unlocked (D4).
+    try:
+        _core_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_core.py")
+        if _core_dir not in sys.path:
+            sys.path.insert(0, _core_dir)
+        import engram_core
+        try:
+            _lock_fd = engram_core.acquire_daemon_lock(LOCK_PATH)
+        except engram_core.DaemonLockHeld:
+            # D2: a daemon of this version is alive. Touch nothing.
+            print(
+                f"[engram-daemon] another process holds the daemon lock {LOCK_PATH} "
+                "-- exiting rather than start a second daemon",
+                file=sys.stderr,
+            )
+            sys.exit(0)
+    except Exception as exc:
+        # D4: unusable lock, or engram_core not importable: fail closed.
+        print(
+            f"[engram-daemon] cannot take the daemon lock {LOCK_PATH}: "
+            f"{type(exc).__name__}: {exc} -- refusing to run the startup gate "
+            f"unlocked; fix the lock path named above first, then a human can clear a stale socket and pidfile with clear-stale-engram-daemon.sh --yes (human-invoked only; never run by a hook, a supervisor or this daemon) (exit {EXIT_SOCKET_UNPROVEN})",
+            file=sys.stderr,
+            flush=True,
+        )
+        _wait_refusal_backoff(_refusal_backoff_s())
+        sys.exit(EXIT_SOCKET_UNPROVEN)
 
     # #1874: only remove the socket if the PID it was bound by is
     # confirmably dead. The prior unconditional unlink let a fresh daemon
@@ -721,17 +835,58 @@ def main():
             )
             _wait_refusal_backoff(_refusal_backoff_s())
             sys.exit(EXIT_SOCKET_HELD)
-        if state == "UNKNOWN":
+        # #4374 D3: with our lifetime lock held (acquired above), UNKNOWN on a host
+        # with NO /proc (macOS: lsof-by-path rc 1) is resolved by the lock, not by
+        # the helper: any daemon of this version holds the lock for life, so nobody
+        # of ours holds this socket. Any other holder is out of model.
+        # The conversion is restricted to the no-/proc arm (evaluated exactly as
+        # _socket_holder_state does): on a host WITH /proc, UNKNOWN keeps refusing as
+        # before (a row that cannot be shown to be another file is not proof of
+        # absence). The lock NEVER overrides HELD (handled above).
+        if state == "UNKNOWN" and os.path.exists("/proc/net/unix"):
             print(
                 f"[engram-daemon] could not prove socket {SOCKET_PATH} is "
                 "unheld (no /proc/net/unix answer and no usable lsof "
                 "answer) -- refusing to remove it; if you know it is stale, "
-                f"remove it by hand (exit {EXIT_SOCKET_UNPROVEN})",
+                "a human can clear it by hand with clear-stale-engram-daemon.sh --yes (human-invoked only; never run by a hook, a supervisor or this daemon)"
+                f" (exit {EXIT_SOCKET_UNPROVEN})",
                 file=sys.stderr,
                 flush=True,
             )
             _wait_refusal_backoff(_refusal_backoff_s())
             sys.exit(EXIT_SOCKET_UNPROVEN)
+        # #4374 D3': before the unlink, enumerate same-uid processes. The lock covers daemons of this
+        # version; a holder that does not take the lock (an older daemon, a wrapper, a harness) is
+        # covered here. Text match on the script name is a HOLD, no cleverness; our own row and other
+        # uids are ignored. An enumeration that cannot be established refuses 76. Both arms.
+        try:
+            _rows = _ps_enumeration()
+        except ValueError as exc:
+            print(
+                f"[engram-daemon] could not establish the same-uid process enumeration: {exc} -- "
+                f"refusing to remove {SOCKET_PATH}; "
+                "a human can clear it with clear-stale-engram-daemon.sh --yes (human-invoked only; never run by a hook, a supervisor or this daemon)"
+                f" (exit {EXIT_SOCKET_UNPROVEN})",
+                file=sys.stderr,
+                flush=True,
+            )
+            _wait_refusal_backoff(_refusal_backoff_s())
+            sys.exit(EXIT_SOCKET_UNPROVEN)
+        _me, _uid = os.getpid(), os.getuid()
+        _peers = sorted(
+            pid for pid, uid, cmd in _rows
+            if pid != _me and uid == _uid and _DAEMON_SCRIPT_NAME in cmd
+        )
+        if _peers:
+            print(
+                f"[engram-daemon] socket {SOCKET_PATH}: same-uid process(es) pid="
+                f"{','.join(str(p) for p in _peers)} carry {_DAEMON_SCRIPT_NAME} in their command -- "
+                f"refusing to steal it (exit {EXIT_SOCKET_HELD})",
+                file=sys.stderr,
+                flush=True,
+            )
+            _wait_refusal_backoff(_refusal_backoff_s())
+            sys.exit(EXIT_SOCKET_HELD)
         # Two race windows, which are NOT the same:
         # (a) FREE -> os.unlink (microseconds): a non-daemon process that
         #     binds a path just proven stale can have its live socket

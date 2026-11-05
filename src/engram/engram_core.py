@@ -1052,6 +1052,66 @@ def release_store_maint_lock(fd: int) -> None:
     _release_db_setup_lock(fd)
 
 
+class DaemonLockError(RuntimeError):
+    """Base for the surface-daemon lifetime-lock failures (#4374)."""
+
+
+class DaemonLockHeld(DaemonLockError):
+    """Another process holds the surface daemon's lifetime lock: a daemon of this version is alive."""
+
+
+class DaemonLockUnusable(DaemonLockError):
+    """The daemon lock directory could not be opened, validated or flocked; the daemon must not run its
+    startup gate without it."""
+
+
+def _daemon_lock_unusable(lock_path: str, exc: BaseException, stage: str) -> "DaemonLockUnusable":
+    verb = "flock" if stage == "flock" else "use"
+    return DaemonLockUnusable(
+        f"cannot {verb} daemon lock directory {lock_path}: {type(exc).__name__}: {exc}"
+    )
+
+
+def _daemon_lock_held(lock_path: str, holder) -> "DaemonLockHeld":
+    return DaemonLockHeld(f"another process holds the daemon lock {lock_path}")
+
+
+def acquire_daemon_lock(lock_path: str) -> int:
+    """Take the surface daemon's lifetime lock at `lock_path` (NON-BLOCKING); return the open fd (#4374).
+
+    Held means a daemon of this version is alive, so a held lock raises DaemonLockHeld; an unusable lock
+    directory raises DaemonLockUnusable, and the caller must then refuse, never run unlocked. The caller
+    holds the fd to process exit and never deletes the directory. The fd is non-inheritable (PEP 446
+    default): the lock is released when the last fd to the open file description closes, which coincides
+    with the holder's death only when no other process inherited it.
+
+    One non-blocking attempt plus the inode recheck, no wait loop (wait_s=0). This copies the store-maintenance
+    lock's policy ("a held lock is the answer"), not the setup lock's wait loop."""
+    try:
+        existing = os.lstat(lock_path)
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        raise _daemon_lock_unusable(lock_path, exc, "use") from exc
+    if existing is not None:
+        import stat as _stat
+        mode = _stat.S_IMODE(existing.st_mode)
+        if _stat.S_ISDIR(existing.st_mode) and mode != 0o700:
+            # The shared primitive would fchmod a wrong-mode directory to 0700; for the daemon lock a
+            # directory someone else could have opened is refused instead (#4374 D4).
+            raise _daemon_lock_unusable(
+                lock_path, OSError(f"has mode {mode:#o}, not 0o700"), "use")
+    return _acquire_lock_dir(lock_path, _LockPolicy(
+        wait_s=0,
+        error_base=DaemonLockError,
+        unusable=_daemon_lock_unusable,
+        read_holder=lambda fd: None,
+        expired=_daemon_lock_held,
+        log_wait=None,
+        holder_payload=f"{os.getpid()} daemon\n".encode("ascii"),
+    ))
+
+
 def _owner_service_commands(db_path):
     """(stop, start) shell commands for THIS seat's owner, built from the strings the repo already uses:
     Linux `engramd-owner-<key>.service` under `systemctl --user`, macOS the launchd label
