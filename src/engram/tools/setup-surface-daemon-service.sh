@@ -599,18 +599,30 @@ _surface_home_bad_char() {
     fi
     return 1
 }
-_surface_refuse_if_bad_home() {
-    # $1 = the absolute ENGRAM_HOME; runs before anything is created
+_surface_refuse_if_bad() {
+    # $1 = what the value is (the label in the message), $2 = the value; runs before anything is created
     local _name _what
-    if _name="$(_surface_home_bad_char "$1")"; then
+    if _name="$(_surface_home_bad_char "$2")"; then
         case "$_name" in
             "control byte "*) _what="$_name" ;;
             a*|e*|i*|o*|u*) _what="an $_name character" ;;
             *) _what="a $_name character" ;;
         esac
-        echo "ERROR: ENGRAM_HOME contains $_what ($(printf '%q' "$1")); the unit or plist would be rendered or read wrongly. No unit or plist was written or loaded and nothing was created." >&2
+        echo "ERROR: $1 contains $_what ($(printf '%q' "$2")); the unit or plist would be rendered or read wrongly. No unit or plist was written or loaded and nothing was created." >&2
         exit 2
     fi
+}
+_surface_refuse_if_bad_home() {
+    # $1 = the absolute ENGRAM_HOME
+    _surface_refuse_if_bad "ENGRAM_HOME" "$1"
+}
+
+# #4347: the same sed renders PYTHON_BIN and HOOKS_DIR, so they get the same per-platform refusal.
+# Called from each OS branch after the tool check and before _surface_compute_home_id (python path
+# first, then hooks dir, then the home), so nothing is created before the values are judged.
+_surface_refuse_if_bad_values() {
+    _surface_refuse_if_bad "the python path" "$PYTHON_BIN"
+    _surface_refuse_if_bad "the hooks dir" "$HOOKS_DIR"
 }
 
 # #4305: surface mode keys its unit / label on the home too. Called from each OS branch AFTER the
@@ -646,6 +658,7 @@ if [[ "$OS" == "Linux" ]]; then
         echo "         $PYTHON_BIN $DAEMON_PY" >&2
         exit 1
     fi
+    [[ "$OWNER_MODE" == "1" ]] || _surface_refuse_if_bad_values
     [[ "$OWNER_MODE" == "1" ]] || _surface_compute_home_id
 
     SERVICE_TEMPLATE="$TEMPLATE_DIR/engram-surface-daemon.service.template"
@@ -732,6 +745,7 @@ elif [[ "$OS" == "Darwin" ]]; then
         echo "         $PYTHON_BIN $DAEMON_PY" >&2
         exit 1
     fi
+    [[ "$OWNER_MODE" == "1" ]] || _surface_refuse_if_bad_values
     [[ "$OWNER_MODE" == "1" ]] || _surface_compute_home_id
 
     PLIST_TEMPLATE="$TEMPLATE_DIR/engram-surface-daemon.plist.template"
