@@ -140,6 +140,15 @@ except Exception:
 # Prompt-body prefixes that identify non-human events (loop self-wakes and
 # monitor notifications). Used as the fallback discriminator when promptSource
 # is absent from the hook payload.
+#
+# _PEER_MESSAGE_PREAMBLE (#4369): Claude Code delivers a message from another
+# session as a UserPromptSubmit prompt whose body begins with this harness
+# line (https://code.claude.com/docs/en/cross-session-messaging). It is not a
+# human keystroke, so it must not stamp last-user-activity. Brittleness: this
+# keys on the harness's English wording, so an upstream wording change would
+# bring the false human stamp back.
+_PEER_MESSAGE_PREAMBLE = "Another Claude session sent a message:"
+
 _NON_HUMAN_PREFIXES = (
     "<task-notification",
     "<command-message",
@@ -147,6 +156,7 @@ _NON_HUMAN_PREFIXES = (
     "<local-command",
     "Stop hook feedback",
     _LOOP_WAKE_MARKER,
+    _PEER_MESSAGE_PREAMBLE,
 )
 
 

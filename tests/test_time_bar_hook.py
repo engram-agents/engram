@@ -356,6 +356,78 @@ class TestIsHumanPromptHtmlEntityNormalization:
         assert tbh._is_human_prompt(payload) is True
 
 
+# #4369 -- a cross-session peer message must not be stamped as human activity.
+# Verbatim shape of two real deliveries (Claude Code 2.1.306): the harness's
+# own preamble line, then the sender's text, then a trailer paragraph.
+_PEER_BODY = (
+    "Another Claude session sent a message:\n"
+    "status check from the other seat\n"
+    "\n"
+    "This came from another Claude session — not typed by your user, but "
+    "very likely working on their behalf. Reply only if useful."
+)
+
+
+class TestPeerMessageClassification:
+    """#4369 -- the fallback (no promptSource) must classify a cross-session
+    peer message as NON-human, while a typed prompt that merely quotes the
+    preamble stays human."""
+
+    # (a) promptSource present: only "typed" is human.
+    @pytest.mark.parametrize("source", ["system", "queued", "", "api"])
+    def test_every_non_typed_prompt_source_is_not_human(self, source):
+        assert tbh._is_human_prompt({"promptSource": source, "prompt": "hello"}) is False
+
+    def test_typed_prompt_source_is_human_even_with_peer_body(self):
+        """promptSource wins when present; the body arm is fallback only."""
+        payload = {"promptSource": "typed", "prompt": _PEER_BODY}
+        assert tbh._is_human_prompt(payload) is True
+
+    # (b) no promptSource + peer-message body -> not human, three shapes.
+    def test_peer_message_exact_shape_is_not_human(self):
+        assert tbh._is_human_prompt(_cc_payload(_PEER_BODY)) is False
+
+    def test_peer_message_with_leading_whitespace_is_not_human(self):
+        assert tbh._is_human_prompt(_cc_payload("  \n\n" + _PEER_BODY)) is False
+
+    def test_peer_message_html_entity_escaped_is_not_human(self):
+        """gh#1646 class: the colon arrives as a numeric entity and html.unescape
+        restores it before the prefix check."""
+        entity_body = _PEER_BODY.replace("message:", "message&#58;", 1)
+        assert entity_body != _PEER_BODY
+        assert tbh._is_human_prompt(_cc_payload(entity_body)) is False
+
+    # (d) quoting the preamble later in a typed body is still human.
+    def test_typed_prompt_quoting_preamble_later_is_human(self):
+        body = "why did I get 'Another Claude session sent a message:' earlier?"
+        assert tbh._is_human_prompt(_cc_payload(body)) is True
+
+
+class TestPeerMessageStampEndToEnd:
+    """#4369 (e) -- through main(): a peer message leaves both stamp files
+    unwritten; a plain typed body still writes them."""
+
+    def _run_main(self, tmp_path, monkeypatch, capsys, payload):
+        import io
+        monkeypatch.setattr(tbh, "LAST_USER_ACTIVITY", tmp_path / "last-user-activity")
+        monkeypatch.setattr(tbh, "LAST_USER_MSG", tmp_path / "last-user-msg.json")
+        monkeypatch.setattr(tbh, "SESSIONS_DIR", tmp_path / "sessions")
+        monkeypatch.setattr(tbh, "CONFIG", tmp_path / "config.json")
+        monkeypatch.setattr(sys, "stdin", io.StringIO(_json.dumps(payload)))
+        tbh.main()
+        capsys.readouterr()
+
+    def test_peer_message_does_not_stamp(self, tmp_path, monkeypatch, capsys):
+        self._run_main(tmp_path, monkeypatch, capsys, _cc_payload(_PEER_BODY))
+        assert not (tmp_path / "last-user-activity").exists()
+        assert not (tmp_path / "last-user-msg.json").exists()
+
+    def test_typed_body_still_stamps(self, tmp_path, monkeypatch, capsys):
+        self._run_main(tmp_path, monkeypatch, capsys, _cc_payload("please summarise the open issues"))
+        assert (tmp_path / "last-user-activity").exists()
+        assert (tmp_path / "last-user-msg.json").exists()
+
+
 class TestSSoTGuard:
     """The hook's fallback marker string equals loop_prompt.LOOP_WAKE_MARKER.
 
