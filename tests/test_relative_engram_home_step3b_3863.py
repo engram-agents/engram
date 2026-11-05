@@ -122,7 +122,8 @@ def _check_migrate(r, H, ctx):
         "  agent:        migrator\n"
         "\n"
         "\n"
-        "Summary: would import 0, skipped 0, failed 0\n"
+        # #3901 added the separate "closed" tally (closed legacy batons are not imported).
+        "Summary: would import 0, skipped 0, closed 0, failed 0\n"
     ), r.stdout
 
 

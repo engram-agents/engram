@@ -30,6 +30,11 @@ Options:
 
 Note:
     Turn-log history is not preserved — the server writes a fresh body on init.
+    Closed batons (status merged or cancelled) are not imported: the server's init
+    route refuses a closed status with a 422, because a baton is born open (#3901),
+    so posting them would only FAIL. Each is reported as a SKIP line, counted in the
+    summary's "closed" tally (separate from skipped and failed), and does not make
+    the run fail. Dry-run reports the same lines.
 """
 from __future__ import annotations
 
@@ -47,6 +52,10 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from forum_api import ForumClient, ForumHttpError, ForumNetworkError, engram_home, forum_url_from_config
+
+# Mirrors forum.coordination.store_file.CLOSED_STATUSES, the set the server's init
+# route refuses (#3901). Local copy: this tool must run without the forum package.
+CLOSED_STATUSES = frozenset({"merged", "cancelled"})
 
 # ---------------------------------------------------------------------------
 # Frontmatter parsing (mirrors baton.py / coordination/markdown.py)
@@ -118,16 +127,21 @@ def migrate(
     client: ForumClient,
     agent: str,
     dry_run: bool,
+    tally: Optional[dict] = None,
 ) -> tuple[int, int, int]:
     """Scan projects_dir and POST each baton to the coord store.
 
-    Returns (imported, skipped, failed).
+    Returns (imported, skipped, failed). Closed legacy batons (merged / cancelled)
+    are not POSTed (init refuses them, #3901); they are counted separately and, when
+    ``tally`` is a dict, reported as ``tally["closed"]``.
     """
     if not projects_dir.is_dir():
         print(f"baton-migrate: projects directory not found: {projects_dir}", file=sys.stderr)
         return 0, 0, 0
 
-    imported = skipped = failed = 0
+    imported = skipped = failed = closed = 0
+    if tally is not None:
+        tally["closed"] = 0
 
     for md_file in sorted(projects_dir.glob("*.md")):
         try:
@@ -157,6 +171,15 @@ def migrate(
         participants_str = fields.get("participants", "").strip()
         participants = _parse_participants(participants_str) if participants_str else []
         github = fields.get("github", "").strip() or None
+
+        # #3901: a baton is born open; init refuses a closed status, so never POST one.
+        if status in CLOSED_STATUSES:
+            print(f"  SKIP  {project_id}: closed ({status}); closed batons are not imported "
+                  f"\u2014 a baton is born open (#3901)")
+            closed += 1
+            if tally is not None:
+                tally["closed"] = closed
+            continue
 
         # Minimal validation before attempting POST
         if not turn:
@@ -269,11 +292,13 @@ def main() -> None:
     print(f"  agent:        {agent}")
     print()
 
-    imported, skipped, failed = migrate(projects_dir, client, agent, args.dry_run)
+    tally: dict = {}
+    imported, skipped, failed = migrate(projects_dir, client, agent, args.dry_run, tally=tally)
 
     print()
     action = "would import" if args.dry_run else "imported"
-    print(f"Summary: {action} {imported}, skipped {skipped}, failed {failed}")
+    print(f"Summary: {action} {imported}, skipped {skipped}, "
+          f"closed {tally.get('closed', 0)}, failed {failed}")
     if failed:
         sys.exit(1)
 

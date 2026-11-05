@@ -1487,6 +1487,92 @@ def _anchor_refusal(route: str, pid: str, store, new_anchor: str,
     return None
 
 
+ANCHOR_BINDING_NOT_CHECKED = "not_checked: no login map configured"
+
+
+def _stored_github(raw: Optional[str]) -> str:
+    """The raw ``github`` frontmatter value of a baton file text ("" when absent)."""
+    if raw is None:
+        return ""
+    return (_md.parse_frontmatter(raw)[0].get("github") or "").strip()
+
+
+def _close_binding_check(pid: str, stored_anchor: Optional[str],
+                         login_map_cfg: Optional[dict], verb: str):
+    """#3901: the ONE id<->anchor binding check for every route that can write ``merged``
+    (``merge``, ``gc``, and ``status`` when the requested status is ``merged``).
+
+    Returns ``(refusal, binding)``. ``refusal`` is ``(message, 422)`` or None. On a pass
+    ``binding`` is ``"checked"`` (the map loaded and the anchor is the one the id names),
+    ``ANCHOR_BINDING_NOT_CHECKED`` (a PR anchor but no login map configured, so nothing
+    to check against; the route says so in its 201 body), or None (nothing to bind: no
+    anchor, a ``project/N`` anchor, or an anchor that does not parse -- the route's own
+    paths, including the unparseable-anchor 503, are unchanged).
+
+    A map that IS configured but fails to load refuses (fail-closed whenever a map was
+    intended). The check is local, so it runs whether GitHub integration is ON or OFF,
+    and callers run it BEFORE any GitHub read. An unqualified ``pr/<N>`` anchor is read
+    as ``pr/<repos[prefix]>/<N>`` exactly as ``_advance_gate`` does (derived, never
+    written). ``verb`` names the route for the "re-run" hint in the refusal.
+
+    The refusal is the gate's own text plus the way out, chosen by STRUCTURE: the prefix
+    has no ``repos`` row -> add the row and re-run; the row exists but the anchor names
+    another repo/number -> mis-bound, supersede and cancel; the id carries no PR number
+    -> the gate's text plus the cancel way out (no PR can be bound to such an id).
+    """
+    anchor = (stored_anchor or "").strip().lower()
+    if not anchor:
+        return None, None
+    gate = _load_baton_gate()
+    if gate is None:
+        # An anchored baton and no gate module to read the anchor with: fail closed
+        # (the same stance as _verdict_for_anchor), never "unbound".
+        return (f"the baton gate is unavailable, so the github anchor on {pid} cannot be "
+                f"bound to its id; nothing written for {pid}.", 503), None
+    parsed = gate._parse_github_anchor(anchor)
+    if parsed is None or parsed[0] != "pr":
+        return None, None
+    cfg = login_map_cfg or {}
+    if not cfg.get("path"):
+        return None, ANCHOR_BINDING_NOT_CHECKED
+    try:
+        login_map = gate._load_login_map(
+            cfg.get("path"),
+            extra_trusted_uids=cfg.get("admin_uids") or (),
+            trust_anchor=cfg.get("trust_anchor") or "/",
+        )
+    except gate.LoginMapError as e:
+        return (str(e), 422), None
+    repos = getattr(login_map, "repos", None) or {}
+    pr_repo, pr_num = parsed[1], parsed[2]
+    anchor_shown = None
+    m = gate._ID_BIND_RE.fullmatch(pid or "")
+    prefix = m.group("prefix").upper() if m is not None else None
+    if pr_repo is None:
+        # Unqualified pr/<N>: DERIVE the repo from the table by the id's prefix (as
+        # _advance_gate does); the literal anchor is what the refusal names.
+        anchor_shown = anchor
+        pr_repo = repos.get(prefix) if prefix is not None else None
+    refusal = gate._anchor_id_binding_refusal(
+        pid, pr_repo or "", pr_num, repos, anchor_shown=anchor_shown)
+    if refusal is None:
+        return None, "checked"
+    if prefix is None:
+        remedy = (f" The id {pid} carries no PR number, so no PR can be bound to it. The way "
+                  f"out is to close this baton with 'status cancelled' and a reason.")
+    elif repos.get(prefix) is None:
+        remedy = (f" What is missing is a 'repos' row for prefix {prefix!r}, not a fix to this "
+                  f"baton: after the admin adds that row, re-run '{verb}' and it closes.")
+    else:
+        shown = anchor_shown or f"pr/{pr_repo}/{pr_num}"
+        remedy = (f" This baton cannot record that PR's merge. Open a correctly prefixed baton "
+                  f"anchored to that PR and close it as merged there; close this one with "
+                  f"'status cancelled' and a reason naming the replacement, e.g. "
+                  f"'mis-bound: anchor {shown} does not match prefix {prefix}; "
+                  f"superseded by <ID>'.")
+    return (refusal + remedy, 422), None
+
+
 def _bound_repo(gate, pid: str, login_map_cfg: Optional[dict]) -> Optional[str]:
     """The ``owner/repo`` (lower-case) the baton id's prefix maps to in the admin
     ``repos`` table, or None when that cannot be known: no map configured / map
@@ -3565,7 +3651,8 @@ def create_app(
         ``phase`` -- both are threaded through regardless, for uniformity
         with the other endpoints.
         Response: {seq, project_id}, 201.
-        Errors: 400 (missing/invalid fields), 409 (already exists), 503 (store not configured).
+        Errors: 400 (missing/invalid fields), 409 (already exists), 422 (a closed ``status``:
+        a baton is born open, #3901), 503 (store not configured).
         """
         from forum.coordination import init as _init, ProjectAlreadyExists
 
@@ -3622,6 +3709,17 @@ def create_app(
 
         if not project_id or not title or not status or not turn or not turn_reason or not participants:
             return jsonify({"error": "project_id, title, status, turn, turn_reason, and participants are required"}), 400
+
+        # #3901: a baton is born open. ``merged`` / ``cancelled`` at init would skip the
+        # id<->anchor binding every closing route applies, and leave a record with no
+        # lifecycle behind it. Create it, then close it.
+        from forum.coordination.store_file import CLOSED_STATUSES as _INIT_CLOSED
+        if status.strip().lower() in _INIT_CLOSED:
+            return jsonify({"error": (
+                f"POST /api/projects (init): status {status!r} is a closed status; a baton is "
+                f"born open. Create {project_id} as planning, in-progress or in-review, then "
+                f"close it (baton merge / baton close), so the close goes through the "
+                f"anchor-to-id binding check. Nothing was created.")}), 422
 
         # #3039 U2b round 2: no request body supplies a phase. A brand-new
         # baton has no file to derive a conversion from, so a client
@@ -4092,11 +4190,14 @@ def create_app(
         409 (close-direction write on a baton ALREADY closed -- names the
         current status; reopen of a closed baton is the legal path and is
         never refused with 409), 503 (store not configured).
+        #3901: ``new_status == "merged"`` takes the same id<->anchor binding check as /merge and
+        /gc (422, nothing written; ``anchor_binding`` in the 201 body). Any other status is unchecked.
         """
         from forum.coordination import (
             close as _close, reopen as _reopen, ProjectNotFound,
-            NotAParticipant, AlreadyClosed,
+            NotAParticipant, AlreadyClosed, AnchorChanged,
         )
+        from forum.coordination.store_file import CLOSED_STATUSES as _CLOSED_STATUSES
 
         store = app.config.get("COORD_STORE")
         allocator = app.config.get("COORD_ALLOCATOR")
@@ -4129,12 +4230,33 @@ def create_app(
         if phase_refusal is not None:
             return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
+        # #3901: ``merged`` through /status is the same assertion as /merge and /gc and
+        # takes the same binding check, before any write. Any other status (a cancel
+        # asserts nothing about a PR; reopen) is unchecked. An already-closed baton is
+        # left to _close's 409.
+        anchor_binding = None
+        expected_anchor = None
+        if new_status == "merged":
+            raw_now = store.read_project(pid)
+            if raw_now is not None:
+                _cur = _md.parse_frontmatter(raw_now)[0].get("status", "").strip().lower()
+                if _cur not in _CLOSED_STATUSES:
+                    _checked_anchor = _stored_github(raw_now)
+                    binding_refusal, anchor_binding = _close_binding_check(
+                        pid, _checked_anchor, _login_map_cfg(app), "baton close --status merged")
+                    if binding_refusal is not None:
+                        return jsonify({"error": binding_refusal[0]}), binding_refusal[1]
+                    # The write re-verifies, under the lock, the anchor that was checked.
+                    expected_anchor = _checked_anchor.strip().lower()
+
         try:
             if new_status in _ACTIVE_STATUSES:
                 seq = _reopen(store, allocator, pid, invoker=agent, new_status=new_status, phase=phase)
             else:
                 seq = _close(store, allocator, pid, invoker=agent, new_status=new_status,
-                             reason=reason, phase=phase)
+                             reason=reason, phase=phase, expected_anchor=expected_anchor)
+        except AnchorChanged as e:
+            return _anchor_changed_409(pid, e)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
         except NotAParticipant:
@@ -4144,7 +4266,10 @@ def create_app(
                             "refusing to overwrite a closed status (reopen first)"}), 409
 
         turn, status = _read_project_state(store, pid)
-        return jsonify({"seq": seq, "turn": turn, "status": status}), 201
+        out = {"seq": seq, "turn": turn, "status": status}
+        if anchor_binding:
+            out["anchor_binding"] = anchor_binding
+        return jsonify(out), 201
 
     @app.route("/api/projects/<pid>/rename", methods=["POST"])
     def api_project_rename(pid: str):
@@ -4411,6 +4536,9 @@ def create_app(
         PR state itself and IGNORES ``new_status`` (merged -> ``merged``, closed
         unmerged -> ``cancelled``); the client's value only matters on an
         unanchored baton.
+        #3901: 422 (nothing written, no GitHub call): the baton's PR anchor is not the one its id names
+        (or the login map is configured but cannot load); the 201 body carries ``anchor_binding``
+        (``checked`` / ``not_checked: no login map configured``) for a PR-anchored baton.
         """
         from forum.coordination import (
             close as _close, ProjectNotFound, AlreadyClosed, NotAParticipant, AnchorChanged,
@@ -4457,6 +4585,13 @@ def create_app(
             if _cur in _CLOSED_STATUSES:
                 return jsonify({"error": f"project {pid} is already {_cur}; "
                                 "refusing to overwrite a closed status (reopen first)"}), 409
+        # #3901: a baton recorded as merged/cancelled from GitHub's state must be bound to
+        # that PR by its id. Local check, before any GitHub read; ON or OFF alike.
+        _checked_anchor = _stored_github(raw_now)
+        binding_refusal, anchor_binding = _close_binding_check(
+            pid, _checked_anchor, _login_map_cfg(app), "baton gc")
+        if binding_refusal is not None:
+            return jsonify({"error": binding_refusal[0]}), binding_refusal[1]
         # #3568: with GitHub integration OFF a PR-anchored baton takes the unanchored
         # path (verdict None: client's word + participant gate) and the write records
         # that the PR state was not verified. ON / no service mode: unchanged call.
@@ -4466,6 +4601,10 @@ def create_app(
         else:
             verdict, expected_anchor = _server_pr_read(store, pid)
         unverified = github_off and verdict is None and _off_unverified_pr(expected_anchor)
+        if expected_anchor != _checked_anchor.strip().lower():
+            # #3901: re-anchored between the binding check and the GitHub read.
+            return _anchor_changed_409(
+                pid, AnchorChanged(pid, _checked_anchor.strip().lower(), expected_anchor))
         if verdict is not None:
             repo, number, state = verdict
             if number is None:
@@ -4517,6 +4656,8 @@ def create_app(
 
         turn, status = _read_project_state(store, pid)
         out = {"seq": seq, "turn": turn, "status": status}
+        if anchor_binding:
+            out["anchor_binding"] = anchor_binding
         if unverified:
             out["warnings"] = [GITHUB_OFF_UNVERIFIED_WARNING]
         return jsonify(out), 201
@@ -4544,6 +4685,9 @@ def create_app(
         403 (#3477): on an UNANCHORED baton the caller must be a participant, same
         gate and message as ``/status`` and ``/gc``; nothing written. On an ANCHORED
         baton there is no participant gate (GitHub decides).
+        #3901: 422 (nothing written, no GitHub call): the baton's PR anchor is not the one its id names
+        (or the login map is configured but cannot load); the 201 body carries ``anchor_binding``
+        (``checked`` / ``not_checked: no login map configured``) for a PR-anchored baton.
         """
         from forum.coordination import (
             merge as _merge, ProjectNotFound, AnchorChanged, NotAParticipant, AlreadyClosed,
@@ -4588,6 +4732,16 @@ def create_app(
                                 "refusing to overwrite a closed status (reopen first)",
                                 "reason": "already_closed", "status": _cur}), 409
 
+        # #3901: merged must not be recorded against a PR the id does not name. Local
+        # check, before any GitHub read; ON or OFF alike.
+        _checked_anchor = _stored_github(raw_now)
+        # The re-run hint names gc, not merge: this route runs after ``gh pr merge``
+        # succeeded, so re-running ``baton merge`` would fail at GitHub.
+        binding_refusal, anchor_binding = _close_binding_check(
+            pid, _checked_anchor, _login_map_cfg(app), "baton gc")
+        if binding_refusal is not None:
+            return jsonify({"error": binding_refusal[0]}), binding_refusal[1]
+
         # #3416: on an anchored baton the server requires GitHub MERGED (it never
         # takes the client's word, and ``forced`` does not skip this). Unanchored
         # batons keep the pre-#3416 behaviour.
@@ -4598,6 +4752,10 @@ def create_app(
         else:
             verdict, expected_anchor = _server_pr_read(store, pid)
         unverified = github_off and verdict is None and _off_unverified_pr(expected_anchor)
+        if expected_anchor != _checked_anchor.strip().lower():
+            # #3901: re-anchored between the binding check and the GitHub read.
+            return _anchor_changed_409(
+                pid, AnchorChanged(pid, _checked_anchor.strip().lower(), expected_anchor))
         if verdict is not None:
             repo, number, state = verdict
             if number is None:
@@ -4634,6 +4792,8 @@ def create_app(
                             "reason": "already_closed", "status": e.status}), 409
 
         out = {"seq": seq, "status": "merged"}
+        if anchor_binding:
+            out["anchor_binding"] = anchor_binding
         if unverified:
             out["warnings"] = [GITHUB_OFF_UNVERIFIED_WARNING]
         return jsonify(out), 201

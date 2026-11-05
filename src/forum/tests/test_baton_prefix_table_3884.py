@@ -11,8 +11,9 @@ Measured on dev (see the PR body), prefix row ABSENT:
   advance                       -> 422, the repos-table refusal, nothing written
   flip to the merge seat        -> 422, the same refusal, nothing written
   flip to a non-merge seat      -> accepted (never reaches the strict gate)
-  merge                         -> NOT prefix-gated: closes when GitHub reports
-                                   MERGED (a separate question whether it should bind)
+  merge                         -> 422, the repos-table refusal plus the add-the-row
+                                   remedy, nothing written, no GitHub call (#3901;
+                                   it was NOT prefix-gated on dev before that)
   close                         -> accepted
 
 Identities are SYNTHETIC; GitHub is never contacted (the `gh` boundary is the
@@ -103,16 +104,6 @@ class TestRowAbsentLeavesTheOtherVerbsAlone:
         assert world.fields(PID)[0]["turn"] == AUTHOR
         assert world.gh.calls == []
 
-    def test_merge_is_not_prefix_gated_and_closes_on_github_merged(self, world, monkeypatch):
-        set_map(world, repos=NO_ROW)
-        world.seed(PID, github=ANCHOR)
-        merged_seam(world, monkeypatch)
-        resp = merge(world)
-        assert resp.status_code == 201, resp.get_json()
-        assert resp.get_json()["status"] == "merged"
-        assert TABLE_REFUSAL not in json.dumps(resp.get_json())
-        assert disk(world, PID) is not None  # archived, not lost
-
     def test_close_is_accepted(self, world):
         set_map(world, repos=NO_ROW)
         world.seed(PID, github=ANCHOR)
@@ -121,6 +112,22 @@ class TestRowAbsentLeavesTheOtherVerbsAlone:
         assert resp.get_json()["status"] == "closed"
         assert world.fields(PID)[0]["status"] == "closed"
         assert world.gh.calls == []
+
+
+class TestRowAbsentRefusesMerge:
+    """#3901 flips the old "merge is not prefix-gated" pin: merge applies the binding."""
+
+    def test_merge_is_prefix_gated_and_refuses_with_the_add_the_row_remedy(self, world, monkeypatch):
+        set_map(world, repos=NO_ROW)
+        world.seed(PID, github=ANCHOR)
+        merged_seam(world, monkeypatch)
+        before, seq0 = disk(world, PID), seq_state(world)
+        resp = merge(world)
+        assert resp.status_code == 422, resp.get_json()
+        assert TABLE_REFUSAL in resp.get_json()["error"]
+        assert "STUDIO-PR" in resp.get_json()["error"]
+        assert disk(world, PID) == before and seq_state(world) == seq0
+        assert world.fields(PID)[0]["status"] == "in-progress"
 
 
 # ---------------------------------------------------------------------------

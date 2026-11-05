@@ -2054,9 +2054,10 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str, client: F
         if e.status == 404:
             print(f"baton close: project not found: {project_id}", file=sys.stderr)
             sys.exit(EXIT_STATE)
-        if e.status in (403, 409):
+        if e.status in (403, 409, 422):
             # #3313: server-side refusal (non-participant / already closed) --
-            # print the server's message verbatim; nothing was written.
+            # print the server's message verbatim; nothing was written. #3901: 422 =
+            # `--status merged` on a baton whose anchor its id does not name.
             print(f"baton close: refused (HTTP {e.status}): {_server_refusal_text(e)}", file=sys.stderr)
             sys.exit(EXIT_VALIDATION)
         print(f"baton close: server error {e.status}: {e.body}", file=sys.stderr)
@@ -2322,13 +2323,14 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
             print(f"baton gc: closed {project_id} → {new_status} ({repo}#{pr_num})")
             closed += 1
         except ForumHttpError as e:
-            if e.status in (403, 409, 503):
+            if e.status in (403, 409, 422, 503):
                 # #3416: the server derives the PR state itself (the client's
                 # new_status is advisory only). 409 = refused (PR still OPEN /
                 # already closed); 503 = server could not read GitHub; 403 =
                 # unanchored baton and the caller is not a participant (same
-                # refusal /status gives). Either way nothing was written; print
-                # the server's own message.
+                # refusal /status gives); 422 (#3901) = the anchor is not the one the
+                # baton id names. Either way nothing was written; print the server's
+                # own message.
                 print(f"baton gc: server refused {project_id} (HTTP {e.status}): "
                       f"{_server_refusal_text(e)}", file=sys.stderr)
             else:
@@ -2969,6 +2971,17 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         )
         sys.exit(EXIT_IO)
     except ForumHttpError as e:
+        if e.status == 422:
+            # #3901: the baton's anchor is not the one its id names. The GitHub merge
+            # DID succeed, but closing this baton as merged would assert a binding that
+            # does not hold, so the server's text (with the way out) is printed and the
+            # `baton close --status merged` hint is deliberately NOT: /status refuses
+            # `merged` on such a baton for the same reason.
+            print(f"baton merge: baton closure refused (422): {_server_refusal_text(e)}",
+                  file=sys.stderr)
+            print("  (GitHub merge succeeded; the baton was NOT closed. Follow the way out "
+                  "named above.)", file=sys.stderr)
+            sys.exit(EXIT_IO)
         print(f"baton merge: baton closure failed ({e.status}): {e.body}", file=sys.stderr)
         _closed_as = _merge_already_closed_status(e) if e.status == 409 else None
         if _closed_as is not None:
@@ -3049,9 +3062,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_init.add_argument(
         "--status",
-        choices=list(VALID_STATUSES),
+        choices=sorted(ACTIVE_STATUSES),
         default="planning",
-        help="Initial project status (default: planning)",
+        help="Initial project status (default: planning). A baton is born open; "
+             "close it afterwards with 'baton merge' or 'baton close'.",
     )
     p_init.add_argument(
         "--turn", metavar="AGENT",
