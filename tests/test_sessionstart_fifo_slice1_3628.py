@@ -232,9 +232,9 @@ try:
     c.open_regular_text_append(os.path.join(ROOT, "f"), encoding="utf-8").close()
     result = "no-error"
 except OSError as e:
-    result = [e.errno, errno.ENXIO]
+    result = [type(e).__name__, "NotRegularFile"]  # #4380: the strict open maps ENXIO
 """)
-    assert r == [r[1], r[1]]  # ENXIO from os.open(O_NONBLOCK), not a hang
+    assert r == [r[1], r[1]]  # refused at os.open(O_NONBLOCK) (ENXIO), not a hang
 
 
 def test_append_helper_rejects_fifo_with_reader_and_writes_nothing(tmp_path):
@@ -247,14 +247,14 @@ try:
         c.open_regular_text_append(os.path.join(ROOT, "f"), encoding="utf-8").close()
         err = "no-error"
     except OSError as e:
-        err = e.errno
+        err = type(e).__name__
     try:
         got = os.read(rfd, 4096).decode()
     except BlockingIOError:
         got = ""
 finally:
     os.close(rfd)
-result = {"errno": err, "einval": errno.EINVAL, "got": got}
+result = {"errno": err, "einval": "NotRegularFile", "got": got}  # #4380: strict fstat refusal
 """)
     assert r["errno"] == r["einval"], r
     assert r["got"] == "", r
@@ -270,12 +270,11 @@ for name, p in (("dir", os.path.join(ROOT, "d")), ("null", "/dev/null")):
         c.open_regular_text_append(p, encoding="utf-8").close()
         out[name] = "no-error"
     except OSError as e:
-        out[name] = e.errno
-out["eisdir"], out["einval"] = errno.EISDIR, errno.EINVAL
+        out[name] = type(e).__name__
 result = out
 """)
-    assert r["dir"] == r["eisdir"], r
-    assert r["null"] == r["einval"], r
+    assert r["dir"] == "NotRegularFile", r  # #4380: the strict open
+    assert r["null"] == "NotRegularFile", r
 
 
 # --------------------------------------------------------------------------

@@ -813,8 +813,10 @@ _HELPER_DEFS = {
     # write helpers, which would change the mode and drop the no-follow create.
     # atomic_write_text (#4013): its one os.open is O_CREAT|O_EXCL on a fresh random temp name
     # beside the target, so it cannot be a FIFO; the target itself is only stat'd and replaced.
+    # _open_single_regular (#4380): the strict open (O_NONBLOCK, O_NOFOLLOW, fstat) the write
+    # and append helpers now go through; pinned identical to engram_regular_io's copy.
     "_hooklib.py": {"_open_regular_fd", "open_regular_text", "open_regular_text_write",
-                    "open_regular_text_append", "write_route_ledger",
+                    "open_regular_text_append", "_open_single_regular", "write_route_ledger",
                     "append_shown_record", "atomic_write_text"},
     # _reply_gate_fd (#4193): the reply-gate log's own hardened open (O_NONBLOCK + fstat S_ISREG,
     # a non-regular target raises before anything is read or written).

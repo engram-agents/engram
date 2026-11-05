@@ -49,6 +49,7 @@ tests/test_regular_io_parity_3628.py.
 
 from __future__ import annotations
 
+import errno
 import functools
 import json
 import math
@@ -1216,19 +1217,119 @@ def read_state_json_classified(path):
         return {}, f"{type(exc).__name__}: {exc}", False
 
 
-def open_regular_text_write(path, encoding=None):
-    """`open(path, "w", encoding=encoding)` that must never block (#3591).
+def describe_file_kind(mode: int) -> str:
+    """The one word for what `mode` (an st_mode) says a non-regular path is
+    (#3773). The ONE kind mapping: the engramd owner and the collab tools all
+    name a refused path through it. Anything not listed (and a regular mode,
+    which callers do not ask about) reads "non-regular file"."""
+    if stat.S_ISFIFO(mode):
+        return "FIFO"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return "non-regular file"
 
-    A write-open of a FIFO waits for a reader. O_WRONLY|O_NONBLOCK makes that
-    fail at once with ENXIO when no reader exists (an OSError); and when a
-    reader does exist the fstat still rejects the FIFO before anything is
-    written. O_CREAT|O_TRUNC with mode 0o666 (umask applies) matches what
-    open(path, "w") does, so a regular file is created / truncated and written
-    exactly as before. Raises OSError for a non-regular target."""
-    fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_CREAT | os.O_TRUNC, 0o666)
+
+class NotRegularFile(OSError):
+    """A pidfile write target that is not a single regular file (#3773).
+
+    str(exc) is "<path> is a <kind>, not a regular file", or, for a regular
+    file with st_nlink != 1, "<path> has <n> hard links, not a single regular
+    file". Fields: .path, .st_mode (int | None), .nlink (int | None), .kind
+    (the describe_file_kind word, or "hard-linked file")."""
+
+    def __init__(self, path, st_mode=None, nlink=None):
+        self.path = str(path)
+        self.st_mode = st_mode
+        self.nlink = nlink
+        if st_mode is not None and stat.S_ISREG(st_mode) and nlink is not None and nlink != 1:
+            self.kind = "hard-linked file"
+            text = f"{self.path} has {nlink} hard links, not a single regular file"
+        else:
+            self.kind = describe_file_kind(st_mode) if st_mode is not None else "non-regular file"
+            text = f"{self.path} is a {self.kind}, not a regular file"
+        super().__init__(text)
+
+    def __str__(self) -> str:
+        return self.args[0]
+
+
+def _open_single_regular(path, flags, mode=0o666):
+    """The ONE strict-open sequence (#3773, extracted for #3781): open `path`
+    with `flags` PLUS O_NOFOLLOW|O_NONBLOCK and never O_TRUNC, map ENXIO,
+    ELOOP, EISDIR, EOPNOTSUPP and ENODEV to NotRegularFile (any other OSError
+    propagates unchanged), then fstat the fd: not a regular file, or
+    st_nlink != 1 -> close it and raise NotRegularFile. Returns the open fd of
+    a single regular file. The caller owns the fd and closes it.
+
+    O_NOFOLLOW refuses a symlink (on a write the follow IS the truncation of
+    its target); O_NONBLOCK makes a reader-less FIFO fail with ENXIO instead of
+    waiting. `write_pidfile`, `append_regular_line`,
+    `write_regular_bytes_synced`, `read_regular_text_strict` and
+    `open_regular_append_strict` all go through here, so a refusal means the
+    same thing at every one of them."""
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise _not_regular_error(fd, path)
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, mode)
+    except OSError as exc:
+        # getattr so a platform lacking one of them still imports.
+        not_regular = {
+            getattr(errno, name)
+            for name in ("ENXIO", "ELOOP", "EISDIR", "EOPNOTSUPP", "ENODEV")
+            if hasattr(errno, name)
+        }
+        if exc.errno not in not_regular:
+            raise
+        try:
+            mode_seen = os.lstat(path).st_mode
+        except OSError:
+            mode_seen = None
+        raise NotRegularFile(path, mode_seen, None) from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise NotRegularFile(path, st.st_mode, st.st_nlink)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+
+
+def _on_refusal(exc):
+    """Called with the NotRegularFile a write/append open refused (#4380): tell
+    the seat, once per window, which path is a link. Not pinned against core's
+    no-op `_on_refusal`; the call sites inside the helpers are."""
+    report_refused_write(exc)
+
+
+def open_regular_text_write(path, encoding=None):
+    """`open(path, "w", encoding=encoding)` that must never block (#3591) and
+    never truncate through a link (#4380).
+
+    The strict open of `write_pidfile` (O_WRONLY|O_CREAT|O_NOFOLLOW|O_NONBLOCK,
+    mode 0o666 so the umask applies, and NO O_TRUNC at open): a symlink, a
+    hard-linked file (st_nlink != 1), a FIFO, a directory or a device raises
+    NotRegularFile (an OSError subclass, so an `except OSError` caller keeps
+    working) and nothing is touched. Only after the fstat check passes is the
+    file truncated, with ftruncate on the validated descriptor. A reader-less
+    FIFO fails at once with ENXIO (mapped to NotRegularFile), never a wait.
+    Same compatibility trade as write_pidfile: on an odd or network-mounted
+    home a LEGITIMATE file can report st_nlink != 1 and be refused."""
+    try:
+        fd = _open_single_regular(path, os.O_WRONLY | os.O_CREAT)
+    except NotRegularFile as exc:
+        _on_refusal(exc)
+        raise
+    try:
+        os.ftruncate(fd, 0)
         return os.fdopen(fd, "w", encoding=encoding)
     except BaseException:
         try:
@@ -1239,17 +1340,19 @@ def open_regular_text_write(path, encoding=None):
 
 
 def open_regular_text_append(path, encoding=None):
-    """`open(path, "a", encoding=encoding)` that must never block (#3628).
+    """`open(path, "a", encoding=encoding)` that must never block (#3628) and
+    never append through a link (#4380).
 
-    Same shape as open_regular_text_write, with O_APPEND|O_CREAT (no O_TRUNC)
-    and mode 0o666 (umask applies), matching open(path, "a"). A reader-less
-    FIFO fails at os.open with ENXIO; a FIFO that has a reader is rejected by
-    the fstat before any byte is written. Raises OSError for a non-regular
-    target."""
-    fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_APPEND | os.O_CREAT, 0o666)
+    The same strict open as open_regular_text_write with O_APPEND added and no
+    truncate: NotRegularFile for a symlink, a hard-linked file or anything
+    that is not a regular file, with nothing written. Mode 0o666 (umask
+    applies). Same st_nlink compatibility trade as write_pidfile."""
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise _not_regular_error(fd, path)
+        fd = _open_single_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    except NotRegularFile as exc:
+        _on_refusal(exc)
+        raise
+    try:
         return os.fdopen(fd, "a", encoding=encoding)
     except BaseException:
         try:
@@ -2181,6 +2284,42 @@ def mark_probe_notice(engram_home, key: str, now=None) -> None:
         path = _probe_stamp_path(engram_home)
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(path, {"shown_at": kept})
+    except Exception:
+        pass
+
+
+def refused_write_line(exc, hook_name=None) -> str:
+    """The one plain line for a write the strict open refused (#4380): the path,
+    what it is, and the fix. `exc` is a NotRegularFile (.path, .kind, .nlink).
+    One bounded line; control characters in the path become spaces. Never raises."""
+    try:
+        path = sanitize_probe_text(getattr(exc, "path", "?"), 400)
+        kind = getattr(exc, "kind", "non-regular file")
+        if kind == "hard-linked file":
+            what = f"has {getattr(exc, 'nlink', '?')} hard links"
+        else:
+            what = f"is a {kind}"
+        hook = sanitize_probe_text(hook_name or os.path.basename(sys.argv[0] or "hook"), 60)
+        return (f"{hook}: wrote nothing to {path}: it {what}; "
+                f"replace it with a regular file")
+    except Exception:
+        return "engram hook: refused a write through a link or non-regular file"
+
+
+def report_refused_write(exc, hook_name=None) -> None:
+    """Say, at most once per notice window per path, that a state-file write was
+    refused (#4380). One stderr line (stdout and the exit code are untouched, so
+    the prompt proceeds), rate-limited by the same stamp as the other advisory
+    probe notices (probe_notice_due / mark_probe_notice, key `refused-write:<path>`).
+    The stamp is written by atomic_write_json, which replaces a link planted at
+    the stamp rather than writing through it. Never raises."""
+    try:
+        home = engram_home()
+        key = "refused-write:" + str(getattr(exc, "path", "?"))
+        if not probe_notice_due(home, key):
+            return
+        sys.stderr.write(refused_write_line(exc, hook_name) + "\n")
+        mark_probe_notice(home, key)
     except Exception:
         pass
 

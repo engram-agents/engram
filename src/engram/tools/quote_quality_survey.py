@@ -74,6 +74,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import engram_anchoring  # noqa: E402
 import engram_core as core  # noqa: E402
+import engram_regular_io as _regular_io  # noqa: E402
 
 # The population query and the read-only open live in anchoring_report; load that
 # file by path (the `tools` package name is contested, see engram_core #2565 note)
@@ -487,8 +488,10 @@ def _sheet_items(key_items: dict, by_id: dict) -> list[dict]:
 
 def _write_sheet(path: Path, text: str) -> None:
     """The sheet is for another seat to read: normal default mode (0o666 less the umask,
-    which is what write_text gave). O_NOFOLLOW: never write through a symlink."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o666)
+    which is what write_text gave). The strict open (#4380): a symlink or a hard-linked
+    file raises NotRegularFile and is never truncated; the truncate is on the checked fd."""
+    fd = _regular_io._open_single_regular(path, os.O_WRONLY | os.O_CREAT, 0o666)
+    os.ftruncate(fd, 0)
     with os.fdopen(fd, "w") as fh:
         fh.write(text)
 
@@ -496,9 +499,11 @@ def _write_sheet(path: Path, text: str) -> None:
 def _write_key(path: Path, text: str) -> None:
     """The key is private. Created 0600 at open(), so there is no window where it
     exists with a looser mode; fchmod covers a key file that already existed.
-    O_NOFOLLOW: a symlink at the path is never followed, so fchmod can never
-    change the mode of some other file."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    The strict open (#4380): a symlink or a hard-linked file raises NotRegularFile before
+    anything is truncated or chmod'ed, so fchmod can never change the mode of some other
+    file and the truncate is on the checked fd."""
+    fd = _regular_io._open_single_regular(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    os.ftruncate(fd, 0)
     with os.fdopen(fd, "w") as fh:
         os.fchmod(fh.fileno(), 0o600)
         fh.write(text)

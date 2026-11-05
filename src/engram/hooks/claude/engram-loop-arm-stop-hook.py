@@ -460,6 +460,17 @@ try:
 except Exception:
     _atomic_write_json = None
 
+# #4380: the reply-gate log is WRITTEN (appended, and trimmed by rotation), so it must go
+# through the strict open (no O_TRUNC at open, O_NOFOLLOW, single regular file). The helper is
+# NOT copied here: this hook's log is diagnostic and fail-silent, so with no _hooklib it simply
+# does not log (the gate decision never depends on it).
+try:
+    from _hooklib import _open_single_regular as _strict_open
+    from _hooklib import report_refused_write as _report_refused_write
+except Exception:
+    _strict_open = None
+    _report_refused_write = None
+
 try:
     from _hooklib import open_regular_text
 except Exception:
@@ -1445,9 +1456,9 @@ _REPLY_GATE_LOG_MAX_BYTES = 64 * 1024
 _REPLY_GATE_LOG_KEEP_LINES = 200
 
 
-def _reply_gate_fd(flags: int) -> int:
-    """A non-blocking fd on the log that must be a regular file (never hangs on a FIFO)."""
-    fd = os.open(_REPLY_GATE_LOG, flags | os.O_NONBLOCK, 0o666)
+def _reply_gate_fd() -> int:
+    """A non-blocking READ-ONLY fd on the log that must be a regular file (never hangs on a FIFO)."""
+    fd = os.open(_REPLY_GATE_LOG, os.O_RDONLY | os.O_NONBLOCK)
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
         raise OSError("not a regular file: %s" % (_REPLY_GATE_LOG,))
@@ -1466,18 +1477,35 @@ def _log_reply_gate(session_id: str, payload_len: int | None, facts: tuple[bool,
             "absent" if payload_len is None else payload_len,
             "y" if found else "n", "y" if ends_on_tool else "n", decision)
         data = line.encode("utf-8")
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        rotate = False
         try:
             if os.path.getsize(_REPLY_GATE_LOG) > _REPLY_GATE_LOG_MAX_BYTES:
-                fd = _reply_gate_fd(os.O_RDONLY)
+                fd = _reply_gate_fd()
                 with os.fdopen(fd, "rb") as f:
                     kept = f.read().splitlines(keepends=True)[-_REPLY_GATE_LOG_KEEP_LINES:]
                 data = b"".join(kept) + data
-                flags = os.O_WRONLY | os.O_TRUNC
+                rotate = True
         except OSError:
             pass
-        fd = _reply_gate_fd(flags)
-        with os.fdopen(fd, "ab" if flags & os.O_APPEND else "wb") as f:
+        # #4380: WRITE through the strict open (O_NOFOLLOW, single regular file, never O_TRUNC
+        # at open). A symlink, hard link or non-regular file is refused (nothing touched; one
+        # rate-limited stderr line names it) rather than appended to or truncated; the rotation
+        # truncates only on the validated fd. With no _hooklib there is no log (diagnostic only).
+        if _strict_open is None:
+            return
+        try:
+            fd = _strict_open(_REPLY_GATE_LOG, os.O_WRONLY | os.O_CREAT | (0 if rotate else os.O_APPEND))
+        except OSError as exc:
+            if type(exc).__name__ == "NotRegularFile" and _report_refused_write is not None:
+                _report_refused_write(exc)
+            return
+        if rotate:
+            try:
+                os.ftruncate(fd, 0)
+            except BaseException:
+                os.close(fd)
+                raise
+        with os.fdopen(fd, "wb" if rotate else "ab") as f:
             f.write(data)
     except Exception:  # noqa: BLE001
         pass

@@ -476,8 +476,9 @@ print(json.dumps({
     assert out["fifo"] == "OSError"
     assert out["regular"] == "ok"
     assert out["text"] == "héllo"
-    assert out["w_fifo_noreader"] == "OSError"
-    assert out["w_dir"] == "IsADirectoryError"
+    # #4380: the write helper is the strict open; a refusal is NotRegularFile (an OSError).
+    assert out["w_fifo_noreader"] == "NotRegularFile"
+    assert out["w_dir"] == "NotRegularFile"
 
 
 def test_write_helper_truncates_and_creates_like_open(tmp_path):
@@ -519,14 +520,14 @@ try:
         h.open_regular_text_write(root + "/f", encoding="utf-8").close()
         err = "no-error"
     except OSError as e:
-        err = e.errno
+        err = type(e).__name__
     try:
         got = os.read(rfd, 4096).decode()
     except BlockingIOError:
         got = ""
 finally:
     os.close(rfd)
-print(json.dumps({"errno": err, "einval": errno.EINVAL, "got": got}))
+print(json.dumps({"errno": err, "einval": "NotRegularFile", "got": got}))  # #4380: strict fstat refusal
 """)
     assert out["errno"] == out["einval"], out
     assert out["got"] == "", out  # the reader received zero bytes
@@ -540,8 +541,8 @@ try:
     h.open_regular_text_write("/dev/null", encoding="utf-8").close()
     err = "no-error"
 except OSError as e:
-    err = e.errno
-print(json.dumps({"errno": err, "einval": errno.EINVAL}))
+    err = type(e).__name__
+print(json.dumps({"errno": err, "einval": "NotRegularFile"}))  # #4380: strict fstat refusal
 """)
     assert out["errno"] == out["einval"], out
 

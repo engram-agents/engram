@@ -794,6 +794,21 @@ jobs:
         # file path is listed rather than node ids.
         run: python3 -m pytest -q tests/test_forum_process_spawn_ratchet_3518.py
 
+      - name: invariant-checks — truncating-write ratchet (#4380)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        # AST-scans every non-test .py under src/engram/ for a call that truncates or
+        # writes through a path name (os.open with O_TRUNC, also via a flags name; os.open
+        # with unresolved flags and no O_NOFOLLOW; builtin/module/Path open with a 'w' or
+        # 'a' mode or a non-constant mode; write_text, write_bytes; os.truncate;
+        # shutil.copy*; import aliases of these). The collector's blind spots are listed
+        # in the test's docstring. It
+        # fails on a site that is not in tests/data/truncating_writes_baseline_4380.txt,
+        # or on a baseline line whose site is gone (the baseline only shrinks). Like the
+        # forum ratchet above, it is a repo-level property a dev PR would otherwise never
+        # run (dev PRs run only this workflow; #4027 records that pr-checks skips some
+        # AST tests). Stdlib + pytest only, so the file path is listed.
+        run: python3 -m pytest -q tests/test_truncating_writes_ratchet_4380.py
+
       - name: invariant-checks — health L0 set hash (MAJOR-bump gate)
         if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Pins a SHA over the canonical L0 measurement set — every

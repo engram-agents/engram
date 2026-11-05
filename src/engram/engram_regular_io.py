@@ -156,8 +156,8 @@ def append_regular_line(path, text: str) -> None:
     FIFO / directory / socket; NotRegularFile otherwise, nothing touched) with
     O_APPEND|O_WRONLY|O_CREAT added, one write, close. UTF-8. For the
     diagnostic logs whose callers must degrade, not hang or write through a
-    link; the older open_regular_text_append follows symlinks and does not
-    check st_nlink, and its many callers keep that behaviour."""
+    link. open_regular_text_append (a text file object) has the same strict
+    open since #4380."""
     fd = _open_single_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
     try:
         _write_all(fd, (text + "\n").encode("utf-8"))
@@ -274,19 +274,34 @@ def read_regular_text(path, encoding=None):
         return f.read()
 
 
-def open_regular_text_write(path, encoding=None):
-    """`open(path, "w", encoding=encoding)` that must never block (#3591).
+def _on_refusal(exc):
+    """Called with the NotRegularFile a write/append open refused (#4380). The
+    core copy does nothing; `_hooklib` has its own `_on_refusal` that tells the
+    seat, once, which path is a link. Not pinned between the two files: the
+    call sites inside the shared helpers are."""
+    return None
 
-    A write-open of a FIFO waits for a reader. O_WRONLY|O_NONBLOCK makes that
-    fail at once with ENXIO when no reader exists (an OSError); and when a
-    reader does exist the fstat still rejects the FIFO before anything is
-    written. O_CREAT|O_TRUNC with mode 0o666 (umask applies) matches what
-    open(path, "w") does, so a regular file is created / truncated and written
-    exactly as before. Raises OSError for a non-regular target."""
-    fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_CREAT | os.O_TRUNC, 0o666)
+
+def open_regular_text_write(path, encoding=None):
+    """`open(path, "w", encoding=encoding)` that must never block (#3591) and
+    never truncate through a link (#4380).
+
+    The strict open of `write_pidfile` (O_WRONLY|O_CREAT|O_NOFOLLOW|O_NONBLOCK,
+    mode 0o666 so the umask applies, and NO O_TRUNC at open): a symlink, a
+    hard-linked file (st_nlink != 1), a FIFO, a directory or a device raises
+    NotRegularFile (an OSError subclass, so an `except OSError` caller keeps
+    working) and nothing is touched. Only after the fstat check passes is the
+    file truncated, with ftruncate on the validated descriptor. A reader-less
+    FIFO fails at once with ENXIO (mapped to NotRegularFile), never a wait.
+    Same compatibility trade as write_pidfile: on an odd or network-mounted
+    home a LEGITIMATE file can report st_nlink != 1 and be refused."""
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise _not_regular_error(fd, path)
+        fd = _open_single_regular(path, os.O_WRONLY | os.O_CREAT)
+    except NotRegularFile as exc:
+        _on_refusal(exc)
+        raise
+    try:
+        os.ftruncate(fd, 0)
         return os.fdopen(fd, "w", encoding=encoding)
     except BaseException:
         try:
@@ -297,17 +312,19 @@ def open_regular_text_write(path, encoding=None):
 
 
 def open_regular_text_append(path, encoding=None):
-    """`open(path, "a", encoding=encoding)` that must never block (#3628).
+    """`open(path, "a", encoding=encoding)` that must never block (#3628) and
+    never append through a link (#4380).
 
-    Same shape as open_regular_text_write, with O_APPEND|O_CREAT (no O_TRUNC)
-    and mode 0o666 (umask applies), matching open(path, "a"). A reader-less
-    FIFO fails at os.open with ENXIO; a FIFO that has a reader is rejected by
-    the fstat before any byte is written. Raises OSError for a non-regular
-    target."""
-    fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_APPEND | os.O_CREAT, 0o666)
+    The same strict open as open_regular_text_write with O_APPEND added and no
+    truncate: NotRegularFile for a symlink, a hard-linked file or anything
+    that is not a regular file, with nothing written. Mode 0o666 (umask
+    applies). Same st_nlink compatibility trade as write_pidfile."""
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise _not_regular_error(fd, path)
+        fd = _open_single_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    except NotRegularFile as exc:
+        _on_refusal(exc)
+        raise
+    try:
         return os.fdopen(fd, "a", encoding=encoding)
     except BaseException:
         try:

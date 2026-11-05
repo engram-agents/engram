@@ -189,7 +189,13 @@ def _write_status(home, result, stderr, sha, ab):
         "rewrite_guard": prev.get("rewrite_guard", "installed"),
     }
     tmp = path.with_name("." + path.name + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # #4380: deterministic tmp name, so a link planted there must not be written through:
+    # unlink it (removes the link, never its target), then create fresh with O_EXCL|O_NOFOLLOW.
+    try:
+        os.unlink(str(tmp))
+    except FileNotFoundError:
+        pass
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(doc, indent=2) + "\n")
     os.chmod(tmp, 0o600)

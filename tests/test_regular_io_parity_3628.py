@@ -54,7 +54,11 @@ SHARED = ["_not_regular_error", "open_regular_text", "read_regular_text",
           # read_regular_text; the two are pinned by the same AST cell. Its
           # behaviour table (incl. the ruling-5 symlink rows) is P1 in
           # tests/test_principle_trigger_state_writers_3521.py.
-          "read_state_json_classified"]
+          "read_state_json_classified",
+          # #4380: the strict open the write/append helpers now go through. Core owns
+          # it; _hooklib cannot import core, so it carries these copies (NotRegularFile,
+          # a class, is pinned by its own cell below).
+          "describe_file_kind", "_open_single_regular"]
 # The loop-arm hook's import-failure fallback copies (see module docstring).
 LOOP_ARM_FALLBACK = ["_not_regular_error", "open_regular_text"]
 # A generated module holding ONLY the fallback defs, importable like an impl.
@@ -133,9 +137,9 @@ p = os.path.join(ROOT, "f")
 try:
     impl.open_regular_text_write(p).close(); result = "no-error"
 except OSError as e:
-    result = [e.errno, errno.ENXIO]
+    result = [type(e).__name__, "NotRegularFile"]  # #4380: the strict open maps ENXIO
 """)
-    assert r == [r[1], r[1]], r  # ENXIO from os.open(O_NONBLOCK), not a hang
+    assert r == [r[1], r[1]], r  # refused at os.open(O_NONBLOCK) (ENXIO), not a hang
 
 
 @_NEEDS_FIFO
@@ -150,14 +154,14 @@ try:
         f = impl.open_regular_text_write(p)
         f.write("leak"); f.close(); err = "no-error"
     except OSError as e:
-        err = e.errno
+        err = type(e).__name__
     try:
         got = os.read(rfd, 4096).decode()
     except BlockingIOError:
         got = ""
 finally:
     os.close(rfd)
-result = {"err": err, "einval": errno.EINVAL, "got": got}
+result = {"err": err, "einval": "NotRegularFile", "got": got}  # #4380: refused by the strict fstat check
 """)
     assert r["err"] == r["einval"], r
     assert r["got"] == "", r  # zero bytes reached the reader
@@ -173,11 +177,11 @@ for name, fn in (("read", impl.read_regular_text), ("write", impl.open_regular_t
     try:
         fn(p); out[name] = "no-error"
     except OSError as e:
-        out[name] = e.errno
+        out[name] = e.errno if name == "read" else type(e).__name__
 result = out
 """)
     assert r["read"] == r["eisdir"], r
-    assert r["write"] == r["eisdir"], r
+    assert r["write"] == "NotRegularFile", r  # #4380: the write side is the strict open
 
 
 @pytest.mark.parametrize("impl", IMPLS)
@@ -190,11 +194,11 @@ for name, fn in (("read", impl.read_regular_text), ("write", impl.open_regular_t
     try:
         fn("/dev/null"); out[name] = "no-error"
     except OSError as e:
-        out[name] = e.errno
+        out[name] = e.errno if name == "read" else type(e).__name__
 result = out
 """)
     assert r["read"] == r["einval"], r
-    assert r["write"] == r["einval"], r
+    assert r["write"] == "NotRegularFile", r  # #4380: the write side is the strict open
 
 
 @pytest.mark.parametrize("impl", IMPLS)
@@ -289,6 +293,25 @@ def test_shared_helper_has_identical_ast_in_both_files(name):
         "the duplicated non-blocking helpers must stay identical (#3628)")
 
 
+def _class_dump(path: Path, name: str) -> str:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name]
+    assert len(found) == 1, f"{path.name}: expected exactly one top-level class {name}"
+    cls = found[0]
+    body = list(cls.body)
+    if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]  # docstring dropped, as for the functions
+    return ast.dump(ast.ClassDef(name=cls.name, bases=cls.bases, keywords=cls.keywords,
+                                 body=body, decorator_list=cls.decorator_list,
+                                 **({"type_params": []} if hasattr(cls, "type_params") else {})))
+
+
+def test_not_regular_file_class_has_identical_ast_in_both_files():
+    assert _class_dump(HOOKLIB, "NotRegularFile") == _class_dump(CORE_IO, "NotRegularFile"), (
+        "NotRegularFile differs between _hooklib.py and engram_regular_io.py (#4380)")
+
+
 # ------------------------------------------------- (a') behaviour: the append helper
 
 @_NEEDS_FIFO
@@ -300,9 +323,9 @@ p = os.path.join(ROOT, "f")
 try:
     impl.open_regular_text_append(p).close(); result = "no-error"
 except OSError as e:
-    result = [e.errno, errno.ENXIO]
+    result = [type(e).__name__, "NotRegularFile"]  # #4380: the strict open maps ENXIO
 """)
-    assert r == [r[1], r[1]], r  # ENXIO from os.open(O_NONBLOCK), not a hang
+    assert r == [r[1], r[1]], r  # refused at os.open(O_NONBLOCK) (ENXIO), not a hang
 
 
 @_NEEDS_FIFO
@@ -317,14 +340,14 @@ try:
         f = impl.open_regular_text_append(p)
         f.write("leak"); f.close(); err = "no-error"
     except OSError as e:
-        err = e.errno
+        err = type(e).__name__
     try:
         got = os.read(rfd, 4096).decode()
     except BlockingIOError:
         got = ""
 finally:
     os.close(rfd)
-result = {"err": err, "einval": errno.EINVAL, "got": got}
+result = {"err": err, "einval": "NotRegularFile", "got": got}  # #4380: refused by the strict fstat check
 """)
     assert r["err"] == r["einval"], r
     assert r["got"] == "", r  # zero bytes reached the reader
@@ -339,12 +362,12 @@ for name, p in (("dir", os.path.join(ROOT, "d")), ("null", "/dev/null")):
     try:
         impl.open_regular_text_append(p).close(); out[name] = "no-error"
     except OSError as e:
-        out[name] = e.errno
+        out[name] = type(e).__name__
 result = out
 """)
-    assert r["dir"] == r["eisdir"], r
+    assert r["dir"] == "NotRegularFile", r  # #4380: the strict open
     if os.path.exists("/dev/null"):
-        assert r["null"] == r["einval"], r
+        assert r["null"] == "NotRegularFile", r
 
 
 @pytest.mark.parametrize("impl", IMPLS)

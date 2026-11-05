@@ -1,0 +1,88 @@
+# #4380 ratchet baseline: truncating / text-writing call sites under src/engram/ that
+# are NOT yet routed through engram_regular_io's strict family. One line per site:
+# relative/path.py::<qualified function>::<route>. This file only SHRINKS: delete a line
+# when its site is fixed (the test fails on a stale line), never add one without review.
+# Regenerate NOTHING by script in a PR: a new line is a decision.
+# Round 2 (#4380 review): routes os.open:nonconst-flags, os.truncate, shutil.copy* and open:a were
+# added to the collector. The three os.open:nonconst-flags lines are READ-ONLY opens
+# (O_RDONLY plus an attribute lookup the collector cannot resolve); the other new lines are existing
+# append / copy sites, reviewed and left as they are.
+src/engram/bootstrap.py::_render_codex_target::write_text
+src/engram/bootstrap.py::_set_cleanup_period_days::write_text
+src/engram/bootstrap.py::main::write_text
+src/engram/bootstrap.py::main::write_text
+src/engram/bootstrap.py::merge_codex_config_toml::write_text
+src/engram/bootstrap.py::substitute_template::write_text
+src/engram/engram_core.py::_commit_snapshot_sync::write_text
+src/engram/engram_core.py::_ensure_engram_gitignore::write_text
+src/engram/engram_core.py::_install_rewrite_guard::write_bytes
+src/engram/engram_core.py::_maybe_run_daily_git_gc::write_text
+src/engram/engram_core.py::_rebuild_cornerstone_anchors_cache::open:w
+src/engram/engram_core.py::_rebuild_incidents_cache::open:w
+src/engram/engram_core.py::_reset_principle_enactments._do_reset::open:w
+src/engram/engram_core.py::_write_feeling_nudge::write_text
+src/engram/engram_epistemic.py::_update_incident_index::open:w
+src/engram/engram_home_registry.py::read_entry::os.open:nonconst-flags
+src/engram/engram_lifecycle.py::_append_nap_to_history._do_append::open:w
+src/engram/engram_lifecycle.py::_checkpoint_internal::open:a
+src/engram/engram_lifecycle.py::_checkpoint_internal::write_text
+src/engram/engram_observation.py::_log_anchoring_advisory::open:a
+src/engram/engram_observation.py::_requote_impl::open:w
+src/engram/engram_observation.py::_requote_impl::open:w
+src/engram/engram_query.py::_pattern_telemetry_log::open:a
+src/engram/engram_query.py::_write_person_moment_ledger::open:w
+src/engram/engram_snapshot_worker.py::_append_entry::open:a
+src/engram/engram_snapshot_worker.py::_compact_queue_locked::open:w
+src/engram/engram_snapshot_worker.py::_regenerate_derived_files::write_text
+src/engram/engram_telemetry_store.py::_write_telemetry_record_inner::open:a
+src/engram/health/engine.py::write_snapshot::write_text
+src/engram/health/engine.py::write_snapshot::write_text
+src/engram/health/engine.py::write_snapshot::write_text
+src/engram/hooks/claude/_engramd_owner_hook_io.py::launch::open:a
+src/engram/hooks/claude/engram-session-start-hook.py::write_session_start_overflow::write_text
+src/engram/server.py::_write_mcp_ready_marker::open:w
+src/engram/tools/backup_claude_projects.py::main::Module.open:w
+src/engram/tools/backup_claude_projects.py::main::shutil.copy*
+src/engram/tools/backup_knowledge_db.py::_write_watermark::open:w
+src/engram/tools/backup_session_logs.py::main::shutil.copy*
+src/engram/tools/baton_gate.py::_load_login_map::os.open:nonconst-flags
+src/engram/tools/baton_gate.py::_load_login_map::os.open:nonconst-flags
+src/engram/tools/check-claude-md-drift.py::_render_ref::write_text
+src/engram/tools/check_stale_processes.py::main::open:w
+src/engram/tools/cohort_dispatch.py::cmd_incorporate_retry::write_text
+src/engram/tools/cohort_dispatch.py::cmd_incorporate_retry::write_text
+src/engram/tools/cohort_dispatch.py::cmd_incorporate_retry::write_text
+src/engram/tools/cohort_dispatch.py::cmd_incorporate_retry::write_text
+src/engram/tools/cohort_dispatch.py::cmd_incorporate_retry::write_text
+src/engram/tools/cohort_dispatch.py::cmd_incorporate_retry::write_text
+src/engram/tools/cohort_dispatch.py::cmd_prepare::write_text
+src/engram/tools/cohort_dispatch.py::cmd_prepare::write_text
+src/engram/tools/cohort_dispatch.py::cmd_prepare::write_text
+src/engram/tools/cohort_dispatch.py::cmd_validate::write_text
+src/engram/tools/cohort_dispatch.py::cmd_validate::write_text
+src/engram/tools/cohort_dispatch.py::cmd_validate::write_text
+src/engram/tools/cohort_dispatch.py::cmd_validate::write_text
+src/engram/tools/compact-request.py::_atomic_write::open:w
+src/engram/tools/dream_lottery.py::append_history::open:a
+src/engram/tools/dream_lottery.py::save_state::write_text
+src/engram/tools/dream_pickup.py::_locked::open:a
+src/engram/tools/forum.py::_pack_publish::Module.open:w
+src/engram/tools/forum.py::_write_cursor::write_text
+src/engram/tools/ia.py::_write_cursor_int::write_text
+src/engram/tools/install_selfcheck.py::_restore_marker::write_bytes
+src/engram/tools/merge_batch.py::_save::write_text
+src/engram/tools/metricgate_adapter.py::append_attempt::open:a
+src/engram/tools/metricgate_adapter.py::append_run_record::open:a
+src/engram/tools/presence.py::set_mode::open:w
+src/engram/tools/release-cutover.py::main::shutil.copy*
+src/engram/tools/telemetry_manifest_gate.py::_write::open:w
+src/engram/tools/telemetry_manifest_gate.py::emit_dispatch_map::open:w
+src/engram/tools/write_sleep_marker.py::main::open:w
+src/engram/viz/data/config.py::write_config_key::open:w
+src/engram/viz/data/config.py::write_config_key::shutil.copy*
+src/engram/viz/data/config.py::write_config_key::shutil.copy*
+src/engram/viz/data/config.py::write_config_key::shutil.copy*
+src/engram/viz/data/config.py::write_config_key::shutil.copy*
+src/engram/viz/data/config.py::write_config_key::shutil.copy*
+src/engram/viz/server.py::Handler.log_message::open:a
+src/engram/viz/workbench.py::Handler.log_message::open:a

@@ -781,9 +781,12 @@ def test_s1_key_is_created_with_os_open_0600_no_chmod_window(capsys, monkeypatch
     monkeypatch.setattr(os, "open", recorder)
     tmp = _tmp()
     sheet, key, _ = _sample(tool, db, tmp, sims, capsys)
-    wanted = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    # #4380: the strict open never passes O_TRUNC at open (the truncate is an ftruncate on the
+    # checked fd), so a hard-linked key is refused before anything is truncated.
+    wanted = os.O_WRONLY | os.O_CREAT
     key_calls = [c for c in calls if c[0] == str(key)]
     assert key_calls and key_calls[0][1] & wanted == wanted and key_calls[0][2] == 0o600
+    assert key_calls[0][1] & os.O_TRUNC == 0 and key_calls[0][1] & os.O_NOFOLLOW
     assert not any(c[0] == str(sheet) and c[2] == 0o600 for c in calls)
 
 

@@ -56,6 +56,7 @@ from _hooklib import (
 # #3628: every file open here is non-blocking and regular-file-only (a FIFO at
 # a state path must not hang the hook); the helpers live in _hooklib.
 from _hooklib import open_regular_text, open_regular_text_write
+from _hooklib import NotRegularFile  # #4380: the strict write helper's refusal (an OSError)
 # #3628: every mode=ro sqlite connect refuses a FIFO / directory (raising a
 # sqlite3.OperationalError + OSError) instead of hanging.
 from _hooklib import connect_regular_ro, owner_bound_elapsed_text
@@ -3507,8 +3508,10 @@ def write_prompt_counter(state: dict):
         # a failure on a regular file still raises exactly as before.
         try:
             f = open_regular_text_write(COUNTER_PATH)
-        except OSError:
-            if os.path.exists(COUNTER_PATH) and not os.path.isfile(COUNTER_PATH):
+        except OSError as exc:
+            # #4380: a refused link (NotRegularFile) is skipped like a non-regular target.
+            if isinstance(exc, NotRegularFile) or (
+                    os.path.exists(COUNTER_PATH) and not os.path.isfile(COUNTER_PATH)):
                 return
             raise
         with f:
@@ -3539,10 +3542,11 @@ def check_write_reminder() -> str:
                 else:
                     with open_regular_text_write(WRITE_REMINDER_PATH) as f:
                         json.dump(marker, f)
-            except OSError:
-                # Only a non-regular target (swapped in after the read) is
-                # tolerated; any other OSError propagates as before.
-                if os.path.exists(WRITE_REMINDER_PATH) and not os.path.isfile(WRITE_REMINDER_PATH):
+            except OSError as exc:
+                # Only a non-regular target (swapped in after the read) or a
+                # refused link (#4380) is tolerated; any other OSError propagates as before.
+                if isinstance(exc, NotRegularFile) or (
+                        os.path.exists(WRITE_REMINDER_PATH) and not os.path.isfile(WRITE_REMINDER_PATH)):
                     return ""
                 raise
             return (
@@ -3685,8 +3689,9 @@ def check_repair_marker() -> str:
             else:
                 with open_regular_text_write(REPAIR_MARKER_PATH) as f:
                     json.dump(marker, f)
-        except OSError:
-            if os.path.exists(REPAIR_MARKER_PATH) and not os.path.isfile(REPAIR_MARKER_PATH):
+        except OSError as exc:
+            if isinstance(exc, NotRegularFile) or (
+                    os.path.exists(REPAIR_MARKER_PATH) and not os.path.isfile(REPAIR_MARKER_PATH)):
                 return ""
             raise
         tool_name = marker.get("tool_name", "?")

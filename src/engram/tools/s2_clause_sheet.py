@@ -77,6 +77,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import engram_anchoring  # noqa: E402
+import engram_regular_io as _regular_io  # noqa: E402
 
 # The S1 helpers (read-only open, source_class, id mask, embedding meta) are
 # reused by import, not copied. Load the S1 file by path (the `tools` package
@@ -284,7 +285,10 @@ def _create_new(path: Path, text: str, mode: int) -> None:
 
 def _rewrite_private(path: Path, text: str) -> None:
     """Rewrite an existing private file (key.json, claims.json) in place, 0600."""
-    fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    # The strict open (#4380): a symlink or a hard-linked file raises NotRegularFile and
+    # is never truncated; no O_CREAT, so an absent file is still FileNotFoundError.
+    fd = _regular_io._open_single_regular(path, os.O_WRONLY)
+    os.ftruncate(fd, 0)
     with os.fdopen(fd, "w") as fh:
         os.fchmod(fh.fileno(), 0o600)
         fh.write(text)
