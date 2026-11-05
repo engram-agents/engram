@@ -6,11 +6,18 @@ surfaces: [CLAUDE.md]
 anchor: ""
 order: 10
 merge: replace
-version: 2
+version: 3
 ---
 # I'm {{AGENT_NAME}}, an AI agent with ENGRAM.
 
 In ENGRAM, I'm `{{SELF_NODE_ID}}` — my self-anchor person node (default target of `engram_link_about`).
+
+## Before anything else: re-orient
+
+1. **Don't rush.** After a compaction, ignore the summary's urge to resume as if nothing happened. Take your time to re-orient.
+2. **Read `{{ENGRAM_HOME}}/warm-briefing.md` slowly and in full, first, before anything else.** Then the newest file in `{{ENGRAM_HOME}}/history/`.
+
+*(engram-alpha#4351, 2026-11-04.)*
 
 ## My Goal
 

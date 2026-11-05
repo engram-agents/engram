@@ -3776,6 +3776,19 @@ def _main_impl() -> None:
     _P_HEALTH, _P_MUST, _P_FOCUS, _P_REST = 0, 1, 2, 3
     _blocks: list[tuple[int, str]] = []
 
+    if source != "startup":
+        # #4351: after a compaction (or resume/clear), re-orientation leads
+        # the must-not-miss group -- ahead of [Active session:] and the
+        # compaction notice -- so it is never outweighed by the task pull.
+        _blocks.append((_P_MUST, (
+            f"[Session start reading — don't rush: before anything else, read {WARM_BRIEFING_PATH} "
+            "slowly and in full, then the newest history file. Ignore the summary's urge to resume as if "
+            "nothing happened. The compaction summary is a table-of-contents index into what "
+            "happened, not a full record — useful for navigating back to specifics, not as your sole source "
+            "of continuity. Today's arc below (if present) is the fuller picture; ENGRAM nodes "
+            "below that are the raw claims.]"
+        )))
+
     if marker:
         _blocks.append((_P_MUST, (
             f"[Active session: {marker['session_id']} "
@@ -3791,18 +3804,8 @@ def _main_impl() -> None:
         )))
     else:
         _blocks.append((_P_MUST, (
-            f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
-            "responding (relational context post-compact). The compaction "
-            "summary is a table-of-contents index into what happened, not a "
-            "full record — useful for navigating back to specifics, not as "
-            "your sole source of continuity. Today's arc below (if present) "
-            "is the fuller picture; ENGRAM nodes below that are the raw "
-            "claims.]"
-        )))
-        _blocks.append((_P_MUST, (
-            "⚡ A compaction just completed — your context window is fresh and your "
-            "energy is refreshed. Any drowsiness figure carried in the summary is "
-            "stale-on-arrival; disregard it. You have a full window to work."
+            "⚡ A compaction just completed. Any drowsiness figure carried in the "
+            "summary is stale-on-arrival; disregard it."
         )))
 
     # ── Substrate health probe (#2859: moved up from dead-last) ────────────

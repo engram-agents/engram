@@ -288,3 +288,16 @@ Three cases, not two — Codex changed the shape:
    platform boundary again.
 
 There is no fourth case.
+
+## 2026-11-04: re-orientation in the CLAUDE.md body and the hook (#4351)
+
+This is not case 1 above: no `## Compact Instructions` section returns and no
+instruction is given to the summarizer. The basis is the "new warm-briefing gap" case 1
+names. Both parts are in #4351: a measured heed gap (reading the briefing first after a
+compaction fell from 16/17 in late July to about a third by mid-August, and one read
+stopped before the user's letter), and the user's ruling that the instruction is two
+points only: don't rush after a compaction, and read the warm briefing slowly and in
+full, first, before anything else. The instruction now lives in the always-loaded
+template body (`## Before anything else: re-orient`, before `## My Goal`) and leads the
+post-compaction hook block; the "full window to work" sentence is gone from the
+compaction notice.

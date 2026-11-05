@@ -349,10 +349,12 @@ class TestSmallInputNothingCut:
         assert compaction_idx != -1, f"compaction notice (_P_MUST) missing: {ctx!r}"
         assert calib_idx != -1, f"calibration block (_P_REST) missing: {ctx!r}"
 
-        assert active_idx < reading_idx < compaction_idx, (
-            "within _P_MUST, the hook's existing relative order "
-            "(active-session, then session-start-reading, then compaction "
-            "notice) must be preserved"
+        # #4351: on a non-startup source the re-orient block now leads the
+        # group (session-start-reading, then active-session, then the
+        # compaction notice).
+        assert reading_idx < active_idx < compaction_idx, (
+            "within _P_MUST, the order is (session-start-reading re-orient "
+            "block, then active-session, then compaction notice) per #4351"
         )
         # #127 r3: _P_MUST now precedes _P_FOCUS (inverted from r1/r2's own
         # P1<P2 scheme -- see this class's docstring above).

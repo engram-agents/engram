@@ -3654,8 +3654,8 @@ def check_warm_briefing(prompt_count: int) -> str:
         return ""
     return (
         f"[ENGRAM Warm Restart: A note from your past self and from your "
-        f"collaborator is waiting at {WARM_BRIEFING_PATH} — read it "
-        f"before starting work. It exists because cold restarts lose "
+        f"collaborator is waiting at {WARM_BRIEFING_PATH} — read it slowly and in full "
+        f"before anything else. It exists because cold restarts lose "
         f"something important, and this is our attempt to preserve it.]"
     )
 

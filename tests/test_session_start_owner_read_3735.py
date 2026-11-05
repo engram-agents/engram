@@ -1515,13 +1515,65 @@ F_SCENARIOS = ["populated_startup_no_marker", "compact_with_checkpoint", "startu
                "embedding_flag_set", "no_focus_no_sets", "knowledge_sql_present"]
 
 
+def _advance_oracle_by_4351(old_stdout: str, new_stdout: str) -> str:
+    """#4351: the oracle is the
+    pre-#4351 hook, and #4351 deliberately changed exactly three things on the non-startup path,
+    so apply exactly those three to the oracle's output and nothing else: (1) the reading line's
+    text, (2) its position (now BEFORE `[Active session:`, was after), (3) the `⚡` notice's text.
+    The new strings are read from the current hook's own stdout by their stable prefixes, never
+    retyped here (cell 1 of test_post_compaction_reorient_4351.py pins the wording). Any shape
+    other than exactly one reading line and one notice line on each side FAILS; no fallback."""
+    READ, NOTICE, ACTIVE = "[Session start reading —", "⚡ A compaction just completed", "[Active session:"
+    KEPT_READ_FROM = "The compaction summary is a table-of-contents index"
+    KEPT_NOTICE = "Any drowsiness figure carried in the summary is stale-on-arrival; disregard it."
+
+    def ctx_lines(stdout):
+        out = json.loads(stdout)
+        assert json.dumps(out) + "\n" == stdout, "stdout is not the hook's one-line JSON form"
+        return out, out["hookSpecificOutput"]["additionalContext"].split("\n")
+
+    def only(lines, prefix, label):
+        hits = [i for i, ln in enumerate(lines) if ln.startswith(prefix)]
+        assert len(hits) == 1, (label, prefix, len(hits))
+        return hits[0]
+
+    old_obj, old_lines = ctx_lines(old_stdout)
+    _, new_lines = ctx_lines(new_stdout)
+    new_read = new_lines[only(new_lines, READ, "new")]
+    new_notice = new_lines[only(new_lines, NOTICE, "new")]
+    old_read = old_lines[only(old_lines, READ, "oracle")]
+    old_notice = old_lines[only(old_lines, NOTICE, "oracle")]
+    # Pin what #4351 KEPT: the substituted lines are copied whole from the new hook, so an edit to
+    # their retained text would otherwise go unseen. Each anchor must occur exactly once per line.
+    for label, anchor, a, b in (
+        ("reading line retained tail", KEPT_READ_FROM, old_read, new_read),
+        ("notice retained sentence", KEPT_NOTICE, old_notice, new_notice),
+    ):
+        assert a.count(anchor) == 1 and b.count(anchor) == 1, (
+            label, "anchor not exactly once (oracle, new)", anchor, a.count(anchor), b.count(anchor))
+    # The retained reading-line text runs from the anchor to the END of the line and must be
+    # identical in the oracle and the new hook (anchor present exactly once in each, above).
+    old_tail = old_read[old_read.index(KEPT_READ_FROM):]
+    new_tail = new_read[new_read.index(KEPT_READ_FROM):]
+    assert old_tail == new_tail, ("reading line: retained text (anchor to end of line) differs "
+                                  "between oracle and new hook", old_tail, new_tail)
+    old_lines.remove(old_read)
+    old_lines[only(old_lines, NOTICE, "oracle")] = new_notice
+    old_lines.insert(only(old_lines, ACTIVE, "oracle"), new_read)
+    old_obj["hookSpecificOutput"]["additionalContext"] = "\n".join(old_lines)
+    return json.dumps(old_obj) + "\n"
+
+
 @pytest.mark.parametrize("scenario", F_SCENARIOS)
 def test_f_flag_off_equals_the_unmodified_hook_byte_for_byte(scenario, tmp_path, monkeypatch, stub_modules):
     """The flag-OFF hook against the UNMODIFIED hook (`git show 4f475cf4:<path>`) on identical
     copies of one home: the same stdout, the same stderr, the same session/state files (times
     stripped). This is what proves the by-index rewrite and fix B changed nothing observable.
     Mutation: any behavioural change on the OFF path (a changed SQL byte, a wrong index, a
-    reordered block, an extra stderr line) -> red."""
+    reordered block, an extra stderr line) -> red.
+    #4351: for a non-startup source the oracle is advanced by exactly that issue's three changes
+    (reading line text, reading line position, `⚡` notice text) via `_advance_oracle_by_4351`;
+    every other byte, stderr and the state snapshot stay compared unchanged."""
     src_home = tmp_path / "src"
     src_home.mkdir()
     source = _scenario(src_home, scenario)
@@ -1538,6 +1590,8 @@ def test_f_flag_off_equals_the_unmodified_hook_byte_for_byte(scenario, tmp_path,
         run = run_main(mod, h, source)
         assert run.exc is None, (label, run.exc)
         results[label] = (norm_home(run.stdout, h), norm_home(run.stderr, h), _snapshot(h))
+    if source != "startup":
+        results["old"] = (_advance_oracle_by_4351(results["old"][0], results["new"][0]),) + results["old"][1:]
     assert results["new"] == results["old"]
     assert results["old"][0].strip(), "the reference fire produced no output"
 
