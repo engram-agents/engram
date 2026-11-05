@@ -3605,8 +3605,10 @@ def check_nap_backstop_refusal(session_id=None) -> tuple:
     ``compact/backstop-last.json``; its stderr never reaches the agent, so a refused request
     (e.g. a warm briefing older than the checkpoint) used to go unseen. This reads that record and,
     for outcome refused/error/timeout, returns the line for the (checkpoint_at, briefing_mtime_ns)
-    pair it describes, unless ``compact/backstop-surfaced.json`` already holds that pair. A record
-    with a non-empty ``session_id`` different from `session_id` is another session's: no line.
+    pair it describes, unless ``compact/backstop-surfaced.json`` already holds that pair. A refusal is
+    shown only to the session it names: a record whose ``session_id`` is missing, null or empty (every
+    record written before #4354) cannot be attributed, a record naming a different session is another
+    session's, and a call with no `session_id` has no session to match: all of these give no line.
     It WRITES NOTHING: the stamp is ``mark_nap_backstop_refusal_surfaced(pair)``, which main() calls
     only after emit_context rendered a context that holds the line. Any read or parse failure is
     silent: this never raises.
@@ -3618,7 +3620,7 @@ def check_nap_backstop_refusal(session_id=None) -> tuple:
         if not isinstance(last, dict) or last.get("outcome") not in ("refused", "error", "timeout"):
             return "", None
         record_session = last.get("session_id")
-        if isinstance(record_session, str) and record_session and record_session != session_id:
+        if not (isinstance(record_session, str) and record_session and record_session == session_id):
             return "", None
         pair = [last.get("checkpoint_at"), last.get("briefing_mtime_ns")]
         if not isinstance(pair[0], str) or not pair[0]:

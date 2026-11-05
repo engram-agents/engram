@@ -265,8 +265,46 @@ def test_n10_another_sessions_refusal_is_neither_shown_nor_stamped(tmp_path):
     assert len(marker_lines(surface_context(home, session_id=t4012.SESSION))) == 1
 
 
-def test_n10b_a_null_session_record_surfaces_to_any_session(tmp_path):
+# Removed-test: tests/test_nap_autocompact_4350.py::test_n10b_a_null_session_record_surfaces_to_any_session — it pinned the defect (a record naming no session shown to any session); replaced by the parametrized n10b below, which pins the opposite rule.
+@pytest.mark.parametrize("variant", ["missing", "null", "empty"])
+def test_n10b_a_record_naming_no_session_is_neither_shown_nor_stamped(variant, tmp_path):
+    """C3: a refusal that names no session (every pre-#4354 record) cannot be attributed, so nobody sees it."""
     home = refused_home(tmp_path, loop=False)
-    rec = t4012.backstop_last(home)
-    t4012._write_json(home / "compact" / "backstop-last.json", dict(rec, session_id=None))
-    assert len(marker_lines(surface_context(home, session_id="some-other-session"))) == 1
+    rec = dict(t4012.backstop_last(home))
+    if variant == "missing":
+        rec.pop("session_id")
+    else:
+        rec["session_id"] = None if variant == "null" else ""
+    t4012._write_json(home / "compact" / "backstop-last.json", rec)
+    assert marker_lines(surface_context(home, session_id="some-other-session")) == []
+    assert marker_lines(surface_context(home, session_id=t4012.SESSION)) == []
+    assert not (home / "compact" / "backstop-surfaced.json").exists()
+
+
+def test_n10e_an_empty_session_record_meets_an_empty_session_prompt_and_shows_nothing(tmp_path):
+    """C3b: an empty session_id on both sides is still no attribution."""
+    home = refused_home(tmp_path, loop=False)
+    rec = dict(t4012.backstop_last(home), session_id="")
+    t4012._write_json(home / "compact" / "backstop-last.json", rec)
+    assert marker_lines(surface_context(home, session_id="")) == []
+    assert not (home / "compact" / "backstop-surfaced.json").exists()
+
+
+def test_n10c_a_prompt_with_no_session_id_shows_nothing_whatever_the_record_holds(tmp_path):
+    """C4: a refusal cannot be matched to an unknown session."""
+    home = refused_home(tmp_path, loop=False)
+    assert t4012.backstop_last(home)["session_id"] == t4012.SESSION
+    assert marker_lines(surface_context(home, session_id=None)) == []
+    rec = dict(t4012.backstop_last(home), session_id=None)
+    t4012._write_json(home / "compact" / "backstop-last.json", rec)
+    assert marker_lines(surface_context(home, session_id=None)) == []
+    assert not (home / "compact" / "backstop-surfaced.json").exists()
+
+
+@pytest.mark.parametrize("outcome", ["written", "ok", "something-else"])
+def test_n10d_a_non_failure_outcome_for_this_session_shows_nothing(outcome, tmp_path):
+    """C5: only refused/error/timeout are shown, even when the record names this very session."""
+    home = refused_home(tmp_path, loop=False)
+    rec = dict(t4012.backstop_last(home), outcome=outcome)
+    t4012._write_json(home / "compact" / "backstop-last.json", rec)
+    assert marker_lines(surface_context(home, session_id=t4012.SESSION)) == []
