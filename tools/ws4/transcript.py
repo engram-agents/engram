@@ -25,6 +25,15 @@ Transcript layout is exactly as measured in ws4-adjudication-kit.md's
     agent's own acts. Excluded from windows, outbound-act detection, and O2
     counts throughout this module.
 
+  - Sub-agent files (opt-in, own_agent_id given -- the WS4 sub-agent
+    stratum, engram-alpha#2753 D11 ruling): inside ONE sub-agent
+    transcript every record is isSidechain:true, so the global exclusion
+    would leave nothing. There the acting agent's records are those whose
+    agentId equals the file's own agent id; records with a different or
+    absent agentId (anything nested deeper) stay excluded. The mode is an
+    explicit own_agent_id parameter (None = main transcript, the default
+    and the registered behaviour), never a module-level switch.
+
 Everything else (system subtypes stop_hook_summary / turn_duration /
 scheduled_task_fire, pr-link, mode, ...) is ignored, per spec.
 """
@@ -86,10 +95,23 @@ def is_sidechain(record: dict) -> bool:
     return bool(record.get("isSidechain"))
 
 
-def is_human_prompt(record: dict) -> bool:
+def is_excluded(record: dict, own_agent_id=None) -> bool:
+    """True if the record is not the acting agent's own act.
+
+    Main-transcript mode (own_agent_id None): every isSidechain record is
+    excluded -- exactly the registered behaviour. Sub-agent mode: the
+    acting agent's records are those whose agentId equals own_agent_id
+    (they count even though isSidechain is true); a different or missing
+    agentId stays excluded."""
+    if own_agent_id is None:
+        return is_sidechain(record)
+    return record.get("agentId") != own_agent_id
+
+
+def is_human_prompt(record: dict, own_agent_id=None) -> bool:
     """A {"type": "user"} record whose content is text, not a tool_result,
     and that is not isCompactSummary (spec, transcript-layout section)."""
-    if is_sidechain(record):
+    if is_excluded(record, own_agent_id):
         return False
     if record.get("type") != "user":
         return False
@@ -109,9 +131,9 @@ def is_compaction_boundary(record: dict) -> bool:
     return record.get("type") == "system" and record.get("subtype") == "compact_boundary"
 
 
-def _next_non_sidechain(records: list, start_idx: int):
+def _next_non_sidechain(records: list, start_idx: int, own_agent_id=None):
     for j in range(start_idx + 1, len(records)):
-        if not is_sidechain(records[j]):
+        if not is_excluded(records[j], own_agent_id):
             return j
     return None
 
@@ -127,14 +149,14 @@ def _parse_ts(value) -> "float | None":
     return None
 
 
-def find_fired_tool_use(records: list, tool_use_id, tool_name, ts) -> "FiredCall | None":
+def find_fired_tool_use(records: list, tool_use_id, tool_name, ts, own_agent_id=None) -> "FiredCall | None":
     """Locate the fired tool call: by tool_use_id when present; otherwise
     by the nearest assistant tool_use to ts with matching tool_name (spec,
     Piece 1). locate_basis records which strategy found it: "tool_use_id"
     or "nearest_ts"."""
     if tool_use_id:
         for ridx, rec in enumerate(records):
-            if is_sidechain(rec) or rec.get("type") != "assistant":
+            if is_excluded(rec, own_agent_id) or rec.get("type") != "assistant":
                 continue
             for cidx, item in enumerate(get_message_content(rec)):
                 if isinstance(item, dict) and item.get("type") == "tool_use" and item.get("id") == tool_use_id:
@@ -145,7 +167,7 @@ def find_fired_tool_use(records: list, tool_use_id, tool_name, ts) -> "FiredCall
     best = None
     best_distance = None
     for ridx, rec in enumerate(records):
-        if is_sidechain(rec) or rec.get("type") != "assistant":
+        if is_excluded(rec, own_agent_id) or rec.get("type") != "assistant":
             continue
         rec_ts = _parse_ts(rec.get("timestamp"))
         for cidx, item in enumerate(get_message_content(rec)):
@@ -163,7 +185,7 @@ def find_fired_tool_use(records: list, tool_use_id, tool_name, ts) -> "FiredCall
     return best
 
 
-def compute_window(records: list, fired: FiredCall, k: int) -> WindowResult:
+def compute_window(records: list, fired: FiredCall, k: int, own_agent_id=None) -> WindowResult:
     """Heeding window: starts after the fired call; closes at the FIRST of
     (a) k further tool calls, or (b) the first OUTBOUND ACT. The fired call
     never closes its own window -- only content strictly after
@@ -183,7 +205,7 @@ def compute_window(records: list, fired: FiredCall, k: int) -> WindowResult:
     calls_counted = 0
     for ridx in range(fired.record_idx, n):
         rec = records[ridx]
-        if is_sidechain(rec):
+        if is_excluded(rec, own_agent_id):
             continue
         if rec.get("type") == "assistant":
             content = get_message_content(rec)
@@ -202,13 +224,19 @@ def compute_window(records: list, fired: FiredCall, k: int) -> WindowResult:
             # LAST content item of its turn, with the next non-sidechain
             # record being a human-typed prompt (not a tool_result).
             if content and isinstance(content[-1], dict) and content[-1].get("type") == "text":
-                nxt_idx = _next_non_sidechain(records, ridx)
-                if nxt_idx is not None and is_human_prompt(records[nxt_idx]):
+                nxt_idx = _next_non_sidechain(records, ridx, own_agent_id)
+                if nxt_idx is not None and is_human_prompt(records[nxt_idx], own_agent_id):
+                    return WindowResult(ridx, "outbound_act", calls_counted, k)
+                # Sub-agent mode only: the sub-agent's final text ends the
+                # file -- no later prompt will ever follow it -- and that
+                # ending of its turn is the same third category. Main
+                # transcripts keep their end_of_transcript fallback below.
+                if nxt_idx is None and own_agent_id is not None:
                     return WindowResult(ridx, "outbound_act", calls_counted, k)
     return WindowResult(n - 1, "end_of_transcript", calls_counted, k)
 
 
-def find_tripwire_attachment(records: list, fired: FiredCall):
+def find_tripwire_attachment(records: list, fired: FiredCall, own_agent_id=None):
     """The attachment record carrying THIS fire's own tripwire stdout:
     toolUseID == the located call's own transcript id (never the ledger
     row's tool_use_id field directly -- when that was null, the id we
@@ -226,7 +254,7 @@ def find_tripwire_attachment(records: list, fired: FiredCall):
         return None
     for ridx in range(fired.record_idx, len(records)):
         rec = records[ridx]
-        if is_sidechain(rec) or rec.get("type") != "attachment":
+        if is_excluded(rec, own_agent_id) or rec.get("type") != "attachment":
             continue
         att = rec.get("attachment") or {}
         if att.get("toolUseID") != call_id:
@@ -308,7 +336,10 @@ def _render_tool_result(item: dict) -> str:
     return str(content)
 
 
-def build_span(records: list, fired: FiredCall, window: WindowResult, fire_id: str, k: int, redact_chain: bool = True) -> str:
+def build_span(
+    records: list, fired: FiredCall, window: WindowResult, fire_id: str, k: int, redact_chain: bool = True,
+    own_agent_id=None,
+) -> str:
     """Render one fire's markdown span: the fired call, the nudge text
     (verbatim, chain-redacted if redact_chain), then each subsequent
     call/result/text up to the window close. Header carries the fire id,
@@ -328,7 +359,7 @@ def build_span(records: list, fired: FiredCall, window: WindowResult, fire_id: s
     lines.append(_render_tool_use({"name": fired.tool_name, "input": fired.tool_input}))
     lines.append("")
 
-    attachment = find_tripwire_attachment(records, fired)
+    attachment = find_tripwire_attachment(records, fired, own_agent_id)
     lines.append("## Nudge (verbatim)")
     if attachment is None:
         lines.append("_(tripwire attachment not found in transcript)_")
@@ -343,7 +374,7 @@ def build_span(records: list, fired: FiredCall, window: WindowResult, fire_id: s
     call_number = 0
     for ridx in range(fired.record_idx, window.end_record_idx + 1):
         rec = records[ridx]
-        if is_sidechain(rec):
+        if is_excluded(rec, own_agent_id):
             continue
         if ridx == fired.record_idx:
             content = get_message_content(rec)

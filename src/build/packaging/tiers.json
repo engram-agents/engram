@@ -1440,7 +1440,7 @@
     },
     {
       "path": "tools/ws4",
-      "reason": "offline, read-only, stdlib-only adjudication kit for the WS4 chain-A/B tripwire experiment (epic #2753): extract_spans.py cuts blinded heeding-window spans from a fire ledger + transcripts for a human adjudicator, analyze.py computes the pre-registered O1/O2/length-control statistics from the adjudicator's verdicts. Never imported by the shipped hook or server; run by hand by the researcher analyzing one experiment. Same shape as tools/propose-generalizes-migration.py's entry directly above: an offline analyst tool for this epic, never shipped in any install tier."
+      "reason": "offline, read-only, stdlib-only adjudication kit for the WS4 chain-A/B tripwire experiment (epic #2753): extract_spans.py cuts blinded heeding-window spans from a fire ledger + transcripts for a human adjudicator, analyze.py computes the pre-registered O1/O2/length-control statistics from the adjudicator's verdicts, merge_spans.py merges the primary and sub-agent span directories into one flat fire-id-ordered delivery list. Never imported by the shipped hook or server; run by hand by the researcher analyzing one experiment. Same shape as tools/propose-generalizes-migration.py's entry directly above: an offline analyst tool for this epic, never shipped in any install tier."
     },
     {
       "path": "tools/selftest.py",

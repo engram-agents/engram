@@ -63,6 +63,17 @@ verdict=="heeded" and corrective_at<=K; otherwise it is walked_past at K.
 The headline reported by main() is K_PRIMARY; the full sweep + whether the
 arm-difference sign holds across K is reported alongside it.
 
+EXPLORATORY sub-agent stratum (engram-alpha#2753, D11 ruling 2026-11-06): the
+optional --subagent-dir DIR (once per --seat; "-" skips a seat) names the
+<out>/subagent/ subtree that extract_spans.py --subagent-stratum wrote. The
+primary report above is untouched (byte-identical when the option is
+absent); the stratum is reported afterwards in its own block labelled
+"EXPLORATORY (added 2026-11-06 before any outcome was read): sub-agent
+stratum": O1 at K_PRIMARY plus the K-sweep, NO O2. No O1 or count is ever
+pooled across the two strata -- inputs that would mix them (a sub-agent
+key/flags/unlocatable file passed as primary, or one fire_id in both keys)
+are refused with a non-zero exit naming the conflict.
+
 Read-only: never writes to the ledger, to knowledge.db, or to any
 adjudicator-facing file. Stdlib only.
 
@@ -676,6 +687,62 @@ def compute_denominators(seats: "list[SeatInputs]", unlocatable_paths=None):
     }
 
 
+EXPLORATORY_LABEL = "EXPLORATORY (added 2026-11-06 before any outcome was read): sub-agent stratum"
+
+
+class StratumMixError(ValueError):
+    """Inputs that would pool the primary and the sub-agent strata."""
+
+
+def _refuse_stratum_file_as_primary(path, label: str) -> None:
+    """A sub-agent subtree is recognised by its analyst-only stratum.jsonl
+    sitting beside key/flags/unlocatable.jsonl. Passing one of those files
+    as a PRIMARY input would mix the strata, so refuse (no stratum.jsonl
+    exists beside a primary file, so today's invocations never trip this)."""
+    if path is None:
+        return
+    if (Path(path).parent / "stratum.jsonl").exists():
+        raise StratumMixError(
+            f"sub-agent stratum file passed as the primary {label}: {path} "
+            "(it sits beside a stratum.jsonl); the strata are never pooled -- "
+            "pass it via --subagent-dir instead"
+        )
+
+
+def compute_subagent_stratum(sub_seats: "list[SeatInputs]", unlocatable_paths):
+    """The exploratory stratum's own numbers: O1 at K_PRIMARY, the K-sweep
+    and a denominators subset -- all over the stratum's key rows only. There
+    is deliberately no O2 here and no function that takes both strata."""
+    denominators = compute_denominators(sub_seats, unlocatable_paths)
+    return {
+        "o1": compute_o1(sub_seats, K_PRIMARY),
+        "o1_k_sweep": compute_o1_k_sweep(sub_seats),
+        "denominators": {
+            key: denominators[key]
+            for key in ("fires_by_arm", "unclear", "dropped_privacy", "unlocatable", "unlocatable_by_arm")
+        },
+    }
+
+
+def _print_subagent_block(stratum: dict) -> None:
+    print(f"\n== {EXPLORATORY_LABEL} ==")
+    print("(a separate stratum: nothing below is combined with, or compared to, the primary report above)")
+    for name, value in stratum["denominators"].items():
+        print(f"{name}: {value}")
+    o1 = stratum["o1"]
+    print(f"\nO1 at K_PRIMARY={K_PRIMARY} (arm difference only; this stratum only)")
+    print(f"all seats, this stratum arm_difference={o1['pooled']['arm_difference']}")
+    for seat, summary in o1["per_seat"].items():
+        print(f"  seat={seat} arm_difference={summary['arm_difference']}")
+    print(f"flagged (excluded from tally above): {o1['flagged_excluded']}")
+    print(f"dropped_privacy (excluded from tally above): {o1['dropped_excluded']}")
+    print("O1 K-sweep (this stratum only)")
+    for k, summary in stratum["o1_k_sweep"]["by_k"].items():
+        print(f"  K={k} arm_difference={summary['pooled']['arm_difference']}")
+    print(f"sign_stable={stratum['o1_k_sweep']['sign_stable']}")
+    print("O2 is not reported for this stratum.")
+
+
 def _print_sample_report(sample_report: dict) -> None:
     """Amendment 3's printed section (#2753): one line per seat with
     eligible / sampled / fraction / days, then that seat's per-lesson
@@ -823,6 +890,16 @@ def main(argv=None) -> int:
             "the consequence. Mutually exclusive with --sample-summary."
         ),
     )
+    parser.add_argument(
+        "--subagent-dir",
+        action="append",
+        default=None,
+        help=(
+            "EXPLORATORY sub-agent stratum (D11 ruling): the <out>/subagent/ directory written by "
+            "extract_spans.py --subagent-stratum (repeatable, once per --seat; '-' skips a seat). "
+            "Reported in its own labelled block, O1 only, never pooled with the primary report."
+        ),
+    )
     parser.add_argument("--db", default=None, help="knowledge.db path, read-only (for O2 situation_pattern lookups)")
     args = parser.parse_args(argv)
 
@@ -872,6 +949,21 @@ def main(argv=None) -> int:
             )
         sample_summary_list = args.sample_summary
 
+    subagent_dirs = args.subagent_dir
+    if subagent_dirs is not None and len(subagent_dirs) != n:
+        parser.error(f"--subagent-dir must be given once per --seat (got {len(subagent_dirs)}, expected {n})")
+
+    try:
+        for key_path in args.key:
+            _refuse_stratum_file_as_primary(key_path, "--key")
+        for flags_path in flags_list:
+            _refuse_stratum_file_as_primary(flags_path, "--flags")
+        for unlocatable_path in args.unlocatable or []:
+            _refuse_stratum_file_as_primary(unlocatable_path, "--unlocatable")
+    except StratumMixError as exc:
+        print(f"analyze: {exc}", file=sys.stderr)
+        return 2
+
     seats = []
     for seat, ledger_path, verdicts_path, key_path, flags_path, drops_path, sample_summary_pattern in zip(
         args.seat, args.ledger, args.verdicts, args.key, flags_list, drops_list, sample_summary_list
@@ -892,6 +984,38 @@ def main(argv=None) -> int:
             )
         )
 
+    sub_seats = []
+    sub_unlocatable_paths = []
+    if subagent_dirs is not None:
+        primary_ids = {fire_id for seat_inputs in seats for fire_id in seat_inputs.key}
+        for seat_inputs, sub_dir in zip(seats, subagent_dirs):
+            if sub_dir == "-":
+                continue
+            sub_path = Path(sub_dir)
+            if not (sub_path / "stratum.jsonl").exists():
+                print(f"analyze: --subagent-dir {sub_dir!r} has no stratum.jsonl -- not a sub-agent subtree", file=sys.stderr)
+                return 2
+            sub_key = load_key(sub_path / "key.jsonl")
+            shared = sorted(primary_ids & set(sub_key))
+            if shared:
+                print(
+                    "analyze: fire_id(s) present in both the primary key and the sub-agent stratum key "
+                    f"(the strata are never pooled): {', '.join(shared)}",
+                    file=sys.stderr,
+                )
+                return 2
+            sub_seats.append(
+                SeatInputs(
+                    seat=seat_inputs.seat,
+                    ledger_rows=seat_inputs.ledger_rows,
+                    key=sub_key,
+                    verdicts=seat_inputs.verdicts,
+                    flags=({} if args.no_flags else load_flags(sub_path / "flags.jsonl")),
+                    drops=seat_inputs.drops,
+                )
+            )
+            sub_unlocatable_paths.append(str(sub_path / "unlocatable.jsonl"))
+
     o1_headline = compute_o1(seats, K_PRIMARY)
     o1_k_sweep = compute_o1_k_sweep(seats)
     length_control = compute_length_control(seats)
@@ -909,6 +1033,8 @@ def main(argv=None) -> int:
         sample_report=sample_report,
         no_sample_summary_warning=args.no_sample_summary,
     )
+    if sub_seats:
+        _print_subagent_block(compute_subagent_stratum(sub_seats, sub_unlocatable_paths))
     return 0
 
 

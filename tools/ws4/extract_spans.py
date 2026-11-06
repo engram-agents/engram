@@ -49,6 +49,20 @@ dropped. Piece 1's invariant (amendment 3: over SAMPLED fires, not every
 eligible fire): sampled == spans_out + unlocatable, and eligible ==
 sampled + unsampled, both printed at the end of every run.
 
+Opt-in exploratory sub-agent stratum (engram-alpha#2753, the design owner's
+D11 ruling of 2026-11-06): with --subagent-stratum, each SAMPLED row that
+ends as call_not_located above is looked up in the sub-agent transcripts of
+its OWN session -- <dir of transcript_path>/<session-id>/subagents/
+agent-<id>.jsonl -- by tool_use_id only (no timestamp fallback). Exactly one
+file matches: the span is cut from it (that file's own agentId records are
+the acting agent; see transcript.is_excluded). None: reason call_not_located.
+More than one: reason ambiguous_subagent. Everything lands ONLY under
+<out>/subagent/ (spans/, key.jsonl, flags.jsonl, unlocatable.jsonl, and the
+analyst-only stratum.jsonl with agent type / model / file name); every
+top-level output stays byte-identical to a run without the flag, and the
+rows stay unlocatable in the primary denominators. The span header carries
+the fire id only. Without the flag nothing changes.
+
 Read-only: never writes to the ledger or to knowledge.db. Stdlib only.
 
 Usage:
@@ -79,6 +93,7 @@ from .ledger import (
 )
 from .transcript import (
     TranscriptReadError,
+    get_message_content,
     build_span,
     compute_window,
     find_fired_tool_use,
@@ -94,6 +109,41 @@ def default_ledger_path() -> str:
     """$ENGRAM_HOME/tripwire-fire-ledger.jsonl through the one resolver (#3863): a RELATIVE ENGRAM_HOME raises
     ValueError naming it (main() turns that into a one-line refusal, exit 2)."""
     return str(owner_read.engram_home() / "tripwire-fire-ledger.jsonl")
+
+
+def _extract_from_records(row: dict, fire_id: str, records: list, k: int, redact_chain: bool, own_agent_id=None):
+    """Locate-and-cut over already-loaded records (shared by the main path
+    and the sub-agent stratum; own_agent_id None = main-transcript mode)."""
+    fired = find_fired_tool_use(
+        records, row.get("tool_use_id"), row.get("tool_name"), row.get("ts"), own_agent_id=own_agent_id
+    )
+    if fired is None:
+        return {"fire_id": fire_id, "ok": False, "reason": "call_not_located"}
+
+    attachment = find_tripwire_attachment(records, fired, own_agent_id=own_agent_id)
+    if attachment is None:
+        return {
+            "fire_id": fire_id,
+            "ok": False,
+            "reason": "tripwire_attachment_not_found",
+            "locate_basis": fired.locate_basis,
+        }
+
+    window = compute_window(records, fired, k, own_agent_id=own_agent_id)
+    span_text = build_span(records, fired, window, fire_id, k, redact_chain=redact_chain, own_agent_id=own_agent_id)
+    heads = flatten_heads(row.get("heads_by_lesson"))
+    flagged = head_named_in_span(span_text, heads)
+
+    return {
+        "fire_id": fire_id,
+        "ok": True,
+        "span_text": span_text,
+        "locate_basis": fired.locate_basis,
+        "close_reason": window.close_reason,
+        "head_named_in_span": flagged,
+        "heads": heads,
+        "arm": row.get("arm"),
+    }
 
 
 def extract_one(row: dict, k: int, redact_chain: bool = REDACT_CHAIN):
@@ -113,34 +163,113 @@ def extract_one(row: dict, k: int, redact_chain: bool = REDACT_CHAIN):
     except TranscriptReadError as exc:
         return {"fire_id": fire_id, "ok": False, "reason": f"transcript_unreadable: {exc}"}
 
-    fired = find_fired_tool_use(records, row.get("tool_use_id"), row.get("tool_name"), row.get("ts"))
-    if fired is None:
-        return {"fire_id": fire_id, "ok": False, "reason": "call_not_located"}
+    return _extract_from_records(row, fire_id, records, k, redact_chain)
 
-    attachment = find_tripwire_attachment(records, fired)
-    if attachment is None:
-        return {
-            "fire_id": fire_id,
-            "ok": False,
-            "reason": "tripwire_attachment_not_found",
-            "locate_basis": fired.locate_basis,
-        }
 
-    window = compute_window(records, fired, k)
-    span_text = build_span(records, fired, window, fire_id, k, redact_chain=redact_chain)
-    heads = flatten_heads(row.get("heads_by_lesson"))
-    flagged = head_named_in_span(span_text, heads)
+# --- opt-in sub-agent stratum (D11 ruling, contract items a to g) -----------
 
-    return {
-        "fire_id": fire_id,
-        "ok": True,
-        "span_text": span_text,
-        "locate_basis": fired.locate_basis,
-        "close_reason": window.close_reason,
-        "head_named_in_span": flagged,
-        "heads": heads,
-        "arm": row.get("arm"),
-    }
+
+def subagents_dir_for(transcript_path):
+    """<dir>/<session-id>/subagents for a main transcript <dir>/<session-id>.jsonl
+    -- derived from the row's OWN transcript_path, never another session's.
+    None when the path is not a usable string."""
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    p = Path(transcript_path)
+    if ".." in p.parts:
+        # A path that navigates is not provably this row's own session:
+        # the resolve()-containment check below is self-consistent for it
+        # (the directory it names resolves to itself), so refuse it here.
+        return None
+    return p.parent / p.stem / "subagents"
+
+
+def _subagent_id_from_name(path: Path) -> str:
+    """agent-<id>.jsonl -> <id> (the file's own agentId)."""
+    return path.stem[len("agent-"):]
+
+
+def _file_has_tool_use(records: list, agent_id: str, tool_use_id: str) -> bool:
+    """True if tool_use_id is the id of a tool_use block in an assistant
+    record of this file's own agent (match by id only; no timestamp
+    fallback)."""
+    for rec in records:
+        if rec.get("agentId") != agent_id or rec.get("type") != "assistant":
+            continue
+        for item in get_message_content(rec):
+            if isinstance(item, dict) and item.get("type") == "tool_use" and item.get("id") == tool_use_id:
+                return True
+    return False
+
+
+def locate_subagent_files(row: dict) -> list:
+    """All (path, agent_id, records) in the row's own session's subagents/
+    directory whose own-agent assistant records carry the row's
+    tool_use_id. Empty when the row has no tool_use_id, the directory does
+    not exist, or nothing matches."""
+    tool_use_id = row.get("tool_use_id")
+    sub_dir = subagents_dir_for(row.get("transcript_path"))
+    if not tool_use_id or sub_dir is None or not sub_dir.is_dir():
+        return []
+    root = sub_dir.resolve()
+    matches = []
+    for path in sorted(sub_dir.glob("agent-*.jsonl")):
+        # Own session only, enforced: a match whose resolved path lies
+        # outside this session's resolved subagents/ (a symlink to another
+        # session's file) is skipped, not followed.
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        agent_id = _subagent_id_from_name(path)
+        try:
+            records = load_transcript(path)
+        except TranscriptReadError:
+            continue
+        if _file_has_tool_use(records, agent_id, tool_use_id):
+            matches.append((path, agent_id, records))
+    return matches
+
+
+def _stratum_facts(path, agent_id, records):
+    """Analyst-only: agent type (meta.json beside the file) and model (first
+    assistant record that names one)."""
+    agent_type = None
+    meta_path = Path(path).with_name(f"agent-{agent_id}.meta.json")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if isinstance(meta, dict) and isinstance(meta.get("agentType"), str):
+            agent_type = meta["agentType"]
+    except (OSError, ValueError):
+        pass
+    model = None
+    for rec in records:
+        if rec.get("type") == "assistant":
+            m = (rec.get("message") or {}).get("model")
+            if isinstance(m, str):
+                model = m
+                break
+    return agent_type, model
+
+
+def extract_subagent_one(row: dict, k: int, redact_chain: bool = REDACT_CHAIN):
+    """The stratum lookup for one row that ended call_not_located in its main
+    transcript. Returns the extract_one dict plus agent_type / model /
+    subagent_file (None where unknown). Never raises."""
+    fire_id = compute_fire_id(row)
+    base = {"agent_type": None, "model": None, "subagent_file": None}
+    if not row.get("tool_use_id"):
+        return {"fire_id": fire_id, "ok": False, "reason": "call_not_located", **base}
+    matches = locate_subagent_files(row)
+    if not matches:
+        return {"fire_id": fire_id, "ok": False, "reason": "call_not_located", **base}
+    if len(matches) > 1:
+        return {"fire_id": fire_id, "ok": False, "reason": "ambiguous_subagent", **base}
+    path, agent_id, records = matches[0]
+    agent_type, model = _stratum_facts(path, agent_id, records)
+    result = _extract_from_records(row, fire_id, records, k, redact_chain, own_agent_id=agent_id)
+    result.update({"agent_type": agent_type, "model": model, "subagent_file": path.name})
+    return result
 
 
 def _sample_sort_key(fire_id: str, sample_seed: str):
@@ -161,11 +290,16 @@ def run(
     redact_chain: bool = REDACT_CHAIN,
     sample_n: int = SAMPLE_N,
     sample_seed: str = SAMPLE_SEED,
+    subagent_stratum: bool = False,
 ) -> dict:
     rows = load_jsonl(ledger_path)
     selected = rows_for_date_and_arms(rows, date_str, ADJUDICATION_ARMS)
 
     out = Path(out_dir)
+    if subagent_stratum:
+        # Checked BEFORE the first write of any kind, so a refused run
+        # leaves no half-written stratum and touches no top-level output.
+        _require_fresh_stratum_dir(out)
     spans_dir = out / "spans"
     spans_dir.mkdir(parents=True, exist_ok=True)
 
@@ -207,6 +341,9 @@ def run(
     unlocatable_rows = []
     flags_rows = []
     spans_out = 0
+    # Rows that ended call_not_located in their own main transcript -- the
+    # only rows the opt-in sub-agent stratum ever looks at.
+    stratum_candidates = []
 
     for idx, row in enumerate(selected):
         fire_id = fire_ids[idx]
@@ -227,6 +364,8 @@ def run(
                     "reason": result["reason"],
                 }
             )
+            if result["reason"] == "call_not_located":
+                stratum_candidates.append(row)
             continue
 
         (spans_dir / f"{fire_id}.md").write_text(result["span_text"], encoding="utf-8")
@@ -283,13 +422,92 @@ def run(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    return {
+    subagent_report = None
+    if subagent_stratum:
+        subagent_report = _run_subagent_stratum(stratum_candidates, k, out, redact_chain)
+
+    report = {
         "rows_in": eligible,
         "eligible": eligible,
         "sampled": sampled_n,
         "unsampled": unsampled_n,
         "spans_out": spans_out,
         "unlocatable": unlocatable_n,
+        "flagged": sum(1 for r in flags_rows if r["head_named_in_span"]),
+    }
+    if subagent_report is not None:
+        report["subagent"] = subagent_report
+    return report
+
+
+class StratumDirNotFresh(Exception):
+    """<out>/subagent/ already holds files; a re-run would leave stale spans
+    beside a fresh key.jsonl, and screeners read subagent/spans/."""
+
+
+def _require_fresh_stratum_dir(out: Path) -> None:
+    sub_dir = out / "subagent"
+    if sub_dir.exists() and (not sub_dir.is_dir() or any(sub_dir.iterdir())):
+        raise StratumDirNotFresh(
+            f"{sub_dir} already exists and is not empty; "
+            "re-run with --subagent-stratum into a fresh --out directory"
+        )
+
+
+def _run_subagent_stratum(candidates: list, k: int, out: Path, redact_chain: bool) -> dict:
+    """Write the exploratory sub-agent stratum under <out>/subagent/ only.
+    Nothing here touches a top-level output (D11 ruling item 1: the rows
+    stay in the primary denominators as unlocatable)."""
+    sub_dir = out / "subagent"
+    spans_dir = sub_dir / "spans"
+    spans_dir.mkdir(parents=True, exist_ok=True)
+    key_rows, flags_rows, unlocatable_rows, stratum_rows = [], [], [], []
+    spans_out = 0
+    for row in candidates:
+        fire_id = compute_fire_id(row)
+        result = extract_subagent_one(row, k, redact_chain=redact_chain)
+        stratum_rows.append(
+            {
+                "fire_id": fire_id,
+                "agent_type": result["agent_type"],
+                "model": result["model"],
+                "subagent_file": result["subagent_file"],
+            }
+        )
+        if not result["ok"]:
+            unlocatable_rows.append(
+                {
+                    "fire_id": fire_id,
+                    "transcript_path": row.get("transcript_path"),
+                    "tool_use_id": row.get("tool_use_id"),
+                    "ts": row.get("ts"),
+                    "reason": result["reason"],
+                }
+            )
+            continue
+        (spans_dir / f"{fire_id}.md").write_text(result["span_text"], encoding="utf-8")
+        spans_out += 1
+        key_rows.append({"fire_id": fire_id, "arm": result["arm"]})
+        flags_rows.append(
+            {
+                "fire_id": fire_id,
+                "head_named_in_span": result["head_named_in_span"],
+                "locate_basis": result["locate_basis"],
+                "close_reason": result["close_reason"],
+            }
+        )
+    write_jsonl(sub_dir / "key.jsonl", key_rows)
+    write_jsonl(sub_dir / "flags.jsonl", flags_rows)
+    write_jsonl(sub_dir / "unlocatable.jsonl", unlocatable_rows)
+    write_jsonl(sub_dir / "stratum.jsonl", stratum_rows)
+    assert len(stratum_rows) == spans_out + len(unlocatable_rows), (
+        f"WS4 extract_spans sub-agent invariant violated: stratum_rows={len(stratum_rows)} "
+        f"spans_out={spans_out} unlocatable={len(unlocatable_rows)}"
+    )
+    return {
+        "stratum_rows": len(stratum_rows),
+        "spans_out": spans_out,
+        "unlocatable": len(unlocatable_rows),
         "flagged": sum(1 for r in flags_rows if r["head_named_in_span"]),
     }
 
@@ -333,6 +551,15 @@ def main(argv=None) -> int:
         default=SAMPLE_SEED,
         help=f"amendment 3 (#2753): published sample seed (default: SAMPLE_SEED={SAMPLE_SEED!r}).",
     )
+    parser.add_argument(
+        "--subagent-stratum",
+        action="store_true",
+        help=(
+            "opt-in EXPLORATORY sub-agent stratum (D11 ruling): look up rows that end call_not_located "
+            "in their own session's subagents/ directory and write them ONLY under <out>/subagent/. "
+            "Every top-level output is byte-identical to a run without this flag."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -340,10 +567,15 @@ def main(argv=None) -> int:
     except ValueError as exc:  # a relative ENGRAM_HOME: refused before the output directory or any file is touched
         print(f"extract_spans: {exc}", file=sys.stderr)
         return 2
-    report = run(
-        args.date, args.k, args.out, ledger_path,
-        sample_n=args.sample, sample_seed=args.sample_seed,
-    )
+    try:
+        report = run(
+            args.date, args.k, args.out, ledger_path,
+            sample_n=args.sample, sample_seed=args.sample_seed,
+            subagent_stratum=args.subagent_stratum,
+        )
+    except StratumDirNotFresh as exc:
+        print(f"extract_spans: {exc}", file=sys.stderr)
+        return 2
 
     print(f"eligible={report['eligible']} sampled={report['sampled']} unsampled={report['unsampled']}")
     print(f"spans_out={report['spans_out']} unlocatable={report['unlocatable']}")
@@ -356,6 +588,15 @@ def main(argv=None) -> int:
         f"{report['eligible']} == {report['sampled']} + {report['unsampled']}"
     )
     print(f"flagged (head_named_in_span): {report['flagged']}")
+    sub = report.get("subagent")
+    if sub is not None:
+        print("\nsubagent stratum (exploratory):")
+        print(f"  spans_out={sub['spans_out']} unlocatable={sub['unlocatable']}")
+        print(
+            "  invariant stratum_rows == spans_out + unlocatable: "
+            f"{sub['stratum_rows']} == {sub['spans_out']} + {sub['unlocatable']}"
+        )
+        print(f"  flagged (head_named_in_span): {sub['flagged']}")
     return 0
 
 
