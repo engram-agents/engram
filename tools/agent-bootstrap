@@ -572,15 +572,31 @@ else
 fi
 
 # ---------- 6. community shared dirs ----------
-mkdir -p "$SHARED_ROOT/inter-agent"
-mkdir -p "$SHARED_ROOT/health/$NAME"
-mkdir -p "$SHARED_ROOT/audit"
+# engram-alpha#4405: this script runs as root and $SHARED_ROOT is group-writable,
+# so every name under it is one an agent can replace with a link. chmod follows a
+# link and has no -h, so a mode is set ONLY at creation (mkdir -m, no -p) and is
+# never re-applied to a path that already exists; an existing directory keeps the
+# mode the installer gave it. The shared root no longer holds an audit directory:
+# the audit log lives in agentctl's root-only state directory.
+[[ -e "$SHARED_ROOT" || -L "$SHARED_ROOT" ]] || mkdir -m 2775 "$SHARED_ROOT"
+[[ -e "$SHARED_ROOT/inter-agent" || -L "$SHARED_ROOT/inter-agent" ]] || mkdir -m 2775 "$SHARED_ROOT/inter-agent"
+[[ -e "$SHARED_ROOT/health" || -L "$SHARED_ROOT/health" ]] || mkdir -m 3775 "$SHARED_ROOT/health"
+# No -p: a planted name (a link or a directory) is a loud refusal, not a followed path.
+if [[ -e "$SHARED_ROOT/health/$NAME" || -L "$SHARED_ROOT/health/$NAME" ]]; then
+    echo "ERROR: $SHARED_ROOT/health/$NAME already exists. It may be a leftover: 'userdel -r' (the cleanup after a failed spawn) keeps health/<name>. It may also be a plant. Nothing has been changed by following this refusal; inspect it, remove it by hand if it is yours, and run again." >&2
+    exit 1
+fi
+mkdir -m 0750 "$SHARED_ROOT/health/$NAME"
 chgrp -R agents "$SHARED_ROOT"
-chmod 2775 "$SHARED_ROOT" "$SHARED_ROOT/inter-agent" "$SHARED_ROOT/audit"
-chown "$USER_NAME:agents" "$SHARED_ROOT/health/$NAME"
-chmod 0750 "$SHARED_ROOT/health/$NAME"
+chown -h "$USER_NAME:agents" "$SHARED_ROOT/health/$NAME"
 
 # ---------- 7. fix ownership of agent's home ----------
+# The newborn owns this tree: refuse a home that is itself a link, since a
+# recursive chown starts from whatever the argument names.
+if [[ -L "$USER_HOME" ]]; then
+    echo "ERROR: $USER_HOME is a symlink; refusing to chown through it." >&2
+    exit 1
+fi
 chown -R "$USER_NAME:$USER_NAME" "$USER_HOME"
 
 # ---------- 8. run the public installer as the newborn ----------

@@ -358,7 +358,7 @@ class TestDNeverExecutes:
 PURE_INTERNAL_VERBS = {
     "__codex-managed-session", "__expand-session-args", "__session-prologue",
     "__require-viz-operator", "__read-viz-operator-config",
-    "__viz-operator-conf-provenance-ok",
+    "__viz-operator-conf-provenance-ok", "__state-dir-ok",
     "__viz-operator-config-value-if-provenance-ok",
     "__resolve-viz-operator-from-config", "__viz-operator-charset-ok",
     "__validate-chosen-name", "__as-self-check", "__parse-session-flags",
@@ -462,6 +462,14 @@ def _make_copy(tmp_path, source_text):
     new, n = re.subn(r'^SHARED_ROOT="[^"]*"$', f'SHARED_ROOT="{shared}"',
                      source_text, flags=re.M)
     assert n == 1, "expected exactly one SHARED_ROOT assignment"
+    # The audit log lives in the root-only state directory (#4405). Its parent is
+    # a scratch directory the fake root owns, mode 0755; the verb creates the rest.
+    state_parent = tmp_path / "var-lib"
+    state_parent.mkdir()
+    state_parent.chmod(0o755)
+    new, n = re.subn(r'^readonly AGENTCTL_STATE="[^"]*"$',
+                     f'readonly AGENTCTL_STATE="{state_parent}/agentctl"', new, flags=re.M)
+    assert n == 1, "expected exactly one AGENTCTL_STATE literal"
     copy = state / "agentctl-copy"
     copy.write_text(new)
     for name, body in (("id", STUB_ID), ("stat", STUB_STAT), ("chown", STUB_CHOWN)):
@@ -489,7 +497,7 @@ def _spawn(tmp_path, *args, owner=None, precreate=False, source_text=None):
     proc = subprocess.run(
         ["unshare", "-Urm", "bash", "-c", WRAPPER, "wrapper", *args],
         capture_output=True, text=True, timeout=120, env=_hermetic_env(**extra))
-    log = shared / "audit" / "share-log"
+    log = tmp_path / "var-lib" / "agentctl" / "share-log"
     audit = log.read_text() if log.exists() else ""
     return proc, state, audit
 

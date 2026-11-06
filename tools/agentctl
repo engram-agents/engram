@@ -94,6 +94,13 @@ set -euo pipefail
 
 SHARED_ROOT="/home/agents-shared"
 
+# Root-only state (engram-alpha#4405): the audit log and the share state live here,
+# never under $SHARED_ROOT, which every agent account can write. A LITERAL, not
+# `${AGENTCTL_STATE:-...}` and not read from the environment or a config file:
+# a value root honours from the environment is the same hole. Holds `share-log`
+# and `share-state/<agent>.json`. Tests rewrite the literal in a COPY of this file.
+readonly AGENTCTL_STATE="/var/lib/agentctl"
+
 # Viz/operator account that needs read access to agent ~/.engram dirs for the
 # viz dashboard (knowledge.db dropdown) and write access to config.json for
 # the viz config tab.
@@ -121,7 +128,8 @@ AGENTCTL_CONFIG="$SHARED_ROOT/agentctl.conf"
 # _read_viz_operator_from_config: restricted, NON-EXECUTING read of a
 # `VIZ_OPERATOR=<value>` line from $AGENTCTL_CONFIG.
 #
-# $SHARED_ROOT ("/home/agents-shared") is mode 3775, group "agents" --
+# $SHARED_ROOT ("/home/agents-shared") is mode 2775 (setgid, NOT sticky; a sticky
+# shared root is not part of #4405 and needs a survey), group "agents" --
 # writable by every agent account on the fleet, NOT root-only. This file
 # must therefore never be `source`d (full shell evaluation of arbitrary
 # syntax): any unprivileged agent account could plant
@@ -1424,6 +1432,7 @@ _write_forum_hint() {
 
 cmd_spawn() {
     require_root "spawn"
+    _state_dir_init || exit 1
     _require_viz_operator "spawn"
 
     local runtime="claude"
@@ -1555,7 +1564,7 @@ cmd_spawn() {
     # the line records THAT a hint was left (yes|no), never the URL.
     local audit_extras="runtime=$runtime"
     [[ $forum_url_given -eq 1 ]] && audit_extras+=" forum_hint=$forum_hint"
-    audit "spawn" "$newborn_tag" "newborn" "$audit_extras"
+    audit "spawn" "$newborn_tag" "newborn" "$audit_extras" || exit 1
 
     cat <<NEXT
 
@@ -1585,6 +1594,8 @@ NEXT
 
 cmd_finalize_name() {
     require_root "finalize-name"
+    _state_dir_init || exit 1
+    _shared_dir_sticky_check "$SHARED_ROOT/health" || exit 1
     _require_viz_operator "finalize-name"
 
     local newborn_tag="${1:-}"; shift || true
@@ -1626,6 +1637,12 @@ cmd_finalize_name() {
     if id "$chosen_user" >/dev/null 2>&1; then
         echo "ERROR: chosen name '$chosen_user' is already taken" >&2
         exit 1
+    fi
+
+    # Refuse a planted health entry BEFORE any account change; the same check
+    # runs again right before the rename.
+    if [[ -L "$SHARED_ROOT/health/$newborn_tag" || -d "$SHARED_ROOT/health/$newborn_tag" ]]; then
+        _health_rename_check "$SHARED_ROOT/health/$newborn_tag" "$SHARED_ROOT/health/$chosen" || exit 1
     fi
 
     echo "== agentctl finalize-name =="
@@ -1678,7 +1695,9 @@ cmd_finalize_name() {
             if [[ "$base" == "$old_encoded"* ]]; then
                 local suffix="${base#$old_encoded}"
                 local new_base="${new_encoded}${suffix}"
-                mv "$d" "$claude_projects/$new_base"
+                # As the newborn, not root: the names under ~/.claude/projects are
+                # the newborn's to create, replace or link (#4405).
+                sudo -u "$chosen_user" mv "$d" "$claude_projects/$new_base"
                 echo "  $base → $new_base"
             fi
         done
@@ -2044,38 +2063,41 @@ PYTHON
         echo "  (no claude symlink at $claude_symlink — skipped)"
     fi
 
-    # ACL sweep on shared dirs. For a fresh newborn, there typically aren't
-    # any g:agent-newborn-* ACL entries, but sweep defensively.
-    echo "Step 3: ACL sweep on $SHARED_ROOT (replacing g:$newborn_user → g:$chosen_user)..."
-    if command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1; then
-        local found_acls
-        found_acls=$(getfacl -R -p "$SHARED_ROOT" 2>/dev/null | grep -B 2 "^group:$newborn_user:" || true)
-        if [[ -n "$found_acls" ]]; then
-            # Best-effort sweep — non-fatal if any entry resists.
-            getfacl -R -p "$SHARED_ROOT" 2>/dev/null \
-                | grep -B 1 "^group:$newborn_user:" \
-                | grep "^# file:" \
-                | sed 's/^# file: //' \
-                | while read -r path; do
-                    setfacl -m "g:$chosen_user:$(getfacl --tabular -- "$path" 2>/dev/null | awk -F: -v u="$newborn_user" '$2==u {print $3}')" "$path" 2>/dev/null || true
-                    setfacl -x "g:$newborn_user" "$path" 2>/dev/null || true
-                done
-        fi
-    fi
+    # ACL sweep on shared dirs. REMOVED (#4405): A POSIX ACL entry stores the gid, so after the groupmod -n above the old group name no longer appears in getfacl output and the entry already reads as the new name; the sweep's grep matched nothing after a successful rename (measured in a user namespace with a renamed group table), and it was a root setfacl over an agent-replaceable tree.
 
-    # Health dir rename in the community share.
-    if [[ -d "$SHARED_ROOT/health/$newborn_tag" ]]; then
-        mv "$SHARED_ROOT/health/$newborn_tag" "$SHARED_ROOT/health/$chosen"
-        chown "$chosen_user:agents" "$SHARED_ROOT/health/$chosen"
+    # Health dir rename in the community share. The sticky gate on
+    # $SHARED_ROOT/health (top of this verb) is what makes the -L test below
+    # meaningful: no other agent can swap or unlink this entry between the test and
+    # the rename. The sticky bit does not stop an agent CREATING the destination name
+    # after the check, so mv -T: a destination that appeared (a link to a directory
+    # included) makes the mv fail instead of receiving the source inside it. chown -h
+    # acts on the entry, never its target.
+    if [[ -L "$SHARED_ROOT/health/$newborn_tag" || -d "$SHARED_ROOT/health/$newborn_tag" ]]; then
+        _health_rename_check "$SHARED_ROOT/health/$newborn_tag" "$SHARED_ROOT/health/$chosen" || exit 1
+        mv -T -- "$SHARED_ROOT/health/$newborn_tag" "$SHARED_ROOT/health/$chosen"
+        chown -h "$chosen_user:agents" "$SHARED_ROOT/health/$chosen"
     fi
 
     # Snapshot the post-finalize ENGRAM state — this is the rebirth target
     # if first session goes wrong (first-session lifecycle: rebirth case).
     echo "Step 4: snapshot ~/.engram → ~/.engram.first-session-baseline.bak/..."
     if [[ -d "$chosen_home/.engram" ]]; then
-        cp -a "$chosen_home/.engram" "$chosen_home/.engram.first-session-baseline.bak"
-        chown -R "$chosen_user:$chosen_user" "$chosen_home/.engram.first-session-baseline.bak"
-        echo "  ✓ baseline snapshot taken"
+        # The newborn owns this tree. Refuse a link at either end, then copy AS the
+        # newborn (#4405): root never writes, chowns or follows anything in it.
+        if [[ -L "$chosen_home/.engram" ]] || [[ -L "$chosen_home/.engram.first-session-baseline.bak" ]] \
+           || [[ -e "$chosen_home/.engram.first-session-baseline.bak" ]]; then
+            echo "ERROR: $chosen_home/.engram is a link, or the baseline path already exists; refusing to snapshot." >&2
+            echo "       The rename (Step 2) already completed; inspect $chosen_home by hand." >&2
+            exit 1
+        fi
+        # The copy is the newborn's own, so no chown follows. A failed copy is a
+        # WARN, not an exit: the rename above already happened, and a missing
+        # baseline is recoverable.
+        if sudo -u "$chosen_user" cp -a "$chosen_home/.engram" "$chosen_home/.engram.first-session-baseline.bak"; then
+            echo "  ✓ baseline snapshot taken"
+        else
+            echo "  WARN: baseline snapshot NOT taken: could not copy $chosen_home/.engram to $chosen_home/.engram.first-session-baseline.bak (run as $chosen_user); finalize-name goes on, copy it by hand if you want the rebirth target" >&2
+        fi
     else
         echo "  (no ~/.engram yet — skipped; agent will install ENGRAM after this finalize)"
     fi
@@ -2086,14 +2108,16 @@ PYTHON
     # filing). The agent's first session already files the 3-candidate
     # naming observation as part of engram-first-session — finalize-name
     # doesn't need to duplicate that work.
-    cat > "$chosen_home/.engram/finalize-name-complete.json" 2>/dev/null <<JSON
+    # Written AS the newborn (#4405): it owns this tree and may have planted a link
+    # here, and a root redirect would write (and chown) the link's target.
+    sudo -u "$chosen_user" tee "$chosen_home/.engram/finalize-name-complete.json" >/dev/null 2>&1 <<JSON \
+        || echo "  WARN: could not write $chosen_home/.engram/finalize-name-complete.json" >&2
 {
   "newborn_uid": "$newborn_user",
   "chosen_name": "$chosen",
   "finalized_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 JSON
-    chown "$chosen_user:$chosen_user" "$chosen_home/.engram/finalize-name-complete.json" 2>/dev/null || true
 
     # Deferred viz-ACL marker: Step 7's setfacl is gated on [[ -d "$_engram_dir" ]]
     # but the agent installs ENGRAM AFTER finalize-name runs, so Step 7 silently
@@ -2102,14 +2126,14 @@ JSON
     # on first session after ENGRAM is installed. Only written when VIZ_OPERATOR
     # is set (mirrors Step 7's guard). Closes #1525.
     if [[ -n "${VIZ_OPERATOR:-}" ]]; then
-        cat > "$chosen_home/.engram-finalize-pending.json" <<JSON
+        sudo -u "$chosen_user" tee "$chosen_home/.engram-finalize-pending.json" >/dev/null 2>&1 <<JSON \
+            || echo "  WARN: could not write $chosen_home/.engram-finalize-pending.json" >&2
 {
   "viz_operator": "${VIZ_OPERATOR}",
   "chosen_name": "${chosen}",
   "finalized_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 JSON
-        chown "$chosen_user:$chosen_user" "$chosen_home/.engram-finalize-pending.json" 2>/dev/null || true
     fi
 
     # Restart the ENGRAM surface daemon (a.k.a. recall daemon) under
@@ -2172,15 +2196,18 @@ JSON
         local _viz_ok=0 _viz_skipped=0 _viz_cfg_ok=0
         for _engram_dir in "$chosen_home"/.engram "$chosen_home"/.engram-*; do
             [[ -d "$_engram_dir" ]] || { (( _viz_skipped++ )) || true; continue; }
+            # The newborn owns these names; the ACL calls below run as the newborn
+            # (an owner can set ACLs on its own files), and a link is skipped.
+            [[ -L "$_engram_dir" ]] && { echo "  WARN: $_engram_dir is a symbolic link; skipped" >&2; continue; }
             # Read+traverse on the whole dir tree (new files inherit via default ACL).
             local _setfacl_err
-            _setfacl_err=$(setfacl -R -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir" 2>&1) \
-                && setfacl -R -d -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir" 2>/dev/null \
+            _setfacl_err=$(sudo -u "$chosen_user" setfacl -R -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir" 2>&1) \
+                && sudo -u "$chosen_user" setfacl -R -d -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir" 2>/dev/null \
                 && (( ++_viz_ok )) \
                 || { echo "  WARN: setfacl rX failed on $_engram_dir: $_setfacl_err" >&2; continue; }
             # Write on config.json (only when rX succeeded — traversal is prerequisite).
             local _cfg="$_engram_dir/config.json"
-            [[ -f "$_cfg" ]] && setfacl -m "u:${VIZ_OPERATOR}:rw" "$_cfg" 2>/dev/null \
+            [[ -f "$_cfg" ]] && sudo -u "$chosen_user" setfacl -m "u:${VIZ_OPERATOR}:rw" "$_cfg" 2>/dev/null \
                 && (( _viz_cfg_ok++ )) || true
         done
         if (( _viz_ok > 0 )); then
@@ -2194,7 +2221,7 @@ JSON
         echo "  ✓ viz ACL: $_viz_acl_result"
     fi
 
-    audit "finalize-name" "$chosen" "uid" "from=$newborn_user"
+    audit "finalize-name" "$chosen" "uid" "from=$newborn_user" || exit 1
 
     cat <<DONE
 
@@ -2218,7 +2245,135 @@ DONE
 #
 # Mechanism: POSIX ACLs (setfacl/getfacl). Compatible with several agents (each agent
 # has its own ACL entry on the path), TTL-revocable, audit-logged. State lives
-# at $SHARED_ROOT/share-state/<agent>.json; audit at $SHARED_ROOT/audit/share-log.
+# at $AGENTCTL_STATE/share-state/<agent>.json; audit at $AGENTCTL_STATE/share-log
+# (root-only, never under the agent-writable $SHARED_ROOT; engram-alpha#4405).
+
+# _state_dir_ok: PURE predicate, no filesystem. 0 only for a non-link directory
+# owned by <expected_uid> with no group or other write. Same family as
+# _viz_operator_conf_provenance_ok above. Every input must be numeric (is_dir and
+# is_link are 0/1); anything else is a refusal.
+#
+# Usage: _state_dir_ok <uid> <octal_mode> <is_dir> <is_link> <expected_uid>
+_state_dir_ok() {
+    local uid="${1:-}" mode="${2:-}" is_dir="${3:-}" is_link="${4:-}" expected="${5:-}"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    [[ "$is_dir" =~ ^[01]$ ]] || return 1
+    [[ "$is_link" =~ ^[01]$ ]] || return 1
+    [[ "$expected" =~ ^[0-9]+$ ]] || return 1
+    (( is_link == 0 )) || return 1
+    (( is_dir == 1 )) || return 1
+    (( uid == expected )) || return 1
+    (( (8#$mode) & 8#022 )) && return 1
+    return 0
+}
+
+# _state_dir_check: measure <path> and apply _state_dir_ok with the LITERAL uid 0
+# (never the caller's own uid: that would be satisfied by whoever runs it, not by
+# the directory's real owner). `[[ -L ]]` is read FIRST and is the only source of
+# the link verdict, because `-d` and `stat -L` both answer through a link. On
+# failure: one stderr line naming the path, what was found and the exact sudo
+# command that repairs it; non-zero. No fallback path.
+_state_dir_check() {
+    local path="$1" is_link=0 is_dir=0 uid="" mode="" st
+    [[ -L "$path" ]] && is_link=1
+    if st="$(stat -L -c '%u %a' -- "$path" 2>/dev/null)"; then
+        read -r uid mode <<< "$st"
+        [[ -d "$path" ]] && is_dir=1
+    elif (( is_link )); then
+        uid=0; mode=0   # a dangling link: reported as a link below
+    else
+        echo "ERROR: $path does not exist. Fix: sudo install -d -m 0755 -o root -g root $path" >&2
+        return 1
+    fi
+    if _state_dir_ok "$uid" "$mode" "$is_dir" "$is_link" 0; then
+        return 0
+    fi
+    local fix="sudo chown root:root $path && sudo chmod 0755 $path" found="owner uid $uid, mode $mode"
+    if (( is_link )); then
+        found="a symbolic link"
+        fix="inspect it, then: sudo rm -- $path && sudo install -d -m 0755 -o root -g root $path"
+    elif (( ! is_dir )); then
+        found="not a directory"
+        fix="inspect it, then: sudo mv -- $path $path.bad && sudo install -d -m 0755 -o root -g root $path"
+    fi
+    echo "ERROR: $path must be a real directory owned by root (uid 0) with no group or other write; found $found. Fix: $fix" >&2
+    return 1
+}
+
+# _state_dir_init: called ONLY from the gate at the top of the four root verbs.
+# Verifies the PARENT is itself a root-owned, non-link, non-group/other-writable
+# directory, creates a missing state directory with `mkdir -m 0755` (no -p, so a
+# name that appeared meanwhile is a loud EEXIST, never a followed path), then
+# checks the result. Never chmods an existing path.
+_state_dir_init() {
+    local parent d
+    parent="$(dirname "$AGENTCTL_STATE")"
+    _state_dir_check "$parent" || return 1
+    for d in "$AGENTCTL_STATE" "$AGENTCTL_STATE/share-state"; do
+        if [[ ! -e "$d" && ! -L "$d" ]]; then
+            mkdir -m 0755 "$d" || { echo "ERROR: could not create $d" >&2; return 1; }
+        fi
+        _state_dir_check "$d" || return 1
+    done
+}
+
+# _shared_dir_sticky_ok: PURE predicate for the community health directory. 0 only
+# for a non-link directory owned by <expected_uid> with the sticky bit set.
+#
+# Usage: _shared_dir_sticky_ok <uid> <octal_mode> <is_dir> <is_link> <expected_uid>
+_shared_dir_sticky_ok() {
+    local uid="${1:-}" mode="${2:-}" is_dir="${3:-}" is_link="${4:-}" expected="${5:-}"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    [[ "$is_dir" =~ ^[01]$ ]] || return 1
+    [[ "$is_link" =~ ^[01]$ ]] || return 1
+    [[ "$expected" =~ ^[0-9]+$ ]] || return 1
+    (( is_link == 0 )) || return 1
+    (( is_dir == 1 )) || return 1
+    (( uid == expected )) || return 1
+    (( (8#$mode) & 8#1000 )) || return 1
+    return 0
+}
+
+# _shared_dir_sticky_check: the wrapper. The sticky bit is what makes the later
+# `[[ -L ]]` test on an entry of this directory meaningful: without it an agent can
+# swap the entry between the test and the rename. The repair keeps the real mode
+# (setgid included) and adds only the sticky bit.
+_shared_dir_sticky_check() {
+    local path="$1" is_link=0 is_dir=0 uid="" mode="" st
+    [[ -L "$path" ]] && is_link=1
+    if st="$(stat -L -c '%u %a' -- "$path" 2>/dev/null)"; then
+        read -r uid mode <<< "$st"
+        [[ -d "$path" ]] && is_dir=1
+    else
+        echo "ERROR: $path is missing or unreadable; finalize-name needs the community health directory (root-owned, sticky)." >&2
+        return 1
+    fi
+    if _shared_dir_sticky_ok "$uid" "$mode" "$is_dir" "$is_link" 0; then
+        return 0
+    fi
+    local newmode; newmode="$(printf '%o' $(( 8#$mode | 8#1000 )))"
+    echo "ERROR: $path must be a real directory owned by root (uid 0) with the sticky bit; found uid $uid, mode $mode, link=$is_link, directory=$is_dir. Fix (keeps the setgid bit): sudo chown root:agents $path && sudo chmod $newmode $path" >&2
+    return 1
+}
+
+# _health_rename_check: refuse a health rename that would follow a link or move a
+# directory INSIDE an existing one (`mv A B` into an existing B puts A inside it).
+# The `-L` test is only meaningful because the sticky gate on the health
+# directory holds (an agent cannot swap or unlink the entry of another account).
+_health_rename_check() {
+    local src="$1" dest="$2"
+    if [[ -L "$src" ]]; then
+        echo "ERROR: $src is a symbolic link; refusing to rename or chown it." >&2
+        return 1
+    fi
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        echo "ERROR: $dest already exists; refusing to rename $src onto or into it." >&2
+        return 1
+    fi
+    return 0
+}
 
 require_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -2231,11 +2386,15 @@ require_root() {
 audit() {
     local action="$1"; local agent="$2"; local path="$3"; local extras="${4:-}"
     local stamp; stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    local audit_dir="$SHARED_ROOT/audit"
-    mkdir -p "$audit_dir"
-    echo "$stamp $action ${SUDO_USER:-$(id -un)}→$agent path=$path${extras:+ $extras}" >> "$audit_dir/share-log"
-    chgrp agents "$audit_dir/share-log" 2>/dev/null || true
-    chmod 0664 "$audit_dir/share-log" 2>/dev/null || true
+    # The action has already happened by the time this runs; a failure here is a
+    # loud logged error, never a silent success. No mkdir, chgrp or chmod: the
+    # directory and its modes were set once, by _state_dir_init.
+    if ! _state_dir_check "$AGENTCTL_STATE"; then
+        echo "ERROR: $action happened but could not be logged (state directory failed its check)." >&2
+        return 1
+    fi
+    ( umask 022; echo "$stamp $action ${SUDO_USER:-$(id -un)}→$agent path=$path${extras:+ $extras}" >> "$AGENTCTL_STATE/share-log" ) \
+        || { echo "ERROR: $action happened but could not be logged (write to $AGENTCTL_STATE/share-log failed)." >&2; return 1; }
 }
 
 cmd_share() {
@@ -2254,9 +2413,15 @@ cmd_share() {
         echo "Usage: sudo agentctl share <agent> <path> [--mode rw|ro] [--ttl <duration>]" >&2; exit 2
     }
     require_root share
+    _state_dir_init || exit 1
     local user; user=$(resolve_user "$agent")
     [[ -e "$path" ]] || { echo "ERROR: path '$path' does not exist" >&2; exit 1; }
     path=$(readlink -f "$path")
+    # Residual, not a guard: $path is operator-chosen and was just resolved by
+    # readlink -f, so this -L test is a check-then-use gap (the path can change
+    # between here and the setfacl calls below). It catches a stale or odd path,
+    # nothing more (engram-alpha#4405).
+    [[ -L "$path" ]] && { echo "ERROR: '$path' is a symbolic link; refusing to set ACLs through it" >&2; exit 1; }
 
     case "$path" in
         /etc/*|/usr/*|/var/*|/sys/*|/proc/*|/dev/*|/boot/*|/root/*|/etc|/usr|/var|/root|/)
@@ -2324,8 +2489,9 @@ cmd_share() {
     fi
 
     # State tracking
-    local state_dir="$SHARED_ROOT/share-state"
-    mkdir -p "$state_dir"
+    # $agent is a real account name here: resolve_user (above) proved it exists,
+    # so it cannot carry a slash. Keep that order (cell O1).
+    local state_dir="$AGENTCTL_STATE/share-state"
     local state_file="$state_dir/$agent.json"
     AGENT="$agent" SHARE_PATH="$path" SHARE_MODE="$mode" SHARE_TTL="$ttl" STATE_FILE="$state_file" \
     python3 - <<'PYEOF'
@@ -2344,12 +2510,17 @@ if os.path.exists(sf):
     except Exception: state = []
 state = [s for s in state if s.get("path") != entry["path"]]
 state.append(entry)
-json.dump(state, open(sf, "w"), indent=2)
+# temp file in the (root-only) state directory + atomic replace; mode 0644 from an
+# explicit umask, no chgrp, no chmod.
+os.umask(0o022)
+tmp = f"{sf}.tmp.{os.getpid()}"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+with os.fdopen(fd, "w") as fh:
+    json.dump(state, fh, indent=2)
+os.replace(tmp, sf)
 PYEOF
-    chgrp agents "$state_file" 2>/dev/null || true
-    chmod 0664 "$state_file" 2>/dev/null || true
 
-    audit share "$agent" "$path" "mode=$mode ttl=${ttl:-none}"
+    audit share "$agent" "$path" "mode=$mode ttl=${ttl:-none}" || exit 1
     echo "✓ Shared $path with $agent (mode=$mode${ttl:+, ttl=$ttl})"
 }
 
@@ -2360,17 +2531,21 @@ cmd_unshare() {
         echo "Usage: sudo agentctl unshare <agent> <path>" >&2; exit 2
     }
     require_root unshare
+    _state_dir_init || exit 1
     local user; user=$(resolve_user "$agent")
     path=$(readlink -f "$path" 2>/dev/null || echo "$path")
 
     # Remove recursive + default ACL
     if [[ -e "$path" ]]; then
+        # Residual, not a guard: operator-chosen path resolved by readlink -f; this
+        # -L test is a check-then-use gap (engram-alpha#4405).
+        [[ -L "$path" ]] && { echo "ERROR: '$path' is a symbolic link; refusing to remove ACLs through it" >&2; exit 1; }
         setfacl -R -x "g:$user" "$path" 2>/dev/null || true
         [[ -d "$path" ]] && setfacl -R -d -x "g:$user" "$path" 2>/dev/null || true
     fi
 
     # Update state file
-    local state_file="$SHARED_ROOT/share-state/$agent.json"
+    local state_file="$AGENTCTL_STATE/share-state/$agent.json"
     if [[ -f "$state_file" ]]; then
         SHARE_PATH="$path" STATE_FILE="$state_file" python3 - <<'PYEOF'
 import json, os
@@ -2378,10 +2553,15 @@ sf = os.environ['STATE_FILE']
 target = os.environ['SHARE_PATH']
 state = json.load(open(sf))
 state = [s for s in state if s.get("path") != target]
-json.dump(state, open(sf, "w"), indent=2)
+os.umask(0o022)
+tmp = f"{sf}.tmp.{os.getpid()}"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+with os.fdopen(fd, "w") as fh:
+    json.dump(state, fh, indent=2)
+os.replace(tmp, sf)
 PYEOF
         # GC parent --x ACLs: remove any parent ACL not needed by remaining shares
-        REMAINING=$(python3 -c "import json; print('\n'.join(s['path'] for s in json.load(open('$state_file'))))")
+        REMAINING=$(STATE_FILE="$state_file" python3 -c "import json, os; print('\n'.join(s['path'] for s in json.load(open(os.environ['STATE_FILE']))))")
         local parent
         parent=$(dirname "$path")
         while [[ "$parent" != "/" && -n "$parent" ]]; do
@@ -2423,13 +2603,14 @@ PYEOF
         fi
     fi
 
-    audit unshare "$agent" "$path"
+    audit unshare "$agent" "$path" || exit 1
     echo "✓ Unshared $path from $agent"
 }
 
 cmd_share_status() {
     local agent="${1:-}"
-    local state_dir="$SHARED_ROOT/share-state"
+    local state_dir="$AGENTCTL_STATE/share-state"
+    echo "(shares granted before the move to $AGENTCTL_STATE are not listed here; their ACLs may still be in force)"
     if [[ ! -d "$state_dir" ]]; then
         echo "(no shares — $state_dir not yet created)"
         return 0
@@ -2523,6 +2704,15 @@ cmd__read_viz_operator_config() {
 cmd__viz_operator_conf_provenance_ok() {
     local uid="${1:-}" mode="${2:-}"
     _viz_operator_conf_provenance_ok "$uid" "$mode"
+}
+
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __state-dir-ok <uid> <octal_mode> <is_dir> <is_link> <expected_uid>
+# Exercises the PURE _state_dir_ok predicate with explicit arguments: no
+# filesystem, no stat, no root. Exit 0 = accepted. Test seam, like
+# __viz-operator-conf-provenance-ok (engram-alpha#4405).
+cmd__state_dir_ok() {
+    _state_dir_ok "$@"
 }
 
 # Not listed in user-facing help (internal verb, invoked programmatically).
@@ -2657,6 +2847,7 @@ case "$SUBCMD" in
     __require-viz-operator) cmd__require_viz_operator "$@" ;;
     __read-viz-operator-config) cmd__read_viz_operator_config "$@" ;;
     __viz-operator-conf-provenance-ok) cmd__viz_operator_conf_provenance_ok "$@" ;;
+    __state-dir-ok) cmd__state_dir_ok "$@" ;;
     __viz-operator-config-value-if-provenance-ok) cmd__viz_operator_config_value_if_provenance_ok "$@" ;;
     __resolve-viz-operator-from-config) cmd__resolve_viz_operator_from_config "$@" ;;
     __viz-operator-charset-ok) cmd__viz_operator_charset_ok "$@" ;;

@@ -59,7 +59,18 @@ sessions.
 
    ```bash
    sudo install -m 0755 tools/agentctl /usr/local/bin/agentctl
+   sudo install -m 0755 tools/agent-bootstrap /usr/local/sbin/agent-bootstrap
    ```
+
+   `agentctl` keeps its audit log and share state in the root-only
+   `/var/lib/agentctl` (engram-alpha#4405), never under the agent-writable
+   `/home/agents-shared`. The first `sudo agentctl spawn|finalize-name|share|unshare`
+   creates it (`mkdir -m 0755`, then verifies owner, mode and that it is not a
+   link); it refuses, naming the repair command, if it exists in any other shape.
+   To create it by hand: `sudo install -d -m 0755 -o root -g root /var/lib/agentctl /var/lib/agentctl/share-state`.
+   `finalize-name` also needs `/home/agents-shared/health` to be root-owned with
+   the sticky bit; read its mode first (`getfacl -p /home/agents-shared/health`)
+   and add only `+t`, keeping the setgid bit.
 
    Session cwd, resolved at launch time from `$HOME` (nothing is written at
    rename time): (1) the first line of `~/.engram/boot-cwd` if it names an
