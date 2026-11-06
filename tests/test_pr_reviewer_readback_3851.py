@@ -84,7 +84,10 @@ def _comment(first: str, pr: str = PR, verdict: bool = True) -> str:
     )
 
 
-ALL_LOGS = []  # every stub-gh argv log written by any cell in this module (R20)
+# (cell label, stub-gh argv log TEXT) for every cell in this module (R20). Text,
+# not paths: under `tmp_path_retention_policy=failed` a passing test's tmp dir is
+# deleted at teardown, so a path kept for a later cell would be gone (#4392).
+ALL_LOG_TEXTS = []
 
 
 def _run(
@@ -113,7 +116,6 @@ def _run(
     logs = {n: tmp_path / (n + ".log") for n in ("api", "pr", "all")}
     for lg in logs.values():
         lg.write_text("", encoding="utf-8")
-    ALL_LOGS.append(logs["all"])
     if body_path is None:
         b = tmp_path / "body.md"
         b.write_text(body_text, encoding="utf-8")
@@ -134,7 +136,15 @@ def _run(
         "--repo", repo, "--pr", str(pr), "--expected", expected,
         "--body-file", str(b), "--gh", str(gh),
     ] + list(extra_args or [])
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
+    finally:
+        # After the helper has run, so the capture holds what it logged; in a
+        # finally so a cell whose helper call raises is still swept. Plain
+        # read_text: the file was created above, so a missing one must raise.
+        ALL_LOG_TEXTS.append(
+            (f"{tmp_path.parent.name}/{tmp_path.name}", logs["all"].read_text(encoding="utf-8"))
+        )
     calls = len(logs["pr"].read_text(encoding="utf-8").splitlines())
     return (
         r.stdout,
@@ -392,17 +402,17 @@ def test_R20_never_edit_or_delete(tmp_path):
         d = tmp_path / name
         d.mkdir()
         _run(d, _body(GOOD_FIRST), GOOD_URL, _comment(GOOD_FIRST), **kw)
-    assert len(ALL_LOGS) >= 2
+    assert len(ALL_LOG_TEXTS) >= 2
     seen = 0
-    for lg in ALL_LOGS:
-        for line in lg.read_text(encoding="utf-8").splitlines():
+    for label, text in ALL_LOG_TEXTS:
+        for line in text.splitlines():
             seen += 1
             words = line.split()
-            assert words[0] in ("pr", "api"), line
-            assert "edit" not in words and "delete" not in words, line
-            assert "DELETE" not in words and "PATCH" not in words, line
+            assert words[0] in ("pr", "api"), (label, line)
+            assert "edit" not in words and "delete" not in words, (label, line)
+            assert "DELETE" not in words and "PATCH" not in words, (label, line)
             if words[0] == "pr":
-                assert words[1] == "comment", line
+                assert words[1] == "comment", (label, line)
     assert seen >= 1
 
 
