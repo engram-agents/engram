@@ -365,17 +365,36 @@ def _pid_path_for_socket(socket_path: Path) -> Path | None:
     return socket_path.parent.parent / DEFAULT_PID_NAME
 
 
-def socket_path_too_long_reason(socket_path: Path | str) -> str | None:
+def socket_path_too_long_reason(
+    socket_path: Path | str, *, service: str = "engramd", relative: str | None = None
+) -> str | None:
     """None when `socket_path` fits an AF_UNIX address; otherwise the reason
     text (byte length, limit, remedy). The ONE source of that text: the owner
     raises it as OwnerSocketPathTooLong and the client returns it as the
     Unavailable detail, so the two cannot disagree (#3696). Length is in
-    BYTES (os.fsencode), as the kernel counts, never characters."""
+    BYTES (os.fsencode), as the kernel counts, never characters.
+
+    #4401: `relative` names the socket's place under ENGRAM_HOME for a caller
+    whose layout is not the owner's (the surface daemon's is
+    `recall-daemon.sock`); `service` names the caller in the text. With
+    neither given the text is byte-identical to the owner's. The limit is the
+    same SOCKET_PATH_MAX_BYTES either way."""
     n = len(os.fsencode(socket_path))
     if n <= SOCKET_PATH_MAX_BYTES:
         return None
+    if relative is not None:
+        added = len("/" + relative)
+        return (
+            f"{service} socket path is {n} bytes, over the {SOCKET_PATH_MAX_BYTES}-byte "
+            f"AF_UNIX limit. Shorten ENGRAM_HOME: ENGRAM_HOME is "
+            f"{n - added} bytes; the longest it can be here is "
+            f"{SOCKET_PATH_MAX_BYTES - added} (the socket path is {n} bytes, the "
+            f"limit {SOCKET_PATH_MAX_BYTES}). The socket lives at "
+            f"<ENGRAM_HOME>/{relative}, which adds {added} bytes. "
+            f"Socket path: {socket_path}"
+        )
     return (
-        f"engramd socket path is {n} bytes, over the {SOCKET_PATH_MAX_BYTES}-byte "
+        f"{service} socket path is {n} bytes, over the {SOCKET_PATH_MAX_BYTES}-byte "
         f"AF_UNIX limit: {socket_path}. Shorten ENGRAM_HOME (the socket lives at "
         f"<ENGRAM_HOME>/{SOCKET_DIR_NAME}/{DEFAULT_SOCKET_NAME}, which adds "
         f"{len('/' + SOCKET_DIR_NAME + '/' + DEFAULT_SOCKET_NAME)} bytes)."

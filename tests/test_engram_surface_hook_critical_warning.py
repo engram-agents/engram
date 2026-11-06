@@ -204,7 +204,10 @@ class TestCriticalWarningIntegration(unittest.TestCase):
         query_daemon is mocked to return None (simulates daemon offline).
         The output must contain the CRITICAL warning header and "Notify Alex".
         """
-        raw_output = _run_main_capture(self.hook, _make_hook_input())
+        # #4401: this test is about the CRITICAL branch, not path length. On macOS the default tmp
+        # base makes the socket path 106 bytes (limit 103), so the length check would pre-empt it.
+        with patch.object(self.hook, "_surface_socket_check", return_value=("ok", None)):
+            raw_output = _run_main_capture(self.hook, _make_hook_input())
         self.assertTrue(
             raw_output.strip(),
             "main() produced no stdout — expected a JSON response with CRITICAL warning",
@@ -567,7 +570,10 @@ class TestStaleTombstone(unittest.TestCase):
         with open(tombstone_path, "w") as f:
             f.write(str(int(time.time()) - 172801))
 
-        raw_output = _run_main_capture(self.hook, _make_hook_input())
+        # #4401: this test is about the CRITICAL branch, not path length. On macOS the default tmp
+        # base makes the socket path 106 bytes (limit 103), so the length check would pre-empt it.
+        with patch.object(self.hook, "_surface_socket_check", return_value=("ok", None)):
+            raw_output = _run_main_capture(self.hook, _make_hook_input())
         self.assertTrue(raw_output.strip(), "main() produced no stdout")
         response = json.loads(raw_output.strip())
         additional_context = (
@@ -620,7 +626,10 @@ class TestCorruptTombstone(unittest.TestCase):
         with open(tombstone_path, "w") as f:
             f.write("not-an-int")
 
-        raw_output = _run_main_capture(self.hook, _make_hook_input())
+        # #4401: this test is about the CRITICAL branch, not path length. On macOS the default tmp
+        # base makes the socket path 106 bytes (limit 103), so the length check would pre-empt it.
+        with patch.object(self.hook, "_surface_socket_check", return_value=("ok", None)):
+            raw_output = _run_main_capture(self.hook, _make_hook_input())
         self.assertTrue(raw_output.strip(), "main() produced no stdout")
         response = json.loads(raw_output.strip())
         additional_context = (

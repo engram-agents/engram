@@ -428,6 +428,10 @@ EXIT_SOCKET_UNPROVEN = 76   # could not prove SOCKET_PATH is unheld (fail closed
 # like the two refusals above and keeps retrying about once a minute, which
 # self-heals the moment someone fixes the file's mode or removes it.
 EXIT_PIDFILE_UNWRITABLE = 77
+# #4401: SOCKET_PATH is over the AF_UNIX byte limit (sysexits 78 = EX_CONFIG), so
+# server.bind() could never succeed. Refused before the lifetime lock, the pid
+# file and the model load; backs off in-process like the refusals above.
+EXIT_SOCKET_PATH_TOO_LONG = 78
 
 # #3361: a refusal waits this long BEFORE exiting. Under systemd
 # (Restart=always) and launchd (KeepAlive true) an immediate exit would
@@ -760,8 +764,36 @@ def _write_pidfile():
         sys.exit(EXIT_PIDFILE_UNWRITABLE)
 
 
+def _socket_path_too_long_reason():
+    """#4401: the reason SOCKET_PATH cannot be bound (over the AF_UNIX byte
+    limit), or None when it fits. Also None when engramd_client cannot be
+    imported: a missing helper must not stop a healthy daemon (today's
+    behaviour). Never raises."""
+    try:
+        _dir = resolve_runtime_dir(ENGRAM_HOME, "engramd_client.py")
+        if _dir not in sys.path:
+            sys.path.insert(0, _dir)
+        import engramd_client
+        return engramd_client.socket_path_too_long_reason(
+            SOCKET_PATH, service="recall daemon", relative="recall-daemon.sock")
+    except Exception:
+        return None
+
+
 def main():
     global _client, _bound_socket, _lock_fd
+
+    # #4401: before everything, the lifetime lock included, so a refusal leaves
+    # no lock directory, pid file or log behind.
+    _too_long = _socket_path_too_long_reason()
+    if _too_long is not None:
+        print(
+            f"[engram-daemon] refusing to start: {_too_long} (exit {EXIT_SOCKET_PATH_TOO_LONG})",
+            file=sys.stderr,
+            flush=True,
+        )
+        _wait_refusal_backoff(_refusal_backoff_s())
+        sys.exit(EXIT_SOCKET_PATH_TOO_LONG)
 
     # #4374 D1: the lifetime lock is the FIRST act, before the socket gate and also
     # when no socket exists. Non-blocking; held for the process life in _lock_fd.

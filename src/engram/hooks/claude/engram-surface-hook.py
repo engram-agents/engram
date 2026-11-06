@@ -435,7 +435,8 @@ def _owner_write_failure_text(run: dict) -> str:
 
 
 def _import_engramd_client():
-    """Lazy import (flag OFF must never import it), resolved layout-agnostically via the shared
+    """Lazy import (a flag-OFF fire on the owner-read paths must never import it; the daemon-down
+    branch's `_surface_socket_check` does, #4401), resolved layout-agnostically via the shared
     resolver -- plugin root first, then a walk-parents search; never a fixed parents[N] (project
     CLAUDE.md, "Plugin build restructures code paths")."""
     runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engramd_client.py")
@@ -1065,6 +1066,20 @@ def _resolve_warmup_window() -> int:
     return 120
 
 _DAEMON_WARMUP_WINDOW_SECONDS = _resolve_warmup_window()
+
+
+def _surface_socket_check():
+    """#4401: can the surface daemon's socket ever bind at SOCKET_PATH? Pure and
+    stateless. Returns ("ok", None), ("too_long", reason) or ("unknown", None).
+    "unknown" means engramd_client could not be imported or raised: the caller
+    fails TOWARDS the louder message, never towards the quiet warm-up line."""
+    try:
+        ec = _import_engramd_client()
+        reason = ec.socket_path_too_long_reason(
+            SOCKET_PATH, service="recall daemon", relative="recall-daemon.sock")
+    except (Exception, SystemExit):  # noqa: BLE001 -- any failure is "unknown"
+        return ("unknown", None)
+    return ("too_long", reason) if reason else ("ok", None)
 
 
 def _spawn_daemon_relaunch(daemon_script: str) -> None:
@@ -4619,8 +4634,15 @@ def _main_impl():
             os.path.dirname(os.path.abspath(__file__)),
             "start-engram-daemon.sh",
         )
+        # #4401: a socket path over the AF_UNIX limit can never bind, so say so
+        # before the warm-up branch (a fresh launch stamp must not mask it) and
+        # request no relaunch (it cannot succeed). "unknown" (helper not
+        # importable) skips the quiet warm-up line and falls to the louder ones.
+        _sock_state, _sock_reason = _surface_socket_check()
         warming_up = False
         try:
+            if _sock_state != "ok":
+                raise RuntimeError("socket check not ok: no warm-up line")
             marker = os.path.join(ENGRAM_HOME, "daemon-launch-attempt")
             with open_regular_text(marker) as _f:
                 launched_at = int(_f.read().strip())
@@ -4628,7 +4650,9 @@ def _main_impl():
                 warming_up = True
         except Exception:
             warming_up = False   # fail-safe: when in doubt, the louder CRITICAL
-        if warming_up:
+        if _sock_state == "too_long":
+            head_blocks.append(f"[⚠️ ENGRAM: surface daemon cannot start: {_sock_reason}]")
+        elif warming_up:
             head_blocks.append(
                 f"[ENGRAM: surface daemon warming up (cold model load) — "
                 f"semantic recall resumes in a few seconds; ranking is "
