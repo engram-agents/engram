@@ -2458,7 +2458,10 @@ def _main_impl() -> None:
     # nothing). One fail-open call; the import sits inside the try so a missing module is a no-op.
     try:
         from _same_batch_shadow import evaluate as _sbs_evaluate
-        _sbs_evaluate(hook_input.get("transcript_path"), hook_input.get("session_id"), "pretooluse")
+        # a sub-agent's payload carries the PARENT's session and transcript plus a non-empty agent_id:
+        # it is judged as a parent fire, only its source is marked (no agent id is recorded anywhere)
+        _sbs_evaluate(hook_input.get("transcript_path"), hook_input.get("session_id"),
+                      "pretooluse-subagent" if hook_input.get("agent_id") else "pretooluse")
     except Exception:
         pass
 

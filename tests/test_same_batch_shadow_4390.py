@@ -96,7 +96,7 @@ def rows(home):
     p = Path(home) / LEDGER
     if not p.exists():
         return []
-    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    return [r for r in (json.loads(l) for l in p.read_text().splitlines() if l.strip()) if "event" not in r]
 
 
 GOOD = [crossing("I sent the note " + DISTINCT), push()]
@@ -717,7 +717,7 @@ def test_c9_default_is_off_only_boolean_true_enables(sbs, home, tmp_path, monkey
     if cfg is not None:
         cp.write_text(cfg)
     called = []
-    monkeypatch.setattr(sbs, "_read_tail", lambda *a, **k: called.append(1) or ("", False, None))
+    monkeypatch.setattr(sbs, "_read_tail", lambda *a, **k: called.append(1) or ("", False, None, 0, 0))
     t = tmp_path / "t.jsonl"
     write(t, block("msg_A", GOOD))
     sbs.evaluate(str(t), "s1", "stop")
@@ -1022,7 +1022,7 @@ def test_c14_after_the_cap_row_there_is_no_transcript_read(sbs, home, tmp_path, 
     _fill_to_cap(home, sbs)
     sbs.evaluate(str(t), "s1", "stop")
     called = []
-    monkeypatch.setattr(sbs, "_read_tail", lambda *a, **k: called.append(1) or ("", False, None))
+    monkeypatch.setattr(sbs, "_read_tail", lambda *a, **k: called.append(1) or ("", False, None, 0, 0))
     size = (home / LEDGER).stat().st_size
     sbs.evaluate(str(t), "s1", "stop")
     assert called == [] and (home / LEDGER).stat().st_size == size
@@ -1094,7 +1094,10 @@ def test_lock_held_by_another_process_evaluate_returns_fast_and_writes_nothing(s
         sbs.evaluate(str(t), "s1", "stop")
         assert time.time() - t0 < 0.5
         assert rows(home) == []
-        assert _state(home) == before  # no seen file, no ledger, no partial state
+        # no seen file, no ledger, no partial state; the one new path is the lock-skip count (round 5)
+        assert [p for p in _state(home) if p not in before] == [
+            p for p in _state(home) if "/skips-" in p] and len([p for p in _state(home) if "/skips-" in p]) == 1
+        assert [p for p in before if p not in _state(home)] == []
     finally:
         holder.kill()
         holder.wait()
@@ -1153,3 +1156,723 @@ def test_module_never_takes_a_blocking_flock():
     assert calls
     for c in calls:
         assert "LOCK_NB" in ast.unparse(c), ast.unparse(c)
+
+
+# ======================================================================================================
+# #4390 unread-gap observables (Kepler's ruling, issue comment 6689572337): contract cells G1..G16.
+# One state file per session, `same-batch-shadow/pos-<24-hex>.json` = {size, truncated_reads,
+# result_first_reads}; a gap row {"event":"unread_gap", ts, session_id, source, unread_bytes}.
+# Fixed 100-byte lines make every expected byte count a literal, never a recomputation.
+# ======================================================================================================
+
+import hashlib  # noqa: E402
+
+LINE = 100          # bytes per pad line, newline included
+TAIL = 1050         # window that lands mid-line: first_pos is the NEXT boundary, not the window start
+_PAD_K = LINE - 1 - len(json.dumps({"type": "system", "x": ""}))
+
+
+def padline():
+    s = json.dumps({"type": "system", "x": "p" * _PAD_K})
+    assert len(s.encode()) == LINE - 1
+    return s
+
+
+def pads(n):
+    return [padline() for _ in range(n)]
+
+
+def pos_path(home, sid, t):
+    key = (sid + "\0" + str(t)).encode()
+    return Path(home) / "same-batch-shadow" / ("pos-" + hashlib.sha256(key).hexdigest()[:24] + ".json")
+
+
+def pos_state(home, sid, t):
+    return json.loads(pos_path(home, sid, t).read_text())
+
+
+def gaps(home):
+    p = Path(home) / LEDGER
+    if not p.exists():
+        return []
+    out = []
+    for l in p.read_text().splitlines():
+        try:
+            r = json.loads(l)
+        except ValueError:
+            continue                               # a cap-fill pad line
+        if isinstance(r, dict) and r.get("event") == "unread_gap":
+            out.append(r)
+    return out
+
+
+def fire(sbs, t, sid="g", tail=TAIL, source="stop"):
+    sbs.evaluate(str(t), sid, source, tail_bytes=tail)
+
+
+def seed(sbs, home, t, sid="g", lines=5):
+    """A first, untruncated evaluation of a `lines`-line file: stored size = lines*100, no row."""
+    write(t, pads(lines))
+    fire(sbs, t, sid, tail=10 ** 6)               # a window that holds the whole file: never truncated
+    assert pos_state(home, sid, t)["size"] == lines * LINE
+
+
+def test_g1_gap_is_exact_first_pos_minus_stored_size(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)                           # P = 500
+    write(t, pads(40))                           # S = 4000; window start 2950 is mid-line; first_pos = 3000
+    fire(sbs, t)
+    g = gaps(home)
+    assert len(g) == 1 and g[0]["unread_bytes"] == 2500       # 3000 - 500: not 2450 (start), 0, or 1000 (tail)
+    assert g[0]["event"] == "unread_gap" and g[0]["session_id"] == "g" and g[0]["source"] == "stop"
+    assert g[0]["ts"].endswith("Z")
+    assert pos_state(home, "g", t)["size"] == 4000
+
+
+def test_g1_no_newline_in_window_means_nothing_kept_and_window_starts_at_size(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)                           # P = 500
+    Path(t).write_text("\n".join(pads(5)) + "\n" + "z" * 4000)     # S = 4500, one giant unfinished line
+    fire(sbs, t)
+    g = gaps(home)
+    assert len(g) == 1 and g[0]["unread_bytes"] == 4000      # W = S (nothing kept): 4500 - 500
+    text, truncated, prev, size, first_pos = sbs._read_tail(str(t), TAIL)
+    assert (text, truncated, size, first_pos) == ("", True, 4500, 4500)
+
+
+def test_g1_read_tail_exposes_size_and_first_pos(sbs, tmp_path):
+    t = tmp_path / "t.jsonl"
+    write(t, pads(40))
+    text, truncated, prev, size, first_pos = sbs._read_tail(str(t), TAIL)
+    assert (truncated, size, first_pos) == (True, 4000, 3000) and len(text.encode()) == 1000
+    text, truncated, prev, size, first_pos = sbs._read_tail(str(t), 1000)   # window starts ON a boundary
+    assert (truncated, size, first_pos) == (True, 4000, 3000)
+    write(t, pads(5))
+    text, truncated, prev, size, first_pos = sbs._read_tail(str(t), TAIL)
+    assert (truncated, size, first_pos) == (False, 500, 0)
+
+
+def test_g2_no_gap_when_window_starts_at_or_before_stored_size(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t, lines=30)                 # P = 3000
+    write(t, pads(40))                           # first_pos = 3000 == P: nothing unread
+    fire(sbs, t)
+    assert gaps(home) == []
+    write(t, pads(45))                           # P = 4000, S = 4500, first_pos = 3500 < P
+    fire(sbs, t)
+    assert gaps(home) == [] and pos_state(home, "g", t)["size"] == 4500
+
+
+def test_g3_first_evaluation_over_the_window_is_unknown_never_zero_then_quiet(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    write(t, pads(40))
+    fire(sbs, t)
+    g = gaps(home)
+    assert len(g) == 1 and g[0]["unread_bytes"] == "unknown"
+    assert pos_state(home, "g", t)["size"] == 4000
+    fire(sbs, t)
+    write(t, pads(41))                           # grows 100: window start 3150 <= 4000
+    fire(sbs, t)
+    assert len(gaps(home)) == 1
+
+
+def test_g4_first_evaluation_within_the_window_writes_no_row(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    write(t, pads(5))
+    fire(sbs, t)
+    assert gaps(home) == [] and pos_state(home, "g", t) == {"size": 500, "truncated_reads": 0, "result_first_reads": 0}
+
+
+def test_g5_shrunk_or_replaced_file_is_one_unknown_row_and_state_resets(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t, lines=40)                 # P = 4000
+    write(t, pads(20))                           # S = 2000 < 4000 (still over the 1050 window)
+    fire(sbs, t)
+    g = gaps(home)
+    assert len(g) == 1 and g[0]["unread_bytes"] == "unknown"
+    assert pos_state(home, "g", t)["size"] == 2000
+    write(t, pads(5))                            # shrinks again, untruncated this time: still unknown
+    fire(sbs, t)
+    assert [x["unread_bytes"] for x in gaps(home)] == ["unknown", "unknown"]
+    assert pos_state(home, "g", t)["size"] == 500
+
+
+@pytest.mark.parametrize("content", [
+    b"", b"{not json", b"[]", b"7", b'"s"', b"null",
+    b'{"size": -1, "truncated_reads": 0, "result_first_reads": 0}',
+    b'{"size": "500", "truncated_reads": 0, "result_first_reads": 0}',
+    b'{"size": 1.5, "truncated_reads": 0, "result_first_reads": 0}',
+    b'{"size": true, "truncated_reads": 0, "result_first_reads": 0}',
+    b'{"size": null, "truncated_reads": 0, "result_first_reads": 0}',
+    b'{"size": 500}',
+    b'{"size": 500, "truncated_reads": -1, "result_first_reads": 0}',
+    b'{"size": 500, "truncated_reads": 0, "result_first_reads": "x"}',
+    b'\xff\xfe\x00',
+])
+def test_g6_bad_state_is_no_state_never_zero_never_raises(sbs, home, tmp_path, content):
+    t = tmp_path / "t.jsonl"
+    (home / "same-batch-shadow").mkdir()
+    pos_path(home, "g", t).write_bytes(content)
+    write(t, pads(40))
+    assert sbs._evaluate(str(t), "g", "stop", TAIL) is None       # the inner function must not raise either
+    g = gaps(home)
+    assert len(g) == 1 and g[0]["unread_bytes"] == "unknown"      # G3
+    assert pos_state(home, "g", t) == {"size": 4000, "truncated_reads": 1, "result_first_reads": 0}
+    # and the small-file twin: G4, no row
+    pos_path(home, "g", t).write_bytes(content)
+    (home / LEDGER).unlink()
+    write(t, pads(5))
+    assert sbs._evaluate(str(t), "g", "stop", TAIL) is None
+    assert gaps(home) == [] and pos_state(home, "g", t)["size"] == 500
+
+
+def test_g7_lock_held_returns_fast_writes_nothing_and_keeps_the_older_size(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)                           # P = 500
+    before = pos_path(home, "g", t).read_bytes()
+    write(t, pads(40))
+    holder = _hold_lock(home)
+    try:
+        t0 = time.time()
+        fire(sbs, t)
+        assert time.time() - t0 < 0.5
+        assert gaps(home) == [] and pos_path(home, "g", t).read_bytes() == before
+    finally:
+        holder.kill()
+        holder.wait()
+    fire(sbs, t)                                 # the next fire reports from the OLDER size
+    assert [x["unread_bytes"] for x in gaps(home)] == [2500]
+    assert pos_state(home, "g", t) == {"size": 4000, "truncated_reads": 1, "result_first_reads": 0}
+
+
+@pytest.mark.parametrize("with_flagged", [False, True])
+def test_g8_row_write_failure_advances_neither_state_nor_counters(sbs, home, tmp_path, monkeypatch, with_flagged):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)                           # P = 500, counters 0
+    before = pos_path(home, "g", t).read_bytes()
+    write(t, pads(30) + block("msg_A", GOOD) if with_flagged else pads(40))
+    real = sbs._append_line
+
+    def boom(path, line):
+        if os.path.basename(path) == LEDGER:
+            raise OSError("ledger write refused")
+        return real(path, line)
+    monkeypatch.setattr(sbs, "_append_line", boom)
+    fire(sbs, t)
+    assert pos_path(home, "g", t).read_bytes() == before
+    monkeypatch.setattr(sbs, "_append_line", real)
+    fire(sbs, t)
+    assert pos_state(home, "g", t)["truncated_reads"] == 1        # counted once, not twice
+    assert len(gaps(home)) == 1
+    if with_flagged:
+        assert [r["message_id"] for r in rows(home) if "message_id" in r] == ["msg_A"]
+
+
+def _rec(kind):
+    if kind == "result":
+        return res("x1")
+    if kind == "assistant":
+        return tu("msg_Q", "q1", "Bash", {"command": "ls"})
+    if kind == "unparseable":
+        return "{broken line"
+    if kind == "user_string":
+        return json.dumps({"type": "user", "message": {"role": "user", "content": "just text"}})
+    if kind == "user_list_no_result":
+        return json.dumps({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}})
+    raise AssertionError(kind)
+
+
+def _tail_file(t, kind, extra_lines):
+    """A file whose window (tail_bytes = len(tail_lines)) starts exactly on `kind`'s line."""
+    tail_lines = [_rec(kind)] + pads(extra_lines)
+    write(t, pads(30) + tail_lines)
+    return _bytes(tail_lines)
+
+
+def test_g9_counters_three_reads(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)                                          # one UNtruncated read
+    n = _tail_file(t, "result", 3)
+    sbs.evaluate(str(t), "g", "stop", tail_bytes=n)             # truncated, first line tool_result
+    n = _tail_file(t, "assistant", 4)
+    sbs.evaluate(str(t), "g", "stop", tail_bytes=n)             # truncated, first line assistant
+    st = pos_state(home, "g", t)
+    assert (st["truncated_reads"], st["result_first_reads"]) == (2, 1)
+
+
+@pytest.mark.parametrize("kind,expect", [("unparseable", (1, 0)), ("user_string", (1, 0)),
+                                         ("user_list_no_result", (1, 0)), ("result", (1, 1)), ("assistant", (1, 0))])
+def test_g9_first_line_classification(sbs, home, tmp_path, kind, expect):
+    t = tmp_path / "t.jsonl"
+    n = _tail_file(t, kind, 3)
+    sbs.evaluate(str(t), "g", "stop", tail_bytes=n)
+    st = pos_state(home, "g", t)
+    assert (st["truncated_reads"], st["result_first_reads"]) == expect
+
+
+def test_g10_at_the_cap_there_is_no_read_no_state_write_no_row(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)
+    before = pos_path(home, "g", t).read_bytes()
+    mtime = pos_path(home, "g", t).stat().st_mtime_ns
+    write(t, pads(40))
+    _fill_to_cap(home, sbs)
+    fire(sbs, t)                                                # writes the cap row only
+    fire(sbs, t)
+    size = (home / LEDGER).stat().st_size
+    fire(sbs, t)
+    assert (home / LEDGER).stat().st_size == size
+    assert pos_path(home, "g", t).read_bytes() == before and pos_path(home, "g", t).stat().st_mtime_ns == mtime
+    assert gaps(home) == []
+
+
+def test_g10_a_gap_row_that_would_cross_the_cap_writes_the_cap_row_once(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    write(t, pads(40))
+    pad = b"x" * (sbs.SHADOW_LOG_CAP_BYTES - 50 - 1) + b"\n"
+    (home / LEDGER).write_bytes(pad)
+    fire(sbs, t)
+    fire(sbs, t)
+    last = (home / LEDGER).read_bytes()[len(pad):].decode().splitlines()
+    assert len(last) == 1 and json.loads(last[0])["event"] == "cap_reached"
+
+
+def test_g11_privacy_exact_key_sets_and_modes(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    secret = [tu("msg_P", "p1", "Bash", {"command": "echo " + DISTINCT}), res("p1", text=DISTINCT)]
+    write(t, pads(5))
+    old = os.umask(0)
+    try:
+        fire(sbs, t)
+        write(t, pads(30) + secret + pads(10))
+        fire(sbs, t)
+    finally:
+        os.umask(old)
+    g = gaps(home)
+    assert len(g) == 1 and set(g[0]) == {"event", "ts", "session_id", "source", "unread_bytes", "from_size", "to_offset"}
+    assert set(pos_state(home, "g", t)) == {"size", "truncated_reads", "result_first_reads"}
+    assert DISTINCT not in (home / LEDGER).read_text() and DISTINCT not in pos_path(home, "g", t).read_text()
+    assert (home / LEDGER).stat().st_mode & 0o777 == 0o600
+    assert pos_path(home, "g", t).stat().st_mode & 0o777 == 0o600
+
+
+def test_g12_symlink_at_the_pos_path_is_refused(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    (home / "same-batch-shadow").mkdir()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep\n")
+    pos_path(home, "g", t).symlink_to(victim)
+    write(t, pads(40))
+    assert sbs.evaluate(str(t), "g", "stop", tail_bytes=TAIL) is None
+    assert victim.read_text() == "keep\n" and pos_path(home, "g", t).is_symlink()
+    assert gaps(home) == []
+
+
+def test_g12_fifo_at_the_pos_path_is_refused_without_hanging(sbs, home, tmp_path, capsys):
+    t = tmp_path / "t.jsonl"
+    (home / "same-batch-shadow").mkdir()
+    os.mkfifo(pos_path(home, "g", t))
+    write(t, pads(40))
+    t0 = time.time()
+    assert sbs.evaluate(str(t), "g", "stop", tail_bytes=TAIL) is None
+    assert time.time() - t0 < 5
+    assert not pos_path(home, "g", t).is_file() and gaps(home) == []
+    assert capsys.readouterr().out == ""
+
+
+def test_g12_hard_linked_pos_file_is_refused(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    (home / "same-batch-shadow").mkdir()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep\n")
+    os.link(victim, pos_path(home, "g", t))
+    write(t, pads(40))
+    sbs.evaluate(str(t), "g", "stop", tail_bytes=TAIL)
+    assert victim.read_text() == "keep\n"
+
+
+def test_g12_a_planted_link_at_the_temp_path_is_never_written_through(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep\n")
+    d = home / "same-batch-shadow"
+    (d / (pos_path(home, "g", t).name + ".tmp")).symlink_to(victim)
+    write(t, pads(40))
+    sbs.evaluate(str(t), "g", "stop", tail_bytes=TAIL)
+    assert victim.read_text() == "keep\n"
+    assert pos_state(home, "g", t)["size"] == 4000                   # the state still advanced, validly
+
+
+def test_g12_no_temp_file_is_left_behind_and_state_is_always_whole(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)
+    write(t, pads(40))
+    fire(sbs, t)
+    names = os.listdir(home / "same-batch-shadow")
+    assert not [n for n in names if n.endswith(".tmp")]
+    assert pos_state(home, "g", t)["size"] == 4000
+
+
+def test_g13_off_touches_nothing(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    write(t, pads(40))
+    (home / "config.json").write_text(json.dumps({"same_batch_shadow": {"enabled": False}}))
+    fire(sbs, t)
+    assert sorted(os.listdir(home)) == ["config.json"]
+    (home / "config.json").unlink()
+    fire(sbs, t)
+    assert os.listdir(home) == []
+
+
+def test_g13_off_leaves_an_existing_pos_file_byte_and_mtime_identical(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)
+    p = pos_path(home, "g", t)
+    b, m = p.read_bytes(), p.stat().st_mtime_ns
+    lock_m = (home / "same-batch-shadow" / "lock").stat().st_mtime_ns
+    before = sorted(os.listdir(home / "same-batch-shadow"))
+    for cfg in ('{"same_batch_shadow": {"enabled": false}}', None):
+        if cfg is None:
+            (home / "config.json").unlink()
+        else:
+            (home / "config.json").write_text(cfg)
+        write(t, pads(40))
+        fire(sbs, t)
+        assert p.read_bytes() == b and p.stat().st_mtime_ns == m
+        assert sorted(os.listdir(home / "same-batch-shadow")) == before
+        assert (home / "same-batch-shadow" / "lock").stat().st_mtime_ns == lock_m
+
+
+_GAP_RACER = textwrap.dedent("""
+    import os, sys, time
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("m", os.path.join(sys.argv[1], "_same_batch_shadow.py"))
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    _real = m._append_line
+    def _slow(path, line):
+        time.sleep(0.05)
+        return _real(path, line)
+    m._append_line = _slow
+    go = sys.argv[3]
+    while not os.path.exists(go):
+        time.sleep(0.0005)
+    m.evaluate(sys.argv[2], "g", sys.argv[4], tail_bytes=1050)
+""")
+
+
+def test_g14_racing_evaluators_write_one_gap_row_and_a_valid_state(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)                           # P = 500
+    write(t, pads(40))
+    go = tmp_path / "go"
+    env = {**os.environ, "ENGRAM_HOME": str(home)}
+    procs = [subprocess.Popen([sys.executable, "-c", _GAP_RACER, str(HOOK_DIR), str(t), str(go),
+                               "pretooluse" if i % 2 else "stop"], env=env) for i in range(6)]
+    time.sleep(0.5)
+    go.write_text("go")
+    for p in procs:
+        assert p.wait(timeout=60) == 0
+    fire(sbs, t)                                 # a loser that skipped on the lock: a later fire settles it
+    assert [x["unread_bytes"] for x in gaps(home)] == [2500]
+    st = pos_state(home, "g", t)
+    assert st["size"] == 4000 and st["truncated_reads"] >= 2   # the winner's read + the settling fire (+ any late loser)
+
+
+def test_g15_end_to_end_a_flagged_block_lost_between_fires_is_reported_as_a_gap(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    write(t, pads(10))
+    sbs.evaluate(str(t), "e2e", "stop")                       # default 256 KiB window
+    p1 = pos_state(home, "e2e", t)["size"]
+    assert p1 == 1000
+    lost = block("msg_LOST", GOOD)
+    lost_bytes = _bytes(lost)
+    big_pad = [json.dumps({"type": "system", "x": "p" * 1000}) for _ in range(300)]   # > 256 KiB after the block
+    with open(t, "a", encoding="utf-8") as f:
+        f.write("\n".join(lost + big_pad) + "\n")
+    size = t.stat().st_size
+    assert size - p1 - lost_bytes > sbs.SHADOW_TAIL_BYTES
+    sbs.evaluate(str(t), "e2e", "stop")
+    assert [r for r in rows(home) if r.get("message_id") == "msg_LOST"] == []     # the block was never read
+    g = [x for x in gaps(home) if x["session_id"] == "e2e"]
+    assert len(g) == 1 and isinstance(g[0]["unread_bytes"], int)
+    data = t.read_bytes()
+    start = size - sbs.SHADOW_TAIL_BYTES
+    w = data.index(b"\n", start - 1) + 1
+    assert g[0]["unread_bytes"] == w - p1 and g[0]["unread_bytes"] >= lost_bytes
+
+
+@pytest.mark.parametrize("prior", [None, 500, 10 ** 9])
+def test_g16_window_off_never_writes_a_gap_row(sbs, home, tmp_path, prior):
+    t = tmp_path / "t.jsonl"
+    write(t, pads(40))
+    if prior is not None:
+        (home / "same-batch-shadow").mkdir()
+        pos_path(home, "g", t).write_text(json.dumps({"size": prior, "truncated_reads": 0, "result_first_reads": 0}))
+    sbs.evaluate(str(t), "g", "stop", tail_bytes=None)
+    assert gaps(home) == []
+
+
+def test_docstring_states_the_gap_bound():
+    import ast
+    doc = ast.get_docstring(ast.parse(MODULE_FILE.read_text()))
+    assert "counts bytes, not blocks" in doc and "claims no loss" in doc
+    assert "first bytes were read" in doc and "replay remains the truth" in doc
+
+
+@pytest.mark.parametrize("sid", ["same-session", ""])
+def test_g17_two_transcripts_never_share_a_position(sbs, home, tmp_path, sid):
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    write(a, pads(5))
+    fire(sbs, a, sid=sid)                         # A: small, within the window; stored size 500
+    write(b, pads(40))                            # B: much longer than A, over the window
+    fire(sbs, b, sid=sid)
+    g = gaps(home)
+    assert [x["unread_bytes"] for x in g] == ["unknown"]      # a first evaluation, never an integer gap
+    assert all(not isinstance(x["unread_bytes"], int) for x in g)
+    pos_files = sorted((home / "same-batch-shadow").glob("pos-*.json"))
+    assert len(pos_files) == 2                                # separate state per transcript
+    assert sorted(json.loads(p.read_text())["size"] for p in pos_files) == [500, 4000]
+    # and a B that fits the window is a first evaluation with no row at all
+    c = tmp_path / "c.jsonl"
+    write(c, pads(8))
+    (home / LEDGER).unlink()
+    fire(sbs, c, sid=sid)
+    assert gaps(home) == [] and len(list((home / "same-batch-shadow").glob("pos-*.json"))) == 3
+
+
+def test_g17_the_row_keeps_the_session_id_and_the_seen_file_name_is_unchanged(sbs, home, tmp_path):
+    a = tmp_path / "a.jsonl"
+    write(a, pads(40))
+    fire(sbs, a, sid="s9")
+    assert gaps(home)[0]["session_id"] == "s9"
+    write(a, pads(40) + block("msg_A", GOOD))
+    fire(sbs, a, sid="s9")
+    assert (home / "same-batch-shadow" / ("seen-" + hashlib.sha256(b"s9").hexdigest()[:24] + ".txt")).exists()
+
+
+# ----- G18..G20: a sub-agent fire is a parent fire with its source marked (#4390 round 3) ------------------
+
+def _tw_fire(tmp_path, t, home_dir, **extra):
+    payload = {**_tripwire_payload(t), **extra}
+    p = _run_hook(_flat_layout(tmp_path), TRIPWIRE, payload, home_dir)
+    assert p.returncode == 0
+    return p
+
+
+def _real_home(tmp_path, name):
+    h = tmp_path / name
+    h.mkdir()
+    enable(h)
+    return h
+
+
+def test_g18_subagent_fire_marks_the_source(tmp_path):
+    t = tmp_path / "t.jsonl"
+    write(t, block("msg_A", GOOD))
+    h = _real_home(tmp_path, "h18")
+    _tw_fire(tmp_path, t, h, agent_id="a92ae039d4bf5950b", agent_type="probe")
+    r = rows(h)
+    assert len(r) == 1 and r[0]["source"] == "pretooluse-subagent"
+    text = (h / LEDGER).read_text()
+    assert "a92ae039d4bf5950b" not in text and "probe" not in text
+
+
+@pytest.mark.parametrize("extra", [{}, {"agent_id": ""}, {"agent_id": None}])
+def test_g19_main_fire_or_empty_agent_id_is_plain_pretooluse(tmp_path, extra):
+    t = tmp_path / "t.jsonl"
+    write(t, block("msg_A", GOOD))
+    h = _real_home(tmp_path, "h19")
+    _tw_fire(tmp_path, t, h, **extra)
+    r = rows(h)
+    assert len(r) == 1 and r[0]["source"] == "pretooluse"
+
+
+def test_g20_subagent_then_parent_fire_on_one_transcript_advances_once_and_logs_once(tmp_path):
+    t = tmp_path / "t.jsonl"
+    write(t, pads(5) + block("msg_A", GOOD))
+    h = _real_home(tmp_path, "h20")
+    _tw_fire(tmp_path, t, h, agent_id="sub1", agent_type="probe")
+    st = json.loads(next((h / "same-batch-shadow").glob("pos-*.json")).read_text())
+    assert st["size"] == t.stat().st_size                       # the sub-agent fire advanced the stored size
+    _tw_fire(tmp_path, t, h)                                    # parent fire, no bytes added
+    assert gaps(h) == []
+    r = rows(h)
+    assert [x["message_id"] for x in r] == ["msg_A"] and r[0]["source"] == "pretooluse-subagent"
+    assert len(list((h / "same-batch-shadow").glob("pos-*.json"))) == 1
+
+
+# ----- round 4: interval on the gap row (G21), bounded read (G22), no splitlines in the counter (G9) -------
+
+def test_g21_failed_state_write_repeats_the_row_with_one_from_size_and_the_union_is_exact(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)                                              # P = 500, state written
+    pp = pos_path(home, "g", t)
+    (pp.parent / (pp.name + ".tmp")).mkdir()                        # the state write now fails
+    for n in (40, 60, 80):                                          # S = 4000, 6000, 8000; first_pos = S - 1000
+        write(t, pads(n))
+        assert sbs.evaluate(str(t), "g", "stop", tail_bytes=TAIL) is None     # never raises
+    g = gaps(home)
+    assert [(x["from_size"], x["to_offset"], x["unread_bytes"]) for x in g] == [
+        (500, 3000, 2500), (500, 5000, 4500), (500, 7000, 6500)]
+    assert pos_state(home, "g", t)["size"] == 500                   # the state never advanced
+    union, end = 0, None
+    for a, b in sorted((x["from_size"], x["to_offset"]) for x in g):
+        a = a if end is None else max(a, end)
+        union += max(0, b - a)
+        end = b if end is None else max(end, b)
+    assert union == 6500 and sum(x["unread_bytes"] for x in g) != 6500
+
+
+def test_g21_the_interval_fields_on_every_row_shape(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    write(t, pads(40))
+    fire(sbs, t)                                                    # no state: unknown, from_size null
+    seed(sbs, home, t, sid="h")
+    write(t, pads(40))
+    fire(sbs, t, sid="h")                                           # state 500 -> integer
+    write(t, pads(10))
+    fire(sbs, t, sid="g")                                           # state 4000, file shrank -> unknown with from_size
+    by = {x["session_id"]: x for x in gaps(home)}
+    assert (by["h"]["from_size"], by["h"]["to_offset"], by["h"]["unread_bytes"]) == (500, 3000, 2500)
+    first = [x for x in gaps(home) if x["session_id"] == "g"]
+    assert (first[0]["from_size"], first[0]["to_offset"], first[0]["unread_bytes"]) == (None, 3000, "unknown")
+    assert (first[1]["from_size"], first[1]["unread_bytes"]) == (4000, "unknown")
+
+
+def test_g22_a_file_that_grows_between_fstat_and_read_is_not_judged_and_the_next_gap_is_exact(sbs, home, tmp_path, monkeypatch):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)                                              # P = 500
+    write(t, pads(40))                                              # S = 4000
+    ino = t.stat().st_ino
+    late = block("msg_LATE", GOOD) + pads(20)
+    real, n = os.fstat, [0]
+
+    def grow(fd):
+        st = real(fd)
+        if st.st_ino == ino:
+            n[0] += 1
+            if n[0] == 2:                       # 1: the strict open's check; 2: _read_tail's size
+                with open(t, "ab") as f:
+                    f.write(("\n".join(late) + "\n").encode())
+        return st
+    monkeypatch.setattr(sbs.os, "fstat", grow)
+    fire(sbs, t)
+    monkeypatch.setattr(sbs.os, "fstat", real)
+    assert n[0] >= 2
+    assert [r for r in rows(home) if r.get("message_id") == "msg_LATE"] == []    # the extra bytes were not judged
+    assert [x["unread_bytes"] for x in gaps(home)] == [2500] and pos_state(home, "g", t)["size"] == 4000
+    fire(sbs, t)                                                    # next fire: gap is from 4000, exact
+    data = t.read_bytes()
+    w = data.index(b"\n", len(data) - TAIL - 1) + 1
+    assert w > 4000
+    assert [x["unread_bytes"] for x in gaps(home)] == [2500, w - 4000]
+    assert pos_state(home, "g", t)["size"] == len(data)
+
+
+def test_g9_first_line_result_without_splitlines_blank_lines_and_no_newline(sbs):
+    r = res("x1")
+    assert sbs._first_line_is_result(r) is True                     # no newline at all
+    assert sbs._first_line_is_result("\n\n   \n" + r + "\nrest") is True      # leading blank lines
+    assert sbs._first_line_is_result("") is False and sbs._first_line_is_result("  \n \n") is False
+    assert sbs._first_line_is_result("{bad\n" + r) is False         # the FIRST non-empty line decides
+    assert sbs._first_line_is_result(_rec("assistant") + "\n" + r) is False
+
+
+def test_g9_first_line_check_never_calls_splitlines():
+    import ast
+    tree = ast.parse(MODULE_FILE.read_text())
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_first_line_is_result")
+    assert not [c for c in ast.walk(fn) if isinstance(c, ast.Attribute) and c.attr == "splitlines"]
+
+
+def test_g9_a_window_with_a_leading_blank_line_then_a_result_counts_as_result_first(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    tail_lines = [""] + [res("x1")] + pads(3)
+    write(t, pads(30) + tail_lines)
+    sbs.evaluate(str(t), "g", "stop", tail_bytes=_bytes(tail_lines))
+    st = pos_state(home, "g", t)
+    assert (st["truncated_reads"], st["result_first_reads"]) == (1, 1)
+
+
+def test_g9_a_window_with_no_newline_counts_truncated_only(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    Path(t).write_text("\n".join(pads(5)) + "\n" + "z" * 4000)
+    fire(sbs, t)
+    st = pos_state(home, "g", t)
+    assert (st["truncated_reads"], st["result_first_reads"]) == (1, 0)
+
+
+# ----- round 5: the lock-skip counter (G23) and the cap-stopped gap row (G24) ----------------------------------
+
+def skips_path(home, sid, t):
+    return pos_path(home, sid, t).with_name(pos_path(home, sid, t).name.replace("pos-", "skips-").replace(".json", ".txt"))
+
+
+def test_g23_lock_held_fires_are_counted_one_line_each_and_nothing_else_changes(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)                                              # P = 500
+    write(t, pads(40))
+    pos_before = pos_path(home, "g", t).read_bytes()
+    ledger_before = (home / LEDGER).read_bytes() if (home / LEDGER).exists() else None
+    holder = _hold_lock(home)
+    try:
+        t0 = time.time()
+        assert sbs.evaluate(str(t), "g", "stop", tail_bytes=TAIL) is None
+        assert sbs.evaluate(str(t), "g", "pretooluse", tail_bytes=TAIL) is None
+        assert time.time() - t0 < 1
+        assert skips_path(home, "g", t).read_text() == "1\n1\n"
+        assert (skips_path(home, "g", t).stat().st_mode & 0o777) == 0o600
+        assert pos_path(home, "g", t).read_bytes() == pos_before
+        assert ((home / LEDGER).read_bytes() if (home / LEDGER).exists() else None) == ledger_before
+    finally:
+        holder.kill()
+        holder.wait()
+    fire(sbs, t)                                                    # released: the gap is from the OLDER size
+    assert [x["unread_bytes"] for x in gaps(home)] == [2500]
+    assert skips_path(home, "g", t).read_text() == "1\n1\n"        # a fire that got the lock does not count
+
+
+def test_g23_a_symlink_at_the_skips_path_is_refused_and_nothing_raises(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep\n")
+    skips_path(home, "g", t).symlink_to(victim)
+    holder = _hold_lock(home)
+    try:
+        assert sbs.evaluate(str(t), "g", "stop", tail_bytes=TAIL) is None
+    finally:
+        holder.kill()
+        holder.wait()
+    assert victim.read_text() == "keep\n" and skips_path(home, "g", t).is_symlink()
+
+
+def test_g23_a_fifo_at_the_skips_path_never_hangs(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    seed(sbs, home, t)
+    os.mkfifo(skips_path(home, "g", t))
+    holder = _hold_lock(home)
+    try:
+        t0 = time.time()
+        assert sbs.evaluate(str(t), "g", "stop", tail_bytes=TAIL) is None
+        assert time.time() - t0 < 1
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_g24_a_gap_row_stopped_by_the_cap_leaves_no_state_and_is_reported_after_a_trim(sbs, home, tmp_path):
+    t = tmp_path / "t.jsonl"
+    write(t, pads(40))                                              # first windowed fire, no state
+    pad = b"x" * (sbs.SHADOW_LOG_CAP_BYTES - 50 - 1) + b"\n"        # under the cap, but the gap row would cross it
+    (home / LEDGER).write_bytes(pad)
+    fire(sbs, t)
+    tail = (home / LEDGER).read_bytes()[len(pad):].decode().splitlines()
+    assert len(tail) == 1 and json.loads(tail[0])["event"] == "cap_reached"
+    assert not pos_path(home, "g", t).exists()                      # state did not advance past the stopped row
+    (home / LEDGER).write_bytes(b"")                                # trimmed under the cap
+    fire(sbs, t)
+    g = gaps(home)
+    assert len(g) == 1 and (g[0]["from_size"], g[0]["to_offset"], g[0]["unread_bytes"]) == (None, 3000, "unknown")
+    assert pos_state(home, "g", t)["size"] == 4000

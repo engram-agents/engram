@@ -25,6 +25,34 @@ file is read, the row appended to the ledger, and the message id appended to the
 failed ledger write leaves the id unseen, so a later fire retries. (A crash between the two
 appends could, rarely, duplicate a row on retry; the other order could lose one.)
 
+Unread gap (#4390, Kepler's ruling): the window is the last 256 KiB, so traffic between two fires can
+pass wholly unread. Per session and transcript one state file `same-batch-shadow/pos-<24-hex>.json` (the hash is of
+session id, NUL, transcript path; mode 0600,
+replaced whole through a temp file) holds {"size", "truncated_reads", "result_first_reads"}: the
+transcript size at the last COMPLETED evaluation, the reads with a window start past 0, and the subset
+whose first newline-delimited line is a user record holding a tool_result item (a counter, not a loss claim; `_blocks` also splits on U+0085, U+2028 and U+2029, so on such a first line the two can differ, and only this counter is affected).
+On EVERY enabled fire, under the same lock and in this order, the state is loaded, flagged rows are
+written, then at most one `{"event":"unread_gap","ts","session_id","source","unread_bytes","from_size","to_offset"}` row, then the
+state: `unread_bytes` is the first kept line's offset minus the stored size when that is positive, and
+the string "unknown" (never 0) on a session's first evaluation of a file over the window or when the
+file is smaller than the stored size. No row when the window is off (`tail_bytes=None`). A fire that
+finds the lock held, a failed row write or a cap stop leaves the state where it was, so the next fire
+reports the gap from the older size. A link, FIFO or hard link at the state path is refused: no gap row,
+no write. (A crash between the gap row and the state write could, rarely, repeat the row.) Pos and skips files,
+like seen files, are not pruned. Since every enabled fire now takes the lock, a concurrent sibling fire
+that finds it held returns having written no row, so its flagged blocks wait for a later fire and are
+lost only if they leave the window first. Lock-held fires are counted, one line each, in
+`same-batch-shadow/skips-<24-hex>.txt`; that count says how often a fire deferred, not how many blocks.
+
+A sub-agent's fire carries the parent's transcript and session (measured on Claude Code 2.1.319, one fire), so it is judged as a parent fire with source "pretooluse-subagent"; a row's source says which fire saw the block first, not who wrote it; a sub-agent's own blocks live in its own transcript and are never judged.
+
+The row names its interval: `from_size` is the stored size (null when there was no usable state),
+`to_offset` the first kept offset, and in the integer case unread_bytes == to_offset - from_size.
+
+More bounds on the gap row: the size advances on every completed fire even when the window held incomplete blocks, so a block incomplete at one fire that scrolls out before the next is unjudged, and a gap row claims nothing about it; a gap row carries the time and source of the fire that found the gap, not of the traffic; "unknown" also fires for a transcript rewritten smaller than its stored size, where nothing need be lost, and after a deleted or corrupt state file, while a transcript rewritten larger gives no row or a false integer gap; a file shrunk during the read leaves text short of size, which the next fire reports as "unknown"; a failed state write repeats and grows the row, each row naming its interval, so read the union, not the sum.
+
+Stated bound on the gap: a gap row counts bytes, not blocks, and claims no loss. A block whose tool_use lay before the stored size and whose results lie in the gap is also unjudged, though its first bytes were read. The replay remains the truth.
+
 Privacy: a row holds no report text and no tool input -- fields only (see `_row`).
 
 Never raises: `evaluate` swallows every Exception. All file I/O goes through the strict
@@ -175,8 +203,10 @@ def _read_prev_line(fd, line_start):
 
 
 def _read_tail(path, tail_bytes):
-    """(text, truncated, prev). Strict regular-file open (no link, no FIFO). With tail_bytes, only the
-    last that many bytes; when that starts mid-file the first partial line is discarded.
+    """(text, truncated, prev, size, first_pos). Strict regular-file open (no link, no FIFO). With
+    tail_bytes, only the last that many bytes; when that starts mid-file the first partial line is
+    discarded. `size` is the file size read; `first_pos` is the byte offset of the first line actually
+    kept: 0 when not truncated, and `size` when truncated and no newline was found (nothing kept).
 
     `prev` is None except in ONE branch: the read was truncated AND the window's first complete line
     is an assistant record. Only then is the complete line just before it read back, through the same
@@ -194,14 +224,16 @@ def _read_tail(path, tail_bytes):
         off = max(start - 1, 0)
         os.lseek(fd, off, os.SEEK_SET)
         chunks = []
-        while True:
-            b = os.read(fd, 1 << 20)
+        remaining = size - off          # never past the size read: text and size describe the same bytes
+        while remaining > 0:
+            b = os.read(fd, min(1 << 20, remaining))
             if not b:
                 break
             chunks.append(b)
+            remaining -= len(b)
         data = b"".join(chunks)
         truncated = start > 0
-        first_pos = None
+        first_pos = 0
         if truncated:
             if data[:1] == b"\n":
                 data = data[1:]
@@ -210,18 +242,42 @@ def _read_tail(path, tail_bytes):
                 nl = data.find(b"\n")
                 if nl < 0:
                     data = b""
+                    first_pos = size
                 else:
                     data = data[nl + 1:]
                     first_pos = off + nl + 1
         text = data.decode("utf-8", "replace")
-        if truncated and first_pos is not None and data[:1] not in (b"", b"\n") \
+        if truncated and data[:1] not in (b"", b"\n") \
                 and _first_line_assistant_mid(text) is not None:
             prev = _read_prev_line(fd, first_pos)
             if prev is None:
                 prev = _PREV_UNKNOWN
     finally:
         os.close(fd)
-    return text, truncated, prev
+    return text, truncated, prev, size, first_pos
+
+
+def _first_line_is_result(text):
+    """True when the first non-empty line of `text` parses to a user record whose content holds a
+    tool_result item. A line that does not parse, or any other record, is False."""
+    pos = 0
+    while True:                         # first non-empty line by finding newlines, no pass over the window
+        nl = text.find("\n", pos)
+        line = text[pos:] if nl < 0 else text[pos:nl]
+        if line.strip():
+            first = line
+            break
+        if nl < 0:
+            return False
+        pos = nl + 1
+    try:
+        fr = json.loads(first)
+    except Exception:
+        return False
+    fm = fr.get("message") if isinstance(fr, dict) else None
+    content = fm.get("content") if isinstance(fm, dict) else None
+    return fr.get("type") == "user" and isinstance(content, list) \
+        and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
 
 
 def _blocks(text, truncated, prev=None):
@@ -425,21 +481,103 @@ def _capped_fast(home) -> bool:
     return True
 
 
-def _record(home, session_id, rows):
-    """Append each (mid, row) not yet seen for this session, once, under the lock; stop at the cap."""
+_GAP_UNKNOWN = "unknown"
+_POS_KEYS = ("size", "truncated_reads", "result_first_reads")
+
+
+def _is_count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _load_pos(path):
+    """(state, refused). state is the stored dict, or None for absent / empty / corrupt / wrong-shape
+    (treated as no state). refused is True when the path is a link, FIFO, hard-linked or otherwise
+    unreadable through the strict open: nothing is read or written there."""
+    try:
+        fd = _open_single_regular(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return None, False
+    except OSError:
+        return None, True
+    try:
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(4096)
+        st = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None, False
+    if not isinstance(st, dict) or not all(_is_count(st.get(k)) for k in _POS_KEYS):
+        return None, False
+    return {k: st[k] for k in _POS_KEYS}, False
+
+
+def _write_pos(path, state):
+    """Whole-file replace: a temp file in the same dir (made fresh through the strict open, mode 0600,
+    never through a link) then os.replace, so a half-written file is never read as state."""
+    tmp = path + ".tmp"
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    data = json.dumps({k: state[k] for k in _POS_KEYS}, separators=(",", ":")).encode("utf-8")
+    fd = _open_single_regular(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _gap_value(prev_state, obs):
+    """The unread_bytes for this fire: an int, `_GAP_UNKNOWN`, or None for no row."""
+    if not obs["windowed"]:
+        return None
+    if prev_state is None:
+        return _GAP_UNKNOWN if obs["truncated"] else None
+    if obs["size"] < prev_state["size"]:
+        return _GAP_UNKNOWN
+    if obs["start"] > prev_state["size"]:
+        return obs["start"] - prev_state["size"]
+    return None
+
+
+def _record(home, session_id, rows, obs):
+    """Under the lock, taken on every enabled fire and never waited for: (1) load this session's
+    position state; (2) append each (mid, row) not yet seen, once; (3) append the unread_gap row if any;
+    (4) write the new state. A failed write or a cap stop skips the later steps, so state never advances
+    past a row that was not written. `obs` = size, start (first_pos), truncated, result_first, windowed."""
     import fcntl
     d = _state_dir(home)
     if d is None:
         return
-    seen_name = "seen-" + hashlib.sha256(str(session_id).encode("utf-8", "replace")).hexdigest()[:24] + ".txt"
-    seen_path = os.path.join(d, seen_name)
+    h = hashlib.sha256(str(session_id).encode("utf-8", "replace")).hexdigest()[:24]
+    seen_path = os.path.join(d, "seen-" + h + ".txt")
+    # the position is per (session, transcript): a missing session id ("unknown") or one id seen with a
+    # second transcript path must not share a stored size across files
+    hp = hashlib.sha256((str(session_id) + "\0" + str(obs["path"])).encode("utf-8", "replace")).hexdigest()[:24]
+    pos_path = os.path.join(d, "pos-" + hp + ".json")
     ledger = os.path.join(str(home), LEDGER_NAME)
     lock_fd = _open_single_regular(os.path.join(d, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return  # another fire holds the lock: never wait; the blocks stay unseen, a later fire retries
+            # another fire holds the lock: never wait; the blocks stay unseen, a later fire retries.
+            # Count the deferral outside the lock: one "1" line, O_APPEND keeps it whole; swallowed.
+            try:
+                _append_line(os.path.join(d, "skips-" + hp + ".txt"), "1")
+            except Exception:
+                pass
+            return
+        prev_state, refused = _load_pos(pos_path)
         try:
             sfd = _open_single_regular(seen_path, os.O_RDONLY)  # strict: a link here is refused, not read
         except FileNotFoundError:
@@ -457,6 +595,26 @@ def _record(home, session_id, rows):
             _append_line(ledger, line)
             _append_line(seen_path, mid)
             seen.add(mid)
+        if refused:
+            return  # a link / FIFO at the pos path: no gap row (it could only say "unknown"), no write
+        gap = _gap_value(prev_state, obs)
+        if gap is not None:
+            grow = {"event": "unread_gap",
+                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "session_id": session_id, "source": obs["source"], "unread_bytes": gap,
+                    "from_size": prev_state["size"] if prev_state is not None else None,
+                    "to_offset": obs["start"]}
+            line = json.dumps(grow, separators=(",", ":"))
+            if _ledger_size(home) + len(line) + 1 > SHADOW_LOG_CAP_BYTES:
+                _write_cap_row_once(home, d)
+                return
+            _append_line(ledger, line)
+        base = prev_state or {"truncated_reads": 0, "result_first_reads": 0}
+        _write_pos(pos_path, {
+            "size": obs["size"],
+            "truncated_reads": base["truncated_reads"] + (1 if obs["truncated"] else 0),
+            "result_first_reads": base["result_first_reads"] + (1 if obs["result_first"] else 0),
+        })
     finally:
         os.close(lock_fd)  # closing drops the flock
 
@@ -471,13 +629,16 @@ def _evaluate(transcript_path, session_id, source, tail_bytes):
         return
     if _capped_fast(home):
         return
-    text, truncated, prev = _read_tail(transcript_path, tail_bytes)
+    text, truncated, prev, size, first_pos = _read_tail(transcript_path, tail_bytes)
+    sid = session_id if session_id else "unknown"
     rows = []
     for mid, calls, complete, err in _blocks(text, truncated, prev):
         if complete and _flagged(calls):
-            rows.append((mid, _row(session_id if session_id else "unknown", mid, source, calls, err)))
-    if rows:
-        _record(home, session_id if session_id else "unknown", rows)
+            rows.append((mid, _row(sid, mid, source, calls, err)))
+    obs = {"path": transcript_path, "size": size, "start": first_pos, "truncated": truncated, "source": source,
+           "windowed": tail_bytes is not None,
+           "result_first": truncated and _first_line_is_result(text)}
+    _record(home, sid, rows, obs)
 
 
 def evaluate(transcript_path, session_id, source, tail_bytes=SHADOW_TAIL_BYTES):
