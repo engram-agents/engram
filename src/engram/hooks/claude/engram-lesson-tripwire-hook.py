@@ -1281,10 +1281,30 @@ def _ws4_config() -> dict:
         return inactive
 
 
+def _agent_fields(hook_input) -> dict:
+    """#4395 Q2: the sub-agent identity fields of one PreToolUse payload, as a
+    dict to merge into a ledger row. A sub-agent's payload carries `agent_id` and
+    `agent_type` (alongside the PARENT's session_id / transcript_path); a main-agent
+    payload carries neither. Each is returned exactly as given, ONLY when the payload
+    has it as a non-empty string; otherwise the key is ABSENT from the result -- never
+    null, "" or "main", so an absent field can never read as the main agent (a
+    malformed value, e.g. a number or null, is treated as absent). Read ONCE per fire
+    in _main_impl() and passed down to every ledger writer. Never raises."""
+    out: dict = {}
+    try:
+        for key in ("agent_id", "agent_type"):
+            value = hook_input.get(key)
+            if isinstance(value, str) and value:
+                out[key] = value
+    except Exception:
+        return {}
+    return out
+
+
 def _build_ws4_ledger_entry(
     *, ts, ts_iso, hook_input, raw_tool_use_id, nonce, draw_basis, seed,
     arm, shown_lesson_ids, cut_lesson_ids, heads_by_lesson, nudge_chars,
-    principles_block, chain_rendered, error, chain_cut=False,
+    principles_block, chain_rendered, error, chain_cut=False, agent_fields=None,
 ) -> dict:
     """Assemble one full WS4 fire-ledger row (schema per the WS4 spec).
 
@@ -1325,6 +1345,8 @@ def _build_ws4_ledger_entry(
     }
     if error is not None:
         entry["error"] = error
+    if agent_fields:  # #4395: only present keys, absent otherwise
+        entry.update(agent_fields)
     return entry
 
 
@@ -1652,7 +1674,7 @@ def build_deny_reason(deny: dict) -> str:
     )
 
 
-def _log_threshold_crossed(now: float, deny: dict) -> None:
+def _log_threshold_crossed(now: float, deny: dict, agent_fields=None) -> None:
     """alpha#1944 step 4 — the read-time-lease signal: a loud stderr line
     (hook stdout is reserved for the additionalContext/deny JSON contract;
     stderr is safe to use freely) plus a distinct ledger entry, emitted
@@ -1678,12 +1700,13 @@ def _log_threshold_crossed(now: float, deny: dict) -> None:
                 "override_count": deny["override_count"],
                 "threshold": deny["threshold"],
                 "window_days": deny["window_days"],
+                **(agent_fields or {}),  # #4395: only present keys
             }) + "\n")
     except Exception:
         pass
 
 
-def _append_prevention_ledger(now: float, hits: list) -> None:
+def _append_prevention_ledger(now: float, hits: list, agent_fields=None) -> None:
     """Best-effort append of one JSONL entry per would-have-blocked fire
     (alpha#1944 step 2, extended step 3 with override fields — the log a
     future promotion/demotion gate reads). Mirrors _append_ledger's
@@ -1705,6 +1728,7 @@ def _append_prevention_ledger(now: float, hits: list) -> None:
                     "override_reason": hit.get("override_reason"),
                     # step 4 field (independent-predicate verdict) lands
                     # when the auto-demotion counter is wired.
+                    **(agent_fields or {}),  # #4395: only present keys
                 }) + "\n")
     except Exception:
         pass
@@ -2048,7 +2072,8 @@ _RECALL_FOOTER = "\n  (ambient action-moment recall; engram_inspect(id) for deta
 
 def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
                          record_out: dict | None = None,
-                         max_chars: int | None = None, cut_reserve: int = 0) -> str:
+                         max_chars: int | None = None, cut_reserve: int = 0,
+                         agent_fields: dict | None = None) -> str:
     """Budgeted general recall at action-moment, behind the novelty gate.
 
     hook_input (#1749): the raw PreToolUse payload, passed through from
@@ -2274,7 +2299,11 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
             state["recent_term_sets"] = term_sets[-_RECENT_TERM_SETS_KEPT:]
 
         def _ledger_entry(outcome: str, match_count: int, rendered_ids_: list, skipped_recent_: int) -> dict:
+            # #4395: main() passes the fields it read once; a legacy caller that
+            # passes only hook_input gets them derived from it (same helper).
+            _agent = agent_fields if agent_fields is not None else _agent_fields(hook_input)
             return {
+                **_agent,
                 "ts": now,
                 "session_id": hook_input.get("session_id") if hook_input else None,
                 "transcript_path": hook_input.get("transcript_path") if hook_input else None,
@@ -2454,6 +2483,10 @@ def _main_impl() -> None:
         # silent exit (the outer-handler crash notice below does not cover it).
         sys.exit(0)
 
+    # #4395 Q2: the sub-agent identity fields, read ONCE from this payload and passed
+    # down to every ledger row below (absent keys stay absent).
+    agent_fields = _agent_fields(hook_input)
+
     # #4390 phase 1: same-batch report detector, SHADOW (default off; logs, prints nothing, changes
     # nothing). One fail-open call; the import sits inside the try so a missing module is a no-op.
     try:
@@ -2508,7 +2541,7 @@ def _main_impl() -> None:
             # and fall through to the normal advisory path below.
             try:
                 import time as _time
-                _log_threshold_crossed(_time.time(), deny)
+                _log_threshold_crossed(_time.time(), deny, agent_fields)
             except Exception:
                 pass
             deny = None
@@ -2941,7 +2974,7 @@ def _main_impl() -> None:
                         nudge_chars=nudge_chars,
                         principles_block=principles_block,
                         chain_rendered=chain_rendered, error=arm_error,
-                        chain_cut=_chain_cut,
+                        chain_cut=_chain_cut, agent_fields=agent_fields,
                     )
                     if _defer_row:
                         _ws4_rows.append(entry)
@@ -2973,6 +3006,7 @@ def _main_impl() -> None:
                         # decision itself was corrupted, not just its
                         # downstream bookkeeping.
                         "error": arm_error or f"{type(row_exc).__name__}: {str(row_exc)[:200]}",
+                        **agent_fields,  # #4395
                     }
                     if _defer_row:
                         _ws4_rows.append(_fallback_row)
@@ -2999,7 +3033,7 @@ def _main_impl() -> None:
                 check_shadow_block(match_target, prevention_lessons, hook_input)
                 if prevention_lessons else []
             )
-            _append_prevention_ledger(_time.time(), shadow_hits)
+            _append_prevention_ledger(_time.time(), shadow_hits, agent_fields)
         except Exception:
             pass
 
@@ -3036,7 +3070,8 @@ def _main_impl() -> None:
             if _recall_state == "empty":
                 recall = ""
             else:
-                recall = check_in_turn_recall(_recall_text, hook_input, _pending_shown, **_recall_kw)
+                recall = check_in_turn_recall(_recall_text, hook_input, _pending_shown,
+                                              agent_fields=agent_fields, **_recall_kw)
         except Exception:
             recall = ""
             _pending_shown.clear()

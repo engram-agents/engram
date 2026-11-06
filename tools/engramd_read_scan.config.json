@@ -239,6 +239,7 @@
   "hooks/claude/engram-lesson-tripwire-hook.py:_truncate_for_label",
   "hooks/claude/engram-lesson-tripwire-hook.py:render_triggered_principles",
   "hooks/claude/engram-lesson-tripwire-hook.py:_ws4_config",
+  "hooks/claude/engram-lesson-tripwire-hook.py:_agent_fields",
   "hooks/claude/engram-lesson-tripwire-hook.py:_build_ws4_ledger_entry",
   "hooks/claude/engram-lesson-tripwire-hook.py:_append_ws4_fire_ledger",
   "hooks/claude/engram-lesson-tripwire-hook.py:_tail_cut_clause",

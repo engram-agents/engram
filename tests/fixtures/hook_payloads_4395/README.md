@@ -1,0 +1,1 @@
+Real PreToolUse payloads for #4395, captured on macOS, Claude Code 2.1.306, by Halley's fixture (a logging-only PreToolUse hook passed with `--settings` and a headless four-step prompt); byte-for-byte, except the home directory and seat username in paths are replaced with `/HOME` and `seatuser`.
