@@ -625,7 +625,26 @@
   "tools/inspect_raw.py:read_row",
   "tools/anchoring_report.py:_fetch_population",
   "tools/install_selfcheck.py:_read_counts",
-  "tools/install_selfcheck.py:_read_present_ids"
+  "tools/install_selfcheck.py:_read_present_ids",
+  "hooks/claude/_same_batch_shadow.py:_append_line",
+  "hooks/claude/_same_batch_shadow.py:_blocks",
+  "hooks/claude/_same_batch_shadow.py:_capped_fast",
+  "hooks/claude/_same_batch_shadow.py:_enabled",
+  "hooks/claude/_same_batch_shadow.py:_evaluate",
+  "hooks/claude/_same_batch_shadow.py:_first_line_assistant_mid",
+  "hooks/claude/_same_batch_shadow.py:_flagged",
+  "hooks/claude/_same_batch_shadow.py:_harness_ok",
+  "hooks/claude/_same_batch_shadow.py:_ledger_size",
+  "hooks/claude/_same_batch_shadow.py:_read_prev_line",
+  "hooks/claude/_same_batch_shadow.py:_read_tail",
+  "hooks/claude/_same_batch_shadow.py:_record",
+  "hooks/claude/_same_batch_shadow.py:_row",
+  "hooks/claude/_same_batch_shadow.py:_state_dir",
+  "hooks/claude/_same_batch_shadow.py:_write_cap_row_once",
+  "hooks/claude/_same_batch_shadow.py:evaluate",
+  "hooks/claude/_same_batch_shadow.py:isfx",
+  "hooks/claude/_same_batch_shadow.py:report_text",
+  "hooks/claude/_same_batch_shadow.py:short"
  ],
  "exclusions": [
   {

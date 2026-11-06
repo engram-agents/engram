@@ -880,6 +880,12 @@
       "note": "engram-alpha#3196 (U4c, part of #2652): build-time read-template scanner -- walks the hook call graph (reusing tools/write_op_census.py's _scan_package/_bfs_reach) and emits src/engram/engramd_read_templates.json; a site that is neither a readable literal nor declared fails the build. ENGRAM-development tooling; real file under repo-root tools/, so 'source' is set explicitly."
     },
     {
+      "path": "tools/same_batch_shadow_latency.py",
+      "tier": "dev",
+      "source": "tools/same_batch_shadow_latency.py",
+      "note": "engram-alpha#4390 phase 1: the latency measurement of the same-batch shadow detector, tripwire hook ON vs OFF. A measurement owed in the PR body, not a CI gate; ENGRAM-development tooling, real file under repo-root tools/, so 'source' is set explicitly."
+    },
+    {
       "path": "tools/engramd_a6_latency.py",
       "tier": "dev",
       "source": "tools/engramd_a6_latency.py",
@@ -1164,6 +1170,11 @@
       "path": "hooks/claude/engram-lesson-tripwire-hook.py",
       "tier": "convenience",
       "dest": "hooks/engram-lesson-tripwire-hook.py"
+    },
+    {
+      "path": "hooks/claude/_same_batch_shadow.py",
+      "tier": "convenience",
+      "dest": "hooks/_same_batch_shadow.py"
     },
     {
       "path": "skills/claude/engram-first-session",

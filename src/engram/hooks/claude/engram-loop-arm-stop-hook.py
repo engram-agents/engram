@@ -1800,6 +1800,16 @@ def main() -> None:
     except Exception:
         return
 
+    # #4390 phase 1: same-batch report detector, SHADOW (default off; logs, prints nothing, changes
+    # nothing). One fail-open call, after the stop_hook_active return above and BEFORE the loop-marker
+    # gate below, so it runs on every Stop, in a loop or not. The import sits inside the try so a
+    # missing module is a no-op.
+    try:
+        from _same_batch_shadow import evaluate as _sbs_evaluate
+        _sbs_evaluate(transcript_path, session_id, "stop")
+    except Exception:
+        pass
+
     # Never nag a non-loop session. No state-file touch on this path — the
     # gate is stateless, matching engram-stop-hook.py's maturity-gate
     # discipline (crossing back into loop mode later leaves this hook's

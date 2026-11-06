@@ -171,6 +171,7 @@ RUNTIME_FILES = {
     # tests/test_engramd_a6_latency.py keeps this list honest).
     "hooks/engram-lesson-tripwire-hook.py": "src/engram/hooks/claude/engram-lesson-tripwire-hook.py",
     "hooks/_harness.py": "src/engram/hooks/claude/_harness.py",
+    "hooks/_same_batch_shadow.py": "src/engram/hooks/claude/_same_batch_shadow.py",
     "engramd_owner_flags.py": "src/engram/engramd_owner_flags.py",
     "engram_idf.py": "src/engram/engram_idf.py",
     "engram_core.py": "src/engram/engram_core.py",

@@ -2454,6 +2454,14 @@ def _main_impl() -> None:
         # silent exit (the outer-handler crash notice below does not cover it).
         sys.exit(0)
 
+    # #4390 phase 1: same-batch report detector, SHADOW (default off; logs, prints nothing, changes
+    # nothing). One fail-open call; the import sits inside the try so a missing module is a no-op.
+    try:
+        from _same_batch_shadow import evaluate as _sbs_evaluate
+        _sbs_evaluate(hook_input.get("transcript_path"), hook_input.get("session_id"), "pretooluse")
+    except Exception:
+        pass
+
     # #3665: the flag, read once per fire. A failed helper reads OFF and is reported (the
     # stderr line is written at the end of the fire, with any owner failure).
     _OWNER_RUN = {"on": _owner_reads_enabled(), "conn": None, "failure": None}

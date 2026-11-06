@@ -502,6 +502,11 @@
       "note": "engram-alpha#3196 (U4c): loaded by tests/test_engramd_read_scan.py via importlib (file path), so it is invisible to the layer-1 import graph."
     },
     {
+      "path_prefix_or_glob": "hooks/claude/_same_batch_shadow.py",
+      "test_globs": ["tests/test_same_batch_shadow_4390.py"],
+      "note": "engram-alpha#4390 phase 1: imported lazily inside a try by the tripwire and loop-arm hooks, so it is invisible to the layer-1 import graph."
+    },
+    {
       "path_prefix_or_glob": "tools/engramd_a6_latency.py",
       "test_globs": [
         "tests/test_engramd_a6_latency.py",
@@ -1105,6 +1110,10 @@
     }
   ],
   "unmapped": [
+    {
+      "path": "tools/same_batch_shadow_latency.py",
+      "reason": "engram-alpha#4390 phase 1: a measurement instrument owed in the PR body, with its own positive arm; no dedicated test file."
+    },
     {
       "path": "tools/_channel.py",
       "reason": "Internal transport helper for letters between agents; no dedicated test file. Changes covered by ia.py test suite indirectly."

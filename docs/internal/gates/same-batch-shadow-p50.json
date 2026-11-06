@@ -1,0 +1,23 @@
+{
+  "alpha": 0.05,
+  "block_bound": 20,
+  "deciders": {
+    "trade_off": "the design owner of #4390 (Kepler), per the band he set on the issue 2026-11-06; Lei informed by him"
+  },
+  "design": "paired by run, ON and OFF phases of 100 fires alternating with order flipped each run; A/A (OFF vs OFF) control first per cell, must pass both ways",
+  "direction": "lower_is_better",
+  "gate_sha256": "f5392fc0d907586c30cbd3ebea303086039f7d3db622dad4ff7a631403890f92",
+  "instrument": "tools/same_batch_shadow_latency.py",
+  "instrument_version": "b85a8a4374c29d1667b01472c9e03ac06bc2b474",
+  "margin": 5,
+  "metric": "p50 ms per run, ON minus OFF",
+  "metricgate_version": "0.1.0",
+  "n_planned": 8,
+  "paired": true,
+  "population": "Halley's Linux seat, branch feat/4390-same-batch-shadow, source layout, knowledge.db copy, tripwire hook fed one fixed Bash payload; two cells, frozen copies of transcripts 5c606497 (11.8 MB) and 51a15598 (22.6 MB), each with one synthetic flagged block appended so every ON fire takes the worst path; the worse cell counts",
+  "registered_at": "2026-11-06T14:31:57Z",
+  "scale": "diff",
+  "unit": "ms",
+  "unit_of_analysis": "run",
+  "verdict_rule": "PASS when the 90% upper bound of ON minus OFF is <= 5 ms at n=8; BLOCK when the estimate is beyond 20 ms; otherwise TRADE_OFF, the design owner's. Read once. Worse of the two cells counts. Band set by Kepler on #4390, comment of 2026-11-06T13:56:23Z."
+}
