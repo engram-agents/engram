@@ -584,3 +584,177 @@ class TestWriteRanks(unittest.TestCase):
                 os.environ["ENGRAM_HOME"] = orig_env
         self.assertEqual(code, 0)
         self.assertTrue((home / "lesson-fire-ranks.json").exists())
+
+
+# ---------------------------------------------------------------------------
+# 8. alpha#4396: --write-ranks ranks from MAIN-session transcripts only
+# ---------------------------------------------------------------------------
+
+class TestWriteRanksMainSessionOnly(unittest.TestCase):
+    """alpha#4396: sub-agent (fairy) transcripts live under a `subagents/` directory and must not feed
+    the rank file; the coverage audit still reads them (a fairy's calls are real calls)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_audit_mainonly_"))
+        self.db = _make_db(self.tmp)
+        _insert_lesson(self.db, node_id="lsx-001", pattern=r"main-only-verb")
+        _insert_lesson(self.db, node_id="lsy-001", pattern=r"fairy-only-verb")
+        self.root = self.tmp / "tree"
+        self.out = self.tmp / "ranks.json"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _put(self, rel, commands, mtime):
+        """Write a transcript at root/rel with an explicit mtime (order never depends on write timing)."""
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _write_transcript(p, [_bash_entry(c) for c in commands])
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def _tree_x_and_y(self):
+        self._put("proj/main.jsonl", ["main-only-verb 1", "ls"], 1_000_000)
+        self._put("proj/sess/subagents/agent-1.jsonl", ["fairy-only-verb 1", "fairy-only-verb 2"], 2_000_000)
+
+    def _glob(self):
+        return str(self.root / "**" / "*.jsonl")
+
+    def _write_ranks(self, **kw):
+        out = io.StringIO()
+        code = _audit.run_write_ranks(db_path=str(self.db), transcript_glob=self._glob(),
+                                      path=str(self.out), out=out, err=io.StringIO(), **kw)
+        return code, out.getvalue()
+
+    def test_t1_subagent_calls_do_not_feed_the_ranks(self):
+        """T1. Y matches only a NEWER sub-agent file: its rank is 0.0, X's (main file) is > 0.0.
+        Red for m3 (run_write_ranks not passing the flag) and m5 (filter dropped): both give Y > 0."""
+        self._tree_x_and_y()
+        code, _ = self._write_ranks()
+        self.assertEqual(code, 0)
+        doc = json.loads(self.out.read_text())
+        self.assertEqual(doc["ranks"]["lsy-001"], 0.0)
+        self.assertGreater(doc["ranks"]["lsx-001"], 0.0)
+        self.assertEqual(doc["targets"], 2)  # main.jsonl only
+
+    def test_t2_default_still_reads_subagents_and_audit_counts_them(self):
+        """T2. Default exclude_subagents=False keeps every file: collect_targets returns the sub-agent
+        call, and run_audit still sees the Y match. Red for m4 (default flipped to True)."""
+        self._tree_x_and_y()
+        cur, prior, srcs = collect_targets(transcript_glob=self._glob(), limit_files=6)
+        self.assertIn("fairy-only-verb 1", cur + prior)
+        self.assertEqual(len(srcs), 2)
+        # pairs=True with the default keyword must not start filtering (red for k4: default following `pairs`)
+        pcur, pprior, psrcs = collect_targets(transcript_glob=self._glob(), limit_files=6, pairs=True)
+        self.assertTrue(any("fairy-only-verb 1" in full for full, _cmd in pcur + pprior))
+        self.assertEqual(len(psrcs), 2)
+        out = io.StringIO()
+        rc = run_audit(db_path=str(self.db), transcript_glob=self._glob(), limit_files=6,
+                       out=out, err=io.StringIO())
+        self.assertEqual(rc, 0)
+        report = out.getvalue()
+        self.assertIn("[lsy-001] LIVE", report)
+        self.assertNotIn("[lsy-001] DEAD", report)
+
+    def test_t3_filter_applies_before_the_window_limit(self):
+        """T3. 7 older main files + 3 newer sub-agent files, limit 6: exactly the 6 newest MAIN files.
+        Red for m1 (filter after the slice: would return only 3 main files) and m5."""
+        for i in range(7):
+            self._put(f"proj/main-{i}.jsonl", [f"main-only-verb {i}"], 1_000_000 + i)
+        for i in range(3):
+            self._put(f"proj/sess/subagents/agent-{i}.jsonl", [f"fairy-only-verb {i}"], 2_000_000 + i)
+        _cur, _prior, srcs = collect_targets(transcript_glob=self._glob(), limit_files=6,
+                                             exclude_subagents=True)
+        self.assertEqual(sorted(os.path.basename(f) for f in srcs),
+                         sorted(f"main-{i}.jsonl" for i in range(1, 7)))
+
+    def test_t4_only_subagent_files_writes_nothing(self):
+        """T4. A tree of sub-agent files only: the "no transcripts found" line, exit 0, an existing rank
+        file untouched byte for byte. Red for m3 and m5 (the file would be rewritten)."""
+        self._put("proj/sess/subagents/agent-1.jsonl", ["fairy-only-verb 1"], 2_000_000)
+        self.out.write_bytes(b'{"ranks": {"keep": 1.0}}\n')
+        before = self.out.read_bytes()
+        code, said = self._write_ranks()
+        self.assertEqual(code, 0)
+        self.assertIn("no transcripts found; rank file left as is", said)
+        self.assertEqual(self.out.read_bytes(), before)
+
+    def test_t5_path_component_not_filename_substring(self):
+        """T5. `my-subagents-notes.jsonl` (a file NAME containing the word) is KEPT; files under a
+        directory named exactly `subagents`, at depth 2 and 3, are DROPPED, and so is a file whose
+        `subagents` directory is NOT its direct parent (`subagents/nested/`). Red for m2 (substring
+        match on the name drops the notes file), m5, and k2 (direct-parent test only)."""
+        self._put("my-subagents-notes.jsonl", ["main-only-verb n"], 1_000_000)
+        self._put("proj/subagents/a.jsonl", ["fairy-only-verb a"], 1_000_001)
+        self._put("proj/sess/subagents/b.jsonl", ["fairy-only-verb b"], 1_000_002)
+        self._put("proj/sess/subagents/nested/agent-9.jsonl", ["fairy-only-verb c"], 1_000_003)
+        _cur, _prior, srcs = collect_targets(transcript_glob=self._glob(), limit_files=6,
+                                             exclude_subagents=True)
+        self.assertEqual([os.path.basename(f) for f in srcs], ["my-subagents-notes.jsonl"])
+
+    def test_t6_compare_views_still_reads_subagent_traffic(self):
+        """T6. Over the T1 tree, --compare-views (run_view_comparison) still includes the sub-agent
+        calls: 4 targets, and the Y lesson (matching only the sub-agent file) sees both of its calls.
+        Red for k3 (run_view_comparison also passing the flag) and k4 (default following `pairs`)."""
+        self._tree_x_and_y()
+        buf = io.StringIO()
+        code = _audit.run_view_comparison(db_path=str(self.db), transcript_glob=self._glob(),
+                                          limit_files=6, out=buf)
+        self.assertEqual(code, 0)
+        report = buf.getvalue()
+        self.assertIn("targets: 4 ", report)
+        self.assertIn("2 transcripts)", report)
+        y_line = [ln for ln in report.splitlines() if ln.startswith("[lsy-001]")][0]
+        self.assertIn("full=2", y_line)
+
+    def _under_subagents_root(self, glob_tail):
+        """A tree whose own root is a directory named `subagents`: main.jsonl at proj/, a real
+        sub-agent file at proj/sess/subagents/. Returns the glob built from glob_tail."""
+        self.root = self.tmp / "subagents"
+        self._put("proj/main.jsonl", ["main-only-verb 1", "ls"], 1_000_000)
+        self._put("proj/sess/subagents/agent-1.jsonl", ["fairy-only-verb 1"], 2_000_000)
+        return str(self.root / glob_tail)
+
+    def _assert_root_named_subagents(self, pattern):
+        _cur, _prior, srcs = collect_targets(transcript_glob=pattern, limit_files=6, exclude_subagents=True)
+        self.assertEqual([os.path.basename(f) for f in srcs], ["main.jsonl"])
+        out = io.StringIO()
+        code = _audit.run_write_ranks(db_path=str(self.db), transcript_glob=pattern, path=str(self.out),
+                                      out=out, err=io.StringIO())
+        self.assertEqual(code, 0)
+        self.assertNotIn("no transcripts found", out.getvalue())
+        doc = json.loads(self.out.read_text())
+        self.assertGreater(doc["ranks"]["lsx-001"], 0.0)
+        self.assertEqual(doc["ranks"]["lsy-001"], 0.0)
+
+    def test_t7a_glob_root_under_a_subagents_dir_keeps_main_drops_subagent(self):
+        """T7a. The glob's static root is itself under a directory named `subagents`: the filter looks
+        only BELOW that root, so the main file is kept, the real sub-agent file dropped, and a rank file
+        is written. Red for n1 (absolute-path test), n2 (parts[-3:]), n3 (slice one too far)."""
+        self._assert_root_named_subagents(self._under_subagents_root("proj/**/*.jsonl"))
+
+    def test_t7b_wildcard_right_after_the_subagents_named_root(self):
+        """T7b. Same tree, glob `<tmp>/subagents/**/*.jsonl` (wildcard right after the directory named
+        subagents). Red for n1, n3 and n4 (prefix includes the first wildcard component)."""
+        self._assert_root_named_subagents(self._under_subagents_root("**/*.jsonl"))
+
+    def test_t7c_glob_with_no_static_prefix_beyond_the_root_still_filters(self):
+        """T7c. A wildcard directly under the root dir (`<tree>/*/*.jsonl` style) still drops the
+        sub-agent file below it. Red for n4 and m5."""
+        self._put("proj/main.jsonl", ["main-only-verb 1"], 1_000_000)
+        self._put("subagents/agent-1.jsonl", ["fairy-only-verb 1"], 2_000_000)
+        _cur, _prior, srcs = collect_targets(transcript_glob=str(self.root / "*" / "*.jsonl"), limit_files=6,
+                                             exclude_subagents=True)
+        self.assertEqual([os.path.basename(f) for f in srcs], ["main.jsonl"])
+
+    def test_cli_help_names_the_main_session_scope(self):
+        out = io.StringIO()
+        orig = sys.argv
+        sys.argv = ["lesson-pattern-audit", "--help"]
+        try:
+            with redirect_stdout(out), self.assertRaises(SystemExit):
+                main()
+        finally:
+            sys.argv = orig
+        self.assertIn("main-session transcripts only", " ".join(out.getvalue().split()))

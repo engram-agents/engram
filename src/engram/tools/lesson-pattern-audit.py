@@ -227,8 +227,20 @@ def read_lesson_rows(db_path, home: "Path | None" = None, use_owner: "bool | Non
     return rows
 
 
+def _static_glob_prefix(pattern):
+    """The leading path components of a glob pattern that hold none of `*`, `?`, `[` (alpha#4396): the
+    part of the path the caller chose, as opposed to the part the glob discovered."""
+    prefix = []
+    for part in Path(pattern).parts:
+        if any(ch in part for ch in "*?["):
+            break
+        prefix.append(part)
+    return tuple(prefix)
+
+
 def collect_targets(transcript_glob=DEFAULT_TRANSCRIPT_GLOB,
-                     limit_files=DEFAULT_N_TRANSCRIPTS, session="", pairs=False):
+                     limit_files=DEFAULT_N_TRANSCRIPTS, session="", pairs=False,
+                     exclude_subagents=False):
     """Return (current_targets, prior_targets, filenames).
 
     Provenance is tracked per target so a LIVE verdict resting only on the
@@ -237,10 +249,24 @@ def collect_targets(transcript_glob=DEFAULT_TRANSCRIPT_GLOB,
     pairs=True (alpha#3920): each target is a (full, command) tuple of the
     hook's two views of the call instead of the full string alone; de-duplication
     and the introspection filter still key on the full string.
+
+    exclude_subagents=True (alpha#4396): drop every file with a path COMPONENT named `subagents` below the glob's static root (sub-agent
+    transcripts) BEFORE the mtime sort and the limit, so the window is the newest `limit_files` MAIN files.
+    The default keeps all traffic: the coverage audit asks whether a pattern matches real calls.
     """
     _hook_module()   # fail on a missing or broken hook before reading anything, whatever the inventory holds
-    files = sorted(glob.glob(transcript_glob, recursive=True),
-                   key=os.path.getmtime, reverse=True)[:limit_files]
+    files = glob.glob(transcript_glob, recursive=True)
+    if exclude_subagents:
+        # Test only the part BELOW the glob's static root: a root the caller chose that is itself named
+        # `subagents` must not drop every file.  A path that does not start with the prefix (should not
+        # happen) falls back to its full parts.
+        prefix = _static_glob_prefix(transcript_glob)
+
+        def _below_root(f):
+            parts = Path(f).parts
+            return parts[len(prefix):] if parts[:len(prefix)] == prefix else parts
+        files = [f for f in files if "subagents" not in _below_root(f)]
+    files = sorted(files, key=os.path.getmtime, reverse=True)[:limit_files]
     if not files:
         return [], [], []
     marker = session or os.environ.get("ENGRAM_AUDIT_SESSION", "")
@@ -490,7 +516,10 @@ def run_write_ranks(db_path=None, transcript_glob=DEFAULT_TRANSCRIPT_GLOB,
     situation_pattern; a lesson that fires on nothing gets 0.0 (rated, rarest). With NO transcripts (or
     transcripts that yield no target) it says so, exits 0 and writes NOTHING: an empty rank file would read
     as "every lesson is rare", a false tie-break worse than a stale file (which the hook's age rule already
-    handles).  The store is not read then."""
+    handles).  The store is not read then.
+
+    alpha#4396: the corpus is MAIN-session transcripts only (files under a `subagents/` directory are dropped
+    before the window limit); a tree holding only sub-agent files is the "no transcripts" case above."""
     from datetime import datetime, timezone
     if out is None:
         out = sys.stdout
@@ -504,7 +533,7 @@ def run_write_ranks(db_path=None, transcript_glob=DEFAULT_TRANSCRIPT_GLOB,
         print("no tripwire hook installed; rank file left as is", file=out)
         return 0
     cur, prior, srcs = collect_targets(transcript_glob=transcript_glob, limit_files=limit_files,
-                                       session=session, pairs=True)
+                                       session=session, pairs=True, exclude_subagents=True)
     pairs = cur + prior
     if not pairs:
         if not srcs:
@@ -583,7 +612,7 @@ def main() -> int:
     parser.add_argument(
         "--write-ranks", nargs="?", const="", default=None, metavar="PATH",
         help="alpha#3924: instead of the coverage audit, write each armed lesson's fires per 1,000 "
-             "targets (the whole file, mode and ACL preserved) to PATH (default: "
+             "targets, counted over main-session transcripts only (the whole file, mode and ACL preserved) to PATH (default: "
              "$ENGRAM_HOME/lesson-fire-ranks.json). The tripwire hook reads it to choose which "
              "co-firing lesson gets the full nudge.",
     )
