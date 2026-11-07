@@ -41,6 +41,7 @@ import sys
 import uuid
 
 import engram_core as core
+import engram_unblock_run as _unblock
 
 from engram_log_emitter import Emitter, emit_if_initialized
 
@@ -703,18 +704,26 @@ def _cascade_frontier_node_summary(conn, node_id: str) -> dict:
     }
 
 
-def _cascade_frontier_packet(conn, node_id: str, summary: dict) -> dict:
+def _cascade_frontier_packet(conn, node_id: str, summary: dict,
+                             eligibility: dict = None) -> dict:
     """Full adjudication packet for one frontier node — the K (``limit``)
     nodes this pass admits. Everything the summary carries, plus the full
     (untruncated) claim, confidence, recall_summary, created_at, is_current.
     Invariant 8: show ALL the raw information the agent needs to
     adjudicate, never only the machine's compressed summary-tier take.
+
+    #4421: also ``eligible_shapes`` — the ``eligible`` list of
+    ``_cascade_eligible_shapes``, the same function ``engram_cascade_resolve``
+    checks — and ``acknowledge_blocked_by`` when non-empty, so the resolver
+    has the allowed shapes at hand instead of learning them from a refusal.
     """
     row = conn.execute(
         "SELECT claim, confidence, recall_summary, created_at, is_current, type "
         "FROM nodes WHERE id = ?", (node_id,),
     ).fetchone()
-    return {
+    if eligibility is None:
+        eligibility = _cascade_eligible_shapes(conn, node_id)
+    packet = {
         "id": node_id,
         "type": row["type"] if row else summary.get("type"),
         "claim": row["claim"] if row else None,
@@ -723,10 +732,90 @@ def _cascade_frontier_packet(conn, node_id: str, summary: dict) -> dict:
         "created_at": row["created_at"] if row else None,
         "is_current": bool(row["is_current"]) if row else None,
         "events": summary["events"],
+        "eligible_shapes": list(eligibility["eligible"]),
+    }
+    if eligibility["acknowledge_blocked_by"]:
+        packet["acknowledge_blocked_by"] = list(eligibility["acknowledge_blocked_by"])
+    return packet
+
+
+def _cascade_or_join(items: list) -> str:
+    """'a', 'a or b', 'a, b or c'."""
+    items = list(items)
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " or " + items[-1]
+
+
+def _cascade_kinds_text(eligible: list) -> str:
+    """One node's allowed resolution kinds in words ('retracted or superseded (not acknowledged)'): the ONE wording the
+    frontier's next_step sentence and the BLOCKED_STALE derive refusal share."""
+    kinds = _cascade_or_join(eligible)
+    if "acknowledged" not in eligible:
+        kinds += " (not acknowledged)"
+    return kinds
+
+
+def _cascade_next_step_text(frontier_eligibility: list) -> str:
+    """The frontier's one instruction sentence (#4421; the wording is the lab's e6 run, which measured it): every
+    frontier node, in frontier order, with the resolution kinds the resolver will accept for it. A kind the node may not
+    take (acknowledged, downstream of a retract) is named as not allowed, because a model picks from what the sentence
+    names. ``frontier_eligibility`` is [(node_id, eligible_list)] and covers EVERY frontier node, not only the packets."""
+    if not frontier_eligibility:
+        return "Nothing is ready to adjudicate."
+    parts = [f"{nid}: {_cascade_kinds_text(eligible)}" for nid, eligible in frontier_eligibility]
+    return ("Resolve each frontier node with engram_cascade_resolve. Allowed resolution_kind per node: "
+            + "; ".join(parts) + ".")
+
+
+def _cascade_pending_ancestors(conn, root: str, pending_node_ids: set, walk_warnings: list) -> set:
+    """ancestors(root) ∩ pending, self-inclusive (root counts when it is itself pending). A walk cut short by its
+    budget falls back to the partial set and says so in ``walk_warnings`` (#2339), never presenting it as complete."""
+    try:
+        ancestors = _cascade_ancestors(conn, root, strict=True)
+    except core.CascadeWalkTruncated as exc:
+        # Best effort on the partial set, never presented as complete.
+        ancestors = exc.partial
+        walk_warnings.append(
+            f"{root}: the mode-C ancestor walk was cut short "
+            f"(budget {exc.budget} exhausted after {exc.visited} "
+            f"node(s), {exc.remaining_queue} unvisited still queued) "
+            f"— the pending-ancestor set below is PARTIAL."
+        )
+    return ancestors & pending_node_ids
+
+
+def _cascade_pending_union(conn, roots: list, pending_node_ids: set, walk_warnings: list = None) -> set:
+    """union over roots of (ancestors(root) ∩ pending), the targets themselves included when pending."""
+    out: set = set()
+    warnings = walk_warnings if walk_warnings is not None else []
+    for r in roots:
+        out |= _cascade_pending_ancestors(conn, r, pending_node_ids, warnings)
+    return out
+
+
+def _cascade_pending_ids(conn) -> set:
+    return {r["node_id"] for r in conn.execute(
+        "SELECT DISTINCT node_id FROM cascade_markers WHERE status = 'pending'").fetchall()}
+
+
+def _cascade_run_summary(conn, run: dict, pending_node_ids: set):
+    """The `unblock_run` value of a reply: None (no run), {"unavailable": reason}, or {targets, started_by,
+    remaining_pending} where remaining_pending = len(union(ancestors(t)) ∩ pending) over the run's targets, the targets
+    themselves included."""
+    if run is None:
+        return None
+    if "unavailable" in run:
+        return {"unavailable": run["unavailable"]}
+    return {
+        "targets": list(run["targets"]),
+        "started_by": run["started_by"],
+        "remaining_pending": len(_cascade_pending_union(conn, run["targets"], pending_node_ids)),
     }
 
 
-def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
+def _cascade_frontier_impl(node_id: str = None, limit: int = None, roots: list = None,
+                           run: dict = None, run_expired: dict = None) -> str:
     """Impl for engram_cascade_frontier — see the @mcp.tool wrapper's
     docstring in server.py for the full contract. READ-ONLY throughout: no
     write ever happens on this path (no marker mutation, no confidence
@@ -738,10 +827,23 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
     cascade-ancestors (plus node_id itself, when node_id is itself already
     frontier — ancestors(node_id) includes node_id per _cascade_ancestors'
     documented convention). Also returns a labeled blast-radius ESTIMATE.
+    Mode C over a SET (``roots``, #4421): candidates = union over the roots of
+    (ancestors(r) ∩ pending), each kept when CLEAR against the GLOBAL pending
+    set, the same rule as the one-root case; ``pending_ancestor_count`` and
+    ``blast_radius_estimate`` are computed over the union. ``roots=[x]`` is
+    byte-identical to ``node_id=x`` (one root IS mode C). ``node_id`` and
+    ``roots`` together is an error.
 
-    Recomputed fresh from marker state on every call — no queue, no cursor,
-    no persisted frontier state; identical input state always yields
-    identical output (deterministic ordering, see the sort key below).
+    The MARKER-derived fields are a pure function of marker state: no queue,
+    no cursor, no persisted frontier state, and identical marker state always
+    yields identical output (deterministic ordering, see the sort key below).
+    The reply additionally carries ``unblock_run``, the one piece of SESSION
+    state, held by the engramd owner and handed in here as ``run`` (None = no
+    run, ``{"unavailable": reason}`` = could not find out, else the run's
+    targets / started_by); a run changes ``unblock_run`` and nothing else in
+    the reply unless the CALLER chose ``roots=targets``. ``run_expired`` is the
+    expiry notice of a run that has expired and not yet been replaced or ended, echoed as ``unblock_run_expired`` when present
+    (it is STICKY: present on every reply from that session until the agent starts a new run or ends the old one, or 7 days pass).
     """
     if limit is None:
         limit = _CASCADE_FRONTIER_DEFAULT_LIMIT
@@ -749,20 +851,26 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
         return json.dumps({
             "error": f"limit must be a non-negative integer, got {limit!r}"
         })
+    if roots is not None:
+        if node_id is not None:
+            return json.dumps({"error": "node_id and roots cannot be given together."})
+        if (not isinstance(roots, (list, tuple)) or not roots
+                or not all(isinstance(r, str) and r for r in roots)):
+            return json.dumps({"error": f"roots must be a non-empty list of node ids, got {roots!r}"})
+        roots = sorted(set(roots))
+        if len(roots) == 1:
+            node_id, roots = roots[0], None  # one root IS mode C of that node: byte-identical by construction
 
     conn = core._get_db()
     try:
-        if node_id is not None:
+        for root_id in ([node_id] if node_id is not None else (roots or [])):
             root_row = conn.execute(
-                "SELECT id FROM nodes WHERE id = ?", (node_id,)
+                "SELECT id FROM nodes WHERE id = ?", (root_id,)
             ).fetchone()
             if not root_row:
-                return json.dumps({"error": f"Node '{node_id}' not found."})
+                return json.dumps({"error": f"Node '{root_id}' not found."})
 
-        pending_rows = conn.execute(
-            "SELECT DISTINCT node_id FROM cascade_markers WHERE status = 'pending'"
-        ).fetchall()
-        pending_node_ids = {r["node_id"] for r in pending_rows}
+        pending_node_ids = _cascade_pending_ids(conn)
 
         # #2339: truncated ancestor walks (a blocked-check withholds its node
         # from the frontier, never offers it; the mode-C candidate walk below
@@ -770,21 +878,15 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
         # as `cascade_walk_truncated`.
         walk_warnings: list = []
 
-        if node_id is None:
+        per_root_pending: dict = {}
+        if node_id is None and roots is None:
             candidates = set(pending_node_ids)
+        elif roots is None:
+            candidates = _cascade_pending_ancestors(conn, node_id, pending_node_ids, walk_warnings)
         else:
-            try:
-                ancestors = _cascade_ancestors(conn, node_id, strict=True)
-            except core.CascadeWalkTruncated as exc:
-                # Best effort on the partial set, never presented as complete.
-                ancestors = exc.partial
-                walk_warnings.append(
-                    f"{node_id}: the mode-C ancestor walk was cut short "
-                    f"(budget {exc.budget} exhausted after {exc.visited} "
-                    f"node(s), {exc.remaining_queue} unvisited still queued) "
-                    f"— the pending-ancestor set below is PARTIAL."
-                )
-            candidates = ancestors & pending_node_ids
+            for r in roots:
+                per_root_pending[r] = _cascade_pending_ancestors(conn, r, pending_node_ids, walk_warnings)
+            candidates = set().union(*per_root_pending.values())
 
         frontier_ids = [
             nid for nid in candidates
@@ -821,21 +923,28 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
             del s["_earliest_pending_created_at"]
             del s["_earliest_pending_event"]
 
+        # #4421: eligibility for EVERY frontier node (the instruction sentence covers all of them, past the packet cap).
+        eligibility = {s["id"]: _cascade_eligible_shapes(conn, s["id"]) for s in summaries}
         packets = [
-            _cascade_frontier_packet(conn, s["id"], s)
+            _cascade_frontier_packet(conn, s["id"], s, eligibility[s["id"]])
             for s in summaries[:limit]
         ]
 
-        response: dict = {
-            "mode": "B" if node_id is None else "C",
-            "node_id": node_id,
-            "frontier": summaries,
-            "frontier_count": len(summaries),
-            "total_pending_nodes": len(pending_node_ids),
-            "packets": packets,
-            "packets_returned": len(packets),
-            "packets_limit": limit,
-        }
+        response: dict = {"unblock_run": _cascade_run_summary(conn, run, pending_node_ids)}
+        if run_expired:
+            response["unblock_run_expired"] = run_expired
+        response["mode"] = "B" if node_id is None and roots is None else "C"
+        response["node_id"] = node_id
+        if roots is not None:
+            response["roots"] = list(roots)
+        response["frontier"] = summaries
+        response["frontier_count"] = len(summaries)
+        response["next_step"] = _cascade_next_step_text(
+            [(s["id"], eligibility[s["id"]]["eligible"]) for s in summaries])
+        response["total_pending_nodes"] = len(pending_node_ids)
+        response["packets"] = packets
+        response["packets_returned"] = len(packets)
+        response["packets_limit"] = limit
 
         # Invariant-1 anomaly check (READ-ONLY — flags, never repairs). If
         # `candidates` (self-inclusive: pending_node_ids in mode B,
@@ -854,11 +963,18 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
         # mere presence is the loud signal, consistent with how the mode-C-
         # only fields below are absent rather than null in mode B.
         if not summaries and candidates:
-            if node_id is None:
+            if node_id is None and roots is None:
                 _anomaly_scope = (
                     f"{len(pending_node_ids)} node(s) graph-wide carry a "
                     "pending cascade marker (total_pending_nodes) but "
                     "frontier_count is 0 — nothing is resolvable."
+                )
+            elif roots is not None:
+                _anomaly_scope = (
+                    f"{len(candidates)} node(s) in the pending-ancestor set "
+                    f"of the roots {roots} (self-inclusive) carry a pending "
+                    "cascade marker but frontier_count is 0 — nothing in "
+                    "that set is resolvable."
                 )
             else:
                 _anomaly_scope = (
@@ -901,12 +1017,18 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
                 f"sweep MUST NOT treat it as complete. {shown}{more}"
             )
 
-        if node_id is not None:
+        if node_id is not None or roots is not None:
             # ancestors(node_id) ∩ pending, EXCLUDING node_id itself — "the
             # pending-marked cascade-ancestors of the target" the spec names
             # for the blast estimate (distinct from `candidates` above,
             # which is self-inclusive for frontier-membership purposes).
-            ancestors_pending = candidates - {node_id}
+            # Over a SET of roots (#4421) it is the union of each root's own
+            # proper pending ancestors.
+            if roots is None:
+                ancestors_pending = candidates - {node_id}
+            else:
+                ancestors_pending = set().union(*(per_root_pending[r] - {r} for r in roots))
+            _target_label = node_id if roots is None else f"the roots {roots}"
             events_in_play: set = set()
             for anc in ancestors_pending:
                 for m in core._pending_markers_for_node(conn, anc):
@@ -925,7 +1047,7 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
             response["blast_radius_estimate_note"] = (
                 "ESTIMATE, not a guarantee. blast_radius_estimate = total "
                 "distinct nodes ever marked (pending OR resolved) by the "
-                f"cascade_event(s) reaching {node_id}'s pending ancestors — "
+                f"cascade_event(s) reaching {_target_label}'s pending ancestors — "
                 "the larger historical footprint. pending_ancestor_count is "
                 "the SMALLER, minimal set that must resolve before node_id "
                 "itself clears (full pending_ancestor_count ~= blast_radius_"
@@ -942,6 +1064,236 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
         return json.dumps(response)
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# The unblock run (#4421) — entry points over the owner-held session state
+# ---------------------------------------------------------------------------
+# A run is a SET of premise ids a session is unblocking (explicit start, or auto-started by a derive refused on marked
+# premises). While it is active, `engram_cascade_frontier()` (no node_id) and every `engram_cascade_resolve` reply follow
+# the run's view (`roots=targets`), and the run ends itself once nothing under its targets is pending. The state lives in
+# the engramd owner (`engramd_owner.UnblockRunStore`); this section is the server-side client of it. The session key is
+# resolved HERE, from the server's environment, and the agent never passes it.
+
+
+def _unblock_view(touch: bool = True):
+    """(session, view): the session key (None when none resolves) and the owner's answer for it (see
+    `engram_unblock_run.fetch`). Reads `core.DATA_DIR` at call time, so the owner reached is the one for the data dir the
+    core is configured with."""
+    session = _unblock.session_key()
+    return session, _unblock.fetch(core.DATA_DIR, session, touch=touch)
+
+
+def _unblock_run_arg(view: dict):
+    """The `run` argument of `_cascade_frontier_impl` for an owner answer: {"unavailable": reason} when the owner could
+    not say (never None: None means 'no run is active'), the run record when one is, else None."""
+    if view["unavailable"]:
+        return {"unavailable": view["unavailable"]}
+    return view["run"]
+
+
+def _cascade_frontier_session_impl(node_id: str = None, limit: int = None) -> str:
+    """The `engram_cascade_frontier` tool body (#4421): `_cascade_frontier_impl` plus this session's run. With a run
+    active and no node_id the view is the run's (`roots=targets`); an explicit node_id still means mode C of that node.
+    Either way the reply carries `unblock_run` (and, while an expired run has been neither replaced nor ended, the sticky `unblock_run_expired`). Reading the run slides its
+    24 h idle expiry."""
+    _session, view = _unblock_view(touch=True)
+    run = _unblock_run_arg(view)
+    roots = None
+    if node_id is None and run is not None and "targets" in run:
+        roots = list(run["targets"])
+    out = _cascade_frontier_impl(node_id=node_id, limit=limit, roots=roots, run=run, run_expired=view["expired"])
+    if view["expired"]:
+        # The expiry notice is sticky (the owner keeps the expired entry until start/end), so no reply can burn it. A success
+        # reply carries it (run_expired); an ERROR reply (bad limit, unknown node id, ...) returns before that point, so it
+        # carries it here too: the failing reply itself shows what happened to the run.
+        parsed = json.loads(out)
+        if "error" in parsed:
+            parsed["unblock_run_expired"] = view["expired"]
+            out = json.dumps(parsed)
+    return out
+
+
+def _cascade_start_unblock_impl(node_ids=None) -> str:
+    """The `engram_cascade_start_unblock` tool body: start a run for exactly this set, replacing any active run of the
+    session (the reply names the replaced one, or `replaced: null`). Refuses, creating and replacing nothing: node_ids
+    empty or not a list of strings; an id that does not exist; a view that is empty (nothing under these ids is
+    pending); no session id; an owner that cannot be reached or whose state file is bad (loud, naming the cause)."""
+    if (not isinstance(node_ids, (list, tuple)) or not node_ids
+            or not all(isinstance(n, str) and n.strip() for n in node_ids)):
+        return json.dumps({"error": f"node_ids must be a non-empty list of node id strings, got {node_ids!r}"})
+    ids = sorted({n.strip() for n in node_ids})
+    session = _unblock.session_key()
+    if session is None:
+        return json.dumps({"error": _unblock.no_session_error()})
+    conn = core._get_db()
+    try:
+        for nid in ids:
+            if not conn.execute("SELECT 1 FROM nodes WHERE id = ?", (nid,)).fetchone():
+                return json.dumps({"error": f"Node '{nid}' not found."})
+        pending_ids = _cascade_pending_ids(conn)
+        if not _cascade_pending_union(conn, ids, pending_ids):
+            return json.dumps({"error": "nothing pending under these nodes; nothing to unblock"})
+        started = _unblock.start(core.DATA_DIR, session, ids, "explicit")
+        if not started["ok"]:
+            return json.dumps({"error": f"could not start the unblock run: {started['error']}"})
+        summary = _cascade_run_summary(conn, started["run"], pending_ids)
+    finally:
+        conn.close()
+    out = {
+        "status": "started",
+        "unblock_run": summary,
+        "replaced": started["replaced"],
+        "next_step": ("Call engram_cascade_frontier() for the node to resolve first; every engram_cascade_resolve "
+                      "reply then says what is next and when the run is complete."),
+    }
+    if started.get("expired"):
+        out["unblock_run_expired"] = started["expired"]  # the start overwrote an expired entry: this reply shows its notice
+    return json.dumps(out)
+
+
+def _cascade_end_unblock_impl() -> str:
+    """The `engram_cascade_end_unblock` tool body: end this session's run. The reply names it, or `ended: null` when
+    there was none (a run that finished itself, expired, or never existed). No session id resolves -> no run can exist for
+    this session, so `ended: null` with a note; an owner that cannot be reached is a loud error."""
+    session = _unblock.session_key()
+    if session is None:
+        return json.dumps({"ended": None, "note": "no session id resolved; no run can exist for this session"})
+    ended = _unblock.end(core.DATA_DIR, session)
+    if not ended["ok"]:
+        return json.dumps({"error": f"could not end the unblock run: {ended['error']}"})
+    out = {"ended": ended["ended"]}
+    if ended.get("expired"):
+        out["unblock_run_expired"] = ended["expired"]
+    return json.dumps(out)
+
+
+_UNBLOCK_NO_SESSION_LINE = "no session id; use engram_cascade_frontier(node_id=...)"
+_UNBLOCK_TAINTED_LINE = (
+    "acknowledged is never eligible downstream of a retract: the path ends with that premise retracted (drop it from "
+    "your derivation) or superseded (cite its successor), then retry."
+)
+
+
+def _cascade_unblock_on_derive_refusal(conn, block: dict, supporting_ids: list) -> dict:
+    """#4421 C4/C6: a derive refused `blocked_tainted` or `blocked_stale` starts an unblock run (any other refusal starts
+    none). TARGETS come from the markers on EVERY cited premise, never from the refusal's own list (a tainted refusal
+    names only the tainted premises; a mixed derive would otherwise miss the stale ones): a cited premise is a target iff
+    it carries >=1 PENDING marker AND is not itself retracted AND is not itself superseded (those keep their routes: drop
+    it / cite the successor). No real target -> the refusal is returned unchanged. With a run already active the refusal
+    neither replaces it nor starts a second one: it names both sets and gives the exact call for each choice.
+
+    Adds lines to the front of `guidance` (run line first, the tainted line second) and, only when a run was started, a
+    structured `unblock_run: {targets, started_by}`."""
+    status = block.get("status")
+    if status not in ("blocked_tainted", "blocked_stale"):
+        return block
+    targets = []
+    for sid in dict.fromkeys(supporting_ids):
+        row = conn.execute(
+            "SELECT status, is_current, superseded_by FROM nodes WHERE id = ?", (sid,)).fetchone()
+        if not row or row["status"] == "retracted":
+            continue
+        if row["is_current"] == 0 and row["superseded_by"] is not None:
+            continue
+        if core._pending_markers_for_node(conn, sid):
+            targets.append(sid)
+    targets = sorted(targets)
+    if not targets:
+        return block
+
+    lines = []
+    started = False
+    expired_line = None
+    session = _unblock.session_key()
+    if session is None:
+        lines.append(_UNBLOCK_NO_SESSION_LINE)
+    else:
+        view = _unblock.fetch(core.DATA_DIR, session, touch=True)
+        if view["expired"]:
+            # The expiry notice is sticky, and this refusal is about to start a new run, which REPLACES the expired entry:
+            # this refusal is the last reply that can show it.
+            expired = view["expired"]
+            block["unblock_run_expired"] = expired
+            expired_line = f"your earlier unblock run for {', '.join(expired['targets'])} expired"
+        if view["unavailable"]:
+            lines.append(f"unblock run not started: {view['unavailable']}; use engram_cascade_frontier(node_id=...)")
+        elif view["run"] is not None:
+            active = list(view["run"]["targets"])
+            pending = _cascade_run_summary(conn, view["run"], _cascade_pending_ids(conn))["remaining_pending"]
+            compact = lambda ids: json.dumps(ids, separators=(",", ":"))  # noqa: E731
+            if set(targets) <= set(active):
+                # Nothing to choose: the agent retried before finishing the run. Say so, with no menu and no start call.
+                lines.append(
+                    f"Blocked by marked premises {', '.join(targets)}; they are already in the active unblock run for "
+                    f"{', '.join(active)} ({pending} pending). Finish it: call engram_cascade_frontier() and resolve "
+                    "the node it gives, then retry your derivation.")
+            else:
+                lines.append(
+                    f"Blocked by marked premises {', '.join(targets)}. An unblock run is already active for "
+                    f"{', '.join(active)} ({pending} pending). Choose one:\n"
+                    "(a) finish that run first: call engram_cascade_frontier() and resolve the node it gives;\n"
+                    f"(b) switch to the new premises: call engram_cascade_start_unblock(node_ids={compact(targets)});\n"
+                    f"(c) do both together: call engram_cascade_start_unblock(node_ids={compact(sorted(set(active) | set(targets)))}).")
+        else:
+            res = _unblock.start(core.DATA_DIR, session, targets, "derive_refusal")
+            if res["ok"]:
+                started = True
+                lines.append(f"unblock run started for {', '.join(targets)}")
+            else:
+                lines.append(f"unblock run not started: {res['error']}; use engram_cascade_frontier(node_id=...)")
+    if expired_line:
+        lines.append(expired_line)
+    if status == "blocked_tainted":
+        lines.append(_UNBLOCK_TAINTED_LINE)
+    block["guidance"] = "\n".join(lines) + "\n" + block.get("guidance", "")
+    if started:
+        block["unblock_run"] = {"targets": targets, "started_by": "derive_refusal"}
+    return block
+
+
+def _cascade_attach_next(response: dict) -> dict:
+    """#4421 B: a SUCCESSFUL resolve reply says what is next. `next` is what `_cascade_frontier_impl` returns, evaluated
+    after the resolve's commit: with no active run, mode B; with an active run, the run's view (`roots=targets`): one
+    function, no copy. `done` is true iff `next["frontier"]` is empty. When done: no run -> `the cascade is closed`; a
+    run -> `unblock run for <targets> complete; you can retry your derivation` and the run ends. The resolution is
+    already committed, so a failure to compute any of this is reported in `next_error`, never turned into a refusal."""
+    view = None
+    try:
+        session, view = _unblock_view(touch=True)
+        run = _unblock_run_arg(view)
+        roots = list(run["targets"]) if run is not None and "targets" in run else None
+        nxt = json.loads(_cascade_frontier_impl(node_id=None, roots=roots, run=run))
+        done = not nxt["frontier"]
+        end_failed = None
+        if not done:
+            text = nxt["next_step"]
+        elif roots is not None and nxt["unblock_run"]["remaining_pending"] == 0:
+            text = f"unblock run for {', '.join(roots)} complete; you can retry your derivation"
+            ended = _unblock.end(core.DATA_DIR, session)
+            if not ended["ok"]:
+                end_failed = ended["error"]
+        elif roots is None and nxt["total_pending_nodes"] == 0:
+            text = "Nothing is pending: the cascade is closed."
+        else:
+            text = ("Nothing is ready to adjudicate, but pending nodes remain: see invariant_1_violation_suspected "
+                    "in next. This is not a completed run.")
+    except Exception as exc:  # pragma: no cover -- defensive: the write above already committed
+        out = dict(response)
+        out["next_error"] = f"could not compute what is next ({type(exc).__name__}: {exc}); call engram_cascade_frontier()"
+        if view is not None and view.get("expired"):
+            out["unblock_run_expired"] = view["expired"]  # sticky notice: still on the owner, and shown here too
+        return out
+    out = {"unblock_run": nxt["unblock_run"]}
+    if view["expired"]:
+        out["unblock_run_expired"] = view["expired"]
+    out.update(response)
+    out["next"] = nxt
+    out["done"] = done
+    out["next_step"] = text
+    if end_failed:
+        out["unblock_run_end_failed"] = end_failed
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2232,7 +2584,7 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
             "resolved": "_resolve_impl",
         }.get(resolution_kind, "_retract_impl")
         response["delegated_result"] = delegated
-    return json.dumps(response)
+    return json.dumps(_cascade_attach_next(response))
 
 
 # ---------------------------------------------------------------------------

@@ -330,7 +330,8 @@ def test_the_dimension_constant_is_the_one_the_server_stores():
 
 
 def test_the_closed_write_set_is_exactly_the_four_ops():
-    assert eo.WRITE_METHODS == frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen"})
+    assert eo.WRITE_METHODS == frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen",
+                                          "cascade_unblock_start", "cascade_unblock_end"})  # the last two: #4421
 
 
 @requires_linux_owner
@@ -340,7 +341,7 @@ def test_both_new_ops_are_in_the_table_classified_write_and_the_read_set_is_unch
     assert owner._method_kinds["finish_embedding_regen"] == "write"
     assert {m for m, k in owner._method_kinds.items() if k == "write"} == set(eo.WRITE_METHODS)
     assert {m for m, k in owner._method_kinds.items() if k == "read"} == {
-        "ping", "snapshot", "read", "df", "chain", "confidence_by_type"}
+        "ping", "snapshot", "read", "df", "chain", "confidence_by_type", "cascade_unblock_get"}  # cascade_unblock_get: #4421
 
 
 @requires_linux_owner

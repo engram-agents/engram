@@ -1050,6 +1050,8 @@ Log the result: X summaries applied, Y failures deferred to next cycle.
 > at Step 8 — you are skipping the routine (see the invariant at the top). The dream-master
 > is spawned *with* the fairy bundle, never *instead of* it.
 
+**Immediately before the spawn, end any unblock run:** call `engram_cascade_end_unblock({})` (engram-alpha#4421). A stale run left open from the day would steer the sweep's `engram_cascade_resolve` `next` into the run's view instead of the whole graph. `ended: null` is the normal answer (no run, or it finished itself); an error here (owner unreachable) is worth one line in the dream record, not a reason to skip the spawn.
+
 Once all fairy reports are collected (or marked timed-out) and the final payload is ready, spawn the master with everything in its initial prompt:
 
 ```

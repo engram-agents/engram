@@ -106,6 +106,43 @@ the frontier is empty — should be unreachable in a well-formed graph. Don't
 treat its presence as a normal empty result; it means something (most likely
 a `CASCADE_RELATIONS` cycle) needs investigating, not resolving.
 
+**What the reply tells you to do (#4421).** Every frontier packet carries
+`eligible_shapes` (the kinds `engram_cascade_resolve` will accept for that
+node; `acknowledge_blocked_by` names the retracted premise when
+`acknowledged` is withdrawn), and the reply's `next_step` sentence names the
+allowed `resolution_kind` for EVERY frontier node, packets or not. Pick from
+that sentence; do not guess a kind and learn it from a refusal.
+
+## The unblock run: unblocking one derivation without a full sweep
+
+When a derive is refused on marked premises (`blocked_stale` or
+`blocked_tainted`), the refusal starts an **unblock run** for you: its
+guidance begins `unblock run started for <premises>`. The run is the set of
+premises you are unblocking, held by the engramd owner for this Claude Code
+session (you never pass a session id). While it is active:
+
+- `engram_cascade_frontier()` with no `node_id` shows the run's view (the
+  union of the targets' pending ancestors), not the whole graph;
+- every successful `engram_cascade_resolve` reply carries `next` (exactly what
+  the frontier call would now return) and `done` (true iff `next.frontier` is
+  empty), so you do not re-read the frontier by hand between resolves;
+- when nothing under the targets is pending the run ends itself and the reply
+  says `unblock run for <targets> complete; you can retry your derivation`.
+
+Downstream of a retract, `acknowledged` is never eligible, so the path ends with
+each target retracted (drop it from your derivation) or superseded (cite its
+successor). A refused derive with a run already active does not replace it:
+its text names both sets and gives the exact call for each choice (finish the
+run, switch with `engram_cascade_start_unblock`, or do both together).
+`engram_cascade_start_unblock({"node_ids": [...]})` starts or replaces a run on
+purpose; `engram_cascade_end_unblock({})` ends one (the sleep parent calls it
+before the dream master is spawned, so a stale run cannot steer the sweep). A
+run ends itself after 24 h idle, and its absence is never silent: the first
+reply after it reports `unblock_run_expired`, and keeps reporting it until you start a new run or end the old one. If the owner cannot be reached
+or the session has no id, the replies say `unblock_run: {"unavailable": ...}`
+(never `null`, which means "no run") and the manual path still works:
+`engram_cascade_frontier(node_id=<premise>)` after each resolve.
+
 # Adjudication: engram_cascade_resolve (the write half)
 
 For each frontier node, `engram_cascade_resolve` records **one of three

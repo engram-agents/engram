@@ -470,13 +470,16 @@ def test_T9_ancestor_walks_live_only_in_cascade_blocked():
     (e.g. the resolve refusal re-inlining its own walk) means two places
     decide what 'blocked' is. (Bound: a name-matching visitor; an aliased
     import or getattr would evade it. See T9c.)"""
+    # #4421: the mode-C candidate LISTING moved out of `_cascade_frontier_impl` into the one helper
+    # `_cascade_pending_ancestors` (the impl for one root AND for a set of roots, the unblock run's remaining-pending
+    # count and the start-time emptiness check all list through it: one listing, still not a blocked-decision).
     calls = _calls_by_function(_revision_tree(), "_cascade_ancestors")
-    assert set(calls) == {"_cascade_blocked", "_cascade_frontier_impl"}, (
+    assert set(calls) == {"_cascade_blocked", "_cascade_pending_ancestors"}, (
         f"_cascade_ancestors called from {sorted(calls)}; only "
-        f"_cascade_blocked (the decision) and _cascade_frontier_impl "
-        f"(mode C candidate listing) may call it"
+        f"_cascade_blocked (the decision) and _cascade_pending_ancestors "
+        f"(the mode-C candidate listing) may call it"
     )
-    assert len(calls["_cascade_frontier_impl"]) == 1  # the mode-C listing only
+    assert len(calls["_cascade_pending_ancestors"]) == 1  # the listing only
     assert len(calls["_cascade_blocked"]) == 1
 
 

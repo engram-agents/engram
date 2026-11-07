@@ -83,6 +83,9 @@ EXCLUDED_ENGRAM = {
     "engram_deactivate_goal", "engram_embedding_cluster", "engram_focus_delete_set", "engram_focus_load",
     "engram_focus_save", "engram_focus_sets", "engram_get_subgraph", "engram_requote", "engram_sandbox",
     "engram_scan_emergence", "engram_set_trust_tier", "engram_sign", "engram_surface",
+    # #4421: the unblock run is a focused-derivation tool. The sleep PARENT ends it before spawning the master (the
+    # master shares the parent's session id), so the master itself never calls either.
+    "engram_cascade_start_unblock", "engram_cascade_end_unblock",
 }
 
 

@@ -677,6 +677,17 @@ def _cascade_frontier_impl(*args, **kwargs):
 # and the frontier read it composes with.
 def _cascade_resolve_impl(*args, **kwargs):
     return _revision_mod._cascade_resolve_impl(*args, **kwargs)
+
+
+# #4421: the unblock run's entry points (same placement rationale: the logic sits next to the frontier it composes with).
+def _cascade_frontier_session_impl(*args, **kwargs):
+    return _revision_mod._cascade_frontier_session_impl(*args, **kwargs)
+
+def _cascade_start_unblock_impl(*args, **kwargs):
+    return _revision_mod._cascade_start_unblock_impl(*args, **kwargs)
+
+def _cascade_end_unblock_impl(*args, **kwargs):
+    return _revision_mod._cascade_end_unblock_impl(*args, **kwargs)
 # ---- end engram_cascade_frontier/resolve forwarders --------------------
 
 # ---- #872 wave-7 compat forwarders -----------------------------------
@@ -2616,6 +2627,9 @@ _CASCADE_FRONTIER_FIELDS = frozenset({
     ),
     annotations={
         "title": "Cascade Marker Frontier",
+        # readOnlyHint is about the GRAPH: no marker, node or edge is written. A read does slide this session's unblock-run
+        # expiry (#4421: the owner rewrites its run file on `get` with touch). That slide is deliberate; do not
+        # "optimise" the touch away, or an active run would expire under an agent that is still reading it.
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -2640,11 +2654,17 @@ def engram_cascade_frontier(payload_json: str) -> str:
     exactly once in the output, with all its events listed.
 
     The frontier IS the topological order, recomputed from marker state on
-    every call. There is no queue, no stored cursor, no session state —
-    identical marker state always yields an identical result.
+    every call. There is no queue and no stored cursor: the MARKER-derived
+    fields of the reply are a pure function of marker state, so identical
+    marker state always yields identical frontier, packets and counts. The
+    reply additionally carries `unblock_run`, which IS session state: the run
+    this Claude Code session started (engram_cascade_start_unblock, or a
+    derive refused on marked premises), held by the engramd owner. While a run
+    is active, a call WITHOUT node_id returns the run's view (the union of its
+    targets' pending ancestors) instead of the whole graph.
 
     Two modes:
-      Mode B (node_id omitted): every frontier node in the graph.
+      Mode B (node_id omitted, no run active): every frontier node in the graph.
       Mode C (node_id given): the frontier restricted to
         ancestors(node_id) ∩ pending — node_id's own pending-marked
         cascade-ancestors, provably minimal and sufficient to unblock
@@ -2664,7 +2684,15 @@ def engram_cascade_frontier(payload_json: str) -> str:
 
     Returns:
         JSON with:
-          mode ("B" or "C"), node_id (echoed or null).
+          unblock_run (FIRST key): null when this session has no run;
+            {targets, started_by, remaining_pending} when it has one;
+            {"unavailable": reason} when the owner could not say (never null
+            in that case: null means "no run is active").
+          unblock_run_expired ({targets, expired_at}): present on EVERY reply
+            from this session after a run's 24 h idle expiry, until the agent
+            starts a new run or ends the old one (or 7 days pass).
+          mode ("B" or "C"), node_id (echoed or null), roots (only for a run
+            over several targets).
           frontier: uncapped list of one-line summaries — {id, type,
             claim_gist (truncated, see claim_gist_truncated),
             events: [{cascade_event, root_node, root_op,
@@ -2673,12 +2701,18 @@ def engram_cascade_frontier(payload_json: str) -> str:
               root_is_direct_premise, immediate_cause, dead_premises
               (which direct premises died and how: resolution_kind,
               resolution_replacement_id, resolved_at)}]}.
+          next_step: one sentence naming EVERY frontier node (past the packet
+            cap too) with the resolution kinds engram_cascade_resolve will
+            accept for it ("... <id_a>: retracted or superseded (not
+            acknowledged); <id_b>: retracted, superseded or acknowledged."),
+            or "Nothing is ready to adjudicate."
           frontier_count, total_pending_nodes (GRAPH-WIDE in BOTH modes —
             in mode C this is NOT scoped to node_id's own pending-ancestor
             set; that scoped count is pending_ancestor_count, mode-C-only,
             below).
           packets: full adjudication packets (claim, confidence,
-            recall_summary, is_current, events) for at most `limit` nodes.
+            recall_summary, is_current, events, eligible_shapes, and
+            acknowledge_blocked_by when non-empty) for at most `limit` nodes.
           packets_returned, packets_limit.
           Mode C only: pending_ancestor_count, blast_radius_estimate,
             blast_radius_estimate_note.
@@ -2713,7 +2747,112 @@ def engram_cascade_frontier(payload_json: str) -> str:
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
                      f"Allowed: {sorted(_CASCADE_FRONTIER_FIELDS)}"
         })
-    return _cascade_frontier_impl(**params)
+    return _cascade_frontier_session_impl(**params)
+
+
+# DESIGN INTENT — engram_cascade_start_unblock / engram_cascade_end_unblock (#4421)
+# -------------------------------------------------------------------------------
+# A derive refused on marked premises starts an unblock run by itself; these two tools let the agent start one on purpose
+# (for example to switch or merge runs after the refusal names the conflict) and end one (the sleep parent ends it before
+# the dream master is spawned, because sub-agents share the parent's MCP server and so its session id: a stale run would
+# steer the sweep's `next` into the run's view). The run is held by the engramd owner, keyed by the Claude Code session
+# id the SERVER resolves from its own environment; the agent never passes it, and a payload `session_id` is an unknown
+# field.
+_CASCADE_START_UNBLOCK_FIELDS = frozenset({"node_ids"})
+_CASCADE_END_UNBLOCK_FIELDS = frozenset()
+
+
+@mcp.tool(
+    name="engram_cascade_start_unblock",
+    capability=(
+        "Start an unblock run for exactly these node ids: until it completes, engram_cascade_frontier() and every "
+        "engram_cascade_resolve reply show only what stands between you and those nodes, and say when you can retry "
+        "your derivation. Replaces this session's active run (the reply names it)."
+    ),
+    annotations={
+        "title": "Start Cascade Unblock Run",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_cascade_start_unblock(payload_json: str) -> str:
+    """Start an unblock run: a set of premise ids this session is working to unblock.
+
+    A derive refused on marked premises already starts one for you. Use this to start one on purpose, or to switch or
+    merge after a refusal names an active run (its text gives the exact call for each choice).
+
+    While the run is active, `engram_cascade_frontier()` without node_id returns the run's view (the union of the
+    targets' pending ancestors), and every successful `engram_cascade_resolve` reply carries `next` (that same view,
+    after the resolve) and `done`. When nothing under the targets is pending the run ends itself and the reply says
+    `unblock run for <targets> complete; you can retry your derivation`.
+
+    The run is held by the engramd owner in a file under ENGRAM_HOME, keyed by this Claude Code session id (resolved
+    from the server's environment; never passed by you). It ends itself after 24 h idle, or via
+    engram_cascade_end_unblock. Without a session id, or with the owner unreachable, this refuses loudly and the
+    manual path still works: engram_cascade_frontier(node_id=...) after each resolve.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_ids (list of str, REQUIRED): the node ids to unblock (usually the premises a refused derive named).
+
+    Returns:
+        JSON with status "started", unblock_run ({targets, started_by, remaining_pending}), replaced ({targets} of the
+        run this one replaced, or null) and next_step. On refusal {"error": "..."} and nothing is created or replaced:
+        node_ids empty or not a list of strings; an id that does not exist; "nothing pending under these nodes;
+        nothing to unblock"; no session id; owner unreachable or its state file unreadable.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+    unknown = set(params.keys()) - _CASCADE_START_UNBLOCK_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_CASCADE_START_UNBLOCK_FIELDS)}"
+        })
+    return _cascade_start_unblock_impl(**params)
+
+
+@mcp.tool(
+    name="engram_cascade_end_unblock",
+    capability=(
+        "End this session's unblock run (the sleep parent calls it before spawning the dream master). Names the "
+        "ended run, or says ended: null when there was none."
+    ),
+    annotations={
+        "title": "End Cascade Unblock Run",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_cascade_end_unblock(payload_json: str) -> str:
+    """End this session's unblock run.
+
+    Idempotent: a second call finds nothing and reports `ended: null`. A run that finished itself, expired or never
+    existed also reports `ended: null`. The engram-sleep parent calls this before it spawns the dream master:
+    sub-agents share the parent's session id, so a stale run would steer the sweep's `next` into the run's view.
+
+    Args:
+        payload_json: JSON object (as a string); no fields (send {}).
+
+    Returns:
+        JSON with ended ({targets} of the run just ended, or null). An unreachable owner or an unreadable run file is a
+        loud {"error": "..."}.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+    unknown = set(params.keys()) - _CASCADE_END_UNBLOCK_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_CASCADE_END_UNBLOCK_FIELDS)}"
+        })
+    return _cascade_end_unblock_impl()
 
 
 # DESIGN INTENT — engram_cascade_resolve
@@ -2904,8 +3043,11 @@ def engram_cascade_resolve(payload_json: str) -> str:
                 duplicate, other.
 
     Returns:
-        JSON with: node_id, resolution_kind, resolved_events (every
-        cascade_event this one judgement closed) + resolved_marker_count,
+        JSON with: unblock_run (FIRST key; null, {targets, started_by,
+        remaining_pending} or {"unavailable": reason}, as in
+        engram_cascade_frontier), unblock_run_expired (once, after a run's
+        24 h idle expiry), then node_id, resolution_kind, resolved_events
+        (every cascade_event this one judgement closed) + resolved_marker_count,
         affected_premises (which of your direct premises moved, per event,
         and how — including the cascade ROOT, which carries no marker of its
         own), eligible_shapes, confidence_recompute ({nodes_considered,
@@ -2922,7 +3064,13 @@ def engram_cascade_resolve(payload_json: str) -> str:
         this resolution marked for review), contradiction_cascade_event (the
         dedicated event id they were marked under, or null when the node has
         no contradictions), re_cascade (an explanation of what did and
-        did not propagate), and — only when resolution_kind is `superseded`,
+        did not propagate), next (WHAT COMES NEXT: exactly what
+        engram_cascade_frontier returns right after this resolve — the
+        whole-graph mode-B view, or, while this session's unblock run is
+        active, the run's view), done (true iff next.frontier is empty),
+        next_step (one sentence: the frontier's instruction sentence, or "the
+        cascade is closed", or "unblock run for <targets> complete; you can
+        retry your derivation", in which case the run has ended), and — only when resolution_kind is `superseded`,
         `retracted` or `resolved` — delegated_to + delegated_result, naming the verb
         this resolution handed off to and what it returned. The #3625
         bears_on hint keys (`bears_on_hints`, `bears_on_hint_prompt`,

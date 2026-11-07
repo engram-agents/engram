@@ -9,6 +9,22 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+### Added
+
+- **Cascade: eligible shapes at hand, resolve replies that say what is next, and the unblock run (#4421).**
+  Every `engram_cascade_frontier` packet now carries `eligible_shapes` (and `acknowledge_blocked_by` when non-empty),
+  and the reply gets a `next_step` sentence naming the allowed `resolution_kind` of every frontier node.
+  `engram_cascade_resolve` success replies carry `next` (exactly what the frontier would now return) and `done`.
+  A derive refused `blocked_tainted` or `blocked_stale` starts an **unblock run** for the marked premises it cites;
+  while it is active, the frontier and every resolve reply follow the run's view, and it ends itself when nothing under
+  its targets is pending. Two new MCP tools, `engram_cascade_start_unblock` and `engram_cascade_end_unblock`; the
+  engram-sleep parent ends the run before it spawns the dream master. The run is held by the engramd owner in
+  `$ENGRAM_HOME/unblock-runs.json` (mode 0600, atomic, 24 h idle TTL, keyed by the Claude Code session id; three new owner
+  methods, `cascade_unblock_start` / `_end` / `_get`). Every frontier and resolve reply carries `unblock_run` as its first
+  key. The frontier's "no session state" promise is rewritten: its marker-derived fields are still a pure function of
+  marker state; `unblock_run` is the one piece of session state. After a run's 24 h idle expiry every reply
+  carries `unblock_run_expired` until the agent starts a new run or ends the old one (7-day backstop prune). Codex sessions are out of scope (no session id there).
+
 ## [v0.5.5] - 2026-10-28
 
 This release is everything on `dev` that is not in v0.5.4. The range

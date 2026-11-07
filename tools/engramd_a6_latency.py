@@ -186,6 +186,9 @@ RUNTIME_FILES = {
     # #3856: the shared person-moment cursor advance. The surface hook imports it at module level (and engramd_owner
     # imports it), so a fire in the installed layout loads it; without this entry the closure cell would flag it.
     "engram_moment_cursor.py": "src/engram/engram_moment_cursor.py",
+    # #4421: the unblock run's server-side client. engram_revision (loaded by the session-start calibration block's
+    # EngramClient) imports it at module level, so a fire in the installed layout loads it.
+    "engram_unblock_run.py": "src/engram/engram_unblock_run.py",
     "engram_search_rules.py": "src/engram/engram_search_rules.py",
     "tools/__init__.py": "src/engram/tools/__init__.py",
     "tools/recall_summary_validator.py": "src/engram/tools/recall_summary_validator.py",

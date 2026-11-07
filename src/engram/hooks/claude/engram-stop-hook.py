@@ -349,6 +349,9 @@ _ENGRAM_WRITE_VERBS = frozenset({
     "reflect",
     # --- #2013 slice 4 (PR #2342): the cascade adjudication verb ---
     "cascade_resolve",
+    # --- #4421: the unblock run's start / end (they write the run file, so they are write-capable) ---
+    "cascade_start_unblock",
+    "cascade_end_unblock",
     # --- #2265 (PR #3160): correct a wrong edge by making it weaker ---
     "retype_edge",
 })

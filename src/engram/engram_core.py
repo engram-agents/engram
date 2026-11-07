@@ -12214,15 +12214,19 @@ def _validate_premises(
         soft block (BLOCKED_CONTRADICTED, #1654). Agent opts in with
         use_contested=True — a contradiction is a live dispute, not a
         refutation, so building on it is a deliberate, loudly-marked
-        choice, not a hard wall. Checked before stale (a disputed claim is
-        a more acute concern than a merely-superseded one).
+        choice, not a hard wall. Reported AFTER stale: tainted and stale are
+        hard blocks and are returned first, because an override that cannot
+        unblock the call (use_contested against a stale premise) would only
+        walk the agent into a wall.
       - Any premise carrying a pending supersede-rooted cascade marker, OR
         any premise that has ITSELF been superseded → HARD block
         (BLOCKED_STALE). No override: `use_stale` was retired by #2324 and
         is accepted-but-inert. The two are reported as separate cases with
-        separate routes — a marker is resolved by superseding/retracting the
-        premise that carries it; a superseded premise is resolved by citing
-        its successor. Same marker-table source as the taint rule above;
+        separate routes — a marker is resolved THROUGH engram_cascade_resolve
+        on the premise that carries it (a plain supersede/retract on it is
+        refused while markers are pending; the guidance names each marked
+        premise's eligible kinds, #4421); a superseded premise is resolved by
+        citing its successor. Same marker-table source as the taint rule above;
         metadata.stale_by is retired as a store.
       - Mixed taint + (contradicted|stale) → treated as tainted (taint
         dominates and short-circuits both other checks for that premise).
@@ -12420,6 +12424,24 @@ def _validate_premises(
     # Hard blocks report first because they are the ones that decide the
     # outcome.
     if stale_premises:
+        # #4421: a marked premise is resolved THROUGH engram_cascade_resolve (a plain supersede/retract on it is refused
+        # while markers are pending; the per-premise `route` says so). Its allowed kinds are stated in the frontier
+        # sentence's own words, computed with the function the resolver checks. engram_revision imports this module, so
+        # it is imported at call time; if it cannot be, the guidance still routes through the cascade tools.
+        _marked = [p["id"] for p in stale_premises
+                   if any(b.get("case") == "cascade_marker" for b in p["stale_because"])]
+        _eligible_text = ""
+        if _marked:
+            try:
+                import engram_revision as _rev
+                _eligible_text = (
+                    " Allowed resolution_kind per marked premise: "
+                    + "; ".join(
+                        f"{sid}: {_rev._cascade_kinds_text(_rev._cascade_eligible_shapes(conn, sid)['eligible'])}"
+                        for sid in _marked)
+                    + ".")
+            except Exception:  # pragma: no cover -- defensive: the route lines still carry the way
+                _eligible_text = ""
         resp = {
             "status": "blocked_stale",
             "error": (
@@ -12430,8 +12452,10 @@ def _validate_premises(
             "guidance": (
                 "This is a hard block — there is no override. Each entry in "
                 "stale_premises carries a per-case `route`: a premise that "
-                "carries a cascade marker is resolved by superseding or "
-                "retracting it; a premise that is itself superseded is resolved "
+                "carries a cascade marker is resolved through "
+                "engram_cascade_resolve, after reading its frontier with "
+                "engram_cascade_frontier(node_id=...)." + _eligible_text +
+                " A premise that is itself superseded is resolved "
                 "by citing its successor. Resolving the premise is the point — "
                 "the old force-through let a derivation record a dependency on "
                 "a claim its author already knew had moved."

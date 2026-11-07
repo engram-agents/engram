@@ -257,6 +257,11 @@
       "note": "The one shared compare-and-set advance of a person's moment-rotation cursor (#3856). Stdlib-only. Essential because the surface hook and engram_query import it (hard dependencies; the hook degrades to no cursor advance if it is missing)."
     },
     {
+      "path": "engram_unblock_run.py",
+      "tier": "essential",
+      "note": "engram-alpha#4421: the server-side client of the owner-held unblock run (session key from engram_signature's shared resolver, owner socket from the caller's own data dir, one reason string per non-Ok answer). Imported by engram_revision.py (essential), so same tier; its only runtime import is engramd_client (guarded), so an owner-less install reads as 'owner unreachable', not a crash."
+    },
+    {
       "path": "engram_config_io.py",
       "tier": "essential",
       "note": "Atomic write + retrying read of config.json (#3607). Stdlib-only. Essential because engram_core and engram_restamp import it (hard dependencies)."

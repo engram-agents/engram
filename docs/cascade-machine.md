@@ -553,3 +553,60 @@ derivation's, and the contradiction's *sides* play the part of premises.
   migration rung 10 rebuilds `cascade_markers` preserving every row, and
   `LATEST_SCHEMA_VERSION` is 10. No backfill: existing stores gain the kind from
   their next resolution on.
+
+## 15. The unblock run, and what a frontier or resolve reply says next (#4421)
+
+**The problem.** A derive refused on a marked premise P pointed at
+`engram_cascade_frontier(node_id=P)`, but after each `engram_cascade_resolve`
+the agent had to remember P and call that again, because the resolve reply did
+not know P. Models also guessed a resolution kind and learned the allowed ones
+from a refusal.
+
+**Eligible shapes at hand.** Every frontier packet carries `eligible_shapes`
+(the `eligible` list of `_cascade_eligible_shapes`, the function
+`engram_cascade_resolve` checks) and `acknowledge_blocked_by` when non-empty.
+The reply's new top-level `next_step` sentence names the allowed
+`resolution_kind` of EVERY frontier node, packets beyond the cap included,
+because a model picks from the kinds a sentence names (measured in the lab
+before this shipped). An empty frontier says `Nothing is ready to adjudicate.`
+
+**One function, one more parameter.** `_cascade_frontier_impl` gained `roots`:
+the union over the roots of `ancestors(r) ∩ pending`, each node kept when CLEAR
+against the GLOBAL pending set (the same rule as mode C). `roots=[x]` is
+byte-identical to `node_id=x`; `node_id` and `roots` together is an error.
+
+**The run.** A run is a set of premise ids per Claude Code session. A derive
+refused `blocked_tainted` or `blocked_stale` starts one (targets: every cited
+premise that carries a pending marker and is neither retracted nor superseded
+itself, computed from the markers, not from the refusal's own list), or the
+agent starts one with `engram_cascade_start_unblock`. While it is active:
+`engram_cascade_frontier()` returns the run's view; every successful
+`engram_cascade_resolve` reply carries `next` (exactly what
+`_cascade_frontier_impl` returns for the same view, evaluated after the
+resolve's commit) and `done` (true iff `next.frontier` is empty); and when
+nothing under the targets is pending the run ends itself. A refused resolve
+carries neither. Every frontier and resolve reply carries `unblock_run` as its
+FIRST key: `null` (no run), `{targets, started_by, remaining_pending}`, or
+`{"unavailable": reason}` when the owner could not say, which is never `null`.
+A derive refused while a run is active neither replaces it nor starts a second
+one; its text gives the exact calls to finish, switch or merge.
+
+**Where it lives.** In the engramd owner, in `$ENGRAM_HOME/unblock-runs.json`
+(`{"version": 1, "runs": {session: {targets, started_by, started_at,
+last_used_at, expires_at}}}`): written only by the owner, atomically, mode
+0600, no schema change. The session key is resolved by the MCP server from its
+environment (`engram_signature._resolve_session_id`) and passed in the request;
+the agent never passes it. TTL 24 h idle-sliding; after expiry every reply
+carries `unblock_run_expired` (sticky: a lost reply cannot silence it) until the agent starts a new run or ends the old
+one, or 7 days pass. A bad file is loud (owner start log,
+and every run call is refused naming the path), never read as "no run". Sub-
+agents share the parent's session id, so the sleep parent ends the run before it
+spawns the dream master.
+
+**What stays true of the frontier.** Its MARKER-derived fields (`frontier`,
+`packets`, `next_step`, counts) are still a pure function of marker state; the
+only session state in the reply is `unblock_run`, and a run changes the reply
+only because the caller asked for the run's view (`roots=targets`). Bounds: Codex
+sessions carry no `CLAUDE_CODE_SESSION_ID`, so there the run cannot start (the
+refusal says so and the manual path works); an owner that predates this change
+answers `unknown_operation`, reported as unavailable.

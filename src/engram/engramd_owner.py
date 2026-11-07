@@ -258,7 +258,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import engram_home_resolver
@@ -1939,12 +1939,14 @@ def _acl_leftovers(entries: list[str]) -> list[str]:
 # by tests/test_engramd_use_reward_3822.py to exactly the four below. An unclassified method is
 # default-deny at dispatch.
 METHOD_KINDS = frozenset({"read", "write"})
-# the 2nd write: #3856; the 3rd and 4th: #3879 (the regenerate-embeddings tool's `fill_embeddings` / `finish_embedding_regen`)
-WRITE_METHODS = frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen"})
+# the 2nd write: #3856; the 3rd and 4th: #3879 (the regenerate-embeddings tool's `fill_embeddings` / `finish_embedding_regen`);
+# the 5th and 6th: #4421 (the unblock run's `cascade_unblock_start` / `cascade_unblock_end`: they write the run FILE, not the store)
+WRITE_METHODS = frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen",
+                           "cascade_unblock_start", "cascade_unblock_end"})
 # Writes whose handler also receives the WIRE envelope's `request_id` (as a third argument): their params are a
 # closed key set that cannot carry one (`fill_embeddings`: exactly {model, items}). use_reward carries its own
 # request_id inside params and is not in this set.
-WIRE_REQUEST_ID_METHODS = frozenset({"fill_embeddings"})
+WIRE_REQUEST_ID_METHODS = frozenset({"fill_embeddings", "cascade_unblock_start", "cascade_unblock_end"})
 
 # The closed action enum (today one action). Anything else is refused before the store is touched.
 USE_REWARD_ACTIONS = frozenset({"mention"})
@@ -2043,6 +2045,221 @@ class _UseRewardGuard:
             return sqlite3.SQLITE_OK
         self.denials.append((action_code, arg1, arg2, db_name, trigger_or_view))
         return sqlite3.SQLITE_DENY
+
+
+# ---------------------------------------------------------------------------
+# The unblock run (#4421): session-keyed working state held by the owner in a FILE, not in the store
+# ---------------------------------------------------------------------------
+#
+# A focused unblock of a derivation holds a SET of premise ids per Claude Code session, so a resolve reply can say what is
+# next for THAT set. It is session working state, not a claim: it lives in `$ENGRAM_HOME/unblock-runs.json`, written only
+# by this owner (the single writer), atomically (temp file in the same directory, fsync, rename), mode 0600, no schema
+# change. The session key is supplied by the MCP server from its own environment and arrives in the request params; the
+# owner never guesses it. Shape:
+#   {"version": 1, "runs": {"<session_key>": {"targets": [sorted ids], "started_by": "derive_refusal" | "explicit",
+#                                              "started_at": iso, "last_used_at": iso, "expires_at": iso}}}
+# TTL: 24 h idle-sliding (every `get` with touch slides it). An expired run is STICKY: every `get` reports it in `expired`
+# and changes nothing (no removal, no slide, no rewrite); only `start` (replaces it) and `end` (removes it) delete it, both
+# request_id deduped, so a lost reply cannot silence the notice. A file that cannot be read or fails
+# validation is LOUD (logged at owner start, refused by name on every call) and is never treated as "no run".
+UNBLOCK_RUNS_FILENAME = "unblock-runs.json"
+UNBLOCK_RUN_TTL_SECONDS = 24 * 3600
+# Entries of sessions that never call again are only removed when THEIR session calls start/end, so every `save` also drops entries
+# whose `expires_at` is more than this far in the past. 7 days keeps the expiry notice available for a week;
+# a live or recently expired run is never pruned.
+UNBLOCK_RUN_EXPIRED_RETENTION_SECONDS = 7 * 24 * 3600
+UNBLOCK_RUN_STARTED_BY = frozenset({"derive_refusal", "explicit"})
+UNBLOCK_RUN_MAX_TARGETS = 500
+UNBLOCK_RUN_ID_MAX_BYTES = 256
+UNBLOCK_RUN_FILE_MODE = 0o600
+
+
+class UnblockStateError(Exception):
+    """The unblock-run file is unreadable or fails validation. `str()` names the path and the cause."""
+
+    def __init__(self, path, cause: str) -> None:
+        self.path = str(path)
+        self.cause = cause
+        super().__init__(f"{self.path}: {cause}")
+
+
+def _unblock_ts(value, what: str, path) -> datetime:
+    if not isinstance(value, str):
+        raise UnblockStateError(path, f"{what} is not a string")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise UnblockStateError(path, f"{what} is not an ISO timestamp ({value!r})") from None
+    if parsed.tzinfo is None:
+        raise UnblockStateError(path, f"{what} has no timezone ({value!r})")
+    return parsed
+
+
+class UnblockRunStore:
+    """Pure file store behind the three owner methods. No locking here: the owner serialises every call under its own
+    `_unblock_lock`. `now` is always passed in (the owner's `_unblock_now`), so a test drives the clock."""
+
+    def __init__(self, path) -> None:
+        self.path = Path(path)
+
+    def load(self) -> dict:
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {"version": 1, "runs": {}}
+        except (OSError, ValueError) as exc:
+            raise UnblockStateError(self.path, f"unreadable ({type(exc).__name__}: {exc})") from None
+        try:
+            state = json.loads(raw)
+        except ValueError as exc:
+            raise UnblockStateError(self.path, f"not valid JSON ({exc})") from None
+        if not isinstance(state, dict) or state.get("version") != 1 or not isinstance(state.get("runs"), dict):
+            raise UnblockStateError(self.path, 'not an object of the form {"version": 1, "runs": {...}}')
+        for key, run in state["runs"].items():
+            if not isinstance(run, dict):
+                raise UnblockStateError(self.path, f"run {key!r} is not an object")
+            targets = run.get("targets")
+            if (not isinstance(targets, list) or not targets
+                    or not all(isinstance(t, str) and t for t in targets)):
+                raise UnblockStateError(self.path, f"run {key!r}: targets is not a non-empty list of ids")
+            if run.get("started_by") not in UNBLOCK_RUN_STARTED_BY:
+                raise UnblockStateError(self.path, f"run {key!r}: started_by is not one of {sorted(UNBLOCK_RUN_STARTED_BY)}")
+            for field in ("started_at", "last_used_at", "expires_at"):
+                _unblock_ts(run.get(field), f"run {key!r}: {field}", self.path)
+        return state
+
+    def save(self, state: dict, now: datetime) -> None:
+        """Atomic: temp file in the same directory (created 0600 by mkstemp, re-asserted), fsync, rename, fsync the directory.
+        Every save first drops entries expired more than UNBLOCK_RUN_EXPIRED_RETENTION_SECONDS ago (abandoned sessions)."""
+        cutoff = now - timedelta(seconds=UNBLOCK_RUN_EXPIRED_RETENTION_SECONDS)
+        for key in [k for k, run in state["runs"].items()
+                    if _unblock_ts(run["expires_at"], "expires_at", self.path) < cutoff]:
+            del state["runs"][key]
+        directory = self.path.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".unblock-runs.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                os.fchmod(handle.fileno(), UNBLOCK_RUN_FILE_MODE)
+                handle.write(json.dumps(state, indent=2, sort_keys=True).encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        try:
+            dir_fd = os.open(str(directory), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass  # a directory fsync is best-effort durability; the rename already happened
+
+    def _expired(self, run: dict, now: datetime) -> bool:
+        return now > _unblock_ts(run["expires_at"], "expires_at", self.path)
+
+    def get(self, session: str, touch: bool, now: datetime) -> dict:
+        state = self.load()
+        run = state["runs"].get(session)
+        if run is None:
+            return {"run": None, "expired": None}
+        if self._expired(run, now):
+            # STICKY: an expired entry is reported by EVERY read and is neither removed, slid nor rewritten here. A
+            # read is not idempotent-safe to consume (reads carry no request-id dedupe, so a lost reply would silence
+            # the notice for good). Only `start` (replaces it) and `end` (removes it) delete it, and both are
+            # request_id deduped; the retention prune in `save` is the backstop for sessions that never call again.
+            return {"run": None, "expired": {"targets": list(run["targets"]), "expired_at": run["expires_at"]}}
+        if touch:
+            run["last_used_at"] = now.isoformat()
+            run["expires_at"] = (now + timedelta(seconds=UNBLOCK_RUN_TTL_SECONDS)).isoformat()
+            self.save(state, now)
+        return {"run": copy.deepcopy(run), "expired": None}
+
+    def start(self, session: str, targets: list, started_by: str, now: datetime) -> dict:
+        state = self.load()
+        existing = state["runs"].get(session)
+        replaced = None
+        expired = None
+        if existing is not None:
+            if not self._expired(existing, now):
+                replaced = {"targets": list(existing["targets"])}
+            else:
+                # Overwriting an expired entry removes its notice from later reads: deliver it in THIS reply, `replaced` stays null.
+                expired = {"targets": list(existing["targets"]), "expired_at": existing["expires_at"]}
+        run = {
+            "targets": sorted(set(targets)),
+            "started_by": started_by,
+            "started_at": now.isoformat(),
+            "last_used_at": now.isoformat(),
+            "expires_at": (now + timedelta(seconds=UNBLOCK_RUN_TTL_SECONDS)).isoformat(),
+        }
+        state["runs"][session] = run
+        self.save(state, now)
+        out = {"run": copy.deepcopy(run), "replaced": replaced}
+        if expired is not None:
+            out["expired"] = expired
+        return out
+
+    def end(self, session: str, now: datetime) -> dict:
+        state = self.load()
+        run = state["runs"].pop(session, None)
+        if run is None:
+            return {"ended": None}
+        self.save(state, now)
+        if self._expired(run, now):
+            # an expired run is no run, but removing it here ends its notice, so deliver it in THIS reply
+            return {"ended": None, "expired": {"targets": list(run["targets"]), "expired_at": run["expires_at"]}}
+        return {"ended": {"targets": list(run["targets"])}}
+
+
+def _unblock_str_refusal(value, what: str) -> "dict | None":
+    if (not isinstance(value, str) or value == ""
+            or len(value.encode("utf-8", "surrogatepass")) > UNBLOCK_RUN_ID_MAX_BYTES):
+        return _df_rejection(
+            "unblock_params_shape", f"'{what}' must be a non-empty string of at most {UNBLOCK_RUN_ID_MAX_BYTES} UTF-8 bytes",
+            "send the session key the MCP server resolved from its environment")
+    return None
+
+
+def _unblock_params_refusal(method: str, params, keys: frozenset) -> "dict | None":
+    """Shared shape check: params is a dict with EXACTLY `keys` (no extra, none missing), a valid session_key; then the
+    per-method fields. None = valid. Touches no file."""
+    if not isinstance(params, dict) or set(params) != set(keys):
+        return _df_rejection(
+            "unblock_params_shape", f"{method} params must be a dict with exactly the keys {sorted(keys)}",
+            "send exactly those keys; the session key comes from the MCP server's environment, never from the agent")
+    refusal = _unblock_str_refusal(params["session_key"], "session_key")
+    if refusal is not None:
+        return refusal
+    if "touch" in keys and not isinstance(params["touch"], bool):
+        return _df_rejection("unblock_params_shape", "'touch' must be a JSON boolean", "send true or false")
+    if "targets" in keys:
+        targets = params["targets"]
+        if not isinstance(targets, list) or not targets or len(targets) > UNBLOCK_RUN_MAX_TARGETS:
+            return _df_rejection(
+                "unblock_params_shape", f"'targets' must be a non-empty list of at most {UNBLOCK_RUN_MAX_TARGETS} ids",
+                "send the premise ids the run is for")
+        for i, t in enumerate(targets):
+            refusal = _unblock_str_refusal(t, f"targets[{i}]")
+            if refusal is not None:
+                return refusal
+        if params["started_by"] not in UNBLOCK_RUN_STARTED_BY:
+            return _df_rejection(
+                "unblock_params_shape", f"'started_by' must be one of {sorted(UNBLOCK_RUN_STARTED_BY)}",
+                "send 'explicit' or 'derive_refusal'")
+    return None
+
+
+def _unblock_state_rejection(exc: UnblockStateError) -> dict:
+    return _df_rejection(
+        "unblock_state_unreadable", f"the unblock-run file is unusable: {exc}",
+        f"repair or remove {exc.path} (it is never overwritten or read as 'no run' while it is bad); "
+        "until then use engram_cascade_frontier(node_id=...) after each resolve")
 
 
 # ---------------------------------------------------------------------------
@@ -2989,6 +3206,10 @@ class EngramdOwner:
             # #3879. `fill_embeddings` is in WIRE_REQUEST_ID_METHODS: `_dispatch` passes it the envelope's request_id.
             "fill_embeddings": lambda params, deadline, request_id=None: self._handle_fill_embeddings(params, deadline, request_id),
             "finish_embedding_regen": lambda params, deadline: self._handle_finish_embedding_regen(params, deadline),
+            # #4421: the unblock run. start/end are in WIRE_REQUEST_ID_METHODS (the envelope's request_id is their idempotency key).
+            "cascade_unblock_start": lambda params, deadline, request_id=None: self._handle_cascade_unblock_start(params, deadline, request_id),
+            "cascade_unblock_end": lambda params, deadline, request_id=None: self._handle_cascade_unblock_end(params, deadline, request_id),
+            "cascade_unblock_get": lambda params, deadline: self._handle_cascade_unblock_get(params, deadline),
         }
         # Every method carries a kind (8a). Kept ALONGSIDE `_methods` (tests replace handlers there). A method in
         # `_methods` with no entry here is default-deny at dispatch (8a-default), never treated as a read.
@@ -2997,6 +3218,7 @@ class EngramdOwner:
             "ping": "read", "snapshot": "read", "read": "read", "df": "read", "chain": "read",
             "confidence_by_type": "read", "use_reward": "write", "advance_moment_cursor": "write",
             "fill_embeddings": "write", "finish_embedding_regen": "write",
+            "cascade_unblock_start": "write", "cascade_unblock_end": "write", "cascade_unblock_get": "read",
         }
         # use_reward's dedupe store: request_id -> {"fp": (ids, action), "response": <first wire dict>}.
         # In-memory and LRU-bounded by USE_REWARD_DEDUPE_CAP; guarded by `_owner_lock`.
@@ -3005,6 +3227,13 @@ class EngramdOwner:
         # different ops): request_id -> {"fp": sha256 digest, "response": <first wire dict>}. Same bound and the same
         # KNOWN LIMIT as use_reward's (dies with the process; the oldest entry is forgotten past the cap).
         self._fill_embeddings_seen: "OrderedDict[str, dict]" = OrderedDict()
+        # #4421: the unblock run. `_unblock_lock` serialises every read-modify-write of the run file; `_unblock_seen` is the
+        # start/end dedupe store, keyed (op, request_id) -> {"fp", "response"}: in-memory and LRU-bounded like use_reward's
+        # (KNOWN BOUND, the same: it dies with the process, so a retry after an owner restart recomputes). `_unblock_now` is
+        # an instance attribute so a test drives the clock.
+        self._unblock_lock = threading.Lock()
+        self._unblock_seen: "OrderedDict[tuple, dict]" = OrderedDict()
+        self._unblock_now = lambda: datetime.now(timezone.utc)
         # The vec mirror's capability, probed ONCE per owner connection on the first fill: None = not tried yet,
         # False = this process cannot load vec0 (so every fill acks `vec_mirrored: false`), else the serializer.
         self._fill_vec_state = None
@@ -3342,8 +3571,20 @@ class EngramdOwner:
         self._shutdown.clear()
         self._lockwait.set_family_map(_load_lockwait_family_map())  # #4234: before the first read can arrive
         self._lockwait.start(LOCKWAIT_FLUSH_INTERVAL_S)
+        self._report_unblock_state_at_start()  # #4421: loud, never fatal
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
+
+    def _report_unblock_state_at_start(self) -> None:
+        """#4421: an unreadable or malformed unblock-run file is reported at owner start (log + stderr) and refused by name
+        on every run call; it is never treated as 'no run' and never overwritten."""
+        try:
+            UnblockRunStore(self.engram_home / UNBLOCK_RUNS_FILENAME).load()
+        except UnblockStateError as exc:
+            msg = (f"unblock runs: the state file is unusable and every unblock-run call will be refused until it is "
+                   f"repaired or removed: {exc}")
+            logging.getLogger("engramd_owner").error(msg)
+            print(msg, file=sys.stderr)
 
     @staticmethod
     def _kind_of_mode(mode: int) -> str:
@@ -4947,6 +5188,82 @@ class EngramdOwner:
                 f"COMMITTED but UNVERIFIED: the post-commit verification failed ({type(exc).__name__}); the commit stands and cannot be undone",
                 "do not blindly repeat; read the person's current cursor and decide"),
                 "commit": "committed_unverified"}
+
+    # -- the unblock run (#4421) -----------------------------------------------------------------
+
+    def _unblock_store(self) -> UnblockRunStore:
+        return UnblockRunStore(self.engram_home / UNBLOCK_RUNS_FILENAME)
+
+    def _unblock_write_op(self, op: str, params: dict, request_id, store_call) -> dict:
+        """Shared body of the two unblock WRITES. Order: the request_id; then UNDER `_unblock_lock` a dedupe check (a
+        replay answers the ORIGINAL stored reply with `duplicate: True`, never a recomputed one; the same id with a
+        different payload is refused), the file operation, and the record. A bad state file or a failed write is refused
+        and NOT recorded (nothing changed, a retry runs fresh)."""
+        refusal = _fill_request_id_refusal(request_id)
+        if refusal is not None:
+            return refusal
+        fingerprint = hashlib.sha256(json.dumps(params, sort_keys=True, separators=(",", ":"),
+                                                ensure_ascii=True).encode("ascii")).digest()
+        key = (op, request_id)
+        with self._unblock_lock:
+            prior = self._unblock_seen.get(key)
+            if prior is not None:
+                self._unblock_seen.move_to_end(key)
+                if prior["fp"] != fingerprint:
+                    return _df_rejection(
+                        "request_id_reused", "this request_id was already used for a different payload",
+                        "generate a fresh request_id per distinct operation; reuse one only to retry the SAME call")
+                replay = copy.deepcopy(prior["response"])
+                replay["result"]["duplicate"] = True
+                return replay
+            try:
+                result = store_call(self._unblock_store(), self._unblock_now())
+            except UnblockStateError as exc:
+                return _unblock_state_rejection(exc)
+            except OSError as exc:
+                return _df_rejection(f"{op}_write_failed", f"the unblock-run file could not be written ({type(exc).__name__})",
+                                     "retry with the SAME request_id; if it persists check the disk and permissions of ENGRAM_HOME")
+            response = {"status": "ok", "result": result}
+            self._unblock_seen[key] = {"fp": fingerprint, "response": copy.deepcopy(response)}
+            while len(self._unblock_seen) > USE_REWARD_DEDUPE_CAP:
+                self._unblock_seen.popitem(last=False)
+            return response
+
+    def _handle_cascade_unblock_start(self, params: dict, deadline: float, request_id=None) -> dict:
+        """`cascade_unblock_start` (kind `write`): params exactly {session_key, targets, started_by}. ALWAYS replaces the
+        session's run and names the replaced one (`replaced: null` when none)."""
+        refusal = _unblock_params_refusal("cascade_unblock_start", params, frozenset({"session_key", "targets", "started_by"}))
+        if refusal is not None:
+            return refusal
+        return self._unblock_write_op(
+            "cascade_unblock_start", params, request_id,
+            lambda store, now: store.start(params["session_key"], params["targets"], params["started_by"], now))
+
+    def _handle_cascade_unblock_end(self, params: dict, deadline: float, request_id=None) -> dict:
+        """`cascade_unblock_end` (kind `write`): params exactly {session_key}. Names the ended run, or `ended: null`."""
+        refusal = _unblock_params_refusal("cascade_unblock_end", params, frozenset({"session_key"}))
+        if refusal is not None:
+            return refusal
+        return self._unblock_write_op(
+            "cascade_unblock_end", params, request_id, lambda store, now: store.end(params["session_key"], now))
+
+    def _handle_cascade_unblock_get(self, params: dict, deadline: float) -> dict:
+        """`cascade_unblock_get` (kind `read`: it never touches the store): params exactly {session_key, touch}. With
+        touch=true a live run's expiry slides to now + 24 h (an idempotent file rewrite, safe to retry); an expired run is
+        removed and reported ONCE in `expired`."""
+        refusal = _unblock_params_refusal("cascade_unblock_get", params, frozenset({"session_key", "touch"}))
+        if refusal is not None:
+            return refusal
+        with self._unblock_lock:
+            try:
+                result = self._unblock_store().get(params["session_key"], params["touch"], self._unblock_now())
+            except UnblockStateError as exc:
+                return _unblock_state_rejection(exc)
+            except OSError as exc:
+                return _df_rejection("cascade_unblock_get_failed",
+                                     f"the unblock-run file could not be written ({type(exc).__name__})",
+                                     "retry; if it persists check the disk and permissions of ENGRAM_HOME")
+        return {"status": "ok", "result": result}
 
     # -- the owner's third and fourth writes (#3879) ---------------------------------------------
 

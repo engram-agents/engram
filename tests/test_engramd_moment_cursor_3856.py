@@ -126,7 +126,7 @@ def cursor_of(db, nid):
 
 
 def test_write_set_is_exactly_the_two_ops_and_the_version_is_1_3():  # name kept for a stable test id; the set is now the four ops
-    assert eo.WRITE_METHODS == frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen"})  # fill_embeddings / finish_embedding_regen: #3879
+    assert eo.WRITE_METHODS == frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen", "cascade_unblock_start", "cascade_unblock_end"})  # fill_embeddings / finish_embedding_regen: #3879; cascade_unblock_*: #4421
     assert ec.CONTRACT_VERSION == "1.3"
     assert eo.METHOD_KINDS == frozenset({"read", "write"})
 
@@ -145,7 +145,7 @@ def test_the_new_method_is_in_the_table_kind_write_and_the_read_set_is_unchanged
     assert OP in owner._methods
     assert {m for m, k in owner._method_kinds.items() if k == "write"} == set(eo.WRITE_METHODS)
     reads = {m for m, k in owner._method_kinds.items() if k == "read"}
-    assert reads == {"ping", "snapshot", "read", "df", "chain", "confidence_by_type"}
+    assert reads == {"ping", "snapshot", "read", "df", "chain", "confidence_by_type", "cascade_unblock_get"}  # cascade_unblock_get: #4421
 
 
 @requires_linux_owner

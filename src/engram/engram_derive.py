@@ -299,6 +299,14 @@ def _derive_impl(
             summary_missing=_summary_missing,
         )
         if block is not None:
+            # #4421: a refusal on marked premises starts (or, with a run already active, names the choice about) the
+            # session's unblock run. The refusal itself is already decided; this only adds guidance lines, so a failure
+            # here must never turn the refusal into something else.
+            try:
+                import engram_revision
+                block = engram_revision._cascade_unblock_on_derive_refusal(conn, block, ids)
+            except Exception as _unblock_exc:  # pragma: no cover -- defensive
+                block["unblock_run_error"] = f"{type(_unblock_exc).__name__}: {_unblock_exc}"
             # --- engram.tool.engram_call event — blocked path (DESIGN.md §4.2) ---
             # alpha #2574 WS5: site attestation + outcome recording +
             # protection (docs/internal/2574-telemetry-design.md §1/§4/§5). A new,
