@@ -82,6 +82,14 @@
     .btn:hover { background: #1a4a8a; }
     .btn:active { background: #245090; }
 
+    /* Node types panel: the Hide all / Show all pair (#4388). */
+    .type-bulk {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .type-bulk .btn { font-family: inherit; }
+
     label.toggle {
       display: flex;
       align-items: center;

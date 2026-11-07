@@ -140,10 +140,9 @@ let TIER2_MAX = 1000;
 // Legible-default constants (#1169)
 // ═══════════════════════════════════════════════════════════════════
 
-// Identity-backbone node types: always shown in legible-default mode.
-// cornerstone is now a fully-styled type (in NODE_STYLE) and appears in the
-// type-filter panel; BACKBONE_TYPES retains it here so it is always visible
-// when showFullGraph is false (backbone bypasses the activeTypes gate).
+// Identity-backbone node types: always part of the legible-default SUBSET
+// (legibleNodeIds). They are NOT exempt from the type filter: a hidden type
+// is hidden in both modes, backbone types included (#4388).
 const BACKBONE_TYPES = new Set(['cornerstone', 'axiom', 'goal', 'person']);
 
 // How many recent nodes (by created_at DESC, excluding backbone) to include.
@@ -388,15 +387,14 @@ function legibleNodeIds() {
 
 function filteredData() {
   // In legible-default mode, restrict to the backbone+recent subset first.
-  // Backbone nodes (cornerstone/axiom/goal/person) bypass the activeTypes check
-  // so they are always visible in legible mode regardless of filter state.
-  // The showSuperseded filter is applied uniformly to both modes.
+  // The activeTypes and showSuperseded filters are then applied uniformly to
+  // both modes; there is no backbone exemption (#4388).
   let nodes;
   if (!showFullGraph) {
     const allowed = legibleNodeIds();
     nodes = rawData.nodes.filter(n =>
       allowed.has(n.id) &&
-      (BACKBONE_TYPES.has(n.type) || activeTypes.has(n.type)) &&
+      activeTypes.has(n.type) &&
       (showSuperseded || n.is_current)
     );
   } else {
@@ -1405,6 +1403,27 @@ function buildSidebar() {
     };
     tf.appendChild(div);
   });
+
+  // Hide all / Show all (#4388). Static markup in graph.html; this function
+  // runs more than once, so wire with .onclick ASSIGNMENT (idempotent).
+  const hideAll = document.getElementById('type-hide-all');
+  const showAll = document.getElementById('type-show-all');
+  const syncChips = () => {
+    Array.from(tf.children).forEach(div => {
+      if (activeTypes.has(div.dataset.type)) div.classList.remove('dimmed');
+      else div.classList.add('dimmed');
+    });
+  };
+  hideAll.onclick = () => {
+    activeTypes = new Set();
+    syncChips();
+    render();
+  };
+  showAll.onclick = () => {
+    activeTypes = new Set(Object.keys(NODE_STYLE));
+    syncChips();
+    render();
+  };
 
   // Edge legend — built from EDGE_STYLE (all 13 relations from /api/schema).
   // Each swatch shows the relation's color AND its solid/dashed line style.
