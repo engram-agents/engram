@@ -88,6 +88,20 @@
 #                                        # (this is first-session-only, NOT a
 #                                        # general rename — names are immutable
 #                                        # post-finalize — names are immutable).
+#
+# Exit codes of the four root verbs (spawn, finalize-name, share, unshare):
+#   Exit 8  the action HAPPENED but its audit-log line (or, for unshare, its state
+#           record) could not be written. Do not repeat the action: look at the state
+#           directory, then record the line by hand. No other exit in this file uses 8.
+#           Every refusal BEFORE the action (the state-directory gate, a bad argument,
+#           a failed read-back) is a different code: 1 for a failed gate, 2 for a usage
+#           error, 3 for a missing VIZ_OPERATOR (spawn, finalize-name). Exit 3 is NOT
+#           "the action happened".
+#   share --ttl needs 'at', a running atd (where systemctl exists) and a time of the form
+#           <number><unit>, unit minutes|hours|days|weeks (2hours, 3days; not 2h). The
+#           removal job is queued FIRST; if it cannot be, nothing is granted. A swapped-in
+#           link at the shared path itself is refused by a read-back; a link swapped in at
+#           a parent directory is not closed.
 # =============================================================================
 
 set -euo pipefail
@@ -100,6 +114,19 @@ SHARED_ROOT="/home/agents-shared"
 # a value root honours from the environment is the same hole. Holds `share-log`
 # and `share-state/<agent>.json`. Tests rewrite the literal in a COPY of this file.
 readonly AGENTCTL_STATE="/var/lib/agentctl"
+
+# Exit code of spawn, finalize-name, share and unshare when the action HAPPENED and its
+# audit-log write failed (a refusal before the action is never this code). A value no
+# other `exit` in this file uses: 3 is _require_viz_operator's refusal, which comes BEFORE
+# any action (a static cell pins that no literal exit carries this value). Stated in the
+# help header and in audit()'s error text (engram-alpha#4405 follow-up).
+readonly EXIT_ACTION_UNLOGGED=8
+
+# The tool a queued `at` job runs, a LITERAL for the same reason: `$0` is whatever path
+# the operator typed (a relative or agent-writable one runs later, as root, from
+# wherever `at` lands). The operator installs agentctl here (root:root, 0755). Tests
+# rewrite the literal in a COPY of this file (engram-alpha#4409).
+readonly AGENTCTL_TOOL="/usr/local/bin/agentctl"
 
 # Viz/operator account that needs read access to agent ~/.engram dirs for the
 # viz dashboard (knowledge.db dropdown) and write access to config.json for
@@ -1372,37 +1399,39 @@ _forum_hint_url_problem() {
 }
 
 # _write_forum_hint <home> <user> <group> <url>
-# Writes <home>/.engram/forum-url.hint as ROOT: exactly one line (the URL), mode
-# 0600, owned by <user>:<group>. Never overwrites and never follows a symlink:
-# it refuses when .engram is not a real directory owned by <user>, or when the
-# target path already exists in any form; the file is written under a temp name
-# in the same directory, owned and moded there, then PUBLISHED with a link(2)-
-# style `ln temp final`, which fails when `final` exists (mv -n is not atomic
-# against a racing create). Returns 0 on success; on any refusal or failure it
-# prints a WARN naming the manual step and returns 1. The caller treats that as
-# non-fatal: the newborn exists and is usable without a hint.
+# Leaves <home>/.engram/forum-url.hint: exactly one line (the URL), mode 0600, owned by
+# <user>. EVERY write runs AS <user> (`sudo -u`), never as root: root only measures
+# (a link, a directory, an owner, an existing name). Never overwrites and never follows
+# a symlink: it refuses when .engram is not a real directory owned by <user>, or when
+# the target path already exists in any form; the file is written under a temp name in
+# the same directory, then PUBLISHED with a link(2)-style `ln temp final`, which fails
+# when `final` exists (mv -n is not atomic against a racing create). Returns 0 on
+# success; on any refusal or failure it prints a WARN naming the manual step and returns
+# 1. The caller treats that as non-fatal: the newborn exists and is usable without a
+# hint. The group argument is accepted for the caller's signature and unused: a file the
+# newborn creates carries the newborn's own primary group.
 _write_forum_hint() {
-    local home="$1" user="$2" group="$3" url="$4"
+    local home="$1" newborn_user="$2" group="$3" url="$4"
     local dir="$home/.engram"
     local target="$dir/forum-url.hint"
     local tmp="" why=""
-    local manual="to leave a hint by hand, write the URL as one line to $target as $user"
+    local manual="to leave a hint by hand, write the URL as one line to $target as $newborn_user"
 
     if ! why="$(_forum_hint_url_problem "$url")"; then
         echo "WARN: forum-url.hint not written: URL $why; $manual" >&2
         return 1
     fi
-    # Assumption that makes this check-then-write window acceptable: at spawn
-    # time the newborn account has just been created and has no running process,
-    # so nothing can swap .engram between these checks and the write below. If
-    # that ever stops being true, do the write AS the newborn (runuser) instead
-    # of as root.
+    # The checks below read as root; the writes after them run as the newborn, so a
+    # name the newborn swaps between a check and a write is the newborn's own tree and
+    # nothing root writes can follow it. (This used to rest on "the account has no
+    # running process yet", an assumption that stops holding the moment one starts;
+    # the newborn identity makes it unnecessary.)
     if [[ -L "$home" || -L "$dir" || ! -d "$dir" ]]; then
         echo "WARN: forum-url.hint not written: $dir is not a real directory (symlink or missing); $manual" >&2
         return 1
     fi
-    if [[ "$(stat -c %U "$dir" 2>/dev/null)" != "$user" ]]; then
-        echo "WARN: forum-url.hint not written: $dir is not owned by $user; $manual" >&2
+    if [[ "$(stat -c %U "$dir" 2>/dev/null)" != "$newborn_user" ]]; then
+        echo "WARN: forum-url.hint not written: $dir is not owned by $newborn_user; $manual" >&2
         return 1
     fi
     if [[ -e "$target" || -L "$target" ]]; then
@@ -1410,23 +1439,22 @@ _write_forum_hint() {
         return 1
     fi
 
-    tmp="$(umask 077; mktemp "$dir/.forum-url.hint.XXXXXX" 2>/dev/null)" || {
+    tmp="$(sudo -u "$newborn_user" mktemp "$dir/.forum-url.hint.XXXXXX" 2>/dev/null)" || {
         echo "WARN: forum-url.hint not written: cannot create a temp file in $dir; $manual" >&2
         return 1
     }
-    if ! { (umask 077; printf '%s\n' "$url" > "$tmp") \
-           && chown -h "$user:$group" "$tmp" \
-           && chmod 0600 "$tmp"; } 2>/dev/null; then
-        rm -f -- "$tmp"
-        echo "WARN: forum-url.hint not written: could not write or own the temp file in $dir; $manual" >&2
+    if ! { printf '%s\n' "$url" | sudo -u "$newborn_user" tee -- "$tmp" >/dev/null \
+           && sudo -u "$newborn_user" chmod 0600 "$tmp"; } 2>/dev/null; then
+        sudo -u "$newborn_user" rm -f -- "$tmp"
+        echo "WARN: forum-url.hint not written: could not write the temp file in $dir; $manual" >&2
         return 1
     fi
-    if ! ln -- "$tmp" "$target" 2>/dev/null; then
-        rm -f -- "$tmp"
+    if ! sudo -u "$newborn_user" ln -- "$tmp" "$target" 2>/dev/null; then
+        sudo -u "$newborn_user" rm -f -- "$tmp"
         echo "WARN: forum-url.hint not written: $target appeared first or cannot be linked (never overwritten); $manual" >&2
         return 1
     fi
-    rm -f -- "$tmp"
+    sudo -u "$newborn_user" rm -f -- "$tmp"
     return 0
 }
 
@@ -1564,7 +1592,7 @@ cmd_spawn() {
     # the line records THAT a hint was left (yes|no), never the URL.
     local audit_extras="runtime=$runtime"
     [[ $forum_url_given -eq 1 ]] && audit_extras+=" forum_hint=$forum_hint"
-    audit "spawn" "$newborn_tag" "newborn" "$audit_extras" || exit 1
+    audit "spawn" "$newborn_tag" "newborn" "$audit_extras" || exit "$EXIT_ACTION_UNLOGGED"
 
     cat <<NEXT
 
@@ -2221,7 +2249,7 @@ JSON
         echo "  ✓ viz ACL: $_viz_acl_result"
     fi
 
-    audit "finalize-name" "$chosen" "uid" "from=$newborn_user" || exit 1
+    audit "finalize-name" "$chosen" "uid" "from=$newborn_user" || exit "$EXIT_ACTION_UNLOGGED"
 
     cat <<DONE
 
@@ -2275,19 +2303,29 @@ _state_dir_ok() {
 # failure: one stderr line naming the path, what was found and the exact sudo
 # command that repairs it; non-zero. No fallback path.
 _state_dir_check() {
-    local path="$1" is_link=0 is_dir=0 uid="" mode="" st
+    local path="$1" kind="${2:-state}" is_link=0 is_dir=0 uid="" mode="" st
     [[ -L "$path" ]] && is_link=1
     if st="$(stat -L -c '%u %a' -- "$path" 2>/dev/null)"; then
         read -r uid mode <<< "$st"
         [[ -d "$path" ]] && is_dir=1
     elif (( is_link )); then
         uid=0; mode=0   # a dangling link: reported as a link below
+    elif [[ "$kind" == parent ]]; then
+        echo "ERROR: $path (the parent of the state directory, a system directory) does not exist. Investigate before running this verb again: the host layout is not what agentctl expects, and no repair is suggested for a system directory." >&2
+        return 1
     else
         echo "ERROR: $path does not exist. Fix: sudo install -d -m 0755 -o root -g root $path" >&2
         return 1
     fi
     if _state_dir_ok "$uid" "$mode" "$is_dir" "$is_link" 0; then
         return 0
+    fi
+    if [[ "$kind" == parent ]]; then
+        local what="owner uid $uid, mode $mode"
+        (( is_link )) && what="a symbolic link"
+        (( ! is_link && ! is_dir )) && what="not a directory"
+        echo "ERROR: $path (the parent of the state directory, a system directory) must be a real directory owned by root (uid 0) with no group or other write; found $what. Investigate who changed it and why before running this verb again; it is a system directory, so no repair is suggested here." >&2
+        return 1
     fi
     local fix="sudo chown root:root $path && sudo chmod 0755 $path" found="owner uid $uid, mode $mode"
     if (( is_link )); then
@@ -2309,7 +2347,7 @@ _state_dir_check() {
 _state_dir_init() {
     local parent d
     parent="$(dirname "$AGENTCTL_STATE")"
-    _state_dir_check "$parent" || return 1
+    _state_dir_check "$parent" parent || return 1
     for d in "$AGENTCTL_STATE" "$AGENTCTL_STATE/share-state"; do
         if [[ ! -e "$d" && ! -L "$d" ]]; then
             mkdir -m 0755 "$d" || { echo "ERROR: could not create $d" >&2; return 1; }
@@ -2390,22 +2428,48 @@ audit() {
     # loud logged error, never a silent success. No mkdir, chgrp or chmod: the
     # directory and its modes were set once, by _state_dir_init.
     if ! _state_dir_check "$AGENTCTL_STATE"; then
-        echo "ERROR: $action happened but could not be logged (state directory failed its check)." >&2
+        echo "ERROR: $action happened but could not be logged (state directory failed its check). Exit code $EXIT_ACTION_UNLOGGED: the action is DONE; do not repeat it, repair the state directory and add the log line by hand." >&2
         return 1
     fi
     ( umask 022; echo "$stamp $action ${SUDO_USER:-$(id -un)}→$agent path=$path${extras:+ $extras}" >> "$AGENTCTL_STATE/share-log" ) \
-        || { echo "ERROR: $action happened but could not be logged (write to $AGENTCTL_STATE/share-log failed)." >&2; return 1; }
+        || { echo "ERROR: $action happened but could not be logged (write to $AGENTCTL_STATE/share-log failed). Exit code $EXIT_ACTION_UNLOGGED: the action is DONE; do not repeat it, repair the state directory and add the log line by hand." >&2; return 1; }
+}
+
+# _acl_has <path> <key>: 0 when `getfacl -p` prints a line that starts <key>: (for
+# example group:agent-x, or default:group:agent-x) for <path> ITSELF, 1 when it does not,
+# 2 when getfacl could not read it. The listing is captured first, never piped into
+# `grep -q` (under pipefail an early-exiting grep reads a long listing as a failure).
+# A read that FAILED is not an absence: callers treat 2 as a refusal either way.
+_acl_has() {
+    local out line
+    out="$(getfacl -p -- "$1" 2>/dev/null)" || return 2
+    while IFS= read -r line; do
+        [[ "$line" == "$2":* ]] && return 0
+    done <<< "$out"
+    return 1
+}
+
+# _ttl_job_undo <job>: a share whose removal job was queued did not happen after all, so
+# take the job back out, or say that it remains. Nothing queued (empty <job>): nothing to do.
+_ttl_job_undo() {
+    local job="${1:-}"
+    [[ -n "$job" ]] || return 0
+    if [[ "$job" != unknown ]] && atrm "$job" 2>/dev/null; then
+        echo "  the queued auto-unshare job $job was removed" >&2
+    else
+        echo "  WARNING: queued auto-unshare job $job remains (atrm failed or the id is unknown): the share did not happen, so the job will run 'unshare' for nothing; list it with atq and remove it with atrm" >&2
+    fi
 }
 
 cmd_share() {
     local agent="${1:-}"; shift || true
     local path="${1:-}"; shift || true
     local mode="rw"
-    local ttl=""
+    local ttl="" ttl_given=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --mode) mode="${2:-}"; shift 2 ;;
-            --ttl)  ttl="${2:-}"; shift 2 ;;
+            --ttl)  ttl="${2:-}"; ttl_given=1; shift 2 ;;
             *) echo "ERROR: unknown flag '$1'" >&2; exit 2 ;;
         esac
     done
@@ -2419,9 +2483,14 @@ cmd_share() {
     path=$(readlink -f "$path")
     # Residual, not a guard: $path is operator-chosen and was just resolved by
     # readlink -f, so this -L test is a check-then-use gap (the path can change
-    # between here and the setfacl calls below). It catches a stale or odd path,
-    # nothing more (engram-alpha#4405).
+    # between here and the setfacl calls below). The LEAF is closed by -P on every
+    # recursive call plus the read-back below; a swapped MIDDLE component (a parent
+    # of $path replaced by a link) stays open and is not closed here (engram-alpha#4405).
     [[ -L "$path" ]] && { echo "ERROR: '$path' is a symbolic link; refusing to set ACLs through it" >&2; exit 1; }
+    # setfacl -R -P on a link WITH a trailing slash acts on the link's target (setfacl
+    # 2.3.2, measured). readlink -f never prints one; every argument below is that
+    # result, so a trailing slash here means something other than readlink answered.
+    [[ "$path" != "/" && "$path" == */ ]] && { echo "ERROR: '$path' ends in a trailing slash after resolution; refusing: a recursive ACL call on a link with a trailing slash acts on the link's target" >&2; exit 1; }
 
     case "$path" in
         /etc/*|/usr/*|/var/*|/sys/*|/proc/*|/dev/*|/boot/*|/root/*|/etc|/usr|/var|/root|/)
@@ -2435,13 +2504,48 @@ cmd_share() {
         *)  echo "ERROR: --mode must be rw or ro (got '$mode')" >&2; exit 2 ;;
     esac
 
+    # TTL (#4409): a share with --ttl has a scheduled removal or does not happen. The job
+    # is queued, and its success read, BEFORE any ACL changes; at's own error is shown,
+    # never discarded. The job runs the fixed tool path, not $0.
+    local at_job="" at_out=""
+    local ttl_forms="Accepted forms: a positive number and a unit spelled out, minutes, hours, days or weeks, for example --ttl 2hours, 3days, 30minutes or 1week (at(1) rejects 2h and 2d)."
+    if (( ttl_given )); then
+        # A closed grammar, checked before at is called: the value is interpolated into
+        # at's timespec, and 0minutes would fire before the grant lands and leave it forever.
+        [[ "$ttl" =~ ^[1-9][0-9]*(minutes?|hours?|days?|weeks?)$ ]] \
+            || { echo "ERROR: --ttl '$ttl' is not an accepted form; nothing was granted. $ttl_forms" >&2; exit 2; }
+        command -v at >/dev/null 2>&1 \
+            || { echo "ERROR: --ttl needs 'at' and it is not installed; nothing was granted. Install it (apt install at), or share without --ttl and unshare by hand. $ttl_forms" >&2; exit 1; }
+        # at queues a job that nothing runs when atd is down: the share would be permanent
+        # while reported as scheduled. Checked where systemctl exists; at is the arbiter elsewhere.
+        if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet atd; then
+            echo "ERROR: --ttl needs the at daemon and 'systemctl is-active atd' says it is not running; nothing was granted. Start it (systemctl start atd), or share without --ttl and unshare by hand." >&2
+            exit 1
+        fi
+        [[ -x "$AGENTCTL_TOOL" ]] \
+            || { echo "ERROR: --ttl queues '$AGENTCTL_TOOL unshare ...' and that file is not an executable; nothing was granted. Install agentctl there (root:root, mode 0755)." >&2; exit 1; }
+        # ttl-queue-begin
+        # POSIX single-quoting, never printf %q: at runs the job with /bin/sh, and a %q word with
+        # a control character is $'...', which dash reads as $ plus a plain quoted string.
+        _shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+        if at_out="$(printf '%s %s %s %s\n' "$(_shq "$AGENTCTL_TOOL")" unshare "$(_shq "$agent")" "$(_shq "$path")" | at "now + $ttl" 2>&1)"; then
+            at_job="$(sed -n 's/^job \([0-9][0-9]*\) at .*/\1/p' <<< "$at_out")"
+            [[ -n "$at_job" ]] || at_job="unknown"
+            echo "  scheduled auto-unshare at: now + $ttl (job $at_job)"
+        else
+            echo "ERROR: at rejected the time 'now + $ttl'; nothing was granted. at said: $at_out. $ttl_forms" >&2
+            exit 1
+        fi
+        # ttl-queue-end
+    fi
+
     # Parent traversal: walk from path's parent up to /, add g:user:--x ACL.
     # setfacl is idempotent — re-running is safe.
     local parent
     parent=$(dirname "$path")
     while [[ "$parent" != "/" && -n "$parent" ]]; do
         setfacl -m "g:$user:--x" "$parent" \
-            || { echo "ERROR: setfacl --x failed on '$parent'" >&2; exit 1; }
+            || { echo "ERROR: setfacl --x failed on '$parent'" >&2; _ttl_job_undo "$at_job"; exit 1; }
         # Preserve the invoking human user's read+traverse on every ancestor
         # we restrict via named-group --x. Without this, if the invoker is a
         # member of the named group (e.g. the operator is in the agent groups for
@@ -2456,14 +2560,34 @@ cmd_share() {
         parent=$(dirname "$parent")
     done
 
-    # Target: recursive ACL
-    setfacl -R -m "g:$user:$acl_perm" "$path" \
-        || { echo "ERROR: setfacl $acl_perm failed on '$path'" >&2; exit 1; }
+    # Target: recursive ACL. -P: never follow a link. Without it a link swapped in at
+    # the argument puts the entry (with -d, a DEFAULT entry that later files inherit)
+    # on the link's target directory; with it, setfacl applies nothing and exits 0,
+    # which is why the read-back below is not optional.
+    setfacl -R -P -m "g:$user:$acl_perm" "$path" \
+        || { echo "ERROR: setfacl $acl_perm failed on '$path'" >&2; _ttl_job_undo "$at_job"; exit 1; }
 
     # Default ACL on directories so new files inherit
     if [[ -d "$path" ]]; then
-        setfacl -R -d -m "g:$user:$acl_perm" "$path" \
-            || echo "WARNING: default ACL setfacl failed on '$path'" >&2
+        setfacl -R -P -d -m "g:$user:$acl_perm" "$path" \
+            || { echo "ERROR: default ACL setfacl failed on '$path'" >&2; _ttl_job_undo "$at_job"; exit 1; }
+    fi
+
+    # Read-back on $path ITSELF, after both calls: refuse loudly, with no "Shared", no
+    # state record and no log line, when the entry is not there.
+    local rb=0
+    _acl_has "$path" "group:$user" || rb=$?
+    if (( rb )); then
+        echo "ERROR: read-back failed: '$path' does not carry g:$user after setfacl (rc=$rb; 1 = absent: a link swapped in at that name, or a filesystem without ACLs; 2 = could not be read). Nothing is recorded." >&2
+        _ttl_job_undo "$at_job"; exit 1
+    fi
+    if [[ -d "$path" ]]; then
+        rb=0
+        _acl_has "$path" "default:group:$user" || rb=$?
+        if (( rb )); then
+            echo "ERROR: read-back failed: '$path' carries no default entry for $user after setfacl -d (rc=$rb). Nothing is recorded." >&2
+            _ttl_job_undo "$at_job"; exit 1
+        fi
     fi
 
     # Git safe.directory exception: git 2.35.2+ refuses to operate on repos owned
@@ -2478,23 +2602,13 @@ cmd_share() {
         fi
     fi
 
-    # TTL: schedule revoke via 'at' if specified and available
-    if [[ -n "$ttl" ]]; then
-        if command -v at >/dev/null 2>&1; then
-            echo "$0 unshare $agent $path" | at "now + $ttl" 2>/dev/null \
-                && echo "  scheduled auto-unshare at: now + $ttl"
-        else
-            echo "WARNING: 'at' not installed; --ttl requested but not enforced. Manual unshare needed." >&2
-        fi
-    fi
-
     # State tracking
     # $agent is a real account name here: resolve_user (above) proved it exists,
     # so it cannot carry a slash. Keep that order (cell O1).
     local state_dir="$AGENTCTL_STATE/share-state"
     local state_file="$state_dir/$agent.json"
     AGENT="$agent" SHARE_PATH="$path" SHARE_MODE="$mode" SHARE_TTL="$ttl" STATE_FILE="$state_file" \
-    python3 - <<'PYEOF'
+    python3 - <<'PYEOF' || { echo "ERROR: share happened but its state record could not be written ($state_file). The share IS in force${at_job:+ and its auto-unshare job $at_job remains queued}. Exit code $EXIT_ACTION_UNLOGGED: do not repeat the share; repair the state directory." >&2; exit "$EXIT_ACTION_UNLOGGED"; }
 import json, os
 from datetime import datetime, timezone
 sf = os.environ['STATE_FILE']
@@ -2520,7 +2634,7 @@ with os.fdopen(fd, "w") as fh:
 os.replace(tmp, sf)
 PYEOF
 
-    audit share "$agent" "$path" "mode=$mode ttl=${ttl:-none}" || exit 1
+    audit share "$agent" "$path" "mode=$mode ttl=${ttl:-none}" || exit "$EXIT_ACTION_UNLOGGED"
     echo "✓ Shared $path with $agent (mode=$mode${ttl:+, ttl=$ttl})"
 }
 
@@ -2534,20 +2648,59 @@ cmd_unshare() {
     _state_dir_init || exit 1
     local user; user=$(resolve_user "$agent")
     path=$(readlink -f "$path" 2>/dev/null || echo "$path")
+    # The fallback keeps the operator's RAW path. `setfacl -R -P` on a link WITH a
+    # trailing slash acts on the link's target (setfacl 2.3.2, measured), so strip it:
+    # the bare name is then the link itself and the -L test below refuses it.
+    while [[ "$path" != "/" && "$path" == */ ]]; do path="${path%/}"; done
 
     # Remove recursive + default ACL
     if [[ -e "$path" ]]; then
         # Residual, not a guard: operator-chosen path resolved by readlink -f; this
-        # -L test is a check-then-use gap (engram-alpha#4405).
+        # -L test is a check-then-use gap. The LEAF is closed by -P on every recursive
+        # call plus the read-back below; a swapped MIDDLE component stays open and is
+        # not closed here (engram-alpha#4405).
         [[ -L "$path" ]] && { echo "ERROR: '$path' is a symbolic link; refusing to remove ACLs through it" >&2; exit 1; }
-        setfacl -R -x "g:$user" "$path" 2>/dev/null || true
-        [[ -d "$path" ]] && setfacl -R -d -x "g:$user" "$path" 2>/dev/null || true
+        # -P: never follow a link at the argument. -n: do NOT recalculate the mask: a
+        # plain -x can widen a restricted file (mode 600, mask --- became 640, mask
+        # r--, measured by two seats). No `|| true`: a recursive removal that meets a
+        # directory it cannot list exits 1 and keeps going, and that is a PARTIAL
+        # removal, reported as one below. setfacl's own message stays on stderr.
+        local rm_rc=0
+        setfacl -R -P -n -x "g:$user" "$path" || rm_rc=1
+        if [[ -d "$path" ]]; then
+            setfacl -R -P -d -n -x "g:$user" "$path" || rm_rc=1
+        fi
+        if (( rm_rc )); then
+            echo "ERROR: removal from '$path' was PARTIAL: setfacl failed on part of the tree (its message is above). The path it names is the directory it could not LIST: that directory lost its own entry, and the entries that remain sit on its children. Entries may remain; the share record is kept and no ancestor was cleaned. Fix the cause and run unshare again, then check with: getfacl -R -p '$path'" >&2
+            audit unshare-partial "$agent" "$path" "removal=incomplete" || exit "$EXIT_ACTION_UNLOGGED"
+            exit 1
+        fi
+        # A link at $path NOW is a refusal: -P applied nothing through it, and getfacl
+        # follows it, so a swapped-in link to a directory without the entry would pass the
+        # entry test below as "gone" while the real directory was never processed.
+        [[ -L "$path" ]] && { echo "ERROR: '$path' is a symbolic link after the removal (swapped in while this ran); the real directory was not processed. The share record is kept. Check with: getfacl -p '$path'" >&2; exit 1; }
+        # Read-back on $path ITSELF: the entry (and, on a directory, the default entry)
+        # must be gone. A read that fails is not an absence.
+        local rb=0
+        _acl_has "$path" "group:$user" || rb=$?
+        if (( rb != 1 )); then
+            echo "ERROR: read-back failed: '$path' still carries g:$user, or its ACL could not be read (rc=$rb; 0 = still there, 2 = unreadable). Not removed; check with: getfacl -p '$path'" >&2
+            exit 1
+        fi
+        if [[ -d "$path" ]]; then
+            rb=0
+            _acl_has "$path" "default:group:$user" || rb=$?
+            if (( rb != 1 )); then
+                echo "ERROR: read-back failed: '$path' still carries a default entry for $user, or its ACL could not be read (rc=$rb). Not removed; check with: getfacl -p '$path'" >&2
+                exit 1
+            fi
+        fi
     fi
 
     # Update state file
     local state_file="$AGENTCTL_STATE/share-state/$agent.json"
     if [[ -f "$state_file" ]]; then
-        SHARE_PATH="$path" STATE_FILE="$state_file" python3 - <<'PYEOF'
+        SHARE_PATH="$path" STATE_FILE="$state_file" python3 - <<'PYEOF' || { echo "ERROR: unshare removed the ACL entries from '$path' (the removal happened) but the state record could not be rewritten ($state_file). Exit code $EXIT_ACTION_UNLOGGED: do not repeat the unshare; repair the record and add the log line by hand. No ancestor was cleaned and no audit line was written." >&2; exit "$EXIT_ACTION_UNLOGGED"; }
 import json, os
 sf = os.environ['STATE_FILE']
 target = os.environ['SHARE_PATH']
@@ -2561,22 +2714,33 @@ with os.fdopen(fd, "w") as fh:
 os.replace(tmp, sf)
 PYEOF
         # GC parent --x ACLs: remove any parent ACL not needed by remaining shares
-        REMAINING=$(STATE_FILE="$state_file" python3 -c "import json, os; print('\n'.join(s['path'] for s in json.load(open(os.environ['STATE_FILE']))))")
+        REMAINING=$(STATE_FILE="$state_file" python3 -c "import json, os; print('\n'.join(s['path'] for s in json.load(open(os.environ['STATE_FILE']))))") \
+            || { echo "ERROR: unshare removed the ACL entries from '$path' (the removal happened) but the state record could not be read back ($state_file). Exit code $EXIT_ACTION_UNLOGGED: do not repeat the unshare; repair the record and add the log line by hand. No ancestor was cleaned and no audit line was written." >&2; exit "$EXIT_ACTION_UNLOGGED"; }
+        # An older record under $SHARED_ROOT (the agent-writable place shares were
+        # recorded before #4405) means older shares exist that THIS state cannot see, and
+        # they may depend on the ancestors' --x entries. Its mere presence (-e or -L)
+        # decides: nothing is read from it, so a planted name can only make this clean-up
+        # skip, which is harmless. The target's own ACL was already removed above.
+        local old_state="$SHARED_ROOT/share-state/$agent.json"
         local parent
-        parent=$(dirname "$path")
-        while [[ "$parent" != "/" && -n "$parent" ]]; do
-            local still_needed=0
-            while IFS= read -r remp; do
-                [[ -z "$remp" ]] && continue
-                case "$remp" in
-                    "$parent"/*|"$parent") still_needed=1; break ;;
-                esac
-            done <<< "$REMAINING"
-            if [[ $still_needed -eq 0 ]]; then
-                setfacl -x "g:$user" "$parent" 2>/dev/null || true
-            fi
-            parent=$(dirname "$parent")
-        done
+        if [[ -e "$old_state" || -L "$old_state" ]]; then
+            echo "WARN: ancestor ACL clean-up SKIPPED: an older share record exists at $old_state (not read). The older shares may depend on the --x entries on the ancestors of '$path'. Check each ancestor with 'getfacl -p <ancestor>', and remove an entry by hand ('setfacl -n -x g:$user <ancestor>') only when no older share needs it." >&2
+        else
+            parent=$(dirname "$path")
+            while [[ "$parent" != "/" && -n "$parent" ]]; do
+                local still_needed=0
+                while IFS= read -r remp; do
+                    [[ -z "$remp" ]] && continue
+                    case "$remp" in
+                        "$parent"/*|"$parent") still_needed=1; break ;;
+                    esac
+                done <<< "$REMAINING"
+                if [[ $still_needed -eq 0 ]]; then
+                    setfacl -n -x "g:$user" "$parent" 2>/dev/null || true
+                fi
+                parent=$(dirname "$parent")
+            done
+        fi
 
         # GC git safe.directory: remove the agent's exception for this repo
         # root only if no remaining share is inside the same repo. Path may be
@@ -2603,14 +2767,14 @@ PYEOF
         fi
     fi
 
-    audit unshare "$agent" "$path" || exit 1
+    audit unshare "$agent" "$path" || exit "$EXIT_ACTION_UNLOGGED"
     echo "✓ Unshared $path from $agent"
 }
 
 cmd_share_status() {
     local agent="${1:-}"
     local state_dir="$AGENTCTL_STATE/share-state"
-    echo "(shares granted before the move to $AGENTCTL_STATE are not listed here; their ACLs may still be in force)"
+    echo "(shares granted before the move to $AGENTCTL_STATE are not listed here; their ACLs may still be in force. The old records, if any, are at $SHARED_ROOT/share-state/<agent>.json: look there, and check the ACLs with getfacl)"
     if [[ ! -d "$state_dir" ]]; then
         echo "(no shares — $state_dir not yet created)"
         return 0

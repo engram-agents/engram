@@ -10,7 +10,17 @@ scratch tree) inside ``unshare -Urm``, a fake root whose own files read as uid 0
 
 What the static cells (G1-G5, O1) cannot see: a write through a variable that
 holds a path, through a helper, or through a sourced file. The security read
-covers that remainder by hand; the scan below is a search by pattern.
+covers that remainder by hand; the scan below is a search by pattern. G4's own
+limits are stated on ``scan_root_writes``.
+
+The share/unshare cells (TestShareVerb) run the REAL setfacl and getfacl on the
+scratch tree under the fake root, with the grantee's group stood in for by the
+namespace's one mapped gid. They cannot reproduce: a real second uid (so the
+"swapped link" is a stand-in that swaps on the first recursive call, not a racing
+process), an unreadable directory (a fake root reads every directory, so the
+partial-removal cell uses a stand-in that prints the message setfacl printed for
+one on a real run), a real `at` (a fake queues and prints `job 7`), or the
+installed path of the tool.
 """
 import os
 import re
@@ -64,6 +74,21 @@ def _identity_drop_ok() -> bool:
     return r.stdout.split() == ["DENIED", "ORIG"]
 
 
+def _acl_ok() -> bool:
+    """The share/unshare cells run the real setfacl and getfacl on the scratch tree
+    (a filesystem without ACL support, or no acl package, skips them, reported)."""
+    if not (shutil.which("setfacl") and shutil.which("getfacl")):
+        return False
+    d = tempfile.mkdtemp()
+    try:
+        r = subprocess.run(["setfacl", "-m", f"u:{os.getuid()}:rwx", d], capture_output=True)
+        g = subprocess.run(["getfacl", "-p", d], capture_output=True, text=True)
+        return r.returncode == 0 and re.search(r"^user:[^:]+:rwx", g.stdout, re.M) is not None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+needs_acl = pytest.mark.skipif(not _acl_ok(), reason="needs setfacl/getfacl and an ACL-capable /tmp")
 needs_stat = pytest.mark.skipif(not _stat_ok(), reason="needs GNU stat -c")
 needs_userns = pytest.mark.skipif(not _userns_ok(), reason="no unprivileged user+mount namespace")
 needs_nested = pytest.mark.skipif(not _identity_drop_ok(),
@@ -136,18 +161,19 @@ def _logical_lines(text):
 
 
 WRITE_CMDS = frozenset({"chown", "chgrp", "chmod", "setfacl", "mv", "cp", "install",
-                        "tee", "ln", "rm"})
+                        "tee", "ln", "rm", "mkdir"})
 # a root shell running a quoted string: the string is invisible to the scan, so
 # the wrapper itself must be a named allow-list row
 INDIRECT_CMDS = frozenset({"bash", "sh", "dash", "zsh", "eval", "xargs"})
 NEWBORN_WRAPPERS = frozenset({"ab_as_newborn"})
-NEWBORN_USER = re.compile(r'^"?\$\{?(chosen_user|USER_NAME)\}?"?$')
-_KEEP_STR = re.compile(r'\$\{?(chosen_user|USER_NAME)\}?')
+NEWBORN_USER = re.compile(r'^"?\$\{?(chosen_user|USER_NAME|newborn_user)\}?"?$')
+_KEEP_STR = re.compile(r'\$\{?(chosen_user|USER_NAME|newborn_user)\}?')
 SKIP_WRAPPERS = frozenset({"env", "exec", "nice", "time", "nohup", "timeout", "builtin"})
 KEYWORDS = ("then", "do", "else", "!", "if", "elif", "while", "until")
 # the root-run regions of tools/agentctl (R2); tools/agent-bootstrap is scanned whole
 AGENTCTL_REGIONS = frozenset({"cmd_spawn", "cmd_finalize_name", "cmd_share",
-                              "cmd_unshare", "audit"})
+                              "cmd_unshare", "audit", "_write_forum_hint",
+                              "_state_dir_init"})
 
 
 def _blank(line, in_dq):
@@ -218,14 +244,27 @@ _REDIRECT = re.compile(r"(?<![<>])(\d*|&)>>?(?!&)\s*([^\s;)|&<]*)")
 
 def scan_root_writes(text, regions=None):
     """Every root-run write in the text: chown chgrp chmod setfacl mv cp install
-    tee ln rm, or a redirect to a file, unless the command runs behind
-    `sudo -u "$chosen_user"` (or ab_as_newborn). A redirect is root's even behind
-    sudo -u, because the shell opens it. A root bash/sh/eval/xargs is flagged too:
-    its quoted body is not read. No path token decides anything (round 3: the
-    first G4 read only lines naming five variables and missed the viz setfacl
-    lines). `regions` limits the scan to those function names (None: all text).
-    Built to be run in Python: a `$` in a double-quoted shell pattern would
-    expand. Returns [(lineno, logical line, why)]."""
+    tee ln rm mkdir, or a redirect to a file, unless the command runs behind
+    `sudo -u "$chosen_user"` / `"$USER_NAME"` / `"$newborn_user"` (or ab_as_newborn).
+    A redirect is root's even behind sudo -u, because the shell opens it. A root
+    bash/sh/eval/xargs is flagged too: its quoted body is not read. No path token
+    decides anything (round 3: the first G4 read only lines naming five variables
+    and missed the viz setfacl lines). `regions` limits the scan to those function
+    names (None: all text). Built to be run in Python: a `$` in a double-quoted
+    shell pattern would expand. Returns [(lineno, logical line, why)].
+
+    LIMITS, stated so a green G4 is not read as more than it is. It does NOT see:
+      * a command outside the list above that writes or creates: touch, mktemp,
+        dd, truncate, sed -i, git, tar, rsync, useradd/usermod/groupmod/userdel,
+        systemctl, a python/perl/awk body (the state-file writer in cmd_share is a
+        python heredoc), or `at`/`atrm` queue changes;
+      * a command named by a variable, or run through a function defined elsewhere;
+      * anything outside AGENTCTL_REGIONS in tools/agentctl (agent-bootstrap is
+        scanned whole);
+      * which PATH an argument names: a row says why a line is acceptable, the scan
+        never reads the argument;
+      * a command inside a quoted string handed to bash/sh/eval (flagged, not read).
+    mkdir is no longer among the limits (it was, until the #4405 follow-up)."""
     hits = []
     in_dq = False
     for lineno, line, func in _logical_lines(text):
@@ -275,29 +314,32 @@ ALLOW = [
      'chown -h "$chosen_user:agents" "$SHARED_ROOT/health/$chosen"',
      "OWN: -h acts on the entry, never its target; the entry was just moved by the sticky-gated rename"),
     ("agentctl",
-     '( umask 022; echo "$stamp $action ${SUDO_USER:-$(id -un)}→$agent path=$path${extras:+ $extras}" >> "$AGENTCTL_STATE/share-log" )  || { echo "ERROR: $action happened but could not be logged (write to $AGENTCTL_STATE/share-log failed)." >&2; return 1; }',
+     '( umask 022; echo "$stamp $action ${SUDO_USER:-$(id -un)}→$agent path=$path${extras:+ $extras}" >> "$AGENTCTL_STATE/share-log" )  || { echo "ERROR: $action happened but could not be logged (write to $AGENTCTL_STATE/share-log failed). Exit code $EXIT_ACTION_UNLOGGED: the action is DONE; do not repeat it, repair the state directory and add the log line by hand." >&2; return 1; }',
      "OWN: append into the root-only state directory, re-verified by _state_dir_check immediately before"),
     ("agentctl",
-     'setfacl -m "g:$user:--x" "$parent"  || { echo "ERROR: setfacl --x failed on \'$parent\'" >&2; exit 1; }',
-     "OPERATOR: cmd_share parent walk, an ancestor of the operator-chosen path; same check-then-use residual as the path rows below (an ancestor an agent owns can be renamed and replaced by a link); not a guard"),
+     'mkdir -m 0755 "$d" || { echo "ERROR: could not create $d" >&2; return 1; }',
+     "OWN: _state_dir_init creates the root-only state directories: no -p, so a name that appeared meanwhile is a loud EEXIST and never a followed path; only when the name is absent; the parent was just verified root-owned, non-link and without group or other write, and the result is re-checked by _state_dir_check right after"),
+    ("agentctl",
+     'setfacl -m "g:$user:--x" "$parent"  || { echo "ERROR: setfacl --x failed on \'$parent\'" >&2; _ttl_job_undo "$at_job"; exit 1; }',
+     "OPERATOR: cmd_share parent walk, an ancestor of the operator-chosen path. NOT closed by -P or by the read-back (those cover the leaf): a swapped MIDDLE component stays open and this PR does not close it (a known residual, declared, not a guard)"),
     ("agentctl",
      'setfacl -m "u:$SUDO_USER:r-x" "$parent"  || echo "WARNING: preserve u:$SUDO_USER:r-x failed on \'$parent\'" >&2',
-     "OPERATOR: cmd_share parent walk, same ancestors and same residual as the row above"),
+     "OPERATOR: cmd_share parent walk, same ancestors and same residual as the row above: a swapped MIDDLE component stays open and this PR does not close it"),
     ("agentctl",
-     'setfacl -R -m "g:$user:$acl_perm" "$path"  || { echo "ERROR: setfacl $acl_perm failed on \'$path\'" >&2; exit 1; }',
-     "OPERATOR: cmd_share on an operator-chosen path resolved by readlink -f; the [[ -L ]] test before it is a check-then-use gap, a known residual, not a guard"),
+     'setfacl -R -P -m "g:$user:$acl_perm" "$path"  || { echo "ERROR: setfacl $acl_perm failed on \'$path\'" >&2; _ttl_job_undo "$at_job"; exit 1; }',
+     "OPERATOR: cmd_share on an operator-chosen path resolved by readlink -f. The LEAF is closed by -P (a link swapped in at the argument takes no entry) plus the getfacl -p read-back on $path itself, which refuses when the entry is absent; a trailing slash is refused before this line. A swapped MIDDLE component stays open and this PR does not close it"),
     ("agentctl",
-     'setfacl -R -d -m "g:$user:$acl_perm" "$path"  || echo "WARNING: default ACL setfacl failed on \'$path\'" >&2',
-     "OPERATOR: cmd_share default ACL: same operator-chosen path, same residual, not a guard"),
+     'setfacl -R -P -d -m "g:$user:$acl_perm" "$path"  || { echo "ERROR: default ACL setfacl failed on \'$path\'" >&2; _ttl_job_undo "$at_job"; exit 1; }',
+     "OPERATOR: cmd_share default ACL, same operator-chosen path: the leaf is closed by -P plus the read-back of the default entry; a swapped MIDDLE component stays open and this PR does not close it"),
     ("agentctl",
-     'setfacl -R -x "g:$user" "$path" 2>/dev/null || true',
-     "OPERATOR: cmd_unshare on an operator-chosen path resolved by readlink -f; the [[ -L ]] test is a check-then-use gap, a known residual, not a guard"),
+     'setfacl -R -P -n -x "g:$user" "$path" || rm_rc=1',
+     "OPERATOR: cmd_unshare on an operator-chosen path resolved by readlink -f (the fallback strips a trailing slash). The LEAF is closed by -P plus the read-back that the entry is gone; -n keeps the mask; a partial failure is reported, never swallowed. A swapped MIDDLE component stays open and this PR does not close it"),
     ("agentctl",
-     '[[ -d "$path" ]] && setfacl -R -d -x "g:$user" "$path" 2>/dev/null || true',
-     "OPERATOR: cmd_unshare default ACL: same operator-chosen path, same residual, not a guard"),
+     'setfacl -R -P -d -n -x "g:$user" "$path" || rm_rc=1',
+     "OPERATOR: cmd_unshare default ACL: same operator-chosen path, same leaf closure (-P plus read-back), -n, loud partial failure; a swapped MIDDLE component stays open and this PR does not close it"),
     ("agentctl",
-     'setfacl -x "g:$user" "$parent" 2>/dev/null || true',
-     "OPERATOR: cmd_unshare parent GC, ancestors of the operator-chosen path; same residual as the cmd_share parent walk"),
+     'setfacl -n -x "g:$user" "$parent" 2>/dev/null || true',
+     "OPERATOR: cmd_unshare parent GC, ancestors of the operator-chosen path (skipped when an older share record exists); -n keeps the mask. The same MIDDLE-component residual as the cmd_share parent walk: stays open and this PR does not close it"),
     ("agent-bootstrap", 'chmod 0755 "$cfgdir"',
      "CREATED: $cfgdir was made by mktemp -d a few lines up (root-owned, random name, in TMPDIR, normally sticky /tmp)"),
     ("agent-bootstrap",
@@ -305,6 +347,25 @@ ALLOW = [
      "CREATED: $cfg is a new file inside the root-owned $cfgdir, which no agent can write"),
     ("agent-bootstrap", 'rm -rf -- "$cfgdir"   # success or failure: the trust entry never outlives the clone command',
      "CREATED: removes the root-owned mktemp directory made above"),
+    ("agent-bootstrap", 'mkdir -p "$USER_HOME/.runtime"', "CREATED: " + _NB),
+    ("agent-bootstrap", 'mkdir -p "$USER_HOME/.local/bin"', "CREATED: " + _NB),
+    ("agent-bootstrap", 'mkdir -p "$ENGRAM_HOME"',
+     "CREATED on a fresh spawn: " + _NB + ". Residual, not a guard: this script also runs against a home that already exists, where "
+     "an account with a live process could have replaced a component of $USER_HOME/.engram by a link; mkdir -p then creates "
+     "only a MISSING leaf (it never changes an existing entry and writes no data), and the setfacl rows below carry the same "
+     "re-bootstrap residual"),
+    ("agent-bootstrap",
+     '[[ -e "$SHARED_ROOT" || -L "$SHARED_ROOT" ]] || mkdir -m 2775 "$SHARED_ROOT"',
+     "CREATED: only when the name is absent, no -p (a name that appears after the test is a loud EEXIST, never a followed path), "
+     "mode set at creation and never re-applied; the parent is /home, which only root can write"),
+    ("agent-bootstrap",
+     '[[ -e "$SHARED_ROOT/inter-agent" || -L "$SHARED_ROOT/inter-agent" ]] || mkdir -m 2775 "$SHARED_ROOT/inter-agent"',
+     "CREATED: only when absent, no -p, mode at creation only; mkdir does not follow a link at its final component, so a planted name is an EEXIST in a directory agents can write"),
+    ("agent-bootstrap",
+     '[[ -e "$SHARED_ROOT/health" || -L "$SHARED_ROOT/health" ]] || mkdir -m 3775 "$SHARED_ROOT/health"',
+     "CREATED: only when absent, no -p, mode at creation only; same reasoning as inter-agent above"),
+    ("agent-bootstrap", 'mkdir -m 0750 "$SHARED_ROOT/health/$NAME"',
+     "CREATED: no -p; a planted name was refused loudly just above and a name planted after that is an EEXIST; the parent is the sticky root-owned health directory, in which one account cannot replace another's entry"),
     ("agent-bootstrap", 'chmod "$HOME_MODE" "$USER_HOME"', "CREATED: " + _NB),
     ("agent-bootstrap", 'cat >"$USER_HOME/.bashrc" <<\'BASHRC\'', "CREATED: " + _NB),
     ("agent-bootstrap", 'chown "$USER_NAME:$USER_NAME" "$USER_HOME/.bashrc"', "CREATED: " + _NB),
@@ -481,6 +542,21 @@ class TestWrapper:
 # --------------------------------------------------------------------------
 
 class TestStatic:
+    def test_G1_the_unlogged_action_exit_value_is_used_by_no_other_exit(self):
+        text = AGENTCTL.read_text()
+        m = re.search(r"^readonly EXIT_ACTION_UNLOGGED=(\d+)$", text, re.M)
+        assert m, "the constant is not in its expected form"
+        value = m.group(1)
+        code = [l for _n, l, _f in _logical_lines(text)]
+        literal = [l for l in code if re.search(rf"\b(exit|return)\s+[\"']?{value}[\"']?(?![\w$])", l)]
+        assert literal == [], f"a literal exit {value} bypasses the constant: {literal}"
+        # and no other exit in the file uses that value
+        others = {x for l in code for x in re.findall(r"\bexit\s+(\d+)\b", l)}
+        assert value not in others
+        assert int(value) not in (0, 1, 2, 3) and others, (value, others)
+        # the constant is what the four verbs exit with (spawn, finalize-name, share x2, unshare x3)
+        assert sum('exit "$EXIT_ACTION_UNLOGGED"' in l for l in code) >= 6
+
     def test_G1_gate_follows_require_root_in_all_four_verbs(self):
         text = AGENTCTL.read_text()
         lines = text.split("\n")
@@ -566,6 +642,7 @@ class TestStatic:
             'setfacl -R -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir"',
             '[[ -f "$_cfg" ]] && setfacl -m "u:${VIZ_OPERATOR}:rw" "$_cfg"',
             'chmod 777 "$d"',
+            'mkdir -p "$d"',
             'rm -f "$whatever"',
             'ln -s "$a" "$b"',
             'install -m 0644 "$a" "$b"',
@@ -574,7 +651,7 @@ class TestStatic:
             'sudo -u root chmod 777 "$d"',
             'sudo -u "$chosen_user" echo hi > "$chosen_home/f"',
         ])
-        assert len(scan_root_writes(planted)) == 18
+        assert len(scan_root_writes(planted)) == 19
         # and it does not see these
         quiet = "\n".join([
             'sudo -u "$chosen_user" tee "$chosen_home/f" <<JSON',
@@ -587,6 +664,7 @@ class TestStatic:
             'echo "refusing to chown or mv it" >&2',
             'sudo -u "$chosen_user" setfacl -R -m "u:x:rX" "$_engram_dir" 2>/dev/null',
             'ab_as_newborn chmod 0755 "$d"',
+            'sudo -u "$newborn_user" mkdir "$d"',
             'x=$(sudo -u "$chosen_user" cp -a "$a" "$b" 2>&1)',
             'echo "multi',
             'chmod 777 inside a string "',
@@ -619,6 +697,80 @@ class TestStatic:
         assert mutated != text, "the viz setfacl line moved: update this cell"
         unallowed, _ = _scan_file("agentctl", mutated)
         assert [u for u in unallowed if needle in u[1]], unallowed
+
+    def test_G4_control_mkdir_is_a_root_write_and_a_newborn_mkdir_is_not(self):
+        assert [h[2] for h in scan_root_writes('mkdir -p "$d"')] == ["root mkdir"]
+        assert scan_root_writes('sudo -u "$newborn_user" mkdir "$d"') == []
+
+    def test_G4_the_forum_hint_writer_is_a_root_region_and_its_writes_are_all_newborn_run(self):
+        text = AGENTCTL.read_text()
+        assert "_write_forum_hint" in AGENTCTL_REGIONS
+        body = _func_body(text, "_write_forum_hint")
+        for cmd in ("tee", "chmod", "ln", "rm"):
+            assert f'sudo -u "$newborn_user" {cmd}' in body, cmd
+        assert [h for h in scan_root_writes(text, {"_write_forum_hint"})] == []
+
+    def test_G4_mutant_a_root_chmod_planted_in_the_forum_hint_writer_goes_red(self):
+        text = AGENTCTL.read_text()
+        assert _scan_file("agentctl", text)[0] == []          # positive control: clean as shipped
+        old = '    local tmp="" why=""\n'
+        assert text.count(old) == 1
+        planted = text.replace(old, old + '    chmod 0600 "$target"\n', 1)
+        unallowed, _ = _scan_file("agentctl", planted)
+        assert [u for u in unallowed if u[1] == 'chmod 0600 "$target"'], unallowed
+
+    @pytest.mark.parametrize("cmd", ["tee", "chmod", "ln", "rm"])
+    def test_G4_mutant_a_forum_hint_write_turned_root_goes_red(self, cmd):
+        text = AGENTCTL.read_text()
+        assert _scan_file("agentctl", text)[0] == []
+        needle = f'sudo -u "$newborn_user" {cmd}'
+        assert needle in text
+        mutated = text.replace(needle, cmd, 1)
+        assert mutated != text
+        unallowed, _ = _scan_file("agentctl", mutated)
+        assert [u for u in unallowed if re.search(rf"\b{cmd}\b", u[1])], (cmd, unallowed)
+
+    @pytest.mark.parametrize("name,exact", [(f, x) for f, x, _w in ALLOW
+                                            if "mkdir" in x and "setfacl" not in x])
+    def test_G4_mutant_each_mkdir_row_rewritten_to_another_root_write_goes_red(self, name, exact):
+        path = AGENTCTL if name == "agentctl" else BOOTSTRAP
+        text = path.read_text()
+        assert _scan_file(name, text)[0] == [] and _scan_file(name, text)[1] == []   # control: clean
+        assert text.count(exact) == 1, exact
+        mutated = text.replace(exact, exact.replace("mkdir", "chmod 0777", 1))
+        unallowed, stale = _scan_file(name, mutated)
+        assert unallowed and stale, "the row bound by exact line text did not notice a different root write"
+
+    def test_F8_the_queued_job_runs_a_fixed_tool_path_never_dollar_zero(self):
+        text = AGENTCTL.read_text()
+        assigns = [l for l in text.split("\n") if re.match(r"^\s*(readonly\s+)?AGENTCTL_TOOL=", l)]
+        assert assigns == ['readonly AGENTCTL_TOOL="/usr/local/bin/agentctl"'], assigns
+        body = "\n".join(l for l in _func_body(text, "cmd_share").split("\n")
+                         if not l.lstrip().startswith("#"))
+        assert '"$AGENTCTL_TOOL"' in body
+        assert "$0" not in body and "${0" not in body
+
+    def test_F1_F9_every_recursive_setfacl_has_P_and_every_removal_has_n(self):
+        text = AGENTCTL.read_text()
+        for fn in ("cmd_share", "cmd_unshare"):
+            for _ln, line, func in _logical_lines("\n".join([f"{fn}() {{", _func_body(text, fn), "}"])):
+                for m in re.finditer(r"(?<![\w./-])setfacl\s+([^|;&)]*)", line):
+                    toks = m.group(1).split()
+                    if any(t == "-R" for t in toks):
+                        assert "-P" in toks, (fn, line)
+                    if "-x" in toks and fn == "cmd_unshare":
+                        assert "-n" in toks, (fn, line)
+        # control: the scan of a planted pair sees both omissions
+        planted = 'f() {\n    setfacl -R -m g:a:r "$p"\n    setfacl -R -P -x g:a "$p"\n}\n'
+        bad = []
+        for _ln, line, _f in _logical_lines(planted):
+            for m in re.finditer(r"(?<![\w./-])setfacl\s+([^|;&)]*)", line):
+                toks = m.group(1).split()
+                if "-R" in toks and "-P" not in toks:
+                    bad.append("P")
+                if "-x" in toks and "-n" not in toks:
+                    bad.append("n")
+        assert bad == ["P", "n"]
 
     @pytest.mark.parametrize("name,path", [("agentctl", AGENTCTL), ("agent-bootstrap", BOOTSTRAP)])
     def test_G5_recursive_ops_never_follow_links_and_get_a_real_directory(self, name, path):
@@ -689,6 +841,7 @@ echo "usermod $*" >> "$STUB_STATE/usermod.log"
 new="$2"; newhome="$4"; old="$6"
 mv "/home/$old" "$newhome"
 touch "$STUB_STATE/renamed"
+[ -n "${STUB_BREAK_STATE:-}" ] && chmod g+w "$STUB_BREAK_STATE"
 exit 0
 """
 
@@ -757,12 +910,16 @@ exit $rc
 """
 
 
-def _rewrite_literals(text, shared, state):
+def _rewrite_literals(text, shared, state, tool=None):
     text, n = re.subn(r'^SHARED_ROOT="[^"]*"$', f'SHARED_ROOT="{shared}"', text, flags=re.M)
     assert n == 1
     text, n = re.subn(r'^readonly AGENTCTL_STATE="[^"]*"$', f'readonly AGENTCTL_STATE="{state}"',
                       text, flags=re.M)
     assert n == 1, "the AGENTCTL_STATE literal is not in the expected form"
+    if tool is not None:
+        text, n = re.subn(r'^readonly AGENTCTL_TOOL="[^"]*"$', f'readonly AGENTCTL_TOOL="{tool}"',
+                          text, flags=re.M)
+        assert n == 1, "the AGENTCTL_TOOL literal is not in the expected form"
     return text
 
 
@@ -841,8 +998,9 @@ class TestSpawnVerb:
         b2.good_state()
         b2.state.chmod(0o775)
         r = b2.run(SPAWN_WRAPPER)
-        assert r.returncode != 0
+        assert r.returncode == 1          # a failed gate is exit 1, never the exit 8 of an unlogged action
         assert str(b2.state) in r.stderr and "775" in r.stderr
+        assert "chmod" in r.stderr        # the state directory itself keeps its concrete repair
         assert b2.read("bootstrap-called") == ""
         assert not (b2.state / "share-log").exists()
 
@@ -866,8 +1024,9 @@ class TestSpawnVerb:
         b2.good_state()
         # the bootstrap stub opens the state directory to group write AFTER the gate
         r = b2.run(SPAWN_WRAPPER, STUB_BREAK_STATE=b2.state)
-        assert r.returncode != 0
+        assert r.returncode == 8          # F3/G1: the action happened, the log write failed
         assert "spawn happened but could not be logged" in r.stderr
+        assert "exit code 8" in r.stderr.lower()
         assert b2.read("bootstrap-called")   # the action did happen
         assert not (b2.state / "share-log").exists()
 
@@ -883,11 +1042,35 @@ class TestSpawnVerb:
     def test_A1b_group_writable_parent_refuses_and_creates_nothing(self, bench):
         bench.state.parent.chmod(0o775)
         r = bench.run(SPAWN_WRAPPER)
-        assert r.returncode != 0 and str(bench.state.parent) in r.stderr
+        assert r.returncode == 1 and str(bench.state.parent) in r.stderr
         assert not bench.state.exists() and bench.read("bootstrap-called") == ""
         # positive control: the same layout with a good parent works
         b2 = _second(bench)
         assert b2.run(SPAWN_WRAPPER).returncode == 0
+
+    @pytest.mark.parametrize("shape", ["group-writable", "link", "missing"])
+    def test_F4_the_parent_is_a_system_directory_and_its_message_offers_no_chmod_or_chown(self, bench, shape):
+        # F4: a refusal about /var/lib must say "investigate", never hand the operator a
+        # command that rewrites a system directory. The state directory itself keeps
+        # its concrete repair (V1 asserts chmod there).
+        parent = bench.state.parent
+        if shape == "group-writable":
+            parent.chmod(0o775)
+        elif shape == "link":
+            real = bench.root / "real-parent"
+            real.mkdir(mode=0o755)
+            real.chmod(0o755)
+            parent.rmdir()
+            parent.symlink_to(real)
+        else:
+            parent.rmdir()
+        r = bench.run(SPAWN_WRAPPER)
+        assert r.returncode == 1 and str(parent) in r.stderr, r.stderr
+        low = r.stderr.lower()
+        assert "investigate" in low and "system directory" in low, r.stderr
+        for word in ("chmod", "chown", "install -d", "sudo rm", "sudo mv"):
+            assert word not in low, (word, r.stderr)
+        assert bench.read("bootstrap-called") == ""
 
     def test_A1c_linked_parent_refuses_and_creates_nothing_through_it(self, bench):
         real_parent = bench.root / "real-parent"
@@ -1027,6 +1210,23 @@ class TestFinalizeVerb:
         assert re.search(r"sudo chmod 3775 \S+/health", r.stderr), r.stderr
         assert bench.read("usermod.log") == ""
 
+    def test_V2_finalize_name_audit_failure_is_exit_8_and_a_failed_gate_is_exit_1(self, bench):
+        self._ready(bench)
+        (bench.shared / "health" / TAG).mkdir()
+        r = self._go(bench, STUB_BREAK_STATE=bench.state)
+        assert r.returncode == 8, r.stdout + r.stderr
+        assert "finalize-name happened but could not be logged" in r.stderr
+        assert "exit code 8" in r.stderr.lower()
+        assert bench.read("usermod.log"), "the rename did happen"
+        # a failed gate stays exit 1, before anything moves
+        b2 = _second(bench)
+        self._ready(b2)
+        b2.state.chmod(0o775)
+        (b2.shared / "health" / TAG).mkdir()
+        r2 = b2.run(FIN_WRAPPER, VICTIM=b2.victim_dir / "target", VICTIM_FILE=b2.victim_dir / "target")
+        assert r2.returncode == 1, r2.stdout + r2.stderr
+        assert b2.read("usermod.log") == ""
+
     @needs_nested
     def test_V4_planted_marker_link_leaves_its_target_untouched(self, bench):
         self._ready(bench)
@@ -1061,6 +1261,688 @@ class TestFinalizeVerb:
         import json
         assert json.loads(bench.read("complete.copy"))["chosen_name"] == "chosenone"
         assert json.loads(bench.read("pending.copy"))["viz_operator"] == "operator"
+
+
+# --------------------------------------------------------------------------
+# SH -- share / unshare under the fake root, with the REAL setfacl and getfacl
+# --------------------------------------------------------------------------
+# The sandbox maps one uid and one gid, so the grantee's group is stood in for by
+# gid 0 (the fake root's own gid, the only gid the namespace knows). The wrappers
+# below rename agent-grantee <-> 0 on the way in and out and leave every ACL
+# ancestor outside the scratch tree alone (they belong to the host's root); all
+# else is the real tool. Two stand-ins ACT on the call, to put the verb in a
+# position a one-process bench cannot reach by chance:
+#   SWAP_AT/SWAP_TO   on the first recursive call, the named directory is replaced by
+#                     a link to SWAP_TO: the race the leaf cannot rule out by test
+#   SETFACL_*         NOOP (exit 0, applied nothing; _DEFAULT / _ACCESS: only the -d / only
+#                     the non-d recursive calls), FAIL, PARTIAL (applied it, then
+#                     the error setfacl prints for a directory it could not list --
+#                     measured on a real unreadable directory by the security seat;
+#                     a fake root can read every directory, so it cannot be reproduced)
+STUB_ID_SHARE = """#!/bin/bash
+for a in "$@"; do [ "$a" = agent-grantee ] && exit 0; done
+exec /usr/bin/id "$@"
+"""
+
+STUB_SETFACL_SH = """#!/bin/bash
+echo "setfacl $*" >> "$STUB_STATE/setfacl.log"
+last="${@: -1}"
+case "$last" in "$BENCH_ROOT"/*) ;; *) exit 0 ;; esac
+rec=0; dfl=0; rm=0
+for a in "$@"; do
+  case "$a" in -R) rec=1 ;; -d) dfl=1 ;; -x) rm=1 ;; esac
+done
+[ -n "${BREAK_STATE:-}" ] && chmod g+w "$BREAK_STATE"
+if [ "$rec" = 1 ] && [ -n "${SWAP_AT:-}" ] && [ ! -e "$STUB_STATE/swapped" ]; then
+  touch "$STUB_STATE/swapped"
+  /bin/mv "$SWAP_AT" "$SWAP_AT.moved" && ln -s "$SWAP_TO" "$SWAP_AT"
+fi
+if [ "$rec" = 1 ]; then
+  [ "${SETFACL_NOOP:-}" = 1 ] && exit 0
+  [ "${SETFACL_NOOP_DEFAULT:-}" = 1 ] && [ "$dfl" = 1 ] && exit 0
+  [ "${SETFACL_NOOP_ACCESS:-}" = 1 ] && [ "$dfl" = 0 ] && exit 0
+  [ "${SETFACL_FAIL:-}" = 1 ] && { echo "setfacl: simulated failure" >&2; exit 1; }
+  [ "${SETFACL_FAIL_DEFAULT:-}" = 1 ] && [ "$dfl" = 1 ] && { echo "setfacl: simulated failure" >&2; exit 1; }
+fi
+if [ "$rec" = 0 ] && [ "$rm" = 0 ] && [ "${SETFACL_FAIL_ANCESTOR:-}" = 1 ]; then
+  case "$*" in *g:agent-grantee:--x*) echo "setfacl: simulated failure" >&2; exit 1 ;; esac
+fi
+args=(); for a in "$@"; do args+=("${a//agent-grantee/0}"); done
+want=0
+case "${SETFACL_PARTIAL:-}" in
+  1) want=1 ;;
+  access) [ "$dfl" = 0 ] && want=1 ;;
+  default) [ "$dfl" = 1 ] && want=1 ;;
+esac
+if [ "$want" = 1 ] && [ "$rec" = 1 ] && [ "$rm" = 1 ]; then
+  /usr/bin/setfacl "${args[@]}"
+  echo "setfacl: $last/blocked: Permission denied" >&2
+  exit 1
+fi
+exec /usr/bin/setfacl "${args[@]}"
+"""
+
+STUB_GETFACL_SH = """#!/bin/bash
+/usr/bin/getfacl "$@" | sed -e 's/group:root:/group:agent-grantee:/'
+exit ${PIPESTATUS[0]}
+"""
+
+STUB_AT = """#!/bin/bash
+body="$(cat)"
+echo "at $*" >> "$STUB_STATE/at.calls"
+echo "setfacl_calls_before=$([ -f "$STUB_STATE/setfacl.log" ] && wc -l < "$STUB_STATE/setfacl.log" || echo 0)" >> "$STUB_STATE/at.calls"
+if [ "${AT_MODE:-accept}" = reject ]; then
+  echo "syntax error. Last token seen: h" >&2
+  echo "Garbled time" >&2
+  exit 1
+fi
+echo "$body" >> "$STUB_STATE/at.queue"
+echo "warning: commands will be executed using /bin/sh" >&2
+echo "job 7 at Thu Jan  1 00:00:00 2026" >&2
+exit 0
+"""
+
+STUB_ATRM = """#!/bin/bash
+echo "atrm $*" >> "$STUB_STATE/atrm.log"
+[ "${ATRM_FAIL:-}" = 1 ] && exit 1
+exit 0
+"""
+
+STUB_SYSTEMCTL = """#!/bin/bash
+echo "systemctl $*" >> "$STUB_STATE/systemctl.calls"
+[ "${ATD_MODE:-active}" = inactive ] && exit 3
+exit 0
+"""
+
+STUB_READLINK = """#!/bin/bash
+[ "${READLINK_FAIL:-}" = 1 ] && exit 1
+[ -n "${READLINK_SLASH:-}" ] && [ "$1" = -f ] && { echo "${2}/"; exit 0; }
+exec /usr/bin/readlink "$@"
+"""
+
+SHARE_WRAPPER = 'bash "$AGENTCTL_COPY" "$@"\n'
+
+
+class ShareBench(Bench):
+    def __init__(self, root):
+        super().__init__(root)
+        self.tool = self.stub / "agentctl-fixed"       # the fixed install path, rewritten into the copy
+        self.tool.write_text("#!/bin/bash\nexit 0\n")
+        self.tool.chmod(0o755)
+        self.copy.write_text(_rewrite_literals(AGENTCTL.read_text(), self.shared, self.state,
+                                               tool=self.tool))
+        for name, body in (("id", STUB_ID_SHARE), ("setfacl", STUB_SETFACL_SH),
+                           ("getfacl", STUB_GETFACL_SH), ("at", STUB_AT), ("atrm", STUB_ATRM),
+                           ("readlink", STUB_READLINK), ("systemctl", STUB_SYSTEMCTL)):
+            (self.bin / name).write_text(body)
+            (self.bin / name).chmod(0o755)
+        self.data = root / "data"
+        self.data.mkdir()
+        self.data.chmod(0o755)
+        self.good_state()
+
+    def tree(self, name):
+        d = self.data / name
+        d.mkdir()
+        d.chmod(0o755)
+        (d / "child").write_text("c")
+        (d / "sub").mkdir()
+        (d / "sub" / "leaf").write_text("l")
+        return d
+
+    def verb(self, *args, **env):
+        env.setdefault("BENCH_ROOT", self.root)
+        return self.run(SHARE_WRAPPER, *args, **env)
+
+    def no_at_path(self):
+        """A PATH holding every real tool and every stub EXCEPT at/atrm: `command -v at`
+        must fail while the rest of the verb still runs."""
+        return self.path_without("at", "atq", "atrm", "batch", dirname="noat-bin")
+
+    def path_without(self, *names, dirname="without-bin"):
+        """A PATH holding every real tool and every stub except the named ones."""
+        d = self.root / dirname
+        d.mkdir()
+        skip = set(names)
+        for src in (self.bin, Path("/usr/bin"), Path("/bin")):
+            for f in src.iterdir():
+                if f.name in skip or (d / f.name).exists():
+                    continue
+                (d / f.name).symlink_to(f.resolve() if src != self.bin else f)
+        return str(d)
+
+
+def _second_sh(bench):
+    d = bench.root / "second"
+    d.mkdir()
+    d.chmod(0o755)
+    return ShareBench(d)
+
+
+@pytest.fixture
+def sb(scratch):
+    return ShareBench(scratch)
+
+
+def _named(path):
+    """Every NAMED group entry of <path> itself (access and default), read by the real
+    getfacl from outside the namespace: what the grantee's gid actually holds there."""
+    r = subprocess.run(["/usr/bin/getfacl", "-p", "--", str(path)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return [l.split("\t")[0] for l in r.stdout.splitlines()
+            if re.match(r"^(default:)?group:[^:]+:", l)]
+
+
+def _acl_text(path):
+    r = subprocess.run(["/usr/bin/getfacl", "-p", "--", str(path)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def _acl_set(args, path):
+    """Plant an ACL fact as the (unprivileged) owner, outside the namespace."""
+    r = subprocess.run(["/usr/bin/setfacl", *args, "--", str(path)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def _access(entries):
+    return [e for e in entries if e.startswith("group:")]
+
+
+def _default(entries):
+    return [e for e in entries if e.startswith("default:group:")]
+
+
+def _record(bench):
+    return bench.state / "share-state" / "grantee.json"
+
+
+@needs_stat
+@needs_userns
+@needs_acl
+class TestShareVerb:
+    # ---- F1: -P with a read-back (leaf closed; a swapped MIDDLE component stays open) ----
+    def test_F1_a_real_directory_takes_the_acl_and_a_link_swapped_in_leaves_the_target_clean(self, sb):
+        d = sb.tree("real")
+        r = sb.verb("share", "grantee", d)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "Shared" in r.stdout
+        # control: the real directory, its children and its default entry all took it
+        for p in (d, d / "child", d / "sub", d / "sub" / "leaf"):
+            assert _access(_named(p)), p
+        assert _default(_named(d)) and _default(_named(d / "sub"))
+        assert _record(sb).exists()
+
+        b2 = _second_sh(sb)
+        d2 = b2.tree("real")
+        t = b2.tree("target")
+        r2 = b2.verb("share", "grantee", d2, SWAP_AT=d2, SWAP_TO=t)
+        assert r2.returncode != 0, r2.stdout + r2.stderr
+        assert str(d2) in r2.stderr and "Shared" not in r2.stdout
+        for p in (t, t / "child", t / "sub", t / "sub" / "leaf"):
+            assert _named(p) == [], (p, _named(p))      # the target's own entries, access
+        assert _default(_named(t)) == [] and _default(_named(t / "sub")) == []
+        assert not _record(b2).exists()
+        assert not (b2.state / "share-log").exists()
+
+    def test_F1_a_setfacl_that_exits_0_and_applied_nothing_is_refused_by_the_read_back(self, sb):
+        d = sb.tree("a")
+        r = sb.verb("share", "grantee", d, SETFACL_NOOP="1")
+        assert r.returncode != 0 and str(d) in r.stderr, r.stdout + r.stderr
+        assert "Shared" not in r.stdout
+        assert not _record(sb).exists() and not (sb.state / "share-log").exists()
+        # the default entry has its own read-back: the access entry lands, the default does not
+        b2 = _second_sh(sb)
+        d2 = b2.tree("a")
+        r2 = b2.verb("share", "grantee", d2, SETFACL_NOOP_DEFAULT="1")
+        assert r2.returncode != 0 and str(d2) in r2.stderr and "default" in r2.stderr.lower(), r2.stderr
+        assert "Shared" not in r2.stdout
+        assert not _record(b2).exists() and not (b2.state / "share-log").exists()
+        # and the access entry has its own: the default lands, the access entry does not
+        b4 = ShareBench(_mk_root(b2, "four"))
+        d4 = b4.tree("a")
+        r4 = b4.verb("share", "grantee", d4, SETFACL_NOOP_ACCESS="1")
+        assert r4.returncode != 0 and str(d4) in r4.stderr and "does not carry g:" in r4.stderr, r4.stderr
+        assert "Shared" not in r4.stdout
+        assert not _record(b4).exists() and not (b4.state / "share-log").exists()
+        # control: neither stand-in, the same verb shares
+        b3 = _second_sh(b2)
+        assert b3.verb("share", "grantee", b3.tree("a")).returncode == 0
+
+    def test_F1b_a_path_ending_in_a_slash_is_refused_and_the_targets_entry_stays_clean(self, sb):
+        # setfacl 2.3.2 -R -P on a LINK WITH A TRAILING SLASH puts the entry on the target
+        # (measured by the filer). readlink -f never prints one, so a stand-in does.
+        t = sb.tree("target")
+        link = sb.data / "link"
+        link.symlink_to(t)
+        r = sb.verb("share", "grantee", link, READLINK_SLASH="1")
+        assert r.returncode != 0, r.stdout + r.stderr
+        assert "Shared" not in r.stdout and "trailing slash" in r.stderr.lower()
+        assert _named(t) == [] and _named(t / "child") == [], "the entry went through link/"
+        assert not _record(sb).exists()
+        # control: without the stand-in the same link is resolved to the target and shared
+        b2 = _second_sh(sb)
+        t2 = b2.tree("target")
+        link2 = b2.data / "link"
+        link2.symlink_to(t2)
+        r2 = b2.verb("share", "grantee", link2)
+        assert r2.returncode == 0, r2.stderr
+        assert _access(_named(t2))
+
+    # ---- F8: a share with --ttl has a scheduled removal or does not happen ----
+    def test_F8_an_accepted_time_queues_a_job_for_the_fixed_tool_before_the_grant(self, sb):
+        d = sb.tree("a")
+        r = sb.verb("share", "grantee", d, "--ttl", "2hours")
+        assert r.returncode == 0, r.stdout + r.stderr
+        queue = sb.read("at.queue").strip().splitlines()
+        assert queue == [f"'{sb.tool}' unshare 'grantee' '{d}'"], queue     # the fixed path, never $0
+        assert str(sb.copy) not in sb.read("at.queue")
+        assert "now + 2hours" in sb.read("at.calls")
+        assert "scheduled" in r.stdout
+        import json
+        assert json.loads(_record(sb).read_text())[0]["ttl"] == "2hours"
+        assert "ttl=2hours" in (sb.state / "share-log").read_text()
+        # the job was queued BEFORE the first ACL change of any kind
+        assert "setfacl_calls_before=0" in sb.read("at.calls")
+        assert sb.read("setfacl.log")
+        # control: no --ttl, no at call, ttl recorded as none
+        b2 = _second_sh(sb)
+        r2 = b2.verb("share", "grantee", b2.tree("a"))
+        assert r2.returncode == 0 and b2.read("at.calls") == ""
+        assert json.loads(_record(b2).read_text())[0]["ttl"] is None
+
+    def test_F8_a_rejected_time_is_a_loud_refusal_and_nothing_is_granted_or_logged(self, sb):
+        # control in the same cell: an accepted time on a sibling bench grants and logs
+        ok = sb.verb("share", "grantee", sb.tree("ok"), "--ttl", "2hours")
+        assert ok.returncode == 0 and _record(sb).exists()
+        b2 = _second_sh(sb)
+        d = b2.tree("a")
+        r = b2.verb("share", "grantee", d, "--ttl", "2hours", AT_MODE="reject")
+        assert r.returncode != 0, r.stdout + r.stderr
+        assert "Garbled time" in r.stderr              # at's own error is shown, not discarded
+        assert "hours" in r.stderr and "days" in r.stderr   # the accepted forms are named
+        assert "Shared" not in r.stdout and "scheduled" not in r.stdout
+        assert _named(d) == [] and _named(d.parent) == []
+        assert b2.read("setfacl.log") == "", "an ACL call ran before the job was queued"
+        assert not _record(b2).exists() and not (b2.state / "share-log").exists()
+        assert b2.read("at.queue") == ""
+
+    def test_F8_a_missing_at_is_a_loud_refusal_naming_the_forms_and_nothing_is_granted(self, sb):
+        d = sb.tree("a")
+        r = sb.verb("share", "grantee", d, "--ttl", "2hours", PATH=sb.no_at_path())
+        assert r.returncode != 0, r.stdout + r.stderr
+        assert "'at'" in r.stderr and "hours" in r.stderr and "days" in r.stderr, r.stderr
+        assert "Shared" not in r.stdout
+        assert _named(d) == [] and sb.read("setfacl.log") == ""
+        assert not _record(sb).exists() and not (sb.state / "share-log").exists()
+        # control: the same PATH without --ttl needs no at and shares
+        b2 = _second_sh(sb)
+        assert b2.verb("share", "grantee", b2.tree("a"), PATH=b2.no_at_path()).returncode == 0
+
+    def test_F8_a_grant_that_fails_after_the_job_was_queued_removes_the_job_or_says_it_remains(self, sb):
+        d = sb.tree("a")
+        r = sb.verb("share", "grantee", d, "--ttl", "2hours", SETFACL_FAIL="1")
+        assert r.returncode != 0, r.stdout + r.stderr
+        assert "atrm 7" in sb.read("atrm.log")                  # the job was removed
+        assert not _record(sb).exists() and not (sb.state / "share-log").exists()
+        b2 = _second_sh(sb)
+        r2 = b2.verb("share", "grantee", b2.tree("a"), "--ttl", "2hours", SETFACL_FAIL="1", ATRM_FAIL="1")
+        assert r2.returncode != 0
+        assert re.search(r"job 7.*remain", r2.stderr, re.S), r2.stderr   # it says the job remains
+        assert not _record(b2).exists()
+
+    def test_F8_a_ttl_share_whose_read_back_refuses_does_not_leave_a_queued_job_unmentioned(self, sb):
+        d = sb.tree("a")
+        r = sb.verb("share", "grantee", d, "--ttl", "2hours", SETFACL_NOOP="1")
+        assert r.returncode != 0
+        assert "atrm 7" in sb.read("atrm.log")
+        assert not _record(sb).exists()
+
+    # ---- H1 (#4410 review B1): the at job line is POSIX single-quoted, never printf %q ----
+    # dash has no $'...': a %q word holding a control character and an apostrophe is read as
+    # `$` plus a plain quoted string, and the text after \' runs as code (as root, from at).
+    PLANTED_NAMES = ["\t'; touch MARK; #", "it's", "q'; touch MARK; #",
+                     "nl\n'; touch MARK; #", "$(touch MARK)"]
+
+    @staticmethod
+    def _run_job(shell, job, cwd, rec):
+        env = dict(os.environ, REC=str(rec))
+        return subprocess.run([shell, "-c", job], cwd=cwd, env=env, capture_output=True,
+                              text=True, timeout=60)
+
+    @pytest.mark.parametrize("idx", range(5))
+    def test_H1_the_generated_at_job_runs_a_planted_name_as_data_under_every_sh(self, sb, scratch, idx):
+        name = self.PLANTED_NAMES[idx]
+        d = sb.data / name
+        d.mkdir()
+        d.chmod(0o755)
+        # the recording stub stands in for the fixed tool path the job runs
+        sb.tool.write_text('#!/bin/sh\nprintf \'%s\\0\' "$@" > "$REC"\n')
+        sb.tool.chmod(0o755)
+        r = sb.verb("share", "grantee", d, "--ttl", "2hours")
+        assert r.returncode == 0, r.stdout + r.stderr
+        job = sb.read("at.queue")
+        assert job.strip(), "the fake at received no job text"
+        shells = ["/bin/sh"]
+        if shutil.which("dash"):
+            shells.append("dash")          # by name, in addition to whatever /bin/sh is
+        else:
+            import warnings
+            warnings.warn("dash not found: %q positive control NOT exercised on this host; "
+                          "a green run here is not evidence the injection was refused")
+        for shell in shells:
+            work = Path(tempfile.mkdtemp(dir=scratch))
+            rec = work / "rec"
+            res = self._run_job(shell, job, work, rec)
+            assert res.returncode == 0, (shell, repr(name), res.stdout + res.stderr)
+            assert not (work / "MARK").exists(), (shell, repr(name), "the name ran as code")
+            got = rec.read_bytes().split(b"\0")[:-1]
+            assert got == [b"unshare", b"grantee", os.fsencode(os.path.realpath(d))], (shell, got)
+
+    @pytest.mark.skipif(shutil.which("dash") is None, reason="dash not found: %q positive control NOT exercised on this host")
+    def test_H1_control_the_same_line_built_with_percent_q_does_create_the_marker_under_dash(self, sb, scratch):
+        name = self.PLANTED_NAMES[0]
+        work = Path(tempfile.mkdtemp(dir=scratch))
+        stub = work / "tool"
+        stub.write_text('#!/bin/sh\nexit 0\n')
+        stub.chmod(0o755)
+        job = subprocess.run(["bash", "-c", 'printf "%q %q %q %q\\n" "$1" unshare agent-x "$2"', "x", str(stub), name],
+                             capture_output=True, text=True, check=True).stdout
+        self._run_job("dash", job, work, work / "rec")
+        assert (work / "MARK").exists(), "the %q control did not reproduce the injection on this dash"
+
+    # ---- F3/G1: exit 8 for "the action happened, the log write failed"; a failed gate stays 1 ----
+    def test_F3_share_and_unshare_exit_3_when_the_log_write_fails_and_1_at_the_gate(self, sb):
+        d = sb.tree("a")
+        r = sb.verb("share", "grantee", d, BREAK_STATE=sb.state)
+        assert r.returncode == 8, r.stdout + r.stderr
+        assert "share happened but could not be logged" in r.stderr
+        assert "exit code 8" in r.stderr.lower()
+        assert _access(_named(d)), "the action did happen"
+        assert "Shared" not in r.stdout
+        # unshare: share cleanly first, then break the state directory
+        b2 = _second_sh(sb)
+        d2 = b2.tree("a")
+        assert b2.verb("share", "grantee", d2).returncode == 0
+        r2 = b2.verb("unshare", "grantee", d2, BREAK_STATE=b2.state)
+        assert r2.returncode == 8, r2.stdout + r2.stderr
+        assert "unshare happened but could not be logged" in r2.stderr
+        assert _named(d2) == [], "the removal did happen"
+        # a failed gate stays exit 1, whichever verb
+        for verb in ("share", "unshare"):
+            b3 = _second_sh(b2) if verb == "share" else ShareBench(_mk(b2, "g2"))
+            b3.state.chmod(0o775)
+            r3 = b3.verb(verb, "grantee", b3.tree("a"))
+            assert r3.returncode == 1, (verb, r3.stdout + r3.stderr)
+
+    def test_F3_agentctl_help_states_the_exit_code_near_the_verbs(self, sb):
+        r = sb.verb("help")
+        assert r.returncode == 0
+        low = r.stdout.lower()
+        i = low.index("exit 8")
+        assert i > low.index("finalize-name <newborn-id>"), "exit 8 must follow the verb list"
+        window = low[max(0, i - 300):i + 500]
+        assert "log" in window and "spawn" in window and "finalize-name" in window
+        assert "share" in window and "unshare" in window
+
+    # ---- F5: share-status names the old location ----
+    def test_F5_share_status_names_the_old_records_as_where_to_look(self, sb):
+        r = sb.verb("share-status")
+        assert r.returncode == 0, r.stderr
+        assert f"{sb.shared}/share-state/<agent>.json" in r.stdout
+        assert "may still be in force" in r.stdout
+
+    # ---- unshare ----
+    def _shared(self, sb, name="a"):
+        d = sb.tree(name)
+        assert sb.verb("share", "grantee", d).returncode == 0
+        return d
+
+    def test_F1_unshare_a_link_swapped_in_leaves_the_targets_entries_and_is_refused(self, sb):
+        d = self._shared(sb, "real")
+        r = sb.verb("unshare", "grantee", d)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "Unshared" in r.stdout
+        for p in (d, d / "child", d / "sub", d / "sub" / "leaf"):      # control: the real one is cleaned
+            assert _named(p) == [], (p, _named(p))
+        b2 = _second_sh(sb)
+        d2 = self._shared(b2, "real")
+        t = self._shared(b2, "target")
+        before = {p: _named(p) for p in (t, t / "child", t / "sub")}
+        assert _access(before[t]) and _default(before[t])
+        r2 = b2.verb("unshare", "grantee", d2, SWAP_AT=d2, SWAP_TO=t)
+        assert r2.returncode != 0, r2.stdout + r2.stderr
+        assert "Unshared" not in r2.stdout and str(d2) in r2.stderr
+        for p, e in before.items():
+            assert _named(p) == e, (p, _named(p))        # the target's own entries, access and default
+        assert _record(b2).exists()
+
+    def test_F1_unshare_read_back_refuses_when_the_entry_is_still_there(self, sb):
+        d = self._shared(sb)
+        r = sb.verb("unshare", "grantee", d, SETFACL_NOOP="1")
+        assert r.returncode != 0 and str(d) in r.stderr, r.stdout + r.stderr
+        assert "Unshared" not in r.stdout
+        import json
+        assert json.loads(_record(sb).read_text()), "the record must stay while the entry does"
+        b2 = _second_sh(sb)
+        d2 = self._shared(b2)
+        r2 = b2.verb("unshare", "grantee", d2, SETFACL_NOOP_DEFAULT="1")
+        assert r2.returncode != 0 and "default" in r2.stderr.lower(), r2.stderr
+        assert "Unshared" not in r2.stdout
+        b3 = _second_sh(b2)
+        d3 = self._shared(b3)
+        r3 = b3.verb("unshare", "grantee", d3, SETFACL_NOOP_ACCESS="1")
+        assert r3.returncode != 0 and "still carries g:" in r3.stderr and str(d3) in r3.stderr, r3.stderr
+        assert "Unshared" not in r3.stdout
+
+    def test_F1b_unshare_a_raw_path_ending_in_a_slash_never_removes_through_the_link(self, sb):
+        t = self._shared(sb, "target")
+        link = sb.data / "link"
+        link.symlink_to(t)
+        before = _named(t)
+        assert _access(before)
+        # readlink failing is the branch that keeps the operator's raw path
+        r = sb.verb("unshare", "grantee", f"{link}/", READLINK_FAIL="1")
+        assert r.returncode != 0, r.stdout + r.stderr
+        assert "Unshared" not in r.stdout
+        assert _named(t) == before and _named(t / "child") != [], "the entry was removed through link/"
+
+    def test_F2_an_old_share_record_skips_the_ancestor_clean_up_and_warns_both_ways(self, sb):
+        for kind in ("file", "dangling-link"):
+            b = _second_sh(sb) if kind == "dangling-link" else sb
+            d = self._shared(b)
+            assert _access(_named(b.data)), "the share put a traversal entry on the ancestor"
+            old = b.shared / "share-state"
+            old.mkdir()
+            if kind == "file":
+                (old / "grantee.json").write_text("{not json at all")    # nothing is read from it
+            else:
+                os.symlink(b.root / "nowhere", old / "grantee.json")
+            r = b.verb("unshare", "grantee", d)
+            assert r.returncode == 0, (kind, r.stdout + r.stderr)
+            assert _named(d) == [], "the target's own ACL is still removed"
+            assert _access(_named(b.data)), (kind, "the ancestor entry was cleaned despite the old record")
+            assert "WARN" in r.stderr and "getfacl" in r.stderr and "older shares" in r.stderr, r.stderr
+            assert "Unshared" in r.stdout
+        # control: no old record, the ancestor entry is cleaned and there is no warning
+        b3 = ShareBench(_mk_root(sb, "ctl"))
+        d3 = self._shared(b3)
+        r3 = b3.verb("unshare", "grantee", d3)
+        assert r3.returncode == 0
+        assert _named(b3.data) == [] and "older shares" not in r3.stderr
+
+    # ---- F9: removal keeps the mask; a partial removal is loud ----
+    @pytest.mark.parametrize("which", ["access", "default", "ancestor"])
+    def test_F9_a_removal_never_recalculates_the_mask(self, sb, which):
+        d = self._shared(sb)
+        if which == "access":
+            f = d / "child"
+            f.chmod(0o600)                               # the mask becomes ---
+            probe, key = f, "mask::"
+        elif which == "default":
+            _acl_set(["-d", "-m", "m::---"], d)
+            probe, key = d, "default:mask::"
+        else:
+            _acl_set(["-m", "m::---"], sb.data)
+            probe, key = sb.data, "mask::"
+        def mask(p):
+            return [l for l in _acl_text(p).splitlines() if l.startswith(key)]
+        before = mask(probe)
+        assert before == [key + "---"], before          # the planted narrow mask
+        mode0 = os.stat(probe).st_mode
+        r = sb.verb("unshare", "grantee", d)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert mask(probe) == before, (which, mask(probe))
+        assert os.stat(probe).st_mode == mode0, (which, oct(os.stat(probe).st_mode))
+        if which == "ancestor":
+            assert _access(_named(sb.data)) == [], "the clean-up of this ancestor did run"
+
+    @pytest.mark.parametrize("which", ["1", "access", "default"])
+    def test_F9_a_partial_removal_is_non_zero_named_and_never_says_unshared(self, sb, which):
+        # "access" / "default": only that one of the two recursive removals fails, so a
+        # swallowed exit status on either call has its own observable
+        d = self._shared(sb)
+        r = sb.verb("unshare", "grantee", d, SETFACL_PARTIAL=which)
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "Unshared" not in r.stdout
+        assert "partial" in r.stderr.lower() and str(d) in r.stderr
+        assert "blocked" in r.stderr, "setfacl's own message is passed through"
+        import json
+        assert json.loads(_record(sb).read_text()), "a half-removed share keeps its record"
+        assert "unshare-partial" in (sb.state / "share-log").read_text()
+        # control: the same verb without the stand-in is a clean unshare
+        b2 = _second_sh(sb)
+        d2 = self._shared(b2)
+        assert b2.verb("unshare", "grantee", d2).returncode == 0
+
+    # ---- Round 2 ----
+    # G3: every _ttl_job_undo call site has a behaviour cell of its own. Each case fails the
+    # grant at ONE place after the job was queued; the cell reddens if THAT call is removed.
+    @pytest.mark.parametrize("site,env,says", [
+        ("ancestor --x", {"SETFACL_FAIL_ANCESTOR": "1"}, "setfacl --x failed"),
+        ("access setfacl", {"SETFACL_FAIL": "1"}, "failed on"),
+        ("default setfacl", {"SETFACL_FAIL_DEFAULT": "1"}, "default ACL setfacl failed"),
+        ("access read-back", {"SETFACL_NOOP_ACCESS": "1"}, "does not carry g:"),
+        ("default read-back", {"SETFACL_NOOP_DEFAULT": "1"}, "no default entry"),
+    ])
+    def test_G3_every_undo_site_takes_the_queued_job_back_out(self, sb, site, env, says):
+        d = sb.tree("a")
+        r = sb.verb("share", "grantee", d, "--ttl", "2hours", **env)
+        assert r.returncode != 0 and says in r.stderr, (site, r.stdout + r.stderr)
+        assert "Shared" not in r.stdout
+        assert "atrm 7" in sb.read("atrm.log"), (site, "the queued job was not taken back out")
+        assert "was removed" in r.stderr
+        assert not _record(sb).exists() and not (sb.state / "share-log").exists()
+        # the other branch of the undo, at the same site: atrm fails, the job is said to remain
+        b2 = _second_sh(sb)
+        r2 = b2.verb("share", "grantee", b2.tree("a"), "--ttl", "2hours", ATRM_FAIL="1", **env)
+        assert r2.returncode != 0 and re.search(r"job 7.*remains", r2.stderr, re.S), (site, r2.stderr)
+        # control: with none of the failures the same share is complete and no job is removed
+        b3 = _second_sh(b2)
+        assert b3.verb("share", "grantee", b3.tree("a"), "--ttl", "2hours").returncode == 0
+        assert b3.read("atrm.log") == ""
+
+    # G4b: a closed grammar for --ttl, before at is called
+    @pytest.mark.parametrize("ttl", ["0minutes", "00hours", "2h", "2 hours", "-1days", "1hour+1day",
+                                     "2hours; touch x", "2hours\nnow", "now", "2HOURS", "1.5hours", ""])
+    def test_G4b_a_ttl_outside_the_grammar_is_refused_before_at_is_called(self, sb, ttl):
+        ok = sb.verb("share", "grantee", sb.tree("ok"), "--ttl", "2hours")      # control, same cell
+        assert ok.returncode == 0 and "now + 2hours" in sb.read("at.calls")
+        b2 = _second_sh(sb)
+        d = b2.tree("a")
+        r = b2.verb("share", "grantee", d, "--ttl", ttl)
+        assert r.returncode != 0, (repr(ttl), r.stdout + r.stderr)
+        assert b2.read("at.calls") == "", (repr(ttl), "at was called with a ttl outside the grammar")
+        assert "hours" in r.stderr and "days" in r.stderr and "weeks" in r.stderr, r.stderr
+        assert "Shared" not in r.stdout and _named(d) == [] and b2.read("setfacl.log") == ""
+        assert not _record(b2).exists() and not (b2.state / "share-log").exists()
+
+    @pytest.mark.parametrize("ttl", ["1minute", "30minutes", "2hours", "1hour", "3days", "1week", "2weeks"])
+    def test_G4b_every_form_of_the_grammar_reaches_at_verbatim(self, sb, ttl):
+        r = sb.verb("share", "grantee", sb.tree("a"), "--ttl", ttl)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert f"now + {ttl}" in sb.read("at.calls")
+
+    def test_G4b_an_atd_that_is_not_active_refuses_the_ttl_share_and_grants_nothing(self, sb):
+        ok = sb.verb("share", "grantee", sb.tree("ok"), "--ttl", "2hours")      # control: active
+        assert ok.returncode == 0 and "is-active" in sb.read("systemctl.calls")
+        assert "atd" in sb.read("systemctl.calls")
+        b2 = _second_sh(sb)
+        d = b2.tree("a")
+        r = b2.verb("share", "grantee", d, "--ttl", "2hours", ATD_MODE="inactive")
+        assert r.returncode != 0 and "atd" in r.stderr, r.stdout + r.stderr
+        assert b2.read("at.calls") == "" and b2.read("setfacl.log") == ""
+        assert "Shared" not in r.stdout and _named(d) == []
+        assert not _record(b2).exists() and not (b2.state / "share-log").exists()
+        # no --ttl: atd is not consulted and the share goes through
+        b3 = _second_sh(b2)
+        r3 = b3.verb("share", "grantee", b3.tree("a"), ATD_MODE="inactive")
+        assert r3.returncode == 0 and b3.read("systemctl.calls") == ""
+        # no systemctl on the host: the check is skipped, at is still the arbiter
+        b4 = _second_sh(b3)
+        r4 = b4.verb("share", "grantee", b4.tree("a"), "--ttl", "2hours",
+                     PATH=b4.path_without("systemctl"), ATD_MODE="inactive")
+        assert r4.returncode == 0, r4.stdout + r4.stderr
+        assert "now + 2hours" in b4.read("at.calls") and b4.read("systemctl.calls") == ""
+
+    # G2: unshare's state-record rewrite after the removal
+    @pytest.mark.parametrize("record", ["{not json", '[{"mode": "rw"}]'])
+    def test_G2_a_state_record_that_cannot_be_rewritten_exits_8_and_says_the_removal_happened(self, sb, record):
+        d = self._shared(sb)
+        _record(sb).write_text(record)           # first rewrite breaks, or (second param) the read of REMAINING
+        r = sb.verb("unshare", "grantee", d)
+        assert r.returncode == 8, r.stdout + r.stderr
+        assert _named(d) == [], "the removal did happen"
+        assert "removal" in r.stderr and "happened" in r.stderr and "8" in r.stderr, r.stderr
+        assert "Unshared" not in r.stdout
+        # control: a well-formed record unshares and exits 0
+        b2 = _second_sh(sb)
+        d2 = self._shared(b2)
+        r2 = b2.verb("unshare", "grantee", d2)
+        assert r2.returncode == 0 and "Unshared" in r2.stdout
+
+    # G1: a refusal before the action is never the unlogged-action code
+    def test_G1_a_refusal_before_the_action_is_not_exit_8(self, sb):
+        r = sb.verb("share", "grantee", sb.tree("a"), "--mode", "bogus")
+        assert r.returncode == 2
+        r2 = sb.verb("share", "grantee", sb.data / "no-such-dir")
+        assert r2.returncode == 1
+        r3 = sb.verb("spawn", VIZ_OPERATOR="")
+        assert r3.returncode not in (0, 8), r3.stdout + r3.stderr
+        assert "happened" not in r3.stderr
+
+    # G5b: a link at $path after the removals is a refusal, with a positive control
+    def test_G5b_unshare_refuses_a_link_at_the_path_even_when_its_target_has_no_entry(self, sb):
+        d = self._shared(sb, "real")
+        bare = sb.tree("bare")                       # a target that never had the entry
+        assert _named(bare) == []
+        r = sb.verb("unshare", "grantee", d, SWAP_AT=d, SWAP_TO=bare)
+        assert r.returncode != 0, r.stdout + r.stderr
+        assert "Unshared" not in r.stdout and str(d) in r.stderr and "symbolic link" in r.stderr
+        assert _record(sb).exists() and json_len(_record(sb)) == 1, "the record must stay"
+        assert _named(bare) == [] and _named(bare / "child") == []
+        # control: no swap, the same verb unshares and drops the record
+        b2 = _second_sh(sb)
+        d2 = self._shared(b2, "real")
+        r2 = b2.verb("unshare", "grantee", d2)
+        assert r2.returncode == 0 and "Unshared" in r2.stdout
+        assert json_len(_record(b2)) == 0
+
+
+def json_len(path):
+    import json
+    return len(json.loads(path.read_text()))
+
+
+def _mk_root(bench, name):
+    d = bench.root / name
+    d.mkdir()
+    d.chmod(0o755)
+    return d
+
+
+def _mk(bench, name):
+    return _mk_root(bench, name)
 
 
 # --------------------------------------------------------------------------

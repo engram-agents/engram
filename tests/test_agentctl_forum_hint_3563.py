@@ -187,20 +187,33 @@ def _region():
     return text[a:b] + "\n"
 
 
+SUDO_SHIM = (
+    'sudo() { [ "$1" = -u ] || return 99; printf "%s\\n" "$2 $3" >> "$SUDO_LOG"; '
+    'local u="$2"; shift 2; "$@"; }'
+)
+
+
 def _write_hint(home, url=URL, user=ME, group=MYGROUP, umask=None, pre=""):
     """Source the extracted region in a temp script (same shell options as
     agentctl) and call _write_forum_hint. ``pre`` is bash run AFTER the region
-    is defined and BEFORE the call (used to shadow ``ln`` or ``chown``)."""
+    is defined and BEFORE the call (used to shadow ``ln`` or ``chown``). ``sudo`` is
+    shadowed by SUDO_SHIM, which logs ``<user> <command>`` to <home's parent>/sudo.log:
+    the writer does every write as the newborn, and a non-root caller has no sudo."""
     script = ["set -euo pipefail"]
     if umask is not None:
         script.append(f"umask {umask}")
-    script += [_region(), pre, '_write_forum_hint "$@"']
+    script += [_region(), SUDO_SHIM, pre, '_write_forum_hint "$@"']
     d = Path(home).parent
     f = d / "writer-under-test.sh"
     f.write_text("\n".join(script) + "\n")
+    env = _hermetic_env(SUDO_LOG=str(d / "sudo.log"))
     return subprocess.run(["bash", str(f), str(home), user, group, url],
-                          capture_output=True, text=True, timeout=60,
-                          env=_hermetic_env())
+                          capture_output=True, text=True, timeout=60, env=env)
+
+
+def _sudo_log(home):
+    p = Path(home).parent / "sudo.log"
+    return p.read_text().splitlines() if p.exists() else []
 
 
 def _entries(d):
@@ -313,12 +326,28 @@ class TestDWriter:
         assert _entries(hint.parent) == [], "no file and no temp name may be left"
 
     @needs_gnu_stat
-    def test_unresolvable_group_publishes_nothing(self, tmp_path):
+    def test_the_group_argument_no_longer_decides_anything(self, tmp_path):
+        # The writer used to chown the file to <user>:<group> as root. Every write is the
+        # newborn's now, so the file carries the newborn's own primary group and an
+        # unresolvable group name cannot matter (and cannot half-own a file).
         home, hint = _tree(tmp_path)
         r = _write_hint(home, group="no-such-group-xyz")
-        assert r.returncode != 0
-        assert "WARN" in r.stderr
-        assert _entries(hint.parent) == [], "a half-owned file must never be published"
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert hint.read_bytes() == (URL + "\n").encode()
+        assert hint.lstat().st_gid == os.getgid()
+        assert _entries(hint.parent) == ["forum-url.hint"]
+
+    @needs_gnu_stat
+    def test_every_write_runs_as_the_newborn_and_none_as_root(self, tmp_path):
+        home, hint = _tree(tmp_path)
+        r = _write_hint(home)
+        assert r.returncode == 0, r.stdout + r.stderr
+        log = _sudo_log(home)
+        # mktemp, tee, chmod, ln, rm: each one as <user>, and nothing else
+        cmds = [l.split(None, 2)[1] if len(l.split()) > 1 else "" for l in log]
+        assert [c for c in cmds if c in ("mktemp", "tee", "chmod", "ln", "rm")] == \
+            ["mktemp", "tee", "chmod", "ln", "rm"], log
+        assert all(l.split()[0] == ME for l in log), log
 
     @needs_gnu_stat
     def test_target_created_between_check_and_publish_survives(self, tmp_path):
@@ -426,6 +455,16 @@ echo "chown $*" >> "$STUB_STATE/chown.log"
 exit 0
 """
 
+# sudo -u <user> cmd...: a one-uid sandbox cannot switch identity, so the stub logs the
+# call and runs the command as the namespace's root. The log is what shows WHICH
+# commands the verb moved behind `sudo -u <newborn>`.
+STUB_SUDO = """#!/bin/bash
+[ "$1" = "-u" ] || exit 99
+user="$2"; shift 2
+echo "sudo -u $user $*" >> "$STUB_STATE/sudo.log"
+exec "$@"
+"""
+
 STUB_BOOTSTRAP = """#!/bin/bash
 # agent-bootstrap stub: records its call and creates the newborn home + .engram.
 echo "$*" >> "$STUB_STATE/bootstrap-called"
@@ -472,7 +511,8 @@ def _make_copy(tmp_path, source_text):
     assert n == 1, "expected exactly one AGENTCTL_STATE literal"
     copy = state / "agentctl-copy"
     copy.write_text(new)
-    for name, body in (("id", STUB_ID), ("stat", STUB_STAT), ("chown", STUB_CHOWN)):
+    for name, body in (("id", STUB_ID), ("stat", STUB_STAT), ("chown", STUB_CHOWN),
+                       ("sudo", STUB_SUDO)):
         (bindir / name).write_text(body)
         (bindir / name).chmod(0o755)
     (state / "agent-bootstrap").write_text(STUB_BOOTSTRAP)
@@ -568,7 +608,11 @@ class TestFWholeSpawn:
         tag = _tag(proc)
         assert _read(state, "hint.copy") == URL + "\n"
         assert _read(state, "hint.mode").strip() == "600"
-        assert f"{tag}:{tag}" in _read(state, "chown.log")
+        # the hint is written AS the newborn: no root chown of it, and each write behind sudo -u
+        assert _read(state, "chown.log") is None
+        sudo = _read(state, "sudo.log")
+        assert re.search(rf"sudo -u {tag} tee -- \S+/\.forum-url\.hint\.", sudo), sudo
+        assert re.search(rf"sudo -u {tag} ln -- \S+/\.forum-url\.hint\.\S+ \S+/forum-url\.hint", sudo), sudo
         norm = _normalised(proc, state)
         assert norm.startswith(GOLDEN_NO_FLAG.rstrip("\n"))
         extra = norm[len(GOLDEN_NO_FLAG.rstrip("\n")):].strip("\n").splitlines()

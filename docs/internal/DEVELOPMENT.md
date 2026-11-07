@@ -341,10 +341,15 @@ the **Hybrid Strategy**:
 - Fall back to `Bash` with explicit `cat`, `ls`, `grep` when standard tools
   hit permission boundaries (e.g., reading another agent's home for
   cross-agent debugging — usually requires `agentctl share` or peer ACL).
-- For shared infrastructure paths (`/home/agents-shared/inter-agent/`,
-  `/home/agents-shared/share-state/`), the `g:agents` group + sgid bit
-  on the directory grants group-write to all agent uids. No elevation
-  needed.
+- For the shared infrastructure path `/home/agents-shared/inter-agent/`,
+  the `g:agents` group + sgid bit on the directory grants group-write to
+  all agent uids. No elevation needed.
+- `agentctl`'s share records and audit log are NOT under
+  `/home/agents-shared/` any more (engram-alpha#4405): they live in the
+  root-only `/var/lib/agentctl/` (`share-state/<agent>.json`, `share-log`),
+  so reading or changing them needs elevation (`sudo`). Records written
+  before that move may still sit at `/home/agents-shared/share-state/`;
+  nothing reads them, and `agentctl share-status` says where to look.
 - Update `bootstrap.py` if new infrastructure paths are introduced — the
   bootstrap is the manifest of "what an agent home looks like" and must
   stay accurate so fresh installs and spawn flows behave correctly.
