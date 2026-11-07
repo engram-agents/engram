@@ -39,6 +39,24 @@ permissions:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    # #4389: the job limit is 15 minutes ABOVE the suite step's 180, so on a live
+    # runner the step limit always fires first (a step `failure`, and the in-job
+    # notify step below runs) and the job limit never pre-empts that step. The job
+    # limit exists for the other case: a LOST runner. A lost runner is released at
+    # the job limit + 5 minutes (195 + 5 = 200; measured at two limit values with
+    # simulated kills), and the `notify-nightly-failure` job below then files the
+    # issue. Without a limit the default is 360 minutes; the unbounded
+    # lost-runner case was not measured.
+    timeout-minutes: 195
+    # #4389: set by the in-job notify step ONLY after it filed. The second job
+    # reads it to skip a night that was already reported. (It is empty after a
+    # lost runner, which is exactly when the second job must file.)
+    # `suite_green` is set by the in-job success step as its LAST line: it means the
+    # suite step was green AND that step ran to its end. A failing non-suite step
+    # after a green suite (coverage upload, summary) must not file an issue.
+    outputs:
+      notified: ${{ steps.notify_failure.outputs.notified }}
+      suite_green: ${{ steps.notify_success.outputs.suite_green }}
     strategy:
       # Costs nothing on a single-entry matrix, and stays correct if the
       # matrix ever grows again — so leave it on rather than remove it.
@@ -183,6 +201,11 @@ jobs:
         # behaviour should be specified too, under this project's
         # prescriptive-SPEC framing.
         id: suite
+        # #4389: the slowest healthy night of the last nine took 1h56 (116 min).
+        # A hung suite on a live runner now ends as a step `failure` at three
+        # hours, so the in-job notify step below fires (a step limit is a failure;
+        # a job limit is a cancel).
+        timeout-minutes: 180
         shell: bash
         run: |
           # set -o pipefail: without it, the step's status is tee's (0) even
@@ -408,11 +431,17 @@ jobs:
       # you include one of these functions." The carve-out functions are
       # success(), failure(), always(), cancelled(); a plain expression such
       # as `steps.suite.outcome == 'success'` gets success() ANDed in, and
-      # !cancelled() opts out of that default. !cancelled() means a cancelled
-      # job — including a job TIMEOUT (a hung pytest hitting the default
-      # 360-minute limit is reported as cancelled) — notifies nothing; the
-      # promise these two steps make is "notify steps cannot be masked by a
-      # label-step failure", not "cannot be masked" (alpha#2275 round 4).
+      # !cancelled() opts out of that default. !cancelled() means a run that
+      # a PERSON cancelled notifies nothing from these two steps; the promise
+      # they make is "notify steps cannot be masked by a label-step failure",
+      # not "cannot be masked" (alpha#2275 round 4).
+      #
+      # What a time limit does now (#4389): a hung suite on a live runner ends as
+      # a step failure at 180 minutes, and this step notifies. A job-limit cancel
+      # on a live runner, or a lost runner bounded by the 195-minute job limit,
+      # kills or skips this step, and the `notify-nightly-failure` job below
+      # notifies instead. Only a cancel BY A PERSON notifies nothing at all
+      # (the alpha#2275 reasoning stands: a person who cancels does not want an issue).
       - name: on failure — open or update the ci-nightly issue
         # Fires when the suite step did not succeed (red, or skipped because
         # install failed) and the job was not cancelled. The bare failure()
@@ -420,6 +449,7 @@ jobs:
         # failed label step on a green night filed a false issue with a
         # passing log tail.
         if: ${{ !cancelled() && (steps.suite.outcome != 'success' || steps.timing.outcome != 'success') }}
+        id: notify_failure
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -451,12 +481,20 @@ jobs:
               --label ci-nightly \
               --body "$BODY"
           fi
+          # #4389: the output is set only after the issue call above returned
+          # success (`set -e` aborts before this line otherwise). The second job
+          # reads it to skip a night that was already reported.
+          # A lost runner in the gap between the issue create and this line gives
+          # ONE extra update from the second job (a comment on the issue just
+          # created). That is accepted: it is one comment, never a missed night.
+          echo "notified=true" >> "$GITHUB_OUTPUT"
 
       - name: on success — close any open ci-nightly issue
         # Fires when the suite succeeded and the job was not cancelled. A
         # bare `steps.suite.outcome == 'success'` would inherit the default
         # success() and be skipped whenever the label step failed.
         if: ${{ !cancelled() && steps.suite.outcome == 'success' && steps.timing.outcome == 'success' }}
+        id: notify_success
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -468,4 +506,84 @@ jobs:
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body "green on ${DATE}"
             gh issue close "$EXISTING"
+          fi
+          # #4389: the output is the LAST line, set only after the calls above
+          # returned success (`set -e` aborts before it otherwise). The second job
+          # reads it so that a green suite followed by a failing non-suite step
+          # (coverage upload, summary, label) files nothing. A lost runner between
+          # a green suite and this line leaves the output empty, and the second job
+          # files: that is right, because the night did not finish.
+          echo "suite_green=true" >> "$GITHUB_OUTPUT"
+
+  # #4389: files the ci-nightly issue when the `pytest` job did not succeed and
+  # its own in-job notify step did not already file. Why it exists: the in-job
+  # notify steps run on the same runner as the suite, so they die with it when a
+  # hosted runner is lost, and the night went unreported. This job runs on its
+  # own fresh runner after `pytest` ends, however it ends.
+  #
+  # The gate is `!cancelled()`, not `always()`: a run a PERSON cancelled files
+  # nothing (same reasoning as alpha#2275), while a job-limit cancel or a lost
+  # runner is a cancel of the `pytest` JOB, not of the run, so this job still runs.
+  #
+  # The same-night skip rests on the `notified` job output and NOT on an issue-list
+  # read: `gh issue list` and the REST list missed an issue written one second
+  # earlier (measured), so a list read here could file a duplicate of the issue the
+  # in-job step had just created. The output is empty after a lost runner, which
+  # is the case this job is for.
+  #
+  # It has no log tail: the suite ran on a runner this job cannot read, and the
+  # log file lived on that runner. The issue body says so and points at the run.
+  # No checkout either: nothing here needs the repository, only `gh`.
+  notify-nightly-failure:
+    needs: pytest
+    if: ${{ !cancelled() && needs.pytest.result != 'success' && needs.pytest.outputs.notified != 'true' && needs.pytest.outputs.suite_green != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: ensure the ci-nightly label exists
+        # Same as the label step in `pytest`: idempotent, and a missing label makes
+        # `gh issue create` fail, so it is created here too (that job's copy may
+        # never have run).
+        shell: bash
+        run: gh label create ci-nightly --description "nightly full-suite failure tracking" --color B60205 --force
+
+      - name: open or update the ci-nightly issue
+        shell: bash
+        env:
+          RESULT: ${{ needs.pytest.result }}
+        run: |
+          set -e
+          DATE="$(date -u +%Y-%m-%d)"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BODY="Nightly full-suite run did not succeed: ${RUN_URL}
+
+          The suite job ended with result: ${RESULT}
+
+          This issue has NO LOG TAIL: the job that ran the suite did not report one
+          (a lost runner, or a job that hit its time limit). Read the run's own page
+          above for what happened."
+          # A list read is fine HERE: an open issue found now is from an earlier
+          # night, hours old. (The same-night skip is the job's `if:`, not this.)
+          # A failed read must not swallow the report: file a NEW issue anyway (never a
+          # comment, there is no number) and say so in the body. If that create fails
+          # too, `set -e` ends the script non-zero (a red job).
+          LIST_FAILED=""
+          EXISTING="$(gh issue list --label ci-nightly --state open --json number --jq '.[0].number // empty')" || LIST_FAILED=1
+          if [ -n "$LIST_FAILED" ]; then
+            BODY="${BODY}
+
+          NOTE: the list read failed, so an older open ci-nightly issue may exist
+          that this report could not be attached to."
+            EXISTING=""
+          fi
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create \
+              --title "nightly CI failure — ${DATE}" \
+              --label ci-nightly \
+              --body "$BODY"
           fi
