@@ -579,8 +579,8 @@ def test_mac_codex_ensures_verified_daemon_then_starts_remote_tui_in_cwd(tmp_pat
     assert lines[:2] == ["codex app-server daemon start", "codex app-server daemon version"]
     new_session = next(line for line in lines if line.startswith("tmux new-session"))
     assert f"-c {cwd}" in new_session
-    assert "codex\\ --remote\\ unix://" in new_session
-    assert "resume\\ --last" in new_session
+    assert "\\'codex\\'\\ \\'--remote\\'\\ \\'unix://" in new_session
+    assert "\\'resume\\'\\ \\'--last\\'" in new_session
     assert "tmux set-option -t agent-luria mouse on" in lines
     assert "tmux attach -t agent-luria" in lines
     assert not any(line.startswith("codex --remote") for line in lines)

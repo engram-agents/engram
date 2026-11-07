@@ -990,12 +990,20 @@ _codex_managed_session() {
     fi
 
     # tmux accepts a shell command rather than an argv vector on all supported
-    # versions. Quote each word with printf %q, including prompts, so argument
-    # forwarding retains exact word boundaries.
+    # versions, and runs it with its default-shell, which tmux takes from the first
+    # suitable of $SHELL in the environment that started the server, the passwd
+    # login shell, or /bin/sh (bash for every agent account's login shell here;
+    # what a given server inherited is not measured). Each word,
+    # prompts included, is POSIX single-quoted with _shq so word boundaries stay
+    # exact under ANY POSIX shell. printf %q is not enough: a %q word holding a
+    # control character plus a quote is $'...', which dash reads as $ plus a plain
+    # quoted string. Because the string starts with exec, the consequence under
+    # dash would be silently WRONG WORDS handed to codex (prompts included); were
+    # exec ever dropped, the rest of such a word would run as code.
     local remote_command="exec"
     local word quoted_word
     for word in codex --remote "unix://${socket_path}" "$@"; do
-        printf -v quoted_word ' %q' "$word"
+        quoted_word=" $(_shq "$word")"
         remote_command+="$quoted_word"
     done
     tmux new-session -d -s "$tmux_session" -c "$cwd" "$remote_command"
@@ -1031,6 +1039,14 @@ PROLOGUE
 }
 
 cmd__session_prologue() { session_prologue_text; }
+
+# POSIX single-quoting, never printf %q: at runs the job with /bin/sh, and tmux runs a
+# launch string with its default-shell; a %q word with a control character plus a quote is
+# $'...', which dash reads as $ plus a plain quoted string. Used by cmd_share (the at job) and
+# _codex_managed_session (the tmux launch). agentctl requires bash 4.3+ (header
+# os-harness-check). Under macOS bash 3.2 this function itself failed 10 of 54 hostile-name
+# runs (PR 4410 read), unreachable here because of that floor; bash 4.3 to 5.1 is NOT tested.
+_shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
 cmd_session() {
     local name="${1:-}"; shift || true
@@ -2525,9 +2541,6 @@ cmd_share() {
         [[ -x "$AGENTCTL_TOOL" ]] \
             || { echo "ERROR: --ttl queues '$AGENTCTL_TOOL unshare ...' and that file is not an executable; nothing was granted. Install agentctl there (root:root, mode 0755)." >&2; exit 1; }
         # ttl-queue-begin
-        # POSIX single-quoting, never printf %q: at runs the job with /bin/sh, and a %q word with
-        # a control character is $'...', which dash reads as $ plus a plain quoted string.
-        _shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
         if at_out="$(printf '%s %s %s %s\n' "$(_shq "$AGENTCTL_TOOL")" unshare "$(_shq "$agent")" "$(_shq "$path")" | at "now + $ttl" 2>&1)"; then
             at_job="$(sed -n 's/^job \([0-9][0-9]*\) at .*/\1/p' <<< "$at_out")"
             [[ -n "$at_job" ]] || at_job="unknown"

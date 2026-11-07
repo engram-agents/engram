@@ -815,7 +815,7 @@ def test_codex_managed_session_starts_daemon_then_one_remote_tmux_tui(tmp_path):
     assert lines[0] == "codex app-server daemon start"
     assert lines[1] == "codex app-server daemon version"
     new_session = next(line for line in lines if line.startswith("tmux new-session"))
-    assert "codex\\ --remote\\ unix://" in new_session
+    assert "\\'codex\\'\\ \\'--remote\\'\\ \\'unix://" in new_session
     assert "--dangerously-bypass-approvals-and-sandbox" in new_session
     assert "tmux set-option -t agent-mira mouse on" in lines
     assert "tmux attach -t agent-mira" in lines
