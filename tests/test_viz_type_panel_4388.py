@@ -563,5 +563,107 @@ class TestMarkup(unittest.TestCase):
         self.assertRegex(sec, r'<div id="type-filters">\s*</div>')
 
 
+# ---------------------------------------------------------------------------
+# engram-alpha#4417: the search re-enable path in searchAndFocus.
+#
+# Contract: searching a node whose type is hidden re-enables exactly that type
+# (R1a), a node whose type is already active changes nothing (R1b), and a
+# query that matches nothing changes nothing (R1c).
+# Held constant (named): ORDER OF EFFECTS, state is assigned before render()
+# and buildSidebar() read it, so both stubs record the sorted activeTypes AT
+# CALL TIME.  Varied: TYPE (derivation vs cornerstone) x STARTING STATE (all
+# hidden vs one other type active).
+# STUBS: document.getElementById (a recording element), rawData, activeTypes,
+# showSuperseded, showFullGraph, legibleNodeIds (holds the node id, so the
+# full-graph block does nothing), buildSidebar and render (recorders),
+# setTimeout.  selectNode THROWS StopAfterSelect, so the run ends before the
+# zoom / svg / nodeGroup / d3 code, which these cells cannot run.
+# HELD CONSTANT IN EVERY ROW, so these inputs cannot tell the real code from a
+# mutant that differs only there: showSuperseded is false and is_current is
+# true (the superseded block never fires, so a guard that also tests
+# showSuperseded passes), the full-graph block never fires, and every type
+# name is already lower case (a lower-casing of d.type passes).  A later cell
+# for the superseded or full-graph block that reuses run_search must also
+# revisit R1b's render == [] assertion.
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(_NODE_AVAILABLE, "node is not available on this seat")
+class TestSearchReenable(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._src = _extract_function_source(JS_TEXT, "searchAndFocus")
+
+    def run_search(self, query, *, node, active):
+        script = "\n".join(
+            [
+                "const rawData = { nodes: [" + json.dumps(node) + "], edges: [] };",
+                "const activeTypes = new Set(" + json.dumps(sorted(active)) + ");",
+                "let showSuperseded = false, showFullGraph = false;",
+                "const bsSeen = [], rSeen = [], selected = [];",
+                "const input = { value: '', checked: false, _cls: new Set(),"
+                " classList: { add: c => input._cls.add(c), remove: c => input._cls.delete(c) } };",
+                "const document = { getElementById: id => input };",
+                "const setTimeout = () => 0;",
+                "const legibleNodeIds = () => new Set([" + json.dumps(node["id"]) + "]);",
+                "const buildSidebar = () => bsSeen.push(Array.from(activeTypes).sort());",
+                "const render = () => rSeen.push(Array.from(activeTypes).sort());",
+                "const selectNode = d => { selected.push(d.id);"
+                " throw new Error('StopAfterSelect'); };",
+                self._src,
+                "let stopped = false;",
+                "try { searchAndFocus(" + json.dumps(query) + "); }",
+                "catch (e) { if (e.message === 'StopAfterSelect') stopped = true; else throw e; }",
+                "process.stdout.write(JSON.stringify({act: Array.from(activeTypes).sort(),"
+                " bs: bsSeen, r: rSeen, selected, stopped,"
+                " notFound: input._cls.has('not-found')}));",
+            ]
+        )
+        r = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        return json.loads(r.stdout)
+
+    @staticmethod
+    def _node(t):
+        return {"id": t + "_target", "type": t, "is_current": True}
+
+    def test_R1a_hidden_type_is_reenabled_before_sidebar_and_render_read_it(self):
+        for t in ("derivation", "cornerstone"):
+            for start_name, start in (("all_hidden", set()), ("one_other_active", {"observation"})):
+                with self.subTest(type=t, start=start_name):
+                    node = self._node(t)
+                    out = self.run_search(node["id"].upper(), node=node, active=start)
+                    want = sorted(start | {t})
+                    self.assertEqual(out["act"], want)
+                    self.assertEqual(out["bs"], [want])
+                    self.assertEqual(out["r"], [want])
+                    self.assertEqual(out["selected"], [node["id"]])
+                    self.assertTrue(out["stopped"])
+
+    def test_R1b_active_type_does_not_fire_the_reenable_block(self):
+        for t in ("derivation", "cornerstone"):
+            with self.subTest(type=t):
+                node = self._node(t)
+                start = {t, "observation"}
+                out = self.run_search(node["id"], node=node, active=start)
+                self.assertEqual(out["act"], sorted(start))
+                self.assertEqual(out["bs"], [])
+                self.assertEqual(out["r"], [])
+                self.assertEqual(out["selected"], [node["id"]])
+                self.assertTrue(out["stopped"])
+
+    def test_R1c_not_found_changes_nothing(self):
+        for t, start in (("derivation", set()), ("cornerstone", {"observation"})):
+            with self.subTest(type=t):
+                node = self._node(t)
+                out = self.run_search("no_such_node", node=node, active=start)
+                self.assertTrue(out["notFound"])
+                self.assertEqual(out["act"], sorted(start))
+                self.assertEqual(out["bs"], [])
+                self.assertEqual(out["r"], [])
+                self.assertEqual(out["selected"], [])
+                self.assertFalse(out["stopped"])
+
+
 if __name__ == "__main__":
     unittest.main()
