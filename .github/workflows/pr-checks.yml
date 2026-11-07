@@ -542,8 +542,12 @@ jobs:
       # that advisory behavior inside this combined job.
       #
       # Activation: an org/repo admin must set the NAME_LEAK_ROSTER secret (one-time
-      # maintainer action). Until then the gate self-skips harmlessly. Fork PRs also
-      # self-skip (secrets are unavailable in fork contexts).
+      # maintainer action). This step stays advisory-by-design; the BLOCKING
+      # surface is .github/workflows/name-leak-gate.yml (#4429), which gates a
+      # same-repo PR on the roster plus the coverage attestation and fails a fork
+      # PR with a status name containing NOT SCANNED. Fork PRs self-skip HERE
+      # (secrets are unavailable in fork contexts); that is exactly why they are
+      # red THERE.
       #
       # NAME_LEAK_ROSTER format: newline-separated regex patterns, applied as-written.
       # Authors encode their own word boundaries / case handling per pattern.

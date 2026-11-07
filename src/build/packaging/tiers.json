@@ -1539,6 +1539,10 @@
       "reason": "repo-CI infrastructure consumed only by .github/workflows/name-leak-warn.yml (warn-only diff gate); runs in GitHub Actions, not shipped in any install tier"
     },
     {
+      "path": "tools/name_leak_gate.py",
+      "reason": "repo-CI infrastructure: the pure decision function consumed only by .github/workflows/name-leak-gate.yml (#4429, trusted-context name-leak gate); runs in GitHub Actions, not shipped in any install tier"
+    },
+    {
       "path": "tools/stray_master_ref_check.py",
       "reason": "repo-CI infrastructure consumed only by .github/workflows/pr-checks.yml's stray-master-ref-check step (#1884, warn-only whole-tree scan); runs in GitHub Actions, not shipped in any install tier"
     },
