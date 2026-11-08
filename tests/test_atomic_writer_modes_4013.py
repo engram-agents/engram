@@ -459,6 +459,7 @@ MODE_AWARE = {
     "tools/engramd_batch_a_acceptance.py": (
         "explicit chmod 0o644 on the --report output; a report path inside the live ENGRAM home is refused"
     ),
+    "src/engram/bootstrap.py": "_copy_exclusive: shutil.copystat copies the source's mode onto the temp before publish (backup keeps the original's mode)",
 }
 
 # Private on purpose: only the owner reads it, and the file says so.
