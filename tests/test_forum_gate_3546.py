@@ -308,7 +308,7 @@ def test_f_env_forum_url_alone_does_not_configure(hook, tmp_path):
 HEALTHY_MARKER = {
     "forum": "2 new forum posts since last read",
     "baton": "1 baton in your court",
-    "inter": "1 new message from luria",
+    "inter": "1 new message",
 }
 
 

@@ -87,6 +87,9 @@ try:
         # #3628: the cache read/write are non-blocking and regular-file-only.
         hooklib_io as _hooklib_io,
         engram_home_or_exit as _engram_home,
+        # #1459: every forum-sourced string is sanitised and framed as data.
+        forum_field as _forum_field,
+        forum_data_block as _forum_data_block,
     )
     _PROMPTHOOKLIB_OK = True
 except Exception as _lib_exc:
@@ -878,9 +881,16 @@ def main() -> None:
         # UCS invariant: fail LOUD — surface a banner rather than silently
         # rendering nothing. The forum being down IS a problem the agent should
         # see (even on the 5090 server host); it is never masked by a local read.
+        # #1459: the exception class and HTTP status only. str(e) of a
+        # ForumHttpError is the raw response body: unsanitised, uncapped, outside
+        # any data block.
+        _status = getattr(e, "status", None)
+        _what = type(e).__name__ + (
+            f" (HTTP {_status})" if isinstance(_status, int) else ""
+        )
         _emit_context(
             "⚠️ UCS unreachable — baton/coordination state is "
-            f"unavailable (forum API error: {e}). Coordination reads/writes will "
+            f"unavailable (forum API error: {_what}). Coordination reads/writes will "
             "fail until the forum service is back."
         )
         return
@@ -911,10 +921,15 @@ def main() -> None:
             f"(a baton here = ACTION PENDING from you, NOT 'parked', NOT 'waiting on them'):"
         ]
 
+        # #1459: the baton id, reason and live-status text came from the forum
+        # store, so each goes through forum_field and the entry lines sit inside
+        # one framed data block. The count header above and the decision prompt
+        # below are this hook's own text and stay OUTSIDE it.
+        data_lines: list = []
         for b in my_batons:
-            pid = b["project_id"]
+            pid = _forum_field(b["project_id"], 80)
             turn_since = b["turn_since"]
-            turn_reason = b["turn_reason"]
+            turn_reason = _forum_field(b["turn_reason"])
             github_anchor = b["github_anchor"]
 
             # Format: since HH:MMZ, Xh ago
@@ -934,14 +949,16 @@ def main() -> None:
                 try:
                     live_status = _get_live_status(github_anchor, cache)
                     if live_status:
-                        live_clause = f" [{live_status}]"
+                        live_clause = f" [{_forum_field(live_status, 80)}]"
                 except Exception:
                     pass
 
             if since_str:
-                lines.append(f"  - {pid} ({since_str}){reason_part}{live_clause}")
+                data_lines.append(f"  - {pid} ({since_str}){reason_part}{live_clause}")
             else:
-                lines.append(f"  - {pid}{reason_part}{live_clause}")
+                data_lines.append(f"  - {pid}{reason_part}{live_clause}")
+
+        lines.extend(_forum_data_block(data_lines, "baton"))
 
         # Explicit decision prompt — a baton in your court is a PENDING ACTION, not a
         # status line. Force classification rather than glazing past "in your court"

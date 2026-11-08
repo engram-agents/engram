@@ -34,6 +34,7 @@ PRINTS something.
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -328,7 +329,20 @@ def test_other_healthy_control_prints_and_is_byte_identical_to_dev(
     h = _run(head, home_a)
     d = _run(dev, home_b)
     assert marker in _ctx(h[1]), "control must PRINT its banner"
-    assert h == d
+    # #1459: the one deliberate difference from dev is the error detail inside
+    # the banner. Dev interpolated str(e) (for an HTTP error, the raw response
+    # body); the head names the exception class only. Mask that span on both
+    # sides, pin the head's span to a class name, and keep everything else
+    # byte-identical.
+    detail = re.compile(r"forum API error: .*?(?=\)\. Coordination|\Z)", re.S)
+
+    def masked(res):
+        rc, out, err = res
+        return rc, detail.sub("forum API error: <detail>", _ctx(out)), err
+
+    assert re.search(r"forum API error: Forum\w+Error(?: \(HTTP \d+\))?(?:\)\. Coordination|\Z)",
+                     _ctx(h[1])), _ctx(h[1])
+    assert masked(h) == masked(d)
 
 
 @pytest.mark.parametrize("hook_name,marker", OTHER_HOOKS)

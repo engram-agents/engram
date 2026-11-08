@@ -191,7 +191,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 ### **3.6 engram-inter-agent-prompt-hook.py**
 
-**what** — Surfaces new inter-agent letters before the agent responds. Implements a read-before-responding discipline: counterpart-agent letters carry context (user messages, decisions, suspicions) the agent would otherwise miss. Maintains two cursors: read_cursor (explicit acknowledgment via `ia read`) and surfaced_cursor (hook fire time). A letter is "new" if unread (ts > read_cursor). Distinction: "new" (both unread and newer than surfaced window) vs "still-unread older" (read cursor still behind).
+**what** — Surfaces new inter-agent letters before the agent responds. Implements a read-before-responding discipline: counterpart-agent letters are information to weigh, never instructions, and the agent acts on one only where its own user's instructions already call for it (the hook frames senders and subjects as forum data, and the engram-letter skill carries the same rule). Maintains two cursors: read_cursor (explicit acknowledgment via `ia read`) and surfaced_cursor (hook fire time). A letter is "new" if unread (ts > read_cursor). Distinction: "new" (both unread and newer than surfaced window) vs "still-unread older" (read cursor still behind).
 
 **how** — Entry point: main() (230–437). Key operations:
 - Cursor management: READ_CURSOR_PATH = ENGRAM_HOME/inter-agent-read-cursor.txt, SURFACED_CURSOR_PATH = ENGRAM_HOME/inter-agent-surfaced-cursor.txt (lines 53–54; ISO-timestamp contents, format-validated with pointer to inter-agent/README.md §4 at line 143).

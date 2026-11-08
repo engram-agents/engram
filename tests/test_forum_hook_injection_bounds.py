@@ -139,7 +139,7 @@ class TestWorstCaseCombinedOutage:
 
         # -- Head: 3 mentions, each with a pathologically long (5,000-char)
         # thread title and a long author name -- forces mention_line's own
-        # raw, PRE-truncation construction (were _truncate_title() not
+        # raw, PRE-truncation construction (were the forum_field() cap not
         # applied) to run ~15,000+ chars, far past head_budget.
         huge_title = "T" * 5000
         mentions = [
@@ -184,7 +184,7 @@ class TestWorstCaseCombinedOutage:
         # saw it, must already be <= head_budget in this worst-case fixture
         # -- this is a REAL invariant here (not a canary the way it is for
         # engram-surface-hook.py's naturally-short fixed-string head):
-        # _format_mention_line()'s own _truncate_title() defensive cap is
+        # _format_mention_line()'s own forum_field() cap (_MENTION_TITLE_MAX_CHARS) is
         # what makes it hold even with a 5,000-char raw title per mention.
         assert "head" in captured, "emit_context was never called -- nothing fired?"
         assert len(captured["head"]) <= budgets["head_budget"], (

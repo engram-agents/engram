@@ -281,6 +281,9 @@ try:
         # <dest>.tmp). Reached through _prompthooklib so a missing _hooklib
         # helper degrades to OSError at the site, not to an import crash.
         hooklib_io as _hooklib_io,
+        # #1459: every forum-sourced string is sanitised and framed as data.
+        forum_field as _forum_field,
+        forum_data_block as _forum_data_block,
     )
     _PROMPTHOOKLIB_OK = True
 except Exception as _lib_exc:
@@ -868,24 +871,20 @@ def _fetch_inbox(forum_url: str, agent_name: str, deadline: float) -> tuple:
 _MENTION_TITLE_MAX_CHARS = 150
 
 
-def _truncate_title(title: str) -> str:
-    """Defensively cap a single thread title before it enters mention_line.
-
-    150 chars is a generous display width for a thread title (real titles
-    observed in production top out far shorter -- census: 608-char total
-    mention line, 2026-09-12) while keeping even the worst case (3 shown
-    items, each at the cap) comfortably under head_budget (1,800)."""
-    if len(title) <= _MENTION_TITLE_MAX_CHARS:
-        return title
-    return title[: _MENTION_TITLE_MAX_CHARS - 1] + "…"
-
-
 def _format_mention_line(mentions: list) -> Optional[str]:
-    """Format the 🔔 mention summary line for injection into additionalContext.
+    """Format the 🔔 mention summary for injection into additionalContext.
 
     Mirrors the wording of forum status's _format_mention_line (tools/forum.py)
     but uses "mention"/"mentions" (not "post"/"posts") for noun agreement, caps
     inline display at 3, and appends the `forum read <id>` nudge.
+
+    #1459: the first line is this hook's own count line; the thread ids, titles
+    and authors (all forum-sourced) follow inside one framed data block, each
+    through forum_field. A title is capped at _MENTION_TITLE_MAX_CHARS (150
+    chars is a generous display width -- real titles observed in production top
+    out far shorter, census: 608-char total mention line, 2026-09-12 -- and the
+    worst case, 3 shown items each at the cap, stays comfortably under
+    head_budget, 1,800).
 
     Returns None when the list is empty.
     """
@@ -896,28 +895,27 @@ def _format_mention_line(mentions: list) -> Optional[str]:
     shown = mentions[:MAX_SHOWN]
     rest = len(mentions) - MAX_SHOWN
 
-    parts = []
+    entries = []
     for m in shown:
-        tid = m.get("thread_id", "?")
-        title = _truncate_title(m.get("thread_title", "?"))
-        author = m.get("author", "?")
+        tid = _forum_field(m.get("thread_id", "?"), 20)
+        title = _forum_field(m.get("thread_title", "?"), _MENTION_TITLE_MAX_CHARS)
+        author = _forum_field(m.get("author", "?"), 40)
         kind = m.get("kind", "")
         if kind == "at_mention":
             desc = f"@mention by {author}"
         else:
             desc = f"reply to your thread by {author}"
-        parts.append(f'#{tid} "{title}" ({desc})')
-
-    summary = ", ".join(parts)
+        entries.append(f'  - #{tid} "{title}" ({desc})')
     if rest > 0:
-        summary += f", +{rest} more"
+        entries.append(f"  +{rest} more")
 
     total = len(mentions)
     noun = "mention" if total == 1 else "mentions"
-    return (
-        f"\U0001f514 {total} forum {noun} waiting on you: {summary}"
+    count_line = (
+        f"\U0001f514 {total} forum {noun} waiting on you"
         f" — `forum read <id>` to clear."
     )
+    return "\n".join([count_line, *_forum_data_block(entries, "forum mentions")])
 
 
 def _format_umwelt_advisory_line(mentions: list) -> Optional[str]:
@@ -1106,8 +1104,8 @@ def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
         # hook's normal content (max delivered historically: 608 chars, per
         # the #2863 census) is nowhere near either ceiling, so no real
         # content is lost by choosing the smaller target -- it only
-        # tightens the worst-case guarantee. (Also see _truncate_title()'s
-        # own defensive cap on individual titles -- belt-and-suspenders
+        # tightens the worst-case guarantee. (Also see forum_field()'s
+        # own cap on individual titles -- belt-and-suspenders
         # with this target choice, not a substitute for it: together they
         # make the "head stays under head_budget" property a real
         # invariant here, not a canary.)

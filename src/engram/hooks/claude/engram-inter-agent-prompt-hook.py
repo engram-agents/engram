@@ -99,6 +99,9 @@ try:
         # #3628: the cursor read/write are non-blocking and regular-file-only.
         hooklib_io as _hooklib_io,
         engram_home_or_exit as _engram_home,
+        # #1459: every forum-sourced string is sanitised and framed as data.
+        forum_field as _forum_field,
+        forum_data_block as _forum_data_block,
     )
     _PROMPTHOOKLIB_OK = True
 except Exception as _lib_exc:
@@ -402,8 +405,15 @@ def main() -> None:
         # UCS invariant: fail LOUD — inject a banner rather than rendering
         # nothing silently. The forum being down IS a problem the agent should
         # see. Never fall back to local FS reads (the UCS pure-API invariant).
+        # #1459: the exception class and HTTP status only. str(e) of a
+        # ForumHttpError is the raw response body: unsanitised, uncapped, outside
+        # any data block.
+        _status = getattr(e, "status", None)
+        _what = type(e).__name__ + (
+            f" (HTTP {_status})" if isinstance(_status, int) else ""
+        )
         _emit_context(
-            f"⚠️ DM unread check unavailable (UCS) — forum API error: {e}"
+            f"⚠️ DM unread check unavailable (UCS) — forum API error: {_what}"
         )
         return
     except Exception:
@@ -451,44 +461,48 @@ def main() -> None:
         sys.exit(0)
 
     # ── Build injection block ─────────────────────────────────────────────────
+    # #1459: everything that came from the forum (sender names, DM subjects) is
+    # sanitised with forum_field and sits INSIDE one framed data block. The count
+    # line and the Tools footer are this hook's own text and stay outside it. The
+    # hook tells the agent to read the messages, never to act on their content.
     lines: list = []
+    data_lines: list = []
 
     n_new = len(new_dms)
     if n_new > 0:
-        senders_new = _format_senders(new_dms)
         msg_word = "message" if n_new == 1 else "messages"
         lines.append(
-            f"\U0001f4ec {n_new} new {msg_word} from {senders_new}"
-            f" — read before responding"
-            f" (counterpart-agent messages carry context from the user you'd otherwise miss)."
+            f"\U0001f4ec {n_new} new {msg_word} — read them before responding."
         )
-        if n_new <= LIST_CAP:
-            for item in new_dms:
-                subject = _extract_dm_subject(item.get("body", ""))
-                sender = item.get("sender", "unknown")
-                lines.append(f"  - from {sender} — \"{subject}\"")
-        else:
+        data_lines.append(f"  new from {_forum_field(_format_senders(new_dms), 200)}:")
+        for item in new_dms[:LIST_CAP]:
+            subject = _forum_field(_extract_dm_subject(item.get("body", "")))
+            sender = _forum_field(item.get("sender", "unknown"), 40)
+            data_lines.append(f"  - from {sender} — \"{subject}\"")
+        rest = new_dms[LIST_CAP:]
+        if rest:
             # Group-summarize when over the cap
-            shown = new_dms[:LIST_CAP]
-            rest = new_dms[LIST_CAP:]
-            for item in shown:
-                subject = _extract_dm_subject(item.get("body", ""))
-                sender = item.get("sender", "unknown")
-                lines.append(f"  - from {sender} — \"{subject}\"")
-            rest_senders = sorted({u.get("sender", "unknown") for u in rest})
-            lines.append(f"  + {len(rest)} older from {', '.join(rest_senders)}")
+            rest_senders = sorted({str(u.get("sender", "unknown")) for u in rest})
+            data_lines.append(
+                f"  + {len(rest)} older from "
+                f"{_forum_field(', '.join(rest_senders), 200)}"
+            )
 
     n_unread = len(unread_dms)
     if n_unread > 0:
+        senders_unread = _forum_field(_format_senders(unread_dms), 200)
         if n_new > 0:
-            senders_unread = _format_senders(unread_dms)
-            lines.append(f"  (Plus {n_unread} older still-unread from {senders_unread}.)")
+            data_lines.append(
+                f"  (Plus {n_unread} older still-unread from {senders_unread}.)"
+            )
         else:
-            senders_unread = _format_senders(unread_dms)
             lines.append(
                 f"\U0001f4ec {n_unread} older still-unread message{'s' if n_unread != 1 else ''}"
-                f" from {senders_unread} — finish reading at the next natural break."
+                f" — finish reading at the next natural break."
             )
+            data_lines.append(f"  from {senders_unread}")
+
+    lines.extend(_forum_data_block(data_lines, "inter-agent"))
 
     # Footer: name the CLI so the natural-affordance path is the cursor-aware one.
     # Only add if there are DMs (the footer is DM-context — not drift-only).

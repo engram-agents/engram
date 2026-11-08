@@ -396,8 +396,11 @@ class TestMainRendering:
         stdout, stderr, rc = _call_main(mod, updates=[update], as_of=5)
         assert rc == 0
         ctx = _parse_ctx(stdout)
-        assert "1 new message from ariadne" in ctx
-        assert "read before responding" in ctx
+        # #1459: the count line is the hook's own text; the sender is forum text and
+        # sits inside the framed data block.
+        assert "1 new message" in ctx
+        assert "new from ariadne" in ctx
+        assert "read them before responding" in ctx
         assert "Review request" in ctx
 
     # 16. New + unread -> both surface, correct partitioning
@@ -418,7 +421,8 @@ class TestMainRendering:
         ctx = _parse_ctx(stdout)
 
         # New DM surfaces
-        assert "1 new message from ariadne" in ctx
+        assert "1 new message" in ctx
+        assert "new from ariadne" in ctx
         assert "New arrival" in ctx
 
         # Older unread appears as "(Plus N older still-unread from …)"
@@ -609,7 +613,7 @@ class TestMainRendering:
 
     # 25. Two new DMs from different senders: sorted senders in header
     def test_two_new_senders_sorted_in_header(self, engram_home):
-        """Two distinct new-DM senders appear sorted in the header line."""
+        """Two distinct new-DM senders appear sorted (in the data block)."""
         _write_config(engram_home)
         mod = _load_hook_module(engram_home)
         updates = [
@@ -621,8 +625,10 @@ class TestMainRendering:
         ctx = _parse_ctx(stdout)
         first_line = ctx.splitlines()[0]
         assert "2 new messages" in first_line
-        assert "from ariadne, mneme" in first_line, (
-            f"Sorted senders 'ariadne, mneme' must appear in header; got: {first_line!r}"
+        # #1459: the sorted senders are forum text, so they sit in the data block,
+        # not the hook's own count line.
+        assert "new from ariadne, mneme" in ctx, (
+            f"Sorted senders 'ariadne, mneme' must appear in the block; got: {ctx!r}"
         )
 
     # 26. Still-unread-only (no new): 'older still-unread' line and wording
