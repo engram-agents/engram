@@ -365,7 +365,9 @@ seat can run it and any other seat can check that it ran.
    hook into its tree), `tests/test_docs_layout_guard.py`,
    `tests/test_metadata_parse_drift_guard_3413.py`,
    `tests/test_json_extract_metadata_guard_3485.py` and
-   `tests/test_no_retired_cascade_store_asserts.py` (it scans `tests/` itself).
+   `tests/test_no_retired_cascade_store_asserts.py` (it scans `tests/` itself) and
+   `tests/test_forum_redirect_origin_1459.py` (it derives the forum's sender set with
+   `git ls-files` and a walk of `src/` and `tools/`).
    The list is a floor, not a census: a PR that adds a test with this property adds
    its name here in the same PR, and a seat that finds one missing adds it. Verify
    the list with `git ls-files` **in a checkout of the base tip**, not the seat's

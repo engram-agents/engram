@@ -292,7 +292,9 @@ def test_prompt_hook_follows_no_redirect_at_all(servers, owned_tmp):
 #   1. D = non-test .py in the UNIVERSE (every file `git ls-files` lists at the repo root, plus an
 #      os.walk of src/ and tools/ for untracked files) that (a) has a string literal naming
 #      the Authorization header in any casing (HTTP header names are case-insensitive), or (b)
-#      an Authorization= keyword, or (c) references the forum token source; realpath-deduped,
+#      an Authorization= keyword, or (c) uses the forum token source (the token-name literals
+#      count everywhere except as an element of a list/tuple/set/dict display, a mention; bound:
+#      a use spelled as such an element is not seen); realpath-deduped,
 #      minus the receiver src/forum/server.py. A failing `git ls-files` raises.
 #   2. D is non-empty and contains at least the four known senders (a floor, not the domain).
 #   3. No F in D REFERENCES urllib.request.urlopen (a load: called, or bound to a variable and
@@ -336,11 +338,28 @@ def _has_header_keyword(tree):
                for n in ast.walk(tree))
 
 
-def _has_token_reference(tree):
-    """(c) a reference to the forum token source: the literal ``ENGRAM_FORUM_TOKEN`` or
-    ``forum-token``, or a Name, Attribute or import of ``load_forum_token``."""
+def _collection_element_ids(tree):
+    """ids of the nodes that are direct elements of a List, Tuple or Set display, or a key or value
+    of a Dict display (a ``**spread`` has a None key, which is skipped)."""
+    ids = set()
     for n in ast.walk(tree):
-        if isinstance(n, ast.Constant) and n.value in ("ENGRAM_FORUM_TOKEN", "forum-token"):
+        if isinstance(n, (ast.List, ast.Tuple, ast.Set)):
+            ids.update(id(e) for e in n.elts)
+        elif isinstance(n, ast.Dict):
+            ids.update(id(e) for e in n.keys if e is not None)
+            ids.update(id(e) for e in n.values)
+    return ids
+
+
+def _has_token_reference(tree):
+    """(c) a USE of the forum token source: the literal ``ENGRAM_FORUM_TOKEN`` or ``forum-token``
+    anywhere EXCEPT as an element of a list, tuple, set or dict display (that is a mention, e.g. a
+    gitignore-pattern list, not a use), or a Name, Attribute or import of ``load_forum_token``.
+    Bound: a use spelled as a collection element (``os.path.join(*[h, "forum-token"])``) is not seen."""
+    listed = _collection_element_ids(tree)
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Constant) and n.value in ("ENGRAM_FORUM_TOKEN", "forum-token")
+                and id(n) not in listed):
             return True
         if isinstance(n, ast.Name) and n.id == "load_forum_token":
             return True
@@ -645,6 +664,50 @@ def test_sender_set_is_walked_on_disk_and_includes_untracked_files(tmp_path):
     (root / "tools" / "plain.py").write_text("x = 1\n")
     found = [str(p.relative_to(root.resolve())) for p in _sender_set(root.resolve())]
     assert found == ["src/pkg/sender.py"], found
+
+
+def test_a_token_name_listed_in_a_collection_is_a_mention_not_a_sender():
+    """#4519: a token-name literal that is a DIRECT element of a list, tuple, set or dict display (a key
+    or a value) is a mention (an ignore-pattern or scrub list), not a token use. Every other
+    position stays a use. The header literal is never narrowed: ``{"Authorization": t}`` stays IN."""
+    out_rows = {}
+    for lit in ("forum-token", "ENGRAM_FORUM_TOKEN"):
+        out_rows[f"list, {lit}"] = f'PATTERNS = ["*.db", "{lit}"]\n'
+        out_rows[f"tuple, {lit}"] = f'PATTERNS = ("*.db", "{lit}")\n'
+        out_rows[f"set, {lit}"] = f'PATTERNS = {{"*.db", "{lit}"}}\n'
+        out_rows[f"dict value, {lit}"] = f'PATTERNS = {{"k": "{lit}"}}\n'
+        out_rows[f"dict key, {lit}"] = f'PATTERNS = {{"{lit}": 1}}\n'
+    out_rows["tuple of the env name and another"] = 'SCRUB = ("ENGRAM_FORUM_TOKEN", "OTHER")\n'
+    in_rows = {
+        "path join with the operator": 'p = home / "forum-token"\n',
+        "os.path.join call": 'import os\np = os.path.join(h, "forum-token")\n',
+        "environ subscript": 'import os\nt = os.environ["ENGRAM_FORUM_TOKEN"]\n',
+        "env.get call": 'v = env.get("ENGRAM_FORUM_TOKEN")\n',
+        "use nested in a list element, operator": 'P = [home / "forum-token"]\n',
+        "use nested in a list element, call": 'import os\nP = [os.path.join(h, "forum-token")]\n',
+        "use nested in a dict value": 'P = {"k": env.get("ENGRAM_FORUM_TOKEN")}\n',
+        "plain assignment, file": 'name = "forum-token"\n',
+        "plain assignment, env": 'name = "ENGRAM_FORUM_TOKEN"\n',
+        "header dict stays IN": 'h = {"Authorization": t}\n',
+        "header dict stays IN, lowercase": 'h = {"authorization": t}\n',
+        "header literal in a list stays IN": 'HDRS = ["Authorization"]\n',
+        "load_forum_token still IN beside a list": 'P = ["x"]\ntok = load_forum_token()\n',
+    }
+    for label, src in out_rows.items():
+        assert not _is_sender_source(src), f"{label}: a listed token name must be OUT of D"
+    for label, src in in_rows.items():
+        assert _is_sender_source(src), f"{label}: expected IN D"
+
+
+def test_a_planted_ignore_list_stays_out_and_a_planted_token_path_stays_in(tmp_path):
+    """The real-tree control for #4519, in a throwaway repo: one file whose only mention is an
+    ignore-pattern tuple is OUT of D; one file that builds the token path is IN."""
+    root = _git_repo(tmp_path / "repo")
+    (root / "src").mkdir()
+    (root / "src" / "ignores.py").write_text('IGNORE = ("*.db", "forum-token")\n')
+    (root / "src" / "reads.py").write_text('TOKEN_PATH = home / "forum-token"\n')
+    found = [str(p.relative_to(root.resolve())) for p in _sender_set(root.resolve())]
+    assert "src/reads.py" in found and "src/ignores.py" not in found, found
 
 
 def test_sender_set_includes_tracked_files_outside_src_and_tools(tmp_path):
