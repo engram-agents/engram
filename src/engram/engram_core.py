@@ -3427,6 +3427,10 @@ ENGRAM_GITIGNORE_PATTERNS = [
     # were found on fleet seats).
     "secrets/",
     "*api-key*",
+    # #4503: the #1459 bearer token lands at $ENGRAM_HOME/forum-token on every
+    # seat. It must live in this constant, not a seat-side hand-add: a canonical
+    # refresh preserves only `!`-prefixed lines, so a hand-added line is dropped.
+    "forum-token",
     "*.bak-*",
     # #4208: hand-made binary copies (backups/, dated knowledge.db.<suffix>) and the
     # rotating rollback copies the backup tool writes must never be staged.

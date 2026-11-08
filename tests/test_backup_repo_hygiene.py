@@ -519,3 +519,77 @@ class TestEnsureEngramGitignoreWithNewPatterns:
         assert "preserving 2" in captured.err
         assert "!diary/diary.db" in captured.err
         assert "!some/stale/negation" in captured.err
+
+    def test_forum_token_is_in_the_canonical_patterns(self):
+        """#4503: the #1459 bearer token (`$ENGRAM_HOME/forum-token`) must be a
+        canonical pattern, not a seat-side hand-add — a canonical refresh
+        rewrites the file and a hand-added line would be dropped."""
+        import engram_core
+
+        assert "forum-token" in engram_core.ENGRAM_GITIGNORE_PATTERNS
+
+    def test_forced_refresh_ignores_forum_token_and_keeps_negation(self):
+        """#4503 contract, on the REWRITE path: a `forum-token` file present in
+        a home is ignored after `_ensure_engram_gitignore` runs, and the
+        hand-added `!diary/diary.db` negation still survives that same refresh.
+
+        The fixture .gitignore is deliberately incomplete, which is what makes
+        the function rewrite instead of early-returning; the guard below
+        asserts that precondition so this cell cannot silently pass on the
+        early-return path and prove nothing.
+        """
+        import engram_core
+
+        gitignore = self.tmp / ".gitignore"
+        gitignore.write_text(
+            "*.db\n"
+            "!diary/diary.db\n"
+            "*.log\n",
+            encoding="utf-8",
+        )
+
+        # Guard: the fixture MUST be missing at least one canonical pattern, or
+        # _ensure_engram_gitignore early-returns and this cell proves nothing.
+        existing_lines = {
+            l.strip() for l in gitignore.read_text(encoding="utf-8").splitlines()
+        }
+        missing = [
+            p for p in engram_core.ENGRAM_GITIGNORE_PATTERNS
+            if p not in existing_lines
+        ]
+        assert missing, (
+            "fixture .gitignore already contains every canonical pattern — the "
+            "function would early-return and this cell would not exercise the "
+            "rewrite path it exists to test"
+        )
+
+        (self.tmp / "forum-token").write_text("deadbeef\n", encoding="utf-8")
+
+        self.server._ensure_engram_gitignore(self.tmp)
+
+        content = gitignore.read_text(encoding="utf-8")
+        lines = {l.strip() for l in content.splitlines()}
+        assert "forum-token" in lines, (
+            "forced refresh did not write a forum-token line — the #1459 bearer "
+            "token would stay stageable by a hand `git add -A`"
+        )
+        assert "!diary/diary.db" in lines, (
+            "Refresh dropped the hand-added negation — this would silently "
+            "re-ignore diary.db on an install that had un-ignored it"
+        )
+
+        # The file is actually ignored by git (this half is skipped cleanly
+        # where git is unavailable).
+        if shutil.which("git") is None:
+            return
+        _init_repo(self.tmp)
+        r = subprocess.run(
+            ["git", "check-ignore", "--", "forum-token"],
+            cwd=str(self.tmp),
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, (
+            "Expected 'forum-token' to be gitignored (check-ignore rc=0); "
+            f"got rc={r.returncode}, stdout={r.stdout!r}, stderr={r.stderr!r}"
+        )
