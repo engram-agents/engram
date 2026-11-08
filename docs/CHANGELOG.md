@@ -11,6 +11,19 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Added
 
+- **Bootstrap asks before it touches `~/.claude/settings.json`, never replaces a corrupt one, and keeps the data home owner-only (#4445).**
+  `bootstrap.py` no longer sets `cleanupPeriodDays` by itself. It does so only for `--retention-days N` (ASCII digits only, 1 to 36500, any order with
+  `--force`), which the `engram-first-session` skill passes only when the user gave a number. Without the flag the file is never read or
+  written. With it: an absent file is created (0600), a valid one is merged atomically (mode kept), and an existing
+  `cleanupPeriodDays` is kept. A `settings.json` that is not a JSON object is copied to `settings.json.corrupt.<UTC>`, left
+  byte-identical, and the run refuses at the very start, before anything is created, so repairing the file and re-running works; the old `except ...: settings = {}` replace path is gone. New `engram_home_perms.tighten_data_home()`
+  (essential tier) makes the ENGRAM home and its data directories (`diary`, `sessions`, `compact`, `history`, `health-snapshots`, `session-logs-archive`, `claude-projects-archive`, `db-backup`, `evidence-archive`, `logs`, `telemetry`, `session-start-overflow`, `tripwire-overflow`): owner-only; named ACL grants such as the operator's are preserved and inherited (a preserved default ACL entry means files created later under an inherited operator grant stay operator-readable, which reaches memory text such as the overflow files, not only the viz health snapshots).
+  Directories and files lose their group and other bits (a directory is never widened: 0500 stays 0500, 0755 becomes 0700), as do top-level files such as `knowledge.db`; a regular file with more than one hard link is skipped and reported, so nothing outside the tree changes mode; it resolves a symlinked ENGRAM_HOME root once, never follows symlinks inside the tree and never touches
+  `.git`, `marketplace`, `venv`, `tools`. Owner-only EXCEPT on paths carrying a named-user ACL (Linux), where the owning-group and other
+  entries are cleared and the named entries and the mask are preserved, so the cross-user viz operator keeps read access; the ACL
+  is rewritten in place (never `chmod`, never `setfacl`), a directory's default ACL gets the same rewrite, and those paths are
+  reported as `acl_preserved` (`access`, `default` or `both`). It runs at bootstrap (both targets) and at every SessionStart (one counts-only stderr line, when something changed or a path could not be tightened, so a home left loose is visible). A settings.json that cannot be written (disk error, or a lone-surrogate escape that cannot be encoded) is refused with the install otherwise complete.
+
 - **Cascade: eligible shapes at hand, resolve replies that say what is next, and the unblock run (#4421).**
   Every `engram_cascade_frontier` packet now carries `eligible_shapes` (and `acknowledge_blocked_by` when non-empty),
   and the reply gets a `next_step` sentence naming the allowed `resolution_kind` of every frontier node.

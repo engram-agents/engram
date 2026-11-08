@@ -520,6 +520,37 @@ def _record_engram_home() -> None:
         pass
 
 
+def _tighten_engram_home() -> None:
+    """#4445: make the ENGRAM data home owner-only (ACL-aware), once per session, so a
+    loose child created since the last session is caught. Never raises. Hook stdout is
+    the context channel, so it writes ONE bounded line to stderr (counts only, never paths),
+    only when something changed or a path could not be tightened (so a loose home is visible)."""
+    try:
+        _dir = resolve_runtime_dir(ENGRAM_HOME, "engram_home_perms.py")
+        if _dir not in sys.path:
+            sys.path.insert(0, _dir)
+        from engram_home_perms import tighten_data_home
+        res = tighten_data_home(ENGRAM_HOME)
+        if res.changed and res.errors:
+            print(
+                f"[engram] data home permissions: {len(res.changed)} path(s) tightened, "
+                f"{len(res.errors)} could not be tightened",
+                file=sys.stderr,
+            )
+        elif res.changed:
+            print(
+                f"[engram] data home permissions tightened: {len(res.changed)} path(s)",
+                file=sys.stderr,
+            )
+        elif res.errors:
+            print(
+                f"[engram] data home permissions: {len(res.errors)} path(s) could not be tightened",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+
+
 def _runtime_platform() -> str | None:
     """Return the baked plugin platform name when available.
 
@@ -3737,6 +3768,7 @@ def _main_impl() -> None:
         pass  # fail-soft: never break SessionStart for registration
 
     _record_engram_home()
+    _tighten_engram_home()
 
     if os.path.exists(CURRENT_USER_PATH):
         try:

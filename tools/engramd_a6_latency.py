@@ -199,6 +199,9 @@ RUNTIME_FILES = {
     # #3907: the per-seat home registry (#3863 PR 5). The session-start hook imports it to record a non-default
     # home; without this entry the closure cell flags it. tiers.json ships it (convenience tier).
     "engram_home_registry.py": "src/engram/engram_home_registry.py",
+    # #4445: the owner-only data-home tightener. The session-start hook imports it once per session
+    # (_tighten_engram_home); without this entry the closure cell flags it. tiers.json ships it (essential tier).
+    "engram_home_perms.py": "src/engram/engram_home_perms.py",
     # #3821: the surface arm's hook. Its fire loads nothing the tripwire / session-start entries above do not already
     # cover (derived by firing the built hook; the closure cell in tests/test_engramd_a6_latency.py keeps it honest).
     "hooks/engram-surface-hook.py": "src/engram/hooks/claude/engram-surface-hook.py",

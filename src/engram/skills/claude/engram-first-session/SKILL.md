@@ -60,6 +60,8 @@ BOOTSTRAP="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/bootstrap.py}"
 [ ! -f "$BOOTSTRAP" ] && { echo "ERROR: cannot locate bootstrap.py"; exit 1; }
 ```
 
+**Ask the user one question first (#4445), in plain words:** "Claude Code deletes chat transcripts after about 30 days. ENGRAM keeps its evidence in those transcripts, so it works best if you keep them much longer. How many days should Claude Code keep them? 36500 means about 100 years. Saying no is fine: I will leave your settings alone." If the user gives a whole number from 1 to 36500, add `--retention-days <that number>` after `"$BOOTSTRAP"` in the command below. If they say no or do not answer, add nothing: bootstrap then never reads or writes `~/.claude/settings.json`. Never pick a number for them. If bootstrap prints `[bootstrap] REFUSED: ... settings.json cannot be edited`, show the user that line (their file was copied to `settings.json.corrupt.<time>` and left unchanged) and let them repair it; nothing else was written, so the same command can be re-run once it is fixed.
+
 Run it (it creates the ENGRAM home directory + seed graph + renders install-time placeholders + writes `first-run-pending`):
 
 ```bash

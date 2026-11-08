@@ -8,7 +8,6 @@
 # (O_RDONLY plus an attribute lookup the collector cannot resolve); the other new lines are existing
 # append / copy sites, reviewed and left as they are.
 src/engram/bootstrap.py::_render_codex_target::write_text
-src/engram/bootstrap.py::_set_cleanup_period_days::write_text
 src/engram/bootstrap.py::main::write_text
 src/engram/bootstrap.py::main::write_text
 src/engram/bootstrap.py::merge_codex_config_toml::write_text

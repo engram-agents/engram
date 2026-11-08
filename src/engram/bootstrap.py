@@ -38,9 +38,11 @@ import errno
 import json
 import os
 import re
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 
 def _now_iso() -> str:
@@ -629,30 +631,162 @@ def _render_codex_target(substitutions: dict[str, str], force_identity_file: boo
     print(f"  AGENTS.md → {CODEX_HOME}/AGENTS.md", flush=True)
 
 
-def _set_cleanup_period_days(claude_home: Path, days: int = 36500) -> None:
-    """Merge cleanupPeriodDays into ~/.claude/settings.json if not already set.
+def _utc_stamp() -> str:
+    """UTC time as `%Y%m%dT%H%M%SZ`, the suffix of a settings.json.corrupt.<UTC> backup."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-    Claude Code's default ~30-day rolling trim silently deletes chat transcripts.
-    For ENGRAM agents, transcripts are identity history and ENGRAM evidence anchors
-    — losing them means losing re-auditability for any observation cited by jsonl
-    path. Setting a large value (36500 = 100 years) at install time preserves them
-    without the user needing to know the trim exists.
 
-    Only sets the key when absent — never overrides a value the user already chose.
+def _json_indent(text: str) -> "int | str":
+    """The indent of the first indented line of `text` (spaces or a tab), else 2."""
+    m = re.search(r"^([ \t]+)\S", text, re.MULTILINE)
+    if not m:
+        return 2
+    lead = m.group(1)
+    return "\t" if lead.startswith("\t") else len(lead)
+
+
+def _atomic_write_text(path: Path, text: str, mode: int) -> None:
+    """Write `text` to `path` via a temp file in the same directory: fsync, then os.replace.
+
+    The temp is created exclusively with `mode` and unlinked on any failure, so a crash
+    leaves either the old file or the new one, never a partial settings.json.
+    """
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _check_settings(claude_home: Path) -> "tuple[Path, dict | None, str]":
+    """Read-only validation of ~/.claude/settings.json, shared by the preflight and the final step.
+
+    Returns (target, settings, text): `target` is where a write would go (a symlinked
+    settings.json is edited through the link, since replacing the link would detach it),
+    `settings` is the parsed object, or None when the file is absent (fine), `text` its text.
+    A dangling symlink, an unreadable file, or anything that is not a JSON object REFUSES
+    with SystemExit; the non-object case first copies the file with _backup_once to
+    settings.json.corrupt.<UTC>. The file itself is never modified.
     """
     settings_path = claude_home / "settings.json"
+    if _is_dangling_symlink(settings_path):
+        _refuse_dangling(settings_path)
+    target = Path(os.path.realpath(settings_path)) if settings_path.is_symlink() else settings_path
+    if not _target_present(target):
+        return target, None, ""
     try:
-        settings: dict = json.loads(settings_path.read_text()) if settings_path.exists() else {}
-    except (json.JSONDecodeError, OSError):
-        settings = {}
-    if "cleanupPeriodDays" not in settings:
-        settings["cleanupPeriodDays"] = days
-        settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+        raw = target.read_bytes()
+    except OSError as e:
+        raise SystemExit(
+            f"[bootstrap] REFUSED: cannot read {settings_path} ({e}). Nothing was changed; "
+            f"fix its permissions, then re-run."
+        )
+    reason = None
+    settings = None
+    text = ""
+    try:
+        text = raw.decode("utf-8")
+        settings = json.loads(text)
+        if not isinstance(settings, dict):
+            reason = f"it holds JSON {type(settings).__name__}, not an object"
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        reason = f"it is not valid JSON ({e})"
+    if reason is not None:
+        backup = settings_path.parent / f"settings.json.corrupt.{_utc_stamp()}"
+        existed = _target_present(backup)
+        _backup_once(settings_path, backup)
+        saved = (
+            f"an earlier backup already at {backup} was left untouched"
+            if existed else f"a copy was saved to {backup}"
+        )
+        raise SystemExit(
+            f"[bootstrap] REFUSED: {settings_path} cannot be edited: {reason}; {saved}. "
+            f"The file itself was left unchanged. Repair or remove it, then re-run "
+            f"with --retention-days."
+        )
+    return target, settings, text
+
+
+def _preflight_settings(claude_home: Path) -> None:
+    """Run at the very start of main() for `--retention-days` on the Claude target: refuse a
+    bad settings.json BEFORE anything is created, so the user can repair it and simply re-run
+    (once the graph is seeded, bootstrap's existing-DB guard refuses a re-run). Read-only apart
+    from the corrupt-file backup."""
+    _check_settings(claude_home)
+
+
+def _set_cleanup_period_days(claude_home: Path, days: int) -> None:
+    """Merge cleanupPeriodDays into ~/.claude/settings.json, only when the user asked (#4445).
+
+    Called only when `--retention-days N` was given; without the flag bootstrap never
+    reads or writes settings.json. Claude Code's default ~30-day rolling trim deletes chat
+    transcripts, which are the evidence behind ENGRAM observations; the user decides how
+    long to keep them.
+
+    * absent file: created as {"cleanupPeriodDays": N}, mode 0600.
+    * valid JSON object without the key: merged, other keys and indent style kept.
+    * valid JSON object WITH the key: left byte-identical (the earlier choice stands).
+    * anything else (invalid JSON, empty, a list or scalar): copied once to
+      settings.json.corrupt.<UTC>, the file left byte-identical, and the run REFUSES.
+      A settings.json is never replaced after a parse failure.
+    """
+    settings_path = claude_home / "settings.json"
+    # Second check, not a copy of the first: settings.json can change after the preflight.
+    target, settings, text = _check_settings(claude_home)
+    if settings is None:
+        try:
+            claude_home.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(target, json.dumps({"cleanupPeriodDays": days}, indent=2) + "\n", 0o600)
+        except (OSError, UnicodeError) as e:
+            _refuse_settings_write(settings_path, e)
+        _print_retention_set(days, settings_path)
+        return
+    if "cleanupPeriodDays" in settings:
         print(
-            f"  settings.json → cleanupPeriodDays={days} "
-            f"(preserves transcript history; override anytime in {settings_path})",
+            f"  settings.json → cleanupPeriodDays={settings['cleanupPeriodDays']} kept "
+            f"(your earlier choice; --retention-days {days} did not change it; "
+            f"edit {settings_path} to change it)",
             flush=True,
         )
+        return
+    settings["cleanupPeriodDays"] = days
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+        _atomic_write_text(
+            target, json.dumps(settings, indent=_json_indent(text), ensure_ascii=False) + "\n", mode
+        )
+    except (OSError, UnicodeError) as e:
+        # UnicodeError: a lone-surrogate JSON escape ("\\ud800") loads but cannot be encoded
+        # as UTF-8; that is a ValueError, not an OSError, and must not become a traceback.
+        _refuse_settings_write(settings_path, e)
+    _print_retention_set(days, settings_path)
+
+
+def _refuse_settings_write(settings_path: Path, err: Exception) -> None:
+    raise SystemExit(
+        f"[bootstrap] REFUSED: settings.json was not written ({err}). The install is otherwise "
+        f"complete (graph seeded, files rendered, data home tightened); settings.json is "
+        f"unchanged. Fix the cause, or add cleanupPeriodDays to {settings_path} by hand."
+    )
+
+
+def _print_retention_set(days: int, settings_path: Path) -> None:
+    print(
+        f"  settings.json → cleanupPeriodDays={days}: Claude Code keeps your chat "
+        f"transcripts for {days} days before deleting them (change it anytime in "
+        f"{settings_path})",
+        flush=True,
+    )
 
 
 def _db_node_count(db_path: Path) -> int:
@@ -770,21 +904,76 @@ def _predicted_agents_render() -> str | None:
         return None
 
 
-def _parse_args(argv: list[str]) -> bool:
-    """Return True if --force was given. Anything else is an error (no silent ignore)."""
+class _Args(NamedTuple):
+    force: bool
+    retention_days: "int | None"
+
+
+def _parse_args(argv: list[str]) -> _Args:
+    """Return (force, retention_days). Anything else is an error (no silent ignore).
+
+    `--force` is the identity-file overwrite (#4440). `--retention-days N` (#4445) is the
+    only way bootstrap touches ~/.claude/settings.json; N must be an integer 1..36500.
+    """
     force = False
-    for arg in argv:
+    retention_days = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
         if arg == "--force":
             force = True
+        elif arg == "--retention-days":
+            value = argv[i + 1] if i + 1 < len(argv) else None
+            try:
+                # ASCII digits only: int() would also take " 30", "+30", "3_0", Arabic digits.
+                n = int(value) if value is not None and value.isascii() and value.isdigit() else None
+            except ValueError:
+                n = None
+            if n is None or not 1 <= n <= 36500:
+                raise SystemExit(
+                    f"[bootstrap] --retention-days needs an integer from 1 to 36500 (days "
+                    f"Claude Code keeps chat transcripts; 36500 is about 100 years), got "
+                    f"{value if value is not None else 'nothing'!r}"
+                )
+            retention_days = n
+            i += 1
         else:
-            raise SystemExit(f"[bootstrap] unknown argument {arg!r}; the only option is --force")
-    return force
+            raise SystemExit(
+                f"[bootstrap] unknown argument {arg!r}; the options are --force and "
+                f"--retention-days N"
+            )
+        i += 1
+    return _Args(force, retention_days)
+
+
+def _tighten_home_step() -> None:
+    """Make the data home owner-only (#4445); never lets a failure stop the install."""
+    try:
+        import engram_home_perms
+        res = engram_home_perms.tighten_data_home(ENGRAM_HOME)
+    except Exception as e:  # a stale build without the module must not break bootstrap
+        print(f"  data home permissions: not tightened ({type(e).__name__}: {e})", flush=True)
+        return
+    if res.changed or res.acl_preserved or res.errors:
+        print(
+            f"  data home → owner-only: {len(res.changed)} path(s) tightened"
+            + (f", {len(res.acl_preserved)} carrying a named-user ACL (group and other entries cleared, named entries and mask kept)"
+               if res.acl_preserved else "")
+            + (f", {len(res.errors)} skipped (first: {res.errors[0]})" if res.errors else ""),
+            flush=True,
+        )
 
 
 def main() -> None:
     # --force: the one overwrite path for an existing, differing CLAUDE.md (#4440). It is a
     # CLI flag, distinct from the FORCE env var below, which is about the knowledge.db.
-    force_identity_file = _parse_args(sys.argv[1:])
+    _args = _parse_args(sys.argv[1:])
+    force_identity_file = _args.force
+
+    # #4445: a bad settings.json is refused before ANYTHING is created (no ENGRAM_HOME, no
+    # knowledge.db), so repair + plain re-run works. Read-only apart from the backup copy.
+    if _args.retention_days is not None and TARGET == "claude":
+        _preflight_settings(CLAUDE_HOME)
 
     # Refuse to overwrite an existing install — defense-in-depth for the
     # plugin path.
@@ -1046,6 +1235,10 @@ def main() -> None:
     (ENGRAM_HOME / "first-run-pending").write_text(marker_payload)
     print(f"  first-run-pending → {ENGRAM_HOME}/first-run-pending", flush=True)
 
+    # Owner-only data home (#4445), both targets. Runs BEFORE the settings step below so a
+    # refusal there never skips it.
+    _tighten_home_step()
+
     # Target-specific identity doc + hook config
     if TARGET == "claude":
         # #2067: the Claude template no longer folds in compact-instructions.md
@@ -1071,9 +1264,18 @@ def main() -> None:
         )
         print(f"  CLAUDE.md → {CLAUDE_HOME}/CLAUDE.md", flush=True)
 
-        _set_cleanup_period_days(CLAUDE_HOME)
+        # #4445: LAST, and only when asked. It can refuse (a settings.json that is not a
+        # JSON object), which must not skip anything above.
+        if _args.retention_days is not None:
+            _set_cleanup_period_days(CLAUDE_HOME, _args.retention_days)
 
     elif TARGET == "codex":
+        if _args.retention_days is not None:
+            print(
+                "  --retention-days applies to the Claude target only and was ignored "
+                "(settings.json was not touched)",
+                flush=True,
+            )
         _render_codex_target(substitutions, force_identity_file)
 
 

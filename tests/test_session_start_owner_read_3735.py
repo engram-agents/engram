@@ -1478,6 +1478,14 @@ def _snapshot(home: Path) -> dict:
     return snap
 
 
+def _owner_only(home: Path) -> None:
+    """#4445: SessionStart now tightens a loose ENGRAM home and says so on stderr (one line,
+    only when something changed). These tests compare the hook's stderr with the unmodified
+    hook's, so they start from a home that is already owner-only: nothing to change, no line."""
+    import engram_home_perms
+    engram_home_perms.tighten_data_home(home)
+
+
 def _scenario(home, name):
     build_store(home)
     set_flag(home, None)
@@ -1577,6 +1585,7 @@ def test_f_flag_off_equals_the_unmodified_hook_byte_for_byte(scenario, tmp_path,
     src_home = tmp_path / "src"
     src_home.mkdir()
     source = _scenario(src_home, scenario)
+    _owner_only(src_home)
     homes = {}
     for label in ("old", "new"):
         h = tmp_path / label
@@ -1708,6 +1717,7 @@ def test_i_every_off_state_is_the_direct_path_and_never_touches_the_client(state
     build_store(home)
     seed_marker(home)
     set_flag(home, **dict(OFF_STATES)[state])
+    _owner_only(home)
     new_home, old_home = tmp_path / "new", tmp_path / "old"
     shutil.copytree(home, new_home)
     shutil.copytree(home, old_home)

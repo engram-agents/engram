@@ -119,7 +119,11 @@ def test_C_config_mode_0444(tmp_path):
     before = _snap(cfg)
     _run(home, shared, tmp_path)
     assert _snap(cfg) == before
-    assert cfg.stat().st_mode & 0o777 == 0o444
+    # #4445: SessionStart now strips group/other bits from a top-level file in the data home
+    # (0444 -> 0400). The contract here is that the CONTENT is never rewritten (bytes and
+    # mtime above, on a file nobody can write); the mode is the one thing that may change,
+    # and only by dropping group/other bits.
+    assert cfg.stat().st_mode & 0o777 == 0o400
 
 
 @pytest.mark.parametrize("um", [0o077, 0o002])

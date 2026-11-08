@@ -363,6 +363,7 @@
   "hooks/claude/engram-session-start-hook.py:format_calibration_block",
   "hooks/claude/engram-session-start-hook.py:write_agent_registration",
   "hooks/claude/engram-session-start-hook.py:_record_engram_home",
+  "hooks/claude/engram-session-start-hook.py:_tighten_engram_home",
   "hooks/claude/engram-session-start-hook.py:peer_topology_block",
   "hooks/claude/engram-session-start-hook.py:_get_focus_staleness_days",
   "hooks/claude/engram-session-start-hook.py:_parse_iso_timestamp",

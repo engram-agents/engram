@@ -267,6 +267,11 @@
       "note": "Atomic write + retrying read of config.json (#3607). Stdlib-only. Essential because engram_core and engram_restamp import it (hard dependencies)."
     },
     {
+      "path": "engram_home_perms.py",
+      "tier": "essential",
+      "note": "engram-alpha#4445: tighten_data_home(), the owner-only permission rule for the ENGRAM data home (0700 dirs, no group/other bits on files, ACL-aware, never follows symlinks). Stdlib-only. Essential because bootstrap.py and the SessionStart hook run it; both degrade to 'not tightened' if the module is missing, but a privacy control that silently ships absent is worse than one that is loud, so it is not Convenience."
+    },
+    {
       "path": "engram_home_registry.py",
       "tier": "convenience",
       "note": "Per-seat ENGRAM home registry (#3863 PR 5, ruling R3): the SessionStart hook records a non-default home, viz discovery and the viz-operator ACL tool read it before their glob. Stdlib-only. Every importer is fail-soft (hook swallows, viz and the ACL tool fall back to the glob), so a missing copy degrades to today's behaviour."

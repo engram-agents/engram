@@ -555,13 +555,20 @@ def test_bootstrap_force_reseed_empty_on_nonempty_db_refuses():
 
 # ---------------------------------------------------------------------------
 # Tests for _set_cleanup_period_days (via subprocess — same pattern as above)
+#
+# #4445: bootstrap no longer sets cleanupPeriodDays on its own. It touches settings.json
+# only for `--retention-days N`. The three tests below pinned the old unconditional merge;
+# each is rewritten to the new contract (the full cells live in
+# tests/test_bootstrap_privacy_4445.py).
 # ---------------------------------------------------------------------------
 
 
-def _run_bootstrap_for_cleanup_test(workdir: Path, pre_settings: dict | None = None):
+def _run_bootstrap_for_cleanup_test(
+    workdir: Path, pre_settings: dict | None = None, extra_args: list[str] | None = None
+):
     """Run bootstrap.py in a subprocess and return the resulting settings.json
     content.  pre_settings, if given, is written to CLAUDE_HOME/settings.json
-    before bootstrap runs — used to test the no-override path."""
+    before bootstrap runs. extra_args are passed to bootstrap.py."""
     engram_home = workdir / ".engram"
     claude_home = workdir / ".claude"
     engram_home.mkdir(parents=True)
@@ -588,7 +595,7 @@ def _run_bootstrap_for_cleanup_test(workdir: Path, pre_settings: dict | None = N
     })
     env.pop("ENGRAM_BOOTSTRAP", None)
     result = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
+        [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py"), *(extra_args or [])],
         env=env, capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, (
@@ -598,24 +605,25 @@ def _run_bootstrap_for_cleanup_test(workdir: Path, pre_settings: dict | None = N
     return json.loads(settings_path.read_text()) if settings_path.exists() else {}
 
 
-def test_bootstrap_sets_cleanup_period_days_when_settings_absent():
-    """bootstrap sets cleanupPeriodDays=36500 in settings.json when absent."""
+def test_bootstrap_without_retention_flag_leaves_settings_absent():
+    """No --retention-days: bootstrap does not create settings.json (was: sets 36500)."""
     workdir = Path(tempfile.mkdtemp(prefix="engram_cleanup_test_"))
     try:
         data = _run_bootstrap_for_cleanup_test(workdir)
-        assert data.get("cleanupPeriodDays") == 36500, (
-            f"expected 36500, got {data.get('cleanupPeriodDays')}"
-        )
+        assert data == {}, f"settings.json must stay absent without the flag, got {data}"
+        assert not (workdir / ".claude" / "settings.json").exists()
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def test_bootstrap_sets_cleanup_period_days_merges_into_existing_settings():
-    """bootstrap sets cleanupPeriodDays, preserving existing keys."""
+def test_bootstrap_retention_flag_merges_into_existing_settings():
+    """--retention-days 36500 sets cleanupPeriodDays, preserving existing keys
+    (was: merged unconditionally)."""
     workdir = Path(tempfile.mkdtemp(prefix="engram_cleanup_test_"))
     try:
         data = _run_bootstrap_for_cleanup_test(
-            workdir, pre_settings={"model": "sonnet", "theme": "dark"}
+            workdir, pre_settings={"model": "sonnet", "theme": "dark"},
+            extra_args=["--retention-days", "36500"],
         )
         assert data.get("cleanupPeriodDays") == 36500, (
             f"expected 36500, got {data.get('cleanupPeriodDays')}"
@@ -627,11 +635,13 @@ def test_bootstrap_sets_cleanup_period_days_merges_into_existing_settings():
 
 
 def test_bootstrap_does_not_override_existing_cleanup_period_days():
-    """bootstrap does not overwrite cleanupPeriodDays when already set."""
+    """Even with --retention-days, an already-set cleanupPeriodDays is kept
+    (was: kept without the flag, since the merge was unconditional)."""
     workdir = Path(tempfile.mkdtemp(prefix="engram_cleanup_test_"))
     try:
         data = _run_bootstrap_for_cleanup_test(
-            workdir, pre_settings={"cleanupPeriodDays": 90}
+            workdir, pre_settings={"cleanupPeriodDays": 90},
+            extra_args=["--retention-days", "36500"],
         )
         assert data.get("cleanupPeriodDays") == 90, (
             f"user's value 90 should be preserved, got {data.get('cleanupPeriodDays')}"
