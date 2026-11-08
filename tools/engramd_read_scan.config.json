@@ -170,7 +170,6 @@
   "hooks/claude/engram-end-of-day-hook.py:sleep_recently",
   "hooks/claude/engram-end-of-day-hook.py:main",
   "hooks/claude/engram-forum-prompt-hook.py:_remaining_budget",
-  "hooks/claude/engram-forum-prompt-hook.py:_ipv4_only_urlopen",
   "hooks/claude/engram-forum-prompt-hook.py:_ipv4_only_connect",
   "hooks/claude/engram-forum-prompt-hook.py:_fetch_with_deadline",
   "hooks/claude/engram-forum-prompt-hook.py:_fetch_classified",

@@ -84,7 +84,6 @@ import sys
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -186,7 +185,7 @@ PUBLISH_TIMEOUT_SECONDS = 1.0
 # bound; see _fetch_with_deadline's own docstring for the read loop.
 #
 # Scope note: this budget covers time AFTER a connection is established, not
-# DNS resolution. _ipv4_only_urlopen's own docstring documents why this
+# DNS resolution. _ipv4_only_connect's own docstring documents why this
 # module pins IPv4 explicitly (an mDNS record advertising unreachable IPv6
 # candidates ahead of the working address); DNS itself was separately
 # measured at ~5ms on a reachable forum host, negligible against this
@@ -315,8 +314,8 @@ except Exception:
 # had.
 # ---------------------------------------------------------------------------
 
-def _ipv4_only_urlopen(req: urllib.request.Request, timeout: float):
-    """urlopen, forced to IPv4-only DNS resolution.
+def _ipv4_only_connect(conn) -> None:
+    """conn.connect(), forced to IPv4-only DNS resolution.
 
     The forum host's mDNS record advertises unreachable IPv6 candidates (a
     link-local address plus globally-scoped ones with no route on this LAN)
@@ -326,27 +325,11 @@ def _ipv4_only_urlopen(req: urllib.request.Request, timeout: float):
     compounded across the dead entries, to blow this hook's outer
     UserPromptSubmit budget (observed: multi-second stalls vs. a 5s budget).
     curl doesn't hit this because it races families (Happy Eyeballs); stdlib
-    urllib has no such racing, so pin the family explicitly. See
+    has no such racing, so pin the family explicitly. See
     tools/forum_api.py's ForumClient._execute for the canonical writeup —
     duplicated here (not imported) per this hook's zero-import-back design.
-    """
-    real_getaddrinfo = socket.getaddrinfo
-
-    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-        return real_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
-
-    socket.getaddrinfo = _ipv4_only_getaddrinfo
-    try:
-        return urllib.request.urlopen(req, timeout=timeout)
-    finally:
-        socket.getaddrinfo = real_getaddrinfo
-
-
-def _ipv4_only_connect(conn) -> None:
-    """conn.connect(), forced to IPv4-only DNS resolution -- the http.client
-    analogue of _ipv4_only_urlopen (same rationale: see that function's
-    docstring), applied here because _fetch_with_deadline drives
-    http.client.HTTPConnection directly rather than urlopen.
+    Applied here because _fetch_with_deadline drives
+    http.client.HTTPConnection directly rather than urllib.
     """
     real_getaddrinfo = socket.getaddrinfo
 
