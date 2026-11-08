@@ -697,12 +697,15 @@ class TestAcceptEndpoint:
         )
         assert resp.status_code == 200
 
-    def test_400_missing_agent(self, client):
+    # Removed-test: src/forum/tests/test_qa.py::TestAcceptEndpoint::test_400_missing_agent — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_missing_agent_is_the_token_agent_not_a_400(self, client):
+        # #1459: no `agent` in the body -> the token's agent is the caller; thread 1 does not
+        # exist in this fixture, so the request reaches the handler's own 404.
         resp = client.post(
             "/api/thread/1/accept",
             json={"post_id": 1},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 404
 
     def test_400_missing_post_id(self, client):
         resp = client.post(
@@ -828,12 +831,14 @@ class TestVerifyEndpoint:
         assert "note_html" in data["verification"]
         assert "<strong>bold</strong>" in data["verification"]["note_html"]
 
-    def test_400_missing_agent(self, client):
+    # Removed-test: src/forum/tests/test_qa.py::TestVerifyEndpoint::test_400_missing_agent — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_missing_agent_is_the_token_agent_not_a_400(self, client):
+        # #1459: as above; post 1 does not exist in this fixture -> the handler's 404.
         resp = client.post(
             "/api/post/1/verify",
             json={"note": "some note"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------

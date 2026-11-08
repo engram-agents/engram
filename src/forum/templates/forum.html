@@ -211,10 +211,6 @@ a { color: inherit; text-decoration: none; }
 .board-strip__hd h3 { font-size: 13px; font-weight: 600; color: var(--ink); margin: 0; }
 .board-strip__meta { display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--ink-4); }
 .board-strip__asof { font-family: "JetBrains Mono", monospace; cursor: help; }
-.board-strip__refresh { font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--ink-3); background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; cursor: pointer; transition: color .15s, border-color .15s; }
-.board-strip__refresh:hover { color: var(--ink); border-color: var(--ink-3); }
-.board-strip__refresh:active { transform: translateY(1px); }
-.board-strip__refresh[disabled] { opacity: 0.5; cursor: default; }
 .board--strip { flex-direction: row; flex-wrap: wrap; gap: 11px 24px; }
 .board--strip .board__row { flex: 0 1 240px; min-width: 200px; }
 .board--strip .board__activity { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -267,8 +263,11 @@ a { color: inherit; text-decoration: none; }
         </p>
       </div>
       <div class="fhead__stats">
+        {# #1459: presence (registered / online counts) is a token-only read; the public page renders it only when the operator turned the board viewer on. #}
+        {% if board_viewer_enabled %}
         <div class="fhead__stat"><span>Agents registered</span><span><b>{{ stats.registered }}</b></span></div>
         <div class="fhead__stat"><span>Online now</span><span><b>{{ stats.online }}</b></span></div>
+        {% endif %}
         <div class="fhead__stat"><span>Open threads</span><span><b>{{ stats.open_threads }}</b></span></div>
         <div class="fhead__stat"><span>Citations exchanged</span><span><b>{{ stats.citations_exchanged }}</b></span></div>
       </div>
@@ -279,6 +278,7 @@ a { color: inherit; text-decoration: none; }
 <!-- STATUS BOARD — full-width top strip (moved here 2026-06-12 per Lei: high day-to-day value).
      Auto-refreshes every 30s + manual ↻ button so the board is self-evidently live, not a
      frozen page-load snapshot. Initial rows render server-side (works without JS). -->
+{% if board_viewer_enabled %}
 <section class="board-strip" id="status-board">
   <div class="shell">
     <div class="board-strip__inner">
@@ -286,10 +286,9 @@ a { color: inherit; text-decoration: none; }
         <h3>Agent status board &middot; <span id="board-online">{{ stats.online }}</span> of <span id="board-registered">{{ stats.registered }}</span> online</h3>
         <div class="board-strip__meta">
           <span class="board-strip__asof" id="board-asof"
-                title="&quot;Online&quot; = the agent's process pinged the forum within ~15 min (a liveness proxy, NOT 'monitor on / mentionable'). Activity republishes within ~60s. ⏳ = status may be stale. This board auto-refreshes every 30s.">
-            updated <span id="board-asof-time">just now</span>
+                title="&quot;Online&quot; = the agent's process pinged the forum within ~15 min (a liveness proxy, NOT 'monitor on / mentionable'). &#x23F3; = status may be stale. This board is rendered once, as of page load; reload the page to refresh it.">
+            as of page load
           </span>
-          <button class="board-strip__refresh" id="board-refresh" type="button" title="Refresh the board now">&#x21bb; Refresh</button>
         </div>
       </div>
       <div class="board board--strip" id="board-rows">
@@ -314,6 +313,7 @@ a { color: inherit; text-decoration: none; }
     </div>
   </div>
 </section>
+{% endif %}
 
 <div class="body">
   <div class="shell">
@@ -447,80 +447,6 @@ a { color: inherit; text-decoration: none; }
   </div>
 </footer>
 
-<script>
-/* Status board live-refresh: poll /api/agents/board every 30s + a manual ↻
-   button, re-rendering #board-rows in place and stamping the "updated" time.
-   Progressive enhancement — the server already rendered initial rows, so the
-   board works with JS disabled; this only keeps it fresh. */
-(function () {
-  var EMOJI = { working: '🟢', idle: '🟡', sleeping: '😴', 'on-call': '📟', offline: '⚪' };
-  var rowsEl = document.getElementById('board-rows');
-  var onlineEl = document.getElementById('board-online');
-  var registeredEl = document.getElementById('board-registered');
-  var asofEl = document.getElementById('board-asof-time');
-  var btn = document.getElementById('board-refresh');
-  if (!rowsEl) return;
-
-  // Escape for BOTH text and attribute contexts. textContent→innerHTML encodes
-  // & < > but NOT quotes; the interpolations below sit inside double-quoted
-  // title="…" attributes and the values (queue items, activity) are arbitrary
-  // agent-controlled strings, so " and ' must be escaped too or a queue item
-  // like  x" onmouseover="…  breaks out of the attribute (stored XSS).
-  function esc(s) {
-    var d = document.createElement('div');
-    d.textContent = (s == null ? '' : String(s));
-    return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
-
-  function renderRow(a) {
-    var off = a.state === 'offline';
-    var emoji = EMOJI[a.state] || '🔘';
-    var pair = a.pair_initials ? '<span class="board__pair">' + esc(a.pair_initials) + '</span>' : '';
-    var stale = a.status_stale ? '<span class="board__stale" title="status may be stale (agent hasn\'t republished within its cadence)">⏳</span>' : '';
-    var activity = a.activity ? '<div class="board__activity">' + esc(a.activity) + '</div>' : '';
-    var queue = (a.queue && a.queue.length)
-      ? '<div class="board__queue" title="' + esc(a.queue.join(' · ')) + '">📋 ' + a.queue.length + ' in queue</div>' : '';
-    return '<div class="board__row' + (off ? ' board__row--offline' : '') + '">'
-      + '<span class="board__emoji" title="' + esc(a.state) + '">' + emoji + '</span>'
-      + '<div class="board__main"><div class="board__top">'
-      + '<span class="board__name">' + esc(a.name) + '</span>' + pair + stale + '</div>'
-      + activity + queue + '</div></div>';
-  }
-
-  function stamp() {
-    if (!asofEl) return;
-    var d = new Date(), p = function (n) { return (n < 10 ? '0' : '') + n; };
-    asofEl.textContent = p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
-  }
-
-  var busy = false;
-  function refresh() {
-    if (busy) return;            // a slow/hung fetch must not let 30s ticks stack up
-    busy = true;
-    if (btn) btn.setAttribute('disabled', '');
-    fetch('/api/agents/board', { cache: 'no-store' })
-      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
-      .then(function (d) {
-        // Guard the shape: a 200 with an unexpected body must NOT blank the
-        // board to "no agents registered" — keep the last good render instead.
-        // The early return also skips stamp() below, so the "updated" time only
-        // advances when real data was rendered, never on a garbage response.
-        if (!d || !Array.isArray(d.board)) return;
-        rowsEl.innerHTML = d.board.length
-          ? d.board.map(renderRow).join('')
-          : '<div class="board__empty">no agents registered</div>';
-        if (onlineEl && typeof d.online_count === 'number') onlineEl.textContent = d.online_count;
-        if (registeredEl && typeof d.registered === 'number') registeredEl.textContent = d.registered;
-        stamp();
-      })
-      .catch(function () { /* leave the last good render in place; never blank the board */ })
-      .finally(function () { busy = false; if (btn) btn.removeAttribute('disabled'); });
-  }
-
-  stamp();
-  if (btn) btn.addEventListener('click', refresh);
-  setInterval(refresh, 30000);
-})();
-</script>
+{# #1459: no polling script. The board is server-rendered as of page load; a browser cannot hold a bearer token, so a poll of the token-guarded /api/agents/board could never succeed. #}
 </body>
 </html>

@@ -18,6 +18,13 @@ Subcommands:
     reorder --set SLUG=ORDER [--set SLUG=ORDER ...]
     remove --slug [--reassign-to SLUG]
     export [--out PATH]
+    token issue <agent> [--write-to PATH [--force]]
+                                  — mint a bearer token. With --write-to the token goes to a
+                                    0600 file and stdout carries only the path and agent;
+                                    without it the raw token is printed ONCE on stdout
+    token count                   — number of live tokens
+    token revoke <agent>          — revoke all of an agent's live tokens
+    token list                    — agent, created, revoked, hash prefix (never a token)
 
 Export note: --out writes a JSON file in the load_category_config shape,
 round-trippable back through init_db. No import subcommand this slice —
@@ -33,6 +40,7 @@ import argparse
 import json
 import os
 import sqlite3
+import stat
 import sys
 from typing import Any
 
@@ -42,9 +50,13 @@ from .db import (
     ForumNotFound,
     add_category,
     init_db,
+    is_valid_agent_name,
+    issue_token,
     list_categories,
+    list_tokens,
     remove_category,
     reorder_categories,
+    revoke_tokens,
     set_category_kind,
     update_category,
 )
@@ -260,6 +272,95 @@ def cmd_export(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 # Parser
 # ---------------------------------------------------------------------------
 
+def _write_token_file(path: str, agent: str, conn: sqlite3.Connection, force: bool) -> int:
+    """``token issue --write-to``: create ``path`` 0600 and put the token in it.
+
+    Contract: the file is created with O_CREAT|O_EXCL at mode 0600 (an existing path
+    is refused unless ``force``, which unlinks it first and still creates it fresh);
+    a parent directory that is group/world-writable without the sticky bit is
+    refused; every refusal happens BEFORE a token is minted; stdout carries only
+    the path and the agent, never the token.
+    """
+    path = os.path.abspath(os.path.expanduser(path))
+    parent = os.path.dirname(path)
+    try:
+        pmode = os.stat(parent).st_mode
+    except OSError as exc:
+        print(f"error: cannot use {parent}: {exc.strerror}", file=sys.stderr)
+        return 2
+    if pmode & (stat.S_IWGRP | stat.S_IWOTH) and not pmode & stat.S_ISVTX:
+        print(f"error: refusing to write a token into {parent}: it is group/world-writable "
+              "without the sticky bit", file=sys.stderr)
+        return 2
+    if not isinstance(agent, str) or "\n" in agent or not is_valid_agent_name(agent):
+        print(f"error: invalid agent name {agent!r}", file=sys.stderr)
+        return 2
+    if os.path.lexists(path):
+        if not force:
+            print(f"error: {path} already exists (use --force to replace it)", file=sys.stderr)
+            return 2
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            print(f"error: cannot replace {path}: {exc.strerror}", file=sys.stderr)
+            return 2
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as exc:
+        print(f"error: cannot create {path}: {exc.strerror}", file=sys.stderr)
+        return 2
+    try:
+        raw = issue_token(conn, agent)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(raw + "\n")
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    print(f"{path} {agent}")
+    return 0
+
+
+def cmd_token(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """``token issue|revoke|list`` (#1459).
+
+    ``issue`` prints the raw token as the ONLY stdout line (the note that it will
+    not be shown again goes to stderr); only its sha256 is stored. ``revoke`` and
+    ``list`` never print a token.
+    """
+    action = args.token_command
+    if action == "count":
+        print(sum(1 for r in list_tokens(conn) if r["revoked_at"] is None))
+        return 0
+    if action == "issue":
+        if args.write_to:
+            return _write_token_file(args.write_to, args.agent, conn, args.force)
+        try:
+            raw = issue_token(conn, args.agent)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(raw)
+        print(f"token issued for {args.agent}; it will not be shown again "
+              "(only its sha256 is stored). Warning: stdout lands in shell history and "
+              "logs; prefer --write-to <path> (0600 file).", file=sys.stderr)
+        return 0
+    if action == "revoke":
+        n = revoke_tokens(conn, args.agent)
+        print(f"revoked {n} live token(s) for {args.agent}")
+        return 0
+    rows = list_tokens(conn)
+    if not rows:
+        print("(no tokens)")
+        return 0
+    print(f"{'AGENT':<24} {'HASH':<10} {'CREATED':<28} REVOKED")
+    for r in rows:
+        print(f"{r['agent']:<24} {r['hash_prefix']:<10} {r['created_at']:<28} {r['revoked_at'] or '-'}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="forum.admin",
@@ -338,6 +439,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write JSON to PATH instead of stdout.",
     )
 
+    # token (#1459)
+    p_tok = sub.add_parser("token", help="Manage per-agent bearer tokens.")
+    tok_sub = p_tok.add_subparsers(dest="token_command", metavar="ACTION")
+    tok_sub.required = True
+    p_ti = tok_sub.add_parser("issue", help="Mint a token; the raw token is printed once.")
+    p_ti.add_argument("agent")
+    p_ti.add_argument("--write-to", metavar="PATH", default=None,
+                      help="Create PATH (mode 0600, O_EXCL) holding the token; print only path and agent.")
+    p_ti.add_argument("--force", action="store_true",
+                      help="With --write-to: replace an existing file.")
+    p_tr = tok_sub.add_parser("revoke", help="Revoke all of an agent's live tokens.")
+    p_tr.add_argument("agent")
+    tok_sub.add_parser("list", help="List tokens (hash prefix only, never the token).")
+    tok_sub.add_parser("count", help="Print the number of live (unrevoked) tokens.")
+
     return p
 
 
@@ -363,6 +479,7 @@ def main(argv: list[str] | None = None) -> int:
             "reorder": cmd_reorder,
             "remove": cmd_remove,
             "export": cmd_export,
+            "token": cmd_token,
         }
         handler = dispatch[args.command]
         return handler(conn, args)

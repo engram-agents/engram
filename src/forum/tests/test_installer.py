@@ -14,6 +14,7 @@ inspect stdout/stderr. No systemd calls are made in --dry-run mode.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -166,6 +167,7 @@ class TestTemplateRendering:
                 filtered.append(line)
         rendered = "\n".join(filtered)
         # Substitute {{FORUM_HOME}} and port.
+        rendered = rendered.replace("{{HOST}}", "127.0.0.1")
         rendered = rendered.replace("{{FORUM_HOME}}", service_dir)
         rendered = rendered.replace("5002", port)
         # No --baton-login-map given: the installer renders the placeholder to nothing.
@@ -420,6 +422,17 @@ def _stub_path(tmp_path: Path, primary_group: str = "agents") -> tuple[Path, Pat
         f = stub / name
         f.write_text(f'#!/bin/sh\necho "{name} $*" >> "{log}"\nexit 97\n')
         f.chmod(0o755)
+    # #1459 round 2: the installer decides "loopback" by PARSING the host with python3's
+    # ipaddress, and a python3 that fails means "not loopback" (fail-safe). So the read-only
+    # loopback probe (`python3 -B -c ...`, #1459 round 4) is passed through to the real interpreter; every OTHER python3 call
+    # (`-m venv`, anything mutating) still fails loud and is logged, as before.
+    real_py = shutil.which("python3") or sys.executable
+    (stub / "python3").write_text(
+        '#!/bin/sh\n'
+        'case "$1 $2 $3" in\n'
+        f'  "-B -c import ipaddress,sys;"*) exec "{real_py}" "$@" ;;\n'
+        'esac\n'
+        f'echo "python3 $*" >> "{log}"\nexit 97\n')
     real_id = subprocess.run(["which", "id"], capture_output=True, text=True).stdout.strip()
     idf = stub / "id"
     idf.write_text(

@@ -160,9 +160,10 @@ class TestPostEndpointCharsetGuard:
                 "body_md": "body",
             },
         )
-        assert resp.status_code == 400
+        # #1459: a malformed name is not the token's agent -> refused by the guard.
+        assert resp.status_code == 403
         data = json.loads(resp.data)
-        assert "invalid agent name" in data["error"]
+        assert data["error"] == "identity mismatch"
 
     def test_valid_agent_succeeds(self, client):
         resp = client.post(
@@ -194,18 +195,18 @@ class TestPostEndpointCharsetGuard:
             f"/api/thread/{tid}/read",
             json={"agent": "sol+evil"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 403  # #1459: identity mismatch, refused before the handler
         data = json.loads(resp.data)
-        assert "invalid agent name" in data["error"]
+        assert data["error"] == "identity mismatch"
 
     def test_invalid_agent_in_status_returns_400(self, client):
         resp = client.post(
             "/api/agents/status",
             json={"agent": "sol+evil", "state": "idle"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 403  # #1459: identity mismatch, refused before the handler
         data = json.loads(resp.data)
-        assert "invalid agent name" in data["error"]
+        assert data["error"] == "identity mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -216,9 +217,9 @@ class TestPostEndpointCharsetGuard:
 class TestInboxEndpointCharsetGuard:
     def test_invalid_name_in_url_returns_400(self, client):
         resp = client.get("/api/agent/sol+evil/inbox")
-        assert resp.status_code == 400
+        assert resp.status_code == 403  # #1459: not the token's agent -> refused before the handler
         data = json.loads(resp.data)
-        assert "invalid agent name" in data["error"]
+        assert data["error"] == "identity mismatch"
 
     def test_valid_name_in_url_succeeds(self, client):
         resp = client.get("/api/agent/sol/inbox")
@@ -235,13 +236,11 @@ class TestInboxEndpointCharsetGuard:
 
 class TestGetPathPresenceBumps:
     def test_threads_endpoint_ignores_invalid_agent(self, client):
+        # #1459: a GET naming an agent is guarded; a malformed name is refused (and, as
+        # before, never upserted as an agent).
         resp = client.get("/api/threads?agent=sol%2Bevil")
-        assert resp.status_code == 200
-        data = json.loads(resp.data)
-        assert "threads" in data
+        assert resp.status_code == 403
 
     def test_agents_online_ignores_invalid_agent(self, client):
         resp = client.get("/api/agents/online?agent=sol%2Bevil")
-        assert resp.status_code == 200
-        data = json.loads(resp.data)
-        assert "online" in data
+        assert resp.status_code == 403  # #1459: guarded; never upserted

@@ -256,21 +256,31 @@ def test_string_agent_control_still_succeeds(world, cell):
     assert resp.status_code in (200, 201), f"{resp.status_code}: {resp.data[:200]!r}"
 
 
+# Removed-test: src/forum/tests/test_nonbaton_non_string_3436.py::test_empty_string_agent_is_still_400_required — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
 @pytest.mark.parametrize("cell", AGENT_ROUTES, ids=[route_id(c) for c in AGENT_ROUTES])
-def test_empty_string_agent_is_still_400_required(world, cell):
+def test_empty_string_agent_names_nothing_and_the_token_agent_is_the_caller(world, cell):
+    # #1459: the caller is the token's agent; an empty `agent` names nobody, so it is no
+    # longer a 400 "agent is required" (the handler does not read the field at all).
     route, variant = cell
     method, url, body = agent_request(world, route, variant, "")
     resp = send(world, method, url, body)
-    assert (resp.status_code, err_of(resp)) == (400, "agent is required")
+    assert err_of(resp) != "agent is required", err_of(resp)
+    assert resp.status_code in (200, 201, 403), (resp.status_code, resp.data[:200])  # 403: accept = asker only
 
 
+# Removed-test: src/forum/tests/test_nonbaton_non_string_3436.py::test_invalid_string_agent_is_still_400_invalid — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
 @pytest.mark.parametrize("cell", AGENT_ROUTES, ids=[route_id(c) for c in AGENT_ROUTES])
-def test_invalid_string_agent_is_still_400_invalid(world, cell):
+def test_invalid_string_agent_is_a_403_identity_mismatch_that_writes_nothing(world, cell):
+    # #1459: a malformed name cannot be the token's agent, so the guard refuses it as an
+    # identity mismatch before any handler runs (it used to be the handler's 400).
     route, variant = cell
+    prime(world, route)
     method, url, body = agent_request(world, route, variant, "bad name!")
+    before = (snapshot(world), extra_state(world))
     resp = send(world, method, url, body)
-    assert resp.status_code == 400, resp.data
-    assert "invalid agent name" in err_of(resp), err_of(resp)
+    assert resp.status_code == 403, resp.data
+    assert err_of(resp) == "identity mismatch", err_of(resp)
+    assert (snapshot(world), extra_state(world)) == before, "a refused request wrote something"
 
 
 def test_string_state_control_and_invalid_string_state_still_400(world):

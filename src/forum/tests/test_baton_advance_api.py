@@ -458,7 +458,9 @@ class TestExistingGatesPreserved:
         world.seed()
         r = world.client.post("/api/projects/PR-9001/advance", json={"agent": COLLEAGUE})
         assert r.status_code == 400
-        r = world.client.post("/api/projects/PR-9001/advance", json={"to_agent": SEAT})
+        # #1459: `agent` is no longer a body field a client must send (the caller is the
+        # token's agent), so the missing-`to_agent` half is the only missing-field cell.
+        r = world.client.post("/api/projects/PR-9001/advance", json={"agent": COLLEAGUE})
         assert r.status_code == 400
 
     def test_fairy_phase_baton_refuses_naming_the_actual_phase(self, world):

@@ -21,3 +21,37 @@ def _stub_pr_identity(monkeypatch):
         monkeypatch.setattr(gate, "_pr_identity",
                             lambda pr_number, repo: ("exists", None), raising=True)
     yield
+
+
+# ---------------------------------------------------------------------------
+# #1459: forum auth plumbing (TEST-ONLY; the logic lives in auth_plumbing.py).
+#
+# The server's one before_request guard refuses writes (and reads naming an agent)
+# without a bearer token for that agent. The ~90 existing forum test files predate it
+# and call the Flask test client as a named agent. Rather than weaken the guard, every
+# test client this directory creates attaches a token for the identity each request
+# names. Tests of the guard itself mark themselves ``raw_auth`` and see the real,
+# unaided server. No production switch bypasses the guard.
+# ---------------------------------------------------------------------------
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "raw_auth: do not add the #1459 test-client auth plumbing; exercise the real guard")
+
+
+@pytest.fixture(autouse=True)
+def _forum_test_client_auth(request, monkeypatch):
+    if request.node.get_closest_marker("raw_auth"):
+        yield
+        return
+    from flask import Flask
+
+    from forum.tests.auth_plumbing import wrap_client
+
+    real_test_client = Flask.test_client
+
+    def test_client_with_auth(self, *args, **kwargs):
+        return wrap_client(real_test_client(self, *args, **kwargs))
+
+    monkeypatch.setattr(Flask, "test_client", test_client_with_auth)
+    yield

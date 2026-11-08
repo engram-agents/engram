@@ -107,7 +107,7 @@ def app(tmp_path, store, allocator):
     conn = sqlite3.connect(db_path)
     init_db(conn)
     conn.close()
-    application = create_app(db_path, audit_path)
+    application = create_app(db_path, audit_path, enable_board_viewer=True)
     application.config["TESTING"] = True
     application.config["COORD_STORE"] = store
     application.config["COORD_ALLOCATOR"] = allocator
@@ -614,7 +614,7 @@ class TestApiBoardProjects:
         conn = sqlite3.connect(db_path)
         init_db(conn)
         conn.close()
-        app = create_app(db_path, audit)
+        app = create_app(db_path, audit, enable_board_viewer=True)
         app.config["TESTING"] = True
         c = app.test_client()
         assert c.get("/api/board/projects").status_code == 503
@@ -686,7 +686,7 @@ class TestApiBoardUpdates:
         conn = sqlite3.connect(db_path)
         init_db(conn)
         conn.close()
-        app = create_app(db_path, audit)
+        app = create_app(db_path, audit, enable_board_viewer=True)
         app.config["TESTING"] = True
         c = app.test_client()
         assert c.get("/api/board/updates").status_code == 503
@@ -720,7 +720,7 @@ class TestHtmlBoard:
         conn = sqlite3.connect(db_path)
         init_db(conn)
         conn.close()
-        app = create_app(db_path, audit)
+        app = create_app(db_path, audit, enable_board_viewer=True)
         app.config["TESTING"] = True
         c = app.test_client()
         resp = c.get("/board")

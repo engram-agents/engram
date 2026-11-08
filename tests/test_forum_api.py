@@ -91,7 +91,7 @@ def _mock_response(data: dict, status: int = 200):
 def test_get_happy_path():
     client = ForumClient("http://localhost:5002")
     expected = {"threads": ["ariadne", "borges"]}
-    with patch("urllib.request.urlopen", return_value=_mock_response(expected)) as mock_open:
+    with patch("tools.forum_api.forum_urlopen", return_value=_mock_response(expected)) as mock_open:
         result = client.get("/api/dm", params={"agent": "luria"})
     assert result == expected
     called_url = mock_open.call_args[0][0].full_url
@@ -101,14 +101,14 @@ def test_get_happy_path():
 
 def test_get_builds_url_without_params():
     client = ForumClient("http://localhost:5002")
-    with patch("urllib.request.urlopen", return_value=_mock_response({"ok": True})) as mock_open:
+    with patch("tools.forum_api.forum_urlopen", return_value=_mock_response({"ok": True})) as mock_open:
         client.get("/api/dm")
     assert mock_open.call_args[0][0].full_url == "http://localhost:5002/api/dm"
 
 
 def test_get_network_error_raises_forum_network_error():
     client = ForumClient("http://localhost:5002")
-    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+    with patch("tools.forum_api.forum_urlopen", side_effect=urllib.error.URLError("refused")):
         with pytest.raises(ForumNetworkError) as exc_info:
             client.get("/api/dm")
     assert exc_info.value.exit_code == EXIT_UNREACHABLE
@@ -118,7 +118,7 @@ def test_get_network_error_raises_forum_network_error():
 def test_get_http_error_raises_forum_http_error():
     client = ForumClient("http://localhost:5002")
     err = urllib.error.HTTPError("http://localhost:5002/api/dm", 404, "Not Found", {}, io.BytesIO(b"not found"))
-    with patch("urllib.request.urlopen", side_effect=err):
+    with patch("tools.forum_api.forum_urlopen", side_effect=err):
         with pytest.raises(ForumHttpError) as exc_info:
             client.get("/api/dm")
     assert exc_info.value.status == 404
@@ -134,7 +134,7 @@ def test_post_happy_path():
     client = ForumClient("http://localhost:5002")
     expected = {"seq": 5, "ts": "2026-06-26T17:00:00Z"}
     payload = {"agent": "luria", "body": "hello borges"}
-    with patch("urllib.request.urlopen", return_value=_mock_response(expected)) as mock_open:
+    with patch("tools.forum_api.forum_urlopen", return_value=_mock_response(expected)) as mock_open:
         result = client.post("/api/dm/borges", payload)
     assert result == expected
     req = mock_open.call_args[0][0]
@@ -145,7 +145,7 @@ def test_post_happy_path():
 
 def test_post_network_error_raises_forum_network_error():
     client = ForumClient("http://localhost:5002")
-    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("timeout")):
+    with patch("tools.forum_api.forum_urlopen", side_effect=urllib.error.URLError("timeout")):
         with pytest.raises(ForumNetworkError):
             client.post("/api/projects/PR-1/flip", {"agent": "luria"})
 
@@ -156,7 +156,7 @@ def test_post_http_400_raises_forum_http_error():
         "http://localhost:5002/api/projects/PR-1/flip", 400, "Bad Request", {},
         io.BytesIO(b'{"error": "invalid participant"}')
     )
-    with patch("urllib.request.urlopen", side_effect=err):
+    with patch("tools.forum_api.forum_urlopen", side_effect=err):
         with pytest.raises(ForumHttpError) as exc_info:
             client.post("/api/projects/PR-1/flip", {})
     assert exc_info.value.status == 400

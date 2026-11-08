@@ -542,16 +542,86 @@ CURL_MAX_TIME="${FORUM_MENTION_MAX_TIME_SECONDS:-10}"
 # (space-separated after time_total) for the phase named on rc 28.
 # Sets RESP, _CURL_RC, _CURL_T and the phase fields; returns curl's own status.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Forum bearer token (#1459). The same rule as forum_api.load_forum_token: the
+# environment variable ENGRAM_FORUM_TOKEN when set and non-empty, else the first line of
+# ${ENGRAM_HOME:-$HOME/.engram}/forum-token, whitespace-trimmed. A token file readable by
+# group or others is REFUSED (never used). The token rides to curl on STDIN as a curl
+# config line (`curl -K -`), never in argv, so `ps` cannot show it; printf is a shell
+# builtin, so it is not an exec'd argv either.
+# _forum_token sets _TOKEN (empty when none is configured) and returns 0;
+# returns 1 when the file is refused or the token has a character that cannot ride in a
+# curl config line, and sets _TOKEN_WHY (never the token).
+# ---------------------------------------------------------------------------
+_TOKEN_WARNED=0
+_TOKEN=""
+_TOKEN_WHY=""
+_forum_token_file() { printf '%s' "${ENGRAM_HOME:-$HOME/.engram}/forum-token"; }
+_forum_token() {
+    local _f _m _t=""
+    _TOKEN=""; _TOKEN_WHY=""
+    if [ -n "${ENGRAM_FORUM_TOKEN-}" ]; then
+        _t="$ENGRAM_FORUM_TOKEN"
+    else
+        _f="$(_forum_token_file)"
+        if [ -L "$_f" ] && [ ! -e "$_f" ]; then
+            # A link whose target is gone is a broken setup, not "no token configured".
+            _TOKEN_WHY="forum token file $_f is a dangling symlink (its target does not exist); refusing it"
+            if [ "$_TOKEN_WARNED" -eq 0 ]; then
+                _TOKEN_WARNED=1
+                echo "forum monitor: $_TOKEN_WHY" >&2
+            fi
+            return 1
+        fi
+        [ -f "$_f" ] || return 0
+        # -L: a symlinked token file is judged by its TARGET (the Python clients' os.stat
+        # follows links too); without it stat reports the link's own mode, 777.
+        _m="$(stat -L -c '%a' "$_f" 2>/dev/null || stat -L -f '%Lp' "$_f" 2>/dev/null)"
+        case "$_m" in
+            ''|*[!0-7]*) _TOKEN_WHY="cannot read the mode of $_f"; return 1 ;;
+        esac
+        if [ $(( 8#$_m & 8#077 )) -ne 0 ]; then
+            _TOKEN_WHY="forum token file $_f is group- or world-readable; refusing it (chmod 600 $_f)"
+            if [ "$_TOKEN_WARNED" -eq 0 ]; then
+                _TOKEN_WARNED=1
+                echo "forum monitor: $_TOKEN_WHY" >&2
+            fi
+            return 1
+        fi
+        IFS= read -r _t < "$_f" || true
+    fi
+    # trim surrounding whitespace
+    _t="${_t#"${_t%%[![:space:]]*}"}"; _t="${_t%"${_t##*[![:space:]]}"}"
+    case "$_t" in
+        *[!A-Za-z0-9._~+/=-]*) _TOKEN_WHY="forum token has a character outside A-Za-z0-9._~+/=-; refusing it"; return 1 ;;
+    esac
+    _TOKEN="$_t"
+}
+
 _curl_fetch() {
-    local _out _w
-    _out="$(curl -s --fail --max-time "$1" -w '\n%{time_total} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' "$2" 2>/dev/null)"
+    local _out _w _tok
+    _CURL_HTTP=""
+    if ! _forum_token; then
+        # Refused token: a failure of its own (rc 77), reported through the same edge
+        # line as any other failed poll, so it is one line per state change, not per poll.
+        _CURL_RC=77; RESP=""; _CURL_T=""; _CURL_DNS=""; _CURL_TCP=""; _CURL_TLS=""; _CURL_TTFB=""
+        _CURL_HTTPS=0
+        return 77
+    fi
+    _tok="$_TOKEN"
+    if [ -n "$_tok" ]; then
+        _out="$({ printf 'header = "Authorization: Bearer %s"\n' "$_tok"; } 2>/dev/null \
+            | curl -K - -s --fail --max-time "$1" -w '\n%{time_total} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{http_code}' "$2" 2>/dev/null)"
+    else
+        _out="$(curl -s --fail --max-time "$1" -w '\n%{time_total} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{http_code}' "$2" 2>/dev/null)"
+    fi
     _CURL_RC=$?
     case "$_out" in
         *$'\n'*) RESP="${_out%$'\n'*}"; _w="${_out##*$'\n'}" ;;
         *)       RESP="$_out"; _w="" ;;
     esac
     _CURL_T=""; _CURL_DNS=""; _CURL_TCP=""; _CURL_TLS=""; _CURL_TTFB=""
-    read -r _CURL_T _CURL_DNS _CURL_TCP _CURL_TLS _CURL_TTFB <<< "$_w"
+    read -r _CURL_T _CURL_DNS _CURL_TCP _CURL_TLS _CURL_TTFB _CURL_HTTP <<< "$_w"
     case "$2" in https://*) _CURL_HTTPS=1 ;; *) _CURL_HTTPS=0 ;; esac
     [ "$_CURL_RC" -eq 0 ] || RESP=""
     return "$_CURL_RC"
@@ -603,7 +673,12 @@ _curl_detail() {
     case "$_CURL_RC" in
         6)  _m="could not resolve host" ;;
         7)  _m="connect failed" ;;
-        22) _m="HTTP error" ;;
+        22) case "${_CURL_HTTP-}" in
+                401) _m="HTTP 401: forum token missing or invalid; put it in $(_forum_token_file) (mode 0600) or set ENGRAM_FORUM_TOKEN" ;;
+                403) _m="HTTP 403: the forum token belongs to a different agent than this monitor polls as" ;;
+                *)   _m="HTTP error" ;;
+            esac ;;
+        77) _m="$_TOKEN_WHY" ;;
         28) _m="timed out" ;;
         35) _m="TLS handshake failed" ;;
         52) _m="empty reply" ;;
@@ -671,6 +746,34 @@ BUF="$SEEN.buf"
 : > "$BUF"          # fresh arm — no pending burst carried over from a prior run
 _WINDOW_OPEN_TS=""  # empty = no window currently open
 
+# The ONE forum_field definition of this script (round 2). Both python blocks below (the
+# append path and the flush path) take it from this variable ("$_FORUM_FIELD_PY" is
+# concatenated in front of each block's own source), so the two cannot drift apart. The text
+# must hold no single quote (it lives inside a single-quoted bash string).
+_FORUM_FIELD_PY='
+import unicodedata
+# #1459 PR A: forum-written text is DATA. Same rules as the PR B forum_field (merged as #4453,
+# 8bb5d40a; this is a small local copy): Unicode Cc/Cf -> space; then the shape map:
+# every character whose unicodedata.name() ends in LESS-THAN SIGN or GREATER-THAN SIGN or
+# contains ANGLE QUOTATION MARK is REPLACED with U+FFFD (deleting an operator inverts it:
+# x <= 3 would read x = 3, a -> b would read a - b), while every BRACKET-named character is
+# DELETED (so no closer, ASCII or exotic, can forge or end the marker); then collapse
+# whitespace; then cap the length (at most cap characters, as PR B). Unlike PR B this has NO
+# phrase breaker: the monitor marker brackets are already deleted, and breaking the common
+# word ENGRAM would mangle ordinary text. \u escapes keep this source ASCII.
+def forum_field(x, cap=64):
+    s = "".join(" " if unicodedata.category(c) in ("Cc", "Cf") else c for c in str(x))
+    out = []
+    for c in s:
+        n = unicodedata.name(c, "")
+        if n.endswith("LESS-THAN SIGN") or n.endswith("GREATER-THAN SIGN") or "ANGLE QUOTATION MARK" in n:
+            out.append("\ufffd")
+        elif "BRACKET" not in n:
+            out.append(c)
+    s = " ".join("".join(out).split())
+    return s[: cap - 1].rstrip() + "\u2026" if len(s) > cap else s
+'
+
 # flush_buffer: $BUF holds one thread_id per buffered new mention (one line
 # per mention, so a thread_id repeats once per mention in that thread — the
 # source of the "×N" tally below). On a non-empty buffer, emit ONE summary
@@ -679,13 +782,11 @@ _WINDOW_OPEN_TS=""  # empty = no window currently open
 # has elapsed, whether or not anything is actually buffered.
 flush_buffer() {
     if [ -s "$BUF" ]; then
-        python3 -c '
+        python3 -c "$_FORUM_FIELD_PY"'
 import collections, sys
-# #3613: thread ids come from the forum; delete EVERY U+27E6/U+27E7 before
-# wrapping so no payload can forge or rebuild (split-token) a marker.
-def clean(x):
-    return str(x).replace("\u27e6", "").replace("\u27e7", "")
-lines = [clean(l.strip()) for l in sys.stdin if l.strip()]
+# #3613: thread ids come from the forum; forum_field (above, shared with the append path)
+# deletes EVERY bracket-named character, so no payload can forge or rebuild (split-token) a marker.
+lines = [forum_field(l, 32) for l in sys.stdin if l.strip()]
 n = len(lines)
 counts = collections.OrderedDict()
 for tid in lines:
@@ -701,6 +802,26 @@ print("\U0001f4e3 " + str(n) + " new @-" + mention_word + " across " + str(len(c
         : > "$BUF"
     fi
     _WINDOW_OPEN_TS=""
+}
+
+# Append one line per newly-seen mention (its thread_id, from the just-fetched $RESP) to
+# $BUF. A function so the cells can drive it; behaviour is the former inline block.
+append_new_thread_ids() {
+    printf '%s' "$RESP" | python3 -c "$_FORUM_FIELD_PY"'
+import json, sys
+wanted = set(sys.argv[1].split())
+# Blanket-except + isinstance guards so a status-200-but-malformed body
+# (non-dict, or "mentions" a non-list) degrades to "append nothing this
+# cycle" rather than throwing mid-loop — matches ids()'"'"'s defensive style.
+try:
+    d = json.load(sys.stdin)
+    mentions = d.get("mentions", []) if isinstance(d, dict) else []
+    for m in mentions:
+        if isinstance(m, dict) and str(m.get("post_id")) in wanted:
+            print(forum_field(m.get("thread_id", "?"), 32))
+except Exception:
+    pass
+' "$_new_pids" >> "$BUF"
 }
 
 # Edge-triggered reachability state for the unreachable-vs-quiet announce
@@ -759,21 +880,7 @@ while true; do
         # (no extra HTTP call) and append one line per mention to the buffer
         # — the coalesce window changes WHEN/HOW these are announced, never
         # whether $SEEN advances (already done above).
-        printf '%s' "$RESP" | python3 -c '
-import json, sys
-wanted = set(sys.argv[1].split())
-# Blanket-except + isinstance guards so a status-200-but-malformed body
-# (non-dict, or "mentions" a non-list) degrades to "append nothing this
-# cycle" rather than throwing mid-loop — matches ids()'"'"'s defensive style.
-try:
-    d = json.load(sys.stdin)
-    mentions = d.get("mentions", []) if isinstance(d, dict) else []
-    for m in mentions:
-        if isinstance(m, dict) and str(m.get("post_id")) in wanted:
-            print(m.get("thread_id", "?"))
-except Exception:
-    pass
-' "$_new_pids" >> "$BUF"
+        append_new_thread_ids
         [ -z "$_WINDOW_OPEN_TS" ] && _WINDOW_OPEN_TS="$(date +%s)"
     fi
     # Check window elapsed every cycle (not just cycles with fresh mentions)

@@ -142,10 +142,10 @@ class _FakeProjectsResponse:
 
 
 def _mock_forum_projects(monkeypatch, projects=None):
-    """Patch _status_derive's urlopen to return the given /api/projects records."""
+    """Patch _status_derive.forum_urlopen to return the given /api/projects records."""
     resp = _FakeProjectsResponse(projects or [])
     monkeypatch.setattr(
-        _status_derive.urllib.request, "urlopen",
+        _status_derive, "forum_urlopen",
         lambda req, timeout=None: resp,
     )
 

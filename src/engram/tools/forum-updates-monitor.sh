@@ -359,26 +359,39 @@ except Exception:
 # #3613: wrap the meaningful payload (DM body, baton title) in the ENGRAM
 # marker; a line with no meaningful text carries the EMPTY marker. \u escapes
 # keep this source ASCII (bash 3.2 / LC_ALL=C safe).
-def clean(x):
-    # Delete EVERY U+27E6/U+27E7 from forum-supplied text before it is wrapped:
-    # a single-pass token strip can be rebuilt by split tokens.
-    return str(x).replace("\u27e6", "").replace("\u27e7", "")
+import unicodedata
+# #1459 PR A: forum-written text is DATA. Same rules as the PR B forum_field (merged as #4453,
+# 8bb5d40a; this is a small local copy): Unicode Cc/Cf -> space; then the shape map:
+# every character whose unicodedata.name() ends in LESS-THAN SIGN or GREATER-THAN SIGN or
+# contains ANGLE QUOTATION MARK is REPLACED with U+FFFD (deleting an operator inverts it:
+# x <= 3 would read x = 3, a -> b would read a - b), while every BRACKET-named character is
+# DELETED (so no closer, ASCII or exotic, can forge or end the marker); then collapse
+# whitespace; then cap the length (at most cap characters, as PR B). Unlike PR B this has NO
+# phrase breaker: the monitor marker brackets are already deleted, and breaking the common
+# word ENGRAM would mangle ordinary text. \u escapes keep this source ASCII.
+def forum_field(x, cap=64):
+    s = "".join(" " if unicodedata.category(c) in ("Cc", "Cf") else c for c in str(x))
+    out = []
+    for c in s:
+        n = unicodedata.name(c, "")
+        if n.endswith("LESS-THAN SIGN") or n.endswith("GREATER-THAN SIGN") or "ANGLE QUOTATION MARK" in n:
+            out.append("\ufffd")
+        elif "BRACKET" not in n:
+            out.append(c)
+    s = " ".join("".join(out).split())
+    return s[: cap - 1].rstrip() + "\u2026" if len(s) > cap else s
 OPEN = "\u27e6ENGRAM\u27e7"
 CLOSE = "\u27e6/ENGRAM\u27e7"
 for u in d.get("updates", []):
     k = u.get("kind")
     if k == "dm":
-        body = clean(u.get("body") or "").replace("\n", " ").strip()
-        if len(body) > 90:
-            body = body[:90] + "…"
-        print("✉️  new DM from " + clean(u.get("sender", "?")) + ": " + OPEN + body + CLOSE)
+        body = forum_field(u.get("body") or "", 90)
+        print("\u2709\ufe0f  new DM from " + forum_field(u.get("sender", "?")) + ": " + OPEN + body + CLOSE)
     elif k == "baton":
-        title = clean(u.get("title") or "").strip()
-        if len(title) > 50:
-            title = title[:50] + "…"
-        print("\U0001f3be baton " + clean(u.get("project_id", "?")) + " → turn: " + clean(u.get("turn", "?")) + " (" + OPEN + title + CLOSE + ")")
+        title = forum_field(u.get("title") or "", 50)
+        print("\U0001f3be baton " + forum_field(u.get("project_id", "?")) + " \u2192 turn: " + forum_field(u.get("turn", "?")) + " (" + OPEN + title + CLOSE + ")")
     else:
-        print("\U0001f514 new " + clean(k) + " update (seq " + clean(u.get("seq", "?")) + ") " + OPEN + CLOSE)
+        print("\U0001f514 new " + forum_field(k, 32) + " update (seq " + forum_field(u.get("seq", "?"), 32) + ") " + OPEN + CLOSE)
 '
 }
 
@@ -582,16 +595,86 @@ _engaged() {
 # (space-separated after time_total) for the phase named on rc 28.
 # Sets RESP, _CURL_RC, _CURL_T and the phase fields; returns curl's own status.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Forum bearer token (#1459). The same rule as forum_api.load_forum_token: the
+# environment variable ENGRAM_FORUM_TOKEN when set and non-empty, else the first line of
+# ${ENGRAM_HOME:-$HOME/.engram}/forum-token, whitespace-trimmed. A token file readable by
+# group or others is REFUSED (never used). The token rides to curl on STDIN as a curl
+# config line (`curl -K -`), never in argv, so `ps` cannot show it; printf is a shell
+# builtin, so it is not an exec'd argv either.
+# _forum_token sets _TOKEN (empty when none is configured) and returns 0;
+# returns 1 when the file is refused or the token has a character that cannot ride in a
+# curl config line, and sets _TOKEN_WHY (never the token).
+# ---------------------------------------------------------------------------
+_TOKEN_WARNED=0
+_TOKEN=""
+_TOKEN_WHY=""
+_forum_token_file() { printf '%s' "${ENGRAM_HOME:-$HOME/.engram}/forum-token"; }
+_forum_token() {
+    local _f _m _t=""
+    _TOKEN=""; _TOKEN_WHY=""
+    if [ -n "${ENGRAM_FORUM_TOKEN-}" ]; then
+        _t="$ENGRAM_FORUM_TOKEN"
+    else
+        _f="$(_forum_token_file)"
+        if [ -L "$_f" ] && [ ! -e "$_f" ]; then
+            # A link whose target is gone is a broken setup, not "no token configured".
+            _TOKEN_WHY="forum token file $_f is a dangling symlink (its target does not exist); refusing it"
+            if [ "$_TOKEN_WARNED" -eq 0 ]; then
+                _TOKEN_WARNED=1
+                echo "forum monitor: $_TOKEN_WHY" >&2
+            fi
+            return 1
+        fi
+        [ -f "$_f" ] || return 0
+        # -L: a symlinked token file is judged by its TARGET (the Python clients' os.stat
+        # follows links too); without it stat reports the link's own mode, 777.
+        _m="$(stat -L -c '%a' "$_f" 2>/dev/null || stat -L -f '%Lp' "$_f" 2>/dev/null)"
+        case "$_m" in
+            ''|*[!0-7]*) _TOKEN_WHY="cannot read the mode of $_f"; return 1 ;;
+        esac
+        if [ $(( 8#$_m & 8#077 )) -ne 0 ]; then
+            _TOKEN_WHY="forum token file $_f is group- or world-readable; refusing it (chmod 600 $_f)"
+            if [ "$_TOKEN_WARNED" -eq 0 ]; then
+                _TOKEN_WARNED=1
+                echo "forum monitor: $_TOKEN_WHY" >&2
+            fi
+            return 1
+        fi
+        IFS= read -r _t < "$_f" || true
+    fi
+    # trim surrounding whitespace
+    _t="${_t#"${_t%%[![:space:]]*}"}"; _t="${_t%"${_t##*[![:space:]]}"}"
+    case "$_t" in
+        *[!A-Za-z0-9._~+/=-]*) _TOKEN_WHY="forum token has a character outside A-Za-z0-9._~+/=-; refusing it"; return 1 ;;
+    esac
+    _TOKEN="$_t"
+}
+
 _curl_fetch() {
-    local _out _w
-    _out="$(curl -s --fail --max-time "$1" -w '\n%{time_total} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' "$2" 2>/dev/null)"
+    local _out _w _tok
+    _CURL_HTTP=""
+    if ! _forum_token; then
+        # Refused token: a failure of its own (rc 77), reported through the same edge
+        # line as any other failed poll, so it is one line per state change, not per poll.
+        _CURL_RC=77; RESP=""; _CURL_T=""; _CURL_DNS=""; _CURL_TCP=""; _CURL_TLS=""; _CURL_TTFB=""
+        _CURL_HTTPS=0
+        return 77
+    fi
+    _tok="$_TOKEN"
+    if [ -n "$_tok" ]; then
+        _out="$({ printf 'header = "Authorization: Bearer %s"\n' "$_tok"; } 2>/dev/null \
+            | curl -K - -s --fail --max-time "$1" -w '\n%{time_total} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{http_code}' "$2" 2>/dev/null)"
+    else
+        _out="$(curl -s --fail --max-time "$1" -w '\n%{time_total} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{http_code}' "$2" 2>/dev/null)"
+    fi
     _CURL_RC=$?
     case "$_out" in
         *$'\n'*) RESP="${_out%$'\n'*}"; _w="${_out##*$'\n'}" ;;
         *)       RESP="$_out"; _w="" ;;
     esac
     _CURL_T=""; _CURL_DNS=""; _CURL_TCP=""; _CURL_TLS=""; _CURL_TTFB=""
-    read -r _CURL_T _CURL_DNS _CURL_TCP _CURL_TLS _CURL_TTFB <<< "$_w"
+    read -r _CURL_T _CURL_DNS _CURL_TCP _CURL_TLS _CURL_TTFB _CURL_HTTP <<< "$_w"
     case "$2" in https://*) _CURL_HTTPS=1 ;; *) _CURL_HTTPS=0 ;; esac
     [ "$_CURL_RC" -eq 0 ] || RESP=""
     return "$_CURL_RC"
@@ -643,7 +726,12 @@ _curl_detail() {
     case "$_CURL_RC" in
         6)  _m="could not resolve host" ;;
         7)  _m="connect failed" ;;
-        22) _m="HTTP error" ;;
+        22) case "${_CURL_HTTP-}" in
+                401) _m="HTTP 401: forum token missing or invalid; put it in $(_forum_token_file) (mode 0600) or set ENGRAM_FORUM_TOKEN" ;;
+                403) _m="HTTP 403: the forum token belongs to a different agent than this monitor polls as" ;;
+                *)   _m="HTTP error" ;;
+            esac ;;
+        77) _m="$_TOKEN_WHY" ;;
         28) _m="timed out" ;;
         35) _m="TLS handshake failed" ;;
         52) _m="empty reply" ;;

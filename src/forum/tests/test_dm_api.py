@@ -84,9 +84,12 @@ class TestDmListEndpoint:
         resp = client.get("/api/dm?agent=sol")
         assert resp.status_code == 200
 
-    def test_requires_agent(self, client):
+    # Removed-test: src/forum/tests/test_dm_api.py::TestDmListEndpoint::test_requires_agent — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_agent_defaults_to_the_token_agent(self, client):
+        # #1459: the caller is the token's agent; naming one is optional (it is a cross-check).
         resp = client.get("/api/dm")
-        assert resp.status_code == 400
+        assert resp.status_code == 200
+        assert resp.get_json()["agent"] == "test-harness"
 
     def test_empty_threads_for_new_agent(self, client):
         data = client.get("/api/dm?agent=sol").get_json()
@@ -101,9 +104,10 @@ class TestDmReadEndpoint:
         data = resp.get_json()
         assert data["messages"] == []
 
-    def test_requires_agent(self, client):
+    # Removed-test: src/forum/tests/test_dm_api.py::TestDmReadEndpoint::test_requires_agent — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_agent_defaults_to_the_token_agent(self, client):
         resp = client.get("/api/dm/ariadne")
-        assert resp.status_code == 400
+        assert resp.status_code == 200
 
     def test_returns_messages_after_send(self, client):
         client.post(
@@ -149,9 +153,12 @@ class TestDmSendEndpoint:
         assert "ts" in data
         assert data["seq"] >= 1
 
-    def test_requires_agent(self, client):
+    # Removed-test: src/forum/tests/test_dm_api.py::TestDmSendEndpoint::test_requires_agent — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_sender_is_the_token_agent_when_none_is_named(self, client):
         resp = client.post("/api/dm/ariadne", json={"body": "hi"})
-        assert resp.status_code == 400
+        assert resp.status_code == 201
+        msgs = client.get("/api/dm/ariadne").get_json()["messages"]
+        assert msgs[-1]["sender"] == "test-harness"
 
     def test_requires_body(self, client):
         resp = client.post("/api/dm/ariadne", json={"agent": "sol"})

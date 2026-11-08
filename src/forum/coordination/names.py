@@ -24,7 +24,10 @@ import re
 # Allowlist: lowercase alnum start, then alnum/_/- , max 63 chars. ``+`` (the
 # dm_thread_key separator), whitespace, and path separators are all excluded.
 # Identical regex to forum.db's (which now re-exports this) — one definition.
-_AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+# Applied with ``fullmatch`` (#1459): ``$`` also matches before one trailing newline, so a
+# ``match`` + ``$`` pair accepted "alice\n" -- and a name becomes a token's agent, a file name
+# and an identity comparison key. ``fullmatch`` refuses it.
+_AGENT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 
 
 class InvalidAgentName(ValueError):
@@ -40,7 +43,7 @@ class InvalidAgentName(ValueError):
 
 def is_valid_agent_name(name: str) -> bool:
     """True if ``name`` is a safe agent/DM identifier (matches the allowlist)."""
-    return bool(_AGENT_NAME_RE.match(name))
+    return bool(_AGENT_NAME_RE.fullmatch(name))
 
 
 # ---------------------------------------------------------------------------

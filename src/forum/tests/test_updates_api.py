@@ -93,14 +93,16 @@ def make_app(tmp_path):
 # ---------------------------------------------------------------------------
 # validation
 # ---------------------------------------------------------------------------
-def test_requires_agent(make_app):
+# Removed-test: src/forum/tests/test_updates_api.py::test_requires_agent — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+def test_agent_defaults_to_the_token_agent(make_app):
+    # #1459: with a token the caller is known; naming an agent is only a cross-check.
     resp = make_app().test_client().get("/api/updates")
-    assert resp.status_code == 400
+    assert resp.status_code == 200
 
 
 def test_invalid_agent_name_rejected(make_app):
     resp = make_app().test_client().get("/api/updates?agent=a+b")
-    assert resp.status_code == 400
+    assert resp.status_code == 403  # #1459: a malformed name is not the token's agent
 
 
 def test_non_integer_since_rejected(make_app):

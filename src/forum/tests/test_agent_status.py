@@ -349,12 +349,15 @@ class TestInvalidState:
         )
         assert resp.status_code == 400
 
-    def test_endpoint_rejects_missing_agent(self, client):
+    # Removed-test: src/forum/tests/test_agent_status.py::TestInvalidState::test_endpoint_rejects_missing_agent — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_endpoint_without_agent_publishes_for_the_token_agent(self, client):
+        # #1459: the caller is the token's agent; `agent` may be omitted.
         resp = client.post(
             "/api/agents/status",
             json={"state": "idle"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 200
+        assert resp.get_json()["agent"] == "test-harness"
 
     def test_endpoint_rejects_non_list_queue(self, client):
         resp = client.post(

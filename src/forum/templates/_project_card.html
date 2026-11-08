@@ -56,27 +56,5 @@
   </div>
   {% endif %}
 
-  {# Write-button affordances — rendered by Jinja, shown/hidden by board.js
-     based on the actor identity set in localStorage. Hidden by default (no identity).
-     data-project-id mirrors data-pid on the article for per-button routing. #}
-  <div class="pcard__actions" style="display:none;" aria-label="Write actions (requires identity)">
-    <button class="pcard__action-btn pcard__action-btn--primary"
-            data-action="flip" data-project-id="{{ item.project }}"
-            type="button">Flip →</button>
-    <button class="pcard__action-btn pcard__action-btn--primary"
-            data-action="claim" data-project-id="{{ item.project }}"
-            type="button">Claim</button>
-    <button class="pcard__action-btn pcard__action-btn--danger"
-            data-action="release" data-project-id="{{ item.project }}"
-            type="button">Release</button>
-    {% if eff not in terminal_statuses %}
-    <button class="pcard__action-btn pcard__action-btn--danger"
-            data-action="status" data-project-id="{{ item.project }}"
-            data-direction="close" type="button">Close</button>
-    {% else %}
-    <button class="pcard__action-btn"
-            data-action="status" data-project-id="{{ item.project }}"
-            data-direction="reopen" type="button">Reopen</button>
-    {% endif %}
-  </div>
+  {# #1459: no write controls here; the board viewer is read-only. #}
 </article>

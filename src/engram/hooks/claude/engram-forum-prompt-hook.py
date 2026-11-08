@@ -296,6 +296,13 @@ try:
 except Exception:
     derive_own_status = None  # publish becomes a no-op; never break the hook
     _read_loop_mode = None    # type: ignore[assignment]
+# #1459: the forum token has ONE source (tools/forum_api.load_forum_token), reached through
+# the tools dir bootstrapped just above. Missing import -> None: requests go out unauthenticated
+# and the forum's 401 surfaces through the hook's existing `http-401` unknown-state banner.
+try:
+    from forum_api import load_forum_token as _load_forum_token
+except Exception:
+    _load_forum_token = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +407,20 @@ def _fetch_classified(
     remaining = _remaining_budget(deadline)
     if remaining <= 0:
         return None, "deadline: shared budget already spent"
+    # #1459: every forum request carries the bearer token when one is configured. A refused
+    # token file (group/world-readable) is a failure class of its own, not a silent skip.
+    # The header only ever goes to `url`'s own origin: this drives http.client directly, which
+    # follows no redirect (a 3xx is the non-2xx failure below), so the same-origin redirect
+    # policy of forum_api.forum_urlopen has nothing to guard here (pinned by
+    # tests/test_forum_redirect_origin_1459.py).
+    headers = dict(headers or {})
+    if _load_forum_token is not None and "Authorization" not in headers:
+        try:
+            _tok = _load_forum_token()
+        except Exception as _tok_exc:  # noqa: BLE001 - ForumTokenFileError names path + chmod 600
+            return None, f"error: {_tok_exc}"
+        if _tok:
+            headers["Authorization"] = f"Bearer {_tok}"
     parsed = urllib.parse.urlsplit(url)
     conn_cls = (
         http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection

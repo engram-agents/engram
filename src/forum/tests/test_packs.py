@@ -391,16 +391,17 @@ class TestPacksShapeValidation:
         body = json.loads(resp.data)
         assert "README" in body["error"]
 
-    def test_missing_agent_rejected(self, client):
+    # Removed-test: src/forum/tests/test_packs.py::TestPacksShapeValidation::test_missing_agent_rejected — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_missing_agent_publishes_as_the_token_agent(self, client):
+        # #1459: the caller is the token's agent; the form `agent` may be omitted.
         tarball = _make_pack_tarball()
         resp = client.post(
             "/api/packs",
             data={"pack": (io.BytesIO(tarball), "test.tar.gz")},
             content_type="multipart/form-data",
         )
-        assert resp.status_code == 400
-        body = json.loads(resp.data)
-        assert "agent" in body["error"].lower()
+        assert resp.status_code == 201, resp.data.decode()
+        assert json.loads(resp.data)["author"] == "test-harness"
 
     def test_missing_pack_field_rejected(self, client):
         resp = client.post(
@@ -1089,7 +1090,10 @@ class TestPackLabelEndpoint:
         body = json.loads(resp.data)
         assert "method" in body["error"].lower()
 
-    def test_missing_agent_400(self, client):
+    # Removed-test: src/forum/tests/test_packs.py::TestPackLabelEndpoint::test_missing_agent_400 — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_missing_agent_is_the_token_agent_who_is_not_the_author(self, client):
+        # #1459: no form `agent` -> the token's agent is the caller, which is not the
+        # pack's author, so the label is refused as a non-author (it was a 400 before).
         tarball = _make_pack_tarball()
         pub_resp = _upload_pack(client, tarball, agent="agent-a")
         pack_id = json.loads(pub_resp.data)["pack_id"]
@@ -1098,7 +1102,8 @@ class TestPackLabelEndpoint:
             f"/api/packs/{pack_id}/label",
             data={"clearance": "private"},
         )
-        assert resp.status_code == 400, resp.data.decode()
+        assert resp.status_code == 403, resp.data.decode()
+        assert "not the author" in json.loads(resp.data)["error"]
 
 
 # ---------------------------------------------------------------------------

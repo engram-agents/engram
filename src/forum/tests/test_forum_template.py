@@ -145,7 +145,7 @@ def app(tmp_path):
     conn = sqlite3.connect(db_path)
     init_db(conn)
     conn.close()
-    application = create_app(db_path, audit_path)
+    application = create_app(db_path, audit_path, enable_board_viewer=True)  # #1459: presence renders only with the viewer on
     application.config["TESTING"] = True
     return application
 

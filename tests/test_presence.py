@@ -404,7 +404,7 @@ class TestDeriveOwnStatusPresenceIntegration:
                 return False
 
         monkeypatch.setattr(
-            mod.urllib.request, "urlopen",
+            mod, "forum_urlopen",
             lambda req, timeout=None: _EmptyProjectsResponse(),
         )
 

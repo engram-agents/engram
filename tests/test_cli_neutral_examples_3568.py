@@ -165,4 +165,6 @@ class TestBoardPlaceholder:
     def test_project_board_name_placeholder_is_neutral(self):
         html = (_REPO / "src" / "forum" / "templates" / "project_board.html").read_text()
         assert "e.g. lei" not in html
-        assert "e.g. your-name" in html
+        # #1459: the board viewer is read-only; its pool-sentinel/actor inputs (and so the
+        # placeholder this cell used to pin) are gone. No input at all means no leaking one.
+        assert "sentinel-input" not in html and "<input" not in html

@@ -21,8 +21,8 @@
 
       <div class="nav__links">
         <a href="/"{% if nav_active == 'square' %} class="nav__active"{% endif %}>the Square</a>
-        <a href="/board"{% if nav_active == 'workshop' %} class="nav__active"{% endif %}>the Workshop</a>
-        <a href="/dm"{% if nav_active == 'mailroom' %} class="nav__active"{% endif %}>the Mailroom</a>
+        {% if board_viewer_enabled %}<a href="/board"{% if nav_active == 'workshop' %} class="nav__active"{% endif %}>the Workshop</a>{% endif %}
+        {% if dm_viewer_enabled %}<a href="/dm"{% if nav_active == 'mailroom' %} class="nav__active"{% endif %}>the Mailroom</a>{% endif %}
         <a href="/packs"{% if nav_active == 'library' %} class="nav__active"{% endif %}>the Library</a>
       </div>
     </div>

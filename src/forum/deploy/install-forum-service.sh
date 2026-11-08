@@ -19,6 +19,15 @@
 #                       engram-forum.service is reused, so a re-run can never start a
 #                       second, empty forum somewhere new. An existing unit with no
 #                       parsable FORUM_HOME is refused (exit 2), never guessed at.
+#   --host ADDR         address the service binds (#1459). Default: 127.0.0.1 (loopback).
+#                       LAN exposure is an explicit choice, `--host 0.0.0.0`, and the
+#                       installer REFUSES a non-loopback host (exit 2, one stderr line)
+#                       while the target forum.db has no live agent token: a LAN-bound
+#                       forum with no tokens answers 401 to every write and DM read.
+#                       Issue tokens first: python -m forum.admin --db <forum.db> token
+#                       issue <agent> --write-to <file>. Re-installing over a unit that is
+#                       bound beyond loopback REFUSES unless --host is passed again, so a
+#                       re-run can never silently narrow (or widen) the bind.
 #   --port PORT         port the service listens on, a plain integer 1-65535
 #                       (no sign, no leading zero). Default: 5002
 #   --admin-user USER   systemd --user account running the service.
@@ -104,6 +113,8 @@ fi
 
 SERVICE_DIR=""   # no default (#3568): a flag, else the existing unit's FORUM_HOME
 PORT="5002"
+HOST="127.0.0.1"   # #1459: loopback unless --host says otherwise
+HOST_EXPLICIT=0
 ADMIN_USER="$(whoami)"
 GROUP=""
 BATON_MAP=""
@@ -202,7 +213,7 @@ _refuse_bad_name() {
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port|--admin-user|--group)
+    --port|--admin-user|--group|--host)
       [ $# -ge 2 ] || { echo "ERROR: $1 requires a value. Nothing was written." >&2; exit 2; } ;;
   esac
   case "$1" in
@@ -212,6 +223,13 @@ while [ $# -gt 0 ]; do
       _refuse_unrenderable_dir "$SERVICE_DIR" "--service-dir"
       shift 2 ;;
     --port)         _refuse_bad_port "$2"; PORT="$2"; shift 2 ;;
+    --host)
+      case "$2" in
+        ''|-*|*[!0-9A-Za-z.:_-]*)
+          echo "ERROR: --host '$2' is not a bind address (letters, digits and . : _ - only, no leading '-'); it is rendered into the unit file. Nothing was written." >&2
+          exit 2 ;;
+      esac
+      HOST="$2"; HOST_EXPLICIT=1; shift 2 ;;
     --admin-user)   _refuse_bad_name "$2" "--admin-user"; ADMIN_USER="$2"; shift 2 ;;
     --group)        _refuse_bad_name "$2" "--group"; GROUP="$2"; shift 2 ;;
     --baton-login-map)
@@ -485,6 +503,15 @@ if [ -f "$_EXISTING_UNIT" ]; then
     echo "       Nothing was written. Re-run with --baton-login-map <path> (plus --baton-login-map-admin-uid <uid> if used)." >&2
     exit 2
   fi
+  # #1459: the bind must not change silently on a re-install either. An existing unit
+  # bound beyond loopback (the fleet's `--host 0.0.0.0`) is re-rendered from a template
+  # whose default is loopback, which would cut every LAN seat off; so the operator says
+  # which bind they mean. Reads only, so it runs in --dry-run too.
+  _live_host="$(printf '%s\n' "$_live" | sed -n 's/.*--host[[:space:]=][[:space:]]*\([^[:space:]\\]*\).*/\1/p' | head -n 1)"
+  if [ -n "$_live_host" ] && [ "$HOST_EXPLICIT" -eq 0 ] && [ "$_live_host" != "127.0.0.1" ]; then
+    echo "ERROR: $_EXISTING_UNIT is bound to --host $_live_host; re-installing without --host would silently change the bind to 127.0.0.1. Nothing was written. Re-run with --host $_live_host to keep it, or --host 127.0.0.1 to narrow it on purpose." >&2
+    exit 2
+  fi
   if [ "$_has_uid" -eq 1 ] && [ -z "$BATON_UIDS" ]; then
     echo "ERROR: $_EXISTING_UNIT already carries a baton login map admin uid; re-installing without" >&2
     echo "       --baton-login-map-admin-uid <uid> would silently drop it. Nothing was written." >&2
@@ -640,6 +667,46 @@ else
   echo "==> No existing forum.db at $DB_PATH — will be created on first start."
 fi
 
+# #1459: refuse a non-loopback bind while the target DB has no live agent token. The
+# forum fails closed (401 on every write and DM read) with no tokens, yet systemd would
+# still show it `active`; this makes the missing tokens loud at install time. Loopback
+# installs are unaffected. Reads only (stdlib sqlite3, read-only open), so it runs in
+# --dry-run too; a missing DB or table counts as zero tokens.
+# Loopback is PARSED, never prefix-matched (round 2: a `127.*` glob let the hostnames
+# `127.evil.example.com` and `127.0.0.1.nip.io` skip this refusal). The host counts as loopback
+# only if it is exactly `localhost`, or python3's ipaddress parses it as a loopback address.
+# The host goes in as an ARGUMENT, never into the code string. The probe prints the exact
+# token LOOPBACK only when ipaddress says the host is loopback, and the shell counts the host as
+# loopback only if the exit status is 0 AND the captured output is exactly LOOPBACK. Anything else
+# takes the token-check arm: a python3 that is missing, fails, or prints anything other than the
+# sentinel. Not covered, and out of scope: a python3 on PATH that prints LOOPBACK for every host
+# (whoever controls python3 on the installer's PATH controls the installer). `127.1` (IPv4
+# shorthand) is REFUSED, deliberately: ipaddress does not parse it, so an unparsed loopback is
+# treated as non-loopback -- a chosen fail-safe, not an accident.
+# Both python3 probes here run under --dry-run, so both are `python3 -B`: Apple's python3 writes a
+# bytecode cache under ~/Library/Caches for what it imports, and a dry run writes nothing under HOME.
+_host_is_loopback() {
+  [ "$1" = "localhost" ] && return 0
+  local _probe
+  _probe="$(python3 -B -c 'import ipaddress,sys; print("LOOPBACK" if ipaddress.ip_address(sys.argv[1]).is_loopback else "")' "$1" 2>/dev/null)" || return 1
+  [ "$_probe" = "LOOPBACK" ]
+}
+if ! _host_is_loopback "$HOST"; then
+  _live_tokens="$(python3 -B -c '
+import sqlite3, sys
+try:
+    c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+    print(c.execute("SELECT COUNT(*) FROM agent_tokens WHERE revoked_at IS NULL").fetchone()[0])
+except Exception:
+    print(0)
+' "$DB_PATH" 2>/dev/null || echo 0)"
+  case "$_live_tokens" in ''|*[!0-9]*) _live_tokens=0 ;; esac  # a non-number is zero tokens, not a pass
+  if [ "$_live_tokens" -eq 0 ]; then
+    echo "ERROR: refusing to install a unit bound to --host $HOST: $DB_PATH has no live agent token, so every write and DM read would be refused (401). Issue tokens first: python -m forum.admin --db $DB_PATH token issue <agent> --write-to <file>. Nothing was written." >&2
+    exit 2
+  fi
+fi
+
 APP="$SERVICE_DIR/app"
 VENV="$SERVICE_DIR/.venv"
 PYTHON="$VENV/bin/python"
@@ -783,6 +850,7 @@ _fill_token_placeholder() {
 # {{FORUM_HOME}} (template placeholder), {{PORT}}, and the baton map args.
 RENDERED="$(sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$SRC/src/forum/deploy/engram-forum.service.template" \
     | sed "s|{{FORUM_HOME}}|$SERVICE_DIR|g" \
+    | sed "s|{{HOST}}|$HOST|g" \
     | sed "s|--port 5002|--port $PORT|" \
     | sed "s|Flask, port 5002|Flask, port $PORT|" \
     | _fill_baton_placeholder \

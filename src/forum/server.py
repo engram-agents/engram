@@ -5,7 +5,8 @@ Usage:
                            --audit ~/.forum/forum-audit.jsonl
 
 Stack: Python 3 + Flask + Jinja2 + SQLite.
-Bind: 0.0.0.0:5002 (5001 is viz_server). Same-LAN only for v0.1.
+Bind: 127.0.0.1:5002 by default (5001 is viz_server). LAN exposure is an explicit
+operator choice (--host 0.0.0.0) and is safe only with per-agent tokens on every seat (#1459).
 """
 
 from __future__ import annotations
@@ -1984,6 +1985,107 @@ def _read_backup_stamp(backup_dir: str) -> dict:
     return {"last_success_at": at, "age_hours": max(age, 0.0)}
 
 
+# ---------------------------------------------------------------------------
+# #1459 auth guard helpers (see ``create_app._auth_guard``)
+# ---------------------------------------------------------------------------
+_AUTH_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_AGENT_PATH_RE = re.compile(r"^/api/agent/([^/]+)/")
+# Team-internal reads that name no agent but expose the fleet's coordination state
+# (the board, presence, baton projects, DMs, the update feed). They need a valid
+# token for ANY agent, no identity match. One explicit set, enforced in the guard
+# only; /health, /forum.md, thread/search/pack reads stay public.
+_TOKEN_REQUIRED_READ_PREFIXES = (
+    "/api/board/",
+    "/api/agents/online",
+    "/api/agents/board",
+    "/api/projects",
+    "/api/updates",
+    "/api/dm",
+)
+
+
+def _viewer_host_ok(host_header: str | None, bind_host: str | None) -> bool:
+    """May an operator-viewer request with this ``Host`` header be served? (#1459 round 2.)
+
+    The opt-in HTML viewers (``/dm``, ``/dm/<a>/<b>``, ``/board``) carry no token, so a
+    DNS-rebound page (same-origin to the browser, pointed at a loopback port) could read
+    them. A rebound request keeps the attacker's hostname in ``Host``, so the viewers
+    serve only a loopback host (``localhost``, ``127.0.0.1``, ``[::1]``, with or without a
+    port) or the exact host the server was started with (``--host``). No Host header, or
+    one that does not parse, is refused. Bound: this stops a browser that was TRICKED INTO
+    the connection; ANY client that sends an accepted Host (`localhost`, `127.0.0.1`,
+    `[::1]` or the ``--host`` value) is served, a non-browser client on the LAN included, which
+    is why the viewers stay opt-in. Called through ``_host_ok`` by the viewer routes and by
+    ``_public_presence`` (the public pages lose presence, not the page); the token-guarded
+    API does not call it.
+    """
+    h = (host_header or "").strip().lower()
+    if not h:
+        return False
+    if h.startswith("["):  # [::1] or [::1]:5002
+        end = h.find("]")
+        if end < 0:
+            return False
+        name, rest = h[: end + 1], h[end + 1:]
+        if rest and not (rest.startswith(":") and rest[1:].isdigit()):
+            return False
+    else:  # name or name:port; a second colon leaves a non-numeric "port"
+        name, sep, port = h.partition(":")
+        if sep and not port.isdigit():
+            return False
+    allowed = {"localhost", "127.0.0.1", "[::1]"}
+    b = (bind_host or "").strip().lower()
+    if b:
+        allowed.add(b)
+        if ":" in b and not b.startswith("["):
+            allowed.add("[" + b + "]")
+    return name in allowed
+
+
+def _bearer_token(header: str | None) -> str | None:
+    """The token of an ``Authorization: Bearer <token>`` header, else None."""
+    if not header:
+        return None
+    parts = header.strip().split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
+        return parts[1].strip()
+    return None
+
+
+def _identity_text(value) -> str | None:
+    """The identity a value names (strip().lower()), or None when it names nothing."""
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    text = text.strip().lower()
+    return text or None
+
+
+def _route_label() -> str:
+    """``METHOD /api/x/<pid>/y`` for error text: the matched rule with converters dropped
+    (``<int:tid>`` -> ``<tid>``), the shape every handler's own refusal text already uses."""
+    rule = request.url_rule.rule if request.url_rule is not None else request.path
+    if request.method == "POST" and rule == "/api/projects":
+        return "POST /api/projects (init)"  # the label the init handler's own refusals carry
+    return f"{request.method} " + re.sub(r"<(?:[A-Za-z_]+(?:\([^)]*\))?:)?", "<", rule)
+
+
+def _names_identity(values) -> bool:
+    return any(_identity_text(v) is not None for v in values)
+
+
+def _body_identities() -> list:
+    """Every ``agent`` value in a JSON object body or form data of this request."""
+    out: list = []
+    body = request.get_json(silent=True)
+    if isinstance(body, dict) and "agent" in body:
+        out.append(body["agent"])
+    if request.mimetype in ("application/x-www-form-urlencoded", "multipart/form-data"):
+        out.extend(request.form.getlist("agent"))
+    return out
+
+
+
 def create_app(
     db_path: str,
     audit_path: str,
@@ -1995,6 +2097,9 @@ def create_app(
     baton_login_map: str | None = None,
     baton_login_map_admin_uids: tuple = (),
     github_integration: str | None = None,
+    enable_dm_viewer: bool = False,
+    enable_board_viewer: bool = False,
+    bind_host: str | None = None,
 ) -> Flask:
     """Create and configure the Flask application.
 
@@ -2039,6 +2144,22 @@ def create_app(
             directly meaningful. ``"off"`` makes every GitHub read advisory with no
             ``gh`` call; see the #3568 block above ``_advance_gate``.
 
+        enable_dm_viewer:  #1459 A5. The all-DM operator viewer (``/dm``, ``/dm/<a>/<b>``)
+            is 404 unless True (``main()`` feeds it from ``--enable-dm-viewer``): it shows
+            every pair's messages to anyone who can reach the port.
+
+        enable_board_viewer: #1459. The HTML project board (``/board``) is 404 unless True
+            (``--enable-board-viewer``): it shows every baton's title, participants and
+            turn state to anyone who can reach the port, with no token. Read-only: the page
+            renders state only (writes go through the token-bearing CLI).
+
+        bind_host: #1459 round 2. The ``--host`` the server was started with (``main()``
+            passes it). The operator viewers answer 403 unless the request's ``Host`` header
+            names a loopback host or exactly this value (see ``_viewer_host_ok``).
+
+    Auth (#1459): one ``before_request`` guard (``_auth_guard``) is the ONLY auth
+    mechanism; there is deliberately no configuration that disables it.
+
     Returns:
         A configured Flask application instance.
     """
@@ -2063,6 +2184,15 @@ def create_app(
     app.config["BATON_LOGIN_MAP"] = baton_login_map
     app.config["BATON_LOGIN_MAP_ADMIN_UIDS"] = tuple(baton_login_map_admin_uids or ())
     app.config["GITHUB_INTEGRATION"] = github_integration
+    app.config["ENABLE_DM_VIEWER"] = bool(enable_dm_viewer)
+    app.config["ENABLE_BOARD_VIEWER"] = bool(enable_board_viewer)
+    app.config["BIND_HOST"] = bind_host  # #1459 round 2: the one non-loopback Host a viewer accepts
+
+    @app.context_processor
+    def _inject_dm_viewer_flag():
+        # #1459 A5: the nav renders the Mailroom link only when the viewer is on.
+        return {"dm_viewer_enabled": app.config["ENABLE_DM_VIEWER"],
+                "board_viewer_enabled": app.config["ENABLE_BOARD_VIEWER"]}
 
     # UCS coordination store (fork-1): wire the file-backed FileStore + the
     # process-level SeqAllocator so the /api/dm routes are live. The allocator is
@@ -2106,6 +2236,74 @@ def create_app(
         # Mirrors the per-connection load pattern from server.py:1043-1060 and
         # the init_db call in db._load_vec_extension.
         db._load_vec_extension(g.conn)
+
+    # ------------------------------------------------------------------
+    # #1459: THE auth guard. One before_request, no per-handler checks, and no
+    # config key / env var / flag that turns it off.
+    #
+    # GUARDED iff the method is POST/PUT/PATCH/DELETE (any route), or the path is
+    # under /api/ and names an agent identity (an ``agent`` key in the query
+    # string, a JSON object body or form data, or the <name> of
+    # /api/agent/<name>/...). A guarded request needs ``Authorization: Bearer
+    # <token>``: none/unknown/revoked -> 401; a valid token whose agent differs
+    # from a named identity (strip().lower()) -> 403, never silently
+    # substituted. Targets (to_agent, counterpart, colleague, ...) are not
+    # identity. Public reads naming no agent proceed with g.auth_agent = None.
+    # ------------------------------------------------------------------
+    @app.before_request
+    def _auth_guard():
+        # Bearer-header auth (not cookies) is deliberate: a DNS-rebound page is
+        # same-origin to the browser and can reach a loopback port, but it cannot
+        # read the 0600 token file, so it cannot attach this header. A cookie
+        # would ride along on the rebound request and defeat the loopback default.
+        g.auth_agent = None
+        g.names_identity = False
+        write = request.method in _AUTH_WRITE_METHODS
+        under_api = request.path.startswith("/api/")
+        if not write and not under_api:
+            return None
+        named: list = []
+        seg = _AGENT_PATH_RE.match(request.path)
+        if seg:
+            named.append(seg.group(1))
+        named.extend(request.args.getlist("agent"))
+        internal_read = (not write) and request.path.startswith(_TOKEN_REQUIRED_READ_PREFIXES)
+        # A body is parsed only for a request that is already authenticated, or a
+        # GET that carries one: an unauthenticated write is refused unread.
+        has_body = bool(request.content_length)
+        if not write and not internal_read and not _names_identity(named) and not (
+                has_body and _names_identity(_body_identities())):
+            return None  # a public read that names no agent
+        token = _bearer_token(request.headers.get("Authorization"))
+        token_agent = db.resolve_token(g.conn, token) if token else None
+        if token_agent is None:
+            resp = jsonify({
+                "error": "authentication required",
+                "hint": ("send 'Authorization: Bearer <token>'. Clients read the token from "
+                         "$ENGRAM_FORUM_TOKEN or <ENGRAM_HOME>/forum-token (mode 0600); the "
+                         "forum admin issues one with: python -m forum.admin token issue <agent>"),
+            })
+            resp.status_code = 401
+            resp.headers["WWW-Authenticate"] = "Bearer"
+            return resp
+        body_ids = _body_identities()
+        label = _route_label()
+        for v in body_ids:
+            # The same typed refusals the handlers used to apply to `agent` (#3436, #3294,
+            # #3318): a non-string, a lone surrogate or a line-break/control character is a
+            # 422 naming route + field, never str()-coerced and never compared.
+            _read_ident(label, "agent", v, lower=False)
+        named.extend(body_ids)
+        for n in named:
+            name = _identity_text(n)
+            if name is not None and name != token_agent:
+                resp = jsonify({"error": "identity mismatch",
+                                "token_agent": token_agent, "named_agent": name})
+                resp.status_code = 403
+                return resp
+        g.auth_agent = token_agent
+        g.names_identity = _names_identity(named)
+        return None
 
     @app.teardown_request
     def _close_db(exc: BaseException | None) -> None:
@@ -2170,6 +2368,22 @@ def create_app(
     # ------------------------------------------------------------------
     # GET /
     # ------------------------------------------------------------------
+    def _host_ok() -> bool:
+        """The ONE Host check of this app: the viewer routes and _public_presence both call it
+        (round 3), so a presence read cannot skip what a viewer route does."""
+        return _viewer_host_ok(request.headers.get("Host"), app.config["BIND_HOST"])
+
+    def _public_presence():
+        """Presence for the PUBLIC HTML pages (#1459). Presence is a token-only read (the JSON
+        board needs a token), so the public pages compute and render none of it unless the
+        operator started the server with --enable-board-viewer AND the request's Host passes
+        the viewer Host check (round 3: a DNS-rebound page must not read what the token-guarded
+        board protects). A refused Host gets the page WITHOUT presence, never a 403: these
+        pages are public."""
+        if app.config["ENABLE_BOARD_VIEWER"] and _host_ok():
+            return db.list_board(g.conn)
+        return [], None, None
+
     @app.route("/")
     def index() -> str:
         # --- Param extraction ---
@@ -2198,7 +2412,7 @@ def create_app(
             )
         else:
             threads = db.list_threads(g.conn, category=category, sort=sort)
-        board, online_count, registered = db.list_board(g.conn)
+        board, online_count, registered = _public_presence()
         open_threads = db.count_open_threads(g.conn)
         citations_exchanged = db.count_citations(g.conn)
         return render_template(
@@ -2223,11 +2437,9 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/thread/<int:tid>")
     def thread_view(tid: int) -> str:
-        # Optional ?agent= bump for polling clients to stay online.
-        agent_name = request.args.get("agent")
-        if agent_name and db.is_valid_agent_name(agent_name):
-            db.upsert_agent(g.conn, agent_name)
-
+        # #1459 A5: an HTML GET writes nothing. It used to bump/upsert the agent
+        # named by ?agent=, which an unauthenticated visitor could use to create
+        # agents; polling clients that need a presence bump use the guarded /api.
         thread_dict, posts = db.get_thread(g.conn, tid)
         if thread_dict is None:
             abort(404)
@@ -2241,7 +2453,7 @@ def create_app(
                 v["note_html"] = render_post_body(v["note"])
 
         categories = db.list_categories(g.conn)
-        board, online_count, registered = db.list_board(g.conn)
+        board, online_count, registered = _public_presence()
         open_threads = db.count_open_threads(g.conn)
         citations_exchanged = db.count_citations(g.conn)
         return render_template(
@@ -2277,7 +2489,7 @@ def create_app(
         results, mode_used = _run_search(g.conn, q, mode)
 
         categories = db.list_categories(g.conn)
-        board, online_count, registered = db.list_board(g.conn)
+        board, online_count, registered = _public_presence()
         open_threads = db.count_open_threads(g.conn)
         citations_exchanged = db.count_citations(g.conn)
         return render_template(
@@ -2376,7 +2588,7 @@ def create_app(
             sort = "hot"
 
         # Optional ?agent= bump for polling clients to stay online.
-        agent_name = request.args.get("agent")
+        agent_name = g.auth_agent if g.names_identity else None  # #1459
         if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
@@ -2388,7 +2600,7 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/api/thread/<int:tid>")
     def api_thread(tid: int):
-        agent_name = request.args.get("agent")
+        agent_name = g.auth_agent if g.names_identity else None  # #1459
         agent_id = None
         if agent_name and db.is_valid_agent_name(agent_name):
             agent_id = db.upsert_agent(g.conn, agent_name)
@@ -2427,8 +2639,7 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        _require_str("POST /api/thread/<tid>/accept", "agent", data.get("agent"))  # #3436: before any read / write
-        agent_name = (data.get("agent") or "").strip()
+        agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
 
@@ -2476,8 +2687,7 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        _require_str("POST /api/post/<pid>/verify", "agent", data.get("agent"))  # #3436: before any read / write
-        agent_name = (data.get("agent") or "").strip()
+        agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
 
@@ -2520,8 +2730,7 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        _require_str("POST /api/post", "agent", data.get("agent"))  # #3436: before any read / write
-        agent_name = (data.get("agent") or "").strip()
+        agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
 
@@ -2643,7 +2852,7 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/api/agents/online")
     def api_agents_online():
-        agent_name = request.args.get("agent")
+        agent_name = g.auth_agent if g.names_identity else None  # #1459
         if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
@@ -2670,8 +2879,7 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        _require_str("POST /api/agents/status", "agent", data.get("agent"))  # #3436: before any read / write
-        agent_name = (data.get("agent") or "").strip()
+        agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
         if not db.is_valid_agent_name(agent_name):
@@ -2742,7 +2950,7 @@ def create_app(
         /api/agents/online's ``online`` (a list) — sibling endpoints must not
         reuse the same key name for different types.
         """
-        agent_name = request.args.get("agent")
+        agent_name = g.auth_agent if g.names_identity else None  # #1459
         if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
@@ -2754,6 +2962,7 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/api/agent/<name>/mentions")
     def api_agent_mentions(name: str):
+        name = g.auth_agent or name  # #1459: the guard verified <name> is the token's agent
         since = request.args.get("since", "").strip() or None
 
         # Validate since format if provided
@@ -2793,6 +3002,7 @@ def create_app(
 
     @app.route("/api/agent/<name>/inbox")
     def api_agent_inbox(name: str):
+        name = g.auth_agent or name  # #1459: the guard verified <name> is the token's agent
         if not db.is_valid_agent_name(name):
             return jsonify({"error": f"invalid agent name {name!r}"}), 400
         agent_id = db.upsert_agent(g.conn, name)
@@ -2823,8 +3033,7 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        _require_str("POST /api/thread/<tid>/read", "agent", data.get("agent"))  # #3436: before any read / write
-        agent_name = (data.get("agent") or "").strip()
+        agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
 
@@ -2877,8 +3086,7 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        _require_str("PATCH /api/agent/me", "agent", data.get("agent"))  # #3436: before any read / write
-        agent_name = (data.get("agent") or "").strip()
+        agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
 
@@ -2911,7 +3119,7 @@ def create_app(
     @app.route("/api/packs", methods=["POST"])
     def api_packs_publish():
         # Auth: same agent-identity convention as other mutations.
-        agent_name = (request.form.get("agent") or "").strip()
+        agent_name = g.auth_agent or ""  # #1459
         if not agent_name:
             return jsonify({"error": "agent is required (form field)"}), 400
 
@@ -3043,7 +3251,7 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/api/packs/<pack_id>/label", methods=["POST"])
     def api_packs_label(pack_id: str):
-        agent_name = (request.form.get("agent") or "").strip()
+        agent_name = g.auth_agent or ""  # #1459
         if not agent_name:
             return jsonify({"error": "agent is required (form field)"}), 400
 
@@ -3138,6 +3346,10 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/board")
     def project_board() -> str:
+        if not app.config["ENABLE_BOARD_VIEWER"]:
+            abort(404)  # #1459: off unless the server started with --enable-board-viewer
+        if not _host_ok():
+            abort(403)  # #1459 round 2: DNS-rebinding defence (see _viewer_host_ok for its bound)
         try:
             items = read_project_board(app.config.get("COORD_STORE"))
         except Exception as exc:  # noqa: BLE001
@@ -3190,9 +3402,10 @@ def create_app(
     # GET /dm          — operator DM overview (all pairs)
     # GET /dm/<a>/<b>  — operator DM thread view (one pair, chronological)
     #
-    # Operator oversight view — sees all pairs by design; for release this
-    # must be gated to the operator/admin once forum auth lands (#1459),
-    # else it would leak the 1:1 DM privacy.
+    # Operator oversight view — sees all pairs by design, so it is OFF unless the
+    # server starts with --enable-dm-viewer (#1459 A5): every DM is then readable
+    # by anyone who can reach the port (loopback does not separate agents on a
+    # shared host; only tokens do, and this view takes none).
     #
     # READ-ONLY — no POST / no send from this UI. The agent-facing /api/dm
     # routes (1:1 ACL, agent-scoped) are distinct and untouched.
@@ -3202,10 +3415,13 @@ def create_app(
     def dm_viewer_overview():
         """Operator DM overview — list every pair across the store.
 
-        Operator oversight view — sees all pairs by design; for release this
-        must be gated to the operator/admin once forum auth lands (#1459),
-        else it would leak the 1:1 DM privacy.
+        Operator oversight view — sees all pairs by design, so it is 404 unless
+        the server started with --enable-dm-viewer (#1459 A5).
         """
+        if not app.config["ENABLE_DM_VIEWER"]:
+            abort(404)  # #1459 A5: off unless the server was started with --enable-dm-viewer
+        if not _host_ok():
+            abort(403)  # #1459 round 2: DNS-rebinding defence (see _viewer_host_ok for its bound)
         store = app.config.get("COORD_STORE")
         if store is None:
             abort(503)
@@ -3230,14 +3446,17 @@ def create_app(
     def dm_viewer_thread(a: str, b: str):
         """Operator DM thread view — render a single pair's full thread.
 
-        Operator oversight view — sees all pairs by design; for release this
-        must be gated to the operator/admin once forum auth lands (#1459),
-        else it would leak the 1:1 DM privacy.
+        Operator oversight view — sees all pairs by design, so it is 404 unless
+        the server started with --enable-dm-viewer (#1459 A5).
 
         Missing pairs (no messages yet) are rendered as an empty thread,
         not a 500 or hard 404.  Invalid agent names (charset violation)
         return 400.
         """
+        if not app.config["ENABLE_DM_VIEWER"]:
+            abort(404)  # #1459 A5: off unless the server was started with --enable-dm-viewer
+        if not _host_ok():
+            abort(403)  # #1459 round 2: DNS-rebinding defence (see _viewer_host_ok for its bound)
         store = app.config.get("COORD_STORE")
         if store is None:
             abort(503)
@@ -3339,7 +3558,7 @@ def create_app(
         if store is None or allocator is None:
             return jsonify({"error": "coordination store not configured"}), 503
 
-        agent = request.args.get("agent", "").strip() or None
+        agent = (g.auth_agent if g.names_identity else None)  # #1459
 
         try:
             since = int(request.args.get("since", 0))
@@ -3394,7 +3613,7 @@ def create_app(
         if store is None:
             return jsonify({"error": "coordination store not configured"}), 503
 
-        agent = (request.args.get("agent") or "").strip().lower()
+        agent = g.auth_agent or ""  # #1459
         if not agent:
             return jsonify({"error": "agent is required"}), 400
         if not db.is_valid_agent_name(agent):
@@ -3426,7 +3645,7 @@ def create_app(
         if store is None:
             return jsonify({"error": "coordination store not configured"}), 503
 
-        agent = (request.args.get("agent") or "").strip().lower()
+        agent = g.auth_agent or ""  # #1459
         if not agent:
             return jsonify({"error": "agent is required"}), 400
 
@@ -3461,10 +3680,8 @@ def create_app(
         """Send a DM from agent to counterpart.
 
         JSON body: {"agent": "<sender>", "body": "<message text>"}
-        Trust model: ``agent`` is client-supplied and not cryptographically
-        verified — the same honor-system trust as the rest of the forum
-        (``/api/post`` uses the same pattern). DM privacy is LAN-scoped;
-        hardenable when forum-wide auth lands (issue #1459).
+        Trust model (#1459): the sender is the bearer token's agent. ``agent`` in the
+        body is only a cross-check (a different name is a 403) and may be omitted.
 
         Response: {seq: <int>, ts: <str>}
         """
@@ -3479,8 +3696,7 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        _require_str("POST /api/dm/<counterpart>", "agent", data.get("agent"))  # #3436: before any read / write
-        agent = (data.get("agent") or "").strip().lower()
+        agent = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent:
             return jsonify({"error": "agent is required"}), 400
 
@@ -3525,7 +3741,7 @@ def create_app(
         if store is None or allocator is None:
             return jsonify({"error": "coordination store not configured"}), 503
 
-        agent = (request.args.get("agent") or "").strip().lower()
+        agent = g.auth_agent or ""  # #1459
         if not agent:
             return jsonify({"error": "agent is required"}), 400
         if not db.is_valid_agent_name(agent):
@@ -3597,7 +3813,9 @@ def create_app(
 
         active_raw = (request.args.get("active_only") or "true").strip().lower()
         active_only = active_raw not in ("false", "0", "no")
-        agent = (request.args.get("agent") or "").strip().lower()
+        # Optional participant filter: only when the request actually named an agent
+        # (the token alone, with no ?agent=, must not narrow the list).
+        agent = (g.auth_agent if g.names_identity else "") or ""  # #1459
 
         records = store.read_projects(active_only=active_only)
         if agent:
@@ -3669,12 +3887,12 @@ def create_app(
         # with a line-break/control char => 422, free text normalised, non-strings
         # => 422) BEFORE anything else looks at the request.
         f = _read_fields("POST /api/projects (init)", data, {
-            "agent": "idl", "project_id": "id", "title": "text", "status": "id",
+            "project_id": "id", "title": "text", "status": "id",
             "turn": "idl", "turn_reason": "text", "github": "id", "colleague": "id",
             "author": "id", "phase": "idl", "transition_phase": "idl",
             "participants": "list",
         })
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -3920,10 +4138,10 @@ def create_app(
             return jsonify({"error": "JSON body required"}), 400
 
         f = _read_fields("POST /api/projects/<pid>/flip", data, {
-            "agent": "idl", "to_agent": "idl", "reason": "text",
+            "to_agent": "idl", "reason": "text",
             "phase": "idl", "transition_phase": "idl",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -4022,9 +4240,9 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
         f = _read_fields("POST /api/projects/<pid>/advance", data, {
-            "agent": "idl", "to_agent": "idl", "reason": "text",
+            "to_agent": "idl", "reason": "text",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
         to_agent = f["to_agent"]
@@ -4077,9 +4295,9 @@ def create_app(
             return jsonify({"error": "JSON body required"}), 400
 
         f = _read_fields("POST /api/projects/<pid>/claim", data, {
-            "agent": "idl", "pool_sentinel": "idl", "phase": "idl", "transition_phase": "idl",
+            "pool_sentinel": "idl", "phase": "idl", "transition_phase": "idl",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -4132,10 +4350,10 @@ def create_app(
             return jsonify({"error": "JSON body required"}), 400
 
         f = _read_fields("POST /api/projects/<pid>/release", data, {
-            "agent": "idl", "pool_sentinel": "idl", "reason": "text", "done": "bool",
+            "pool_sentinel": "idl", "reason": "text", "done": "bool",
             "phase": "idl", "transition_phase": "idl",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -4209,9 +4427,9 @@ def create_app(
             return jsonify({"error": "JSON body required"}), 400
 
         f = _read_fields("POST /api/projects/<pid>/status", data, {
-            "agent": "idl", "new_status": "idl", "reason": "text", "phase": "idl",
+            "new_status": "idl", "reason": "text", "phase": "idl",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -4294,9 +4512,9 @@ def create_app(
             return jsonify({"error": "JSON body required"}), 400
 
         f = _read_fields("POST /api/projects/<pid>/rename", data, {
-            "agent": "idl", "new_title": "text", "phase": "idl",
+            "new_title": "text", "phase": "idl",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -4343,9 +4561,9 @@ def create_app(
             return jsonify({"error": "JSON body required"}), 400
 
         f = _read_fields("POST /api/projects/<pid>/anchor", data, {
-            "agent": "idl", "github": "id", "phase": "idl",
+            "github": "id", "phase": "idl",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -4410,9 +4628,9 @@ def create_app(
             return jsonify({"error": "JSON body required"}), 400
 
         f = _read_fields("POST /api/projects/<pid>/participants", data, {
-            "agent": "idl", "participant": "idl", "phase": "idl",
+            "participant": "idl", "phase": "idl",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -4476,9 +4694,9 @@ def create_app(
             return jsonify({"error": "JSON body required"}), 400
 
         f = _read_fields("POST /api/projects/<pid>/colleague", data, {
-            "agent": "idl", "colleague": "idl", "phase": "idl",
+            "colleague": "idl", "phase": "idl",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -4555,9 +4773,9 @@ def create_app(
             return jsonify({"error": "JSON body required"}), 400
 
         f = _read_fields("POST /api/projects/<pid>/gc", data, {
-            "agent": "idl", "new_status": "idl", "reason": "text", "phase": "idl",
+            "new_status": "idl", "reason": "text", "phase": "idl",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -4704,9 +4922,9 @@ def create_app(
             return jsonify({"error": "JSON body required"}), 400
 
         f = _read_fields("POST /api/projects/<pid>/merge", data, {
-            "agent": "idl", "forced": "bool", "phase": "idl",
+            "forced": "bool", "phase": "idl",
         }, pid=pid)
-        agent = f["agent"]
+        agent = g.auth_agent or ""
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -4965,7 +5183,15 @@ def _parse_args(argv=None, environ=None):
     env = os.environ if environ is None else environ
     p = argparse.ArgumentParser(description="LAN agent forum server")
     p.add_argument("--port", type=int, default=5002)
-    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="Bind address (default 127.0.0.1, loopback). LAN exposure is an explicit "
+                        "choice, --host 0.0.0.0, and is safe only with tokens on every seat (#1459).")
+    p.add_argument("--enable-board-viewer", action="store_true",
+                   help="Serve the HTML project board (/board). OFF by default: when on, every baton's "
+                        "title, participants and turn state are readable by anyone who can reach this port.")
+    p.add_argument("--enable-dm-viewer", action="store_true",
+                   help="Serve the all-DM operator viewer (/dm, /dm/<a>/<b>). OFF by default: when on, "
+                        "every DM is readable by anyone who can reach this port.")
     p.add_argument("--db", default=os.path.expanduser("~/.forum/forum.db"))
     p.add_argument("--audit", default=os.path.expanduser("~/.forum/forum-audit.jsonl"))
     p.add_argument("--categories-config", default=None,
@@ -5096,6 +5322,40 @@ def _adopt_gate_identity(gate, environ) -> None:
         os.environ.pop("GH_TOKEN", None)
 
 
+def _report_auth_startup(conn, enable_dm_viewer: bool, file=None,
+                         enable_board_viewer: bool = False) -> None:
+    """Startup lines for the #1459 auth posture (stderr by default).
+
+    Fail closed, loud: with no live token, print one line saying writes and DM
+    reads will be refused until tokens are issued. With the DM viewer on, print
+    that every DM is readable by anyone who can reach the port (and likewise for the
+    board viewer). Prints nothing
+    for the quiet, healthy posture. Never prints a token.
+    """
+    out = sys.stderr if file is None else file
+    if not db.has_live_token(conn):
+        print("[forum] auth: no live agent token -- writes and DM reads will be refused (401) "
+              "until tokens are issued: python -m forum.admin token issue <agent> "
+              "(put --db <path> before 'token' when the DB is not the default)",
+              file=out)
+    # The Host-header clause is shared by both viewer lines (round 2). It states the
+    # defence AND its bound: a rebound browser page is refused, a client that sends an
+    # allowed Host is not (so on a LAN bind, anyone on the LAN who can reach the port).
+    host_note = (" The pages refuse a request whose Host header is not localhost, 127.0.0.1 or "
+                 "[::1] (with or without a port) or the exact --host value (DNS rebinding "
+                 "defence); it does not stop a non-browser client that sends an allowed Host.")
+    if enable_board_viewer:
+        print("[forum] --enable-board-viewer: the project board (every baton's title, participants "
+              "and turn state) is readable by anyone who can reach this port, without a token "
+              "(read-only operator viewer; writes go through the token-bearing CLI)." + host_note,
+              file=out)
+    if enable_dm_viewer:
+        print("[forum] --enable-dm-viewer: every DM is readable by anyone who can reach this "
+              "port; on a shared host loopback does not separate agents, only tokens do."
+              + host_note,
+              file=out)
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -5142,6 +5402,8 @@ def main() -> None:
     conn = sqlite3.connect(args.db)
     db.init_db(conn, categories_config=args.categories_config)
     seed.seed_threads(conn)
+    _report_auth_startup(conn, args.enable_dm_viewer,
+                         enable_board_viewer=args.enable_board_viewer)
     conn.close()
 
     app = create_app(
@@ -5155,6 +5417,9 @@ def main() -> None:
         baton_login_map=args.baton_login_map,
         baton_login_map_admin_uids=tuple(args.baton_login_map_admin_uid),
         github_integration=github_mode,
+        enable_dm_viewer=args.enable_dm_viewer,
+        enable_board_viewer=args.enable_board_viewer,
+        bind_host=args.host,
     )
     # #3283: the gate's own, dedicated read-only GitHub identity, kept beside the
     # service data (the unit sets FORUM_HOME; else the dir holding the DB).

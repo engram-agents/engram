@@ -118,7 +118,12 @@ def flask_app(tmp_path):
 
 @pytest.fixture
 def flask_client(flask_app):
-    return flask_app.test_client()
+    # #1459: the forum guard needs a bearer token for the agent each request names; the
+    # test-only plumbing attaches one (the CLI's own header is exercised in
+    # tests/test_forum_token_client_1459.py).
+    from forum.tests.auth_plumbing import authed_test_client
+
+    return authed_test_client(flask_app)
 
 
 @pytest.fixture
@@ -1507,7 +1512,11 @@ def wired_cli_packs(flask_app_with_packs, engram_home):
     (used by forum pack publish).  The multipart body is passed as-is to the
     Flask test client which handles it natively.
     """
-    flask_client_packs = flask_app_with_packs.test_client()
+    # #1459: token plumbing; the CLI's multipart body is raw bytes the plumbing cannot parse, so
+    # requests default to the CLI's own agent (testbot, set in the config just below).
+    from forum.tests.auth_plumbing import authed_test_client
+
+    flask_client_packs = authed_test_client(flask_app_with_packs, default_agent="testbot")
     base_url = "http://testserver"
 
     config = {"agent_name": "testbot", "forum": {"url": base_url}}

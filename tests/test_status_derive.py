@@ -9,7 +9,7 @@ Covers:
 
 Uses temp directories to avoid touching any real ~/.engram or /home/agents-shared
 paths. The module's path constants are monkeypatched for each test that touches
-them. The forum HTTP call is mocked via ``urllib.request.urlopen`` — no real
+them. The forum HTTP call is mocked via ``forum_urlopen`` — no real
 server is ever hit.
 """
 
@@ -81,20 +81,20 @@ def _project(project_id: str, turn: str, *, title: str = "", turn_reason: str = 
 
 
 def _mock_urlopen_returning(mod, monkeypatch, projects: list):
-    """Patch mod.urllib.request.urlopen to return a fixed /api/projects payload."""
+    """Patch mod.forum_urlopen (the forum_api redirect-policy opener) to return a fixed /api/projects payload."""
     fake = _FakeHTTPResponse(_projects_payload(projects))
 
     def _fake_urlopen(req, timeout=None):
         return fake
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(mod, "forum_urlopen", _fake_urlopen)
 
 
 def _mock_urlopen_raising(mod, monkeypatch, exc: Exception):
     def _fake_urlopen(req, timeout=None):
         raise exc
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(mod, "forum_urlopen", _fake_urlopen)
 
 
 def _mock_urlopen_raw(mod, monkeypatch, raw: bytes):
@@ -104,7 +104,7 @@ def _mock_urlopen_raw(mod, monkeypatch, raw: bytes):
     def _fake_urlopen(req, timeout=None):
         return fake
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(mod, "forum_urlopen", _fake_urlopen)
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +193,7 @@ class TestHeldBatonTurns:
             called.append(req)
             raise AssertionError("must not be called for an empty agent name")
 
-        monkeypatch.setattr(mod.urllib.request, "urlopen", _fake_urlopen)
+        monkeypatch.setattr(mod, "forum_urlopen", _fake_urlopen)
         assert mod._held_baton_turns("") == []
         assert called == []
 

@@ -22,9 +22,11 @@ Embedding storage (slice 1 of issue #807):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -471,6 +473,20 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
         conn.execute("ALTER TABLE packs ADD COLUMN clearance_method TEXT")
 
     # ----------------------------------------------------------------
+    # #1459: per-agent bearer tokens. Only sha256(raw) is stored, never the raw
+    # token, so a leaked DB backup yields no usable token (the forum DB is backed
+    # up and pushed). Lookup is an indexed ``WHERE token_sha256 = ?``, never a Python
+    # string compare. Revocation is a timestamp so the row stays as an audit trail.
+    # ----------------------------------------------------------------
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_tokens ("
+        " token_sha256 TEXT PRIMARY KEY,"
+        " agent        TEXT NOT NULL,"
+        " created_at   TEXT NOT NULL,"
+        " revoked_at   TEXT)"
+    )
+
+    # ----------------------------------------------------------------
     # vec0 virtual tables (created only when sqlite-vec is available).
     # Their absence must never break the forum -- all writes succeed
     # whether or not the vec tables exist.
@@ -513,6 +529,76 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
 # here for the HTTP routes' early-validation; ForumInvalidAgentName below maps a
 # violation to a 400. One regex, one definition — no validator drift.
 from forum.coordination.names import is_valid_agent_name  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Agent bearer tokens (#1459)
+#
+# Contract: ``issue_token`` returns the raw token ONCE and stores only its
+# sha256; ``resolve_token`` maps a raw token to its agent, or None when the
+# token is unknown or revoked; ``revoke_tokens`` revokes every live token of an
+# agent and returns how many; ``list_tokens`` never carries a raw token (only
+# the first 8 hex chars of the hash). Several live tokens per agent are allowed
+# (rotation). Nothing here logs or returns a raw token except ``issue_token``.
+# ---------------------------------------------------------------------------
+def _token_hash(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def issue_token(conn: sqlite3.Connection, agent: str) -> str:
+    """Mint a token for ``agent`` (a valid agent name); return the raw token once."""
+    # is_valid_agent_name uses ``$``, which accepts one trailing newline: refuse it
+    # here, since a token's agent is compared against request-named identities.
+    if (not isinstance(agent, str) or "\n" in agent
+            or not is_valid_agent_name(agent)):
+        raise ValueError(f"invalid agent name {agent!r}")
+    raw = secrets.token_urlsafe(32)
+    conn.execute(
+        "INSERT INTO agent_tokens(token_sha256, agent, created_at, revoked_at) "
+        "VALUES(?, ?, ?, NULL)",
+        (_token_hash(raw), agent, _now_iso()),
+    )
+    conn.commit()
+    return raw
+
+
+def revoke_tokens(conn: sqlite3.Connection, agent: str) -> int:
+    """Revoke every live token of ``agent``; return the number revoked."""
+    cur = conn.execute(
+        "UPDATE agent_tokens SET revoked_at = ? WHERE agent = ? AND revoked_at IS NULL",
+        (_now_iso(), agent),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def resolve_token(conn: sqlite3.Connection, raw: str) -> str | None:
+    """The agent a raw token belongs to, or None (unknown or revoked)."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    row = conn.execute(
+        "SELECT agent FROM agent_tokens WHERE token_sha256 = ? AND revoked_at IS NULL",
+        (_token_hash(raw),),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def list_tokens(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every token row without its secret: agent, created_at, revoked_at, hash_prefix."""
+    rows = conn.execute(
+        "SELECT agent, created_at, revoked_at, substr(token_sha256, 1, 8) "
+        "FROM agent_tokens ORDER BY created_at, agent"
+    ).fetchall()
+    return [
+        {"agent": r[0], "created_at": r[1], "revoked_at": r[2], "hash_prefix": r[3]}
+        for r in rows
+    ]
+
+
+def has_live_token(conn: sqlite3.Connection) -> bool:
+    """True if at least one unrevoked token exists."""
+    return conn.execute(
+        "SELECT 1 FROM agent_tokens WHERE revoked_at IS NULL LIMIT 1").fetchone() is not None
 
 
 def upsert_agent(conn: sqlite3.Connection, name: str, hostname: str | None = None) -> int:

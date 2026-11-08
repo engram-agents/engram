@@ -173,7 +173,7 @@ class TestProjectInit:
             "participants": ["luria"],
             "turn_reason": "r",
         })
-        assert resp.status_code == 400
+        assert resp.status_code == 403  # #1459: a malformed name is not the token's agent
 
     def test_init_threads_agent_into_turn_by(self, client, app):
         # #1812: the endpoint's `agent` (the API caller) becomes turn_by —
@@ -908,11 +908,14 @@ class TestProjectAddParticipant:
         })
         assert resp.status_code == 403
 
-    def test_add_participant_400_missing_agent(self, client):
+    # Removed-test: src/forum/tests/test_projects_api.py::TestProjectAddParticipant::test_add_participant_400_missing_agent — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_add_participant_missing_agent_is_the_token_agent_not_a_400(self, client):
+        # #1459: no `agent` in the body -> the token's agent is the caller; it is not a
+        # participant of PR-42, so the handler's own authorization refuses it.
         resp = client.post("/api/projects/PR-42/participants", json={
             "participant": "borges",
         })
-        assert resp.status_code == 400
+        assert resp.status_code == 403
 
     def test_add_participant_400_missing_participant(self, client):
         resp = client.post("/api/projects/PR-42/participants", json={
@@ -986,11 +989,13 @@ class TestProjectSetColleague:
         })
         assert resp.status_code == 403
 
-    def test_set_colleague_400_missing_agent(self, client):
+    # Removed-test: src/forum/tests/test_projects_api.py::TestProjectSetColleague::test_set_colleague_400_missing_agent — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_set_colleague_missing_agent_is_the_token_agent_not_a_400(self, client):
+        # #1459: as above; the token's agent is neither a participant nor the turn holder.
         resp = client.post("/api/projects/PR-42/colleague", json={
             "colleague": "borges",
         })
-        assert resp.status_code == 400
+        assert resp.status_code == 403
 
     def test_set_colleague_400_missing_colleague(self, client):
         resp = client.post("/api/projects/PR-42/colleague", json={
@@ -1104,11 +1109,12 @@ class TestProjectMerge:
         })
         assert resp.status_code == 404
 
-    def test_merge_400_invalid_agent(self, client):
+    # Removed-test: src/forum/tests/test_projects_api.py::TestProjectMerge::test_merge_400_invalid_agent — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_merge_invalid_agent_is_refused_as_identity_mismatch(self, client):
         resp = client.post("/api/projects/PR-42/merge", json={
             "agent": "a+b",
         })
-        assert resp.status_code == 400
+        assert resp.status_code == 403  # #1459: a malformed name is not the token's agent
 
     def test_503_without_store(self, tmp_path):
         db_path = str(tmp_path / "f.db")

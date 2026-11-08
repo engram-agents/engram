@@ -51,6 +51,7 @@ import os
 import socket
 import time
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
@@ -58,7 +59,13 @@ from typing import Any, Optional
 # forum_api.py sits beside this file in the plugin tree and in the shared-bin flat copies; it owns
 # the layer's engram_home() (see its docstring), so a direct import of this module finds it too.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from forum_api import engram_home  # noqa: E402
+from forum_api import (  # noqa: E402
+    ForumRedirectError,
+    auth_failure_line,
+    engram_home,
+    forum_urlopen,
+    load_forum_token,
+)
 
 # ---------------------------------------------------------------------------
 # Environment + paths  (mirrored exactly from tools/forum.py — keep in sync)
@@ -193,7 +200,18 @@ def _fetch_held_batons(agent_name: str) -> list:
     try:
         base_url = _resolve_forum_url()
         url = f"{base_url}/api/projects?active_only=true"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        headers = {"Accept": "application/json"}
+        # #1459: GET /api/projects is a token-required read. The token comes from the one
+        # shared source (forum_api.load_forum_token); a refused token file is a loud line
+        # on stderr, never a silent empty list, though the function still fails soft.
+        try:
+            token = load_forum_token()
+        except Exception as exc:  # noqa: BLE001 - ForumTokenFileError names the path + chmod 600
+            print(f"[forum] {exc}", file=sys.stderr)
+            return []
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(url, headers=headers)
         # Force IPv4-only resolution: the forum host's mDNS record advertises
         # unreachable IPv6 candidates ahead of the working IPv4 address, and
         # stdlib create_connection tries each serially at full timeout cost
@@ -208,7 +226,9 @@ def _fetch_held_batons(agent_name: str) -> list:
 
         socket.getaddrinfo = _ipv4_only_getaddrinfo
         try:
-            with urllib.request.urlopen(req, timeout=_FORUM_REQUEST_TIMEOUT_SECONDS) as resp:
+            # #1459: the ONE redirect policy (forum_api.forum_urlopen): the bearer token never
+            # follows a redirect to another origin.
+            with forum_urlopen(req, timeout=_FORUM_REQUEST_TIMEOUT_SECONDS) as resp:
                 raw = resp.read()
         finally:
             socket.getaddrinfo = real_getaddrinfo
@@ -228,6 +248,19 @@ def _fetch_held_batons(agent_name: str) -> list:
                 continue
             held.append(item)
         return held
+    except urllib.error.HTTPError as exc:
+        # #1459: a 401 / 403 from the forum's guard must not vanish into "no batons".
+        try:
+            line = auth_failure_line(exc.code, exc.read().decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            line = None
+        if line:
+            print(f"[forum] {line}", file=sys.stderr)
+        return []
+    except ForumRedirectError as exc:
+        # #1459: a cross-origin redirect was refused; still fails soft, but never silently.
+        print(f"[forum] {exc}", file=sys.stderr)
+        return []
     except Exception:
         return []
 

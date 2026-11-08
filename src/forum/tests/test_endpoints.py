@@ -49,9 +49,10 @@ class TestGetIndex:
 
     def test_contains_stub_marker(self, client):
         resp = client.get("/")
-        # The stub template renders stats fields
+        # The template renders its stats fields. #1459: the registered/online counts are
+        # presence, rendered only with --enable-board-viewer, so look at a public stat.
         body = resp.data.decode("utf-8")
-        assert "Registered" in body or "Online" in body or "stub" in body.lower()
+        assert "Open threads" in body or "Registered" in body or "Online" in body or "stub" in body.lower()
 
 
 class TestPostApi:
@@ -172,12 +173,14 @@ class TestPostApi:
         assert row is not None
         assert row[0] is not None
 
-    def test_post_missing_agent_returns_400(self, client):
+    # Removed-test: src/forum/tests/test_endpoints.py::TestPostApi::test_post_missing_agent_returns_400 — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_post_without_agent_is_authored_by_the_token_agent(self, client):
+        # #1459: the caller is the token's agent; the body `agent` may be omitted.
         resp = client.post(
             "/api/post",
             json={"category_slug": "inter-agent", "title": "T", "body_md": "b"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 201
 
     def test_post_missing_body_returns_400(self, client):
         resp = client.post(
@@ -449,9 +452,11 @@ class TestPatchAgentMe:
         record = json.loads(lines[0])
         assert record["action"] == "patch_agent"
 
-    def test_missing_agent_returns_400(self, client):
+    # Removed-test: src/forum/tests/test_endpoints.py::TestPatchAgentMe::test_missing_agent_returns_400 — replaced, not dropped: #1459 makes the token's agent the caller, so the old handler-level refusal no longer exists; the cell below asserts the new contract
+    def test_missing_agent_patches_the_token_agent(self, client):
+        # #1459: `agent` may be omitted; the token's agent is the caller.
         resp = client.patch("/api/agent/me", json={"pair_initials": "x"})
-        assert resp.status_code == 400
+        assert resp.status_code == 200
 
 
 class TestGetAgentMentions:

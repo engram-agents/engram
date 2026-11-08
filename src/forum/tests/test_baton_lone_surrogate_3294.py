@@ -296,7 +296,10 @@ def test_canary_matrix_covers_every_read_fields_call_site_and_field():
         f"call sites missing from the matrix: {sorted(set(sites) - set(ROUTES))}; "
         f"matrix routes with no call site: {sorted(set(ROUTES) - set(sites))}")
     for label, spec in sites.items():
-        assert spec == ROUTES[label][2], f"{label}: the matrix's fields/kinds differ from server.py's spec"
+        # #1459: `agent` is read by the auth guard, not by a handler's _read_fields spec; the
+        # matrix keeps its agent cells (refused by the guard with the same 422).
+        matrix_spec = {k: v for k, v in ROUTES[label][2].items() if k != "agent"}
+        assert spec == matrix_spec, f"{label}: the matrix's fields/kinds differ from server.py's spec"
 
 
 def test_canary_every_string_field_has_a_cell():

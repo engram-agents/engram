@@ -67,6 +67,9 @@ src/engram/tools/dream_lottery.py::save_state::write_text
 src/engram/tools/dream_pickup.py::_locked::open:a
 src/engram/tools/forum.py::_pack_publish::Module.open:w
 src/engram/tools/forum.py::_write_cursor::write_text
+# urllib.request.OpenerDirector.open: a network request with no file I/O, misread by the collector
+# as Path.open with a non-constant mode (#4462).
+src/engram/tools/forum_api.py::forum_urlopen::Path.open:nonconstant-mode
 src/engram/tools/ia.py::_write_cursor_int::write_text
 src/engram/tools/install_selfcheck.py::_restore_marker::write_bytes
 src/engram/tools/merge_batch.py::_save::write_text

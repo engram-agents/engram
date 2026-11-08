@@ -269,8 +269,7 @@ class TestDescribeCli:
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
 
-        import urllib.request as _urlrequest
-        with mock.patch.object(_urlrequest, "urlopen", side_effect=fake_urlopen), \
+        with mock.patch.object(forum_cli, "forum_urlopen", side_effect=fake_urlopen), \
              mock.patch("sys.argv", ["forum", "describe"]), \
              mock.patch("sys.stdout", stdout_buf), \
              mock.patch("sys.stderr", stderr_buf):
@@ -292,8 +291,7 @@ class TestDescribeCli:
         fake_urlopen = _make_fake_urlopen(flask_client)
 
         stdout_buf = io.StringIO()
-        import urllib.request as _urlrequest
-        with mock.patch.object(_urlrequest, "urlopen", side_effect=fake_urlopen), \
+        with mock.patch.object(forum_cli, "forum_urlopen", side_effect=fake_urlopen), \
              mock.patch("sys.argv", ["forum", "describe"]), \
              mock.patch("sys.stdout", stdout_buf), \
              mock.patch("sys.stderr", io.StringIO()):
@@ -331,7 +329,6 @@ class TestDescribeCli:
     def test_describe_404_exits_not_found(self, engram_home):
         """forum describe exits EXIT_NOT_FOUND (4) when the server returns 404."""
         import urllib.error
-        import urllib.request as _urlrequest
 
         def _raise_404(req, timeout=10):
             raise urllib.error.HTTPError(
@@ -344,7 +341,7 @@ class TestDescribeCli:
 
         stderr_buf = io.StringIO()
         stdout_buf = io.StringIO()
-        with mock.patch.object(_urlrequest, "urlopen", side_effect=_raise_404), \
+        with mock.patch.object(forum_cli, "forum_urlopen", side_effect=_raise_404), \
              mock.patch("sys.argv", ["forum", "describe"]), \
              mock.patch("sys.stdout", stdout_buf), \
              mock.patch("sys.stderr", stderr_buf):
@@ -362,7 +359,6 @@ class TestDescribeCli:
     def test_describe_non404_http_error_exits_validation(self, engram_home):
         """forum describe exits EXIT_VALIDATION (2) on non-404 HTTP errors."""
         import urllib.error
-        import urllib.request as _urlrequest
 
         def _raise_500(req, timeout=10):
             raise urllib.error.HTTPError(
@@ -375,7 +371,7 @@ class TestDescribeCli:
 
         stderr_buf = io.StringIO()
         stdout_buf = io.StringIO()
-        with mock.patch.object(_urlrequest, "urlopen", side_effect=_raise_500), \
+        with mock.patch.object(forum_cli, "forum_urlopen", side_effect=_raise_500), \
              mock.patch("sys.argv", ["forum", "describe"]), \
              mock.patch("sys.stdout", stdout_buf), \
              mock.patch("sys.stderr", stderr_buf):

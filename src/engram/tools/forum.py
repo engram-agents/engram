@@ -50,7 +50,14 @@ from _status_derive import (  # noqa: E402
     _UNSET,
     LOOP_MODE_PATH,
 )
-from forum_api import engram_home  # noqa: E402
+from forum_api import (  # noqa: E402
+    ForumApiError,
+    ForumRedirectError,
+    auth_failure_line,
+    engram_home,
+    forum_urlopen,
+    load_forum_token,
+)
 
 # ---------------------------------------------------------------------------
 # Environment + paths
@@ -94,9 +101,25 @@ def _ipv4_only_urlopen(req: urllib.request.Request, timeout: float):
     def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         return real_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
 
+    # #1459: EVERY request this CLI makes carries the forum bearer token (the one
+    # source, forum_api.load_forum_token). The guard is server-side; this just sends.
+    try:
+        token = load_forum_token()
+    except ForumApiError as exc:  # e.g. a world-readable token file: refuse loudly
+        print(f"forum: {exc}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+    if token and not req.has_header("Authorization"):
+        req.add_header("Authorization", f"Bearer {token}")
+
     socket.getaddrinfo = _ipv4_only_getaddrinfo
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        # #1459: the ONE redirect policy (forum_api.forum_urlopen): the token never follows a
+        # redirect to another origin. A refused one is a loud line and a non-zero exit, like
+        # the refused token file above, never a traceback.
+        return forum_urlopen(req, timeout=timeout)
+    except ForumRedirectError as exc:
+        print(f"forum: {exc}", file=sys.stderr)
+        sys.exit(exc.exit_code)
     finally:
         socket.getaddrinfo = real_getaddrinfo
 
@@ -326,6 +349,15 @@ def _api_post_form(url: str, fields: dict) -> dict:
     return _do_request(req, url)
 
 
+def _exit_on_auth_refusal(status: int, body: str) -> None:
+    """If (status, body) is the forum guard's 401 / 403, print ONE line naming the
+    token file (403: the two agent names) and exit non-zero. Otherwise return."""
+    line = auth_failure_line(status, body)
+    if line is not None:
+        print(f"forum: {line}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+
 def _do_request(req: urllib.request.Request, url: str) -> dict:
     """Execute an HTTP request; handle errors uniformly."""
     forum_url = _resolve_forum_url()
@@ -335,6 +367,7 @@ def _do_request(req: urllib.request.Request, url: str) -> dict:
             return json.loads(body)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        _exit_on_auth_refusal(e.code, body)  # #1459: a 401/403 from the guard is one loud line
         try:
             err_data = json.loads(body)
             err_msg = err_data.get("error", body)
@@ -1296,6 +1329,7 @@ def _do_binary_request(req: urllib.request.Request, url: str) -> bytes:
             return resp.read()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        _exit_on_auth_refusal(e.code, body)  # #1459: a 401/403 from the guard is one loud line
         try:
             err_data = json.loads(body)
             err_msg = err_data.get("error", body)

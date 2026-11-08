@@ -86,7 +86,7 @@ def make_app(tmp_path):
         conn = sqlite3.connect(db_path)
         init_db(conn)
         conn.close()
-        app = create_app(db_path, audit_path)
+        app = create_app(db_path, audit_path, enable_dm_viewer=True)
         app.config["TESTING"] = True
         stub = StubStore()
         app.config["COORD_STORE"] = stub
@@ -228,7 +228,7 @@ def test_dm_overview_503_without_store(tmp_path):
     conn = sqlite3.connect(db_path)
     init_db(conn)
     conn.close()
-    app = create_app(db_path, audit)
+    app = create_app(db_path, audit, enable_dm_viewer=True)
     app.config["TESTING"] = True
     # COORD_STORE intentionally not set.
     resp = app.test_client().get("/dm")
@@ -241,7 +241,7 @@ def test_dm_thread_503_without_store(tmp_path):
     conn = sqlite3.connect(db_path)
     init_db(conn)
     conn.close()
-    app = create_app(db_path, audit)
+    app = create_app(db_path, audit, enable_dm_viewer=True)
     app.config["TESTING"] = True
     resp = app.test_client().get("/dm/ariadne/borges")
     assert resp.status_code == 503

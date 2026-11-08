@@ -783,6 +783,9 @@ def _covered_fields():
 def test_every_post_route_reads_its_fields_through_the_shared_helper_and_is_covered():
     blocks = _route_blocks()
     cov = _covered_fields()
+    # #1459: `agent` is no longer a handler-read field (the guard reads it and the caller is
+    # the token's agent); the matrix keeps its agent cells, exercised through the guard.
+    cov = {k: v - {"agent"} for k, v in cov.items()}
     assert set(blocks) == set(cov), (set(blocks) ^ set(cov))
     for suffix, text in blocks.items():
         # no handler may read a client field around the shared sanitising helper

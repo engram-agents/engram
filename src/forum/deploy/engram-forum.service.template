@@ -65,13 +65,15 @@ UMask=002
 # Self-contained venv (Flask + deps) in the shared dir — group-readable so any
 # admin can run it; does not depend on the system python having Flask.
 ExecStart={{FORUM_HOME}}/.venv/bin/python -m forum.server \
-    --host 0.0.0.0 \
+    --host {{HOST}} \
     --port 5002 \
     --db {{FORUM_HOME}}/forum.db \
     --audit {{FORUM_HOME}}/forum-audit.jsonl{{BATON_LOGIN_MAP_ARGS}}
     # --packs-dir {{FORUM_HOME}}/packs   # uncomment to enable the pack registry;
     #                                    # defaults to a packs/ subdir next to forum.db
-# Bind 0.0.0.0 so same-LAN agents on other hosts can reach the forum. Canonical
+# Bind {{HOST}}: loopback (127.0.0.1) by default. LAN exposure is opt-in via the
+# installer's `--host 0.0.0.0` and needs a per-agent token on every seat (#1459; the
+# installer refuses a non-loopback host while no token is issued). Canonical
 # DB pinned via --db; a refuse-start-on-other-DB guard is a tracked #738 follow-up.
 Restart=on-failure
 RestartPreventExitStatus=78

@@ -6659,7 +6659,11 @@ def _real_forum_client(tmp_path) -> _RealForumClientAdapter:
     application.config["TESTING"] = True
     application.config["COORD_STORE"] = store
     application.config["COORD_ALLOCATOR"] = allocator
-    return _RealForumClientAdapter(application.test_client())
+    # #1459: the forum guard needs a bearer token for the agent each request names; the
+    # test-only plumbing attaches one.
+    from forum.tests.auth_plumbing import authed_test_client
+
+    return _RealForumClientAdapter(authed_test_client(application))
 
 
 class TestDoubleClaimRegressionEndToEnd:

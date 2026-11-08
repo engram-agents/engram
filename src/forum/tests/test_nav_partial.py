@@ -92,7 +92,7 @@ def app(tmp_path):
     conn = sqlite3.connect(db_path)
     init_db(conn)
     conn.close()
-    application = create_app(db_path, audit_path)
+    application = create_app(db_path, audit_path, enable_dm_viewer=True, enable_board_viewer=True)
     application.config["TESTING"] = True
     return application
 

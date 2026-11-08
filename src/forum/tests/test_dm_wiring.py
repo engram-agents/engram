@@ -32,7 +32,7 @@ def forum_home(tmp_path):
 @pytest.fixture
 def client(tmp_path, forum_home):
     db_path, audit_path = _make_db(tmp_path)
-    app = create_app(db_path, audit_path, coord_root=str(forum_home))
+    app = create_app(db_path, audit_path, coord_root=str(forum_home), enable_dm_viewer=True)
     app.config["TESTING"] = True
     return app.test_client()
 
@@ -40,7 +40,7 @@ def client(tmp_path, forum_home):
 @pytest.fixture
 def unwired_client(tmp_path):
     db_path, audit_path = _make_db(tmp_path)
-    app = create_app(db_path, audit_path)  # NO coord_root → store unconfigured
+    app = create_app(db_path, audit_path, enable_dm_viewer=True)  # NO coord_root → store unconfigured
     app.config["TESTING"] = True
     return app.test_client()
 
@@ -111,13 +111,13 @@ def test_since_seq_incremental(client):
 def test_seq_recovers_across_app_restart(tmp_path, forum_home):
     db_path, audit_path = _make_db(tmp_path)
 
-    app1 = create_app(db_path, audit_path, coord_root=str(forum_home))
+    app1 = create_app(db_path, audit_path, coord_root=str(forum_home), enable_dm_viewer=True)
     app1.config["TESTING"] = True
     c1 = app1.test_client()
     s1 = c1.post("/api/dm/sol", json={"agent": "ariadne", "body": "before restart"}).get_json()["seq"]
 
     # "restart" — a brand-new app instance on the SAME forum-home.
-    app2 = create_app(db_path, audit_path, coord_root=str(forum_home))
+    app2 = create_app(db_path, audit_path, coord_root=str(forum_home), enable_dm_viewer=True)
     app2.config["TESTING"] = True
     c2 = app2.test_client()
     s2 = c2.post("/api/dm/sol", json={"agent": "ariadne", "body": "after restart"}).get_json()["seq"]
@@ -146,7 +146,7 @@ class TestAgentNameCharsetGuard:
     def test_plus_in_sender_rejected(self, client):
         # "a+b" as sender would key "a+b"+"sol" == "a"+"b+sol" — a silent collision.
         r = client.post("/api/dm/sol", json={"agent": "a+b", "body": "x"})
-        assert r.status_code == 400
+        assert r.status_code == 403  # #1459: not the token's agent -> refused before the handler
 
     def test_plus_in_counterpart_rejected(self, client):
         r = client.post("/api/dm/b+c", json={"agent": "ariadne", "body": "x"})
@@ -154,12 +154,12 @@ class TestAgentNameCharsetGuard:
 
     def test_plus_rejected_on_read_and_list(self, client):
         assert client.get("/api/dm/b+c?agent=ariadne").status_code == 400
-        assert client.get("/api/dm?agent=a+b").status_code == 400
+        assert client.get("/api/dm?agent=a+b").status_code == 403  # #1459: identity mismatch
 
     def test_whitespace_and_separators_rejected(self, client):
         for bad in ["a b", "a/b", "a.b", "a:b"]:
             r = client.post("/api/dm/sol", json={"agent": bad, "body": "x"})
-            assert r.status_code == 400, f"{bad!r} should be rejected"
+            assert r.status_code == 403, f"{bad!r} should be rejected"  # #1459: identity mismatch
 
     def test_no_collision_after_guard(self, client, forum_home):
         # The pair that WOULD collide is now un-creatable; legit names still work
