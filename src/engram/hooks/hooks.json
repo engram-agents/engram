@@ -94,6 +94,11 @@
           },
           {
             "type": "command",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-bash-memrun-advisory.py\"",
+            "timeout": 3
+          },
+          {
+            "type": "command",
             "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
             "timeout": 3
           }

@@ -1192,6 +1192,11 @@
       "dest": "hooks/engram-bash-pipe-exit-warn.py"
     },
     {
+      "path": "hooks/claude/engram-bash-memrun-advisory.py",
+      "tier": "convenience",
+      "dest": "hooks/engram-bash-memrun-advisory.py"
+    },
+    {
       "path": "hooks/claude/engram-lesson-tripwire-hook.py",
       "tier": "convenience",
       "dest": "hooks/engram-lesson-tripwire-hook.py"

@@ -108,6 +108,13 @@
       "note": "PreToolUse hook that warns on pipe-exit-masking patterns (issue #1085)"
     },
     {
+      "path_prefix_or_glob": "hooks/claude/engram-bash-memrun-advisory.py",
+      "test_globs": [
+        "tests/test_engram_bash_memrun_advisory.py"
+      ],
+      "note": "PreToolUse hook that advises memrun for memory-heavy Bash commands (issue #4435)"
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-deference-detector-prompt.py",
       "test_globs": [
         "tests/test_deference_detector_scope_gate.py",
