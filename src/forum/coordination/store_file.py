@@ -172,18 +172,35 @@ def _embed_seq(content: str, seq: int) -> str:
     return f"---\n{new_block}\n---\n" + content[m.end():]
 
 
-def _read_text_nofollow(path: Path) -> str:
-    """Read ``path`` as UTF-8, refusing a symlink and any non-regular file.
+def _read_store_file_text(path: Path, *, errors: str = "strict") -> Optional[str]:
+    """Read a store file as UTF-8, or ``None`` when it is not a plain regular file.
 
-    ``O_NOFOLLOW`` makes the open itself fail with ``ELOOP`` on a symlink (a
-    planted link, dangling or not), which surfaces as :class:`InvalidDmPath`.
+    Returns ``None`` for exactly two refusals: the final component is a symlink
+    (``O_NOFOLLOW`` makes the open itself fail with ``ELOOP``) or the opened fd
+    is not a regular file (a FIFO, a device, a directory). Every other
+    ``OSError`` propagates unchanged, so ``FileNotFoundError`` keeps its "not
+    there" meaning at the call sites that already rely on it.
+
+    ``errors`` selects the decode policy, split by what the read is FOR:
+
+    - **``"replace"`` for display and integrity reads** -- the board
+      (``read_projects``), a single project (``read_project``), and the seq
+      high-water-mark (``recover_max_seq``). For a high-water mark,
+      UNDER-counting is dangerous (a fresh allocator reissues sequence numbers
+      over a live baton) while over-counting is safe (gaps are harmless); for a
+      display read, lossy rendering beats the entry vanishing. The seq lives in
+      ASCII frontmatter, so a bad byte in the body no longer hides it.
+    - **``"strict"`` (the default) for DM content reads** -- ``read_dm_thread``
+      and ``append_dm``. A corrupted thread body must not be silently mangled
+      into a clean-looking parse; those callers can react (the explicit read
+      raises, the wake feed skips the thread).
+
     ``O_NONBLOCK`` is what makes a FIFO (or other non-regular file) open
     INSTANTLY instead of blocking the reader, so the kind refusal has to be the
-    ``fstat`` + ``S_ISREG`` check on the fd, never a stat-then-open (that would
-    reintroduce the TOCTOU this helper exists to close). ``O_NONBLOCK`` is a
-    no-op on a regular file on Linux, so the normal path is unchanged.
-    Every other ``OSError`` is re-raised unchanged, so ``FileNotFoundError``
-    keeps its current "no thread yet" meaning at the DM call sites.
+    ``fstat`` + ``S_ISREG`` check on the already-opened fd, never a
+    stat-then-open (that would reintroduce the check-then-use window this helper
+    exists to close). ``O_NONBLOCK`` is a no-op on a regular file on Linux, so
+    the normal read is unchanged.
 
     ``getattr(os, "O_NOFOLLOW", 0)`` is the portability floor: on a platform
     without the flag this helper cannot detect a link on its own, and the
@@ -197,17 +214,13 @@ def _read_text_nofollow(path: Path) -> str:
         )
     except OSError as exc:
         if exc.errno == errno.ELOOP:
-            raise InvalidDmPath(
-                f"dm thread path is not a plain file: {path.name!r}"
-            ) from None
+            return None
         raise
     try:
         # Checked on the fd, after the open: a path stat before opening is the
         # very check-then-use window this helper closes.
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise InvalidDmPath(
-                f"dm thread path is not a regular file: {path.name!r}"
-            )
+            return None
         chunks: list[bytes] = []
         while True:
             chunk = os.read(fd, 65536)
@@ -216,7 +229,58 @@ def _read_text_nofollow(path: Path) -> str:
             chunks.append(chunk)
     finally:
         os.close(fd)
-    return b"".join(chunks).decode("utf-8")
+    return b"".join(chunks).decode("utf-8", errors)
+
+
+def _scan_text(path: Path) -> Optional[str]:
+    """Read one directory-scan entry; ``None`` means "skip this entry".
+
+    A scan over many files must never raise (and must never block) because one
+    entry is unusable: a planted FIFO opens instantly under ``O_NONBLOCK`` and
+    is refused by the fd kind check, a symlink is refused, and any ``OSError``
+    (a file deleted mid-scan, a permission denial) folds into the same skip. The
+    caller continues the scan.
+
+    Decoding is ``errors="replace"`` (see :func:`_read_store_file_text`), so a
+    malformed byte cannot raise here at all. That is deliberate: the old
+    "also catch ``UnicodeDecodeError``" would have been a silent seq
+    UNDER-count -- dropping the entry from a high-water mark reissues sequence
+    numbers over a live baton -- so the display/integrity policy replaces the
+    byte instead, and "a scan never raises because one entry is bad" is true by
+    construction rather than by a catch that only looked like coverage.
+    """
+    try:
+        return _read_store_file_text(path, errors="replace")
+    except OSError:
+        return None
+
+
+def _read_text_nofollow(path: Path) -> str:
+    """Read ``path`` as UTF-8, refusing a symlink and any non-regular file.
+
+    The open/fstat/read work is :func:`_read_store_file_text` -- one shared core,
+    so this DM-facing surface and the directory scans cannot drift apart. This
+    wrapper supplies the DM surface's two named refusals; it never reads a byte
+    of a refused path (the core refuses on the opened fd, before any read).
+
+    Every other ``OSError`` is re-raised unchanged, so ``FileNotFoundError``
+    keeps its current "no thread yet" meaning at the DM call sites.
+
+    Decoding stays STRICT by design: a corrupted thread body must not be
+    silently mangled into a clean-looking parse. This is the deliberate
+    asymmetry with the display/integrity reads, which use ``errors="replace"``
+    -- the explicit read can react (it raises), and the wake feed wraps it.
+    """
+    text = _read_store_file_text(path)
+    if text is not None:
+        return text
+    # ``None``: a link under O_NOFOLLOW, or a non-regular kind. Distinguish only
+    # to preserve this surface's two named messages; the refusal itself already
+    # happened before any byte was read, so this probe selects a string and
+    # never gates content access.
+    if os.path.islink(path):
+        raise InvalidDmPath(f"dm thread path is not a plain file: {path.name!r}")
+    raise InvalidDmPath(f"dm thread path is not a regular file: {path.name!r}")
 
 
 class FileStore(CoordinationStore):
@@ -280,9 +344,8 @@ class FileStore(CoordinationStore):
             # this read path.
             if os.path.islink(md):
                 continue
-            try:
-                raw = md.read_text(encoding="utf-8")
-            except OSError:
+            raw = _scan_text(md)
+            if raw is None:
                 continue
             fields, _body = _parse_frontmatter(raw)
             status = fields.get("status", "").strip().lower()
@@ -326,7 +389,13 @@ class FileStore(CoordinationStore):
     def read_project(self, project_id: str) -> Optional[str]:
         path = self._project_file(project_id)
         try:
-            return path.read_text(encoding="utf-8")
+            # A single-project read blocks on a FIFO exactly like a scan read
+            # does. The core returns None for a non-regular kind (and for a
+            # link, which _project_file already refused above) and re-raises a
+            # real OSError for the handler below. Decoding is lossy on purpose
+            # (display/integrity policy): a bad body byte must not make a live
+            # project vanish, and its ASCII frontmatter stays readable.
+            return _read_store_file_text(path, errors="replace")
         except OSError:
             return None
 
@@ -477,10 +546,10 @@ class FileStore(CoordinationStore):
                 # (non-disclosure; detection is the operator's filesystem audit).
                 if os.path.islink(md):
                     continue
-                try:
-                    fields, _ = _parse_frontmatter(md.read_text(encoding="utf-8"))
-                except OSError:
+                raw = _scan_text(md)
+                if raw is None:
                     continue
+                fields, _ = _parse_frontmatter(raw)
                 hi = max(hi, _coerce_seq(fields.get("seq", "")))
         archive_dir = self._contained_dir("archive")
         if archive_dir.is_dir():
@@ -488,10 +557,10 @@ class FileStore(CoordinationStore):
                 # Same rule: a scan skips a planted link (non-disclosure).
                 if os.path.islink(md):
                     continue
-                try:
-                    fields, _ = _parse_frontmatter(md.read_text(encoding="utf-8"))
-                except OSError:
+                raw = _scan_text(md)
+                if raw is None:
                     continue
+                fields, _ = _parse_frontmatter(raw)
                 hi = max(hi, _coerce_seq(fields.get("seq", "")))
         dm_dir = self._dm_dir()
         if dm_dir.is_dir():
@@ -499,9 +568,8 @@ class FileStore(CoordinationStore):
                 # Same rule: a scan skips a planted link (non-disclosure).
                 if os.path.islink(md):
                     continue
-                try:
-                    raw = md.read_text(encoding="utf-8")
-                except OSError:
+                raw = _scan_text(md)
+                if raw is None:
                     continue
                 # Parse STRUCTURALLY (length-prefixed), not by line-scanning for
                 # headers — a body line shaped like a header must not inflate the

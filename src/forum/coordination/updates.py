@@ -42,6 +42,14 @@ idempotent (no duplicate replay).
 
 Wake tiering (§3): each item carries ``wake ∈ {act-now, ambient}``. Phase-1 ``dm``
 and ``baton`` are both ``act-now`` (your-move / addressed-to-you signals).
+
+Availability — a DELIBERATE asymmetry: one poisoned DM thread -- a refused path
+(``InvalidDmPath``) or a non-UTF-8 body (``UnicodeDecodeError``) -- is SKIPPED so
+the feed degrades rather than dying. The explicit ``read_dm_thread`` stays strict
+and raises: a caller that asked about ONE thread should hear about corruption,
+while a feed over EVERY thread must not die for it. The skip is not an accident
+of a broad catch; it is the feed's contract, and the strict read is the other
+half of it.
 """
 
 from __future__ import annotations
@@ -113,10 +121,16 @@ def build_updates(
         for other in store.list_dm_threads(agent):
             try:
                 messages = store.read_dm_thread(agent, other, since_seq=since)
-            except InvalidDmPath:
+            except (InvalidDmPath, UnicodeDecodeError):
                 # One poisoned thread must not take down the whole wake feed
                 # (every seat's, not one caller's read): skip it and keep
-                # building. Detection is the operator's filesystem audit.
+                # building. A refused path (InvalidDmPath) and a corrupt,
+                # non-UTF-8 thread body (UnicodeDecodeError) are the same
+                # availability class here. This asymmetry with the explicit
+                # `read_dm_thread` is deliberate: that read stays strict and
+                # raises for a caller that asked about ONE thread, while the
+                # feed over EVERY thread degrades by skipping. Detection is the
+                # operator's filesystem audit.
                 continue
             for m in messages:
                 if _norm(m.recipient) == agent and m.seq <= as_of:
