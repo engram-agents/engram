@@ -23,7 +23,9 @@ something these cells prove:
 
 The cells (C1..C6):
 
-C1  limits: job 195, `id: suite` step 180, step lower than job by exactly 15.
+C1  limits: job 330, `id: suite` step 315, step lower than job by exactly 15.
+    (#4420: the suite step is five sequential shards of 60 minutes plus 15 of headroom;
+    the arithmetic is pinned in test_nightly_workflow_split_4420.py.)
 C2  second job structure: exactly one other job, needs == pytest, ubuntu-latest,
     its own timeout <= 15, no checkout, `issues: write` not narrowed.
 C3  the gate: the REAL `if:` string is evaluated by a small evaluator for the
@@ -419,16 +421,16 @@ def _arg_after(argv, flag):
 # --- C1 limits ----------------------------------------------------------------
 
 
-def test_c1_job_limit_is_195(pytest_job):
-    assert pytest_job.get("timeout-minutes") == 195, (
-        f"jobs.pytest.timeout-minutes must be 195, got {pytest_job.get('timeout-minutes')!r}"
+def test_c1_job_limit_is_330(pytest_job):
+    assert pytest_job.get("timeout-minutes") == 330, (
+        f"jobs.pytest.timeout-minutes must be 330, got {pytest_job.get('timeout-minutes')!r}"
     )
 
 
-def test_c1_suite_step_limit_is_180(pytest_job):
+def test_c1_suite_step_limit_is_315(pytest_job):
     suite = _step_by_id(pytest_job, "suite")
-    assert suite.get("timeout-minutes") == 180, (
-        f"the `id: suite` step's timeout-minutes must be 180, got {suite.get('timeout-minutes')!r}"
+    assert suite.get("timeout-minutes") == 315, (
+        f"the `id: suite` step's timeout-minutes must be 315, got {suite.get('timeout-minutes')!r}"
     )
 
 
@@ -442,11 +444,11 @@ def test_c1_step_limit_is_exactly_15_below_job_limit(pytest_job):
 
 
 def test_c1_timing_step_carries_no_such_limit(pytest_job):
-    """The 180 belongs on the suite step; a limit moved onto `timing` is a different contract."""
+    """The 315 belongs on the suite step; a limit moved onto `timing` is a different contract."""
     suite = _step_by_id(pytest_job, "suite")
     timing = _step_by_id(pytest_job, "timing")
-    assert suite.get("timeout-minutes") == 180, "the suite step must carry the 180-minute limit"
-    assert timing.get("timeout-minutes") != 180, "the timing step must not carry the suite limit"
+    assert suite.get("timeout-minutes") == 315, "the suite step must carry the 315-minute limit"
+    assert timing.get("timeout-minutes") != 315, "the timing step must not carry the suite limit"
 
 
 # --- C2 second job structure ---------------------------------------------------

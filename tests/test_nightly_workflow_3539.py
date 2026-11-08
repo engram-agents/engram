@@ -257,13 +257,18 @@ def test_every_pip_install_line_has_no_cache_dir(steps):
         assert "--no-cache-dir" in argv_part, f"pip install without --no-cache-dir: {ln!r}"
 
 
+SHARD_SCRIPT = WORKFLOW.parent.parent / "ci" / "nightly_run_shards.sh"
+
+
 def test_suite_step_drops_passing_tests_tmp_dirs(steps):
-    # Code lines only: the step's explanatory comment quotes the flag too, so a
-    # raw substring check would stay green with the flag itself deleted. And the
-    # flag must sit in pytest's argv: the part of the command before the first
-    # `|` / `2>&1`, so moving it after `| tee` (passed to tee) goes red.
-    cmd = _joined_command(steps[_suite_index(steps)]["run"])
-    pytest_part = re.split(r"\||2>&1", cmd, maxsplit=1)[0]
+    # Since #4420 the suite step calls .github/ci/nightly_run_shards.sh, which owns
+    # the pytest command. Code lines only: the explanatory comment quotes the flag
+    # too, so a raw substring check would stay green with the flag itself deleted.
+    # And the flag must sit in pytest's argv: the part of the command before the
+    # first `|` / `2>&1`, so moving it after `| tee` (passed to tee) goes red.
+    assert ".github/ci/nightly_run_shards.sh" in _joined_command(steps[_suite_index(steps)]["run"])
+    cmd = _joined_command(SHARD_SCRIPT.read_text(encoding="utf-8"))
+    pytest_part = re.split(r"\||2>&1", cmd[cmd.index('pytest "${FILES'):], maxsplit=1)[0]
     assert "pytest " in pytest_part, pytest_part
     assert "-o tmp_path_retention_policy=failed" in pytest_part, pytest_part
 
@@ -271,10 +276,13 @@ def test_suite_step_drops_passing_tests_tmp_dirs(steps):
 def test_suite_step_rest_of_contract_unchanged(steps):
     step = steps[_suite_index(steps)]
     assert step.get("shell") == "bash"
-    run = "\n".join(_code_lines(step["run"]))
-    for needle in ("set -o pipefail", "tests/ src/forum/tests/", "--cov=src --cov-branch",
-                   "tee /tmp/nightly-output.log"):
-        assert needle in run, f"{needle!r} missing from the suite step"
+    # #4420: the pytest command, pipefail and tee live in the shard script; the roots
+    # (`tests` and `src/forum/tests`) are the shard tool's default collection roots.
+    run = "\n".join(_code_lines(SHARD_SCRIPT.read_text(encoding="utf-8")))
+    for needle in ("set -o pipefail", "--cov=src --cov-branch", "/tmp/nightly-output.log", "tee -a"):
+        assert needle in run, f"{needle!r} missing from the shard script"
+    tool = (SHARD_SCRIPT.parent / "nightly_shards.py").read_text(encoding="utf-8")
+    assert 'ROOTS = ("tests", "src/forum/tests")' in tool
 
 
 RETENTION_ARG = "tmp_path_retention_policy=failed"

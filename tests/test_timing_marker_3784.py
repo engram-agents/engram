@@ -204,7 +204,12 @@ def _pytest_argv_part(step):
 
 
 def test_the_coverage_step_deselects_timing_and_keeps_coverage(steps):
-    part = _pytest_argv_part(_by_id(steps, "suite"))
+    # Since #4420 the suite step calls the shard script, which owns the pytest command.
+    suite = _by_id(steps, "suite")
+    assert ".github/ci/nightly_run_shards.sh" in _joined_command(suite["run"])
+    script = WORKFLOW.parent.parent / "ci" / "nightly_run_shards.sh"
+    cmd = _joined_command(script.read_text(encoding="utf-8"))
+    part = re.split(r"\||2>&1", cmd[cmd.index('pytest "${FILES'):], maxsplit=1)[0]
     assert '-m "not timing"' in part, part
     assert "--cov=src --cov-branch" in part, part
 

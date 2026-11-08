@@ -39,15 +39,18 @@ permissions:
 jobs:
   pytest:
     runs-on: ubuntu-latest
-    # #4389: the job limit is 15 minutes ABOVE the suite step's 180, so on a live
+    # #4389: the job limit is 15 minutes ABOVE the suite step's 315, so on a live
     # runner the step limit always fires first (a step `failure`, and the in-job
     # notify step below runs) and the job limit never pre-empts that step. The job
     # limit exists for the other case: a LOST runner. A lost runner is released at
-    # the job limit + 5 minutes (195 + 5 = 200; measured at two limit values with
-    # simulated kills), and the `notify-nightly-failure` job below then files the
-    # issue. Without a limit the default is 360 minutes; the unbounded
-    # lost-runner case was not measured.
-    timeout-minutes: 195
+    # the job limit + 5 minutes (330 + 5 = 335; the +5 was measured at two limit
+    # values with simulated kills), and the `notify-nightly-failure` job below then
+    # files the issue. Without a limit the default is 360 minutes, which is also the
+    # ceiling a hosted job can be given: 335 stays under it, so the shard count and
+    # the per-shard limit below cannot grow without bound (a test pins the sum).
+    # #4420: the suite step is N sequential pytest processes, so its limit is the
+    # sum of the per-shard limits plus headroom (see the suite step).
+    timeout-minutes: 330
     # #4389: set by the in-job notify step ONLY after it filed. The second job
     # reads it to skip a night that was already reported. (It is empty after a
     # lost runner, which is exactly when the second job must file.)
@@ -85,6 +88,18 @@ jobs:
       # step below annotates this explicitly instead — read its output before
       # treating embedding-path lines as a real gap.
       ENGRAM_NO_EMBEDDINGS: "1"
+      # #4420: N, the number of sequential pytest processes. Basis: the
+      # single-process footprint (RSS + swap) was 1.1 GB at test 560, 2.4 GB at
+      # 3,278, 3.9 GB at 7,567, 4.9 GB at 12,080, 6.4 GB at 17,370 and about
+      # 10.1 GB at 23,929 of about 38,000 tests. A process must stay under about
+      # 5 GB (swap onset, not the kill, is the line), which is about 9,000-10,000
+      # tests per process, so N = 5 (about 7,500 tests each). One run's
+      # measurement; the per-shard peaks in the run summary decide the next value.
+      NIGHTLY_SHARD_COUNT: "5"
+      # Per-shard limit in minutes, used as `timeout -k 60 <min>m`. The pre-split
+      # suite took about 120 minutes of pytest in total, so a shard is expected to
+      # take about 25; 60 is a hang bound, not a target.
+      NIGHTLY_SHARD_TIMEOUT_MIN: "60"
     steps:
       - uses: actions/checkout@v4
 
@@ -158,8 +173,16 @@ jobs:
           } 2>/dev/null || true
 
       - name: Run full pytest suite
-        # Same explicit paths as tests.yml (pytest.ini sets no testpaths):
-        # the main suite AND src/forum/tests/.
+        # Same files as tests.yml (pytest.ini sets no testpaths): the main suite AND
+        # src/forum/tests/. (#4420) They run as N SEQUENTIAL pytest processes, not one:
+        # a single process grew past the runner's RAM (about 10 GB at test 23,929 of
+        # about 38,000, extrapolated 15-17 GB for the whole suite; the runner has
+        # 7.9 GB), so the run slowed under swap and died. The files are split by
+        # .github/ci/nightly_shards.py from pytest's own collection (contiguous groups
+        # balanced by test count, a file never split), so a new test file needs no
+        # edit here. No xdist: shards are sequential, never parallel. Each shard
+        # writes its own coverage data file; the combine step below merges them.
+        # .github/ci/nightly_run_shards.sh carries the pytest flags described below.
         #
         # Coverage (#2774): --cov-branch, not line-only — a line executed on
         # only one side of an `if` is a behaviour half-specified, and this
@@ -201,33 +224,22 @@ jobs:
         # behaviour should be specified too, under this project's
         # prescriptive-SPEC framing.
         id: suite
-        # #4389: the slowest healthy night of the last nine took 1h56 (116 min).
-        # A hung suite on a live runner now ends as a step `failure` at three
-        # hours, so the in-job notify step below fires (a step limit is a failure;
-        # a job limit is a cancel).
-        timeout-minutes: 180
+        # #4389/#4420: step limit = the sum of the per-shard limits plus 15 minutes of
+        # headroom for the planning and collection steps and the sampler's start:
+        # 5 shards x 60 min + 15 = 315. A hung shard is killed by its own limit (and
+        # named in the log) and the loop goes on, so a hang costs at most one limit;
+        # this step limit is the outer bound, and a step limit is a failure, so the
+        # in-job notify step below fires. The job limit above is this + 15.
+        timeout-minutes: 315
         shell: bash
         run: |
-          # set -o pipefail: without it, the step's status is tee's (0) even
-          # when pytest fails, so `if: failure()` never fires and `if:
-          # success()` closes any open ci-nightly issue on a red suite
-          # (umwelt#738 round 1 / CLAUDE.md's umwelt#558 pipe-exit note).
-          set -o pipefail
-          # -o tmp_path_retention_policy=failed (#3539): pytest's default keeps
-          # every test's tmp_path (measured 1.8G retained on a green night);
-          # with "failed", passing tests' dirs are removed, failing tests keep theirs.
-          #
-          # -m "not timing" (#3784): a cell that asserts a measured ratio or
-          # latency bound judges the TRACER under --cov (the stage-accounting
-          # cell read ~0.118 against its 10% bound, 0.072-0.076 without
-          # coverage). Those cells are deselected here and judged by the
-          # separate no-coverage `timing` step below, on the same runner.
-          pytest tests/ src/forum/tests/ -v --tb=short \
-            -o tmp_path_retention_policy=failed \
-            -m "not timing" \
-            --cov=src --cov-branch \
-            --cov-report=xml:coverage.xml --cov-report=html:htmlcov --cov-report=term \
-            2>&1 | tee /tmp/nightly-output.log
+          # The shards, their per-shard timeout, the pipefail/tee handling, the
+          # sampler and the exit status (red if ANY shard is red; every shard runs)
+          # all live in the script. Its stdout is the live log; all shards are also
+          # tee'd into /tmp/nightly-output.log, whose tail the notify step prints.
+          # -o tmp_path_retention_policy=failed (#3539), -m "not timing" (#3784) and
+          # --cov=src --cov-branch (#2774) are carried into every shard unchanged.
+          bash .github/ci/nightly_run_shards.sh
 
       - name: disk usage — after suite
         # #3539 — MEASUREMENT ONLY, same contract as `disk usage — before suite`:
@@ -298,6 +310,43 @@ jobs:
             [ "$rc" -ne 0 ] || rc=1
           fi
           exit "$rc"
+
+      - name: Combine shard coverage
+        # #4420: each shard wrote its own data file (.coverage.<k>); this merges
+        # them and produces the artifacts at the same root paths the single-process
+        # run did (coverage.xml, htmlcov/, the terminal report), so the upload and
+        # summary steps below are unchanged. `if: always()` so a red or timed-out
+        # shard still yields the partial report (#2774).
+        #
+        # `source = src` is added to the rc file for this step only, mirroring the
+        # `--cov=src` each shard ran with. Without it the combined XML lists files
+        # as src/engram/server.py instead of engram/server.py (a different path
+        # root, which the summary and diff-cover read) because the report no longer
+        # knows the source root pytest-cov was given. .coveragerc itself is not
+        # changed: other callers pass --cov=src themselves.
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          src = open(".coveragerc", encoding="utf-8").read()
+          assert src.count("[run]\n") == 1, "expected exactly one [run] section in .coveragerc"
+          open(".coveragerc.combine", "w", encoding="utf-8").write(
+              src.replace("[run]\n", "[run]\nsource = src\n", 1))
+          PYEOF
+          export COVERAGE_RCFILE=.coveragerc.combine
+          python3 -m coverage combine .coverage.[0-9]*
+          python3 -m coverage xml -o coverage.xml
+          python3 -m coverage html -d htmlcov
+          python3 -m coverage report
+
+      - name: Shard summary (results and peak memory)
+        # #4420 — MEASUREMENT ONLY: continue-on-error, so it can never flip the
+        # night. It still exits non-zero (and prints an ::error:: naming the shard)
+        # when a shard has no sampler peak line: a gap is loud, never a quiet 0.
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: python3 .github/ci/nightly_shard_summary.py --n "$NIGHTLY_SHARD_COUNT" --sampler-log /tmp/sampler.log --dir /tmp
 
       - name: Upload coverage artifacts
         # A red suite should still yield its partial report (#2774) — hence
@@ -437,8 +486,8 @@ jobs:
       # not "cannot be masked" (alpha#2275 round 4).
       #
       # What a time limit does now (#4389): a hung suite on a live runner ends as
-      # a step failure at 180 minutes, and this step notifies. A job-limit cancel
-      # on a live runner, or a lost runner bounded by the 195-minute job limit,
+      # a step failure at 315 minutes, and this step notifies. A job-limit cancel
+      # on a live runner, or a lost runner bounded by the 330-minute job limit,
       # kills or skips this step, and the `notify-nightly-failure` job below
       # notifies instead. Only a cancel BY A PERSON notifies nothing at all
       # (the alpha#2275 reasoning stands: a person who cancels does not want an issue).
