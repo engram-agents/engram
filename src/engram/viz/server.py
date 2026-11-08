@@ -81,6 +81,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import agents as viz_agents
+from . import cors as viz_cors
 from . import footer
 from . import routes
 from . import shell
@@ -222,7 +223,7 @@ def _health_workbench_model_available() -> bool:
     return True
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(viz_cors.SameOriginGuard, BaseHTTPRequestHandler):
     # HTTP/1.1 persistent connections -- required for ThreadingHTTPServer's
     # concurrency to actually help a slow-client scenario (engram-alpha#2866
     # fix 2): the default HTTP/1.0 closes the connection after every response
@@ -557,12 +558,9 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_OPTIONS(self):
-        """CORS preflight — needed for PUT from a browser on a different origin."""
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
+        """CORS preflight (engram-alpha#4441): answered only for this server's own origin
+        (or a configured viz.allowed_origins entry); 403 for any other Origin; never a wildcard."""
+        viz_cors.SameOriginGuard.handle_preflight(self)
 
     def do_PUT(self):
         """PUT /api/config/<key>?agent=<name>
@@ -575,6 +573,13 @@ class Handler(BaseHTTPRequestHandler):
         Response (404 on path mismatch):
           {"ok": false, "error": "not found"}
         """
+        # engram-alpha#4441: a PUT must prove same origin (X-Engram-Viz: 1, an Origin or Referer
+        # of this server, Sec-Fetch-Site same-origin when sent) BEFORE the body is read or parsed.
+        reason = self.put_refusal_reason()
+        if reason is not None:
+            viz_cors.send_refusal(self, 403, reason)
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -639,7 +644,7 @@ class Handler(BaseHTTPRequestHandler):
         if gzip_ok:
             self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -715,6 +720,10 @@ def main():
 
     if args.config and args.db:
         parser.error("--config and --db are mutually exclusive")
+
+    # engram-alpha#4441: the configured viz.allowed_origins, read ONCE from this process's own
+    # config (never from an ?agent= agent's), feeding both the Origin and the Host check.
+    viz_cors.load_configured_origins()
 
     # Resolves AGENTS/DEFAULT_AGENT/_AGENT_STARTUP_MODE/_AGENT_STARTUP_CONFIG/
     # _AGENT_CACHE_TS from these same --db/--config/--no-autodetect flags.

@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import agents as viz_agents
+from .. import cors as viz_cors
 
 
 # Inline copy, not an import: viz/data modules import only the viz package; no tree-root module is guaranteed on sys.path (this module itself finds `tools/`).
@@ -271,6 +272,15 @@ def _validate_config_value(key: str, raw_value) -> tuple:
     elif expected_type in ("list", "list_of_objects"):
         if not isinstance(v, list):
             return None, f"Key {key!r} expects list, got {type(raw_value).__name__}: {raw_value!r}"
+        if row.get("item_check") == "origin":
+            # engram-alpha#4441: literal origins only (scheme://host[:port]); never a pattern.
+            for i, item in enumerate(v):
+                if not viz_cors.is_valid_origin_entry(item):
+                    return None, (
+                        f"Key {key!r}: item {i} {item!r} is not a literal origin "
+                        "(exactly scheme://host[:port] with http or https; no path, "
+                        "trailing slash, userinfo or '*')"
+                    )
         if expected_type == "list_of_objects":
             for i, item in enumerate(v):
                 if not isinstance(item, dict):

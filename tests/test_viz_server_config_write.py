@@ -525,6 +525,13 @@ class TestWriteConfigKeyPreservesInode(ConfigWriteBase):
 # HTTP integration tests for PUT /api/config/<key>
 # ---------------------------------------------------------------------------
 
+def _same_origin_headers(port: int) -> dict:
+    """The same-origin proofs the config page's own fetch sends (prep for
+    #4441): the viz header plus this server's own Origin. Harmless against a
+    server that ignores them, required by one that checks them."""
+    return {"X-Engram-Viz": "1", "Origin": f"http://127.0.0.1:{port}"}
+
+
 def _start_test_server() -> tuple:
     """Start viz_server on an ephemeral port. Returns (server, port, thread)."""
     server = HTTPServer(("127.0.0.1", 0), viz_server.Handler)
@@ -551,7 +558,8 @@ class TestPutRouteHTTP(ConfigWriteBase):
         url = f"http://127.0.0.1:{self._port}/api/config/{key}?agent={agent}"
         req = Request(url, data=body, method="PUT",
                       headers={"Content-Type": "application/json",
-                               "Content-Length": str(len(body))})
+                               "Content-Length": str(len(body)),
+                               **_same_origin_headers(self._port)})
         try:
             resp = urlopen(req)
             data = json.loads(resp.read())
@@ -609,7 +617,8 @@ class TestPutRouteHTTP(ConfigWriteBase):
         url = f"http://127.0.0.1:{self._port}/api/config/cadence.drowsiness_caution_pct?agent=test"
         req = Request(url, data=body, method="PUT",
                       headers={"Content-Type": "application/json",
-                               "Content-Length": str(len(body))})
+                               "Content-Length": str(len(body)),
+                               **_same_origin_headers(self._port)})
         try:
             resp = urlopen(req)
             data = json.loads(resp.read())
@@ -624,7 +633,8 @@ class TestPutRouteHTTP(ConfigWriteBase):
         url = f"http://127.0.0.1:{self._port}/api/config/cadence.drowsiness_caution_pct?agent=test"
         req = Request(url, data=b"", method="PUT",
                       headers={"Content-Type": "application/json",
-                               "Content-Length": "0"})
+                               "Content-Length": "0",
+                               **_same_origin_headers(self._port)})
         try:
             resp = urlopen(req)
             data = json.loads(resp.read())
@@ -639,7 +649,13 @@ class TestPutRouteHTTP(ConfigWriteBase):
         """CORS preflight should return 204 with allow headers."""
         from urllib.request import urlopen
         url = f"http://127.0.0.1:{self._port}/api/config/cadence.drowsiness_caution_pct"
-        req = Request(url, method="OPTIONS")
+        # A real browser preflight carries the page's Origin and names the
+        # method and header it is asking about.
+        req = Request(url, method="OPTIONS", headers={
+            "Origin": f"http://127.0.0.1:{self._port}",
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "content-type,x-engram-viz",
+        })
         try:
             resp = urlopen(req)
             self.assertEqual(resp.status, 204)
@@ -693,7 +709,8 @@ class TestWriteConfigKeyConcurrency(ConfigWriteBase):
         url = f"http://127.0.0.1:{self._port}/api/config/{key}?agent={agent}"
         req = Request(url, data=body, method="PUT",
                       headers={"Content-Type": "application/json",
-                               "Content-Length": str(len(body))})
+                               "Content-Length": str(len(body)),
+                               **_same_origin_headers(self._port)})
         try:
             resp = urlopen(req)
             data = json.loads(resp.read())

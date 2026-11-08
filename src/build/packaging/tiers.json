@@ -332,6 +332,11 @@
       "note": "engram-alpha#2754 PR B: shared /static/<filename> file-serving logic, extracted out of viz/server.py's original _serve_static/_STATIC_DIR/etc so both viz.server (:5001) and the new dev-tier viz.workbench (:5021) serve the same flat viz/static/ directory through one code path. Ships at 'convenience' (not 'dev') even though viz.workbench -- a dev-tier module -- also imports it: dev is cumulative over convenience (Essential ⊂ Convenience ⊂ Dev), so a convenience-tier build (viz.server's own tier) still ships this file, and a dev-tier build ships it too via the cumulative inclusion. Tagging it 'dev' instead would break viz.server's own import on a convenience-tier build."
     },
     {
+      "path": "viz/cors.py",
+      "tier": "convenience",
+      "note": "engram-alpha#4441: the one same-origin policy (no CORS wildcard, exact-equality Origin/Referer checks, Host rule, viz.allowed_origins loader) that both viz.server (convenience) and viz.workbench (dev) mix into their Handlers. Convenience, like its viz/ siblings, because viz.server imports it at module top; dev is cumulative over convenience so the workbench build ships it too."
+    },
+    {
       "path": "viz/server.py",
       "tier": "convenience",
       "note": "engram-alpha#2555 PR A folder move: relocated from root-level viz_server.py into the viz/ package. Same tier the single-file original carried."

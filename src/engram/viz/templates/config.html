@@ -183,7 +183,7 @@
     try {
       const res = await fetch(_withAgent('/api/config/' + encodeURIComponent(key)), {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Engram-Viz': '1' },
         body: JSON.stringify({ value: value }),
       });
       const data = await res.json();
@@ -499,7 +499,7 @@
     try {
       const res = await fetch(_withAgent('/api/config/' + encodeURIComponent(key)), {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Engram-Viz': '1' },
         body: JSON.stringify({ value }),
       });
       const data = await res.json();

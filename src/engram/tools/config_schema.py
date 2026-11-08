@@ -120,6 +120,21 @@ SCHEMA: list[dict] = [
      "tooltip": "Domains flagged for caution. Each entry has a domain, a reason, and an optional engram_node reference. Cited domains show as warning-level in evidence reports.",
      "editable": True, "restart_required": False},
 
+    # Viz server (engram-alpha#4441)
+    {"key": "viz.allowed_origins", "section": "viz", "tier": TIER_B, "type": "list",
+     "control": "list_edit", "label": "Viz allowed origins", "default": [],
+     "item_check": "origin",
+     "tooltip": "Literal origins a browser may use to reach the viz server and workbench besides "
+                "http://127.0.0.1:<port> and http://localhost:<port>, e.g. 'https://viz.example.com' "
+                "when you front the viz through a tunnel. Each entry is exactly scheme://host[:port] "
+                "(http or https): no path, trailing slash, userinfo or '*'; never a pattern. Default "
+                "empty = same-origin only. Read once when the viz server starts, from the serving "
+                "process's own config.json (under its ENGRAM_HOME), not from the --config agents file and "
+                "not from another agent's file chosen with ?agent=: edit that file by hand and restart. An entry with a default port (http host:80, https host:443) never matches, "
+                "because browsers omit default ports. Read-only over HTTP and in the page, on purpose: a same-origin "
+                "page must not be able to persist an allowed origin.",
+     "editable": False, "restart_required": True},
+
     # Fairy delegation policies
     {
         "key": "coder_fairy_policy",
@@ -230,6 +245,7 @@ SECTIONS: list[dict] = [
     {"id": "memory",       "label": "Memory",                  "tier": TIER_B, "order": 9},
     {"id": "polarity",     "label": "Polarity-dedup (NLI)",    "tier": TIER_B, "order": 10, "section_gate": "polarity.enabled"},
     {"id": "deference_detector", "label": "Deference detector", "tier": TIER_B, "order": 11},
+    {"id": "viz",          "label": "Viz server",              "tier": TIER_B, "order": 12},
 ]
 
 

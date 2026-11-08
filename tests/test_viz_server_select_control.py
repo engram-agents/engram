@@ -228,6 +228,9 @@ class TestSelectControlHTTPPut(SelectControlSchemaBase):
         body = json.dumps({"value": value}).encode()
         req = Request(url, data=body, method="PUT")
         req.add_header("Content-Type", "application/json")
+        # same-origin proofs the config page's own fetch sends (#4441)
+        req.add_header("X-Engram-Viz", "1")
+        req.add_header("Origin", f"http://127.0.0.1:{self.port}")
         try:
             with urlopen(req, timeout=5) as resp:
                 return resp.status, json.loads(resp.read())

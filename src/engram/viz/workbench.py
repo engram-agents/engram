@@ -87,6 +87,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import agents as viz_agents
+from . import cors as viz_cors
 from . import footer
 from . import shell
 from . import static_serve
@@ -259,7 +260,7 @@ _DEFAULT_PORT = 5021
 _ACCESS_LOG_PATH: "str | None" = None
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(viz_cors.SameOriginGuard, BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Mirrors viz.server.Handler.log_message exactly (engram-alpha#2767)
         # -- see that method's own docstring for why args[1]/self.command/
@@ -396,7 +397,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -448,6 +449,10 @@ def main():
 
     if args.config and args.db:
         parser.error("--config and --db are mutually exclusive")
+
+    # engram-alpha#4441: the same configured viz.allowed_origins viz.server reads, from this
+    # process's own config, feeding both the Origin and the Host check.
+    viz_cors.load_configured_origins()
 
     # Resolves AGENTS/DEFAULT_AGENT/etc from the SAME flags viz.server's own
     # main() uses, via the SAME shared helper -- "against the same operator
