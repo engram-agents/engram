@@ -451,7 +451,7 @@ def test_w6e_the_real_hooks_json_helper_stages_and_creates_private_for_an_existi
 MODE_AWARE = {
     "src/engram/engram_backup.py": "chmods the temp to the old target's mode (comment names the default-ACL case)",
     "src/engram/engram_home_registry.py": "fchmod 0o644",
-    "src/forum/coordination/store_file.py": "fixed 0o644, deliberate",
+    "src/forum/coordination/store_file.py": "explicit mode per callsite: 0o644 batons (read off disk by seats), 0o600 DM threads (#4501)",
     "src/engram/tools/set_forum_url.py": "copies the old mode onto the temp",
     "src/engram/tools/dream_pickup.py": "copies the old mode onto the temp",
     "src/engram/tools/engram-pkg/engram-pkg": "explicit chmod 0o644 on both outputs",

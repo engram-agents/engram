@@ -105,17 +105,25 @@ def _coerce_seq(raw: str) -> int:
         return 0
 
 
-def _atomic_write(path: Path, content: str) -> None:
+def _atomic_write(path: Path, content: str, mode: int = 0o644) -> None:
     """Write ``content`` to ``path`` atomically (tempfile + ``os.replace``).
 
     The tempfile is created in the SAME directory so ``os.replace`` is a true
     rename (atomic on POSIX), never a cross-device copy. On any failure the
     tempfile is removed so a crash mid-write never leaves a partial sibling.
 
+    The final file mode is explicit per callsite (``mode``, default 0644):
+    baton files stay 0644 because every seat reads them off disk; DM threads
+    are written 0600 (#4501) because only the forum server reads them.
+    mkstemp already creates the temp 0600; the explicit os.chmod below sets
+    the final mode on the TEMP file before the rename, so there is no window
+    in which the target carries a wider mode than intended.
+
     Deliberately NOT converted to the shared hooks/claude/_hooklib.py
-    atomic_write_json() helper introduced by gh#2035: this store is read by
-    OTHER agents, so the file must stay world-readable (0644) after rename,
-    not mkstemp's default 0600 -- see the os.chmod call below.
+    atomic_write_text()/atomic_write_json() helpers (gh#2035, #4013): they keep
+    an existing file's mode and give a new file the umask / default-ACL mode,
+    and take no mode argument, so they cannot pin 0644 for batons or 0600 for
+    DM threads -- see the os.chmod call below.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -127,7 +135,7 @@ def _atomic_write(path: Path, content: str) -> None:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp, 0o644)  # world-readable before rename; mkstemp defaults to 0600
+        os.chmod(tmp, mode)  # final mode set before rename; mkstemp defaults to 0600
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -322,7 +330,8 @@ class FileStore(CoordinationStore):
             existing = path.read_text(encoding="utf-8")
         except OSError:
             existing = f"<!-- dm thread: {dm_thread_key(sender, recipient)} -->\n"
-        _atomic_write(path, existing + block)
+        # DM threads are read only by the forum server: owner-only (#4501).
+        _atomic_write(path, existing + block, mode=0o600)
         return DmMessage(
             seq=seq, sender=sender, recipient=recipient, body=body, ts=ts
         )
