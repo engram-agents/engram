@@ -46,6 +46,26 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 MODEL = "all-MiniLM-L6-v2"
+SNAP = os.path.abspath("/stub/verified-snapshot")
+
+
+def _stub_resolver(engram_core, fail_local=False):
+    """#4468: the pinned model is loaded from a resolved, verified snapshot
+    path. Returns (patcher, online_flags): the resolver stub records the
+    `online` flag of each call; fail_local simulates a local-cache miss."""
+    from pathlib import Path
+    flags = []
+
+    def resolve(model_name, online=False):
+        flags.append(online)
+        if not online and fail_local:
+            raise OSError(
+                f"Model '{model_name}' not found in local HF cache "
+                f"(local_files_only=True)"
+            )
+        return Path(SNAP)
+
+    return mock.patch.object(engram_core, "_resolve_pinned_snapshot", resolve), flags
 
 
 def _fresh_engram_core():
@@ -74,21 +94,22 @@ class TestLocalFilesOnlyPassedOnSuccess:
         fake_st_module.SentenceTransformer = _fake_sentence_transformer
 
         mgr = engram_core.EmbeddingManager()
+        resolver, flags = _stub_resolver(engram_core)
 
-        with mock.patch.object(engram_core, "_verify_pinned_snapshot", return_value=None), mock.patch.dict("sys.modules", {"sentence_transformers": fake_st_module}):
+        with resolver, mock.patch.object(engram_core, "_verify_pinned_snapshot", return_value=None), mock.patch.dict("sys.modules", {"sentence_transformers": fake_st_module}):
             mgr._load_model(MODEL)
 
         assert mgr._model is not None, "expected model to load successfully"
+        assert flags == [False], f"expected one local-only resolve, got {flags}"
         assert mgr._model_name == MODEL
         assert len(calls) == 1, (
             f"expected exactly one SentenceTransformer call (offline success, "
             f"no fallback needed), got {len(calls)}: {calls}"
         )
         args, kwargs = calls[0]
-        assert kwargs.get("local_files_only") is True, (
-            f"expected local_files_only=True on the (only) call, got kwargs={kwargs}"
-        )
-        assert args == (MODEL,) or (args and args[0] == MODEL)
+        # #4468: constructed FROM the verified absolute snapshot path.
+        assert args == (SNAP,), f"expected the verified absolute path, got {args}"
+        assert "revision" not in kwargs
 
 
 class TestCacheMissFallsBackToOnlineDownload:
@@ -102,41 +123,29 @@ class TestCacheMissFallsBackToOnlineDownload:
 
         def _fake_sentence_transformer(*args, **kwargs):
             calls.append((args, kwargs))
-            if kwargs.get("local_files_only"):
-                # Simulate a genuine cache-miss under local_files_only=True
-                # (huggingface_hub raises an OSError-family exception here;
-                # any Exception is treated as cache-miss by the fallback).
-                raise OSError(
-                    f"Model '{MODEL}' not found in local HF cache "
-                    f"(local_files_only=True)"
-                )
             return _FakeModel()
 
         fake_st_module = types.ModuleType("sentence_transformers")
         fake_st_module.SentenceTransformer = _fake_sentence_transformer
 
         mgr = engram_core.EmbeddingManager()
+        # #4468: the genuine cache-miss is simulated at the snapshot resolver
+        # (the local_files_only resolve raises; the online one succeeds).
+        resolver, flags = _stub_resolver(engram_core, fail_local=True)
 
-        with mock.patch.object(engram_core, "_verify_pinned_snapshot", return_value=None), mock.patch.dict("sys.modules", {"sentence_transformers": fake_st_module}):
+        with resolver, mock.patch.object(engram_core, "_verify_pinned_snapshot", return_value=None), mock.patch.dict("sys.modules", {"sentence_transformers": fake_st_module}):
             mgr._load_model(MODEL)
 
         assert mgr._model is not None, (
             "expected the online fallback to succeed and populate self._model"
         )
         assert mgr._model_name == MODEL
-        assert len(calls) == 2, (
-            f"expected two SentenceTransformer calls (offline attempt, then "
-            f"online fallback), got {len(calls)}: {calls}"
+        assert flags == [False, True], (
+            f"expected a local resolve, then one online resolve, got {flags}"
         )
-        first_args, first_kwargs = calls[0]
-        assert first_kwargs.get("local_files_only") is True, (
-            f"expected the first attempt to be offline (local_files_only=True), "
-            f"got kwargs={first_kwargs}"
-        )
-        second_args, second_kwargs = calls[1]
-        assert not second_kwargs.get("local_files_only"), (
-            f"expected the fallback attempt to NOT force local_files_only "
-            f"(online download), got kwargs={second_kwargs}"
+        assert len(calls) == 1 and calls[0][0] == (SNAP,), (
+            f"expected one SentenceTransformer call from the downloaded and "
+            f"verified path, got {calls}"
         )
 
         captured = capsys.readouterr()
@@ -159,8 +168,9 @@ class TestCacheMissFallsBackToOnlineDownload:
         fake_st_module.SentenceTransformer = _always_raise
 
         mgr = engram_core.EmbeddingManager()
+        resolver, _flags = _stub_resolver(engram_core)
 
-        with mock.patch.dict("sys.modules", {"sentence_transformers": fake_st_module}):
+        with resolver, mock.patch.object(engram_core, "_verify_pinned_snapshot", return_value=None), mock.patch.dict("sys.modules", {"sentence_transformers": fake_st_module}):
             mgr._load_model(MODEL)
 
         assert mgr._model is None

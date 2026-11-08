@@ -27,6 +27,7 @@ import os
 import sqlite3
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -177,8 +178,12 @@ def env(tmp_path, monkeypatch):
     # #4447: the default model is checksum-verified against the real HF cache
     # after load; these tests drive a fake SentenceTransformer and never have
     # model bytes, so the verification is stubbed out here (it has its own
-    # cells in test_embedding_model_pin_4447.py).
-    monkeypatch.setattr(core, "_verify_pinned_snapshot", lambda name: None)
+    # cells in test_embedding_model_pin_4447.py). #4468: the pinned snapshot
+    # is also resolved by the loader before construction; install() stubs the
+    # resolver, and Spy.st_fail_local_only makes the LOCAL resolve miss (the
+    # online fallback now lives at the snapshot download, so a pinned load is
+    # ONE constructor call, made from the resolved absolute path).
+    monkeypatch.setattr(core, "_verify_pinned_snapshot", lambda name, snap: None)
 
     class E:
         pass
@@ -194,6 +199,13 @@ def env(tmp_path, monkeypatch):
     def install(spy):
         for name, mod in spy.modules().items():
             monkeypatch.setitem(sys.modules, name, mod)
+
+        def resolve(model_name, online=False):
+            if not online and spy.st_fail_local_only:
+                raise OSError("not in cache")
+            return Path(os.path.abspath("/stub/verified-snapshot"))
+
+        monkeypatch.setattr(core, "_resolve_pinned_snapshot", resolve)
         return spy
 
     e.set_config = set_config
@@ -223,8 +235,9 @@ def test_c1_default_cpu_all_four_sites_no_cuda(env):
     mgr.revive(MODEL)                 # local-only reload
     nli = core._NLIClassifier()
     assert nli._ensure_loaded("p-model") is True
-    # offline attempt, online fallback, revive reload
-    assert spy.st_devices == ["cpu", "cpu", "cpu"]
+    # #4468: the cache miss is handled at the snapshot download, so the pinned
+    # load is one constructor call; then the revive reload
+    assert spy.st_devices == ["cpu", "cpu"]
     assert spy.ce_calls == [("p-model", "cpu")]
     assert spy.cuda_calls == []
 
@@ -359,6 +372,11 @@ def test_c4_auto_no_gpu_real_torch_get_num_threads_equals_cpu_threads(env, monke
         # only the sentence_transformers fake; keep REAL torch
         monkeypatch.setitem(sys.modules, "sentence_transformers",
                             spy.modules()["sentence_transformers"])
+        # #4468: the pinned model resolves/verifies a snapshot before the
+        # constructor; stub both (as env.install() does) so this cell never
+        # touches the HF cache or the network. Real torch is kept.
+        monkeypatch.setattr(env.core, "_resolve_pinned_snapshot",
+                            lambda model_name, online=False: Path("/stub/verified-snapshot"))
         target = 1 if saved != 1 else 2
         env.set_config(device="auto", cpu_threads=target)
         env.core.EmbeddingManager()._load_model(MODEL)
@@ -487,7 +505,7 @@ def test_c7_site_offline_first_load(env):
     spy = env.install(Spy(gpu=True))
     env.set_config(device="cuda")
     env.core.EmbeddingManager()._load_model(MODEL)
-    assert spy.st_calls[0][1].get("local_files_only") is True
+    assert os.path.isabs(spy.st_calls[0][0]) and spy.st_calls[0][0] != MODEL
     assert spy.st_calls[0][1].get("device") == "cuda"
 
 
@@ -496,9 +514,9 @@ def test_c7_site_online_fallback_load(env):
     spy.st_fail_local_only = True
     env.set_config(device="cuda")
     env.core.EmbeddingManager()._load_model(MODEL)
-    assert len(spy.st_calls) == 2
-    assert "local_files_only" not in spy.st_calls[1][1]
-    assert spy.st_calls[1][1].get("device") == "cuda"
+    assert len(spy.st_calls) == 1
+    assert "local_files_only" not in spy.st_calls[0][1]
+    assert spy.st_calls[0][1].get("device") == "cuda"
 
 
 def test_c7_site_online_fallback_cpu_default(env):
@@ -506,7 +524,7 @@ def test_c7_site_online_fallback_cpu_default(env):
     spy.st_fail_local_only = True
     env.set_config()
     env.core.EmbeddingManager()._load_model(MODEL)
-    assert spy.st_calls[1][1].get("device") == "cpu"
+    assert spy.st_calls[0][1].get("device") == "cpu"
     assert spy.cuda_calls == []
 
 
@@ -518,7 +536,7 @@ def test_c7_site_revive_reload(env):
     spy.st_calls.clear()
     assert mgr.revive(MODEL) is True
     assert len(spy.st_calls) == 1
-    assert spy.st_calls[0][1].get("local_files_only") is True
+    assert os.path.isabs(spy.st_calls[0][0]) and spy.st_calls[0][0] != MODEL
     assert spy.st_calls[0][1].get("device") == "cuda"
 
 
@@ -655,7 +673,7 @@ def test_cpu_path_records_no_cuda_access_at_all_four_sites(env):
     spy.st_fail_local_only = False
     mgr.revive(MODEL)
     core._NLIClassifier()._ensure_loaded("p-model")
-    assert len(spy.st_calls) == 3 and len(spy.ce_calls) == 1
+    assert len(spy.st_calls) == 2 and len(spy.ce_calls) == 1
     assert spy.cuda_calls == []
 
 
@@ -798,7 +816,7 @@ def test_all_four_sites_call_the_real_constructor_shape(env, source, device):
     ok = core._NLIClassifier()._ensure_loaded("p-model")  # site 4 (CrossEncoder)
     assert spy.rejected == [], spy.rejected
     assert ok is True and mgr._model is not None
-    assert len(spy.st_calls) == 3 and len(spy.ce_calls) == 1
+    assert len(spy.st_calls) == 2 and len(spy.ce_calls) == 1
 
 
 def test_strict_signature_fake_actually_rejects_an_unknown_keyword():

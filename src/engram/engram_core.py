@@ -214,14 +214,15 @@ def _cap_cpu_threads(model, threads: int) -> None:
 
 
 # #4447: the default embedding model is pinned to one revision and its files
-# are checksummed after load. Provenance, fetched 2026-11-08: the revision and
-# the model.safetensors sha256 (the LFS oid) come from the HF API
+# are checksummed after load. The table covers the ten files the loader reads.
+# Provenance, fetched 2026-11-08: the revision comes from the HF API
 # (/api/models/sentence-transformers/all-MiniLM-L6-v2, `main` at that date);
-# the other nine hashes were computed by hashing the files of that exact
-# snapshot in a local HF cache (the HF tree API gives sha256 only for LFS
-# files). To refresh: take the new `main` sha, re-download that snapshot,
-# re-hash these ten files, and update this table in one change (the
-# RELEASING.md step lands in the lock-file PR of #4447). The drift cell in
+# the model.safetensors hash is the Hugging Face LFS object id from that API
+# (the HF tree API gives sha256 only for LFS files); the other nine were
+# hashed from a local snapshot of that exact revision. To refresh: take the new
+# `main` sha, re-download that snapshot, re-hash these ten files, and update
+# this table in one change (the RELEASING.md step lands in the lock-file PR of
+# #4447). The drift cell in
 # tests/test_embedding_model_pin_4447.py checks these constants against a
 # cached snapshot when one exists.
 _MINILM_PIN = {
@@ -246,19 +247,90 @@ EMBEDDING_MODEL_PINS = {
 }
 
 
-def _verify_pinned_snapshot(model_name: str) -> Optional[str]:
-    """Hash the files of the pinned snapshot; return None if all match, else
-    a one-line reason naming the file and, for a mismatch, the expected and
-    actual sha256 in full. Never touches the network."""
+def _resolve_pinned_snapshot(model_name: str, online: bool = False) -> Path:
+    """Return the ABSOLUTE path of the pinned revision's snapshot directory
+    (#4468). online=False asks the local HF cache only (local_files_only=True,
+    never touches the network) and raises if the revision is not cached;
+    online=True downloads the pinned revision. The caller verifies the
+    directory and then hands THIS path to the constructor, so the verified
+    bytes are the loaded bytes."""
     pin = EMBEDDING_MODEL_PINS[model_name]
-    try:
-        from huggingface_hub import snapshot_download
-        snap = Path(snapshot_download(
-            pin["repo_id"], revision=pin["revision"], local_files_only=True
-        ))
-    except Exception as e:
-        return (f"cannot locate the cached snapshot of revision "
-                f"{pin['revision']} to verify it ({type(e).__name__}: {e})")
+    from huggingface_hub import snapshot_download
+    if online:
+        # Only the ten pinned files: the repo holds 30 files (~977 MB,
+        # pickle-capable ones included), so the download is limited to the
+        # table. (The verifier separately refuses a directory holding any
+        # other file; see _unexpected_entry.) huggingface_hub matches these with
+        # fnmatch against repo-relative paths, so an exact name such as
+        # "1_Pooling/config.json" matches only itself.
+        kwargs = {"allow_patterns": list(pin["sha256"])}
+    else:
+        kwargs = {"local_files_only": True}
+    return Path(os.path.abspath(
+        snapshot_download(pin["repo_id"], revision=pin["revision"], **kwargs)
+    ))
+
+
+# A verification reason that starts with this means a pinned file is missing or
+# unreadable (an interrupted download), as opposed to a checksum mismatch.
+_INCOMPLETE_PREFIX = "snapshot file "
+
+
+# The only files the verified directory may hold: the pinned names plus
+# exactly a top-level README.md (the old by-name constructor left one in
+# existing caches; sentence-transformers 5.3.0 reads it as UTF-8 text into its
+# model-card text and never executes or parses it as configuration, but it is
+# NOT hashed).
+_ALLOWED_EXTRA_FILES = frozenset({"README.md"})
+
+
+def _unexpected_entry(snap, pinned_names) -> "Optional[str]":
+    """Return a one-line reason for the first FILE under `snap` whose
+    posix-relative path is not a pinned name or README.md, else None.
+    Walks recursively and follows symlinked directories (snapshot entries are
+    symlinks into blobs, and a linked directory must not hide a file); a
+    directory already visited (a symlink cycle) is not walked twice. That
+    also skips an alias to an already-walked directory, which is harmless:
+    the loader reads only the fixed pinned relative paths, and the
+    first-walked path of that directory was fully checked. The skip is
+    order-dependent in the closed direction: an alias that sorts BEFORE its
+    target is the first-walked path, and its files, under the alias's name,
+    are unexpected and refused. Empty directories are harmless. A directory that cannot be listed is a reason
+    too. The reason does NOT start with the missing-file prefix, so it is
+    never healed by an online download."""
+    allowed = set(pinned_names) | _ALLOWED_EXTRA_FILES
+    errors = []
+    seen = set()
+    for dirpath, dirs, files in os.walk(snap, followlinks=True,
+                                        onerror=errors.append):
+        real = os.path.realpath(dirpath)
+        if real in seen:
+            dirs[:] = []
+            continue
+        seen.add(real)
+        dirs.sort()
+        for name in sorted(files):
+            rel = Path(os.path.relpath(os.path.join(dirpath, name), snap)).as_posix()
+            if rel not in allowed:
+                return (f"unexpected file {rel} in the snapshot directory "
+                        f"(allowed: the ten pinned files and README.md)")
+    if errors:
+        return f"cannot list a snapshot directory ({errors[0]})"
+    return None
+
+
+def _verify_pinned_snapshot(model_name: str, snap: Path) -> Optional[str]:
+    """Check the directory's entry set, then hash the ten pinned files under
+    `snap`; return None if all is as pinned, else a one-line reason naming the
+    file and, for a mismatch, the expected and actual sha256 in full. Never
+    touches the network. The entry check runs FIRST: a directory holding an
+    unexpected file (the loader would read it: e.g. adapter_config.json
+    switches transformers to its PEFT branch) is refused without hashing
+    about 90 MB."""
+    pin = EMBEDDING_MODEL_PINS[model_name]
+    reason = _unexpected_entry(snap, pin["sha256"])
+    if reason is not None:
+        return reason
     for rel, expected in pin["sha256"].items():
         path = snap / rel
         h = hashlib.sha256()
@@ -301,9 +373,12 @@ class EmbeddingManager:
         self._model = None
         self._model_name = None
         self._failed_models = set()  # cache download failures
-        # #4447: pinned model names whose snapshot checksums already passed
-        # in this process (guarded by self._lock, written in _load_model).
-        self._pin_verified: set[str] = set()
+        # #4447/#4468: pinned model name -> the ABSOLUTE snapshot path whose
+        # checksums already passed in this process (guarded by self._lock).
+        # A later reload of the same name constructs from the memoised path
+        # without re-hashing; bounded limit: a file changed on disk after the
+        # first pass is not re-checked in the same process.
+        self._pin_verified: dict[str, str] = {}
         # #345 PR3 B2 Rider 1: a SIBLING dict, not a repurposing of
         # _failed_models itself. _failed_models stays a plain set with its
         # existing semantics (server.py's pre-warm .add(), several tests'
@@ -326,18 +401,32 @@ class EmbeddingManager:
         when HF Hub is slow/unreachable). Falls back to a one-time online
         download on a genuine cache-miss — auto-downloads from HuggingFace.
 
-        #4447: a model named in EMBEDDING_MODEL_PINS (the default) is loaded
-        at its pinned revision on BOTH attempts, and after a successful load
-        the pinned snapshot's files are sha256-checked once per process. A
-        mismatch, a missing file, or a check that cannot run REFUSES the
-        model (self._model = None, name added to _failed_models, one stderr
-        line with the file and the expected and actual hashes); there is no
-        fallback to an unpinned load. A model name NOT in the table (a custom
-        `embedding.model`) is the user's own choice and is unpinned: it loads
-        exactly as before, with no revision and no verification.
+        #4447/#4468: a model named in EMBEDDING_MODEL_PINS (the default) is
+        loaded from its pinned revision's snapshot directory: the snapshot is
+        resolved (local cache; on a miss, one online snapshot_download of the
+        pinned revision), its files are sha256-checked once per process, and
+        only then is the constructor handed the verified ABSOLUTE snapshot
+        path (no revision, no model name), so neither the working directory
+        nor SENTENCE_TRANSFORMERS_HOME can redirect the load: the ten pinned
+        files are hashed, and the directory's entry set is checked to be those
+        ten plus a top-level README.md (not hashed; sentence-transformers
+        reads it as text only), before the constructor runs. A mismatch, a missing file, or a
+        check that cannot run REFUSES the model (self._model = None, name
+        added to _failed_models, one stderr line with the file and the
+        expected and actual hashes); there is no fallback to an unpinned
+        load. A model name NOT in the table (a custom `embedding.model`) is
+        the user's own choice and is unpinned: it loads exactly as before, by
+        name, with no revision and no verification.
 
-        The checksum runs AFTER the constructor has read the files: a refusal
-        drops the model, it does not stop the files from being parsed.
+        A cache-miss download fetches only the ten pinned files. If the local
+        snapshot cannot read a pinned file (an interrupted first download),
+        _load_model (not revive) does ONE online resolve to complete it and
+        verifies again; a checksum mismatch is refused at once and never
+        healed by downloading over it.
+
+        One residual: a file replaced or added between the check and
+        construction (same-user write access) is not covered, and a file changed on disk
+        after the first pass is not re-checked in the same process.
         """
         # Fast path: no lock if already loaded for this model_name.
         if self._model is not None and self._model_name == model_name:
@@ -357,39 +446,46 @@ class EmbeddingManager:
                 st_kwargs = _sentence_transformer_device_kwargs(device)
                 pin = EMBEDDING_MODEL_PINS.get(model_name)
                 if pin:
-                    st_kwargs = {**st_kwargs, "revision": pin["revision"]}
-                try:
-                    # #1682: offline-first load. A cached model loads with
-                    # ZERO HuggingFace Hub network traffic — no online
-                    # etag-check, so the ~83s stall (HF Hub slow/unreachable)
-                    # cannot happen on the common warm-cache path (every
-                    # daemon warmup / MCP server restart after the first
-                    # successful load).
-                    model = SentenceTransformer(
-                        model_name, local_files_only=True, **st_kwargs
+                    model = self._build_pinned(
+                        model_name, SentenceTransformer, st_kwargs,
+                        allow_online=True,
                     )
-                except Exception:
-                    # Cache-miss: this install does NOT pre-download the
-                    # embedder model as a discrete install step (verified —
-                    # no install script calls SentenceTransformer(...); the
-                    # daemon's own background pre-warm in server.py only
-                    # loads an ALREADY-cached model, it does not download).
-                    # The genuine first-time download happens here, lazily,
-                    # on first real use — README-AGENT.md's documented
-                    # "first cold launch loads the sentence-transformer
-                    # model (~80 MB); later launches hit the warm cache"
-                    # behavior. Fall back to a one-time online download so
-                    # a fresh install keeps working; every subsequent load
-                    # hits the local_files_only path above.
-                    import sys as _sys
-                    print(
-                        f"[engram] Embedding model '{model_name}' not in "
-                        f"local HF cache — downloading once (online); "
-                        f"subsequent loads are offline.",
-                        file=_sys.stderr,
-                    )
-                    model = SentenceTransformer(model_name, **st_kwargs)
-                self._keep_if_verified(model_name, model, cpu_threads)
+                    if model is None:
+                        return  # refused: recorded by _build_pinned
+                else:
+                    try:
+                        # #1682: offline-first load. A cached model loads
+                        # with ZERO HuggingFace Hub network traffic — no
+                        # online etag-check, so the ~83s stall (HF Hub
+                        # slow/unreachable) cannot happen on the common
+                        # warm-cache path (every daemon warmup / MCP server
+                        # restart after the first successful load).
+                        model = SentenceTransformer(
+                            model_name, local_files_only=True, **st_kwargs
+                        )
+                    except Exception:
+                        # Cache-miss: this install does NOT pre-download the
+                        # embedder model as a discrete install step
+                        # (verified — no install script calls
+                        # SentenceTransformer(...); the daemon's own
+                        # background pre-warm in server.py only loads an
+                        # ALREADY-cached model, it does not download). The
+                        # genuine first-time download happens here, lazily,
+                        # on first real use — README-AGENT.md's documented
+                        # "first cold launch loads the sentence-transformer
+                        # model (~80 MB); later launches hit the warm cache"
+                        # behavior. Fall back to a one-time online download
+                        # so a fresh install keeps working; every subsequent
+                        # load hits the local_files_only path above.
+                        import sys as _sys
+                        print(
+                            f"[engram] Embedding model '{model_name}' not in "
+                            f"local HF cache — downloading once (online); "
+                            f"subsequent loads are offline.",
+                            file=_sys.stderr,
+                        )
+                        model = SentenceTransformer(model_name, **st_kwargs)
+                self._assign_model(model_name, model, cpu_threads)
             except ImportError:
                 self._model = None
                 self._model_name = None
@@ -440,18 +536,52 @@ class EmbeddingManager:
             vectors = self._model.encode(texts, convert_to_numpy=True)
         return vectors.tolist()
 
-    def _keep_if_verified(self, model_name: str, model, cpu_threads) -> None:
-        """Shared by _load_model and _load_model_local_only (#4447); the
-        caller holds self._lock. Takes a freshly built, NOT yet assigned
-        model. A name outside EMBEDDING_MODEL_PINS is kept as is. A pinned
-        name is checksum-verified once per manager; on a problem the model
-        is dropped, the name goes into _failed_models and one stderr line
-        names the file and the expected and actual hashes. self._model and
-        self._model_name are assigned together, and only after verification,
-        so no reader sees an unverified model."""
-        pin = EMBEDDING_MODEL_PINS.get(model_name)
-        if pin and model_name not in self._pin_verified:
-            problem = _verify_pinned_snapshot(model_name)
+    def _build_pinned(self, model_name: str, SentenceTransformer, st_kwargs,
+                      allow_online: bool):
+        """Shared by _load_model (allow_online=True) and
+        _load_model_local_only (False) (#4447/#4468); the caller holds
+        self._lock. Resolve the pinned snapshot, verify it once per manager
+        (memo: name -> verified absolute path), and only then construct
+        SentenceTransformer(<that absolute path>, **st_kwargs), WITHOUT
+        revision= (meaningless for a path). Returns the built, NOT yet
+        assigned model, or None on a refusal (self._model/_model_name None,
+        the name in _failed_models, one stderr line naming the file and the
+        expected and actual hashes). A cache miss where there is no online
+        fallback, or a failed online download, raises to the caller's except
+        path exactly as a failed constructor did."""
+        pin = EMBEDDING_MODEL_PINS[model_name]
+        path = self._pin_verified.get(model_name)
+        if path is None:
+            online_done = False
+            try:
+                snap = _resolve_pinned_snapshot(model_name)
+            except Exception:
+                if not allow_online:
+                    raise
+                import sys as _sys
+                print(
+                    f"[engram] Embedding model '{model_name}' not in "
+                    f"local HF cache — downloading once (online); "
+                    f"subsequent loads are offline.",
+                    file=_sys.stderr,
+                )
+                snap = _resolve_pinned_snapshot(model_name, online=True)
+                online_done = True
+            problem = _verify_pinned_snapshot(model_name, snap)
+            if (problem is not None and allow_online and not online_done
+                    and problem.startswith(_INCOMPLETE_PREFIX)):
+                # A partially populated snapshot (interrupted first
+                # download): complete it once, online (never on the revive
+                # path), and verify again. A mismatch never gets here; a
+                # failed download raises to the caller's except path.
+                import sys as _sys
+                print(
+                    f"[engram] Embedding model '{model_name}' snapshot is "
+                    f"incomplete ({problem}) — completing it once (online).",
+                    file=_sys.stderr,
+                )
+                snap = _resolve_pinned_snapshot(model_name, online=True)
+                problem = _verify_pinned_snapshot(model_name, snap)
             if problem is not None:
                 # (callers' `except` clauses bind a local `sys`)
                 import sys as _pin_sys
@@ -463,8 +593,15 @@ class EmbeddingManager:
                 self._model = None
                 self._model_name = None
                 self._failed_models.add(model_name)
-                return
-            self._pin_verified.add(model_name)
+                return None
+            path = str(snap)
+            self._pin_verified[model_name] = path
+        return SentenceTransformer(path, **st_kwargs)
+
+    def _assign_model(self, model_name: str, model, cpu_threads) -> None:
+        """Cap threads and assign self._model / self._model_name together,
+        only for a model that is unpinned or was built from a verified path,
+        so no reader sees an unverified model."""
         _cap_cpu_threads(model, cpu_threads)
         self._model = model
         self._model_name = model_name
@@ -510,15 +647,23 @@ class EmbeddingManager:
             try:
                 from sentence_transformers import SentenceTransformer
                 device, cpu_threads = _embedding_device_settings()
-                # #4447: same pin + checksum gate as _load_model.
+                # #4447/#4468: same pin + checksum gate as _load_model, with
+                # NO online fallback: a snapshot not in the local cache is a
+                # failed local load, never a network call.
                 st_kwargs = _sentence_transformer_device_kwargs(device)
                 pin = EMBEDDING_MODEL_PINS.get(model_name)
                 if pin:
-                    st_kwargs = {**st_kwargs, "revision": pin["revision"]}
-                model = SentenceTransformer(
-                    model_name, local_files_only=True, **st_kwargs,
-                )
-                self._keep_if_verified(model_name, model, cpu_threads)
+                    model = self._build_pinned(
+                        model_name, SentenceTransformer, st_kwargs,
+                        allow_online=False,
+                    )
+                    if model is None:
+                        return  # refused: recorded by _build_pinned
+                else:
+                    model = SentenceTransformer(
+                        model_name, local_files_only=True, **st_kwargs,
+                    )
+                self._assign_model(model_name, model, cpu_threads)
             except Exception as e:
                 import sys
                 print(

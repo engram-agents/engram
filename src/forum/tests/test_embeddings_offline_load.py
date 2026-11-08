@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -56,6 +57,25 @@ import pytest
 from forum import embeddings as emb
 
 MODEL = emb.FORUM_EMBEDDING_MODEL
+SNAP = os.path.abspath("/stub/verified-snapshot")
+
+
+def _install_resolver(monkeypatch, fail_local=False):
+    """#4468: stub the pinned-snapshot resolver; returns the list of `online`
+    flags it was called with. fail_local simulates a local-cache miss."""
+    online_flags = []
+
+    def resolve(online=False):
+        online_flags.append(online)
+        if not online and fail_local:
+            raise OSError(
+                f"Model '{MODEL}' not found in local HF cache "
+                f"(local_files_only=True)"
+            )
+        return Path(SNAP)
+
+    monkeypatch.setattr(emb, "_resolve_pinned_snapshot", resolve)
+    return online_flags
 
 
 @pytest.fixture(autouse=True)
@@ -65,6 +85,12 @@ def _reset_model_singleton(monkeypatch):
     other test modules in the same process aren't affected."""
     monkeypatch.delenv("FORUM_NO_EMBEDDINGS", raising=False)
     monkeypatch.setattr(emb, "_ST_AVAILABLE", True)
+    # #4468: the fake constructors here carry no model bytes. Stub the
+    # verifier and reset the refusal/verified memo; each test installs its own
+    # snapshot resolver (the real ones are tested in test_embeddings_pin_4468).
+    monkeypatch.setattr(emb, "_verify_pinned_snapshot", lambda snap: None)
+    monkeypatch.setattr(emb, "_model_refused", False)
+    monkeypatch.setattr(emb, "_verified_snapshot", None, raising=False)
     original_model = emb._model
     emb._model = None
     yield
@@ -83,19 +109,21 @@ class TestLocalFilesOnlyPassedOnSuccess:
             return _FakeModel()
 
         monkeypatch.setattr(emb, "_SentenceTransformer", _fake_sentence_transformer)
+        flags = _install_resolver(monkeypatch)
 
         model = emb._get_model()
 
         assert model is not None, "expected model to load successfully"
+        # #4468: the cached path resolves the snapshot LOCALLY only (zero
+        # network, #1762) and constructs once, from the verified path.
+        assert flags == [False], f"expected one local-only resolve, got {flags}"
         assert len(calls) == 1, (
             f"expected exactly one _SentenceTransformer call (offline success, "
             f"no fallback needed), got {len(calls)}: {calls}"
         )
         args, kwargs = calls[0]
-        assert kwargs.get("local_files_only") is True, (
-            f"expected local_files_only=True on the (only) call, got kwargs={kwargs}"
-        )
-        assert args == (MODEL,) or (args and args[0] == MODEL)
+        assert args == (SNAP,), f"expected the verified absolute path, got {args}"
+        assert "revision" not in kwargs
 
 
 class TestCacheMissFallsBackToOnlineDownload:
@@ -107,37 +135,26 @@ class TestCacheMissFallsBackToOnlineDownload:
 
         def _fake_sentence_transformer(*args, **kwargs):
             calls.append((args, kwargs))
-            if kwargs.get("local_files_only"):
-                # Simulate a genuine cache-miss under local_files_only=True
-                # (huggingface_hub raises an OSError-family exception here;
-                # any Exception is treated as cache-miss by the fallback).
-                raise OSError(
-                    f"Model '{MODEL}' not found in local HF cache "
-                    f"(local_files_only=True)"
-                )
             return _FakeModel()
 
         monkeypatch.setattr(emb, "_SentenceTransformer", _fake_sentence_transformer)
+        # #4468: the cache-miss is simulated at the snapshot resolver (a
+        # local_files_only resolve raises; the online one succeeds).
+        flags = _install_resolver(monkeypatch, fail_local=True)
 
         model = emb._get_model()
 
         assert model is not None, (
             "expected the online fallback to succeed and populate the singleton"
         )
-        assert len(calls) == 2, (
-            f"expected two _SentenceTransformer calls (offline attempt, then "
-            f"online fallback), got {len(calls)}: {calls}"
+        assert flags == [False, True], (
+            f"expected a local resolve, then one online resolve, got {flags}"
         )
-        first_args, first_kwargs = calls[0]
-        assert first_kwargs.get("local_files_only") is True, (
-            f"expected the first attempt to be offline (local_files_only=True), "
-            f"got kwargs={first_kwargs}"
+        assert len(calls) == 1, (
+            f"expected one _SentenceTransformer call, made from the downloaded "
+            f"and verified snapshot path, got {len(calls)}: {calls}"
         )
-        second_args, second_kwargs = calls[1]
-        assert not second_kwargs.get("local_files_only"), (
-            f"expected the fallback attempt to NOT force local_files_only "
-            f"(online download), got kwargs={second_kwargs}"
-        )
+        assert calls[0][0] == (SNAP,)
 
         captured = capsys.readouterr()
         assert "downloading once" in captured.err, (
@@ -154,6 +171,7 @@ class TestCacheMissFallsBackToOnlineDownload:
             raise RuntimeError("simulated total load failure")
 
         monkeypatch.setattr(emb, "_SentenceTransformer", _always_raise)
+        _install_resolver(monkeypatch)
 
         model = emb._get_model()
 

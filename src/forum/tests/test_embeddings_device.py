@@ -10,8 +10,9 @@ Mirrors #3905 (engram side, #3898) for src/forum/embeddings.py:
   FORUM_EMBEDDING_CPU_THREADS  unset -> 4; an integer 1..1024 is used; an
                                invalid value prints ONE stderr line and uses 4.
 
-The device reaches BOTH _SentenceTransformer(...) calls (offline-first and
-online fallback). The thread cap is torch.set_num_threads(n), applied once per
+The device reaches the _SentenceTransformer(...) call on both the cached path
+and the cache-miss path (#4468: the miss is now handled at the snapshot
+download, so there is one constructor call, made from the verified path). The thread cap is torch.set_num_threads(n), applied once per
 successful load iff the LOADED model reports a CPU device.
 
 Cell granularity is part of the contract: the fallback's ``device=`` is pinned
@@ -24,8 +25,10 @@ sys.modules.
 
 from __future__ import annotations
 
+import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -59,6 +62,14 @@ def _clean(monkeypatch):
     monkeypatch.delenv(DEV_KEY, raising=False)
     monkeypatch.delenv(THREADS_KEY, raising=False)
     monkeypatch.setattr(emb, "_ST_AVAILABLE", True)
+    # #4468: these tests load the default model through a fake constructor with
+    # no model bytes. The loader now resolves the pinned snapshot, hashes it,
+    # and constructs from that path; stub the resolver and the verifier so a
+    # host without the HF cache stays hermetic (the real ones are tested in
+    # test_embeddings_pin_4468).
+    monkeypatch.setattr(emb, "_verify_pinned_snapshot", lambda snap: None)
+    monkeypatch.setattr(emb, "_model_refused", False)
+    monkeypatch.setattr(emb, "_verified_snapshot", None, raising=False)
     original = emb._model
     emb._model = None
     yield
@@ -75,19 +86,28 @@ def torch_calls(monkeypatch):
     return calls
 
 
+SNAP = os.path.abspath("/stub/verified-snapshot")
+
+
 def _install(monkeypatch, model_cls=_CpuModel, fail_offline=False, fail_online=False):
-    """Fake _SentenceTransformer; returns the recorded (args, kwargs) list."""
+    """Fake snapshot resolver + _SentenceTransformer; returns the recorded
+    constructor (args, kwargs) list. fail_offline / fail_online make the
+    LOCAL / ONLINE snapshot resolution raise (#4468: the cache miss and its
+    online fallback live at the snapshot download, not the constructor)."""
     calls = []
+
+    def resolve(online=False):
+        if not online and fail_offline:
+            raise OSError("simulated cache miss")
+        if online and fail_online:
+            raise RuntimeError("simulated online failure")
+        return Path(SNAP)
 
     def fake(*args, **kwargs):
         calls.append((args, kwargs))
-        offline = kwargs.get("local_files_only") is True
-        if offline and fail_offline:
-            raise OSError("simulated cache miss")
-        if not offline and fail_online:
-            raise RuntimeError("simulated online failure")
         return model_cls()
 
+    monkeypatch.setattr(emb, "_resolve_pinned_snapshot", resolve)
     monkeypatch.setattr(emb, "_SentenceTransformer", fake)
     return calls
 
@@ -106,8 +126,8 @@ def test_default_device_is_cpu_on_the_offline_path(monkeypatch):
     assert emb._get_model() is not None
     assert len(calls) == 1
     args, kwargs = calls[0]
-    assert args == (MODEL,)
-    assert kwargs.get("local_files_only") is True
+    assert args == (SNAP,)
+    assert "revision" not in kwargs
     assert kwargs.get("device") == "cpu", kwargs
 
 
@@ -124,9 +144,9 @@ def test_env_device_reaches_the_fallback_path(monkeypatch, env):
         monkeypatch.setenv(DEV_KEY, env)
     calls = _install(monkeypatch, fail_offline=True)
     assert emb._get_model() is not None
-    assert len(calls) == 2
-    args, kwargs = calls[1]
-    assert args == (MODEL,)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == (SNAP,)
     assert "local_files_only" not in kwargs
     assert kwargs.get("device") == (env or "cpu"), kwargs
 
