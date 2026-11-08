@@ -447,10 +447,28 @@ def _normalise(text: str, home: Path, eh: Path, script: Path) -> str:
     return re.sub(r"\b[0-9a-f]{40}\b", "<SHA>", text)
 
 
+def _step2_out(text: str) -> str:
+    """#4506: the Step 2 (.gitignore) block of the run output differs from the pinned dev script BY DESIGN (the
+    list now comes from engram_core, and the dry-run wording changed). Everything outside that block stays
+    compared. The script HEADER is not normalised: it is compared raw (see the header cell below)."""
+    # engram_core, imported by Step 2 under a PYTHON_BIN without sqlite_vec, prints exactly this one line.
+    # It must occur at most once per text (a second step importing engram_core would be a new difference that
+    # stripping every occurrence would hide); then that one line is dropped and nothing else.
+    assert len(re.findall(r"(?m)^\[engram\] sqlite-vec unavailable", text)) <= 1, text
+    text = re.sub(r"(?m)^\[engram\] sqlite-vec unavailable.*\n", "", text)
+    text = re.sub(r"\[engram-fix-git-backup\] Step 2:.*?(?=\[engram-fix-git-backup\] Step 3:)", "<STEP2>\n", text,
+                  flags=re.DOTALL)
+    text = re.sub(r"(?m)^\[engram-fix-git-backup\]   skipped \(gitignored\): session_log\.md\n", "", text)
+    return text.replace("Staged: knowledge.sql session_log.md ", "Staged: knowledge.sql ")
+
+
 def _tree(root: Path) -> dict:
     out = {}
     for p in sorted(root.rglob("*")):
         rel = str(p.relative_to(root))
+        # #4506: .gitignore differs from the pinned dev script by design; T3 asserts its content separately.
+        if rel == ".gitignore":
+            continue
         if rel == ".git" or rel.startswith(".git" + os.sep) or rel.startswith("run" + os.sep) or p.is_dir():
             continue
         rel = re.sub(r"\d{8}T\d{6}Z", "<TS>", rel)
@@ -471,8 +489,9 @@ def _snapshot_of_run(script, home, eh, args, setup, seed_db: Path):
     r = run_script(script, home, eh, args)
     result = {
         "rc": r.returncode,
-        "stdout": _normalise(r.stdout, home, eh, script),
-        "stderr": _normalise(r.stderr, home, eh, script),
+        "stdout": _step2_out(_normalise(r.stdout, home, eh, script)),
+        "stderr": _step2_out(_normalise(r.stderr, home, eh, script)),
+        "gitignore": (eh / ".gitignore").read_text(encoding="utf-8") if (eh / ".gitignore").is_file() else None,
         "eh": _tree(eh),
         "home": _tree(home),
     }
@@ -531,11 +550,43 @@ def test_t3_flag_off_is_identical_to_the_dev_script(dev_script, variant):
         assert dev["rc"] == new["rc"]
         assert dev["stdout"] == new["stdout"]
         assert dev["stderr"] == new["stderr"]
+        # #4506: the .gitignore (and the Step-2 block of the output) is the one deliberate difference from the
+        # pinned dev script: the dev script wrote its 14-line literal, the new one writes the engram_core list.
+        # Compare everything else, and assert the new file equals the constant where a live run wrote one.
+        dev_gi, new_gi = dev.pop("gitignore"), new.pop("gitignore")
+        # #4506 (C6): the dev script committed session_log.md; the new one skips it because the canonical
+        # list ignores it (and `git add` of an ignored path would have failed after the old .git was gone).
+        # Drop only that file from the committed-file comparison, and assert both sides of the difference.
+        if "git_files" in dev:
+            assert "session_log.md" in dev["git_files"].split()
+            assert "session_log.md" not in new["git_files"].split()
+            for r_ in (dev, new):
+                r_["git_files"] = "\n".join(f for f in r_["git_files"].split() if f != "session_log.md")
         assert dev == new
+        if variant.startswith("live"):
+            assert new_gi is not None and new_gi.endswith("\n")
+            assert [ln for ln in new_gi.splitlines() if ln] == list(engram_core.ENGRAM_GITIGNORE_PATTERNS)
+            assert dev_gi is not None  # the dev script wrote one too (its own, shorter, list)
+        else:
+            assert dev_gi is None and new_gi is None
         if variant.startswith("live"):  # not vacuous: the run really did the work
             assert dev["rc"] == 0 and "dump_rows" in dev and dev["safety_rows"]
     finally:
         shutil.rmtree(seed_base, ignore_errors=True)
+
+
+def test_t3_header_comment_is_byte_identical_to_the_dev_script_with_the_prefix_intact(dev_script):
+    """#4506 (Luria's B1): --help prints the header through `sed 's/^# \\?//'`, and `\\?` is GNU-only, so on BSD sed
+    (macOS) the `# ` prefix stays and a header line that changed shows up as a --help difference there. Compare
+    the RAW header lines (`sed -n '2,/^set -euo/p'`, no prefix stripping, which is what BSD sed leaves) so a
+    header edit is caught on Linux too."""
+    def raw_header(script: Path) -> list:
+        out = subprocess.run(["sed", "-n", "2,/^set -euo/p", str(script)], capture_output=True, text=True,
+                             check=True).stdout
+        return [ln for ln in out.splitlines() if ln.startswith("#")]
+    dev, new = raw_header(dev_script), raw_header(SCRIPT)
+    assert len(dev) > 20 and any("2.   Write" in ln or "2. Write" in ln for ln in dev)  # not vacuous
+    assert new == dev
 
 
 def test_t3_failure_exit_codes_match_dev_for_a_missing_store_and_a_relative_home(dev_script, sandbox):
@@ -698,6 +749,15 @@ def test_t6b_a_crash_reading_the_flag_is_one_stable_line_and_reads_off(sandbox, 
     script = tree / "tools" / "engram-fix-git-backup.sh"
     shutil.copy(SCRIPT, script)  # a tools dir with NO _owner_read.py next to it
     (tree / "engram_backup.py").symlink_to(ENGRAM_BACKUP)
+    # #4506: C2 needs engram_core.py next to engram_backup.py, and it imports its sibling modules, so link the
+    # runtime's top-level modules (tools/ is still the scratch dir above, with NO _owner_read.py).
+    for mod in sorted(SCRIPT.parent.parent.glob("*.py")):
+        if not (tree / mod.name).exists():
+            (tree / mod.name).symlink_to(mod)
+    # engram_core also imports `tools.*`; link those modules too, except the one this cell must lack.
+    for mod in sorted(SCRIPT.parent.glob("*.py")):
+        if mod.name != "_owner_read.py" and not (tree / "tools" / mod.name).exists():
+            (tree / "tools" / mod.name).symlink_to(mod)
     with SnapshotOwner(eh, "ok") as owner:
         r = run_script(script, home, eh, instr=instrument)
     assert r.returncode == 0, (r.stdout, r.stderr)  # the flag-OFF path ran to the end

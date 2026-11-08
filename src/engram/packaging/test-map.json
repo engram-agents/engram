@@ -828,8 +828,10 @@
     },
     {
       "path_prefix_or_glob": "tools/engram-fix-git-backup.sh",
-      "full_suite_fallback": true,
-      "note": "No test file found for engram-fix-git-backup.sh"
+      "test_globs": [
+        "tests/test_fix_git_backup_canonical_gitignore_4506.py",
+        "tests/test_fix_git_backup_owner_snapshot_2652.py"
+      ]
     },
     {
       "path_prefix_or_glob": "tools/forum-mention-monitor.sh",

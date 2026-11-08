@@ -78,6 +78,13 @@ if [[ ! -f "$ENGRAM_BACKUP" ]]; then
     echo "[engram-fix-git-backup] ERROR: engram_backup.py not found at $ENGRAM_BACKUP" >&2
     exit 1
 fi
+# Resolve the engram_core.py module (same fixed one-level window as engram_backup.py: src/engram/tools ->
+# src/engram, <plugin>/tools -> <plugin>). Checked here, before any step writes anything (#4506).
+ENGRAM_CORE="$(dirname "$(readlink -f "$0")")/../engram_core.py"
+if [[ ! -f "$ENGRAM_CORE" ]]; then
+    echo "[engram-fix-git-backup] ERROR: engram_core.py not found at $ENGRAM_CORE" >&2
+    exit 1
+fi
 PY="$PYTHON_BIN"
 
 # ---------------------------------------------------------------------------
@@ -245,32 +252,48 @@ fi
 # ---------------------------------------------------------------------------
 # Step 2: Write / refresh .gitignore
 # ---------------------------------------------------------------------------
+# The pattern list is NOT kept here (#4506): a literal copy drifted to 14 of 25 entries and "repaired" a home
+# by removing the rest (secrets/, *api-key*, forum-token, backups/, ...). It comes only from engram_core:
+# --dry-run prints engram_core.ENGRAM_GITIGNORE_PATTERNS; a live run calls
+# engram_core._ensure_engram_gitignore(Path(ENGRAM_HOME)) and inherits its semantics: a .gitignore that
+# already holds every pattern is left untouched (hand-added lines survive), and a rewrite preserves
+# hand-added `!` negations. That function swallows OSError and returns None, so the script re-reads the file
+# itself and dies (before step 3) unless every pattern is there as an exact line.
+# insert(0), never append: under `python -c` sys.path[0] is the cwd, which must not outrank the real module.
+# The only path added is the fixed one-level window $TOOLS_DIR/.. (no upward walk).
 log ""
 log "Step 2: Writing canonical .gitignore"
 
 GITIGNORE_PATH="$ENGRAM_HOME/.gitignore"
-GITIGNORE_CONTENT='*.db
-*.db-shm
-*.db-wal
-*.db-journal
-*?mode=*
-*.bak
-*.bak.*
-config.json.bak*
-*.backfill-snapshot-*
-*.log
-marketplace/
-venv/
-__pycache__/
-*.pyc
-'
+GITIGNORE_PY='import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+import engram_core
+patterns = list(engram_core.ENGRAM_GITIGNORE_PATTERNS)
+if sys.argv[2] == "dry":
+    for p in patterns:
+        print("    " + p)
+    sys.exit(0)
+eh = Path(sys.argv[3])
+engram_core._ensure_engram_gitignore(eh)
+try:
+    have = {ln.strip() for ln in (eh / ".gitignore").read_text(encoding="utf-8").splitlines()}
+except OSError as exc:
+    print("cannot read " + str(eh / ".gitignore") + " after the write: " + type(exc).__name__ + ": " + str(exc))
+    sys.exit(1)
+missing = [p for p in patterns if p not in have]
+if missing:
+    print(str(eh / ".gitignore") + " is missing " + str(len(missing)) + " canonical pattern(s) after the write: " + ", ".join(missing))
+    sys.exit(1)'
 
 if [[ $DRY_RUN -eq 1 ]]; then
-    echo "  [DRY-RUN] would write .gitignore with patterns:"
-    echo "$GITIGNORE_CONTENT" | sed 's/^/    /'
+    echo "  [DRY-RUN] would ensure .gitignore holds the canonical patterns (engram_core.ENGRAM_GITIGNORE_PATTERNS; a complete file is left untouched):"
+    GI_OUT=$("$PY" -c "$GITIGNORE_PY" "$TOOLS_DIR/.." dry) || die "could not read the canonical .gitignore patterns from $ENGRAM_CORE"
+    echo "$GI_OUT"
 else
-    printf '%s' "$GITIGNORE_CONTENT" > "$GITIGNORE_PATH"
-    log "  .gitignore written ($GITIGNORE_PATH)"
+    GI_ERR=$(ENGRAM_HOME="$ENGRAM_HOME" "$PY" -c "$GITIGNORE_PY" "$TOOLS_DIR/.." live "$ENGRAM_HOME" 2>&1) \
+        || die ".gitignore was not brought up to the canonical patterns: $GI_ERR -- aborting before step 3"
+    log "  .gitignore ensured ($GITIGNORE_PATH)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -326,10 +349,30 @@ else
     git -C "$ENGRAM_HOME" config user.email "engram@local"
     git -C "$ENGRAM_HOME" config user.name "KG Memory"
 
-    # Stage only the tracked files (same set as _commit_snapshot)
+    # Stage only the tracked files (same set as _commit_snapshot), minus anything the .gitignore ignores
+    # (#4506, mirroring _commit_snapshot's #731 filter): the canonical list ignores session_log.md, and
+    # `git add` of an ignored path exits 1 -- here, AFTER .git was removed. Never `add -f`. check-ignore rc
+    # 0 = ignored (skip), 1 = not ignored (add), anything else = a git error: die rather than carry on,
+    # because the old history is already gone.
     STAGED_FILES=()
+    SKIPPED_IGNORED=()
+    # Sets IGNORED=1/0 for a path relative to $ENGRAM_HOME.
+    is_ignored() {
+        local rc=0
+        git -C "$ENGRAM_HOME" check-ignore -q -- "$1" || rc=$?
+        case $rc in
+            0) IGNORED=1 ;;
+            1) IGNORED=0 ;;
+            *) die "git check-ignore failed (exit $rc) on '$1' after the old .git was removed -- aborting" ;;
+        esac
+    }
     for fname in "graph_snapshot.md" "knowledge.sql" "session_log.md" "config.json" "warm-briefing.md" ".gitignore"; do
         if [[ -f "$ENGRAM_HOME/$fname" ]]; then
+            is_ignored "$fname"
+            if [[ $IGNORED -eq 1 ]]; then
+                SKIPPED_IGNORED+=("$fname")
+                continue
+            fi
             git -C "$ENGRAM_HOME" add -- "$fname"
             STAGED_FILES+=("$fname")
         fi
@@ -341,10 +384,19 @@ else
             basename_f=$(basename "$f")
             if [[ "$basename_f" != ".key" ]] && [[ "$f" != *__pycache__* ]]; then
                 rel="diary/$basename_f"
+                is_ignored "$rel"
+                if [[ $IGNORED -eq 1 ]]; then
+                    SKIPPED_IGNORED+=("$rel")
+                    continue
+                fi
                 git -C "$ENGRAM_HOME" add -- "$rel" 2>/dev/null || true
                 STAGED_FILES+=("$rel")
             fi
         done < <(find "$ENGRAM_HOME/diary" -maxdepth 1 -type f -print0 2>/dev/null)
+    fi
+
+    if [[ ${#SKIPPED_IGNORED[@]} -gt 0 ]]; then
+        log "  skipped (gitignored): ${SKIPPED_IGNORED[*]}"
     fi
 
     if [[ ${#STAGED_FILES[@]} -eq 0 ]]; then
