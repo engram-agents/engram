@@ -78,9 +78,12 @@ class Env:
         e.update(
             HOME=str(self.home), TMPDIR=str(self.tmpdir), SEAT_RUN_ROOT=str(self.root),
             ENGRAM_PY=str(python or sys.executable),
+            # Floor off by default [#4507]: cells that do not test the floor must not go
+            # red on a host with little free space. The C9 cells set or remove it (None).
+            SEAT_RUN_DISK_FLOOR="0",
         )
         e.update(extra)
-        return e
+        return {k: v for k, v in e.items() if v is not None}
 
     def scratch(self):
         return sorted(self.root.glob("seat-run.*"))
@@ -1069,3 +1072,216 @@ def test_g3_absolute_engram_home_reaches_the_tools_own_usage_refusal(world, tmp_
     assert r.returncode == 2, out(r)
     assert r.stderr.startswith("usage: seat-run.sh"), repr(r.stderr)
     assert "must be an absolute path" not in out(r)
+
+
+# ---- C9 disk floor [engram-alpha#4507] ---------------------------------------
+# The tool refuses to start when free space on SEAT_RUN_ROOT is below
+# max(5% of the volume, 20 GiB) (the same arithmetic as memrun), prints the
+# free / total / floor figures on every run, and states the floor in --help.
+# Written before the implementation; D1, D3 and D5 were watched red on dev.
+GIB = 2**30
+FLOOR_ENV = "SEAT_RUN_DISK_FLOOR"
+DISK_LINE = re.compile(r"^disk: (.+) free ([0-9.]+) GiB of ([0-9.]+) GiB, floor ([0-9.]+) GiB$")
+
+
+def _default_floor_gib(path):
+    st = os.statvfs(path)
+    total = st.f_blocks * st.f_frsize
+    return f"{max(total // 20, 20 * GIB) / GIB:.1f}", f"{total / GIB:.1f}"
+
+
+def test_d1_floor_above_free_space_refuses_before_any_write(world):
+    repo, env, _ = world
+    r = run_tool(repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], **{FLOOR_ENV: "999T"})
+    assert r.returncode == 2, out(r)
+    o = out(r)
+    assert "not started" in o and "floor" in o, o
+    assert str(env.root) in o, o
+    assert re.search(r"is [0-9.]+ GiB, below the floor 1022976\.0 GiB", o), o
+    assert "(overridden by SEAT_RUN_DISK_FLOOR)" in o, o
+    assert env.scratch() == []
+    assert list(env.root.iterdir()) == [], "nothing may be written under the root before the check"
+    assert "FILE " not in o and "SUMMARY" not in o
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_d1b_floor_is_checked_before_the_root_is_written_to(world):
+    # The exit trap removes a scratch dir, so an empty root after a refusal cannot show
+    # that nothing was created first. A root nobody can write to can: if the check ran
+    # after mktemp, the refusal would be "cannot create a scratch dir", not the floor.
+    repo, env, _ = world
+    env.root.chmod(0o555)
+    try:
+        r = run_tool(repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], **{FLOOR_ENV: "999T"})
+    finally:
+        env.root.chmod(0o755)
+    assert r.returncode == 2, out(r)
+    assert "not started" in out(r), out(r)
+    assert "cannot create a scratch dir" not in out(r), out(r)
+
+
+def test_d2_zero_floor_lets_a_normal_run_through(world):
+    repo, env, _ = world
+    r = run_tool(repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], **{FLOOR_ENV: "0"})
+    assert r.returncode == 0, out(r)
+    assert "SUMMARY files=1 passed=2" in r.stdout
+
+
+def test_d3_every_run_prints_one_disk_line_with_the_default_floor(world):
+    # No override (None removes the Env default): the real default floor applies, so the
+    # outcome depends on this host's free space. Both outcomes print the disk line first.
+    repo, env, _ = world
+    r = run_tool(repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], **{FLOOR_ENV: None})
+    disk = [ln for ln in r.stdout.splitlines() if ln.startswith("disk:")]
+    assert len(disk) == 1, out(r)
+    m = DISK_LINE.match(disk[0])
+    assert m, disk[0]
+    floor, total = _default_floor_gib(env.root)
+    assert m.group(1) == str(env.root)
+    assert m.group(3) == total, (m.group(3), total)
+    assert m.group(4) == floor, (m.group(4), floor)
+    st = os.statvfs(env.root)
+    if st.f_bavail * st.f_frsize >= max(st.f_blocks * st.f_frsize // 20, 20 * GIB) + GIB:
+        assert r.returncode == 0, out(r)
+    elif st.f_bavail * st.f_frsize < max(st.f_blocks * st.f_frsize // 20, 20 * GIB) - GIB:
+        assert r.returncode == 2 and "not started" in out(r), out(r)
+        assert "max(5% of" in out(r), out(r)
+
+
+@pytest.mark.parametrize("bad, named", [("lots", "lots"), ("9" * 5000, "5000 digits")], ids=["word", "5000-digits"])
+def test_d4_bad_override_is_refused_naming_variable_and_value(world, bad, named):
+    repo, env, _ = world
+    r = run_tool(repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], **{FLOOR_ENV: bad})
+    assert r.returncode == 2, out(r)
+    assert FLOOR_ENV in out(r) and named in out(r) and "not a size" in out(r), out(r)
+    assert env.scratch() == []
+    assert list(env.root.iterdir()) == []
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_d5_help_states_the_floor_and_exits_zero_without_preflight(world, flag):
+    _, env, tmp_path = world
+    # not a git repo, and an interpreter that does not exist: help must touch neither
+    r = run_tool(env.home, env, [flag], ENGRAM_PY=str(tmp_path / "nope" / "python"))
+    assert r.returncode == 0, out(r)
+    assert "usage: seat-run.sh" in r.stdout, out(r)
+    assert "max(5% of the volume, 20 GiB)" in r.stdout, out(r)
+    assert FLOOR_ENV in r.stdout, out(r)
+    assert list(env.root.iterdir()) == []
+
+
+def test_d6_unreadable_free_space_is_refused(world):
+    repo, env, tmp_path = world
+    py = stub_python(
+        tmp_path,
+        # statvfs first: the root path contains "pytest-of-", so a *pytest* arm listed
+        # first would answer the statvfs call and the junk branch would never run (Sol).
+        'case "$*" in *statvfs*) echo junk;; *pytest*) echo 9.0.0;; *) echo 3.12.0;; esac\n',
+    )
+    r = run_tool(repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], ENGRAM_PY=str(py))
+    assert r.returncode == 2, out(r)
+    assert "cannot read free space" in out(r), out(r)
+    assert "got 'junk'" in out(r), out(r)  # the junk branch ran, not the pytest probe
+    assert env.scratch() == []
+    assert "FILE " not in out(r)
+
+
+# D7: the script's own arithmetic on a SIMULATED small volume. ENGRAM_PY is a wrapper
+# around the real interpreter that replaces os.statvfs inside the script's statvfs
+# call only (every other call is exec'd unchanged), so this pins what a large-disk host
+# cannot: the 20 GiB minimum arm, that free is f_bavail (not f_bfree), and the refusal
+# branch of the real default floor.
+FAKE_PY = '''#!{real}
+import os, sys
+if len(sys.argv) > 2 and sys.argv[1] == "-c" and "statvfs" in sys.argv[2]:
+    blocks, bfree, bavail = (int(x) for x in os.environ["FAKE_STATVFS"].split(","))
+    fake = os.statvfs_result((4096, 4096, blocks, bfree, bavail, 0, 0, 0, 0, 255))
+    os.statvfs = lambda path: fake
+    code = sys.argv[2]
+    sys.argv = ["-c"] + sys.argv[3:]
+    exec(compile(code, "<string>", "exec"), {{"__name__": "__main__"}})
+else:
+    os.execv(sys.executable, [sys.executable] + sys.argv[1:])
+'''
+
+
+def _fake_py(tmp_path):
+    p = tmp_path / "fakepy"
+    p.write_text(FAKE_PY.format(real=sys.executable))
+    p.chmod(0o755)
+    return p
+
+
+def _blocks(gib):  # 4096-byte blocks in <gib> GiB
+    return gib * GIB // 4096
+
+
+@pytest.mark.parametrize(
+    "total, bfree, bavail, rc",
+    [
+        (100, 40, 30, 0),  # 5% of 100 GiB is 5 GiB: the 20 GiB arm wins; 30 free -> runs
+        (100, 25, 15, 2),  # 15 available < 20 floor -> refused, although bfree (25) is above it
+    ],
+    ids=["min-arm-passes", "bavail-not-bfree-refuses"],
+)
+def test_d7_default_floor_on_a_simulated_small_volume(world, total, bfree, bavail, rc):
+    repo, env, tmp_path = world
+    r = run_tool(
+        repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"],
+        ENGRAM_PY=str(_fake_py(tmp_path)), SEAT_RUN_DISK_FLOOR=None,
+        FAKE_STATVFS=f"{_blocks(total)},{_blocks(bfree)},{_blocks(bavail)}",
+    )
+    o = out(r)
+    assert f"free {bavail:.1f} GiB of {total:.1f} GiB, floor 20.0 GiB" in r.stdout, o
+    assert r.returncode == rc, o
+    if rc == 2:
+        assert "not started" in o and "max(5% of 100.0 GiB volume, 20 GiB)" in o, o
+        assert list(env.root.iterdir()) == [], o
+    else:
+        assert "SUMMARY files=1 passed=2" in r.stdout, o
+
+
+# Sol's colleague-pass cells (review on c93d616c): each kills a mutant that every cell above
+# let through. d6b: empty / failing interpreter output must refuse, never fail open (a
+# dropped empty-string case would run with no floor). d7b: free exactly at the floor runs
+# (-lt, not -le). d7c: the 5% arm on a volume where it beats 20 GiB (D7's 100 GiB cannot
+# tell total//20 from total//10). d4b: the G unit is GiB.
+@pytest.mark.parametrize("body", [":", "exit 1"], ids=["empty-output", "nonzero-exit"])
+def test_d6b_empty_or_failing_statvfs_is_refused(world, body):
+    repo, env, tmp_path = world
+    py = stub_python(tmp_path, 'case "$*" in *statvfs*) %s;; *pytest*) echo 9.0.0;; *) echo 3.12.0;; esac\n' % body)
+    r = run_tool(repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], ENGRAM_PY=str(py), SEAT_RUN_DISK_FLOOR=None)
+    assert r.returncode == 2, out(r)
+    assert "cannot read free space" in out(r), out(r)
+    assert list(env.root.iterdir()) == [], out(r)
+
+
+@pytest.mark.parametrize("bavail, rc", [(20, 0), (19, 2)], ids=["free-equals-floor-runs", "one-gib-below-refuses"])
+def test_d7b_boundary(world, bavail, rc):
+    repo, env, tmp_path = world
+    r = run_tool(
+        repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], ENGRAM_PY=str(_fake_py(tmp_path)),
+        SEAT_RUN_DISK_FLOOR=None, FAKE_STATVFS=f"{_blocks(100)},{_blocks(40)},{_blocks(bavail)}",
+    )
+    assert r.returncode == rc, out(r)
+
+
+def test_d7c_five_percent_arm_on_a_1000_gib_volume(world):
+    repo, env, tmp_path = world
+    r = run_tool(
+        repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], ENGRAM_PY=str(_fake_py(tmp_path)),
+        SEAT_RUN_DISK_FLOOR=None, FAKE_STATVFS=f"{_blocks(1000)},{_blocks(60)},{_blocks(60)}",
+    )
+    assert "free 60.0 GiB of 1000.0 GiB, floor 50.0 GiB" in r.stdout, out(r)
+    assert r.returncode == 0, out(r)
+
+
+@pytest.mark.parametrize("floor, rc", [("15G", 0), ("40G", 2)])
+def test_d4b_override_units(world, floor, rc):
+    repo, env, tmp_path = world  # 30 GiB available on a simulated 100 GiB volume
+    r = run_tool(
+        repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], ENGRAM_PY=str(_fake_py(tmp_path)),
+        SEAT_RUN_DISK_FLOOR=floor, FAKE_STATVFS=f"{_blocks(100)},{_blocks(40)},{_blocks(30)}",
+    )
+    assert r.returncode == rc, (floor, out(r))
+    assert f"floor {float(floor[:-1]):.1f} GiB" in r.stdout, (floor, out(r))

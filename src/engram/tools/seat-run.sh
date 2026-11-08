@@ -17,8 +17,17 @@
 # requested -o flag did not land.
 #
 # Env: ENGRAM_PY (default: the seat venv python), SEAT_RUN_ROOT (default
-# ${TMPDIR:-/tmp}). bash 3.2-safe: indexed arrays only, no GNU-only commands.
+# ${TMPDIR:-/tmp}), SEAT_RUN_DISK_FLOOR (a size: integer with an optional K, M,
+# G or T suffix; overrides the disk floor below). bash 3.2-safe: indexed
+# arrays only, no GNU-only commands.
 # Writes only under SEAT_RUN_ROOT (scratch worktree, removed on exit/INT/TERM).
+#
+# Disk floor [alpha #4507]: the tool refuses to start when free space on
+# SEAT_RUN_ROOT is below max(5% of the volume, 20 GiB) -- memrun's arithmetic
+# (free = f_bavail * f_frsize, total = f_blocks * f_frsize), so the fleet has one
+# floor rule. It is checked ONCE, at start, before anything is written under the
+# root; it cannot stop a run that later grows past the floor. A refusal is exit
+# 2 and prints the free / total / floor figures; every run prints a `disk:` line.
 #
 # C8 covers the tool's OWN writes only. The pytest child inherits HOME and
 # ENGRAM_HOME as given, except that a leading ~ in ENGRAM_HOME is expanded
@@ -117,6 +126,11 @@ RC=0
 usage() {
   echo "usage: seat-run.sh (--pr N | --ref REF) [--keep] [--control] -- <pytest args>" >&2
 }
+# --help / -h: usage plus the disk floor, on stdout, exit 0 (before git and the python preflight)
+help_text() {
+  echo "usage: seat-run.sh (--pr N | --ref REF) [--keep] [--control] -- <pytest args>"
+  echo "disk floor: refuses to start (exit 2) when free space on SEAT_RUN_ROOT is below max(5% of the volume, 20 GiB); override with SEAT_RUN_DISK_FLOOR=<size> (integer, optional K/M/G/T suffix, e.g. 20G, 0)."
+}
 
 refuse() { # refuse <exit-code> <one-line reason>
   echo "seat-run: $2" >&2
@@ -184,6 +198,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --pr) [ $# -ge 2 ] || { usage; exit 2; }; PR=$2; shift 2 ;;
     --ref) [ $# -ge 2 ] || { usage; exit 2; }; REF=$2; shift 2 ;;
+    --help | -h) help_text; exit 0 ;;
     --keep) KEEP=1; shift ;;
     --control) shift ;; # the zero-test guard is on by default for named files
     --) shift; PYARGS=("$@"); break ;;
@@ -248,6 +263,62 @@ fi
 
 # ---- scratch worktree (C1) --------------------------------------------------
 [ -d "$ROOT" ] || refuse 2 "SEAT_RUN_ROOT '$ROOT' is not a directory"
+
+# disk floor [alpha #4507]: checked once, here, before anything is written under ROOT.
+# free = f_bavail * f_frsize, total = f_blocks * f_frsize (memrun's arithmetic), read
+# through the interpreter already validated above; the python call does all the byte
+# arithmetic and prints "free total floor" as integers. awk only formats them as GiB.
+DF_OVERRIDE=0
+DF_NUM=""
+DF_SFX=""
+if [ -n "${SEAT_RUN_DISK_FLOOR+x}" ]; then
+  DF_OVERRIDE=1
+  DF_NUM=${SEAT_RUN_DISK_FLOOR%[KMGT]}
+  DF_SFX=${SEAT_RUN_DISK_FLOOR#"$DF_NUM"}
+  case "$DF_NUM" in
+    '' | *[!0-9]*) refuse 2 "SEAT_RUN_DISK_FLOOR '$SEAT_RUN_DISK_FLOOR' is not a size (a non-negative integer with an optional K, M, G or T suffix)" ;;
+  esac
+  # more digits than any disk needs (and than Python's int-string limit allows)
+  [ ${#DF_NUM} -le 30 ] || refuse 2 "SEAT_RUN_DISK_FLOOR is not a size (${#DF_NUM} digits; at most 30)"
+fi
+DF_OUT=$("$PY" -c '
+import os, sys
+st = os.statvfs(sys.argv[1])
+free = st.f_bavail * st.f_frsize
+total = st.f_blocks * st.f_frsize
+if sys.argv[2]:
+    floor = int(sys.argv[2]) * {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}[sys.argv[3]]
+else:
+    floor = max(total // 20, 20 * 2**30)
+print("%d %d %d" % (free, total, min(floor, 2**62)))
+' "$ROOT" "$DF_NUM" "$DF_SFX" 2>/dev/null)
+DF_FREE=""
+DF_TOTAL=""
+DF_FLOOR=""
+DF_EXTRA=""
+read -r DF_FREE DF_TOTAL DF_FLOOR DF_EXTRA <<EOF
+$DF_OUT
+EOF
+for _df_v in "$DF_FREE" "$DF_TOTAL" "$DF_FLOOR"; do
+  case "$_df_v" in
+    '' | *[!0-9]*) refuse 2 "cannot read free space on '$ROOT' (got '$DF_OUT')" ;;
+  esac
+done
+[ -z "$DF_EXTRA" ] || refuse 2 "cannot read free space on '$ROOT' (got '$DF_OUT')"
+gib() { awk -v b="$1" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
+DF_FREE_G=$(gib "$DF_FREE")
+DF_TOTAL_G=$(gib "$DF_TOTAL")
+DF_FLOOR_G=$(gib "$DF_FLOOR")
+echo "disk: $ROOT free $DF_FREE_G GiB of $DF_TOTAL_G GiB, floor $DF_FLOOR_G GiB"
+if [ "$DF_FREE" -lt "$DF_FLOOR" ]; then
+  if [ "$DF_OVERRIDE" = 1 ]; then
+    DF_WHY="overridden by SEAT_RUN_DISK_FLOOR"
+  else
+    DF_WHY="max(5% of $DF_TOTAL_G GiB volume, 20 GiB)"
+  fi
+  refuse 2 "not started: free space on $ROOT is $DF_FREE_G GiB, below the floor $DF_FLOOR_G GiB ($DF_WHY). Free space or set SEAT_RUN_ROOT to a larger disk."
+fi
+
 SCRATCH=$(mktemp -d "${ROOT%/}/seat-run.XXXXXX") || refuse 2 "cannot create a scratch dir under '$ROOT'"
 WT="$SCRATCH/wt"
 mkdir "$SCRATCH/tmp" "$SCRATCH/plug"
