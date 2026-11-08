@@ -36,6 +36,7 @@ _STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
 _STATIC_CONTENT_TYPES = {
     ".css": "text/css",
     ".js": "application/javascript",
+    ".txt": "text/plain; charset=utf-8",  # #4447: d3.LICENSE.txt
 }
 
 # These are static assets bundled with the plugin (not per-agent dynamic

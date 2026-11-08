@@ -435,6 +435,16 @@
       "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <script src>."
     },
     {
+      "path": "viz/static/d3.v7.9.2.min.js",
+      "tier": "convenience",
+      "note": "engram-alpha#4447: d3 v7.9.2 vendored (byte-identical to npm d3@7.9.2 dist/d3.min.js, sha256 pinned in tests/test_viz_d3_local_4447.py) so graph.html no longer loads a floating remote script."
+    },
+    {
+      "path": "viz/static/d3.LICENSE.txt",
+      "tier": "convenience",
+      "note": "engram-alpha#4447: ISC license text of the vendored d3 (package/LICENSE of d3@7.9.2)."
+    },
+    {
       "path": "viz/static/graph-agent-select.js",
       "tier": "convenience",
       "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <script src>."

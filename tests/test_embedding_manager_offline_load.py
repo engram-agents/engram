@@ -75,7 +75,7 @@ class TestLocalFilesOnlyPassedOnSuccess:
 
         mgr = engram_core.EmbeddingManager()
 
-        with mock.patch.dict("sys.modules", {"sentence_transformers": fake_st_module}):
+        with mock.patch.object(engram_core, "_verify_pinned_snapshot", return_value=None), mock.patch.dict("sys.modules", {"sentence_transformers": fake_st_module}):
             mgr._load_model(MODEL)
 
         assert mgr._model is not None, "expected model to load successfully"
@@ -117,7 +117,7 @@ class TestCacheMissFallsBackToOnlineDownload:
 
         mgr = engram_core.EmbeddingManager()
 
-        with mock.patch.dict("sys.modules", {"sentence_transformers": fake_st_module}):
+        with mock.patch.object(engram_core, "_verify_pinned_snapshot", return_value=None), mock.patch.dict("sys.modules", {"sentence_transformers": fake_st_module}):
             mgr._load_model(MODEL)
 
         assert mgr._model is not None, (

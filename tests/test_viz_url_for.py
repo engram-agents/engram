@@ -330,7 +330,11 @@ class TestLiveServerStaticServing(_LiveServerBase):
     """Static serving correctness: content match, Content-Type, cache
     header, path-traversal rejection, 404 on missing file."""
 
-    _CONTENT_TYPES = {".css": "text/css", ".js": "application/javascript"}
+    _CONTENT_TYPES = {
+        ".css": "text/css",
+        ".js": "application/javascript",
+        ".txt": "text/plain; charset=utf-8",  # #4447: d3.LICENSE.txt
+    }
 
     def test_every_static_asset_content_type_and_cache_header(self):
         for f in sorted(_STATIC_DIR.iterdir()):

@@ -174,6 +174,11 @@ def env(tmp_path, monkeypatch):
 
     cfg_path = tmp_path / "config.json"
     monkeypatch.setattr(core, "CONFIG_PATH", cfg_path)
+    # #4447: the default model is checksum-verified against the real HF cache
+    # after load; these tests drive a fake SentenceTransformer and never have
+    # model bytes, so the verification is stubbed out here (it has its own
+    # cells in test_embedding_model_pin_4447.py).
+    monkeypatch.setattr(core, "_verify_pinned_snapshot", lambda name: None)
 
     class E:
         pass
