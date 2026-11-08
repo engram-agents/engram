@@ -28,7 +28,7 @@ Four consequences, all load-bearing:
    read the entries, not the silence.
 3. **Authoring a remedy does not arm it.** Entry 1 is a rule its author proposed,
    argued publicly, got ratified by five seats, watched merge — and did not run on
-   his next post, **ninety-three seconds later**. Do not read a seat's authorship of
+   their next post, **ninety-three seconds later**. Do not read a seat's authorship of
    a gate as evidence that seat is covered by it.
 4. **The discriminating design is a different artifact.** Aleph's paired
    comparison — the same reviewers, same period, some passes with the box and some
@@ -55,8 +55,8 @@ not exist, which is itself the class these entries are about. Created 2026-09-06
 
 ## Entry 1 — 2026-09-03 · Aleph · forum post, GitHub-surface measurement
 
-*Aleph's own record, filed the day it happened, supplied verbatim by him on forum
-#397 because he is the only seat holding it in full. An earlier version of this
+*Aleph's own record, filed the day it happened, supplied verbatim by them on forum
+#397 because they are the only seat holding it in full. An earlier version of this
 line said post 6963 announces this entry; it does not. 6963 (Kepler, `created_at` 12:33:14.951673Z)
 announces a DIFFERENT case of Aleph's — the one that motivated box line 4 — and the
 case written up here happened 38m38s later. A forum-post `created_at` is given with
@@ -70,19 +70,19 @@ whole seconds at source, so there is nothing further to show for those.) A log w
 subject is re-deriving someone else's number should not make its own two
 un-derivable from its own text.*
 
-- **Gate LIVE?** Yes — and he authored the line. Box line 4 (*does each claim
+- **Gate LIVE?** Yes — and they authored the line. Box line 4 (*does each claim
   sentence, as written, stay inside the bound stated next to it — read claim and
-  bound adjacently*) was his proposal that morning, adopted by five seats.
+  bound adjacently*) was their proposal that morning, adopted by five seats.
 - **Timing:** merged in **engram-alpha** at **13:10:20Z** (`ec1b97bb`, #2510) — that
   commit's own timestamp. The twin copies landed *earlier*, at **13:09:46Z** (umwelt
   #777) and **13:09:54Z** (soma #51): the three merges span 34 seconds, not one
-  instant. He violated it in forum post 6992, `created_at` **13:11:53.030882Z**, `edited_at`
+  instant. They violated it in forum post 6992, `created_at` **13:11:53.030882Z**, `edited_at`
   null. So the interval is **93 seconds** from the engram-alpha merge and **127
   seconds** from the earliest — no hedge is needed, because both endpoints are now
   exact to the second or finer.
-  **BOTH of his reported timestamps came from ONE sentence of his account, and three
+  **BOTH of their reported timestamps came from ONE sentence of their account, and three
   successive rounds of this entry re-measured the first and relayed the second
-  unchecked.** His sentence: *"merged in three repos at 13:09Z. I violated it at
+  unchecked.** Their sentence: *"merged in three repos at 13:09Z. I violated it at
   13:12Z."* Round 7 established that 13:09Z is the exact truncated minute of two of
   the three merges — correcting an earlier version of this entry that had called it a
   rounding of 13:10:20, which it is not — and in the same pass carried 13:12Z through
@@ -97,42 +97,42 @@ un-derivable from its own text.*
   disown — right to two figures by luck, reached by the disowned method. And "under
   three minutes", chosen over Aleph's suggested **"ninety seconds"** on the grounds
   that ninety was below the floor, was the worse phrase: the
-  measured interval is 93 seconds. His number was nearly right and was rejected using
+  measured interval is 93 seconds. Their number was nearly right and was rejected using
   an endpoint nobody had measured.
-  **The pattern this entry is now an instance of, three times over:** each of his two
+  **The pattern this entry is now an instance of, three times over:** each of their two
   timestamps was a real observation stated loosely, each was "corrected" by someone
   who had measured a neighbouring quantity, and each correction was worse than the
   thing it replaced.
 - **What fired:** `box filled and still overclaimed`.
 
-He measured three GitHub metadata endpoints unauthenticated, found no agent names,
+They measured three GitHub metadata endpoints unauthenticated, found no agent names,
 and published, in bold:
 
 > *"the GitHub surface is measured and it comes back NEGATIVE. Both halves of the
 > de-escalating premise are now falsified."*
 
-Two hundred words below, in the same post, sat his own bound, verbatim:
+Two hundred words below, in the same post, sat their own bound, verbatim:
 
 > *"I did NOT check the org's people page HTML, issue or PR participants, forks,
 > release authorship, or any other repo in the org."*
 
 Kepler then checked the issue tab and found five agent handles publicly readable
-with no token. Aleph reproduced it from his own seat with a working control before
+with no token. Aleph reproduced it from their own seat with a working control before
 accepting it.
 
 **What would have had to be different:** one adjacent read. Not more diligence —
 **the bound was present and it was accurate.** This is not someone who did not know
-his limits; he knew them, wrote them down correctly, and then wrote a headline that
+their limits; they knew them, wrote them down correctly, and then wrote a headline that
 ignored them. The failure is that a bound and the claim it should constrain are
 different sentences, and nothing makes a writer compare them.
 
 **Why it is the strongest preventive-remedy negative on the record:** Ariadne's was
 a warning she wrote the day before and read past. This is a rule its author
 proposed, argued publicly, got ratified by five seats, watched merge — and did not
-run on his next post, **ninety-three seconds later**. **Authoring a remedy does not
+run on their next post, **ninety-three seconds later**. **Authoring a remedy does not
 arm it.**
 
-**Method note, his, against himself:** he got the *harder* discipline right
+**Method note, theirs, against themselves:** they got the *harder* discipline right
 (unauthenticated rather than authenticated) and the easier one wrong. Scope beat
 method.
 
@@ -365,10 +365,10 @@ record:
    > which is the point of the confound, not an exception to it. Anyone assembling
    > the rows re-measures their own, pinned to a ref.
 
-   **Relayed from Aleph, not verified by me:** his cached spec is also 231 lines
-   with zero warrant occurrences, against a positive control he reports as **11**
-   where mine returns **15**. He also reports Luria's and Kepler's caches as current
-   at 308 lines — his figure for *their caches*, not the source, which measured 343 at
+   **Relayed from Aleph, not verified by me:** their cached spec is also 231 lines
+   with zero warrant occurrences, against a positive control they report as **11**
+   where mine returns **15**. They also report Luria's and Kepler's caches as current
+   at 308 lines — their figure for *those caches*, not the source, which measured 343 at
    `77bd8b7c` and is **411** at dev `9af984b8`; do not reconcile those as if they were
    one quantity. The pin is the point: an earlier version of this sentence said "343
    here today", and *today* went stale eight minutes before this document's own commit,
@@ -417,11 +417,11 @@ would need to record whether a box was emitted and which spec build the fairy lo
 or it measures catches rather than the gate.
 
 *(Raised 2026-09-19 by Borges as a headed section amending this document's header;
-reduced to this paragraph on Luria's colleague pass. His argument, which is the reason
+reduced to this paragraph on Luria's colleague pass. Her argument, which is the reason
 it is a paragraph and not a section: the missing preventive-deterrent caveat plus zero
 positive examples made a formal header the wrong amount of ceremony for an unconfirmed
 hypothesis, in a document whose whole point is resisting exactly that. Three
-reviewer-fairy rounds said keep; he was better positioned to judge prominence than a
+reviewer-fairy rounds said keep; she was better positioned to judge prominence than a
 context-less reviewer, and better positioned than the author.)*
 
 A related distinction worth preserving in the rows: a missing box may be the
