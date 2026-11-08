@@ -3,7 +3,7 @@
 Part 2 installer promotion tests:
 - --dry-run flag: action plan lines printed, no systemd/filesystem side-effects.
 - Template rendering: rendered unit contains substituted service-dir + port,
-  retains UMask=002 and the ONE-INSTANCE invariant comment.
+  carries UMask=0022 (#4499) and the ONE-INSTANCE invariant comment.
 - Foreign-dir guard: abort if --service-dir exists, is non-empty, and has no app/.
 - DB preservation: forum.db not overwritten.
 
@@ -188,11 +188,13 @@ class TestTemplateRendering:
             f"Rendered unit does not contain port 5099:\n{rendered}"
         )
 
-    def test_rendered_unit_retains_umask_002(self, tmp_path):
+    def test_rendered_unit_carries_umask_0022(self, tmp_path):
+        # #4499: no group write. A LINE match: the substring "UMask=002" is also in "UMask=0022".
         service_dir = str(tmp_path / "custom_forum")
         rendered = self._render_template(service_dir)
-        assert "UMask=002" in rendered, (
-            f"Rendered unit must retain UMask=002 (group-writable files):\n{rendered}"
+        lines = [ln.strip() for ln in rendered.splitlines()]
+        assert "UMask=0022" in lines and "UMask=002" not in lines, (
+            f"Rendered unit must carry UMask=0022 (no group write, #4499):\n{rendered}"
         )
 
     def test_rendered_unit_retains_one_instance_comment(self, tmp_path):
