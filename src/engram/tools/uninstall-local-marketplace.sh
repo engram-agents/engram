@@ -18,6 +18,12 @@
 #     $HOME/.engram/venv/              Python environment
 #     ~/.claude/CLAUDE.md             agent identity configuration
 #
+#   RESTORED (only if a pre-engram backup exists, #4440):
+#     ~/.claude/CLAUDE.md.pre-engram  -> ~/.claude/CLAUDE.md   (--target claude-code)
+#     ~/.codex/config.toml.pre-engram -> ~/.codex/config.toml  (--target codex)
+#     The CURRENT file is first copied to <name>.pre-uninstall.<UTC timestamp>, so edits
+#     made since install are never lost. No backup: the file is left untouched.
+#
 # For a complete data reset, remove $ENGRAM_HOME/ manually AFTER running this
 # script. See README.md § Uninstall for the full decision tree.
 #
@@ -103,14 +109,57 @@ case "$TARGET" in
 esac
 
 ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
+CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 MARKETPLACE_ROOT="$ENGRAM_HOME/marketplace"
 VERSION_MARKER="$ENGRAM_HOME/.deployed-version"
 
 [[ $DRY_RUN -eq 1 ]] && log "[dry-run — no changes will be made]"
 
+# ── Identity-file restore helper (#4440) ───────────────────────────────────────
+# Only when a <name>.pre-engram backup exists. The current file is saved first (the agent and
+# the user edit it for weeks, so restoring over it would silently drop all of that).
+restore_identity_file() {
+  local file="$1" backup="$1.pre-engram" stamp saved
+  if [[ ! -e "$backup" && ! -L "$backup" ]]; then
+    log "No $backup — $file left untouched."
+    return 0
+  fi
+  if [[ -L "$backup" && ! -e "$backup" ]]; then
+    warn "$backup is a dangling symlink — $file left untouched."
+    return 0
+  fi
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  saved="$file.pre-uninstall.$stamp"
+  if [[ -e "$file" || -L "$file" ]]; then
+    if [[ -L "$file" && ! -e "$file" ]]; then
+      warn "$file is a dangling symlink — not restoring over it."
+      return 0
+    fi
+    if [[ -e "$saved" || -L "$saved" ]]; then
+      warn "$saved already exists — $file left untouched; re-run in a second."
+      return 0
+    fi
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log "(dry-run) Would copy $file to $saved, then restore $backup to $file"
+      return 0
+    fi
+    cp -p "$file" "$saved" || die "could not save $file to $saved; $file left untouched"
+    log "Saved your current $file to $saved"
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    log "(dry-run) Would restore $backup to $file"
+    return 0
+  fi
+  cp -p "$backup" "$file" || die "could not restore $backup to $file"
+  log "Restored $backup to $file (the backup is kept)."
+}
+
 # ── Nothing to do? ──────────────────────────────────────────────────────────
 if [[ ! -d "$MARKETPLACE_ROOT" && ! -f "$VERSION_MARKER" ]]; then
   log "Nothing to uninstall — marketplace and version marker both absent."
+  # A leftover .pre-engram backup must still be restored (the restore has no dependence on
+  # the marketplace tree); with no backup this logs "left untouched" and changes nothing.
+  restore_identity_file "$([[ "$TARGET" == "codex" ]] && echo "$CODEX_HOME/config.toml" || echo "$CLAUDE_HOME/CLAUDE.md")"
   if [[ $SKIP_CLI -eq 0 ]]; then
     warn "If the plugin is still registered with Claude Code, run:"
     warn "  claude plugin marketplace remove engram-local"
@@ -179,6 +228,13 @@ if [[ -f "$VERSION_MARKER" ]]; then
   else
     log "(dry-run) Would remove: $VERSION_MARKER"
   fi
+fi
+
+# ── 4. Restore the identity file (function defined above, before the early exit) ──
+if [[ "$TARGET" == "codex" ]]; then
+  restore_identity_file "$CODEX_HOME/config.toml"
+else
+  restore_identity_file "$CLAUDE_HOME/CLAUDE.md"
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────

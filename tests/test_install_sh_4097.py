@@ -526,6 +526,53 @@ def test_existing_backup_is_left_byte_identical(sb):
     assert str(sb.claude_home / "CLAUDE.md.pre-engram") in r.stdout
 
 
+def test_dangling_backup_link_fails_step_6_before_bootstrap_and_without_force(sb):
+    sb.claude_home.mkdir(parents=True)
+    original = b"the user's file, must survive\n"
+    (sb.claude_home / "CLAUDE.md").write_bytes(original)
+    bak = sb.claude_home / "CLAUDE.md.pre-engram"
+    bak.symlink_to(sb.root / "nowhere-backup.md")
+    r = sb.run("--yes")
+    assert r.returncode != 0
+    assert "FAIL: [step 6]" in r.all and str(bak) in r.all
+    assert "kept untouched" not in r.all
+    assert (sb.claude_home / "CLAUDE.md").read_bytes() == original
+    assert bak.is_symlink() and not (sb.root / "nowhere-backup.md").exists()
+    assert not sb.calls_starting("bootstrap"), sb.call_lines()
+
+
+def test_directory_at_backup_path_fails_step_6_before_bootstrap_and_without_force(sb):
+    sb.claude_home.mkdir(parents=True)
+    original = b"the user's file, must survive\n"
+    (sb.claude_home / "CLAUDE.md").write_bytes(original)
+    bak = sb.claude_home / "CLAUDE.md.pre-engram"
+    bak.mkdir()
+    r = sb.run("--yes")
+    assert r.returncode != 0
+    assert "FAIL: [step 6]" in r.all and str(bak) in r.all
+    assert "not a regular file" in r.all
+    assert "kept untouched" not in r.all
+    assert (sb.claude_home / "CLAUDE.md").read_bytes() == original
+    assert bak.is_dir() and not list(bak.iterdir())
+    assert not sb.calls_starting("bootstrap"), sb.call_lines()
+
+
+def test_hard_link_at_backup_path_fails_step_6_before_bootstrap_and_without_force(sb):
+    sb.claude_home.mkdir(parents=True)
+    original = b"the user's file, must survive\n"
+    md = sb.claude_home / "CLAUDE.md"
+    md.write_bytes(original)
+    bak = sb.claude_home / "CLAUDE.md.pre-engram"
+    os.link(md, bak)
+    r = sb.run("--yes")
+    assert r.returncode != 0
+    assert "FAIL: [step 6]" in r.all and str(bak) in r.all and str(md) in r.all
+    assert "same file" in r.all
+    assert "kept untouched" not in r.all
+    assert md.read_bytes() == original and bak.read_bytes() == original
+    assert not sb.calls_starting("bootstrap"), sb.call_lines()
+
+
 def test_second_run_after_aborted_seed_does_not_overwrite_the_backup(sb):
     sb.claude_home.mkdir(parents=True)
     original = b"user original\n"

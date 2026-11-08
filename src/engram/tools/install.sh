@@ -515,11 +515,21 @@ else
 fi
 
 if [ "$_run_bootstrap" -eq 1 ]; then
+  # bootstrap.py refuses to overwrite an existing, differing CLAUDE.md (#4440) unless it is
+  # given --force. That flag is passed ONLY on the branch below where the file exists and the
+  # consent/backup step has already succeeded; every other run passes nothing.
+  _bootstrap_flags=""
   # Back up an existing CLAUDE.md BEFORE bootstrap renders over it, once, never over an
   # existing backup. Only when bootstrap will run: on a seat whose graph is seeded the file
   # is ENGRAM's own rendering, and copying it would put the wrong file in the backup.
   if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
-    if [ -e "$CLAUDE_MD_BACKUP" ] || [ -L "$CLAUDE_MD_BACKUP" ]; then
+    if [ -L "$CLAUDE_MD_BACKUP" ] && [ ! -e "$CLAUDE_MD_BACKUP" ]; then
+      fail "$CLAUDE_MD_BACKUP is a symlink to a path that does not exist, so $CLAUDE_MD cannot be backed up there" "remove or repair the link (rm '$CLAUDE_MD_BACKUP'), then re-run"
+    elif [ -e "$CLAUDE_MD_BACKUP" ] && [ "$CLAUDE_MD" -ef "$CLAUDE_MD_BACKUP" ]; then
+      fail "$CLAUDE_MD_BACKUP is the same file as $CLAUDE_MD (a hard link or link to it), so it would be overwritten too" "move '$CLAUDE_MD_BACKUP' away, then re-run"
+    elif { [ -e "$CLAUDE_MD_BACKUP" ] || [ -L "$CLAUDE_MD_BACKUP" ]; } && [ ! -f "$CLAUDE_MD_BACKUP" ]; then
+      fail "$CLAUDE_MD_BACKUP exists but is not a regular file, so $CLAUDE_MD cannot be backed up there" "move it away, then re-run"
+    elif [ -e "$CLAUDE_MD_BACKUP" ] || [ -L "$CLAUDE_MD_BACKUP" ]; then
       _claude_md_note="existing backup kept untouched at $CLAUDE_MD_BACKUP; $CLAUDE_MD will be replaced"
     else
       _go=$DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD
@@ -534,6 +544,7 @@ if [ "$_run_bootstrap" -eq 1 ]; then
         || fail "could not copy $CLAUDE_MD to $CLAUDE_MD_BACKUP" "fix the permissions of $CLAUDE_HOME and re-run"
       _claude_md_note="backed up $CLAUDE_MD to $CLAUDE_MD_BACKUP; $CLAUDE_MD will be replaced"
     fi
+    _bootstrap_flags="--force"
     printf '[step 6] CLAUDE.md: %s\n' "$_claude_md_note"
   fi
 
@@ -543,14 +554,14 @@ if [ "$_run_bootstrap" -eq 1 ]; then
       ALPHA_DIR="$PLUGIN_ROOT" ALPHA_TEMPLATES_DIR="$PLUGIN_ROOT/templates" \
       ENGRAM_HOME="$ENGRAM_HOME" CLAUDE_HOME="$CLAUDE_HOME" PYTHON_BIN="$VENV_PY" \
       TARGET=claude ENGRAM_INSTALL_MODE=plugin \
-      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" \
+      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" $_bootstrap_flags \
       || fail "bootstrap.py failed" "read its output above and re-run; the 0-node state is retried safely"
   else
     env -u FORCE -u FORCE_RESEED_EMPTY \
       ALPHA_DIR="$PLUGIN_ROOT" ALPHA_TEMPLATES_DIR="$PLUGIN_ROOT/templates" \
       ENGRAM_HOME="$ENGRAM_HOME" CLAUDE_HOME="$CLAUDE_HOME" PYTHON_BIN="$VENV_PY" \
       TARGET=claude ENGRAM_INSTALL_MODE=plugin \
-      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" \
+      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" $_bootstrap_flags \
       || fail "bootstrap.py failed" "read its output above; if knowledge.db was left behind with 0 nodes, re-running this installer reseeds it"
   fi
   BOOTSTRAP_RAN=1

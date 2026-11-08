@@ -34,6 +34,7 @@ Edges:
   - goal (epistemic humility) about axiom (honesty)    [via context_ids]
 """
 
+import errno
 import json
 import os
 import re
@@ -187,14 +188,200 @@ def create_seed_graph() -> dict[str, str]:
     return ids
 
 
-def substitute_template(
-    src: Path, dst: Path, substitutions: dict[str, str]
-) -> None:
+def _render_template_text(src: Path, substitutions: dict[str, str]) -> str:
     text = src.read_text()
     for placeholder, value in substitutions.items():
         text = text.replace(placeholder, value)
+    return text
+
+
+def substitute_template(
+    src: Path, dst: Path, substitutions: dict[str, str]
+) -> None:
+    text = _render_template_text(src, substitutions)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(text)
+
+
+# --- Never clobber a user's existing identity file (#4440) -------------------
+# The Claude path (CLAUDE.md) and the Codex path (config.toml) decide "is there a
+# file here I must not destroy" through ONE helper, so they cannot disagree.
+
+CLAUDE_MD_BACKUP_NAME = "CLAUDE.md.pre-engram"  # same name install.sh writes
+CODEX_CONFIG_BACKUP_NAME = "config.toml.pre-engram"
+
+
+def _target_present(path: Path) -> bool:
+    """True if anything sits at `path`, a dangling symlink included.
+
+    os.path.lexists, not Path.exists(): exists() follows a symlink and says False
+    for a dangling one, which would skip the backup for exactly that case.
+    """
+    return os.path.lexists(path)
+
+
+def _is_dangling_symlink(path: Path) -> bool:
+    return _target_present(path) and path.is_symlink() and not path.exists()
+
+
+def _refuse_dangling(path: Path) -> None:
+    raise SystemExit(
+        f"[bootstrap] REFUSED: {path} is a symlink to a path that does not exist "
+        f"({os.readlink(path)}). Remove the link (rm '{path}') or repair it so it "
+        f"points at a real file, then re-run."
+    )
+
+
+# os.link errnos meaning "this filesystem has no hard links" (exFAT/FAT, some CIFS/SMB).
+_NO_HARDLINK_ERRNOS = frozenset(
+    e for e in (
+        errno.EPERM, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", None),
+        errno.EXDEV, errno.ENOSYS,
+    ) if e is not None
+)
+
+
+def _copy_exclusive(src: Path, dst: Path) -> None:
+    """Copy bytes then metadata from `src` to `dst`, publishing it all at once; raise
+    FileExistsError if anything is at `dst`.
+
+    Property: after this returns or raises, `dst` either does not exist or holds a COMPLETE
+    copy of `src` (bytes and metadata). It is built in a sibling temp `<dst>.partial-<pid>`
+    (opened "xb", O_EXCL), the temp's bytes are fsync'd, then it is published with
+    os.link(temp, dst): atomic, raises FileExistsError for anything at `dst` (a symlink
+    included), never overwrites or truncates. The temp is always unlinked afterwards. No
+    directory fsync is done. shutil.copy2/copyfile onto `dst` would open it for writing
+    and follow links (#4380 ratchet).
+
+    Fallback, honestly: on a filesystem without hard links (os.link fails with EPERM,
+    EOPNOTSUPP, ENOTSUP, EXDEV or ENOSYS) the finished temp is published with
+    os.replace(temp, dst). That is still atomic, so no partial file can appear, but it
+    LOSES EXCLUSIVITY: os.replace overwrites whatever is at `dst`. The caller has already
+    established that `dst` is absent, so the residual risk is the check-then-publish race,
+    on those filesystems only. Any other OSError from os.link propagates with nothing at `dst`.
+    """
+    import shutil
+    temp = Path(f"{dst}.partial-{os.getpid()}")
+    try:
+        with open(src, "rb") as src_f, open(temp, "xb") as temp_f:
+            shutil.copyfileobj(src_f, temp_f)
+            temp_f.flush()
+            os.fsync(temp_f.fileno())
+        shutil.copystat(src, temp)
+        try:
+            os.link(temp, dst)
+        except FileExistsError:
+            raise
+        except OSError as e:
+            if e.errno not in _NO_HARDLINK_ERRNOS:
+                raise
+            os.replace(temp, dst)
+    finally:
+        try:
+            os.unlink(temp)
+        except FileNotFoundError:
+            pass
+
+
+def _backup_once(path: Path, backup: Path) -> None:
+    """Copy `path` to `backup` with metadata, once; an existing backup is never touched.
+
+    A dangling symlink at `backup` is neither "a backup exists" (nothing is saved there)
+    nor "absent" (a plain copy would write through the link): refuse and write nothing. So
+    is a backup that is the same file as `path` (hard link or link to it: overwriting `path`
+    would destroy both), and anything else that is not a regular file (directory, FIFO,
+    device, socket). The backup itself is written with an exclusive create.
+    """
+    if _is_dangling_symlink(backup):
+        raise SystemExit(
+            f"[bootstrap] REFUSED: the backup path {backup} is a symlink to a path that "
+            f"does not exist ({os.readlink(backup)}), so {path} cannot be saved there. "
+            f"Remove the link (rm '{backup}') or repair it, then re-run."
+        )
+    if _target_present(backup) and os.path.samefile(path, backup):
+        raise SystemExit(
+            f"[bootstrap] REFUSED: the backup path {backup} is the same file as {path} "
+            f"(a hard link or link to it), so it would be overwritten too. Move "
+            f"'{backup}' away, then re-run."
+        )
+    if _target_present(backup) and not backup.is_file():
+        raise SystemExit(
+            f"[bootstrap] REFUSED: the backup path {backup} is not a regular file, so "
+            f"{path} cannot be saved there. Move it away, then re-run."
+        )
+    if _target_present(backup):
+        print(f"  backup: existing {backup} kept untouched", flush=True)
+        return
+    try:
+        _copy_exclusive(path, backup)
+    except FileExistsError:
+        raise SystemExit(
+            f"[bootstrap] REFUSED: something appeared at the backup path {backup} while "
+            f"{path} was being saved, so nothing was written there. Move it away, then re-run."
+        )
+    except OSError as e:
+        raise SystemExit(
+            f"[bootstrap] REFUSED: could not save {path} to the backup path {backup} "
+            f"({e}), so nothing was written there. Fix the cause, then re-run."
+        )
+    print(f"  backup: {path} -> {backup}", flush=True)
+
+
+def _claude_md_state(path: Path, expected: str | None) -> str:
+    """'absent' | 'dangling' | 'identical' | 'differs' for the Claude identity file."""
+    if not _target_present(path):
+        return "absent"
+    if _is_dangling_symlink(path):
+        return "dangling"
+    if expected is not None:
+        try:
+            if path.read_text() == expected:
+                return "identical"
+        except (OSError, UnicodeDecodeError):
+            pass
+    return "differs"
+
+
+def _claude_md_guard(
+    path: Path, expected: str | None, force: bool, seeded_db: Path | None = None
+) -> None:
+    """Refuse (SystemExit) unless writing `path` is safe; back it up first under --force.
+
+    `seeded_db` is set only by the late guard, which runs after seeding: its refusal
+    message then says the DB already exists and how to recover.
+    """
+    state = _claude_md_state(path, expected)
+    if state == "dangling":
+        _refuse_dangling(path)
+    if state == "differs":
+        backup = path.parent / CLAUDE_MD_BACKUP_NAME
+        if not force and seeded_db is not None:
+            raise SystemExit(
+                f"[bootstrap] REFUSED: {path} already exists and differs from what ENGRAM "
+                f"would write, and {seeded_db} was already seeded before this check ran. "
+                f"Recover: remove {seeded_db} and re-run with --force (backs the file up to "
+                f"{backup} first), or move {path} away and re-run."
+            )
+        if not force:
+            raise SystemExit(
+                f"[bootstrap] REFUSED: {path} already exists and differs from what ENGRAM "
+                f"would write. Re-run with --force (backs it up to {backup} first), "
+                f"or move the file away yourself."
+            )
+        _backup_once(path, backup)
+
+
+def _codex_config_preflight(path: Path) -> None:
+    """Codex: refuse a dangling symlink; otherwise back up an existing file once.
+
+    The merge itself stays (foreign stanzas survive); the backup covers what the
+    strip removes, i.e. the user's own top-level instructions block.
+    """
+    if not _target_present(path):
+        return
+    if _is_dangling_symlink(path):
+        _refuse_dangling(path)
+    _backup_once(path, path.parent / CODEX_CONFIG_BACKUP_NAME)
 
 
 def _remove_compact_section(text: str) -> str:
@@ -441,7 +628,80 @@ def _db_node_count(db_path: Path) -> int:
         ) from exc
 
 
+def _build_substitutions(ids: dict[str, str], quiet: bool = False) -> dict[str, str]:
+    """Placeholder -> value map shared by every render (and by the pre-write guard)."""
+    substitutions = dict(ids)
+    substitutions["{{ENGRAM_HOOKS_DIR}}"] = str(ENGRAM_HOME / "hooks")
+    substitutions["{{ENGRAM_HOME}}"] = str(ENGRAM_HOME)
+    substitutions["{{PYTHON}}"] = os.environ.get("PYTHON_BIN", "python3")
+
+    # Load compact-instructions.md into substitutions. The CODEX target writes
+    # it as a separate file (codex-compact-prompt.md) and wires it into
+    # config.toml. The CLAUDE target no longer uses this key at all (#2067
+    # removed the ## Compact Instructions section from template.CLAUDE.md); it
+    # stays loaded here because both targets share this substitutions dict.
+    compact_instructions_path = TEMPLATES_DIR / "compact-instructions.md"
+    if compact_instructions_path.exists():
+        substitutions["{{COMPACT_INSTRUCTIONS}}"] = (
+            compact_instructions_path.read_text()
+        )
+    else:
+        # Fallback: leave the marker unreplaced (the template will still render
+        # with the literal placeholder, which is visible and actionable).
+        if not quiet:
+            print(
+                f"  WARN: compact-instructions.md not found at "
+                f"{compact_instructions_path}; {{{{COMPACT_INSTRUCTIONS}}}} "
+                f"left unresolved",
+                flush=True,
+            )
+    return substitutions
+
+
+_SEED_PLACEHOLDERS = (
+    "{{AX_HONESTY}}", "{{AX_HONESTY_DISCRETION}}", "{{AX_PROVENANCE}}",
+    "{{DF_ENGRAM}}", "{{DF_EPISTEMIC_IDENTITY}}", "{{GL_EPISTEMIC_HUMILITY}}",
+)
+
+
+def _predicted_claude_render() -> str | None:
+    """What this run would write to CLAUDE.md, for the pre-write identity check.
+
+    Seed IDs are only known after seeding, and the guard must run BEFORE anything is
+    written. So the IDs come from a previous run's seed-manifest.json (the aborted-then-
+    retried install, where an empty graph re-seeds to the same IDs). No usable manifest
+    -> None, and an existing file is then treated as differing.
+    """
+    try:
+        ids = json.loads((ENGRAM_HOME / "seed-manifest.json").read_text())["seed_ids"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(ids, dict) or not all(isinstance(ids.get(k), str) for k in _SEED_PLACEHOLDERS):
+        return None
+    try:
+        return _render_template_text(
+            TEMPLATES_DIR / "template.CLAUDE.md", _build_substitutions(ids, quiet=True)
+        )
+    except OSError:
+        return None
+
+
+def _parse_args(argv: list[str]) -> bool:
+    """Return True if --force was given. Anything else is an error (no silent ignore)."""
+    force = False
+    for arg in argv:
+        if arg == "--force":
+            force = True
+        else:
+            raise SystemExit(f"[bootstrap] unknown argument {arg!r}; the only option is --force")
+    return force
+
+
 def main() -> None:
+    # --force: the one overwrite path for an existing, differing CLAUDE.md (#4440). It is a
+    # CLI flag, distinct from the FORCE env var below, which is about the knowledge.db.
+    force_identity_file = _parse_args(sys.argv[1:])
+
     # Refuse to overwrite an existing install — defense-in-depth for the
     # plugin path.
     #
@@ -484,6 +744,16 @@ def main() -> None:
                 "  - FORCE_RESEED_EMPTY=1 re-seeds an empty (0-node) DB.\n"
                 "  - For a true fresh start, delete the file first."
             )
+
+    # #4440: decide about the user's identity file BEFORE the first write of this run
+    # (seeding, symlinks, manifest), so a refusal HERE leaves nothing half-done. (That holds
+    # for this early guard only; the late guard below runs after seeding.)
+    if TARGET == "claude":
+        assert CLAUDE_HOME is not None
+        _claude_md_guard(CLAUDE_HOME / "CLAUDE.md", _predicted_claude_render(), force_identity_file)
+    elif TARGET == "codex":
+        assert CODEX_HOME is not None
+        _codex_config_preflight(CODEX_HOME / "config.toml")
 
     # In plugin mode, symlink ~/.engram/tools ($ENGRAM_HOME/tools) -> <plugin-root>/tools so that
     # existing skill/agent references to ~/.engram/tools/<file> ($ENGRAM_HOME) (which were
@@ -654,30 +924,7 @@ def main() -> None:
     for placeholder, node_id in ids.items():
         print(f"    {placeholder} = {node_id}", flush=True)
 
-    substitutions = dict(ids)
-    substitutions["{{ENGRAM_HOOKS_DIR}}"] = str(ENGRAM_HOME / "hooks")
-    substitutions["{{ENGRAM_HOME}}"] = str(ENGRAM_HOME)
-    substitutions["{{PYTHON}}"] = os.environ.get("PYTHON_BIN", "python3")
-
-    # Load compact-instructions.md into substitutions. The CODEX target writes
-    # it as a separate file (codex-compact-prompt.md) and wires it into
-    # config.toml. The CLAUDE target no longer uses this key at all (#2067
-    # removed the ## Compact Instructions section from template.CLAUDE.md); it
-    # stays loaded here because both targets share this substitutions dict.
-    compact_instructions_path = TEMPLATES_DIR / "compact-instructions.md"
-    if compact_instructions_path.exists():
-        substitutions["{{COMPACT_INSTRUCTIONS}}"] = (
-            compact_instructions_path.read_text()
-        )
-    else:
-        # Fallback: leave the marker unreplaced (the template will still render
-        # with the literal placeholder, which is visible and actionable).
-        print(
-            f"  WARN: compact-instructions.md not found at "
-            f"{compact_instructions_path}; {{{{COMPACT_INSTRUCTIONS}}}} "
-            f"left unresolved",
-            flush=True,
-        )
+    substitutions = _build_substitutions(ids)
 
     manifest = {
         "seed_ids": ids,
@@ -713,6 +960,18 @@ def main() -> None:
         # (removed the ## Compact Instructions section entirely — see
         # docs/compaction-continuity.md). A plain single-file substitution is
         # the whole render now (substitute_template() creates CLAUDE_HOME).
+        if not force_identity_file:
+            # Skipping this guard under --force rests on the early guard's predicted render
+            # matching the real one, which holds because create_seed_graph mints fixed IDs.
+            # Defence in depth: the early guard compared against a PREDICTED render; this
+            # one compares against the real one. (Under --force the early guard already
+            # backed the file up.)
+            _claude_md_guard(
+                CLAUDE_HOME / "CLAUDE.md",
+                _render_template_text(TEMPLATES_DIR / "template.CLAUDE.md", substitutions),
+                False,
+                seeded_db=ENGRAM_HOME / "knowledge.db",
+            )
         substitute_template(
             TEMPLATES_DIR / "template.CLAUDE.md",
             CLAUDE_HOME / "CLAUDE.md",

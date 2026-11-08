@@ -82,6 +82,8 @@ ENGRAM_INSTALL_MODE=plugin \
 "$VENV_PY" "$BOOTSTRAP"
 ```
 
+**If bootstrap prints `[bootstrap] REFUSED: ... CLAUDE.md already exists and differs`**, the user already has their own `~/.claude/CLAUDE.md`, and bootstrap will not overwrite it without consent (#4440). Nothing has been written yet. Show the user that line and ask: overwrite it (bootstrap first copies it to `~/.claude/CLAUDE.md.pre-engram`, and never overwrites an existing backup), or stop so they can move the file themselves. Only on a clear yes, re-run the same command with `--force` appended after `"$BOOTSTRAP"`. Never add `--force` on your own judgement. A `REFUSED` about a dangling symlink is not fixed by `--force`: the line names the link to remove or repair.
+
 (The `ENGRAM_HOME` variable was resolved in Step 0; using it here ensures users with a custom `ENGRAM_HOME` bootstrap to the right path rather than the default `~/.engram`. `PYTHON_BIN` is set to the venv python so bootstrap.py + any subprocesses it spawns inherit the right interpreter.)
 
 After this runs, `~/.engram/knowledge.db` (under `$ENGRAM_HOME`) exists with the 6 seed nodes + 2 edges; `~/.engram/first-run-pending` is armed (bootstrap.py writes the marker as the final step of its main() — single source of truth across scatter and plugin paths); templates are rendered with install-time placeholders. The MCP server's `_get_db()` fail-loud now passes because the DB + seed nodes exist — your NEXT MCP tool call will succeed.
