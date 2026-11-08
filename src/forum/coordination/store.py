@@ -96,6 +96,25 @@ class ProjectRecord:
     # notifying exactly as they did before this field was introduced.
 
 
+@dataclass(frozen=True)
+class ProjectScan:
+    """One project scan's outcome: the records kept, and how many were refused.
+
+    ``refused`` counts entries the scan DECLINED to read (#4518 part 2) -- a
+    symlink skipped by the ``os.path.islink`` pre-check, or a ``_scan_text``
+    call that returned ``None`` (a non-regular file, an unreadable entry, or an
+    ``OSError``). It does NOT count a closed-status entry filtered out by
+    ``active_only`` -- that is normal filtering, and conflating the two would
+    make the number meaningless -- and it does NOT count an entry that vanished
+    between the directory listing and its read (``_VANISHED``): a routine
+    archive race is not evidence of a bad entry. So ``refused`` means "the scan
+    found something it would not read", never "an entry disappeared".
+    """
+
+    records: list[ProjectRecord]
+    refused: int
+
+
 def dm_thread_key(a: str, b: str) -> str:
     """Return the canonical per-pair thread key: the two names sorted + ``+``-joined.
 
@@ -144,6 +163,21 @@ class CoordinationStore(abc.ABC):
         A scan skips an entry that is not a plain file inside the store, and a
         scan ROOT that resolves outside the store is refused rather than scanned.
         """
+
+    def scan_projects(self, *, active_only: bool = True) -> ProjectScan:
+        """Return the records plus the number of entries the scan refused.
+
+        This is the additive form of :meth:`read_projects` (#4518 part 2): the
+        two MUST agree on the records, and ``read_projects`` is the thin
+        ``.records`` view of this call.
+
+        The default is for stores that keep their items somewhere they cannot
+        refuse to read -- an in-memory test double, say -- where ``refused`` is
+        genuinely always 0. A store whose scan CAN decline an entry must
+        override this rather than inherit the zero, because a silent 0 is the
+        exact failure this method exists to end.
+        """
+        return ProjectScan(records=self.read_projects(active_only=active_only), refused=0)
 
     @abc.abstractmethod
     def read_project(self, project_id: str) -> Optional[str]:

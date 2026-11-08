@@ -2086,6 +2086,32 @@ def _body_identities() -> list:
 
 
 
+def _scan_board(store) -> tuple[list | None, int | None]:
+    """ONE store scan for a board surface (#4518 part 2).
+
+    Returns ``(records, refused)`` from a single ``scan_projects`` call, so a
+    count can never annotate a list read at a different moment:
+
+    - success: ``(records, refused)`` with ``refused`` an ``int >= 0``;
+    - scan failure: ``(None, None)``. ``records=None`` lets
+      ``read_project_board`` fall back to its own read (the pre-#4518
+      fail-soft), and ``refused=None`` says UNKNOWN -- never 0, which would be
+      byte-identical to a clean store;
+    - ``store is None`` (unconfigured): ``(None, None)``.
+
+    The try lives here, once, so a scan failure can never blank the surface and
+    the two board routes cannot drift apart.
+    """
+    if store is None:
+        return None, None
+    try:
+        scan = store.scan_projects(active_only=False)
+        return scan.records, scan.refused
+    except Exception as exc:  # noqa: BLE001
+        print(f"[forum] board scan error: {exc}", file=sys.stderr)
+        return None, None
+
+
 def create_app(
     db_path: str,
     audit_path: str,
@@ -3350,8 +3376,14 @@ def create_app(
             abort(404)  # #1459: off unless the server started with --enable-board-viewer
         if not _host_ok():
             abort(403)  # #1459 round 2: DNS-rebinding defence (see _viewer_host_ok for its bound)
+        store = app.config.get("COORD_STORE")
+        # ONE scan (#4518 part 2): the rendered items and the refusal count come
+        # from the same ProjectScan, so the line can never disagree with the
+        # board beside it. On a scan failure `refused` is None, so the template
+        # renders no chip rather than a false "0 refused".
+        records, refused = _scan_board(store)
         try:
-            items = read_project_board(app.config.get("COORD_STORE"))
+            items = read_project_board(store, records=records)
         except Exception as exc:  # noqa: BLE001
             print(f"[forum] project_board error: {exc}", file=sys.stderr)
             items = []
@@ -3382,6 +3414,10 @@ def create_app(
             groups=groups,
             group_by=group_by,
             counts=counts,
+            # #4518 part 2: entries the scan declined to read. The template
+            # renders one line when this is non-zero, so a vanished baton reads
+            # as "one entry refused" rather than as nothing.
+            refused=refused,
             # Presentation theme — all read from board_theme (SSoT).
             status_color=board_theme.status_color_map(),
             terminal_statuses=board_theme.terminal_statuses(),
@@ -3477,7 +3513,8 @@ def create_app(
     # ------------------------------------------------------------------
     # GET /api/board/projects  — JSON project board snapshot
     #
-    # Response: {board: [...], counts: {<status>: <int>}}
+    # Response: {board: [...], counts: {<status>: <int>}, refused: <int|null>,
+    #            scan_ok: <bool>}
     # NB: key is "board" here (work items) — distinct from
     # /api/agents/board which returns "board" of agent presence records.
     # The sibling convention: different key semantics, same key name by
@@ -3487,7 +3524,13 @@ def create_app(
     def api_board_projects():
         """Return the current project board as JSON.
 
-        Response: {board: [...], counts: {<effective_status>: <n>}}
+        Response: {board: [...], counts: {<effective_status>: <n>},
+                   refused: <int|null>, scan_ok: <bool>}
+        ``refused`` is the number of store entries the scan declined to read
+        (a symlink, a non-regular file, an unreadable entry) -- #4518 part 2, so
+        an entry the store refused reads as "one entry refused" rather than as
+        nothing. On a scan failure it is ``null`` with ``scan_ok: false`` -- an
+        UNKNOWN count, never a clean store's ``0``.
         Read-only: reads the coordination store fresh, never writes.
         Degrades gracefully when gh is unavailable (gh_state='unknown',
         gh_unknown=True on affected items).
@@ -3498,14 +3541,25 @@ def create_app(
         if store is None:
             return jsonify({"error": "coordination store not configured"}), 503
 
+        # ONE scan (#4518 part 2): the records that render the board and the
+        # refusal count annotating it come from the SAME call, so the count can
+        # never disagree with the list beside it.
+        records, refused = _scan_board(store)
         try:
-            items = read_project_board(store)
+            items = read_project_board(store, records=records)
         except Exception as exc:  # noqa: BLE001
             print(f"[forum] api_board_projects error: {exc}", file=sys.stderr)
             items = []
         counts = get_board_counts(items)
         # Serialize: strip internal datetime objects (turn_since is already a string).
-        return jsonify({"board": items, "counts": counts})
+        # `refused: null` + `scan_ok: false` when the scan failed -- UNKNOWN,
+        # never a clean-store 0, so the two states stay distinguishable.
+        return jsonify({
+            "board": items,
+            "counts": counts,
+            "refused": refused,
+            "scan_ok": refused is not None,
+        })
 
     # ------------------------------------------------------------------
     # GET /api/board/updates?since=<seq>[&agent=<name>]

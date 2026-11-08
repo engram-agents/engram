@@ -364,7 +364,7 @@ def _effective_status(
 # Core read model
 # ---------------------------------------------------------------------------
 
-def read_project_board(store) -> list[dict[str, Any]]:
+def read_project_board(store, records=None) -> list[dict[str, Any]]:
     """Read every project record from the live coordination store and return
     a list of project board items.
 
@@ -375,6 +375,12 @@ def read_project_board(store) -> list[dict[str, Any]]:
         store: a ``CoordinationStore`` (e.g. ``forum.coordination.FileStore``)
             — the same live backend ``GET /api/projects`` reads. ``None``
             (coordination store not configured) returns ``[]``.
+        records: optional pre-read ``ProjectRecord`` list (#4518 part 2). When
+            supplied, the board renders THESE records and the store is not
+            scanned again, so a caller that also needs the scan's refusal count
+            can take both from one ``scan_projects`` call and the count can
+            never disagree with the list beside it. Omitted (the default), the
+            behaviour is exactly as before: the store is read here.
 
     Returns:
         List of dicts with keys:
@@ -393,7 +399,8 @@ def read_project_board(store) -> list[dict[str, Any]]:
     if store is None:
         return []
 
-    records = store.read_projects(active_only=False)
+    if records is None:
+        records = store.read_projects(active_only=False)
 
     items: list[dict[str, Any]] = []
     pr_refs_to_resolve: list[tuple[str, str]] = []

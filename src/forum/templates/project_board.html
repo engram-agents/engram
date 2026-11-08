@@ -229,6 +229,14 @@ a { color: inherit; text-decoration: none; }
       {% if not counts %}
       <div class="pboard__count"><b>0</b> <span class="pboard__count-label">items</span></div>
       {% endif %}
+      {% if refused %}
+      {# #4518 part 2: a refused entry is VISIBLE, not silently absent -- a
+         vanished baton must read as "one entry refused", not as nothing. #}
+      <div class="pboard__count" title="store entries the scan declined to read: a symlink, a non-regular file, or an unreadable entry">
+        <b>{{ refused }}</b>
+        <span class="pboard__count-label">refused</span>
+      </div>
+      {% endif %}
     </div>
   </div>
 

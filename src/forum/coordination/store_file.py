@@ -40,6 +40,7 @@ from .store import (
     CoordinationStore,
     DmMessage,
     ProjectRecord,
+    ProjectScan,
     dm_thread_key,
 )
 
@@ -232,14 +233,37 @@ def _read_store_file_text(path: Path, *, errors: str = "strict") -> Optional[str
     return b"".join(chunks).decode("utf-8", errors)
 
 
-def _scan_text(path: Path) -> Optional[str]:
-    """Read one directory-scan entry; ``None`` means "skip this entry".
+class _Vanished:
+    """Sentinel: a scan entry disappeared between ``glob`` and its read.
+
+    ``archive_project`` RENAMES a baton out of ``projects/``, so a board poll
+    racing a routine archive must not report that file as a refusal: a refused
+    count means "evidence somebody planted something", and a vanished entry is
+    not evidence. Callers skip this sentinel WITHOUT counting it (#4518).
+    """
+
+    __slots__ = ()
+
+
+_VANISHED = _Vanished()
+
+
+def _scan_text(path: Path) -> str | _Vanished | None:
+    """Read one directory-scan entry.
+
+    Returns the text, or one of two non-text outcomes:
+
+    - ``_VANISHED`` when the entry no longer exists (``ENOENT``): a routine
+      archive/unlink race. The caller skips it WITHOUT counting a refusal.
+    - ``None`` for a genuine refusal: a symlink, a non-regular file (FIFO,
+      device, directory), an unreadable entry (permission denied), or any other
+      ``OSError``. The caller skips it and COUNTS a refusal.
 
     A scan over many files must never raise (and must never block) because one
     entry is unusable: a planted FIFO opens instantly under ``O_NONBLOCK`` and
     is refused by the fd kind check, a symlink is refused, and any ``OSError``
-    (a file deleted mid-scan, a permission denial) folds into the same skip. The
-    caller continues the scan.
+    (a permission denial, a file deleted mid-open by something other than the
+    archive path) folds into a skip. The caller continues the scan.
 
     Decoding is ``errors="replace"`` (see :func:`_read_store_file_text`), so a
     malformed byte cannot raise here at all. That is deliberate: the old
@@ -251,7 +275,10 @@ def _scan_text(path: Path) -> Optional[str]:
     """
     try:
         return _read_store_file_text(path, errors="replace")
-    except OSError:
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            # The routine archive race: gone, not bad. Not a refusal.
+            return _VANISHED
         return None
 
 
@@ -330,22 +357,30 @@ class FileStore(CoordinationStore):
         return path
 
     # --- baton / board (projects) ------------------------------------------
-    def read_projects(self, *, active_only: bool = True) -> list[ProjectRecord]:
+    def scan_projects(self, *, active_only: bool = True) -> ProjectScan:
         # Resolve the scan ROOT first: a directory that is not the store's is
         # not a per-file anomaly to skip -- nothing in it is trustworthy.
         base = self._contained_dir("projects")
         if not base.is_dir():
-            return []
+            return ProjectScan(records=[], refused=0)
         records: list[ProjectRecord] = []
+        refused = 0
         for md in sorted(base.glob("*.md")):
             # A scan over many files must not turn one planted link into a 500
             # for the whole board, so the scan SKIPS it: non-disclosure is what
             # this buys, and detection is the operator's filesystem audit, not
-            # this read path.
+            # this read path. Each skip is COUNTED (#4518 part 2) so the board
+            # can read "one entry refused" instead of showing nothing.
             if os.path.islink(md):
+                refused += 1
                 continue
             raw = _scan_text(md)
+            if raw is _VANISHED:
+                # Raced a routine archive/unlink: gone, not refused. Counting it
+                # would make the board cry wolf on every archive during a poll.
+                continue
             if raw is None:
+                refused += 1
                 continue
             fields, _body = _parse_frontmatter(raw)
             status = fields.get("status", "").strip().lower()
@@ -384,7 +419,13 @@ class FileStore(CoordinationStore):
         # ISO-8601 turn_since sorts lexicographically == chronologically; empty
         # (unstamped) sorts first. Mirrors baton list's oldest-first ordering.
         records.sort(key=lambda r: r.turn_since)
-        return records
+        return ProjectScan(records=records, refused=refused)
+
+    def read_projects(self, *, active_only: bool = True) -> list[ProjectRecord]:
+        # The records view of the scan. List, order and filtering are exactly
+        # what they were before scan_projects existed; the refusal count rides
+        # on the separate call, so no existing caller changes shape.
+        return self.scan_projects(active_only=active_only).records
 
     def read_project(self, project_id: str) -> Optional[str]:
         path = self._project_file(project_id)
@@ -547,7 +588,7 @@ class FileStore(CoordinationStore):
                 if os.path.islink(md):
                     continue
                 raw = _scan_text(md)
-                if raw is None:
+                if raw is None or raw is _VANISHED:
                     continue
                 fields, _ = _parse_frontmatter(raw)
                 hi = max(hi, _coerce_seq(fields.get("seq", "")))
@@ -558,7 +599,7 @@ class FileStore(CoordinationStore):
                 if os.path.islink(md):
                     continue
                 raw = _scan_text(md)
-                if raw is None:
+                if raw is None or raw is _VANISHED:
                     continue
                 fields, _ = _parse_frontmatter(raw)
                 hi = max(hi, _coerce_seq(fields.get("seq", "")))
@@ -569,7 +610,7 @@ class FileStore(CoordinationStore):
                 if os.path.islink(md):
                     continue
                 raw = _scan_text(md)
-                if raw is None:
+                if raw is None or raw is _VANISHED:
                     continue
                 # Parse STRUCTURALLY (length-prefixed), not by line-scanning for
                 # headers — a body line shaped like a header must not inflate the
