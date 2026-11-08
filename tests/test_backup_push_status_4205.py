@@ -462,6 +462,14 @@ def test_diagnose_backup_push_unreadable_file_flares():
     assert bp["result"] == "unreadable" and bp["flare"] is True
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _release_fresh_server_diag_4427():
+    """#4427: the tests below park a fresh `server` copy in the module global
+    `fresh_server_diag`; without this it stays pinned after the file, a second live copy."""
+    yield
+    globals()["fresh_server_diag"] = None
+
+
 def _diagnose_archive():
     return json.loads(fresh_server_diag.engram_diagnose())["backup_archive"]
 

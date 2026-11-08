@@ -730,3 +730,42 @@ def _release_replaced_server_copies_3807():
     helper = _load_release_helper()
     if helper is not None:
         helper.release_if_server_changed()
+
+
+def _load_instance_helper():
+    """Return the `_release_instance_modules` module, or None; never raises. Same absolute-path
+    resolution and one-module-one-state registration as `_load_release_helper`."""
+    try:
+        mod = sys.modules.get("_release_instance_modules")
+        if mod is not None:
+            return mod
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).with_name("_release_instance_modules.py")
+        spec = importlib.util.spec_from_file_location("_release_instance_modules", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_release_instance_modules"] = mod  # registered BEFORE exec
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            sys.modules.pop("_release_instance_modules", None)
+            raise
+        return mod
+    except Exception:
+        return None
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    """#4427: pytest caches a class-based test's instance on its item for the whole session, so
+    a module stored on `self` (re-imported `server`) pins that copy until the end. After every
+    fixture has finished (trylast), drop module-valued attributes from the cached instance.
+    Do not store a module on `self` for a class-scoped fixture to read later: it is dropped here
+    after the first item that used it (a class-scoped fixture method is bound to the first item's
+    instance). Never raises."""
+    helper = _load_instance_helper()
+    if helper is not None:
+        helper.release_instance_module_attrs(item)
