@@ -34,6 +34,7 @@
 #   RESTORED (only if a pre-engram backup exists, #4440):
 #     ~/.claude/CLAUDE.md.pre-engram  -> ~/.claude/CLAUDE.md   (--target claude-code)
 #     ~/.codex/config.toml.pre-engram -> ~/.codex/config.toml  (--target codex)
+#     ~/.codex/AGENTS.md.pre-engram   -> ~/.codex/AGENTS.md    (--target codex, #4452)
 #     The CURRENT file is first copied to <name>.pre-uninstall.<UTC timestamp>, so edits
 #     made since install are never lost. No backup: the file is left untouched.
 #
@@ -174,6 +175,16 @@ restore_identity_file() {
   fi
   cp -p "$backup" "$file" || die "could not restore $backup to $file"
   log "Restored $backup to $file (the backup is kept)."
+}
+
+# The identity files this target restores (Codex has two: config.toml and AGENTS.md, #4452).
+restore_identity_files() {
+  if [[ "$TARGET" == "codex" ]]; then
+    restore_identity_file "$CODEX_HOME/config.toml"
+    restore_identity_file "$CODEX_HOME/AGENTS.md"
+  else
+    restore_identity_file "$CLAUDE_HOME/CLAUDE.md"
+  fi
 }
 
 # ── Services and daemons of THIS home (#4446) ────────────────────────────────────
@@ -536,7 +547,7 @@ if [[ ! -d "$MARKETPLACE_ROOT" && ! -f "$VERSION_MARKER" ]]; then
   log "Nothing to uninstall — marketplace and version marker both absent."
   # A leftover .pre-engram backup must still be restored (the restore has no dependence on
   # the marketplace tree); with no backup this logs "left untouched" and changes nothing.
-  restore_identity_file "$([[ "$TARGET" == "codex" ]] && echo "$CODEX_HOME/config.toml" || echo "$CLAUDE_HOME/CLAUDE.md")"
+  restore_identity_files
   if [[ $SKIP_CLI -eq 0 ]]; then
     warn "If the plugin is still registered with Claude Code, run:"
     warn "  claude plugin marketplace remove engram-local"
@@ -609,11 +620,7 @@ if [[ -f "$VERSION_MARKER" ]]; then
 fi
 
 # ── 4. Restore the identity file (function defined above, before the early exit) ──
-if [[ "$TARGET" == "codex" ]]; then
-  restore_identity_file "$CODEX_HOME/config.toml"
-else
-  restore_identity_file "$CLAUDE_HOME/CLAUDE.md"
-fi
+restore_identity_files
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 log ""

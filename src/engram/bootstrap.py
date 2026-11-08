@@ -209,6 +209,7 @@ def substitute_template(
 
 CLAUDE_MD_BACKUP_NAME = "CLAUDE.md.pre-engram"  # same name install.sh writes
 CODEX_CONFIG_BACKUP_NAME = "config.toml.pre-engram"
+AGENTS_MD_BACKUP_NAME = "AGENTS.md.pre-engram"  # #4452, the Codex counterpart of CLAUDE.md
 
 
 def _target_present(path: Path) -> bool:
@@ -246,12 +247,15 @@ def _copy_exclusive(src: Path, dst: Path) -> None:
     FileExistsError if anything is at `dst`.
 
     Property: after this returns or raises, `dst` either does not exist or holds a COMPLETE
-    copy of `src` (bytes and metadata). It is built in a sibling temp `<dst>.partial-<pid>`
-    (opened "xb", O_EXCL), the temp's bytes are fsync'd, then it is published with
-    os.link(temp, dst): atomic, raises FileExistsError for anything at `dst` (a symlink
-    included), never overwrites or truncates. The temp is always unlinked afterwards. No
-    directory fsync is done. shutil.copy2/copyfile onto `dst` would open it for writing
-    and follow links (#4380 ratchet).
+    copy of `src` (bytes and metadata). It never removes, truncates or writes through an
+    entry it did not create in this call. The copy is built in a UNIQUE sibling temp
+    `<dst>.partial-<random>` made by tempfile.mkstemp (O_CREAT|O_EXCL, never reuses an
+    existing name, so whatever already sits at any `.partial-` name is left alone); the
+    temp's bytes are fsync'd, then it is published with os.link(temp, dst): atomic, raises
+    FileExistsError for anything at `dst` (a symlink included), never overwrites or
+    truncates. The temp this call created is always unlinked afterwards. No directory
+    fsync is done, so no durability claim is made. shutil.copy2/copyfile onto `dst` would
+    open it for writing and follow links (#4380 ratchet).
 
     Fallback, honestly: on a filesystem without hard links (os.link fails with EPERM,
     EOPNOTSUPP, ENOTSUP, EXDEV or ENOSYS) the finished temp is published with
@@ -261,9 +265,17 @@ def _copy_exclusive(src: Path, dst: Path) -> None:
     on those filesystems only. Any other OSError from os.link propagates with nothing at `dst`.
     """
     import shutil
-    temp = Path(f"{dst}.partial-{os.getpid()}")
+    import tempfile
+    temp = None  # the exact path mkstemp returned, stored once; None until it has created it
     try:
-        with open(src, "rb") as src_f, open(temp, "xb") as temp_f:
+        # dir=dst.parent is LOAD-BEARING: os.link is same-filesystem only, so a temp under
+        # $TMPDIR would make every publish hit the EXDEV os.replace fallback below and
+        # silently lose exclusivity. A killed run can leave a uniquely named
+        # `<name>.partial-*` file; it is inert (never read or published) and safe to delete
+        # by hand.
+        fd, temp = tempfile.mkstemp(dir=dst.parent, prefix=dst.name + ".partial-")
+        # fdopen first, so the fd mkstemp returned is closed even if opening src fails.
+        with os.fdopen(fd, "wb") as temp_f, open(src, "rb") as src_f:
             shutil.copyfileobj(src_f, temp_f)
             temp_f.flush()
             os.fsync(temp_f.fileno())
@@ -277,38 +289,50 @@ def _copy_exclusive(src: Path, dst: Path) -> None:
                 raise
             os.replace(temp, dst)
     finally:
-        try:
-            os.unlink(temp)
-        except FileNotFoundError:
-            pass
+        if temp is not None:
+            try:
+                os.unlink(temp)
+            except FileNotFoundError:
+                pass
 
 
-def _backup_once(path: Path, backup: Path) -> None:
-    """Copy `path` to `backup` with metadata, once; an existing backup is never touched.
+def _backup_path_problem(path: Path, backup: Path) -> str | None:
+    """The REFUSED message if `path` cannot be saved to `backup`, else None. Pure: writes nothing.
 
     A dangling symlink at `backup` is neither "a backup exists" (nothing is saved there)
-    nor "absent" (a plain copy would write through the link): refuse and write nothing. So
-    is a backup that is the same file as `path` (hard link or link to it: overwriting `path`
-    would destroy both), and anything else that is not a regular file (directory, FIFO,
-    device, socket). The backup itself is written with an exclusive create.
+    nor "absent" (a plain copy would write through the link). A backup that is the same file
+    as `path` (hard link or link to it) would be destroyed with `path`. Anything else that is
+    not a regular file (directory, FIFO, device, socket) cannot hold a copy.
     """
     if _is_dangling_symlink(backup):
-        raise SystemExit(
+        return (
             f"[bootstrap] REFUSED: the backup path {backup} is a symlink to a path that "
             f"does not exist ({os.readlink(backup)}), so {path} cannot be saved there. "
             f"Remove the link (rm '{backup}') or repair it, then re-run."
         )
     if _target_present(backup) and os.path.samefile(path, backup):
-        raise SystemExit(
+        return (
             f"[bootstrap] REFUSED: the backup path {backup} is the same file as {path} "
             f"(a hard link or link to it), so it would be overwritten too. Move "
             f"'{backup}' away, then re-run."
         )
     if _target_present(backup) and not backup.is_file():
-        raise SystemExit(
+        return (
             f"[bootstrap] REFUSED: the backup path {backup} is not a regular file, so "
             f"{path} cannot be saved there. Move it away, then re-run."
         )
+    return None
+
+
+def _backup_once(path: Path, backup: Path) -> None:
+    """Copy `path` to `backup` with metadata, once; an existing backup is never touched.
+
+    Refuses (writing nothing) on any `_backup_path_problem`. The backup itself is written
+    with an exclusive create.
+    """
+    problem = _backup_path_problem(path, backup)
+    if problem is not None:
+        raise SystemExit(problem)
     if _target_present(backup):
         print(f"  backup: existing {backup} kept untouched", flush=True)
         return
@@ -327,8 +351,8 @@ def _backup_once(path: Path, backup: Path) -> None:
     print(f"  backup: {path} -> {backup}", flush=True)
 
 
-def _claude_md_state(path: Path, expected: str | None) -> str:
-    """'absent' | 'dangling' | 'identical' | 'differs' for the Claude identity file."""
+def _identity_file_state(path: Path, expected: str | None) -> str:
+    """'absent' | 'dangling' | 'identical' | 'differs' for an identity file (CLAUDE.md, AGENTS.md)."""
     if not _target_present(path):
         return "absent"
     if _is_dangling_symlink(path):
@@ -342,19 +366,25 @@ def _claude_md_state(path: Path, expected: str | None) -> str:
     return "differs"
 
 
-def _claude_md_guard(
-    path: Path, expected: str | None, force: bool, seeded_db: Path | None = None
+def _identity_file_guard(
+    path: Path, expected: str | None, force: bool, backup_name: str,
+    seeded_db: Path | None = None, act: bool = True,
 ) -> None:
     """Refuse (SystemExit) unless writing `path` is safe; back it up first under --force.
 
-    `seeded_db` is set only by the late guard, which runs after seeding: its refusal
-    message then says the DB already exists and how to recover.
+    `act=False` is the check-only pass: every refusal (including the backup-path ones) is
+    raised exactly as in the act pass, but nothing is written.
+
+    One guard for every identity file the installer renders (CLAUDE.md, #4440; AGENTS.md,
+    #4452), so the decision cannot differ between them. `seeded_db` is set only by the late
+    guard, which runs after seeding: its refusal message then says the DB already exists and
+    how to recover.
     """
-    state = _claude_md_state(path, expected)
+    state = _identity_file_state(path, expected)
     if state == "dangling":
         _refuse_dangling(path)
     if state == "differs":
-        backup = path.parent / CLAUDE_MD_BACKUP_NAME
+        backup = path.parent / backup_name
         if not force and seeded_db is not None:
             raise SystemExit(
                 f"[bootstrap] REFUSED: {path} already exists and differs from what ENGRAM "
@@ -368,11 +398,31 @@ def _claude_md_guard(
                 f"would write. Re-run with --force (backs it up to {backup} first), "
                 f"or move the file away yourself."
             )
+        if not act:
+            problem = _backup_path_problem(path, backup)
+            if problem is not None:
+                raise SystemExit(problem)
+            return
         _backup_once(path, backup)
 
 
-def _codex_config_preflight(path: Path) -> None:
+def _claude_md_guard(
+    path: Path, expected: str | None, force: bool, seeded_db: Path | None = None
+) -> None:
+    _identity_file_guard(path, expected, force, CLAUDE_MD_BACKUP_NAME, seeded_db)
+
+
+def _agents_md_guard(
+    path: Path, expected: str | None, force: bool, seeded_db: Path | None = None,
+    act: bool = True,
+) -> None:
+    _identity_file_guard(path, expected, force, AGENTS_MD_BACKUP_NAME, seeded_db, act)
+
+
+def _codex_config_preflight(path: Path, act: bool = True) -> None:
     """Codex: refuse a dangling symlink; otherwise back up an existing file once.
+
+    `act=False` is the check-only pass: the same refusals, no backup written.
 
     The merge itself stays (foreign stanzas survive); the backup covers what the
     strip removes, i.e. the user's own top-level instructions block.
@@ -381,7 +431,13 @@ def _codex_config_preflight(path: Path) -> None:
         return
     if _is_dangling_symlink(path):
         _refuse_dangling(path)
-    _backup_once(path, path.parent / CODEX_CONFIG_BACKUP_NAME)
+    backup = path.parent / CODEX_CONFIG_BACKUP_NAME
+    if not act:
+        problem = _backup_path_problem(path, backup)
+        if problem is not None:
+            raise SystemExit(problem)
+        return
+    _backup_once(path, backup)
 
 
 def _remove_compact_section(text: str) -> str:
@@ -478,7 +534,7 @@ def merge_codex_config_toml(
     config_path.write_text(new_content)
 
 
-def _render_codex_target(substitutions: dict[str, str]) -> None:
+def _render_codex_target(substitutions: dict[str, str], force_identity_file: bool = False) -> None:
     """Render the three Codex identity surfaces.
 
     1. ~/.engram/codex-compact-prompt.md ($ENGRAM_HOME)  — compact instructions (standalone)
@@ -553,6 +609,18 @@ def _render_codex_target(substitutions: dict[str, str]) -> None:
     print(f"  config.toml → {CODEX_HOME}/config.toml", flush=True)
 
     # 3. ~/.codex/AGENTS.md — project conventions placeholder
+    if not force_identity_file:
+        # Late guard (#4452): the early guard compared against a PREDICTED render; this one
+        # compares against the real one. Under --force the early guard already backed up.
+        # Skipping this under --force (and `_predicted_agents_render` being exact at all)
+        # holds only while template.AGENTS.md contains none of `_SEED_PLACEHOLDERS`; pinned
+        # by test_agents_template_has_no_seed_placeholders in tests/test_bootstrap_agents_md_4452.py.
+        _agents_md_guard(
+            CODEX_HOME / "AGENTS.md",
+            _render_template_text(TEMPLATES_DIR / "template.AGENTS.md", substitutions),
+            False,
+            seeded_db=ENGRAM_HOME / "knowledge.db",
+        )
     substitute_template(
         TEMPLATES_DIR / "template.AGENTS.md",
         CODEX_HOME / "AGENTS.md",
@@ -686,6 +754,22 @@ def _predicted_claude_render() -> str | None:
         return None
 
 
+def _predicted_agents_render() -> str | None:
+    """What this run would write to AGENTS.md, for the pre-write identity check.
+
+    template.AGENTS.md carries no seed-ID placeholders, so no seed manifest is needed: the
+    render is the template under the same substitutions the real run uses (the unresolved
+    first-session markers stay literal). An unreadable template -> None, and an existing
+    file is then treated as differing.
+    """
+    try:
+        return _render_template_text(
+            TEMPLATES_DIR / "template.AGENTS.md", _build_substitutions({}, quiet=True)
+        )
+    except OSError:
+        return None
+
+
 def _parse_args(argv: list[str]) -> bool:
     """Return True if --force was given. Anything else is an error (no silent ignore)."""
     force = False
@@ -753,6 +837,14 @@ def main() -> None:
         _claude_md_guard(CLAUDE_HOME / "CLAUDE.md", _predicted_claude_render(), force_identity_file)
     elif TARGET == "codex":
         assert CODEX_HOME is not None
+        # Check-only pass over BOTH files first: every refusal either can produce (including
+        # the backup-path ones) must precede the first backup, or a --force run could save
+        # AGENTS.md and then refuse about config.toml, leaving a backup behind a refusal that
+        # says nothing was written (#4452).
+        agents_expected = _predicted_agents_render()
+        _agents_md_guard(CODEX_HOME / "AGENTS.md", agents_expected, force_identity_file, act=False)
+        _codex_config_preflight(CODEX_HOME / "config.toml", act=False)
+        _agents_md_guard(CODEX_HOME / "AGENTS.md", agents_expected, force_identity_file)
         _codex_config_preflight(CODEX_HOME / "config.toml")
 
     # In plugin mode, symlink ~/.engram/tools ($ENGRAM_HOME/tools) -> <plugin-root>/tools so that
@@ -982,7 +1074,7 @@ def main() -> None:
         _set_cleanup_period_days(CLAUDE_HOME)
 
     elif TARGET == "codex":
-        _render_codex_target(substitutions)
+        _render_codex_target(substitutions, force_identity_file)
 
 
 if __name__ == "__main__":

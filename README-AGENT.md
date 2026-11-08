@@ -462,6 +462,8 @@ ENGRAM_INSTALL_MODE=plugin \
 "$VENV_PY" bootstrap.py
 ```
 
+**If bootstrap prints `[bootstrap] REFUSED: ... AGENTS.md already exists and differs`**, the user already has their own `~/.codex/AGENTS.md`, and bootstrap will not overwrite it without consent (#4452). Nothing has been written yet. Show the user that line and ask: overwrite it (bootstrap first copies it to `~/.codex/AGENTS.md.pre-engram`, and never overwrites an existing backup), or stop so they can move the file themselves. Only on a clear yes, re-run the same command with `--force` appended after `bootstrap.py`. Never add `--force` on your own judgement. A `REFUSED` about a dangling symlink is not fixed by `--force`: the line names the link to remove or repair.
+
 ### Phase 1.6 — Hook trust (CODEX-DELTA)
 
 **Ask the human to** review and trust the ENGRAM hook definitions on first `codex`

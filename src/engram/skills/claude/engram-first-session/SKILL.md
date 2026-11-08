@@ -620,6 +620,8 @@ A lost or duplicated anchor is not cosmetic: `engram-sleep` Step 3's erase keys 
 
 The codex file set is different. Bootstrap wrote identity surfaces across four files; this step resolves the remaining first-session placeholders in all four.
 
+**If the Codex bootstrap (README Phase 1.5) printed `[bootstrap] REFUSED: ... AGENTS.md already exists and differs`**, the user already has their own `~/.codex/AGENTS.md`, and bootstrap will not overwrite it without consent (#4452). Nothing has been written yet. Show the user that line and ask: overwrite it (bootstrap first copies it to `~/.codex/AGENTS.md.pre-engram`, and never overwrites an existing backup), or stop so they can move the file themselves. Only on a clear yes, re-run the same command with `--force` appended after `bootstrap.py`. Never add `--force` on your own judgement. A `REFUSED` about a dangling symlink is not fixed by `--force`: the line names the link to remove or repair.
+
 1. Read the four codex surfaces:
    - `~/.codex/config.toml` (instructions= body + compact_prompt_file pointer)
    - `~/.codex/AGENTS.md` (project conventions placeholder)

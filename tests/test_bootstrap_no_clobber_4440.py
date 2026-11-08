@@ -514,7 +514,7 @@ def _fn_source(src: str, name: str) -> str:
 def test_shared_helper_is_lexists_and_used_by_both_paths():
     src = BOOTSTRAP.read_text()
     assert "os.path.lexists" in _fn_source(src, "_target_present")
-    assert "_target_present(" in _fn_source(src, "_claude_md_state")
+    assert "_target_present(" in _fn_source(src, "_identity_file_state")
     assert "_target_present(" in _fn_source(src, "_codex_config_preflight")
 
 
