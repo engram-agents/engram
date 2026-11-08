@@ -280,10 +280,13 @@ class TestAvailable:
         monkeypatch.setenv("FORUM_NO_EMBEDDINGS", "1")
         assert emb.available() is False
 
-    def test_available_returns_bool(self):
-        # Just confirm it returns a bool without error.
-        result = emb.available()
-        assert isinstance(result, bool)
+    def test_available_returns_bool(self, monkeypatch):
+        # #4489: the bool contract, with the loader stubbed (never the real model).
+        monkeypatch.delenv("FORUM_NO_EMBEDDINGS", raising=False)
+        monkeypatch.setattr(emb, "_get_model", lambda: object())
+        assert emb.available() is True
+        monkeypatch.setattr(emb, "_get_model", lambda: None)
+        assert emb.available() is False
 
 
 # ---------------------------------------------------------------------------
@@ -572,11 +575,16 @@ class TestEmbedOnWriteEndpoint:
         """If encoder raises, the post/thread write still succeeds."""
         monkeypatch.delenv("FORUM_NO_EMBEDDINGS", raising=False)
 
-        # Patch emb.encode to raise
+        # Patch emb.encode to raise. #4489: patch the module object the SERVER
+        # holds (a string path resolves via sys.modules, which another test file
+        # replaces), and make create_app's warm_model() a no-op so no test
+        # reaches the real loader.
+        from forum import server as _server
         monkeypatch.setattr(
-            "forum.embeddings.encode",
+            _server.emb_mod, "encode",
             lambda text: (_ for _ in ()).throw(RuntimeError("simulated encode failure")),
         )
+        monkeypatch.setattr(_server.emb_mod, "warm_model", lambda: None)
 
         from forum.server import create_app
         db_path = str(tmp_path / "test_raise.db")
@@ -615,7 +623,14 @@ class TestEmbedOnWriteEndpoint:
                 return None
             return captured_vec
 
-        monkeypatch.setattr("forum.embeddings.encode", fake_encode)
+        # #4489: patch the module object the SERVER holds. The old string path
+        # "forum.embeddings.encode" resolves via sys.modules, which
+        # test_embeddings_offline_load replaces; in a full run the fake then
+        # landed on a module the server never calls, and the test passed only
+        # when the REAL model loaded from a warm cache.
+        from forum import server as _server
+        monkeypatch.setattr(_server.emb_mod, "encode", fake_encode)
+        monkeypatch.setattr(_server.emb_mod, "warm_model", lambda: None)
 
         from forum.server import create_app
         db_path = str(tmp_path / "test_embed.db")
