@@ -22,14 +22,35 @@
 #     $ENGRAM_HOME/.deployed-version  install version marker
 #     host CLI registration           (claude plugin marketplace remove / codex plugin remove)
 #
+#   ALSO REMOVED, each only when it is provably THIS home's install artifact (#4446, files and links;
+#   anything else is left and named in the "Files and links" summary):
+#     $ENGRAM_HOME/tools, $ENGRAM_HOME/hooks, ~/.local/bin/engram-viz-setup
+#                                     only a symlink whose target lies under $ENGRAM_HOME/marketplace/
+#                                     (a dangling one too); the link is removed, never its target
+#     $CODEX_HOME/agents/<name>.toml  --target codex only: the names in the plugin's agents dir (read
+#                                     before the tree goes); with the tree already gone, engram-*.toml
+#                                     files holding the installer's exact
+#                                     [plugins."engram@engram-local".mcp_servers.engram] line
+#     ~/.claude/plugins/cache/engram-local/
+#                                     --target claude-code only, after the CLI remove, and only when
+#                                     known_marketplaces.json is absent or no longer lists engram-local
+#     $HOME/.engram/venv              only with --purge-venv (shared by every home on the account)
+#
 #   PRESERVED:
 #     $ENGRAM_HOME/knowledge.db       your entire ENGRAM graph
 #     $ENGRAM_HOME/history/           awake-state milestone log
 #     $ENGRAM_HOME/diary/             private diary entries
 #     $ENGRAM_HOME/warm-briefing.md   relational context letter
 #     $ENGRAM_HOME/config.json        agent configuration
-#     $HOME/.engram/venv/              Python environment
+#     $ENGRAM_HOME/seed-manifest.json, first-run-pending, codex-compact-prompt.md, install-logs/,
+#     knowledge.db.setup.lockdir/     tied to the kept graph (named in the summary)
+#     $HOME/.engram/venv/             Python environment (unless --purge-venv)
 #     ~/.claude/CLAUDE.md             agent identity configuration
+#     cleanupPeriodDays in ~/.claude/settings.json
+#                                     KEPT and named, never written (B3): the installer asks the user
+#                                     about retention and offers 36500, so the value may be their own
+#                                     choice, and removing the key would let Claude Code delete old
+#                                     transcripts. Remove it by hand for Claude Code's default.
 #
 #   RESTORED (only if a pre-engram backup exists, #4440):
 #     ~/.claude/CLAUDE.md.pre-engram  -> ~/.claude/CLAUDE.md   (--target claude-code)
@@ -43,7 +64,7 @@
 #
 # USAGE:
 #   bash tools/uninstall-local-marketplace.sh [--help] [--dry-run]
-#       [--skip-cli] [--include-viz] [--target <claude-code|codex>]
+#       [--skip-cli] [--include-viz] [--purge-venv] [--target <claude-code|codex>]
 #
 # OPTIONS:
 #   --help        Show this help and exit.
@@ -54,6 +75,12 @@
 #   --include-viz Also stop and remove the viz units (engram-viz-user.service,
 #                 engram-workbench-user.service, com.engram.viz-server). They carry no
 #                 home (a fixed name on one account), so by default they are left alone.
+#   --purge-venv  Also remove $HOME/.engram/venv. That venv does not depend on ENGRAM_HOME, so every
+#                 home on the account shares it: refused (and named) when the service step left
+#                 another home's unit, when it could not check other homes' units (no home key, no
+#                 service manager, unsupported OS), or when the venv is a symlink. A home with no
+#                 service unit (daemons only hook-started) cannot be detected: the flag is your
+#                 statement that no other ENGRAM home on this account uses the venv.
 #   --target T    Host target: claude-code (default) or codex.
 #
 # ENGRAM_UNINSTALL_TERM_WAIT_S (default 10): seconds to wait for a SIGTERMed daemon to exit.
@@ -87,7 +114,7 @@ die()  { printf '[uninstall-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'EOF'
 Usage: bash tools/uninstall-local-marketplace.sh [--help] [--dry-run]
-    [--skip-cli] [--include-viz] [--target <claude-code|codex>]
+    [--skip-cli] [--include-viz] [--purge-venv] [--target <claude-code|codex>]
 
 Stops and removes this home's services and daemons, then removes the ENGRAM plugin
 registration and marketplace tree.
@@ -98,7 +125,10 @@ Options:
   --dry-run     Print what would be done without making any changes.
   --skip-cli    Skip host CLI unregistration (remove marketplace tree only).
   --include-viz Also stop and remove the (shared, not per-home) viz units.
-  --target T    claude-code (default) or codex.
+  --purge-venv  Also remove $HOME/.engram/venv (shared by every home on this account). Refused when
+                other homes' service units could not be checked. A home with no service unit cannot be
+                detected: the flag is your statement that no other home on this account uses it.
+  --target T   claude-code (default) or codex.
 
 To reinstall after uninstalling:
   bash tools/install-local-marketplace.sh
@@ -111,6 +141,7 @@ EOF
 DRY_RUN=0
 SKIP_CLI=0
 INCLUDE_VIZ=0
+PURGE_VENV=0
 TARGET="claude-code"
 
 while [[ $# -gt 0 ]]; do
@@ -119,6 +150,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)    DRY_RUN=1; shift ;;
     --skip-cli)   SKIP_CLI=1; shift ;;
     --include-viz) INCLUDE_VIZ=1; shift ;;
+    --purge-venv) PURGE_VENV=1; shift ;;
     --target)
       [[ $# -ge 2 ]] || die "--target requires a value: claude-code or codex"
       TARGET="$2"; shift 2 ;;
@@ -195,6 +227,15 @@ restore_identity_files() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SVC_SUMMARY=""
 SVC_NEED_RELOAD=0
+# Set to 1 when the service step left a unit that is, or may be, ANOTHER home's (the 2b --purge-venv
+# refusal reads it: the venv is $HOME/.engram/venv for every home on the account).
+SVC_FOREIGN=0
+# Set to 1 only when the service step really looked at other homes' units: it had a home key, a service
+# manager (launchctl / systemctl) on a supported OS, and ran the other-home keyed scan. Otherwise
+# SVC_SCAN_MISSING says which part was missing. --purge-venv refuses unless this is 1: not having looked
+# is not the same as having found nothing.
+SVC_SCAN_COMPLETE=0
+SVC_SCAN_MISSING=""
 
 svc_note() { SVC_SUMMARY="${SVC_SUMMARY}   $*"$'\n'; }
 svc_left() { # <name> <reason>
@@ -274,10 +315,12 @@ _svc_mac_one() {
       jobhome="$(_plist_string ENGRAM_HOME "$plist" || true)"
     fi
     if [[ -z "$jobhome" ]]; then
+      SVC_FOREIGN=1
       svc_left "$label" "could not read its ENGRAM_HOME"
       return 0
     fi
     if ! _svc_same_home "$jobhome"; then
+      SVC_FOREIGN=1
       svc_left "$label" "belongs to ENGRAM_HOME=$jobhome, not this home"
       return 0
     fi
@@ -334,10 +377,12 @@ _svc_linux_one() {
   else
     jobhome="$(sed -n 's/^Environment=ENGRAM_HOME=//p' "$file" | head -n 1 || true)"
     if [[ -z "$jobhome" ]]; then
+      SVC_FOREIGN=1
       svc_left "$unit" "could not read its ENGRAM_HOME"
       return 0
     fi
     if ! _svc_same_home "$jobhome"; then
+      SVC_FOREIGN=1
       svc_left "$unit" "belongs to ENGRAM_HOME=$jobhome, not this home"
       return 0
     fi
@@ -361,6 +406,27 @@ _svc_linux_one() {
   SVC_NEED_RELOAD=1
 }
 
+# _svc_unit_dir_lookable <dir>: 0 when scanning <dir> for other homes' units really looks at it. A
+# directory that does not exist is a genuine empty scan (no unit can be there). A directory that exists
+# but cannot be listed or entered, a path that is not a directory (a file, a dangling link), or a missing
+# directory whose nearest existing ancestor cannot be searched, would make the glob return its literal
+# pattern: that reads as "nothing found" without having looked. Then this returns 1 and names the directory.
+_svc_unit_dir_lookable() {
+  local d="$1" p="$1"
+  while [[ ! -e "$p" && ! -L "$p" && "$p" != "/" && "$p" != "." ]]; do
+    p="$(dirname "$p")"
+  done
+  if [[ "$p" == "$d" ]]; then
+    [[ -d "$d" && -r "$d" && -x "$d" ]] && return 0
+  else
+    # $d is not there: genuine, provided the nearest existing ancestor is a directory we can search
+    [[ -d "$p" && -x "$p" ]] && return 0
+  fi
+  warn "the unit directory $d could not be read — other homes' units were not checked."
+  SVC_SCAN_MISSING="${SVC_SCAN_MISSING:+$SVC_SCAN_MISSING; }the unit directory $d could not be read"
+  return 1
+}
+
 # _svc_other_keyed <own1> <own2> <suffix> <file>...: name the keyed units of OTHER homes (read-only).
 _svc_other_keyed() {
   local own1="$1" own2="$2" suffix="$3" f n
@@ -369,6 +435,7 @@ _svc_other_keyed() {
     [[ -e "$f" || -L "$f" ]] || continue
     n="$(basename "$f")"; n="${n%"$suffix"}"
     if [[ "$n" != "$own1" && "$n" != "$own2" ]]; then
+      SVC_FOREIGN=1
       svc_left "$(basename "$f")" "keyed for a different home, not this one"
     fi
   done
@@ -467,20 +534,27 @@ uninstall_services() {
   else
     key=""
     warn "cannot key unit names on $ENGRAM_HOME (it must exist); only the old fixed-name units are checked."
+    SVC_SCAN_MISSING="the home key could not be computed"
   fi
   case "$os" in
     Darwin)
       if ! command -v launchctl >/dev/null 2>&1; then
         warn "'launchctl' not found — LaunchAgents were not checked."
+        SVC_SCAN_MISSING="${SVC_SCAN_MISSING:+$SVC_SCAN_MISSING; }the service manager launchctl is missing"
       else
         AGENTS_DIR="$HOME/Library/LaunchAgents"
         if [[ -n "$key" ]]; then
+          # This home's own units are read by name (search permission is enough): never behind the
+          # readability guard below, which only protects the scan of OTHER homes' units.
           s_name="com.engram.surface-daemon.$key"
           o_name="com.engram.engramd-owner.$key"
           _svc_mac_one "$s_name" home
           _svc_mac_one "$o_name" home
+        fi
+        if [[ -n "$key" ]] && _svc_unit_dir_lookable "$AGENTS_DIR"; then
           _svc_other_keyed "$s_name" "$o_name" ".plist" \
             "$AGENTS_DIR/$(_uninst_legacy_surface_label)".*.plist "$AGENTS_DIR"/com.engram.engramd-owner.*.plist
+          SVC_SCAN_COMPLETE=1
         fi
         _svc_mac_one "$(_uninst_legacy_surface_label)" home
         _svc_mac_one "com.engram.viz-server" viz
@@ -493,15 +567,20 @@ uninstall_services() {
     Linux)
       if ! command -v systemctl >/dev/null 2>&1; then
         warn "'systemctl' not found — systemd user units were not checked."
+        SVC_SCAN_MISSING="${SVC_SCAN_MISSING:+$SVC_SCAN_MISSING; }the service manager systemctl is missing"
       else
         UNIT_DIR="$HOME/.config/systemd/user"
         if [[ -n "$key" ]]; then
+          # This home's own units: see the macOS branch; never behind the readability guard.
           s_name="engram-surface-daemon-$key.service"
           o_name="engramd-owner-$key.service"
           _svc_linux_one "$s_name" home
           _svc_linux_one "$o_name" home
+        fi
+        if [[ -n "$key" ]] && _svc_unit_dir_lookable "$UNIT_DIR"; then
           _svc_other_keyed "$s_name" "$o_name" "" \
             "$UNIT_DIR"/engram-surface-daemon-*.service "$UNIT_DIR"/engramd-owner-*.service
+          SVC_SCAN_COMPLETE=1
         fi
         _svc_linux_one "$(_uninst_legacy_surface_unit)" home
         _svc_linux_one "engram-viz-user.service" viz
@@ -515,7 +594,9 @@ uninstall_services() {
           fi
         fi
       fi ;;
-    *) log "Unsupported OS '$os' — no services or LaunchAgents to check." ;;
+    *)
+      log "Unsupported OS '$os' — no services or LaunchAgents to check."
+      SVC_SCAN_MISSING="${SVC_SCAN_MISSING:+$SVC_SCAN_MISSING; }unsupported OS '$os'" ;;
   esac
   uninstall_hook_daemons
 }
@@ -530,6 +611,317 @@ print_services_summary() {
     while IFS= read -r line; do
       [[ -n "$line" ]] && log "$line"
     done <<< "$SVC_SUMMARY"
+  fi
+  return 0
+}
+
+# ── Files and links of THIS home (#4446 step 2b, sections B and C) ───────────────
+# Each row is removed only when it is provably this home's install artifact; anything else is left and
+# named. One line per row that is present; absent rows print nothing. Nothing in $ENGRAM_HOME other
+# than C3/C4 is touched. Rows: docs/internal/4446-install-artifacts.md.
+FILE_SUMMARY=""
+
+files_note() { FILE_SUMMARY="${FILE_SUMMARY}   $*"$'\n'; }
+files_done() { # <row> <what> [note]: the removal already happened (or is only announced under --dry-run)
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "(dry-run) Would remove: $2 ($1${3:+; $3})"
+    files_note "(dry-run) would remove: $2 ($1${3:+; $3})"
+  else
+    log "Removed: $2 ($1${3:+; $3})"
+    files_note "Removed: $2 ($1${3:+; $3})"
+  fi
+}
+files_left() { # <row> <what> <reason>
+  log "Left alone: $2 ($1: $3)"
+  files_note "Left alone: $2 ($1: $3)"
+}
+files_kept() { # <row> <what> <reason>
+  log "Kept: $2 ($1: $3)"
+  files_note "Kept: $2 ($1: $3)"
+}
+_files_keep_if_present() { # <row> <path> <reason>
+  [[ -e "$2" || -L "$2" ]] || return 0
+  files_kept "$1" "$2" "$3"
+}
+
+# _uninst_resolve_into <path> <varname>: the physical path of the deepest EXISTING ancestor of <path>
+# plus the remaining (possibly dangling) components, so a dangling link target still resolves the way
+# an existing one would (macOS /var -> /private/var included). Fails (var empty) on a ".." component:
+# a lexical prefix test cannot be trusted across one.
+_uninst_resolve_into() {
+  local LC_ALL=C p="${1-}" _name="${2-}" rest="" phys base n=0
+  printf -v "$_name" '%s' ""
+  case "/$p/" in */../*) return 1 ;; esac
+  while [[ "${#p}" -gt 1 && "$p" == */ ]]; do p="${p%/}"; done
+  [[ "$p" == /* ]] || return 1
+  while [[ "$p" != "/" && ! -d "$p" && $n -lt 256 ]]; do
+    base="${p##*/}"
+    rest="/$base$rest"
+    p="${p%/*}"
+    [[ -n "$p" ]] || p="/"
+    n=$((n + 1))
+  done
+  phys="$(cd "$p" 2>/dev/null && pwd -P)" || return 1
+  [[ "$phys" == "/" ]] && phys=""
+  printf -v "$_name" '%s' "$phys$rest"
+}
+
+# _files_link_into_marketplace <path>: succeeds only when <path> is a symlink whose target lies strictly
+# under THIS home's marketplace/ (a "/" boundary, so a sibling home like <home>-work is not matched). The
+# target need not exist. On failure LINK_WHY holds the reason. Never follows the link to anything.
+LINK_WHY=""
+_files_link_into_marketplace() {
+  local p="$1" t m r
+  LINK_WHY=""
+  if [[ ! -L "$p" ]]; then
+    if [[ -d "$p" ]]; then LINK_WHY="a real directory, not a symlink"; else LINK_WHY="not a symlink"; fi
+    return 1
+  fi
+  t="$(readlink "$p" 2>/dev/null || true)"
+  if [[ -z "$t" ]]; then LINK_WHY="cannot read the link target"; return 1; fi
+  case "$t" in /*) ;; *) t="$(dirname "$p")/$t" ;; esac
+  if ! _uninst_resolve_into "$ENGRAM_HOME/marketplace" m; then
+    LINK_WHY="cannot resolve this home's marketplace path"; return 1
+  fi
+  if ! _uninst_resolve_into "$t" r; then
+    LINK_WHY="its target ($t) has a '..' part or cannot be resolved, so it is not provably inside this home's marketplace"
+    return 1
+  fi
+  if [[ "$r" == "$m"/* ]]; then return 0; fi
+  LINK_WHY="symlink to $t, not inside this home's marketplace ($m)"
+  return 1
+}
+
+_files_one_link() { # <row> <path>
+  local row="$1" p="$2"
+  [[ -e "$p" || -L "$p" ]] || return 0
+  if ! _files_link_into_marketplace "$p"; then
+    files_left "$row" "$p" "$LINK_WHY"
+    return 0
+  fi
+  if [[ $DRY_RUN -eq 0 ]]; then
+    rm -f -- "$p" || { files_left "$row" "$p" "could not remove the link"; return 0; }
+  fi
+  files_done "$row" "$p" "symlink only; its target was not touched"
+}
+
+# B15: Codex custom-agent copies. The list is read from the plugin tree, so this must run BEFORE it goes.
+_files_agent_marker='[plugins."engram@engram-local".mcp_servers.engram]'
+uninstall_codex_agents() {
+  [[ "$TARGET" == "codex" ]] || return 0
+  local adir="$CODEX_HOME/agents" pdir="$MARKETPLACE_ROOT/plugins/engram/agents" names="" mode f n p
+  [[ -d "$adir" ]] || return 0
+  if [[ -d "$pdir" ]]; then
+    mode=list
+    for f in "$pdir"/*.toml; do
+      [[ -e "$f" ]] || continue
+      names="${names}${f##*/}"$'\n'
+    done
+    # (a) tree present: exactly the names the plugin ships.
+    while IFS= read -r n; do
+      [[ -n "$n" ]] || continue
+      p="$adir/$n"
+      [[ -e "$p" || -L "$p" ]] || continue
+      if [[ -L "$p" ]]; then
+        files_left B15 "$p" "a symlink, not a regular file"
+      elif [[ ! -f "$p" ]]; then
+        files_left B15 "$p" "not a regular file"
+      else
+        [[ $DRY_RUN -eq 1 ]] || rm -f -- "$p" || { files_left B15 "$p" "could not remove it"; continue; }
+        files_done B15 "$p" "named in the plugin's agents dir"
+      fi
+    done <<< "$names"
+  else
+    mode=marker
+  fi
+  for p in "$adir"/engram-*.toml; do
+    [[ -e "$p" || -L "$p" ]] || continue
+    n="${p##*/}"
+    if [[ "$mode" == "list" ]]; then
+      # already handled above when it is in the list; anything else is not provably this install's
+      if printf '%s' "$names" | grep -Fxq -- "$n"; then continue; fi
+      files_left B15 "$p" "not in this install's plugin agents list"
+      continue
+    fi
+    # (b) tree already absent: the installer's rewrite leaves this exact line in the files it wrote.
+    if [[ -L "$p" ]]; then
+      files_left B15 "$p" "a symlink, not a regular file"
+    elif [[ ! -f "$p" ]]; then
+      files_left B15 "$p" "not a regular file"
+    elif grep -Fxq -- "$_files_agent_marker" "$p" 2>/dev/null; then
+      [[ $DRY_RUN -eq 1 ]] || rm -f -- "$p" || { files_left B15 "$p" "could not remove it"; continue; }
+      files_done B15 "$p" "carries the installer's engram@engram-local line"
+    else
+      files_left B15 "$p" "no exact $_files_agent_marker line, so not provably this install's"
+    fi
+  done
+}
+
+# python3 for the two JSON checks (a plain system python is enough; no venv needed).
+_files_python() { command -v python3 || true; }
+
+# B8: the host CLI's orphaned plugin cache. Runs AFTER the CLI remove step.
+uninstall_plugin_cache() {
+  [[ "$TARGET" == "claude-code" ]] || return 0
+  local d="$CLAUDE_HOME/plugins/cache/engram-local" km="$CLAUDE_HOME/plugins/known_marketplaces.json" py st
+  [[ -e "$d" || -L "$d" ]] || return 0
+  if [[ -L "$d" ]]; then files_left B8 "$d" "a symlink; not followed"; return 0; fi
+  if [[ ! -d "$d" ]]; then files_left B8 "$d" "not a directory"; return 0; fi
+  py="$(_files_python)"
+  if [[ -z "$py" ]]; then files_left B8 "$d" "no python3 to read $km"; return 0; fi
+  st="$("$py" -I -c '
+import json, os, sys
+p = sys.argv[1]
+if not os.path.lexists(p):
+    print("absent")
+    sys.exit(0)
+try:
+    with open(p, encoding="utf-8") as f:
+        d = json.load(f)
+except Exception:
+    print("unparsable")
+    sys.exit(0)
+if not isinstance(d, dict):
+    print("unparsable")
+elif "engram-local" in d:
+    print("listed")
+else:
+    print("clean")
+' "$km" 2>/dev/null || true)"
+  case "$st" in
+    absent|clean)
+      if [[ $DRY_RUN -eq 0 ]]; then
+        rm -rf -- "$d" || { files_left B8 "$d" "could not remove it"; return 0; }
+      fi
+      if [[ "$st" == "absent" ]]; then
+        files_done B8 "$d" "known_marketplaces.json is absent"
+      else
+        files_done B8 "$d" "known_marketplaces.json no longer lists engram-local"
+      fi ;;
+    listed)
+      if [[ $SKIP_CLI -eq 1 ]]; then
+        files_left B8 "$d" "$km still lists engram-local and --skip-cli was passed"
+      elif [[ $DRY_RUN -eq 1 ]]; then
+        files_left B8 "$d" "(dry-run) removed only if the CLI remove step clears engram-local from $km; it is still listed now"
+      else
+        files_left B8 "$d" "$km still lists engram-local (the host CLI remove did not clear it)"
+      fi ;;
+    *) files_left B8 "$d" "$km is unparsable (or not a JSON object), so engram-local's registration cannot be checked" ;;
+  esac
+}
+
+# B3: cleanupPeriodDays is KEPT and named, never written. Since the installer asks the user about retention
+# and offers 36500, that value cannot be told apart from the user's own choice, and removing the key would
+# let Claude Code start deleting transcripts older than its default. Detection is read-only: a small
+# `python3 -I -c` that loads the file and exits 0 (top-level key present), 1 (absent; a non-object has no
+# top-level key), 2 (unparsable). No python3, or unparsable: the same Kept line, "(could not be read)".
+uninstall_cleanup_period() {
+  [[ "$TARGET" == "claude-code" ]] || return 0
+  local f="$CLAUDE_HOME/settings.json" py rc=0 note="may be your own choice; removing it would let Claude Code delete old transcripts; remove it by hand if you want Claude Code's default"
+  [[ -e "$f" || -L "$f" ]] || return 0
+  py="$(_files_python)"
+  if [[ -z "$py" ]]; then
+    files_kept B3 "$f cleanupPeriodDays" "$note (could not be read: no python3)"
+    return 0
+  fi
+  "$py" -I -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(2)
+sys.exit(0 if isinstance(data, dict) and "cleanupPeriodDays" in data else 1)
+' "$f" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) files_kept B3 "$f cleanupPeriodDays" "$note" ;;
+    1) : ;;
+    *) files_kept B3 "$f cleanupPeriodDays" "$note (could not be read)" ;;
+  esac
+}
+
+# C6: the shared venv. Opt-in only; refused when it may serve another home.
+uninstall_venv() {
+  local v="$HOME/.engram/venv"
+  [[ -e "$v" || -L "$v" ]] || return 0
+  if [[ $PURGE_VENV -eq 0 ]]; then
+    files_kept C6 "$v" "shared by every home on this account; pass --purge-venv to remove"
+    return 0
+  fi
+  if [[ -L "$v" ]]; then files_left C6 "$v" "a symlink; not followed"; return 0; fi
+  if [[ $SVC_SCAN_COMPLETE -ne 1 ]]; then
+    files_left C6 "$v" "could not check other homes' service units (${SVC_SCAN_MISSING:-the service step did not run}), and this venv is shared by every home on the account"
+    return 0
+  fi
+  if [[ $SVC_FOREIGN -eq 1 ]]; then
+    files_left C6 "$v" "another home's service unit was left alone above, and this venv is shared by every home on the account"
+    return 0
+  fi
+  if [[ ! -d "$v" ]]; then files_left C6 "$v" "not a directory"; return 0; fi
+  if [[ $DRY_RUN -eq 0 ]]; then
+    rm -rf -- "$v" || { files_left C6 "$v" "could not remove it"; return 0; }
+  fi
+  files_done C6 "$v" "--purge-venv: no other home's unit was found, but a home with no service unit cannot be detected; the flag is your statement that no other ENGRAM home on this account uses it"
+}
+
+# Rows kept on purpose, or whose removal by the host CLI is unmeasured: named, never touched.
+files_keep_notes() {
+  local tied="tied to the kept graph; bootstrap writes it only on a fresh DB, so a reinstall over kept data would not recreate it"
+  local unm="not removed: host-CLI behaviour unmeasured" cc="$CODEX_HOME/plugins/cache/engram-local" f what hf
+  _files_keep_if_present C10 "$ENGRAM_HOME/seed-manifest.json" "$tied"
+  _files_keep_if_present C11 "$ENGRAM_HOME/first-run-pending" "$tied"
+  _files_keep_if_present C12 "$ENGRAM_HOME/codex-compact-prompt.md" "$tied"
+  _files_keep_if_present C13 "$ENGRAM_HOME/install-logs" "failure logs only, tied to the kept data home"
+  _files_keep_if_present C15 "$ENGRAM_HOME/knowledge.db.setup.lockdir" "a flock lock directory, inert when left; deleting it while a process holds it is the risk"
+  [[ -e "$CLAUDE_HOME/plugins/data/engram-engram-local" || -L "$CLAUDE_HOME/plugins/data/engram-engram-local" ]] \
+    && files_left B9 "$CLAUDE_HOME/plugins/data/engram-engram-local" "$unm"
+  what=""
+  [[ -e "$cc" || -L "$cc" ]] && what="$cc"
+  if [[ -f "$CODEX_HOME/config.toml" ]] && grep -Fq 'engram@engram-local' "$CODEX_HOME/config.toml" 2>/dev/null; then
+    what="${what:+$what and }the plugin stanza in $CODEX_HOME/config.toml"
+  fi
+  [[ -z "$what" ]] || files_left B12 "$what" "$unm"
+  for f in "$cc"/engram/*-dev.*; do
+    [[ -L "$f" ]] || continue
+    files_left B13 "$f (and any others like it)" "$unm"
+    break
+  done
+  for f in "$cc"/engram/*/.mcp.json; do
+    [[ -e "$f" ]] || continue
+    files_left B14 "$f (and any others like it)" "$unm"
+    break
+  done
+  hf="${HF_HUB_CACHE:-${HF_HOME:+$HF_HOME/hub}}"
+  hf="${hf:-$HOME/.cache/huggingface/hub}/models--sentence-transformers--all-MiniLM-L6-v2"
+  [[ -e "$hf" || -L "$hf" ]] && files_left B17 "$hf" "shared model cache other software may use; untouched"
+  [[ -e "$HOME/.local/bin/claude" || -L "$HOME/.local/bin/claude" ]] \
+    && files_left B18 "$HOME/.local/bin/claude" "Claude Code itself, third-party software; untouched"
+  return 0
+}
+
+# All file rows, in the order the contract needs: B15 reads the plugin tree (so before it goes), B8 and B3
+# come after the host CLI remove step, C3/C4/B16 test only the link target string.
+uninstall_files() {
+  _files_one_link C3 "$ENGRAM_HOME/tools"
+  _files_one_link C4 "$ENGRAM_HOME/hooks"
+  _files_one_link B16 "$HOME/.local/bin/engram-viz-setup"
+  uninstall_codex_agents
+  uninstall_plugin_cache
+  uninstall_cleanup_period
+  uninstall_venv
+  files_keep_notes
+}
+
+print_files_summary() {
+  local line
+  log " "
+  log " Files and links:"
+  if [[ -z "$FILE_SUMMARY" ]]; then
+    log "   (none found)"
+  else
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && log "$line"
+    done <<< "$FILE_SUMMARY"
   fi
   return 0
 }
@@ -553,7 +945,10 @@ if [[ ! -d "$MARKETPLACE_ROOT" && ! -f "$VERSION_MARKER" ]]; then
     warn "  claude plugin marketplace remove engram-local"
     warn "  (or from inside Claude Code: /plugin disable engram)"
   fi
+  # The file rows (#4446 2b) do not depend on the marketplace tree either; B15 uses its marker-line test here.
+  uninstall_files
   print_services_summary
+  print_files_summary
   exit 0
 fi
 
@@ -595,6 +990,10 @@ else
   fi
 fi
 
+# ── 1b. Files and links of this home (#4446 2b). After the CLI remove (B8, B3), before the tree goes
+#        (B15 reads the plugin's agents list from it) ──────────────────────────────────────────────
+uninstall_files
+
 # ── 2. Remove marketplace tree ──────────────────────────────────────────────
 REMOVED_MARKETPLACE=0
 if [[ -d "$MARKETPLACE_ROOT" ]]; then
@@ -626,6 +1025,7 @@ restore_identity_files
 log ""
 log "═══════════════════════════════════════════════════════════════════"
 print_services_summary
+print_files_summary
 if [[ $DRY_RUN -eq 1 ]]; then
   log " Dry run complete. Run without --dry-run to apply the changes."
 else
@@ -641,7 +1041,7 @@ else
   log "   $ENGRAM_HOME/history/      — session history"
   log "   $ENGRAM_HOME/diary/        — diary entries"
   log "   $ENGRAM_HOME/config.json   — configuration"
-  log "   $HOME/.engram/venv/         — Python environment"
+  log "   $HOME/.engram/venv/         — Python environment (removed only with --purge-venv; see Files and links)"
   log "   ~/.claude/CLAUDE.md        — agent identity"
   log " "
   log " To reinstall: bash tools/install-local-marketplace.sh"

@@ -94,6 +94,10 @@ SH_ALLOW = {
         "C: nearest EXISTING ancestor of a not-yet-existing home path, not a runtime-file lookup",
     "tools/setup-surface-daemon-service.sh:_physical_path":
         "C: symlink resolution (readlink chain, capped at 40), not a runtime-file lookup",
+    "tools/uninstall-local-marketplace.sh:_svc_unit_dir_lookable":
+        "C: nearest EXISTING ancestor of the unit directory (stops at / or .), not a runtime-file lookup",
+    "tools/uninstall-local-marketplace.sh:_uninst_resolve_into":
+        "C: path canonicaliser for a link target (deepest existing parent, capped at 256), not a runtime-file lookup",
 }
 
 

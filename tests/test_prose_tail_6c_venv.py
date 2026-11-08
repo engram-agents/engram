@@ -42,7 +42,7 @@ FIXED_LINES = {
     ],
     "tools/engram-fix-git-backup.sh": ['if [[ -x "$HOME/.engram/venv/bin/python" ]]; then', 'PYTHON_BIN="$HOME/.engram/venv/bin/python"'],
     "tools/install-local-marketplace.sh": ['_ENGRAM_VENV_PY="$HOME/.engram/venv/bin/python"', 'log "Provisioning venv at $HOME/.engram/venv (tier: $_eff_tier)"'],
-    "tools/uninstall-local-marketplace.sh": ['log "   $HOME/.engram/venv/         — Python environment"'],
+    "tools/uninstall-local-marketplace.sh": ['log "   $HOME/.engram/venv/         — Python environment (removed only with --purge-venv; see Files and links)"'],
     "tools/ghpr.sh": ['PYTHON="${GHPR_PYTHON:-$HOME/.engram/venv/bin/python}"'],
     "tools/run-all-tests.sh": [
         "#      ($HOME/.engram/venv) which has sqlite-vec, anthropic, etc.",
