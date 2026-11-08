@@ -76,7 +76,9 @@ It states that it preserves `$ENGRAM_HOME` data, the venv and `~/.claude/CLAUDE.
   - **On macOS**, A3 keeps a true `PathState`, A6 restarts on any unsuccessful exit (throttled to 60 s), and A10 has unconditional `KeepAlive`. This is from the plist text and was not run.
   - **At login**, the enable symlinks (A2, A5, A9) start the units again, so step 2 must remove them as well as the unit files.
 
-The **legacy fixed-name units** `engram-surface-daemon.service` and `com.engram.surface-daemon` (before #4305) are removed by the setup script itself when it installs the keyed one for the same home (lines 685-700, 811-839). Uninstall does not touch them either.
+The **legacy fixed-name units** `engram-surface-daemon.service` and `com.engram.surface-daemon` (before #4305) are removed by the setup script itself when it installs the keyed one for the same home (lines 685-700, 811-839). Uninstall does not touch them either. They are a live case in the field: the colleague review of #4448 found the unkeyed `com.engram.surface-daemon` label loaded on a Mac, for another account.
+
+**On a headless Mac** (no GUI session), `launchctl print gui/<uid>` answers "Domain does not support specified action". A3 and A6 can then sit on disk **without ever being loaded**, while the daemons run hook-started (see D). Step 2 needs a "plist present, not loaded" cell for its bootout path. This is from the colleague's seat, read-only, n=1.
 
 ## B. Files and links outside `$ENGRAM_HOME`
 
@@ -119,6 +121,7 @@ The **legacy fixed-name units** `engram-surface-daemon.service` and `com.engram.
 | C12 | `$ENGRAM_HOME/codex-compact-prompt.md` | `bootstrap.py` (lines 321-323), Codex target | install | **NOT** |
 | C13 | `$ENGRAM_HOME/install-logs/<UTC>/`, only on a failed `install.sh` run | install.sh `_on_exit` (lines 170-179, 398) | install record | **NOT** |
 | C14 | `$ENGRAM_HOME/.gitignore`; `$ENGRAM_HOME/.git/` (`git init`, local `user.email`/`user.name`); `.git/hooks/reference-transaction` (the rewrite guard) | The first MCP server start: `engram_core._init_git` and `_install_rewrite_guard` (`engram_core.py` lines 3069-3096, 3118-3142). `install.sh` step 9 triggers it through `install_selfcheck.py`'s `mcp-handshake` (`install_selfcheck.py` lines 29-31), unless a live server holds the ready marker (lines 443-446). Not with `ENGRAM_DISABLE_GIT`. The same start also creates `$ENGRAM_HOME/db-backup/.pending/` (`server.py` lines 8958-8970 → `engram_snapshot_worker.start_worker` → `_pending_dir`, lines 99-102, 593-595) and `$ENGRAM_HOME/logs/sessions/` (`server.py` line 8997 → `engram_log_emitter.Emitter`, lines 118-119); whether they hold files after a handshake is not checked | data history | **NOT** |
+| C15 | `$ENGRAM_HOME/knowledge.db.setup.lockdir/` (a 0700 directory, not removed when the lock is released; the holder pid is written to `holder` inside it) | `engram_core._acquire_db_setup_lock` (`SETUP_LOCK_SUFFIX`, `engram_core.py` lines 578 and 884-901). It is called from `_get_db` (line 6831) on a process's first store setup. On a fresh install the first caller is `bootstrap.py`'s seed graph (install.sh step 6, the same path as C8); otherwise the first MCP server or hook | data-dir lock | **NOT** |
 
 **Fresh-DB condition.** `install.sh` runs `bootstrap.py` only when `knowledge.db` is absent or has 0 nodes (lines 501-515). So the bootstrap rows are written on a fresh install only, and are not refreshed by a re-install: B1, B3, B10, B11, C3, C4, C5, C8, C9, C10, C11, C12.
 
@@ -141,6 +144,8 @@ These paths are named in the unit templates and the two launchers. The running c
 - `knowledge.db.maint.lockdir/`
 - `viz-server.log` and `viz-server.err` (macOS viz)
 
+The pid and socket files above can name **live processes with no unit at all**. The recall daemon and the owner are hook-started when no supervisor is registered (`start-engram-daemon.sh`, `start-engramd-owner.sh`). So stopping only the units in A leaves them running out of `$ENGRAM_HOME/marketplace`. Step 2 must also stop hook-started daemons, found through these files.
+
 ## Out of scope here (not user-install artifacts; named so their absence is a choice)
 
 - `src/forum/deploy/install-forum-service.sh`, which installs the operator's forum service.
@@ -152,11 +157,11 @@ These paths are named in the unit templates and the two launchers. The running c
 
 ## Counts (over the rows above)
 
-- 43 rows in A, B and C: A 11, B 18, C 14.
+- 44 rows in A, B and C: A 11, B 18, C 15.
 - Uninstall removes 2 of them for certain (C1, C2).
 - 9 rows depend on host-CLI behaviour that is unmeasured: B4-B9 for Claude Code, B12-B14 for Codex.
 - 5 rows are kept on purpose by uninstall's own header or by design: B1, C6, C7, C8, C9.
-- The other 27 are not removed today, including every service in A.
+- The other 28 are not removed today, including every service in A.
 - These counts come from `grep` over the table's own rows, not from adding them up by hand.
 
 ## Revision history
@@ -174,3 +179,8 @@ These paths are named in the unit templates and the two launchers. The running c
   - Corrected C14's self-check line range.
   - Reconciled A4's exit-4 clause.
   - Bounded the no-self-stop headline.
+- Fourth version, after the merge of #4448 (b0f21c14), folding the colleague review's three riders (#4446 comment 6715576159):
+  - Added C15, the setup lockdir.
+  - Noted that the hook-started daemons have no unit.
+  - Added the headless-Mac "not loaded" case.
+  - Recorded that the legacy label is live in the field.
