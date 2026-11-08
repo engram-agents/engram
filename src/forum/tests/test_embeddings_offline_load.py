@@ -178,12 +178,21 @@ class TestCacheMissFallsBackToOnlineDownload:
         assert model is None
 
 
+def _forget_forum_embeddings(monkeypatch):
+    """#4502: make the next `import forum.embeddings` a genuine fresh import,
+    and undo it on teardown. Both places the module lives are recorded: the
+    sys.modules entry and the `embeddings` attribute on the `forum` package,
+    so afterwards both are the original module object again (the one
+    forum.server.emb_mod holds), not the fresh one."""
+    forum_pkg = sys.modules["forum"]
+    monkeypatch.setattr(forum_pkg, "embeddings", forum_pkg.embeddings)
+    monkeypatch.delitem(sys.modules, "forum.embeddings", raising=False)
+
+
 class TestHfHubEtagTimeoutEnvSet:
     def test_hf_hub_etag_timeout_env_set(self, monkeypatch):
         monkeypatch.delenv("HF_HUB_ETAG_TIMEOUT", raising=False)
-        for key in list(sys.modules):
-            if key == "forum.embeddings":
-                del sys.modules[key]
+        _forget_forum_embeddings(monkeypatch)
         import forum.embeddings as fresh_emb  # noqa: F401
         assert os.environ.get("HF_HUB_ETAG_TIMEOUT") == "1", (
             f"expected forum.embeddings import to set HF_HUB_ETAG_TIMEOUT=1 via "
@@ -192,9 +201,7 @@ class TestHfHubEtagTimeoutEnvSet:
 
     def test_hf_hub_etag_timeout_respects_operator_override(self, monkeypatch):
         monkeypatch.setenv("HF_HUB_ETAG_TIMEOUT", "30")
-        for key in list(sys.modules):
-            if key == "forum.embeddings":
-                del sys.modules[key]
+        _forget_forum_embeddings(monkeypatch)
         import forum.embeddings as fresh_emb  # noqa: F401
         assert os.environ.get("HF_HUB_ETAG_TIMEOUT") == "30", (
             "setdefault() must not clobber an operator-set override"
