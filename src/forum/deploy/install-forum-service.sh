@@ -32,7 +32,8 @@
 #                       (no sign, no leading zero). Default: 5002
 #   --admin-user USER   systemd --user account running the service.
 #                       Default: current user ($(whoami))
-#   --group NAME        group that co-admins share (group-writable data).
+#   --group NAME        group that co-admins share (group-READABLE data; no group
+#                       write, #4498/#4499: a hand-off is an owner change, not group write).
 #                       Pass the shared group your forum seats belong to. If
 #                       omitted, the installer REFUSES (exit 2) unless your primary
 #                       group (`id -gn`) is literally `agents` -- it never silently
@@ -711,18 +712,65 @@ APP="$SERVICE_DIR/app"
 VENV="$SERVICE_DIR/.venv"
 PYTHON="$VENV/bin/python"
 
-# Group-writable creations so a counterpart admin in $GROUP can also write data.
-RUN umask 002
+# >>> service-modes
+# No group write anywhere under the service dir (#4498/#4499): the group may READ
+# (co-admins), nobody but the owner writes. Admin hand-off is an explicit owner
+# change (a chown, or a fresh install by the new admin), never group write.
+# Three functions so the mode phase can be run on its own against a scratch tree
+# (src/forum/tests/test_installer_modes_4499.py extracts this block).
+_set_service_modes() {
+  RUN umask 022
+  RUN mkdir -p "$SERVICE_DIR"
+  RUN chgrp "$GROUP" "$SERVICE_DIR" 2>/dev/null || true
+  RUN chmod 2755 "$SERVICE_DIR" 2>/dev/null || true   # setgid: new files inherit $GROUP
+}
+
+# Run AFTER everything is written: takes group write off whatever an earlier install
+# (or a UMask=002 unit) left behind, and pins an existing dm/ to 2700 with no ACL.
+# Symlinks are skipped: a venv's python links always read 777 and chmod would follow them.
+_normalize_service_modes() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  [dry-run] find $SERVICE_DIR -xdev ! -type l -exec chmod g-w {} +"
+    echo "  [dry-run] if $SERVICE_DIR/dm exists: setfacl -b, then chmod 2700"
+    return 0
+  fi
+  [ -d "$SERVICE_DIR" ] || return 0
+  # Best effort: a path owned by someone else cannot be changed by this account; the
+  # assertion below names every such path rather than letting it pass.
+  find "$SERVICE_DIR" -xdev ! -type l -exec chmod g-w {} + 2>/dev/null || true
+  if [ -d "$SERVICE_DIR/dm" ] && [ ! -L "$SERVICE_DIR/dm" ]; then
+    # setfacl -b alone lands 2750 (measured); the chmod is what pins 2700.
+    if command -v setfacl >/dev/null 2>&1; then setfacl -b "$SERVICE_DIR/dm" 2>/dev/null || true; fi
+    chmod 2700 "$SERVICE_DIR/dm" 2>/dev/null || true
+  fi
+}
+
+# The post-install assertion: nothing but symlinks may carry the group-write bit.
+# Prints every offending path to stderr and returns 2. Also fails when find itself
+# could not finish (an uninspected subtree is not a clean one).
+_assert_no_group_write() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  [dry-run] assert: find $SERVICE_DIR -xdev -perm -g+w ! -type l lists nothing"
+    return 0
+  fi
+  local _bad="" _rc=0
+  _bad="$(find "$SERVICE_DIR" -xdev -perm -g+w ! -type l 2>/dev/null)" || _rc=$?
+  if [ -n "$_bad" ] || [ "$_rc" -ne 0 ]; then
+    echo "ERROR: path(s) under $SERVICE_DIR carry the group-write bit after install (#4499):" >&2
+    [ -z "$_bad" ] || printf '  %s\n' "$_bad" >&2
+    [ "$_rc" -eq 0 ] || echo "  (find exited $_rc: part of the tree could not be inspected)" >&2
+    return 2
+  fi
+}
+# <<< service-modes
 
 echo "==> Forum service dir: $SERVICE_DIR (port $PORT, group $GROUP); admin: $ADMIN_USER"
-RUN mkdir -p "$SERVICE_DIR"
-RUN chgrp "$GROUP" "$SERVICE_DIR" 2>/dev/null || true
-RUN chmod 2775 "$SERVICE_DIR" 2>/dev/null || true   # setgid: new files inherit $GROUP
+_set_service_modes
 
 if [ "$DRY_RUN" -eq 0 ]; then
   # Verify the group AND the setgid bit actually took.
   ACT_GRP="$(stat -c '%G' "$SERVICE_DIR" 2>/dev/null || echo '?')"
-  [ "$ACT_GRP" = "$GROUP" ] || echo "    WARN: $SERVICE_DIR group is '$ACT_GRP', not '$GROUP' — a counterpart admin may not be able to write."
+  [ "$ACT_GRP" = "$GROUP" ] || echo "    WARN: $SERVICE_DIR group is '$ACT_GRP', not '$GROUP' — a counterpart admin may not be able to read."
   find "$SERVICE_DIR" -maxdepth 0 -perm -2000 >/dev/null 2>&1 || echo "    WARN: setgid bit not set on $SERVICE_DIR — new files won't inherit group '$GROUP'."
 fi
 
@@ -1228,9 +1276,13 @@ echo "    Other seats on THIS host:       python3 $_FU_TOOL_Q http://localhost:$
 echo "    Seats on ANOTHER host (LAN):    python3 $_FU_TOOL_Q http://<this-host-address>:$PORT"
 # <<< forum-url-step
 
+echo "==> Checking that no path under $SERVICE_DIR carries the group-write bit"
+_normalize_service_modes
+_assert_no_group_write || exit 2
+
 echo "==> Done."
 echo "    Manage: systemctl --user {status,restart,stop} $UNIT  ·  Logs: journalctl --user -u $UNIT -f"
-echo "    Shared data: $SERVICE_DIR/forum.db (group $GROUP, group-writable)"
+echo "    Shared data: $SERVICE_DIR/forum.db (group $GROUP, group-readable; only the owner writes)"
 if [ "$DRY_RUN" -eq 0 ] && [ "$LINGER_OK" -eq 0 ]; then
   echo "    REMAINING STEP for reboot-survival (one-time, needs sudo):  sudo loginctl enable-linger $ADMIN_USER"
 fi
