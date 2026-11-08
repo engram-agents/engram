@@ -12,12 +12,16 @@ This tool classifies each worktree and removes the safely-finished ones:
 
   PRUNE   branch worktree whose PR is MERGED or CLOSED (gh), worktree clean,
           AND no live process has its CWD inside it (fairy not still running)
-  PRUNE   detached-HEAD worktree, clean (reviewer-fairy leftover; nothing to lose)
+  PRUNE   detached-HEAD worktree, clean, whose head SHA matches NO open PR
+          (reviewer-fairy leftover; nothing to lose)
   PRUNE   `worktree-agent-*` / `review-*` tmp-branch worktree, clean
   KEEP    branch worktree whose PR is OPEN (active work)
   KEEP    branch worktree with NO PR (pre-PR or abandoned — flagged for a human)
   SKIP    any worktree that is DIRTY (uncommitted changes) — never destroy work
   SKIP    any worktree that has a live process with CWD inside it (in-use guard)
+  SKIP    detached-HEAD worktree whose head SHA is an OPEN PR's head (a
+          reviewer's `refs/pr/<N>` checkout), or whose open-PR state could not
+          be verified (gh unavailable) — never prune on unknown
 
 Default is DRY-RUN: it prints the plan and changes nothing. Pass --apply to
 execute (`git worktree remove` + delete the now-merged local branch, then
@@ -141,6 +145,68 @@ def _pr_state(branch: str, root: str) -> str | None:
     return s or None
 
 
+# Cache of {headRefOid: number} for every OPEN PR, keyed by repo root. main()
+# classifies many worktrees and the open-PR set is identical for all of them,
+# so this keeps the detached-HEAD lookup to one `gh` call per run rather than
+# one per worktree. A FAILED lookup is never cached; the next caller retries.
+_OPEN_PR_HEADS: dict[str, dict[str, int]] = {}
+
+
+def _pr_for_sha(sha: str, root: str) -> tuple[bool, int | None]:
+    """Return (verified, pr_number) for an OPEN PR whose head commit is `sha`.
+
+    Three states, deliberately NOT collapsed (unlike _pr_state, whose `None`
+    conflates "no PR" with "gh unavailable" — tolerable for a KEEP/PRUNE
+    decision on a named branch, wrong for a delete verb on a bare SHA):
+      * (True, N)     -> open PR #N has this head SHA
+      * (True, None)  -> verified: no open PR has this head SHA
+      * (False, None) -> the lookup could not be made (gh missing or errored);
+                         the caller must not prune on this.
+    """
+    if not sha:
+        return False, None
+    heads = _OPEN_PR_HEADS.get(root)
+    if heads is None:
+        try:
+            rc, out, _ = _run(
+                ["gh", "pr", "list", "--state", "open", "--limit", "1000",
+                 "--json", "number,headRefOid"],
+                cwd=root,
+            )
+        except OSError:
+            return False, None
+        if rc != 0:
+            return False, None
+        if not out.strip():
+            # rc == 0 with no output is not an affirmative "no open PR" — the
+            # answer is unknown, and a delete verb must fail toward keeping.
+            return False, None
+        try:
+            prs = json.loads(out)
+        except ValueError:
+            return False, None
+        if not isinstance(prs, list):
+            # An abnormal payload (object / scalar) is not the list
+            # `gh pr list` emits; treat it as unknown, never as "no open PR".
+            return False, None
+        heads = {}
+        for pr in prs:
+            head_oid = pr.get("headRefOid") if isinstance(pr, dict) else None
+            number = pr.get("number") if isinstance(pr, dict) else None
+            if not (isinstance(head_oid, str) and head_oid
+                    and isinstance(number, int) and not isinstance(number, bool)):
+                # An entry we cannot read makes the whole answer UNKNOWN, not
+                # "no match". Skipping such entries would be the dangerous
+                # default: if `--json` ever loses headRefOid every entry lands
+                # here, `heads` stays empty, and the caller is told "verified:
+                # no open PR" — reproducing the bug this function exists to
+                # prevent. A delete verb must fail toward keeping.
+                return False, None
+            heads[head_oid] = number
+        _OPEN_PR_HEADS[root] = heads
+    return True, heads.get(sha)
+
+
 def classify(t: dict, root: str) -> tuple[str, str]:
     """Return (action, reason). action in {PRUNE, KEEP, SKIP, MAIN}."""
     if t.get("is_main"):
@@ -154,6 +220,20 @@ def classify(t: dict, root: str) -> tuple[str, str]:
     if branch is None:  # detached HEAD — reviewer-fairy leftover (unless still running)
         if _is_in_use(path):
             return "SKIP", "detached HEAD but process active (reviewer-fairy still running)"
+        # A detached HEAD is often a reviewer's `git worktree add --detach …
+        # refs/pr/<N>` checkout, so a clean detached worktree is NOT
+        # automatically safe to prune: it may hold an OPEN PR's head. Prune
+        # only when the open-PR lookup ran successfully AND no open PR points
+        # at this SHA. If the lookup failed we cannot tell, and a delete verb
+        # must fail toward keeping.
+        try:
+            verified, pr_number = _pr_for_sha(t.get("head") or "", root)
+        except Exception:  # gh unavailable / subprocess error / unexpected output
+            verified, pr_number = False, None
+        if not verified:
+            return "SKIP", "detached HEAD but open-PR state unverified (gh lookup failed); not pruning"
+        if pr_number is not None:
+            return "SKIP", f"detached HEAD matches OPEN PR #{pr_number}; not pruning"
         return "PRUNE", "detached HEAD, clean (reviewer-fairy leftover)"
     if branch.startswith("worktree-agent-") or branch.startswith("review-"):
         if _is_in_use(path):
