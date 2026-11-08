@@ -297,7 +297,7 @@ _svc_mac_one() {
   if [[ $loaded -eq 0 && ! -f "$plist" ]]; then return 0; fi
   if [[ "$mode" == "viz" ]]; then
     if [[ $INCLUDE_VIZ -eq 0 ]]; then
-      svc_left "$label" "shared, not tied to this home; pass --include-viz to remove"
+      svc_left "$label" "shared by every ENGRAM home on this machine; pass --include-viz to remove"
       return 0
     fi
     if [[ ! -f "$plist" ]]; then
@@ -371,7 +371,7 @@ _svc_linux_one() {
   if [[ ! -e "$file" && ! -L "$file" ]]; then return 0; fi
   if [[ "$mode" == "viz" ]]; then
     if [[ $INCLUDE_VIZ -eq 0 ]]; then
-      svc_left "$unit" "shared, not tied to this home; pass --include-viz to remove"
+      svc_left "$unit" "shared by every ENGRAM home on this machine; pass --include-viz to remove"
       return 0
     fi
   else

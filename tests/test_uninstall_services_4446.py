@@ -487,7 +487,7 @@ def test_linux_viz_units_left_and_named_without_the_flag(linux):
     out = _ok(linux.run())
     for n, p in zip(VIZ_UNITS, paths):
         assert p.exists() and (linux.wants / n).is_symlink()
-        assert _lines(out, "Left alone:", n, "--include-viz"), out
+        assert _lines(out, "Left alone:", n, "shared by every ENGRAM home on this machine", "--include-viz"), out
     assert not linux.log("systemctl")
 
 
@@ -506,7 +506,7 @@ def test_mac_viz_plist_left_without_flag_removed_with_flag_when_logs_are_in_this
     plist = mac.plist(VIZ_LABEL, None, logs=mac.eh)
     mac.load(VIZ_LABEL, "-")
     out = _ok(mac.run())
-    assert plist.exists() and _lines(out, "Left alone:", VIZ_LABEL, "--include-viz"), out
+    assert plist.exists() and _lines(out, "Left alone:", VIZ_LABEL, "shared by every ENGRAM home on this machine", "--include-viz"), out
     assert not [ln for ln in mac.log("launchctl") if ln.startswith("bootout ")]
     _ok(mac.run("--include-viz"))
     boots = [ln for ln in mac.log("launchctl") if ln.startswith("bootout ")]
