@@ -120,8 +120,10 @@ def test_related_at_moderate_similarity():
     _stub_semantic_with(server, similarity=0.55, target_id=first_id,
                         target_claim="Original anchor claim about topic Z.")
     r = _add_second_obs(server, claim="Adjacent but distinct topic-Z claim.")
-    hint = r["similar_existing"][0]["action_hint"]
-    assert hint.startswith("RELATED"), f"Expected RELATED, got: {hint}"
+    # #4424: RELATED is tier C (id, severity, keywords): the hint prose is
+    # not rendered, the severity the caller set beside it is.
+    assert r["similar_existing"][0]["severity"] == "related", r["similar_existing"]
+    assert "action_hint" not in r["similar_existing"][0]
 
 
 def test_weak_match_at_low_similarity():
@@ -135,8 +137,11 @@ def test_weak_match_at_low_similarity():
     _stub_semantic_with(server, similarity=0.45, target_id=first_id,
                         target_claim="Original anchor claim about topic Z.")
     r = _add_second_obs(server, claim="Tangential topic-Z mention.")
-    hint = r["similar_existing"][0]["action_hint"]
-    assert hint.startswith("WEAK_MATCH"), f"Expected WEAK_MATCH, got: {hint}"
+    # #4424: WEAK_MATCH is tier D: not shown, counted (and similar_count
+    # still counts it).
+    assert r.get("similar_existing", []) == [], r
+    assert r["similar_not_shown"]["weak_match"] == 1, r
+    assert r["similar_count"] == 1, r
 
 
 def test_corroborate_at_exact_threshold():
@@ -159,9 +164,9 @@ def test_related_at_exact_threshold():
     _stub_semantic_with(server, similarity=0.50, target_id=first_id,
                         target_claim="Original anchor claim about topic Z.")
     r = _add_second_obs(server, claim="Mid-strength topic Z claim.")
-    hint = r["similar_existing"][0]["action_hint"]
-    assert hint.startswith("RELATED"), (
-        f"sim==0.50 should be RELATED (>= boundary), got: {hint}"
+    sev = r["similar_existing"][0]["severity"]  # tier C: severity, no hint prose
+    assert sev == "related", (
+        f"sim==0.50 should be RELATED (>= boundary), got: {sev}"
     )
 
 
@@ -206,7 +211,7 @@ def test_thresholds_loaded_from_config_override():
     _stub_semantic_with(server, similarity=0.70, target_id=first_id,
                         target_claim="Original anchor claim about topic Z.")
     r = _add_second_obs(server, claim="Topic Z claim under custom thresholds.")
-    hint = r["similar_existing"][0]["action_hint"]
-    assert hint.startswith("RELATED"), (
-        f"With CORROBORATE bumped to 0.90, sim=0.70 should be RELATED, got: {hint}"
+    sev = r["similar_existing"][0]["severity"]  # tier C: severity, no hint prose
+    assert sev == "related", (
+        f"With CORROBORATE bumped to 0.90, sim=0.70 should be RELATED, got: {sev}"
     )

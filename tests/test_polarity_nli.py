@@ -332,9 +332,12 @@ def test_polarity_skipped_when_sim_below_min_check():
     _stub_semantic_with(server, similarity=0.55, target_id=first_id,
                         target_claim="Topic Z is X.")
     r = _add_second_obs(server, claim="Different topic Y is something else.")
-    hint = r["similar_existing"][0]["action_hint"]
+    # #4424: sim 0.55 is RELATED, tier C: severity, no hint prose. Had the
+    # overlay fired it would be a polarity_alert (tier A) carrying the hint.
+    entry = r["similar_existing"][0]
     assert call_count["n"] == 0, f"NLI should not be called below min_sim_for_check; was called {call_count['n']}x"
-    assert not hint.startswith("POLARITY_ALERT"), hint
+    assert entry["severity"] == "related", entry
+    assert "action_hint" not in entry, entry
 
 
 def test_polarity_threshold_configurable():

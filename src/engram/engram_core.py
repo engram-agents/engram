@@ -11200,6 +11200,145 @@ def _strip_similar_block(entries: list[dict]) -> list[dict]:
     ]
 
 
+# ── #4424: tiered render of the similar_existing / similar_existing_lessons block ──
+#
+# Severity is set by the CALLER, at the place it sets `action_hint`
+# (m["severity"], one of the names below); this renderer never parses hint
+# prose. Tier A needs a decision and the full claim, tier B needs a look and
+# a one-line scent, tier C is a pointer, tier D is counted only. What is not
+# shown is counted in `similar_not_shown` (never silently dropped).
+SIMILAR_TIER_A = frozenset({"duplicate", "polarity_alert"})
+SIMILAR_TIER_B = frozenset({
+    "corroborate", "keyword_overlap_same_source", "distinct_from_same_source",
+})
+SIMILAR_TIER_C = frozenset({"related", "keyword_overlap_other_source"})
+SIMILAR_TIER_D = frozenset({"weak_match"})
+SIMILAR_TIER_C_MAX_ENTRIES = 5
+SIMILAR_TIER_C_MAX_KEYWORDS = 5
+SIMILAR_RECALL_SUMMARY_FALLBACK_CHARS = 140
+SIMILAR_LEAD_MAX_IDS = 3
+# Leading-line phrases, in the order they are said: (severity, singular, plural).
+_SIMILAR_LEAD_PHRASES = (
+    ("polarity_alert", "polarity alert", "polarity alerts"),
+    ("duplicate", "duplicate candidate", "duplicate candidates"),
+    ("corroborate", "corroboration candidate", "corroboration candidates"),
+)
+
+
+def _similar_not_shown_label(category: str, n: int) -> str:
+    if category == "related":
+        return f"{n} more related"
+    if category == "keyword_overlap_other_source":
+        return f"{n} more keyword overlap{'s' if n != 1 else ''} from other sources"
+    return f"{n} weak match{'es' if n != 1 else ''}"
+
+
+_SIMILAR_RAW_RECALL_KEYS = frozenset({"recall_summary", "recall_keywords"})
+
+
+def _similar_scent(entry: dict) -> str:
+    """recall_summary of a match, else its claim cut to 140 chars (with an ellipsis)."""
+    rs = (entry.get("recall_summary") or "").strip()
+    if rs:
+        return rs
+    claim = (entry.get("claim") or "").strip()
+    cap = SIMILAR_RECALL_SUMMARY_FALLBACK_CHARS
+    if len(claim) <= cap:
+        return claim
+    return claim[: cap - 1].rstrip() + "\u2026"
+
+
+def _similar_keywords(entry: dict) -> list:
+    raw = entry.get("recall_keywords")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw) if raw else None
+        except (ValueError, TypeError):
+            raw = None
+    if not isinstance(raw, list):
+        return []
+    kept = [str(k) for k in raw if k is not None and str(k).strip() != ""]
+    return kept[:SIMILAR_TIER_C_MAX_KEYWORDS]
+
+
+def _render_similar_block(entries: list[dict]) -> tuple[str, list[dict], dict]:
+    """Render similar-existing matches by severity tier (#4424).
+
+    Every entry must carry `severity` (set by the caller beside its
+    `action_hint`); an entry without one is treated as tier A, shown in full,
+    so a missing severity can only over-show, never hide a match.
+
+    Returns (lead, shown, not_shown):
+      lead       one line saying what needs action (tier A, and corroborate).
+      shown      tier A (full entry), then B, then C (at most 5 entries);
+                 within a tier, the order the builder returned.
+      not_shown  {} when everything is shown, else a count per category with
+                 unshown matches (tier C remainder, all of tier D) plus
+                 `summary` (one human sentence) and `see` (the call that
+                 shows them). Note it mixes int counts (keyed by category)
+                 with the string keys `summary` and `see`: a consumer must not
+                 iterate it assuming every value is an int.
+    """
+    tier_a, tier_b, tier_c, hidden = [], [], [], []
+    for e in entries:
+        sev = e.get("severity")
+        if sev in SIMILAR_TIER_D:
+            hidden.append(e)
+        elif sev in SIMILAR_TIER_B:
+            tier_b.append(e)
+        elif sev in SIMILAR_TIER_C:
+            tier_c.append(e)
+        else:
+            tier_a.append(e)
+
+    shown: list[dict] = []
+    for e in tier_a:
+        full = {k: v for k, v in e.items()
+                if k not in _SIMILAR_STRIP_KEYS and k not in _SIMILAR_RAW_RECALL_KEYS}
+        shown.append(full)
+    for e in tier_b:
+        shown.append({
+            "id": e["id"],
+            "severity": e["severity"],
+            "recall_summary": _similar_scent(e),
+            "confidence": e.get("confidence"),
+            "action_hint": e.get("action_hint", ""),
+        })
+    for e in tier_c[:SIMILAR_TIER_C_MAX_ENTRIES]:
+        shown.append({
+            "id": e["id"],
+            "severity": e["severity"],
+            "keywords": _similar_keywords(e),
+        })
+    hidden.extend(tier_c[SIMILAR_TIER_C_MAX_ENTRIES:])
+
+    # Leading line: what needs action. At most 3 ids per phrase, rest counted.
+    phrases = []
+    for sev, singular, plural in _SIMILAR_LEAD_PHRASES:
+        ids = [e["id"] for e in entries if e.get("severity") == sev]
+        if not ids:
+            continue
+        text = f"{len(ids)} {singular if len(ids) == 1 else plural}: " + ", ".join(
+            ids[:SIMILAR_LEAD_MAX_IDS])
+        if len(ids) > SIMILAR_LEAD_MAX_IDS:
+            text += f" and {len(ids) - SIMILAR_LEAD_MAX_IDS} more"
+        phrases.append(text)
+    lead = "; ".join(phrases) if phrases else "nothing needs action"
+
+    not_shown: dict = {}
+    for e in hidden:
+        not_shown[e["severity"]] = not_shown.get(e["severity"], 0) + 1
+    if not_shown:
+        parts = [_similar_not_shown_label(c, n) for c, n in not_shown.items()]
+        if len(parts) > 1:
+            said = ", ".join(parts[:-1]) + " and " + parts[-1]
+        else:
+            said = parts[0]
+        not_shown["summary"] = f"{said} not shown; engram_query shows them"
+        not_shown["see"] = "engram_query with this claim as the query shows them"
+    return lead, shown, not_shown
+
+
 def _compute_confidence(
     conn: sqlite3.Connection,
     node_type: str,

@@ -361,6 +361,7 @@ class TestSimilarExistingStripping:
         assert r.get("similar_count", 0) >= 1, (
             f"Expected at least 1 similar match, got: {r}"
         )
+        assert r.get("similar_existing"), r  # #4424: guard against a vacuous loop
         for entry in r.get("similar_existing", []):
             assert "match_type" not in entry, (
                 f"match_type should be stripped from similar_existing: {entry}"
@@ -379,6 +380,7 @@ class TestSimilarExistingStripping:
             "claim": "Confirmation of anchor B.",
             "quote_type": "attributed_analysis",
         })))
+        assert r.get("similar_existing"), r  # #4424: guard against a vacuous loop
         for entry in r.get("similar_existing", []):
             assert "similarity" not in entry, (
                 f"similarity should be stripped from similar_existing: {entry}"
@@ -399,6 +401,7 @@ class TestSimilarExistingStripping:
             "claim": "Confirmation of anchor C.",
             "quote_type": "attributed_analysis",
         })))
+        assert r.get("similar_existing"), r  # #4424: guard against a vacuous loop
         for entry in r.get("similar_existing", []):
             assert "action_hint" in entry, (
                 f"action_hint must NOT be stripped from similar_existing: {entry}"
@@ -467,6 +470,7 @@ class TestSimilarExistingLessonsStripping:
             "logical_chain": "Pattern confirmed from second incident.",
             "reasoning_type": "inductive_enumeration",
         })))
+        assert r.get("similar_existing_lessons"), r  # #4424: guard against a vacuous loop
         for entry in r.get("similar_existing_lessons", []):
             assert "match_type" not in entry, (
                 f"match_type should be stripped from similar_existing_lessons: {entry}"
@@ -488,6 +492,7 @@ class TestSimilarExistingLessonsStripping:
             "logical_chain": "Confirmed avoiding Z.",
             "reasoning_type": "inductive_enumeration",
         })))
+        assert r.get("similar_existing_lessons"), r  # #4424: guard against a vacuous loop
         for entry in r.get("similar_existing_lessons", []):
             assert "similarity" not in entry, (
                 f"similarity should be stripped from similar_existing_lessons: {entry}"

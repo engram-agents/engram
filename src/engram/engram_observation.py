@@ -2110,7 +2110,7 @@ def _add_observation_impl(
         similar_matches = core._similar_existing_matches(
             conn, claim,
             type_filter={"observation_factual", "observation_predictive"},
-            extra_columns=("evidence_id",),
+            extra_columns=("evidence_id", "recall_summary", "recall_keywords"),
         )
 
         node_id = core._next_id(conn, node_type)
@@ -2325,11 +2325,13 @@ def _add_observation_impl(
                 if sim is None:
                     # FTS keyword match: coarse signal, no cosine score
                     if same_ev:
+                        m["severity"] = "keyword_overlap_same_source"
                         m["action_hint"] = (
                             f"KEYWORD_OVERLAP_SAME_SOURCE — keyword match with {m['id']} "
                             f"in the same {own_source_type}. Inspect to decide if duplicate or distinct."
                         )
                     else:
+                        m["severity"] = "keyword_overlap_other_source"
                         m["action_hint"] = (
                             f"KEYWORD_OVERLAP_OTHER_SOURCE — keyword match with {m['id']} "
                             f"from a different source. Inspect to decide if corroboration."
@@ -2347,17 +2349,20 @@ def _add_observation_impl(
                 # files), so DUPLICATE only fires at very high similarity.
                 if same_ev:
                     if own_source_type in ("document", "web_page") and sim >= 0.85:
+                        m["severity"] = "duplicate"
                         m["action_hint"] = (
                             f"DUPLICATE — high-similarity ({sim:.2f}) claim from the same {own_source_type}. "
                             f"Likely the author repeating themselves. Consider retracting this new observation."
                         )
                     elif own_source_type in ("conversation", "file") and sim >= 0.92:
+                        m["severity"] = "duplicate"  # POSSIBLE_DUPLICATE hint
                         m["action_hint"] = (
                             f"POSSIBLE_DUPLICATE — very-high similarity ({sim:.2f}) "
                             f"with {m['id']} from the same {own_source_type}. "
                             f"Inspect both before deciding — long-running sources can repeat."
                         )
                     else:
+                        m["severity"] = "distinct_from_same_source"
                         m["action_hint"] = (
                             f"DISTINCT_FROM_SAME_SOURCE — same {own_source_type} source, similarity {sim:.2f}. "
                             f"Likely a different fact from a long-running source. "
@@ -2365,17 +2370,20 @@ def _add_observation_impl(
                         )
                 else:
                     if sim >= float(_th["action_hint_corroborate"]):
+                        m["severity"] = "corroborate"
                         m["action_hint"] = (
                             f"CORROBORATE — high-similarity ({sim:.2f}) claim from an independent source. "
                             f"Create a corroboration derivation (inductive_generalization) "
                             f"citing both {m['id']} and {node_id}."
                         )
                     elif sim >= float(_th["action_hint_related"]):
+                        m["severity"] = "related"
                         m["action_hint"] = (
                             f"RELATED — moderate similarity ({sim:.2f}) from a different source. "
                             f"Inspect to decide whether corroboration is warranted."
                         )
                     else:
+                        m["severity"] = "weak_match"
                         m["action_hint"] = (
                             f"WEAK_MATCH — low similarity ({sim:.2f}). "
                             f"Probably unrelated. Ignore unless inspection suggests otherwise."
@@ -2391,9 +2399,15 @@ def _add_observation_impl(
                 # are simply not in the dict.
                 polarity_prefix = _polarity_alerts.get(m["id"])
                 if polarity_prefix:
+                    m["severity"] = "polarity_alert"
                     m["action_hint"] = polarity_prefix + m["action_hint"]
 
-            result["similar_existing"] = core._strip_similar_block(similar_matches)
+            # #4424: render by severity tier; what is not shown is counted.
+            _lead, _shown, _not_shown = core._render_similar_block(similar_matches)
+            result["similar_existing_lead"] = _lead
+            result["similar_existing"] = _shown
+            if _not_shown:
+                result["similar_not_shown"] = _not_shown
             result["similar_count"] = len(similar_matches)
             result["dedup_guidance"] = (
                 "Similarity-graded matches. Action hints account for source type "
