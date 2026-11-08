@@ -141,6 +141,30 @@ def test_i1_the_service_dir_itself_ends_2755_and_the_shell_umask_is_022(tmp_path
     assert _mode(svc) == 0o2755, oct(_mode(svc))
 
 
+@pytest.mark.parametrize("target_kind", ["file", "dir"])
+@pytest.mark.parametrize("mask", [0o002, 0o022])
+def test_i1_the_normalize_step_never_chmods_through_a_symlink(tmp_path, mask, target_kind):
+    """A symlink inside the tree whose target is OUTSIDE it and owned by the test user: a
+    chmod through the link would succeed (unlike the fixture's root-owned /usr/bin/env)."""
+    svc = tmp_path / "forum"
+    _legacy_tree(svc, pack=False, dm=False)
+    outside = tmp_path / "elsewhere"
+    if target_kind == "file":
+        outside.write_text("x")
+        os.chmod(outside, 0o664)
+        want = 0o664
+    else:
+        outside.mkdir()
+        os.chmod(outside, 0o775)
+        want = 0o775
+    (svc / "app" / "link-out").symlink_to(outside)
+    r = _bash(svc, PHASE, mask=mask)
+    assert r.returncode == 0, r.stderr
+    assert (svc / "app" / "link-out").is_symlink()
+    assert _mode(outside) == want, f"chmod went through the symlink: {oct(_mode(outside))}"
+    assert _find_g_w(svc) == []
+
+
 @pytest.mark.parametrize("mask", [0o002, 0o022])
 def test_i1_the_dry_run_plan_prints_the_new_modes_and_not_the_old(tmp_path, mask):
     svc = tmp_path / "forum"
@@ -221,6 +245,38 @@ def test_i2_the_installer_calls_the_assertion_before_done_and_does_not_swallow_i
     assert last.start() > text.index("# <<< forum-url-step")
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+@pytest.mark.parametrize("locked", [0o000, 0o100])
+@pytest.mark.parametrize("mask", [0o002, 0o022])
+def test_i2_an_uninspectable_subtree_fails_the_assertion(tmp_path, mask, locked):
+    """An admin hand-off leaves a dir find cannot list: that is not a clean tree."""
+    svc = tmp_path / "forum"
+    _legacy_tree(svc, pack=False, dm=False)
+    sub = svc / "handed-off"
+    sub.mkdir()
+    (sub / "inner.txt").write_text("x")
+    os.chmod(sub, locked)
+    try:
+        r = _bash(svc, PHASE + "\n_assert_no_group_write", mask=mask)
+    finally:
+        os.chmod(sub, 0o755)
+    assert r.returncode != 0, "the assertion passed over a subtree it could not inspect"
+    assert "could not be inspected" in r.stderr, r.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+def test_i2_a_readable_subtree_control_passes(tmp_path):
+    svc = tmp_path / "forum"
+    _legacy_tree(svc, pack=False, dm=False)
+    sub = svc / "handed-off"
+    sub.mkdir()
+    (sub / "inner.txt").write_text("x")
+    os.chmod(sub / "inner.txt", 0o644)
+    os.chmod(sub, 0o755)
+    r = _bash(svc, PHASE + "\n_assert_no_group_write", mask=0o022)
+    assert r.returncode == 0, r.stderr
+
+
 def test_i2_dry_run_prints_a_plan_line_and_does_not_run_the_find(tmp_path):
     svc = tmp_path / "forum"
     svc.mkdir()
@@ -235,6 +291,25 @@ def test_i2_dry_run_prints_a_plan_line_and_does_not_run_the_find(tmp_path):
 # ---------------------------------------------------------------------------
 # I3
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mask", [0o002, 0o022])
+def test_i3_the_installer_body_normalizes_before_it_asserts(tmp_path, mask):
+    """Behavioural (dry-run) route: the WHOLE installer prints the normalize plan line and
+    then the assertion plan line. Deleting the installer's own normalize call drops the first."""
+    svc = tmp_path / "forum"
+    r = subprocess.run(
+        ["bash", "-c", f"umask {mask:04o}; bash {INSTALLER} --src {_REPO} --service-dir {svc} "
+                       f"--group agents --dry-run"],
+        capture_output=True, text=True, env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)},
+    )
+    assert r.returncode == 0, r.stderr
+    out = r.stdout + r.stderr
+    norm = f"[dry-run] find {svc} -xdev ! -type l -exec chmod g-w {{}} +"
+    asrt = f"[dry-run] assert: find {svc} -xdev -perm -g+w ! -type l lists nothing"
+    assert out.count(norm) == 1, out
+    assert out.count(asrt) == 1, out
+    assert out.index(norm) < out.index(asrt)
+
 
 def _getfacl(path: Path) -> str:
     return subprocess.run(["getfacl", "-n", "--skip-base", "--absolute-names", str(path)],

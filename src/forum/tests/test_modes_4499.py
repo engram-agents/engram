@@ -84,12 +84,15 @@ def _prepare(path: Path, state: str) -> None:
     os.chmod(path, mode)
 
 
-def _check_created_or_left_alone(path: Path, state: str) -> None:
+def _check_created_or_left_alone(path: Path, state: str, mask: int) -> None:
     assert path.exists(), f"{path.name} was not created"
     if state == "absent":
         # 0640 or narrower (umask 077 narrows the 0o640 request to 0o600): never g+w, never o-anything.
         assert _mode(path) & 0o037 == 0, oct(_mode(path))
         assert _mode(path) & 0o600 == 0o600, oct(_mode(path))  # the owner can still use it
+        # EXACT: the group READ bit is part of the contract (co-admins read the db and the
+        # audit log), so 0o640 under umask 002/022 and 0o600 under 077 -- not "anything narrower".
+        assert _mode(path) == 0o640 & ~mask, f"{oct(_mode(path))} under umask {mask:04o}"
     else:
         want = {"present-664": 0o664, "present-600": 0o600}[state]
         assert _mode(path) == want, f"existing file's mode was changed: {oct(_mode(path))}"
@@ -146,7 +149,7 @@ def test_s1_db_mode_whichever_path_creates_it_first(tmp_path, monkeypatch, umask
         _create_db_via_main(db_path, audit_path, monkeypatch)
     else:
         _create_db_via_create_app(db_path, audit_path)
-    _check_created_or_left_alone(db_path, state)
+    _check_created_or_left_alone(db_path, state, mask)
 
 
 @pytest.mark.parametrize("mask", [0o002, 0o022])
@@ -273,7 +276,7 @@ def test_s4_audit_mode_whichever_path_creates_it_first(tmp_path, umask, path_kin
         _create_db_via_probe(tmp_path / "forum.db", audit_path)
     else:
         _write_one_audit_line(audit_path)
-    _check_created_or_left_alone(audit_path, state)
+    _check_created_or_left_alone(audit_path, state, mask)
 
 
 def test_s4_an_append_keeps_the_existing_content(tmp_path, umask):
@@ -423,6 +426,9 @@ def test_b1_output_is_0640_and_the_temp_is_at_its_final_mode_at_replace_time(
     assert all(m & 0o037 == 0 for m in seen), f"temp was wider than 0640 at rename time: {[oct(m) for m in seen]}"
     assert _mode(dest) & 0o037 == 0, oct(_mode(dest))
     assert _mode(dest) & 0o600 == 0o600
+    # EXACT 0o640: the group read bit (co-admins read the backup) at rename time AND on the final file.
+    assert all(m == 0o640 for m in seen), f"temp at rename time: {[oct(m) for m in seen]}"
+    assert _mode(dest) == 0o640, oct(_mode(dest))
 
 
 @pytest.mark.parametrize("kind", list(WRITERS))
@@ -485,6 +491,27 @@ def test_p1_a_published_pack_has_no_group_or_other_write(tmp_path, umask, mask, 
         assert _mode(p) & 0o022 == 0, f"{p.name}: {oct(_mode(p))}"
     assert (pack_dir / "package.tar.gz").read_bytes() == tarball.read_bytes()
     assert os.access(pack_dir / "meta.json", os.R_OK)
+    # Packs are content to be READ: group AND other keep the read bit on both files, and
+    # the (newly created) pack dir keeps read+search for both.
+    for p in (pack_dir / "package.tar.gz", pack_dir / "meta.json"):
+        assert _mode(p) & 0o044 == 0o044, f"{p.name}: {oct(_mode(p))}"
+    assert _mode(pack_dir) & 0o055 == 0o055, oct(_mode(pack_dir))
+
+
+@pytest.mark.parametrize("mask", [0o002, 0o022])
+def test_p1_an_existing_pack_dir_is_left_alone(tmp_path, umask, mask):
+    tarball = tmp_path / "upload.tar.gz"
+    tarball.write_bytes(b"x")
+    packs_dir = tmp_path / "packs"
+    packs_dir.mkdir()
+    os.chmod(packs_dir, 0o755)
+    pre = packs_dir / "alice__demo__v1"
+    pre.mkdir()
+    os.chmod(pre, 0o750)
+    umask(mask)
+    pack_dir = packs.store_pack(packs_dir, "alice__demo__v1", tarball)
+    assert pack_dir == pre
+    assert _mode(pre) == 0o750, oct(_mode(pre))
 
 
 def test_p1_the_source_upload_is_not_modified_by_publishing(tmp_path, umask):
