@@ -203,6 +203,16 @@ def _is_bare_pr_anchor(anchor: Optional[str]) -> bool:
 # Render text for an in-court baton whose anchor is a bare pr/<N>.
 _NEEDS_QUALIFIED_ANCHOR = "needs a qualified anchor: pr/<owner>/<repo>/<N>"
 
+# #4525: the hook's OWN fixed notices (instructions with <placeholder> text). They are
+# authored here, not read from the forum or GitHub, so they are emitted verbatim; every
+# other live status is data and goes through _forum_field. ONE definition, derived from
+# the constants above by name (``*_NOTICE`` / ``_NEEDS_*``), so a new notice cannot be
+# added without being trusted, nor a data value be trusted by shape.
+_FIXED_NOTICES = frozenset(
+    _v for _k, _v in tuple(globals().items())
+    if isinstance(_v, str) and (_k.endswith("_NOTICE") or _k.startswith("_NEEDS_"))
+)
+
 # Frontmatter parsing (same regex as ia.py / inter-agent hook)
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):[ \t]*(.*)$", re.MULTILINE)
@@ -949,7 +959,9 @@ def main() -> None:
                 try:
                     live_status = _get_live_status(github_anchor, cache)
                     if live_status:
-                        live_clause = f" [{_forum_field(live_status, 80)}]"
+                        shown = (live_status if live_status in _FIXED_NOTICES
+                                 else _forum_field(live_status, 80))
+                        live_clause = f" [{shown}]"
                 except Exception:
                     pass
 
