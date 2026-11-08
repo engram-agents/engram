@@ -139,7 +139,11 @@ class CoordinationStore(abc.ABC):
     # --- baton / board (projects) ------------------------------------------
     @abc.abstractmethod
     def read_projects(self, *, active_only: bool = True) -> list[ProjectRecord]:
-        """Return all project records (optionally only non-closed ones)."""
+        """Return all project records (optionally only non-closed ones).
+
+        A scan skips an entry that is not a plain file inside the store, and a
+        scan ROOT that resolves outside the store is refused rather than scanned.
+        """
 
     @abc.abstractmethod
     def read_project(self, project_id: str) -> Optional[str]:
@@ -179,6 +183,11 @@ class CoordinationStore(abc.ABC):
 
         Order-independent in ``a``/``b`` (see ``dm_thread_key``). Returns ``[]``
         if the thread does not exist. Messages are returned in seq order.
+        A filesystem-backed implementation MAY raise
+        ``coordination.names.InvalidDmPath`` instead of returning ``[]`` when the
+        computed thread path is not a plain file inside the store (a symlink,
+        dangling or not, or a path resolving outside it); ``[]`` means the thread
+        is absent, never that it was unreadable.
         """
 
     @abc.abstractmethod
@@ -188,7 +197,10 @@ class CoordinationStore(abc.ABC):
         """Atomically append one message to the ``sender``↔``recipient`` thread.
 
         Embeds the module-assigned ``seq``. Creates the thread file on first
-        message. Returns the persisted :class:`DmMessage`. The 1:1 ACL is NOT
+        message. A filesystem-backed implementation MAY raise
+        ``coordination.names.InvalidDmPath`` instead of creating or replacing
+        the file when the computed thread path is not a plain file inside the
+        store. Returns the persisted :class:`DmMessage`. The 1:1 ACL is NOT
         enforced here — it is enforced at the API layer, where ``sender`` is the
         authenticated agent (never a client-supplied field). The store trusts its
         caller (the module) to have authorized the write.
@@ -232,4 +244,7 @@ class CoordinationStore(abc.ABC):
         surfaces and return the global max. Missing either undercounts and silently
         re-issues live seqs. See those two methods' docstrings for the exact embed
         locations.
+
+        A scan skips an entry that is not a plain file inside the store, and a
+        scan ROOT that resolves outside the store is refused rather than scanned.
         """

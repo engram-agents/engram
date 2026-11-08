@@ -49,6 +49,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Optional
 
+from .names import InvalidDmPath
 from .seq import SeqAllocator
 from .store import CoordinationStore
 
@@ -110,7 +111,14 @@ def build_updates(
 
     if "dm" in want:
         for other in store.list_dm_threads(agent):
-            for m in store.read_dm_thread(agent, other, since_seq=since):
+            try:
+                messages = store.read_dm_thread(agent, other, since_seq=since)
+            except InvalidDmPath:
+                # One poisoned thread must not take down the whole wake feed
+                # (every seat's, not one caller's read): skip it and keep
+                # building. Detection is the operator's filesystem audit.
+                continue
+            for m in messages:
                 if _norm(m.recipient) == agent and m.seq <= as_of:
                     updates.append({
                         "kind": "dm",

@@ -3640,6 +3640,7 @@ def create_app(
              (read_dm_thread is order-independent; only the pair's messages are returned).
         """
         from forum.coordination import dm_read as _dm_read
+        from forum.coordination.names import InvalidDmPath
 
         store = app.config.get("COORD_STORE")
         if store is None:
@@ -3659,7 +3660,10 @@ def create_app(
         except ValueError:
             return jsonify({"error": "since_seq must be an integer"}), 400
 
-        messages = _dm_read(store, agent, counterpart_n, since_seq=since_seq)
+        try:
+            messages = _dm_read(store, agent, counterpart_n, since_seq=since_seq)
+        except InvalidDmPath:
+            return jsonify({"error": "dm thread path is not a plain file"}), 500
         as_of_seq = messages[-1].seq if messages else since_seq
         return jsonify({
             "messages": [
@@ -3686,6 +3690,7 @@ def create_app(
         Response: {seq: <int>, ts: <str>}
         """
         from forum.coordination import dm_send as _dm_send
+        from forum.coordination.names import InvalidDmPath
 
         store = app.config.get("COORD_STORE")
         allocator = app.config.get("COORD_ALLOCATOR")
@@ -3710,7 +3715,10 @@ def create_app(
         if not db.is_valid_agent_name(agent) or not db.is_valid_agent_name(counterpart_n):
             return jsonify({"error": "invalid agent name"}), 400
 
-        msg = _dm_send(store, allocator, agent, counterpart_n, body)
+        try:
+            msg = _dm_send(store, allocator, agent, counterpart_n, body)
+        except InvalidDmPath:
+            return jsonify({"error": "dm thread path is not a plain file"}), 500
         return jsonify({"seq": msg.seq, "ts": msg.ts}), 201
 
     # ------------------------------------------------------------------

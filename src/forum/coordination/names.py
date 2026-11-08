@@ -67,6 +67,23 @@ class InvalidProjectId(ValueError):
     """
 
 
+class InvalidDmPath(ValueError):
+    """A computed DM thread path that is not a plain file inside ``<root>/dm``.
+
+    The target's final component is a symlink (dangling or not), or the path
+    resolves outside ``<root>/dm`` (e.g. through a symlinked parent). Raised by
+    the file store's DM path helper and its no-follow read helper; HTTP routes
+    surface it (``GET`` and ``POST /api/dm/<counterpart>`` answer a named JSON
+    500).
+
+    It deliberately does NOT subclass ``OSError``, and that is load-bearing: both
+    DM call sites carry ``except OSError:`` handlers that mean "no thread yet".
+    An ``OSError``-derived refusal would be swallowed into "no thread" and the
+    store would fail OPEN, which is the exact defect this type exists to prevent.
+    Do not rebase it onto ``OSError``.
+    """
+
+
 def is_valid_project_id(project_id) -> bool:
     """True if ``project_id`` is a string matching the CLI's project-id rule."""
     return isinstance(project_id, str) and PROJECT_ID_RE.fullmatch(project_id) is not None

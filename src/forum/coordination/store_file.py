@@ -27,13 +27,15 @@ contract, kept self-contained so Slice A ships without a cross-package import.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 from typing import Optional
 
-from .names import InvalidProjectId
+from .names import InvalidDmPath, InvalidProjectId
 from .store import (
     CoordinationStore,
     DmMessage,
@@ -170,6 +172,53 @@ def _embed_seq(content: str, seq: int) -> str:
     return f"---\n{new_block}\n---\n" + content[m.end():]
 
 
+def _read_text_nofollow(path: Path) -> str:
+    """Read ``path`` as UTF-8, refusing a symlink and any non-regular file.
+
+    ``O_NOFOLLOW`` makes the open itself fail with ``ELOOP`` on a symlink (a
+    planted link, dangling or not), which surfaces as :class:`InvalidDmPath`.
+    ``O_NONBLOCK`` is what makes a FIFO (or other non-regular file) open
+    INSTANTLY instead of blocking the reader, so the kind refusal has to be the
+    ``fstat`` + ``S_ISREG`` check on the fd, never a stat-then-open (that would
+    reintroduce the TOCTOU this helper exists to close). ``O_NONBLOCK`` is a
+    no-op on a regular file on Linux, so the normal path is unchanged.
+    Every other ``OSError`` is re-raised unchanged, so ``FileNotFoundError``
+    keeps its current "no thread yet" meaning at the DM call sites.
+
+    ``getattr(os, "O_NOFOLLOW", 0)`` is the portability floor: on a platform
+    without the flag this helper cannot detect a link on its own, and the
+    structural ``os.path.islink`` check in ``FileStore._dm_path`` is what
+    remains. The ``fstat`` regular-file check still runs there.
+    """
+    try:
+        fd = os.open(
+            str(path),
+            os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise InvalidDmPath(
+                f"dm thread path is not a plain file: {path.name!r}"
+            ) from None
+        raise
+    try:
+        # Checked on the fd, after the open: a path stat before opening is the
+        # very check-then-use window this helper closes.
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise InvalidDmPath(
+                f"dm thread path is not a regular file: {path.name!r}"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8")
+
+
 class FileStore(CoordinationStore):
     """Concrete file-backed coordination store (fork-1 default impl)."""
 
@@ -218,10 +267,19 @@ class FileStore(CoordinationStore):
 
     # --- baton / board (projects) ------------------------------------------
     def read_projects(self, *, active_only: bool = True) -> list[ProjectRecord]:
-        if not self.projects_dir.is_dir():
+        # Resolve the scan ROOT first: a directory that is not the store's is
+        # not a per-file anomaly to skip -- nothing in it is trustworthy.
+        base = self._contained_dir("projects")
+        if not base.is_dir():
             return []
         records: list[ProjectRecord] = []
-        for md in sorted(self.projects_dir.glob("*.md")):
+        for md in sorted(base.glob("*.md")):
+            # A scan over many files must not turn one planted link into a 500
+            # for the whole board, so the scan SKIPS it: non-disclosure is what
+            # this buys, and detection is the operator's filesystem audit, not
+            # this read path.
+            if os.path.islink(md):
+                continue
             try:
                 raw = md.read_text(encoding="utf-8")
             except OSError:
@@ -291,16 +349,51 @@ class FileStore(CoordinationStore):
         src.rename(dst)  # atomic POSIX rename (same fs)
 
     # --- DM ----------------------------------------------------------------
+    def _dm_dir(self) -> Path:
+        """The store's ``dm/`` directory, guaranteed to really be ``<root>/dm``.
+
+        Mirrors :meth:`_contained_dir`: the root itself may be a symlink (an
+        admin's layout), so both sides are compared RESOLVED. Differs only in
+        raising :class:`InvalidDmPath` (not ``InvalidProjectId``), since this is
+        the DM surface. The containment check here is deliberately redundant
+        with ``_dm_path``'s ``resolve().parent`` comparison -- the directory's
+        identity vs the file's -- and the redundancy is defence in depth, not
+        dead code.
+        """
+        want = self.root.resolve() / "dm"
+        if (self.root / "dm").resolve() != want:
+            raise InvalidDmPath("store directory 'dm' resolves outside the store root")
+        return want
+
     def _dm_path(self, a: str, b: str) -> Path:
-        return self.dm_dir / f"{dm_thread_key(a, b)}.md"
+        """The ONLY way a DM pair becomes a path (read/write).
+
+        ``dm_thread_key`` validates both names at this chokepoint, so the
+        filename cannot carry a separator. Then the target must sit directly in
+        the contained ``dm`` directory and NOT be a symlink (a link is refused
+        even when it points inside the store; so is a dangling one). Returns a
+        path built from the resolved directory, so later I/O cannot be
+        redirected through a symlinked parent. (A check-then-use window remains
+        against a concurrent local attacker who can already write in ``dm/``;
+        the ``O_NOFOLLOW`` open in :func:`_read_text_nofollow` is what closes it
+        for READS.)
+        """
+        dm_dir = self._dm_dir()
+        path = dm_dir / f"{dm_thread_key(a, b)}.md"
+        if os.path.islink(path) or path.resolve().parent != dm_dir:
+            raise InvalidDmPath(f"dm thread path is not a plain file in the store: {path.name!r}")
+        return path
 
     def read_dm_thread(
         self, a: str, b: str, *, since_seq: int = 0
     ) -> list[DmMessage]:
         path = self._dm_path(a, b)
         try:
-            raw = path.read_text(encoding="utf-8")
+            raw = _read_text_nofollow(path)
         except OSError:
+            # "No thread yet". InvalidDmPath is a ValueError, NOT an OSError, so
+            # a planted-link refusal propagates past this handler on purpose --
+            # do not widen it to Exception.
             return []
         messages = _parse_dm_thread(raw)
         out = [m for m in messages if m.seq > since_seq]
@@ -327,7 +420,7 @@ class FileStore(CoordinationStore):
         block = header + "\n" + "\n".join(body_lines) + "\n"
 
         try:
-            existing = path.read_text(encoding="utf-8")
+            existing = _read_text_nofollow(path)
         except OSError:
             existing = f"<!-- dm thread: {dm_thread_key(sender, recipient)} -->\n"
         # DM threads are read only by the forum server: owner-only (#4501).
@@ -375,23 +468,37 @@ class FileStore(CoordinationStore):
     # --- cursor recovery ---------------------------------------------------
     def recover_max_seq(self) -> int:
         hi = 0
-        if self.projects_dir.is_dir():
-            for md in self.projects_dir.glob("*.md"):
+        # Each scan ROOT is resolved through the contained-dir helpers: a
+        # directory that resolves outside the store is refused, not scanned.
+        projects_dir = self._contained_dir("projects")
+        if projects_dir.is_dir():
+            for md in projects_dir.glob("*.md"):
+                # Same rule as read_projects: a scan skips a planted link
+                # (non-disclosure; detection is the operator's filesystem audit).
+                if os.path.islink(md):
+                    continue
                 try:
                     fields, _ = _parse_frontmatter(md.read_text(encoding="utf-8"))
                 except OSError:
                     continue
                 hi = max(hi, _coerce_seq(fields.get("seq", "")))
-        archive_dir = self.root / "archive"
+        archive_dir = self._contained_dir("archive")
         if archive_dir.is_dir():
             for md in archive_dir.glob("*.md"):
+                # Same rule: a scan skips a planted link (non-disclosure).
+                if os.path.islink(md):
+                    continue
                 try:
                     fields, _ = _parse_frontmatter(md.read_text(encoding="utf-8"))
                 except OSError:
                     continue
                 hi = max(hi, _coerce_seq(fields.get("seq", "")))
-        if self.dm_dir.is_dir():
-            for md in self.dm_dir.glob("*.md"):
+        dm_dir = self._dm_dir()
+        if dm_dir.is_dir():
+            for md in dm_dir.glob("*.md"):
+                # Same rule: a scan skips a planted link (non-disclosure).
+                if os.path.islink(md):
+                    continue
                 try:
                     raw = md.read_text(encoding="utf-8")
                 except OSError:
