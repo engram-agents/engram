@@ -191,20 +191,40 @@ def test_c3_replaced_server_sweeps(reset_state, monkeypatch):
 
 
 def test_c3_replaced_server_sweeps_when_first_is_freed(reset_state, monkeypatch):
-    monkeypatch.setitem(sys.modules, "server", types.ModuleType("server"))
+    first = types.ModuleType("server")
+    monkeypatch.setitem(sys.modules, "server", first)
     assert rsc.release_if_server_changed() is True
+    ref = weakref.ref(first)
+    del first
     sys.modules.pop("server", None)
-    gc.collect()
+    _assert_freed(ref, "first server module", [1])
     sys.modules["server"] = types.ModuleType("server")
     assert rsc.release_if_server_changed() is True
+
+
+def _assert_freed(ref, what, budget):
+    """The 'freed predecessor' precondition is observed, not assumed (#4420): a bare module has
+    no cycle, so CPython frees it when its last reference goes. If it is still alive, spend the
+    cell's ONE collection (`budget == [1]`, created per cell) and look again; if the budget is
+    already spent, fail at once without collecting, so a retained reference can never turn a
+    cell back into a loop of full collections."""
+    if ref() is not None:
+        assert budget[0] > 0, (
+            f"{what} is still alive and this cell's one collection was already spent"
+        )
+        budget[0] -= 1
+        gc.collect()
+    assert ref() is None, f"{what} is still alive: the freed-predecessor precondition failed"
 
 
 def test_c3a_freed_predecessor_never_makes_helper_skip(reset_state, monkeypatch):
     monkeypatch.setitem(sys.modules, "server", types.ModuleType("server"))  # restores after
     results = []
+    budget = [1]  # one collection for the whole 50-iteration loop
     for _ in range(50):
+        ref = weakref.ref(sys.modules["server"])
         sys.modules.pop("server", None)
-        gc.collect()
+        _assert_freed(ref, "predecessor server module", budget)
         sys.modules["server"] = types.ModuleType("server")
         results.append(rsc.release_if_server_changed())
     assert results == [True] * 50, f"{results.count(False)} of 50 replacements were missed"
@@ -217,8 +237,42 @@ def test_c3b_helper_does_not_keep_server_alive(reset_state, monkeypatch):
     ref = weakref.ref(server)
     del server
     sys.modules.pop("server", None)
-    gc.collect()
-    assert ref() is None, "helper pins the last server module"
+    _assert_freed(ref, "helper pins the last server module", [1])
+
+
+def test_c3_assert_freed_fails_fast_when_the_collection_budget_is_spent(monkeypatch):
+    """A retained reference (a tracer, a plugin) must not turn a cell into a collect loop: the
+    first survivor spends the cell's one collection, the second fails without collecting."""
+    calls = []
+    monkeypatch.setattr(gc, "collect", lambda *a, **k: calls.append(1) or 0)
+    alive = types.ModuleType("server")  # kept alive on purpose
+    ref = weakref.ref(alive)
+    budget = [1]
+    with pytest.raises(AssertionError):  # budget spent on this one, still alive
+        _assert_freed(ref, "first survivor", budget)
+    with pytest.raises(AssertionError, match="already spent") as exc:
+        _assert_freed(ref, "second survivor", budget)
+    assert "second survivor" in str(exc.value)
+    assert len(calls) == 1, f"expected exactly one collection, saw {len(calls)}"
+
+
+def test_c3_cells_do_not_collect_on_the_healthy_path(reset_state, monkeypatch):
+    """#4420: bare-module cells free by refcount, so none may call gc.collect at all on CPython
+    (count must be exactly zero); on other interpreters at most one (the cell's budget). The
+    replacement is a pure counter and never collects, so this cell cannot itself pay for a
+    full collection on a heavy heap; an unhealthy cell fails its freed assertion instead."""
+    calls = []
+    monkeypatch.setattr(gc, "collect", lambda *a, **k: calls.append(1) or 0)
+    limit = 0 if sys.implementation.name == "cpython" else 1
+    for cell in (
+        test_c3_replaced_server_sweeps_when_first_is_freed,
+        test_c3a_freed_predecessor_never_makes_helper_skip,
+        test_c3b_helper_does_not_keep_server_alive,
+    ):
+        del calls[:]
+        rsc._reset_for_tests()
+        cell(reset_state, monkeypatch)
+        assert len(calls) <= limit, f"{cell.__name__} called gc.collect {len(calls)} times"
 
 
 def test_c3_absent_server_does_not_sweep(reset_state, monkeypatch):
