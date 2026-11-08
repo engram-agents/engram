@@ -1152,17 +1152,76 @@ def test_c3_home_symlink_to_a_file_is_an_error_entry(tmp_path):
     assert stat.S_IMODE(os.stat(f).st_mode) == 0o644
 
 
-@pytest.mark.parametrize("bad", [None, 42, ""], ids=["none", "int", "empty-string"])
+class _BytesPath:
+    """An os.PathLike whose __fspath__ returns bytes (os.fspath accepts it)."""
+
+    def __init__(self, p):
+        self._p = os.fsencode(str(p))
+
+    def __fspath__(self):
+        return self._p
+
+
+def _snapshot_all(root: Path):
+    """Mode of EVERY path under root (not only the tighten scope), so a stray chmod shows."""
+    out = {root: os.lstat(root).st_mode}
+    for dp, dns, fns in os.walk(root):
+        for n in dns + fns:
+            q = Path(dp) / n
+            out[q] = os.lstat(q).st_mode
+    return out
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [None, 0, 42, "", Path(""), Path(), Path("."), ".", "rel/home", "./rel/home", Path("rel/home")],
+    ids=["none", "zero", "int", "empty-string", "path-empty", "path-bare", "path-dot", "dot-string",
+         "relative-string", "dot-relative-string", "relative-path"],
+)
 def test_c3_non_path_home_is_an_error_entry_and_changes_nothing(tmp_path, monkeypatch, bad):
-    """None and 42 are not paths; "" would realpath to the CURRENT DIRECTORY, which must never
-    be tightened by accident. cwd is a loose tree here so a wrong answer is visible."""
+    """None and 42 are not paths; "" / Path("") / "." / a relative path would resolve against the
+    CURRENT DIRECTORY, which must never be tightened by accident (#4479). cwd is a scratch loose
+    tree (with a loose tree at rel/home too, so a relative home that DID resolve would be
+    visible) so a wrong answer is visible and a failure cannot touch the repo."""
     cwd = tmp_path / "cwd"
     _loose_tree(cwd)
+    (cwd / "rel").mkdir()
+    _loose_tree(cwd / "rel" / "home")
     monkeypatch.chdir(cwd)
-    before = {p: os.lstat(p).st_mode for p in _in_scope(cwd)}
+    before = _snapshot_all(cwd)
     res = _perms().tighten_data_home(bad)
-    assert res.changed == [] and res.errors, res
-    assert {p: os.lstat(p).st_mode for p in _in_scope(cwd)} == before
+    assert res.changed == [] and len(res.errors) == 1, res
+    assert "is not a usable path, nothing was changed" in res.errors[0], res.errors
+    assert _snapshot_all(cwd) == before
+
+
+@pytest.mark.parametrize("kind", ["bytes", "pathlike-bytes"])
+def test_c3_bytes_home_is_refused_and_the_whole_tree_is_unchanged(tmp_path, monkeypatch, kind):
+    """A bytes home (or a PathLike whose __fspath__ returns bytes) is REFUSED, not half-handled:
+    on the unfixed tree the root was tightened but diary/ and diary/f.txt were left loose
+    (#4479). The real loose tree is absolute, so only the type can be what refuses it."""
+    home = tmp_path / "h"
+    _loose_tree(home)
+    monkeypatch.chdir(tmp_path)  # scratch cwd, never the repo
+    before = _snapshot_all(home)
+    arg = os.fsencode(str(home)) if kind == "bytes" else _BytesPath(home)
+    res = _perms().tighten_data_home(arg)
+    assert res.changed == [] and len(res.errors) == 1, res
+    assert "is not a usable path, nothing was changed" in res.errors[0], res.errors
+    assert _snapshot_all(home) == before
+    assert stat.S_IMODE(os.lstat(home).st_mode) == 0o755
+    assert stat.S_IMODE(os.lstat(home / "diary").st_mode) == 0o755
+    assert stat.S_IMODE(os.lstat(home / "diary" / "f.txt").st_mode) == 0o644
+
+
+def test_c3_absolute_str_and_path_homes_still_tighten(tmp_path):
+    """The refusal must not catch the forms that work: an absolute str and an absolute Path."""
+    for i, wrap in enumerate((str, Path)):
+        home = tmp_path / f"h{i}"
+        _loose_tree(home)
+        res = _perms().tighten_data_home(wrap(home))
+        assert res.errors == [], res
+        _assert_tight(home)
 
 
 # The contract cells this file must keep. Deleting one (it has happened: three cells vanished
@@ -1182,6 +1241,8 @@ REQUIRED_CONTRACT_CELLS = (
     "test_c3_dangling_home_symlink_is_an_error_entry_not_a_raise",
     "test_c3_home_symlink_to_a_file_is_an_error_entry",
     "test_c3_non_path_home_is_an_error_entry_and_changes_nothing",
+    "test_c3_bytes_home_is_refused_and_the_whole_tree_is_unchanged",
+    "test_c3_absolute_str_and_path_homes_still_tighten",
     "test_c3_symlinks_never_followed_or_changed",
     "test_a_cell_makes_the_home_root_itself_a_symlink",
     "test_c3_hard_linked_file_is_skipped_and_outside_mode_kept",

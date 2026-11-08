@@ -15,7 +15,11 @@ transcripts), not only the viz health snapshots. Only the owning-group and other
 cleared. Details under "Owner-only EXCEPT" below.
 
 The root `home` is resolved once with realpath (ENGRAM_HOME may be a symlink to a bigger
-disk); a root that does not resolve to a directory is an `errors` entry. Below the root:
+disk); a root that does not resolve to a directory is an `errors` entry. `home` must be an
+absolute str or os.PathLike returning an absolute str: anything else (None, an int, "",
+Path(""), ".", a relative path, bytes or a PathLike returning bytes) is ONE `errors` entry and
+nothing is changed (a relative path would resolve against the current directory; bytes is
+refused rather than decoded, the smaller and safer change). Below the root:
 
 Rules, per path, never following a symlink (a symlink is skipped, its target never touched):
   * Directories never widen: they lose group and other bits like files do (a 0500 directory stays
@@ -238,10 +242,13 @@ def tighten_data_home(home) -> TightenResult:
     try:
         # The ROOT is resolved once: ENGRAM_HOME may legitimately be a symlink (a bigger disk).
         # Symlinks INSIDE the tree are still never followed.
-        # Not a path (None, an int) or an empty string is an error entry: realpath("") is the
-        # CURRENT DIRECTORY, which must never be tightened by accident.
+        # Not an ABSOLUTE str path (None, an int, "", Path(""), ".", a relative path, bytes) is an
+        # error entry: realpath of a relative path resolves against the CURRENT DIRECTORY, which
+        # must never be tightened by accident. bytes (also a PathLike returning bytes) is refused
+        # rather than fsdecode'd: the smaller, safer change; it used to be half-handled (root
+        # tightened, the str-only walk below left the children loose).
         raw = os.fspath(home) if isinstance(home, (str, bytes, os.PathLike)) else None
-        if not raw:
+        if not isinstance(raw, str) or not os.path.isabs(raw):
             res.errors.append(f".: {home!r} is not a usable path, nothing was changed")
             return res
         root = os.path.realpath(raw)
