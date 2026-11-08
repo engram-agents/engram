@@ -88,6 +88,15 @@
 #                                        # (this is first-session-only, NOT a
 #                                        # general rename — names are immutable
 #                                        # post-finalize — names are immutable).
+#   agentctl oom-status [<seat> ...]     # read-only: print the OOM protection the
+#                                        # unit ASKED for and the oom_score_adj each
+#                                        # live process actually READS. No seat ->
+#                                        # every seat. Exit 0 OK, 1 a problem
+#                                        # (ACCEPTED-NOT-APPLIED / UNPROTECTED),
+#                                        # 2 usage error (unknown seat) or a seat
+#                                        # that could not be reported, 3 UNKNOWN
+#                                        # (could not tell). Across several seats
+#                                        # a definite problem outranks an unknown.
 #
 # Exit codes of the four root verbs (spawn, finalize-name, share, unshare):
 #   Exit 8  the action HAPPENED but its audit-log line (or, for unshare, its state
@@ -431,6 +440,573 @@ except Exception as e:
         fi
         printf '%-12s %-7s %-22s %-10s\n' "$name" "$uid" "$last_sleep" "$([ -r "$hf" ] && echo OK || echo MISSING)"
     done < <(list_agents)
+}
+
+# ---------- oom-status ----------
+# Read-only report of OOM protection for one or more agent seats.
+#
+# Why this exists (engram-alpha#4436): systemd ACCEPTING an OOMScoreAdjust
+# property is not evidence that it took effect. An unprivileged
+# `systemd-run --user -p OOMScoreAdjust=-200` accepts the property, runs the
+# process at 100, and still reports `result success`. The only thing that
+# settles "what took effect" is /proc/<pid>/oom_score_adj read inside the live
+# process, so this verb prints the requested value and the effective value side
+# by side and never infers one from the other.
+#
+# Process ENUMERATION is by USER, never by cgroup: a seat's processes live in
+# the unit's cgroup after a boot start, in a login session scope after a human
+# relaunch, or in a tmux-spawn scope on some paths. Selecting by cgroup is what
+# makes a healthy seat report "no processes found". The VERDICT, however, is
+# computed over SESSION processes only: the uid also owns unrelated services
+# (engramd-owner, dbus) whose oom_score_adj the seat's drop-in can never make
+# negative, so counting them made OK unreachable. A process is SESSION iff its
+# cgroup equals the unit's ControlGroup, or it is a .scope under the seat's own
+# user slice (user-<uid>.slice/...), except the user manager's own init.scope
+# and a default-named `systemd-run --user --scope` transient (run-<hex>.scope).
+# Everything else is CONTEXT: printed, never counted.
+#
+# Exit codes ARE the verdict: 0 OK, 1 a problem (OUTSIDE-UNIT,
+# ACCEPTED-NOT-APPLIED or UNPROTECTED), 2 a usage error (unknown seat) or a seat
+# that could not be reported, 3 UNKNOWN. UNKNOWN has its own code so a script
+# cannot collapse "could not tell" into "fine". Across several seats a DEFINITE
+# outcome outranks a softer one (1 > 2 > 3 > 0, see the roll-up comment in
+# cmd_oom_status).
+
+# How many process rows one seat prints. The verdict is computed over every
+# SESSION process found (context processes never enter it); when rows are
+# omitted the report says how many, so a truncated display never reads as the
+# whole population.
+readonly OOM_STATUS_DISPLAY_CAP=50
+
+# The process tree to inspect. A test seam only: defaults to the real /proc and
+# is set by nothing outside the test suite.
+_oom_proc_root() {
+    printf '%s' "${AGENTCTL_OOM_PROC_ROOT:-/proc}"
+}
+
+# Print one file's contents; return 1 if it cannot be read. Callers put this in
+# an `if`, so `set -e` never aborts the report when a pid vanishes mid-scan.
+_oom_read_file() {
+    local f="$1"
+    [[ -r "$f" ]] || return 1
+    cat "$f" 2>/dev/null || return 1
+}
+
+# Last two components of a cgroup line ("0::/system.slice/x.service" ->
+# "system.slice/x.service"): narrow enough for the table, while keeping the
+# part that says who started the process.
+_oom_cgroup_short() {
+    local cg="${1#0::}"
+    cg="${cg%/}"
+    local last="${cg##*/}"
+    local head="${cg%/*}"
+    if [[ -n "$last" && "$head" != "$cg" && -n "${head##*/}" ]]; then
+        last="${head##*/}/$last"
+    fi
+    printf '%s' "$last"
+}
+
+# The unified cgroup path a process lives in ("0::/system.slice/x.service" ->
+# "/system.slice/x.service"). Returns 1 when the file holds no unified line:
+# without one the process cannot be placed, and the verdict says UNKNOWN
+# rather than guessing.
+_oom_cgroup_path() {
+    local line
+    while IFS= read -r line; do
+        [[ "$line" == 0::* ]] || continue
+        printf '%s' "${line#0::}"
+        return 0
+    done <<< "$1"
+    return 1
+}
+
+# True when a cgroup path is a transient .scope anywhere under the seat's own
+# user slice (user-<uid>.slice/...). Both launch paths the verb exists for are
+# covered: a tmux-spawn scope nested under user@<uid>.service
+# (user@<uid>.service/app.slice/app-tmux.slice/tmux-spawn-*.scope) and a logind
+# login-session scope directly under the user slice
+# (user-<uid>.slice/session-N.scope). Each seat has its own uid, hence its own
+# slice, so the uid-bounded match cannot leak across seats.
+#
+# The `.scope`-versus-`.service` split is the rule, not a detail: systemd names
+# an EXTERNALLY-CREATED process group `.scope` (tmux-spawn, login session,
+# systemd-run), while `.service` names a MANAGED daemon (engramd-owner,
+# dbus) that the seat does not run as part of its session. Counting the
+# daemons is what made OK unreachable and every seat read
+# ACCEPTED-NOT-APPLIED (#4436).
+_oom_is_session_scope() {
+    local path="$1" uid="$2" name
+    [[ "$path" == *.scope ]] || return 1
+    [[ "$path" == *"/user-${uid}.slice/"* ]] || return 1
+    name="${path##*/}"
+    # init.scope IS the user manager itself, not a transient process group
+    # created for the seat: a drop-in on the seat unit cannot reach it, and
+    # counting it made every seat read OUTSIDE-UNIT on a real host (measured on
+    # uid 1008: user@1008.service/init.scope at oom_score_adj 100, holding
+    # systemd and sd-pam). Measured, not assumed.
+    [[ "$name" != "init.scope" ]] || return 1
+    # A `systemd-run --user --scope` one-shot is not the seat's session either.
+    # systemd's default transient name is run-<32 hex>.scope, under
+    # user@<uid>.service/app.slice/ where the widened rule would otherwise call
+    # it SESSION and flip a protected seat to OUTSIDE-UNIT. Measured on uid
+    # 1008: `systemd-run --user --scope --quiet sleep 3` produced
+    #   /sys/fs/cgroup/user.slice/user-1008.slice/user@1008.service/app.slice/
+    #     run-r30af8eafd81248d5a8731c3db2d1e815.scope
+    #
+    # Stated bound: a transient started with an explicit --unit=<name> becomes
+    # <name>.scope, which this exclusion does NOT catch; it will still count as
+    # session. Excluding arbitrary names as well would be worse than this
+    # stated hole.
+    [[ "$name" != run-* ]]
+}
+
+# MemoryMax is finite when systemd reports an integer; its unset value is the
+# literal string "infinity".
+_oom_memory_is_finite() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# True when a validated decimal score string ("-200", "0", "09") is negative.
+# LEXICAL on purpose: `(( 09 >= 0 ))` parses 09 as invalid octal and errors, so
+# no externally supplied number ever goes through $(( )) in this verb.
+_oom_is_negative() {
+    [[ "$1" == -* && "$1" != "-0" ]]
+}
+
+# State letter from /proc/<pid>/stat ("R", "S", "Z", ...). Returns 1 when the
+# file cannot be read (the process vanished mid-scan). The comm field is
+# parenthesised and may itself contain ") ", so strip through the LAST ") ".
+_oom_proc_state() {
+    local line
+    line=$(_oom_read_file "$1/stat") || return 1
+    local rest="${line##*) }"
+    printf '%s' "${rest%% *}"
+}
+
+# Print the seat names for oom-status and return 0 when the group LOOKUP
+# succeeded, 1 when it failed (getent absent, or the group cannot be read).
+# An existing group with no agent-* members is SUCCESS with no output: that is
+# an empty universe, not an unknown one. list_agents itself is untouched and
+# still serves the other verbs; this wrapper exists only to keep the status,
+# which list_agents' pipeline discards.
+_oom_known_seats() {
+    local group_line
+    if ! group_line=$(getent group agents 2>/dev/null); then
+        return 1
+    fi
+    printf '%s\n' "$group_line" \
+        | awk -F: '{print $4}' \
+        | tr ',' '\n' \
+        | grep -E '^agent-' \
+        | sed 's/^agent-//' \
+        | sort || true
+    return 0
+}
+
+# Usage: _oom_seat_report <seat>
+# Prints the seat block and returns the verdict's exit code (0, 1 or 3; 2 for
+# a seat whose Linux user has vanished since validation).
+_oom_seat_report() {
+    local seat="$1"
+    local user="agent-$seat"
+    local unit="agent-session@${seat}.service"
+
+    local uid
+    uid=$(id -u "$user" 2>/dev/null) || {
+        echo "ERROR: agent seat '$seat' has no Linux user '$user'" >&2
+        return 2
+    }
+
+    # --- requested (the unit property) and the memory bound ---
+    local load="unknown" active="unknown" req="" mmax="" unit_cg=""
+    local facts_ok=0
+    local systemctl_out=""
+    if systemctl_out=$(systemctl show "$unit" \
+            -p LoadState -p ActiveState -p OOMScoreAdjust -p MemoryMax \
+            -p ControlGroup 2>/dev/null); then
+        facts_ok=1
+        local key value
+        while IFS='=' read -r key value; do
+            case "$key" in
+                LoadState)      load="$value" ;;
+                ActiveState)    active="$value" ;;
+                OOMScoreAdjust) req="$value" ;;
+                MemoryMax)      mmax="$value" ;;
+                ControlGroup)   unit_cg="$value" ;;
+            esac
+        done <<< "$systemctl_out"
+    fi
+
+    printf '=== %s (%s, uid %s) ===\n' "$seat" "$user" "$uid"
+
+    if (( facts_ok == 0 )); then
+        printf 'requested: %s  [%s]\n' "unavailable" "systemctl query failed"
+        printf 'memory:    %s  [%s]\n' "unavailable" "systemctl query failed"
+    else
+        local req_display req_note
+        if [[ "$load" == "not-found" ]]; then
+            req_display="n/a"
+            req_note="unit not found"
+        elif [[ "$active" == "inactive" ]]; then
+            # A template instance systemd has never started still answers with
+            # the property's default; that default is not a configured policy.
+            req_display="$req"
+            req_note="unit inactive: property default, not a running policy"
+        else
+            req_display="$req"
+            req_note="unit $active"
+        fi
+        printf 'requested: %s  [%s]\n' "$req_display" "$req_note"
+        if _oom_memory_is_finite "$mmax"; then
+            printf 'memory:    MemoryMax=%s  [bounded]\n' "$mmax"
+        else
+            printf 'memory:    MemoryMax=%s  [no bound]\n' "$mmax"
+        fi
+    fi
+    # Printed ALWAYS: the placement question ("would this drop-in reach the
+    # seat's processes?") must be answerable from this report alone.
+    if (( facts_ok == 0 )); then
+        printf 'unit cgroup: unknown  [systemctl query failed]\n'
+    elif [[ -n "$unit_cg" ]]; then
+        printf 'unit cgroup: %s\n' "$unit_cg"
+    else
+        printf 'unit cgroup: (not reported by systemd)\n'
+    fi
+
+    # --- effective (live processes, selected by user, never by cgroup) ---
+    local root
+    root="$(_oom_proc_root)"
+    local -a pids=()
+    local pid_count=0
+    local d owner pid
+    for d in "$root"/[0-9]*; do
+        [[ -d "$d" ]] || continue
+        owner=$(stat -c %u "$d" 2>/dev/null) || continue
+        [[ "$owner" == "$uid" ]] || continue
+        pid="${d##*/}"
+        pids+=("$pid")
+        pid_count=$((pid_count + 1))
+    done
+    if (( pid_count > 1 )); then
+        local sorted
+        sorted=$(printf '%s\n' "${pids[@]}" | sort -n)
+        pids=()
+        pid_count=0
+        while IFS= read -r pid; do
+            [[ -n "$pid" ]] || continue
+            pids+=("$pid")
+            pid_count=$((pid_count + 1))
+        done <<< "$sorted"
+    fi
+
+    printf '%-8s %-16s %-14s %s\n' 'PID' 'COMM' 'OOM_SCORE_ADJ' 'CGROUP'
+    printf '%-8s %-16s %-14s %s\n' '--------' '----------------' '-------------' '------'
+
+    local total=0 shown=0 unknown_proc=0 unknown_pid=""
+    local session_total=0 session_outside=0 context_total=0 cgroup_unknown=0
+    local any_session_nonneg=0
+    local -a session_cgs=()
+    local comm cg_raw cg_path cg_short score score_display pstate role
+    local seen_cg cg_seen
+    for pid in "${pids[@]+"${pids[@]}"}"; do
+        # A zombie (Z) or dead (X) process has no memory and cannot be
+        # OOM-killed: it is not part of the protection surface. Its
+        # oom_score_adj still reads 0, so counting it would flip a fully
+        # protected seat to ACCEPTED-NOT-APPLIED. Skip it the same way a
+        # vanished process is skipped below.
+        if pstate=$(_oom_proc_state "$root/$pid"); then
+            case "$pstate" in
+                Z|X) continue ;;
+            esac
+        fi
+        if comm=$(_oom_read_file "$root/$pid/comm"); then
+            # comm is up to 15 bytes of arbitrary text; a raw newline, tab or
+            # CR would break the row. It is printed as an argument, so this is
+            # layout hygiene, not a format-string concern.
+            comm="${comm//$'\n'/ }"
+            comm="${comm//$'\t'/ }"
+            comm="${comm//$'\r'/ }"
+        else
+            comm="?"
+        fi
+        cg_path=""
+        cg_short="?"
+        if cg_raw=$(_oom_read_file "$root/$pid/cgroup"); then
+            cg_short="$(_oom_cgroup_short "${cg_raw%%$'\n'*}")"
+            cg_path=$(_oom_cgroup_path "$cg_raw") || cg_path=""
+        fi
+        # Classify BEFORE the score read: only a SESSION process's unreadable
+        # score is "could not tell". A context process is context either way,
+        # and a context score of 100 (engramd-owner) says nothing about the
+        # seat's policy.
+        role="context"
+        if [[ -z "$cg_path" ]]; then
+            role="unknown"
+        elif [[ -n "$unit_cg" && "$cg_path" == "$unit_cg" ]]; then
+            role="session"
+        elif _oom_is_session_scope "$cg_path" "$uid"; then
+            role="session"
+        fi
+        if score=$(_oom_read_file "$root/$pid/oom_score_adj") \
+                && [[ "$score" =~ ^-?[0-9]+$ ]]; then
+            score_display="$score"
+        else
+            if [[ ! -e "$root/$pid/oom_score_adj" ]]; then
+                # The process exited between enumeration and this read (its
+                # proc entry is gone). It is no longer a live process, so it
+                # is not evidence of "could not tell": skip it. Without this,
+                # any transient process exiting mid-scan made a healthy seat
+                # flake to UNKNOWN (measured with 30 ms-lived processes). A
+                # file that EXISTS but cannot be read, or reads as garbage,
+                # still sets UNKNOWN below -- that is the real "unreadable".
+                continue
+            fi
+            score_display="?"
+        fi
+        total=$((total + 1))
+        case "$role" in
+            session)
+                session_total=$((session_total + 1))
+                if [[ -n "$unit_cg" && "$cg_path" == "$unit_cg" ]]; then
+                    :
+                else
+                    session_outside=$((session_outside + 1))
+                fi
+                if [[ "$score_display" == "?" ]]; then
+                    unknown_proc=1
+                    if [[ -z "$unknown_pid" ]]; then
+                        unknown_pid="$pid"
+                    fi
+                elif ! _oom_is_negative "$score_display"; then
+                    any_session_nonneg=1
+                fi
+                # Distinct cgroups only: the placement question is answered by
+                # the set of session cgroups, and listing every pid would leak
+                # pids the display cap deliberately hides.
+                cg_seen=0
+                for seen_cg in "${session_cgs[@]+"${session_cgs[@]}"}"; do
+                    if [[ "$seen_cg" == "$cg_path" ]]; then
+                        cg_seen=1
+                        break
+                    fi
+                done
+                if (( cg_seen == 0 )); then
+                    session_cgs+=("$cg_path")
+                fi
+                ;;
+            unknown)
+                # A cgroup we cannot read could be the unit's or a session
+                # scope: the placement is undeterminable, so the verdict is
+                # UNKNOWN rather than a guess.
+                cgroup_unknown=1
+                if [[ "$score_display" == "?" && -z "$unknown_pid" ]]; then
+                    unknown_pid="$pid"
+                fi
+                ;;
+            *)
+                context_total=$((context_total + 1))
+                ;;
+        esac
+        if (( shown < OOM_STATUS_DISPLAY_CAP )); then
+            printf '%-8s %-16.16s %-14s %s\n' "$pid" "$comm" "$score_display" "$cg_short"
+            shown=$((shown + 1))
+        fi
+    done
+
+    if (( total > shown )); then
+        printf '... (%d more process(es) not shown; verdict computed over session processes among all %d)\n' \
+            "$((total - shown))" "$total"
+    fi
+
+    # The placement evidence: UNIT_CG above, and the full cgroup of every
+    # SESSION process here. Context processes are summarized, not listed.
+    printf 'session: %d process(es), %d outside the unit cgroup\n' \
+        "$session_total" "$session_outside"
+    local scg
+    for scg in "${session_cgs[@]+"${session_cgs[@]}"}"; do
+        printf '  session cgroup: %s\n' "$scg"
+    done
+    printf 'context: %d process(es) owned by uid %s, never counted in the verdict\n' \
+        "$context_total" "$uid"
+
+    # --- verdict ---
+    local req_known=0 req_negative=0
+    if [[ "$req" =~ ^-?[0-9]+$ ]]; then
+        req_known=1
+        if _oom_is_negative "$req"; then
+            req_negative=1
+        fi
+    fi
+
+    # --- verdict: SESSION processes only, in the contract's order ---
+    local state code reason
+    if (( total == 0 )); then
+        state="UNKNOWN"; code=3
+        reason="no live process found for $user"
+    elif (( facts_ok == 0 )); then
+        state="UNKNOWN"; code=3
+        reason="could not query systemd unit $unit"
+    elif (( session_total == 0 )) && (( cgroup_unknown == 0 )); then
+        state="UNKNOWN"; code=3
+        reason="no session process found for $user: all $total live process(es) owned by the uid are context (.service units, init.scope, or scopes outside user-$uid.slice)"
+    elif (( cgroup_unknown != 0 )); then
+        state="UNKNOWN"; code=3
+        reason="the cgroup of at least one live process owned by $user could not be read, so session placement could not be determined"
+    elif (( unknown_proc != 0 )); then
+        state="UNKNOWN"; code=3
+        reason="at least one session process's /proc/<pid>/oom_score_adj was unreadable or unparseable (first: pid $unknown_pid)"
+    elif (( req_known == 0 )); then
+        state="UNKNOWN"; code=3
+        reason="systemd reported no parseable OOMScoreAdjust for $unit"
+    elif (( session_outside != 0 )); then
+        # OUTSIDE-UNIT outranks the policy verdicts: when the session did not
+        # launch through the unit, "the drop-in was not applied" is the wrong
+        # diagnosis -- the drop-in cannot reach these processes at all.
+        state="OUTSIDE-UNIT"; code=1
+        reason="$session_outside of $session_total session process(es) live outside unit cgroup ${unit_cg:-<unknown>}; relaunch the seat through its unit so the drop-in applies"
+    elif (( any_session_nonneg == 0 )) && _oom_memory_is_finite "$mmax"; then
+        state="OK"; code=0
+        reason="all $session_total live process(es) (session-scoped) read a negative oom_score_adj and MemoryMax=$mmax is finite"
+        if (( req_negative == 0 )); then
+            # OK is decided on the EFFECTIVE state, so a non-negative requested
+            # value does not block it. Say so explicitly: protection that did
+            # not come from the policy will not survive a relaunch, and pushing
+            # the reader to install a drop-in that does not reach these
+            # processes is the placement error this verb exists to expose.
+            if [[ "$load" == "not-found" ]]; then
+                reason="$reason; note: the unit was not found, so this protection did not come from its policy and will not survive a relaunch from it"
+            else
+                reason="$reason; note: requested OOMScoreAdjust=$req is not negative, so this protection did not come from the unit policy and will not survive a relaunch from it"
+            fi
+        fi
+    elif (( req_negative != 0 )) && (( any_session_nonneg != 0 )); then
+        state="ACCEPTED-NOT-APPLIED"; code=1
+        reason="requested OOMScoreAdjust=$req is negative but at least one session process reads >= 0"
+    elif (( req_negative != 0 )); then
+        # The table has no row for "requested negative, applied, but no finite
+        # memory bound". Reported as UNPROTECTED: the seat lacks a memory bound,
+        # and claiming OK would contradict the OK row's finite-MemoryMax clause.
+        state="UNPROTECTED"; code=1
+        reason="every session process reads a negative oom_score_adj but MemoryMax=$mmax is not finite"
+    else
+        state="UNPROTECTED"; code=1
+        if [[ "$load" == "not-found" ]]; then
+            # The display above says n/a: never cite systemd's synthesized 0.
+            reason="unit $unit was not found, so no OOM policy is configured"
+        elif [[ "$active" == "inactive" ]]; then
+            reason="unit $unit is inactive; its OOMScoreAdjust is only a property default, not a running policy"
+        elif (( any_session_nonneg == 0 )) && ! _oom_memory_is_finite "$mmax"; then
+            # Every session process is in fact protected; the MISSING BOUND is
+            # why the seat is not OK. Name that rather than the request value.
+            reason="every session process reads a negative oom_score_adj but MemoryMax=$mmax is not finite"
+        else
+            reason="requested OOMScoreAdjust=$req is not negative"
+        fi
+    fi
+
+    printf 'verdict: %s (%s)\n' "$state" "$reason"
+    printf '\n'
+    return "$code"
+}
+
+# Usage: agentctl oom-status [<seat> ...]
+cmd_oom_status() {
+    local -a seats=()
+    local seat_count=0
+
+    # Resolve the seat universe ONCE: it is the validation set and, for a
+    # no-argument run, also the request. The LOOKUP STATUS matters: an existing
+    # group with no agent-* members is an empty universe (0 is fine), while a
+    # failed lookup means nothing could be determined (3, never 0).
+    # list_agents discards getent's status inside its pipeline -- acceptable
+    # for the other verbs, a false "all fine" here.
+    local known_out
+    if ! known_out=$(_oom_known_seats); then
+        echo "oom-status: could not look up the 'agents' group (getent failed); no seat state could be determined" >&2
+        return 3
+    fi
+
+    local -a known=()
+    local known_count=0
+    local k
+    while IFS= read -r k; do
+        [[ -n "$k" ]] || continue
+        known+=("$k")
+        known_count=$((known_count + 1))
+    done <<< "$known_out"
+
+    if (( $# > 0 )); then
+        seats=("$@")
+        seat_count=$#
+    else
+        for k in "${known[@]+"${known[@]}"}"; do
+            seats+=("$k")
+            seat_count=$((seat_count + 1))
+        done
+    fi
+
+    if (( seat_count == 0 )); then
+        echo "oom-status: no agent seats found (the 'agents' group exists but has no agent-* members)" >&2
+        return 0
+    fi
+
+    # Validate the whole request BEFORE printing anything: a bad name is a
+    # usage error (exit 2) naming it, never a silent skip.
+    local s found
+    for s in "${seats[@]+"${seats[@]}"}"; do
+        found=0
+        for k in "${known[@]+"${known[@]}"}"; do
+            if [[ "$k" == "$s" ]]; then
+                found=1
+                break
+            fi
+        done
+        if (( found == 0 )); then
+            echo "ERROR: unknown seat '$s' (not a member of the 'agents' group)" >&2
+            if (( known_count > 0 )); then
+                echo "Known seats: ${known[*]}" >&2
+            fi
+            echo "Usage: agentctl oom-status [<seat> ...]" >&2
+            return 2
+        fi
+        if ! id -u "agent-$s" >/dev/null 2>&1; then
+            echo "ERROR: unknown seat '$s' (no Linux user 'agent-$s')" >&2
+            return 2
+        fi
+    done
+
+    # --- roll-up: NOT the numeric max ---
+    # Rank, highest first: 1 (a definite problem: some seat is UNPROTECTED or
+    # ACCEPTED-NOT-APPLIED), 2 (a seat could not be reported at all), 3 (a
+    # seat's state could not be determined), 0 (every seat OK).
+    #
+    # Arithmetic max would be the intuitive default and it is wrong here: a run
+    # with seven definitely-unprotected seats plus one unknown would return 3,
+    # telling a script "could not tell" about a run that holds seven
+    # certainties -- the very collapse the per-seat UNKNOWN code exists to
+    # prevent, reintroduced at the roll-up. A definite outcome outranks a
+    # softer one; 0 stays the floor so OK seats never mask an unknown.
+    local overall=0 saw_definite=0 saw_unreported=0 saw_unknown=0 code
+    for s in "${seats[@]+"${seats[@]}"}"; do
+        if _oom_seat_report "$s"; then
+            code=0
+        else
+            code=$?
+        fi
+        case "$code" in
+            1) saw_definite=1 ;;
+            2) saw_unreported=1 ;;
+            3) saw_unknown=1 ;;
+        esac
+    done
+    if (( saw_definite != 0 )); then
+        overall=1
+    elif (( saw_unreported != 0 )); then
+        overall=2
+    elif (( saw_unknown != 0 )); then
+        overall=3
+    fi
+    return "$overall"
 }
 
 # ---------- session helpers ----------
@@ -3017,6 +3593,7 @@ case "$SUBCMD" in
     share)         cmd_share         "$@" ;;
     unshare)       cmd_unshare       "$@" ;;
     share-status)  cmd_share_status  "$@" ;;
+    oom-status)    cmd_oom_status    "$@" ;;
     help|--help|-h) cmd_help ;;
     __codex-managed-session) cmd__codex_managed_session "$@" ;;
     __expand-session-args) cmd__expand_session_args "$@" ;;
