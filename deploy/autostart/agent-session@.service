@@ -35,6 +35,15 @@ Type=oneshot
 RemainAfterExit=yes
 User=agent-%i
 ExecStart=/usr/local/lib/agentctl/autostart/agent-session-launch.sh %i
+# #4435: claude now runs in its own user scope (agent-claude-%i.scope, created
+# by `agentctl __scope-exec`), outside this unit's cgroup, so stopping this unit
+# no longer reaches it by itself. ExecStop stops that scope, which keeps
+# `systemctl stop|restart agent-session@<name>` ending the session as before.
+# `-`: a failure here (e.g. user manager down) never fails this unit's stop.
+# This line depends on `User=agent-%i` above: without that line, ExecStop runs as root,
+# `__scope-stop` refuses, the `-` prefix swallows the refusal, and the scope survives
+# the unit stop silently.
+ExecStop=-/usr/local/bin/agentctl __scope-stop %i
 
 # Restart=no — DELIBERATE, not an oversight. A crashed or failed morning
 # session must be VISIBLE to the operator (systemctl status shows

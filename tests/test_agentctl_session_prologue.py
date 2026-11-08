@@ -203,7 +203,28 @@ def test_every_claude_launch_site_carries_the_prologue():
 
 # Each Claude launch site is one line of the cmd_session body carrying one of
 # these exec forms (the quoting differs per site, so match the unquoted tail).
-_CLAUDE_EXEC_MARKERS = ('exec \\"$binary\\"', "exec ~/.runtime/start.sh")
+# The two direct forms are listed on purpose: a site that execs the binary
+# directly (no scope verb, #4435) is still FOUND as a launch site, then fails
+# `_check_scope_exec_word` instead of silently dropping out of the count.
+_CLAUDE_EXEC_MARKERS = (
+    'exec \\"$binary\\"', "exec ~/.runtime/start.sh", "exec $scope_words",
+)
+
+
+def _check_scope_exec_word(line: str) -> None:
+    """Assert the FIRST `exec` on the line execs `$scope_words` (the abs-agentctl
+    + `__scope-exec` + seat words the outer shell inserted), directly followed
+    by the launch target (`"$binary"` or the start.sh adapter)."""
+    where = f"launch site: {line.strip()!r}"
+    m = re.search(r"exec (\S+)", line)
+    assert m, f"no exec on the line -- {where}"
+    assert m.group(1) == "$scope_words", (
+        f"exec does not go through `$scope_words` (__scope-exec) -- {where}"
+    )
+    after = line[m.end():]
+    assert re.match(r"""\s*(\\"\$binary\\"|"'~/\.runtime/start\.sh|~/\.runtime/start\.sh)""", after), (
+        f"`$scope_words` is not directly followed by the launch target -- {where}"
+    )
 
 
 def _check_launch_site_order(line: str) -> None:
@@ -216,6 +237,7 @@ def _check_launch_site_order(line: str) -> None:
     assert p != -1, f"no `$prologue;` on the same line as the exec -- {where}"
     exec_at = min(i for i in (line.find(m) for m in _CLAUDE_EXEC_MARKERS) if i != -1)
     assert p < exec_at, f"`$prologue;` is not before `exec` -- {where}"
+    _check_scope_exec_word(line)
     # Any `cd` command, whatever its argument form: a `cd` token not glued to a
     # word, `$`, `.`, `/` or `-` on its left (so not `abcd`, `$cd`, `./cd`) and
     # followed by whitespace.
@@ -249,26 +271,39 @@ def test_every_claude_launch_site_runs_the_prologue_before_cd_and_exec():
 # The four real shapes below are each used twice in cmd_session (as-self and
 # sudo carry identical text), so four distinct strings cover the eight sites.
 _ORDER_PASS_LINES = [
-    '"$prologue; cd $(printf \'%q\' "${cwd_arg[0]}") && exec \\"$binary\\" \\"\\$@\\""',
-    '"$prologue; exec \\"$binary\\" \\"\\$@\\""',
-    '"$prologue; cd $(printf \'%q\' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \\"\\$@\\""',
-    '"$prologue; "\'exec ~/.runtime/start.sh "$@"\'',
+    '"$prologue; cd $(printf \'%q\' "${cwd_arg[0]}") && exec $scope_words \\"$binary\\" \\"\\$@\\""',
+    '"$prologue; exec $scope_words \\"$binary\\" \\"\\$@\\""',
+    '"$prologue; cd $(printf \'%q\' "${cwd_arg[0]}") && exec $scope_words ~/.runtime/start.sh \\"\\$@\\""',
+    '"$prologue; exec $scope_words "\'~/.runtime/start.sh "$@"\'',
     # Any cd form is fine as long as the prologue and exec order holds.
-    '"$prologue; cd . && exec \\"$binary\\" \\"\\$@\\""',
+    '"$prologue; cd . && exec $scope_words \\"$binary\\" \\"\\$@\\""',
     # `cd` inside another word, as a variable, or as a path component is not a
     # cd command (guards the regex's left boundary).
-    '"$prologue; exec \\"$binary\\" \\"\\$@\\"; echo abcd $cd ./cd x"',
+    '"$prologue; exec $scope_words \\"$binary\\" \\"\\$@\\"; echo abcd $cd ./cd x"',
 ]
 _ORDER_RAISE_LINES = [
     # cd before the prologue (a cd form other than `cd $(printf`).
-    '"cd . && $prologue; exec \\"$binary\\" \\"\\$@\\""',
-    '"cd \\"$d\\" && $prologue; exec ~/.runtime/start.sh \\"\\$@\\""',
+    '"cd . && $prologue; exec $scope_words \\"$binary\\" \\"\\$@\\""',
+    '"cd \\"$d\\" && $prologue; exec $scope_words ~/.runtime/start.sh \\"\\$@\\""',
     # prologue after exec.
-    '"exec \\"$binary\\" \\"\\$@\\"; $prologue;"',
+    '"exec $scope_words \\"$binary\\" \\"\\$@\\"; $prologue;"',
     # exec with no prologue at all.
-    '"exec \\"$binary\\" \\"\\$@\\""',
+    '"exec $scope_words \\"$binary\\" \\"\\$@\\""',
     # cd after exec (prologue first).
-    '"$prologue; exec \\"$binary\\" \\"\\$@\\"; cd . "',
+    '"$prologue; exec $scope_words \\"$binary\\" \\"\\$@\\"; cd . "',
+]
+# #4435: a launch site that execs the target directly skips the OOMPolicy scope.
+# Prologue and cd order are correct on every one of these; only the scope word
+# is missing or misplaced, so these discriminate `_check_scope_exec_word`.
+_SCOPE_RAISE_LINES = [
+    '"$prologue; exec \\"$binary\\" \\"\\$@\\""',
+    '"$prologue; cd $(printf \'%q\' "${cwd_arg[0]}") && exec \\"$binary\\" \\"\\$@\\""',
+    '"$prologue; cd $(printf \'%q\' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \\"\\$@\\""',
+    '"$prologue; "\'exec ~/.runtime/start.sh "$@"\'',
+    # the scope words are present but are not what is exec'd
+    '"$prologue; echo $scope_words; exec \\"$binary\\" \\"\\$@\\""',
+    # scope words not followed by a launch target
+    '"$prologue; exec $scope_words true"',
 ]
 
 
@@ -283,11 +318,35 @@ def test_launch_site_order_check_rejects_misordered_lines(line):
         _check_launch_site_order(line)
 
 
+@pytest.mark.parametrize("line", _SCOPE_RAISE_LINES)
+def test_launch_site_order_check_rejects_sites_that_skip_the_scope_verb(line):
+    with pytest.raises(AssertionError, match="scope_words|launch target"):
+        _check_launch_site_order(line)
+
+
+def test_scope_words_are_built_from_abs_agentctl_and_the_quoted_seat():
+    """The words the outer shell inserts name the verb and the seat, each
+    quoted with `printf %q` (never raw, never a `$`-expansion in the inserted
+    text itself)."""
+    body = _cmd_session_body()
+    want = ('scope_words="$(printf \'%q\' "$agentctl_abs") __scope-exec '
+            '$(printf \'%q\' "$name")"')
+    assert want in body, "scope_words is not abs-agentctl + __scope-exec + %q seat"
+    assert re.search(r"agentctl_abs=.*readlink -f", body)
+    assert "cannot resolve" in body  # fails loudly when the path does not resolve
+
+
 # --- End-to-end: the REAL cmd_session under --as-self, no sudo, no real agent.
 # A fake `id` on PATH satisfies resolve_user and _as_self_check on any host;
 # a fake `claude` (or ~/.runtime/start.sh) prints argv, pwd and the SURV env.
 
 _FAKE_ID = '#!/bin/sh\nif [ "$1" = "-un" ]; then echo agent-zed; else exit 0; fi\n'
+# #4435: records its argv and runs the part after `--`; the probe says `inactive`.
+_FAKE_SYSTEMD_RUN = (
+    '#!/bin/bash\nprintf "%s\\0" "$@" >> "$FAKE_REC/sdrun.argv"\n'
+    'while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n'
+)
+_FAKE_SYSTEMCTL = '#!/bin/sh\necho inactive\n'
 _FAKE_LAUNCHEE = '#!/bin/sh\necho "ARGV:$*"; echo "PWD:$(pwd)"; env | grep ^SURV\n'
 
 
@@ -305,6 +364,12 @@ def _run_as_self(tmp_path: Path, *, claude_on_path: bool, cd: Path | None):
     _boot_env(home, "B=$NOPE_UNSET\nfalse\nSURV=yes\n")
     bindir = tmp_path / "bin"
     _exe(bindir / "id", _FAKE_ID)
+    # #4435: the launch goes through `__scope-exec`, which would create a REAL
+    # `agent-claude-zed` scope on a systemd host. Fakes first on PATH.
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    _exe(bindir / "systemd-run", _FAKE_SYSTEMD_RUN)
+    _exe(bindir / "systemctl", _FAKE_SYSTEMCTL)
     if claude_on_path:
         _exe(bindir / "claude", _FAKE_LAUNCHEE)
     else:
@@ -313,7 +378,8 @@ def _run_as_self(tmp_path: Path, *, claude_on_path: bool, cd: Path | None):
     if cd is not None:
         args += ["--cd", str(cd)]
     args += ["-c"]
-    env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(home)}
+    env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(home),
+           "FAKE_REC": str(rec), "XDG_RUNTIME_DIR": str(tmp_path)}
     return subprocess.run(args, capture_output=True, text=True, env=env)
 
 
@@ -335,6 +401,20 @@ def test_as_self_e2e_without_cd(tmp_path):
     assert "ARGV:--continue" in lines
     assert any(l.startswith("PWD:") for l in lines)
     assert "SURV=yes" in lines
+
+
+def test_as_self_e2e_goes_through_the_scope_unit(tmp_path):
+    """#4435: the as-self launch reaches the child via systemd-run with the
+    seat's own unit name (both the binary and the start.sh adapter branch)."""
+    for claude_on_path in (True, False):
+        sub = tmp_path / ("bin_branch" if claude_on_path else "adapter_branch")
+        sub.mkdir()
+        proc = _run_as_self(sub, claude_on_path=claude_on_path, cd=None)
+        assert proc.returncode == 0, proc.stderr
+        argv = (sub / "rec" / "sdrun.argv").read_bytes().split(b"\0")[:-1]
+        assert b"--unit=agent-claude-zed" in argv
+        assert b"OOMPolicy=continue" in argv
+        assert "ARGV:--continue" in proc.stdout.splitlines()
 
 
 def test_as_self_e2e_start_sh_adapter_branch(tmp_path):

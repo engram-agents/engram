@@ -1616,6 +1616,207 @@ PROLOGUE
 
 cmd__session_prologue() { session_prologue_text; }
 
+# Internal verb (#4435), not in user-facing help: exec a Claude launch inside
+# its own transient user scope, `agent-claude-<seat>.scope`, created with
+# OOMPolicy=continue. Why: on 2026-11-07 the kernel OOM-killed ONE process in a
+# session's cgroup and systemd's default OOMPolicy=stop then stopped the WHOLE
+# unit. A scope created with OOMPolicy=continue survives an OOM kill of one of
+# its processes. OOMPolicy is creation-time only (`systemctl set-property`
+# refuses it), so the launch itself must create the scope.
+#
+# Why a verb and not a function in the prologue: the prologue text is run
+# through `sudo -u <user> -i bash -c` at four launch sites, and `sudo -i`
+# backslash-escapes braces and parens and joins lines, so the prologue must stay
+# free of `${}` / `$()` / newlines. Every launch site instead execs
+# `<abs agentctl> __scope-exec <seat> <cmd> [args...]`, where the outer shell
+# inserted the path and seat with printf %q.
+#
+# Usage: agentctl __scope-exec <seat> <cmd> [args...]
+#   1. no `systemd-run` on PATH: on macOS exec <cmd> silently; on Linux one
+#      WARNING (`systemd-run not found on PATH`), then exec <cmd> unconfined.
+#   2. invalid seat name: one WARNING line, exec <cmd> unconfined.
+#   3. XDG_RUNTIME_DIR unset: use <base>/<uid> when it is a directory, else one
+#      WARNING line and exec unconfined. ENGRAM_RUNTIME_BASE (default /run/user)
+#      exists ONLY so tests can point at a temp dir; it is not an operator knob.
+#   4. ONE probe: `systemctl --user show -p ActiveState --value <unit>.scope`;
+#      a non-zero exit -> one WARNING carrying the first line of its stderr.
+#      Exit 0 but no line is exactly a systemd ActiveState word -> one WARNING
+#      `user manager probe unreadable: <first line>`, exec unconfined.
+#   5. probe says active/activating/reloading/deactivating -> name collision.
+#      Exactly ONE more systemctl call, on the collision branch only (no retry,
+#      no loop): `systemctl --user show -p ControlGroup --value <unit>.scope`
+#      (stderr discarded). If it exits 0 and its last non-empty line starts with
+#      `/`, read <cgroup root><that path>/cgroup.procs (ENGRAM_CGROUP_ROOT,
+#      default /sys/fs/cgroup, exists ONLY so tests can point at a temp dir; it
+#      is not an operator knob) and, for each pid, /proc/<pid>/comm (a pid that is
+#      unreadable or gone is skipped). If any comm is exactly `claude`: ONE ERROR
+#      line on stderr, `exit 3`, exec nothing, never call systemd-run (a live
+#      claude already owns the scope; starting a second session would be wrong).
+#      Otherwise (no claude among the pids; the ControlGroup call failing; an
+#      empty or non-`/` value; an unreadable cgroup.procs) keep the one WARNING
+#      and exec unconfined.
+#   6. otherwise exec systemd-run --user --scope ... -p OOMPolicy=continue.
+# Exit status is the child's own (everything is exec). Never prompts, never
+# sleeps. The probe's stdout and stderr share one pipe (single call, no temp
+# file): on failure stdout is empty so the first line IS stderr's first line; on
+# success the state is the LAST line that is exactly one of systemd's ActiveState
+# words (active reloading inactive failed activating deactivating maintenance
+# refreshing), so stray stderr lines such as `Warning: ...` on either side of it
+# cannot be mistaken for the state.
+#
+# STATED BOUNDS, not claims of protection:
+#   - An unreadable cgroup (or cgroup.procs) is treated as "no claude": the
+#     leftover-orphans case stays warn-and-launch.
+#   - comm matches a native install (comm `claude`; the exe basename is a version
+#     number, so never test that). A node-run claude whose comm is not `claude` is
+#     not detected (unmeasured).
+#   - Probe-then-exec has a race. If
+# systemd-run itself then fails to create the scope (for example another
+# process took the name in between), the launch FAILS with systemd-run's own
+# error; it does not fall back to an unconfined launch. That is accepted: a
+# second probe would only narrow the race, never close it.
+_scope_exec_warn() {
+    printf '[agentctl] WARNING: session NOT in a protected scope (%s); launching unconfined.\n' "$1" >&2
+}
+
+cmd__scope_exec() {
+    # Refusal, not a fallback: every `__` verb is dispatched with no
+    # require_root, and this one execs an arbitrary command, so under
+    # `sudo agentctl __scope-exec ...` it would be a root primitive. It never
+    # legitimately runs as root: each launch site runs it as the target agent
+    # user (sudo -u <user> -i, or as-self). Must stay the FIRST statement. The
+    # guard reads the shell's own $EUID, which no environment variable or PATH
+    # entry can shadow (unlike `id -u`, a PATH lookup). The test runs it under
+    # a real user namespace (`unshare -r`).
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "[agentctl] ERROR: __scope-exec refuses to run as root (it execs an arbitrary command)" >&2
+        exit 2
+    fi
+    local seat="${1-}"
+    shift || true
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: agentctl __scope-exec <seat> <cmd> [args...]" >&2
+        exit 2
+    fi
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        # Expected on macOS (no systemd): silent. On Linux a missing systemd-run
+        # means something is broken (e.g. PATH), so say so like every other
+        # fallback rather than dropping the protection without a word.
+        if [[ "$(uname -s 2>/dev/null)" == Linux ]]; then
+            _scope_exec_warn "systemd-run not found on PATH"
+        fi
+        exec "$@"
+    fi
+    if [[ ! "$seat" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]; then
+        # Control characters would split the one-line warning.
+        _scope_exec_warn "invalid seat name '${seat//[^[:print:]]/?}'"
+        exec "$@"
+    fi
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        local rdir
+        rdir="${ENGRAM_RUNTIME_BASE:-/run/user}/$UID"  # $UID, like the guard: no PATH lookup
+        if [[ -d "$rdir" ]]; then
+            export XDG_RUNTIME_DIR="$rdir"
+        else
+            _scope_exec_warn "XDG_RUNTIME_DIR unset and $rdir missing"
+            exec "$@"
+        fi
+    fi
+    local unit="agent-claude-$seat" probe probe_rc=0 state
+    probe="$(systemctl --user show -p ActiveState --value "$unit.scope" 2>&1)" || probe_rc=$?
+    if [[ "$probe_rc" -ne 0 ]]; then
+        _scope_exec_warn "user manager unreachable: ${probe%%$'\n'*}"
+        exec "$@"
+    fi
+    local line
+    state=""
+    while IFS= read -r line; do
+        case "$line" in
+            active|reloading|inactive|failed|activating|deactivating|maintenance|refreshing)
+                state="$line" ;;
+        esac
+    done <<<"$probe"
+    if [[ -z "$state" ]]; then
+        _scope_exec_warn "user manager probe unreadable: ${probe%%$'\n'*}"
+        exec "$@"
+    fi
+    case "$state" in
+        active|activating|reloading|deactivating)
+            local cg cg_rc=0 cg_line cgl procs pid comm
+            cg="$(systemctl --user show -p ControlGroup --value "$unit.scope" 2>/dev/null)" || cg_rc=$?
+            cg_line=""
+            while IFS= read -r cgl; do
+                [[ -n "$cgl" ]] && cg_line="$cgl"
+            done <<<"$cg"
+            if [[ "$cg_rc" -eq 0 && "$cg_line" == /* ]]; then
+                procs="${ENGRAM_CGROUP_ROOT:-/sys/fs/cgroup}$cg_line/cgroup.procs"
+                if [[ -r "$procs" ]]; then
+                    while IFS= read -r pid || [[ -n "$pid" ]]; do
+                        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+                        comm=""
+                        { IFS= read -r comm < "/proc/$pid/comm"; } 2>/dev/null || continue
+                        if [[ "$comm" == claude ]]; then
+                            echo "[agentctl] ERROR: claude is already running in $unit.scope (pid $pid); not starting a second session. Attach with 'agentctl attach $seat' or stop it with 'agentctl __scope-stop $seat'." >&2
+                            exit 3
+                        fi
+                    done < "$procs"
+                fi
+            fi
+            _scope_exec_warn "$unit.scope already $state"
+            exec "$@"
+            ;;
+    esac
+    exec systemd-run --user --scope --quiet --collect --unit="$unit" \
+        -p OOMPolicy=continue -- "$@"
+}
+
+# Internal verb (#4435): stop the seat's `agent-claude-<seat>.scope`. Called by
+# agent-session@.service's ExecStop, so `systemctl stop|restart
+# agent-session@<seat>` still ends the session. Before #4435 claude lived in the
+# unit's own cgroup (or a tmux scope) and died with it; __scope-exec moves it
+# into its own user scope, which a unit stop no longer reaches, so a claude that
+# did not exit on the pty hangup would survive and the next start would collide.
+# Runs as the agent (User=agent-%i); refuses root and invalid seat names.
+# Absent or inactive scope -> exit 0 (nothing to stop). The unit prefixes the
+# line with `-`, so a failure here never fails the unit's own stop.
+cmd__scope_stop() {
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "[agentctl] ERROR: __scope-stop refuses to run as root" >&2
+        exit 2
+    fi
+    local seat="${1-}"
+    if [[ ! "$seat" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]; then
+        echo "[agentctl] ERROR: __scope-stop: invalid seat name '${seat//[^[:print:]]/?}'" >&2
+        exit 2
+    fi
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        local rdir="${ENGRAM_RUNTIME_BASE:-/run/user}/$UID"
+        if [[ ! -d "$rdir" ]]; then
+            echo "[agentctl] WARNING: __scope-stop: XDG_RUNTIME_DIR unset and $rdir missing; nothing to stop" >&2
+            exit 0
+        fi
+        export XDG_RUNTIME_DIR="$rdir"
+    fi
+    local unit="agent-claude-$seat.scope" probe line state=""
+    probe="$(systemctl --user show -p ActiveState --value "$unit" 2>&1)" || {
+        echo "[agentctl] WARNING: __scope-stop: user manager unreachable: ${probe%%$'\n'*}" >&2
+        exit 1
+    }
+    while IFS= read -r line; do
+        case "$line" in
+            active|reloading|inactive|failed|activating|deactivating|maintenance|refreshing)
+                state="$line" ;;
+        esac
+    done <<<"$probe"
+    if [[ -z "$state" ]]; then
+        echo "[agentctl] WARNING: __scope-stop: user manager probe unreadable: ${probe%%$'\n'*}; stopping anyway" >&2
+    fi
+    case "$state" in
+        inactive|failed) exit 0 ;;
+    esac
+    exec systemctl --user stop "$unit"
+}
+
 # POSIX single-quoting, never printf %q: at runs the job with /bin/sh, and tmux runs a
 # launch string with its default-shell; a %q word with a control character plus a quote is
 # $'...', which dash reads as $ plus a plain quoted string. Used by cmd_share (the at job) and
@@ -1847,6 +2048,16 @@ cmd_session() {
     # exec mechanism differs.
     local prologue
     prologue="$(session_prologue_text)"
+    # #4435: every launch below execs through `agentctl __scope-exec <seat>`
+    # (own scope, OOMPolicy=continue). The two words are inserted by THIS shell
+    # with printf %q, so the string handed to `sudo -i bash -c` carries no
+    # `$ { } ( )` of its own (sudo -i escapes braces and parens).
+    local agentctl_abs scope_words
+    agentctl_abs="$(readlink -f "${BASH_SOURCE[0]:-$0}")" && [[ -f "$agentctl_abs" && -x "$agentctl_abs" ]] || {
+        echo "ERROR: cannot resolve agentctl's own path to an executable file (needed for the scope launch)" >&2
+        exit 1
+    }
+    scope_words="$(printf '%q' "$agentctl_abs") __scope-exec $(printf '%q' "$name")"
     if [[ "$as_self" -eq 1 ]]; then
         # This shell already IS the target user, so no sudo -- but the launch
         # goes through the SAME form as the sudo branches below (bash -c,
@@ -1865,21 +2076,21 @@ cmd_session() {
         if command -v "$binary" >/dev/null 2>&1; then
             if [[ ${#cwd_arg[@]} -gt 0 ]]; then
                 exec bash -c \
-                    "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec \"$binary\" \"\$@\"" \
+                    "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec $scope_words \"$binary\" \"\$@\"" \
                     -- "${tail_args[@]}"
             else
                 exec bash -c \
-                    "$prologue; exec \"$binary\" \"\$@\"" \
+                    "$prologue; exec $scope_words \"$binary\" \"\$@\"" \
                     -- "${tail_args[@]}"
             fi
         elif [[ -x "$HOME/.runtime/start.sh" ]]; then
             if [[ ${#cwd_arg[@]} -gt 0 ]]; then
                 exec bash -c \
-                    "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" \
+                    "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec $scope_words ~/.runtime/start.sh \"\$@\"" \
                     -- "${tail_args[@]}"
             else
                 exec bash -c \
-                    "$prologue; "'exec ~/.runtime/start.sh "$@"' \
+                    "$prologue; exec $scope_words "'~/.runtime/start.sh "$@"' \
                     -- "${tail_args[@]}"
             fi
         else
@@ -1889,11 +2100,11 @@ cmd_session() {
     elif sudo -u "$user" -i bash -c "command -v \"$binary\"" >/dev/null 2>&1; then
         if [[ ${#cwd_arg[@]} -gt 0 ]]; then
             sudo -u "$user" -i bash -c \
-                "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec \"$binary\" \"\$@\"" \
+                "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec $scope_words \"$binary\" \"\$@\"" \
                 -- "${tail_args[@]}"
         else
             sudo -u "$user" -i bash -c \
-                "$prologue; exec \"$binary\" \"\$@\"" \
+                "$prologue; exec $scope_words \"$binary\" \"\$@\"" \
                 -- "${tail_args[@]}"
         fi
     elif sudo -u "$user" -i bash -c 'test -x "$HOME/.runtime/start.sh"' 2>/dev/null; then
@@ -1901,11 +2112,11 @@ cmd_session() {
         # base binary word — the adapter knows what to launch).
         if [[ ${#cwd_arg[@]} -gt 0 ]]; then
             sudo -u "$user" -i bash -c \
-                "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" \
+                "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec $scope_words ~/.runtime/start.sh \"\$@\"" \
                 -- "${tail_args[@]}"
         else
             sudo -u "$user" -i bash -c \
-                "$prologue; "'exec ~/.runtime/start.sh "$@"' \
+                "$prologue; exec $scope_words "'~/.runtime/start.sh "$@"' \
                 -- "${tail_args[@]}"
         fi
     else
@@ -3598,6 +3809,8 @@ case "$SUBCMD" in
     __codex-managed-session) cmd__codex_managed_session "$@" ;;
     __expand-session-args) cmd__expand_session_args "$@" ;;
     __session-prologue) cmd__session_prologue "$@" ;;
+    __scope-exec) cmd__scope_exec "$@" ;;
+    __scope-stop) cmd__scope_stop "$@" ;;
     __require-viz-operator) cmd__require_viz_operator "$@" ;;
     __read-viz-operator-config) cmd__read_viz_operator_config "$@" ;;
     __viz-operator-conf-provenance-ok) cmd__viz_operator_conf_provenance_ok "$@" ;;

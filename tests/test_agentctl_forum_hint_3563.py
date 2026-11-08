@@ -392,6 +392,10 @@ PURE_INTERNAL_VERBS = {
     "__resolve-viz-operator-from-config", "__viz-operator-charset-ok",
     "__validate-chosen-name", "__as-self-check", "__parse-session-flags",
     "__detect-platform-as-self", "__forum-hint-url-ok",
+    # not a root primitive because it refuses EUID 0 (#4435)
+    "__scope-exec",
+    # #4435: stops one named user scope of the caller; no arbitrary exec, refuses EUID 0.
+    "__scope-stop",
 }
 
 
