@@ -973,6 +973,12 @@ LEGACY_ALLOWLIST = {
     ("src/engram/tools/setup-surface-daemon-service.sh", "_legacy_surface_label"),
     ("src/engram/hooks/claude/start-engram-daemon.sh", "_legacy_surface_unit"),
     ("src/engram/hooks/claude/start-engram-daemon.sh", "_legacy_surface_label"),
+    # #4446: uninstall stops this home's old fixed-name units too (same ENGRAM_HOME check as the setup script).
+    ("src/engram/tools/uninstall-local-marketplace.sh", "_uninst_legacy_surface_unit"),
+    ("src/engram/tools/uninstall-local-marketplace.sh", "_uninst_legacy_surface_label"),
+    # the same file seen through the repo-root tools/ symlink the scan also walks
+    ("tools/uninstall-local-marketplace.sh", "_uninst_legacy_surface_unit"),
+    ("tools/uninstall-local-marketplace.sh", "_uninst_legacy_surface_label"),
 }
 
 _FUNC_RE = {".sh": re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{"), ".py": re.compile(r"^\s*def ([A-Za-z_0-9]+)\(")}
