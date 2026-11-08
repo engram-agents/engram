@@ -348,8 +348,39 @@ seat can run it and any other seat can check that it ran.
    `tools/scan-leaks.py`, `tools/test_id_set_check.py`, and the whole-tree
    guards (`tests/test_syspath_shadow_guard.py`, `tests/test_tiers_manifest.py`,
    `tests/test_run_touched_tests.py`, `tests/test_ci_wiring_guard.py`,
-   `tests/test_engramd_read_scan.py`'s real-tree cells). Verify the list with
-   `git ls-files` before pasting it; a guard that moved is not a guard that ran.
+   `tests/test_engramd_read_scan.py`'s real-tree cells), **and the source-scanning
+   ratchets** (Kepler, 2026-11-08, after #4478). What puts a test on this list: a
+   cell that **enumerates** shipped files (a walk of `src/`, `tools/`, the skills or
+   the docs; `git ls-files`; a glob over a shipped directory), directly or through
+   the tool it runs, instead of naming them, so a change to a file the test never names can redden it while rule 1's
+   basename selection never picks it; the guard set is then the only place it runs
+   before the nightly. Today they are `tests/test_atomic_writer_modes_4013.py`,
+   `tests/test_truncating_writes_ratchet_4380.py`,
+   `tests/test_forum_process_spawn_ratchet_3518.py`,
+   `tests/test_no_db_creation_before_bootstrap_4107.py`,
+   `tests/test_no_unbounded_upward_walks_3983.py`,
+   `tests/test_prose_home_sweep_3863.py`, `tests/test_prose_tail_6c_venv.py`,
+   `tests/test_raw_home_read_gate_3863.py`, `tests/test_home_path_gate.py`,
+   `tests/test_lesson_pattern_audit_shipped_3941.py` (it copies every shipped
+   hook into its tree), `tests/test_docs_layout_guard.py`,
+   `tests/test_metadata_parse_drift_guard_3413.py`,
+   `tests/test_json_extract_metadata_guard_3485.py` and
+   `tests/test_no_retired_cascade_store_asserts.py` (it scans `tests/` itself).
+   The list is a floor, not a census: a PR that adds a test with this property adds
+   its name here in the same PR, and a seat that finds one missing adds it. Verify
+   the list with `git ls-files` **in a checkout of the base tip**, not the seat's
+   working clone (a clone parked on an older commit lists an older tree), before
+   pasting it; a guard that moved is not a guard that ran. *Evidence:* #4478
+   (2026-11-08). The seat's run for #4464 selected every test naming a touched file
+   plus the guards it then ran by name (docs layout, name-leak, upward walks,
+   `sys.path` shadow, tiers manifest), and read green; `test_atomic_writer_modes_4013.py`,
+   which scans `src/` for `mkstemp` + `os.replace` writers and names no file, went
+   red on `dev` at 05:23Z, was found as #4478 at 07:00Z (98 minutes), and was fixed
+   by #4480 at 07:41Z (about 2h18m red). Two hours after the miss the seat held
+   #4472 on two guards green on `dev` alone: `test_no_unbounded_upward_walks_3983.py`,
+   which was already among the five the seat ran by name, and
+   `test_prose_tail_6c_venv.py`, which sat in no guard list and reached the run
+   only because the ratchets were by then in it by name.
    **Record the base SHA the scratch merge used** (`git rev-parse origin/<base>` at
    the time of the run, after a fetch); item 8 asserts against it and item 10 names
    it (Borges, 2026-10-22).
