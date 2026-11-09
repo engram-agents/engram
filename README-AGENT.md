@@ -228,6 +228,7 @@ smaller, faster, and the right default — ENGRAM runs entirely on CPU.
 ```bash
 git clone https://github.com/engram-agents/engram.git
 cd engram
+git checkout "$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
 bash tools/install-local-marketplace.sh
 ```
 
@@ -422,6 +423,7 @@ codex login
 ```bash
 git clone https://github.com/engram-agents/engram.git
 cd engram
+git checkout "$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
 python3 -m tools.engine.cli build --target codex
 ```
 
