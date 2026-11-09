@@ -247,6 +247,8 @@ class TestEmbedderConcurrentFirstTouch:
                     return _Vecs()
                 return _Vec()
 
+        ctor_args = []
+
         def _fake_ctor(model_name, **kwargs):
             # Line up all 8 threads so they race into construction together
             # (best-effort — a slow thread that misses the barrier just
@@ -257,28 +259,53 @@ class TestEmbedderConcurrentFirstTouch:
             except threading.BrokenBarrierError:
                 pass
             load_count["n"] += 1
+            ctor_args.append(model_name)
             return _FakeModel()
 
         core._embedder._model = None
         core._embedder._model_name = None
         core._embedder._failed_models.discard(core.DEFAULT_EMBEDDING_MODEL)
 
-        with mock.patch(
-            "sentence_transformers.SentenceTransformer", side_effect=_fake_ctor
-        ), mock.patch.object(core._embedder, "is_available", return_value=True):
-            errors = []
+        # #4531: the default model is pinned (#4468), so _load_model resolves
+        # and checksum-verifies a snapshot BEFORE the constructor runs. Stub
+        # those two seams (looked up in module globals by _build_pinned) so the
+        # cell needs no HF cache and no network; the pinned path is kept.
+        snap_dir = tempfile.TemporaryDirectory()
+        stub_snap = Path(snap_dir.name)
+        try:
+            with mock.patch(
+                "sentence_transformers.SentenceTransformer", side_effect=_fake_ctor
+            ), mock.patch.object(
+                core, "_resolve_pinned_snapshot", return_value=stub_snap
+            ), mock.patch.object(
+                core, "_verify_pinned_snapshot", return_value=None
+            ), mock.patch.object(core._embedder, "is_available", return_value=True):
+                errors = []
 
-            def _worker(i):
-                try:
-                    core._embedder.embed(f"text {i}", core.DEFAULT_EMBEDDING_MODEL)
-                except Exception as e:  # pragma: no cover
-                    errors.append(e)
+                def _worker(i):
+                    try:
+                        core._embedder.embed(f"text {i}", core.DEFAULT_EMBEDDING_MODEL)
+                    except Exception as e:  # pragma: no cover
+                        errors.append(e)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-                list(pool.map(_worker, range(8)))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    list(pool.map(_worker, range(8)))
+        finally:
+            snap_dir.cleanup()
 
+        assert not stub_snap.exists(), (
+            f"the temp snapshot dir was not cleaned up: {str(stub_snap)!r} still exists"
+        )
         assert not errors, f"concurrent embed() raised: {errors}"
+        assert core.DEFAULT_EMBEDDING_MODEL not in core._embedder._failed_models, (
+            "the default model landed in _failed_models: the pinned load was "
+            "refused or failed before the constructor, so this cell is not hermetic"
+        )
         assert load_count["n"] == 1, (
             f"expected the model to be constructed exactly once across 8 "
             f"concurrent first-touch embed() calls, constructed {load_count['n']} times"
+        )
+        assert ctor_args == [str(stub_snap)], (
+            f"expected exactly one constructor call, with the stubbed snapshot "
+            f"path as its first argument: [{str(stub_snap)!r}]; recorded {ctor_args!r}"
         )
