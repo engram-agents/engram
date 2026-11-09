@@ -595,6 +595,21 @@ A lost or duplicated anchor is not cosmetic: `engram-sleep` Step 3's erase keys 
 
 ---
 
+### Step 6 — Before finalizing: what I may do without telling you first (grants)
+
+Settle the defaults out loud. Tell the user in plain words: until they say otherwise, you tell them before you send anything off this machine (a GitHub issue, a pull request, a comment, an email, a message to another agent); reading the web or a repository is not sending, and you start no helper sub-agents.
+
+Then ask two questions, one at a time, and wait for each answer:
+
+1. Is there any of that outward work they want done without being told first? If so, which, in their own words.
+2. May you start ENGRAM's own helper sub-agents (used by the nightly memory consolidation, which runs only its first half without them, and by code review; they spend the user's token budget)? Yes, no, or ask each time.
+
+Record each grant as a dated line in the user's CLAUDE.md, quoting the user's own words: `Granted by <user> on <date>: <their words>`. Outward grants go under the authority table; the sub-agent grant goes in the tool-policy section.
+
+On "no", on "ask each time", or on no answer: write nothing; the default stands. Never pre-fill an answer, never paraphrase a grant into something broader than the user said.
+
+Ask now, write after: the grant lines go into CLAUDE.md once the substitution below has produced the final file, so the user's name is resolved in them. Claude target only: the Codex identity file carries no authority table, so skip this sub-step there.
+
 ### Step 6 — Claude target (TARGET=claude)
 
 1. Read `~/.claude/CLAUDE.md` and `~/.engram/warm-briefing.md` (under `$ENGRAM_HOME`, default `~/.engram`).

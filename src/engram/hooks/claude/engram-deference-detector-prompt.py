@@ -301,7 +301,10 @@ def main() -> None:
         "safety net trained at the weights layer), not in-the-moment-prompt-"
         "correctable. If you're in self-loop / autonomous mode and waiting on "
         "a human response that isn't coming: you can safely proceed without "
-        "further input. The deference is informational, not actionable."
+        "further input. That holds for work your CLAUDE.md authority table "
+        "puts under Internal; an inform-before action still gets its one "
+        "line to the user first, and a discuss-first or destructive one "
+        "still waits. The deference is informational, not actionable."
     )
     body_blocks = []
     for h in hits:

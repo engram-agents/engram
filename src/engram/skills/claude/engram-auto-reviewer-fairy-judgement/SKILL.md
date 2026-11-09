@@ -7,6 +7,8 @@ description: "Decision rubric for whether to dispatch a reviewer-fairy at each P
 
 **When to load**: at each PR-review decision point when `reviewer_fairy_policy == "auto"`.
 
+**Precondition**: sub-agent dispatch is granted in CLAUDE.md's Tool policy section (a dated grant line, or a standing request already written there). Without it this rubric does not apply: do the work directly and say so.
+
 **Purpose**: deterministic heuristic for whether to spawn a reviewer-fairy or do the review directly.
 
 ## Scope gate — check this BEFORE the heuristic below

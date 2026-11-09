@@ -85,6 +85,8 @@ The parent's role is purely orchestration.
 > runs *inside* the sleep. If you are about to spawn the dream-master and have NOT collected
 > the dream-fairy + batch-summary reports this cycle, **STOP — you are skipping the routine.**
 >
+> **One precondition comes before everything below: the sub-agent grant.** Phase B runs through the `Agent` tool, and that tool is the user's to grant (CLAUDE.md, Tool policy). If the user's CLAUDE.md carries no grant of sub-agent dispatch in its Tool policy section (a dated `Granted by` line, or a standing request already written there, which installs made before this release carry), do NOT dispatch: run Phase A, stop before Phase B, and tell the user in one line that the consolidation half was skipped because helper sub-agents are not granted, and that saying yes enables it. Before you stop, still run Step 9.75 when tonight is an away night: it dispatches nothing, and Step 3.5 has already taken down what would otherwise wake the seat. That is the one legitimate partial sleep. Everything below about never trimming Phase B applies once the grant exists.
+>
 > **ALL-OR-NOTHING — never skip *part* of a sleep.** Once you commit to a sleep, Phase B's
 > fairy dispatch is MANDATORY, not optional. If a day is genuinely too light to consolidate,
 > skip the **whole** sleep — but NEVER run Phase A + advance the turn while dropping the
@@ -579,7 +581,7 @@ fi
 
 ## Phase B — Consolidation orchestration
 
-> **Phase B is MANDATORY whenever you reach it** (see the all-or-nothing invariant in
+> **Phase B is MANDATORY whenever you reach it, and reaching it requires the sub-agent grant** (see the all-or-nothing invariant in
 > "When NOT to sleep"). The rule is: **skip the whole sleep, or none of it — never skip *part* of it.** The dream-fairy dispatch (Step 6) is the load-bearing part — the fairies are the ONLY pass that scans the fresh cohort while it is still the current turn.
 >
 > **As of #1901 (2026-08-04), the dream-fairy scan categories are no longer
@@ -1248,4 +1250,4 @@ The dedicated-dream-master refactor landed 2026-05-19 to address:
 - **Wait-for-fairies discipline misfires**: the parent's "advance the turn after all fairies return" gate had been broken multiple times by post-compaction time pressure. Moving advance into the master removes the parent's role in turn timing.
 - **Disposition gap**: an agent running sleep ALSO has awake-state pressures pulling them. The dedicated dream master is summoned with a single role and a single disposition (engram health custodian) — no role conflict.
 
-The 2026-05-24 merge of engram-bedtime into engram-sleep eliminates the structural failure mode of **stopping after Phase A but before Phase B**: a compaction, user interrupt, or fairy dispatch error between the two former skills left the day's missed nodes filed but the turn never advanced, conflating the next day's cohort with today's. By making Phase A and Phase B a single skill invocation, that failure mode is structurally impossible.
+The 2026-05-24 merge of engram-bedtime into engram-sleep eliminates the structural failure mode of **stopping after Phase A but before Phase B**: a compaction, user interrupt, or fairy dispatch error between the two former skills left the day's missed nodes filed but the turn never advanced, conflating the next day's cohort with today's. By making Phase A and Phase B a single skill invocation, that failure mode is structurally impossible. The one deliberate exception is the no-grant stop described under "When NOT to sleep": Phase A alone, reported to the user, and the turn does not advance that night.
