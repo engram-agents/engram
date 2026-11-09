@@ -17,6 +17,8 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    # Suite step limit (315) + 15, the nightly's pairing (nightly.yml).
+    timeout-minutes: 330
     strategy:
       matrix:
         python-version: ["3.12"]
@@ -53,13 +55,46 @@ jobs:
           # fail loudly if a CUDA stack came back.
           python3 tools/check_no_cuda_wheels.py
 
-      - name: Run pytest
-        # Explicit paths (pytest.ini sets no testpaths). Covers the main suite
-        # AND src/forum/tests/ (8 files) — the latter was silently skipped by the
-        # original `pytest tests/` since forum/ postdates this workflow.
+      - name: Collect the reference test-id set
+        # The REFERENCE set: exactly what the old one-process step collected
+        # (`pytest tests/ src/forum/tests/`, no -m filter, so the `timing` cells
+        # are in it). The shards below are checked against this file before any
+        # shard runs (K1). Explicit paths (pytest.ini sets no testpaths): the main
+        # suite AND src/forum/tests/, the latter silently skipped by the original
+        # `pytest tests/` since forum/ postdates this workflow.
+        # This stays ONE line starting `run: pytest <roots>`: tests/test_ci_wiring_guard.py
+        # (parse_collected_dirs) and tests/test_test_id_set_check.py (the #2950 sync
+        # gate against TEST_SCAN_ROOTS) read the roots from it, and stop at the first
+        # `-` token.
         # tools/ forum-CLI tests arrive with #616; add `tools/` to this path
         # once #616 merges (omitted now — empty tools/ test set would exit-5).
-        run: pytest tests/ src/forum/tests/ -v --tb=short
+        run: pytest tests/ src/forum/tests/ --collect-only -q -p no:cacheprovider > "$RUNNER_TEMP/reference-collect.txt"
+
+      - name: Run pytest — the full suite as sequential shards (#4420)
+        # One process over the whole suite died of memory on the hosted runner (the
+        # nightly's finding, #4420), so this runs on the nightly's shard runner:
+        # N sequential pytest processes, files split from pytest's own collection.
+        # Planned FROM the reference file above, so the plan and the check use the
+        # same collection. Before the first shard, the runner re-collects each shard
+        # and compares: every reference id in exactly one shard, none extra, none
+        # missing (a failure names the ids and no shard runs). Every shard runs even
+        # after a red one, and the step is red if any is. No continue-on-error here.
+        # The marker is empty (no -m), so the `timing` cells run inside the shards,
+        # as they did in the old one-process step; no coverage (this workflow never
+        # had any).
+        # Step limit = shards x per-shard limit + 15 (planning and collection
+        # headroom), as in nightly.yml. The job limit (330) is the step limit + 15, the
+        # nightly's pairing, so the step limit, not the job limit, ends a hang.
+        env:
+          NIGHTLY_SHARD_COUNT: "5"
+          NIGHTLY_SHARD_TIMEOUT_MIN: "60"
+          NIGHTLY_MARKER: ""
+          NIGHTLY_COVERAGE: "0"
+          NIGHTLY_COLLECT_FILE: ${{ runner.temp }}/reference-collect.txt
+          NIGHTLY_IDSET_REFERENCE: ${{ runner.temp }}/reference-collect.txt
+        timeout-minutes: 315
+        shell: bash
+        run: bash .github/ci/nightly_run_shards.sh
 
       - name: Run pytest — name-leak-warn self-test (real roster)
         # Deliberately a SEPARATE step from the full-suite run above, and a

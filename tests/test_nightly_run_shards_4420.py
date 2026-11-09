@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _shard_env import hermetic_env
 
 REPO = Path(__file__).resolve().parent.parent
 CI_DIR = REPO / ".github" / "ci"
@@ -49,7 +50,8 @@ cov = os.environ.get("COVERAGE_FILE", "")
 k = cov.rsplit(".", 1)[-1]
 with open(os.environ["SHIM_LOG"], "a") as f:
     f.write(json.dumps({{"argv": sys.argv[1:], "cov": cov, "pythonpath": os.environ.get("PYTHONPATH", ""),
-                        "rss_out": os.environ.get("NIGHTLY_RSS_OUT", "")}}) + "\\n")
+                        "rss_out": os.environ.get("NIGHTLY_RSS_OUT", ""),
+                        "env_keys": sorted(os.environ)}}) + "\\n")
 if k in os.environ.get("SHIM_SLEEP", "").split(","):
     time.sleep(float(os.environ.get("SHIM_SLEEP_SECS", "60")))
 print("shim pytest shard " + k)
@@ -98,7 +100,7 @@ def sandbox(tmp_path):
 
 
 def _env(sb, **extra):
-    env = dict(os.environ)
+    env = hermetic_env()
     env.pop("PYTEST_ADDOPTS", None)
     env.update(
         PATH=f"{sb / 'bin'}{os.pathsep}{env['PATH']}",
@@ -421,3 +423,45 @@ def test_c4s_summary_goes_to_stdout_when_no_summary_file(tmp_path):
     r = _run_summary(d, 1)
     assert r.returncode == 0
     assert 1 in _rows(r.stdout)
+
+
+# --- the runner's own settings must not leak into the tests it runs (part of #4420) ----------
+# tests.yml sets these in the env of the shard pytest processes it runs; a test that runs the
+# runner in a subprocess must not inherit them, and the runner must not hand its own settings
+# on to the shards.
+
+CI_RUNNER_ENV = {
+    "NIGHTLY_SHARD_COUNT": "5",
+    "NIGHTLY_SHARD_TIMEOUT_MIN": "60",
+    "NIGHTLY_MARKER": "",
+    "NIGHTLY_COVERAGE": "0",
+}
+
+
+def test_outer_ci_runner_settings_do_not_change_the_all_green_run(sandbox, monkeypatch):
+    ref = sandbox / "one-test-reference.txt"
+    ref.write_text("tests/test_a.py::test_one\n\n1 test collected in 0.1s\n", encoding="utf-8")
+    for k, v in {**CI_RUNNER_ENV, "NIGHTLY_COLLECT_FILE": str(ref),
+                 "NIGHTLY_IDSET_REFERENCE": str(ref)}.items():
+        monkeypatch.setenv(k, v)
+    r = _run(sandbox)
+    assert r.returncode == 0, r.stdout + r.stderr
+    inv = _invocations(sandbox)
+    assert [i["cov"] for i in inv] == [".coverage.1", ".coverage.2", ".coverage.3", ".coverage.4"]
+    for i in inv:
+        assert i["argv"][i["argv"].index("-m") + 1] == "not timing"
+
+
+@pytest.mark.parametrize("knobs", [{}, {"NIGHTLY_MARKER": ""}],
+                         ids=["default-knobs", "non-default-knobs"])
+def test_a_shard_env_holds_no_runner_setting_but_the_rss_out_path(sandbox, knobs):
+    r = _run(sandbox, NIGHTLY_FUTURE_KNOB="1", SHARD_IDSET_PYTHON="/nonexistent",
+             NIGHTLY_SHARD_TIMEOUT_SECONDS="600", NIGHTLY_SAMPLER_DISABLE="1", **knobs)
+    assert r.returncode == 0, r.stdout + r.stderr
+    inv = _invocations(sandbox)
+    assert len(inv) == 4
+    for i in inv:
+        leaked = [k for k in i["env_keys"]
+                  if k.startswith(("NIGHTLY_", "SHARD_IDSET_")) and k != "NIGHTLY_RSS_OUT"]
+        assert leaked == []
+        assert "NIGHTLY_RSS_OUT" in i["env_keys"]

@@ -30,6 +30,18 @@
 #   NIGHTLY_OUTPUT_LOG NIGHTLY_SHARD_DIR NIGHTLY_SAMPLER_LOG NIGHTLY_SAMPLE_SECS
 #   NIGHTLY_SAMPLER_DISABLE=1     no sampler
 #   NIGHTLY_PYTHON                python for the helper tools (default python3)
+#   NIGHTLY_MARKER                the pytest -m expression for every shard. Unset means
+#                                 `not timing` (the nightly). Set but EMPTY means no -m
+#                                 at all (tests.yml: the timing cells run in the shards).
+#   NIGHTLY_COVERAGE              unset or 1: `--cov=src --cov-branch` and
+#                                 COVERAGE_FILE=.coverage.<k> per shard (the nightly).
+#                                 0: no --cov* flags and no COVERAGE_FILE (tests.yml).
+#   NIGHTLY_IDSET_REFERENCE       path to a reference `pytest --collect-only -q` output.
+#                                 When set, shard_idset_check.py compares the plan with
+#                                 it BEFORE the first shard; on any difference the script
+#                                 prints ::error:: lines and exits 1 with no shard run.
+#                                 Unset means no check (the nightly).
+#   SHARD_IDSET_PYTHON            python the id-set check collects with (tests only)
 #
 # bash 3.2-safe on purpose (the cells also run on a Mac with the stock bash).
 
@@ -66,6 +78,22 @@ else
   echo "::error::no timeout command on PATH; refusing to run shards without a per-shard limit"
   exit 2
 fi
+
+# Knobs with the nightly as the default. `-` (not `:-`) for the marker: set-but-empty
+# must be told apart from unset.
+MARKER="${NIGHTLY_MARKER-not timing}"
+MARK_ARGS=()
+if [ -n "$MARKER" ]; then MARK_ARGS=(-m "$MARKER"); fi
+COV_MODE="${NIGHTLY_COVERAGE:-1}"
+COV_ARGS=()
+case "$COV_MODE" in
+  1) COV_ARGS=(--cov=src --cov-branch) ;;
+  0) ;;
+  *)
+    echo "::error::NIGHTLY_COVERAGE must be 0 or 1 (got '$COV_MODE')"
+    exit 2
+    ;;
+esac
 
 : > "$OUT_LOG"
 : > "$SAMPLER_LOG"
@@ -107,6 +135,18 @@ if [ "$PLAN_RC" -ne 0 ]; then
 fi
 "$PY" "$CI_DIR/nightly_shards.py" table --plan "$PLAN" | tee -a "$OUT_LOG"
 
+if [ -n "${NIGHTLY_IDSET_REFERENCE:-}" ]; then
+  # Before any shard: every id of the reference in exactly one shard, none extra.
+  IDSET_ARGS=(--plan "$PLAN" --reference "$NIGHTLY_IDSET_REFERENCE")
+  if [ -n "$MARKER" ]; then IDSET_ARGS+=(--marker "$MARKER"); fi
+  "$PY" "$CI_DIR/shard_idset_check.py" "${IDSET_ARGS[@]}" 2>&1 | tee -a "$OUT_LOG"
+  IDSET_RC="${PIPESTATUS[0]}"
+  if [ "$IDSET_RC" -ne 0 ]; then
+    echo "::error::the shard plan does not match the reference id set (rc=$IDSET_RC); no test ran" | tee -a "$OUT_LOG"
+    exit 1
+  fi
+fi
+
 RED=""
 k=1
 while [ "$k" -le "$N" ]; do
@@ -128,15 +168,46 @@ while [ "$k" -le "$N" ]; do
     echo "=== shard $k of $N: $NFILES files ===" | tee -a "$OUT_LOG" "$SHARD_LOG"
     (
       set -o pipefail
-      COVERAGE_FILE=".coverage.$k" \
-      NIGHTLY_RSS_OUT="$DIR/nightly-rss-shard-$k.md" \
-      PYTHONPATH="$CI_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-      "$TIMEOUT_CMD" -k 60 "$LIMIT" pytest "${FILES[@]}" -v --tb=short \
-        -o tmp_path_retention_policy=failed \
-        -m "not timing" \
-        --cov=src --cov-branch \
-        -p nightly_rss_plugin \
-        2>&1 | tee -a "$OUT_LOG" "$SHARD_LOG"
+      # The runner's own settings (NIGHTLY_*, SHARD_IDSET_*: the count, limits, marker,
+      # coverage mode, reference file, python ...) are for this script. They must not reach
+      # the tests the shard runs: a test that runs this script itself would inherit them. The
+      # sweep takes every such name, so a knob added later is covered too. Two survive on
+      # purpose: NIGHTLY_RSS_OUT is set per shard just below, and NIGHTLY_RSS_STATUS_PATH is
+      # read by the rss plugin inside the shard's own pytest. Nothing below reads the rest.
+      for _v in $(compgen -e); do
+        case "$_v" in
+          NIGHTLY_RSS_OUT|NIGHTLY_RSS_STATUS_PATH) ;;
+          NIGHTLY_*|SHARD_IDSET_*) unset "$_v" ;;
+        esac
+      done
+      if [ "$MARKER" = "not timing" ] && [ "$COV_MODE" = "1" ]; then
+        # The nightly's command, byte for byte (the default knobs). Kept as its own
+        # literal because tests/test_timing_marker_3784.py pins this exact text.
+        COVERAGE_FILE=".coverage.$k" \
+        NIGHTLY_RSS_OUT="$DIR/nightly-rss-shard-$k.md" \
+        PYTHONPATH="$CI_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$TIMEOUT_CMD" -k 60 "$LIMIT" pytest "${FILES[@]}" -v --tb=short \
+          -o tmp_path_retention_policy=failed \
+          -m "not timing" \
+          --cov=src --cov-branch \
+          -p nightly_rss_plugin \
+          2>&1 | tee -a "$OUT_LOG" "$SHARD_LOG"
+      else
+        # Non-default knobs (tests.yml): marker and coverage come from MARK_ARGS / COV_ARGS.
+        if [ "${#COV_ARGS[@]}" -gt 0 ]; then
+          export COVERAGE_FILE=".coverage.$k"
+        else
+          unset COVERAGE_FILE
+        fi
+        NIGHTLY_RSS_OUT="$DIR/nightly-rss-shard-$k.md" \
+        PYTHONPATH="$CI_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$TIMEOUT_CMD" -k 60 "$LIMIT" pytest "${FILES[@]}" -v --tb=short \
+          -o tmp_path_retention_policy=failed \
+          "${MARK_ARGS[@]}" \
+          "${COV_ARGS[@]}" \
+          -p nightly_rss_plugin \
+          2>&1 | tee -a "$OUT_LOG" "$SHARD_LOG"
+      fi
     ) || rc=$?
   fi
   echo "[shard $k end] $(date -u +%H:%M:%SZ) rc=$rc" >> "$SAMPLER_LOG"
