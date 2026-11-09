@@ -110,8 +110,8 @@ def test_the_resolve_cascade_skill_and_the_design_doc_carry_the_run():
     for needle in ("unblock_run", "eligible_shapes", "next_step", "unblock-runs.json", "roots"):
         assert needle in doc, needle
     log = (REPO / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
-    unreleased = log.split("## [Unreleased]", 1)[1].split("\n## [v", 1)[0]
-    assert "4421" in unreleased and "unblock" in unreleased.lower()
+    # A release cut moves the entry from [Unreleased] to its version section, so pin that it exists, not where.
+    assert "the unblock run (#4421)" in log
 
 
 def test_the_client_module_is_tiered_essential_exactly_once():
