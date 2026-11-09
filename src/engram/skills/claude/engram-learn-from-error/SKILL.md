@@ -22,7 +22,7 @@ A lesson can fire at two different moments, and they catch different failures. M
 
 | | **Prompt-time (semantic)** | **Action-time (regex)** |
 |---|---|---|
-| Fires at | `UserPromptSubmit` | `PreToolUse` (`Bash` + `mcp__.*`) |
+| Fires at | `UserPromptSubmit` | `PreToolUse` (`Bash` + `mcp__.*` + `Agent`) |
 | Matches on | incident claim, embedding similarity to the prompt | `situation_pattern` regex vs the tool call |
 | Armed by | writing the incident in task-level language (Step 2) | setting `situation_pattern` on the lesson (Step 3b) |
 | Catches | "this whole task resembles a past mistake" | "this specific call is the mistake, right now" |
@@ -115,6 +115,7 @@ If the mistake has a recognisable **tool-call shape**, add a `situation_pattern`
 |---|---|
 | `Bash` | the raw shell command string, nothing else |
 | `mcp__*` | `"{tool_name} {compact_json_of_args}"` |
+| `Agent` (a fairy dispatch) | `"Agent {subagent_type} {description} {first 500 chars of prompt}"`, e.g. `Agent engram:engram-pr-reviewer ...`. A pattern that occurs only past the 500-character prompt head cannot match. **Advisory only**: an Agent call is never denied or shadow-logged, even for a lesson with `prevention_type: blocking` (blocking is limited to ENGRAM and Umwelt calls). A prompt head can hold real newlines, so `(?s)` applies as for Bash. |
 | anything else | `""` — the hook exits early, your pattern can never fire |
 
 Two consequences worth internalising:
@@ -124,7 +125,7 @@ Two consequences worth internalising:
 
 ### Scope by CHANNEL, not by content alone
 
-The hook is registered globally on `Bash` and `mcp__.*`. What decides whether *your* lesson fires is your pattern — so a pattern that keys only on content will fire on every tool call that happens to contain that content, including your own routine ones.
+The hook is registered globally on `Bash`, `mcp__.*` and `Agent`. What decides whether *your* lesson fires is your pattern — so a pattern that keys only on content will fire on every tool call that happens to contain that content, including your own routine ones.
 
 Worked example. A lesson wanting "don't put internal identifiers in outbound messages" cannot key on the identifier shape alone: identifiers legitimately appear in nearly every knowledge-graph write. Requiring **channel AND content together** fixes it, via two lookaheads:
 
