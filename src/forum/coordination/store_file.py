@@ -88,6 +88,21 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     return fields, text[m.end():]
 
 
+def frontmatter_parses(raw: str) -> bool:
+    """True when ``raw`` begins with a frontmatter block this store can parse (#4528).
+
+    The public form of the store's own parse predicate, so every caller that has
+    to decide "is this a readable item at all" asks the same question
+    :func:`_parse_frontmatter` does -- rather than a cheaper heuristic like
+    ``raw.startswith("---")``, which says yes to a block that OPENS and never
+    closes. It is also NOT "the parsed field dict is empty": a valid empty block
+    (``"---\\n\\n---\\n"`` -- the grammar needs a newline before the closing
+    fence) parses to ``{}`` and is legitimate, while the degenerate
+    ``"---\\n---\\n"`` does not parse at all.
+    """
+    return _FRONTMATTER_RE.match(raw) is not None
+
+
 def _parse_participants(participants_str: str) -> tuple[str, ...]:
     """Parse ``[borges, ariadne]`` / ``borges,ariadne`` → lowercase name tuple."""
     m = _PARTICIPANTS_LIST_RE.match(participants_str.strip())
@@ -380,6 +395,16 @@ class FileStore(CoordinationStore):
                 # would make the board cry wolf on every archive during a poll.
                 continue
             if raw is None:
+                refused += 1
+                continue
+            # A file whose frontmatter block does not PARSE is not a readable
+            # item either (#4528). Emitting an all-empty record for it would
+            # hide it behind `refused == 0` while the board silently dropped it;
+            # refusing it makes the existing refusal count report it. The test
+            # is the store's own parse predicate -- NOT `startswith("---")` and
+            # NOT "the field dict is empty": a VALID EMPTY block
+            # ("---\n\n---\n") parses and stays a (field-less) record.
+            if not frontmatter_parses(raw):
                 refused += 1
                 continue
             fields, _body = _parse_frontmatter(raw)

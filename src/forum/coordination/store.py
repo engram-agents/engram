@@ -101,9 +101,12 @@ class ProjectScan:
     """One project scan's outcome: the records kept, and how many were refused.
 
     ``refused`` counts entries the scan DECLINED to read (#4518 part 2) -- a
-    symlink skipped by the ``os.path.islink`` pre-check, or a ``_scan_text``
-    call that returned ``None`` (a non-regular file, an unreadable entry, or an
-    ``OSError``). It does NOT count a closed-status entry filtered out by
+    symlink skipped by the ``os.path.islink`` pre-check, a ``_scan_text`` call
+    that returned ``None`` (a non-regular file, an unreadable entry, or an
+    ``OSError``), or a file whose frontmatter block does not parse (#4528; the
+    scan asks :func:`~forum.coordination.store_file.frontmatter_parses`, so a
+    VALID EMPTY block still counts as readable). It does NOT count a
+    closed-status entry filtered out by
     ``active_only`` -- that is normal filtering, and conflating the two would
     make the number meaningless -- and it does NOT count an entry that vanished
     between the directory listing and its read (``_VANISHED``): a routine

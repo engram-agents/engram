@@ -21,7 +21,7 @@ from typing import Callable, Optional
 from . import markdown as md
 from .seq import SeqAllocator
 from .store import CoordinationStore
-from .store_file import CLOSED_STATUSES
+from .store_file import CLOSED_STATUSES, frontmatter_parses
 
 # Participants list format: [alice, bob] or alice,bob — the same on-disk
 # grammar tools/baton.py and store_file.py already parse. A third private copy
@@ -1381,23 +1381,44 @@ def _refuse_existing_id(store: CoordinationStore, project_id: str) -> None:
     DOCUMENTED EXEMPTION (#4527): this is the ONE reader of the project store
     that deliberately does NOT report a refused entry. The check compares
     ENUMERATED ids; a refused entry (a symlink, a non-regular file, an
-    unreadable file) contributes no record, so its id cannot participate in the
-    comparison and this check can allow a duplicate id hidden behind a refusal.
-    That fail-open is DELIBERATE: raising here would let one planted file block
-    EVERY ``init``, which is the availability class #4518 exists to prevent.
-    The trade is accepted -- a duplicate hidden by a refusal is a
-    filesystem-audit finding, not a refusal to create work. This function gets
-    no ``refused`` count and no sentinel; the display surfaces (``GET
-    /api/projects``, ``GET /api/board/updates``, ``build_updates``) are where a
-    refusal is made visible.
+    unreadable file, a file whose frontmatter does not parse) contributes no
+    record, so its id cannot participate in the comparison and this check can
+    allow a duplicate id hidden behind a refusal. That fail-open is DELIBERATE:
+    raising here would let one planted file block EVERY ``init``, which is the
+    availability class #4518 exists to prevent. The trade is accepted -- a
+    duplicate hidden by a refusal is a filesystem-audit finding, not a refusal
+    to create work. This function gets no ``refused`` count and no sentinel; the
+    display surfaces (``GET /api/projects``, ``GET /api/board/updates``,
+    ``build_updates``) are where a refusal is made visible.
+
+    The fourth class above is the only one this function must gate EXPLICITLY,
+    and the code below is that gate: a symlink, a non-regular file or an
+    unreadable file leaves ``read_project`` returning nothing, but an
+    unparseable frontmatter is a READABLE file that ``read_project`` returns,
+    so the filename-based exact check would reserve its id and resurrect the
+    refusal. An id whose file exists but whose frontmatter does NOT parse is
+    therefore no longer reserved (#4528): the store's scan already refuses such
+    a file, so it never appears in the enumeration above, and the filename check
+    below is gated on the same parse predicate so it cannot resurrect it.
+    ``init`` of that id therefore SUCCEEDS and replaces the unparseable file
+    with a well-formed baton -- the repair path, since the file was already
+    unparseable and the board was already hiding it. Without the gate the
+    refusal would become platform-dependent: a malformed file's case-variant id
+    would be blocked on a case-insensitive filesystem (the filename probe
+    collides) and allowed on Linux -- exactly what this function exists to
+    avoid.
     """
     folded = project_id.casefold()
     matches = sorted(
         r.project_id for r in store.read_projects(active_only=False)
         if r.project_id.casefold() == folded
     )
-    if not matches and store.read_project(project_id) is not None:
-        matches = [project_id]
+    if not matches:
+        raw = store.read_project(project_id)
+        # Only a PARSING file reserves its id: an unparseable one is not a
+        # readable baton, and init of it is the repair path (see docstring).
+        if raw is not None and frontmatter_parses(raw):
+            matches = [project_id]
     if matches:
         raise ProjectAlreadyExists(project_id, matches)
 

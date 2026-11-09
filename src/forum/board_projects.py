@@ -390,11 +390,13 @@ def read_project_board(store, records=None) -> list[dict[str, Any]]:
         Sorted: active items by turn_since (oldest first), then done items
         by turn_since (most-recently-done first).
 
-    A record whose raw content has no parseable frontmatter (the store's
-    ``read_projects()`` degrades those to an all-empty ``ProjectRecord``
-    rather than raising) is skipped here — same "malformed → skipped, never
-    500s the board" contract the old glob-reader had for a file with no
-    frontmatter.
+    A record with no parseable frontmatter never reaches this function from a
+    store scan: the store's scan REFUSES such a file (#4528) — it increments
+    ``scan_projects().refused`` and emits no ``ProjectRecord`` — so the
+    "no frontmatter → skip" filter that used to live here is gone (it was
+    unreachable by construction once the scan refuses). The "malformed →
+    never 500s the board" contract still holds, and the entry is now VISIBLE in
+    the refusal count instead of silently absent.
     """
     if store is None:
         return []
@@ -409,18 +411,6 @@ def read_project_board(store, records=None) -> list[dict[str, Any]]:
     # First pass: normalize record fields, collect PR numbers for batch gh lookup.
     raw_items: list[dict[str, Any]] = []
     for record in records:
-        # A record with no parseable frontmatter block in its raw content is the
-        # store-backed equivalent of the old "no frontmatter → skip" glob case —
-        # store.read_projects() never raises on it, it just returns empty fields,
-        # so detect it here from the raw text rather than a fragile all-fields-empty
-        # heuristic.
-        if not record.raw.lstrip().startswith("---"):
-            print(
-                f"[forum/board] warning: no frontmatter in project {record.project_id!r}, skipping",
-                file=sys.stderr,
-            )
-            continue
-
         project_id = record.project_id
         title = (record.title or "").strip() or project_id
         file_status = (record.status or "").strip().lower()

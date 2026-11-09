@@ -72,7 +72,8 @@ def _seed_store(store: FileStore, allocator: SeqAllocator) -> None:
           turn_reason="design discussion needed", ts="2026-06-21T12:00:00Z")
     # Malformed: no frontmatter at all — written directly (bypassing init(), which
     # always emits well-formed frontmatter), the store-backed equivalent of the
-    # retired MALFORMED.md fixture.
+    # retired MALFORMED.md fixture. Since #4528 the store's scan REFUSES it
+    # (refused += 1, no record), so it never reaches the board.
     (store.projects_dir / "MALFORMED.md").write_text(
         "# This is a plain markdown file with no frontmatter\n\n"
         "It should be skipped gracefully by the board parser without causing errors.\n"
@@ -213,7 +214,7 @@ class TestReadModel:
 
 class TestMalformedSkipped:
     def test_malformed_not_in_board(self, store):
-        """A record with no frontmatter is skipped; it never appears in board."""
+        """A file with no frontmatter is refused by the scan; never in board."""
         items = _board_with_gh_mock(store, {})
         project_ids = {i["project"] for i in items}
         assert "MALFORMED" not in project_ids
