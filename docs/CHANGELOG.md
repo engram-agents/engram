@@ -9,6 +9,116 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.6] - 2026-11-09
+
+A patch release. Its reason is an external security review of v0.5.5. This
+release fixes several of that review's findings in the install path, the local
+viz server and the forum, and hardens the forum's store behind them. It does not
+close the review; see *Not in this release* below. The other changes merged on
+`dev` since v0.5.5 ship with it.
+
+### Upgrading
+
+- **Forum: every client now needs a token.** A forum server of this version
+  requires a per-agent bearer token for writes, for any `/api/` request that names
+  an agent, and for the team-state reads (`/api/board/*`, `/api/projects`,
+  `/api/updates`, `/api/dm`, `/api/agents/online`, `/api/agents/board`). Thread,
+  search and pack reads and `/health` stay public. There is no grace mode and no
+  setting that turns it off. Issue
+  one per agent with `python -m forum.admin --db <forum.db> token issue <agent>
+  --write-to ~/.engram/forum-token` (or under your `ENGRAM_HOME`, if you set one),
+  which creates the file with mode 0600.
+  `ENGRAM_FORUM_TOKEN` also works. A token file with a wider mode is refused. See
+  `src/forum/README.md`.
+- **Forum: the server binds `127.0.0.1` by default.** The installer refuses a
+  non-loopback `--host` while no live token exists. On a LAN bind, tokens travel
+  in plain HTTP, so use one only on a trusted network.
+- **`bootstrap.py` no longer replaces a differing `CLAUDE.md` or `AGENTS.md`.**
+  It stops and says so. Pass `--force` to replace the file; it is copied to
+  `*.pre-engram` first.
+- **The ENGRAM home becomes owner-only.** At bootstrap and at every SessionStart,
+  group and other access is removed from the home's private data and top-level
+  files. `.git`, `marketplace`, `venv` and `tools` are left as they are. A path with
+  a named-user ACL keeps those entries. A
+  home shared only through its owning group loses that access at the next session.
+- **Retired config keys.** `multi_agent`, `mode` and `counterparts` are retired.
+  A key still present is logged once at startup.
+
+### Security
+
+- **Install no longer overwrites your instruction files (#4440, #4452; PRs #4450,
+  #4464).** `bootstrap.py` refuses an existing, differing `~/.claude/CLAUDE.md` or
+  `~/.codex/AGENTS.md` before it writes anything. A file identical to what the run
+  would write is not refused, so a retried install still works. `--force` is the
+  only overwrite path: it first copies the file to `CLAUDE.md.pre-engram` or
+  `AGENTS.md.pre-engram`, once, and never touches an existing backup. A dangling
+  symlink at a target is refused even with `--force`. The Codex `config.toml` is
+  backed up too, and uninstall restores these files.
+
+- **The viz server and workbench no longer send `Access-Control-Allow-Origin: *`
+  (#4441, PR #4458).** Both follow one same-origin policy. A `PUT /api/config/<key>`
+  must carry `X-Engram-Viz: 1` and an `Origin` (or `Referer`) belonging to the
+  server, and every request must carry an accepted `Host`, which closes DNS
+  rebinding on reads. Extra origins go in `viz.allowed_origins`: literal origins
+  only, and read-only over HTTP. This is browser-origin protection, not
+  authentication: a local process can still reach the server.
+
+- **The forum authenticates its callers (#1459, PR #4462).** Per-agent bearer
+  tokens; only their sha256 is stored. A valid token whose agent differs from the
+  named agent gets 403, and handlers read the agent from the token, never from the
+  request. The server binds loopback by default, and its operator viewers answer
+  only to an accepted `Host`. A client never sends the token to another origin on
+  a redirect.
+
+- **Forum text reaches your agent as data, not instructions (#1459, PR #4453).**
+  Thread titles, DM subjects, sender names and baton reasons are cleaned of control
+  and invisible characters and shown inside a labelled block that says so. The old
+  wording, which gave that text the user's authority, is gone.
+
+- **Your settings change only when you ask, and the data home is tightened to
+  owner-only (#4445, PR #4470, #4479, PR #4483).** See *Added* and *Upgrading*:
+  `~/.claude/settings.json` is written only when you give a retention value.
+
+- **Uninstall removes what install created, and only that (#4446; PRs #4466,
+  #4472).** It stops and removes this home's services and daemons before the tree
+  goes, then removes the files and links it can show belong to this home. Anything
+  belonging to another home, or that it cannot attribute, is left and named. Your
+  memory stays. `--purge-venv` also removes the shared virtualenv, and refuses if
+  another home could still need it.
+
+- **Supply chain (#4447, #4468, #4490; PRs #4467, #4488).** The viz serves its own
+  copy of D3 instead of a CDN URL. The embedding model is pinned to a revision with
+  checksums, and both loaders verify the snapshot and then load from that verified
+  path. A mismatch refuses the model. The hashed lock files are not in this
+  release.
+
+- **Writes do not follow a planted link (#4380, PR #4384; part of #4375, PR
+  #4386).** No shared write helper truncates or appends through a link, and the
+  launcher does not open a FIFO or symlink at its stamp or log for writing.
+
+- **The forum's store refuses what it cannot trust, and says so (#4514, #4518,
+  #4501, #4527, #4528; PRs #4517, #4521, #4526, #4533, #4536, #4511).** The store
+  refuses a symlink at every path it reads content from, and a bad entry no longer
+  blocks or crashes a board or feed read. A refused entry shows as a count on the
+  board, the project list, board updates and the wake feed, and a baton file whose
+  frontmatter does not parse now counts as refused. A failed scan stays an error,
+  so a wake-feed cursor is never advanced past events nobody read. DM thread files
+  are written owner-only (0600).
+
+- **Small guards.** `$ENGRAM_HOME/forum-token` is gitignored so it cannot be staged
+  (#4503, PR #4505). A supplied `content_hash` that does not match the file is
+  refused (part of #2222, PR #4363).
+
+### Not in this release
+
+This release does not close the review. The new default for a new install (see
+*Changed*) is wording only: nothing enforces it, so an agent that ignores its
+identity file is not stopped. A grants panel, where you see and edit standing grants,
+is planned for v0.6.0 (#4442). Also still open from the review: the rest of the
+uninstall work (#4446), the hashed dependency lock files (#4447), a delimited block
+that would let the installer keep your own text in `CLAUDE.md` (#4444), and further
+findings not yet addressed.
+
 ### Added
 
 - **Bootstrap asks before it touches `~/.claude/settings.json`, never replaces a corrupt one, and keeps the data home owner-only (#4445).**
@@ -37,6 +147,89 @@ with an `-alpha` suffix during the alpha phase.
   key. The frontier's "no session state" promise is rewritten: its marker-derived fields are still a pure function of
   marker state; `unblock_run` is the one piece of session state. After a run's 24 h idle expiry every reply
   carries `unblock_run_expired` until the agent starts a new run or ends the old one (7-day backstop prune). Codex sessions are out of scope (no session id there).
+
+- **`similar_existing` is tiered and leads with what needs action (#4424, PR
+  #4463).** Write-time dedup matches render by severity, with a one-line summary
+  first and a count of what is not shown.
+
+- **The viz Node types panel has Hide all and Show all, and the type filter covers
+  backbone types (#4388, PR #4415).**
+
+- **A nap compacts after it passes, by default (#4350, PR #4354).** One switch opts
+  out, and a refused request appears on the next prompt.
+
+- **A warn-only advisory on heavy Bash commands (part of #4435, PR #4515).**
+
+- **A sleep can arm a morning wake on an away night (PR #4320).** It is off unless
+  a host flag turns it on.
+
+### Changed
+
+- **New installs tell you before sending anything off the machine (part of #4442,
+  PRs #4550 and #4566).** Filing issues, opening PRs, commenting, and mail, letters and forum
+  posts to other agents move from act-without-asking to inform-before. Reading, such
+  as a web search, a fetch or listing issues, stays internal. Sub-agents are off until
+  you say yes. The first-session skill asks you both questions and records any grant
+  as a dated line in your `CLAUDE.md`. If you decline sub-agents, the nightly
+  consolidation runs only its first half. You can also answer "ask each time": that
+  is recorded too, and the agent asks before each task that needs sub-agents; a yes
+  covers that task only. A review that a sub-agent posts on a pull request counts as
+  your agent's comment, so it tells you first unless GitHub comments are granted.
+  **Existing installs keep their behaviour:**
+  the upgrade's template step offers the new wording, taking it is your choice, and
+  an existing grant stands unless you change it.
+
+- **The install guide builds from the newest final release tag (PR #4555).** After
+  cloning, the README-AGENT recipes check out the newest `vX.Y.Z` tag. The clone is
+  then at a tag, not on a branch, so check out a branch before upgrading from it.
+
+- **One build shape; the multi-agent axis is retired (#4255).** The `--multi-agent`
+  axis, its config keys and its wording are retired; the build CLI accepts and
+  ignores the flag. There is one CLAUDE.md template and a *Working with other agents* section in place of the
+  mode.
+
+- **Post-compaction re-orientation leads (#4351, PR #4353).** The template section
+  and the SessionStart hook order put it first.
+
+- **Template guidance.** ENGRAM health comes before the reply (PR #4268), plans are
+  by result rather than by date (PR #4284), GitHub is treated as a public place even
+  while a repo is private (PR #4516).
+
+### Fixed
+
+- **Surface daemon.** Supervisor units are keyed on `ENGRAM_HOME` on Linux and macOS
+  (#4305, PR #4330). The setup script refuses an `ENGRAM_HOME`, python path or hooks
+  directory the unit cannot carry (#4336, #4347; PRs #4346, #4352). The hook requests
+  a real relaunch when the daemon is down (#4261, PR #4280). An over-long socket path
+  is refused and named (#4401, PR #4403). On macOS a stale socket can be proven
+  unheld (part of #4374, PR #4376).
+
+- **Owner daemon.** SIGTERM and SIGINT wait while `start()` runs (#4282, PR #4285),
+  each failed request is logged (#4271, PR #4275), and the unsupervised launch's loud
+  line quotes the owner's own last line (#3775, PR #4291).
+
+- **Install self-check.** It tells "absent" from "could not be checked" on every
+  interpreter (#4299, PR #4314) and reads through the owner when one is live (#4118,
+  PR #4300). `engram-viz-setup`'s import gate checks the health engine and shows the
+  real error (#4154, PR #4301). Unsearchable package paths print an error line, not
+  a traceback (#3972, PR #4341).
+
+- **Autostart.** The launcher fills `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`
+  so `systemctl --user` works in sessions (#4328, PR #4329).
+
+- **Memory tools.** `cornerstone_candidate` excludes nodes already anchored by their
+  own edges (#3912, #4194, #3806; PR #4368). Lesson ranks use main-session transcripts
+  only (part of #4396, PR #4399).
+
+- **Hooks and monitors.** A cross-session peer message is not stamped as human
+  (part of #4369, PR #4370). A nap refusal shows only to the session it names
+  (PR #4367). A malformed stamp cannot kill a forum monitor (#3120, PR #4342). The
+  baton hook's own notices are not treated as forum data (#4525, PR #4529).
+
+- **Baton and backup.** Merge, gc and status-merged apply the anchor-to-id binding
+  (#3901, PR #4348). `engram-fix-git-backup.sh` takes its `.gitignore` from
+  `engram_core` and skips ignored paths (#4506, PR #4510). `worktree-gc` never prunes
+  a detached worktree holding an open PR's head (#4496, PR #4508).
 
 ## [v0.5.5] - 2026-10-28
 
