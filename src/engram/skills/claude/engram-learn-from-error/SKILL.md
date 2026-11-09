@@ -115,7 +115,7 @@ If the mistake has a recognisable **tool-call shape**, add a `situation_pattern`
 |---|---|
 | `Bash` | the raw shell command string, nothing else |
 | `mcp__*` | `"{tool_name} {compact_json_of_args}"` |
-| `Agent` (a fairy dispatch) | `"Agent {subagent_type} {description} {first 500 chars of prompt}"`, e.g. `Agent engram:engram-pr-reviewer ...`. A pattern that occurs only past the 500-character prompt head cannot match. **Advisory only**: an Agent call is never denied or shadow-logged, even for a lesson with `prevention_type: blocking` (blocking is limited to ENGRAM and Umwelt calls). A prompt head can hold real newlines, so `(?s)` applies as for Bash. |
+| `Agent` (a fairy dispatch) | `"Agent {subagent_type} {description} {first 500 chars of prompt}"`, e.g. `Agent engram:engram-pr-reviewer ...`. A pattern that occurs only past the 500-character prompt head cannot match. **Advisory only**: an Agent call is never denied or shadow-logged, even for a lesson with `prevention_type: blocking` (a fairy dispatch is outside what a prevention lesson may block). A prompt head can hold real newlines, so `(?s)` applies as for Bash. |
 | anything else | `""` — the hook exits early, your pattern can never fire |
 
 Two consequences worth internalising:
