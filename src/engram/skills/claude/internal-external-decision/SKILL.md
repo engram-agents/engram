@@ -7,7 +7,7 @@ description: Use when uncertain whether an action falls under "internal" (my aut
 
 CLAUDE.md `Authority Structure` holds the principle. This skill is for the 20% nuanced cases where classification isn't obvious.
 
-**Your own CLAUDE.md table wins over every row below.** The shipped default puts anything sent off this machine, or that reaches someone other than your user, at inform-before, and starts no sub-agents. Reading is not sending: a search, a fetch or listing issues is internal. A row below that reads "once granted" applies only where your CLAUDE.md grants it: its authority table lists that action under Internal, a dated grant line covers it (`Granted by <user> on <date>: <their words>`), or, for sub-agent dispatch, its Tool policy section carries a standing request. Without any of these, the action is inform-before, or for sub-agent dispatch, not done. Where a row's Why still argues for Internal, its Class cell governs.
+**Your own CLAUDE.md table wins over every row below.** The shipped default puts anything sent off this machine, or that reaches someone other than your user, at inform-before, and starts no sub-agents. Reading is not sending: a search, a fetch or listing issues is internal. A row below that reads "once granted" applies only where your CLAUDE.md grants it: its authority table lists that action under Internal, a dated grant line covers it (`Granted by <user> on <date>: <their words>`), or, for sub-agent dispatch, its Tool policy section carries a standing request. An `ask each time` line there means ask first; a yes covers that one task. Without any of these, the action is inform-before, or for sub-agent dispatch, not done. Where a row's Why still argues for Internal, its Class cell governs.
 
 ## Quick decision tree
 

@@ -606,7 +606,7 @@ Then ask two questions, one at a time, and wait for each answer:
 
 Record each grant as a dated line in the user's CLAUDE.md, quoting the user's own words: `Granted by <user> on <date>: <their words>`. Outward grants go under the authority table; the sub-agent grant goes in the tool-policy section.
 
-On "no", on "ask each time", or on no answer: write nothing; the default stands. Never pre-fill an answer, never paraphrase a grant into something broader than the user said.
+On "no" or on no answer: write nothing; the default stands. On "ask each time": write one dated line in the tool-policy section, `<user> on <date>: ask each time`, so a later session asks before each task that needs sub-agents instead of skipping. Never pre-fill an answer, never paraphrase a grant into something broader than the user said.
 
 Ask now, write after: the grant lines go into CLAUDE.md once the substitution below has produced the final file, so the user's name is resolved in them. Claude target only: the Codex identity file carries no authority table, so skip this sub-step there.
 
@@ -628,8 +628,9 @@ Ask now, write after: the grant lines go into CLAUDE.md once the substitution be
    ```bash
    grep -r '{{' ~/.claude/CLAUDE.md "${ENGRAM_HOME:-$HOME/.engram}"/warm-briefing.md 2>/dev/null && echo "WARN: unresolved placeholders"
    ```
-7. Delete the first-run marker: `rm -f "${ENGRAM_HOME:-$HOME/.engram}"/first-run-pending`.
-8. Call `engram_advance_turn(payload_json=json.dumps({"message": "First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>."}))` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
+7. **Write the grants.** Add the lines settled in the grants sub-step to the resolved `~/.claude/CLAUDE.md` (outward grants under the authority table; the sub-agent line, or the ask-each-time line, in the tool-policy section), read the file back and show the user the lines. Nothing to record: write nothing and say so. This comes before the marker is deleted, so a session that ends here re-enters the skill instead of losing the answers.
+8. Delete the first-run marker: `rm -f "${ENGRAM_HOME:-$HOME/.engram}"/first-run-pending`.
+9. Call `engram_advance_turn(payload_json=json.dumps({"message": "First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>."}))` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
 
 ---
 
@@ -667,7 +668,7 @@ The codex file set is different. Bootstrap wrote identity surfaces across four f
 
 6. Delete the first-run marker: `rm -f "${ENGRAM_HOME:-$HOME/.engram}"/first-run-pending`.
 
-7. Call `engram_advance_turn(...)` as in the claude path (step 6.8 above).
+7. Call `engram_advance_turn(...)` as in the claude path (step 6.9 above).
 
 ## Step 7 — Tell the user what's next
 

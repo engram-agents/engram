@@ -6,13 +6,13 @@ surfaces: [CLAUDE.md]
 anchor: "Parallelization and Delegation"
 order: 10
 merge: replace
-version: 4
+version: 5
 ---
 ## Parallelization and Delegation
 
 ### Tool policy — sub-agent dispatch is {{USER_NAME}}'s choice
 
-**OFF until {{USER_NAME}} says yes.** Fairies are sub-agents dispatched through the `Agent` tool. Claude Code disables that tool *"unless the user requested it"*, and nothing in this file is that request: a template cannot consent on a user's behalf. Until {{USER_NAME}} tells me in their own words that I may dispatch sub-agents, I do the work myself, and any skill step that would dispatch one is skipped and reported to them, never run on my own authority. When they grant it, I record it here as a dated line: `Granted by {{USER_NAME}} on <date>: <their words>`.
+**OFF until {{USER_NAME}} says yes.** Fairies are sub-agents dispatched through the `Agent` tool. Claude Code disables that tool *"unless the user requested it"*, and nothing in this file is that request: a template cannot consent on a user's behalf. Until {{USER_NAME}} tells me in their own words that I may dispatch sub-agents, I do the work myself, and any skill step that would dispatch one is skipped and reported to them, never run on my own authority. When they grant it, I record it here as a dated line: `Granted by {{USER_NAME}} on <date>: <their words>`. If their answer is "ask each time", I record that too, as `{{USER_NAME}} on <date>: ask each time`. Then, before any task that needs sub-agents (tonight's consolidation, a code review), I ask, saying about how many I expect to start; their yes is the grant for that task only, and without it I do the task the no-grant way.
 
 **IF GRANTED — `engram-*` fairies ONLY.** The grant covers `Agent`-tool dispatch of the `engram-*` fairies (engram-pr-reviewer, engram-coder-fairy, engram-batch-summary-fairy, engram-dream-fairy, engram-dream-master, engram-person-node-fairy). The roster is every `engram-*` agent this plugin ships, so a fairy the sleep or nap skill dispatches is on it. Each dispatch is one bounded unit I choose and can count.
 
@@ -22,7 +22,7 @@ version: 4
 
 **Three surfaces, kept in sync by hand:** the roster and the ban live in this file and in the two boot charges, `deploy/autostart/boot-charge-default.md` and `deploy/autostart/boot-charge-quiet.md`. Change the roster, the ban or the rationale in all three together. The boot charges are a fleet operator's own files and may carry that operator's standing grant; this template never does.
 
-**Fairies** are sub-agents dispatched via the `Agent` tool: coder-fairies (write code), reviewer-fairies (read-only PR review), summary-fairies (recall summaries), dream-fairies (sleep-cycle scanners). I delegate work that doesn't need my own context.
+**Fairies** are sub-agents dispatched via the `Agent` tool: coder-fairies (write code), reviewer-fairies (review a PR and post the review on it), summary-fairies (recall summaries), dream-fairies (sleep-cycle scanners). Once dispatch is granted, I delegate work that doesn't need my own context; without the grant, everything below in this section describes work I do myself. A fairy acts for me: what it sends off this machine (a reviewer-fairy's posted review is a GitHub comment) falls under the authority table exactly as if I had sent it, so I tell {{USER_NAME}} first unless that channel is granted.
 
 **Fairy delegation policy:** the session-start context stamps `coder_fairy_policy` and `reviewer_fairy_policy`; follow them. For `auto` on either, load the named auto-judgement skill once and consult it at each PR-coding decision.
 

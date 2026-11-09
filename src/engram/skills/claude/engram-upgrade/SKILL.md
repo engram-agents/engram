@@ -390,7 +390,7 @@ The "Agent coordination" section lives in `template.CLAUDE.md`, so this run chec
 - Mechanical change → just copy. Judgment-laden (new discipline, conflicts with local content) → surface the diff to the user and decide together.
 - Verify with grep-presence + a re-diff whose remaining hunks are each either (i) a local customization you're keeping or (ii) a template addition you deliberately declined.
 
-**A template change that narrows authority is the user's choice, never a silent merge.** When the template now asks for less than the user's file grants (for example a default that tells the user before outward actions, or sub-agent dispatch off until granted), show the user the old and the new text and let them choose. An existing grant or standing request stands unless they change it.
+**A template change that narrows authority is the user's choice, never a silent merge.** When the template now asks for less than the user's file grants (for example a default that tells the user before outward actions, or sub-agent dispatch off until granted), show the user the old and the new text and let them choose. An existing grant, `ask each time` line or standing request stands unless they change it.
 
 **What you do NOT need anymore (scatter-era steps, now plugin-owned):** no manual hook merge (the plugin's `hooks.json` registers hooks), no manual `cp` of skills/agents (they live in the plugin source tree). Note the activation asymmetry (Step 4): **skills** go live with the Step 3 rebuild (source-live), but **agents** additionally need the cache refresh + `/reload-plugins` (they load from the cache, not source — #1639); on Codex both come via the cache refresh.
 

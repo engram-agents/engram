@@ -7,7 +7,7 @@ description: "Decision rubric for whether to dispatch a coder-fairy at each PR-c
 
 **When to load**: at each PR-coding decision point when `coder_fairy_policy == "auto"`.
 
-**Precondition**: sub-agent dispatch is granted in CLAUDE.md's Tool policy section (a dated grant line, or a standing request already written there). Without it this rubric does not apply: do the work directly and say so.
+**Precondition**: sub-agent dispatch is granted in CLAUDE.md's Tool policy section (a dated grant line, or a standing request already written there). Without it this rubric does not apply: do the work directly and say so. Where that section carries an `ask each time` line, ask the user before this dispatch; a yes covers this task only.
 
 **Purpose**: deterministic heuristic for whether to spawn a coder-fairy or do the work directly.
 
