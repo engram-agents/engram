@@ -723,6 +723,22 @@ jobs:
         if: success() || failure()
         run: pip install pytest pyyaml
 
+      - name: invariant-checks — name-leak-warn self-test with the real roster
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        # Runs only tests/test_name_leak_warn.py, never the whole suite, and the
+        # roster secret is handed to no other pytest invocation in this file:
+        # the roster is a secret and these logs can become public. The real
+        # roster is otherwise exercised only by the release/nightly runs, so a
+        # defect in it (e.g. a roster line the self-test cannot compile) waits
+        # for a release to appear — this step is the gain: every same-repo PR
+        # checks it. Fork PRs get no secret, so the two real-file cells skip
+        # there by design and the step still passes. The file takes ~0.2 s and
+        # runs inside this job's existing invariant-checks minute.
+        env:
+          NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
+        timeout-minutes: 2
+        run: python3 -m pytest tests/test_name_leak_warn.py -q --tb=short --show-capture=no
+
       - name: invariant-checks — scan-leaks (whole-repo structural invariant)
         if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Runs the real-repo integration test: scans the checked-out tree for

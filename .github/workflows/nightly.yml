@@ -274,6 +274,21 @@ jobs:
             printf '### disk usage — after suite\n\n```\n%s\n```\n' "$OUT" >> "$GITHUB_STEP_SUMMARY"
           } 2>/dev/null || true
 
+      - name: Name-leak-warn self-test (real roster)
+        # Deliberately a SEPARATE step from the sharded suite above, never a
+        # step-level env on it: the roster is a secret and these logs can
+        # become public, so it is handed only to the one file that needs it.
+        # The real roster is otherwise exercised only by the release run, so a
+        # defect in it (e.g. a roster line the self-test cannot compile) waits
+        # for a release to appear. Fork PRs get no secret; the two real-file
+        # cells skip there by design and the step still passes. `!cancelled()`
+        # so it still runs when the suite is red — it costs about 0.2 s.
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        env:
+          NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
+        run: pytest tests/test_name_leak_warn.py -v --tb=short --show-capture=no
+
       - name: Run timing cells (no coverage)
         # #3784 — the cells the suite step deselects with -m "not timing", run
         # with NO tracer so their measured ratios are judged in the regime they

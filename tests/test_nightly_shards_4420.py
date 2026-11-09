@@ -158,8 +158,15 @@ def test_c2c_a_new_file_lands_in_exactly_one_shard_without_a_workflow_edit(tmp_p
     assert len(flat) == len(set(flat)) == 5
 
     # ...and the workflow holds no hand-written test file list to edit.
+    # One named occurrence is expected and carved out: the targeted
+    # name-leak-warn self-test step re-runs a single file that already sits
+    # inside the shard suite's roots, so it gets the roster secret; it is not a
+    # shard file list. Subtracting exactly that run line keeps the guard's
+    # property intact for every other step (a hand-written list still fires).
     wf = WORKFLOW.read_text(encoding="utf-8")
-    assert "tests/test_" not in wf.replace("src/forum/tests/ ", "")
+    selftest_run = "pytest tests/test_name_leak_warn.py -v --tb=short --show-capture=no"
+    scan = wf.replace("src/forum/tests/ ", "").replace(selftest_run, "")
+    assert "tests/test_" not in scan
     assert "test_new_file" not in wf
 
 

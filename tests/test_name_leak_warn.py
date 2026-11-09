@@ -7,12 +7,20 @@ Coverage:
   3. JSON format shape: --format json produces {"matches": [...]} with required keys.
   4. Empty roster: empty patterns list produces zero matches (skip-when-absent).
   5. Multi-pattern: multiple patterns in roster, correct pattern_index reported.
-  6. Real-name pattern self-test (alpha#3303): REAL_NAME_PATTERN must
-     actually be live — regression guard for the non-raw-string bug that
-     made the shipped pattern's trailing \\b compile to a literal backspace.
+  6. Roster-fed pattern self-test (alpha#3303): roster_text() and
+     strict_pattern() must be live — the patterns match an injected roster
+     name as a whole word, reject look-alikes, and reject a name absent from
+     the injected roster. The regression guard for the non-raw-string bug
+     (trailing \\b compiling to a literal backspace) is preserved, and the
+     cell needs no real value. strict_pattern() compiles one pattern per
+     roster line, exactly as tools/name_leak_warn.py's load_roster does — never
+     joined into one alternation, which is a different language (a line
+     carrying inline flags, e.g. ``(?i)name``, is valid alone but raises
+     "global flags not at the start of the expression" when joined).
   7. No-real-names hygiene (STRICT): tools/name_leak_warn.py itself contains
      no real personal/agent names at all (mirrors test_scan_leaks.py's
-     example-file hygiene test).
+     example-file hygiene test). Skips when NAME_LEAK_ROSTER is unset or
+     compiles to no pattern (comment-only / whitespace-only).
   8. Workflow-hygiene rule fixtures (alpha#3303, Kepler's ruling, CLAUDE.md
      "Attribution convention"): cases (a) other-human-anywhere, (b)
      marker-on-comment-line-only, (c) @handle-mention-anywhere — planted
@@ -21,15 +29,35 @@ Coverage:
      post-#1598 consolidation) satisfies the (a)/(b)/(c) rule above.
   10. load_roster: absent file is an IO error — exits 1 (SystemExit(1)).
   11. load_roster: invalid regex in roster triggers exit 1 (usage error).
+
+Principal marker: the principal set is declared in a separate
+``NAME_LEAK_PRINCIPAL`` variable (same regex-line convention as the roster:
+one bare regex per line, ``#`` comments skipped, multiple lines unioned) by
+repeating the principal's ``NAME_LEAK_ROSTER`` line. The roster keeps exactly
+one meaning — the patterns the scanner applies as-written — so the marker
+never enters it (a ``principal: ...`` line there would be compiled as one
+literal regex by ``tools/name_leak_warn.py``). With the principal declared,
+the principal plus the agent handles are comment-line attribution markers
+(case b) and every other roster name is forbidden anywhere (case a). Without
+the declaration the rule degrades: case (a) becomes the empty set and every
+roster name is treated as case (b), logged once. The degraded mode does NOT
+check a roster name on a comment line — attribution comments are
+policy-allowed — but it still flags a roster name on a ``run:`` line, a step
+``name:``, an env value, or in an ``@``-mention anywhere.
 """
 
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
+import warnings
 from pathlib import Path
+
+import pytest
+import yaml
 
 # ---------------------------------------------------------------------------
 # Path setup — import the tool module directly for unit tests
@@ -58,58 +86,306 @@ FAKE_NAME_A = "Alice Example"
 FAKE_NAME_B = "agentname-nick"
 
 # ---------------------------------------------------------------------------
-# Real-name roster — single source of raw-string pieces, reused by every
-# hygiene check below (alpha#3303: the shipped pattern's second piece was
-# NOT a raw string, so its closing \b compiled to a literal backspace
-# \x08, and the pattern could never match real text — both pieces are raw
-# here, and test_real_name_pattern_is_live below guards against regression).
+# Real-name roster — the real values live only in the NAME_LEAK_ROSTER
+# secret. This module reads them through roster_text() and never carries a
+# literal of its own, so importing the module cannot fail when the secret is
+# absent and the file can be published without leaking a name.
+#
+# Agent handles stay as literals: they already ship in three READMEs, so they
+# are not part of the secret.
 # ---------------------------------------------------------------------------
 
-_LEI = r"lei"
-_OTHER_HUMAN_NAMES = r"the child|lin(?!e|ux|k)"
+_SKIP_REASON = "NAME_LEAK_ROSTER not set — real-name hygiene not checked"
+
 _AGENT_HANDLES = r"borges|ariadne|luria|aleph|mira|funes|calvino|hebb|kepler|clio|sol|zephyr"
 
-# Strict: every roster name (Lei, other humans, agent handles) — the rule
-# used where NO roster name may appear at all (tools/name_leak_warn.py), and
-# the pattern exercised directly by test_real_name_pattern_is_live.
-REAL_NAME_PATTERN = re.compile(
-    r"\b(" + _LEI + "|" + _OTHER_HUMAN_NAMES + "|" + _AGENT_HANDLES + r")\b",
-    re.IGNORECASE,
-)
 
-# Workflow-file rule — Lei's functional-vs-marker test (CLAUDE.md
+def roster_text() -> str | None:
+    """Return the roster secret's text, or None when it is unset or empty.
+
+    This is the only place the roster enters this module. A missing roster is
+    not an error — cells that need it skip — but it is never silently green.
+    """
+    value = os.environ.get("NAME_LEAK_ROSTER")
+    return value if value else None
+
+
+def _require_roster() -> str:
+    """Return the roster text, or skip the calling cell when it has no pattern.
+
+    A skip is the honest outcome: a green pass with no roster would assert
+    nothing about real names. A comment-only or whitespace-only
+    ``NAME_LEAK_ROSTER`` is truthy but compiles to zero patterns, so the
+    tool's own ``load_roster()`` decides — a non-empty string alone is not a
+    roster.
+    """
+    roster = roster_text()
+    if roster is None or not load_roster(roster_source=roster, roster_file=None):
+        pytest.skip(_SKIP_REASON)
+    return roster
+
+
+def principal_text() -> str | None:
+    """Return the principal variable's text, or None when unset or empty.
+
+    ``NAME_LEAK_PRINCIPAL`` is deliberately separate from ``NAME_LEAK_ROSTER``:
+    ``tools/name_leak_warn.py`` compiles every non-comment roster line as one
+    regex, so a ``principal: <regex>`` line inside the roster secret would
+    compile as that whole string and silently stop scanning the principal.
+    """
+    value = os.environ.get("NAME_LEAK_PRINCIPAL")
+    return value if value else None
+
+
+def _regex_lines(text: str) -> list[str]:
+    """The bare, non-comment lines of a regex-line variable, stripped."""
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def _principal_patterns() -> list[str]:
+    """The principal patterns declared in ``NAME_LEAK_PRINCIPAL``.
+
+    A declaration names a principal by repeating that name's roster line; the
+    roster therefore keeps exactly one meaning (the patterns the scanner
+    applies) while this variable only classifies them.
+    """
+    principal = principal_text()
+    return _regex_lines(principal) if principal is not None else []
+
+
+def _parse_roster(roster: str) -> tuple[list[str], list[str], bool]:
+    """Split the roster into (principal, other, declared) patterns.
+
+    The roster is the scanner's pattern list, applied as-written. The separate
+    ``NAME_LEAK_PRINCIPAL`` variable declares which roster lines are the
+    principal by repeating them; those move from case (a) to case (b). A
+    declaration that repeats no roster line is still a principal pattern (the
+    strict rule scans it), but it cannot be case (a) because it is not in the
+    roster.
+    """
+    declared = _principal_patterns()
+    declared_set = set(declared)
+    roster_patterns = _regex_lines(roster)
+    others = [p for p in roster_patterns if p not in declared_set]
+    principal = [p for p in roster_patterns if p in declared_set]
+    principal += [p for p in declared if p not in set(roster_patterns)]
+    return principal, others, bool(declared)
+
+
+def _all_roster_patterns(roster: str) -> list[str]:
+    """Every roster pattern (principal and other names)."""
+    principal, others, _ = _parse_roster(roster)
+    return principal + others
+
+
+_DEGRADATION_NOTED = False
+
+
+def _note_degradation_once() -> None:
+    """Say, once per process, that no principal has been declared.
+
+    The degraded rule is not silent: case (a) becomes the empty set and every
+    roster name is checked as a comment-line marker (case b). Attribution
+    comments are therefore not flagged, but a roster name on any other line is.
+    """
+    global _DEGRADATION_NOTED
+    if _DEGRADATION_NOTED:
+        return
+    _DEGRADATION_NOTED = True
+    warnings.warn(
+        "NAME_LEAK_PRINCIPAL is not set: case (a) is empty and every roster "
+        "name is treated as comment-line-only (case b). Roster names on "
+        "non-comment lines and @mentions are still checked; attribution "
+        "comments are not flagged.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
+# A leading GLOBAL inline-flag group, e.g. ``(?i)`` or ``(?im)``. Python accepts
+# global flags only at the very start of an expression, so a roster line that
+# carries them must keep them at position 0 when re-compiled (see
+# _compile_bounded). Scoped groups such as ``(?i:...)`` do not match this and
+# are left in place.
+_GLOBAL_INLINE_FLAGS = re.compile(r"^\(\?[aiLmsux]+\)")
+
+
+def _compile_bounded(
+    fragment: str,
+    prefix: str = r"\b(",
+    suffix: str = r")\b",
+    label: str = "the pattern",
+) -> re.Pattern:
+    """Compile ONE roster line the way the gate does, bounded as a whole word.
+
+    The gate (``tools/name_leak_warn.py: load_roster``) compiles each non-comment
+    roster line on its own; it never joins the lines into a single alternation.
+    The two are different languages. A line carrying an inline flag
+    (``(?i)quillonfex``) is a valid roster entry for the gate, but inside a
+    larger alternation ``re`` raises "global flags not at the start of the
+    expression". Compiling one line at a time keeps this self-test in the same
+    language as the scanner.
+
+    ``re.IGNORECASE`` is applied as before, *unless the line carries its own
+    flags* — such a line keeps them, moved back to position 0 so ``re`` accepts
+    them, and is not given IGNORECASE on top.
+
+    A line that fails to compile is loud and never a silent skip: print to
+    stderr, then exit 1. That follows the gate's precedent (``name-leak-gate.yml``
+    validates the roster first and prints the LINE NUMBER only), but here the
+    message names ``label`` — the line's 1-based index within the roster and the
+    roster's line count, or ``the agent-handle pattern`` — together with the
+    exception class and its ``.pos`` offset. It prints neither the line's text
+    (not even truncated or ``repr``'d) nor ``str(exc)``: the roster is the
+    ``NAME_LEAK_ROSTER`` secret, whose values are real human names, and
+    ``re.error.__str__`` and some ``msg`` values embed part of the pattern.
+    """
+    at_start = _GLOBAL_INLINE_FLAGS.match(fragment)
+    if at_start:
+        flags_text = at_start.group(0)
+        body = fragment[at_start.end():]
+        source = flags_text + prefix + body + suffix
+        flags = 0
+    else:
+        source = prefix + fragment + suffix
+        flags = re.IGNORECASE
+    try:
+        return re.compile(source, flags)
+    except re.error as exc:
+        # Build the message from the class name and offset only: the fragment
+        # and str(exc) can each embed part of the secret roster line.
+        print(
+            f"name_leak_warn: cannot compile {label}: "
+            f"{type(exc).__name__} at offset {exc.pos}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _matches_any(patterns: list[re.Pattern], text: str) -> bool:
+    """True when any compiled roster pattern matches ``text``."""
+    return any(pattern.search(text) for pattern in patterns)
+
+
+def strict_pattern(roster: str) -> list[re.Pattern]:
+    """Build the 'no roster name may appear anywhere' patterns.
+
+    One compiled pattern per roster line — and one for the agent-handle
+    alternation — never a single joined alternation. Each line is compiled
+    exactly the way ``tools/name_leak_warn.py`` compiles it (see
+    ``_compile_bounded``), so a roster line the gate accepts cannot make this
+    self-test raise. Every pattern is bounded as a whole word, so a name is
+    matched as a whole word and a look-alike that merely contains it does not
+    fire. Every roster line — and every principal line declared in
+    ``NAME_LEAK_PRINCIPAL`` — is a regex inserted as written (never escaped), so
+    each line keeps its own anchors and case handling.
+    """
+    roster_parts = _all_roster_patterns(roster)
+    total = len(roster_parts)
+    labelled = [
+        (part, f"roster line {index} of {total}")
+        for index, part in enumerate(roster_parts, 1)
+    ]
+    labelled.append((_AGENT_HANDLES, "the agent-handle pattern"))
+    return [_compile_bounded(part, label=label) for part, label in labelled]
+
+
+# Workflow-file rule — the principal's functional-vs-marker test (CLAUDE.md
 # "Attribution convention", alpha#2270), mechanised per Kepler's #3303
 # ruling on issue #3303:
-#   (a) any human name other than Lei — must not appear ANYWHERE (case 2 of
-#       the convention is held open; the safe side is none).
-#   (b) Lei + bare agent handles — attribution markers, allowed ONLY on a
-#       YAML comment line (the line's first non-space char is '#'); on any
-#       other line (step `name:`, `run:`, env, etc.) that position is
+#   (a) any human name the roster covers, other than the principal — must not
+#       appear ANYWHERE (case 2 of the convention is held open; the safe side
+#       is none).
+#   (b) the principal and bare agent handles — attribution markers, allowed
+#       ONLY on a YAML comment line (the line's first non-space char is '#');
+#       on any other line (step `name:`, `run:`, env, etc.) that position is
 #       functional, so it fails.
-#   (c) an `@handle` mention of ANY roster name — functional (renders as a
-#       live GitHub notification the moment it's quoted anywhere on the
-#       platform) — forbidden anywhere, comment or not.
-_CASE_A_RE = re.compile(r"\b(" + _OTHER_HUMAN_NAMES + r")\b", re.IGNORECASE)
-_CASE_B_RE = re.compile(r"\b(" + _LEI + "|" + _AGENT_HANDLES + r")\b", re.IGNORECASE)
-_CASE_C_RE = re.compile(
-    r"@(" + _LEI + "|" + _OTHER_HUMAN_NAMES + "|" + _AGENT_HANDLES + r")\b",
-    re.IGNORECASE,
+#   (c) an `@handle` mention of any roster name or agent handle — functional
+#       (renders as a live GitHub notification the moment it's quoted
+#       anywhere on the platform) — forbidden anywhere, comment or not.
+#
+# The principal set comes from NAME_LEAK_PRINCIPAL, which repeats the
+# principal's roster line (see _parse_roster). Without a declaration the rule
+# degrades: case (a) becomes empty and every roster name moves to case (b), so
+# nothing false-positives on a policy-allowed attribution comment.
+def _workflow_case_patterns(
+    roster: str,
+) -> tuple[list[re.Pattern], list[re.Pattern], list[re.Pattern]]:
+    """Build the (a)/(b)/(c) pattern lists from the same roster the strict rule
+    uses, plus the separately declared principal and the agent handles.
+
+    Each roster line is compiled on its own, exactly as the strict rule (and the
+    gate) does; the partitioning into cases is unchanged.
+    """
+    principal, others, declared = _parse_roster(roster)
+    if declared:
+        case_a_humans, case_b_humans = others, principal
+    else:
+        _note_degradation_once()
+        case_a_humans, case_b_humans = [], principal + others
+
+    roster_lines = _regex_lines(roster)
+    total = len(roster_lines)
+
+    def _label(pattern: str) -> str:
+        # Name the roster line by its 1-based position. A declared principal
+        # that repeats no roster line is not a roster line; say so instead.
+        if pattern == _AGENT_HANDLES:
+            return "the agent-handle pattern"
+        try:
+            index = roster_lines.index(pattern)
+        except ValueError:
+            return "a declared principal pattern"
+        return f"roster line {index + 1} of {total}"
+
+    case_a = [_compile_bounded(p, label=_label(p)) for p in case_a_humans]
+    case_b = [
+        _compile_bounded(p, label=_label(p))
+        for p in case_b_humans + [_AGENT_HANDLES]
+    ]
+    case_c = [
+        _compile_bounded(p, prefix="@(", suffix=r")\b", label=_label(p))
+        for p in principal + others + [_AGENT_HANDLES]
+    ]
+    return case_a, case_b, case_c
+
+
+# Synthetic rosters for the workflow-hygiene fixture cells. These names appear
+# nowhere else in the repository; the cells inject them so the rule mechanism
+# can be exercised without any real value. (The injected-roster cell above
+# uses a different pair, deliberately kept unique to that cell.)
+#
+# _CASE_ROSTER carries the principal (Aurelio) as an ordinary roster line, so
+# the scanner applies it as-written; _CASE_PRINCIPAL repeats that line to
+# declare it as the principal, which leaves Ottoline and Maribel as "other"
+# names for case (a). Without the declaration the same roster exercises the
+# degraded rule.
+_CASE_ROSTER = (
+    r"\bAurelio\b" + "\n" + r"\bOttoline\b" + "\n" + r"\bMaribel\b"
 )
+_CASE_PRINCIPAL = r"\bAurelio\b"
 
 
-def _check_workflow_name_hygiene(content: str) -> list[tuple[int, str, str]]:
+def _check_workflow_name_hygiene(
+    content: str, roster: str
+) -> list[tuple[int, str, str]]:
     """Apply the workflow-file name-hygiene rule (cases a/b/c above) to
     ``content``. Returns a list of (line_number, case, line_text) violations;
     empty means clean. Shared by the real-file test and its fixtures so both
     exercise the identical rule."""
+    case_a, case_b, case_c = _workflow_case_patterns(roster)
     violations: list[tuple[int, str, str]] = []
     for i, line in enumerate(content.splitlines(), 1):
         is_comment = line.lstrip().startswith("#")
-        if _CASE_A_RE.search(line):
+        if _matches_any(case_a, line):
             violations.append((i, "a", line.strip()[:100]))
-        if _CASE_B_RE.search(line) and not is_comment:
+        if _matches_any(case_b, line) and not is_comment:
             violations.append((i, "b", line.strip()[:100]))
-        if _CASE_C_RE.search(line):
+        if _matches_any(case_c, line):
             violations.append((i, "c", line.strip()[:100]))
     return violations
 
@@ -272,40 +548,138 @@ def test_multi_pattern_first_pattern_wins():
 
 
 # ---------------------------------------------------------------------------
-# Test 6 (self-test): the real-name pattern must actually be live.
-# alpha#3303 — the shipped pattern's second alternation piece was a plain
-# (non-raw) Python string, so the trailing \b compiled to a literal
-# backspace character and the pattern could never match real text.
+# Test 6 (self-test): the roster-fed pattern must actually be live, proved
+# without any real value. alpha#3303's regression guard (a non-raw \b became a
+# literal backspace) is preserved here: the pattern must match a synthetic
+# name as a whole word, must not match a look-alike that merely contains it,
+# and — the discriminating arm — must not match a name absent from the
+# injected roster (a match-everything pattern passes the first two).
 # ---------------------------------------------------------------------------
 
-def test_real_name_pattern_is_live():
-    """REAL_NAME_PATTERN must match each roster name as a whole word, and
-    must not match look-alike substrings (line/linux/link, Malice)."""
-    must_match = [
-        "approved by Lei",
-        "Borges ran it",
-        "mira-verala's note",
-        "the child",
-        "Lin said",
-        "Kepler merged it",
-        "per Clio's review",
-        "Sol re-measured",
-        "zephyr is idle",
-    ]
-    for text in must_match:
-        assert REAL_NAME_PATTERN.search(text), f"pattern must match {text!r} but did not"
+def test_roster_text_absent_is_none(monkeypatch):
+    """roster_text() is None when NAME_LEAK_ROSTER is unset."""
+    monkeypatch.delenv("NAME_LEAK_ROSTER", raising=False)
+    assert roster_text() is None
 
-    must_not_match = [
-        "keep this on one line",
-        "runs on linux",
-        "click the link",
-        "Malice in wonderland",
-        "solution",
-        "console",
-        "isolate",
-    ]
-    for text in must_not_match:
-        assert not REAL_NAME_PATTERN.search(text), f"pattern incorrectly matched {text!r}"
+
+def test_roster_text_empty_is_none(monkeypatch):
+    """roster_text() is None when NAME_LEAK_ROSTER is set but empty."""
+    monkeypatch.setenv("NAME_LEAK_ROSTER", "")
+    assert roster_text() is None
+
+
+def test_roster_text_returns_value(monkeypatch):
+    """roster_text() returns the environment value verbatim when non-empty."""
+    monkeypatch.setenv("NAME_LEAK_ROSTER", r"\bXx\b")
+    assert roster_text() == r"\bXx\b"
+
+
+@pytest.mark.parametrize("roster", ["# only a comment", "   "])
+def test_require_roster_skips_a_roster_with_no_pattern(monkeypatch, roster):
+    """A truthy but patternless NAME_LEAK_ROSTER (comment-only or
+    whitespace-only) must take the named skip path. Both inputs compile to
+    zero patterns, so a green pass would assert nothing about real names —
+    the bug this cell pins is a truthy-string check, which both satisfy."""
+    monkeypatch.setenv("NAME_LEAK_ROSTER", roster)
+    with pytest.raises(pytest.skip.Exception) as exc_info:
+        _require_roster()
+    assert _SKIP_REASON in str(exc_info.value), (
+        f"the skip must carry the named reason; got {exc_info.value!r}"
+    )
+
+
+def test_strict_pattern_roster_path_is_live(monkeypatch):
+    """The injected roster must drive the built pattern: both synthetic
+    names match as whole words, look-alikes that merely contain them do not,
+    and a name absent from the injected roster does not."""
+    monkeypatch.setenv(
+        "NAME_LEAK_ROSTER", r"\bQuillonfex\b" + "\n" + r"\bBrimwatley\b"
+    )
+    monkeypatch.delenv("NAME_LEAK_PRINCIPAL", raising=False)
+    roster = roster_text()
+    assert roster is not None
+    patterns = strict_pattern(roster)
+
+    for name in ("Quillonfex", "Brimwatley"):
+        assert _matches_any(patterns, name), (
+            f"strict_pattern must match the injected roster name {name!r}"
+        )
+
+    for lookalike in ("Quillonfexish", "Brimwatleyville"):
+        assert not _matches_any(patterns, lookalike), (
+            f"strict_pattern must not match look-alike {lookalike!r}"
+        )
+
+    assert not _matches_any(patterns, "Zorblaxim"), (
+        "strict_pattern must not match a name absent from the injected roster"
+    )
+
+
+def test_strict_pattern_accepts_a_roster_line_with_inline_flags(monkeypatch):
+    """A roster line carrying its own global inline flags is a valid entry for
+    the gate — ``load_roster`` compiles each line on its own — so the strict
+    matcher must accept it too.
+
+    The discriminating input: joined into one alternation, ``(?i)Quillonfex``
+    raises "global flags not at the start of the expression". A fix that only
+    keeps plain patterns working does not pass this cell.
+    """
+    monkeypatch.setenv(
+        "NAME_LEAK_ROSTER", "(?i)Quillonfex" + "\n" + r"\bBrimwatley\b"
+    )
+    monkeypatch.delenv("NAME_LEAK_PRINCIPAL", raising=False)
+    roster = roster_text()
+    assert roster is not None
+
+    patterns = strict_pattern(roster)
+
+    for name in ("Quillonfex", "quillonfex", "QUILLONFEX", "Brimwatley", "brimwatley"):
+        assert _matches_any(patterns, name), (
+            f"strict_pattern must match the injected roster name {name!r}"
+        )
+    assert not _matches_any(patterns, "Quillonfexish"), (
+        "a name embedded in a longer word must not fire"
+    )
+    assert not _matches_any(patterns, "Zorblaxim"), (
+        "a name absent from the injected roster must not fire"
+    )
+
+
+# Contract for an uncompilable roster line, stated here and tested by the cell
+# below. On such a line the process must (a) exit non-zero, (b) write a
+# message to stderr naming the line's 1-based index and total (or, for the
+# agent-handle alternation, a label saying so), and (c) write nothing that
+# contains the line's text — the roster is the NAME_LEAK_ROSTER secret, whose
+# values are real human names, and CI logs can become public. `re.error.__str__`
+# and some `msg` values embed part of the pattern, so the message is built from
+# `type(exc).__name__` and `exc.pos` only.
+def test_compile_error_names_the_line_not_its_text(monkeypatch, capsys):
+    """An uncompilable roster line fails loud without echoing the line.
+
+    The bad line carries a token invented for this cell (it appears in no
+    roster and nowhere else in the repository), so the green case can only
+    come from the token staying out of stderr — not from it being absent
+    anyway.
+    """
+    monkeypatch.delenv("NAME_LEAK_PRINCIPAL", raising=False)
+    token = "Qwemberlax"
+    roster = r"\bQuillonfex\b" + "\n" + f"*{token}"
+
+    with pytest.raises(SystemExit) as exc_info:
+        strict_pattern(roster)
+
+    assert exc_info.value.code == 1, (
+        f"an uncompilable roster line must exit 1; got {exc_info.value.code!r}"
+    )
+    captured = capsys.readouterr()
+    assert "roster line 2 of 2" in captured.err, (
+        "the message must name the failing line by 1-based index and total; "
+        f"got stderr {captured.err!r}"
+    )
+    assert token not in captured.err, (
+        "the compile-error message echoed the roster line's text (the roster "
+        f"is a secret); got stderr {captured.err!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -314,18 +688,20 @@ def test_real_name_pattern_is_live():
 
 def test_tool_file_no_real_names():
     """tools/name_leak_warn.py must contain no real personal/agent names at
-    all — the STRICT rule (no roster name anywhere), using REAL_NAME_PATTERN
-    (module-level, built from raw-string pieces; see #3303).
+    all — the STRICT rule (no roster name anywhere), using the same roster
+    source as the scanner (strict_pattern; see #3303).
 
-    Mirrors the example-file hygiene test from test_scan_leaks.py.
-
-    This test is intentionally conservative — it checks the literal committed
-    file rather than running the scanner so that no local roster is required.
+    Mirrors the example-file hygiene test from test_scan_leaks.py. It checks
+    the literal committed file rather than running the scanner; without the
+    roster there is nothing to check, so the cell skips rather than passing
+    green.
     """
+    roster = _require_roster()
+    patterns = strict_pattern(roster)
     content = TOOL_PATH.read_text(encoding="utf-8")
     violations = []
     for i, line in enumerate(content.splitlines(), 1):
-        if REAL_NAME_PATTERN.search(line):
+        if _matches_any(patterns, line):
             violations.append(f"  line {i}: {line.strip()[:100]}")
 
     assert not violations, (
@@ -341,42 +717,73 @@ def test_tool_file_no_real_names():
 # the real-file test below also uses).
 # ---------------------------------------------------------------------------
 
-def test_workflow_rule_case_a_blocks_other_human_names_anywhere():
-    """(a) a human name other than Lei must not appear ANYWHERE — comment
-    or not — and look-alike substrings (line/linux/link) must not false-fire."""
-    on_comment_line = "# a note mentioning the child's review\n"
-    violations = _check_workflow_name_hygiene(on_comment_line)
-    assert any(v[1] == "a" for v in violations), f"case (a) should flag the child; got {violations}"
+def test_workflow_rule_case_a_blocks_other_human_names_anywhere(monkeypatch):
+    """(a) a human name the roster covers must not appear ANYWHERE — comment
+    or not — and a name embedded in a longer word must not false-fire while
+    the same name standing alone must.
 
-    on_run_line = "      run: echo 'as Lin said, this works'\n"
-    violations = _check_workflow_name_hygiene(on_run_line)
-    assert any(v[1] == "a" for v in violations), f"case (a) should flag bare Lin; got {violations}"
+    The roster is injected (synthetic names) so the cell never depends on a
+    real value, and it does not read the secret at all — it runs whether or not
+    ``NAME_LEAK_ROSTER`` is set.
+    """
+    monkeypatch.setenv("NAME_LEAK_ROSTER", _CASE_ROSTER)
+    monkeypatch.setenv("NAME_LEAK_PRINCIPAL", _CASE_PRINCIPAL)
+    roster = roster_text()
+    assert roster is not None
 
-    substrings_only = "      # keep this on one line, not linux, no link here\n"
-    violations = _check_workflow_name_hygiene(substrings_only)
+    on_comment_line = "# a note mentioning Ottoline's review\n"
+    violations = _check_workflow_name_hygiene(on_comment_line, roster)
+    assert any(v[1] == "a" for v in violations), f"case (a) should flag Ottoline; got {violations}"
+
+    on_run_line = "      run: echo 'as Maribel said, this works'\n"
+    violations = _check_workflow_name_hygiene(on_run_line, roster)
+    assert any(v[1] == "a" for v in violations), f"case (a) should flag bare Maribel; got {violations}"
+
+    # Boundary control, both directions: the helper bounds each pattern as a
+    # whole word, so an injected *bare* roster name must not fire when it is
+    # embedded in a longer word, while the same name standing alone must. The
+    # old line/linux/link decoy belonged to a short-name pattern this cell no
+    # longer injects, so it could not fail; this pair can.
+    boundary_roster = _CASE_ROSTER + "\n" + "Vexalor"
+    embedded = "      # keep this on one line: Vexalorian is not the name\n"
+    violations = _check_workflow_name_hygiene(embedded, boundary_roster)
     assert not any(v[1] == "a" for v in violations), (
-        f"case (a) false-positived on line/linux/link substrings; got {violations}"
+        f"case (a) false-positived on a bare name embedded in a longer word; got {violations}"
+    )
+
+    standalone = "      # keep this on one line: Vexalor is the name\n"
+    violations = _check_workflow_name_hygiene(standalone, boundary_roster)
+    assert any(v[1] == "a" for v in violations), (
+        f"case (a) must flag the bare name standing alone; got {violations}"
     )
 
 
-def test_workflow_rule_case_b_marker_allowed_only_on_comment_lines():
-    """(b) Lei + bare agent handles are attribution markers — allowed ONLY
-    on a YAML comment line; the same name on a non-comment line (step
-    `name:`, `run:`, env, etc.) is functional, so it fails."""
-    marker_on_comment = "      # approved by Lei after Borges's review\n"
-    violations = _check_workflow_name_hygiene(marker_on_comment)
+def test_workflow_rule_case_b_marker_allowed_only_on_comment_lines(monkeypatch):
+    """(b) bare agent handles are attribution markers — allowed ONLY on a
+    YAML comment line; the same handle on a non-comment line (step `name:`,
+    `run:`, env, etc.) is functional, so it fails.
+
+    The roster is injected (synthetic names), so the cell does not read the
+    secret and runs whether or not ``NAME_LEAK_ROSTER`` is set."""
+    monkeypatch.setenv("NAME_LEAK_ROSTER", _CASE_ROSTER)
+    monkeypatch.setenv("NAME_LEAK_PRINCIPAL", _CASE_PRINCIPAL)
+    roster = roster_text()
+    assert roster is not None
+
+    marker_on_comment = "      # approved by Borges after Ariadne's review\n"
+    violations = _check_workflow_name_hygiene(marker_on_comment, roster)
     assert not any(v[1] == "b" for v in violations), (
         f"marker on a comment line should be clean; got {violations}"
     )
 
     marker_in_run = '      run: echo "Borges did this"\n'
-    violations = _check_workflow_name_hygiene(marker_in_run)
+    violations = _check_workflow_name_hygiene(marker_in_run, roster)
     assert any(v[1] == "b" for v in violations), (
         f"marker on a non-comment (run:) line should be flagged; got {violations}"
     )
 
-    marker_in_step_name = "      - name: Lei's gate\n"
-    violations = _check_workflow_name_hygiene(marker_in_step_name)
+    marker_in_step_name = "      - name: Borges's gate\n"
+    violations = _check_workflow_name_hygiene(marker_in_step_name, roster)
     assert any(v[1] == "b" for v in violations), (
         f"marker in a step name: line should be flagged; got {violations}"
     )
@@ -384,31 +791,39 @@ def test_workflow_rule_case_b_marker_allowed_only_on_comment_lines():
     # New-roster-handle fixture (alpha#3307): Kepler marker on a comment line
     # is clean; the same handle on a run: line is functional and flagged.
     new_handle_marker_on_comment = "      # per Kepler's review, this is fine\n"
-    violations = _check_workflow_name_hygiene(new_handle_marker_on_comment)
+    violations = _check_workflow_name_hygiene(new_handle_marker_on_comment, roster)
     assert not any(v[1] == "b" for v in violations), (
         f"new-handle marker on a comment line should be clean; got {violations}"
     )
 
     new_handle_marker_in_run = '      run: echo "Kepler did this"\n'
-    violations = _check_workflow_name_hygiene(new_handle_marker_in_run)
+    violations = _check_workflow_name_hygiene(new_handle_marker_in_run, roster)
     assert any(v[1] == "b" for v in violations), (
         f"new-handle marker on a non-comment (run:) line should be flagged; got {violations}"
     )
 
 
-def test_workflow_rule_case_c_blocks_at_handle_mentions_anywhere():
+def test_workflow_rule_case_c_blocks_at_handle_mentions_anywhere(monkeypatch):
     """(c) an @handle mention of any roster name is functional (renders as a
     live GitHub notification once quoted on the platform) — forbidden
     anywhere, including inside a comment line; a bare handle with no @ is
-    not an (c)-violation (that's case (b)'s territory)."""
+    not an (c)-violation (that's case (b)'s territory).
+
+    The roster is injected (synthetic names), so the cell does not read the
+    secret and runs whether or not ``NAME_LEAK_ROSTER`` is set."""
+    monkeypatch.setenv("NAME_LEAK_ROSTER", _CASE_ROSTER)
+    monkeypatch.setenv("NAME_LEAK_PRINCIPAL", _CASE_PRINCIPAL)
+    roster = roster_text()
+    assert roster is not None
+
     at_mention_in_comment = "      # cc @Borges for review\n"
-    violations = _check_workflow_name_hygiene(at_mention_in_comment)
+    violations = _check_workflow_name_hygiene(at_mention_in_comment, roster)
     assert any(v[1] == "c" for v in violations), (
         f"@handle mention inside a comment should still be flagged; got {violations}"
     )
 
     bare_handle_in_comment = "      # Borges reviewed this\n"
-    violations = _check_workflow_name_hygiene(bare_handle_in_comment)
+    violations = _check_workflow_name_hygiene(bare_handle_in_comment, roster)
     assert not any(v[1] == "c" for v in violations), (
         f"bare handle (no @) must not trip case (c); got {violations}"
     )
@@ -417,9 +832,86 @@ def test_workflow_rule_case_c_blocks_at_handle_mentions_anywhere():
     # (a live GitHub notification once quoted) and forbidden even on a
     # comment line.
     new_handle_at_mention_in_comment = "      # cc @clio\n"
-    violations = _check_workflow_name_hygiene(new_handle_at_mention_in_comment)
+    violations = _check_workflow_name_hygiene(new_handle_at_mention_in_comment, roster)
     assert any(v[1] == "c" for v in violations), (
         f"@handle mention of a new roster name should still be flagged; got {violations}"
+    )
+
+
+def test_workflow_principal_marker_keeps_the_strict_split(monkeypatch):
+    """With NAME_LEAK_PRINCIPAL set the principal is a comment-line marker
+    (case b) — clean on a comment line, flagged on a run: line — while an
+    other roster name is forbidden anywhere (case a)."""
+    monkeypatch.setenv("NAME_LEAK_ROSTER", _CASE_ROSTER)
+    monkeypatch.setenv("NAME_LEAK_PRINCIPAL", _CASE_PRINCIPAL)
+    roster = roster_text()
+    assert roster is not None
+
+    principal_on_comment = "      # approved by Aurelio\n"
+    violations = _check_workflow_name_hygiene(principal_on_comment, roster)
+    assert not any(v[1] in ("a", "b") for v in violations), (
+        f"principal on a comment line should be clean; got {violations}"
+    )
+
+    principal_in_run = '      run: echo "Aurelio did this"\n'
+    violations = _check_workflow_name_hygiene(principal_in_run, roster)
+    assert any(v[1] == "b" for v in violations), (
+        f"principal on a non-comment (run:) line should be flagged; got {violations}"
+    )
+
+    other_on_comment = "      # a note mentioning Ottoline\n"
+    violations = _check_workflow_name_hygiene(other_on_comment, roster)
+    assert any(v[1] == "a" for v in violations), (
+        f"an other roster name must be case (a) anywhere; got {violations}"
+    )
+
+
+def test_workflow_principal_comments_are_skipped(monkeypatch):
+    """A `#` line inside NAME_LEAK_PRINCIPAL is a comment, not a declaration:
+    only the remaining bare lines declare the principal. The discriminating
+    assertion: a commented-out declaration leaves the rule degraded, so an
+    other roster name on a comment line is NOT case (a) — if the comment line
+    counted, that name would be case (a) there."""
+    monkeypatch.setenv("NAME_LEAK_ROSTER", _CASE_ROSTER)
+    monkeypatch.setenv(
+        "NAME_LEAK_PRINCIPAL", "# " + _CASE_PRINCIPAL + "\n# a note, not a pattern"
+    )
+    roster = roster_text()
+    assert roster is not None
+
+    other_on_comment = "      # a note mentioning Ottoline\n"
+    violations = _check_workflow_name_hygiene(other_on_comment, roster)
+    assert not any(v[1] == "a" for v in violations), (
+        f"a commented-out principal must leave case (a) empty; got {violations}"
+    )
+
+    other_in_run = '      run: echo "Ottoline did this"\n'
+    violations = _check_workflow_name_hygiene(other_in_run, roster)
+    assert any(v[1] == "b" for v in violations), (
+        f"degraded mode must still flag the name on a run: line; got {violations}"
+    )
+
+
+def test_workflow_no_principal_marker_degrades_to_non_comment_only(monkeypatch):
+    """Without a NAME_LEAK_PRINCIPAL declaration, case (a) is empty and every
+    roster name is treated as case (b): clean on a comment line, STILL flagged
+    on a run: line. The second pair is the discriminating one — a degradation that
+    quietly checked nothing would pass the first pair only."""
+    monkeypatch.setenv("NAME_LEAK_ROSTER", _CASE_ROSTER)
+    monkeypatch.delenv("NAME_LEAK_PRINCIPAL", raising=False)
+    roster = roster_text()
+    assert roster is not None
+
+    name_on_comment = "      # a note mentioning Ottoline\n"
+    violations = _check_workflow_name_hygiene(name_on_comment, roster)
+    assert not any(v[1] in ("a", "b") for v in violations), (
+        f"degraded mode must allow the name on a comment line; got {violations}"
+    )
+
+    name_in_run = '      run: echo "Ottoline did this"\n'
+    violations = _check_workflow_name_hygiene(name_in_run, roster)
+    assert any(v[1] == "b" for v in violations), (
+        f"degraded mode must STILL flag the name on a run: line; got {violations}"
     )
 
 
@@ -429,19 +921,81 @@ def test_workflow_rule_case_c_blocks_at_handle_mentions_anywhere():
 
 def test_workflow_file_no_real_names():
     """pr-checks.yml (the name-leak-warn job's home post-#1598) must satisfy
-    Lei's functional-vs-marker rule (CLAUDE.md "Attribution convention",
-    alpha#2270; mechanised per Kepler's #3303 ruling) — cases (a)/(b)/(c),
-    via the shared _check_workflow_name_hygiene helper, exercised green here
-    on the real file and red on synthetic fixtures above."""
+    the principal's functional-vs-marker rule (CLAUDE.md "Attribution
+    convention", alpha#2270; mechanised per Kepler's #3303 ruling) — cases
+    (a)/(b)/(c), via the shared _check_workflow_name_hygiene helper, exercised
+    green here on the real file and red on synthetic fixtures above. Without
+    the roster there is no pattern to apply, so the cell skips."""
+    roster = _require_roster()
     assert WORKFLOW_PATH.exists(), f"workflow file not found: {WORKFLOW_PATH}"
     content = WORKFLOW_PATH.read_text(encoding="utf-8")
-    violations = _check_workflow_name_hygiene(content)
+    violations = _check_workflow_name_hygiene(content, roster)
 
     assert not violations, (
         ".github/workflows/pr-checks.yml fails the name-hygiene rule "
         "(case a/b/c — see CLAUDE.md 'Attribution convention'):\n"
         + "\n".join(f"  line {i} [case {c}]: {t}" for i, c, t in violations)
     )
+
+
+# ---------------------------------------------------------------------------
+# CI flags guard: the roster secret must never reach the log
+# ---------------------------------------------------------------------------
+#
+# When a roster line is invalid, load_roster() raises SystemExit inside a
+# frame of this module. pytest prints that frame's locals when the traceback
+# style is the default (``--tb=auto``, which is what a bare ``-q`` gives), and
+# it prints captured stderr separately. Either surface prints the roster's
+# values, including the good lines, and these logs can become public. Nothing
+# else in the suite sees the runner's flags, so this cell reads the three
+# workflow files that invoke this module and asserts the flags that keep the
+# secret out of the log.
+
+CI_WORKFLOW_PATHS = (
+    REPO_ROOT / ".github" / "workflows" / "pr-checks.yml",
+    REPO_ROOT / ".github" / "workflows" / "tests.yml",
+    REPO_ROOT / ".github" / "workflows" / "nightly.yml",
+)
+
+_THIS_FILE = "tests/test_name_leak_warn.py"
+
+
+def test_ci_steps_run_this_file_without_captured_output():
+    """Every CI step that runs this file must keep the roster out of the log.
+
+    The sweep is a property check over the three workflow files rather than a
+    list of command strings, so a moved, renamed or reworded step is still
+    checked. For each file: exactly one step invokes this module (a second
+    copy would be a second set of flags nobody reviewed), that step passes
+    ``--show-capture=no``, and it names its traceback style explicitly —
+    ``--tb=short`` or ``--tb=no`` — because pytest's default (``--tb=auto``)
+    dumps frame locals, which is where the roster would appear.
+    """
+    for path in CI_WORKFLOW_PATHS:
+        assert path.exists(), f"workflow not found: {path}"
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        steps = [
+            step
+            for job in (doc.get("jobs") or {}).values()
+            for step in (job.get("steps") or [])
+            if "pytest" in (step.get("run") or "")
+            and _THIS_FILE in (step.get("run") or "")
+        ]
+        assert len(steps) == 1, (
+            f"{path.name}: expected exactly one step running {_THIS_FILE}, "
+            f"found {len(steps)}; a second copy would be a second set of "
+            "flags nobody reviewed"
+        )
+        command = steps[0]["run"]
+        assert "--show-capture=no" in command, (
+            f"{path.name}: the step running {_THIS_FILE} does not pass "
+            "--show-capture=no; its captured stderr would print the roster"
+        )
+        assert "--tb=short" in command or "--tb=no" in command, (
+            f"{path.name}: the step running {_THIS_FILE} leaves the traceback "
+            "style at pytest's default (--tb=auto, which dumps frame locals); "
+            "name --tb=short or --tb=no explicitly"
+        )
 
 
 # ---------------------------------------------------------------------------

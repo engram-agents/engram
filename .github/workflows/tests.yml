@@ -61,6 +61,24 @@ jobs:
         # once #616 merges (omitted now — empty tools/ test set would exit-5).
         run: pytest tests/ src/forum/tests/ -v --tb=short
 
+      - name: Run pytest — name-leak-warn self-test (real roster)
+        # Deliberately a SEPARATE step from the full-suite run above, and a
+        # multi-line block rather than a single-line `run: pytest` line: two
+        # parsers (#2950's scan-roots gate in tools/test_id_set_check.py and
+        # tests/test_ci_wiring_guard.py) read tests.yml's single-line
+        # `run: pytest <paths>` invocations and take every positional path as a
+        # collected root; a narrow single-file run must not join that set.
+        # The roster is a secret and these logs can become public, so it is
+        # handed only to the one file that needs it, never to the whole suite.
+        # The real roster is otherwise exercised only by the release/nightly
+        # runs, so a defect in it (e.g. a roster line the self-test cannot
+        # compile) waits for a release to appear. Fork PRs get no secret; the
+        # two real-file cells skip there by design and the step still passes.
+        env:
+          NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
+        run: |
+          python3 -m pytest tests/test_name_leak_warn.py -v --tb=short --show-capture=no
+
       - name: Run pytest — test files outside the roots above (#3346)
         # Deliberately a SEPARATE step, not extra positionals on the line
         # above: tools/test_id_set_check.py's TEST_SCAN_ROOTS must equal that
