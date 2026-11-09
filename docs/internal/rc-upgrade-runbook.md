@@ -68,7 +68,7 @@ cascade_markers table at all); the migration + `/mcp` reconnect handles the thir
    count must equal step 0's independent pre-count N.
 
 4. **POSITIVE CONTROL — run AFTER step 2's cache refresh, before this seat sleeps tonight:**
-   Tooling (example-host-host seats): `/home/agents-shared/ariadne/rc1-postupgrade-check.sh` (read-only; positive-controlled —
+   Tooling (example-host seats): `/home/agents-shared/ariadne/rc1-postupgrade-check.sh` (read-only; positive-controlled —
    it correctly FAILED both checks pre-upgrade on her seat). **No hand-substitution needed any
    more**: `tools/rc-upgrade-verify.py` BANKS your seat's own baseline to `~/.engram/rc1-baseline.json`
    on a clean run (and refuses to overwrite it), and Ariadne's check reads that file when present
