@@ -108,7 +108,8 @@ def test_c2_clears_lru_in_uncalled_for(fakes):
     m = fakes("uncalled_for._probe3807")
     rsc.release_retained_server_copies()
     assert m.fn.cache_info().currsize == 0
-    assert m._other_cache == {"k": 1}
+    # #4541: uncalled_for.* `*_cache` plain dicts are now cleared by rule (R1)
+    assert m._other_cache == {}
 
 
 def test_c2_other_package_untouched(fakes):
@@ -132,15 +133,16 @@ def test_c2_exact_count_on_fakes(monkeypatch):
     assert intro._signature_cache == {} and intro._parameter_cache == {}
 
 
+# Name kept for the test-id set (test-id-set-check); it now also pins that a non-`*_cache` name survives.
 def test_c2_clears_the_two_introspection_dicts_only(monkeypatch):
     intro = types.ModuleType("uncalled_for.introspection")
     intro._signature_cache = {1: 1}
     intro._parameter_cache = {2: 2}
-    intro._unrelated_cache = {3: 3}
+    intro._unrelated_state = {3: 3}
     monkeypatch.setitem(sys.modules, "uncalled_for.introspection", intro)
     rsc.release_retained_server_copies()
     assert intro._signature_cache == {} and intro._parameter_cache == {}
-    assert intro._unrelated_cache == {3: 3}
+    assert intro._unrelated_state == {3: 3}
 
 
 def test_c2_never_imports(monkeypatch):
@@ -164,6 +166,96 @@ def test_c2_real_introspection_dicts_exist():
     import uncalled_for.introspection as i
 
     assert isinstance(i._signature_cache, dict) and isinstance(i._parameter_cache, dict)
+
+
+# ---- C2b (#4541): uncalled_for `*_cache` plain dicts, by rule ----------------------------
+
+def _fake(monkeypatch, name, **attrs):
+    m = types.ModuleType(name)
+    for k, v in attrs.items():
+        setattr(m, k, v)
+    monkeypatch.setitem(sys.modules, name, m)
+    return m
+
+
+def test_r1_unseen_module_and_name_are_cleared(monkeypatch):
+    m = _fake(monkeypatch, "uncalled_for._newmod3807", _whatever_cache={1: 1}, _again_cache={2: 2})
+    rsc.release_retained_server_copies()
+    assert m._whatever_cache == {} and m._again_cache == {}
+
+
+def test_r2_non_cache_name_untouched(monkeypatch):
+    m = _fake(monkeypatch, "uncalled_for._r2_3807", _registry={1: 1}, _x_cache={2: 2})
+    rsc.release_retained_server_copies()
+    assert m._registry == {1: 1}
+    assert m._x_cache == {}
+
+
+def test_r3_non_plain_dict_cache_not_cleared_and_no_raise(monkeypatch):
+    class D(dict):
+        pass
+
+    m = _fake(monkeypatch, "uncalled_for._r3_3807", _a_cache=[1], _b_cache=None, _c_cache=D({1: 1}))
+    rsc.release_retained_server_copies()
+    assert m._a_cache == [1] and m._b_cache is None and m._c_cache == {1: 1}
+
+
+def test_r4_other_packages_untouched(monkeypatch):
+    o = _fake(monkeypatch, "otherpkg3807", _x_cache={1: 1})
+    f = _fake(monkeypatch, "fastmcp._r4_3807", _y_cache={2: 2})
+    rsc.release_retained_server_copies()
+    assert o._x_cache == {1: 1}
+    assert f._y_cache == {2: 2}
+
+
+def test_r4b_lookalike_package_names_untouched(monkeypatch):
+    a = _fake(monkeypatch, "uncalled_forever3807", _x_cache={1: 1})
+    b = _fake(monkeypatch, "uncalled_for_x3807", _x_cache={1: 1})
+    rsc.release_retained_server_copies()
+    assert a._x_cache == {1: 1}
+    assert b._x_cache == {1: 1}
+
+
+def test_r5_exact_count_includes_new_dicts(monkeypatch):
+    _drop_fastmcp_modules(monkeypatch)
+    _fake(monkeypatch, "fastmcp._r5_3807", a=functools.lru_cache(maxsize=None)(lambda x: x))
+    _fake(monkeypatch, "uncalled_for._r5_3807", b=functools.lru_cache(maxsize=None)(lambda x: x),
+          _p_cache={1: 1}, _q_cache={2: 2}, _registry={3: 3}, _n_cache=None)
+    assert rsc.release_retained_server_copies() == 4
+
+
+def test_r6_never_raises_on_hostile_modules(monkeypatch):
+    class Hostile:
+        @property
+        def __dict__(self):
+            raise RuntimeError("no vars")
+
+    monkeypatch.setitem(sys.modules, "uncalled_for._none3807", None)
+    monkeypatch.setitem(sys.modules, "uncalled_for._hostile3807", Hostile())
+    good = _fake(monkeypatch, "uncalled_for._good3807", _z_cache={1: 1})
+    assert isinstance(rsc.release_retained_server_copies(), int)
+    assert good._z_cache == {}  # a hostile neighbour does not stop the sweep
+
+
+def test_r7_every_real_uncalled_for_cache_dict_is_cleared():
+    import importlib
+    import pkgutil
+
+    uf = importlib.import_module("uncalled_for")
+    mods = [uf]
+    for info in pkgutil.walk_packages(uf.__path__, "uncalled_for."):
+        mods.append(importlib.import_module(info.name))
+    filled = []
+    for mod in mods:
+        for name, obj in list(vars(mod).items()):
+            if name.endswith("_cache") and type(obj) is dict:
+                obj[("sentinel3807", name)] = 1
+                filled.append((mod.__name__, name))
+    assert filled, "found no uncalled_for *_cache dicts at all: the guard would pass vacuously"
+    rsc.release_retained_server_copies()
+    left = [(m.__name__, n) for m in mods for n, o in vars(m).items()
+            if n.endswith("_cache") and type(o) is dict and o]
+    assert not left, f"uncalled_for cache dicts survived the release: {left}"
 
 
 # ---- C3: trigger ---------------------------------------------------------------------------
