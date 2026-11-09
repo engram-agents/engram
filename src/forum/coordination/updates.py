@@ -102,8 +102,22 @@ def build_updates(
         now_fn:     injectable clock for the ``ts`` liveness field (tests pin it).
 
     Returns:
-        ``{"updates": [...], "as_of": <int>, "ts": <str>}`` — ``updates`` sorted by
-        ``seq`` ascending; each item ``{kind, seq, wake, …payload}``.
+        ``{"updates": [...], "as_of": <int>, "ts": <str>, "refused": <int|null>,
+        "scan_ok": <bool>}`` — ``updates`` sorted by ``seq`` ascending; each item
+        ``{kind, seq, wake, …payload}``.
+
+        ``refused``/``scan_ok`` are the project store's refusal accounting
+        (#4518 part 2, #4527), the same pair the board routes carry:
+        ``int >= 0`` / ``True`` when the baton half scanned; ``null`` / ``False``
+        means NO project scan backed this envelope -- the only remaining case is
+        a ``kinds`` narrowing that excluded the baton half.
+
+        A scan that FAILS raises. This is a CURSOR feed: its consumer
+        (``tools/forum-updates-monitor.sh``) advances the cursor on any
+        successful response carrying a usable ``as_of``, so a degraded 200 would
+        move the cursor past baton events that were never read. The caller
+        surfaces the error and a cursor consumer preserves its cursor; there is
+        no degraded 200 here.
     """
     agent = _norm(agent)
     want = _PHASE1_KINDS if kinds is None else (frozenset(_norm(k) for k in kinds) & _PHASE1_KINDS)
@@ -116,6 +130,10 @@ def build_updates(
     as_of = allocator.current()
 
     updates: list[dict] = []
+    # Project-store refusal accounting (#4518 part 2, #4527). None unless the
+    # baton half scans; `null` means NO scan backed this envelope -- never a
+    # clean store's 0.
+    refused: Optional[int] = None
 
     if "dm" in want:
         for other in store.list_dm_threads(agent):
@@ -150,7 +168,16 @@ def build_updates(
                     })
 
     if "baton" in want:
-        for p in store.read_projects(active_only=True):
+        # ONE scan for the baton half (#4527), so the refusal count annotates
+        # exactly the records rendered beside it. The scan is STRICT: a failed
+        # scan RAISES. This is a cursor feed, and its consumer advances the
+        # cursor on any 200 with a usable `as_of` -- a degraded envelope would
+        # move the cursor past baton events that were never read, a permanent
+        # silent miss. A non-200 leaves the consumer's cursor where it was.
+        scan = store.scan_projects(active_only=True)
+        records = scan.records
+        refused = scan.refused
+        for p in records:
             # Self-exclusion: a self-authored turn (I flipped/initted it to
             # myself) is redundant to notify — I set it, I know my own turn.
             # `turn_by` is "" for legacy batons written before this field
@@ -179,4 +206,10 @@ def build_updates(
                 })
 
     updates.sort(key=lambda u: u["seq"])
-    return {"updates": updates, "as_of": as_of, "ts": now_fn()}
+    return {
+        "updates": updates,
+        "as_of": as_of,
+        "ts": now_fn(),
+        "refused": refused,
+        "scan_ok": refused is not None,
+    }

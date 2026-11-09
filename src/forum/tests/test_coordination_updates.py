@@ -102,7 +102,14 @@ def _build(store, agent="ariadne", *, since=0, kinds=None, watermark=100):
 # ---------------------------------------------------------------------------
 def test_empty_store_returns_alive_empty():
     out = _build(StubStore(), watermark=0)
-    assert out == {"updates": [], "as_of": 0, "ts": FIXED_TS}
+    # #4527: the envelope also carries the project store's refusal accounting.
+    assert out == {
+        "updates": [],
+        "as_of": 0,
+        "ts": FIXED_TS,
+        "refused": 0,
+        "scan_ok": True,
+    }
 
 
 def test_as_of_is_allocator_current():

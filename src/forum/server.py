@@ -2086,28 +2086,40 @@ def _body_identities() -> list:
 
 
 
-def _scan_board(store) -> tuple[list | None, int | None]:
-    """ONE store scan for a board surface (#4518 part 2).
+def _scan_board(
+    store, *, active_only: bool = False, fail_soft: bool = True
+) -> tuple[list | None, int | None]:
+    """ONE store scan for a project-reading surface (#4518 part 2, #4527).
 
     Returns ``(records, refused)`` from a single ``scan_projects`` call, so a
     count can never annotate a list read at a different moment:
 
     - success: ``(records, refused)`` with ``refused`` an ``int >= 0``;
-    - scan failure: ``(None, None)``. ``records=None`` lets
-      ``read_project_board`` fall back to its own read (the pre-#4518
-      fail-soft), and ``refused=None`` says UNKNOWN -- never 0, which would be
-      byte-identical to a clean store;
+    - scan failure with ``fail_soft=True``: ``(None, None)``. ``records=None``
+      lets the board routes fall back to ``read_project_board``'s own read (the
+      board fail-soft that predates this branch), and ``refused=None`` says
+      UNKNOWN -- never 0, which would be byte-identical to a clean store;
+    - scan failure with ``fail_soft=False``: the exception propagates. That is
+      ``GET /api/projects``' contract: its consumer shows "coordination state
+      unavailable" only on an HTTP error, so a 200 it could read as "no batons"
+      is worse than the failure;
     - ``store is None`` (unconfigured): ``(None, None)``.
 
-    The try lives here, once, so a scan failure can never blank the surface and
-    the two board routes cannot drift apart.
+    ``active_only`` is the caller's own filter: the board routes render every
+    record (``False``, the default), while ``GET /api/projects`` must honour its
+    query param (#4527). Parameterising the helper keeps the try in one place
+    instead of duplicating it per route.
+
+    The try lives here, once, so the project-reading routes cannot drift apart.
     """
     if store is None:
         return None, None
     try:
-        scan = store.scan_projects(active_only=False)
+        scan = store.scan_projects(active_only=active_only)
         return scan.records, scan.refused
     except Exception as exc:  # noqa: BLE001
+        if not fail_soft:
+            raise
         print(f"[forum] board scan error: {exc}", file=sys.stderr)
         return None, None
 
@@ -3593,7 +3605,17 @@ def create_app(
                    negative clamps to 0. Echo back the response's `as_of`.
           agent  — If provided, only items whose turn == agent.
 
-        Response: {updates: [...], as_of: <int>}
+        Response: {updates: [...], as_of: <int>, refused: <int|null>,
+                   scan_ok: <bool>}
+        ``refused``/``scan_ok`` carry the same three states as
+        ``GET /api/board/projects`` (#4518 part 2, #4527): a successful scan
+        reports the number of store entries it declined to read with
+        ``scan_ok: true``; a failed scan reports UNKNOWN (``null``/``false``),
+        never a clean store's ``0``. The items and the count come from ONE scan
+        (``_scan_board`` + ``read_project_board(store, records=...)``).
+        The count is **store-wide**: ``?agent=`` and ``?since=`` narrow the item
+        list only, never ``refused``. A refused entry has no participants or
+        seq for either filter to narrow it by.
 
         Cursor correctness: two complementary properties. (1) `as_of` is
         `allocator.current()` captured BEFORE reading the board, so the
@@ -3625,8 +3647,14 @@ def create_app(
         # above (mirrors coordination/updates.py::build_updates).
         as_of = allocator.current()
 
+        # ONE scan (#4518 part 2, #4527): the items and the refusal count are
+        # read from the SAME call, so the count can never annotate a list read
+        # at a different moment. On a scan failure records is None and
+        # read_project_board falls back to its own read (the pre-#4518
+        # fail-soft); `refused=None` then says UNKNOWN.
+        records, refused = _scan_board(store)
         try:
-            items = read_project_board(store)
+            items = read_project_board(store, records=records)
         except Exception as exc:  # noqa: BLE001
             print(f"[forum] api_board_updates error: {exc}", file=sys.stderr)
             items = []
@@ -3635,7 +3663,12 @@ def create_app(
         # (since, as_of] window the response promises (idempotent re-poll).
         items = [i for i in items if i["seq"] <= as_of]
         updates = filter_updates(items, since, agent)
-        return jsonify({"updates": updates, "as_of": as_of})
+        return jsonify({
+            "updates": updates,
+            "as_of": as_of,
+            "refused": refused,
+            "scan_ok": refused is not None,
+        })
 
     # ------------------------------------------------------------------
     # DM private channel  (UCS Slice D)
@@ -3788,7 +3821,10 @@ def create_app(
                      negative clamps to 0.
             kinds  — optional comma-separated narrowing (Phase-1 kinds: dm, baton).
 
-        Response: ``{"updates": [{kind, seq, wake, …}], "as_of": <int>, "ts": <str>}``.
+        Response: ``{"updates": [{kind, seq, wake, …}], "as_of": <int>, "ts": <str>,
+        "refused": <int|null>, "scan_ok": <bool>}``.
+        ``refused``/``scan_ok`` are the project store's refusal accounting,
+        passed through from ``build_updates`` unchanged (#4527).
         ``as_of`` = the served watermark (``allocator.current()``; may LEGITIMATELY
         freeze when there are no new commits — a frozen ``as_of`` is not a dead feed).
         ``ts`` = the server clock for this request, the LIVENESS signal: the consumer
@@ -3865,7 +3901,22 @@ def create_app(
             active_only — optional bool string (true/false/1/0); default true.
 
         Response: {projects: [{project_id, title, status, turn, turn_since, turn_reason,
-                               participants, seq, github}]}
+                               participants, seq, github}],
+                   refused: <int|null>, scan_ok: <bool>}
+        ``refused`` is the number of store entries the scan declined to read (a
+        symlink, a non-regular file, an unreadable entry) -- #4518 part 2, #4527,
+        the same spelling as ``GET /api/board/projects``. The records and the
+        count come from ONE scan, honouring ``active_only``.
+
+        On THIS route a scan that FAILS is an HTTP 500, not a degraded envelope:
+        the consumer shows its "coordination state unavailable" banner only on an
+        HTTP error, so a 200 with an empty list would read as "you have no
+        batons". ``scan_ok`` is therefore always ``true`` whenever this route
+        returns an envelope.
+
+        **The ``agent`` filter narrows ``projects`` only, never ``refused``.**
+        A refused entry has no participants to filter on, so the count is
+        store-wide; reading it as "0 refused among my items" is not supported.
         """
         from forum.coordination import projects as _proj
 
@@ -3879,7 +3930,11 @@ def create_app(
         # (the token alone, with no ?agent=, must not narrow the list).
         agent = (g.auth_agent if g.names_identity else "") or ""  # #1459
 
-        records = store.read_projects(active_only=active_only)
+        # ONE scan (#4527): the list and its refusal count come from the same
+        # call. This route fails LOUD on a scan error (fail_soft=False): its
+        # consumer shows "coordination state unavailable" only on an HTTP error,
+        # so a 200 with an empty list would read as "you have no batons".
+        records, refused = _scan_board(store, active_only=active_only, fail_soft=False)
         if agent:
             records = [r for r in records if agent in r.participants]
 
@@ -3897,7 +3952,9 @@ def create_app(
                     "github": r.github,
                 }
                 for r in records
-            ]
+            ],
+            "refused": refused,
+            "scan_ok": refused is not None,
         })
 
     @app.route("/api/projects/<pid>", methods=["GET"])

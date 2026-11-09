@@ -1377,6 +1377,19 @@ def _refuse_existing_id(store: CoordinationStore, project_id: str) -> None:
     today. No migration:
     existing ids -- including any case-variant pairs already present -- are
     never touched, and every other verb keeps exact-id lookup.
+
+    DOCUMENTED EXEMPTION (#4527): this is the ONE reader of the project store
+    that deliberately does NOT report a refused entry. The check compares
+    ENUMERATED ids; a refused entry (a symlink, a non-regular file, an
+    unreadable file) contributes no record, so its id cannot participate in the
+    comparison and this check can allow a duplicate id hidden behind a refusal.
+    That fail-open is DELIBERATE: raising here would let one planted file block
+    EVERY ``init``, which is the availability class #4518 exists to prevent.
+    The trade is accepted -- a duplicate hidden by a refusal is a
+    filesystem-audit finding, not a refusal to create work. This function gets
+    no ``refused`` count and no sentinel; the display surfaces (``GET
+    /api/projects``, ``GET /api/board/updates``, ``build_updates``) are where a
+    refusal is made visible.
     """
     folded = project_id.casefold()
     matches = sorted(
