@@ -77,8 +77,10 @@ neighbouring commits also contain every file of the release, because they
 changed only files the release left out. The twin is the commit the release
 was made from: the one that carried that release's candidate tag during
 development. Four early releases (v0.1.0, v0.1.1, v0.1.3 and v0.1.4) have no
-candidate tag that matches; for each of them exactly one commit contains every
-file, and that commit is the twin.
+candidate tag that matches; for each of them exactly one commit in the
+development history contains every file, and that commit is the twin. (The old
+release commit on `release-snapshots` contains every file too, by construction;
+it is not part of the development history.)
 
 | Release | Release commit date | Release tag (on `release-snapshots`) | Twin tag (on `main` and `dev`) | Files in the release | Of those, changed at the twin |
 |---|---|---|---|---|---|
