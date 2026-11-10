@@ -153,7 +153,7 @@ def _default_alpha_source(tmp_path, shared_dirs, env_override=None):
     env = {"PATH": os.environ["PATH"]}
     if env_override:
         env["ENGRAM_ALPHA_SOURCE"] = env_override
-    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
+    p = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
     return re.search(r"^AS=\[(.*)\]$", p.stdout, re.M).group(1), shared
 
 

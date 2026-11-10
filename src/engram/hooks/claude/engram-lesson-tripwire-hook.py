@@ -2039,7 +2039,11 @@ def _resolve_runtime_dir() -> str:
                 return str(candidate)
     except OSError:
         pass
-    return os.path.expanduser("~/engram-alpha/src/engram")  # last-ditch, unchanged
+    for name in ("~/engram/src/engram", "~/engram-alpha/src/engram"):  # default name, then accepted old name
+        cand = os.path.expanduser(name)
+        if os.path.isdir(cand):
+            return cand
+    return os.path.expanduser("~/engram/src/engram")  # last-ditch
 
 
 def _query_recall_daemon(query: str, top_k: int = 5) -> dict | None:

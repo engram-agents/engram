@@ -313,7 +313,11 @@ def resolve_own_server_py_path(engram_home: Path) -> str:
     candidate = engram_home / "server.py"
     if candidate.exists():
         return str(candidate)
-    return str(Path("~/engram-alpha/server.py").expanduser())
+    for name in ("~/engram/server.py", "~/engram-alpha/server.py"):  # default name, then accepted old name
+        cand = Path(name).expanduser()
+        if cand.exists():
+            return str(cand)
+    return str(Path("~/engram/server.py").expanduser())
 
 
 def resolve_daemon_script_path(engram_home: Path) -> str:

@@ -42,9 +42,12 @@ except ValueError as _exc:
     _HOME_REFUSAL = str(_exc)
 if _HOME_REFUSAL is None:
     REPO = _first([os.environ.get("ENGRAM_REPO"),
+                   os.path.expanduser("~/engram"),
                    os.path.expanduser("~/engram-alpha"),
+                   os.path.expanduser("~/src/engram"),
                    os.path.expanduser("~/src/engram-alpha"),
-                   os.path.expanduser("~/GitHub/engram-alpha")], "the engram-alpha checkout")
+                   os.path.expanduser("~/GitHub/engram"),
+                   os.path.expanduser("~/GitHub/engram-alpha")], "the engram checkout")
     LIVE = _first([os.path.join(ENGRAM_HOME, "knowledge.db")], "your knowledge.db")
     PY   = _first([os.environ.get("ENGRAM_PY"),
                    os.path.join(os.path.expanduser("~"), ".engram", "venv", "bin", "python3"),

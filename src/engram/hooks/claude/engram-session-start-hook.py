@@ -612,7 +612,8 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
          MCP server runs from the plugin tree, not from ENGRAM_HOME.
       2. $ENGRAM_HOME/server.py (legacy scatter-install pattern in case
          hooks were copied separately or the colocation is unusual)
-      3. ~/engram-alpha/server.py (live-source dev fallback)
+      3. ~/engram/server.py, else ~/engram-alpha/server.py (live-source dev fallback;
+         engram is the default name, engram-alpha the accepted old one)
     """
     # Hook lives at <runtime-dir>/hooks/engram-session-start-hook.py,
     # server.py lives at <runtime-dir>/server.py.
@@ -624,7 +625,11 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
     candidate = os.path.join(engram_home, "server.py")
     if os.path.exists(candidate):
         return candidate
-    return os.path.expanduser("~/engram-alpha/server.py")
+    for name in ("~/engram/server.py", "~/engram-alpha/server.py"):
+        cand = os.path.expanduser(name)
+        if os.path.exists(cand):
+            return cand
+    return os.path.expanduser("~/engram/server.py")
 
 
 def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
@@ -2691,15 +2696,22 @@ DEFAULT_PURPOSES = {
 }
 # Repos scanned for Piece C (recent commit cross-check at startup).
 # ENGRAM_HOME is always included. Extra repos via ENGRAM_PIECE_C_REPOS env var
-# (colon-separated). Default extra: ~/engram-alpha if it exists (the agent's dev checkout, if present);
+# (colon-separated). Default extras: ~/engram then ~/engram-alpha (old name) if they exist (the agent's dev checkout, if present);
 # for agents installed without a local alpha clone, silently
 # no-ops because the isdir guard returns False.
 _PIECE_C_EXTRA = os.environ.get("ENGRAM_PIECE_C_REPOS", "").strip()
 if _PIECE_C_EXTRA:
     PIECE_C_REPOS = [os.path.expanduser(p) for p in _PIECE_C_EXTRA.split(":") if p] + [ENGRAM_HOME]
 else:
-    _default_extra = os.path.expanduser("~/engram-alpha")
-    PIECE_C_REPOS = ([_default_extra] if os.path.isdir(_default_extra) else []) + [ENGRAM_HOME]
+    # `engram` is the default checkout name, `engram-alpha` the accepted old one; a symlink from
+    # one to the other (same realpath) is listed once.
+    _default_extras = []
+    for _name in ("~/engram", "~/engram-alpha"):
+        _cand = os.path.expanduser(_name)
+        if os.path.isdir(_cand) and os.path.realpath(_cand) not in [
+                os.path.realpath(_x) for _x in _default_extras]:
+            _default_extras.append(_cand)
+    PIECE_C_REPOS = _default_extras + [ENGRAM_HOME]
 PIECE_C_WINDOW = "2 days ago"
 PIECE_C_MAX_LINES = 20
 PIECE_C_MAX_LINE_CHARS = 140
