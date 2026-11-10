@@ -58,6 +58,7 @@ name: pr-checks
 #      step is waiting on. `continue-on-error` on the checkout keeps this
 #      advisory (a loud ::warning::, never a silent pass) until then, so
 #      it does not block every PR to this repo on an org-admin item.)
+#      This gate runs on the private repository only; it is skipped everywhere else.
 #   11. check-stubbed-signatures  (#3118 — BLOCKING; a signature change to a
 #      function stubbed BY BARE NAME in a test (monkeypatch.setattr, or a
 #      removed stdlib-transport call a stub relies on going away) is
@@ -1400,7 +1401,12 @@ jobs:
       # analogous App-token case.
       - name: team-practice-drift-gate — checkout team-practice
         id: team-practice-checkout
-        if: success() || failure()
+        # This check does not apply to the public repository: team-practice is
+        # a private repo and must not be checked out from a public one, so the
+        # step runs only on the private repository (engram-agents/engram-alpha).
+        # The condition is the repository's identity, never whether the secret
+        # exists: a missing secret on the private repository must still fail loudly.
+        if: (success() || failure()) && github.repository == 'engram-agents/engram-alpha'
         continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         uses: actions/checkout@v4
         with:
@@ -1434,7 +1440,7 @@ jobs:
       # clear diagnosis. Cheap to get right now rather than rediscover
       # later.
       - name: team-practice-drift-gate — advisory notice (checkout unavailable)
-        if: (success() || failure()) && steps.team-practice-checkout.outcome != 'success'
+        if: (success() || failure()) && github.repository == 'engram-agents/engram-alpha' && steps.team-practice-checkout.outcome != 'success'
         run: |
           if [ "${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}" = "true" ]; then
             echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice from this fork PR (fork PRs cannot carry this repo's secrets by design). CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811."
