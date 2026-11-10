@@ -2,8 +2,8 @@
 
 REVISION 2: the default checkout name is `engram`; `engram-alpha` is the accepted old name.
   C4.1 the end-of-day `for repo in ...` loop lists both `~/engram` and `~/engram-alpha`, engram first.
-  C5.1 the "Walk the day's commit log" command names the dev checkout as `~/engram`, with
-       `~/engram-alpha` named as the accepted old name.
+  C5.1 the "Walk the day's commit log" command is a loop over both candidates (`~/engram`, `~/engram-alpha`),
+       so a seat holding both walks both.
   C5.2 no `git -C ~/engram-alpha` occurrence without `~/engram` (the other name) on the same line.
   C5.3 the dream-master placeholder is name-neutral: no `<engram-alpha-repo-path>`; `<engram-repo-path>`.
 """
@@ -28,8 +28,10 @@ def test_C4_1_loop_lists_both_engram_first():
 def test_C5_1_commit_log_walk_names_both():
     lines = [ln for ln in SKILL.splitlines() if "Walk the day's commit log" in ln]
     assert len(lines) == 1
-    assert "git -C ~/engram log --since=6am" in lines[0]
-    assert "~/engram-alpha" in lines[0]
+    # a loop over every existing candidate, like the C4.1 loop (a missing folder is silent via 2>/dev/null)
+    assert "for repo in ~/engram ~/engram-alpha;" in lines[0]
+    assert 'git -C "$repo" log --since=6am 2>/dev/null' in lines[0]
+    assert lines[0].index("~/engram ") < lines[0].index("~/engram-alpha")
 
 
 def test_C5_2_no_bare_alpha_git_c():
