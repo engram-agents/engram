@@ -43,7 +43,7 @@ asserted a FROZEN fact (the sweep commit's own diff) against this file's MUTABLE
 (FILES, COVERED_BY_PR_3A, COVERED_BY_PR_3B), so any later PR that deleted or renamed a
 swept file would have turned them red, in the full suite only. Their job, stopping two PRs
 from editing the same files while the sweep was in flight, ended when the sweep merged as
-caebaf3c. They keep their names so test-id accounting stays clean. Delete all four, and
+5c5d9e13. They keep their names so test-id accounting stays clean. Delete all four, and
 RETIRED_REASON with them, when the #3863 epic closes.
 
 Every git command below whose failure can mean "the evidence is missing" (a commit or a
@@ -67,10 +67,10 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = "src/engram/"
-BASE = "0d5bbeba0b2fde99a6db4e3dbf1a1fb1fb8edf3f"
+BASE = "121033153e7b3ced065fe099c7f38b8976ce2001"
 # The sweep commit (PR #3888), a descendant of BASE. A snapshot check runs only on
 # content that is still the sweep's own; see retire_reason().
-SWEEP = "caebaf3c6f237b9e727f648f41988969268efdab"
+SWEEP = "5c5d9e1364191e98d3c51460bb1635428ece48f7"
 # Why the four frozen-fact tests are skipped, unconditionally (see the module docstring).
 RETIRED_REASON = f"sweep merged as {SWEEP[:8]}; concurrent-edit guard no longer applies"
 BASELINE_REL = "tools/home_path_baseline.json"
@@ -1382,7 +1382,7 @@ class TestRetired:
         assert RETIRED_REASON == (
             f"sweep merged as {SWEEP[:8]}; concurrent-edit guard no longer applies"
         )
-        assert RETIRED_REASON == "sweep merged as caebaf3c; concurrent-edit guard no longer applies"
+        assert RETIRED_REASON == "sweep merged as 5c5d9e13; concurrent-edit guard no longer applies"
 
     def test_diff_files_skips_unconditionally_even_where_the_old_code_would_run(self, tmp_path):
         repo = _p_repo(tmp_path)

@@ -58,7 +58,7 @@ if _SRC_ENGRAM not in sys.path:
     sys.path.insert(0, _SRC_ENGRAM)
 _HOOKS_SRC = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 _HOOK_PATH = _HOOKS_SRC / "engram-surface-hook.py"
-BASE_REF = "ae55c31a"  # origin/dev the U10 branch was cut from (the unmodified hook)
+BASE_REF = "bf6ee5bd"  # origin/dev the U10 branch was cut from (the unmodified hook)
 # (#4271: the owner stderr line may end with `, bound N ms` and/or `; failed E ms into the B ms fire budget`)
 OWNER_LINE_TAIL = r"(?:, bound \d+ ms)?(?:; failed \d+ ms into the \d+ ms fire budget)?"
 
@@ -390,7 +390,7 @@ def _base_hook_source():
 @pytest.mark.parametrize("restore", ["set", "unset"])
 @pytest.mark.parametrize("state", ["absent", "false", "none-config"])
 def test_c0_flag_off_equals_the_unmodified_hook_byte_for_byte(state, restore, person, home, monkeypatch, tmp_path):
-    """The flag-OFF hook against the UNMODIFIED hook (`git show ae55c31a:<path>`, loaded from a
+    """The flag-OFF hook against the UNMODIFIED hook (`git show bf6ee5bd:<path>`, loaded from a
     flattened copy so its imports resolve): same stdout, stderr and state (ledgers, counters,
     shown records) on the same store, with the restore flag set and unset and with a person
     moment (the RW cursor write is part of the compared state). Skips when the base object is

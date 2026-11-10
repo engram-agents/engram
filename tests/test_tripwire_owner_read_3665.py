@@ -54,7 +54,7 @@ if _SRC_ENGRAM not in sys.path:
     sys.path.insert(0, _SRC_ENGRAM)
 _HOOKS_SRC = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 _HOOK_PATH = _HOOKS_SRC / "engram-lesson-tripwire-hook.py"
-BASE_REF = "97f2a499"  # origin/dev the stage-2c branch was cut from (the unmodified hook)
+BASE_REF = "df0f3660"  # origin/dev the stage-2c branch was cut from (the unmodified hook)
 
 import engramd_client as ec  # noqa: E402
 import engramd_owner as eo  # noqa: E402
@@ -1141,7 +1141,7 @@ def _base_hook_source():
 
 @pytest.mark.parametrize("cmd", [FULL_CMD, BLOCK_CMD, "echo nothing"], ids=["fire", "deny", "silent"])
 def test_c0_flag_off_equals_the_unmodified_hook_byte_for_byte(cmd, home, monkeypatch, tmp_path):
-    """The flag-OFF hook against the UNMODIFIED hook (`git show 97f2a499:<path>`, loaded
+    """The flag-OFF hook against the UNMODIFIED hook (`git show df0f3660:<path>`, loaded
     from a copy in this hook's own directory so its imports resolve): same stdout, stderr,
     state and ledgers on the same store. Skips when the base object is not in the clone.
     Mutation: any behavioural change on the OFF path -> red."""

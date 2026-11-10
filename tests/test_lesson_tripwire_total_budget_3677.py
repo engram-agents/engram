@@ -46,7 +46,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 HOOK_SRC_DIR = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude"
 HOOK_NAME = "engram-lesson-tripwire-hook.py"
-DEV_BASE = "1b956b0a"  # origin/dev the change was cut from
+DEV_BASE = "4aa79f31"  # origin/dev the change was cut from
 
 SESSION = "sess-3677"
 TERMS = ("alphaterm", "betaterm")

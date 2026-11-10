@@ -14,7 +14,7 @@ that heuristic resolves by import/path, never by the bare names a stub binds.
 Nobody caught it until the full suite ran on the release PR.
 
 The primary test below is the REAL regression fixture: this repo's own
-commit `40239f40` (PR #3110), diffed against its own parent `9cc9715`. The
+commit `becc164a` (PR #3110), diffed against its own parent `a7c2929`. The
 ground-truth numbers it asserts against were independently measured (Aleph,
 issue #3118 comment thread) and re-verified here directly against this
 checkout — see the inline `git grep` commands in each assertion's comment.
@@ -44,8 +44,8 @@ collect_wide_hits = _mod.collect_wide_hits
 get_diff = _mod.get_diff
 
 # The real #3110 commit pair, from this repo's own history.
-PR_3110_PARENT = "9cc971591ed548f77ea8f8594963f8945c952679"
-PR_3110_HEAD = "40239f40d2ffa7e46d946257bdd0dc747c29014b"
+PR_3110_PARENT = "a7c2929fbbec1d34a50690939ca3f5ca913e8b04"
+PR_3110_HEAD = "becc164ab9dfb0a6ce92ff4ae134902fac2a2eab"
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -74,7 +74,7 @@ def test_3110_regression_finds_the_three_missed_test_files(monkeypatch, capsys):
     all be in the output.
 
     Independently verified ground truth (re-run against this checkout):
-      git grep -l -E -- "_fetch_threads|_fetch_inbox" 40239f40 -- tests/
+      git grep -l -E -- "_fetch_threads|_fetch_inbox" becc164a -- tests/
         -> tests/test_forum_hook.py, tests/test_forum_hook_injection_bounds.py
       test_forum_hook_publish.py is reached via the wide "urlopen" watchlist
       name's module-scoped fallback (its raw bare-name grep is 20-21 files,
@@ -93,7 +93,7 @@ def test_3110_regression_finds_the_three_missed_test_files(monkeypatch, capsys):
 def test_3110_regression_does_not_dump_the_full_urlopen_list(monkeypatch, capsys):
     """A regression to 'just report every raw urlopen hit' must be caught:
     the real urlopen-in-tests/ list is 20-21 files (measured independently,
-    `git grep -l -- "urlopen" 40239f40 -- tests/ | wc -l` -> 21); this tool's
+    `git grep -l -- "urlopen" becc164a -- tests/ | wc -l` -> 21); this tool's
     output must stay well short of that."""
     rc, out, err = _run_main(
         monkeypatch, REPO_ROOT, ["--base", PR_3110_PARENT, "--head", PR_3110_HEAD], capsys

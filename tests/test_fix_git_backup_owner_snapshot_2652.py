@@ -15,7 +15,7 @@ Cells (each drives the script as a SUBPROCESS: a temp HOME, a temp ENGRAM_HOME, 
   T2  flag ON: the live knowledge.db is opened ZERO times across steps 1-5 (a sitecustomize on PYTHONPATH logs
       every sqlite3.connect target, resolved). T2c is its POSITIVE CONTROL: flag OFF logs >= 4 live opens, so a
       zero is not a broken instrument. T2d: flag ON and flag OFF write the same knowledge.sql rows.
-  T3  flag OFF: identical to the DEV script (c0e49e0c, `git show`) run on an identical fixture: stdout, stderr
+  T3  flag OFF: identical to the DEV script (1e4f42ff, `git show`) run on an identical fixture: stdout, stderr
       (modulo the timestamp and the paths), exit code, files written.
   T4  indeterminate snapshot (Rejected(commit="indeterminate"), a dropped connection, a real timeout) -> dies
       before step 3; names the flag; says the file may be incomplete and must not be trusted; the file is never
@@ -57,7 +57,7 @@ import engramd_owner as eo  # noqa: E402
 
 SCRIPT = REPO_ROOT / "src" / "engram" / "tools" / "engram-fix-git-backup.sh"
 ENGRAM_BACKUP = REPO_ROOT / "src" / "engram" / "engram_backup.py"
-DEV_COMMIT = "c0e49e0c"
+DEV_COMMIT = "1e4f42ff"
 DEV_SCRIPT_REL = "src/engram/tools/engram-fix-git-backup.sh"
 FLAG_KEY = "fix_git_backup_reads_via_owner"
 FLAG_DOTTED = f"engramd.{FLAG_KEY}"
@@ -420,7 +420,7 @@ def test_t2d_flag_on_and_flag_off_write_the_same_dump(sandbox):
 
 @pytest.fixture(scope="module")
 def dev_script(tmp_path_factory):
-    """The script at c0e49e0c, run from a scratch tree where `<tools>/../engram_backup.py` resolves."""
+    """The script at 1e4f42ff, run from a scratch tree where `<tools>/../engram_backup.py` resolves."""
     try:
         text = subprocess.run(["git", "show", f"{DEV_COMMIT}:{DEV_SCRIPT_REL}"], cwd=str(REPO_ROOT),
                               capture_output=True, text=True, check=True).stdout

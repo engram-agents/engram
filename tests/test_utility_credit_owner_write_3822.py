@@ -57,7 +57,7 @@ HOOKS_JSON = REPO_ROOT / "src" / "engram" / "hooks" / "hooks.json"
 # are the migration proof "flag OFF == the unmodified hook: same store, same log, same count", and a proof that skips in a
 # fresh or shallow clone is no proof. BASE_COMMIT is the commit the fixture was taken from (checked by one provenance cell).
 # These cells and the fixture are a MIGRATION PROOF: retire both together when the flag is flipped on by default or removed.
-BASE_COMMIT = "99b85494"
+BASE_COMMIT = "91da3142"
 BASE_HOOK_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "utility_credit_hook_before_3822_stage_b.py.txt"
 
 import engram_core  # noqa: E402

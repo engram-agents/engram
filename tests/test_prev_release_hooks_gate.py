@@ -1303,14 +1303,15 @@ class TestLiveRepositoryAcceptance:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# live historical-incident record — pinned at ITS OWN tag, never at "newest"
+# live historical-incident record — pinned at ITS OWN release commit, never at "newest"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 # #3213's incident: a hook was renamed away while the previous release still
-# registered it.  That release is v0.5.2-rc3 (measured: its hooks.json names
-# this basename; the newer v0.5.2-rc4 does not).
-_LIVE_INCIDENT_TAG = "v0.5.2-rc3"
+# registered it.  The commit below is that release's merge commit in this
+# repository's history (measured: its hooks.json names this basename).  It is
+# pinned by commit, not by tag: this repository does not carry the release tag.
+_LIVE_INCIDENT_COMMIT = "56d058dc12d6a7389c84de3ec89748e9989dc30c"
 _LIVE_INCIDENT_REF = "engram-toolcall-repair.py"
 
 
@@ -1341,12 +1342,12 @@ class TestLiveHistoricalIncident:
         registering the renamed hook.  The incident record is stable — but only
         at its own tag — so it belongs here.
         """
-        refs, reason = _refs_at_tag(PROJECT_ROOT, _LIVE_INCIDENT_TAG)
+        refs, reason = _refs_at_tag(PROJECT_ROOT, _LIVE_INCIDENT_COMMIT)
         if refs is None:
             pytest.skip(
-                f"{_LIVE_INCIDENT_TAG} is not readable in this checkout: {reason}"
+                f"commit {_LIVE_INCIDENT_COMMIT} is not readable in this checkout: {reason}"
             )
         assert _LIVE_INCIDENT_REF in refs, (
-            f"{_LIVE_INCIDENT_TAG}'s hooks.json no longer references "
+            f"commit {_LIVE_INCIDENT_COMMIT}'s hooks.json no longer references "
             f"{_LIVE_INCIDENT_REF}; the #3213 record moved: {sorted(refs)}"
         )

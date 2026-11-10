@@ -22,7 +22,7 @@ cell (a2) pins that residue. A flag-ON fire is NOT zero-open.
   (d)  cold start: the wait rule (once per fire, only for Unavailable/down before any success,
        bounded), shown as a RUN of the migrated hook with and without the wait;
   (e)  store absent: no function creates a file (flag OFF and ON);
-  (f)  flag OFF: byte-identical to dev 4f475cf4 (apart from (e));
+  (f)  flag OFF: byte-identical to dev 6a7b1ed9 (apart from (e));
   (g)  "S6 class": the local store file is never consulted on the flag-ON path;
   (h)  every statement sent is a registered template, byte for byte;
   (i)  the flag gate: only the JSON boolean true;
@@ -62,7 +62,7 @@ if _SRC_ENGRAM not in sys.path:
     sys.path.insert(0, _SRC_ENGRAM)
 _HOOKS_SRC = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 _HOOK_PATH = _HOOKS_SRC / "engram-session-start-hook.py"
-BASE_REF = "4f475cf4"  # origin/dev the U9 branch was cut from (the unmodified hook)
+BASE_REF = "6a7b1ed9"  # origin/dev the U9 branch was cut from (the unmodified hook)
 
 import engramd_client as ec  # noqa: E402
 import engramd_owner as eo  # noqa: E402
@@ -669,7 +669,7 @@ def _oracle_source():
 
 
 def oracle_hook(tmp: Path) -> Path:
-    """The UNMODIFIED hook (`git show 4f475cf4:<path>`) as a sibling of copies of the hook helpers
+    """The UNMODIFIED hook (`git show 6a7b1ed9:<path>`) as a sibling of copies of the hook helpers
     in a throwaway directory, so its imports resolve. Skips when the base object is not in the clone."""
     src = _oracle_source()
     if src is None:
@@ -1441,7 +1441,7 @@ def test_e_store_absent_a_full_fire_creates_no_store_file(flag, home, tmp_path):
 
 
 def test_e_control_the_unmodified_hook_does_create_the_zero_byte_file(home, tmp_path):
-    """Anti-vacuity for (e): the SAME instrument run on the unmodified hook (4f475cf4) sees the
+    """Anti-vacuity for (e): the SAME instrument run on the unmodified hook (6a7b1ed9) sees the
     0-byte store file created by `sleep_status_block`'s raw connect. Without this the 'no file'
     assertion could not tell a fixed hook from a blind instrument."""
     hook = oracle_hook(tmp_path)
@@ -1574,7 +1574,7 @@ def _advance_oracle_by_4351(old_stdout: str, new_stdout: str) -> str:
 
 @pytest.mark.parametrize("scenario", F_SCENARIOS)
 def test_f_flag_off_equals_the_unmodified_hook_byte_for_byte(scenario, tmp_path, monkeypatch, stub_modules):
-    """The flag-OFF hook against the UNMODIFIED hook (`git show 4f475cf4:<path>`) on identical
+    """The flag-OFF hook against the UNMODIFIED hook (`git show 6a7b1ed9:<path>`) on identical
     copies of one home: the same stdout, the same stderr, the same session/state files (times
     stripped). This is what proves the by-index rewrite and fix B changed nothing observable.
     Mutation: any behavioural change on the OFF path (a changed SQL byte, a wrong index, a
