@@ -46,6 +46,7 @@ ALLOWLIST = {
     "CODEX-MOBILE.md": "README.md and README-AGENT.md send Codex users to it for continuing their local agent from an iPhone",
     "FORUM-SERVER.md": "README.md and README-AGENT.md send users to it for running the forum server",
     "README.md": "the index of docs/ itself, for public readers (carries the docs/internal/ pointer sentence)",
+    "VERSIONING.md": "the user-facing page on version names, branches, tags and the v0.5.6 history change; README.md and CHANGELOG.md link to it",
     "ZH-TERMINOLOGY.md": "the public paper's Chinese chapters cite it as the terminology ruling",
     "baton-protocol.md": "the engram-baton skill, the baton prompt hook, tools/baton.py, README-AGENT.md and the forum service template send readers to it",
     "cascade-machine.md": "the engram-resolve-cascade skill and the dream-master agent send agents to it",

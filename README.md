@@ -67,6 +67,8 @@ Install [Claude Code](https://code.claude.com) and **ask your agent to guide you
 
 **How do I update?** Just ask your agent: *"Please upgrade ENGRAM."* It runs the upgrade flow — pulls the new code, leaves your graph, history, and settings untouched, and tells you if it needs you to restart anything. Takes a minute or two.
 
+**I cloned before v0.5.6 and the update stops at `git pull`.** With v0.5.6 this repository began to carry its full development history, so an older clone can no longer pull. Run `git branch my-old-main; git fetch origin && git checkout -B main origin/main` once in the clone, then upgrade as usual. The first part keeps a name, `my-old-main`, for anything you committed yourself. **[docs/VERSIONING.md](docs/VERSIONING.md)** has the details and what to do if git refuses; it also explains the branches and the tags ending in `-history-twin`.
+
 **I have another question about using it.** Ask your agent first — it can read its own docs and memory, and often already knows. For "what's it actually like to work with this day-to-day," see the **[User Guide](USER_GUIDE.md)** — written for people new to working with an agent that remembers.
 
 ---

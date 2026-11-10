@@ -1,5 +1,14 @@
 # Releasing ENGRAM
 
+> **Out of date since v0.5.6 (2026-11-10), kept until it is rewritten.** This
+> document describes the two-repository model used through v0.5.5: development
+> in a private repository, and one squashed snapshot per release copied to the
+> public one. From v0.5.6 on, development and releases both happen in the public
+> repository, on one history; the old snapshots are archived on the branch
+> `release-snapshots`. The current branch and tag rules are in
+> [`docs/VERSIONING.md`](../VERSIONING.md). Where the two disagree, that page
+> is right.
+
 engram-alpha is a **private** repo. There is a separate **public** repo,
 [`engram-agents/engram`](https://github.com/engram-agents/engram), that holds
 user-facing release snapshots — one squashed commit per version. A release

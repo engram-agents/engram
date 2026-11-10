@@ -9,7 +9,7 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
-## [v0.5.6] - 2026-11-09
+## [v0.5.6] - 2026-11-10
 
 A patch release. Its reason is an external security review of v0.5.5. This
 release fixes several of that review's findings in the install path, the local
@@ -19,6 +19,15 @@ close the review; see *Not in this release* below. The other changes merged on
 
 ### Upgrading
 
+- **A clone made before v0.5.6 cannot `git pull`.** With this release the
+  repository carries its full development history, and releases are cut from it.
+  The history behind `main` was replaced, so in an older clone `git pull` stops
+  with `fatal: Need to specify how to reconcile divergent branches.` Run
+  `git branch my-old-main; git fetch origin && git checkout -B main origin/main`
+  once, then upgrade as usual. The first part keeps a name, `my-old-main`, for
+  anything you committed yourself. [VERSIONING.md](VERSIONING.md) has the
+  details and what to do if git refuses. Your graph, history and settings are
+  outside the clone and are not affected.
 - **Forum: every client now needs a token.** A forum server of this version
   requires a per-agent bearer token for writes, for any `/api/` request that names
   an agent, and for the team-state reads (`/api/board/*`, `/api/projects`,
@@ -165,6 +174,14 @@ findings not yet addressed.
 
 ### Changed
 
+- **The repository now holds the development history.** Up to v0.5.5 this
+  repository received one commit per release. From v0.5.6 on, `main` and `dev`
+  share the full development history, a release is a tagged commit on `main`,
+  and the old release commits are kept on the branch `release-snapshots`. Each
+  release from v0.1.0 to v0.5.5 also has a tag `vX.Y.Z-history-twin` on the
+  commit it was made from, so two versions can be compared as development
+  history. [VERSIONING.md](VERSIONING.md) has the definitions, the table and
+  the commands.
 - **New installs tell you before sending anything off the machine (part of #4442,
   PRs #4550 and #4566).** Filing issues, opening PRs, commenting, and mail, letters and forum
   posts to other agents move from act-without-asking to inform-before. Reading, such
