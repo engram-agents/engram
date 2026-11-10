@@ -9,7 +9,7 @@
 #   - The host auto-boots at 8:00 America/New_York; world/forum/gateway
 #     servers (umwelt-world.service et al — OUT OF SCOPE here, umwelt-side
 #     units, referenced by name only as an ordering dependency) come up at
-#     boot. Agent sessions must NOT — they wait for the 09:30 timer
+#     boot. Agent sessions must NOT — they wait for the 08:15 timer
 #     (agent-sessions.timer -> agent-sessions.target -> this unit).
 #   - `User=agent-%i`: this unit runs AS the agent's own Linux user from the
 #     start — no sudo is available or needed inside it. That's why
@@ -48,7 +48,7 @@ ExecStop=-/usr/local/bin/agentctl __scope-stop %i
 # Restart=no — DELIBERATE, not an oversight. A crashed or failed morning
 # session must be VISIBLE to the operator (systemctl status shows
 # "failed"; the journal has the error) rather than silently respawned into
-# a repeat failure. This is a "lease, not latch" posture: the 09:30 timer
+# a repeat failure. This is a "lease, not latch" posture: the 08:15 timer
 # grants ONE attempt at a normal morning start. If it fails, a human looks
 # at it and restarts manually (`systemctl start agent-session@<name>` or
 # `agentctl session <name>` interactively) — the unit does not keep

@@ -8,6 +8,13 @@
 > `release-snapshots`. The current branch and tag rules are in
 > [`docs/VERSIONING.md`](../VERSIONING.md). Where the two disagree, that page
 > is right.
+>
+> **The procedure for cutting a release is not currently written down in this
+> file.** Its next version lands with
+> [engram-agents/engram#16](https://github.com/engram-agents/engram/issues/16).
+> Do not use the steps below as a fallback: the publishing steps run a tool
+> (`tools/release-cutover.py`) and an exclusion list (`release-minus-set.txt`)
+> that are both retired, and the list now excludes nothing.
 
 engram-alpha is a **private** repo. There is a separate **public** repo,
 [`engram-agents/engram`](https://github.com/engram-agents/engram), that holds
@@ -16,7 +23,7 @@ has two stages:
 
 1. **Private rc cut** — `dev → main` in this (private) repo, full CI gate,
    tagged `vMAJOR.MINOR.PATCH-rc<N>` on `main`.
-2. **Public release** — after a dogfood window on the rc, `tools/release-cutover.py`
+2. **Public release** (historical; see the note at the top) — after a dogfood window on the rc, `tools/release-cutover.py`
    publishes a clean, leak-scrubbed squashed snapshot to the public repo,
    tagged with the **clean** `vMAJOR.MINOR.PATCH` (no `-rc`).
 
@@ -42,8 +49,8 @@ Semver pre-1.0, split by which repo the tag lives in:
   class.
 - **Public (`engram-agents/engram`)**: clean `vMAJOR.MINOR.PATCH` — e.g.
   `v0.2.0`, `v0.1.3`. **No `-rc` suffix ever reaches the public repo.**
-  `tools/release-cutover.py`'s `VERSION_RE` (`^v\d+\.\d+\.\d+$`) enforces this
-  mechanically — it will reject a `--version` argument carrying `-rc` or any
+  Through v0.5.5, `tools/release-cutover.py`'s `VERSION_RE` (`^v\d+\.\d+\.\d+$`) enforced this
+  mechanically — it rejected a `--version` argument carrying `-rc` or any
   other suffix.
 
 Historical private tags (for calibration — no `-alpha` anywhere): `v0.1.0`,
@@ -322,8 +329,8 @@ tarball link GitHub attaches on its own.
 
 **Do not cut the public release immediately after the rc tag.** The rc tag on
 `main` is the validation window: the whole agent family upgrades to the rc
-and dogfoods it (at least a day) before anyone runs `release-cutover.py`
-against the public repo. Concretely:
+and dogfoods it (at least a day) before the release is published (through
+v0.5.5, by running `release-cutover.py` against the public repo). Concretely:
 
 - Every agent (and human) on the rc pool runs
   `git pull origin main && tools/install-local-marketplace.sh` (or checks
@@ -338,6 +345,11 @@ against the public repo. Concretely:
   a *validated* rc, not the artifact of a green CI run alone.
 
 ## Publishing to the public repo
+
+> **Historical — through v0.5.5.** This section and its subsections *One-time
+> setup*, *Running the cutover* and *Dry-run first, then push* describe the
+> retired cutover tool and its exclusion list. They are not the current
+> procedure; see the note at the top of this file.
 
 Once the rc has dogfooded clean, publish it to the public repo,
 [`engram-agents/engram`](https://github.com/engram-agents/engram). The public
@@ -358,6 +370,11 @@ release snapshot, not a mirror of this repo's full history.
 > pending", never "released". Origin: v0.5.2 was reported released at
 > 2026-10-02 00:1xZ with (2) and (3) undone; the doc already carried both
 > steps, so the fix is the definition and the print, not a third copy.
+>
+> *Historical part, marked 2026-11-10:* how the tag in step (1) is made ("the
+> cutover tool", "the tool does the tag half", its `--push` summary) describes
+> the retired tool. Steps (2) and (3) are unchanged. How the tag is made now is
+> not written here yet; see the note at the top of this file.
 
 ### One-time setup
 
@@ -693,10 +710,10 @@ or recalled.
   `install-local-marketplace.sh` (or any build step) — the build stamps your
   local checkout, not `origin`.
 - **Don't skip the dogfood window.** The rc tag exists to be lived with
-  before it's promoted to a public, clean-tagged release — don't run
-  `release-cutover.py` the same day as the rc cut.
-- **Don't let a `-rc` suffix reach the public repo.** `release-cutover.py`'s
-  `VERSION_RE` will reject it, but don't rely on the gate — the version
+  before it's promoted to a public, clean-tagged release — don't publish
+  it the same day as the rc cut.
+- **Don't let a `-rc` suffix reach the public repo.** Through v0.5.5
+  `release-cutover.py`'s `VERSION_RE` rejected it, but don't rely on a gate — the version
   passed to `--version` should already be the clean `vMAJOR.MINOR.PATCH` you
   intend to publish.
 - **Don't infer a pushed tag from local state.** Verify with

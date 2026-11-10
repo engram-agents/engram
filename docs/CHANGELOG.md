@@ -48,7 +48,9 @@ close the review; see *Not in this release* below. The other changes merged on
 - **The ENGRAM home becomes owner-only.** At bootstrap and at every SessionStart,
   group and other access is removed from the home's private data and top-level
   files. `.git`, `marketplace`, `venv` and `tools` are left as they are. A path with
-  a named-user ACL keeps those entries. A
+  a named ACL entry keeps it — a named user or a named group, including an entry
+  inherited from a parent directory — and a group entry that survives still grants
+  its access. Remove it explicitly if you do not want it to. A
   home shared only through its owning group loses that access at the next session.
 - **Retired config keys.** `multi_agent`, `mode` and `counterparts` are retired.
   A key still present is logged once at startup.
@@ -139,7 +141,7 @@ findings not yet addressed.
   (essential tier) makes the ENGRAM home and its data directories (`diary`, `sessions`, `compact`, `history`, `health-snapshots`, `session-logs-archive`, `claude-projects-archive`, `db-backup`, `evidence-archive`, `logs`, `telemetry`, `session-start-overflow`, `tripwire-overflow`): owner-only; named ACL grants such as the operator's are preserved and inherited (a preserved default ACL entry means files created later under an inherited operator grant stay operator-readable, which reaches memory text such as the overflow files, not only the viz health snapshots).
   Directories and files lose their group and other bits (a directory is never widened: 0500 stays 0500, 0755 becomes 0700), as do top-level files such as `knowledge.db`; a regular file with more than one hard link is skipped and reported, so nothing outside the tree changes mode; it resolves a symlinked ENGRAM_HOME root once, never follows symlinks inside the tree and never touches
   `.git`, `marketplace`, `venv`, `tools`. Owner-only EXCEPT on paths carrying a named-user ACL (Linux), where the owning-group and other
-  entries are cleared and the named entries and the mask are preserved, so the cross-user viz operator keeps read access; the ACL
+  entries are cleared and the named entries and the mask are preserved — including any inherited named group grant, which keeps its effective access — so the cross-user viz operator keeps read access; the ACL
   is rewritten in place (never `chmod`, never `setfacl`), a directory's default ACL gets the same rewrite, and those paths are
   reported as `acl_preserved` (`access`, `default` or `both`). It runs at bootstrap (both targets) and at every SessionStart (one counts-only stderr line, when something changed or a path could not be tightened, so a home left loose is visible). A settings.json that cannot be written (disk error, or a lone-surrogate escape that cannot be encoded) is refused with the install otherwise complete.
 

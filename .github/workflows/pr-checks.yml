@@ -1036,9 +1036,9 @@ jobs:
       # coverage that isn't there.
       # docs-layout-guard: a new file directly under docs/ must be on the
       # allowlist in tests/test_docs_layout_guard.py (a shipped surface sends
-      # readers to it), else it belongs in docs/internal/, which the one
-      # docs/internal/ line in release-minus-set.txt keeps out of the public
-      # snapshot. Pure stdlib (git ls-files + the cutover tool's own matcher),
+      # readers to it), else it belongs in docs/internal/, the developers'
+      # tree (public since v0.5.6; release-minus-set.txt is historical and
+      # excludes nothing). Pure stdlib (git ls-files + the retired cutover tool's matcher),
       # well under a second. Without this line the guard would gate nothing:
       # dev PRs do not run tests/.
       - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency, claude-md-moves, prev-release-hooks-gate, docs-layout-guard

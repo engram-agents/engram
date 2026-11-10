@@ -1,7 +1,7 @@
 # Boot-time agent auto-start
 
 Systemd units + boot-charge templates that bring agent Claude Code (and, after
-a supervised trial, Codex) sessions up automatically at 09:30
+a supervised trial, Codex) sessions up automatically at 08:15
 America/New_York on a host that already auto-boots at 8:00 America/New_York.
 
 ## Design in one paragraph
@@ -9,7 +9,7 @@ America/New_York on a host that already auto-boots at 8:00 America/New_York.
 The host boots at 8:00; world/forum/gateway servers (`umwelt-world.service`
 et al — **umwelt-side units, out of scope for this repo**, referenced here
 only by name as an `After=`/ordering dependency) come up then. Agent
-**sessions** must NOT start at boot — they wait for a separate 09:30 timer,
+**sessions** must NOT start at boot — they wait for a separate 08:15 timer,
 staggered ~30s apart across agents. Each session runs as its own Linux user
 (`agent-<name>`) inside a detached `tmux` session so the operator can `ssh`
 in (including over tailscale) and `tmux attach` later. Because the systemd
@@ -22,7 +22,7 @@ them** — that's the reason `tools/agentctl session` grew an `--as-self` mode
 | File | Role |
 |------|------|
 | `agent-session@.service` | per-agent template unit (`User=agent-%i`); runs `agent-session-launch.sh %i` |
-| `agent-sessions.timer` | daily 09:30 America/New_York trigger, `Persistent=false` (see the unit's own comment for why) |
+| `agent-sessions.timer` | daily 08:15 America/New_York trigger, `Persistent=false` (see the unit's own comment for why) |
 | `agent-sessions.target` | grouping target the timer triggers; `Wants=` each Claude agent's instance |
 | `agent-session-launch.sh` | wrapper: sources the optional host-common `boot-env.common`, then optional per-agent `~/.engram/boot-env`, first, passes the installed charge directory + session cwd to the runner, prepends `~/.local/bin` to PATH, pre-checks the CLI + agentctl `--charge-file` support, starts detached tmux running `agent-session-run.sh` |
 | `agent-session-run.sh` | runs INSIDE tmux: detects the platform as the target agent, selects and renders a harness-valid charge, then invokes `agentctl session <name> -d [-r for Claude] --as-self --cd <dir> --charge-file <file>`; logs every launch/exit and holds a failed pane open for autopsy |
@@ -245,19 +245,19 @@ kill-session -t agent-<name>` (or attach and exit normally). This is deliberate:
 the unit is a launcher, not a supervisor, and a session's lifecycle belongs to
 the agent + operator, not to systemd's restart machinery.
 
-## Dress-rehearsal checklist (do this before trusting the real 8:00/9:30 boot)
+## Dress-rehearsal checklist (do this before trusting the real 8:00/8:15 boot)
 
 Run through this **with the operator physically present** (not remote) the
 first time:
 
 - [ ] `sudo systemctl daemon-reload` after any unit/drop-in change.
-- [ ] `systemctl list-timers agent-sessions.timer` shows the next 09:30
+- [ ] `systemctl list-timers agent-sessions.timer` shows the next 08:15
       America/New_York fire time.
 - [ ] One **real reboot** of the host (not just `systemctl restart`) —
       confirm world/forum/gateway servers come up automatically at boot
       (umwelt-side, out of scope here, but a precondition for this to make
-      sense) and that NO agent session starts before 09:30.
-- [ ] At/after 09:30, confirm each `agent-session@<name>.service` shows
+      sense) and that NO agent session starts before 08:15.
+- [ ] At/after 08:15, confirm each `agent-session@<name>.service` shows
       `active (exited)` (expected for `Type=oneshot` +
       `RemainAfterExit=yes` — the launcher exits quickly once tmux forks
       off; the session itself lives on independently).

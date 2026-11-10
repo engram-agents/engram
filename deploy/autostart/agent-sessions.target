@@ -1,5 +1,5 @@
 # agent-sessions.target — grouping target triggered by agent-sessions.timer
-# at 09:30 America/New_York. Wants= each Claude-running agent's per-instance
+# at 08:15 America/New_York. Wants= each Claude-running agent's per-instance
 # agent-session@<name>.service. Stagger (~30s apart) is applied via
 # per-instance ExecStartPre drop-ins on the individual instances, NOT here —
 # see deploy/autostart/README.md.
@@ -16,7 +16,7 @@
 # agents whose agent-<name> user exists on THIS host.
 
 [Unit]
-Description=All boot-time agent sessions (triggered daily at 09:30 America/New_York)
+Description=All boot-time agent sessions (triggered daily at 08:15 America/New_York)
 Wants=agent-session@kepler.service
 Wants=agent-session@borges.service
 Wants=agent-session@ariadne.service

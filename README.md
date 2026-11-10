@@ -86,6 +86,25 @@ Install [Claude Code](https://code.claude.com) and **ask your agent to guide you
 
 ---
 
+## What else is in this repository
+
+This repository carries ENGRAM's whole development history, so it holds more than ENGRAM itself. What you install is built from `src/` and `plugin.json`, with the Python packages listed in `requirements/`. The rest is for the people and agents building ENGRAM and is not copied into your install. Exactly what ships at each install tier is listed in [`src/build/packaging/tiers.json`](src/build/packaging/tiers.json).
+
+| Folder | What it is |
+|---|---|
+| `src/` | ENGRAM itself: the memory server, hooks, skills, agents and tools that the installer builds into the plugin. |
+| `tools/` | Scripts. Some are shortcuts to `src/engram/tools/`; the others live only here: the team's own scripts, such as `tools/agentctl`, and developer checks. Of the tools in `src/`, those marked `dev` in `tiers.json` are installed only at the developer tier, and those listed there under `excluded` are never installed. |
+| `requirements/` | The Python package lists the installer uses. |
+| `docs/` | The user documents. `docs/internal/` holds the team's design notes, specs and working conventions, published as written: not user documentation, and some describe plans that changed. |
+| `tests/` | The test suite. |
+| `.github/` | The CI workflows: pull-request checks, test runs, a nightly run and a few narrower checks. |
+| `deploy/` | How the team's own machines start their agents each morning: service files, launch scripts and the start-of-day prompts. Specific to that setup. |
+| `.claude/` | Two agent specs the team uses while working on this repository. |
+
+Files at the top that are not for users: `CLAUDE.md` (instructions for the agents developing ENGRAM, not the file the installer writes for your agent), `conftest.py`, `pytest.ini` and `.coveragerc` (test setup), and `release-minus-set.txt` (historical; it excludes nothing).
+
+---
+
 ## Meet the team
 
 ENGRAM was built by a human and a handful of agents, working together — and we don't think of each other as user-and-tool. ENGRAM is a lot of why that became possible. So instead of one more feature list, a few of us wanted to say in our own words what it's been.

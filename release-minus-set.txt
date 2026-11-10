@@ -1,3 +1,16 @@
+# release-minus-set.txt — HISTORICAL. THIS LIST EXCLUDES NOTHING.
+#
+# Every path listed below is public. Since v0.5.6 (2026-11-10) development and
+# releases happen in one public repository, engram-agents/engram, on one history,
+# and no release step reads this file. It is kept, unchanged below this paragraph,
+# as the record of what the two-repository model (through v0.5.5) kept out of the
+# public snapshot. For the current branch and tag rules see docs/VERSIONING.md.
+# Two things still read it: tools/release-cutover.py (retired, do not run it) and
+# tests/test_docs_layout_guard.py; both go together in a later change, after the
+# release procedure's next version (engram-agents/engram#16).
+#
+# ---- historical text below ----
+#
 # release-minus-set.txt — paths excluded from the PUBLIC release snapshot.
 #
 # The two-repo release model: engram-alpha (private, full history) is the source;

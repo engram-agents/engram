@@ -20,7 +20,7 @@ See engram-alpha#3002 for the full incident writeup.
 
 | | Linux (`deploy/autostart/`) | macOS (`deploy/autostart/macos/`) |
 |---|---|---|
-| Scheduler | systemd timer, daily 09:30 | `launchd`, every 2h (`StartInterval`) |
+| Scheduler | systemd timer, daily 08:15 | `launchd`, every 2h (`StartInterval`) |
 | Multi-tenant? | Yes — `agent-<name>` Linux user per agent | No — single macOS user, single seat (`clio`) |
 | Privilege | root/sudo to install system units | **No sudo** — a user-level LaunchAgent |
 | Already-live session | Treated as an **error** (fires once/day; unexpected) | Treated as a **quiet skip, exit 0** (fires every 2h; the expected common case) |

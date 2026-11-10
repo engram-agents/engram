@@ -3,9 +3,11 @@
 The rule that decides where a doc lives: a doc stays directly under ``docs/``
 (public) if a shipped surface -- a skill, a tool's help text, the README, or
 the public paper -- sends a user or a user's agent to it.  Everything else
-about *building* ENGRAM goes in ``docs/internal/``, which ONE entry in
-``release-minus-set.txt`` keeps out of the public snapshot.  Nobody has to
-remember to add each new internal doc to the minus-set.
+about *building* ENGRAM goes in ``docs/internal/``, the developers' tree.
+Since v0.5.6 ``docs/internal/`` is public as well; the guard keeps the top of
+``docs/`` to user documents.  ``release-minus-set.txt`` is historical and
+excludes nothing; G3 and G4 below still check that file and the retired
+cutover tool's matcher, and go with them in a later change (engram-agents/engram#16).
 
 Files inside ``docs/handbook/`` and ``docs/assets/`` are public by definition.
 This guard polices only the top level of ``docs/`` and the set of sub-folders,
@@ -54,12 +56,12 @@ ALLOWLIST = {
     "macos-agent-setup.md": "README-AGENT.md links it from its install section (Mac users installing ENGRAM)",
     "os-harness-constraints.md": "tools/os-harness-check.py names it in its docstring and its error output",
 }
-# The only sub-folders of docs/, each with its reason.  "internal" is the one
-# folder the public snapshot does NOT carry (one release-minus-set.txt entry).
+# The only sub-folders of docs/, each with its reason.  "internal" is the
+# developers' tree; it is public since v0.5.6 (release-minus-set.txt is historical).
 SUBFOLDER_REASONS = {
     "assets": "README.md and README.zh.md show assets/engram-triptych.png",
     "handbook": "README.md, README.zh.md and README-AGENT.md send readers to docs/handbook/ for the deep internals",
-    "internal": "design notes, specs, research, team process and release procedure; one release-minus-set.txt entry keeps it out of the public release",
+    "internal": "design notes, specs, research, team process and release procedure, for the people and agents building ENGRAM; public since v0.5.6, not part of a user's install",
 }
 ALLOWED_SUBFOLDERS = set(SUBFOLDER_REASONS)
 PUBLIC_SUBFOLDERS = ALLOWED_SUBFOLDERS - {"internal"}
@@ -132,8 +134,8 @@ def test_g1_every_top_level_docs_file_is_on_the_allowlist():
         f"New top-level file(s) directly under docs/: {stray}. docs/ holds only docs that a "
         "shipped surface (a skill, a tool's help, the README or the public paper) sends a user "
         "or a user's agent to. Docs about BUILDING ENGRAM (design notes, specs, research, team "
-        "process, release procedure) go in docs/internal/, which release-minus-set.txt keeps out "
-        "of the public release. If a shipped surface really does send readers to the new file, "
+        "process, release procedure) go in docs/internal/, the developers' tree. If a shipped "
+        "surface really does send readers to the new file, "
         "add it to ALLOWLIST in tests/test_docs_layout_guard.py with that surface as its reason."
     )
     assert all(r.strip() for r in ALLOWLIST.values()), "every ALLOWLIST entry needs a reason"

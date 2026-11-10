@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """release-cutover.py — repeatable two-repo release cutover.
 
+HISTORICAL — RETIRED AT v0.5.6 (2026-11-10). DO NOT RUN IT. It publishes a
+squashed snapshot of a private repository to a public one, which is the
+two-repository model used through v0.5.5. Since v0.5.6 development and releases
+happen in one public repository on one history; see docs/VERSIONING.md. The
+file stays only because tests/test_docs_layout_guard.py imports its path
+matcher. It, its list (release-minus-set.txt) and its test go together in a
+later change, after the release procedure's next version
+(engram-agents/engram#16).
+
+The original description follows.
+
 Produces a clean public-release snapshot from the private engram-alpha repo:
   1. git-archive the source ref into a temp dir (tracked files only).
   2. Apply the minus-set (release-minus-set.txt) — drop excluded paths.
