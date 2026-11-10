@@ -91,6 +91,30 @@ fails loudly, naming the tag; same for the derived pin constant.
 A tie in T — two tags at the same max version with DIFFERENT pinned
 hashes — is a corrupted tag set and also fails loudly, naming both tags;
 never picked silently.
+
+### The one deliberate exception: release-snapshot tags
+
+A deployable tag whose tree has NO ``tests/`` directory at all is a
+**release-snapshot tag** and is skipped when resolving T: it contributes no
+version and is never read for a pin. The public repo carries such tags
+(``v0.1.0`` .. ``v0.5.5``): the old public releases shipped without any
+``tests/`` tree, so they have no pin file BY CONSTRUCTION, and some of them
+carry ``health/version.py`` at the same max version as the newest real tag.
+Without the skip, ``resolve_T`` read their pin file and raised "broken tag"
+for tags that are not broken.
+
+The exception is keyed on the absence of the ``tests/`` DIRECTORY, never on
+the absence of the pin file. A tag that HAS ``tests/`` but lacks
+``tests/test_health_measurements.py`` is still a broken tag and still raises,
+exactly as before. If every tag carrying ``version.py`` is snapshot-shaped,
+``resolve_T`` returns ``None`` (gate inactive). There is no ancestry filter
+(see ``deployable_tags``).
+
+The skip is never silent: ``run_live_gate`` appends
+``"; N release-snapshot tag(s) with no tests/ directory skipped"`` to its
+message, on every status, whenever N >= 1. And an instrument failure is never
+a skip: a ref that does not resolve to a commit, or a failing ``git ls-tree``
+on the directory check, raises (``_tag_has_tests_dir``).
 """
 
 from __future__ import annotations
@@ -158,6 +182,46 @@ def _verify_tag_resolves(repo_path, tag: str) -> None:
             f"tag {tag!r} does not resolve to a commit -- bad ref, not a "
             f"missing-file case -- stderr: {result.stderr.strip()!r}"
         )
+
+
+def _tag_has_tests_dir(repo_path, tag: str) -> bool:
+    """True iff the tree at ``tag`` has a ``tests/`` DIRECTORY.
+
+    The one deliberate exception to "every deployable tag counts": a
+    release-snapshot tag (the old public releases shipped with no ``tests/``
+    at all) has no pin file BY CONSTRUCTION, so reading it for a pin would
+    raise "broken tag" for a tag that is not broken. The key is the absence
+    of the DIRECTORY, never of the pin file -- a tag with ``tests/`` but no
+    pin file is still a broken tag and still raises.
+
+    An instrument failure is never a skip: a ref that does not resolve to a
+    commit, or an ``ls-tree`` that exits non-zero, raises here. Reading
+    either as "no tests/ directory" would turn a broken tag into a skipped
+    one -- the silent degradation this gate exists to refuse."""
+    _verify_tag_resolves(repo_path, tag)
+    result = _git(repo_path, ["ls-tree", "-d", "--name-only", f"{tag}^{{commit}}", "tests"])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git ls-tree failed while checking {tag!r} for a tests/ "
+            f"directory -- instrument failure, not a release-snapshot tag "
+            f"-- stderr: {result.stderr.strip()!r}"
+        )
+    return result.stdout.strip() == "tests"
+
+
+def _split_snapshot_tags(repo_path) -> tuple[list[str], list[str]]:
+    """Partition ``deployable_tags`` into ``(kept, skipped)``, where
+    ``skipped`` are the release-snapshot tags (no ``tests/`` directory).
+
+    The single source for both what ``resolve_T`` ignores and what
+    ``run_live_gate`` reports as skipped, so the two cannot drift apart.
+    Deliberately NO ancestry filter (see ``deployable_tags``): only the
+    tag's own tree decides."""
+    kept: list[str] = []
+    skipped: list[str] = []
+    for tag in deployable_tags(repo_path):
+        (kept if _tag_has_tests_dir(repo_path, tag) else skipped).append(tag)
+    return kept, skipped
 
 
 def _path_exists_at_tag(repo_path, tag: str, path: str) -> bool:
@@ -393,7 +457,7 @@ def resolve_T(repo_path) -> tuple[tuple[int, int], str, str, str | None] | None:
     since T is now simply "the current state at this version," not a
     guess about which tag looks more authoritative.
     """
-    tags = deployable_tags(repo_path)
+    tags, _skipped_snapshots = _split_snapshot_tags(repo_path)
     versions: dict[str, tuple[int, int]] = {}
     for tag in tags:
         version = _read_version_at_tag(repo_path, tag)
@@ -427,6 +491,12 @@ def resolve_T(repo_path) -> tuple[tuple[int, int], str, str, str | None] | None:
             f"{sorted(hashes.items())}"
         )
 
+    # (The ONE deliberate exception to "every tag": release-snapshot tags,
+    # i.e. tags whose tree has no tests/ directory at all, were already
+    # partitioned out by _split_snapshot_tags above -- they have no pin file
+    # by construction. That exception is keyed on the tests/ DIRECTORY; a tag
+    # that has tests/ and lacks only the pin file is NOT exempt and raises.)
+    #
     # This raise -- and the L0-agreement raise above it -- must keep seeing
     # EVERY tag at max version, pinned or not: both loop over the full,
     # unfiltered tags_at_max built above, never a subset pre-filtered to
@@ -796,18 +866,28 @@ def run_live_gate(repo_path=REPO_ROOT) -> tuple[str, str]:
     test_gate_on_this_repo and the CI step / manual verification run."""
     resolved = resolve_T(repo_path)
     if resolved is None:
-        return "PASS", INACTIVE_MESSAGE
-    t, tag, pinned_hash, pinned_derived_hash = resolved
-    s = _current_S()
-    return evaluate_gate(
-        t,
-        s,
-        _l0_hash_at_head,
-        lambda: pinned_hash,
-        _derived_hash_at_head,
-        lambda: pinned_derived_hash,
-        tag=tag,
-    )
+        status, message = "PASS", INACTIVE_MESSAGE
+    else:
+        t, tag, pinned_hash, pinned_derived_hash = resolved
+        s = _current_S()
+        status, message = evaluate_gate(
+            t,
+            s,
+            _l0_hash_at_head,
+            lambda: pinned_hash,
+            _derived_hash_at_head,
+            lambda: pinned_derived_hash,
+            tag=tag,
+        )
+    # The release-snapshot skip is never silent: on EVERY status, name how
+    # many tags were skipped. n == 0 leaves the message byte-identical.
+    _kept, skipped = _split_snapshot_tags(repo_path)
+    if skipped:
+        message += (
+            f"; {len(skipped)} release-snapshot tag(s) with no tests/ "
+            f"directory skipped"
+        )
+    return status, message
 
 
 # ---------------------------------------------------------------------------
@@ -1255,6 +1335,10 @@ def test_broken_tag_carries_version_but_no_pin_fails_loudly(tmp_path):
     _git_run(repo, "config", "user.email", "fairy@example.com")
     _git_run(repo, "config", "user.name", "gate-falsifier")
     _write_version_py(repo, 1, 0)
+    # A tests/ directory without the pin file: broken, not a release snapshot
+    # (a tag with NO tests/ directory at all is skipped, not raised on).
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_other.py").write_text("# unrelated\n", encoding="utf-8")
     _git_run(repo, "add", "-A")
     _git_run(repo, "commit", "-q", "-m", "v1.0, no pin test at all")
     _git_run(repo, "tag", "v1.0.0")
@@ -1671,6 +1755,10 @@ def _build_three_tag_broken_guard_fixture(tmp_path, name: str) -> Path:
 
     _write_version_py(repo, 1, 0)
     _write_pin_test(repo, HASH_A, derived_hash=None)
+    # Keeps a tests/ directory in ccc's tree after its pin file is removed:
+    # ccc must stay a broken tag (tests/ present, pin absent), not become a
+    # release-snapshot tag (no tests/ at all), which would be skipped.
+    (repo / "tests" / "test_other.py").write_text("# unrelated\n", encoding="utf-8")
     _git_run(repo, "add", "-A")
     _git_run(repo, "commit", "-q", "-m", "aaa: v1.0, no derived pin")
     _git_run(repo, "tag", "deploy/aaa-unpinned")
@@ -1787,3 +1875,223 @@ def test_full_history_scratch_repo_major_pass_and_under_bump(tmp_path):
     assert status == "PASS"
     assert f"tag {tag}" in message
     assert "T=1.0" in message
+
+
+# ---------------------------------------------------------------------------
+# Release-snapshot tags (a tag whose tree has NO tests/ directory at all).
+#
+# The public repo carries old release-snapshot tags (v0.1.0 .. v0.5.5) cut
+# from trees that shipped without any tests/ directory. Some of them carry
+# health/version.py at the same max version as the newest real tag, so without
+# a skip ``resolve_T`` read their (nonexistent) pin file and raised "broken
+# tag". The contract, pinned by the cells below:
+#
+#   C1  no tests/ directory at the tag -> skipped (no version, no pin read).
+#   C2  tests/ present but pin file absent -> STILL the broken-tag raise. The
+#       skip is keyed on the DIRECTORY, never on the pin file.
+#   C3  every version-carrying tag snapshot-shaped -> resolve_T is None.
+#   C4  run_live_gate names the skipped count, on every status, only n >= 1.
+#   C5  an instrument failure (bad ref / failing git call) raises, never skips.
+#   C6  deployable_tags() and resolve_T's return shape are unchanged.
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_SUFFIX_FMT = "; {n} release-snapshot tag(s) with no tests/ directory skipped"
+
+
+def _new_scratch_repo(tmp_path: Path, name: str) -> Path:
+    repo = tmp_path / name
+    repo.mkdir()
+    _git_run(repo, "init", "-q")
+    _git_run(repo, "config", "user.email", "fairy@example.com")
+    _git_run(repo, "config", "user.name", "gate-falsifier")
+    return repo
+
+
+def _commit_tree_and_tag(
+    repo: Path,
+    tag: str,
+    *,
+    version: tuple[int, int] | None,
+    pin_hash: str | None = None,
+    other_test_file: bool = False,
+) -> None:
+    """Rewrite the scratch repo's working tree to exactly the requested shape,
+    commit, and tag (lightweight). ``pin_hash``/``other_test_file`` populate
+    ``tests/``; with neither, the tree has NO ``tests/`` directory at all
+    (a release-snapshot shape -- git does not track empty directories)."""
+    import shutil
+
+    for sub in ("tests", "src"):
+        if (repo / sub).exists():
+            shutil.rmtree(repo / sub)
+    if version is not None:
+        _write_version_py(repo, *version)
+    if pin_hash is not None:
+        _write_pin_test(repo, pin_hash)
+    if other_test_file:
+        (repo / "tests").mkdir(exist_ok=True)
+        (repo / "tests" / "test_other.py").write_text("# unrelated\n", encoding="utf-8")
+    (repo / "marker.txt").write_text(tag + "\n", encoding="utf-8")
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "--allow-empty", "-m", tag)
+    _git_run(repo, "tag", tag)
+
+
+def _patch_head_values(monkeypatch, s, l0, derived) -> None:
+    """Point ``run_live_gate``'s HEAD-side reads at fixed values (the scratch
+    repo is the TAG side; HEAD's S and hashes come from the live imports)."""
+    g = globals()
+    monkeypatch.setitem(g, "_current_S", lambda: s)
+    monkeypatch.setitem(g, "_l0_hash_at_head", lambda: l0)
+    monkeypatch.setitem(g, "_derived_hash_at_head", lambda: derived)
+
+
+# --- C1 -------------------------------------------------------------------
+
+def test_snapshot_tag_at_same_max_version_is_skipped_normal_tag_chosen(tmp_path):
+    repo = _new_scratch_repo(tmp_path, "snap-same-max")
+    _commit_tree_and_tag(repo, "v1.0.0", version=(1, 0), pin_hash=HASH_A)
+    _commit_tree_and_tag(repo, "v1.0.1", version=(1, 0))  # snapshot: no tests/
+    assert resolve_T(repo) == ((1, 0), "v1.0.0", HASH_A, "c" * 64)
+
+
+def test_snapshot_tag_at_higher_version_contributes_no_version(tmp_path):
+    repo = _new_scratch_repo(tmp_path, "snap-higher")
+    _commit_tree_and_tag(repo, "v1.0.0", version=(1, 0), pin_hash=HASH_A)
+    _commit_tree_and_tag(repo, "v3.0.0", version=(3, 0))  # snapshot, higher
+    assert resolve_T(repo) == ((1, 0), "v1.0.0", HASH_A, "c" * 64)
+
+
+def test_snapshot_tags_do_not_disturb_tie_break_between_real_tags(tmp_path):
+    """Two real annotated tags tied at max plus a snapshot tag at the same
+    version: the tie-break still picks the latest tagger date -- the
+    snapshot (lightweight, would otherwise trip the lightweight refusal) is
+    not a candidate at all."""
+    repo = _new_scratch_repo(tmp_path, "snap-tiebreak")
+    _commit_tree_and_tag(repo, "v1.0.0", version=(1, 0), pin_hash=HASH_A)
+    _git_run(repo, "tag", "-d", "v1.0.0")
+    _git_tag_annotated(repo, "v1.0.0", committer_date="2020-01-01T00:00:00")
+    _commit_tree_and_tag(repo, "v1.0.1", version=(1, 0), pin_hash=HASH_A)
+    _git_run(repo, "tag", "-d", "v1.0.1")
+    _git_tag_annotated(repo, "v1.0.1", committer_date="2021-01-01T00:00:00")
+    _commit_tree_and_tag(repo, "v0.9.0", version=(1, 0))  # snapshot, lightweight
+    resolved = resolve_T(repo)
+    assert resolved is not None and resolved[1] == "v1.0.1"
+
+
+# --- C2 (the load-bearing distinction) -------------------------------------
+
+def test_tests_dir_without_pin_file_still_raises_even_beside_a_snapshot_tag(tmp_path):
+    repo = _new_scratch_repo(tmp_path, "snap-c2")
+    _commit_tree_and_tag(repo, "v1.0.0", version=(1, 0), pin_hash=HASH_A)
+    _commit_tree_and_tag(repo, "v1.0.1", version=(1, 0))  # snapshot: skipped
+    _commit_tree_and_tag(repo, "v1.0.2", version=(1, 0), other_test_file=True)  # tests/, no pin
+    with pytest.raises(RuntimeError, match="v1.0.2") as excinfo:
+        resolve_T(repo)
+    assert "broken tag" in str(excinfo.value)
+    assert "v1.0.1" not in str(excinfo.value)
+
+
+def test_tests_dir_without_pin_file_raises_when_it_is_the_only_tag(tmp_path):
+    repo = _new_scratch_repo(tmp_path, "snap-c2-solo")
+    _commit_tree_and_tag(repo, "v1.0.0", version=(1, 0), other_test_file=True)
+    with pytest.raises(RuntimeError, match="v1.0.0"):
+        resolve_T(repo)
+
+
+# --- C3 + C4 (inactive path) -------------------------------------------------
+
+def test_only_snapshot_tags_resolve_to_none_and_gate_reports_inactive_with_count(tmp_path):
+    repo = _new_scratch_repo(tmp_path, "snap-only")
+    _commit_tree_and_tag(repo, "v0.1.0", version=None)
+    _commit_tree_and_tag(repo, "v0.2.0", version=(1, 0))
+    _commit_tree_and_tag(repo, "v0.3.0", version=(2, 0))
+    assert resolve_T(repo) is None
+    status, message = run_live_gate(repo)
+    assert status == "PASS"
+    assert INACTIVE_MESSAGE in message
+    assert message == INACTIVE_MESSAGE + SNAPSHOT_SUFFIX_FMT.format(n=3)
+
+
+def test_inactive_message_is_byte_identical_when_no_snapshot_tag_exists(tmp_path):
+    repo = _new_scratch_repo(tmp_path, "snap-none-inactive")
+    _commit_tree_and_tag(repo, "v1.0.0", version=None, other_test_file=True)
+    assert run_live_gate(repo) == ("PASS", INACTIVE_MESSAGE)
+
+
+# --- C4 (active path, PASS and DENY; n == 0 unchanged) -----------------------
+
+def test_active_gate_pass_and_deny_both_carry_the_snapshot_count(tmp_path, monkeypatch):
+    repo = _new_scratch_repo(tmp_path, "snap-active")
+    _commit_tree_and_tag(repo, "v0.9.0", version=(1, 0))  # snapshot
+    _commit_tree_and_tag(repo, "v1.0.0", version=(1, 0), pin_hash=HASH_A)
+    _commit_tree_and_tag(repo, "v0.9.1", version=None)  # snapshot
+    suffix = SNAPSHOT_SUFFIX_FMT.format(n=2)
+
+    _patch_head_values(monkeypatch, (1, 0), HASH_A, "c" * 64)
+    status, message = run_live_gate(repo)
+    assert status == "PASS"
+    assert message.endswith(suffix)
+    assert "T=1.0 (tag v1.0.0)" in message
+
+    _patch_head_values(monkeypatch, (1, 0), HASH_B, "c" * 64)  # L0 moved, no bump
+    status, message = run_live_gate(repo)
+    assert status == "DENY"
+    assert message.endswith(suffix)
+
+
+def test_active_gate_message_unchanged_when_no_snapshot_tag_exists(tmp_path, monkeypatch):
+    repo = _new_scratch_repo(tmp_path, "snap-active-none")
+    _commit_tree_and_tag(repo, "v1.0.0", version=(1, 0), pin_hash=HASH_A)
+    for head_l0 in (HASH_A, HASH_B):
+        _patch_head_values(monkeypatch, (1, 0), head_l0, "c" * 64)
+        expected = evaluate_gate(
+            (1, 0),
+            (1, 0),
+            lambda: head_l0,
+            lambda: HASH_A,
+            lambda: "c" * 64,
+            lambda: "c" * 64,
+            tag="v1.0.0",
+        )
+        got = run_live_gate(repo)
+        assert got == expected
+        assert "release-snapshot" not in got[1]
+
+
+# --- C5 (an instrument failure is never a skip) ------------------------------
+
+def test_failed_tests_dir_check_raises_instead_of_skipping(tmp_path, monkeypatch):
+    repo = _new_scratch_repo(tmp_path, "snap-c5-git-fail")
+    _commit_tree_and_tag(repo, "v1.0.0", version=(1, 0), pin_hash=HASH_A)
+    real_git = _git
+
+    def flaky_git(repo_path, args):
+        if args and args[0] == "ls-tree":
+            return subprocess.CompletedProcess(
+                ["git", *args], 128, stdout="", stderr="fatal: simulated failure"
+            )
+        return real_git(repo_path, args)
+
+    monkeypatch.setitem(globals(), "_git", flaky_git)
+    with pytest.raises(RuntimeError, match="v1.0.0"):
+        resolve_T(repo)
+    with pytest.raises(RuntimeError, match="v1.0.0"):
+        run_live_gate(repo)
+
+
+def test_tag_that_does_not_resolve_to_a_commit_raises_instead_of_skipping(tmp_path):
+    repo = _new_scratch_repo(tmp_path, "snap-c5-bad-ref")
+    _commit_tree_and_tag(repo, "v1.0.0", version=(1, 0), pin_hash=HASH_A)
+    _git_run(repo, "tag", "v1.0.1", "HEAD^{tree}")  # a tag on a tree, not a commit
+    with pytest.raises(RuntimeError, match="v1.0.1"):
+        resolve_T(repo)
+
+
+# --- C6 (public shapes unchanged) --------------------------------------------
+
+def test_deployable_tags_still_lists_snapshot_tags(tmp_path):
+    repo = _new_scratch_repo(tmp_path, "snap-c6")
+    _commit_tree_and_tag(repo, "v1.0.0", version=(1, 0), pin_hash=HASH_A)
+    _commit_tree_and_tag(repo, "v0.9.0", version=(1, 0))  # snapshot
+    assert sorted(deployable_tags(repo)) == ["v0.9.0", "v1.0.0"]
