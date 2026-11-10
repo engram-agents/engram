@@ -141,6 +141,121 @@ case "$platform" in
         ;;
 esac
 
+# Model-family pin (public issue 20). A seat that boots on another model family
+# than its recorded self_lineage is stopped by the model gate, so the launcher
+# passes the FAMILY word (opus, sonnet, haiku, fable; never a model id) derived
+# from ~/.engram/config.json self_lineage. Claude only; every path that cannot
+# decide starts the seat as it always did and SAYS so in the log and on the pane.
+# Order matters:
+#   (A)  any non-empty ANTHROPIC_DEFAULT_*_MODEL in this environment (boot-env
+#        files are sourced before this runs): pass nothing, stop. A seat that
+#        remaps models through the environment must not get a literal family.
+#   (A') lineage provider other than anthropic: pass nothing, one INFO line.
+#        Unset or unusable lineage, or an unknown anthropic family: WARNING.
+#   (B)  anthropic only: read `model` from the settings the harness merges
+#        (user, then project, then local; later wins; managed settings and
+#        CLAUDE_CONFIG_DIR are NOT read; neither is the ANTHROPIC_MODEL variable
+#        nor an `env` block inside a settings file), drop a trailing [...] suffix. Same
+#        family: pass nothing (keeps a [1m] variant). Absent: pass the family.
+#        Different family or an unrecognised value: pass the lineage family and
+#        WARN. Settings that cannot be read: pass nothing and WARN; no guess.
+# Settings are never edited; ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL are never touched.
+_log_info() {
+    echo "[$(date -Is)] [$AGENT_NAME] INFO: $1" >> "$LOG"
+    echo "[autostart] INFO: $1" >&2
+}
+
+_resolve_model_pin() {
+    local var kind text
+    model_flag=()
+    for var in $(compgen -e | grep -E '^ANTHROPIC_DEFAULT_.*_MODEL$'); do
+        if [[ -n "${!var}" ]]; then
+            _log_info "model pin: $var is set in the environment; passing no --model"
+            return 0
+        fi
+    done
+    if ! command -v python3 >/dev/null 2>&1; then
+        _log_warn "model pin: python3 not found; cannot read self_lineage, starting as before"
+        return 0
+    fi
+    while IFS=$'\t' read -r kind text; do
+        case "$kind" in
+            FLAG) model_flag=(--model "$text") ;;
+            INFO) _log_info "$text" ;;
+            WARN) _log_warn "$text" ;;
+        esac
+    done < <(python3 - "$HOME" "$CD_TARGET" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+home, cwd = Path(sys.argv[1]), Path(sys.argv[2])
+FAMILIES = ("opus", "sonnet", "haiku", "fable")
+
+
+def out(kind, text=""):
+    print(f"{kind}\t{text}")
+
+
+def _internal_error(exc_type, exc, tb):
+    # Any failure the code below did not foresee must still be said in the log.
+    out("WARN", f"model pin: internal error {exc_type.__name__}: {exc}; passing no --model")
+
+
+sys.excepthook = _internal_error
+
+
+try:
+    lineage = json.loads((home / ".engram" / "config.json").read_text(encoding="utf-8")).get("self_lineage")
+except (OSError, ValueError, AttributeError):
+    lineage = None
+parts = lineage.split(":") if isinstance(lineage, str) else []
+if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+    out("WARN", f"model pin: self_lineage is unset or has no provider:family form ({lineage!r}); starting as before, no --model passed")
+    sys.exit(0)
+provider, family = parts[0].strip().lower(), parts[1].strip().lower()
+if provider != "anthropic":
+    out("INFO", f"model pin: self_lineage provider is {provider!r}, not anthropic; passing no --model")
+    sys.exit(0)
+if family not in FAMILIES:
+    out("WARN", f"model pin: self_lineage family {family!r} is not one of {', '.join(FAMILIES)}; starting as before, no --model passed")
+    sys.exit(0)
+
+value = None
+for path in (home / ".claude" / "settings.json", cwd / ".claude" / "settings.json", cwd / ".claude" / "settings.local.json"):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except FileNotFoundError:
+        continue
+    except (OSError, ValueError):
+        out("WARN", f"model pin: cannot read settings file {path}; not guessing the merged model, passing no --model")
+        sys.exit(0)
+    if "model" in data and data["model"] not in (None, ""):
+        value = data["model"]
+
+if value is None:
+    out("FLAG", family)
+    sys.exit(0)
+norm = re.sub(r"\[[^\]]*\]$", "", str(value)).strip().lower()
+m = re.match(r"^(?:claude-)?(opus|sonnet|haiku|fable)(?![a-z])", norm)
+if not m:
+    out("WARN", f"model pin: settings model {value!r} names no known family; passing --model {family} from self_lineage")
+    out("FLAG", family)
+elif m.group(1) == family:
+    pass
+else:
+    out("WARN", f"model pin: settings model {value!r} ({m.group(1)}) disagrees with self_lineage 'anthropic:{family}'; passing --model {family}")
+    out("FLAG", family)
+PY
+)
+}
+
+model_flag=()
+if [[ "$platform" == "claude" ]]; then
+    _resolve_model_pin
+fi
+
 CHARGE_FILE="$(_resolve_charge "$platform")" || exit 1
 # A generated file is internal runtime state; preserve explicit user-owned
 # overrides untouched. agentctl consumes --charge-file synchronously, so it
@@ -153,11 +268,12 @@ if [[ ! -r "$CHARGE_FILE" || ! -s "$CHARGE_FILE" ]]; then
     exit 1
 fi
 
-echo "[$(date -Is)] [$AGENT_NAME] launching: agentctl session $AGENT_NAME ${session_aliases[*]} --as-self --cd $CD_TARGET --charge-file $CHARGE_FILE" >> "$LOG"
+echo "[$(date -Is)] [$AGENT_NAME] launching: agentctl session $AGENT_NAME ${session_aliases[*]} --as-self ${model_flag[*]:+${model_flag[*]} }--cd $CD_TARGET --charge-file $CHARGE_FILE" >> "$LOG"
 
 # stderr rides through tee into the log AND stays on the pane. stdout is left
 # alone — the platform CLI's interactive UI owns it.
 agentctl session "$AGENT_NAME" "${session_aliases[@]}" --as-self \
+    ${model_flag[@]+"${model_flag[@]}"} \
     --cd "$CD_TARGET" --charge-file "$CHARGE_FILE" \
     2> >(tee -a "$LOG" >&2)
 ec=$?
