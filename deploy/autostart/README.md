@@ -34,7 +34,7 @@ them** — that's the reason `tools/agentctl session` grew an `--as-self` mode
 ## Install (operator/sudo actions — HOST-OWNER-ONLY)
 
 Everything in this section requires root or an account with `sudo`. Run
-these from an `engram-alpha` checkout on the host that will run the agent
+these from an `engram` checkout (or `engram-alpha`, the accepted old folder name) on the host that will run the agent
 sessions.
 
 1. **Install the wrapper + boot-charge templates to a fixed, checkout-independent
@@ -75,7 +75,8 @@ sessions.
    Session cwd, resolved at launch time from `$HOME` (nothing is written at
    rename time): (1) the first line of `~/.engram/boot-cwd` if it names an
    existing directory wins, even if untrusted; (2) else the first existing
-   directory among `$HOME/engram-alpha`, `$HOME/umwelt`, `$HOME` that Claude
+   directory among `$HOME/engram`, `$HOME/engram-alpha` (the accepted old
+   name), `$HOME/umwelt`, `$HOME` that Claude
    Code has trusted (same read-only check as the preflight below); (3) else,
    if none is trusted, the first existing one in that order, plus the
    `ERROR:`. When trust cannot be verified (`CLAUDE_CONFIG_DIR` set, or no
@@ -84,7 +85,8 @@ sessions.
    one trailing `/` are stripped; relative paths are not resolved). Every
    launch prints one stderr line `boot cwd: <dir> (from <arm>)`, where
    `<arm>` says why: `boot-cwd`, `$HOME/umwelt, first trusted`, or
-   `$HOME/engram-alpha, none trusted`.
+   `$HOME/engram, none trusted` (`$HOME/engram-alpha, ...` on a seat still on
+   the old folder name).
 
    Trust preflight: Claude Code stalls on its "trust this folder?" dialog in a
    directory it has not seen (observed once, ~3 h, #4170). The launcher reads

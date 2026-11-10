@@ -71,6 +71,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
+from _hooklib import pick_checkout
 from _hooklib import atomic_write_json, atomic_write_text, resolve_runtime_dir, emit_context, _trim_to_line_boundary
 from _hooklib import _open_regular_fd
 from _hooklib import prune_shown_records
@@ -625,11 +626,7 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
     candidate = os.path.join(engram_home, "server.py")
     if os.path.exists(candidate):
         return candidate
-    for name in ("~/engram/server.py", "~/engram-alpha/server.py"):
-        cand = os.path.expanduser(name)
-        if os.path.exists(cand):
-            return cand
-    return os.path.expanduser("~/engram/server.py")
+    return pick_checkout("/server.py") or os.path.expanduser("~/engram/server.py")
 
 
 def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:

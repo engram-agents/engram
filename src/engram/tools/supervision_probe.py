@@ -313,11 +313,18 @@ def resolve_own_server_py_path(engram_home: Path) -> str:
     candidate = engram_home / "server.py"
     if candidate.exists():
         return str(candidate)
-    for name in ("~/engram/server.py", "~/engram-alpha/server.py"):  # default name, then accepted old name
-        cand = Path(name).expanduser()
-        if cand.exists():
-            return str(cand)
-    return str(Path("~/engram/server.py").expanduser())
+    # Single pick between the two accepted checkout names (C13): the one the cwd is inside, else engram first.
+    found = [Path(n).expanduser() for n in ("~/engram", "~/engram-alpha")
+             if (Path(n).expanduser() / "server.py").exists()]
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        cwd = None
+    for cand in found:
+        if cwd is not None and (str(cwd) == str(cand.resolve())
+                                or str(cwd).startswith(str(cand.resolve()).rstrip(os.sep) + os.sep)):
+            return str(cand / "server.py")
+    return str((found[0] if found else Path("~/engram").expanduser()) / "server.py")
 
 
 def resolve_daemon_script_path(engram_home: Path) -> str:

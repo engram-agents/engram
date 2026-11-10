@@ -49,7 +49,7 @@ the real LaunchDaemon, using the throwaway diagnostic in this directory
 — see that script's own header for the full context):
 
 ```bash
-sed -e "s|__CREDENTIAL_PROBE_SH__|$HOME/GitHub/engram-alpha/deploy/autostart/macos/credential-probe.sh|" \
+sed -e "s|__CREDENTIAL_PROBE_SH__|$HOME/GitHub/engram/deploy/autostart/macos/credential-probe.sh|" \
     -e "s|__CLIO_ACCOUNT__|$(whoami)|" \
     -e "s|__HOME__|$HOME|g" \
     deploy/autostart/macos/com.engram.clio-credential-probe.plist.template \
@@ -84,13 +84,13 @@ probe succeeded or failed.
    need real, absolute values:
 
    ```bash
-   sed -e "s|__CLIO_WAKE_LAUNCH_SH__|$HOME/GitHub/engram-alpha/deploy/autostart/macos/clio-wake-launch.sh|" \
+   sed -e "s|__CLIO_WAKE_LAUNCH_SH__|$HOME/GitHub/engram/deploy/autostart/macos/clio-wake-launch.sh|" \
        -e "s|__HOME__|$HOME|g" \
        deploy/autostart/macos/com.engram.clio-wake.plist.template \
        > ~/Library/LaunchAgents/com.engram.clio-wake.plist
    ```
 
-   This installs from `$HOME/GitHub/engram-alpha` — a live dev checkout, deliberately: a `git pull` that changes `wake-charge-clio.md` or either script changes what the next wake runs, the same way editing this seat's own CLAUDE.md takes effect on the next session without a separate install step. If that's ever undesirable, point the plist and this sed command at a pinned copy instead.
+   This installs from `$HOME/GitHub/engram` (use `$HOME/GitHub/engram-alpha` on a seat still on the old folder name) — a live dev checkout, deliberately: a `git pull` that changes `wake-charge-clio.md` or either script changes what the next wake runs, the same way editing this seat's own CLAUDE.md takes effect on the next session without a separate install step. If that's ever undesirable, point the plist and this sed command at a pinned copy instead.
 
 2. Make the scripts executable:
 

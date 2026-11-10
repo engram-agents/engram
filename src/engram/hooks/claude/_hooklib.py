@@ -145,6 +145,32 @@ def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
     return tools_dir
 
 
+def pick_checkout(suffix: str = ""):
+    """Single-pick choice between the two accepted checkout folder names (C13).
+
+    Candidates are ~/engram (the default name) then ~/engram-alpha (the accepted old name); a candidate
+    counts when `<candidate><suffix>` exists. If the process's own working folder is inside an existing
+    candidate (realpath equal or under it, so a linked worktree under ~/engram-alpha/.claude/worktrees/<id>
+    counts as inside ~/engram-alpha), that candidate wins; else the first existing one. Returns
+    `<candidate><suffix>`, or None when neither exists. Never raises.
+    """
+    found = []
+    for name in ("~/engram", "~/engram-alpha"):
+        cand = os.path.expanduser(name)
+        if os.path.exists(cand + suffix):
+            found.append(cand)
+    try:
+        cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        cwd = None
+    if cwd:
+        for cand in found:
+            real = os.path.realpath(cand)
+            if cwd == real or cwd.startswith(real.rstrip(os.sep) + os.sep):
+                return cand + suffix
+    return found[0] + suffix if found else None
+
+
 def resolve_runtime_dir(engram_home: str, sentinel: str) -> str:
     """Locate the directory containing `sentinel` for import.
 
@@ -217,11 +243,7 @@ def resolve_runtime_dir(engram_home: str, sentinel: str) -> str:
                 return str(candidate)
     except OSError:
         pass
-    for name in ("~/engram", "~/engram-alpha"):  # engram = default name, engram-alpha = accepted old name
-        cand = os.path.expanduser(name)
-        if os.path.isdir(cand):
-            return cand
-    return os.path.expanduser("~/engram")  # last-ditch
+    return pick_checkout() or os.path.expanduser("~/engram")  # last-ditch
 
 
 def import_owner_flags(engram_home: str):
@@ -315,11 +337,7 @@ def resolve_own_server_py_path(engram_home: str) -> str:
     candidate = os.path.join(engram_home, "server.py")
     if os.path.exists(candidate):
         return candidate
-    for name in ("~/engram/server.py", "~/engram-alpha/server.py"):
-        cand = os.path.expanduser(name)
-        if os.path.exists(cand):
-            return cand
-    return os.path.expanduser("~/engram/server.py")
+    return pick_checkout("/server.py") or os.path.expanduser("~/engram/server.py")
 
 
 def is_own_server_py_running(engram_home: str) -> bool:
