@@ -8,7 +8,7 @@ happen in one public repository on one history; see docs/VERSIONING.md. The
 file stays only because tests/test_docs_layout_guard.py imports its path
 matcher. It, its list (release-minus-set.txt) and its test go together in a
 later change, after the release procedure's next version
-(engram-agents/engram#16).
+(engram-agents/engram#4592).
 
 The original description follows.
 
