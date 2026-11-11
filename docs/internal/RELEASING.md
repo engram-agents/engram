@@ -104,8 +104,8 @@ goes into the release record (step 9) with the run's identifier.
 | G1 | The hosted full suite is green on the candidate: `gh workflow run tests.yml --repo engram-agents/engram --ref vX.Y.Z-rcN`, then confirm the run's `headSha` is the candidate commit before reading its result. | Release seat |
 | G2 | A whole-suite run on a fresh full clone checked out at the candidate tag, with the project's own interpreter, is green. The full output is kept. | Gate seat |
 | G3 | The skip-set comparison below shows no unexplained new skip. | Gate seat |
-| G4 | `name-leak-gate` and `pr-checks` are green on the candidate's last merged pull request, and the secret-scanning alert list has no open alert. | Release seat |
-| G5 | The security seat has read the changes since the previous release and states no objection, on the commit by its full id. | Security seat |
+| G4 | `name-leak-gate` is green on the candidate commit (it runs on the push to `dev`). `pr-checks` is green on the pull request whose merge produced the candidate, and that pull request's head tree equals the candidate's tree (`pr-checks` runs on pull requests only, so no run exists on the squash commit itself). The secret-scanning alert list has no open alert; this covers code and issue text, and it is a read at one moment: if scanning was enabled or the candidate was pushed within the hour, this part is "not run" until the list has settled. | Release seat |
+| G5 | The security seat reads the net change `vPREV..vCAND`, the diff plus the list of merge commits, and records on the candidate commit, by its full id, either "no objection" or an objection naming the change and the reason. The record states what was read and its bound: files reviewed against files changed. If the security seat could not make the read, the gate is not run; it is not an implied pass. | Security seat |
 | G6 | An install from a plain clone at the candidate tag into an empty home passes `install_selfcheck.py`; and an install over a copy of an existing home leaves every file of that home byte-identical or backed up. | Gate seat |
 | G7 | On macOS, the tests that skip on Linux pass on a seat that runs a real Mac, on the candidate commit. | A Mac seat |
 
@@ -192,9 +192,18 @@ git push origin "$C":refs/heads/main               # never with --force
 git ls-remote origin refs/heads/main               # must print C
 ```
 
-If the first line prints nothing, `main` holds a commit `dev` lacks. Stop and
-find out why; do not force. `main` is protected against deletion and against
-non-fast-forward pushes.
+If the fast-forward line prints nothing, `main` holds a commit `dev` lacks.
+Stop and find out why; do not force.
+
+Who may run this step: only an account in the repository's release team. Two
+rulesets protect `main`. One forbids deletion and non-fast-forward pushes for
+everyone, with no bypass. The other forbids any update of `main` except by the
+release team. What the second one buys is narrow, and it should not be read as
+more: another account can no longer publish unreleased code by moving `main`
+to a commit of `dev`. It does not protect against a release-team account that
+is itself compromised, and it does not protect `dev`. No ruleset can say
+"`main` only ever equals a release tag"; the fast-forward check above is what
+carries that, and the rulesets are the second layer.
 
 The push to `main` starts `tests.yml` on `main`. That run is a confirmation
 after the fact, not the gate; G1 was the gate.
