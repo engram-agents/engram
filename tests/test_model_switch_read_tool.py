@@ -748,6 +748,21 @@ def test_5b_unblinded_json_cannot_be_precreated_to_fake_a_result(drawn, kind):
     assert f.read_bytes() == before
 
 
+def test_5b_the_record_is_created_exclusively_so_a_racing_file_is_never_overwritten(drawn, monkeypatch, capsys):
+    # Two first runs can both pass the "no record yet" look; the create must then refuse for the loser.
+    # The look is blinded here so that only the exclusive create ('x') stands between the file and an overwrite.
+    a, _ = _two_label_files(drawn)
+    f = drawn["out"] / "unblinded.json"
+    f.write_text('{"raced": true}')
+    mod = _load_tool()
+    monkeypatch.setattr(mod.os.path, "lexists", lambda p: False)
+    rc = mod.main(["unblind", "--dir", str(drawn["out"]), "--labels", str(a)])
+    out = capsys.readouterr()
+    assert rc == 1, (rc, out.err)
+    assert out.out.strip() == ""
+    assert f.read_text() == '{"raced": true}'
+
+
 # ---------------------------------------------------------------------------
 # 6. failure is loud
 # ---------------------------------------------------------------------------
