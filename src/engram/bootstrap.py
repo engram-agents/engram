@@ -582,14 +582,27 @@ _SEED_PLACEHOLDERS = (
 # by tests/test_engram_file_guard_slice1.py, so the check-only pass can predict every render
 # without a seed manifest. If a run ever mints different IDs (a 0-node store that kept old
 # counters), the post-seeding pass judges the REAL renders and refuses what it cannot replace.
-_FIXED_SEED_IDS = {
-    "{{AX_HONESTY}}": "ax_0001",
-    "{{AX_HONESTY_DISCRETION}}": "ax_0002",
-    "{{AX_PROVENANCE}}": "ax_0003",
-    "{{DF_ENGRAM}}": "df_0001",
-    "{{DF_EPISTEMIC_IDENTITY}}": "df_0002",
-    "{{GL_EPISTEMIC_HUMILITY}}": "gl_0001",
-}
+_SEED_ORDER = (  # (placeholder, node-type prefix), in create_seed_graph's call order
+    ("{{AX_HONESTY}}", "ax"),
+    ("{{AX_HONESTY_DISCRETION}}", "ax"),
+    ("{{AX_PROVENANCE}}", "ax"),
+    ("{{DF_ENGRAM}}", "df"),
+    ("{{DF_EPISTEMIC_IDENTITY}}", "df"),
+    ("{{GL_EPISTEMIC_HUMILITY}}", "gl"),
+)
+
+
+def _seed_ids_on_empty_graph() -> dict[str, str]:
+    """The IDs a fresh graph mints: each type's counter starts at 1, in _SEED_ORDER."""
+    counts: dict[str, int] = {}
+    ids: dict[str, str] = {}
+    for placeholder, prefix in _SEED_ORDER:
+        counts[prefix] = counts.get(prefix, 0) + 1
+        ids[placeholder] = f"{prefix}_{counts[prefix]:04d}"
+    return ids
+
+
+_FIXED_SEED_IDS = _seed_ids_on_empty_graph()
 
 
 def _predicted_claude_render() -> str | None:
