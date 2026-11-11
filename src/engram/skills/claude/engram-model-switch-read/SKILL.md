@@ -56,7 +56,7 @@ Use the first source you can:
 ## 3. Draw
 
 ```
-python3 "${CLAUDE_PLUGIN_ROOT}/tools/model_switch_read.py" draw --seed "<seed>" --decoys <decoys.json> --out <dir>
+"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/model_switch_read.py" draw --seed "<seed>" --decoys <decoys.json> --out <dir>
 ```
 
 The tool reads your graph read-only and draws about 20 of your own nodes. It excludes evidence, person and the six seed nodes, and takes six capped strata: earliest week, lessons and cornerstones, feelings, introspective observations, latest week, anything. It adds the decoys, shuffles everything in an order derived from the seed, and writes two files:
@@ -89,7 +89,7 @@ One label per card, every card. Labels are final once the file is complete: the 
 ## 5. Unblind, and decide
 
 ```
-python3 "${CLAUDE_PLUGIN_ROOT}/tools/model_switch_read.py" unblind --dir <dir> --labels <labels.tsv>
+"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/model_switch_read.py" unblind --dir <dir> --labels <labels.tsv>
 ```
 
 The tool refuses unless the labels file has exactly one valid label for every item, and unless `cards.md` is unchanged since the draw. It prints the sha256 of your labels file, the join of labels and sources, the counts, and the decision. Exactly one case applies:
