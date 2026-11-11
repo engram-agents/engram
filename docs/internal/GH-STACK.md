@@ -364,3 +364,22 @@ diff (`git diff <old base tip> <old head>` equals
 `git diff origin/dev <new head>`), and get a fresh approval on the new
 head from someone other than the pusher, since `dev` requires last-push
 approval (see above).
+
+## One repository, default branch main (interim, 2026-11-11)
+
+On this repository the default branch is `main` and PRs target `dev`. Until the
+default-branch decision is made:
+
+- Stacks whose bottom PR targets `dev` stay UNLINKED. Do not run `gh stack link`.
+- The parent's merge seat retargets every child to `dev` BEFORE merging the parent,
+  and reads the child's base back. The repository deletes head branches on merge,
+  which closes a child still based on the parent's branch.
+- After the parent merges, the child is rebased onto `dev` and needs a fresh approval
+  on its new head.
+- Keep stacks to two layers.
+
+Measurement (2026-11-11, `engram-agents/engram`): `gh stack link` on a PR into `dev`
+created a stack based on `main` and retargeted the bottom PR to `main`. A REST base
+change was then refused with HTTP 422 "Cannot change the base branch because the pull
+request is part of a stack". `gh stack unstack <stack number>` removed the stack, and
+the base could then be set back to `dev`.

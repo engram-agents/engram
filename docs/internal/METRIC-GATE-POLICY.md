@@ -54,7 +54,7 @@ The estimates agree; the Welch interval is 1.8x to 2.8x wider (ratio of interval
 
 The library is its own repository, shared by every project that sets a gate: `engram-agents/metricgate`, at tag `v0.1.0`. It depends on numpy and scipy only. It provides `preregister` (validate the R1 fields and stamp the gate), `tost_mean`, `bootstrap_ci`, `rate_ci`, `power_n`, `aa_check`, `verdict`, `adjust_p`, `judge` (read a cell against its gate, counting runs from the records), `report` (the R12 table), and a `metricgate` command line. Its README and `src/metricgate/{core,gate,cli}.py` are the API.
 
-**Install it into a development venv, never into the plugin venv or the requirements.** engram-alpha's use of it is dev tier (T3): the engram-specific parts below never ship to a user install, and the library is an optional dependency of the development tools.
+**Install it into a development venv, never into the plugin venv or the requirements.** engram's use of it is dev tier (T3): the engram-specific parts below never ship to a user install, and the library is an optional dependency of the development tools.
 
 ```
 pip install "metricgate @ git+ssh://git@github.com/engram-agents/metricgate@v0.1.0"
@@ -62,7 +62,7 @@ pip install "metricgate @ git+ssh://git@github.com/engram-agents/metricgate@v0.1
 
 A seat without it still runs every tool: the tool prints one line naming this install line and leaves its other output unchanged.
 
-**engram-alpha's dev-tier parts**
+**engram's dev-tier parts**
 
 - `src/engram/tools/metricgate_adapter.py` (linked as `tools/metricgate_adapter.py`) is the ONE import site of the library: `have_metricgate`, `require_metricgate`, `append_run_record`, `judge_cell`. No other file imports `metricgate`.
 - `tools/engramd_a6_latency.py --emit-runs DIR` appends, after a completed run, two run records (one per path, one shared `run_id`) for the gate cell's sequential p50 to `DIR/a6-<hook>-<sqlite_version>-excl<on|off>-<baseline|owner>.jsonl`. `--gate tools/gates/a6-<hook>.json` (with `--emit-runs`) then prints the library's R12 report under the table, headed `metricgate verdict (R12)`. The tool's own `sequential p50 owner/baseline` ratio is a point ratio and not the gate.

@@ -106,11 +106,15 @@ form that fires the parser.
    the PR BODY only — a merge commit's own message is a THIRD close surface
    GitHub's parser reads independently, invisible to checks 1 and 2. **This
    repo's exposure is currently LOWER than umwelt's and soma's, and say so
-   precisely:** engram-alpha's `squash_merge_commit_message` is `BLANK`
+   precisely:** in the development repo as it was (engram-alpha, private, retired
+   2026-11-10), `squash_merge_commit_message` was `BLANK`
    (measured 2026-08-22 — three real recent squash merges carry no
    branch-commit content, only PR title + co-author lines; the setting
    re-read `BLANK` on 2026-09-03 and 2026-09-28), so branch commit messages
-   do NOT ride into the merge commit here today. The check stays anyway, as
+   did NOT ride into the merge commit there. **Current repo (engram, public):**
+   read 2026-11-11 as `squash_merge_commit_message` `BLANK` and
+   `squash_merge_commit_title` `PR_TITLE`; they were reset to these values after
+   the rebuild. The check stays anyway, as
    defense-in-depth against the three ways the exposure appears without any
    code change: a repo-settings flip to `COMMIT_MESSAGES` (silent, and
    exactly what makes **umwelt and soma** exposed — both read
@@ -140,3 +144,29 @@ form that fires the parser.
    one of "the setting changed since May" / "subject keywords don't fire" is
    true, and nobody has separated them. Measure on the next real
    `[closes #N]` merge before claiming either way.
+
+## Closing keywords do not close issues on a merge into `dev` (2026-11-11)
+
+On this repository the default branch is `main` and PRs merge into `dev`. Measured
+twice on 2026-11-11: a PR with the title `[closes #N]` and the body `Closes #N.`
+merged into `dev`, and the issue stayed open both times. The two cases, read off
+GitHub:
+
+- #4606 (body `Closes #4600.`, base `dev`) was squash-merged into `dev` as
+  `47e4c615` at 2026-11-11T14:49:33Z. Before the merge, `closingIssuesReferences`
+  was empty. Twenty seconds after it, #4600 was still open with only
+  `cross-referenced` and `referenced` events.
+- #4607 (body `Closes #4522.`, base `dev`) was squash-merged into `dev` as
+  `e0c09c74` at 15:16:52Z. #4522 got a `referenced` event at 15:16:54Z and was
+  still open until it was closed by hand at 15:17:10Z, 18 seconds after the
+  merge, with no commit on the close event.
+
+In both cases the merge seat closed the issue by hand, with a comment naming the
+PR and the merge commit.
+
+GitHub applies closing keywords only on a merge into the default branch, which
+matches what was observed. The team commander's ruling of the same day, standing
+rather than interim: the merge seat closes the issue by hand right after the
+press, naming the PR and the merge commit. Titles keep `[closes #N]` and bodies
+keep `Closes #N.` as readable intent. No closing workflow is built for now. If
+`dev` becomes the default branch, the keywords work again and the rule lapses.

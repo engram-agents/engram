@@ -15,7 +15,7 @@ the fix lands here first (see *Revision protocol*), then in the next lane post.
 
 ## Scope
 
-- **Applies to:** choosing which open issues in engram-alpha and umwelt become a
+- **Applies to:** choosing which open issues in engram and umwelt become a
   seat's lane, and in what order within a seat's queue.
 - **Does not decide:** who merges (see `PR-MERGE-POLICY.md`), who reviews (see
   `CLAUDE.md` → *PR review convention*), or whether an issue is real (that is
