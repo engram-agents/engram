@@ -38,7 +38,7 @@ Write these down first, in the observation you will file at the end: the seed, t
 **The candidates.** Own nodes only:
 - current nodes (`is_current = 1`, superseded nodes excluded);
 - never `evidence` or `person` nodes;
-- never the six seed nodes every install starts with. Those are the axioms, definitions and goal that bootstrap creates, `ax_0001`–`ax_0003`, `df_0001`, `df_0002` and `gl_0001` on a fresh install.
+- never the six seed nodes every install starts with: the three axioms, two definitions and one goal that bootstrap creates. Bootstrap creates them on an empty graph before any other node, so they are the oldest nodes of their types: list axioms, definitions and goals by `created_at`, and exclude the first three axioms, the first two definitions and the first goal.
 
 List each stratum with `engram_list` in structured mode, passing `"unlimited": true` (the default limit is 100 rows):
 
