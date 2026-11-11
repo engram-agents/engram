@@ -337,6 +337,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/model_switch_read.py",
+      "test_globs": [
+        "tests/test_model_switch_read_tool.py"
+      ],
+      "note": "#4616: the blinding tool for the model-switch read. The test runs it as a subprocess, so the layer-1 import graph cannot see the link."
+    },
+    {
       "path_prefix_or_glob": "tools/baton_gate.py",
       "test_globs": [
         "tests/test_baton_gate.py",
