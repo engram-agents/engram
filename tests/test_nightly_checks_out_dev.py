@@ -3,7 +3,9 @@
 The repository's default branch is main (the release branch). A scheduled
 workflow runs from the default branch's copy of the file, and a bare
 `actions/checkout` checks out that same commit, so the nightly would test the
-last release. Every job that checks out code to TEST it must say `ref: dev`.
+last release. So every `actions/checkout` step in nightly.yml, in every job,
+must carry `ref: dev`; the test below asserts exactly that and makes no
+distinction between checkouts that test code and any other.
 """
 
 from __future__ import annotations
