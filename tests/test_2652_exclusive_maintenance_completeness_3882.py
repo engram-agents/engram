@@ -48,7 +48,6 @@ OPENER_ATTRS = ("connect", "_get_db")
 # Tools whose live-store rows are still plain `direct` today, with the reason they are allowed to be.
 KNOWN_DIRECT = {
     "anchoring_report.py": "read-only report; its own unit moves it onto the owner path",
-    "model_switch_read.py": "one-shot read-only draw (mode=ro, never written) for the model-switch read (#4616); no owner path planned",
 }
 
 

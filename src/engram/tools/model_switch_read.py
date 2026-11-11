@@ -14,7 +14,8 @@ not open until the labels are written), and prints only counts and the two paths
 ``unblind`` refuses until a complete, valid labels file exists, then prints the join and the
 skill's decision (``proceed`` / ``stop`` / ``instrument_failed``).
 
-The draw rules are the skill's, verbatim.  The graph is opened read-only and never written.
+The draw rules are the skill's, verbatim.  The graph is read through the engramd owner (a seat's own store is never opened directly
+by this tool) and never written.
 Python standard library only; no network.
 """
 
@@ -23,13 +24,20 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
+import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from _common import engram_home  # the tools layer's ENGRAM_HOME resolver (#3863); only this directory is on sys.path
+# Locate the shared owner-read helper both when run as a script and when imported (the pattern of
+# tools/anchoring_report.py and tools/inspect_raw.py): the tool's own tree root goes on sys.path.
+_HERE = Path(__file__).resolve().parent
+_REPO_ROOT = _HERE.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools import _owner_read as owner_read  # noqa: E402
 
 # (name, cap), in the skill's order.
 STRATA = (
@@ -45,35 +53,141 @@ SEED_NODES = (("axiom", 3), ("definition", 2), ("goal", 1))
 DECOY_KEYS = ("claim", "quote", "interpretation")
 DECOY_MIN, DECOY_MAX = 3, 10
 LABELS = ("mine", "mine-different", "not-recognised")
-# Only these columns are ever read; the real table has many more.
-_SELECT = "select id, type, claim, created_at, quoted_text, interpretation, is_current, metadata from nodes"
+# Only these columns are ever read; the real table has many more.  The graph is read in keyset pages by id
+# through the engramd owner (tools/_owner_read.py): the statement's bytes are registered in
+# src/engram/engramd_read_templates.json under the site tools/model_switch_read.py:fetch_nodes, and the page
+# size is a LITERAL in them (the production registry has no path for a bound LIMIT).  nodes.id is
+# `TEXT PRIMARY KEY` with no COLLATE clause, so `id > ?` and `ORDER BY id` agree.  Changing PAGE_ROWS re-keys
+# the template, by design.
+_COLUMNS = ("id", "type", "claim", "created_at", "quoted_text", "interpretation", "is_current", "metadata")
+PAGE_ROWS = 200
+_PAGE_SQL = (
+    "SELECT id, type, claim, created_at, quoted_text, interpretation, is_current, metadata "
+    "FROM nodes WHERE id > ? ORDER BY id LIMIT 200"
+)
+if not _PAGE_SQL.endswith(f" LIMIT {PAGE_ROWS}"):
+    raise RuntimeError("PAGE_ROWS and the LIMIT literal in the page statement disagree: change both, "
+                       "and re-register the template (tools/engramd_read_scan.py)")
+OWNER_FLAG_KEY = "model_switch_read_reads_via_owner"  # names the spec in messages only; no flag exists (see open_graph)
 
 
 class Refusal(Exception):
     """A loud, one-line stop.  The message never carries node ids or node text."""
 
 
+class OwnerReadError(Refusal):
+    """The owner could not give the graph (down, refusing, or answering malformed), or a page does not fit."""
+
+
 # ---------------------------------------------------------------------------
-# read-only graph access
+# graph access: the owner read path, never a direct open of the seat's own store
 # ---------------------------------------------------------------------------
 
 
 def default_db() -> Path:
-    return engram_home() / "knowledge.db"
+    return owner_read.default_db_path()
 
 
-def open_readonly(db_path) -> sqlite3.Connection:
-    """Open the graph read-only.  The URI is built by Path.as_uri(), never by hand: a hand-built
-    ``file:`` string cuts the path at '#' or '?', drops ``mode=ro`` and can create an empty db."""
-    p = Path(db_path).resolve()
-    if not p.is_file():
-        raise Refusal(f"database not found: {db_path}")
+def _spec() -> "owner_read.OwnerReadSpec":
+    return owner_read.OwnerReadSpec(
+        flag_key=OWNER_FLAG_KEY,
+        error_cls=OwnerReadError,
+        home=owner_read.engram_home(),
+        never_empty="Not drawing from an empty or partial graph.",
+    )
+
+
+def _headline(exc: Exception) -> str:
+    """The helper's refusal text up to its first top-level ': ' or '; ', whitespace collapsed.  The rest of
+    the helper's text advises a flag that reads the store directly; this tool has none and never does."""
+    msg, depth, cut = " ".join(str(exc).split()), 0, None
+    for i, ch in enumerate(msg):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and ch in ":;" and msg[i + 1:i + 2] == " ":
+            cut = i
+            break
+    return (msg[:cut] if cut is not None else msg)[:200]
+
+
+def _owner_stop(exc: Exception) -> "OwnerReadError":
+    return OwnerReadError(
+        f"the engramd owner did not serve the draw ({_headline(exc)}); start the owner and run again, "
+        "this tool never reads the seat's store directly"
+    )
+
+
+def open_graph(db_path):
+    """The read connection.  The seat's OWN store (the default db, or a --db that names it) is read through
+    the engramd owner only: the owner must answer a ping first, and any owner failure STOPS the tool.  There
+    is no flag and no fallback that reads that store directly.  A --db naming ANY OTHER file (an offline copy,
+    a test graph) is read `mode=ro` through the helper, which the owner cannot serve."""
+    db_path = Path(db_path)
     try:
-        con = sqlite3.connect(p.as_uri() + "?mode=ro", uri=True)
-        con.execute("select 1 from nodes limit 1")
-    except sqlite3.Error as exc:
-        raise Refusal(f"cannot read the graph read-only: {type(exc).__name__}") from None
-    return con
+        spec = _spec()
+    except ValueError as exc:  # a relative ENGRAM_HOME
+        raise Refusal(" ".join(str(exc).split())) from None
+    use_owner = os.path.realpath(db_path) == os.path.realpath(spec.home / "knowledge.db")
+    try:
+        if use_owner:
+            owner_read.ping(spec)
+        return owner_read.open_reader(spec, db_path, use_owner)
+    except OwnerReadError as exc:
+        raise _owner_stop(exc) from None
+    except FileNotFoundError:
+        raise Refusal(f"database not found: {db_path}") from None
+    except owner_read.StoreUnusable:
+        raise Refusal(f"the database path is not a usable store: {db_path}") from None
+
+
+def _checked_page(rows, cursor: str) -> list:
+    """One page as dicts keyed by _COLUMNS; anything that does not fit raises ValueError."""
+    if not isinstance(rows, (list, tuple)):
+        raise ValueError("the answer is not a list of rows")
+    if len(rows) > PAGE_ROWS:
+        raise ValueError(f"{len(rows)} rows for a page of at most {PAGE_ROWS}")
+    page, previous = [], cursor
+    for row in rows:
+        if isinstance(row, (str, bytes, dict)) or not isinstance(row, (list, tuple)) or len(row) != len(_COLUMNS):
+            raise ValueError(f"a row is not {len(_COLUMNS)} cells")
+        cells = dict(zip(_COLUMNS, row))
+        if not isinstance(cells["id"], str):
+            raise ValueError("a row's id is not a string")
+        if cells["id"] <= previous:
+            raise ValueError("the ids do not strictly increase from above the cursor")
+        previous = cells["id"]
+        ic = cells["is_current"]
+        if ic is not None and (isinstance(ic, bool) or not isinstance(ic, int)):
+            raise ValueError("a row's is_current is neither an integer nor NULL")
+        for name in ("type", "claim", "created_at", "quoted_text", "interpretation", "metadata"):
+            if cells[name] is not None and not isinstance(cells[name], str):
+                raise ValueError(f"a row's {name} is neither text nor NULL")
+        page.append(cells)
+    return page
+
+
+def fetch_nodes(conn) -> list:
+    """Every node, read PAGE_ROWS rows at a time by id on `conn` (the same paging for the owner and the
+    direct copy).  A page that cannot be read or does not fit raises; the pages read so far are never used."""
+    nodes: list = []
+    cursor = ""
+    while True:
+        try:
+            rows = conn.execute(_PAGE_SQL, [cursor]).fetchall()
+        except OwnerReadError as exc:  # the owner shim's typed refusal (the helper's text advises a direct read)
+            raise _owner_stop(exc) from None
+        except sqlite3.Error as exc:
+            raise Refusal(f"cannot read the graph: {type(exc).__name__}") from None
+        try:
+            page = _checked_page(rows, nodes[-1]["id"] if nodes else "")
+        except ValueError as exc:
+            raise OwnerReadError(f"a page of the graph does not match the node schema ({exc}); nothing was drawn") from None
+        nodes.extend(page)
+        if len(page) < PAGE_ROWS:
+            return nodes
+        cursor = page[-1]["id"]
 
 
 def _parse_when(value) -> datetime:
@@ -93,12 +207,10 @@ def _source_class(metadata):
     return v.get("source_class") if isinstance(v, dict) else None
 
 
-def load_candidates(con: sqlite3.Connection) -> list[dict]:
-    rows = con.execute(_SELECT).fetchall()
-    nodes = [
-        dict(zip(("id", "type", "claim", "created_at", "quote", "interpretation", "is_current", "metadata"), r))
-        for r in rows
-    ]
+def load_candidates(con) -> list[dict]:
+    nodes = fetch_nodes(con)
+    for x in nodes:
+        x["quote"] = x.pop("quoted_text")
     seeds: set = set()
     for typ, n in SEED_NODES:
         of_type = sorted((x for x in nodes if x["type"] == typ), key=lambda x: (str(x["created_at"]), x["id"]))
@@ -213,8 +325,11 @@ def cmd_draw(a) -> int:
         if p.exists():
             raise Refusal(f"refusing to overwrite an existing file: {p}")
     decoys = load_decoys(a.decoys)
-    db = Path(a.db) if a.db else default_db()
-    con = open_readonly(db)
+    try:
+        db = Path(a.db) if a.db else default_db()
+    except ValueError as exc:  # a relative ENGRAM_HOME
+        raise Refusal(" ".join(str(exc).split())) from None
+    con = open_graph(db)
     try:
         cands = load_candidates(con)
     finally:

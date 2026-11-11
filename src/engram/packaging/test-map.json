@@ -339,9 +339,10 @@
     {
       "path_prefix_or_glob": "tools/model_switch_read.py",
       "test_globs": [
+        "tests/test_model_switch_read_owner_4616.py",
         "tests/test_model_switch_read_tool.py"
       ],
-      "note": "#4616: the blinding tool for the model-switch read. The test runs it as a subprocess, so the layer-1 import graph cannot see the link."
+      "note": "#4616: the blinding tool for the model-switch read. The tests run it as a subprocess, so the layer-1 import graph cannot see the link; it reads the graph through tools/_owner_read.py (the owner for the seat's own store), so its registered read template also ties it to tests/test_engramd_read_scan.py."
     },
     {
       "path_prefix_or_glob": "tools/baton_gate.py",

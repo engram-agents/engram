@@ -24,6 +24,9 @@ from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _fake_owner import FakeOwner  # noqa: E402
+
 TOOL = Path(
     os.environ.get("MODEL_SWITCH_READ_TOOL")
     or Path(__file__).parent.parent / "src" / "engram" / "tools" / "model_switch_read.py"
@@ -239,7 +242,7 @@ def drawn(world):
 def _load_tool():
     spec = importlib.util.spec_from_file_location("model_switch_read_under_test", TOOL)
     mod = importlib.util.module_from_spec(spec)
-    # run as the CLI runs: only the tool's own directory on sys.path (it imports `_common` flat)
+    # run as the CLI runs: only the tool's own directory on sys.path (the tool puts its tree root there itself)
     sys.path.insert(0, str(Path(TOOL).parent))
     try:
         spec.loader.exec_module(mod)
@@ -263,7 +266,7 @@ def test_1_db_bytes_and_mtime_unchanged_by_draw_and_unblind(world):
 
 def test_1_connection_is_read_only(world):
     mod = _load_tool()
-    con = mod.open_readonly(world["db"])
+    con = mod.open_graph(world["db"])  # a --db that is not the seat's own store: the helper's mode=ro open
     with pytest.raises(sqlite3.OperationalError):
         con.execute("insert into nodes (id, type, claim) values ('x','observation','y')")
     with pytest.raises(sqlite3.OperationalError):
@@ -283,12 +286,15 @@ def test_1_path_with_uri_metacharacters_is_not_mangled(tmp_path):
 
 
 def test_1_default_db_is_engram_home_and_nothing_else_is_written_there(tmp_path):
+    # The default db is the seat's own store, which is read through the owner only (#4616 ruling): a fake owner
+    # serves it here.  The only thing the owner's socket adds to the home is its run/ directory.
     home = tmp_path / "home"
     make_fixture(home)
     decoys = make_decoys(tmp_path / "decoys.json")
-    r = run("draw", "--seed", "s", "--decoys", decoys, "--out", tmp_path / "out", env={"ENGRAM_HOME": str(home)})
+    with FakeOwner(home):
+        r = run("draw", "--seed", "s", "--decoys", decoys, "--out", tmp_path / "out", env={"ENGRAM_HOME": str(home)})
     assert r.returncode == 0, r.stderr
-    assert sorted(p.name for p in home.iterdir()) == ["knowledge.db"]
+    assert sorted(p.name for p in home.iterdir()) == ["knowledge.db", "run"]
 
 
 # ---------------------------------------------------------------------------
