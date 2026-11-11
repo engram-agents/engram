@@ -705,3 +705,30 @@ def test_home_prefix_is_case_sensitive_but_users_is_not(tmp_path):
     subprocess.run(["git", "commit", "-q", "-m", "users"], cwd=tmp_path, check=True)
     r = _run_scan(tmp_path)
     assert r.returncode == 1 and "b.md:1" in r.stderr
+
+
+def test_allowed_home_segment_set_is_pinned():
+    """The allowed set is the one hole in a default-deny check, so it is pinned.
+
+    Any addition turns this red, including a real person's or seat's folder name.
+    """
+    expected = {
+        # fictional placeholders
+        "someone", "someone01", "user", "you", "x", "alice", "bob", "test",
+        "testuser", "example-user", "dev", "agent", "g", "zzz", "other", "seat",
+        "PLACEHOLDER_USER", "agent-alice", "agent-bob", "agent-chosenone",
+        # seat-home convention prefixes before a glob or placeholder
+        "agent-", "agent-NAME", "agent-newborn-", "agent-newborn-XXX",
+        # system and shared directories
+        "Shared", "agents-shared",
+    }
+    actual = set(_mod.ALLOWED_HOME_SEGMENTS)
+    assert actual == expected, (
+        "The allowed home-path segment set changed "
+        f"(added: {sorted(actual - expected)}, removed: {sorted(expected - actual)}). "
+        "Adding an entry needs a security-seat read, and a real person's or seat's "
+        "folder name must never be added; the PR adding it must say why."
+    )
+    assert all(isinstance(why, str) and why.strip() for why in _mod.ALLOWED_HOME_SEGMENTS.values()), (
+        "every allowed home-path segment needs a non-empty reason"
+    )
