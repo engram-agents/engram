@@ -517,24 +517,30 @@ fi
 # Only runs in the non-skip-build path: --skip-build callers managed their own
 # flags and their choices are not visible here.
 if [[ $SKIP_BUILD -eq 0 ]] && [[ -n "${_cfg:-}" ]] && [[ -f "${_cfg}" ]] && command -v python3 &>/dev/null; then
-  python3 - "${_cfg}" "${_tier:-}" <<'PY'
-import json, sys
-path, tier = sys.argv[1], sys.argv[2]
-try:
-    with open(path) as f:
-        d = json.load(f)
-except (OSError, json.JSONDecodeError):
+  # The write goes through the one file guard of this checkout (MERGE class: install_tier is the
+  # one key written, every other key keeps its value and order, a changed file is backed up
+  # first, an unchanged one is not touched, a file that does not parse is refused and left as is).
+  # A refusal is a warning here, not a failure: the tier is only remembered for the next upgrade.
+  if ! python3 - "${_cfg}" "${_tier:-}" "$REPO_ROOT/src/engram" <<'PY'
+import sys
+path, tier, guard_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+if not tier:
     sys.exit(0)
-changed = False
-if tier and d.get('install_tier') != tier:
-    d['install_tier'] = tier
-    changed = True
-if changed:
-    with open(path, 'w') as f:
-        json.dump(d, f, indent=2)
-        f.write('\n')
-    print(f"[install-local-marketplace] config.json updated: install_tier={tier or 'unset'}")
+sys.dont_write_bytecode = True
+sys.path.insert(0, guard_dir)
+import engram_file_guard as fg
+from pathlib import Path
+try:
+    result = fg.apply_merge(Path(path), {'install_tier': tier}, filename='config.json')
+except (fg.MergeRefused, OSError, SystemExit) as exc:
+    print(f"[install-local-marketplace] config.json left unchanged: {exc}", file=sys.stderr)
+    sys.exit(1)
+if result != 'unchanged':
+    print(f"[install-local-marketplace] config.json updated: install_tier={tier}")
 PY
+  then
+    log "WARNING: install_tier was not saved to ${_cfg} (see the line above); the file was left as it is, so pass --tier again on the next upgrade."
+  fi
 fi
 
 # ── Tier-aware venv provisioning (Lei 2026-08-10, #576/#578) ──────────────────
@@ -942,23 +948,39 @@ PY
   if compgen -G "$MARKETPLACE_ROOT/plugins/engram/agents/*.toml" > /dev/null; then
     log "Installing Codex custom-agent TOML files -> $CODEX_AGENTS_DIR"
     mkdir -p "$CODEX_AGENTS_DIR"
-    cp -a "$MARKETPLACE_ROOT/plugins/engram/agents/"*.toml "$CODEX_AGENTS_DIR/"
 
     # Codex custom agents are config layers.  Plugin MCP tool allow/deny policy
     # must target the plugin-provided server namespace, not top-level
-    # [mcp_servers.*] transport tables.  Rewrite older built TOMLs defensively.
-    python3 - "$CODEX_AGENTS_DIR" <<'PY'
-import pathlib
+    # [mcp_servers.*] transport tables.  The text is rewritten for that BEFORE it
+    # is written, then written through the one file guard of this checkout: a
+    # file that is already there and differs from what would be written may hold
+    # the user's edits, so it is saved to a time-stamped backup first, and each
+    # backup is printed as "backup: <file> -> <backup>". These are ENGRAM's own
+    # file names, so no question is asked (one per upgrade would train a reflex yes).
+    if ! python3 - "$MARKETPLACE_ROOT/plugins/engram/agents" "$CODEX_AGENTS_DIR" "$REPO_ROOT/src/engram" <<'PY'
 import sys
-agents_dir = pathlib.Path(sys.argv[1])
-for path in agents_dir.glob("engram-*.toml"):
-    text = path.read_text(encoding="utf-8")
-    text = text.replace(
-        "[mcp_servers.engram]",
-        "[plugins.\"engram@engram-local\".mcp_servers.engram]",
-    )
-    path.write_text(text, encoding="utf-8")
+from pathlib import Path
+src_dir, dest_dir, guard_dir = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+sys.dont_write_bytecode = True
+sys.path.insert(0, guard_dir)
+import engram_file_guard as fg
+OLD = "[mcp_servers.engram]"
+NEW = "[plugins.\"engram@engram-local\".mcp_servers.engram]"
+items = []
+for src in sorted(src_dir.glob("*.toml")):
+    text = src.read_text(encoding="utf-8")
+    if src.name.startswith("engram-"):
+        text = text.replace(OLD, NEW)
+    items.append(fg.Item(dest_dir / src.name, text))
+try:
+    fg.apply(fg.plan(items), fg.Consent(all_paths=True))
+except (fg.Refused, SystemExit) as exc:
+    print(f"[install-local-marketplace] Codex agent files NOT installed: {exc}", file=sys.stderr)
+    sys.exit(1)
 PY
+    then
+      log "WARN: the Codex custom-agent files were not all installed (see the message above); nothing was overwritten without a backup."
+    fi
   else
     log "WARN: no Codex custom-agent TOML files found in $MARKETPLACE_ROOT/plugins/engram/agents"
   fi

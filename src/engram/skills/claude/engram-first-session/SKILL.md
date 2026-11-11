@@ -538,10 +538,10 @@ fi
 Show the tool's own output to the user verbatim. Then by exit status:
 
 - **0** — written, or already that value. Done.
-- **3** — a DIFFERENT `forum.url` is already set. Tell the user what is set. Do not pass `--force` unless the user says so explicitly (they have to ask to overwrite it); without that, leave it as it is and continue. (To overwrite when they do ask, see the force fence below.)
+- **3** — a DIFFERENT `forum.url` is already set. Tell the user what is set. Do not pass `--force` unless the user says so explicitly (they have to ask to overwrite it); without that, leave it as it is and continue. If they do ask, first show the user the old url, the new url and where the old file is saved (`config.json.engram-backup.<UTC time>`, beside it), and pass `--force` only on their yes (see the force fence below).
 - **2** — refused (a bad URL, or a missing or unreadable config). Show the reason; the config is untouched. Continue first-session: a refused forum URL never blocks identity formation. If the user wants to retry with a corrected URL, run the block again.
 
-**Overwriting (exit 3 only).** ONLY after the user has explicitly asked to overwrite the different `forum.url`, write the answer file again (the block consumed it), then paste this fence right before the block and run both together in one Bash call. The block adds `--force` to the tool call only when `FORUM_FORCE` is exactly `1`. Never insert it on your own initiative.
+**Overwriting (exit 3 only).** ONLY after the user has explicitly asked to overwrite the different `forum.url`, and after you have shown the user the old url, the new url and the backup the old file gets (`config.json.engram-backup.<UTC time>`) and they said yes, write the answer file again (the block consumed it), then paste this fence right before the block and run both together in one Bash call. The block adds `--force` to the tool call only when `FORUM_FORCE` is exactly `1`. Never insert it on your own initiative.
 
 ```bash
 # forum-url-force

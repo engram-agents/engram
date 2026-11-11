@@ -502,6 +502,141 @@ def test_install_local_marketplace_installs_codex_agent_toml(tmp_path):
     assert '[mcp_servers.engram]' not in installed_text
 
 
+_AGENT_NAME = "engram-probe-fairy.toml"
+_AGENT_WRITTEN = (
+    'name = "engram-probe-fairy"\n'
+    'description = "Probe"\n'
+    'developer_instructions = "Probe"\n'
+    '[plugins."engram@engram-local".mcp_servers.engram]\n'
+    'enabled_tools = ["engram_query"]\n'
+)
+
+
+def _run_codex_agent_install(tmp_path, existing=None):
+    """Run the real installer for the codex target against a fake plugin that ships one agent file.
+    `existing` is a callable(agents_dir) that plants whatever sits in $CODEX_HOME/agents beforehand."""
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="codex", codex_agent=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    codex = fake_bin / "codex"
+    codex.write_text("#!/usr/bin/env bash\nprintf 'fake codex %s\\n' \"$*\"\n")
+    codex.chmod(0o755)
+    codex_home = tmp_path / "codex-home"
+    agents_dir = codex_home / "agents"
+    agents_dir.mkdir(parents=True)
+    if existing is not None:
+        existing(agents_dir)
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root, CODEX_HOME=codex_home,
+                 PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}"),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+    )
+    return result, agents_dir
+
+
+def _agent_backups(agents_dir):
+    return sorted(p for p in agents_dir.iterdir() if ".engram-backup." in p.name)
+
+
+def test_codex_agent_file_that_differs_is_backed_up_and_the_backup_is_printed(tmp_path):
+    """An existing engram-*.toml that differs from what would be written may hold the user's edits:
+    it is saved to a stamped backup before it is replaced, and ONE printed line names the file and
+    its backup. No question is asked (these are ENGRAM's own file names)."""
+    mine = b'name = "engram-probe-fairy"\ndescription = "edited by the user, keep me"\n'
+    result, agents = _run_codex_agent_install(tmp_path, lambda d: (d / _AGENT_NAME).write_bytes(mine))
+    backups = _agent_backups(agents)
+    assert len(backups) == 1 and backups[0].read_bytes() == mine, "the user's bytes were not kept in a backup"
+    assert (agents / _AGENT_NAME).read_text() == _AGENT_WRITTEN
+    lines = [ln for ln in result.stdout.splitlines() if "backup:" in ln and _AGENT_NAME in ln]
+    assert len(lines) == 1, "expected exactly one printed backup line for the file:\n" + result.stdout
+    assert str(agents / _AGENT_NAME) in lines[0] and str(backups[0]) in lines[0], lines[0]
+    # control: the line filter above does find a backup line when one is planted in the same shape
+    planted = f"  backup: {agents / _AGENT_NAME} -> {backups[0]}"
+    assert [ln for ln in [planted] if "backup:" in ln and _AGENT_NAME in ln] == [planted]
+
+
+def test_codex_agent_file_that_is_new_or_identical_gets_no_backup(tmp_path):
+    result, agents = _run_codex_agent_install(tmp_path)  # absent: written
+    assert (agents / _AGENT_NAME).read_text() == _AGENT_WRITTEN
+    assert _agent_backups(agents) == [] and "backup:" not in result.stdout
+
+def test_codex_agent_file_identical_to_what_would_be_written_is_not_touched(tmp_path):
+    planted = {}
+
+    def plant(d):
+        (d / _AGENT_NAME).write_text(_AGENT_WRITTEN)
+        planted["mtime"] = (d / _AGENT_NAME).stat().st_mtime_ns
+
+    result, agents = _run_codex_agent_install(tmp_path, plant)
+    assert _agent_backups(agents) == [] and "backup:" not in result.stdout
+    assert (agents / _AGENT_NAME).stat().st_mtime_ns == planted["mtime"], "an identical file was rewritten"
+
+
+def test_codex_agent_name_that_is_not_a_file_is_left_alone_with_a_warning(tmp_path):
+    result, agents = _run_codex_agent_install(tmp_path, lambda d: (d / _AGENT_NAME).mkdir())
+    assert (agents / _AGENT_NAME).is_dir() and not list((agents / _AGENT_NAME).iterdir())
+    assert "WARN" in result.stdout and "not all installed" in result.stdout
+    assert _agent_backups(agents) == []
+
+
+def _persist_tier_block():
+    """The python code of install-local-marketplace.sh's install_tier persist block."""
+    text = INSTALLER.read_text()
+    blocks = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "<<'PY'" in line:
+            body = []
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip() == "PY":
+                    break
+                body.append(lines[j])
+            code = "\n".join(body)
+            if "install_tier" in code and "apply_merge" in code:
+                blocks.append(code)
+    assert len(blocks) == 1, "the install_tier persist block moved or vanished"
+    return blocks[0]
+
+
+def _run_persist(tmp_path, content, tier):
+    cfg = tmp_path / "config.json"
+    cfg.write_bytes(content)
+    proc = subprocess.run(
+        [sys.executable, "-c", _persist_tier_block(), str(cfg), tier, str(REPO_ROOT / "src" / "engram")],
+        capture_output=True, text=True,
+    )
+    return proc, cfg
+
+
+def test_persisted_install_tier_is_merged_with_a_stamped_backup_first(tmp_path):
+    old = json.dumps({"z": 1, "install_tier": "dev", "a": {"k": [1, 2]}}, indent=2).encode() + b"\n"
+    proc, cfg = _run_persist(tmp_path, old, "convenience")
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(cfg.read_text())
+    assert data["install_tier"] == "convenience" and data["a"] == {"k": [1, 2]} and list(data) == ["z", "install_tier", "a"]
+    backups = [p for p in tmp_path.iterdir() if ".engram-backup." in p.name]
+    assert len(backups) == 1 and backups[0].read_bytes() == old
+
+
+def test_persisted_install_tier_that_is_already_stored_writes_and_backs_up_nothing(tmp_path):
+    old = b'{"install_tier":   "dev",  "note": "odd spacing is kept"}'
+    proc, cfg = _run_persist(tmp_path, old, "dev")
+    assert proc.returncode == 0, proc.stderr
+    assert cfg.read_bytes() == old
+    assert [p.name for p in tmp_path.iterdir()] == ["config.json"]
+
+
+@pytest.mark.parametrize("content", [b"{not json", b'{"install_tier": "dev", "install_tier": "essential"}', b"[1]"])
+def test_persisted_install_tier_never_repairs_a_config_it_cannot_merge(tmp_path, content):
+    proc, cfg = _run_persist(tmp_path, content, "convenience")
+    assert proc.returncode != 0 and "left unchanged" in proc.stderr
+    assert cfg.read_bytes() == content
+    assert [p.name for p in tmp_path.iterdir()] == ["config.json"]
+
+
 def test_install_local_marketplace_preserves_prior_codex_cache_across_dev_upgrades(tmp_path):
     """Keep each active cache path alive even when Codex removes its cache root."""
     build_root = tmp_path / "build" / "plugin"

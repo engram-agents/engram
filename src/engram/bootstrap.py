@@ -921,7 +921,7 @@ def main() -> None:
     pre_plan = fg.plan(_write_items(
         dict(_FIXED_SEED_IDS), _build_substitutions(dict(_FIXED_SEED_IDS), quiet=True),
         marker_payload, predicted_claude, predicted_agents,
-    ))
+    ), home=ENGRAM_HOME)
     pre_refusal = fg.refusal(pre_plan, consent)
     if pre_refusal is not None:
         raise SystemExit(pre_refusal)
@@ -1110,7 +1110,7 @@ def main() -> None:
     )
     try:
         written = fg.apply(
-            fg.plan(final_items), consent,
+            fg.plan(final_items, home=ENGRAM_HOME), consent,
             context=(
                 f"{db_path} was already seeded just before this second check ran. "
                 f"To retry, move it aside, then re-run with the same flags:\n"

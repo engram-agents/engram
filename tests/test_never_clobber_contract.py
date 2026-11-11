@@ -54,20 +54,32 @@ MERGE class (a JSON file where ENGRAM owns a few keys and the user owns everythi
   M4. A stamped backup is taken before a merge that changes the file. A merge that leaves the
       file byte-identical writes nothing and backs up nothing.
   The three config.json writers (install.sh step 3, install-local-marketplace.sh's python block,
-  set_forum_url.py) are still their own writers; the static gate lists them as "slice 2: MERGE
-  backup".
+  set_forum_url.py) write through engram_file_guard.apply_merge; none of them keeps a write of its
+  own, and the static gate has no entry for them.
+  The Codex custom-agent files (engram-*.toml) are written through the guard too: a copy that
+  differs from what would be written is saved to a stamped backup first, with one printed line
+  per file naming the file and its backup. They are ENGRAM's own names, so no question is asked.
+  C10. An ENGRAM-owned bookkeeping name (first-run-pending, seed-manifest.json) is rewritten
+      without consent only when it sits directly in the ENGRAM home being set up; the same name
+      anywhere else is protected like any other file.
+  C11. Uninstall restores `<name>.pre-engram` only when it is a different file from `<name>`;
+      when both names are one file it leaves both and says why.
 
 Two MECHANICAL gates, so a write site added later is caught without anyone remembering:
   * test_differential_gate_no_consent builds its fixture FROM WHAT THE CODE WRITES: it runs
     bootstrap into a fresh home, records every regular file that run created, and plants a
     unique sentinel at each of those paths in a second home. A future write site shows up in the
     first run, so it is covered automatically.
-  * test_static_write_sites_are_reviewed parses bootstrap.py, install.sh (the shell AND the
-    Python heredoc blocks PY_* inside it) and set_forum_url.py, and lists every call that can
-    overwrite, truncate, rename or delete a file. Each must sit inside a reviewed allowlist entry
-    (with a one-line reason) or the test fails and names it. An entry covers ONE occurrence: a
-    second identical call in the same function is a new site.
-A heuristic third gate, test_docs_never_tell_a_bare_delete, scans the agent-facing docs.
+  * test_static_write_sites_are_reviewed parses bootstrap.py, install.sh and
+    install-local-marketplace.sh (the shell AND the Python heredoc blocks inside them) and
+    set_forum_url.py, and lists every call that can overwrite, truncate, rename or delete a file.
+    Each must sit inside a reviewed allowlist entry (with a one-line reason that says why it
+    stays) or the test fails and names it. An entry covers ONE occurrence: a second identical call
+    in the same function is a new site.
+A heuristic third gate, test_docs_never_tell_a_bare_delete, scans the agent-facing docs. A
+fourth, test_flag_instructions_are_paired_with_show_the_user_and_their_yes, requires that every
+instruction to pass --yes, --force or --replace over an existing file has the "show the user ...
+their yes" sentence in the same paragraph.
 
 All runs use tmp homes through env; the real ~/.claude, ~/.codex and ~/.engram are never read or
 written. Every "this content is gone / kept" assertion uses a unique SENTINEL string, and every
@@ -97,7 +109,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_bootstrap_no_clobber_4440 import (  # noqa: E402
-    REPO_ROOT, RUNTIME_FILES, SRC, _db, _home, _run,
+    REPO_ROOT, RUNTIME_FILES, SRC, _db, _home, _run, _run_uninstall,
 )
 from test_install_sh_4097 import Sandbox  # noqa: E402
 
@@ -686,21 +698,16 @@ def _assert_python_scanner_controls() -> None:
 
 
 _PROTECTED_VAR_RE = re.compile(
-    r"\$\{?(?:CLAUDE_MD_BACKUP|CLAUDE_MD|DB_PATH|CONFIG_PATH)(?![A-Za-z0-9_])"
+    r"\$\{?(?:CLAUDE_MD_BACKUP|CLAUDE_MD|DB_PATH|CONFIG_PATH|CODEX_AGENTS_DIR)(?![A-Za-z0-9_])"
     r"|\$\{?ENGRAM_HOME\}?/(?!(?:marketplace|venv|install-logs|\.deployed-version)(?:/|$|[^A-Za-z0-9_.-]))[^\s\"']+"
     r"|\$\{?(?:CLAUDE_HOME|CODEX_HOME)\}?/[^\s\"']+"
 )
 
 # Reviewed shell lines that touch files but not a user's protected file. (They do not expand a
 # protected variable, so the scanner would not flag them anyway; the entries record the review.)
-# Shell write sites to a protected variable that are NOT yet moved into the helper. Each reason
-# names the slice that moves it; the entry is removed in that slice.
-INSTALL_SH_PENDING = [
-    ('cp -p "$CLAUDE_MD" "$CLAUDE_MD_BACKUP"',
-     "slice 2: install.sh step 6 keeps its own `cp -p` backup beside the file until the installer "
-     "hands the backup to the helper; bootstrap backs up per write in the meantime"),
-]
-
+# Every protected-variable write in install.sh and install-local-marketplace.sh now goes through
+# the guard, so no shell write site is allowed to remain: an entry that comes back must say why
+# it stays.
 INSTALL_SH_ALLOWLIST = [
     ('rm -rf "$WORK_DIR"', "the installer's own scratch directory"),
     ('cp -R "$WORK_DIR/." "$LOG_SAVE_DIR/"', "saves the failed run's log into $ENGRAM_HOME/install-logs (ENGRAM-owned)"),
@@ -710,26 +717,19 @@ MARKETPLACE_SH = SRC / "tools" / "install-local-marketplace.sh"
 SET_FORUM_URL_PY = SRC / "tools" / "set_forum_url.py"
 
 # Python heredoc blocks inside install.sh (the PY_* variables). Entries are func="<BLOCK>:<function>";
-# each covers ONE occurrence.
-INSTALL_SH_PY_ALLOWLIST = [
-    {"func": "PY_CONFIG:<module>", "call": "open(path, 'w', encoding='utf-8')",
-     "reason": "slice 2: MERGE backup. Step 3 writes install_tier into config.json in place; the MERGE "
-               "class backs the file up first once the installer hands this write to the guard"},
+# each covers ONE occurrence. Empty: step 3 (PY_CONFIG) writes config.json through the guard's MERGE class.
+INSTALL_SH_PY_ALLOWLIST: list[dict] = []
+# Python heredoc blocks inside install-local-marketplace.sh. The blocks have no PY_* name there, so
+# an unnamed block is spelled "<heredoc>" (its line number would break on every edit above it).
+# The config.json block and the Codex agent-file block write through the guard and have no entry.
+MARKETPLACE_PY_ALLOWLIST = [
+    {"func": "<heredoc>:<module>", "call": "open(path, 'w', encoding='utf-8')",
+     "reason": "stays: patches the `command` in the .mcp.json that `codex plugin add` just created inside "
+               "Codex's own plugin cache; ENGRAM's own copy of a generated file, never a file the user or "
+               "their agent wrote"},
 ]
-# The config.json block of install-local-marketplace.sh (selected by the text `install_tier`).
-MARKETPLACE_CONFIG_ALLOWLIST = [
-    {"func": "<module>", "call": "open(path, 'w')",
-     "reason": "slice 2: MERGE backup. Persists install_tier into config.json; same hand-over to the guard"},
-]
-# src/engram/tools/set_forum_url.py: the one shared forum.url writer (atomic temp + replace).
-SET_FORUM_URL_ALLOWLIST = [
-    {"func": "_atomic_write", "call": "os.fdopen(fd, 'w')",
-     "reason": "slice 2: MERGE backup. Writes forum.url into config.json via an atomic temp file"},
-    {"func": "_atomic_write", "call": "os.replace(tmp, path)",
-     "reason": "slice 2: MERGE backup. Publishes that temp file over config.json"},
-    {"func": "_atomic_write", "call": "os.unlink(tmp)",
-     "reason": "slice 2: MERGE backup. Removes the writer's own temp file on failure"},
-]
+# src/engram/tools/set_forum_url.py: forum.url is written through the guard's MERGE class; no write of its own.
+SET_FORUM_URL_ALLOWLIST: list[dict] = []
 
 
 def _mask_shell(text: str) -> tuple[str, str | None]:
@@ -854,6 +854,7 @@ _PLANTED_SH_POSITIVE = [
     'ln -sf /tmp/x "$CLAUDE_MD"',
     'install -m 600 /tmp/x "$CLAUDE_MD"',
     "python3 -c \"open(p, 'w').write('x')\"",
+    'cp -a "$SRC/agents/"*.toml "$CODEX_AGENTS_DIR/"',
 ]
 _PLANTED_SH_NEGATIVE = [
     'cp "$CLAUDE_MD" /tmp/copy-only-reads-the-protected-file',
@@ -949,13 +950,14 @@ def _heredoc_violations(text: str, allowlist: list[dict], only_containing: "str 
 
 
 def test_static_write_sites_are_reviewed():
-    """Static gate: every file-writing call in bootstrap.py / install.sh is a reviewed, kept site.
+    """Static gate: every file-writing call in bootstrap.py / install.sh / install-local-marketplace.sh
+    / set_forum_url.py is a reviewed, kept site.
 
     The allowlist holds only the sites the contract KEEPS; the helper that implements consent and
     backup lives in another module (src/engram/engram_file_guard.py), so none of its calls appear
-    here. Sites not yet moved into it are listed with a reason that names the slice that moves them.
-    Covered: bootstrap.py (AST), install.sh (shell scanner AND the AST scan of its Python heredoc
-    blocks), set_forum_url.py (AST) and the config.json block of install-local-marketplace.sh.
+    here. Every entry says why it stays; none may say it waits for a later slice.
+    Covered: bootstrap.py (AST), install.sh and install-local-marketplace.sh (shell scanner AND the
+    AST scan of their Python heredoc blocks) and set_forum_url.py (AST).
 
     THE BOUND, stated plainly. This gate covers the call SPELLINGS it lists and no others:
       * method calls: write_text, write_bytes, symlink_to, unlink, Path.open / open with a write
@@ -974,36 +976,80 @@ def test_static_write_sites_are_reviewed():
     _assert_python_scanner_controls()
     _assert_shell_scanner_controls()
     py_bad = _py_violations(BOOTSTRAP_PY.read_text(), BOOTSTRAP_ALLOWLIST)
-    pending = {cmd for cmd, reason in INSTALL_SH_PENDING if "slice 2" in reason}
     install_text = INSTALL_SH.read_text()
-    sh_bad = [(ln, text) for ln, text in _sh_write_sites(install_text) if text not in pending]
+    sh_bad = _sh_write_sites(install_text)
     assert len(_heredoc_python_blocks(install_text)) >= 3, "the heredoc extractor found no PY_* blocks in install.sh"
     heredoc_bad = _heredoc_violations(install_text, INSTALL_SH_PY_ALLOWLIST)
+    market_text = MARKETPLACE_SH.read_text()
+    market_sh_bad = _sh_write_sites(market_text)
+    assert len(_heredoc_python_blocks(market_text)) >= 5, "the heredoc extractor found too few blocks in install-local-marketplace.sh"
+    market_py_bad = _marketplace_py_violations(market_text, MARKETPLACE_PY_ALLOWLIST)
+    forum_bad = _py_violations(SET_FORUM_URL_PY.read_text(), SET_FORUM_URL_ALLOWLIST)
     problems = [f"src/engram/bootstrap.py:{ln}: {text}   (in {func})" for ln, func, text in py_bad]
     problems += [f"src/engram/tools/install.sh:{ln}: {text}" for ln, text in sh_bad]
     problems += [f"src/engram/tools/install.sh:{ln}: {text}   (Python block {func})" for ln, func, text in heredoc_bad]
+    problems += [f"src/engram/tools/install-local-marketplace.sh:{ln}: {text}" for ln, text in market_sh_bad]
+    problems += [f"src/engram/tools/install-local-marketplace.sh:{ln}: {text}   (Python block {func})" for ln, func, text in market_py_bad]
+    problems += [f"src/engram/tools/set_forum_url.py:{ln}: {text}   (in {func})" for ln, func, text in forum_bad]
     assert not problems, (
         "file-writing calls outside the reviewed allowlist (each must go through the consent and "
         "backup helper, or be reviewed and added to the allowlist with a reason):\n  " + "\n  ".join(problems)
     )
 
 
-def test_config_json_writers_are_listed_for_slice_2():
-    """The three config.json writers stay as they are in slice 1 and are listed with the reason
-    'slice 2: MERGE backup'. Each entry must still match a real write site (a stale entry fails),
-    and no other write site may appear in these writers."""
-    for entry in INSTALL_SH_PY_ALLOWLIST + MARKETPLACE_CONFIG_ALLOWLIST + SET_FORUM_URL_ALLOWLIST:
-        assert entry["reason"].startswith("slice 2: MERGE backup"), entry
-    install_hits = _heredoc_python_hits(INSTALL_SH.read_text())
-    assert any(n == "PY_CONFIG" for _l, n, _f, _c in install_hits), "install.sh step 3 (PY_CONFIG) write site moved or vanished"
-    market_text = MARKETPLACE_SH.read_text()
-    market_hits = _heredoc_python_hits(market_text, only_containing="install_tier")
-    assert market_hits, "install-local-marketplace.sh's config.json block moved or vanished"
-    assert Counter((f, c) for _l, _n, f, c in market_hits) == Counter((a["func"], a["call"]) for a in MARKETPLACE_CONFIG_ALLOWLIST), \
-        f"install-local-marketplace.sh's config.json block does not match its allowlist: {market_hits}"
+def _marketplace_py_violations(text: str, allowlist: list[dict]) -> list[tuple[int, str, str]]:
+    """Heredoc write sites of install-local-marketplace.sh not covered by the allowlist. A block
+    without a PY_* name is spelled "<heredoc>" so an edit above it does not move its entry."""
+    named = [(ln, f"{re.sub(r'^line[0-9]+$', '<heredoc>', name)}:{func}", call)
+             for ln, name, func, call in _heredoc_python_hits(text)]
+    budget: Counter = Counter((a["func"], a["call"]) for a in allowlist)
+    out = []
+    for ln, func, call in named:
+        if budget[(func, call)] > 0:
+            budget[(func, call)] -= 1
+        else:
+            out.append((ln, func, call))
+    return out
+
+
+def _entries_waiting_for_a_later_slice(entries: list) -> list:
+    """Allowlist entries (dicts with a "reason", or (key, reason) pairs) whose reason says the
+    site waits for a later slice, or that give no reason at all."""
+    bad = []
+    for e in entries:
+        reason = e["reason"] if isinstance(e, dict) else e[1]
+        if not reason.strip() or re.search(r"slice\s*[0-9]", reason, re.IGNORECASE):
+            bad.append(e)
+    return bad
+
+
+def test_no_allowlist_entry_waits_for_a_later_slice():
+    """Every site setup used to write by itself now goes through the guard. An entry that is left
+    must say why it stays; one whose reason says it waits for a later slice fails here."""
+    planted = [{"func": "f", "call": "c", "reason": "slice 2: not moved yet"}, ("cmd", "slice 3 will move it"),
+               {"func": "g", "call": "d", "reason": ""}]
+    assert len(_entries_waiting_for_a_later_slice(planted)) == 3, "the 'waits for a later slice' check is broken"
+    assert _entries_waiting_for_a_later_slice([{"func": "f", "call": "c", "reason": "stays: ENGRAM's own file"}]) == []
+    everything = (BOOTSTRAP_ALLOWLIST + INSTALL_SH_ALLOWLIST + INSTALL_SH_PY_ALLOWLIST
+                  + MARKETPLACE_PY_ALLOWLIST + SET_FORUM_URL_ALLOWLIST + GUARD_ALLOWLIST)
+    assert _entries_waiting_for_a_later_slice(everything) == []
+
+
+def test_the_three_config_json_writers_go_through_the_guard():
+    """install.sh step 3, install-local-marketplace.sh's install_tier block and set_forum_url.py
+    each call the guard's MERGE path (positive), and none keeps a write call of its own."""
+    install_blocks = [code for name, _l, code in _heredoc_python_blocks(INSTALL_SH.read_text()) if name == "PY_CONFIG"]
+    assert len(install_blocks) == 1 and "fg.apply_merge(" in install_blocks[0], "install.sh step 3 does not call apply_merge"
+    market_blocks = [code for _n, _l, code in _heredoc_python_blocks(MARKETPLACE_SH.read_text()) if "install_tier" in code and "apply_merge" in code]
+    assert len(market_blocks) == 1, "install-local-marketplace.sh's install_tier block does not call apply_merge"
     forum_src = SET_FORUM_URL_PY.read_text()
-    assert _py_violations(forum_src, SET_FORUM_URL_ALLOWLIST) == [], "set_forum_url.py grew a write site"
-    assert len(_py_write_sites(forum_src)) == len(SET_FORUM_URL_ALLOWLIST), "a set_forum_url.py allowlist entry is stale"
+    assert "fg.apply_merge(" in forum_src and "import engram_file_guard" in forum_src
+    for label, sites in (("install.sh PY_CONFIG", _py_write_sites(install_blocks[0])),
+                         ("marketplace install_tier block", _py_write_sites(market_blocks[0])),
+                         ("set_forum_url.py", _py_write_sites(forum_src))):
+        assert sites == [], f"{label} still has a write call of its own: {sites}"
+    # control: the same scan finds a planted write in a block of the same shape
+    assert _py_write_sites("import json\nopen(path, 'w').write('x')\n"), "the write scan is broken"
 
 
 # --------------------------------------------------------------------- C6: installer default
@@ -1609,6 +1655,253 @@ GUARD_ALLOWLIST = [
     {"func": "atomic_write_text", "call": "os.unlink(tmp)", "reason": "removes the temp on failure"},
     {"func": "apply", "call": "os.unlink(e.path)", "reason": "a delete request: only after a stamped backup, only on consent"},
 ]
+
+
+# ====================================================================== slice 2 cells
+# The remaining writers of protected files go through the guard. Each cell below names the
+# writer it pins; the static gate above keeps the old write calls from coming back.
+
+# --------------------------------------------- C10: owned names count only in the ENGRAM home
+
+def test_owned_names_count_only_directly_in_the_engram_home(tmp_path):
+    """C10: Item(owned=True) is honoured only for a path directly in the home given to plan().
+    The same name in another folder, in a sub-folder of the home, or with no home given, is
+    protected like any other file: it needs consent and gets a backup."""
+    home = tmp_path / ".engram"
+    elsewhere = tmp_path / "elsewhere"
+    nested = home / "sub"
+    for d in (home, elsewhere, nested):
+        d.mkdir(parents=True)
+    inside, outside, deeper = home / "first-run-pending", elsewhere / "first-run-pending", nested / "first-run-pending"
+    for f in (inside, outside, deeper):
+        f.write_text('{"created": "user-authored content"}')
+    items = [fg.Item(f, "new", owned=True) for f in (inside, outside, deeper)]
+    p = fg.plan(items, home=home)
+    assert [e.state for e in p.entries] == ["owned", "differs", "differs"], [e.state for e in p.entries]
+    msg = fg.refusal(p)
+    assert msg is not None and str(outside) in msg and str(deeper) in msg and str(inside) not in msg
+    assert [e.state for e in fg.plan(items).entries] == ["differs"] * 3, "with no home nothing may count as owned"
+    # the home may be spelled through a symlinked folder
+    link = tmp_path / "home-link"
+    link.symlink_to(home)
+    assert [e.state for e in fg.plan([fg.Item(inside, "new", owned=True)], home=link).entries] == ["owned"]
+    # apply() judges the same way: the outside file is refused, nothing is written
+    with pytest.raises(fg.Refused):
+        fg.apply(p)
+    assert inside.read_text() == '{"created": "user-authored content"}' and outside.read_text() == inside.read_text()
+
+
+# ------------------------------------------------------ C11: uninstall restore, same-file case
+
+def _uninstall_restore_cell(tmp_path, link_kind):
+    home = tmp_path / ".claude"
+    home.mkdir()
+    md, pre = home / "CLAUDE.md", home / "CLAUDE.md.pre-engram"
+    md.write_bytes(_sentinel("uninstall-same-file"))
+    (os.link if link_kind == "hard" else os.symlink)(md, pre)
+    before = md.read_bytes()
+    r = _run_uninstall(tmp_path)
+    return home, md, pre, before, r
+
+
+@pytest.mark.parametrize("link_kind", ["hard", "symbolic"])
+def test_uninstall_leaves_both_files_when_the_backup_name_is_the_file_itself(tmp_path, link_kind):
+    """C11: `<name>.pre-engram` and `<name>` are one file, so a restore would copy a file onto
+    itself. Uninstall leaves both as they are, saves nothing, and says why."""
+    home, md, pre, before, r = _uninstall_restore_cell(tmp_path, link_kind)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert md.read_bytes() == before and pre.read_bytes() == before
+    assert os.path.samefile(md, pre), "the cell's fixture is not the same-file case"
+    assert not [p for p in home.iterdir() if "pre-uninstall" in p.name], "a saved copy was made for a restore that did not happen"
+    assert "same file" in r.stdout and str(pre) in r.stdout, r.stdout
+
+
+def test_uninstall_still_restores_a_backup_that_is_a_different_file(tmp_path):
+    """Control for the cell above: the same flow with two different files restores (and saves first)."""
+    home = tmp_path / ".claude"
+    home.mkdir()
+    (home / "CLAUDE.md").write_bytes(b"current\n")
+    (home / "CLAUDE.md.pre-engram").write_bytes(b"original\n")
+    r = _run_uninstall(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (home / "CLAUDE.md").read_bytes() == b"original\n"
+    assert [p.read_bytes() for p in home.iterdir() if "pre-uninstall" in p.name] == [b"current\n"]
+    assert "same file" not in r.stdout
+
+
+# ----------------------------------------------- the config.json writers: backup before a change
+
+def test_install_sh_step_3_backs_up_config_json_before_changing_install_tier(tmp_path):
+    sb = Sandbox(tmp_path)
+    sb.engram.mkdir(parents=True, exist_ok=True)
+    old = (json.dumps({"agent": "user-authored", "install_tier": "essential", "z": [1, {"k": 2}]}, indent=2) + "\n").encode()
+    (sb.engram / "config.json").write_bytes(old)
+    r = sb.run("--yes", "--tier", "dev")
+    assert r.returncode == 0, r.all
+    after = json.loads((sb.engram / "config.json").read_text())
+    assert after["install_tier"] == "dev" and after["agent"] == "user-authored" and after["z"] == [1, {"k": 2}]
+    backups = _backups_of(sb.engram / "config.json")
+    assert len(backups) == 1 and backups[0].read_bytes() == old, "the old bytes were not kept in a stamped backup"
+    assert str(backups[0]) in r.stdout, "the step must print the backup it made"
+
+
+@pytest.mark.parametrize("content", [b"{not json", b'{"install_tier": "dev", "install_tier": "essential"}', b"[1]"])
+def test_install_sh_step_3_refuses_a_config_it_cannot_merge_and_leaves_it(tmp_path, content):
+    sb = Sandbox(tmp_path)
+    sb.engram.mkdir(parents=True, exist_ok=True)
+    cfg = sb.engram / "config.json"
+    cfg.write_bytes(content)
+    r = sb.run("--yes")
+    assert r.returncode != 0 and "FAIL: [step 3]" in r.all, r.all
+    assert cfg.read_bytes() == content and _backups_of(cfg) == []
+    assert not sb.calls_starting("marketplace"), "a later step ran after the refusal"
+
+
+def test_install_sh_with_neither_a_tty_nor_yes_refuses_and_does_not_call_bootstrap(tmp_path):
+    """Pins 'neither a tty nor --yes: refuse' beyond the constant: no bootstrap run, the file is
+    byte-identical, no backup was made, and the FAIL line carries the show-the-user instruction."""
+    sb = Sandbox(tmp_path)
+    sb.claude_home.mkdir(parents=True)
+    mine = _sentinel("installer-no-yes")
+    md = sb.claude_home / "CLAUDE.md"
+    md.write_bytes(mine)
+    r = sb.run()  # stdin is /dev/null, stdout a pipe: no tty
+    assert r.returncode != 0 and "FAIL: [step 6]" in r.all, r.all
+    assert md.read_bytes() == mine
+    assert not sb.calls_starting("bootstrap"), sb.call_lines()
+    assert _SHOW_THE_USER_RE.search(r.stderr) and _YES_RE.search(r.stderr), r.stderr
+    assert not list(sb.claude_home.glob("CLAUDE.md.*")), "a backup file was made although nothing was replaced"
+
+
+def test_set_forum_url_backs_up_config_json_before_writing_and_force_is_the_users_yes(tmp_path):
+    cfg = tmp_path / "config.json"
+    old = (json.dumps({"agent": "user-authored", "forum": {"url": "http://other:5002", "keep": 1}}, indent=2) + "\n").encode()
+    cfg.write_bytes(old)
+    env = {**os.environ, "ENGRAM_HOME": str(tmp_path)}
+    tool = [sys.executable, str(SET_FORUM_URL_PY), "http://localhost:5002", "--config", str(cfg)]
+    refused = subprocess.run(tool, capture_output=True, text=True, env=env)
+    assert refused.returncode == 3 and cfg.read_bytes() == old and _backups_of(cfg) == []
+    assert _SHOW_THE_USER_RE.search(refused.stderr) and _YES_RE.search(refused.stderr), refused.stderr
+    done = subprocess.run(tool + ["--force"], capture_output=True, text=True, env=env)
+    assert done.returncode == 0, done.stderr
+    backups = _backups_of(cfg)
+    assert len(backups) == 1 and backups[0].read_bytes() == old
+    after = json.loads(cfg.read_text())
+    assert after["forum"] == {"url": "http://localhost:5002", "keep": 1} and after["agent"] == "user-authored"
+    # the same value again: nothing is written and nothing is backed up
+    again = subprocess.run(tool, capture_output=True, text=True, env=env)
+    assert again.returncode == 0 and len(_backups_of(cfg)) == 1
+
+
+def test_set_forum_url_never_repairs_a_config_it_cannot_merge(tmp_path):
+    cfg = tmp_path / "config.json"
+    env = {**os.environ, "ENGRAM_HOME": str(tmp_path)}
+    for content in (b'{"forum": {"url": "", "url": "http://x:1"}}', b"{not json"):
+        cfg.write_bytes(content)
+        r = subprocess.run([sys.executable, str(SET_FORUM_URL_PY), "http://localhost:5002", "--config", str(cfg)],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode == 2, r.stderr
+        assert cfg.read_bytes() == content and _backups_of(cfg) == []
+
+
+# ------------------------------------------ docs gate: flags are paired with show-the-user + yes
+
+_SHOW_THE_USER_RE = re.compile(r"\bshow(?:s|n|ing)?\s+the\s+user\b", re.IGNORECASE)
+_YES_RE = re.compile(r"\byes\b", re.IGNORECASE)
+_FLAG_RE = re.compile(r"(?<![\w-])--(?:yes|force|replace)\b")
+# A paragraph is about OUR setup tools when it names one of these; the same flags mean other
+# things for git, the release tool or the forum CLIs.
+_SETUP_CONTEXT_RE = re.compile(
+    r"bootstrap|install\.sh|set_forum_url|\[bootstrap\] REFUSED|forum\.url|CLAUDE\.md|AGENTS\.md|config\.toml",
+    re.IGNORECASE,
+)
+
+
+def _flag_paragraphs_missing_the_sentence(text: str) -> list[tuple[int, str]]:
+    """(first line, excerpt) of each prose paragraph that mentions --yes/--force/--replace in the
+    context of our setup tools but has no "show the user" and no "yes" in the same paragraph.
+
+    A paragraph is a run of lines between blank lines. Fenced code blocks (``` or ~~~) are not
+    prose: the instruction lives in the sentence around them, so their lines are skipped. THE
+    BOUND: lines about the forum read-cursor are skipped (its --force moves a cursor); it reads wording, not meaning; a paragraph that names a flag and the sentence but
+    says the opposite would pass."""
+    out: list[tuple[int, str]] = []
+    para: list[tuple[int, str]] = []
+    in_fence = False
+
+    def flush() -> None:
+        if para:
+            body = " ".join(t for _n, t in para)
+            if _FLAG_RE.search(body) and _SETUP_CONTEXT_RE.search(body) \
+                    and not (_SHOW_THE_USER_RE.search(body) and _YES_RE.search(body)):
+                out.append((para[0][0], body[:100]))
+        para.clear()
+
+    for n, line in enumerate(text.split("\n"), 1):
+        if re.match(r"^\s*(?:>\s*)*(```|~~~)", line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if not line.strip():
+            flush()
+        elif re.search(r"\bcursor\b", line, re.IGNORECASE):
+            continue  # the forum read-cursor's own --force moves a cursor; no file is replaced
+        else:
+            para.append((n, line))
+    flush()
+    return out
+
+
+def test_flag_instructions_are_paired_with_show_the_user_and_their_yes():
+    """Wherever our text could lead an agent to pass --yes, --force or --replace over an existing
+    user file, the same paragraph first has the agent show the user what will be replaced and
+    where each backup goes, and pass the flag only on the user's yes."""
+    planted_bad = "Re-run bootstrap with `--force` and it will replace CLAUDE.md.\n\nNext paragraph.\n"
+    planted_good = ("Re-run bootstrap with `--force`. An agent shows the user the list and where each "
+                    "backup goes first, and passes it only on their yes.\n")
+    planted_unrelated = "Use `git push --force` on your own branch.\n"
+    planted_fence = "Show the user the list, then yes.\n\n```bash\nbootstrap --force\n```\n\nbootstrap.py --replace x\n"
+    assert [ln for ln, _ in _flag_paragraphs_missing_the_sentence(planted_bad)] == [1], "the planted bad paragraph was not found"
+    assert _flag_paragraphs_missing_the_sentence(planted_good) == [], "the planted good paragraph was flagged"
+    assert _flag_paragraphs_missing_the_sentence(planted_unrelated) == [], "a git --force paragraph was flagged"
+    assert _flag_paragraphs_missing_the_sentence("| `forum cursor [--force]` | moves the cursor; see forum.url |\n") == [], \
+        "a read-cursor --force line was flagged"
+    assert [ln for ln, _ in _flag_paragraphs_missing_the_sentence("| `cursor` | x |\nbootstrap --force over CLAUDE.md\n")] == [2], \
+        "the cursor exemption must be per line, not per paragraph"
+    assert [ln for ln, _ in _flag_paragraphs_missing_the_sentence(planted_fence)] == [7], \
+        "fenced lines must be skipped and the unpaired prose paragraph after them found"
+    docs = [REPO_ROOT / "README-AGENT.md", REPO_ROOT / "README.md", REPO_ROOT / "USER_GUIDE.md"]
+    docs += sorted((SRC / "skills").rglob("SKILL.md"))
+    docs += sorted((SRC / "agents").rglob("*.md"))
+    docs += sorted((REPO_ROOT / "deploy").rglob("*.md"))
+    docs += sorted(p for p in (REPO_ROOT / "docs").glob("*.md") if p.name != "CHANGELOG.md")
+    docs += sorted(p for p in (SRC / "templates").rglob("*") if p.is_file())
+    found: list[str] = []
+    checked = 0
+    for doc in docs:
+        try:
+            text = doc.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        checked += 1
+        found += [f"{doc.relative_to(REPO_ROOT).as_posix()}:{ln}: {txt}" for ln, txt in _flag_paragraphs_missing_the_sentence(text)]
+    assert checked >= 20, f"the doc list is too short to mean anything ({checked} files)"
+    assert not found, ("a paragraph tells the reader to pass --yes, --force or --replace with no 'show the user ... "
+                       "their yes' sentence:\n  " + "\n  ".join(found))
+
+
+def test_refusal_messages_that_name_a_flag_carry_the_show_the_user_sentence(tmp_path):
+    """The code-side twin of the docs gate, on the messages themselves: the guard's refusal, the
+    installer's --help and the set_forum_url refusal each tell the agent to show the user and wait
+    for their yes before passing the flag."""
+    f = tmp_path / "CLAUDE.md"
+    f.write_text("user-authored")
+    msg = fg.refusal(fg.plan([fg.Item(f, "new", first_identity=True)]))
+    helptext = subprocess.run(["bash", str(INSTALL_SH), "--help"], capture_output=True, text=True).stdout
+    for label, text in (("guard refusal", msg), ("install.sh --help", helptext)):
+        assert text and _FLAG_RE.search(text), f"{label} no longer names a flag"
+        assert _SHOW_THE_USER_RE.search(text) and _YES_RE.search(text), f"{label} lacks the show-the-user / yes sentence:\n{text}"
 
 
 def test_guard_write_sites_are_exactly_the_reviewed_ones():

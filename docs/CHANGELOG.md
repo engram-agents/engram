@@ -24,7 +24,13 @@ with an `-alpha` suffix during the alpha phase.
   automatically. When setup sets one of its own keys in a settings or config
   file (`cleanupPeriodDays`, `install_tier`, `forum.url`), it backs the file
   up first, keeps every other key in value and order, and leaves a file that
-  does not parse as it is.
+  does not parse as it is. This now holds for all three writers of those keys
+  (the installer, the marketplace installer and `set_forum_url.py`). The
+  installer only asks about `CLAUDE.md`; the backups are made by
+  `bootstrap.py` before it writes. A Codex custom-agent file (`engram-*.toml`)
+  that differs from the one setup installs is backed up first, and one line per
+  file names the backup. Uninstall leaves both files as they are when
+  `<name>.pre-engram` is the same file as `<name>`.
 
 ## [v0.5.6] - 2026-11-10
 
