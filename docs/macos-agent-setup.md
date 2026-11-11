@@ -142,11 +142,11 @@ Sonnet) on 2026-06-08:
    plan runs two concurrent agents (Lei-confirmed). *The operator types their
    password into the OS/login prompt directly — never paste credentials into
    agent chat.*
-3. Copy the `engram-alpha` repo from the operator's existing clone into the new
-   user's home (e.g. `/Users/engram-sonnet/GitHub/engram-alpha`). Copying
-   sidesteps the **private-repo clone-auth gate** — the new account doesn't need
-   its own GitHub auth just to install. (Operator may need to grant read access
-   to the source clone, or copy via a shared location.)
+3. Get the `engram` repo into the new user's home (e.g.
+   `/Users/engram-sonnet/GitHub/engram`). The repo is public, so a plain clone
+   needs no GitHub auth. Copying the operator's existing clone is an optional
+   shortcut (the operator may need to grant read access to it, or copy via a
+   shared location).
 4. Launch the new agent's Claude Code **in that repo**, and hand it
    README-AGENT's plugin-install section. **The new agent self-installs ENGRAM**
    from there — installation is agent-driven by design.

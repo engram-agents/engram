@@ -8,8 +8,8 @@ root resolution).
 
 `pr-checks.yml`'s `name-leak-warn` step is advisory by design: it
 `continue-on-error`s, always exits success, and sets `skip=true` when
-`NAME_LEAK_ROSTER` is unset. It runs on `pull_request` only. On a public repo,
-a PR from a fork therefore runs the gate with **no roster**, prints a benign
+`NAME_LEAK_ROSTER` is unset. It runs on `pull_request` only. This repository is public, so
+a PR from a fork is a live case, not a hypothetical: it runs the gate with **no roster**, prints a benign
 skip line, and passes — the gate is absent exactly where the risk is, and its
 absence is reported as a green tick.
 
@@ -25,7 +25,7 @@ all I/O and hands it five facts.
   token `NOT SCANNED` (message: "not scanned, roster unavailable"). A fork
   never receives the roster secret, so the gate cannot run there. The
   `NOT SCANNED` status name must **never** be configured as a required check.
-- **Push to the default branch (`dev`)**: post-merge backstop. Fails loud when
+- **Push to `dev`**: post-merge backstop. Fails loud when
   the roster is missing or the attestation does not match, and files (or
   comments on) an issue labelled `name-leak-gate`, closing it on the next
   green run — the same notify shape as nightly.yml's `ci-nightly` issue, under
@@ -151,12 +151,12 @@ of a `BOOTSTRAP` warning is **not** the check — silence and a run that never
 reached that paragraph look identical, which is the whole reason a positive line
 is printed.
 
-**Not this workflow's job, but owed at cutover:** code-owner review on
+**Not this workflow's job, but owed (open items):** code-owner review on
 `.github/workflows/` and the two `tools/` files, so a forged green cannot land;
 and GitHub's approval requirement for fork PR workflows, which covers forks but
 **not** a re-pushed same-repo branch — a same-repo push is by definition by
-someone with write access, so the platform has no reason to gate it. Both belong
-on the cutover checklist, and the seat rule above remains the floor either way.
+someone with write access, so the platform has no reason to gate it. Both are open
+items for the maintainers, and the seat rule above remains the floor either way.
 
 ## The contract
 

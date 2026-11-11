@@ -106,11 +106,16 @@ form that fires the parser.
    the PR BODY only — a merge commit's own message is a THIRD close surface
    GitHub's parser reads independently, invisible to checks 1 and 2. **This
    repo's exposure is currently LOWER than umwelt's and soma's, and say so
-   precisely:** engram-alpha's `squash_merge_commit_message` is `BLANK`
+   precisely:** in the development repo as it was (engram-alpha, private, retired
+   2026-11-10), `squash_merge_commit_message` was `BLANK`
    (measured 2026-08-22 — three real recent squash merges carry no
    branch-commit content, only PR title + co-author lines; the setting
    re-read `BLANK` on 2026-09-03 and 2026-09-28), so branch commit messages
-   do NOT ride into the merge commit here today. The check stays anyway, as
+   did NOT ride into the merge commit there. **Current repo (engram, public):**
+   read 2026-11-11 as `squash_merge_commit_message` `BLANK` and
+   `squash_merge_commit_title` `PR_TITLE`; they were reset to these values after
+   the rebuild, because a fresh repo defaults to `COMMIT_MESSAGES` /
+   `COMMIT_OR_PR_TITLE`. The check stays anyway, as
    defense-in-depth against the three ways the exposure appears without any
    code change: a repo-settings flip to `COMMIT_MESSAGES` (silent, and
    exactly what makes **umwelt and soma** exposed — both read
