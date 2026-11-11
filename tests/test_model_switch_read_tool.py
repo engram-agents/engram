@@ -16,9 +16,11 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -288,13 +290,18 @@ def test_1_path_with_uri_metacharacters_is_not_mangled(tmp_path):
 def test_1_default_db_is_engram_home_and_nothing_else_is_written_there(tmp_path):
     # The default db is the seat's own store, which is read through the owner only (#4616 ruling): a fake owner
     # serves it here.  The only thing the owner's socket adds to the home is its run/ directory.
-    home = tmp_path / "home"
-    make_fixture(home)
-    decoys = make_decoys(tmp_path / "decoys.json")
-    with FakeOwner(home):
-        r = run("draw", "--seed", "s", "--decoys", decoys, "--out", tmp_path / "out", env={"ENGRAM_HOME": str(home)})
-    assert r.returncode == 0, r.stderr
-    assert sorted(p.name for p in home.iterdir()) == ["knowledge.db", "run"]
+    # The fake owner's socket lives at <home>/run/engramd.sock and AF_UNIX paths are capped (104 bytes on macOS),
+    # so the home is a short directory under /tmp, not a path under a long worktree's tmp_path.
+    home = Path(tempfile.mkdtemp(prefix="msr", dir="/tmp"))
+    try:
+        make_fixture(home)
+        decoys = make_decoys(tmp_path / "decoys.json")
+        with FakeOwner(home):
+            r = run("draw", "--seed", "s", "--decoys", decoys, "--out", tmp_path / "out", env={"ENGRAM_HOME": str(home)})
+        assert r.returncode == 0, r.stderr
+        assert sorted(p.name for p in home.iterdir()) == ["knowledge.db", "run"]
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +659,93 @@ def test_5_instrument_failed_takes_precedence_over_stop(drawn):
 
     res, _ = _decide(drawn, "not-recognised", "not-recognised", tweak)
     assert res["decision"] == "instrument_failed"
+
+
+# ---------------------------------------------------------------------------
+# 5b. labels are final once the key has been seen (unblinded.json)
+# ---------------------------------------------------------------------------
+
+
+def _two_label_files(drawn):
+    """Two complete labels files that decide differently (proceed vs stop)."""
+    a = write_labels(drawn["tmp"] / "a.tsv", drawn["key"], lambda i, k: "mine" if k["source"] == "own" else "not-recognised")
+    b = write_labels(drawn["tmp"] / "b.tsv", drawn["key"], lambda i, k: "not-recognised")
+    return a, b
+
+
+def test_5b_a_relabel_after_unblinding_is_refused_and_prints_no_key(drawn):
+    a, b = _two_label_files(drawn)
+    first = _unblind(drawn, a)
+    assert first.returncode == 0, first.stderr
+    assert json.loads(first.stdout)["decision"] == "proceed"
+    before = (drawn["out"] / "unblinded.json").read_bytes()
+    r = _unblind(drawn, b)
+    _assert_refusal(r)
+    sha = hashlib.sha256(a.read_bytes()).hexdigest()[:12]
+    assert r.stderr.strip() == (
+        f"model_switch_read: labels already fixed for this draw (sha256 {sha}\u2026); "
+        "a re-label after unblinding is refused"
+    )
+    assert r.stdout.strip() == ""
+    for v in drawn["key"]["items"].values():
+        if v["source"] == "own":
+            assert v["id"] not in r.stdout + r.stderr
+    assert (drawn["out"] / "unblinded.json").read_bytes() == before  # nothing written
+
+
+def test_5b_same_labels_again_reprints_the_recorded_result_and_writes_nothing(drawn):
+    a, _ = _two_label_files(drawn)
+    first = _unblind(drawn, a)
+    assert first.returncode == 0, first.stderr
+    f = drawn["out"] / "unblinded.json"
+    before, mtime = f.read_bytes(), f.stat().st_mtime_ns
+    again = _unblind(drawn, a)
+    assert again.returncode == 0, again.stderr
+    assert again.stdout == first.stdout
+    assert f.read_bytes() == before and f.stat().st_mtime_ns == mtime
+    # a byte-different file is a different sha, even with the same meaning
+    a2 = drawn["tmp"] / "a2.tsv"
+    a2.write_bytes(a.read_bytes() + b"\n")
+    _assert_refusal(_unblind(drawn, a2))
+
+
+def test_5b_unblinded_json_records_sha_decision_and_the_printed_result(drawn):
+    a, _ = _two_label_files(drawn)
+    first = _unblind(drawn, a)
+    rec = json.loads((drawn["out"] / "unblinded.json").read_text())
+    assert rec["labels_sha256"] == hashlib.sha256(a.read_bytes()).hexdigest()
+    assert rec["decision"] == "proceed"
+    assert rec["result"] == json.loads(first.stdout)
+
+
+def test_5b_a_refused_unblind_writes_no_unblinded_json_and_labels_can_still_be_fixed(drawn):
+    a, _ = _two_label_files(drawn)
+    incomplete = drawn["tmp"] / "inc.tsv"
+    incomplete.write_text("\n".join(a.read_text().splitlines()[1:]) + "\n")
+    _assert_refusal(_unblind(drawn, incomplete))
+    assert not (drawn["out"] / "unblinded.json").exists()
+    ok = _unblind(drawn, a)
+    assert ok.returncode == 0, ok.stderr
+    assert (drawn["out"] / "unblinded.json").exists()
+
+
+@pytest.mark.parametrize("kind", ["garbage", "forged-decision-right-sha", "forged-wrong-sha"])
+def test_5b_unblinded_json_cannot_be_precreated_to_fake_a_result(drawn, kind):
+    # Reason: a file present before the first successful run was not written by the tool, so it is no
+    # record of anything the key was shown for; honouring it would let a forged result stand in for the join.
+    a, _ = _two_label_files(drawn)
+    f = drawn["out"] / "unblinded.json"
+    if kind == "garbage":
+        f.write_text("not json")
+    else:
+        sha = hashlib.sha256(a.read_bytes()).hexdigest() if kind == "forged-decision-right-sha" else "0" * 64
+        fake = {"labels_sha256": sha, "decision": "proceed", "result": {"decision": "proceed", "forged": True}}
+        f.write_text(json.dumps(fake))
+    before = f.read_bytes()
+    r = _unblind(drawn, a)
+    _assert_refused_with_nothing_leaked(r, drawn)
+    assert "forged" not in r.stdout
+    assert f.read_bytes() == before
 
 
 # ---------------------------------------------------------------------------
