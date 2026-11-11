@@ -351,6 +351,8 @@ def test_i3_the_installer_body_normalizes_before_it_asserts(tmp_path, mask):
 
 
 def _getfacl(path: Path) -> str:
+    if shutil.which("getfacl") is None:  # the ACL half is exercised only where getfacl exists (macOS has none)
+        return ""
     return subprocess.run(["getfacl", "-n", "--skip-base", "--absolute-names", str(path)],
                           capture_output=True, text=True).stdout.strip()
 
