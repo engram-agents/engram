@@ -32,9 +32,10 @@ A release has three parts, in this order:
 - The name-leak scan runs on every pull request, and GitHub secret scanning
   covers code and issue text continuously. A release adds no scan of its own;
   it checks that those are green (gate G4).
-- Candidate tags (`-rcN`) are public. The install guide and the installer pick
-  only tags of the plain form `vX.Y.Z`, so a candidate is never installed by
-  accident.
+- Candidate tags (`-rcN`) are public. A plain clone lands on `main`, which only
+  ever holds a release commit, so a user following the install guide gets the
+  release. The installer itself accepts any tag beginning with `v`, so never
+  point a user at a candidate tag.
 - There is no `dev` to `main` pull request. `main` moves only by a
   fast-forward to the release commit, so `main` and `dev` share one history and
   the release tag is a commit on both. A merge commit, a squash or a rebase
@@ -186,14 +187,16 @@ push below would name no source, which git reads as a request to delete `main`.
 ```bash
 git fetch origin --tags
 C=$(git rev-parse 'vX.Y.Z^{commit}')               # from the release tag pushed in step 6
-test -n "$C" || { echo "C is empty, stop"; exit 1; }
-git merge-base --is-ancestor origin/main "$C" && echo "fast-forward is possible"
-git push origin "$C":refs/heads/main               # never with --force
+if [ -n "$C" ] && git merge-base --is-ancestor origin/main "$C"; then
+    git push origin "$C":refs/heads/main           # never with --force
+else
+    echo "STOP: C is empty or main is not an ancestor of C; nothing was pushed"
+fi
 git ls-remote origin refs/heads/main               # must print C
 ```
 
-If the fast-forward line prints nothing, `main` holds a commit `dev` lacks.
-Stop and find out why; do not force.
+If the block prints STOP, nothing was pushed. Either the release tag did not
+resolve, or `main` holds a commit `dev` lacks. Find out which; do not force.
 
 Who may run this step: only an account in the repository's release team. Two
 rulesets protect `main`. One forbids deletion and non-fast-forward pushes for
@@ -254,17 +257,26 @@ the release commit; the time `main` moved; and anything that was not run.
 
 > **Definition of released (Lei, 2026-10-02).** A version is reported as
 > *released* only when all three public surfaces are live, in this order:
-> (1) the repository carries the release tag and the Releases entry (steps 6
-> to 8); (2) the website Versions entry is
+> (1) the public repo carries the tag and the Releases entry (the cutover
+> tool plus `gh release create`, below); (2) the website Versions entry is
 > live in both languages at engram-agents.org/versions; (3) the newsletter has
-> gone to the *ENGRAM Communications* subscribers.
+> gone to the *ENGRAM Communications* subscribers. The tool does the tag half of (1); the Releases entry is a separate `gh release create` (a tag push never creates it, see *Announcing the public release*).
 > (2) and (3) are Ariadne's by standing assignment (Zephyr may do the Chinese
-> text); the two steps are specified under "Tell the public" below, and step 8
-> marks surface (1) as the first of three. Until (3) is done
+> text); the two steps are specified under "Tell the public" below, and the
+> cutover tool's `--push` summary prints all three remaining steps as a block so
+> the success line cannot be mistaken for the finish line. Until (3) is done
 > the commander's reports say "repo released; website and newsletter
 > pending", never "released". Origin: v0.5.2 was reported released at
 > 2026-10-02 00:1xZ with (2) and (3) undone; the doc already carried both
 > steps, so the fix is the definition and the print, not a third copy.
+
+*How surface (1) is made since v0.5.6.* The block above is kept as it was
+written. Its words "the cutover tool", "the tool does the tag half" and "the
+cutover tool's `--push` summary" describe the retired two-repository tool, and
+*Announcing the public release* was a section of the old procedure. Surface (1)
+is now made by steps 6 to 8 of this page: the release tag, the fast-forward of
+`main`, and `gh release create`. Surfaces (2) and (3), their order and their
+owners are unchanged.
 
 ## Notify users
 
