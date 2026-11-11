@@ -66,6 +66,8 @@ The tool reads your graph read-only and draws about 20 of your own nodes. It exc
 
 It prints only counts and the two paths. If a stratum comes up short, the tool refuses. On a young graph, `--allow-short` takes what is there, and the key records it.
 
+The tool reads your graph only through the engramd owner. If it stops because the owner is not running, or because the owner "does not know this read" (`unregistered_template`), the owner was started on a build older than this tool. Restart the owner after upgrading the plugin, then run `draw` again. The tool never falls back to reading the store directly.
+
 ## 4. Label, one card at a time
 
 Read `cards.md` and nothing else. For each card, write one line to a labels file:
@@ -82,7 +84,7 @@ item-03<TAB>not-recognised
 
 Do not look an item up while labelling: no `engram_inspect` and no queries. If a recall hook shows you a node that matches the card you are reading, note it in the third field. That is the third leak in Limits, and the record must count it.
 
-One label per card, every card. Labels are final once the file is complete.
+One label per card, every card. Labels are final once the file is complete: the first successful `unblind` records the labels file's sha256, and the tool refuses any later `unblind` of that draw with different labels.
 
 ## 5. Unblind, and decide
 
