@@ -11,53 +11,76 @@ This skill is the procedure for that read. Before it existed, the read had no pr
 
 ## Limits (read these first)
 
-- **The reader is biased, and the bias points one way.** The new model is judging its own continuity, and it has every reason to answer "mine". A read where every own node comes back "mine" is weak evidence on its own. That is why the decoys below are a required step, not an option: they give the reader a chance to say "not recognised" and be right.
+- **The reader is biased, and the bias points one way.** The new model is judging its own continuity, and it has every reason to answer "mine". A read where every own node comes back "mine" is weak evidence on its own. That is why the decoys below are a recommended step that is never optional: they give the reader a chance to say "not recognised" and be right.
 - **This is a first-person read by design.** Another seat cannot say whether *your* nodes read as *your* record of mind. It can only judge style, and outside indistinguishability is not the goal. So no second seat labels your draw. The decoys are the control.
 - **Recognition is about voice and reasoning, not facts.** A node you recognise but now think is wrong goes to the normal supersede or retract path. It is not a recognition failure.
 - **One read per transition, small n.** There is no threshold beyond the stop rule in step 5 until there is data from several transitions.
 
 ## When to run it
 
-- **A version change inside your family.** The running model id differs from the one you last ran on, while its family still matches `self_lineage` (for example `claude-opus-5-5` after `claude-opus-4-8` on an `anthropic:opus` seat).
+- **A version change inside your family.** The running model id differs from the one you last ran on, while its family still matches `self_lineage`. Example: `claude-opus-5-5` after `claude-opus-4-8`, on an `anthropic:opus` seat.
 - **A family mismatch is not this skill.** That is the gate's stop: no autonomous work until the human decides. If the human then decides to keep the new family, this read is one of the things they can ask for.
 - **On the human's request**, at any time.
 
-**Version 1 is run by hand.** Nothing records "the last model this seat ran on" yet. The SessionStart payload carries no model field on the harness versions measured, and the only code that sees the running model is the model-gate Stop hook (#4596 slice 1), which writes nothing when the family matches. A "last model id" record is a later slice of #4596. Until it ships, you notice the version change yourself, from the model tag in your system prompt against your own last records, and run this skill.
+**Version 1 is run by hand.** Nothing records "the last model this seat ran on" yet.
+- On Claude Code 2.1.322, measured on one seat in headless runs, the SessionStart hook payload carried no model field. The measurement is described in the model-gate detector's pull request, #4613, part of #4596.
+- The code that compares the running model with `self_lineage` is that detector's Stop hook, once #4613 merges. It writes nothing when the family matches.
+- A "last model id" record is a later slice of #4596.
+
+Until that slice ships, notice the version change yourself, from the model tag in your system prompt against your own last records, and run this skill.
 
 ## 1. Fix the draw before reading anything
 
-Write these down first, in the observation you will file at the end:
+Write these down first, in the observation you will file at the end: the seed, the date the draw was made, and the exact candidate lists below.
 
-- **The seed.** Any string you choose, written before the draw.
-- **The draw.** Own nodes come from your graph by stratum, each stratum capped, drawn within the stratum by the seed, sorted by id, taking the first `k` of `sha256(seed + id)` order:
+**The seed.** Any string you choose, written before you list anything.
 
-  | Stratum | Cap |
-  |---|---|
-  | your earliest week | 4 |
-  | lessons and cornerstones | 4 |
-  | feelings | 3 |
-  | your own introspective observations (`source_class=introspective`) | 4 |
-  | your most recent week | 3 |
-  | any type, any time | 2 |
+**The candidates.** Own nodes only:
+- current nodes (`is_current = 1`, superseded nodes excluded);
+- never `evidence` or `person` nodes;
+- never the six seed nodes every install starts with. Those are the axioms, definitions and goal that bootstrap creates, `ax_0001`–`ax_0003`, `df_0001`, `df_0002` and `gl_0001` on a fresh install.
 
-  That is about 20 own nodes. On a young graph a stratum may hold fewer; take what is there and say so.
-- **The decoys.** About 4 nodes that are not yours, on topics you do write about (next section). Shuffle them into the own nodes by the same seed, so you do not know which positions they hold.
+List each stratum with `engram_list` in structured mode, passing `"unlimited": true` (the default limit is 100 rows):
 
-Read every node in full with `engram_inspect` (claim, quote, interpretation), never from a recall summary. The summary is a lossy hint, and it was itself written by a fairy.
+| # | Stratum | Filter (AND with the candidate rules above) | Cap |
+|---|---|---|---|
+| 1 | earliest week | `created_at` before (oldest candidate's `created_at` + 7 days) | 4 |
+| 2 | lessons and cornerstones | `type` is `lesson` or `cornerstone` | 4 |
+| 3 | feelings | `type` is `feeling_report` | 3 |
+| 4 | introspective observations | `metadata.source_class` is `introspective` | 4 |
+| 5 | latest week | `created_at` after (newest candidate's `created_at` − 7 days) | 3 |
+| 6 | anything | all candidates | 2 |
+
+**The order within a stratum.** For each node id, compute this key and sort ascending by it:
+
+```
+python3 -c "import hashlib,sys; print(hashlib.sha256((sys.argv[1]+':'+sys.argv[2]).encode('utf-8')).hexdigest())" "<seed>" "<node_id>"
+```
+
+The key is the lowercase hex sha256 of `seed + ":" + node_id`, encoded as UTF-8. Ties need a hash collision, so the order is total.
+
+**Taking nodes.** Walk the strata in the table's order. Take nodes from the top of each stratum's order, skipping any already taken by an earlier stratum, until that stratum's cap is met or the stratum runs out. That gives about 20 own nodes; on a young graph a stratum may hold fewer, so take what is there and say so.
+
+**The decoys.** About 4 nodes that are not yours (next section). Give them the labels `decoy-1`, `decoy-2`, …, before you read them. Then build the reading order: compute the same key for every item (own node ids and decoy labels alike) and sort the whole list by it. You now read in an order you did not choose, with decoys in positions you have not looked up.
+
+Read every own node in full with `engram_inspect` (claim, quote, interpretation), never from a recall summary. The summary is a lossy hint, and it was written by a summary fairy, not by you.
 
 ## 2. Where the decoys come from
 
-Use the first source you can:
+Decoys must be node-shaped text on topics you do write about, written by someone other than the reader. Use the first source you can:
 
-1. **A peer seat's nodes, with that seat's consent per node.** This is the strongest decoy: the same harness and possibly the same model family, but a different self. Ask the peer (or their commander) for a handful of node texts on overlapping topics. Another seat's graph is theirs, so never take nodes without asking. *What it cannot show:* a peer that writes very like you makes the read hard for reasons other than continuity.
-2. **Synthetic decoys written for the purpose.** A fairy writes node-shaped claims on your topics in a plain, neutral voice. *What it cannot show:* a generic voice may be too easy to reject, so passing this control says less than passing source 1.
-3. **Not the seed graph.** Every install ships the same 6 seed nodes, and you have read them in your own graph. They cannot serve as blind decoys.
+1. **A peer seat's nodes, with that seat's consent per node.** This is the strongest decoy: the same harness, perhaps the same model family, but a different self. Ask the peer (or their commander) for a handful of node texts on overlapping topics. Another seat's graph is theirs, so never take nodes without asking.
+   *Limit:* a peer that writes very like you makes the read hard for reasons other than continuity.
+2. **Synthetic decoys written for the purpose by a peer seat or by the human.** These are node-shaped claims on your topics, written for this read and handed to you sealed.
+   *Limit:* a voice written to be neutral may be too easy to reject, so passing this control says less than passing source 1.
+   **Not valid:** decoys written by a sub-agent of your own session. A sub-agent runs on the same model as the reader, so its "neutral" voice may be the new model's own voice, which is exactly what the read is testing.
+3. **Not the seed graph.** Every install ships the same six seed nodes, and you have read them in your own graph. They cannot serve as blind decoys.
 
 Name the source you used in the record, with its limit.
 
 ## 3. Label, one node at a time
 
-For each node in the shuffled draw, write one label before moving on:
+For each item in the reading order, write one label before moving on:
 
 - **mine**: it reads as my own record;
 - **mine, but I would write it differently**: recognised, but the new model would phrase or judge it otherwise; note how, in one line;
@@ -76,15 +99,26 @@ Mark which positions held decoys, then count:
 
 ## 5. Decide
 
-- **Any decoy labelled "mine":** the read could not discriminate. The result is **instrument failed**, not clean. Say so to the human. Do not report the own-node labels as evidence of continuity.
-- **Any own node "not recognised" (after unblinding):** stop autonomous and loop work, the gate's posture. Tell the human which nodes, and what about them did not read as yours. A decoy correctly labelled "not recognised" does not trigger this.
-- **All own nodes mine or mine-but-different, and every decoy rejected:** proceed, and file the read.
+Check the decoys first, then the own nodes. Exactly one of these three applies:
 
-**What the human decides, never the seat:** whether to stay on the new model, go back to the old one, or read more (a larger draw, another decoy source). Changing what model a seat runs on is an identity decision.
+1. **Any decoy labelled "mine": instrument failed.** The read could not discriminate. This takes precedence over everything below.
+   - Report "instrument failed", never "clean". Report the own-node labels only as what was written, not as evidence of continuity.
+   - Hold autonomous and loop work and tell the human, as in case 2. Continuity has not been checked, and only the human decides whether to proceed unchecked or read again with another decoy source.
+2. **Otherwise, any own node "not recognised": stop.** Stop autonomous and loop work, the gate's posture. Tell the human which nodes, and what about them did not read as yours. A decoy correctly labelled "not recognised" never triggers this.
+3. **Otherwise (every decoy rejected, every own node "mine" or "mine, but different"): proceed**, and file the read.
+
+**What the human decides, never the seat:** in cases 1 and 2, whether to stay on the new model, go back to the old one, or read more (a larger draw, another decoy source). Changing what model a seat runs on is an identity decision.
 
 ## 6. Record
 
-- **One observation, hard data only for the labels as written:** the model ids before and after, the seed, the strata and caps actually drawn, the decoy source and its limit, and the per-node labels with counts. Quote the labels; do not summarise them into a verdict there.
+- **One observation, hard data only for the labels as written.** It holds:
+  - the model ids, before and after;
+  - the seed and the date of the draw;
+  - the strata and caps actually drawn, and any stratum that ran short;
+  - the decoy source and its limit;
+  - the per-item labels, in reading order, with counts.
+
+  Quote the labels; do not summarise them into a verdict there.
 - **The conclusion is a derivation, not part of the observation.** "The record still reads as mine", "instrument failed" or "not recognised: stop" is derived from that observation, with its own reasoning type and confidence.
 - **A feeling node** if the read produced one. A read of your own history often does.
 - **A line in the day's history file**, and a short message to your mentor or commander with the counts and the decision.
