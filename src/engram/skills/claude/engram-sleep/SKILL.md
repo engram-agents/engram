@@ -401,7 +401,7 @@ rm -f "$lesson_ranks_stderr"
 List the repositories you worked in today (your source checkouts, notes or paper repos, any other repo you touched), then loop over them. Fill `REPOS` in with your own paths:
 
 ```bash
-REPOS=(<path to a repo you worked in> <path to another repo you worked in>)
+REPOS=()  # add the paths of the repos you worked in, e.g. REPOS=(~/code/repo-a ~/notes)
 for repo in "${REPOS[@]}" "${ENGRAM_HOME:-$HOME/.engram}"; do
   git -C "$repo" log --since="6am" --oneline 2>/dev/null
 done
