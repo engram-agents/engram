@@ -23,8 +23,9 @@ B.  Anthropic lineage only: read ``model`` from the merged settings view (user,
     loud line.
 
 Always: a family word, never a model id; settings files are never edited;
-``ANTHROPIC_API_KEY`` is never set and ``ANTHROPIC_BASE_URL`` is never
-overwritten; the Codex path is untouched. No tmux, systemd, daemon or live
+``ANTHROPIC_API_KEY`` and ``ANTHROPIC_AUTH_TOKEN`` are never set and
+``ANTHROPIC_BASE_URL`` is never overwritten; the ``ANTHROPIC_DEFAULT_*_MODEL``
+variables are read, never written; the Codex path is untouched. No tmux, systemd, daemon or live
 platform is started: only the external ``agentctl`` is replaced.
 """
 from __future__ import annotations
@@ -35,6 +36,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -100,6 +102,9 @@ def run_runner(
     project_raw: str | None = None,
     lock_project_dir: bool = False,
     env_extra: dict[str, str] | None = None,
+    local_raw: str | None = None,
+    fake_python: str | None = None,
+    runner_cwd: Path | None = None,
 ) -> Run:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -126,6 +131,22 @@ def run_runner(
         _write_json(cwd / ".claude" / "settings.local.json", {"model": local_model})
     if project_raw is not None:
         _write_json(cwd / ".claude" / "settings.json", project_raw)
+    if local_raw is not None:
+        _write_json(cwd / ".claude" / "settings.local.json", local_raw)
+    if fake_python is not None:
+        # first arg "-" or "-I" is the model-pin helper call; anything else is the real python3
+        body = {
+            "exit1": "exit 1\n",
+            "partial": "printf 'FLAG\\topus\\n'\nexit 1\n",
+        }[fake_python]
+        fp = bin_dir / "python3"
+        fp.write_text(
+            "#!/bin/bash\n"
+            "if [[ \"${1:-}\" == - || \"${1:-}\" == -I ]]; then\n" + body + "fi\n"
+            f"exec {sys.executable} \"$@\"\n",
+            encoding="utf-8",
+        )
+        fp.chmod(0o755)
 
     agentctl = bin_dir / "agentctl"
     agentctl.write_text(
@@ -145,7 +166,9 @@ def run_runner(
     )
     agentctl.chmod(0o755)
 
-    env = {k: v for k, v in os.environ.items() if k not in _SCRUB}
+    # drop EVERY inherited ANTHROPIC_* variable (prefix, not a fixed list) so no
+    # seat's own variable can reach a cell; _SCRUB stays as the documented core
+    env = {k: v for k, v in os.environ.items() if k not in _SCRUB and not k.startswith("ANTHROPIC_")}
     env.update(
         {
             "HOME": str(home),
@@ -166,6 +189,7 @@ def run_runner(
             capture_output=True,
             text=True,
             env=env,
+            cwd=str(runner_cwd) if runner_cwd is not None else None,
         )
     finally:
         if lock_project_dir:
@@ -495,6 +519,7 @@ class _Expected:
     opaque on purpose (a printed dict of digests would still be 64 hex chars each)."""
 
     def __init__(self, env):
+        self.names = frozenset(env)
         self._digests = {
             var: hashlib.sha256(f"{var}={value}".encode()).hexdigest()
             for var, value in env.items()
@@ -509,6 +534,10 @@ class _Expected:
 
 
 def _assert_env_unchanged(r, expected):
+    # the set of ANTHROPIC_* NAMES reaching agentctl is exactly the set passed in
+    seen_names = {ln.split("=", 1)[0] for ln in r.env_seen.splitlines() if ln.startswith("ANTHROPIC_")}
+    extra, gone = sorted(seen_names - expected.names), sorted(expected.names - seen_names)
+    assert not extra and not gone, f"ANTHROPIC_* names differ: unexpected {extra}, missing {gone}"
     # Booleans only: messages name the variable, never the value.
     for var in expected.missing(r.env_seen):
         ok = False
@@ -593,3 +622,123 @@ def test_env_credentials_reach_agentctl_unchanged_when_no_remap_by_lineage(tmp_p
     else:
         assert r.model_args() == [], "a --model flag was passed"
         assert len(r.lines("INFO")) == 1, "expected exactly one INFO line"
+
+
+# --- fold 2, C2: no ANTHROPIC_* variable appears from nowhere ----------------
+
+def test_no_anthropic_variable_appears_from_nowhere(tmp_path):
+    r = run_runner(tmp_path, lineage="anthropic:opus")
+    assert r.proc.returncode == 0, r.proc.stderr
+    names = sorted(ln.split("=", 1)[0] for ln in r.env_seen.splitlines())
+    assert names == [], f"unexpected ANTHROPIC_* names reached agentctl: {names}"
+
+
+# --- fold 2, C1: a python3 that cannot run is never silent --------------------
+
+@pytest.mark.parametrize("mode", ["exit1", "partial"])
+def test_python_that_cannot_run_warns_no_end_record_and_passes_no_flag(tmp_path, mode):
+    r = run_runner(tmp_path, lineage="anthropic:opus", fake_python=mode)
+    assert r.proc.returncode == 0, r.proc.stderr
+    assert r.model_args() == [], "a partial result was trusted"
+    warns = r.lines("WARNING")
+    assert len(warns) == 1, warns
+    assert "python3" in warns[0] and "no end record" in warns[0]
+    assert len([ln for ln in r.log.splitlines() if "WARNING" in ln]) == 1, r.log
+    assert "no end record" in r.log
+
+
+def test_plain_run_logs_no_info_and_no_warning(tmp_path):
+    r = run_runner(tmp_path, lineage="anthropic:opus")
+    assert r.model_args() == ["opus"]
+    assert not r.lines("INFO") and not r.lines("WARNING")
+    assert "INFO" not in r.log and "WARNING" not in r.log
+
+
+# --- fold 2, C3: a settings env block that remaps a default model -------------
+
+def _env_settings(**kv):
+    return json.dumps({"env": kv})
+
+
+@pytest.mark.parametrize("layer", ["user", "project", "local"])
+def test_settings_env_remap_gets_no_flag_and_one_info(tmp_path, layer):
+    raw = _env_settings(ANTHROPIC_DEFAULT_SONNET_MODEL="served")
+    kw = {"user": "raw_user_settings", "project": "project_raw", "local": "local_raw"}[layer]
+    r = run_runner(tmp_path, lineage="anthropic:opus", **{kw: raw})
+    assert r.proc.returncode == 0, r.proc.stderr
+    assert r.model_args() == []
+    assert not r.lines("WARNING")
+    infos = r.lines("INFO")
+    assert len(infos) == 1, infos
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL" in infos[0] and "settings env" in infos[0]
+
+
+def test_settings_env_later_layer_clears_the_remap(tmp_path):
+    r = run_runner(
+        tmp_path,
+        lineage="anthropic:opus",
+        raw_user_settings=_env_settings(ANTHROPIC_DEFAULT_SONNET_MODEL="served"),
+        project_raw=_env_settings(ANTHROPIC_DEFAULT_SONNET_MODEL=""),
+    )
+    assert r.model_args() == ["opus"]
+    assert not r.lines("WARNING") and not r.lines("INFO")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _env_settings(ANTHROPIC_DEFAULT_SONNET_MODEL=5),
+        '{"env": ["ANTHROPIC_DEFAULT_SONNET_MODEL"]}',
+        _env_settings(SOME_OTHER_KEY="x"),
+        _env_settings(ANTHROPIC_DEFAULT_SONNET_MODEL=None),
+    ],
+)
+def test_settings_env_that_is_not_a_remap_is_ignored(tmp_path, raw):
+    r = run_runner(tmp_path, lineage="anthropic:opus", raw_user_settings=raw)
+    assert r.proc.returncode == 0, r.proc.stderr
+    assert r.model_args() == ["opus"]
+    assert not r.lines("WARNING") and not r.lines("INFO")
+
+
+def test_settings_env_remap_wins_over_a_disagreeing_model(tmp_path):
+    r = run_runner(
+        tmp_path,
+        lineage="anthropic:opus",
+        raw_user_settings=json.dumps({"model": "sonnet", "env": {"ANTHROPIC_DEFAULT_SONNET_MODEL": "served"}}),
+    )
+    assert r.model_args() == []
+    assert not r.lines("WARNING")
+    assert len(r.lines("INFO")) == 1
+
+
+# --- fold 2, C4: the helper cannot be shadowed from the working directory -----
+
+def test_helper_is_not_shadowed_by_a_json_py_in_the_working_directory(tmp_path):
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    marker = tmp_path / "SHADOWED"
+    (hostile / "json.py").write_text(f"open({str(marker)!r}, 'w').close()\n", encoding="utf-8")
+    sub = tmp_path / "run"
+    sub.mkdir()
+    r = run_runner(sub, lineage="anthropic:opus", runner_cwd=hostile)
+    assert not marker.exists(), "a json.py in the working directory was imported by the helper"
+    assert r.model_args() == ["opus"]
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    ],
+)
+def test_settings_env_remap_any_default_model_variable_gets_no_flag(tmp_path, var):
+    r = run_runner(tmp_path, lineage="anthropic:opus", raw_user_settings=_env_settings(**{var: "served"}))
+    assert r.proc.returncode == 0, r.proc.stderr
+    assert r.model_args() == []
+    assert not r.lines("WARNING")
+    infos = r.lines("INFO")
+    assert len(infos) == 1, infos
+    assert var in infos[0] and "settings env" in infos[0]

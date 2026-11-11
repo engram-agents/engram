@@ -150,15 +150,22 @@ esac
 #   (A)  any non-empty ANTHROPIC_DEFAULT_*_MODEL in this environment (boot-env
 #        files are sourced before this runs): pass nothing, stop. A seat that
 #        remaps models through the environment must not get a literal family.
+#   (A2) the same through the settings files: an `env` block (user, then project,
+#        then local; later wins per key; a non-string or empty value counts as
+#        unset) that sets a non-empty ANTHROPIC_DEFAULT_*_MODEL: pass nothing,
+#        one INFO line, whatever `model` says.
 #   (A') lineage provider other than anthropic: pass nothing, one INFO line.
 #        Unset or unusable lineage, or an unknown anthropic family: WARNING.
 #   (B)  anthropic only: read `model` from the settings the harness merges
 #        (user, then project, then local; later wins; managed settings and
 #        CLAUDE_CONFIG_DIR are NOT read; neither is the ANTHROPIC_MODEL variable
-#        nor an `env` block inside a settings file), drop a trailing [...] suffix. Same
+#        nor any other key of a settings `env` block), drop a trailing [...] suffix. Same
 #        family: pass nothing (keeps a [1m] variant). Absent: pass the family.
 #        Different family or an unrecognised value: pass the lineage family and
-#        WARN. Settings that cannot be read: pass nothing and WARN; no guess.
+#        WARN. An alias that only STARTS with a family word (for example `opusplan`)
+#        is an unrecognised value on purpose: the lineage family is passed with a
+#        WARNING (a decision, pinned by test_unrecognised_settings_value_passes_lineage_flag_and_warns).
+#        Settings that cannot be read: pass nothing and WARN; no guess.
 # Settings are never edited. The ANTHROPIC_DEFAULT_*_MODEL variables are only READ (rule A); the launcher
 # never sets, unsets or overrides them, nor ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY.
 _log_info() {
@@ -167,7 +174,7 @@ _log_info() {
 }
 
 _resolve_model_pin() {
-    local var kind text
+    local var kind text end_seen=0
     model_flag=()
     for var in $(compgen -e | grep -E '^ANTHROPIC_DEFAULT_.*_MODEL$'); do
         if [[ -n "${!var}" ]]; then
@@ -184,9 +191,10 @@ _resolve_model_pin() {
             FLAG) model_flag=(--model "$text") ;;
             INFO) _log_info "$text" ;;
             WARN) _log_warn "$text" ;;
+            END) end_seen=1 ;;
         esac
-    done < <(python3 - "$HOME" "$CD_TARGET" <<'PY'
-import json, re, sys
+    done < <(python3 -I - "$HOME" "$CD_TARGET" <<'PY'
+import atexit, json, re, sys
 from pathlib import Path
 
 home, cwd = Path(sys.argv[1]), Path(sys.argv[2])
@@ -195,6 +203,10 @@ FAMILIES = ("opus", "sonnet", "haiku", "fable")
 
 def out(kind, text=""):
     print(f"{kind}\t{text}")
+
+
+# the last line on every path (normal end, sys.exit, after the excepthook)
+atexit.register(out, "END")
 
 
 def _internal_error(exc_type, exc, tb):
@@ -222,6 +234,7 @@ if family not in FAMILIES:
     sys.exit(0)
 
 value = None
+remap = {}
 for path in (home / ".claude" / "settings.json", cwd / ".claude" / "settings.json", cwd / ".claude" / "settings.local.json"):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -232,8 +245,18 @@ for path in (home / ".claude" / "settings.json", cwd / ".claude" / "settings.jso
     except (OSError, ValueError):
         out("WARN", f"model pin: cannot read settings file {path}; not guessing the merged model, passing no --model")
         sys.exit(0)
+    env = data.get("env")
+    if isinstance(env, dict):
+        for key, val in env.items():
+            if isinstance(key, str) and re.fullmatch(r"ANTHROPIC_DEFAULT_[A-Z0-9_]*_MODEL", key):
+                remap[key] = val if isinstance(val, str) and val else None
     if "model" in data and data["model"] not in (None, ""):
         value = data["model"]
+
+set_names = sorted(k for k, v in remap.items() if v)
+if set_names:
+    out("INFO", f"model pin: settings env sets {set_names[0]}; passing no --model")
+    sys.exit(0)
 
 if value is None:
     out("FLAG", family)
@@ -250,6 +273,11 @@ else:
     out("FLAG", family)
 PY
 )
+    # No END record means python3 died or was cut short: never trust a partial result.
+    if [[ "$end_seen" -ne 1 ]]; then
+        model_flag=()
+        _log_warn "model pin: python3 produced no end record; starting as before, no --model passed"
+    fi
 }
 
 model_flag=()
