@@ -239,7 +239,12 @@ def drawn(world):
 def _load_tool():
     spec = importlib.util.spec_from_file_location("model_switch_read_under_test", TOOL)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    # run as the CLI runs: only the tool's own directory on sys.path (it imports `_common` flat)
+    sys.path.insert(0, str(Path(TOOL).parent))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.remove(str(Path(TOOL).parent))
     return mod
 
 

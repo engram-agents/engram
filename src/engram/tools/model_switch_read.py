@@ -23,12 +23,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from _common import engram_home  # the tools layer's ENGRAM_HOME resolver (#3863); only this directory is on sys.path
 
 # (name, cap), in the skill's order.
 STRATA = (
@@ -58,8 +59,7 @@ class Refusal(Exception):
 
 
 def default_db() -> Path:
-    home = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
-    return Path(home) / "knowledge.db"
+    return engram_home() / "knowledge.db"
 
 
 def open_readonly(db_path) -> sqlite3.Connection:
