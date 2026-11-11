@@ -104,7 +104,7 @@ like everything else.
    skill, forgot to tier it" cannot drift past review. This is a mechanical gate,
    not vigilance.
 
-*(All three parts are LIVE, so tiering is enforced rather than aspirational: the
+*(All three parts are LIVE: the
 manifest exists; `src/build/engine/build.py` and `cli.py` resolve it at build
 time, and the CLI's own help calls it "the single source of truth"; and
 `pr-checks.yml` runs the `manifest-gate` step on every PR. Behavioural
@@ -287,8 +287,7 @@ be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
 This is a pointer, not the policy. The single source of truth — the full rule,
 the substrate/non-substrate discriminator, per-project scope, the day-grant
 carve-out, examples, gray-area calls, and the baton turn-target corollary — lives
-in **[`docs/internal/PR-MERGE-POLICY.md`](docs/internal/PR-MERGE-POLICY.md)**. Read it there; don't
-re-derive the rule from this summary.
+in **[`docs/internal/PR-MERGE-POLICY.md`](docs/internal/PR-MERGE-POLICY.md)**. Read it there.
 
 ## PR merge-readiness — CI-green gate
 
@@ -583,8 +582,7 @@ state, does not count as the colleague box.** The colleague pass
 starts only once the reviewer-fairy round has converged on the tip being
 reviewed — or has reached item 1's three-round cap with its open findings
 listed in the PR body, which is the sequence's stopping point — not before,
-not in parallel, no exception for a PR that requests both at once. Lei's reasoning, stated because it should carry the rule rather
-than just accompany it: (1) the fairy round is *within the author's own
+not in parallel, no exception for a PR that requests both at once. Lei's reasoning: (1) the fairy round is *within the author's own
 control* — a self-check by a fresh-eyed, context-less reviewer that interrupts
 nobody's workflow, a sanity check and a courtesy to peers, not a cost worth
 working around. (2) Peer review *assumes* fairy convergence — implementation
@@ -1021,9 +1019,11 @@ When a PR fully closes an issue, **both surfaces are required**:
    verified via the `closingIssuesReferences` GraphQL field. Without it, the
    issue does NOT auto-close on merge regardless of title content. (The
    bracket form in the title is human-scan cosmetic; the parser ignores it.)
-   GitHub documents that keywords close issues only on a merge into the
-   DEFAULT branch, now `main`, not `dev`: after merging, the merge seat checks
-   the issue and, if it stayed open, closes it by hand naming the merge commit.
+   **Standing rule (2026-11-11):** a closing keyword does NOT close an issue on a
+   merge into `dev` (measured twice: `docs/internal/PR-ISSUE-CLOSURE.md`). The merge
+   seat closes it by hand right after the press, naming the PR and merge commit;
+   title and body keep `[closes #N]` / `Closes #N.` as intent. If `dev` becomes the
+   default branch, this lapses.
 
 
 **For multi-PR / EPIC ships:** earlier PRs may reference the issue number but
@@ -1088,7 +1088,7 @@ incident below).
    `"nodes":[]` (empty) means the body is missing the keyword form and the PR
    will NOT auto-close **via the body** on merge; rewrite via
    `gh pr edit <PR> --body "..."`. **An empty array says NOTHING about commit
-   messages — see check 3, which covers the path this query cannot see.** Intent only: a merge to `dev` closes nothing (item 2 above).
+   messages — see check 3, which covers the path this query cannot see.** Intent only: a merge to `dev` closes nothing (standing rule, item 2).
 
    **This query lags a `gh pr edit --body`/push, in EITHER direction** (a fixed body
    can still read non-empty; a bad one can read empty). Query, wait at least 5

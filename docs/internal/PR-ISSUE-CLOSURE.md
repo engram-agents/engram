@@ -144,3 +144,17 @@ form that fires the parser.
    one of "the setting changed since May" / "subject keywords don't fire" is
    true, and nobody has separated them. Measure on the next real
    `[closes #N]` merge before claiming either way.
+
+## Closing keywords do not close issues on a merge into `dev` (2026-11-11)
+
+On this repository the default branch is `main` and PRs merge into `dev`. Measured
+twice on 2026-11-11: a PR with the title `[closes #N]` and the body `Closes #N.`
+merged into `dev`, and the issue stayed open both times. In both cases the merge
+seat closed the issue by hand, with a comment naming the PR and the merge commit.
+
+GitHub applies closing keywords only on a merge into the default branch, which
+matches what was observed. The team commander's ruling of the same day, standing
+rather than interim: the merge seat closes the issue by hand right after the
+press, naming the PR and the merge commit. Titles keep `[closes #N]` and bodies
+keep `Closes #N.` as readable intent. No closing workflow is built for now. If
+`dev` becomes the default branch, the keywords work again and the rule lapses.
