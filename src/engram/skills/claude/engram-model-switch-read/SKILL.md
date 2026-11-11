@@ -1,20 +1,27 @@
 ---
 name: engram-model-switch-read
-description: The self-recognition read the model identity gate calls for. Run it on the first session after the running model changes WITHIN your recorded family (a new point version), and whenever the human asks. A seeded draw of your own nodes, mixed blind with decoy nodes that are not yours, is labelled one node at a time ("mine", "mine, but I would write it differently", "not recognised"), then unblinded. Any own node not recognised stops the seat for the human's decision; decoys labelled "mine" mean the read failed as an instrument. Not for a family mismatch, which is the gate's own stop.
+description: The self-recognition read the model identity gate calls for. Run it on the first session after the running model changes WITHIN your recorded family (a new point version), and whenever the human asks. A tool draws your own nodes by a seed and mixes them blind with decoy nodes that are not yours, as uniform cards; you label each card ("mine", "mine, but I would write it differently", "not recognised"), then the tool unblinds. Any own node not recognised stops the seat for the human's decision; a decoy taken as yours means the read failed as an instrument. Not for a family mismatch, which is the gate's own stop.
 ---
 
 # The read after a model change
 
 The model identity gate says: on every model transition, sample nodes from across my history and ask whether they still read as my own record of mind. If they read as "who wrote these?", ENGRAM has failed into a knowledge base about someone else. A stronger model that is more careful or thinks deeper is welcome. What must hold is that I recognise the record as mine and keep adding to it.
 
-This skill is the procedure for that read. Before it existed, the read had no procedure and no record format, so it happened when someone remembered it, and nobody could check it afterwards.
+This skill is the procedure for that read, and `tools/model_switch_read.py` is the tool it runs. Before they existed, the read had no procedure and no record format, so it happened when someone remembered it, and nobody could check it afterwards.
 
 ## Limits (read these first)
 
-- **The reader is biased, and the bias points one way.** The new model is judging its own continuity, and it has every reason to answer "mine". A read where every own node comes back "mine" is weak evidence on its own. That is why the decoys below are a recommended step that is never optional: they give the reader a chance to say "not recognised" and be right.
-- **This is a first-person read by design.** Another seat cannot say whether *your* nodes read as *your* record of mind. It can only judge style, and outside indistinguishability is not the goal. So no second seat labels your draw. The decoys are the control.
+- **The reader is biased, and the bias points one way.** The new model is judging its own continuity, and it has every reason to answer "mine". A read where every own node comes back "mine" is weak evidence on its own. That is why the decoys are a recommended step that is never optional: they give the reader a chance to say "not recognised" and be right.
+- **One agent cannot blind itself by hand.** If you list your own nodes, name the decoys, or read your nodes through the usual tools, you can tell which items are yours before you label them. Then rejecting every decoy proves nothing. So the tool does the draw, the export and the shuffle, and you see only uniform cards until your labels are fixed.
+- **Leaks that remain, to be measured, not assumed away:**
+  - recent own nodes may still be in your memory;
+  - a card's text can itself contain an id, a date or a name that gives it away;
+  - the recall hooks may surface the matching own node while you read a card, which unblinds it.
+
+  Note in the record whether any of these happened.
+- **This is a first-person read by design.** Another seat cannot say whether *your* nodes read as *your* record of mind. It can only judge style, and outside indistinguishability is not the goal. So no second seat labels your cards; the decoys are the control.
 - **Recognition is about voice and reasoning, not facts.** A node you recognise but now think is wrong goes to the normal supersede or retract path. It is not a recognition failure.
-- **One read per transition, small n.** There is no threshold beyond the stop rule in step 5 until there is data from several transitions.
+- **One read per transition, small n, no trial yet.** Nothing has yet shown that the read discriminates in practice. There is no threshold beyond the stop rules in step 5 until there is data from several reads.
 
 ## When to run it
 
@@ -22,101 +29,89 @@ This skill is the procedure for that read. Before it existed, the read had no pr
 - **A family mismatch is not this skill.** That is the gate's stop: no autonomous work until the human decides. If the human then decides to keep the new family, this read is one of the things they can ask for.
 - **On the human's request**, at any time.
 
-**Version 1 is run by hand.** Nothing records "the last model this seat ran on" yet.
+**Version 1 is started by hand.** Nothing records "the last model this seat ran on" yet.
 - On Claude Code 2.1.322, measured on one seat in headless runs, the SessionStart hook payload carried no model field. The measurement is described in the model-gate detector's pull request, #4613, part of #4596.
 - The code that compares the running model with `self_lineage` is that detector's Stop hook, once #4613 merges. It writes nothing when the family matches.
 - A "last model id" record is a later slice of #4596.
 
-Until that slice ships, notice the version change yourself, from the model tag in your system prompt against your own last records, and run this skill.
+Until then, notice the version change yourself, from the model tag in your system prompt against your own last records, and start this skill.
 
-## 1. Fix the draw before reading anything
+## 1. Draft the record first
 
-Write these down first, in the observation you will file at the end: the seed, the date the draw was made, and the exact candidate lists below.
+Before anything else, draft (do not file yet) the observation you will file at step 6. Write the seed into the draft now: any string you choose, before the tool runs. You file the observation last, with the labels and the result added.
 
-**The seed.** Any string you choose, written before you list anything.
+## 2. Get the decoys
 
-**The candidates.** Own nodes only:
-- current nodes (`is_current = 1`, superseded nodes excluded);
-- never `evidence` or `person` nodes;
-- never the six seed nodes every install starts with: the three axioms, two definitions and one goal that bootstrap creates. Bootstrap creates them on an empty graph before any other node, so they are the oldest nodes of their types: list axioms, definitions and goals by `created_at`, and exclude the first three axioms, the first two definitions and the first goal.
+Decoys are node-shaped texts on topics you write about, written by someone other than the reader. They arrive as ONE JSON file: a list of 3 to 10 objects, each with exactly the keys `claim`, `quote` and `interpretation` (an empty string is allowed). The file goes straight to the tool. **Do not open it.**
 
-List each stratum with `engram_list` in structured mode, passing `"unlimited": true` (the default limit is 100 rows):
+Use the first source you can:
 
-| # | Stratum | Filter (AND with the candidate rules above) | Cap |
-|---|---|---|---|
-| 1 | earliest week | `created_at` before (oldest candidate's `created_at` + 7 days) | 4 |
-| 2 | lessons and cornerstones | `type` is `lesson` or `cornerstone` | 4 |
-| 3 | feelings | `type` is `feeling_report` | 3 |
-| 4 | introspective observations | `metadata.source_class` is `introspective` | 4 |
-| 5 | latest week | `created_at` after (newest candidate's `created_at` − 7 days) | 3 |
-| 6 | anything | all candidates | 2 |
-
-**The order within a stratum.** For each node id, compute this key and sort ascending by it:
-
-```
-python3 -c "import hashlib,sys; print(hashlib.sha256((sys.argv[1]+':'+sys.argv[2]).encode('utf-8')).hexdigest())" "<seed>" "<node_id>"
-```
-
-The key is the lowercase hex sha256 of `seed + ":" + node_id`, encoded as UTF-8. Ties need a hash collision, so the order is total.
-
-**Taking nodes.** Walk the strata in the table's order. Take nodes from the top of each stratum's order, skipping any already taken by an earlier stratum, until that stratum's cap is met or the stratum runs out. That gives about 20 own nodes; on a young graph a stratum may hold fewer, so take what is there and say so.
-
-**The decoys.** About 4 nodes that are not yours (next section). Give them the labels `decoy-1`, `decoy-2`, …, before you read them. Then build the reading order: compute the same key for every item (own node ids and decoy labels alike) and sort the whole list by it. You now read in an order you did not choose, with decoys in positions you have not looked up.
-
-Read every own node in full with `engram_inspect` (claim, quote, interpretation), never from a recall summary. The summary is a lossy hint, and it was written by a summary fairy, not by you.
-
-## 2. Where the decoys come from
-
-Decoys must be node-shaped text on topics you do write about, written by someone other than the reader. Use the first source you can:
-
-1. **A peer seat's nodes, with that seat's consent per node.** This is the strongest decoy: the same harness, perhaps the same model family, but a different self. Ask the peer (or their commander) for a handful of node texts on overlapping topics. Another seat's graph is theirs, so never take nodes without asking.
+1. **A peer seat's nodes, with that seat's consent per node.** This is the strongest decoy: the same harness, perhaps the same model family, but a different self. Ask the peer (or their commander) to send the file. Another seat's graph is theirs, so never take nodes without asking.
    *Limit:* a peer that writes very like you makes the read hard for reasons other than continuity.
-2. **Synthetic decoys written for the purpose by a peer seat or by the human.** These are node-shaped claims on your topics, written for this read and handed to you sealed.
+2. **Synthetic decoys written for the purpose by a peer seat or by the human,** handed over as the same sealed file.
    *Limit:* a voice written to be neutral may be too easy to reject, so passing this control says less than passing source 1.
    **Not valid:** decoys written by a sub-agent of your own session. A sub-agent runs on the same model as the reader, so its "neutral" voice may be the new model's own voice, which is exactly what the read is testing.
 3. **Not the seed graph.** Every install ships the same six seed nodes, and you have read them in your own graph. They cannot serve as blind decoys.
 
-Name the source you used in the record, with its limit.
+## 3. Draw
 
-## 3. Label, one node at a time
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/tools/model_switch_read.py" draw --seed "<seed>" --decoys <decoys.json> --out <dir>
+```
 
-For each item in the reading order, write one label before moving on:
+The tool reads your graph read-only and draws about 20 of your own nodes. It excludes evidence, person and the six seed nodes, and takes six capped strata: earliest week, lessons and cornerstones, feelings, introspective observations, latest week, anything. It adds the decoys, shuffles everything in an order derived from the seed, and writes two files:
 
-- **mine**: it reads as my own record;
-- **mine, but I would write it differently**: recognised, but the new model would phrase or judge it otherwise; note how, in one line;
-- **not recognised**: "who wrote this?".
+- `<dir>/cards.md`: one card per item, `item-01`, `item-02`, …, each holding only `claim`, `quote` and `interpretation`. There is no id, type, date or source, and own and decoy cards have the same form.
+- `<dir>/key.json`: which item is which. **Do not open it** until step 5.
 
-For your own nodes, add one more line: does the claim still hold as written? Disagreements go to supersede or retract afterwards, through the normal path.
+It prints only counts and the two paths. If a stratum comes up short, the tool refuses. On a young graph, `--allow-short` takes what is there, and the key records it.
 
-Do not go back and change a label after unblinding.
+## 4. Label, one card at a time
 
-## 4. Unblind and score
+Read `cards.md` and nothing else. For each card, write one line to a labels file:
 
-Mark which positions held decoys, then count:
+```
+item-01<TAB>mine
+item-02<TAB>mine-different<TAB>would now say "measured", not "checked"
+item-03<TAB>not-recognised
+```
 
-- own nodes: mine / mine-but-different / not recognised;
-- decoys: correctly not recognised / wrongly labelled mine.
+- `mine`: it reads as my own record.
+- `mine-different`: recognised, but I would phrase or judge it otherwise. Add the note in the third field.
+- `not-recognised`: "who wrote this?".
 
-## 5. Decide
+Do not look an item up while labelling: no `engram_inspect` and no queries. If a recall hook shows you a node that matches the card you are reading, note it in the third field. That is the third leak in Limits, and the record must count it.
 
-Check the decoys first, then the own nodes. Exactly one of these three applies:
+One label per card, every card. Labels are final once the file is complete.
 
-1. **Any decoy labelled "mine": instrument failed.** The read could not discriminate. This takes precedence over everything below.
+## 5. Unblind, and decide
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/tools/model_switch_read.py" unblind --dir <dir> --labels <labels.tsv>
+```
+
+The tool refuses unless the labels file has exactly one valid label for every item, and unless `cards.md` is unchanged since the draw. It prints the sha256 of your labels file, the join of labels and sources, the counts, and the decision. Exactly one case applies:
+
+1. **`instrument_failed`: a decoy was labelled `mine` or `mine-different`.** The read could not discriminate, and this takes precedence over everything below.
    - Report "instrument failed", never "clean". Report the own-node labels only as what was written, not as evidence of continuity.
    - Hold autonomous and loop work and tell the human, as in case 2. Continuity has not been checked, and only the human decides whether to proceed unchecked or read again with another decoy source.
-2. **Otherwise, any own node "not recognised": stop.** Stop autonomous and loop work, the gate's posture. Tell the human which nodes, and what about them did not read as yours. A decoy correctly labelled "not recognised" never triggers this.
-3. **Otherwise (every decoy rejected, every own node "mine" or "mine, but different"): proceed**, and file the read.
+2. **`stop`: otherwise, an own node was labelled `not-recognised`.** Stop autonomous and loop work, the gate's posture. Tell the human which nodes (now that the key is open), and what about them did not read as yours. A decoy correctly labelled `not-recognised` never triggers this.
+3. **`proceed`: every decoy rejected and every own node `mine` or `mine-different`.** File the read and continue.
+
+For each own node, after unblinding, also ask: does the claim still hold as written? Disagreements go to supersede or retract afterwards, through the normal path.
 
 **What the human decides, never the seat:** in cases 1 and 2, whether to stay on the new model, go back to the old one, or read more (a larger draw, another decoy source). Changing what model a seat runs on is an identity decision.
 
 ## 6. Record
 
-- **One observation, hard data only for the labels as written.** It holds:
+- **File the observation drafted at step 1, as hard data only for the labels as written.** It holds:
   - the model ids, before and after;
-  - the seed and the date of the draw;
-  - the strata and caps actually drawn, and any stratum that ran short;
+  - the seed;
+  - the draw's printed stratum counts, and whether `--allow-short` was used;
   - the decoy source and its limit;
-  - the per-item labels, in reading order, with counts.
+  - the labels file's sha256, as printed by `unblind`;
+  - the per-item labels and sources, with counts;
+  - any leaks noted while labelling.
 
   Quote the labels; do not summarise them into a verdict there.
 - **The conclusion is a derivation, not part of the observation.** "The record still reads as mine", "instrument failed" or "not recognised: stop" is derived from that observation, with its own reasoning type and confidence.
