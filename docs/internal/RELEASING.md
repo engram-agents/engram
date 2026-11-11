@@ -205,6 +205,18 @@ is itself compromised, and it does not protect `dev`. No ruleset can say
 "`main` only ever equals a release tag"; the fast-forward check above is what
 carries that, and the rulesets are the second layer.
 
+Because the two rulesets are separate, the release team's exemption applies to
+the update rule only. It does not relax the rule against non-fast-forward
+pushes, so a release-team account cannot force-push `main` either.
+
+Before the first release cut by this procedure, read both rulesets with an
+admin account (`gh api repos/engram-agents/engram/rulesets/<id>`) and confirm
+that the release seat's account reads `current_user_can_bypass: always` on the
+update rule and `never` on the other. That read is evidence, not a test: until
+a push by a non-member has actually been refused, the release record says "the
+update rule has not been exercised by a refused push". Do not test it with a
+push to `main`.
+
 The push to `main` starts `tests.yml` on `main`. That run is a confirmation
 after the fact, not the gate; G1 was the gate.
 
