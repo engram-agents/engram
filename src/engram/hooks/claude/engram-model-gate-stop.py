@@ -15,7 +15,10 @@ Decision order (the Stop payload carries ``session_id`` and ``transcript_path``)
      (``engram_signature.read_model_tail``, the same row rules as the signature's ``_read_model``).
   3. ``engram_core.model_id_to_lineage()``: the ONE family table.  This file holds no mapping of its own.
   4. MATCH writes nothing.  MISMATCH (mapped, and different) and UNKNOWN (cannot tell) write one record.
-     UNKNOWN never collapses into MATCH.
+     UNKNOWN never collapses into MATCH when a record can be written.  Three paths write nothing while
+     ``self_lineage`` is set: a ``_hooklib`` import failure, a failed append (a symlinked or hard-linked
+     records file, a full disk), and a refused ``ENGRAM_HOME``.  They are the broken-hook case that the
+     planned gate-run fallback record (below) is for.
 
 UNKNOWN reasons (a closed set): ``transcript_path_missing``, ``transcript_not_found``,
 ``transcript_unreadable``, ``no_model_row`` (no assistant or attachment row yet, or only placeholder
@@ -31,6 +34,11 @@ or rotates it.  Growth bounds: (1) change-only: no append when the newest record
 costs one line per session; (2) a hard cap: at ``RECORDS_MAX_BYTES`` exactly one final
 ``records_cap_reached`` line is appended and nothing more, so the cap is visible, never silent.
 
+Limits of the record, for whoever reads it: change-only hides a flap within one session (sonnet, opus,
+sonnet writes one line, then nothing for the return), so a record means "this session was seen on X", not
+a count of switches.  "Exactly one cap line" holds serially: two concurrent sessions that both see the file
+at the cap can each append one (bounded, and visible).
+
 Time: the detector's own work stays under ``TIME_BUDGET_MS`` on a 50 MB transcript, measured in-process
 without interpreter or first-import cost (``tests/test_model_gate_detector_4596.py``).
 
@@ -44,6 +52,7 @@ any change to the autostart runner.
 """
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +67,9 @@ RECORDS_MAX_BYTES = 5 * 1024 * 1024
 TIME_BUDGET_MS = 100
 SCHEMA_VERSION = 1
 STDIN_MAX_BYTES = 1 << 20
+# Copy of engram_core._LINEAGE_RE (the `provider:family` shape of self_lineage), kept here only so the hook
+# can decide dormancy WITHOUT importing engram_core.  If the source pattern changes, change this one too.
+_LINEAGE_RE = re.compile(r"[a-z0-9_-]+:[a-z0-9._-]+")
 
 try:
     from _hooklib import (
@@ -224,11 +236,11 @@ def detect(payload, home):
     self_lineage = _config_lineage(home)
     if not self_lineage:
         return None  # dormant: write nothing, create nothing
+    if not _LINEAGE_RE.fullmatch(self_lineage):
+        return None  # malformed: dormant, as _self_lineage() treats it, decided before any runtime import
     try:
         if not _load_runtime():
             return _safe_write(home, "UNKNOWN", "internal_error", session_id, None, None, self_lineage, tpath)
-        if not _core._LINEAGE_RE.fullmatch(self_lineage):
-            return None  # malformed: dormant, as _self_lineage() treats it
         if tpath is None:
             return _safe_write(home, "UNKNOWN", "transcript_path_missing", session_id, None, None, self_lineage, None)
         res = read_model_tail(tpath, TAIL_BYTES)

@@ -385,7 +385,7 @@ def read_model_tail(transcript, max_bytes: int) -> TailResult:
         if code in ("no_model_row", "no_usable_model"):
             code = "window_exceeded" if truncated else "no_model_row"
         elif code not in ("mixed_harness", "unmapped_model"):
-            code = "no_model_row"
+            code = "internal_error"  # a refusal this reader does not recognise (or one with no code)
         return TailResult(reason=code)
     return TailResult(model_id=model_id, marketing_name=name)
 

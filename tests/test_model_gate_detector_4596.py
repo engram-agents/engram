@@ -312,6 +312,37 @@ def test_c10_dormant_when_config_is_missing_or_unparseable(home, hook, tmp_path)
     assert not (home / "model-gate").exists()
 
 
+def test_c10_dormancy_is_decided_before_the_runtime_is_loaded(home, hook, tmp_path, monkeypatch):
+    """Round 2 (S1): a malformed or unset self_lineage must not even touch the runtime modules."""
+    calls = []
+    monkeypatch.setattr(hook, "_load_runtime", lambda: calls.append(1) or False)
+    t = write_jsonl(tmp_path / "t.jsonl", [asst("claude-fable-5-2")])
+    for value in ("Anthropic:Opus", "opus", None):
+        set_lineage(home, value)
+        stop(hook, home, t)
+    assert calls == [] and not (home / "model-gate").exists()
+
+
+def test_c10_malformed_lineage_with_unloadable_runtime_writes_nothing(home, tmp_path):
+    """Round 2 (S1): real process, hooks beside NO runtime modules, malformed self_lineage -> nothing written."""
+    root = tmp_path / "bare"
+    (root / "hooks").mkdir(parents=True)
+    for f in HOOK_DIR.glob("*.py"):
+        shutil.copy2(f, root / "hooks" / f.name)
+    set_lineage(home, "Not A Lineage")
+    t = write_jsonl(tmp_path / "t.jsonl", [asst("claude-fable-5-2")])
+    done = run_hook(home, {"session_id": "b1", "transcript_path": str(t)},
+                    hook_file=root / "hooks" / HOOK_FILE.name, cwd=str(tmp_path))
+    assert (done.returncode, done.stdout) == (0, "")
+    assert not (home / "model-gate").exists()
+    # and a VALID lineage with the same unloadable runtime still records internal_error (the case S2 names)
+    set_lineage(home, "anthropic:opus")
+    done = run_hook(home, {"session_id": "b2", "transcript_path": str(t)},
+                    hook_file=root / "hooks" / HOOK_FILE.name, cwd=str(tmp_path))
+    assert done.returncode == 0 and done.stdout == ""
+    assert [(r["outcome"], r["reason"]) for r in records(home)] == [("UNKNOWN", "internal_error")]
+
+
 # ------------------------------------------------------------ 11-14 record file
 
 def test_c11_schema(home, hook, tmp_path):
@@ -389,6 +420,60 @@ def test_c14_cap_writes_exactly_one_visible_line_then_nothing(home, hook, tmp_pa
     assert len(lines) == 1
     r = json.loads(lines[0])
     assert r["outcome"] == "UNKNOWN" and r["reason"] == "records_cap_reached" and set(r) == SCHEMA_KEYS
+
+
+
+def _filler_records(total, line_len=1024):
+    """Valid JSON-lines filler of exactly ``total`` bytes (lines of ``line_len``, the last one the remainder)."""
+    def mk(n):
+        base = len(json.dumps({"schema": 1, "filler": ""}).encode()) + 1
+        return (json.dumps({"schema": 1, "filler": "x" * (n - base)}) + "\n").encode()
+    full, rem = divmod(total, line_len)
+    blob = mk(line_len) * full + (mk(rem) if rem else b"")
+    assert len(blob) == total
+    return blob
+
+
+def test_c14_cap_boundary_exactly_at_the_cap_is_capped(home, hook, tmp_path):
+    """Round 2 (S4b): 'at or over'.  Kills the mutant ``size > RECORDS_MAX_BYTES``."""
+    d = home / "model-gate"
+    d.mkdir()
+    blob = _filler_records(hook.RECORDS_MAX_BYTES)
+    (d / "records.jsonl").write_bytes(blob)
+    t = write_jsonl(tmp_path / "t.jsonl", [asst("claude-fable-5-2")])
+    stop(hook, home, t)
+    (r,) = [json.loads(x) for x in (d / "records.jsonl").read_bytes()[len(blob):].decode().splitlines()]
+    assert r["reason"] == "records_cap_reached"
+
+
+def test_c14_cap_boundary_one_byte_under_gets_a_normal_record(home, hook, tmp_path):
+    d = home / "model-gate"
+    d.mkdir()
+    blob = _filler_records(hook.RECORDS_MAX_BYTES - 1)
+    (d / "records.jsonl").write_bytes(blob)
+    t = write_jsonl(tmp_path / "t.jsonl", [asst("claude-fable-5-2")])
+    stop(hook, home, t)
+    (r,) = [json.loads(x) for x in (d / "records.jsonl").read_bytes()[len(blob):].decode().splitlines()]
+    assert (r["outcome"], r["reason"], r["model_id"]) == ("MISMATCH", None, "claude-fable-5-2")
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_c14_linked_records_file_is_refused_and_the_target_untouched(home, tmp_path, kind):
+    """Round 2 (S5): nothing is written through a link; the hook still exits 0 with no stdout."""
+    d = home / "model-gate"
+    d.mkdir()
+    target = tmp_path / "victim.txt"
+    target.write_bytes(b"precious\n")
+    link = d / "records.jsonl"
+    if kind == "symlink":
+        link.symlink_to(target)
+    else:
+        os.link(target, link)
+    t = write_jsonl(tmp_path / "t.jsonl", [asst("claude-fable-5-2")])
+    done = run_hook(home, {"session_id": "L", "transcript_path": str(t)})
+    assert (done.returncode, done.stdout) == (0, "")
+    assert target.read_bytes() == b"precious\n"
+    assert link.read_bytes() == b"precious\n"
 
 
 # ------------------------------------------------------------ 15 hook process
@@ -530,6 +615,53 @@ def test_c17_read_model_whole_file_is_unchanged_in_shape(tmp_path):
     assert e.value.field == "model"
 
 
+
+def _first_line_decides(path, total):
+    """A transcript of exactly ``total`` bytes whose only model row is the FIRST line (opus)."""
+    first = json.dumps(asst("claude-opus-5-5")) + "\n"
+    pad = total - len(first.encode()) - len(json.dumps(user("")) + "\n")
+    assert pad >= 0
+    rest = json.dumps(user("p" * pad)) + "\n"
+    path.write_text(first + rest, encoding="utf-8")
+    assert path.stat().st_size == total
+    return path
+
+
+def test_c17_window_boundary_exactly_the_bound_reads_the_first_line_whole(tmp_path):
+    """Round 2 (S4a).  Kills the mutant 'start the window one byte late'."""
+    n = sig.read_model_tail(_first_line_decides(tmp_path / "a.jsonl", 4096), 4096)
+    assert (n.model_id, n.reason) == ("claude-opus-5-5", None)
+
+
+def test_c17_window_boundary_one_byte_over_discards_the_partial_first_line(tmp_path):
+    n = sig.read_model_tail(_first_line_decides(tmp_path / "b.jsonl", 4097), 4096)
+    assert (n.model_id, n.reason) == (None, "window_exceeded")
+
+
+def test_c17_hook_window_boundary_at_TAIL_BYTES(home, hook, tmp_path):
+    ta = _first_line_decides(tmp_path / "a.jsonl", hook.TAIL_BYTES)
+    stop(hook, home, ta, session="A")          # opus decides at exactly the bound -> MATCH, nothing written
+    assert records(home) == []
+    tb = _first_line_decides(tmp_path / "b.jsonl", hook.TAIL_BYTES + 1)
+    stop(hook, home, tb, session="B")          # one over: the first line is partial and discarded
+    (r,) = records(home)
+    assert (r["outcome"], r["reason"]) == ("UNKNOWN", "window_exceeded")
+
+
+def test_c17_unknown_refusal_code_maps_to_internal_error(tmp_path, monkeypatch):
+    """Round 2 (S3): a refusal whose code the tail reader does not know is not 'no_model_row'."""
+    t = write_jsonl(tmp_path / "t.jsonl", [asst("claude-opus-5-5")])
+
+    def boom(rows, transcript):
+        raise sig._Refusal("model", "something new", code="brand_new_code")
+
+    monkeypatch.setattr(sig, "_model_from_rows", boom)
+    assert sig.read_model_tail(t, 1 << 20).reason == "internal_error"
+    monkeypatch.setattr(sig, "_model_from_rows",
+                        lambda rows, transcript: (_ for _ in ()).throw(sig._Refusal("model", "no code")))
+    assert sig.read_model_tail(t, 1 << 20).reason == "internal_error"
+
+
 # ----------------------------------------------------------------- 19 budget
 
 @pytest.fixture(scope="module")
@@ -549,6 +681,8 @@ def big_transcript(tmp_path_factory):
 
 
 def test_c19_time_budget_in_process(home, hook, big_transcript, capsys):
+    # Scope of the number: tail read, parse, map and the append / change-only skip.  The records scan is NOT
+    # inside it in any meaningful way: the records file here is one line (a full 64 KiB scan is not measured).
     assert hook.TIME_BUDGET_MS == 100
     stop(hook, home, big_transcript, session="warm")  # untimed: first call imports the runtime modules
     cold_free = []

@@ -1190,7 +1190,7 @@
       "path": "hooks/claude/engram-model-gate-stop.py",
       "tier": "essential",
       "dest": "hooks/engram-model-gate-stop.py",
-      "note": "engram-alpha#4596 slice 1: the model identity gate's detector. A Stop hook that records (never blocks, never prints) when the session's model family differs from self_lineage or cannot be told. Essential because the gate ships in every tier's template; the tier is the ruling seat's to confirm."
+      "note": "engram-alpha#4596 slice 1: the model identity gate's detector. A Stop hook that records (never blocks, never prints) when the session's model family differs from self_lineage or cannot be told. Essential because the gate ships in every tier's template; the tier was confirmed by the ruling seat for this PR."
     },
     {
       "path": "hooks/claude/engram-bash-pipe-exit-warn.py",
