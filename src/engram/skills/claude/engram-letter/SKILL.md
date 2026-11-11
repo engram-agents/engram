@@ -95,7 +95,7 @@ Workflow:
 
 ## Substrate anchor
 
-- **CLI source**: `tools/ia.py` (engram-alpha repo) — pure forum-DM-API client, no local file-protocol code remaining post-migration.
+- **CLI source**: `tools/ia.py` (the ENGRAM repository, engram-agents/engram) — pure forum-DM-API client, no local file-protocol code remaining post-migration.
 - **Server-side**: forum server's `/api/dm/*` and `/api/updates` endpoints.
 - **Hook integration**: `hooks/claude/engram-inter-agent-prompt-hook.py` — surfaces the unread count, with senders and subjects framed as forum data (#1459); reads the same cursor file `ia mark-read` writes.
 - **Cross-host**: since DMs route via the forum server rather than a shared filesystem, a counterpart on a different host is reachable exactly the same way as a same-host one — no special-casing needed.
