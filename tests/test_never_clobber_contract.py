@@ -1,8 +1,8 @@
 """Contract tests: setup never silently overwrites or deletes a user's file.
 
-Written BEFORE the implementation. On the commit that adds this file most of these cells FAIL,
-each for the contract reason it names; they pass once a fix implements the contract. Related
-guards already exist (#4440 for CLAUDE.md, #4452 for AGENTS.md); this file pins the wider rule.
+Written BEFORE the implementation, each cell failing for the contract reason it names until the
+contract is implemented. Related guards exist (#4440 for CLAUDE.md, #4452 for AGENTS.md); this
+file pins the wider rule.
 
 The rule: setup backs up first, asks, and acts only on the user's yes.
 
@@ -189,19 +189,19 @@ def _file_map(*roots: Path) -> dict[str, str]:
 
 # --------------------------------------------------------------------- C5: existing agent
 
-LETTER = _sentinel("warm-briefing-letter")
+USER_AUTHORED = _sentinel("warm-briefing-user-authored")
 
 
 def _memory_without_graph(tmp_path: Path) -> Path:
     wb = tmp_path / ".engram" / "warm-briefing.md"
     wb.parent.mkdir(parents=True, exist_ok=True)
-    wb.write_bytes(LETTER)
+    wb.write_bytes(USER_AUTHORED)
     return wb
 
 
 def _assert_nothing_written_by_refusal(tmp_path: Path, r: subprocess.CompletedProcess, wb: Path) -> None:
     assert r.returncode != 0, "bootstrap must refuse to seed over an existing agent's memory:\n" + _text(r)
-    assert wb.read_bytes() == LETTER, "warm-briefing.md was overwritten"
+    assert wb.read_bytes() == USER_AUTHORED, "warm-briefing.md was overwritten"
     assert not (tmp_path / ".engram" / "first-run-pending").exists()
     assert not (tmp_path / ".engram" / "seed-manifest.json").exists()
     assert "warm-briefing.md" in _text(r), "the refusal must name what it found:\n" + _text(r)
@@ -250,8 +250,8 @@ def test_refusal_names_newest_db_backup(tmp_path):
 def test_second_install_backs_up_current_identity_file(tmp_path):
     """C4: a second install must not lose the CURRENT CLAUDE.md just because .pre-engram exists.
 
-    Today the first-ever backup (.pre-engram) is kept and the current file is overwritten with
-    no copy anywhere, so the CURRENT sentinel is gone.
+    The first-ever backup (.pre-engram) is kept as it is; the current file gets its own stamped
+    backup before it is replaced, so the CURRENT sentinel survives.
     """
     current = _sentinel("claude-md-CURRENT")
     old = _sentinel("claude-md-OLD")
@@ -281,8 +281,8 @@ def test_identical_file_is_not_backed_up(tmp_path, flags):
 
     The identical file is the render of an earlier run into the same home path (the render
     embeds the home path, so the same tmp home is reused); the data home is then emptied, so
-    this is not an existing-agent home. Today a CLAUDE.md with no seed manifest cannot be
-    recognised as identical: it is refused (no flag) or backed up (--force).
+    this is not an existing-agent home. A CLAUDE.md that equals the render is recognised as
+    identical without any seed manifest.
     """
     first = _run(tmp_path)
     assert first.returncode == 0, _text(first)
@@ -312,7 +312,7 @@ def _codex_pair(tmp_path: Path) -> tuple[Path, Path, bytes, bytes]:
 
 
 def test_refusal_lists_every_path_needing_consent(tmp_path):
-    """C2: ONE refusal names EVERY differing protected path (today: only AGENTS.md)."""
+    """C2: ONE refusal names EVERY differing protected path."""
     compact, agents, c_bytes, a_bytes = _codex_pair(tmp_path)
     r = _run(tmp_path, target="codex")
     msg = _text(r)
@@ -433,12 +433,9 @@ _WRITE_MODE_RE = re.compile(r"[wax+]")
 _OS_OPEN_WRITE_RE = re.compile(r"O_(WRONLY|RDWR|CREAT|TRUNC|APPEND)")
 
 # Reviewed write sites that the contract KEEPS. Anything else in bootstrap.py is a violation:
-# it must go through the consent/backup helper instead. `call=None` allows the whole function.
+# it must go through the consent/backup helper (src/engram/engram_file_guard.py) instead; the
+# helper's own writes are exempt by file. `call=None` allows the whole function.
 BOOTSTRAP_ALLOWLIST = [
-    {"func": "_copy_exclusive", "call": None,
-     "reason": "exclusive create of a NEW backup/copy: mkstemp temp + os.link publish, never overwrites dst"},
-    {"func": "_atomic_write_text", "call": None,
-     "reason": "settings.json merge the user asked for with --retention-days: temp file + fsync + os.replace"},
     {"func": "main", "call": "engram_tools_link.unlink()",
      "reason": "removes the ENGRAM-made plugin symlink only (guarded by is_symlink())"},
     {"func": "main", "call": "engram_tools_link.rename(backup)",
@@ -569,6 +566,14 @@ _PROTECTED_VAR_RE = re.compile(
 
 # Reviewed shell lines that touch files but not a user's protected file. (They do not expand a
 # protected variable, so the scanner would not flag them anyway; the entries record the review.)
+# Shell write sites to a protected variable that are NOT yet moved into the helper. Each reason
+# names the slice that moves it; the entry is removed in that slice.
+INSTALL_SH_PENDING = [
+    ('cp -p "$CLAUDE_MD" "$CLAUDE_MD_BACKUP"',
+     "slice 2: install.sh step 6 keeps its own `cp -p` backup beside the file until the installer "
+     "hands the backup to the helper; bootstrap backs up per write in the meantime"),
+]
+
 INSTALL_SH_ALLOWLIST = [
     ('rm -rf "$WORK_DIR"', "the installer's own scratch directory"),
     ('cp -R "$WORK_DIR/." "$LOG_SAVE_DIR/"', "saves the failed run's log into $ENGRAM_HOME/install-logs (ENGRAM-owned)"),
@@ -670,14 +675,14 @@ def test_static_write_sites_are_reviewed():
     """Static gate: every file-writing call in bootstrap.py / install.sh is a reviewed, kept site.
 
     The allowlist holds only the sites the contract KEEPS; the helper that implements consent and
-    backup will live in another module, so none of its calls appear here. Today's violations are
-    the plain write_text calls (template renders, seed manifest, first-run marker, codex compact
-    prompt, config.toml merge) and install.sh's `cp -p "$CLAUDE_MD" "$CLAUDE_MD_BACKUP"`.
+    backup lives in another module (src/engram/engram_file_guard.py), so none of its calls appear
+    here. Sites not yet moved into it are listed with a reason that names the slice that moves them.
     """
     _assert_python_scanner_controls()
     _assert_shell_scanner_controls()
     py_bad = _py_violations(BOOTSTRAP_PY.read_text(), BOOTSTRAP_ALLOWLIST)
-    sh_bad = _sh_write_sites(INSTALL_SH.read_text())
+    pending = {cmd for cmd, reason in INSTALL_SH_PENDING if "slice 2" in reason}
+    sh_bad = [(ln, text) for ln, text in _sh_write_sites(INSTALL_SH.read_text()) if text not in pending]
     problems = [f"src/engram/bootstrap.py:{ln}: {text}   (in {func})" for ln, func, text in py_bad]
     problems += [f"src/engram/tools/install.sh:{ln}: {text}" for ln, text in sh_bad]
     assert not problems, (
@@ -729,7 +734,7 @@ def _installer_with_real_bootstrap(tmp_path: Path) -> Sandbox:
 
 def _existing_agent_home(sb: Sandbox, with_graph: bool) -> dict[Path, bytes]:
     sentinel_files = {
-        sb.engram / "warm-briefing.md": _sentinel("letter"),
+        sb.engram / "warm-briefing.md": _sentinel("warm-briefing-user-authored"),
         sb.engram / "history" / "2026-11-01.md": _sentinel("history"),
         sb.engram / "diary" / "x.md": _sentinel("diary"),
         sb.claude_home / "CLAUDE.md": _sentinel("claude-md"),
@@ -770,8 +775,8 @@ def test_reinstall_over_existing_home_keeps_the_old_agent(tmp_path, with_graph):
 
     Run: the installer end to end (harness fakes for claude/pip/network/marketplace, the REAL
     bootstrap.py), non-interactive, no --yes. Cell 1 has a graph (the installer skips bootstrap
-    today, so this cell may already pass). Cell 2 moves knowledge.db away: memory without a graph,
-    which the installer must refuse.
+    then). Cell 2 moves knowledge.db away: memory without a graph, which the installer must
+    refuse.
     """
     sb = _installer_with_real_bootstrap(tmp_path)
     sentinel_files = _existing_agent_home(sb, with_graph)

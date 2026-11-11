@@ -80,6 +80,7 @@ CODEX_HOME = Path(os.environ["CODEX_HOME"]) if TARGET == "codex" else None
 # resolve DATA_DIR — that's a separate concern from where server.py lives.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import server  # noqa: E402
+import engram_file_guard as fg  # noqa: E402
 
 
 def _add(fn, **kwargs) -> str:
@@ -200,246 +201,37 @@ def _render_template_text(src: Path, substitutions: dict[str, str]) -> str:
 def substitute_template(
     src: Path, dst: Path, substitutions: dict[str, str]
 ) -> None:
+    """Render `src` to `dst` through the file guard: an existing differing `dst` is refused."""
     text = _render_template_text(src, substitutions)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(text)
+    try:
+        fg.apply(fg.plan([fg.Item(dst, text)]))
+    except fg.Refused as e:
+        raise SystemExit(str(e))
 
 
-# --- Never clobber a user's existing identity file (#4440) -------------------
-# The Claude path (CLAUDE.md) and the Codex path (config.toml) decide "is there a
-# file here I must not destroy" through ONE helper, so they cannot disagree.
+# --- Never clobber a user's existing file -----------------------------------------------
+# engram_file_guard owns the decision, the backup and the write for every protected path
+# (CLAUDE.md, AGENTS.md, config.toml, codex-compact-prompt.md, warm-briefing.md,
+# seed-manifest.json, first-run-pending). These names stay for callers and tests.
 
 CLAUDE_MD_BACKUP_NAME = "CLAUDE.md.pre-engram"  # same name install.sh writes
 CODEX_CONFIG_BACKUP_NAME = "config.toml.pre-engram"
 AGENTS_MD_BACKUP_NAME = "AGENTS.md.pre-engram"  # #4452, the Codex counterpart of CLAUDE.md
 
-
-def _target_present(path: Path) -> bool:
-    """True if anything sits at `path`, a dangling symlink included.
-
-    os.path.lexists, not Path.exists(): exists() follows a symlink and says False
-    for a dangling one, which would skip the backup for exactly that case.
-    """
-    return os.path.lexists(path)
-
-
-def _is_dangling_symlink(path: Path) -> bool:
-    return _target_present(path) and path.is_symlink() and not path.exists()
+_target_present = fg.target_present
+_is_dangling_symlink = fg.is_dangling_symlink
+_copy_exclusive = fg.copy_exclusive
+_atomic_write_text = fg.atomic_write_text
+_backup_path_problem = fg.backup_path_problem
+_backup_once = fg.backup_once
 
 
 def _refuse_dangling(path: Path) -> None:
     raise SystemExit(
         f"[bootstrap] REFUSED: {path} is a symlink to a path that does not exist "
-        f"({os.readlink(path)}). Remove the link (rm '{path}') or repair it so it "
-        f"points at a real file, then re-run."
+        f"({os.readlink(path)}). Move the link aside (mv '{path}' '{path}.moved-aside') or "
+        f"repair it so it points at a real file, then re-run."
     )
-
-
-# os.link errnos meaning "this filesystem has no hard links" (exFAT/FAT, some CIFS/SMB).
-_NO_HARDLINK_ERRNOS = frozenset(
-    e for e in (
-        errno.EPERM, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", None),
-        errno.EXDEV, errno.ENOSYS,
-    ) if e is not None
-)
-
-
-def _copy_exclusive(src: Path, dst: Path) -> None:
-    """Copy bytes then metadata from `src` to `dst`, publishing it all at once; raise
-    FileExistsError if anything is at `dst`.
-
-    Property: after this returns or raises, `dst` either does not exist or holds a COMPLETE
-    copy of `src` (bytes and metadata). It never removes, truncates or writes through an
-    entry it did not create in this call. The copy is built in a UNIQUE sibling temp
-    `<dst>.partial-<random>` made by tempfile.mkstemp (O_CREAT|O_EXCL, never reuses an
-    existing name, so whatever already sits at any `.partial-` name is left alone); the
-    temp's bytes are fsync'd, then it is published with os.link(temp, dst): atomic, raises
-    FileExistsError for anything at `dst` (a symlink included), never overwrites or
-    truncates. The temp this call created is always unlinked afterwards. No directory
-    fsync is done, so no durability claim is made. shutil.copy2/copyfile onto `dst` would
-    open it for writing and follow links (#4380 ratchet).
-
-    Fallback, honestly: on a filesystem without hard links (os.link fails with EPERM,
-    EOPNOTSUPP, ENOTSUP, EXDEV or ENOSYS) the finished temp is published with
-    os.replace(temp, dst). That is still atomic, so no partial file can appear, but it
-    LOSES EXCLUSIVITY: os.replace overwrites whatever is at `dst`. The caller has already
-    established that `dst` is absent, so the residual risk is the check-then-publish race,
-    on those filesystems only. Any other OSError from os.link propagates with nothing at `dst`.
-    """
-    import shutil
-    import tempfile
-    temp = None  # the exact path mkstemp returned, stored once; None until it has created it
-    try:
-        # dir=dst.parent is LOAD-BEARING: os.link is same-filesystem only, so a temp under
-        # $TMPDIR would make every publish hit the EXDEV os.replace fallback below and
-        # silently lose exclusivity. A killed run can leave a uniquely named
-        # `<name>.partial-*` file; it is inert (never read or published) and safe to delete
-        # by hand.
-        fd, temp = tempfile.mkstemp(dir=dst.parent, prefix=dst.name + ".partial-")
-        # fdopen first, so the fd mkstemp returned is closed even if opening src fails.
-        with os.fdopen(fd, "wb") as temp_f, open(src, "rb") as src_f:
-            shutil.copyfileobj(src_f, temp_f)
-            temp_f.flush()
-            os.fsync(temp_f.fileno())
-        shutil.copystat(src, temp)
-        try:
-            os.link(temp, dst)
-        except FileExistsError:
-            raise
-        except OSError as e:
-            if e.errno not in _NO_HARDLINK_ERRNOS:
-                raise
-            os.replace(temp, dst)
-    finally:
-        if temp is not None:
-            try:
-                os.unlink(temp)
-            except FileNotFoundError:
-                pass
-
-
-def _backup_path_problem(path: Path, backup: Path) -> str | None:
-    """The REFUSED message if `path` cannot be saved to `backup`, else None. Pure: writes nothing.
-
-    A dangling symlink at `backup` is neither "a backup exists" (nothing is saved there)
-    nor "absent" (a plain copy would write through the link). A backup that is the same file
-    as `path` (hard link or link to it) would be destroyed with `path`. Anything else that is
-    not a regular file (directory, FIFO, device, socket) cannot hold a copy.
-    """
-    if _is_dangling_symlink(backup):
-        return (
-            f"[bootstrap] REFUSED: the backup path {backup} is a symlink to a path that "
-            f"does not exist ({os.readlink(backup)}), so {path} cannot be saved there. "
-            f"Remove the link (rm '{backup}') or repair it, then re-run."
-        )
-    if _target_present(backup) and os.path.samefile(path, backup):
-        return (
-            f"[bootstrap] REFUSED: the backup path {backup} is the same file as {path} "
-            f"(a hard link or link to it), so it would be overwritten too. Move "
-            f"'{backup}' away, then re-run."
-        )
-    if _target_present(backup) and not backup.is_file():
-        return (
-            f"[bootstrap] REFUSED: the backup path {backup} is not a regular file, so "
-            f"{path} cannot be saved there. Move it away, then re-run."
-        )
-    return None
-
-
-def _backup_once(path: Path, backup: Path) -> None:
-    """Copy `path` to `backup` with metadata, once; an existing backup is never touched.
-
-    Refuses (writing nothing) on any `_backup_path_problem`. The backup itself is written
-    with an exclusive create.
-    """
-    problem = _backup_path_problem(path, backup)
-    if problem is not None:
-        raise SystemExit(problem)
-    if _target_present(backup):
-        print(f"  backup: existing {backup} kept untouched", flush=True)
-        return
-    try:
-        _copy_exclusive(path, backup)
-    except FileExistsError:
-        raise SystemExit(
-            f"[bootstrap] REFUSED: something appeared at the backup path {backup} while "
-            f"{path} was being saved, so nothing was written there. Move it away, then re-run."
-        )
-    except OSError as e:
-        raise SystemExit(
-            f"[bootstrap] REFUSED: could not save {path} to the backup path {backup} "
-            f"({e}), so nothing was written there. Fix the cause, then re-run."
-        )
-    print(f"  backup: {path} -> {backup}", flush=True)
-
-
-def _identity_file_state(path: Path, expected: str | None) -> str:
-    """'absent' | 'dangling' | 'identical' | 'differs' for an identity file (CLAUDE.md, AGENTS.md)."""
-    if not _target_present(path):
-        return "absent"
-    if _is_dangling_symlink(path):
-        return "dangling"
-    if expected is not None:
-        try:
-            if path.read_text() == expected:
-                return "identical"
-        except (OSError, UnicodeDecodeError):
-            pass
-    return "differs"
-
-
-def _identity_file_guard(
-    path: Path, expected: str | None, force: bool, backup_name: str,
-    seeded_db: Path | None = None, act: bool = True,
-) -> None:
-    """Refuse (SystemExit) unless writing `path` is safe; back it up first under --force.
-
-    `act=False` is the check-only pass: every refusal (including the backup-path ones) is
-    raised exactly as in the act pass, but nothing is written.
-
-    One guard for every identity file the installer renders (CLAUDE.md, #4440; AGENTS.md,
-    #4452), so the decision cannot differ between them. `seeded_db` is set only by the late
-    guard, which runs after seeding: its refusal message then says the DB already exists and
-    how to recover.
-    """
-    state = _identity_file_state(path, expected)
-    if state == "dangling":
-        _refuse_dangling(path)
-    if state == "differs":
-        backup = path.parent / backup_name
-        if not force and seeded_db is not None:
-            raise SystemExit(
-                f"[bootstrap] REFUSED: {path} already exists and differs from what ENGRAM "
-                f"would write, and {seeded_db} was already seeded before this check ran. "
-                f"Recover: remove {seeded_db} and re-run with --force (backs the file up to "
-                f"{backup} first), or move {path} away and re-run."
-            )
-        if not force:
-            raise SystemExit(
-                f"[bootstrap] REFUSED: {path} already exists and differs from what ENGRAM "
-                f"would write. Re-run with --force (backs it up to {backup} first), "
-                f"or move the file away yourself."
-            )
-        if not act:
-            problem = _backup_path_problem(path, backup)
-            if problem is not None:
-                raise SystemExit(problem)
-            return
-        _backup_once(path, backup)
-
-
-def _claude_md_guard(
-    path: Path, expected: str | None, force: bool, seeded_db: Path | None = None
-) -> None:
-    _identity_file_guard(path, expected, force, CLAUDE_MD_BACKUP_NAME, seeded_db)
-
-
-def _agents_md_guard(
-    path: Path, expected: str | None, force: bool, seeded_db: Path | None = None,
-    act: bool = True,
-) -> None:
-    _identity_file_guard(path, expected, force, AGENTS_MD_BACKUP_NAME, seeded_db, act)
-
-
-def _codex_config_preflight(path: Path, act: bool = True) -> None:
-    """Codex: refuse a dangling symlink; otherwise back up an existing file once.
-
-    `act=False` is the check-only pass: the same refusals, no backup written.
-
-    The merge itself stays (foreign stanzas survive); the backup covers what the
-    strip removes, i.e. the user's own top-level instructions block.
-    """
-    if not _target_present(path):
-        return
-    if _is_dangling_symlink(path):
-        _refuse_dangling(path)
-    backup = path.parent / CODEX_CONFIG_BACKUP_NAME
-    if not act:
-        problem = _backup_path_problem(path, backup)
-        if problem is not None:
-            raise SystemExit(problem)
-        return
-    _backup_once(path, backup)
 
 
 def _remove_compact_section(text: str) -> str:
@@ -463,27 +255,26 @@ def _remove_compact_section(text: str) -> str:
     return text[:start] + "\n" + text[next_section + 1:]
 
 
-def merge_codex_config_toml(
-    config_path: Path,
+def merged_codex_config_text(
+    existing: str,
     instructions_body: str,
     compact_prompt_path: str,
-) -> None:
-    """Write Codex identity keys into config.toml, preserving pre-existing stanzas.
+) -> str:
+    """Return the config.toml text with the Codex identity keys set, preserving other stanzas.
+
+    Pure: reads and writes nothing. The caller hands the result to the file guard, which
+    backs the current file up before replacing it.
 
     Strategy (merge-not-clobber):
-    - Read the existing file if present; otherwise start from empty string.
+    - Start from the existing text (empty string if there is no file).
     - Strip any pre-existing instructions=, experimental_compact_prompt_file=,
       and # model = ... lines (to replace them idempotently).
     - Prepend the new identity block (instructions, compact_prompt_file, model
       comment) to the remaining content.
-    - Write the result back.
 
     This ensures that plugin stanzas appended by 'codex plugin add' after an
     initial bootstrap run are preserved intact on subsequent runs.
     """
-    # Read existing content (may contain plugin stanzas)
-    existing = config_path.read_text() if config_path.exists() else ""
-
     # Strip lines that are part of the identity block we're (re)writing.
     # These patterns match:
     #   instructions = """..."""  (multiline — find start/end)
@@ -532,62 +323,46 @@ def merge_codex_config_toml(
     else:
         new_content = identity_block
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(new_content)
+    return new_content
 
 
-def _render_codex_target(substitutions: dict[str, str], force_identity_file: bool = False) -> None:
-    """Render the three Codex identity surfaces.
+def _codex_texts(substitutions: dict[str, str]) -> "tuple[str, str]":
+    """Render the two Codex texts that depend on the substitutions. Pure: writes nothing.
 
-    1. ~/.engram/codex-compact-prompt.md ($ENGRAM_HOME)  — compact instructions (standalone)
-    2. ~/.codex/config.toml               — identity keys (merge-not-clobber)
-    3. ~/.codex/AGENTS.md                 — project conventions placeholder
+    Returns (compact_prompt_text, instructions_body):
+    1. ~/.engram/codex-compact-prompt.md ($ENGRAM_HOME)  - compact instructions (standalone)
+    2. the instructions= body of ~/.codex/config.toml (the identity keys, merge-not-clobber)
+    ~/.codex/AGENTS.md (project conventions placeholder) is the plain template render.
 
     The instructions= body is the full template.CLAUDE.md rendered with
-    seed-IDs/ENGRAM_HOME, then adapted for Codex (CLAUDE_PLUGIN_ROOT →
-    CODEX_PLUGIN_ROOT; ~/.claude/CLAUDE.md self-refs → ~/.codex/config.toml;
-    output-styles ref → personality/#816). template.CLAUDE.md no longer
-    contains a ## Compact Instructions section (as of engram-alpha#2067),
-    so there is nothing left to remove here; the Codex compact prompt is
-    rendered separately, at step 1 above, from templates/compact-instructions.md.
+    seed-IDs/ENGRAM_HOME, then adapted for Codex (CLAUDE_PLUGIN_ROOT -> CODEX_PLUGIN_ROOT;
+    ~/.claude/CLAUDE.md self-refs -> ~/.codex/config.toml; output-styles ref ->
+    a personality pointer). template.CLAUDE.md no longer contains a ## Compact Instructions
+    section (as of engram-alpha#2067), so there is nothing left to remove here; the Codex
+    compact prompt is rendered separately from templates/compact-instructions.md.
 
     {{AGENT_NAME}}, {{USER_NAME}}, {{SELF_NODE_ID}}, {{TODAY}} are intentionally
     left for the first-session skill to resolve.
     """
-    assert CODEX_HOME is not None, "CODEX_HOME must be set for TARGET=codex"
-
-    # 1. codex-compact-prompt.md — compact instructions file
     compact_body = substitutions.get("{{COMPACT_INSTRUCTIONS}}", "")
     # Apply seed-IDs and ENGRAM_HOME (leave first-session markers alone)
     compact_rendered = compact_body
     for placeholder, value in substitutions.items():
         if placeholder != "{{COMPACT_INSTRUCTIONS}}":
             compact_rendered = compact_rendered.replace(placeholder, value)
-    compact_out = ENGRAM_HOME / "codex-compact-prompt.md"
-    compact_out.parent.mkdir(parents=True, exist_ok=True)
-    compact_out.write_text(compact_rendered)
-    print(f"  codex-compact-prompt.md → {compact_out}", flush=True)
 
-    # 2. ~/.codex/config.toml — instructions= body
     # Start from the template.CLAUDE.md, substitute seed-IDs + ENGRAM_HOME,
     # then apply Codex-specific adaptations, then remove compact section.
-    claude_template_path = TEMPLATES_DIR / "template.CLAUDE.md"
-    raw = claude_template_path.read_text()
-
-    # Apply all substitutions. template.CLAUDE.md no longer contains
-    # {{COMPACT_INSTRUCTIONS}} (as of engram-alpha#2067), so this loop no
-    # longer folds the compact instructions back in — the compact prompt was
-    # already rendered separately in step 1 above.
+    raw = (TEMPLATES_DIR / "template.CLAUDE.md").read_text()
     rendered = raw
     for placeholder, value in substitutions.items():
         rendered = rendered.replace(placeholder, value)
 
     # Strip a ## Compact Instructions section if present. This is currently
-    # a no-op — the template no longer carries that section (engram-alpha#2067)
-    # — retained deliberately as a guard: docs/compaction-continuity.md
+    # a no-op (the template no longer carries that section, engram-alpha#2067),
+    # retained deliberately as a guard: docs/compaction-continuity.md
     # anticipates the section being re-added to template.CLAUDE.md later, and
-    # if that happens this call makes the Codex path strip it automatically
-    # rather than relying on someone remembering to re-add the strip.
+    # if that happens this call makes the Codex path strip it automatically.
     rendered = _remove_compact_section(rendered)
 
     # Codex-specific textual adaptations
@@ -601,34 +376,7 @@ def _render_codex_target(substitutions: dict[str, str], force_identity_file: boo
         "`~/.claude/output-styles/*`",
         "personality (see #816)",
     )
-
-    compact_prompt_path = str(ENGRAM_HOME / "codex-compact-prompt.md")
-    merge_codex_config_toml(
-        CODEX_HOME / "config.toml",
-        rendered,
-        compact_prompt_path,
-    )
-    print(f"  config.toml → {CODEX_HOME}/config.toml", flush=True)
-
-    # 3. ~/.codex/AGENTS.md — project conventions placeholder
-    if not force_identity_file:
-        # Late guard (#4452): the early guard compared against a PREDICTED render; this one
-        # compares against the real one. Under --force the early guard already backed up.
-        # Skipping this under --force (and `_predicted_agents_render` being exact at all)
-        # holds only while template.AGENTS.md contains none of `_SEED_PLACEHOLDERS`; pinned
-        # by test_agents_template_has_no_seed_placeholders in tests/test_bootstrap_agents_md_4452.py.
-        _agents_md_guard(
-            CODEX_HOME / "AGENTS.md",
-            _render_template_text(TEMPLATES_DIR / "template.AGENTS.md", substitutions),
-            False,
-            seeded_db=ENGRAM_HOME / "knowledge.db",
-        )
-    substitute_template(
-        TEMPLATES_DIR / "template.AGENTS.md",
-        CODEX_HOME / "AGENTS.md",
-        substitutions,
-    )
-    print(f"  AGENTS.md → {CODEX_HOME}/AGENTS.md", flush=True)
+    return compact_rendered, rendered
 
 
 def _utc_stamp() -> str:
@@ -643,29 +391,6 @@ def _json_indent(text: str) -> "int | str":
         return 2
     lead = m.group(1)
     return "\t" if lead.startswith("\t") else len(lead)
-
-
-def _atomic_write_text(path: Path, text: str, mode: int) -> None:
-    """Write `text` to `path` via a temp file in the same directory: fsync, then os.replace.
-
-    The temp is created exclusively with `mode` and unlinked on any failure, so a crash
-    leaves either the old file or the new one, never a partial settings.json.
-    """
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
 
 
 def _check_settings(claude_home: Path) -> "tuple[Path, dict | None, str]":
@@ -865,36 +590,42 @@ _SEED_PLACEHOLDERS = (
     "{{DF_ENGRAM}}", "{{DF_EPISTEMIC_IDENTITY}}", "{{GL_EPISTEMIC_HUMILITY}}",
 )
 
+# create_seed_graph on an empty graph mints these IDs every time: the sequences table counts
+# from 1 per node type, in the fixed order of the calls above. Pinned against the real seeding
+# by tests/test_engram_file_guard_slice1.py, so the check-only pass can predict every render
+# without a seed manifest. If a run ever mints different IDs (a 0-node store that kept old
+# counters), the post-seeding pass judges the REAL renders and refuses what it cannot replace.
+_FIXED_SEED_IDS = {
+    "{{AX_HONESTY}}": "ax_0001",
+    "{{AX_HONESTY_DISCRETION}}": "ax_0002",
+    "{{AX_PROVENANCE}}": "ax_0003",
+    "{{DF_ENGRAM}}": "df_0001",
+    "{{DF_EPISTEMIC_IDENTITY}}": "df_0002",
+    "{{GL_EPISTEMIC_HUMILITY}}": "gl_0001",
+}
+
 
 def _predicted_claude_render() -> str | None:
-    """What this run would write to CLAUDE.md, for the pre-write identity check.
+    """What this run would write to CLAUDE.md, for the check-only pass.
 
-    Seed IDs are only known after seeding, and the guard must run BEFORE anything is
-    written. So the IDs come from a previous run's seed-manifest.json (the aborted-then-
-    retried install, where an empty graph re-seeds to the same IDs). No usable manifest
-    -> None, and an existing file is then treated as differing.
+    The seed IDs are fixed (`_FIXED_SEED_IDS`), so no seed manifest is read. An unreadable
+    template -> None.
     """
     try:
-        ids = json.loads((ENGRAM_HOME / "seed-manifest.json").read_text())["seed_ids"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-    if not isinstance(ids, dict) or not all(isinstance(ids.get(k), str) for k in _SEED_PLACEHOLDERS):
-        return None
-    try:
         return _render_template_text(
-            TEMPLATES_DIR / "template.CLAUDE.md", _build_substitutions(ids, quiet=True)
+            TEMPLATES_DIR / "template.CLAUDE.md",
+            _build_substitutions(dict(_FIXED_SEED_IDS), quiet=True),
         )
     except OSError:
         return None
 
 
 def _predicted_agents_render() -> str | None:
-    """What this run would write to AGENTS.md, for the pre-write identity check.
+    """What this run would write to AGENTS.md, for the check-only pass.
 
-    template.AGENTS.md carries no seed-ID placeholders, so no seed manifest is needed: the
-    render is the template under the same substitutions the real run uses (the unresolved
-    first-session markers stay literal). An unreadable template -> None, and an existing
-    file is then treated as differing.
+    template.AGENTS.md carries no seed-ID placeholders: the render is the template under the
+    same substitutions the real run uses (the unresolved first-session markers stay literal).
+    An unreadable template -> None.
     """
     try:
         return _render_template_text(
@@ -904,24 +635,128 @@ def _predicted_agents_render() -> str | None:
         return None
 
 
+def _read_existing_text(path: Path) -> str:
+    """Existing text of `path` for the merge ('' if absent, dangling or not a file: the guard
+    refuses those). A file that exists but cannot be read as UTF-8 text refuses here."""
+    if not fg.target_present(path) or not path.is_file():
+        return ""
+    try:
+        return path.read_text()
+    except (OSError, UnicodeDecodeError) as e:
+        raise SystemExit(
+            f"[bootstrap] REFUSED: cannot read {path} as text ({e}), so ENGRAM cannot merge "
+            f"into it. Nothing was written. Move it aside, then re-run."
+        )
+
+
+def _write_items(
+    ids: dict[str, str], substitutions: dict[str, str], marker_payload: str,
+    claude_md_text: "str | None", agents_md_text: "str | None",
+) -> "list[fg.Item]":
+    """Every protected path this run would write, with its new text (one list for both passes)."""
+    manifest = json.dumps(
+        {"seed_ids": ids, "alpha_dir": str(ALPHA_DIR), "target": TARGET}, indent=2
+    )
+    items = [
+        fg.Item(ENGRAM_HOME / "seed-manifest.json", manifest),
+        fg.Item(
+            ENGRAM_HOME / "warm-briefing.md",
+            _render_template_text(TEMPLATES_DIR / "template.warm-briefing.md", substitutions),
+        ),
+        fg.Item(ENGRAM_HOME / "first-run-pending", marker_payload),
+    ]
+    if TARGET == "claude":
+        assert CLAUDE_HOME is not None
+        items.append(fg.Item(CLAUDE_HOME / "CLAUDE.md", claude_md_text, first_identity=True))
+    else:
+        assert CODEX_HOME is not None
+        compact_text, instructions_body = _codex_texts(substitutions)
+        compact_path = ENGRAM_HOME / "codex-compact-prompt.md"
+        config_path = CODEX_HOME / "config.toml"
+        items.append(fg.Item(compact_path, compact_text))
+        items.append(fg.Item(
+            config_path,
+            merged_codex_config_text(
+                _read_existing_text(config_path), instructions_body, str(compact_path)
+            ),
+            first_identity=True,
+        ))
+        items.append(fg.Item(CODEX_HOME / "AGENTS.md", agents_md_text, first_identity=True))
+    return items
+
+
+def _move_aside_command() -> str:
+    """The shell command that sets the whole ENGRAM home aside, for a deliberate fresh start."""
+    import shlex
+    home = str(ENGRAM_HOME)
+    return f"mv {shlex.quote(home)} {shlex.quote(home + '.moved-aside-')}$(date -u +%Y%m%dT%H%M%SZ)"
+
+
+def _memory_found() -> "list[str]":
+    """The files of an existing agent's memory in ENGRAM_HOME (C5): warm-briefing.md,
+    seed-manifest.json, a non-empty history/ or diary/."""
+    found = []
+    for name in ("warm-briefing.md", "seed-manifest.json"):
+        if fg.target_present(ENGRAM_HOME / name):
+            found.append(str(ENGRAM_HOME / name))
+    for name in ("history", "diary"):
+        d = ENGRAM_HOME / name
+        try:
+            if d.is_dir() and any(d.iterdir()):
+                found.append(f"{d}/ (not empty)")
+        except OSError:
+            found.append(f"{d}/ (unreadable)")
+    return found
+
+
+def _refuse_existing_memory(found: "list[str]", db_state: str) -> None:
+    lines = [
+        f"[bootstrap] REFUSED: {ENGRAM_HOME} already holds an agent's memory but {db_state}, "
+        f"so bootstrap will not seed a new graph beside it. --force and FORCE do not change "
+        f"this. Nothing was written.",
+        "  Found:",
+        *[f"    - {f}" for f in found],
+    ]
+    backups = sorted((ENGRAM_HOME / "db-backup").glob("*.db")) if (ENGRAM_HOME / "db-backup").is_dir() else []
+    if backups:
+        lines.append(
+            f"  The newest graph backup is {backups[-1]}. Restore it to "
+            f"{ENGRAM_HOME / 'knowledge.db'} (an empty knowledge.db there: move it aside "
+            f"first), then re-run."
+        )
+    lines.append(
+        f"  For a deliberate fresh start, set the whole home aside, then re-run:\n"
+        f"    {_move_aside_command()}"
+    )
+    raise SystemExit("\n".join(lines))
+
+
 class _Args(NamedTuple):
-    force: bool
+    consent: "fg.Consent"
     retention_days: "int | None"
 
 
 def _parse_args(argv: list[str]) -> _Args:
-    """Return (force, retention_days). Anything else is an error (no silent ignore).
+    """Return (consent, retention_days). Anything else is an error (no silent ignore).
 
-    `--force` is the identity-file overwrite (#4440). `--retention-days N` (#4445) is the
-    only way bootstrap touches ~/.claude/settings.json; N must be an integer 1..36500.
+    `--force` is consent to replace every differing file the refusal lists; `--replace PATH`
+    (repeatable) is consent for that path only. Either one is for use only after the user has
+    seen the list and said yes. `--retention-days N` is the only way bootstrap touches
+    ~/.claude/settings.json; N must be an integer 1..36500.
     """
     force = False
+    replace: list[str] = []
     retention_days = None
     i = 0
     while i < len(argv):
         arg = argv[i]
         if arg == "--force":
             force = True
+        elif arg == "--replace":
+            if i + 1 >= len(argv):
+                raise SystemExit("[bootstrap] --replace needs a PATH (the file the user agreed to replace)")
+            replace.append(argv[i + 1])
+            i += 1
         elif arg == "--retention-days":
             value = argv[i + 1] if i + 1 < len(argv) else None
             try:
@@ -939,11 +774,11 @@ def _parse_args(argv: list[str]) -> _Args:
             i += 1
         else:
             raise SystemExit(
-                f"[bootstrap] unknown argument {arg!r}; the options are --force and "
-                f"--retention-days N"
+                f"[bootstrap] unknown argument {arg!r}; the options are --force, "
+                f"--replace PATH and --retention-days N"
             )
         i += 1
-    return _Args(force, retention_days)
+    return _Args(fg.consent_for(force, replace), retention_days)
 
 
 def _tighten_home_step() -> None:
@@ -964,77 +799,105 @@ def _tighten_home_step() -> None:
         )
 
 
+def _check_existing_agent(db_path: Path) -> None:
+    """Refuse (SystemExit) before ANY write when the home already holds an agent (C5).
+
+    * knowledge.db with nodes: never seeded over, whatever FORCE / FORCE_RESEED_EMPTY say.
+    * no knowledge.db, or one with 0 nodes, while memory files are present: refused even
+      with --force, FORCE and FORCE_RESEED_EMPTY; no graph and no marker is created.
+    * no knowledge.db and no memory (a truly empty home): seed.
+    * an existing 0-node knowledge.db and no memory: seed only when FORCE=1 or
+      FORCE_RESEED_EMPTY=1 names it (an aborted prior bootstrap).
+
+    No path is deleted. A deliberate fresh start sets the whole home aside.
+    """
+    found = _memory_found()
+    if not db_path.exists():
+        if found:
+            _refuse_existing_memory(found, "there is no knowledge.db")
+        return
+    force = os.environ.get("FORCE", "0") == "1"
+    force_reseed_empty = os.environ.get("FORCE_RESEED_EMPTY", "0") == "1"
+    node_count = _db_node_count(db_path)
+    if node_count > 0:
+        if force or force_reseed_empty:
+            escape_var = "FORCE" if force else "FORCE_RESEED_EMPTY"
+            raise SystemExit(
+                f"[bootstrap] {escape_var}=1 refused: knowledge.db is non-empty "
+                f"({node_count} nodes).\n"
+                f"  Both FORCE=1 and FORCE_RESEED_EMPTY=1 require an empty (0-node) DB.\n"
+                f"  To start fresh on purpose, set the whole home aside, then re-run bootstrap\n"
+                f"  without any FORCE variable:\n"
+                f"    {_move_aside_command()}"
+            )
+        raise SystemExit(
+            f"ERROR: knowledge.db already exists at {db_path} ({node_count} nodes).\n"
+            "  bootstrap.py refuses to overwrite an existing install.\n"
+            "  - If this is your data, leave it as it is. To upgrade, use the\n"
+            "    engram-upgrade skill.\n"
+            "  - For a deliberate fresh start, set the whole home aside, then re-run:\n"
+            f"    {_move_aside_command()}"
+        )
+    # knowledge.db exists with 0 nodes.
+    if found:
+        _refuse_existing_memory(found, "its knowledge.db holds no nodes")
+    if not (force or force_reseed_empty):
+        raise SystemExit(
+            f"ERROR: knowledge.db already exists at {db_path} and holds no nodes.\n"
+            "  bootstrap.py refuses to overwrite an existing install without being told.\n"
+            "  - If this is an aborted prior bootstrap (verify the DB is truly empty),\n"
+            "    re-run with FORCE_RESEED_EMPTY=1.\n"
+            "  - Otherwise move the file aside (it is not removed), then re-run:\n"
+            f"    mv {db_path} {db_path}.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)"
+        )
+    escape_var = "FORCE" if force else "FORCE_RESEED_EMPTY"
+    print(
+        f"[bootstrap] {escape_var}=1 on empty DB — proceeding with seeding.",
+        flush=True,
+    )
+
+
 def main() -> None:
-    # --force: the one overwrite path for an existing, differing CLAUDE.md (#4440). It is a
-    # CLI flag, distinct from the FORCE env var below, which is about the knowledge.db.
+    # Consent: --force = yes to every file the refusal lists, --replace PATH = yes to that
+    # path only. Both are for use after the user has seen the list and said yes. They are CLI
+    # flags, distinct from the FORCE env var below, which is about an empty knowledge.db.
     _args = _parse_args(sys.argv[1:])
-    force_identity_file = _args.force
+    consent = _args.consent
 
     # #4445: a bad settings.json is refused before ANYTHING is created (no ENGRAM_HOME, no
     # knowledge.db), so repair + plain re-run works. Read-only apart from the backup copy.
     if _args.retention_days is not None and TARGET == "claude":
         _preflight_settings(CLAUDE_HOME)
 
-    # Refuse to overwrite an existing install — defense-in-depth for the
-    # plugin path.
-    #
-    # Named escape valves (in order of check):
-    #   FORCE=1             — on an EMPTY DB (0 nodes): proceed with seeding.
-    #                         On a non-empty DB: REFUSE (would corrupt the graph).
-    #   FORCE_RESEED_EMPTY=1 — same semantics as FORCE=1-on-empty-DB; explicit
-    #                         name for callers that want clarity at the call site.
-    #
-    # Neither escape valve deletes anything. A true clean slate requires
-    # manually deleting knowledge.db first, then re-running bootstrap.
+    # Existing-agent check (C5), before any write. Neither FORCE nor FORCE_RESEED_EMPTY
+    # deletes or seeds over memory; a clean slate is the user moving the whole home aside.
     db_path = ENGRAM_HOME / "knowledge.db"
-    if db_path.exists():
-        force = os.environ.get("FORCE", "0") == "1"
-        force_reseed_empty = os.environ.get("FORCE_RESEED_EMPTY", "0") == "1"
-        if force or force_reseed_empty:
-            node_count = _db_node_count(db_path)
-            escape_var = "FORCE" if force else "FORCE_RESEED_EMPTY"
-            if node_count > 0:
-                raise SystemExit(
-                    f"[bootstrap] {escape_var}=1 refused: knowledge.db is non-empty "
-                    f"({node_count} nodes).\n"
-                    f"  Both FORCE=1 and FORCE_RESEED_EMPTY=1 require an empty (0-node) DB.\n"
-                    f"  To start fresh: delete {db_path} manually (copy it first if unsure),\n"
-                    f"  then re-run bootstrap without any FORCE variable."
-                )
-            print(
-                f"[bootstrap] {escape_var}=1 on empty DB — proceeding with seeding.",
-                flush=True,
-            )
-            # DB file exists but has 0 nodes — safe to seed.
-        else:
-            raise SystemExit(
-                f"ERROR: knowledge.db already exists at {db_path}.\n"
-                "  bootstrap.py refuses to overwrite an existing install.\n"
-                "  - If this is your data — DO NOT delete it. To upgrade, use\n"
-                "    the engram-upgrade skill.\n"
-                "  - If this is an aborted prior bootstrap (verify the DB is\n"
-                "    truly empty first), delete the file and re-run.\n"
-                "  - FORCE_RESEED_EMPTY=1 re-seeds an empty (0-node) DB.\n"
-                "  - For a true fresh start, delete the file first."
-            )
+    _check_existing_agent(db_path)
 
-    # #4440: decide about the user's identity file BEFORE the first write of this run
-    # (seeding, symlinks, manifest), so a refusal HERE leaves nothing half-done. (That holds
-    # for this early guard only; the late guard below runs after seeding.)
-    if TARGET == "claude":
-        assert CLAUDE_HOME is not None
-        _claude_md_guard(CLAUDE_HOME / "CLAUDE.md", _predicted_claude_render(), force_identity_file)
-    elif TARGET == "codex":
-        assert CODEX_HOME is not None
-        # Check-only pass over BOTH files first: every refusal either can produce (including
-        # the backup-path ones) must precede the first backup, or a --force run could save
-        # AGENTS.md and then refuse about config.toml, leaving a backup behind a refusal that
-        # says nothing was written (#4452).
-        agents_expected = _predicted_agents_render()
-        _agents_md_guard(CODEX_HOME / "AGENTS.md", agents_expected, force_identity_file, act=False)
-        _codex_config_preflight(CODEX_HOME / "config.toml", act=False)
-        _agents_md_guard(CODEX_HOME / "AGENTS.md", agents_expected, force_identity_file)
-        _codex_config_preflight(CODEX_HOME / "config.toml")
+    # ONE check-only pass over every protected path this run would write, BEFORE the first
+    # write: absent -> will be written; identical -> left alone; differs -> needs consent.
+    # One refusal names every path that still needs it, and nothing has been written.
+    # The seed IDs are fixed, so the renders are predicted without a seed manifest.
+    marker_payload = json.dumps({
+        "created": _now_iso(),
+        "install_path": str(ALPHA_DIR),
+    }, indent=2)
+    predicted_claude = _predicted_claude_render()
+    predicted_agents = _predicted_agents_render()
+    if (TARGET == "claude" and predicted_claude is None) or (TARGET == "codex" and predicted_agents is None):
+        raise SystemExit(
+            f"[bootstrap] REFUSED: cannot read the templates under {TEMPLATES_DIR}. Nothing was written."
+        )
+    pre_plan = fg.plan(_write_items(
+        dict(_FIXED_SEED_IDS), _build_substitutions(dict(_FIXED_SEED_IDS), quiet=True),
+        marker_payload, predicted_claude, predicted_agents,
+    ))
+    pre_refusal = fg.refusal(pre_plan, consent)
+    if pre_refusal is not None:
+        raise SystemExit(pre_refusal)
+    # Back up every consented, differing file NOW: a backup that cannot be written refuses
+    # the run while nothing else has changed (no graph seeded, no file replaced).
+    backups = fg.save_backups(pre_plan, consent)
 
     # In plugin mode, symlink ~/.engram/tools ($ENGRAM_HOME/tools) -> <plugin-root>/tools so that
     # existing skill/agent references to ~/.engram/tools/<file> ($ENGRAM_HOME) (which were
@@ -1207,63 +1070,37 @@ def main() -> None:
 
     substitutions = _build_substitutions(ids)
 
-    manifest = {
-        "seed_ids": ids,
-        "alpha_dir": str(ALPHA_DIR),
-        "target": TARGET,
-    }
-    (ENGRAM_HOME / "seed-manifest.json").write_text(
-        json.dumps(manifest, indent=2)
+    # Every protected write goes through the guard: absent -> written; identical -> left
+    # alone; differs and consented -> backed up first. The guard judges the REAL renders here
+    # (the check-only pass judged predicted ones), so a path that changed meanwhile is refused.
+    final_items = _write_items(
+        ids, substitutions, marker_payload,
+        _render_template_text(TEMPLATES_DIR / "template.CLAUDE.md", substitutions) if TARGET == "claude" else None,
+        _render_template_text(TEMPLATES_DIR / "template.AGENTS.md", substitutions) if TARGET == "codex" else None,
     )
-    print(f"  manifest → {ENGRAM_HOME}/seed-manifest.json", flush=True)
-
-    # Shared (both targets): warm briefing lives in ENGRAM_HOME.
-    substitute_template(
-        TEMPLATES_DIR / "template.warm-briefing.md",
-        ENGRAM_HOME / "warm-briefing.md",
-        substitutions,
-    )
-    print(f"  warm-briefing.md → {ENGRAM_HOME}/warm-briefing.md", flush=True)
-
-    # Arm the first-run-pending marker — engram-first-session checks it to
-    # gate the cold-start dialogue. bootstrap.py is the single source of
-    # truth for the marker write (both plugin and any other install path).
-    marker_payload = json.dumps({
-        "created": _now_iso(),
-        "install_path": str(ALPHA_DIR),
-    }, indent=2)
-    (ENGRAM_HOME / "first-run-pending").write_text(marker_payload)
-    print(f"  first-run-pending → {ENGRAM_HOME}/first-run-pending", flush=True)
+    try:
+        written = fg.apply(
+            fg.plan(final_items), consent,
+            context=(
+                f"{db_path} was already seeded just before this second check ran. "
+                f"To retry, move it aside, then re-run with the same flags:\n"
+                f"    mv {db_path} {db_path}.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)"
+            ),
+            saved=backups,
+        )
+    except fg.Refused as e:
+        raise SystemExit(str(e))
+    for item in final_items:
+        if item.path in written:
+            print(f"  {item.path.name} → {item.path}", flush=True)
+        else:
+            print(f"  {item.path.name} unchanged (already holds what ENGRAM would write)", flush=True)
 
     # Owner-only data home (#4445), both targets. Runs BEFORE the settings step below so a
     # refusal there never skips it.
     _tighten_home_step()
 
-    # Target-specific identity doc + hook config
     if TARGET == "claude":
-        # #2067: the Claude template no longer folds in compact-instructions.md
-        # (removed the ## Compact Instructions section entirely — see
-        # docs/compaction-continuity.md). A plain single-file substitution is
-        # the whole render now (substitute_template() creates CLAUDE_HOME).
-        if not force_identity_file:
-            # Skipping this guard under --force rests on the early guard's predicted render
-            # matching the real one, which holds because create_seed_graph mints fixed IDs.
-            # Defence in depth: the early guard compared against a PREDICTED render; this
-            # one compares against the real one. (Under --force the early guard already
-            # backed the file up.)
-            _claude_md_guard(
-                CLAUDE_HOME / "CLAUDE.md",
-                _render_template_text(TEMPLATES_DIR / "template.CLAUDE.md", substitutions),
-                False,
-                seeded_db=ENGRAM_HOME / "knowledge.db",
-            )
-        substitute_template(
-            TEMPLATES_DIR / "template.CLAUDE.md",
-            CLAUDE_HOME / "CLAUDE.md",
-            substitutions,
-        )
-        print(f"  CLAUDE.md → {CLAUDE_HOME}/CLAUDE.md", flush=True)
-
         # #4445: LAST, and only when asked. It can refuse (a settings.json that is not a
         # JSON object), which must not skip anything above.
         if _args.retention_days is not None:
@@ -1276,7 +1113,6 @@ def main() -> None:
                 "(settings.json was not touched)",
                 flush=True,
             )
-        _render_codex_target(substitutions, force_identity_file)
 
 
 if __name__ == "__main__":

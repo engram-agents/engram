@@ -41,7 +41,7 @@ Five modes:
 | Exists | seeded | Exists | **identity-resolve** (scatter install today) | Skip 0.5/0.6 → Steps 1-7 |
 | Exists | seeded | Missing | **already-initialized** | Stop the skill; you're done already |
 | Missing | — | Exists | **corrupted-state** | Stop and surface to user — manual cleanup needed |
-| Exists | empty (0 axioms) | Missing | **partial-bootstrap** | Surface the seed-empty error to user; recovery is `rm knowledge.db && rerun first-session` (the seed-empty error message includes the exact path) |
+| Exists | empty (0 axioms) | Missing | **partial-bootstrap** | Surface the seed-empty error to user; recovery is to move the empty `knowledge.db` aside, then rerun first-session: `mv "$ENGRAM_HOME/knowledge.db" "$ENGRAM_HOME/knowledge.db.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)"` (the seed-empty error message includes the exact path) |
 
 For the seed-empty check (column 2 of the row): `python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"SELECT COUNT(*) FROM nodes WHERE type='axiom'\").fetchone()[0])" "$ENGRAM_HOME/knowledge.db"` returns 0 → empty; ≥3 → seeded (post-bootstrap.py). (stdlib — no CLI dependency)
 
@@ -588,7 +588,7 @@ Then follow the branch for the detected target:
 ```bash
 _a=$(grep -c '^## From this session$' "${ENGRAM_HOME:-$HOME/.engram}/warm-briefing.md")
 _last=$(tail -n 1 "${ENGRAM_HOME:-$HOME/.engram}/warm-briefing.md")
-[ "$_a" = 1 ] && [ "$_last" = '## From this session' ] || echo "FAIL: warm-briefing anchor lost, duplicated, or moved off the end — restore the file from the template and redo the substitution; never hand-patch the heading"
+[ "$_a" = 1 ] && [ "$_last" = '## From this session' ] || echo "FAIL: warm-briefing anchor lost, duplicated, or moved off the end — first copy the current warm-briefing.md aside (cp -p warm-briefing.md warm-briefing.md.engram-backup.<UTC time>), then restore the file from the template and redo the substitution; never hand-patch the heading"
 ```
 
 A lost or duplicated anchor is not cosmetic: `engram-sleep` Step 3's erase keys on the LAST matching heading through EOF, so a lost heading makes a later sleep APPEND a stub instead of erasing (freezing the stale arc above it), and a duplicate strands everything between the two headings as preserved user notes. Full reasoning: `engram-nap` Step 5 post-condition.

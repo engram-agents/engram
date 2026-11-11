@@ -51,10 +51,10 @@ fi
 # 0 = the Claude Code native installer runs only behind --install-claude-code. It runs remote
 #     code, so that flag is the operator's yes and --yes NEVER implies it.
 DEFAULT_INSTALL_CLAUDE_CODE=0
-# 1 = an existing ~/.claude/CLAUDE.md is copied ONCE to CLAUDE.md.pre-engram (never
-#     overwritten) and then replaced. It answers the step-6 question when nobody can be asked
-#     (--yes, or no tty). 0 = stop instead of replacing.
-DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD=1
+# 0 = with no one to ask (no tty) and no --yes, an existing ~/.claude/CLAUDE.md is left alone
+#     and the install stops. Only an explicit yes replaces it: --yes, or "y" at the tty question
+#     (default No). 1 would answer yes for a user who was never asked; keep it 0.
+DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD=0
 # 1 = the persistent recall service is installed unless --no-recall-service.
 DEFAULT_RECALL_SERVICE=1
 
@@ -519,6 +519,21 @@ if [ "$_run_bootstrap" -eq 1 ]; then
   # given --force. That flag is passed ONLY on the branch below where the file exists and the
   # consent/backup step has already succeeded; every other run passes nothing.
   _bootstrap_flags=""
+  # The yes for replacing an existing CLAUDE.md. --yes is a yes; on a terminal the question
+  # defaults to No; with no one to ask the constant decides (0). Called on every branch below
+  # that would replace the file, so no branch replaces it without this yes.
+  _require_claude_md_yes() {
+    _go=$DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD
+    if [ "$ASSUME_YES" -eq 1 ]; then
+      _go=1
+    elif [ -t 0 ] && [ -t 1 ]; then
+      printf '%s already exists. ENGRAM will replace it. Back it up first and continue? [y/N] ' "$CLAUDE_MD"
+      read -r _answer || _answer="n"
+      case "$_answer" in y|Y|yes|YES|Yes) _go=1 ;; *) _go=0 ;; esac
+    fi
+    [ "$_go" -eq 1 ] \
+      || fail "$CLAUDE_MD exists and was not backed up" "move or copy it away yourself, or re-run with --yes to back it up and replace it"
+  }
   # Back up an existing CLAUDE.md BEFORE bootstrap renders over it, once, never over an
   # existing backup. Only when bootstrap will run: on a seat whose graph is seeded the file
   # is ENGRAM's own rendering, and copying it would put the wrong file in the backup.
@@ -530,16 +545,10 @@ if [ "$_run_bootstrap" -eq 1 ]; then
     elif { [ -e "$CLAUDE_MD_BACKUP" ] || [ -L "$CLAUDE_MD_BACKUP" ]; } && [ ! -f "$CLAUDE_MD_BACKUP" ]; then
       fail "$CLAUDE_MD_BACKUP exists but is not a regular file, so $CLAUDE_MD cannot be backed up there" "move it away, then re-run"
     elif [ -e "$CLAUDE_MD_BACKUP" ] || [ -L "$CLAUDE_MD_BACKUP" ]; then
-      _claude_md_note="existing backup kept untouched at $CLAUDE_MD_BACKUP; $CLAUDE_MD will be replaced"
+      _require_claude_md_yes
+      _claude_md_note="existing backup kept untouched at $CLAUDE_MD_BACKUP; $CLAUDE_MD will be replaced (bootstrap saves the current file to a stamped backup first)"
     else
-      _go=$DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD
-      if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
-        printf '%s already exists. ENGRAM will replace it. Back it up to %s first and continue? [Y/n] ' "$CLAUDE_MD" "$CLAUDE_MD_BACKUP"
-        read -r _answer || _answer="n"
-        case "$_answer" in ""|y|Y|yes|YES|Yes) _go=1 ;; *) _go=0 ;; esac
-      fi
-      [ "$_go" -eq 1 ] \
-        || fail "$CLAUDE_MD exists and was not backed up" "move or copy it away yourself, or re-run with --yes to back it up to CLAUDE.md.pre-engram and replace it"
+      _require_claude_md_yes
       cp -p "$CLAUDE_MD" "$CLAUDE_MD_BACKUP" \
         || fail "could not copy $CLAUDE_MD to $CLAUDE_MD_BACKUP" "fix the permissions of $CLAUDE_HOME and re-run"
       _claude_md_note="backed up $CLAUDE_MD to $CLAUDE_MD_BACKUP; $CLAUDE_MD will be replaced"

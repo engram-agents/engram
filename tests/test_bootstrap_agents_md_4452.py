@@ -24,6 +24,7 @@ All runs use tmp homes through env; the real ~/.claude, ~/.codex, ~/.engram are 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -91,12 +92,14 @@ def test_agents_existing_differing_file_refused_and_untouched(tmp_path):
     assert md.read_bytes() == b"my own codex conventions\n"
     assert cfg.read_bytes() == b'model = "x"\n'
     assert not (tmp_path / ".codex" / "config.toml.pre-engram").exists()
-    lines = _refused_lines(r)
-    assert len(lines) == 1, lines
-    msg = lines[0]
-    assert msg.startswith("[bootstrap] REFUSED:"), msg
+    # The refusal is ONE message that names every path needing consent (AGENTS.md and
+    # config.toml here), each with the backup it would get.
+    msg = r.stderr + r.stdout
+    assert msg.count("REFUSED") == 1, msg
+    assert "[bootstrap] REFUSED:" in msg
     assert str(md) in msg and "--force" in msg and "AGENTS.md.pre-engram" in msg
-    assert "move the file away yourself" in msg
+    assert str(cfg) in msg and "config.toml.pre-engram" in msg
+    assert "move" in msg
     assert not (tmp_path / ".codex" / "AGENTS.md.pre-engram").exists()
 
 
@@ -123,7 +126,7 @@ def test_agents_identical_existing_file_is_not_refused(tmp_path):
     assert first.returncode == 0, first.stdout + first.stderr
     md = _agents(tmp_path)
     rendered = md.read_bytes()
-    _db(tmp_path).unlink()
+    shutil.rmtree(tmp_path / ".engram")  # a retried install over an emptied data home
     r = _codex(tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert md.read_bytes() == rendered
@@ -154,6 +157,8 @@ def test_agents_force_never_touches_existing_backup(tmp_path):
     assert bak.read_bytes() == b"first original\n"
     assert int(bak.stat().st_mtime) == 1_100_000_000
     assert _agents(tmp_path).read_bytes() != b"current\n"
+    stamped = [p for p in bak.parent.iterdir() if p.name.startswith("AGENTS.md.engram-backup.")]
+    assert [p.read_bytes() for p in stamped] == [b"current\n"], "the CURRENT file gets its own stamped backup"
 
 
 def test_agents_dangling_symlink_refused_without_force(tmp_path):
@@ -179,19 +184,18 @@ def test_agents_dangling_symlink_refused_even_with_force(tmp_path):
     assert not _db(tmp_path).exists()
 
 
-def test_agents_hard_link_at_backup_path_refused_under_force_and_nothing_written(tmp_path):
+def test_agents_hard_link_at_backup_path_gets_a_stamped_backup_and_the_link_is_kept(tmp_path):
+    """.pre-engram is used only when absent: a hard link there is left as it is, the current
+    file gets a stamped backup, and the replace is atomic so the linked bytes stay original."""
     md = _mk(tmp_path)
     bak = tmp_path / ".codex" / "AGENTS.md.pre-engram"
     os.link(md, bak)
     r = _codex(tmp_path, ["--force"])
-    assert r.returncode != 0
-    lines = _refused_lines(r)
-    assert len(lines) == 1, lines
-    assert lines[0].startswith("[bootstrap] REFUSED:"), lines[0]
-    assert str(md) in lines[0] and str(bak) in lines[0] and "same file" in lines[0]
-    assert md.read_bytes() == b"my own codex conventions\n"
+    assert r.returncode == 0, r.stdout + r.stderr
+    stamped = [p for p in bak.parent.iterdir() if p.name.startswith("AGENTS.md.engram-backup.")]
+    assert [p.read_bytes() for p in stamped] == [b"my own codex conventions\n"]
     assert bak.read_bytes() == b"my own codex conventions\n"
-    assert not _db(tmp_path).exists()
+    assert md.read_bytes() != b"my own codex conventions\n"
 
 
 def test_agents_force_dangling_config_refuses_before_any_backup(tmp_path):
@@ -211,18 +215,19 @@ def test_agents_force_dangling_config_refuses_before_any_backup(tmp_path):
     assert not _db(tmp_path).exists()
 
 
-def test_agents_force_unusable_config_backup_path_refuses_before_any_backup(tmp_path):
+def test_agents_force_directory_at_config_backup_name_gets_a_stamped_backup(tmp_path):
+    """A directory at config.toml.pre-engram is not a usable first backup: it is left alone and
+    config.toml is saved to a stamped name instead."""
     md = _mk(tmp_path)
     (tmp_path / ".codex" / "config.toml").write_bytes(b'model = "x"\n')
     (tmp_path / ".codex" / "config.toml.pre-engram").mkdir()
     r = _codex(tmp_path, ["--force"])
-    assert r.returncode != 0
-    lines = _refused_lines(r)
-    assert len(lines) == 1, lines
-    assert "not a regular file" in lines[0], lines[0]
-    assert not (tmp_path / ".codex" / "AGENTS.md.pre-engram").exists()
-    assert md.read_bytes() == b"my own codex conventions\n"
-    assert not _db(tmp_path).exists()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / ".codex" / "config.toml.pre-engram").is_dir()
+    stamped = [p for p in (tmp_path / ".codex").iterdir() if p.name.startswith("config.toml.engram-backup.")]
+    assert [p.read_bytes() for p in stamped] == [b'model = "x"\n']
+    assert (tmp_path / ".codex" / "AGENTS.md.pre-engram").read_bytes() == b"my own codex conventions\n"
+    assert md.read_bytes() != b"my own codex conventions\n"
 
 
 def test_agents_template_has_no_seed_placeholders(tmp_path):
@@ -255,10 +260,9 @@ def test_agents_late_guard_refusal_says_db_was_seeded_and_gives_recovery(tmp_pat
     ))
     assert r.returncode != 0, r.stdout + r.stderr
     assert md.read_bytes() == b"x"
-    lines = _refused_lines(r)
-    assert len(lines) == 1, lines
-    msg = lines[0]
-    assert msg.startswith("[bootstrap] REFUSED:"), msg
+    msg = r.stderr + r.stdout
+    assert msg.count("REFUSED") == 1, msg
+    assert "[bootstrap] REFUSED:" in msg
     assert str(md) in msg and "already seeded" in msg
     assert str(_db(tmp_path)) in msg
     assert "--force" in msg and "move" in msg
