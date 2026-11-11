@@ -12,7 +12,9 @@ shuffle itself, so own node ids and texts never pass through the reader before l
 ``draw`` writes ``DIR/cards.md`` (what the reader labels) and ``DIR/key.json`` (what it must
 not open until the labels are written), and prints only counts and the two paths.
 ``unblind`` refuses until a complete, valid labels file exists, then prints the join and the
-skill's decision (``proceed`` / ``stop`` / ``instrument_failed``).
+skill's decision (``proceed`` / ``stop`` / ``instrument_failed``).  The first successful
+``unblind`` also writes ``DIR/unblinded.json`` (never overwritten): from then on the labels are final,
+the same labels print the recorded result again, and different labels are refused.
 
 The draw rules are the skill's, verbatim.  The graph is read through the engramd owner (a seat's own store is never opened directly
 by this tool) and never written.
@@ -375,6 +377,9 @@ def cmd_draw(a) -> int:
 # ---------------------------------------------------------------------------
 
 
+RECORD_NAME = "unblinded.json"
+
+
 def read_labels(path, items: dict) -> tuple[dict, str]:
     try:
         raw = Path(path).read_bytes()
@@ -443,17 +448,44 @@ def cmd_unblind(a) -> int:
         decision = "stop"
     else:
         decision = "proceed"
-    json.dump(
-        {
-            "labels_sha256": labels_sha,
-            "seed": key.get("seed"),
-            "items": rows,
-            "counts": {"own": own, "decoys": {"rejected": rejected, "labelled_mine": accepted}},
-            "decision": decision,
-        },
-        sys.stdout,
-        indent=2,
-    )
+    result = {
+        "labels_sha256": labels_sha,
+        "seed": key.get("seed"),
+        "items": rows,
+        "counts": {"own": own, "decoys": {"rejected": rejected, "labelled_mine": accepted}},
+        "decision": decision,
+    }
+    record = d / RECORD_NAME
+    if os.path.lexists(record):
+        # Labels are final once the key has been seen: the first successful unblind wrote this record.
+        try:
+            rec = json.loads(record.read_text(encoding="utf-8"))
+            recorded_sha, recorded = rec["labels_sha256"], rec["result"]
+            valid = isinstance(recorded_sha, str) and isinstance(recorded, dict) and recorded.get("decision") == rec.get("decision")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            valid = False
+        if not valid:
+            raise Refusal(f"{RECORD_NAME} exists but is not a record this tool wrote; refusing")
+        if recorded_sha != labels_sha:
+            raise Refusal(
+                f"labels already fixed for this draw (sha256 {recorded_sha[:12]}\u2026); "
+                "a re-label after unblinding is refused"
+            )
+        if recorded != result:
+            # A file present before the first successful run (or edited since) cannot stand in for the join.
+            raise Refusal(f"{RECORD_NAME} does not match the draw it sits in; refusing")
+        json.dump(recorded, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+    try:
+        with open(record, "x", encoding="utf-8") as fh:  # 'x': never overwritten
+            json.dump({"labels_sha256": labels_sha, "decision": decision, "result": result}, fh, indent=2)
+            fh.write("\n")
+    except FileExistsError:
+        raise Refusal(f"{RECORD_NAME} appeared during this run; refusing") from None
+    except OSError as exc:
+        raise Refusal(f"cannot record the result in {record}: {exc.strerror or exc}") from None
+    json.dump(result, sys.stdout, indent=2)
     sys.stdout.write("\n")
     return 0
 
