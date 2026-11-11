@@ -396,6 +396,36 @@ def test_c13_a_changed_outcome_or_model_writes_again(home, hook, tmp_path):
         ("UNKNOWN", "transcript_path_missing", None)]
 
 
+def test_c13_change_only_compares_the_reason_alone(home, hook, tmp_path):
+    # Same session, same outcome (UNKNOWN), same null model_id; only the reason differs -> two lines.
+    t = tmp_path / "t.jsonl"
+    t.write_bytes(b"x" * (hook.TAIL_BYTES + 10) + b"\n")  # one huge line, no model row: window_exceeded
+    stop(hook, home, t)
+    write_jsonl(t, [user()])                                 # small file, no assistant row: no_model_row
+    stop(hook, home, t)
+    stop(hook, home, t)                                      # unchanged: still no third line
+    assert [(r["outcome"], r["reason"], r["model_id"]) for r in records(home)] == [
+        ("UNKNOWN", "window_exceeded", None), ("UNKNOWN", "no_model_row", None)]
+
+
+def test_c10_hook_lineage_pattern_equals_cores(hook):
+    # The hook decides dormancy before loading the runtime (by design), so it carries its own copy of
+    # engram_core._LINEAGE_RE.  Nothing else ties the two copies together: this does.
+    import engram_core
+    assert hook._LINEAGE_RE.pattern == engram_core._LINEAGE_RE.pattern
+
+
+@pytest.mark.parametrize("value", ["anthropic:opus", "Anthropic:opus", "anth.ropic:opus", "anthropic:opus.5",
+                                   "anthropic:", ":opus", "a b:c", "anthropic:opus:5", "openai:gpt-6_1"])
+def test_c10_hook_dormancy_agrees_with_core_on_the_lineage_shape(home, hook, tmp_path, value):
+    import engram_core
+    set_lineage(home, value)
+    t = write_jsonl(tmp_path / "t.jsonl", [asst("claude-fable-5-2")])  # a model no listed lineage matches
+    wrote = stop(hook, home, t) is not None
+    assert wrote == bool(engram_core._LINEAGE_RE.fullmatch(value))
+    assert bool(records(home)) == wrote
+
+
 def test_c13_change_only_finds_the_record_past_other_sessions(home, hook, tmp_path):
     t = write_jsonl(tmp_path / "t.jsonl", [asst("claude-fable-5-2")])
     stop(hook, home, t, session="A")
@@ -681,8 +711,17 @@ def big_transcript(tmp_path_factory):
 
 
 def test_c19_time_budget_in_process(home, hook, big_transcript, capsys):
-    # Scope of the number: tail read, parse, map and the append / change-only skip.  The records scan is NOT
-    # inside it in any meaningful way: the records file here is one line (a full 64 KiB scan is not measured).
+    # Scope of the number: tail read, parse, map, the records scan and the append / change-only skip.  The
+    # records file is pre-filled so the 64 KiB scan window is full (records of OTHER sessions, so every timed
+    # call still scans the whole window and then appends or skips).
+    rdir = home / "model-gate"
+    rdir.mkdir()
+    filler = (json.dumps({"schema": 1, "at": "2026-01-01T00:00:00+00:00", "session_id": "other",
+                          "outcome": "UNKNOWN", "reason": "no_model_row", "model_id": None,
+                          "measured_lineage": None, "self_lineage": "anthropic:opus",
+                          "transcript_path": "/x" * 100}) + "\n").encode()
+    (rdir / "records.jsonl").write_bytes(filler * (3 * hook.RECORDS_SCAN_BYTES // len(filler)))
+    assert (rdir / "records.jsonl").stat().st_size > hook.RECORDS_SCAN_BYTES
     assert hook.TIME_BUDGET_MS == 100
     stop(hook, home, big_transcript, session="warm")  # untimed: first call imports the runtime modules
     cold_free = []
