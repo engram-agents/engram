@@ -18,7 +18,8 @@ The rule: setup backs up first, asks, and acts only on the user's yes.
       `<name>.engram-backup.<UTC %Y%m%dT%H%M%SZ>` (a -N suffix if that name is taken). An
       existing `<name>.pre-engram` is used only when absent and is never modified.
   C5. Existing agent: if the home holds a non-empty knowledge.db, OR (knowledge.db absent or with
-      0 nodes AND any of warm-briefing.md, seed-manifest.json, a non-empty history/ or diary/),
+      0 nodes AND any of warm-briefing.md, seed-manifest.json, a non-empty history/ or diary/;
+      a folder holding only dotfiles such as .DS_Store is empty for this purpose),
       bootstrap never seeds over it. Graph present: bootstrap writes nothing (the installer
       already skips bootstrap). Memory without a graph: bootstrap REFUSES even with --force,
       writes nothing, creates no knowledge.db and no first-run-pending, and the message names
@@ -463,7 +464,13 @@ def test_differential_gate_no_consent(tmp_path, tmp_path_factory, target, db_sta
 
 _PY_WRITE_METHODS_ANY_RECEIVER = {"write_text", "write_bytes", "symlink_to"}
 _PY_SHUTIL = {"rmtree", "move", "copy", "copy2", "copyfile", "copytree"}
-_PY_OS = {"replace", "rename", "remove", "unlink", "link", "symlink", "truncate", "removedirs", "rmdir"}
+_PY_OS = {"replace", "rename", "remove", "unlink", "link", "symlink", "truncate", "removedirs", "rmdir",
+          "system", "popen"}
+# Names that are write calls when imported straight from os / shutil (`from os import replace`),
+# or fetched by name (`getattr(x, "write_text")`). open/fdopen are write calls only with a write
+# mode, which a bare name cannot show, so importing them by name is treated as a write spelling too.
+_PY_FROM_OS_NAMES = _PY_OS | {"open", "fdopen"}
+_PY_GETATTR_NAMES = (_PY_WRITE_METHODS_ANY_RECEIVER | _PY_SHUTIL | _PY_OS | {"unlink", "open", "fdopen"})
 _WRITE_MODE_RE = re.compile(r"[wax+]")
 _OS_OPEN_WRITE_RE = re.compile(r"O_(WRONLY|RDWR|CREAT|TRUNC|APPEND)")
 
@@ -472,13 +479,13 @@ _OS_OPEN_WRITE_RE = re.compile(r"O_(WRONLY|RDWR|CREAT|TRUNC|APPEND)")
 # helper's own writes are exempt by file. `call=None` allows the whole function.
 BOOTSTRAP_ALLOWLIST = [
     {"func": "main", "call": "engram_tools_link.unlink()",
-     "reason": "removes the ENGRAM-made plugin symlink only (guarded by is_symlink())"},
+     "reason": "removes a symlink at that name (guarded by is_symlink()); only the link, never its target"},
     {"func": "main", "call": "engram_tools_link.rename(backup)",
      "reason": "moves an existing scatter-install dir aside to tools.scatter-backup, nothing deleted"},
     {"func": "main", "call": "engram_tools_link.symlink_to(plugin_tools)",
      "reason": "creates the plugin tools link after the old entry was removed or moved aside"},
     {"func": "main", "call": "engram_hooks_link.unlink()",
-     "reason": "removes the ENGRAM-made plugin symlink only (guarded by is_symlink())"},
+     "reason": "removes a symlink at that name (guarded by is_symlink()); only the link, never its target"},
     {"func": "main", "call": "engram_hooks_link.rename(backup)",
      "reason": "moves an existing scatter-install dir aside to hooks.scatter-backup, nothing deleted"},
     {"func": "main", "call": "engram_hooks_link.symlink_to(plugin_hooks)",
@@ -507,9 +514,29 @@ def _py_write_sites(source: str) -> list[tuple[int, str, str]]:
             return bool(_WRITE_MODE_RE.search(mode.value))
         return True  # a mode we cannot read statically is not provably read-only
 
+    def is_import_spelling(node: ast.AST) -> bool:
+        """The import forms that hide a write call from the call-spelling checks below: an alias
+        of os / shutil (`import os as o`), a write function pulled in by name (`from os import
+        replace`, `from shutil import move`), or anything from subprocess."""
+        if isinstance(node, ast.Import):
+            return any(
+                (a.name in ("os", "shutil") and a.asname not in (None, a.name)) or a.name.split(".")[0] == "subprocess"
+                for a in node.names
+            )
+        if isinstance(node, ast.ImportFrom) and node.level == 0:
+            mod = (node.module or "").split(".")[0]
+            if mod == "subprocess":
+                return True
+            wanted = _PY_FROM_OS_NAMES if mod == "os" else _PY_SHUTIL if mod == "shutil" else None
+            return wanted is not None and any(a.name == "*" or a.name in wanted for a in node.names)
+        return False
+
     def is_write(call: ast.Call) -> bool:
         f = call.func
         if isinstance(f, ast.Name):
+            if f.id == "getattr":  # getattr(x, "write_text")(...) hides the method name from the checks below
+                return (len(call.args) >= 2 and isinstance(call.args[1], ast.Constant)
+                        and call.args[1].value in _PY_GETATTR_NAMES)
             return f.id == "open" and mode_is_write(call, 1)
         if not isinstance(f, ast.Attribute):
             return False
@@ -537,7 +564,7 @@ def _py_write_sites(source: str) -> list[tuple[int, str, str]]:
             name = func
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 name = child.name
-            if isinstance(child, ast.Call) and is_write(child):
+            if (isinstance(child, ast.Call) and is_write(child)) or is_import_spelling(child):
                 text = ast.unparse(child)
                 hits.append((child.lineno, name, text if len(text) <= 90 else text[:87] + "..."))
             walk(child, name)
@@ -581,6 +608,16 @@ def planted(p, q, s):
     shutil.copyfile(p, q)
     shutil.copytree(p, q)
     p.symlink_to(q)
+    os.symlink(p, q)
+    os.truncate(p, 0)
+    os.rmdir(p)
+    os.removedirs(p)
+    os.link(p, q)
+    os.open(p, os.O_WRONLY | os.O_CREAT)
+    os.fdopen(3, "w")
+    os.system("rm " + p)
+    os.popen("rm " + p)
+    getattr(p, "write_text")("x")
 def quiet(p, s):
     open(p)
     open(p, "rb")
@@ -588,7 +625,33 @@ def quiet(p, s):
     d = dict()
     d.copy()
     p.read_text()
+    os.open(p, os.O_RDONLY)
+    os.fdopen(3, "r")
+    getattr(p, "name")
 '''
+
+# One planted positive per import spelling that hides a write call from the call checks.
+_PLANTED_IMPORT_POSITIVE = [
+    "import os as o",
+    "import shutil as sh",
+    "from os import replace",
+    "from os import path, rename",
+    "from shutil import move",
+    "from shutil import *",
+    "import subprocess",
+    "from subprocess import run",
+]
+_PLANTED_IMPORT_NEGATIVE = [
+    "import os",
+    "import shutil",
+    "import os, shutil",
+    "from os import path",
+    "from os import environ, getcwd",
+    "from shutil import which",
+    "from pathlib import Path",
+    "import os as os",
+]
+_PLANTED_IMPORTS = "\n".join(_PLANTED_IMPORT_POSITIVE + _PLANTED_IMPORT_NEGATIVE) + "\n"
 
 
 _PLANTED_TWICE = """
@@ -600,8 +663,20 @@ def allowlisted(p):
 
 def _assert_python_scanner_controls() -> None:
     hits = _py_write_sites(_PLANTED_PY)
-    assert len(hits) == 18, f"the AST scanner is broken: found {len(hits)} of 18 planted write sites: {hits}"
+    assert len(hits) == 28, f"the AST scanner is broken: found {len(hits)} of 28 planted write sites: {hits}"
     assert all(func == "planted" for _l, func, _t in hits), "the scanner flagged a read-only call in quiet()"
+    # One planted positive per new spelling, found by the SAME scanner (named, so a miss says which).
+    texts = {t for _l, _f, t in hits}
+    for spelled in ("os.symlink(p, q)", "os.truncate(p, 0)", "os.rmdir(p)", "os.removedirs(p)", "os.link(p, q)",
+                    "os.open(p, os.O_WRONLY | os.O_CREAT)", "os.fdopen(3, 'w')", "os.system('rm ' + p)",
+                    "os.popen('rm ' + p)", "getattr(p, 'write_text')"):
+        assert spelled in texts, f"the AST scanner missed the planted spelling {spelled!r}: {sorted(texts)}"
+    imports = [t for _l, _f, t in _py_write_sites(_PLANTED_IMPORTS)]
+    want = [ast.unparse(ast.parse(s)) for s in _PLANTED_IMPORT_POSITIVE]
+    assert imports == want, (
+        f"the import-spelling check is broken: found {imports}; "
+        f"missed {[w for w in want if w not in imports]}, false hits {[i for i in imports if i not in want]}"
+    )
     # Positive control for the per-(func, call) count: one entry, two identical calls -> exactly one violation.
     one_entry = [{"func": "allowlisted", "call": "p.unlink()", "reason": "control"}]
     left = _py_violations(_PLANTED_TWICE, one_entry)
@@ -881,6 +956,20 @@ def test_static_write_sites_are_reviewed():
     here. Sites not yet moved into it are listed with a reason that names the slice that moves them.
     Covered: bootstrap.py (AST), install.sh (shell scanner AND the AST scan of its Python heredoc
     blocks), set_forum_url.py (AST) and the config.json block of install-local-marketplace.sh.
+
+    THE BOUND, stated plainly. This gate covers the call SPELLINGS it lists and no others:
+      * method calls: write_text, write_bytes, symlink_to, unlink, Path.open / open with a write
+        mode, Path.replace / Path.rename (one argument);
+      * os.<fn> and shutil.<fn> calls for the functions in _PY_OS / _PY_SHUTIL (including
+        os.system and os.popen), os.open with write flags, os.fdopen with a write mode;
+      * import spellings that would hide those calls: `import os|shutil as X`, `from os import
+        <write fn>`, `from shutil import <write fn>`, and any import of subprocess;
+      * getattr(<x>, "<one of those function names>").
+    A write reached some other way (importlib / __import__, exec or eval, a function stored in a
+    variable, a C extension, a spelling not in the lists above) is NOT seen. The gate catches a
+    later edit that uses a listed spelling; it does not prove the absence of every possible write.
+    Each listed spelling has a planted positive in _PLANTED_PY / _PLANTED_IMPORT_POSITIVE that this
+    same scanner must find (test body: _assert_python_scanner_controls).
     """
     _assert_python_scanner_controls()
     _assert_shell_scanner_controls()
@@ -937,6 +1026,48 @@ def test_install_sh_never_defaults_to_yes(tmp_path):
     assert md.read_bytes() == mine, "the installer replaced CLAUDE.md without anyone saying yes"
     assert r.returncode != 0
     assert "FAIL" in r.all, "the refusal must be a FAIL line:\n" + r.all
+
+
+def test_install_sh_consent_is_replace_of_exactly_claude_md_even_with_a_space_in_the_path(tmp_path):
+    """The yes the installer asks for covers CLAUDE.md only: bootstrap gets `--replace <that
+    path>` as ONE argument (a CLAUDE_HOME with a space in it must not split), never `--force`."""
+    sb = Sandbox(tmp_path)
+    spaced = sb.root / "my claude home"
+    spaced.mkdir()
+    (spaced / "CLAUDE.md").write_bytes(_sentinel("spaced-claude-md"))
+    r = sb.run("--yes", env={"CLAUDE_HOME": str(spaced)})
+    assert r.returncode == 0, r.all
+    argv_lines = sb.calls_starting("argv-of-bootstrap ")
+    assert len(argv_lines) == 1, sb.call_lines()
+    argv = json.loads(argv_lines[0].split(" ", 1)[1])
+    assert argv == ["--replace", str(spaced / "CLAUDE.md")], argv
+    assert "--force" not in argv
+
+
+def test_install_sh_passes_no_consent_flag_when_there_is_no_claude_md(tmp_path):
+    """No existing CLAUDE.md -> nothing to consent to -> bootstrap gets no arguments (the empty
+    array must expand to nothing under `set -u`)."""
+    sb = Sandbox(tmp_path)
+    r = sb.run("--yes")
+    assert r.returncode == 0, r.all
+    argv_lines = sb.calls_starting("argv-of-bootstrap ")
+    assert [json.loads(l.split(" ", 1)[1]) for l in argv_lines] == [[]], sb.call_lines()
+
+
+def test_install_sh_with_real_bootstrap_replaces_a_spaced_claude_md_after_backup(tmp_path):
+    """End to end with the REAL bootstrap.py: the one `--replace` path is understood, the file
+    is backed up and replaced."""
+    sb = _installer_with_real_bootstrap(tmp_path)
+    spaced = sb.root / "my claude home"
+    spaced.mkdir()
+    mine = _sentinel("spaced-claude-md-real")
+    (spaced / "CLAUDE.md").write_bytes(mine)
+    r = sb.run("--yes", env={"CLAUDE_HOME": str(spaced)})
+    assert r.returncode == 0, r.all
+    assert (spaced / "CLAUDE.md").read_bytes() != mine
+    assert (spaced / "CLAUDE.md.pre-engram").read_bytes() == mine
+    stamped = list(spaced.glob("CLAUDE.md.engram-backup.*"))
+    assert len(stamped) == 1 and stamped[0].read_bytes() == mine
 
 
 # --------------------------------------------------------------------- whole-flow cell
@@ -1472,8 +1603,8 @@ GUARD_ALLOWLIST = [
     {"func": "copy_exclusive", "call": "os.link(temp, dst)", "reason": "publishes exclusively: FileExistsError for anything at dst"},
     {"func": "copy_exclusive", "call": "os.replace(temp, dst)", "reason": "only on a filesystem without hard links, and only after dst was found absent"},
     {"func": "copy_exclusive", "call": "os.unlink(temp)", "reason": "removes the temp this call created"},
-    {"func": "atomic_write_text", "call": "os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)", "reason": "exclusive temp beside the target"},
-    {"func": "atomic_write_text", "call": "os.fdopen(fd, 'w', encoding='utf-8')", "reason": "writes that temp"},
+    {"func": "atomic_write_text", "call": "os.fdopen(fd, 'w', encoding='utf-8')",
+     "reason": "writes the unique exclusive temp tempfile.mkstemp created beside the target"},
     {"func": "atomic_write_text", "call": "os.replace(tmp, path)", "reason": "atomic publish: never writes through the target"},
     {"func": "atomic_write_text", "call": "os.unlink(tmp)", "reason": "removes the temp on failure"},
     {"func": "apply", "call": "os.unlink(e.path)", "reason": "a delete request: only after a stamped backup, only on consent"},

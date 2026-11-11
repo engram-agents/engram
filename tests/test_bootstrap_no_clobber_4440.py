@@ -11,8 +11,8 @@ Contract (written before the implementation):
   * A dangling symlink is "present": refused with and without --force.
   * Codex: config.toml is backed up once to config.toml.pre-engram before the first
     rewrite; the merge keeps foreign stanzas; a dangling symlink is refused.
-  * install.sh passes --force to bootstrap only on the path where CLAUDE.md exists
-    and its own consent/backup step succeeded.
+  * install.sh passes `--replace <CLAUDE.md>` (never --force) to bootstrap only on the path
+    where CLAUDE.md exists and its own consent/backup step succeeded.
   * uninstall: current CLAUDE.md is copied to CLAUDE.md.pre-uninstall.<UTC> first,
     then the pre-engram backup is restored; with no backup, CLAUDE.md is untouched.
 
@@ -616,17 +616,22 @@ def test_codex_hard_link_at_backup_path_is_refused_even_with_force(tmp_path):
 # --------------------------------------------------------------- install.sh
 
 def test_install_sh_passes_force_only_when_claude_md_exists_after_consent():
+    """(Name kept from the original cell.) install.sh passes `--replace "$CLAUDE_MD"` (yes to
+    that one file), never `--force` (yes to every path), and only after the consent/backup step."""
     sh = INSTALL_SH.read_text()
-    # Every bootstrap invocation takes its args from one variable ...
+    # Every bootstrap invocation takes its args from one array variable ...
     calls = re.findall(r'"\$VENV_PY" "\$PLUGIN_ROOT/bootstrap\.py"([^\n]*)', sh)
     assert len(calls) == 2, calls
     for tail in calls:
-        assert "_bootstrap_flags" in tail, tail
-    # ... which is set to --force in exactly one place, inside the existing-CLAUDE.md branch,
-    # after the consent/backup `fail` guard and the backup copy.
-    assigns = [m.start() for m in re.finditer(r'_bootstrap_flags=.*--force', sh)]
+        assert "_bootstrap_flags[@]" in tail, tail
+    # ... the installer's code never mentions --force ...
+    code = "\n".join(ln for ln in sh.splitlines() if not ln.lstrip().startswith("#"))
+    assert "--force" not in code
+    # ... and the array is set to `--replace "$CLAUDE_MD"` in exactly one place, inside the
+    # existing-CLAUDE.md branch, after the consent/backup `fail` guard and the backup copy.
+    assigns = [m.start() for m in re.finditer(r'_bootstrap_flags=\(--replace "\$CLAUDE_MD"\)', sh)]
     assert len(assigns) == 1
-    default = sh.index('_bootstrap_flags=""')
+    default = sh.index('_bootstrap_flags=()')
     consent = sh.index('exists and was not backed up')
     note = sh.index("printf '[step 6] CLAUDE.md: %s\\n'")
     assert default < consent < assigns[0] < note

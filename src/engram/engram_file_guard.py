@@ -33,9 +33,16 @@ import re
 import shutil
 import stat
 import tempfile
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, NamedTuple
+
+# ENGRAM's own bookkeeping files: a closed list, by file name. Setup rewrites them when they
+# differ, with no consent and no backup (they hold nothing the user or their agent wrote; the
+# install-time timestamp in first-run-pending differs on every run). A caller cannot add to it:
+# Item(owned=True) is honoured only for these names.
+ENGRAM_OWNED_NAMES = ("first-run-pending", "seed-manifest.json")
 
 STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 FIRST_BACKUP_SUFFIX = ".pre-engram"
@@ -57,15 +64,19 @@ class Item(NamedTuple):
     path: Path
     new_text: "str | None"
     first_identity: bool = False
+    owned: bool = False
+    # owned=True: ENGRAM's own bookkeeping file (see ENGRAM_OWNED_NAMES). It is rewritten when
+    # it differs, with no consent and no backup; it is never something the user or their agent wrote.
 
 
 class Entry(NamedTuple):
     path: Path
     new_text: "str | None"
-    state: str           # absent | identical | differs | dangling | blocked
+    state: str           # absent | identical | differs | owned | dangling | blocked | obstructed
     backup: "Path | None"  # the stamped backup the current bytes would be saved to (differs only)
     first_backup: "Path | None" = None  # `<name>.pre-engram`, when it would also be written
     first_identity: bool = False
+    owned: bool = False
 
 
 class Plan(NamedTuple):
@@ -79,7 +90,31 @@ class Consent(NamedTuple):
     paths: "frozenset[str]" = frozenset()
 
     def allows(self, path: Path) -> bool:
-        return self.all_paths or _key(path) in self.paths
+        """True for `--force`, for a path given in the same canonical spelling, or for a path
+        that is the very same file under another spelling of its NAME (`claude.md` for
+        `CLAUDE.md` on a case-insensitive filesystem: same folder, name equal ignoring case and
+        Unicode form, and os.path.samefile says yes). A hard link or symlink under a different
+        name is NOT accepted: consent names the file the user was shown."""
+        if self.all_paths:
+            return True
+        key = _key(path)
+        if key in self.paths:
+            return True
+        parent, name = os.path.split(key)
+        norm = _norm_name(name)
+        for given in self.paths:
+            gparent, gname = os.path.split(given)
+            if gparent == parent and gname != name and _norm_name(gname) == norm:
+                try:
+                    if os.path.samefile(given, key):
+                        return True
+                except OSError:
+                    pass
+        return False
+
+
+def _norm_name(name: str) -> str:
+    return unicodedata.normalize("NFC", name).casefold()
 
 
 NO_CONSENT = Consent()
@@ -151,7 +186,7 @@ def classify(path: Path, new_text: "str | None") -> str:
         return "blocked"
     if new_text is not None:
         try:
-            if path.read_text() == new_text:
+            if path.read_text(encoding="utf-8") == new_text:  # utf-8 like the writes, never the locale's
                 return "identical"
         except (OSError, UnicodeDecodeError):
             pass
@@ -178,9 +213,11 @@ def plan(items: Iterable[Item], stamp: "str | None" = None) -> Plan:
         state = classify(it.path, it.new_text)
         if state == "differs" and it.first_identity and _backup_name_is_the_file_itself(it.path, _pre_engram(it.path)):
             state = "obstructed"
-        backup = _next_backup_name(it.path, stamp) if state == "differs" else None
+        if state == "differs" and it.owned and it.path.name in ENGRAM_OWNED_NAMES:
+            state = "owned"
+        backup =_next_backup_name(it.path, stamp) if state == "differs" else None
         first = _first_backup_name(it.path, it.first_identity) if state == "differs" else None
-        entries.append(Entry(it.path, it.new_text, state, backup, first, it.first_identity))
+        entries.append(Entry(it.path, it.new_text, state, backup, first, it.first_identity, it.owned))
     return Plan(tuple(entries), stamp)
 
 
@@ -305,11 +342,12 @@ def copy_exclusive(src: Path, dst: Path) -> None:
 def atomic_write_text(path: Path, text: str, mode: int) -> None:
     """Write `text` to `path` via a temp file in the same directory: fsync, then os.replace.
 
-    The temp is created exclusively with `mode` and removed on any failure, so a crash
-    leaves either the old file or the new one, never a partial file.
+    The temp has a UNIQUE name per call (tempfile.mkstemp: O_CREAT|O_EXCL, never reuses an
+    existing name, so a leftover from a crashed earlier run is left alone and cannot make this
+    call fail). It is set to `mode` and removed on any failure, so a crash leaves either the
+    old file or the new one, never a partial file.
     """
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
@@ -458,24 +496,31 @@ def apply(p: Plan, consent: Consent = NO_CONSENT, context: str = "",
     """Re-check every path, refuse if any needs consent it lacks, then write. Returns paths written.
 
     The state is read again here (not trusted from `p`), so a file that changed since the
-    check-only pass is judged as it is now. Nothing is written before every path is judged.
-    A differing path is backed up first unless `saved` (from save_backups) already holds a
-    backup with exactly its current bytes. A path whose new_text is None is removed only after
-    a backup, and only on consent.
+    check-only pass is judged as it is now. Order, exactly:
+      1. judge every path; any that needs consent it lacks (or is stuck) -> Refused, nothing
+         written;
+      2. back up EVERY differing path that `saved` (from save_backups) does not already cover
+         with exactly its current bytes; if any one backup cannot be written, SystemExit
+         (REFUSED) and NOT ONE path has been replaced (backups already made stay; they are
+         copies, nothing is lost);
+      3. only then write, path by path.
+    A path whose new_text is None is removed only after a backup, and only on consent. A path
+    in ENGRAM_OWNED_NAMES that differs is rewritten with no consent and no backup.
     """
     saved = saved or {}
-    fresh = plan([Item(e.path, e.new_text, e.first_identity) for e in p.entries], p.stamp)
+    fresh = plan([Item(e.path, e.new_text, e.first_identity, e.owned) for e in p.entries], p.stamp)
     msg = refusal(fresh, consent, context)
     if msg is not None:
         raise Refused(msg)
-    written: list[Path] = []
     for e in fresh.entries:
-        if e.state == "identical" or (e.state == "absent" and e.new_text is None):
-            continue
         if e.state == "differs":
             have = saved.get(_key(e.path))
             if have is None or not target_present(have) or not _same_bytes(e.path, have):
                 save_backup(e.path, e.first_identity, fresh.stamp)
+    written: list[Path] = []
+    for e in fresh.entries:
+        if e.state == "identical" or (e.state == "absent" and e.new_text is None):
+            continue
         if e.new_text is None:
             os.unlink(e.path)
         else:
@@ -536,14 +581,53 @@ def _without_owned(doc: dict, owned: "tuple[str, ...]") -> dict:
     return out
 
 
+def _strict_loads(text: str, filename: str) -> Any:
+    """json.loads that refuses what a re-serialization would silently change: a duplicate key
+    (the parser keeps only the last one) and a non-finite number (`Infinity`, `NaN`, or a number
+    like 1e400 that overflows to infinity, which strict JSON readers reject when written back).
+    Raises MergeRefused, which is a refusal, never a rewrite."""
+    def pairs(items: "list[tuple[str, Any]]") -> dict:
+        seen: set = set()
+        for k, _v in items:
+            if k in seen:
+                raise MergeRefused(
+                    f"{filename} has the key {k!r} more than once; rewriting it would keep only one "
+                    f"of them. Nothing was changed. Remove the duplicate yourself, then re-run."
+                )
+            seen.add(k)
+        return dict(items)
+
+    def number(s: str) -> float:
+        value = float(s)
+        if value in (float("inf"), float("-inf")):
+            raise MergeRefused(
+                f"{filename} holds the number {s} which is not a finite value; rewriting it would "
+                f"change it. Nothing was changed."
+            )
+        return value
+
+    def constant(name: str) -> float:
+        raise MergeRefused(
+            f"{filename} holds {name}, which is not valid JSON; rewriting it would change it. "
+            f"Nothing was changed."
+        )
+
+    return json.loads(text, object_pairs_hook=pairs, parse_float=number, parse_constant=constant)
+
+
 def merge_json_text(filename: str, existing: "str | None", changes: "dict[str, Any]") -> str:
     """Return `existing` (None = absent file) with the owned keys in `changes` set. Pure.
 
     Raises MergeRefused if `filename` has no owned keys, if `changes` names a key that is not
-    owned, if `existing` does not parse as a JSON object, or if setting a nested key would mean
-    replacing something the user wrote that is not an object. Returns `existing` unchanged,
-    byte for byte, when every owned key already holds the requested value. Otherwise the result
-    is re-serialized with the file's own indent: every other key keeps its value and its order.
+    owned, if `existing` does not parse as a JSON object, if it holds a duplicate key or a
+    non-finite number (NaN, Infinity, 1e400), or if setting a nested key would mean replacing
+    something the user wrote that is not an object. Returns `existing` unchanged, byte for
+    byte, when every owned key already holds the requested value. Otherwise the result is
+    re-serialized with the file's own indent: every other key keeps its parsed value and its
+    order. "Keeps its parsed value" is the bound: NUMBER SPELLINGS MAY BE NORMALISED on a merge
+    (1E5 is written back as 100000.0, 1.0 stays 1.0, 10 stays 10); the number is the same, its
+    spelling may not be. Comments do not exist in JSON; a file with any is not a JSON object
+    and is refused above.
     """
     owned = OWNED_KEYS.get(filename)
     if owned is None:
@@ -558,7 +642,7 @@ def merge_json_text(filename: str, existing: "str | None", changes: "dict[str, A
         doc: dict = {}
     else:
         try:
-            doc = json.loads(existing)
+            doc = _strict_loads(existing, filename)
         except ValueError as e:
             raise MergeRefused(f"{filename} is not valid JSON ({e}); nothing repairs a broken file") from e
         if not isinstance(doc, dict):

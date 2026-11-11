@@ -99,7 +99,7 @@ def test_agents_existing_differing_file_refused_and_untouched(tmp_path):
     assert "[bootstrap] REFUSED:" in msg
     assert str(md) in msg and "--force" in msg and "AGENTS.md.pre-engram" in msg
     assert str(cfg) in msg and "config.toml.pre-engram" in msg
-    assert "move" in msg
+    assert "move it aside yourself, then re-run" in msg  # the remedy phrase of refusal(), verbatim
     assert not (tmp_path / ".codex" / "AGENTS.md.pre-engram").exists()
 
 

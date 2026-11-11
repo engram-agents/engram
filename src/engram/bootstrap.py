@@ -641,7 +641,7 @@ def _read_existing_text(path: Path) -> str:
     if not fg.target_present(path) or not path.is_file():
         return ""
     try:
-        return path.read_text()
+        return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
         raise SystemExit(
             f"[bootstrap] REFUSED: cannot read {path} as text ({e}), so ENGRAM cannot merge "
@@ -658,12 +658,13 @@ def _write_items(
         {"seed_ids": ids, "alpha_dir": str(ALPHA_DIR), "target": TARGET}, indent=2
     )
     items = [
-        fg.Item(ENGRAM_HOME / "seed-manifest.json", manifest),
+        # ENGRAM's own bookkeeping (fg.ENGRAM_OWNED_NAMES): rewritten when it differs, no consent.
+        fg.Item(ENGRAM_HOME / "seed-manifest.json", manifest, owned=True),
         fg.Item(
             ENGRAM_HOME / "warm-briefing.md",
             _render_template_text(TEMPLATES_DIR / "template.warm-briefing.md", substitutions),
         ),
-        fg.Item(ENGRAM_HOME / "first-run-pending", marker_payload),
+        fg.Item(ENGRAM_HOME / "first-run-pending", marker_payload, owned=True),
     ]
     if TARGET == "claude":
         assert CLAUDE_HOME is not None
@@ -692,6 +693,13 @@ def _move_aside_command() -> str:
     return f"mv {shlex.quote(home)} {shlex.quote(home + '.moved-aside-')}$(date -u +%Y%m%dT%H%M%SZ)"
 
 
+# Said BEFORE every whole-home move-aside command: the home holds live sockets and the running
+# server, so moving it under them breaks the running ENGRAM.
+MOVE_ASIDE_STOP_FIRST_NOTE = (
+    "Stop the running ENGRAM server, daemons and monitors first: the home holds the installed "
+    "plugin, the Python environment and live sockets."
+)
+
 # Said wherever a message gives the move-aside command: the home holds the installed plugin and venv.
 MOVE_ASIDE_REINSTALL_NOTE = (
     "The installed plugin and its Python environment move too, so ENGRAM must be reinstalled afterwards."
@@ -700,7 +708,8 @@ MOVE_ASIDE_REINSTALL_NOTE = (
 
 def _memory_found() -> "list[str]":
     """The files of an existing agent's memory in ENGRAM_HOME (C5): warm-briefing.md,
-    seed-manifest.json, a non-empty history/ or diary/."""
+    seed-manifest.json, a history/ or diary/ holding anything but dotfiles (a lone .DS_Store is
+    not memory). seed-manifest.json counts here even though bootstrap itself rewrites it."""
     found = []
     for name in ("warm-briefing.md", "seed-manifest.json"):
         if fg.target_present(ENGRAM_HOME / name):
@@ -708,7 +717,7 @@ def _memory_found() -> "list[str]":
     for name in ("history", "diary"):
         d = ENGRAM_HOME / name
         try:
-            if d.is_dir() and any(d.iterdir()):
+            if d.is_dir() and any(not child.name.startswith(".") for child in d.iterdir()):
                 found.append(f"{d}/ (not empty)")
         except OSError:
             found.append(f"{d}/ (unreadable)")
@@ -741,7 +750,8 @@ def _refuse_existing_memory(found: "list[str]", db_state: str) -> None:
             f"first), then re-run."
         )
     lines.append(
-        f"  For a deliberate fresh start, set the whole home aside, then re-run:\n"
+        f"  For a deliberate fresh start, set the whole home aside, then re-run. "
+        f"{MOVE_ASIDE_STOP_FIRST_NOTE}\n"
         f"    {_move_aside_command()}\n"
         f"  {MOVE_ASIDE_REINSTALL_NOTE}"
     )
@@ -844,7 +854,7 @@ def _check_existing_agent(db_path: Path) -> None:
                 f"({node_count} nodes).\n"
                 f"  Both FORCE=1 and FORCE_RESEED_EMPTY=1 require an empty (0-node) DB.\n"
                 f"  To start fresh on purpose, set the whole home aside, then re-run bootstrap\n"
-                f"  without any FORCE variable:\n"
+                f"  without any FORCE variable. {MOVE_ASIDE_STOP_FIRST_NOTE}\n"
                 f"    {_move_aside_command()}\n"
                 f"  {MOVE_ASIDE_REINSTALL_NOTE}"
             )
@@ -853,7 +863,8 @@ def _check_existing_agent(db_path: Path) -> None:
             "  bootstrap.py refuses to overwrite an existing install.\n"
             "  - If this is your data, leave it as it is. To upgrade, use the\n"
             "    engram-upgrade skill.\n"
-            "  - For a deliberate fresh start, set the whole home aside, then re-run:\n"
+            "  - For a deliberate fresh start, set the whole home aside, then re-run.\n"
+            f"    {MOVE_ASIDE_STOP_FIRST_NOTE}\n"
             f"    {_move_aside_command()}\n"
             f"    {MOVE_ASIDE_REINSTALL_NOTE}"
         )

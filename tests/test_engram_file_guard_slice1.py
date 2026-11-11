@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import stat
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -225,14 +229,26 @@ def test_replace_accepts_a_relative_path_with_the_cwd_set(tmp_path, monkeypatch)
     assert fg.refusal(p, fg.consent_for(False, ["./d/../d/a.md"])) is None
 
 
-@pytest.mark.skipif(not Path("/var").is_symlink(), reason="the /var vs /private/var spelling exists on macOS only")
-def test_replace_accepts_the_var_and_private_var_spellings(tmp_path):
-    real = Path(os.path.realpath(tmp_path)) / "a.md"
-    real.write_text("mine")
-    p = fg.plan([fg.Item(real, "new")], STAMP)
-    assert str(real).startswith("/private/var/"), real
-    short = str(real)[len("/private"):]
-    assert fg.refusal(p, fg.consent_for(False, [short])) is None
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not Path("/var").is_symlink() or not os.access("/private/var/tmp", os.W_OK),
+    reason="the /var vs /private/var spelling exists on macOS only, and /private/var/tmp must be writable",
+)
+def test_replace_accepts_the_var_and_private_var_spellings():
+    """The pair is built explicitly under /private/var/tmp (not taken from tmp_path, whose
+    location depends on TMPDIR): the same file spelled /private/var/tmp/... and /var/tmp/..."""
+    base = Path(tempfile.mkdtemp(dir="/private/var/tmp"))
+    try:
+        real = base / "a.md"
+        real.write_text("mine")
+        long_spelling = str(real)
+        assert long_spelling.startswith("/private/var/tmp/"), long_spelling
+        short = long_spelling[len("/private"):]
+        assert short.startswith("/var/tmp/")
+        p = fg.plan([fg.Item(real, "new")], STAMP)
+        assert fg.refusal(p, fg.consent_for(False, [short])) is None
+        assert fg.refusal(fg.plan([fg.Item(Path(short), "new")], STAMP), fg.consent_for(False, [long_spelling])) is None
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def test_a_symlink_at_the_path_is_not_followed_for_the_decision(tmp_path):
@@ -327,3 +343,214 @@ def test_backup_keeps_bytes_mode_and_mtime(tmp_path):
     assert st.st_mtime_ns == 1_000_000_000_123_456_789, "the backup lost the file's modification time"
     # Extended attributes and ACLs are NOT promised (shutil.copystat drops them on macOS); the
     # contract and README-AGENT say so, and this test does not claim otherwise.
+
+
+# ------------------------------------------------ K: apply() backs up EVERY differing path before the first write
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_apply_with_a_second_unbackable_path_replaces_nothing(tmp_path):
+    """Two differing, consented files; the second one's directory is read-only, so its backup
+    cannot be written. apply() (called without `saved`, as when a path changed between the two
+    passes) must refuse BEFORE replacing the first: both files keep their bytes."""
+    first = tmp_path / "ok" / "a.md"
+    second = tmp_path / "locked" / "b.md"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_text("mine A")
+    second.write_text("mine B")
+    os.chmod(second.parent, stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        with pytest.raises(SystemExit) as e:
+            fg.apply(fg.plan([fg.Item(first, "new A"), fg.Item(second, "new B")], STAMP), fg.consent_for(True, []))
+    finally:
+        os.chmod(second.parent, stat.S_IRWXU)
+    assert "REFUSED" in str(e.value) and str(second) in str(e.value)
+    assert first.read_text() == "mine A", "the first file was replaced although the second could not be saved"
+    assert second.read_text() == "mine B"
+
+
+def test_apply_backs_up_every_differing_path_before_writing_any(tmp_path, monkeypatch):
+    """Order, observed: no write happens until the last backup has been taken."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.write_text("mine A")
+    b.write_text("mine B")
+    events: list[str] = []
+    real_copy, real_write = fg.copy_exclusive, fg._write
+    monkeypatch.setattr(fg, "copy_exclusive", lambda s, d: (events.append("backup"), real_copy(s, d))[1])
+    monkeypatch.setattr(fg, "_write", lambda p, t: (events.append("write"), real_write(p, t))[1])
+    fg.apply(fg.plan([fg.Item(a, "n"), fg.Item(b, "n")], STAMP), fg.consent_for(True, []))
+    assert events == ["backup", "backup", "write", "write"], events
+
+
+# ------------------------------------------------ L: ENGRAM's own bookkeeping files are rewritten, no consent
+
+def test_engram_owned_files_are_rewritten_without_consent_or_backup(tmp_path):
+    marker = tmp_path / "first-run-pending"
+    manifest = tmp_path / "seed-manifest.json"
+    marker.write_text('{"created": "an earlier run"}')
+    manifest.write_text('{"seed_ids": {}}')
+    items = [fg.Item(marker, "new marker", owned=True), fg.Item(manifest, "new manifest", owned=True)]
+    p = fg.plan(items, STAMP)
+    assert [e.state for e in p.entries] == ["owned", "owned"]
+    assert fg.refusal(p) is None
+    assert sorted(fg.apply(p)) == sorted([marker, manifest])
+    assert (marker.read_text(), manifest.read_text()) == ("new marker", "new manifest")
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["first-run-pending", "seed-manifest.json"], "no backup expected"
+
+
+def test_the_owned_list_is_closed_a_caller_cannot_widen_it(tmp_path):
+    f = tmp_path / "warm-briefing.md"
+    f.write_text("mine")
+    p = fg.plan([fg.Item(f, "new", owned=True)], STAMP)
+    assert p.entries[0].state == "differs", "owned=True is honoured only for the names on the closed list"
+    assert fg.refusal(p) is not None
+    assert fg.ENGRAM_OWNED_NAMES == ("first-run-pending", "seed-manifest.json")
+
+
+def test_a_leftover_first_run_pending_alone_does_not_block_bootstrap(tmp_path):
+    marker = tmp_path / ".engram" / "first-run-pending"
+    marker.parent.mkdir(parents=True)
+    marker.write_text('{"created": "2020-01-01T00:00:00Z", "install_path": "/elsewhere"}')
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "elsewhere" not in marker.read_text(), "the marker was not rewritten"
+    assert sorted(x.name for x in marker.parent.iterdir() if "engram-backup" in x.name) == []
+
+
+# ------------------------------------------------ M: smaller consent / reading points
+
+def _case_insensitive_fs(d: Path) -> bool:
+    probe = d / "CaseProbe.tmp"
+    probe.write_text("x")
+    try:
+        return (d / "caseprobe.tmp").exists()
+    finally:
+        probe.unlink()
+
+
+def test_replace_matches_a_name_that_is_the_same_file_ignoring_case(tmp_path):
+    """macOS APFS is case-insensitive by default: `--replace .../claude.md` names CLAUDE.md."""
+    if not _case_insensitive_fs(tmp_path):
+        pytest.skip("this filesystem is case-sensitive; the lower-case spelling is a different file here")
+    f = tmp_path / "CLAUDE.md"
+    f.write_text("mine")
+    p = fg.plan([fg.Item(f, "new")], STAMP)
+    assert fg.refusal(p, fg.consent_for(False, [str(tmp_path / "claude.md")])) is None
+
+
+def test_replace_does_not_accept_a_hard_link_under_another_name(tmp_path):
+    """Same file, different NAME (not a case/Unicode variant): not the file the user was shown."""
+    f = tmp_path / "CLAUDE.md"
+    f.write_text("mine")
+    alias = tmp_path / "alias.md"
+    os.link(f, alias)
+    p = fg.plan([fg.Item(f, "new")], STAMP)
+    assert fg.refusal(p, fg.consent_for(False, [str(alias)])) is not None
+
+
+def test_replace_does_not_accept_a_case_variant_that_is_a_different_file(tmp_path):
+    f = tmp_path / "CLAUDE.md"
+    f.write_text("mine")
+    other = tmp_path / "claude.MD"
+    other.write_text("another")
+    if f.read_text() != "mine":  # a case-insensitive filesystem folded the two names into one file
+        pytest.skip("this filesystem folds the two names into one file")
+    p = fg.plan([fg.Item(f, "new")], STAMP)
+    assert fg.refusal(p, fg.consent_for(False, [str(other)])) is not None
+
+
+def test_identical_check_reads_utf8_whatever_the_locale(tmp_path):
+    """The writes are UTF-8; the check must read UTF-8 too, so a file already holding the new
+    non-ASCII text is `identical`, not `differs`, under a C/ASCII locale."""
+    f = tmp_path / "a.md"
+    body = "café — done\n"
+    f.write_bytes(body.encode("utf-8"))
+    code = (
+        "import importlib.util, sys\n"
+        "from pathlib import Path\n"
+        f"s = importlib.util.spec_from_file_location('g', {str(SRC / 'engram_file_guard.py')!r})\n"
+        "g = importlib.util.module_from_spec(s); s.loader.exec_module(g)\n"
+        f"print(g.classify(Path({str(f)!r}), {body!r}))\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONUTF8", "PYTHONIOENCODING")}
+    env.update({"LC_ALL": "C", "LANG": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"})
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "identical", r.stdout + r.stderr
+
+
+def test_history_or_diary_holding_only_dotfiles_is_not_memory(tmp_path):
+    for sub in ("history", "diary"):
+        d = tmp_path / ".engram" / sub
+        d.mkdir(parents=True)
+        (d / ".DS_Store").write_bytes(b"\x00")
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / ".engram" / "knowledge.db").exists()
+
+
+def test_history_with_a_real_file_is_still_memory(tmp_path):
+    d = tmp_path / ".engram" / "history"
+    d.mkdir(parents=True)
+    (d / ".DS_Store").write_bytes(b"\x00")
+    (d / "2026-01-01.md").write_text("an entry")
+    r = _run(tmp_path)
+    assert r.returncode != 0 and "memory" in (r.stdout + r.stderr)
+    assert not (tmp_path / ".engram" / "knowledge.db").exists()
+
+
+# ------------------------------------------------ N: merge refuses what a rewrite would silently change
+
+@pytest.mark.parametrize("text", [
+    '{"model": "a", "model": "b"}',
+    '{"hooks": {"x": 1, "x": 2}, "theme": "dark"}',
+])
+def test_merge_refuses_a_duplicate_key_and_leaves_the_file_alone(tmp_path, text):
+    path = tmp_path / "settings.json"
+    path.write_text(text)
+    with pytest.raises(fg.MergeRefused) as e:
+        fg.apply_merge(path, {"cleanupPeriodDays": 30})
+    assert "more than once" in str(e.value)
+    assert path.read_text() == text and sorted(x.name for x in tmp_path.iterdir()) == ["settings.json"]
+
+
+@pytest.mark.parametrize("text", [
+    '{"limit": 1e400}', '{"limit": -1e400}', '{"x": Infinity}', '{"x": NaN}', '{"x": -Infinity}',
+])
+def test_merge_refuses_a_non_finite_number_and_leaves_the_file_alone(tmp_path, text):
+    path = tmp_path / "settings.json"
+    path.write_text(text)
+    with pytest.raises(fg.MergeRefused):
+        fg.apply_merge(path, {"cleanupPeriodDays": 30})
+    assert path.read_text() == text and sorted(x.name for x in tmp_path.iterdir()) == ["settings.json"]
+
+
+def test_merge_says_number_spellings_may_be_normalised_and_does_so_visibly(tmp_path):
+    assert "NUMBER SPELLINGS MAY BE NORMALISED" in fg.merge_json_text.__doc__
+    path = tmp_path / "settings.json"
+    path.write_text('{"n": 1E5}')
+    assert fg.apply_merge(path, {"cleanupPeriodDays": 30}) == "merged"
+    assert json.loads(path.read_text())["n"] == 100000.0 and "100000.0" in path.read_text()
+
+
+# ------------------------------------------------ O: atomic_write_text temp names are unique per call
+
+def test_atomic_write_survives_a_leftover_temp_of_the_same_pid(tmp_path):
+    target = tmp_path / "a.txt"
+    leftover = tmp_path / f".a.txt.tmp-{os.getpid()}"
+    leftover.write_text("a crashed run's leftover")
+    fg.atomic_write_text(target, "new", 0o600)
+    assert target.read_text() == "new"
+    assert leftover.read_text() == "a crashed run's leftover", "an unrelated temp was touched"
+    assert sorted(x.name for x in tmp_path.iterdir()) == [leftover.name, "a.txt"], "this call left a temp behind"
+
+
+def test_atomic_write_temp_names_differ_per_call(tmp_path, monkeypatch):
+    names: list[str] = []
+    real = os.replace
+    monkeypatch.setattr(os, "replace", lambda s, d: (names.append(os.path.basename(s)), real(s, d))[1])
+    target = tmp_path / "a.txt"
+    fg.atomic_write_text(target, "1", 0o600)
+    fg.atomic_write_text(target, "2", 0o600)
+    assert len(names) == 2 and names[0] != names[1], names
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600

@@ -464,7 +464,7 @@ ENGRAM_INSTALL_MODE=plugin \
 "$VENV_PY" bootstrap.py
 ```
 
-**If bootstrap prints `[bootstrap] REFUSED:` followed by a list of files**, the user already has their own version of one or more files that bootstrap would write (for Codex: `~/.codex/AGENTS.md`, `~/.codex/config.toml`, `codex-compact-prompt.md`; for Claude: `~/.claude/CLAUDE.md`), and bootstrap will not replace them without consent (#4440, #4452). Nothing has been changed yet. The one message names every file that needs a yes, and the backup each would get. Show the user that whole list and ask: replace them (each is copied to a backup first: a stamped `<name>.engram-backup.<UTC time>` every time, plus a `<name>.pre-engram` the first time for an identity file; an earlier backup is never touched), or stop so they can move the files themselves. A backup keeps the file's bytes, its permission mode and its modification time; it does not keep extended attributes or ACLs. **Backups accumulate: every replace adds one, and nothing deletes them automatically.** Show the user the WHOLE list in ONE question, so one yes never covers a path they did not see. Only on a clear yes, re-run the same command with `--replace PATH` for each file they agreed to (repeat the flag; use this to cover exactly what they approved), or `--force`, which means yes to EVERY file the refusal listed. If the refusal says a `<name>.pre-engram` is the same file as the file itself (a hard link or a link to it), no flag gets past it: move that backup name aside as the message says, then re-run. **An agent passes `--force`, `--replace` or `--yes` only after showing the user the full list of files the refusal named and getting their yes.** Never add them on your own judgement. A `REFUSED` about a dangling symlink is not fixed by these flags: the message names the link to move aside or repair.
+**If bootstrap prints `[bootstrap] REFUSED:` followed by a list of files**, the user already has their own version of one or more files that bootstrap would write (for Codex: `~/.codex/AGENTS.md`, `~/.codex/config.toml`, `codex-compact-prompt.md`; for Claude: `~/.claude/CLAUDE.md`), and bootstrap will not replace them without consent (#4440, #4452). **Codex note:** an existing `~/.codex/config.toml` that does not yet hold the ENGRAM block now needs that consent on the FIRST Codex bootstrap (earlier versions merged into it after a backup, with no flag), so expect this refusal for any user who already has a Codex config, and show the user the whole refusal list in one question. Nothing has been changed yet. The one message names every file that needs a yes, and the backup each would get. Show the user that whole list and ask: replace them (each is copied to a backup first: a stamped `<name>.engram-backup.<UTC time>` every time, plus a `<name>.pre-engram` the first time for an identity file; an earlier backup is never touched), or stop so they can move the files themselves. A backup keeps the file's bytes, its permission mode and its modification time; it does not keep extended attributes or ACLs. **Backups accumulate: every replace adds one, and nothing deletes them automatically.** Show the user the WHOLE list in ONE question, so one yes never covers a path they did not see. Only on a clear yes, re-run the same command with `--replace PATH` for each file they agreed to (repeat the flag; use this to cover exactly what they approved), or `--force`, which means yes to EVERY file the refusal listed. If the refusal says a `<name>.pre-engram` is the same file as the file itself (a hard link or a link to it), no flag gets past it: move that backup name aside as the message says, then re-run. **An agent passes `--force`, `--replace` or `--yes` only after showing the user the full list of files the refusal named and getting their yes.** Never add them on your own judgement. A `REFUSED` about a dangling symlink is not fixed by these flags: the message names the link to move aside or repair.
 
 ### Phase 1.6 — Hook trust (CODEX-DELTA)
 
@@ -595,8 +595,10 @@ skill's inverse-merge gate above.
 > **Never re-bootstrap to "refresh."** `FORCE=1` and `FORCE_RESEED_EMPTY=1`
 > **refuse on a non-empty DB**, and they refuse on a home that still holds the agent's
 > memory (`warm-briefing.md`, `seed-manifest.json`, `history/`, `diary/`). A genuine fresh
-> start means moving the whole data home aside first
-> (`mv ~/.engram ~/.engram.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)`), so nothing is lost.
+> start means moving the whole data home aside first. Stop the running ENGRAM server,
+> daemons and monitors before the move (the home holds the installed plugin, the venv and
+> live sockets). Then run
+> `mv ~/.engram ~/.engram.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)`, so nothing is lost.
 > The installed plugin and its Python environment move too, so ENGRAM must be reinstalled afterwards.
 > Upgrade is non-destructive; re-bootstrapping is never the upgrade path. Do NOT kill the MCP subprocess
 > yourself — the stdio-MCP reconnect contract is user-restart only.
@@ -713,7 +715,9 @@ spare terminal and refresh to watch the graph grow.
 
 **Install refuses to overwrite an existing install:** intentional. Either **upgrade**
 (keep the graph; update code) via the upgrade flow above, or a **fresh start**
-(empty graph) by setting the whole data home aside, then re-running:
+(empty graph) by setting the whole data home aside, then re-running. Stop the running
+ENGRAM server, daemons and monitors first (the home holds the installed plugin, the venv
+and live sockets):
 `mv ~/.engram ~/.engram.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)`. The installed plugin and its Python environment move too, so ENGRAM must be reinstalled afterwards. Moving only `knowledge.db`
 is not enough, because bootstrap also refuses a home that still holds the agent's memory
 files. `FORCE=1` refuses on a non-empty DB. If the refusal names a graph backup under
@@ -752,6 +756,7 @@ bash tools/uninstall-local-marketplace.sh --dry-run  # preview
 
 # Full data reset (set the data home aside; keeps a copy you can move back):
 bash tools/uninstall-local-marketplace.sh
+# First stop the running ENGRAM server, daemons and monitors (the home holds the installed plugin, the venv and live sockets).
 mv ~/.engram ~/.engram.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)
 # The installed plugin and its Python environment move too, so ENGRAM must be reinstalled afterwards.
 mv ~/.claude/CLAUDE.md ~/.claude/CLAUDE.md.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)   # optional: set the agent identity aside

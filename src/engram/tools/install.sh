@@ -516,9 +516,13 @@ fi
 
 if [ "$_run_bootstrap" -eq 1 ]; then
   # bootstrap.py refuses to overwrite an existing, differing CLAUDE.md (#4440) unless it is
-  # given --force. That flag is passed ONLY on the branch below where the file exists and the
-  # consent/backup step has already succeeded; every other run passes nothing.
-  _bootstrap_flags=""
+  # given consent for it. The consent is `--replace "$CLAUDE_MD"`: yes to exactly that one
+  # file, the one the question below names, never to any other path. It is added ONLY on the
+  # branch below where the file exists and the consent/backup step has already succeeded;
+  # every other run passes nothing. An array keeps a path with spaces as one argument; the
+  # ${arr[@]+...} form is the spelling that is safe for an empty array under `set -u` on
+  # bash 3.2 (macOS /bin/bash) too.
+  _bootstrap_flags=()
   # The yes for replacing an existing CLAUDE.md. --yes is a yes; on a terminal the question
   # defaults to No; with no one to ask the constant decides (0). Called on every branch below
   # that would replace the file, so no branch replaces it without this yes.
@@ -553,7 +557,7 @@ if [ "$_run_bootstrap" -eq 1 ]; then
         || fail "could not copy $CLAUDE_MD to $CLAUDE_MD_BACKUP" "fix the permissions of $CLAUDE_HOME and re-run"
       _claude_md_note="backed up $CLAUDE_MD to $CLAUDE_MD_BACKUP; $CLAUDE_MD will be replaced"
     fi
-    _bootstrap_flags="--force"
+    _bootstrap_flags=(--replace "$CLAUDE_MD")
     printf '[step 6] CLAUDE.md: %s\n' "$_claude_md_note"
   fi
 
@@ -563,14 +567,14 @@ if [ "$_run_bootstrap" -eq 1 ]; then
       ALPHA_DIR="$PLUGIN_ROOT" ALPHA_TEMPLATES_DIR="$PLUGIN_ROOT/templates" \
       ENGRAM_HOME="$ENGRAM_HOME" CLAUDE_HOME="$CLAUDE_HOME" PYTHON_BIN="$VENV_PY" \
       TARGET=claude ENGRAM_INSTALL_MODE=plugin \
-      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" $_bootstrap_flags \
+      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" ${_bootstrap_flags[@]+"${_bootstrap_flags[@]}"} \
       || fail "bootstrap.py failed" "read its output above and re-run; the 0-node state is retried safely"
   else
     env -u FORCE -u FORCE_RESEED_EMPTY \
       ALPHA_DIR="$PLUGIN_ROOT" ALPHA_TEMPLATES_DIR="$PLUGIN_ROOT/templates" \
       ENGRAM_HOME="$ENGRAM_HOME" CLAUDE_HOME="$CLAUDE_HOME" PYTHON_BIN="$VENV_PY" \
       TARGET=claude ENGRAM_INSTALL_MODE=plugin \
-      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" $_bootstrap_flags \
+      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" ${_bootstrap_flags[@]+"${_bootstrap_flags[@]}"} \
       || fail "bootstrap.py failed" "read its output above; if knowledge.db was left behind with 0 nodes, re-running this installer reseeds it"
   fi
   BOOTSTRAP_RAN=1
