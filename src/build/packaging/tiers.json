@@ -1222,6 +1222,11 @@
       "dest": "skills/engram-nap"
     },
     {
+      "path": "skills/claude/engram-model-switch-read",
+      "tier": "essential",
+      "dest": "skills/engram-model-switch-read"
+    },
+    {
       "path": "skills/claude/engram-observe",
       "tier": "essential",
       "dest": "skills/engram-observe"
