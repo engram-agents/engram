@@ -19,6 +19,10 @@ Thank you for helping. This page is short on purpose.
 - A fork pull request gets a red check named
   `name-leak-gate (NOT SCANNED - fork PR)`. This is expected. Fork pull requests
   never receive the secret that check needs, so it cannot run.
+  This check is not a required status check (the `dev` ruleset requires only
+  `pr-checks`), so on its own it does not block a merge.
+- Workflow runs on pull requests from forks may wait for a maintainer to
+  approve them before they start.
 - It does not mean your change is wrong. A maintainer reads your branch's
   workflow and code changes, then re-pushes it as a branch in this repository
   so the check can run.

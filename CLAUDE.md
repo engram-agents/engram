@@ -697,8 +697,8 @@ knows it exists unless a surface carries it; this section is that surface (Lei,
   `submitted_at` is not earlier than that commit's committer date.
   **`commit_id == headRefOid` alone is never sufficient**: GitHub can re-point live
   approvals onto newer heads (engram-alpha#2267). Otherwise get a fresh approval
-  (source of truth: engram `docs/internal/PR-MERGE-POLICY.md`, gate item 2). Never trust `reviewDecision` alone. (On engram the setting is `true` on `dev`,
-  `false` on `main`.)
+  (source of truth: engram `docs/internal/PR-MERGE-POLICY.md`, gate item 2). Never trust `reviewDecision` alone. (On engram the setting is `true` on `dev`;
+  `main` has no pull-request rule, so it is unset there.)
 - **Read branch protection via `rules/branches/<b>`, never
   `branches/<b>/protection`.** The classic endpoint answers by caller permission
   (admin: "Branch not protected"; non-admin: "Not Found"; unauthenticated: 401)
@@ -1092,7 +1092,7 @@ incident below).
    `"nodes":[]` (empty) means the body is missing the keyword form and the PR
    will NOT auto-close **via the body** on merge; rewrite via
    `gh pr edit <PR> --body "..."`. **An empty array says NOTHING about commit
-   messages — see check 3, which covers the path this query cannot see.**
+   messages — see check 3, which covers the path this query cannot see.** Intent only: a merge to `dev` closes nothing (item 2 above).
 
    **This query lags a `gh pr edit --body`/push, in EITHER direction** (a fixed body
    can still read non-empty; a bad one can read empty). Query, wait at least 5
@@ -1112,7 +1112,7 @@ incident below).
    the PR BODY only — a merge commit's own message is a THIRD close surface
    GitHub's parser reads independently, invisible to checks 1 and 2.
    This repo's `squash_merge_commit_message` is `BLANK` (title `PR_TITLE`; reset
-   after the 2026-11 rebuild, as a fresh repo defaults to `COMMIT_MESSAGES`), but **umwelt and soma
+   after the 2026-11 rebuild), but **umwelt and soma
    read `COMMIT_MESSAGES`** — check `gh api repos/engram-agents/<repo> --jq
    .squash_merge_commit_message` for the repo you are in. Run the grep anyway; a
    settings flip is silent, and so are a hand-edited squash message and

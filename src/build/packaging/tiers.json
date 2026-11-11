@@ -1727,6 +1727,10 @@
       "reason": "documentation files — developer reference, not shipped in any install tier"
     },
     {
+      "path": "CONTRIBUTING.md",
+      "reason": "contributor documentation for the repository — not shipped in the plugin bundle"
+    },
+    {
       "path": "README.md",
       "reason": "repository landing-page documentation — not shipped in the plugin bundle"
     },

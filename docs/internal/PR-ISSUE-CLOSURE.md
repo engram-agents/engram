@@ -114,8 +114,7 @@ form that fires the parser.
    did NOT ride into the merge commit there. **Current repo (engram, public):**
    read 2026-11-11 as `squash_merge_commit_message` `BLANK` and
    `squash_merge_commit_title` `PR_TITLE`; they were reset to these values after
-   the rebuild, because a fresh repo defaults to `COMMIT_MESSAGES` /
-   `COMMIT_OR_PR_TITLE`. The check stays anyway, as
+   the rebuild. The check stays anyway, as
    defense-in-depth against the three ways the exposure appears without any
    code change: a repo-settings flip to `COMMIT_MESSAGES` (silent, and
    exactly what makes **umwelt and soma** exposed — both read

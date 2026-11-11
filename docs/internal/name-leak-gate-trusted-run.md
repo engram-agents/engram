@@ -114,15 +114,22 @@ the bootstrap branch "is unreachable for every later pull request" because a
 base commit can never lose a merged file. That was true of pull requests into
 `dev` and **false of every other base**: the workflow has no branch filter, so
 a pull request into `main` runs the gate too, and `main` does not carry the tool
-until the next release cut. Measured 2026-11-07: `tools/name_leak_gate.py` is
-absent on `main` (`69894967`) while `tools/name_leak_warn.py` is present there.
+until the next release cut. Measured 2026-11-07 (historical): `tools/name_leak_gate.py` was
+absent on `main` (`69894967`) while `tools/name_leak_warn.py` was present there.
 Such a pull request would have sat on the bootstrap path indefinitely, running
 its own gate code with the roster. The claim was a clause true of the branch I
 checked and extended, in my head, to branches I had not.
 
-With the default-branch link in place the property holds: `dev` is protected, so
-a pull request cannot remove the tool from it, and step 3 becomes unreachable
-once the gate has merged there.
+The default branch is now `main` (the workflow reads it from
+`github.event.repository.default_branch`). As read on 2026-11-11,
+`git ls-tree origin/main tools/name_leak_gate.py` lists the tool, so the second
+link finds it there. What is not shown is the old property that "a pull request
+cannot remove the tool": `main`'s ruleset has only deletion and non-fast-forward
+rules (`gh api repos/engram-agents/engram/rules/branches/main`, read 2026-11-11),
+and no pull-request rule. `main` moves only on release cuts, so the tool stays
+there in practice, but that is a convention, not a protection shown for `main`.
+For pull requests into `dev`, the base commit (link 1) carries the tool, and
+`dev` is protected.
 
 **Step 3 is entered only on positive knowledge, and that distinction is the last
 one in this section.** Before reading anything, both protected refs must
