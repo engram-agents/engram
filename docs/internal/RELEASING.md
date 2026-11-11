@@ -432,7 +432,9 @@ Key flags (from `--help`):
   `<source>/tools/scan-leaks.py`. Use it when `--source` is a repo that does
   not carry that script. A path that is not an existing file (nonexistent, or
   a directory) fails closed before the target is touched; the path must be a
-  Python scanner, and the tool does not inspect its contents.
+  Python scanner, and the tool does not inspect its contents. A standalone
+  copy must have `engine/home_path_class.py` beside it (the scanner loads its
+  home-path class from there and aborts with ImportError without it).
 - `--author` — commit author; defaults to whatever's parsed from the LICENSE
   copyright line.
 - `--push` — push the branch + tag to the target's origin after committing.

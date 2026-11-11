@@ -64,7 +64,7 @@ ALLOWED_HOME_SEGMENTS = {
     # System and shared directories.
     "Shared": "macOS system folder under /Users, not a person",
     "agents-shared": (
-        "shared coordination folder the multi-agent tools use as a default; "
+        "shared coordination folder the team coordination tools use as a default; "
         "whether it should stay a public default is a separate open decision"
     ),
 }
