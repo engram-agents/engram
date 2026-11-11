@@ -653,60 +653,59 @@ of this rule: `docs/internal/PR-REVIEW-CONVENTION.md` § The order is a rule.*
 ### Stacked PRs (`gh-stack`) — the merge verb changes, and nothing in training knows it
 
 GitHub Stacked PRs (public preview 2026-07-30; official extension
-`github/gh-stack`) is **post-cutoff for every model on the team** — no session
-knows it exists unless a surface carries it; this section is that surface (Lei,
-2026-08-29). Install is **per-user**: `gh extension install github/gh-stack`
+`github/gh-stack`) is **post-cutoff for every model on the team**; this section is
+the surface that carries it (Lei, 2026-08-29). Install is **per-user**:
+`gh extension install github/gh-stack`
 (verify with `gh extension list`).
 
 - **Link at PR creation — not optional.** The moment you open a PR whose base is
-  another PR's branch, `gh stack link <parent> <child> …` (works on already-open
-  PRs; `gh stack link <pr1> <pr2> …` links existing PRs into a stack). An
+  another PR's branch, `gh stack link <parent> <child> …` (works on open PRs;
+  `gh stack link <pr1> <pr2> …` links existing PRs). An
   unlinked stack has none of the protections below: plain `gh pr merge` is NOT
   refused, nothing auto-rebases, and merging the parent with `--delete-branch`
   CLOSES the child instead of retargeting it. An auto-closed child is
   recoverable only while its head is untouched: **restore the deleted base ref
   BEFORE you rebase anything** — a post-close force-push forecloses reopen.
-- **Membership is a timestamped snapshot, never a standing fact.** Another seat
-  can change it mid-operation. Never carry a membership read across an interval
-  in which another seat may act, and never pair `--delete-branch` with a
+  **Interim (2026-11-11, pending the default-branch decision):** here PRs target `dev`
+  but the default branch is `main`, and `gh stack link` retargets the bottom PR to
+  `main`. Do not link such stacks; the parent's merge seat retargets each child to
+  `dev` before merging. Procedure: `docs/internal/GH-STACK.md`.
+- **Membership is a timestamped snapshot, never a standing fact.** Never carry a
+  membership read across an interval in which another seat may act, and never pair `--delete-branch` with a
   membership read you have not just re-taken: read the PR's `stack` field AND its
   events API (`added_to_stack` / `removed_from_stack`) immediately before
   merging. The merge attempt is authoritative (believing a member is not one
   earns a refusal; believing a non-member has no dependents orphans them). A
   local `gh stack view` can claim "not part of a stack" while the PR is one.
 - **A stack member REFUSES plain `gh pr merge`.** The verb is
-  `gh stack merge <pr> --squash --yes`; the refusal is the signal you are on a
-  stack.
+  `gh stack merge <pr> --squash --yes`; the refusal signals a stack.
 - **After a layer merges, GitHub auto-rebases the next layer itself** (no push
   from any seat; the force-push is attributed to the merger). Verify with
   `git range-diff`/patch-id — but that check is **necessary, not sufficient**: it
   answers "did the patch change?", never "does the result still work?". A
-  conflict-free rebase can break the tree (one PR drops an import as dead code,
-  another adds a caller). **Run the tests on each rebased tip.**
-- **Other verbs:** `gh stack sync` / `gh stack rebase` (cascading rebase of
-  un-merged layers), `gh stack view --json`. Stacks are API-readable (REST
+  conflict-free rebase can break the tree (one PR drops an import, another adds a caller).
+  **Run the tests on each rebased tip.**
+- **Other verbs:** `gh stack sync` / `gh stack rebase` (cascading rebase),
+  `gh stack view --json`. Stacks are API-readable (REST
   `stack`, GraphQL `PullRequestStack`), not API-mutable.
 - **Approvals after a layer: compare, never predict.** With
   `require_last_push_approval=true` on the target branch, the seat that
-  syncs/rebases cannot be the tip re-affirmer; a teammate re-approves. Whether an
+  syncs/rebases cannot re-affirm the tip; a teammate re-approves. Whether an
   approval is dismissed on push depends on the base branch's
   `dismiss_stale_reviews_on_push` — **necessary on the evidence, not
-  demonstrably sufficient**, so never treat it as a rule that predicts the
-  outcome. After every layer, read the approval back off `pulls/<N>/reviews`: it
+  demonstrably sufficient**, so it predicts nothing. After every layer, read the approval back off `pulls/<N>/reviews`: it
   counts only if its `commit_id` is the PR's current `headRefOid` AND its
   `submitted_at` is not earlier than that commit's committer date.
   **`commit_id == headRefOid` alone is never sufficient**: GitHub can re-point live
   approvals onto newer heads (engram-alpha#2267). Otherwise get a fresh approval
-  (source of truth: engram `docs/internal/PR-MERGE-POLICY.md`, gate item 2). Never trust `reviewDecision` alone. (On engram the setting is `true` on `dev`;
+  (see `docs/internal/PR-MERGE-POLICY.md`, gate item 2). Never trust `reviewDecision` alone. (On engram the setting is `true` on `dev`;
   `main` has no pull-request rule, so it is unset there.)
 - **Read branch protection via `rules/branches/<b>`, never
   `branches/<b>/protection`.** The classic endpoint answers by caller permission
   (admin: "Branch not protected"; non-admin: "Not Found"; unauthenticated: 401)
-  and gives the same answer for a ruleset-protected and an unprotected branch, so
-  it discriminates nothing.
+  and gives the same answer for a ruleset-protected and an unprotected branch.
 
-*Evidence for every rule above (the dated measurements, the dismissal cases, the
-numbering sweep): engram's `docs/internal/GH-STACK.md`.*
+*Evidence for every rule above: engram's `docs/internal/GH-STACK.md`.*
 
 > **Duplicated by hand in engram, umwelt, and soma `CLAUDE.md`** (Lei,
 > 2026-08-29: whichever repo a session starts from must load it), with no
