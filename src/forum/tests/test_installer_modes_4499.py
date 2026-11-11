@@ -221,7 +221,7 @@ def test_i2_a_planted_group_writable_path_fires_and_is_named(tmp_path, mask, pla
         for t in targets
     )
     r = _bash(svc, PHASE + "\n" + plant + "\n_assert_no_group_write", mask=mask)
-    assert r.returncode != 0, "the assertion stayed silent over a planted group-writable path"
+    assert r.returncode == 2, "the assertion stayed silent over a planted group-writable path"
     for t in targets:
         assert str(svc / t) in r.stderr, f"{t} not named in: {r.stderr!r}"
 
@@ -260,7 +260,7 @@ def test_i2_an_uninspectable_subtree_fails_the_assertion(tmp_path, mask, locked)
         r = _bash(svc, PHASE + "\n_assert_no_group_write", mask=mask)
     finally:
         os.chmod(sub, 0o755)
-    assert r.returncode != 0, "the assertion passed over a subtree it could not inspect"
+    assert r.returncode == 2, "the assertion passed over a subtree it could not inspect"
     assert "could not be inspected" in r.stderr, r.stderr
 
 
@@ -275,6 +275,45 @@ def test_i2_a_readable_subtree_control_passes(tmp_path):
     os.chmod(sub, 0o755)
     r = _bash(svc, PHASE + "\n_assert_no_group_write", mask=0o022)
     assert r.returncode == 0, r.stderr
+
+
+def _symlinked_svc(tmp_path: Path, *, dirty: bool) -> tuple[Path, Path]:
+    """svc is a SYMLINK to a real directory (the finding: find does not descend into it)."""
+    real = tmp_path / "real-forum"
+    real.mkdir()
+    (real / "f.txt").write_text("x")
+    (real / "d").mkdir()
+    os.chmod(real / "f.txt", 0o664 if dirty else 0o644)
+    os.chmod(real / "d", 0o775 if dirty else 0o755)
+    os.chmod(real, 0o755)
+    svc = tmp_path / "forum"
+    svc.symlink_to(real)
+    return svc, real
+
+
+@pytest.mark.parametrize("mask", [0o002, 0o022])
+def test_i2_c1a_a_symlinked_service_dir_is_still_normalized(tmp_path, mask):
+    svc, real = _symlinked_svc(tmp_path, dirty=True)
+    r = _bash(svc, "_normalize_service_modes", mask=mask)
+    assert r.returncode == 0, r.stderr
+    assert _mode(real / "f.txt") & 0o020 == 0, oct(_mode(real / "f.txt"))
+    assert _mode(real / "d") & 0o020 == 0, oct(_mode(real / "d"))
+
+
+@pytest.mark.parametrize("mask", [0o002, 0o022])
+def test_i2_c1b_a_symlinked_service_dir_does_not_hide_a_group_writable_path(tmp_path, mask):
+    svc, real = _symlinked_svc(tmp_path, dirty=True)
+    r = _bash(svc, "_assert_no_group_write", mask=mask)
+    assert r.returncode == 2, (r.returncode, r.stderr)
+    assert "f.txt" in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("mask", [0o002, 0o022])
+def test_i2_c1c_a_symlinked_clean_service_dir_is_silent(tmp_path, mask):
+    svc, _real = _symlinked_svc(tmp_path, dirty=False)
+    r = _bash(svc, "_assert_no_group_write", mask=mask)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "" and r.stderr.strip() == ""
 
 
 def test_i2_dry_run_prints_a_plan_line_and_does_not_run_the_find(tmp_path):
@@ -304,8 +343,8 @@ def test_i3_the_installer_body_normalizes_before_it_asserts(tmp_path, mask):
     )
     assert r.returncode == 0, r.stderr
     out = r.stdout + r.stderr
-    norm = f"[dry-run] find {svc} -xdev ! -type l -exec chmod g-w {{}} +"
-    asrt = f"[dry-run] assert: find {svc} -xdev -perm -g+w ! -type l lists nothing"
+    norm = f"[dry-run] find -H {svc} -xdev ! -type l -exec chmod g-w {{}} +"
+    asrt = f"[dry-run] assert: find -H {svc} -xdev -perm -g+w ! -type l lists nothing"
     assert out.count(norm) == 1, out
     assert out.count(asrt) == 1, out
     assert out.index(norm) < out.index(asrt)

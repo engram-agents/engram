@@ -727,17 +727,19 @@ _set_service_modes() {
 
 # Run AFTER everything is written: takes group write off whatever an earlier install
 # (or a UMask=002 unit) left behind, and pins an existing dm/ to 2700 with no ACL.
+# find -H follows only SERVICE_DIR itself when it is a symlink (else find lists nothing and the
+# assertion is vacuous); symlinks inside the tree are still not followed.
 # Symlinks are skipped: a venv's python links always read 777 and chmod would follow them.
 _normalize_service_modes() {
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  [dry-run] find $SERVICE_DIR -xdev ! -type l -exec chmod g-w {} +"
+    echo "  [dry-run] find -H $SERVICE_DIR -xdev ! -type l -exec chmod g-w {} +"
     echo "  [dry-run] if $SERVICE_DIR/dm exists: setfacl -b, then chmod 2700"
     return 0
   fi
   [ -d "$SERVICE_DIR" ] || return 0
   # Best effort: a path owned by someone else cannot be changed by this account; the
   # assertion below names every such path rather than letting it pass.
-  find "$SERVICE_DIR" -xdev ! -type l -exec chmod g-w {} + 2>/dev/null || true
+  find -H "$SERVICE_DIR" -xdev ! -type l -exec chmod g-w {} + 2>/dev/null || true
   if [ -d "$SERVICE_DIR/dm" ] && [ ! -L "$SERVICE_DIR/dm" ]; then
     # setfacl -b alone lands 2750 (measured); the chmod is what pins 2700.
     if command -v setfacl >/dev/null 2>&1; then setfacl -b "$SERVICE_DIR/dm" 2>/dev/null || true; fi
@@ -750,11 +752,11 @@ _normalize_service_modes() {
 # could not finish (an uninspected subtree is not a clean one).
 _assert_no_group_write() {
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  [dry-run] assert: find $SERVICE_DIR -xdev -perm -g+w ! -type l lists nothing"
+    echo "  [dry-run] assert: find -H $SERVICE_DIR -xdev -perm -g+w ! -type l lists nothing"
     return 0
   fi
   local _bad="" _rc=0
-  _bad="$(find "$SERVICE_DIR" -xdev -perm -g+w ! -type l 2>/dev/null)" || _rc=$?
+  _bad="$(find -H "$SERVICE_DIR" -xdev -perm -g+w ! -type l 2>/dev/null)" || _rc=$?
   if [ -n "$_bad" ] || [ "$_rc" -ne 0 ]; then
     echo "ERROR: path(s) under $SERVICE_DIR carry the group-write bit after install (#4499):" >&2
     [ -z "$_bad" ] || printf '  %s\n' "$_bad" >&2

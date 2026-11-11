@@ -431,6 +431,32 @@ def test_b1_output_is_0640_and_the_temp_is_at_its_final_mode_at_replace_time(
     assert _mode(dest) == 0o640, oct(_mode(dest))
 
 
+# The temp name each writer uses (read off tools/forum_backup.py: _write_atomic uses
+# dest.with_suffix(".tmp"); _write_success_stamp uses STAMP_NAME + ".tmp").
+def _temp_name(fb, kind: str) -> str:
+    if kind == "forum.sql":
+        return Path(WRITERS[kind][1]).with_suffix(".tmp").name
+    return fb.STAMP_NAME + ".tmp"
+
+
+@pytest.mark.parametrize("mask", [0o002, 0o022])
+@pytest.mark.parametrize("kind", list(WRITERS))
+def test_b1_a_stale_wide_temp_from_a_killed_run_is_narrowed_before_publishing(tmp_path, umask, kind, mask):
+    """``_write_private_tmp`` claims fchmod covers a stale temp (O_CREAT keeps its mode): pin it."""
+    fb = _backup_module()
+    backup_dir = tmp_path / "backup"
+    backup_dir.mkdir()
+    stale = backup_dir / _temp_name(fb, kind)
+    stale.write_text("stale\n")
+    os.chmod(stale, 0o666)
+    umask(mask)
+    dest = _call_writer(fb, kind, backup_dir)
+    assert _mode(dest) == 0o640, oct(_mode(dest))
+    assert _mode(dest) & 0o022 == 0, oct(_mode(dest))
+    assert not stale.exists()
+    assert [p.name for p in backup_dir.iterdir() if p.name.endswith(".tmp")] == []
+
+
 @pytest.mark.parametrize("kind", list(WRITERS))
 def test_b1_a_failing_chmod_is_loud_leaves_no_temp_and_keeps_the_old_file(tmp_path, monkeypatch, umask, kind):
     fb = _backup_module()
