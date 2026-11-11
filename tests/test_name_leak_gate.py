@@ -20,8 +20,10 @@ row is one independently identified case.
 """
 
 import ast
+import hashlib
 import importlib.util
 import itertools
+import json
 import os
 import re
 import shutil
@@ -678,6 +680,56 @@ def test_harness_puts_the_roster_in_a_private_per_run_directory(gate_repo, tmp_p
     second_rc, second_out = _run_gate(work, base_without_tool, tmp_path)
     assert second_rc == 0, second_out
     assert _roster_path(tmp_path) != first
+
+
+# ── the count-mismatch warning (#4600) ───────────────────────────────────────
+#
+# Contract: the "attestation records N pattern(s) but the roster has M" warning
+# is printed IF AND ONLY IF the roster is present AND the attestation is present
+# AND the attested sha256 MATCHED AND the counts differ. The warning's own text
+# says "the sha256 still matched", so printing it on a hash mismatch contradicts
+# the verdict line. The roster below is one pattern, so pattern_count == 1.
+
+_COUNT_WARNING = "the sha256 still matched"
+_ROSTER_ONE_PATTERN_SHA = hashlib.sha256(b"somepattern\n").hexdigest()
+
+
+def _run_with_attestation(gate_repo, tmp_path, *, count, sha):
+    """Run the decide step with an attestation (count, sha); None = file absent."""
+    work, base_without_tool, _g = gate_repo
+    (tmp_path / "decide.py").write_text(_decide_script())
+    (work / "tools" / "name_leak_gate.py").write_text(_STUB_TOOL)
+    att = work / ".github" / "name-leak-roster.attestation.json"
+    if count is None:
+        att.unlink()
+    else:
+        att.write_text(
+            json.dumps(
+                {"roster_format": 1, "pattern_count": count, "roster_sha256": sha}
+            )
+        )
+    rc, out = _run_gate(work, base_without_tool, tmp_path)
+    assert rc == 0, out
+    return out
+
+
+@pytest.mark.parametrize(
+    "count, sha, warned",
+    [
+        pytest.param(5, _ROSTER_ONE_PATTERN_SHA, True, id="hash-match-count-differs"),
+        pytest.param(5, "0" * 64, False, id="hash-mismatch-count-differs"),
+        pytest.param(1, _ROSTER_ONE_PATTERN_SHA, False, id="hash-match-count-equal"),
+        pytest.param(1, "0" * 64, False, id="hash-mismatch-count-equal"),
+        pytest.param(None, None, False, id="attestation-absent"),
+    ],
+)
+def test_count_warning_only_when_the_hash_matched(gate_repo, tmp_path, count, sha, warned):
+    out = _run_with_attestation(gate_repo, tmp_path, count=count, sha=sha)
+    assert (_COUNT_WARNING in out) is warned, out
+    if warned:
+        assert "records 5 pattern(s) but the roster has 1" in out
+    # The verdict line is unaffected either way.
+    assert "name-leak gate: success" in out, out
 
 
 

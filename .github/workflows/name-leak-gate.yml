@@ -321,7 +321,14 @@ jobs:
               fh.write(f"run_dir={run_dir}\n")
               fh.write(f"roster_path={roster_path}\n")
 
-          if roster_present and attestation_present and attested_count != pattern_count:
+          # Only when the hash matched: the text below says "still matched", so
+          # on a mismatch it would contradict the verdict (#4600).
+          if (
+              roster_present
+              and attestation_present
+              and attestation_matches
+              and attested_count != pattern_count
+          ):
               print(
                   f"::warning::the attestation records {attested_count} pattern(s) "
                   f"but the roster has {pattern_count}; the sha256 still matched"
