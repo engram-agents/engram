@@ -57,39 +57,30 @@ LOCAL_CONFIG_NAME = ".scan-leaks-local.json"
 SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service", ".timer", ".yml", ".yaml"}
 
 # --- Absolute home paths: default-deny -------------------------------------
-# The class: /home/<seg>/ or /Users/<seg>/, <seg> one whole path segment.
-HOME_PATH_RE = re.compile(r"/(?:home|Users)/([A-Za-z][A-Za-z0-9._-]*)/")
+# The class definition (regex + declared allowed set with reasons) lives in ONE
+# place, shared with the build engine's foreign-bundle leak scan:
+# engine/home_path_class.py.  Deployed it sits beside this file under engine/;
+# in the source tree it is under src/build/engine/.
+def _load_home_path_class():
+    import importlib.util
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "engine" / "home_path_class.py",
+        here.parent.parent / "build" / "engine" / "home_path_class.py",
+    ]
+    for cand in candidates:
+        if cand.is_file():
+            spec = importlib.util.spec_from_file_location("home_path_class", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise ImportError("home_path_class.py not found beside scan-leaks.py: "
+                      + ", ".join(str(c) for c in candidates))
 
-# A segment is allowed only if declared here, each with a one-line reason.
-ALLOWED_HOME_SEGMENTS = {
-    # Obviously fictional placeholders.
-    "someone": "fictional placeholder user",
-    "someone01": "fictional placeholder user, numbered",
-    "user": "generic placeholder user",
-    "you": "placeholder addressing the reader",
-    "x": "single-letter placeholder",
-    "alice": "fictional placeholder user",
-    "bob": "fictional placeholder user",
-    "test": "generic test-fixture user",
-    "testuser": "generic test-fixture user",
-    "example-user": "fictional placeholder user",
-    "dev": "generic placeholder user",
-    "agent": "generic placeholder seat user",
-    "g": "single-letter placeholder",
-    "zzz": "obviously fictional filler",
-    "other": "generic placeholder for another user",
-    "seat": "generic placeholder seat user",
-    "PLACEHOLDER_USER": "explicit placeholder token",
-    "agent-alice": "fictional placeholder seat",
-    "agent-bob": "fictional placeholder seat",
-    "agent-chosenone": "fictional placeholder seat",
-    # System and shared directories.
-    "Shared": "macOS system folder under /Users, not a person",
-    "agents-shared": (
-        "shared coordination folder the multi-agent tools use as a default; "
-        "whether it should stay a public default is a separate open decision"
-    ),
-}
+
+_hpc = _load_home_path_class()
+HOME_PATH_RE = _hpc.HOME_PATH_RE
+ALLOWED_HOME_SEGMENTS = _hpc.ALLOWED_HOME_SEGMENTS
 
 # Files exempt from the home-path check, by repo-relative path, each with a reason.
 HOME_PATH_EXEMPT_FILES = {
@@ -97,6 +88,8 @@ HOME_PATH_EXEMPT_FILES = {
         "defines the pattern and the allowed set; contains them by design",
     "tests/test_scan_leaks.py":
         "plants home-path strings to prove the check fires; contains them by design",
+    "tests/test_engine_phase3.py":
+        "plants home-path leaks to prove the foreign-bundle scan fires; contains them by design",
 }
 # LICENSE: copyright lines are intentional.
 # .scan-leaks-local.json: the local personal-name roster must be skipped —

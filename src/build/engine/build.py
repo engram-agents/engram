@@ -94,6 +94,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .manifest import select_shippables, load_manifest, resolve_tier
+from .home_path_class import disallowed_home_path_regex
 
 
 # ---------------------------------------------------------------------------
@@ -118,23 +119,16 @@ SPECIAL_COPY_PREFIXES = (
     "output-styles/claude/",
 )
 
-# Patterns that must not appear in a foreign bundle.
-# These catch PERSONAL IDENTITY strings — the builder's specific home path and
-# agent identifier.  They do NOT include 'agents-shared' because that string
-# appears in hook source files as a configurable environment-variable default
-# (os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/...")) which is a
-# legitimate deployment configuration default, not a personal identity leak.
-#
-# IMPORTANT: these patterns are built via concatenation rather than written as
-# plain string literals.  If the literals appeared here verbatim, this source
-# file would match its own patterns when it is shipped at the convenience tier
-# (tools/engine is a shipped tools/ entry), causing the foreign leak-scan to
-# flag three self-inflicted hits.  Concatenation produces identical regex
-# semantics while keeping this file clean.
-_AB = "agent-" + "borges"  # personal agent identifier — do NOT expand inline
+# Patterns that must not appear in a foreign bundle: the absolute-home-path
+# class (default-deny), defined once in home_path_class.py and shared with
+# scan-leaks.py.  Any /home/<name>/ or /Users/<name>/ whose <name> is not in the
+# declared allowed set is a leak, so no seat is protected by name only.  The
+# deployment default under the shared coordination folder is in that allowed set
+# (a configurable environment-variable default, not a personal identity).
+# Bare names (a seat name with no path around it) are deliberately NOT scanned
+# here: that is the name-leak gate's domain, which scans with a roster in CI.
 FOREIGN_LEAK_PATTERNS: list[re.Pattern[str]] = [
-    re.compile("/home/" + _AB),
-    re.compile(r"\b" + _AB + r"\b"),
+    disallowed_home_path_regex(),
 ]
 
 SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service"}

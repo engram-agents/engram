@@ -37,8 +37,8 @@ If we expose a parallel set of `mcp__engram_wiki__engram_*` tools, two near-iden
 The script is a single executable Python file. Make it discoverable on PATH:
 
 ```bash
-ln -s ~/engram-alpha/tools/engram-pkg/engram-pkg ~/.local/bin/engram-pkg
-# or add engram-alpha/tools/engram-pkg/ to PATH
+ln -s "$PWD/src/engram/tools/engram-pkg/engram-pkg" ~/.local/bin/engram-pkg   # run from your clone of this repository
+# or add "$PWD/src/engram/tools/engram-pkg" to PATH
 ```
 
 Requires `python3` and the `engram_client` module (shipped at the engram-alpha repo root). The script auto-locates its source repo from its own path.

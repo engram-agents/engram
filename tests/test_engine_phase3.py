@@ -540,7 +540,7 @@ class TestIdentityAxis:
         """A planted identity leak causes the foreign build to fail.
 
         This is the negative test: if a file in the bundle contains a known
-        identity string (e.g. '/home/agent-borges'), the leak-scan VALIDATE
+        identity string (e.g. '/home/agent-zed', any home path outside the allowed set), the leak-scan VALIDATE
         step must fail the build.
         """
         from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
@@ -554,7 +554,7 @@ class TestIdentityAxis:
             "hooks": {
                 "UserPromptSubmit": [
                     {"hooks": [
-                        {"command": "python3 /home/" + "agent-borges" + "/hooks/some-hook.py"}
+                        {"command": "python3 /home/agent-zed/hooks/some-hook.py"}
                     ]}
                 ]
             }
@@ -565,7 +565,7 @@ class TestIdentityAxis:
         # scan_for_leaks must find the leak
         leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
         assert leaks, (
-            "scan_for_leaks did not detect the planted '/home/agent-borges' leak"
+            "scan_for_leaks did not detect the planted '/home/agent-zed' leak"
         )
         # Verify the hit is in the right file
         hit_files = {rel for rel, _lineno, _snippet in leaks}
@@ -574,19 +574,35 @@ class TestIdentityAxis:
         )
 
     def test_planted_agent_borges_identifier_detected(self, tmp_path):
-        """scan_for_leaks detects 'agent-borges' identifier pattern."""
+        """scan_for_leaks detects a home path naming any seat, in a JSON config."""
         from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
 
         bundle_dir = str(tmp_path / "bundle2")
         os.makedirs(bundle_dir)
 
-        # Plant an agent-borges identifier leak
-        leak_content = '{"engram_home": "/home/' + "agent-borges" + '/.engram"}\n'
+        # Plant a home-path identifier leak (a seat name outside the allowed set)
+        leak_content = '{"engram_home": "/home/agent-zed/.engram"}\n'
         with open(os.path.join(bundle_dir, "config.json"), "w") as f:
             f.write(leak_content)
 
         leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
-        assert leaks, "scan_for_leaks did not detect 'agent-borges' identifier leak"
+        assert leaks, "scan_for_leaks did not detect the home-path identifier leak"
+
+    def test_allowed_home_placeholder_is_not_a_leak(self, tmp_path):
+        """The class is default-deny with a declared allowed set: a placeholder
+        home path passes, a prefix-extended one does not."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "allowed")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "ok.md"), "w") as f:
+            f.write("data in /home/someone/.engram and /home/agents-shared/forum\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+
+        with open(os.path.join(bundle_dir, "bad.md"), "w") as f:
+            f.write("data in /home/someone2/.engram\n")
+        leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
+        assert [rel for rel, _n, _s in leaks] == ["bad.md"]
 
     def test_clean_bundle_passes_leak_scan(self, tmp_path):
         """A bundle with no identity strings passes the leak scan."""
@@ -690,7 +706,7 @@ class TestIdentityAxis:
         os.makedirs(os.path.join(bundle_dir, "tools"))
 
         # Plant a leak inside a tools/ Python file (convenience-tier surface)
-        leak_content = '# installed at /home/' + 'agent-borges/.engram\n'
+        leak_content = '# installed at /home/agent-zed/.engram\n'
         with open(os.path.join(bundle_dir, "tools", "config_schema.py"), "w") as f:
             f.write(leak_content)
 
@@ -705,7 +721,7 @@ class TestIdentityAxis:
 
         Regression test for the SCAN_EXTENSIONS gap closed in PR #896 / issue #814:
         build.py originally lacked '.service' in SCAN_EXTENSIONS, so a systemd
-        service template with a hardcoded builder identity (e.g. User=agent-borges)
+        service template with a hardcoded builder identity (e.g. User=agent-zed)
         was invisible to the foreign-bundle leak-scan.  Adding '.service' closed
         that class.  This test pins the fix: a planted .service leak must be detected.
         """
@@ -715,13 +731,12 @@ class TestIdentityAxis:
         os.makedirs(bundle_dir)
 
         # Plant the leak in a .service file using the same sentinel as the
-        # other planted-leak tests.  Concatenation keeps this source file
-        # itself clean (same discipline as FOREIGN_LEAK_PATTERNS above).
+        # other planted-leak tests.
         leak_content = (
             "[Service]\n"
-            "User=" + "agent-borges" + "\n"
-            "WorkingDirectory=/home/" + "agent-borges" + "/.engram\n"
-            "ExecStart=/home/" + "agent-borges" + "/.engram/venv/bin/python3 viz_server.py\n"
+            "User=agent-zed\n"
+            "WorkingDirectory=/home/agent-zed/.engram\n"
+            "ExecStart=/home/agent-zed/.engram/venv/bin/python3 viz_server.py\n"
         )
         with open(os.path.join(bundle_dir, "engram-viz.service"), "w") as f:
             f.write(leak_content)
