@@ -98,10 +98,14 @@ class SignatureResult:
 
 
 class _Refusal(Exception):
-    def __init__(self, field_name: str, reason: str):
+    def __init__(self, field_name: str, reason: str, code: str | None = None):
         super().__init__(reason)
         self.field = field_name
         self.reason = reason
+        # Machine-readable kind, set only where a caller other than the signature
+        # (the #4596 detector) must tell refusals apart: "mixed_harness",
+        # "unmapped_model", "no_model_row", "no_usable_model".  None elsewhere.
+        self.code = code
 
 
 # ---------------------------------------------------------------- config
@@ -225,14 +229,27 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
         raw = transcript.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         raise _Refusal("transcript", f"cannot read transcript {transcript}: {e}")
+    return _model_from_rows(_parse_rows(raw.splitlines()), transcript)
+
+
+def _parse_rows(lines) -> list:
+    """The JSON-object rows among ``lines``; a malformed line or a non-object is skipped."""
     rows = []
-    for ln in raw.splitlines():
+    for ln in lines:
         try:
             r = json.loads(ln)
         except ValueError:
             continue
         if isinstance(r, dict):
             rows.append(r)
+    return rows
+
+
+def _model_from_rows(rows: list, transcript) -> tuple[str, str | None]:
+    """The row-level model rules, over already-parsed rows (shared by ``_read_model``,
+    which reads the whole file, and ``read_model_tail``, which reads a window).
+    ``transcript`` is only the name used in refusal messages.  See ``_read_model``
+    for the precedence rules; raises ``_Refusal`` exactly as it always has."""
     turns = [r for r in rows if r.get("type") == "turn_context"]
     if turns:
         if _has_claude_source(rows):
@@ -240,7 +257,8 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
                 "model",
                 f"transcript {transcript} holds both Claude model evidence and "
                 "Codex turn_context records (mixed-harness): cannot determine "
-                "the running model, refusing rather than ranking the sources")
+                "the running model, refusing rather than ranking the sources",
+                code="mixed_harness")
         payload = turns[-1].get("payload")
         mid = payload.get("model") if isinstance(payload, dict) else None
         if isinstance(mid, str) and mid.strip():
@@ -249,7 +267,8 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
             "model",
             f"the newest turn_context record in {transcript} has no usable "
             "payload.model (missing, non-string or blank): refusing rather "
-            "than falling back to an older turn or a nested model key")
+            "than falling back to an older turn or a nested model key",
+            code="no_usable_model")
     # Primary: harness model attachment (id + marketing name).
     for r in reversed(rows):
         att = r.get("attachment")
@@ -285,17 +304,90 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
             f"the newest assistant row with a usable model id in {transcript} "
             f"has model id {mid!r}, "
             "which does not map to a lineage: refusing rather than signing "
-            "with an older row's model")
+            "with an older row's model", code="unmapped_model")
     if saw_assistant:
         raise _Refusal(
             "model",
             f"every assistant row in {transcript} has a placeholder, blank or "
             "non-string model (no usable model id): cannot determine the "
-            "running model")
+            "running model", code="no_usable_model")
     raise _Refusal(
         "model",
         f"transcript {transcript} has neither a model attachment row nor an "
-        "assistant row with message.model: cannot determine the running model")
+        "assistant row with message.model: cannot determine the running model",
+        code="no_model_row")
+
+
+# ------------------------------------------------------- bounded tail read
+
+@dataclass
+class TailResult:
+    """``read_model_tail``'s answer: ``reason is None`` means ``model_id`` is the
+    running model of the newest turn in the window (``marketing_name`` or None);
+    otherwise ``reason`` is the UNKNOWN reason (the #4596 closed set):
+    ``transcript_not_found``, ``transcript_unreadable``, ``no_model_row``,
+    ``window_exceeded``, ``unmapped_model`` or ``mixed_harness``."""
+    model_id: str | None = None
+    marketing_name: str | None = None
+    reason: str | None = None
+
+
+def read_model_tail(transcript, max_bytes: int) -> TailResult:
+    """``_read_model`` over at most ``max_bytes`` taken from the END of the file (#4596).
+
+    Same row rules (``_model_from_rows``), different window.  When the read starts
+    past offset 0 the first, partial line is discarded; a malformed line is
+    skipped as always.  A window with no complete line, or whose rows carry no
+    model while the file is larger than the window, is ``window_exceeded`` (a
+    newest entry larger than the bound lands here): never an older row's id, and
+    never a guess.  Never raises.  Opens non-blocking and refuses anything that is
+    not a regular file, so a FIFO cannot hang a hook."""
+    import errno
+    import stat
+    try:
+        fd = os.open(os.fspath(transcript), os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return TailResult(reason="transcript_not_found")
+    except NotADirectoryError:
+        return TailResult(reason="transcript_not_found")
+    except OSError:
+        return TailResult(reason="transcript_unreadable")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return TailResult(reason="transcript_unreadable")
+        size = st.st_size
+        start = max(0, size - max(0, int(max_bytes)))
+        os.lseek(fd, start, os.SEEK_SET)
+        chunks, left = [], size - start
+        while left > 0:
+            b = os.read(fd, min(left, 1 << 20))
+            if not b:
+                break
+            chunks.append(b)
+            left -= len(b)
+        data = b"".join(chunks)
+    except OSError as e:
+        return TailResult(reason="transcript_unreadable" if e.errno != errno.ENOENT else "transcript_not_found")
+    finally:
+        os.close(fd)
+    truncated = start > 0
+    if truncated:
+        nl = data.find(b"\n")
+        data = b"" if nl < 0 else data[nl + 1:]
+    text = data.decode("utf-8", errors="replace")
+    if not text.strip():
+        return TailResult(reason="window_exceeded" if truncated else "no_model_row")
+    try:
+        model_id, name = _model_from_rows(_parse_rows(text.splitlines()), transcript)
+    except _Refusal as r:
+        code = r.code
+        if code in ("no_model_row", "no_usable_model"):
+            code = "window_exceeded" if truncated else "no_model_row"
+        elif code not in ("mixed_harness", "unmapped_model"):
+            code = "no_model_row"
+        return TailResult(reason=code)
+    return TailResult(model_id=model_id, marketing_name=name)
 
 
 # --------------------------------------------------------------- version

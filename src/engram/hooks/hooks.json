@@ -179,6 +179,11 @@
             "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-nap-compact-backstop-stop.py\"",
             "timeout": 30,
             "statusMessage": "Checking nap compaction backstop..."
+          },
+          {
+            "type": "command",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-model-gate-stop.py\"",
+            "timeout": 5
           }
         ]
       }
