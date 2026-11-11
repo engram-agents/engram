@@ -11,7 +11,7 @@
 >
 > **The procedure for cutting a release is not currently written down in this
 > file.** Its next version lands with
-> [engram-agents/engram#16](https://github.com/engram-agents/engram/issues/16).
+> [engram-agents/engram#4592](https://github.com/engram-agents/engram/issues/4592).
 > Do not use the steps below as a fallback: the publishing steps run a tool
 > (`tools/release-cutover.py`) and an exclusion list (`release-minus-set.txt`)
 > that are both retired, and the list now excludes nothing.

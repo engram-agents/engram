@@ -7,7 +7,7 @@ about *building* ENGRAM goes in ``docs/internal/``, the developers' tree.
 Since v0.5.6 ``docs/internal/`` is public as well; the guard keeps the top of
 ``docs/`` to user documents.  ``release-minus-set.txt`` is historical and
 excludes nothing; G3 and G4 below still check that file and the retired
-cutover tool's matcher, and go with them in a later change (engram-agents/engram#16).
+cutover tool's matcher, and go with them in a later change (engram-agents/engram#4592).
 
 Files inside ``docs/handbook/`` and ``docs/assets/`` are public by definition.
 This guard polices only the top level of ``docs/`` and the set of sub-folders,
