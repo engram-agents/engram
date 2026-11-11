@@ -387,7 +387,7 @@ mkdir -p "$CLAUDE_HOME" 2>/dev/null && [ -w "$CLAUDE_HOME" ] \
   || fail "$CLAUDE_HOME is not writable" "fix its ownership or permissions (chown/chmod) and re-run"
 # A dangling ~/.claude/CLAUDE.md link would make bootstrap refuse in step 6 after real work was done.
 if [ -L "$CLAUDE_MD" ] && [ ! -e "$CLAUDE_MD" ]; then
-  fail "$CLAUDE_MD is a symlink to a path that does not exist ($(readlink "$CLAUDE_MD"))" "remove the link (rm '$CLAUDE_MD') or repair it so it points at a real file, then re-run"
+  fail "$CLAUDE_MD is a symlink to a path that does not exist ($(readlink "$CLAUDE_MD"))" "move the link aside (mv '$CLAUDE_MD' '$CLAUDE_MD.moved-aside') or repair it so it points at a real file, then re-run"
 fi
 mkdir -p "$ENGRAM_HOME" 2>/dev/null && [ -w "$ENGRAM_HOME" ] \
   || fail "$ENGRAM_HOME is not writable" "fix its ownership or permissions (chown/chmod) and re-run"
