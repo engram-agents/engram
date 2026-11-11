@@ -465,18 +465,27 @@ def test_identical_check_reads_utf8_whatever_the_locale(tmp_path):
     f = tmp_path / "a.md"
     body = "café — done\n"
     f.write_bytes(body.encode("utf-8"))
-    code = (
-        "import importlib.util, sys\n"
+    # The child program goes in an ASCII file (ascii() spells the body with escapes), not on the
+    # command line: under LC_ALL=C with UTF-8 mode off, Linux decodes argv with the locale, so a
+    # non-ASCII -c string stops the child before classify runs.
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import importlib.util, locale\n"
         "from pathlib import Path\n"
-        f"s = importlib.util.spec_from_file_location('g', {str(SRC / 'engram_file_guard.py')!r})\n"
+        f"s = importlib.util.spec_from_file_location('g', {ascii(str(SRC / 'engram_file_guard.py'))})\n"
         "g = importlib.util.module_from_spec(s); s.loader.exec_module(g)\n"
-        f"print(g.classify(Path({str(f)!r}), {body!r}))\n"
+        "print(locale.getpreferredencoding(False))\n"
+        f"print(g.classify(Path({ascii(str(f))}), {ascii(body)}))\n",
+        encoding="ascii",
     )
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONUTF8", "PYTHONIOENCODING")}
     env.update({"LC_ALL": "C", "LANG": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"})
-    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+    r = subprocess.run([sys.executable, str(probe)], env=env, capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == "identical", r.stdout + r.stderr
+    encoding, verdict = r.stdout.split()
+    if encoding.lower().replace("-", "") in ("utf8", "utf_8"):
+        pytest.skip(f"the C locale here reads as {encoding}, so this run cannot tell a utf-8 read from a locale read")
+    assert verdict == "identical", r.stdout + r.stderr
 
 
 def test_history_or_diary_holding_only_dotfiles_is_not_memory(tmp_path):
