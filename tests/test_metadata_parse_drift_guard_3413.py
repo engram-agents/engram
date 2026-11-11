@@ -103,6 +103,8 @@ ALLOW_LIST = {
         (2, "LOCAL", "routed locally: isinstance guard (hook/viz cannot assume engram_core on sys.path by convention)"),
     ("tools/engram-pkg/engram-pkg", "_render_origin"):
         (1, "LOCAL", "routed locally: isinstance guard (standalone script, no engram_core import by convention)"),
+    ("tools/model_switch_read.py", "_source_class"):
+        (1, "LOCAL", "routed locally: isinstance guard; read-only stdlib-only draw must not import the server core (#4616)"),
     # ---- deliberate, not to be routed --------------------------------------
     ("engram_core.py", "_legacy_roots"):
         (1, "S", "guarded: `isinstance(m, dict)` check and a ValueError/TypeError catch right after the parse"),

@@ -206,7 +206,9 @@ def _source_class(metadata):
         v = json.loads(metadata)
     except (TypeError, ValueError):
         return None
-    return v.get("source_class") if isinstance(v, dict) else None
+    if not isinstance(v, dict):
+        v = {}
+    return v.get("source_class")
 
 
 def load_candidates(con) -> list[dict]:

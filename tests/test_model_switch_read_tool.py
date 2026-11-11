@@ -906,3 +906,13 @@ def test_same_seed_same_packet_different_seed_different_packet(world):
     assert outs["x1"][0] == outs["x2"][0]
     assert outs["x1"][1] == outs["x2"][1]
     assert outs["x1"][0] != outs["y"][0]
+
+
+@pytest.mark.parametrize("raw", [None, "", "not json", "[1, 2]", '"str"', "5", "null", b"{}"])
+def test_source_class_malformed_or_non_object_metadata_is_not_introspective(raw):
+    """#4616: NULL, malformed and non-object metadata yield None (never raise, never a class)."""
+    spec = importlib.util.spec_from_file_location("msr_source_class_cell", TOOL)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod._source_class(raw) is None
+    assert mod._source_class('{"source_class": "introspective"}') == "introspective"
