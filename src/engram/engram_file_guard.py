@@ -11,23 +11,39 @@ Shape:
                         differs and consented -> backup first, then atomic write.
 
 States of a path: absent, identical (already holds the new text), differs, dangling (a symlink
-to nothing), blocked (present but not a regular file, so it cannot be saved or replaced).
-Only `differs` can be consented to. Stdlib only.
+to nothing), blocked (present but not a regular file, so it cannot be saved or replaced),
+obstructed (an identity file whose `<name>.pre-engram` is the same file as the identity file
+itself, so replacing it would overwrite that backup too). Only `differs` can be consented to.
+
+What a backup promises: the file's BYTES, its permission MODE and its modification time (the
+copy is shutil.copyfileobj + shutil.copystat). It does NOT promise extended attributes or ACLs;
+shutil.copystat drops them on macOS. Backups accumulate: each replace adds one, and nothing
+here deletes them. Stdlib only.
+
+MERGE class (a JSON file where ENGRAM owns a few keys and the user owns everything else): see
+OWNED_KEYS and apply_merge() below.
 """
 
 from __future__ import annotations
 
 import errno
+import json
 import os
+import re
 import shutil
+import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, NamedTuple
+from typing import Any, Callable, Iterable, NamedTuple
 
 STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 FIRST_BACKUP_SUFFIX = ".pre-engram"
 STAMPED_BACKUP_INFIX = ".engram-backup."
+
+# The clock behind every stamped backup name. A module seam so a test can pin it and force two
+# backups into the same second (the second then takes the -1 suffix).
+CLOCK: "Callable[[], datetime]" = lambda: datetime.now(timezone.utc)  # noqa: E731
 
 
 class Item(NamedTuple):
@@ -74,7 +90,15 @@ class Refused(Exception):
 
 
 def _key(path: Path) -> str:
-    return os.path.abspath(os.path.expanduser(str(path)))
+    """One canonical spelling of `path`, used to compare consent with the planned path.
+
+    The parent directory is resolved (symlinked folders, /var vs /private/var, relative paths
+    against the current directory); the final name is kept as written, so a symlink AT the path
+    is not followed into its target for the decision.
+    """
+    full = os.path.abspath(os.path.expanduser(str(path)))
+    parent, name = os.path.split(full)
+    return os.path.join(os.path.realpath(parent), name)
 
 
 def consent_for(all_paths: bool, replace: Iterable[str]) -> Consent:
@@ -82,7 +106,7 @@ def consent_for(all_paths: bool, replace: Iterable[str]) -> Consent:
 
 
 def utc_stamp() -> str:
-    return datetime.now(timezone.utc).strftime(STAMP_FORMAT)
+    return CLOCK().astimezone(timezone.utc).strftime(STAMP_FORMAT)
 
 
 def target_present(path: Path) -> bool:
@@ -134,22 +158,44 @@ def classify(path: Path, new_text: "str | None") -> str:
     return "differs"
 
 
+def _backup_name_is_the_file_itself(path: Path, first: Path) -> bool:
+    """True if `first` (`<name>.pre-engram`) is the same file as `path`: a hard link, or a
+    symlink that resolves to it. Replacing `path` would then overwrite that backup too. A
+    dangling link or a directory at that name is a different case (never the same file)."""
+    if not target_present(first):
+        return False
+    try:
+        return os.path.samefile(path, first)
+    except OSError:
+        return False
+
+
 def plan(items: Iterable[Item], stamp: "str | None" = None) -> Plan:
     """Check-only pass. Writes nothing and raises nothing."""
     stamp = stamp or utc_stamp()
     entries = []
     for it in items:
         state = classify(it.path, it.new_text)
+        if state == "differs" and it.first_identity and _backup_name_is_the_file_itself(it.path, _pre_engram(it.path)):
+            state = "obstructed"
         backup = _next_backup_name(it.path, stamp) if state == "differs" else None
         first = _first_backup_name(it.path, it.first_identity) if state == "differs" else None
         entries.append(Entry(it.path, it.new_text, state, backup, first, it.first_identity))
     return Plan(tuple(entries), stamp)
 
 
+def _canon(path: Path) -> Path:
+    return Path(_key(path))
+
+
 def refusal(p: Plan, consent: Consent = NO_CONSENT, context: str = "") -> "str | None":
-    """ONE message naming every path that cannot proceed yet, or None when all can."""
+    """ONE message naming every path that cannot proceed yet, or None when all can.
+
+    Every path is printed in one canonical form (parent directory resolved, name as written),
+    the same form `--replace PATH` is compared in.
+    """
     need = [e for e in p.entries if e.state == "differs" and not consent.allows(e.path)]
-    stuck = [e for e in p.entries if e.state in ("dangling", "blocked")]
+    stuck = [e for e in p.entries if e.state in ("dangling", "blocked", "obstructed")]
     if not need and not stuck:
         return None
     lines = ["[bootstrap] REFUSED: no existing file was changed."]
@@ -161,23 +207,33 @@ def refusal(p: Plan, consent: Consent = NO_CONSENT, context: str = "") -> "str |
             "backup shown before it is replaced:"
         )
         for e in need:
-            also = f" and {e.first_backup}" if e.first_backup is not None else ""
-            lines.append(f"  - {e.path}   (backup: {e.backup}{also})")
+            where = _canon(e.path)
+            also = f" and {where.parent / e.first_backup.name}" if e.first_backup is not None else ""
+            lines.append(f"  - {where}   (backup: {where.parent / e.backup.name}{also})")
         lines.append(
+            "Backups accumulate: every replace adds one, and nothing deletes them automatically. "
             "Show the user this list and get their yes first. Then re-run with "
             "--replace PATH (repeat it for each path they agreed to) or --force (every path "
             "listed). Or leave a file as it is: move it aside yourself, then re-run."
         )
     for e in stuck:
+        where = _canon(e.path)
         if e.state == "dangling":
             lines.append(
-                f"  - {e.path} is a symlink to a path that does not exist ({os.readlink(e.path)}). "
-                f"Move the link aside (mv '{e.path}' '{e.path}.moved-aside') or repair it so it "
+                f"  - {where} is a symlink to a path that does not exist ({os.readlink(e.path)}). "
+                f"Move the link aside (mv '{where}' '{where}.moved-aside') or repair it so it "
                 f"points at a real file, then re-run."
+            )
+        elif e.state == "obstructed":
+            first = where.parent / (where.name + FIRST_BACKUP_SUFFIX)
+            lines.append(
+                f"  - {where}: its backup name {first} is the same file as {where} (a hard "
+                f"link or a link to it), so replacing {where.name} would overwrite that backup "
+                f"too. Move that backup name aside (mv '{first}' '{first}.moved-aside'), then re-run."
             )
         else:
             lines.append(
-                f"  - {e.path} is not a regular file, so it cannot be saved or replaced. "
+                f"  - {where} is not a regular file, so it cannot be saved or replaced. "
                 f"Move it aside, then re-run."
             )
     return "\n".join(lines)
@@ -426,3 +482,137 @@ def apply(p: Plan, consent: Consent = NO_CONSENT, context: str = "",
             _write(e.path, e.new_text)
         written.append(e.path)
     return written
+
+
+# --- MERGE class: ENGRAM owns a few keys of a JSON file, the user owns the rest ---------------
+#
+# Four conditions, each pinned by tests/test_never_clobber_contract.py:
+#   1. The owned keys are ONE closed, named list per file (OWNED_KEYS). A key not on it is never
+#      ENGRAM's to change. A dotted name is a nested key: "forum.url" is the key `url` inside the
+#      object `forum`.
+#   2. A merge keeps every other key, in value and in order.
+#   3. A file that does not parse (or is not a JSON object) is NOT a merge candidate: nothing
+#      repairs a broken user file; the merge refuses and the file is left untouched.
+#   4. A merge that changes the file takes a stamped backup first; a merge that leaves the file
+#      byte-identical writes nothing and backs up nothing.
+
+OWNED_KEYS: "dict[str, tuple[str, ...]]" = {
+    "settings.json": ("cleanupPeriodDays",),
+    "config.json": ("install_tier", "forum.url"),
+}
+
+
+class MergeRefused(Exception):
+    """A merge that would change something that is not ENGRAM's, or into a file that cannot be merged."""
+
+
+def json_indent(text: str) -> "int | str":
+    """The indent of the first indented line of `text` (spaces or a tab), else 2."""
+    m = re.search(r"^([ \t]+)\S", text, re.MULTILINE)
+    if not m:
+        return 2
+    lead = m.group(1)
+    return "\t" if lead.startswith("\t") else len(lead)
+
+
+def _without_owned(doc: dict, owned: "tuple[str, ...]") -> dict:
+    """A copy of `doc` with every owned leaf removed, for comparing the part that is not ENGRAM's.
+
+    The containers of a nested owned key are created if missing on BOTH sides of a comparison,
+    so a container the merge had to create does not count as a change.
+    """
+    out = json.loads(json.dumps(doc))
+    for key in owned:
+        parts = key.split(".")
+        node = out
+        for part in parts[:-1]:
+            nxt = node.setdefault(part, {})
+            if not isinstance(nxt, dict):
+                node = None
+                break
+            node = nxt
+        if isinstance(node, dict):
+            node.pop(parts[-1], None)
+    return out
+
+
+def merge_json_text(filename: str, existing: "str | None", changes: "dict[str, Any]") -> str:
+    """Return `existing` (None = absent file) with the owned keys in `changes` set. Pure.
+
+    Raises MergeRefused if `filename` has no owned keys, if `changes` names a key that is not
+    owned, if `existing` does not parse as a JSON object, or if setting a nested key would mean
+    replacing something the user wrote that is not an object. Returns `existing` unchanged,
+    byte for byte, when every owned key already holds the requested value. Otherwise the result
+    is re-serialized with the file's own indent: every other key keeps its value and its order.
+    """
+    owned = OWNED_KEYS.get(filename)
+    if owned is None:
+        raise MergeRefused(f"{filename} has no keys ENGRAM owns, so ENGRAM never merges into it")
+    stray = [k for k in changes if k not in owned]
+    if stray:
+        raise MergeRefused(
+            f"{filename}: {', '.join(stray)} is not one of the keys ENGRAM owns "
+            f"({', '.join(owned)}), so it will not be changed"
+        )
+    if existing is None:
+        doc: dict = {}
+    else:
+        try:
+            doc = json.loads(existing)
+        except ValueError as e:
+            raise MergeRefused(f"{filename} is not valid JSON ({e}); nothing repairs a broken file") from e
+        if not isinstance(doc, dict):
+            raise MergeRefused(f"{filename} holds JSON {type(doc).__name__}, not an object; nothing repairs it")
+    before = json.loads(json.dumps(doc))
+    for key, value in changes.items():
+        parts = key.split(".")
+        node = doc
+        for part in parts[:-1]:
+            if part not in node:
+                node[part] = {}
+            elif not isinstance(node[part], dict):
+                raise MergeRefused(
+                    f"{filename}: '{part}' is not an object, so {key} cannot be set without changing it"
+                )
+            node = node[part]
+        node[parts[-1]] = value
+    if existing is not None and doc == before:
+        return existing
+    if json.dumps(_without_owned(before, owned)) != json.dumps(_without_owned(doc, owned)):
+        raise MergeRefused(f"{filename}: the merge would change a key that is not ENGRAM's; nothing was written")
+    indent = json_indent(existing) if existing else 2
+    return json.dumps(doc, indent=indent, ensure_ascii=False) + "\n"
+
+
+def apply_merge(path: Path, changes: "dict[str, Any]", *, filename: "str | None" = None,
+                new_mode: int = 0o600, stamp: "str | None" = None) -> str:
+    """Merge the owned keys in `changes` into the JSON file at `path`. Returns what happened:
+    "created" (file was absent), "merged" (stamped backup taken, then written atomically,
+    keeping the file's mode and a symlink in place) or "unchanged" (nothing written, no backup).
+    Raises MergeRefused, with the file untouched, for anything merge_json_text refuses and for a
+    dangling link, a non-regular file or an unreadable file.
+    """
+    name = filename or path.name
+    if is_dangling_symlink(path):
+        raise MergeRefused(f"{path} is a symlink to a path that does not exist ({os.readlink(path)})")
+    real = Path(os.path.realpath(path)) if path.is_symlink() else path
+    existing = None
+    if target_present(real):
+        if not real.is_file():
+            raise MergeRefused(f"{path} is not a regular file, so it cannot be merged into")
+        try:
+            existing = real.read_bytes().decode("utf-8")
+        except OSError as e:
+            raise MergeRefused(f"cannot read {path} ({e})") from e
+        except UnicodeDecodeError as e:
+            raise MergeRefused(f"{path} is not valid UTF-8 text ({e}); nothing repairs a broken file") from e
+    new_text = merge_json_text(name, existing, changes)
+    if existing is None:
+        real.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(real, new_text, new_mode)
+        return "created"
+    if new_text == existing:
+        return "unchanged"
+    save_backup(path, False, stamp or utc_stamp())
+    atomic_write_text(real, new_text, stat.S_IMODE(os.stat(real).st_mode))
+    return "merged"

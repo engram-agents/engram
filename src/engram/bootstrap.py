@@ -384,13 +384,7 @@ def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _json_indent(text: str) -> "int | str":
-    """The indent of the first indented line of `text` (spaces or a tab), else 2."""
-    m = re.search(r"^([ \t]+)\S", text, re.MULTILINE)
-    if not m:
-        return 2
-    lead = m.group(1)
-    return "\t" if lead.startswith("\t") else len(lead)
+_json_indent = fg.json_indent  # moved into the guard with the MERGE class
 
 
 def _check_settings(claude_home: Path) -> "tuple[Path, dict | None, str]":
@@ -436,7 +430,7 @@ def _check_settings(claude_home: Path) -> "tuple[Path, dict | None, str]":
         )
         raise SystemExit(
             f"[bootstrap] REFUSED: {settings_path} cannot be edited: {reason}; {saved}. "
-            f"The file itself was left unchanged. Repair or remove it, then re-run "
+            f"The file itself was left unchanged. Repair it (or move it aside), then re-run "
             f"with --retention-days."
         )
     return target, settings, text
@@ -456,11 +450,13 @@ def _set_cleanup_period_days(claude_home: Path, days: int) -> None:
     Called only when `--retention-days N` was given; without the flag bootstrap never
     reads or writes settings.json. Claude Code's default ~30-day rolling trim deletes chat
     transcripts, which are the evidence behind ENGRAM observations; the user decides how
-    long to keep them.
+    long to keep them. The write is the guard's MERGE class (engram_file_guard.apply_merge):
+    cleanupPeriodDays is the only key ENGRAM owns in this file.
 
     * absent file: created as {"cleanupPeriodDays": N}, mode 0600.
-    * valid JSON object without the key: merged, other keys and indent style kept.
-    * valid JSON object WITH the key: left byte-identical (the earlier choice stands).
+    * valid JSON object without the key: stamped backup first, then merged; every other key,
+      its order and the indent style are kept.
+    * valid JSON object WITH the key: left byte-identical, no backup (the earlier choice stands).
     * anything else (invalid JSON, empty, a list or scalar): copied once to
       settings.json.corrupt.<UTC>, the file left byte-identical, and the run REFUSES.
       A settings.json is never replaced after a parse failure.
@@ -468,15 +464,7 @@ def _set_cleanup_period_days(claude_home: Path, days: int) -> None:
     settings_path = claude_home / "settings.json"
     # Second check, not a copy of the first: settings.json can change after the preflight.
     target, settings, text = _check_settings(claude_home)
-    if settings is None:
-        try:
-            claude_home.mkdir(parents=True, exist_ok=True)
-            _atomic_write_text(target, json.dumps({"cleanupPeriodDays": days}, indent=2) + "\n", 0o600)
-        except (OSError, UnicodeError) as e:
-            _refuse_settings_write(settings_path, e)
-        _print_retention_set(days, settings_path)
-        return
-    if "cleanupPeriodDays" in settings:
+    if settings is not None and "cleanupPeriodDays" in settings:
         print(
             f"  settings.json → cleanupPeriodDays={settings['cleanupPeriodDays']} kept "
             f"(your earlier choice; --retention-days {days} did not change it; "
@@ -484,12 +472,11 @@ def _set_cleanup_period_days(claude_home: Path, days: int) -> None:
             flush=True,
         )
         return
-    settings["cleanupPeriodDays"] = days
     try:
-        mode = stat.S_IMODE(os.stat(target).st_mode)
-        _atomic_write_text(
-            target, json.dumps(settings, indent=_json_indent(text), ensure_ascii=False) + "\n", mode
-        )
+        claude_home.mkdir(parents=True, exist_ok=True)
+        fg.apply_merge(settings_path, {"cleanupPeriodDays": days}, filename="settings.json", new_mode=0o600)
+    except fg.MergeRefused as e:
+        raise SystemExit(f"[bootstrap] REFUSED: settings.json was not changed ({e}).")
     except (OSError, UnicodeError) as e:
         # UnicodeError: a lone-surrogate JSON escape ("\\ud800") loads but cannot be encoded
         # as UTF-8; that is a ValueError, not an OSError, and must not become a traceback.
@@ -692,6 +679,12 @@ def _move_aside_command() -> str:
     return f"mv {shlex.quote(home)} {shlex.quote(home + '.moved-aside-')}$(date -u +%Y%m%dT%H%M%SZ)"
 
 
+# Said wherever a message gives the move-aside command: the home holds the installed plugin and venv.
+MOVE_ASIDE_REINSTALL_NOTE = (
+    "The installed plugin and its Python environment move too, so ENGRAM must be reinstalled afterwards."
+)
+
+
 def _memory_found() -> "list[str]":
     """The files of an existing agent's memory in ENGRAM_HOME (C5): warm-briefing.md,
     seed-manifest.json, a non-empty history/ or diary/."""
@@ -709,6 +702,16 @@ def _memory_found() -> "list[str]":
     return found
 
 
+def _newest_by_mtime(paths: "list[Path]") -> Path:
+    """The most recently modified file; ties go to the later name. An unreadable entry sorts oldest."""
+    def key(p: Path) -> "tuple[int, str]":
+        try:
+            return (p.stat().st_mtime_ns, p.name)
+        except OSError:
+            return (-1, p.name)
+    return max(paths, key=key)
+
+
 def _refuse_existing_memory(found: "list[str]", db_state: str) -> None:
     lines = [
         f"[bootstrap] REFUSED: {ENGRAM_HOME} already holds an agent's memory but {db_state}, "
@@ -717,16 +720,17 @@ def _refuse_existing_memory(found: "list[str]", db_state: str) -> None:
         "  Found:",
         *[f"    - {f}" for f in found],
     ]
-    backups = sorted((ENGRAM_HOME / "db-backup").glob("*.db")) if (ENGRAM_HOME / "db-backup").is_dir() else []
+    backups = list((ENGRAM_HOME / "db-backup").glob("*.db")) if (ENGRAM_HOME / "db-backup").is_dir() else []
     if backups:
         lines.append(
-            f"  The newest graph backup is {backups[-1]}. Restore it to "
+            f"  The newest graph backup is {_newest_by_mtime(backups)}. Restore it to "
             f"{ENGRAM_HOME / 'knowledge.db'} (an empty knowledge.db there: move it aside "
             f"first), then re-run."
         )
     lines.append(
         f"  For a deliberate fresh start, set the whole home aside, then re-run:\n"
-        f"    {_move_aside_command()}"
+        f"    {_move_aside_command()}\n"
+        f"  {MOVE_ASIDE_REINSTALL_NOTE}"
     )
     raise SystemExit("\n".join(lines))
 
@@ -828,7 +832,8 @@ def _check_existing_agent(db_path: Path) -> None:
                 f"  Both FORCE=1 and FORCE_RESEED_EMPTY=1 require an empty (0-node) DB.\n"
                 f"  To start fresh on purpose, set the whole home aside, then re-run bootstrap\n"
                 f"  without any FORCE variable:\n"
-                f"    {_move_aside_command()}"
+                f"    {_move_aside_command()}\n"
+                f"  {MOVE_ASIDE_REINSTALL_NOTE}"
             )
         raise SystemExit(
             f"ERROR: knowledge.db already exists at {db_path} ({node_count} nodes).\n"
@@ -836,7 +841,8 @@ def _check_existing_agent(db_path: Path) -> None:
             "  - If this is your data, leave it as it is. To upgrade, use the\n"
             "    engram-upgrade skill.\n"
             "  - For a deliberate fresh start, set the whole home aside, then re-run:\n"
-            f"    {_move_aside_command()}"
+            f"    {_move_aside_command()}\n"
+            f"    {MOVE_ASIDE_REINSTALL_NOTE}"
         )
     # knowledge.db exists with 0 nodes.
     if found:

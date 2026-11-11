@@ -25,15 +25,47 @@ The rule: setup backs up first, asks, and acts only on the user's yes.
       what it found and, if `<ENGRAM_HOME>/db-backup/` holds any `*.db`, the newest one.
   C6. The installer with no tty and no --yes never replaces an existing differing CLAUDE.md:
       DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD is 0.
+  C7. Backup fidelity. A backup promises the file's BYTES, its permission MODE and its
+      modification time. It does NOT promise extended attributes or ACLs (the copy is
+      shutil.copyfileobj + shutil.copystat, which drops them on macOS). Backups accumulate: every
+      replace adds one, and nothing deletes them automatically; the user-facing text says so.
+  C8. Obstructed first-backup name. If `<name>.pre-engram` resolves to the same file as the
+      identity file itself (a hard link, or a symlink to it), replacing the file would overwrite
+      that backup too, so the run REFUSES (even with --force), writes nothing, and the one
+      refusal names the remedy: move that backup name aside. A dangling link or a directory at
+      that name is a different case: it is left alone, the stamped backup is written, and the
+      run proceeds on consent.
+  C9. Consent is compared on resolved paths: the parent directory is resolved and the name is
+      kept as written (a symlink AT the path is not followed into its target). The refusal
+      prints that one canonical form. A second spelling of the same path (a symlinked folder,
+      /var vs /private/var, a relative path) counts as the same path.
+
+MERGE class (a JSON file where ENGRAM owns a few keys and the user owns everything else):
+  M1. The owned keys are ONE closed, named list per file, in engram_file_guard.OWNED_KEYS:
+      settings.json -> {cleanupPeriodDays}; config.json -> {install_tier, forum.url (the key
+      `url` inside the object `forum`)}. A key not on the list is never ENGRAM's to change.
+  M2. A merge keeps every other key, in value and in order. The tests compare the non-owned part
+      BYTE FOR BYTE on its re-serialization with the file's own indent (the merge re-serializes
+      the whole file, so the raw file bytes differ by the owned entry) and also key by key; each
+      test says which.
+  M3. A file that does not parse (or is not a JSON object) is NOT a merge candidate: nothing
+      repairs a broken user file. The merge refuses and the file is left untouched.
+  M4. A stamped backup is taken before a merge that changes the file. A merge that leaves the
+      file byte-identical writes nothing and backs up nothing.
+  The three config.json writers (install.sh step 3, install-local-marketplace.sh's python block,
+  set_forum_url.py) are still their own writers; the static gate lists them as "slice 2: MERGE
+  backup".
 
 Two MECHANICAL gates, so a write site added later is caught without anyone remembering:
   * test_differential_gate_no_consent builds its fixture FROM WHAT THE CODE WRITES: it runs
     bootstrap into a fresh home, records every regular file that run created, and plants a
     unique sentinel at each of those paths in a second home. A future write site shows up in the
     first run, so it is covered automatically.
-  * test_static_write_sites_are_reviewed parses bootstrap.py and install.sh and lists every
-    call that can overwrite, truncate, rename or delete a file. Each must sit inside a reviewed
-    allowlist entry (with a one-line reason) or the test fails and names it.
+  * test_static_write_sites_are_reviewed parses bootstrap.py, install.sh (the shell AND the
+    Python heredoc blocks PY_* inside it) and set_forum_url.py, and lists every call that can
+    overwrite, truncate, rename or delete a file. Each must sit inside a reviewed allowlist entry
+    (with a one-line reason) or the test fails and names it. An entry covers ONE occurrence: a
+    second identical call in the same function is a new site.
 A heuristic third gate, test_docs_never_tell_a_bare_delete, scans the agent-facing docs.
 
 All runs use tmp homes through env; the real ~/.claude, ~/.codex and ~/.engram are never read or
@@ -46,6 +78,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -55,6 +88,8 @@ import sqlite3
 import subprocess
 import sys
 import uuid
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -512,10 +547,14 @@ def _py_write_sites(source: str) -> list[tuple[int, str, str]]:
 
 
 def _py_violations(source: str, allowlist: list[dict]) -> list[tuple[int, str, str]]:
+    """Write sites not covered by the allowlist. Each entry covers ONE occurrence of its
+    (func, call): a second identical call in an allowlisted function is a new site and fails."""
+    budget: Counter = Counter((a["func"], a["call"]) for a in allowlist)
     out = []
     for line, func, text in _py_write_sites(source):
-        ok = any(a["func"] == func and (a["call"] is None or a["call"] == text) for a in allowlist)
-        if not ok:
+        if budget[(func, text)] > 0:
+            budget[(func, text)] -= 1
+        else:
             out.append((line, func, text))
     return out
 
@@ -552,10 +591,23 @@ def quiet(p, s):
 '''
 
 
+_PLANTED_TWICE = """
+def allowlisted(p):
+    p.unlink()
+    p.unlink()
+"""
+
+
 def _assert_python_scanner_controls() -> None:
     hits = _py_write_sites(_PLANTED_PY)
     assert len(hits) == 18, f"the AST scanner is broken: found {len(hits)} of 18 planted write sites: {hits}"
     assert all(func == "planted" for _l, func, _t in hits), "the scanner flagged a read-only call in quiet()"
+    # Positive control for the per-(func, call) count: one entry, two identical calls -> exactly one violation.
+    one_entry = [{"func": "allowlisted", "call": "p.unlink()", "reason": "control"}]
+    left = _py_violations(_PLANTED_TWICE, one_entry)
+    assert len(left) == 1 and left[0][1:] == ("allowlisted", "p.unlink()"), \
+        f"a second identical call in an allowlisted function was not flagged: {left}"
+    assert _py_violations(_PLANTED_TWICE, one_entry * 2) == [], "two entries must cover two identical calls"
 
 
 _PROTECTED_VAR_RE = re.compile(
@@ -577,6 +629,31 @@ INSTALL_SH_PENDING = [
 INSTALL_SH_ALLOWLIST = [
     ('rm -rf "$WORK_DIR"', "the installer's own scratch directory"),
     ('cp -R "$WORK_DIR/." "$LOG_SAVE_DIR/"', "saves the failed run's log into $ENGRAM_HOME/install-logs (ENGRAM-owned)"),
+]
+
+MARKETPLACE_SH = SRC / "tools" / "install-local-marketplace.sh"
+SET_FORUM_URL_PY = SRC / "tools" / "set_forum_url.py"
+
+# Python heredoc blocks inside install.sh (the PY_* variables). Entries are func="<BLOCK>:<function>";
+# each covers ONE occurrence.
+INSTALL_SH_PY_ALLOWLIST = [
+    {"func": "PY_CONFIG:<module>", "call": "open(path, 'w', encoding='utf-8')",
+     "reason": "slice 2: MERGE backup. Step 3 writes install_tier into config.json in place; the MERGE "
+               "class backs the file up first once the installer hands this write to the guard"},
+]
+# The config.json block of install-local-marketplace.sh (selected by the text `install_tier`).
+MARKETPLACE_CONFIG_ALLOWLIST = [
+    {"func": "<module>", "call": "open(path, 'w')",
+     "reason": "slice 2: MERGE backup. Persists install_tier into config.json; same hand-over to the guard"},
+]
+# src/engram/tools/set_forum_url.py: the one shared forum.url writer (atomic temp + replace).
+SET_FORUM_URL_ALLOWLIST = [
+    {"func": "_atomic_write", "call": "os.fdopen(fd, 'w')",
+     "reason": "slice 2: MERGE backup. Writes forum.url into config.json via an atomic temp file"},
+    {"func": "_atomic_write", "call": "os.replace(tmp, path)",
+     "reason": "slice 2: MERGE backup. Publishes that temp file over config.json"},
+    {"func": "_atomic_write", "call": "os.unlink(tmp)",
+     "reason": "slice 2: MERGE backup. Removes the writer's own temp file on failure"},
 ]
 
 
@@ -615,15 +692,36 @@ def _mask_shell(text: str) -> tuple[str, str | None]:
     return "".join(out), q
 
 
-_SHELL_CMD_RE = re.compile(r"(?<![\w./$-])(cp|mv|rm)(?=\s)")
+_SHELL_CMD_RE = re.compile(r"(?<![\w./$-])(cp|mv|rm|tee|sed|ln|install|python3?)(?=\s)")
+# `>` / `>>` / `&>` / `2>` (but not `>&2`, `->`, `=>`, `>=`, `>(`); the target is read from the original line.
+_REDIRECT_RE = re.compile(r"(?<![<>=\-])&?>>?\|?(?![>&(=])")
+_REDIRECT_TARGET_RE = re.compile(r"""(?:"[^"]*"|'[^']*'|[^\s;&|()"'])+""")
+_PY_INLINE_MODE_RES = (
+    re.compile(r"""\bopen\([^,()]*,\s*\\?['"]([A-Za-z+]+)\\?['"]"""),
+    re.compile(r"""\bmode\s*=\s*\\?['"]([A-Za-z+]+)\\?['"]"""),
+)
+_PY_INLINE_WRITE_RE = re.compile(r"\.write_(?:text|bytes)\(")
+
+
+def _inline_python_writes(seg: str) -> bool:
+    """True if a `python -c "..."` segment opens a file for writing or calls write_text/write_bytes."""
+    if _PY_INLINE_WRITE_RE.search(seg):
+        return True
+    return any(re.search(r"[wax+]", mode) for rx in _PY_INLINE_MODE_RES for mode in rx.findall(seg))
 
 
 def _sh_write_sites(text: str) -> list[tuple[int, str]]:
-    """(line, command text) for cp/mv/rm outside quotes whose target expands a protected variable."""
+    """(line, text) for every shell line that can write, replace or delete a protected path:
+    cp/mv/rm/tee/sed -i/ln -f/install whose target expands a protected variable, a `>` or `>>`
+    redirect to one, and `python -c` whose inline code opens a file for writing."""
     masked, open_quote = _mask_shell(text)
     assert open_quote is None, "the shell scanner lost track of quotes; its result would be meaningless"
     hits = []
     for lineno, (orig, mline) in enumerate(zip(text.split("\n"), masked.split("\n")), 1):
+        for m in _REDIRECT_RE.finditer(mline):
+            tm = _REDIRECT_TARGET_RE.match(orig[m.end():].lstrip())
+            if tm and _PROTECTED_VAR_RE.search(tm.group(0)):
+                hits.append((lineno, orig.strip()))
         for m in _SHELL_CMD_RE.finditer(mline):
             prefix = mline[: m.start()].rstrip()
             at_command = (
@@ -643,32 +741,136 @@ def _sh_write_sites(text: str) -> list[tuple[int, str]]:
                 tokens = shlex.split(seg)
             except ValueError:
                 tokens = seg.split()
+            opts = [t for t in tokens[1:] if t.startswith("-") and len(t) > 1]
             args = [t for t in tokens[1:] if not (t.startswith("-") and len(t) > 1)]
             cmd = tokens[0]
-            if cmd == "cp":
+            if cmd in ("python", "python3"):
+                if "-c" in opts and _inline_python_writes(seg):
+                    hits.append((lineno, seg))
+                continue
+            if cmd == "cp" or cmd == "install":
                 targets = args[-1:]
-            else:  # mv removes its source, rm removes everything it is given
+            elif cmd == "ln":  # only a forced link replaces an existing name
+                forced = any(re.match(r"^-[A-Za-z]*f", o) or o == "--force" for o in opts)
+                targets = args[-1:] if forced else []
+            elif cmd == "sed":  # only in-place editing writes the file (GNU `-i`, BSD `-i ''`, `-i.bak`)
+                in_place = any(re.match(r"^-[A-Za-z]*i", o) or o.startswith("--in-place") for o in opts)
+                targets = args if in_place else []
+            else:  # mv removes its source; rm removes everything it is given; tee writes every file it is given
                 targets = args
             if any(_PROTECTED_VAR_RE.search(t) for t in targets):
                 hits.append((lineno, seg))
-    return hits
+    return sorted(set(hits))
 
 
-_PLANTED_SH = '''#!/usr/bin/env bash
-cp -p "$CLAUDE_MD" "$CLAUDE_MD_BACKUP"
-x=1; mv "$CONFIG_PATH" /tmp/x
-test -e a && rm -f "$DB_PATH"
-if rm "$ENGRAM_HOME/warm-briefing.md"; then :; fi
-cp "$CLAUDE_MD" /tmp/copy-only-reads-the-protected-file
-rm -rf "$ENGRAM_HOME/venv"
-fail "remove the link (rm '$CLAUDE_MD') then re-run"   # quoted: message text, not a command
-# rm "$CLAUDE_MD"  <- a comment
-'''
+_PLANTED_SH_POSITIVE = [
+    'cp -p "$CLAUDE_MD" "$CLAUDE_MD_BACKUP"',
+    'x=1; mv "$CONFIG_PATH" /tmp/x',
+    'test -e a && rm -f "$DB_PATH"',
+    'if rm "$ENGRAM_HOME/warm-briefing.md"; then :; fi',
+    'echo x > "$CLAUDE_MD"',
+    'echo x >> $CLAUDE_HOME/notes.md',
+    'printf y 2> "$CONFIG_PATH"',
+    'echo hi | tee "$CLAUDE_MD"',
+    'tee -a "$ENGRAM_HOME/warm-briefing.md" < /dev/null',
+    "sed -i 's/a/b/' \"$CLAUDE_MD\"",
+    "sed -i '' 's/a/b/' \"$CLAUDE_MD\"",
+    "sed -i.bak 's/a/b/' \"$DB_PATH\"",
+    'ln -sf /tmp/x "$CLAUDE_MD"',
+    'install -m 600 /tmp/x "$CLAUDE_MD"',
+    "python3 -c \"open(p, 'w').write('x')\"",
+]
+_PLANTED_SH_NEGATIVE = [
+    'cp "$CLAUDE_MD" /tmp/copy-only-reads-the-protected-file',
+    'rm -rf "$ENGRAM_HOME/venv"',
+    'fail "remove the link (rm \'$CLAUDE_MD\') then re-run"   # quoted: message text, not a command',
+    '# rm "$CLAUDE_MD"  <- a comment',
+    'cat "$CLAUDE_MD" > /tmp/read-only-copy',
+    'echo hi > /dev/null 2>&1',
+    'grep x "$CLAUDE_MD" | tee /tmp/log',
+    'sed -n 1p "$CLAUDE_MD"',
+    'ln -s "$CLAUDE_MD" /tmp/link',
+    'install -m 600 "$CLAUDE_MD" /tmp/copy',
+    "python3 -c \"print(open(p).read(), open(q, 'r').read(), open('/a/x/ax'))\"",
+    '[ "$a" -gt 1 ] && echo "x -> y"',
+]
+_PLANTED_SH = "#!/usr/bin/env bash\n" + "\n".join(_PLANTED_SH_POSITIVE + _PLANTED_SH_NEGATIVE) + "\n"
+
+_PLANTED_SH_PY = """#!/usr/bin/env bash
+read -r -d '' PY_READS <<'PY' || true
+import sys
+print(open(sys.argv[1]).read())
+PY
+read -r -d '' PY_PLANTED <<'PY' || true
+import sys
+open(sys.argv[1], "w").write("x")
+PY
+"""
 
 
 def _assert_shell_scanner_controls() -> None:
     hits = _sh_write_sites(_PLANTED_SH)
-    assert [ln for ln, _ in hits] == [2, 3, 4, 5], f"the shell scanner is broken; planted-script hits: {hits}"
+    want = list(range(2, 2 + len(_PLANTED_SH_POSITIVE)))
+    assert [ln for ln, _ in hits] == want, (
+        f"the shell scanner is broken; planted-script hits: {hits}; "
+        f"missed lines {sorted(set(want) - {ln for ln, _ in hits})}, "
+        f"false hits {sorted({ln for ln, _ in hits} - set(want))}"
+    )
+    blocks = _heredoc_python_blocks(_PLANTED_SH_PY)
+    assert [name for name, _l, _c in blocks] == ["PY_READS", "PY_PLANTED"], f"heredoc extractor broken: {blocks}"
+    flagged = _heredoc_python_hits(_PLANTED_SH_PY)
+    assert [(name, func) for _l, name, func, _t in flagged] == [("PY_PLANTED", "<module>")], \
+        f"the heredoc python scan is broken: {flagged}"
+
+
+def _heredoc_python_blocks(text: str) -> list[tuple[str, int, str]]:
+    """(name, first body line, code) for every `<<'PY'` heredoc in a shell file. The name is the
+    PY_* variable it is read into, else `line<N>`."""
+    lines = text.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        if re.search(r"<<-?\s*'PY'", lines[i]):
+            m = re.search(r"\b(PY_[A-Z_]+)\b", lines[i])
+            name = m.group(1) if m else f"line{i + 1}"
+            j = i + 1
+            body = []
+            while j < len(lines) and lines[j].strip() != "PY":
+                body.append(lines[j])
+                j += 1
+            assert j < len(lines), f"unterminated PY heredoc starting at line {i + 1}"
+            out.append((name, i + 2, "\n".join(body)))
+            i = j
+        i += 1
+    return out
+
+
+def _heredoc_python_hits(text: str, only_containing: "str | None" = None) -> list[tuple[int, str, str, str]]:
+    """(file line, block name, enclosing function, call) for every write site in the Python heredoc
+    blocks of a shell file. A block that does not parse fails the test (it cannot be judged)."""
+    hits = []
+    for name, start, code in _heredoc_python_blocks(text):
+        if only_containing is not None and only_containing not in code:
+            continue
+        try:
+            sites = _py_write_sites(code)
+        except SyntaxError as e:
+            pytest.fail(f"the Python heredoc block {name} (line {start}) does not parse, so it cannot be scanned: {e}")
+        hits += [(start + ln - 1, name, func, call) for ln, func, call in sites]
+    return hits
+
+
+def _heredoc_violations(text: str, allowlist: list[dict], only_containing: "str | None" = None):
+    """Heredoc write sites not covered by the allowlist (entries use func='<BLOCK>:<function>')."""
+    sites = [(ln, f"{name}:{func}", call) for ln, name, func, call in _heredoc_python_hits(text, only_containing)]
+    budget: Counter = Counter((a["func"], a["call"]) for a in allowlist)
+    out = []
+    for ln, func, call in sites:
+        if budget[(func, call)] > 0:
+            budget[(func, call)] -= 1
+        else:
+            out.append((ln, func, call))
+    return out
 
 
 def test_static_write_sites_are_reviewed():
@@ -677,18 +879,42 @@ def test_static_write_sites_are_reviewed():
     The allowlist holds only the sites the contract KEEPS; the helper that implements consent and
     backup lives in another module (src/engram/engram_file_guard.py), so none of its calls appear
     here. Sites not yet moved into it are listed with a reason that names the slice that moves them.
+    Covered: bootstrap.py (AST), install.sh (shell scanner AND the AST scan of its Python heredoc
+    blocks), set_forum_url.py (AST) and the config.json block of install-local-marketplace.sh.
     """
     _assert_python_scanner_controls()
     _assert_shell_scanner_controls()
     py_bad = _py_violations(BOOTSTRAP_PY.read_text(), BOOTSTRAP_ALLOWLIST)
     pending = {cmd for cmd, reason in INSTALL_SH_PENDING if "slice 2" in reason}
-    sh_bad = [(ln, text) for ln, text in _sh_write_sites(INSTALL_SH.read_text()) if text not in pending]
+    install_text = INSTALL_SH.read_text()
+    sh_bad = [(ln, text) for ln, text in _sh_write_sites(install_text) if text not in pending]
+    assert len(_heredoc_python_blocks(install_text)) >= 3, "the heredoc extractor found no PY_* blocks in install.sh"
+    heredoc_bad = _heredoc_violations(install_text, INSTALL_SH_PY_ALLOWLIST)
     problems = [f"src/engram/bootstrap.py:{ln}: {text}   (in {func})" for ln, func, text in py_bad]
     problems += [f"src/engram/tools/install.sh:{ln}: {text}" for ln, text in sh_bad]
+    problems += [f"src/engram/tools/install.sh:{ln}: {text}   (Python block {func})" for ln, func, text in heredoc_bad]
     assert not problems, (
         "file-writing calls outside the reviewed allowlist (each must go through the consent and "
         "backup helper, or be reviewed and added to the allowlist with a reason):\n  " + "\n  ".join(problems)
     )
+
+
+def test_config_json_writers_are_listed_for_slice_2():
+    """The three config.json writers stay as they are in slice 1 and are listed with the reason
+    'slice 2: MERGE backup'. Each entry must still match a real write site (a stale entry fails),
+    and no other write site may appear in these writers."""
+    for entry in INSTALL_SH_PY_ALLOWLIST + MARKETPLACE_CONFIG_ALLOWLIST + SET_FORUM_URL_ALLOWLIST:
+        assert entry["reason"].startswith("slice 2: MERGE backup"), entry
+    install_hits = _heredoc_python_hits(INSTALL_SH.read_text())
+    assert any(n == "PY_CONFIG" for _l, n, _f, _c in install_hits), "install.sh step 3 (PY_CONFIG) write site moved or vanished"
+    market_text = MARKETPLACE_SH.read_text()
+    market_hits = _heredoc_python_hits(market_text, only_containing="install_tier")
+    assert market_hits, "install-local-marketplace.sh's config.json block moved or vanished"
+    assert Counter((f, c) for _l, _n, f, c in market_hits) == Counter((a["func"], a["call"]) for a in MARKETPLACE_CONFIG_ALLOWLIST), \
+        f"install-local-marketplace.sh's config.json block does not match its allowlist: {market_hits}"
+    forum_src = SET_FORUM_URL_PY.read_text()
+    assert _py_violations(forum_src, SET_FORUM_URL_ALLOWLIST) == [], "set_forum_url.py grew a write site"
+    assert len(_py_write_sites(forum_src)) == len(SET_FORUM_URL_ALLOWLIST), "a set_forum_url.py allowlist entry is stale"
 
 
 # --------------------------------------------------------------------- C6: installer default
@@ -850,6 +1076,19 @@ def _command_tokens(seg: str) -> list[str]:
         return seg.split()
 
 
+_SUDO_OPTS_WITH_VALUE = {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-r", "-t"}
+
+
+def _strip_sudo(toks: list[str]) -> list[str]:
+    """`sudo [options] rm ...` is judged as `rm ...` (sudo changes who deletes, not what is deleted)."""
+    if not toks or toks[0] != "sudo":
+        return toks
+    i = 1
+    while i < len(toks) and toks[i].startswith("-") and len(toks[i]) > 1:
+        i += 2 if toks[i] in _SUDO_OPTS_WITH_VALUE else 1
+    return toks[i:]
+
+
 def _code_segments(line: str, in_fence: bool) -> list[str]:
     """Shell-command segments of one doc line: the whole line in a fence, backtick spans otherwise."""
     pieces = [line] if in_fence else re.findall(r"`([^`]+)`", line)
@@ -899,7 +1138,7 @@ def _doc_hits(text: str) -> list[tuple[int, str]]:
     for i, line in enumerate(lines):
         flagged = False
         for seg in segs_by_line[i]:
-            toks = _command_tokens(seg)
+            toks = _strip_sudo(_command_tokens(seg))
             if not toks or toks[0] not in ("rm", "cp"):
                 continue
             args = [t for t in toks[1:] if not (t.startswith("-") and len(t) > 1)]
@@ -943,6 +1182,8 @@ rm -rf ~/.engram
 ```bash
 rm -rf ~/.engram   # HIT
 rm ~/.claude/CLAUDE.md   # HIT
+sudo rm -rf ~/.engram   # HIT
+sudo -u root rm ~/.claude/CLAUDE.md   # HIT
 ```
 
 {filler}
@@ -961,7 +1202,7 @@ def _assert_doc_scanner_controls() -> None:
     lines = _PLANTED_DOC.split("\n")
     expected = [i + 1 for i, ln in enumerate(lines) if "HIT" in ln]
     hits = [ln for ln, _ in _doc_hits(_PLANTED_DOC)]
-    assert len(expected) == 4 and hits == expected, \
+    assert len(expected) == 6 and hits == expected, \
         f"the docs scanner is broken; planted hits at lines {expected}, scanner found {hits}"
 
 
@@ -997,3 +1238,287 @@ def test_docs_never_tell_a_bare_delete():
         "docs that tell the reader to delete or overwrite a protected path with no backup step "
         "in the 6 lines before:\n  " + "\n  ".join(found)
     )
+
+
+# ----------------------------------------------- C5: newest graph backup is the newest by mtime
+
+def test_newest_db_backup_is_by_mtime_not_by_name(tmp_path):
+    """Name order and mtime order disagree: the refusal names the file modified last."""
+    wb = _memory_without_graph(tmp_path)
+    by_name = tmp_path / ".engram" / "db-backup" / "knowledge-20261105.db"   # later name, OLDER mtime
+    by_mtime = tmp_path / ".engram" / "db-backup" / "knowledge-20261101.db"  # earlier name, NEWER mtime
+    by_name.parent.mkdir(parents=True)
+    by_name.write_bytes(b"later name, older file")
+    by_mtime.write_bytes(b"earlier name, newer file")
+    os.utime(by_name, (1_000_000_000, 1_000_000_000))
+    os.utime(by_mtime, (1_100_000_000, 1_100_000_000))
+    r = _run(tmp_path)
+    _assert_nothing_written_by_refusal(tmp_path, r, wb)
+    msg = _text(r)
+    assert "knowledge-20261101.db" in msg, "the refusal must name the mtime-newest backup:\n" + msg
+    assert "knowledge-20261105.db" not in msg, "only the mtime-newest backup should be named:\n" + msg
+
+
+def test_newest_db_backup_ties_go_to_the_later_name(tmp_path):
+    wb = _memory_without_graph(tmp_path)
+    a = tmp_path / ".engram" / "db-backup" / "knowledge-20261101.db"
+    b = tmp_path / ".engram" / "db-backup" / "knowledge-20261105.db"
+    a.parent.mkdir(parents=True)
+    a.write_bytes(b"a")
+    b.write_bytes(b"b")
+    os.utime(a, (1_000_000_000, 1_000_000_000))
+    os.utime(b, (1_000_000_000, 1_000_000_000))
+    msg = _text(_run(tmp_path))
+    assert "knowledge-20261105.db" in msg and "knowledge-20261101.db" not in msg, msg
+    assert wb.read_bytes() == USER_AUTHORED
+
+
+# ------------------------------------------------ move-aside message: the reinstall sentence
+
+MOVE_ASIDE_SENTENCE = "The installed plugin and its Python environment move too, so ENGRAM must be reinstalled afterwards."
+
+
+def test_memory_refusal_gives_the_move_aside_command_and_the_reinstall_sentence(tmp_path):
+    _memory_without_graph(tmp_path)
+    msg = _text(_run(tmp_path))
+    assert "mv " in msg and ".moved-aside-" in msg, msg
+    assert MOVE_ASIDE_SENTENCE in msg, "the move-aside message must say the plugin and venv move too:\n" + msg
+
+
+@pytest.mark.parametrize("extra_env", [None, {"FORCE": "1"}])
+def test_graph_present_refusal_gives_the_reinstall_sentence(tmp_path, extra_env):
+    first = _run_env(tmp_path)
+    assert first.returncode == 0, _text(first)
+    again = _run_env(tmp_path, extra_env=extra_env)
+    msg = _text(again)
+    assert again.returncode != 0 and ".moved-aside-" in msg, msg
+    assert MOVE_ASIDE_SENTENCE in msg, msg
+    assert "delete" not in msg.lower(), "no message of ours says delete:\n" + msg
+
+
+# ------------------------------------------------------------------ MERGE class (M1-M4)
+
+_fg_spec = importlib.util.spec_from_file_location("engram_file_guard_contract", SRC / "engram_file_guard.py")
+fg = importlib.util.module_from_spec(_fg_spec)
+_fg_spec.loader.exec_module(fg)
+
+
+def test_merge_owned_keys_are_one_closed_named_list():
+    """M1: the owned keys are exactly this list. Changing it is a contract change, not a refactor."""
+    assert fg.OWNED_KEYS == {
+        "settings.json": ("cleanupPeriodDays",),
+        "config.json": ("install_tier", "forum.url"),
+    }
+
+
+def _nested(doc: dict, dotted: str):
+    for part in dotted.split("."):
+        doc = doc[part]
+    return doc
+
+
+def _strip_dotted(doc: dict, dotted: str) -> dict:
+    out = json.loads(json.dumps(doc))
+    parts = dotted.split(".")
+    node = out
+    for part in parts[:-1]:
+        node = node.get(part, {})
+    node.pop(parts[-1], None)
+    return out
+
+
+_USER_DOCS = {
+    "settings.json": {"model": "sonnet", "permissions": {"allow": ["Bash(ls)", "Read"], "deny": []},
+                      "env": {"NAME": "café"}, "theme": "dark"},
+    "config.json": {"self_lineage": "anthropic:opus", "forum": {"theme": "x", "retries": 3},
+                    "embedding": {"model": "m", "dims": 384}, "cadence": {"drowsiness_ceiling_tokens": 800000}},
+}
+
+
+@pytest.mark.parametrize("filename,key,value", [
+    ("settings.json", "cleanupPeriodDays", 30),
+    ("config.json", "install_tier", "dev"),
+    ("config.json", "forum.url", "https://forum.example.test"),
+])
+def test_merge_one_cell_per_owned_key(tmp_path, filename, key, value):
+    """M1-M4 for each owned key: the key is set, every other key keeps its value and order, a
+    stamped backup of the original bytes is taken first, the file mode is kept, and a second
+    identical merge writes nothing and backs up nothing.
+
+    Comparison, stated: the NON-OWNED part is compared byte for byte on its re-serialization
+    (json.dumps with the file's own 2-space indent) AND key by key (values and key order, at the
+    top level and inside the objects that hold owned keys). The raw file bytes are not compared,
+    because the merge re-serializes the whole file, so they differ by the owned entry.
+    """
+    before = _USER_DOCS[filename]
+    path = tmp_path / filename
+    original = (json.dumps(before, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    path.write_bytes(original)
+    os.chmod(path, 0o640)
+
+    assert fg.apply_merge(path, {key: value}) == "merged"
+
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert _nested(after, key) == value, "the owned key was not set"
+    assert json.dumps(_strip_dotted(after, key), indent=2, ensure_ascii=False) == \
+        json.dumps(_strip_dotted(before, key), indent=2, ensure_ascii=False), \
+        "the non-owned part changed (byte-for-byte comparison of its re-serialization)"
+    assert list(after) == list(before) + ([key] if "." not in key else []), "top-level key order changed"
+    for top, sub in before.items():
+        if isinstance(sub, dict):
+            assert list(after[top])[: len(sub)] == list(sub), f"key order inside {top!r} changed"
+            for k, v in sub.items():
+                assert after[top][k] == v, f"{top}.{k} changed"
+    assert stat_mode(path) == 0o640, "the file mode was not kept"
+    backups = _backups_of(path)
+    assert [b.read_bytes() for b in backups] == [original], "exactly one stamped backup of the original bytes"
+
+    # M4: merging the same value again leaves the file byte-identical and makes no backup.
+    sha, mtime = _sha(path), path.stat().st_mtime_ns
+    assert fg.apply_merge(path, {key: value}) == "unchanged"
+    assert (_sha(path), path.stat().st_mtime_ns) == (sha, mtime), "an unchanged merge wrote the file"
+    assert _backups_of(path) == backups, "an unchanged merge made a backup"
+
+
+def stat_mode(path: Path) -> int:
+    return path.stat().st_mode & 0o7777
+
+
+def test_merge_into_an_absent_file_creates_only_the_owned_key_mode_0600(tmp_path):
+    path = tmp_path / "settings.json"
+    assert fg.apply_merge(path, {"cleanupPeriodDays": 90}) == "created"
+    assert json.loads(path.read_text()) == {"cleanupPeriodDays": 90}
+    assert stat_mode(path) == 0o600
+    assert _backups_of(path) == [], "there is nothing to back up when the file was absent"
+
+
+@pytest.mark.parametrize("filename,existing,changes", [
+    # a key that is not on the list is never ENGRAM's to change, even alongside an owned one
+    ("settings.json", {"model": "sonnet"}, {"cleanupPeriodDays": 30, "model": "other"}),
+    ("settings.json", {"model": "sonnet"}, {"model": "other"}),
+    ("config.json", {"forum": {"theme": "x"}}, {"forum.url": "https://x.test", "forum.theme": "y"}),
+    ("config.json", {"self_lineage": "anthropic:opus"}, {"self_lineage": "other"}),
+    # a file with no owned keys is never merged into
+    ("other.json", {"a": 1}, {"a": 2}),
+    # an owned nested key whose parent the user made a non-object: setting it would change that value
+    ("config.json", {"forum": "a string the user wrote"}, {"forum.url": "https://x.test"}),
+])
+def test_merge_that_would_change_an_unowned_key_is_refused_and_the_file_untouched(tmp_path, filename, existing, changes):
+    """NEGATIVE cell for M1/M2: refuse with MergeRefused; the file, its mtime and its directory are unchanged."""
+    path = tmp_path / filename
+    path.write_bytes((json.dumps(existing, indent=2) + "\n").encode())
+    state = (_sha(path), path.stat().st_mtime_ns, sorted(x.name for x in tmp_path.iterdir()))
+    with pytest.raises(fg.MergeRefused):
+        fg.apply_merge(path, changes)
+    assert (_sha(path), path.stat().st_mtime_ns, sorted(x.name for x in tmp_path.iterdir())) == state
+
+
+@pytest.mark.parametrize("content", [b"{not json", b"", b"[1, 2]", b"42", b"null", b"\xff\xfe\x00broken"])
+@pytest.mark.parametrize("filename,key,value", [
+    ("settings.json", "cleanupPeriodDays", 30),
+    ("config.json", "install_tier", "dev"),
+    ("config.json", "forum.url", "https://x.test"),
+])
+def test_merge_never_repairs_a_file_that_does_not_parse(tmp_path, filename, key, value, content):
+    """M3: a file that does not parse (or is not a JSON object) is not a merge candidate: refused,
+    byte-identical afterwards, no backup, no temp file."""
+    path = tmp_path / filename
+    path.write_bytes(content)
+    state = (_sha(path), path.stat().st_mtime_ns)
+    with pytest.raises(fg.MergeRefused):
+        fg.apply_merge(path, {key: value})
+    assert (_sha(path), path.stat().st_mtime_ns) == state
+    assert sorted(x.name for x in tmp_path.iterdir()) == [filename]
+
+
+def test_bootstrap_retention_flag_takes_a_stamped_backup_and_keeps_the_other_keys(tmp_path):
+    """cleanupPeriodDays is the one owned key bootstrap touches: --retention-days goes through the merge."""
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    user = {"model": "sonnet", "hooks": {"Stop": []}, "theme": "dark"}
+    original = (json.dumps(user, indent=2) + "\n").encode()
+    settings.write_bytes(original)
+    r = _run(tmp_path, args=["--retention-days", "90"])
+    assert r.returncode == 0, _text(r)
+    after = json.loads(settings.read_text())
+    assert after == {**user, "cleanupPeriodDays": 90} and list(after) == [*user, "cleanupPeriodDays"]
+    assert [b.read_bytes() for b in _backups_of(settings)] == [original]
+
+
+def test_bootstrap_refusal_for_a_broken_settings_file_offers_repair_or_move_aside_never_remove(tmp_path):
+    """M3 through bootstrap: refused before anything is created; the message says repair or move
+    aside (no message of ours tells the user to remove a file)."""
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_bytes(b"{not json")
+    r = _run(tmp_path, args=["--retention-days", "90"])
+    msg = _text(r)
+    assert r.returncode != 0 and "REFUSED" in msg, msg
+    assert settings.read_bytes() == b"{not json"
+    assert "move it aside" in msg and "remove" not in msg.lower() and "delete" not in msg.lower(), msg
+    assert not _db(tmp_path).exists()
+
+
+# ------------------------------------- the helpers the static gate exempts by file: behaviour pins
+#
+# The static gate exempts engram_file_guard.py by file, because the guard IS the helper. So that
+# exemption cannot silently widen, (1) the guard's own write sites are listed below per
+# (function, call), and (2) the two helpers that carry the guarantee get a behaviour pin here.
+# A behaviour pin (not a hash of the function source) because a hash fails on every harmless edit
+# and says nothing about what the function does; a pin fails exactly when the guarantee breaks.
+
+GUARD_ALLOWLIST = [
+    {"func": "copy_exclusive", "call": "os.fdopen(fd, 'wb')", "reason": "writes the private temp it created (mkstemp)"},
+    {"func": "copy_exclusive", "call": "os.link(temp, dst)", "reason": "publishes exclusively: FileExistsError for anything at dst"},
+    {"func": "copy_exclusive", "call": "os.replace(temp, dst)", "reason": "only on a filesystem without hard links, and only after dst was found absent"},
+    {"func": "copy_exclusive", "call": "os.unlink(temp)", "reason": "removes the temp this call created"},
+    {"func": "atomic_write_text", "call": "os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)", "reason": "exclusive temp beside the target"},
+    {"func": "atomic_write_text", "call": "os.fdopen(fd, 'w', encoding='utf-8')", "reason": "writes that temp"},
+    {"func": "atomic_write_text", "call": "os.replace(tmp, path)", "reason": "atomic publish: never writes through the target"},
+    {"func": "atomic_write_text", "call": "os.unlink(tmp)", "reason": "removes the temp on failure"},
+    {"func": "apply", "call": "os.unlink(e.path)", "reason": "a delete request: only after a stamped backup, only on consent"},
+]
+
+
+def test_guard_write_sites_are_exactly_the_reviewed_ones():
+    assert _py_violations((SRC / "engram_file_guard.py").read_text(), GUARD_ALLOWLIST) == []
+    assert len(_py_write_sites((SRC / "engram_file_guard.py").read_text())) == len(GUARD_ALLOWLIST), \
+        "a guard allowlist entry is stale (it matches no write site)"
+
+
+def test_copy_exclusive_still_refuses_anything_at_dst(tmp_path):
+    """Behaviour pin: exclusive create. A regular file, a symlink and a dangling symlink at dst
+    all raise FileExistsError and are left exactly as they were."""
+    src = tmp_path / "src.txt"
+    src.write_bytes(b"source bytes\n")
+    existing = tmp_path / "existing"
+    existing.write_bytes(b"already here\n")
+    real = tmp_path / "real"
+    real.write_bytes(b"link target\n")
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    for dst in (existing, link, dangling):
+        with pytest.raises(FileExistsError):
+            fg.copy_exclusive(src, dst)
+    assert existing.read_bytes() == b"already here\n" and real.read_bytes() == b"link target\n"
+    assert link.is_symlink() and dangling.is_symlink() and not (tmp_path / "nowhere").exists()
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["dangling", "existing", "link", "real", "src.txt"], \
+        "a temp file was left behind"
+    fresh = tmp_path / "fresh"
+    fg.copy_exclusive(src, fresh)
+    assert fresh.read_bytes() == b"source bytes\n"
+
+
+def test_atomic_write_text_replaces_the_file_and_never_writes_through_a_hard_link(tmp_path):
+    """Behaviour pin: the target is replaced (os.replace), not truncated in place, so another hard
+    link to the old file keeps the old bytes; the requested mode is applied; no temp is left."""
+    target = tmp_path / "t.txt"
+    target.write_bytes(b"old bytes\n")
+    other_link = tmp_path / "other-link.txt"
+    os.link(target, other_link)
+    fg.atomic_write_text(target, "new bytes\n", 0o640)
+    assert target.read_bytes() == b"new bytes\n" and stat_mode(target) == 0o640
+    assert other_link.read_bytes() == b"old bytes\n", "the write went through the hard link"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["other-link.txt", "t.txt"], "a temp file was left behind"

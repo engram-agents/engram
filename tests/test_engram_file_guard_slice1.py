@@ -8,6 +8,7 @@ check-only pass predicts every render from those IDs without a seed manifest.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -160,3 +161,169 @@ def test_fixed_seed_ids_match_what_seeding_mints(tmp_path):
     assert probe.returncode == 0, probe.stdout + probe.stderr
     assert json.loads(probe.stdout.strip().splitlines()[-1]) == minted
     assert list(minted) == list(json.loads(probe.stdout.strip().splitlines()[-1]))
+
+
+# ------------------------------------------------------------- C: same-second backup names (-N)
+
+def test_same_second_backups_take_the_dash_one_suffix_and_the_first_stays_byte_identical(tmp_path, monkeypatch):
+    """The stamp clock is the module seam `CLOCK`. With it fixed, two replaces in the same second
+    collide on the stamped name: plan() predicts the -1 name, apply() uses it, and the first
+    stamped backup is byte-for-byte (and mtime-for-mtime) what it was."""
+    from datetime import datetime, timezone
+    monkeypatch.setattr(fg, "CLOCK", lambda: datetime(2026, 11, 11, 12, 0, 0, tzinfo=timezone.utc))
+    a = tmp_path / "a"
+    a.write_bytes(b"v1\n")
+    consent = fg.consent_for(True, [])
+
+    fg.apply(fg.plan([fg.Item(a, "n1\n")]), consent)  # no explicit stamp: the clock supplies it
+    first = tmp_path / "a.engram-backup.20261111T120000Z"
+    assert first.read_bytes() == b"v1\n"
+    first_state = (first.read_bytes(), first.stat().st_mtime_ns, first.stat().st_mode)
+
+    second_plan = fg.plan([fg.Item(a, "n2\n")])
+    assert second_plan.entries[0].backup == tmp_path / "a.engram-backup.20261111T120000Z-1", \
+        "plan() must predict the numbered name"
+    fg.apply(second_plan, consent)
+    assert (tmp_path / "a.engram-backup.20261111T120000Z-1").read_bytes() == b"n1\n"
+    assert (first.read_bytes(), first.stat().st_mtime_ns, first.stat().st_mode) == first_state, \
+        "the first stamped backup was touched by the second one"
+
+    fg.apply(fg.plan([fg.Item(a, "n3\n")]), consent)
+    assert (tmp_path / "a.engram-backup.20261111T120000Z-2").read_bytes() == b"n2\n"
+    assert a.read_bytes() == b"n3\n"
+
+
+# ---------------------------------------- E: consent compares resolved paths (C9)
+
+def test_replace_accepts_a_second_spelling_of_the_same_path(tmp_path):
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_dir)
+    target = real_dir / "CLAUDE.md"
+    target.write_text("mine")
+    p = fg.plan([fg.Item(target, "new")], STAMP)
+    assert fg.refusal(p, fg.consent_for(False, [str(alias / "CLAUDE.md")])) is None, \
+        "a symlinked-folder spelling of the same path was not accepted"
+    assert fg.refusal(p, fg.consent_for(False, [str(tmp_path / "real" / ".." / "real" / "CLAUDE.md")])) is None, \
+        "a dot-dot spelling of the same path was not accepted"
+    # and the other way round: the plan holds the alias spelling, consent the real one
+    p_alias = fg.plan([fg.Item(alias / "CLAUDE.md", "new")], STAMP)
+    assert fg.refusal(p_alias, fg.consent_for(False, [str(target)])) is None
+    assert fg.refusal(p, fg.consent_for(False, [str(tmp_path / "real" / "other.md")])) is not None, \
+        "consent for a different file must not count"
+
+
+def test_replace_accepts_a_relative_path_with_the_cwd_set(tmp_path, monkeypatch):
+    d = tmp_path / "d"
+    d.mkdir()
+    target = d / "a.md"
+    target.write_text("mine")
+    monkeypatch.chdir(tmp_path)
+    p = fg.plan([fg.Item(target, "new")], STAMP)
+    assert fg.refusal(p, fg.consent_for(False, ["d/a.md"])) is None
+    assert fg.refusal(p, fg.consent_for(False, ["./d/../d/a.md"])) is None
+
+
+@pytest.mark.skipif(not Path("/var").is_symlink(), reason="the /var vs /private/var spelling exists on macOS only")
+def test_replace_accepts_the_var_and_private_var_spellings(tmp_path):
+    real = Path(os.path.realpath(tmp_path)) / "a.md"
+    real.write_text("mine")
+    p = fg.plan([fg.Item(real, "new")], STAMP)
+    assert str(real).startswith("/private/var/"), real
+    short = str(real)[len("/private"):]
+    assert fg.refusal(p, fg.consent_for(False, [short])) is None
+
+
+def test_a_symlink_at_the_path_is_not_followed_for_the_decision(tmp_path):
+    real = tmp_path / "real.txt"
+    real.write_text("mine")
+    link = tmp_path / "link.txt"
+    link.symlink_to(real)
+    p = fg.plan([fg.Item(link, "new")], STAMP)
+    assert fg.refusal(p, fg.consent_for(False, [str(real)])) is not None, \
+        "consent for the link's target must not count as consent for the link"
+    assert fg.refusal(p, fg.consent_for(False, [str(link)])) is None
+
+
+def test_refusal_prints_one_canonical_form(tmp_path):
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_dir)
+    (real_dir / "a.md").write_text("mine")
+    msg = fg.refusal(fg.plan([fg.Item(alias / "a.md", "new")], STAMP))
+    canonical = Path(os.path.realpath(real_dir)) / "a.md"
+    assert str(canonical) in msg and str(alias) not in msg, msg
+    assert f"{canonical}.engram-backup.{STAMP}" in msg, "the backup is printed in the same canonical form"
+
+
+# ------------------------------------------- G: an obstructed `<name>.pre-engram` (C8)
+
+def test_pre_engram_that_is_the_same_file_is_refused_even_with_consent(tmp_path):
+    for how in ("hard", "symlink"):
+        d = tmp_path / how
+        d.mkdir()
+        f = d / "CLAUDE.md"
+        f.write_text("mine")
+        bak = d / "CLAUDE.md.pre-engram"
+        os.link(f, bak) if how == "hard" else os.symlink(f, bak)
+        p = fg.plan([fg.Item(f, "new", first_identity=True)], STAMP)
+        assert p.entries[0].state == "obstructed", how
+        msg = fg.refusal(p, fg.consent_for(True, []))
+        assert msg is not None and msg.count("REFUSED") == 1 and str(bak) in msg and "same file" in msg
+        assert "Move that backup name aside" in msg
+        with pytest.raises(fg.Refused):
+            fg.apply(p, fg.consent_for(True, []))
+        assert f.read_text() == "mine" and _backups(f) == []
+
+
+def test_pre_engram_dangling_link_or_directory_is_left_alone_and_the_run_proceeds(tmp_path):
+    for how in ("dangling", "dir"):
+        d = tmp_path / how
+        d.mkdir()
+        f = d / "CLAUDE.md"
+        f.write_text("mine")
+        bak = d / "CLAUDE.md.pre-engram"
+        bak.symlink_to(d / "nowhere") if how == "dangling" else bak.mkdir()
+        p = fg.plan([fg.Item(f, "new", first_identity=True)], STAMP)
+        assert p.entries[0].state == "differs", how
+        fg.apply(p, fg.consent_for(True, []))
+        assert f.read_text() == "new" and [b.read_text() for b in _backups(f)] == ["mine"]
+        assert bak.is_symlink() == (how == "dangling") and not (d / "nowhere").exists()
+
+
+def test_obstructed_name_is_listed_in_the_same_one_refusal_as_the_other_paths(tmp_path):
+    f = tmp_path / "CLAUDE.md"
+    f.write_text("mine")
+    os.link(f, tmp_path / "CLAUDE.md.pre-engram")
+    other = tmp_path / "AGENTS.md"
+    other.write_text("also mine")
+    msg = fg.refusal(fg.plan([fg.Item(f, "n", first_identity=True), fg.Item(other, "n")], STAMP))
+    assert msg.count("REFUSED") == 1 and str(f) in msg and str(other) in msg, msg
+
+
+# ------------------------------------------------ I: backups accumulate, said plainly
+
+def test_refusal_says_backups_accumulate_and_nothing_deletes_them(tmp_path):
+    a = tmp_path / "a"
+    a.write_text("mine")
+    msg = fg.refusal(fg.plan([fg.Item(a, "new")], STAMP))
+    assert "Backups accumulate" in msg and "nothing deletes them automatically" in msg, msg
+
+
+# ------------------------------------------------ J: what a backup promises (C7)
+
+def test_backup_keeps_bytes_mode_and_mtime(tmp_path):
+    a = tmp_path / "a"
+    a.write_bytes(b"mine \x00\xff\n")
+    os.chmod(a, 0o640)
+    os.utime(a, ns=(1_000_000_000_123_456_789, 1_000_000_000_123_456_789))
+    fg.apply(fg.plan([fg.Item(a, "new")], STAMP), fg.consent_for(True, []))
+    (backup,) = _backups(a)
+    st = backup.stat()
+    assert backup.read_bytes() == b"mine \x00\xff\n"
+    assert st.st_mode & 0o7777 == 0o640, "the backup lost the file's mode"
+    assert st.st_mtime_ns == 1_000_000_000_123_456_789, "the backup lost the file's modification time"
+    # Extended attributes and ACLs are NOT promised (shutil.copystat drops them on macOS); the
+    # contract and README-AGENT say so, and this test does not claim otherwise.

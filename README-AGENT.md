@@ -189,7 +189,7 @@ build at a tier you did not choose.)
 
 ## Plugin install (Claude Code) — the canonical path
 
-**Scripted path, beside this one:** from a checkout of a `v*` or `deploy/*` tag that the clone can see is merged into `origin/dev` or `origin/main` (a shallow `git clone --branch` can be refused at step 1, whose message names the fix), `bash tools/install.sh` does the Phase 0–1 work, including `claude plugin install`/`enable` (so no slash commands); it installs Claude Code itself only with `--install-claude-code`. It also bootstraps the graph when none is seeded yet, so Phase 2's missing-database error does not occur (the first session still runs its naming dialogue); before that bootstrap replaces an existing `~/.claude/CLAUDE.md`, it copies it to `CLAUDE.md.pre-engram` (once, never over an earlier backup; on a terminal it asks first and the default answer is No, with no terminal it stops unless you pass `--yes`; bootstrap then saves the current file to a stamped backup of its own before it replaces it); and it installs the recall service by default (`--no-recall-service` opts out, `--viz-service` adds the dashboard). It stops at the first failure naming the step and a remedy, and ends with a PASS/FAIL self-check (`tools/install_selfcheck.py`). **It does not do Phase 1.5 or 1.6:** have the model-family conversation (and the Ollama fix, if it applies) before the human runs `claude` for the first session. `--help` lists its options. It does not replace this guide, which remains the reference for what each step does.
+**Scripted path, beside this one:** from a checkout of a `v*` or `deploy/*` tag that the clone can see is merged into `origin/dev` or `origin/main` (a shallow `git clone --branch` can be refused at step 1, whose message names the fix), `bash tools/install.sh` does the Phase 0–1 work, including `claude plugin install`/`enable` (so no slash commands); it installs Claude Code itself only with `--install-claude-code`. It also bootstraps the graph when none is seeded yet, so Phase 2's missing-database error does not occur (the first session still runs its naming dialogue); before that bootstrap replaces an existing `~/.claude/CLAUDE.md`, it copies it to `CLAUDE.md.pre-engram` (once, never over an earlier backup; on a terminal it asks first and the default answer is No, with no terminal it stops unless you pass `--yes`; bootstrap then saves the current file to a stamped backup of its own before it replaces it; backups accumulate and nothing deletes them automatically); and it installs the recall service by default (`--no-recall-service` opts out, `--viz-service` adds the dashboard). It stops at the first failure naming the step and a remedy, and ends with a PASS/FAIL self-check (`tools/install_selfcheck.py`). **It does not do Phase 1.5 or 1.6:** have the model-family conversation (and the Ollama fix, if it applies) before the human runs `claude` for the first session. `--help` lists its options. It does not replace this guide, which remains the reference for what each step does.
 
 ### Phase 0 — One-time prereqs
 
@@ -464,7 +464,7 @@ ENGRAM_INSTALL_MODE=plugin \
 "$VENV_PY" bootstrap.py
 ```
 
-**If bootstrap prints `[bootstrap] REFUSED:` followed by a list of files**, the user already has their own version of one or more files that bootstrap would write (for Codex: `~/.codex/AGENTS.md`, `~/.codex/config.toml`, `codex-compact-prompt.md`; for Claude: `~/.claude/CLAUDE.md`), and bootstrap will not replace them without consent (#4440, #4452). Nothing has been changed yet. The one message names every file that needs a yes, and the backup each would get. Show the user that whole list and ask: replace them (each is copied to a backup first, a `<name>.pre-engram` the first time and a stamped `<name>.engram-backup.<UTC time>` after that, and an earlier backup is never touched), or stop so they can move the files themselves. Only on a clear yes, re-run the same command with `--replace PATH` for each file they agreed to (repeat the flag), or `--force` for every file listed. **An agent passes `--force`, `--replace` or `--yes` only after showing the user the full list of files the refusal named and getting their yes.** Never add them on your own judgement. A `REFUSED` about a dangling symlink is not fixed by these flags: the message names the link to move aside or repair.
+**If bootstrap prints `[bootstrap] REFUSED:` followed by a list of files**, the user already has their own version of one or more files that bootstrap would write (for Codex: `~/.codex/AGENTS.md`, `~/.codex/config.toml`, `codex-compact-prompt.md`; for Claude: `~/.claude/CLAUDE.md`), and bootstrap will not replace them without consent (#4440, #4452). Nothing has been changed yet. The one message names every file that needs a yes, and the backup each would get. Show the user that whole list and ask: replace them (each is copied to a backup first: a stamped `<name>.engram-backup.<UTC time>` every time, plus a `<name>.pre-engram` the first time for an identity file; an earlier backup is never touched), or stop so they can move the files themselves. A backup keeps the file's bytes, its permission mode and its modification time; it does not keep extended attributes or ACLs. **Backups accumulate: every replace adds one, and nothing deletes them automatically.** Show the user the WHOLE list in ONE question, so one yes never covers a path they did not see. Only on a clear yes, re-run the same command with `--replace PATH` for each file they agreed to (repeat the flag; use this to cover exactly what they approved), or `--force`, which means yes to EVERY file the refusal listed. If the refusal says a `<name>.pre-engram` is the same file as the file itself (a hard link or a link to it), no flag gets past it: move that backup name aside as the message says, then re-run. **An agent passes `--force`, `--replace` or `--yes` only after showing the user the full list of files the refusal named and getting their yes.** Never add them on your own judgement. A `REFUSED` about a dangling symlink is not fixed by these flags: the message names the link to move aside or repair.
 
 ### Phase 1.6 — Hook trust (CODEX-DELTA)
 
@@ -597,6 +597,7 @@ skill's inverse-merge gate above.
 > memory (`warm-briefing.md`, `seed-manifest.json`, `history/`, `diary/`). A genuine fresh
 > start means moving the whole data home aside first
 > (`mv ~/.engram ~/.engram.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)`), so nothing is lost.
+> The installed plugin and its Python environment move too, so ENGRAM must be reinstalled afterwards.
 > Upgrade is non-destructive; re-bootstrapping is never the upgrade path. Do NOT kill the MCP subprocess
 > yourself — the stdio-MCP reconnect contract is user-restart only.
 
@@ -713,7 +714,7 @@ spare terminal and refresh to watch the graph grow.
 **Install refuses to overwrite an existing install:** intentional. Either **upgrade**
 (keep the graph; update code) via the upgrade flow above, or a **fresh start**
 (empty graph) by setting the whole data home aside, then re-running:
-`mv ~/.engram ~/.engram.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)`. Moving only `knowledge.db`
+`mv ~/.engram ~/.engram.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)`. The installed plugin and its Python environment move too, so ENGRAM must be reinstalled afterwards. Moving only `knowledge.db`
 is not enough, because bootstrap also refuses a home that still holds the agent's memory
 files. `FORCE=1` refuses on a non-empty DB. If the refusal names a graph backup under
 `~/.engram/db-backup/`, restoring it to `knowledge.db` is usually what the user wants.
@@ -752,6 +753,7 @@ bash tools/uninstall-local-marketplace.sh --dry-run  # preview
 # Full data reset (set the data home aside; keeps a copy you can move back):
 bash tools/uninstall-local-marketplace.sh
 mv ~/.engram ~/.engram.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)
+# The installed plugin and its Python environment move too, so ENGRAM must be reinstalled afterwards.
 mv ~/.claude/CLAUDE.md ~/.claude/CLAUDE.md.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)   # optional: set the agent identity aside
 ```
 

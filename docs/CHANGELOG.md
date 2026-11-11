@@ -19,6 +19,12 @@ with an `-alpha` suffix during the alpha phase.
   installer's question about an existing `CLAUDE.md` now defaults to No.
   `bootstrap.py` never seeds a new graph beside an existing agent's memory, even
   with `--force`. A fresh start is moving the whole data home aside.
+  A backup keeps the file's bytes, mode and modification time, not extended
+  attributes or ACLs. Backups accumulate, and nothing deletes them
+  automatically. When setup sets one of its own keys in a settings or config
+  file (`cleanupPeriodDays`, `install_tier`, `forum.url`), it backs the file
+  up first, keeps every other key in value and order, and leaves a file that
+  does not parse as it is.
 
 ## [v0.5.6] - 2026-11-10
 

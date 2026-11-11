@@ -265,17 +265,25 @@ def test_claude_valid_backup_symlink_counts_as_existing_backup(tmp_path):
     assert md.read_bytes() != b"current\n"
 
 
-def test_claude_hard_link_at_backup_path_is_kept_and_a_stamped_backup_is_made(tmp_path):
+def _assert_refused_for_obstructed_backup(tmp_path, r, target, bak, original):
+    """The backup name is the same file as the target: refuse, write nothing, name the remedy."""
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert out.count("REFUSED") == 1 and str(bak) in out and "same file" in out
+    assert "Move that backup name aside" in out
+    assert target.read_bytes() == original and bak.read_bytes() == original
+    assert not _stamped_backups(target.parent, target.name), "no stamped backup on a refusal"
+    assert not _db(tmp_path).exists(), "nothing is seeded behind a refusal"
+
+
+def test_claude_hard_link_at_backup_path_is_refused_even_with_force(tmp_path):
     md = tmp_path / ".claude" / "CLAUDE.md"
     md.parent.mkdir()
     md.write_bytes(b"my own instructions\n")
     bak = tmp_path / ".claude" / "CLAUDE.md.pre-engram"
     os.link(md, bak)
     r = _run(tmp_path, args=["--force"])
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert bak.read_bytes() == b"my own instructions\n"
-    assert [p.read_bytes() for p in _stamped_backups(md.parent, "CLAUDE.md")] == [b"my own instructions\n"]
-    assert md.read_bytes() != b"my own instructions\n"
+    _assert_refused_for_obstructed_backup(tmp_path, r, md, bak, b"my own instructions\n")
 
 
 def _probe(tmp_path: Path, body: str, *argv: str) -> subprocess.CompletedProcess:
@@ -469,17 +477,15 @@ def test_backup_once_turns_a_file_that_appeared_into_a_one_line_refusal(tmp_path
     assert src.read_bytes() == b"source bytes\n"
 
 
-def test_claude_symlink_to_target_at_backup_path_is_left_alone_and_a_stamped_backup_is_made(tmp_path):
+def test_claude_symlink_to_target_at_backup_path_is_refused_even_with_force(tmp_path):
     md = tmp_path / ".claude" / "CLAUDE.md"
     md.parent.mkdir()
     md.write_bytes(b"my own instructions\n")
     bak = tmp_path / ".claude" / "CLAUDE.md.pre-engram"
     os.symlink(md, bak)
     r = _run(tmp_path, args=["--force"])
-    assert r.returncode == 0, r.stdout + r.stderr
+    _assert_refused_for_obstructed_backup(tmp_path, r, md, bak, b"my own instructions\n")
     assert bak.is_symlink()
-    assert [p.read_bytes() for p in _stamped_backups(md.parent, "CLAUDE.md")] == [b"my own instructions\n"]
-    assert md.read_bytes() != b"my own instructions\n"
 
 
 # ------------------------------------------------------- shared helper (static)
@@ -597,17 +603,14 @@ def test_codex_directory_at_backup_path_is_left_alone_and_a_stamped_backup_is_ma
     assert [p.read_bytes() for p in _stamped_backups(cfg.parent, "config.toml")] == [b'model = "x"\n']
 
 
-def test_codex_hard_link_at_backup_path_is_kept_and_a_stamped_backup_is_made(tmp_path):
+def test_codex_hard_link_at_backup_path_is_refused_even_with_force(tmp_path):
     cfg = tmp_path / ".codex" / "config.toml"
     cfg.parent.mkdir()
     cfg.write_bytes(b'model = "x"\n')
     bak = tmp_path / ".codex" / "config.toml.pre-engram"
     os.link(cfg, bak)
     r = _run(tmp_path, target="codex", args=["--force"])
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert bak.read_bytes() == b'model = "x"\n'
-    assert [p.read_bytes() for p in _stamped_backups(cfg.parent, "config.toml")] == [b'model = "x"\n']
-    assert cfg.read_bytes() != b'model = "x"\n'
+    _assert_refused_for_obstructed_backup(tmp_path, r, cfg, bak, b'model = "x"\n')
 
 
 # --------------------------------------------------------------- install.sh

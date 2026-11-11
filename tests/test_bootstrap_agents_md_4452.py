@@ -184,18 +184,20 @@ def test_agents_dangling_symlink_refused_even_with_force(tmp_path):
     assert not _db(tmp_path).exists()
 
 
-def test_agents_hard_link_at_backup_path_gets_a_stamped_backup_and_the_link_is_kept(tmp_path):
-    """.pre-engram is used only when absent: a hard link there is left as it is, the current
-    file gets a stamped backup, and the replace is atomic so the linked bytes stay original."""
+def test_agents_hard_link_at_backup_path_is_refused_even_with_force(tmp_path):
+    """`AGENTS.md.pre-engram` that is the same file as AGENTS.md would be overwritten with it:
+    refuse, write nothing, say to move that backup name aside."""
     md = _mk(tmp_path)
     bak = tmp_path / ".codex" / "AGENTS.md.pre-engram"
     os.link(md, bak)
     r = _codex(tmp_path, ["--force"])
-    assert r.returncode == 0, r.stdout + r.stderr
-    stamped = [p for p in bak.parent.iterdir() if p.name.startswith("AGENTS.md.engram-backup.")]
-    assert [p.read_bytes() for p in stamped] == [b"my own codex conventions\n"]
-    assert bak.read_bytes() == b"my own codex conventions\n"
-    assert md.read_bytes() != b"my own codex conventions\n"
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert out.count("REFUSED") == 1 and str(bak) in out and "same file" in out
+    assert "Move that backup name aside" in out
+    assert [p for p in bak.parent.iterdir() if p.name.startswith("AGENTS.md.engram-backup.")] == []
+    assert md.read_bytes() == b"my own codex conventions\n" and bak.read_bytes() == b"my own codex conventions\n"
+    assert not _db(tmp_path).exists()
 
 
 def test_agents_force_dangling_config_refuses_before_any_backup(tmp_path):
