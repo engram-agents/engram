@@ -68,7 +68,7 @@ _PAGE_SQL = (
 if not _PAGE_SQL.endswith(f" LIMIT {PAGE_ROWS}"):
     raise RuntimeError("PAGE_ROWS and the LIMIT literal in the page statement disagree: change both, "
                        "and re-register the template (tools/engramd_read_scan.py)")
-OWNER_FLAG_KEY = "model_switch_read_reads_via_owner"  # names the spec in messages only; no flag exists (see open_graph)
+OWNER_SPEC_NAME = "model_switch_read_owner_only"  # names the spec in messages only; there is NO flag (see open_graph)
 
 
 class Refusal(Exception):
@@ -90,7 +90,7 @@ def default_db() -> Path:
 
 def _spec() -> "owner_read.OwnerReadSpec":
     return owner_read.OwnerReadSpec(
-        flag_key=OWNER_FLAG_KEY,
+        flag_key=OWNER_SPEC_NAME,
         error_cls=OwnerReadError,
         home=owner_read.engram_home(),
         never_empty="Not drawing from an empty or partial graph.",
