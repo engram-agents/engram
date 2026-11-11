@@ -491,6 +491,7 @@ _STUB_TOOL = (
     "def decide(e,f,r,a,am):\n"
     "    if e=='pull_request' and f: return Outcome(FAILURE,STATUS_NOT_SCANNED,FORK_REASON)\n"
     "    if e not in TRUSTED_EVENTS: return Outcome(FAILURE,STATUS_SCANNED,'x')\n"
+    "    if not (r and a and am): return Outcome(FAILURE,STATUS_SCANNED,'not attested')\n"
     "    return Outcome(SUCCESS,STATUS_SCANNED,'ok')\n"
 )
 
@@ -714,22 +715,26 @@ def _run_with_attestation(gate_repo, tmp_path, *, count, sha):
 
 
 @pytest.mark.parametrize(
-    "count, sha, warned",
+    "count, sha, warned, verdict",
     [
-        pytest.param(5, _ROSTER_ONE_PATTERN_SHA, True, id="hash-match-count-differs"),
-        pytest.param(5, "0" * 64, False, id="hash-mismatch-count-differs"),
-        pytest.param(1, _ROSTER_ONE_PATTERN_SHA, False, id="hash-match-count-equal"),
-        pytest.param(1, "0" * 64, False, id="hash-mismatch-count-equal"),
-        pytest.param(None, None, False, id="attestation-absent"),
+        pytest.param(5, _ROSTER_ONE_PATTERN_SHA, True, "success", id="hash-match-count-differs"),
+        pytest.param(5, "0" * 64, False, "failure", id="hash-mismatch-count-differs"),
+        pytest.param(1, _ROSTER_ONE_PATTERN_SHA, False, "success", id="hash-match-count-equal"),
+        pytest.param(1, "0" * 64, False, "failure", id="hash-mismatch-count-equal"),
+        pytest.param(None, None, False, "failure", id="attestation-absent"),
     ],
 )
-def test_count_warning_only_when_the_hash_matched(gate_repo, tmp_path, count, sha, warned):
+def test_count_warning_only_when_the_hash_matched(
+    gate_repo, tmp_path, count, sha, warned, verdict
+):
     out = _run_with_attestation(gate_repo, tmp_path, count=count, sha=sha)
     assert (_COUNT_WARNING in out) is warned, out
     if warned:
         assert "records 5 pattern(s) but the roster has 1" in out
-    # The verdict line is unaffected either way.
-    assert "name-leak gate: success" in out, out
+    # The stub decide() mirrors the real one on the attestation-matches input,
+    # so the verdict line can contradict a stray "sha256 still matched" warning.
+    assert f"name-leak gate: {verdict}" in out, out
+    assert f"name-leak gate: {'failure' if verdict == 'success' else 'success'}" not in out, out
 
 
 
