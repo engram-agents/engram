@@ -209,6 +209,11 @@ Because the two rulesets are separate, the release team's exemption applies to
 the update rule only. It does not relax the rule against non-fast-forward
 pushes, so a release-team account cannot force-push `main` either.
 
+The release team is an organization team (`release-bypass`). Adding a member
+to it is an organization-owner action, and that is the actual protection:
+whoever is on that team can move `main`. Read its membership as part of the
+check below.
+
 Before the first release cut by this procedure, read both rulesets with an
 admin account (`gh api repos/engram-agents/engram/rulesets/<id>`) and confirm
 that the release seat's account reads `current_user_can_bypass: always` on the
