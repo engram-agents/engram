@@ -14,13 +14,16 @@ Patterns flagged (committed structural patterns):
   - Main repo path: kg_protocol_for_ai
 
 Absolute home paths (default-deny, every git-tracked text file):
-  - Any path of the form /home/<name>/ or /Users/<name>/ whose <name> is not
-    in ALLOWED_HOME_SEGMENTS is a finding.  Public text carries no host paths,
+  - Any path of the form /home/<name> or /Users/<name> (the name is one whole
+    segment, ended by any non-segment character or end of string; Users is
+    case-insensitive) whose <name> is not in ALLOWED_HOME_SEGMENTS is a
+    finding.  Public text carries no host paths,
     usernames or seat folder names.  The check is generated from the class,
     not from a list of known names: whole path segments only, so an allowed
     name never allows a longer name that merely starts with it.  It reads
     every tracked file whatever its extension (extensionless executables
     included) and skips only binary files and the declared exemptions.
+    Known limit: JSON-escaped paths (backslash-escaped slashes) are not matched.
 
 Personal-name and user-specific patterns are loaded at runtime from
 .scan-leaks-local.json in the repo root (gitignored). If this file is
@@ -81,16 +84,13 @@ def _load_home_path_class():
 _hpc = _load_home_path_class()
 HOME_PATH_RE = _hpc.HOME_PATH_RE
 ALLOWED_HOME_SEGMENTS = _hpc.ALLOWED_HOME_SEGMENTS
+_DISALLOWED_HOME_PATH_RE = _hpc.disallowed_home_path_regex()
 
-# Files exempt from the home-path check, by repo-relative path, each with a reason.
-HOME_PATH_EXEMPT_FILES = {
-    "src/engram/tools/scan-leaks.py":
-        "defines the pattern and the allowed set; contains them by design",
-    "tests/test_scan_leaks.py":
-        "plants home-path strings to prove the check fires; contains them by design",
-    "tests/test_engine_phase3.py":
-        "plants home-path leaks to prove the foreign-bundle scan fires; contains them by design",
-}
+# Files exempt from the home-path check, by repo-relative path, each with a
+# reason.  Deliberately EMPTY: the scanner, its definition module and every test
+# plant their paths in forms the class does not match.  Keep the mechanism: a
+# future exemption is a declared "path: reason" entry here, never a directory.
+HOME_PATH_EXEMPT_FILES: dict[str, str] = {}
 # LICENSE: copyright lines are intentional.
 # .scan-leaks-local.json: the local personal-name roster must be skipped —
 #   it contains the exact patterns the scanner is looking for (by design).
@@ -232,8 +232,10 @@ def scan_home_paths(root: Path, use_git: bool = True) -> list[tuple[str, int, st
 
     Domain: every git-tracked file (``git ls-files``), whatever its extension,
     including extensionless executables.  A file whose first 8 KiB contains a
-    NUL byte is binary and skipped; so is a file that does not decode as UTF-8
-    and any file in HOME_PATH_EXEMPT_FILES.  Falls back to an os.walk of root
+    NUL byte is binary and skipped, as is any file in HOME_PATH_EXEMPT_FILES.
+    Text is decoded as UTF-8 with errors replaced, so a non-UTF-8 file is still
+    scanned.  The verdict (allowed or not) is made inside the shared regex.
+    Falls back to an os.walk of root
     when git is unavailable (scanning too much beats scanning nothing).
     """
     tracked = _git_tracked_files(root) if use_git else None
@@ -254,14 +256,10 @@ def scan_home_paths(root: Path, use_git: bool = True) -> list[tuple[str, int, st
             continue
         if b"\x00" in data[:8192]:
             continue
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
+        text = data.decode("utf-8", errors="replace")
         for i, line in enumerate(text.splitlines(), 1):
-            for m in HOME_PATH_RE.finditer(line):
-                if m.group(1) not in ALLOWED_HOME_SEGMENTS:
-                    findings.append((rel, i, m.group(1)))
+            for m in _DISALLOWED_HOME_PATH_RE.finditer(line):
+                findings.append((rel, i, m.group(1).rstrip(".")))
     return findings
 
 

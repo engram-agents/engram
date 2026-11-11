@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import pytest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -586,3 +587,92 @@ def test_real_tree_has_no_home_path_findings():
     """The whole-tree gate: the committed tree carries no real home path."""
     findings = _mod.scan_home_paths(REPO_ROOT)
     assert findings == [], "\n".join(f"{f}:{n} {seg}" for f, n, seg in findings)
+
+
+# ---------------------------------------------------------------------------
+# Test 13: segment-boundary forms (no trailing slash needed), exemption scope,
+# non-UTF-8 input.  Each form is a finding: the class is the WHOLE segment
+# after /home/ or /Users/, ended by any non-segment character or end of string.
+# ---------------------------------------------------------------------------
+
+def _bare(seg: str, base: str = "home") -> str:
+    # no trailing slash; assembled so this file's own text carries no path
+    return "/" + base + "/" + seg
+
+
+_BOUNDARY_FORMS = {
+    "end_of_string": lambda: "cd " + _bare("zed"),
+    "double_quoted": lambda: 'p = "' + _bare("zed") + '"',
+    "before_colon": lambda: "PATH=" + _bare("zed") + ":/bin",
+    "sentence_end_dot": lambda: "see " + _bare("zed") + ".",
+    "users_no_slash": lambda: "cd " + _bare("zed", "Users"),
+    "users_lowercase": lambda: "cd " + _bare("zed", "users") + "/x",
+    "digit_start": lambda: "cd " + _bare("9zed") + "/x",
+    "underscore_start": lambda: "cd " + _bare("_zed") + "/x",
+}
+
+
+@pytest.mark.parametrize("form", sorted(_BOUNDARY_FORMS))
+def test_boundary_form_is_a_finding(tmp_path, form):
+    _commit_files(tmp_path, {"doc.md": _BOUNDARY_FORMS[form]() + "\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, (form, r.stdout + r.stderr)
+    assert "doc.md:1" in r.stderr
+
+
+def test_sentence_end_dot_is_stripped_before_the_allowed_check(tmp_path):
+    _commit_files(tmp_path, {
+        "a.md": "see " + _bare("someone") + ". and " + _bare("Shared", "Users") + ",\n",
+    })
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (tmp_path / "b.md").write_text("see " + _bare("zed") + ".\n")
+    subprocess.run(["git", "add", "b.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "more"], cwd=tmp_path, check=True)
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1
+    assert "segment: zed" in r.stderr and "segment: zed." not in r.stderr
+
+
+def test_whole_segment_without_trailing_slash_is_not_prefix_allowed(tmp_path):
+    _commit_files(tmp_path, {"a.md": "cd " + _bare("someone2") + "\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "someone2" in r.stderr
+
+
+def test_real_looking_name_in_an_ordinary_tests_file_is_a_finding(tmp_path):
+    """Pins the exemption scope: only declared files are exempt, never a directory."""
+    _commit_files(tmp_path, {"tests/test_ordinary.py": 'p = "' + _home("zed") + '"\n'})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "tests/test_ordinary.py:1" in r.stderr
+
+
+def test_non_utf8_file_is_still_scanned(tmp_path):
+    payload = b"caf\xe9 " + _home("zed").encode() + b"x\n"
+    _commit_files(tmp_path, {"latin1.md": payload})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "latin1.md:1" in r.stderr
+
+
+def test_no_file_is_exempt_from_the_home_path_check():
+    """Pins the exemption scope: nothing is exempt today, and any entry must carry a reason."""
+    ex = _mod.HOME_PATH_EXEMPT_FILES
+    assert ex == {}, f"a new exemption needs review: {sorted(ex)}"
+    assert all(why.strip() for why in ex.values())
+
+
+def test_seat_home_convention_prefixes_are_clean_but_a_real_name_is_not(tmp_path):
+    """/home/agent-* and /home/agent-$tag are the seat-home convention (a prefix
+    before a glob or placeholder, declared in the allowed set); agent-<name> is a name."""
+    _commit_files(tmp_path, {
+        "a.sh": "for h in " + _bare("agent-") + "*; do :; done\ncd " + _bare("agent-") + "$tag/x\n",
+    })
+    assert _run_scan(tmp_path).returncode == 0
+    (tmp_path / "b.sh").write_text("cd " + _bare("agent-zed") + "\n")
+    subprocess.run(["git", "add", "b.sh"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "name"], cwd=tmp_path, check=True)
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1 and "agent-zed" in r.stderr
