@@ -244,7 +244,7 @@ What each edit needs (the OPPOSITE of the official-marketplace model):
 | MCP server (`server.py`) | the path is the source but the process is from session start: `/mcp` reconnect or restart |
 | `hooks.json` registration | `/reload-plugins` re-reads it (measured for an addition and a removal); a full restart only if a registration demonstrably does not take effect |
 
-**To know which code is actually running, instrument the live artifact — never
+**To know which code is running, instrument the live artifact — never
 infer from a proxy** (a version string, `installed_plugins.json`, or a bash-env
 test will mislead). Add a stderr/file sentinel to each candidate hook copy, fire
 a REAL prompt, and read which copy logged; `CLAUDE_PLUGIN_ROOT` read from
@@ -322,7 +322,7 @@ drift, the doc is the side that moves.
 
 **Re-check after ANY post-approval commit.** A moved tip (e.g. folding a late
 reviewer nit after the approve) re-triggers CI and can fail on the new commit —
-CI-green must hold on the tip the maintainer would actually merge.
+CI-green must hold on the tip the maintainer would merge.
 
 **The merge seat's own test run** is on a scratch merge of the base tip plus the PR
 head, never the head alone; a scratch-merge failure counts against the PR only if
@@ -401,7 +401,7 @@ enters the maintainer's merge queue:
 **The merge gate itself**, operationalizing Lei's same ruling: a non-author
 peer APPROVE of the PR's current head (what counts: "Approvals after a layer"
 below), plus CI green on that same head. A new commit after approval needs a **fresh** peer review
-and approval — the peer simply looks again (the `dev` ruleset already
+and approval — the peer looks again (the `dev` ruleset already
 enforces this mechanically: dismiss-on-push + last-push approval) — never a
 fairy re-check or a diff-equivalence argument standing in for it. The merge
 seat still checks the approval against the head directly rather than
@@ -411,8 +411,7 @@ force-push, explicitly NOT gh-stack's auto-rebase — see "Stacked PRs" below
 for the measurement).
 
 Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
-(merge)**. Symmetric — each agent reviews the other's PRs and has its own
-reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
+(merge)**. Symmetric — each agent reviews the other's PRs. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
 
 <!-- BEGIN team-practice: which-colleague-takes-the-seat (generated -- edit team-practice repo's TEAM-PRACTICE.md, not here; tools/sync_team_practice.py renders it) -->
@@ -693,7 +692,7 @@ the surface that carries it (Lei, 2026-08-29). Install is **per-user**:
   syncs/rebases cannot re-affirm the tip; a teammate re-approves. Whether an
   approval is dismissed on push depends on the base branch's
   `dismiss_stale_reviews_on_push` — **necessary on the evidence, not
-  demonstrably sufficient**, so it predicts nothing. After every layer, read the approval back off `pulls/<N>/reviews`: it
+  demonstrably sufficient**, so do not treat it as predicting the outcome. After every layer, read the approval back off `pulls/<N>/reviews`: it
   counts only if its `commit_id` is the PR's current `headRefOid` AND its
   `submitted_at` is not earlier than that commit's committer date.
   **`commit_id == headRefOid` alone is never sufficient**: GitHub can re-point live
@@ -703,7 +702,7 @@ the surface that carries it (Lei, 2026-08-29). Install is **per-user**:
 - **Read branch protection via `rules/branches/<b>`, never
   `branches/<b>/protection`.** The classic endpoint answers by caller permission
   (admin: "Branch not protected"; non-admin: "Not Found"; unauthenticated: 401)
-  and gives the same answer for a ruleset-protected and an unprotected branch.
+  and gives the same answer for a ruleset-protected and an unprotected branch, so it discriminates nothing.
 
 *Evidence for every rule above: engram's `docs/internal/GH-STACK.md`.*
 
@@ -731,7 +730,7 @@ open PRs guards against your own stale branch from a prior session, not just a
 counterpart's work. All three exist because **a list read and a thread read are
 different operations, and only the list read scales**: nobody opens ten comment
 threads to reconstruct status, so status living only in comments is invisible at the
-altitude people actually work at.
+altitude people work at.
 
 **1. Before starting: `gh pr list --state open`, before the first commit of any new
 task.** A read of the actual list, drafts included. If an open PR already does part of
@@ -789,7 +788,7 @@ close, not another comment.
 Open a PR-baton **at PR creation**, for **every** PR — bunch-driven OR standalone:
 `baton init PR-N --title "<short>" --participants <self>,<counterpart>,<maintainer> --turn <self> --status in-progress --colleague <counterpart> --repo <owner>/<repo>`.
 Use `--colleague <name>` to identify the expected colleague reviewer — this adds them to participants (dedup) and enables the colleague gate: `baton flip PR-N <maintainer>` will be rejected if no non-author APPROVED review exists. Without `--colleague` (and without a third participant), the gate falls back to warn-only (a baton with no colleague).
-Then flip it as the turn actually passes along the review pipeline:
+Then flip it as the turn passes along the review pipeline:
 
 - reviewer-fairy converged → `baton flip PR-N <counterpart> "fairy-converged; colleague please"`
 - counterpart **comments / requests changes** → it flips back to you (`flip PR-N <self>`);
@@ -827,7 +826,7 @@ in `docs/baton-protocol.md`. The maintainer merges from that phase signal — ne
 that merely *looks* parked. A PR with **no baton**, or a baton **not yet at `phase: merge`**,
 is **not** ready, no matter how long it has sat. Symmetrically: never leave a
 colleague-converged PR without running the advance — otherwise its readiness is
-invisible, and a colleague verdict that is actually "COMMENTED with considerations" (not an
+invisible, and a colleague verdict that is "COMMENTED with considerations" (not an
 approval) can be misread as ready. **Fallback — read `turn` as before (turn = the
 maintainer, reached via an explicit colleague approval or, with no counterpart, your own converged
 second-layer pass) — in these known cases (a list of what has been found, not a proof that
@@ -981,10 +980,9 @@ files / functions).
 
 ### With no counterpart
 
-No counterpart → no claim contention. The Project layer remains useful as an
-organizing structure for defect-classes, but the `claim` / `release` ritual is
-moot. PR-layer baton still useful as a per-PR cursor through fairy →
-maintainer.
+No counterpart → no claim contention. The Project layer still organizes
+defect-classes, but the `claim` / `release` ritual is moot. The PR-layer baton
+still serves as a per-PR cursor through fairy → maintainer.
 
 ### Existing Projects vs new
 
@@ -1007,9 +1005,8 @@ maintainer.
 - Skill (HOW details): `engram-baton`.
 - Companion letter skill (verdicts + discoveries channel): `engram-letter`.
 
-**Why project-local** (not user-level): same reasoning as the PR review
-convention above — agent coordination tooling is project-specific, not
-identity-level discipline.
+**Why project-local** (not user-level): as in the PR review
+convention above, agent coordination tooling is project-specific.
 
 ## PR — issue closure
 
@@ -1143,7 +1140,7 @@ This triple check is mechanical; checking is cheap; the cost of missing it is
 either a stale-issue backlog (missed auto-close) or a silently-closed-wrong-issue
 (trap firing).
 
-**THE GATE, at the merge seat, after merging: list which issues actually
+**THE GATE, at the merge seat, after merging: list which issues
 closed and confirm each one is FULLY done.** A close link's existence is not
 the issue's completion, and this step is mechanism-independent — it catches
 body links, commit links, and whatever close path ships next. A regex miss
