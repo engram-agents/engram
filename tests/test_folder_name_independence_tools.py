@@ -1,12 +1,14 @@
-"""Folder-name independence, tools (S6, S7, S8). REVISION 2: `engram` first, then `engram-alpha`.
+"""Checkout folder name, tools: `engram` is the default, `engram-alpha` stays accepted.
 
-  S6 tools/rc-upgrade-verify.py REPO: ENGRAM_REPO overrides; else the first existing of
-     ~/engram, ~/engram-alpha, ~/src/engram, ~/src/engram-alpha, ~/GitHub/engram, ~/GitHub/engram-alpha.
-     None exists -> exit with the "could not locate the engram checkout" text, Tried: list led by ~/engram.
-  S7 agent-bootstrap clone destination: an existing $USER_HOME/engram or $USER_HOME/engram-alpha is
-     resolved (engram first); a NEW seat's clone is created as $USER_HOME/engram.
-  S8 agent-bootstrap shared source default: $SHARED_ROOT/engram if a directory, else
-     $SHARED_ROOT/engram-alpha, else empty. ENGRAM_ALPHA_SOURCE still overrides.
+  rc-upgrade-verify REPO: ENGRAM_REPO overrides; else the first existing of ~/engram, ~/engram-alpha,
+     ~/src/engram, ~/src/engram-alpha, ~/GitHub/engram, ~/GitHub/engram-alpha. None exists -> exit with
+     "could not locate the engram checkout", the Tried: list led by ~/engram.
+  agent-bootstrap clone destination: an existing $USER_HOME/engram or $USER_HOME/engram-alpha is resolved
+     (engram first); a NEW seat's clone is created as $USER_HOME/engram; the closing "ENGRAM installed ...
+     from <path>" line names the clone actually used.
+  agent-bootstrap shared source default: $SHARED_ROOT/engram if a directory, else $SHARED_ROOT/engram-alpha,
+     else empty; ENGRAM_ALPHA_SOURCE still overrides. When both exist with different real paths, one
+     `WARNING:` line on stderr names both and says engram is used.
 """
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ REPO = Path(__file__).resolve().parent.parent
 RC = REPO / "tools" / "rc-upgrade-verify.py"
 
 
-# ---- S6 ---------------------------------------------------------------------
+# ---- rc-upgrade-verify ---------------------------------------------------------------------
 
 _RC_DRIVER = r"""
 import os, sys
@@ -101,7 +103,7 @@ def test_S6_neither_fails_naming_engram_default(tmp_path):
     assert out.index(f"{home}/engram\n") < out.index(f"{home}/engram-alpha")
 
 
-# ---- S7 ---------------------------------------------------------------------
+# ---- clone destination ---------------------------------------------------------------------
 
 def _clone_with(tmp_path, pre_dirs):
     env, home = make_env(tmp_path)
@@ -140,7 +142,7 @@ def test_S7_install_call_and_note_name_the_resolved_clone(tmp_path):
     assert str(home / "engram" / "tools" / "install.sh") in call
 
 
-# ---- S8 ---------------------------------------------------------------------
+# ---- shared source default ---------------------------------------------------------------------
 
 def _default_alpha_source(tmp_path, shared_dirs, env_override=None):
     m = re.search(r'(if \[\[ -z "\$ALPHA_SOURCE" \]\]; then\n.*?\nfi\n)', SRC, re.S)
@@ -182,3 +184,70 @@ def test_S8_env_override_wins(tmp_path):
     o.mkdir()
     got, _ = _default_alpha_source(tmp_path, ["engram"], env_override=str(o))
     assert got == str(o)
+
+
+# ---- closing banner names the clone actually used ----------------------------------------------------
+
+def _banner_after_clone(tmp_path, pre_dirs):
+    env, home = make_env(tmp_path)
+    for d in pre_dirs:
+        (home / d).mkdir()
+    src = make_source(tmp_path, tags={"v0.1.0": "c2"})
+    body = install_body(home, src) + "\nNAME=nb; RUNTIME=claude; HOME_MODE=0750; NO_INSTALL=0; ab_print_next_steps"
+    proc = run_lib(env, body)
+    assert _rc(proc) == 0, proc.stdout + proc.stderr
+    line = [ln for ln in proc.stdout.splitlines() if ln.startswith("ENGRAM installed by tools/install.sh from ")]
+    assert len(line) == 1, proc.stdout
+    return home, line[0]
+
+
+def test_banner_names_the_reused_old_name_clone(tmp_path):
+    home, line = _banner_after_clone(tmp_path, ["engram-alpha"])
+    assert f"from {home}/engram-alpha at tag" in line
+
+
+def test_banner_names_the_engram_clone(tmp_path):
+    home, line = _banner_after_clone(tmp_path, [])
+    assert f"from {home}/engram at tag" in line
+
+
+# ---- both shared sources exist and differ: one WARNING, engram still chosen --------------------------
+
+def _source_with_stderr(tmp_path, setup):
+    m = re.search(r'(if \[\[ -z "\$ALPHA_SOURCE" \]\]; then\n.*?\nfi\n)', SRC, re.S)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    setup(shared)
+    script = f'SHARED_ROOT="{shared}"\nALPHA_SOURCE=""\n{m.group(1)}echo "AS=[$ALPHA_SOURCE]"\n'
+    p = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True,
+                       env={"PATH": os.environ["PATH"]}, timeout=30)
+    return re.search(r"^AS=\[(.*)\]$", p.stdout, re.M).group(1), p.stderr, shared
+
+
+def test_shared_both_differ_warns_once_and_picks_engram(tmp_path):
+    def setup(sh):
+        (sh / "engram").mkdir()
+        (sh / "engram-alpha").mkdir()
+    got, err, shared = _source_with_stderr(tmp_path, setup)
+    assert got == str(shared / "engram")
+    warns = [ln for ln in err.splitlines() if ln.startswith("WARNING:")]
+    assert len(warns) == 1, err
+    assert str(shared / "engram") in warns[0] and str(shared / "engram-alpha") in warns[0]
+
+
+def test_shared_both_same_realpath_no_warning(tmp_path):
+    def setup(sh):
+        (sh / "engram").mkdir()
+        os.symlink(sh / "engram", sh / "engram-alpha")
+    got, err, shared = _source_with_stderr(tmp_path, setup)
+    assert got == str(shared / "engram")
+    assert "WARNING" not in err
+
+
+def test_shared_only_one_no_warning(tmp_path):
+    for only in ("engram", "engram-alpha"):
+        t = tmp_path / only
+        t.mkdir()
+        got, err, shared = _source_with_stderr(t, lambda sh, o=only: (sh / o).mkdir())
+        assert got == str(shared / only)
+        assert "WARNING" not in err

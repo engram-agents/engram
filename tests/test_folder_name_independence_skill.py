@@ -1,11 +1,10 @@
-"""Folder-name independence, engram-sleep SKILL.md (S4, S5): a TEXT contract (pins wording, not agent behaviour).
+"""engram-sleep SKILL.md: wording of the checkout folder in the commands an agent runs (a text check).
 
-REVISION 2: the default checkout name is `engram`; `engram-alpha` is the accepted old name.
-  C4.1 the end-of-day `for repo in ...` loop lists both `~/engram` and `~/engram-alpha`, engram first.
-  C5.1 the "Walk the day's commit log" command is a loop over both candidates (`~/engram`, `~/engram-alpha`),
-       so a seat holding both walks both.
-  C5.2 no `git -C ~/engram-alpha` occurrence without `~/engram` (the other name) on the same line.
-  C5.3 the dream-master placeholder is name-neutral: no `<engram-alpha-repo-path>`; `<engram-repo-path>`.
+`engram` is the default checkout name; `engram-alpha` is the accepted old name.
+  - the end-of-day `for repo in ...` loop lists both `~/engram` and `~/engram-alpha`, engram first;
+  - the "Walk the day's commit log" command is a loop over both candidates, so a seat holding both walks both;
+  - no `git -C ~/engram-alpha` occurrence without `~/engram` (the other name) on the same line;
+  - the dream-master placeholder is name-neutral: no `<engram-alpha-repo-path>`; `<engram-repo-path>`.
 """
 from __future__ import annotations
 

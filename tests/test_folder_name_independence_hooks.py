@@ -1,18 +1,16 @@
-"""Folder-name independence, hook/tool fallbacks (S3, S9, S10, S11, S12).
+"""Hook and tool fallbacks: `engram` is tried first, then `engram-alpha`; neither -> the `engram` default.
 
-Contract (REVISION 2: `engram` first, then `engram-alpha`; neither -> the `engram` default):
-  S3  session-start hook PIECE_C_REPOS default (ENGRAM_PIECE_C_REPOS unset)
+  Piece C default extras of the session-start hook (ENGRAM_PIECE_C_REPOS unset); test names keep C3.n:
     C3.1 env override set and non-empty: unchanged (wins)
     C3.2 only ~/engram a directory      -> [~/engram, ENGRAM_HOME]
     C3.3 only ~/engram-alpha            -> [~/engram-alpha, ENGRAM_HOME]
     C3.4 both directories               -> engram first, alpha second, ENGRAM_HOME last;
-                                           same realpath (symlink) -> listed once (engram name)
+                                           same real path (symlink) -> listed once (engram name)
     C3.5 neither                        -> [ENGRAM_HOME]
-  S9  _hooklib.resolve_runtime_dir last-ditch (dir) and resolve_own_server_py_path (server.py)
-  S10 session-start hook _resolve_mcp_server_path
-  S11 lesson-tripwire hook _resolve_runtime_dir last-ditch (<repo>/src/engram)
-  S12 supervision_probe.resolve_own_server_py_path
-      each: first EXISTING of [engram, engram-alpha] candidate; neither -> the `engram` default.
+  Last-rung fallbacks: _hooklib.resolve_runtime_dir and resolve_own_server_py_path, the session-start hook's
+  _resolve_mcp_server_path, the lesson-tripwire hook's _resolve_runtime_dir, supervision_probe's
+  resolve_own_server_py_path: first existing of [engram, engram-alpha] candidate; neither -> `engram`.
+  (The extra rule for a working folder inside one candidate lives in test_folder_name_independence_cwd_c13.py.)
 """
 from __future__ import annotations
 

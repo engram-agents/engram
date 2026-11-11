@@ -1,18 +1,17 @@
-"""Folder-name independence, launchers (S1, S2): the checkout may be `engram` or `engram-alpha`.
+"""Launch cwd of the two launchers: the checkout may be `engram` (default) or `engram-alpha` (accepted).
 
-Contract (REVISION 2: `engram` is the default and is tried FIRST; `engram-alpha` stays accepted):
-  S1 agent-session-launch.sh launch cwd
-    C1.1 only $HOME/engram exists            -> cd $HOME/engram, arm names `$HOME/engram`
-    C1.2 only $HOME/engram-alpha exists      -> unchanged result and text
-    C1.3 both exist, both trusted            -> engram wins
-    C1.4 engram untrusted, alpha trusted     -> alpha (trust beats order); and the mirror case -> engram
-    C1.5 neither exists                      -> umwelt, then $HOME, as before
-    C1.6 ~/.engram/boot-cwd still wins over every candidate
-  S2 macos/clio-wake-launch.sh launch cwd
-    C2.1 only $HOME/GitHub/engram exists     -> that
-    C2.2 only $HOME/GitHub/engram-alpha      -> unchanged
-    C2.3 both exist                          -> engram
-    C2.4 neither                             -> $HOME; boot-cwd override unchanged
+Linux launcher (agent-session-launch.sh); test names keep the case numbers:
+  C1.1 only $HOME/engram exists            -> cd $HOME/engram, arm names `$HOME/engram`
+  C1.2 only $HOME/engram-alpha exists      -> unchanged result and text
+  C1.3 both exist, both trusted            -> engram wins
+  C1.4 engram untrusted, alpha trusted     -> alpha (trust beats order); and the mirror case -> engram
+  C1.5 neither exists                      -> umwelt, then $HOME, as before
+  C1.6 ~/.engram/boot-cwd still wins over every candidate
+macOS launcher (clio-wake-launch.sh):
+  C2.1 only $HOME/GitHub/engram exists     -> that
+  C2.2 only $HOME/GitHub/engram-alpha      -> unchanged
+  C2.3 both exist                          -> engram
+  C2.4 neither                             -> $HOME; boot-cwd override unchanged
 """
 from __future__ import annotations
 

@@ -1,16 +1,20 @@
-"""Folder-name independence, REVISION 3 / contract C13: the cwd guard at SINGLE-PICK sites.
+"""Single-pick sites: prefer the checkout folder the process is working inside.
 
-At a single-pick site with no trust tie-break, if the process's own working folder is inside one of the two
-candidates (realpath equal or under; a linked worktree under ~/engram-alpha/.claude/worktrees/<id> is inside
-~/engram-alpha), pick THAT candidate; otherwise first existing of [engram, engram-alpha].
+When both `~/engram` and `~/engram-alpha` exist and a site has no trust check, it picks the candidate the
+process's own working folder is inside (real path equal or under it, so a linked worktree under
+`~/engram-alpha/.claude/worktrees/<id>` is inside `~/engram-alpha`); otherwise the first existing of
+`engram`, `engram-alpha`. Cases (test names keep the C-numbers):
   C13.1 cwd inside ~/engram-alpha, both exist -> ~/engram-alpha
   C13.2 cwd inside ~/engram, both exist       -> ~/engram
   C13.3 cwd elsewhere, both exist             -> ~/engram (the default)
   C13.4 only one exists                       -> that one, whatever the cwd
+Also here: when no candidate holds the target file, fall back to the sole existing candidate directory
+(cwd-first), so an old-name-only seat keeps its old value; and a candidate that is a symlink to a folder
+elsewhere is matched by real path.
 Sites: _hooklib.resolve_runtime_dir last rung, _hooklib.resolve_own_server_py_path, session-start hook
 _resolve_mcp_server_path, lesson-tripwire hook _resolve_runtime_dir last rung,
 supervision_probe.resolve_own_server_py_path, tools/rc-upgrade-verify.py REPO.
-NOT here: launchers S1/S2 (trust tie-break), S3 (list-all), S7/S8 (agent-bootstrap).
+Not here: the launchers (they have a trust tie-break), the Piece C extras (list-all), agent-bootstrap.
 """
 from __future__ import annotations
 
@@ -51,7 +55,7 @@ def _expected(site, home, name):
     return str(home / name / "server.py")
 
 
-def _run(site, tmp_path, monkeypatch, names, cwd):
+def _run(site, tmp_path, monkeypatch, names, cwd, extra_dirs=(), alpha_symlink=False):
     """cwd: path relative to HOME (created if missing) the process sits in while the site resolves."""
     home = tmp_path / "home"
     home.mkdir()
@@ -61,6 +65,14 @@ def _run(site, tmp_path, monkeypatch, names, cwd):
     for f in files:
         (home / f).parent.mkdir(parents=True, exist_ok=True)
         (home / f).write_text("# fixture\n")
+    for d in extra_dirs:
+        (home / d).mkdir(parents=True, exist_ok=True)
+    if alpha_symlink:
+        # ~/engram-alpha becomes a symlink to a real folder elsewhere in the fake HOME
+        (home / "elsewhere").mkdir()
+        import shutil
+        shutil.move(str(home / "engram-alpha"), str(home / "elsewhere" / "alpha-real"))
+        os.symlink(home / "elsewhere" / "alpha-real", home / "engram-alpha")
     (home / cwd).mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
     eh = tmp_path / "eh"
@@ -151,13 +163,48 @@ def test_C13_4_only_one_exists_whatever_the_cwd(site, only, tmp_path, monkeypatc
     assert got == _expected(site, home, only)
 
 
-@pytest.mark.parametrize("site", SITES)
-def test_C13_prefix_sibling_is_not_inside(site, tmp_path, monkeypatch):
-    # "engram-alpha-old" shares the string prefix with "engram-alpha" but is not inside it
-    home, got = _run(site, tmp_path, monkeypatch, BOTH, "engram-alpha-old/sub")
-    assert got == _expected(site, home, "engram")
+# The separator property (`engram` must not prefix-match a cwd under `engram-alpha/...`) is pinned by
+# test_C13_1_cwd_inside_alpha_picks_alpha and test_C13_3_cwd_is_the_checkout_root_itself: a prefix match
+# without the separator would pick `engram` there and turn those red.
 
 
 def test_C13_rc_prints_the_folder_it_chose():
     src = RC.read_text()
     assert 'print(f"USING: repo={REPO}' in src
+
+
+# ---- fallback to the sole existing candidate directory ---------------------------------------------
+
+SUFFIX_SITES = ["hooklib_server", "session_server", "tripwire", "supervision"]
+
+
+@pytest.mark.parametrize("site", SUFFIX_SITES)
+def test_fallback_a_only_alpha_dir_without_target_keeps_old_value(site, tmp_path, monkeypatch):
+    home, got = _run(site, tmp_path, monkeypatch, [], "umwelt", extra_dirs=["engram-alpha"])
+    assert got == _expected(site, home, "engram-alpha")
+
+
+@pytest.mark.parametrize("site", SUFFIX_SITES)
+def test_fallback_b_both_dirs_only_one_has_the_target(site, tmp_path, monkeypatch):
+    home, got = _run(site, tmp_path, monkeypatch, ["engram-alpha"], "umwelt", extra_dirs=["engram"])
+    assert got == _expected(site, home, "engram-alpha")
+
+
+@pytest.mark.parametrize("site", SUFFIX_SITES)
+def test_fallback_c_both_dirs_no_target_cwd_inside_alpha(site, tmp_path, monkeypatch):
+    home, got = _run(site, tmp_path, monkeypatch, [], "engram-alpha/sub", extra_dirs=["engram", "engram-alpha"])
+    assert got == _expected(site, home, "engram-alpha")
+
+
+@pytest.mark.parametrize("site", SUFFIX_SITES)
+def test_fallback_d_neither_dir_exists_is_the_engram_default(site, tmp_path, monkeypatch):
+    home, got = _run(site, tmp_path, monkeypatch, [], "umwelt")
+    assert got == _expected(site, home, "engram")
+
+
+# ---- symlinked candidate: matched by real path ----------------------------------------------------
+
+@pytest.mark.parametrize("site", ["hooklib_runtime", "hooklib_server", "supervision", "rc"])
+def test_symlinked_alpha_cwd_inside_its_target_picks_alpha(site, tmp_path, monkeypatch):
+    home, got = _run(site, tmp_path, monkeypatch, BOTH, "elsewhere/alpha-real/sub", alpha_symlink=True)
+    assert got == _expected(site, home, "engram-alpha")
