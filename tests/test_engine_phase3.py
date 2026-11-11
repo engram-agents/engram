@@ -651,6 +651,42 @@ class TestIdentityAxis:
                     + "/".join(["", "Users", "Shared"]) + ":/bin\n")
         assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
 
+    @pytest.mark.parametrize("seg", ["someone.x", "alice.smith"])
+    def test_allowed_name_plus_dot_plus_more_is_a_leak_in_the_build_scan(self, tmp_path, seg):
+        """A dot inside the segment is a segment character: an allowed name, a dot
+        and more characters is a different, undeclared name."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "dotted")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("cd " + _planted_home(seg, "/x") + "\ncd " + _planted_home(seg, "") + "\n")
+        leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
+        assert sorted(n for _r, n, _s in leaks) == [1, 2], leaks
+
+    def test_allowed_name_before_a_sentence_end_dot_is_clean_in_the_build_scan(self, tmp_path):
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "sentence_end")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("see " + _planted_home("someone", "") + ".\n"
+                    + "see " + _planted_home("alice", "") + ". Next.\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+
+    def test_home_prefix_is_case_sensitive_in_the_build_scan(self, tmp_path):
+        """Documented design: /home/ is case-sensitive, /Users/ is not."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "case")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("cd " + "/".join(["", "HOME", "agent-zed"]) + "/x\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+        with open(os.path.join(bundle_dir, "y.md"), "w") as f:
+            f.write("cd " + "/".join(["", "USERS", "agent-zed"]) + "/x\n")
+        assert [r for r, _n, _s in scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)] == ["y.md"]
+
     def test_clean_bundle_passes_leak_scan(self, tmp_path):
         """A bundle with no identity strings passes the leak scan."""
         from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS

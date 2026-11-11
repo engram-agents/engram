@@ -676,3 +676,32 @@ def test_seat_home_convention_prefixes_are_clean_but_a_real_name_is_not(tmp_path
     subprocess.run(["git", "commit", "-q", "-m", "name"], cwd=tmp_path, check=True)
     r = _run_scan(tmp_path)
     assert r.returncode == 1 and "agent-zed" in r.stderr
+
+
+@pytest.mark.parametrize("seg", ["someone.x", "alice.smith"])
+def test_allowed_name_plus_dot_plus_more_is_a_different_segment(tmp_path, seg):
+    """A dot inside the segment is a segment character: an allowed name followed by
+    a dot and more characters is a different, undeclared name."""
+    _commit_files(tmp_path, {"a.md": "cd " + _home(seg) + "x\n" + "cd " + _bare(seg) + "\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "a.md:1" in r.stderr and "a.md:2" in r.stderr
+    assert "segment: " + seg in r.stderr
+
+
+def test_allowed_name_before_a_sentence_end_dot_is_clean(tmp_path):
+    _commit_files(tmp_path, {"a.md": "see " + _bare("someone") + ".\n" + "see " + _bare("alice") + ". Next.\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_home_prefix_is_case_sensitive_but_users_is_not(tmp_path):
+    """Documented design: /home/ is case-sensitive, /Users/ is not."""
+    _commit_files(tmp_path, {"a.md": "cd " + _home("zed", "HOME") + "x\n" + "cd " + _bare("zed", "Home") + "\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (tmp_path / "b.md").write_text("cd " + _home("zed", "USERS") + "x\n")
+    subprocess.run(["git", "add", "b.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "users"], cwd=tmp_path, check=True)
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1 and "b.md:1" in r.stderr
