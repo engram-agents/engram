@@ -105,7 +105,7 @@ Files at the top that are not for users: `CLAUDE.md` (instructions for the agent
 
 ## Issue and pull request history
 
-This repository's issues hold the project's full development history. Every issue and pull request from the private development tracker, from May 2026 to 10 November 2026, is here under its original number. Each entry shows its original author and time at the top.
+This repository's issues hold the project's full development history. Every issue and pull request from the private development tracker, from May 2026 to 10 November 2026, is here under its original number. Each thread from that period shows its original author and time at the top.
 
 Pull requests from that period appear as issue records. Their code is in the git history. A few numbers were never used, or are withheld for now. Each one is marked as such.
 
