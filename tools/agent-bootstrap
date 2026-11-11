@@ -416,6 +416,10 @@ if [[ -z "$ALPHA_SOURCE" ]]; then
         ALPHA_SOURCE="$ENGRAM_ALPHA_SOURCE"
     elif [[ -d "$SHARED_ROOT/engram" ]]; then
         ALPHA_SOURCE="$SHARED_ROOT/engram"
+        if [[ -d "$SHARED_ROOT/engram-alpha" ]] \
+           && [[ "$(cd "$SHARED_ROOT/engram" && pwd -P)" != "$(cd "$SHARED_ROOT/engram-alpha" && pwd -P)" ]]; then
+            echo "WARNING: both $SHARED_ROOT/engram and $SHARED_ROOT/engram-alpha exist and differ; using $SHARED_ROOT/engram (the default name). Pass --alpha-source to use the other." >&2
+        fi
     elif [[ -d "$SHARED_ROOT/engram-alpha" ]]; then
         ALPHA_SOURCE="$SHARED_ROOT/engram-alpha"
     else

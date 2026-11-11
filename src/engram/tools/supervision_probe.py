@@ -313,9 +313,12 @@ def resolve_own_server_py_path(engram_home: Path) -> str:
     candidate = engram_home / "server.py"
     if candidate.exists():
         return str(candidate)
-    # Single pick between the two accepted checkout names (C13): the one the cwd is inside, else engram first.
+    # Single pick between the two accepted checkout names: the one the cwd is inside, else engram first.
+    # Same rule as _hooklib.pick_checkout and tools/rc-upgrade-verify.py; keep the copies in step.
     found = [Path(n).expanduser() for n in ("~/engram", "~/engram-alpha")
              if (Path(n).expanduser() / "server.py").exists()]
+    if not found:  # no server.py anywhere: use the existing candidate directory (old-name-only seats keep their value)
+        found = [Path(n).expanduser() for n in ("~/engram", "~/engram-alpha") if Path(n).expanduser().is_dir()]
     try:
         cwd = Path.cwd().resolve()
     except OSError:

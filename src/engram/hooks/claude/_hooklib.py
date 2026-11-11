@@ -146,24 +146,29 @@ def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
 
 
 def pick_checkout(suffix: str = ""):
-    """Single-pick choice between the two accepted checkout folder names (C13).
+    """Single-pick choice between the two accepted checkout folder names.
 
     Candidates are ~/engram (the default name) then ~/engram-alpha (the accepted old name); a candidate
     counts when `<candidate><suffix>` exists. If the process's own working folder is inside an existing
     candidate (realpath equal or under it, so a linked worktree under ~/engram-alpha/.claude/worktrees/<id>
-    counts as inside ~/engram-alpha), that candidate wins; else the first existing one. Returns
-    `<candidate><suffix>`, or None when neither exists. Never raises.
+    counts as inside ~/engram-alpha), that candidate wins; else the first existing one. When no candidate
+    holds the suffix, the sole existing candidate DIRECTORY is used the same way (cwd-first, then first
+    existing), so an old-name-only seat keeps its old value. Returns `<candidate><suffix>`, or None when
+    neither candidate folder exists. Never raises.
     """
     found = []
     for name in ("~/engram", "~/engram-alpha"):
         cand = os.path.expanduser(name)
         if os.path.exists(cand + suffix):
             found.append(cand)
+    if not found:
+        found = [c for c in (os.path.expanduser(n) for n in ("~/engram", "~/engram-alpha")) if os.path.isdir(c)]
     try:
         cwd = os.path.realpath(os.getcwd())
     except OSError:
         cwd = None
     if cwd:
+        # Same rule as supervision_probe.py and tools/rc-upgrade-verify.py; keep the copies in step.
         for cand in found:
             real = os.path.realpath(cand)
             if cwd == real or cwd.startswith(real.rstrip(os.sep) + os.sep):

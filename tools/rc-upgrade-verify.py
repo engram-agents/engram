@@ -44,7 +44,8 @@ if _HOME_REFUSAL is None:
     _repo_cands = [os.path.expanduser(p) for p in
                    ("~/engram", "~/engram-alpha", "~/src/engram", "~/src/engram-alpha",
                     "~/GitHub/engram", "~/GitHub/engram-alpha")]
-    # C13: a checkout the cwd is inside of (a linked worktree counts) wins over the order; ENGRAM_REPO first.
+    # A checkout the cwd is inside of (a linked worktree counts) wins over the order; ENGRAM_REPO first.
+    # Same rule as _hooklib.pick_checkout and supervision_probe.py; keep the copies in step.
     try:
         _cwd = os.path.realpath(os.getcwd())
     except OSError:

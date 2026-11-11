@@ -46,7 +46,8 @@ the credential path instead of the process-liveness path.
 Verify this empirically, in the SAME `sudo` session where you would install
 the real LaunchDaemon, using the throwaway diagnostic in this directory
 (`credential-probe.sh` + `com.engram.clio-credential-probe.plist.template`
-— see that script's own header for the full context):
+— see that script's own header for the full context; use `$HOME/GitHub/engram-alpha` in place of
+`$HOME/GitHub/engram` below on a seat still on the old folder name):
 
 ```bash
 sed -e "s|__CREDENTIAL_PROBE_SH__|$HOME/GitHub/engram/deploy/autostart/macos/credential-probe.sh|" \
