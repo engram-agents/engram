@@ -26,7 +26,7 @@ RestartSec=5s
 # `append:` log-routing requires systemd >= 240 (2018-10-03); the unit's overall floor is
 # 243 (ExecCondition above), which already covers it.
 # Pre-v243 systemd (Ubuntu 18.04 ships 237) would fail to parse this unit.
-# Practical floor is fine — engram-alpha's Python 3.10+ floor already
+# Practical floor is fine — ENGRAM's Python 3.10+ floor already
 # excludes 18.04 (3.10 not in main repos). Switch to `StandardOutput=journal`
 # if a pre-v243 target ever needs support (and drop ExecCondition).
 StandardOutput=append:{{ENGRAM_HOME}}/surface-daemon.log
