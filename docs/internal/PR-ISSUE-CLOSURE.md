@@ -149,8 +149,20 @@ form that fires the parser.
 
 On this repository the default branch is `main` and PRs merge into `dev`. Measured
 twice on 2026-11-11: a PR with the title `[closes #N]` and the body `Closes #N.`
-merged into `dev`, and the issue stayed open both times. In both cases the merge
-seat closed the issue by hand, with a comment naming the PR and the merge commit.
+merged into `dev`, and the issue stayed open both times. The two cases, read off
+GitHub:
+
+- #4606 (body `Closes #4600.`, base `dev`) was squash-merged into `dev` as
+  `47e4c615` at 2026-11-11T14:49:33Z. Before the merge, `closingIssuesReferences`
+  was empty. Twenty seconds after it, #4600 was still open with only
+  `cross-referenced` and `referenced` events.
+- #4607 (body `Closes #4522.`, base `dev`) was squash-merged into `dev` as
+  `e0c09c74` at 15:16:52Z. #4522 got a `referenced` event at 15:16:54Z and was
+  still open until it was closed by hand at 15:17:10Z, 18 seconds after the
+  merge, with no commit on the close event.
+
+In both cases the merge seat closed the issue by hand, with a comment naming the
+PR and the merge commit.
 
 GitHub applies closing keywords only on a merge into the default branch, which
 matches what was observed. The team commander's ruling of the same day, standing
