@@ -729,6 +729,17 @@ def test_5b_a_refused_unblind_writes_no_unblinded_json_and_labels_can_still_be_f
     assert (drawn["out"] / "unblinded.json").exists()
 
 
+def test_5b_a_refusal_after_the_labels_were_read_also_writes_no_unblinded_json(drawn):
+    a, _ = _two_label_files(drawn)
+    cards = drawn["out"] / "cards.md"
+    good = cards.read_bytes()
+    cards.write_bytes(good + b"\n")
+    _assert_refused_with_nothing_leaked(_unblind(drawn, a), drawn)
+    assert not (drawn["out"] / "unblinded.json").exists()
+    cards.write_bytes(good)
+    assert _unblind(drawn, a).returncode == 0
+
+
 @pytest.mark.parametrize("kind", ["garbage", "forged-decision-right-sha", "forged-wrong-sha"])
 def test_5b_unblinded_json_cannot_be_precreated_to_fake_a_result(drawn, kind):
     # Reason: a file present before the first successful run was not written by the tool, so it is no
