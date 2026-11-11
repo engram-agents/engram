@@ -115,6 +115,16 @@
         ]
       },
       {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
+            "timeout": 3
+          }
+        ]
+      },
+      {
         "matcher": "Read|Grep|Glob|Bash",
         "hooks": [
           {

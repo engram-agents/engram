@@ -235,6 +235,7 @@
   "hooks/claude/engram-lesson-tripwire-hook.py:strip_heredoc_bodies",
   "hooks/claude/engram-lesson-tripwire-hook.py:_heredoc_ops_on_line",
   "hooks/claude/engram-lesson-tripwire-hook.py:_redact_prose",
+  "hooks/claude/engram-lesson-tripwire-hook.py:_agent_fields_text",
   "hooks/claude/engram-lesson-tripwire-hook.py:build_match_views",
   "hooks/claude/engram-lesson-tripwire-hook.py:_tripwire_bullet",
   "hooks/claude/engram-lesson-tripwire-hook.py:_ranks_now",
