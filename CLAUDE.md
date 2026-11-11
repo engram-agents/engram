@@ -1140,7 +1140,7 @@ This triple check is mechanical; checking is cheap; the cost of missing it is
 either a stale-issue backlog (missed auto-close) or a silently-closed-wrong-issue
 (trap firing).
 
-**THE GATE, at the merge seat, after merging: list which issues
+**THE GATE, at the merge seat, after merging: list which issues actually
 closed and confirm each one is FULLY done.** A close link's existence is not
 the issue's completion, and this step is mechanism-independent — it catches
 body links, commit links, and whatever close path ships next. A regex miss
