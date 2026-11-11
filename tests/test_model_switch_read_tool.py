@@ -314,12 +314,23 @@ def test_2_stdout_reports_counts_and_paths_only(drawn):
     assert str(drawn["out"] / "key.json") in out
 
 
+def _assert_refusal(r):
+    """A refusal is loud and tidy: exit 1, one stderr line ``model_switch_read: <reason>``, no traceback.
+
+    ``returncode != 0`` alone would accept a crash (an uncaught exception exits 1 too)."""
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    assert "Traceback" not in r.stderr, r.stderr
+    lines = r.stderr.strip().splitlines()
+    assert len(lines) == 1 and lines[0].startswith("model_switch_read: "), r.stderr
+    assert lines[0] != "model_switch_read: ", "refusal gives no reason"
+
+
 def test_2_failure_output_also_carries_no_text(world):
     control_ok(world["db"], world["decoys"], world["tmp"])
     bad = world["tmp"] / "bad.json"
     bad.write_text(json.dumps([{"claim": "quokka-secret", "quote": "q"}] * 4))
     r = draw(world["db"], world["out"], bad)
-    assert r.returncode != 0
+    _assert_refusal(r)
     assert "quokka-secret" not in r.stdout + r.stderr
     assert "zebra" not in r.stdout + r.stderr
 
@@ -379,7 +390,7 @@ def test_3_decoy_missing_a_key_is_refused_naming_the_entry_and_writes_nothing(wo
     del items[1][bad_key]
     world["decoys"].write_text(json.dumps(items))
     r = draw(world["db"], world["out"], world["decoys"])
-    assert r.returncode != 0
+    _assert_refusal(r)
     assert bad_key in r.stderr and "2" in r.stderr
     assert len(r.stderr.strip().splitlines()) == 1
     assert not world["out"].exists() or not any(world["out"].iterdir())
@@ -396,7 +407,7 @@ def test_3_decoy_with_extra_key_or_non_string_value_is_refused(world):
         mutate(items)
         world["decoys"].write_text(json.dumps(items))
         r = draw(world["db"], world["out"], world["decoys"])
-        assert r.returncode != 0
+        _assert_refusal(r)
         assert not world["out"].exists() or not any(world["out"].iterdir())
 
 
@@ -477,7 +488,7 @@ def _unblind(d, labels):
 
 
 def _assert_refused_with_nothing_leaked(r, d):
-    assert r.returncode != 0
+    _assert_refusal(r)
     assert r.stdout.strip() == ""
     blob = r.stdout + r.stderr
     for v in d["key"]["items"].values():
@@ -552,7 +563,8 @@ def test_5_unblind_refuses_without_a_key(drawn):
     p = write_labels(drawn["tmp"] / "l.tsv", drawn["key"], _all("mine"))
     (drawn["out"] / "key.json").unlink()
     r = _unblind(drawn, p)
-    assert r.returncode != 0 and r.stdout.strip() == ""
+    _assert_refusal(r)
+    assert r.stdout.strip() == ""
 
 
 def _decide(drawn, own_label, decoy_label, tweak=None, name="l.tsv"):
@@ -637,7 +649,7 @@ def test_5_instrument_failed_takes_precedence_over_stop(drawn):
 
 
 def _assert_loud(r, world):
-    assert r.returncode != 0
+    _assert_refusal(r)
     assert r.stdout.strip() == ""
     assert len(r.stderr.strip().splitlines()) == 1
     assert not world["out"].exists() or not any(world["out"].iterdir())
@@ -718,11 +730,11 @@ def test_6_refuses_to_overwrite_either_file(drawn):
         other.mkdir()
         (other / name).write_text("precious")
         r = draw(drawn["db"], other, drawn["decoys"])
-        assert r.returncode != 0
+        _assert_refusal(r)
         assert (other / name).read_text() == "precious"
         assert sorted(p.name for p in other.iterdir()) == [name]
     again = draw(drawn["db"], drawn["out"], drawn["decoys"])
-    assert again.returncode != 0
+    _assert_refusal(again)
 
 
 # ---------------------------------------------------------------------------
