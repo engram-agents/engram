@@ -474,3 +474,115 @@ def test_archived_dev_repo_url_is_not_flagged(tmp_path):
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "history.md" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Test 12: the absolute-home-path class (default-deny, whole segments)
+# ---------------------------------------------------------------------------
+#
+# Contract (written before the implementation):
+#   - class: /(home|Users)/<seg>/ with <seg> = [A-Za-z][A-Za-z0-9._-]*
+#   - default-deny: a segment outside the declared allowed set is a finding
+#   - whole segments only: an allowed name that prefixes a longer name is
+#     still a finding
+#   - domain: every git-tracked text file whatever its extension; a file whose
+#     first 8 KiB holds a NUL byte is skipped
+#   - a finding exits 1 and names file:line and the segment
+# Planted names are fictional; verdicts are asserted on scratch git repos,
+# never on counts read from the real tree.
+
+def _commit_files(path: Path, files: dict, mode: dict | None = None) -> None:
+    _init_git_repo(path)
+    for rel, content in files.items():
+        f = path / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            f.write_bytes(content)
+        else:
+            f.write_text(content)
+        if mode and rel in mode:
+            f.chmod(mode[rel])
+        subprocess.run(["git", "add", rel], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "plant"], cwd=path, check=True)
+
+
+def _run_scan(root: Path):
+    return subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json")],
+        capture_output=True, text=True,
+    )
+
+
+def _home(seg: str, base: str = "home") -> str:
+    # assembled so this file's own text never carries a complete path
+    return "/" + base + "/" + seg + "/"
+
+
+def test_home_path_in_md_is_a_finding(tmp_path):
+    _commit_files(tmp_path, {"doc.md": f"data in {_home('zorblax')}.engram\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "doc.md:1" in r.stderr
+    assert "zorblax" in r.stderr
+
+
+def test_home_path_in_extensionless_executable_is_a_finding(tmp_path):
+    _commit_files(
+        tmp_path,
+        {"tools/runner": f"#!/bin/sh\necho {_home('zorblax')}x\n"},
+        mode={"tools/runner": 0o755},
+    )
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "tools/runner:2" in r.stderr
+    assert "zorblax" in r.stderr
+
+
+def test_home_path_in_yml_is_a_finding(tmp_path):
+    _commit_files(tmp_path, {".github/workflows/ci.yml": f"run: ls {_home('zorblax', 'Users')}\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "ci.yml:1" in r.stderr
+    assert "zorblax" in r.stderr
+
+
+def test_home_path_in_yaml_is_a_finding(tmp_path):
+    _commit_files(tmp_path, {"c.yaml": f"p: {_home('zorblax')}\n"})
+    assert _run_scan(tmp_path).returncode == 1
+
+
+def test_allowed_placeholders_and_system_dirs_are_clean(tmp_path):
+    _commit_files(tmp_path, {
+        "a.md": f"{_home('alice')} and {_home('Shared', 'Users')} and {_home('agent-bob')}\n",
+        "b.txt": f"{_home('agents-shared')}forum\n",
+    })
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_prefix_of_allowed_name_is_still_a_finding(tmp_path):
+    _commit_files(tmp_path, {"a.md": f"see {_home('alice2')}x\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "alice2" in r.stderr
+
+
+def test_binary_file_with_home_path_is_skipped(tmp_path):
+    payload = b"\x00\x01" + _home("zorblax").encode() + b"\x00"
+    _commit_files(tmp_path, {"blob.bin": payload})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_allowed_set_entries_carry_reasons():
+    allowed = _mod.ALLOWED_HOME_SEGMENTS
+    assert {"someone", "agent-alice", "Shared", "agents-shared"} <= set(allowed)
+    assert all(isinstance(why, str) and why.strip() for why in allowed.values())
+    assert "open decision" in allowed["agents-shared"]
+
+
+def test_real_tree_has_no_home_path_findings():
+    """The whole-tree gate: the committed tree carries no real home path."""
+    findings = _mod.scan_home_paths(REPO_ROOT)
+    assert findings == [], "\n".join(f"{f}:{n} {seg}" for f, n, seg in findings)

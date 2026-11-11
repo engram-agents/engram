@@ -631,7 +631,7 @@ class TestB7FinalizeNameClaudeSymlink:
         # the native installer's shape: ~/.local/bin/claude -> <home>/.local/share/claude/versions/X
         # (absolute). After `usermod -d -m` the old absolute home is gone, so it dangles.
         def link(home):
-            os.symlink("/home/agent-newborn-GONE/.local/share/claude/versions/2.1.0",
+            os.symlink("/home/agent-alice/.local/share/claude/versions/2.1.0",
                        home / ".local" / "bin" / "claude")
         home, proc = self._run(tmp_path, link)
         assert proc.returncode == 0, proc.stdout + proc.stderr

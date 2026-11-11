@@ -143,7 +143,7 @@ Sonnet) on 2026-06-08:
    password into the OS/login prompt directly — never paste credentials into
    agent chat.*
 3. Copy the `engram-alpha` repo from the operator's existing clone into the new
-   user's home (e.g. `/Users/engram-sonnet/GitHub/engram-alpha`). Copying
+   user's home (e.g. `~/GitHub/engram-alpha`). Copying
    sidesteps the **private-repo clone-auth gate** — the new account doesn't need
    its own GitHub auth just to install. (Operator may need to grant read access
    to the source clone, or copy via a shared location.)

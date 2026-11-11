@@ -344,7 +344,7 @@ def _check(tmp_path: Path, unit_text: str, *, home_files: tuple = ()) -> SimpleN
     assert m, "installer must keep the '# >>> backup-units' / '# <<< backup-units' markers"
     assert "_check_backup_exec_paths" in m.group(1), (
         "the dead-target check must live in ONE function inside the marked region")
-    home = tmp_path / "home"
+    home = tmp_path / "fakehome"
     unit_dir = home / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True)
     svc = tmp_path / "forum"
@@ -436,7 +436,7 @@ class TestDeadTargetCheck:
         bad = _check(tmp_path / "b", u.replace(f"{tmp_path}", f"{tmp_path}/b"),
                      home_files=("bin/py",))
         assert not bad.passed
-        assert f"{tmp_path}/b/home/tools/s.py" in bad.both, bad.both
+        assert f"{tmp_path}/b/fakehome/tools/s.py" in bad.both, bad.both
         assert "%h/tools/s.py" not in bad.both, bad.both
 
     @pytest.mark.parametrize("body", [

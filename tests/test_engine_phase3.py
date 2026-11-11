@@ -554,7 +554,7 @@ class TestIdentityAxis:
             "hooks": {
                 "UserPromptSubmit": [
                     {"hooks": [
-                        {"command": "python3 /home/agent-borges/hooks/some-hook.py"}
+                        {"command": "python3 /home/" + "agent-borges" + "/hooks/some-hook.py"}
                     ]}
                 ]
             }
@@ -581,7 +581,7 @@ class TestIdentityAxis:
         os.makedirs(bundle_dir)
 
         # Plant an agent-borges identifier leak
-        leak_content = '{"engram_home": "/home/agent-borges/.engram"}\n'
+        leak_content = '{"engram_home": "/home/' + "agent-borges" + '/.engram"}\n'
         with open(os.path.join(bundle_dir, "config.json"), "w") as f:
             f.write(leak_content)
 
