@@ -254,31 +254,26 @@ the release commit; the time `main` moved; and anything that was not run.
 
 > **Definition of released (Lei, 2026-10-02).** A version is reported as
 > *released* only when all three public surfaces are live, in this order:
-> (1) the public repo carries the tag and the Releases entry (the cutover
-> tool plus `gh release create`, below); (2) the website Versions entry is
+> (1) the repository carries the release tag and the Releases entry (steps 6
+> to 8); (2) the website Versions entry is
 > live in both languages at engram-agents.org/versions; (3) the newsletter has
-> gone to the *ENGRAM Communications* subscribers. The tool does the tag half of (1); the Releases entry is a separate `gh release create` (a tag push never creates it, see *Announcing the public release*).
+> gone to the *ENGRAM Communications* subscribers.
 > (2) and (3) are Ariadne's by standing assignment (Zephyr may do the Chinese
-> text); the two steps are specified under "Tell the public" below, and the
-> cutover tool's `--push` summary prints all three remaining steps as a block so
-> the success line cannot be mistaken for the finish line. Until (3) is done
+> text); the two steps are specified under "Tell the public" below, and step 8
+> marks surface (1) as the first of three. Until (3) is done
 > the commander's reports say "repo released; website and newsletter
 > pending", never "released". Origin: v0.5.2 was reported released at
 > 2026-10-02 00:1xZ with (2) and (3) undone; the doc already carried both
 > steps, so the fix is the definition and the print, not a third copy.
-
-*How surface (1) is made since v0.5.6:* steps 6 to 8 above (the release tag,
-the fast-forward of `main`, and `gh release create`). Surfaces (2) and (3) are
-unchanged and are specified under "Tell the public" below. Where the paragraph
-above says "the cutover tool", read "steps 6 to 8"; where it or the sections
-below point to *Announcing the public release*, read step 8.
 
 ## Notify users
 
 For alpha-tester pool (agents, users, or counterparts on other hosts):
 - Brief release announcement summarizing what's in the version
 - Pointer to the public GitHub Release page (`engram-agents/engram`)
-- Upgrade instruction: `git pull origin dev && tools/install-local-marketplace.sh`,
+- Upgrade instruction: `git fetch origin --tags && git checkout vX.Y.Z &&
+  tools/install-local-marketplace.sh` (the release tag; `dev` is ahead of the
+  release and is for development, not for upgrading to it),
   then `/plugin marketplace update engram-local`, then /plugin -> Installed ->
   engram plugin -> Update now, inside Claude Code (or `git checkout` the tag
   if they prefer pinning)
@@ -354,7 +349,7 @@ from, not where you send.
 
 **⚠️ ORDER MATTERS — send AFTER the public release exists, never before.**
 The email links the public repo's Releases entry, which you created by hand
-under *Announcing the public release* above (the subsection carrying the
+in step 8 (the subsection carrying the
 `gh release create` command) — it is not created by the tag push. Announcing first produces an email
 whose main link 404s, and unlike a broken doc link **you cannot edit an email
 after it is sent.** Load every link once before sending.
@@ -378,7 +373,7 @@ after it is sent.** Load every link once before sending.
   or reconnect steps. The harm is SUBSTITUTION, not redundancy, and it lands hardest
   on the users least able to notice what was skipped.
 - Links to the **public** GitHub Release page (`engram-agents/engram`), not
-  the private rc, and to the Versions entry from step 1.
+  a candidate (`-rcN`) tag, and to the Versions entry from step 1.
 
 **Do NOT hand-roll an unsubscribe link.** Buttondown states that every email
 it sends is one-click-unsubscribe compliant (RFC 8058) and injects the headers
