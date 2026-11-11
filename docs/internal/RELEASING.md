@@ -20,7 +20,7 @@ A release has three parts, in this order:
 | Role | Does |
 |---|---|
 | Release seat | Runs this procedure, declares the freeze, pushes tags, moves `main`, writes the release record. One seat per release, named when the candidate is cut. |
-| Gate seat | Runs the whole test suite on the candidate commit and the skip-set comparison (gate G2, G3). Not the release seat. |
+| Gate seat | Runs the whole test suite on the candidate commit and the skip-set comparison, and the install checks (gates G2, G3, G6). Not the release seat. |
 | Security seat | Reads the candidate for the release (gate G5) and says so in writing on the record. |
 | Surfaces | Website Versions entry in both languages, then the newsletter. |
 | Maintainer (human) | Says go for the release tag. Nothing in part 2 happens before that word. |
@@ -59,8 +59,8 @@ is `-rc1`; each fix round adds one.
 ### 2. Bump the plugin version and move the CHANGELOG, in one pull request
 
 Root `plugin.json` carries the clean version (`X.Y.Z`, never `-rc`). It is the
-single source the build reads: `compute_build_version()` in
-`src/build/engine/build.py` stamps every artifact from it.
+single source the build reads: the build engine (`src/build/engine/build.py`)
+loads that version and `compute_build_version()` stamps every artifact from it.
 
 The changelog is `docs/CHANGELOG.md`. Check `[Unreleased]` against the last
 release tag and remove anything already released. Move what remains to a new
@@ -101,7 +101,7 @@ goes into the release record (step 9) with the run's identifier.
 
 | Gate | What must be true | Who |
 |---|---|---|
-| G1 | The hosted full suite is green on the candidate: run `tests.yml` by `workflow_dispatch` on the candidate tag. | Release seat |
+| G1 | The hosted full suite is green on the candidate: `gh workflow run tests.yml --repo engram-agents/engram --ref vX.Y.Z-rcN`, then confirm the run's `headSha` is the candidate commit before reading its result. | Release seat |
 | G2 | A whole-suite run on a fresh full clone checked out at the candidate tag, with the project's own interpreter, is green. The full output is kept. | Gate seat |
 | G3 | The skip-set comparison below shows no unexplained new skip. | Gate seat |
 | G4 | `name-leak-gate` and `pr-checks` are green on the candidate's last merged pull request, and the secret-scanning alert list has no open alert. | Release seat |
@@ -122,7 +122,10 @@ showed them.
 1. **Two runs are compared:** the gate seat's whole run on this candidate (G2)
    and the recorded run of the previous release. The reference is the file
    `docs/internal/release-records/vA.B.C-skips.json` of the previous release
-   `vA.B.C`.
+   `vA.B.C`. If no such file exists (the case for the first release cut
+   by this procedure), the gate seat first makes it from the recorded run of
+   the previous release and commits it in its own pull request; G3 is "not
+   run" until a reference exists.
 2. **What is recorded** for each run: the commit, the interpreter and platform,
    the number of tests collected, passed, failed and skipped, and the skipped
    tests by full id, grouped by skip reason.
@@ -164,6 +167,7 @@ Nothing in this part happens before the maintainer's go.
 ### 6. Tag the release on the accepted candidate commit
 
 ```bash
+git fetch origin --tags                            # a stale ref makes the next check pass falsely
 C=$(git rev-parse 'vX.Y.Z-rcN^{commit}')          # the accepted candidate
 git rev-parse origin/dev                           # must still equal C; if not, stop
 git tag -a vX.Y.Z "$C" -m "vX.Y.Z"
@@ -176,7 +180,13 @@ deleted. Read `C` twice before pushing.
 
 ### 7. Fast-forward `main` to the release commit
 
+Run this in one shell. `C` is set again here on purpose: with `C` empty the
+push below would name no source, which git reads as a request to delete `main`.
+
 ```bash
+git fetch origin --tags
+C=$(git rev-parse 'vX.Y.Z^{commit}')               # from the release tag pushed in step 6
+test -n "$C" || { echo "C is empty, stop"; exit 1; }
 git merge-base --is-ancestor origin/main "$C" && echo "fast-forward is possible"
 git push origin "$C":refs/heads/main               # never with --force
 git ls-remote origin refs/heads/main               # must print C
@@ -193,9 +203,12 @@ after the fact, not the gate; G1 was the gate.
 
 A tag push does not create a Releases entry.
 
+Copy the `## [vX.Y.Z]` section of `docs/CHANGELOG.md`, without its heading,
+into a file first; `--notes-file` takes a file, not a section.
+
 ```bash
 gh release create vX.Y.Z --repo engram-agents/engram --verify-tag \
-  --title "vX.Y.Z" --notes-file <the vX.Y.Z section of docs/CHANGELOG.md> --latest
+  --title "vX.Y.Z" --notes-file release-notes-vX.Y.Z.md --latest
 gh release view vX.Y.Z --repo engram-agents/engram
 ```
 
@@ -231,7 +244,8 @@ the release commit; the time `main` moved; and anything that was not run.
 *How surface (1) is made since v0.5.6:* steps 6 to 8 above (the release tag,
 the fast-forward of `main`, and `gh release create`). Surfaces (2) and (3) are
 unchanged and are specified under "Tell the public" below. Where the paragraph
-above says "the cutover tool", read "steps 6 to 8".
+above says "the cutover tool", read "steps 6 to 8"; where it or the sections
+below point to *Announcing the public release*, read step 8.
 
 ## Notify users
 
