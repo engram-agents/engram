@@ -121,6 +121,7 @@ if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, write_route_ledger, tool_fire_key
 from _hooklib import import_owner_flags as _hooklib_import_owner_flags
+from _hooklib import pick_checkout
 # #3628: this hook runs on EVERY tool call. Every file open goes through these
 # non-blocking, regular-file-only helpers (a FIFO makes a plain open() wait for
 # a peer and the harness kills the hook silently); a non-regular target raises
@@ -2064,7 +2065,7 @@ def _resolve_runtime_dir() -> str:
                 return str(candidate)
     except OSError:
         pass
-    return os.path.expanduser("~/engram-alpha/src/engram")  # last-ditch, unchanged
+    return pick_checkout("/src/engram") or os.path.expanduser("~/engram/src/engram")  # last-ditch
 
 
 def _query_recall_daemon(query: str, top_k: int = 5) -> dict | None:

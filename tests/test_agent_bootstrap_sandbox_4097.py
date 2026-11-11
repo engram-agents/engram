@@ -36,7 +36,7 @@ def test_branch_ref_checks_out_exactly_that_commit_without_any_tag(tmp_path):
     sha = _git(src, "rev-parse", "dev")
     proc = run_lib(env, install_body(home, src, 'SANDBOX_REF="dev"'))
     assert _rc(proc) == 0, proc.stdout + proc.stderr
-    assert _git(home / "engram-alpha", "rev-parse", "HEAD") == sha
+    assert _git(home / "engram", "rev-parse", "HEAD") == sha
     assert f"{BANNER}: dev = {sha}" in proc.stdout
 
 
@@ -57,7 +57,7 @@ def test_short_sha_ref_resolves_to_the_full_sha(tmp_path):
     full = _git(src, "rev-parse", "dev~1")
     proc = run_lib(env, install_body(home, src, f'SANDBOX_REF="{full[:9]}"'))
     assert _rc(proc) == 0, proc.stdout + proc.stderr
-    assert _git(home / "engram-alpha", "rev-parse", "HEAD") == full
+    assert _git(home / "engram", "rev-parse", "HEAD") == full
     assert f"{BANNER}: {full[:9]} = {full}" in proc.stdout
 
 
@@ -66,7 +66,7 @@ def test_tag_ref_resolves(tmp_path):
     src = make_source(tmp_path, tags={"v0.1.0": "c1"})
     proc = run_lib(env, install_body(home, src, 'SANDBOX_REF="v0.1.0"'))
     assert _rc(proc) == 0, proc.stdout + proc.stderr
-    assert _git(home / "engram-alpha", "rev-parse", "HEAD") == _git(src, "rev-parse", "v0.1.0^{commit}")
+    assert _git(home / "engram", "rev-parse", "HEAD") == _git(src, "rev-parse", "v0.1.0^{commit}")
 
 
 def test_sandbox_ref_skips_the_tag_pick_even_when_a_deployable_tag_exists(tmp_path):
@@ -75,7 +75,7 @@ def test_sandbox_ref_skips_the_tag_pick_even_when_a_deployable_tag_exists(tmp_pa
     sha = _git(src, "rev-parse", "dev")
     proc = run_lib(env, install_body(home, src, 'SANDBOX_REF="dev"'))
     assert _rc(proc) == 0, proc.stdout + proc.stderr
-    assert _git(home / "engram-alpha", "rev-parse", "HEAD") == sha  # head, not the tag at c2
+    assert _git(home / "engram", "rev-parse", "HEAD") == sha  # head, not the tag at c2
 
 
 def test_unknown_ref_fails_naming_the_ref_and_runs_nothing(tmp_path):

@@ -247,9 +247,14 @@ ab_left_in_place_note() {
 # failure. Nothing is written to the newborn's ~/.gitconfig, /etc/gitconfig or any persistent
 # config; every later git command runs on the newborn's own clone and needs no trust.
 ab_clone_and_install() {
-    local clone="$USER_HOME/engram-alpha" rc=0 tag
+    # `engram` is the default clone name; an existing clone under either name is reused.
+    local clone="$USER_HOME/engram" rc=0 tag
+    if [[ ! -d "$clone" && -d "$USER_HOME/engram-alpha" ]]; then
+        clone="$USER_HOME/engram-alpha"
+    fi
     local srcgit="$ALPHA_SOURCE/.git" cfgdir cfg esc
     CLONE_TAG=""
+    CLONE_DIR="$clone"
     echo "Cloning $ALPHA_SOURCE -> $clone (as $USER_NAME)..."
     cfgdir="$(mktemp -d "${TMPDIR:-/tmp}/agent-bootstrap.XXXXXX")" || { echo "agent-bootstrap: mktemp failed" >&2; ab_left_in_place_note; return 1; }
     # Remove the trust dir on EXIT and on INT/TERM too (a signal mid-clone must not leave it);
@@ -371,7 +376,7 @@ NEXT
 Agent $USER_NAME created (uid=$(id -u "$USER_NAME" 2>/dev/null || echo "?"), runtime=$RUNTIME).
 Home: $USER_HOME (mode $HOME_MODE)
 Joined group: agents
-ENGRAM installed by tools/install.sh from $USER_HOME/engram-alpha at tag ${CLONE_TAG:-?} (Claude Code installed natively in the newborn's own home).
+ENGRAM installed by tools/install.sh from ${CLONE_DIR:-$USER_HOME/engram} at tag ${CLONE_TAG:-?} (Claude Code installed natively in the newborn's own home).
 
 Next steps:
   1. Enter the new agent's bash login shell:
@@ -409,8 +414,14 @@ SHARED_ROOT="/home/agents-shared"
 if [[ -z "$ALPHA_SOURCE" ]]; then
     if [[ -n "${ENGRAM_ALPHA_SOURCE:-}" && -d "$ENGRAM_ALPHA_SOURCE" ]]; then
         ALPHA_SOURCE="$ENGRAM_ALPHA_SOURCE"
-    elif [[ -d "/home/agents-shared/engram-alpha" ]]; then
-        ALPHA_SOURCE="/home/agents-shared/engram-alpha"
+    elif [[ -d "$SHARED_ROOT/engram" ]]; then
+        ALPHA_SOURCE="$SHARED_ROOT/engram"
+        if [[ -d "$SHARED_ROOT/engram-alpha" ]] \
+           && [[ "$(cd "$SHARED_ROOT/engram" && pwd -P)" != "$(cd "$SHARED_ROOT/engram-alpha" && pwd -P)" ]]; then
+            echo "WARNING: both $SHARED_ROOT/engram and $SHARED_ROOT/engram-alpha exist and differ; using $SHARED_ROOT/engram (the default name). Pass --alpha-source to use the other." >&2
+        fi
+    elif [[ -d "$SHARED_ROOT/engram-alpha" ]]; then
+        ALPHA_SOURCE="$SHARED_ROOT/engram-alpha"
     else
         ALPHA_SOURCE=""  # rendered path will be empty; user must pass --alpha-source or set ENGRAM_ALPHA_SOURCE
     fi

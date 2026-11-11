@@ -313,7 +313,21 @@ def resolve_own_server_py_path(engram_home: Path) -> str:
     candidate = engram_home / "server.py"
     if candidate.exists():
         return str(candidate)
-    return str(Path("~/engram-alpha/server.py").expanduser())
+    # Single pick between the two accepted checkout names: the one the cwd is inside, else engram first.
+    # Same rule as _hooklib.pick_checkout and tools/rc-upgrade-verify.py; keep the copies in step.
+    found = [Path(n).expanduser() for n in ("~/engram", "~/engram-alpha")
+             if (Path(n).expanduser() / "server.py").exists()]
+    if not found:  # no server.py anywhere: use the existing candidate directory (old-name-only seats keep their value)
+        found = [Path(n).expanduser() for n in ("~/engram", "~/engram-alpha") if Path(n).expanduser().is_dir()]
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        cwd = None
+    for cand in found:
+        if cwd is not None and (str(cwd) == str(cand.resolve())
+                                or str(cwd).startswith(str(cand.resolve()).rstrip(os.sep) + os.sep)):
+            return str(cand / "server.py")
+    return str((found[0] if found else Path("~/engram").expanduser()) / "server.py")
 
 
 def resolve_daemon_script_path(engram_home: Path) -> str:

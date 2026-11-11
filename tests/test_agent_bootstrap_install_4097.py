@@ -284,7 +284,7 @@ class TestB3RunsAsNewborn:
         log = (tmp_path / "install.log").read_text()
         assert f"HOME={home}" in log
         assert "ANTHROPIC_API_KEY=<unset>" in log, "install.sh must not inherit an API key"
-        assert str(home / "engram-alpha") in call
+        assert str(home / "engram") in call
 
     def test_flags_absent_when_not_given(self, tmp_path):
         env, home = make_env(tmp_path)
@@ -337,7 +337,7 @@ class TestB4CloneOnDeployableTag:
                           unmerged_tag="v9.9.9")
         proc = run_lib(env, install_body(home, src))
         assert _rc(proc) == 0, proc.stdout + proc.stderr
-        clone = home / "engram-alpha"
+        clone = home / "engram"
         # newest by commit date among tags that are ancestors of origin/dev: the deploy tag at
         # c2, NOT the older v0.1.0, NOT the unmerged v9.9.9, NOT dev's untagged c3 head.
         assert _git(clone, "describe", "--tags", "--exact-match", "HEAD") == "deploy/2026-02-01-x"

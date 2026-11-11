@@ -4,6 +4,7 @@
   "hooks/claude/_harness.py:detect_harness",
   "hooks/claude/_hooklib.py:bounded_parents",
   "hooks/claude/_hooklib.py:resolve_tools_dir",
+  "hooks/claude/_hooklib.py:pick_checkout",
   "hooks/claude/_hooklib.py:resolve_runtime_dir",
   "hooks/claude/_hooklib.py:import_owner_flags",
   "hooks/claude/_hooklib.py:resolve_own_server_py_path",
