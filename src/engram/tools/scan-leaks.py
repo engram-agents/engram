@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""scan-leaks.py — defensive scanner for personal references in alpha.
+"""scan-leaks.py — defensive scanner for personal references in this public repository.
 
-Belt-and-suspenders against regex-miss in the upstream release script.
-Run standalone or wire as a pre-commit hook.
+Flags committed structural patterns and a gitignored local roster of personal
+names. Run standalone or wire as a pre-commit hook.
 
 Standalone:
     python3 tools/scan-leaks.py            # exit 0 clean, 1 if leaks
@@ -19,8 +19,7 @@ Personal-name and user-specific patterns are loaded at runtime from
 absent the scanner runs committed structural patterns only and prints one
 advisory line.
 
-See docs/internal/.scan-leaks-local.json.example (kept in the development
-repository, not in the public release) for the config shape.
+See docs/internal/.scan-leaks-local.json.example for the config shape.
 
 Allowlist:
   - LICENSE (copyright lines are intentional)
@@ -43,7 +42,6 @@ from pathlib import Path
 # Structural patterns with NO personal data — safe to commit.
 COMMITTED_PATTERNS = [
     (re.compile(r"kg_protocol_for_ai"), "main repo path"),
-    (re.compile(r"engram-agents/engram-alpha"), "private dev-repo URL — must be engram-agents/engram in public snapshot"),
 ]
 
 LOCAL_CONFIG_NAME = ".scan-leaks-local.json"
