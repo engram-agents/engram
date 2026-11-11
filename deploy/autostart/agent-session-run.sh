@@ -214,7 +214,7 @@ if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
     sys.exit(0)
 provider, family = parts[0].strip().lower(), parts[1].strip().lower()
 if provider != "anthropic":
-    out("INFO", f"model pin: self_lineage provider is {provider!r}, not anthropic; passing no --model")
+    out("INFO", f"model pin: self_lineage {lineage!r} names provider {provider!r}, not anthropic; passing no --model")
     sys.exit(0)
 if family not in FAMILIES:
     out("WARN", f"model pin: self_lineage family {family!r} is not one of {', '.join(FAMILIES)}; starting as before, no --model passed")

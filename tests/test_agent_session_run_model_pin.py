@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 from pathlib import Path
 
@@ -50,6 +51,7 @@ _SCRUB = [
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
 ]
@@ -469,3 +471,125 @@ def test_codex_argv_is_exactly_the_pre_pin_shape(tmp_path):
     r = run_runner(tmp_path, platform="codex", lineage="anthropic:opus", user_model="sonnet")
     assert r.argv[:6] == ["session", "mira", "-d", "--as-self", "--cd", str(r.cwd)]
     assert r.argv[6] == "--charge-file" and len(r.argv) == 8
+
+
+# --- fold 1: the launcher never touches the model-remapping environment -------
+
+def _remap_env():
+    # SYNTHETIC token, generated here, never read from the real environment.
+    # It must never reach an assertion message or a comparison pytest prints.
+    tok = secrets.token_hex(16)
+    env = {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:9/served",
+        "ANTHROPIC_AUTH_TOKEN": tok,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "served-opus-x",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "served-sonnet-y",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "served-haiku-z",
+    }
+    return env
+
+
+class _Expected:
+    """SHA-256 digests of 'VAR=value' lines. Helpers receive this, never the plain
+    values: pytest prints each frame's arguments on failure, and the repr here is
+    opaque on purpose (a printed dict of digests would still be 64 hex chars each)."""
+
+    def __init__(self, env):
+        self._digests = {
+            var: hashlib.sha256(f"{var}={value}".encode()).hexdigest()
+            for var, value in env.items()
+        }
+
+    def __repr__(self):
+        return "<expected env digests>"
+
+    def missing(self, env_seen):
+        have = {hashlib.sha256(ln.encode()).hexdigest() for ln in env_seen.splitlines()}
+        return [var for var, d in self._digests.items() if d not in have]
+
+
+def _assert_env_unchanged(r, expected):
+    # Booleans only: messages name the variable, never the value.
+    for var in expected.missing(r.env_seen):
+        ok = False
+        assert ok, f"{var} changed or missing"
+
+
+def _assert_remap_env_unchanged(r, expected):
+    _assert_env_unchanged(r, expected)
+    assert r.model_args() == [], "a --model flag was passed"
+
+
+def test_env_remap_vars_reach_agentctl_unchanged(tmp_path):
+    env = _remap_env()
+    r = run_runner(tmp_path, lineage="anthropic:opus", env_extra=env)
+    assert r.proc.returncode == 0, "runner did not exit 0"
+    _assert_remap_env_unchanged(r, _Expected(env))
+
+
+def test_env_remap_vars_reach_agentctl_unchanged_nonanthropic_lineage(tmp_path):
+    env = _remap_env()
+    r = run_runner(tmp_path, lineage="deepseek:flash", env_extra=env)
+    assert r.proc.returncode == 0, "runner did not exit 0"
+    _assert_remap_env_unchanged(r, _Expected(env))
+
+
+# --- fold 1: an unknown anthropic family is a loud warning naming it ----------
+
+def test_unknown_anthropic_family_flash_is_a_warning_naming_it(tmp_path):
+    r = run_runner(tmp_path, lineage="anthropic:flash")
+    assert r.proc.returncode == 0, r.proc.stderr
+    assert r.model_args() == []
+    warns = r.lines("WARNING")
+    assert len(warns) == 1, warns
+    assert "flash" in warns[0]
+
+
+# --- fold 1: the non-anthropic INFO names the provider and the lineage --------
+
+def test_nonanthropic_info_names_provider_and_lineage(tmp_path):
+    r = run_runner(tmp_path, lineage="deepseek:flash")
+    assert r.proc.returncode == 0, r.proc.stderr
+    assert r.model_args() == []
+    assert not r.lines("WARNING")
+    infos = r.lines("INFO")
+    assert len(infos) == 1, infos
+    assert "deepseek:flash" in infos[0]
+    assert "deepseek" in infos[0]
+    # the provider as its own quoted token ('deepseek:flash' does not contain it),
+    # so dropping the provider while keeping the lineage is caught
+    assert "'deepseek'" in infos[0], infos[0]
+    body = infos[0].split("INFO: ", 1)[1]
+    assert body.startswith("model pin:"), infos[0]
+    assert len([ln for ln in r.log.splitlines() if "INFO" in ln]) == 1, r.log
+
+
+# --- fold 1: credentials survive the LATER code path (no remap variables) -----
+
+def _credentials_env():
+    # SYNTHETIC token; never in a message or a printed comparison.
+    return {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:9/served",
+        "ANTHROPIC_AUTH_TOKEN": secrets.token_hex(16),
+    }
+
+
+def test_env_credentials_reach_agentctl_unchanged_when_no_remap(tmp_path):
+    env = _credentials_env()
+    r = run_runner(tmp_path, lineage="anthropic:opus", env_extra=env)
+    assert r.proc.returncode == 0, "runner did not exit 0"
+    _assert_env_unchanged(r, _Expected(env))
+    assert r.model_args() == ["opus"], "expected --model opus (rule E)"
+
+
+@pytest.mark.parametrize("lineage", ["anthropic:opus", "deepseek:flash"])
+def test_env_credentials_reach_agentctl_unchanged_when_no_remap_by_lineage(tmp_path, lineage):
+    env = _credentials_env()
+    r = run_runner(tmp_path, lineage=lineage, env_extra=env)
+    assert r.proc.returncode == 0, "runner did not exit 0"
+    _assert_env_unchanged(r, _Expected(env))
+    if lineage == "anthropic:opus":
+        assert r.model_args() == ["opus"], "expected --model opus (rule E)"
+    else:
+        assert r.model_args() == [], "a --model flag was passed"
+        assert len(r.lines("INFO")) == 1, "expected exactly one INFO line"
