@@ -159,7 +159,8 @@ esac
 #        family: pass nothing (keeps a [1m] variant). Absent: pass the family.
 #        Different family or an unrecognised value: pass the lineage family and
 #        WARN. Settings that cannot be read: pass nothing and WARN; no guess.
-# Settings are never edited; ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL are never touched.
+# Settings are never edited. The ANTHROPIC_DEFAULT_*_MODEL variables are only READ (rule A); the launcher
+# never sets, unsets or overrides them, nor ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY.
 _log_info() {
     echo "[$(date -Is)] [$AGENT_NAME] INFO: $1" >> "$LOG"
     echo "[autostart] INFO: $1" >&2
