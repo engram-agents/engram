@@ -494,8 +494,16 @@ printf '[step 5] running install-local-marketplace.sh (its output follows)\n'
 _market_flags=""
 [ "$SANDBOX_UNTAGGED" != "1" ] || _market_flags="--allow-untagged --allow-branch"
 # shellcheck disable=SC2086  # intentional word splitting of the two fixed flags
-bash "$TOOLS_DIR/install-local-marketplace.sh" $_market_flags \
-  || fail "install-local-marketplace.sh exited non-zero" "read its output above (a tag or branch guard, the model pre-warm and pip are the usual causes) and re-run"
+_market_rc=0
+bash "$TOOLS_DIR/install-local-marketplace.sh" $_market_flags || _market_rc=$?
+# Exit 10 is its own code: "finished, with items not done" (the block it printed lists each one).
+# It is still this step's FAIL (steps 6-9 do not run), but the line says so, so an operator can tell
+# "the marketplace step did not finish" from "it finished and one item is missing".
+if [ "$_market_rc" -eq 10 ]; then
+  fail "the marketplace step finished, but it reported items it did not do (exit 10; the block above lists each one)" "the marketplace is assembled, and steps 6-9 did not run; do what the block says for each item, then re-run this installer"
+elif [ "$_market_rc" -ne 0 ]; then
+  fail "install-local-marketplace.sh exited non-zero" "read its output above (a tag or branch guard, the model pre-warm and pip are the usual causes) and re-run"
+fi
 [ -f "$PLUGIN_ROOT/bootstrap.py" ] \
   || fail "the marketplace was assembled but $PLUGIN_ROOT/bootstrap.py is missing" "re-run the build; if it persists the plugin build is broken"
 step_ok

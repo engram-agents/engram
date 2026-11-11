@@ -643,7 +643,9 @@ def merge_json_text(filename: str, existing: "str | None", changes: "dict[str, A
 
     `replace_non_object=True` is the caller saying the user agreed (their yes) to replace a
     parent value that is not an object (for "forum.url": a `forum` that holds a string or a
-    number) with an object. Without it that case is refused. The replaced value survives only
+    number) with an object. Without it that case is refused. An explicit null parent counts as
+    absent and needs no flag. The only caller that passes True is set_forum_url, on its --force
+    path (a cell in tests/test_never_clobber_contract.py pins that). The replaced value survives only
     in the stamped backup that apply_merge takes before it writes.
 
     Raises MergeRefused if `filename` has no owned keys, if `changes` names a key that is not
@@ -683,6 +685,11 @@ def merge_json_text(filename: str, existing: "str | None", changes: "dict[str, A
         for i, part in enumerate(parts[:-1]):
             if part not in node:
                 node[part] = {}
+            elif node[part] is None:
+                # An explicit null holds nothing the user wrote: it counts as absent. The stamped
+                # backup taken before the write still keeps the file as it was.
+                node[part] = {}
+                replaced.append(parts[: i + 1])
             elif not isinstance(node[part], dict):
                 if not replace_non_object:
                     raise MergeRefused(

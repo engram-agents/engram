@@ -914,7 +914,7 @@ def test_dangling_claude_md_symlink_fails_step_1_before_any_real_work(sb):
     (sb.claude_home / "CLAUDE.md").symlink_to(sb.root / "nowhere" / "CLAUDE.md")
     r = sb.run("--yes")
     assert r.returncode != 0 and "FAIL: [step 1]" in r.stderr, r.all
-    assert str(sb.claude_home / "CLAUDE.md") in r.stderr and "remove" in r.stderr.lower()
+    assert str(sb.claude_home / "CLAUDE.md") in r.stderr and "move the link aside" in r.stderr.lower()
     for prefix in ("pip", "marketplace", "bootstrap", "claude plugin", "selfcheck"):
         assert not sb.calls_starting(prefix), sb.call_lines()
     assert (sb.claude_home / "CLAUDE.md").is_symlink()  # untouched

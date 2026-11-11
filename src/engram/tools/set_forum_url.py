@@ -174,9 +174,9 @@ def set_forum_url(config_path, url, *, force: bool = False) -> SetResult:
         return _refuse(f"refused: {exc}; file unchanged")
 
     forum = config.get("forum")
-    replace_non_object = False
+    replace_non_object = False  # becomes True only on the --force path below, after the user's yes
     if forum is None:
-        replace_non_object = "forum" in config  # an explicit null holds nothing; the backup keeps it anyway
+        pass  # absent or an explicit null: the guard treats both as absent
     elif isinstance(forum, dict):
         existing = forum.get("url")
         if isinstance(existing, str) and existing.strip():

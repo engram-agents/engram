@@ -51,6 +51,17 @@
 #   marketplace is registered.
 #
 # IDEMPOTENT: re-running cleans + reassembles the marketplace tree.
+#
+# EXIT CODES:
+#   0   finished; nothing was left undone.
+#   1   failed (an error line says why; a venv or embedding-model failure also exits 1).
+#   2   ENGRAM_HOME is not an absolute path.
+#   10  FINISHED, WITH ITEMS NOT DONE. The marketplace was assembled, but one or more steps were
+#       skipped (the install_tier persist step refused to change config.json; a Codex agent file
+#       could not be installed). The run does not stop at the first one: it collects them and ends
+#       with a block that lists each item and what the user should do. Code 10 is not a "retry"
+#       signal: running the installer again changes nothing until the cause in the block is fixed.
+#       A caller shows the user that block; it does not loop on this code.
 
 set -euo pipefail
 
@@ -87,7 +98,41 @@ die() { printf '[install-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 # (Lei, 2026-08-10). The trap catches all exits; it is a no-op when the
 # venv block never flagged (the normal case).
 _venv_fail=0
-_venv_fail_trap() {
+
+# Items the run could not do. The run goes on past each one and ends with a block that lists them
+# (see _report_not_done), then exits EXIT_NOT_DONE: neither a silent warning nor an abort half way.
+EXIT_NOT_DONE=10
+_not_done=""
+_not_done_n=0
+# not_done "<what was not done>" "<what the user should do about it>"
+not_done() {
+  _not_done_n=$((_not_done_n + 1))
+  _not_done="${_not_done}  ${_not_done_n}. $1"$'\n'"     What to do: $2"$'\n'
+}
+_report_not_done() {
+  [[ -n "${_not_done:-}" ]] || return 0
+  log ""
+  log "═══════════════════════════════════════════════════════════════════"
+  log " ITEMS NOT DONE ($_not_done_n)"
+  log "═══════════════════════════════════════════════════════════════════"
+  log "The marketplace step finished, but these items were not done:"
+  log ""
+  while IFS= read -r _nd_line; do log "$_nd_line"; done <<EOF_ND
+${_not_done%$'\n'}
+EOF_ND
+  log ""
+  log "Show this list to the user. Running the installer again does not fix an item until its cause is fixed."
+  if [[ "${1:-0}" -eq 0 && "${_venv_fail:-0}" != "1" ]]; then
+    log "Exit code $EXIT_NOT_DONE means: finished, with items not done."
+  fi
+}
+
+# One EXIT trap for every path. The installer has several early `exit 0` short-circuits
+# (--skip-add, codex-not-found, the codex plugin path) that fire BEFORE the end of the script, so an
+# end-of-script check would be unreachable from those paths; the trap catches all exits.
+_exit_trap() {
+  local rc=$?
+  _report_not_done "$rc"
   if [[ "${_venv_fail:-0}" == "1" ]]; then
     log ""
     log "ERROR: venv runtime-requirements provisioning failed."
@@ -95,8 +140,11 @@ _venv_fail_trap() {
     log "       Re-run this installer to retry, or inspect the pip output above."
     exit 1
   fi
+  if [[ "$rc" -eq 0 && -n "${_not_done:-}" ]]; then
+    exit "$EXIT_NOT_DONE"
+  fi
 }
-trap _venv_fail_trap EXIT
+trap _exit_trap EXIT
 
 usage() {
   cat <<'EOF'
@@ -122,6 +170,15 @@ Options:
                     gate (#2563) treats as the deployable predecessors. Use only for
                     a deliberate untagged deploy (e.g. certifying an unreleased
                     merge commit); .deployed-version records alpha_tag=none.
+
+Exit codes:
+  0    finished; nothing left undone.
+  1    failed (an error line says why).
+  10   finished, WITH ITEMS NOT DONE: the marketplace was assembled, but a step was skipped (the
+       install_tier persist step refused to change config.json, or a Codex agent file could not
+       be installed). The run ends with a block that lists each item and what to do. Show that
+       block to the user. Code 10 is not a retry signal: running again fixes nothing until the
+       cause in the block is fixed.
 
 After running:
   $ENGRAM_HOME/marketplace/.claude-plugin/marketplace.json
@@ -520,8 +577,11 @@ if [[ $SKIP_BUILD -eq 0 ]] && [[ -n "${_cfg:-}" ]] && [[ -f "${_cfg}" ]] && comm
   # The write goes through the one file guard of this checkout (MERGE class: install_tier is the
   # one key written, every other key keeps its value and order, a changed file is backed up
   # first, an unchanged one is not touched, a file that does not parse is refused and left as is).
-  # A refusal is a warning here, not a failure: the tier is only remembered for the next upgrade.
-  if ! python3 - "${_cfg}" "${_tier:-}" "$REPO_ROOT/src/engram" <<'PY'
+  # A refusal does not stop the run and is not hidden: it is collected as an item NOT done and
+  # listed in the block at the end of the run (exit code 10). The tier is only remembered for the
+  # next upgrade, so nothing else depends on it. The reason line is kept (stderr) for that block.
+  _persist_err="$(mktemp "${TMPDIR:-/tmp}/install-local-marketplace-persist.XXXXXX")"
+  if ! python3 - "${_cfg}" "${_tier:-}" "$REPO_ROOT/src/engram" 2>"$_persist_err" <<'PY'
 import sys
 path, tier, guard_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 if not tier:
@@ -539,8 +599,13 @@ if result != 'unchanged':
     print(f"[install-local-marketplace] config.json updated: install_tier={tier}")
 PY
   then
-    log "WARNING: install_tier was not saved to ${_cfg} (see the line above); the file was left as it is, so pass --tier again on the next upgrade."
+    cat "$_persist_err" >&2
+    not_done "install_tier was not saved to ${_cfg} ($(tail -n 1 "$_persist_err" | sed 's/^\[install-local-marketplace\] //')). The file was left exactly as it was." \
+             "fix that file, or move it aside, then run this installer again; until then the next upgrade does not remember the tier."
+  else
+    cat "$_persist_err" >&2
   fi
+  rm -f "$_persist_err"
 fi
 
 # ── Tier-aware venv provisioning (Lei 2026-08-10, #576/#578) ──────────────────
@@ -957,7 +1022,8 @@ PY
     # the user's edits, so it is saved to a time-stamped backup first, and each
     # backup is printed as "backup: <file> -> <backup>". These are ENGRAM's own
     # file names, so no question is asked (one per upgrade would train a reflex yes).
-    if ! python3 - "$MARKETPLACE_ROOT/plugins/engram/agents" "$CODEX_AGENTS_DIR" "$REPO_ROOT/src/engram" <<'PY'
+    _codex_err="$(mktemp "${TMPDIR:-/tmp}/install-local-marketplace-codex.XXXXXX")"
+    if ! python3 - "$MARKETPLACE_ROOT/plugins/engram/agents" "$CODEX_AGENTS_DIR" "$REPO_ROOT/src/engram" 2>"$_codex_err" <<'PY'
 import sys
 from pathlib import Path
 src_dir, dest_dir, guard_dir = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
@@ -979,8 +1045,13 @@ except (fg.Refused, SystemExit) as exc:
     sys.exit(1)
 PY
     then
-      log "WARN: the Codex custom-agent files were not all installed (see the message above); nothing was overwritten without a backup."
+      cat "$_codex_err" >&2
+      not_done "the Codex custom-agent files were not all installed into ${CODEX_AGENTS_DIR} ($(tail -n 1 "$_codex_err" | sed 's/^\[install-local-marketplace\] //')). Nothing was overwritten without a backup." \
+               "fix the cause named there (for example, a folder sitting where a file should be), then run: bash tools/install-local-marketplace.sh --target codex"
+    else
+      cat "$_codex_err" >&2
     fi
+    rm -f "$_codex_err"
   else
     log "WARN: no Codex custom-agent TOML files found in $MARKETPLACE_ROOT/plugins/engram/agents"
   fi

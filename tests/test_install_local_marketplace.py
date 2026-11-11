@@ -512,9 +512,10 @@ _AGENT_WRITTEN = (
 )
 
 
-def _run_codex_agent_install(tmp_path, existing=None):
+def _run_codex_agent_install(tmp_path, existing=None, check=True):
     """Run the real installer for the codex target against a fake plugin that ships one agent file.
-    `existing` is a callable(agents_dir) that plants whatever sits in $CODEX_HOME/agents beforehand."""
+    `existing` is a callable(agents_dir) that plants whatever sits in $CODEX_HOME/agents beforehand.
+    `check=False` lets a cell look at a non-zero exit (code 10: finished, with items not done)."""
     build_root = tmp_path / "build" / "plugin"
     _write_fake_plugin(build_root, platform="codex", codex_agent=True)
     fake_bin = tmp_path / "bin"
@@ -532,7 +533,7 @@ def _run_codex_agent_install(tmp_path, existing=None):
         cwd=REPO_ROOT,
         env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root, CODEX_HOME=codex_home,
                  PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}"),
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check,
     )
     return result, agents_dir
 
@@ -575,11 +576,90 @@ def test_codex_agent_file_identical_to_what_would_be_written_is_not_touched(tmp_
     assert (agents / _AGENT_NAME).stat().st_mtime_ns == planted["mtime"], "an identical file was rewritten"
 
 
-def test_codex_agent_name_that_is_not_a_file_is_left_alone_with_a_warning(tmp_path):
-    result, agents = _run_codex_agent_install(tmp_path, lambda d: (d / _AGENT_NAME).mkdir())
+def _not_done_block(stdout):
+    """The lines of the end block (from its ITEMS NOT DONE heading to the end of the output)."""
+    lines = stdout.splitlines()
+    at = [i for i, ln in enumerate(lines) if "ITEMS NOT DONE" in ln]
+    assert len(at) == 1, "expected exactly one ITEMS NOT DONE block:\n" + stdout
+    return lines[at[0]:]
+
+
+_CODE_10_LINE = "Exit code 10 means: finished, with items not done."
+
+
+def test_codex_agent_name_that_is_not_a_file_is_left_alone_and_listed_in_the_end_block(tmp_path):
+    """A Codex agent file that cannot be installed does not stop the run and is not a bare warning:
+    the run finishes, ends with a block listing the item and what to do, and exits 10."""
+    result, agents = _run_codex_agent_install(tmp_path, lambda d: (d / _AGENT_NAME).mkdir(), check=False)
     assert (agents / _AGENT_NAME).is_dir() and not list((agents / _AGENT_NAME).iterdir())
-    assert "WARN" in result.stdout and "not all installed" in result.stdout
     assert _agent_backups(agents) == []
+    assert result.returncode == 10, (result.returncode, result.stdout, result.stderr)
+    block = "\n".join(_not_done_block(result.stdout))
+    assert "Codex custom-agent files were not all installed" in block and str(agents) in block
+    assert "What to do:" in block and "--target codex" in block
+    assert _CODE_10_LINE in block
+    # the run went past the item: the later steps ran, and the block is the LAST thing printed
+    assert "Codex marketplace installed/updated" in result.stdout
+    assert result.stdout.rstrip().endswith(_CODE_10_LINE)
+
+
+def _scratch_repo_for_a_full_run(tmp_path):
+    """A scratch repo whose installer runs WITHOUT --skip-build: a stub build-plugin.sh and the file guard."""
+    repo = _make_scratch_repo(tmp_path)
+    (repo / "tools" / "build-plugin.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (repo / "tools" / "build-plugin.sh").chmod(0o755)
+    shutil.copy(REPO_ROOT / "src" / "engram" / "engram_file_guard.py", repo / "src" / "engram" / "engram_file_guard.py")
+    return repo
+
+
+def _full_run(repo, tmp_path, config_bytes):
+    engram_home = tmp_path / "engram-home"
+    engram_home.mkdir()
+    (engram_home / "config.json").write_bytes(config_bytes)
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(repo / "tools" / "install-local-marketplace.sh"), "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=repo, env=_env(engram_home, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    return result, engram_home
+
+
+def test_install_tier_persist_refusal_does_not_stop_the_run_and_exits_10_with_the_block(tmp_path):
+    """The persist step refuses a config it cannot merge (here a duplicate key, which the earlier plain
+    read accepts). The run continues to the end, then lists the item and exits 10."""
+    repo = _scratch_repo_for_a_full_run(tmp_path)
+    content = b'{"install_tier": "dev", "install_tier": "essential"}'
+    result, home = _full_run(repo, tmp_path, content)
+    assert result.returncode == 10, (result.returncode, result.stdout, result.stderr)
+    assert (home / "config.json").read_bytes() == content
+    assert [p.name for p in home.iterdir() if ".engram-backup." in p.name] == []
+    assert (home / ".deployed-version").is_file() and (home / "marketplace" / ".claude-plugin" / "marketplace.json").is_file(), \
+        "the run stopped before the end"
+    block = "\n".join(_not_done_block(result.stdout))
+    assert "install_tier was not saved to" in block and str(home / "config.json") in block
+    assert "more than once" in block, "the block must carry the reason the guard gave"
+    assert "What to do:" in block and _CODE_10_LINE in block
+    assert result.stdout.rstrip().endswith(_CODE_10_LINE)
+    # the reason is also printed where it happened (not only in the block)
+    assert "config.json left unchanged" in result.stderr
+
+
+def test_a_clean_full_run_exits_0_with_no_block(tmp_path):
+    """Control for the two cells above: the same run with a config the guard can merge exits 0 and
+    prints no block, so the block and the code are not just always there."""
+    repo = _scratch_repo_for_a_full_run(tmp_path)
+    result, home = _full_run(repo, tmp_path, b'{"install_tier": "dev"}')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "ITEMS NOT DONE" not in result.stdout and "Exit code 10" not in result.stdout
+
+
+def test_help_documents_exit_code_10():
+    out = subprocess.run(["bash", str(INSTALLER), "--help"], capture_output=True, text=True).stdout
+    assert "Exit codes:" in out and "10   finished, WITH ITEMS NOT DONE" in out
+    assert "not a retry signal" in out
+    assert "# EXIT CODES:" in INSTALLER.read_text(), "the script header must document the code too"
 
 
 def _persist_tier_block():

@@ -1946,3 +1946,340 @@ def test_atomic_write_text_replaces_the_file_and_never_writes_through_a_hard_lin
     assert target.read_bytes() == b"new bytes\n" and stat_mode(target) == 0o640
     assert other_link.read_bytes() == b"old bytes\n", "the write went through the hard link"
     assert sorted(x.name for x in tmp_path.iterdir()) == ["other-link.txt", "t.txt"], "a temp file was left behind"
+
+
+# ------------------- replace_non_object: reachable only from set_forum_url --force, backup first
+
+def _replace_non_object_sites(source: str) -> list[tuple[int, str]]:
+    """(line, enclosing function) of every call that passes `replace_non_object` as anything but a
+    literal False: by keyword, by a `**kwargs` spread (cannot be read, so it counts), or as the
+    4th positional argument of merge_json_text."""
+    tree = ast.parse(source)
+    out: list[tuple[int, str]] = []
+
+    def walk(node: ast.AST, func: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            name = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else func
+            if isinstance(child, ast.Call):
+                callee = child.func.attr if isinstance(child.func, ast.Attribute) else getattr(child.func, "id", "")
+                for kw in child.keywords:
+                    if kw.arg is None or (kw.arg == "replace_non_object"
+                                          and not (isinstance(kw.value, ast.Constant) and kw.value.value is False)):
+                        out.append((child.lineno, func))
+                if callee == "merge_json_text" and len(child.args) >= 4:
+                    out.append((child.lineno, func))
+            walk(child, name)
+
+    walk(tree, "<module>")
+    return out
+
+
+def _true_assignments_are_behind_the_force_check(source: str) -> bool:
+    """In set_forum_url(): `replace_non_object` is assigned True exactly once, and that assignment
+    sits in a block where an earlier statement is `if not force: return ...`, so the flag can only
+    become True on the --force path."""
+    tree = ast.parse(source)
+    fn = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "set_forum_url"), None)
+    if fn is None:
+        return False
+    trues: list[tuple[list, int]] = []
+    for block_owner in ast.walk(fn):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(block_owner, field, None)
+            if not isinstance(block, list):
+                continue
+            for i, stmt in enumerate(block):
+                if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "replace_non_object" for t in stmt.targets):
+                    if not (isinstance(stmt.value, ast.Constant) and stmt.value.value in (True, False)):
+                        return False
+                    if stmt.value.value is True:
+                        trues.append((block, i))
+    if len(trues) != 1:
+        return False
+    block, at = trues[0]
+    for stmt in block[:at]:
+        if (isinstance(stmt, ast.If) and isinstance(stmt.test, ast.UnaryOp) and isinstance(stmt.test.op, ast.Not)
+                and isinstance(stmt.test.operand, ast.Name) and stmt.test.operand.id == "force"
+                and stmt.body and isinstance(stmt.body[-1], ast.Return)):
+            return True
+    return False
+
+
+_PLANTED_SECOND_CALLER = '''
+def other(p):
+    fg.apply_merge(p, {"install_tier": "dev"}, filename="config.json", replace_non_object=True)
+def third(p, kw):
+    fg.apply_merge(p, {}, **kw)
+def fourth(text):
+    return fg.merge_json_text("config.json", text, {}, True)
+def fine(p):
+    fg.apply_merge(p, {}, replace_non_object=False)
+'''
+
+_FORCE_GATED = '''
+def set_forum_url(path, url, *, force=False):
+    replace_non_object = False
+    if forum is None:
+        pass
+    else:
+        if not force:
+            return refuse()
+        replace_non_object = True
+    fg.apply_merge(path, {}, replace_non_object=replace_non_object)
+'''
+_NOT_GATED = _FORCE_GATED.replace("        if not force:\n            return refuse()\n", "")
+_TRUE_IN_NULL_BRANCH = _FORCE_GATED.replace("    if forum is None:\n        pass\n", "    if forum is None:\n        replace_non_object = True\n")
+
+
+def test_replace_non_object_is_passed_true_only_by_set_forum_url_on_its_force_path():
+    # planted controls: the scanner finds a second caller, a spread, a positional True; it ignores False
+    found = _replace_non_object_sites(_PLANTED_SECOND_CALLER)
+    assert sorted(fn for _ln, fn in found) == ["fourth", "other", "third"], found
+    assert _true_assignments_are_behind_the_force_check(_FORCE_GATED), "the good shape was rejected"
+    assert not _true_assignments_are_behind_the_force_check(_NOT_GATED), "an ungated True was accepted"
+    assert not _true_assignments_are_behind_the_force_check(_TRUE_IN_NULL_BRANCH), "a True outside the force path was accepted"
+    # the real tree: python files by AST, every other text file by name (shell heredocs, docs)
+    seen: set[Path] = set()
+    callers: list[str] = []
+    mentions: list[str] = []
+    for root in (SRC, REPO_ROOT / "tools"):
+        for path in sorted(root.rglob("*")):
+            real = path.resolve()
+            if real in seen or not real.is_file() or "__pycache__" in real.parts:
+                continue
+            seen.add(real)
+            try:
+                text = real.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            if "replace_non_object" not in text and "merge_json_text" not in text:
+                continue
+            if real.suffix == ".py":
+                for ln, fn in _replace_non_object_sites(text):
+                    if real.name == "engram_file_guard.py" and fn == "apply_merge":
+                        continue  # the guard only forwards the caller's value; it never decides it
+                    callers.append(f"{real.relative_to(REPO_ROOT).as_posix()}:{ln} in {fn}")
+            if "replace_non_object" in text and real.name not in ("engram_file_guard.py", "set_forum_url.py"):
+                mentions.append(real.relative_to(REPO_ROOT).as_posix())
+    assert len(callers) == 1 and callers[0].endswith(" in set_forum_url") and "set_forum_url.py" in callers[0], \
+        f"replace_non_object=True must have exactly one caller, set_forum_url: {callers}"
+    assert not mentions, f"another file names replace_non_object: {mentions}"
+    assert _true_assignments_are_behind_the_force_check(SET_FORUM_URL_PY.read_text()), \
+        "set_forum_url sets replace_non_object=True somewhere other than behind `if not force: return`"
+
+
+def test_set_forum_url_force_over_a_non_object_forum_takes_the_backup_first_and_prints_it(tmp_path):
+    cfg = tmp_path / "config.json"
+    old = (json.dumps({"agent": "user-authored", "forum": "not an object", "z": [1]}, indent=2) + "\n").encode()
+    cfg.write_bytes(old)
+    env = {**os.environ, "ENGRAM_HOME": str(tmp_path)}
+    tool = [sys.executable, str(SET_FORUM_URL_PY), "http://localhost:5002", "--config", str(cfg)]
+    refused = subprocess.run(tool, capture_output=True, text=True, env=env)  # the default stays refuse
+    assert refused.returncode == 2 and cfg.read_bytes() == old and _backups_of(cfg) == [], refused.stderr
+    assert _SHOW_THE_USER_RE.search(refused.stderr) and _YES_RE.search(refused.stderr), refused.stderr
+    done = subprocess.run(tool + ["--force"], capture_output=True, text=True, env=env)
+    assert done.returncode == 0, done.stderr
+    backups = _backups_of(cfg)
+    assert len(backups) == 1 and backups[0].read_bytes() == old, "the replaced value did not survive in a backup"
+    lines = done.stdout.splitlines()
+    want = f"  backup: {cfg} -> {backups[0]}"
+    assert want in lines, done.stdout
+    assert lines.index(want) < next(i for i, ln in enumerate(lines) if ln.startswith("written:")), \
+        "the backup line must come before the write is reported"
+    assert json.loads(cfg.read_text())["forum"] == {"url": "http://localhost:5002"}
+
+
+def test_set_forum_url_treats_an_explicit_null_forum_as_absent_with_backup_and_no_flag(tmp_path):
+    cfg = tmp_path / "config.json"
+    old = (json.dumps({"agent": "user-authored", "forum": None}, indent=2) + "\n").encode()
+    cfg.write_bytes(old)
+    env = {**os.environ, "ENGRAM_HOME": str(tmp_path)}
+    done = subprocess.run([sys.executable, str(SET_FORUM_URL_PY), "http://localhost:5002", "--config", str(cfg)],
+                          capture_output=True, text=True, env=env)
+    assert done.returncode == 0, done.stderr
+    backups = _backups_of(cfg)
+    assert len(backups) == 1 and backups[0].read_bytes() == old
+    assert f"  backup: {cfg} -> {backups[0]}" in done.stdout.splitlines(), done.stdout
+    # control: only null is special; a falsy value that is not null is still refused without --force
+    for other in (0, False, ""):
+        cfg.write_text(json.dumps({"forum": other}))
+        before = cfg.read_bytes()
+        r = subprocess.run([sys.executable, str(SET_FORUM_URL_PY), "http://localhost:5002", "--config", str(cfg)],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode == 2 and cfg.read_bytes() == before, (other, r.stderr)
+
+
+# --------------------- docs gate: set_forum_url --force names the "not even the right shape" case
+
+_FORCE_SHAPE_RE = re.compile(r"right shape", re.IGNORECASE)
+_FORUM_FORCE_RE = re.compile(r"set_forum_url|forum\.url", re.IGNORECASE)
+
+
+def _forum_force_paragraphs_missing_the_shape_sentence(text: str) -> list[tuple[int, str]]:
+    """Prose paragraphs that mention `--force` together with set_forum_url / forum.url but do not
+    say that --force may replace a value that is not even the right shape. Fenced lines skipped."""
+    out: list[tuple[int, str]] = []
+    para: list[tuple[int, str]] = []
+    in_fence = False
+
+    def flush() -> None:
+        if para:
+            body = " ".join(t for _n, t in para)
+            if re.search(r"(?<![\w-])--force\b", body) and _FORUM_FORCE_RE.search(body) \
+                    and not _FORCE_SHAPE_RE.search(body):
+                out.append((para[0][0], body[:100]))
+        para.clear()
+
+    for n, line in enumerate(text.split("\n"), 1):
+        if re.match(r"^\s*(?:>\s*)*(```|~~~)", line):
+            in_fence = not in_fence
+        elif in_fence:
+            continue
+        elif not line.strip():
+            flush()
+        elif re.search(r"\bcursor\b", line, re.IGNORECASE):
+            continue
+        else:
+            para.append((n, line))
+    flush()
+    return out
+
+
+def test_every_doc_that_tells_an_agent_about_set_forum_url_force_names_the_wrong_shape_case():
+    bad = "Pass `--force` to set_forum_url when the url differs. Show the user the old url; their yes first.\n"
+    good = bad.rstrip("\n") + " It may replace a value that is not even the right shape.\n"
+    assert [ln for ln, _ in _forum_force_paragraphs_missing_the_shape_sentence(bad)] == [1], "planted bad paragraph not found"
+    assert _forum_force_paragraphs_missing_the_shape_sentence(good) == [], "planted good paragraph was flagged"
+    docs = [REPO_ROOT / "README-AGENT.md", REPO_ROOT / "README.md", REPO_ROOT / "USER_GUIDE.md"]
+    docs += sorted((SRC / "skills").rglob("SKILL.md"))
+    docs += sorted((SRC / "agents").rglob("*.md"))
+    docs += sorted((REPO_ROOT / "deploy").rglob("*.md"))
+    docs += sorted(p for p in (REPO_ROOT / "docs").glob("*.md") if p.name != "CHANGELOG.md")
+    found: list[str] = []
+    mentioning = 0
+    for doc in docs:
+        try:
+            text = doc.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        hits = _forum_force_paragraphs_missing_the_shape_sentence(text)
+        found += [f"{doc.relative_to(REPO_ROOT).as_posix()}:{ln}: {txt}" for ln, txt in hits]
+        mentioning += bool(re.search(r"--force", text) and _FORUM_FORCE_RE.search(text))
+    assert mentioning >= 1, "no doc mentions set_forum_url --force any more; the gate no longer reads anything"
+    assert not found, ("a paragraph tells the agent about set_forum_url --force without saying it may replace a value "
+                       "that is not even the right shape:\n  " + "\n  ".join(found))
+    skill = (SRC / "skills" / "claude" / "engram-first-session" / "SKILL.md").read_text()
+    assert _FORCE_SHAPE_RE.search(skill) and "where the backup goes" in skill, \
+        "the first-session skill must carry the show-the-user sentence for the wrong-shape case"
+
+
+# ------------------- install-local-marketplace exit code 10 and its caller install.sh (step 5)
+
+MARKET_SH = SRC / "tools" / "install-local-marketplace.sh"
+
+
+def _market_persist_block() -> str:
+    """The python code of install-local-marketplace.sh's install_tier persist block."""
+    lines = MARKET_SH.read_text().splitlines()
+    found = []
+    for i, line in enumerate(lines):
+        if "<<'PY'" in line:
+            body = []
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip() == "PY":
+                    break
+                body.append(lines[j])
+            code = "\n".join(body)
+            if "install_tier" in code and "apply_merge" in code:
+                found.append(code)
+    assert len(found) == 1, "the install_tier persist block moved or vanished"
+    return found[0]
+
+
+def _plant_bytes(content: bytes):
+    def plant(path: Path) -> None:
+        path.write_bytes(content)
+    return plant
+
+
+def _plant_dangling_link(path: Path) -> None:
+    path.symlink_to(path.parent / "nowhere.json")
+
+
+def _plant_directory(path: Path) -> None:
+    path.mkdir()
+
+
+_UNMERGEABLE_CONFIGS = [
+    ("not-json", _plant_bytes(b"{not json")),
+    ("duplicate-key", _plant_bytes(b'{"install_tier": "dev", "install_tier": "essential"}')),
+    ("array", _plant_bytes(b"[1]")),
+    ("string", _plant_bytes(b'"text"')),
+    ("nan", _plant_bytes(b'{"a": NaN}')),
+    ("infinity", _plant_bytes(b'{"a": Infinity}')),
+    ("overflowing-number", _plant_bytes(b'{"a": 1e999}')),
+    ("not-utf8", _plant_bytes(b"\xff\xfe{}")),
+    ("empty-file", _plant_bytes(b"")),
+    ("dangling-link", _plant_dangling_link),
+    ("directory", _plant_directory),
+]
+
+
+def _persist_refuses(tmp_path: Path, plant) -> bool:
+    cfg = tmp_path / "config.json"
+    plant(cfg)
+    r = subprocess.run([sys.executable, "-c", _market_persist_block(), str(cfg), "convenience", str(SRC)],
+                       capture_output=True, text=True)
+    return r.returncode != 0
+
+
+def test_the_persist_block_and_install_sh_step_3_make_the_same_guard_call():
+    """Same guard call, same strict parse: both write install_tier through apply_merge on
+    config.json, with no private reader of their own in between."""
+    call = re.compile(r"""fg\.apply_merge\(Path\(path\), \{["']install_tier["']: tier\}, filename=["']config\.json["']""")
+    assert call.search(_market_persist_block()), "the persist block no longer calls apply_merge the way step 3 does"
+    assert call.search(INSTALL_SH.read_text()), "install.sh step 3 no longer calls apply_merge the way the persist block does"
+
+
+@pytest.mark.parametrize("name,plant", _UNMERGEABLE_CONFIGS, ids=[n for n, _ in _UNMERGEABLE_CONFIGS])
+def test_install_sh_step_3_refuses_everything_the_persist_block_would_refuse(tmp_path, name, plant):
+    """So through install.sh only a race can reach exit code 10 from the persist block: whatever it
+    would refuse, step 3 already refused (and stopped the install) before the marketplace step."""
+    (tmp_path / "persist").mkdir()
+    assert _persist_refuses(tmp_path / "persist", plant), \
+        f"{name}: the premise failed, the persist block does not refuse this shape"
+    sb = Sandbox(tmp_path / "sandbox")
+    sb.engram.mkdir(parents=True, exist_ok=True)
+    plant(sb.engram / "config.json")
+    r = sb.run("--yes")
+    assert r.returncode != 0 and "FAIL: [step 3]" in r.all, f"{name}: step 3 let it through\n{r.all}"
+    assert not sb.calls_starting("marketplace"), f"{name}: the marketplace step ran after step 3 should have stopped"
+
+
+def test_a_config_both_accept_is_accepted_by_both(tmp_path):
+    """Control for the cell above: the comparison can say 'accepted'. A mergeable config is not refused
+    by the persist block and install.sh runs on to the marketplace step."""
+    (tmp_path / "persist").mkdir()
+    assert not _persist_refuses(tmp_path / "persist", _plant_bytes(b'{"install_tier": "dev", "keep": 1}'))
+    sb = Sandbox(tmp_path / "sandbox")
+    sb.engram.mkdir(parents=True, exist_ok=True)
+    (sb.engram / "config.json").write_bytes(b'{"install_tier": "dev", "keep": 1}')
+    r = sb.run("--yes")
+    assert r.returncode == 0 and sb.calls_starting("marketplace"), r.all
+
+
+def test_install_sh_step_5_says_so_in_its_own_words_when_the_marketplace_step_exits_10(tmp_path):
+    """Exit 10 from install-local-marketplace.sh is still step 5's FAIL (steps 6-9 do not run), but
+    the line says: the step finished, items were not done, do what its block says, re-run. An operator
+    can then tell 'not installed' from 'installed, one item missing'."""
+    sb = Sandbox(tmp_path)
+    r = sb.run("--yes", env={"FAKE_MARKET_RC": "10"})
+    assert r.returncode != 0 and "FAIL: [step 5]" in r.stderr, r.all
+    fail_line = next(ln for ln in r.stderr.splitlines() if ln.startswith("FAIL: [step 5]"))
+    assert "finished" in fail_line and "items it did not do" in fail_line and "block above" in fail_line, fail_line
+    assert "re-run" in fail_line and "exited non-zero" not in fail_line, fail_line
+    assert not sb.calls_starting("bootstrap"), "step 6 ran after step 5 failed"
+    # control: any other non-zero exit still gets the generic line, so the 10 branch is not the only one
+    other = Sandbox(tmp_path / "other").run("--yes", env={"FAKE_MARKET_RC": "1"})
+    generic = next(ln for ln in other.stderr.splitlines() if ln.startswith("FAIL: [step 5]"))
+    assert "exited non-zero" in generic and "items it did not do" not in generic, generic

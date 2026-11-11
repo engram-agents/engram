@@ -407,10 +407,16 @@ class TestS4ForumKey:
         assert _tool().set_forum_url(p, URL).status == "written"
         assert json.loads(p.read_text())["forum"] == {"url": URL}
 
-    def test_null(self, tmp_path):
+    def test_null(self, tmp_path, capsys):
+        # An explicit null counts as absent: no flag is needed. The write still takes a stamped
+        # backup first and prints its "backup:" line, so the file as it was is kept.
         p = _cfg(tmp_path, {"forum": None})
+        old = p.read_bytes()
         assert _tool().set_forum_url(p, URL).status == "written"
         assert json.loads(p.read_text())["forum"] == {"url": URL}
+        backups = [q for q in tmp_path.iterdir() if ".engram-backup." in q.name]
+        assert len(backups) == 1 and backups[0].read_bytes() == old
+        assert f"backup: {p} -> {backups[0]}" in capsys.readouterr().out
 
     def test_dict_with_other_keys(self, tmp_path):
         p = _cfg(tmp_path, {"forum": {"poll": 30, "url": "", "z": [1]}})

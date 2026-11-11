@@ -181,6 +181,8 @@ bash tools/build-plugin.sh --tier dev                     # pick your tier
 bash tools/install-local-marketplace.sh --skip-build      # install the tree just built
 ```
 
+Exit code 10 from `install-local-marketplace.sh` means it finished with items not done (a step it skipped on purpose, such as saving `install_tier` into a `config.json` it would not change). Its last output is a block headed `ITEMS NOT DONE`; show that block to the user. Running it again does not fix an item until the cause in the block is fixed.
+
 (If `config.json` exists, the script reads it with `python3` and stops with an error
 when it cannot parse the file or `install_tier` is not a string. It will not quietly
 build at a tier you did not choose.)

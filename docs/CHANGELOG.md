@@ -30,7 +30,11 @@ with an `-alpha` suffix during the alpha phase.
   `bootstrap.py` before it writes. A Codex custom-agent file (`engram-*.toml`)
   that differs from the one setup installs is backed up first, and one line per
   file names the backup. Uninstall leaves both files as they are when
-  `<name>.pre-engram` is the same file as `<name>`.
+  `<name>.pre-engram` is the same file as `<name>`. When the marketplace
+  installer finishes but skips an item (saving `install_tier` into a config it
+  would not change, or a Codex agent file it could not install), it no longer
+  hides this in a warning: it ends with a block that lists each item and what to
+  do, and exits with code 10, "finished, with items not done".
 
 ## [v0.5.6] - 2026-11-10
 
