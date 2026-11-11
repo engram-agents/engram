@@ -743,7 +743,7 @@ jobs:
       - name: invariant-checks — scan-leaks (whole-repo structural invariant)
         if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Runs the real-repo integration test: scans the checked-out tree for
-        # structural leak patterns (private dev-repo URLs, main-repo paths) with
+        # structural leak patterns (the main-repo path pattern) with
         # no local personal-name config (CI has none). Exit 1 = leak found.
         run: python3 -m pytest tests/test_scan_leaks.py -q
 
