@@ -126,6 +126,8 @@ This single script is the whole agent-side upgrade: it **reads your `config.json
 
 **Exit code 10 is its own result: finished, with items not done.** The marketplace was assembled, but one or more steps were skipped (the `install_tier` save into `config.json` refused to change the file; a Codex agent file could not be installed). The script goes on past each one and ends with a block headed `ITEMS NOT DONE` that lists what was not done and what to do for each. When the exit code is 10, show the user that block. Code 10 is not a "retry" signal: running the script again fixes nothing until the cause named in the block is fixed, so do not loop on it. Any other non-zero exit is a failure; read the output above it.
 
+**On a Codex seat, relay the `backup:` lines.** With `--target codex`, an existing `engram-*.toml` in the Codex agents folder that differs from the one being installed is saved to a stamped backup first and then replaced, with one printed `backup:` line per file, no question and exit 0 (these are ENGRAM's own file names). The user may have edited such a file, so after the run show the user every `backup:` line: the file that was replaced and where its backup is.
+
 **Watch the build log for the feature-set lines** — this is where a silent mis-build would happen:
 - The tier line must match your install (e.g. `Tier: dev (rank=2), target: claude-code, …`). A dev-tier install that builds at a lower tier **silently drops** the dev surfaces (#704 class).
 - If your `install_tier` is null/unset, the build falls back to the manifest default (`convenience`) — a dev-tier install would silently lose its dev tools (#707). Set `install_tier` in `${ENGRAM_HOME:-$HOME/.engram}/config.json` before building if it's unset.

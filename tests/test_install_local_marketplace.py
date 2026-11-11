@@ -559,6 +559,15 @@ def test_codex_agent_file_that_differs_is_backed_up_and_the_backup_is_printed(tm
     assert [ln for ln in [planted] if "backup:" in ln and _AGENT_NAME in ln] == [planted]
 
 
+def test_upgrade_skill_tells_the_agent_to_show_the_codex_backup_lines():
+    """The Codex agent-file replace asks no question and exits 0, so the printed `backup:` line is the
+    only trace. The upgrade skill's Step 3 (what an agent upgrading a seat reads) must tell the agent
+    to show the user every such line."""
+    text = (REPO_ROOT / "src" / "engram" / "skills" / "claude" / "engram-upgrade" / "SKILL.md").read_text()
+    step3 = text[text.index("## Step 3"):text.index("## Step 4")]
+    assert "show the user every `backup:` line" in step3, "Step 3 lost the instruction to relay the Codex backup lines"
+
+
 def test_codex_agent_file_that_is_new_or_identical_gets_no_backup(tmp_path):
     result, agents = _run_codex_agent_install(tmp_path)  # absent: written
     assert (agents / _AGENT_NAME).read_text() == _AGENT_WRITTEN
@@ -653,6 +662,73 @@ def test_a_clean_full_run_exits_0_with_no_block(tmp_path):
     result, home = _full_run(repo, tmp_path, b'{"install_tier": "dev"}')
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "ITEMS NOT DONE" not in result.stdout and "Exit code 10" not in result.stdout
+
+
+def _trap_block():
+    """The installer's own text from `_venv_fail=0` through `trap _exit_trap EXIT` (the not-done
+    collector, the end block and the exit trap), so these cells run the shipped code, not a copy."""
+    lines = INSTALLER.read_text().splitlines()
+    start = lines.index("_venv_fail=0")
+    end = lines.index("trap _exit_trap EXIT")
+    return "\n".join(lines[start:end + 1])
+
+
+def _bashes():
+    """bash from PATH, plus /bin/bash when it is a different program (macOS ships bash 3.2 there)."""
+    found = [shutil.which("bash")]
+    if Path("/bin/bash").exists() and (not found[0] or not os.path.samefile("/bin/bash", found[0])):
+        found.append("/bin/bash")
+    return [b for b in found if b]
+
+
+def _run_trap(bash, body):
+    script = "set -euo pipefail\nlog() { printf '[ilm] %s\\n' \"$*\"; }\n" + _trap_block() + "\n" + body + "\n"
+    return subprocess.run([bash, "-c", script], capture_output=True, text=True, check=False)
+
+
+_ONE_ITEM = 'not_done "an item" "do a thing"'
+
+
+@pytest.mark.parametrize("bash", _bashes())
+def test_exit_trap_keeps_a_failure_code_over_10(bash):
+    """Precedence in the exit trap: an item collected and then a later failure keeps that failure's
+    code (10 only replaces a clean 0), and the block is still printed, without the code-10 line."""
+    result = _run_trap(bash, _ONE_ITEM + "\nexit 3")
+    assert result.returncode == 3, (result.returncode, result.stdout, result.stderr)
+    assert "ITEMS NOT DONE (1)" in result.stdout and "an item" in result.stdout
+    assert "Exit code 10" not in result.stdout
+
+
+@pytest.mark.parametrize("bash", _bashes())
+def test_exit_trap_venv_failure_wins_over_10(bash):
+    """A venv provisioning failure exits 1 even with items collected and a clean 0 underneath, and
+    the code-10 line is not printed (it would describe the wrong code)."""
+    result = _run_trap(bash, _ONE_ITEM + "\n_venv_fail=1\nexit 0")
+    assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+    assert "ITEMS NOT DONE (1)" in result.stdout and "venv runtime-requirements provisioning failed" in result.stdout
+    assert "Exit code 10" not in result.stdout
+
+
+@pytest.mark.parametrize("bash", _bashes())
+def test_exit_trap_clean_exit_with_an_item_is_10_and_no_item_is_0(bash):
+    """Controls for the two cells above: the same harness gives 10 (with the code-10 line) for an
+    item over a clean exit, and 0 with no block when nothing was collected."""
+    with_item = _run_trap(bash, _ONE_ITEM + "\nexit 0")
+    assert with_item.returncode == 10 and _CODE_10_LINE in with_item.stdout, with_item.stdout
+    nothing = _run_trap(bash, "exit 0")
+    assert nothing.returncode == 0 and "ITEMS NOT DONE" not in nothing.stdout, nothing.stdout
+
+
+@pytest.mark.parametrize("bash", _bashes())
+def test_end_block_lists_items_with_no_extra_empty_line(bash):
+    """The item list in the end block is followed by exactly one empty line under every bash on the
+    machine, including macOS /bin/bash 3.2 (which does not expand $'\\n' inside a heredoc body)."""
+    result = _run_trap(bash, _ONE_ITEM + '\nnot_done "a second item" "do another thing"\nexit 0')
+    block = _not_done_block(result.stdout)
+    texts = [ln.removeprefix("[ilm]").strip() for ln in block]
+    last_item = max(i for i, t in enumerate(texts) if t.startswith("What to do:"))
+    assert texts[last_item + 1] == "" and texts[last_item + 2].startswith("Show this list"), \
+        (bash, "\n".join(block))
 
 
 def test_help_documents_exit_code_10():

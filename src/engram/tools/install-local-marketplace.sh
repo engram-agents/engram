@@ -117,8 +117,11 @@ _report_not_done() {
   log "═══════════════════════════════════════════════════════════════════"
   log "The marketplace step finished, but these items were not done:"
   log ""
+  # Strip the trailing newline here, not inside the heredoc: bash 3.2 does not expand $'\n' in a
+  # heredoc body, so the list would end with an extra empty line there.
+  local _nd_body="${_not_done%$'\n'}"
   while IFS= read -r _nd_line; do log "$_nd_line"; done <<EOF_ND
-${_not_done%$'\n'}
+${_nd_body}
 EOF_ND
   log ""
   log "Show this list to the user. Running the installer again does not fix an item until its cause is fixed."

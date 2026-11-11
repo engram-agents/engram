@@ -493,6 +493,10 @@ class TestS6Atomic:
         assert r.status != "written", r
         assert p.read_bytes() == before
         assert _no_temp_left(tmp_path, ["config.json"], with_backups=True)
+        # The stamped backup is a copy taken BEFORE the write (the failing os.replace is the write's
+        # last step), so exactly one exists and it holds the old bytes; a second file is a stray.
+        backups = [x for x in tmp_path.iterdir() if ".engram-backup." in x.name]
+        assert len(backups) == 1 and backups[0].read_bytes() == before, backups
 
     def test_mode_preserved(self, tmp_path):
         p = _cfg(tmp_path, {})
