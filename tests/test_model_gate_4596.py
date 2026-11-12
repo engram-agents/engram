@@ -1299,3 +1299,27 @@ def test_c16_a_spec_with_frontmatter_and_no_tools_line_inherits_every_tool_so_it
 def test_c16_a_file_without_frontmatter_is_not_an_agent_spec(tmp_path):
     (tmp_path / "README.md").write_text("# Agents\n\nmodel: sonnet\ntools: none\n", encoding="utf-8")
     assert writer_specs_with_a_model(tmp_path) == (set(), [])
+
+
+# -- Round 7 (Kepler, crossing 27718): the write-gate hook prints its notice on a relative ENGRAM_HOME even though
+# the shipped server routes refuse to start there.  Premise: "the ENGRAM MCP server never starts with a relative
+# ENGRAM_HOME", pinned on both start routes so a change that lets it start turns red.
+#   launcher route: tests/test_launchers_relative_engram_home_3863.py
+#       ::test_L1_L5_a_relative_engram_home_is_refused_before_any_side_effect[src/engram/launch-engram-server.sh-*]
+#       (exact rc 2, the refusal line on stderr, empty stdout, nothing created, no external command run, so no
+#       server can start); not duplicated here.
+#   direct route: the cell below.
+
+def test_r7_a_direct_server_start_on_a_relative_engram_home_refuses_non_zero_and_serves_nothing(tmp_path):
+    if importlib.util.find_spec("fastmcp") is None:
+        pytest.skip("fastmcp is not importable in this interpreter; server.py cannot reach the home resolution")
+    home, cwd = tmp_path / "home", tmp_path / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "ENGRAM_HOME": "rel/home", "PYTHONDONTWRITEBYTECODE": "1"}
+    done = subprocess.run([sys.executable, str(SRC_ENGRAM / "server.py")], input="", capture_output=True,
+                          text=True, env=env, cwd=str(cwd), timeout=60)
+    assert done.returncode != 0, (done.returncode, done.stderr[-400:])
+    assert done.stdout == "", done.stdout[:300]
+    assert "ENGRAM_HOME must be an absolute path, got 'rel/home'" in done.stderr, done.stderr[-400:]
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == ["cwd", "home"]

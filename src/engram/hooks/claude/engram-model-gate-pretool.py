@@ -303,6 +303,10 @@ def main():
         # A SystemExit is `_hooklib`'s refusal of a relative ENGRAM_HOME: it already wrote its one stderr line,
         # which names the value (the #3863 rule), so this hook adds no line of its own and does not re-import
         # `_hooklib` to ask about dormancy (that would print the refusal again).  Any other failure: own line.
+        # On this path the shipped server routes refuse to start (pinned by tests/test_model_gate_4596.py
+        # ::test_r7_a_direct_server_start_on_a_relative_engram_home_refuses_non_zero_and_serves_nothing and the
+        # launcher cell in test_launchers_relative_engram_home_3863.py); the notice is printed anyway because a
+        # server started with its own environment could still be live (Kepler 27718, Borges's PR amendment).
         refused = _IMPORT_ERROR == "SystemExit"
         if not refused:
             sys.stderr.write("engram model-gate: helper import failed (%s); the gate did not run\n" % _IMPORT_ERROR)
