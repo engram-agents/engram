@@ -35,6 +35,19 @@ on:
     # convention"); update this filter if the default branch ever moves.
     branches: [dev]
   pull_request:
+    # `edited` is load-bearing, not a convenience. What this workflow scans is
+    # `git diff "$BASE_SHA"...HEAD` — the pull request's diff — so a base-branch
+    # retarget replaces the entire subject of the scan. Without `edited` the
+    # gate does not re-run, and the previous run's success stays attached to the
+    # head commit: check runs bind to the commit, not to the base. The status
+    # list then shows a green tick describing a diff that no longer exists. That
+    # is the same false tick this file's header (#4429) exists to forbid, via a
+    # route the header did not name.
+    #
+    # The job-level `if` below keeps a title or body edit from buying a runner
+    # start: `edited` fires for those too, and only a base change invalidates
+    # the previous run.
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -44,6 +57,18 @@ jobs:
     # The status context a reviewer sees. Fork PRs get the distinct name that
     # says the gate did not run; the token is load-bearing.
     name: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'name-leak-gate (NOT SCANNED - fork PR)' || 'name-leak-gate' }}
+    # `edited` fires for a title or body change as well as for a retarget, but
+    # `changes.base` is populated only when the base ref actually moved. Running
+    # on every edit would cost a runner start each time and re-introduce the
+    # known same-SHA double run; running on a non-base edit would also replace a
+    # good result with an identical one. Skip everything else.
+    #
+    # A skipped job reports the conclusion `skipped` under this job's `name`,
+    # which GitHub counts as satisfied for a required status check — so the
+    # guard does not strand a required check, and it is not this fix's job to
+    # decide whether the gate should be required (it is not, on `dev` or
+    # `main`, as of 2026-11-12).
+    if: github.event.action != 'edited' || github.event.changes.base != null
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
