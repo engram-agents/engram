@@ -44,9 +44,8 @@ on:
     # is the same false tick this file's header (#4429) exists to forbid, via a
     # route the header did not name.
     #
-    # The job-level `if` below keeps a title or body edit from buying a runner
-    # start: `edited` fires for those too, and only a base change invalidates
-    # the previous run.
+    # There is deliberately NO job-level `if` to trim the title/body case.
+    # See the job block below for why a skip is a false tick.
     types: [opened, synchronize, reopened, edited]
 
 permissions:
