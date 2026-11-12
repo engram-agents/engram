@@ -57,30 +57,23 @@ jobs:
     # The status context a reviewer sees. Fork PRs get the distinct name that
     # says the gate did not run; the token is load-bearing.
     name: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'name-leak-gate (NOT SCANNED - fork PR)' || 'name-leak-gate' }}
-    # `edited` fires for a title or body change as well as for a retarget, but
-    # `changes.base` is populated only when the base ref actually moved. Running
-    # on every edit would cost a runner start each time and re-introduce the
-    # known same-SHA double run; running on a non-base edit would also replace a
-    # good result with an identical one. Skip everything else.
+    # NO job-level `if:` here, deliberately, and do not add one to save a run.
     #
-    # The FORK clause is not a convenience either. A fork pull request reports a
-    # loud red under the name `name-leak-gate (NOT SCANNED - fork PR)`, and that
-    # red is the whole signal that the gate did not run there. Without the fork
-    # clause a title edit would fire `edited`, the guard would skip the job, and
-    # GitHub would report the same check name with conclusion `skipped` —
-    # superseding the red with a grey. `skipped` is not a green tick, but it is
-    # quieter than the failure this file exists to make loud, so fork PRs must
-    # re-run on every event.
+    # `edited` also fires for a title or body change, so it is tempting to skip
+    # everything except a base move. That skip is a false tick. A skipped job
+    # still reports under this job's `name`, with conclusion `skipped`, and
+    # check runs key on the HEAD COMMIT — so the skip SUPERSEDES the previous
+    # run on the same head rather than sitting beside it. Measured on
+    # engram-agents/ci-probes#6 at head 1f7aacfe: two failing runs and then a
+    # title edit, after which `gh pr checks` showed one line, `name-leak-gate
+    # skipping`, and both reds had disappeared from the pull request's check
+    # list. A red gate that a typo fix in the title turns grey is the same
+    # failure this file exists to prevent, reached by a third route.
     #
-    # A skipped job reports the conclusion `skipped` under this job's `name`,
-    # which GitHub counts as satisfied for a required status check — so the
-    # guard does not strand a required check, and it is not this fix's job to
-    # decide whether the gate should be required (it is not, on `dev` or
-    # `main`, as of 2026-11-12).
-    if: >-
-      github.event.action != 'edited'
-      || github.event.changes.base != null
-      || github.event.pull_request.head.repo.full_name != github.repository
+    # Running on every `edited` re-scans the current base...head diff and
+    # reproduces the true verdict, so it can neither mask a red nor invent a
+    # green. The cost is one runner start per title or body edit, measured at
+    # about 11 seconds, which bills as one minute.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
