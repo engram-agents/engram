@@ -41,10 +41,22 @@ except ValueError as _exc:
     ENGRAM_HOME = None
     _HOME_REFUSAL = str(_exc)
 if _HOME_REFUSAL is None:
-    REPO = _first([os.environ.get("ENGRAM_REPO"),
-                   os.path.expanduser("~/engram-alpha"),
-                   os.path.expanduser("~/src/engram-alpha"),
-                   os.path.expanduser("~/GitHub/engram-alpha")], "the engram-alpha checkout")
+    _repo_cands = [os.path.expanduser(p) for p in
+                   ("~/engram", "~/engram-alpha", "~/src/engram", "~/src/engram-alpha",
+                    "~/GitHub/engram", "~/GitHub/engram-alpha")]
+    # A checkout the cwd is inside of (a linked worktree counts) wins over the order; ENGRAM_REPO first.
+    # Same rule as _hooklib.pick_checkout and supervision_probe.py; keep the copies in step.
+    try:
+        _cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        _cwd = ""
+    for _c in _repo_cands:
+        _r = os.path.realpath(_c)
+        if os.path.isdir(_c) and _cwd and (_cwd == _r or _cwd.startswith(_r.rstrip(os.sep) + os.sep)):
+            _repo_cands.remove(_c)
+            _repo_cands.insert(0, _c)
+            break
+    REPO = _first([os.environ.get("ENGRAM_REPO")] + _repo_cands, "the engram checkout")
     LIVE = _first([os.path.join(ENGRAM_HOME, "knowledge.db")], "your knowledge.db")
     PY   = _first([os.environ.get("ENGRAM_PY"),
                    os.path.join(os.path.expanduser("~"), ".engram", "venv", "bin", "python3"),

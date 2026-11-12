@@ -170,9 +170,9 @@ filer verified the condition and declined the close because this carve-out
 existed in the commander's table and not in the filer's; the asymmetry was the
 defect, and this paragraph is the shared table.)*
 
-## Scope — the substrate gate is **engram-alpha only**
+## Scope — the substrate gate is **engram only**
 
-The substrate-feature gate below is **engram-alpha-specific**. Other repos in the org carry their own **delegated** merge authority, set by Lei per project:
+The substrate-feature gate below is **engram-specific**. Other repos in the org carry their own **delegated** merge authority, set by Lei per project:
 
 - **umwelt** — merges are **Borges's + Ariadne's** to make (Lei, 2026-07-03: *"umwelt is yours to maintain"*); Lei removed *his* gate on umwelt, including for umwelt substrate-level / new-mechanism changes. The review discipline (reviewer-fairy → counterpart-colleague → CI-green) still holds; only the final merge is the team's, not Lei's. *(Amended 2026-08-22 by the two-holder grant below: Kepler is added to the merge authority; existing authorities — Ariadne's own lane included — are unchanged.)*
 - **soma** — Ariadne is the principal approver + merger (Lei, 2026-06-21).
@@ -199,7 +199,7 @@ catch, 2026-08-22, adopted). The one-person seat existed to serialize merges,
 not because one person was special — two holders keep that property by
 mechanism, not luck:
 
-- **Default repo lanes**: Borges holds engram-alpha's queue, Kepler holds
+- **Default repo lanes**: Borges holds engram's queue, Kepler holds
   umwelt's. Crossing into the other's lane is fine and takes **one line saying
   so first** — never a silent concurrent merge into the same tip. *(Amended
   2026-10-22 by *Owner merge* below: for project owners the lanes are suspended
@@ -231,7 +231,7 @@ mechanism, not luck:
   the review-scope lines above as "the security seat", which today means Zephyr's exact-head approval, with Mira's read
   additive and never a substitute for it.
 
-So "flip to Lei for substrate" is an **engram-alpha** rule. Do not extend it to a delegated-authority repo; do not relax it inside engram-alpha beyond what the 2026-09-27 delegation above grants. When you're unsure which repo's rule applies, the repo you're merging *into* decides.
+So "flip to Lei for substrate" is an **engram** rule. Do not extend it to a delegated-authority repo; do not relax it inside engram beyond what the 2026-09-27 delegation above grants. When you're unsure which repo's rule applies, the repo you're merging *into* decides.
 
 ## Owner merge (Lei, 2026-10-21 and 2026-10-22) — every project owner merges converged non-substrate PRs under the written gate
 
@@ -274,7 +274,7 @@ contradicting rules behind."* The surfaces changed in the same PR: this section,
 **Who.** The **owner of the project the PR belongs to** (the Project Register in the
 Workshop, an in-world surface, not a file in this repo) merges it. Not the colleague
 who approved it, and not a seat that merely holds the baton. **Scope:** owner merge
-applies on every org repo whose merge authority is the team's (engram-alpha under this
+applies on every org repo whose merge authority is the team's (engram under this
 policy, umwelt, local-model-lab, gpu-broker and the rest under the 2026-08-22 grant);
 soma stays Ariadne's as principal approver and merger (*Scope* above). Two groups go
 to the **merge seats** instead (Kepler and Borges on all org repos, with Ariadne on
@@ -424,7 +424,7 @@ seat can run it and any other seat can check that it ran.
    linked stack merges with `gh stack merge` (plain `gh pr merge` is refused there).
    On a repo with no `dev` branch (local-model-lab and gpu-broker, both read
    2026-11-03), every PR targets `main` and merges as a **squash**. The merge-commit
-   rule above is engram-alpha's rule for release cuts, hotfixes and reconciles; it
+   rule above is engram's rule for release cuts, hotfixes and reconciles; it
    does not apply there. Both of those repos set `squash_merge_commit_message` to
    `COMMIT_MESSAGES`, so the branch's commit messages ride into the squash and the
    close-keyword read covers them (CLAUDE.md § PR — issue closure, check 3).
@@ -549,7 +549,7 @@ So at every `baton flip … <maintainer>`, ask: *is this a substrate concept cha
 
 ### Baton turn-target corollary
 
-The "flip to Lei" half applies **only to substrate PRs** (in engram-alpha). For a fix / non-substrate PR, the maintainer (pool sentinel) — **not Lei** — is the merge-ready turn-target; the agent team merges it directly after colleague-convergence + CI-green. Setting `turn: lei` on a non-substrate baton is the anti-pattern: it produces a stuck baton that no one can advance, because Lei isn't gating that class (origin: PR #1333, a forum brand rename, whose baton was parked at Lei and stuck after merge — #1442). Match the turn-target to the class: substrate whose design Lei has not read → Lei; everything else, including substrate implementing a design he read → maintainer.
+The "flip to Lei" half applies **only to substrate PRs** (in engram). For a fix / non-substrate PR, the maintainer (pool sentinel) — **not Lei** — is the merge-ready turn-target; the agent team merges it directly after colleague-convergence + CI-green. Setting `turn: lei` on a non-substrate baton is the anti-pattern: it produces a stuck baton that no one can advance, because Lei isn't gating that class (origin: PR #1333, a forum brand rename, whose baton was parked at Lei and stuck after merge — #1442). Match the turn-target to the class: substrate whose design Lei has not read → Lei; everything else, including substrate implementing a design he read → maintainer.
 
 ## Gray areas
 
@@ -862,8 +862,9 @@ In the same command as the press, the step:
 - (a) asserts the base is the SHA the run was built on, or the previous step's merge
   commit;
 - (b) polls until `mergeStateStatus` reads `CLEAN`, or until a read of every run of
-  the repo's required check on the head (on engram-alpha's `dev` ruleset that check
-  is `pr-checks`) prints `success`. The poll is bounded at five minutes. Past that
+  the repo's required check on the head (on engram's `dev` ruleset, which requires a PR, 1 approval, stale approvals
+  dismissed on push, last-push approval and the status check `pr-checks`, that
+  check is `pr-checks`) prints `success`. The poll is bounded at five minutes. Past that
   ceiling the press refuses and names the last state it read;
 - (c) after the press, asserts that the base's tree equals the tree the run predicted
   for that step.

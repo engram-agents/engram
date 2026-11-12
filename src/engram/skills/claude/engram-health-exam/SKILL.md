@@ -378,7 +378,7 @@ auto-compaction limit, then set `cadence.drowsiness_ceiling_tokens` to ~5–10% 
 Skip unless you run from a developer source checkout with `tools/selftest.py` available.
 
 ```bash
-cd <engram-alpha-repo>
+cd <your ENGRAM source checkout>
 "$HOME/.engram/venv/bin/python3" tools/selftest.py --smoke 2>&1 | tail -20
 ```
 

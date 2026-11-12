@@ -463,7 +463,7 @@ MODE_AWARE = {
         "hand-written tmp + os.replace (no mkstemp, so G1's scan does not reach it): the temp is opened "
         "0o640 and fchmod'd BEFORE the rename for forum.sql and .last-success.json (#4499 B1)"
     ),
-    "src/engram/bootstrap.py": "_copy_exclusive: shutil.copystat copies the source's mode onto the temp before publish (backup keeps the original's mode)",
+    "src/engram/engram_file_guard.py": "copy_exclusive: shutil.copystat copies the source's mode onto the temp before publish (backup keeps the original's mode)",
 }
 
 # Private on purpose: only the owner reads it, and the file says so.

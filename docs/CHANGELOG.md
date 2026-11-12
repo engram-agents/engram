@@ -9,6 +9,23 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+### Installer and setup safety
+
+- Setup never silently overwrites or deletes a file you or your agent wrote. It
+  backs the file up first, and it replaces it only on an explicit flag passed
+  after your yes: `--replace PATH` for one file, `--force` for every file the
+  refusal listed. One refusal names every such file and the backup each would
+  get. A file that already holds what setup would write is left untouched. The
+  installer's question about an existing `CLAUDE.md` now defaults to No.
+  `bootstrap.py` never seeds a new graph beside an existing agent's memory, even
+  with `--force`. A fresh start is moving the whole data home aside.
+  A backup keeps the file's bytes, mode and modification time, not extended
+  attributes or ACLs. Backups accumulate, and nothing deletes them
+  automatically. When setup sets one of its own keys in a settings or config
+  file (`cleanupPeriodDays`, `install_tier`, `forum.url`), it backs the file
+  up first, keeps every other key in value and order, and leaves a file that
+  does not parse as it is.
+
 ## [v0.5.6] - 2026-11-10
 
 A patch release. Its reason is an external security review of v0.5.5. This

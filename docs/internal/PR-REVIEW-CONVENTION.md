@@ -44,7 +44,7 @@ not the gate.
 **A quiet week is not confirmation.** A preventive gate's successes are invisible
 by construction, so the falsifier can fire and the corresponding confirmation
 cannot. Read the falsifier log —
-engram-alpha's `docs/internal/conclusion-warrant-falsifier-log.md`
+engram's `docs/internal/conclusion-warrant-falsifier-log.md`
 — not the silence. The log deliberately **does not start clean**: its first
 entry is a case where the box would have been filled in honestly — every claim
 enumerated, the unmeasured half named explicitly — and the claim sentence two
@@ -232,7 +232,7 @@ Kepler's own amendment on alpha#2270 states the relation between this test and t
 
 it happened twice on engram-alpha (#2618, #2697), both scrubbing the same colleague's credit, both against Lei's already-ruled test.
 
-The gates themselves are CI steps in engram-alpha's `pr-checks.yml`
+The gates themselves are CI steps in engram's `pr-checks.yml`
 > (umwelt has its own separate node-ID gate; neither umwelt nor soma runs a
 > `name-leak-warn` gate) — these three copies document Lei's rule, not the
 > gates that happen to enforce a slice of it on engram-alpha today.
