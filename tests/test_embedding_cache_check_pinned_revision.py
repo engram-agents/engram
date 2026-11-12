@@ -71,6 +71,11 @@ def _write_snapshot(cache: Path, repo_id: str, sha: str, refs_main: bool) -> Non
 
 @pytest.fixture
 def server(tmp_path, monkeypatch):
+    # tests.yml, nightly.yml and affected-tests.yml set ENGRAM_NO_EMBEDDINGS=1 for the whole
+    # job, and the startup gate returns early when it is set: the (f) cells would then never
+    # reach the FATAL text they assert on. test_prewarm_embeddings.py pops it per cell for the
+    # same reason.
+    monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)
     srv = _import_server()
     import huggingface_hub.constants as hub_constants
     cache = tmp_path / "hub"
