@@ -123,6 +123,8 @@ e = os.environ
 open(e["CALLS_LOG"], "a").write("bootstrap FORCE_RESEED_EMPTY=%s FORCE=%s TARGET=%s ALPHA_DIR=%s TEMPLATES=%s PYTHON_BIN=%s\\n" % (
     e.get("FORCE_RESEED_EMPTY", "unset"), e.get("FORCE", "unset"), e.get("TARGET"), e.get("ALPHA_DIR"),
     e.get("ALPHA_TEMPLATES_DIR"), e.get("PYTHON_BIN")))
+import json
+open(e["CALLS_LOG"], "a").write("argv-of-bootstrap " +json.dumps(sys.argv[1:]) + "\\n")
 if int(e.get("FAKE_BOOTSTRAP_RC", "0")):
     print("bootstrap fake: failing")
     sys.exit(int(e["FAKE_BOOTSTRAP_RC"]))
@@ -704,7 +706,7 @@ def test_the_three_ruled_defaults_are_named_constants_near_the_top():
     head = REAL_INSTALL_SH.read_text().splitlines()[:60]
     text = "\n".join(head)
     assert "DEFAULT_INSTALL_CLAUDE_CODE=0" in text
-    assert "DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD=1" in text
+    assert "DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD=0" in text
     assert "DEFAULT_RECALL_SERVICE=1" in text
 
 

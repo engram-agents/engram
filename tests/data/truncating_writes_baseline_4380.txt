@@ -7,11 +7,6 @@
 # added to the collector. The three os.open:nonconst-flags lines are READ-ONLY opens
 # (O_RDONLY plus an attribute lookup the collector cannot resolve); the other new lines are existing
 # append / copy sites, reviewed and left as they are.
-src/engram/bootstrap.py::_render_codex_target::write_text
-src/engram/bootstrap.py::main::write_text
-src/engram/bootstrap.py::main::write_text
-src/engram/bootstrap.py::merge_codex_config_toml::write_text
-src/engram/bootstrap.py::substitute_template::write_text
 src/engram/engram_core.py::_commit_snapshot_sync::write_text
 src/engram/engram_core.py::_ensure_engram_gitignore::write_text
 src/engram/engram_core.py::_install_rewrite_guard::write_bytes

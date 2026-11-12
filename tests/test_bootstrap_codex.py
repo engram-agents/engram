@@ -67,11 +67,12 @@ def _bootstrap_env(
     return env
 
 
-def _run_bootstrap(workdir: Path, target: str, extra: dict[str, str] | None = None):
+def _run_bootstrap(workdir: Path, target: str, extra: dict[str, str] | None = None,
+                   args: list[str] | None = None):
     """Run bootstrap.py and return the CompletedProcess."""
     env = _bootstrap_env(workdir, target, extra)
     return subprocess.run(
-        [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
+        [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py"), *(args or [])],
         env=env,
         capture_output=True,
         text=True,
@@ -336,13 +337,13 @@ def test_codex_config_toml_merge_idempotency():
             "After first run: experimental_compact_prompt_file appears more than once"
         )
 
-        # Remove the knowledge.db so bootstrap can run again (FORCE bypasses the
-        # overwrite-refusal guard for the DB; config.toml is separate).
-        db_path = workdir / ".engram" / "knowledge.db"
-        db_path.unlink(missing_ok=True)
+        # Empty the whole data home so bootstrap can run again (a home that still holds
+        # an agent's memory is never seeded over); config.toml is separate and stays.
+        shutil.rmtree(workdir / ".engram")
+        (workdir / ".engram").mkdir()
 
-        # Second run (FORCE=1 so the DB check is bypassed)
-        result2 = _run_bootstrap(workdir, "codex", extra={"FORCE": "1"})
+        # Second run: config.toml already holds exactly what bootstrap would write
+        result2 = _run_bootstrap(workdir, "codex")
         assert result2.returncode == 0, (
             f"Second codex bootstrap failed:\n{result2.stdout}\n{result2.stderr}"
         )
@@ -384,8 +385,9 @@ def test_codex_config_toml_preserves_preexisting_stanzas():
         )
         (codex_home / "config.toml").write_text(preexisting_stanzas)
 
-        # Run bootstrap (FORCE=1 not needed since no DB exists yet)
-        result = _run_bootstrap(workdir, "codex")
+        # Run bootstrap with --force: config.toml exists and differs, so replacing it
+        # (backed up first) needs the consent flag
+        result = _run_bootstrap(workdir, "codex", args=["--force"])
         assert result.returncode == 0, (
             f"codex bootstrap failed:\n{result.stdout}\n{result.stderr}"
         )

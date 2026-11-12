@@ -11,8 +11,8 @@ Contract (written before the implementation):
   * A dangling symlink is "present": refused with and without --force.
   * Codex: config.toml is backed up once to config.toml.pre-engram before the first
     rewrite; the merge keeps foreign stanzas; a dangling symlink is refused.
-  * install.sh passes --force to bootstrap only on the path where CLAUDE.md exists
-    and its own consent/backup step succeeded.
+  * install.sh passes `--replace <CLAUDE.md>` (never --force) to bootstrap only on the path
+    where CLAUDE.md exists and its own consent/backup step succeeded.
   * uninstall: current CLAUDE.md is copied to CLAUDE.md.pre-uninstall.<UTC> first,
     then the pre-engram backup is restored; with no backup, CLAUDE.md is untouched.
 
@@ -129,33 +129,27 @@ def test_claude_refusal_then_force_rerun_succeeds(tmp_path):
 
 
 def test_claude_late_guard_refusal_says_db_was_seeded_and_gives_recovery(tmp_path):
-    """The late (post-seeding) guard's refusal must not read like the early one.
+    """The late (post-seeding) check's refusal must not read like the early one.
 
-    Late path, constructed from the outside: a seed-manifest.json with made-up IDs makes
-    the early prediction render exactly the user's file, so the early guard passes; the
-    real seeding then mints different IDs, so the late guard refuses.
+    Late path, constructed from the outside: the predicted seed IDs are replaced by made-up
+    ones and CLAUDE.md is planted as exactly that prediction, so the check-only pass finds it
+    identical; the real seeding then mints the real IDs, so the second check refuses.
     """
-    first = _run(tmp_path)
-    assert first.returncode == 0, first.stdout + first.stderr
     md = tmp_path / ".claude" / "CLAUDE.md"
-    manifest = tmp_path / ".engram" / "seed-manifest.json"
-    data = json.loads(manifest.read_text())
-    text = md.read_text()
-    fake = {}
-    for i, (k, v) in enumerate(data["seed_ids"].items()):
-        fake[k] = v[:3] + f"{9001 + i}"
-        text = text.replace(v, fake[k])
-    data["seed_ids"] = fake
-    manifest.write_text(json.dumps(data))
-    md.write_text(text)
-    _db(tmp_path).unlink()
-    r = _run(tmp_path)
-    assert r.returncode != 0
-    assert md.read_text() == text
-    lines = [ln for ln in (r.stderr + r.stdout).splitlines() if "REFUSED" in ln]
-    assert len(lines) == 1, lines
-    msg = lines[0]
-    assert msg.startswith("[bootstrap] REFUSED:"), msg
+    md.parent.mkdir()
+    r = _probe(tmp_path, (
+        "import os\nos.environ['PYTHON_BIN'] = sys.executable\n"
+        "bootstrap._FIXED_SEED_IDS = {k: v[:3] + str(9001 + i) for i, (k, v) in enumerate(bootstrap._FIXED_SEED_IDS.items())}\n"
+        "Path(sys.argv[1]).write_text(bootstrap._predicted_claude_render())\n"
+        "sys.argv = ['bootstrap.py']\n"
+        "bootstrap.main()\n"
+    ), str(md))
+    assert r.returncode != 0, r.stdout + r.stderr
+    planted = md.read_text()
+    assert "9001" in planted, "the planted file is not the made-up prediction"
+    msg = r.stderr + r.stdout
+    assert msg.count("REFUSED") == 1, msg
+    assert "[bootstrap] REFUSED:" in msg
     assert str(md) in msg
     assert "already seeded" in msg
     assert str(_db(tmp_path)) in msg
@@ -167,8 +161,8 @@ def test_claude_identical_existing_file_is_not_refused(tmp_path):
     assert first.returncode == 0, first.stdout + first.stderr
     md = tmp_path / ".claude" / "CLAUDE.md"
     rendered = md.read_bytes()
-    # An aborted-then-retried install: empty graph again, same render.
-    _db(tmp_path).unlink()
+    # A retried install over an emptied data home: same render.
+    shutil.rmtree(tmp_path / ".engram")
     r = _run(tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert md.read_bytes() == rendered
@@ -224,7 +218,11 @@ def test_claude_dangling_symlink_refused_even_with_force(tmp_path):
     assert not _db(tmp_path).exists()
 
 
-def test_claude_dangling_backup_link_refused_under_force_and_nothing_written(tmp_path):
+def _stamped_backups(parent: Path, name: str):
+    return sorted(p for p in parent.iterdir() if p.name.startswith(name + ".engram-backup."))
+
+
+def test_claude_dangling_backup_link_is_left_alone_and_a_stamped_backup_is_made(tmp_path):
     md = tmp_path / ".claude" / "CLAUDE.md"
     md.parent.mkdir()
     md.write_bytes(b"my own instructions\n")
@@ -232,33 +230,23 @@ def test_claude_dangling_backup_link_refused_under_force_and_nothing_written(tmp
     gone = tmp_path / "nowhere-backup.md"
     bak.symlink_to(gone)
     r = _run(tmp_path, args=["--force"])
-    assert r.returncode != 0
-    lines = [ln for ln in (r.stderr + r.stdout).splitlines() if "REFUSED" in ln]
-    assert len(lines) == 1, lines
-    assert lines[0].startswith("[bootstrap] REFUSED:"), lines[0]
-    assert str(bak) in lines[0] and str(gone) in lines[0]
-    assert "kept untouched" not in (r.stderr + r.stdout)
-    assert md.read_bytes() == b"my own instructions\n"
+    assert r.returncode == 0, r.stdout + r.stderr
     assert bak.is_symlink() and not gone.exists(), "never write through the link"
-    assert not _db(tmp_path).exists()
+    assert [p.read_bytes() for p in _stamped_backups(md.parent, "CLAUDE.md")] == [b"my own instructions\n"]
+    assert md.read_bytes() != b"my own instructions\n"
 
 
-def test_claude_directory_at_backup_path_refused_under_force_and_nothing_written(tmp_path):
+def test_claude_directory_at_backup_path_is_left_alone_and_a_stamped_backup_is_made(tmp_path):
     md = tmp_path / ".claude" / "CLAUDE.md"
     md.parent.mkdir()
     md.write_bytes(b"my own instructions\n")
     bak = tmp_path / ".claude" / "CLAUDE.md.pre-engram"
     bak.mkdir()
     r = _run(tmp_path, args=["--force"])
-    assert r.returncode != 0
-    lines = [ln for ln in (r.stderr + r.stdout).splitlines() if "REFUSED" in ln]
-    assert len(lines) == 1, lines
-    assert lines[0].startswith("[bootstrap] REFUSED:"), lines[0]
-    assert str(bak) in lines[0] and "not a regular file" in lines[0]
-    assert "kept untouched" not in (r.stderr + r.stdout)
-    assert md.read_bytes() == b"my own instructions\n"
+    assert r.returncode == 0, r.stdout + r.stderr
     assert bak.is_dir() and not list(bak.iterdir())
-    assert not _db(tmp_path).exists()
+    assert [p.read_bytes() for p in _stamped_backups(md.parent, "CLAUDE.md")] == [b"my own instructions\n"]
+    assert md.read_bytes() != b"my own instructions\n"
 
 
 def test_claude_valid_backup_symlink_counts_as_existing_backup(tmp_path):
@@ -273,27 +261,29 @@ def test_claude_valid_backup_symlink_counts_as_existing_backup(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert real.read_bytes() == b"first original\n"
     assert bak.is_symlink()
-    assert "kept untouched" in r.stdout
+    assert [p.read_bytes() for p in _stamped_backups(md.parent, "CLAUDE.md")] == [b"current\n"]
     assert md.read_bytes() != b"current\n"
 
 
-def test_claude_hard_link_at_backup_path_refused_under_force_and_nothing_written(tmp_path):
+def _assert_refused_for_obstructed_backup(tmp_path, r, target, bak, original):
+    """The backup name is the same file as the target: refuse, write nothing, name the remedy."""
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert out.count("REFUSED") == 1 and str(bak) in out and "same file" in out
+    assert "Move that backup name aside" in out
+    assert target.read_bytes() == original and bak.read_bytes() == original
+    assert not _stamped_backups(target.parent, target.name), "no stamped backup on a refusal"
+    assert not _db(tmp_path).exists(), "nothing is seeded behind a refusal"
+
+
+def test_claude_hard_link_at_backup_path_is_refused_even_with_force(tmp_path):
     md = tmp_path / ".claude" / "CLAUDE.md"
     md.parent.mkdir()
     md.write_bytes(b"my own instructions\n")
     bak = tmp_path / ".claude" / "CLAUDE.md.pre-engram"
     os.link(md, bak)
     r = _run(tmp_path, args=["--force"])
-    assert r.returncode != 0
-    lines = [ln for ln in (r.stderr + r.stdout).splitlines() if "REFUSED" in ln]
-    assert len(lines) == 1, lines
-    assert lines[0].startswith("[bootstrap] REFUSED:"), lines[0]
-    assert str(md) in lines[0] and str(bak) in lines[0]
-    assert "same file" in lines[0]
-    assert "kept untouched" not in (r.stderr + r.stdout)
-    assert md.read_bytes() == b"my own instructions\n"
-    assert bak.read_bytes() == b"my own instructions\n"
-    assert not _db(tmp_path).exists()
+    _assert_refused_for_obstructed_backup(tmp_path, r, md, bak, b"my own instructions\n")
 
 
 def _probe(tmp_path: Path, body: str, *argv: str) -> subprocess.CompletedProcess:
@@ -418,6 +408,7 @@ def test_force_midcopy_failure_refuses_keeps_claude_md_then_rerun_backs_up_exact
     assert md.read_bytes() == b"my own instructions, long enough to be cut\n"
     assert not os.path.lexists(bak)
     assert not list(md.parent.glob("*.partial-*"))
+    assert not _db(tmp_path).exists(), "the backup failed before anything was seeded"
     r2 = _run(tmp_path, args=["--force"])
     assert r2.returncode == 0, r2.stdout + r2.stderr
     assert bak.read_bytes() == b"my own instructions, long enough to be cut\n"
@@ -474,8 +465,8 @@ def test_backup_once_turns_a_file_that_appeared_into_a_one_line_refusal(tmp_path
     bak = tmp_path / "CLAUDE.md.pre-engram"
     bak.write_bytes(b"appeared in the window\n")
     r = _probe(tmp_path, (
-        "real = bootstrap._target_present\n"
-        "bootstrap._target_present = lambda p: False if Path(p) == Path(sys.argv[2]) else real(p)\n"
+        "real = bootstrap.fg.target_present\n"
+        "bootstrap.fg.target_present = lambda p: False if Path(p) == Path(sys.argv[2]) else real(p)\n"
         "bootstrap._backup_once(Path(sys.argv[1]), Path(sys.argv[2]))\n"
     ), str(src), str(bak))
     assert r.returncode != 0
@@ -486,21 +477,15 @@ def test_backup_once_turns_a_file_that_appeared_into_a_one_line_refusal(tmp_path
     assert src.read_bytes() == b"source bytes\n"
 
 
-def test_claude_symlink_to_target_at_backup_path_refused_by_samefile_arm(tmp_path):
+def test_claude_symlink_to_target_at_backup_path_is_refused_even_with_force(tmp_path):
     md = tmp_path / ".claude" / "CLAUDE.md"
     md.parent.mkdir()
     md.write_bytes(b"my own instructions\n")
     bak = tmp_path / ".claude" / "CLAUDE.md.pre-engram"
     os.symlink(md, bak)
     r = _run(tmp_path, args=["--force"])
-    assert r.returncode != 0
-    lines = [ln for ln in (r.stderr + r.stdout).splitlines() if "REFUSED" in ln]
-    assert len(lines) == 1, lines
-    assert lines[0].startswith("[bootstrap] REFUSED:")
-    assert str(md) in lines[0] and str(bak) in lines[0] and "same file" in lines[0]
-    assert "not a regular file" not in lines[0]
-    assert md.read_bytes() == b"my own instructions\n"
-    assert not _db(tmp_path).exists()
+    _assert_refused_for_obstructed_backup(tmp_path, r, md, bak, b"my own instructions\n")
+    assert bak.is_symlink()
 
 
 # ------------------------------------------------------- shared helper (static)
@@ -512,10 +497,12 @@ def _fn_source(src: str, name: str) -> str:
 
 
 def test_shared_helper_is_lexists_and_used_by_both_paths():
-    src = BOOTSTRAP.read_text()
-    assert "os.path.lexists" in _fn_source(src, "_target_present")
-    assert "_target_present(" in _fn_source(src, "_identity_file_state")
-    assert "_target_present(" in _fn_source(src, "_codex_config_preflight")
+    src = (SRC / "engram_file_guard.py").read_text()
+    assert "os.path.lexists" in _fn_source(src, "target_present")
+    assert "target_present(" in _fn_source(src, "classify")
+    assert "target_present(" in _fn_source(src, "_next_backup_name")
+    boot = BOOTSTRAP.read_text()
+    assert "fg.plan(" in boot and "fg.apply(" in boot, "bootstrap decides and writes through the guard"
 
 
 def test_backup_name_is_the_installers_name():
@@ -542,18 +529,23 @@ def test_codex_backup_made_once_with_original_bytes(tmp_path):
     cfg.parent.mkdir()
     original = b'instructions = """\nmine\n"""\n[plugins.someone]\nkey = "v"\n'
     cfg.write_bytes(original)
-    r = _run(tmp_path, target="codex")
+    assert _run(tmp_path, target="codex").returncode != 0, "a differing config.toml needs consent"
+    assert cfg.read_bytes() == original
+    r = _run(tmp_path, target="codex", args=["--force"])
     assert r.returncode == 0, r.stdout + r.stderr
     bak = tmp_path / ".codex" / "config.toml.pre-engram"
     assert bak.read_bytes() == original
-    # second rewrite (re-render over an empty graph): backup untouched
-    _db(tmp_path).unlink()
+    # second run over an emptied data home: config.toml already holds what would be written,
+    # so it is left alone and the backup is untouched
+    shutil.rmtree(tmp_path / ".engram")
     mtime = bak.stat().st_mtime_ns
     time.sleep(0.01)
     r2 = _run(tmp_path, target="codex")
     assert r2.returncode == 0, r2.stdout + r2.stderr
     assert bak.read_bytes() == original
     assert bak.stat().st_mtime_ns == mtime
+    # only the first (consented) run saved anything: the second run wrote nothing
+    assert len([p for p in cfg.parent.iterdir() if p.name.startswith("config.toml.engram-backup.")]) == 1
 
 
 def test_codex_no_config_means_no_backup(tmp_path):
@@ -567,8 +559,8 @@ def test_codex_foreign_stanza_survives_rerender_byte_for_byte(tmp_path):
     cfg.parent.mkdir()
     stanza = '[plugins.someone]\nkey = "value"\nother = 3\n'
     cfg.write_text(stanza)
-    assert _run(tmp_path, target="codex").returncode == 0
-    _db(tmp_path).unlink()
+    assert _run(tmp_path, target="codex", args=["--force"]).returncode == 0
+    shutil.rmtree(tmp_path / ".engram")
     assert _run(tmp_path, target="codex").returncode == 0
     assert stanza in cfg.read_text()
     assert cfg.read_text().count('instructions = """') == 1
@@ -586,74 +578,60 @@ def test_codex_dangling_symlink_refused(tmp_path):
     assert "symlink" in (r.stderr + r.stdout)
 
 
-def test_codex_dangling_backup_link_refused_and_config_untouched(tmp_path):
+def test_codex_dangling_backup_link_is_left_alone_and_a_stamped_backup_is_made(tmp_path):
     cfg = tmp_path / ".codex" / "config.toml"
     cfg.parent.mkdir()
     cfg.write_bytes(b'model = "x"\n')
     bak = tmp_path / ".codex" / "config.toml.pre-engram"
     gone = tmp_path / "nowhere-backup.toml"
     bak.symlink_to(gone)
-    r = _run(tmp_path, target="codex")
-    assert r.returncode != 0
-    lines = [ln for ln in (r.stderr + r.stdout).splitlines() if "REFUSED" in ln]
-    assert len(lines) == 1, lines
-    assert lines[0].startswith("[bootstrap] REFUSED:")
-    assert str(bak) in lines[0] and str(gone) in lines[0]
-    assert cfg.read_bytes() == b'model = "x"\n'
+    r = _run(tmp_path, target="codex", args=["--force"])
+    assert r.returncode == 0, r.stdout + r.stderr
     assert bak.is_symlink() and not gone.exists()
-    assert not _db(tmp_path).exists()
+    assert [p.read_bytes() for p in _stamped_backups(cfg.parent, "config.toml")] == [b'model = "x"\n']
 
 
-def test_codex_directory_at_backup_path_refused_and_config_untouched(tmp_path):
+def test_codex_directory_at_backup_path_is_left_alone_and_a_stamped_backup_is_made(tmp_path):
     cfg = tmp_path / ".codex" / "config.toml"
     cfg.parent.mkdir()
     cfg.write_bytes(b'model = "x"\n')
     bak = tmp_path / ".codex" / "config.toml.pre-engram"
     bak.mkdir()
-    r = _run(tmp_path, target="codex")
-    assert r.returncode != 0
-    lines = [ln for ln in (r.stderr + r.stdout).splitlines() if "REFUSED" in ln]
-    assert len(lines) == 1, lines
-    assert lines[0].startswith("[bootstrap] REFUSED:")
-    assert str(bak) in lines[0] and "not a regular file" in lines[0]
-    assert "kept untouched" not in (r.stderr + r.stdout)
-    assert cfg.read_bytes() == b'model = "x"\n'
+    r = _run(tmp_path, target="codex", args=["--force"])
+    assert r.returncode == 0, r.stdout + r.stderr
     assert bak.is_dir() and not list(bak.iterdir())
-    assert not _db(tmp_path).exists()
+    assert [p.read_bytes() for p in _stamped_backups(cfg.parent, "config.toml")] == [b'model = "x"\n']
 
 
-def test_codex_hard_link_at_backup_path_refused_and_config_untouched(tmp_path):
+def test_codex_hard_link_at_backup_path_is_refused_even_with_force(tmp_path):
     cfg = tmp_path / ".codex" / "config.toml"
     cfg.parent.mkdir()
     cfg.write_bytes(b'model = "x"\n')
     bak = tmp_path / ".codex" / "config.toml.pre-engram"
     os.link(cfg, bak)
-    r = _run(tmp_path, target="codex")
-    assert r.returncode != 0
-    lines = [ln for ln in (r.stderr + r.stdout).splitlines() if "REFUSED" in ln]
-    assert len(lines) == 1, lines
-    assert lines[0].startswith("[bootstrap] REFUSED:")
-    assert str(cfg) in lines[0] and str(bak) in lines[0] and "same file" in lines[0]
-    assert "kept untouched" not in (r.stderr + r.stdout)
-    assert cfg.read_bytes() == b'model = "x"\n'
-    assert bak.read_bytes() == b'model = "x"\n'
-    assert not _db(tmp_path).exists()
+    r = _run(tmp_path, target="codex", args=["--force"])
+    _assert_refused_for_obstructed_backup(tmp_path, r, cfg, bak, b'model = "x"\n')
 
 
 # --------------------------------------------------------------- install.sh
 
 def test_install_sh_passes_force_only_when_claude_md_exists_after_consent():
+    """(Name kept from the original cell.) install.sh passes `--replace "$CLAUDE_MD"` (yes to
+    that one file), never `--force` (yes to every path), and only after the consent/backup step."""
     sh = INSTALL_SH.read_text()
-    # Every bootstrap invocation takes its args from one variable ...
+    # Every bootstrap invocation takes its args from one array variable ...
     calls = re.findall(r'"\$VENV_PY" "\$PLUGIN_ROOT/bootstrap\.py"([^\n]*)', sh)
     assert len(calls) == 2, calls
     for tail in calls:
-        assert "_bootstrap_flags" in tail, tail
-    # ... which is set to --force in exactly one place, inside the existing-CLAUDE.md branch,
-    # after the consent/backup `fail` guard and the backup copy.
-    assigns = [m.start() for m in re.finditer(r'_bootstrap_flags=.*--force', sh)]
+        assert "_bootstrap_flags[@]" in tail, tail
+    # ... the installer's code never mentions --force ...
+    code = "\n".join(ln for ln in sh.splitlines() if not ln.lstrip().startswith("#"))
+    assert "--force" not in code
+    # ... and the array is set to `--replace "$CLAUDE_MD"` in exactly one place, inside the
+    # existing-CLAUDE.md branch, after the consent/backup `fail` guard and the backup copy.
+    assigns = [m.start() for m in re.finditer(r'_bootstrap_flags=\(--replace "\$CLAUDE_MD"\)', sh)]
     assert len(assigns) == 1
-    default = sh.index('_bootstrap_flags=""')
+    default = sh.index('_bootstrap_flags=()')
     consent = sh.index('exists and was not backed up')
     note = sh.index("printf '[step 6] CLAUDE.md: %s\\n'")
     assert default < consent < assigns[0] < note

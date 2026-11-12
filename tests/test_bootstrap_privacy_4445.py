@@ -183,7 +183,9 @@ def test_c1d_atomic_write_leaves_no_temp_sibling(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     names = {p.name for p in (tmp_path / ".claude").iterdir()}
     stray = [n for n in names if n != "settings.json" and "settings" in n]
-    assert not stray, stray
+    # The merge (MERGE class) takes ONE stamped backup of the file before changing it; nothing else.
+    assert len(stray) == 1 and ".engram-backup." in stray[0], stray
+    assert (tmp_path / ".claude" / stray[0]).read_bytes() == b'{"model": "x"}\n'
     assert not [n for n in names if "tmp" in n.lower() or n.endswith(".partial")]
 
 
@@ -1007,8 +1009,12 @@ def test_c6_final_write_oserror_is_refused_with_install_otherwise_complete(tmp_p
         f"sys.argv = [{str(BOOTSTRAP)!r}, '--retention-days', '90']\n"
         f"spec = importlib.util.spec_from_file_location('bootstrap_4445w', {str(BOOTSTRAP)!r})\n"
         "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
-        "def boom(*a, **k): raise OSError(28, 'No space left on device')\n"
-        "m._atomic_write_text = boom\n"
+        # The settings.json write now happens inside the guard's merge; fail only that one write.
+        "real = m.fg.atomic_write_text\n"
+        "def boom(path, *a, **k):\n"
+        "    if str(path).endswith('settings.json'): raise OSError(28, 'No space left on device')\n"
+        "    return real(path, *a, **k)\n"
+        "m.fg.atomic_write_text = boom\n"
         "m.main()\n"
     )
     env = os.environ.copy()
