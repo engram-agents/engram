@@ -1646,9 +1646,15 @@ def test_bootstrap_refusal_for_a_broken_settings_file_offers_repair_or_move_asid
 
 GUARD_ALLOWLIST = [
     {"func": "copy_exclusive", "call": "os.fdopen(fd, 'wb')", "reason": "writes the private temp it created (mkstemp)"},
-    {"func": "copy_exclusive", "call": "os.link(temp, dst)", "reason": "publishes exclusively: FileExistsError for anything at dst"},
-    {"func": "copy_exclusive", "call": "os.replace(temp, dst)", "reason": "only on a filesystem without hard links, and only after dst was found absent"},
     {"func": "copy_exclusive", "call": "os.unlink(temp)", "reason": "removes the temp this call created"},
+    {"func": "_publish_new", "call": "os.link(temp, dst)", "reason": "publishes exclusively: FileExistsError for anything at dst"},
+    {"func": "_publish_new", "call": "os.replace(temp, dst)", "reason": "only on a filesystem without hard links, and only after dst was found absent"},
+    {"func": "create_exclusive", "call": "os.fdopen(fd, 'w', encoding='utf-8')",
+     "reason": "writes the unique temp tempfile.mkstemp created beside the new file"},
+    {"func": "create_exclusive", "call": "os.unlink(temp)", "reason": "removes the temp this call created"},
+    {"func": "write_in_place", "call": "os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)",
+     "reason": "rewrites an existing regular file in its own inode, after its backup; no link followed, no FIFO "
+               "waited on (pinned by tests/test_guard_write_keeps_metadata.py)"},
     {"func": "atomic_write_text", "call": "os.fdopen(fd, 'w', encoding='utf-8')",
      "reason": "writes the unique exclusive temp tempfile.mkstemp created beside the target"},
     {"func": "atomic_write_text", "call": "os.replace(tmp, path)", "reason": "atomic publish: never writes through the target"},

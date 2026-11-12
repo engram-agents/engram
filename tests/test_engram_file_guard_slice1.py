@@ -377,7 +377,7 @@ def test_apply_backs_up_every_differing_path_before_writing_any(tmp_path, monkey
     events: list[str] = []
     real_copy, real_write = fg.copy_exclusive, fg._write
     monkeypatch.setattr(fg, "copy_exclusive", lambda s, d: (events.append("backup"), real_copy(s, d))[1])
-    monkeypatch.setattr(fg, "_write", lambda p, t: (events.append("write"), real_write(p, t))[1])
+    monkeypatch.setattr(fg, "_write", lambda p, t, *rest: (events.append("write"), real_write(p, t, *rest))[1])
     fg.apply(fg.plan([fg.Item(a, "n"), fg.Item(b, "n")], STAMP), fg.consent_for(True, []))
     assert events == ["backup", "backup", "write", "write"], events
 
