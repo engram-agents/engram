@@ -7,8 +7,9 @@ replaced only on an explicit consent that the user gave (`--replace PATH`, or `-
 Shape:
   plan(items)           check-only: classify every path, pick its backup name. Writes nothing.
   refusal(plan, consent) ONE message naming every path that still needs consent, or None.
-  apply(plan, consent)  re-check, then write: absent -> write; identical -> nothing;
-                        differs and consented -> backup first, then atomic write.
+  apply(plan, consent)  re-check, then write: absent -> create (exclusive, all at once);
+                        identical -> nothing; differs and consented -> backup first, then
+                        rewrite in place (same inode: mode, owner, links, ACL, xattrs kept).
 
 States of a path: absent, identical (already holds the new text), differs, dangling (a symlink
 to nothing), blocked (present but not a regular file, so it cannot be saved or replaced),
@@ -337,20 +338,111 @@ def copy_exclusive(src: Path, dst: Path) -> None:
             temp_f.flush()
             os.fsync(temp_f.fileno())
         shutil.copystat(src, temp)
-        try:
-            os.link(temp, dst)
-        except FileExistsError:
-            raise
-        except OSError as e:
-            if e.errno not in _NO_HARDLINK_ERRNOS:
-                raise
-            os.replace(temp, dst)
+        _publish_new(temp, dst)
     finally:
         if temp is not None:
             try:
                 os.unlink(temp)
             except FileNotFoundError:
                 pass
+
+
+def _publish_new(temp: str, dst: Path) -> None:
+    """Publish the finished `temp` at `dst` with os.link: atomic, and FileExistsError for
+    anything at `dst`. On a filesystem without hard links, os.replace (the limit is stated in
+    copy_exclusive). The caller unlinks `temp` afterwards."""
+    try:
+        os.link(temp, dst)
+    except FileExistsError:
+        raise
+    except OSError as e:
+        if e.errno not in _NO_HARDLINK_ERRNOS:
+            raise
+        os.replace(temp, dst)
+
+
+def create_exclusive(path: Path, text: str, mode: int) -> None:
+    """Create the NEW file `path` holding `text` with permission `mode`, all at once; raise
+    FileExistsError, writing nothing there, if anything is at `path` (a symlink included).
+
+    Built in a unique sibling temp (tempfile.mkstemp), fsync'd, set to `mode`, then published
+    the way copy_exclusive publishes a backup. No partial file can appear at `path`, and the
+    temp is always removed.
+    """
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp, mode)
+        _publish_new(temp, path)
+    finally:
+        try:
+            os.unlink(temp)
+        except FileNotFoundError:
+            pass
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _replace_contents(fd: int, data: bytes) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    _write_all(fd, data)
+    os.fsync(fd)
+
+
+def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
+    """Rewrite the EXISTING regular file `path` with `text`, in place. `backup` is the copy
+    the caller already saved (None only for an ENGRAM-owned file, which is never backed up).
+
+    In place, not temp file + rename: a rename gives the path a new inode, and with it go the
+    file's ACL and extended attributes, its owner and group, and its other hard links. Writing
+    into the same inode keeps all of them, as v0.5.6 did. What that gives up is atomicity, which
+    is why every caller saves the stamped backup BEFORE calling this, and why a write that
+    fails part-way first puts the old bytes back. Every failure is a SystemExit with one
+    REFUSED line naming `backup`.
+
+    The open does not follow a link (O_NOFOLLOW: a link put at `path` after the check is
+    refused, not written through) and does not wait on a FIFO (O_NONBLOCK); anything that is
+    not a regular file is refused before a byte is written.
+    """
+    if backup is not None:
+        saved = f"A copy of it from before this run is at {backup}."
+        restore = f"Restore it with: cp -p '{backup}' '{path}'"
+    else:
+        saved = restore = "ENGRAM owns this file and keeps no backup of it; re-run setup to write it again."
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:
+        raise SystemExit(f"[bootstrap] REFUSED: could not open {path} to write it ({e}); it was not changed. {saved}")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SystemExit(f"[bootstrap] REFUSED: {path} is not a regular file, so it was not written. {saved}")
+        old = b""
+        while chunk := os.read(fd, 1 << 20):
+            old += chunk
+        try:
+            _replace_contents(fd, text.encode("utf-8"))
+        except OSError as e:
+            try:
+                _replace_contents(fd, old)
+            except OSError as e2:
+                raise SystemExit(
+                    f"[bootstrap] REFUSED: could not write {path} ({e}), and putting its previous "
+                    f"contents back also failed ({e2}), so it may be incomplete. {restore}"
+                )
+            raise SystemExit(
+                f"[bootstrap] REFUSED: could not write {path} ({e}); its previous contents were "
+                f"put back. {saved}"
+            )
+    finally:
+        os.close(fd)
 
 
 def atomic_write_text(path: Path, text: str, mode: int) -> None:
@@ -471,17 +563,28 @@ def save_backup(path: Path, first_identity: bool, stamp: str) -> Path:
     return _copy_to_free_name(path, lambda: _next_backup_name(path, stamp))
 
 
-def _write(path: Path, text: str) -> None:
-    """Write `text` over/into `path`, keeping a symlink in place and an existing file's mode."""
+def _write(path: Path, text: str, backup: "Path | None" = None) -> None:
+    """Write `text` over/into `path`, keeping a symlink in place (its target is written).
+
+    An existing file is rewritten IN PLACE (write_in_place), never by temp file + rename: a
+    rename replaces the inode, which silently drops the file's ACL and extended attributes
+    (and its owner, group and other hard links). The stamped backup `backup` was saved before
+    this runs. A new file is created exclusively and all at once (create_exclusive).
+    """
     target = Path(os.path.realpath(path)) if path.is_symlink() else path
     target.parent.mkdir(parents=True, exist_ok=True)
     if target_present(target):
-        mode = os.stat(target).st_mode & 0o7777
-    else:
-        old = os.umask(0)
-        os.umask(old)
-        mode = 0o666 & ~old
-    atomic_write_text(target, text, mode)
+        write_in_place(target, text, backup)
+        return
+    old = os.umask(0)
+    os.umask(old)
+    try:
+        create_exclusive(target, text, 0o666 & ~old)
+    except FileExistsError:
+        raise SystemExit(
+            f"[bootstrap] REFUSED: something appeared at {target} after the check, so nothing was "
+            f"written there. Look at it, move it aside if it is not yours to keep, then re-run."
+        )
 
 
 def save_backups(p: Plan, consent: Consent = NO_CONSENT) -> "dict[str, Path]":
@@ -526,11 +629,13 @@ def apply(p: Plan, consent: Consent = NO_CONSENT, context: str = "",
     msg = refusal(fresh, consent, context)
     if msg is not None:
         raise Refused(msg)
+    backups: dict[str, Path] = {}
     for e in fresh.entries:
         if e.state == "differs":
             have = saved.get(_key(e.path))
             if have is None or not target_present(have) or not _same_bytes(e.path, have):
-                save_backup(e.path, e.first_identity, fresh.stamp)
+                have = save_backup(e.path, e.first_identity, fresh.stamp)
+            backups[_key(e.path)] = have
     written: list[Path] = []
     for e in fresh.entries:
         if e.state == "identical" or (e.state == "absent" and e.new_text is None):
@@ -538,7 +643,7 @@ def apply(p: Plan, consent: Consent = NO_CONSENT, context: str = "",
         if e.new_text is None:
             os.unlink(e.path)
         else:
-            _write(e.path, e.new_text)
+            _write(e.path, e.new_text, backups.get(_key(e.path)))
         written.append(e.path)
     return written
 
@@ -715,11 +820,13 @@ def apply_merge(path: Path, changes: "dict[str, Any]", *, filename: "str | None"
                 new_mode: int = 0o600, stamp: "str | None" = None,
                 replace_non_object: bool = False) -> str:
     """Merge the owned keys in `changes` into the JSON file at `path`. Returns what happened:
-    "created" (file was absent), "merged" (stamped backup taken, then written atomically,
-    keeping the file's mode and a symlink in place) or "unchanged" (nothing written, no backup).
+    "created" (file was absent; created exclusively with `new_mode`), "merged" (stamped backup
+    taken, then rewritten in place, so the file's inode and with it its mode, owner, ACL and
+    xattrs are kept, and a symlink stays in place) or "unchanged" (nothing written, no backup).
     Raises MergeRefused, with the file untouched, for anything merge_json_text refuses and for a
     dangling link, a non-regular file or an unreadable file. `replace_non_object` is passed on
-    to merge_json_text; the stamped backup is taken first either way.
+    to merge_json_text; the stamped backup is taken first either way. A rewrite that fails is a
+    SystemExit naming the backup (write_in_place).
     """
     name = filename or path.name
     if is_dangling_symlink(path):
@@ -738,10 +845,14 @@ def apply_merge(path: Path, changes: "dict[str, Any]", *, filename: "str | None"
     new_text = merge_json_text(name, existing, changes, replace_non_object)
     if existing is None:
         real.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(real, new_text, new_mode)
+        try:
+            create_exclusive(real, new_text, new_mode)
+        except FileExistsError:
+            raise MergeRefused(f"something appeared at {path} while it was being created; nothing was written there")
         return "created"
     if new_text == existing:
         return "unchanged"
-    save_backup(path, False, stamp or utc_stamp())
-    atomic_write_text(real, new_text, stat.S_IMODE(os.stat(real).st_mode))
+    backup = save_backup(path, False, stamp or utc_stamp())
+    # In place, not temp + rename: a rename would drop the file's ACL and xattrs (see _write).
+    write_in_place(real, new_text, backup)
     return "merged"
