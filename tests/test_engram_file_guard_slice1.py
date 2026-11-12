@@ -390,7 +390,7 @@ def test_engram_owned_files_are_rewritten_without_consent_or_backup(tmp_path):
     marker.write_text('{"created": "an earlier run"}')
     manifest.write_text('{"seed_ids": {}}')
     items = [fg.Item(marker, "new marker", owned=True), fg.Item(manifest, "new manifest", owned=True)]
-    p = fg.plan(items, STAMP)
+    p = fg.plan(items, STAMP, home=tmp_path)
     assert [e.state for e in p.entries] == ["owned", "owned"]
     assert fg.refusal(p) is None
     assert sorted(fg.apply(p)) == sorted([marker, manifest])
@@ -401,7 +401,7 @@ def test_engram_owned_files_are_rewritten_without_consent_or_backup(tmp_path):
 def test_the_owned_list_is_closed_a_caller_cannot_widen_it(tmp_path):
     f = tmp_path / "warm-briefing.md"
     f.write_text("mine")
-    p = fg.plan([fg.Item(f, "new", owned=True)], STAMP)
+    p = fg.plan([fg.Item(f, "new", owned=True)], STAMP, home=tmp_path)
     assert p.entries[0].state == "differs", "owned=True is honoured only for the names on the closed list"
     assert fg.refusal(p) is not None
     assert fg.ENGRAM_OWNED_NAMES == ("first-run-pending", "seed-manifest.json")

@@ -452,7 +452,7 @@ MODE_AWARE = {
     "src/engram/engram_backup.py": "chmods the temp to the old target's mode (comment names the default-ACL case)",
     "src/engram/engram_home_registry.py": "fchmod 0o644",
     "src/forum/coordination/store_file.py": "explicit mode per callsite: 0o644 batons (read off disk by seats), 0o600 DM threads (#4501)",
-    "src/engram/tools/set_forum_url.py": "copies the old mode onto the temp",
+    "src/engram/tools/set_forum_url.py": "writes through engram_file_guard.apply_merge, which keeps the old mode",
     "src/engram/tools/dream_pickup.py": "copies the old mode onto the temp",
     "src/engram/tools/engram-pkg/engram-pkg": "explicit chmod 0o644 on both outputs",
     "src/engram/tools/lesson-pattern-audit.py": "old mode (0o640 new) and best-effort ACL",

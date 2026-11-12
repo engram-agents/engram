@@ -115,8 +115,13 @@ def _cli(args, env_home=None):
                           capture_output=True, text=True, env=_hermetic_env(**extra))
 
 
-def _no_temp_left(directory, keep):
-    return sorted(p.name for p in directory.iterdir()) == sorted(keep)
+def _no_temp_left(directory, keep, with_backups=False):
+    """The directory holds exactly `keep`. With `with_backups=True`, stamped backups
+    (`<name>.engram-backup.<UTC>`) are allowed too: a write that changes the file saves the old
+    bytes there first. Anything else is a leftover. A refused run passes no `with_backups`, so a
+    backup it should not have made still fails."""
+    names = sorted(p.name for p in directory.iterdir() if with_backups is False or ".engram-backup." not in p.name)
+    return names == sorted(keep)
 
 
 # ---------------------------------------------------------------- S1 ----
@@ -402,10 +407,16 @@ class TestS4ForumKey:
         assert _tool().set_forum_url(p, URL).status == "written"
         assert json.loads(p.read_text())["forum"] == {"url": URL}
 
-    def test_null(self, tmp_path):
+    def test_null(self, tmp_path, capsys):
+        # An explicit null counts as absent: no flag is needed. The write still takes a stamped
+        # backup first and prints its "backup:" line, so the file as it was is kept.
         p = _cfg(tmp_path, {"forum": None})
+        old = p.read_bytes()
         assert _tool().set_forum_url(p, URL).status == "written"
         assert json.loads(p.read_text())["forum"] == {"url": URL}
+        backups = [q for q in tmp_path.iterdir() if ".engram-backup." in q.name]
+        assert len(backups) == 1 and backups[0].read_bytes() == old
+        assert f"backup: {p} -> {backups[0]}" in capsys.readouterr().out
 
     def test_dict_with_other_keys(self, tmp_path):
         p = _cfg(tmp_path, {"forum": {"poll": 30, "url": "", "z": [1]}})
@@ -481,7 +492,11 @@ class TestS6Atomic:
         r = mod.set_forum_url(p, URL)
         assert r.status != "written", r
         assert p.read_bytes() == before
-        assert _no_temp_left(tmp_path, ["config.json"])
+        assert _no_temp_left(tmp_path, ["config.json"], with_backups=True)
+        # The stamped backup is a copy taken BEFORE the write (the failing os.replace is the write's
+        # last step), so exactly one exists and it holds the old bytes; a second file is a stray.
+        backups = [x for x in tmp_path.iterdir() if ".engram-backup." in x.name]
+        assert len(backups) == 1 and backups[0].read_bytes() == before, backups
 
     def test_mode_preserved(self, tmp_path):
         p = _cfg(tmp_path, {})
@@ -492,7 +507,7 @@ class TestS6Atomic:
     def test_no_temp_file_after_success(self, tmp_path):
         p = _cfg(tmp_path, {})
         _tool().set_forum_url(p, URL)
-        assert _no_temp_left(tmp_path, ["config.json"])
+        assert _no_temp_left(tmp_path, ["config.json"], with_backups=True)
 
     def test_temp_is_in_same_directory(self, tmp_path, monkeypatch):
         p = _cfg(tmp_path, {})
@@ -520,8 +535,8 @@ class TestS6Atomic:
         assert r.status == "written"
         assert link.is_symlink() and os.readlink(link) == str(target)
         assert json.loads(target.read_text())["forum"] == {"url": URL}
-        assert _no_temp_left(link_dir, ["config.json"])
-        assert _no_temp_left(real_dir, ["cfg-target.json"])
+        assert _no_temp_left(link_dir, ["config.json"], with_backups=True)
+        assert _no_temp_left(real_dir, ["cfg-target.json"], with_backups=True)
 
 
 # ---------------------------------------------------------------- S7 ----
@@ -697,6 +712,8 @@ class TestS8Installer:
         # tools/ dir carries it (and the package marker) beside the tool.
         for sibling in ("__init__.py", "_owner_read.py"):
             (tool_dir / sibling).write_text((TOOL.parent / sibling).read_text())
+        # The write goes through the file guard, which sits beside tools/ in a checkout.
+        (tool_dir.parent / "engram_file_guard.py").write_text((TOOL.parent.parent / "engram_file_guard.py").read_text())
         _write(tmp_path / "config.json", {"forum": {"url": "http://other:5002"}})
         before = (tmp_path / "config.json").read_bytes()
         script = (
