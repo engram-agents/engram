@@ -45,20 +45,21 @@ v0.5.6 ship with it.
   do, and exits with code 10, "finished, with items not done".
 - **Setup rewrites an existing file in place.** The file keeps its inode, so its
   mode, owner, group, hard links, ACL entries and extended attributes stay as
-  they were (one file is an exception whenever setup runs: `settings.json`, see
-  Known limits below). The stamped backup is saved first; a file ENGRAM itself
-  owns has no backup, and a refusal for such a file says so. A write
-  that fails part-way puts the old bytes back into the same file. When the
-  failure is an error from the system, it is reported in one REFUSED line that
-  names the backup; an interruption such as Ctrl-C gets the same put-back and
-  then ends the run without that line. If putting the bytes back also fails,
-  the line says the file may be incomplete and gives the command that restores
-  it. A kill or a power loss during the write gets no put-back, so the file can
-  be left incomplete; the backup taken first restores its bytes. A program that
-  reads the file during the write can see it empty or partial. A file that does
-  not exist yet is created exclusively: a file that appears at that path in the
-  meantime is refused and left as it is, on a filesystem that supports hard
-  links; without them the new file is put in place by a rename.
+  they were (one file is an exception whenever the installer runs:
+  `settings.json`, see Known limits below). The stamped backup is saved first;
+  a file ENGRAM itself owns has no backup, and a refusal for such a file says
+  so. A write that fails part-way puts the old bytes back into the same file.
+  When the failure is an error from the system, it is reported in one REFUSED
+  line that names the backup; an interruption such as Ctrl-C gets the same
+  put-back and then ends the run without that line. If putting the bytes back
+  also fails, the line says the file may be incomplete and gives the command
+  that restores it. A kill or a power loss during the write gets no put-back,
+  so the file can be left incomplete; the backup taken first restores its
+  bytes. A program that reads the file during the write can see it empty or
+  partial. A file that does not exist yet is created exclusively: a file that
+  appears at that path in the meantime is refused and left as it is, on a
+  filesystem that supports hard links; without them the new file is put in
+  place by a rename.
 
 ### Fixes
 
@@ -91,8 +92,9 @@ the same way.
   runs, even when nothing in the file changes. The content is kept. An ACL
   entry or an extended attribute set on that file is not carried over, and
   nothing backs the file up or prints a message for that write. This is Claude
-  Code's write, not ENGRAM's; it was measured on one Mac and on one Linux
-  machine, with one Claude Code build each (#4638, #4628).
+  Code's write, not ENGRAM's. The every-run case was measured on one Linux
+  machine (#4628) and the install case on one Mac (#4638), with one Claude Code
+  build each.
 - **`config.json` while an agent runs.** ENGRAM rewrites its own `config.json`
   at least at every turn advance, by writing a new file and renaming it over
   the old one, so that a concurrent reader never sees a partial file. An ACL
