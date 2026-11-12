@@ -1156,6 +1156,10 @@
   ],
   "unmapped": [
     {
+      "path": "tools/model_gate_write_count.py",
+      "reason": "engram#4596: a read-only measurement instrument for the model-family gate's sleep-cycle latency line in the PR body; no dedicated test file."
+    },
+    {
       "path": "tools/same_batch_shadow_latency.py",
       "reason": "engram-alpha#4390 phase 1: a measurement instrument owed in the PR body, with its own positive arm; no dedicated test file."
     },

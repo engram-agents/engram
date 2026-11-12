@@ -127,8 +127,13 @@ def main(argv=None) -> int:
         return 2
     new_hooks = hooks_text[:m.start(2)] + json.dumps(matcher)[1:-1] + hooks_text[m.end(2):]
     if args.write:
-        json_path.write_text(want_json, encoding="utf-8")
-        hooks_path.write_text(new_hooks, encoding="utf-8")
+        # #4380: never truncate through a link; the strict writer lives at this tree's root (_ROOT).
+        if str(_ROOT) not in sys.path:
+            sys.path.insert(0, str(_ROOT))
+        from engram_regular_io import open_regular_text_write
+        for path, text in ((json_path, want_json), (hooks_path, new_hooks)):
+            with open_regular_text_write(path, encoding="utf-8") as fh:
+                fh.write(text)
         print(f"wrote {json_path} and the matcher in {hooks_path} ({len(data['write_tools'])} write tools)")
         return 0
     problems = []
