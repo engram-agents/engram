@@ -277,11 +277,13 @@ def _stdlib_dormant():
         return False
 
 
-def _emit_import_failure():
+def _emit_import_failure(skip_dormancy=False):
     """An import failure is never silent (code ``gate_import_failed``), unless the gate is dormant.  Standard
-    library plus `_hooklib.engram_home` (imported on its own): it must not depend on the import that failed.  The text is ``_unverified_text``'s."""
+    library plus `_hooklib.engram_home` (imported on its own): it must not depend on the import that failed.  The text is ``_unverified_text``'s.
+    ``skip_dormancy``: the failed import was a refusal (``SystemExit``), so the home is known to be refused and
+    the answer is "not dormant" without a second `_hooklib` import, which would print the refusal line again."""
     try:
-        if _stdlib_dormant():
+        if not skip_dormancy and _stdlib_dormant():
             return
         text = ("ENGRAM model-family gate: this write went through UNVERIFIED (`gate_import_failed`): the "
                 "gate could not confirm which model made the call.")
@@ -298,8 +300,13 @@ def main():
     except Exception:  # noqa: BLE001
         payload = {}
     if _IMPORT_ERROR:
-        sys.stderr.write("engram model-gate: helper import failed (%s); the gate did not run\n" % _IMPORT_ERROR)
-        _emit_import_failure()
+        # A SystemExit is `_hooklib`'s refusal of a relative ENGRAM_HOME: it already wrote its one stderr line,
+        # which names the value (the #3863 rule), so this hook adds no line of its own and does not re-import
+        # `_hooklib` to ask about dormancy (that would print the refusal again).  Any other failure: own line.
+        refused = _IMPORT_ERROR == "SystemExit"
+        if not refused:
+            sys.stderr.write("engram model-gate: helper import failed (%s); the gate did not run\n" % _IMPORT_ERROR)
+        _emit_import_failure(skip_dormancy=refused)
         return 0
     try:
         res = decide(payload, _engram_home_or_exit())

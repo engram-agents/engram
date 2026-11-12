@@ -341,6 +341,48 @@ def test_r12_window_boundary_one_byte_over_discards_the_partial_first_line(tmp_p
     assert (n.model_id, n.reason) == (None, "window_exceeded")
 
 
+def _boundary_transcript(path, calling_plus_newest):
+    """[filler][calling row, sonnet, tool_use toolu_EDGE][newest row, opus] with len(calling) + len(newest)
+    == ``calling_plus_newest`` bytes, so the file size is ``len(filler) + calling_plus_newest`` and the window
+    start (size - CALL_WINDOW_BYTES) falls at a chosen byte of the calling row."""
+    newest = json.dumps(asst("claude-opus-5-5")) + "\n"
+    def calling_of(pad):
+        return json.dumps(call_row("claude-sonnet-5-5", "toolu_EDGE", extra_blocks=[{"type": "text", "text": "x" * pad}]))
+
+    calling = calling_of(calling_plus_newest - len(calling_of(0) + "\n") - len(newest))
+    path.write_text(json.dumps(user("f")) + "\n" + calling + "\n" + newest, encoding="utf-8")
+    return path
+
+
+def test_r15_the_calling_scan_window_edge_is_exact_through_model_of_call(tmp_path):
+    """The window the CALLING-ROW scan reads (``_read_window``) is a copy of ``read_model_tail``'s, and r11/r12
+    pin only the tail reader.  Here the calling row begins at byte s of the file and the window starts at
+    s - 1 (the newline before it): the row is found whole.  Mutation: a window 100 bytes smaller starts inside
+    the row, the row is lost, the fallback answers (opus) -> red."""
+    w = sig.CALL_WINDOW_BYTES
+    t = _boundary_transcript(tmp_path / "a.jsonl", w - 1)
+    assert t.stat().st_size - w == len(json.dumps(user("f")) + "\n") - 1
+    assert sig.model_of_call(t, "toolu_EDGE", 0.0, 0.01) == ("claude-sonnet-5-5", "calling_entry", None)
+
+
+def test_r16_the_calling_scan_discards_the_first_line_of_a_truncated_window(tmp_path):
+    """One byte more and the window starts exactly at the calling row's first byte: a window that does not
+    start at offset 0 drops its first line (the partial-line rule), so the row is not found and the fallback
+    answers.  Mutation: keep the first line -> the row is found (sonnet) -> red."""
+    w = sig.CALL_WINDOW_BYTES
+    t = _boundary_transcript(tmp_path / "b.jsonl", w)
+    assert t.stat().st_size - w == len(json.dumps(user("f")) + "\n")
+    assert sig.model_of_call(t, "toolu_EDGE", 0.0, 0.01) == ("claude-opus-5-5", "fallback_newest_row", None)
+
+
+def test_r17_two_rows_with_one_tool_use_id_the_newest_wins(tmp_path):
+    """A transcript can carry one id twice (a resumed or replayed turn).  The newest matching row is the
+    call being made.  Mutation: scan oldest first -> the older row's model (sonnet) -> red."""
+    t = write_jsonl(tmp_path / "t.jsonl", [call_row("claude-sonnet-5-5", "toolu_DUP"), user(),
+                                           call_row("claude-opus-5-5", "toolu_DUP")])
+    assert sig.model_of_call(t, "toolu_DUP", 0.0, 0.01) == ("claude-opus-5-5", "calling_entry", None)
+
+
 def test_r13_tail_and_whole_file_parsers_agree_on_small_transcripts(tmp_path):
     cases = {
         "opus": [asst("claude-opus-5-5")],
@@ -927,7 +969,10 @@ def test_r5_a_relative_engram_home_on_the_main_path_is_unverified_not_silent(tmp
     done = _run_real_hook_with_home(tmp_path, "rel")
     assert done.returncode == 0
     assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
-    assert "helper import failed" in done.stderr
+    # round 6: ONE stderr line in total, `_hooklib`'s refusal naming the value (the #3863 rule); the hook's own
+    # "helper import failed" line is not added on top, and the dormancy re-import does not repeat the refusal
+    assert [ln for ln in done.stderr.splitlines() if ln.strip()] == [
+        "engram hook: ENGRAM_HOME must be an absolute path, got 'rel'; doing nothing"], done.stderr
 
 
 def test_r5_b_absolute_dormant_home_on_the_main_path_stays_silent(tmp_path):
