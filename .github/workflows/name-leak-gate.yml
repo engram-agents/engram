@@ -35,6 +35,18 @@ on:
     # convention"); update this filter if the default branch ever moves.
     branches: [dev]
   pull_request:
+    # `edited` is load-bearing, not a convenience. What this workflow scans is
+    # `git diff "$BASE_SHA"...HEAD` — the pull request's diff — so a base-branch
+    # retarget replaces the entire subject of the scan. Without `edited` the
+    # gate does not re-run, and the previous run's success stays attached to the
+    # head commit: check runs bind to the commit, not to the base. The status
+    # list then shows a green tick describing a diff that no longer exists. That
+    # is the same false tick this file's header (#4429) exists to forbid, via a
+    # route the header did not name.
+    #
+    # There is deliberately NO job-level `if` to trim the title/body case.
+    # See the job block below for why a skip is a false tick.
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -44,6 +56,24 @@ jobs:
     # The status context a reviewer sees. Fork PRs get the distinct name that
     # says the gate did not run; the token is load-bearing.
     name: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'name-leak-gate (NOT SCANNED - fork PR)' || 'name-leak-gate' }}
+    # NO job-level `if:` here, deliberately, and do not add one to save a run.
+    #
+    # `edited` also fires for a title or body change, so it is tempting to skip
+    # everything except a base move. That skip is a false tick. A skipped job
+    # still reports under this job's `name`, with conclusion `skipped`, and
+    # check runs key on the HEAD COMMIT — so the skip SUPERSEDES the previous
+    # run on the same head rather than sitting beside it. Measured on
+    # engram-agents/ci-probes#6 at head 1f7aacfe: two failing runs and then a
+    # title edit, after which `gh pr checks` showed one line, `name-leak-gate
+    # skipping`, and both reds had disappeared from the pull request's check
+    # list. A red gate that a typo fix in the title turns grey is the same
+    # failure this file exists to prevent, reached by a third route.
+    #
+    # Running on every `edited` re-scans the current base...head diff and
+    # reproduces the true verdict, so it can neither mask a red nor invent a
+    # green. The cost is one runner start per title or body edit, about 11
+    # seconds of wall time. It is not a billing cost: this repository is
+    # public, so standard Actions minutes are free.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
