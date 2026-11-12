@@ -8684,14 +8684,18 @@ def _embedding_prewarm_command(model_name: str) -> str:
     An unpinned (custom) model is the user's own choice and keeps the by-name
     download.
     """
+    import shlex
     import sys
-    py = sys.executable or "python"
+    py = shlex.quote(sys.executable or "python")
     if model_name in core.EMBEDDING_MODEL_PINS:
+        # shlex-quoted: a home directory with a space (common on macOS) or a
+        # quote in the plugin path must still paste and run.
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        return (
-            f"{py} -c \"import sys; sys.path.insert(0, {plugin_dir!r}); "
-            f"import engram_core; engram_core._embedder._load_model({model_name!r})\""
+        payload = (
+            f"import sys; sys.path.insert(0, {plugin_dir!r}); "
+            f"import engram_core; engram_core._embedder._load_model({model_name!r})"
         )
+        return f"{py} -c {shlex.quote(payload)}"
     return (
         f"{py} -c \"from sentence_transformers import "
         f"SentenceTransformer; SentenceTransformer('{model_name}')\""

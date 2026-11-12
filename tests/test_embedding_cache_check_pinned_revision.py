@@ -182,3 +182,18 @@ def test_f_fatal_message_for_an_unpinned_model_keeps_the_by_name_advice(server, 
             server._embedding_startup_gate()
     err = capsys.readouterr().err
     assert "SentenceTransformer('BAAI/bge-small-en')" in err, err
+
+
+def test_f_pinned_remedy_command_survives_a_plugin_path_with_spaces_and_quotes(server, tmp_path):
+    """The printed command is shell-parsed: a directory name with a space or a
+    quote must round-trip through shlex to the same argv."""
+    import shlex
+    odd = tmp_path / "My Mac's plugin"
+    odd.mkdir()
+    with mock.patch.object(server, "__file__", str(odd / "server.py")), \
+         mock.patch.object(sys, "executable", str(odd / "py thon")):
+        cmd = server._embedding_prewarm_command(MODEL)
+    argv = shlex.split(cmd)
+    assert argv[0] == str(odd / "py thon") and argv[1] == "-c" and len(argv) == 3
+    assert repr(str(odd)) in argv[2] and "_load_model('all-MiniLM-L6-v2')" in argv[2]
+    compile(argv[2], "<remedy>", "exec")  # the payload is valid Python
