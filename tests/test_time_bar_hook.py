@@ -276,12 +276,12 @@ def _cc_payload(body: str) -> dict:
     There is NO promptSource field — which is the root cause of #1592.
     """
     return {
-        "cwd": "/home/agent-borges/engram-alpha",
+        "cwd": "/home/agent-alice/engram-alpha",
         "hook_event_name": "UserPromptSubmit",
         "permission_mode": "bypassPermissions",
         "prompt": body,
         "session_id": "test-session-1592",
-        "transcript_path": "/home/agent-borges/.claude/projects/test/transcript.jsonl",
+        "transcript_path": "/home/agent-alice/.claude/projects/test/transcript.jsonl",
     }
 
 

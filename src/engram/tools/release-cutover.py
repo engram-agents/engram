@@ -34,6 +34,10 @@ Usage:
     python3 tools/release-cutover.py --version v0.1.0 --target /path/to/public/repo --push
     python3 tools/release-cutover.py --version v0.1.0 --target /path/to/public/repo \\
         --source /path/to/other/checkout --scan-leaks /path/to/scan-leaks.py
+
+A standalone --scan-leaks copy must have engine/home_path_class.py beside it
+(<dir of scan-leaks.py>/engine/home_path_class.py): the scanner loads its
+home-path class from there and aborts with ImportError without it.
 """
 
 import argparse
@@ -285,7 +289,8 @@ def main():
                              "A path that is not a regular file warns on stderr.")
     parser.add_argument("--scan-leaks", default=None, metavar="PATH",
                         help="Path to the leak-scanner script used for the gate. "
-                             "Default: <source>/tools/scan-leaks.py.")
+                             "Default: <source>/tools/scan-leaks.py. A standalone copy "
+                             "needs engine/home_path_class.py beside it.")
     parser.add_argument("--author", default=None,
                         help='Author for the release commit, e.g. "Jane Doe <jane@example.com>". '
                              "Default: parsed from LICENSE copyright line.")
