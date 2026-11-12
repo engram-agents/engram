@@ -1073,7 +1073,7 @@ def _home_forms() -> List[str]:
 def tilde_home(value: Any) -> Any:
     """Every string in `value` (a report dict, recursively) with the operator's home path written as `~`, so a
     report can be posted without the account name. A path outside the home stays absolute. Only a whole path
-    component matches: /Users/seat2 is not under /Users/seat."""
+    component matches: a sibling folder whose name merely starts with the account name is not under it."""
     forms = _home_forms()
     if not forms:
         return value

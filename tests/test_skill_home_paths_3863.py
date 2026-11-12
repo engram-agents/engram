@@ -162,7 +162,7 @@ class TestPlantedDefinition:
         assert flagged_lines("```\nls ~/.engram-gemini/x ~/.engram_home\n```\n") == []
 
     def test_braced_quoted_home_and_absolute_paths_are_flagged(self):
-        for spelling in ('"${HOME}"/.engram/x', "/Users/lei/.engram/x", "/home/lei/.engram/x"):
+        for spelling in ('"${HOME}"/.engram/x', "/Users/someone/.engram/x", "/home/someone/.engram/x"):
             assert flagged_lines(f"```\ncat {spelling}\n```\n"), spelling
             assert flagged_lines(f"see `{spelling}` here\n"), spelling
 

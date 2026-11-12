@@ -79,6 +79,9 @@ class Sandbox:
         self.tools_src.mkdir(parents=True)
         if REAL_INSTALL_SH.exists():
             shutil.copy(REAL_INSTALL_SH, self.tools_src / "install.sh")
+        # Step 3 writes install_tier through the checkout's file guard (stdlib only), so a
+        # repo-shaped tree carries it beside tools/.
+        shutil.copy(REPO_ROOT / "src" / "engram" / "engram_file_guard.py", self.tools_src.parent / "engram_file_guard.py")
         (self.repo / "tools").mkdir()
         (self.repo / "tools" / "install.sh").symlink_to("../src/engram/tools/install.sh")
         (self.repo / "requirements").mkdir()
@@ -123,6 +126,8 @@ e = os.environ
 open(e["CALLS_LOG"], "a").write("bootstrap FORCE_RESEED_EMPTY=%s FORCE=%s TARGET=%s ALPHA_DIR=%s TEMPLATES=%s PYTHON_BIN=%s\\n" % (
     e.get("FORCE_RESEED_EMPTY", "unset"), e.get("FORCE", "unset"), e.get("TARGET"), e.get("ALPHA_DIR"),
     e.get("ALPHA_TEMPLATES_DIR"), e.get("PYTHON_BIN")))
+import json
+open(e["CALLS_LOG"], "a").write("argv-of-bootstrap " +json.dumps(sys.argv[1:]) + "\\n")
 if int(e.get("FAKE_BOOTSTRAP_RC", "0")):
     print("bootstrap fake: failing")
     sys.exit(int(e["FAKE_BOOTSTRAP_RC"]))
@@ -221,6 +226,18 @@ if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then
 fi
 exec "$REAL_PY" "$@"
 """)
+
+    def use_real_bootstrap(self):
+        """Replace the fake bootstrap.py by a thin wrapper that execs the repo's REAL one, with the
+        real templates beside it. The installer only ASKS about CLAUDE.md; the real bootstrap makes
+        the backups, so the cells about backups need it."""
+        shutil.copytree(REPO_ROOT / "src" / "engram" / "templates", self.plugin_src / "templates", dirs_exist_ok=True)
+        (self.plugin_src / "bootstrap.py").write_text(
+            "import os, sys\n"
+            "open(os.environ['CALLS_LOG'], 'a').write('bootstrap (real) ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+            f"os.execv(sys.executable, [sys.executable, {str(REPO_ROOT / 'src' / 'engram' / 'bootstrap.py')!r}, *sys.argv[1:]])\n"
+        )
+        return self
 
     # -- running -----------------------------------------------------------------------------
     def run(self, *args, env=None, stdin=subprocess.DEVNULL):
@@ -398,12 +415,12 @@ def test_claude_that_does_not_run_fails_step_1(tmp_path):
 def test_git_that_cannot_read_the_checkout_gets_the_safe_directory_remedy(tmp_path):
     sb2 = Sandbox(tmp_path)
     _write(sb2.fakebin / "git", """#!/bin/sh
-echo "fatal: detected dubious ownership in repository at '/some/other/users/checkout'" >&2
+echo "fatal: detected dubious ownership in repository at '/some/other/clone/checkout'" >&2
 exit 128
 """)
     r = sb2.run("--yes")
     assert r.returncode != 0 and "FAIL: [step 1]" in r.stderr, r.all
-    assert "safe.directory '/some/other/users/checkout'" in r.stderr
+    assert "safe.directory '/some/other/clone/checkout'" in r.stderr
     assert not sb2.calls_starting("pip")
 
 
@@ -503,61 +520,89 @@ def test_config_created_when_absent_with_install_tier_only(sb):
 
 
 # ── Cell 5: CLAUDE.md backup ───────────────────────────────────────────────────────────────
+def _stamped_backups(claude_home):
+    return sorted(claude_home.glob("CLAUDE.md.engram-backup.*"))
+
+
 def test_existing_claude_md_is_backed_up_with_its_original_bytes(sb):
+    """The installer only ASKS; the real bootstrap makes the backups: the first-ever `.pre-engram`
+    and a stamped copy, both holding the original bytes. The step-6 line names the file and both
+    backup names."""
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     original = b"my own rules \xe2\x80\x94 do not lose me\r\nline two\n"
     (sb.claude_home / "CLAUDE.md").write_bytes(original)
     r = sb.run("--yes")
     assert r.returncode == 0, r.all
     assert (sb.claude_home / "CLAUDE.md.pre-engram").read_bytes() == original
-    assert (sb.claude_home / "CLAUDE.md").read_text() == "rendered by ENGRAM bootstrap\n"
+    stamped = _stamped_backups(sb.claude_home)
+    assert len(stamped) == 1 and stamped[0].read_bytes() == original
+    assert (sb.claude_home / "CLAUDE.md").read_bytes() != original
+    assert sb.calls_starting("argv-of-bootstrap") == [] and sb.calls_starting("bootstrap (real) --replace ")
     assert str(sb.claude_home / "CLAUDE.md") in r.stdout and str(sb.claude_home / "CLAUDE.md.pre-engram") in r.stdout
 
 
-def test_existing_backup_is_left_byte_identical(sb):
+def test_the_installer_makes_no_copy_of_claude_md_itself(sb):
+    """With the fake bootstrap (which copies nothing) an existing CLAUDE.md gets NO backup file:
+    the only code that copies it is bootstrap's guard. A copy made by install.sh would show here."""
     sb.claude_home.mkdir(parents=True)
-    (sb.claude_home / "CLAUDE.md").write_bytes(b"ENGRAM's own rendered file from an earlier run\n")
+    (sb.claude_home / "CLAUDE.md").write_bytes(b"the user's file\n")
+    r = sb.run("--yes")
+    assert r.returncode == 0, r.all
+    assert not (sb.claude_home / "CLAUDE.md.pre-engram").exists()
+    assert _stamped_backups(sb.claude_home) == []
+
+
+def test_existing_backup_is_left_byte_identical(sb):
+    sb.use_real_bootstrap()
+    sb.claude_home.mkdir(parents=True)
+    current = b"ENGRAM's own rendered file from an earlier run\n"
+    (sb.claude_home / "CLAUDE.md").write_bytes(current)
     users_original = b"the user's real original, backed up on the first run\n"
     (sb.claude_home / "CLAUDE.md.pre-engram").write_bytes(users_original)
     r = sb.run("--yes")
     assert r.returncode == 0, r.all
     assert (sb.claude_home / "CLAUDE.md.pre-engram").read_bytes() == users_original
-    assert (sb.claude_home / "CLAUDE.md").read_text() == "rendered by ENGRAM bootstrap\n"
+    stamped = _stamped_backups(sb.claude_home)
+    assert len(stamped) == 1 and stamped[0].read_bytes() == current, "the current file must get its own stamped backup"
+    assert (sb.claude_home / "CLAUDE.md").read_bytes() not in (current, users_original)
     assert str(sb.claude_home / "CLAUDE.md.pre-engram") in r.stdout
 
 
-def test_dangling_backup_link_fails_step_6_before_bootstrap_and_without_force(sb):
+def test_dangling_backup_link_is_left_alone_and_the_current_file_gets_a_stamped_backup(sb):
+    """The backup-name checks moved from the shell to bootstrap's guard: a dangling link at
+    `.pre-engram` is not written through; the stamped backup is made and the run goes on."""
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     original = b"the user's file, must survive\n"
     (sb.claude_home / "CLAUDE.md").write_bytes(original)
     bak = sb.claude_home / "CLAUDE.md.pre-engram"
     bak.symlink_to(sb.root / "nowhere-backup.md")
     r = sb.run("--yes")
-    assert r.returncode != 0
-    assert "FAIL: [step 6]" in r.all and str(bak) in r.all
-    assert "kept untouched" not in r.all
-    assert (sb.claude_home / "CLAUDE.md").read_bytes() == original
-    assert bak.is_symlink() and not (sb.root / "nowhere-backup.md").exists()
-    assert not sb.calls_starting("bootstrap"), sb.call_lines()
+    assert r.returncode == 0, r.all
+    assert bak.is_symlink() and not (sb.root / "nowhere-backup.md").exists(), "the link was written through"
+    stamped = _stamped_backups(sb.claude_home)
+    assert len(stamped) == 1 and stamped[0].read_bytes() == original
 
 
-def test_directory_at_backup_path_fails_step_6_before_bootstrap_and_without_force(sb):
+def test_directory_at_backup_path_is_left_alone_and_the_current_file_gets_a_stamped_backup(sb):
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     original = b"the user's file, must survive\n"
     (sb.claude_home / "CLAUDE.md").write_bytes(original)
     bak = sb.claude_home / "CLAUDE.md.pre-engram"
     bak.mkdir()
     r = sb.run("--yes")
-    assert r.returncode != 0
-    assert "FAIL: [step 6]" in r.all and str(bak) in r.all
-    assert "not a regular file" in r.all
-    assert "kept untouched" not in r.all
-    assert (sb.claude_home / "CLAUDE.md").read_bytes() == original
+    assert r.returncode == 0, r.all
     assert bak.is_dir() and not list(bak.iterdir())
-    assert not sb.calls_starting("bootstrap"), sb.call_lines()
+    stamped = _stamped_backups(sb.claude_home)
+    assert len(stamped) == 1 and stamped[0].read_bytes() == original
 
 
-def test_hard_link_at_backup_path_fails_step_6_before_bootstrap_and_without_force(sb):
+def test_hard_link_at_backup_path_fails_step_6_and_nothing_is_replaced(sb):
+    """bootstrap's guard refuses (the backup name is the same file as CLAUDE.md, so replacing it
+    would overwrite the backup too); the installer reports it as a step-6 failure."""
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     original = b"the user's file, must survive\n"
     md = sb.claude_home / "CLAUDE.md"
@@ -568,22 +613,30 @@ def test_hard_link_at_backup_path_fails_step_6_before_bootstrap_and_without_forc
     assert r.returncode != 0
     assert "FAIL: [step 6]" in r.all and str(bak) in r.all and str(md) in r.all
     assert "same file" in r.all
-    assert "kept untouched" not in r.all
     assert md.read_bytes() == original and bak.read_bytes() == original
-    assert not sb.calls_starting("bootstrap"), sb.call_lines()
+    assert _stamped_backups(sb.claude_home) == []
 
 
 def test_second_run_after_aborted_seed_does_not_overwrite_the_backup(sb):
+    """First run (real bootstrap) saves the original to `.pre-engram`. The seed is then undone
+    (graph and memory markers removed) and CLAUDE.md is edited; the second run replaces CLAUDE.md after a
+    stamped backup of that edit, and `.pre-engram` is not touched."""
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     original = b"user original\n"
     (sb.claude_home / "CLAUDE.md").write_bytes(original)
-    first = sb.run("--yes", env={"FAKE_BOOTSTRAP_RC": "1"})  # backup made, bootstrap then fails
-    assert first.returncode != 0
+    first = sb.run("--yes")
+    assert first.returncode == 0, first.all
     assert (sb.claude_home / "CLAUDE.md.pre-engram").read_bytes() == original
-    (sb.claude_home / "CLAUDE.md").write_bytes(b"something ENGRAM wrote meanwhile\n")
+    # undo the seed (graph and the files that mark an existing agent), keep CLAUDE.md
+    for name in ("knowledge.db", "warm-briefing.md", "seed-manifest.json", "first-run-pending"):
+        (sb.engram / name).unlink()
+    edited = b"something ENGRAM wrote meanwhile\n"
+    (sb.claude_home / "CLAUDE.md").write_bytes(edited)
     second = sb.run("--yes")
     assert second.returncode == 0, second.all
     assert (sb.claude_home / "CLAUDE.md.pre-engram").read_bytes() == original
+    assert edited in [p.read_bytes() for p in _stamped_backups(sb.claude_home)]
 
 
 def test_no_backup_is_made_when_bootstrap_is_skipped(sb):
@@ -704,7 +757,7 @@ def test_the_three_ruled_defaults_are_named_constants_near_the_top():
     head = REAL_INSTALL_SH.read_text().splitlines()[:60]
     text = "\n".join(head)
     assert "DEFAULT_INSTALL_CLAUDE_CODE=0" in text
-    assert "DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD=1" in text
+    assert "DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD=0" in text
     assert "DEFAULT_RECALL_SERVICE=1" in text
 
 
@@ -861,13 +914,14 @@ def test_dangling_claude_md_symlink_fails_step_1_before_any_real_work(sb):
     (sb.claude_home / "CLAUDE.md").symlink_to(sb.root / "nowhere" / "CLAUDE.md")
     r = sb.run("--yes")
     assert r.returncode != 0 and "FAIL: [step 1]" in r.stderr, r.all
-    assert str(sb.claude_home / "CLAUDE.md") in r.stderr and "remove" in r.stderr.lower()
+    assert str(sb.claude_home / "CLAUDE.md") in r.stderr and "move the link aside" in r.stderr.lower()
     for prefix in ("pip", "marketplace", "bootstrap", "claude plugin", "selfcheck"):
         assert not sb.calls_starting(prefix), sb.call_lines()
     assert (sb.claude_home / "CLAUDE.md").is_symlink()  # untouched
 
 
 def test_live_claude_md_symlink_still_has_its_target_bytes_backed_up(sb):
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     target = sb.root / "dotfiles" / "CLAUDE.md"
     target.parent.mkdir()

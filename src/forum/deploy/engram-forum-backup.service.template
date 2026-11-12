@@ -32,9 +32,10 @@ OnFailure=engram-forum-backup-alarm.service
 
 [Service]
 Type=oneshot
-# Run with the same UMask as the forum service so backup files in the shared
-# dir are group-writable (664/775) and a counterpart admin can read them.
-UMask=002
+# Run with the same UMask as the forum service (no group write, #4499): backup
+# files in the shared dir land 644 / dirs 755, so a counterpart admin can read them.
+# forum.sql and the success stamp are narrowed to 0640 by the tool itself.
+UMask=0022
 # Interpreter: the FORUM's own venv, NOT system python3. The forum venv has
 # sqlite_vec installed (same interpreter the live forum server runs under), so
 # the backup runs with the vec0 extension present — eliminating the #1057 class

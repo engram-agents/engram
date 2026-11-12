@@ -145,6 +145,37 @@ def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
     return tools_dir
 
 
+def pick_checkout(suffix: str = ""):
+    """Single-pick choice between the two accepted checkout folder names.
+
+    Candidates are ~/engram (the default name) then ~/engram-alpha (the accepted old name); a candidate
+    counts when `<candidate><suffix>` exists. If the process's own working folder is inside an existing
+    candidate (realpath equal or under it, so a linked worktree under ~/engram-alpha/.claude/worktrees/<id>
+    counts as inside ~/engram-alpha), that candidate wins; else the first existing one. When no candidate
+    holds the suffix, the sole existing candidate DIRECTORY is used the same way (cwd-first, then first
+    existing), so an old-name-only seat keeps its old value. Returns `<candidate><suffix>`, or None when
+    neither candidate folder exists. Never raises.
+    """
+    found = []
+    for name in ("~/engram", "~/engram-alpha"):
+        cand = os.path.expanduser(name)
+        if os.path.exists(cand + suffix):
+            found.append(cand)
+    if not found:
+        found = [c for c in (os.path.expanduser(n) for n in ("~/engram", "~/engram-alpha")) if os.path.isdir(c)]
+    try:
+        cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        cwd = None
+    if cwd:
+        # Same rule as supervision_probe.py and tools/rc-upgrade-verify.py; keep the copies in step.
+        for cand in found:
+            real = os.path.realpath(cand)
+            if cwd == real or cwd.startswith(real.rstrip(os.sep) + os.sep):
+                return cand + suffix
+    return found[0] + suffix if found else None
+
+
 def resolve_runtime_dir(engram_home: str, sentinel: str) -> str:
     """Locate the directory containing `sentinel` for import.
 
@@ -182,8 +213,8 @@ def resolve_runtime_dir(engram_home: str, sentinel: str) -> str:
          under the guessed path, e.g. .claude/worktrees/<id>/ under
          ~/engram-alpha -- silently shadowing the actually-running copy with
          a sibling one).
-      5. ~/engram-alpha (live-source fallback for dev installs, last-ditch,
-         unchanged).
+      5. ~/engram, else ~/engram-alpha (live-source fallback for dev installs,
+         last-ditch; engram is the default name, engram-alpha the accepted old one).
 
     This file lives in the SAME directory as the hooks that call it, in both
     topologies (mirrors resolve_tools_dir's own reasoning above) -- so
@@ -217,7 +248,7 @@ def resolve_runtime_dir(engram_home: str, sentinel: str) -> str:
                 return str(candidate)
     except OSError:
         pass
-    return os.path.expanduser("~/engram-alpha")  # last-ditch, unchanged
+    return pick_checkout() or os.path.expanduser("~/engram")  # last-ditch
 
 
 def import_owner_flags(engram_home: str):
@@ -294,7 +325,7 @@ def resolve_own_server_py_path(engram_home: str) -> str:
          bug class, not just re-reading the source.)
       2. `$ENGRAM_HOME/server.py` (legacy scatter-install pattern, in case
          hooks were copied separately from server.py).
-      3. `~/engram-alpha/server.py` (live-source dev fallback).
+      3. `~/engram/server.py`, else `~/engram-alpha/server.py` (live-source dev fallback).
 
     Returns an absolute path suitable for a SCOPED `pgrep -f <path>` match.
     Never returns a bare "server.py" -- an unscoped pgrep -f server.py
@@ -311,7 +342,7 @@ def resolve_own_server_py_path(engram_home: str) -> str:
     candidate = os.path.join(engram_home, "server.py")
     if os.path.exists(candidate):
         return candidate
-    return os.path.expanduser("~/engram-alpha/server.py")
+    return pick_checkout("/server.py") or os.path.expanduser("~/engram/server.py")
 
 
 def is_own_server_py_running(engram_home: str) -> bool:

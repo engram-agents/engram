@@ -1,7 +1,7 @@
 # F4 — engram_surface failure forensics (H5b + error classification)
 
-Perf umbrella #1668. Read-only analysis of `/home/agent-borges/.engram/knowledge.db`
-(`tool_timing`) and `/home/agent-borges/.engram/logs/index.db` (`events`, copied to
+Perf umbrella #1668. Read-only analysis of `~/.engram/knowledge.db`
+(`tool_timing`) and `~/.engram/logs/index.db` (`events`, copied to
 scratch to open — direct `mode=ro` open failed with "attempt to write a readonly
 database", likely a WAL-checkpoint side effect on connect).
 

@@ -41,7 +41,7 @@ Five modes:
 | Exists | seeded | Exists | **identity-resolve** (scatter install today) | Skip 0.5/0.6 → Steps 1-7 |
 | Exists | seeded | Missing | **already-initialized** | Stop the skill; you're done already |
 | Missing | — | Exists | **corrupted-state** | Stop and surface to user — manual cleanup needed |
-| Exists | empty (0 axioms) | Missing | **partial-bootstrap** | Surface the seed-empty error to user; recovery is `rm knowledge.db && rerun first-session` (the seed-empty error message includes the exact path) |
+| Exists | empty (0 axioms) | Missing | **partial-bootstrap** | Surface the seed-empty error to user; recovery is to move the empty `knowledge.db` aside, then rerun first-session: `mv "$ENGRAM_HOME/knowledge.db" "$ENGRAM_HOME/knowledge.db.moved-aside-$(date -u +%Y%m%dT%H%M%SZ)"` (the seed-empty error message includes the exact path) |
 
 For the seed-empty check (column 2 of the row): `python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"SELECT COUNT(*) FROM nodes WHERE type='axiom'\").fetchone()[0])" "$ENGRAM_HOME/knowledge.db"` returns 0 → empty; ≥3 → seeded (post-bootstrap.py). (stdlib — no CLI dependency)
 
@@ -84,7 +84,7 @@ ENGRAM_INSTALL_MODE=plugin \
 "$VENV_PY" "$BOOTSTRAP"
 ```
 
-**If bootstrap prints `[bootstrap] REFUSED: ... CLAUDE.md already exists and differs`**, the user already has their own `~/.claude/CLAUDE.md`, and bootstrap will not overwrite it without consent (#4440). Nothing has been written yet. Show the user that line and ask: overwrite it (bootstrap first copies it to `~/.claude/CLAUDE.md.pre-engram`, and never overwrites an existing backup), or stop so they can move the file themselves. Only on a clear yes, re-run the same command with `--force` appended after `"$BOOTSTRAP"`. Never add `--force` on your own judgement. A `REFUSED` about a dangling symlink is not fixed by `--force`: the line names the link to remove or repair.
+**If bootstrap prints `[bootstrap] REFUSED: ... CLAUDE.md already exists and differs`**, the user already has their own `~/.claude/CLAUDE.md`, and bootstrap will not overwrite it without consent (#4440). Nothing has been written yet. Show the user the whole list the message names, in ONE question, and ask: replace them (each file is first copied to a stamped backup `<name>.engram-backup.<UTC time>`; `CLAUDE.md` also keeps `~/.claude/CLAUDE.md.pre-engram` the first time, and an earlier backup is never touched; backups accumulate and nothing deletes them automatically), or stop so they can move the files themselves. Only on a clear yes, re-run the same command with `--force` appended after `"$BOOTSTRAP"`. `--force` means yes to EVERY path the message listed, so one yes must never cover a path the user did not see; to replace only what they approved, use `--replace PATH` for each of those files instead. Never add either on your own judgement. A `REFUSED` about a dangling symlink is not fixed by `--force`: the line names the link to remove or repair.
 
 (The `ENGRAM_HOME` variable was resolved in Step 0; using it here ensures users with a custom `ENGRAM_HOME` bootstrap to the right path rather than the default `~/.engram`. `PYTHON_BIN` is set to the venv python so bootstrap.py + any subprocesses it spawns inherit the right interpreter.)
 
@@ -538,10 +538,10 @@ fi
 Show the tool's own output to the user verbatim. Then by exit status:
 
 - **0** — written, or already that value. Done.
-- **3** — a DIFFERENT `forum.url` is already set. Tell the user what is set. Do not pass `--force` unless the user says so explicitly (they have to ask to overwrite it); without that, leave it as it is and continue. (To overwrite when they do ask, see the force fence below.)
-- **2** — refused (a bad URL, or a missing or unreadable config). Show the reason; the config is untouched. Continue first-session: a refused forum URL never blocks identity formation. If the user wants to retry with a corrected URL, run the block again.
+- **3** — a DIFFERENT `forum.url` is already set. Tell the user what is set. Do not pass `--force` unless the user says so explicitly (they have to ask to overwrite it); without that, leave it as it is and continue. If they do ask, first show the user the old url, the new url and where the old file is saved (`config.json.engram-backup.<UTC time>`, beside it), and pass `--force` only on their yes (see the force fence below).
+- **2** — refused (a bad URL, or a missing or unreadable config, or a `forum` entry that is not an object). Show the reason; the config is untouched. `--force` here may replace a value that is not even the right shape (that `forum` entry), not only a different url: pass it only after you have shown the user what is there and where the backup goes (`config.json.engram-backup.<UTC time>`, beside it), and they said yes. Continue first-session: a refused forum URL never blocks identity formation. If the user wants to retry with a corrected URL, run the block again.
 
-**Overwriting (exit 3 only).** ONLY after the user has explicitly asked to overwrite the different `forum.url`, write the answer file again (the block consumed it), then paste this fence right before the block and run both together in one Bash call. The block adds `--force` to the tool call only when `FORUM_FORCE` is exactly `1`. Never insert it on your own initiative.
+**Overwriting (exit 3, or exit 2 for a `forum` entry that is not an object).** ONLY after the user has explicitly asked to overwrite the different `forum.url` (or to replace a `forum` value that is not even the right shape), and after you have shown the user the old url or value, the new url and the backup the old file gets (`config.json.engram-backup.<UTC time>`) and they said yes, write the answer file again (the block consumed it), then paste this fence right before the block and run both together in one Bash call. The block adds `--force` to the tool call only when `FORUM_FORCE` is exactly `1`. Never insert it on your own initiative.
 
 ```bash
 # forum-url-force
@@ -588,7 +588,7 @@ Then follow the branch for the detected target:
 ```bash
 _a=$(grep -c '^## From this session$' "${ENGRAM_HOME:-$HOME/.engram}/warm-briefing.md")
 _last=$(tail -n 1 "${ENGRAM_HOME:-$HOME/.engram}/warm-briefing.md")
-[ "$_a" = 1 ] && [ "$_last" = '## From this session' ] || echo "FAIL: warm-briefing anchor lost, duplicated, or moved off the end — restore the file from the template and redo the substitution; never hand-patch the heading"
+[ "$_a" = 1 ] && [ "$_last" = '## From this session' ] || echo "FAIL: warm-briefing anchor lost, duplicated, or moved off the end — first copy the current warm-briefing.md aside (cp -p warm-briefing.md warm-briefing.md.engram-backup.<UTC time>), then restore the file from the template and redo the substitution; never hand-patch the heading"
 ```
 
 A lost or duplicated anchor is not cosmetic: `engram-sleep` Step 3's erase keys on the LAST matching heading through EOF, so a lost heading makes a later sleep APPEND a stub instead of erasing (freezing the stale arc above it), and a duplicate strands everything between the two headings as preserved user notes. Full reasoning: `engram-nap` Step 5 post-condition.
@@ -638,7 +638,7 @@ Ask now, write after: the grant lines go into CLAUDE.md once the substitution be
 
 The codex file set is different. Bootstrap wrote identity surfaces across four files; this step resolves the remaining first-session placeholders in all four.
 
-**If the Codex bootstrap (README Phase 1.5) printed `[bootstrap] REFUSED: ... AGENTS.md already exists and differs`**, the user already has their own `~/.codex/AGENTS.md`, and bootstrap will not overwrite it without consent (#4452). Nothing has been written yet. Show the user that line and ask: overwrite it (bootstrap first copies it to `~/.codex/AGENTS.md.pre-engram`, and never overwrites an existing backup), or stop so they can move the file themselves. Only on a clear yes, re-run the same command with `--force` appended after `bootstrap.py`. Never add `--force` on your own judgement. A `REFUSED` about a dangling symlink is not fixed by `--force`: the line names the link to remove or repair.
+**If the Codex bootstrap (README Phase 1.5) printed `[bootstrap] REFUSED: ... AGENTS.md already exists and differs`**, the user already has their own `~/.codex/AGENTS.md`, and bootstrap will not overwrite it without consent (#4452). Nothing has been written yet. Show the user the whole list the message names, in ONE question, and ask: replace them (each file is first copied to a stamped backup `<name>.engram-backup.<UTC time>`; `AGENTS.md` and `config.toml` also keep a `<name>.pre-engram` the first time, and an earlier backup is never touched; backups accumulate and nothing deletes them automatically), or stop so they can move the files themselves. Only on a clear yes, re-run the same command with `--force` appended after `bootstrap.py`. `--force` means yes to EVERY path the message listed, so one yes must never cover a path the user did not see; to replace only what they approved, use `--replace PATH` for each of those files instead. Never add either on your own judgement. A `REFUSED` about a dangling symlink is not fixed by `--force`: the line names the link to remove or repair.
 
 1. Read the four codex surfaces:
    - `~/.codex/config.toml` (instructions= body + compact_prompt_file pointer)

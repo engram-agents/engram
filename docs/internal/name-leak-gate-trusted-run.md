@@ -8,8 +8,8 @@ root resolution).
 
 `pr-checks.yml`'s `name-leak-warn` step is advisory by design: it
 `continue-on-error`s, always exits success, and sets `skip=true` when
-`NAME_LEAK_ROSTER` is unset. It runs on `pull_request` only. On a public repo,
-a PR from a fork therefore runs the gate with **no roster**, prints a benign
+`NAME_LEAK_ROSTER` is unset. It runs on `pull_request` only. This repository is public, so
+a PR from a fork is a live case, not a hypothetical: it runs the gate with **no roster**, prints a benign
 skip line, and passes — the gate is absent exactly where the risk is, and its
 absence is reported as a green tick.
 
@@ -25,7 +25,7 @@ all I/O and hands it five facts.
   token `NOT SCANNED` (message: "not scanned, roster unavailable"). A fork
   never receives the roster secret, so the gate cannot run there. The
   `NOT SCANNED` status name must **never** be configured as a required check.
-- **Push to the default branch (`dev`)**: post-merge backstop. Fails loud when
+- **Push to `dev`**: post-merge backstop. Fails loud when
   the roster is missing or the attestation does not match, and files (or
   comments on) an issue labelled `name-leak-gate`, closing it on the next
   green run — the same notify shape as nightly.yml's `ci-nightly` issue, under
@@ -114,15 +114,22 @@ the bootstrap branch "is unreachable for every later pull request" because a
 base commit can never lose a merged file. That was true of pull requests into
 `dev` and **false of every other base**: the workflow has no branch filter, so
 a pull request into `main` runs the gate too, and `main` does not carry the tool
-until the next release cut. Measured 2026-11-07: `tools/name_leak_gate.py` is
-absent on `main` (`69894967`) while `tools/name_leak_warn.py` is present there.
+until the next release cut. Measured 2026-11-07 (historical): `tools/name_leak_gate.py` was
+absent on `main` (`69894967`) while `tools/name_leak_warn.py` was present there.
 Such a pull request would have sat on the bootstrap path indefinitely, running
 its own gate code with the roster. The claim was a clause true of the branch I
 checked and extended, in my head, to branches I had not.
 
-With the default-branch link in place the property holds: `dev` is protected, so
-a pull request cannot remove the tool from it, and step 3 becomes unreachable
-once the gate has merged there.
+The default branch is now `main` (the workflow reads it from
+`github.event.repository.default_branch`). As read on 2026-11-11,
+`git ls-tree origin/main tools/name_leak_gate.py` lists the tool, so the second
+link finds it there. What is not shown is the old property that "a pull request
+cannot remove the tool": `main`'s ruleset has only deletion and non-fast-forward
+rules (`gh api repos/engram-agents/engram/rules/branches/main`, read 2026-11-11),
+and no pull-request rule. `main` moves only on release cuts, so the tool stays
+there in practice, but that is a convention, not a protection shown for `main`.
+For pull requests into `dev`, the base commit (link 1) carries the tool, and
+`dev` is protected.
 
 **Step 3 is entered only on positive knowledge, and that distinction is the last
 one in this section.** Before reading anything, both protected refs must
@@ -151,12 +158,12 @@ of a `BOOTSTRAP` warning is **not** the check — silence and a run that never
 reached that paragraph look identical, which is the whole reason a positive line
 is printed.
 
-**Not this workflow's job, but owed at cutover:** code-owner review on
+**Not this workflow's job, but owed (open items):** code-owner review on
 `.github/workflows/` and the two `tools/` files, so a forged green cannot land;
 and GitHub's approval requirement for fork PR workflows, which covers forks but
 **not** a re-pushed same-repo branch — a same-repo push is by definition by
-someone with write access, so the platform has no reason to gate it. Both belong
-on the cutover checklist, and the seat rule above remains the floor either way.
+someone with write access, so the platform has no reason to gate it. Both are open
+items for the maintainers, and the seat rule above remains the floor either way.
 
 ## The contract
 

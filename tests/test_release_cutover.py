@@ -30,6 +30,10 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOL_PATH = REPO_ROOT / "src" / "engram" / "tools" / "release-cutover.py"
 SCAN_LEAKS_PATH = REPO_ROOT / "src" / "engram" / "tools" / "scan-leaks.py"
+# scan-leaks.py loads its home-path class from engine/home_path_class.py BESIDE
+# it (deployed layout) and raises ImportError without it, so any copy of the
+# scanner staged outside the source tree must carry this sibling.
+HOME_PATH_CLASS_PATH = REPO_ROOT / "src" / "build" / "engine" / "home_path_class.py"
 
 # Load release-cutover module (hyphen-free import via importlib).
 _spec = importlib.util.spec_from_file_location("release_cutover", TOOL_PATH)
@@ -93,7 +97,10 @@ def _make_source_repo(tmp: Path, extra_files: dict[str, str] | None = None,
     sl_dest = src / "tools" / "scan-leaks.py"
     sl_dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(str(SCAN_LEAKS_PATH), str(sl_dest))
-    _git(["add", "tools/scan-leaks.py"], cwd=str(src))
+    hpc_dest = src / "tools" / "engine" / "home_path_class.py"
+    hpc_dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(HOME_PATH_CLASS_PATH), str(hpc_dest))
+    _git(["add", "tools/scan-leaks.py", "tools/engine/home_path_class.py"], cwd=str(src))
     _git(["commit", "-m", "add scan-leaks"], cwd=str(src))
 
     # Extra files requested by test.

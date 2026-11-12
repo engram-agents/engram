@@ -9,6 +9,73 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.7] - 2026-11-12
+
+A patch release. Its reason is one guarantee: ENGRAM's setup (the installer,
+`bootstrap.py` and the marketplace installer) never silently replaces or deletes
+a file that you or an earlier agent wrote. The first section below says exactly
+which files and settings this covers. The other changes merged on `dev` since
+v0.5.6 ship with it.
+
+### Installer and setup safety
+
+- Setup never silently overwrites or deletes a file you or your agent wrote. It
+  backs the file up first, and it replaces it only on an explicit flag passed
+  after your yes: `--replace PATH` for one file, `--force` for every file the
+  refusal listed. One refusal names every such file and the backup each would
+  get. A file that already holds what setup would write is left untouched. The
+  installer's question about an existing `CLAUDE.md` now defaults to No.
+  `bootstrap.py` never seeds a new graph beside an existing agent's memory, even
+  with `--force`. A fresh start is moving the whole data home aside.
+  A backup keeps the file's bytes, mode and modification time, not extended
+  attributes or ACLs. Backups accumulate, and nothing deletes them
+  automatically. When setup sets one of its own keys in a settings or config
+  file (`cleanupPeriodDays`, `install_tier`, `forum.url`), it backs the file
+  up first, keeps every other key in value and order, and leaves a file that
+  does not parse as it is. This now holds for all three writers of those keys
+  (the installer, the marketplace installer and `set_forum_url.py`). The
+  installer only asks about `CLAUDE.md`; the backups are made by
+  `bootstrap.py` before it writes. A Codex custom-agent file (`engram-*.toml`)
+  that differs from the one setup installs is backed up first, and one line per
+  file names the backup. Uninstall leaves both files as they are when
+  `<name>.pre-engram` is the same file as `<name>`. When the marketplace
+  installer finishes but skips an item (saving `install_tier` into a config it
+  would not change, or a Codex agent file it could not install), it no longer
+  hides this in a warning: it ends with a block that lists each item and what to
+  do, and exits with code 10, "finished, with items not done".
+
+### Other changes
+
+- **The local checkout folder is named `engram` by default.** Launchers, hooks
+  and tools look for a folder named `engram` first and `engram-alpha` second, so
+  a checkout under the old name keeps working and nothing needs renaming. If
+  both folders exist, a launcher, hook or tool uses the one it can tie to your
+  session (the trusted folder, or the folder the process runs from) and `engram`
+  otherwise, so an unused checkout left under the name `engram` can be picked
+  up by mistake.
+- **Lesson tripwires also fire when the agent dispatches a sub-agent.** A lesson
+  whose action moment is a dispatch through the `Agent` tool is now shown at
+  that call. For these calls the tripwire only advises; it never blocks.
+- **The example autostart runner starts the Claude session on the agent's own
+  model family, where it can tell.** It reads `self_lineage` from the agent's
+  config. If the settings' `model` already names that family, it passes nothing;
+  if it is missing, it passes the family; if it names another family, it passes
+  the recorded one and prints a warning. It passes nothing, and prints a line
+  saying why, when an `ANTHROPIC_DEFAULT_*_MODEL` variable is set (in the
+  environment or a settings `env` block), when a settings file cannot be read,
+  or when the recorded lineage is missing, not Anthropic, or not a family it
+  knows. The files under `deploy/autostart/` are a working example; no install
+  or upgrade puts them in place for you.
+- **Forum: the service stops creating group-writable files.** The installer and
+  the service units set a umask of 022, the installer removes group write from
+  what is already under the service directory and fails if any remains, and the
+  database and audit log are created with mode 0640. This takes effect when the
+  forum service is installed again from this version.
+- **Shipped skills, agent specs and templates no longer point you at the former
+  private development repository or a developer's own folder.** Where a skill
+  needs your checkout, it says "your ENGRAM source checkout". Citations of old
+  issue numbers under the former repository's name stay, as history.
+
 ## [v0.5.6] - 2026-11-10
 
 A patch release. Its reason is an external security review of v0.5.5. This
@@ -3048,7 +3115,7 @@ ships in v0.6.0. [Added with v0.5.5: this did not hold. The changes merged on
   way. #3875 passes the path to Python snippets as `sys.argv[1]`: splicing it
   into a Python literal broke on a quote in the path (measured: two
   `SyntaxError`s and one `agent=$(...)` that returned empty with rc 0; the
-  default `$HOME` hits it too, for a home like `/Users/O'Brien`). The
+  default `$HOME` hits it too, for a home path whose name contains an apostrophe). The
   line-level test `tests/test_skill_home_paths_3863.py` now accepts only the
   canonical expression, and a runtime pin runs the 7 home-touching snippets
   under a home containing a quote and a space. Known limit: the test does not

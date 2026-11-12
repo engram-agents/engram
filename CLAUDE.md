@@ -1,6 +1,6 @@
-# CLAUDE.md — engram-alpha project conventions
+# CLAUDE.md — ENGRAM project conventions
 
-Developer-facing conventions for contributing to engram-alpha. Identity-level
+Developer-facing conventions for contributing to engram. Identity-level
 instructions live in the user-level CLAUDE.md.
 
 **Convention for this file (#3322).** A section states the rule, its one-line
@@ -29,9 +29,10 @@ the unified payload_json signature as of 2026-05-27.
 
 ## Branching convention
 
-- **`dev`** is the default branch and the merge target for ALL feature/fix PRs.
-  Always open PRs against `dev` unless an explicit release-cut is happening.
-- **`main`** is the stable-release branch. It moves only on explicit release
+- **`dev`** is the merge target for ALL feature/fix PRs. Always open PRs
+  against `dev` unless an explicit release-cut is happening.
+- **`main`** is GitHub's default branch and holds releases (a plain clone lands
+  on a tagged release, which the installer needs). It moves only on explicit release
   cuts; routine PRs do NOT target main. **A release cut = opening a formal
   PR from `dev` → `main`** — this fires the full CI gate (`tests.yml` full
   suite + `pr-checks`), the thorough pre-release
@@ -52,12 +53,10 @@ the unified payload_json signature as of 2026-05-27.
   stated — never added inside a fix PR. (Billing measurement:
   `docs/internal/CI-COST-MODEL.md`.)
 - **Whole-minute billing (Lei, 2026-10-03).** GitHub bills CI in whole minutes rounded up, so an addition that keeps the whole pr-checks run under one minute costs nothing extra.
-- Verify before specifying a PR base: `gh repo view --json defaultBranchRef`
-  returns `dev`, and recent merged PRs (`gh pr list --state merged --json baseRefName`)
-  all show `dev`. If your session-start banner shows a branch other than `dev`
-  for "Main branch", trust the repo state — confirm with the `gh repo view`
-  command above. Fix locally with `git remote set-head origin --auto` to
-  re-sync your clone's `origin/HEAD` pointer.
+- Verify before specifying a PR base: recent merged PRs
+  (`gh pr list --state merged --json baseRefName`) all show `dev`.
+  `gh repo view --json defaultBranchRef` returns `main` by design, so a banner
+  naming `main` as "Main branch" is expected; PRs still target `dev`.
 
 ## Install tiers — a design-time discipline
 
@@ -105,7 +104,7 @@ like everything else.
    skill, forgot to tier it" cannot drift past review. This is a mechanical gate,
    not vigilance.
 
-*(All three parts are LIVE, so tiering is enforced rather than aspirational: the
+*(All three parts are LIVE: the
 manifest exists; `src/build/engine/build.py` and `cli.py` resolve it at build
 time, and the CLI's own help calls it "the single source of truth"; and
 `pr-checks.yml` runs the `manifest-gate` step on every PR. Behavioural
@@ -245,7 +244,7 @@ What each edit needs (the OPPOSITE of the official-marketplace model):
 | MCP server (`server.py`) | the path is the source but the process is from session start: `/mcp` reconnect or restart |
 | `hooks.json` registration | `/reload-plugins` re-reads it (measured for an addition and a removal); a full restart only if a registration demonstrably does not take effect |
 
-**To know which code is actually running, instrument the live artifact — never
+**To know which code is running, instrument the live artifact — never
 infer from a proxy** (a version string, `installed_plugins.json`, or a bash-env
 test will mislead). Add a stderr/file sentinel to each candidate hook copy, fire
 a REAL prompt, and read which copy logged; `CLAUDE_PLUGIN_ROOT` read from
@@ -281,15 +280,14 @@ colleague's recorded run on the exact head is the test gate; the owner's scratch
 merge on the current base and the base-SHA assertion stay; CI is the floor, since
 `pr-checks` runs only a fixed set of guard test files on `dev` PRs, never the full
 suite). This gate is
-**engram-alpha-only** — other repos (umwelt, soma) carry their own delegated
+**engram-only** — other repos (umwelt, soma) carry their own delegated
 authority. During an explicit Lei-absence day-grant, a settled substrate PR may
 be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
 
 This is a pointer, not the policy. The single source of truth — the full rule,
 the substrate/non-substrate discriminator, per-project scope, the day-grant
 carve-out, examples, gray-area calls, and the baton turn-target corollary — lives
-in **[`docs/internal/PR-MERGE-POLICY.md`](docs/internal/PR-MERGE-POLICY.md)**. Read it there; don't
-re-derive the rule from this summary.
+in **[`docs/internal/PR-MERGE-POLICY.md`](docs/internal/PR-MERGE-POLICY.md)**. Read it there.
 
 ## PR merge-readiness — CI-green gate
 
@@ -323,7 +321,7 @@ drift, the doc is the side that moves.
 
 **Re-check after ANY post-approval commit.** A moved tip (e.g. folding a late
 reviewer nit after the approve) re-triggers CI and can fail on the new commit —
-CI-green must hold on the tip the maintainer would actually merge.
+CI-green must hold on the tip the maintainer would merge.
 
 **The merge seat's own test run** is on a scratch merge of the base tip plus the PR
 head, never the head alone; a scratch-merge failure counts against the PR only if
@@ -402,7 +400,7 @@ enters the maintainer's merge queue:
 **The merge gate itself**, operationalizing Lei's same ruling: a non-author
 peer APPROVE of the PR's current head (what counts: "Approvals after a layer"
 below), plus CI green on that same head. A new commit after approval needs a **fresh** peer review
-and approval — the peer simply looks again (the `dev` ruleset already
+and approval — the peer looks again (the `dev` ruleset already
 enforces this mechanically: dismiss-on-push + last-push approval) — never a
 fairy re-check or a diff-equivalence argument standing in for it. The merge
 seat still checks the approval against the head directly rather than
@@ -412,8 +410,7 @@ force-push, explicitly NOT gh-stack's auto-rebase — see "Stacked PRs" below
 for the measurement).
 
 Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
-(merge)**. Symmetric — each agent reviews the other's PRs and has its own
-reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
+(merge)**. Symmetric — each agent reviews the other's PRs. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
 
 <!-- BEGIN team-practice: which-colleague-takes-the-seat (generated -- edit team-practice repo's TEAM-PRACTICE.md, not here; tools/sync_team_practice.py renders it) -->
@@ -442,7 +439,7 @@ escape seat).
 
 - **"Not available" = the seat did not answer.** Send the ask; it *is* the probe.
   Do not check a presence board: `forum online` tracks *prompts processed*, not
-  liveness (`engram-alpha src/forum/db.py:735`; the inbox endpoint upserts per
+  liveness (`engram src/forum/db.py:735`; the inbox endpoint upserts per
   prompt, `src/forum/server.py:900`). A seat that has **never published a
   cadence** falls back to a global 15-minute window and can read offline while
   fully available — our heartbeat floor is 30 minutes and idles to 55 (a team
@@ -475,7 +472,7 @@ an oversight: Opus seats focus on design, Sonnet seats on building and reviewing
 
 This names *which* seat; it does not add one.
 
-**Adoption status (2026-09-16):** engram-alpha, umwelt. Not soma — a routing
+**Adoption status (2026-09-16):** engram, umwelt. Not soma — a routing
 choice for Lei and soma's principal, never a structural blocker. (History,
 carried from the pre-migration hand-duplicated copies: an earlier version of
 this note claimed soma's cohort excludes Sol so the rotation cannot resolve
@@ -549,12 +546,12 @@ in when the PR seems claim-heavy" reproduces the exact defect this section
 exists to fix: a condition has no firing moment, and nobody watches for it.
 
 **A quiet week is not confirmation.** A preventive gate's successes are invisible
-by construction, so read the falsifier log — engram-alpha's
+by construction, so read the falsifier log — engram's
 `docs/internal/conclusion-warrant-falsifier-log.md` — not the silence. It records cases
 only, has no denominator, and can never confirm.
 
 *Evidence, the preventive-vs-additive argument, and the SET / OBJECT / AXIS
-diagnostic aid (n=4, one agent's carving, not a taxonomy): engram-alpha's
+diagnostic aid (n=4, one agent's carving, not a taxonomy): engram's
 `docs/internal/PR-REVIEW-CONVENTION.md` § Conclusion warrant.*
 
 *(Author-side counterpart, already minted separately and deliberately not
@@ -562,11 +559,11 @@ restated here: an error site the author can NAME in writing is the author's own
 to verify before the PR ships, never a review ask. Cite that node; don't copy it,
 or the two prose copies drift.)*
 
-> **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`**, with no
+> **Duplicated by hand in engram, umwelt, and soma `CLAUDE.md`**, with no
 > generator or test binding the copies. Change one, change all three in the same
 > pass. This copy is the condensed form (#3323); the umwelt and soma copies still
 > carry the long text until their sibling PRs land, after which the RULE portion
-> is byte-identical across all three again and each points at engram-alpha's
+> is byte-identical across all three again and each points at engram's
 > `docs/internal/PR-REVIEW-CONVENTION.md` for the history and argument. The gate itself
 > lives in exactly one place (`engram-pr-reviewer.md`'s output contract), so
 > these three copies document one mechanism, never three copies of it.
@@ -585,8 +582,7 @@ state, does not count as the colleague box.** The colleague pass
 starts only once the reviewer-fairy round has converged on the tip being
 reviewed — or has reached item 1's three-round cap with its open findings
 listed in the PR body, which is the sequence's stopping point — not before,
-not in parallel, no exception for a PR that requests both at once. Lei's reasoning, stated because it should carry the rule rather
-than just accompany it: (1) the fairy round is *within the author's own
+not in parallel, no exception for a PR that requests both at once. Lei's reasoning: (1) the fairy round is *within the author's own
 control* — a self-check by a fresh-eyed, context-less reviewer that interrupts
 nobody's workflow, a sanity check and a courtesy to peers, not a cost worth
 working around. (2) Peer review *assumes* fairy convergence — implementation
@@ -654,62 +650,61 @@ of this rule: `docs/internal/PR-REVIEW-CONVENTION.md` § The order is a rule.*
 ### Stacked PRs (`gh-stack`) — the merge verb changes, and nothing in training knows it
 
 GitHub Stacked PRs (public preview 2026-07-30; official extension
-`github/gh-stack`) is **post-cutoff for every model on the team** — no session
-knows it exists unless a surface carries it; this section is that surface (Lei,
-2026-08-29). Install is **per-user**: `gh extension install github/gh-stack`
+`github/gh-stack`) is **post-cutoff for every model on the team**; this section is
+the surface that carries it (Lei, 2026-08-29). Install is **per-user**:
+`gh extension install github/gh-stack`
 (verify with `gh extension list`).
 
 - **Link at PR creation — not optional.** The moment you open a PR whose base is
-  another PR's branch, `gh stack link <parent> <child> …` (works on already-open
-  PRs; `gh stack link <pr1> <pr2> …` links existing PRs into a stack). An
+  another PR's branch, `gh stack link <parent> <child> …` (works on open PRs;
+  `gh stack link <pr1> <pr2> …` links existing PRs). An
   unlinked stack has none of the protections below: plain `gh pr merge` is NOT
   refused, nothing auto-rebases, and merging the parent with `--delete-branch`
   CLOSES the child instead of retargeting it. An auto-closed child is
   recoverable only while its head is untouched: **restore the deleted base ref
   BEFORE you rebase anything** — a post-close force-push forecloses reopen.
-- **Membership is a timestamped snapshot, never a standing fact.** Another seat
-  can change it mid-operation. Never carry a membership read across an interval
-  in which another seat may act, and never pair `--delete-branch` with a
+  **Interim (2026-11-11, pending the default-branch decision):** here PRs target `dev`
+  but the default branch is `main`, and `gh stack link` retargets the bottom PR to
+  `main`. Do not link such stacks; the parent's merge seat retargets each child to
+  `dev` before merging. Procedure: `docs/internal/GH-STACK.md`.
+- **Membership is a timestamped snapshot, never a standing fact.** Never carry a
+  membership read across an interval in which another seat may act, and never pair `--delete-branch` with a
   membership read you have not just re-taken: read the PR's `stack` field AND its
   events API (`added_to_stack` / `removed_from_stack`) immediately before
   merging. The merge attempt is authoritative (believing a member is not one
   earns a refusal; believing a non-member has no dependents orphans them). A
   local `gh stack view` can claim "not part of a stack" while the PR is one.
 - **A stack member REFUSES plain `gh pr merge`.** The verb is
-  `gh stack merge <pr> --squash --yes`; the refusal is the signal you are on a
-  stack.
+  `gh stack merge <pr> --squash --yes`; the refusal signals a stack.
 - **After a layer merges, GitHub auto-rebases the next layer itself** (no push
   from any seat; the force-push is attributed to the merger). Verify with
   `git range-diff`/patch-id — but that check is **necessary, not sufficient**: it
   answers "did the patch change?", never "does the result still work?". A
-  conflict-free rebase can break the tree (one PR drops an import as dead code,
-  another adds a caller). **Run the tests on each rebased tip.**
-- **Other verbs:** `gh stack sync` / `gh stack rebase` (cascading rebase of
-  un-merged layers), `gh stack view --json`. Stacks are API-readable (REST
+  conflict-free rebase can break the tree (one PR drops an import, another adds a caller).
+  **Run the tests on each rebased tip.**
+- **Other verbs:** `gh stack sync` / `gh stack rebase` (cascading rebase),
+  `gh stack view --json`. Stacks are API-readable (REST
   `stack`, GraphQL `PullRequestStack`), not API-mutable.
 - **Approvals after a layer: compare, never predict.** With
   `require_last_push_approval=true` on the target branch, the seat that
-  syncs/rebases cannot be the tip re-affirmer; a teammate re-approves. Whether an
+  syncs/rebases cannot re-affirm the tip; a teammate re-approves. Whether an
   approval is dismissed on push depends on the base branch's
   `dismiss_stale_reviews_on_push` — **necessary on the evidence, not
-  demonstrably sufficient**, so never treat it as a rule that predicts the
-  outcome. After every layer, read the approval back off `pulls/<N>/reviews`: it
+  demonstrably sufficient**, so do not treat it as predicting the outcome. After every layer, read the approval back off `pulls/<N>/reviews`: it
   counts only if its `commit_id` is the PR's current `headRefOid` AND its
   `submitted_at` is not earlier than that commit's committer date.
   **`commit_id == headRefOid` alone is never sufficient**: GitHub can re-point live
   approvals onto newer heads (engram-alpha#2267). Otherwise get a fresh approval
-  (source of truth: engram-alpha `docs/internal/PR-MERGE-POLICY.md`, gate item 2). Never trust `reviewDecision` alone. (On engram-alpha the setting is `true` on `dev`,
-  `false` on `main`.)
+  (see `docs/internal/PR-MERGE-POLICY.md`, gate item 2). Never trust `reviewDecision` alone. (On engram the setting is `true` on `dev`;
+  `main` has no pull-request rule, so it is unset there.)
 - **Read branch protection via `rules/branches/<b>`, never
   `branches/<b>/protection`.** The classic endpoint answers by caller permission
   (admin: "Branch not protected"; non-admin: "Not Found"; unauthenticated: 401)
-  and gives the same answer for a ruleset-protected and an unprotected branch, so
-  it discriminates nothing.
+  and gives the same answer for a ruleset-protected and an unprotected branch, so it discriminates nothing.
 
-*Evidence for every rule above (the dated measurements, the dismissal cases, the
-numbering sweep): engram-alpha's `docs/internal/GH-STACK.md`.*
+*Evidence for every rule above: engram's `docs/internal/GH-STACK.md`.*
 
-> **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`** (Lei,
+> **Duplicated by hand in engram, umwelt, and soma `CLAUDE.md`** (Lei,
 > 2026-08-29: whichever repo a session starts from must load it), with no
 > generator or test binding them. Change one, change all three in the same
 > pass — **but the ruleset paragraph and any repo-specific merge-authority
@@ -724,7 +719,7 @@ numbering sweep): engram-alpha's `docs/internal/GH-STACK.md`.*
 > (umwelt#816) — **do not read this note as "already synced across all
 > three"; it is synced once all three of this PR / soma#60 / umwelt#816
 > have merged.** The evidence behind this section — every dated measurement — now lives in
-> engram-alpha's `docs/internal/GH-STACK.md`, and the sibling copies point there.
+> engram's `docs/internal/GH-STACK.md`, and the sibling copies point there.
 
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 
@@ -733,7 +728,7 @@ open PRs guards against your own stale branch from a prior session, not just a
 counterpart's work. All three exist because **a list read and a thread read are
 different operations, and only the list read scales**: nobody opens ten comment
 threads to reconstruct status, so status living only in comments is invisible at the
-altitude people actually work at.
+altitude people work at.
 
 **1. Before starting: `gh pr list --state open`, before the first commit of any new
 task.** A read of the actual list, drafts included. If an open PR already does part of
@@ -791,7 +786,7 @@ close, not another comment.
 Open a PR-baton **at PR creation**, for **every** PR — bunch-driven OR standalone:
 `baton init PR-N --title "<short>" --participants <self>,<counterpart>,<maintainer> --turn <self> --status in-progress --colleague <counterpart> --repo <owner>/<repo>`.
 Use `--colleague <name>` to identify the expected colleague reviewer — this adds them to participants (dedup) and enables the colleague gate: `baton flip PR-N <maintainer>` will be rejected if no non-author APPROVED review exists. Without `--colleague` (and without a third participant), the gate falls back to warn-only (a baton with no colleague).
-Then flip it as the turn actually passes along the review pipeline:
+Then flip it as the turn passes along the review pipeline:
 
 - reviewer-fairy converged → `baton flip PR-N <counterpart> "fairy-converged; colleague please"`
 - counterpart **comments / requests changes** → it flips back to you (`flip PR-N <self>`);
@@ -829,7 +824,7 @@ in `docs/baton-protocol.md`. The maintainer merges from that phase signal — ne
 that merely *looks* parked. A PR with **no baton**, or a baton **not yet at `phase: merge`**,
 is **not** ready, no matter how long it has sat. Symmetrically: never leave a
 colleague-converged PR without running the advance — otherwise its readiness is
-invisible, and a colleague verdict that is actually "COMMENTED with considerations" (not an
+invisible, and a colleague verdict that is "COMMENTED with considerations" (not an
 approval) can be misread as ready. **Fallback — read `turn` as before (turn = the
 maintainer, reached via an explicit colleague approval or, with no counterpart, your own converged
 second-layer pass) — in these known cases (a list of what has been found, not a proof that
@@ -877,16 +872,16 @@ since agent coordination work started in 2026-05.
 `name-leak-warn` **advises, never blocks** because it cannot itself tell a
 citation from a leak, so it asks the seat to decide. Umwelt and soma run no
 `name-leak-warn` gate — a merge seat there applies Lei's rule by reading the PR.
-(Rationale: engram-alpha's `docs/internal/PR-REVIEW-CONVENTION.md` § Attribution convention.)
+(Rationale: engram's `docs/internal/PR-REVIEW-CONVENTION.md` § Attribution convention.)
 
 **For the merge seat:** an advisory `name-leak-warn` hit on a **bare agent handle** is never, by itself, grounds to hold a PR — not because the gate has ruled (it explicitly hasn't; see above), but because Lei's 2026-08-15 ruling already has, for this one case. The seat's job on a hit is first to identify *which* name matched — the gate reports one pattern per line and does not name the category, so a line with several candidate names does not tell you which one tripped it — and only then apply this rule to a bare agent handle specifically. Scrubbing a colleague's attribution under a self-invented "cite the PR, not the person" habit is the exact over-application this section exists to name.
 
-> **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`**, with no
+> **Duplicated by hand in engram, umwelt, and soma `CLAUDE.md`**, with no
 > generator or test binding the copies. Change one, change all three in the same
-> pass. The gates themselves are CI steps in engram-alpha's `pr-checks.yml` (umwelt has
+> pass. The gates themselves are CI steps in engram's `pr-checks.yml` (umwelt has
 > its own separate node-ID gate; neither umwelt nor soma runs a `name-leak-warn`
 > gate); these three copies document Lei's rule, not the gates, and the evidence
-> behind it now lives in engram-alpha's `docs/internal/PR-REVIEW-CONVENTION.md`, to which
+> behind it now lives in engram's `docs/internal/PR-REVIEW-CONVENTION.md`, to which
 > the sibling copies point.
 
 ## Project-as-bunch coordination (with a counterpart agent)
@@ -983,10 +978,9 @@ files / functions).
 
 ### With no counterpart
 
-No counterpart → no claim contention. The Project layer remains useful as an
-organizing structure for defect-classes, but the `claim` / `release` ritual is
-moot. PR-layer baton still useful as a per-PR cursor through fairy →
-maintainer.
+No counterpart → no claim contention. The Project layer still organizes
+defect-classes, but the `claim` / `release` ritual is moot. The PR-layer baton
+still serves as a per-PR cursor through fairy → maintainer.
 
 ### Existing Projects vs new
 
@@ -1009,9 +1003,8 @@ maintainer.
 - Skill (HOW details): `engram-baton`.
 - Companion letter skill (verdicts + discoveries channel): `engram-letter`.
 
-**Why project-local** (not user-level): same reasoning as the PR review
-convention above — agent coordination tooling is project-specific, not
-identity-level discipline.
+**Why project-local** (not user-level): as in the PR review
+convention above, agent coordination tooling is project-specific.
 
 ## PR — issue closure
 
@@ -1026,6 +1019,11 @@ When a PR fully closes an issue, **both surfaces are required**:
    verified via the `closingIssuesReferences` GraphQL field. Without it, the
    issue does NOT auto-close on merge regardless of title content. (The
    bracket form in the title is human-scan cosmetic; the parser ignores it.)
+   **Standing rule (2026-11-11):** a closing keyword does NOT close an issue on a
+   merge into `dev` (measured twice: `docs/internal/PR-ISSUE-CLOSURE.md`). The merge
+   seat closes it by hand right after the press, naming the PR and merge commit;
+   title and body keep `[closes #N]` / `Closes #N.` as intent. If `dev` becomes the
+   default branch, this lapses.
 
 
 **For multi-PR / EPIC ships:** earlier PRs may reference the issue number but
@@ -1083,14 +1081,14 @@ incident below).
 1. **Auto-close intent fires** (when the PR DOES close an issue): the body
    must contain a close-keyword referencing the target.
    ```
-   gh api graphql -f query='{repository(owner:"engram-agents",name:"engram-alpha"){pullRequest(number:<PR>){closingIssuesReferences(first:5){nodes{number}}}}}'
+   gh api graphql -f query='{repository(owner:"engram-agents",name:"engram"){pullRequest(number:<PR>){closingIssuesReferences(first:5){nodes{number}}}}}'
    ```
    The full API envelope is `{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[...]}}}}}` —
    look for `nodes: [{number: <N>}]` where N matches the title's `[closes #N]`.
    `"nodes":[]` (empty) means the body is missing the keyword form and the PR
    will NOT auto-close **via the body** on merge; rewrite via
    `gh pr edit <PR> --body "..."`. **An empty array says NOTHING about commit
-   messages — see check 3, which covers the path this query cannot see.**
+   messages — see check 3, which covers the path this query cannot see.** Intent only: a merge to `dev` closes nothing (standing rule, item 2).
 
    **This query lags a `gh pr edit --body`/push, in EITHER direction** (a fixed body
    can still read non-empty; a bad one can read empty). Query, wait at least 5
@@ -1109,8 +1107,8 @@ incident below).
 3. **No commit-message auto-close** (always): `closingIssuesReferences` reads
    the PR BODY only — a merge commit's own message is a THIRD close surface
    GitHub's parser reads independently, invisible to checks 1 and 2.
-   engram-alpha's `squash_merge_commit_message` is `BLANK` (branch commit
-   messages do not ride into the merge commit here today), but **umwelt and soma
+   This repo's `squash_merge_commit_message` is `BLANK` (title `PR_TITLE`; reset
+   after the 2026-11 rebuild), but **umwelt and soma
    read `COMMIT_MESSAGES`** — check `gh api repos/engram-agents/<repo> --jq
    .squash_merge_commit_message` for the repo you are in. Run the grep anyway; a
    settings flip is silent, and so are a hand-edited squash message and

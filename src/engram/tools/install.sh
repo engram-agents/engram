@@ -21,8 +21,8 @@
 # CLAUDE_HOME and CLAUDE_CONFIG_DIR unset. ENGRAM_HOME alone leaves the venv (~/.engram/venv, by
 # design, #3863), ~/.claude/CLAUDE.md and the plugin config live. Untagged tip: --sandbox-untagged.
 #
-# Bash 3.2 compatible (macOS). No interactive prompt except the one CLAUDE.md question in
-# step 6 (a tty, no --yes, an existing ~/.claude/CLAUDE.md and no backup yet).
+# Bash 3.2 compatible (macOS). One prompt only: the CLAUDE.md question in step 6 (a tty, no --yes,
+# an existing CLAUDE.md). The installer only ASKS; bootstrap makes the backups. See --help for --yes.
 
 set -euo pipefail
 
@@ -51,10 +51,10 @@ fi
 # 0 = the Claude Code native installer runs only behind --install-claude-code. It runs remote
 #     code, so that flag is the operator's yes and --yes NEVER implies it.
 DEFAULT_INSTALL_CLAUDE_CODE=0
-# 1 = an existing ~/.claude/CLAUDE.md is copied ONCE to CLAUDE.md.pre-engram (never
-#     overwritten) and then replaced. It answers the step-6 question when nobody can be asked
-#     (--yes, or no tty). 0 = stop instead of replacing.
-DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD=1
+# 0 = with no one to ask (no tty) and no --yes, an existing ~/.claude/CLAUDE.md is left alone
+#     and the install stops. Only an explicit yes replaces it: --yes, or "y" at the tty question
+#     (default No). 1 would answer yes for a user who was never asked; keep it 0.
+DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD=0
 # 1 = the persistent recall service is installed unless --no-recall-service.
 DEFAULT_RECALL_SERVICE=1
 
@@ -81,7 +81,9 @@ Options:
   --forum-url URL       write forum.url into config.json
   --install-claude-code run Claude Code's native installer if `claude` is missing
                         (off by default; --yes never implies it)
-  --yes                 non-interactive: answer the CLAUDE.md question "back up and replace"
+  --yes                 non-interactive: answer yes to the CLAUDE.md question (replace it; it is
+                        backed up first). An agent passes --yes only after showing the user the
+                        file that will be replaced and where its backups go, and getting their yes
   --sandbox-untagged    SANDBOX RIGS ONLY, not a release: build from an untagged commit or a
                         branch (passes --allow-untagged and --allow-branch to step 5) and print
                         "SANDBOX BUILD (not a release): <HEAD sha>" in step 1 and at the end.
@@ -216,8 +218,14 @@ LOG_SAVE_DIR=""
 # ── Python helpers (kept in variables, run with `python3 -c`: no heredoc inside $(...), which
 # bash 3.2 mis-parses) ────────────────────────────────────────────────────────────────────────
 read -r -d '' PY_CONFIG <<'PY' || true
-import json, os, sys
-path, tier_arg, default_tier = sys.argv[1], sys.argv[2], sys.argv[3]
+import contextlib, io, json, os, sys
+from pathlib import Path
+path, tier_arg, default_tier, guard_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+# The write goes through the one guard module of this checkout (stdlib only, so the system
+# python3 can import it before the venv exists). No bytecode is written into the checkout.
+sys.dont_write_bytecode = True
+sys.path.insert(0, guard_dir)
+import engram_file_guard as fg
 TIERS = ("essential", "convenience", "dev")
 if os.path.lexists(path):
     try:
@@ -244,27 +252,30 @@ def show(v):
 notes = []
 if "install_tier" in d and d["install_tier"] != tier:
     notes.append("config: install_tier %s -> %s" % (show(d["install_tier"]), tier))
-changed = d.get("install_tier") != tier
 # First output line: "<status> <tier>"; any further lines are change notes.
 def out(status):
     print("%s %s" % (status, tier))
     for n in notes:
         print(n)
-if existed and not changed:
-    out("unchanged")
-    sys.exit(0)
-d["install_tier"] = tier
-# Written in place (not temp file + rename): that keeps the file's mode, owner and ACL, which a
-# rename resets. The file is a few hundred bytes, written from a dict already held in memory.
-# Other keys keep their values and their order; the formatting is normalized (indent=2).
+# The MERGE class of the guard: install_tier is the one key written; every other key keeps its
+# value and order; a changed file is backed up (stamped) first; an unchanged one is not touched;
+# a file that does not parse, or holds a duplicate key, is refused and never repaired.
+buf = io.StringIO()
+umask = os.umask(0)
+os.umask(umask)
 try:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(d, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-except OSError as exc:
+    with contextlib.redirect_stdout(buf):
+        # A new file gets the mode this installer always gave it (0666 minus the umask).
+        result = fg.apply_merge(Path(path), {"install_tier": tier}, filename="config.json",
+                                new_mode=0o666 & ~umask)
+except fg.MergeRefused as exc:
+    print("ERR %s" % exc)
+    sys.exit(1)
+except (OSError, SystemExit) as exc:
     print("ERR could not write %s: %s" % (path, exc))
     sys.exit(1)
-out("updated" if existed else "created")
+notes.extend(l.strip() for l in buf.getvalue().splitlines() if l.strip())
+out({"created": "created", "merged": "updated", "unchanged": "unchanged"}[result])
 PY
 
 read -r -d '' PY_NODE_COUNT <<'PY' || true
@@ -348,6 +359,8 @@ if [ -z "$REPO_ROOT" ]; then
 fi
 [ -f "$REPO_ROOT/requirements/requirements.txt" ] \
   || fail "requirements/requirements.txt missing under $REPO_ROOT" "run this script from a complete engram checkout"
+[ -f "$REPO_ROOT/src/engram/engram_file_guard.py" ] \
+  || fail "src/engram/engram_file_guard.py missing under $REPO_ROOT (it makes the backup before any config change)" "run this script from a complete engram checkout"
 
 # L1: refuse here what install-local-marketplace.sh's step-5 guard would refuse, before the venv
 # and pip are spent. Same rule, same code: src/build/engine/deploy_tag.py deployable_tag_at
@@ -372,9 +385,9 @@ fi
 
 mkdir -p "$CLAUDE_HOME" 2>/dev/null && [ -w "$CLAUDE_HOME" ] \
   || fail "$CLAUDE_HOME is not writable" "fix its ownership or permissions (chown/chmod) and re-run"
-# A dangling ~/.claude/CLAUDE.md link would fail the step-6 backup after real work was done.
+# A dangling ~/.claude/CLAUDE.md link would make bootstrap refuse in step 6 after real work was done.
 if [ -L "$CLAUDE_MD" ] && [ ! -e "$CLAUDE_MD" ]; then
-  fail "$CLAUDE_MD is a symlink to a path that does not exist ($(readlink "$CLAUDE_MD"))" "remove the link (rm '$CLAUDE_MD') or repair it so it points at a real file, then re-run"
+  fail "$CLAUDE_MD is a symlink to a path that does not exist ($(readlink "$CLAUDE_MD"))" "move the link aside (mv '$CLAUDE_MD' '$CLAUDE_MD.moved-aside') or repair it so it points at a real file, then re-run"
 fi
 mkdir -p "$ENGRAM_HOME" 2>/dev/null && [ -w "$ENGRAM_HOME" ] \
   || fail "$ENGRAM_HOME is not writable" "fix its ownership or permissions (chown/chmod) and re-run"
@@ -432,8 +445,8 @@ fi
 
 # ── Step 3: config.json ──────────────────────────────────────────────────────────────────────
 begin_step 3 "config.json"
-if ! _cfg_out="$(python3 -c "$PY_CONFIG" "$CONFIG_PATH" "$TIER_ARG" "$DEFAULT_TIER")"; then
-  fail "${_cfg_out#ERR }" "fix or remove $CONFIG_PATH by hand and re-run (this installer never overwrites a config it cannot parse)"
+if ! _cfg_out="$(python3 -c "$PY_CONFIG" "$CONFIG_PATH" "$TIER_ARG" "$DEFAULT_TIER" "$REPO_ROOT/src/engram")"; then
+  fail "${_cfg_out#ERR }" "fix $CONFIG_PATH by hand, or move it aside ('mv $CONFIG_PATH $CONFIG_PATH.moved-aside'), and re-run (this installer never overwrites a config it cannot parse)"
 fi
 # Line 1 is "<status> <tier>" (the EFFECTIVE value: kept, changed or default);
 # later lines are "config: <key> <old> -> <new>" for every stored value this run changes.
@@ -481,8 +494,16 @@ printf '[step 5] running install-local-marketplace.sh (its output follows)\n'
 _market_flags=""
 [ "$SANDBOX_UNTAGGED" != "1" ] || _market_flags="--allow-untagged --allow-branch"
 # shellcheck disable=SC2086  # intentional word splitting of the two fixed flags
-bash "$TOOLS_DIR/install-local-marketplace.sh" $_market_flags \
-  || fail "install-local-marketplace.sh exited non-zero" "read its output above (a tag or branch guard, the model pre-warm and pip are the usual causes) and re-run"
+_market_rc=0
+bash "$TOOLS_DIR/install-local-marketplace.sh" $_market_flags || _market_rc=$?
+# Exit 10 is its own code: "finished, with items not done" (the block it printed lists each one).
+# It is still this step's FAIL (steps 6-9 do not run), but the line says so, so an operator can tell
+# "the marketplace step did not finish" from "it finished and one item is missing".
+if [ "$_market_rc" -eq 10 ]; then
+  fail "the marketplace step finished, but it reported items it did not do (exit 10; the block above lists each one)" "the marketplace is assembled, and steps 6-9 did not run; do what the block says for each item, then re-run this installer"
+elif [ "$_market_rc" -ne 0 ]; then
+  fail "install-local-marketplace.sh exited non-zero" "read its output above (a tag or branch guard, the model pre-warm and pip are the usual causes) and re-run"
+fi
 [ -f "$PLUGIN_ROOT/bootstrap.py" ] \
   || fail "the marketplace was assembled but $PLUGIN_ROOT/bootstrap.py is missing" "re-run the build; if it persists the plugin build is broken"
 step_ok
@@ -516,36 +537,37 @@ fi
 
 if [ "$_run_bootstrap" -eq 1 ]; then
   # bootstrap.py refuses to overwrite an existing, differing CLAUDE.md (#4440) unless it is
-  # given --force. That flag is passed ONLY on the branch below where the file exists and the
-  # consent/backup step has already succeeded; every other run passes nothing.
-  _bootstrap_flags=""
-  # Back up an existing CLAUDE.md BEFORE bootstrap renders over it, once, never over an
-  # existing backup. Only when bootstrap will run: on a seat whose graph is seeded the file
-  # is ENGRAM's own rendering, and copying it would put the wrong file in the backup.
-  if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
-    if [ -L "$CLAUDE_MD_BACKUP" ] && [ ! -e "$CLAUDE_MD_BACKUP" ]; then
-      fail "$CLAUDE_MD_BACKUP is a symlink to a path that does not exist, so $CLAUDE_MD cannot be backed up there" "remove or repair the link (rm '$CLAUDE_MD_BACKUP'), then re-run"
-    elif [ -e "$CLAUDE_MD_BACKUP" ] && [ "$CLAUDE_MD" -ef "$CLAUDE_MD_BACKUP" ]; then
-      fail "$CLAUDE_MD_BACKUP is the same file as $CLAUDE_MD (a hard link or link to it), so it would be overwritten too" "move '$CLAUDE_MD_BACKUP' away, then re-run"
-    elif { [ -e "$CLAUDE_MD_BACKUP" ] || [ -L "$CLAUDE_MD_BACKUP" ]; } && [ ! -f "$CLAUDE_MD_BACKUP" ]; then
-      fail "$CLAUDE_MD_BACKUP exists but is not a regular file, so $CLAUDE_MD cannot be backed up there" "move it away, then re-run"
-    elif [ -e "$CLAUDE_MD_BACKUP" ] || [ -L "$CLAUDE_MD_BACKUP" ]; then
-      _claude_md_note="existing backup kept untouched at $CLAUDE_MD_BACKUP; $CLAUDE_MD will be replaced"
-    else
-      _go=$DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD
-      if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
-        printf '%s already exists. ENGRAM will replace it. Back it up to %s first and continue? [Y/n] ' "$CLAUDE_MD" "$CLAUDE_MD_BACKUP"
-        read -r _answer || _answer="n"
-        case "$_answer" in ""|y|Y|yes|YES|Yes) _go=1 ;; *) _go=0 ;; esac
-      fi
-      [ "$_go" -eq 1 ] \
-        || fail "$CLAUDE_MD exists and was not backed up" "move or copy it away yourself, or re-run with --yes to back it up to CLAUDE.md.pre-engram and replace it"
-      cp -p "$CLAUDE_MD" "$CLAUDE_MD_BACKUP" \
-        || fail "could not copy $CLAUDE_MD to $CLAUDE_MD_BACKUP" "fix the permissions of $CLAUDE_HOME and re-run"
-      _claude_md_note="backed up $CLAUDE_MD to $CLAUDE_MD_BACKUP; $CLAUDE_MD will be replaced"
+  # given consent for it. The consent is `--replace "$CLAUDE_MD"`: yes to exactly that one
+  # file, the one the question below names, never to any other path. It is added ONLY on the
+  # branch below where the file exists and the user has said yes; every other run passes
+  # nothing. The installer makes NO copy of the file itself: it only asks. bootstrap.py (its
+  # file guard) saves the current bytes first: `CLAUDE.md.pre-engram` the first time, and a
+  # time-stamped `CLAUDE.md.engram-backup.<UTC>` copy every time. An array keeps a path with
+  # spaces as one argument; the
+  # ${arr[@]+...} form is the spelling that is safe for an empty array under `set -u` on
+  # bash 3.2 (macOS /bin/bash) too.
+  _bootstrap_flags=()
+  # The yes for replacing an existing CLAUDE.md. --yes is a yes; on a terminal the question
+  # defaults to No; with no one to ask the constant decides (0): with neither a tty nor --yes
+  # the answer is no and the installer stops (it never answers for a user who was not asked).
+  _require_claude_md_yes() {
+    _go=$DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD
+    if [ "$ASSUME_YES" -eq 1 ]; then
+      _go=1
+    elif [ -t 0 ] && [ -t 1 ]; then
+      printf '%s already exists. ENGRAM will replace it; the current file is saved first to %s (once) and to a time-stamped %s.engram-backup.<UTC> copy. Replace it? [y/N] ' "$CLAUDE_MD" "$CLAUDE_MD_BACKUP" "$CLAUDE_MD"
+      read -r _answer || _answer="n"
+      case "$_answer" in y|Y|yes|YES|Yes) _go=1 ;; *) _go=0 ;; esac
     fi
-    _bootstrap_flags="--force"
-    printf '[step 6] CLAUDE.md: %s\n' "$_claude_md_note"
+    [ "$_go" -eq 1 ] \
+      || fail "$CLAUDE_MD exists and was not replaced (no yes was given: there is no terminal to ask on, or the answer was no)" "move it aside yourself, or, for an agent, first show the user that $CLAUDE_MD will be replaced and that its backups go to $CLAUDE_MD_BACKUP and $CLAUDE_MD.engram-backup.<UTC>, and re-run with --yes only on the user's yes"
+  }
+  # Only when bootstrap will run: on a seat whose graph is seeded the file is ENGRAM's own
+  # rendering and nothing is replaced. The question comes first; the copy is bootstrap's.
+  if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
+    _require_claude_md_yes
+    _bootstrap_flags=(--replace "$CLAUDE_MD")
+    printf '[step 6] CLAUDE.md: %s will be replaced after bootstrap saves the current file to %s (once) and to a time-stamped %s.engram-backup.<UTC> copy\n' "$CLAUDE_MD" "$CLAUDE_MD_BACKUP" "$CLAUDE_MD"
   fi
 
   printf '[step 6] %s\n' "$_state_note"
@@ -554,14 +576,14 @@ if [ "$_run_bootstrap" -eq 1 ]; then
       ALPHA_DIR="$PLUGIN_ROOT" ALPHA_TEMPLATES_DIR="$PLUGIN_ROOT/templates" \
       ENGRAM_HOME="$ENGRAM_HOME" CLAUDE_HOME="$CLAUDE_HOME" PYTHON_BIN="$VENV_PY" \
       TARGET=claude ENGRAM_INSTALL_MODE=plugin \
-      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" $_bootstrap_flags \
+      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" ${_bootstrap_flags[@]+"${_bootstrap_flags[@]}"} \
       || fail "bootstrap.py failed" "read its output above and re-run; the 0-node state is retried safely"
   else
     env -u FORCE -u FORCE_RESEED_EMPTY \
       ALPHA_DIR="$PLUGIN_ROOT" ALPHA_TEMPLATES_DIR="$PLUGIN_ROOT/templates" \
       ENGRAM_HOME="$ENGRAM_HOME" CLAUDE_HOME="$CLAUDE_HOME" PYTHON_BIN="$VENV_PY" \
       TARGET=claude ENGRAM_INSTALL_MODE=plugin \
-      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" $_bootstrap_flags \
+      "$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" ${_bootstrap_flags[@]+"${_bootstrap_flags[@]}"} \
       || fail "bootstrap.py failed" "read its output above; if knowledge.db was left behind with 0 nodes, re-running this installer reseeds it"
   fi
   BOOTSTRAP_RAN=1

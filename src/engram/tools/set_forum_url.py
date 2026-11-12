@@ -30,11 +30,16 @@ at most 63 and the name at most 253 characters); an empty port (``h:``) is
 refused. One trailing ``/`` is removed (a second one is refused, so the stored
 value never ends in ``/`` and a re-run is idempotent), and an existing
 ``forum.url`` that differs from the new value only by one trailing ``/``
-counts as already set (unchanged). A config file that is formatted
-differently is reformatted on write (``json.dump(indent=2)`` plus a trailing
-newline, default ASCII escapes for non-ASCII text, as
-``install-local-marketplace.sh`` writes it; values round-trip unchanged); key
-order is preserved.
+counts as already set (unchanged). The write is the file guard's MERGE class
+(``engram_file_guard.apply_merge``): ``forum.url`` is the one key written, every
+other key keeps its value and order, and the file is re-serialized with its own
+indent (2 when it has none) plus a trailing newline. Before a write that changes
+the file, its current bytes are saved to ``config.json.engram-backup.<UTC>``
+beside it (backups accumulate; nothing deletes them). A file that does not
+parse, holds a duplicate key or a non-finite number is refused and left as it
+is. ``--force`` is the user's yes to replacing a DIFFERENT url (or a ``forum``
+value that is not an object); an agent shows the user the old and new value and
+where the backup goes before it passes ``--force``.
 The write is atomic (same-directory temp file, fsync, ``os.replace``), keeps
 the file mode, and follows a symlinked ``config.json`` to its target. Ownership
 and file-level ACL entries are not preserved by the atomic replace (a directory
@@ -49,7 +54,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 from typing import Any, NamedTuple, Optional
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -61,6 +65,9 @@ _PKG_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PKG_ROOT not in sys.path:
     sys.path.append(_PKG_ROOT)
 from tools import _owner_read as owner_read  # noqa: E402
+# The write goes through the one file guard (engram_file_guard.py), which sits in the same
+# folder as `tools` in both layouts: backup first, then an atomic write.
+import engram_file_guard as fg  # noqa: E402
 
 EXIT_OK = 0
 EXIT_INVALID = 2
@@ -142,27 +149,6 @@ def validate_url(url: Any) -> "tuple[Optional[str], str]":
     return value, ""
 
 
-def _atomic_write(path: str, data: dict) -> None:
-    """Write ``data`` to ``path`` (already symlink-resolved) atomically."""
-    directory = os.path.dirname(path) or "."
-    mode = os.stat(path).st_mode & 0o7777
-    fd, tmp = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh, indent=2)
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def set_forum_url(config_path, url, *, force: bool = False) -> SetResult:
     """Set ``forum.url`` in ``config_path``; touch nothing else."""
     value, reason = validate_url(url)
@@ -182,10 +168,15 @@ def set_forum_url(config_path, url, *, force: bool = False) -> SetResult:
         return _refuse(f"refused: cannot read {config_path} as JSON ({exc})")
     if not isinstance(config, dict):
         return _refuse(f"refused: {config_path} is not a JSON object")
+    try:  # the guard's own strict reading: a duplicate key or a non-finite number is refused before any decision
+        fg.merge_json_text("config.json", Path(path).read_text(encoding="utf-8"), {})
+    except fg.MergeRefused as exc:
+        return _refuse(f"refused: {exc}; file unchanged")
 
     forum = config.get("forum")
+    replace_non_object = False  # becomes True only on the --force path below, after the user's yes
     if forum is None:
-        new_forum: dict = {"url": value}
+        pass  # absent or an explicit null: the guard treats both as absent
     elif isinstance(forum, dict):
         existing = forum.get("url")
         if isinstance(existing, str) and existing.strip():
@@ -197,23 +188,29 @@ def set_forum_url(config_path, url, *, force: bool = False) -> SetResult:
             if not force:
                 return _refuse(
                     f"refused: forum.url is already {existing.strip()!r}; "
-                    "pass --force to overwrite it",
+                    "pass --force to overwrite it (the old file is saved to a backup first). "
+                    "An agent shows the user the old and the new url and where the backup goes "
+                    "first, and passes --force only on the user's yes",
                     EXIT_CONFLICT,
                 )
-        new_forum = dict(forum)
-        new_forum["url"] = value
     else:
         if not force:
             return _refuse(
                 f"refused: 'forum' in {config_path} is a "
-                f"{type(forum).__name__}, not an object; pass --force to replace it"
+                f"{type(forum).__name__}, not an object; pass --force to replace it (the old "
+                "file is saved to a backup first). An agent shows the user that value and "
+                "where the backup goes first, and passes --force only on the user's yes"
             )
-        new_forum = {"url": value}
+        replace_non_object = True
 
-    config["forum"] = new_forum
+    # The write is the file guard's MERGE class: forum.url is the one key written, every other
+    # key keeps its value and order, and the file is saved to a time-stamped backup first.
     try:
-        _atomic_write(path, config)
-    except OSError as exc:
+        fg.apply_merge(Path(path), {"forum.url": value}, filename="config.json",
+                       replace_non_object=replace_non_object)
+    except fg.MergeRefused as exc:
+        return _refuse(f"refused: {exc}; file unchanged")
+    except (OSError, SystemExit) as exc:
         return _refuse(f"refused: could not write {config_path} ({exc}); file unchanged")
     return SetResult("written", f"written: forum.url set to {value}", EXIT_OK)
 
