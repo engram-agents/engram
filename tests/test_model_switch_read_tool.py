@@ -916,3 +916,196 @@ def test_source_class_malformed_or_non_object_metadata_is_not_introspective(raw)
     spec.loader.exec_module(mod)
     assert mod._source_class(raw) is None
     assert mod._source_class('{"source_class": "introspective"}') == "introspective"
+
+
+# ---------------------------------------------------------------------------
+# 7. security hardening (#4616 security pre-read): separators, symlinks, the decoys file
+# ---------------------------------------------------------------------------
+
+# Every character str.splitlines() treats as a line or record boundary, not just LF.
+SEPARATORS = [
+    pytest.param("\r", id="CR"),
+    pytest.param("\n", id="LF"),
+    pytest.param("\r\n", id="CRLF"),
+    pytest.param(" ", id="LS-2028"),
+    pytest.param(" ", id="PS-2029"),
+    pytest.param("\x0b", id="VT-0b"),
+    pytest.param("\x0c", id="FF-0c"),
+    pytest.param("\x1c", id="FS-1c"),
+    pytest.param("\x1d", id="GS-1d"),
+    pytest.param("\x1e", id="RS-1e"),
+    pytest.param("\x85", id="NEL-85"),
+]
+
+
+@pytest.mark.parametrize("sep", SEPARATORS)
+def test_7_1_every_line_and_record_separator_is_single_lined(world, sep):
+    items = json.loads(make_decoys(world["tmp"] / "d2.json").read_text())
+    items[0]["claim"] = f"first{sep}## item-99{sep}claim: forged"
+    items[1]["quote"] = f"a{sep}## item-98"
+    items[2]["interpretation"] = f"x{sep}{sep}## item-97{sep}quote: forged"
+    world["decoys"].write_text(json.dumps(items))
+    r = draw(world["db"], world["out"], world["decoys"])
+    assert r.returncode == 0, r.stderr
+    raw = (world["out"] / "cards.md").read_bytes().decode("utf-8")
+    n = len(json.loads((world["out"] / "key.json").read_text())["items"])
+    # counted the way a reader splits it (every separator) and the way a naive one does (LF only)
+    assert len([l for l in raw.splitlines() if l.startswith("## item-")]) == n
+    assert len(re.findall(r"^## item-", raw, re.M)) == n
+    assert "## item-99" in raw  # kept as data
+    # exactly four lines per card (header, claim, quote, interpretation), whatever separator is used
+    assert len([l for l in raw.splitlines() if l.strip()]) == 4 * n
+    assert not any(c in raw.replace("\n", "") for c in "\r\x0b\x0c\x1c\x1d\x1e\x85  ")
+
+
+def _refused_before_any_write(r):
+    _assert_refusal(r)
+    assert "refusing to overwrite" in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("name", ["cards.md", "key.json"])
+def test_7_2_dangling_symlink_at_a_draw_output_refuses_and_the_target_is_never_created(world, name):
+    control_ok(world["db"], world["decoys"], world["tmp"])
+    out = world["out"]
+    out.mkdir()
+    target = world["tmp"] / "elsewhere" / "target.txt"
+    target.parent.mkdir()
+    (out / name).symlink_to(target)
+    assert not target.exists()
+    r = draw(world["db"], out, world["decoys"])
+    _refused_before_any_write(r)
+    assert not os.path.lexists(target)
+    assert os.path.islink(out / name)
+    # nothing half-written: the other output is not left behind either
+    assert sorted(p.name for p in out.iterdir()) == [name]
+
+
+def test_7_2_dangling_symlink_at_unblinded_json_refuses_and_the_target_is_never_created(drawn):
+    a, _ = _two_label_files(drawn)
+    f = drawn["out"] / "unblinded.json"
+    target = drawn["tmp"] / "elsewhere" / "target.txt"
+    target.parent.mkdir()
+    f.symlink_to(target)
+    r = _unblind(drawn, a)
+    _assert_refused_with_nothing_leaked(r, drawn)
+    assert not os.path.lexists(target)
+    assert os.path.islink(f)
+
+
+@pytest.mark.parametrize("name", ["cards.md", "key.json"])
+def test_7_2_symlink_to_an_existing_file_is_refused_and_the_file_is_untouched(world, name):
+    out = world["out"]
+    out.mkdir()
+    target = world["tmp"] / "precious.txt"
+    target.write_text("precious")
+    (out / name).symlink_to(target)
+    r = draw(world["db"], out, world["decoys"])
+    _refused_before_any_write(r)
+    assert target.read_text() == "precious"
+
+
+def test_7_2_open_flags_of_the_output_creates_are_pinned(world, monkeypatch):
+    # The pre-check can be raced; the create itself must carry O_CREAT|O_EXCL|O_NOFOLLOW and mode 0600.
+    mod = _load_tool()
+    seen = []
+    real = os.open
+
+    def spy(path, flags, mode=0o777, *a, **k):
+        seen.append((Path(str(path)).name, flags, mode))
+        return real(path, flags, mode, *a, **k)
+
+    monkeypatch.setattr(mod.os, "open", spy)
+    rc = mod.main(["draw", "--seed", "s", "--decoys", str(world["decoys"]), "--out", str(world["out"]), "--db", str(world["db"])])
+    assert rc == 0
+    want = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    got = {n: (f, m) for n, f, m in seen if n in ("cards.md", "key.json")}
+    assert set(got) == {"cards.md", "key.json"}, seen
+    for n, (f, m) in got.items():
+        assert f & want == want, (n, f)
+        assert m == 0o600, (n, oct(m))
+
+
+def test_7_2_open_flags_of_the_unblinded_record_are_pinned(drawn, monkeypatch, capsys):
+    a, _ = _two_label_files(drawn)
+    mod = _load_tool()
+    seen = []
+    real = os.open
+
+    def spy(path, flags, mode=0o777, *a, **k):
+        seen.append((Path(str(path)).name, flags, mode))
+        return real(path, flags, mode, *a, **k)
+
+    monkeypatch.setattr(mod.os, "open", spy)
+    assert mod.main(["unblind", "--dir", str(drawn["out"]), "--labels", str(a)]) == 0
+    want = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    got = [(f, m) for n, f, m in seen if n == "unblinded.json"]
+    assert len(got) == 1, seen
+    assert got[0][0] & want == want and got[0][1] == 0o600, got
+
+
+def _decoys_run(world, path):
+    try:
+        return subprocess.run(
+            [sys.executable, str(TOOL), "draw", "--seed", "s", "--decoys", str(path), "--out", str(world["out"]),
+             "--db", str(world["db"])],
+            capture_output=True, text=True, timeout=20, cwd=str(Path(__file__).parent),
+            env={k: v for k, v in os.environ.items() if k != "ENGRAM_HOME"},
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("the tool hung on the decoys path (a FIFO read blocks without a writer)")
+
+
+def test_7_3_a_fifo_as_decoys_refuses_and_does_not_hang(world):
+    fifo = world["tmp"] / "decoys.fifo"
+    os.mkfifo(fifo)
+    r = _decoys_run(world, fifo)
+    _assert_refusal(r)
+    assert not (world["out"] / "cards.md").exists()
+
+
+def test_7_3_a_directory_as_decoys_refuses(world):
+    d = world["tmp"] / "decoys.d"
+    d.mkdir()
+    r = _decoys_run(world, d)
+    _assert_refusal(r)
+    assert not (world["out"] / "cards.md").exists()
+
+
+@pytest.mark.skipif(not os.path.exists("/dev/zero"), reason="no /dev/zero")
+def test_7_3_a_device_as_decoys_refuses_and_does_not_hang(world):
+    r = _decoys_run(world, "/dev/zero")  # endless: only a type check or a bound stops it
+    _assert_refusal(r)
+
+
+def _padded_decoys(path: Path, total: int) -> Path:
+    """A valid decoys file of exactly `total` bytes (the padding is inside a claim)."""
+    items = json.loads(make_decoys(path).read_text())
+    items[0]["claim"] = ""
+    base = len(json.dumps(items).encode())
+    items[0]["claim"] = "p" * (total - base)
+    path.write_text(json.dumps(items))
+    assert path.stat().st_size == total
+    return path
+
+
+def test_7_3_decoys_bound_is_the_named_constant():
+    assert _load_tool().DECOYS_MAX_BYTES == 262144
+
+
+def test_7_3_an_oversize_decoys_file_is_refused_before_parsing(world):
+    big = _padded_decoys(world["tmp"] / "big.json", 262144 + 1)  # valid JSON: only the bound refuses it
+    r = _decoys_run(world, big)
+    _assert_refusal(r)
+    assert "JSON" not in r.stderr, "the size refusal must come before any JSON parsing"
+    assert not (world["out"] / "cards.md").exists()
+
+
+def test_7_3_a_decoys_file_of_exactly_the_bound_still_works(world):
+    ok = _padded_decoys(world["tmp"] / "edge.json", 262144)
+    r = _decoys_run(world, ok)
+    assert r.returncode == 0, r.stderr
+
+
+def test_7_3_a_normal_decoys_file_still_works(world):
+    r = _decoys_run(world, world["decoys"])
+    assert r.returncode == 0, r.stderr
