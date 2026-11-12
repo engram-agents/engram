@@ -834,6 +834,41 @@ def test_c11_the_walk_stops_at_the_tree_root(home, tmp_path):
     assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("internal_error"))
 
 
+# -- Round 3 fold 1: an import failure is never silent (only dormancy is)
+
+def _hook_without_helper(tmp_path):
+    """The hook file alone in a directory: `_model_gatelib` (and `_hooklib`) cannot be imported."""
+    d = tmp_path / "lonely"
+    d.mkdir()
+    shutil.copy2(PRETOOL_FILE, d / PRETOOL_FILE.name)
+    return d / PRETOOL_FILE.name
+
+
+def test_r3_c18a_helper_module_missing_is_unverified_gate_import_failed(home, tmp_path):
+    t = write_jsonl(tmp_path / "t.jsonl", [call_row("claude-sonnet-5-5", "toolu_01")])
+    done = run_hook(home, pay(tpath=t), _hook_without_helper(tmp_path))
+    assert done.returncode == 0
+    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+    assert "helper import failed" in done.stderr   # the stderr line is kept
+
+
+@pytest.mark.parametrize("cfg", [None, {}, {"self_lineage": ""}, {"self_lineage": "  "}, {"self_lineage": None}])
+def test_r3_c18b_helper_module_missing_with_a_dormant_config_is_silent(home, tmp_path, cfg):
+    if cfg is None:
+        (home / "config.json").unlink()
+    else:
+        (home / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    done = run_hook(home, pay(), _hook_without_helper(tmp_path))
+    assert (done.returncode, done.stdout) == (0, "")
+
+
+@pytest.mark.parametrize("body", ["{not json", "[]", '{"self_lineage": 5}'])
+def test_r3_c18c_helper_module_missing_with_an_unusable_config_is_unverified(home, tmp_path, body):
+    (home / "config.json").write_text(body, encoding="utf-8")
+    done = run_hook(home, pay(), _hook_without_helper(tmp_path))
+    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+
+
 # ====================================================================== ROUND 2: helper-agent (sub-agent) calls
 # Spec section 7 (R2.1-R2.5; Kepler's rulings, Umwelt 27654).  A sub-agent's PreToolUse payload carries
 # `agent_id` and `agent_type` beside the PARENT's `session_id` and `transcript_path`.  The sub-agent's own
@@ -1052,6 +1087,11 @@ def test_c17_the_main_session_call_still_reads_the_parent_file(hook, home, tmp_p
 AGENT_SPEC_DIR = SRC_ENGRAM / "agents" / "claude"   # tiers.json ships agents/claude/<f>.md as agents/<f>.md
 
 
+def _has_frontmatter(text):
+    lines = text.splitlines()
+    return bool(lines) and lines[0].strip() == "---"
+
+
 def _frontmatter_fields(text):
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
@@ -1083,10 +1123,12 @@ def writer_specs_with_a_model(spec_dir):
     writers = _write_tool_full_names()
     named, pinned = set(), []
     for f in sorted(Path(spec_dir).glob("*.md")):
-        fm = _frontmatter_fields(f.read_text(encoding="utf-8"))
-        if "tools" not in fm:
-            continue
-        if _tool_names(fm["tools"]) & writers:
+        text = f.read_text(encoding="utf-8")
+        if not _has_frontmatter(text):
+            continue   # not an agent spec (e.g. README.md)
+        fm = _frontmatter_fields(text)
+        # no `tools:` line: Claude Code gives the agent EVERY tool, ENGRAM write tools included
+        if "tools" not in fm or _tool_names(fm["tools"]) & writers:
             named.add(f.stem)
             if "model" in fm:
                 pinned.append(f.stem)
@@ -1133,6 +1175,13 @@ def test_c16_matching_is_by_exact_tool_name_not_prefix(tmp_path):
     assert named == {"writes-focus"} and pinned == ["writes-focus"]
 
 
-def test_c16_a_spec_with_no_tools_line_is_not_a_writer(tmp_path):
+def test_c16_a_spec_with_frontmatter_and_no_tools_line_inherits_every_tool_so_it_is_a_writer(tmp_path):
     (tmp_path / "x.md").write_text("---\nname: x\nmodel: sonnet\n---\nbody\n", encoding="utf-8")
+    (tmp_path / "y.md").write_text("---\nname: y\n---\nbody\n", encoding="utf-8")
+    named, pinned = writer_specs_with_a_model(tmp_path)
+    assert named == {"x", "y"} and pinned == ["x"]
+
+
+def test_c16_a_file_without_frontmatter_is_not_an_agent_spec(tmp_path):
+    (tmp_path / "README.md").write_text("# Agents\n\nmodel: sonnet\ntools: none\n", encoding="utf-8")
     assert writer_specs_with_a_model(tmp_path) == (set(), [])

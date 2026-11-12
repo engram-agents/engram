@@ -373,6 +373,8 @@
   "hooks/claude/engram-model-gate-pretool.py:_unmapped",
   "hooks/claude/engram-model-gate-pretool.py:_decide",
   "hooks/claude/engram-model-gate-pretool.py:decide",
+  "hooks/claude/engram-model-gate-pretool.py:_stdlib_dormant",
+  "hooks/claude/engram-model-gate-pretool.py:_emit_import_failure",
   "hooks/claude/engram-model-gate-pretool.py:main",
   "hooks/claude/engram-model-gate-prompt.py:_warning_text",
   "hooks/claude/engram-model-gate-prompt.py:_load_runtime",

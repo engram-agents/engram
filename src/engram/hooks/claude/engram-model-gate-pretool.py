@@ -32,6 +32,10 @@ Decision, in order (the PreToolUse payload carries ``tool_name``, ``tool_use_id`
      ``transcript_not_found``, ``transcript_unreadable``, ``window_exceeded``, ``budget_expired_no_row``,
      ``internal_error``): allow, NEVER SILENT, text 2.2 with the code.
 
+An import failure of the helpers (round 3) is not silent either: ``gate_import_failed``, text 2.2, printed with
+the standard library only, plus the stderr line, exit 0.  Dormancy still wins when it can be decided without
+the failed import: a config that the standard library reads, with ``self_lineage`` absent or empty, stays silent.
+
 Helper agents (round 2, R2.1-R2.3): a payload with a non-empty ``agent_id`` is a call made by a sub-agent.  The
 model is read from THAT helper's own transcript (``engram_signature.model_of_call(..., agent_id=, session_id=)``:
 ``<dirname(transcript_path)>/<session_id>/subagents/agent-<agent_id>.jsonl``), never the parent's, with the
@@ -250,6 +254,39 @@ def decide(payload, home):
         return _unverified("internal_error")
 
 
+def _stdlib_dormant():
+    """True only when ``$ENGRAM_HOME/config.json`` (default ``~/.engram``) can be read with the standard library
+    alone AND ``self_lineage`` is absent, null or blank.  Used only when an import failed, so it may not use
+    any helper: same rule as ``_model_gatelib.config_state``'s dormant states, nothing else counts as dormant."""
+    try:
+        home = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
+        try:
+            with open(os.path.join(home, "config.json"), "r", encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except (FileNotFoundError, NotADirectoryError):
+            return True
+        if not isinstance(cfg, dict):
+            return False
+        val = cfg.get("self_lineage")
+        return val is None or (isinstance(val, str) and not val.strip())
+    except Exception:  # noqa: BLE001 - unreadable: not dormant
+        return False
+
+
+def _emit_import_failure():
+    """An import failure is never silent (code ``gate_import_failed``), unless the gate is dormant.  Standard
+    library only: it must not depend on the import that failed.  The text is ``_unverified_text``'s."""
+    try:
+        if _stdlib_dormant():
+            return
+        text = ("ENGRAM model-family gate: this write went through UNVERIFIED (`gate_import_failed`): the "
+                "gate could not confirm which model made the call.")
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                            "additionalContext": text}}) + "\n")
+    except Exception:  # noqa: BLE001 - a hook never raises
+        pass
+
+
 def main():
     try:
         raw = sys.stdin.read(STDIN_MAX_BYTES)
@@ -258,6 +295,7 @@ def main():
         payload = {}
     if _IMPORT_ERROR:
         sys.stderr.write("engram model-gate: helper import failed (%s); the gate did not run\n" % _IMPORT_ERROR)
+        _emit_import_failure()
         return 0
     try:
         res = decide(payload, _engram_home_or_exit())
