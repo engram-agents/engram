@@ -265,6 +265,35 @@ def test_claude_valid_backup_symlink_counts_as_existing_backup(tmp_path):
     assert md.read_bytes() != b"current\n"
 
 
+def test_after_a_replace_every_restore_source_is_a_separate_file_from_the_target(tmp_path):
+    """The restore invariant stated as a test. After setup replaces CLAUDE.md (a first run, then a
+    reinstall from scratch over the edited file), `CLAUDE.md.pre-engram` and every stamped backup are files of
+    their own: not links to CLAUDE.md, not other names for it, each still holding the bytes it
+    saved. A backup made as a link, or CLAUDE.md written in place over a linked backup, would make
+    uninstall's restore read the new file and report success; this cell goes red on either."""
+    md = tmp_path / ".claude" / "CLAUDE.md"
+    md.parent.mkdir()
+    md.write_bytes(b"my own instructions\n")
+    pre = md.parent / "CLAUDE.md.pre-engram"
+    saved = [b"my own instructions\n"]
+    for run in (1, 2):
+        r = _run(tmp_path, args=["--force"])
+        assert r.returncode == 0, r.stdout + r.stderr
+        stamped = _stamped_backups(md.parent, "CLAUDE.md")
+        for source in [pre] + stamped:
+            assert source.is_file() and not source.is_symlink(), source
+            assert not os.path.samefile(source, md), f"{source} is the same file as {md}"
+        assert pre.read_bytes() == saved[0], "the first backup must keep the pre-install bytes"
+        assert sorted(b.read_bytes() for b in stamped) == sorted(saved)
+        assert md.read_bytes() not in saved
+        edited = b"edited after run %d\n" % run
+        md.write_bytes(edited)
+        saved.append(edited)
+        # the next run is a reinstall from scratch: the ENGRAM home is set aside, as the
+        # existing-install refusal tells the user to do; the Claude home stays as it is
+        (tmp_path / ".engram").rename(tmp_path / f".engram.moved-aside-{run}")
+
+
 def _assert_refused_for_obstructed_backup(tmp_path, r, target, bak, original):
     """The backup name is the same file as the target: refuse, write nothing, name the remedy."""
     out = r.stdout + r.stderr
