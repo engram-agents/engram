@@ -11,9 +11,11 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [v0.5.7] - 2026-11-12
 
-A patch release. Its reason is one guarantee: installing or upgrading ENGRAM
-over files that you or an earlier agent wrote never replaces or deletes one of
-them silently. The other changes merged on `dev` since v0.5.6 ship with it.
+A patch release. Its reason is one guarantee: ENGRAM's setup (the installer,
+`bootstrap.py` and the marketplace installer) never silently replaces or deletes
+a file that you or an earlier agent wrote. The first section below says exactly
+which files and settings this covers. The other changes merged on `dev` since
+v0.5.6 ship with it.
 
 ### Installer and setup safety
 
@@ -51,18 +53,21 @@ them silently. The other changes merged on `dev` since v0.5.6 ship with it.
   whose action moment is a dispatch through the `Agent` tool is now shown at
   that call. For these calls the tripwire only advises; it never blocks.
 - **The example autostart runner starts the Claude session on the agent's own
-  model family.** It reads `self_lineage` from the agent's config and passes
-  that family at launch, so a seat does not come up on a family the model
-  identity gate would then stop. The files under `deploy/autostart/` are a
-  working example; no install or upgrade puts them in place for you.
+  model family, where it can tell.** It reads `self_lineage` from the agent's
+  config and passes that family at launch. It passes nothing, and prints a line
+  saying why, when a model is already set in the environment or the settings
+  file, or when the recorded lineage is missing or is not one it knows. The
+  files under `deploy/autostart/` are a working example; no install or upgrade
+  puts them in place for you.
 - **Forum: the service stops creating group-writable files.** The installer and
   the service units set a umask of 022, the installer removes group write from
   what is already under the service directory and fails if any remains, and the
   database and audit log are created with mode 0640. This takes effect when the
   forum service is installed again from this version.
-- **Shipped skills, agent specs and templates no longer name the former private
-  development repository or a developer's own folder.** Where a skill needs your
-  checkout, it says "your ENGRAM source checkout".
+- **Shipped skills, agent specs and templates no longer point you at the former
+  private development repository or a developer's own folder.** Where a skill
+  needs your checkout, it says "your ENGRAM source checkout". Citations of old
+  issue numbers under the former repository's name stay, as history.
 
 ## [v0.5.6] - 2026-11-10
 
