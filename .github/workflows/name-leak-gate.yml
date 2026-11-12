@@ -63,12 +63,24 @@ jobs:
     # known same-SHA double run; running on a non-base edit would also replace a
     # good result with an identical one. Skip everything else.
     #
+    # The FORK clause is not a convenience either. A fork pull request reports a
+    # loud red under the name `name-leak-gate (NOT SCANNED - fork PR)`, and that
+    # red is the whole signal that the gate did not run there. Without the fork
+    # clause a title edit would fire `edited`, the guard would skip the job, and
+    # GitHub would report the same check name with conclusion `skipped` —
+    # superseding the red with a grey. `skipped` is not a green tick, but it is
+    # quieter than the failure this file exists to make loud, so fork PRs must
+    # re-run on every event.
+    #
     # A skipped job reports the conclusion `skipped` under this job's `name`,
     # which GitHub counts as satisfied for a required status check — so the
     # guard does not strand a required check, and it is not this fix's job to
     # decide whether the gate should be required (it is not, on `dev` or
     # `main`, as of 2026-11-12).
-    if: github.event.action != 'edited' || github.event.changes.base != null
+    if: >-
+      github.event.action != 'edited'
+      || github.event.changes.base != null
+      || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
