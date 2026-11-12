@@ -121,6 +121,7 @@ if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, write_route_ledger, tool_fire_key
 from _hooklib import import_owner_flags as _hooklib_import_owner_flags
+from _hooklib import pick_checkout
 # #3628: this hook runs on EVERY tool call. Every file open goes through these
 # non-blocking, regular-file-only helpers (a FIFO makes a plain open() wait for
 # a peer and the harness kills the hook silently); a non-regular target raises
@@ -1751,6 +1752,10 @@ PROSE_FIELDS = frozenset({
 
 _HEREDOC_PLACEHOLDER = "<<HEREDOC>>"
 _PROSE_PLACEHOLDER = "<<TEXT>>"
+
+# alpha#4522: an Agent (fairy dispatch) target carries only this many leading characters of the
+# prompt; a pattern that occurs only past it cannot match. Bounds the text a lesson regex scans.
+AGENT_PROMPT_HEAD_CHARS = 500
 # A heredoc fed to an interpreter or a shell is a script, not prose: its body RUNS, so the command
 # view must not hide it (a wrong strip is blindness).
 _EXEC_WORDS = (r"(?:sudo|env|exec|xargs|eval|source|bash|sh|zsh|dash|ksh|fish|ssh|node|deno|bun|"
@@ -1857,6 +1862,10 @@ def build_match_views(hook_input: dict) -> tuple:
         return ("", "")
     tool_name = hook_input.get("tool_name", "")
     ti = hook_input.get("tool_input") or hook_input.get("input") or {}
+    if tool_name == "Agent":
+        # alpha#4522: the command view is the dispatch identity only, no prompt text
+        sub, desc, _ = _agent_fields_text(ti)
+        return (full, f"Agent {sub} {desc}")
     if tool_name == "Bash":
         return (full, strip_heredoc_bodies(full))
     if tool_name.startswith("mcp__"):
@@ -1868,16 +1877,33 @@ def build_match_views(hook_input: dict) -> tuple:
     return (full, full)
 
 
+def _agent_fields_text(ti) -> tuple:
+    """(subagent_type, description, prompt) of an Agent call's tool_input. A missing or
+    non-string field is "", and a tool_input that is not a dict gives all three empty."""
+    if not isinstance(ti, dict):
+        return ("", "", "")
+    return tuple(ti.get(k) if isinstance(ti.get(k), str) else ""
+                 for k in ("subagent_type", "description", "prompt"))
+
+
 def build_match_target(hook_input: dict) -> str:
     """Build the string to match situation_pattern against, or "" to skip.
 
     Bash calls   → the shell command string.
     MCP calls    → "{tool_name} {compact_json_args}" so patterns like
                    `engram_add_observation` match the tool name substring.
+    Agent calls  → "Agent {subagent_type} {description} {first AGENT_PROMPT_HEAD_CHARS
+                   chars of prompt}" (alpha#4522); "" when tool_input is not a dict.
     Other calls  → "" (caller exits early).
     """
     tool_name = hook_input.get("tool_name", "")
     ti = hook_input.get("tool_input") or hook_input.get("input") or {}
+
+    if tool_name == "Agent":
+        if not isinstance(ti, dict):
+            return ""
+        sub, desc, prompt = _agent_fields_text(ti)
+        return f"Agent {sub} {desc} {prompt[:AGENT_PROMPT_HEAD_CHARS]}"
 
     if tool_name == "Bash":
         return ti.get("command", "") if isinstance(ti.get("command"), str) else ""
@@ -2039,7 +2065,7 @@ def _resolve_runtime_dir() -> str:
                 return str(candidate)
     except OSError:
         pass
-    return os.path.expanduser("~/engram-alpha/src/engram")  # last-ditch, unchanged
+    return pick_checkout("/src/engram") or os.path.expanduser("~/engram/src/engram")  # last-ditch
 
 
 def _query_recall_daemon(query: str, top_k: int = 5) -> dict | None:
@@ -2527,7 +2553,12 @@ def _main_impl() -> None:
         prevention_lessons = []
         deny = None
         try:
-            prevention_lessons = load_prevention_lessons()
+            # alpha#4522: an Agent (fairy dispatch) call is advisory only. Lei's standing ruling of
+            # 2026-10-18 limits blocking to ENGRAM and Umwelt calls, and a dispatch is outside that
+            # set: no prevention lessons are loaded, so no deny, shadow-block record, ledger row or
+            # override handling can happen for it.
+            if hook_input.get("tool_name") != "Agent":
+                prevention_lessons = load_prevention_lessons()
             if prevention_lessons:
                 deny = check_blocking_deny(match_target, prevention_lessons)
         except Exception:

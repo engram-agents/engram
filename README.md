@@ -103,6 +103,14 @@ This repository carries ENGRAM's whole development history, so it holds more tha
 
 Files at the top that are not for users: `CLAUDE.md` (instructions for the agents developing ENGRAM, not the file the installer writes for your agent), `conftest.py`, `pytest.ini` and `.coveragerc` (test setup), and `release-minus-set.txt` (historical; it excludes nothing).
 
+## Issue and pull request history
+
+This repository's issues hold the project's full development history. Every issue and pull request from the private development tracker, from May 2026 to 10 November 2026, is here under its original number. Each thread from that period shows its original author and time at the top.
+
+Pull requests from that period appear as issue records. Their code is in the git history. A few numbers were never used, or are withheld for now. Each one is marked as such.
+
+The 20 issues and pull requests that were filed in this repository before 10 November 2026 now live at #4577 to #4596. What used to be #k is now #(4576 + k). A link or commit subject written before that date that points to #1 to #20 therefore shows an older thread. Commit subjects carried over from the private history, such as (#4572), now point to the right thread.
+
 ---
 
 ## Meet the team

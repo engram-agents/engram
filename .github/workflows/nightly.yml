@@ -10,8 +10,12 @@ name: nightly
 # scrub gates, the local full-suite run convention on PRs, and the main-only
 # release gate (tests.yml).
 #
-# Scheduled workflows run from the DEFAULT branch (dev) and check it out by
-# default — so this exercises dev, which is the whole point.
+# Scheduled workflows run from the DEFAULT branch's copy of this file, and the
+# default branch is main (the release branch). So the testing checkout below
+# names `ref: dev` explicitly; without it the run would test the last release.
+# Consequence: an edit to this file takes effect for scheduled runs only once it
+# reaches main, i.e. at the next release. A manual workflow_dispatch also tests
+# dev, whatever ref it was started from.
 on:
   schedule:
     # 03:37 UTC daily. Cron is UTC, so this is 23:37 EDT / 22:37 EST — after
@@ -102,6 +106,8 @@ jobs:
       NIGHTLY_SHARD_TIMEOUT_MIN: "60"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: dev
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5

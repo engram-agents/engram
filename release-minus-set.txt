@@ -7,7 +7,7 @@
 # public snapshot. For the current branch and tag rules see docs/VERSIONING.md.
 # Two things still read it: tools/release-cutover.py (retired, do not run it) and
 # tests/test_docs_layout_guard.py; both go together in a later change, after the
-# release procedure's next version (engram-agents/engram#16).
+# release procedure's next version (engram-agents/engram#4592).
 #
 # ---- historical text below ----
 #
