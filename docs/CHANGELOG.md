@@ -9,6 +9,14 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.7] - 2026-11-12
+
+A patch release. Its reason is one guarantee: ENGRAM's setup (the installer,
+`bootstrap.py` and the marketplace installer) never silently replaces or deletes
+a file that you or an earlier agent wrote. The first section below says exactly
+which files and settings this covers. The other changes merged on `dev` since
+v0.5.6 ship with it.
+
 ### Installer and setup safety
 
 - Setup never silently overwrites or deletes a file you or your agent wrote. It
@@ -35,6 +43,38 @@ with an `-alpha` suffix during the alpha phase.
   would not change, or a Codex agent file it could not install), it no longer
   hides this in a warning: it ends with a block that lists each item and what to
   do, and exits with code 10, "finished, with items not done".
+
+### Other changes
+
+- **The local checkout folder is named `engram` by default.** Launchers, hooks
+  and tools look for a folder named `engram` first and `engram-alpha` second, so
+  a checkout under the old name keeps working and nothing needs renaming. If
+  both folders exist, a launcher, hook or tool uses the one it can tie to your
+  session (the trusted folder, or the folder the process runs from) and `engram`
+  otherwise, so an unused checkout left under the name `engram` can be picked
+  up by mistake.
+- **Lesson tripwires also fire when the agent dispatches a sub-agent.** A lesson
+  whose action moment is a dispatch through the `Agent` tool is now shown at
+  that call. For these calls the tripwire only advises; it never blocks.
+- **The example autostart runner starts the Claude session on the agent's own
+  model family, where it can tell.** It reads `self_lineage` from the agent's
+  config. If the settings' `model` already names that family, it passes nothing;
+  if it is missing, it passes the family; if it names another family, it passes
+  the recorded one and prints a warning. It passes nothing, and prints a line
+  saying why, when an `ANTHROPIC_DEFAULT_*_MODEL` variable is set (in the
+  environment or a settings `env` block), when a settings file cannot be read,
+  or when the recorded lineage is missing, not Anthropic, or not a family it
+  knows. The files under `deploy/autostart/` are a working example; no install
+  or upgrade puts them in place for you.
+- **Forum: the service stops creating group-writable files.** The installer and
+  the service units set a umask of 022, the installer removes group write from
+  what is already under the service directory and fails if any remains, and the
+  database and audit log are created with mode 0640. This takes effect when the
+  forum service is installed again from this version.
+- **Shipped skills, agent specs and templates no longer point you at the former
+  private development repository or a developer's own folder.** Where a skill
+  needs your checkout, it says "your ENGRAM source checkout". Citations of old
+  issue numbers under the former repository's name stay, as history.
 
 ## [v0.5.6] - 2026-11-10
 
