@@ -29,6 +29,7 @@ from flask import Flask, Response, abort, g, jsonify, render_template, request, 
 
 from . import audit, board_projects, board_theme, db, embeddings as emb_mod, packs as packs_mod, seed
 from .avatar import avatar_svg
+from .fileperms import create_if_absent
 from .board_projects import filter_updates, get_board_counts, read_project_board
 from .coordination import default_store_root
 from .coordination import markdown as _md
@@ -2266,6 +2267,9 @@ def create_app(
 
     @app.before_request
     def _open_db() -> None:
+        # #4499: if nothing has created the db yet, create it 0640 rather than let
+        # sqlite3.connect make it 0644. An existing db keeps its mode.
+        create_if_absent(db_path)
         g.conn = sqlite3.connect(db_path)
         g.conn.row_factory = sqlite3.Row
         g.conn.execute("PRAGMA foreign_keys = ON")
@@ -5173,6 +5177,9 @@ def probe_deps(db_path: str, audit_path: str) -> dict:
     try:
         if not os.path.isdir(db_parent) or not os.access(db_parent, os.W_OK):
             raise OSError(f"directory {db_parent!r} missing or not writable")
+        # #4499: the probe is usually the FIRST creator of forum.db; create it 0640
+        # (an existing db keeps its mode).
+        create_if_absent(db_abs)
         _probe_conn = sqlite3.connect(db_abs)
         _probe_conn.execute("PRAGMA user_version")
         _probe_conn.close()
@@ -5189,6 +5196,8 @@ def probe_deps(db_path: str, audit_path: str) -> dict:
     audit_parent = os.path.dirname(audit_abs)
     try:
         os.makedirs(audit_parent, exist_ok=True)
+        # #4499: same for the audit log (an existing log keeps its mode).
+        create_if_absent(audit_abs)
         with open(audit_abs, "a", encoding="utf-8"):
             pass
         results["audit_log"] = "ok"
@@ -5518,6 +5527,7 @@ def main() -> None:
     os.makedirs(db_dir, exist_ok=True)
 
     # Run migrations + seed
+    create_if_absent(args.db)  # #4499: 0640 if absent; an existing db keeps its mode
     conn = sqlite3.connect(args.db)
     db.init_db(conn, categories_config=args.categories_config)
     seed.seed_threads(conn)

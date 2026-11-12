@@ -459,6 +459,10 @@ MODE_AWARE = {
     "tools/engramd_batch_a_acceptance.py": (
         "explicit chmod 0o644 on the --report output; a report path inside the live ENGRAM home is refused"
     ),
+    "tools/forum_backup.py": (
+        "hand-written tmp + os.replace (no mkstemp, so G1's scan does not reach it): the temp is opened "
+        "0o640 and fchmod'd BEFORE the rename for forum.sql and .last-success.json (#4499 B1)"
+    ),
     "src/engram/engram_file_guard.py": "copy_exclusive: shutil.copystat copies the source's mode onto the temp before publish (backup keeps the original's mode)",
 }
 
