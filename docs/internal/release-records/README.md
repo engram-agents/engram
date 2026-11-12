@@ -13,7 +13,8 @@ The skip set of a release's recorded whole run: which tests did not run, and why
 | `run` | the run's own label |
 | `reason_source` | where the skip set and the skip reasons came from |
 | `collected` | test ids collected by `pytest tests/ src/forum/tests/ --collect-only -q` |
-| `counts` | outcomes by kind; they sum to `collected` |
+| `counts` | outcomes by kind (`passed`, `failed`, `skipped`, `xfail`, `xpass`, `error`); they sum to `collected` |
+| `skipped_total` | the number of skipped ids, equal to `counts.skipped` and to the ids listed in `skipped_by_reason` |
 | `skipped_by_reason` | every skipped test id, grouped under its skip reason |
 | `skipped_without_reason` | skipped ids with no recorded reason (0 when the reasons were captured) |
 
