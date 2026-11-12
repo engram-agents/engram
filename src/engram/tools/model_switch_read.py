@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,6 +55,7 @@ EXCLUDED_TYPES = ("evidence", "person")
 SEED_NODES = (("axiom", 3), ("definition", 2), ("goal", 1))
 DECOY_KEYS = ("claim", "quote", "interpretation")
 DECOY_MIN, DECOY_MAX = 3, 10
+DECOYS_MAX_BYTES = 262144  # the decoys file is a handful of short entries; anything larger is refused unread
 LABELS = ("mine", "mine-different", "not-recognised")
 # Only these columns are ever read; the real table has many more.  The graph is read in keyset pages by id
 # through the engramd owner (tools/_owner_read.py): the statement's bytes are registered in
@@ -279,10 +281,48 @@ def draw_own(cands: list[dict], seed: str, allow_short: bool):
 # ---------------------------------------------------------------------------
 
 
-def load_decoys(path) -> list[dict]:
+def _read_decoys_bytes(path) -> bytes:
+    """The decoys file's bytes, read through a strict open.  O_NONBLOCK makes open() on a FIFO return at once
+    instead of waiting for a writer; the fstat then refuses anything that is not a regular file (FIFO, device,
+    socket, directory) before a byte is read, and the read never takes more than DECOYS_MAX_BYTES + 1 bytes.
+    The shape of hooks/_hooklib._open_regular_fd, written here because tools/ has no clean import path to the
+    hooks tree (it is a different directory in the deployed plugin layout) and a one-open helper is smaller than
+    a path search."""
     try:
-        raw = Path(path).read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        raise Refusal(f"decoys file unreadable: {path}") from None
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            raise Refusal(f"decoys file unreadable: {path}") from None
+        if not stat.S_ISREG(st.st_mode):
+            raise Refusal(f"decoys file is not a regular file: {path}")
+        if st.st_size > DECOYS_MAX_BYTES:
+            raise Refusal(f"decoys file is larger than {DECOYS_MAX_BYTES} bytes: {path}")
+        chunks, total = [], 0
+        while total <= DECOYS_MAX_BYTES:
+            try:
+                chunk = os.read(fd, DECOYS_MAX_BYTES + 1 - total)
+            except OSError:
+                raise Refusal(f"decoys file unreadable: {path}") from None
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > DECOYS_MAX_BYTES:  # grew after the fstat
+            raise Refusal(f"decoys file is larger than {DECOYS_MAX_BYTES} bytes: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def load_decoys(path) -> list[dict]:
+    raw_bytes = _read_decoys_bytes(path)
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeError:
         raise Refusal(f"decoys file unreadable: {path}") from None
     try:
         items = json.loads(raw)
@@ -308,7 +348,10 @@ def load_decoys(path) -> list[dict]:
 
 
 def one_line(value) -> str:
-    """Single-line a field so it cannot forge a card header; empty renders as (none)."""
+    """Single-line a field so it cannot forge a card header; empty renders as (none).
+
+    The rule is: all line- and record-separator characters (str.splitlines), not just LF.  That is CR, LF,
+    CRLF, VT, FF, FS, GS, RS, NEL (U+0085), LS (U+2028) and PS (U+2029); each becomes one space."""
     text = " ".join(("" if value is None else str(value)).splitlines()).strip()
     return text or "(none)"
 
@@ -322,11 +365,23 @@ def render_card(n: int, claim, quote, interpretation) -> str:
     )
 
 
+def _create_new(path, mode, **kw):
+    """Create `path` and open it for writing.  The create is enforced by the open itself: O_EXCL refuses an
+    existing name and O_NOFOLLOW a symlink at the last component (a dangling one included), so nothing is
+    ever written through a link, whatever a look at the path said a moment earlier.  Mode 0600."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        return os.fdopen(fd, mode, **kw)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def cmd_draw(a) -> int:
     out = Path(a.out)
     cards_p, key_p = out / "cards.md", out / "key.json"
     for p in (cards_p, key_p):
-        if p.exists():
+        if os.path.lexists(p):  # lexists: a dangling symlink is present, and is never followed
             raise Refusal(f"refusing to overwrite an existing file: {p}")
     decoys = load_decoys(a.decoys)
     try:
@@ -358,9 +413,9 @@ def cmd_draw(a) -> int:
     }
     out.mkdir(parents=True, exist_ok=True)
     try:
-        with open(cards_p, "xb") as f:
+        with _create_new(cards_p, "wb") as f:
             f.write(cards_bytes)
-        with open(key_p, "x", encoding="utf-8") as f:
+        with _create_new(key_p, "w", encoding="utf-8") as f:
             json.dump(key, f, indent=2)
             f.write("\n")
     except OSError as exc:
@@ -480,7 +535,7 @@ def cmd_unblind(a) -> int:
         sys.stdout.write("\n")
         return 0
     try:
-        with open(record, "x", encoding="utf-8") as fh:  # 'x': never overwritten
+        with _create_new(record, "w", encoding="utf-8") as fh:  # exclusive and never through a symlink
             json.dump({"labels_sha256": labels_sha, "decision": decision, "result": result}, fh, indent=2)
             fh.write("\n")
     except FileExistsError:
