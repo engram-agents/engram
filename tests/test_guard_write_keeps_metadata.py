@@ -332,6 +332,24 @@ def test_a_symlinked_file_stays_a_link_and_its_target_keeps_its_inode(tmp_path):
     assert real.read_text() == "new text\n" and _meta(real) == before
 
 
+def test_a_symlink_to_a_fifo_is_refused_and_nothing_waits(tmp_path):
+    """The link is resolved first, then the open is O_NOFOLLOW|O_NONBLOCK on what it resolved
+    to: a FIFO there is refused (by the plan, and by the final open if one appears later),
+    never opened in a way that waits for a reader."""
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    link = tmp_path / "CLAUDE.md"
+    link.symlink_to(fifo)
+    p = fg.plan([fg.Item(link, "new text\n", first_identity=True)], STAMP)
+    assert p.entries[0].state == "blocked"
+    with pytest.raises(fg.Refused):
+        fg.apply(p, fg.consent_for(True, []))
+    with pytest.raises(SystemExit) as got:
+        fg.write_in_place(fifo, "new text\n", None)
+    assert "not a regular file" in str(got.value)
+    assert link.is_symlink() and os.path.realpath(link) == os.path.realpath(fifo)
+
+
 def test_write_in_place_refuses_a_link_put_there_after_the_check(tmp_path):
     """The final open does not follow a link: the decision was made about a regular file, so a
     link that took its place meanwhile is refused, and what it points at is not written."""

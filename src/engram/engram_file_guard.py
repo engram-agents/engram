@@ -406,7 +406,9 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     into the same inode keeps all of them, as v0.5.6 did. What that gives up is atomicity, which
     is why every caller saves the stamped backup BEFORE calling this, and why a write that
     fails part-way first puts the old bytes back. Every failure is a SystemExit with one
-    REFUSED line naming `backup`.
+    REFUSED line naming `backup`. The residual, accepted on purpose: a kill (SIGKILL, power
+    loss) during the write gets no put-back and prints nothing, so the file can be left
+    incomplete; the backup saved before the write is then the copy to restore from.
 
     The open does not follow a link (O_NOFOLLOW: a link put at `path` after the check is
     refused, not written through) and does not wait on a FIFO (O_NONBLOCK); anything that is
