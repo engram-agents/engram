@@ -481,6 +481,10 @@ def _set_cleanup_period_days(claude_home: Path, days: int) -> None:
         # UnicodeError: a lone-surrogate JSON escape ("\\ud800") loads but cannot be encoded
         # as UTF-8; that is a ValueError, not an OSError, and must not become a traceback.
         _refuse_settings_write(settings_path, e)
+    except SystemExit as e:
+        # The guard's own REFUSED line (a backup or an in-place write that failed) already says
+        # what state settings.json is in; only the rest of the install is added here.
+        raise SystemExit(f"{e} The install is otherwise complete (graph seeded, files rendered, data home tightened).")
     _print_retention_set(days, settings_path)
 
 

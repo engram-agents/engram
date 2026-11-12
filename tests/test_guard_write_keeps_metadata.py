@@ -317,6 +317,27 @@ def test_a_new_files_temp_is_built_beside_it_and_published_by_link(tmp_path, mon
     assert len(seen) == 1 and seen[0][1] == path and seen[0][0].parent == tmp_path, seen
 
 
+def test_content_that_cannot_be_encoded_never_touches_the_file(tmp_path):
+    """Decided by the content alone, so refused before the file is opened or backed up: bytes,
+    mode, mtime and inode unchanged (a put-back would move the mtime), and no backup."""
+    for which in ("apply", "merge"):
+        folder = tmp_path / which
+        folder.mkdir()
+        name, text, _ = WRITERS[which]
+        path = folder / name
+        path.write_text(text)
+        os.utime(path, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
+        st = os.stat(path)
+        with pytest.raises(UnicodeEncodeError):
+            if which == "apply":
+                fg.apply(fg.plan([fg.Item(path, "bad \ud800\n", first_identity=True)], STAMP), fg.consent_for(True, []))
+            else:
+                fg.apply_merge(path, {"install_tier": "\ud800"}, filename="config.json", stamp=STAMP)
+        after = os.stat(path)
+        assert path.read_text() == text and (after.st_ino, after.st_mtime_ns, after.st_mode) == (st.st_ino, st.st_mtime_ns, st.st_mode)
+        assert _backups(path) == [] and not (folder / (name + ".pre-engram")).exists()
+
+
 def test_apply_merge_creates_a_new_config_exclusively(tmp_path):
     path = tmp_path / "config.json"
     assert fg.apply_merge(path, {"install_tier": "dev"}, filename="config.json", new_mode=0o600) == "created"

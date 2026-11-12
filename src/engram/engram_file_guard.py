@@ -411,7 +411,8 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     incomplete; the backup saved before the write is then the copy to restore from.
 
     The put-back writes into the same inode too, so the ACL and xattrs survive a FAILED write,
-    not only a successful one. The backup does not carry them (see the module docstring), so
+    not only a successful one. It restores the bytes, and the mode, owner and links never
+    changed; the modification time does move, since the file was written twice. The backup does not carry them (see the module docstring), so
     the restore command given is `cat backup > path`, which writes into the same inode: `cp -p`
     would replace the file's ACL and xattrs with the backup's (none; measured on macOS).
 
@@ -421,6 +422,9 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     does not wait on a FIFO (O_NONBLOCK); anything that is not a regular file is refused before
     a byte is written.
     """
+    # Encoded before the file is opened: content that cannot be written is refused without
+    # touching the file (no truncate, no put-back, so even its mtime stays).
+    data = text.encode("utf-8")
     if backup is not None:
         saved = f"A copy of it from before this run is at {backup}."
         restore = f"Restore it with: cat '{backup}' > '{path}'"
@@ -440,7 +444,7 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
         except OSError as e:
             raise SystemExit(f"[bootstrap] REFUSED: could not read {path} before writing it ({e}); it was not changed. {saved}")
         try:
-            _replace_contents(fd, text.encode("utf-8"))
+            _replace_contents(fd, data)
         except BaseException as e:  # Ctrl-C too: put the old bytes back, then let it go on
             try:
                 _replace_contents(fd, old)
@@ -641,6 +645,9 @@ def apply(p: Plan, consent: Consent = NO_CONSENT, context: str = "",
     """
     saved = saved or {}
     fresh = plan([Item(e.path, e.new_text, e.first_identity, e.owned) for e in p.entries], p.stamp, p.home)
+    for e in fresh.entries:
+        if e.new_text is not None:
+            e.new_text.encode("utf-8")  # UnicodeEncodeError here: nothing backed up, nothing written
     msg = refusal(fresh, consent, context)
     if msg is not None:
         raise Refused(msg)
@@ -858,6 +865,7 @@ def apply_merge(path: Path, changes: "dict[str, Any]", *, filename: "str | None"
         except UnicodeDecodeError as e:
             raise MergeRefused(f"{path} is not valid UTF-8 text ({e}); nothing repairs a broken file") from e
     new_text = merge_json_text(name, existing, changes, replace_non_object)
+    new_text.encode("utf-8")  # UnicodeEncodeError here: nothing backed up, nothing written
     if existing is None:
         real.parent.mkdir(parents=True, exist_ok=True)
         try:
