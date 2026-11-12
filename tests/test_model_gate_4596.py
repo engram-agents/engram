@@ -14,6 +14,8 @@ independently of the hooks, so a drifting hook text fails loudly.
    C4 every UNKNOWN code (unmapped a-d)      C5 polling                   C6 budget
    C7 read tools never blocked               C8 one source for the list   C9 both prefixes
    C10 next-turn warning                     C11 deployed layout          C12 mutation controls (PR body)
+   Round 2 (spec section 7): C13 helper call found in its own file   C14 helper fallback   C15 missing / unreadable /
+   invalid helper ids   C16 agent specs that can write pin no model   C17 the parent file is never read for a helper
 """
 from __future__ import annotations
 
@@ -830,3 +832,307 @@ def test_c11_the_walk_stops_at_the_tree_root(home, tmp_path):
     done = run_hook(home, pay(tpath=t), root / "hooks" / PRETOOL_FILE.name, cwd=str(tmp_path))
     assert (done.returncode, done.stderr) == (0, "")
     assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("internal_error"))
+
+
+# ====================================================================== ROUND 2: helper-agent (sub-agent) calls
+# Spec section 7 (R2.1-R2.5; Kepler's rulings, Umwelt 27654).  A sub-agent's PreToolUse payload carries
+# `agent_id` and `agent_type` beside the PARENT's `session_id` and `transcript_path`.  The sub-agent's own
+# transcript is <dirname(transcript_path)>/<session_id>/subagents/agent-<agent_id>.jsonl and records the
+# call under the sub-agent's own model.  Contracts C13-C17, written before the implementation.
+
+AGENT_ID = "a1b2c3d4e5f6"
+AGENT_TYPE = "engram:engram-dream-master"
+
+
+def helper_deny_text(source, agent_type, agent_id, model_id, lineage, self_lineage):
+    lead = "This call came from a" if source == THIS_CALL else "The previous reply of a"
+    return (f"ENGRAM write blocked by the model-family gate. {lead} helper agent (`{agent_type}`, id "
+            f"`{agent_id}`) running on model `{model_id}` (family `{lineage}`); this ENGRAM memory is locked "
+            f"to `{self_lineage}`. Nothing was written. The main session's own model is not affected by this "
+            f"block. To let this helper write, its agent definition must run on a `{self_lineage}` model; "
+            f"that is the human's decision.")
+
+
+def helper_deny_unmapped_text(source, agent_type, agent_id, model_id, self_lineage):
+    lead = "This call came from a" if source == THIS_CALL else "The previous reply of a"
+    return (f"ENGRAM write blocked by the model-family gate. {lead} helper agent (`{agent_type}`, id "
+            f"`{agent_id}`) running on model `{model_id}`, which the gate does not recognise as family "
+            f"`{self_lineage}`. Nothing was written. The main session's own model is not affected by this "
+            f"block. To let this helper write, its agent definition must run on a `{self_lineage}` model; "
+            f"that is the human's decision.")
+
+
+def sub_pay(tpath, session="sess-1", agent_id=AGENT_ID, agent_type=AGENT_TYPE, tid="toolu_01", **kw):
+    p = pay(tid=tid, tpath=tpath, session=session)
+    if agent_id is not None:
+        p["agent_id"] = agent_id
+    if agent_type is not None:
+        p["agent_type"] = agent_type
+    p.update(kw)
+    return p
+
+
+def sub_layout(tmp_path, parent_rows, sub_rows, session="sess-1", agent_id=AGENT_ID):
+    """(parent_transcript, subagent_transcript) in the harness layout."""
+    parent = write_jsonl(tmp_path / f"{session}.jsonl", parent_rows)
+    d = tmp_path / session / "subagents"
+    d.mkdir(parents=True)
+    sub = write_jsonl(d / f"agent-{agent_id}.jsonl", sub_rows)
+    return parent, sub
+
+
+# -- C13: the calling row is found in the sub-agent's own file
+
+def test_c13_subagent_calling_row_match_is_silent(hook, home, tmp_path):
+    parent, _ = sub_layout(tmp_path, [asst("claude-sonnet-5-5")],
+                           [asst("claude-opus-5-5"), call_row("claude-opus-5-5", "toolu_01")])
+    assert hook.decide(sub_pay(parent), home) is None
+
+
+def test_c13_subagent_calling_row_mismatch_denies_with_the_helper_text(hook, home, tmp_path):
+    parent, _ = sub_layout(tmp_path, [asst("claude-opus-5-5")],
+                           [asst("claude-opus-5-5"), call_row("claude-haiku-5-5", "toolu_01")])
+    assert out(hook.decide(sub_pay(parent), home)) == (
+        "deny", helper_deny_text(THIS_CALL, AGENT_TYPE, AGENT_ID, "claude-haiku-5-5", "anthropic:haiku", SELF))
+
+
+def test_c13_the_helper_text_names_the_helper_and_clears_the_main_session(hook, home, tmp_path):
+    parent, _ = sub_layout(tmp_path, [], [call_row("claude-haiku-5-5", "toolu_01")])
+    _, text = out(hook.decide(sub_pay(parent), home))
+    assert f"`{AGENT_TYPE}`" in text and f"`{AGENT_ID}`" in text
+    assert "The main session's own model is not affected by this block." in text
+    assert "helper agent" in text
+
+
+@pytest.mark.parametrize("bad", ["absent", None, 7, ""])
+def test_c13_agent_type_missing_or_not_a_string_renders_unknown(hook, home, tmp_path, bad):
+    parent, _ = sub_layout(tmp_path, [], [call_row("claude-haiku-5-5", "toolu_01")])
+    p = sub_pay(parent, agent_type=None)
+    if bad != "absent":
+        p["agent_type"] = bad
+    assert out(hook.decide(p, home)) == (
+        "deny", helper_deny_text(THIS_CALL, "unknown", AGENT_ID, "claude-haiku-5-5", "anthropic:haiku", SELF))
+
+
+def test_c13_a_subagent_row_appended_late_is_found_by_polling(hook, home, tmp_path):
+    parent, sub = sub_layout(tmp_path, [asst("claude-opus-5-5")], [asst("claude-opus-5-5")])
+    w = threading.Timer(0.25, append_jsonl, (sub, call_row("claude-haiku-5-5", "toolu_01")))
+    w.start()
+    try:
+        res = hook.decide(sub_pay(parent), home)
+    finally:
+        w.join()
+    assert out(res) == ("deny", helper_deny_text(THIS_CALL, AGENT_TYPE, AGENT_ID, "claude-haiku-5-5",
+                                                 "anthropic:haiku", SELF))
+
+
+def test_c13_empty_agent_id_is_a_main_session_call(hook, home, tmp_path):
+    """Only a NON-EMPTY string agent_id makes a helper call: the parent file is read, the plain text 2.1 is used."""
+    parent = write_jsonl(tmp_path / "t.jsonl", [call_row("claude-sonnet-5-5", "toolu_01")])
+    assert out(hook.decide(sub_pay(parent, agent_id=""), home)) == (
+        "deny", deny_text(THIS_CALL, "claude-sonnet-5-5", "anthropic:sonnet", SELF, home))
+
+
+# -- R2.2: unmapped branches a-d apply to the helper's model id
+
+@pytest.mark.parametrize("model,self_lineage,expect", [
+    ("claude-opus-5 beta", "openai:gpt", "deny"),            # a: known other provider
+    ("claude-flash-9 beta", "deepseek:flash", "deny"),       # a: shared family word across providers
+    ("claude-opus-5 beta", SELF, "unmapped_model"),          # b
+    ("mystery-opus-9", SELF, "unmapped_model"),              # c
+    ("mystery-9", SELF, "deny"),                             # d
+])
+def test_r22_unmapped_branches_apply_to_the_helper_model(hook, home, tmp_path, model, self_lineage, expect):
+    set_lineage(home, self_lineage)
+    parent, _ = sub_layout(tmp_path, [], [call_row(model, "toolu_01")])
+    got = out(hook.decide(sub_pay(parent), home))
+    if expect == "deny":
+        assert got == ("deny", helper_deny_unmapped_text(THIS_CALL, AGENT_TYPE, AGENT_ID, model, self_lineage))
+    else:
+        assert got == ("allow-context", unverified_text("unmapped_model"))
+
+
+# -- C14: the fallback reads the SUB-AGENT file, never the parent's
+
+def test_c14_fallback_mismatch_from_the_subagent_file_denies_with_previous_reply_helper_text(fast, home, tmp_path):
+    parent, _ = sub_layout(tmp_path, [asst("claude-opus-5-5")], [asst("claude-haiku-5-5"), user()])
+    assert out(fast.decide(sub_pay(parent), home)) == (
+        "deny", helper_deny_text(PREVIOUS, AGENT_TYPE, AGENT_ID, "claude-haiku-5-5", "anthropic:haiku", SELF))
+
+
+def test_c14_fallback_match_from_the_subagent_file_is_never_silent(fast, home, tmp_path):
+    parent, _ = sub_layout(tmp_path, [asst("claude-haiku-5-5")], [asst("claude-opus-5-5"), user()])
+    assert out(fast.decide(sub_pay(parent), home)) == ("allow-context", unverified_text("fallback_newest_row"))
+
+
+def test_c14_fallback_unmapped_helper_model_uses_the_previous_reply_wording(fast, home, tmp_path):
+    parent, _ = sub_layout(tmp_path, [asst("claude-opus-5-5")], [asst("mystery-9")])
+    assert out(fast.decide(sub_pay(parent), home)) == (
+        "deny", helper_deny_unmapped_text(PREVIOUS, AGENT_TYPE, AGENT_ID, "mystery-9", SELF))
+
+
+# -- C15: missing / unreadable / invalid-id sub-agent file: allow, never silent, with its code
+
+def test_c15_missing_subagent_file(fast, home, tmp_path):
+    parent = write_jsonl(tmp_path / "sess-1.jsonl", [asst("claude-haiku-5-5")])  # the parent would DENY if read
+    assert out(fast.decide(sub_pay(parent), home)) == ("allow-context", unverified_text("subagent_transcript_missing"))
+
+
+def test_c15_missing_subagent_directory_too(fast, home, tmp_path):
+    parent = write_jsonl(tmp_path / "sess-1.jsonl", [asst("claude-haiku-5-5")])
+    (tmp_path / "sess-1").write_text("a file where the session directory should be")
+    assert out(fast.decide(sub_pay(parent), home)) == ("allow-context", unverified_text("subagent_transcript_missing"))
+
+
+def test_c15_unreadable_subagent_file_not_a_regular_file(fast, home, tmp_path):
+    parent = write_jsonl(tmp_path / "sess-1.jsonl", [asst("claude-haiku-5-5")])
+    (tmp_path / "sess-1" / "subagents" / f"agent-{AGENT_ID}.jsonl").mkdir(parents=True)  # a directory
+    assert out(fast.decide(sub_pay(parent), home)) == (
+        "allow-context", unverified_text("subagent_transcript_unreadable"))
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_c15_a_fifo_subagent_file_is_unreadable_and_does_not_hang(fast, home, tmp_path):
+    parent = write_jsonl(tmp_path / "sess-1.jsonl", [asst("claude-haiku-5-5")])
+    d = tmp_path / "sess-1" / "subagents"
+    d.mkdir(parents=True)
+    os.mkfifo(d / f"agent-{AGENT_ID}.jsonl")
+    assert out(fast.decide(sub_pay(parent), home)) == (
+        "allow-context", unverified_text("subagent_transcript_unreadable"))
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("agent_id", "../x"), ("agent_id", ".."), ("agent_id", "a/b"), ("agent_id", "a\\b"), ("agent_id", "a\x00b"),
+    ("agent_id", "/abs"), ("agent_id", ["x"]), ("agent_id", 12),
+    ("session_id", "../x"), ("session_id", ".."), ("session_id", "a/b"), ("session_id", "a\\b"),
+    ("session_id", "a\x00b"), ("session_id", None), ("session_id", ""),
+])
+def test_c15_invalid_ids_allow_unverified_and_read_nothing(fast, home, tmp_path, field, bad):
+    parent, _ = sub_layout(tmp_path, [asst("claude-haiku-5-5")], [call_row("claude-haiku-5-5", "toolu_01")])
+    p = sub_pay(parent)
+    p[field] = bad
+    assert out(fast.decide(p, home)) == ("allow-context", unverified_text("subagent_id_invalid"))
+
+
+def test_c15_model_of_call_reports_each_code_directly(tmp_path):
+    parent = write_jsonl(tmp_path / "sess-1.jsonl", [asst("claude-opus-5-5")])
+    assert sig.model_of_call(parent, "toolu_01", 0.05, 0.01, agent_id=AGENT_ID, session_id="sess-1") == (
+        None, "fallback_newest_row", "subagent_transcript_missing")
+    assert sig.model_of_call(parent, "toolu_01", 0.05, 0.01, agent_id="../x", session_id="sess-1") == (
+        None, "fallback_newest_row", "subagent_id_invalid")
+    assert sig.model_of_call(parent, "toolu_01", 0.05, 0.01, agent_id=AGENT_ID, session_id="a/b") == (
+        None, "fallback_newest_row", "subagent_id_invalid")
+
+
+# -- C17: the parent transcript is never read for a helper call
+
+def test_c17_parent_newest_row_matches_while_the_subagent_file_mismatches_denies(fast, home, tmp_path):
+    parent, _ = sub_layout(tmp_path, [asst("claude-opus-5-5"), call_row("claude-opus-5-5", "toolu_01")],
+                           [asst("claude-haiku-5-5"), call_row("claude-haiku-5-5", "toolu_01")])
+    kind, text = out(fast.decide(sub_pay(parent), home))
+    assert kind == "deny" and "claude-haiku-5-5" in text and "helper agent" in text
+
+
+def test_c17_the_parent_calling_row_is_not_used_when_the_subagent_file_lacks_it(fast, home, tmp_path):
+    """The parent holds the calling row (opus, MATCH); the helper's file does not: the HELPER file's newest
+    row (haiku) decides, so the answer is a deny naming the previous reply."""
+    parent, _ = sub_layout(tmp_path, [call_row("claude-opus-5-5", "toolu_01")], [asst("claude-haiku-5-5")])
+    assert out(fast.decide(sub_pay(parent), home)) == (
+        "deny", helper_deny_text(PREVIOUS, AGENT_TYPE, AGENT_ID, "claude-haiku-5-5", "anthropic:haiku", SELF))
+
+
+def test_c17_the_main_session_call_still_reads_the_parent_file(hook, home, tmp_path):
+    parent, _ = sub_layout(tmp_path, [call_row("claude-sonnet-5-5", "toolu_01")], [asst("claude-opus-5-5")])
+    assert out(hook.decide(pay(tpath=parent, session="sess-1"), home)) == (
+        "deny", deny_text(THIS_CALL, "claude-sonnet-5-5", "anthropic:sonnet", SELF, home))
+
+
+# -- C16: no shipped agent spec that can WRITE to ENGRAM pins a model (R2.4)
+
+AGENT_SPEC_DIR = SRC_ENGRAM / "agents" / "claude"   # tiers.json ships agents/claude/<f>.md as agents/<f>.md
+
+
+def _frontmatter_fields(text):
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    fields = {}
+    for ln in lines[1:]:
+        if ln.strip() == "---":
+            break
+        m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", ln)
+        if m:
+            fields[m.group(1)] = m.group(2).strip()
+    return fields
+
+
+def _tool_names(tools_value):
+    v = tools_value.strip()
+    if v.startswith("[") and v.endswith("]"):
+        v = v[1:-1]
+    return {t.strip().strip("'\"") for t in v.split(",") if t.strip()}
+
+
+def _write_tool_full_names():
+    d = json.loads(TOOL_LIST_JSON.read_text(encoding="utf-8"))
+    return {p + n for p in d["prefixes"] for n in d["write_tools"]}
+
+
+def writer_specs_with_a_model(spec_dir):
+    """({spec names naming an ENGRAM write tool}, [those that also carry a `model:` line])."""
+    writers = _write_tool_full_names()
+    named, pinned = set(), []
+    for f in sorted(Path(spec_dir).glob("*.md")):
+        fm = _frontmatter_fields(f.read_text(encoding="utf-8"))
+        if "tools" not in fm:
+            continue
+        if _tool_names(fm["tools"]) & writers:
+            named.add(f.stem)
+            if "model" in fm:
+                pinned.append(f.stem)
+    return named, pinned
+
+
+def test_c16_every_shipped_agent_spec_that_can_write_to_engram_has_no_model_line():
+    named, pinned = writer_specs_with_a_model(AGENT_SPEC_DIR)
+    assert "engram-dream-master" in named, "the check found no writer: its own parse is broken"
+    assert pinned == [], (f"agent specs that name an ENGRAM write tool AND pin `model:`: {pinned}. A helper that "
+                          f"writes must run on the session's model (the gate denies another family): decide first.")
+
+
+def test_c16_the_shipped_set_today_is_the_dream_master_only():
+    named, _ = writer_specs_with_a_model(AGENT_SPEC_DIR)
+    assert named == {"engram-dream-master"}
+
+
+def _plant(d, name, tools, model=None):
+    lines = ["---", f"name: {name}", "description: planted", f"tools: {tools}"]
+    if model:
+        lines.append(f"model: {model}")
+    lines += ["---", "body", ""]
+    (d / f"{name}.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def test_c16_a_planted_writer_with_a_model_line_is_flagged(tmp_path):
+    _plant(tmp_path, "planted-writer", "Read, mcp__engram__engram_add_observation", model="sonnet")
+    _plant(tmp_path, "planted-plugin-prefix", "Read, mcp__plugin_engram_engram__engram_add_edge", model="sonnet")
+    _plant(tmp_path, "planted-ok", "Read, mcp__engram__engram_add_observation")
+    named, pinned = writer_specs_with_a_model(tmp_path)
+    assert named == {"planted-writer", "planted-plugin-prefix", "planted-ok"}
+    assert pinned == ["planted-plugin-prefix", "planted-writer"]
+
+
+def test_c16_matching_is_by_exact_tool_name_not_prefix(tmp_path):
+    """`engram_focus` is a write tool; `engram_focus_sets` is read-only and must not be mistaken for it."""
+    assert "mcp__engram__engram_focus" in _write_tool_full_names()
+    assert "mcp__engram__engram_focus_sets" not in _write_tool_full_names()
+    _plant(tmp_path, "reads-focus-sets", "Read, mcp__engram__engram_focus_sets, mcp__engram__engram_query",
+           model="sonnet")
+    _plant(tmp_path, "writes-focus", "[Read, mcp__engram__engram_focus]", model="sonnet")
+    named, pinned = writer_specs_with_a_model(tmp_path)
+    assert named == {"writes-focus"} and pinned == ["writes-focus"]
+
+
+def test_c16_a_spec_with_no_tools_line_is_not_a_writer(tmp_path):
+    (tmp_path / "x.md").write_text("---\nname: x\nmodel: sonnet\n---\nbody\n", encoding="utf-8")
+    assert writer_specs_with_a_model(tmp_path) == (set(), [])

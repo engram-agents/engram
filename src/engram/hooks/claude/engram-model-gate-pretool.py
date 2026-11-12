@@ -32,6 +32,13 @@ Decision, in order (the PreToolUse payload carries ``tool_name``, ``tool_use_id`
      ``transcript_not_found``, ``transcript_unreadable``, ``window_exceeded``, ``budget_expired_no_row``,
      ``internal_error``): allow, NEVER SILENT, text 2.2 with the code.
 
+Helper agents (round 2, R2.1-R2.3): a payload with a non-empty ``agent_id`` is a call made by a sub-agent.  The
+model is read from THAT helper's own transcript (``engram_signature.model_of_call(..., agent_id=, session_id=)``:
+``<dirname(transcript_path)>/<session_id>/subagents/agent-<agent_id>.jsonl``), never the parent's, with the
+same poll, budget, fallback and unmapped rules.  Extra allow-never-silent codes: ``subagent_id_invalid``,
+``subagent_transcript_missing``, ``subagent_transcript_unreadable``.  A deny names the helper (``agent_type``,
+``agent_id``) and says the main session's own model is not affected.
+
 "Allow, never silent" is an ``additionalContext`` block with no permission decision, so the harness's own
 permission flow still applies.  A deny is ``permissionDecision: deny`` with the text as its reason.  The hook
 always exits 0.
@@ -79,15 +86,37 @@ def _remedy(self_lineage, home):
             f"in `{home}/config.json`. Reading memory still works.")
 
 
-def _deny_text(source, model_id, lineage, self_lineage, home):
+def _deny_text(source, model_id, lineage, self_lineage, home, helper=None):
+    if helper:
+        return (f"ENGRAM write blocked by the model-family gate. {_helper_lead(source, helper)} running on "
+                f"model `{model_id}` (family `{lineage}`); this ENGRAM memory is locked to `{self_lineage}`. "
+                + _helper_remedy(self_lineage))
     return (f"ENGRAM write blocked by the model-family gate. {source} came from model `{model_id}` "
             f"(family `{lineage}`); this ENGRAM memory is locked to `{self_lineage}`. "
             + _remedy(self_lineage, home))
 
 
-def _deny_unmapped_text(source, model_id, self_lineage, home):
+def _deny_unmapped_text(source, model_id, self_lineage, home, helper=None):
+    if helper:
+        return (f"ENGRAM write blocked by the model-family gate. {_helper_lead(source, helper)} running on "
+                f"model `{model_id}`, which the gate does not recognise as family `{self_lineage}`. "
+                + _helper_remedy(self_lineage))
     return (f"ENGRAM write blocked by the model-family gate. {source} came from model `{model_id}`, "
             f"which the gate does not recognise as family `{self_lineage}`. " + _remedy(self_lineage, home))
+
+
+def _helper_lead(source, helper):
+    """The subject of a helper-agent (sub-agent) deny: names the HELPER, so the parent session does not
+    read the text as its own model being wrong.  ``helper`` is ``(agent_type, agent_id)``."""
+    agent_type, agent_id = helper
+    who = f"helper agent (`{agent_type}`, id `{agent_id}`)"
+    return f"This call came from a {who}" if source == _SOURCE_CALL else f"The previous reply of a {who}"
+
+
+def _helper_remedy(self_lineage):
+    return ("Nothing was written. The main session's own model is not affected by this block. To let this "
+            f"helper write, its agent definition must run on a `{self_lineage}` model; that is the human's "
+            "decision.")
 
 
 def _deny_mixed_text(self_lineage, home):
@@ -166,17 +195,17 @@ def _load_runtime():
 
 # --------------------------------------------------------------- decision
 
-def _unmapped(model_id, source_text, self_lineage, home):
+def _unmapped(model_id, source_text, self_lineage, home, helper=None):
     """Branches a-d of the unmapped-id rule."""
     mid = re.sub(r"\[[^\]]*\]\s*$", "", model_id.strip()).strip()
     provider = (_parse_model_id(mid).get("provider") or "")
     self_provider, _, self_family = self_lineage.partition(":")
     if provider and provider != self_provider:                    # a
-        return _deny(_deny_unmapped_text(source_text, model_id, self_lineage, home))
+        return _deny(_deny_unmapped_text(source_text, model_id, self_lineage, home, helper))
     fam, toks = self_family.split("-"), mid.split("-")
     if any(toks[i:i + len(fam)] == fam for i in range(len(toks) - len(fam) + 1)):  # b, c
         return _unverified("unmapped_model")
-    return _deny(_deny_unmapped_text(source_text, model_id, self_lineage, home))      # d
+    return _deny(_deny_unmapped_text(source_text, model_id, self_lineage, home, helper))      # d
 
 
 def _decide(payload, home):
@@ -190,16 +219,24 @@ def _decide(payload, home):
     if not _load_runtime():
         return _unverified("internal_error")
     tpath, tid = payload.get("transcript_path"), payload.get("tool_use_id")
-    mid, source, reason = model_of_call(tpath, tid, BUDGET_S, STEP_S)
+    agent_id = payload.get("agent_id")
+    helper = None
+    if agent_id is None or agent_id == "":
+        mid, source, reason = model_of_call(tpath, tid, BUDGET_S, STEP_S)
+    else:  # a helper agent's call: its own transcript, never the parent's (R2.1)
+        at = payload.get("agent_type")
+        helper = (at if isinstance(at, str) and at.strip() else "unknown", agent_id)
+        mid, source, reason = model_of_call(tpath, tid, BUDGET_S, STEP_S, agent_id=agent_id,
+                                            session_id=payload.get("session_id"))
     source_text = _SOURCE_CALL if source == "calling_entry" else _SOURCE_PREVIOUS
     if reason == "mixed_harness":
         return _deny(_deny_mixed_text(self_lineage, home))
     if mid and reason in (None, "unmapped_model"):
         lineage = _core.model_id_to_lineage(mid)
         if not lineage:
-            return _unmapped(mid, source_text, self_lineage, home)
+            return _unmapped(mid, source_text, self_lineage, home, helper)
         if lineage != self_lineage:
-            return _deny(_deny_text(source_text, mid, lineage, self_lineage, home))
+            return _deny(_deny_text(source_text, mid, lineage, self_lineage, home, helper))
         return None if source == "calling_entry" else _unverified("fallback_newest_row")
     return _unverified(reason or "internal_error")
 

@@ -467,7 +467,7 @@ def _calling_row_model(data: bytes, needle: bytes, tool_use_id: str):
     return False, None
 
 
-def model_of_call(transcript_path, tool_use_id, budget_s, step_s) -> tuple:
+def model_of_call(transcript_path, tool_use_id, budget_s, step_s, agent_id=None, session_id=None) -> tuple:
     """``(model_id | None, source, reason | None)``: the model that made one tool call (#4596).
 
     The harness starts a PreToolUse hook before the calling assistant row reaches the transcript, so a
@@ -484,21 +484,49 @@ def model_of_call(transcript_path, tool_use_id, budget_s, step_s) -> tuple:
       id and reason ``unmapped_model``.
     * A calling row larger than the window cannot be found by the scan; it ends in the fallback.
     * A missing or unreadable transcript returns at once (the fallback would say the same).
+    * A helper-agent (sub-agent) call (``agent_id`` is a non-empty string, or any non-None non-string, which
+      is invalid): the transcript read is the helper's own, ``<dirname(transcript_path)>/<session_id>/
+      subagents/agent-<agent_id>.jsonl`` (``transcript_path`` and ``session_id`` are the PARENT's, as the
+      harness sends them), never the parent's file: same poll, budget and fallback, the fallback's newest
+      row taken from that file.  Its extra reason codes: ``subagent_id_invalid`` (an id that is not a string,
+      or holds ``/``, ``\\``, NUL or ``..``; ``session_id`` empty or absent too), ``subagent_transcript_missing``,
+      ``subagent_transcript_unreadable``.
     * Never raises: every failure is a reason code (the closed set of ``read_model_tail``, plus
-      ``transcript_path_missing``, ``budget_expired_no_row`` and ``internal_error``)."""
+      ``transcript_path_missing``, ``budget_expired_no_row``, ``internal_error`` and the three above)."""
     try:
-        return _model_of_call(transcript_path, tool_use_id, budget_s, step_s)
+        return _model_of_call(transcript_path, tool_use_id, budget_s, step_s, agent_id, session_id)
     except Exception:  # noqa: BLE001
         return None, "fallback_newest_row", "internal_error"
 
 
-def _model_of_call(transcript_path, tool_use_id, budget_s, step_s) -> tuple:
+def _bad_id(v) -> bool:
+    return (not isinstance(v, str) or not v or "/" in v or "\\" in v or "\x00" in v or ".." in v)
+
+
+def _subagent_transcript(transcript_path, agent_id, session_id):
+    """``(path | None, reason | None)``: the helper agent's own transcript, built only from the parent's
+    ``transcript_path`` directory and the two payload ids (each checked for a path separator, NUL, ``..``)."""
+    if _bad_id(agent_id) or _bad_id(session_id):
+        return None, "subagent_id_invalid"
+    return (Path(os.fspath(transcript_path)).parent / session_id / "subagents" / f"agent-{agent_id}.jsonl"), None
+
+
+_SUBAGENT_CODES = {"transcript_not_found": "subagent_transcript_missing",
+                   "transcript_unreadable": "subagent_transcript_unreadable"}
+
+
+def _model_of_call(transcript_path, tool_use_id, budget_s, step_s, agent_id=None, session_id=None) -> tuple:
     fb = "fallback_newest_row"
     if isinstance(transcript_path, str):
         if not transcript_path.strip():
             return None, fb, "transcript_path_missing"
     elif not isinstance(transcript_path, os.PathLike):
         return None, fb, "transcript_path_missing"
+    helper = agent_id is not None and agent_id != ""
+    if helper:
+        transcript_path, bad = _subagent_transcript(transcript_path, agent_id, session_id)
+        if bad:
+            return None, fb, bad
     try:
         budget = max(0.0, float(budget_s))
     except (TypeError, ValueError):
@@ -514,7 +542,7 @@ def _model_of_call(transcript_path, tool_use_id, budget_s, step_s) -> tuple:
         while True:
             data, _truncated, reason = _read_window(transcript_path)
             if reason is not None:
-                return None, fb, reason
+                return None, fb, (_SUBAGENT_CODES.get(reason, reason) if helper else reason)
             found, mid = _calling_row_model(data, needle, tool_use_id)
             if found:
                 return (mid, "calling_entry", None) if mid else (None, "calling_entry", "no_model_row")
@@ -530,7 +558,7 @@ def _model_of_call(transcript_path, tool_use_id, budget_s, step_s) -> tuple:
         return res.model_id, fb, "unmapped_model"
     if res.reason == "no_model_row" and polled:
         return None, fb, "budget_expired_no_row"
-    return None, fb, res.reason
+    return None, fb, (_SUBAGENT_CODES.get(res.reason, res.reason) if helper else res.reason)
 
 
 # --------------------------------------------------------------- version
