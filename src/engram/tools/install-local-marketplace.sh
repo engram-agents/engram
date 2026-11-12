@@ -680,10 +680,11 @@ def remedy(model):
     helper = getattr(server, "_embedding_prewarm_command", None)
     if helper is not None:
         return helper(model)
+    import shlex
     return (
-        venv_py + " -c "
-        + chr(34) + "from sentence_transformers import SentenceTransformer; "
-        + "SentenceTransformer(" + repr(model) + ")" + chr(34)
+        shlex.quote(venv_py) + " -c "
+        + shlex.quote("from sentence_transformers import SentenceTransformer; "
+                      + "SentenceTransformer(" + repr(model) + ")")
     )
 
 

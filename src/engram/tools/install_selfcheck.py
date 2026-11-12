@@ -249,7 +249,8 @@ def cache_dir():
 # The remedy comes from the server's own helper: a pinned model is fetched by the
 # loader's pinned path (a by-name fetch gets main, which is not the pin once main moves).
 helper = getattr(server, "_embedding_prewarm_command", None)
-print(helper(model) if helper else sys.executable + " -c " + chr(34) + "from sentence_transformers import SentenceTransformer; SentenceTransformer(" + repr(model) + ")" + chr(34))
+import shlex
+print(helper(model) if helper else shlex.quote(sys.executable) + " -c " + shlex.quote("from sentence_transformers import SentenceTransformer; SentenceTransformer(" + repr(model) + ")"))
 print(model)
 print(cache_dir())
 print("CACHED" if server._embedding_cache_status(model) else "MISSING")

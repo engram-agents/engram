@@ -2845,6 +2845,22 @@ def test_prewarm_falls_back_to_the_runtime_default_model_when_config_names_none(
     assert load_log.read_text().splitlines() == ["fake-default-model"]
 
 
+def _remedy_names_model(out, model):
+    """True when some printed line parses (shlex) to `<python> -c <payload>` whose
+    payload is the by-name download of `model`. The remedy is shell-quoted, so the
+    raw text no longer contains the bare `SentenceTransformer('<model>')` literal."""
+    import shlex
+    want = "SentenceTransformer(%r)" % model
+    for line in out.splitlines():
+        try:
+            argv = shlex.split(line)
+        except ValueError:
+            continue
+        if len(argv) >= 3 and argv[-2] == "-c" and want in argv[-1]:
+            return True
+    return False
+
+
 def test_prewarm_failure_exits_nonzero_naming_model_cache_dir_and_remedy(tmp_path):
     """A3 failure: offline / HF error -> install exits non-zero (via _venv_fail), message
     names the model, the cache dir it tried, and the exact one-line remedy."""
@@ -2854,7 +2870,7 @@ def test_prewarm_failure_exits_nonzero_naming_model_cache_dir_and_remedy(tmp_pat
     assert result.returncode != 0, out
     assert "fake-default-model" in out
     assert str(tmp_path / "hf-home") in out  # the cache dir it tried (HF_HOME honoured)
-    assert "SentenceTransformer('fake-default-model')" in out  # the remedy command
+    assert _remedy_names_model(out, "fake-default-model")  # the remedy command, shell-parsed
     assert str(_login_home(tmp_path) / ".engram" / "venv" / "bin" / "python") in out
     assert "ERROR: venv runtime-requirements provisioning failed" in out  # the _venv_fail trap ran
 
@@ -2871,7 +2887,7 @@ def test_prewarm_fails_when_the_model_loaded_but_the_server_predicate_is_still_f
     assert "downloaded to" not in out, out
     assert "fake-default-model" in out
     assert str(tmp_path / "hf-home") in out  # the cache dir tried
-    assert "SentenceTransformer('fake-default-model')" in out  # the remedy
+    assert _remedy_names_model(out, "fake-default-model")  # the remedy, shell-parsed
     assert "loaded but is not where the server looks" in out
     assert "ERROR: venv runtime-requirements provisioning failed" in out  # the _venv_fail trap ran
 

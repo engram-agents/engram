@@ -8696,10 +8696,12 @@ def _embedding_prewarm_command(model_name: str) -> str:
             f"import engram_core; engram_core._embedder._load_model({model_name!r})"
         )
         return f"{py} -c {shlex.quote(payload)}"
-    return (
-        f"{py} -c \"from sentence_transformers import "
-        f"SentenceTransformer; SentenceTransformer('{model_name}')\""
+    # repr + shlex.quote: the name is user config, and it is pasted into a shell.
+    payload = (
+        "from sentence_transformers import SentenceTransformer; "
+        f"SentenceTransformer({model_name!r})"
     )
+    return f"{py} -c {shlex.quote(payload)}"
 
 
 def _looks_like_local_model_path(model_name: str) -> bool:

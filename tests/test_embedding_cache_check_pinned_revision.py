@@ -119,8 +119,10 @@ def test_c_the_check_makes_no_network_or_download_call(server):
         assert kwargs.get("local_files_only") is True, "the check must never touch the network"
         return real(*args, **kwargs)
 
-    with mock.patch("huggingface_hub.snapshot_download", side_effect=_offline_only):
+    with mock.patch("huggingface_hub.snapshot_download", side_effect=_offline_only) as spy:
         assert server._embedding_cache_status(MODEL) is True
+    # The double must have been consulted, or the assertion inside it proved nothing.
+    assert spy.call_count == 1
 
 
 def test_d_local_path_clause_unchanged(server, tmp_path):
@@ -175,13 +177,33 @@ def test_f_fatal_message_for_a_pinned_model_names_the_pinned_fetch(server, capsy
 
 
 def test_f_fatal_message_for_an_unpinned_model_keeps_the_by_name_advice(server, capsys):
+    import shlex
     with mock.patch.object(server._embedder, "is_available", return_value=True), \
          mock.patch.object(server, "_embedding_cache_status", return_value=False), \
          mock.patch.object(server, "_get_embedding_config", return_value={"model": "BAAI/bge-small-en"}):
         with pytest.raises(SystemExit):
             server._embedding_startup_gate()
     err = capsys.readouterr().err
-    assert "SentenceTransformer('BAAI/bge-small-en')" in err, err
+    cmds = [ln for ln in err.splitlines() if " -c " in ln]
+    assert len(cmds) == 1, err
+    argv = shlex.split(cmds[0])
+    assert argv[-2] == "-c" and "SentenceTransformer('BAAI/bge-small-en')" in argv[-1], argv
+
+
+def test_f_unpinned_remedy_cannot_be_used_to_inject_shell_or_python(server):
+    """The model name is user config pasted into a shell: a name carrying quotes and a
+    second statement must stay ONE string literal inside the Python payload, and the
+    whole payload ONE shell word (security read on #4627)."""
+    import ast
+    import shlex
+    evil = "x'); import os; os.system('id'); ('"
+    argv = shlex.split(server._embedding_prewarm_command(evil))
+    assert len(argv) == 3 and argv[1] == "-c", argv
+    tree = ast.parse(argv[2])
+    assert len(tree.body) == 2, ast.dump(tree)  # the import and ONE call, nothing injected
+    call = tree.body[1].value
+    assert isinstance(call, ast.Call) and len(call.args) == 1
+    assert isinstance(call.args[0], ast.Constant) and call.args[0].value == evil
 
 
 def test_f_pinned_remedy_command_survives_a_plugin_path_with_spaces_and_quotes(server, tmp_path):
