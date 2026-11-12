@@ -674,6 +674,12 @@ def cache_dir():
 
 
 def remedy(model):
+    # The server's own helper: a pinned model is fetched by the loader's
+    # pinned path, an unpinned one by name (a by-name fetch would not satisfy
+    # the pinned cache check).
+    helper = getattr(server, "_embedding_prewarm_command", None)
+    if helper is not None:
+        return helper(model)
     return (
         venv_py + " -c "
         + chr(34) + "from sentence_transformers import SentenceTransformer; "

@@ -8618,6 +8618,25 @@ def _embedding_cache_status(model_name: str) -> bool:
     if "\\" in model_name or model_name.count("/") > 1:
         return False
 
+    # Clause 3a -- a name the loader PINS (#4447/#4468, the default model). The
+    # loader never asks "is some revision of this repo cached"; it resolves one
+    # commit via core._resolve_pinned_snapshot, and a download by commit id
+    # writes snapshots/<sha>/ but no refs/main. So ask the loader's own
+    # question, with the loader's own resolver (G6 on v0.5.7-rc1: the by-name
+    # lookup below resolves through refs/main and said "not cached" right
+    # after a successful pinned download, so a fresh install died at the
+    # gate). No fallback to an unpinned lookup on a miss: a cached `main` at
+    # another revision must NOT satisfy a pin, because the loader will not
+    # load it. Presence only, same strength as clause 3: the hash check stays
+    # at load time (it reads ~90 MB; the gate runs before the MCP handshake).
+    if model_name in core.EMBEDDING_MODEL_PINS:
+        from huggingface_hub.errors import LocalEntryNotFoundError
+        try:
+            snap = core._resolve_pinned_snapshot(model_name, online=False)
+        except LocalEntryNotFoundError:
+            return False
+        return os.path.isfile(os.path.join(str(snap), "config.json"))
+
     # Clause 3 -- a hub repo id. The loader prepends the org prefix only when
     # the name contains no "/" AND is not one of the 68 legacy no-org names in
     # `basic_transformer_models`. That list is a FUNCTION-LOCAL variable inside
@@ -8654,6 +8673,29 @@ def _embedding_cache_status(model_name: str) -> bool:
             # for a CONFIGURATION mistake, not no traceback ever.
             continue
     return False
+
+
+def _embedding_prewarm_command(model_name: str) -> str:
+    """The one-liner that fills the cache the way the loader will read it.
+
+    A pinned model (the default) must be fetched by the loader's own pinned
+    path: `SentenceTransformer(name)` downloads whatever `main` is today, which
+    is not the pin once `main` moves, so the pinned check would still say no.
+    An unpinned (custom) model is the user's own choice and keeps the by-name
+    download.
+    """
+    import sys
+    py = sys.executable or "python"
+    if model_name in core.EMBEDDING_MODEL_PINS:
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        return (
+            f"{py} -c \"import sys; sys.path.insert(0, {plugin_dir!r}); "
+            f"import engram_core; engram_core._embedder._load_model({model_name!r})\""
+        )
+    return (
+        f"{py} -c \"from sentence_transformers import "
+        f"SentenceTransformer; SentenceTransformer('{model_name}')\""
+    )
 
 
 def _looks_like_local_model_path(model_name: str) -> bool:
@@ -8894,11 +8936,7 @@ def _embedding_startup_gate() -> None:
             )
             print("", file=sys.stderr)
             print("  To fix, pre-warm the cache once:", file=sys.stderr)
-            print(
-                f"  python -c \"from sentence_transformers import "
-                f"SentenceTransformer; SentenceTransformer('{model_name}')\"",
-                file=sys.stderr,
-            )
+            print(f"  {_embedding_prewarm_command(model_name)}", file=sys.stderr)
         print("", file=sys.stderr)
         print(
             "  To start deliberately degraded (test/dev only): "
