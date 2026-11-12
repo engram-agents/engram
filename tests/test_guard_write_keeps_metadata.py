@@ -306,6 +306,17 @@ def test_a_read_only_file_is_refused_unchanged_and_the_line_names_the_backup(tmp
     assert len(backups) == 1 and str(backups[0]) in str(got.value) and "not changed" in str(got.value)
 
 
+def test_a_new_files_temp_is_built_beside_it_and_published_by_link(tmp_path, monkeypatch):
+    """The temp of a new file sits in the target's own folder (os.link is same-filesystem only),
+    and the publish is a link, not a rename."""
+    seen = []
+    real = os.link
+    monkeypatch.setattr(fg.os, "link", lambda s, d, *a, **k: (seen.append((Path(s), Path(d))), real(s, d, *a, **k))[1])
+    path = tmp_path / "config.json"
+    assert fg.apply_merge(path, {"install_tier": "dev"}, filename="config.json") == "created"
+    assert len(seen) == 1 and seen[0][1] == path and seen[0][0].parent == tmp_path, seen
+
+
 def test_apply_merge_creates_a_new_config_exclusively(tmp_path):
     path = tmp_path / "config.json"
     assert fg.apply_merge(path, {"install_tier": "dev"}, filename="config.json", new_mode=0o600) == "created"
