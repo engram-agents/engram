@@ -3075,7 +3075,7 @@ ships in v0.6.0. [Added with v0.5.5: this did not hold. The changes merged on
   way. #3875 passes the path to Python snippets as `sys.argv[1]`: splicing it
   into a Python literal broke on a quote in the path (measured: two
   `SyntaxError`s and one `agent=$(...)` that returned empty with rc 0; the
-  default `$HOME` hits it too, for a home like `/Users/O'Brien`). The
+  default `$HOME` hits it too, for a home path whose name contains an apostrophe). The
   line-level test `tests/test_skill_home_paths_3863.py` now accepts only the
   canonical expression, and a runtime pin runs the 7 home-touching snippets
   under a home containing a quote and a space. Known limit: the test does not

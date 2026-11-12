@@ -415,12 +415,12 @@ def test_claude_that_does_not_run_fails_step_1(tmp_path):
 def test_git_that_cannot_read_the_checkout_gets_the_safe_directory_remedy(tmp_path):
     sb2 = Sandbox(tmp_path)
     _write(sb2.fakebin / "git", """#!/bin/sh
-echo "fatal: detected dubious ownership in repository at '/some/other/users/checkout'" >&2
+echo "fatal: detected dubious ownership in repository at '/some/other/clone/checkout'" >&2
 exit 128
 """)
     r = sb2.run("--yes")
     assert r.returncode != 0 and "FAIL: [step 1]" in r.stderr, r.all
-    assert "safe.directory '/some/other/users/checkout'" in r.stderr
+    assert "safe.directory '/some/other/clone/checkout'" in r.stderr
     assert not sb2.calls_starting("pip")
 
 

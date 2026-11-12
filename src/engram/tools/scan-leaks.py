@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 """scan-leaks.py — defensive scanner for personal references in this public repository.
 
-Flags committed structural patterns and a gitignored local roster of personal
-names. Run standalone or wire as a pre-commit hook.
+Flags committed structural patterns, absolute home paths, and a gitignored
+local roster of personal names. Run standalone or wire as a pre-commit hook.
 
 Standalone:
     python3 tools/scan-leaks.py            # exit 0 clean, 1 if leaks
-    python3 tools/scan-leaks.py --strict   # also flag /home/<user>/ paths
 
 Pre-commit (from inside ~/engram-alpha):
     ln -s ../../tools/scan-leaks.py .git/hooks/pre-commit
 
 Patterns flagged (committed structural patterns):
   - Main repo path: kg_protocol_for_ai
+
+Absolute home paths (default-deny, every git-tracked text file):
+  - Any path of the form /home/<name> or /Users/<name> (the name is one whole
+    segment, ended by any non-segment character or end of string; Users is
+    case-insensitive) whose <name> is not in ALLOWED_HOME_SEGMENTS is a
+    finding.  Public text carries no host paths,
+    usernames or seat folder names.  The check is generated from the class,
+    not from a list of known names: whole path segments only, so an allowed
+    name never allows a longer name that merely starts with it.  It reads
+    every tracked file whatever its extension (extensionless executables
+    included) and skips only binary files and the declared exemptions.
+    Known limit: JSON-escaped paths (backslash-escaped slashes) are not matched.
 
 Personal-name and user-specific patterns are loaded at runtime from
 .scan-leaks-local.json in the repo root (gitignored). If this file is
@@ -46,7 +57,40 @@ COMMITTED_PATTERNS = [
 
 LOCAL_CONFIG_NAME = ".scan-leaks-local.json"
 
-SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service", ".timer"}
+SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service", ".timer", ".yml", ".yaml"}
+
+# --- Absolute home paths: default-deny -------------------------------------
+# The class definition (regex + declared allowed set with reasons) lives in ONE
+# place, shared with the build engine's foreign-bundle leak scan:
+# engine/home_path_class.py.  Deployed it sits beside this file under engine/;
+# in the source tree it is under src/build/engine/.
+def _load_home_path_class():
+    import importlib.util
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "engine" / "home_path_class.py",
+        here.parent.parent / "build" / "engine" / "home_path_class.py",
+    ]
+    for cand in candidates:
+        if cand.is_file():
+            spec = importlib.util.spec_from_file_location("home_path_class", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise ImportError("home_path_class.py not found beside scan-leaks.py: "
+                      + ", ".join(str(c) for c in candidates))
+
+
+_hpc = _load_home_path_class()
+HOME_PATH_RE = _hpc.HOME_PATH_RE
+ALLOWED_HOME_SEGMENTS = _hpc.ALLOWED_HOME_SEGMENTS
+_DISALLOWED_HOME_PATH_RE = _hpc.disallowed_home_path_regex()
+
+# Files exempt from the home-path check, by repo-relative path, each with a
+# reason.  Deliberately EMPTY: the scanner, its definition module and every test
+# plant their paths in forms the class does not match.  Keep the mechanism: a
+# future exemption is a declared "path: reason" entry here, never a directory.
+HOME_PATH_EXEMPT_FILES: dict[str, str] = {}
 # LICENSE: copyright lines are intentional.
 # .scan-leaks-local.json: the local personal-name roster must be skipped —
 #   it contains the exact patterns the scanner is looking for (by design).
@@ -183,6 +227,42 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> list[tuple[st
     return leaks
 
 
+def scan_home_paths(root: Path, use_git: bool = True) -> list[tuple[str, int, str]]:
+    """Return (relpath, lineno, segment) for every disallowed absolute home path.
+
+    Domain: every git-tracked file (``git ls-files``), whatever its extension,
+    including extensionless executables.  A file whose first 8 KiB contains a
+    NUL byte is binary and skipped, as is any file in HOME_PATH_EXEMPT_FILES.
+    Text is decoded as UTF-8 with errors replaced, so a non-UTF-8 file is still
+    scanned.  The verdict (allowed or not) is made inside the shared regex.
+    Falls back to an os.walk of root
+    when git is unavailable (scanning too much beats scanning nothing).
+    """
+    tracked = _git_tracked_files(root) if use_git else None
+    if tracked is None:
+        tracked = []
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            tracked.extend(Path(dirpath) / f for f in files)
+
+    findings = []
+    for fpath in tracked:
+        rel = fpath.relative_to(root).as_posix()
+        if rel in HOME_PATH_EXEMPT_FILES:
+            continue
+        try:
+            data = fpath.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in data[:8192]:
+            continue
+        text = data.decode("utf-8", errors="replace")
+        for i, line in enumerate(text.splitlines(), 1):
+            for m in _DISALLOWED_HOME_PATH_RE.finditer(line):
+                findings.append((rel, i, m.group(1).rstrip(".")))
+    return findings
+
+
 def main():
     parser = argparse.ArgumentParser(description="Scan alpha for personal-info leaks")
     parser.add_argument("--root", default=None,
@@ -216,18 +296,18 @@ def main():
 
     all_patterns = COMMITTED_PATTERNS + local_patterns
 
-    if not all_patterns:
-        print(f"scan-leaks: clean ({root})")
-        sys.exit(0)
-
     leaks = scan(root, all_patterns)
-    if not leaks:
+    home_findings = scan_home_paths(root)
+    if not leaks and not home_findings:
         print(f"scan-leaks: clean ({root})")
         sys.exit(0)
 
-    print(f"scan-leaks: {len(leaks)} potential leak(s) in {root}", file=sys.stderr)
+    print(f"scan-leaks: {len(leaks) + len(home_findings)} potential leak(s) in {root}",
+          file=sys.stderr)
     for rel, lineno, label, snippet in leaks:
         print(f"  {rel}:{lineno} [{label}] {snippet}", file=sys.stderr)
+    for rel, lineno, seg in home_findings:
+        print(f"  {rel}:{lineno} [absolute home path] segment: {seg}", file=sys.stderr)
     sys.exit(1)
 
 

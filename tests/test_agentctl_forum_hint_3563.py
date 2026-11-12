@@ -621,7 +621,7 @@ class TestFWholeSpawn:
         assert norm.startswith(GOLDEN_NO_FLAG.rstrip("\n"))
         extra = norm[len(GOLDEN_NO_FLAG.rstrip("\n")):].strip("\n").splitlines()
         assert len(extra) == 1, extra
-        assert "forum-url.hint" in extra[0] and "/home/agent-newborn-TS/.engram" in extra[0]
+        assert "forum-url.hint" in extra[0] and "agent-newborn-TS/.engram" in extra[0]
         assert "default" in extra[0] and "first-session" in extra[0]
         assert URL not in proc.stdout
 

@@ -325,6 +325,49 @@ def test_run_phase_collision_is_caught_by_the_fixture_not_collectstart(tmp_path:
 # ---------------------------------------------------------------------------
 
 
+def _run_selection_expect_all_pass(selection: list):
+    """Run `selection` and require every collected test to pass cleanly.
+
+    The expected count is DERIVED (a `--collect-only -q` pass over the same
+    selection), never pinned: a literal "N passed" breaks every time a test
+    is added to tests/test_engine_phase3.py. The regression this guards
+    still fails loud: it shows up as collection/run errors and
+    passed < collected ("5 passed, 53 errors"), never as a clean N passed.
+    Returns (combined_output, collected_count, summary_line)."""
+    import re
+
+    repo_root = Path(__file__).resolve().parent.parent
+    base = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q"]
+    co = subprocess.run(
+        base + ["--collect-only"] + selection,
+        cwd=str(repo_root), capture_output=True, text=True, timeout=120,
+    )
+    co_out = co.stdout + co.stderr
+    m = re.search(r"(\d+) tests? collected", co_out)
+    collected = int(m.group(1)) if m else None
+    proc = subprocess.run(
+        base + selection,
+        cwd=str(repo_root), capture_output=True, text=True, timeout=120,
+    )
+    combined = proc.stdout + proc.stderr
+    lines = [ln for ln in combined.splitlines() if ln.strip()]
+    summary = lines[-1] if lines else ""
+    return combined, collected, summary, co_out
+
+
+def _assert_clean_full_pass(combined, collected, summary, co_out):
+    import re
+
+    assert collected, f"could not derive the collected count from:\n{co_out}"
+    assert re.search(rf"\b{collected} passed\b", summary), (
+        f"expected all {collected} collected tests to pass, summary line "
+        f"{summary!r}; full output:\n{combined}"
+    )
+    assert not re.search(r"\b(error|errors|failed)\b", summary), (
+        f"summary reports errors/failures: {summary!r}\n{combined}"
+    )
+
+
 def test_surgical_relation_sets_no_longer_collides_with_test_engine_phase3():
     """#2664 site 1. Before the fix, tests/test_surgical_relation_sets.py's
     `_load_surgical()` did `sys.path.insert(0, str(SRC_ENGRAM))` (removed
@@ -336,26 +379,17 @@ def test_surgical_relation_sets_no_longer_collides_with_test_engine_phase3():
     `_load_surgical()`'s exec_module() call re-runs surgical.py's own
     top-level code fresh every time it's invoked). Measured before this
     fix: 5 passed, 53 errors. After: 58 passed, 0 errors -- this test
-    checks in that measurement so a regression at either site fails loud."""
-    repo_root = Path(__file__).resolve().parent.parent
-    proc = subprocess.run(
-        [
-            sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
-            "tests/test_surgical_relation_sets.py", "tests/test_engine_phase3.py",
-        ],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=120,
+    checks in that measurement so a regression at either site fails loud.
+    (The expected count is now derived from a --collect-only pass, not
+    pinned: \"58 passed\" above is the historical measurement.)"""
+    combined, collected, summary, co_out = _run_selection_expect_all_pass(
+        ["tests/test_surgical_relation_sets.py", "tests/test_engine_phase3.py"]
     )
-    combined = proc.stdout + proc.stderr
     assert "sys.path collision (#2565)" not in combined, (
         f"the #2664 fix regressed -- test_engine_phase3.py collided again "
         f"when run alongside test_surgical_relation_sets.py:\n{combined}"
     )
-    assert "58 passed" in combined, (
-        f"expected all 58 tests (5 + 53) to pass cleanly, got:\n{combined}"
-    )
+    _assert_clean_full_pass(combined, collected, summary, co_out)
 
 
 def test_principle_triggers_registry_no_longer_collides_with_test_engine_phase3():
@@ -377,30 +411,20 @@ def test_principle_triggers_registry_no_longer_collides_with_test_engine_phase3(
     masking is why the full-file combination stays green before AND
     after this fix (checked, not assumed) and is not itself evidence of
     anything -- the narrower selection below is. Measured before this
-    fix: 3 passed, 53 errors. After: 56 passed, 0 errors."""
-    repo_root = Path(__file__).resolve().parent.parent
-    proc = subprocess.run(
-        [
-            sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
-            "tests/test_principle_triggers_registry.py::test_concurrent_hook_and_reset_writes_lose_no_update",
-            "tests/test_principle_triggers_registry.py::test_with_state_lock_degrades_when_lockfile_open_fails",
-            "tests/test_principle_triggers_registry.py::test_with_state_lock_releases_lock_when_closure_raises",
-            "tests/test_engine_phase3.py",
-        ],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    combined = proc.stdout + proc.stderr
+    fix: 3 passed, 53 errors. After: 56 passed, 0 errors. (The expected
+    count is now derived from a --collect-only pass, not pinned.)"""
+    combined, collected, summary, co_out = _run_selection_expect_all_pass([
+        "tests/test_principle_triggers_registry.py::test_concurrent_hook_and_reset_writes_lose_no_update",
+        "tests/test_principle_triggers_registry.py::test_with_state_lock_degrades_when_lockfile_open_fails",
+        "tests/test_principle_triggers_registry.py::test_with_state_lock_releases_lock_when_closure_raises",
+        "tests/test_engine_phase3.py",
+    ])
     assert "sys.path collision (#2565)" not in combined, (
         f"the #2664 fix regressed -- test_engine_phase3.py collided again "
         f"when run alongside these 3 test_principle_triggers_registry.py "
         f"tests:\n{combined}"
     )
-    assert "56 passed" in combined, (
-        f"expected all 56 tests (3 + 53) to pass cleanly, got:\n{combined}"
-    )
+    _assert_clean_full_pass(combined, collected, summary, co_out)
 
 
 # ---------------------------------------------------------------------------

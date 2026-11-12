@@ -127,7 +127,7 @@ def test_lacking_install_sh_at_the_ref_fails_before_running_anything(tmp_path):
 
 def _next_steps(tmp_path, extra):
     env, _home = make_env(tmp_path)
-    proc = run_lib(env, ('NAME=nb; USER_NAME=agent-nb; USER_HOME=/home/agent-nb; RUNTIME=claude\n'
+    proc = run_lib(env, ('NAME=nb; USER_NAME=agent-alice; USER_HOME=/home/agent-alice; RUNTIME=claude\n'
                          'HOME_MODE=0750; ALPHA_SOURCE=/x/alpha; NO_INSTALL=0\n'
                          f'{extra}\nab_print_next_steps'))
     assert proc.returncode == 0, proc.stderr

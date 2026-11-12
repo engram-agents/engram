@@ -1,7 +1,7 @@
 p65874
 fcwd
 tDIR
-n/Users/seat/GitHub/ai-portfolio
+n/Users/seat/GitHub/some-repo
 ftxt
 tREG
 n/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python
