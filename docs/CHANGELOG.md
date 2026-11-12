@@ -45,14 +45,19 @@ v0.5.6 ship with it.
   do, and exits with code 10, "finished, with items not done".
 - **Setup rewrites an existing file in place.** The file keeps its inode, so its
   mode, owner, group, hard links, ACL entries and extended attributes stay as
-  they were. The stamped backup is saved first. A write that fails part-way puts
-  the old bytes back into the same file and prints one REFUSED line that names
-  the backup; if putting them back also fails, the line says the file may be
-  incomplete and gives the command that restores it. A kill or a power loss
-  during the write gets no put-back, so the file can be left incomplete; the
-  backup taken first restores its bytes. A file that does not exist yet is
-  created exclusively: a file that appears at that path in the meantime is
-  refused and left as it is.
+  they were (one file is an exception during a full install: `settings.json`,
+  see Known limits below). The stamped backup is saved first; a file ENGRAM
+  itself owns has no backup, and the message says so. A write that fails
+  part-way puts the old bytes back into the same file, and a failed write is
+  reported in one REFUSED line that names the backup; if putting the bytes back
+  also fails, the line says the file may be incomplete and gives the command
+  that restores it. A kill or a power loss during the write gets no put-back,
+  so the file can be left incomplete; the backup taken first restores its
+  bytes. A program that reads the file during the write can see it empty or
+  partial. A file that does not exist yet is created exclusively: a file that
+  appears at that path in the meantime is refused and left as it is, on a
+  filesystem that supports hard links; without them the new file is put in
+  place by a rename.
 
 ### Fixes
 
@@ -61,20 +66,23 @@ v0.5.6 ship with it.
   server's check for it then looked the model up by name without the pin and
   did not find it, the installer stopped at step 5 and the memory server refused
   to start. The check now asks the same question the loader asks. A machine that
-  had downloaded the model before it was pinned was not affected. The server's
-  message and the installer's remedy for a missing pinned model now name the
-  pinned download.
+  had downloaded the model before it was pinned was not affected by this fault.
+  The server's message and the installer's remedy for a missing pinned model
+  now name the pinned download.
 - **macOS: the installer's remedy for a `python3` that is too old now works as
   printed.** A versioned Homebrew Python links `python3.12` but no `python3`, so
   `brew install python@3.12` alone changed nothing. The message now adds the
   `export PATH=...` command that makes `python3` resolve to the new
-  interpreter. Measured on one Mac with Homebrew; other Python installs are not
-  covered by this message.
+  interpreter. The command lasts for that shell only, so run the installer
+  again in the same shell. Measured on one Mac with Homebrew; other Python
+  installs are not covered by this message.
 
 ### Known limits
 
-The guarantee above is about what setup does to an existing file. Two writes
-are outside it, and neither is new in this release.
+The guarantee above is about what setup itself writes to an existing file. Two
+writes are outside it. Neither comes from a change in this release: the v0.5.6
+installer runs the same Claude Code command, and v0.5.6 rewrites `config.json`
+the same way.
 
 - **`settings.json` during an install.** Setup registers the plugin with Claude
   Code's own command (`claude plugin marketplace add`), and that command
@@ -83,11 +91,10 @@ are outside it, and neither is new in this release.
   Code's write, not ENGRAM's; it was measured on one Mac with one Claude Code
   build (#4638).
 - **`config.json` while an agent runs.** ENGRAM rewrites its own `config.json`
-  at every turn advance by writing a new file and renaming it over the old one,
-  so that a concurrent reader never sees a partial file. An ACL entry or an
-  extended attribute set on the file itself is dropped by that rewrite; one that
-  the folder supplies by default is applied again. v0.5.6 behaves the same
-  (#4641).
+  at least at every turn advance, by writing a new file and renaming it over
+  the old one, so that a concurrent reader never sees a partial file. An ACL
+  entry or an extended attribute set on the file itself is dropped by that
+  rewrite; one that the folder supplies by default is applied again (#4641).
 
 ### Other changes
 
