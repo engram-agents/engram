@@ -192,6 +192,44 @@ def test_darwin_python_remedy_names_brew_python_3_12(tmp_path):
     assert "brew install python@3.12" in r.stderr
 
 
+def test_darwin_python_remedy_makes_an_unversioned_python3_resolve_to_the_new_interpreter(tmp_path):
+    """#4630: `brew install python@3.12` alone is a dead end. A versioned Homebrew formula
+    links `python3.12` but no unversioned `python3` into the Homebrew bin directory (measured
+    on one Mac); the unversioned names live in `$(brew --prefix python@3.12)/libexec/bin`. The
+    preflight runs `python3`, so the printed remedy must also put that directory first on PATH.
+    The remedy is run here, as printed, against a fake `brew`; the real behaviour needs a Mac."""
+    import re
+    import subprocess
+    sb2 = Sandbox(tmp_path)
+    _old_python(sb2)
+    _fake_uname(sb2, "Darwin")
+    r = sb2.run("--yes")
+    assert r.returncode != 0 and "FAIL: [step 1]" in r.stderr, r.all
+    assert "brew install python@3.12" in r.stderr
+    m = re.search(r'export PATH="[^"\n]*"', r.stderr)
+    assert m, "the Darwin remedy must print an `export PATH=\"...\"` command:\n" + r.stderr
+    prefix = tmp_path / "cellar" / "python@3.12"
+    (prefix / "libexec" / "bin").mkdir(parents=True)
+    new_py = prefix / "libexec" / "bin" / "python3"
+    new_py.write_text("#!/bin/sh\necho new\n")
+    new_py.chmod(0o755)
+    fakebrew = tmp_path / "fakebrew"
+    fakebrew.mkdir()
+    brew = fakebrew / "brew"
+    brew.write_text('#!/bin/sh\n[ "$1" = "--prefix" ] && [ "$2" = "python@3.12" ] && echo "%s" && exit 0\nexit 1\n' % prefix)
+    brew.chmod(0o755)
+    old = tmp_path / "oldbin"
+    old.mkdir()
+    old_py = old / "python3"
+    old_py.write_text("#!/bin/sh\necho old\n")
+    old_py.chmod(0o755)
+    out = subprocess.run(
+        ["/bin/bash", "-c", m.group(0) + '; command -v python3'],
+        env={"PATH": "%s:%s:/usr/bin:/bin" % (fakebrew, old), "HOME": str(tmp_path)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    assert out.stdout.strip() == str(new_py), (out.stdout, out.stderr, m.group(0))
+
+
 def test_linux_python_remedy_does_not_mention_brew(tmp_path):
     sb2 = Sandbox(tmp_path)
     _old_python(sb2)
