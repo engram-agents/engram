@@ -288,11 +288,39 @@
       "note": "engram-alpha#3822 (U11 Stage B): test_utility_credit_owner_write_3822.py added -- the flagged owner-write path (differential at the write, zero opens, owner-down / skew / readback / indeterminate-retry cells); the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
     {
-      "path_prefix_or_glob": "hooks/claude/engram-model-gate-stop.py",
+      "path_prefix_or_glob": "hooks/claude/engram-model-gate-pretool.py",
       "test_globs": [
-        "tests/test_model_gate_detector_4596.py"
+        "tests/test_model_gate_4596.py"
       ],
-      "note": "#4596 slice 1 model-family detector Stop hook: loaded via importlib (hyphenated name) and run as a subprocess against a temp ENGRAM_HOME (source and flattened deployed layouts), so the layer-1 AST import graph cannot trace it to a test."
+      "note": "#4596 model-family gate, write block: loaded via importlib (hyphenated name) and run as a subprocess against a temp ENGRAM_HOME (source and flattened deployed layouts), so the layer-1 AST import graph cannot trace it to a test."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-model-gate-prompt.py",
+      "test_globs": [
+        "tests/test_model_gate_4596.py"
+      ],
+      "note": "#4596 model-family gate, next-turn warning: loaded via importlib (hyphenated name) and run as a subprocess against a temp ENGRAM_HOME (source and flattened deployed layouts), so the layer-1 AST import graph cannot trace it to a test."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/_model_gatelib.py",
+      "test_globs": [
+        "tests/test_model_gate_4596.py"
+      ],
+      "note": "#4596: helper imported by the two model-gate hooks (themselves loaded via importlib)."
+    },
+    {
+      "path_prefix_or_glob": "model_gate_write_tools.json",
+      "test_globs": [
+        "tests/test_model_gate_4596.py"
+      ],
+      "note": "#4596: the generated write-tool list; C8 compares it with hooks.json and server.py's annotations."
+    },
+    {
+      "path_prefix_or_glob": "tools/gen_model_gate_write_tools.py",
+      "test_globs": [
+        "tests/test_model_gate_4596.py"
+      ],
+      "note": "#4596: generator for the write-tool list and the pretool matcher (loaded via importlib by C8)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-nap-compact-backstop-stop.py",
