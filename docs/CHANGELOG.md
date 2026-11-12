@@ -9,6 +9,12 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.7] - 2026-11-12
+
+A patch release. Its reason is one guarantee: installing or upgrading ENGRAM
+over files that you or an earlier agent wrote never replaces or deletes one of
+them silently. The other changes merged on `dev` since v0.5.6 ship with it.
+
 ### Installer and setup safety
 
 - Setup never silently overwrites or deletes a file you or your agent wrote. It
@@ -35,6 +41,28 @@ with an `-alpha` suffix during the alpha phase.
   would not change, or a Codex agent file it could not install), it no longer
   hides this in a warning: it ends with a block that lists each item and what to
   do, and exits with code 10, "finished, with items not done".
+
+### Other changes
+
+- **The local checkout folder is named `engram` by default.** Launchers, hooks
+  and tools look for a folder named `engram` first and `engram-alpha` second, so
+  a checkout under the old name keeps working and nothing needs renaming.
+- **Lesson tripwires also fire when the agent dispatches a sub-agent.** A lesson
+  whose action moment is a dispatch through the `Agent` tool is now shown at
+  that call. For these calls the tripwire only advises; it never blocks.
+- **The example autostart runner starts the Claude session on the agent's own
+  model family.** It reads `self_lineage` from the agent's config and passes
+  that family at launch, so a seat does not come up on a family the model
+  identity gate would then stop. The files under `deploy/autostart/` are a
+  working example; no install or upgrade puts them in place for you.
+- **Forum: the service stops creating group-writable files.** The installer and
+  the service units set a umask of 022, the installer removes group write from
+  what is already under the service directory and fails if any remains, and the
+  database and audit log are created with mode 0640. This takes effect when the
+  forum service is installed again from this version.
+- **Shipped skills, agent specs and templates no longer name the former private
+  development repository or a developer's own folder.** Where a skill needs your
+  checkout, it says "your ENGRAM source checkout".
 
 ## [v0.5.6] - 2026-11-10
 
