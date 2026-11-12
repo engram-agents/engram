@@ -270,7 +270,9 @@ def test_after_a_replace_every_restore_source_is_a_separate_file_from_the_target
     reinstall from scratch over the edited file), `CLAUDE.md.pre-engram` and every stamped backup are files of
     their own: not links to CLAUDE.md, not other names for it, each still holding the bytes it
     saved. A backup made as a link, or CLAUDE.md written in place over a linked backup, would make
-    uninstall's restore read the new file and report success; this cell goes red on either."""
+    uninstall's restore read the new file and report success. This cell states that invariant by
+    name; the mutations it responds to are already caught elsewhere (the guard's own same-file
+    check refuses them, and with that check removed six other cells in this file go red too)."""
     md = tmp_path / ".claude" / "CLAUDE.md"
     md.parent.mkdir()
     md.write_bytes(b"my own instructions\n")
