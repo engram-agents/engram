@@ -911,6 +911,33 @@ def test_r4_d_relative_engram_home_on_the_import_failure_path_is_unverified(home
     assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
 
 
+# -- Round 5: the MAIN path agrees with the import-failure path on a relative ENGRAM_HOME.  `_hooklib` exits
+# (SystemExit) at import on a relative home; that exit must be recorded as an import failure, not escape main().
+
+def _run_real_hook_with_home(tmp_path, home_value):
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+    env["ENGRAM_HOME"] = home_value
+    return subprocess.run([sys.executable, str(PRETOOL_FILE)], input=json.dumps(pay()), text=True,
+                          capture_output=True, env=env, cwd=str(tmp_path), timeout=60)
+
+
+def test_r5_a_relative_engram_home_on_the_main_path_is_unverified_not_silent(tmp_path):
+    (tmp_path / "rel").mkdir()
+    (tmp_path / "rel" / "config.json").write_text(json.dumps({"self_lineage": SELF}), encoding="utf-8")
+    done = _run_real_hook_with_home(tmp_path, "rel")
+    assert done.returncode == 0
+    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+    assert "helper import failed" in done.stderr
+
+
+def test_r5_b_absolute_dormant_home_on_the_main_path_stays_silent(tmp_path):
+    h = tmp_path / "abs"
+    h.mkdir()
+    (h / "config.json").write_text("{}", encoding="utf-8")
+    done = _run_real_hook_with_home(tmp_path, str(h))
+    assert (done.returncode, done.stdout) == (0, "")
+
+
 # ====================================================================== ROUND 2: helper-agent (sub-agent) calls
 # Spec section 7 (R2.1-R2.5; Kepler's rulings, Umwelt 27654).  A sub-agent's PreToolUse payload carries
 # `agent_id` and `agent_type` beside the PARENT's `session_id` and `transcript_path`.  The sub-agent's own

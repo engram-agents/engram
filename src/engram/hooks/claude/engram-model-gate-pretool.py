@@ -69,7 +69,7 @@ try:
     import _model_gatelib as _gate
     from _hooklib import engram_home_or_exit as _engram_home_or_exit
     _IMPORT_ERROR = None
-except Exception as _exc:  # noqa: BLE001 - main() reports it on stderr and still exits 0
+except (Exception, SystemExit) as _exc:  # noqa: BLE001 - `_hooklib` exits (SystemExit) at import on a relative ENGRAM_HOME; main() reports it on stderr and still exits 0
     _IMPORT_ERROR = type(_exc).__name__
 
 # Filled by _load_runtime() on first use: a dormant seat and a read tool never pay for the engram_core import.
