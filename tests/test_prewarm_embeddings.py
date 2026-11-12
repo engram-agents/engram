@@ -123,6 +123,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # ---------------------------------------------------------------------------
 
 MODEL = "all-MiniLM-L6-v2"
+# A legacy bare name that is NOT in EMBEDDING_MODEL_PINS: the by-name candidate
+# logic (clause 3) applies to it; the pinned default takes clause 3a instead
+# (see test_embedding_cache_check_pinned_revision.py).
+UNPINNED_BARE = "paraphrase-MiniLM-L6-v2"
 
 
 def _import_server():
@@ -176,7 +180,11 @@ class TestCacheMissIsFatal:
         assert MODEL in captured.err, (
             f"expected model name '{MODEL}' in stderr, got: {captured.err!r}"
         )
-        assert "SentenceTransformer" in captured.err, (
+        # The default model is pinned: the recovery command is the loader's own
+        # pinned fetch, not a by-name download (which fetches `main`, not the
+        # pin). The by-name advice stays for an unpinned model; see
+        # test_embedding_cache_check_pinned_revision.py.
+        assert "_load_model" in captured.err, (
             f"expected the pre-warm recovery command in stderr, got: {captured.err!r}"
         )
 
@@ -568,7 +576,7 @@ class TestCacheKeySlashHandling:
             server._embedding_cache_status("BAAI/bge-small-en")
             captured_repo_ids_slash = list(captured_repo_ids)
             captured_repo_ids.clear()
-            server._embedding_cache_status(MODEL)
+            server._embedding_cache_status(UNPINNED_BARE)
             captured_repo_ids_bare = list(captured_repo_ids)
 
         assert captured_repo_ids_slash == ["BAAI/bge-small-en"], (
@@ -576,8 +584,8 @@ class TestCacheKeySlashHandling:
             f"containing name, got: {captured_repo_ids_slash!r}"
         )
         assert captured_repo_ids_bare == [
-            f"sentence-transformers/{MODEL}",
-            MODEL,
+            f"sentence-transformers/{UNPINNED_BARE}",
+            UNPINNED_BARE,
         ], (
             f"expected the prefixed key probed first, then the bare key, "
             f"for a bare name, got: {captured_repo_ids_bare!r}"
@@ -813,7 +821,7 @@ class TestBareNameHitsOnPrefixedCandidate:
     def test_bare_name_hits_on_prefixed_candidate(self):
         server = _import_server()
 
-        prefixed = f"sentence-transformers/{MODEL}"
+        prefixed = f"sentence-transformers/{UNPINNED_BARE}"
         probed = []
 
         def _fake(repo_id, filename):
@@ -823,7 +831,7 @@ class TestBareNameHitsOnPrefixedCandidate:
         with mock.patch(
             "huggingface_hub.try_to_load_from_cache", side_effect=_fake
         ):
-            result = server._embedding_cache_status(MODEL)
+            result = server._embedding_cache_status(UNPINNED_BARE)
 
         assert result is True, (
             f"expected True when the prefixed candidate is cached, got "
