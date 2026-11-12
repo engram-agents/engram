@@ -238,7 +238,11 @@ def _plant_forum_url(root, ctx):
 
 def _check_forum_url(r, H, ctx):
     assert r.returncode == 0, (r.returncode, r.stderr)
-    assert (r.stdout, r.stderr) == ("written: forum.url set to http://localhost:5002\n", "")
+    # The planted config differs from the result, so the guard saves it first and prints one
+    # `  backup: <file> -> <backup>` line before the tool's own line.
+    backup_line, written_line = r.stdout.splitlines(keepends=True)
+    assert backup_line.startswith("  backup: ") and ".engram-backup." in backup_line, r.stdout
+    assert (written_line, r.stderr) == ("written: forum.url set to http://localhost:5002\n", "")
     assert json.loads((H / "config.json").read_text()) == {"forum": {"url": "http://localhost:5002"}}
 
 
@@ -455,7 +459,8 @@ def test_over_forum_url_an_explicit_config_does_not_read_the_variable(tmp_path):
     cfg.write_text("{}")
     r = subprocess.run([sys.executable, str(TOOLS / "set_forum_url.py"), "http://localhost:5002", "--config", str(cfg)],
                        cwd=w.cwd, env=_env(w.home, ENGRAM_HOME=REL), capture_output=True, text=True, timeout=120)
-    assert r.returncode == 0 and r.stdout == "written: forum.url set to http://localhost:5002\n", r
+    assert r.returncode == 0 and r.stdout.endswith("written: forum.url set to http://localhost:5002\n"), r
+    assert r.stdout.count("\n") == 2 and r.stdout.startswith("  backup: "), r  # the guard's one backup line, then the tool's
 
 
 # ----------------------------------------------------------------------------------------- the daemon's subcommands

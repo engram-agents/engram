@@ -452,12 +452,16 @@ MODE_AWARE = {
     "src/engram/engram_backup.py": "chmods the temp to the old target's mode (comment names the default-ACL case)",
     "src/engram/engram_home_registry.py": "fchmod 0o644",
     "src/forum/coordination/store_file.py": "explicit mode per callsite: 0o644 batons (read off disk by seats), 0o600 DM threads (#4501)",
-    "src/engram/tools/set_forum_url.py": "copies the old mode onto the temp",
+    "src/engram/tools/set_forum_url.py": "writes through engram_file_guard.apply_merge, which keeps the old mode",
     "src/engram/tools/dream_pickup.py": "copies the old mode onto the temp",
     "src/engram/tools/engram-pkg/engram-pkg": "explicit chmod 0o644 on both outputs",
     "src/engram/tools/lesson-pattern-audit.py": "old mode (0o640 new) and best-effort ACL",
     "tools/engramd_batch_a_acceptance.py": (
         "explicit chmod 0o644 on the --report output; a report path inside the live ENGRAM home is refused"
+    ),
+    "tools/forum_backup.py": (
+        "hand-written tmp + os.replace (no mkstemp, so G1's scan does not reach it): the temp is opened "
+        "0o640 and fchmod'd BEFORE the rename for forum.sql and .last-success.json (#4499 B1)"
     ),
     "src/engram/engram_file_guard.py": "copy_exclusive: shutil.copystat copies the source's mode onto the temp before publish (backup keeps the original's mode)",
 }

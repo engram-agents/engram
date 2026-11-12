@@ -13,6 +13,8 @@ import json
 import os
 from datetime import datetime, timezone
 
+from .fileperms import create_if_absent
+
 _VALID_ACTIONS = frozenset({"post", "reply", "edit", "patch_agent"})
 
 
@@ -72,5 +74,7 @@ def write_audit(
         )
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    # #4499: create the log 0640 if absent; appends to an existing log leave its mode.
+    create_if_absent(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")

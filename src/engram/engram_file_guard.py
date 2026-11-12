@@ -41,7 +41,9 @@ from typing import Any, Callable, Iterable, NamedTuple
 # ENGRAM's own bookkeeping files: a closed list, by file name. Setup rewrites them when they
 # differ, with no consent and no backup (they hold nothing the user or their agent wrote; the
 # install-time timestamp in first-run-pending differs on every run). A caller cannot add to it:
-# Item(owned=True) is honoured only for these names.
+# Item(owned=True) is honoured only for these names, and only when the file sits directly in the
+# ENGRAM home being set up (the `home` given to plan()). The same name in any other folder is a
+# file like any other.
 ENGRAM_OWNED_NAMES = ("first-run-pending", "seed-manifest.json")
 
 STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
@@ -83,6 +85,7 @@ class Entry(NamedTuple):
 class Plan(NamedTuple):
     entries: "tuple[Entry, ...]"
     stamp: str
+    home: "Path | None" = None  # the ENGRAM home this plan is for; the only folder where owned=True counts
 
 
 class Consent(NamedTuple):
@@ -214,8 +217,19 @@ def same_file(path: Path, other: Path) -> "tuple[str, OSError | None]":
         return UNKNOWN, e
 
 
-def plan(items: Iterable[Item], stamp: "str | None" = None) -> Plan:
-    """Check-only pass. Writes nothing and raises nothing."""
+def _is_directly_in(path: Path, home: "Path | None") -> bool:
+    """True if `path` sits directly in the folder `home` (both compared in the canonical spelling)."""
+    if home is None:
+        return False
+    return os.path.dirname(_key(path)) == os.path.realpath(os.path.abspath(os.path.expanduser(str(home))))
+
+
+def plan(items: Iterable[Item], stamp: "str | None" = None, home: "Path | None" = None) -> Plan:
+    """Check-only pass. Writes nothing and raises nothing.
+
+    `home` is the ENGRAM home being set up. Item(owned=True) counts only for a path directly in
+    it; with no `home`, nothing is treated as owned.
+    """
     stamp = stamp or utc_stamp()
     entries = []
     for it in items:
@@ -227,12 +241,12 @@ def plan(items: Iterable[Item], stamp: "str | None" = None) -> Plan:
                 state = "obstructed"
             elif verdict == UNKNOWN:
                 state, note = "unreadable", str(err)
-        if state == "differs" and it.owned and it.path.name in ENGRAM_OWNED_NAMES:
+        if state == "differs" and it.owned and it.path.name in ENGRAM_OWNED_NAMES and _is_directly_in(it.path, home):
             state = "owned"
-        backup =_next_backup_name(it.path, stamp) if state == "differs" else None
+        backup = _next_backup_name(it.path, stamp) if state == "differs" else None
         first = _first_backup_name(it.path, it.first_identity) if state == "differs" else None
         entries.append(Entry(it.path, it.new_text, state, backup, first, it.first_identity, it.owned, note))
-    return Plan(tuple(entries), stamp)
+    return Plan(tuple(entries), stamp, home)
 
 
 def _canon(path: Path) -> Path:
@@ -536,7 +550,7 @@ def apply(p: Plan, consent: Consent = NO_CONSENT, context: str = "",
     in ENGRAM_OWNED_NAMES that differs is rewritten with no consent and no backup.
     """
     saved = saved or {}
-    fresh = plan([Item(e.path, e.new_text, e.first_identity, e.owned) for e in p.entries], p.stamp)
+    fresh = plan([Item(e.path, e.new_text, e.first_identity, e.owned) for e in p.entries], p.stamp, p.home)
     msg = refusal(fresh, consent, context)
     if msg is not None:
         raise Refused(msg)
@@ -643,8 +657,24 @@ def _strict_loads(text: str, filename: str) -> Any:
     return json.loads(text, object_pairs_hook=pairs, parse_float=number, parse_constant=constant)
 
 
-def merge_json_text(filename: str, existing: "str | None", changes: "dict[str, Any]") -> str:
+def _drop_path(doc: dict, parts: "list[str]") -> None:
+    node: Any = doc
+    for part in parts[:-1]:
+        node = node.get(part) if isinstance(node, dict) else None
+    if isinstance(node, dict):
+        node.pop(parts[-1], None)
+
+
+def merge_json_text(filename: str, existing: "str | None", changes: "dict[str, Any]",
+                    replace_non_object: bool = False) -> str:
     """Return `existing` (None = absent file) with the owned keys in `changes` set. Pure.
+
+    `replace_non_object=True` is the caller saying the user agreed (their yes) to replace a
+    parent value that is not an object (for "forum.url": a `forum` that holds a string or a
+    number) with an object. Without it that case is refused. An explicit null parent counts as
+    absent and needs no flag. The only caller that passes True is set_forum_url, on its --force
+    path (a cell in tests/test_never_clobber_contract.py pins that). The replaced value survives only
+    in the stamped backup that apply_merge takes before it writes.
 
     Raises MergeRefused if `filename` has no owned keys, if `changes` names a key that is not
     owned, if `existing` does not parse as a JSON object, if it holds a duplicate key or a
@@ -676,33 +706,48 @@ def merge_json_text(filename: str, existing: "str | None", changes: "dict[str, A
         if not isinstance(doc, dict):
             raise MergeRefused(f"{filename} holds JSON {type(doc).__name__}, not an object; nothing repairs it")
     before = json.loads(json.dumps(doc))
+    replaced: "list[list[str]]" = []  # parents the caller agreed to replace; compared apart below
     for key, value in changes.items():
         parts = key.split(".")
         node = doc
-        for part in parts[:-1]:
+        for i, part in enumerate(parts[:-1]):
             if part not in node:
                 node[part] = {}
+            elif node[part] is None:
+                # An explicit null holds nothing the user wrote: it counts as absent. The stamped
+                # backup taken before the write still keeps the file as it was.
+                node[part] = {}
+                replaced.append(parts[: i + 1])
             elif not isinstance(node[part], dict):
-                raise MergeRefused(
-                    f"{filename}: '{part}' is not an object, so {key} cannot be set without changing it"
-                )
+                if not replace_non_object:
+                    raise MergeRefused(
+                        f"{filename}: '{part}' is not an object, so {key} cannot be set without changing it"
+                    )
+                node[part] = {}
+                replaced.append(parts[: i + 1])
             node = node[part]
         node[parts[-1]] = value
     if existing is not None and doc == before:
         return existing
-    if json.dumps(_without_owned(before, owned)) != json.dumps(_without_owned(doc, owned)):
+    cmp_before, cmp_after = json.loads(json.dumps(before)), json.loads(json.dumps(doc))
+    for parts in replaced:
+        _drop_path(cmp_before, parts)
+        _drop_path(cmp_after, parts)
+    if json.dumps(_without_owned(cmp_before, owned)) != json.dumps(_without_owned(cmp_after, owned)):
         raise MergeRefused(f"{filename}: the merge would change a key that is not ENGRAM's; nothing was written")
     indent = json_indent(existing) if existing else 2
     return json.dumps(doc, indent=indent, ensure_ascii=False) + "\n"
 
 
 def apply_merge(path: Path, changes: "dict[str, Any]", *, filename: "str | None" = None,
-                new_mode: int = 0o600, stamp: "str | None" = None) -> str:
+                new_mode: int = 0o600, stamp: "str | None" = None,
+                replace_non_object: bool = False) -> str:
     """Merge the owned keys in `changes` into the JSON file at `path`. Returns what happened:
     "created" (file was absent), "merged" (stamped backup taken, then written atomically,
     keeping the file's mode and a symlink in place) or "unchanged" (nothing written, no backup).
     Raises MergeRefused, with the file untouched, for anything merge_json_text refuses and for a
-    dangling link, a non-regular file or an unreadable file.
+    dangling link, a non-regular file or an unreadable file. `replace_non_object` is passed on
+    to merge_json_text; the stamped backup is taken first either way.
     """
     name = filename or path.name
     if is_dangling_symlink(path):
@@ -718,7 +763,7 @@ def apply_merge(path: Path, changes: "dict[str, Any]", *, filename: "str | None"
             raise MergeRefused(f"cannot read {path} ({e})") from e
         except UnicodeDecodeError as e:
             raise MergeRefused(f"{path} is not valid UTF-8 text ({e}); nothing repairs a broken file") from e
-    new_text = merge_json_text(name, existing, changes)
+    new_text = merge_json_text(name, existing, changes, replace_non_object)
     if existing is None:
         real.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(real, new_text, new_mode)

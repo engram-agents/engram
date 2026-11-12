@@ -502,6 +502,297 @@ def test_install_local_marketplace_installs_codex_agent_toml(tmp_path):
     assert '[mcp_servers.engram]' not in installed_text
 
 
+_AGENT_NAME = "engram-probe-fairy.toml"
+_AGENT_WRITTEN = (
+    'name = "engram-probe-fairy"\n'
+    'description = "Probe"\n'
+    'developer_instructions = "Probe"\n'
+    '[plugins."engram@engram-local".mcp_servers.engram]\n'
+    'enabled_tools = ["engram_query"]\n'
+)
+
+
+def _run_codex_agent_install(tmp_path, existing=None, check=True):
+    """Run the real installer for the codex target against a fake plugin that ships one agent file.
+    `existing` is a callable(agents_dir) that plants whatever sits in $CODEX_HOME/agents beforehand.
+    `check=False` lets a cell look at a non-zero exit (code 10: finished, with items not done)."""
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="codex", codex_agent=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    codex = fake_bin / "codex"
+    codex.write_text("#!/usr/bin/env bash\nprintf 'fake codex %s\\n' \"$*\"\n")
+    codex.chmod(0o755)
+    codex_home = tmp_path / "codex-home"
+    agents_dir = codex_home / "agents"
+    agents_dir.mkdir(parents=True)
+    if existing is not None:
+        existing(agents_dir)
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root, CODEX_HOME=codex_home,
+                 PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}"),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check,
+    )
+    return result, agents_dir
+
+
+def _agent_backups(agents_dir):
+    return sorted(p for p in agents_dir.iterdir() if ".engram-backup." in p.name)
+
+
+def test_codex_agent_file_that_differs_is_backed_up_and_the_backup_is_printed(tmp_path):
+    """An existing engram-*.toml that differs from what would be written may hold the user's edits:
+    it is saved to a stamped backup before it is replaced, and ONE printed line names the file and
+    its backup. No question is asked (these are ENGRAM's own file names)."""
+    mine = b'name = "engram-probe-fairy"\ndescription = "edited by the user, keep me"\n'
+    result, agents = _run_codex_agent_install(tmp_path, lambda d: (d / _AGENT_NAME).write_bytes(mine))
+    backups = _agent_backups(agents)
+    assert len(backups) == 1 and backups[0].read_bytes() == mine, "the user's bytes were not kept in a backup"
+    assert (agents / _AGENT_NAME).read_text() == _AGENT_WRITTEN
+    lines = [ln for ln in result.stdout.splitlines() if "backup:" in ln and _AGENT_NAME in ln]
+    assert len(lines) == 1, "expected exactly one printed backup line for the file:\n" + result.stdout
+    assert str(agents / _AGENT_NAME) in lines[0] and str(backups[0]) in lines[0], lines[0]
+    # control: the line filter above does find a backup line when one is planted in the same shape
+    planted = f"  backup: {agents / _AGENT_NAME} -> {backups[0]}"
+    assert [ln for ln in [planted] if "backup:" in ln and _AGENT_NAME in ln] == [planted]
+
+
+def test_upgrade_skill_tells_the_agent_to_show_the_codex_backup_lines():
+    """The Codex agent-file replace asks no question and exits 0, so the printed `backup:` line is the
+    only trace. The upgrade skill's Step 3 (what an agent upgrading a seat reads) must tell the agent
+    to show the user every such line."""
+    text = (REPO_ROOT / "src" / "engram" / "skills" / "claude" / "engram-upgrade" / "SKILL.md").read_text()
+    step3 = text[text.index("## Step 3"):text.index("## Step 4")]
+    assert "show the user every `backup:` line" in step3, "Step 3 lost the instruction to relay the Codex backup lines"
+
+
+def test_codex_agent_file_that_is_new_or_identical_gets_no_backup(tmp_path):
+    result, agents = _run_codex_agent_install(tmp_path)  # absent: written
+    assert (agents / _AGENT_NAME).read_text() == _AGENT_WRITTEN
+    assert _agent_backups(agents) == [] and "backup:" not in result.stdout
+
+def test_codex_agent_file_identical_to_what_would_be_written_is_not_touched(tmp_path):
+    planted = {}
+
+    def plant(d):
+        (d / _AGENT_NAME).write_text(_AGENT_WRITTEN)
+        planted["mtime"] = (d / _AGENT_NAME).stat().st_mtime_ns
+
+    result, agents = _run_codex_agent_install(tmp_path, plant)
+    assert _agent_backups(agents) == [] and "backup:" not in result.stdout
+    assert (agents / _AGENT_NAME).stat().st_mtime_ns == planted["mtime"], "an identical file was rewritten"
+
+
+def _not_done_block(stdout):
+    """The lines of the end block (from its ITEMS NOT DONE heading to the end of the output)."""
+    lines = stdout.splitlines()
+    at = [i for i, ln in enumerate(lines) if "ITEMS NOT DONE" in ln]
+    assert len(at) == 1, "expected exactly one ITEMS NOT DONE block:\n" + stdout
+    return lines[at[0]:]
+
+
+_CODE_10_LINE = "Exit code 10 means: finished, with items not done."
+
+
+def test_codex_agent_name_that_is_not_a_file_is_left_alone_and_listed_in_the_end_block(tmp_path):
+    """A Codex agent file that cannot be installed does not stop the run and is not a bare warning:
+    the run finishes, ends with a block listing the item and what to do, and exits 10."""
+    result, agents = _run_codex_agent_install(tmp_path, lambda d: (d / _AGENT_NAME).mkdir(), check=False)
+    assert (agents / _AGENT_NAME).is_dir() and not list((agents / _AGENT_NAME).iterdir())
+    assert _agent_backups(agents) == []
+    assert result.returncode == 10, (result.returncode, result.stdout, result.stderr)
+    block = "\n".join(_not_done_block(result.stdout))
+    assert "Codex custom-agent files were not all installed" in block and str(agents) in block
+    assert "What to do:" in block and "--target codex" in block
+    assert _CODE_10_LINE in block
+    # the run went past the item: the later steps ran, and the block is the LAST thing printed
+    assert "Codex marketplace installed/updated" in result.stdout
+    assert result.stdout.rstrip().endswith(_CODE_10_LINE)
+
+
+def _scratch_repo_for_a_full_run(tmp_path):
+    """A scratch repo whose installer runs WITHOUT --skip-build: a stub build-plugin.sh and the file guard."""
+    repo = _make_scratch_repo(tmp_path)
+    (repo / "tools" / "build-plugin.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (repo / "tools" / "build-plugin.sh").chmod(0o755)
+    shutil.copy(REPO_ROOT / "src" / "engram" / "engram_file_guard.py", repo / "src" / "engram" / "engram_file_guard.py")
+    return repo
+
+
+def _full_run(repo, tmp_path, config_bytes):
+    engram_home = tmp_path / "engram-home"
+    engram_home.mkdir()
+    (engram_home / "config.json").write_bytes(config_bytes)
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(repo / "tools" / "install-local-marketplace.sh"), "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=repo, env=_env(engram_home, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    return result, engram_home
+
+
+def test_install_tier_persist_refusal_does_not_stop_the_run_and_exits_10_with_the_block(tmp_path):
+    """The persist step refuses a config it cannot merge (here a duplicate key, which the earlier plain
+    read accepts). The run continues to the end, then lists the item and exits 10."""
+    repo = _scratch_repo_for_a_full_run(tmp_path)
+    content = b'{"install_tier": "dev", "install_tier": "essential"}'
+    result, home = _full_run(repo, tmp_path, content)
+    assert result.returncode == 10, (result.returncode, result.stdout, result.stderr)
+    assert (home / "config.json").read_bytes() == content
+    assert [p.name for p in home.iterdir() if ".engram-backup." in p.name] == []
+    assert (home / ".deployed-version").is_file() and (home / "marketplace" / ".claude-plugin" / "marketplace.json").is_file(), \
+        "the run stopped before the end"
+    block = "\n".join(_not_done_block(result.stdout))
+    assert "install_tier was not saved to" in block and str(home / "config.json") in block
+    assert "more than once" in block, "the block must carry the reason the guard gave"
+    assert "What to do:" in block and _CODE_10_LINE in block
+    assert result.stdout.rstrip().endswith(_CODE_10_LINE)
+    # the reason is also printed where it happened (not only in the block)
+    assert "config.json left unchanged" in result.stderr
+
+
+def test_a_clean_full_run_exits_0_with_no_block(tmp_path):
+    """Control for the two cells above: the same run with a config the guard can merge exits 0 and
+    prints no block, so the block and the code are not just always there."""
+    repo = _scratch_repo_for_a_full_run(tmp_path)
+    result, home = _full_run(repo, tmp_path, b'{"install_tier": "dev"}')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "ITEMS NOT DONE" not in result.stdout and "Exit code 10" not in result.stdout
+
+
+def _trap_block():
+    """The installer's own text from `_venv_fail=0` through `trap _exit_trap EXIT` (the not-done
+    collector, the end block and the exit trap), so these cells run the shipped code, not a copy."""
+    lines = INSTALLER.read_text().splitlines()
+    start = lines.index("_venv_fail=0")
+    end = lines.index("trap _exit_trap EXIT")
+    return "\n".join(lines[start:end + 1])
+
+
+def _bashes():
+    """bash from PATH, plus /bin/bash when it is a different program (macOS ships bash 3.2 there)."""
+    found = [shutil.which("bash")]
+    if Path("/bin/bash").exists() and (not found[0] or not os.path.samefile("/bin/bash", found[0])):
+        found.append("/bin/bash")
+    return [b for b in found if b]
+
+
+def _run_trap(bash, body):
+    script = "set -euo pipefail\nlog() { printf '[ilm] %s\\n' \"$*\"; }\n" + _trap_block() + "\n" + body + "\n"
+    return subprocess.run([bash, "-c", script], capture_output=True, text=True, check=False)
+
+
+_ONE_ITEM = 'not_done "an item" "do a thing"'
+
+
+@pytest.mark.parametrize("bash", _bashes())
+def test_exit_trap_keeps_a_failure_code_over_10(bash):
+    """Precedence in the exit trap: an item collected and then a later failure keeps that failure's
+    code (10 only replaces a clean 0), and the block is still printed, without the code-10 line."""
+    result = _run_trap(bash, _ONE_ITEM + "\nexit 3")
+    assert result.returncode == 3, (result.returncode, result.stdout, result.stderr)
+    assert "ITEMS NOT DONE (1)" in result.stdout and "an item" in result.stdout
+    assert "Exit code 10" not in result.stdout
+
+
+@pytest.mark.parametrize("bash", _bashes())
+def test_exit_trap_venv_failure_wins_over_10(bash):
+    """A venv provisioning failure exits 1 even with items collected and a clean 0 underneath, and
+    the code-10 line is not printed (it would describe the wrong code)."""
+    result = _run_trap(bash, _ONE_ITEM + "\n_venv_fail=1\nexit 0")
+    assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+    assert "ITEMS NOT DONE (1)" in result.stdout and "venv runtime-requirements provisioning failed" in result.stdout
+    assert "Exit code 10" not in result.stdout
+
+
+@pytest.mark.parametrize("bash", _bashes())
+def test_exit_trap_clean_exit_with_an_item_is_10_and_no_item_is_0(bash):
+    """Controls for the two cells above: the same harness gives 10 (with the code-10 line) for an
+    item over a clean exit, and 0 with no block when nothing was collected."""
+    with_item = _run_trap(bash, _ONE_ITEM + "\nexit 0")
+    assert with_item.returncode == 10 and _CODE_10_LINE in with_item.stdout, with_item.stdout
+    nothing = _run_trap(bash, "exit 0")
+    assert nothing.returncode == 0 and "ITEMS NOT DONE" not in nothing.stdout, nothing.stdout
+
+
+@pytest.mark.parametrize("bash", _bashes())
+def test_end_block_lists_items_with_no_extra_empty_line(bash):
+    """The item list in the end block is followed by exactly one empty line under every bash on the
+    machine, including macOS /bin/bash 3.2 (which does not expand $'\\n' inside a heredoc body)."""
+    result = _run_trap(bash, _ONE_ITEM + '\nnot_done "a second item" "do another thing"\nexit 0')
+    block = _not_done_block(result.stdout)
+    texts = [ln.removeprefix("[ilm]").strip() for ln in block]
+    last_item = max(i for i, t in enumerate(texts) if t.startswith("What to do:"))
+    assert texts[last_item + 1] == "" and texts[last_item + 2].startswith("Show this list"), \
+        (bash, "\n".join(block))
+
+
+def test_help_documents_exit_code_10():
+    out = subprocess.run(["bash", str(INSTALLER), "--help"], capture_output=True, text=True).stdout
+    assert "Exit codes:" in out and "10   finished, WITH ITEMS NOT DONE" in out
+    assert "not a retry signal" in out
+    assert "# EXIT CODES:" in INSTALLER.read_text(), "the script header must document the code too"
+
+
+def _persist_tier_block():
+    """The python code of install-local-marketplace.sh's install_tier persist block."""
+    text = INSTALLER.read_text()
+    blocks = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "<<'PY'" in line:
+            body = []
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip() == "PY":
+                    break
+                body.append(lines[j])
+            code = "\n".join(body)
+            if "install_tier" in code and "apply_merge" in code:
+                blocks.append(code)
+    assert len(blocks) == 1, "the install_tier persist block moved or vanished"
+    return blocks[0]
+
+
+def _run_persist(tmp_path, content, tier):
+    cfg = tmp_path / "config.json"
+    cfg.write_bytes(content)
+    proc = subprocess.run(
+        [sys.executable, "-c", _persist_tier_block(), str(cfg), tier, str(REPO_ROOT / "src" / "engram")],
+        capture_output=True, text=True,
+    )
+    return proc, cfg
+
+
+def test_persisted_install_tier_is_merged_with_a_stamped_backup_first(tmp_path):
+    old = json.dumps({"z": 1, "install_tier": "dev", "a": {"k": [1, 2]}}, indent=2).encode() + b"\n"
+    proc, cfg = _run_persist(tmp_path, old, "convenience")
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(cfg.read_text())
+    assert data["install_tier"] == "convenience" and data["a"] == {"k": [1, 2]} and list(data) == ["z", "install_tier", "a"]
+    backups = [p for p in tmp_path.iterdir() if ".engram-backup." in p.name]
+    assert len(backups) == 1 and backups[0].read_bytes() == old
+
+
+def test_persisted_install_tier_that_is_already_stored_writes_and_backs_up_nothing(tmp_path):
+    old = b'{"install_tier":   "dev",  "note": "odd spacing is kept"}'
+    proc, cfg = _run_persist(tmp_path, old, "dev")
+    assert proc.returncode == 0, proc.stderr
+    assert cfg.read_bytes() == old
+    assert [p.name for p in tmp_path.iterdir()] == ["config.json"]
+
+
+@pytest.mark.parametrize("content", [b"{not json", b'{"install_tier": "dev", "install_tier": "essential"}', b"[1]"])
+def test_persisted_install_tier_never_repairs_a_config_it_cannot_merge(tmp_path, content):
+    proc, cfg = _run_persist(tmp_path, content, "convenience")
+    assert proc.returncode != 0 and "left unchanged" in proc.stderr
+    assert cfg.read_bytes() == content
+    assert [p.name for p in tmp_path.iterdir()] == ["config.json"]
+
+
 def test_install_local_marketplace_preserves_prior_codex_cache_across_dev_upgrades(tmp_path):
     """Keep each active cache path alive even when Codex removes its cache root."""
     build_root = tmp_path / "build" / "plugin"

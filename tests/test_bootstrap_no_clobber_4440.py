@@ -648,7 +648,8 @@ def test_codex_hard_link_at_backup_path_is_refused_even_with_force(tmp_path):
 
 def test_install_sh_passes_force_only_when_claude_md_exists_after_consent():
     """(Name kept from the original cell.) install.sh passes `--replace "$CLAUDE_MD"` (yes to
-    that one file), never `--force` (yes to every path), and only after the consent/backup step."""
+    that one file), never `--force` (yes to every path), and only after the question (the installer
+    makes no copy of its own; bootstrap's guard makes the backups)."""
     sh = INSTALL_SH.read_text()
     # Every bootstrap invocation takes its args from one array variable ...
     calls = re.findall(r'"\$VENV_PY" "\$PLUGIN_ROOT/bootstrap\.py"([^\n]*)', sh)
@@ -659,12 +660,13 @@ def test_install_sh_passes_force_only_when_claude_md_exists_after_consent():
     code = "\n".join(ln for ln in sh.splitlines() if not ln.lstrip().startswith("#"))
     assert "--force" not in code
     # ... and the array is set to `--replace "$CLAUDE_MD"` in exactly one place, inside the
-    # existing-CLAUDE.md branch, after the consent/backup `fail` guard and the backup copy.
+    # existing-CLAUDE.md branch, after the consent `fail` guard (no copy of the file is made here).
     assigns = [m.start() for m in re.finditer(r'_bootstrap_flags=\(--replace "\$CLAUDE_MD"\)', sh)]
     assert len(assigns) == 1
+    assert 'cp -p "$CLAUDE_MD"' not in code
     default = sh.index('_bootstrap_flags=()')
-    consent = sh.index('exists and was not backed up')
-    note = sh.index("printf '[step 6] CLAUDE.md: %s\\n'")
+    consent = sh.index('exists and was not replaced')
+    note = sh.index("printf '[step 6] CLAUDE.md: %s will be replaced after bootstrap saves")
     assert default < consent < assigns[0] < note
     first_call = sh.index('"$VENV_PY" "$PLUGIN_ROOT/bootstrap.py"')
     assert note < first_call

@@ -48,10 +48,11 @@ Environment=FORUM_BACKUP_DIR={{FORUM_HOME}}/backup
 # (repeatable); they render as real ExecStart flags just below. The installer
 # refuses to replace a unit that already carries a map unless you pass them again.
 # PROPOSED location (not yet chosen by the admin): /etc/engram-forum/baton-login-map.json
-# Group-writable file creation (664/775) so a counterpart admin in the shared
-# group can also read/write the DB + audit log it creates. Without this, files
-# land 644 and a covering agent's writes fail (HTTP 500 on every mutation).
-UMask=002
+# No group write (#4498/#4499): files the service creates land 644 / dirs 755. The
+# DB and the audit log are created 0640 by the service itself (forum/fileperms.py),
+# and dm/ owner-only, so a covering admin READS through the group and takes over by
+# an explicit owner change, never by group write.
+UMask=0022
 # GitHub identity for the baton gate (#3283): a dedicated READ-ONLY token, never
 # the service user's own gh login. The admin installs a root-owned 0640 file
 # holding one `GH_TOKEN=...` line OUTSIDE any group-readable shared tree
