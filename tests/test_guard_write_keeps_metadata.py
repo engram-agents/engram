@@ -250,6 +250,62 @@ def test_a_new_file_that_fails_mid_write_leaves_nothing(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_a_file_that_appears_after_the_check_is_refused_not_overwritten(tmp_path, monkeypatch):
+    """The plan found nothing at the path; by the time of the write someone has put a file
+    there. It is not ENGRAM's and has no backup, so it is refused and left as it is."""
+    target = tmp_path / "CLAUDE.md"
+    real_plan = fg.plan
+
+    def plan_then_someone_writes(items, *a, **kw):
+        p = real_plan(items, *a, **kw)
+        if not target.exists():
+            target.write_text("someone else's\n")
+        return p
+
+    monkeypatch.setattr(fg, "plan", plan_then_someone_writes)
+    with pytest.raises(SystemExit) as got:
+        fg.apply(real_plan([fg.Item(target, "new\n")], STAMP))
+    assert "appeared" in str(got.value) and "owns" not in str(got.value), str(got.value)
+    assert target.read_text() == "someone else's\n" and _backups(target) == []
+
+
+def test_ctrl_c_mid_write_puts_the_old_bytes_back_and_stops(tmp_path, monkeypatch):
+    name, text, writer = WRITERS["apply"]
+    path = tmp_path / name
+    path.write_text(text)
+    before = _meta(path)
+    real = fg._write_all
+    calls = []
+
+    def interrupted(fd, data):
+        calls.append(len(data))
+        if len(calls) == 1:
+            os.write(fd, data[: len(data) // 2])
+            raise KeyboardInterrupt
+        real(fd, data)
+
+    monkeypatch.setattr(fg, "_write_all", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        writer(path)
+    assert path.read_text() == text and _meta(path) == before
+    assert len(_backups(path)) == 1
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can write a read-only file")
+def test_a_read_only_file_is_refused_unchanged_and_the_line_names_the_backup(tmp_path):
+    """A rename could replace a read-only file; an in-place write cannot (as at v0.5.6). The run
+    refuses with the file and its mode untouched and the backup named."""
+    name, text, writer = WRITERS["apply"]
+    path = tmp_path / name
+    path.write_text(text)
+    os.chmod(path, 0o444)
+    with pytest.raises(SystemExit) as got:
+        writer(path)
+    backups = _backups(path)
+    assert path.read_text() == text and os.stat(path).st_mode & 0o777 == 0o444
+    assert len(backups) == 1 and str(backups[0]) in str(got.value) and "not changed" in str(got.value)
+
+
 def test_apply_merge_creates_a_new_config_exclusively(tmp_path):
     path = tmp_path / "config.json"
     assert fg.apply_merge(path, {"install_tier": "dev"}, filename="config.json", new_mode=0o600) == "created"

@@ -434,18 +434,23 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise SystemExit(f"[bootstrap] REFUSED: {path} is not a regular file, so it was not written. {saved}")
         old = b""
-        while chunk := os.read(fd, 1 << 20):
-            old += chunk
+        try:
+            while chunk := os.read(fd, 1 << 20):
+                old += chunk
+        except OSError as e:
+            raise SystemExit(f"[bootstrap] REFUSED: could not read {path} before writing it ({e}); it was not changed. {saved}")
         try:
             _replace_contents(fd, text.encode("utf-8"))
-        except OSError as e:
+        except BaseException as e:  # Ctrl-C too: put the old bytes back, then let it go on
             try:
                 _replace_contents(fd, old)
-            except OSError as e2:
+            except BaseException as e2:
                 raise SystemExit(
-                    f"[bootstrap] REFUSED: could not write {path} ({e}), and putting its previous "
-                    f"contents back also failed ({e2}), so it may be incomplete. {restore}"
+                    f"[bootstrap] REFUSED: could not write {path} ({e!r}), and putting its previous "
+                    f"contents back also failed ({e2!r}), so it may be incomplete. {restore}"
                 )
+            if not isinstance(e, OSError):
+                raise
             raise SystemExit(
                 f"[bootstrap] REFUSED: could not write {path} ({e}); its previous contents were "
                 f"put back. {saved}"
@@ -572,26 +577,27 @@ def save_backup(path: Path, first_identity: bool, stamp: str) -> Path:
     return _copy_to_free_name(path, lambda: _next_backup_name(path, stamp))
 
 
-def _write(path: Path, text: str, backup: "Path | None" = None) -> None:
+def _write(path: Path, text: str, backup: "Path | None" = None, *, new: bool = False) -> None:
     """Write `text` over/into `path`, keeping a symlink in place (its target is written).
 
-    An existing file is rewritten IN PLACE (write_in_place), never by temp file + rename: a
-    rename replaces the inode, which silently drops the file's ACL and extended attributes
-    (and its owner, group and other hard links). The stamped backup `backup` was saved before
-    this runs. A new file is created exclusively and all at once (create_exclusive).
+    `new` is what the check found: nothing at `path`. Then the file is created exclusively and
+    all at once (create_exclusive), and anything that appeared there since is refused, never
+    overwritten. Otherwise the existing file is rewritten IN PLACE (write_in_place), never by
+    temp file + rename: a rename replaces the inode, which silently drops the file's ACL and
+    extended attributes (and its owner, group and other hard links). The stamped backup
+    `backup` was saved before this runs.
     """
-    target = Path(os.path.realpath(path)) if path.is_symlink() else path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target_present(target):
-        write_in_place(target, text, backup)
+    if not new:
+        write_in_place(Path(os.path.realpath(path)) if path.is_symlink() else path, text, backup)
         return
+    path.parent.mkdir(parents=True, exist_ok=True)
     old = os.umask(0)
     os.umask(old)
     try:
-        create_exclusive(target, text, 0o666 & ~old)
+        create_exclusive(path, text, 0o666 & ~old)
     except FileExistsError:
         raise SystemExit(
-            f"[bootstrap] REFUSED: something appeared at {target} after the check, so nothing was "
+            f"[bootstrap] REFUSED: something appeared at {path} after the check, so nothing was "
             f"written there. Look at it, move it aside if it is not yours to keep, then re-run."
         )
 
@@ -652,7 +658,7 @@ def apply(p: Plan, consent: Consent = NO_CONSENT, context: str = "",
         if e.new_text is None:
             os.unlink(e.path)
         else:
-            _write(e.path, e.new_text, backups.get(_key(e.path)))
+            _write(e.path, e.new_text, backups.get(_key(e.path)), new=e.state == "absent")
         written.append(e.path)
     return written
 
