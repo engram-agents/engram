@@ -47,17 +47,18 @@ v0.5.6 ship with it.
   mode, owner, group, hard links, ACL entries and extended attributes stay as
   they were (one file is an exception during a full install: `settings.json`,
   see Known limits below). The stamped backup is saved first; a file ENGRAM
-  itself owns has no backup, and the message says so. A write that fails
-  part-way puts the old bytes back into the same file, and a failed write is
-  reported in one REFUSED line that names the backup; if putting the bytes back
-  also fails, the line says the file may be incomplete and gives the command
-  that restores it. A kill or a power loss during the write gets no put-back,
-  so the file can be left incomplete; the backup taken first restores its
-  bytes. A program that reads the file during the write can see it empty or
-  partial. A file that does not exist yet is created exclusively: a file that
-  appears at that path in the meantime is refused and left as it is, on a
-  filesystem that supports hard links; without them the new file is put in
-  place by a rename.
+  itself owns has no backup, and a refusal for such a file says so. A write
+  that fails part-way puts the old bytes back into the same file. When the
+  failure is an error from the system, it is reported in one REFUSED line that
+  names the backup; an interruption such as Ctrl-C gets the same put-back and
+  then ends the run without that line. If putting the bytes back also fails,
+  the line says the file may be incomplete and gives the command that restores
+  it. A kill or a power loss during the write gets no put-back, so the file can
+  be left incomplete; the backup taken first restores its bytes. A program that
+  reads the file during the write can see it empty or partial. A file that does
+  not exist yet is created exclusively: a file that appears at that path in the
+  meantime is refused and left as it is, on a filesystem that supports hard
+  links; without them the new file is put in place by a rename.
 
 ### Fixes
 
