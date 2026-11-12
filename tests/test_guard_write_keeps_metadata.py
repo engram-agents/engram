@@ -305,7 +305,28 @@ def test_a_failed_rewrite_whose_put_back_also_fails_says_so_and_names_the_backup
     msg = str(got.value)
     backups = _backups(path)
     assert len(backups) == 1 and backups[0].read_text() == text, "the backup is intact"
-    assert "may be incomplete" in msg and str(backups[0]) in msg and "cp -p" in msg, msg
+    assert "may be incomplete" in msg and str(backups[0]) in msg and "Restore it with: " in msg, msg
+
+
+def test_the_restore_command_in_the_message_keeps_the_acl_and_xattr(tmp_path, monkeypatch):
+    """The backup carries bytes, mode and mtime, not the ACL or xattrs, so the command the
+    message gives must restore INTO the file (same inode), not replace its metadata with the
+    backup's. Runs the printed command as written."""
+    name, text, writer = WRITERS["apply"]
+    path = tmp_path / name
+    path.write_text(text)
+    entry = _plant_acl(path)
+    _set_xattr(path)
+    before = _meta(path)
+    _fail_first_write(monkeypatch, then_fail_again=True)
+    with pytest.raises(SystemExit) as got:
+        writer(path)
+    monkeypatch.undo()
+    command = str(got.value).split("Restore it with: ", 1)[1].strip()
+    subprocess.run(["/bin/sh", "-c", command], check=True)
+    assert path.read_text() == text
+    assert _meta(path) == before
+    assert entry in _acl_entries(path) and _get_xattr(path) == b"kept"
 
 
 def test_a_failed_rewrite_of_an_owned_file_says_there_is_no_backup(tmp_path, monkeypatch):

@@ -410,13 +410,20 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     loss) during the write gets no put-back and prints nothing, so the file can be left
     incomplete; the backup saved before the write is then the copy to restore from.
 
-    The open does not follow a link (O_NOFOLLOW: a link put at `path` after the check is
-    refused, not written through) and does not wait on a FIFO (O_NONBLOCK); anything that is
-    not a regular file is refused before a byte is written.
+    The put-back writes into the same inode too, so the ACL and xattrs survive a FAILED write,
+    not only a successful one. The backup does not carry them (see the module docstring), so
+    the restore command given is `cat backup > path`, which writes into the same inode: `cp -p`
+    would replace the file's ACL and xattrs with the backup's (none; measured on macOS).
+
+    The caller passes a path already resolved with realpath; the open does not follow a link
+    (O_NOFOLLOW is hardening on this final open: a link put there after the check is refused,
+    not written through; symlinked targets still work because they were resolved first) and
+    does not wait on a FIFO (O_NONBLOCK); anything that is not a regular file is refused before
+    a byte is written.
     """
     if backup is not None:
         saved = f"A copy of it from before this run is at {backup}."
-        restore = f"Restore it with: cp -p '{backup}' '{path}'"
+        restore = f"Restore it with: cat '{backup}' > '{path}'"
     else:
         saved = restore = "ENGRAM owns this file and keeps no backup of it; re-run setup to write it again."
     try:
