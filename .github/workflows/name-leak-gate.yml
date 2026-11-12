@@ -72,8 +72,9 @@ jobs:
     #
     # Running on every `edited` re-scans the current base...head diff and
     # reproduces the true verdict, so it can neither mask a red nor invent a
-    # green. The cost is one runner start per title or body edit, measured at
-    # about 11 seconds, which bills as one minute.
+    # green. The cost is one runner start per title or body edit, about 11
+    # seconds of wall time. It is not a billing cost: this repository is
+    # public, so standard Actions minutes are free.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
