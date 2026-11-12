@@ -255,11 +255,15 @@ def decide(payload, home):
 
 
 def _stdlib_dormant():
-    """True only when ``$ENGRAM_HOME/config.json`` (default ``~/.engram``) can be read with the standard library
-    alone AND ``self_lineage`` is absent, null or blank.  Used only when an import failed, so it may not use
-    any helper: same rule as ``_model_gatelib.config_state``'s dormant states, nothing else counts as dormant."""
+    """True only when ``config.json`` in the layer's ENGRAM home can be read with the standard library alone AND
+    ``self_lineage`` is absent, null or blank.  Used only when an import failed.  The home comes from
+    ``_hooklib.engram_home`` (a separate module from the one that failed; it refuses a relative value), imported
+    here on its own: if that import fails (it also exits, ``SystemExit``, on a relative home), or the home is
+    refused, nothing is judged and the answer is False.
+    Same rule as ``_model_gatelib.config_state``'s dormant states, nothing else counts as dormant."""
     try:
-        home = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
+        from _hooklib import engram_home as _home_of
+        home = str(_home_of())
         try:
             with open(os.path.join(home, "config.json"), "r", encoding="utf-8") as fh:
                 cfg = json.load(fh)
@@ -269,13 +273,13 @@ def _stdlib_dormant():
             return False
         val = cfg.get("self_lineage")
         return val is None or (isinstance(val, str) and not val.strip())
-    except Exception:  # noqa: BLE001 - unreadable: not dormant
+    except (Exception, SystemExit):  # noqa: BLE001 - importing `_hooklib` exits on a relative home; never dormant
         return False
 
 
 def _emit_import_failure():
     """An import failure is never silent (code ``gate_import_failed``), unless the gate is dormant.  Standard
-    library only: it must not depend on the import that failed.  The text is ``_unverified_text``'s."""
+    library plus `_hooklib.engram_home` (imported on its own): it must not depend on the import that failed.  The text is ``_unverified_text``'s."""
     try:
         if _stdlib_dormant():
             return

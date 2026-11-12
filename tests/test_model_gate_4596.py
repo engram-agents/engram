@@ -844,6 +844,15 @@ def _hook_without_helper(tmp_path):
     return d / PRETOOL_FILE.name
 
 
+def _hook_with_hooklib_only(tmp_path):
+    """The hook plus `_hooklib` in a directory: `_model_gatelib` cannot be imported, `_hooklib` can (round 4)."""
+    d = tmp_path / "hooklib_only"
+    d.mkdir()
+    shutil.copy2(PRETOOL_FILE, d / PRETOOL_FILE.name)
+    shutil.copy2(HOOK_DIR / "_hooklib.py", d / "_hooklib.py")
+    return d / PRETOOL_FILE.name
+
+
 def test_r3_c18a_helper_module_missing_is_unverified_gate_import_failed(home, tmp_path):
     t = write_jsonl(tmp_path / "t.jsonl", [call_row("claude-sonnet-5-5", "toolu_01")])
     done = run_hook(home, pay(tpath=t), _hook_without_helper(tmp_path))
@@ -858,14 +867,47 @@ def test_r3_c18b_helper_module_missing_with_a_dormant_config_is_silent(home, tmp
         (home / "config.json").unlink()
     else:
         (home / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
-    done = run_hook(home, pay(), _hook_without_helper(tmp_path))
+    done = run_hook(home, pay(), _hook_with_hooklib_only(tmp_path))
     assert (done.returncode, done.stdout) == (0, "")
 
 
 @pytest.mark.parametrize("body", ["{not json", "[]", '{"self_lineage": 5}'])
 def test_r3_c18c_helper_module_missing_with_an_unusable_config_is_unverified(home, tmp_path, body):
     (home / "config.json").write_text(body, encoding="utf-8")
+    done = run_hook(home, pay(), _hook_with_hooklib_only(tmp_path))
+    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+
+
+# -- Round 4: no raw ENGRAM_HOME read; the import-failure path asks `_hooklib.engram_home`
+
+def test_r4_a_helper_import_fails_hooklib_importable_dormant_config_is_silent(home, tmp_path):
+    (home / "config.json").write_text("{}", encoding="utf-8")
+    done = run_hook(home, pay(), _hook_with_hooklib_only(tmp_path))
+    assert (done.returncode, done.stdout) == (0, "")
+
+
+def test_r4_b_helper_import_fails_hooklib_importable_set_lineage_is_unverified(home, tmp_path):
+    (home / "config.json").write_text(json.dumps({"self_lineage": SELF}), encoding="utf-8")
+    done = run_hook(home, pay(), _hook_with_hooklib_only(tmp_path))
+    assert done.returncode == 0
+    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+
+
+def test_r4_c_both_imports_fail_is_unverified_even_with_a_dormant_config(home, tmp_path):
+    (home / "config.json").write_text("{}", encoding="utf-8")
     done = run_hook(home, pay(), _hook_without_helper(tmp_path))
+    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+
+
+def test_r4_d_relative_engram_home_on_the_import_failure_path_is_unverified(home, tmp_path):
+    hook = _hook_with_hooklib_only(tmp_path)
+    (tmp_path / "rel").mkdir()
+    (tmp_path / "rel" / "config.json").write_text("{}", encoding="utf-8")   # dormant, if it were read
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+    env["ENGRAM_HOME"] = "rel"
+    done = subprocess.run([sys.executable, str(hook)], input=json.dumps(pay()), text=True, capture_output=True,
+                          env=env, cwd=str(tmp_path), timeout=60)
+    assert done.returncode == 0
     assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
 
 
