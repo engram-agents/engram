@@ -45,9 +45,9 @@ v0.5.6 ship with it.
   do, and exits with code 10, "finished, with items not done".
 - **Setup rewrites an existing file in place.** The file keeps its inode, so its
   mode, owner, group, hard links, ACL entries and extended attributes stay as
-  they were (one file is an exception during a full install: `settings.json`,
-  see Known limits below). The stamped backup is saved first; a file ENGRAM
-  itself owns has no backup, and a refusal for such a file says so. A write
+  they were (one file is an exception whenever setup runs: `settings.json`, see
+  Known limits below). The stamped backup is saved first; a file ENGRAM itself
+  owns has no backup, and a refusal for such a file says so. A write
   that fails part-way puts the old bytes back into the same file. When the
   failure is an error from the system, it is reported in one REFUSED line that
   names the backup; an interruption such as Ctrl-C gets the same put-back and
@@ -85,12 +85,14 @@ writes are outside it. Neither comes from a change in this release: the v0.5.6
 installer runs the same Claude Code command, and v0.5.6 rewrites `config.json`
 the same way.
 
-- **`settings.json` during an install.** Setup registers the plugin with Claude
-  Code's own command (`claude plugin marketplace add`), and that command
-  replaces `~/.claude/settings.json` with a new file. An ACL entry or an
-  extended attribute set on that file is not carried over. This is Claude
-  Code's write, not ENGRAM's; it was measured on one Mac with one Claude Code
-  build (#4638).
+- **`settings.json` at every install or re-install.** Setup registers the
+  plugin with Claude Code's own command (`claude plugin marketplace add`), and
+  that command replaces `~/.claude/settings.json` with a new file each time it
+  runs, even when nothing in the file changes. The content is kept. An ACL
+  entry or an extended attribute set on that file is not carried over, and
+  nothing backs the file up or prints a message for that write. This is Claude
+  Code's write, not ENGRAM's; it was measured on one Mac and on one Linux
+  machine, with one Claude Code build each (#4638, #4628).
 - **`config.json` while an agent runs.** ENGRAM rewrites its own `config.json`
   at least at every turn advance, by writing a new file and renaming it over
   the old one, so that a concurrent reader never sees a partial file. An ACL
