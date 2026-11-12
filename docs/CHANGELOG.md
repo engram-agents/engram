@@ -49,7 +49,10 @@ v0.5.6 ship with it.
 - **The local checkout folder is named `engram` by default.** Launchers, hooks
   and tools look for a folder named `engram` first and `engram-alpha` second, so
   a checkout under the old name keeps working and nothing needs renaming. If
-  both folders exist, the one named `engram` is used.
+  both folders exist, a launcher, hook or tool uses the one it can tie to your
+  session (the trusted folder, or the folder the process runs from) and `engram`
+  otherwise, so an unused checkout left under the name `engram` can be picked
+  up by mistake.
 - **Lesson tripwires also fire when the agent dispatches a sub-agent.** A lesson
   whose action moment is a dispatch through the `Agent` tool is now shown at
   that call. For these calls the tripwire only advises; it never blocks.
