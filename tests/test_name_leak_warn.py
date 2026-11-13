@@ -1152,9 +1152,11 @@ def test_load_roster_pos_none_error_reports_offset_unknown(capsys):
     except re.error as probe:
         if probe.pos is not None:
             pytest.skip(f"this Python sets pos={probe.pos!r} for the line")
+        # The class name is "error" on 3.12 and "PatternError" on 3.13+.
+        class_name = type(probe).__name__
     else:
         pytest.skip("this Python compiles the line; no re.error to test")
-    _assert_one_line_unknown_offset(capsys, bad_line, token, "error")
+    _assert_one_line_unknown_offset(capsys, bad_line, token, class_name)
 
 
 # ---------------------------------------------------------------------------
