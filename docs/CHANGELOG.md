@@ -46,8 +46,9 @@ v0.5.6 ship with it.
   10, "finished, with items not done".
 
 - **Setup rewrites an existing file in place.** The file keeps its inode, so
-  its mode (except the setuid and setgid bits, which the write clears), owner,
-  group, hard links, ACL entries and extended attributes stay as they were
+  its mode (except the setuid and setgid bits, which an unprivileged writer's
+  write clears; measured on Linux), owner, group, hard links, ACL entries and
+  extended attributes stay as they were
   (one file is an exception whenever the installer runs: `settings.json`, see
   Known limits below). The stamped backup is saved first; a file ENGRAM itself
   owns has no backup, and a refusal for such a file says so. A write that
@@ -89,7 +90,8 @@ in this release: the v0.5.6 installer runs the same Claude Code commands, and
 v0.5.6 rewrites `config.json` the same way. The last two are about setup's own
 messages.
 
-- **`settings.json` whenever the installer runs.** Setup registers the plugin
+- **`settings.json` whenever the installer runs, and `~/.claude.json` on
+  Claude Code's first start.** Setup registers the plugin
   with Claude Code's own commands. `claude plugin marketplace add` replaces
   `~/.claude/settings.json` with a new file each time it runs, even when
   nothing in the file changes, and `claude plugin install` rewrites it again
@@ -99,10 +101,14 @@ messages.
   the file up or prints a message for these writes. They are Claude Code's
   writes, not ENGRAM's. The replace-on-every-run behaviour was measured on one
   Linux machine and on one Mac (#4628). On a second Mac, with an older Claude
-  Code build, the first plugin command in a home also ran Claude Code's own
-  one-time settings migration and changed `model` from `opus` to `opus[1m]`;
-  the same test on one Linux machine did not reproduce that, and what makes it
-  fire is not established (#4628). The marketplace step comes before the
+  Code build, the first plugin command in a home with no `~/.claude.json`, or
+  with a hand-made one, also ran Claude Code's own first-start migration. It
+  changed `model` from `opus` to `opus[1m]` in `settings.json`, and it created
+  `~/.claude.json` or rewrote the hand-made one, which lost an ACL entry, an
+  extended attribute and one of its keys. With a copy of a `.claude.json` that
+  Claude Code had used for months, `model` stayed `opus`. A fresh home on one
+  Linux machine with a newer build did not reproduce the change, and that
+  difference is not explained (#4628). The marketplace step comes before the
   installer's question about an existing `CLAUDE.md`, so a run that stops at
   that question has already run that step (and any migration) and has created
   the data folder, but has not run the plugin install; `CLAUDE.md` itself is
