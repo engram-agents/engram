@@ -22,6 +22,15 @@ with an `-alpha` suffix during the alpha phase.
   release cut. `--json` gains `layers` and `unreferenced` keys; no key is
   removed. (#4358)
 
+### Fixed
+- The Quiet Wake nudge now prints a command that runs as printed: the plugin venv
+  interpreter (`~/.engram/venv/bin/python3`) and the study-queue tool's absolute
+  path. On a host whose only `python3` is older than 3.10, the tool re-execs under
+  that venv instead of crashing while importing `engram_core`; a re-exec that does
+  not reach a 3.10+ interpreter (a wrapper script, or a venv that is itself older)
+  fails once rather than retrying. With no usable venv it refuses with one line on
+  stderr and exit 3, before doing any work. (#4642)
+
 ### Docs
 - The install guide now says that an ACL or extended attribute on `~/.claude/settings.json` is lost during
   install: measured for `claude plugin marketplace add` on one Mac and on Linux, and for a full

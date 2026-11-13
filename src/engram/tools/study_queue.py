@@ -77,29 +77,49 @@ import sys
 # ---------------------------------------------------------------------------
 
 def _reexec_plan(version_info: tuple[int, ...],
-                 venv_python: str) -> tuple[str, str | None]:
+                 venv_python: str,
+                 executable: str | None = None,
+                 already_reexeced: bool = False) -> tuple[str, str | None]:
     """('run', None) to continue in-process; ('exec', path) to re-exec;
        ('fail', message) when a re-exec is needed and impossible.
 
-    Three distinct states: "not needed" is never encoded as a boolean alongside
-    "needed but impossible" (the latter says so, in one line, and exits 3)."""
+    `executable` is the running interpreter (default: sys.executable), a parameter so
+    the realpath comparison is testable without touching the process.  `already_reexeced`
+    is the loop sentinel: a re-exec has already been attempted and the interpreter is
+    STILL too old (a wrapper script that re-execs an under-powered python, or a venv
+    that is itself <3.10) — that is "needed and impossible", never "not needed".
+
+    Three distinct states, never a boolean: "not needed" and "needed but impossible"
+    are different outcomes and the second says so, in one line, and exits 3."""
+    if executable is None:
+        executable = sys.executable
     if version_info >= (3, 10):
         return ("run", None)
-    if sys.executable and os.path.realpath(venv_python) == os.path.realpath(sys.executable):
+    version = ".".join(str(part) for part in version_info[:3])
+    if already_reexeced:
+        return ("fail",
+                f"study_queue: this python is {version} (needs 3.10+); a re-exec under "
+                f"{venv_python} did not reach a 3.10+ interpreter — run the installer "
+                f"with a 3.10+ python3")
+    if executable and os.path.realpath(venv_python) == os.path.realpath(executable):
         return ("run", None)  # never loop: the venv interpreter IS this process
     if not (os.path.isfile(venv_python) and os.access(venv_python, os.X_OK)):
-        version = ".".join(str(part) for part in version_info[:3])
         return ("fail",
                 f"study_queue: this python is {version} (needs 3.10+); the venv interpreter "
-                f"{venv_python} is missing or not executable — run the installer, or "
-                f"{venv_python} by hand")
+                f"{venv_python} is missing or not executable — run the installer")
     return ("exec", venv_python)
 
 
 if sys.version_info < (3, 10):
     _VENV_PYTHON = os.path.expanduser("~/.engram/venv/bin/python3")
-    _action, _detail = _reexec_plan(tuple(sys.version_info[:3]), _VENV_PYTHON)
+    _action, _detail = _reexec_plan(
+        tuple(sys.version_info[:3]), _VENV_PYTHON,
+        already_reexeced=bool(os.environ.get("ENGRAM_STUDY_QUEUE_REEXEC")))
     if _action == "exec":
+        # Loop sentinel, set immediately before the exec: a wrapper script whose
+        # realpath never equals the child's sys.executable, or a venv that is itself
+        # <3.10, would otherwise retry forever or fall through to the raw TypeError.
+        os.environ["ENGRAM_STUDY_QUEUE_REEXEC"] = "1"
         try:
             os.execv(_detail, [_detail, __file__, *sys.argv[1:]])
         except OSError as _exc:  # the plan said usable; a race is still one line, never a traceback
@@ -574,7 +594,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="study_queue.py",
         description="This seat's top study targets: one id or file reference, why, and one method each. "
                     "Read-only. The queue on stdout and exit 0, or NOTHING on stdout and exit 1 with the "
-                    "error class on stderr.",
+                    "error class on stderr. A pre-3.10 interpreter with no usable venv refuses before "
+                    "any work: one stderr line, exit 3.",
     )
     ap.add_argument("--n", type=_positive_int, default=3, help="how many targets, at least 1 (default 3)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
