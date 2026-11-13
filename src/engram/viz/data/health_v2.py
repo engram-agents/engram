@@ -443,13 +443,24 @@ def _assemble_health_v2_payload(
         "unscored_aspects": unscored_aspects,
     }
 
-    return {
+    payload = {
         "has_snapshot": True,
         "provenance": provenance,
         "signal_rows": signal_rows,
         "aspect_tile": aspect_tile,
         "composed": composed,
     }
+    # engram-alpha#2770: a snapshot can exist while its composed score is
+    # unavailable (e.g. every aspect held out of composition). The Score
+    # panel's fail-honest branch reads ``v2.reason``, which used to be set
+    # only on the has_snapshot:false paths -- so that panel rendered blank.
+    if composed["value"] is None or composed["value"] == "UNAVAILABLE":
+        unscored_txt = ", ".join(str(a) for a in unscored_aspects)
+        payload["reason"] = (
+            "Snapshot present but the composed score is unavailable"
+            + (f" -- unscored aspects: {unscored_txt}" if unscored_txt else "")
+        )
+    return payload
 
 
 def get_health_v2_data(agent_name: str) -> dict:
