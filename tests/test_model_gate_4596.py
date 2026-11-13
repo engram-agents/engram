@@ -710,6 +710,16 @@ def test_c4_rule_u_a_lineage_with_no_table_rows_trusts_only_its_provider_token(h
         "deny", deny_unmapped_c_text(THIS_CALL, "whiz-1", "acme:whiz", home))
 
 
+def test_c4_rule_u_another_lineages_table_token_is_not_own(hook, home, tmp_path):
+    """`gpt-flash-x` on deepseek:flash: `flash` is the family token and the provider is not recognised, but
+    the first token `gpt` belongs to openai:gpt's table ids, not to deepseek:flash's own set, so it is (c)
+    foreign and denies with the branch-(c) text.  Pins that own first tokens are per lineage."""
+    set_lineage(home, "deepseek:flash")
+    t = _call(tmp_path, "gpt-flash-x")
+    assert out(hook.decide(pay(tpath=t), home)) == (
+        "deny", deny_unmapped_c_text(THIS_CALL, "gpt-flash-x", "deepseek:flash", home))
+
+
 def test_c4_rule_u_branch_c_deny_text_orders_the_remedies(hook, home, tmp_path):
     """relaunch / agent definition, then the table row, then the human's `self_lineage` decision."""
     t = _call(tmp_path, "mystery-opus-9")
