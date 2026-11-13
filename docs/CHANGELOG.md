@@ -85,48 +85,51 @@ v0.5.6 ship with it.
 
 The guarantee above is about what setup itself writes to an existing file. The
 first two limits below are writes outside it, and neither comes from a change
-in this release: the v0.5.6 installer runs the same Claude Code command, and
-v0.5.6 rewrites `config.json` the same way. The last two are about the
-installer's own messages.
+in this release: the v0.5.6 installer runs the same Claude Code commands, and
+v0.5.6 rewrites `config.json` the same way. The last two are about setup's own
+messages.
 
-- **`settings.json` at every install or re-install.** Setup registers the
-  plugin with Claude Code's own commands. `claude plugin marketplace add`
-  replaces `~/.claude/settings.json` with a new file each time it runs, even
-  when nothing in the file changes, and `claude plugin install` rewrites it
-  again when it enables the plugin. Your own keys are kept, and Claude Code
-  adds its own (`extraKnownMarketplaces`, `enabledPlugins`). In a home where
-  no Claude Code plugin command has run before, the first one also runs Claude
-  Code's own one-time settings migration, which can change a value: on one Mac
-  with one Claude Code build, `model` went from `opus` to `opus[1m]`. An ACL
-  entry or an extended attribute set on that file is not carried over, and
-  nothing backs the file up or prints a message for these writes. They are
-  Claude Code's writes, not ENGRAM's. The every-run case was measured on one
-  Linux machine and on one Mac (#4628), and the install case on one Mac
-  (#4638), with one Claude Code build on each machine. This step comes before
-  the installer's question about an existing `CLAUDE.md`, so a run that stops
-  at that question has already made these changes and has created the data
-  folder; `CLAUDE.md` itself is untouched.
+- **`settings.json` whenever the installer runs.** Setup registers the plugin
+  with Claude Code's own commands. `claude plugin marketplace add` replaces
+  `~/.claude/settings.json` with a new file each time it runs, even when
+  nothing in the file changes, and `claude plugin install` rewrites it again
+  when it enables the plugin. Your own keys are kept, and Claude Code adds its
+  own (`extraKnownMarketplaces`, `enabledPlugins`). An ACL entry or an
+  extended attribute set on that file is not carried over, and nothing backs
+  the file up or prints a message for these writes. They are Claude Code's
+  writes, not ENGRAM's. The replace-on-every-run behaviour was measured on one
+  Linux machine and on one Mac (#4628). On a second Mac, with an older Claude
+  Code build, the first plugin command in a home also ran Claude Code's own
+  one-time settings migration and changed `model` from `opus` to `opus[1m]`;
+  the same test on one Linux machine did not reproduce that, and what makes it
+  fire is not established (#4628). The marketplace step comes before the
+  installer's question about an existing `CLAUDE.md`, so a run that stops at
+  that question has already run that step (and any migration) and has created
+  the data folder, but has not run the plugin install; `CLAUDE.md` itself is
+  untouched.
 - **`config.json` while an agent runs.** ENGRAM rewrites its own `config.json`
   at least at every turn advance (at each sleep), by writing a new file and
   renaming it over the old one, so that a concurrent reader never sees a
   partial file. An ACL entry or an extended attribute set on the file itself
   is lost in that rewrite; one that the folder supplies by default is applied
-  again. Where the ACL mask was wider than the file's group permission, the
-  rewrite also gives the file's own group that permission (on a `config.json`
-  with mode 0660: read and write) where it had none. The file holds no
-  credentials. Setup's writes are fixed in this release; this runtime write is
-  not (#4641).
+  again. For an entry set on the file alone, where the ACL mask was wider than
+  the file's group permission, the rewrite also gives the file's own group
+  that permission (on a `config.json` with mode 0660: read and write) where it
+  had none; this was measured on Linux. ENGRAM stores no credentials in
+  `config.json`; the forum token is a separate file. Setup's writes are fixed
+  in this release; this runtime write is not (#4641).
 - **A shallow clone is refused, and the printed remedy does not help.** The
-  installer's first step refuses a shallow checkout (one made with `git clone
-  --depth 1`), and the remedy it prints (`git fetch --tags origin`) does not
-  rescue that clone. Clone without `--depth`. To rescue a shallow clone, run
+  installer's first step refuses a clone made with
+  `git clone --depth 1 --branch <tag>`, and the remedy it prints
+  (`git fetch --tags origin`) does not rescue that clone. Clone without
+  `--depth`. To rescue a shallow clone, run
   `git remote set-branches origin '*'` and then `git fetch --unshallow` in it
   (#4645). Measured on one Mac with git 2.50.1.
-- **A wrong last line after a double failure.** When a write fails and putting
-  the old bytes back also fails, the file guard prints that the file may be
-  incomplete. `set_forum_url.py` and the marketplace installer then print a
-  last line of their own that says the file was left unchanged. In that case
-  the guard's line is the true one (#4631).
+- **A wrong last sentence after a double failure.** When a write fails and
+  putting the old bytes back also fails, the file guard prints that the file
+  may be incomplete. `set_forum_url.py` and the marketplace installer then end
+  their own message with a sentence that says the file was left unchanged. In
+  that case the guard's line is the true one (#4631).
 
 ### Other changes
 
