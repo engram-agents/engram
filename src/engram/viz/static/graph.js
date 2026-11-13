@@ -618,13 +618,13 @@ function showTooltip(event, d) {
   const tierLabel = tier === 1 ? 'Tier 1 (working)' : tier === 2 ? 'Tier 2 (searchable)' : 'Tier 3 (archive)';
   const tierColor = tier === 1 ? '#5cb85c' : tier === 2 ? '#f0ad4e' : '#e05252';
 
-  let lines = [`<b>${d.id}</b> <span style="color:#7788aa">${NODE_STYLE[d.type]?.label || d.type}</span>`];
+  let lines = [`<b>${escHtml(d.id)}</b> <span style="color:#7788aa">${escHtml(NODE_STYLE[d.type]?.label || d.type)}</span>`];
   const text = nodeDisplayText(d);
-  if (text !== d.id) lines.push(truncate(text, 80));
+  if (text !== d.id) lines.push(escHtml(truncate(text, 80)));
   if (d.confidence != null) lines.push(`Confidence: ${(d.confidence * 100).toFixed(0)}%`);
   if (d.importance_score != null) lines.push(`Importance: ${d.importance_score.toFixed(4)} · <span style="color:${tierColor}">${tierLabel}</span>`);
   if (d.status && d.status !== 'active' && d.status !== 'open')
-    lines.push(`Status: <span style="color:${d.status === 'retracted' ? '#e05252' : '#f0ad4e'}">${d.status}</span>`);
+    lines.push(`Status: <span style="color:${d.status === 'retracted' ? '#e05252' : '#f0ad4e'}">${escHtml(d.status)}</span>`);
   if (isRetracted(d)) lines.push('<span style="color:#e05252">⊘ Retracted</span>');
   else if (!d.is_current) lines.push('<span style="color:#f0ad4e">⚠ Superseded</span>');
   if (isTainted(d)) lines.push('<span style="color:#ff9800">⚠ Tainted</span>');
@@ -1114,7 +1114,8 @@ function confBar(container, value) {
 }
 
 function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 // ═══════════════════════════════════════════════════════════════════
