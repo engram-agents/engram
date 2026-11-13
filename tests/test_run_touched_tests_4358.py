@@ -337,7 +337,11 @@ def _importers_of(stem: str) -> set[str]:
 
 def _transitive_importers(stem: str) -> set[str]:
     """Independent re-implementation: reverse closure over source modules,
-    then every test importing any module in the closure."""
+    then every test importing any module in the closure.
+
+    The four source dirs below are deliberately fixed (the oracle must not
+    derive roots the way the tool does). If conftest gains a root, only
+    `test_import_roots_of_the_real_conftest` notices; update both together."""
     src_dirs = [REPO_ROOT, REPO_ROOT / "tools",
                 REPO_ROOT / "src" / "engram", REPO_ROOT / "src" / "engram" / "tools"]
     imports: dict[str, set[str]] = {}
