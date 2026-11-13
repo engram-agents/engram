@@ -164,7 +164,7 @@ DEPLOYED="$SERVICE_DIR/app/forum"
 # deployed side enumerates as empty, producing a false "STALE, N files
 # missing" verdict instead of a clear permission error. Caught live against
 # the real /home/agents-shared/forum/app/forum, whose group ownership predates
-# this script and denies read to any account outside agent-ariadne's own
+# this script and denies read to any account outside the installing admin account's own
 # private group -- exactly the scenario this check exists to name honestly.
 if [ ! -r "$DEPLOYED" ] || [ ! -x "$DEPLOYED" ]; then
   echo "ERROR: cannot read $DEPLOYED (permission denied) -- this account may not be in the group that owns the deployed tree. Fix the directory's group ownership/permissions, or run this check as the forum admin." >&2
