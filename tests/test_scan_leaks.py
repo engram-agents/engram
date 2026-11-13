@@ -732,3 +732,102 @@ def test_allowed_home_segment_set_is_pinned():
     assert all(isinstance(why, str) and why.strip() for why in _mod.ALLOWED_HOME_SEGMENTS.values()), (
         "every allowed home-path segment needs a non-empty reason"
     )
+
+
+# ---------------------------------------------------------------------------
+# A bad local-config entry is reported by position, never echoed
+# (the local roster is a personal-name list: regex and label can be names).
+# Tokens below are invented, carry no real name, and appear nowhere else.
+# ---------------------------------------------------------------------------
+
+_TOK_RE = "zqxtok7731"
+_TOK_LABEL = "vwjlab5519"
+
+
+def _load_with_entries(tmp_path, entries, capsys):
+    cfg = tmp_path / "roster.json"
+    cfg.write_text(json.dumps({"patterns": entries}))
+    patterns, present = _mod.load_local_patterns(tmp_path, cfg)
+    return patterns, present, capsys.readouterr().err
+
+
+def _good(label):
+    return {"regex": r"\b" + label + r"\b", "label": label}
+
+
+def _assert_reported_by_position(err, index, cls, entries):
+    assert f"skipping bad pattern entry {index}: {cls}" in err
+    assert _TOK_RE not in err
+    assert _TOK_LABEL not in err
+    for entry in entries:
+        assert repr(entry) not in err
+
+
+def test_bad_entry_missing_regex_reported_by_position(tmp_path, capsys):
+    bad = {"label": _TOK_LABEL}
+    entries = [_good("okone"), bad, _good("oktwo")]
+    patterns, present, err = _load_with_entries(tmp_path, entries, capsys)
+    assert present is True
+    assert [lbl for _, lbl in patterns] == ["okone", "oktwo"]
+    _assert_reported_by_position(err, 2, "KeyError", entries)
+    assert "missing key 'regex'" in err
+
+
+def test_bad_entry_missing_label_names_the_key_only(tmp_path, capsys):
+    bad = {"regex": _TOK_RE}
+    entries = [bad, _good("oktwo")]
+    patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
+    assert [lbl for _, lbl in patterns] == ["oktwo"]
+    _assert_reported_by_position(err, 1, "KeyError", entries)
+    assert "missing key 'label'" in err
+
+
+def test_bad_entry_re_error_does_not_echo_exception_text(tmp_path, capsys):
+    pattern = f"(?P={_TOK_RE})"
+    # Precondition: the re.error text really embeds the token, so a loader
+    # that appends str(exc) would leak it.
+    with pytest.raises(re.error) as info:
+        re.compile(pattern)
+    assert _TOK_RE in str(info.value)
+    # "error" on 3.12, "PatternError" on 3.13+.
+    cls = type(info.value).__name__
+    bad = {"regex": pattern, "label": "okbad"}
+    entries = [_good("okone"), bad, _good("oktwo")]
+    patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
+    assert [lbl for _, lbl in patterns] == ["okone", "oktwo"]
+    _assert_reported_by_position(err, 2, cls, entries)
+
+
+def test_bad_entry_label_is_not_echoed(tmp_path, capsys):
+    # Derive the class name ("error" on 3.12, "PatternError" on 3.13+).
+    with pytest.raises(re.error) as info:
+        re.compile(f"(?P={_TOK_RE})")
+    cls = type(info.value).__name__
+    bad = {"regex": f"(?P={_TOK_RE})", "label": _TOK_LABEL}
+    entries = [_good("okone"), bad]
+    patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
+    assert [lbl for _, lbl in patterns] == ["okone"]
+    _assert_reported_by_position(err, 2, cls, entries)
+
+
+def test_bad_entry_not_a_dict_reported_by_position(tmp_path, capsys):
+    entries = [_TOK_LABEL, _good("oktwo")]
+    patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
+    assert [lbl for _, lbl in patterns] == ["oktwo"]
+    _assert_reported_by_position(err, 1, "TypeError", entries)
+
+
+@pytest.mark.parametrize("exc_cls", [OverflowError, RecursionError])
+def test_bad_entry_other_compile_failures_are_skipped(tmp_path, capsys, monkeypatch, exc_cls):
+    real_compile = re.compile
+
+    def fake_compile(pat, *a, **k):
+        if pat == _TOK_RE:
+            raise exc_cls(_TOK_LABEL)
+        return real_compile(pat, *a, **k)
+
+    monkeypatch.setattr(_mod.re, "compile", fake_compile)
+    entries = [{"regex": _TOK_RE, "label": "okbad"}, _good("oktwo")]
+    patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
+    assert [lbl for _, lbl in patterns] == ["oktwo"]
+    _assert_reported_by_position(err, 1, exc_cls.__name__, entries)

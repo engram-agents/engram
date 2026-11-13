@@ -133,12 +133,17 @@ def load_local_patterns(root: Path, config_path: Path | None = None) -> tuple[li
         return [], True  # file existed but malformed; treat as present
 
     patterns = []
-    for entry in raw.get("patterns", []):
+    for i, entry in enumerate(raw.get("patterns", []), start=1):
         try:
             patterns.append((re.compile(entry["regex"]), entry["label"]))
-        except (KeyError, re.error) as exc:
-            print(f"scan-leaks: warning — skipping bad pattern entry {entry!r}: {exc}",
-                  file=sys.stderr)
+        except (KeyError, TypeError, re.error, OverflowError, RecursionError) as exc:
+            # The roster is a personal-name list: the entry, its label and
+            # str(re.error) can all carry a name.  Report only the 1-based
+            # position, the exception class, and (for KeyError) the missing
+            # schema key, which is ours and not user data.
+            detail = f" (missing key {exc.args[0]!r})" if isinstance(exc, KeyError) else ""
+            print(f"scan-leaks: warning — skipping bad pattern entry {i}: "
+                  f"{type(exc).__name__}{detail}", file=sys.stderr)
     return patterns, True
 
 
