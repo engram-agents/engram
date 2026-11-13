@@ -58,7 +58,7 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
 
    Full decision tree lives in the `engram-contradiction-resolution` skill — reference it in your report so the parent can follow the canonical steps.
 
-3. **Stale-but-load-bearing nodes.** `engram_query_pattern(pattern_name='stale_load_bearing')` as primary; or inline: cross-reference `engram_list(sort_by='recalls', limit=200)` ascending with `sort_by='importance', limit=50` descending. Nodes appearing in both sets are high-importance + low-recent-recall — candidates for the parent to either re-engage with or supersede. Distinguish *cornerstone* nodes (which by design are anchored against forgetting and should not be flagged as stale) from *non-cornerstone* high-importance nodes **by the node's own type** — mirror what the pattern does: `type NOT IN ('cornerstone', 'feeling_report')`. **Do NOT use focus-list membership as the discriminator.** The focus list holds current work, not a standing inventory of principles (it is capped at 15 slots and is normally full), so membership answers "is this hot right now", not "is this a cornerstone" — keying the exemption on it both flags unpinned cornerstones as stale and exempts whatever happens to be pinned this week. Additionally, **seed axioms** (identifiable by `basis` containing `"Seed axiom installed with ENGRAM"`) and **all definition nodes** (`df_*`) are exempt from this scan — seed axioms' high-importance + low-recall profile is structural (foundational bedrock installed at bootstrap, not stale), and definitions are structural anchors with no claim-bearing role. Skip both.
+3. **Stale-but-load-bearing nodes.** `engram_query_pattern(pattern_name='stale_load_bearing')` as primary; or inline: cross-reference `engram_list(sort_by='recalls', limit=200)` ascending with `sort_by='importance', limit=50` descending. Nodes appearing in both sets are high-importance + low-recent-recall — candidates for the parent to either re-engage with or supersede. Distinguish *cornerstone* nodes (which by design are anchored against forgetting and should not be flagged as stale) from *non-cornerstone* high-importance nodes **by the node's own type** — mirror what the pattern does: `type NOT IN ('cornerstone', 'feeling_report')`. **Do NOT use focus-list membership as the discriminator.** The focus list holds current work, not a standing inventory of principles (it is capped at 15 slots and is normally full), so membership answers "is this hot right now", not "is this a cornerstone" — keying the exemption on it both flags unpinned cornerstones as stale and exempts whatever happens to be pinned this week. Additionally, **seed axioms** (identifiable by `basis` containing `"Seed axiom installed with ENGRAM"`) and **all definition nodes** (`df_*`) are exempt from this scan — seed axioms' high-importance + low-recall profile is structural (foundational bedrock installed at bootstrap, not stale), and definitions are structural anchors with no claim-bearing role. Skip both. **"Load-bearing" here means high importance, not edge fan-in.** Do not rank candidates by how many nodes cite them: the pattern ranks by the node's own importance, and fan-in is not what it measures. **Read its silence correctly, because the cut is not where the name suggests.** The score is `inflation_gap = importance_base * decay_base^current_turn - importance_score`, so a node's gap GROWS the longer it goes un-recalled — a quiet node ranks higher, not lower — and `importance_base` is time-invariant. The real cut happens before that sort: the pool is the **top 200 nodes by `importance_base`**. Identity-anchored node types — axioms, definitions, goals, lessons, person nodes, and tasks while they are active or planned — are stamped at a base of 2.0 or above, far above any derivation (which top out near 0.95). **Cornerstones and feeling reports are also stamped at 2.0, but they never enter the pool at all**: the `SELECT` excludes both by type, before the `ORDER BY`, so they cannot count toward the 200 — counting them overstates the room available to everything else. Definitions DO enter and DO count toward the 200 even though this scan exempts them from being reported, so they consume slots without ever appearing in your results. **Where a graph carries 200 or more of the eligible anchors, the 200th row falls above the derivation band and derivations are excluded by the pre-sort however large their gap would be.** On a younger or smaller graph the 200th row is lower, and a derivation can enter the pool and rank. The code names this an accepted approximation cost. Questions are eligible (their base clears the 0.7 floor) but are cut by the same 200-row pool plus the protection-channel floor, so on a smaller graph a cold unprotected question can appear. **If you see only observations here, say so and say which cut produced it** — do not report an empty category as if it had ranged over everything.
 
 4. **Cornerstone candidates.** `engram_query_pattern(pattern_name='cornerstone_candidate')` as primary. Inline fallback (only when the pattern tool is unavailable — not an equal alternative, and not for padding; to examine a returned candidate use `engram_inspect`; see below): run `engram_list_focused()` and `engram_focus_sets()` for the agent's current working set (a *signal source* for where practice-derived principles are surfacing — not a cornerstone inventory), run `engram_list(sort_by='importance', limit=20)`.
 
@@ -318,6 +318,12 @@ needs to see), emit `"key_neighbors": []` rather than omitting the field.
   current state through one CLI, `"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/dream_master_batch.py" safety-row <node_id>`
   (it prints one JSON object, or `null` for a missing node).  You never run it
   and never connect to the store: use `engram_inspect` for everything you read.
+- **Supersede chains are linear.** A cluster of N duplicates consolidates as ONE
+  `engram_supersede` plus (N−1) `engram_retract` calls carrying `error_type='duplicate'` **and** `replacement_absent_because='NONE_BECAUSE_DUPLICATE'` — a retract is refused without a replacement decision, so `error_type` alone is not an executable instruction.
+  Never propose superseding two nodes with a single successor: the second `supersede` call
+  is refused, because a node cannot be the successor of more than one chain. This applies
+  to the suggested actions you write in Categories 1, 3 and 4 — phrase every duplicate
+  cluster that way, or the parent receives an instruction it cannot execute.
 
 # Output contract
 
@@ -337,7 +343,7 @@ Use this format:
 
 ## Category 1 — Open questions with sufficient answers nearby
 **Status scope this scan:** `open, partially_resolved` (or the actual set you ranged over, if you fell back to a narrower query — state it plainly, never let a null result imply full-domain coverage it didn't have; #1860).
-- [qu_XXXX] (verified) <one-line question summary> — RESOLVES via <evidence chain> — suggest parent composes resolving derivation via `engram_derive`, then wires via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_YYYY)`.
+- [qu_XXXX] (verified) <one-line question summary> — RESOLVES via <evidence chain> — suggest parent composes resolving derivation via `engram_derive`, then wires via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_YYYY)` (duplicate clusters: one supersede + N−1 retract-duplicates — see Invariants).
 ... or "None this scan."
 
 ## Category 2 — Contradictions ready for resolution
@@ -345,11 +351,11 @@ Use this format:
 ... or "None this scan."
 
 ## Category 3 — Stale-but-load-bearing nodes
-- [node_id] (pattern-match) high-importance + low-recent-recall — last recalled <when> — suggested action: re-engage on <topic> OR supersede with <fresher framing>.
+- [node_id] (pattern-match) high-importance + low-recent-recall — last recalled <when> — suggested action: re-engage on <topic> OR supersede with <fresher framing> (duplicate clusters: one supersede + N−1 retract-duplicates — see Invariants).
 ... or "None this scan."
 
 ## Category 4 — Cornerstone candidates
-- [node_id] (verified: principle-test passed) recently cited by ≥3 distinct current nodes in the window + load-bearing for <thread> — suggested action: anchor as cornerstone via `engram_add_cornerstone` or `engram_focus`.
+- [node_id] (verified: principle-test passed) recently cited by ≥3 distinct current nodes in the window + load-bearing for <thread> — suggested action: anchor as cornerstone via `engram_add_cornerstone` or `engram_focus` (duplicate clusters: one supersede + N−1 retract-duplicates — see Invariants).
   <!-- pattern-match is not used here: the principle-guides-execution test IS the semantic-verification step, so a candidate that passes it is verified, not merely pattern-matched. -->
 ... or "None this scan."
 
