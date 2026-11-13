@@ -1061,6 +1061,24 @@ def _field_refusal(route: str, field: str, why: str) -> _RequestRefusal:
     return _RequestRefusal(f"{route}: field '{field}' {why}")
 
 
+def _json_object_body() -> dict:
+    """The request's JSON body, which must be a non-empty JSON object (#4465).
+
+    ``get_json(silent=True)`` returns whatever JSON parsed -- a list, a number, a string --
+    and the handlers then call ``.get`` on it. Anything that is not an object is a typed
+    400 naming the route (the same refusal ``_read_fields`` raises for a non-object body),
+    never an AttributeError and an HTML 500. An absent, unparseable or empty body keeps its
+    existing ``JSON body required`` 400.
+    """
+    data = request.get_json(silent=True)
+    if data is not None and not isinstance(data, dict):
+        raise _RequestRefusal(
+            f"{_route_label()}: JSON body must be an object (got {type(data).__name__})", 400)
+    if not data:
+        raise _RequestRefusal("JSON body required", 400)
+    return data
+
+
 _NO_CONTROL = "must not contain line-break or control characters (it is an identifier, not free text)"
 # #3294: json.loads accepts the escape "\\ud800" and yields a lone surrogate, which the
 # store's UTF-8 encode then rejects at write time (a 500 and a burned seq).
@@ -2677,9 +2695,7 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/api/thread/<int:tid>/accept", methods=["POST"])
     def api_accept_answer(tid: int):
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"error": "JSON body required"}), 400
+        data = _json_object_body()
 
         agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
@@ -2725,9 +2741,7 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/api/post/<int:pid>/verify", methods=["POST"])
     def api_verify_post(pid: int):
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"error": "JSON body required"}), 400
+        data = _json_object_body()
 
         agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
@@ -2768,9 +2782,7 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/api/post", methods=["POST"])
     def api_post():
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"error": "JSON body required"}), 400
+        data = _json_object_body()
 
         agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
@@ -2917,9 +2929,7 @@ def create_app(
           window; rejected with 400 if malformed.
         No audit write: high-frequency heartbeat, same rationale as online polls.
         """
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"error": "JSON body required"}), 400
+        data = _json_object_body()
 
         agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
@@ -3071,9 +3081,7 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/api/thread/<int:tid>/read", methods=["POST"])
     def api_thread_read(tid: int):
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"error": "JSON body required"}), 400
+        data = _json_object_body()
 
         agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
@@ -3124,9 +3132,7 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/api/agent/me", methods=["PATCH"])
     def api_patch_agent():
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"error": "JSON body required"}), 400
+        data = _json_object_body()
 
         agent_name = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent_name:
@@ -3788,9 +3794,7 @@ def create_app(
         if store is None or allocator is None:
             return jsonify({"error": "coordination store not configured"}), 503
 
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"error": "JSON body required"}), 400
+        data = _json_object_body()
 
         agent = g.auth_agent or ""  # #1459: the caller is the token's agent
         if not agent:
