@@ -166,11 +166,11 @@ jobs:
           )
 
           # Validate every roster pattern HERE, before any scan step can run.
-          # tools/name_leak_warn.py prints the offending pattern text to stderr
-          # on an invalid pattern, and this workflow does not redirect it, so an
-          # unvalidated roster could echo one line into the CI log. Validating
-          # first makes that path unreachable: on failure this step prints the
-          # LINE NUMBER only and fails. Never print the pattern text.
+          # tools/name_leak_warn.py reports an invalid pattern by line number,
+          # exception class and offset only (never the pattern text), but this
+          # workflow validates first anyway, as defence in depth: on failure
+          # this step prints the LINE NUMBER only and fails. Never print the
+          # pattern text.
           invalid_pattern_line = None
           for lineno, line in enumerate(canonical.splitlines(), start=1):
               stripped = line.strip()

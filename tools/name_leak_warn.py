@@ -36,7 +36,12 @@ def load_roster(roster_source: str | None, roster_file: str | None) -> list[re.P
     """Load newline-separated regex patterns from a string or file path.
 
     Blank lines and lines starting with '#' are skipped.
-    Raises SystemExit(1) on invalid regex.
+    Raises SystemExit(1) on a line that fails to compile (``re.error``,
+    ``OverflowError`` or ``RecursionError``). The error line names the roster line
+    by its raw 1-based number (blank and comment lines count) plus the exception
+    class and ``.pos`` (``unknown`` when absent); it never echoes the line's text or ``str(exc)``, because
+    the roster is the NAME_LEAK_ROSTER secret (real names), CI stderr can reach a
+    public log, and ``re.error.__str__`` embeds part of the pattern.
 
     Returns empty list if the source is None or empty (skip-when-absent).
     """
@@ -52,14 +57,24 @@ def load_roster(roster_source: str | None, roster_file: str | None) -> list[re.P
         return []
 
     patterns = []
-    for raw_line in text.splitlines():
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         try:
             patterns.append(re.compile(line))
-        except re.error as exc:
-            print(f"name_leak_warn: invalid pattern {line!r}: {exc}", file=sys.stderr)
+        except (re.error, OverflowError, RecursionError) as exc:
+            # Class name, offset and line number only: the line and str(exc)
+            # can each embed part of the secret roster line (engram#4559).
+            # ``pos`` is absent on OverflowError/RecursionError and None on some
+            # re.error values: report ``unknown`` rather than ``None``.
+            pos = getattr(exc, "pos", None)
+            offset = pos if isinstance(pos, int) else "unknown"
+            print(
+                f"name_leak_warn: invalid pattern at roster line {lineno}: "
+                f"{type(exc).__name__} at offset {offset}",
+                file=sys.stderr,
+            )
             sys.exit(1)
     return patterns
 
