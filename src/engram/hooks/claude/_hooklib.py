@@ -502,6 +502,12 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     process CWD.  A pre-existing target's named ACL entries and ``user.*``
     xattrs are therefore NOT carried over in that mode -- its mode and group
     still are -- so a caller that needs both must use a path-based write.
+    The removal below is skipped with the copy, so an existing target written
+    through ``dir_fd`` ends up carrying the directory's DEFAULT access ACL when
+    that directory has one -- the metadata a fresh create there would get --
+    even if the file it replaced had no access ACL at all.  That is the accepted
+    cost of not being able to bind the xattr API to the pinned directory, not a
+    property to preserve.
     Duplicated here because this module must
     stay self-contained; kept AST-identical with
     ``engram_config_io.atomic_write_text`` (tests/test_atomic_write_parity_4013.py)."""

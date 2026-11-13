@@ -647,3 +647,44 @@ def test_mode_applied_before_the_acl_so_the_preserved_mask_survives(mod, tmp_pat
         "the preserved ACL was altered by the mode= application; fchmod after "
         "setxattr rewrites mask::, so mode= must come first"
     )
+
+
+def test_dir_fd_write_in_a_default_acl_directory_leaves_the_inherited_acl(mod, tmp_path):
+    """Pins a KNOWN difference between the two modes: the path-based writer
+    REMOVES the temp's inherited access ACL when the replaced file had none
+    (cell A6), while the ``dir_fd`` writer installs it.
+
+    This is the accepted cost of skipping the xattr block under ``dir_fd``
+    (#4682: the API cannot be bound to the pinned directory), not a property
+    to preserve.  The cell exists so that a future change to either mode must
+    be deliberate rather than silent.
+    """
+    nobody = _nobody_uid()
+    _require_default_acl(tmp_path, nobody)
+    # Created AFTER the default ACL, so the target inherited one; remove it so
+    # the file being replaced genuinely has NO access ACL (the A6 shape).
+    target = tmp_path / "state.json"
+    target.write_text("old")
+    os.removexattr(target, ACL, follow_symlinks=False)
+    try:
+        os.getxattr(target, ACL, follow_symlinks=False)
+    except OSError as exc:
+        assert exc.errno in (
+            errno.ENODATA,
+            getattr(errno, "ENOATTR", errno.ENODATA),
+        ), f"setup: unexpected errno {exc.errno} reading the target's ACL"
+    else:
+        pytest.fail("setup: the target must start with no access ACL")
+
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        mod.atomic_write_text("state.json", "new", dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+
+    assert target.read_text() == "new"
+    inherited = os.getxattr(target, ACL, follow_symlinks=False)
+    assert _has_named_user_entry(inherited, nobody), (
+        "the dir_fd writer was expected to leave the directory default's named "
+        f"entry installed, the accepted cost of the skip; got {inherited.hex()}"
+    )
