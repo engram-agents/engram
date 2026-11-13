@@ -23,6 +23,7 @@ with an `-alpha` suffix during the alpha phase.
   removed. (#4358)
 
 ### Docs
+- The `engram-trust-tier` skill no longer describes a `force=true` override that `engram_set_trust_tier` does not have: it now names the real gate (`justification_obs_id` and `primary_user_approval_obtained`) and says the call fails closed without them (engram#4303). The handbook says config updates are `PUT /api/config/<key>`, not POST (engram#4461).
 - The install guide now says that an ACL or extended attribute on `~/.claude/settings.json` is lost during
   install: measured for `claude plugin marketplace add` on one Mac and on Linux, and for a full
   install on Linux (engram#4640, option 1).
