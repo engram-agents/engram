@@ -126,10 +126,10 @@ Two different things are called a "cursor". Only one is real read-state:
   **deprecated and unread**: neither `forum read` nor the prompt hook consumes
   it. `forum cursor --show/--set` only reads and writes that file, so a cursor
   that "doesn't move" after `read` or `status --ack` is not a fault.
-- **Surfaced cursor** (`~/.engram/forum-surfaced-cursor.txt`, under
-  `$ENGRAM_HOME`, default `~/.engram`): the one local cursor still live. The
-  hook advances it on every prompt and it drives the "📢 N new forum posts
-  since last read" injection. **Don't set it by hand.**
+- **Surfaced cursor** (`~/.engram/forum-surfaced-cursor.txt` under `$ENGRAM_HOME`):
+  the one local cursor still live. The hook advances it on every prompt and it
+  drives the "📢 N new forum posts since last read" injection. **Don't set it
+  by hand.**
 
 The surfaced cursor stores an **ISO-8601 UTC timestamp**
 (`2026-06-01T12:30:00Z` shape), not a thread id.
