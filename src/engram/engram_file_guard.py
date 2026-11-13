@@ -414,7 +414,7 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     The put-back writes into the same inode too, so the ACL and xattrs survive a FAILED write,
     not only a successful one. It restores the bytes, and the mode, owner and links never
     changed; the modification time does move, since the file was written twice. The backup does not carry them (see the module docstring), so
-    the restore command given is `cat backup > path`, which writes into the same inode: `cp -p`
+    the restore command given is `cat -- backup > path`, which writes into the same inode: `cp -p`
     would replace the file's ACL and xattrs with the backup's (none; measured on macOS).
 
     The shipped callers (`_write`, `apply_merge`) pass a path that is absolute in the default

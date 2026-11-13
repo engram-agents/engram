@@ -472,6 +472,42 @@ def test_the_restore_command_works_for_a_hostile_file_name(tmp_path, monkeypatch
     assert path.read_bytes() == text.encode()
 
 
+def test_the_restore_command_works_for_a_dash_leading_relative_operand(tmp_path, monkeypatch):
+    """The `--` marker itself, which no absolute-path cell can exercise.
+
+    Contract: with the working directory moved to `tmp_path`, the writer's path is the RELATIVE
+    name `-dash.md`, so its stamped backup is relative and dash-leading too
+    (`-dash.md.engram-backup.<stamp>`). The command printed by the REFUSED message, taken after
+    "Restore it with: " and run verbatim as `/bin/sh -c "<command>"` in that directory, must put
+    the original bytes back. Without `--` before the backup operand, `cat` reads the dash-leading
+    operand as options and refuses, so the bytes are never restored.
+
+    Bound, stated rather than papered over: this cell exercises the OPTION-PARSING hazard
+    specifically; the absolute-path cells exercise QUOTING (shell metacharacters in the name).
+    Both are needed and neither substitutes for the other -- under `tmp_path` every absolute
+    operand begins with "/", so no row there can fail when the marker is removed.
+    """
+    monkeypatch.chdir(tmp_path)
+    _, text, writer = WRITERS["apply"]
+    path = Path("-dash.md")
+    path.write_text(text)
+    real_write_all = fg._write_all
+    _fail_first_write(monkeypatch, then_fail_again=True)
+    with pytest.raises(SystemExit) as got:
+        writer(path)
+    # Restore the real writer without monkeypatch.undo(): that would also undo the chdir, and
+    # the printed command is relative to it.
+    monkeypatch.setattr(fg, "_write_all", real_write_all)
+
+    msg = str(got.value)
+    assert msg.count("Restore it with: ") == 1, msg
+    command = msg.split("Restore it with: ", 1)[1].strip()
+    backups = _backups(path)
+    assert len(backups) == 1 and backups[0].read_text() == text, "the backup is intact"
+    subprocess.run(["/bin/sh", "-c", command], check=True, cwd=tmp_path)
+    assert path.read_bytes() == text.encode()
+
+
 def test_a_failed_rewrite_of_an_owned_file_says_there_is_no_backup(tmp_path, monkeypatch):
     path = tmp_path / "seed-manifest.json"
     path.write_text("{}\n")
