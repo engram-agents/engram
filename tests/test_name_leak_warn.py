@@ -1112,6 +1112,51 @@ def test_load_roster_compile_error_names_the_line_not_its_text(
     )
 
 
+# The one-line contract also holds for compile failures that are not ``re.error``
+# or whose ``.pos`` is None (#4711 review). ``RecursionError`` (deeply nested
+# parentheses) is caught by the same clause but has no cell here: provoking it is
+# slow and depends on the interpreter's recursion limit.
+def _assert_one_line_unknown_offset(capsys, bad_line, token, class_name):
+    with pytest.raises(SystemExit) as exc_info:
+        load_roster(roster_source="\\bQuillonfex\\b\n" + bad_line + "\n", roster_file=None)
+    assert exc_info.value.code == 1, f"must exit 1; got {exc_info.value.code!r}"
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1, f"exactly one stderr line; got {err!r}"
+    assert "roster line 2" in err, f"must name raw line 2; got {err!r}"
+    assert class_name in err, f"must carry {class_name}; got {err!r}"
+    assert "offset unknown" in err, f"no int pos, so 'offset unknown'; got {err!r}"
+    assert token not in err, f"the roster line's text reached stderr: {err!r}"
+
+
+def test_load_roster_overflow_error_is_one_line_without_text(capsys):
+    """``<Token>{99999999999}`` raises OverflowError (no ``.pos``), not re.error."""
+    token = "Xelvandroq"
+    bad_line = f"{token}{{99999999999}}"
+    try:
+        re.compile(bad_line)
+    except OverflowError:
+        pass
+    except re.error:
+        pytest.skip("this Python raises re.error, not OverflowError, for the line")
+    else:
+        pytest.skip("this Python compiles the line; no OverflowError to test")
+    _assert_one_line_unknown_offset(capsys, bad_line, token, "OverflowError")
+
+
+def test_load_roster_pos_none_error_reports_offset_unknown(capsys):
+    """A re.error whose ``.pos`` is None prints ``offset unknown``, not ``None``."""
+    token = "Ysparnovik"
+    bad_line = f"(?<={token}+)x"
+    try:
+        re.compile(bad_line)
+    except re.error as probe:
+        if probe.pos is not None:
+            pytest.skip(f"this Python sets pos={probe.pos!r} for the line")
+    else:
+        pytest.skip("this Python compiles the line; no re.error to test")
+    _assert_one_line_unknown_offset(capsys, bad_line, token, "error")
+
+
 # ---------------------------------------------------------------------------
 # Integration test: subprocess round-trip
 # ---------------------------------------------------------------------------
