@@ -3170,16 +3170,17 @@ def engram_checkpoint(payload_json: str) -> str:
                 in this work-burst.
             session_id (str, optional): The current session's id (as
                 injected at session start — same value passed to
-                engram_add_observation's own session_id field). Accepted
-                for backward compatibility with existing callers, but as
-                of #3014 it is NOT used to compute the `warm_briefing`
-                advisory below — that advisory now anchors on the most
-                recent nap/sleep checkpoint already in session_log.md
-                (via `_last_checkpoint_timestamp`), independent of session
+                engram_add_observation's own session_id field). It does
+                NOT feed the `warm_briefing` advisory below (#3014): that
+                advisory anchors on the most recent nap/sleep checkpoint
+                already in session_log.md (via
+                `_last_checkpoint_timestamp`), independent of session
                 identity, which correctly re-arms after every nap and
                 covers the post-compaction case too (see
                 `_compute_warm_briefing_advisory`'s docstring for why the
-                anchor changed from session-start).
+                anchor changed from session-start). It IS recorded with
+                this checkpoint, by name, in `compact/last-checkpoint.json`
+                (#4012), so callers should pass it.
 
     Returns:
         JSON with previous_turn (unchanged from current_turn since no
@@ -3242,10 +3243,13 @@ def engram_checkpoint(payload_json: str) -> str:
     # session_id is consumed here (advisory-only, #2997) and passed to _nap_impl
     # by name below, where it is only recorded in compact/last-checkpoint.json
     # (#4012); it must not also reach **params.
-    # As of #3014, session_id is accepted-but-unused: the warm_briefing
-    # advisory no longer depends on session identity (see
-    # _compute_warm_briefing_advisory) — the pop is kept only so existing
-    # callers that still pass session_id don't hit an "unknown field" error.
+    # As of #3014 the warm_briefing advisory no longer depends on session
+    # identity (see _compute_warm_briefing_advisory), so session_id is not
+    # "used" for that purpose. It is NOT unused, though: it is passed to
+    # _nap_impl by name below and recorded in compact/last-checkpoint.json
+    # (#4012), which the two lines above already say. The pop exists so a
+    # caller that passes it does not hit an "unknown field" error; it must
+    # not also reach **params.
     session_id = params.pop("session_id", None)
     # Snapshot the last checkpoint's timestamp BEFORE _nap_impl runs.
     # _nap_impl -> _checkpoint_internal appends THIS nap's OWN header to
