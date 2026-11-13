@@ -29,7 +29,9 @@ ROOT_FALLBACK = (
 
 
 def _stale_engine_block() -> str:
-    i = MASTER.index("cannot locate health/engine.py") if "cannot locate health/engine.py" in MASTER else MASTER.index("health/engine.py", MASTER.index('"projection_engine_stale"'))
+    # Located by the Python import the block exists to run, NOT by the guard line, so deleting
+    # the loud-failure line reddens the loud-failure cell for the right reason.
+    i = MASTER.index("from health import engine as he")
     start = MASTER.rfind("```bash", 0, i)
     end = MASTER.index("```", start + 7)
     return MASTER[start:end]
@@ -51,9 +53,11 @@ def test_stale_engine_check_uses_fallback_for_guard_and_sys_path():
 
 def test_stale_engine_check_still_fails_loud_on_missing_engine():
     block = _stale_engine_block()
-    assert "health/engine.py" in block
-    assert re.search(r"\[ -f [^\n]*health/engine\.py\"? \]", block)
-    assert "exit" in block or "||" in block
+    # the guard tests the resolved root's health/engine.py and the failure branch exits non-zero
+    assert re.search(
+        r'\[ -f "?\$PLUGIN_ROOT/health/engine\.py"? \] \|\| \{[^}]*\bexit 1\b[^}]*\}', block
+    ), block
+    assert "|| true" not in block
 
 
 def test_regenerate_embeddings_command_honours_engram_home():
@@ -76,8 +80,22 @@ def _invariant() -> str:
     return FAIRY[i : i + 2500]
 
 
-def test_fairy_recall_refresh_rule_covers_all_three_tools():
+def _pairs(inv: str, flag: str, tool: str) -> bool:
+    return re.search(rf"`{re.escape(flag)}`\s+on\s+every\s+`{tool}`\s+call", inv) is not None
+
+
+def test_fairy_recall_refresh_rule_pins_each_flag_to_its_tool():
     inv = _invariant()
-    assert "engram_inspect" in inv and "engram_get_subgraph" in inv and "engram_query" in inv
-    assert "refresh_recall=False" in inv
-    assert inv.count("dream_mode=True") >= 2
+    assert _pairs(inv, "dream_mode=True", "engram_inspect")
+    assert _pairs(inv, "dream_mode=True", "engram_get_subgraph")
+    assert _pairs(inv, "refresh_recall=False", "engram_query")
+    # the swapped pairings must not appear
+    assert not _pairs(inv, "refresh_recall=False", "engram_get_subgraph")
+    assert not _pairs(inv, "refresh_recall=False", "engram_inspect")
+    assert not _pairs(inv, "dream_mode=True", "engram_query")
+
+
+def test_fairy_rule_says_query_pattern_never_refreshes():
+    inv = _invariant()
+    assert re.search(r"`engram_query_pattern`\s+never\s+refreshes\s+recall", inv)
+    assert not re.search(r"`engram_query_pattern`\s+always\s+refreshes", inv)
