@@ -413,3 +413,30 @@ def test_4206_sentence_final_period_is_a_boundary():
     assert result.anchored == 1
     assert result.unanchored == []
     assert result.ratio == 1.0
+
+
+def test_4206_later_boundary_occurrence_anchors_past_an_embedded_first():
+    # The first occurrence is embedded in `#4040`; a later one stands free.
+    result = anchor("error 404", "#4040 then error 404")
+    assert result.unanchored == []
+    assert result.ratio == 1.0
+
+
+def test_4206_occurrence_at_the_quote_start_edge_is_a_boundary():
+    result = anchor("error 404", "404")
+    assert result.hard_tokens == 1
+    assert result.anchored == 1
+    assert result.ratio == 1.0
+
+
+def test_4206_embedded_occurrence_only_is_still_unanchored_control():
+    # Control for the cell above: two occurrences, neither free -> unanchored.
+    result = anchor("error 404", "#4040 error 404x")
+    assert result.unanchored == ["404"]
+    assert result.ratio == 0.0
+
+
+def test_4206_hex_prefers_a_later_free_occurrence_over_an_embedded_one():
+    result = anchor("ref abcdef1", "ref abcdef1zz and then abcdef1c0ffee9")
+    assert result.unanchored == []
+    assert result.ratio == 1.0
