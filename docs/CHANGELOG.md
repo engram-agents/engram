@@ -10,8 +10,9 @@ with an `-alpha` suffix during the alpha phase.
 ## [Unreleased]
 
 ### Docs
-- The install guide now says that `claude plugin marketplace add` makes Claude Code replace
-  `~/.claude/settings.json`, so an ACL or extended attribute on that file is lost (engram#4640, option 1).
+- The install guide now says that an ACL or extended attribute on `~/.claude/settings.json` is lost during
+  install: measured on one Mac for `claude plugin marketplace add`, and on Linux for a full install
+  (engram#4640, option 1).
 
 ## [v0.5.7] - 2026-11-12
 
