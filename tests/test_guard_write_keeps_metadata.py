@@ -417,6 +417,97 @@ def test_the_restore_command_in_the_message_keeps_the_acl_and_xattr(tmp_path, mo
     assert entry in _acl_entries(path) and _get_xattr(path) == b"kept"
 
 
+# Names that break a restore command built from naive single quotes: the apostrophe ends the
+# quoted operand, and the rest are the shell metacharacters that quoting must keep literal.
+# The apostrophe is the one the old form got wrong; the others pin the surrounding behaviour so
+# a "fix" that drops the quoting entirely cannot pass. "-dash.md" is a different class: `cat`
+# reads a leading-dash operand as options, which the `--` marker prevents. Under `tmp_path` its
+# operand still begins with "/", so this row pins the name only -- see the cell docstring.
+RESTORE_HOSTILE_NAMES = [
+    "it's.md",
+    "a b.md",
+    "$HOME.md",
+    "`id`.md",
+    "back\\slash.md",
+    "semi;colon.md",
+    "amp&and.md",
+    'quote".md',
+    "paren(1).md",
+    "-dash.md",
+]
+
+
+@pytest.mark.parametrize("name", RESTORE_HOSTILE_NAMES)
+def test_the_restore_command_works_for_a_hostile_file_name(tmp_path, monkeypatch, name):
+    """The printed restore command must work for ANY operand, whatever its name or shape.
+
+    Contract: take the substring after "Restore it with: " from the REFUSED message and run it
+    verbatim as `/bin/sh -c "<command>"`. It restores the backup's bytes into `path`, writing
+    INTO the existing inode (`cat backup > path`), so the file's ACL and extended attributes
+    survive. This cell checks the bytes; the ACL/xattr half is pinned by its sibling cell.
+
+    Safety is a property of the command's shape, not of its operands: `--` ends `cat`'s options
+    before the backup operand, and the destination is a shell redirect target that never
+    reaches `cat` as an argument. Both are `shlex.quote`d as well. Nothing rests on the
+    operands being absolute or already resolved: the shipped callers pass a path that is
+    absolute in the default configuration and resolve a symlink to its target first, but a
+    regular file's path is passed through as given, so a relative or "-"-leading operand is
+    reachable in principle (a home variable that starts with "-" makes one).
+
+    The "-dash.md" row is the name-level check, not a check of `--`: under `tmp_path` every
+    operand is absolute, so that row still begins with "/" and it passes with the marker
+    removed (measured, not assumed). The marker has no failing row here.
+    """
+    path = tmp_path / name
+    text = "mine\n"
+    path.write_text(text)
+    _fail_first_write(monkeypatch, then_fail_again=True)
+    with pytest.raises(SystemExit) as got:
+        _rewrite_by_apply(path)
+    monkeypatch.undo()
+    msg = str(got.value)
+    assert msg.count("Restore it with: ") == 1, msg
+    command = msg.split("Restore it with: ", 1)[1].strip()
+    subprocess.run(["/bin/sh", "-c", command], check=True)
+    assert path.read_bytes() == text.encode()
+
+
+def test_the_restore_command_works_for_a_dash_leading_relative_operand(tmp_path, monkeypatch):
+    """The `--` marker itself, which no absolute-path cell can exercise.
+
+    Contract: with the working directory moved to `tmp_path`, the writer's path is the RELATIVE
+    name `-dash.md`, so its stamped backup is relative and dash-leading too
+    (`-dash.md.engram-backup.<stamp>`). The command printed by the REFUSED message, taken after
+    "Restore it with: " and run verbatim as `/bin/sh -c "<command>"` in that directory, must put
+    the original bytes back. Without `--` before the backup operand, `cat` reads the dash-leading
+    operand as options and refuses, so the bytes are never restored.
+
+    Bound, stated rather than papered over: this cell exercises the OPTION-PARSING hazard
+    specifically; the absolute-path cells exercise QUOTING (shell metacharacters in the name).
+    Both are needed and neither substitutes for the other -- under `tmp_path` every absolute
+    operand begins with "/", so no row there can fail when the marker is removed.
+    """
+    monkeypatch.chdir(tmp_path)
+    _, text, writer = WRITERS["apply"]
+    path = Path("-dash.md")
+    path.write_text(text)
+    real_write_all = fg._write_all
+    _fail_first_write(monkeypatch, then_fail_again=True)
+    with pytest.raises(SystemExit) as got:
+        writer(path)
+    # Restore the real writer without monkeypatch.undo(): that would also undo the chdir, and
+    # the printed command is relative to it.
+    monkeypatch.setattr(fg, "_write_all", real_write_all)
+
+    msg = str(got.value)
+    assert msg.count("Restore it with: ") == 1, msg
+    command = msg.split("Restore it with: ", 1)[1].strip()
+    backups = _backups(path)
+    assert len(backups) == 1 and backups[0].read_text() == text, "the backup is intact"
+    subprocess.run(["/bin/sh", "-c", command], check=True, cwd=tmp_path)
+    assert path.read_bytes() == text.encode()
+
+
 def test_a_failed_rewrite_of_an_owned_file_says_there_is_no_backup(tmp_path, monkeypatch):
     path = tmp_path / "seed-manifest.json"
     path.write_text("{}\n")
