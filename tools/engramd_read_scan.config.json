@@ -344,6 +344,7 @@
   "hooks/claude/engram-loop-arm-stop-hook.py:_read_waiting_on",
   "hooks/claude/engram-loop-arm-stop-hook.py:_loop_prompt_helper_path",
   "hooks/claude/engram-loop-arm-stop-hook.py:_marker_has_loop_prompt",
+  "hooks/claude/engram-loop-arm-stop-hook.py:_study_queue_helper_path",
   "hooks/claude/engram-loop-arm-stop-hook.py:_nudge_text_for_marker",
   "hooks/claude/engram-nap-compact-backstop-stop.py:_say",
   "hooks/claude/engram-nap-compact-backstop-stop.py:_read_json",
