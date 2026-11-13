@@ -55,6 +55,37 @@ _XATTR_API = (
     hasattr(os, "getxattr") and hasattr(os, "setxattr") and hasattr(os, "listxattr")
 )
 
+# Read errors that mean "this attribute is absent or this filesystem cannot
+# carry it": a tolerant read, used by the explicit ACL getxattr and by
+# listxattr.  Here "nothing to copy" is not a failure -- a filesystem that
+# cannot carry xattrs at all (ENOTSUP/EOPNOTSUPP/ENOSYS) and an attribute that
+# is simply missing (ENODATA/ENOATTR) are both benign.
+_NO_XATTR_ERRNOS = tuple(
+    e
+    for e in (
+        getattr(errno, "ENODATA", None),
+        getattr(errno, "ENOATTR", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+        getattr(errno, "ENOSYS", None),
+    )
+    if e is not None
+)
+
+# Read errors that mean only "the attribute vanished between listxattr and
+# getxattr", used by the per-name read: it is genuinely absent, so nothing is
+# lost.  Everything else -- notably EACCES and EPERM on a file the caller may
+# write but not read -- raises, because metadata that cannot be read must not
+# be dropped silently.
+_VANISHED_XATTR_ERRNOS = tuple(
+    e
+    for e in (
+        getattr(errno, "ENODATA", None),
+        getattr(errno, "ENOATTR", None),
+    )
+    if e is not None
+)
+
 
 class ConfigUnreadableError(ValueError):
     """``config.json`` exists but does not parse after the retry window."""
@@ -100,10 +131,12 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     platform exposes no xattr API (macOS), the copy is a no-op, never an error.
     A per-name read that returns ENODATA/ENOATTR (the attribute vanished between
     ``listxattr`` and ``getxattr``) is skipped: it is genuinely absent, so
-    nothing is lost.  Any other read error, notably EACCES/EPERM on a file the
-    caller may write but not read, fails the write -- a bounded behaviour change
-    from the writer before #4641, which wrote successfully and dropped that
-    attribute, because metadata that cannot be read must not be lost silently.
+    nothing is lost.  Any other error on a per-name read -- not the explicit ACL
+    ``getxattr`` or ``listxattr`` above, which tolerate the whole
+    absent-or-unsupported set -- notably EACCES/EPERM on a file the caller may
+    write but not read, fails the write -- a bounded behaviour change from the
+    writer before #4641, which wrote successfully and dropped that attribute,
+    because metadata that cannot be read must not be lost silently.
     If the source carries one of these and it cannot be applied to the temp, the
     write raises, the temp is removed, and the target is left untouched.  Note
     the ownership assumption: in a directory other users can write, the source's
@@ -153,41 +186,17 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
             # fd-relative: target is then a bare name resolved against the
             # process CWD, and os.getxattr/os.setxattr take no dir_fd parameter.
             if copy_mode and _XATTR_API:
-                no_attr = tuple(
-                    e
-                    for e in (
-                        getattr(errno, "ENODATA", None),
-                        getattr(errno, "ENOATTR", None),
-                        getattr(errno, "ENOTSUP", None),
-                        getattr(errno, "EOPNOTSUPP", None),
-                        getattr(errno, "ENOSYS", None),
-                    )
-                    if e is not None
-                )
-                # Only a vanished attribute is skipped per name: ENODATA/ENOATTR
-                # means it was there when listxattr ran and is genuinely absent
-                # now, so nothing is lost.  Everything else -- notably EACCES and
-                # EPERM on a file the caller may write but not read -- raises:
-                # metadata that cannot be read must not be dropped silently.
-                no_entry = tuple(
-                    e
-                    for e in (
-                        getattr(errno, "ENODATA", None),
-                        getattr(errno, "ENOATTR", None),
-                    )
-                    if e is not None
-                )
                 try:
                     acl = os.getxattr(target, "system.posix_acl_access", follow_symlinks=False)
                 except OSError as exc:
-                    if exc.errno not in no_attr:
+                    if exc.errno not in _NO_XATTR_ERRNOS:
                         raise
                 else:
                     os.setxattr(tmp, "system.posix_acl_access", acl, follow_symlinks=False)
                 try:
                     names = os.listxattr(target, follow_symlinks=False)
                 except OSError as exc:
-                    if exc.errno not in no_attr:
+                    if exc.errno not in _NO_XATTR_ERRNOS:
                         raise
                     names = ()
                 for name in names:
@@ -195,7 +204,7 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
                         try:
                             value = os.getxattr(target, name, follow_symlinks=False)
                         except OSError as exc:
-                            if exc.errno in no_entry:
+                            if exc.errno in _VANISHED_XATTR_ERRNOS:
                                 continue
                             raise
                         os.setxattr(tmp, name, value, follow_symlinks=False)

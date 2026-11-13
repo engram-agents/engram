@@ -201,6 +201,41 @@ def test_file_without_acl_is_written_normally(mod, tmp_path):
     assert p.read_text() == "new"
 
 
+def test_acl_read_unsupported_is_tolerated_and_applies_no_acl(mod, tmp_path, monkeypatch):
+    """A filesystem that cannot carry xattrs at all is "no ACL to copy", not an
+    error: EOPNOTSUPP/ENOTSUP/ENOSYS on the explicit ACL ``getxattr`` is in the
+    absent-or-unsupported set, so the write succeeds and no ACL is applied."""
+    p = tmp_path / "state.json"
+    p.write_text("old")
+    os.setxattr(p, "user.keep", b"keep-me", follow_symlinks=False)
+    real_getxattr = os.getxattr
+    real_setxattr = os.setxattr
+    set_calls = []
+
+    def unsupported(path, name, **kwargs):
+        if name == ACL:
+            raise OSError(errno.EOPNOTSUPP, "ACLs are not supported on this filesystem")
+        return real_getxattr(path, name, **kwargs)
+
+    def spy_set(path, name, value, **kwargs):
+        set_calls.append(name)
+        return real_setxattr(path, name, value, **kwargs)
+
+    monkeypatch.setattr(os, "getxattr", unsupported)
+    monkeypatch.setattr(os, "setxattr", spy_set)
+
+    mod.atomic_write_text(p, "new")
+
+    assert p.read_text() == "new"
+    assert ACL not in set_calls, (
+        "an unsupported ACL read must not be followed by an ACL copy"
+    )
+    assert os.getxattr(p, "user.keep", follow_symlinks=False) == b"keep-me", (
+        "tolerating the ACL read must not skip the user.* copy"
+    )
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["state.json"]
+
+
 def test_acl_apply_failure_raises_and_leaves_the_target_intact(mod, tmp_path, monkeypatch):
     p = tmp_path / "state.json"
     p.write_text("old")
@@ -281,6 +316,49 @@ def test_listxattr_unsupported_is_tolerated_and_copies_no_names(mod, tmp_path, m
     assert p.read_text() == "new"
     with pytest.raises(OSError):
         os.getxattr(p, "user.test", follow_symlinks=False)
+
+
+def test_only_the_user_namespace_is_copied_from_listxattr(mod, tmp_path, monkeypatch):
+    """The copy is bounded to ``user.*`` even when ``listxattr`` reports other
+    namespaces.  ``security.*``/``trusted.*`` are frequently unsettable by an
+    unprivileged writer, so attempting them turns a normal write into an SELinux
+    host failure; only the ``user.*`` names may reach ``setxattr``."""
+    p = tmp_path / "state.json"
+    p.write_text("old")
+    os.setxattr(p, "user.keep", b"keep-me", follow_symlinks=False)
+    foreign = {"security.selinux": b"ctx", "trusted.overlay": b"opaque"}
+    real_getxattr = os.getxattr
+    real_setxattr = os.setxattr
+    set_calls = []
+
+    def listed(path, **kwargs):
+        # The ACL name is included on purpose: the ACL is read explicitly, never
+        # inferred from this list, so a filesystem that reports it must not make
+        # the user.* loop copy it either.
+        return [ACL, "user.keep", "security.selinux", "trusted.overlay"]
+
+    def reading(path, name, **kwargs):
+        if name in foreign:
+            return foreign[name]  # readable on the simulated host, hence tempting
+        return real_getxattr(path, name, **kwargs)
+
+    def writing(path, name, value, **kwargs):
+        set_calls.append(name)
+        if name in foreign:
+            return None  # recorded, not really applied: unprivileged here
+        return real_setxattr(path, name, value, **kwargs)
+
+    monkeypatch.setattr(os, "listxattr", listed)
+    monkeypatch.setattr(os, "getxattr", reading)
+    monkeypatch.setattr(os, "setxattr", writing)
+
+    mod.atomic_write_text(p, "new")
+
+    assert p.read_text() == "new"
+    assert set_calls == ["user.keep"], (
+        "only the user.* namespace may be copied; the writer attempted "
+        f"{set_calls!r}"
+    )
 
 
 def test_user_xattr_removed_between_listxattr_and_getxattr_is_skipped(mod, tmp_path, monkeypatch):
