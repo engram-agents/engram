@@ -138,10 +138,10 @@ _PEER_MESSAGE_PREAMBLE = "Another Claude session sent a message:"
 # import. Add a member to one, add it to both, or the test reddens.
 #
 # This tuple is the ONLY place a shape is listed (#4719 round 2). _is_cron_prompt
-# used to carry a per-shape `if` for four of these members; they are folded in
-# here because a branch is invisible to the equality pin -- a sixth shape added
-# as another branch would have reddened nothing. The reasons those branches
-# recorded, moved here so they cannot be lost:
+# used to carry a per-shape `if` for five of these members across four
+# branches; they are folded in here because a branch is invisible to the equality
+# pin -- a sixth shape added as another branch would have reddened nothing.
+# The reasons those branches recorded, moved here so they cannot be lost:
 #   - "<task-notification" / "<command-message" / "<command-name" /
 #     "<local-command": the harness envelopes #4686 enumerated -- monitor task
 #     notifications and slash-command / local-command blocks.
@@ -163,8 +163,13 @@ _PEER_MESSAGE_PREAMBLE = "Another Claude session sent a message:"
 #     "<<autonomous-loop>>junk". Acceptable -- a prompt beginning with the
 #     sentinel is machine-sent either way.
 #   - a human prompt that literally BEGINS with one of these envelopes is
-#     classified non-human. The failure direction is a MISSING deference
-#     cooldown, which makes the detector quieter, not noisier: acceptable.
+#     classified non-human, so no cooldown marker is written -- and the
+#     cooldown is what SUPPRESSES detection (engram-deference-detector-stop.py
+#     exits early when a real user message landed inside the window). The
+#     failure direction is therefore a FALSE POSITIVE: the detector keeps
+#     firing on a turn where the human was present. Noisy, not silent, and
+#     that is the safe side of this hook -- a spurious nudge costs a sentence,
+#     a missed one costs the catch.
 _NON_HUMAN_PREFIXES = (
     "<task-notification",
     "<command-message",

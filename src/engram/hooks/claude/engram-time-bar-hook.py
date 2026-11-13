@@ -172,8 +172,14 @@ _PEER_MESSAGE_PREAMBLE = "Another Claude session sent a message:"
 # Matching is by PREFIX on the raw prompt (after html.unescape + lstrip), so
 # the sentinels widen ("<<autonomous-loop>>junk" matches too -- acceptable: a
 # prompt beginning with the sentinel is machine-sent either way), and a human
-# prompt literally beginning with an envelope classifies non-human. The failure
-# direction is a MISSING stamp/cooldown -- quieter, not noisier. Acceptable.
+# prompt literally beginning with an envelope classifies non-human, so no
+# `last-user-activity` stamp is written. src/engram/tools/presence.py derives
+# `user` only while that stamp is fresh and fails OPEN to `auto` otherwise, so
+# the direction is that the seat reads as LESS engaged, not more -- the loop
+# keeps running when it could have narrowed. That is the fail-open the presence
+# spine is designed around (#1469's discipline: degrade toward more autonomy),
+# so it is acceptable here. Note this hook has no cooldown; only the deference
+# detector does.
 _NON_HUMAN_PREFIXES = (
     "<task-notification",
     "<command-message",

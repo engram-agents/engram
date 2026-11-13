@@ -62,7 +62,6 @@ _BEHAVIOUR_TABLE = [
     ("Another Claude session sent a message: hi", True),
     # regressions: already classified before this change
     ("Stop hook feedback: ...", True),
-    ("Loop continuation. Read ...", True),
     # the three shapes that used to be per-shape branches in _is_cron_prompt
     # rather than vocabulary members (#4719 round 2) — machine-sent, and now
     # tuple members like every other shape.
