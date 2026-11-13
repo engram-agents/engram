@@ -135,7 +135,7 @@ def _open_readonly(db_path: Path) -> sqlite3.Connection:
     """A direct `mode=ro` connection with sqlite3.Row rows. NOT the population reader (that is
     `_open_population_reader`); kept direct-only for tools/s2_clause_sheet.py, which borrows it through the
     survey and makes two reads of its own on it (alpha #4286 tracks moving those)."""
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 

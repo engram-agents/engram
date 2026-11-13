@@ -8,6 +8,7 @@ Agreement of the two is the check; the migration's count alone is circular.
 Never touches your live DB. Never touches another seat's graph.
 """
 import json, os, shutil, sqlite3, subprocess, sys, tempfile
+from pathlib import Path
 
 # The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). The repo root (the parent of this
 # file's directory) is appended, never inserted at [0] (#2565, #4054).
@@ -161,7 +162,7 @@ def precount(db):
     """Structured key-presence. NOT truthiness (eats empty lists, under-counts).
     NOT substring (eats the phrase in prose, over-counts). Both were measured
     wrong today, in opposite directions."""
-    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True); c.row_factory = sqlite3.Row
+    c = sqlite3.connect(Path(db).absolute().as_uri() + "?mode=ro", uri=True); c.row_factory = sqlite3.Row
     nodes, entries, roots, by_op = set(), 0, set(), {"supersede": 0, "retract": 0}
     for r in c.execute("SELECT id, is_current, metadata FROM nodes "
                        "WHERE metadata LIKE '%stale_by%' OR metadata LIKE '%tainted_by%'"):
@@ -204,7 +205,7 @@ def main():
         assert os.path.realpath(copy) != os.path.realpath(LIVE), "refusing to run on the live DB"
 
         exp_nodes, exp_entries, exp_events, by_op = precount(copy)
-        pre = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
+        pre = sqlite3.connect(Path(copy).absolute().as_uri() + "?mode=ro", uri=True)
         had_table = bool(pre.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                                      "AND name='cascade_markers'").fetchone())
         pre.close()

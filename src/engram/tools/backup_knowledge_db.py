@@ -380,7 +380,7 @@ def _write_binary_copy(out_dir: str, source_path: str) -> None:
         for stray in glob.glob(os.path.join(glob.escape(bdir), ".knowledge-*.db.tmp")):
             os.unlink(stray)  # a kill between tmp creation and os.replace leaves one forever
         tmp_path = os.path.join(bdir, "." + os.path.basename(target) + ".tmp")
-        src = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+        src = sqlite3.connect(Path(source_path).absolute().as_uri() + "?mode=ro", uri=True)
         try:
             dst = sqlite3.connect(tmp_path)
             try:
@@ -496,7 +496,7 @@ def _read_live_watermark(db_path: str) -> dict:
     this file fails toward backing up; querying an absent auxiliary table
     unconditionally was the one that failed closed).
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=ro", uri=True)
     try:
         row_count, max_created_at = conn.execute(
             "SELECT COUNT(*), MAX(created_at) FROM nodes"
