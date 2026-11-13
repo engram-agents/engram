@@ -280,8 +280,10 @@ soma stays Ariadne's as principal approver and merger (*Scope* above). Two group
 to the **merge seats** instead (Kepler and Borges on all org repos, with Ariadne on
 umwelt and soma, per *Scope* and *Who presses the button* above):
 
-- a PR with **no project owner**, a **release cut** (a `dev`→`main` release PR or a
-  hotfix PR into `main`), and a **reconcile** PR;
+- a PR with **no project owner**, a **release** (the fast-forward of `main` to the
+  head of the release PR, a soak-fix copy into `release/*`, and the merge-back of a
+  release branch into `dev`: `docs/internal/RELEASING.md` steps 5 to 10), and a
+  **reconcile** PR;
 - *(retired 2026-10-22 23:31Z, see the Amendment above)* ~~a PR whose author is its
   project owner goes to a merge seat for the press~~ — **the owner presses their own PR**
   once the record below is posted; the hand-off to a seat was clerical once the record
@@ -466,7 +468,7 @@ change.
 *Queue status: NOT AVAILABLE on this repository (Team plan, private), measured 2026-10-22 16:05Z.*
 
 **What the merge seats still do.** Kepler and Borges (Ariadne on umwelt) keep the
-seat for ownerless PRs, release cuts, reconciles, the seats whose user has not granted
+seat for ownerless PRs, releases (as defined above), reconciles, the seats whose user has not granted
 merge clicks (*Who* above), ⛔-list and security PRs, and any merge an owner declines ("I'd rather a second pair
 of eyes" is always allowed and never a demerit); the commander keeps the day-end
 sample of merge records. The seat is no longer the serial point; the written gate is.

@@ -25,6 +25,7 @@ wonder what the tags ending in `-history-twin` are.
 |---|---|
 | `main` | Releases. From v0.5.6 on, every release is a tagged commit on `main`. This is the default branch. |
 | `dev` | Development. Changes are merged here first; `main` moves forward only when a release is made. |
+| `release/X.Y.Z` | One per release, from v0.5.7 on: cut from `dev` at the release candidate, it carries that version's candidate tags while they are tested. `main` is moved forward to its head at the release. It is kept afterwards and never deleted. |
 | `release-snapshots` | The archive: the 17 commits that were `main` up to v0.5.5 (one per release for the 16 releases, and one extra commit from the v0.4.0 release). We do not add to it or change it. |
 
 `main` and `dev` share one history. `release-snapshots` shares no commit with

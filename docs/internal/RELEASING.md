@@ -215,7 +215,8 @@ that is the maintainer's call.
 
 ## Part 2: the release
 
-Nothing in this part happens before the maintainer's go.
+Nothing in this part that moves a branch or creates a tag happens before the
+maintainer's go. Step 6 only reads.
 
 ### 6. Read the release pull request's check
 
@@ -224,7 +225,7 @@ the soak report. Read it again now, on the accepted candidate, in one shell:
 
 ```bash
 git fetch origin --tags
-C=$(git rev-parse 'vX.Y.Z-rcN^{commit}')           # the accepted candidate
+C=$(git rev-parse --verify -q 'vX.Y.Z-rcN^{commit}')           # the accepted candidate
 if [ -n "$C" ] && [ "$C" = "$(git rev-parse origin/release/X.Y.Z)" ]; then
     gh api "repos/engram-agents/engram/commits/$C/check-runs?per_page=100" \
       --jq '.check_runs[] | select(.name=="pytest (3.12)") | {conclusion, head_sha, run: .details_url}'
@@ -235,9 +236,15 @@ gh run view <run-id> --repo engram-agents/engram --json event,headSha,conclusion
 ```
 
 The first command prints one line for **every** run of the check on that
-commit; read all of them, not the first. `head_sha` must equal `C`, the
-producing run's `event` must be `pull_request`, and the conclusion must be
-`success`. This check is gate G1.
+commit, and more than one is normal: a hand-started run on the candidate tag
+shows up under the same name (measured on v0.5.7-rc3: two rows, one from a
+hand-started run on the tag and one from the release pull request). **Pick the
+row by its event, not by its colour.** For each row, read its run with the
+second command; the row that counts is the one whose `event` is
+`pull_request`. That row's `head_sha` must equal `C` and its conclusion must
+be `success`. A green row from a hand-started run does not count, and `main`
+would refuse the push in step 7 if it were the only one. This check is gate
+G1.
 
 **If the check is red, stop.** Read which cells failed and bring them to the
 maintainer with their cause. Whether a red that is confined to a test already
@@ -253,7 +260,7 @@ push below would name no source, which git reads as a request to delete `main`.
 
 ```bash
 git fetch origin --tags
-C=$(git rev-parse 'vX.Y.Z-rcN^{commit}')           # the commit whose check was read in step 6
+C=$(git rev-parse --verify -q 'vX.Y.Z-rcN^{commit}')           # the commit whose check was read in step 6
 if [ -n "$C" ] && [ "$C" = "$(git rev-parse origin/release/X.Y.Z)" ] \
    && git merge-base --is-ancestor origin/main "$C"; then
     git push origin "$C":refs/heads/main           # never with --force
@@ -275,7 +282,9 @@ maintainer. Never force, and never suspend a rule to get past a refusal.
 `main` is never moved back: its history rule allows no force-move for anyone,
 so a bad release is repaired by a new release, not by moving `main`.
 
-The pull request reads `MERGED` once `main` contains its head. If it reads
+The pull request is expected to read `MERGED` once `main` contains its head
+(GitHub's documented behaviour; not yet observed on this repository, so the
+first release cut this way records what it actually read). If it reads
 `CLOSED`, the record would say the release pull request was abandoned; find
 out why before going on.
 
@@ -340,7 +349,7 @@ green `pytest (3.12)` from a pull request or push run on that commit.
 
 ```bash
 git fetch origin --tags
-C=$(git rev-parse 'vX.Y.Z-rcN^{commit}')           # the accepted candidate
+C=$(git rev-parse --verify -q 'vX.Y.Z-rcN^{commit}')           # the accepted candidate
 if [ -n "$C" ] && [ "$C" = "$(git rev-parse origin/main)" ] \
    && [ "$C" = "$(git rev-parse origin/release/X.Y.Z)" ]; then
     git tag -a vX.Y.Z "$C" -m "vX.Y.Z" && git push origin vX.Y.Z
