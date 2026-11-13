@@ -440,3 +440,80 @@ def test_4206_hex_prefers_a_later_free_occurrence_over_an_embedded_one():
     result = anchor("ref abcdef1", "ref abcdef1zz and then abcdef1c0ffee9")
     assert result.unanchored == []
     assert result.ratio == 1.0
+
+
+# ── #4678: a verbatim quote anchors every token (the round-trip property) ──
+#
+# The invariant: when the quote is byte-identical to the claim, every hard
+# token the claim tokenizer cut out is anchored. Before this fix the claim
+# tokenizer drops glued units (`19.3s` -> `19.3`, `82089B` -> `82089`) and
+# `_token_is_anchored` then refused that token in the quote, because the
+# quote spells it with the dropped suffix glued on. The same token was cut
+# from the claim and refused in the identical place in the quote.
+#
+# Every fixture below is used as BOTH claim and quote.
+
+VERBATIM_ROUNDTRIP_FIXTURES = [
+    # The six shapes that scored 0/N before the fix.
+    "took 404ms",
+    "run took 19.3s",
+    "file is 82089B",
+    "at 2026-09-06T10:00Z",
+    "merged as engram#4040",
+    "see owner/repo#123",
+    # A hex sha that already passed (control), plus the other token classes.
+    "sha 60754dcc",
+    "cites ob_1234",  # a node id
+    "closes #404",  # a bare issue/PR ref
+    "fetched https://example.com/doc?rev=1234",  # a URL
+    "wrote /var/log/app/2026-09-06.log",  # a path
+    "grew 3.5%",  # a percent (tokenizes to zero hard tokens -- see guard)
+    "",  # empty: vacuously anchored, ratio is None
+    "the sha 60754dcc closed #4040 at 2026-09-06T10:00Z",  # multi-token
+]
+
+
+def test_4678_verbatim_quote_anchors_every_token():
+    """The cell that would have caught the blocker: for each fixture,
+    ``anchor(c, c)`` anchors every hard token the claim tokenizer emits.
+
+    The sweep must also be non-degenerate: a tokenizer that silently emitted
+    nothing would make every fixture vacuously "anchored", so the aggregate
+    token count across the fixtures is asserted to be substantial.
+    """
+    total_tokens = 0
+    for text in VERBATIM_ROUNDTRIP_FIXTURES:
+        result = anchor(text, text)
+        total_tokens += result.hard_tokens
+        assert result.unanchored == [], (
+            f"verbatim quote did not anchor every token: {text!r} -> "
+            f"unanchored={result.unanchored} (tokens={hard_tokens(text)})"
+        )
+        if result.hard_tokens:
+            assert result.ratio == 1.0, f"{text!r} -> ratio={result.ratio}"
+        else:
+            # No hard tokens: "every token anchored" is vacuously true, and
+            # ratio is None by the module's documented zero-token contract.
+            assert result.ratio is None, f"{text!r} -> ratio={result.ratio}"
+    assert total_tokens >= 8, (
+        f"degenerate sweep: only {total_tokens} hard tokens across "
+        f"{len(VERBATIM_ROUNDTRIP_FIXTURES)} fixtures"
+    )
+
+
+def test_4678_glued_claim_token_anchors_where_the_quote_separates_it():
+    """Direct cell for the tokenizer-set union.
+
+    The quote ``the request 404-ed`` carries ``404`` as its own hard token --
+    the ``-ed`` is hyphen-delimited, so the number run is ``404``. The claim
+    token ''404'' (cut from ``404ms``) is therefore present in the quote's
+    own token set. It SHOULD anchor: the number is literally in the quote,
+    and the hyphen is a token boundary on ``_token_is_anchored``'s own rule
+    too, so the two agree.
+    """
+    assert hard_tokens("the request 404-ed") == ["404"]
+    result = anchor("took 404ms", "the request 404-ed")
+    assert result.hard_tokens == 1
+    assert result.anchored == 1
+    assert result.unanchored == []
+    assert result.ratio == 1.0

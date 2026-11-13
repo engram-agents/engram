@@ -142,6 +142,51 @@ def _token_is_anchored(tok: str, quote: str, *, hex_class: bool) -> bool:
     return False
 
 
+def _glued_sides(text: str, start: int, end: int) -> tuple[bool, bool]:
+    """(left, right): whether a word or number unit glues onto the occurrence
+    ``text[start:end]`` on each side.
+
+    A side is glued when the adjacent character is a word character, or a
+    '.'/',' standing between two digits (the number-separator rule). A text
+    edge is never glued. This mirrors the boundary alphabet ``_token_is_anchored``
+    uses, but measures the occurrence's own neighbourhood rather than a
+    fixed per-token rule -- so the same (left, right) pair means "the
+    tokenizer cut this token out of the same kind of surroundings".
+    """
+    tok = text[start:end]
+    left = False
+    if start > 0:
+        ch = text[start - 1]
+        left = ch in _WORD_CHARS or (
+            ch in _NUMERIC_SEPARATORS
+            and tok[:1].isdigit()
+            and start >= 2
+            and text[start - 2].isdigit()
+        )
+    right = False
+    if end < len(text):
+        ch = text[end]
+        right = ch in _WORD_CHARS or (
+            ch in _NUMERIC_SEPARATORS
+            and tok[-1:].isdigit()
+            and end + 1 < len(text)
+            and text[end + 1].isdigit()
+        )
+    return left, right
+
+
+def _boundary_signatures(text: str, tok: str) -> set[tuple[bool, bool]]:
+    """Every (left, right) glue signature `tok` takes at any occurrence in
+    `text`. Used for the #4678 union: the quote must carry the token with the
+    same boundary structure the claim has, not merely the same characters."""
+    signatures: set[tuple[bool, bool]] = set()
+    start = text.find(tok)
+    while start != -1:
+        signatures.add(_glued_sides(text, start, start + len(tok)))
+        start = text.find(tok, start + 1)
+    return signatures
+
+
 def _digit_count(token: str) -> int:
     return sum(ch.isdigit() for ch in token)
 
@@ -267,17 +312,38 @@ def anchor(claim: str, quoted_text: str) -> AnchoringResult:
     the same sha in mixed case across surfaces); see `_token_is_anchored`
     for the exact boundary rule, including the hex class's looser right
     side so a short sha still anchors as the prefix of the full one.
+
+    A token also anchors when it is in the quote's own hard-token set AND
+    the quote carries it with the same boundary structure the claim has
+    (#4678). Two strings agree iff the same tokenizer finds the same token
+    in both: membership in the quote's token set is the tokenizer's own
+    verdict, and it cannot produce a token the tokenizer would not have cut
+    there. That union is what makes a verbatim quote anchor every token --
+    the claim tokenizer drops a glued unit (`19.3s` -> `19.3`) and
+    membership recovers it. Membership alone is not enough: the number
+    regex has no left boundary, so the tokenizer also cuts `404` out of
+    `x404`; requiring the quote occurrence to share the claim occurrence's
+    boundary structure keeps `404` out of `x404`, `404x` and `#4040` (the
+    #4206 regressions this must not reopen).
     """
     tokens = _hard_tokens_with_class(claim)
     if not tokens:
         return AnchoringResult(hard_tokens=0, anchored=0, ratio=None, unanchored=[])
 
     quote = quoted_text or ""
+    # The quote's own hard-token set, computed once (engram-alpha#4678).
+    quote_tokens = set(hard_tokens(quote))
 
     unanchored: list[str] = []
     anchored_count = 0
     for tok, cls in tokens:
-        if _token_is_anchored(tok, quote, hex_class=cls == _HEX_SHA_CLASS):
+        anchored = _token_is_anchored(tok, quote, hex_class=cls == _HEX_SHA_CLASS)
+        if not anchored and tok in quote_tokens:
+            anchored = bool(
+                _boundary_signatures(claim, tok)
+                & _boundary_signatures(quote, tok)
+            )
+        if anchored:
             anchored_count += 1
         else:
             unanchored.append(tok)

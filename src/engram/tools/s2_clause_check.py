@@ -284,7 +284,9 @@ def check_b1(quote: str, clause: str) -> dict:
     shipped advisory's pre-#4206 behaviour -- ``tok in quote``, case-insensitive for the hex-sha
     class only -- implemented here rather than borrowed from engram_anchoring.anchor(): that
     matcher became token-boundary-aware in #4206 and may move again, and a baseline must not move
-    with the thing it is a baseline of."""
+    with the thing it is a baseline of. The freeze covers the VERDICT, not the list: this baseline
+    still calls ``_hard_tokens_with_class``, so tokenizer changes move its ``unanchored`` LIST
+    (measured: 2,576 of 4,852 observations on Ariadne's corpus) while the verdict did not move."""
     quote = quote or ""
     quote_lower = quote.lower()
     unanchored = [
