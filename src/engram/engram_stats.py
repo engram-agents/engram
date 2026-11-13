@@ -1027,6 +1027,25 @@ def _diagnose_impl() -> str:
             "flare": _nul_live > 0,
         }
 
+        # Strict summary-refresh debt is current-node-only operational state;
+        # it is not a claim that every historic marked vector differs, and it
+        # deliberately does not participate in confidence/health algebra.
+        _refresh_debt_ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM nodes WHERE is_current = 1 "
+                "AND json_valid(metadata) "
+                "AND json_type(metadata, '$.embedding_refresh_pending') = 'object' "
+                "ORDER BY id"
+            ).fetchall()
+        ]
+        metrics["embedding_refresh_debt"] = {
+            "entity_kind": "current_node",
+            "count": len(_refresh_debt_ids),
+            "sample_ids": _refresh_debt_ids[:10],
+            "flare": bool(_refresh_debt_ids),
+        }
+
         # ── Agent Experience ─────────────────────────────────────────────
         experience: dict = {}
 

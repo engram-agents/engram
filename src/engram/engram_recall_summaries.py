@@ -11,6 +11,7 @@ HOUSE RULES (mirror engram_core.py § HOUSE RULES):
 
 import json
 import os
+from datetime import datetime, timezone
 
 import engram_core as core
 from tools.recall_summary_validator import validate_summary_entry
@@ -40,7 +41,9 @@ from tools.recall_summary_validator import validate_summary_entry
 # entries apply, invalid entries return per-item errors. Doesn't roll back
 # the whole batch on one bad row.
 #
-# Idempotent: re-writing the same node with the same summary is a no-op.
+# Idempotent at the curated-field level: re-writing the same node leaves the
+# same summary/keywords, but still performs a strict embedding refresh so a
+# same-input replay can repair stale vector data.
 # Constants + per-entry validation live in tools/recall_summary_validator.py
 # (single source of truth — used both here and by the batch-summary-fairy).
 #
@@ -60,6 +63,104 @@ from tools.recall_summary_validator import validate_summary_entry
 # resolve to an unrelated file. "summaries" and "summaries_file" together is
 # a loud, ambiguous-input error; neither present is the existing
 # missing-"summaries" error.
+
+_EMBEDDING_REFRESH_PENDING = "embedding_refresh_pending"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _vec_store_exists(conn) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vec_nodes'"
+    ).fetchone() is not None
+
+
+def _set_embedding_refresh_marker(conn, node_id: str, metadata_raw, *, reason: str) -> str | None:
+    """Persist strict-refresh debt while preserving unrelated metadata keys."""
+    metadata, warning = core._metadata_dict_for_write(
+        metadata_raw, node_id, "engram_set_recall_summaries"
+    )
+    metadata[_EMBEDDING_REFRESH_PENDING] = {
+        "reason": reason, "stage": "strict_refresh", "at": _utc_now(),
+    }
+    if conn.execute(
+        "UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(metadata), node_id)
+    ).rowcount != 1:
+        raise RuntimeError("could not persist embedding refresh debt marker")
+    return warning
+
+
+def _clear_embedding_refresh_marker(conn, node_id: str, metadata_raw) -> str | None:
+    """The sole debt-clearer: a verified strict refresh of this one node."""
+    metadata, warning = core._metadata_dict_for_write(
+        metadata_raw, node_id, "engram_set_recall_summaries"
+    )
+    metadata.pop(_EMBEDDING_REFRESH_PENDING, None)
+    if conn.execute(
+        "UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(metadata), node_id)
+    ).rowcount != 1:
+        raise RuntimeError("could not clear embedding refresh debt marker")
+    return warning
+
+
+def _pending_reason(outcome) -> str:
+    if outcome.status == "skipped":
+        return "unavailable"
+    if outcome.stage in {"text", "embed", "store"}:
+        return outcome.stage
+    return "embedding"
+
+
+def _strict_refresh_embedding(conn, node_id: str, metadata_raw) -> tuple[dict, str | None]:
+    """Refresh and verify one full recipe; restore both vector stores on failure.
+
+    This is intentionally the single per-node marker-clearing path which a
+    later explicit repair operation must reuse.
+    """
+    conn.execute("SAVEPOINT recall_summary_vector_refresh")
+    reason = None
+    try:
+        outcome = core._compute_and_store_embedding(conn, node_id)
+        if outcome.status != "embedded":
+            reason = _pending_reason(outcome)
+        elif not outcome.vec_mirror_ok:
+            reason = "mirror"
+        else:
+            row = conn.execute("SELECT embedding FROM nodes WHERE id = ?", (node_id,)).fetchone()
+            try:
+                vector = json.loads(row[0]) if row else None
+            except (TypeError, json.JSONDecodeError):
+                vector = None
+            if not isinstance(vector, list) or not vector:
+                reason = "canonical"
+            elif _vec_store_exists(conn):
+                # Do not accept the core helper's normal-write tolerance or
+                # its wrong-dimension mirror bypass in this strict path.
+                if (not core._VEC_BACKEND_AVAILABLE or core._sqlite_vec is None
+                        or len(vector) != 384):
+                    reason = "mirror"
+                else:
+                    mirror = conn.execute(
+                        "SELECT embedding FROM vec_nodes WHERE node_id = ?", (node_id,)
+                    ).fetchone()
+                    if mirror is None or mirror[0] != core._sqlite_vec.serialize_float32(vector):
+                        reason = "mirror"
+    except Exception:  # savepoint makes unexpected compute/verify failure non-destructive
+        reason = "embedding"
+
+    if reason is not None:
+        conn.execute("ROLLBACK TO recall_summary_vector_refresh")
+        conn.execute("RELEASE recall_summary_vector_refresh")
+        warning = _set_embedding_refresh_marker(conn, node_id, metadata_raw, reason=reason)
+        return {"embedding_refresh": "pending", "embedding_refresh_reason": reason}, warning
+
+    conn.execute("RELEASE recall_summary_vector_refresh")
+    warning = _clear_embedding_refresh_marker(conn, node_id, metadata_raw)
+    return {"embedding_refresh": "refreshed"}, warning
+
+
 def _set_recall_summaries_impl(payload_json: str) -> str:
     """Impl for engram_set_recall_summaries — takes raw payload_json string."""
     # -- Parse payload --
@@ -152,6 +253,8 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
 
     # -- Apply valid entries in a single transaction --
     ok: list[dict] = []
+    needs_reembed: list[str] = []
+    warnings: list[str] = []
     conn = core._get_db()
     try:
         with conn:
@@ -159,9 +262,10 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
                 node_id = entry["node_id"].strip()
                 recall_summary = entry["recall_summary"]
                 recall_keywords = entry["recall_keywords"]
+                conn.execute("SAVEPOINT recall_summary_entry")
                 try:
                     row = conn.execute(
-                        "SELECT id, is_current FROM nodes WHERE id = ?",
+                        "SELECT id, is_current, metadata FROM nodes WHERE id = ?",
                         (node_id,),
                     ).fetchone()
                     if row is None:
@@ -169,12 +273,14 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
                             "node_id": node_id,
                             "error": "node not found",
                         })
+                        conn.execute("RELEASE recall_summary_entry")
                         continue
                     if row["is_current"] != 1:
                         errors.append({
                             "node_id": node_id,
                             "error": "node is not current (superseded)",
                         })
+                        conn.execute("RELEASE recall_summary_entry")
                         continue
                     # Clear needs_tightening/summary_missing on successful apply
                     # (#1952 PR3): both flags exist to queue a node into the
@@ -196,8 +302,17 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
                         "needs_tightening = 0, summary_missing = 0 WHERE id = ?",
                         (recall_summary, json.dumps(recall_keywords), node_id),
                     )
-                    ok.append({"node_id": node_id})
+                    refresh, warning = _strict_refresh_embedding(conn, node_id, row["metadata"])
+                    if warning is not None:
+                        warnings.append(warning)
+                    conn.execute("RELEASE recall_summary_entry")
+                    item = {"node_id": node_id, **refresh}
+                    ok.append(item)
+                    if refresh["embedding_refresh"] == "pending" and node_id not in needs_reembed:
+                        needs_reembed.append(node_id)
                 except Exception as exc:  # noqa: BLE001
+                    conn.execute("ROLLBACK TO recall_summary_entry")
+                    conn.execute("RELEASE recall_summary_entry")
                     errors.append({"node_id": node_id, "error": str(exc)})
     finally:
         conn.close()
@@ -208,7 +323,10 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
         "applied": len(ok),
         "failed": len(errors),
         "pre_flight_failures": pre_flight_failures,
+        "needs_reembed": needs_reembed,
     }
+    if warnings:
+        result["warnings"] = warnings
     # File-based responses always echo the resolved path, even when applied=0 —
     # so a genuinely-empty final_payload.json ("nothing to summarize tonight")
     # is distinguishable in the response from a misread/empty file, and never
