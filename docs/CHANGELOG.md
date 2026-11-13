@@ -109,17 +109,18 @@ messages.
   Claude Code had used for months, `model` stayed `opus`. A fresh home on one
   Linux machine with a newer build did not reproduce the change, and that
   difference is not explained (#4628). On that Linux machine both replaced
-  files kept their permission mode (600, 640 and 644 were tried, with no ACL)
-  and a newly created `~/.claude.json` had mode 600. For a file that carried
+  files kept their permission mode with no ACL set (`settings.json` at 600,
+  640 and 644; `~/.claude.json` at 600 and 644), and a newly created
+  `~/.claude.json` had mode 600. For a file that carried
   an ACL entry, the kept mode is the ACL mask, so the entry is gone and the
   file's own group has the permission the mask had: a file whose group had no
   access, with a read entry for one other user, came out readable by its
   group, and with a read-and-write entry, readable and writable by its group.
   The mode after a replace, and this effect on the group, were not measured
-  on macOS. The marketplace step comes before the installer's question about an existing `CLAUDE.md`, so a run that stops at
-  that question has already run that step (and any migration) and has created
-  the data folder, but has not run the plugin install; `CLAUDE.md` itself is
-  untouched.
+  on macOS. The marketplace step comes before the installer's question about
+  an existing `CLAUDE.md`, so a run that stops at that question has already
+  run that step (and any migration) and has created the data folder, but has
+  not run the plugin install; `CLAUDE.md` itself is untouched.
 - **`config.json` while an agent runs.** ENGRAM rewrites its own `config.json`
   at least at every turn advance (at each sleep), by writing a new file and
   renaming it over the old one, so that a concurrent reader never sees a
