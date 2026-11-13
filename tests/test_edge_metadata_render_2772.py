@@ -243,3 +243,65 @@ def test_existing_keys_unchanged():
                direction="both", view="edges")
     e = _by_id(sg["topology"][ids["hub"]], ids["null"], "to")
     assert set(e) == {"to", "relation", "direction"}
+
+
+# ---- the WHOLE dict, not a projection of it ------------------------------
+
+TWO_KEY = {"reason": "kept the finding", "extra": "x"}
+NESTED = {"reason": "r", "detail": {"a": [1, 2]}}
+
+
+def _seed_rich(server):
+    """_seed plus two `cites` edges (SQL on the tmp store) whose metadata is
+    a two-key dict (second key not reason/note) and a nested-value dict."""
+    ids = _seed(server)
+    ids["rich"] = _axiom(server, "Rich metadata source.")
+    ids["two"] = _axiom(server, "Target of the two-key edge.")
+    ids["nest"] = _axiom(server, "Target of the nested edge.")
+    conn = server._get_db()
+    try:
+        for tgt, meta in (("two", TWO_KEY), ("nest", NESTED)):
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at, metadata) "
+                "VALUES (?, ?, 'cites', '2026-01-01T00:00:00Z', ?)",
+                (ids["rich"], ids[tgt], json.dumps(meta)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return ids
+
+
+def _assert_whole(server, ids, key, expected):
+    for view in ("edges", "deep"):
+        e = _by_id(_topo_entries(_inspect(server, ids["rich"], view)),
+                   ids[key], "dst")
+        assert e["edge_metadata"] == expected, (view, e)
+    for view in ("edges", "recall"):
+        resp = _call(server, "engram_get_subgraph", node_id=ids["rich"],
+                     depth=1, direction="both", view=view)
+        assert "error" not in resp, resp
+        out = _by_id(resp["topology"][ids["rich"]], ids[key], "to")
+        inc = _by_id(resp["topology"][ids[key]], ids["rich"], "to")
+        for ent in (out, inc):
+            assert ent["edge_metadata"] == expected, (view, ent)
+
+
+def test_two_key_dict_rendered_whole():
+    s = fresh_server(); ids = _seed_rich(s)
+    _assert_whole(s, ids, "two", TWO_KEY)
+
+
+def test_nested_value_rendered_whole():
+    s = fresh_server(); ids = _seed_rich(s)
+    _assert_whole(s, ids, "nest", NESTED)
+
+
+def test_recall_view_superseded_node_downstream_group():
+    # inspecting the OLD node puts the new node in the DOWNSTREAM group,
+    # a different render group from the new node's upstream view.
+    s = fresh_server(); ids = _seed(s)
+    resp = _inspect(s, ids["old"], "recall")
+    e = _by_id(resp["logical_neighbors"]["downstream"], ids["new"], "id")
+    assert e["relation"] == "supersedes"
+    assert e["edge_metadata"] == {"reason": REASON}
