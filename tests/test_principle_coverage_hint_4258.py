@@ -121,6 +121,54 @@ def seed_uncovered(server, core, ptype):
     return lid
 
 
+_CALL_RE = re.compile(r"(engram_\w+)\(payload fields: (.*?)\)(?=;| writes|$)")
+
+
+def _split_top(text):
+    """Split on ',' outside {} and <>."""
+    parts, depth, cur = [], 0, ""
+    for ch in text:
+        if ch in "{<":
+            depth += 1
+        elif ch in "}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
+def parse_tool_calls(hint):
+    """Parse every `tool(payload fields: a=b, c=d)` call the hint prints into
+    [(tool, {name: raw_value})], in printed order."""
+    calls = []
+    for m in _CALL_RE.finditer(hint):
+        args = {}
+        for part in _split_top(m.group(2)):
+            name, _, val = part.partition("=")
+            args[name.strip()] = val.strip()
+        calls.append((m.group(1), args))
+    return calls
+
+
+def dispatch_hint_call(server, tool, args, placeholder_id):
+    """Run a parsed hint call: `<...>` placeholders become `placeholder_id`
+    (updates is a JSON object whose placeholder becomes a real regex)."""
+    payload = {}
+    for name, raw in args.items():
+        if name == "updates":
+            payload[name] = json.loads(re.sub(r"<[^>]*>", "npm publish --tag next", raw))
+        elif raw.startswith("<") and raw.endswith(">"):
+            payload[name] = placeholder_id
+        else:
+            payload[name] = raw
+    return _call(getattr(server, tool), **payload)
+
+
 def run_coverage(fake_home):
     import engram_stats
     with mock.patch("engram_stats.Path") as m:
@@ -173,15 +221,24 @@ def test_axiom_goal_hint_has_no_exemplar_tools(env, ptype):
     assert "exemplar" not in hint
 
 
-def test_axiom_hint_names_instantiates_and_goal_hint_names_serves(env):
+def _hint(env, ptype):
     server, core, home = env
-    ax = seed_uncovered(server, core, "axiom")
-    goal = seed_uncovered(server, core, "goal")
-    pc = run_coverage(home)
-    assert "engram_add_edge" in uncovered_entry(pc, ax)["cheapest_fix"]
-    assert "instantiates" in uncovered_entry(pc, ax)["cheapest_fix"]
-    assert "engram_add_edge" in uncovered_entry(pc, goal)["cheapest_fix"]
-    assert "serves" in uncovered_entry(pc, goal)["cheapest_fix"]
+    nid = seed_uncovered(server, core, ptype)
+    return nid, uncovered_entry(run_coverage(home), nid)["cheapest_fix"]
+
+
+def test_axiom_hint_names_exact_relation(env):
+    _nid, hint = _hint(env, "axiom")
+    assert "relation=instantiates" in hint
+    assert "relation=serves" not in hint
+    assert "engram_add_edge" in hint
+
+
+def test_goal_hint_names_exact_relation(env):
+    _nid, hint = _hint(env, "goal")
+    assert "relation=serves" in hint
+    assert "relation=instantiates" not in hint
+    assert "engram_add_edge" in hint
 
 
 def test_lesson_and_cornerstone_hints_name_register_exemplar(env):
@@ -195,34 +252,54 @@ def test_lesson_and_cornerstone_hints_name_register_exemplar(env):
     assert "engram_update_lesson" not in uncovered_entry(pc, cs)["cheapest_fix"]
 
 
-# ── C: follow the hint ───────────────────────────────────────────────────────
-
-def _apply_tool_action(server, ptype, nid):
-    """Apply the hint's tool action as the hint describes it."""
-    ex = _seed_axiom(server, f"Exemplar/realizer for {nid}.")
-    if ptype in ("lesson", "cornerstone"):
-        r = _call(server.engram_register_exemplar, target_id=nid, exemplar_id=ex)
-        assert r.get("status") == "created", r
-    else:
-        r = _call(server.engram_add_edge, source_id=ex, target_id=nid,
-                  relation="instantiates" if ptype == "axiom" else "serves")
-        assert r.get("status") == "created", r
+def _field_sets(server):
+    """The real payload field names, read from the tool code in server.py."""
+    return {
+        "engram_register_exemplar": set(server._REGISTER_EXEMPLAR_FIELDS),
+        "engram_add_edge": set(server._ADD_EDGE_FIELDS),
+        "engram_update_lesson": set(server._UPDATE_LESSON_FIELDS),
+    }
 
 
 @pytest.mark.parametrize("ptype", TYPES)
-def test_following_tool_action_clears_uncovered(env, ptype):
+def test_every_printed_argument_name_is_a_real_payload_field(env, ptype):
+    server, _core, _home = env
+    _nid, hint = _hint(env, ptype)
+    calls = parse_tool_calls(hint)
+    assert calls, hint
+    fields = _field_sets(server)
+    for tool, args in calls:
+        assert tool in fields, tool
+        assert args, tool
+        assert set(args) <= fields[tool], (tool, set(args) - fields[tool])
+
+
+# ── C: follow the hint ───────────────────────────────────────────────────────
+
+EXPECTED_RELATION = {"axiom": "instantiates", "goal": "serves"}
+
+
+@pytest.mark.parametrize("ptype", TYPES)
+def test_following_printed_first_action_clears_uncovered(env, ptype):
+    """Parse the FIRST tool call out of the printed hint and dispatch it."""
     server, core, home = env
-    nid = seed_uncovered(server, core, ptype)
+    nid, hint = _hint(env, ptype)
     assert uncovered_entry(run_coverage(home), nid) is not None
-    _apply_tool_action(server, ptype, nid)
+    tool, args = parse_tool_calls(hint)[0]
+    if ptype in EXPECTED_RELATION:
+        assert args.get("relation") == EXPECTED_RELATION[ptype], args
+    ex = _seed_axiom(server, f"Exemplar/realizer for {nid}.")
+    r = dispatch_hint_call(server, tool, args, ex)
+    assert r.get("status") == "created", r
     assert uncovered_entry(run_coverage(home), nid) is None
 
 
-def test_following_update_lesson_action_clears_uncovered(env):
+def test_following_printed_update_lesson_action_clears_uncovered(env):
     server, core, home = env
-    nid = seed_uncovered(server, core, "lesson")
-    r = _call(server.engram_update_lesson, node_id=nid,
-              updates={"situation_pattern": r"git push --force"})
+    nid, hint = _hint(env, "lesson")
+    calls = [c for c in parse_tool_calls(hint) if c[0] == "engram_update_lesson"]
+    assert len(calls) == 1, hint
+    r = dispatch_hint_call(server, calls[0][0], calls[0][1], nid)
     assert "error" not in r, r
     assert uncovered_entry(run_coverage(home), nid) is None
 
