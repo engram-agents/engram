@@ -81,8 +81,10 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     authoritative.  Only the ``user.*`` namespace is copied: ``security.*`` and
     ``trusted.*`` are frequently unreadable or unsettable by an unprivileged
     writer, so attempting them would turn a normal write into a failure on
-    SELinux hosts.  The access ACL is read explicitly, since the kernel may not
-    list it with ``listxattr``; ``system.posix_acl_default`` is a directory
+    SELinux hosts.  The access ACL is read explicitly rather than inferred from
+    ``listxattr``: whether that call reports ``system.posix_acl_access`` is
+    filesystem-dependent (some list it, some do not), and the copy must not
+    depend on which; ``system.posix_acl_default`` is a directory
     attribute and does not apply to a regular file.  If the source carries one
     of these and it cannot be applied to the temp, the write raises, the temp is
     removed, and the target is left untouched.  Kept AST-identical with
