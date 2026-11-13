@@ -72,7 +72,8 @@ def deny_unmapped_text(source, model_id, self_lineage, home):
 
 
 def deny_unmapped_c_text(source, model_id, self_lineage, home):
-    """Branch (c) deny (rule U): remedies in the order relaunch, table row, human's lineage decision."""
+    """Branches (c) and (d) deny: remedies in the order relaunch, table row, human's lineage decision.
+    (Round 9: branch (d) carries this same text; branch (a) keeps `deny_unmapped_text`.)"""
     return (f"ENGRAM write blocked by the model-family gate. {source} came from model `{model_id}`, "
             f"which the gate does not recognise as family `{self_lineage}`. Nothing was written. To continue: "
             f"relaunch the session on a `{self_lineage}` model. If `{model_id}` is your own vendor's "
@@ -590,7 +591,30 @@ def test_c4_unmapped_c_provider_not_recognised_own_first_token_allows_unverified
 @pytest.mark.parametrize("model", ["mystery-9", "claude-sonnet-5 beta"])
 def test_c4_unmapped_d_family_token_absent_denies(hook, home, tmp_path, model):
     t = _call(tmp_path, model)
-    assert out(hook.decide(pay(tpath=t), home)) == ("deny", deny_unmapped_text(THIS_CALL, model, SELF, home))
+    assert out(hook.decide(pay(tpath=t), home)) == ("deny", deny_unmapped_c_text(THIS_CALL, model, SELF, home))
+
+
+@pytest.mark.parametrize("lineage,model", [("openai:gpt", "o5-mini"), (SELF, "gemini-2.5-flash")])
+def test_c4_unmapped_d_deny_carries_the_three_remedies_in_order(hook, home, tmp_path, lineage, model):
+    """Round 9: branch (d) (family token absent): own vendor with no family token, and a foreign id with
+    none.  The exact text AND the order relaunch < table row < `self_lineage`."""
+    set_lineage(home, lineage)
+    t = _call(tmp_path, model)
+    got = out(hook.decide(pay(tpath=t), home))
+    assert got == ("deny", deny_unmapped_c_text(THIS_CALL, model, lineage, home))
+    text = got[1]
+    assert (text.index("relaunch the session") < text.index("add its exact id to the model table")
+            < text.index("change `self_lineage` in"))
+
+
+def test_c4_unmapped_a_deny_does_not_carry_the_table_row_sentence(hook, home, tmp_path):
+    """Round 9: branch (a) keeps the old text; the parser knows the id is another vendor's, so a table row
+    cannot be the fix."""
+    set_lineage(home, "openai:gpt")
+    t = _call(tmp_path, "claude-opus-5 beta")
+    got = out(hook.decide(pay(tpath=t), home))
+    assert got == ("deny", deny_unmapped_text(THIS_CALL, "claude-opus-5 beta", "openai:gpt", home))
+    assert "add its exact id to the model table" not in got[1]
 
 
 def test_c4_unmapped_family_token_is_a_whole_hyphen_token_not_a_substring(hook, home, tmp_path):
@@ -600,7 +624,7 @@ def test_c4_unmapped_family_token_is_a_whole_hyphen_token_not_a_substring(hook, 
 
 def test_c4_unmapped_from_the_fallback_uses_the_previous_reply_wording(fast, home, tmp_path):
     t = write_jsonl(tmp_path / "t.jsonl", [asst("mystery-9")])
-    assert out(fast.decide(pay(tpath=t), home)) == ("deny", deny_unmapped_text(PREVIOUS, "mystery-9", SELF, home))
+    assert out(fast.decide(pay(tpath=t), home)) == ("deny", deny_unmapped_c_text(PREVIOUS, "mystery-9", SELF, home))
     t2 = write_jsonl(tmp_path / "t2.jsonl", [asst("mystery-opus-9")])
     assert out(fast.decide(pay(tpath=t2), home)) == (
         "deny", deny_unmapped_c_text(PREVIOUS, "mystery-opus-9", SELF, home))
@@ -609,12 +633,12 @@ def test_c4_unmapped_from_the_fallback_uses_the_previous_reply_wording(fast, hom
 
 
 # Rule U measured column: (lineage, id, expected).  Expected kinds: allow (silent), notice, deny_c (branch c
-# text), deny_old (branch a/d text), deny_mapped:<lineage> (the id maps to another lineage).
+# text), deny_d (branch d text, the same as c since round 9), deny_mapped:<lineage> (the id maps to another lineage).
 RULE_U_ROWS = [
     ("deepseek:flash", "deepseek-v4.1-flash", "allow"),
     ("deepseek:flash", "deepseek-v5-flash", "notice"),
     ("deepseek:flash", "ds-v5-flash", "deny_c"),
-    ("deepseek:flash", "deepseek-v5-pro", "deny_old"),
+    ("deepseek:flash", "deepseek-v5-pro", "deny_d"),
     ("deepseek:flash", "gemini-2.5-flash", "deny_c"),
     ("deepseek:flash", "qwen3-flash", "deny_c"),
     ("deepseek:flash", "kimi-k3-flash", "deny_c"),
@@ -626,13 +650,13 @@ RULE_U_ROWS = [
     ("anthropic:opus", "claude-sonnet-5-5", "deny_mapped:anthropic:sonnet"),
     ("anthropic:opus", "llama-opus-70b", "deny_c"),
     ("anthropic:opus", "opus-mini", "deny_c"),
-    ("anthropic:opus", "gemini-2.5-flash", "deny_old"),
+    ("anthropic:opus", "gemini-2.5-flash", "deny_d"),
     ("openai:gpt", "gpt-6.1-sol", "allow"),
     ("openai:gpt", "gpt-7", "notice"),
     ("openai:gpt", "gpt-6.5-mini", "notice"),
-    ("openai:gpt", "o5-mini", "deny_old"),
+    ("openai:gpt", "o5-mini", "deny_d"),
     ("openai:gpt", "gpt-neox-20b", "notice"),
-    ("openai:gpt", "chatgpt-4o-latest", "deny_old"),
+    ("openai:gpt", "chatgpt-4o-latest", "deny_d"),
     ("openai:gpt", "deepseek-v4.1-flash", "deny_mapped:deepseek:flash"),
     ("openai:gpt", "qwen-gpt-7b", "deny_c"),
     ("acme:whiz", "acme-whiz-1", "notice"),
@@ -650,8 +674,8 @@ def _rule_u_expect(kind, lineage, model, home):
         return "allow-context", unverified_text("unmapped_model")
     if kind == "deny_c":
         return "deny", deny_unmapped_c_text(THIS_CALL, model, lineage, home)
-    if kind == "deny_old":
-        return "deny", deny_unmapped_text(THIS_CALL, model, lineage, home)
+    if kind == "deny_d":
+        return "deny", deny_unmapped_c_text(THIS_CALL, model, lineage, home)
     mapped = kind.split(":", 1)[1]
     return "deny", deny_text(THIS_CALL, model, mapped, lineage, home)
 
@@ -1222,7 +1246,7 @@ def test_c13_empty_agent_id_is_a_main_session_call(hook, home, tmp_path):
     ("claude-opus-5 beta", SELF, "unmapped_model"),          # b
     ("mystery-opus-9", SELF, "deny_c"),                      # c: first token foreign (rule U)
     ("anthropic-opus-6", SELF, "unmapped_model"),            # c: first token is the seat's own
-    ("mystery-9", SELF, "deny"),                             # d
+    ("mystery-9", SELF, "deny_c"),                           # d: same three-remedy text as c (round 9)
 ])
 def test_r22_unmapped_branches_apply_to_the_helper_model(hook, home, tmp_path, model, self_lineage, expect):
     set_lineage(home, self_lineage)
@@ -1252,7 +1276,7 @@ def test_c14_fallback_match_from_the_subagent_file_is_never_silent(fast, home, t
 def test_c14_fallback_unmapped_helper_model_uses_the_previous_reply_wording(fast, home, tmp_path):
     parent, _ = sub_layout(tmp_path, [asst("claude-opus-5-5")], [asst("mystery-9")])
     assert out(fast.decide(sub_pay(parent), home)) == (
-        "deny", helper_deny_unmapped_text(PREVIOUS, AGENT_TYPE, AGENT_ID, "mystery-9", SELF))
+        "deny", helper_deny_unmapped_c_text(PREVIOUS, AGENT_TYPE, AGENT_ID, "mystery-9", SELF))
 
 
 # -- C15: missing / unreadable / invalid-id sub-agent file: allow, never silent, with its code
