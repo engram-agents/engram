@@ -122,6 +122,48 @@ def test_a_null_self_no_advisory_key():
     )
 
 
+def test_a_deductive_no_advisory_key():
+    # Green on base too (the old advisory only fired for inductive_generalization);
+    # pins that the key no longer exists for any reasoning type.
+    c = fresh_client()
+    o1 = _obs(c, 1, lineage="anthropic:sonnet")
+    o2 = _obs(c, 2, lineage="anthropic:sonnet")
+    result = c.call("engram_derive", {
+        "claim": "Deductive claim",
+        "supporting_ids": f"{o1},{o2}",
+        "logical_chain": "P, and P implies Q, therefore Q.",
+        "reasoning_type": "deductive_modus_ponens",
+    })
+    assert result.get("status") == "created", f"derive failed: {result}"
+    assert "independence_advisory" not in result, sorted(result)
+
+
+def test_a_blocked_path_no_advisory_key():
+    """The old code attached the key on TWO paths: success and the early return
+    when _create_derivation refuses. Refusal used here: BLOCKED_STALE, reached
+    via _validate_premises inside _create_derivation, i.e. AFTER the old advisory
+    computation point. Reproduced by superseding one same-lineage premise and
+    citing it (a hard block with no override, so it is deterministic)."""
+    c = fresh_client()
+    o1 = _obs(c, 1, lineage="anthropic:sonnet")
+    o2 = _obs(c, 2, lineage="anthropic:sonnet")
+    o3 = _obs(c, 3, lineage="anthropic:sonnet")
+    sup = c.call("engram_supersede", {
+        "old_node_id": o1, "new_node_id": o3, "supersede_reason": "test",
+    })
+    assert sup.get("status") == "superseded", f"setup failed: {sup}"
+    result = c.call("engram_derive", {
+        "claim": "Generalization over a superseded premise",
+        "supporting_ids": f"{o1},{o2}",
+        "logical_chain": "Both premises show the pattern.",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert result.get("status") == "blocked_stale", f"expected a refusal: {result}"
+    assert "independence_advisory" not in result, (
+        f"independence_advisory must be gone on the blocked path: {sorted(result)}"
+    )
+
+
 # -- Cell B / C --------------------------------------------------------------
 
 def test_b_line_fires_when_graph_holds_two_lineages():
@@ -164,5 +206,8 @@ def test_d_folded_wording_absent_when_line_silent():
     _set_self_lineage("anthropic:opus")
     result = _generalize(c, [_obs(c, 1), _obs(c, 2)])
     blob = json.dumps(result, ensure_ascii=False)
-    for frag in _FOLD_FRAGMENTS[:2] + _FOLD_FRAGMENTS[3:]:
+    # All five fragments, inductive_analogy included: measured on this silent
+    # response, the word appears only in the folded line, so its absence IS a
+    # property of the silent case (an earlier draft skipped it without reason).
+    for frag in _FOLD_FRAGMENTS:
         assert frag not in blob, f"{frag!r} leaked into a silent response: {blob}"
