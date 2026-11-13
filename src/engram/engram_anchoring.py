@@ -149,14 +149,18 @@ def _hard_tokens_with_class(text: str) -> list[tuple[str, str]]:
     """Internal: hard tokens paired with their class tag, in first-
     appearance document order, de-duplicated by exact token string.
 
-    A NUMBER token whose span lies inside another emitted token's span (the
-    `1234` in `ob_1234`, the digit run in a hex sha, the year in a date) is
-    part of that token, not a separate count -- the same rule
-    s2_clause_check._clause_hard_tokens applies for M1. An all-digit
-    7+-character token is a number, not a hex sha (#4206: decimal digits
-    are hex digits, so the sha regex matches them too, and the sha class's
-    loose right side would re-open the 404-in-4040 defect one digit count
-    up).
+    A NUMBER token whose SPAN lies inside another emitted token's span (the
+    `1234` in `ob_1234`, the digit run in a hex sha, the year in a date, the
+    integer part of `1234567.89`) is part of that token, not a separate
+    count. This is deliberately span containment, NOT the substring test
+    s2_clause_check._clause_hard_tokens uses for M1: substring containment
+    would drop a standalone `404` merely because `#4040` appears elsewhere in
+    the text, while span containment keeps both (`hard_tokens("404 and
+    #4040")` -> `["404", "#4040"]`). Do not "align" this to the broader rule.
+    An all-digit 7+-character token is a number, not a hex sha (#4206: decimal
+    digits are hex digits, so the sha regex matches them too, and the sha
+    class's loose right side would re-open the 404-in-4040 defect one digit
+    count up).
     """
     if not text:
         return []
@@ -181,8 +185,13 @@ def _hard_tokens_with_class(text: str) -> list[tuple[str, str]]:
         candidates.append((m.start(), m.end(), m.group(0), "time"))
 
     # Span containment for NUMBER tokens only; endpoints may coincide (the
-    # numeric tail of `ob_1234` ends where the node id ends).
-    outer_spans = [(s, e) for s, e, _tok, cls in candidates if cls != "number"]
+    # numeric tail of `ob_1234` ends where the node id ends). ALL candidate
+    # spans are outer spans, including other numbers': the integer part of a
+    # decimal is its own number-regex match ("1234567" inside
+    # "1234567.89"), and dropping only non-number outers would leave it as a
+    # separate token that the separator rule then refuses inside its own
+    # decimal. The self-exclusion keeps every candidate that IS the span.
+    outer_spans = [(s, e) for s, e, _tok, _cls in candidates]
     candidates = [
         c
         for c in candidates

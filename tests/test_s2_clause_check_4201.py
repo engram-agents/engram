@@ -1025,6 +1025,14 @@ def test_b1_is_the_pre_4206_baseline_while_anchor_moves(cc, anchoring):
     assert anchoring.anchor(clause, quote).unanchored == ["404"]
 
 
+def test_b1_normalizes_a_none_quote_like_anchor_did(cc):
+    # anchor() used `quoted_text or ""`; check_b1 keeps that normalization, so a None quote
+    # yields a verdict rather than raising (round-1 review nit).
+    r = cc.check_b1(None, "error 404")
+    assert r["verdict"] == "NOT"
+    assert r["unanchored"] == ["404"]
+
+
 # ---- 2. the freeze covers the dependencies
 DEP_FIELDS = {"engram_anchoring_sha256": "engram_anchoring", "s2_score_sha256": "_s2"}
 

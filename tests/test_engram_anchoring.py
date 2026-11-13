@@ -326,6 +326,43 @@ def test_4206_embedded_digit_run_in_a_hex_sha_is_part_of_it():
     assert result.unanchored == []
 
 
+def test_4206_decimal_number_keeps_its_integer_part_embedded():
+    # The number regex emits the integer part of a decimal as its own match;
+    # span containment drops it, so a verbatim quote is not refused by its
+    # own decimal point (round-2 regression: this scored 0.5).
+    assert hard_tokens("count 1234567.89") == ["1234567.89"]
+    result = anchor("count 1234567.89", "count 1234567.89")
+    assert result.hard_tokens == 1
+    assert result.anchored == 1
+    assert result.ratio == 1.0
+    assert result.unanchored == []
+
+
+def test_4206_comma_decimal_number_keeps_its_integer_part_embedded():
+    # The tokenizer's comma form is the comma-grouped number ("1234567,89"),
+    # one token; its integer part is dropped as contained.
+    assert hard_tokens("count 1234567,89") == ["1234567,89"]
+    result = anchor("count 1234567,89", "count 1234567,89")
+    assert result.hard_tokens == 1
+    assert result.anchored == 1
+    assert result.ratio == 1.0
+    assert result.unanchored == []
+
+
+def test_4206_adjacent_separate_numbers_still_emit_both_control():
+    # Containment is span containment, not substring containment: two
+    # separate numbers are both tokens.
+    assert hard_tokens("404 505") == ["404", "505"]
+
+
+def test_4206_standalone_number_beside_a_longer_ref_is_not_dropped():
+    # The deliberate difference from s2_clause_check._clause_hard_tokens'
+    # substring rule: a standalone "404" is NOT inside "#4040"'s span, so
+    # both survive. If this cell reddens, someone has "aligned" the span
+    # rule to the substring one.
+    assert hard_tokens("404 and #4040") == ["404", "#4040"]
+
+
 # Round-1 review, finding 2 — an all-digit 7+-character run is a NUMBER,
 # not a hex sha, so it takes the strict right-boundary rule. (The control
 # for the reclassification is test_4206_hex_prefix_of_a_longer_sha_is_anchored:
