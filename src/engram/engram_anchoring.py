@@ -16,7 +16,8 @@ see engram_observation.py's call site and #2602's own sequencing, which
 reserves refusal for facet 3 after a week of logged distribution).
 
 Bound, stated once here rather than re-derived at each call site: anchoring
-is a LITERAL SUBSTRING match, so it under-counts a quote that carries the
+is a literal, token-boundary match (#4206 -- a token inside a longer number
+or identifier does not count), so it under-counts a quote that carries the
 same fact in a different surface form (`5,121` in the claim vs `5121` in
 the quote; a spelled-out date vs ISO form). This is the issue's own
 accepted bound, not a defect to route around.
@@ -65,6 +66,50 @@ _TIME_RE = re.compile(r"\d{1,2}:\d{2}(?::\d{2})?Z?")
 # Class tag for tokens that need case-insensitive anchoring (hex shas only
 # -- git often renders the same sha in mixed case across surfaces).
 _HEX_SHA_CLASS = "hex_sha"
+
+# Token-boundary alphabet (#4206): a hard token anchors only when the
+# characters immediately around its occurrence are each absent or outside
+# this set. `#` and punctuation are boundaries; letters, digits and `_` are
+# not, so `404` does not anchor inside `#4040`, `x404`, or `ob_1234`.
+_WORD_CHARS = frozenset(
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
+)
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _token_is_anchored(tok: str, quote: str, *, hex_class: bool) -> bool:
+    """True when `tok` occurs in `quote` at a token boundary.
+
+    Non-hex tokens need a non-word character (or the quote's edge) on both
+    sides. Hex tokens are matched case-insensitively and their right side
+    is deliberately looser (#4206): a 7-character sha is usually written
+    as the prefix of the longer sha it names, so an occurrence followed by
+    more hex digits anchors -- but only if the whole remainder of the word
+    is hex (`abcdef1c0ffee9` anchors `abcdef1`; `abcdef1zz` does not).
+    """
+    if not tok:
+        return False
+    haystack = quote.lower() if hex_class else quote
+    needle = tok.lower() if hex_class else tok
+
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        left_ok = start == 0 or haystack[start - 1] not in _WORD_CHARS
+        if left_ok:
+            if end == len(haystack) or haystack[end] not in _WORD_CHARS:
+                return True
+            if hex_class:
+                # The next character is a word character: the token anchors
+                # only if what follows is a longer all-hex word (a sha
+                # prefix) and not a non-hex extension (`zz`, `x`, `_`).
+                i = end
+                while i < len(haystack) and haystack[i] in _HEX_DIGITS:
+                    i += 1
+                if i == len(haystack) or haystack[i] not in _WORD_CHARS:
+                    return True
+        start = haystack.find(needle, start + 1)
+    return False
 
 
 def _digit_count(token: str) -> int:
@@ -143,30 +188,30 @@ class AnchoringResult:
 
 
 def anchor(claim: str, quoted_text: str) -> AnchoringResult:
-    """Compute how many of `claim`'s hard tokens are literal substrings of
-    `quoted_text`.
+    """Compute how many of `claim`'s hard tokens appear in `quoted_text` at
+    a token boundary (engram-alpha#4206: a token inside a longer number or
+    identifier does not count).
 
     `ratio` is `None` when there are zero hard tokens -- "nothing to
     anchor" is a different state than "fully anchored" (which would read
     1.0), so a caller must be able to tell the two apart rather than
     treating an empty-tokens claim as trivially well-anchored.
 
-    Anchoring is a literal substring check, case-insensitive only for the
-    hex-sha class (git renders the same sha in mixed case across
-    surfaces); every other class is matched case-sensitively.
+    Matching is case-sensitive except for the hex-sha class (git renders
+    the same sha in mixed case across surfaces); see `_token_is_anchored`
+    for the exact boundary rule, including the hex class's looser right
+    side so a short sha still anchors as the prefix of the full one.
     """
     tokens = _hard_tokens_with_class(claim)
     if not tokens:
         return AnchoringResult(hard_tokens=0, anchored=0, ratio=None, unanchored=[])
 
     quote = quoted_text or ""
-    quote_lower = quote.lower()
 
     unanchored: list[str] = []
     anchored_count = 0
     for tok, cls in tokens:
-        hit = tok.lower() in quote_lower if cls == _HEX_SHA_CLASS else tok in quote
-        if hit:
+        if _token_is_anchored(tok, quote, hex_class=cls == _HEX_SHA_CLASS):
             anchored_count += 1
         else:
             unanchored.append(tok)

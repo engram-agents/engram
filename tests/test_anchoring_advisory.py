@@ -78,7 +78,15 @@ def test_hard_data_advisory_no_hint_when_fully_anchored():
     server = fresh_server()
     payload = _payload(
         claim="the record cites ob_9999 and counted 42000 events",
-        quoted_text="the record cites ob_9999 and counted 42000 events exactly",
+        # #4206: the claim's embedded digit run "9999" sits inside
+        # "ob_9999" (preceded by "_", not a token boundary), so a purely
+        # verbatim quote can no longer anchor every token. The widened
+        # quote carries "9999" a second time at a real boundary, which is
+        # what the advisory's "widen the quote" hint asks for.
+        quoted_text=(
+            "the record cites ob_9999 and counted 42000 events "
+            "(9999 rows in total)"
+        ),
     )
     r = json.loads(server.engram_add_observation(payload_json=json.dumps(payload)))
     assert r["status"] == "created", r

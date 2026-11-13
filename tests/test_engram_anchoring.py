@@ -126,21 +126,26 @@ def test_zero_hard_tokens_ratio_is_none_not_one():
 def test_fully_anchored_claim():
     # "ob_1234" and "#2609" each also surface their embedded digit run
     # ("1234", "2609") as an independent number token — 4 hard tokens
-    # total, all anchored since both digit runs are substrings of the
-    # tokens that contain them.
+    # total. Since #4206 those digit runs anchor only on a token boundary:
+    # "2609" is preceded by '#' (a boundary) so it anchors, but "1234"
+    # sits inside "ob_1234" preceded by '_' (NOT a boundary), so it does
+    # not. Changed from 4/4 by the boundary rule, deliberately.
     result = anchor("cites ob_1234 and #2609", "source discusses ob_1234 in #2609 detail")
     assert result.hard_tokens == 4
-    assert result.anchored == 4
-    assert result.ratio == 1.0
-    assert result.unanchored == []
+    assert result.anchored == 3
+    assert result.ratio == 0.75
+    assert result.unanchored == ["1234"]
 
 
 def test_partially_anchored_claim_lists_unanchored():
+    # #4206: the embedded "1234" no longer anchors inside "ob_1234"
+    # (preceded by '_', not a token boundary), so it joins the unanchored
+    # list alongside the tokens the quote never mentions.
     result = anchor("cites ob_1234 and #2609", "source discusses ob_1234 only")
     assert result.hard_tokens == 4
-    assert result.anchored == 2
-    assert result.ratio == 0.5
-    assert result.unanchored == ["#2609", "2609"]
+    assert result.anchored == 1
+    assert result.ratio == 0.25
+    assert result.unanchored == ["1234", "#2609", "2609"]
 
 
 def test_comma_thousands_mismatch_counts_as_unanchored():
@@ -161,14 +166,16 @@ def test_hex_sha_anchoring_is_case_insensitive():
 
 def test_node_id_anchoring_is_case_sensitive():
     # A node id is lowercase by construction; anchoring for that class is
-    # a plain substring check (no case-folding), unlike hex shas. The
-    # embedded digit run ("1234") is a separate number token and anchors
-    # independently of the node-id string's own case — digits have no
-    # case, so it correctly matches regardless; this test isolates the
-    # node-id token itself, not the overlap.
+    # a plain substring check (no case-folding), unlike hex shas, so the
+    # differently-cased "OB_1234" does not anchor it. The embedded digit
+    # run ("1234") is a separate number token, but since #4206 it too is
+    # unanchored here: it sits inside "OB_1234" preceded by '_', which is
+    # not a token boundary (this test used to assert the opposite for the
+    # digit run; the case-sensitivity assertion on the node id itself is
+    # unchanged).
     result = anchor("cites ob_1234", "quote mentions OB_1234 only")
     assert "ob_1234" in result.unanchored
-    assert "1234" not in result.unanchored
+    assert "1234" in result.unanchored
 
 
 def test_empty_quote_leaves_every_token_unanchored():
@@ -177,3 +184,122 @@ def test_empty_quote_leaves_every_token_unanchored():
     assert result.anchored == 0
     assert result.ratio == 0.0
     assert result.unanchored == ["ob_1234", "1234"]
+
+
+# ── #4206: a hard token anchors on a boundary, not as a raw substring ──────
+
+
+# Cell 1 — the issue's four rows.
+
+
+def test_4206_pr_ref_inside_a_longer_number_is_unanchored():
+    result = anchor("PR #404 merged", "PR #4040 merged")
+    assert "#404" in result.unanchored
+    assert "404" in result.unanchored
+    assert result.anchored == 0
+    assert result.ratio == 0.0
+
+
+def test_4206_number_inside_a_longer_number_is_unanchored():
+    result = anchor("error 404", "error 4040")
+    assert result.unanchored == ["404"]
+    assert result.ratio == 0.0
+
+
+def test_4206_exact_number_still_anchored_control():
+    result = anchor("error 404", "error 404")
+    assert result.hard_tokens == 1
+    assert result.anchored == 1
+    assert result.unanchored == []
+    assert result.ratio == 1.0
+
+
+def test_4206_different_number_still_unanchored_control():
+    result = anchor("error 404", "error 505")
+    assert result.unanchored == ["404"]
+    assert result.ratio == 0.0
+
+
+# Cell 2 — boundary neighbours, both directions.
+
+
+def test_4206_punctuation_is_a_boundary():
+    result = anchor("error 404", "error:404")
+    assert result.unanchored == []
+    assert result.ratio == 1.0
+
+
+def test_4206_letter_before_is_not_a_boundary():
+    result = anchor("error 404", "x404")
+    assert result.unanchored == ["404"]
+    assert result.ratio == 0.0
+
+
+def test_4206_letter_after_is_not_a_boundary():
+    result = anchor("error 404", "404x")
+    assert result.unanchored == ["404"]
+    assert result.ratio == 0.0
+
+
+# Cell 3 — the '#' shape: the fix must not pass by refusing every '#' token.
+
+
+def test_4206_hash_token_inside_a_longer_number_is_unanchored():
+    result = anchor("PR #404 merged", "PR #4040 merged")
+    assert "#404" in result.unanchored
+    assert result.ratio == 0.0
+
+
+def test_4206_hash_token_anchored_when_exact():
+    result = anchor("PR #404 merged", "PR #404 merged")
+    assert result.hard_tokens == 2  # "#404" and its embedded "404"
+    assert result.anchored == 2
+    assert result.unanchored == []
+    assert result.ratio == 1.0
+
+
+# Cell 4 — a 7-char sha anchors as the prefix of a longer sha, but not when
+# it sits inside a longer NON-hex alphanumeric run. The two quotes differ
+# in exactly that way: "abcdef1c0ffee9" (all hex) vs "abcdef1zz" (not).
+
+
+def test_4206_hex_prefix_of_a_longer_sha_is_anchored():
+    result = anchor("merged as abcdef1", "the commit abcdef1c0ffee9 landed")
+    assert result.hard_tokens == 1
+    assert result.anchored == 1
+    assert result.unanchored == []
+    assert result.ratio == 1.0
+
+
+def test_4206_hex_token_inside_a_nonhex_alphanumeric_run_is_unanchored():
+    result = anchor("merged as abcdef1", "the ref abcdef1zz landed")
+    assert result.unanchored == ["abcdef1"]
+    assert result.ratio == 0.0
+
+
+# Cell 5 — the hex class stays case-insensitive.
+
+
+def test_4206_hex_anchoring_stays_case_insensitive_on_boundaries():
+    result = anchor("merged as ABCDEF1", "the commit abcdef1 landed")
+    assert result.hard_tokens == 1
+    assert result.anchored == 1
+    assert result.unanchored == []
+    assert result.ratio == 1.0
+
+
+# Cell 6 — the no-tokens branch never consults the boundary helper at all.
+
+
+def test_4206_no_hard_tokens_never_consults_the_boundary_helper(monkeypatch):
+    import engram_anchoring
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("_token_is_anchored must not be called with zero tokens")
+
+    monkeypatch.setattr(engram_anchoring, "_token_is_anchored", _explode)
+    result = anchor("no hard facts here at all", "an unrelated quote")
+    assert result.hard_tokens == 0
+    assert result.anchored == 0
+    assert result.ratio is None
+    assert result.unanchored == []
