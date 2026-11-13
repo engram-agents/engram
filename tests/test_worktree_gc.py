@@ -762,6 +762,32 @@ def test_cli_flag_reaches_classify(tmp_path):
     assert seen.get("age_guard_seconds") == 1234
 
 
+def test_main_passes_main_checkout_not_run_root_as_main_path(tmp_path):
+    """main() run from a sibling worktree must hand classify trees[0]'s path
+    (the main checkout), not the run root (#2808 round 3)."""
+    main_dir = str(tmp_path / "main-checkout")
+    run_root = str(tmp_path / "sibling-run-dir")
+    trees = [_make_worktree(main_dir), _make_worktree(run_root)]
+    seen = []
+
+    def fake_classify(t, root, **kw):
+        seen.append((root, kw))
+        return "KEEP", "stub"
+
+    with (
+        patch.object(sys, "argv", ["worktree-gc"]),
+        patch.object(_mod, "_repo_root", return_value=run_root),
+        patch.object(_mod, "_list_worktrees", return_value=trees),
+        patch.object(_mod, "classify", side_effect=fake_classify),
+    ):
+        assert _mod.main() == 0
+    assert len(seen) == len(trees)
+    for root, kw in seen:
+        assert root == run_root
+        assert kw["main_path"] == trees[0]["path"]
+        assert kw["main_path"] != run_root
+
+
 # ---------------------------------------------------------------------------
 # 15. AGE GUARD uses the MAIN checkout's folder, not the directory the tool
 #     runs from (#2808 round 2)
