@@ -1559,12 +1559,22 @@ def write_agent_registration(
     a path that may be a symlink (#4682): a group member can create the
     ``agents`` entry pointing at a directory this user owns, so the entry is
     opened with ``O_NOFOLLOW`` and, if that fails, NOTHING is chmodded and
-    nothing is written through it. The shared directory ends up 0o2775
+    nothing is written through it. The fd stays open for the whole call and
+    every later step — the chmod, the temp creation, the replace — is
+    fd-relative, so a co-tenant who swaps ``agents`` for a symlink AFTER the
+    check cannot redirect the chmod or the write either (#4682 TOCTOU).
+    ``agent_name`` must be a bare name (no separator, not ``.``/``..``): the
+    fd-bound writer accepts only a basename, and a separator would otherwise
+    join straight out of the directory. The shared directory ends up 0o2775
     (group-writable, setgid) so each co-tenant can create its own file; the
     registration file itself is 0o644 — group-readable, never group-writable,
     since a writable record would let a co-tenant impersonate another agent in
     peer topology. The file's mode is applied to the temp file before the
-    atomic replace, so there is no post-replace chmod to redirect.
+    atomic replace, so there is no post-replace chmod to redirect. The 0o644
+    closes the WRITE vector, not the UNLINK vector: ``agents`` is
+    group-writable and not sticky, so a co-tenant can still unlink or rename
+    another agent's record whatever its mode — the file mode stops an in-place
+    rewrite, not removal.
     Fails soft if the shared filesystem is absent or unwritable — this only
     matters when /home/agents-shared/ exists, and is a convenience, not a
     blocker. Never raises and never prints (the hook injects context on
@@ -1582,10 +1592,13 @@ def write_agent_registration(
         {"registered": bool, "dir_mode": int | None, "dir_error": str | None,
          "file_path": str, "file_error": str | None}
         ``dir_mode`` is the mode READ BACK with os.fstat on the opened
-        directory after the fchmod attempt (not the mode requested); it must
-        equal 0o2775, else ``dir_error`` says why (EPERM, a dropped setgid
-        bit, or an unusable/symlinked entry). ``registered`` is True only once
-        the JSON file — including its 0o644 mode — was written.
+        directory after the fchmod attempt (not the mode requested). The read
+        back happens EVEN IF the fchmod was refused, and ``dir_error`` is set
+        only when that read-back differs from 0o2775: EPERM on a directory
+        already at the right mode (every agent that does not own it) reports
+        no error, while a dropped setgid bit or an unusable/symlinked entry
+        does. ``registered`` is True only once the JSON file — including its
+        0o644 mode — was written.
     """
     status = {
         "registered": False,
@@ -1596,6 +1609,19 @@ def write_agent_registration(
     }
 
     if not agent_name:
+        return status
+
+    # #4682: the registration write is bound to the registry directory's fd, so
+    # a name carrying a path separator would join straight out of it. Refuse it
+    # before anything is created, chmodded or written.
+    if (
+        agent_name in (".", "..")
+        or os.sep in agent_name
+        or (os.altsep is not None and os.altsep in agent_name)
+    ):
+        status["file_error"] = (
+            f"refusing an agent name that would escape the registry: {agent_name!r}"
+        )
         return status
 
     # Gate: the shared-fs root must exist and be a directory. If absent (single-
@@ -1623,48 +1649,61 @@ def write_agent_registration(
         )
         return status
 
+    # The single fd opened with O_NOFOLLOW above stays open across BOTH the
+    # chmod and the write; one finally closes it. Every step in between is
+    # fd-relative, so replacing the `agents` entry after this point can
+    # redirect neither.
     try:
+        chmod_error = None
         try:
             os.fchmod(dir_fd, 0o2775)
         except OSError as exc:
-            # EPERM when the directory is another agent's: report it, never raise.
-            status["dir_error"] = f"could not set registry dir mode: {exc}"
+            # EPERM when the directory belongs to another agent. That is not
+            # itself a failure: the mode we need may already be set, so keep
+            # going and let the read-back decide. Never raise.
+            chmod_error = exc
+        try:
+            dir_mode = stat.S_IMODE(os.fstat(dir_fd).st_mode)
+        except OSError as exc:
+            status["dir_error"] = f"could not read back registry dir mode: {exc}"
         else:
-            try:
-                dir_mode = stat.S_IMODE(os.fstat(dir_fd).st_mode)
-            except OSError as exc:
-                status["dir_error"] = f"could not read back registry dir mode: {exc}"
-            else:
-                status["dir_mode"] = dir_mode
-                if dir_mode != 0o2775:
-                    # POSIX can silently drop setgid for a non-member caller:
-                    # the requested mode is not proof the mode took.
-                    status["dir_error"] = (
-                        f"registry dir mode is 0o{dir_mode:o}, expected 0o2775"
-                    )
+            status["dir_mode"] = dir_mode
+            if dir_mode != 0o2775:
+                # POSIX can silently drop setgid for a non-member caller, and a
+                # refused fchmod leaves the old mode: the requested mode is not
+                # proof the mode took, so report the READ-BACK mismatch (#4682).
+                status["dir_error"] = (
+                    f"could not set registry dir mode: {chmod_error}"
+                    if chmod_error is not None
+                    else f"registry dir mode is 0o{dir_mode:o}, expected 0o2775"
+                )
+
+        dest = os.path.join(registry_dir, f"{agent_name}.json")
+        try:
+            record = {
+                "agent_name": agent_name,
+                "hostname": socket.gethostname(),
+                "pid": os.getpid(),
+                "registered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            # Atomic write, mode- and group-preserving (#4013), with the file
+            # mode applied to the TEMP file before the replace (#4682):
+            # group-READABLE, never group-writable — a writable <name>.json
+            # would let any co-tenant in `agents` rewrite another agent's
+            # record, which feeds peer topology and liveness. The shared
+            # DIRECTORY is group-writable so each agent can create its own
+            # file; the file itself needs no group write. The write is bound to
+            # the fd opened above: the temp is created inside THAT directory
+            # and the replace happens inside it, so a symlink swapped in after
+            # the check cannot redirect it. The bare basename is what dir_fd
+            # requires; an absolute path would silently ignore it.
+            atomic_write_json(f"{agent_name}.json", record, mode=0o644, dir_fd=dir_fd)
+        except Exception as exc:
+            # Fail-soft: never raise from a convenience side-effect.
+            status["file_error"] = f"could not write registration file: {exc}"
+            return status
     finally:
         os.close(dir_fd)
-
-    dest = os.path.join(registry_dir, f"{agent_name}.json")
-
-    try:
-        record = {
-            "agent_name": agent_name,
-            "hostname": socket.gethostname(),
-            "pid": os.getpid(),
-            "registered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-        # Atomic write, mode- and group-preserving (#4013), with the file mode
-        # applied to the TEMP file before the replace (#4682): group-READABLE,
-        # never group-writable — a writable <name>.json would let any co-tenant
-        # in `agents` rewrite another agent's record, which feeds peer topology
-        # and liveness. The shared DIRECTORY is group-writable so each agent can
-        # create its own file; the file itself needs no group write.
-        atomic_write_json(dest, record, mode=0o644)
-    except Exception as exc:
-        # Fail-soft: never raise from a convenience side-effect.
-        status["file_error"] = f"could not write registration file: {exc}"
-        return status
 
     status["registered"] = True
     status["file_path"] = dest

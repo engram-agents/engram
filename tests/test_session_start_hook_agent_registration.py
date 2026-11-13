@@ -266,8 +266,12 @@ class TestRegistryPermissions4026:
     def test_chmod_failure_is_soft_and_reported(self, tmp_path, monkeypatch):
         """#4026 cell 4: a directory owned by another agent raises EPERM on chmod.
 
-        SessionStart must still run, and the failure must be visible in the
-        returned status rather than silent.
+        SessionStart must still run, and a genuinely wrong directory mode must
+        still be visible in the returned status rather than silent.  #4682: the
+        read-back happens even after a refused chmod, so when the mode is
+        ALREADY 0o2775 there is nothing to report — only the read-back decides,
+        never the chmod's exit status (every agent but the directory's owner
+        gets EPERM on every session otherwise).
         """
         engram_home = tmp_path / ".engram"
         engram_home.mkdir()
@@ -290,8 +294,10 @@ class TestRegistryPermissions4026:
 
         assert status["registered"] is True
         assert (registry_dir / "borges.json").exists()
-        assert status["dir_mode"] is None
-        assert isinstance(status["dir_error"], str) and status["dir_error"]
+        # The chmod was refused, but the directory is ALREADY at the mode we
+        # need: report the read-back mode and no error (#4682).
+        assert status["dir_mode"] == 0o2775
+        assert status["dir_error"] is None
 
     def test_positive_control_registers_normally(self, tmp_path, monkeypatch):
         """#4026 cell 5: the normal path still registers and reports its file."""
@@ -440,9 +446,17 @@ class TestRegistryPermissions4026:
         replace_modes = []
         real_replace, real_stat = os.replace, os.stat
 
-        def _recording_replace(src, dst):
-            replace_modes.append(stat.S_IMODE(real_stat(src).st_mode))
-            return real_replace(src, dst)
+        def _recording_replace(src, dst, **kwargs):
+            # #4682: the replace is fd-relative now, so src is a bare basename
+            # and its mode is read through the same directory fd.
+            src_dir_fd = kwargs.get("src_dir_fd")
+            st = (
+                real_stat(src, dir_fd=src_dir_fd)
+                if src_dir_fd is not None
+                else real_stat(src)
+            )
+            replace_modes.append(stat.S_IMODE(st.st_mode))
+            return real_replace(src, dst, **kwargs)
 
         monkeypatch.setattr(mod.os, "replace", _recording_replace)
 
@@ -459,3 +473,90 @@ class TestRegistryPermissions4026:
             f"mode at replace time was {[f'{m:o}' for m in replace_modes]}, not 644"
         )
         assert stat.S_IMODE(os.stat(registry_dir / "borges.json").st_mode) == 0o644
+
+
+# ---------------------------------------------------------------------------
+# #4682: the write is bound to the directory fd that was checked
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryWriteIsBoundToTheOpenedDirectory:
+    @pytest.mark.parametrize("agent_name", [".", "..", "../evil", "a/b", "/abs"])
+    def test_a_name_that_would_escape_the_registry_is_refused(
+        self, tmp_path, monkeypatch, agent_name
+    ):
+        """A name carrying a path separator would join out of the registry.
+
+        #4682 binds the write to the directory fd, which accepts only a bare
+        basename, so such a name is refused up front: file_error, no file
+        written anywhere, and not even the registry directory is created.
+        """
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+        _, registry_dir = _registry_pair(tmp_path)
+
+        status = mod.write_agent_registration(
+            agent_name, registry_dir=str(registry_dir)
+        )
+
+        assert status["registered"] is False
+        assert status["file_path"] == ""
+        assert isinstance(status["file_error"], str) and status["file_error"]
+        assert list(tmp_path.rglob("*.json")) == []
+
+    def test_a_symlink_swapped_in_after_the_open_cannot_redirect_the_write(
+        self, tmp_path, monkeypatch
+    ):
+        """#4682 TOCTOU, the decisive cell: the swap happens AFTER the check.
+
+        A co-tenant replaces the ``agents`` entry with a symlink to a victim
+        directory at the exact moment between the O_NOFOLLOW open (with its
+        fchmod/fstat) and the registration write.  No sleeps: a patched
+        ``os.open`` fires the swap when the writer creates its temp file.
+        Before #4682 the writer re-resolved the path string, so the write
+        followed the new link and replaced a file inside the victim directory.
+
+        After the fix the call still registers, and ``probe.json`` appears in
+        the directory the fd was opened on (now renamed ``agents.real``).  The
+        assertion is deliberately the safe one: whichever way the
+        implementation resolves it, the victim keeps its bytes and its mode and
+        the write never lands through the swapped-in link.
+        """
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+
+        _, registry_dir = _registry_pair(tmp_path)
+        registry_dir.mkdir()
+        victim = tmp_path / "victim-dir"
+        victim.mkdir()
+        precious = victim / "probe.json"
+        precious.write_text("PRECIOUS-USER-DATA")
+        os.chmod(precious, 0o600)
+        real_dir = registry_dir.with_name(registry_dir.name + ".real")
+
+        real_open = os.open
+        swapped = {"done": False}
+
+        def _swap_before_temp(path, flags, *args, **kwargs):
+            if isinstance(path, str) and path.endswith(".tmp") and not swapped["done"]:
+                swapped["done"] = True
+                os.rename(registry_dir, real_dir)
+                os.symlink(victim, registry_dir)
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(mod.os, "open", _swap_before_temp)
+
+        # The agent's name matches the victim file's, so a redirected write
+        # REPLACES a real file rather than merely adding one.
+        status = mod.write_agent_registration("probe", registry_dir=str(registry_dir))
+
+        # Control: the swap really fired, at the temp-file moment.
+        assert swapped["done"], "the swap never fired; the cell proves nothing"
+        assert precious.read_text() == "PRECIOUS-USER-DATA"
+        assert stat.S_IMODE(os.stat(precious).st_mode) == 0o600
+        assert sorted(os.listdir(victim)) == ["probe.json"]
+        # Either the write was refused, or it landed in the directory that was
+        # open when it was checked — never through the swapped-in link.
+        assert status["registered"] is False or (real_dir / "probe.json").exists()
