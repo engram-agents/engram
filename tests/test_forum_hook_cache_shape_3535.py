@@ -128,3 +128,59 @@ def test_e2e_hook_survives_a_malformed_cache(tmp_path, raw):
                        text=True, env=env, timeout=60)
     assert p.returncode == 0, p.stderr
     assert "Traceback" not in p.stderr
+
+
+# ---- items inside the cached lists (#3535 "not yet checked" sub-case) -------
+#
+# Behaviour chosen: a non-dict item in a cached `mentions` list is DROPPED; dict items
+# still render. A list that is all non-dicts renders no mention line. A non-list
+# `threads` is treated as no threads (the hook only counts them).
+
+def _run_hook_with_cache(tmp_path, payload):
+    home = tmp_path / "engram_home"
+    home.mkdir()
+    (home / "config.json").write_text(
+        json.dumps({"agent_name": "testbot", "forum": {"url": _dead_url()}}))
+    (home / CACHE_NAME).write_text(json.dumps(payload))
+    env = {k: v for k, v in os.environ.items() if k not in ("FORUM_URL", "CLAUDE_PLUGIN_ROOT")}
+    env["ENGRAM_HOME"] = str(home)
+    env["HOME"] = str(home)
+    env["PYTHONPATH"] = f"{PROJECT_ROOT / 'src' / 'engram'}:{PROJECT_ROOT / 'src'}"
+    return subprocess.run([sys.executable, str(HOOK_PATH)], input="{}", capture_output=True,
+                          text=True, env=env, timeout=60)
+
+
+_VALID_MENTION = {"thread_id": "99", "thread_title": "Review my PR", "author": "luria",
+                  "kind": "at_mention"}
+
+
+def test_e2e_fresh_cache_with_non_dict_mentions_exits_0(tmp_path):
+    p = _run_hook_with_cache(
+        tmp_path, {"fetched_at": time.time(), "threads": [], "mentions": [1, "a", None]})
+    assert p.returncode == 0, p.stderr
+    assert "Traceback" not in p.stderr
+    assert "forum mention" not in p.stdout  # all dropped -> no mention line
+
+
+def test_e2e_valid_mention_still_renders_beside_a_non_dict_item(tmp_path):
+    p = _run_hook_with_cache(
+        tmp_path, {"fetched_at": time.time(), "threads": [], "mentions": [_VALID_MENTION, 1]})
+    assert p.returncode == 0, p.stderr
+    ctx = json.loads(p.stdout.strip())["hookSpecificOutput"]["additionalContext"]
+    assert "1 forum mention waiting on you" in ctx   # the dropped item is not counted
+    assert "Review my PR" in ctx
+
+
+@pytest.mark.parametrize("threads", [5, "x", None, {"a": 1}], ids=["int", "str", "null", "dict"])
+def test_e2e_non_list_cached_threads_exits_0(tmp_path, threads):
+    p = _run_hook_with_cache(
+        tmp_path, {"fetched_at": time.time(), "threads": threads, "mentions": []})
+    assert p.returncode == 0, p.stderr
+    assert "Traceback" not in p.stderr
+
+
+def test_cached_mentions_drops_non_dict_items(hook):
+    assert hook._cached_mentions({"mentions": [1, "a", None, _VALID_MENTION]}) == [_VALID_MENTION]
+    assert hook._cached_mentions({"mentions": [1]}) == []
+    assert hook._cached_mentions({"mentions": "x"}) is None   # non-list: still unknown
+    assert hook._cached_mentions({}) == []                    # absent: still known-empty
