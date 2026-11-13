@@ -11,8 +11,15 @@
 #
 #   <issue-number>  bare integer OR with leading '#' (both accepted).
 #
+# What it answers: does an open PR TITLE or an in-flight baton cite this
+# number?  What it does not answer: is anyone already doing this work?  When
+# the work belongs to an epic, run it with the epic number as well, since a
+# "[part of #EPIC]" PR cites only the epic.  PR bodies are not searched, so a
+# CLEAR answer is about citations, not about work.  It sees only PRs open at
+# the moment it runs, so work started in parallel afterwards is not seen.
+#
 # Exit codes:
-#   0  CLEAR — no open PR or in-flight baton references the issue
+#   0  CLEAR — no open PR or in-flight baton cites the issue
 #   1  DUPLICATE RISK — at least one hit (open PR or baton file)
 #   2  usage error — missing or invalid argument
 #   3  UNKNOWN — gh unavailable; fall back to manual check
