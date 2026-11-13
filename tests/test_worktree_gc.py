@@ -286,7 +286,7 @@ def test_classify_detached_head_in_use_beats_open_pr_lookup(tmp_path):
 def test_classify_worktree_agent_branch(tmp_path):
     # Agent-owned since #2808: needs a readable age, so a real worktree aged
     # past the guard (the decision under test is unchanged: old + clean -> PRUNE).
-    root, wt = _real_worktree(tmp_path, "worktree-agent-abc123", under_claude=False)
+    _root, wt = _real_worktree(tmp_path, "worktree-agent-abc123", under_claude=False)
     _set_age(wt, 6 * 3600 + 60)
     t = _make_worktree(str(wt), branch="worktree-agent-abc123")
     with patch.object(_mod, "_is_clean", return_value=True):
@@ -302,7 +302,7 @@ def test_classify_worktree_agent_branch(tmp_path):
 
 def test_classify_review_branch(tmp_path):
     # Agent-owned since #2808 (see test_classify_worktree_agent_branch).
-    root, wt = _real_worktree(tmp_path, "review-456", under_claude=False)
+    _root, wt = _real_worktree(tmp_path, "review-456", under_claude=False)
     _set_age(wt, 6 * 3600 + 60)
     t = _make_worktree(str(wt), branch="review-456")
     with patch.object(_mod, "_is_clean", return_value=True):
@@ -758,3 +758,65 @@ def test_cli_flag_reaches_classify(tmp_path):
     ):
         assert _mod.main() == 0
     assert seen.get("age_guard_seconds") == 1234
+
+
+# ---------------------------------------------------------------------------
+# 15. AGE GUARD uses the MAIN checkout's folder, not the directory the tool
+#     runs from (#2808 round 2)
+# ---------------------------------------------------------------------------
+
+
+def _sibling_root(tmp_path, main):
+    """A second linked worktree OUTSIDE <main>/.claude/worktrees/: the
+    `--show-toplevel` a run from inside a linked worktree would report."""
+    sib = tmp_path / "sibling-run-dir"
+    _git("worktree", "add", "-q", "--detach", str(sib), cwd=main)
+    return str(sib)
+
+
+@pytest.mark.parametrize("branch,pr", [(None, None), ("fix/named-thing", "MERGED")],
+                         ids=["detached", "named-merged"])
+def test_age_guard_uses_main_checkout_when_run_from_sibling_worktree(tmp_path, branch, pr):
+    main, wt = _real_worktree(tmp_path, branch)
+    _set_age(wt, 120)
+    sib = _sibling_root(tmp_path, main)
+    action, reason = _classify_real(sib, wt, branch, pr_state=pr)
+    assert action == "SKIP", reason
+    assert "age guard" in reason
+
+
+@pytest.mark.parametrize("branch,pr", [(None, None), ("fix/named-thing", "MERGED")],
+                         ids=["detached", "named-merged"])
+def test_age_guard_explicit_main_path_beats_run_root(tmp_path, branch, pr):
+    main, wt = _real_worktree(tmp_path, branch)
+    _set_age(wt, 120)
+    sib = _sibling_root(tmp_path, main)
+    action, reason = _classify_real(sib, wt, branch, pr_state=pr, main_path=main)
+    assert action == "SKIP", reason
+
+
+def test_age_guard_main_path_underivable_means_branch_rule_only(tmp_path):
+    """No derivable main path: the under-folder test is False (never `root`)."""
+    main, wt = _real_worktree(tmp_path, None)
+    _set_age(wt, 120)
+    with patch.object(_mod, "_main_checkout_path", return_value=None):
+        action, reason = _classify_real(main, wt, None)
+    assert action == "PRUNE", reason
+
+
+def test_age_guard_boundary_age_equal_to_guard_prunes(tmp_path):
+    """The rule is `age < guard` keeps: age == guard is old enough to prune."""
+    root, wt = _real_worktree(tmp_path, "worktree-agent-edge")
+    _set_age(wt, 0)
+    newest = max(p.stat().st_mtime for p in
+                 (_admin_dir(wt) / r for r in ("HEAD", "index", "logs/HEAD"))
+                 if p.exists())
+    guard = 1000
+    with patch.object(_mod.time, "time", return_value=newest + guard):
+        action, reason = _classify_real(root, wt, "worktree-agent-edge",
+                                        age_guard_seconds=guard)
+    assert action == "PRUNE", reason
+    with patch.object(_mod.time, "time", return_value=newest + guard - 1):
+        action, reason = _classify_real(root, wt, "worktree-agent-edge",
+                                        age_guard_seconds=guard)
+    assert action == "SKIP", reason
