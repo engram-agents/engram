@@ -132,6 +132,9 @@ SUGGESTION_ROUTING: list[tuple[str, str]] = [
     (r"\bgt_\w+", BUCKET_GOAL_TENSION_RESOLUTIONS),
     # Resolution patterns (after goal-tension so no false positives)
     (r"\bresolv", BUCKET_RESOLUTIONS),
+    # The tool name itself: "_" is a word character, so \bresolv cannot match
+    # inside "engram_resolve" (#4538).  After goal-tension so those still win.
+    (r"\bengram_resolve\b", BUCKET_RESOLUTIONS),
     (r"\bclose\b.*\bquestion\b", BUCKET_RESOLUTIONS),
     (r"\bwire\b.*\bengram_resolve\b", BUCKET_RESOLUTIONS),
     # Supersede patterns
