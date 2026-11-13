@@ -551,6 +551,14 @@ routes to [Troubleshooting](#troubleshooting):
 └── .git/                             # version control for the data dir
 ```
 
+> **Claude Code, not ENGRAM, rewrites `~/.claude/settings.json` during install.**
+> Install step 3 runs `claude plugin marketplace add`, and Claude Code replaces
+> `settings.json` with a new file (a new inode). A file ACL or an extended attribute
+> you put on `settings.json` is not kept (measured on one Mac, Claude Code 2.1.311;
+> Linux and other versions not checked). ENGRAM's own writes keep them (measured for
+> `CLAUDE.md` and `config.json`), so the loss comes from that Claude Code step. If you
+> rely on an ACL or xattr on `settings.json`, set it again after install. (engram#4640)
+
 > **Hooks are registered in the plugin's `hooks/hooks.json`, not in
 > `~/.claude/settings.json`.** Don't hand-maintain a hook list anywhere else — read
 > `hooks.json` for the authoritative set. The hooks cover: session-start reading,

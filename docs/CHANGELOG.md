@@ -9,6 +9,10 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+### Docs
+- The install guide now says that `claude plugin marketplace add` makes Claude Code replace
+  `~/.claude/settings.json`, so an ACL or extended attribute on that file is lost (engram#4640, option 1).
+
 ## [v0.5.7] - 2026-11-12
 
 A patch release. Its reason is one guarantee: ENGRAM's setup (the installer,
