@@ -80,7 +80,9 @@ def get_primary_user() -> str:
     try:
         with open_regular_text(CONFIG_PATH) as f:
             config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError, RecursionError):
+        return ""
+    if not isinstance(config, dict):
         return ""
     return (config.get("primary_user") or "").lower()
 
