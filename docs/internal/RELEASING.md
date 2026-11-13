@@ -9,9 +9,12 @@ page and that one disagree about names, that page is right.
 
 A release has three parts, in this order:
 
-1. **Candidate.** A commit on `dev` is tagged `vX.Y.Z-rcN`, gated and lived on.
-2. **Release.** The accepted candidate commit is tagged `vX.Y.Z`, `main` is
-   fast-forwarded to it, and the Releases entry is created.
+1. **Candidate.** A release branch `release/X.Y.Z` is cut from `dev` at the
+   candidate commit and tagged `vX.Y.Z-rcN`. `dev` stays open. The candidate is
+   gated and the team lives on it (the soak).
+2. **Release.** A pull request from the release branch into `main` runs the
+   whole test suite. When it is green, `main` is fast-forwarded to the soaked
+   commit, that commit is tagged `vX.Y.Z`, and the Releases entry is created.
 3. **Tell the public.** Website, then newsletter. A version is *released* only
    when all three public surfaces are live (definition below).
 
@@ -19,7 +22,7 @@ A release has three parts, in this order:
 
 | Role | Does |
 |---|---|
-| Release seat | Runs this procedure, declares the freeze, pushes tags, moves `main`, writes the release record. One seat per release, named when the candidate is cut. |
+| Release seat | Runs this procedure, cuts the release branch, pushes tags, merges soak fixes into the release branch, moves `main`, writes the soak report and the release record. One seat per release, named when the candidate is cut. |
 | Gate seat | Runs the whole test suite on the candidate commit and the skip-set comparison, and the install checks (gates G2, G3, G6). Not the release seat. |
 | Security seat | Reads the candidate for the release (gate G5) and says so in writing on the record. |
 | Surfaces | Website Versions entry in both languages, then the newsletter. |
@@ -36,10 +39,14 @@ A release has three parts, in this order:
   ever holds a release commit, so a user following the install guide gets the
   release. The installer itself accepts any tag beginning with `v`, so never
   point a user at a candidate tag.
-- There is no `dev` to `main` pull request. `main` moves only by a
-  fast-forward to the release commit, so `main` and `dev` share one history and
-  the release tag is a commit on both. A merge commit, a squash or a rebase
-  would put a commit on `main` that `dev` does not have.
+- `main` moves only by a fast-forward to the release commit. A pull request
+  from the release branch into `main` exists to run the whole suite on that
+  commit (step 6); it is never merged with the button. A merge commit, a squash
+  or a rebase would put a commit on `main` that no tag names, and the installer
+  requires that the commit a plain clone lands on carries a release tag.
+- Since v0.5.7 there is no freeze of `dev` (maintainer's ruling, 2026-11-13).
+  The candidate lives on its own branch `release/X.Y.Z`, so `dev` keeps taking
+  pull requests while the candidate is gated and soaked.
 - Because `main` is the default branch, a pull request into `dev` does not
   close its issue by itself. Whoever merges closes the issue by hand, naming the
   pull request and the merge commit.
@@ -73,42 +80,46 @@ path. `TestPluginVersionHasChangelogSection` in `tests/test_release_gates.py`
 fails unless `plugin.json`'s version equals the newest changelog heading, so
 `dev` is red between two separate pull requests.
 
-### 3. Freeze `dev` and tag the candidate
+### 3. Cut the release branch and tag the candidate
 
-When that pull request has merged, read the tip and say it:
-
-```bash
-git fetch origin && git rev-parse origin/dev      # this is H
-```
-
-Post the freeze where the team reads orders: `dev` is frozen at `H` for
-`vX.Y.Z`; nothing merges until the release tag exists, except a fix for a
-release blocker named by the release seat. Then tag:
+When that pull request has merged, read the tip, cut the branch there and tag:
 
 ```bash
-git tag -a vX.Y.Z-rcN H -m "vX.Y.Z-rcN"
+git fetch origin && H=$(git rev-parse origin/dev)  # the candidate commit
+git push origin "$H":refs/heads/release/X.Y.Z
+git tag -a vX.Y.Z-rcN "$H" -m "vX.Y.Z-rcN"
 git push origin vX.Y.Z-rcN
-git ls-remote --tags origin vX.Y.Z-rcN            # read it back; local state proves nothing
+git ls-remote origin refs/heads/release/X.Y.Z 'refs/tags/vX.Y.Z-rcN^{}'   # both must print H
 ```
 
-A fix that merges during the freeze moves the tip. The next candidate is
-tagged on the new tip and **every gate below runs again on it**. An approved
-change that is not a release blocker waits for the next release.
+Post where the team reads orders: `release/X.Y.Z` is cut at `H`, `dev` is open,
+and new work goes under the changelog's `[Unreleased]` heading, never under the
+version that now has a release branch.
+
+**`dev` is not frozen.** From this point the candidate and `dev` are two
+branches. What merges into `dev` rides the next release unless it is copied to
+the release branch by the rule in step 5.
+
+The release branch and every tag beginning with `v` or `deploy/` are protected
+by rulesets (table in step 7): only the release team can create such a tag or
+push to a release branch, the branch cannot be deleted or force-moved by
+anyone, and a new commit reaches it only through a pull request. The branch is
+never deleted. It stays as the record of what was released.
 
 ### 4. Gates on the candidate commit
 
 Every gate is read on the commit the candidate tag points at, and its result
-goes into the release record (step 9) with the run's identifier.
+goes into the release record (step 10) with the run's identifier.
 
 | Gate | What must be true | Who |
 |---|---|---|
-| G1 | The hosted full suite is green on the candidate: `gh workflow run tests.yml --repo engram-agents/engram --ref vX.Y.Z-rcN`, then confirm the run's `headSha` is the candidate commit before reading its result. | Release seat |
+| G1 | The hosted full suite is green on the release pull request (step 6): the `pytest (3.12)` check on the pull request's head, produced by a `pull_request` run, with the head equal to the soaked commit. A hand-started run on the candidate tag (`gh workflow run tests.yml --ref vX.Y.Z-rcN`) is useful early corroboration and cannot substitute: `main` requires the check, and a check produced by a hand-started run on a tag did not satisfy it when measured (2026-11-13). | Release seat |
 | G2 | A whole-suite run on a fresh full clone checked out at the candidate tag, with the project's own interpreter, is green. The full output is kept. | Gate seat |
 | G3 | The skip-set comparison below shows no unexplained new skip. | Gate seat |
 | G4 | `name-leak-gate` is green on the candidate commit (it runs on the push to `dev`). `pr-checks` is green on the pull request whose merge produced the candidate, and that pull request's head tree equals the candidate's tree (`pr-checks` runs on pull requests only, so no run exists on the squash commit itself). The secret-scanning alert list has no open alert; this covers code and issue text, and it is a read at one moment: if scanning was enabled or the candidate was pushed within the hour, this part is "not run" until the list has settled. | Release seat |
 | G5 | The security seat reads the net change `vPREV..vCAND`, the diff plus the list of merge commits, and records on the candidate commit, by its full id, either "no objection" or an objection naming the change and the reason. The record states what was read and its bound: files reviewed against files changed. If the security seat could not make the read, the gate is not run; it is not an implied pass. | Security seat |
 | G6 | An install from a plain clone at the candidate tag into an empty home passes `install_selfcheck.py`; and an install over a copy of an existing home leaves every file of that home byte-identical or backed up. | Gate seat |
-| G7 | On macOS, the tests that skip on Linux pass on a seat that runs a real Mac, on the candidate commit. | A Mac seat |
+| G7 | On macOS, the tests that skip on Linux pass on a seat that runs a real Mac, on the candidate commit. The record names the `bash` that ran them: the stock `/bin/bash` (3.2) and a newer one differ (#4620). | A Mac seat |
 
 A gate that cannot be run is not a pass. Write "not run" with the reason, and
 the maintainer decides whether the release goes without it.
@@ -136,48 +147,81 @@ showed them.
    disappeared from collection altogether is treated the same way.
 4. **Where it is stored:** the new run's skip set is committed as
    `docs/internal/release-records/vX.Y.Z-skips.json` in the release-record
-   pull request (step 9), so the next release can read it.
+   pull request (step 10), so the next release can read it.
 
 The release record states both skip counts and the list of differences, even
 when that list is empty.
 
-### 5. Live on the candidate
+### 5. Soak: live on the candidate
 
-The team upgrades to the candidate and works on it. Each seat checks out the
-candidate tag and rebuilds:
+The soak seats upgrade to the candidate and work on it for the soak period.
+The maintainer names the seats and the period when the candidate is cut; the
+starting rule is **one day on the team's own seats, including one night's
+sleep cycle on each** (2026-11-13), to be adjusted from practice. Each soak
+seat checks out the candidate tag and rebuilds:
 
 ```bash
 git fetch origin --tags && git checkout vX.Y.Z-rcN
 tools/install-local-marketplace.sh
 ```
 
-then runs the activation steps of the `engram-upgrade` skill. Anything that
-surfaces is a fix on `dev` through the normal review path, followed by a new
-candidate on the new tip and a fresh pass through step 4. There is no fix on
-`main` and no fix on a tag.
+then runs the activation steps of the `engram-upgrade` skill and reports its
+own read-back (version, the stale-process check, the store's counts).
 
-The candidate is accepted when every gate is recorded and the seats that
-upgraded have reported. How long the team lives on it is the maintainer's
-call, stated when the candidate is cut; a fix for a defect that loses user data
-does not wait for a soak it does not need.
+**A soak finding** is posted at once, marked as such, and comes before other
+work. A seat that checks something and finds it is not caused by the candidate
+posts that too, so it is not asked again.
+
+**A fix found in soak goes to `dev` first**, through the normal review path,
+with its changelog line in the same pull request. Its copy for the candidate
+then **arrives as a pull request into `release/X.Y.Z`**. A hand-pushed
+cherry-pick is refused by rule: the release branch requires the `pr-checks`
+check and a directly pushed commit has no such run. The release seat merges
+that pull request, tags the next candidate on the new tip of the release
+branch, and the gates of step 4 run again on it. There is no fix on `main`
+and no fix on a tag.
+
+**The soak report.** Before asking for the go, the release seat gives the
+maintainer one report: the soak seats and when each started, every finding and
+every checked non-finding, each gate's result, and the known limits that go
+into the release notes. The candidate is accepted when every gate is recorded,
+the soak seats have reported and the maintainer has read that report. A fix
+for a defect that loses user data does not wait for a soak it does not need;
+that is the maintainer's call.
 
 ## Part 2: the release
 
 Nothing in this part happens before the maintainer's go.
 
-### 6. Tag the release on the accepted candidate commit
+### 6. Open the release pull request and read its check
 
 ```bash
-git fetch origin --tags                            # a stale ref makes the next check pass falsely
-C=$(git rev-parse 'vX.Y.Z-rcN^{commit}')          # the accepted candidate
-git rev-parse origin/dev                           # must still equal C; if not, stop
-git tag -a vX.Y.Z "$C" -m "vX.Y.Z"
-git push origin vX.Y.Z
-git ls-remote --tags origin vX.Y.Z
+git fetch origin --tags
+C=$(git rev-parse origin/release/X.Y.Z)            # the soaked commit
+git rev-parse 'vX.Y.Z-rcN^{commit}'                # must equal C; if not, stop
+gh pr create --repo engram-agents/engram --base main --head release/X.Y.Z \
+  --title "release: vX.Y.Z" --body "Release gate for vX.Y.Z. Not merged with the button; main is fast-forwarded to the head (docs/internal/RELEASING.md)."
 ```
 
-Release tags are protected: once pushed, a release tag cannot be moved or
-deleted. Read `C` twice before pushing.
+`tests.yml` runs the whole suite on this pull request. Wait for it, then read
+the required check on the head, both fields in one call:
+
+```bash
+gh api repos/engram-agents/engram/commits/"$C"/check-runs \
+  --jq '.check_runs[] | select(.name=="pytest (3.12)") | {conclusion, head_sha, run: .details_url}'
+gh run view <run-id> --repo engram-agents/engram --json event,headSha,conclusion
+```
+
+`head_sha` must equal `C`, the run's `event` must be `pull_request`, and the
+conclusion must be `success`. This check is gate G1. Never press the merge
+button on this pull request.
+
+**If the check is red, stop.** Read which cells failed and bring them to the
+maintainer with their cause. Whether a red that is confined to a test already
+filed as flaky may be answered by rerunning the failed job is the maintainer's
+decision for that release, recorded on the pull request before any rerun.
+(The suite's memory use on the hosted runner, and the plan that keeps it from
+blocking a release, are tracked in #4655.)
 
 ### 7. Fast-forward `main` to the release commit
 
@@ -186,49 +230,97 @@ push below would name no source, which git reads as a request to delete `main`.
 
 ```bash
 git fetch origin --tags
-C=$(git rev-parse 'vX.Y.Z^{commit}')               # from the release tag pushed in step 6
+C=$(git rev-parse origin/release/X.Y.Z)            # the commit whose check was read in step 6
 if [ -n "$C" ] && git merge-base --is-ancestor origin/main "$C"; then
     git push origin "$C":refs/heads/main           # never with --force
 else
     echo "STOP: C is empty or main is not an ancestor of C; nothing was pushed"
 fi
 git ls-remote origin refs/heads/main               # must print C
+gh pr view <N> --repo engram-agents/engram --json state,mergedAt   # must say MERGED
 ```
 
-If the block prints STOP, nothing was pushed. Either the release tag did not
-resolve, or `main` holds a commit `dev` lacks. Find out which; do not force.
+If the block prints STOP, nothing was pushed. Either the branch did not
+resolve, or `main` holds a commit the release branch lacks. Find out which.
 
-Who may run this step: only an account in the repository's release team. Two
-rulesets protect `main`. One forbids deletion and non-fast-forward pushes for
-everyone, with no bypass. The other forbids any update of `main` except by the
-release team. What the second one buys is narrow, and it should not be read as
-more: another account can no longer publish unreleased code by moving `main`
-to a commit of `dev`. It does not protect against a release-team account that
-is itself compromised, and it does not protect `dev`. No ruleset can say
-"`main` only ever equals a release tag"; the fast-forward check above is what
-carries that, and the rulesets are the second layer.
+**If the push is refused for any reason** (the check is not accepted, `main`
+moved meanwhile, the account is not exempt): stop and report to the
+maintainer. Never force, and never suspend a rule to get past a refusal.
+`main` is never moved back: its history rule allows no force-move for anyone,
+so a bad release is repaired by a new release, not by moving `main`.
 
-Because the two rulesets are separate, the release team's exemption applies to
-the update rule only. It does not relax the rule against non-fast-forward
-pushes, so a release-team account cannot force-push `main` either.
+The pull request reads `MERGED` once `main` contains its head. If it reads
+`CLOSED`, the record would say the release pull request was abandoned; find
+out why before going on.
 
-The release team is an organization team (`release-bypass`). Adding a member
-to it is an organization-owner action, and that is the actual protection:
-whoever is on that team can move `main`. Read its membership as part of the
-check below.
+**Why a fast-forward and not the merge button.** The installer's first step
+requires that the commit a plain clone lands on carries a release tag. So
+`main` must end exactly on the tagged commit, not on a merge commit with an
+equal tree. Do not simplify this step into a merge.
 
-Before the first release cut by this procedure, read both rulesets with an
-admin account (`gh api repos/engram-agents/engram/rulesets/<id>`) and confirm
-that the release seat's account reads `current_user_can_bypass: always` on the
-update rule and `never` on the other. That read is evidence, not a test: until
-a push by a non-member has actually been refused, the release record says "the
-update rule has not been exercised by a refused push". Do not test it with a
-push to `main`.
+**Who may run this step, and how to check.** Only an account in the
+repository's release team (the organization team `release-bypass`). Adding a
+member to it is an organization-owner action, and that is the actual
+protection: whoever is on that team can move `main`, push to a release branch
+and create a release tag. Name the account in the release record. The
+rulesets, each separate so that one can be read or suspended alone:
 
-The push to `main` starts `tests.yml` on `main`. That run is a confirmation
-after the fact, not the gate; G1 was the gate.
+| Ruleset | Covers | Rule | Exempt |
+|---|---|---|---|
+| `main-protect-history` | `main` | no deletion, no force-move | nobody |
+| the update rule on `main` | `main` | no update | release team |
+| `main-require-full-suite` | `main` | required check `pytest (3.12)` | nobody |
+| `release-branches-protect-history` | `release/*` | no deletion, no force-move | nobody |
+| `release-branches-release-seat-only` | `release/*` | no update | release team |
+| `release-branches-require-pr-checks` | `release/*` | required check `pr-checks`, not enforced when the branch is created | nobody |
+| `deployable-tags-release-seat-only` | tags `v*` and `deploy/*` | no creation | release team |
+| `protect-release-tags` | all tags | no deletion, no move | nobody |
 
-### 8. Create the Releases entry
+The tag rule covers both prefixes because the installer accepts a tag that
+begins with `v` or with `deploy/`.
+
+A non-admin account reads every exemption list as empty, so the list is not
+evidence from such an account. The field that is evidence from any account is
+`current_user_can_bypass`, read from the account that will act:
+
+```bash
+gh api repos/engram-agents/engram/rulesets/<id> --jq .current_user_can_bypass
+```
+
+It must print `always` on the three rules the release team is exempt from and
+`never` on the others. Measured 2026-11-13 from both sides: `always` from a
+release-team account on those three, `never` on all of them from an account
+outside the team. **Never test these rules with a real push.** A tag or a
+release branch that slipped through could never be deleted.
+
+What the rules buy is narrow, and it should not be read as more. Another
+account can no longer publish unreleased code by moving `main` or by creating
+a tag the installer accepts. They do not protect against a release-team
+account that is itself compromised, and they do not protect `dev`. No ruleset
+can say "`main` only ever equals a release tag"; the checks in this step and
+the next carry that.
+
+**A lasting effect to know.** The required check on `main` applies to every
+future write to `main`, not only to releases. Any commit pushed there needs a
+green `pytest (3.12)` from a pull request or push run on that commit.
+
+### 8. Tag the release
+
+```bash
+git fetch origin --tags
+C=$(git rev-parse origin/main)
+[ "$C" = "$(git rev-parse origin/release/X.Y.Z)" ] || echo "STOP: main is not the release branch head"
+git tag -a vX.Y.Z "$C" -m "vX.Y.Z"
+git push origin vX.Y.Z
+git ls-remote origin 'refs/tags/vX.Y.Z^{}' refs/heads/main refs/heads/release/X.Y.Z   # three equal ids
+```
+
+Before the tag, `main` must equal the release pull request's head. After it,
+the commit the tag peels to, `main` and the release branch head must be one
+id. Release tags are protected: once pushed, a release tag cannot be moved or
+deleted. Read `C` twice before pushing.
+
+### 9. Create the Releases entry
 
 A tag push does not create a Releases entry.
 
@@ -244,14 +336,24 @@ gh release view vX.Y.Z --repo engram-agents/engram
 Open the page logged out and confirm it renders before anything links to it.
 This completes surface (1) of the definition below, and only that one.
 
-### 9. Unfreeze `dev` and write the release record
+### 10. Write the release record, and bring the release branch home
 
-Post that the freeze is lifted. Then open one pull request into `dev` that
+Open one pull request into `dev` that
 adds `docs/internal/release-records/vX.Y.Z.md` and the skip-set file of G3.
 The record names: the release seat, gate seat and security seat; the candidate
 tags and their commits; each gate with its run identifier and result; both
 skip counts and the differences; the full ids of the release tag object and
-the release commit; the time `main` moved; and anything that was not run.
+the release commit; the time `main` moved; the account that pushed; the soak seats and the soak
+report; and anything that was not run.
+
+**If the release branch carries a commit that `dev` lacks** (a soak fix copied
+onto it), `main` now holds that commit too, and the next release branch, cut
+from `dev`, would not contain it: the next fast-forward of `main` would be
+impossible. So before the next release branch is cut, open a pull request
+from `release/X.Y.Z` into `dev` and merge it **with a merge commit, not a
+squash**. Check afterwards that `git merge-base --is-ancestor origin/main
+origin/dev` succeeds. When no soak fix was needed, the release branch is
+already inside `dev`'s history and this step is only that check.
 
 ## Part 3: tell the public
 
@@ -361,7 +463,7 @@ from, not where you send.
 
 **⚠️ ORDER MATTERS — send AFTER the public release exists, never before.**
 The email links the public repo's Releases entry, which you created by hand
-in step 8 (the subsection carrying the
+in step 9 (the subsection carrying the
 `gh release create` command) — it is not created by the tag push. Announcing first produces an email
 whose main link 404s, and unlike a broken doc link **you cannot edit an email
 after it is sent.** Load every link once before sending.
@@ -441,15 +543,23 @@ or recalled.
   on `dev`.
 - A defect found after the release is fixed on `dev` and shipped as the next
   patch release through this whole procedure. There is no hotfix on `main`.
+- The release branch stays. Nobody deletes it.
 
 ## Anti-patterns
 
-- **Don't move `main` by a pull request, a merge commit, a squash or a
-  rebase.** Each puts a commit on `main` that `dev` does not have. `main` moves
-  by fast-forward to the release commit and in no other way.
-- **Don't merge into `dev` during the freeze.** Each merge moves the tip, and
-  the candidate and every gate have to be redone on the new tip. An approved
-  change that is not a release blocker rides the next release.
+- **Don't move `main` with the merge button, a merge commit, a squash or a
+  rebase.** Each puts an untagged commit on `main`. `main` moves by
+  fast-forward to the release commit and in no other way; the release pull
+  request exists for its check.
+- **Don't push a fix straight to a release branch, and don't fix only there.**
+  A soak fix lands on `dev` first and reaches the release branch by pull
+  request. A fix that exists only on the release branch is lost at the next
+  release.
+- **Don't cut the next release branch while `main` holds a commit `dev`
+  lacks.** Merge the previous release branch back first (step 10).
+- **Don't delete a release branch.** It is the record, and the rules refuse it.
+- **Don't treat a hand-started suite run as the gate.** The gate is the check
+  on the release pull request.
 - **Don't tag a release on a commit whose gates were read on another commit.**
   Read the commit's full id from the tag, not from memory, at every gate.
 - **Don't take a green run as proof that the tests ran.** Compare the skip
