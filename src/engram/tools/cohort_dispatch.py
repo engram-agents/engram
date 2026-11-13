@@ -1465,6 +1465,25 @@ def cmd_validate(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _normalise_retry_item_id(item: dict) -> tuple[dict, str | None]:
+    """Treat a retry item keyed `id` (no `node_id`) as if `node_id` held that value (#1967).
+
+    Returns (item, conflict). `item` is a shallow copy with `node_id` filled in when only
+    `id` was given. `conflict` is an error string when both keys are present with
+    different values, else None. An item with neither key is returned unchanged.
+    """
+    if not isinstance(item, dict) or "id" not in item:
+        return item, None
+    if "node_id" not in item:
+        return {**item, "node_id": item["id"]}, None
+    if item["node_id"] != item["id"]:
+        return item, (
+            f"retry item carries both keys with different values: "
+            f"node_id={item['node_id']!r} vs 'id'={item['id']!r}"
+        )
+    return item, None
+
+
 @_exit_2_on_unexpected
 def cmd_incorporate_retry(args: argparse.Namespace) -> int:
     """Merge retry output + prior failures into final artifacts.
@@ -1543,8 +1562,12 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
             })
     else:
         for item in retry_items:
+            item, key_conflict = _normalise_retry_item_id(item)
             nid = item.get("node_id", "")
-            if not nid or nid not in known_ids:
+            if key_conflict:
+                # Item carries both `node_id` and `id` with different values (#1967)
+                unfixable_items.append({"node_id": nid or "<empty>", "reason": key_conflict})
+            elif not nid or nid not in known_ids:
                 # Fairy invented an ID or returned an empty node_id — unfixable
                 unfixable_items.append({
                     "node_id": nid or "<empty>",
@@ -1601,9 +1624,16 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
     for failure in prior_failures:
         node_id = failure["node_id"]
 
-        # Skip if already classified as unfixable (structural parse failure)
-        if any(u["node_id"] == node_id for u in unfixable_items):
-            builder.add_failure(node_id, "retry output malformed beyond recovery")
+        # Skip if already classified as unfixable. The whole-output parse failure keeps
+        # its fixed final-payload text; a per-item entry (key conflict, #1967) records
+        # its own reason, so the final payload names the real cause.
+        unfixable_entry = next((u for u in unfixable_items if u["node_id"] == node_id), None)
+        if unfixable_entry is not None:
+            builder.add_failure(
+                node_id,
+                "retry output malformed beyond recovery" if parse_failed
+                else unfixable_entry["reason"],
+            )
             continue
 
         if node_id in retry_by_id:

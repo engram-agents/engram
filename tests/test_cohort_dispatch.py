@@ -2309,3 +2309,101 @@ def test_prepare_mismatch_gate_uses_capped_backfill_total(tmp_path):
         f"backfill_total=120 with 60 IDs should not trigger mismatch gate "
         f"(0 + min(120,60)=60): {result.stderr}"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1967: incorporate accepts retry items keyed `id` as well as `node_id`
+# ---------------------------------------------------------------------------
+
+
+def _run_incorporate_1967(retry_items: list[dict]) -> tuple[int, dict, list]:
+    """One failure (ob_0002) + the given retry items. Returns (exit, final_payload, unfixable)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        prior_failures = [
+            {
+                "node_id": "ob_0002",
+                "payload": {"id": "ob_0002", "type": "observation_factual", "claim": "test"},
+                "error": "overcap",
+            },
+        ]
+        out_dir, retry_path = _setup_incorporate_retry(tmp_dir, [], prior_failures, retry_items)
+        _write_manifest(out_dir, [])
+        exit_code = _run(["incorporate", "--retry-output", str(retry_path), "--out", str(out_dir)])
+        final = json.loads((out_dir / "final_payload.json").read_text())
+        unfixable_path = out_dir / "unfixable.json"
+        unfixable = json.loads(unfixable_path.read_text()) if unfixable_path.exists() else []
+        return exit_code, final, unfixable
+
+
+def test_incorporate_id_only_item_accepted_1967():
+    item = _valid_item("ob_0002")
+    item["id"] = item.pop("node_id")
+    code, final, unfixable = _run_incorporate_1967([item])
+    assert code == 0
+    assert unfixable == [], f"id-keyed item must not be unfixable: {unfixable}"
+    assert "Short valid summary for ob_0002" in json.dumps(final)
+    assert not final.get("failures"), final
+
+
+def test_incorporate_both_keys_equal_accepted_1967():
+    item = _valid_item("ob_0002")
+    item["id"] = "ob_0002"
+    code, final, unfixable = _run_incorporate_1967([item])
+    assert code == 0
+    assert unfixable == []
+    assert not final.get("failures"), final
+
+
+def test_incorporate_both_keys_different_unfixable_1967():
+    item = _valid_item("ob_0002")
+    item["id"] = "ob_0009"
+    code, _final, unfixable = _run_incorporate_1967([item])
+    assert code == 0
+    assert len(unfixable) == 1, unfixable
+    reason = unfixable[0]["reason"]
+    for needle in ("node_id", "'id'", "ob_0002", "ob_0009"):
+        assert needle in reason, f"reason must name {needle!r}: {reason}"
+    # The final payload must carry the same cause, not the whole-output-parse text
+    fail = [f for f in _final["failures"] if f["node_id"] == "ob_0002"]
+    assert len(fail) == 1, _final
+    for needle in ("node_id", "'id'", "ob_0002", "ob_0009"):
+        assert needle in fail[0]["reason"], f"final failure must name {needle!r}: {fail[0]}"
+    assert "malformed beyond recovery" not in fail[0]["reason"]
+
+
+def test_incorporate_whole_output_malformed_final_reason_unchanged_1967():
+    """Whole-output parse failure keeps its final-payload failure text."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        prior_failures = [
+            {
+                "node_id": "ob_0002",
+                "payload": {"id": "ob_0002", "type": "observation_factual", "claim": "test"},
+                "error": "overcap",
+            },
+        ]
+        out_dir, retry_path = _setup_incorporate_retry(tmp_dir, [], prior_failures, [])
+        retry_path.write_text("{not json")
+        _write_manifest(out_dir, [])
+        code = _run(["incorporate", "--retry-output", str(retry_path), "--out", str(out_dir)])
+        assert code == 0
+        final = json.loads((out_dir / "final_payload.json").read_text())
+        assert final["failures"] == [
+            {"node_id": "ob_0002", "reason": "retry output malformed beyond recovery"}
+        ]
+
+
+def test_incorporate_node_id_only_unchanged_1967():
+    code, final, unfixable = _run_incorporate_1967([_valid_item("ob_0002")])
+    assert code == 0
+    assert unfixable == []
+    assert not final.get("failures"), final
+
+
+def test_incorporate_neither_key_unfixable_1967():
+    item = _valid_item("ob_0002")
+    del item["node_id"]
+    code, _final, unfixable = _run_incorporate_1967([item])
+    assert code == 0
+    assert len(unfixable) == 1, unfixable
