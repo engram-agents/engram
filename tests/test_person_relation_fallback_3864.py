@@ -181,3 +181,66 @@ def test_query_omits_relation_when_neither_key_set():
     q = json.loads(server.engram_query(payload_json=json.dumps({"query": "Barepersonxyz"})))
     entry = next(e for e in q["results"] if e["id"] == pid)
     assert "relation" not in entry
+
+
+# --- round 2 (PR #4718): the identity hook and the viz person panel ---------
+
+import importlib.util as _ilu
+
+_HOOK_PATH = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-user-identity-hook.py"
+_GRAPH_JS = PROJECT_ROOT / "src" / "engram" / "viz" / "static" / "graph.js"
+
+
+def _load_identity_hook(tmp_path, monkeypatch):
+    monkeypatch.setenv("ENGRAM_HOME", str(tmp_path))
+    sys.modules.pop("engram_user_identity_hook_3864", None)
+    spec = _ilu.spec_from_file_location("engram_user_identity_hook_3864", str(_HOOK_PATH))
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _hook_person(pid, **meta):
+    return {"id": pid, "metadata": json.dumps({"name": "Ann", **meta}), "logical_chain": "d"}
+
+
+@pytest.mark.parametrize("meta,expected", [
+    ({"relation": "newrel"}, "newrel"),
+    ({"role": "oldrel"}, "oldrel"),
+    ({"relation": "newrel", "role": "oldrel"}, "newrel"),
+    ({"relation": "  ", "role": "oldrel"}, "oldrel"),
+    ({"relation": 5, "role": 7}, ""),
+    ({}, ""),
+])
+def test_identity_hook_detect_speaker_both_cohorts(meta, expected, tmp_path, monkeypatch, isolate_hook_loads):
+    hook = _load_identity_hook(tmp_path, monkeypatch)
+    got = hook.detect_speaker("Ann: hi", [_hook_person("pn_1", **meta)])
+    assert got is not None and got["role"] == expected
+    assert set(got) == {"person_id", "name", "role", "description", "matched_prefix"}
+
+
+def test_reader_prefers_relation_when_both_keys_set(people):
+    """A reader (not only the helper) pins that relation wins over role."""
+    server, legacy, modern = people
+    import engram_core as core
+    conn = core._get_db()
+    try:
+        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (modern,)).fetchone()
+        meta = json.loads(row["metadata"])
+        meta["role"] = "stale-role"
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(meta), modern))
+        conn.commit()
+        snap = core._generate_snapshot(conn)
+    finally:
+        conn.close()
+    assert "Role: newrel" in snap and "stale-role" not in snap
+
+
+def test_graph_js_person_panel_reads_relation_before_role():
+    """TEXT check on graph.js (no JS runner here); it does not execute the panel."""
+    src = _GRAPH_JS.read_text(encoding="utf-8")
+    start = src.index("case 'person':")
+    block = src[start:start + 1500]
+    assert "meta.relation" in block and "meta.role" in block
+    assert block.index("meta.relation") < block.index("meta.role")
+    assert "field('Role'" in block
