@@ -78,6 +78,7 @@ Design doc: forum/spec.md
 
 import http.client
 import json
+import math
 import os
 import socket
 import sys
@@ -605,7 +606,18 @@ def _load_cache() -> Optional[dict]:
     try:
         raw = _hooklib_io().read_regular_text(HOOK_CACHE_PATH)
         data = json.loads(raw)
-        age = time.time() - data.get("fetched_at", 0)
+        # #3535: a cache that is not a JSON object, or whose `fetched_at` is not a
+        # finite number (bool counts as not a number), is an INVALID cache -- the
+        # same as an unparsable one -- never an AttributeError / TypeError that
+        # exits the hook rc=1 with no forum signal. A non-finite stamp is invalid
+        # too: NaN/Infinity would make `age > TTL` False and serve it as fresh.
+        if not isinstance(data, dict):
+            return None
+        fetched_at = data.get("fetched_at", 0)
+        if (isinstance(fetched_at, bool) or not isinstance(fetched_at, (int, float))
+                or not math.isfinite(fetched_at)):
+            return None
+        age = time.time() - fetched_at
         if age > CACHE_TTL_SECONDS:
             return None
         return data
