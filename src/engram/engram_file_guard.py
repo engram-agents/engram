@@ -31,6 +31,7 @@ import errno
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import tempfile
@@ -413,10 +414,13 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     The put-back writes into the same inode too, so the ACL and xattrs survive a FAILED write,
     not only a successful one. It restores the bytes, and the mode, owner and links never
     changed; the modification time does move, since the file was written twice. The backup does not carry them (see the module docstring), so
-    the restore command given is `cat backup > path`, which writes into the same inode: `cp -p`
+    the restore command given is `cat -- backup > path`, which writes into the same inode: `cp -p`
     would replace the file's ACL and xattrs with the backup's (none; measured on macOS).
 
-    The caller passes a path already resolved with realpath; the open does not follow a link
+    The shipped callers (`_write`, `apply_merge`) pass a path that is absolute in the default
+    configuration, and resolve a symlink to its target before calling; a regular file's path is
+    passed through as given. Absoluteness is the callers' convention, not something this
+    function checks, and resolution happens only for a symlink. The open does not follow a link
     (O_NOFOLLOW is hardening on this final open: a link put there after the check is refused,
     not written through; symlinked targets still work because they were resolved first) and
     does not wait on a FIFO (O_NONBLOCK); anything that is not a regular file is refused before
@@ -427,7 +431,7 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     data = text.encode("utf-8")
     if backup is not None:
         saved = f"A copy of it from before this run is at {backup}."
-        restore = f"Restore it with: cat '{backup}' > '{path}'"
+        restore = f"Restore it with: cat -- {shlex.quote(str(backup))} > {shlex.quote(str(path))}"
     else:
         saved = restore = "ENGRAM owns this file and keeps no backup of it; re-run setup to write it again."
     try:

@@ -51,6 +51,7 @@ For each candidate, write NOW. Don't defer. Don't batch mentally. Use the right 
 ```
 engram_checkpoint(
     message="<1-3 sentence summary of what this burst covered and what was written>",
+    session_id="<this session's id, as injected at session start>",
 )
 ```
 
@@ -65,7 +66,7 @@ own hot-reload takes effect immediately, but the running server does not
 until a `/mcp` reconnect). Call `engram_nap` instead until the reconnect
 lands; both names take identical arguments and return identical shapes.
 
-`session_id` is still accepted (kept for backward compatibility with older callers) but no longer does anything for the `warm_briefing` advisory below — as of #3014 that advisory anchors on the **last nap/sleep checkpoint already in `session_log.md`**, not on session identity. `warm_briefing.written_since_last_nap` resolves to `true`/`false` on its own, with no `session_id` needed; it's `null` only when there's no prior checkpoint in the file yet (e.g. this is the very first nap ever) or the warm-briefing file itself is missing.
+Pass `session_id` (the id injected at session start): it is recorded in `compact/last-checkpoint.json` so the #4012 backstop can tell sessions apart on a shared `ENGRAM_HOME` (#4356). It no longer does anything for the `warm_briefing` advisory below — as of #3014 that advisory anchors on the **last nap/sleep checkpoint already in `session_log.md`**, not on session identity. `warm_briefing.written_since_last_nap` resolves to `true`/`false` on its own, with no `session_id` needed; it's `null` only when there's no prior checkpoint in the file yet (e.g. this is the very first nap ever) or the warm-briefing file itself is missing.
 
 The `nap` mode:
 - Logs the summary to `~/.engram/session_log.md` (under `$ENGRAM_HOME`, default `~/.engram`) with a "Nap (turn N)" header

@@ -13,6 +13,7 @@ implementation of PR B of engram-alpha #133.
 
 Gates:
 - Skipped if prompt starts with `/` or `!` (commands, not natural language)
+- Skipped if prompt starts with the loop-wake marker (the agent's own wake, #2204)
 - Skipped if a sleep cycle completed within the last 4 hours (sleep-marker
   freshness check) — handles the re-fire case where user says "good night
   ... actually one more thing ... ok really good night" within the same
@@ -41,9 +42,41 @@ if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import open_regular_text
 from _hooklib import engram_home_or_exit
+from _hooklib import bounded_parents
 
 ENGRAM_HOME = str(engram_home_or_exit())
 SLEEP_MARKER = os.path.join(ENGRAM_HOME, "sessions", "last-sleep-success.json")
+
+# ---------------------------------------------------------------------------
+# loop_prompt import -- SSoT for the loop-wake marker (#2204). Same pattern as
+# engram-deference-detector-prompt.py: resolve tools/ in both deploy topologies
+# ($CLAUDE_PLUGIN_ROOT first, then a bounded walk of our own tree; never a
+# fixed parents[N]). FAIL-SAFE: on any import failure fall back to the local
+# constant, which a test pins equal to loop_prompt.LOOP_WAKE_MARKER.
+# ---------------------------------------------------------------------------
+_LOOP_WAKE_MARKER_FALLBACK: str = "<loop-wake>"
+
+_lp_candidates = []
+_lp_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+if _lp_plugin_root:
+    _lp_candidates.append(Path(_lp_plugin_root) / "tools")
+for _lp_parent in bounded_parents(Path(__file__).resolve()):
+    _lp_candidates.append(_lp_parent / "tools")
+_LP_TOOLS_DIR = None
+for _lp_candidate in _lp_candidates:
+    try:
+        _lp_found = (_lp_candidate / "loop_prompt.py").exists()
+    except OSError:
+        continue  # per-candidate guard: an unreadable dir must not abort the search
+    if _lp_found:
+        _LP_TOOLS_DIR = _lp_candidate
+        break
+if _LP_TOOLS_DIR is not None and str(_LP_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_LP_TOOLS_DIR))
+try:
+    from loop_prompt import LOOP_WAKE_MARKER as _LOOP_WAKE_MARKER
+except Exception:
+    _LOOP_WAKE_MARKER = _LOOP_WAKE_MARKER_FALLBACK
 
 # Hours since last successful sleep below which the nudge is suppressed.
 # Tuned to handle within-session re-fire ("good night... wait... ok night")
@@ -101,6 +134,9 @@ def main() -> None:
 
     prompt = hook_input.get("prompt", "").strip()
     if not prompt or prompt.startswith("/") or prompt.startswith("!"):
+        sys.exit(0)
+    # #2204: the agent's own loop-wake prompt is not the user speaking.
+    if prompt.startswith(_LOOP_WAKE_MARKER):
         sys.exit(0)
 
     match = EOD_RE.search(prompt)

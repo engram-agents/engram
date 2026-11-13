@@ -436,6 +436,70 @@ class TestFairyPolicyModeLines:
             f"always mode label missing: {block!r}"
         )
 
+    def test_coder_always_line_states_grant_precondition(self, tmp_path):
+        """#4562: the 'always' coder line names the sub-agent grant and where it lives."""
+        block = self._get_block(tmp_path, "always", "auto")
+        line = block.splitlines()[0]
+        assert line == (
+            "[Coder fairy policy: always] Every PR coding task gets a fairy — "
+            "no size exception, no quick-fix exception. Spec and dispatch, once "
+            "sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
+            "(a dated grant line or a standing request); without it, do the work "
+            "directly and say so. "
+            "Where that section carries an \"ask each time\" line, ask the user "
+            "before each dispatch; a yes covers that task only."
+        ), line
+        assert len(line) < 450
+
+    def test_coder_always_ask_each_time_branch_order(self, tmp_path):
+        """#4562 r2: grant, then the direct fallback, then the ask-each-time branch; once."""
+        line = self._get_block(tmp_path, "always", "auto").splitlines()[0]
+        assert line.count("ask each time") == 1, line
+        assert line.index("granted") < line.index("do the work") < line.index("ask each time"), line
+
+    def test_reviewer_always_line_states_grant_precondition(self, tmp_path):
+        """#4562: the 'always' reviewer line names the sub-agent grant and where it lives."""
+        block = self._get_block(tmp_path, "auto", "always")
+        line = block.splitlines()[1]
+        assert line == (
+            "[Reviewer fairy policy: always] Every PR review task gets a "
+            "reviewer-fairy — no size exception, no quick-fix exception. Dispatch, "
+            "once sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
+            "(a dated grant line or a standing request); without it, do the review "
+            "directly and say so. "
+            "Where that section carries an \"ask each time\" line, ask the user "
+            "before each dispatch; a yes covers that task only."
+        ), line
+        assert len(line) < 450
+
+    def test_reviewer_always_ask_each_time_branch_order(self, tmp_path):
+        """#4562 r2: grant, then the direct fallback, then the ask-each-time branch; once."""
+        line = self._get_block(tmp_path, "auto", "always").splitlines()[1]
+        assert line.count("ask each time") == 1, line
+        assert line.index("granted") < line.index("do the review") < line.index("ask each time"), line
+
+    def test_other_policy_lines_unchanged(self, tmp_path):
+        """#4562: only the two 'always' lines change; explicit/auto stay byte-identical."""
+        block = self._get_block(tmp_path, "explicit", "auto", primary_user="lin")
+        assert block.splitlines() == [
+            "[Coder fairy policy: explicit] Do PR coding work directly unless "
+            "lin explicitly invokes a fairy. Mentally spec the change first.",
+            "[Reviewer fairy policy: auto] Use judgment per task. Before deciding on "
+            "PR-review work, load engram-auto-reviewer-fairy-judgement skill — "
+            "its heuristic decides direct vs. dispatch.",
+        ]
+
+    def test_other_policy_lines_unchanged_swapped(self, tmp_path):
+        """#4562: companion of the above, the swapped pairing."""
+        block = self._get_block(tmp_path, "auto", "explicit", primary_user="lin")
+        assert block.splitlines() == [
+            "[Coder fairy policy: auto] Use judgment per task. Before deciding on "
+            "PR-coding work, load engram-auto-coder-fairy-judgement skill — "
+            "its heuristic decides direct vs. dispatch.",
+            "[Reviewer fairy policy: explicit] Do PR review work directly unless "
+            "lin explicitly invokes a reviewer-fairy. Review inline.",
+        ]
+
     def test_reviewer_auto_contains_skill_name(self, tmp_path):
         block = self._get_block(tmp_path, "auto", "auto")
         assert "engram-auto-reviewer-fairy-judgement" in block, (
