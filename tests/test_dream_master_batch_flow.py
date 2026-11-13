@@ -1324,6 +1324,26 @@ def test_goal_tension_with_engram_resolve_still_routes_to_goal_tension():
         assert _bucket_of(suggestion) == BUCKET_GOAL_TENSION_RESOLUTIONS, suggestion
 
 
+# Mixed suggestions that route to a non-unknown bucket on origin/dev (6ae44978)
+# keep that bucket; engram_resolve only claims what was unknown (the
+# mention-vs-action class of #4663/#3536 must not gain instances).
+
+
+def test_engram_resolve_mention_keeps_supersedes():
+    s = "supersede ob_1 with ob_2, then engram_resolve qu_3"
+    assert _bucket_of(s) == BUCKET_SUPERSEDES
+
+
+def test_engram_resolve_mention_keeps_retractions():
+    s = "retract ob_9; engram_resolve not needed"
+    assert _bucket_of(s) == BUCKET_RETRACTIONS
+
+
+def test_engram_resolve_mention_keeps_task_closures():
+    s = "close task and mark done \u2014 engram_resolve n/a"
+    assert _bucket_of(s) == BUCKET_TASK_CLOSURES
+
+
 def test_edge_wiring_with_engram_resolve_still_routes_to_edge_wiring():
     s = "engram_add_edge(...) then engram_resolve(target_id=qu_0001)"
     assert _bucket_of(s) == BUCKET_EDGE_WIRING
