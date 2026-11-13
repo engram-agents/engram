@@ -71,6 +71,17 @@ def deny_unmapped_text(source, model_id, self_lineage, home):
             f"which the gate does not recognise as family `{self_lineage}`. " + _tail(self_lineage, home))
 
 
+def deny_unmapped_c_text(source, model_id, self_lineage, home):
+    """Branch (c) deny (rule U): remedies in the order relaunch, table row, human's lineage decision."""
+    return (f"ENGRAM write blocked by the model-family gate. {source} came from model `{model_id}`, "
+            f"which the gate does not recognise as family `{self_lineage}`. Nothing was written. To continue: "
+            f"relaunch the session on a `{self_lineage}` model. If `{model_id}` is your own vendor's "
+            f"`{self_lineage}` model and the gate does not know it yet, add its exact id to the model table "
+            f"(`_NON_CLAUDE_MODEL_TABLE` in `engram_trust.py`, a reviewed change). If the change of model "
+            f"family is deliberate, that is the human's decision: change `self_lineage` in "
+            f"`{home}/config.json`. Reading memory still works.")
+
+
 def unverified_text(code):
     return (f"ENGRAM model-family gate: this write went through UNVERIFIED (`{code}`): the gate could "
             f"not confirm which model made the call.")
@@ -564,8 +575,15 @@ def test_c4_unmapped_b_same_provider_family_token_present_allows_unverified(hook
     assert out(hook.decide(pay(tpath=t), home)) == ("allow-context", unverified_text("unmapped_model"))
 
 
-def test_c4_unmapped_c_provider_not_recognised_family_token_present_allows_unverified(hook, home, tmp_path):
+def test_c4_unmapped_c_provider_not_recognised_family_token_present_first_token_foreign_denies(hook, home, tmp_path):
+    """Rule U: `mystery` is not one of anthropic:opus's own first tokens, so (c) denies with the new text."""
     t = _call(tmp_path, "mystery-opus-9")
+    assert out(hook.decide(pay(tpath=t), home)) == (
+        "deny", deny_unmapped_c_text(THIS_CALL, "mystery-opus-9", SELF, home))
+
+
+def test_c4_unmapped_c_provider_not_recognised_own_first_token_allows_unverified(hook, home, tmp_path):
+    t = _call(tmp_path, "anthropic-opus-6")
     assert out(hook.decide(pay(tpath=t), home)) == ("allow-context", unverified_text("unmapped_model"))
 
 
@@ -584,7 +602,110 @@ def test_c4_unmapped_from_the_fallback_uses_the_previous_reply_wording(fast, hom
     t = write_jsonl(tmp_path / "t.jsonl", [asst("mystery-9")])
     assert out(fast.decide(pay(tpath=t), home)) == ("deny", deny_unmapped_text(PREVIOUS, "mystery-9", SELF, home))
     t2 = write_jsonl(tmp_path / "t2.jsonl", [asst("mystery-opus-9")])
-    assert out(fast.decide(pay(tpath=t2), home)) == ("allow-context", unverified_text("unmapped_model"))
+    assert out(fast.decide(pay(tpath=t2), home)) == (
+        "deny", deny_unmapped_c_text(PREVIOUS, "mystery-opus-9", SELF, home))
+    t3 = write_jsonl(tmp_path / "t3.jsonl", [asst("anthropic-opus-6")])
+    assert out(fast.decide(pay(tpath=t3), home)) == ("allow-context", unverified_text("unmapped_model"))
+
+
+# Rule U measured column: (lineage, id, expected).  Expected kinds: allow (silent), notice, deny_c (branch c
+# text), deny_old (branch a/d text), deny_mapped:<lineage> (the id maps to another lineage).
+RULE_U_ROWS = [
+    ("deepseek:flash", "deepseek-v4.1-flash", "allow"),
+    ("deepseek:flash", "deepseek-v5-flash", "notice"),
+    ("deepseek:flash", "ds-v5-flash", "deny_c"),
+    ("deepseek:flash", "deepseek-v5-pro", "deny_old"),
+    ("deepseek:flash", "gemini-2.5-flash", "deny_c"),
+    ("deepseek:flash", "qwen3-flash", "deny_c"),
+    ("deepseek:flash", "kimi-k3-flash", "deny_c"),
+    ("deepseek:flash", "claude-opus-5-5", "deny_mapped:anthropic:opus"),
+    ("anthropic:opus", "claude-opus-5-5", "allow"),
+    ("anthropic:opus", "claude-opus-9", "allow"),
+    ("anthropic:opus", "anthropic-opus-6", "notice"),
+    ("anthropic:opus", "opus-6", "deny_c"),
+    ("anthropic:opus", "claude-sonnet-5-5", "deny_mapped:anthropic:sonnet"),
+    ("anthropic:opus", "llama-opus-70b", "deny_c"),
+    ("anthropic:opus", "opus-mini", "deny_c"),
+    ("anthropic:opus", "gemini-2.5-flash", "deny_old"),
+    ("openai:gpt", "gpt-6.1-sol", "allow"),
+    ("openai:gpt", "gpt-7", "notice"),
+    ("openai:gpt", "gpt-6.5-mini", "notice"),
+    ("openai:gpt", "o5-mini", "deny_old"),
+    ("openai:gpt", "gpt-neox-20b", "notice"),
+    ("openai:gpt", "chatgpt-4o-latest", "deny_old"),
+    ("openai:gpt", "deepseek-v4.1-flash", "deny_mapped:deepseek:flash"),
+    ("openai:gpt", "qwen-gpt-7b", "deny_c"),
+    ("acme:whiz", "acme-whiz-1", "notice"),
+    ("acme:whiz", "acme-whiz-2-mini", "notice"),
+    ("acme:whiz", "whiz-1", "deny_c"),
+    ("acme:whiz", "gemini-2.5-whiz", "deny_c"),
+    ("acme:whiz", "claude-whiz-1", "deny_mapped:anthropic:whiz"),
+]
+
+
+def _rule_u_expect(kind, lineage, model, home):
+    if kind == "allow":
+        return None, ""
+    if kind == "notice":
+        return "allow-context", unverified_text("unmapped_model")
+    if kind == "deny_c":
+        return "deny", deny_unmapped_c_text(THIS_CALL, model, lineage, home)
+    if kind == "deny_old":
+        return "deny", deny_unmapped_text(THIS_CALL, model, lineage, home)
+    mapped = kind.split(":", 1)[1]
+    return "deny", deny_text(THIS_CALL, model, mapped, lineage, home)
+
+
+@pytest.mark.parametrize("lineage,model,kind", RULE_U_ROWS)
+def test_c4_rule_u_matches_the_measured_column(hook, home, tmp_path, lineage, model, kind):
+    set_lineage(home, lineage)
+    t = write_jsonl(tmp_path / "t.jsonl", [call_row(model, "toolu_01")])
+    assert out(hook.decide(pay(tpath=t), home)) == _rule_u_expect(kind, lineage, model, home)
+
+
+def test_c4_rule_u_column_has_29_rows():
+    assert len(RULE_U_ROWS) == 29
+
+
+def test_c4_rule_u_named_residual_an_own_first_token_passes_with_the_notice(hook, home, tmp_path):
+    """Pins the ACCEPTED residual: `gpt-neox-20b` on openai:gpt has the family token `gpt` and the seat's own
+    first token `gpt`, so it passes with the notice although it is not an OpenAI GPT.  Narrow, never silent.
+    A later change to this outcome must be a deliberate one: this cell goes red with it."""
+    set_lineage(home, "openai:gpt")
+    t = _call(tmp_path, "gpt-neox-20b")
+    assert out(hook.decide(pay(tpath=t), home)) == ("allow-context", unverified_text("unmapped_model"))
+
+
+def test_c4_rule_u_a_lineage_with_no_table_rows_trusts_only_its_provider_token(hook, home, tmp_path):
+    """`acme:whiz` has no table row: own first tokens are just {acme}."""
+    set_lineage(home, "acme:whiz")
+    t = _call(tmp_path, "acme-whiz-1")
+    assert out(hook.decide(pay(tpath=t), home)) == ("allow-context", unverified_text("unmapped_model"))
+    t2 = write_jsonl(tmp_path / "t2.jsonl", [call_row("whiz-1", "toolu_01")])
+    assert out(hook.decide(pay(tpath=t2), home)) == (
+        "deny", deny_unmapped_c_text(THIS_CALL, "whiz-1", "acme:whiz", home))
+
+
+def test_c4_rule_u_branch_c_deny_text_orders_the_remedies(hook, home, tmp_path):
+    """relaunch / agent definition, then the table row, then the human's `self_lineage` decision."""
+    t = _call(tmp_path, "mystery-opus-9")
+    main = out(hook.decide(pay(tpath=t), home))[1]
+    assert (main.index("relaunch the session") < main.index("add its exact id to the model table")
+            < main.index("change `self_lineage` in"))
+    parent, _ = sub_layout(tmp_path, [], [call_row("mystery-opus-9", "toolu_01")])
+    helper = out(hook.decide(sub_pay(parent), home))[1]
+    assert (helper.index("agent definition must run") < helper.index("add its exact id to the model table")
+            < helper.index("Changing `self_lineage` is the human's decision"))
+
+
+def test_c4_rule_u_own_first_tokens_are_read_from_the_table_not_hard_coded(hook, home, tmp_path, monkeypatch):
+    set_lineage(home, "deepseek:flash")
+    t = _call(tmp_path, "zz-flash-2")
+    assert out(hook.decide(pay(tpath=t), home)) == (
+        "deny", deny_unmapped_c_text(THIS_CALL, "zz-flash-2", "deepseek:flash", home))
+    monkeypatch.setitem(sys.modules["engram_trust"]._NON_CLAUDE_MODEL_TABLE, "zz-flash-1",
+                        ("deepseek", "flash", "1"))
+    assert out(hook.decide(pay(tpath=t), home)) == ("allow-context", unverified_text("unmapped_model"))
 
 
 def test_c4_every_allow_unverified_output_carries_text_2_2_with_its_code(fast, home, tmp_path):
@@ -1011,6 +1132,17 @@ def helper_deny_unmapped_text(source, agent_type, agent_id, model_id, self_linea
             f"that is the human's decision.")
 
 
+def helper_deny_unmapped_c_text(source, agent_type, agent_id, model_id, self_lineage):
+    lead = "This call came from a" if source == THIS_CALL else "The previous reply of a"
+    return (f"ENGRAM write blocked by the model-family gate. {lead} helper agent (`{agent_type}`, id "
+            f"`{agent_id}`) running on model `{model_id}`, which the gate does not recognise as family "
+            f"`{self_lineage}`. Nothing was written. The main session's own model is not affected by this "
+            f"block. To let this helper write, its agent definition must run on a `{self_lineage}` model. If "
+            f"`{model_id}` is your own vendor's `{self_lineage}` model and the gate does not know it yet, add "
+            f"its exact id to the model table (`_NON_CLAUDE_MODEL_TABLE` in `engram_trust.py`, a reviewed "
+            f"change). Changing `self_lineage` is the human's decision.")
+
+
 def sub_pay(tpath, session="sess-1", agent_id=AGENT_ID, agent_type=AGENT_TYPE, tid="toolu_01", **kw):
     p = pay(tid=tid, tpath=tpath, session=session)
     if agent_id is not None:
@@ -1088,7 +1220,8 @@ def test_c13_empty_agent_id_is_a_main_session_call(hook, home, tmp_path):
     ("claude-opus-5 beta", "openai:gpt", "deny"),            # a: known other provider
     ("claude-flash-9 beta", "deepseek:flash", "deny"),       # a: shared family word across providers
     ("claude-opus-5 beta", SELF, "unmapped_model"),          # b
-    ("mystery-opus-9", SELF, "unmapped_model"),              # c
+    ("mystery-opus-9", SELF, "deny_c"),                      # c: first token foreign (rule U)
+    ("anthropic-opus-6", SELF, "unmapped_model"),            # c: first token is the seat's own
     ("mystery-9", SELF, "deny"),                             # d
 ])
 def test_r22_unmapped_branches_apply_to_the_helper_model(hook, home, tmp_path, model, self_lineage, expect):
@@ -1097,6 +1230,8 @@ def test_r22_unmapped_branches_apply_to_the_helper_model(hook, home, tmp_path, m
     got = out(hook.decide(sub_pay(parent), home))
     if expect == "deny":
         assert got == ("deny", helper_deny_unmapped_text(THIS_CALL, AGENT_TYPE, AGENT_ID, model, self_lineage))
+    elif expect == "deny_c":
+        assert got == ("deny", helper_deny_unmapped_c_text(THIS_CALL, AGENT_TYPE, AGENT_ID, model, self_lineage))
     else:
         assert got == ("allow-context", unverified_text("unmapped_model"))
 
