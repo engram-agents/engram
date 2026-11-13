@@ -387,8 +387,8 @@ def is_own_server_py_running(engram_home: str) -> bool:
 
 def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = True) -> None:
     """Atomically replace ``path`` with ``text`` (#4013).  The one shared
-    mode- and group-preserving writer: an existing file keeps its permission
-    bits and, where permitted, its group; a new file gets what ``write_text``
+    mode-, group-, ACL- and user-xattr-preserving writer: an existing file keeps
+    its permission bits and, where permitted, its group; a new file gets what ``write_text``
     would give it (umask or the directory's default ACL).  By default a symlink
     is followed (the link stays, its target changes).  With
     ``follow_symlinks=False`` the path itself is replaced: a symlink (live or
@@ -399,8 +399,19 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     True exists for paths the caller owns and links on purpose, such as config.json via
     ``write_config_json``.  Needs write access to the containing directory (same-UID
     callers).  On any error the temp file is removed and the error re-raised;
-    ``path`` is never left partial.  Duplicated here because this module must
-    stay self-contained; kept AST-identical with
+    ``path`` is never left partial.  Named POSIX ACL entries
+    (``system.posix_acl_access``) and ``user.*`` extended attributes are copied
+    from the existing file onto the temp before the publish, after the mode and
+    group are restored, so the ACL's mask (which settles the group bits) is
+    authoritative.  Only the ``user.*`` namespace is copied: ``security.*`` and
+    ``trusted.*`` are frequently unreadable or unsettable by an unprivileged
+    writer, so attempting them would turn a normal write into a failure on
+    SELinux hosts.  The access ACL is read explicitly, since the kernel may not
+    list it with ``listxattr``; ``system.posix_acl_default`` is a directory
+    attribute and does not apply to a regular file.  If the source carries one
+    of these and it cannot be applied to the temp, the write raises, the temp is
+    removed, and the target is left untouched.  Duplicated here because this
+    module must stay self-contained; kept AST-identical with
     ``engram_config_io.atomic_write_text`` (tests/test_atomic_writer_modes_4013.py)."""
     target = os.path.realpath(path) if follow_symlinks else os.path.abspath(path)
     try:
@@ -433,6 +444,38 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
                 except PermissionError:
                     pass  # not a member of that group: the new inode keeps its own
                 os.fchmod(fh.fileno(), stat.S_IMODE(st.st_mode))
+                # ACL entries and user.* xattrs are inode metadata too, and the
+                # rename installs a new inode: read them from the file being
+                # replaced and apply them to the temp BEFORE the publish, after the
+                # fchmod so the ACL mask settles the final group bits.
+                no_attr = tuple(
+                    e
+                    for e in (
+                        getattr(errno, "ENODATA", None),
+                        getattr(errno, "ENOATTR", None),
+                        getattr(errno, "ENOTSUP", None),
+                        getattr(errno, "EOPNOTSUPP", None),
+                        getattr(errno, "ENOSYS", None),
+                    )
+                    if e is not None
+                )
+                try:
+                    acl = os.getxattr(target, "system.posix_acl_access", follow_symlinks=False)
+                except OSError as exc:
+                    if exc.errno not in no_attr:
+                        raise
+                else:
+                    os.setxattr(tmp, "system.posix_acl_access", acl, follow_symlinks=False)
+                try:
+                    names = os.listxattr(target, follow_symlinks=False)
+                except OSError as exc:
+                    if exc.errno not in no_attr:
+                        raise
+                    names = ()
+                for name in names:
+                    if name.startswith("user."):
+                        value = os.getxattr(target, name, follow_symlinks=False)
+                        os.setxattr(tmp, name, value, follow_symlinks=False)
         os.replace(tmp, target)
     except BaseException:
         try:
