@@ -508,7 +508,7 @@ Seed nodes:
 
 **what** — Standalone HTTP server rendering D3.js force-directed graph visualization of the knowledge graph. It auto-detects agents (and layers an `agents.json` from `--config` on top), with a dropdown selector; with `--db`, or when nothing is found, it serves one default agent on ~/.engram/knowledge.db (`viz/agents.py` startup modes `single_db`, `discover_*`, `config_only`). Endpoints: `/` (graph view), `/health` (dashboard), `/stats` (metrics), `/config` (config UI). Stdlib-only (no external JS deps); reads DB on each request.
 
-**how** — Entry point: `viz_server.py` (standalone script). Usage: `python viz_server.py [--db PATH] [--config agents.json] [--port 5001]`. HTTP server via `http.server.BaseHTTPRequestHandler` (stdlib). D3 graph data endpoints: `/api/nodes`, `/api/edges`, `/api/agents` (multi-mode). Config endpoints: `/api/config/schema` (GET), `/api/config` (POST for updates).
+**how** — Entry point: `viz_server.py` (standalone script). Usage: `python viz_server.py [--db PATH] [--config agents.json] [--port 5001]`. HTTP server via `http.server.BaseHTTPRequestHandler` (stdlib). D3 graph data endpoints: `/api/nodes`, `/api/edges`, `/api/agents` (multi-mode). Config endpoints: `/api/config/schema` (GET), `/api/config` (GET), and `PUT /api/config/<key>?agent=<name>` for updates (the body is `{"value": ...}`; the request must prove same origin before the body is read; `src/engram/viz/server.py` `do_PUT`). There is no POST route for config.
 
 **status-candidate** — **PARKED on #770** (code complete; manual/daemon launch only, live on the dogfood host at :5001; ship-vs-demote is the open #770 decision). `[verified 2026-06-05]`
 
