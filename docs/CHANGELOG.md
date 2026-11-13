@@ -43,6 +43,63 @@ v0.5.6 ship with it.
   would not change, or a Codex agent file it could not install), it no longer
   hides this in a warning: it ends with a block that lists each item and what to
   do, and exits with code 10, "finished, with items not done".
+- **Setup rewrites an existing file in place.** The file keeps its inode, so its
+  mode, owner, group, hard links, ACL entries and extended attributes stay as
+  they were (one file is an exception whenever the installer runs:
+  `settings.json`, see Known limits below). The stamped backup is saved first;
+  a file ENGRAM itself owns has no backup, and a refusal for such a file says
+  so. A write that fails part-way puts the old bytes back into the same file.
+  When the failure is an error from the system, it is reported in one REFUSED
+  line that names the backup; an interruption such as Ctrl-C gets the same
+  put-back and then ends the run without that line. If putting the bytes back
+  also fails, the line says the file may be incomplete and gives the command
+  that restores it. A kill or a power loss during the write gets no put-back,
+  so the file can be left incomplete; the backup taken first restores its
+  bytes. A program that reads the file during the write can see it empty or
+  partial. A file that does not exist yet is created exclusively: a file that
+  appears at that path in the meantime is refused and left as it is, on a
+  filesystem that supports hard links; without them the new file is put in
+  place by a rename.
+
+### Fixes
+
+- **A first install on a machine that has never downloaded the embedding model
+  now completes.** In v0.5.6 the installer downloaded the pinned model, the
+  server's check for it then looked the model up by name without the pin and
+  did not find it, the installer stopped at step 5 and the memory server refused
+  to start. The check now asks the same question the loader asks. A machine that
+  had downloaded the model before it was pinned was not affected by this fault.
+  The server's message and the installer's remedy for a missing pinned model
+  now name the pinned download.
+- **macOS: the installer's remedy for a `python3` that is too old now works as
+  printed.** A versioned Homebrew Python links `python3.12` but no `python3`, so
+  `brew install python@3.12` alone changed nothing. The message now adds the
+  `export PATH=...` command that makes `python3` resolve to the new
+  interpreter. The command lasts for that shell only, so run the installer
+  again in the same shell. Measured on one Mac with Homebrew; other Python
+  installs are not covered by this message.
+
+### Known limits
+
+The guarantee above is about what setup itself writes to an existing file. Two
+writes are outside it. Neither comes from a change in this release: the v0.5.6
+installer runs the same Claude Code command, and v0.5.6 rewrites `config.json`
+the same way.
+
+- **`settings.json` at every install or re-install.** Setup registers the
+  plugin with Claude Code's own command (`claude plugin marketplace add`), and
+  that command replaces `~/.claude/settings.json` with a new file each time it
+  runs, even when nothing in the file changes. The content is kept. An ACL
+  entry or an extended attribute set on that file is not carried over, and
+  nothing backs the file up or prints a message for that write. This is Claude
+  Code's write, not ENGRAM's. The every-run case was measured on one Linux
+  machine (#4628) and the install case on one Mac (#4638), with one Claude Code
+  build each.
+- **`config.json` while an agent runs.** ENGRAM rewrites its own `config.json`
+  at least at every turn advance, by writing a new file and renaming it over
+  the old one, so that a concurrent reader never sees a partial file. An ACL
+  entry or an extended attribute set on the file itself is dropped by that
+  rewrite; one that the folder supplies by default is applied again (#4641).
 
 ### Other changes
 
