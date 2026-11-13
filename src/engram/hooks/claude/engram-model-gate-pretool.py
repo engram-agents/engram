@@ -26,7 +26,9 @@ Decision, in order (the PreToolUse payload carries ``tool_name``, ``tool_use_id`
        a. the parsed provider is known and is not self's provider: DENY (a family word such as ``flash``
           can be shared across providers);
        b. same provider and the family token is present: allow, never silent (``unmapped_model``);
-       c. provider not recognised and the family token is present: allow, never silent (``unmapped_model``);
+       c. provider not recognised and the family token is present (rule U): allow, never silent
+          (``unmapped_model``) only when the id's first ``-`` token is one of the seat's own first tokens;
+          otherwise DENY with the branch-(c) text (three remedies, fixed order);
        d. the family token is absent: DENY.
      ``mixed_harness``: DENY.  Every other code (``no_model_row``, ``transcript_path_missing``,
      ``transcript_not_found``, ``transcript_unreadable``, ``window_exceeded``, ``budget_expired_no_row``,
@@ -76,6 +78,7 @@ except (Exception, SystemExit) as _exc:  # noqa: BLE001 - `_hooklib` exits (Syst
 _core = None
 model_of_call = None
 _parse_model_id = None
+_trust = None   # the ``engram_trust`` module: branch (c) reads its ``_NON_CLAUDE_MODEL_TABLE`` at call time
 
 
 # ------------------------------------------------------------------ fixed texts
@@ -107,6 +110,24 @@ def _deny_unmapped_text(source, model_id, self_lineage, home, helper=None):
                 + _helper_remedy(self_lineage))
     return (f"ENGRAM write blocked by the model-family gate. {source} came from model `{model_id}`, "
             f"which the gate does not recognise as family `{self_lineage}`. " + _remedy(self_lineage, home))
+
+
+def _deny_unmapped_c_text(source, model_id, self_lineage, home, helper=None):
+    """Branch (c) deny (rule U): relaunch / agent definition, then a table row, then the human's decision."""
+    table_row = (f"If `{model_id}` is your own vendor's `{self_lineage}` model and the gate does not know it "
+                 f"yet, add its exact id to the model table (`_NON_CLAUDE_MODEL_TABLE` in `engram_trust.py`, "
+                 f"a reviewed change).")
+    if helper:
+        return (f"ENGRAM write blocked by the model-family gate. {_helper_lead(source, helper)} running on "
+                f"model `{model_id}`, which the gate does not recognise as family `{self_lineage}`. Nothing "
+                f"was written. The main session's own model is not affected by this block. To let this "
+                f"helper write, its agent definition must run on a `{self_lineage}` model. {table_row} "
+                f"Changing `self_lineage` is the human's decision.")
+    return (f"ENGRAM write blocked by the model-family gate. {source} came from model `{model_id}`, which "
+            f"the gate does not recognise as family `{self_lineage}`. Nothing was written. To continue: "
+            f"relaunch the session on a `{self_lineage}` model. {table_row} If the change of model family "
+            f"is deliberate, that is the human's decision: change `self_lineage` in `{home}/config.json`. "
+            f"Reading memory still works.")
 
 
 def _helper_lead(source, helper):
@@ -179,7 +200,7 @@ def _is_write_tool(tool_name):
 
 def _load_runtime():
     """Import ``engram_core`` and ``engram_signature``; True when both are usable (cached)."""
-    global _core, model_of_call, _parse_model_id
+    global _core, model_of_call, _parse_model_id, _trust
     if _core is not None:
         return True
     d = _gate.find_dir(__file__, "engram_core.py", "engram_signature.py")
@@ -189,8 +210,10 @@ def _load_runtime():
         sys.path.insert(0, d)
     import engram_core
     from engram_signature import model_of_call as _moc
+    import engram_trust
     from engram_trust import _parse_model_id as _pmi
     _core = engram_core
+    _trust = engram_trust
     _parse_model_id = _pmi
     if model_of_call is None:  # (a test may have replaced it)
         model_of_call = _moc
@@ -199,8 +222,37 @@ def _load_runtime():
 
 # --------------------------------------------------------------- decision
 
+def _own_first_tokens(self_lineage):
+    """The first ``-`` tokens that count as the seat's own: those of the table keys whose value maps to
+    ``self_lineage``, the seat's provider, and ``claude`` for an Anthropic seat.  Never empty."""
+    self_provider = self_lineage.partition(":")[0]
+    own = {self_provider}
+    if self_provider == "anthropic":
+        own.add("claude")
+    for key, (prov, fam, _ver) in _trust._NON_CLAUDE_MODEL_TABLE.items():
+        if f"{prov}:{fam}" == self_lineage:
+            own.add(key.split("-")[0])
+    return own
+
+
 def _unmapped(model_id, source_text, self_lineage, home, helper=None):
-    """Branches a-d of the unmapped-id rule."""
+    """Branches a-d of the unmapped-id rule (after ``model_id_to_lineage`` returned "").
+
+    a. provider known and not the seat's provider: DENY.
+    d. the family token (``self_family`` split on ``-``) is absent from the id's ``-`` tokens: DENY.
+    b. provider is the seat's and the family token is present: allow with the notice ``unmapped_model``.
+    c. provider EMPTY and the family token present (rule U): allow with the notice only when the id's first
+       ``-`` token is one of the seat's own first tokens (``_own_first_tokens``: table keys of this lineage,
+       the provider, ``claude`` for anthropic); otherwise DENY with the branch-(c) text.
+
+    NAMED RESIDUAL: an id whose first token is itself one of the seat's own first tokens passes with the
+    notice, e.g. ``gpt-neox-20b`` on ``openai:gpt`` (narrow, never silent; pinned by a test).  Accepted loud
+    false denies: an own-vendor id with a prefix the table has never seen (``ds-v5-flash``, a bare
+    ``opus-6``, ``o5-mini``); the remedy is a table row.
+
+    The gate is an identity backstop against an accidental launch on another model family, never a security
+    boundary against a process that can write the transcript.
+    """
     mid = re.sub(r"\[[^\]]*\]\s*$", "", model_id.strip()).strip()
     provider = (_parse_model_id(mid).get("provider") or "")
     self_provider, _, self_family = self_lineage.partition(":")
@@ -208,7 +260,9 @@ def _unmapped(model_id, source_text, self_lineage, home, helper=None):
         return _deny(_deny_unmapped_text(source_text, model_id, self_lineage, home, helper))
     fam, toks = self_family.split("-"), mid.split("-")
     if any(toks[i:i + len(fam)] == fam for i in range(len(toks) - len(fam) + 1)):  # b, c
-        return _unverified("unmapped_model")
+        if provider or toks[0] in _own_first_tokens(self_lineage):
+            return _unverified("unmapped_model")
+        return _deny(_deny_unmapped_c_text(source_text, model_id, self_lineage, home, helper))   # c, foreign
     return _deny(_deny_unmapped_text(source_text, model_id, self_lineage, home, helper))      # d
 
 
