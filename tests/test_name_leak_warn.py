@@ -29,6 +29,11 @@ Coverage:
      post-#1598 consolidation) satisfies the (a)/(b)/(c) rule above.
   10. load_roster: absent file is an IO error — exits 1 (SystemExit(1)).
   11. load_roster: invalid regex in roster triggers exit 1 (usage error).
+  12. Roster secret scope: no workflow binds NAME_LEAK_ROSTER outside a step's
+     ``env`` (workflow-level env, job-level env, and step ``with`` are flagged;
+     a step ``env`` is the one legal location), the step-level bindings are
+     non-vacuous and include tests.yml and pr-checks.yml, and a synthetic table
+     pins each flagged path. alpha#4568.
 
 Principal marker: the principal set is declared in a separate
 ``NAME_LEAK_PRINCIPAL`` variable (same regex-line convention as the roster:
@@ -1108,3 +1113,202 @@ def test_subprocess_json_output(tmp_path):
     m = data["matches"][0]
     assert m["pattern_index"] == 0
     assert FAKE_NAME_A in m["line"]
+
+
+# ---------------------------------------------------------------------------
+# Roster secret scope guard: NAME_LEAK_ROSTER binds only in a step's `env`
+# ---------------------------------------------------------------------------
+#
+# The roster holds real personal names. A step-level `env:` hands it to exactly
+# the step that needs it; a workflow- or job-level `env:` hands it to every step
+# in that scope, including steps that dump their environment or run third-party
+# actions. The cells elsewhere in this file read the variable's VALUE; none of
+# them reads where the YAML binds it, so moving a binding up a level would leave
+# every one of them green. These cells read the binding's location.
+#
+# The sweep is over a glob of .github/workflows/ rather than the four-file list
+# used by the CI-flags guard, so a workflow added later is covered the day it
+# lands. The secret's value is never read here — only the key's location.
+
+_ROSTER_VAR = "NAME_LEAK_ROSTER"
+_WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
+_WORKFLOW_FILES = tuple(
+    sorted(
+        path
+        for path in _WORKFLOWS_DIR.glob("*")
+        if path.suffix in (".yml", ".yaml")
+    )
+)
+
+
+def _roster_bindings_outside_steps(doc: dict) -> list[str]:
+    """Dotted paths where a workflow doc binds NAME_LEAK_ROSTER outside a step env.
+
+    Returns [] for a clean doc. Each entry is a JSON-ish path a human can grep:
+      "env.NAME_LEAK_ROSTER"                        (workflow-level env)
+      "jobs.<job_id>.env.NAME_LEAK_ROSTER"          (job-level env)
+      "jobs.<job_id>.steps[3].with.NAME_LEAK_ROSTER" (step `with`)
+      "jobs.<job_id>.steps[3].env.NAME_LEAK_ROSTER"  -> NOT reported (legal)
+    A step's `env` is the only legal location. A step's `with` is reported,
+    because a `with:` value is action input, not an environment binding, and
+    this check is about the environment.
+    """
+    found: list[str] = []
+
+    workflow_env = doc.get("env")
+    if isinstance(workflow_env, dict) and _ROSTER_VAR in workflow_env:
+        found.append(f"env.{_ROSTER_VAR}")
+
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict):
+        return found
+
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        job_env = job.get("env")
+        if isinstance(job_env, dict) and _ROSTER_VAR in job_env:
+            found.append(f"jobs.{job_id}.env.{_ROSTER_VAR}")
+        for index, step in enumerate(job.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            step_with = step.get("with")
+            if isinstance(step_with, dict) and _ROSTER_VAR in step_with:
+                found.append(f"jobs.{job_id}.steps[{index}].with.{_ROSTER_VAR}")
+
+    return found
+
+
+# Synthetic docs for the scope table. Each must-flag case names the exact dotted
+# path it expects; the last case is the positive control — a step-level `env` is
+# the one legal location and must return [] so the function cannot reject
+# everything and still look green.
+_ROSTER_BINDING_CASES = (
+    pytest.param(
+        {"env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"}},
+        ["env.NAME_LEAK_ROSTER"],
+        id="workflow-env",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                }
+            }
+        },
+        ["jobs.build.env.NAME_LEAK_ROSTER"],
+        id="job-env",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {"run": "echo first"},
+                        {
+                            "uses": "example/action@v1",
+                            "with": {
+                                _ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"
+                            },
+                        },
+                    ]
+                }
+            }
+        },
+        ["jobs.build.steps[1].with.NAME_LEAK_ROSTER"],
+        id="step-with",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {
+                            "run": "echo legal",
+                            "env": {
+                                _ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        [],
+        id="step-env-is-legal",
+    ),
+)
+
+
+@pytest.mark.parametrize("path", _WORKFLOW_FILES, ids=lambda path: path.name)
+def test_real_workflows_bind_roster_only_in_step_env(path):
+    """No workflow may bind NAME_LEAK_ROSTER outside a step's `env`.
+
+    Covers every *.yml / *.yaml in .github/workflows/ by glob, so a workflow
+    added after this test was written is still checked.
+    """
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(doc, dict), (
+        f"{path.name}: yaml.safe_load did not return a mapping (got "
+        f"{type(doc).__name__}); refusing to read that as a clean pass"
+    )
+    offenders = _roster_bindings_outside_steps(doc)
+    assert offenders == [], (
+        f"{path.name} binds {_ROSTER_VAR} outside a step env: "
+        f"{', '.join(offenders)}. A workflow- or job-level env hands the "
+        "secret to every step in that scope; bind it on the one step that "
+        "needs it."
+    )
+
+
+def test_roster_step_env_bindings_are_non_vacuous():
+    """The scope guard must be checking real bindings, not an empty set.
+
+    Half (a): at least one step-level binding exists somewhere in the workflow
+    set, so a wholesale rename cannot leave the sweep green over nothing.
+    Half (b): tests.yml and pr-checks.yml each still bind it at step level —
+    those are the two workflows that must keep running the real-roster
+    self-test.
+    """
+    assert _WORKFLOW_FILES, (
+        f"no *.yml/*.yaml found under {_WORKFLOWS_DIR}; the scope guard is "
+        "vacuous"
+    )
+
+    step_env_files: dict[str, int] = {}
+    for path in _WORKFLOW_FILES:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert isinstance(doc, dict), (
+            f"{path.name}: yaml.safe_load did not return a mapping (got "
+            f"{type(doc).__name__}); refusing to read that as a clean pass"
+        )
+        count = 0
+        for job in (doc.get("jobs") or {}).values():
+            if not isinstance(job, dict):
+                continue
+            for step in job.get("steps") or []:
+                if (
+                    isinstance(step, dict)
+                    and isinstance(step.get("env"), dict)
+                    and _ROSTER_VAR in step["env"]
+                ):
+                    count += 1
+        if count:
+            step_env_files[path.name] = count
+
+    assert step_env_files, (
+        f"no workflow binds {_ROSTER_VAR} at step level; the scope guard "
+        "would pass over nothing and a wholesale rename would go unnoticed"
+    )
+    for required in ("tests.yml", "pr-checks.yml"):
+        assert step_env_files.get(required, 0) >= 1, (
+            f"{required} no longer carries a step-level {_ROSTER_VAR} "
+            "binding; those are the two workflows that must keep the "
+            "real-roster self-test running"
+        )
+
+
+@pytest.mark.parametrize("doc,expected", _ROSTER_BINDING_CASES)
+def test_roster_bindings_outside_steps_scope_table(doc, expected):
+    """Flag workflow env, job env and step `with`; allow step `env`."""
+    assert _roster_bindings_outside_steps(doc) == expected
