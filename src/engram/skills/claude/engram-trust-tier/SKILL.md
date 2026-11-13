@@ -119,7 +119,7 @@ Manual tier updates only in v1. When you've accumulated enough trust signals to 
 
 **The approval gate — read carefully:**
 
-There is no `force` parameter. Promoting a counterparty to `our_side` or above (`our_side`, `user_family`, `primary_user`) is refused unless the call carries two more fields: `justification_obs_id` (an observation recording your primary user's approval) and `primary_user_approval_obtained: true`. The refusal message lists the steps: surface the proposed promotion to your primary user, receive their explicit approval, file an observation documenting it (`quote_type` `personal_communication`, `source_class` `user_stated`), then retry with both fields. Without them the call fails closed.
+There is no `force` parameter. Setting a counterparty's tier to `our_side` or above (`our_side`, `user_family`, `primary_user`) is refused unless the call carries two more fields (the gate is on the tier you set, not the direction, so stepping down from `primary_user` to `our_side` is gated too): `justification_obs_id` (an observation recording your primary user's approval) and `primary_user_approval_obtained: true`. The refusal message lists the steps: surface the proposed promotion to your primary user, receive their explicit approval, file an observation documenting it (`quote_type` `personal_communication`, `source_class` `user_stated`), then retry with both fields. Without them the call fails closed.
 
 **`primary_user_approval_obtained` is your attestation, and the server cannot check it.** Setting it to `true` without a direct, verbatim statement from your primary user blessing THIS specific promotion is a structural-honesty violation, the same epistemic kind as a fabricated quote. Not based on inference of likely intent. Not based on "they'd probably approve." Direct, verbatim, this-counterparty-specific blessing only.
 
@@ -135,7 +135,7 @@ When you notice anomalous behavior from a counterparty (style change, topic drif
 1. File the observation with `trust_signal` substructure, category=anomaly, anomaly_sub set, valence=negative, magnitude per severity.
 2. Consider whether the anomaly warrants immediate tier step-down via `engram_set_trust_tier`.
 3. Single high-magnitude anomaly OR accumulated medium anomalies → step down.
-4. Step-downs are NOT gated by the approval fields — only promotions to `our_side` or above are gated.
+4. Moving a counterparty to a tier below `our_side` is NOT gated by the approval fields; setting any tier at or above `our_side` is, in either direction.
 
 ### D5 — Cross-install bleed-through discipline
 
