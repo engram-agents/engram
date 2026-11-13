@@ -1026,9 +1026,9 @@ function renderDetailBody(d) {
         chip.innerHTML =
           `<div style="display:flex;align-items:center;gap:5px">
             <span style="color:${color};font-size:10px">${isOutgoing ? '→' : '←'}</span>
-            <span class="relation-tag" style="color:${color}">${edgeDirectionLabel(e.relation, isOutgoing)}</span>
-            <span style="font-family:monospace;color:#aaccff">${otherId}</span>
-            <span style="font-size:9px;color:${otherColor};opacity:0.7">${otherType}</span>
+            <span class="relation-tag" style="color:${color}">${escHtml(edgeDirectionLabel(e.relation, isOutgoing))}</span>
+            <span style="font-family:monospace;color:#aaccff">${escHtml(otherId)}</span>
+            <span style="font-size:9px;color:${otherColor};opacity:0.7">${escHtml(otherType)}</span>
           </div>
           ${otherClaim ? '<span class="chip-claim">' + escHtml(otherClaim) + '</span>' : ''}`;
         chip.onclick = () => {

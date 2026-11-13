@@ -64,6 +64,35 @@ def test_tooltip_interpolations_escaped():
     assert "escHtml(NODE_STYLE[d.type]?.label || d.type)" in body
 
 
+def test_tooltip_pushes_are_literals_or_escaped():
+    """Every lines.push(...) argument is a string literal/template or an escHtml(...) call,
+    so a non-${} leak such as lines.push(d.id) is caught too."""
+    body = _tooltip()
+    # initial array literal element counts as a push too
+    pushes = re.findall(r"lines\.push\((.*)\);", body) + re.findall(r"let lines = \[(.*)\];", body)
+    assert len(pushes) >= 6, pushes
+    for arg in pushes:
+        arg = arg.strip()
+        assert arg.startswith(("'", '"', "`", "escHtml(")), f"lines.push argument is neither a literal nor escaped: {arg}"
+
+
+def test_edge_chip_template_escaped():
+    body = _func_body(GRAPH, "function renderChips(")
+    start = body.index("chip.innerHTML =")
+    tpl = body[start : body.index("chip.onclick", start)]
+    interps = re.findall(r"\$\{([^}]*)\}", tpl)
+    assert any("otherId" in e for e in interps) and any("otherType" in e for e in interps)
+    fixed = {"color", "otherColor", "isOutgoing ? '→' : '←'"}  # fixed-literal lookups
+    for e in interps:
+        if e.strip() in fixed:
+            continue
+        if e.strip().startswith("otherClaim ?"):
+            assert "escHtml(otherClaim)" in e
+            continue
+        assert e.strip().startswith("escHtml("), f"unescaped chip interpolation: ${{{e}}}"
+    assert "escHtml(otherId)" in tpl and "escHtml(otherType)" in tpl
+
+
 def test_escHtml_coerces_and_escapes_quotes():
     body = _func_body(GRAPH, "function escHtml(")
     assert "String(s)" in body
