@@ -55,8 +55,10 @@ def test_registry_write_replaces_a_planted_symlink_and_spares_its_target(tmp_pat
     assert victim.read_bytes() == before
     assert os.stat(victim).st_mode & 0o777 == 0o600
     # New-file behaviour: the victim's 0600 must not leak onto the registry file.
-    um = os.umask(0); os.umask(um)
-    assert os.stat(link).st_mode & 0o777 == 0o666 & ~um
+    # #4026 asserts the registry file's mode explicitly (0o664, umask-defeating).
+    mode = os.stat(link).st_mode & 0o777
+    assert mode == 0o664
+    assert mode != 0o600, "the victim's 0600 leaked onto the registry file"
     record = json.loads(link.read_text())
     assert record["agent_name"] == "sol"
     assert sorted(os.listdir(registry)) == ["sol.json"]

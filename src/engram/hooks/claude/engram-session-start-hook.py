@@ -63,6 +63,7 @@ import os
 import re
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -1546,13 +1547,19 @@ AGENT_REGISTRY_DIR = os.path.join(AGENTS_SHARED_ROOT, "agents")
 def write_agent_registration(
     agent_name: str,
     registry_dir: str = AGENT_REGISTRY_DIR,
-) -> None:
+) -> dict:
     """Write/refresh the agent's registration file in the shared registry.
 
     Writes atomically via temp-file + os.replace so concurrent agents never
     read a partial JSON. Creates the registry dir (group-writable, setgid) if
-    it does not exist. Fails silently if the shared filesystem is absent or
-    unwritable — this only matters when /home/agents-shared/ exists, and is a convenience, not a blocker.
+    it does not exist, and asserts that mode explicitly afterwards (#4026):
+    ``os.makedirs`` applies its ``mode`` THROUGH the process umask, and
+    ``exist_ok=True`` never repairs a directory that already exists at the
+    wrong mode, so a ``chmod`` is the only way the intent actually holds.
+    Fails soft if the shared filesystem is absent or unwritable — this only
+    matters when /home/agents-shared/ exists, and is a convenience, not a
+    blocker. Never raises and never prints (the hook injects context on
+    stdout); failures are reported in the returned status.
 
     File path: <registry_dir>/<agent_name>.json
     Content   : {"agent_name": ..., "hostname": ..., "pid": ..., "registered_at": <ISO UTC>}
@@ -1561,34 +1568,77 @@ def write_agent_registration(
         agent_name   : The agent's own name (from config.json or env).
         registry_dir : Override for the default /home/agents-shared/agents/.
                        (Exposed for testing.)
+
+    Returns:
+        {"registered": bool, "dir_mode": int | None, "dir_error": str | None,
+         "file_path": str, "file_error": str | None}
+        ``dir_mode`` is the mode READ BACK with os.stat after the chmod
+        attempt (not the mode requested); ``None`` alongside a non-empty
+        ``dir_error`` means the chmod failed (EPERM: the directory belongs to
+        another agent). ``registered`` is True once the JSON write succeeded,
+        whether or not the subsequent file-mode assertion did.
     """
+    status = {
+        "registered": False,
+        "dir_mode": None,
+        "dir_error": None,
+        "file_path": "",
+        "file_error": None,
+    }
+
     if not agent_name:
-        return
+        return status
 
     # Gate: the shared-fs root must exist and be a directory. If absent (single-
     # host install with no shared fs), skip silently — never break SessionStart.
     shared_root = os.path.dirname(registry_dir)
     if not os.path.isdir(shared_root):
-        return
+        return status
 
     try:
-        # Create the registry dir with group-writable, setgid permissions so
-        # co-tenant agents can each write their own file.
         os.makedirs(registry_dir, mode=0o2775, exist_ok=True)
+    except OSError as exc:
+        status["dir_error"] = f"could not create registry dir: {exc}"
+        return status
 
+    # Group-writable, setgid, whatever the umask and whoever created the dir
+    # first (#4026). chmod is the one thing the umask cannot filter, and the
+    # existing-directory case is the one that was broken.
+    try:
+        os.chmod(registry_dir, 0o2775)
+        status["dir_mode"] = stat.S_IMODE(os.stat(registry_dir).st_mode)
+    except OSError as exc:
+        # EPERM when the directory is another agent's: report it, never raise.
+        status["dir_error"] = f"could not set registry dir mode: {exc}"
+
+    dest = os.path.join(registry_dir, f"{agent_name}.json")
+
+    try:
         record = {
             "agent_name": agent_name,
             "hostname": socket.gethostname(),
             "pid": os.getpid(),
             "registered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
-        dest = os.path.join(registry_dir, f"{agent_name}.json")
-
         # Atomic write, mode- and group-preserving (#4013): peers read the registry through group.
         atomic_write_json(dest, record)
-    except Exception:
+    except Exception as exc:
         # Fail-soft: never raise from a convenience side-effect.
-        pass
+        status["file_error"] = f"could not write registration file: {exc}"
+        return status
+
+    status["registered"] = True
+    status["file_path"] = dest
+
+    # A NEW temp file's creation mode follows the umask, so a 077 session lands
+    # 0600 — group-unreadable, which defeats the registry. Assert the file
+    # mode at the call site (#4026); atomic_write_json itself is unchanged.
+    try:
+        os.chmod(dest, 0o664)
+    except OSError as exc:
+        status["file_error"] = f"could not set registration file mode: {exc}"
+
+    return status
 
 
 PEER_STALE_HOURS = 24  # mirror ia.py's default

@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import socket
+import stat
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -135,7 +136,13 @@ class TestWriteAgentRegistration:
         assert not registry_dir.exists()
 
     def test_no_op_on_unwritable_registry_dir(self, tmp_path, monkeypatch):
-        """An unwritable registry dir causes a silent no-op (no raise)."""
+        """An unwritable registry dir causes a silent no-op (no raise).
+
+        #4026: an existing directory WE own is repaired by the mode assertion, so
+        the remaining unwritable case is a chmod we are not allowed to make (the
+        dir belongs to another agent -> EPERM). Simulate that, leaving the dir at
+        0o555 so the write itself still fails.
+        """
         if os.getuid() == 0:
             pytest.skip("root bypasses permission checks")
 
@@ -147,14 +154,27 @@ class TestWriteAgentRegistration:
         shared_root.mkdir()
         registry_dir = shared_root / "agents"
         registry_dir.mkdir(mode=0o555)  # read + execute, no write
+        os.chmod(registry_dir, 0o555)
 
+        real_chmod = os.chmod
+
+        def _deny_dir_chmod(path, mode, *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(str(registry_dir)):
+                raise PermissionError("simulated: registry dir belongs to another agent")
+            return real_chmod(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(mod.os, "chmod", _deny_dir_chmod)
         try:
             # Must not raise
-            mod.write_agent_registration("borges", registry_dir=str(registry_dir))
+            status = mod.write_agent_registration(
+                "borges", registry_dir=str(registry_dir)
+            )
             # No file written
             assert not (registry_dir / "borges.json").exists()
+            assert status["registered"] is False
         finally:
-            # Restore perms so tmp_path cleanup succeeds
+            # Restore chmod (and perms) so tmp_path cleanup succeeds
+            monkeypatch.setattr(mod.os, "chmod", real_chmod)
             registry_dir.chmod(0o755)
 
     def test_no_op_on_empty_agent_name(self, tmp_path, monkeypatch):
@@ -169,3 +189,115 @@ class TestWriteAgentRegistration:
 
         mod.write_agent_registration("", registry_dir=str(registry_dir))
         assert not registry_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# #4026: the registry must end up group-writable, whatever the umask
+# ---------------------------------------------------------------------------
+
+
+def _registry_pair(tmp_path):
+    """A shared root that exists plus the registry dir path under it."""
+    shared_root = tmp_path / "agents-shared"
+    shared_root.mkdir()
+    return shared_root, shared_root / "agents"
+
+
+class TestRegistryPermissions4026:
+    def test_umask_022_fresh_dir_is_group_writable_and_setgid(
+        self, tmp_path, monkeypatch
+    ):
+        """#4026 cell 1: os.makedirs' mode goes through the umask (022 -> 2755)."""
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+        _, registry_dir = _registry_pair(tmp_path)
+
+        old_umask = os.umask(0o022)
+        try:
+            status = mod.write_agent_registration(
+                "borges", registry_dir=str(registry_dir)
+            )
+        finally:
+            os.umask(old_umask)
+
+        assert os.stat(registry_dir).st_mode & 0o7770 == 0o2770
+        file_st = os.stat(registry_dir / "borges.json")
+        assert file_st.st_mode & 0o040, "registration file is not group-readable"
+        assert status["registered"] is True
+
+    def test_existing_dir_at_wrong_mode_is_repaired(self, tmp_path, monkeypatch):
+        """#4026 cell 2: exist_ok=True never repairs an existing directory."""
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+        _, registry_dir = _registry_pair(tmp_path)
+        registry_dir.mkdir()
+        os.chmod(registry_dir, 0o2750)
+        assert stat.S_IMODE(os.stat(registry_dir).st_mode) == 0o2750
+
+        status = mod.write_agent_registration("borges", registry_dir=str(registry_dir))
+
+        assert stat.S_IMODE(os.stat(registry_dir).st_mode) == 0o2775
+        assert status["registered"] is True
+
+    def test_umask_077_file_is_still_group_readable(self, tmp_path, monkeypatch):
+        """#4026 cell 3: a 077 session would land the file 0600, defeating the registry."""
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+        _, registry_dir = _registry_pair(tmp_path)
+
+        old_umask = os.umask(0o077)
+        try:
+            status = mod.write_agent_registration(
+                "borges", registry_dir=str(registry_dir)
+            )
+        finally:
+            os.umask(old_umask)
+
+        mode = stat.S_IMODE(os.stat(registry_dir / "borges.json").st_mode)
+        assert mode & 0o040, f"registration file is not group-readable: {mode:o}"
+        assert mode == 0o664
+        assert status["registered"] is True
+
+    def test_chmod_failure_is_soft_and_reported(self, tmp_path, monkeypatch):
+        """#4026 cell 4: a directory owned by another agent raises EPERM on chmod.
+
+        SessionStart must still run, and the failure must be visible in the
+        returned status rather than silent.
+        """
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+        _, registry_dir = _registry_pair(tmp_path)
+        # Pre-create it writable so the registration WRITE itself still succeeds.
+        registry_dir.mkdir()
+        os.chmod(registry_dir, 0o2775)
+
+        def _deny_chmod(*args, **kwargs):
+            raise PermissionError("simulated: not the registry dir's owner")
+
+        monkeypatch.setattr(mod.os, "chmod", _deny_chmod)
+
+        status = mod.write_agent_registration("borges", registry_dir=str(registry_dir))
+
+        assert status["registered"] is True
+        assert (registry_dir / "borges.json").exists()
+        assert status["dir_mode"] is None
+        assert isinstance(status["dir_error"], str) and status["dir_error"]
+
+    def test_positive_control_registers_normally(self, tmp_path, monkeypatch):
+        """#4026 cell 5: the normal path still registers and reports its file."""
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+        _, registry_dir = _registry_pair(tmp_path)
+
+        status = mod.write_agent_registration("borges", registry_dir=str(registry_dir))
+
+        assert isinstance(status, dict)
+        assert status["registered"] is True
+        assert status["file_path"] and os.path.exists(status["file_path"])
+        assert status["dir_error"] is None
+        assert status["file_error"] is None
