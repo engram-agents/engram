@@ -108,17 +108,17 @@ def _check_premise_independence(conn: "sqlite3.Connection", premise_ids: list[st
     # having no lineage recorded is undetermined, not collinear.
     if len(collinear_ids) < 2:
         return None
-    null_self_in_cluster = [n for n in null_self_ids if n in collinear_ids]
+    # Exactly one cluster here, so every null-self premise is inside it.
     null_self_note = (
-        f"{len(null_self_in_cluster)} of them had no standpoint_lineage and "
+        f"{len(null_self_ids)} of them had no standpoint_lineage and "
         "were counted as this install's own lineage (null=self). "
-        if null_self_in_cluster else ""
+        if null_self_ids else ""
     )
     return {
         "collinear_verdict": "collinear",
         "shared_lineage": shared_lineage,
         "collinear_premise_ids": collinear_ids,
-        "null_self_premise_ids": null_self_in_cluster,
+        "null_self_premise_ids": null_self_ids,
         "message": (
             f"independence_advisory: all {len(collinear_ids)} observation premise(s) "
             f"share standpoint_lineage '{shared_lineage}'. "

@@ -148,3 +148,27 @@ def test_c6_explicit_same_lineage_unchanged_with_empty_null_self_list():
     assert adv["shared_lineage"] == OTHER
     assert adv["null_self_premise_ids"] == []
     assert "null=self" not in adv["message"]
+
+
+def test_c7_end_to_end_derive_carries_null_self_advisory():
+    """The real engram_derive path surfaces the advisory (top-level
+    ``independence_advisory``) with every pre-existing key plus
+    ``null_self_premise_ids``."""
+    c = _fresh_client()
+    _set_self_lineage(SELF)
+    a, b = _obs(c, 1), _obs(c, 2)
+    dv = c.call("engram_derive", {
+        "claim": "General pattern from two unmarked observations",
+        "supporting_ids": f"{a},{b}",
+        "logical_chain": "Both observations show the pattern.",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert dv.get("status") == "created", dv
+    adv = dv.get("independence_advisory")
+    assert adv is not None, dv
+    for key in ("collinear_verdict", "shared_lineage", "collinear_premise_ids", "message"):
+        assert key in adv, (key, adv)
+    assert adv["collinear_verdict"] == "collinear"
+    assert adv["shared_lineage"] == SELF
+    assert sorted(adv["collinear_premise_ids"]) == sorted([a, b])
+    assert sorted(adv["null_self_premise_ids"]) == sorted([a, b])
