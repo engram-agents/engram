@@ -581,26 +581,28 @@ def _principle_cheapest_fix(ptype: str, nid: str) -> str:
     The anchor line is the channel that works for every type.
     """
     anchor = f"add a one-line anchor naming {nid} to warm-briefing.md or ~/.claude/CLAUDE.md"
+    # Every tool takes one `payload_json` string; "payload fields:" names the
+    # keys of that JSON object, not positional arguments.
     if ptype in ("lesson", "cornerstone"):
         first = (
-            f"engram_register_exemplar(target_id={nid}, exemplar_id=<a claim-bearing node "
-            "that shows the pattern>) writes a registry trigger"
+            f"engram_register_exemplar(payload fields: target_id={nid}, exemplar_id=<a "
+            "claim-bearing node that shows the pattern>) writes a registry trigger"
         )
         if ptype == "lesson":
             first += (
-                f"; or engram_update_lesson(node_id={nid}, updates={{situation_pattern: "
-                "<command-shape regex>}})"
+                f"; or engram_update_lesson(payload fields: node_id={nid}, "
+                'updates={"situation_pattern": "<command-shape regex>"})'
             )
         return f"{first}; or {anchor}"
     if ptype == "axiom":
         return (
-            f"engram_add_edge(source_id=<a claim-bearing node that realizes it>, "
+            "engram_add_edge(payload fields: source_id=<a claim-bearing node that realizes it>, "
             f"target_id={nid}, relation=instantiates) writes a registry trigger; or {anchor}"
         )
     if ptype == "goal":
         return (
-            f"engram_add_edge(source_id=<a node that serves it>, target_id={nid}, "
-            f"relation=serves) writes a registry trigger; or {anchor}"
+            "engram_add_edge(payload fields: source_id=<a node that serves it>, "
+            f"target_id={nid}, relation=serves) writes a registry trigger; or {anchor}"
         )
     return anchor
 
