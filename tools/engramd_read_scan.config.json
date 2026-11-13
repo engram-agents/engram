@@ -361,7 +361,7 @@
   "hooks/claude/engram-model-gate-pretool.py:_remedy",
   "hooks/claude/engram-model-gate-pretool.py:_deny_text",
   "hooks/claude/engram-model-gate-pretool.py:_deny_unmapped_text",
-  "hooks/claude/engram-model-gate-pretool.py:_deny_unmapped_c_text",
+  "hooks/claude/engram-model-gate-pretool.py:_deny_unmapped_own_text",
   "hooks/claude/engram-model-gate-pretool.py:_helper_lead",
   "hooks/claude/engram-model-gate-pretool.py:_helper_remedy",
   "hooks/claude/engram-model-gate-pretool.py:_deny_mixed_text",

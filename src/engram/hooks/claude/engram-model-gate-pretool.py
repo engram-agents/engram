@@ -29,7 +29,9 @@ Decision, in order (the PreToolUse payload carries ``tool_name``, ``tool_use_id`
        c. provider not recognised and the family token is present (rule U): allow, never silent
           (``unmapped_model``) only when the id's first ``-`` token is one of the seat's own first tokens;
           otherwise DENY with the branch-(c) text (three remedies, fixed order);
-       d. the family token is absent: DENY.
+       d. the family token is absent: DENY with the same branch-(c) text (three remedies, fixed order);
+          branch (a) keeps the relaunch / ``self_lineage`` text, because the parser already knows the id is
+          another vendor's, so a table row cannot be the fix.
      ``mixed_harness``: DENY.  Every other code (``no_model_row``, ``transcript_path_missing``,
      ``transcript_not_found``, ``transcript_unreadable``, ``window_exceeded``, ``budget_expired_no_row``,
      ``internal_error``): allow, NEVER SILENT, text 2.2 with the code.
@@ -112,8 +114,8 @@ def _deny_unmapped_text(source, model_id, self_lineage, home, helper=None):
             f"which the gate does not recognise as family `{self_lineage}`. " + _remedy(self_lineage, home))
 
 
-def _deny_unmapped_c_text(source, model_id, self_lineage, home, helper=None):
-    """Branch (c) deny (rule U): relaunch / agent definition, then a table row, then the human's decision."""
+def _deny_unmapped_own_text(source, model_id, self_lineage, home, helper=None):
+    """Branch (c) and (d) deny: relaunch / agent definition, then a table row, then the human's decision."""
     table_row = (f"If `{model_id}` is your own vendor's `{self_lineage}` model and the gate does not know it "
                  f"yet, add its exact id to the model table (`_NON_CLAUDE_MODEL_TABLE` in `engram_trust.py`, "
                  f"a reviewed change).")
@@ -238,12 +240,14 @@ def _own_first_tokens(self_lineage):
 def _unmapped(model_id, source_text, self_lineage, home, helper=None):
     """Branches a-d of the unmapped-id rule (after ``model_id_to_lineage`` returned "").
 
-    a. provider known and not the seat's provider: DENY.
-    d. the family token (``self_family`` split on ``-``) is absent from the id's ``-`` tokens: DENY.
+    a. provider known and not the seat's provider: DENY with ``_deny_unmapped_text`` (relaunch /
+       ``self_lineage``; no table-row sentence, since the id is known to be another vendor's).
+    d. the family token (``self_family`` split on ``-``) is absent from the id's ``-`` tokens: DENY with the
+       branch-(c) text (``_deny_unmapped_own_text``: the same three remedies as (c)).
     b. provider is the seat's and the family token is present: allow with the notice ``unmapped_model``.
     c. provider EMPTY and the family token present (rule U): allow with the notice only when the id's first
        ``-`` token is one of the seat's own first tokens (``_own_first_tokens``: table keys of this lineage,
-       the provider, ``claude`` for anthropic); otherwise DENY with the branch-(c) text.
+       the provider, ``claude`` for anthropic); otherwise DENY with the branch-(c) text (``_deny_unmapped_own_text``).
 
     NAMED RESIDUAL: an id whose first token is itself one of the seat's own first tokens passes with the
     notice, e.g. ``gpt-neox-20b`` on ``openai:gpt`` (narrow, never silent; pinned by a test).  Accepted loud
@@ -262,8 +266,8 @@ def _unmapped(model_id, source_text, self_lineage, home, helper=None):
     if any(toks[i:i + len(fam)] == fam for i in range(len(toks) - len(fam) + 1)):  # b, c
         if provider or toks[0] in _own_first_tokens(self_lineage):
             return _unverified("unmapped_model")
-        return _deny(_deny_unmapped_c_text(source_text, model_id, self_lineage, home, helper))   # c, foreign
-    return _deny(_deny_unmapped_text(source_text, model_id, self_lineage, home, helper))      # d
+        return _deny(_deny_unmapped_own_text(source_text, model_id, self_lineage, home, helper))   # c, foreign
+    return _deny(_deny_unmapped_own_text(source_text, model_id, self_lineage, home, helper))   # d: same text as c
 
 
 def _decide(payload, home):
