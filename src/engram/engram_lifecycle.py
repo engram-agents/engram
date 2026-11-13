@@ -883,7 +883,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                 {
                     "id": p["id"],
                     "name": core._metadata_dict(p["metadata"]).get("name", ""),
-                    "role": core._metadata_dict(p["metadata"]).get("role", ""),
+                    "role": core.person_relation(core._metadata_dict(p["metadata"])),
                     "since": p["created_at"],
                 }
                 for p in people

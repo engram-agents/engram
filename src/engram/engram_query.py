@@ -1266,8 +1266,9 @@ def _build_inspect_recall_view(
     if node.get("type") == "person":
         if _meta.get("pronouns"):
             node_recall["pronouns"] = _meta["pronouns"]
-        if _meta.get("relation"):
-            node_recall["relation"] = _meta["relation"]
+        _rel = core.person_relation(_meta)
+        if _rel:
+            node_recall["relation"] = _rel
         _moments = _meta.get("special_moments")
         if isinstance(_moments, list) and _moments:
             _moment_text = _select_and_render_person_moment(conn, node_id)
@@ -2644,8 +2645,9 @@ def _surface_impl(
                     _pmeta = core._metadata_dict(n.get("metadata"))
                     if _pmeta.get("pronouns"):
                         entry["pronouns"] = _pmeta["pronouns"]
-                    if _pmeta.get("relation"):
-                        entry["relation"] = _pmeta["relation"]
+                    _rel = core.person_relation(_pmeta)
+                    if _rel:
+                        entry["relation"] = _rel
                     if n.get("trust_tier"):
                         entry["trust_tier"] = n.get("trust_tier")
                     _moments = _pmeta.get("special_moments")
@@ -3077,8 +3079,9 @@ def _query_impl(
                 _pmeta = core._metadata_dict(node.get("metadata"))
                 if _pmeta.get("pronouns"):
                     node["pronouns"] = _pmeta["pronouns"]
-                if _pmeta.get("relation"):
-                    node["relation"] = _pmeta["relation"]
+                _rel = core.person_relation(_pmeta)
+                if _rel:
+                    node["relation"] = _rel
             node.pop("metadata", None)
             node["neighbors"] = _get_neighbors(conn, node["id"])
             if w:
