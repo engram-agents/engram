@@ -1215,3 +1215,104 @@ def test_4000_c5_skipped_reason_survives_long_head(empty_seat, monkeypatch):
     assert "needs Lei" in result[0]["why"], (
         f"skip reason clipped from why: {result[0]['why']!r}"
     )
+
+
+# ==========================================================================
+# Interpreter guard: re-exec into the venv on a stock pre-3.10 python (#4642)
+#
+# A stock macOS python3 (3.9.6) dies importing weakest_load_bearing -> engram_core,
+# which evaluates `str | Path` at module scope.  The guard decides BEFORE that import
+# and either execs the venv interpreter or exits 3 with one line.  `_reexec_plan`
+# is the decision, pure/in-process so these cells need no subprocess.  The spec's
+# literal "/x/venv/bin/python3" denotes "a usable venv interpreter": the plan checks
+# the filesystem (that is what makes cell 4's failure reachable), so cells 1 and 4
+# use real temp paths and cell 3 passes the actual running interpreter.
+# ==========================================================================
+
+_HOOK_PATH_4642 = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-loop-arm-stop-hook.py"
+
+
+def _usable_venv_4642(tmp_path) -> str:
+    """A real, executable file at a venv-shaped path (see the block comment above)."""
+    venv = tmp_path / "venv" / "bin" / "python3"
+    venv.parent.mkdir(parents=True)
+    venv.write_text("#!/bin/sh\n", encoding="utf-8")
+    venv.chmod(0o755)
+    return str(venv)
+
+
+def _load_hook_4642():
+    spec = importlib.util.spec_from_file_location("loop_arm_hook_4642", str(_HOOK_PATH_4642))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_4642_c1_too_old_with_a_usable_venv_plans_exec(empty_seat, monkeypatch, tmp_path):
+    """Cell 1: 3.9.6 with a present, executable venv interpreter -> ('exec', that path)."""
+    mod = _load_tool(empty_seat, monkeypatch)
+    venv = _usable_venv_4642(tmp_path)
+    assert mod._reexec_plan((3, 9, 6), venv) == ("exec", venv)
+
+
+def test_4642_c2_new_enough_runs_in_process(empty_seat, monkeypatch):
+    """Cell 2: 3.12 needs no re-exec -> ('run', None)."""
+    mod = _load_tool(empty_seat, monkeypatch)
+    assert mod._reexec_plan((3, 12, 0), "/x/venv/bin/python3") == ("run", None)
+
+
+def test_4642_c3_the_running_interpreter_never_reexecs_into_itself(empty_seat, monkeypatch):
+    """Cell 3: too old, but the venv interpreter IS the running one -> ('run', None).
+
+    Mutation: drop the same-file check -> this cell returns ('exec', sys.executable)
+    and would loop forever."""
+    mod = _load_tool(empty_seat, monkeypatch)
+    assert mod._reexec_plan((3, 9, 6), sys.executable) == ("run", None)
+
+
+@pytest.mark.parametrize("kind", ["missing", "not-executable"])
+def test_4642_c4_too_old_without_a_usable_venv_fails_naming_both(
+        empty_seat, monkeypatch, tmp_path, kind):
+    """Cell 4: too old and the venv interpreter is missing / not executable ->
+    ('fail', message), and the message names the running version and the venv path.
+
+    Mutation: collapse "needed but impossible" into "not needed" (return ('run', None))
+    -> red here; the two states must stay distinct."""
+    mod = _load_tool(empty_seat, monkeypatch)
+    venv = tmp_path / "venv" / "bin" / "python3"
+    if kind == "not-executable":
+        venv.parent.mkdir(parents=True)
+        venv.write_text("#!/bin/sh\n", encoding="utf-8")
+        venv.chmod(0o644)
+    action, detail = mod._reexec_plan((3, 9, 6), str(venv))
+    assert action == "fail"
+    assert "3.9.6" in detail and str(venv) in detail
+
+
+def test_4642_c5_the_quiet_wake_nudge_names_the_venv_interpreter(
+        tmp_path, monkeypatch, isolate_hook_loads):
+    """Cell 5: the rendered Quiet Wake nudge carries the venv interpreter and never the
+    bare `python3 tools/study_queue.py` that dies on a stock 3.9.
+
+    Path SHAPE, not an exact absolute path: the expected path is computed from
+    Path.home() here, so the cell passes wherever it runs.  ENGRAM_HOME is set to a
+    temp dir on purpose: the venv is an installation artifact at ~/.engram/venv,
+    independent of ENGRAM_HOME, so the nudge must NOT follow the environment."""
+    home = tmp_path / "seat-home"
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    hook = _load_hook_4642()
+    text = hook._QUIET_NUDGE_TEXT.format(n=2)
+    venv = str(Path.home() / ".engram" / "venv" / "bin" / "python3")
+    assert venv in text
+    assert str(home) not in text, "the venv is not under ENGRAM_HOME"
+    assert "`python3 tools/study_queue.py`" not in text
+    assert "For the awake seat" in text  # the rest of the message is unchanged
+
+
+def test_4642_c6_the_tool_still_runs_under_the_current_interpreter(seat):
+    """Cell 6: on a 3.10+ interpreter the guard changes nothing -- the CLI still prints
+    the queue and exits 0 (the existing contract; catches a guard that execs or exits)."""
+    _dream(seat, "2026-10-17.md", "## For the awake seat\n1. still queued ob-901\n")
+    r = _cli(seat, ["--now", NOW])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert r.stdout.startswith("study queue (") and "ob-901" in r.stdout

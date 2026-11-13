@@ -959,11 +959,21 @@ QUIET_WAKE_OBSERVE_OR_ARM_TOOLS = frozenset({
     "Read", "Glob", "Grep",
 }) | _UMWELT_READ_VERBS
 
+# #4642: name the venv interpreter, not a bare `python3` -- a stock macOS python3 is
+# 3.9.6 and study_queue.py's import chain needs 3.10+.  The venv is an INSTALLATION
+# ARTIFACT at ~/.engram/venv, independent of ENGRAM_HOME (CLAUDE.md "Infrastructure
+# Locations"; install.sh VENV_DIR="$HOME/.engram/venv"; tools/home_path_gate.py's
+# 'engram_home_derived_venv' class), so it is NOT built from this hook's engram_home()
+# result above: that would name a path that does not exist on a non-default home.
+# `{n}` stays a literal placeholder: only the command fragment is an f-string, the
+# surrounding message is unchanged.
+_VENV_PYTHON = os.path.expanduser("~/.engram/venv/bin/python3")
+
 _QUIET_NUDGE_TEXT = (
     "[Quiet Wake Check: {n} quiet wakes in a row (no work done, only looking "
     "and re-arming). Take an OWNER step from your board, or run ONE study unit: "
     "one target, one method, one written ENGRAM result. Next act: run "
-    "`python3 tools/study_queue.py` once it exists (alpha #3919 M3); until "
+    f"`{_VENV_PYTHON} tools/study_queue.py` once it exists (alpha #3919 M3); until "
     "then read the latest dream report's `For the awake seat` section "
     "(`~/.engram/history/dream/`, most recent file).]"
 )
