@@ -241,7 +241,7 @@ class TestModeGate:
         rc, stdout, stderr = _run_ia(engram_home, "list")
         assert rc == EXIT_STATE
         assert "no forum configured" in stderr
-        assert "inter-agent/README.md" in stderr
+        assert "engram-letter" in stderr
 
     def test_list_single_mode_with_forum_configured_proceeds_past_gate(self, engram_home):
         """mode=single but forum.url set → list proceeds past the gate."""
@@ -319,7 +319,52 @@ class TestModeGate:
         rc, stdout, stderr = _run_ia(engram_home, "list")
         assert rc == EXIT_STATE
         assert "no forum configured" in stderr
-        assert "inter-agent/README.md" in stderr
+        assert "engram-letter" in stderr
+
+    def test_refusal_pointer_is_the_shipped_skill_row(self, engram_home):
+        """C2 (#3560): the refusal names the skill row and never the dev-only README."""
+        _write_config(engram_home, "single", agent_name=None)
+        rc, stdout, stderr = _run_ia(engram_home, "list")
+        assert rc == EXIT_STATE
+        assert len(stderr.splitlines()) == 3
+        assert (
+            'See: the engram-letter skill, troubleshooting table, '
+            'row "ia exits 3 with no forum configured".'
+        ) in stderr
+        assert "inter-agent/README.md" not in stderr
+
+
+class TestSeePointersResolve3560:
+    """C1 (#3560): every `See:` string literal in ia.py resolves on the shipped tree."""
+
+    def test_every_see_pointer_names_an_existing_skill_row(self):
+        import ast
+        import re
+
+        src = _REPO_ROOT / "src" / "engram" / "tools" / "ia.py"
+        tree = ast.parse(src.read_text())
+        pointers = [
+            n.value
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Constant)
+            and isinstance(n.value, str)
+            and n.value.startswith("See:")
+        ]
+        assert pointers, "ia.py has no See: pointer literal at all"
+        skill = _REPO_ROOT / "src" / "engram" / "skills" / "claude" / "engram-letter" / "SKILL.md"
+        assert skill.is_file(), f"{skill} does not exist"
+        # The table writes the symptom in backticks; the pointer quotes it plain.
+        # Only table lines count: the row text turning up in prose is not the row.
+        table_lines = [
+            ln.replace("`", "") for ln in skill.read_text().splitlines() if ln.lstrip().startswith("|")
+        ]
+        for ptr in pointers:
+            assert "engram-letter" in ptr, ptr
+            m = re.search(r'row "([^"]+)"', ptr)
+            assert m, f"pointer quotes no row: {ptr!r}"
+            assert any(m.group(1) in ln for ln in table_lines), (
+                f"row {m.group(1)!r} is not a line of a table in SKILL.md"
+            )
 
 
 # ===========================================================================

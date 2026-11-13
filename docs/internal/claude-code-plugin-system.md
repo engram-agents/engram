@@ -136,7 +136,7 @@ it is **required** (paired with `/plugin marketplace update`, which refreshes th
 cache snapshot agents load from — §4/§6), not merely a forcing function. For
 skills/tools (source-live) it is only a forcing function if a hot-reload ever fails.
 It does **not** substitute for the MCP reconnect; for a `hooks.json` *registration*
-change it reloaded hooks in-session: 19 in the #1639 case, and on the rc4 upgrade
+change it reloaded hooks in-session: on the rc4 upgrade
 (#3265) it reported 28 = 20 engram + 8 umwelt, the NEW set (the old would read 30),
 with no restart. The addition case was measured on another seat (#1892, 2026-08-03:
 29 = 22 + 7, the new Stop hook fired). One seat each, two dates (harness versions not recorded); a full
