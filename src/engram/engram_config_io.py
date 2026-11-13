@@ -46,13 +46,16 @@ from pathlib import Path
 
 from engram_regular_io import read_regular_text
 
-# os.getxattr / os.setxattr / os.listxattr exist on Linux and FreeBSD only:
-# macOS does not expose POSIX ACLs (or any file xattrs) through them, and
-# calling a missing attribute raises AttributeError, not OSError.  Decided once
-# at import so the copy below is a no-op, never an error, where the API is
-# absent.
+# os.getxattr / os.setxattr / os.listxattr / os.removexattr exist on Linux and
+# FreeBSD only: macOS does not expose POSIX ACLs (or any file xattrs) through
+# them, and calling a missing attribute raises AttributeError, not OSError.
+# Decided once at import so the copy and the inherited-ACL removal below are a
+# no-op, never an error, where the API is absent.
 _XATTR_API = (
-    hasattr(os, "getxattr") and hasattr(os, "setxattr") and hasattr(os, "listxattr")
+    hasattr(os, "getxattr")
+    and hasattr(os, "setxattr")
+    and hasattr(os, "listxattr")
+    and hasattr(os, "removexattr")
 )
 
 # Read errors that mean "this attribute is absent or this filesystem cannot
@@ -116,7 +119,11 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     callers).  On any error the temp file is removed and the error re-raised;
     ``path`` is never left partial.  Named POSIX ACL entries
     (``system.posix_acl_access``) and ``user.*`` extended attributes are copied
-    from the existing file onto the temp before the publish.  That copy is the
+    from the existing file onto the temp before the publish; when the existing
+    file has NO access ACL, the temp's inherited access ACL is REMOVED instead,
+    so the write cannot grant access the replaced file never had.  A new target
+    keeps the directory's default ACL by design: there is nothing to replace,
+    and a plain ``open`` would inherit it too.  That copy (or removal) is the
     LAST metadata step before the publish, and must stay last: the mode and
     group are restored first, and ``fchmod`` rewrites the ACL mask (which is the
     final word on the group bits), so a mode change after the ACL is applied
@@ -191,6 +198,19 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
                 except OSError as exc:
                     if exc.errno not in _NO_XATTR_ERRNOS:
                         raise
+                    # No access ACL on the file being replaced.  The temp was
+                    # created in this same directory, so it may have INHERITED
+                    # the directory's default ACL, which the target never had;
+                    # publishing it would grant access the target's metadata
+                    # never allowed.  Remove it here, at the same position as
+                    # the copy and for the same reason: every fchmod has
+                    # already run (a mode change after the ACL work would alter
+                    # the mask), and os.replace has not run yet.
+                    try:
+                        os.removexattr(tmp, "system.posix_acl_access", follow_symlinks=False)
+                    except OSError as remove_exc:
+                        if remove_exc.errno not in _NO_XATTR_ERRNOS:
+                            raise
                 else:
                     os.setxattr(tmp, "system.posix_acl_access", acl, follow_symlinks=False)
                 try:

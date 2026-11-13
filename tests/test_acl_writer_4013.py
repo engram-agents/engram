@@ -15,6 +15,11 @@ Contract (written before the implementation; the cells below are the design):
   A5  If the source HAS an ACL and applying it to the temp fails, the write RAISES,
       the target is byte-identical, and no temp file is left behind. Silently
       dropping it is the defect being fixed.
+  A6  The same guarantee from the other side: replacing an existing file that had
+      NO access ACL leaves the target with NO access ACL, even when the target's
+      directory carries a DEFAULT ACL that the staged temp inherits. A brand-new
+      target still inherits that default ACL by design (a plain ``open`` would
+      give it the same), so the removal is confined to the replace path.
 
 The whole file skips when this filesystem cannot carry ``system.posix_acl_access``
 unprivileged; the skip reason names the errno and the platform, so a Linux-with-ACL
@@ -37,6 +42,7 @@ COPIES = {
     "hooks": SRC / "hooks" / "claude" / "_hooklib.py",
 }
 ACL = "system.posix_acl_access"
+DEFAULT_ACL = "system.posix_acl_default"
 _NONE = 0xFFFFFFFF
 
 
@@ -61,6 +67,66 @@ def _set_named_acl(path, uid=None):
     blob = _minimal_named_acl(os.getuid() if uid is None else uid)
     os.setxattr(path, ACL, blob, follow_symlinks=False)
     return blob
+
+
+def _nobody_uid():
+    """The uid the default-ACL cells name: ``u:nobody:r``, as the defect was
+    measured. Falls back to the conventional nobody uid where the account is
+    absent, so the cell still names a user that is neither owner nor group."""
+    try:
+        import pwd
+    except ImportError:  # Windows: the module fixture skips before any cell runs
+        return 65534
+    try:
+        return pwd.getpwnam("nobody").pw_uid
+    except KeyError:
+        return 65534
+
+
+def _set_default_acl(directory, uid):
+    """Give ``directory`` a default access ACL carrying one named user entry.
+
+    Every file created inside inherits it -- that is how the writer's staged
+    temp picks up an ACL the file being REPLACED never had.
+    """
+    blob = _minimal_named_acl(uid)
+    os.setxattr(directory, DEFAULT_ACL, blob, follow_symlinks=False)
+    return blob
+
+
+def _require_default_acl(directory, uid):
+    """``_set_default_acl``, or a loud skip when this filesystem cannot carry a
+    default ACL unprivileged. Never a weakened assertion."""
+    cannot_carry = {
+        errno.EOPNOTSUPP,
+        getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+        errno.ENOSYS,
+        errno.EPERM,
+    }
+    try:
+        return _set_default_acl(directory, uid)
+    except OSError as exc:
+        if exc.errno in cannot_carry:
+            name = errno.errorcode.get(exc.errno, str(exc.errno))
+            pytest.skip(
+                f"filesystem cannot carry system.posix_acl_default unprivileged "
+                f"({name}: {exc})"
+            )
+        raise
+
+
+def _acl_entries(blob):
+    """Parse a POSIX ACL xattr blob into ``(tag, perm, id)`` entries."""
+    version = struct.unpack_from("<I", blob, 0)[0]
+    assert version == 2, f"unexpected ACL blob version {version}"
+    return [struct.unpack_from("<HHI", blob, offset) for offset in range(4, len(blob), 8)]
+
+
+def _has_named_user_entry(blob, uid):
+    """True when the blob carries ``user:<uid>:r--`` (tag 0x02, perm 0o4)."""
+    return any(
+        tag == 0x02 and perm == 0o4 and ident == uid for tag, perm, ident in _acl_entries(blob)
+    )
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -199,6 +265,86 @@ def test_file_without_acl_is_written_normally(mod, tmp_path):
     mod.atomic_write_text(p, "new")
 
     assert p.read_text() == "new"
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o600])
+def test_replacing_a_file_with_no_acl_does_not_install_the_directory_default(
+    mod, tmp_path, mode
+):
+    """A6: the temp is created beside the target, so it inherits that directory's
+    DEFAULT access ACL. The file being replaced had none, so publishing the
+    temp's inherited ACL would GRANT access the old file never had -- the same
+    metadata-survives-the-write guarantee as A1/A2, from the other side."""
+    target = tmp_path / "state.json"
+    target.write_text("old")
+    os.chmod(target, mode)
+    try:
+        os.getxattr(target, ACL, follow_symlinks=False)
+    except OSError as exc:
+        assert exc.errno in (
+            errno.ENODATA,
+            getattr(errno, "ENOATTR", errno.ENODATA),
+        ), f"setup: unexpected errno {exc.errno} on a file with no ACL"
+    else:
+        pytest.fail("setup: the target must start with no access ACL")
+
+    nobody = _nobody_uid()
+    _require_default_acl(tmp_path, nobody)
+    # Instrument check: prove the hazard is live HERE -- a file created in this
+    # directory now inherits the default entry. Without it the cell could pass
+    # against a writer that never had an ACL to remove.
+    probe = tmp_path / "probe"
+    probe.write_text("x")
+    try:
+        inherited = os.getxattr(probe, ACL, follow_symlinks=False)
+    except OSError as exc:
+        pytest.fail(
+            f"the default ACL did not reach a new file ({exc}); this cell would "
+            "assert nothing"
+        )
+    assert _has_named_user_entry(inherited, nobody), inherited.hex()
+    probe.unlink()
+
+    mod.atomic_write_text(target, "new")
+
+    assert target.read_text() == "new"
+    try:
+        installed = os.getxattr(target, ACL, follow_symlinks=False)
+    except OSError as exc:
+        assert exc.errno in (
+            errno.ENODATA,
+            getattr(errno, "ENOATTR", errno.ENODATA),
+        ), f"unexpected errno {exc.errno} reading the target's ACL"
+    else:
+        pytest.fail(
+            "the replaced file had no access ACL, but the write installed one "
+            f"({installed.hex()}): it now grants access the old file never had"
+        )
+    after = stat.S_IMODE(os.stat(target).st_mode)
+    assert after == mode, f"mode {oct(after)} != the source's {oct(mode)}"
+    assert after & 0o007 == 0, (
+        "with no access ACL the other bits decide for a non-owner: they must not "
+        "grant a user outside the owning group the read the default entry gave it"
+    )
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["state.json"]
+
+
+def test_a_new_target_keeps_the_directory_default_acl(mod, tmp_path):
+    """A6's control: nothing is being replaced, so the new inode keeps the
+    directory's default ACL, exactly as a plain ``open`` would give it. Stripping
+    it here would be a behaviour change, not a fix."""
+    target = tmp_path / "brand-new.json"
+    nobody = _nobody_uid()
+    _require_default_acl(tmp_path, nobody)
+
+    mod.atomic_write_text(target, "new")
+
+    assert target.read_text() == "new"
+    inherited = os.getxattr(target, ACL, follow_symlinks=False)
+    assert _has_named_user_entry(inherited, nobody), (
+        "a brand-new target lost the directory's default ACL; that is what a "
+        f"plain open() would give it (blob {inherited.hex()})"
+    )
 
 
 def test_acl_read_unsupported_is_tolerated_and_applies_no_acl(mod, tmp_path, monkeypatch):
@@ -424,6 +570,28 @@ def test_no_xattr_api_is_a_no_op_not_an_error(which, tmp_path, monkeypatch):
     monkeypatch.delattr(os, "setxattr")
     monkeypatch.delattr(os, "listxattr")
     mod = _load_fresh(f"_writer_no_xattr_{which}", COPIES[which])
+
+    mod.atomic_write_text(p, "new")
+
+    assert p.read_text() == "new"
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["state.json"]
+
+
+@pytest.mark.parametrize("which", ["core", "hooks"])
+def test_absent_removexattr_is_a_no_op_not_an_error(which, tmp_path, monkeypatch):
+    """The ACL REMOVAL needs the same import-time guard as the copy: a platform
+    where ``os.removexattr`` is absent must never attempt the call (it raises
+    ``AttributeError``, not ``OSError``).
+
+    Deleting ONLY ``removexattr`` leaves every other guard attribute present, so
+    this cell discriminates a guarded removal from an unconditional one -- unlike
+    deleting all four, which the pre-existing cell above already exercises.
+    """
+    p = tmp_path / "state.json"
+    p.write_text("old")
+
+    monkeypatch.delattr(os, "removexattr")
+    mod = _load_fresh(f"_writer_no_removexattr_{which}", COPIES[which])
 
     mod.atomic_write_text(p, "new")
 
