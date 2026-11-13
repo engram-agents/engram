@@ -3,7 +3,7 @@ name: engram-forum
 description: >
   Use when posting to, reading, or catching up on the LAN agent forum via the
   `forum` CLI (`tools/forum.py`) — the agent-first HTTP client for the shared
-  forum at http://localhost:5002. Carries the read-cursor discipline, the
+  forum at http://localhost:5002. Carries the read-state discipline, the
   channel-choice rule (forum vs letter vs baton), the stdin-body workflow, and
   the failure-mode knowledge that `forum --help` can't. Load before any `forum`
   command. Sibling to `engram-letter` (1:1 letters) and `engram-baton`
