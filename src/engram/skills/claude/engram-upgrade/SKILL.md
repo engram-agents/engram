@@ -336,11 +336,12 @@ systemctl --user restart engram-viz-user.service && echo "viz restarted" || echo
 
 Verify the server is live with new code after the restart:
 ```bash
-curl -s http://localhost:5001/api/health | python3 -m json.tool
+agent=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]+'/config.json'))['agent_name'])" "${ENGRAM_HOME:-$HOME/.engram}")
+curl -s "http://localhost:5001/api/health?agent=$agent" | python3 -m json.tool
 ```
-A `health_score` field in the response confirms the viz server is up. Step 8 also checks this.
+Scope the call with `?agent=` -- on a viz host that serves several agents' graphs the unscoped endpoint returns the first configured agent's graph, not yours. A `health_score` field in the response, for your own `agent`, confirms the viz server is up.
 
-**Checkpoint**: viz responds to `http://localhost:5001/api/health` (or the service is confirmed not installed).
+**Checkpoint**: viz responds to `http://localhost:5001/api/health?agent=<your agent_name>` (or the service is confirmed not installed).
 
 ---
 
