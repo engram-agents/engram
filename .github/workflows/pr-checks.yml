@@ -35,7 +35,8 @@ name: pr-checks
 #      hooks-stdout-audit below: a gate positioned outside the path where
 #      the decision is made cannot protect the thing it audits.)
 #   9. hooks-stdout-audit         (#2718 — BLOCKING when the diff touches
-#      src/engram/hooks/ or hooks.json, self-skips otherwise; the audit
+#      src/engram/hooks/, hooks.json or the audit's own test file (#2733),
+#      self-skips otherwise; the audit
 #      (tests/test_hooks_json_stdout_audit.py) previously ran ONLY in the
 #      nightly full suite, so a plaintext-stdout regression to a shipped
 #      hook (#2700) went green through pr-checks and broke hours later in
@@ -1339,11 +1340,13 @@ jobs:
           # break the audit. --no-renames forces both the old and new path
           # to appear as separate entries so the predicate still matches.
           CHANGED=$(git diff --no-renames --name-only "$BASE_REF...HEAD")
-          if echo "$CHANGED" | grep -qE '^src/engram/hooks/|(^|/)hooks\.json$'; then
-            echo "Diff touches src/engram/hooks/ or hooks.json — audit will run."
+          # #2733: the audit's OWN file is in the predicate too. A PR that weakens,
+          # skip-lists or disables the audit must run it, not skip it.
+          if echo "$CHANGED" | grep -qE '^src/engram/hooks/|(^|/)hooks\.json$|^tests/test_hooks_json_stdout_audit\.py$'; then
+            echo "Diff touches src/engram/hooks/, hooks.json or the audit's own test file — audit will run."
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Diff does not touch src/engram/hooks/ or hooks.json — audit self-skips."
+            echo "Diff does not touch src/engram/hooks/, hooks.json or the audit's own test file — audit self-skips."
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
