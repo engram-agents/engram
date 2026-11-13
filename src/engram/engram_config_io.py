@@ -204,6 +204,10 @@ def _prune_backups(path: Path) -> None:
         return
     found.sort()
     for _, cand in (found[:-BACKUP_KEEP] if len(found) > BACKUP_KEEP else []):
+        # cand was built from the listing (path.parent / entry.name) and lstat'ed above,
+        # never resolved.  A symlink matching the backup pattern is unlinked itself,
+        # never followed.  Never resolve cand before unlink: resolving first would let
+        # a planted link delete an arbitrary file.
         try:
             os.unlink(cand)
         except FileNotFoundError:
