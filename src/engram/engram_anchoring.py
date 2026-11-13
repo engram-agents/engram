@@ -71,7 +71,8 @@ _HEX_SHA_CLASS = "hex_sha"
 # Token-boundary alphabet (#4206): a hard token anchors only when the
 # characters immediately around its occurrence are each absent or outside
 # this set. `#` and punctuation are boundaries; letters, digits and `_` are
-# not, so `404` does not anchor inside `#4040`, `x404`, or `ob_1234`.
+# not, so `404` does not anchor inside `#4040`, `x404`, or the numeric
+# tail of a node id.
 _WORD_CHARS = frozenset(
     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
 )
@@ -150,8 +151,8 @@ def _hard_tokens_with_class(text: str) -> list[tuple[str, str]]:
     appearance document order, de-duplicated by exact token string.
 
     A NUMBER token whose SPAN lies inside another emitted token's span (the
-    `1234` in `ob_1234`, the digit run in a hex sha, the year in a date, the
-    integer part of `1234567.89`) is part of that token, not a separate
+    `1234` in a node id (`xx_NNNN`), the digit run in a hex sha, the year in a
+    date, the integer part of `1234567.89`) is part of that token, not a separate
     count. This is deliberately span containment, NOT the substring test
     s2_clause_check._clause_hard_tokens uses for M1: substring containment
     would drop a standalone `404` merely because `#4040` appears elsewhere in
@@ -185,7 +186,7 @@ def _hard_tokens_with_class(text: str) -> list[tuple[str, str]]:
         candidates.append((m.start(), m.end(), m.group(0), "time"))
 
     # Span containment for NUMBER tokens only; endpoints may coincide (the
-    # numeric tail of `ob_1234` ends where the node id ends). ALL candidate
+    # numeric tail of a node id ends where the node id ends). ALL candidate
     # spans are outer spans, including other numbers': the integer part of a
     # decimal is its own number-regex match ("1234567" inside
     # "1234567.89"), and dropping only non-number outers would leave it as a

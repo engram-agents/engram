@@ -94,6 +94,16 @@ def test_m1_missing_number_is_typed_count(cc):
     assert "4812" in r["missing"]
 
 
+def test_m1_verbatim_decimal_is_stated(cc):
+    # #4206 knock-on: the integer part of a decimal is no longer emitted as a
+    # second, separate token, so a verbatim decimal quote is fully contained.
+    # Before the span-containment fix this scored NOT: `1234567` was emitted
+    # first and its substring test failed against the `1234567.89` in the quote.
+    r = cc.check_m1("count 1234567.89", "count 1234567.89", 0.0)
+    assert r["verdict"] == "STATED"
+    assert r["missing"] == []
+
+
 def test_m1_missing_issue_ref_is_typed_ref(cc):
     r = cc.check_m1("the fix landed in the tracker", "the fix landed in #123", 0.0)
     assert (r["verdict"], r["missing_type"]) == ("NOT", "ref")
