@@ -26,6 +26,8 @@ def _calls():
             line_no = text.count("\n", 0, m.start()) + 1
             if lines[line_no - 1].lstrip().startswith("description:"):
                 continue  # frontmatter prose naming the tool, not a call
+            if re.search(r"^#|[Cc]all(ing)? `?engram_checkpoint", lines[line_no - 1]):
+                continue  # a heading or a sentence naming the call, not an example
             depth, i = 1, m.end()
             while i < len(text) and depth:
                 depth += {"(": 1, ")": -1}.get(text[i], 0)
