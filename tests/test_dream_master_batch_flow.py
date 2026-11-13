@@ -1288,6 +1288,47 @@ class TestCategoryToBucketRouting:
         assert "_bucket" in item
 
 
+# ---------------------------------------------------------------------------
+# 4538. The tool name engram_resolve routes to resolutions (\bresolv cannot
+# match inside it: "_" is a word character, so there is no boundary)
+# ---------------------------------------------------------------------------
+
+
+def _bucket_of(suggestion: str) -> str:
+    buckets = bucket_findings([_make_report([_make_finding("qu_0001", suggestion)])])
+    hits = [name for name, items in buckets.items() if items]
+    assert len(hits) == 1, f"expected exactly one bucket for {suggestion!r}, got {hits}"
+    return hits[0]
+
+
+def test_engram_resolve_tool_name_routes_to_resolutions():
+    for suggestion in [
+        "run engram_resolve(target_id=qu_0001, resolving_node_id=dv_0002)",
+        "call engram_resolve on qu_0001",
+        "ENGRAM_RESOLVE(target_id=qu_0001)",
+    ]:
+        assert _bucket_of(suggestion) == BUCKET_RESOLUTIONS, suggestion
+
+
+def test_resolve_prose_still_routes_to_resolutions():
+    for suggestion in ["resolve this question", "close as resolved", "resolving the open question"]:
+        assert _bucket_of(suggestion) == BUCKET_RESOLUTIONS, suggestion
+
+
+def test_goal_tension_with_engram_resolve_still_routes_to_goal_tension():
+    for suggestion in [
+        "goal-tension gt_0001: run engram_resolve(target_id=gt_0001)",
+        "run engram_resolve to settle gt_0002",
+        "engram_resolve the goal tension between gl_0001 and gl_0002",
+    ]:
+        assert _bucket_of(suggestion) == BUCKET_GOAL_TENSION_RESOLUTIONS, suggestion
+
+
+def test_edge_wiring_with_engram_resolve_still_routes_to_edge_wiring():
+    s = "engram_add_edge(...) then engram_resolve(target_id=qu_0001)"
+    assert _bucket_of(s) == BUCKET_EDGE_WIRING
+
+
 if __name__ == "__main__":
     import traceback
 
