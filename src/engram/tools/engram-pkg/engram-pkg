@@ -683,7 +683,7 @@ def _compute_provenance_closure(
 
     Traversal rule (spec §3):
       - Follows all outgoing edges from each included node (derives_from,
-        supports, cites, evidence links, supersedes, contradicts, resolves).
+        supported_by, cites, evidence links, supersedes, contradicts, resolves).
       - Also includes incoming edges that touch included nodes (so the
         reader sees the node's epistemic status).
       - Stops at natural provenance leaves (axioms, definitions, evidence
