@@ -533,15 +533,12 @@ def test_c10_sheet_masks_id_shaped_tokens_text_only(capsys):
     keyd = json.loads(key.read_text())
     assert keyd["meta"]["masked_id_tokens"] == 5
     assert keyd["items"]["1"]["node_id"] == "zq_7001"
-    # distributions are computed from the unmasked text: the claim's node-id
-    # tokens anchor in the quote (and their embedded digit runs do not, under
-    # #4206's boundary rule), so the ratio is 0.5 rather than 0.0 — which is
-    # what makes this a control that masking did not feed the distribution.
+    # distributions are computed from the unmasked text: the claim's two tokens anchor in the quote
     with_sheet = json.loads(out)
     rc, out2 = _run_main(tool, ["--db", str(db), "--format", "json"], {quote: 0.1}, capsys)
     plain = json.loads(out2)
     assert with_sheet["strata"] == plain["strata"]
-    assert plain["strata"]["all"]["deciles"]["anchoring_ratio"] == [0.5] * 9
+    assert plain["strata"]["all"]["deciles"]["anchoring_ratio"] == [1.0] * 9
 
 
 # --------------------------------------------------------------------------- C6 round 2

@@ -11,6 +11,16 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- The write-time `anchoring_advisory` on every observation write now matches a
+  claim's hard tokens only at token boundaries. `#404` is no longer reported as
+  anchored by a quote containing `#4040`, nor `404` by `4040`, `4.404` or
+  `5,404`. A number that lies inside another hard token (the `1234` in
+  `ob_1234`, a digit run inside a hex sha, the year in a date) is part of that
+  token and is no longer counted separately, so a verbatim quote still anchors
+  fully. Seven-digit and longer all-decimal runs are classified as numbers, not
+  hex shas, and take the strict rule: an all-digit sha is no longer accepted as
+  the prefix of a longer all-digit sha, while a sha with letters still is. Hex
+  shas remain case-insensitive. (#4206)
 - The touched-test selector (`run_touched_tests.py`) now finds the tests for
   changes under `src/engram`. Before, it only looked at the old repo-root layout,
   so a change to `server.py` or `engram_core.py` fell back to the whole suite.

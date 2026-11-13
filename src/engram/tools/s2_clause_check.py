@@ -285,6 +285,7 @@ def check_b1(quote: str, clause: str) -> dict:
     class only -- implemented here rather than borrowed from engram_anchoring.anchor(): that
     matcher became token-boundary-aware in #4206 and may move again, and a baseline must not move
     with the thing it is a baseline of."""
+    quote = quote or ""
     quote_lower = quote.lower()
     unanchored = [
         tok

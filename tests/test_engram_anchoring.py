@@ -92,10 +92,11 @@ def test_glued_units_stripped_from_numbers():
 def test_trailing_punctuation_not_swallowed_into_number():
     # Deviation from the build spec's literal `\d[\d,]*\.?\d*` regex, which
     # would produce "2609," and "247." — see engram_anchoring.py's comment
-    # on _NUMBER_RE for the full reasoning. "60754dcc" also independently
-    # surfaces its embedded digit run "60754" as its own number token —
-    # the documented class-overlap, not a bug in this specific assertion.
-    assert hard_tokens("in #2609, sha 60754dcc") == ["#2609", "2609", "60754dcc", "60754"]
+    # on _NUMBER_RE for the full reasoning. Since #4206 a NUMBER token that
+    # lies inside another emitted token is part of that token and is not
+    # emitted separately: "2609" sits inside "#2609", and "60754" inside the
+    # hex sha "60754dcc".
+    assert hard_tokens("in #2609, sha 60754dcc") == ["#2609", "60754dcc"]
     assert hard_tokens("count 247. Next sentence") == ["247"]
 
 
@@ -123,29 +124,26 @@ def test_zero_hard_tokens_ratio_is_none_not_one():
     assert result.to_dict()["ratio"] is None
 
 
-def test_fully_anchored_claim():
-    # "ob_1234" and "#2609" each also surface their embedded digit run
-    # ("1234", "2609") as an independent number token — 4 hard tokens
-    # total. Since #4206 those digit runs anchor only on a token boundary:
-    # "2609" is preceded by '#' (a boundary) so it anchors, but "1234"
-    # sits inside "ob_1234" preceded by '_' (NOT a boundary), so it does
-    # not. Changed from 4/4 by the boundary rule, deliberately.
+def test_verbatim_claim_with_embedded_digit_runs_is_fully_anchored():
+    # #4206: the digit runs "1234" (inside the node id "ob_1234") and
+    # "2609" (inside the issue ref "#2609") are part of those tokens, not
+    # separate hard tokens, so a verbatim quote anchors every token. Two
+    # tokens, both anchored -- not four, and not a partial ratio.
     result = anchor("cites ob_1234 and #2609", "source discusses ob_1234 in #2609 detail")
-    assert result.hard_tokens == 4
-    assert result.anchored == 3
-    assert result.ratio == 0.75
-    assert result.unanchored == ["1234"]
+    assert result.hard_tokens == 2
+    assert result.anchored == 2
+    assert result.ratio == 1.0
+    assert result.unanchored == []
 
 
 def test_partially_anchored_claim_lists_unanchored():
-    # #4206: the embedded "1234" no longer anchors inside "ob_1234"
-    # (preceded by '_', not a token boundary), so it joins the unanchored
-    # list alongside the tokens the quote never mentions.
+    # #4206: only the outer tokens count ("ob_1234", "#2609"); the quote
+    # carries the node id but not the issue ref.
     result = anchor("cites ob_1234 and #2609", "source discusses ob_1234 only")
-    assert result.hard_tokens == 4
+    assert result.hard_tokens == 2
     assert result.anchored == 1
-    assert result.ratio == 0.25
-    assert result.unanchored == ["1234", "#2609", "2609"]
+    assert result.ratio == 0.5
+    assert result.unanchored == ["#2609"]
 
 
 def test_comma_thousands_mismatch_counts_as_unanchored():
@@ -167,23 +165,20 @@ def test_hex_sha_anchoring_is_case_insensitive():
 def test_node_id_anchoring_is_case_sensitive():
     # A node id is lowercase by construction; anchoring for that class is
     # a plain substring check (no case-folding), unlike hex shas, so the
-    # differently-cased "OB_1234" does not anchor it. The embedded digit
-    # run ("1234") is a separate number token, but since #4206 it too is
-    # unanchored here: it sits inside "OB_1234" preceded by '_', which is
-    # not a token boundary (this test used to assert the opposite for the
-    # digit run; the case-sensitivity assertion on the node id itself is
-    # unchanged).
+    # differently-cased "OB_1234" does not anchor it. Since #4206 the node
+    # id is the only token here: its embedded digit run "1234" is part of
+    # that token and is not emitted separately.
     result = anchor("cites ob_1234", "quote mentions OB_1234 only")
-    assert "ob_1234" in result.unanchored
-    assert "1234" in result.unanchored
+    assert result.hard_tokens == 1
+    assert result.unanchored == ["ob_1234"]
 
 
 def test_empty_quote_leaves_every_token_unanchored():
     result = anchor("cites ob_1234", "")
-    assert result.hard_tokens == 2  # "ob_1234" plus its embedded "1234"
+    assert result.hard_tokens == 1  # "ob_1234"; its digit run is part of it
     assert result.anchored == 0
     assert result.ratio == 0.0
-    assert result.unanchored == ["ob_1234", "1234"]
+    assert result.unanchored == ["ob_1234"]
 
 
 # ── #4206: a hard token anchors on a boundary, not as a raw substring ──────
@@ -194,8 +189,8 @@ def test_empty_quote_leaves_every_token_unanchored():
 
 def test_4206_pr_ref_inside_a_longer_number_is_unanchored():
     result = anchor("PR #404 merged", "PR #4040 merged")
-    assert "#404" in result.unanchored
-    assert "404" in result.unanchored
+    # #4206: "#404" is the only token -- the embedded "404" is part of it.
+    assert result.unanchored == ["#404"]
     assert result.anchored == 0
     assert result.ratio == 0.0
 
@@ -246,14 +241,14 @@ def test_4206_letter_after_is_not_a_boundary():
 
 def test_4206_hash_token_inside_a_longer_number_is_unanchored():
     result = anchor("PR #404 merged", "PR #4040 merged")
-    assert "#404" in result.unanchored
+    assert result.unanchored == ["#404"]
     assert result.ratio == 0.0
 
 
 def test_4206_hash_token_anchored_when_exact():
     result = anchor("PR #404 merged", "PR #404 merged")
-    assert result.hard_tokens == 2  # "#404" and its embedded "404"
-    assert result.anchored == 2
+    assert result.hard_tokens == 1  # "#404"; its embedded "404" is part of it
+    assert result.anchored == 1
     assert result.unanchored == []
     assert result.ratio == 1.0
 
@@ -303,3 +298,81 @@ def test_4206_no_hard_tokens_never_consults_the_boundary_helper(monkeypatch):
     assert result.anchored == 0
     assert result.ratio is None
     assert result.unanchored == []
+
+
+# Round-1 review, finding 1 — an embedded digit run is part of its outer
+# token, never a separate count (so a verbatim quote stays fully anchored).
+
+
+def test_4206_embedded_number_token_in_a_node_id_is_part_of_it():
+    assert hard_tokens("cites ob_1234 and #2609") == ["ob_1234", "#2609"]
+    assert hard_tokens("filed on 2026-09-06") == ["2026-09-06"]
+
+
+def test_4206_verbatim_node_id_quote_is_fully_anchored():
+    result = anchor("cites ob_1234", "cites ob_1234")
+    assert result.hard_tokens == 1
+    assert result.anchored == 1
+    assert result.ratio == 1.0
+    assert result.unanchored == []
+
+
+def test_4206_embedded_digit_run_in_a_hex_sha_is_part_of_it():
+    assert hard_tokens("commit abcdef1234") == ["abcdef1234"]
+    result = anchor("commit abcdef1234", "commit abcdef1234")
+    assert result.hard_tokens == 1
+    assert result.anchored == 1
+    assert result.ratio == 1.0
+    assert result.unanchored == []
+
+
+# Round-1 review, finding 2 — an all-digit 7+-character run is a NUMBER,
+# not a hex sha, so it takes the strict right-boundary rule. (The control
+# for the reclassification is test_4206_hex_prefix_of_a_longer_sha_is_anchored:
+# a sha with letters still anchors as the prefix of a longer sha.)
+
+
+def test_4206_all_digit_seven_plus_token_is_a_number_not_a_sha():
+    result = anchor("error 1234567", "error 12345670")
+    assert result.hard_tokens == 1
+    assert result.anchored == 0
+    assert result.unanchored == ["1234567"]
+    assert result.ratio == 0.0
+
+
+def test_4206_all_digit_date_shaped_token_is_a_number_not_a_sha():
+    result = anchor("date 20260906", "date 202609060")
+    assert result.hard_tokens == 1
+    assert result.anchored == 0
+    assert result.unanchored == ["20260906"]
+    assert result.ratio == 0.0
+
+
+# Round-1 review, finding 3 — a '.' or ',' that touches a digit is part of
+# the number, not a boundary (M1's rule: s2_clause_check._token_present).
+
+
+def test_4206_decimal_separator_before_token_is_not_a_boundary():
+    result = anchor("error 404", "error 4.404 seen")
+    assert result.unanchored == ["404"]
+    assert result.ratio == 0.0
+
+
+def test_4206_decimal_separator_after_token_is_not_a_boundary():
+    result = anchor("error 404", "error 404.5")
+    assert result.unanchored == ["404"]
+    assert result.ratio == 0.0
+
+
+def test_4206_thousands_separator_before_token_is_not_a_boundary():
+    result = anchor("error 404", "saw 5,404 rows")
+    assert result.unanchored == ["404"]
+    assert result.ratio == 0.0
+
+
+def test_4206_sentence_final_period_is_a_boundary():
+    result = anchor("error 404", "error 404.")
+    assert result.hard_tokens == 1
+    assert result.anchored == 1
+    assert result.unanchored == []
+    assert result.ratio == 1.0

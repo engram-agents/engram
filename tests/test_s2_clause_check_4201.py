@@ -202,7 +202,11 @@ def test_b0_always_not(cc):
     ("Quillon wrote 4812 cells", "ran 4812 cells on 2026-10-01"),                     # one unanchored
     ("nothing numeric here", "no hard tokens in this clause"),                        # nothing to anchor
 ])
-def test_b1_matches_anchor_exactly(cc, anchoring, quote, clause):
+def test_b1_agrees_with_anchor_on_boundary_safe_fixtures(cc, anchoring, quote, clause):
+    # Renamed from test_b1_matches_anchor_exactly: that name was true only while check_b1 CALLED
+    # anchor(). Since #4206 they are different implementations by design -- B1 is the frozen
+    # pre-#4206 substring baseline, anchor() is boundary-aware -- and they agree only on fixtures
+    # where the two rules coincide, which is exactly what these three cases are.
     want_unanchored = anchoring.anchor(clause, quote).unanchored
     r = cc.check_b1(quote, clause)
     assert r["verdict"] == ("NOT" if want_unanchored else "STATED")

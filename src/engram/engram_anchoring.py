@@ -22,14 +22,15 @@ same fact in a different surface form (`5,121` in the claim vs `5121` in
 the quote; a spelled-out date vs ISO form). This is the issue's own
 accepted bound, not a defect to route around.
 
-Known overlap (also accepted, not filtered): the five token classes below
-are independent regexes over the same text, so a single span can
-contribute more than one token -- a date like `2026-09-06` also matches
+Known overlap (accepted, and suppressed once by the tokenizer): the five
+token classes below are independent regexes over the same text, so a single
+span can match more than one class -- a date like `2026-09-06` also matches
 the number class as `2026` (digit count 4 >= 3), and a hex sha with an
-embedded digit run can likewise also surface as its own number token.
-Both tokens are real substrings of the claim and both get anchored (or
-not) independently; the class list is "exactly these five" per the
-issue's build spec, with no cross-class suppression.
+embedded digit run can likewise also surface as a number token. A NUMBER
+token whose span lies inside another emitted token's span is dropped
+(#4206): it is part of that token, not a separate count. The class list is
+"exactly these five" per the issue's build spec; the containment drop is
+not a sixth class.
 """
 
 from __future__ import annotations
@@ -76,38 +77,66 @@ _WORD_CHARS = frozenset(
 )
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
+# Numeric separators (#4206 review): a '.' or ',' that touches a digit is
+# part of the number, not a boundary -- the same rule s2_clause_check's
+# _token_present (M1) applies. 404 is not in 4.404, 404.5 or 5,404, but it
+# is in "error 404." and "404, then".
+_NUMERIC_SEPARATORS = frozenset(".,")
+
 
 def _token_is_anchored(tok: str, quote: str, *, hex_class: bool) -> bool:
     """True when `tok` occurs in `quote` at a token boundary.
 
     Non-hex tokens need a non-word character (or the quote's edge) on both
-    sides. Hex tokens are matched case-insensitively and their right side
-    is deliberately looser (#4206): a 7-character sha is usually written
-    as the prefix of the longer sha it names, so an occurrence followed by
-    more hex digits anchors -- but only if the whole remainder of the word
-    is hex (`abcdef1c0ffee9` anchors `abcdef1`; `abcdef1zz` does not).
+    sides. For a token that starts with a digit, a '.' or ',' touching a
+    digit is not a boundary (M1's rule): `404` is not in `4.404`, `404.5`
+    or `5,404`, but is in `error 404.`. Hex tokens are matched
+    case-insensitively and their right side is deliberately looser (#4206):
+    a 7-character sha is usually written as the prefix of the longer sha it
+    names, so an occurrence followed by more hex digits anchors -- but only
+    if the whole remainder of the word is hex (`abcdef1c0ffee9` anchors
+    `abcdef1`; `abcdef1zz` does not).
     """
     if not tok:
         return False
     haystack = quote.lower() if hex_class else quote
     needle = tok.lower() if hex_class else tok
+    digit_leading = tok[:1].isdigit()
 
     start = haystack.find(needle)
     while start != -1:
         end = start + len(needle)
         left_ok = start == 0 or haystack[start - 1] not in _WORD_CHARS
+        if (
+            left_ok
+            and digit_leading
+            and start >= 2
+            and haystack[start - 1] in _NUMERIC_SEPARATORS
+            and haystack[start - 2].isdigit()
+        ):
+            # `4.404` / `5,404`: the separator joins the token to a number.
+            left_ok = False
         if left_ok:
-            if end == len(haystack) or haystack[end] not in _WORD_CHARS:
-                return True
-            if hex_class:
-                # The next character is a word character: the token anchors
-                # only if what follows is a longer all-hex word (a sha
-                # prefix) and not a non-hex extension (`zz`, `x`, `_`).
-                i = end
-                while i < len(haystack) and haystack[i] in _HEX_DIGITS:
-                    i += 1
-                if i == len(haystack) or haystack[i] not in _WORD_CHARS:
+            right = haystack[end] if end < len(haystack) else None
+            separator_tail = (
+                digit_leading
+                and right in _NUMERIC_SEPARATORS
+                and end + 1 < len(haystack)
+                and haystack[end + 1].isdigit()
+            )
+            if not separator_tail:
+                if right is None or right not in _WORD_CHARS:
                     return True
+                if hex_class:
+                    # The next character is a word character: the token
+                    # anchors only if what follows is a longer all-hex word
+                    # (a sha prefix) and not a non-hex extension (`zz`,
+                    # `x`, `_`).
+                    i = end
+                    while i < len(haystack) and haystack[i] in _HEX_DIGITS:
+                        i += 1
+                    if i == len(haystack) or haystack[i] not in _WORD_CHARS:
+                        return True
         start = haystack.find(needle, start + 1)
     return False
 
@@ -118,32 +147,57 @@ def _digit_count(token: str) -> int:
 
 def _hard_tokens_with_class(text: str) -> list[tuple[str, str]]:
     """Internal: hard tokens paired with their class tag, in first-
-    appearance document order, de-duplicated by exact token string."""
+    appearance document order, de-duplicated by exact token string.
+
+    A NUMBER token whose span lies inside another emitted token's span (the
+    `1234` in `ob_1234`, the digit run in a hex sha, the year in a date) is
+    part of that token, not a separate count -- the same rule
+    s2_clause_check._clause_hard_tokens applies for M1. An all-digit
+    7+-character token is a number, not a hex sha (#4206: decimal digits
+    are hex digits, so the sha regex matches them too, and the sha class's
+    loose right side would re-open the 404-in-4040 defect one digit count
+    up).
+    """
     if not text:
         return []
 
-    candidates: list[tuple[int, str, str]] = []  # (start, token, class)
+    candidates: list[tuple[int, int, str, str]] = []  # (start, end, token, class)
 
     for m in _NODE_ID_RE.finditer(text):
-        candidates.append((m.start(), m.group(0), "node_id"))
+        candidates.append((m.start(), m.end(), m.group(0), "node_id"))
     for m in _ISSUE_REF_RE.finditer(text):
-        candidates.append((m.start(), m.group(0), "issue_ref"))
+        candidates.append((m.start(), m.end(), m.group(0), "issue_ref"))
     for m in _HEX_SHA_RE.finditer(text):
-        candidates.append((m.start(), m.group(0), _HEX_SHA_CLASS))
+        tok = m.group(0)
+        cls = "number" if tok.isdigit() else _HEX_SHA_CLASS
+        candidates.append((m.start(), m.end(), tok, cls))
     for m in _NUMBER_RE.finditer(text):
         tok = m.group(0)
         if _digit_count(tok) >= 3:
-            candidates.append((m.start(), tok, "number"))
+            candidates.append((m.start(), m.end(), tok, "number"))
     for m in _DATE_RE.finditer(text):
-        candidates.append((m.start(), m.group(0), "date"))
+        candidates.append((m.start(), m.end(), m.group(0), "date"))
     for m in _TIME_RE.finditer(text):
-        candidates.append((m.start(), m.group(0), "time"))
+        candidates.append((m.start(), m.end(), m.group(0), "time"))
+
+    # Span containment for NUMBER tokens only; endpoints may coincide (the
+    # numeric tail of `ob_1234` ends where the node id ends).
+    outer_spans = [(s, e) for s, e, _tok, cls in candidates if cls != "number"]
+    candidates = [
+        c
+        for c in candidates
+        if c[3] != "number"
+        or not any(
+            s <= c[0] and c[1] <= e and (s, e) != (c[0], c[1])
+            for s, e in outer_spans
+        )
+    ]
 
     candidates.sort(key=lambda c: c[0])
 
     seen: set[str] = set()
     ordered: list[tuple[str, str]] = []
-    for _start, tok, cls in candidates:
+    for _start, _end, tok, cls in candidates:
         if tok in seen:
             continue
         seen.add(tok)
@@ -161,7 +215,9 @@ def hard_tokens(text: str) -> list[str]:
                                  'owner/repo#123' cross-repo form is what
                                  matches; the owner/repo prefix is not
                                  part of the token)
-      3. hex shas             -- 7-40 hex characters
+      3. hex shas             -- 7-40 hex characters (all-decimal runs of
+                                 that length are classified as numbers,
+                                 so they take the strict boundary rule)
       4. numbers, >= 3 digits -- glued units are dropped by the regex
                                  boundary (19.3s -> 19.3, 82089B -> 82089);
                                  a comma-grouped number (5,121) counts its
