@@ -438,3 +438,22 @@ def test_g_tracked_backup_checker_sees_the_backup_name(tmp_path):
     assert _git(repo, "add", "-f", ".").returncode == 0
     assert sorted(core._tracked_binary_paths(repo)) == sorted(
         [PREFIX + "20260101T000000Z", PREFIX + "20260101T000000Z-2"])
+
+
+# ------------------------------------------------------------------ pin ---
+
+def test_pin_4705_db_open_regenerates_default_config_today(tmp_path):
+    """Pins TODAY's behaviour; engram#4705 removes it. The #4705 fix turns this
+    cell red on purpose and replaces it.
+
+    With a database present and config.json absent, one ``_get_db()`` open
+    re-creates config.json as the default config (identity keys blank)."""
+    server = _fresh_server(str(tmp_path))
+    import engram_core as core
+    server.engram_diagnose()  # one-time schema bootstrap creates the database
+    assert core.DB_PATH.exists()
+    core.CONFIG_PATH.unlink()
+    assert not core.CONFIG_PATH.exists()
+    core._get_db().close()
+    assert core.CONFIG_PATH.exists()
+    assert json.loads(core.CONFIG_PATH.read_text())["self_lineage"] == ""
