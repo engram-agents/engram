@@ -1624,9 +1624,16 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
     for failure in prior_failures:
         node_id = failure["node_id"]
 
-        # Skip if already classified as unfixable (structural parse failure)
-        if any(u["node_id"] == node_id for u in unfixable_items):
-            builder.add_failure(node_id, "retry output malformed beyond recovery")
+        # Skip if already classified as unfixable. The whole-output parse failure keeps
+        # its fixed final-payload text; a per-item entry (key conflict, #1967) records
+        # its own reason, so the final payload names the real cause.
+        unfixable_entry = next((u for u in unfixable_items if u["node_id"] == node_id), None)
+        if unfixable_entry is not None:
+            builder.add_failure(
+                node_id,
+                "retry output malformed beyond recovery" if parse_failed
+                else unfixable_entry["reason"],
+            )
             continue
 
         if node_id in retry_by_id:
