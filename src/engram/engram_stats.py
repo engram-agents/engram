@@ -568,6 +568,45 @@ def _backup_archive_view() -> dict:
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
+def _principle_cheapest_fix(ptype: str, nid: str) -> str:
+    """#4258: type-specific hint for an uncovered principle.
+
+    Names only actions that create one of the four channels principle_coverage
+    counts (registry_trigger, situation_pattern, warm_briefing_anchor,
+    claude_md), per the tool code: engram_register_exemplar writes an
+    `exemplifies` edge (lesson/cornerstone targets only) that the registry
+    rebuild turns into a registry_trigger; engram_update_lesson writes
+    situation_pattern (lessons only); engram_add_edge with `instantiates`
+    (axiom target) or `serves` (goal target) feeds the registry the same way.
+    The anchor line is the channel that works for every type.
+    """
+    anchor = f"add a one-line anchor naming {nid} to warm-briefing.md or ~/.claude/CLAUDE.md"
+    # Every tool takes one `payload_json` string; "payload fields:" names the
+    # keys of that JSON object, not positional arguments.
+    if ptype in ("lesson", "cornerstone"):
+        first = (
+            f"engram_register_exemplar(payload fields: target_id={nid}, exemplar_id=<a "
+            "claim-bearing node that shows the pattern>) writes a registry trigger"
+        )
+        if ptype == "lesson":
+            first += (
+                f"; or engram_update_lesson(payload fields: node_id={nid}, "
+                'updates={"situation_pattern": "<command-shape regex>"})'
+            )
+        return f"{first}; or {anchor}"
+    if ptype == "axiom":
+        return (
+            "engram_add_edge(payload fields: source_id=<a claim-bearing node that realizes it>, "
+            f"target_id={nid}, relation=instantiates) writes a registry trigger; or {anchor}"
+        )
+    if ptype == "goal":
+        return (
+            "engram_add_edge(payload fields: source_id=<a node that serves it>, "
+            f"target_id={nid}, relation=serves) writes a registry trigger; or {anchor}"
+        )
+    return anchor
+
+
 def _diagnose_impl() -> str:
     """Impl for engram_diagnose — callable for in-server callers.
 
@@ -1475,10 +1514,7 @@ def _diagnose_impl() -> str:
                         "id": nid,
                         "type": row["type"],
                         "claim": (row["claim"] or "")[:120],
-                        "cheapest_fix": (
-                            "register one exemplar (engram_register_exemplar / "
-                            "engram_lesson_register_incident)"
-                        ),
+                        "cheapest_fix": _principle_cheapest_fix(row["type"], nid),
                     })
 
             metrics["principle_coverage"] = {
