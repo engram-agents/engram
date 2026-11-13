@@ -27,6 +27,7 @@ atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 REASON = "keeps the class finding; replaces the account"
 NOTE = "why this incident fits"
+CITE_REASON = "cited for the measurement"
 
 
 def fresh_server():
@@ -73,6 +74,9 @@ def _seed(server):
     # edges without usable metadata, made by SQL on the tmp store
     hub = _axiom(server, "Hub node.")
     ids = {"old": old, "new": new, "cs": cs_id, "ex": ex, "hub": hub}
+    # a `cites` edge carrying a reason; no public tool writes one, so SQL
+    ids["citer"] = _axiom(server, "A claim that cites a source.")
+    ids["cited"] = _axiom(server, "A source that is cited.")
     cases = (("null", None), ("bad", "{not json"),
              ("list", "[1, 2]"), ("empty", "{}"))
     for name, _meta in cases:
@@ -85,6 +89,11 @@ def _seed(server):
                 "VALUES (?, ?, 'cites', '2026-01-01T00:00:00Z', ?)",
                 (hub, ids[name], meta),
             )
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at, metadata) "
+            "VALUES (?, ?, 'cites', '2026-01-01T00:00:00Z', ?)",
+            (ids["citer"], ids["cited"], json.dumps({"reason": CITE_REASON})),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -158,6 +167,30 @@ def test_get_neighbors_helper_renders_edge_metadata():
     finally:
         conn.close()
     e = _by_id(nbs, ids["old"], "neighbor_id")
+    assert e["edge_metadata"] == {"reason": REASON}
+
+
+def test_recall_view_cites_reason_in_contextual_neighbors():
+    # `cites` is a contextual relation: the recall view renders it through
+    # _trim_contextual, a different site from the logical groups.
+    s = fresh_server(); ids = _seed(s)
+    resp = _inspect(s, ids["citer"], "recall")
+    e = _by_id(resp["contextual_neighbors"], ids["cited"], "id")
+    assert e["relation"] == "cites"
+    assert e["edge_metadata"] == {"reason": CITE_REASON}
+
+
+def test_engram_query_neighbors_carry_edge_metadata():
+    # the public engram_query path (node["neighbors"]), not the helper alone.
+    # `neighbors` is only on the return_debug=True shape (the default tiered
+    # shape carries none), so that is the public surface that exposes it.
+    s = fresh_server(); ids = _seed(s)
+    r = _call(s, "engram_query", query="New claim alpha",
+              include_superseded=True, return_debug=True)
+    assert "error" not in r, r
+    node = _by_id(r["results"], ids["new"], "id")
+    e = _by_id(node["neighbors"], ids["old"], "neighbor_id")
+    assert e["relation"] == "supersedes"
     assert e["edge_metadata"] == {"reason": REASON}
 
 
