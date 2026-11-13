@@ -258,7 +258,8 @@ class TestRegistryPermissions4026:
 
         mode = stat.S_IMODE(os.stat(registry_dir / "borges.json").st_mode)
         assert mode & 0o040, f"registration file is not group-readable: {mode:o}"
-        assert mode == 0o664
+        assert mode & 0o020 == 0, "registration file is group-writable"
+        assert mode == 0o644
         assert status["registered"] is True
 
     def test_chmod_failure_is_soft_and_reported(self, tmp_path, monkeypatch):
@@ -301,3 +302,31 @@ class TestRegistryPermissions4026:
         assert status["file_path"] and os.path.exists(status["file_path"])
         assert status["dir_error"] is None
         assert status["file_error"] is None
+
+    def test_file_is_not_group_writable_but_dir_is_group_writable(
+        self, tmp_path, monkeypatch
+    ):
+        """#4026 security property: the DIRECTORY is shared, the FILE is not.
+
+        A group-writable directory is what lets each co-tenant create its own
+        registration file. A group-writable FILE would let any co-tenant
+        rewrite another agent's record, and that record feeds peer topology
+        and liveness — an impersonation surface for no benefit.
+        """
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+        _, registry_dir = _registry_pair(tmp_path)
+
+        mod.write_agent_registration("borges", registry_dir=str(registry_dir))
+
+        file_mode = stat.S_IMODE(os.stat(registry_dir / "borges.json").st_mode)
+        assert file_mode & 0o220 == 0o200, (
+            f"file must be owner-writable, not group-writable: {file_mode:o}"
+        )
+        assert file_mode & 0o020 == 0, f"file is group-writable: {file_mode:o}"
+        assert file_mode & 0o040, f"file is not group-readable: {file_mode:o}"
+
+        dir_mode = stat.S_IMODE(os.stat(registry_dir).st_mode)
+        assert dir_mode & 0o020, f"dir is not group-writable: {dir_mode:o}"
+        assert dir_mode & 0o2000, f"dir is not setgid: {dir_mode:o}"

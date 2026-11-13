@@ -1556,6 +1556,10 @@ def write_agent_registration(
     ``os.makedirs`` applies its ``mode`` THROUGH the process umask, and
     ``exist_ok=True`` never repairs a directory that already exists at the
     wrong mode, so a ``chmod`` is the only way the intent actually holds.
+    The shared directory ends up 0o2775 (group-writable, setgid) so each
+    co-tenant can create its own file; the registration file itself is
+    0o644 — group-readable, never group-writable, since a writable record
+    would let a co-tenant impersonate another agent in peer topology.
     Fails soft if the shared filesystem is absent or unwritable — this only
     matters when /home/agents-shared/ exists, and is a convenience, not a
     blocker. Never raises and never prints (the hook injects context on
@@ -1633,8 +1637,13 @@ def write_agent_registration(
     # A NEW temp file's creation mode follows the umask, so a 077 session lands
     # 0600 — group-unreadable, which defeats the registry. Assert the file
     # mode at the call site (#4026); atomic_write_json itself is unchanged.
+    # Group-READABLE but never group-writable: a group-writable <name>.json
+    # would let any co-tenant in `agents` rewrite another agent's record, and
+    # that record feeds peer topology and liveness. The shared DIRECTORY is
+    # group-writable (0o2775) so each agent can create its own file; the file
+    # itself needs no group write.
     try:
-        os.chmod(dest, 0o664)
+        os.chmod(dest, 0o644)
     except OSError as exc:
         status["file_error"] = f"could not set registration file mode: {exc}"
 
