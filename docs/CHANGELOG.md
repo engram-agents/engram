@@ -22,6 +22,11 @@ with an `-alpha` suffix during the alpha phase.
   release cut. `--json` gains `layers` and `unreferenced` keys; no key is
   removed. (#4358)
 
+### Docs
+- The install guide now says that an ACL or extended attribute on `~/.claude/settings.json` is lost during
+  install: measured for `claude plugin marketplace add` on one Mac and on Linux, and for a full
+  install on Linux (engram#4640, option 1).
+
 ## [v0.5.7] - 2026-11-12
 
 A patch release. Its reason is one guarantee: ENGRAM's setup (the installer,
