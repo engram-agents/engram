@@ -35,7 +35,7 @@ them: it was made by copying files, so git sees it as a separate line.
 | Tag | Example | Meaning |
 |---|---|---|
 | `vX.Y.Z` | `v0.5.6` | A release. From v0.5.6 on, it is a commit on `main`. For v0.5.5 and earlier, it is a commit on `release-snapshots`. |
-| `vX.Y.Z-rcN` | `v0.5.6-rc1` | A release candidate: a commit on `dev` that is being tested before it becomes the release. A release tag can sit on the same commit as its last candidate. |
+| `vX.Y.Z-rcN` | `v0.5.6-rc1` | A release candidate: a commit on the release branch `release/X.Y.Z` that is being tested before it becomes the release. The first candidate of a version is also a commit on `dev`, where the branch was cut; a later one, after a fix found in testing, is not. A release tag can sit on the same commit as its last candidate. |
 | `vX.Y.Z-history-twin` | `v0.5.5-history-twin` | For each release up to v0.5.5: the commit in the development history that the release was made from. Defined exactly below. |
 
 Version numbers follow [Semantic Versioning](https://semver.org/) below 1.0:
@@ -245,7 +245,9 @@ visible:
 ## From v0.5.6 on
 
 - Development happens on `dev`, in this repository.
-- A release candidate is a tag `vX.Y.Z-rcN` on `dev`.
+- A release candidate is a tag `vX.Y.Z-rcN` on the release branch
+  `release/X.Y.Z`, which is cut from `dev` (from v0.5.7 on; v0.5.6's candidates
+  were tags on `dev`).
 - A release moves `main` forward to the tested commit and tags it `vX.Y.Z`.
   `main` is protected on this repository against being rewritten or deleted,
   so from here on `git pull` on `main` keeps working from one release to the

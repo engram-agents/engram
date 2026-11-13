@@ -418,14 +418,16 @@ seat can run it and any other seat can check that it ran.
    pressing: `--match-head-commit` pins only the head, never the base, so without
    this check two owners can each pass a scratch run on the same base and the second
    presses on a tree it never tested (the 2026-09-13 jointly-broken case, Borges).
-   Every PR into `main`
-   (release cut, hotfix, reconcile) and a `main`→`dev` reconcile merge as a **merge
-   commit** (`docs/internal/RELEASING.md`); every other PR into `dev` squashes; a member of a
+   The release PR into `main` is **never merged with the button**: `main` is
+   fast-forwarded to its head (`docs/internal/RELEASING.md`, steps 6 to 8), and there
+   is no hotfix PR into `main`. A release branch that carries its own commits comes
+   back into `dev` as a **merge commit** (same page, step 10); every other PR into
+   `dev` squashes, and a soak-fix copy into `release/*` squashes; a member of a
    linked stack merges with `gh stack merge` (plain `gh pr merge` is refused there).
    On a repo with no `dev` branch (local-model-lab and gpu-broker, both read
-   2026-11-03), every PR targets `main` and merges as a **squash**. The merge-commit
-   rule above is engram's rule for release cuts, hotfixes and reconciles; it
-   does not apply there. Both of those repos set `squash_merge_commit_message` to
+   2026-11-03), every PR targets `main` and merges as a **squash**. The fast-forward
+   and merge-commit rules above are engram's rules for releases; they
+   do not apply there. Both of those repos set `squash_merge_commit_message` to
    `COMMIT_MESSAGES`, so the branch's commit messages ride into the squash and the
    close-keyword read covers them (CLAUDE.md § PR — issue closure, check 3).
 9. **On umwelt, merge does not promote** (Ariadne): prod promotion stays a separate,
