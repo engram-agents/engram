@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """tools/run_touched_tests.py — import-graph test selection for fast PR iteration.
 
-Two-layer deterministic, stateless, fail-open selection:
+Three-layer union, deterministic, stateless (#4358):
 
   Layer 1 — Static import graph:
-    AST-parse all tests/*.py and repo-root source modules per run (no stored
+    AST-parse all tests/*.py and every source module under the import roots
+    that tests/conftest.py puts on sys.path (derived by parsing conftest, never
+    a hand-written directory list; see `_import_roots`) per run (no stored
     state — a stale selection DB would itself be a silent-green axis). Build
     a reverse map from source module → all test files that transitively import
     it. Changed module → selected test set.
@@ -13,15 +15,33 @@ Two-layer deterministic, stateless, fail-open selection:
     Non-imported surfaces (hooks, skills, templates, shell scripts) are mapped
     via a checked-in JSON file. Entries map path prefixes / globs to test globs.
 
-  Fail-open triggers:
-    Any changed file unresolved by both layers → full suite.
+  Layer 3 — Name reference (ALWAYS runs; not a fallback):
+    Every changed file selects every tests/test_*.py whose text contains the
+    changed file's BASENAME (substring, `grep -F` style). It runs even when
+    layer 1 or 2 resolved the file: a test that only reads a file's text is
+    invisible to both of them. Basename, not path: over-selection is accepted
+    (it costs time, not coverage).
+
+  Guard set (GUARD_SET_TESTS):
+    The whole-tree guard tests of PR-MERGE-POLICY "Owner merge" item 4 run in
+    every non-full selection that has at least one changed file.
+
+  Full-suite triggers (unchanged):
     Changes to conftest.py, pytest.ini, requirements*, test-map.json itself,
-    or this script → full suite.
+    or this script → full suite. A convention-map entry marked
+    full_suite_fallback → full suite.
+
+  NO full-suite fallback for an unresolved file: a changed file that no layer
+  resolves selects nothing from that file and is printed BY NAME as
+  unreferenced; the guard set still runs.
 
 Output honesty (the green-is-not-ground-truth discipline):
   SUBSET green: prints "SUBSET green (N/TOTAL selected for M changed files) —
-    iteration signal, NOT a convergence claim. Full suite gates merge-readiness."
-  Full suite fallback: names the triggering file(s).
+    iteration signal, NOT a convergence claim. The full suite runs nightly on
+    dev and at the release cut."
+  Per-layer counts (L1 import graph, L2 map, L3 name reference, guard set) and
+  the unreferenced file names are printed with every selection.
+  Full suite trigger: names the triggering file(s).
 
 Usage:
   python3 tools/run_touched_tests.py [--base REF] [--full] [--dry-run]
@@ -61,6 +81,38 @@ ALWAYS_FULL_PATTERNS: list[str] = [
     "src/engram/packaging/test-map.json",
     "src/engram/tools/run_touched_tests.py",
 ]
+
+# The guard set: whole-tree guard tests that no changed file names, so layers
+# 1-3 never pick them (they enumerate or scan shipped files). Source of truth is
+# docs/internal/PR-MERGE-POLICY.md, "Owner merge" item 4 — copy from there, do
+# not invent members. tests/test_run_touched_tests_4358.py pins that every entry
+# exists in the tree, so this list cannot rot silently.
+#
+# NOT listed on purpose: tools/scan-leaks.py and tools/test_id_set_check.py are
+# named by that policy item but are scanners, not tests; they run outside this
+# tool (the merge seat runs them by hand / CI runs them).
+GUARD_SET_TESTS: tuple[str, ...] = (
+    "tests/test_syspath_shadow_guard.py",
+    "tests/test_tiers_manifest.py",
+    "tests/test_run_touched_tests.py",
+    "tests/test_ci_wiring_guard.py",
+    "tests/test_engramd_read_scan.py",
+    "tests/test_atomic_writer_modes_4013.py",
+    "tests/test_truncating_writes_ratchet_4380.py",
+    "tests/test_forum_process_spawn_ratchet_3518.py",
+    "tests/test_no_db_creation_before_bootstrap_4107.py",
+    "tests/test_no_unbounded_upward_walks_3983.py",
+    "tests/test_prose_home_sweep_3863.py",
+    "tests/test_prose_tail_6c_venv.py",
+    "tests/test_raw_home_read_gate_3863.py",
+    "tests/test_home_path_gate.py",
+    "tests/test_lesson_pattern_audit_shipped_3941.py",
+    "tests/test_docs_layout_guard.py",
+    "tests/test_metadata_parse_drift_guard_3413.py",
+    "tests/test_json_extract_metadata_guard_3485.py",
+    "tests/test_no_retired_cascade_store_asserts.py",
+    "tests/test_forum_redirect_origin_1459.py",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -172,12 +224,127 @@ def _parse_imports(path: str) -> set[str]:
     return imports
 
 
+def _eval_path_expr(node: ast.AST, env: dict[str, str]) -> str | None:
+    """Evaluate a conftest path expression without importing or executing it.
+
+    Supports string constants, names bound earlier, ``__file__`` (seeded in
+    *env*), and ``os.path.join/dirname/abspath/realpath/normpath`` calls.
+    Returns None for anything else (an unevaluable expression is skipped, never
+    guessed).
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return env.get(node.id)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "os"
+        and node.func.value.attr == "path"
+    ):
+        fn = node.func.attr
+        args = [_eval_path_expr(a, env) for a in node.args]
+        if any(a is None for a in args) or not args:
+            return None
+        if fn == "join":
+            return os.path.join(*args)  # type: ignore[arg-type]
+        if fn == "dirname" and len(args) == 1:
+            return os.path.dirname(args[0])  # type: ignore[arg-type]
+        if fn in ("abspath", "realpath", "normpath") and len(args) == 1:
+            return os.path.normpath(args[0])  # type: ignore[arg-type]
+    return None
+
+
+def _import_roots(repo_root: str) -> list[str]:
+    """Return the import roots the tests actually use (#4358).
+
+    Derived by parsing ``tests/conftest.py`` (ast only — no import, no exec):
+    every ``sys.path.insert(i, X)`` / ``sys.path.append(X)`` whose argument
+    evaluates to an existing directory inside the repo is a root, in the order
+    conftest adds them.  If conftest is absent, unparseable or yields nothing,
+    the repo root alone is used (the pre-#4358 behaviour for repos with no
+    conftest).  If conftest's roots change, discovery follows — there is no
+    hand-written directory list here.
+    """
+    repo = os.path.abspath(repo_root)
+    conftest = os.path.join(repo, TESTS_DIR, "conftest.py")
+    try:
+        with open(conftest, encoding="utf-8", errors="replace") as f:
+            tree = ast.parse(f.read(), filename=conftest)
+    except (SyntaxError, OSError):
+        return [repo]
+
+    # Resolve simple `NAME = <path expr>` bindings; repeat so use-before-def
+    # order inside the walk (BFS) cannot hide a binding.
+    env: dict[str, str] = {"__file__": conftest}
+    assigns = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name)
+    ]
+    for _ in range(len(assigns) + 1):
+        progressed = False
+        for n in assigns:
+            name = n.targets[0].id  # type: ignore[union-attr]
+            if name in env:
+                continue
+            val = _eval_path_expr(n.value, env)
+            if val is not None:
+                env[name] = val
+                progressed = True
+        if not progressed:
+            break
+
+    roots: list[str] = []
+    for n in ast.walk(tree):
+        if not (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in ("insert", "append")
+            and isinstance(n.func.value, ast.Attribute)
+            and n.func.value.attr == "path"
+            and isinstance(n.func.value.value, ast.Name)
+            and n.func.value.value.id == "sys"
+        ):
+            continue
+        arg = n.args[-1] if n.args else None
+        if n.func.attr == "insert" and len(n.args) != 2:
+            continue
+        val = _eval_path_expr(arg, env) if arg is not None else None
+        if val is None:
+            continue
+        val = os.path.normpath(val)
+        inside = val == repo or val.startswith(repo + os.sep)
+        if inside and os.path.isdir(val) and val not in roots:
+            roots.append(val)
+    return roots or [repo]
+
+
+def _module_dirs(repo_root: str) -> list[str]:
+    """Directories whose ``*.py`` files are importable by stem in the tests.
+
+    Each import root, plus its ``tools/`` sub-directory (the ``tools`` package
+    is also put on the path by the tests that ``import baton`` directly).
+    """
+    dirs: list[str] = []
+    for root in _import_roots(repo_root):
+        for d in (root, os.path.join(root, "tools")):
+            if os.path.isdir(d) and d not in dirs:
+                dirs.append(d)
+    return dirs
+
+
 def _discover_repo_modules(repo_root: str) -> set[str]:
     """Return the set of Python module stems defined in the repo.
 
-    Scans:
-      - Root-level *.py files  (stem = module name)
-      - tools/*.py files       (stem also importable after conftest sys.path setup)
+    Scans ``*.py`` in every directory of `_module_dirs` (each import root that
+    tests/conftest.py puts on sys.path, plus that root's ``tools/``).  Before
+    #4358 this scanned only ``<repo>/*.py`` and ``<repo>/tools/*.py`` — a layout
+    from before the sources moved under ``src/`` — which left layer 1 blind to
+    every ``src/engram`` module.
 
     NOTE — L1 is effectively inert for `from tools.X import ...` style imports.
     When a test writes `from tools.ia import ...`, AST parsing yields top-level
@@ -190,22 +357,14 @@ def _discover_repo_modules(repo_root: str) -> set[str]:
     key reachable for tools/engine/*.py and tools/migration/*.py changes.
     """
     modules: set[str] = set()
-
-    # Root-level .py modules
-    for p in Path(repo_root).glob("*.py"):
-        modules.add(p.stem)
-
-    # tools/*.py — conftest adds repo_root to sys.path; tools is a package too.
-    # Filter "__init__" — it is never a useful lookup key (no test imports __init__)
-    # and adding it to repo_module_stems pollutes module_deps with a dead entry.
-    tools_dir = Path(repo_root) / "tools"
-    if tools_dir.is_dir():
-        for p in tools_dir.glob("*.py"):
+    for d in _module_dirs(repo_root):
+        for p in Path(d).glob("*.py"):
+            # "__init__" is never a useful lookup key (no test imports it) and
+            # would pollute module_deps with a dead entry.
             if p.stem != "__init__":
                 modules.add(p.stem)
-        if (tools_dir / "__init__.py").exists():
+        if os.path.basename(d) == "tools" and (Path(d) / "__init__.py").exists():
             modules.add("tools")
-
     return modules
 
 
@@ -219,7 +378,7 @@ def _path_to_module_stem(path: str) -> str | None:
     return None
 
 
-def _package_root_stem(path: str) -> str | None:
+def _package_root_stem(path: str, roots_rel: tuple[str, ...] = ("",)) -> str | None:
     """Return the top-level package stem for files in a tools sub-package.
 
     tools/engine/build.py    → "tools"
@@ -227,23 +386,39 @@ def _package_root_stem(path: str) -> str | None:
     tools/ia.py              → None  (direct tools/ file; stem "ia" is the key)
     hooks/claude/foo.py      → None  (not a tools sub-package)
 
+    *roots_rel* are the import roots relative to the repo root ("" = the repo
+    root itself; "src/engram" under today's conftest), so
+    src/engram/tools/engine/build.py → "tools" as well (#4358).  The default
+    keeps the single-root behaviour for callers that pass only a path.
+
     Used as a fallback L1 lookup when the changed file's own stem is absent from
     import_graph.  import_graph["tools"] accumulates every test that does a
     `from tools.X import ...` — including all four test_engine_* suites.  A
     tools sub-package file change (tools/engine/build.py → stem "build", which
     is absent from import_graph) therefore finds its tests via this fallback.
     """
-    parts = Path(path).parts
-    # Sub-package files have at least 3 parts: ("tools", "<subdir>", "<file>.py")
-    if len(parts) >= 3 and parts[0] == "tools" and path.endswith(".py"):
-        return "tools"
+    if not path.endswith(".py"):
+        return None
+    for rel in roots_rel:
+        rel = rel.strip("/")
+        if rel:
+            if not path.startswith(rel + "/"):
+                continue
+            sub = path[len(rel) + 1 :]
+        else:
+            sub = path
+        parts = Path(sub).parts
+        # Sub-package files have at least 3 parts: ("tools", "<subdir>", "<file>.py")
+        if len(parts) >= 3 and parts[0] == "tools":
+            return "tools"
     return None
 
 
 def _build_import_graph(repo_root: str) -> dict[str, set[str]]:
     """Build the reverse import graph: module_stem → set of test files.
 
-    Parses all tests/test_*.py files and all repo source modules.  Follows
+    Parses all tests/test_*.py files and all source modules under the import roots
+    (`_module_dirs`).  Follows
     transitive deps so that if test_foo imports module_a and module_a imports
     module_b, changing module_b also selects test_foo.
 
@@ -262,20 +437,14 @@ def _build_import_graph(repo_root: str) -> dict[str, set[str]]:
         raw = _parse_imports(str(tf))
         test_direct[rel] = raw & repo_module_stems
 
-    # Map: module_stem → directly-imported repo module stems (for transitive walk)
+    # Map: module_stem → directly-imported repo module stems (for transitive walk).
+    # Same stem in two directories (e.g. a repo-root tools/ symlink and its
+    # src/engram/tools target): union the deps rather than let one overwrite.
     module_deps: dict[str, set[str]] = {}
-
-    for p in Path(repo_root).glob("*.py"):
-        stem = p.stem
-        raw = _parse_imports(str(p))
-        module_deps[stem] = raw & repo_module_stems
-
-    tools_dir = Path(repo_root) / "tools"
-    if tools_dir.is_dir():
-        for p in tools_dir.glob("*.py"):
-            stem = p.stem
+    for d in _module_dirs(repo_root):
+        for p in Path(d).glob("*.py"):
             raw = _parse_imports(str(p))
-            module_deps[stem] = raw & repo_module_stems
+            module_deps.setdefault(p.stem, set()).update(raw & repo_module_stems)
 
     # Compute transitive closure for a module stem
     def _transitive_deps(stem: str, visited: set[str] | None = None) -> set[str]:
@@ -458,12 +627,48 @@ def _matches_full_trigger(changed_file: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _name_reference_hits(
+    changed_files: list[str], repo_root: str
+) -> dict[str, set[str]]:
+    """Layer 3: changed file → tests/test_*.py whose text contains its basename.
+
+    Substring match on the BASENAME (``grep -F`` style), deliberately not the
+    repo-relative path: tests build paths (no test spells out
+    ``engram-nap/SKILL.md``), so a path match under-selects.  Generic basenames
+    over-select; that costs time, not coverage.  Each test file is read once.
+    """
+    tests_dir = Path(repo_root) / TESTS_DIR
+    hits: dict[str, set[str]] = {cf: set() for cf in changed_files}
+    if not tests_dir.is_dir() or not changed_files:
+        return hits
+    names = {cf: os.path.basename(cf) for cf in changed_files}
+    for tf in sorted(tests_dir.glob("test_*.py")):
+        try:
+            text = tf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = str(tf.relative_to(repo_root))
+        for cf, name in names.items():
+            if name and name in text:
+                hits[cf].add(rel)
+    return hits
+
+
+def _empty_detail(detail: dict | None) -> None:
+    if detail is not None:
+        detail["layers"] = {
+            "l1_import_graph": 0, "l2_map": 0, "l3_name_reference": 0, "guard_set": 0,
+        }
+        detail["unreferenced"] = []
+
+
 def select_tests(
     changed_files: list[str],
     repo_root: str,
     verbose: bool = False,
+    detail: dict | None = None,
 ) -> tuple[list[str], bool, list[str], set[str]]:
-    """Two-layer selection pipeline.
+    """Three-layer union selection pipeline (+ the guard set).
 
     Returns:
       (selected_test_paths, is_full_suite, full_suite_reasons, map_selected)
@@ -474,8 +679,21 @@ def select_tests(
     map_selected: subset of selected_test_paths that were reached via layer-2
       convention map.  Used by the banner split to attribute the ``map-residue``
       bucket without re-deriving selection attribution.
+
+    If *detail* is a dict it is filled in place with additive diagnostics (the
+    return shape stays the 4-tuple):
+      detail["layers"]       {"l1_import_graph", "l2_map", "l3_name_reference",
+                              "guard_set"} — per-layer selected-test counts
+                              (layers overlap; they are not a partition)
+      detail["unreferenced"] changed files no layer resolved, by name
+
+    An unresolved file no longer triggers the full suite (#4358): it selects
+    nothing from that file, is reported as unreferenced, and the guard set
+    still runs.  An empty change list returns ([], False, [], set()) with no
+    guard set — "nothing changed" keeps its pre-#4358 meaning.
     """
     full_suite_reasons: list[str] = []
+    _empty_detail(detail)
 
     # Phase 0: always-full triggers (conftest, pytest.ini, requirements, self, map)
     for cf in changed_files:
@@ -490,11 +708,22 @@ def select_tests(
 
     # Build layer-1 reverse import graph (stateless per run)
     import_graph = _build_import_graph(repo_root)
+    repo_norm = os.path.abspath(repo_root)
+    roots_rel = tuple(
+        "" if r == repo_norm else os.path.relpath(r, repo_norm).replace(os.sep, "/")
+        for r in _import_roots(repo_root)
+    )
 
     # Load layer-2 convention map
     test_map = _load_test_map(repo_root)
 
+    # Layer 3: name reference — always runs, for every changed file
+    name_hits = _name_reference_hits(changed_files, repo_root)
+
     selected: set[str] = set()
+    l1_all: set[str] = set()
+    l2_all: set[str] = set()
+    l3_all: set[str] = set()
     # Track files reached ONLY via layer-2 convention map.  A file that is
     # reached by BOTH layers is attributed to layer-1 (import graph), which
     # is the more specific attribution for banner-split purposes.
@@ -510,6 +739,7 @@ def select_tests(
         if stem and stem in import_graph:
             l1_hits = import_graph[stem]
             selected |= l1_hits
+            l1_all |= l1_hits
             resolved = True
             if verbose:
                 print(f"  [L1] {cf} → {len(l1_hits)} test(s) via import graph")
@@ -517,10 +747,11 @@ def select_tests(
             # Fallback: for tools sub-package files (tools/engine/build.py → stem
             # "build", absent from graph), check the package root key "tools".
             # import_graph["tools"] holds all tests that import any tools.* module.
-            pkg_root = _package_root_stem(cf)
+            pkg_root = _package_root_stem(cf, roots_rel)
             if pkg_root and pkg_root in import_graph:
                 l1_hits = import_graph[pkg_root]
                 selected |= l1_hits
+                l1_all |= l1_hits
                 resolved = True
                 if verbose:
                     print(
@@ -539,10 +770,23 @@ def select_tests(
             # Only attribute to map-only when L1 did not already reach the file.
             map_only_selected |= map_tests - l1_hits
             selected |= map_tests
+            l2_all |= map_tests
             resolved = True
             if verbose:
                 print(
                     f"  [L2] {cf} → {len(map_tests)} test(s) from convention map"
+                )
+
+        # — Layer 3: name reference (always runs; union with L1/L2) —
+        l3_hits = name_hits.get(cf, set())
+        if l3_hits:
+            selected |= l3_hits
+            l3_all |= l3_hits
+            resolved = True
+            if verbose:
+                print(
+                    f"  [L3] {cf} → {len(l3_hits)} test(s) naming "
+                    f'"{os.path.basename(cf)}"'
                 )
 
         # — Direct: changed file IS a test file —
@@ -562,12 +806,15 @@ def select_tests(
 
         if not resolved:
             unresolved.append(cf)
+            if verbose:
+                print(f"  [unreferenced] {cf} → no layer resolves it")
 
-    if unresolved:
-        full_suite_reasons.extend(
-            f"unresolved by both layers: {cf}" for cf in unresolved
-        )
-        return [], True, full_suite_reasons, set()
+    # Guard set: always runs (skipped quietly when an entry is absent from the
+    # tree; tests/test_run_touched_tests_4358.py fails if the constant rots).
+    guard = {
+        g for g in GUARD_SET_TESTS if os.path.exists(os.path.join(repo_root, g))
+    }
+    selected |= guard
 
     # Filter to only existing files
     existing = [
@@ -579,6 +826,15 @@ def select_tests(
     # map_only_selected constrained to files that actually exist
     existing_set = set(existing)
     map_selected_existing = map_only_selected & existing_set
+
+    if detail is not None:
+        detail["layers"] = {
+            "l1_import_graph": len(l1_all & existing_set),
+            "l2_map": len(l2_all & existing_set),
+            "l3_name_reference": len(l3_all & existing_set),
+            "guard_set": len(guard),
+        }
+        detail["unreferenced"] = list(unresolved)
 
     return existing, False, [], map_selected_existing
 
@@ -594,6 +850,30 @@ def _count_total_test_files(repo_root: str) -> int:
     if not tests_dir.is_dir():
         return 0
     return len(list(tests_dir.glob("test_*.py")))
+
+
+_FULL_SUITE_NOTE = (
+    "The full suite runs nightly on dev and at the release cut."
+)
+
+
+def _layer_lines(detail: dict) -> list[str]:
+    """Human lines for the per-layer counts and the unreferenced files."""
+    lay = detail.get("layers") or {}
+    lines = [
+        "[layers] "
+        f"L1 import graph: {lay.get('l1_import_graph', 0)} | "
+        f"L2 map: {lay.get('l2_map', 0)} | "
+        f"L3 name reference: {lay.get('l3_name_reference', 0)} | "
+        f"guard set: {lay.get('guard_set', 0)}"
+    ]
+    unref = detail.get("unreferenced") or []
+    if unref:
+        lines.append(
+            f"[unreferenced] {len(unref)} changed file(s) no layer resolves "
+            "(no test imports, maps, or names them): " + ", ".join(unref)
+        )
+    return lines
 
 
 def _classify_selection(
@@ -750,6 +1030,15 @@ def _audit_patches(
 # ---------------------------------------------------------------------------
 
 
+_EMPTY_LAYERS = {
+    "l1_import_graph": 0, "l2_map": 0, "l3_name_reference": 0, "guard_set": 0,
+}
+
+
+def _empty_extra() -> dict:
+    return {"layers": dict(_EMPTY_LAYERS), "unreferenced": []}
+
+
 def _emit_json_selection(args, repo_root: str) -> int:
     """Emit the touched-test selection as a single JSON object on stdout.
 
@@ -765,8 +1054,14 @@ def _emit_json_selection(args, repo_root: str) -> int:
           "full_reasons":     [<trigger descriptions when full>],
           "selected":         [<test files>; [] when full or none>],
           "total_test_files": <int>,
-          "buckets":          {"internals": N, "contract": N, "map_residue": N}
+          "buckets":          {"internals": N, "contract": N, "map_residue": N},
+          "layers":           {"l1_import_graph": N, "l2_map": N,
+                               "l3_name_reference": N, "guard_set": N},
+          "unreferenced":     [<changed files no layer resolved>]
         }
+
+    "layers" and "unreferenced" were added in #4358 (additive; no key removed).
+    Layer counts overlap (they are not a partition of "selected").
 
     full=true means the convergence-gate whole suite is selected (selected is []
     then — the consumer runs `pytest tests/`, not the listed subset). Buckets are
@@ -781,20 +1076,27 @@ def _emit_json_selection(args, repo_root: str) -> int:
             "base": args.base, "changed_files": [], "full": True,
             "full_reasons": ["--full flag"], "selected": [],
             "total_test_files": total_test_files, "buckets": empty_buckets,
+            **_empty_extra(),
         }
         print(json.dumps(out))
         return 0
 
     changed = _changed_files(args.base, repo_root)
+    detail: dict = {}
     selected, is_full, reasons, map_selected = select_tests(
-        changed, repo_root, verbose=False
+        changed, repo_root, verbose=False, detail=detail
     )
+    extra = {
+        "layers": detail.get("layers") or dict(_EMPTY_LAYERS),
+        "unreferenced": detail.get("unreferenced") or [],
+    }
 
     if is_full:
         out = {
             "base": args.base, "changed_files": changed, "full": True,
             "full_reasons": reasons, "selected": [],
             "total_test_files": total_test_files, "buckets": empty_buckets,
+            **extra,
         }
         print(json.dumps(out))
         return 0
@@ -817,6 +1119,7 @@ def _emit_json_selection(args, repo_root: str) -> int:
         "base": args.base, "changed_files": changed, "full": False,
         "full_reasons": [], "selected": selected,
         "total_test_files": total_test_files, "buckets": buckets,
+        **extra,
     }
     print(json.dumps(out))
     return 0
@@ -980,8 +1283,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {cf}")
 
     # Run selection pipeline
+    detail: dict = {}
     selected, is_full, reasons, map_selected = select_tests(
-        changed, repo_root, verbose=args.dry_run
+        changed, repo_root, verbose=args.dry_run, detail=detail
     )
 
     if is_full:
@@ -1011,9 +1315,11 @@ def main(argv: list[str] | None = None) -> int:
         msg = (
             f"SUBSET green (0/{total_test_files} selected for "
             f"{len(changed)} changed files) — iteration signal, NOT a "
-            "convergence claim. Full suite gates merge-readiness."
+            f"convergence claim. {_FULL_SUITE_NOTE}"
         )
         print("[run_touched_tests] no tests selected (no changed files resolve to tests)")
+        for line in _layer_lines(detail):
+            print(line)
         print(msg)
         return 0
 
@@ -1022,7 +1328,7 @@ def main(argv: list[str] | None = None) -> int:
     subset_msg = (
         f"SUBSET green ({n_selected}/{total_test_files} selected for "
         f"{n_changed} changed files) — iteration signal, NOT a convergence claim. "
-        "Full suite gates merge-readiness."
+        f"{_FULL_SUITE_NOTE}"
     )
     n_internals, n_contract, n_map_residue = _classify_selection(
         selected, map_selected, allowlist
@@ -1032,14 +1338,20 @@ def main(argv: list[str] | None = None) -> int:
         f"{n_internals} internals + {n_contract} contract + {n_map_residue} map-residue"
     )
 
+    layer_lines = _layer_lines(detail)
+
     if args.dry_run:
         print(f"\n[run_touched_tests] would run {n_selected}/{total_test_files} test files:")
         for tf in selected:
             print(f"  {tf}")
         print(f"\n{subset_msg}")
         print(bucket_line)
+        for line in layer_lines:
+            print(line)
         return 0
 
+    for line in layer_lines:
+        print(line)
     cmd = [sys.executable, "-m", "pytest"] + selected + passthrough
     rc = subprocess.run(cmd, cwd=repo_root).returncode
 
