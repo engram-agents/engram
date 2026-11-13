@@ -59,7 +59,7 @@ class ConfigUnreadableError(ValueError):
         )
 
 
-def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = True) -> None:
+def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = True, mode=None) -> None:
     """Atomically replace ``path`` with ``text`` (#4013).  The one shared
     mode- and group-preserving writer: an existing file keeps its permission
     bits and, where permitted, its group; a new file gets what ``write_text``
@@ -71,7 +71,11 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     REGULAR file, never from a link's target.  Pass ``follow_symlinks=False`` for any path under a
     directory other users can write (a planted link would otherwise redirect the write); the default
     True exists for paths the caller owns and links on purpose, such as config.json via
-    ``write_config_json``.  Needs write access to the containing directory (same-UID
+    ``write_config_json``.  ``mode``, when given, is applied with fchmod to the
+    TEMP file before the atomic rename (#4682) — so a caller placing a file in a
+    directory other users can write never needs a post-replace chmod that an
+    attacker could redirect through a swapped link.  Needs write access to the
+    containing directory (same-UID
     callers).  On any error the temp file is removed and the error re-raised;
     ``path`` is never left partial.  Kept AST-identical with
     ``hooks/claude/_hooklib.atomic_write_text`` (tests/test_atomic_writer_modes_4013.py)."""
@@ -106,6 +110,8 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
                 except PermissionError:
                     pass  # not a member of that group: the new inode keeps its own
                 os.fchmod(fh.fileno(), stat.S_IMODE(st.st_mode))
+            if mode is not None:
+                os.fchmod(fh.fileno(), mode)
         os.replace(tmp, target)
     except BaseException:
         try:

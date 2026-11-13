@@ -385,7 +385,7 @@ def is_own_server_py_running(engram_home: str) -> bool:
         return False
 
 
-def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = True) -> None:
+def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = True, mode=None) -> None:
     """Atomically replace ``path`` with ``text`` (#4013).  The one shared
     mode- and group-preserving writer: an existing file keeps its permission
     bits and, where permitted, its group; a new file gets what ``write_text``
@@ -397,7 +397,11 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     REGULAR file, never from a link's target.  Pass ``follow_symlinks=False`` for any path under a
     directory other users can write (a planted link would otherwise redirect the write); the default
     True exists for paths the caller owns and links on purpose, such as config.json via
-    ``write_config_json``.  Needs write access to the containing directory (same-UID
+    ``write_config_json``.  ``mode``, when given, is applied with fchmod to the
+    TEMP file before the atomic rename (#4682) — so a caller placing a file in a
+    directory other users can write never needs a post-replace chmod that an
+    attacker could redirect through a swapped link.  Needs write access to the
+    containing directory (same-UID
     callers).  On any error the temp file is removed and the error re-raised;
     ``path`` is never left partial.  Duplicated here because this module must
     stay self-contained; kept AST-identical with
@@ -433,6 +437,8 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
                 except PermissionError:
                     pass  # not a member of that group: the new inode keeps its own
                 os.fchmod(fh.fileno(), stat.S_IMODE(st.st_mode))
+            if mode is not None:
+                os.fchmod(fh.fileno(), mode)
         os.replace(tmp, target)
     except BaseException:
         try:
@@ -442,7 +448,7 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
         raise
 
 
-def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks=False):
+def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks=False, mode=None):
     """Write JSON atomically through `atomic_write_text`: build the content in a
     temp file in the SAME directory, fsync it, then os.replace() it over the
     destination.
@@ -484,7 +490,10 @@ def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks
 
     `indent` is passed to `json.dumps`; `encoding` is passed to
     `atomic_write_text`, which opens the temp file with it (None, the default
-    here, means the locale default, as a bare open() would). Extend the
+    here, means the locale default, as a bare open() would). `mode`, when
+    given, is applied to the temp file before the atomic replace (#4682):
+    use it for a file in a directory other users can write, so no
+    post-replace chmod can be redirected through a swapped link. Extend the
     signature to fit a call site's real need rather than working around a
     mismatch with a post-write patch.
 
@@ -497,7 +506,7 @@ def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks
         own mode rather than keeping the existing file's).
     """
     atomic_write_text(path, json.dumps(data, indent=indent), encoding=encoding,
-                      follow_symlinks=follow_symlinks)
+                      follow_symlinks=follow_symlinks, mode=mode)
 
 
 # ---------------------------------------------------------------------------

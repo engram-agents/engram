@@ -135,13 +135,13 @@ class TestWriteAgentRegistration:
         # Nothing was written
         assert not registry_dir.exists()
 
-    def test_no_op_on_unwritable_registry_dir(self, tmp_path, monkeypatch):
-        """An unwritable registry dir causes a silent no-op (no raise).
+    def test_no_op_on_chmod_eperm(self, tmp_path, monkeypatch):
+        """A registry dir whose mode we cannot change (another agent's) is a no-op.
 
         #4026: an existing directory WE own is repaired by the mode assertion, so
-        the remaining unwritable case is a chmod we are not allowed to make (the
+        the remaining unwritable case is an fchmod we are not allowed to make (the
         dir belongs to another agent -> EPERM). Simulate that, leaving the dir at
-        0o555 so the write itself still fails.
+        0o555 so the write itself still fails. No raise, nothing registered.
         """
         if os.getuid() == 0:
             pytest.skip("root bypasses permission checks")
@@ -156,14 +156,14 @@ class TestWriteAgentRegistration:
         registry_dir.mkdir(mode=0o555)  # read + execute, no write
         os.chmod(registry_dir, 0o555)
 
-        real_chmod = os.chmod
+        real_fchmod, real_fstat = os.fchmod, os.fstat
 
-        def _deny_dir_chmod(path, mode, *args, **kwargs):
-            if os.path.abspath(path) == os.path.abspath(str(registry_dir)):
+        def _deny_dir_fchmod(fd, mode, *args, **kwargs):
+            if stat.S_ISDIR(real_fstat(fd).st_mode):
                 raise PermissionError("simulated: registry dir belongs to another agent")
-            return real_chmod(path, mode, *args, **kwargs)
+            return real_fchmod(fd, mode, *args, **kwargs)
 
-        monkeypatch.setattr(mod.os, "chmod", _deny_dir_chmod)
+        monkeypatch.setattr(mod.os, "fchmod", _deny_dir_fchmod)
         try:
             # Must not raise
             status = mod.write_agent_registration(
@@ -172,9 +172,10 @@ class TestWriteAgentRegistration:
             # No file written
             assert not (registry_dir / "borges.json").exists()
             assert status["registered"] is False
+            assert status["dir_error"]
         finally:
-            # Restore chmod (and perms) so tmp_path cleanup succeeds
-            monkeypatch.setattr(mod.os, "chmod", real_chmod)
+            # Restore fchmod (and perms) so tmp_path cleanup succeeds
+            monkeypatch.setattr(mod.os, "fchmod", real_fchmod)
             registry_dir.chmod(0o755)
 
     def test_no_op_on_empty_agent_name(self, tmp_path, monkeypatch):
@@ -221,7 +222,7 @@ class TestRegistryPermissions4026:
         finally:
             os.umask(old_umask)
 
-        assert os.stat(registry_dir).st_mode & 0o7770 == 0o2770
+        assert stat.S_IMODE(os.stat(registry_dir).st_mode) == 0o2775
         file_st = os.stat(registry_dir / "borges.json")
         assert file_st.st_mode & 0o040, "registration file is not group-readable"
         assert status["registered"] is True
@@ -276,10 +277,14 @@ class TestRegistryPermissions4026:
         registry_dir.mkdir()
         os.chmod(registry_dir, 0o2775)
 
-        def _deny_chmod(*args, **kwargs):
-            raise PermissionError("simulated: not the registry dir's owner")
+        real_fchmod, real_fstat = os.fchmod, os.fstat
 
-        monkeypatch.setattr(mod.os, "chmod", _deny_chmod)
+        def _deny_dir_fchmod(fd, mode, *args, **kwargs):
+            if stat.S_ISDIR(real_fstat(fd).st_mode):
+                raise PermissionError("simulated: not the registry dir's owner")
+            return real_fchmod(fd, mode, *args, **kwargs)
+
+        monkeypatch.setattr(mod.os, "fchmod", _deny_dir_fchmod)
 
         status = mod.write_agent_registration("borges", registry_dir=str(registry_dir))
 
@@ -330,3 +335,127 @@ class TestRegistryPermissions4026:
         dir_mode = stat.S_IMODE(os.stat(registry_dir).st_mode)
         assert dir_mode & 0o020, f"dir is not group-writable: {dir_mode:o}"
         assert dir_mode & 0o2000, f"dir is not setgid: {dir_mode:o}"
+
+    def test_symlinked_registry_dir_is_not_followed(self, tmp_path, monkeypatch):
+        """#4682: a planted `agents` symlink must not be chmodded or written through.
+
+        /home/agents-shared is group-writable, so any group member can create the
+        `agents` entry pointing at a directory the hook's user owns. A path-based
+        chmod follows it and widens the VICTIM's directory; the registration write
+        would land inside it too. Both must be refused, and reported.
+        """
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+
+        shared_root, registry_dir = _registry_pair(tmp_path)
+        victim = tmp_path / "victim-dir"
+        victim.mkdir()
+        os.chmod(victim, 0o700)
+        os.symlink(victim, registry_dir)
+
+        status = mod.write_agent_registration("borges", registry_dir=str(registry_dir))
+
+        assert stat.S_IMODE(os.stat(victim).st_mode) == 0o700, (
+            "the victim directory's mode was widened through the planted symlink"
+        )
+        assert os.listdir(victim) == [], "a registration file was written through the symlink"
+        assert status["registered"] is False
+        assert status["dir_mode"] is None
+        assert isinstance(status["dir_error"], str) and status["dir_error"]
+
+    def test_dir_mode_mismatch_is_reported(self, tmp_path, monkeypatch):
+        """#4682: the read-back mode is checked against 0o2775, not assumed.
+
+        POSIX may silently drop the setgid bit for a caller that is not a member
+        of the directory's group; that must report an error, not success.
+        """
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+        _, registry_dir = _registry_pair(tmp_path)
+
+        def _noop_fchmod(fd, mode, *args, **kwargs):
+            return None
+
+        monkeypatch.setattr(mod.os, "fchmod", _noop_fchmod)
+
+        old_umask = os.umask(0o022)
+        try:
+            status = mod.write_agent_registration(
+                "borges", registry_dir=str(registry_dir)
+            )
+        finally:
+            os.umask(old_umask)
+
+        # makedirs' 0o2775 goes through the umask (and the kernel may drop
+        # setgid); the no-op fchmod leaves whatever was created.
+        actual = stat.S_IMODE(os.stat(registry_dir).st_mode)
+        assert actual != 0o2775, "precondition: the no-op fchmod left the wrong mode"
+        assert status["dir_mode"] == actual
+        assert isinstance(status["dir_error"], str) and status["dir_error"]
+        assert "expected" in status["dir_error"]
+        assert status["registered"] is True
+
+    def test_file_fchmod_failure_is_reported(self, tmp_path, monkeypatch):
+        """#4682: the file's mode is set on the temp file before the atomic replace.
+
+        If that fchmod fails, the temp file is removed and the write fails, so the
+        call reports file_error and registers nothing (no post-replace chmod to
+        fail independently).
+        """
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+        _, registry_dir = _registry_pair(tmp_path)
+
+        real_fchmod, real_fstat = os.fchmod, os.fstat
+
+        def _deny_file_fchmod(fd, mode, *args, **kwargs):
+            if not stat.S_ISDIR(real_fstat(fd).st_mode):
+                raise OSError("simulated: cannot set the registration file's mode")
+            return real_fchmod(fd, mode, *args, **kwargs)
+
+        monkeypatch.setattr(mod.os, "fchmod", _deny_file_fchmod)
+
+        status = mod.write_agent_registration("borges", registry_dir=str(registry_dir))
+
+        assert status["registered"] is False
+        assert isinstance(status["file_error"], str) and status["file_error"]
+        assert status["dir_error"] is None
+        assert not (registry_dir / "borges.json").exists()
+        assert list(registry_dir.glob("*.tmp")) == [], "a temp file was left behind"
+
+    def test_file_mode_is_set_before_the_replace(self, tmp_path, monkeypatch):
+        """#4682: the 0o644 is applied to the TEMP file, before os.replace.
+
+        That is what removes the attacker window between the replace and a
+        post-write chmod on a path in a group-writable directory.
+        """
+        engram_home = tmp_path / ".engram"
+        engram_home.mkdir()
+        mod = _load_hook_module(monkeypatch, engram_home)
+        _, registry_dir = _registry_pair(tmp_path)
+
+        replace_modes = []
+        real_replace, real_stat = os.replace, os.stat
+
+        def _recording_replace(src, dst):
+            replace_modes.append(stat.S_IMODE(real_stat(src).st_mode))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(mod.os, "replace", _recording_replace)
+
+        old_umask = os.umask(0o077)
+        try:
+            status = mod.write_agent_registration(
+                "borges", registry_dir=str(registry_dir)
+            )
+        finally:
+            os.umask(old_umask)
+
+        assert status["registered"] is True
+        assert replace_modes == [0o644], (
+            f"mode at replace time was {[f'{m:o}' for m in replace_modes]}, not 644"
+        )
+        assert stat.S_IMODE(os.stat(registry_dir / "borges.json").st_mode) == 0o644
