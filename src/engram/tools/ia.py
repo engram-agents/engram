@@ -159,7 +159,8 @@ def _check_forum_configured(config: Optional[dict] = None) -> None:
             file=sys.stderr,
         )
         print(
-            "See: inter-agent/README.md §2 (Mode gate).",
+            'See: the engram-letter skill, troubleshooting table, '
+            'row "ia exits 3 with no forum configured".',
             file=sys.stderr,
         )
         sys.exit(EXIT_STATE)

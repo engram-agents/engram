@@ -40,6 +40,9 @@ with an `-alpha` suffix during the alpha phase.
   not reach a 3.10+ interpreter (a wrapper script, or a venv that is itself older)
   fails once rather than retrying. With no usable venv it refuses with one line on
   stderr and exit 3, before doing any work. (#4642)
+- The `ia` refusal for an unconfigured forum now points at the engram-letter skill's
+  troubleshooting row, not at a README path that does not ship on an installed seat
+  (engram#3560).
 - A roster line that does not compile as a regex no longer prints that line, or the
   regex error text, to stderr. The advisory name scan now reports only the roster
   line number, the error class and the offset. (engram#4559)
