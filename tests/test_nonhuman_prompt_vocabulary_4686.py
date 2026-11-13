@@ -63,6 +63,16 @@ _BEHAVIOUR_TABLE = [
     # regressions: already classified before this change
     ("Stop hook feedback: ...", True),
     ("Loop continuation. Read ...", True),
+    # the three shapes that used to be per-shape branches in _is_cron_prompt
+    # rather than vocabulary members (#4719 round 2) — machine-sent, and now
+    # tuple members like every other shape.
+    ("Loop continuation. Read the marker.", True),
+    ("<<autonomous-loop>>", True),
+    ("<<autonomous-loop-dynamic>>", True),
+    # mid-text negative: CONTAINS an envelope but does not START with it.
+    # This row is what distinguishes a prefix rule from a containment rule —
+    # a human sentence quoting a tag must stay human.
+    ("I saw <task-notification> in the log, what does it mean?", False),
     # success control INSIDE the same table: a detector that answered True to
     # everything would satisfy every row above.
     ("what did you work on today?", False),
