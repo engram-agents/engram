@@ -654,10 +654,11 @@ def test_dir_fd_write_in_a_default_acl_directory_leaves_the_inherited_acl(mod, t
     REMOVES the temp's inherited access ACL when the replaced file had none
     (cell A6), while the ``dir_fd`` writer installs it.
 
-    This is the accepted cost of skipping the xattr block under ``dir_fd``
-    (#4682: the API cannot be bound to the pinned directory), not a property
-    to preserve.  The cell exists so that a future change to either mode must
-    be deliberate rather than silent.
+    This is a deliberate scope choice for this composition, not an API
+    limitation (#4682: the xattr calls take no ``dir_fd`` keyword, but they DO
+    accept an open file descriptor, so an fd-relative copy is available), and
+    not a property to preserve.  The cell exists so that a future change to
+    either mode must be deliberate rather than silent.
     """
     nobody = _nobody_uid()
     _require_default_acl(tmp_path, nobody)

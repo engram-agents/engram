@@ -177,12 +177,18 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     process CWD.  A pre-existing target's named ACL entries and ``user.*``
     xattrs are therefore NOT carried over in that mode -- its mode and group
     still are -- so a caller that needs both must use a path-based write.
-    The removal below is skipped with the copy, so an existing target written
-    through ``dir_fd`` ends up carrying the directory's DEFAULT access ACL when
-    that directory has one -- the metadata a fresh create there would get --
-    even if the file it replaced had no access ACL at all.  That is the accepted
-    cost of not being able to bind the xattr API to the pinned directory, not a
-    property to preserve.
+    The removal below is skipped with the copy.  State the constraint accurately,
+    because it is narrower than "the API cannot be bound": the xattr calls take
+    NO ``dir_fd`` keyword (``getxattr(..., dir_fd=...)`` raises TypeError), but
+    they DO accept an open file descriptor, so an fd-relative copy is available
+    and this skip is a deliberate scope choice for this composition rather than
+    an impossibility.  Its measured cost: an existing target written through
+    ``dir_fd`` ends up carrying the directory's DEFAULT access ACL when that
+    directory has one -- the metadata a fresh create there would get -- even if
+    the file it replaced had no access ACL at all.  That is accepted here and is
+    not a property to preserve; making the copy fd-relative (open the target
+    with ``os.open(..., dir_fd=dir_fd)`` and pass the fd) would close it, and is
+    left out of this PR deliberately.
     Kept AST-identical with
     ``hooks/claude/_hooklib.atomic_write_text`` (tests/test_atomic_write_parity_4013.py)."""
     if dir_fd is None:
