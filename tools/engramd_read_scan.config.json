@@ -210,6 +210,7 @@
   "hooks/claude/engram-forum-prompt-hook.py:_unknown_notice",
   "hooks/claude/engram-forum-prompt-hook.py:_mark_notices",
   "hooks/claude/engram-forum-prompt-hook.py:_cached_mentions",
+  "hooks/claude/engram-forum-prompt-hook.py:_cached_threads",
   "hooks/claude/engram-forum-prompt-hook.py:_assemble_response",
   "hooks/claude/engram-forum-prompt-hook.py:main",
   "hooks/claude/engram-forum-prompt-hook.py:_ipv4_only_getaddrinfo",
