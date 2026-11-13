@@ -286,3 +286,53 @@ def test_malformed_stdin_exits_nonzero(engram_home: Path) -> None:
     )
     assert proc.returncode == 1
     assert proc.stdout.strip() == ""
+
+
+# ============================================================================
+# Loop-wake guard (#2204): the agent's own loop-wake prompt is not the user
+# ============================================================================
+
+_WAKE_MARKER = "<loop-wake>"
+# Text that would nudge if the guard were absent.
+_EOD_TEXT = "good night, let's call it a day"
+
+
+def test_loop_wake_prompt_is_silent(engram_home: Path) -> None:
+    rc, stdout = _run_hook(f"{_WAKE_MARKER} Loop continuation. {_EOD_TEXT}", engram_home)
+    assert rc == 0
+    assert stdout.strip() == ""
+
+
+def test_loop_wake_prompt_with_leading_whitespace_is_silent(engram_home: Path) -> None:
+    rc, stdout = _run_hook(f"  \n\t{_WAKE_MARKER} {_EOD_TEXT}", engram_home)
+    assert rc == 0
+    assert stdout.strip() == ""
+
+
+def test_same_text_without_marker_still_nudges(engram_home: Path) -> None:
+    rc, stdout = _run_hook(f"Loop continuation. {_EOD_TEXT}", engram_home)
+    assert rc == 0
+    assert "End-of-day detected" in json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_marker_not_at_start_does_not_suppress(engram_home: Path) -> None:
+    rc, stdout = _run_hook(f"please read this: {_WAKE_MARKER} {_EOD_TEXT}", engram_home)
+    assert rc == 0
+    assert "End-of-day detected" in json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_fallback_marker_equals_loop_prompt_marker(
+    engram_home: Path, monkeypatch: pytest.MonkeyPatch, isolate_hook_loads
+) -> None:
+    import importlib.util
+
+    monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+    spec = importlib.util.spec_from_file_location("eod_hook_under_test", HOOK_PATH)
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
+    sys.path.insert(0, str(HOOK_PATH.parent.parent.parent / "tools"))  # restored by the window
+    import loop_prompt
+
+    assert hook._LOOP_WAKE_MARKER_FALLBACK == "<loop-wake>"
+    assert hook._LOOP_WAKE_MARKER_FALLBACK == loop_prompt.LOOP_WAKE_MARKER
+    assert hook._LOOP_WAKE_MARKER == loop_prompt.LOOP_WAKE_MARKER
