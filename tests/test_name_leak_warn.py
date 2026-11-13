@@ -30,12 +30,13 @@ Coverage:
   10. load_roster: absent file is an IO error — exits 1 (SystemExit(1)).
   11. load_roster: invalid regex in roster triggers exit 1 (usage error).
   12. Roster secret scope: no workflow binds NAME_LEAK_ROSTER outside a step's
-     ``env`` (workflow-level env, job-level env, job ``container.env``, and
-     step ``with`` are flagged; a step ``env`` is the one legal location), the
-     step-level bindings are non-vacuous and include tests.yml and
-     pr-checks.yml, and a synthetic table pins each flagged path. Only the
-     allowlisted step-env sites may carry the secret; an unlisted binding and
-     a stale allowlist entry both fail. alpha#4568.
+     ``env`` (workflow-level env, job-level env, job ``container.env``,
+     ``services.*.env``, and step ``with`` are flagged; a step ``env`` is the
+     one legal location), the step-level bindings are non-vacuous and include
+     tests.yml and pr-checks.yml, and a synthetic table pins each flagged
+     path. Only the allowlisted step-env sites may carry the secret, compared
+     as a multiset so a duplicate identity is still a surplus binding; a
+     surplus binding and a stale allowlist entry both fail. alpha#4568.
 
 Principal marker: the principal set is declared in a separate
 ``NAME_LEAK_PRINCIPAL`` variable (same regex-line convention as the roster:
@@ -53,6 +54,7 @@ policy-allowed — but it still flags a roster name on a ``run:`` line, a step
 ``name:``, an env value, or in an ``@``-mention anywhere.
 """
 
+from collections import Counter
 import importlib.util
 import json
 import os
@@ -1128,9 +1130,11 @@ def test_subprocess_json_output(tmp_path):
 # them reads where the YAML binds it, so moving a binding up a level would leave
 # every one of them green. These cells read the binding's location.
 #
-# The sweep is over a glob of .github/workflows/ rather than the four-file list
-# used by the CI-flags guard, so a workflow added later is covered the day it
-# lands. The secret's value is never read here — only the key's location.
+# The sweep is over a glob of .github/workflows/ rather than the three-file
+# tuple used by the CI-flags guard, so a workflow added later is covered the
+# day it lands. The check is deliberately key-based: it flags a literal
+# `NAME_LEAK_ROSTER` key and never scans a value that embeds or aliases the
+# name. The secret's value is never read here — only the key's location.
 
 _ROSTER_VAR = "NAME_LEAK_ROSTER"
 _WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
@@ -1147,17 +1151,22 @@ def _roster_bindings_outside_steps(doc: dict) -> list[str]:
     """Dotted paths where a workflow doc binds NAME_LEAK_ROSTER outside a step env.
 
     Returns [] for a clean doc. Each entry is a JSON-ish path a human can grep:
-      "env.NAME_LEAK_ROSTER"                        (workflow-level env)
-      "jobs.<job_id>.env.NAME_LEAK_ROSTER"          (job-level env)
-      "jobs.<job_id>.container.env.NAME_LEAK_ROSTER" (job container env)
-      "jobs.<job_id>.steps[3].with.NAME_LEAK_ROSTER" (step `with`)
-      "jobs.<job_id>.steps[3].env.NAME_LEAK_ROSTER"  -> NOT reported (legal)
+      "env.NAME_LEAK_ROSTER"                            (workflow-level env)
+      "jobs.<job_id>.env.NAME_LEAK_ROSTER"              (job-level env)
+      "jobs.<job_id>.container.env.NAME_LEAK_ROSTER"    (job container env)
+      "jobs.<job_id>.services.<svc>.env.NAME_LEAK_ROSTER" (service env)
+      "jobs.<job_id>.steps[3].with.NAME_LEAK_ROSTER"    (step `with`)
+      "jobs.<job_id>.steps[3].env.NAME_LEAK_ROSTER"      -> NOT reported (legal)
     A step's `env` is the only legal location. A step's `with` is reported,
     because a `with:` value is action input, not an environment binding, and
-    this check is about the environment. A job's ``container.env`` applies the
-    variable to every step in the job, so it is outside a step in the same
-    sense; ``services.*.env`` is deliberately NOT reported, because that env
-    belongs to the service container, not to the job's steps.
+    this check is about the environment. A job's ``container.env`` and each
+    ``services.<id>.env`` apply the variable to the job's containers rather
+    than to one step, so they are outside a step in the same sense — a service
+    container is often a third-party image, so handing it the roster is an
+    exposure surface. No workflow uses ``container:`` or ``services:`` today;
+    those legs are latent coverage. The check is key-based: it flags a literal
+    ``NAME_LEAK_ROSTER`` key and does not scan a value that embeds or aliases
+    the name.
     """
     found: list[str] = []
 
@@ -1180,6 +1189,16 @@ def _roster_bindings_outside_steps(doc: dict) -> list[str]:
             container_env = container.get("env")
             if isinstance(container_env, dict) and _ROSTER_VAR in container_env:
                 found.append(f"jobs.{job_id}.container.env.{_ROSTER_VAR}")
+        services = job.get("services")
+        if isinstance(services, dict):
+            for service_id, service in services.items():
+                if not isinstance(service, dict):
+                    continue
+                service_env = service.get("env")
+                if isinstance(service_env, dict) and _ROSTER_VAR in service_env:
+                    found.append(
+                        f"jobs.{job_id}.services.{service_id}.env.{_ROSTER_VAR}"
+                    )
         for index, step in enumerate(job.get("steps") or []):
             if not isinstance(step, dict):
                 continue
@@ -1224,6 +1243,24 @@ _ROSTER_BINDING_CASES = (
         },
         ["jobs.build.container.env.NAME_LEAK_ROSTER"],
         id="job-container-env",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "services": {
+                        "db": {
+                            "image": "example/postgres:1",
+                            "env": {
+                                _ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"
+                            },
+                        }
+                    }
+                }
+            }
+        },
+        ["jobs.build.services.db.env.NAME_LEAK_ROSTER"],
+        id="job-service-env",
     ),
     pytest.param(
         {
@@ -1307,17 +1344,7 @@ def test_roster_step_env_bindings_are_non_vacuous():
             f"{path.name}: yaml.safe_load did not return a mapping (got "
             f"{type(doc).__name__}); refusing to read that as a clean pass"
         )
-        count = 0
-        for job in (doc.get("jobs") or {}).values():
-            if not isinstance(job, dict):
-                continue
-            for step in job.get("steps") or []:
-                if (
-                    isinstance(step, dict)
-                    and isinstance(step.get("env"), dict)
-                    and _ROSTER_VAR in step["env"]
-                ):
-                    count += 1
+        count = len(_roster_step_env_keys(doc))
         if count:
             step_env_files[path.name] = count
 
@@ -1335,7 +1362,8 @@ def test_roster_step_env_bindings_are_non_vacuous():
 
 @pytest.mark.parametrize("doc,expected", _ROSTER_BINDING_CASES)
 def test_roster_bindings_outside_steps_scope_table(doc, expected):
-    """Flag workflow env, job env and step `with`; allow step `env`."""
+    """Flag workflow env, job env, job container/service env and step `with`;
+    allow a step `env`."""
     assert _roster_bindings_outside_steps(doc) == expected
 
 
@@ -1351,9 +1379,12 @@ def test_roster_bindings_outside_steps_scope_table(doc, expected):
 # A step identity is the step's `name` when it has one, else its `id`, else its
 # 0-based index — the same precedence applied by the scan below.
 #
-# Equality is asserted in BOTH directions: an unlisted step-level binding fails
-# (the closing condition), and an allowlisted entry with no matching step also
-# fails, so deleting a step cannot silently leave a stale permission behind.
+# The comparison is over MULTISETS, not sets: two steps in one job that resolve
+# to the same identity are two bindings, so the second fails as a surplus
+# instead of collapsing into the first. Equality is asserted in BOTH
+# directions: a surplus step-level binding fails (the closing condition), and
+# an allowlisted entry with no matching step also fails, so deleting a step
+# cannot silently leave a stale permission behind.
 
 _ROSTER_STEP_ALLOWLIST: dict[str, frozenset[tuple[str, str | int]]] = {
     "name-leak-gate.yml": frozenset(
@@ -1384,17 +1415,20 @@ _ROSTER_STEP_ALLOWLIST: dict[str, frozenset[tuple[str, str | int]]] = {
 }
 
 
-def _roster_step_env_keys(doc: dict) -> set[tuple[str, str | int]]:
-    """(job_id, step_identity) for every step whose OWN env binds NAME_LEAK_ROSTER.
+def _roster_step_env_keys(doc: dict) -> dict[tuple[str, str | int], list[int]]:
+    """Map each step-env binding's (job_id, step_identity) to its step indices.
 
     Step identity is the step's ``name`` when it has one, else its ``id``, else
-    its 0-based index. Only a step's own ``env`` counts here: workflow-level and
-    job-level env and a job ``container.env`` are the sweeper's concern.
+    its 0-based index. The value is the list of 0-based indices that resolved to
+    that key — a list rather than a count so a duplicate identity can be named
+    by the index of the surplus occurrence. Only a step's own ``env`` counts
+    here: workflow-level and job-level env, a job ``container.env`` and a
+    ``services.*.env`` are the sweeper's concern.
     """
-    keys: set[tuple[str, str | int]] = set()
+    occurrences: dict[tuple[str, str | int], list[int]] = {}
     jobs = doc.get("jobs")
     if not isinstance(jobs, dict):
-        return keys
+        return occurrences
     for job_id, job in jobs.items():
         if not isinstance(job, dict):
             continue
@@ -1410,20 +1444,60 @@ def _roster_step_env_keys(doc: dict) -> set[tuple[str, str | int]]:
                 identity = step["id"]
             else:
                 identity = index
-            keys.add((job_id, identity))
-    return keys
+            occurrences.setdefault((job_id, identity), []).append(index)
+    return occurrences
+
+
+def _format_step(identity: str | int, index: int | None = None) -> str:
+    """Render a step identity for a failure message.
+
+    An index-identified step is printed as "step index N (0-based)" rather than
+    a bare integer. When ``index`` is given, it is the step's 0-based position
+    in the job — load-bearing for a duplicate identity, where the identity is
+    shared and only the index tells the two steps apart.
+    """
+    if isinstance(identity, int):
+        return f"step index {identity} (0-based)"
+    if index is None:
+        return f"step {identity!r}"
+    return f"step {identity!r} at step index {index}"
 
 
 def _roster_step_env_mismatches(
     doc: dict,
     allowed: frozenset[tuple[str, str | int]] | set[tuple[str, str | int]],
-) -> tuple[list[tuple[str, str | int]], list[tuple[str, str | int]]]:
-    """Return (unlisted, missing) step-env keys relative to ``allowed``."""
-    actual = _roster_step_env_keys(doc)
-    expected = set(allowed)
-    unlisted = sorted(actual - expected, key=repr)
-    missing = sorted(expected - actual, key=repr)
-    return unlisted, missing
+) -> tuple[list[tuple[str, str | int, int]], list[tuple[str, str | int]]]:
+    """Return (surplus, missing) step-env keys relative to ``allowed``.
+
+    The comparison is a MULTISET one (``collections.Counter`` on both sides):
+    two steps that resolve to the same identity are two bindings. ``surplus``
+    holds one ``(job_id, identity, step_index)`` per binding beyond the allowed
+    count, so a second step reusing an allowlisted identity is named by its own
+    index. ``missing`` holds one ``(job_id, identity)`` per allowlisted entry
+    with no matching step.
+    """
+    occurrences = _roster_step_env_keys(doc)
+    actual = Counter(
+        {key: len(indices) for key, indices in occurrences.items()}
+    )
+    expected = Counter(allowed)
+
+    surplus: list[tuple[str, str | int, int]] = []
+    for key in actual - expected:
+        job_id, identity = key
+        allowed_count = expected.get(key, 0)
+        for index in sorted(occurrences[key])[allowed_count:]:
+            surplus.append((job_id, identity, index))
+
+    missing: list[tuple[str, str | int]] = []
+    for key, shortfall in (expected - actual).items():
+        job_id, identity = key
+        for _ in range(shortfall):
+            missing.append((job_id, identity))
+
+    surplus.sort(key=repr)
+    missing.sort(key=repr)
+    return surplus, missing
 
 
 # Synthetic docs for the allowlist comparison. The first case is the positive
@@ -1463,7 +1537,7 @@ _ROSTER_STEP_ENV_CASES = (
             }
         },
         frozenset(),
-        [("build", "unlisted")],
+        [("build", "unlisted", 0)],
         [],
         id="unlisted-step-env-flagged",
     ),
@@ -1530,15 +1604,40 @@ _ROSTER_STEP_ENV_CASES = (
         [],
         id="identity-falls-back-to-index",
     ),
+    # A duplicate identity is a second binding, not a set collision: the
+    # allowlist permits one step named "dup", so the step at index 1 is surplus.
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {
+                            "name": "dup",
+                            "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                        },
+                        {
+                            "name": "dup",
+                            "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                        },
+                    ]
+                }
+            }
+        },
+        frozenset({("build", "dup")}),
+        [("build", "dup", 1)],
+        [],
+        id="duplicate-identity-flagged",
+    ),
 )
 
 
 def test_roster_step_env_bindings_match_allowlist():
     """Only allowlisted steps may bind NAME_LEAK_ROSTER in their own env.
 
-    Both directions: an unlisted step-level binding fails the closing
-    condition, and an allowlisted entry with no matching step (or a missing
-    allowlisted workflow file) fails as a stale permission.
+    The comparison is a multiset, so a second step that reuses an allowlisted
+    identity is a surplus binding and fails, named by its own step index. An
+    allowlisted entry with no matching step (or a missing allowlisted workflow
+    file) fails as a stale permission.
     """
     present = {path.name: path for path in _WORKFLOW_FILES}
     problems: list[str] = []
@@ -1548,7 +1647,7 @@ def test_roster_step_env_bindings_match_allowlist():
             for job_id, identity in sorted(allowed, key=repr):
                 problems.append(
                     f"{name}: allowlisted workflow file is missing "
-                    f"(expected job {job_id!r}, step {identity!r})"
+                    f"(expected job {job_id!r}, {_format_step(identity)})"
                 )
             continue
         doc = yaml.safe_load(present[name].read_text(encoding="utf-8"))
@@ -1556,16 +1655,16 @@ def test_roster_step_env_bindings_match_allowlist():
             f"{name}: yaml.safe_load did not return a mapping (got "
             f"{type(doc).__name__}); refusing to read that as a clean pass"
         )
-        unlisted, missing = _roster_step_env_mismatches(doc, allowed)
-        for job_id, identity in unlisted:
+        surplus, missing = _roster_step_env_mismatches(doc, allowed)
+        for job_id, identity, index in surplus:
             problems.append(
-                f"{name}: step {identity!r} in job {job_id!r} binds "
-                f"{_ROSTER_VAR} but is not allowlisted"
+                f"{name}: {_format_step(identity, index)} in job {job_id!r} "
+                f"binds {_ROSTER_VAR} beyond what the allowlist permits"
             )
         for job_id, identity in missing:
             problems.append(
-                f"{name}: allowlisted step {identity!r} in job {job_id!r} "
-                "no longer exists"
+                f"{name}: allowlisted {_format_step(identity)} in job "
+                f"{job_id!r} no longer exists"
             )
     assert problems == [], (
         f"{_ROSTER_VAR} step-env allowlist mismatch:\n  " + "\n  ".join(problems)
@@ -1573,13 +1672,13 @@ def test_roster_step_env_bindings_match_allowlist():
 
 
 @pytest.mark.parametrize(
-    "doc,allowed,expected_unlisted,expected_missing", _ROSTER_STEP_ENV_CASES
+    "doc,allowed,expected_surplus,expected_missing", _ROSTER_STEP_ENV_CASES
 )
 def test_roster_step_env_allowlist_table(
-    doc, allowed, expected_unlisted, expected_missing
+    doc, allowed, expected_surplus, expected_missing
 ):
     """The allowlist comparison flags both directions and accepts a legal doc."""
     assert _roster_step_env_mismatches(doc, allowed) == (
-        expected_unlisted,
+        expected_surplus,
         expected_missing,
     )
