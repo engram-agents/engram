@@ -1160,7 +1160,7 @@ def test_2077_drift_guard_create_and_insert_derive_from_canonical_constant(tmp_p
         shutil.rmtree(core_test_dir, ignore_errors=True)
 
 
-def test_2077_startup_self_heal_repairs_stale_nodes_fts_on_get_db(tmp_path):
+def test_2077_startup_self_heal_repairs_stale_nodes_fts_on_get_db(tmp_path, capsys):
     """Regression for #2077 finding 1 (reviewer round 2): a LIVE server whose
     nodes_fts is already a stale 3-column table must self-heal on the next
     ``_get_db()`` call (i.e. the next process/server restart), not just on an
@@ -1244,9 +1244,16 @@ def test_2077_startup_self_heal_repairs_stale_nodes_fts_on_get_db(tmp_path):
         # second interpreter).
         core._db_setup_done_paths.clear()
 
+        # Discard setup diagnostics so these assertions cover only the
+        # startup self-heal call below.
+        capsys.readouterr()
+
         # Second _get_db(): must detect the drift and self-heal, with no
         # caller-visible action beyond calling _get_db() again.
         conn = core._get_db()
+        streams = capsys.readouterr()
+        assert streams.out == ""
+        assert "[rebuild_fts_index] repairing under-indexed nodes_fts on" in streams.err
         repaired_cols = [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
         assert repaired_cols == list(engram_backup.NODES_FTS_COLUMNS), (
             f"nodes_fts must self-heal to the canonical schema on "
