@@ -40,6 +40,9 @@ with an `-alpha` suffix during the alpha phase.
   not reach a 3.10+ interpreter (a wrapper script, or a venv that is itself older)
   fails once rather than retrying. With no usable venv it refuses with one line on
   stderr and exit 3, before doing any work. (#4642)
+- A roster line that does not compile as a regex no longer prints that line, or the
+  regex error text, to stderr. The advisory name scan now reports only the roster
+  line number, the error class and the offset. (engram#4559)
 
 ### Docs
 - The `engram-trust-tier` skill no longer describes a `force=true` override that `engram_set_trust_tier` does not have: it now names the real gate (`justification_obs_id` and `primary_user_approval_obtained`) and says the call fails closed without them (engram#4303). The handbook says config updates are `PUT /api/config/<key>`, not POST (engram#4461).

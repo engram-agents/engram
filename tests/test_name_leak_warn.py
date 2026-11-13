@@ -1052,6 +1052,66 @@ def test_load_roster_invalid_regex_exits_1(tmp_path):
     assert exc_info.value.code == 1
 
 
+# Contract for ``load_roster`` on an uncompilable roster line (engram#4559): exit
+# 1 before returning any pattern; write exactly ONE stderr line naming the
+# failing line by its RAW 1-based number in the roster text (blank and comment
+# lines count, the numbering ``name-leak-gate.yml`` prints) plus the exception
+# class and ``.pos``; write NOTHING derived from the line's text (not the line,
+# not a truncation, not ``repr``, not ``str(exc)``, not ``exc.msg``). The roster
+# is the NAME_LEAK_ROSTER secret and ``pr-checks.yml`` leaves stderr unredirected.
+@pytest.mark.parametrize("entry_point", ["roster_file", "roster_source"])
+def test_load_roster_compile_error_names_the_line_not_its_text(
+    tmp_path, capsys, entry_point
+):
+    """A bad roster line exits 1 naming raw line 4, echoing none of its text.
+
+    The bad line is ``(?P=<token>)``: CPython raises "unknown group name
+    '<token>'", so ``str(exc)`` and ``exc.msg`` both embed the invented token.
+    That is asserted below, so a green cell proves the ``str(exc)`` leak is
+    covered and not only the ``repr(line)`` leak. The token appears nowhere else
+    in the repository.
+    """
+    token = "Zvimbrelq"
+    bad_line = f"(?P={token})"
+    with pytest.raises(re.error) as probe:
+        re.compile(bad_line)
+    assert token in str(probe.value) and token in probe.value.msg, (
+        "precondition: this CPython must embed the token in str(exc) and exc.msg"
+    )
+
+    # Raw numbering: valid line, comment, blank, then the bad line = line 4.
+    roster = "\\bQuillonfex\\b\n# a comment\n\n" + bad_line + "\n"
+    if entry_point == "roster_file":
+        roster_file = tmp_path / "roster.txt"
+        roster_file.write_text(roster, encoding="utf-8")
+        kwargs = {"roster_source": None, "roster_file": str(roster_file)}
+    else:
+        kwargs = {"roster_source": roster, "roster_file": None}
+
+    with pytest.raises(SystemExit) as exc_info:
+        load_roster(**kwargs)
+
+    assert exc_info.value.code == 1, (
+        f"an uncompilable roster line must exit 1; got {exc_info.value.code!r}"
+    )
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1, f"exactly one stderr line; got {err!r}"
+    assert "roster line 4" in err, (
+        f"the message must name the raw 1-based line number 4; got {err!r}"
+    )
+    assert f"offset {probe.value.pos}" in err, (
+        f"the message must carry exc.pos ({probe.value.pos}); got {err!r}"
+    )
+    assert type(probe.value).__name__ in err, (
+        f"the message must carry the exception class name; got {err!r}"
+    )
+    assert token not in err, f"the roster line's text reached stderr: {err!r}"
+    assert bad_line not in err, f"the roster line reached stderr: {err!r}"
+    assert probe.value.msg not in err and "unknown group name" not in err, (
+        f"str(exc) / exc.msg reached stderr: {err!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Integration test: subprocess round-trip
 # ---------------------------------------------------------------------------
