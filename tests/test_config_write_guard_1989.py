@@ -214,6 +214,59 @@ def test_a5_write_goes_through_write_config_json(tmp_path, cio, monkeypatch):
     assert seen == [{"a": 2}]
 
 
+def _acl_helpers():
+    """Load tests/test_acl_writer_4013.py by path and reuse its ACL helpers."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_acl_helpers_4013", Path(__file__).with_name("test_acl_writer_4013.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_a5_guarded_write_keeps_acl_and_user_xattr_of_the_replaced_config(tmp_path, cio):
+    """Pins the guarded writer to #4692's ACL/xattr-preserving path.
+
+    A bypass (a plain path.write_text, or any writer that does not go through
+    write_config_json -> atomic_write_text) would leave the new config.json
+    without the named ACL entry and the user.* xattr of the file it replaced.
+    """
+    import errno
+    if not (hasattr(os, "setxattr") and hasattr(os, "getxattr")):
+        pytest.skip("platform does not expose os.setxattr/os.getxattr")
+    acl = _acl_helpers()
+    p = _cfg(tmp_path, {"a": 1})
+    cannot_carry = {errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+                    errno.ENOSYS, errno.EPERM}
+    try:
+        blob = acl._set_named_acl(p)
+        os.setxattr(p, "user.test", b"keep-me", follow_symlinks=False)
+        got = os.getxattr(p, acl.ACL, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno in cannot_carry:
+            pytest.skip("filesystem cannot carry system.posix_acl_access / user.* "
+                        f"unprivileged ({errno.errorcode.get(exc.errno, exc.errno)}: {exc})")
+        raise
+    if got != blob:
+        pytest.skip(f"filesystem did not return the ACL blob verbatim (got {got.hex()})")
+
+    cio.write_engram_config(p, {"a": 2})
+
+    assert json.loads(p.read_text()) == {"a": 2}, "setup: the guarded write did not happen"
+    def _get(name):
+        try:
+            return os.getxattr(p, name, follow_symlinks=False)
+        except OSError as exc:
+            if exc.errno == errno.ENODATA:
+                return None
+            raise
+
+    assert _get(acl.ACL) == blob, (
+        "the guarded writer dropped the named ACL entry: it bypassed #4692's path")
+    assert _get("user.test") == b"keep-me", (
+        "the guarded writer dropped the user.* xattr: it bypassed #4692's path")
+
+
 # ------------------------------------------------------------------- A4 ---
 
 def _times(n):
