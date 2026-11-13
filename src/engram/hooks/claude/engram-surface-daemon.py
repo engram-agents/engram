@@ -806,12 +806,14 @@ def main():
         try:
             _lock_fd = engram_core.acquire_daemon_lock(LOCK_PATH)
         except engram_core.DaemonLockHeld:
-            # D2: a daemon of this version is alive. Touch nothing.
+            # D2: a daemon of this version is alive. We acquired no descriptor,
+            # so touch nothing but the refusal backoff before the exit-0 return.
             print(
                 f"[engram-daemon] another process holds the daemon lock {LOCK_PATH} "
                 "-- exiting rather than start a second daemon",
                 file=sys.stderr,
             )
+            _wait_refusal_backoff(_refusal_backoff_s())
             sys.exit(0)
     except Exception as exc:
         # D4: unusable lock, or engram_core not importable: fail closed.
@@ -847,6 +849,12 @@ def main():
                 f"{SOCKET_PATH} -- exiting rather than steal it",
                 file=sys.stderr,
             )
+            # This process will not serve. Unlike the 75/76 safety refusals,
+            # release only our own just-acquired lifetime lock before waiting,
+            # so a contender is not blocked if the known owner dies meanwhile.
+            os.close(_lock_fd)
+            _lock_fd = None
+            _wait_refusal_backoff(_refusal_backoff_s())
             sys.exit(0)
         # #3361: the recorded pid is dead, but that does not mean nobody
         # holds the path (pidfile stale / missing / names another process).
