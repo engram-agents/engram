@@ -147,6 +147,9 @@ def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
     # engram-loop skill which uses the stub "Loop continuation. Read ...").
     if stripped.startswith("Loop continuation."):
         return True
+    # A blocking Stop-hook re-invocation is not a human message (#2451).
+    if stripped.startswith("Stop hook feedback"):
+        return True
     # Compare against stored loop_prompt in loop-mode.json (present if loop started
     # with the updated engram-loop skill that writes loop_prompt to the marker)
     try:
