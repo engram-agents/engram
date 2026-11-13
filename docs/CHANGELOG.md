@@ -9,6 +9,19 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+### Changed
+
+- The touched-test selector (`run_touched_tests.py`) now finds the tests for
+  changes under `src/engram`. Before, it only looked at the old repo-root layout,
+  so a change to `server.py` or `engram_core.py` fell back to the whole suite.
+  It now follows the import paths that `tests/conftest.py` sets up. It also
+  always adds every test whose text names a changed file, and always adds the
+  guard tests from the Owner merge list. A changed file that nothing refers to
+  no longer runs the whole suite: the selector prints its name as unreferenced.
+  The "SUBSET green" line now says the full suite runs nightly and at the
+  release cut. `--json` gains `layers` and `unreferenced` keys; no key is
+  removed. (#4358)
+
 ### Docs
 - The install guide now says that an ACL or extended attribute on `~/.claude/settings.json` is lost during
   install: measured for `claude plugin marketplace add` on one Mac and on Linux, and for a full
