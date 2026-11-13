@@ -445,9 +445,17 @@ class TestFairyPolicyModeLines:
             "no size exception, no quick-fix exception. Spec and dispatch, once "
             "sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
             "(a dated grant line or a standing request); without it, do the work "
-            "directly and say so."
+            "directly and say so. "
+            "Where that section carries an \"ask each time\" line, ask the user "
+            "before each dispatch; a yes covers that task only."
         ), line
         assert len(line) < 400
+
+    def test_coder_always_ask_each_time_branch_order(self, tmp_path):
+        """#4562 r2: grant, then the direct fallback, then the ask-each-time branch; once."""
+        line = self._get_block(tmp_path, "always", "auto").splitlines()[0]
+        assert line.count("ask each time") == 1, line
+        assert line.index("granted") < line.index("do the work") < line.index("ask each time"), line
 
     def test_reviewer_always_line_states_grant_precondition(self, tmp_path):
         """#4562: the 'always' reviewer line names the sub-agent grant and where it lives."""
@@ -458,9 +466,17 @@ class TestFairyPolicyModeLines:
             "reviewer-fairy — no size exception, no quick-fix exception. Dispatch, "
             "once sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
             "(a dated grant line or a standing request); without it, do the review "
-            "directly and say so."
+            "directly and say so. "
+            "Where that section carries an \"ask each time\" line, ask the user "
+            "before each dispatch; a yes covers that task only."
         ), line
         assert len(line) < 400
+
+    def test_reviewer_always_ask_each_time_branch_order(self, tmp_path):
+        """#4562 r2: grant, then the direct fallback, then the ask-each-time branch; once."""
+        line = self._get_block(tmp_path, "auto", "always").splitlines()[1]
+        assert line.count("ask each time") == 1, line
+        assert line.index("granted") < line.index("do the review") < line.index("ask each time"), line
 
     def test_other_policy_lines_unchanged(self, tmp_path):
         """#4562: only the two 'always' lines change; explicit/auto stay byte-identical."""
