@@ -354,12 +354,17 @@ class TestSeePointersResolve3560:
         skill = _REPO_ROOT / "src" / "engram" / "skills" / "claude" / "engram-letter" / "SKILL.md"
         assert skill.is_file(), f"{skill} does not exist"
         # The table writes the symptom in backticks; the pointer quotes it plain.
-        skill_text = skill.read_text().replace("`", "")
+        # Only table lines count: the row text turning up in prose is not the row.
+        table_lines = [
+            ln.replace("`", "") for ln in skill.read_text().splitlines() if ln.lstrip().startswith("|")
+        ]
         for ptr in pointers:
             assert "engram-letter" in ptr, ptr
             m = re.search(r'row "([^"]+)"', ptr)
             assert m, f"pointer quotes no row: {ptr!r}"
-            assert m.group(1) in skill_text, f"row {m.group(1)!r} not in SKILL.md"
+            assert any(m.group(1) in ln for ln in table_lines), (
+                f"row {m.group(1)!r} is not a line of a table in SKILL.md"
+            )
 
 
 # ===========================================================================
