@@ -288,7 +288,7 @@ def test_a4_failed_listing_is_reported_and_not_fatal(tmp_path, cio, fg, monkeypa
     real = os.scandir
 
     def bad(path=".", *a, **k):
-        if Path(path) == tmp_path:
+        if isinstance(path, (str, os.PathLike)) and Path(path) == tmp_path:
             raise PermissionError("nope")
         return real(path, *a, **k)
     monkeypatch.setattr(os, "scandir", bad)
@@ -370,6 +370,7 @@ def test_b2_present_config_advances_and_keeps_every_key(tmp_path):
 def test_c1_advance_turn_tool_returns_error_with_path_and_creates_nothing(tmp_path):
     server = _fresh_server(str(tmp_path))
     import engram_core as core
+    server.engram_diagnose()  # run the one-time schema bootstrap (it opens the DB, which re-creates an absent default config)
     core.CONFIG_PATH.write_text(json.dumps({"memory": {"current_turn": 30}, "mode": "m"}))
     saved = core.CONFIG_PATH.read_bytes()
     core.CONFIG_PATH.unlink()
@@ -385,6 +386,7 @@ def test_c1_advance_turn_tool_returns_error_with_path_and_creates_nothing(tmp_pa
 def test_c2_the_process_is_alive_after_the_error(tmp_path):
     server = _fresh_server(str(tmp_path))
     import engram_core as core
+    server.engram_diagnose()
     core.CONFIG_PATH.unlink()
     out = json.loads(server.engram_advance_turn(json.dumps({"message": "sleep"})))
     assert "error" in out
