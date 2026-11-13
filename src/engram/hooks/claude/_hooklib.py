@@ -60,6 +60,15 @@ import sys
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+# os.getxattr / os.setxattr / os.listxattr exist on Linux and FreeBSD only:
+# macOS does not expose POSIX ACLs (or any file xattrs) through them, and
+# calling a missing attribute raises AttributeError, not OSError.  Decided once
+# at import so the copy in atomic_write_text is a no-op, never an error, where
+# the API is absent.
+_XATTR_API = (
+    hasattr(os, "getxattr") and hasattr(os, "setxattr") and hasattr(os, "listxattr")
+)
+
 
 def engram_home() -> Path:
     """The ENGRAM home for this layer: $ENGRAM_HOME (default ~/.engram) when set and non-empty,
@@ -401,20 +410,33 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     callers).  On any error the temp file is removed and the error re-raised;
     ``path`` is never left partial.  Named POSIX ACL entries
     (``system.posix_acl_access``) and ``user.*`` extended attributes are copied
-    from the existing file onto the temp before the publish, after the mode and
-    group are restored, so the ACL's mask (which settles the group bits) is
-    authoritative.  Only the ``user.*`` namespace is copied: ``security.*`` and
-    ``trusted.*`` are frequently unreadable or unsettable by an unprivileged
-    writer, so attempting them would turn a normal write into a failure on
-    SELinux hosts.  The access ACL is read explicitly rather than inferred from
-    ``listxattr``: whether that call reports ``system.posix_acl_access`` is
-    filesystem-dependent (some list it, some do not), and the copy must not
-    depend on which; ``system.posix_acl_default`` is a directory
-    attribute and does not apply to a regular file.  If the source carries one
-    of these and it cannot be applied to the temp, the write raises, the temp is
-    removed, and the target is left untouched.  Duplicated here because this
-    module must stay self-contained; kept AST-identical with
-    ``engram_config_io.atomic_write_text`` (tests/test_atomic_writer_modes_4013.py)."""
+    from the existing file onto the temp before the publish.  That copy is the
+    LAST metadata step before the publish, and must stay last: the mode and
+    group are restored first, and ``fchmod`` rewrites the ACL mask (which is the
+    final word on the group bits), so a mode change after the ACL is applied
+    would silently alter a preserved ACL.  Only the ``user.*`` namespace is
+    copied: ``security.*`` and ``trusted.*`` are frequently unreadable or
+    unsettable by an unprivileged writer, so attempting them would turn a normal
+    write into a failure on SELinux hosts.  The access ACL is read explicitly
+    rather than inferred from ``listxattr``: whether that call reports
+    ``system.posix_acl_access`` is filesystem-dependent (some list it, some do
+    not), and the copy must not depend on which; ``system.posix_acl_default`` is
+    a directory attribute and does not apply to a regular file.  Where the
+    platform exposes no xattr API (macOS), the copy is a no-op, never an error.
+    A per-name read that returns ENODATA/ENOATTR (the attribute vanished between
+    ``listxattr`` and ``getxattr``) is skipped: it is genuinely absent, so
+    nothing is lost.  Any other read error, notably EACCES/EPERM on a file the
+    caller may write but not read, fails the write -- a bounded behaviour change
+    from the writer before #4641, which wrote successfully and dropped that
+    attribute, because metadata that cannot be read must not be lost silently.
+    If the source carries one of these and it cannot be applied to the temp, the
+    write raises, the temp is removed, and the target is left untouched.  Note
+    the ownership assumption: in a directory other users can write, the source's
+    ACL and ``user.*`` values are attacker-controlled and are propagated to the
+    new inode -- the same class of trust as the pre-existing mode copy, stated
+    here rather than left implied.  Duplicated here because this module must
+    stay self-contained; kept AST-identical with
+    ``engram_config_io.atomic_write_text`` (tests/test_atomic_write_parity_4013.py)."""
     target = os.path.realpath(path) if follow_symlinks else os.path.abspath(path)
     try:
         st = os.stat(target) if follow_symlinks else os.lstat(target)
@@ -446,10 +468,17 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
                 except PermissionError:
                     pass  # not a member of that group: the new inode keeps its own
                 os.fchmod(fh.fileno(), stat.S_IMODE(st.st_mode))
-                # ACL entries and user.* xattrs are inode metadata too, and the
-                # rename installs a new inode: read them from the file being
-                # replaced and apply them to the temp BEFORE the publish, after the
-                # fchmod so the ACL mask settles the final group bits.
+            # ACL entries and user.* xattrs are inode metadata too, and the
+            # rename installs a new inode: read them from the file being
+            # replaced and apply them to the temp.  This is the LAST metadata
+            # step before the publish, deliberately: fchmod rewrites the ACL
+            # mask (the mask is the final word on the group bits), so a mode
+            # change after setxattr would silently alter the preserved ACL.
+            # It must stay after every fchmod, including any mode= application.
+            # Under a dir_fd-based write the copy must be skipped or made
+            # fd-relative: target is then a bare name resolved against the
+            # process CWD, and os.getxattr/os.setxattr take no dir_fd parameter.
+            if copy_mode and _XATTR_API:
                 no_attr = tuple(
                     e
                     for e in (
@@ -458,6 +487,19 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
                         getattr(errno, "ENOTSUP", None),
                         getattr(errno, "EOPNOTSUPP", None),
                         getattr(errno, "ENOSYS", None),
+                    )
+                    if e is not None
+                )
+                # Only a vanished attribute is skipped per name: ENODATA/ENOATTR
+                # means it was there when listxattr ran and is genuinely absent
+                # now, so nothing is lost.  Everything else -- notably EACCES and
+                # EPERM on a file the caller may write but not read -- raises:
+                # metadata that cannot be read must not be dropped silently.
+                no_entry = tuple(
+                    e
+                    for e in (
+                        getattr(errno, "ENODATA", None),
+                        getattr(errno, "ENOATTR", None),
                     )
                     if e is not None
                 )
@@ -476,7 +518,12 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
                     names = ()
                 for name in names:
                     if name.startswith("user."):
-                        value = os.getxattr(target, name, follow_symlinks=False)
+                        try:
+                            value = os.getxattr(target, name, follow_symlinks=False)
+                        except OSError as exc:
+                            if exc.errno in no_entry:
+                                continue
+                            raise
                         os.setxattr(tmp, name, value, follow_symlinks=False)
         os.replace(tmp, target)
     except BaseException:

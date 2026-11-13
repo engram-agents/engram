@@ -32,6 +32,10 @@ from pathlib import Path
 import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "engram"
+COPIES = {
+    "core": SRC / "engram_config_io.py",
+    "hooks": SRC / "hooks" / "claude" / "_hooklib.py",
+}
 ACL = "system.posix_acl_access"
 _NONE = 0xFFFFFFFF
 
@@ -107,6 +111,16 @@ def _load(name, path):
     return mod
 
 
+def _load_fresh(name, path):
+    """A freshly imported copy, for cells that change the platform API state the
+    module decides its guard from at import."""
+    sys.path.insert(0, str(SRC))
+    try:
+        return _load(name, path)
+    finally:
+        sys.path.remove(str(SRC))
+
+
 @pytest.fixture(scope="module")
 def writer_mods():
     sys.path.insert(0, str(SRC))
@@ -128,15 +142,20 @@ def mod(request, writer_mods):
 def test_named_acl_entry_survives_an_atomic_write(mod, tmp_path):
     p = tmp_path / "state.json"
     p.write_text("old")
-    before = _set_named_acl(p)
-    assert os.getxattr(p, ACL, follow_symlinks=False) == before, "setup: the ACL was not set"
+    before_acl = _set_named_acl(p)
+    assert os.getxattr(p, ACL, follow_symlinks=False) == before_acl, "setup: the ACL was not set"
+    before = os.stat(p)
 
     mod.atomic_write_text(p, "new")
 
     assert p.read_text() == "new"
-    assert os.getxattr(p, ACL, follow_symlinks=False) == before, (
+    assert os.getxattr(p, ACL, follow_symlinks=False) == before_acl, (
         "the named POSIX ACL entry was dropped by the replacement; the new inode "
         "must carry the source's system.posix_acl_access blob"
+    )
+    assert stat.S_IMODE(os.stat(p).st_mode) == stat.S_IMODE(before.st_mode), (
+        "the mode changed; a step applied after the ACL copy (fchmod rewrites the "
+        "ACL mask, the final word on the group bits) must not run after it"
     )
 
 
@@ -199,3 +218,136 @@ def test_acl_apply_failure_raises_and_leaves_the_target_intact(mod, tmp_path, mo
     assert sorted(entry.name for entry in tmp_path.iterdir()) == ["state.json"], (
         "the temp file must be removed when applying the ACL fails"
     )
+
+
+def test_acl_applied_then_a_user_xattr_set_fails(mod, tmp_path, monkeypatch):
+    """A2/A5: the ACL is applied, THEN the ``user.*`` copy fails.
+
+    A5 monkeypatches every ``os.setxattr`` call, so it fails on the ACL set and
+    never reaches the per-name copy; this cell pins the cleanup and the
+    target's byte-identity on that second path.
+    """
+    p = tmp_path / "state.json"
+    p.write_text("old")
+    _set_named_acl(p)
+    os.setxattr(p, "user.test", b"keep-me", follow_symlinks=False)
+    before = p.read_bytes()
+    real_setxattr = os.setxattr
+
+    def spy(path, name, value, **kwargs):
+        if name == "user.test":
+            raise OSError(errno.EPERM, "cannot set the user xattr on the temp")
+        return real_setxattr(path, name, value, **kwargs)
+
+    monkeypatch.setattr(os, "setxattr", spy)
+    with pytest.raises(OSError):
+        mod.atomic_write_text(p, "new")
+
+    assert p.read_bytes() == before, "the target must be untouched when the user.* copy fails"
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["state.json"], (
+        "the temp file must be removed when the user.* copy fails"
+    )
+
+
+def test_acl_and_user_xattr_both_survive_one_write(mod, tmp_path):
+    """A1+A2 in one write: the ACL is set first, then named attributes are listed."""
+    p = tmp_path / "state.json"
+    p.write_text("old")
+    acl = _set_named_acl(p)
+    os.setxattr(p, "user.test", b"keep-me", follow_symlinks=False)
+
+    mod.atomic_write_text(p, "new")
+
+    assert p.read_text() == "new"
+    assert os.getxattr(p, ACL, follow_symlinks=False) == acl, "the named ACL was dropped"
+    assert os.getxattr(p, "user.test", follow_symlinks=False) == b"keep-me", (
+        "the user.* xattr was dropped"
+    )
+
+
+def test_listxattr_unsupported_is_tolerated_and_copies_no_names(mod, tmp_path, monkeypatch):
+    """A filesystem without xattr listing cannot enumerate names: that is "nothing
+    to copy", not an error (ENOTSUP/EOPNOTSUPP/ENOSYS are in the no-attribute set)."""
+    p = tmp_path / "state.json"
+    p.write_text("old")
+    os.setxattr(p, "user.test", b"unseen", follow_symlinks=False)
+
+    def unsupported(*args, **kwargs):
+        raise OSError(errno.EOPNOTSUPP, "listxattr is not supported here")
+
+    monkeypatch.setattr(os, "listxattr", unsupported)
+    mod.atomic_write_text(p, "new")
+
+    assert p.read_text() == "new"
+    with pytest.raises(OSError):
+        os.getxattr(p, "user.test", follow_symlinks=False)
+
+
+def test_user_xattr_removed_between_listxattr_and_getxattr_is_skipped(mod, tmp_path, monkeypatch):
+    """ENODATA/ENOATTR on the per-name read is a benign race: the attribute was
+    listed and then vanished. It is genuinely absent, so skipping it is not a
+    silent loss and the write must succeed."""
+    p = tmp_path / "state.json"
+    p.write_text("old")
+    os.setxattr(p, "user.test", b"gone", follow_symlinks=False)
+    real_getxattr = os.getxattr
+
+    def racing(path, name, **kwargs):
+        if name == "user.test":
+            raise OSError(errno.ENODATA, "removed between listxattr and getxattr")
+        return real_getxattr(path, name, **kwargs)
+
+    monkeypatch.setattr(os, "getxattr", racing)
+    mod.atomic_write_text(p, "new")
+
+    assert p.read_text() == "new"
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["state.json"]
+
+
+def test_user_xattr_unreadable_raises_and_keeps_the_target(mod, tmp_path, monkeypatch):
+    """EACCES/EPERM on the per-name read is NOT tolerated. A file the caller may
+    write but not read would otherwise lose the attribute silently, which is the
+    defect this writer exists to fix; "we cannot tell" must be loud. This is a
+    bounded behaviour change versus the writer before #4641."""
+    p = tmp_path / "state.json"
+    p.write_text("old")
+    os.setxattr(p, "user.test", b"unreadable", follow_symlinks=False)
+    before = p.read_bytes()
+    real_getxattr = os.getxattr
+
+    def denied(path, name, **kwargs):
+        if name == "user.test":
+            raise OSError(errno.EACCES, "write-only file: cannot read the xattr")
+        return real_getxattr(path, name, **kwargs)
+
+    monkeypatch.setattr(os, "getxattr", denied)
+    with pytest.raises(OSError):
+        mod.atomic_write_text(p, "new")
+
+    assert p.read_bytes() == before, "the target must be untouched when a user.* read fails"
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["state.json"]
+
+
+@pytest.mark.parametrize("which", ["core", "hooks"])
+def test_no_xattr_api_is_a_no_op_not_an_error(which, tmp_path, monkeypatch):
+    """CPython exposes ``os.getxattr``/``os.setxattr``/``os.listxattr`` on
+    Linux/FreeBSD only; macOS has none of the three, so an unconditional call
+    raises ``AttributeError`` (not ``OSError``) -- and some callers catch only
+    ``OSError``. The writer must treat an absent API as "nothing to copy".
+
+    The guard is decided at import, so this cell imports a fresh copy with the
+    attributes deleted: that is the macOS import-time state. Against a writer
+    that calls the API unconditionally it raises ``AttributeError``.
+    """
+    p = tmp_path / "state.json"
+    p.write_text("old")
+
+    monkeypatch.delattr(os, "getxattr")
+    monkeypatch.delattr(os, "setxattr")
+    monkeypatch.delattr(os, "listxattr")
+    mod = _load_fresh(f"_writer_no_xattr_{which}", COPIES[which])
+
+    mod.atomic_write_text(p, "new")
+
+    assert p.read_text() == "new"
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["state.json"]
