@@ -52,7 +52,7 @@ def test_stale_engine_check_uses_fallback_for_guard_and_sys_path():
 def test_stale_engine_check_still_fails_loud_on_missing_engine():
     block = _stale_engine_block()
     assert "health/engine.py" in block
-    assert re.search(r"\[ -f [^\]]*health/engine\.py \]|test -f [^\n]*health/engine\.py", block)
+    assert re.search(r"\[ -f [^\n]*health/engine\.py\"? \]", block)
     assert "exit" in block or "||" in block
 
 

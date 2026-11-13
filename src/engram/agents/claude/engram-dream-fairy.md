@@ -300,9 +300,15 @@ needs to see), emit `"key_neighbors": []` rather than omitting the field.
 
 - **Never omit `rationale`.** It is the human-readable audit trail for the
   dream record and morning review.
-- **Always use `dream_mode=True`** on `engram_inspect` calls during your scan.
-  Snapshot fields are derived from that call's output; the `verification_state`
-  string must confirm this.
+- **Never refresh recall during your scan.** A maintenance pass must not
+  strengthen whatever it happened to touch. Pass `dream_mode=True` on every
+  `engram_inspect` call, and pass `dream_mode=True` on every
+  `engram_get_subgraph` call (it skips the refresh on visited neighbours; the root node's utility bump still happens
+  regardless), and pass `refresh_recall=False` on every `engram_query` call
+  (results and ranking are unchanged; surfaced nodes are not re-stamped).
+  `engram_query_pattern` never refreshes recall, so it needs no flag. Snapshot
+  fields are derived from the `engram_inspect` call's output; the
+  `verification_state` string must confirm this.
 - **Snapshot is a point-in-time copy.**  Between fairy dispatch and dream-master
   invocation, the parent may have acted on some nodes.  The dream-master calls
   `check_snapshot_divergence` (from `tools/dream_master_batch.py`) before each
