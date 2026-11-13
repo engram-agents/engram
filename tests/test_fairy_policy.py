@@ -449,7 +449,7 @@ class TestFairyPolicyModeLines:
             "Where that section carries an \"ask each time\" line, ask the user "
             "before each dispatch; a yes covers that task only."
         ), line
-        assert len(line) < 400
+        assert len(line) < 450
 
     def test_coder_always_ask_each_time_branch_order(self, tmp_path):
         """#4562 r2: grant, then the direct fallback, then the ask-each-time branch; once."""
@@ -470,7 +470,7 @@ class TestFairyPolicyModeLines:
             "Where that section carries an \"ask each time\" line, ask the user "
             "before each dispatch; a yes covers that task only."
         ), line
-        assert len(line) < 400
+        assert len(line) < 450
 
     def test_reviewer_always_ask_each_time_branch_order(self, tmp_path):
         """#4562 r2: grant, then the direct fallback, then the ask-each-time branch; once."""

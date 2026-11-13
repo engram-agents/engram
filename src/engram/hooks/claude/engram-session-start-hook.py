@@ -3401,7 +3401,9 @@ def fairy_policy_block() -> str:
             "no size exception, no quick-fix exception. Spec and dispatch, once "
             "sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
             "(a dated grant line or a standing request); without it, do the work "
-            "directly and say so."
+            "directly and say so. "
+            "Where that section carries an \"ask each time\" line, ask the user "
+            "before each dispatch; a yes covers that task only."
         ),
         "auto": (
             "[Coder fairy policy: auto] Use judgment per task. Before deciding on "
@@ -3419,7 +3421,9 @@ def fairy_policy_block() -> str:
             "reviewer-fairy — no size exception, no quick-fix exception. Dispatch, "
             "once sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
             "(a dated grant line or a standing request); without it, do the review "
-            "directly and say so."
+            "directly and say so. "
+            "Where that section carries an \"ask each time\" line, ask the user "
+            "before each dispatch; a yes covers that task only."
         ),
         "auto": (
             "[Reviewer fairy policy: auto] Use judgment per task. Before deciding on "
