@@ -60,12 +60,22 @@ def _check_premise_independence(conn: "sqlite3.Connection", premise_ids: list[st
     boost is unwarranted.  Returns None when premises are diverse or no
     known-lineage observations exist (undetermined).
 
+    null=self (#1572): an observation with a blank standpoint_lineage is
+    counted as this install's own lineage (``core._self_lineage()``), the same
+    read-time convention as ``_standpoint_cluster_key``; nothing is written to
+    the DB.  If self_lineage is unset or malformed, ``_self_lineage()`` returns
+    '' and such premises are skipped as undetermined (fail-closed, the
+    pre-#1572 behaviour).  The returned dict lists the premises counted this
+    way under ``null_self_premise_ids`` (empty when none).
+
     Only observation-type nodes carry meaningful standpoint_lineage.  Derived
-    nodes, axioms, and observations without standpoint_lineage are skipped.
-    If fewer than 2 observations with known lineage are found, the gate cannot
-    fire (not enough signal to conclude collinearity).
+    nodes and axioms are skipped.  If fewer than 2 observations with a
+    determined lineage are found, the gate cannot fire (not enough signal to
+    conclude collinearity).
     """
     lineage_map: dict[str, list[str]] = {}  # lineage → [node_ids]
+    null_self_ids: list[str] = []
+    self_lineage: "str | None" = None  # resolved lazily, at most once
     for nid in premise_ids:
         row = conn.execute(
             "SELECT type, standpoint_lineage FROM nodes WHERE id = ?", (nid,)
@@ -75,9 +85,17 @@ def _check_premise_independence(conn: "sqlite3.Connection", premise_ids: list[st
         if not row["type"].startswith("observation"):
             continue
         lineage = (row["standpoint_lineage"] or "").strip()
+        is_null_self = False
         if not lineage:
-            continue
+            if self_lineage is None:
+                self_lineage = core._self_lineage()
+            if not self_lineage:
+                continue
+            lineage = self_lineage
+            is_null_self = True
         lineage_map.setdefault(lineage, []).append(nid)
+        if is_null_self:
+            null_self_ids.append(nid)
 
     n_clusters = len(lineage_map)
     if n_clusters != 1:
@@ -90,13 +108,21 @@ def _check_premise_independence(conn: "sqlite3.Connection", premise_ids: list[st
     # having no lineage recorded is undetermined, not collinear.
     if len(collinear_ids) < 2:
         return None
+    null_self_in_cluster = [n for n in null_self_ids if n in collinear_ids]
+    null_self_note = (
+        f"{len(null_self_in_cluster)} of them had no standpoint_lineage and "
+        "were counted as this install's own lineage (null=self). "
+        if null_self_in_cluster else ""
+    )
     return {
         "collinear_verdict": "collinear",
         "shared_lineage": shared_lineage,
         "collinear_premise_ids": collinear_ids,
+        "null_self_premise_ids": null_self_in_cluster,
         "message": (
             f"independence_advisory: all {len(collinear_ids)} observation premise(s) "
             f"share standpoint_lineage '{shared_lineage}'. "
+            f"{null_self_note}"
             "inductive_generalization confidence (0.95 level) assumes independent "
             "sources — same-lineage premises are correlated, not independent. "
             "Consider: (a) adding a cross-lineage observation before generalizing, "
