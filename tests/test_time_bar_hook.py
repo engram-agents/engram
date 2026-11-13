@@ -313,6 +313,26 @@ class TestLoopWakeClassification:
         payload = _cc_payload(loop_body)
         assert tbh._is_human_prompt(payload) is False
 
+    def test_cc_payload_canonical_stub_is_not_human(self):
+        """CC-2.1.195 shape + the canonical ScheduleWakeup stub body -> non-human.
+
+        #4719 round 2: "Loop continuation. Read ..." is the stub the standard
+        engram-loop skill writes when the marker carries no loop_prompt. It is
+        machine-sent and must not stamp last-user-activity.
+        """
+        payload = _cc_payload("Loop continuation. Read the marker.")
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_cc_payload_autonomous_loop_sentinel_is_not_human(self):
+        """CC-2.1.195 shape + the back-compat autonomous-loop sentinel -> non-human."""
+        payload = _cc_payload("<<autonomous-loop>>")
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_cc_payload_autonomous_loop_dynamic_sentinel_is_not_human(self):
+        """CC-2.1.195 shape + the dynamic autonomous-loop sentinel -> non-human."""
+        payload = _cc_payload("<<autonomous-loop-dynamic>>")
+        assert tbh._is_human_prompt(payload) is False
+
     def test_cc_payload_no_prompt_source_key(self):
         """Fixture must not carry promptSource — verify our fixture is faithful."""
         payload = _cc_payload("hello")
