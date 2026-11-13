@@ -330,7 +330,7 @@ def test_fallback_marker_equals_loop_prompt_marker(
     spec = importlib.util.spec_from_file_location("eod_hook_under_test", HOOK_PATH)
     hook = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(hook)
-    sys.path.insert(0, str(HOOK_PATH.parent.parent.parent / "tools"))  # restored by the window
+    sys.path.append(str(HOOK_PATH.parent.parent.parent / "tools"))  # restored by the window; append, never position 0 (#2063)
     import loop_prompt
 
     assert hook._LOOP_WAKE_MARKER_FALLBACK == "<loop-wake>"
