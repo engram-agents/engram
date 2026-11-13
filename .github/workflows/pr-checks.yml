@@ -35,7 +35,8 @@ name: pr-checks
 #      hooks-stdout-audit below: a gate positioned outside the path where
 #      the decision is made cannot protect the thing it audits.)
 #   9. hooks-stdout-audit         (#2718 — BLOCKING when the diff touches
-#      src/engram/hooks/ or hooks.json, self-skips otherwise; the audit
+#      src/engram/hooks/, hooks.json or the audit's own test file (#2733),
+#      self-skips otherwise; the audit
 #      (tests/test_hooks_json_stdout_audit.py) previously ran ONLY in the
 #      nightly full suite, so a plaintext-stdout regression to a shipped
 #      hook (#2700) went green through pr-checks and broke hours later in
