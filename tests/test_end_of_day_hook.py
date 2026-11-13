@@ -303,7 +303,7 @@ def test_loop_wake_prompt_is_silent(engram_home: Path) -> None:
     assert stdout.strip() == ""
 
 
-def test_loop_wake_prompt_with_leading_whitespace_is_silent(engram_home: Path) -> None:
+def test_loop_wake_prompt_after_leading_whitespace_is_silent_pins_strip(engram_home: Path) -> None:
     rc, stdout = _run_hook(f"  \n\t{_WAKE_MARKER} {_EOD_TEXT}", engram_home)
     assert rc == 0
     assert stdout.strip() == ""

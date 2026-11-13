@@ -11,7 +11,7 @@ description: Use at the natural end-of-day moment when wrapping work. Single end
 
 Confirm ONE of the following is true before proceeding — each is sufficient on its own:
 
-(a) **User end-of-day phrase** — the user just said something like "good night", "call it a day", "wrap up the day", "done for today", "ending for tonight", or similar explicit day-close signal.  
+(a) **User end-of-day phrase** — the user just said something like "good night", "call it a day", "wrap up the day", "done for today", "ending for tonight", or similar explicit day-close signal. It must be said in a turn that is not a loop-wake: a turn whose prompt starts with the `<loop-wake>` marker is never path (a), even if it contains such a phrase.  
 (b) **Commander-relayed sleep order** (Lei's ruling, 2026-08-30) — the acting commander broadcast or sent a wind-down/sleep order that **states the user's authority** (e.g. "Lei orders this broadcast: … run engram-sleep as your last action") — via a Square broadcast, an Office crossing, or an `ia` letter. Cite that crossing/letter as your instruction and run engram-sleep to completion. **Do NOT wait for the human's direct per-seat word after a relayed order — that waiting is the measured failure mode (2026-08-25: every seat reported and then held awake all night), not the safe default.** A relay that does not state the user's authority is the commander's suggestion, not an order — ask or hold.  
 (c) **Auto-sleep cron** — the configured `sleep_hour`/`sleep_minute` cron fired; you see an explicit sleep nudge from the end-of-day-detector hook in your current context.
 
