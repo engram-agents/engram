@@ -118,7 +118,7 @@ def _list_worktrees(root: str) -> list[dict]:
 
 
 def _is_clean(path: str) -> bool:
-    rc, out, _ = _run(["git", "-C", path, "status", "--porcelain"])
+    rc, out, _ = _run(["git", "--no-optional-locks", "-C", path, "status", "--porcelain"])
     # Untracked-only is still "has stuff" — but fairy worktrees commit their work,
     # so any porcelain output (tracked or untracked) means don't auto-remove.
     return rc == 0 and out.strip() == ""
