@@ -597,3 +597,53 @@ def test_absent_removexattr_is_a_no_op_not_an_error(which, tmp_path, monkeypatch
 
     assert p.read_text() == "new"
     assert sorted(entry.name for entry in tmp_path.iterdir()) == ["state.json"]
+
+
+def test_dir_fd_write_replacing_an_existing_file_skips_the_copy(mod, tmp_path):
+    """Under dir_fd the metadata copy is skipped, and it must not raise.
+
+    This is the composition cell: without the ``dir_fd is None`` conjunct the
+    read resolves ``a.json`` against the process CWD and raises ENOENT, which
+    is NOT in the tolerance set -- so a registration write would succeed the
+    first time (no target yet) and fail every session after.
+    """
+    d = tmp_path / "reg"
+    d.mkdir()
+    target = d / "a.json"
+    target.write_text("old")
+    os.setxattr(target, "user.test", b"source-value", follow_symlinks=False)
+
+    dir_fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        mod.atomic_write_text("a.json", "new", dir_fd=dir_fd, mode=0o644)
+    finally:
+        os.close(dir_fd)
+
+    assert target.read_text() == "new"
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644
+    with pytest.raises(OSError) as exc_info:
+        os.getxattr(target, "user.test", follow_symlinks=False)
+    assert exc_info.value.errno in (
+        errno.ENODATA,
+        getattr(errno, "ENOATTR", errno.ENODATA),
+    ), f"the copy was not skipped under dir_fd: user.test survived ({exc_info.value})"
+
+
+def test_mode_applied_before_the_acl_so_the_preserved_mask_survives(mod, tmp_path):
+    """``mode=`` must never run after the ACL copy: fchmod rewrites the ACL
+    mask, which is the final word on the group bits (#4682 measured it)."""
+    p = tmp_path / "state.json"
+    p.write_text("old")
+    before_acl = _set_named_acl(p)
+
+    mod.atomic_write_text(p, "new", mode=0o600)
+
+    assert p.read_text() == "new"
+    # The file's mode here is whatever the preserved ACL encodes (0o644 for
+    # _minimal_named_acl), NOT mode=0o600: the ACL mask is the final word on
+    # the group bits, by design.  Asserting the blob, not the mode, is the
+    # point of this cell.
+    assert os.getxattr(p, ACL, follow_symlinks=False) == before_acl, (
+        "the preserved ACL was altered by the mode= application; fchmod after "
+        "setxattr rewrites mask::, so mode= must come first"
+    )

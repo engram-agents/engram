@@ -428,7 +428,7 @@ def is_own_server_py_running(engram_home: str) -> bool:
         return False
 
 
-def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = True) -> None:
+def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = True, mode=None, dir_fd=None) -> None:
     """Atomically replace ``path`` with ``text`` (#4013).  The one shared
     mode-, group-, ACL- and user-xattr-preserving writer: an existing file keeps
     its permission bits and, where permitted, its group; a new file gets what ``write_text``
@@ -440,7 +440,29 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     REGULAR file, never from a link's target.  Pass ``follow_symlinks=False`` for any path under a
     directory other users can write (a planted link would otherwise redirect the write); the default
     True exists for paths the caller owns and links on purpose, such as config.json via
-    ``write_config_json``.  Needs write access to the containing directory (same-UID
+    ``write_config_json``.  ``mode``, when given, is applied with fchmod to the
+    TEMP file before the atomic rename (#4682) — so a caller placing a file in a
+    directory other users can write never needs a post-replace chmod that an
+    attacker could redirect through a swapped link.
+
+    ``dir_fd`` binds EVERY step — the existing-target probe, the temp creation,
+    the atomic replace and the failure cleanup — to an open directory
+    descriptor instead of re-resolving ``path`` (#4682 TOCTOU): a co-tenant who
+    swaps a path component for a symlink AFTER the caller opened and checked
+    the directory cannot redirect any step, because no step looks at the path
+    again.  ``path`` must then be a bare basename, and anything else is refused
+    with ValueError: an ABSOLUTE path makes os.open/os.replace ignore ``dir_fd``
+    entirely (no error, no pinning), and a relative path carrying a component
+    resolves into a SUBDIRECTORY that was never the directory the caller opened
+    and checked.  Either form would quietly reintroduce the hole.  (Measured,
+    not assumed: a relative ``sub/f`` under ``dir_fd`` really does land in the
+    pinned directory, so the refusal is about the directory that was verified,
+    not about ``dir_fd`` being ignored wholesale.)  The temp is staged 0o600
+    (private) in that case, even for a new target; pass ``mode`` for the final
+    bits.
+
+    Needs write access to the
+    containing directory (same-UID
     callers).  On any error the temp file is removed and the error re-raised;
     ``path`` is never left partial.  Named POSIX ACL entries
     (``system.posix_acl_access``) and ``user.*`` extended attributes are copied
@@ -474,23 +496,52 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     the ownership assumption: in a directory other users can write, the source's
     ACL and ``user.*`` values are attacker-controlled and are propagated to the
     new inode -- the same class of trust as the pre-existing mode copy, stated
-    here rather than left implied.  Duplicated here because this module must
+    here rather than left implied.
+    Under ``dir_fd`` that copy is SKIPPED: ``os.getxattr``/``os.setxattr``
+    accept no ``dir_fd`` and ``target`` is then a bare name resolved against the
+    process CWD.  A pre-existing target's named ACL entries and ``user.*``
+    xattrs are therefore NOT carried over in that mode -- its mode and group
+    still are -- so a caller that needs both must use a path-based write.
+    Duplicated here because this module must
     stay self-contained; kept AST-identical with
     ``engram_config_io.atomic_write_text`` (tests/test_atomic_write_parity_4013.py)."""
-    target = os.path.realpath(path) if follow_symlinks else os.path.abspath(path)
-    try:
-        st = os.stat(target) if follow_symlinks else os.lstat(target)
-    except OSError:
-        st = None
-    copy_mode = st is not None and (follow_symlinks or stat.S_ISREG(st.st_mode))
+    if dir_fd is None:
+        target = os.path.realpath(path) if follow_symlinks else os.path.abspath(path)
+        try:
+            st = os.stat(target) if follow_symlinks else os.lstat(target)
+        except OSError:
+            st = None
+        copy_mode = st is not None and (follow_symlinks or stat.S_ISREG(st.st_mode))
+    else:
+        # The caller pinned the containing directory with an fd.  A bare name
+        # is the only form that resolves INSIDE that directory: an absolute
+        # path makes os.open/os.replace ignore dir_fd (no error, no pinning),
+        # and a relative path carrying a component resolves into a
+        # subdirectory nobody checked.  Both are refused rather than silently
+        # reintroducing the symlink-swap hole.
+        if os.path.dirname(path):
+            raise ValueError(
+                "atomic_write_text(dir_fd=...) needs a bare basename, got "
+                f"{path!r}: an absolute path makes os.open/os.replace ignore "
+                "dir_fd, and a relative subpath resolves below the verified "
+                "directory, so the write would not be pinned"
+            )
+        target = path
+        try:
+            st = os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            st = None
+        copy_mode = st is not None and stat.S_ISREG(st.st_mode)
     # An existing file's staging copy starts private (0600) and gets the old mode
     # only after the payload is written; a new file or a replaced link keeps the
-    # umask / default-ACL policy of a plain open().
-    create_mode = 0o600 if copy_mode else 0o666
+    # umask / default-ACL policy of a plain open().  Through dir_fd the staging
+    # copy is ALWAYS private: it lands inside a directory other users can write,
+    # so pass `mode` for the final bits.
+    create_mode = 0o600 if copy_mode or dir_fd is not None else 0o666
     for _ in range(8):
         tmp = f"{target}.{secrets.token_hex(8)}.tmp"
         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, create_mode)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, create_mode, dir_fd=dir_fd)
             break
         except FileExistsError:
             continue
@@ -508,17 +559,22 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
                 except PermissionError:
                     pass  # not a member of that group: the new inode keeps its own
                 os.fchmod(fh.fileno(), stat.S_IMODE(st.st_mode))
+            if mode is not None:
+                os.fchmod(fh.fileno(), mode)
             # ACL entries and user.* xattrs are inode metadata too, and the
             # rename installs a new inode: read them from the file being
             # replaced and apply them to the temp.  This is the LAST metadata
             # step before the publish, deliberately: fchmod rewrites the ACL
             # mask (the mask is the final word on the group bits), so a mode
             # change after setxattr would silently alter the preserved ACL.
-            # It must stay after every fchmod, including any mode= application.
-            # Under a dir_fd-based write the copy must be skipped or made
-            # fd-relative: target is then a bare name resolved against the
-            # process CWD, and os.getxattr/os.setxattr take no dir_fd parameter.
-            if copy_mode and _XATTR_API:
+            # It must stay after every fchmod, INCLUDING the mode= above.
+            # Under dir_fd the copy is SKIPPED (see the closure below): target
+            # is then a bare name resolved against the process CWD, and
+            # os.getxattr/os.setxattr take no dir_fd parameter.  Without the
+            # guard the read raises ENOENT -- which is NOT in the tolerance
+            # set -- on every write that REPLACES an existing file, i.e. from
+            # the second session on, while the first one still worked.
+            if copy_mode and _XATTR_API and dir_fd is None:
                 try:
                     acl = os.getxattr(target, "system.posix_acl_access", follow_symlinks=False)
                 except OSError as exc:
@@ -554,16 +610,16 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
                                 continue
                             raise
                         os.setxattr(tmp, name, value, follow_symlinks=False)
-        os.replace(tmp, target)
+        os.replace(tmp, target, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except BaseException:
         try:
-            os.unlink(tmp)
+            os.unlink(tmp, dir_fd=dir_fd)
         except OSError:
             pass
         raise
 
 
-def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks=False):
+def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks=False, mode=None, dir_fd=None):
     """Write JSON atomically through `atomic_write_text`: build the content in a
     temp file in the SAME directory, fsync it, then os.replace() it over the
     destination.
@@ -605,9 +661,17 @@ def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks
 
     `indent` is passed to `json.dumps`; `encoding` is passed to
     `atomic_write_text`, which opens the temp file with it (None, the default
-    here, means the locale default, as a bare open() would). Extend the
+    here, means the locale default, as a bare open() would). `mode`, when
+    given, is applied to the temp file before the atomic replace (#4682):
+    use it for a file in a directory other users can write, so no
+    post-replace chmod can be redirected through a swapped link. Extend the
     signature to fit a call site's real need rather than working around a
     mismatch with a post-write patch.
+
+    ``dir_fd``, when given, binds the WHOLE write to an open directory fd
+    (#4682): ``path`` must then be a bare basename, and neither the temp nor
+    the replace re-resolves the path, so a link swapped in after the directory
+    was checked cannot redirect the write. See ``atomic_write_text``.
 
     NOT for every write in this codebase. Two documented exceptions exist
     and must NOT be converted to this helper (see docs/internal/DEVELOPMENT.md /
@@ -618,7 +682,7 @@ def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks
         own mode rather than keeping the existing file's).
     """
     atomic_write_text(path, json.dumps(data, indent=indent), encoding=encoding,
-                      follow_symlinks=follow_symlinks)
+                      follow_symlinks=follow_symlinks, mode=mode, dir_fd=dir_fd)
 
 
 # ---------------------------------------------------------------------------

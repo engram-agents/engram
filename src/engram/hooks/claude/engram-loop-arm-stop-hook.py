@@ -959,11 +959,57 @@ QUIET_WAKE_OBSERVE_OR_ARM_TOOLS = frozenset({
     "Read", "Glob", "Grep",
 }) | _UMWELT_READ_VERBS
 
+# #4642: the printed study-queue command must RUN AS PRINTED.  Two things are
+# resolved rather than assumed:
+#
+#  * the interpreter: the plugin venv, an INSTALLATION ARTIFACT at ~/.engram/venv,
+#    independent of ENGRAM_HOME (CLAUDE.md "Infrastructure Locations"; install.sh
+#    VENV_DIR="$HOME/.engram/venv"; tools/home_path_gate.py's
+#    'engram_home_derived_venv' class), so it is NOT built from this hook's
+#    engram_home() result above -- that would name a path that does not exist on a
+#    non-default home;
+#  * the script: `tools/study_queue.py` does not exist at the repo root (source:
+#    src/engram/tools/; deployed: the plugin root's tools/), so a bare relative path
+#    resolves in NO cwd.  Same policy as `_loop_prompt_helper_path` above:
+#    $CLAUDE_PLUGIN_ROOT first, then this file's own tree up to and including its
+#    tree root (#3983), and the relative form only when nothing resolves.
+#
+# `{n}` stays a literal placeholder: only the command fragment is an f-string, the
+# surrounding message is unchanged.
+_VENV_PYTHON = os.path.expanduser("~/.engram/venv/bin/python3")
+
+_sq_candidates = []
+_sq_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+if _sq_plugin_root:
+    _sq_candidates.append(Path(_sq_plugin_root) / "tools")
+for _sq_parent in _bounded_parents(Path(__file__).resolve()):
+    _sq_candidates.append(_sq_parent / "tools")
+_SQ_TOOLS_DIR = None
+for _sq_candidate in _sq_candidates:
+    try:
+        _sq_found = (_sq_candidate / "study_queue.py").exists()
+    except OSError:
+        continue
+    if _sq_found:
+        _SQ_TOOLS_DIR = _sq_candidate
+        break
+
+
+def _study_queue_helper_path() -> str:
+    """The printed path of tools/study_queue.py: the directory this hook's own tree
+    resolution found, absolute and shell-quoted; else the relative form (never a
+    broken absolute path)."""
+    if _SQ_TOOLS_DIR is not None:
+        return shlex.quote(str(Path(_SQ_TOOLS_DIR) / "study_queue.py"))
+    return "tools/study_queue.py"
+
+
 _QUIET_NUDGE_TEXT = (
     "[Quiet Wake Check: {n} quiet wakes in a row (no work done, only looking "
     "and re-arming). Take an OWNER step from your board, or run ONE study unit: "
     "one target, one method, one written ENGRAM result. Next act: run "
-    "`python3 tools/study_queue.py` once it exists (alpha #3919 M3); until "
+    f"`{shlex.quote(_VENV_PYTHON)} {_study_queue_helper_path()}` once it exists "
+    "(alpha #3919 M3); until "
     "then read the latest dream report's `For the awake seat` section "
     "(`~/.engram/history/dream/`, most recent file).]"
 )

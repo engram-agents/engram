@@ -193,8 +193,11 @@ class TestGetModeOverride:
         # Verify it's active immediately.
         mode, _ = mod.get_mode()
         assert mode == "user"
-        # Wait for expiry.
-        time.sleep(1.1)
+        # #4017: advance the clock get_mode reads instead of sleeping on the wall clock.
+        real_time = time.time
+        monkeypatch.setattr(
+            mod, "time", types.SimpleNamespace(time=lambda: real_time() + 5.0)
+        )
         mode, _ = mod.get_mode()
         assert mode == "auto"
 

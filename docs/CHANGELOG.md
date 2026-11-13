@@ -11,6 +11,16 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- The write-time `anchoring_advisory` on every observation write now matches a
+  claim's hard tokens only at token boundaries. `#404` is no longer reported as
+  anchored by a quote containing `#4040`, nor `404` by `4040`, `4.404` or
+  `5,404`. A number that lies inside another hard token (the `1234` in
+  `ob_1234`, a digit run inside a hex sha, the year in a date) is part of that
+  token and is no longer counted separately, so a verbatim quote still anchors
+  fully. Seven-digit and longer all-decimal runs are classified as numbers, not
+  hex shas, and take the strict rule: an all-digit sha is no longer accepted as
+  the prefix of a longer all-digit sha, while a sha with letters still is. Hex
+  shas remain case-insensitive. (#4206)
 - The touched-test selector (`run_touched_tests.py`) now finds the tests for
   changes under `src/engram`. Before, it only looked at the old repo-root layout,
   so a change to `server.py` or `engram_core.py` fell back to the whole suite.
@@ -21,6 +31,15 @@ with an `-alpha` suffix during the alpha phase.
   The "SUBSET green" line now says the full suite runs nightly and at the
   release cut. `--json` gains `layers` and `unreferenced` keys; no key is
   removed. (#4358)
+
+### Fixed
+- The Quiet Wake nudge now prints a command that runs as printed: the plugin venv
+  interpreter (`~/.engram/venv/bin/python3`) and the study-queue tool's absolute
+  path. On a host whose only `python3` is older than 3.10, the tool re-execs under
+  that venv instead of crashing while importing `engram_core`; a re-exec that does
+  not reach a 3.10+ interpreter (a wrapper script, or a venv that is itself older)
+  fails once rather than retrying. With no usable venv it refuses with one line on
+  stderr and exit 3, before doing any work. (#4642)
 
 ### Docs
 - The `engram-trust-tier` skill no longer describes a `force=true` override that `engram_set_trust_tier` does not have: it now names the real gate (`justification_obs_id` and `primary_user_approval_obtained`) and says the call fails closed without them (engram#4303). The handbook says config updates are `PUT /api/config/<key>`, not POST (engram#4461).

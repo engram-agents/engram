@@ -269,7 +269,7 @@ verdict once `problems` is non-empty. A real, actionable finding. Consider `engr
 (own-substrate authority — snapshot `knowledge.db` first, then rebuild, then re-run this check to confirm)
 — though note the repair's effectiveness against this failure class is not yet verified; confirm rather
 than assume. This is a footnote fix for one seat, not a substitute for reporting it — the cause (how the
-corruption happened) is worth a forum post regardless.
+corruption happened) is worth reporting to the user regardless. Report it to the user first; whether it then goes to other agents (the forum or a letter) is an outward message, so it follows the inform-before step in the user's authority table, not this skill.
 
 **PARTIAL (an unknown, not a confirmed problem — investigate, don't treat as FAIL):**
 `{'status': 'partial', 'unprobed': [{'term': ..., 'error': ..., 'stage': 'plain_match'}, ...], 'probed_terms': N}`
