@@ -789,19 +789,25 @@ def test_bad_entry_re_error_does_not_echo_exception_text(tmp_path, capsys):
     with pytest.raises(re.error) as info:
         re.compile(pattern)
     assert _TOK_RE in str(info.value)
+    # "error" on 3.12, "PatternError" on 3.13+.
+    cls = type(info.value).__name__
     bad = {"regex": pattern, "label": "okbad"}
     entries = [_good("okone"), bad, _good("oktwo")]
     patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
     assert [lbl for _, lbl in patterns] == ["okone", "oktwo"]
-    _assert_reported_by_position(err, 2, "error", entries)
+    _assert_reported_by_position(err, 2, cls, entries)
 
 
 def test_bad_entry_label_is_not_echoed(tmp_path, capsys):
+    # Derive the class name ("error" on 3.12, "PatternError" on 3.13+).
+    with pytest.raises(re.error) as info:
+        re.compile(f"(?P={_TOK_RE})")
+    cls = type(info.value).__name__
     bad = {"regex": f"(?P={_TOK_RE})", "label": _TOK_LABEL}
     entries = [_good("okone"), bad]
     patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
     assert [lbl for _, lbl in patterns] == ["okone"]
-    _assert_reported_by_position(err, 2, "error", entries)
+    _assert_reported_by_position(err, 2, cls, entries)
 
 
 def test_bad_entry_not_a_dict_reported_by_position(tmp_path, capsys):
