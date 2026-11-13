@@ -8079,7 +8079,7 @@ def engram_set_recall_summaries(payload_json: str) -> str:
             "errors": [{"node_id": "...", "error": "...", ...}, ...],
             "applied": N,
             "failed": M,
-            "needs_reembed": ["..."],  # every pending node from this batch
+            "needs_reembed": ["..."],  # unique targets whose latest applied entry is pending
             "summaries_file": "<path>"  # present only when summaries_file was used
         }
     """

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -80,6 +81,44 @@ def node_row(srv, node_id):
 
 def apply(srv, entries):
     return json.loads(srv.engram_set_recall_summaries(payload_json=json.dumps({"summaries": entries})))
+
+
+def vec_row(srv, node_id):
+    conn = srv._get_db()
+    try:
+        row = conn.execute("SELECT embedding FROM vec_nodes WHERE node_id = ?", (node_id,)).fetchone()
+        return None if row is None else row[0]
+    finally:
+        conn.close()
+
+
+def require_real_vec(srv, core):
+    if not core._VEC_BACKEND_AVAILABLE or core._sqlite_vec is None:
+        pytest.skip("REAL sqlite-vec unavailable in this interpreter")
+    conn = srv._get_db()
+    try:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'vec_nodes'").fetchone() is None:
+            pytest.skip("REAL sqlite-vec store unavailable in this isolated fixture")
+    finally:
+        conn.close()
+
+
+def seed_vector_pair(srv, core, node_id, vector, *, summary="old summary", keywords=None, metadata=None):
+    """Install a deliberately consistent JSON + REAL vec baseline for rollback controls."""
+    conn = srv._get_db()
+    try:
+        conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
+        conn.execute("INSERT INTO vec_nodes VALUES (?, ?)", (
+            node_id, core._sqlite_vec.serialize_float32(vector),
+        ))
+        conn.execute(
+            "UPDATE nodes SET recall_summary = ?, recall_keywords = ?, embedding = ?, metadata = ? WHERE id = ?",
+            (summary, json.dumps(keywords or ["old-one", "old-two", "old-three"]),
+             json.dumps(vector), json.dumps(metadata or {}), node_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def test_summary_only_and_keywords_only_refresh_full_canonical_recipe(monkeypatch):
@@ -287,3 +326,199 @@ def test_same_input_retry_clears_only_its_own_debt_and_diagnose_is_current_only(
     assert debt["count"] == 1 and debt["sample_ids"] == [node_b] and debt["flare"] is True, debt
     assert old not in debt["sample_ids"]
     assert fake.texts[-1] == "retry A\nA retry one two three"
+
+
+def test_successful_real_vec_refresh_matches_fresh_float32_oracle(monkeypatch):
+    """A strict success verifies both canonical JSON and the REAL vec mirror bytes."""
+    srv = fresh_server()
+    node_id = add_obs(srv, "real mirror claim")
+    fake, core = install_fake_encoder(monkeypatch, srv)
+    require_real_vec(srv, core)
+
+    result = apply(srv, [entry(node_id, "real mirror summary", ["one", "two", "three"])])
+    assert result["ok"] == [{"node_id": node_id, "embedding_refresh": "refreshed"}], result
+    expected = [float(len(fake.texts[-1])) + i / 1000 for i in range(384)]
+    assert json.loads(node_row(srv, node_id)["embedding"]) == expected
+    assert vec_row(srv, node_id) == core._sqlite_vec.serialize_float32(expected)
+
+
+def test_real_core_insert_after_delete_failure_restores_both_vectors_and_marks_debt(monkeypatch):
+    """The actual core helper's vec INSERT failure rolls back its preceding DELETE."""
+    srv = fresh_server()
+    node_id = add_obs(srv, "actual core mirror failure")
+    fake, core = install_fake_encoder(monkeypatch, srv)
+    require_real_vec(srv, core)
+    old_vector = [7.0 + i / 1000 for i in range(384)]
+    old_metadata = {"unrelated": "keep"}
+    seed_vector_pair(srv, core, node_id, old_vector, metadata=old_metadata)
+    old_json = node_row(srv, node_id)["embedding"]
+    old_mirror = vec_row(srv, node_id)
+    original_get_db = core._get_db
+
+    def authorizing_db():
+        conn = original_get_db()
+        conn.set_authorizer(
+            lambda action, arg1, _arg2, _db, _source: (
+                sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_INSERT and arg1 == "vec_nodes"
+                else sqlite3.SQLITE_OK
+            )
+        )
+        return conn
+
+    monkeypatch.setattr(core, "_get_db", authorizing_db)
+    result = apply(srv, [entry(node_id, "new summary survives", ["one", "two", "three"])])
+    assert fake.texts, "the real _compute_and_store_embedding path must have embedded first"
+    assert result["ok"] == [{
+        "node_id": node_id, "embedding_refresh": "pending", "embedding_refresh_reason": "mirror",
+    }], result
+    row = node_row(srv, node_id)
+    assert row["recall_summary"] == "new summary survives"
+    assert row["embedding"] == old_json
+    assert vec_row(srv, node_id) == old_mirror
+    metadata = json.loads(row["metadata"])
+    assert metadata["unrelated"] == "keep"
+    assert metadata["embedding_refresh_pending"]["reason"] == "mirror"
+
+
+@pytest.mark.parametrize("via_file", [False, True], ids=["inline", "file"])
+def test_rejected_peers_preserve_vectors_and_debt_while_valid_peer_applies(monkeypatch, tmp_path, via_file):
+    """Validation/not-found/non-current peers have no effects in either payload transport."""
+    srv = fresh_server()
+    invalid = add_obs(srv, "invalid peer")
+    missing = "ob_999999"
+    old = add_obs(srv, "historical peer")
+    valid = add_obs(srv, "valid peer")
+    fake, core = install_fake_encoder(monkeypatch, srv)
+    require_real_vec(srv, core)
+    conn = srv._get_db()
+    try:
+        conn.execute("UPDATE nodes SET is_current = 0 WHERE id = ?", (old,))
+        conn.commit()
+    finally:
+        conn.close()
+    debt = {"embedding_refresh_pending": {"reason": "unavailable", "stage": "strict_refresh", "at": "2026-01-01T00:00:00Z"}}
+    for number, node_id in enumerate((invalid, old), start=1):
+        seed_vector_pair(srv, core, node_id, [float(number)] * 384, metadata=debt)
+    before = {node_id: (dict(node_row(srv, node_id)), vec_row(srv, node_id)) for node_id in (invalid, old)}
+    entries = [
+        entry(invalid, "invalid must not apply", ["only", "two"]),
+        entry(missing, "missing must not apply", ["one", "two", "three"]),
+        entry(old, "old must not apply", ["one", "two", "three"]),
+        entry(valid, "valid does apply", ["one", "two", "three"]),
+    ]
+    if via_file:
+        payload_file = tmp_path / "mixed.json"
+        payload_file.write_text(json.dumps({"summaries": entries}), encoding="utf-8")
+        result = json.loads(srv.engram_set_recall_summaries(payload_json=json.dumps({"summaries_file": str(payload_file)})))
+    else:
+        result = apply(srv, entries)
+    assert result["applied"] == 1 and result["failed"] == 3, result
+    assert result["ok"] == [{"node_id": valid, "embedding_refresh": "refreshed"}], result
+    assert fake.texts, "the valid peer should still perform its strict refresh"
+    for node_id, expected in before.items():
+        assert (dict(node_row(srv, node_id)), vec_row(srv, node_id)) == expected
+
+
+class AvailabilitySequence:
+    def __init__(self, availability):
+        self.availability = iter(availability)
+        self.texts = []
+
+    def is_available(self):
+        return next(self.availability)
+
+    def embed(self, text, _model):
+        self.texts.append(text)
+        return [1.0] * 384
+
+
+def test_needs_reembed_is_latest_applied_debt_per_target_in_stable_order(monkeypatch):
+    """A later strict success removes only that target's earlier response debt."""
+    srv = fresh_server()
+    node_a = add_obs(srv, "duplicate target A")
+    node_b = add_obs(srv, "still pending target B")
+    _fake, core = install_fake_encoder(monkeypatch, srv)
+    monkeypatch.setattr(core, "_embedder", AvailabilitySequence([False, False, True]))
+    result = apply(srv, [
+        entry(node_a, "A pending", ["one", "two", "three"]),
+        entry(node_b, "B pending", ["one", "two", "three"]),
+        entry(node_a, "A refreshed", ["one", "two", "three"]),
+    ])
+    assert [item["embedding_refresh"] for item in result["ok"]] == ["pending", "pending", "refreshed"], result
+    assert result["needs_reembed"] == [node_b], result
+    assert "embedding_refresh_pending" not in json.loads(node_row(srv, node_a)["metadata"])
+    assert "embedding_refresh_pending" in json.loads(node_row(srv, node_b)["metadata"])
+
+
+def test_needs_reembed_latest_pending_replaces_earlier_success(monkeypatch):
+    srv = fresh_server()
+    node_id = add_obs(srv, "success then pending")
+    _fake, core = install_fake_encoder(monkeypatch, srv)
+    monkeypatch.setattr(core, "_embedder", AvailabilitySequence([True, False]))
+    result = apply(srv, [
+        entry(node_id, "first succeeds", ["one", "two", "three"]),
+        entry(node_id, "second pending", ["one", "two", "three"]),
+    ])
+    assert [item["embedding_refresh"] for item in result["ok"]] == ["refreshed", "pending"], result
+    assert result["needs_reembed"] == [node_id], result
+    assert "embedding_refresh_pending" in json.loads(node_row(srv, node_id)["metadata"])
+
+
+@pytest.mark.parametrize("later", ["invalid", "error"])
+def test_needs_reembed_ignores_later_non_applied_attempt(monkeypatch, later):
+    srv = fresh_server()
+    node_id = add_obs(srv, f"pending then {later}")
+    _fake, core = install_fake_encoder(monkeypatch, srv, available=False)
+    if later == "error":
+        # The first marker write is allowed.  The second (successful-refresh
+        # clear) is rejected, so its outer entry savepoint reports an error.
+        conn = srv._get_db()
+        try:
+            conn.execute(
+                "CREATE TRIGGER reject_marker_clear BEFORE UPDATE OF metadata ON nodes "
+                "WHEN NEW.id = '%s' AND NEW.metadata NOT LIKE '%%embedding_refresh_pending%%' "
+                "BEGIN SELECT RAISE(FAIL, 'marker clear rejected'); END" % node_id
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        monkeypatch.setattr(core, "_embedder", AvailabilitySequence([False, True]))
+        second = entry(node_id, "second errors", ["one", "two", "three"])
+    else:
+        second = entry(node_id, "invalid", ["only", "two"])
+    result = apply(srv, [entry(node_id, "first pending", ["one", "two", "three"]), second])
+    assert result["ok"][0]["embedding_refresh"] == "pending", result
+    assert result["failed"] == 1, result
+    assert result["needs_reembed"] == [node_id], result
+    assert "embedding_refresh_pending" in json.loads(node_row(srv, node_id)["metadata"])
+
+
+def test_marker_bookkeeping_failure_rolls_back_that_entry_but_keeps_earlier_peer(monkeypatch):
+    srv = fresh_server()
+    earlier = add_obs(srv, "earlier peer")
+    target = add_obs(srv, "bookkeeping failure peer")
+    _fake, core = install_fake_encoder(monkeypatch, srv)
+    require_real_vec(srv, core)
+    old_vector = [9.0] * 384
+    old_metadata = {"unrelated": "survives"}
+    seed_vector_pair(srv, core, target, old_vector, metadata=old_metadata)
+    before_target = (dict(node_row(srv, target)), vec_row(srv, target))
+    conn = srv._get_db()
+    try:
+        conn.execute(
+            "CREATE TRIGGER reject_target_metadata BEFORE UPDATE OF metadata ON nodes "
+            "WHEN NEW.id = '%s' BEGIN SELECT RAISE(FAIL, 'bookkeeping unavailable'); END" % target
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    result = apply(srv, [
+        entry(earlier, "earlier accepted", ["one", "two", "three"]),
+        entry(target, "target must roll back", ["one", "two", "three"]),
+    ])
+    assert result["applied"] == 1 and result["failed"] == 1, result
+    assert result["ok"] == [{"node_id": earlier, "embedding_refresh": "refreshed"}], result
+    assert result["errors"][0]["node_id"] == target and "bookkeeping unavailable" in result["errors"][0]["error"]
+    assert node_row(srv, earlier)["recall_summary"] == "earlier accepted"
+    assert (dict(node_row(srv, target)), vec_row(srv, target)) == before_target

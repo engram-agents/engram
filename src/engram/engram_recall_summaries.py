@@ -251,12 +251,17 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
         else:
             valid_entries.append(entry)
 
-    # -- Apply valid entries in a single transaction --
+    # -- Apply valid entries with independent per-entry transactions --
     ok: list[dict] = []
-    needs_reembed: list[str] = []
+    # Per-entry `ok` retains every attempt.  The response-level debt is instead
+    # one stable-order state per target, overwritten only by a successfully
+    # applied entry, so a later strict refresh can resolve earlier batch debt.
+    response_debt_by_node: dict[str, bool] = {}
     warnings: list[str] = []
     conn = core._get_db()
     try:
+        # Each outermost entry savepoint commits independently on RELEASE.
+        # This is the best-effort peer-isolation transaction boundary.
         with conn:
             for entry in valid_entries:
                 node_id = entry["node_id"].strip()
@@ -308,8 +313,9 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
                     conn.execute("RELEASE recall_summary_entry")
                     item = {"node_id": node_id, **refresh}
                     ok.append(item)
-                    if refresh["embedding_refresh"] == "pending" and node_id not in needs_reembed:
-                        needs_reembed.append(node_id)
+                    response_debt_by_node[node_id] = (
+                        refresh["embedding_refresh"] == "pending"
+                    )
                 except Exception as exc:  # noqa: BLE001
                     conn.execute("ROLLBACK TO recall_summary_entry")
                     conn.execute("RELEASE recall_summary_entry")
@@ -317,6 +323,9 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
     finally:
         conn.close()
 
+    needs_reembed = [
+        node_id for node_id, is_pending in response_debt_by_node.items() if is_pending
+    ]
     result = {
         "ok": ok,
         "errors": errors,
