@@ -280,8 +280,12 @@ soma stays Ariadne's as principal approver and merger (*Scope* above). Two group
 to the **merge seats** instead (Kepler and Borges on all org repos, with Ariadne on
 umwelt and soma, per *Scope* and *Who presses the button* above):
 
-- a PR with **no project owner**, a **release cut** (a `dev`→`main` release PR or a
-  hotfix PR into `main`), and a **reconcile** PR;
+- a PR with **no project owner**, the **merge-back** of a release branch into `dev`
+  (`docs/internal/RELEASING.md` step 10), and a **reconcile** PR. The two release
+  actions that write to `main` or to `release/*` (the fast-forward of `main` to the
+  head of the release PR, and a soak-fix copy into `release/*`) are NOT a merge
+  seat's: the rulesets let only a release-team account make them, so they go to
+  **the release seat** (same page, steps 5 and 7);
 - *(retired 2026-10-22 23:31Z, see the Amendment above)* ~~a PR whose author is its
   project owner goes to a merge seat for the press~~ — **the owner presses their own PR**
   once the record below is posted; the hand-off to a seat was clerical once the record
@@ -418,14 +422,16 @@ seat can run it and any other seat can check that it ran.
    pressing: `--match-head-commit` pins only the head, never the base, so without
    this check two owners can each pass a scratch run on the same base and the second
    presses on a tree it never tested (the 2026-09-13 jointly-broken case, Borges).
-   Every PR into `main`
-   (release cut, hotfix, reconcile) and a `main`→`dev` reconcile merge as a **merge
-   commit** (`docs/internal/RELEASING.md`); every other PR into `dev` squashes; a member of a
+   The release PR into `main` is **never merged with the button**: `main` is
+   fast-forwarded to its head (`docs/internal/RELEASING.md`, steps 6 to 8), and there
+   is no hotfix PR into `main`. A release branch that carries its own commits comes
+   back into `dev` as a **merge commit** (same page, step 10); every other PR into
+   `dev` squashes, and a soak-fix copy into `release/*` squashes; a member of a
    linked stack merges with `gh stack merge` (plain `gh pr merge` is refused there).
    On a repo with no `dev` branch (local-model-lab and gpu-broker, both read
-   2026-11-03), every PR targets `main` and merges as a **squash**. The merge-commit
-   rule above is engram's rule for release cuts, hotfixes and reconciles; it
-   does not apply there. Both of those repos set `squash_merge_commit_message` to
+   2026-11-03), every PR targets `main` and merges as a **squash**. The fast-forward
+   and merge-commit rules above are engram's rules for releases; they
+   do not apply there. Both of those repos set `squash_merge_commit_message` to
    `COMMIT_MESSAGES`, so the branch's commit messages ride into the squash and the
    close-keyword read covers them (CLAUDE.md § PR — issue closure, check 3).
 9. **On umwelt, merge does not promote** (Ariadne): prod promotion stays a separate,
@@ -464,7 +470,7 @@ change.
 *Queue status: NOT AVAILABLE on this repository (Team plan, private), measured 2026-10-22 16:05Z.*
 
 **What the merge seats still do.** Kepler and Borges (Ariadne on umwelt) keep the
-seat for ownerless PRs, release cuts, reconciles, the seats whose user has not granted
+seat for ownerless PRs, release merge-backs, reconciles, the seats whose user has not granted
 merge clicks (*Who* above), ⛔-list and security PRs, and any merge an owner declines ("I'd rather a second pair
 of eyes" is always allowed and never a demerit); the commander keeps the day-end
 sample of merge records. The seat is no longer the serial point; the written gate is.
