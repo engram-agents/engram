@@ -480,21 +480,29 @@ class TestS5Preservation:
 # ---------------------------------------------------------------- S6 ----
 
 class TestS6Atomic:
-    def test_replace_failure_leaves_original_and_no_temp(self, tmp_path, monkeypatch):
+    def test_failed_write_leaves_original_in_same_inode_and_no_temp(self, tmp_path, monkeypatch):
+        """An existing config.json is rewritten in place (the guard keeps its inode, so its ACL
+        and xattrs survive). A write that fails part-way puts the old bytes back in that same
+        inode; nothing is left beside it but the stamped backup."""
         p = _cfg(tmp_path, {"agent_name": "n"})
-        before = p.read_bytes()
+        before, inode = p.read_bytes(), p.stat().st_ino
         mod = _tool()
+        real, calls = mod.fg._write_all, []
 
-        def boom(*a, **k):
-            raise OSError("simulated replace failure")
+        def fail_first(fd, data):
+            calls.append(len(data))
+            if len(calls) == 1:
+                os.write(fd, data[: len(data) // 2])
+                raise OSError("simulated write failure")
+            real(fd, data)
 
-        monkeypatch.setattr(mod.os, "replace", boom)
+        monkeypatch.setattr(mod.fg, "_write_all", fail_first)
         r = mod.set_forum_url(p, URL)
         assert r.status != "written", r
-        assert p.read_bytes() == before
+        assert p.read_bytes() == before and p.stat().st_ino == inode
         assert _no_temp_left(tmp_path, ["config.json"], with_backups=True)
-        # The stamped backup is a copy taken BEFORE the write (the failing os.replace is the write's
-        # last step), so exactly one exists and it holds the old bytes; a second file is a stray.
+        # The stamped backup is a copy taken BEFORE the write, so exactly one exists and it holds
+        # the old bytes; a second file is a stray.
         backups = [x for x in tmp_path.iterdir() if ".engram-backup." in x.name]
         assert len(backups) == 1 and backups[0].read_bytes() == before, backups
 
@@ -509,19 +517,26 @@ class TestS6Atomic:
         _tool().set_forum_url(p, URL)
         assert _no_temp_left(tmp_path, ["config.json"], with_backups=True)
 
-    def test_temp_is_in_same_directory(self, tmp_path, monkeypatch):
+    def test_existing_file_keeps_its_inode(self, tmp_path):
+        p = _cfg(tmp_path, {"agent_name": "n"})
+        inode = p.stat().st_ino
+        assert _tool().set_forum_url(p, URL).status == "written"
+        assert p.stat().st_ino == inode and json.loads(p.read_text())["forum"] == {"url": URL}
+
+    def test_existing_file_is_written_without_a_temp_or_rename(self, tmp_path, monkeypatch):
+        """set_forum_url only ever changes an existing config.json (a missing one is refused), so
+        no temp file and no rename take part: either would give the file a new inode."""
         p = _cfg(tmp_path, {})
         mod = _tool()
-        seen = {}
-        real = os.replace
-
-        def spy(src, dst):
-            seen["src"], seen["dst"] = Path(src), Path(dst)
-            return real(src, dst)
-
-        monkeypatch.setattr(mod.os, "replace", spy)
-        mod.set_forum_url(p, URL)
-        assert seen["src"].parent == seen["dst"].parent == tmp_path
+        used = []
+        for name in ("replace", "rename", "link"):
+            real = getattr(os, name)
+            monkeypatch.setattr(mod.fg.os, name,
+                                lambda *a, _n=name, _r=real, **k: (used.append((_n, Path(a[1]).name)), _r(*a, **k))[1])
+        assert mod.set_forum_url(p, URL).status == "written"
+        # The only publish is the stamped backup's (a copy taken first); config.json itself is
+        # never the target of a rename or link.
+        assert len(used) == 1 and used[0][0] == "link" and ".engram-backup." in used[0][1], used
 
     def test_symlink_written_through_link_kept(self, tmp_path):
         real_dir = tmp_path / "real"

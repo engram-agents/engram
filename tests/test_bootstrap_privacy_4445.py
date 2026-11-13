@@ -1002,19 +1002,27 @@ def test_c6_merge_keeps_non_ascii_literal_utf8(tmp_path):
 
 
 def test_c6_final_write_oserror_is_refused_with_install_otherwise_complete(tmp_path):
+    """The settings.json write is the guard's in-place rewrite; fail it part-way. The guard puts
+    the old bytes back in the same file (its mtime moves: it was written twice) and says so; the
+    step adds that the rest of the install is complete."""
     p = _seed_settings(tmp_path, b'{"model": "x"}\n')
-    before = _snap(p)
+    before_bytes, before_mode, before_ino = p.read_bytes(), stat.S_IMODE(p.stat().st_mode), p.stat().st_ino
     code = (
         "import sys, importlib.util\n"
         f"sys.argv = [{str(BOOTSTRAP)!r}, '--retention-days', '90']\n"
         f"spec = importlib.util.spec_from_file_location('bootstrap_4445w', {str(BOOTSTRAP)!r})\n"
         "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
-        # The settings.json write now happens inside the guard's merge; fail only that one write.
-        "real = m.fg.atomic_write_text\n"
-        "def boom(path, *a, **k):\n"
-        "    if str(path).endswith('settings.json'): raise OSError(28, 'No space left on device')\n"
-        "    return real(path, *a, **k)\n"
-        "m.fg.atomic_write_text = boom\n"
+        # The settings.json write happens inside the guard's merge, in place; fail its first
+        # write part-way (half the bytes, then a full disk). The put-back that follows succeeds.
+        "import os\n"
+        "real = m.fg._write_all\n"
+        "calls = []\n"
+        "def boom(fd, data):\n"
+        "    calls.append(1)\n"
+        "    if len(calls) == 1:\n"
+        "        os.write(fd, data[: len(data) // 2]); raise OSError(28, 'No space left on device')\n"
+        "    return real(fd, data)\n"
+        "m.fg._write_all = boom\n"
         "m.main()\n"
     )
     env = os.environ.copy()
@@ -1023,8 +1031,9 @@ def test_c6_final_write_oserror_is_refused_with_install_otherwise_complete(tmp_p
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
     out = r.stdout + r.stderr
     assert r.returncode != 0, out
-    assert "REFUSED" in out and "otherwise complete" in out and "No space left" in out
-    assert _snap(p) == before
+    assert "REFUSED" in out and "otherwise complete" in out and "No space left" in out and "put back" in out
+    assert p.read_bytes() == before_bytes and stat.S_IMODE(p.stat().st_mode) == before_mode
+    assert p.stat().st_ino == before_ino
     assert (tmp_path / ".engram" / "knowledge.db").exists()
 
 
@@ -1067,14 +1076,17 @@ def test_c3_directory_loses_exactly_group_and_other_bits(tmp_path, mode, want):
 
 
 def test_c6_lone_surrogate_in_settings_is_refused_not_a_traceback(tmp_path):
+    """Content that cannot be encoded is refused before the file is opened or backed up: bytes,
+    mode, mtime and inode all unchanged, and no stamped backup."""
     p = _seed_settings(tmp_path, b'{"note": "\\ud800"}\n')
-    before = _snap(p)
+    before, before_ino = _snap(p), p.stat().st_ino
     r = _run(tmp_path, ["--retention-days", "90"])
     out = r.stdout + r.stderr
     assert r.returncode != 0, out
     assert "Traceback" not in out, out
     assert "REFUSED" in out and "otherwise complete" in out
-    assert _snap(p) == before
+    assert _snap(p) == before and p.stat().st_ino == before_ino
+    assert list(p.parent.glob("settings.json.engram-backup.*")) == []
     assert (tmp_path / ".engram" / "knowledge.db").exists()
 
 
