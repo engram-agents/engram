@@ -420,7 +420,9 @@ def test_the_restore_command_in_the_message_keeps_the_acl_and_xattr(tmp_path, mo
 # Names that break a restore command built from naive single quotes: the apostrophe ends the
 # quoted operand, and the rest are the shell metacharacters that quoting must keep literal.
 # The apostrophe is the one the old form got wrong; the others pin the surrounding behaviour so
-# a "fix" that drops the quoting entirely cannot pass.
+# a "fix" that drops the quoting entirely cannot pass. "-dash.md" is a different class: `cat`
+# reads a leading-dash operand as options, which the `--` marker prevents. Under `tmp_path` its
+# operand still begins with "/", so this row pins the name only -- see the cell docstring.
 RESTORE_HOSTILE_NAMES = [
     "it's.md",
     "a b.md",
@@ -431,22 +433,30 @@ RESTORE_HOSTILE_NAMES = [
     "amp&and.md",
     'quote".md',
     "paren(1).md",
+    "-dash.md",
 ]
 
 
 @pytest.mark.parametrize("name", RESTORE_HOSTILE_NAMES)
 def test_the_restore_command_works_for_a_hostile_file_name(tmp_path, monkeypatch, name):
-    """The printed restore command must work for ANY absolute path and absolute backup name.
+    """The printed restore command must work for ANY operand, whatever its name or shape.
 
     Contract: take the substring after "Restore it with: " from the REFUSED message and run it
     verbatim as `/bin/sh -c "<command>"`. It restores the backup's bytes into `path`, writing
     INTO the existing inode (`cat backup > path`), so the file's ACL and extended attributes
     survive. This cell checks the bytes; the ACL/xattr half is pinned by its sibling cell.
 
-    Bound, stated rather than papered over: both values are absolute, already-resolved paths at
-    every real call site (`write_in_place` says the caller passes a path resolved with realpath),
-    so a name beginning with "-" is not a reachable `cat` operand. This does NOT claim the fix
-    covers relative names.
+    Safety is a property of the command's shape, not of its operands: `--` ends `cat`'s options
+    before the backup operand, and the destination is a shell redirect target that never
+    reaches `cat` as an argument. Both are `shlex.quote`d as well. Nothing rests on the
+    operands being absolute or already resolved: the shipped callers pass a path that is
+    absolute in the default configuration and resolve a symlink to its target first, but a
+    regular file's path is passed through as given, so a relative or "-"-leading operand is
+    reachable in principle (a home variable that starts with "-" makes one).
+
+    The "-dash.md" row is the name-level check, not a check of `--`: under `tmp_path` every
+    operand is absolute, so that row still begins with "/" and it passes with the marker
+    removed (measured, not assumed). The marker has no failing row here.
     """
     path = tmp_path / name
     text = "mine\n"
