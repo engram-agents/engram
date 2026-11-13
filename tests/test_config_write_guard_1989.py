@@ -457,3 +457,46 @@ def test_pin_4705_db_open_regenerates_default_config_today(tmp_path):
     core._get_db().close()
     assert core.CONFIG_PATH.exists()
     assert json.loads(core.CONFIG_PATH.read_text())["self_lineage"] == ""
+
+
+# ------------------------------------------------- round 4: two controls ---
+
+def _unreadable(cio, path):
+    try:
+        json.loads("{")
+    except json.JSONDecodeError as e:
+        return cio.ConfigUnreadableError(path, e)
+
+
+@pytest.mark.parametrize("kind", ["unreadable", "shrink"])
+def test_c3_only_config_missing_is_turned_into_an_error_result(tmp_path, monkeypatch, kind):
+    """The lifecycle catch is NARROW: any other error from the turn write
+    propagates out of the tool instead of becoming {"error": ...}."""
+    server = _fresh_server(str(tmp_path))
+    import engram_core as core
+    import engram_config_io as cio
+    server.engram_diagnose()  # bootstrap first
+    exc = (_unreadable(cio, core.CONFIG_PATH) if kind == "unreadable"
+           else cio.ConfigShrinkError(core.CONFIG_PATH, ["a_key"]))
+
+    def boom(turn):
+        raise exc
+    monkeypatch.setattr(core, "_set_current_turn", boom)
+    with pytest.raises(type(exc)):
+        server.engram_advance_turn(json.dumps({"message": "sleep"}))
+
+
+def test_a4_prune_orders_by_parsed_stamp_not_mtime(tmp_path, cio):
+    """Nine seeded backups whose mtimes are INVERTED against their stamps (newest
+    stamp, oldest mtime), then one guarded write: the seven kept are the newest by
+    STAMP (the new backup plus the six newest seeded stamps)."""
+    p = _cfg(tmp_path, {"v": 0})
+    seeded = []
+    for i in range(9):
+        b = tmp_path / (PREFIX + f"20250101T00000{i}Z")
+        b.write_text("{}")
+        os.utime(b, (1_000_000 - i * 1000, 1_000_000 - i * 1000))  # higher stamp -> older mtime
+        seeded.append(b.name)
+    new = cio.write_engram_config(p, {"v": 1})
+    kept = set(_backups(tmp_path))
+    assert kept == {new.name, *seeded[3:]}, kept
