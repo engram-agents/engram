@@ -149,6 +149,7 @@ except Exception:
 # bring the false human stamp back.
 _PEER_MESSAGE_PREAMBLE = "Another Claude session sent a message:"
 
+# Pinned equal to engram-deference-detector-prompt.py's copy by tests/test_nonhuman_prompt_vocabulary_4686.py.
 _NON_HUMAN_PREFIXES = (
     "<task-notification",
     "<command-message",

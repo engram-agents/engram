@@ -264,6 +264,29 @@ class TestPromptHookCooldownWrite:
                 "Prompt hook should NOT write cooldown for canonical loop continuation stub"
             )
 
+    def test_prompt_skips_cooldown_for_task_notification(self):
+        """A <task-notification> prompt is machine-sent (#4686) → cooldown NOT written.
+
+        End-to-end cell through the real hook entrypoint: task notifications are
+        not human keystrokes, so they must not open the deference cooldown window.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_loop_marker(tmp)
+
+            cooldown_path = Path(tmp) / "deference-cooldown-at.txt"
+
+            stdin = json.dumps({
+                "session_id": "test-session",
+                "transcript_path": "",
+                "prompt": "<task-notification><task-id>x</task-id></task-notification>",
+            })
+            result = _run_hook(PROMPT_HOOK, {"ENGRAM_HOME": tmp}, stdin=stdin)
+
+            assert result.returncode == 0
+            assert not cooldown_path.exists(), (
+                "Prompt hook should NOT write cooldown for a machine-sent task notification"
+            )
+
     def test_prompt_skips_cooldown_for_empty_prompt(self):
         """Empty prompt (headless/older CC) → cooldown NOT written.
 

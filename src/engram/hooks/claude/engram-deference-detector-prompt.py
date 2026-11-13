@@ -127,6 +127,25 @@ try:
 except Exception:
     _LOOP_WAKE_MARKER = _LOOP_WAKE_MARKER_FALLBACK
 
+# #4369: Claude Code delivers a cross-session peer message as a UserPromptSubmit
+# prompt whose body begins with this harness line. It is not a human keystroke.
+_PEER_MESSAGE_PREAMBLE = "Another Claude session sent a message:"
+
+# The machine-sent prompt vocabulary. engram-time-bar-hook.py carries its own
+# copy of this tuple ON PURPOSE (its header explains: it must run when a
+# sibling lib cannot import), so the two lists are kept equal by
+# tests/test_nonhuman_prompt_vocabulary_4686.py rather than by a shared
+# import. Add a member to one, add it to both, or the test reddens.
+_NON_HUMAN_PREFIXES = (
+    "<task-notification",
+    "<command-message",
+    "<command-name",
+    "<local-command",
+    "Stop hook feedback",
+    _LOOP_WAKE_MARKER,
+    _PEER_MESSAGE_PREAMBLE,
+)
+
 
 def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
     """Return True if the prompt looks like a cron-fired heartbeat, not a real user message."""
@@ -135,6 +154,12 @@ def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
     # instead of real angle brackets) still classifies identically to the
     # plain form. One normalize here covers every check below (gh#1649).
     stripped = html.unescape(prompt).strip()
+    # Machine-sent prompt vocabulary (#4686): task notifications, slash-command
+    # blocks, local-command blocks, Stop-hook feedback, loop wakes and the
+    # cross-session peer preamble. Kept equal to the time-bar hook's own copy
+    # by tests/test_nonhuman_prompt_vocabulary_4686.py.
+    if stripped.startswith(_NON_HUMAN_PREFIXES):
+        return True
     # SSoT loop-wake marker (format_loop_prompt prepends this; see tools/loop_prompt.py).
     if stripped.startswith(_LOOP_WAKE_MARKER):
         return True
