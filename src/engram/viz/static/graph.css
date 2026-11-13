@@ -499,9 +499,6 @@
     .node-label { font-size: 10px; fill: #ccd; pointer-events: none; }
     .status-ring { pointer-events: none; }
     .link { stroke-opacity: 0.65; }
-    .link.supersedes { stroke-dasharray: 5 3; }
-    .link.resolves { stroke-dasharray: 6 3; }
-    .link.retracts { stroke-dasharray: 3 3; }
 
     /* ── Top nav ────────────────────────────────────────────────────── */
     /* .nav/.nav a/.nav a:hover consolidated into static/base.css
