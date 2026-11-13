@@ -13,14 +13,16 @@ Contract (written before the rewording; the cells below are the stated behaviour
   localStorage key, an added statement) are reported; a reworded comment or docstring is not.
 - C. Only a comment or docstring may change: so the diff for any other viz file type is reported.
 
-Limits stated plainly: with no ``origin/dev`` to compare to the cell skips (it is a per-PR check, and
-once the branch is merged the diff is empty and it passes trivially).  The JS tokenizer is a
+Limits stated plainly: cell A is opt-in (``ENGRAM_CHECK_4255S7=1``): it was a one-shot check for the
+slice-7 branch, and in the normal suite it fails on every later branch that legitimately changes viz code
+(#4457).  With no ``origin/dev`` to compare to it skips too.  The JS tokenizer is a
 heuristic: a regex literal it mis-reads could hide a change.  It is a second pair of eyes beside the
 diff reading, not a proof.
 """
 from __future__ import annotations
 
 import ast
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -180,6 +182,10 @@ _BASE = _base()
 _FILES = _changed_viz_files(_BASE) if _BASE else []
 
 
+@pytest.mark.skipif(
+    os.environ.get("ENGRAM_CHECK_4255S7") != "1",
+    reason="one-shot check for #4255 slice 7; opt in with ENGRAM_CHECK_4255S7=1 (#4457)",
+)
 @pytest.mark.skipif(_BASE is None, reason="no origin/dev to compare against")
 @pytest.mark.parametrize("rel", _FILES or [pytest.param(None, marks=pytest.mark.skip(reason="no viz file changed"))])
 def test_a_changed_viz_file_differs_only_in_comments_and_docstrings(rel):
