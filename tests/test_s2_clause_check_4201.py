@@ -1010,6 +1010,17 @@ def test_b1_and_m1_differ_on_404_vs_4040(cc):
     assert "substring" in cc.check_b1.__doc__
 
 
+def test_b1_is_the_pre_4206_baseline_while_anchor_moves(cc, anchoring):
+    # The baseline is implemented inside check_b1 precisely so it does NOT move when anchor()
+    # moves (#4206 made anchor() token-boundary-aware). This cell reddens if the baseline ever
+    # borrows anchor() again, or if anchor()'s older substring behaviour is restored.
+    quote, clause = "error 4040 returned", "error 404 returned"
+    r = cc.check_b1(quote, clause)
+    assert r["verdict"] == "STATED"
+    assert r["unanchored"] == []
+    assert anchoring.anchor(clause, quote).unanchored == ["404"]
+
+
 # ---- 2. the freeze covers the dependencies
 DEP_FIELDS = {"engram_anchoring_sha256": "engram_anchoring", "s2_score_sha256": "_s2"}
 

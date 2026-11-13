@@ -80,7 +80,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import engram_anchoring  # noqa: E402
-from engram_anchoring import _hard_tokens_with_class, anchor, quote_claim_similarity  # noqa: E402
+from engram_anchoring import _HEX_SHA_CLASS, _hard_tokens_with_class, quote_claim_similarity  # noqa: E402
 
 # s2_score is reused by import, not copied (loaded by path: the `tools` package name is contested,
 # as in s2_clause_sheet). Its private helpers (_load_sheet_inputs, _check_structure, _labels_of,
@@ -280,9 +280,17 @@ def check_b0(quote: str, clause: str) -> dict:
 
 
 def check_b1(quote: str, clause: str) -> dict:
-    """NOT iff anchor(clause, quote) leaves a hard token unanchored. anchor() matches hard tokens by
-    substring: that is the shipped advisory's behaviour, kept as-is here for the baseline."""
-    unanchored = anchor(clause, quote).unanchored
+    """NOT iff the historical substring check leaves a hard token unanchored. This baseline is the
+    shipped advisory's pre-#4206 behaviour -- ``tok in quote``, case-insensitive for the hex-sha
+    class only -- implemented here rather than borrowed from engram_anchoring.anchor(): that
+    matcher became token-boundary-aware in #4206 and may move again, and a baseline must not move
+    with the thing it is a baseline of."""
+    quote_lower = quote.lower()
+    unanchored = [
+        tok
+        for tok, cls in _hard_tokens_with_class(clause)
+        if not (tok.lower() in quote_lower if cls == _HEX_SHA_CLASS else tok in quote)
+    ]
     return {"verdict": NOT if unanchored else STATED, "unanchored": unanchored}
 
 
