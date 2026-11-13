@@ -3398,7 +3398,10 @@ def fairy_policy_block() -> str:
         ),
         "always": (
             "[Coder fairy policy: always] Every PR coding task gets a fairy — "
-            "no size exception, no quick-fix exception. Spec and dispatch."
+            "no size exception, no quick-fix exception. Spec and dispatch, once "
+            "sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
+            "(a dated grant line or a standing request); without it, do the work "
+            "directly and say so."
         ),
         "auto": (
             "[Coder fairy policy: auto] Use judgment per task. Before deciding on "
@@ -3413,7 +3416,10 @@ def fairy_policy_block() -> str:
         ),
         "always": (
             "[Reviewer fairy policy: always] Every PR review task gets a "
-            "reviewer-fairy — no size exception, no quick-fix exception. Dispatch."
+            "reviewer-fairy — no size exception, no quick-fix exception. Dispatch, "
+            "once sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
+            "(a dated grant line or a standing request); without it, do the review "
+            "directly and say so."
         ),
         "auto": (
             "[Reviewer fairy policy: auto] Use judgment per task. Before deciding on "
