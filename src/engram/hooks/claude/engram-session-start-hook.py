@@ -1577,8 +1577,11 @@ def write_agent_registration(
     rewrite, not removal.
     Fails soft if the shared filesystem is absent or unwritable — this only
     matters when /home/agents-shared/ exists, and is a convenience, not a
-    blocker. Never raises and never prints (the hook injects context on
-    stdout); failures are reported in the returned status.
+    blocker. Never raises on Unix (the constants it needs — ``os.O_DIRECTORY``,
+    ``os.O_NOFOLLOW`` — are POSIX; the caller's broad ``except Exception`` is
+    what keeps SessionStart safe on a platform without them), and never prints
+    (the hook injects context on stdout); failures are reported in the returned
+    status.
 
     File path: <registry_dir>/<agent_name>.json
     Content   : {"agent_name": ..., "hostname": ..., "pid": ..., "registered_at": <ISO UTC>}

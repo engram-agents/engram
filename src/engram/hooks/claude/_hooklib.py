@@ -407,11 +407,16 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
     descriptor instead of re-resolving ``path`` (#4682 TOCTOU): a co-tenant who
     swaps a path component for a symlink AFTER the caller opened and checked
     the directory cannot redirect any step, because no step looks at the path
-    again.  ``path`` must then be a bare basename; os.open and os.replace
-    SILENTLY IGNORE ``dir_fd`` for a path with a directory component (no error,
-    no pinning), so such a path is refused with ValueError rather than quietly
-    reintroducing the hole.  The temp is staged 0o600 (private) in that case,
-    even for a new target; pass ``mode`` for the final bits.
+    again.  ``path`` must then be a bare basename, and anything else is refused
+    with ValueError: an ABSOLUTE path makes os.open/os.replace ignore ``dir_fd``
+    entirely (no error, no pinning), and a relative path carrying a component
+    resolves into a SUBDIRECTORY that was never the directory the caller opened
+    and checked.  Either form would quietly reintroduce the hole.  (Measured,
+    not assumed: a relative ``sub/f`` under ``dir_fd`` really does land in the
+    pinned directory, so the refusal is about the directory that was verified,
+    not about ``dir_fd`` being ignored wholesale.)  The temp is staged 0o600
+    (private) in that case, even for a new target; pass ``mode`` for the final
+    bits.
 
     Needs write access to the
     containing directory (same-UID
@@ -427,15 +432,18 @@ def atomic_write_text(path, text, *, encoding="utf-8", follow_symlinks: bool = T
             st = None
         copy_mode = st is not None and (follow_symlinks or stat.S_ISREG(st.st_mode))
     else:
-        # The caller pinned the containing directory with an fd.  os.open and
-        # os.replace IGNORE dir_fd for a path that carries a directory
-        # component (no error, no pinning), so a non-bare name here would
-        # silently reintroduce the symlink-swap hole.
+        # The caller pinned the containing directory with an fd.  A bare name
+        # is the only form that resolves INSIDE that directory: an absolute
+        # path makes os.open/os.replace ignore dir_fd (no error, no pinning),
+        # and a relative path carrying a component resolves into a
+        # subdirectory nobody checked.  Both are refused rather than silently
+        # reintroducing the symlink-swap hole.
         if os.path.dirname(path):
             raise ValueError(
                 "atomic_write_text(dir_fd=...) needs a bare basename, got "
-                f"{path!r}: os.open/os.replace ignore dir_fd for a path with a "
-                "directory component, so the write would not be pinned"
+                f"{path!r}: an absolute path makes os.open/os.replace ignore "
+                "dir_fd, and a relative subpath resolves below the verified "
+                "directory, so the write would not be pinned"
             )
         target = path
         try:
