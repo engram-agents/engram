@@ -108,7 +108,10 @@ messages.
   extended attribute and one of its keys. With a copy of a `.claude.json` that
   Claude Code had used for months, `model` stayed `opus`. A fresh home on one
   Linux machine with a newer build did not reproduce the change, and that
-  difference is not explained (#4628). The marketplace step comes before the
+  difference is not explained (#4628). On that Linux machine both replaced
+  files kept their permission mode (600, 640 and 644 were tried) and a newly
+  created `~/.claude.json` had mode 600; the mode of a replaced file was not
+  measured on macOS. The marketplace step comes before the
   installer's question about an existing `CLAUDE.md`, so a run that stops at
   that question has already run that step (and any migration) and has created
   the data folder, but has not run the plugin install; `CLAUDE.md` itself is
