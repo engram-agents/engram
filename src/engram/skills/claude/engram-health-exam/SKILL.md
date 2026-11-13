@@ -251,10 +251,11 @@ term (engram-alpha#2678, forum #398).
 ```bash
 python3 -c "
 import sys, sqlite3, os
+from pathlib import Path
 sys.path.insert(0, sys.argv[1] + '/marketplace/plugins/engram')
 import engram_backup
 p = sys.argv[1] + '/knowledge.db'
-conn = sqlite3.connect(f'file:{p}?mode=ro', uri=True)  # read-only -- this step reads a possibly-corrupt graph
+conn = sqlite3.connect(Path(p).absolute().as_uri() + '?mode=ro', uri=True)  # read-only -- this step reads a possibly-corrupt graph
 print(engram_backup.check_fts_integrity(conn))
 " "${ENGRAM_HOME:-$HOME/.engram}"
 ```

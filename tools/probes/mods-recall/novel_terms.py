@@ -121,7 +121,7 @@ def extract(text: str, db: Path, top_k: int) -> list[str]:
     sys.path.insert(0, str(resolve_runtime_dir()))
     from engram_idf import JUNK_STOPLIST, STOPWORDS, extract_keywords  # noqa: E402
 
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+    conn = sqlite3.connect(Path(db).absolute().as_uri() + "?mode=ro", uri=True, timeout=1.0)
     try:
         n_docs = conn.execute("SELECT COUNT(*) FROM nodes WHERE is_current = 1").fetchone()[0]
         if n_docs == 0:
