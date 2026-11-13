@@ -2548,17 +2548,12 @@ def test_2186_self_heal_skip_branch_fires_on_stale_in_memory_nodes_fts():
         import io
         import contextlib
 
-        # The self-heal block's SKIP diagnostic is a plain print() (stdout),
-        # matching its own sibling "repairing..." branch in the same
-        # if/else -- NOT the file=sys.stderr convention
-        # _take_pre_migration_backup_if_pending uses for its own, differently
-        # worded in-memory-skip message. Capture stdout accordingly; an
-        # earlier draft of this test wrongly assumed stderr by analogy with
-        # that other function and failed against the real code, which is
-        # exactly the kind of assumption this test exists to catch rather
-        # than make.
+        # Startup diagnostics must preserve MCP stdout for protocol frames;
+        # capture both streams so this exercised SKIP branch proves its
+        # diagnostic reaches stderr rather than stdout.
         stdout_buf = io.StringIO()
-        with contextlib.redirect_stdout(stdout_buf):
+        stderr_buf = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
             try:
                 core._run_db_one_time_setup(mem_conn)
             except ValueError:
@@ -2566,13 +2561,18 @@ def test_2186_self_heal_skip_branch_fires_on_stale_in_memory_nodes_fts():
         mem_conn.close()
 
         captured_out = stdout_buf.getvalue()
-        assert "in-memory" in captured_out and "SKIPPED" in captured_out, (
-            f"expected the #2186 self-heal SKIP diagnostic on stdout (the "
-            f"branch this test exists to exercise), got stdout={captured_out!r}"
+        captured_err = stderr_buf.getvalue()
+        assert captured_out == "", (
+            f"the #2186 self-heal SKIP diagnostic must not corrupt MCP stdout, "
+            f"got stdout={captured_out!r}"
         )
-        assert "#2186" in captured_out, (
+        assert "in-memory" in captured_err and "SKIPPED" in captured_err, (
+            f"expected the #2186 self-heal SKIP diagnostic on stderr (the "
+            f"branch this test exists to exercise), got stderr={captured_err!r}"
+        )
+        assert "#2186" in captured_err, (
             f"expected the SKIP diagnostic to cite #2186 (matching the "
-            f"engram_core.py source), got stdout={captured_out!r}"
+            f"engram_core.py source), got stderr={captured_err!r}"
         )
     finally:
         shutil.rmtree(core_test_dir, ignore_errors=True)
