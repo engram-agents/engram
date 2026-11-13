@@ -33,11 +33,9 @@ the unified payload_json signature as of 2026-05-27.
   against `dev` (exceptions: a soak-fix copy, the release PR).
 - **`main`** is GitHub's default branch and holds releases (a plain clone lands
   on a tagged release, which the installer needs). Routine PRs do NOT target it.
-- **`release/X.Y.Z`** (Lei, 2026-11-13) is cut from `dev` at a candidate, for
-  tags and soak; **`dev` is not frozen.** A soak fix lands on `dev` first,
-  then on the release branch by PR. The release PR `release/X.Y.Z` →
-  `main` runs the full suite (required on `main`); `main` is
-  fast-forwarded, never merged, to the soaked commit and tagged. See
+- **`release/X.Y.Z`** (Lei, 2026-11-13) is cut from `dev` at a candidate;
+  **`dev` is not frozen.** The release PR `release/X.Y.Z` → `main` runs the
+  full suite; `main` is fast-forwarded, never merged. See
   `docs/internal/RELEASING.md`.
 - **CI cost model (#1597):** dev PRs run only the cheap combined `pr-checks`
   (static scrubs). The **full pytest suite does NOT run

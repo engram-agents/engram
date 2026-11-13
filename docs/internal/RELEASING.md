@@ -236,7 +236,8 @@ gh run view <run-id> --repo engram-agents/engram --json event,headSha,conclusion
 ```
 
 The first command prints one line for **every** run of the check on that
-commit, and more than one is normal: a hand-started run on the candidate tag
+commit; the run id for the second command is the number after `/runs/` in each
+line's `run` URL. More than one line is normal: a hand-started run on the candidate tag
 shows up under the same name (measured on v0.5.7-rc3: two rows, one from a
 hand-started run on the tag and one from the release pull request). **Pick the
 row by its event, not by its colour.** For each row, read its run with the
@@ -362,6 +363,12 @@ git ls-remote origin 'refs/tags/vX.Y.Z^{}' refs/heads/main refs/heads/release/X.
 The tag and its push sit inside the check on purpose. If step 7 stopped and
 `main` is still the previous release, this block must tag nothing: a release
 tag on the wrong commit could never be corrected.
+
+Between step 7 and this step `main` sits on a commit that carries only a
+candidate tag, so a plain clone in that window lands on `vX.Y.Z-rcN`. The
+content is the release's and the installer accepts it; the window is expected
+and should be minutes. (The old order, tag before fast-forward, had no such
+window, but could tag a commit `main` then failed to reach.)
 
 Before the tag, `main` must equal the release pull request's head. After it,
 the commit the tag peels to, `main` and the release branch head must be one
