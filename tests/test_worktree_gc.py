@@ -848,3 +848,30 @@ def test_age_guard_boundary_age_equal_to_guard_prunes(tmp_path):
         action, reason = _classify_real(root, wt, "worktree-agent-edge",
                                         age_guard_seconds=guard)
     assert action == "SKIP", reason
+
+
+def test_is_clean_does_not_refresh_a_stale_index_4695(tmp_path):
+    """#4695: the gc's own clean check must not write the index. A plain
+    `git status` rewrites an index whose stat data is stale (index mtime older
+    than the files'), which would reset the measured age to zero."""
+    root, wt = _real_worktree(tmp_path, "worktree-agent-stale")
+    admin = _admin_dir(wt)
+    old = time.time() - (_mod.AGE_GUARD_SECONDS + 3 * 3600)
+    for rel in ("HEAD", "logs/HEAD"):
+        if (admin / rel).exists():
+            os.utime(admin / rel, (old, old))
+    # Files newer than the index: the racy shape a plain status refreshes.
+    recent = time.time() - 60
+    for f in wt.iterdir():
+        if f.is_file() and f.name != ".git":
+            os.utime(f, (recent, recent))
+    os.utime(admin / "index", (old, old))
+    index_before = (admin / "index").stat().st_mtime_ns
+    age_before = _mod._worktree_age_seconds(str(wt))
+
+    assert _mod._is_clean(str(wt)) is True
+
+    assert (admin / "index").stat().st_mtime_ns == index_before
+    age_after = _mod._worktree_age_seconds(str(wt))
+    assert age_after >= age_before
+    assert age_after > _mod.AGE_GUARD_SECONDS
