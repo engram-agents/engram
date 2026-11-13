@@ -27,39 +27,41 @@ v0.5.6 ship with it.
   installer's question about an existing `CLAUDE.md` now defaults to No.
   `bootstrap.py` never seeds a new graph beside an existing agent's memory, even
   with `--force`. A fresh start is moving the whole data home aside.
-  A backup keeps the file's bytes, mode and modification time, not extended
-  attributes or ACLs. Backups accumulate, and nothing deletes them
-  automatically. When setup sets one of its own keys in a settings or config
-  file (`cleanupPeriodDays`, `install_tier`, `forum.url`), it backs the file
-  up first, keeps every other key in value and order, and leaves a file that
-  does not parse as it is. This now holds for all three writers of those keys
-  (the installer, the marketplace installer and `set_forum_url.py`). The
-  installer only asks about `CLAUDE.md`; the backups are made by
-  `bootstrap.py` before it writes. A Codex custom-agent file (`engram-*.toml`)
-  that differs from the one setup installs is backed up first, and one line per
-  file names the backup. Uninstall leaves both files as they are when
-  `<name>.pre-engram` is the same file as `<name>`. When the marketplace
-  installer finishes but skips an item (saving `install_tier` into a config it
-  would not change, or a Codex agent file it could not install), it no longer
-  hides this in a warning: it ends with a block that lists each item and what to
-  do, and exits with code 10, "finished, with items not done".
-- **Setup rewrites an existing file in place.** The file keeps its inode, so its
-  mode, owner, group, hard links, ACL entries and extended attributes stay as
-  they were (one file is an exception whenever the installer runs:
-  `settings.json`, see Known limits below). The stamped backup is saved first;
-  a file ENGRAM itself owns has no backup, and a refusal for such a file says
-  so. A write that fails part-way puts the old bytes back into the same file.
-  When the failure is an error from the system, it is reported in one REFUSED
-  line that names the backup; an interruption such as Ctrl-C gets the same
-  put-back and then ends the run without that line. If putting the bytes back
-  also fails, the line says the file may be incomplete and gives the command
-  that restores it. A kill or a power loss during the write gets no put-back,
-  so the file can be left incomplete; the backup taken first restores its
-  bytes. A program that reads the file during the write can see it empty or
-  partial. A file that does not exist yet is created exclusively: a file that
-  appears at that path in the meantime is refused and left as it is, on a
-  filesystem that supports hard links; without them the new file is put in
-  place by a rename.
+  A backup keeps the file's bytes, mode and modification time. On macOS it
+  does not carry ACLs or extended attributes; on Linux it does (measured on one
+  machine each). Backups accumulate, and nothing deletes them automatically.
+  When setup sets one of its own keys in a settings or config file
+  (`cleanupPeriodDays`, `install_tier`, `forum.url`), it backs the file up
+  first, keeps every other key in value and order, and leaves a file that does
+  not parse as it is. This now holds for all three writers of those keys (the
+  installer, the marketplace installer and `set_forum_url.py`). The installer
+  only asks about `CLAUDE.md`; the backups are made by `bootstrap.py` before
+  it writes. A Codex custom-agent file (`engram-*.toml`) that differs from the
+  one setup installs is backed up first, and one line per file names the
+  backup. Uninstall leaves both files as they are when `<name>.pre-engram` is
+  the same file as `<name>`. When the marketplace installer finishes but skips
+  an item (saving `install_tier` into a config it would not change, or a Codex
+  agent file it could not install), it no longer hides this in a warning: it
+  ends with a block that lists each item and what to do, and exits with code
+  10, "finished, with items not done".
+
+- **Setup rewrites an existing file in place.** The file keeps its inode, so
+  its mode (except the setuid and setgid bits, which the write clears), owner,
+  group, hard links, ACL entries and extended attributes stay as they were
+  (one file is an exception whenever the installer runs: `settings.json`, see
+  Known limits below). The stamped backup is saved first; a file ENGRAM itself
+  owns has no backup, and a refusal for such a file says so. A write that
+  fails part-way puts the old bytes back into the same file. When the failure
+  is an error from the system, it is reported in one REFUSED line that names
+  the backup; an interruption such as Ctrl-C gets the same put-back and then
+  ends the run without that line. If putting the bytes back also fails, the
+  line says the file may be incomplete and gives the command that restores it.
+  A kill or a power loss during the write gets no put-back, so the file can be
+  left incomplete; the backup taken first restores its bytes. A program that
+  reads the file during the write can see it empty or partial. A file that
+  does not exist yet is created exclusively: a file that appears at that path
+  in the meantime is refused and left as it is, on a filesystem that supports
+  hard links; without them the new file is put in place by a rename.
 
 ### Fixes
 
@@ -81,25 +83,50 @@ v0.5.6 ship with it.
 
 ### Known limits
 
-The guarantee above is about what setup itself writes to an existing file. Two
-writes are outside it. Neither comes from a change in this release: the v0.5.6
-installer runs the same Claude Code command, and v0.5.6 rewrites `config.json`
-the same way.
+The guarantee above is about what setup itself writes to an existing file. The
+first two limits below are writes outside it, and neither comes from a change
+in this release: the v0.5.6 installer runs the same Claude Code command, and
+v0.5.6 rewrites `config.json` the same way. The last two are about the
+installer's own messages.
 
 - **`settings.json` at every install or re-install.** Setup registers the
-  plugin with Claude Code's own command (`claude plugin marketplace add`), and
-  that command replaces `~/.claude/settings.json` with a new file each time it
-  runs, even when nothing in the file changes. The content is kept. An ACL
+  plugin with Claude Code's own commands. `claude plugin marketplace add`
+  replaces `~/.claude/settings.json` with a new file each time it runs, even
+  when nothing in the file changes, and `claude plugin install` rewrites it
+  again when it enables the plugin. Your own keys are kept, and Claude Code
+  adds its own (`extraKnownMarketplaces`, `enabledPlugins`). In a home where
+  no Claude Code plugin command has run before, the first one also runs Claude
+  Code's own one-time settings migration, which can change a value: on one Mac
+  with one Claude Code build, `model` went from `opus` to `opus[1m]`. An ACL
   entry or an extended attribute set on that file is not carried over, and
-  nothing backs the file up or prints a message for that write. This is Claude
-  Code's write, not ENGRAM's. The every-run case was measured on one Linux
-  machine (#4628) and the install case on one Mac (#4638), with one Claude Code
-  build each.
+  nothing backs the file up or prints a message for these writes. They are
+  Claude Code's writes, not ENGRAM's. The every-run case was measured on one
+  Linux machine and on one Mac (#4628), and the install case on one Mac
+  (#4638), with one Claude Code build on each machine. This step comes before
+  the installer's question about an existing `CLAUDE.md`, so a run that stops
+  at that question has already made these changes and has created the data
+  folder; `CLAUDE.md` itself is untouched.
 - **`config.json` while an agent runs.** ENGRAM rewrites its own `config.json`
-  at least at every turn advance, by writing a new file and renaming it over
-  the old one, so that a concurrent reader never sees a partial file. An ACL
-  entry or an extended attribute set on the file itself is dropped by that
-  rewrite; one that the folder supplies by default is applied again (#4641).
+  at least at every turn advance (at each sleep), by writing a new file and
+  renaming it over the old one, so that a concurrent reader never sees a
+  partial file. An ACL entry or an extended attribute set on the file itself
+  is lost in that rewrite; one that the folder supplies by default is applied
+  again. Where the ACL mask was wider than the file's group permission, the
+  rewrite also gives the file's own group that permission (on a `config.json`
+  with mode 0660: read and write) where it had none. The file holds no
+  credentials. Setup's writes are fixed in this release; this runtime write is
+  not (#4641).
+- **A shallow clone is refused, and the printed remedy does not help.** The
+  installer's first step refuses a shallow checkout (one made with `git clone
+  --depth 1`), and the remedy it prints (`git fetch --tags origin`) does not
+  rescue that clone. Clone without `--depth`. To rescue a shallow clone, run
+  `git remote set-branches origin '*'` and then `git fetch --unshallow` in it
+  (#4645). Measured on one Mac with git 2.50.1.
+- **A wrong last line after a double failure.** When a write fails and putting
+  the old bytes back also fails, the file guard prints that the file may be
+  incomplete. `set_forum_url.py` and the marketplace installer then print a
+  last line of their own that says the file was left unchanged. In that case
+  the guard's line is the true one (#4631).
 
 ### Other changes
 
