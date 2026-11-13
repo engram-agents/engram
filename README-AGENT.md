@@ -552,10 +552,11 @@ routes to [Troubleshooting](#troubleshooting):
 ```
 
 > **An ACL or extended attribute on `~/.claude/settings.json` is lost during install.**
-> On one Mac (Claude Code, recorded as 2.1.311), `claude plugin marketplace add` (step 3 in the table
-> above) was measured to write a new `settings.json`, and a planted ACL entry and xattr were
-> gone afterwards. A full install on Linux loses them too (engram#4629); there the cause was
-> not isolated to that step. Other Claude Code versions are not checked. ENGRAM's own writes
+> On one Mac (Claude Code, recorded as 2.1.311) and on Linux (Claude Code 2.1.322, re-adding
+> the same marketplace path), `claude plugin marketplace add` (step 3 in the table above) was
+> measured to write a new `settings.json`, and a planted ACL entry and xattr were gone
+> afterwards (engram#4640, engram#4628). A full install on Linux loses them too (engram#4629).
+> Other Claude Code versions are not checked. ENGRAM's own writes
 > keep them (measured for `CLAUDE.md` and `config.json`). If you rely on an ACL or xattr on
 > `settings.json`, set it again after install. (engram#4640)
 
