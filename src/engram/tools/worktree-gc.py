@@ -148,14 +148,46 @@ def _is_in_use(path: str) -> bool:
     return False
 
 
-def _is_agent_owned(t: dict, root: str) -> bool:
+def _main_checkout_path(path: str) -> str | None:
+    """The main checkout's directory, derived from a worktree's own `.git`
+    file (`gitdir: <main>/.git/worktrees/<name>`): the admin dir's common dir
+    (its `commondir` file, else two levels up) is `<main>/.git`, and the main
+    checkout is its parent. Reads files only (no subprocess). None if it cannot
+    be derived (no `.git` file, unreadable, or a common dir not named `.git`).
+    """
+    try:
+        line = (Path(path) / ".git").read_text().strip()
+        if not line.startswith("gitdir:"):
+            return None
+        admin = Path(line[len("gitdir:"):].strip())
+        if not admin.is_absolute():
+            admin = Path(path) / admin
+        cd = admin / "commondir"
+        common = (admin / cd.read_text().strip()) if cd.is_file() else admin.parent.parent
+        common = common.resolve()
+    except (OSError, ValueError):
+        return None
+    if common.name != ".git":
+        return None
+    return str(common.parent)
+
+
+def _is_agent_owned(t: dict, main_path: str | None) -> bool:
     """True for a fairy/reviewer worktree: tmp-branch name, or under
-    `<main checkout>/.claude/worktrees/` whatever its branch (incl. detached)."""
+    `<main checkout>/.claude/worktrees/` whatever its branch (incl. detached).
+
+    The folder is the MAIN checkout's, whatever directory the tool runs from.
+    If `main_path` is None (it could not be derived) the under-folder test is
+    False and only the branch-name rule applies; it never falls back to the
+    run directory.
+    """
     branch = t.get("branch")
     if branch and (branch.startswith("worktree-agent-") or branch.startswith("review-")):
         return True
+    if not main_path:
+        return False
     try:
-        base = (Path(root) / ".claude" / "worktrees").resolve()
+        base = (Path(main_path) / ".claude" / "worktrees").resolve()
         Path(t["path"]).resolve().relative_to(base)
         return True
     except (ValueError, OSError):
@@ -275,9 +307,14 @@ def _pr_for_sha(sha: str, root: str) -> tuple[bool, int | None]:
     return True, heads.get(sha)
 
 
-def classify(t: dict, root: str,
+def classify(t: dict, root: str, *, main_path: str | None = None,
              age_guard_seconds: int = AGE_GUARD_SECONDS) -> tuple[str, str]:
-    """Return (action, reason). action in {PRUNE, KEEP, SKIP, MAIN}."""
+    """Return (action, reason). action in {PRUNE, KEEP, SKIP, MAIN}.
+
+    `main_path` is the main checkout (the `.claude/worktrees/` folder the age
+    guard tests is ITS, not `root`'s); when None it is derived from the
+    worktree's own git common dir.
+    """
     if t.get("is_main"):
         return "MAIN", "main checkout — never touched"
     path = t["path"]
@@ -287,7 +324,9 @@ def classify(t: dict, root: str,
         return "SKIP", "DIRTY — uncommitted changes; not removing"
     branch = t.get("branch")
     # Age guard (#2808): before ANY prune return, for agent-owned worktrees.
-    if _is_agent_owned(t, root):
+    if main_path is None:
+        main_path = _main_checkout_path(path)
+    if _is_agent_owned(t, main_path):
         age = _worktree_age_seconds(path)
         if age is None:
             return "SKIP", "agent worktree age could not be read; not pruning (fail closed)"
@@ -375,10 +414,14 @@ def main() -> int:
 
     root = _repo_root()
     trees = _list_worktrees(root)
+    # The main checkout is trees[0] (is_main), NOT `root`: run from inside a
+    # linked worktree, `--show-toplevel` is that worktree.
+    main_path = trees[0]["path"] if trees else None
 
     plan = []
     for t in trees:
-        action, reason = classify(t, root, age_guard_seconds=args.age_guard_seconds)
+        action, reason = classify(t, root, main_path=main_path,
+                                  age_guard_seconds=args.age_guard_seconds)
         plan.append({"path": t["path"], "branch": t.get("branch"),
                      "action": action, "reason": reason})
 

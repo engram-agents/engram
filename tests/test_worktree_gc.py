@@ -705,7 +705,9 @@ def test_age_guard_unreadable_age_fails_closed(tmp_path):
 def test_age_guard_missing_dotgit_fails_closed(tmp_path):
     root, wt = _real_worktree(tmp_path, None)
     (wt / ".git").unlink()
-    action, reason = _classify_real(root, wt, None)
+    # main() always passes main_path (trees[0]); without a `.git` file a direct
+    # caller cannot derive it, so pass it as main() does.
+    action, reason = _classify_real(root, wt, None, main_path=root)
     assert action == "SKIP"
     assert "could not be read" in reason
 
