@@ -3666,8 +3666,13 @@ def create_app(
         try:
             items = read_project_board(store, records=records)
         except Exception as exc:  # noqa: BLE001
+            # #4534: a poller advances its cursor to `as_of`, so a failed read must
+            # NOT be a 200 carrying an empty list and an `as_of` -- that moves the
+            # cursor past data it never saw. 503 + {"error"}, the status and shape
+            # this route already uses for "coordination store not configured", and
+            # no `as_of`.
             print(f"[forum] api_board_updates error: {exc}", file=sys.stderr)
-            items = []
+            return jsonify({"error": f"coordination store read failed: {exc}"}), 503
 
         # Upper-bound to seq <= as_of so the served set is exactly the
         # (since, as_of] window the response promises (idempotent re-poll).
