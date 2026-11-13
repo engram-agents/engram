@@ -46,8 +46,15 @@ import sys
 import time
 from pathlib import Path
 
-import engram_file_guard as _fg
 from engram_regular_io import read_regular_text
+
+def _fg():
+    """engram_file_guard, imported on first use: hooks and tools that copy only
+    this module and engram_regular_io (the flattened plugin layouts) still import
+    the plain read/write functions without it."""
+    import engram_file_guard
+    return engram_file_guard
+
 
 # Newest backups kept by ``write_engram_config`` (#1989).
 BACKUP_KEEP = 7
@@ -98,13 +105,13 @@ class ConfigMissingError(FileNotFoundError):
         if backups:
             newest = shlex.quote(str(backups[-1]))
             cmd = f"cp -p {newest} {shlex.quote(str(self.path))}"
-            where = (f"Backups sit beside it as {shlex.quote(str(self.path.parent / (self.path.name + _fg.STAMPED_BACKUP_INFIX)))}"
+            where = (f"Backups sit beside it as {shlex.quote(str(self.path.parent / (self.path.name + _fg().STAMPED_BACKUP_INFIX)))}"
                      f"<UTC stamp>; the newest is {newest}.")
         else:
-            cmd = (f"cp -p <newest {shlex.quote(self.path.name + _fg.STAMPED_BACKUP_INFIX)}* backup> "
+            cmd = (f"cp -p <newest {shlex.quote(self.path.name + _fg().STAMPED_BACKUP_INFIX)}* backup> "
                    f"{shlex.quote(str(self.path))}")
             where = (f"No backup was found beside it (they are named "
-                     f"{shlex.quote(self.path.name + _fg.STAMPED_BACKUP_INFIX)}<UTC stamp>); "
+                     f"{shlex.quote(self.path.name + _fg().STAMPED_BACKUP_INFIX)}<UTC stamp>); "
                      "check the data dir's git history.")
         super().__init__(
             f"{self.path} does not exist; refusing to create it from empty (the turn counter would "
@@ -114,7 +121,7 @@ class ConfigMissingError(FileNotFoundError):
 
 def _backup_regex(path: Path) -> "re.Pattern":
     return re.compile(
-        re.escape(path.name + _fg.STAMPED_BACKUP_INFIX) + r"(\d{8}T\d{6}Z)(?:-(\d+))?\Z"
+        re.escape(path.name + _fg().STAMPED_BACKUP_INFIX) + r"(\d{8}T\d{6}Z)(?:-(\d+))?\Z"
     )
 
 
@@ -144,14 +151,14 @@ def _next_backup(path: Path) -> Path:
     oldest, which the next prune would delete.  When this stamp already has
     backups, take one past the highest suffix instead (never reusing a number
     while a higher one exists)."""
-    stamp = _fg.utc_stamp()
+    stamp = _fg().utc_stamp()
     taken = [n for (st, n), _ in _parsed_backups(path) if st == stamp]
     if not taken:
-        return _fg._next_backup_name(path, stamp)
+        return _fg()._next_backup_name(path, stamp)
     n = max(taken) + 1
-    while _fg.target_present(_fg._stamped(path, stamp, n)):
+    while _fg().target_present(_fg()._stamped(path, stamp, n)):
         n += 1
-    return _fg._stamped(path, stamp, n)
+    return _fg()._stamped(path, stamp, n)
 
 
 def _parsed_backups(path: Path) -> list:
@@ -342,7 +349,7 @@ def write_engram_config(path, data, *, allow_key_loss: bool = False):
         except OSError:
             pass
         backup = _next_backup(path)
-        _fg.copy_exclusive(path, backup)  # raises -> nothing written
+        _fg().copy_exclusive(path, backup)  # raises -> nothing written
     write_config_json(path, data)
     if backup is not None:
         _prune_backups(path)
