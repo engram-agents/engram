@@ -163,6 +163,12 @@ SUGGESTION_ROUTING: list[tuple[str, str]] = [
     # "close task" anchors on task; "mark.*task.*done" requires both words to
     # prevent false-positives like "mark contradiction done after resolution".
     (r"\b(close task|mark.*task.*done|update.*task|task.*done|stale.*task)\b", BUCKET_TASK_CLOSURES),
+    # The tool name itself (#4538): "_" is a word character, so \bresolv cannot
+    # match inside "engram_resolve".  LAST on purpose: it only claims what no
+    # other pattern routes, because a suggestion that merely MENTIONS the tool
+    # ("supersede X, then engram_resolve Y"; "retract X; engram_resolve not
+    # needed") is routed by its action, not its mention (#4663/#3536 class).
+    (r"\bengram_resolve\b", BUCKET_RESOLUTIONS),
 ]
 
 # Pre-compiled patterns for performance.
