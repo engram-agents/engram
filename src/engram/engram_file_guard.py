@@ -31,6 +31,7 @@ import errno
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import tempfile
@@ -427,7 +428,7 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     data = text.encode("utf-8")
     if backup is not None:
         saved = f"A copy of it from before this run is at {backup}."
-        restore = f"Restore it with: cat '{backup}' > '{path}'"
+        restore = f"Restore it with: cat {shlex.quote(str(backup))} > {shlex.quote(str(path))}"
     else:
         saved = restore = "ENGRAM owns this file and keeps no backup of it; re-run setup to write it again."
     try:

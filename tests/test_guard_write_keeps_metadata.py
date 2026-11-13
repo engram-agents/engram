@@ -417,6 +417,51 @@ def test_the_restore_command_in_the_message_keeps_the_acl_and_xattr(tmp_path, mo
     assert entry in _acl_entries(path) and _get_xattr(path) == b"kept"
 
 
+# Names that break a restore command built from naive single quotes: the apostrophe ends the
+# quoted operand, and the rest are the shell metacharacters that quoting must keep literal.
+# The apostrophe is the one the old form got wrong; the others pin the surrounding behaviour so
+# a "fix" that drops the quoting entirely cannot pass.
+RESTORE_HOSTILE_NAMES = [
+    "it's.md",
+    "a b.md",
+    "$HOME.md",
+    "`id`.md",
+    "back\\slash.md",
+    "semi;colon.md",
+    "amp&and.md",
+    'quote".md',
+    "paren(1).md",
+]
+
+
+@pytest.mark.parametrize("name", RESTORE_HOSTILE_NAMES)
+def test_the_restore_command_works_for_a_hostile_file_name(tmp_path, monkeypatch, name):
+    """The printed restore command must work for ANY absolute path and absolute backup name.
+
+    Contract: take the substring after "Restore it with: " from the REFUSED message and run it
+    verbatim as `/bin/sh -c "<command>"`. It restores the backup's bytes into `path`, writing
+    INTO the existing inode (`cat backup > path`), so the file's ACL and extended attributes
+    survive. This cell checks the bytes; the ACL/xattr half is pinned by its sibling cell.
+
+    Bound, stated rather than papered over: both values are absolute, already-resolved paths at
+    every real call site (`write_in_place` says the caller passes a path resolved with realpath),
+    so a name beginning with "-" is not a reachable `cat` operand. This does NOT claim the fix
+    covers relative names.
+    """
+    path = tmp_path / name
+    text = "mine\n"
+    path.write_text(text)
+    _fail_first_write(monkeypatch, then_fail_again=True)
+    with pytest.raises(SystemExit) as got:
+        _rewrite_by_apply(path)
+    monkeypatch.undo()
+    msg = str(got.value)
+    assert msg.count("Restore it with: ") == 1, msg
+    command = msg.split("Restore it with: ", 1)[1].strip()
+    subprocess.run(["/bin/sh", "-c", command], check=True)
+    assert path.read_bytes() == text.encode()
+
+
 def test_a_failed_rewrite_of_an_owned_file_says_there_is_no_backup(tmp_path, monkeypatch):
     path = tmp_path / "seed-manifest.json"
     path.write_text("{}\n")
