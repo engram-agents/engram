@@ -3725,6 +3725,8 @@ def engram_advance_turn(payload_json: str) -> str:
     if "message" not in params:
         return json.dumps({"error": "payload_json must include required field 'message'"})
     result_dict = json.loads(_advance_turn_impl(**params))
+    if "error" in result_dict:  # #1989: absent config.json; no diagnostic row for a failed advance
+        return json.dumps(result_dict)
     # Diagnostic snapshot (best-effort, never blocks checkpoint). engram_diagnose
     # lives in server.py; the lifecycle impl cannot call it directly (acyclic
     # constraint), so the wrapper adds it here — wave-3 structural split.

@@ -41,6 +41,18 @@ def _run_installer(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path_factory, monkeypatch):
+    """#4393: the installer's --dry-run reads the CALLER's real unit under
+    $HOME/.config/systemd/user. Point HOME and XDG_CONFIG_HOME at a per-test
+    scratch dir (outside tmp_path, which cells inspect) so a seat's real unit
+    never reaches these cells. Cells that pass their own env=HOME still win."""
+    h = tmp_path_factory.mktemp("isolated-home")
+    monkeypatch.setenv("HOME", str(h))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(h / ".config"))
+    return h
+
+
 # ---------------------------------------------------------------------------
 # --dry-run: action plan lines printed, no filesystem mutations.
 # ---------------------------------------------------------------------------
@@ -546,6 +558,15 @@ class TestExistingMapNotSilentlyDropped:
         assert unit.read_text() == existing
         assert not log.exists(), f"refusal must precede every action: {log.read_text()}"
         assert not (tmp_path / "forum").exists()
+
+    def test_refusal_reached_under_isolated_home_4393(self, tmp_path):
+        """#4393 guard stays exercised: a unit carrying a login map, planted in the
+        scratch HOME, still makes --dry-run refuse with the drop-warning text."""
+        r, unit, log = _install(tmp_path, [], unit=_EXISTING_EXEC)
+        assert r.returncode != 0, r.stdout + r.stderr
+        assert "already carries a baton login map" in r.stderr
+        assert str(unit).startswith(str(tmp_path))
+
 
     def test_same_path_flag_proceeds(self, tmp_path):
         r, unit, _ = _install(tmp_path, ["--baton-login-map", "/old/map.json"],

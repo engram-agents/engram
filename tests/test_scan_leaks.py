@@ -831,3 +831,168 @@ def test_bad_entry_other_compile_failures_are_skipped(tmp_path, capsys, monkeypa
     patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
     assert [lbl for _, lbl in patterns] == ["oktwo"]
     _assert_reported_by_position(err, 1, exc_cls.__name__, entries)
+
+
+# ---------------------------------------------------------------------------
+# Test 14: the pattern scan reads every tracked text file (#3732)
+# ---------------------------------------------------------------------------
+#
+# Contract (written before the implementation):
+#   - scan()'s candidate set is every git-tracked file, honouring SKIP_DIRS and
+#     SKIP_FILES; the use_git=False os.walk fallback follows the same policy.
+#     An extension no longer selects a file.
+#   - a file is binary iff its first 8192 bytes hold a NUL byte; it is skipped
+#     and counted as skipped-binary.  Non-UTF-8 text is decoded with
+#     errors="replace" and IS scanned.
+#   - main() prints exactly one summary line
+#     "scan-leaks: scanned N, skipped-binary M", on clean and dirty runs, and
+#     N + M equals the number of files the scan considered.
+#   - findings and exit codes are unchanged.
+
+_ALICE_ROSTER = {"patterns": [{"regex": r"\bAlice\b", "label": "personal name"}]}
+
+_SUMMARY_RE = re.compile(r"^scan-leaks: scanned (\d+), skipped-binary (\d+)$", re.M)
+
+
+def _write_roster(root: Path) -> Path:
+    """Plant a local name roster in the fixture repo root (gitignored by name:
+    LOCAL_CONFIG_NAME is in SKIP_FILES, so it is not itself a candidate)."""
+    cfg = root / ".scan-leaks-local.json"
+    cfg.write_text(json.dumps(_ALICE_ROSTER))
+    return cfg
+
+
+def _run_scan_with_roster(root: Path):
+    """Run the scanner with the fixture's own roster (default config path)."""
+    return subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root)],
+        capture_output=True, text=True,
+    )
+
+
+def _summary(stdout: str) -> tuple[int, int]:
+    """Return (scanned, skipped-binary) from the single summary line."""
+    matches = _SUMMARY_RE.findall(stdout)
+    assert len(matches) == 1, (
+        f"expected exactly one 'scan-leaks: scanned N, skipped-binary M' line; "
+        f"stdout={stdout!r}"
+    )
+    return int(matches[0][0]), int(matches[0][1])
+
+
+def test_roster_hit_in_js_file_is_reported(tmp_path):
+    _commit_files(tmp_path, {"web/app.js": "// Alice wrote this\n"})
+    _write_roster(tmp_path)
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "web/app.js:1" in r.stderr
+    assert "personal name" in r.stderr
+
+
+def test_roster_hit_in_html_file_is_reported(tmp_path):
+    _commit_files(tmp_path, {"site/index.html": "<p>Alice</p>\n"})
+    _write_roster(tmp_path)
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "site/index.html:1" in r.stderr
+    assert "personal name" in r.stderr
+
+
+def test_roster_hit_in_extensionless_executable_is_reported(tmp_path):
+    _commit_files(
+        tmp_path,
+        {"tools/runner": "#!/bin/sh\n# Alice\n"},
+        mode={"tools/runner": 0o755},
+    )
+    _write_roster(tmp_path)
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "tools/runner:2" in r.stderr
+    assert "personal name" in r.stderr
+
+
+def test_roster_hit_in_non_utf8_text_file_is_reported(tmp_path):
+    """Non-UTF-8 text is decoded with errors="replace" and still scanned."""
+    _commit_files(tmp_path, {"notes.txt": b"caf\xe9 Alice\n"})
+    _write_roster(tmp_path)
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "notes.txt:1" in r.stderr
+    assert "personal name" in r.stderr
+
+
+def test_binary_files_are_skipped_and_counted(tmp_path):
+    _commit_files(tmp_path, {
+        "fonts/ui.ttf": b"\x00\x01\x00\x00Alice",
+        "img/logo.png": b"\x89PNG\r\n\x1a\n\x00Alice",
+        "web/app.js": "// a clean text file\n",
+    })
+    _write_roster(tmp_path)
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    scanned, skipped = _summary(r.stdout)
+    assert (scanned, skipped) == (1, 2), (
+        f"one text file scanned, two binaries skipped; stdout={r.stdout!r}"
+    )
+
+
+def test_summary_counts_partition_the_files_considered(tmp_path):
+    """N + M equals the candidate population: tracked files minus SKIP_DIRS
+    and SKIP_FILES entries."""
+    _commit_files(tmp_path, {
+        "app.js": "// js\n",
+        "page.html": "<p>x</p>\n",
+        "blob.bin": b"\x00binary",
+        "LICENSE": "MIT\n",
+        "node_modules/pkg/index.js": "// vendored\n",
+    })
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    scanned, skipped = _summary(r.stdout)
+    # app.js + page.html scanned; blob.bin binary; LICENSE (SKIP_FILES) and
+    # node_modules/ (SKIP_DIRS) are not candidates at all.
+    assert (scanned, skipped) == (2, 1), f"stdout={r.stdout!r}"
+
+
+def test_summary_line_prints_on_a_dirty_run(tmp_path):
+    _commit_files(tmp_path, {"bad.js": "path = '" + "kg_protocol" + "_for_ai" + "/x'\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "main repo path" in r.stderr
+    assert _summary(r.stdout) == (1, 0), f"stdout={r.stdout!r}"
+
+
+def test_use_git_false_fallback_scans_all_text_files(tmp_path):
+    """The os.walk fallback follows the same all-text policy (SKIP_DIRS and
+    SKIP_FILES still honoured)."""
+    (tmp_path / "app.js").write_text("Alice\n")
+    (tmp_path / "blob.bin").write_bytes(b"\x00Alice")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "vendored.js").write_text("Alice\n")
+    (tmp_path / "LICENSE").write_text("Alice\n")
+
+    leaks, scanned, skipped = _mod.scan(
+        tmp_path, [(re.compile(r"\bAlice\b"), "personal name")], use_git=False,
+    )
+    assert [rel for rel, _, _, _ in leaks] == ["app.js"]
+    assert (scanned, skipped) == (1, 1)
+
+
+def test_tracked_directory_symlink_is_not_a_candidate(tmp_path):
+    """A git-tracked symlink to a directory does not inflate either bucket.
+
+    What this pins, stated by what it was measured to catch: it reddens only
+    the CONJUNCTION of a consumer that counts unreadable entries as binary AND
+    a scanner with the ``is_file()`` filter removed. With the filter in place
+    this fixture's OSError arm is unreachable, so the cell does not discriminate
+    the filter itself — keep it for the conjunction, not for the filter."""
+    (tmp_path / "real-dir").mkdir()
+    _commit_files(tmp_path, {"real/member.py": "// clean\n"})
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "engine").symlink_to("../real-dir")
+    subprocess.run(["git", "add", "tools/engine"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "symlink"], cwd=tmp_path, check=True)
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _summary(r.stdout) == (1, 0), f"stdout={r.stdout!r}"
