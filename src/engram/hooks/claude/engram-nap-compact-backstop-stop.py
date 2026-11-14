@@ -28,9 +28,10 @@ own record ``compact/last-checkpoint.json`` supplies the verdict) only when ALL 
      ``compact/backstop-last.json``. Every attempt, success or refusal, is recorded there, so a
      refusal is not retried on every turn; a new checkpoint or a new briefing write re-arms it;
   5. the stdin payload carries a ``session_id`` (checked last, so a Stop with nothing due is silent);
-  6. the record's ``session_id`` and the payload's are not two different non-empty strings (a
-     shared ENGRAM_HOME must not compact a session that did not nap); if either is null or empty
-     the guard does not apply.
+  6. the record's ``session_id`` is a non-empty string equal to the payload's (a shared ENGRAM_HOME
+     must not compact a session that did not nap). A record without one (null, absent, empty,
+     non-string) refuses with one stderr line, because it cannot show which session napped (#4356);
+     like an other-session record it is not written to ``backstop-last.json``.
 
 Every rider (warm-briefing anchor, non-empty arc, briefing mtime at or after the checkpoint, the
 backup verdict) stays in ``compact-request.py``; none is restated here. This hook never reads or
@@ -227,7 +228,10 @@ def main() -> None:
     if session_id is None:
         _say("the Stop payload carries no session_id; not requesting compaction")
         return
-    if isinstance(record_session, str) and record_session and record_session != session_id:
+    if not (isinstance(record_session, str) and record_session):
+        _say("the nap record carries no session_id; not requesting compaction")
+        return  # cannot show which session napped (#4356): refuse, never guess
+    if record_session != session_id:
         return  # another session's nap on a shared ENGRAM_HOME: not this Stop's to compact
     if write_config_json is None:
         _say("engram_config_io is not importable; not requesting compaction (the attempt could not be recorded)")
