@@ -1141,19 +1141,25 @@ class TestBuildPluginVersionWiring:
     """Contract: the plugin.json build_plugin() writes carries
     '<source plugin.json version>-dev.<stamp>.<sha7 or unknown>', the codex
     manifest carries the same stamp, and the source plugin.json is opened
-    exactly once per build_plugin() call. Only builtins.open() is counted: a
-    second read through pathlib or io.open() would not be seen.
+    exactly once per build_plugin() call.
+
+    The source version is a SENTINEL: the patched open() serves the real
+    plugin.json with only its "version" replaced by _SENTINEL_VERSION, so an
+    implementation that hardcodes any version string (including today's real
+    one) cannot pass. Only builtins.open() reads are counted and served: a
+    read through pathlib or io.open() is neither counted nor served, and would
+    see the real version.
     """
 
-    @staticmethod
-    def _source_version() -> str:
-        with open(os.path.join(REPO_ROOT, "plugin.json"), encoding="utf-8") as f:
-            return json.load(f)["version"]
+    _SENTINEL_VERSION = "97.98.99"
 
-    @staticmethod
-    def _build_counting_opens(plugin_root: str, target: str) -> int:
-        """Run build_plugin(); return how many times the source plugin.json was opened."""
+    @classmethod
+    def _build_counting_opens(cls, plugin_root: str, target: str) -> int:
+        """Run build_plugin() against the real repo tree; return how many times
+        the source plugin.json was opened. That one file is served with the
+        sentinel version."""
         import builtins
+        import io
         from unittest import mock
 
         from tools.engine.build import build_plugin
@@ -1164,11 +1170,19 @@ class TestBuildPluginVersionWiring:
 
         def counting_open(file, *args, **kwargs):
             try:
-                if os.path.realpath(os.fspath(file)) == src:
-                    opens.append(file)
+                is_src = os.path.realpath(os.fspath(file)) == src
             except TypeError:
-                pass  # file descriptor, not a path
-            return real_open(file, *args, **kwargs)
+                is_src = False  # file descriptor, not a path
+            if not is_src:
+                return real_open(file, *args, **kwargs)
+            opens.append(file)
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if any(c in mode for c in "wax+b"):
+                return real_open(file, *args, **kwargs)
+            with real_open(file, *args, **kwargs) as f:
+                data = json.load(f)
+            data["version"] = cls._SENTINEL_VERSION
+            return io.StringIO(json.dumps(data))
 
         with mock.patch.object(builtins, "open", counting_open):
             build_plugin(
@@ -1184,10 +1198,10 @@ class TestBuildPluginVersionWiring:
         self._build_counting_opens(bundle, "claude-code")
         with open(os.path.join(bundle, "plugin.json"), encoding="utf-8") as f:
             written = json.load(f)
-        pattern = rf"^{re.escape(self._source_version())}-dev\.\d{{14}}\.(g?[0-9a-f]{{7,}}|unknown)$"
+        pattern = rf"^{re.escape(self._SENTINEL_VERSION)}-dev\.\d{{14}}\.(g?[0-9a-f]{{7,}}|unknown)$"
         assert re.match(pattern, written["version"]), (
             f"written version {written['version']!r} is not "
-            f"'<source version>-dev.<stamp>.<sha|unknown>'"
+            f"'{self._SENTINEL_VERSION}-dev.<stamp>.<sha|unknown>'"
         )
 
     def test_source_plugin_json_opened_exactly_once_claude_code(self, tmp_path):
@@ -1201,4 +1215,4 @@ class TestBuildPluginVersionWiring:
         with open(os.path.join(bundle, ".codex-plugin", "plugin.json"), encoding="utf-8") as f:
             codex = json.load(f)
         assert codex["version"] == written["version"]
-        assert written["version"].startswith(self._source_version() + "-dev.")
+        assert written["version"].startswith(self._SENTINEL_VERSION + "-dev.")
