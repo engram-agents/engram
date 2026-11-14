@@ -50,8 +50,8 @@ SKIP_ROOTS = (".git", "marketplace", "venv", "tools")
 # was dropped: no shipped code creates it.
 DATA_DIRS = (
     "diary", "sessions", "compact", "history", "health-snapshots",
-    "session-logs-archive", "claude-projects-archive", "db-backup", "evidence-archive",
-    "logs", "telemetry", "session-start-overflow", "tripwire-overflow",
+    "session-logs-archive", "claude-projects-archive", "transcript-archive", "db-backup",
+    "evidence-archive", "logs", "telemetry", "session-start-overflow", "tripwire-overflow",
 )
 
 
@@ -462,8 +462,8 @@ def test_c3_data_dirs_set_is_pinned():
 
 
 @pytest.mark.parametrize("name", [
-    "session-logs-archive", "claude-projects-archive", "db-backup", "evidence-archive",
-    "logs", "telemetry", "session-start-overflow", "tripwire-overflow",
+    "session-logs-archive", "claude-projects-archive", "transcript-archive", "db-backup",
+    "evidence-archive", "logs", "telemetry", "session-start-overflow", "tripwire-overflow",
 ])
 def test_c3_archive_dir_with_nested_content_fully_tightened(tmp_path, name):
     home = tmp_path / "h"

@@ -9,6 +9,10 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+### Added
+
+- A daily compressed transcript archive. Sleep now runs `tools/archive_transcripts.py` (Step 4.8) every night, with no option to turn it off. It saves every `.jsonl` Claude Code transcript (subagent transcripts included) under `~/.claude/projects` into `$ENGRAM_HOME/transcript-archive/` as one xz file per run, holding only the bytes added since the last run (a byte offset kept per file, no timestamps). Archives are never overwritten or deleted. `archive_transcripts.py --replay <empty dir>` rebuilds every transcript byte for byte, and a gap, an overlap, or a transcript that shrank is a loud failure (the run exits 2 and names the file), and the other transcripts are still archived. The archive folder is git-ignored and owner-only. What it does not protect: transcripts stay on the machine; files that are not `.jsonl` are not covered; a transcript replaced by a different file of the same size or larger is not detected, because the offsets prove length, not content. (part of #4647)
+
 ### Changed
 
 - The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,

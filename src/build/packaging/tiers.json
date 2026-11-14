@@ -529,6 +529,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/archive_transcripts.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/install_selfcheck.py",
       "tier": "essential"
     },

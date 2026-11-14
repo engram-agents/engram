@@ -3423,6 +3423,7 @@ ENGRAM_GITIGNORE_PATTERNS = [
     "db-backup/",
     "claude-projects-archive/",
     "session-logs-archive/",
+    "transcript-archive/",
     "session_log.md",
     # #4205: key material and dated backup copies must never ride into the off-disk
     # remote (a tracked secrets/ dir and two 157 MB knowledge.db.bak-<date> blobs
@@ -3523,6 +3524,10 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
       session-logs-archive/ — same class of local archive as claude-projects-archive/
           (Lei, 2026-08-15): a rotation of session-log snapshots kept for local
           reference, not a thing a full-history git backup should carry.
+      transcript-archive/ — the compressed daily transcript archive (#4647 part 2):
+          raw chat transcripts, which stay on the machine and never ride into the
+          off-disk remote (#1098 item 2). Kept forever and append-only, so a git
+          history of it would store every byte again for no gain.
       session_log.md — strictly append-only (verified monotonic size across history:
           8.11 MB on 2026-06-02 to 9.75 MB on 2026-08-15). Committing every version of
           an append-only file stores the same information once per commit; the single

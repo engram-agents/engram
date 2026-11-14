@@ -1063,6 +1063,13 @@
       "note": "engram-alpha#2609: carries the identical health.* sys.modules-clearing fresh_server() pattern as test_health_engine_checkpoint_wiring.py -- the same ordering regression class applies to this file too."
     },
     {
+      "path_prefix_or_glob": "tools/archive_transcripts.py",
+      "test_globs": [
+        "tests/test_archive_transcripts_4647.py"
+      ],
+      "note": "engram-alpha#4647 part 2: tests/test_archive_transcripts_4647.py loads the tool by path (spec_from_file_location), so the import graph cannot see it; the same file also pins the sleep skill's Step 4.8 text."
+    },
+    {
       "path_prefix_or_glob": "tools/backup_claude_projects.py",
       "test_globs": [
         "tests/test_tools_engram_home_3863.py"
