@@ -66,6 +66,10 @@ with an `-alpha` suffix during the alpha phase.
   by its position in the list and the kind of error only, never by its contents,
   its label or the regex error text, so a terminal paste cannot carry a name.
   The entry is still skipped and loading continues.
+- `worktree-gc` no longer prunes a clean detached worktree whose HEAD commit is in
+  no ref (branch, tag, remote-tracking or other): removing it would leave that
+  commit only in the reflog. It skips with a reason naming the commit, and skips too when git cannot
+  say whether any ref holds it. (engram#4509)
 - The `ia` refusal for an unconfigured forum now points at the engram-letter skill's
   troubleshooting row, not at a README path that does not ship on an installed seat
   (engram#3560).
