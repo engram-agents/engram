@@ -2424,6 +2424,19 @@ def _select_and_render_person_moment(
     return description
 
 
+def _tier1_fallback_text(node: dict) -> str:
+    """Text a Tier-1 entry falls back to when the node has no recall_summary.
+
+    Prediction nodes keep their text in ``predicted_event`` and have a NULL
+    ``claim`` (#2328); every other node uses ``claim``.  Mirrors the
+    ``predicted_event or claim`` order used for prediction nodes in
+    engram_core.  A real claim still wins for non-prediction nodes.
+    """
+    if node.get("type") == "prediction":
+        return node.get("predicted_event") or node.get("claim") or ""
+    return node.get("claim") or ""
+
+
 def _build_tiered_results(
     results: list[dict],
     summary_top_k: int,
@@ -2491,10 +2504,12 @@ def _build_tiered_results(
                     person_fields["special_moment"] = moment_text
 
         if is_tier1:
-            # Tier 1: prefer recall_summary, fall back to truncated claim.
+            # Tier 1: prefer recall_summary, fall back to truncated claim
+            # (or, for a prediction node whose claim is NULL by design, the
+            # truncated predicted_event, #2328).
             summary = node.get("recall_summary") or None
             if not summary:
-                claim = node.get("claim") or ""
+                claim = _tier1_fallback_text(node)
                 summary = (claim[:160] + "...") if len(claim) > 160 else claim
             entry = {"id": node_id, "confidence": confidence, "summary": summary}
         else:
