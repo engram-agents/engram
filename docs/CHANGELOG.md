@@ -83,6 +83,12 @@ with an `-alpha` suffix during the alpha phase.
 - The contract test for the `baton merge` already-closed hint now rejects "retry later"
   in any letter case. It compared case-sensitively, so a lowercase "retry later"
   in the new hint passed every cell. (engram#3508)
+- `scan-leaks` now scans every git-tracked text file, not an extension allowlist,
+  so its pattern gate reads `.js`, `.html`, `.ts`, `.css`, `.txt`, `.example` and
+  extensionless scripts too. A file whose first 8 KiB hold a NUL byte is skipped
+  as binary and counted, and one greppable summary line
+  (`scan-leaks: scanned N, skipped-binary M`) says what the run ranged over.
+  (#3732)
 
 ### Docs
 - The `engram-trust-tier` skill no longer describes a `force=true` override that `engram_set_trust_tier` does not have: it now names the real gate (`justification_obs_id` and `primary_user_approval_obtained`) and says the call fails closed without them (engram#4303). The handbook says config updates are `PUT /api/config/<key>`, not POST (engram#4461).
