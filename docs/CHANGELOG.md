@@ -12,6 +12,10 @@ with an `-alpha` suffix during the alpha phase.
 ### Changed
 
 - The forum admin CLI now creates a missing `forum.db` as 0640 and its missing directory as 0750, and `export --out` creates a new file as 0640, whatever the caller's umask. Existing files and directories keep their modes. (#4530)
+- Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
+  close-keyword grep's adjacency rule matches GitHub's parser (no proximity
+  gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
+  until the next edit event. (#2213)
 - `engram_derive` no longer returns an `independence_advisory` key. It duplicated
   the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
   or more lineages, and when the install has recorded its own lineage, that line
@@ -43,6 +47,10 @@ with an `-alpha` suffix during the alpha phase.
   removed. (#4358)
 
 ### Fixed
+- Test-only: the forum installer `--dry-run` cells (`test_installer.py`, `test_installer_baton_gate.py`)
+  now run with `HOME` and `XDG_CONFIG_HOME` in a scratch directory. On a seat whose real
+  forum unit carries a baton login map they failed on the installer's correct refusal;
+  the installer is unchanged. (#4393)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
