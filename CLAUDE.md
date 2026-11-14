@@ -327,7 +327,7 @@ CI-green must hold on the tip the maintainer would merge.
 head, never the head alone; a scratch-merge failure counts against the PR only if
 that cell is green on the base alone (or the PR adds it); and a `CANCELLED` same-SHA run can
 block the merge even when another run passed — rerun it (a fresh run instead if the PR body or title changed since that run). A red only the whole run produces
-(green on base and merged tree alone and when co-run with each PR's tests, in a file no PR touches) is a filed load flake, not a
+(green on base and merged tree alone and when co-run with each PR's added or changed test files, in a file no PR touches) is a filed load flake, not a
 PR red; and the press step never presses on a printed `UNKNOWN`: it waits for `CLEAN` or reads
 every run of the required check on the head. Commands and evidence:
 `docs/internal/PR-MERGE-POLICY.md` § "Merge-seat test rules".
