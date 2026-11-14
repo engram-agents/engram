@@ -240,16 +240,17 @@ def test_missing_live_store_is_not_a_match(env, capsys):
 
 
 # ---- C4: byte-identity on a copy, against pins captured from the UNCHANGED tool ----
-# Pinned expected values: sha256 of each output file, computed by running the tool BEFORE the change.
+# Pinned expected values: sha256 of each output file, computed by running the tool BEFORE the change, with the
+# build date and embedder state frozen as below (re-captured that way from the unchanged tool).
 GOLDEN_SELECT = {
     "claims.json": "c21bb18851821f76ab7b7f204a801c153a554e02e1231027ba633b17cb8d3086",
     "screen.md": "91f9c9f00c4b2af07340d2ad94f58313aa8047d6930bfa7d0697fcd16ffebdb8",
-    "key.json": "615bc2a8be0ad29b71218c53988e905d11a361d8c5722daf8f1a8516e3eba19f",
+    "key.json": "1a5132d710de22039ee0a7e4d368598bf0cb966238dcc8d130448203cbaf5e24",
 }
 GOLDEN_RENDER = {
     "claims.json": "c21bb18851821f76ab7b7f204a801c153a554e02e1231027ba633b17cb8d3086",
     "screen.md": "91f9c9f00c4b2af07340d2ad94f58313aa8047d6930bfa7d0697fcd16ffebdb8",
-    "key.json": "60728f5bfa54da2ab4af28e610381c699f5375e11a6053af740fc15edc82f360",
+    "key.json": "b0742b00b321e2fce1e77d1ed1195ecd152527dfccf61c0e04a9380e720881a2",
     "sheet-pass1.md": "927b71a44f5fc036186da520518902e077917bc4e798d471106f282956789266",
     "sheet-pass2.md": "6196c3100443d7309fb81cc4f59785eb8fe44604a85f6d1c71956dbddca60b1c",
 }
@@ -259,15 +260,42 @@ def _hashes(out: Path):
     return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(out.iterdir())}
 
 
+# key.json records the build date and the embedder state; both are frozen so the pins check the code
+# path, not the day or the seat.
+FROZEN_DATE = "2026-11-14"
+FROZEN_MODEL_META = {"model": "fixture-model", "enabled": True, "embedder_available": False}
+
+
+def _freeze_environment(env, monkeypatch):
+    real = env["tool"].datetime
+
+    class _FrozenDatetime(real):
+        @classmethod
+        def now(cls, tz=None):
+            return real(2026, 11, 14, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(env["tool"], "datetime", _FrozenDatetime)
+    monkeypatch.setattr(env["tool"], "_model_meta", lambda: dict(FROZEN_MODEL_META))
+
+
 def _byte_run(env):
     out = env["tmp"] / "golden_out"
     assert env["tool"].main(_argv(env, "select", env["copy"], out)) == 0
     select_hashes = _hashes(out)
+    key = json.loads((out / "key.json").read_text())
+    assert key["sheet_build_date_utc"] == FROZEN_DATE  # the freeze reached the tool
+    assert key["embedding_model"] == FROZEN_MODEL_META
     assert env["tool"].main(_argv(env, "render", env["copy"], out)) == 0
     return select_hashes, _hashes(out)
 
 
-def test_outputs_byte_identical_on_a_copy(env):
+@pytest.mark.parametrize("no_embeddings", [False, True], ids=["embeddings-default", "ENGRAM_NO_EMBEDDINGS=1"])
+def test_outputs_byte_identical_on_a_copy(env, monkeypatch, no_embeddings):
+    if no_embeddings:
+        monkeypatch.setenv("ENGRAM_NO_EMBEDDINGS", "1")
+    else:
+        monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)
+    _freeze_environment(env, monkeypatch)
     select_hashes, render_hashes = _byte_run(env)
     if os.environ.get("S2_4286_PRINT_PINS"):
         print(json.dumps({"select": select_hashes, "render": render_hashes}, indent=2))
