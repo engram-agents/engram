@@ -24,6 +24,10 @@ with an `-alpha` suffix during the alpha phase.
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
   gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
   until the next edit event. (#2213)
+- `ps -o command=` / `args=` now carries `-ww` at the six remaining sites (the daemon-start
+  holder diagnostic, the `engram-upgrade` and `engram-health-exam` skills' argv checks, and
+  three latency test/tool reads), so a pipe-width cut to 80 columns cannot shorten the argv.
+  (engram-agents/engram#4469)
 - `engram_derive` no longer returns an `independence_advisory` key. It duplicated
   the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
   or more lineages, and when the install has recorded its own lineage, that line

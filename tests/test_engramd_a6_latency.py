@@ -87,7 +87,7 @@ def test_launcher_argv_carries_the_owner_marker_and_the_process_is_real(tool):
             cmdline = Path(f"/proc/{handle.proc.pid}/cmdline").read_bytes()
         else:  # no /proc (macOS): the process table's own command line, same fact (#3666)
             import subprocess as _sp
-            cmdline = _sp.run(["ps", "-o", "command=", "-p", str(handle.proc.pid)],
+            cmdline = _sp.run(["ps", "-ww", "-o", "command=", "-p", str(handle.proc.pid)],
                               capture_output=True, check=True).stdout
         assert b"engramd_owner" in cmdline
     finally:
