@@ -161,7 +161,7 @@ def _assert_old_hint(err):
 
 def _assert_new_hint(err, status):
     assert OLD_HINT not in err
-    assert "Retry later" not in err
+    assert "retry later" not in err.lower()
     assert "GitHub merge succeeded" in err
     assert f"already closed as {status}" in err
     assert "someone closed it after this command read it" in err
@@ -241,7 +241,7 @@ class TestMergeClientAlreadyClosedHint:
 
 def _assert_unknown_status_hint(err):
     assert OLD_HINT not in err
-    assert "Retry later" not in err
+    assert "retry later" not in err.lower()
     assert "GitHub merge succeeded" in err
     assert "the baton was already closed when the closure was written" in err
     assert "closed as" not in err

@@ -23,8 +23,10 @@ Produces a clean public-release snapshot from the private engram-alpha repo:
 The minus-set (release-minus-set.txt) is the ONLY hand-maintained input.
 Everything else is derived.
 
-NOTE on scan-leaks coverage: scan-leaks skips extensionless files and does not
-carry all personal-name patterns unless .scan-leaks-local.json is configured.
+NOTE on scan-leaks coverage: scan-leaks reads every tracked text file, whatever
+its extension (binary files are skipped and counted in its summary line), and
+does not carry all personal-name patterns unless .scan-leaks-local.json is
+configured.
 This gate is necessary-but-not-sufficient: it catches the roster patterns.
 Structural review of the snapshot still matters — this tool surfaces the caveat
 in its final summary.
@@ -650,7 +652,8 @@ def main():
             print("  After --push, three public steps remain (Releases entry, website entry, newsletter); see docs/internal/RELEASING.md \"Announcing\" + \"Tell the public\".")
         print()
         print("CAVEAT: scan-leaks is necessary-but-not-sufficient — it catches the configured")
-        print("roster patterns and committed structural patterns. Extensionless files are skipped.")
+        print("roster patterns and committed structural patterns. It reads every tracked text")
+        print("file; binary files are skipped and counted in the scanner's own summary line.")
         print("Structural review of the snapshot is still recommended before making the repo public.")
 
     finally:
