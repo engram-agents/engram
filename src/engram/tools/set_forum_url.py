@@ -210,6 +210,15 @@ def set_forum_url(config_path, url, *, force: bool = False) -> SetResult:
                        replace_non_object=replace_non_object)
     except fg.MergeRefused as exc:
         return _refuse(f"refused: {exc}; file unchanged")
+    except fg.WriteRefused as exc:
+        # The guard's line names the backup; this sentence says which state the file is in.
+        if exc.outcome == "may_be_incomplete":
+            state = "the file may be incomplete; restore it from the backup named above"
+        elif exc.outcome == "restored":
+            state = "file unchanged in content"
+        else:
+            state = "file unchanged"
+        return _refuse(f"refused: could not write {config_path} ({exc}); {state}")
     except (OSError, SystemExit) as exc:
         return _refuse(f"refused: could not write {config_path} ({exc}); file unchanged")
     return SetResult("written", f"written: forum.url set to {value}", EXIT_OK)
