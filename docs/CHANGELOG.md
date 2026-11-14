@@ -74,11 +74,11 @@ with an `-alpha` suffix during the alpha phase.
 - The `ia` refusal for an unconfigured forum now points at the engram-letter skill's
   troubleshooting row, not at a README path that does not ship on an installed seat
   (engram#3560).
-- `agentctl session` now launches correctly under `sudo -i` for a seat name or a `--cd`
-  directory that holds `$`, a newline or a quote: those words are quoted as octal ANSI-C
-  (`$'\ooo...'`, every byte), which survives `sudo -i`'s re-parse where `printf %q` lost
-  them (engram#4416). The evidence is sudo's documented escaping rule applied by hand in a
-  simulation, not a run of real sudo. Arguments after `--` are tracked separately
+- `agentctl session` should now launch correctly under `sudo -i` for a seat name or a
+  `--cd` directory that holds `$`, a newline or a quote (verified by a simulation of sudo's
+  documented escaping rule applied by hand, not by a run of real sudo): those words are
+  quoted as octal ANSI-C (`$'\ooo...'`, every byte), which survives `sudo -i`'s re-parse
+  where `printf %q` lost them (engram#4416). Arguments after `--` are tracked separately
   (engram#4754).
 - A roster line that does not compile as a regex no longer prints that line, or the
   regex error text, to stderr. The advisory name scan now reports only the roster
