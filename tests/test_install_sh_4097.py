@@ -287,9 +287,12 @@ exec "$REAL_PY" "$@"
 
     def make_db(self, nodes, config=True):
         """An installed seat's knowledge.db. It carries its config.json too (#4705: step 3 refuses a
-        database whose config.json is lost); ``config=False`` makes that lost-config state."""
+        database whose config.json is lost). ``config=True`` writes ``{}`` ONLY when config.json does not
+        exist; an existing config.json is left byte-identical (callers plant their own first).
+        ``config=False`` writes nothing to config.json and does not delete an existing one: the caller
+        owns that state."""
         self.engram.mkdir(parents=True, exist_ok=True)
-        if config:
+        if config and not (self.engram / "config.json").exists():
             (self.engram / "config.json").write_text("{}\n")
         con = sqlite3.connect(str(self.engram / "knowledge.db"))
         con.execute("CREATE TABLE nodes (id TEXT)")
