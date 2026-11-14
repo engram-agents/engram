@@ -4229,6 +4229,10 @@ def _db_missing_message() -> str:
     )
 
 
+# Placeholders, never a ready-to-run path (#4705 R2-4c; same reason C10 rejects a pre-filled cp -p).
+_MV_TEMPLATE = "mv <path to knowledge.db> <path to knowledge.db>.moved-aside.<UTC stamp>"
+
+
 def _seed_missing_message() -> str:
     """Actionable error message when the DB exists but has no seed nodes.
 
@@ -4240,8 +4244,9 @@ def _seed_missing_message() -> str:
         f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but has no seed nodes.\n\n"
         "This usually means a bootstrap was started but never completed.\n"
         "Run the engram-first-session skill to complete the bootstrap, or\n"
-        f"delete {DB_PATH} (verify it's empty first!) and re-run first-session\n"
-        "for a clean retry."
+        "Stop and tell the user. Only if THE USER decides this seat is new, move the file aside under a\n"
+        "dated name (never remove it), then re-run first-session for a clean retry:\n"
+        f"  {_MV_TEMPLATE}"
     )
 
 
@@ -4255,9 +4260,31 @@ def _db_damaged_message(reason: str) -> str:
     return (
         f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but is not a readable ENGRAM database "
         f"({reason}), and config.json is absent. Nothing was written.\n\n"
-        "Restore knowledge.db from a backup or snapshot. If this seat is genuinely new, delete the "
-        f"file ({DB_PATH}) and run the engram-first-session skill."
+        "Restore knowledge.db from a backup or snapshot. Stop and tell the user. Only if THE USER decides "
+        "this seat is genuinely new, move the file aside under a dated name (never remove it), then run "
+        "the engram-first-session skill:\n"
+        f"  {_MV_TEMPLATE}"
     )
+
+
+_BUSY_SENTENCE = (
+    "The database could not be read just now because another process (for example a running "
+    "ENGRAM server) holds it; stop that process and retry first, which costs nothing, before "
+    "restoring anything."
+)
+
+
+def _is_busy_or_locked(exc: sqlite3.Error) -> bool:
+    """#4705: True for an OperationalError whose SQLite error is BUSY or LOCKED (primary code, extended
+    bits masked).  The error code is used where the interpreter has it (3.11+); the message text only
+    where it does not."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
 
 
 def _refuse_config_missing() -> None:
@@ -4279,6 +4306,13 @@ def _refuse_config_missing() -> None:
         finally:
             con.close()
     except sqlite3.Error as exc:
+        if _is_busy_or_locked(exc):
+            # A locked/busy database is not a damaged one: the only fact known is that config.json is missing.
+            err = _config_io.ConfigMissingError(CONFIG_PATH)
+            lead, _, rest = str(err).partition("\n")
+            # One sentence before the remedies (R2-4a); a wrapper on the message, same exception class.
+            err.args = (lead + "\n" + _BUSY_SENTENCE + "\n" + rest,)
+            raise err
         kind, reason = "damaged", f"{type(exc).__name__}: {exc}"
     if kind == "damaged":
         raise RuntimeError(_db_damaged_message(reason))
