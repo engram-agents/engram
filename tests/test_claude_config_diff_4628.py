@@ -301,6 +301,20 @@ def test_c5_exception_inside_snapshot_prints_one_line_and_exits_zero(rig):
     assert _lines(res) == [TAG + "claude-config diff unavailable: IsADirectoryError"]
 
 
+def test_snapshot_never_overwrites_an_existing_snapshot_copy(rig):
+    """The snapshot folder is fresh, so a copy already there is unexpected: it is left
+    exactly as it was (never truncated), and the helper still exits 0 with its one line."""
+    _jw(rig.f("k.json"), {"a": 1})
+    kept = rig.snap / "files" / "k.json"
+    kept.parent.mkdir(parents=True)
+    kept.write_bytes(b"EXISTING-LONGER-THAN-THE-NEW-COPY" * 4)
+    before = kept.read_bytes()
+    res = rig.snapshot("k.json")
+    assert res.returncode == 0
+    assert _lines(res) == [TAG + "claude-config diff unavailable: FileExistsError"]
+    assert kept.read_bytes() == before
+
+
 def test_c5_bad_arguments_still_exit_zero(rig):
     res = _run("report")
     assert res.returncode == 0

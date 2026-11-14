@@ -150,7 +150,8 @@ def snapshot(dest: str, files: list) -> None:
             (root / _ABSENT / p.name).touch(mode=0o600)
             continue
         target = root / _FILES / p.name
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # The snapshot folder is fresh, so create exclusively: never truncate a path.
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
         os.chmod(target, 0o600)
