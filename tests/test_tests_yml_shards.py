@@ -566,3 +566,33 @@ def test_the_idset_check_collects_each_shard_without_any_runner_setting(sb, caps
     for keys in check_envs:
         assert _leaked(keys) == []
         assert "IDSET_LOG" in keys, "the scrub removes the runner's settings only"
+
+
+# --- steps after the suite step (#4554) ---------------------------------------------------
+
+_AFTER_SUITE_COND = ("!cancelled()", "steps.suite.conclusion != 'skipped'")
+
+
+def test_4554_every_step_after_the_suite_step_runs_after_it_ran_not_after_a_skip(job):
+    """#4554: the suite step has ``id: suite``; EVERY later step runs when the suite step ran
+    (red or green) but not when it was skipped by a failed setup step, and never after a cancel.
+    A class rule: enumerates the steps after the suite step, so an appended step without the
+    condition fails it."""
+    steps = job["steps"]
+    suite = _suite(job)
+    assert suite.get("id") == "suite"
+    idx = next(i for i, s in enumerate(steps) if s is suite)
+    after = steps[idx + 1 :]
+    assert after, "no step after the suite step: the rule would pass vacuously"
+    for s in after:
+        cond = str(s.get("if", ""))
+        for frag in _AFTER_SUITE_COND:
+            assert frag in cond, f"step {s.get('name')!r}: `if` {cond!r} lacks {frag!r}"
+
+
+def test_4554_setup_steps_before_the_suite_step_keep_the_default_skip_after_failure(job):
+    """#4554: no step BEFORE the suite step carries ``!cancelled()``."""
+    steps = job["steps"]
+    idx = next(i for i, s in enumerate(steps) if s is _suite(job))
+    for s in steps[:idx]:
+        assert "!cancelled()" not in str(s.get("if", "")), s.get("name")

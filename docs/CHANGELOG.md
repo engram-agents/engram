@@ -120,6 +120,11 @@ with an `-alpha` suffix during the alpha phase.
   as binary and counted, and one greppable summary line
   (`scan-leaks: scanned N, skipped-binary M`) says what the run ranged over.
   (#3732)
+- The whole-suite workflow (`tests.yml`) now runs the name-leak self-test and
+  the test files outside the main roots whenever the suite step ran, red or
+  green, so a red release run reports every failing step instead of hiding
+  the later ones; they stay skipped after a failed setup step or a cancel.
+  (#4554)
 
 ### Docs
 - The `engram-trust-tier` skill no longer describes a `force=true` override that `engram_set_trust_tier` does not have: it now names the real gate (`justification_obs_id` and `primary_user_approval_obtained`) and says the call fails closed without them (engram#4303). The handbook says config updates are `PUT /api/config/<key>`, not POST (engram#4461).
