@@ -38,6 +38,7 @@ NEW_GITIGNORE_PATTERNS = [
     "db-backup/",
     "claude-projects-archive/",
     "session-logs-archive/",
+    "transcript-archive/",
     "session_log.md",
 ]
 
@@ -109,6 +110,7 @@ class TestNewGitignorePatternsMatch:
             "db-backup/knowledge-20260101.sql",
             "claude-projects-archive/some-session.jsonl",
             "session-logs-archive/session_log-2026-01-01.md",
+            "transcript-archive/transcripts-20260101T000000Z-001.xz",
             "session_log.md",
         ],
     )
@@ -150,6 +152,8 @@ class TestUntrackGitignoredPaths:
         (self.tmp / "db-backup" / "knowledge-20260101.sql").write_text("dump\n", encoding="utf-8")
         (self.tmp / "claude-projects-archive").mkdir()
         (self.tmp / "claude-projects-archive" / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
+        (self.tmp / "transcript-archive").mkdir()
+        (self.tmp / "transcript-archive" / "transcripts-20260101T000000Z-001.xz").write_bytes(b"xz")
         (self.tmp / "session_log.md").write_text("log entry\n", encoding="utf-8")
         (self.tmp / "graph_snapshot.md").write_text("snapshot\n", encoding="utf-8")
         _commit_all(self.tmp, "seed tracked backup files")
@@ -161,6 +165,7 @@ class TestUntrackGitignoredPaths:
         before = _tracked_paths(self.tmp)
         assert "db-backup/knowledge-20260101.sql" in before
         assert "claude-projects-archive/transcript.jsonl" in before
+        assert "transcript-archive/transcripts-20260101T000000Z-001.xz" in before
         assert "session_log.md" in before
 
         removed = self.core._untrack_gitignored_paths(self.tmp, NEW_GITIGNORE_PATTERNS)
@@ -169,12 +174,14 @@ class TestUntrackGitignoredPaths:
         assert (self.tmp / "db-backup" / "knowledge-20260101.sql").exists(), \
             "File was deleted from disk — --cached must never touch the working tree"
         assert (self.tmp / "claude-projects-archive" / "transcript.jsonl").exists()
+        assert (self.tmp / "transcript-archive" / "transcripts-20260101T000000Z-001.xz").exists()
         assert (self.tmp / "session_log.md").exists()
 
         # Removed from the index?
         after = _tracked_paths(self.tmp)
         assert "db-backup/knowledge-20260101.sql" not in after
         assert "claude-projects-archive/transcript.jsonl" not in after
+        assert "transcript-archive/transcripts-20260101T000000Z-001.xz" not in after
         assert "session_log.md" not in after
         # graph_snapshot.md is not gitignored — must remain tracked.
         assert "graph_snapshot.md" in after
@@ -519,6 +526,13 @@ class TestEnsureEngramGitignoreWithNewPatterns:
         assert "preserving 2" in captured.err
         assert "!diary/diary.db" in captured.err
         assert "!some/stale/negation" in captured.err
+
+    def test_c6_transcript_archive_is_in_the_canonical_patterns(self):
+        """#4647 part 2: the compressed transcript archive holds raw chat transcripts and
+        must stay on the machine, never ride into the off-disk git remote."""
+        import engram_core
+
+        assert "transcript-archive/" in engram_core.ENGRAM_GITIGNORE_PATTERNS
 
     def test_forum_token_is_in_the_canonical_patterns(self):
         """#4503: the #1459 bearer token (`$ENGRAM_HOME/forum-token`) must be a
