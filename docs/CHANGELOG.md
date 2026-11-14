@@ -11,9 +11,9 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
-- `ps -o command=` now carries `-ww` at the five remaining sites (the daemon-start
-  holder diagnostic, the `engram-upgrade` skill's argv check, and three latency
-  test/tool reads), so a pipe-width cut to 80 columns cannot shorten the argv.
+- `ps -o command=` / `args=` now carries `-ww` at the six remaining sites (the daemon-start
+  holder diagnostic, the `engram-upgrade` and `engram-health-exam` skills' argv checks, and
+  three latency test/tool reads), so a pipe-width cut to 80 columns cannot shorten the argv.
   (engram-agents/engram#4469)
 - Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity

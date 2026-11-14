@@ -1,7 +1,7 @@
 """engram-agents/engram#4469: the remaining `ps -o command=` / `args=` sites carry `-ww`.
 
 procps `ps` cuts `command=`/`args=` to 80 columns when stdout is a pipe (pytest-xdist
-exports COLUMNS=80) unless `-ww` is given; #4248 fixed three sites, this pins five more.
+exports COLUMNS=80) unless `-ww` is given; #4248 fixed three sites, this pins six more.
 
 What these cells are: source-text pins, so they go red on ANY host the moment `-ww` is
 removed. They do NOT prove a long argv is read whole: BSD `ps` (macOS) already returns the
@@ -39,6 +39,11 @@ _SITES = [
         "tools/engramd_a6_latency.py",
         "tools/engramd_a6_latency.py",
         r'subprocess\.run\(\[\s*"ps"[^\]]*"command="[^\]]*\]',
+    ),
+    (
+        "engram-health-exam SKILL.md",
+        "src/engram/skills/claude/engram-health-exam/SKILL.md",
+        r'ps [^\n]*args=[^\n]*',
     ),
     (
         "engram-upgrade SKILL.md",
