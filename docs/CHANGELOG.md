@@ -44,6 +44,9 @@ with an `-alpha` suffix during the alpha phase.
   The "SUBSET green" line now says the full suite runs nightly and at the
   release cut. `--json` gains `layers` and `unreferenced` keys; no key is
   removed. (#4358)
+- tests: `test_bootstrap_fresh_db.py` no longer carries three setup loops that copied
+  runtime files from a path that does not exist, so they never copied anything. Bootstrap runs in place
+  at `src/engram/`, and the tests pass with and without the copy (engram#2173).
 
 ### Fixed
 - Test-only: the forum installer `--dry-run` cells (`test_installer.py`, `test_installer_baton_gate.py`)
