@@ -778,7 +778,7 @@ def _advance_watermark(forum_url: str, thread_id: int, agent_name: str, posts: l
             )
 
 
-def _render_thread_human(thread: dict, posts: list, all_posts: list | None = None) -> None:
+def _render_thread_human(thread: dict, posts: list, all_posts: "list | None" = None) -> None:
     """Render a thread + posts to stdout in human/agent-readable text.
 
     ``posts`` are the posts to render; ``all_posts`` is the full thread as
