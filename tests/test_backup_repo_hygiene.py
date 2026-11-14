@@ -528,6 +528,13 @@ class TestEnsureEngramGitignoreWithNewPatterns:
 
         assert "forum-token" in engram_core.ENGRAM_GITIGNORE_PATTERNS
 
+    def test_install_backups_dir_is_in_the_canonical_patterns(self):
+        """#4628: `$ENGRAM_HOME/install-backups/` holds a 0600 copy of the user's
+        Claude settings (which can carry tokens); it must never be staged."""
+        import engram_core
+
+        assert "install-backups/" in engram_core.ENGRAM_GITIGNORE_PATTERNS
+
     def test_forced_refresh_ignores_forum_token_and_keeps_negation(self):
         """#4503 contract, on the REWRITE path: a `forum-token` file present in
         a home is ignored after `_ensure_engram_gitignore` runs, and the

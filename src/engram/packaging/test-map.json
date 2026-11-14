@@ -811,8 +811,16 @@
     {
       "path_prefix_or_glob": "tools/install-local-marketplace.sh",
       "test_globs": [
-        "tests/test_install_local_marketplace.py"
+        "tests/test_install_local_marketplace.py",
+        "tests/test_claude_config_diff_4628.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/claude_config_diff.py",
+      "test_globs": [
+        "tests/test_claude_config_diff_4628.py"
+      ],
+      "note": "engram#4628: the before/after report of what the marketplace add changed in the user's Claude files. The test runs it as a subprocess and drives the installer with a stub claude, invisible to the layer-1 import graph."
     },
     {
       "path_prefix_or_glob": "tools/install_selfcheck.py",
