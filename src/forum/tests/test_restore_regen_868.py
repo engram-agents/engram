@@ -297,6 +297,9 @@ class TestRestoreBlockRuns:
         assert c.execute("SELECT x FROM marker").fetchone()[0] == "old-db"
         c.close()
         assert list(x.live.glob("forum.db*.failed-restore-*"))
+        # ...and its last line starts the service AND the backup timer again
+        calls = (tmp_path / "systemctl.calls").read_text().splitlines()
+        assert calls[-1] == "--user start engram-forum.service engram-forum-backup.timer", calls
 
     def test_model_off_regen_exit_stops_the_block_after_the_text_index_is_rebuilt(self, tmp_path):
         x = _run_block(tmp_path, model=False)
