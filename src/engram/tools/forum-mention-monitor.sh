@@ -430,8 +430,9 @@ POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
 #   - A cursor lost or unreadable MID-RUN is NOT "as before": $SEEN is now only
 #     the last windowed response, so a full poll would announce every mention
 #     older than the window as new. For that poll only, a mention counts as new
-#     if it is not in $SEEN AND its integer post_id is above the largest integer
-#     id in $SEEN (posts.id is INTEGER PRIMARY KEY, so ids grow with time). That
+#     if it is not in $SEEN, unless it is an integer id at or below the largest
+#     integer id in $SEEN (posts.id is INTEGER PRIMARY KEY, so ids grow with
+#     time). A non-integer id is never filtered. That
 #     high-water filter applies ONLY when $SEEN holds at least one integer id;
 #     with an empty $SEEN (or none with an integer id) every id not in $SEEN is
 #     announced, exactly as before #3729, so an agent's first-ever mention is
@@ -1006,11 +1007,12 @@ while true; do
     *"&since="*) ;;
     *)
         # Steady-state poll WITHOUT a usable cursor (lost mid-run): see the
-        # since-cursor block. With integer ids in $SEEN, only ids above the largest count;
-        # with none, every id not in $SEEN counts (as before #3729).
+        # since-cursor block. With integer ids in $SEEN, an id not in $SEEN counts unless
+        # it is an integer at or below the largest; a non-integer id is never filtered.
+        # With none, every id not in $SEEN counts (as before #3729).
         _max_seen="$(cut -f1 "$SEEN" | awk '$1 ~ /^[0-9]+$/ { if (!f || $1+0 > m) { m = $1+0; f = 1 } } END { if (f) printf "%d", m }')"
         if [ -n "$_max_seen" ]; then
-            _new_pids="$(printf '%s\n' "$_new_pids" | awk -v m="$_max_seen" '$1 ~ /^[0-9]+$/ && $1+0 > m+0')"
+            _new_pids="$(printf '%s\n' "$_new_pids" | awk -v m="$_max_seen" '!($1 ~ /^[0-9]+$/) || $1+0 > m+0')"
         fi
         ;;
     esac

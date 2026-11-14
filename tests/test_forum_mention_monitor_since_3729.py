@@ -504,3 +504,51 @@ def test_empty_seed_removes_a_stale_cursor_and_a_later_mention_is_announced(tmp_
     got = announced(lines)
     assert len(got) == 1 and "#800" in got[0], lines
     assert cursor_of(seen) == ts(T0)
+
+
+# 11 ----------------------------------------------------------------------
+
+def test_with_a_cursor_a_late_commit_with_a_lower_post_id_is_announced_once(tmp_path):
+    # With a cursor the plain not-in-$SEEN rule applies; the post_id high-water
+    # filter belongs to the no-cursor poll only. Post 2 is LOWER than the newest
+    # seen id (5) and its created_at is inside the 600 s overlap.
+    srv = Server([post(5, T0)])
+
+    def hook(n, s):
+        if n == 3:
+            s.posts.append(post(2, T0 - timedelta(seconds=100), tid=200))
+
+    srv.on_request = hook
+    try:
+        lines, _ = run(tmp_path, srv, until=lambda s: len(s.paths) >= 7)
+    finally:
+        srv.stop()
+    assert all(since_of(p) for p in srv.paths[1:]), srv.paths  # the cursor path throughout
+    got = announced(lines)
+    assert len(got) == 1, lines
+    assert "1 new @-mention across 1 thread: #200" in got[0], got
+
+
+def test_no_cursor_mid_run_a_non_integer_post_id_is_announced_once(tmp_path):
+    # Cursor lost mid-run with integer ids in $SEEN: the high-water filter applies,
+    # but a non-integer id is never filtered, so it is announced (once).
+    srv = Server([post(5, T0 - timedelta(hours=1)), post(6, T0)])
+    seen_path = tmp_path / "seen"
+    nodate = post(6, T0)
+    del nodate["created_at"]  # cycle 3 cannot re-write the cursor the hook removes
+    srv.script = {3: (200, json.dumps({"mentions": [nodate]}).encode())}.get
+
+    def hook(n, s):
+        if n == 3:
+            Path(str(seen_path) + ".cursor").unlink()
+        if n == 4:  # the full poll: history (5, 6) plus one new mention with a string id
+            s.posts.append(post("abc", T0 + timedelta(seconds=30), tid=900))
+
+    srv.on_request = hook
+    try:
+        lines, _ = run(tmp_path, srv, until=lambda s: len(s.paths) >= 6)
+    finally:
+        srv.stop()
+    assert since_of(srv.paths[3]) is None, srv.paths  # the lost-cursor poll was full
+    got = announced(lines)
+    assert len(got) == 1 and "1 new @-mention across 1 thread: #900" in got[0], lines
