@@ -873,7 +873,7 @@ The step has three parts, in this order:
   the repo's required check on the head (on engram's `dev` ruleset, which requires a PR, 1 approval, stale approvals
   dismissed on push, last-push approval and the status check `pr-checks`, that
   check is `pr-checks`) prints `success`. The poll is bounded at five minutes. Past that
-  ceiling the press refuses and names the last state it read;
+  ceiling the gate read prints the last state it read, and the seat does not press;
 - (c) after the press, asserts that the base's tree equals the tree the run predicted
   for that step.
 
@@ -926,8 +926,8 @@ in a plain terminal, `bash -c 'set -e; false; echo SURVIVED'` exits 1, so do not
 it there. A press script that leans on
 `set -e` or `set -euo pipefail` to stop at a failed guard is therefore fail-open: on
 2026-11-09 a seat's script printed its own failure line and still ran `gh pr merge`,
-the v0.5.6 CHANGELOG pull request (#4545 here, carried over from the private tracker)
-was merged past one failing test that printed in the same output. A guard written as a bare `test ...` or `grep -q ...` on
+and the v0.5.6 CHANGELOG pull request (#4545) was merged past a failing test that printed
+in the same output. A guard written as a bare `test ...` or `grep -q ...` on
 its own line stops nothing. So:
 - A guard stops the press only by explicit control flow: chained to the merge with
   `&&`, or followed by `|| exit 1` (or `|| { echo "<NAME>-FAILED"; exit 1; }`).
