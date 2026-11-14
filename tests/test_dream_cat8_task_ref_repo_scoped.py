@@ -7,10 +7,12 @@ A bare `#N` has no repo: `gh pr view N` silently resolves it against whichever
 repo is the current checkout, so a same-numbered PR in the WRONG repo can read
 as MERGED/CLOSED and a live task gets proposed for closure.
 
-The fix: extraction matches only `owner/repo#N`, every gh call passes
-`--repo` taken from the reference, a bare `#N` is structurally unmatched, and a
-gh error is UNKNOWN. These tests read the extraction regex and the bash block
-out of the fairy spec (single source of truth) and execute them.
+The fix: extraction matches `owner/repo#N` and the two declared bare-repo
+aliases (`engram-alpha`, `umwelt`) resolved through a closed map, every gh call
+passes `--repo` taken from the resolved reference, a bare `#N` and any unlisted
+alias are structurally unmatched, and a gh error is UNKNOWN. These tests read
+the extraction regexes and the bash block out of the fairy spec (single source
+of truth) and execute them.
 """
 from __future__ import annotations
 
@@ -53,14 +55,36 @@ def _cat8_all() -> str:
 
 
 def _refs(text: str) -> list[str]:
-    """Run the extraction pattern like `grep -o` + the sed boundary strip."""
-    return [m.group(0)[len(m.group(1)):] for m in _pattern().finditer(text)]
+    """The tokens the two `grep -o` stages extract, before stage 2's map rewrite
+    and the final `sort -u`: each stage's own match stream, sed-stripped."""
+    out: set[str] = set()
+    for pat in (_pattern(), _alias_pattern()):
+        for m in pat.finditer(text):
+            tok = m.group(0)
+            if tok[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-":
+                tok = tok[1:]  # `sed -E 's/^[^A-Za-z0-9_.-]//'`
+            out.add(tok)
+    return sorted(out)
 
 
 def _pattern() -> re.Pattern[str]:
+    """Stage 1: already-qualified `owner/repo#N`."""
     m = re.search(r"grep -oE '([^']+)'", _cat8())
     assert m, "Category 8 grep -oE pattern not found -- bash block reshaped?"
     return re.compile(m.group(1))
+
+
+def _aliases_literal() -> str:
+    m = re.search(r"^ALIASES='([^']*)'$", _bash_block(), re.MULTILINE)
+    assert m, "Category 8 ALIASES= line not found -- bash block reshaped?"
+    return m.group(1)
+
+
+def _alias_pattern() -> re.Pattern[str]:
+    """Stage 2: the declared aliases, with $ALIASES expanded from the block."""
+    m = re.search(r'grep -oE "([^"]+)"', _cat8())
+    assert m, "Category 8 stage-2 grep -oE pattern not found -- bash block reshaped?"
+    return re.compile(m.group(1).replace("$ALIASES", _aliases_literal()))
 
 
 def _bash_block() -> str:
@@ -88,7 +112,7 @@ def test_left_boundary_rejects_longer_path():
 @pytest.mark.parametrize("text", [
     "#12", "PR #12", "closes #12", "issue #12", "pull request #12",
     "Closes #12 and fixes #13", "seq 7183", "forum post 7183",
-    "alpha#2400",  # bare repo shorthand: no owner/
+    "alpha#2400",  # not a map key: the map is closed, so this stays unmatched
 ])
 def test_pattern_does_not_match_bare_or_other_namespace(text):
     assert not _refs(text), f"pattern matched {text!r}"
@@ -239,3 +263,129 @@ def test_bash_block_executes_repo_scoped(tmp_path):
     # bare numbers never reached gh as a bare-number call
     assert not any(c.split()[:3] in (["pr", "view", "12"],) and "--repo" not in c
                    for c in calls)
+
+
+# --- the declared repo map: a closed vocabulary, resolved before reporting --
+#
+# The two stages run from one `IN=$(cat)` so both see the whole claim; stage 2
+# rewrites each declared alias to its full owner/repo inside the stage, so the
+# final `sort -u` dedupes after the rewrite. `_refs` models the two grep/sed
+# stages (pre-rewrite, pre-dedupe); `_run_cat8` runs the block end to end.
+
+
+def _run_cat8(tmp_path, claim: str):
+    """Run the fairy's bash block under the stub gh."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash unavailable")
+    script = tmp_path / "cat8.sh"
+    script.write_text(_bash_block(), encoding="utf-8")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(_STUB_GH, encoding="utf-8")
+    gh.chmod(0o755)
+    log = tmp_path / "argv.log"
+    log.write_text("", encoding="utf-8")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    env["GH_ARGV_LOG"] = str(log)
+    proc = subprocess.run(
+        [bash, str(script)], cwd=tmp_path, env=env, input=claim,
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.splitlines(), log.read_text(encoding="utf-8").splitlines()
+
+
+def _repos(calls: list[str]) -> list[str]:
+    return [c.split()[c.split().index("--repo") + 1] for c in calls]
+
+
+def test_alias_engram_alpha_resolves_to_full_ref(tmp_path):
+    lines, calls = _run_cat8(tmp_path, "blocked on engram-alpha#3613 landing")
+    assert lines == ["engram-agents/engram-alpha#3613 - UNKNOWN"], lines
+    assert set(_repos(calls)) == {"engram-agents/engram-alpha"}, calls
+
+
+def test_alias_umwelt_resolves_to_full_ref(tmp_path):
+    lines, calls = _run_cat8(tmp_path, "see umwelt#1069 for context")
+    assert lines == ["engram-agents/umwelt#1069 - UNKNOWN"], lines
+    assert set(_repos(calls)) == {"engram-agents/umwelt"}, calls
+
+
+def test_unlisted_org_repo_is_not_an_alias(tmp_path):
+    # `engram` and `engram-alpha` are different repos with overlapping numbers
+    assert _refs("blocked on engram#5 landing") == []
+    lines, _ = _run_cat8(tmp_path, "blocked on engram#5 landing")
+    assert lines == [], lines
+
+
+@pytest.mark.parametrize("text", ["issue #12", "the #5", "PR #12"])
+def test_whitespace_between_token_and_hash_is_never_a_ref(text):
+    # standing guard: the extractor never tolerates whitespace before the `#`
+    assert _refs(text) == [], f"two-stage extraction matched {text!r}"
+
+
+def test_whitespace_guard_runs_end_to_end(tmp_path):
+    lines, calls = _run_cat8(tmp_path, "issue #12; the #5; PR #12")
+    assert lines == [] and calls == []
+
+
+def test_qualified_alias_repo_ref_is_not_double_counted(tmp_path):
+    assert _refs("see engram-agents/engram-alpha#3613") == [
+        "engram-agents/engram-alpha#3613"
+    ]
+    lines, calls = _run_cat8(tmp_path, "see engram-agents/engram-alpha#3613")
+    assert lines == ["engram-agents/engram-alpha#3613 - UNKNOWN"], lines
+    assert set(_repos(calls)) == {"engram-agents/engram-alpha"}, calls
+    assert len(calls) <= 2, calls  # one ref: at most the pr + issue probe
+
+
+def test_two_segment_path_is_qualified_and_not_rewritten(tmp_path):
+    # owner `a`, repo `engram-alpha`: stage 1 matches it; stage 2 must not
+    # rewrite the alias tail to the full org repo
+    assert _refs("a/engram-alpha#5") == ["a/engram-alpha#5"]
+    lines, calls = _run_cat8(tmp_path, "a/engram-alpha#5")
+    assert lines == ["a/engram-alpha#5 - UNKNOWN"], lines
+    assert set(_repos(calls)) == {"a/engram-alpha"}, calls
+    assert not any("engram-agents/engram-alpha#5" in line for line in lines)
+
+
+def test_alias_left_boundary_rejects_hyphen_prefix(tmp_path):
+    assert _refs("x-engram-alpha#5") == []
+    lines, _ = _run_cat8(tmp_path, "x-engram-alpha#5")
+    assert lines == [], lines
+
+
+def test_alias_and_qualified_forms_of_one_artifact_dedupe(tmp_path):
+    # both stages describe the same artifact; the rewrite happens before the
+    # merge, so `sort -u` collapses them to one checked ref
+    lines, calls = _run_cat8(
+        tmp_path, "see umwelt#12 and engram-agents/umwelt#12"
+    )
+    assert lines == ["engram-agents/umwelt#12 - UNKNOWN"], lines
+    assert set(_repos(calls)) == {"engram-agents/umwelt"}, calls
+    assert len(calls) <= 2, calls  # one artifact: at most the pr + issue probe
+
+
+def test_repomap_keys_equal_aliases_alternation():
+    block = _bash_block()
+    m = re.search(r"declare -A REPOMAP=\(\n(.*?)\n\)", block, re.DOTALL)
+    assert m, "REPOMAP declaration not found -- bash block reshaped?"
+    keys = set(re.findall(r"^\s*\[([^\]]+)\]=", m.group(1), re.MULTILINE))
+    aliases = _aliases_literal().split("|")
+    assert keys, "REPOMAP declares no aliases"
+    assert aliases and all(aliases), f"ALIASES is empty or malformed: {aliases!r}"
+    assert keys == set(aliases), (keys, aliases)
+
+
+def test_report_cat8_finding_carries_full_qualified_ref():
+    text = FAIRY_MD.read_text(encoding="utf-8")
+    s = text.index("## Category 8")
+    nxt = text.find("\n## ", s + 1)
+    sec = text[s:nxt if nxt != -1 else len(text)]
+    assert "claim references owner/repo#N" in sec
+    assert "external reference owner/repo#N <state>" in sec
+    assert "always repo-qualified" in sec
+    assert "resolved to its full `owner/repo` before the finding is written" in sec
