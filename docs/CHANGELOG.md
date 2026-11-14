@@ -43,9 +43,9 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Fixed
 - `worktree-gc` no longer prunes a clean detached worktree whose HEAD commit is in
-  no branch, tag or remote ref: removing it would leave that commit only in the
-  reflog. It skips with a reason naming the commit, and skips too when git cannot
-  say whether any ref holds it. (#4509)
+  no ref (branch, tag, remote-tracking or other): removing it would leave that
+  commit only in the reflog. It skips with a reason naming the commit, and skips too when git cannot
+  say whether any ref holds it. (engram#4509)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`

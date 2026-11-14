@@ -13,8 +13,9 @@ This tool classifies each worktree and removes the safely-finished ones:
   PRUNE   branch worktree whose PR is MERGED or CLOSED (gh), worktree clean,
           AND no live process has its CWD inside it (fairy not still running)
   PRUNE   detached-HEAD worktree, clean, whose head SHA matches NO open PR
-          AND whose head commit is reachable from some ref (branch, tag or
-          remote-tracking), so removing the worktree loses no commit
+          AND whose head commit is reachable from some ref (any ref under refs/:
+          branch, tag, remote-tracking or other), so removing the worktree
+          loses no commit
   PRUNE   `worktree-agent-*` / `review-*` tmp-branch worktree, clean
   KEEP    branch worktree whose PR is OPEN (active work)
   KEEP    branch worktree with NO PR (pre-PR or abandoned — flagged for a human)
@@ -312,7 +313,7 @@ def _pr_for_sha(sha: str, root: str) -> tuple[bool, int | None]:
 
 
 def _refs_containing(sha: str, root: str) -> list[str]:
-    """Names of every ref (branch, tag, remote-tracking) whose history holds
+    """Names of every ref (any ref under refs/, not only branches and tags) whose history holds
     `sha`. Raises RuntimeError when git cannot answer; a worktree's HEAD is not
     a ref, so an empty list means the commit lives only in the worktree."""
     rc, out, err = _run(
@@ -359,8 +360,9 @@ def classify(t: dict, root: str, *, main_path: str | None = None,
         # only when the open-PR lookup ran successfully AND no open PR points
         # at this SHA. If the lookup failed we cannot tell, and a delete verb
         # must fail toward keeping.
+        head = t.get("head") or ""
         try:
-            verified, pr_number = _pr_for_sha(t.get("head") or "", root)
+            verified, pr_number = _pr_for_sha(head, root)
         except Exception:  # gh unavailable / subprocess error / unexpected output
             verified, pr_number = False, None
         if not verified:
@@ -369,7 +371,6 @@ def classify(t: dict, root: str, *, main_path: str | None = None,
             return "SKIP", f"detached HEAD matches OPEN PR #{pr_number}; not pruning"
         # Pruning drops the worktree; a HEAD commit no ref contains would then
         # survive only in the reflog (#4509). Fail closed if git cannot say.
-        head = t.get("head") or ""
         try:
             refs = _refs_containing(head, root)
         except Exception:  # nonzero rc / OSError: reachability unknown
@@ -377,7 +378,7 @@ def classify(t: dict, root: str, *, main_path: str | None = None,
                             "verified (git for-each-ref failed); not pruning")
         if not refs:
             return "SKIP", (f"detached HEAD commit {head[:7]} exists only in this "
-                            "worktree (no branch, tag or remote ref contains it); "
+                            "worktree (no ref contains it); "
                             "not pruning")
         return "PRUNE", "detached HEAD, clean (reviewer-fairy leftover)"
     if branch.startswith("worktree-agent-") or branch.startswith("review-"):
