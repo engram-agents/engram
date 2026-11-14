@@ -339,7 +339,11 @@ def _checkpoint_internal(message: str, advance_turn: bool, session_id=None) -> s
 
     if advance_turn:
         new_turn = old_turn + 1
-        core._set_current_turn(new_turn)
+        try:
+            core._set_current_turn(new_turn)
+        except engram_config_io.ConfigMissingError as exc:
+            # #1989: loud, named, process alive; str(exc), never a repr wrapper.
+            return json.dumps({"error": str(exc)})
     else:
         new_turn = old_turn  # no advancement
 

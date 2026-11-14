@@ -3412,6 +3412,8 @@ ENGRAM_GITIGNORE_PATTERNS = [
     "*.bak",
     "*.bak.*",
     "config.json.bak*",
+    # #1989: guarded-writer backups (and the .partial-* temp a killed copy leaves).
+    "config.json.engram-backup.*",
     "*.backfill-snapshot-*",
     "*.log",
     "marketplace/",
@@ -3453,7 +3455,7 @@ _TRACKED_BINARY_PREFIXES = ("backups/", "db-backup/")
 # and engram_stats (engram_diagnose) both import them, so the two cannot drift.
 BACKUP_ARCHIVE_RE = re.compile(r"^knowledge-(\d{4}-\d{2}-\d{2})(-\d+)?\.sql$")
 BACKUP_BINARY_RE = re.compile(r"^knowledge-\d{4}-\d{2}-\d{2}T\d{6}Z\.db$")
-_TRACKED_BINARY_GLOBS = ("*.db.*", "*.bak-*")
+_TRACKED_BINARY_GLOBS = ("*.db.*", "*.bak-*", "config.json.engram-backup.*")
 
 
 def _tracked_binary_paths(engram_home: "Path") -> list:
@@ -7440,12 +7442,18 @@ def _get_current_turn() -> int:
 
 
 def _set_current_turn(turn: int):
-    """Update the turn counter in config."""
+    """Update the turn counter in config.
+
+    An absent config.json raises ``ConfigMissingError`` (never regenerated from
+    empty: the caller reads the old turn with default 0, so the counter would
+    silently restart, #1989).  The write is the guarded ``write_engram_config``."""
+    if not CONFIG_PATH.exists():
+        raise _config_io.ConfigMissingError(CONFIG_PATH)
     config = _config_io.read_config_json(CONFIG_PATH)
     if "memory" not in config:
         config["memory"] = {}
     config["memory"]["current_turn"] = turn
-    _config_io.write_config_json(CONFIG_PATH, config)
+    _config_io.write_engram_config(CONFIG_PATH, config)
 
 
 def _write_feeling_nudge(source: str) -> bool:
