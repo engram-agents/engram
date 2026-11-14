@@ -326,12 +326,12 @@ def test_launch_site_order_check_rejects_sites_that_skip_the_scope_verb(line):
 
 def test_scope_words_are_built_from_abs_agentctl_and_the_quoted_seat():
     """The words the outer shell inserts name the verb and the seat, each
-    quoted with `printf %q` (never raw, never a `$`-expansion in the inserted
+    quoted with `_oct_quote` (#4416; never raw, never a `$`-expansion in the inserted
     text itself)."""
     body = _cmd_session_body()
-    want = ('scope_words="$(printf \'%q\' "$agentctl_abs") __scope-exec '
-            '$(printf \'%q\' "$name")"')
-    assert want in body, "scope_words is not abs-agentctl + __scope-exec + %q seat"
+    want = ('scope_words="$(_oct_quote "$agentctl_abs") __scope-exec '
+            '$(_oct_quote "$name")"')
+    assert want in body, "scope_words is not abs-agentctl + __scope-exec + octal-quoted seat"
     assert re.search(r"agentctl_abs=.*readlink -f", body)
     assert "cannot resolve" in body  # fails loudly when the path does not resolve
 
