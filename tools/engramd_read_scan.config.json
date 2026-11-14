@@ -646,6 +646,7 @@
   "tools/lesson-pattern-audit.py:read_lesson_rows",
   "tools/inspect_raw.py:read_row",
   "tools/anchoring_report.py:_fetch_population",
+  "tools/model_switch_read.py:fetch_nodes",
   "tools/install_selfcheck.py:_read_counts",
   "tools/install_selfcheck.py:_read_present_ids",
   "hooks/claude/_same_batch_shadow.py:_append_line",

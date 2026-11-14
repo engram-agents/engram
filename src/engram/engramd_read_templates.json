@@ -172,6 +172,13 @@
       ]
     },
     {
+      "key": "73de74c4aad9014d7752a64207a73e615cfc75f43c27b2e211be956f8a575503",
+      "sql": "SELECT id, type, claim, created_at, quoted_text, interpretation, is_current, metadata FROM nodes WHERE id > ? ORDER BY id LIMIT 200",
+      "sites": [
+        "tools/model_switch_read.py:fetch_nodes"
+      ]
+    },
+    {
       "key": "85980984a9c48cb2fcc9b9b4f1e4495a5cec0a9818f6f95212bf9c503825779e",
       "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) AND e.target_id = ? ORDER BY e.source_id, e.target_id, e.relation",
       "sites": [
