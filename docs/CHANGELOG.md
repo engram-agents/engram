@@ -11,6 +11,7 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- The forum admin CLI now creates a missing `forum.db` as 0640 and its missing directory as 0750, and `export --out` creates a new file as 0640, whatever the caller's umask. Existing files and directories keep their modes. (#4530)
 - Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
   gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
