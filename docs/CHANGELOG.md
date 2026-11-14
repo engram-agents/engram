@@ -65,8 +65,9 @@ with an `-alpha` suffix during the alpha phase.
   regex error text, to stderr. The advisory name scan now reports only the roster
   line number, the error class and the offset. (engram#4559)
 - The whole-suite workflow (`tests.yml`) now runs the name-leak self-test and
-  the test files outside the main roots even when a shard is red, so a red
-  release run reports every failing step instead of hiding the later ones.
+  the test files outside the main roots whenever the suite step ran, red or
+  green, so a red release run reports every failing step instead of hiding
+  the later ones; they stay skipped after a failed setup step or a cancel.
   (#4554)
 
 ### Docs
