@@ -531,6 +531,40 @@ def test_cell13_control_config_present_no_such_line(seeded_no_config):
     assert "config.json is missing while knowledge.db exists" not in _hook_context(r)
 
 
+# Session-start block markers: copied from BLOCK_MARKERS in tests/test_session_start_owner_read_3735.py
+# (the entries are the ones that module asserts on the hook's output).
+_BLOCK_MARKERS_3735 = {
+    "focus": "Focused nodes",
+    "saved": "Saved focus-sets",
+    "checkpoint": "Nodes created since checkpoint",
+    "sleep": "[SLEEP STATUS",
+    "backup": "Git backup: knowledge.sql not found",
+}
+# The calibration block's marker: CAL_MARK in tests/test_calibration_owner_op_3741.py.
+_CAL_MARK = "[ENGRAM Calibration"
+
+
+def test_cell13b_only_calibration_is_lost_and_c9_added(seeded_no_config):
+    """Characterisation of round 1: with config.json absent the hook loses ONLY the calibration block
+    (whose EngramClient constructor now refuses) and gains ONLY the C9 line; every other block stays."""
+    home = seeded_no_config
+    r_absent = _run_hook(home)
+    assert r_absent.returncode == 0, r_absent.stderr[-800:]
+    absent = _hook_context(r_absent)
+    assert not (home / "config.json").exists(), "the hook wrote config.json"
+    (home / "config.json").write_text('{"self_lineage": "anthropic:opus"}\n')
+    r_present = _run_hook(home)
+    assert r_present.returncode == 0, r_present.stderr[-800:]
+    present = _hook_context(r_present)
+    assert _CAL_MARK in present, ("calibration marker not in the config-present run", present)
+    assert _CAL_MARK not in absent, absent
+    for key, marker in _BLOCK_MARKERS_3735.items():
+        if marker in present:
+            assert marker in absent, (key, marker, absent)
+    assert C9_LINE in absent and C9_LINE not in present
+    assert "config.json is missing while knowledge.db exists" not in present
+
+
 # ----------------------------------------------------------------------------- cell 14
 
 _CELL14 = r"""
@@ -592,3 +626,48 @@ def test_cell16_candidate_labels(seeded_no_config):
     assert not any("(no self_lineage)" in ln or "(unreadable)" in ln for ln in ok)
     assert any("(no self_lineage)" in ln for ln in empty) and not any("(unreadable)" in ln for ln in empty)
     assert any("(unreadable)" in ln for ln in bad) and not any("(no self_lineage)" in ln for ln in bad)
+
+
+# ----------------------------------------------------------------------------- cell 17
+
+_CELL17 = """
+out['r'] = attempt(lambda: core._get_db().close())
+out['cfg'] = os.path.exists(cfg)
+"""
+
+
+def _delete_mode(home: Path) -> None:
+    """The seeded DB is WAL; a WAL reader is never blocked by a writer, so switch to rollback-journal
+    mode, where BEGIN EXCLUSIVE makes a read-only reader fail with SQLITE_BUSY."""
+    c = sqlite3.connect(str(home / "knowledge.db"))
+    try:
+        assert c.execute("PRAGMA journal_mode=DELETE").fetchone()[0].lower() == "delete"
+    finally:
+        c.close()
+
+
+def test_cell17_locked_db_with_config_missing_gets_config_missing_not_damaged(seeded_no_config):
+    home = seeded_no_config
+    _delete_mode(home)
+    # Paired control: lock released (never taken) -> ConfigMissingError.
+    free = _child(home, _CELL17)
+    assert free["r"]["raised"] == "ConfigMissingError", free
+    assert free["cfg"] is False
+    # The lock is held by THIS process; first prove it really blocks a read-only reader.
+    holder = sqlite3.connect(str(home / "knowledge.db"), isolation_level=None)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+        probe = sqlite3.connect(f"{(home / 'knowledge.db').absolute().as_uri()}?mode=ro", uri=True, timeout=0.1)
+        try:
+            with pytest.raises(sqlite3.OperationalError) as ei:
+                probe.execute("SELECT COUNT(*) FROM nodes").fetchone()
+        finally:
+            probe.close()
+        assert "locked" in str(ei.value) or "busy" in str(ei.value), ei.value
+        locked = _child(home, _CELL17)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert locked["r"]["raised"] == "ConfigMissingError", locked
+    assert "delete" not in locked["r"]["msg"].lower(), locked["r"]["msg"]
+    assert locked["cfg"] is False
