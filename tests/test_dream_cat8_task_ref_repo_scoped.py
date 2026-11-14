@@ -384,17 +384,33 @@ def test_alias_and_qualified_forms_of_one_artifact_dedupe(tmp_path):
     assert len(calls) <= 2, calls  # one artifact: at most the pr + issue probe
 
 
+# Constructs bash 3.2 lacks. NOT exhaustive -- bash has more 4.x-only syntax
+# than one list can hold -- so the cell's claim is "none of THESE appear", which
+# is why the docstring says so rather than "the block is bash-4-free".
 _BASH4_ONLY = (
-    "declare -A", "local -A", "mapfile", "readarray", "local -n", ",,}", "^^}",
+    # 4.0
+    "declare -A", "local -A", "declare -g", "mapfile", "readarray", "|&", "&>>",
+    # 4.2
+    "[[ -v ",
+    # 4.3
+    "local -n", "declare -n", ";;&",
+    # 4.4 / 4.0 case-modification and case-conversion operators
+    "@Q}", ",,}", "^^}", "^}", ",}",
 )
 
 
 def test_cat8_bash_block_has_no_bash4_only_constructs():
-    """Encode the block runs under stock macOS bash 3.2: an unsupported
+    """The block must run under stock macOS bash 3.2: an unsupported
     declaration does not abort the script, it leaves the map unset and the
     stage emits NOTHING with exit 0 -- the silent under-reporting this
     category exists to prevent. Checks executable lines only, so a comment
-    naming a construct cannot satisfy or trip the cell."""
+    naming a construct cannot satisfy or trip the cell.
+
+    BOUND, stated because the list cannot be exhaustive: this proves the block
+    contains none of _BASH4_ONLY's entries. It is a construct inventory, not a
+    3.2 run -- the acceptance evidence for the platform is a Mac seat's own
+    /bin/bash, which has been run once (bash 3.2.57, macOS 27.0.1, 2026-11-14)
+    and is not reproduced here."""
     block = _bash_block()  # asserts the block exists; fails loudly if reshaped
     executable = "\n".join(
         line for line in block.splitlines()
