@@ -2,13 +2,19 @@
 
 Contract
 --------
-``owners_for(path)`` returns the list of owners that govern ``path`` under
-GitHub's CODEOWNERS rules, or an empty list when no pattern matches.
+``owners_for(path, codeowners_text)`` returns the owners of the **last
+matching line**, and that includes when the list is empty: an ownerless
+matching line resolves to ``[]`` and shadows any earlier match. A path no
+line matches also resolves to ``[]``. Both results are the same value to the
+caller but mean different things in the file, and GitHub reads the second as
+*ownership removed* — changes there can be approved by anyone with write
+access — so the guard must see ``[]`` for it rather than the earlier match's
+owners.
 
 The guard cell passes iff every tracked file under ``.github/workflows/``
-resolves to at least one owner, and iff every path named in
-``COVERED_SCOPES`` (the scopes ``.github/CODEOWNERS`` claims) resolves to at
-least one owner.
+resolves to ``EXPECTED_OWNERS`` (asserted by value, not merely non-empty), and
+iff every path named in ``COVERED_SCOPES`` (the scopes ``.github/CODEOWNERS``
+claims) resolves to at least one owner.
 
 Matching subset implemented here (NOT full CODEOWNERS fidelity)
 --------------------------------------------------------------
@@ -24,8 +30,10 @@ Only the subset the repository's file needs is implemented:
     the three gitignore positions (``**/``, ``/**``, ``/**/``); any other
     consecutive asterisks are ordinary ``*``s, which cannot cross a ``/``;
   * blank lines and lines whose first non-space character is ``#``;
-  * owners returned as written (``@user``, ``@org/team``, or an email);
-    a line with no owner token is ignored.
+  * owners returned as written (``@user``, ``@org/team``, or an email); a
+    matching line with no owner token is not skipped — it resolves to no
+    owners and, as the last match, shadows any earlier one, which is how
+    GitHub reads it (ownership removed).
 
 Deliberately NOT implemented: ``?``, character classes (``[abc]``),
 backslash escapes, negation (``!`` is gitignore-only and invalid in
@@ -157,8 +165,9 @@ def parse_codeowners(text: str) -> list[tuple[re.Pattern[str], list[str]]]:
         fields = line.split()
         pattern, owner_fields = fields[0], fields[1:]
         owners = [field for field in owner_fields if "@" in field]
-        if not owners:
-            continue
+        # Keep the entry even when it lists no owner: an ownerless matching
+        # line is a real instruction in CODEOWNERS — GitHub reads it as
+        # ownership removed — so it must be able to shadow an earlier match.
         entries.append((_pattern_to_regex(pattern), owners))
     return entries
 
@@ -212,18 +221,54 @@ def test_last_matching_pattern_wins():
 
 
 def test_guard_cell_every_tracked_workflow_and_codeowners_have_an_owner():
-    """Cell 5: the real repository file satisfies the guard for every scope."""
+    """Cell 5: the real repository file satisfies the guard for every scope.
+
+    The workflows are asserted by value, against the same ``EXPECTED_OWNERS``
+    the named scopes are held to: a tracked workflow owned by *someone else*
+    is unowned as far as this gate machinery goes, so presence alone is not
+    evidence the scope is covered.
+    """
     tracked = _tracked_workflow_files()
     assert tracked, (
         "the workflow enumeration is empty, so the guard would otherwise pass "
         "vacuously: git ls-files found no tracked file under .github/workflows"
     )
-    missing = [p for p in tracked if not owners_for(p)]
-    assert not missing, f"tracked workflow files with no CODEOWNERS owner: {missing}"
+    resolutions = [(path, owners_for(path)) for path in tracked]
+    wrong_owners = [
+        (path, owners) for path, owners in resolutions if owners != EXPECTED_OWNERS
+    ]
+    assert not wrong_owners, (
+        f"tracked workflow files not owned by {EXPECTED_OWNERS}: {wrong_owners}"
+    )
     uncovered = [
         f"{path} ({why})" for path, why in COVERED_SCOPES if not owners_for(path)
     ]
     assert not uncovered, f"scopes claimed as covered but unowned: {uncovered}"
+
+
+def test_ownerless_matching_line_shadows_an_earlier_owner():
+    """Cell 6: an ownerless later match resolves to [] and shadows the owner.
+
+    GitHub reads this shape as leaving the path with no owners, so changes
+    there need no approval from the earlier line's owners. A matcher that
+    skips the ownerless line returns the earlier owners and certifies a
+    false green.
+    """
+    synthetic = (
+        "# synthetic: the later line matches with no owner, so ownership is removed\n"
+        "/.github/ @first\n"
+        "/.github/workflows/pr-checks.yml\n"
+    )
+    assert owners_for(".github/workflows/pr-checks.yml", synthetic) == []
+
+
+def test_ownerless_line_that_does_not_match_leaves_a_covered_path_owned():
+    """Cell 7: an ownerless line that matches nothing changes nothing."""
+    synthetic = (
+        "/.github/ @first\n"
+        "/.github/workflows/nightly.yml\n"
+    )
+    assert owners_for(".github/workflows/pr-checks.yml", synthetic) == ["@first"]
 
 
 # ---------------------------------------------------------------------------
