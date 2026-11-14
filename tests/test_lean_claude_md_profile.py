@@ -319,7 +319,7 @@ def test_i_lean_is_strictly_shorter_and_has_none_of_the_dropped_headings():
 # --- (c1) and (h): bootstrap ---------------------------------------------------------------
 
 
-def _bootstrap(tmp_path: Path, args: list[str] | None = None) -> subprocess.CompletedProcess:
+def _bootstrap(tmp_path: Path, args: list[str] | None = None, extra_env: dict | None = None) -> subprocess.CompletedProcess:
     engram_home = tmp_path / ".engram"
     engram_home.mkdir(parents=True, exist_ok=True)
     for fname in (
@@ -341,6 +341,7 @@ def _bootstrap(tmp_path: Path, args: list[str] | None = None) -> subprocess.Comp
     })
     for k in ("ENGRAM_BOOTSTRAP", "FORCE", "FORCE_RESEED_EMPTY"):
         env.pop(k, None)
+    env.update(extra_env or {})
     return subprocess.run(
         [sys.executable, str(BOOTSTRAP), *(args or [])],
         env=env, capture_output=True, text=True, timeout=180,
@@ -389,6 +390,69 @@ def test_c1_explicit_full_records_nothing_and_writes_todays_render(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "claude_md_profile" not in _config(tmp_path)
     assert "## Model Identity Gate" in _claude_md(tmp_path)
+
+
+def test_c1_a_default_run_with_no_record_leaves_config_untouched(full_home):
+    assert "claude_md_profile" not in _config(full_home)
+    assert not list((full_home / ".engram").glob("config.json.engram-backup.*"))
+
+
+def _call_record_step(tmp_path: Path, profile: str | None, config_text: str | None):
+    """Call bootstrap._record_claude_md_profile in a child process against a scratch home.
+
+    A rerun of the whole bootstrap on a seeded home is refused by design (FORCE needs an empty
+    graph), so the record step is driven directly, with ENGRAM_HOME monkeypatched to the scratch home.
+    """
+    home = tmp_path / "scratch-home"
+    home.mkdir()
+    if config_text is not None:
+        (home / "config.json").write_text(config_text, encoding="utf-8")
+    code = (
+        "import importlib.util, pathlib\n"
+        f"spec = importlib.util.spec_from_file_location('bootstrap_mod', {str(BOOTSTRAP)!r})\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        f"m.ENGRAM_HOME = pathlib.Path({str(home)!r})\n"
+        f"m._record_claude_md_profile({profile!r})\n"
+    )
+    env = os.environ.copy()
+    env.update({
+        "ALPHA_DIR": str(REPO_ROOT), "ALPHA_TEMPLATES_DIR": str(TEMPLATES),
+        "ENGRAM_HOME": str(home), "HOME": str(tmp_path),
+        "CLAUDE_HOME": str(tmp_path / ".claude"), "CODEX_HOME": str(tmp_path / ".codex"),
+        "PYTHON_BIN": sys.executable, "TARGET": "claude",
+    })
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    return r, home
+
+
+@pytest.mark.parametrize("profile", [None, "full"])
+def test_c1_a_default_or_full_run_overwrites_a_stale_lean_record(tmp_path, profile):
+    r, home = _call_record_step(tmp_path, profile, json.dumps({"self_lineage": "x:y", "claude_md_profile": "lean"}))
+    assert r.returncode == 0, r.stderr
+    cfg = json.loads((home / "config.json").read_text(encoding="utf-8"))
+    assert cfg["claude_md_profile"] == "full" and cfg["self_lineage"] == "x:y"
+
+
+@pytest.mark.parametrize("profile", [None, "full"])
+def test_c1_a_default_run_with_no_record_writes_nothing(tmp_path, profile):
+    r, home = _call_record_step(tmp_path, profile, json.dumps({"self_lineage": "x:y"}))
+    assert r.returncode == 0, r.stderr
+    assert json.loads((home / "config.json").read_text(encoding="utf-8")) == {"self_lineage": "x:y"}
+    assert not list(home.glob("config.json.engram-backup.*"))
+
+
+def test_c1_a_non_dict_config_is_refused_not_a_traceback(tmp_path):
+    r, _ = _call_record_step(tmp_path, "lean", "5")
+    assert r.returncode != 0 and "Traceback" not in r.stderr
+    assert "REFUSED" in r.stderr and "CLAUDE.md was not written" in r.stderr
+
+
+def test_c1_missing_config_refusal_says_the_graph_was_already_seeded(tmp_path):
+    r, _ = _call_record_step(tmp_path, "lean", None)
+    assert r.returncode != 0
+    msg = r.stderr + r.stdout
+    assert "REFUSED" in msg and "is missing" in msg
+    assert "already seeded" in msg and "CLAUDE.md was not written" in msg
 
 
 def test_c1_unknown_profile_is_refused_before_anything_is_written(tmp_path):

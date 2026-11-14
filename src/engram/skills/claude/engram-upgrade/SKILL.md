@@ -104,10 +104,11 @@ git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH"
 
 ```bash
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
-git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH" -- src/engram/templates/template.CLAUDE.md
+# The template of the profile this home recorded (no record = full; lean = bootstrapped with --claude-md-profile lean):
+TEMPLATE=template.CLAUDE.md
+grep -Eq '"claude_md_profile"[[:space:]]*:[[:space:]]*"lean"' "${ENGRAM_HOME:-$HOME/.engram}/config.json" 2>/dev/null && TEMPLATE=template.CLAUDE.lean.md
+git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH" -- "src/engram/templates/$TEMPLATE"
 ```
-
-If `claude_md_profile` in `${ENGRAM_HOME:-$HOME/.engram}/config.json` is `lean` (a home bootstrapped with `--claude-md-profile lean`, for small-context models), the source is `src/engram/templates/template.CLAUDE.lean.md` instead; use that path in the check. No record means the full profile.
 
 **Checkpoint**: change-set summary surfaced + user confirmed proceed (or concern resolved) + CLAUDE.md-template-changed noted yes/no + pre-upgrade SHA saved to `${ENGRAM_HOME:-$HOME/.engram}/.upgrade-pre-sha`.
 
@@ -353,7 +354,7 @@ If Step 2 found the CLAUDE.md render source (`templates/template.CLAUDE.md`) cha
 
 **The "I'll come back to it" failure mode is real** (2026-05-16: a template discipline-change was deferred post-deploy, never merged, and misfired for days before diagnosis). Resolve it now or track it explicitly — never silent-defer.
 
-**Profiles.** The gate compares your file against the template of the profile your home **recorded** in `config.json` (`claude_md_profile`; no record means full), and never renders or offers the other profile: do not suggest a switch here. A recorded value the upgrade does not know means nothing was compared: ask the user which profile their file follows. The drift tool below diffs the full template, so on a `lean` home skip it and diff the lean template: `git -C "$SOURCE_DIR" diff "$DEPLOYED" "origin/$UPSTREAM_BRANCH" -- src/engram/templates/template.CLAUDE.lean.md`.
+**Profiles.** The gate compares your file against the template of the profile your home **recorded** in `config.json` (`claude_md_profile`; no record means full), and never renders or offers the other profile: do not suggest a switch here. A recorded value the upgrade does not know means nothing was compared: ask the user which profile their file follows. The drift tool below reads that record (pass `--engram-home`) and diffs the recorded profile's template only; an unrecognised value makes it exit 2 and print "undetermined" without comparing, so ask the user.
 
 Use the rendered-diff tool (catches changes to ALL render sources, not just the main template):
 
@@ -371,8 +372,9 @@ UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
 "$HOME/.engram/venv/bin/python3" "$SOURCE_DIR/tools/check-claude-md-drift.py" \
     --repo "$SOURCE_DIR" \
     --base "$DEPLOYED" \
-    --head "origin/$UPSTREAM_BRANCH"
-# Exit 0 = no drift; exit 1 = diff printed to stdout; any other exit = tool/git error (investigate, do NOT read as drift).
+    --head "origin/$UPSTREAM_BRANCH" \
+    --engram-home "${ENGRAM_HOME:-$HOME/.engram}"
+# Exit 0 = no drift; exit 1 = diff printed to stdout; exit 2 = undetermined profile (ask the user); any other exit = tool/git error (investigate, do NOT read as drift).
 # Codex (template.AGENTS.md is single-source; raw diff is sufficient):
 diff "$SOURCE_DIR"/src/engram/templates/template.AGENTS.md /path/to/live/AGENTS.md
 ```

@@ -36,6 +36,11 @@ Arguments
 --head    Git ref for the "after" state (e.g. origin/dev, HEAD, a branch name).
 --live    Mode 2: the live CLAUDE.md to check (read only; never edited).  Mutually
           exclusive with --base.
+--engram-home (both modes)
+          The home whose config.json records ``claude_md_profile``.  The tool diffs
+          THAT profile's template (lean -> template.CLAUDE.lean.md); no record, or no
+          flag, is the full template.  An unrecognised recorded value exits 2 with an
+          "undetermined" message and compares nothing.
 --user-name / --agent-name / --self-node-id / --engram-home
           Mode 2: values for {{USER_NAME}}, {{AGENT_NAME}}, {{SELF_NODE_ID}},
           {{ENGRAM_HOME}}.
@@ -184,7 +189,13 @@ _TOOLS_DIR = Path(__file__).resolve().parent          # src/engram/tools/
 _SRC_ENGRAM = _TOOLS_DIR.parent                       # src/engram/
 
 sys.path.insert(0, str(_SRC_ENGRAM))
-from template_render import CLAUDE_RENDER_SOURCES, render_identity_surface  # noqa: E402
+from template_render import (  # noqa: E402
+    CLAUDE_MD_PROFILE_SOURCES,
+    CLAUDE_RENDER_SOURCES,
+    PROFILE_UNDETERMINED,
+    recorded_claude_md_profile,
+    render_identity_surface,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +239,8 @@ def _git_show(repo: Path, ref: str, rel_path: str) -> str | None:
     raise SystemExit(3)
 
 
-def _render_ref(repo: Path, ref: str) -> str:
-    """Render the CLAUDE.md identity surface for a git ref.
+def _render_ref(repo: Path, ref: str, profile: str = "full") -> str:
+    """Render the CLAUDE.md identity surface of a profile's template for a git ref.
 
     Uses a temp directory populated with the source files from the ref.
     A source file absent at that ref is written as an empty file so
@@ -237,11 +248,11 @@ def _render_ref(repo: Path, ref: str) -> str:
     """
     tmpdir = Path(tempfile.mkdtemp(prefix="engram_drift_"))
     try:
-        for src_file in CLAUDE_RENDER_SOURCES:
+        for src_file in CLAUDE_MD_PROFILE_SOURCES[profile]:
             content = _git_show(repo, ref, src_file)
             dest = tmpdir / src_file
             dest.write_text(content if content is not None else "", encoding="utf-8")
-        return render_identity_surface(tmpdir)
+        return render_identity_surface(tmpdir, profile)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -270,7 +281,6 @@ _PLACEHOLDER_RE = re.compile(r"\{\{[A-Za-z0-9_]+\}\}")
 _HEADING_RE = re.compile(r"^#{1,6}(\s|$)")
 _LIST_RE = re.compile(r"^\s*([-*+]|\d+[.)])\s")
 _FENCE_RE = re.compile(r"^(\s*)(```|~~~)")
-_MAIN_FILE = "template.CLAUDE.md"
 _TRUNC = 100
 
 
@@ -505,7 +515,30 @@ def _check_set(label: str, rendered: str, live_norm: str, skip_headings: bool,
     return checked, missing
 
 
+def _home_profile(args: argparse.Namespace) -> str | None:
+    """The CLAUDE.md profile the home (--engram-home) recorded, or None when undetermined.
+
+    No --engram-home, or no record, is the full profile. An unrecognised recorded value
+    prints the state and returns None: the caller exits 2 without comparing anything,
+    never falling back to the full template.
+    """
+    home = getattr(args, "engram_home", None)
+    profile = recorded_claude_md_profile(os.path.expanduser(home) if home else "")
+    if profile == PROFILE_UNDETERMINED:
+        print(
+            f"check-claude-md-drift: undetermined: the CLAUDE.md profile recorded in "
+            f"{home}/config.json is not one this tool knows (or the file is unreadable), "
+            f"so nothing was compared. Ask the user which profile their CLAUDE.md follows.",
+            file=sys.stderr,
+        )
+        return None
+    return profile
+
+
 def run_live(args: argparse.Namespace, repo: Path) -> int:
+    profile = _home_profile(args)
+    if profile is None:
+        return 2
     try:
         _verify_ref(repo, args.head)
         try:
@@ -526,10 +559,11 @@ def run_live(args: argparse.Namespace, repo: Path) -> int:
         homes = _home_forms(subs.pop("{{ENGRAM_HOME}}", None))
         live_norm = _norm(live_text)
 
-        rendered = _substitute(_render_ref(repo, args.head), subs)
+        main_file = CLAUDE_MD_PROFILE_SOURCES[profile][0]
+        rendered = _substitute(_render_ref(repo, args.head, profile), subs)
         if not rendered.strip():
-            raise _LiveError(f"empty render of {_MAIN_FILE} at {args.head}")
-        sets = [(_MAIN_FILE, rendered, False)]
+            raise _LiveError(f"empty render of {main_file} at {args.head}")
+        sets = [(main_file, rendered, False)]
 
         results = [(label, *_check_set(label, text, live_norm, skip, homes))
                    for label, text, skip in sets]
@@ -590,7 +624,9 @@ def main() -> int:
     parser.add_argument("--agent-name", metavar="NAME", help="Mode 2: value for {{AGENT_NAME}}.")
     parser.add_argument("--self-node-id", metavar="ID", help="Mode 2: value for {{SELF_NODE_ID}} (this install's pn_ self node id).")
     parser.add_argument("--engram-home", metavar="DIR",
-                        help="Mode 2: value for {{ENGRAM_HOME}}; a live file that writes the home as ~/... "
+                        help="The home whose config.json records the CLAUDE.md profile (claude_md_profile; "
+                             "no record = full): the tool diffs THAT profile's template only. An "
+                             "unrecognised recorded value exits 2 without comparing. Mode 2: also the value for {{ENGRAM_HOME}}; a live file that writes the home as ~/... "
                              "or as the absolute path matches either way, whichever form is given here.")
     parser.add_argument("--seed-manifest", metavar="PATH",
                         help="Mode 2: seed-manifest.json written by bootstrap; its 'seed_ids' map fills "
@@ -635,9 +671,13 @@ def main() -> int:
     base_ref = args.base
     head_ref = args.head
 
+    profile = _home_profile(args)
+    if profile is None:
+        return 2
+
     # Render both refs.
-    base_rendered = _render_ref(repo, base_ref)
-    head_rendered = _render_ref(repo, head_ref)
+    base_rendered = _render_ref(repo, base_ref, profile)
+    head_rendered = _render_ref(repo, head_ref, profile)
 
     if base_rendered == head_rendered:
         return 0

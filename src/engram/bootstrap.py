@@ -623,29 +623,44 @@ def _claude_template_path(profile: "str | None") -> Path:
 
 
 def _record_claude_md_profile(profile: "str | None") -> None:
-    """Record a non-default CLAUDE.md profile in config.json, so a later upgrade compares the
-    user's file against the template of the profile the file was rendered from.
+    """Keep config.json's CLAUDE.md profile record in step with the template about to be written,
+    so a later upgrade compares the user's file against the template the file was rendered from.
 
-    The default profile records nothing (an absent key means full). The write goes through
-    the config writer (temp file and rename, with a backup of a changed file). It never
-    creates config.json from empty: that file already exists once the seed graph is made.
+    A `lean` run records `lean`. A default or explicit `full` run records nothing new, but a
+    STALE `claude_md_profile` key already in config.json (an aborted lean run re-run with the
+    default profile) is overwritten with `full`, never left saying lean over a full file. The
+    key is overwritten rather than removed because the config writer refuses to shrink the file.
+    Both go through the config writer (temp file and rename, with a backup of a changed file).
+    This runs after the seed graph exists and never creates config.json from empty.
     """
-    if profile in (None, "full"):
-        return
     config_path = ENGRAM_HOME / "config.json"
+    if profile in (None, "full"):
+        if not config_path.is_file():
+            return
+        try:
+            config = engram_config_io.read_config_json(config_path)
+            if CLAUDE_MD_PROFILE_CONFIG_KEY in config and config[CLAUDE_MD_PROFILE_CONFIG_KEY] != "full":
+                config[CLAUDE_MD_PROFILE_CONFIG_KEY] = "full"
+                engram_config_io.write_engram_config(config_path, config)
+        except (OSError, ValueError, TypeError) as e:
+            raise SystemExit(
+                f"[bootstrap] REFUSED: could not clear a stale CLAUDE.md profile record in "
+                f"{config_path} ({e}). The graph was already seeded; CLAUDE.md was not written."
+            )
+        return
     if not config_path.is_file():
         raise SystemExit(
             f"[bootstrap] REFUSED: {config_path} is missing, so the {profile!r} CLAUDE.md profile "
-            f"cannot be recorded there. CLAUDE.md was not written."
+            f"cannot be recorded there. The graph was already seeded; CLAUDE.md was not written."
         )
     try:
         config = engram_config_io.read_config_json(config_path)
         config[CLAUDE_MD_PROFILE_CONFIG_KEY] = profile
         engram_config_io.write_engram_config(config_path, config)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, TypeError) as e:
         raise SystemExit(
             f"[bootstrap] REFUSED: could not record the {profile!r} CLAUDE.md profile in "
-            f"{config_path} ({e}). CLAUDE.md was not written."
+            f"{config_path} ({e}). The graph was already seeded; CLAUDE.md was not written."
         )
 
 
