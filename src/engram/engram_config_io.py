@@ -139,28 +139,69 @@ class ConfigShrinkError(ValueError):
         )
 
 
+# The shared remedy sentences (#4705, C2/C8/C10).  install.sh's ERR line carries the same key
+# phrases on purpose (a shell script cannot import this); tests/test_config_never_regenerated_4705.py
+# cell 12 asserts both copies hold them.
+NEW_SEAT_TOOL = "write-default-config.py"
+NEW_SEAT_FLAG = "--confirm-new-seat"  # not printed by any refusal message (R3-2); the tool's --help names it
+# The rule on the READER, printed in place of the flag.  install.sh carries a hand-typed copy.
+NEW_SEAT_RULE = (
+    "Do not pass its confirmation flag yourself: only the user can say this seat is new, and the flag "
+    "stands for their word; the tool cannot tell who typed it (see its --help)."
+)
+_CANDIDATE_READ_CAP = 4 * 1024 * 1024  # a config is a few KB; a bigger "backup" is not one
+
+
+def backup_candidate_label(path) -> str:
+    """The one-key label for a listed backup candidate (#4705 C10): ``(unreadable)`` when it does not
+    parse as a JSON object, ``(no self_lineage)`` when it has no ``self_lineage`` key or an empty one,
+    else ``""``.  No other heuristic; never raises."""
+    try:
+        if os.stat(path).st_size > _CANDIDATE_READ_CAP:
+            return "(unreadable)"
+        data = json.loads(read_regular_text(path, encoding="utf-8"))
+    except Exception:
+        return "(unreadable)"
+    if not isinstance(data, dict):
+        return "(unreadable)"
+    lineage = data.get("self_lineage")
+    if not (isinstance(lineage, str) and lineage.strip()):
+        return "(no self_lineage)"
+    return ""
+
+
 class ConfigMissingError(FileNotFoundError):
-    """config.json is absent where a read-modify-write needs it (#1989).  Never
-    regenerated from empty: that turns a deletion into a plausible-looking file."""
+    """config.json is absent where it is needed: a read-modify-write (#1989), or any open of an
+    existing knowledge.db (#4705).  Never regenerated from empty: that turns a deletion into a
+    plausible-looking file whose blank ``self_lineage`` turns the model-family gate dormant."""
 
     def __init__(self, path):
         self.path = Path(path)
+        q = shlex.quote(str(self.path))
         backups = backup_paths(self.path)
+        infix = self.path.name + _fg().STAMPED_BACKUP_INFIX
+        lead = (f"{self.path}: config.json is missing while knowledge.db exists; "
+                if (self.path.parent / "knowledge.db").exists() else f"{self.path}: config.json is missing; ")
+        parts = [lead + "refusing to create it from empty (the turn counter would restart and "
+                 "self_lineage would be blank)."]
         if backups:
-            newest = shlex.quote(str(backups[-1]))
-            cmd = f"cp -p {newest} {shlex.quote(str(self.path))}"
-            where = (f"Backups sit beside it as {shlex.quote(str(self.path.parent / (self.path.name + _fg().STAMPED_BACKUP_INFIX)))}"
-                     f"<UTC stamp>; the newest is {newest}.")
+            parts.append("Backups beside it, newest first:")
+            for b in reversed(backups):
+                label = backup_candidate_label(b)
+                parts.append(f"  {shlex.quote(str(b))}  [{b.name[len(infix):]}]" + (f"  {label}" if label else ""))
         else:
-            cmd = (f"cp -p <newest {shlex.quote(self.path.name + _fg().STAMPED_BACKUP_INFIX)}* backup> "
-                   f"{shlex.quote(str(self.path))}")
-            where = (f"No backup was found beside it (they are named "
-                     f"{shlex.quote(self.path.name + _fg().STAMPED_BACKUP_INFIX)}<UTC stamp>); "
-                     "check the data dir's git history.")
-        super().__init__(
-            f"{self.path} does not exist; refusing to create it from empty (the turn counter would "
-            f"restart). {where} To recover, copy the newest backup over the path: {cmd}"
-        )
+            parts.append(f"No backup was found beside it (they are named "
+                         f"{shlex.quote(self.path.name + _fg().STAMPED_BACKUP_INFIX)}<UTC stamp>); "
+                         "check the data dir's git history.")
+        parts.append("The user decides which backup to restore: the newest may itself be a regenerated "
+                     "default from before this fix, and restoring it sets whatever self_lineage it holds.")
+        parts.append(f"Once the user has chosen, run: cp -p <the backup you chose> {q}")
+        tools = shlex.quote(str(Path(__file__).resolve().parent / "tools"))
+        parts.append("If the user confirms this seat is new, a tool writes the default (it refuses "
+                     "if config.json exists):")
+        parts.append(f"  {shlex.quote(sys.executable)} {tools}/{NEW_SEAT_TOOL}")
+        parts.append(NEW_SEAT_RULE)
+        super().__init__("\n".join(parts))
 
 
 def _backup_regex(path: Path) -> "re.Pattern":
