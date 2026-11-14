@@ -108,6 +108,7 @@ GUARD_SET_TESTS: tuple[str, ...] = (
     "tests/test_home_path_gate.py",
     "tests/test_lesson_pattern_audit_shipped_3941.py",
     "tests/test_docs_layout_guard.py",
+    "tests/test_policy_guard_list_4487.py",
     "tests/test_metadata_parse_drift_guard_3413.py",
     "tests/test_json_extract_metadata_guard_3485.py",
     "tests/test_no_retired_cascade_store_asserts.py",
