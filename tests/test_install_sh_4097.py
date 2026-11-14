@@ -942,6 +942,31 @@ def test_header_states_the_step_1_no_fetch_gap():
     assert "stale" in head and "origin/*" in head
     assert "--branch" in head and "shallow" in head
     assert "git fetch --tags origin" in head
+    # #4645: a shallow single-branch tag clone is NOT rescued by the tags-only fetch.
+    flat = " ".join(line.lstrip("# ").strip() for line in head.splitlines())  # undo comment wrapping
+    assert "does NOT rescue a shallow clone" in flat
+    assert "set-branches origin" in head and "--unshallow" in head
+    # The full-clone remedy must survive on its own: the shallow sentence also names the tags-only
+    # fetch, so a bare "git fetch --tags origin" check cannot tell if the full-clone case is dropped.
+    assert "full clone with stale origin/* refs: `git fetch --tags origin`" in flat
+
+
+def test_step_1_refusal_names_both_remedies_for_stale_and_shallow_clones(tmp_path):
+    """#4645: a HEAD that is not a deployable tag merged into origin/dev is refused at step 1. The
+    printed remedy must cover a full clone with stale refs (git fetch --tags origin) AND a shallow
+    single-branch clone (set-branches + --unshallow), for which the tags-only fetch does nothing."""
+    sb2 = Sandbox(tmp_path)
+    sb2.commit_on_branch("unmerged-feature")
+    r = sb2.run("--yes")
+    assert r.returncode != 0 and "FAIL: [step 1]" in r.stderr, r.all
+    assert "is not a deployable tag merged into origin/dev or origin/main" in r.stderr
+    # The full-clone remedy is pinned by its own sentence; the shallow sentence also names the
+    # tags-only fetch, so a bare substring check could not see the full-clone case dropped.
+    assert "full clone with stale refs, run git fetch --tags origin first" in r.stderr
+    assert "set-branches origin" in r.stderr and "--unshallow" in r.stderr
+    # The copyable command ends the message: no punctuation glued to it.
+    assert r.stderr.rstrip().endswith("git remote set-branches origin '*' && git fetch --unshallow")
+    assert "--sandbox-untagged is for a test rig only" in r.stderr
 
 
 # ═══ #4255 slice 1: the --multi-agent / --single-agent axis is retired ═════════════════════════
