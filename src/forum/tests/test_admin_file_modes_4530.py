@@ -32,7 +32,7 @@ def test_absent_db_created_private(tmp_path, umask002):
     db = tmp_path / "forum.db"
     _open_db(str(db)).close()
     assert db.exists()
-    assert _mode(db) & 0o037 == 0, oct(_mode(db))
+    assert _mode(db) == 0o640, oct(_mode(db))
 
 
 def test_dangling_symlink_db_target_private(tmp_path, umask002):
@@ -44,7 +44,7 @@ def test_dangling_symlink_db_target_private(tmp_path, umask002):
     conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
     conn.close()
     assert target.exists()
-    assert _mode(target) & 0o037 == 0, oct(_mode(target))
+    assert _mode(target) == 0o640, oct(_mode(target))
 
 
 def test_absent_db_dir_created_0750(tmp_path, umask002):
@@ -82,7 +82,7 @@ def test_export_absent_file_created_private(tmp_path, umask002):
     rc = _run_export(db, out)
     assert rc == 0
     assert out.read_text().strip().startswith("[")
-    assert _mode(out) & 0o037 == 0, oct(_mode(out))
+    assert _mode(out) == 0o640, oct(_mode(out))
 
 
 def test_export_existing_file_overwritten_mode_kept(tmp_path, umask002):
@@ -102,7 +102,7 @@ def test_export_dangling_symlink_target_private(tmp_path, umask002):
     os.symlink(target, link)
     assert _run_export(db, link) == 0
     assert target.exists()
-    assert _mode(target) & 0o037 == 0, oct(_mode(target))
+    assert _mode(target) == 0o640, oct(_mode(target))
 
 
 def test_export_missing_parent_raises_nothing_created(tmp_path, umask002):
