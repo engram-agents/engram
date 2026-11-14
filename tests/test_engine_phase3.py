@@ -1130,3 +1130,75 @@ class TestRootFileManifestDerivation:
             f"Root-level manifest entries missing from dev build: {missing} "
             "(manifest-derived root copy must ship every declared root entry)"
         )
+
+
+# ---------------------------------------------------------------------------
+# E. build_plugin() version wiring, end to end (#1624)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPluginVersionWiring:
+    """Contract: the plugin.json build_plugin() writes carries
+    '<source plugin.json version>-dev.<stamp>.<sha7 or unknown>', the codex
+    manifest carries the same stamp, and the source plugin.json is opened
+    exactly once per build_plugin() call. Only builtins.open() is counted: a
+    second read through pathlib or io.open() would not be seen.
+    """
+
+    @staticmethod
+    def _source_version() -> str:
+        with open(os.path.join(REPO_ROOT, "plugin.json"), encoding="utf-8") as f:
+            return json.load(f)["version"]
+
+    @staticmethod
+    def _build_counting_opens(plugin_root: str, target: str) -> int:
+        """Run build_plugin(); return how many times the source plugin.json was opened."""
+        import builtins
+        from unittest import mock
+
+        from tools.engine.build import build_plugin
+
+        src = os.path.realpath(os.path.join(REPO_ROOT, "plugin.json"))
+        real_open = builtins.open
+        opens = []
+
+        def counting_open(file, *args, **kwargs):
+            try:
+                if os.path.realpath(os.fspath(file)) == src:
+                    opens.append(file)
+            except TypeError:
+                pass  # file descriptor, not a path
+            return real_open(file, *args, **kwargs)
+
+        with mock.patch.object(builtins, "open", counting_open):
+            build_plugin(
+                repo_root=REPO_ROOT,
+                plugin_root=plugin_root,
+                tier="essential",
+                target=target,
+            )
+        return len(opens)
+
+    def test_written_plugin_json_version_is_source_version_stamped(self, tmp_path):
+        bundle = str(tmp_path / "cc")
+        self._build_counting_opens(bundle, "claude-code")
+        with open(os.path.join(bundle, "plugin.json"), encoding="utf-8") as f:
+            written = json.load(f)
+        pattern = rf"^{re.escape(self._source_version())}-dev\.\d{{14}}\.(g?[0-9a-f]{{7,}}|unknown)$"
+        assert re.match(pattern, written["version"]), (
+            f"written version {written['version']!r} is not "
+            f"'<source version>-dev.<stamp>.<sha|unknown>'"
+        )
+
+    def test_source_plugin_json_opened_exactly_once_claude_code(self, tmp_path):
+        assert self._build_counting_opens(str(tmp_path / "cc"), "claude-code") == 1
+
+    def test_codex_manifest_carries_same_build_version_and_single_read(self, tmp_path):
+        bundle = str(tmp_path / "cx")
+        assert self._build_counting_opens(bundle, "codex") == 1
+        with open(os.path.join(bundle, "plugin.json"), encoding="utf-8") as f:
+            written = json.load(f)
+        with open(os.path.join(bundle, ".codex-plugin", "plugin.json"), encoding="utf-8") as f:
+            codex = json.load(f)
+        assert codex["version"] == written["version"]
+        assert written["version"].startswith(self._source_version() + "-dev.")

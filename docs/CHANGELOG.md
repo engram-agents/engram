@@ -40,6 +40,9 @@ with an `-alpha` suffix during the alpha phase.
   The "SUBSET green" line now says the full suite runs nightly and at the
   release cut. `--json` gains `layers` and `unreferenced` keys; no key is
   removed. (#4358)
+- The plugin build now reads the source `plugin.json` once instead of twice. The
+  built `plugin.json` and the codex manifest are unchanged. A new test checks that
+  the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
