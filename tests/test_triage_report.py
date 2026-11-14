@@ -672,3 +672,18 @@ def test_source_names_no_write_verbs():
     for verb in ("POST", "PATCH", "PUT", "DELETE"):
         assert verb not in src, verb
     assert dataclasses.is_dataclass(triage_report.Report)
+
+
+def test_the_search_queries_sent_are_exactly_the_open_and_closed_queries(monkeypatch):
+    # The fake ignores the query text when serving items, so the text actually SENT is asserted here.
+    fake = FakeGH([mk(i) for i in range(1, 4)], closed_total=7)
+    build(monkeypatch, fake)
+    searches = [(p, params) for (p, params, _) in fake.calls if p == "/search/issues"]
+    open_calls = [params for (_, params) in searches if "is:closed" not in params["q"]]
+    assert open_calls, "no open search was sent"
+    for params in open_calls:
+        assert params["q"] == f"repo:{REPO} is:issue is:open"
+    closed_calls = [params for (_, params) in searches
+                    if params["q"] == f"repo:{REPO} is:issue is:closed"]
+    assert len(closed_calls) == 1
+    assert str(closed_calls[0]["per_page"]) == "1"
