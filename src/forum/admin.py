@@ -79,7 +79,9 @@ def _open_db(db_path: str) -> sqlite3.Connection:
     os.makedirs(db_dir, mode=0o750, exist_ok=True)
     # Create forum.db 0640 ourselves: the admin CLI runs at the caller's umask, and
     # sqlite3.connect would create it at that umask (#4530, follow-up to #4499).
-    create_if_absent(db_path)
+    # realpath: a dangling symlink counts as present to create_if_absent, so resolve it
+    # and create the link's target 0640, as the export branch does.
+    create_if_absent(os.path.realpath(db_path))
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")

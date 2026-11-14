@@ -35,6 +35,18 @@ def test_absent_db_created_private(tmp_path, umask002):
     assert _mode(db) & 0o037 == 0, oct(_mode(db))
 
 
+def test_dangling_symlink_db_target_private(tmp_path, umask002):
+    target = tmp_path / "real.db"
+    link = tmp_path / "forum.db"
+    os.symlink(target, link)
+    conn = _open_db(str(link))
+    # init ran: the db is usable through the link
+    conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    conn.close()
+    assert target.exists()
+    assert _mode(target) & 0o037 == 0, oct(_mode(target))
+
+
 def test_absent_db_dir_created_0750(tmp_path, umask002):
     db = tmp_path / "newdir" / "forum.db"
     _open_db(str(db)).close()
