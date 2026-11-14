@@ -13589,7 +13589,10 @@ def _validate_reasoning_structure(
                             parts.append(
                                 f"⚠ inductive_generalization: independent cross-lineage instances "
                                 f"(excluding hypothesis-author lineage '{self_lin}') = {len(independent)}; "
-                                f"{n_cross_leaves} of {n_leaves} leaves cross-lineage — consider inductive_analogy"
+                                f"{n_cross_leaves} of {n_leaves} leaves cross-lineage — add a "
+                                f"cross-lineage observation, use a weaker reasoning type "
+                                f"(inductive_analogy or abductive_best_explanation), or proceed "
+                                f"and say why in logical_chain"
                             )
 
                 # Architecture axis: collect raw enum values directly from DB

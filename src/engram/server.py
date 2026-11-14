@@ -6959,7 +6959,9 @@ def engram_derive(payload_json: str) -> str:
                 (use deductive_modus_ponens if "if P then Q; P; therefore Q");
                 analogies (use inductive_analogy). The corroboration formula
                 1 - ∏(1-cᵢ) is mathematically valid only when premises are
-                genuinely independent.
+                genuinely independent. (The separate independence_advisory
+                response key was removed in #4728; the lineage check is the
+                standpoint ⚠ inductive_generalization line in structure_warnings.)
             derivation_mode (str, optional): LEGACY — use reasoning_type instead.
                 Kept for backward compatibility: "chain" or "corroboration".
             context_ids (str, optional): Comma-separated node IDs for context

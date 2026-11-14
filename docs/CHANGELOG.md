@@ -11,6 +11,15 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- `engram_derive` no longer returns an `independence_advisory` key. It duplicated
+  the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
+  or more lineages, and when the install has recorded its own lineage, that line
+  covers every case the advisory did; in a graph
+  with a single lineage, a generalization over same-lineage premises now gets
+  no warning, because the line only warns when a cross-lineage observation
+  exists to cite. That line now carries the same three options (add a
+  cross-lineage observation, use a weaker reasoning type, or proceed and say
+  why in `logical_chain`). Its firing conditions are unchanged. (#4728)
 - The write-time `anchoring_advisory` on every observation write now matches a
   claim's hard tokens only at token boundaries. `#404` is no longer reported as
   anchored by a quote containing `#4040`, nor `404` by `4040`, `4.404` or
