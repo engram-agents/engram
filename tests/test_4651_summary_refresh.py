@@ -337,6 +337,10 @@ def test_successful_refresh_without_marker_preserves_null_metadata(monkeypatch):
     conn = srv._get_db()
     try:
         conn.execute("UPDATE nodes SET metadata = NULL WHERE id = ?", (node_id,))
+        conn.execute(
+            "CREATE TRIGGER reject_no_marker_metadata_update BEFORE UPDATE OF metadata ON nodes "
+            "WHEN NEW.id = '%s' BEGIN SELECT RAISE(FAIL, 'no-marker metadata write'); END" % node_id
+        )
         conn.commit()
     finally:
         conn.close()
@@ -358,6 +362,10 @@ def test_successful_refresh_without_marker_preserves_raw_object_metadata(monkeyp
     conn = srv._get_db()
     try:
         conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (raw_metadata, node_id))
+        conn.execute(
+            "CREATE TRIGGER reject_no_marker_metadata_update BEFORE UPDATE OF metadata ON nodes "
+            "WHEN NEW.id = '%s' BEGIN SELECT RAISE(FAIL, 'no-marker metadata write'); END" % node_id
+        )
         conn.commit()
     finally:
         conn.close()
