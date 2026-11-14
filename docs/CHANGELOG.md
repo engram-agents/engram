@@ -11,6 +11,15 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- A lost `config.json` is no longer regenerated. When `knowledge.db` exists and `config.json` does not, ENGRAM now refuses instead of writing a default (a blank `self_lineage` silently turned the model-family gate off): a seat whose `config.json` is lost cannot open its memory or run the installer until the file is restored from a backup the user chooses. The refusal lists the backups, and a new `write-default-config.py` command writes the default for a genuinely new seat. The command needs the user's confirmation flag, and refusal messages do not print it. A fresh install, and a bootstrap, are unchanged. (#4705)
+- A refused in-place rewrite now reports which state the file is in as data (`WriteRefused.outcome`:
+  `nothing_written`, `restored` or `may_be_incomplete`), and `set_forum_url.py` and the installer's
+  `install_tier` step word their message from it. When the write and the put-back both fail, they no
+  longer say the file is unchanged; they say it may be incomplete and point at the backup. (#4631)
+- Maintainer docs: the #2652 migration ledger now records the session-start hook's real-store A6
+  re-run (2026-10-13, 0.118x PASS, posted on #3761 but never written into the ledger), and its
+  per-row `macOS` cells are swept for the `--owner` LaunchAgent (#3709, #3778, #3789); 33 cells
+  and three notes had still read "no Mac launcher yet". Docs only. (#2652)
 - `s2_clause_sheet` now refuses a `--db` that is the live store (`$ENGRAM_HOME/knowledge.db`, or a symlink or hard link to it) with one `refused:` line that names the backup-copy recipe, so the tool only ever reads copies. Outputs on a copy are unchanged. (#4286)
 - The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
   empty or not a string) with one stderr line, instead of compacting: it cannot show which session

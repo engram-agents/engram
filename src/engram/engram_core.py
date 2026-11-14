@@ -1606,8 +1606,9 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
             _configure_paths(sandbox_path)
             _SANDBOX_ACTIVE = True
 
-            # Write default config
-            if not CONFIG_PATH.exists():
+            # Write default config -- under the same rule as _ensure_data_dir (#4705): not into a
+            # data dir that already holds a knowledge.db (C5); the sandbox keeps its own literal.
+            if not CONFIG_PATH.exists() and _may_write_default_config():
                 _config_io.write_config_json(CONFIG_PATH, {
                     "trust_pool": [],
                     "confidence_map": CONFIDENCE_MAP,
@@ -3729,62 +3730,87 @@ def _untrack_gitignored_paths(data_dir: "Path", patterns: list) -> list:
     return removed
 
 
+def default_config_dict() -> dict:
+    """The one default ``config.json`` a NEW seat gets.  Shared by ``_ensure_data_dir`` and the
+    human-invoked new-seat command (tools/write-default-config.py) so the two writers cannot drift
+    (#4705 C6).  The sandbox's own minimal literal (engram_sandbox) is the deliberate exception."""
+    return {
+        # Schema v2 (2026-05-05): adds cadence block. Migration from
+        # v1 → v2 is in tools/migration/migrate_config_v2.py for existing installs.
+        "schema_version": 2,
+        # Empty by default — users set their own trusted sources via the
+        # config tab (#1228); source-based confidence calibration is
+        # future-work (#1230).
+        "trust_pool": [],
+        "confidence_map": CONFIDENCE_MAP,
+        "predictive_confidence_cap": PREDICTIVE_CONFIDENCE_CAP,
+        "chain_decay": 0.95,
+        "corroboration_decay": 0.98,
+        "resolution_confidence_threshold": DEFAULT_RESOLUTION_THRESHOLD,
+        "memory": {
+            "decay_base": 1.014,
+            "current_turn": 0,
+            "tier2_max_nodes": 1000,
+        },
+        "embedding": {
+            "model": DEFAULT_EMBEDDING_MODEL,
+            "enabled": True,
+        },
+        "cadence": {
+            # Drowsiness meter + in-session auto-sleep scheduler tunables.
+            # drowsiness_caution_pct / drowsiness_urgent_pct trigger
+            # context_tracker warnings as the session fills.
+            # auto_sleep_enabled / auto_sleep_time are consumed by the
+            # SessionStart hook to register a nightly in-session CronCreate
+            # that fires /engram-sleep at the configured time.
+            # Changes take effect next session (restart_required).
+            "drowsiness_caution_pct": 80,
+            "drowsiness_urgent_pct": 90,
+            "auto_sleep_enabled": False,
+            "auto_sleep_time": "03:00",
+        },
+        # Standpoint v3 null=self (D1 §2): the install's OWN training lineage
+        # (provider:family, e.g. "anthropic:opus"). Read by _self_lineage()
+        # so an unmarked observation counts as the filer's own lineage, which
+        # is what makes the standpoint/F-S advisory fire on own-unmarked
+        # derivations. Default "" = feature ships DARK (safe degradation —
+        # gate stays closed, same as pre-feature); the first-session skill
+        # prompts the user to set it. NOT auto-detected — the agent declares it.
+        "self_lineage": "",
+        # Fairy delegation policies — consumed by SessionStart hook per-decision.
+        # Three modes per policy: "explicit", "auto", "always".
+        # "auto" uses the named judgement skill; "explicit" only spawns on
+        # direct user request; "always" unconditionally delegates to fairy.
+        # Changes take effect immediately (read per-decision, restart_required=False).
+        "coder_fairy_policy": "auto",
+        "reviewer_fairy_policy": "auto",
+    }
+
+
+def _bootstrap_mode() -> bool:
+    """True when the DB guards are bypassed: ENGRAM_BOOTSTRAP=1 (bootstrap.py, first-session re-run)
+    or ENGRAM_NO_DB_GUARDS=1 (test mode).  The one definition ``_get_db`` and the config write rule share."""
+    return (
+        os.environ.get("ENGRAM_BOOTSTRAP") == "1"
+        or os.environ.get("ENGRAM_NO_DB_GUARDS") == "1"
+    )
+
+
+def _may_write_default_config() -> bool:
+    """#4705: the default config is written ONLY when knowledge.db does not exist (a new seat) or in
+    bootstrap mode.  With a database present and config.json lost, writing a plausible default would
+    blank ``self_lineage`` (the model-family gate goes dormant, silently) and restart the turn counter."""
+    return _bootstrap_mode() or not DB_PATH.exists()
+
+
 def _ensure_data_dir():
-    """Create data directory and config file if needed. Git is handled separately."""
+    """Create data directory and config file if needed. Git is handled separately.
+
+    The default config is written only under ``_may_write_default_config`` (#4705); a lost config.json
+    beside an existing knowledge.db is refused by ``_get_db``, never regenerated here."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not CONFIG_PATH.exists():
-        default_config = {
-            # Schema v2 (2026-05-05): adds cadence block. Migration from
-            # v1 → v2 is in tools/migration/migrate_config_v2.py for existing installs.
-            "schema_version": 2,
-            # Empty by default — users set their own trusted sources via the
-            # config tab (#1228); source-based confidence calibration is
-            # future-work (#1230).
-            "trust_pool": [],
-            "confidence_map": CONFIDENCE_MAP,
-            "predictive_confidence_cap": PREDICTIVE_CONFIDENCE_CAP,
-            "chain_decay": 0.95,
-            "corroboration_decay": 0.98,
-            "resolution_confidence_threshold": DEFAULT_RESOLUTION_THRESHOLD,
-            "memory": {
-                "decay_base": 1.014,
-                "current_turn": 0,
-                "tier2_max_nodes": 1000,
-            },
-            "embedding": {
-                "model": DEFAULT_EMBEDDING_MODEL,
-                "enabled": True,
-            },
-            "cadence": {
-                # Drowsiness meter + in-session auto-sleep scheduler tunables.
-                # drowsiness_caution_pct / drowsiness_urgent_pct trigger
-                # context_tracker warnings as the session fills.
-                # auto_sleep_enabled / auto_sleep_time are consumed by the
-                # SessionStart hook to register a nightly in-session CronCreate
-                # that fires /engram-sleep at the configured time.
-                # Changes take effect next session (restart_required).
-                "drowsiness_caution_pct": 80,
-                "drowsiness_urgent_pct": 90,
-                "auto_sleep_enabled": False,
-                "auto_sleep_time": "03:00",
-            },
-            # Standpoint v3 null=self (D1 §2): the install's OWN training lineage
-            # (provider:family, e.g. "anthropic:opus"). Read by _self_lineage()
-            # so an unmarked observation counts as the filer's own lineage, which
-            # is what makes the standpoint/F-S advisory fire on own-unmarked
-            # derivations. Default "" = feature ships DARK (safe degradation —
-            # gate stays closed, same as pre-feature); the first-session skill
-            # prompts the user to set it. NOT auto-detected — the agent declares it.
-            "self_lineage": "",
-            # Fairy delegation policies — consumed by SessionStart hook per-decision.
-            # Three modes per policy: "explicit", "auto", "always".
-            # "auto" uses the named judgement skill; "explicit" only spawns on
-            # direct user request; "always" unconditionally delegates to fairy.
-            # Changes take effect immediately (read per-decision, restart_required=False).
-            "coder_fairy_policy": "auto",
-            "reviewer_fairy_policy": "auto",
-        }
-        _config_io.write_config_json(CONFIG_PATH, default_config)
+    if not CONFIG_PATH.exists() and _may_write_default_config():
+        _config_io.write_config_json(CONFIG_PATH, default_config_dict())
 
 
 VALID_SOURCE_TYPES = {"document", "conversation", "file", "web_page"}
@@ -4203,6 +4229,10 @@ def _db_missing_message() -> str:
     )
 
 
+# Placeholders, never a ready-to-run path (#4705 R2-4c; same reason C10 rejects a pre-filled cp -p).
+_MV_TEMPLATE = "mv <path to knowledge.db> <path to knowledge.db>.moved-aside.<UTC stamp>"
+
+
 def _seed_missing_message() -> str:
     """Actionable error message when the DB exists but has no seed nodes.
 
@@ -4211,12 +4241,145 @@ def _seed_missing_message() -> str:
     mid-run or the user manually created an empty knowledge.db).
     """
     return (
-        f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but has no seed nodes.\n\n"
-        "This usually means a bootstrap was started but never completed.\n"
-        "Run the engram-first-session skill to complete the bootstrap, or\n"
-        f"delete {DB_PATH} (verify it's empty first!) and re-run first-session\n"
-        "for a clean retry."
+        f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but has no seed nodes.\n"
+        "This usually means a bootstrap was started but never completed.\n\n"
+        "Stop and tell the user. The user decides what happens next. They can have you complete the "
+        "bootstrap through the engram-first-session skill. Only if the user decides this seat is new, "
+        "move the file aside under a dated name (never remove it), then run first-session for a clean "
+        "retry:\n"
+        f"  {_MV_TEMPLATE}"
     )
+
+
+_PACK_SENTENCE = (
+    "Note: if this is a knowledge pack, its config.json is missing too; restore it from backup."
+)
+
+
+def _db_damaged_message(reason: str) -> str:
+    """#4705 C3b: knowledge.db exists but is not a readable ENGRAM database, and config.json is absent."""
+    return (
+        f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but is not a readable ENGRAM database "
+        f"({reason}), and config.json is absent. Nothing was written.\n\n"
+        "Stop and tell the user. The user decides what happens next. They can have knowledge.db restored "
+        "from a backup or snapshot. Only if the user decides this seat is genuinely new, move the file "
+        "aside under a dated name (never remove it), then run the engram-first-session skill:\n"
+        f"  {_MV_TEMPLATE}"
+    )
+
+
+_BUSY_SENTENCE = (
+    "The database could not be read just now because another process (for example a running "
+    "ENGRAM server) holds it; stop that process and retry first, which costs nothing, before "
+    "restoring anything."
+)
+
+
+_ACCESS_SENTENCE = (
+    "The database could not be opened read-only just now. That usually means the ENGRAM "
+    "directory or the database file is read-only, full or owned by another user. Nothing "
+    "about the database itself is known yet; fix that access and retry before restoring "
+    "anything."
+)
+
+_GENERIC_SENTENCE = (
+    "The database could not be read just now. Nothing about the database itself is known "
+    "yet. Check that the ENGRAM directory and the database file are readable by this "
+    "user, then retry; if it keeps happening, report this line."
+)
+
+
+def _is_busy_or_locked(exc: sqlite3.Error) -> bool:
+    """#4705: True for an OperationalError whose SQLite error is BUSY or LOCKED (primary code, extended
+    bits masked).  The error code is used where the interpreter has it (3.11+); the message text only
+    where it does not."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def _is_positive_damage(exc: sqlite3.Error) -> bool:
+    """#4705 R5: True only for positive evidence the file is not a healthy SQLite database: primary code
+    NOTADB or CORRUPT.  Without sqlite_errorcode (before 3.11) only the two message texts count."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return (code & 0xFF) in (sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT)
+    text = str(exc).lower()
+    return "file is not a database" in text or "malformed" in text
+
+
+def _is_access_failure(exc: sqlite3.Error) -> bool:
+    """#4705 R5: True for an error that says the probe could not get at the file (read-only, cannot open,
+    permission, auth, I/O, disk full), which is a fact about access, not about the graph.  Needs
+    sqlite_errorcode (3.11+); without it the error falls to the generic sentence."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is None:
+        return False
+    return (code & 0xFF) in (
+        sqlite3.SQLITE_READONLY,  # 8
+        sqlite3.SQLITE_CANTOPEN,  # 14
+        sqlite3.SQLITE_PERM,  # 3
+        sqlite3.SQLITE_AUTH,  # 23
+        sqlite3.SQLITE_IOERR,  # 10
+        sqlite3.SQLITE_FULL,  # 13
+    )
+
+
+def _config_missing_with(sentence: str) -> "_config_io.ConfigMissingError":
+    """ConfigMissingError with one sentence placed before the remedies (R2-4a); a wrapper on the message,
+    same exception class."""
+    err = _config_io.ConfigMissingError(CONFIG_PATH)
+    lead, _, rest = str(err).partition("\n")
+    err.args = (lead + "\n" + sentence + "\n" + rest,)
+    return err
+
+
+def _refuse_config_missing() -> None:
+    """config.json is absent and the guards are on: classify the existing knowledge.db read-only and
+    raise the matching refusal (#4705).  Never returns, never writes.
+
+    ConfigMissingError (C2) only for a DB that opens read-only and holds at least one axiom; a DB with
+    no usable graph gets its own wording (C3a seed-missing + pack sentence, C3b damaged), so no message
+    states a fact the file contradicts.  The discriminator is the file, not a size threshold.
+
+    The two failure directions are not equal: a false "damaged" gets a good database moved aside, while
+    a false "not damaged" costs a retry.  So "damaged" (C3b) is an allowlist of positive evidence only:
+    SQLite NOTADB or CORRUPT, or a file that opens and has no nodes table.  A busy or locked database,
+    an access failure (read-only, cannot open, permission, auth, I/O, full) and any unknown sqlite3
+    error all land on ConfigMissingError with a sentence that says so; an unknown code lands on the
+    side that costs a retry.  Every non-damaged message names the SQLite error, so a human or an
+    agent can still act on it when the classification declines to."""
+    kind, reason = "seeded", ""
+    try:
+        con = sqlite3.connect(f"{DB_PATH.absolute().as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "nodes" not in tables:
+                kind, reason = "damaged", "no nodes table"
+            elif con.execute("SELECT COUNT(*) FROM nodes WHERE type='axiom'").fetchone()[0] == 0:
+                kind = "seedless"
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        named = f"({type(exc).__name__}: {exc})"
+        if _is_busy_or_locked(exc):
+            # A locked/busy database is not a damaged one: the only fact known is that config.json is missing.
+            raise _config_missing_with(_BUSY_SENTENCE)
+        if _is_positive_damage(exc):
+            kind, reason = "damaged", f"{type(exc).__name__}: {exc}"
+        elif _is_access_failure(exc):
+            raise _config_missing_with(f"SQLite said {named}. {_ACCESS_SENTENCE}")
+        else:
+            raise _config_missing_with(f"SQLite said {named}. {_GENERIC_SENTENCE}")
+    if kind == "damaged":
+        raise RuntimeError(_db_damaged_message(reason))
+    if kind == "seedless":
+        raise RuntimeError(_seed_missing_message() + "\n\n" + _PACK_SENTENCE)
+    raise _config_io.ConfigMissingError(CONFIG_PATH)
 
 
 def _walguard_startup_clear(conn: sqlite3.Connection) -> None:
@@ -6968,13 +7131,14 @@ def _get_db(setup_wait: str = SETUP_WAIT_SERVER) -> sqlite3.Connection:
     SETUP_LOCK_HOOK_WAIT_S then raises DbSetupLockBusy. Only consulted when
     this process still has to run the one-time setup.
     """
-    bootstrap_mode = (
-        os.environ.get("ENGRAM_BOOTSTRAP") == "1"
-        or os.environ.get("ENGRAM_NO_DB_GUARDS") == "1"
-    )
+    bootstrap_mode = _bootstrap_mode()
     if not DB_PATH.exists() and not bootstrap_mode:
         raise RuntimeError(_db_missing_message())
     _ensure_data_dir()
+    # #4705: config.json lost beside an existing knowledge.db. _ensure_data_dir() wrote nothing (the
+    # DB exists); refuse here, before any write to the store, instead of running on a guessed config.
+    if not bootstrap_mode and not CONFIG_PATH.exists():
+        _refuse_config_missing()
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     try:

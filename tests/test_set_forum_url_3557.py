@@ -752,3 +752,53 @@ class TestS8Installer:
                                 env=_hermetic_env(ENGRAM_HOME=str(tmp_path)))
         assert manual.returncode == 3, (cmds[0], manual.stdout, manual.stderr)
         assert (tmp_path / "config.json").read_bytes() == before
+
+
+# ---------------------------------------------------------------- #4631 ----
+
+class TestRefusalStateIsTruthful:
+    """A refused rewrite ends in one of three states; the tool's sentence follows the guard's
+    `.outcome` and never assumes the file is unchanged."""
+
+    def _fail(self, mod, monkeypatch, *, put_back_works):
+        real, calls = mod.fg._replace_contents, []
+
+        def fake(fd, data):
+            calls.append(data)
+            if len(calls) == 1 or not put_back_works:
+                raise OSError("simulated write failure")
+            real(fd, data)
+
+        monkeypatch.setattr(mod.fg, "_replace_contents", fake)
+
+    def test_state_3_does_not_claim_the_file_is_unchanged_and_names_the_backup(self, tmp_path, monkeypatch):
+        p = _cfg(tmp_path, {"agent_name": "n"})
+        mod = _tool()
+        self._fail(mod, monkeypatch, put_back_works=False)
+        r = mod.set_forum_url(p, URL)
+        assert r.status != "written", r
+        backups = [x for x in tmp_path.iterdir() if ".engram-backup." in x.name]
+        assert len(backups) == 1
+        assert "unchanged" not in r.message and "left as it was" not in r.message, r.message
+        assert "may be incomplete" in r.message and str(backups[0]) in r.message, r.message
+
+    def test_state_2_stays_truthful_about_the_restored_file(self, tmp_path, monkeypatch):
+        p = _cfg(tmp_path, {"agent_name": "n"})
+        before = p.read_bytes()
+        mod = _tool()
+        self._fail(mod, monkeypatch, put_back_works=True)
+        r = mod.set_forum_url(p, URL)
+        assert r.status != "written" and p.read_bytes() == before, r
+        assert "previous contents were put back" in r.message and "unchanged" in r.message, r.message
+        assert "incomplete" not in r.message, r.message
+
+    def test_a_refusal_before_the_target_is_touched_keeps_the_unchanged_wording(self, tmp_path, monkeypatch):
+        p = _cfg(tmp_path, {"agent_name": "n"})
+        mod = _tool()
+
+        def no_backup(*a, **k):
+            raise SystemExit("[bootstrap] REFUSED: could not save it to the backup path (x), so nothing was written there.")
+
+        monkeypatch.setattr(mod.fg, "save_backup", no_backup)
+        r = mod.set_forum_url(p, URL)
+        assert r.status != "written" and r.message.endswith("; file unchanged"), r.message

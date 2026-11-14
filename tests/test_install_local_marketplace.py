@@ -3069,3 +3069,56 @@ def test_fresh_install_default_message_does_not_name_the_axis(tmp_path):
 
     assert [ln for ln in result.stdout.splitlines() if "fresh-install default" in ln]
     assert "single-agent" not in result.stdout
+
+
+# ---- #4631: the persist step says which state config.json is in after a refused rewrite ----------
+
+_FORCE_WRITE_FAILURE = """
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[3])
+import engram_file_guard as _fg
+_real, _calls = _fg._replace_contents, []
+def _fake(fd, data):
+    _calls.append(data)
+    if len(_calls) == 1 or {fail_put_back}:
+        raise OSError("simulated write failure")
+    _real(fd, data)
+_fg._replace_contents = _fake
+"""
+
+
+def _run_persist_failing(tmp_path, *, put_back_works):
+    cfg = tmp_path / "config.json"
+    cfg.write_bytes(b'{"install_tier": "dev"}\n')
+    code = _FORCE_WRITE_FAILURE.format(fail_put_back=("False" if put_back_works else "True")) + _persist_tier_block()
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(cfg), "convenience", str(REPO_ROOT / "src" / "engram")],
+        capture_output=True, text=True,
+    )
+    return proc, cfg
+
+
+def test_persist_state_3_does_not_say_unchanged_and_names_the_backup(tmp_path):
+    proc, cfg = _run_persist_failing(tmp_path, put_back_works=False)
+    assert proc.returncode == 3, (proc.returncode, proc.stderr)
+    backups = [p for p in tmp_path.iterdir() if ".engram-backup." in p.name]
+    assert len(backups) == 1
+    assert "unchanged" not in proc.stderr and "left as it was" not in proc.stderr, proc.stderr
+    assert "may be incomplete" in proc.stderr and str(backups[0]) in proc.stderr, proc.stderr
+
+
+def test_persist_state_2_stays_truthful_about_the_restored_file(tmp_path):
+    proc, cfg = _run_persist_failing(tmp_path, put_back_works=True)
+    assert proc.returncode == 1, (proc.returncode, proc.stderr)
+    assert cfg.read_bytes() == b'{"install_tier": "dev"}\n'
+    assert "previous contents were put back" in proc.stderr and "incomplete" not in proc.stderr, proc.stderr
+
+
+def test_the_shell_block_words_its_not_done_item_by_the_exit_code():
+    """The not_done item must not claim 'left exactly as it was' for the may-be-incomplete state
+    (the python block exits 3 for it); the other refusals keep the old sentence."""
+    text = INSTALLER.read_text()
+    assert "_persist_rc" in text and "may be incomplete" in text
+    state_3 = text.split("_persist_rc -eq 3", 1)[1].split("else", 1)[0]
+    assert "left exactly as it was" not in state_3 and "may be incomplete" in state_3
