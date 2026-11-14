@@ -84,7 +84,7 @@ def _seed_nap_backstop_home(engram_home: Path) -> None:
     (engram_home / "loop-mode.json").write_text('{"kind": "loop"}', encoding="utf-8")
     (engram_home / "compact").mkdir()
     (engram_home / "compact" / "last-checkpoint.json").write_text(
-        json.dumps({"checkpoint_at": header, "session_id": None, "backup_ok": True}), encoding="utf-8")
+        json.dumps({"checkpoint_at": header, "session_id": "codex-json-sweep-test", "backup_ok": True}), encoding="utf-8")
 
 
 def _seed_lesson_tripwire_db(engram_home: Path) -> None:

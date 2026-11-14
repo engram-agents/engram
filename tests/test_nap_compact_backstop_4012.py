@@ -474,6 +474,8 @@ def test_b10b_a_record_without_a_session_means_no_run(record_session, tmp_path, 
 
 
 def test_b10d_payload_without_session_and_record_without_session_prints_only_the_payload_line(tmp_path, stub_plugin):
+    """A precedence pin for guard 5 (payload without session_id), green on the base by design: it is not a
+    cell that catches the C1 change. With both sessions missing, only guard 5's line is printed."""
     home = make_home(tmp_path, record={"checkpoint_at": HEADER_TS, "session_id": None, "backup_ok": True})
     done = stop(home, stub_plugin, session_id=None)
     assert done.returncode == 0
