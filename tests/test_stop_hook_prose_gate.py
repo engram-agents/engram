@@ -775,3 +775,21 @@ def test_race_next_delta_contains_bytes_appended_in_window_1855(tmp_path, monkey
     mod._should_suppress(str(transcript))
 
     assert seen and b"LATE-BYTES" in seen[0]
+
+
+def test_scanned_size_does_not_leak_across_calls_1855(tmp_path, monkeypatch):
+    """The recorded size is per run. A module instance that scanned transcript A (size
+    `_SCANNED_SIZE` = A's size) and is then asked about a DIFFERENT transcript B, which returns
+    at the path-mismatch check before any stat, must record B's own size (a fresh stat), never
+    A's stale scan size. Red without the per-call reset at the top of `_should_suppress`."""
+    mod, a_path, state = _race_setup(tmp_path, monkeypatch)
+    mod._should_suppress(str(a_path))  # scans A: _SCANNED_SIZE is now A's size
+    b_path = tmp_path / "other-transcript.jsonl"
+    b_path.write_text('{"x":1}\n', encoding="utf-8")
+    assert os.path.getsize(b_path) != os.path.getsize(a_path)
+
+    mod._should_suppress(str(b_path))  # path differs from the state file's: returns before a stat
+    mod._update_state(str(b_path))
+
+    recorded = json.loads(state.read_text(encoding="utf-8"))["byte_offset"]
+    assert recorded == os.path.getsize(b_path), (recorded, os.path.getsize(b_path))

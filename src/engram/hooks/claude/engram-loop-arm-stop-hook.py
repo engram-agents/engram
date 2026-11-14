@@ -305,15 +305,16 @@ flush lag is a known prior in this codebase's Stop hooks -- previously
 documented against the `tool_result` shape, and the same lag risk applies
 identically to a `tool_use` block, since both land in the same JSONL
 stream). A turn whose re-arm flushes after this hook has read the delta can
-therefore draw one extra nudge, and that is the whole cost: the offset this
-hook records is the transcript size its own delta scan used (the largest
-size any scan in the invocation stat'd, passed as
-`_stophooklib.write_offset_state(..., offset=)`), not a second stat taken
-after the decision path, so bytes that land after the scan stay in the next
-turn's delta instead of being skipped for good (the earlier re-stat did skip
-them, which made the over-fire unbounded: #1855, fixed). The late record is
-then read by the NEXT turn's scan, so that turn can be suppressed by an arm
-that belongs to the turn before it; this is the same one-turn imprecision.
+therefore draw one extra nudge. The offset this hook records is the
+transcript size its own delta scan used (the largest size any scan in the
+invocation stat'd, passed as `_stophooklib.write_offset_state(..., offset=)`),
+not a second stat taken after the decision path, so bytes that land after the
+scan stay in the next turn's delta instead of being skipped for good (the
+earlier re-stat did skip them, which made the over-fire unbounded: #1855,
+fixed). That has a second, equally bounded cost in the other direction: the
+late record is read by the NEXT turn's scan, so that turn can be SUPPRESSED by
+an arm that belongs to the turn before it (a one-turn false suppression, not
+only an extra nudge). Both effects last one turn.
 The one path with no scan to record (the managed-Codex pacer nudge, which
 returns before any delta is read) still stats the transcript when it writes.
 
@@ -1822,6 +1823,8 @@ def _emit_hook_fire(session_id: str, transcript_path: str, _t0: float) -> None:
 
 
 def main() -> None:
+    global _SCANNED_SIZE  # #1855
+    _SCANNED_SIZE = None  # reset per run: a stale value from an earlier call must not become this run's offset
     # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
     # return in this function.
     write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})

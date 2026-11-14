@@ -896,6 +896,8 @@ def _should_suppress(transcript_path: str) -> bool:
 
     Fail-open: any exception returns False (emit the nudge).
     """
+    global _SCANNED_SIZE  # #1855
+    _SCANNED_SIZE = None  # reset per run: a stale value from an earlier call must not become this run's offset
     try:
         if not transcript_path:
             return False  # no transcript → unknown → emit
@@ -926,7 +928,6 @@ def _should_suppress(transcript_path: str) -> bool:
             return False  # can't stat → emit
         # #1855: remember the size this scan used; _update_state records THAT,
         # not a second stat the transcript may have outgrown.
-        global _SCANNED_SIZE
         _SCANNED_SIZE = current_size
 
         # Stored offset beyond current size → rotation/compaction → emit.
