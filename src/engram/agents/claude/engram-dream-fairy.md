@@ -125,7 +125,8 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
       # Declared repo map — CLOSED vocabulary, written for bash 3.2 on purpose (stock macOS):
       # no associative arrays, no mapfile, no namerefs. An alias not listed here is UNMATCHED,
       # never guessed against the cwd checkout. A test cell asserts this case stays in sync
-      # with ALIASES, and another asserts the whole block stays free of bash-4-only constructs.
+      # with ALIASES, and another inventories the block for a named list of bash-4-only
+      # constructs -- an inventory, not a proof of bash-3.2 compatibility.
       repo_for() {
         case "$1" in
           engram-alpha) echo engram-agents/engram-alpha ;;
