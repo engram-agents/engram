@@ -652,7 +652,8 @@ def main():
             print("  After --push, three public steps remain (Releases entry, website entry, newsletter); see docs/internal/RELEASING.md \"Announcing\" + \"Tell the public\".")
         print()
         print("CAVEAT: scan-leaks is necessary-but-not-sufficient — it catches the configured")
-        print("roster patterns and committed structural patterns. Extensionless files are skipped.")
+        print("roster patterns and committed structural patterns. It reads every tracked text")
+        print("file; binary files are skipped and counted in the scanner's own summary line.")
         print("Structural review of the snapshot is still recommended before making the repo public.")
 
     finally:

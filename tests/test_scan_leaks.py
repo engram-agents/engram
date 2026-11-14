@@ -979,11 +979,17 @@ def test_use_git_false_fallback_scans_all_text_files(tmp_path):
 
 
 def test_tracked_directory_symlink_is_not_a_candidate(tmp_path):
-    """A git-tracked symlink to a directory is not a file to scan, so it does
-    not inflate the considered population (this repo tracks two of them)."""
+    """A git-tracked symlink to a directory does not inflate either bucket.
+
+    What this pins, stated honestly: the symlink is excluded from the counts
+    whether it is filtered out as a candidate or dropped later by the OSError
+    arm, so it does not discriminate the ``is_file()`` filter itself.  It DOES
+    redden a plausible-wrong implementation that counts an unreadable entry as
+    binary — that is the variant it exists for."""
+    (tmp_path / "real-dir").mkdir()
     _commit_files(tmp_path, {"real/member.py": "// clean\n"})
     (tmp_path / "tools").mkdir()
-    (tmp_path / "tools" / "engine").symlink_to("../src/build/engine")
+    (tmp_path / "tools" / "engine").symlink_to("../real-dir")
     subprocess.run(["git", "add", "tools/engine"], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "symlink"], cwd=tmp_path, check=True)
 
