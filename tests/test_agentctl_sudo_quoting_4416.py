@@ -115,7 +115,7 @@ def _simulate(outer: str, quoted: bytes) -> bytes:
     words = [BASH.encode(), b"-c", string, b"--", b"arg one", b"arg two"]
     joined = b" ".join(_esc(w) for w in words)
     return subprocess.run([outer, "-c", joined], capture_output=True,
-                          env={"PATH": os.environ["PATH"], "HOME": "/home/simhome",
+                          env={"PATH": os.environ["PATH"], "HOME": "/simhome",
                                "X": "EXPANDED"}).stdout
 
 
