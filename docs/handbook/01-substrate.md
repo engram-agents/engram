@@ -103,22 +103,22 @@ Embedding stored at creation via `_compute_and_store_embedding()` (called by `_s
 
 ## **5. Memory Tiers, Importance Decay & Recall Surfaces**
 
-**what** — Three-tier memory architecture based on importance scores (confidence × surprise × exponential decay). Tier 1 (working memory, ~200 nodes) surfaces in reflect/checkpoint; Tier 2 (searchable, ~1000 nodes) filters retrieval candidates; Tier 3 (total archive). Exponential decay driven by turn counter: `importance_score = importance_base × decay_base^turn` (default decay_base=1.014). Nodes acquire `importance_base` at creation (from confidence + surprise), then decay exponentially as turns accumulate. Recall events (surface/query/inspect) update `recall_turn` and `recall_count`, boosting the node's importance_score back up.
+**what** — Two-tier memory architecture based on importance scores (confidence × surprise × exponential decay). Tier 1, the old working-memory band, is retired (#1220). Tier 2 (searchable, ~1000 nodes) filters retrieval candidates; Tier 3 (total archive) holds the rest. Exponential decay driven by turn counter: `importance_score = importance_base × decay_base^turn` (default decay_base=1.014). Nodes acquire `importance_base` at creation (from confidence + surprise), then decay exponentially as turns accumulate. Recall events (surface/query/inspect) update `recall_turn` and `recall_count`, boosting the node's importance_score back up.
 
 **how** — Core functions:
 - `_compute_importance()` in `engram_core.py:1900`: `base × decay_base^turn`
 - `_importance_base_for_node()` in `engram_core.py:1907`: `confidence × (1 + surprise)`
-- `_get_tier_threshold()` in `engram_core.py:1919`: dynamic percentile-based threshold, targets tier1_max_nodes=200, tier2_max_nodes=1000
+- `_get_tier_threshold()` in `engram_core.py:1919`: dynamic percentile-based threshold, targets tier2_max_nodes=1000
 - `_refresh_recall()` in `engram_query.py:576`: re-stamps recalled nodes with current turn's importance
 - `_stamp_new_node()` in `engram_core.py:1959`: sets importance_base and importance_score on creation
 
-Columns: `nodes.importance_base`, `nodes.importance_score`, `nodes.recall_turn`, `nodes.recall_count`, `nodes.memory_status` (TEXT: active/faded). Config keys: `memory_config.decay_base`, `current_turn`, `tier1_max_nodes`, `tier2_max_nodes` (from CONFIG_PATH).
+Columns: `nodes.importance_base`, `nodes.importance_score`, `nodes.recall_turn`, `nodes.recall_count`, `nodes.memory_status` (TEXT: active/faded). Config keys: `memory_config.decay_base`, `current_turn`, `tier2_max_nodes` (from CONFIG_PATH).
 
 **status-candidate** — **prod-presumed** (active in every retrieval; turn counter drives time passage).
 
 **files** — `engram_core.py` (core mechanics: `_compute_importance()` :1900, `_importance_base_for_node()` :1907, `_get_tier_threshold()` :1919, `_stamp_new_node()` :1959; `_get_memory_config()` :1747). `engram_query.py` (`_refresh_recall()` :576; threshold in `_search_nodes()` :1150).
 
-**key constants** — Default decay_base=1.014 (lei 2026-05-19 calibration). Tier 1 max nodes 200, Tier 2 max nodes 1000 (defaults in `engram_core.py:1753`). Decay formula preserves semantic memory indefinitely but down-weights old observations (asymptotic forgetting curve).
+**key constants** — Default decay_base=1.014 (lei 2026-05-19 calibration). Tier 2 max nodes 1000 (defaults in `engram_core.py:1753`). Decay formula preserves semantic memory indefinitely but down-weights old observations (asymptotic forgetting curve).
 
 **tests** — Implicit in all recall-related tests; explicit decay testing in integration suites.
 
