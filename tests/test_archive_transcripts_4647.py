@@ -221,25 +221,55 @@ def test_c2_replay_refuses_a_first_segment_above_the_previous_end(dirs, tmp_path
 
 # ------------------------------------------------------------- C3
 
-def test_c3_shrunk_transcript_is_loud_and_writes_nothing(dirs, capsys):
+def test_c3_shrunk_transcript_is_loud_but_does_not_block_the_others(dirs, capsys):
     src, arc = dirs
     _put(src, "p/a.jsonl", b"0123456789\n" * 5)
     _put(src, "p/b.jsonl", b"bbb\n")
     at.archive_run(src, arc)
     before = _tree(arc)
-    (src / "p/a.jsonl").write_bytes(b"0123\n")  # smaller than the archived end
-    _put(src, "p/c.jsonl", b"new bytes that would otherwise be archived\n")
-    with pytest.raises(at.TranscriptShrank) as e:
-        at.archive_run(src, arc)
-    assert "p/a.jsonl" in str(e.value) and "55" in str(e.value) and "5" in str(e.value)
-    assert _tree(arc) == before  # existing archives untouched, nothing new, no temp file
+    (src / "p/a.jsonl").write_bytes(b"0123\n")  # smaller than the archived end (55)
+    _append(src, "p/b.jsonl", b"healthy new bytes\n")
+    _put(src, "p/c.jsonl", b"brand new file\n")
+
+    res = at.archive_run(src, arc)  # no raise: a per-file problem is reported, not thrown
+    assert len(res.problems) == 1
+    assert "p/a.jsonl" in res.problems[0] and "now 5 bytes" in res.problems[0]
+    assert "archived through 55" in res.problems[0]
+    assert res.archive_path is not None
+    segs = {s.path: (s.start, s.end) for s in at.read_manifest(res.archive_path)}
+    assert segs == {"p/b.jsonl": (4, 4 + len(b"healthy new bytes\n")), "p/c.jsonl": (0, 15)}
+    after = _tree(arc)
+    for name, digest in before.items():
+        assert after[name] == digest  # existing archives byte-identical
     assert not _tmps(arc)
 
+    # the shrunk file stays excluded, and the watermark does not move, on every later run
+    marks = at.watermarks(arc)
+    assert marks["p/a.jsonl"] == 55
+    res2 = at.archive_run(src, arc)
+    assert res2.archive_path is None and len(res2.problems) == 1
+    assert at.watermarks(arc) == marks
+
+    # grown back to at least its watermark: archived again from the watermark, not from 0
+    (src / "p/a.jsonl").write_bytes(b"0123456789\n" * 5 + b"tail\n")
+    res3 = at.archive_run(src, arc)
+    assert res3.problems == ()
+    assert [(s.path, s.start, s.end) for s in at.read_manifest(res3.archive_path)] == [("p/a.jsonl", 55, 60)]
+
+
+def test_c3_cli_names_the_shrunk_file_exits_2_and_still_prints_the_summary(dirs, capsys):
+    src, arc = dirs
+    _put(src, "p/a.jsonl", b"0123456789\n" * 5)
+    _put(src, "p/b.jsonl", b"bbb\n")
+    at.archive_run(src, arc)
+    (src / "p/a.jsonl").write_bytes(b"0123\n")
+    _append(src, "p/b.jsonl", b"more\n")
     rc = at.main(["--source", str(src), "--archive-dir", str(arc)])
-    captured = capsys.readouterr()
+    cap = capsys.readouterr()
     assert rc == 2
-    assert captured.err.startswith("ERROR:") and "p/a.jsonl" in captured.err
-    assert _tree(arc) == before
+    assert cap.out.startswith("transcript archive: 1 files, 1 segments, 5 bytes")
+    assert "p/a.jsonl" in cap.err and "now 5 bytes, archived through 55" in cap.err
+    assert cap.err.startswith("ERROR:")
 
 
 def test_c3_limit_is_stated_in_the_module_docstring():
@@ -480,7 +510,9 @@ def test_c12_cli_summary_lines(dirs, capsys):
     (src / "p/a.jsonl").write_bytes(b"")  # shrank below the watermark
     assert at.main(["--source", str(src), "--archive-dir", str(arc)]) == 2
     cap = capsys.readouterr()
-    assert cap.out == "" and cap.err.startswith("ERROR: ") and "p/a.jsonl" in cap.err
+    # the summary line still prints (nothing else changed), then the problem is loud on stderr
+    assert cap.out == f"transcript archive: 0 new bytes; archive total {total} bytes in 1 files\n"
+    assert cap.err.startswith("ERROR: ") and "p/a.jsonl" in cap.err
 
 
 def test_c12_unexpected_exception_is_a_non_zero_exit(dirs, monkeypatch):
@@ -586,6 +618,71 @@ def test_c15_replayed_files_are_private(dirs, tmp_path):
         os.umask(old)
     assert stat.S_IMODE((tmp_path / "out/p/q/a.jsonl").stat().st_mode) == 0o600
     assert stat.S_IMODE((tmp_path / "out/p/q").stat().st_mode) == 0o700
+
+
+# ------------------------------------------------------------- F1: unrepresentable paths
+
+def _backslash_tree(src: Path) -> None:
+    _put(src, "ok.jsonl", b"fine\n")
+    with open(os.path.join(str(src), "a\\b.jsonl"), "xb") as f:  # a backslash is legal on POSIX
+        f.write(b"cannot be represented\n")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="backslash in a file name is POSIX-only")
+def test_f1_writer_skips_a_path_the_reader_refuses(dirs, tmp_path):
+    src, arc = dirs
+    _backslash_tree(src)
+    r1 = at.archive_run(src, arc)
+    assert [s.path for s in at.read_manifest(r1.archive_path)] == ["ok.jsonl"]
+    assert len(r1.problems) == 1
+    assert "a\\b.jsonl" in r1.problems[0] and "path not representable in the archive" in r1.problems[0]
+    for a in _archives(arc):
+        at.read_manifest(a)  # every archive parses
+
+    r2 = at.archive_run(src, arc)  # nothing changed: the same skip, and the archive still reads
+    assert r2.archive_path is None
+    assert len(r2.problems) == 1 and "a\\b.jsonl" in r2.problems[0]
+
+    dest = tmp_path / "out"
+    at.replay(arc, dest)
+    assert _tree(dest) == {"ok.jsonl": hashlib.sha256(b"fine\n").hexdigest()}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="backslash in a file name is POSIX-only")
+def test_f1_cli_exits_2_names_the_skip_and_prints_the_summary(dirs, capsys):
+    src, arc = dirs
+    _backslash_tree(src)
+    rc = at.main(["--source", str(src), "--archive-dir", str(arc)])
+    cap = capsys.readouterr()
+    assert rc == 2
+    assert cap.out.startswith("transcript archive: 1 files, 1 segments, 5 bytes")
+    assert "a\\b.jsonl" in cap.err and "path not representable in the archive" in cap.err
+    assert at.main(["--source", str(src), "--archive-dir", str(arc)]) == 2  # still loud, not broken
+    assert "a\\b.jsonl" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------- F3: replay never ends in a traceback
+
+def test_f3_replay_of_a_file_and_a_folder_under_it_is_an_archive_error(tmp_path, capsys):
+    arc = tmp_path / "arc"
+    arc.mkdir()
+    _make_archive(arc / "transcripts-20260101T000001Z-001.xz", [("a", 0, 3), ("a/b", 0, 2)], b"xxxyy")
+    with pytest.raises(at.ArchiveError) as e:
+        at.replay(arc, tmp_path / "out")
+    assert "a" in str(e.value) and "b" in str(e.value)
+    rc = at.main(["--archive-dir", str(arc), "--replay", str(tmp_path / "out2")])
+    cap = capsys.readouterr()
+    assert rc == 2 and cap.err.startswith("ERROR:") and "Traceback" not in cap.err
+
+
+def test_f3_replay_of_a_folder_then_a_file_of_the_same_name_is_an_archive_error(tmp_path, capsys):
+    arc = tmp_path / "arc"
+    arc.mkdir()
+    _make_archive(arc / "transcripts-20260101T000001Z-001.xz", [("a/b", 0, 2), ("a", 0, 3)], b"yyxxx")
+    with pytest.raises(at.ArchiveError):
+        at.replay(arc, tmp_path / "out")
+    assert at.main(["--archive-dir", str(arc), "--replay", str(tmp_path / "out2")]) == 2
+    assert "Traceback" not in capsys.readouterr().err
 
 
 # ------------------------------------------------------------- scope cells

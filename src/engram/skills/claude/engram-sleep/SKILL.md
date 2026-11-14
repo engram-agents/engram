@@ -608,9 +608,12 @@ later change retires the 4.7 mirror.)
 
 **Non-blocking for sleep**: a failure does not abort sleep (the transcripts still exist in
 `~/.claude/projects/`), but it is **loud**: surface the status line in the history milestone
-(Step 4) so a recurring failure is visible, not silent. A failure means a transcript shrank
-below its archived size, an archive is unreadable, or a read failed; the tool writes nothing
-in that case and names the path and the numbers.
+(Step 4) so a recurring failure is visible, not silent. Two kinds. A **per-file problem**
+(a transcript shrank below its archived size, or a file name cannot be stored in the archive)
+is reported with the path and the numbers while **every other transcript is still archived**;
+the run exits 2. What you do next: look at the named file. The watermark is kept, and the file
+is archived again once the source grows past it. A **run failure** (an unreadable archive, or a
+file that came back short while being read) writes nothing and names the path.
 
 ```
 - transcript archive: $transcript_archive_status

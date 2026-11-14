@@ -22,9 +22,14 @@ same folder, fsynced, then published with ``os.link`` (which fails if the name e
 counter NNN moves on), then the temp file is unlinked. A crash leaves a ``.tmp-*`` file that is
 never read as an archive and is removed at the start of the next run.
 
-Loud failures (exit 2, message on stderr, nothing written): a transcript now SMALLER than its
-archived end offset (``TranscriptShrank``), a file that comes back short while being read, an
-unreadable or malformed archive, and, on replay, a gap or overlap (``ReplayGap``).
+Loud failures (exit 2, message on stderr). Two kinds. A PER-FILE problem is reported while every
+other transcript is still archived: a transcript now SMALLER than its archived end offset (it stays
+excluded, its watermark kept, until the source is at least that large again), and a transcript whose
+path cannot be written into an archive in a form the reader accepts (skipped by name). These come
+back in ``RunResult.problems`` and make the CLI exit 2 after the summary line. A failure of the RUN
+itself aborts it with nothing written: a file that comes back short while being read
+(``TranscriptShrank``), an unreadable or malformed archive, and, on replay, a gap or overlap
+(``ReplayGap``) or a destination that cannot hold the paths (``ArchiveError``, never a traceback).
 
 Stated limit. The watermark proves LENGTH, not content. Replacing a transcript with a
 different file of the same size or larger cannot be detected by size alone, and this tool does
@@ -75,7 +80,7 @@ class ArchiveError(Exception):
 
 
 class TranscriptShrank(ArchiveError):
-    """A transcript is smaller than the bytes already archived from it (or came back short)."""
+    """A transcript came back short, or vanished, while the run was reading it."""
 
 
 class ReplayGap(ArchiveError):
@@ -96,6 +101,7 @@ class RunResult:
     segments: int
     bytes_in: int
     bytes_out: int
+    problems: tuple[str, ...] = ()
 
 
 # ------------------------------------------------------------------ seams (tests patch these)
@@ -335,7 +341,12 @@ def archive_run(source_root, archive_dir) -> RunResult:
 
     segments: list[Segment] = []
     sources: dict[str, str] = {}
+    problems: list[str] = []
     for rel, full in _candidates(src):
+        if not _valid_rel_path(rel):
+            # never write a path into an archive that the reader would refuse
+            problems.append(f"{full}: path not representable in the archive (skipped)")
+            continue
         try:
             st = os.lstat(full)
         except FileNotFoundError:
@@ -345,15 +356,14 @@ def archive_run(source_root, archive_dir) -> RunResult:
         size = st.st_size  # fixed here: the run reads exactly end-start bytes, never more
         mark = marks.get(rel, 0)
         if size < mark:
-            raise TranscriptShrank(
-                f"{full}: is {size} bytes but {mark} bytes are already archived (path {rel}); "
-                f"refusing to archive, nothing written"
-            )
+            # one bad transcript must not block the others: exclude it, keep its watermark
+            problems.append(f"{full}: now {size} bytes, archived through {mark}")
+            continue
         if size > mark:
             segments.append(Segment(rel, mark, size))
             sources[rel] = full
     if not segments:
-        return RunResult(None, 0, 0, 0, 0)
+        return RunResult(None, 0, 0, 0, 0, tuple(problems))
 
     _mkdirs_private(arc)
 
@@ -383,7 +393,8 @@ def archive_run(source_root, archive_dir) -> RunResult:
     _fsync_dir(str(arc))
 
     bytes_in = sum(s.end - s.start for s in segments)
-    return RunResult(Path(final), len(sources), len(segments), bytes_in, os.stat(final).st_size)
+    return RunResult(Path(final), len(sources), len(segments), bytes_in, os.stat(final).st_size,
+                     tuple(problems))
 
 
 # ------------------------------------------------------------------ replay
@@ -443,7 +454,15 @@ def _stream_two(path: Path):
 
 
 def _append_exact(dest: Path, seg: Segment, data_iter, buf: bytearray, path: Path, written: dict) -> None:
-    """Write exactly seg.end-seg.start bytes taken from the stream into dest/seg.path."""
+    """Write exactly seg.end-seg.start bytes taken from the stream into dest/seg.path. An OSError
+    (a file where a folder is needed, a folder where a file is needed, ...) becomes an ArchiveError."""
+    try:
+        _append_exact_raw(dest, seg, data_iter, buf, path, written)
+    except OSError as exc:
+        raise ArchiveError(f"{dest / seg.path}: replay cannot write this path ({exc})") from exc
+
+
+def _append_exact_raw(dest: Path, seg: Segment, data_iter, buf: bytearray, path: Path, written: dict) -> None:
     target = dest / seg.path
     want = seg.end - seg.start
     if seg.start == 0:
@@ -487,7 +506,10 @@ def replay(archive_dir, dest_root) -> dict[str, int]:
     chain = _check_chain(_archive_files(archive_dir))
     written: dict[str, int] = {}
     if chain:
-        _mkdirs_private(dest)
+        try:
+            _mkdirs_private(dest)
+        except OSError as exc:
+            raise ArchiveError(f"{dest}: replay cannot create the destination ({exc})") from exc
     for a, segs in chain:
         it = _stream_two(a)
         buf = bytearray()
@@ -542,7 +564,9 @@ def main(argv=None) -> int:
                 f"{res.bytes_in} bytes -> {res.bytes_out} bytes ({ratio:.1f}x) as "
                 f"{res.archive_path.name}; archive total {total} bytes in {n} files"
             )
-        return 0
+        for problem in res.problems:
+            print(f"ERROR: {problem}", file=sys.stderr)
+        return 2 if res.problems else 0
     except ArchiveError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
