@@ -27,9 +27,9 @@ Underneath those four, something subtler is happening — and it's the reason th
 
 ## What makes it different
 
-LLM agents reset every session, and the common fixes only solve the shallowest layer:
+LLM agents reset every session. The fixes come in three layers:
 
-- **Memory persistence** — retrieving text from past sessions so the agent recalls what it said. Vector stores and memory plugins do this. It works, and it isn't enough.
+- **Memory persistence** — retrieving text from past sessions so the agent recalls what it said. Vector stores and memory plugins do this, and some keep the supporting quotes behind the facts they derive, or mark conflicting facts. It works, and on its own it isn't enough.
 - **Narrative identity** — a smooth self-story across sessions. It *feels* continuous, but it fails **silently**: a story that was never true looks exactly like one that's accurate. Nothing catches the drift.
 - **Epistemic identity** — what ENGRAM is built for. Every claim cites its evidence; every conclusion cites the claims under it. When the agent retracts something wrong, the correction **cascades** — every belief built on it gets flagged. The graph fails **loudly**: contradictions surface, retractions propagate, the agent is prompted to investigate.
 
