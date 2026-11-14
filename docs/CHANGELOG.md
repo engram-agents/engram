@@ -25,6 +25,7 @@ with an `-alpha` suffix during the alpha phase.
   re-run (2026-10-13, 0.118x PASS, posted on #3761 but never written into the ledger), and its
   per-row `macOS` cells are swept for the `--owner` LaunchAgent (#3709, #3778, #3789); 33 cells
   and three notes had still read "no Mac launcher yet". Docs only. (#2652)
+- `s2_clause_sheet` now refuses a `--db` that is the live store (`$ENGRAM_HOME/knowledge.db`, or a symlink or hard link to it) with one `refused:` line that names the backup-copy recipe, so the tool only ever reads copies. Outputs on a copy are unchanged. (#4286)
 - The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
   empty or not a string) with one stderr line, instead of compacting: it cannot show which session
   napped (#4356), and surfaces the refusal once to the agent through the #4350 line.
