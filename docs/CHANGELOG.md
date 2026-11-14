@@ -11,6 +11,10 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- A refused in-place rewrite now reports which state the file is in as data (`WriteRefused.outcome`:
+  `nothing_written`, `restored` or `may_be_incomplete`), and `set_forum_url.py` and the installer's
+  `install_tier` step word their message from it. When the write and the put-back both fail, they no
+  longer say the file is unchanged; they say it may be incomplete and point at the backup. (#4631)
 - The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
   empty or not a string) with one stderr line, instead of compacting: it cannot show which session
   napped (#4356), and surfaces the refusal once to the agent through the #4350 line.

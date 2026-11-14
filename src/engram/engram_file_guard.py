@@ -419,6 +419,23 @@ def _replace_contents(fd: int, data: bytes) -> None:
     os.fsync(fd)
 
 
+class WriteRefused(SystemExit):
+    """A refused `write_in_place`, carrying the state it left the file in as data.
+
+    `.outcome` is exactly one of "nothing_written" (the open, the regular-file check or the read
+    before the write failed; the file was never touched), "restored" (the write failed part-way
+    and the old bytes were put back) or "may_be_incomplete" (the write failed and the put-back
+    failed too). `.backup` is the Path (or None) that `write_in_place` was given. `str(exc)` is
+    the one REFUSED line, so a catch of SystemExit that only reads the text is unaffected; a
+    caller that adds its own sentence about the file's state reads `.outcome`, not the class.
+    """
+
+    def __init__(self, message: str, outcome: str, backup: "Path | None"):
+        super().__init__(message)
+        self.outcome = outcome
+        self.backup = backup
+
+
 def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     """Rewrite the EXISTING regular file `path` with `text`, in place. `backup` is the copy
     the caller already saved (None only for an ENGRAM-owned file, which is never backed up).
@@ -427,8 +444,8 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     file's ACL and extended attributes, its owner and group, and its other hard links. Writing
     into the same inode keeps all of them, as v0.5.6 did. What that gives up is atomicity, which
     is why every caller saves the stamped backup BEFORE calling this, and why a write that
-    fails part-way first puts the old bytes back. Every failure is a SystemExit with one
-    REFUSED line naming `backup`. The residual, accepted on purpose: a kill (SIGKILL, power
+    fails part-way first puts the old bytes back. Every failure is a WriteRefused (a SystemExit; `.outcome` says
+    which state the file is in) with one REFUSED line naming `backup`. The residual, accepted on purpose: a kill (SIGKILL, power
     loss) during the write gets no put-back and prints nothing, so the file can be left
     incomplete; the backup saved before the write is then the copy to restore from.
 
@@ -458,31 +475,36 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     try:
         fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as e:
-        raise SystemExit(f"[bootstrap] REFUSED: could not open {path} to write it ({e}); it was not changed. {saved}")
+        raise WriteRefused(f"[bootstrap] REFUSED: could not open {path} to write it ({e}); it was not changed. {saved}",
+                           "nothing_written", backup)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise SystemExit(f"[bootstrap] REFUSED: {path} is not a regular file, so it was not written. {saved}")
+            raise WriteRefused(f"[bootstrap] REFUSED: {path} is not a regular file, so it was not written. {saved}",
+                               "nothing_written", backup)
         old = b""
         try:
             while chunk := os.read(fd, 1 << 20):
                 old += chunk
         except OSError as e:
-            raise SystemExit(f"[bootstrap] REFUSED: could not read {path} before writing it ({e}); it was not changed. {saved}")
+            raise WriteRefused(f"[bootstrap] REFUSED: could not read {path} before writing it ({e}); it was not changed. {saved}",
+                                   "nothing_written", backup)
         try:
             _replace_contents(fd, data)
         except BaseException as e:  # Ctrl-C too: put the old bytes back, then let it go on
             try:
                 _replace_contents(fd, old)
             except BaseException as e2:
-                raise SystemExit(
+                raise WriteRefused(
                     f"[bootstrap] REFUSED: could not write {path} ({e!r}), and putting its previous "
-                    f"contents back also failed ({e2!r}), so it may be incomplete. {restore}"
+                    f"contents back also failed ({e2!r}), so it may be incomplete. {restore}",
+                    "may_be_incomplete", backup,
                 )
             if not isinstance(e, OSError):
                 raise
-            raise SystemExit(
+            raise WriteRefused(
                 f"[bootstrap] REFUSED: could not write {path} ({e}); its previous contents were "
-                f"put back. {saved}"
+                f"put back. {saved}",
+                "restored", backup,
             )
     finally:
         os.close(fd)

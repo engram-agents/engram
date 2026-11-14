@@ -584,7 +584,11 @@ if [[ $SKIP_BUILD -eq 0 ]] && [[ -n "${_cfg:-}" ]] && [[ -f "${_cfg}" ]] && comm
   # listed in the block at the end of the run (exit code 10). The tier is only remembered for the
   # next upgrade, so nothing else depends on it. The reason line is kept (stderr) for that block.
   _persist_err="$(mktemp "${TMPDIR:-/tmp}/install-local-marketplace-persist.XXXXXX")"
-  if ! python3 - "${_cfg}" "${_tier:-}" "$REPO_ROOT/src/engram" 2>"$_persist_err" <<'PY'
+  # Exit codes of the block: 0 saved or nothing to do; 1 refused (file untouched, or its old contents
+  # put back); 3 refused and the put-back failed too, so the file may be incomplete. The sentence in
+  # the block at the end follows the code, because "left exactly as it was" is false for 3.
+  _persist_rc=0
+  python3 - "${_cfg}" "${_tier:-}" "$REPO_ROOT/src/engram" 2>"$_persist_err" <<'PY' || _persist_rc=$?
 import sys
 path, tier, guard_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 if not tier:
@@ -595,18 +599,32 @@ import engram_file_guard as fg
 from pathlib import Path
 try:
     result = fg.apply_merge(Path(path), {'install_tier': tier}, filename='config.json')
+except fg.WriteRefused as exc:
+    # The guard says which state the file is in; this line must not claim more than that.
+    if exc.outcome == 'may_be_incomplete':
+        print(f"[install-local-marketplace] config.json may be incomplete: {exc}", file=sys.stderr)
+        sys.exit(3)
+    if exc.outcome == 'restored':
+        print(f"[install-local-marketplace] config.json write failed and its previous contents were put back: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"[install-local-marketplace] config.json left unchanged: {exc}", file=sys.stderr)
+    sys.exit(1)
 except (fg.MergeRefused, OSError, SystemExit) as exc:
     print(f"[install-local-marketplace] config.json left unchanged: {exc}", file=sys.stderr)
     sys.exit(1)
 if result != 'unchanged':
     print(f"[install-local-marketplace] config.json updated: install_tier={tier}")
 PY
-  then
+  if [[ $_persist_rc -eq 0 ]]; then
+    cat "$_persist_err" >&2
+  elif [[ $_persist_rc -eq 3 ]]; then
+    cat "$_persist_err" >&2
+    not_done "install_tier may not have been saved to ${_cfg} ($(tail -n 1 "$_persist_err" | sed 's/^\[install-local-marketplace\] //')). The file may be incomplete." \
+             "restore that file from the backup named above, then run this installer again; until then the next upgrade does not remember the tier."
+  else
     cat "$_persist_err" >&2
     not_done "install_tier was not saved to ${_cfg} ($(tail -n 1 "$_persist_err" | sed 's/^\[install-local-marketplace\] //')). The file was left exactly as it was." \
              "fix that file, or move it aside, then run this installer again; until then the next upgrade does not remember the tier."
-  else
-    cat "$_persist_err" >&2
   fi
   rm -f "$_persist_err"
 fi

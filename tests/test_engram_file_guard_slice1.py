@@ -636,3 +636,78 @@ def test_atomic_write_temp_names_differ_per_call(tmp_path, monkeypatch):
     fg.atomic_write_text(target, "2", 0o600)
     assert len(names) == 2 and names[0] != names[1], names
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+# ---- #4631: a refused rewrite reports which state the file is in, as data ------------------------
+
+def _refusal(path, backup=None, text="new\n"):
+    with pytest.raises(SystemExit) as info:
+        fg.write_in_place(path, text, backup)
+    return info.value
+
+
+def test_write_refused_nothing_written_when_the_open_fails(tmp_path):
+    target, backup = tmp_path / "gone.txt", tmp_path / "gone.txt.bak"
+    exc = _refusal(target, backup)
+    assert isinstance(exc, fg.WriteRefused) and exc.outcome == "nothing_written" and exc.backup == backup
+    assert str(exc).startswith(f"[bootstrap] REFUSED: could not open {target} to write it (")
+    assert f"); it was not changed. A copy of it from before this run is at {backup}." in str(exc)
+
+
+def test_write_refused_nothing_written_for_a_file_that_is_not_regular(tmp_path):
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    exc = _refusal(fifo, None)
+    assert isinstance(exc, fg.WriteRefused) and exc.outcome == "nothing_written" and exc.backup is None
+    assert str(exc) == (f"[bootstrap] REFUSED: {fifo} is not a regular file, so it was not written. "
+                        "ENGRAM owns this file and keeps no backup of it; re-run setup to write it again.")
+
+
+def test_write_refused_nothing_written_when_the_read_before_the_write_fails(tmp_path, monkeypatch):
+    target, backup = tmp_path / "a.txt", tmp_path / "a.txt.bak"
+    target.write_text("old\n")
+
+    def boom(fd, n):
+        raise OSError("simulated read failure")
+
+    monkeypatch.setattr(fg.os, "read", boom)
+    exc = _refusal(target, backup)
+    monkeypatch.undo()
+    assert isinstance(exc, fg.WriteRefused) and exc.outcome == "nothing_written" and exc.backup == backup
+    assert str(exc) == (f"[bootstrap] REFUSED: could not read {target} before writing it (simulated read failure); "
+                        f"it was not changed. A copy of it from before this run is at {backup}.")
+    assert target.read_text() == "old\n"
+
+
+def test_write_refused_restored_when_the_write_fails_and_the_put_back_works(tmp_path, monkeypatch):
+    target, backup = tmp_path / "a.txt", tmp_path / "a.txt.bak"
+    target.write_text("old\n")
+    real, calls = fg._replace_contents, []
+
+    def fail_first(fd, data):
+        calls.append(data)
+        if len(calls) == 1:
+            raise OSError("simulated write failure")
+        real(fd, data)
+
+    monkeypatch.setattr(fg, "_replace_contents", fail_first)
+    exc = _refusal(target, backup)
+    assert isinstance(exc, fg.WriteRefused) and exc.outcome == "restored" and exc.backup == backup
+    assert str(exc) == (f"[bootstrap] REFUSED: could not write {target} (simulated write failure); its previous "
+                        f"contents were put back. A copy of it from before this run is at {backup}.")
+    assert target.read_text() == "old\n"
+
+
+def test_write_refused_may_be_incomplete_when_the_put_back_fails_too(tmp_path, monkeypatch):
+    target, backup = tmp_path / "a.txt", tmp_path / "a.txt.bak"
+    target.write_text("old\n")
+
+    def always_fail(fd, data):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(fg, "_replace_contents", always_fail)
+    exc = _refusal(target, backup)
+    assert isinstance(exc, fg.WriteRefused) and exc.outcome == "may_be_incomplete" and exc.backup == backup
+    assert str(exc) == (f"[bootstrap] REFUSED: could not write {target} (OSError('simulated failure')), and putting "
+                        f"its previous contents back also failed (OSError('simulated failure')), so it may be "
+                        f"incomplete. Restore it with: cat -- {backup} > {target}")
