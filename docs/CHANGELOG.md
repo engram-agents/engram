@@ -11,6 +11,10 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
+  close-keyword grep's adjacency rule matches GitHub's parser (no proximity
+  gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
+  until the next edit event. (#2213)
 - `engram_derive` no longer returns an `independence_advisory` key. It duplicated
   the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
   or more lineages, and when the install has recorded its own lineage, that line
