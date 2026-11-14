@@ -7255,6 +7255,23 @@ def changed_concurrently_refusal(conn, kind: str, node_id: str, *,
     })
 
 
+def person_relation(meta) -> str:
+    """A person node's relation from its metadata dict (#3864).
+
+    `metadata.relation` if it is a non-empty string after strip, else the
+    deprecated pre-rename `metadata.role` under the same test, else "".
+    Non-dict input or non-string values give "" (never raises). Mirrors the
+    prefer-relation-then-role rule in viz/data/moments.py.
+    """
+    if not isinstance(meta, dict):
+        return ""
+    for key in ("relation", "role"):
+        v = meta.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
 def _metadata_dict_for_write(raw, node_id, tool) -> "tuple[dict, Optional[str]]":
     """Write-side twin of `_metadata_dict` (#3413): returns (dict, warning).
 
@@ -10045,7 +10062,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
             elif ntype == "person":
                 meta = _metadata_dict(n["metadata"])
                 person_name = meta.get("name", "")
-                person_role = meta.get("role", "")
+                person_role = person_relation(meta)
                 lines.append(f"### {n['id']} [{status_tag}]")
                 lines.append(f"Person: {person_name}")
                 if person_role:
