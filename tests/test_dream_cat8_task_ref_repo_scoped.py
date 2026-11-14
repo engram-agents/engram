@@ -427,14 +427,24 @@ def test_repomap_keys_equal_aliases_alternation():
     block = _bash_block()
     m = re.search(r"^repo_for\(\) \{\n(.*?)^\}", block, re.DOTALL | re.MULTILINE)
     assert m, "repo_for function not found -- bash block reshaped?"
+    # The key class is deliberately ERE-safe (no `.`). `ALIASES` is interpolated
+    # into a `grep -E` alternation unescaped, so a key carrying a regex
+    # metacharacter would match strings that `repo_for`'s literal `case` cannot
+    # resolve -- the alias resolves to nothing and `[ -n "$full" ]` drops the ref
+    # silently, which is the under-reporting this category exists to prevent.
+    # Value class keeps `.` and `-`: values are echoed, never interpolated.
     arms = re.findall(
-        r"^\s*([A-Za-z0-9_.-]+)\)\s*echo\s+(\S+)", m.group(1), re.MULTILINE
+        r"^\s*([A-Za-z0-9_-]+)\)\s*echo\s+(\S+)", m.group(1), re.MULTILINE
     )
     keys = {key for key, _ in arms}
     values = {value for _, value in arms}
     aliases = _aliases_literal().split("|")
     assert keys, "repo_for declares no aliases"
     assert aliases and all(aliases), f"ALIASES is empty or malformed: {aliases!r}"
+    unsafe = [a for a in aliases if not re.fullmatch(r"[A-Za-z0-9_-]+", a)]
+    assert not unsafe, (
+        f"alias {unsafe!r} carries an ERE metacharacter; ALIASES is interpolated "
+        f"into `grep -E` unescaped, so it would match refs repo_for cannot resolve")
     assert keys == set(aliases), (keys, aliases)
     for value in sorted(values):
         assert re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value), (
