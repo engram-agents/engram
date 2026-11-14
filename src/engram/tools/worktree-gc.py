@@ -17,10 +17,12 @@ This tool classifies each worktree and removes the safely-finished ones:
           branch, tag, remote-tracking or other), so removing the worktree
           loses no commit
   PRUNE   `worktree-agent-*` / `review-*` tmp-branch worktree, clean
-  KEEP    the worktree the deploy record names (`deployed_from` in
+  KEEP    a worktree the deploy record names (`deployed_from` in
           `<ENGRAM_HOME>/.deployed-version`): the upgrade flow's source tree,
           load-bearing though it looks like a leftover (#4157); checked first
-          on every path that would otherwise prune it
+          on every path that would otherwise prune it. EVERY `deployed_from`
+          value is protected, because the readers of the record disagree on
+          which line wins when there are several
   KEEP    branch worktree whose PR is OPEN (active work)
   KEEP    branch worktree with NO PR (pre-PR or abandoned — flagged for a human)
   SKIP    an AGENT-OWNED worktree (branch `worktree-agent-*` / `review-*`, or any
@@ -143,26 +145,31 @@ def _is_clean(path: str) -> bool:
     return rc == 0 and out.strip() == ""
 
 
-def _deploy_source() -> str | None:
-    """The realpath of the directory `<ENGRAM_HOME>/.deployed-version` names as
-    `deployed_from`, or None when it cannot be read (#4157).
+def _deploy_sources() -> frozenset[str]:
+    """The realpaths of EVERY directory `<ENGRAM_HOME>/.deployed-version` names
+    as `deployed_from`; empty when the record cannot be read (#4157).
 
-    The upgrade flow uses that directory as the SOURCE_DIR of the next upgrade,
-    so a worktree there is load-bearing even though it looks like a prunable
-    leftover. Fails open to None (today's classification) on a missing,
+    The upgrade flow uses a `deployed_from` directory as the SOURCE_DIR of the
+    next upgrade, so a worktree there is load-bearing even though it looks like
+    a prunable leftover. The two readers of the record disagree on which line
+    wins when it carries more than one (one keeps the first, the other the
+    last), so every value is protected: that is right whichever reader runs.
+    Fails open to the empty set (today's classification) on a missing,
     unreadable or malformed record, an empty value, or an unresolvable home.
     """
+    found: set[str] = set()
     try:
         record = owner_read.engram_home() / ".deployed-version"
         with open(record, encoding="utf-8") as f:
             for line in f:
-                if line.startswith("deployed_from="):
-                    value = line.strip().partition("=")[2].strip()
-                    if value:
-                        return os.path.realpath(value)
+                # Same rule as the readers it must agree with: flows.py
+                # `_read_deployed_version` and the upgrade flow in cli.py.
+                key, sep, value = line.strip().partition("=")
+                if sep and key.strip() == "deployed_from" and value.strip():
+                    found.add(os.path.realpath(value.strip()))
     except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
-        return None
-    return None
+        return frozenset()
+    return frozenset(found)
 
 
 def _is_in_use(path: str) -> bool:
@@ -375,9 +382,9 @@ def classify(t: dict, root: str, *, main_path: str | None = None,
     if not Path(path).exists():
         return "PRUNE", "worktree directory missing (stale admin record)"
     # Deploy source (#4157): before ANY prune return. The upgrade flow reads
-    # `deployed_from` and uses that directory as the next upgrade's source tree.
-    deploy_source = _deploy_source()
-    if deploy_source is not None and os.path.realpath(path) == deploy_source:
+    # `deployed_from` and uses that directory as the next upgrade's source tree;
+    # its readers disagree on which of several lines wins, so all are protected.
+    if os.path.realpath(path) in _deploy_sources():
         return "KEEP", "deploy source — the deploy record's deployed_from; the next upgrade needs it"
     if not _is_clean(path):
         return "SKIP", "DIRTY — uncommitted changes; not removing"

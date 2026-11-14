@@ -1093,6 +1093,56 @@ def test_deploy_source_survives_symlinked_spelling(tmp_path, _isolated_engram_ho
     assert _classify_deploy_target(link)[0] == "KEEP"
 
 
+def test_deploy_source_every_deployed_from_value_is_protected(
+        tmp_path, _isolated_engram_home):
+    # The upgrade readers disagree on which `deployed_from` line wins (one
+    # keeps the first, one the last), so every value is protected.
+    first = tmp_path / "first-tree"
+    second = tmp_path / "second-tree"
+    first.mkdir()
+    second.mkdir()
+    _write_deployed(
+        _isolated_engram_home, f"deployed_from={first}\ndeployed_from={second}\n")
+    assert _classify_deploy_target(first)[0] == "KEEP"
+    assert _classify_deploy_target(second)[0] == "KEEP"
+
+
+def test_deploy_source_spaces_around_key_and_equals_still_protect(
+        tmp_path, _isolated_engram_home):
+    wt = tmp_path / "src-tree"
+    wt.mkdir()
+    _write_deployed(_isolated_engram_home, f"  deployed_from = {wt}  \n")
+    assert _classify_deploy_target(wt)[0] == "KEEP"
+
+
+def test_deploy_source_empty_value_line_protects_nothing_but_others_still_do(
+        tmp_path, _isolated_engram_home):
+    # an empty value must not resolve to the current directory and protect it
+    named = tmp_path / "named-tree"
+    unnamed = tmp_path / "unnamed-tree"
+    named.mkdir()
+    unnamed.mkdir()
+    _write_deployed(
+        _isolated_engram_home, f"deployed_from=\ndeployed_from={named}\n")
+    assert _classify_deploy_target(named)[0] == "KEEP"
+    assert _classify_deploy_target(unnamed)[0] == "PRUNE"
+    # and the empty line alone must not protect the process's cwd
+    _write_deployed(_isolated_engram_home, "deployed_from=\n")
+    assert _classify_deploy_target(Path.cwd())[0] == "PRUNE"
+
+
+def test_deploy_source_worktree_named_by_neither_line_is_pruned(
+        tmp_path, _isolated_engram_home):
+    first = tmp_path / "first-tree"
+    second = tmp_path / "second-tree"
+    third = tmp_path / "third-tree"
+    for d in (first, second, third):
+        d.mkdir()
+    _write_deployed(
+        _isolated_engram_home, f"deployed_from={first}\ndeployed_from={second}\n")
+    assert _classify_deploy_target(third)[0] == "PRUNE"
+
+
 @pytest.mark.parametrize("content", [
     "alpha_tag=v1\n",                 # no deployed_from line
     "deployed_from=\n",               # empty value
