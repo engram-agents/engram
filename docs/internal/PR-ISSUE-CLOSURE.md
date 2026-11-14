@@ -110,7 +110,7 @@ form that fires the parser.
    recollection). It appears to have cleared at the next edit event, a title
    rename hours later; no read was captured at the rename itself. So a stale
    answer is not bounded to a few seconds. This is one data
-   point (n=1, one private repo), and whether the window is bound to the next
+   point (n=1, one repo; public repos not measured), and whether the window is bound to the next
    edit event or to time was not measured.
 
    **No proximity gap: the grep's adjacency matches the parser.** #710 was
