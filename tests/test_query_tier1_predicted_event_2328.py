@@ -100,6 +100,12 @@ def test_claim_preferred_over_predicted_event_when_both_present():
     assert build([node], 1)[0]["summary"] == "the claim"
 
 
+def test_prediction_with_only_a_claim_still_renders_the_claim():
+    build = _build()
+    node = {"id": "pr_0001", "type": "prediction", "claim": "the claim"}
+    assert build([node], 1)[0]["summary"] == "the claim"
+
+
 def test_neither_field_renders_empty_string():
     build = _build()
     node = {"id": "pr_0001", "type": "prediction", "claim": None}
