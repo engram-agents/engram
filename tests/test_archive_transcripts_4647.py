@@ -787,3 +787,31 @@ def test_c6_engram_home_perms_lists_the_private_folder():
     finally:
         sys.path.pop(0)
     assert "transcript-archive" in engram_home_perms.DATA_DIRS
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_mkdirs_private_creates_three_levels_0700_and_is_idempotent(tmp_path):
+    """#4647: every missing folder below an existing one is 0o700 under a permissive umask;
+    a second call is a no-op. The helper must also be free of upward walks (the repo's #3983
+    guard), checked by running that guard's own scanner over the tool, not a copied regex."""
+    base = tmp_path / "exists"
+    base.mkdir(mode=0o755)
+    leaf = base / "a" / "b" / "c"
+    old = os.umask(0o022)
+    try:
+        at._mkdirs_private(leaf)
+        at._mkdirs_private(leaf)  # no-op, no error
+    finally:
+        os.umask(old)
+    for d in (base / "a", base / "a" / "b", leaf):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
+    assert stat.S_IMODE(base.stat().st_mode) == 0o755  # an existing folder keeps its mode
+
+    guard_path = Path(__file__).parent / "test_no_unbounded_upward_walks_3983.py"
+    spec = importlib.util.spec_from_file_location("_guard_3983_for_4647", guard_path)
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    scan_root = tmp_path / "scan"
+    scan_root.mkdir()
+    (scan_root / TOOL.name).write_text(TOOL.read_text())
+    assert guard.scan_python(scan_root) == {}

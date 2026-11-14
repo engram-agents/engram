@@ -272,16 +272,14 @@ def _candidates(source_root: Path) -> list[tuple[str, str]]:
 def _mkdirs_private(path: Path) -> None:
     """Create `path` and any missing parents, each 0o700 (os.makedirs would give parents the
     default mode, and a transcript folder must never be group- or world-readable)."""
-    missing = []
-    p = Path(path)
-    while not p.exists():
-        missing.append(p)
-        if p.parent == p:
-            break
-        p = p.parent
-    for d in reversed(missing):
+    # Walk DOWN from the root over the path's own parts (no upward walk: the #3983 guard).
+    prefix = Path()
+    for part in Path(path).absolute().parts:
+        prefix = prefix / part
+        if prefix.exists():
+            continue
         try:
-            os.mkdir(d, 0o700)
+            os.mkdir(prefix, 0o700)
         except FileExistsError:
             pass
 
