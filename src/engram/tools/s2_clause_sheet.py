@@ -55,7 +55,9 @@ Subcommands
         pass 2, the interpretation.)
 
 The DB is only ever opened read-only (mode=ro). There is no default DB: the
-tool never falls back to the live graph.
+tool never reads the live graph. A --db that is the live store (the seat's
+knowledge.db), or a link to it, is refused before any read; take a backup-API
+copy into a scratch directory and pass that.
 """
 
 from __future__ import annotations
@@ -77,6 +79,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import engram_anchoring  # noqa: E402
+import engram_home_resolver  # noqa: E402
 import engram_regular_io as _regular_io  # noqa: E402
 
 # The S1 helpers (read-only open, source_class, id mask, embedding meta) are
@@ -267,6 +270,25 @@ def read_population(db_path: Path, seed_hex: str) -> dict:
     for b in BIN_LABELS:
         bins[b].sort(key=lambda c: c["sort_hash"])
     return {"bins": bins, "counts": counts, "null_reasons": null_reasons}
+
+
+def _refuse_live_store(db_arg: str) -> None:
+    """Refuse a --db that is the live store (engram_home()/knowledge.db, or a symlink or hard link to it),
+    so the tool only ever reads copies (#4286). Runs before any read. A missing --db or a missing live
+    store is not a match; those fall through to today's behaviour. If engram_home() itself refuses (a
+    relative ENGRAM_HOME) the check cannot run, so this refuses too."""
+    try:
+        live = engram_home_resolver.engram_home() / "knowledge.db"
+    except ValueError as exc:
+        raise Refusal(f"cannot tell whether --db {db_arg} is the live store: {exc}") from None
+    given = Path(db_arg)
+    if not (given.exists() and live.exists()):
+        return
+    if os.path.realpath(given) == os.path.realpath(live) or os.path.samefile(given, live):
+        raise Refusal(
+            f"--db {db_arg} is the live store ({live}); this tool only reads copies. Take a backup-API "
+            f"copy into a scratch directory (sqlite3 <live> \".backup <scratch>/copy.db\", or Python's "
+            f"sqlite3 Connection.backup) and pass that as --db")
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +632,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refused: --seed-hex is pinned to the signed seed {SEED_HEX}", file=sys.stderr)
         return 2
     try:
+        _refuse_live_store(args.db)  # before any read, for every subcommand
         if args.cmd == "select":
             return cmd_select(args)
         if args.cmd == "swap":
