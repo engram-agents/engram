@@ -630,6 +630,10 @@ def test_cell16_candidate_labels(seeded_no_config):
 
 # ----------------------------------------------------------------------------- cell 17
 
+BUSY_SENTENCE = ("The database could not be read just now because another process (for example a running "
+                 "ENGRAM server) holds it; stop that process and retry first, which costs nothing, before "
+                 "restoring anything.")
+
 _CELL17 = """
 out['r'] = attempt(lambda: core._get_db().close())
 out['cfg'] = os.path.exists(cfg)
@@ -653,6 +657,7 @@ def test_cell17_locked_db_with_config_missing_gets_config_missing_not_damaged(se
     free = _child(home, _CELL17)
     assert free["r"]["raised"] == "ConfigMissingError", free
     assert free["cfg"] is False
+    assert BUSY_SENTENCE not in free["r"]["msg"], free
     # The lock is held by THIS process; first prove it really blocks a read-only reader.
     holder = sqlite3.connect(str(home / "knowledge.db"), isolation_level=None)
     try:
@@ -671,15 +676,27 @@ def test_cell17_locked_db_with_config_missing_gets_config_missing_not_damaged(se
     assert locked["r"]["raised"] == "ConfigMissingError", locked
     assert "delete" not in locked["r"]["msg"].lower(), locked["r"]["msg"]
     assert locked["cfg"] is False
+    msg = locked["r"]["msg"]
+    assert BUSY_SENTENCE in msg, msg
+    # the sentence comes before the remedies
+    assert msg.index(BUSY_SENTENCE) < msg.index("The user decides which backup to restore"), msg
 
 
 # ----------------------------------------------------------------------------- cells 18, 18b (R2-3)
 
+MV_TEMPLATE = "mv <path to knowledge.db> <path to knowledge.db>.moved-aside.<UTC stamp>"
+
+
 def _moved_aside_template_ok(msg: str, home: Path) -> bool:
-    return "mv " in msg and ".moved-aside." in msg and str(home / "knowledge.db") in msg
+    """The template line holds the placeholders, never the literal DB path (no ready-to-run command)."""
+    lines = [ln for ln in msg.splitlines() if ln.strip().startswith("mv ")]
+    return (len(lines) == 1 and MV_TEMPLATE in lines[0] and str(home / "knowledge.db") not in lines[0]
+            and ".moved-aside." in lines[0])
 
 
 def test_cell18_no_refusal_message_says_delete_or_rm(work, tmp_path):
+    """The messages built below (C2, C3a, C3b, locked-DB, install.sh C8) ARE the whole population this
+    cell checks: a refusal message added later is not covered unless it is added to this list."""
     msgs = {}
     # C2: seeded, config absent
     h = work / "c2" / ".engram"
