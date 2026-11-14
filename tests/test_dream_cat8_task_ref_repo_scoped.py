@@ -56,7 +56,14 @@ def _cat8_all() -> str:
 
 def _refs(text: str) -> list[str]:
     """The tokens the two `grep -o` stages extract, before stage 2's map rewrite
-    and the final `sort -u`: each stage's own match stream, sed-stripped."""
+    and the final `sort -u`: each stage's own match stream, sed-stripped.
+
+    BOUND: this models only the boundary `sed`, not stage 2's `s/ +#/#/`. An
+    alias written with the optional space therefore comes back as `umwelt #1069`,
+    space intact. That is deliberate — the space form's behaviour is asserted
+    end-to-end through `_run_cat8`, which is where the join actually runs — but a
+    future cell that reads the SPACED token out of `_refs` would be asserting on
+    a string the block never produces. Assert the space form through `_run_cat8`."""
     out: set[str] = set()
     for pat in (_pattern(), _alias_pattern()):
         for m in pat.finditer(text):
