@@ -176,3 +176,28 @@ def test_a_later_sections_item4_is_not_read_when_owner_merge_has_none():
     with pytest.raises(AssertionError) as exc:
         _item4_paths(_SYNTH_NO_ITEM4_HERE)
     assert "item-4 start" in str(exc.value)
+
+
+def test_real_item4_names_the_tools_scanners_too():
+    paths = _real_paths()
+    for expected in ("tools/scan-leaks.py", "tools/test_id_set_check.py"):
+        assert expected in paths, f"item 4 no longer yields {expected}"
+
+
+def test_a_directory_with_a_listed_name_does_not_count_as_a_file(tmp_path):
+    (tmp_path / "tests" / "test_dirlike.py").mkdir(parents=True)
+    message = _missing_message(["tests/test_dirlike.py"], tmp_path)
+    assert message is not None
+    assert "tests/test_dirlike.py" in message
+
+
+_SYNTH_TWICE = """\
+## Owner merge
+4. **The seat's own run** `tests/test_twice.py`
+   and again here `tests/test_twice.py`
+5. **The PR's changed or added tests**
+"""
+
+
+def test_a_path_named_twice_is_returned_once():
+    assert _item4_paths(_SYNTH_TWICE) == ["tests/test_twice.py"]
