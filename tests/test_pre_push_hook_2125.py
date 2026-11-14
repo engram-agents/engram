@@ -40,11 +40,19 @@ def _cp(returncode=0, stdout="", stderr=""):
 def test_check_pr_trap_blocks(hook, capsys):
     """(a) body refs a number that is not the title's target -> 1, BLOCKED, trap named."""
     rc = hook._check_pr("feat: x [closes #10]", "Closes #10.\nAlso fixes #99.")
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "BLOCKED" in captured.err
+    assert "#99" in captured.err
+    assert captured.out == ""
+
+
+def test_check_pr_blocked_message_lists_title_targets_in_numeric_order(hook, capsys):
+    """The 'Title close target' line sorts numerically (#2 before #10), not as strings."""
+    rc = hook._check_pr("feat: x [closes #10] [closes #2]", "Closes #2. Closes #10. Also fixes #99.")
     err = capsys.readouterr().err
     assert rc == 1
-    assert "BLOCKED" in err
-    assert "#99" in err
-    assert capsys.readouterr().out == ""
+    assert "Title close target: #2 #10\n" in err
 
 
 def test_check_pr_matching_target_is_silent(hook, capsys):
