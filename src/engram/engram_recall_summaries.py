@@ -94,6 +94,8 @@ def _set_embedding_refresh_marker(conn, node_id: str, metadata_raw, *, reason: s
 
 def _clear_embedding_refresh_marker(conn, node_id: str, metadata_raw) -> str | None:
     """The sole debt-clearer: a verified strict refresh of this one node."""
+    if _EMBEDDING_REFRESH_PENDING not in core._metadata_dict(metadata_raw):
+        return None
     metadata, warning = core._metadata_dict_for_write(
         metadata_raw, node_id, "engram_set_recall_summaries"
     )

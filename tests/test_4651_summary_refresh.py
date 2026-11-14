@@ -328,6 +328,98 @@ def test_same_input_retry_clears_only_its_own_debt_and_diagnose_is_current_only(
     assert fake.texts[-1] == "retry A\nA retry one two three"
 
 
+def test_successful_refresh_without_marker_preserves_null_metadata(monkeypatch):
+    """A no-marker strict success must not turn NULL metadata into an object."""
+    srv = fresh_server()
+    node_id = add_obs(srv, "NULL metadata refresh")
+    fake, core = install_fake_encoder(monkeypatch, srv)
+    require_real_vec(srv, core)
+    conn = srv._get_db()
+    try:
+        conn.execute("UPDATE nodes SET metadata = NULL WHERE id = ?", (node_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = apply(srv, [entry(node_id, "NULL survives", ["one", "two", "three"])])
+
+    assert result["ok"] == [{"node_id": node_id, "embedding_refresh": "refreshed"}], result
+    assert fake.texts == ["NULL metadata refresh\nNULL survives one two three"]
+    assert node_row(srv, node_id)["metadata"] is None
+
+
+def test_successful_refresh_without_marker_preserves_raw_object_metadata(monkeypatch):
+    """A no-marker strict success must not reserialize compact, non-canonical JSON."""
+    srv = fresh_server()
+    node_id = add_obs(srv, "raw metadata refresh")
+    fake, core = install_fake_encoder(monkeypatch, srv)
+    require_real_vec(srv, core)
+    raw_metadata = '{"z":1,"a":{"nested":[3,2]}}'
+    conn = srv._get_db()
+    try:
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (raw_metadata, node_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = apply(srv, [entry(node_id, "raw survives", ["one", "two", "three"])])
+
+    assert result["ok"] == [{"node_id": node_id, "embedding_refresh": "refreshed"}], result
+    assert fake.texts == ["raw metadata refresh\nraw survives one two three"]
+    assert node_row(srv, node_id)["metadata"] == raw_metadata
+
+
+def test_successful_refresh_removes_present_marker_and_preserves_other_keys(monkeypatch):
+    """Marker-key presence, even with a falsey value, requires only that key's removal."""
+    srv = fresh_server()
+    node_id = add_obs(srv, "marker removal refresh")
+    fake, core = install_fake_encoder(monkeypatch, srv)
+    require_real_vec(srv, core)
+    original = {
+        "unrelated": {"nested": ["keep", 0]},
+        "zero": 0,
+        "embedding_refresh_pending": None,
+    }
+    conn = srv._get_db()
+    try:
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(original), node_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = apply(srv, [entry(node_id, "marker clears", ["one", "two", "three"])])
+
+    assert result["ok"] == [{"node_id": node_id, "embedding_refresh": "refreshed"}], result
+    assert fake.texts == ["marker removal refresh\nmarker clears one two three"]
+    assert json.loads(node_row(srv, node_id)["metadata"]) == {
+        "unrelated": {"nested": ["keep", 0]}, "zero": 0,
+    }
+
+
+def test_pending_refresh_preserves_unrelated_metadata_keys(monkeypatch):
+    """Pending debt writes add their marker without dropping unrelated metadata."""
+    srv = fresh_server()
+    node_id = add_obs(srv, "pending metadata refresh")
+    original = {"unrelated": {"nested": ["keep", 0]}, "zero": 0}
+    conn = srv._get_db()
+    try:
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(original), node_id))
+        conn.commit()
+    finally:
+        conn.close()
+    install_fake_encoder(monkeypatch, srv, available=False)
+
+    result = apply(srv, [entry(node_id, "pending retains keys", ["one", "two", "three"])])
+
+    assert result["ok"] == [{
+        "node_id": node_id, "embedding_refresh": "pending", "embedding_refresh_reason": "unavailable",
+    }], result
+    metadata = json.loads(node_row(srv, node_id)["metadata"])
+    assert metadata["unrelated"] == {"nested": ["keep", 0]}
+    assert metadata["zero"] == 0
+    assert metadata["embedding_refresh_pending"]["reason"] == "unavailable"
+
+
 @pytest.mark.parametrize("non_object_metadata", ["[1, 2, 3]", '"scalar"', "null"])
 def test_diagnose_ignores_non_object_metadata_while_counting_valid_refresh_debt(
     monkeypatch, non_object_metadata,
@@ -557,7 +649,15 @@ def test_marker_bookkeeping_failure_rolls_back_that_entry_but_keeps_earlier_peer
     _fake, core = install_fake_encoder(monkeypatch, srv)
     require_real_vec(srv, core)
     old_vector = [9.0] * 384
-    old_metadata = {"unrelated": "survives"}
+    # The target must carry actual debt: a successful strict refresh then has
+    # to clear this marker, making the metadata-write failure a rollback test
+    # rather than relying on a no-marker clear write.
+    old_metadata = {
+        "unrelated": "survives",
+        "embedding_refresh_pending": {
+            "reason": "unavailable", "stage": "strict_refresh", "at": "2026-01-01T00:00:00Z",
+        },
+    }
     seed_vector_pair(srv, core, target, old_vector, metadata=old_metadata)
     before_target = (dict(node_row(srv, target)), vec_row(srv, target))
     conn = srv._get_db()
