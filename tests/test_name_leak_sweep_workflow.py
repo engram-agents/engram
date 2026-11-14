@@ -48,12 +48,13 @@ Discrimination for the mutations the specs name:
   cell's stub exits 0, and the timeout cell reaches the could-not-examine
   bucket through the separate `TimeoutExpired` arm.
 * R7: making the SELECTION step's fail-closed chain exit return 0 reddens the
-  two cells that read that step's OWN exit code,
-  `test_a_non_capable_bootstrap_verdict_never_starts_the_sweep` and
-  `test_step_a_fails_closed_when_the_checkout_probe_crashes`. The cells that
-  read the combined run stay green: the sweep step then starts on empty
-  outputs and dies, so the pair is still non-zero. That asymmetry is why the
-  exit invariant needs its own cell.
+  three cells that read that step's OWN exit code:
+  `test_step_a_fails_closed_when_a_protected_ref_cannot_be_examined` (the
+  `unexamined` gate), `test_a_non_capable_bootstrap_verdict_never_starts_the_sweep`
+  and `test_step_a_fails_closed_when_the_checkout_probe_crashes` (the
+  no-scanner gate). The cells that read the combined run stay green: the sweep
+  step then starts on empty outputs and dies, so the pair is still non-zero.
+  That asymmetry is why the exit invariant needs its own cells.
 * R7: putting `NAME_LEAK_ROSTER` into the selection step's `env:` reddens
   `test_the_roster_secret_is_unreachable_from_the_selection_step` and no other
   cell (the harness never passes the variable to that step regardless).
@@ -1307,6 +1308,43 @@ def test_step_a_fails_closed_when_the_checkout_probe_crashes(sweep_repo, tmp_pat
     assert sweep_ran is False, (
         "the sweep step started after a selection that selected no scanner"
     )
+    assert "scan-leaks: scanned" not in out, out
+    assert _roster_files(tmp_path) == []
+
+
+def test_step_a_fails_closed_when_a_protected_ref_cannot_be_examined(
+    sweep_repo, tmp_path
+):
+    """#4782 r7 (the exit invariant, `unexamined` gate): a protected ref whose
+    capability probe produces NO verdict must exit the selection step
+    non-zero, so the secret-bearing step never starts.
+
+    This is the gate's OWN cell, not a pair-read: if it wrongly returned 0, the
+    sweep step would start on empty outputs and die, leaving the combined run
+    non-zero and the violation invisible. The invariant lives in this step's
+    exit code, so the assertion is on the exit code.
+
+    Both protected refs carry a scanner that crashes at import; the checkout
+    carries a CAPABLE copy, which the chain must never reach on the strength of
+    a ref this run could not examine.
+    """
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _CRASHING_SCANNER, push=True)
+    (work / "src" / "engram" / "tools" / "scan-leaks.py").write_text(
+        _CAPABLE_MARKER_SCANNER, encoding="utf-8"
+    )
+
+    select_proc, select_out = _run_select(work, base, tmp_path)
+    assert select_proc.returncode != 0, select_out
+    assert "Failing closed before any scan" in select_out, select_out
+    assert _roster_files(tmp_path) == []
+
+    proc, out, sweep_ran = _run_steps(work, base, tmp_path)
+    assert proc.returncode != 0, out
+    assert sweep_ran is False, (
+        "the sweep step started after a selection that selected no scanner"
+    )
+    assert "CHECKOUT_SCANNER_RAN" not in out, out
     assert "scan-leaks: scanned" not in out, out
     assert _roster_files(tmp_path) == []
 
