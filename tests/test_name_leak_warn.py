@@ -1499,6 +1499,9 @@ _ROSTER_STEP_ALLOWLIST: dict[str, frozenset[tuple[str, str | int]]] = {
             ("name-leak-gate", "decide the gate verdict"),
         }
     ),
+    "name-leak-sweep.yml": frozenset(
+        {("name-leak-sweep", "decide, then sweep the whole tree")}
+    ),
     "nightly.yml": frozenset(
         {
             ("pytest", "Name-leak-warn self-test (real roster)"),
