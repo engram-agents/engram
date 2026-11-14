@@ -6,7 +6,7 @@ Contract (written before the fix):
      the dump, so a DB restored from forum.sql and started has NO search index
      and NO embeddings: search returns nothing until they are rebuilt.
   2. The README's ``## Restore`` section therefore runs tools/forum_regen_derived.py
-     AFTER the sqlite3 restore and BEFORE the service start.
+     AFTER the restore and BEFORE the service start.
   3. The installer snapshots forum_regen_derived.py and forum_backfill_embeddings.py
      into <service-dir>/app/tools/ (real files, like forum_backup.py), so the
      README command works from the deployed layout, never from a checkout.
@@ -71,9 +71,9 @@ def _restore_section() -> str:
 
 class TestReadmeRestoreRunsRegen:
 
-    def test_regen_sits_between_the_sqlite3_restore_and_the_service_start(self):
+    def test_regen_sits_between_the_restore_and_the_service_start(self):
         sec = _restore_section()
-        restore = sec.index('sqlite3 "$D/forum.db"')
+        restore = sec.index("c.executescript(")
         regen = sec.index('"$SVC/.venv/bin/python" "$SVC/app/tools/forum_regen_derived.py"')
         start = sec.index("systemctl --user start")
         assert restore < regen < start
@@ -183,7 +183,8 @@ def _make_dump(tmp_path: Path) -> Path:
 
 
 def _run_block(tmp_path: Path, *, model: bool, corrupt: bool = False,
-               block: str | None = None, truncate: bool = False):
+               block: str | None = None, truncate: bool = False,
+               prep=None, no_sqlite3_cli: bool = False):
     live = _make_dump(tmp_path)
     # Reopen the live DB in WAL mode with an open writer, so -wal/-shm exist.
     keep = sqlite3.connect(live / "forum.db")
@@ -218,17 +219,35 @@ def _run_block(tmp_path: Path, *, model: bool, corrupt: bool = False,
     sc.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n')
     sc.chmod(0o755)
 
+    if prep:
+        prep(live, svc)
+
     script = (block or _restore_block()).replace(
         "/home/agents-shared/forum", str(live)).replace("<service-dir>", str(svc))
-    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    path = f"{bindir}:{os.environ['PATH']}"
+    if no_sqlite3_cli:  # only the tools the block needs; no sqlite3 anywhere on PATH
+        tools = tmp_path / "toolbin"
+        tools.mkdir()
+        for name in ("date", "mv", "chmod", "cat", "sh", "env", "dirname", "uname"):
+            real = shutil.which(name)
+            if real:
+                (tools / name).symlink_to(real)
+        path = f"{bindir}:{tools}"
+        assert shutil.which("sqlite3", path=path) is None
+    env = {**os.environ, "PATH": path}
     env.pop("FORUM_NO_EMBEDDINGS", None)
     if not model:
         env["FORUM_NO_EMBEDDINGS"] = "1"
-    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+    r = subprocess.run([shutil.which("bash"), "-c", script], capture_output=True, text=True,
                        env=env, cwd=str(tmp_path), timeout=120)
     keep.close()
     log = calls.read_text().splitlines() if calls.exists() else []
     return SimpleNamespace(r=r, live=live, log=log, both=r.stdout + r.stderr)
+
+
+STOPPED = ["--user stop engram-forum.service", "--user stop engram-forum-backup.timer"]
+STOP_START = STOPPED + ["--user start engram-forum.service",
+                        "--user start engram-forum-backup.timer"]
 
 
 def _pre(live: Path, name: str) -> list[Path]:
@@ -259,12 +278,12 @@ class TestRestoreBlockRuns:
         new.close()
         assert (x.live / "forum.db").stat().st_mode & 0o777 == 0o640
         # stop first, start last
-        assert x.log == ["--user stop engram-forum.service", "--user start engram-forum.service"]
+        assert x.log == STOP_START, x.log
 
     def test_a_failed_restore_does_not_start_the_service_and_keeps_the_old_db(self, tmp_path):
         x = _run_block(tmp_path, model=True, corrupt=True)
         assert x.r.returncode != 0, x.both
-        assert x.log == ["--user stop engram-forum.service"], x.log
+        assert x.log == STOPPED, x.log
         assert len(_pre(x.live, "forum.db")) == 1
         # the README's own put-it-back block restores the old DB, side files included
         stamp = _pre(x.live, "forum.db")[0].name.split(".pre-restore-")[1]
@@ -282,7 +301,7 @@ class TestRestoreBlockRuns:
     def test_model_off_regen_exit_stops_the_block_after_the_text_index_is_rebuilt(self, tmp_path):
         x = _run_block(tmp_path, model=False)
         assert x.r.returncode != 0, x.both
-        assert x.log == ["--user stop engram-forum.service"], x.log
+        assert x.log == STOPPED, x.log
         new = sqlite3.connect(x.live / "forum.db")
         assert new.execute(_MATCH).fetchone()[0] == 1  # FTS was rebuilt before the exit
         new.close()
@@ -301,9 +320,81 @@ def test_a_wrong_service_dir_stops_the_block_before_anything_is_touched(tmp_path
 
 
 def test_a_dump_cut_before_commit_does_not_start_the_service(tmp_path):
-    """sqlite3 exits 0 on a dump truncated before COMMIT and leaves no tables;
-    the post-restore schema check must stop the block before the start."""
+    """executescript raises nothing on a dump truncated before COMMIT, and closing
+    the connection rolls it back, leaving no tables; the Python step must exit
+    non-zero so the block stops before the start."""
     x = _run_block(tmp_path, model=True, truncate=True)
     assert x.r.returncode != 0, x.both
     assert "start" not in " ".join(x.log), x.log
     assert _pre(x.live, "forum.db"), list(x.live.iterdir())
+
+
+def test_a_good_restore_completes_with_no_sqlite3_cli_on_PATH(tmp_path):
+    """Regression cell: the block once ran the `sqlite3` command-line program,
+    absent on the forum host (stop, move aside, then exit 127)."""
+    x = _run_block(tmp_path, model=True, no_sqlite3_cli=True)
+    assert x.r.returncode == 0, x.both
+    assert "sqlite3: command not found" not in x.both
+    new = sqlite3.connect(x.live / "forum.db")
+    assert new.execute(_MATCH).fetchone()[0] == 1
+    new.close()
+    assert (x.live / "forum.db").stat().st_mode & 0o777 == 0o640
+    assert x.log == STOP_START, x.log
+
+
+def test_a_truncated_dump_leaves_no_usable_restore_and_fails_the_step(tmp_path):
+    x = _run_block(tmp_path, model=True, truncate=True, no_sqlite3_cli=True)
+    assert x.r.returncode != 0, x.both
+    assert x.log == STOPPED, x.log
+    new = x.live / "forum.db"
+    if new.exists():  # whatever is left must hold no posts table
+        c = sqlite3.connect(new)
+        assert c.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+        c.close()
+
+
+def _no_dump(live, svc):
+    (live / "backup" / "forum.sql").unlink()
+
+
+def _empty_dump(live, svc):
+    (live / "backup" / "forum.sql").write_text("")
+
+
+def _no_venv_python(live, svc):
+    (svc / ".venv" / "bin" / "python").unlink()
+
+
+def _no_regen_tool(live, svc):
+    (svc / "app" / "tools" / "forum_regen_derived.py").unlink()
+
+
+@pytest.mark.parametrize("prep", [_no_dump, _empty_dump, _no_venv_python, _no_regen_tool],
+                         ids=lambda f: f.__name__.lstrip("_"))
+def test_each_precondition_alone_stops_the_block_before_anything_is_touched(tmp_path, prep):
+    """One failed precondition, the other three satisfied: non-zero, no systemctl
+    call at all, the live DB and its side files still in place."""
+    x = _run_block(tmp_path, model=True, prep=prep)
+    assert x.r.returncode != 0, x.both
+    assert x.log == [], x.log
+    for name in ("forum.db", "forum.db-wal", "forum.db-shm"):
+        assert not _pre(x.live, name), name  # nothing moved aside
+    assert (x.live / "forum.db").stat().st_size > 0
+
+
+def test_set_e_is_ignored_in_an_or_list_so_the_readme_says_to_run_it_plainly():
+    r = subprocess.run(["bash", "-c", "( set -e; false; echo carried-on ) || echo handled"],
+                       capture_output=True, text=True)
+    assert r.stdout.split() == ["carried-on"], r.stdout
+    assert "plain command" in _restore_section()
+
+
+def test_a_complete_dump_with_no_posts_table_does_not_start_the_service(tmp_path):
+    """A well-formed, committed dump of the wrong thing: only the posts-table
+    check stops it (the transaction check sees nothing wrong)."""
+    def other(live, svc):
+        (live / "backup" / "forum.sql").write_text(
+            "BEGIN TRANSACTION;\nCREATE TABLE other(x);\nCOMMIT;\n")
+    x = _run_block(tmp_path, model=True, prep=other)
+    assert x.r.returncode != 0, x.both
+    assert x.log == STOPPED, x.log

@@ -357,11 +357,12 @@ ls /home/agents-shared/forum/backup/                     # forum.sql + .git/
 
 ## Restore
 
-`sqlite3 forum.db < forum.sql` **into the live `forum.db` fails**: the dump
-creates every table, and they already exist (`table agents already exists`,
-exit 1). So the restore goes into a **new** `forum.db`, and the old one is moved
-aside first, never deleted. Run this as the user that owns the old DB, so the
-new file can be read by the service:
+Loading `forum.sql` **into the live `forum.db` fails**: the dump creates every
+table, and they already exist (`table agents already exists`). So the restore
+goes into a **new** `forum.db`, and the old one is moved aside first, never
+deleted. Run this as the user that owns the old DB, so the new file can be read
+by the service. The restore runs under the forum venv's Python (its stdlib
+`sqlite3` module), so the host needs no `sqlite3` command-line program:
 
 ```bash
 (
@@ -373,29 +374,45 @@ new file can be read by the service:
   test -x "$SVC/.venv/bin/python"
   test -f "$SVC/app/tools/forum_regen_derived.py"
   systemctl --user stop engram-forum.service
+  systemctl --user stop engram-forum-backup.timer
   for f in forum.db forum.db-wal forum.db-shm; do
       if [ -e "$D/$f" ]; then mv -- "$D/$f" "$D/$f.pre-restore-$STAMP"; fi
   done
   umask 027
-  sqlite3 "$D/forum.db" < "$D/backup/forum.sql"
-  test "$(sqlite3 "$D/forum.db" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='posts'")" = 1
+  "$SVC/.venv/bin/python" -c '
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript(open(sys.argv[2], encoding="utf-8").read())
+if c.in_transaction:
+    sys.exit("restore: the dump ends inside a transaction (cut before COMMIT)")
+if ("posts",) not in c.execute("SELECT name FROM sqlite_master").fetchall():
+    sys.exit("restore: no posts table in the restored database")
+c.close()
+' "$D/forum.db" "$D/backup/forum.sql"
   chmod 0640 "$D/forum.db"
   "$SVC/.venv/bin/python" "$SVC/app/tools/forum_regen_derived.py" \
       --db "$D/forum.db"
   systemctl --user start engram-forum.service
+  systemctl --user start engram-forum-backup.timer
 )
 ```
 
 The block is a subshell with `set -e` rather than a `&&` chain: it holds a loop
 and reads top to bottom, and a failing step ends the subshell, not your terminal.
+**Run it as a plain command**, not inside an `||`, `&&` or `if` list: bash ignores
+`set -e` there, and the block would carry on past a failed step.
 **Every step runs only if the one before it succeeded, so the service starts only
 after a complete restore.** Set `SVC` to the service directory you installed into.
 The three `test` lines check the dump, the forum venv and the regen tool before
 anything is stopped or moved, so a wrong `SVC` stops the block with the forum
 still running and untouched. An unedited `<service-dir>` is a shell syntax error,
-so nothing in the block runs at all. The `test` line after the restore catches a
-dump cut short before its final `COMMIT`: `sqlite3` then exits 0 but leaves a
-database with no tables, and the block stops before starting the service on it.
+so nothing in the block runs at all. The backup timer is stopped too, so
+`forum_backup.py` cannot open the DB path (and create an empty file) while the
+restore is under way. The Python step catches a dump cut short before its final
+`COMMIT`: the load then raises no error, but the connection is still inside a
+transaction and closing it would roll everything back, so the step exits non-zero
+and the block stops before starting the service on an empty database. A corrupt
+dump raises an error and stops the block the same way.
 The block is plain POSIX shell; paste it into bash or any POSIX `sh`. The old DB is kept as `forum.db.pre-restore-<stamp>`
 (plus `forum.db-wal.pre-restore-<stamp>` and `forum.db-shm.pre-restore-<stamp>`
 when they existed). `0640` is the mode the forum admin CLI gives a new `forum.db`.
@@ -408,7 +425,7 @@ on a host that cannot, the regen still rebuilds the text index first and then
 exits non-zero. **That non-zero exit stops the block before the service starts**:
 the restored DB would be searchable by text but have no embeddings. Make the
 model available and run only the regen line again, then
-`systemctl --user start engram-forum.service`.
+`systemctl --user start engram-forum.service engram-forum-backup.timer`.
 
 **If any step fails, the service is not started.** To put the old DB back, using
 the `<stamp>` from the `*.pre-restore-*` file names (the failed new files are
@@ -422,7 +439,7 @@ done
 for f in forum.db forum.db-wal forum.db-shm; do
     if [ -e "$D/$f.pre-restore-$STAMP" ]; then mv -- "$D/$f.pre-restore-$STAMP" "$D/$f"; fi
 done
-systemctl --user start engram-forum.service
+systemctl --user start engram-forum.service engram-forum-backup.timer
 ```
 
 To restore a previous snapshot, check out an older commit in the backup repo
