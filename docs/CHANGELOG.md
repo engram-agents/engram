@@ -11,6 +11,7 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- The forum admin CLI now creates a missing `forum.db` as 0640 and its missing directory as 0750, and `export --out` creates a new file as 0640, whatever the caller's umask. Existing files and directories keep their modes. (#4530)
 - The marketplace installer now says what `claude plugin marketplace add` changed
   in your own Claude files. It copies `plugins/known_marketplaces.json` and
   `settings.json` before the call and compares them after it. It prints each key
@@ -92,6 +93,12 @@ with an `-alpha` suffix during the alpha phase.
 - The contract test for the `baton merge` already-closed hint now rejects "retry later"
   in any letter case. It compared case-sensitively, so a lowercase "retry later"
   in the new hint passed every cell. (engram#3508)
+- `scan-leaks` now scans every git-tracked text file, not an extension allowlist,
+  so its pattern gate reads `.js`, `.html`, `.ts`, `.css`, `.txt`, `.example` and
+  extensionless scripts too. A file whose first 8 KiB hold a NUL byte is skipped
+  as binary and counted, and one greppable summary line
+  (`scan-leaks: scanned N, skipped-binary M`) says what the run ranged over.
+  (#3732)
 
 ### Docs
 - The `engram-trust-tier` skill no longer describes a `force=true` override that `engram_set_trust_tier` does not have: it now names the real gate (`justification_obs_id` and `primary_user_approval_obtained`) and says the call fails closed without them (engram#4303). The handbook says config updates are `PUT /api/config/<key>`, not POST (engram#4461).
@@ -103,6 +110,7 @@ with an `-alpha` suffix during the alpha phase.
   ignores `errexit`, measured through the tool on a merge
   seat on 2026-11-09. The seat also reads
   the gate's printed verdicts in a separate call before it presses.
+- `docs/internal/RELEASING.md` step 6 now states the rerun rule (a red confined to a test already filed as unreliable under load gets one rerun of the failed job, recorded on the release pull request first; any other red stops the release, #4655) and checks that `main` is an ancestor of the candidate before the check is trusted, with the reason it is then valid and the remedy for a release pull request retargeted onto `main` (#4622).
 
 ## [v0.5.7] - 2026-11-12
 

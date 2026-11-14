@@ -57,8 +57,6 @@ COMMITTED_PATTERNS = [
 
 LOCAL_CONFIG_NAME = ".scan-leaks-local.json"
 
-SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service", ".timer", ".yml", ".yaml"}
-
 # --- Absolute home paths: default-deny -------------------------------------
 # The class definition (regex + declared allowed set with reasons) lives in ONE
 # place, shared with the build engine's foreign-bundle leak scan:
@@ -172,8 +170,18 @@ def _git_tracked_files(root: Path) -> list[Path] | None:
     return [root / p.decode("utf-8", errors="replace") for p in raw.split(b"\x00") if p]
 
 
-def scan(root: Path, leak_patterns: list, use_git: bool = True) -> list[tuple[str, int, str, str]]:
-    """Scan root for leak_patterns and return a list of (relpath, lineno, label, snippet).
+def scan(root: Path, leak_patterns: list, use_git: bool = True
+         ) -> tuple[list[tuple[str, int, str, str]], int, int]:
+    """Scan root for leak_patterns.  Returns (findings, scanned, skipped_binary).
+
+    findings is a list of (relpath, lineno, label, snippet).
+
+    Candidate set: every git-tracked file, whatever its extension
+    (extensionless executables included), minus the SKIP_DIRS components and
+    SKIP_FILES names — the same all-text domain ``scan_home_paths`` uses.  An
+    extension allowlist used to select files here, so the release leak gate
+    never read shipped ``.js``/``.html``/``.ts``/``.css``/``.txt`` files or
+    extensionless scripts (#3732).
 
     When use_git is True (default), candidate files are enumerated via
     ``git ls-files -z`` so that untracked files — gitignored local notes,
@@ -187,14 +195,19 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> list[tuple[st
 
     When use_git is False (explicit-path invocation), the os.walk path is used
     unconditionally so that callers can target specific non-repo directories.
+
+    A file whose first 8 KiB contains a NUL byte is binary: skipped and counted
+    in ``skipped_binary``.  Everything else is decoded as UTF-8 with errors
+    replaced, so a non-UTF-8 text file is still scanned and ``scanned`` counts
+    it.  A file that cannot be read at all is skipped and counted in neither.
     """
     leaks = []
 
     tracked = _git_tracked_files(root) if use_git else None
 
     if tracked is not None:
-        # Git-tracked enumeration: skip SKIP_DIRS and SKIP_FILES by name,
-        # and apply the same extension filter as the os.walk path.
+        # Git-tracked enumeration: skip SKIP_DIRS and SKIP_FILES by name.
+        # Every remaining file is a candidate, whatever its extension.
         candidates = []
         for fpath in tracked:
             # Check every component for SKIP_DIRS membership
@@ -203,33 +216,41 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> list[tuple[st
                 continue
             if fpath.name in SKIP_FILES:
                 continue
-            if fpath.suffix not in SCAN_EXTENSIONS:
-                continue
             candidates.append(fpath)
     else:
-        # Fallback: os.walk (original behavior)
+        # Fallback: os.walk (same all-text policy)
         candidates = []
         for dirpath, dirs, files in os.walk(root):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             for fname in files:
                 if fname in SKIP_FILES:
                     continue
-                if Path(fname).suffix not in SCAN_EXTENSIONS:
-                    continue
                 candidates.append(Path(dirpath) / fname)
 
+    # A tracked symlink can point at a directory (tools/engine, tools/engram-pkg
+    # in this repo).  It is not a text file to scan, so it is not a candidate —
+    # which is what makes scanned + skipped_binary equal the files considered.
+    candidates = [f for f in candidates if f.is_file()]
+
+    scanned = 0
+    skipped_binary = 0
     for fpath in candidates:
         try:
-            content = fpath.read_text()
-        except (UnicodeDecodeError, OSError):
+            data = fpath.read_bytes()
+        except OSError:
             continue
+        if b"\x00" in data[:8192]:
+            skipped_binary += 1
+            continue
+        content = data.decode("utf-8", errors="replace")
+        scanned += 1
         rel = fpath.relative_to(root)
         for i, line in enumerate(content.splitlines(), 1):
             for pattern, label in leak_patterns:
                 if pattern.search(line):
                     leaks.append((str(rel), i, label, line.strip()[:120]))
                     break
-    return leaks
+    return leaks, scanned, skipped_binary
 
 
 def scan_home_paths(root: Path, use_git: bool = True) -> list[tuple[str, int, str]]:
@@ -301,7 +322,10 @@ def main():
 
     all_patterns = COMMITTED_PATTERNS + local_patterns
 
-    leaks = scan(root, all_patterns)
+    leaks, scanned, skipped_binary = scan(root, all_patterns)
+    # One greppable summary line, on clean and dirty runs alike: a clean result
+    # says what it ranged over, so an empty finding list cannot hide a blind spot.
+    print(f"scan-leaks: scanned {scanned}, skipped-binary {skipped_binary}")
     home_findings = scan_home_paths(root)
     if not leaks and not home_findings:
         print(f"scan-leaks: clean ({root})")
