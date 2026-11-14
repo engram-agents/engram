@@ -245,7 +245,8 @@ def _run_block(tmp_path: Path, *, model: bool, corrupt: bool = False,
     return SimpleNamespace(r=r, live=live, log=log, both=r.stdout + r.stderr)
 
 
-STOPPED = ["--user stop engram-forum.service", "--user stop engram-forum-backup.timer"]
+STOPPED = ["--user stop engram-forum.service",
+           "--user stop engram-forum-backup.timer engram-forum-backup.service"]
 STOP_START = STOPPED + ["--user start engram-forum.service",
                         "--user start engram-forum-backup.timer"]
 
@@ -401,3 +402,14 @@ def test_a_complete_dump_with_no_posts_table_does_not_start_the_service(tmp_path
     x = _run_block(tmp_path, model=True, prep=other)
     assert x.r.returncode != 0, x.both
     assert x.log == STOPPED, x.log
+
+
+def test_the_umask_alone_makes_the_new_db_0640_from_creation(tmp_path):
+    """Zephyr's control: with an ambient umask of 022 and the block's chmod made a
+    no-op, the new forum.db must still be 0640, so it is never wider than 0640 at
+    any moment. Fails the moment the block's `umask 027` line goes."""
+    block = "umask 022\n" + _restore_block().replace('chmod 0640 "$D/forum.db"', ":")
+    assert block.count(":\n") >= 1  # the chmod really was replaced
+    x = _run_block(tmp_path, model=True, block=block)
+    assert x.r.returncode == 0, x.both
+    assert (x.live / "forum.db").stat().st_mode & 0o777 == 0o640

@@ -374,7 +374,7 @@ by the service. The restore runs under the forum venv's Python (its stdlib
   test -x "$SVC/.venv/bin/python"
   test -f "$SVC/app/tools/forum_regen_derived.py"
   systemctl --user stop engram-forum.service
-  systemctl --user stop engram-forum-backup.timer
+  systemctl --user stop engram-forum-backup.timer engram-forum-backup.service
   for f in forum.db forum.db-wal forum.db-shm; do
       if [ -e "$D/$f" ]; then mv -- "$D/$f" "$D/$f.pre-restore-$STAMP"; fi
   done
@@ -406,9 +406,13 @@ after a complete restore.** Set `SVC` to the service directory you installed int
 The three `test` lines check the dump, the forum venv and the regen tool before
 anything is stopped or moved, so a wrong `SVC` stops the block with the forum
 still running and untouched. An unedited `<service-dir>` is a shell syntax error,
-so nothing in the block runs at all. The backup timer is stopped too, so
-`forum_backup.py` cannot open the DB path (and create an empty file) while the
-restore is under way. The Python step catches a dump cut short before its final
+so nothing in the block runs at all. The backup timer and the backup
+service are stopped too: the timer so no new backup starts, and the service so a
+backup already running when the block begins is ended. Stopping the timer alone
+leaves a running backup alone, and a connection it opened after the move-aside
+could create an empty file or a stray `forum.db-wal` beside the new database.
+`forum_backup.py` writes `forum.sql` through a temporary file and a rename, so
+ending it mid-run cannot leave a half-written dump for the restore to read. The Python step catches a dump cut short before its final
 `COMMIT`: the load then raises no error, but the connection is still inside a
 transaction and closing it would roll everything back, so the step exits non-zero
 and the block stops before starting the service on an empty database. A corrupt
