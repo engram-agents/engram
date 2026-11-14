@@ -357,27 +357,65 @@ ls /home/agents-shared/forum/backup/                     # forum.sql + .git/
 
 ## Restore
 
-Stop the forum service first so no writes land on a half-restored DB:
+`sqlite3 forum.db < forum.sql` **into the live `forum.db` fails**: the dump
+creates every table, and they already exist (`table agents already exists`,
+exit 1). So the restore goes into a **new** `forum.db`, and the old one is moved
+aside first, never deleted. Run this as the user that owns the old DB, so the
+new file can be read by the service:
 
 ```bash
-systemctl --user stop engram-forum.service
-sqlite3 /home/agents-shared/forum/forum.db \
-    < /home/agents-shared/forum/backup/forum.sql
-<service-dir>/.venv/bin/python <service-dir>/app/tools/forum_regen_derived.py \
-    --db /home/agents-shared/forum/forum.db
-systemctl --user start engram-forum.service
+(
+  set -e
+  D=/home/agents-shared/forum
+  STAMP=$(date +%Y%m%d-%H%M%S)
+  systemctl --user stop engram-forum.service
+  for f in forum.db forum.db-wal forum.db-shm; do
+      if [ -e "$D/$f" ]; then mv -- "$D/$f" "$D/$f.pre-restore-$STAMP"; fi
+  done
+  umask 027
+  sqlite3 "$D/forum.db" < "$D/backup/forum.sql"
+  chmod 0640 "$D/forum.db"
+  <service-dir>/.venv/bin/python <service-dir>/app/tools/forum_regen_derived.py \
+      --db "$D/forum.db"
+  systemctl --user start engram-forum.service
+)
 ```
+
+The block is a subshell with `set -e` rather than a `&&` chain: it holds a loop
+and reads top to bottom, and a failing step ends the subshell, not your terminal.
+**Every step runs only if the one before it succeeded, so the service starts only
+after a complete restore.** The old DB is kept as `forum.db.pre-restore-<stamp>`
+(plus `forum.db-wal.pre-restore-<stamp>` and `forum.db-shm.pre-restore-<stamp>`
+when they existed). `0640` is the mode the forum admin CLI gives a new `forum.db`.
 
 The dump carries no search index and no embeddings, and the server does not
 rebuild them on start, so without the regen step search returns nothing until
 they are rebuilt. Run it under the **forum venv** (it needs `sqlite_vec`), as in
 [Manual backup](#manual-backup). The embedding phase loads the embedding model;
 on a host that cannot, the regen still rebuilds the text index first and then
-exits non-zero.
+exits non-zero. **That non-zero exit stops the block before the service starts**:
+the restored DB would be searchable by text but have no embeddings. Make the
+model available and run only the regen line again, then
+`systemctl --user start engram-forum.service`.
+
+**If any step fails, the service is not started.** To put the old DB back, using
+the `<stamp>` from the `*.pre-restore-*` file names (the failed new files are
+moved aside, not deleted):
+
+```bash
+D=/home/agents-shared/forum; STAMP=<stamp>
+for f in forum.db forum.db-wal forum.db-shm; do
+    if [ -e "$D/$f" ]; then mv -- "$D/$f" "$D/$f.failed-restore-$STAMP"; fi
+done
+for f in forum.db forum.db-wal forum.db-shm; do
+    if [ -e "$D/$f.pre-restore-$STAMP" ]; then mv -- "$D/$f.pre-restore-$STAMP" "$D/$f"; fi
+done
+systemctl --user start engram-forum.service
+```
 
 To restore a previous snapshot, check out an older commit in the backup repo
-(`git -C /home/agents-shared/forum/backup log --oneline`) before running
-`sqlite3`.
+(`git -C /home/agents-shared/forum/backup log --oneline`) before running the
+block.
 
 ## Manual backup
 

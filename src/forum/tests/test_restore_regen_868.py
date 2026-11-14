@@ -25,6 +25,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -72,7 +73,7 @@ class TestReadmeRestoreRunsRegen:
 
     def test_regen_sits_between_the_sqlite3_restore_and_the_service_start(self):
         sec = _restore_section()
-        restore = sec.index("sqlite3 ")
+        restore = sec.index('sqlite3 "$D/forum.db"')
         regen = sec.index("forum_regen_derived.py")
         start = sec.index("systemctl --user start")
         assert restore < regen < start
@@ -138,3 +139,145 @@ def test_restored_dump_has_no_search_index_until_regen_runs(tmp_path):
     r = sqlite3.connect(restored)
     assert r.execute(match).fetchone()[0] == 1
     r.close()
+
+
+# ------------------------------------------------ the Restore block, RUN ----
+# The block's own commands are executed with bash against temp paths.  A restore
+# that fails must never be followed by a service start that looks like success.
+
+_MATCH = "SELECT count(*) FROM posts_fts WHERE posts_fts MATCH 'quokka'"
+_STUB_BACKFILL = (
+    "def run_backfill(db, dry_run=False):\n"
+    "    return {'posts_embedded': 0, 'threads_updated': 0, 'fts_rows_after_rebuild': 0}\n"
+)
+
+
+def _restore_block() -> str:
+    m = re.search(r"```bash\n(.*?)```", _restore_section(), re.S)
+    assert m, "no fenced bash block under '## Restore'"
+    return m.group(1)
+
+
+def _make_dump(tmp_path: Path) -> Path:
+    """A live forum.db with a post, and backup/forum.sql dumped from it."""
+    sys.path.insert(0, str(_REPO / "src"))
+    sys.path.append(str(_REPO / "tools"))
+    try:
+        from forum import db as fdb
+        import forum_backup
+    finally:
+        sys.path.remove(str(_REPO / "src"))
+    live = tmp_path / "forum"
+    (live / "backup").mkdir(parents=True)
+    db = live / "forum.db"
+    c = sqlite3.connect(db)
+    fdb.init_db(c)
+    agent = fdb.upsert_agent(c, "tester")
+    slug = c.execute("SELECT slug FROM categories LIMIT 1").fetchone()[0]
+    fdb.create_thread(c, agent, slug, "Quokka title", "the quokka sat on a wombat")
+    c.commit()
+    (live / "backup" / "forum.sql").write_text(forum_backup._dump_to_sql(str(db)))
+    c.close()
+    return live
+
+
+def _run_block(tmp_path: Path, *, model: bool, corrupt: bool = False,
+               block: str | None = None):
+    live = _make_dump(tmp_path)
+    # Reopen the live DB in WAL mode with an open writer, so -wal/-shm exist.
+    keep = sqlite3.connect(live / "forum.db")
+    keep.execute("PRAGMA journal_mode=WAL")
+    keep.execute("PRAGMA wal_autocheckpoint=0")
+    keep.execute("CREATE TABLE IF NOT EXISTS marker(x)")
+    keep.execute("INSERT INTO marker VALUES ('old-db')")
+    keep.commit()
+    assert (live / "forum.db-wal").exists() and (live / "forum.db-shm").exists()
+    if corrupt:
+        (live / "backup" / "forum.sql").write_text("CREATE TABLE ((( not sql at all;\n")
+
+    ctx = _install(tmp_path)
+    assert ctx.r.returncode == 0, ctx.both
+    svc = ctx.svc
+    if model:  # the model is available: the embedding phase is a stand-in that succeeds
+        (svc / "app" / "tools" / "forum_backfill_embeddings.py").write_text(_STUB_BACKFILL)
+    venv_py = svc / ".venv" / "bin" / "python"
+    venv_py.parent.mkdir(parents=True, exist_ok=True)
+    venv_py.write_text(f'#!/bin/sh\nexec {sys.executable} "$@"\n')
+    venv_py.chmod(0o755)
+
+    bindir = tmp_path / "stubbin"
+    bindir.mkdir()
+    calls = tmp_path / "systemctl.calls"
+    sc = bindir / "systemctl"
+    sc.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n')
+    sc.chmod(0o755)
+
+    script = (block or _restore_block()).replace(
+        "/home/agents-shared/forum", str(live)).replace("<service-dir>", str(svc))
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    env.pop("FORUM_NO_EMBEDDINGS", None)
+    if not model:
+        env["FORUM_NO_EMBEDDINGS"] = "1"
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       env=env, cwd=str(tmp_path), timeout=120)
+    keep.close()
+    log = calls.read_text().splitlines() if calls.exists() else []
+    return SimpleNamespace(r=r, live=live, log=log, both=r.stdout + r.stderr)
+
+
+def _pre(live: Path, name: str) -> list[Path]:
+    return sorted(live.glob(f"{name}.pre-restore-*"))
+
+
+class TestRestoreBlockRuns:
+
+    def test_a_good_restore_moves_the_old_db_aside_restores_and_starts_last(self, tmp_path):
+        x = _run_block(tmp_path, model=True)
+        assert x.r.returncode == 0, x.both
+        # the old DB is kept, with its side files, under the timestamped name
+        for name in ("forum.db", "forum.db-wal", "forum.db-shm"):
+            assert len(_pre(x.live, name)) == 1, (name, sorted(p.name for p in x.live.iterdir()))
+        # the pre-restore files hold the old data: reassemble them under the original
+        # names (the -wal carries the marker row) in a scratch dir and read it
+        scratch = tmp_path / "reassembled"
+        scratch.mkdir()
+        for name in ("forum.db", "forum.db-wal", "forum.db-shm"):
+            shutil.copy(_pre(x.live, name)[0], scratch / name)
+        old = sqlite3.connect(scratch / "forum.db")
+        assert old.execute("SELECT x FROM marker").fetchone()[0] == "old-db"
+        old.close()
+        # the new DB has the post, is searchable, and is 0640
+        new = sqlite3.connect(x.live / "forum.db")
+        assert new.execute(_MATCH).fetchone()[0] == 1
+        assert new.execute("SELECT count(*) FROM sqlite_master WHERE name='marker'").fetchone()[0] == 0
+        new.close()
+        assert (x.live / "forum.db").stat().st_mode & 0o777 == 0o640
+        # stop first, start last
+        assert x.log == ["--user stop engram-forum.service", "--user start engram-forum.service"]
+
+    def test_a_failed_restore_does_not_start_the_service_and_keeps_the_old_db(self, tmp_path):
+        x = _run_block(tmp_path, model=True, corrupt=True)
+        assert x.r.returncode != 0, x.both
+        assert x.log == ["--user stop engram-forum.service"], x.log
+        assert len(_pre(x.live, "forum.db")) == 1
+        # the README's own put-it-back block restores the old DB, side files included
+        stamp = _pre(x.live, "forum.db")[0].name.split(".pre-restore-")[1]
+        rec = re.findall(r"```bash\n(.*?)```", _restore_section(), re.S)[1]
+        rec = rec.replace("/home/agents-shared/forum", str(x.live)).replace("<stamp>", stamp)
+        r = subprocess.run(["bash", "-c", rec], capture_output=True, text=True,
+                           env={**os.environ, "PATH": f"{tmp_path / 'stubbin'}:{os.environ['PATH']}"})
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert not _pre(x.live, "forum.db")
+        c = sqlite3.connect(x.live / "forum.db")
+        assert c.execute("SELECT x FROM marker").fetchone()[0] == "old-db"
+        c.close()
+        assert list(x.live.glob("forum.db*.failed-restore-*"))
+
+    def test_model_off_regen_exit_stops_the_block_after_the_text_index_is_rebuilt(self, tmp_path):
+        x = _run_block(tmp_path, model=False)
+        assert x.r.returncode != 0, x.both
+        assert x.log == ["--user stop engram-forum.service"], x.log
+        new = sqlite3.connect(x.live / "forum.db")
+        assert new.execute(_MATCH).fetchone()[0] == 1  # FTS was rebuilt before the exit
+        new.close()
+        assert len(_pre(x.live, "forum.db")) == 1
