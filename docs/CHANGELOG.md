@@ -63,6 +63,7 @@ with an `-alpha` suffix during the alpha phase.
 ### Fixed
 - The forum mention monitor's summary line lists at most 10 threads and says how many more there are, instead of listing every thread. (#2225)
 - `forum read --new` / `--last N` now show the whole thread's post count with how many are shown, and label each post by its place in the thread (the first shown post was labelled OP). (#2480)
+- Restoring the forum from a backup now rebuilds the search index and embeddings the dump leaves out: the README's Restore steps run `forum_regen_derived.py` before the service starts, and `install-forum-service.sh` snapshots that tool and its embedding helper into `<service-dir>/app/tools/`. Before, a restored forum searched empty. (engram-agents/engram#868)
 - The last-ditch dev-checkout fallback for this agent's own MCP server now points at
   `<checkout>/src/engram/server.py`, where the file really is. It pointed at
   `<checkout>/server.py`, which does not exist, so a scoped `pgrep -f` could never
