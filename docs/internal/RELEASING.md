@@ -248,11 +248,14 @@ would refuse the push in step 7 if it were the only one. This check is gate
 G1.
 
 **If the check is red, stop.** Read which cells failed and bring them to the
-maintainer with their cause. Whether a red that is confined to a test already
-filed as flaky may be answered by rerunning the failed job is the maintainer's
-decision for that release, recorded on the pull request before any rerun.
-(The suite's memory use on the hosted runner, and the plan that keeps it from
-blocking a release, are tracked in #4655.)
+maintainer with their cause. One exception, the maintainer's ruling of
+2026-11-14 on #4655: if the red is confined to a test already filed as
+unreliable under load, the release seat may rerun that one failed job once.
+Before the rerun starts, record on the release pull request that it is a rerun
+and the filed issue it rests on. The rerun is not repeated: if it is red, or
+if any other cell is red, the release stops and goes to the maintainer with its
+cause. (The suite's memory use on the hosted runner, and the plan that keeps it
+from blocking a release, are tracked in #4655.)
 
 ### 7. Fast-forward `main` to the release commit
 
