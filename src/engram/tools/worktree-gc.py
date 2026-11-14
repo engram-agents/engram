@@ -17,6 +17,13 @@ This tool classifies each worktree and removes the safely-finished ones:
           branch, tag, remote-tracking or other), so removing the worktree
           loses no commit
   PRUNE   `worktree-agent-*` / `review-*` tmp-branch worktree, clean
+  KEEP    a worktree the deploy record names (`deployed_from` in
+          `<ENGRAM_HOME>/.deployed-version`): the upgrade flow's source tree,
+          load-bearing though it looks like a leftover (#4157); checked before
+          any prune of an existing worktree. EVERY `deployed_from` value is
+          protected: the readers of the record do not agree when it has several
+          lines (flows.py keeps the last value; cli.py keeps the last one that
+          names an existing directory, and does not accept spaces around the key)
   KEEP    branch worktree whose PR is OPEN (active work)
   KEEP    branch worktree with NO PR (pre-PR or abandoned — flagged for a human)
   SKIP    an AGENT-OWNED worktree (branch `worktree-agent-*` / `review-*`, or any
@@ -73,6 +80,16 @@ import sys
 import time
 from pathlib import Path
 
+# The ONE ENGRAM-home resolver for tools lives in tools/_owner_read.py (#3863);
+# resolve the package root through the symlink so `from tools import ...` works
+# run as a script, loaded by path, or from the flattened plugin layout (same
+# shim as deference_baseline.py).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+
+from tools import _owner_read as owner_read  # noqa: E402
+
 # #2808: an agent-owned worktree younger than this is never pruned. The /proc
 # in-use scan cannot see a running fairy (it is not a process holding a CWD).
 AGE_GUARD_SECONDS = 6 * 3600
@@ -127,6 +144,34 @@ def _is_clean(path: str) -> bool:
     # Untracked-only is still "has stuff" — but fairy worktrees commit their work,
     # so any porcelain output (tracked or untracked) means don't auto-remove.
     return rc == 0 and out.strip() == ""
+
+
+def _deploy_sources() -> frozenset[str]:
+    """The realpaths of EVERY directory `<ENGRAM_HOME>/.deployed-version` names
+    as `deployed_from`; empty when the record cannot be read (#4157).
+
+    The upgrade flow uses a `deployed_from` directory as the SOURCE_DIR of the
+    next upgrade, so a worktree there is load-bearing even though it looks like
+    a prunable leftover. The record's readers do not agree when it carries
+    several lines (flows.py keeps the last value; cli.py keeps the last one that
+    names an existing directory, and does not accept spaces around the key), so
+    every value is protected: that is right whichever reader runs.
+    Fails open to the empty set (today's classification) on a missing,
+    unreadable or malformed record, an empty value, or an unresolvable home.
+    """
+    found: set[str] = set()
+    try:
+        record = owner_read.engram_home() / ".deployed-version"
+        with open(record, encoding="utf-8") as f:
+            for line in f:
+                # Same rule as the readers it must agree with: flows.py
+                # `_read_deployed_version` and the upgrade flow in cli.py.
+                key, sep, value = line.strip().partition("=")
+                if sep and key.strip() == "deployed_from" and value.strip():
+                    found.add(os.path.realpath(value.strip()))
+    except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
+        return frozenset()
+    return frozenset(found)
 
 
 def _is_in_use(path: str) -> bool:
@@ -338,6 +383,12 @@ def classify(t: dict, root: str, *, main_path: str | None = None,
     path = t["path"]
     if not Path(path).exists():
         return "PRUNE", "worktree directory missing (stale admin record)"
+    # Deploy source (#4157): before any prune of an existing worktree (a missing
+    # directory above is still PRUNEd: only its admin record goes). The upgrade
+    # flow reads `deployed_from` and uses that directory as the next upgrade's
+    # source tree; its readers do not agree on several lines, so all are protected.
+    if os.path.realpath(path) in _deploy_sources():
+        return "KEEP", "deploy source — the deploy record's deployed_from; the next upgrade needs it"
     if not _is_clean(path):
         return "SKIP", "DIRTY — uncommitted changes; not removing"
     branch = t.get("branch")

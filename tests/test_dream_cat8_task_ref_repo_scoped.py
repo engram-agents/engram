@@ -1,16 +1,18 @@
 """Dream-fairy Category 8 (open tasks with stale external references) and the
 two dream-master passages that act on its findings must resolve PR/issue
-references against the repo they belong to, never the cwd checkout
-(alpha#3427; same class as alpha#3188 / #3418).
+references against the repo they belong to, never the cwd checkout.
 
 A bare `#N` has no repo: `gh pr view N` silently resolves it against whichever
 repo is the current checkout, so a same-numbered PR in the WRONG repo can read
 as MERGED/CLOSED and a live task gets proposed for closure.
 
-The fix: extraction matches only `owner/repo#N`, every gh call passes
-`--repo` taken from the reference, a bare `#N` is structurally unmatched, and a
-gh error is UNKNOWN. These tests read the extraction regex and the bash block
-out of the fairy spec (single source of truth) and execute them.
+The fix: extraction matches `owner/repo#N` and bare-repo aliases declared by the
+SEAT in `${ENGRAM_HOME:-$HOME/.engram}/repo-aliases`. The map ships empty, so an
+install that declares nothing keeps today's qualified-refs-only behaviour; every
+gh call passes `--repo` taken from the resolved reference; a bare `#N` and any
+alias the file does not declare are structurally unmatched; a gh error is
+UNKNOWN. These tests read the bash block out of the fairy spec (single source of
+truth) and execute it against a temporary ENGRAM_HOME.
 """
 from __future__ import annotations
 
@@ -52,12 +54,23 @@ def _cat8_all() -> str:
     return "\n".join(parts)
 
 
-def _refs(text: str) -> list[str]:
-    """Run the extraction pattern like `grep -o` + the sed boundary strip."""
-    return [m.group(0)[len(m.group(1)):] for m in _pattern().finditer(text)]
+def _stage1_refs(text: str) -> list[str]:
+    """Stage 1's match stream: already-qualified `owner/repo#N`, sed-stripped.
+
+    BOUND: stage 2's alias alternation is built at runtime from the seat's
+    `repo-aliases` file, not from a literal in the block, so alias resolution is
+    asserted end-to-end through `_run_cat8` rather than modelled here."""
+    out: set[str] = set()
+    for m in _pattern().finditer(text):
+        tok = m.group(0)
+        if tok[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-":
+            tok = tok[1:]  # `sed -E 's/^[^A-Za-z0-9_.-]//'`
+        out.add(tok)
+    return sorted(out)
 
 
 def _pattern() -> re.Pattern[str]:
+    """Stage 1: already-qualified `owner/repo#N`."""
     m = re.search(r"grep -oE '([^']+)'", _cat8())
     assert m, "Category 8 grep -oE pattern not found -- bash block reshaped?"
     return re.compile(m.group(1))
@@ -71,32 +84,32 @@ def _bash_block() -> str:
 
 def test_pattern_matches_owner_repo_hash_n_with_captures():
     p = _pattern()
-    refs = _refs("blocked on example-org/repo-a#12 landing")
+    refs = _stage1_refs("blocked on example-org/repo-a#12 landing")
     assert refs == ["example-org/repo-a#12"]
     repo, n = refs[0].rsplit("#", 1)
     assert (repo, n) == ("example-org/repo-a", "12")
-    assert _refs("example-org/repo-a#12 at line start") == ["example-org/repo-a#12"]
-    assert _refs("see example-org/repo-a#5") == ["example-org/repo-a#5"]
+    assert _stage1_refs("example-org/repo-a#12 at line start") == ["example-org/repo-a#12"]
+    assert _stage1_refs("see example-org/repo-a#5") == ["example-org/repo-a#5"]
 
 
 def test_left_boundary_rejects_longer_path():
     # a/b/c#5 must not be mis-read as b/c#5
-    assert _refs("path a/b/c#5 here") == []
-    assert _refs("x.y/z/w#5") == []
+    assert _stage1_refs("path a/b/c#5 here") == []
+    assert _stage1_refs("x.y/z/w#5") == []
 
 
 @pytest.mark.parametrize("text", [
     "#12", "PR #12", "closes #12", "issue #12", "pull request #12",
     "Closes #12 and fixes #13", "seq 7183", "forum post 7183",
-    "alpha#2400",  # bare repo shorthand: no owner/
+    "alpha#2400",  # not a map key: the map is closed, so this stays unmatched
 ])
 def test_pattern_does_not_match_bare_or_other_namespace(text):
-    assert not _refs(text), f"pattern matched {text!r}"
+    assert not _stage1_refs(text), f"pattern matched {text!r}"
 
 
 def test_mixed_claim_extracts_only_qualified():
     prose = "tk: example-org/repo-a#12 is open; PR #12 elsewhere; closes #99; seq 7183"
-    assert _refs(prose) == ["example-org/repo-a#12"]
+    assert _stage1_refs(prose) == ["example-org/repo-a#12"]
 
 
 def test_old_bare_pattern_is_gone():
@@ -204,11 +217,65 @@ _EXPECTED = sorted([
 
 
 def test_bash_block_executes_repo_scoped(tmp_path):
+    lines, calls = _run_cat8(tmp_path, _CLAIM)
+    assert sorted(lines) == _EXPECTED, lines
+    assert "WRONGREPO" not in "\n".join(lines)
+    assert "example-org/repo-a#7 pr CLOSED" in lines
+    assert not any(line.startswith("b/c#5") for line in lines)
+    assert calls, "stub gh never called"
+    for call in calls:
+        argv = call.split()
+        assert "--repo" in argv, f"gh call without --repo: {call!r}"
+        assert re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", argv[argv.index("--repo") + 1]
+        ), call
+
+
+# --- the seat's declared repo map: a closed vocabulary, resolved before reporting
+#
+# The two stages run from one `IN=$(cat)` so both see the whole claim; stage 2
+# runs only when at least one alias is declared, and rewrites each declared
+# alias to its full owner/repo inside the stage, so the final `sort -u` dedupes
+# after the rewrite. Alias resolution is asserted end-to-end through
+# `_run_cat8`, which always points ENGRAM_HOME at a temp dir.
+
+_ALIAS_A = ("alias-a", "example-org/repo-a")
+_ALIAS_B = ("alias-b", "example-org/repo-b")
+_MAP_AB = [_ALIAS_A, _ALIAS_B]
+
+
+def _write_map(home: pathlib.Path, aliases) -> None:
+    """Materialise the seat's ENGRAM_HOME.
+
+    `aliases` is None (no `repo-aliases` file at all), a string (written to the
+    file verbatim, for comment-only / malformed cases), or an iterable of
+    (key, value) pairs rendered as `key=value` lines.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    if aliases is None:
+        return
+    if isinstance(aliases, str):
+        content = aliases
+    else:
+        content = "".join(f"{k}={v}\n" for k, v in aliases)
+    (home / "repo-aliases").write_text(content, encoding="utf-8")
+
+
+def _run_cat8(tmp_path, claim: str, aliases=None, block=None, env_extra=None):
+    """Run the fairy's bash block under the stub gh, against a temporary seat.
+
+    ENGRAM_HOME always points at the temp dir, so the cell never reads the
+    running seat's own map (this repo's test host sets ENGRAM_HOME globally).
+    `block` overrides the extracted block (the belt-removed probe uses this);
+    `env_extra` adds environment variables (e.g. a locale) for one run.
+    """
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash unavailable")
+    home = tmp_path / "home"
+    _write_map(home, aliases)
     script = tmp_path / "cat8.sh"
-    script.write_text(_bash_block(), encoding="utf-8")
+    script.write_text(_bash_block() if block is None else block, encoding="utf-8")
     bindir = tmp_path / "bin"
     bindir.mkdir()
     gh = bindir / "gh"
@@ -219,23 +286,348 @@ def test_bash_block_executes_repo_scoped(tmp_path):
     env = dict(os.environ)
     env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
     env["GH_ARGV_LOG"] = str(log)
+    env["ENGRAM_HOME"] = str(home)
+    env.update(env_extra or {})
     proc = subprocess.run(
-        [bash, str(script)], cwd=tmp_path, env=env, input=_CLAIM,
+        [bash, str(script)], cwd=tmp_path, env=env, input=claim,
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, proc.stderr
-    assert sorted(proc.stdout.splitlines()) == _EXPECTED, proc.stdout
-    assert "WRONGREPO" not in proc.stdout
-    assert "example-org/repo-a#7 pr CLOSED" in proc.stdout.splitlines()
-    assert not any(l.startswith("b/c#5") for l in proc.stdout.splitlines())
-    calls = log.read_text(encoding="utf-8").splitlines()
-    assert calls, "stub gh never called"
-    for call in calls:
-        argv = call.split()
-        assert "--repo" in argv, f"gh call without --repo: {call!r}"
-        assert re.fullmatch(
-            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", argv[argv.index("--repo") + 1]
-        ), call
-    # bare numbers never reached gh as a bare-number call
-    assert not any(c.split()[:3] in (["pr", "view", "12"],) and "--repo" not in c
-                   for c in calls)
+    return proc.stdout.splitlines(), log.read_text(encoding="utf-8").splitlines()
+
+
+def _repos(calls: list[str]) -> list[str]:
+    return [c.split()[c.split().index("--repo") + 1] for c in calls]
+
+
+def test_empty_map_leaves_a_bare_hash_n_unmatched(tmp_path):
+    """Cell 1 — THE TRAP CELL. An empty alternation is not an empty match:
+    `() ?#[0-9]+` would resolve a bare `#N`. With no repo-aliases file, stage 2
+    must not run at all, so `see #1069` yields no ref and no gh call."""
+    lines, calls = _run_cat8(tmp_path, "see #1069", None)
+    assert lines == [] and calls == [], (lines, calls)
+
+
+def test_empty_map_file_behaves_like_no_file(tmp_path):
+    """Cell 2 — a file present but with zero lines declares no aliases."""
+    lines, calls = _run_cat8(tmp_path, "see #1069", "")
+    assert lines == [] and calls == [], (lines, calls)
+
+
+def test_declared_alias_resolves_to_full_ref(tmp_path):
+    """Cell 3 — a declared alias resolves end to end, with the right --repo."""
+    lines, calls = _run_cat8(tmp_path, "blocked on alias-a#12 landing", [_ALIAS_A])
+    assert lines == ["example-org/repo-a#12 pr MERGED"], lines
+    assert _repos(calls) == ["example-org/repo-a"], calls
+
+
+def test_declared_alias_with_optional_space_resolves_to_full_ref(tmp_path):
+    """Cell 4 — one optional space between a declared alias and `#N` resolves."""
+    lines, calls = _run_cat8(tmp_path, "see alias-a #7 for context", [_ALIAS_A])
+    assert lines == ["example-org/repo-a#7 pr CLOSED"], lines
+    assert _repos(calls) == ["example-org/repo-a"], calls
+
+
+def test_undeclared_alias_resolves_to_nothing_with_populated_map(tmp_path):
+    """Cell 5 — the closed-vocabulary cell. The map is NON-EMPTY, so stage 2
+    runs; the unlisted key still resolves to nothing. (Against an empty map this
+    cell would pass for the wrong reason and test nothing.)"""
+    assert _stage1_refs("blocked on alias-z#12 landing") == []
+    lines, calls = _run_cat8(
+        tmp_path, "blocked on alias-z#12 landing", _MAP_AB)
+    assert lines == [] and calls == [], (lines, calls)
+
+
+@pytest.mark.parametrize("bad_line", [
+    "bad=repo",       # single segment
+    "bad=a/b/c",      # three segments
+    "bad=",           # empty value
+    "bad=a/b c",      # bad character in a segment
+    "bad a=x/y",      # bad character in the key
+])
+def test_malformed_declaration_is_ignored(tmp_path, bad_line):
+    """Cell 6 — a malformed line is ignored: that key is undeclared. Each file
+    also declares a valid alias, so stage 2 is demonstrably running and the
+    assertion is not passing on an empty map."""
+    lines, calls = _run_cat8(
+        tmp_path,
+        "bad#12 and alias-a#12",
+        f"{bad_line}\nalias-a=example-org/repo-a\n",
+    )
+    assert lines == ["example-org/repo-a#12 pr MERGED"], lines
+    assert _repos(calls) == ["example-org/repo-a"], calls
+
+
+def test_comment_and_blank_lines_declare_no_aliases(tmp_path):
+    """Cell 7 — a file whose only lines are comments/blank declares nothing.
+
+    The commented-out declaration is the discriminating part: treating a `#`
+    line as a declaration (rather than skipping it) would activate it."""
+    content = (
+        "# a comment\n\n   \n# another comment\n"
+        "#alias-a=example-org/repo-a\n"
+    )
+    lines, calls = _run_cat8(tmp_path, "alias-a#12 and alias-a #7", content)
+    assert lines == [] and calls == [], (lines, calls)
+
+
+# --- the non-ASCII key: the path the fail-closed belt exists for -------------
+#
+# On stock macOS bash 3.2.57 under a UTF-8 locale the key check does NOT reject
+# a non-ASCII key (locale collation), so `é=example-org/repo-a` is "declared";
+# stage 2 matches `é #5`, `sed -E 's/^[^A-Za-z0-9_.-]//'` strips the key's own
+# first character as if it were the boundary, the lookup is empty, and only
+# `[ -n "$full" ] || continue` keeps the bare `#5` away from
+# `gh pr view 5 --repo ""` (which `gh` resolves against the checkout). Bash 5.x
+# and bash 3.2 in the C locale reject the key, so there the alias never exists
+# and the behavioural half of the cell cannot discriminate.
+
+_BELT_RE = re.compile(r'^[ \t]*\[ -n "\$full" \] \|\| continue\n', re.MULTILINE)
+_NON_ASCII_KEY = "é"
+
+
+def _belt_removed(block: str) -> str:
+    """The block with its fail-closed belt removed (no-op if already absent).
+
+    Used only as the new cell's skip gate: if even the belt-less block emits
+    nothing for the fixture, this bash/locale rejected the key and the cell
+    cannot discriminate here."""
+    return _BELT_RE.sub("", block, count=1)
+
+
+def _utf8_locale() -> str | None:
+    """The first installed UTF-8 locale, or None. Availability is a host fact."""
+    try:
+        out = subprocess.run(
+            ["locale", "-a"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    available = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    for cand in ("en_US.UTF-8", "en_US.utf8", "C.utf8", "C.UTF-8"):
+        if cand in available:
+            return cand
+    for name in sorted(available):
+        if re.search(r"\.utf-?8$", name, re.IGNORECASE):
+            return name
+    return None
+
+
+def _bash_version() -> str:
+    bash = shutil.which("bash")
+    if bash is None:
+        return "bash unavailable"
+    try:
+        out = subprocess.run(
+            [bash, "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "bash version unknown"
+    return out.stdout.splitlines()[0] if out.stdout else "bash version unknown"
+
+
+def test_non_ascii_alias_key_never_becomes_a_bare_ref(tmp_path):
+    """Cell 11 — the non-ASCII alias key, the path the fail-closed belt covers.
+
+    Fixture: a `repo-aliases` file declaring only `é=example-org/repo-a`, and a
+    claim `é #5`. On stock macOS bash 3.2.57 under a UTF-8 locale the key check
+    accepts `é` (locale collation), so the alias is added; stage 2 matches,
+    `sed` strips the key's own first character, the lookup is empty, and the
+    belt drops the bare `#5` instead of running `gh pr view 5 --repo ""`.
+
+    WHAT THIS PROVES ON EVERY HOST: the belt line is present in the shipped
+    block (the assertion before the skip). Removing it therefore reddens this
+    cell even where the key check rejects the key (mutation M5).
+
+    WHAT IT PROVES ONLY WHERE THE KEY IS ACCEPTED: that the fixture produces no
+    output line and no gh call. Acceptance depends on bash version and locale —
+    bash 5.x and bash 3.2 in the C locale reject the key. The gate is a probe of
+    this same block with the belt removed: if even that emits nothing, the
+    acceptance did not reproduce here, so the cell SKIPS (naming the bash
+    version and locale) rather than passing vacuously. It runs on stock bash 3.2
+    under a UTF-8 locale, i.e. the macOS seat.
+    """
+    block = _bash_block()
+    assert _BELT_RE.search(block), (
+        'the fail-closed belt `[ -n "$full" ] || continue` is missing from '
+        "Category 8 stage 2; an empty alias lookup would emit a bare `#N`")
+    locale_name = _utf8_locale()
+    env_extra = {"LC_ALL": locale_name} if locale_name else {}
+    map_body = f"{_NON_ASCII_KEY}=example-org/repo-a\n"
+    fixture = f"{_NON_ASCII_KEY} #5"
+    probe_lines, probe_calls = _run_cat8(
+        tmp_path / "probe", fixture, map_body,
+        block=_belt_removed(block), env_extra=env_extra)
+    if not probe_lines and not probe_calls:
+        pytest.skip(
+            "non-ASCII alias key not accepted by this bash "
+            f"({_bash_version()}) under {locale_name or 'the ambient locale'}: "
+            "the alias is never declared, the belt has nothing to drop, and the "
+            "behavioural half of this cell cannot discriminate here. It runs on "
+            "stock bash 3.2 under a UTF-8 locale (the macOS seat).")
+    lines, calls = _run_cat8(
+        tmp_path, fixture, map_body, env_extra=env_extra)
+    assert lines == [], f"non-ASCII alias key produced a reference: {lines!r}"
+    assert calls == [], f"non-ASCII alias key reached gh: {calls!r}"
+
+
+@pytest.mark.parametrize("aliases", [None, _MAP_AB])
+def test_qualified_refs_pass_through_with_and_without_map(tmp_path, aliases):
+    """Cell 8 — a qualified `owner/repo#N` is unchanged whether or not the
+    seat's file exists."""
+    lines, calls = _run_cat8(
+        tmp_path,
+        "see example-org/repo-a#12 and example-org/repo-b#40",
+        aliases,
+    )
+    assert lines == [
+        "example-org/repo-a#12 pr MERGED",
+        "example-org/repo-b#40 issue CLOSED",
+    ], lines
+    assert set(_repos(calls)) == {"example-org/repo-a", "example-org/repo-b"}, calls
+
+
+def test_alias_word_in_non_reference_prose_resolves(tmp_path):
+    """Cell 9 — the STATED COST of the optional-space rule, pinned not fixed.
+
+    A declared alias word followed by a space and a number reads as a reference
+    even in prose. Keeping that behaviour is deliberate; the closed map (only
+    seat-declared keys) is what bounds the false-positive surface."""
+    lines, calls = _run_cat8(tmp_path, "the alias-a #1 priority", [_ALIAS_A])
+    assert lines == ["example-org/repo-a#1 - UNKNOWN"], lines
+    assert _repos(calls) == ["example-org/repo-a", "example-org/repo-a"], calls
+
+
+@pytest.mark.parametrize("text", ["issue #12", "the #5", "PR #12"])
+def test_whitespace_between_token_and_hash_is_never_a_ref(text):
+    # standing guard: stage 1 never tolerates whitespace before the `#`
+    assert _stage1_refs(text) == [], f"stage 1 matched {text!r}"
+
+
+def test_whitespace_guard_runs_end_to_end(tmp_path):
+    lines, calls = _run_cat8(tmp_path, "issue #12; the #5; PR #12", _MAP_AB)
+    assert lines == [] and calls == [], (lines, calls)
+
+
+def test_qualified_ref_is_not_double_counted(tmp_path):
+    assert _stage1_refs("see example-org/repo-a#12") == ["example-org/repo-a#12"]
+    lines, calls = _run_cat8(
+        tmp_path, "see example-org/repo-a#12", _MAP_AB)
+    assert lines == ["example-org/repo-a#12 pr MERGED"], lines
+    assert _repos(calls) == ["example-org/repo-a"], calls
+
+
+def test_two_segment_path_is_qualified_and_not_rewritten(tmp_path):
+    # owner `a`, repo `alias-a`: stage 1 matches it; stage 2's left boundary
+    # excludes `/`, so the alias tail is NOT rewritten to a declared repo
+    assert _stage1_refs("a/alias-a#5") == ["a/alias-a#5"]
+    lines, calls = _run_cat8(tmp_path, "a/alias-a#5", _MAP_AB)
+    assert lines == ["a/alias-a#5 - UNKNOWN"], lines
+    assert set(_repos(calls)) == {"a/alias-a"}, calls
+    assert not any("example-org/repo-a#5" in line for line in lines)
+
+
+def test_alias_left_boundary_rejects_hyphen_prefix(tmp_path):
+    assert _stage1_refs("x-alias-a#5") == []
+    lines, calls = _run_cat8(tmp_path, "x-alias-a#5", _MAP_AB)
+    assert lines == [] and calls == [], (lines, calls)
+
+
+def test_alias_and_qualified_forms_of_one_artifact_dedupe(tmp_path):
+    # both stages describe the same artifact; the rewrite happens before the
+    # merge, so `sort -u` collapses them to one checked ref
+    lines, calls = _run_cat8(
+        tmp_path, "see alias-a#12 and example-org/repo-a#12", _MAP_AB
+    )
+    assert lines == ["example-org/repo-a#12 pr MERGED"], lines
+    assert _repos(calls) == ["example-org/repo-a"], calls
+
+
+# Constructs bash 3.2 lacks. NOT exhaustive -- bash has more 4.x-only syntax
+# than one list can hold -- so the cell's claim is "none of THESE appear", which
+# is why the docstring says so rather than "the block is bash-4-free".
+_BASH4_ONLY = (
+    # 4.0
+    "declare -A", "local -A", "declare -g", "mapfile", "readarray", "|&", "&>>",
+    # 4.2
+    "[[ -v ",
+    # 4.3
+    "local -n", "declare -n", ";;&",
+    # 4.4 / 4.0 case-modification and case-conversion operators
+    "@Q}", ",,}", "^^}", "^}", ",}",
+)
+
+
+def test_cat8_bash_block_has_no_bash4_only_constructs():
+    """The block must run under stock macOS bash 3.2: an unsupported
+    declaration does not abort the script, it leaves the map unset and the
+    stage emits NOTHING with exit 0 -- the silent under-reporting this
+    category exists to prevent. Checks executable lines only, so a comment
+    naming a construct cannot satisfy or trip the cell.
+
+    BOUND, stated because the list cannot be exhaustive: this proves the block
+    contains none of _BASH4_ONLY's entries. It is a construct inventory, not a
+    3.2 run -- the acceptance evidence for the platform is a Mac seat's own
+    /bin/bash, which has been run once (bash 3.2.57, macOS 27.0.1, 2026-11-14)
+    and is not reproduced here."""
+    block = _bash_block()  # asserts the block exists; fails loudly if reshaped
+    executable = "\n".join(
+        line for line in block.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert executable.strip(), "no executable lines in the Category 8 bash block"
+    for construct in _BASH4_ONLY:
+        assert construct not in executable, (
+            f"bash-4-only construct {construct!r} in the Category 8 block; "
+            f"stock macOS ships bash 3.2")
+
+
+def test_block_has_no_hardcoded_alias_map():
+    """The map moved to the seat's file. A hardcoded alias table in the shipped
+    block would re-introduce one organisation's repository names; this is the
+    structural counterpart to the no-org-name cell below."""
+    block = _bash_block()
+    executable = "\n".join(
+        line for line in block.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "repo-aliases" in executable, "the block does not read the seat map"
+    assert 'case "$1" in' not in executable, "a repo_for case table is hardcoded"
+    assert not re.search(
+        r"^\s*[A-Za-z0-9_-]+\)\s*echo\s+\S+/\S+", executable, re.MULTILINE
+    ), "a literal `key) echo owner/repo` arm is a hardcoded alias map"
+
+
+# Repository-reference forms that must never ship in the fairy spec. The bare
+# word `engram` is deliberately NOT here: it is the PRODUCT name and legitimately
+# appears throughout the file (the fairy's own name, ~/.engram, ENGRAM_HOME,
+# `engram_*` MCP tools). What must not ship is any org/repo identity.
+_BANNED_ORG_REFS = ("engram-agents", "engram-alpha", "umwelt")
+
+
+def test_no_org_or_repo_name_in_shipped_fairy():
+    """Cell 10 — the shipped spec carries no organisation or repository name.
+
+    Uses Python `in`, not `grep`: in this environment `grep` is a shell function
+    wrapping ugrep with `-E` alternation inert, so a `grep -E` cell can answer
+    the wrong question while exiting plausibly.
+
+    The positive control proves the matcher is not vacuous: it must catch each
+    banned form in a literal that contains them."""
+    assert _BANNED_ORG_REFS, "banned-name list is empty -- the cell would test nothing"
+    probe = "see engram-agents/engram-alpha#5 and umwelt#9"
+    caught = [name for name in _BANNED_ORG_REFS if name in probe]
+    assert caught == list(_BANNED_ORG_REFS), (
+        f"matcher is vacuous: only caught {caught!r}")
+    text = FAIRY_MD.read_text(encoding="utf-8")
+    hits = [name for name in _BANNED_ORG_REFS if name in text]
+    assert not hits, f"organisation/repo name(s) still shipped: {hits}"
+
+
+def test_report_cat8_finding_carries_full_qualified_ref():
+    text = FAIRY_MD.read_text(encoding="utf-8")
+    s = text.index("## Category 8")
+    nxt = text.find("\n## ", s + 1)
+    sec = text[s:nxt if nxt != -1 else len(text)]
+    assert "claim references owner/repo#N" in sec
+    assert "external reference owner/repo#N <state>" in sec
+    assert "always repo-qualified" in sec
+    assert "resolved to its full `owner/repo` before the finding is written" in sec

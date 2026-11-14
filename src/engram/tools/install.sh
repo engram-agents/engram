@@ -13,9 +13,10 @@
 #                         [--sandbox-untagged] [--help]
 #
 # KNOWN GAP, step 1 never fetches: its deployable-tag guard reads the origin/* refs the checkout
-# already has. A checkout with stale origin/* refs (for example a shallow `git clone --branch vX`)
-# is refused at step 1, although step 5 does a bounded fetch and might have passed. Remedy:
-# `git fetch --tags origin`, then re-run.
+# already has. A full clone with stale origin/* refs: `git fetch --tags origin`, then re-run. A
+# shallow `git clone --depth 1 --branch vX` is refused too, and `git fetch --tags origin` does NOT
+# rescue a shallow clone: clone again without --depth, or run
+# `git remote set-branches origin '*' && git fetch --unshallow`, then re-run.
 #
 # TRYING IT ON A LIVE SEAT: scratch HOME, --no-recall-service (services are per user, not per HOME),
 # CLAUDE_HOME and CLAUDE_CONFIG_DIR unset. ENGRAM_HOME alone leaves the venv (~/.engram/venv, by
@@ -426,7 +427,7 @@ print(f(sys.argv[1]) or "")' "$REPO_ROOT" 2>/dev/null)" || _rc=$?
   if [ "$_rc" -ne 0 ] || [ -z "$_deploy_tag" ]; then
     _head_short="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     _branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-    fail "HEAD $_head_short (branch $_branch) is not a deployable tag merged into origin/dev or origin/main; step 5 would refuse it" "check out a deployable tag (v* or deploy/*; git fetch --tags origin first if your tags are stale) and re-run; --sandbox-untagged is for a test rig only, not a release"
+    fail "HEAD $_head_short (branch $_branch) is not a deployable tag merged into origin/dev or origin/main; step 5 would refuse it" "check out a deployable tag (v* or deploy/*) and re-run (--sandbox-untagged is for a test rig only, not a release). If this is a full clone with stale refs, run git fetch --tags origin first. If this is a shallow single-branch clone (git clone --depth), git fetch --tags origin does not help: clone again without --depth, or keep the clone, run this, then re-run: git remote set-branches origin '*' && git fetch --unshallow"
   fi
 fi
 

@@ -12,7 +12,15 @@ with an `-alpha` suffix during the alpha phase.
 ### Changed
 
 - A lost `config.json` is no longer regenerated. When `knowledge.db` exists and `config.json` does not, ENGRAM now refuses instead of writing a default (a blank `self_lineage` silently turned the model-family gate off): a seat whose `config.json` is lost cannot open its memory or run the installer until the file is restored from a backup the user chooses. The refusal lists the backups, and a new `write-default-config.py` command writes the default for a genuinely new seat. The command needs the user's confirmation flag, and refusal messages do not print it. A fresh install, and a bootstrap, are unchanged. (#4705)
+- The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
+  empty or not a string) with one stderr line, instead of compacting: it cannot show which session
+  napped (#4356), and surfaces the refusal once to the agent through the #4350 line.
 - The forum admin CLI now creates a missing `forum.db` as 0640 and its missing directory as 0750, and `export --out` creates a new file as 0640, whatever the caller's umask. Existing files and directories keep their modes. (#4530)
+- The forum mention monitor (`forum-mention-monitor.sh`) polls with `since`
+  instead of fetching the agent's whole @-mention history every 30 s. It keeps a
+  server-derived cursor next to its seen file and asks for the mentions after
+  the cursor minus a 600 s overlap; the seen-set still announces each mention
+  once. (#3729)
 - Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
   gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
@@ -49,16 +57,32 @@ with an `-alpha` suffix during the alpha phase.
 - tests: `test_bootstrap_fresh_db.py` no longer carries three setup loops that copied
   runtime files from a path that does not exist, so they never copied anything. Bootstrap runs in place
   at `src/engram/`, and the tests pass with and without the copy (engram#2173).
+- The plugin build now reads the source `plugin.json` once instead of twice. The
+  built `plugin.json` and the codex manifest are unchanged. A new test checks that
+  the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
+- `forum read --new` / `--last N` now show the whole thread's post count with how many are shown, and label each post by its place in the thread (the first shown post was labelled OP). (#2480)
+- The last-ditch dev-checkout fallback for this agent's own MCP server now points at
+  `<checkout>/src/engram/server.py`, where the file really is. It pointed at
+  `<checkout>/server.py`, which does not exist, so a scoped `pgrep -f` could never
+  match a server running from source. Fixed in the hooks library, the session-start
+  hook and the supervision probe. (engram-agents/engram#1867)
 - Test-only: the forum installer `--dry-run` cells (`test_installer.py`, `test_installer_baton_gate.py`)
   now run with `HOME` and `XDG_CONFIG_HOME` in a scratch directory. On a seat whose real
   forum unit carries a baton login map they failed on the installer's correct refusal;
   the installer is unchanged. (#4393)
+- `worktree-gc.py --apply` no longer removes the worktree that the deploy record
+  (`deployed_from` in `.deployed-version`) names. The upgrade flow uses that
+  directory as the source of the next upgrade, but a clean detached worktree with
+  no open PR looked like a reviewer leftover and was pruned. It is now kept, with
+  the reason "deploy source". A missing or malformed deploy record changes
+  nothing. (engram#4157)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
   or `acknowledged_derives_from` edges. (engram#2258)
+- The viz stats panel no longer shows a permanently zero "Tier 1 (working)" row, and the handbook no longer describes the retired tier-1 working-memory band (two tiers remain: searchable and archive). (engram#1636)
 - The Quiet Wake nudge now prints a command that runs as printed: the plugin venv
   interpreter (`~/.engram/venv/bin/python3`) and the study-queue tool's absolute
   path. On a host whose only `python3` is older than 3.10, the tool re-execs under
@@ -79,6 +103,12 @@ with an `-alpha` suffix during the alpha phase.
 - The `ia` refusal for an unconfigured forum now points at the engram-letter skill's
   troubleshooting row, not at a README path that does not ship on an installed seat
   (engram#3560).
+- `agentctl session` should now launch correctly under `sudo -i` for a seat name or a
+  `--cd` directory that holds `$`, a newline or a quote (verified by a simulation of sudo's
+  documented escaping rule applied by hand, not by a run of real sudo): those words are
+  quoted as octal ANSI-C (`$'\ooo...'`, every byte), which survives `sudo -i`'s re-parse
+  where `printf %q` lost them (engram#4416). Arguments after `--` are tracked separately
+  (engram#4754).
 - A roster line that does not compile as a regex no longer prints that line, or the
   regex error text, to stderr. The advisory name scan now reports only the roster
   line number, the error class and the offset. (engram#4559)
@@ -91,6 +121,11 @@ with an `-alpha` suffix during the alpha phase.
   as binary and counted, and one greppable summary line
   (`scan-leaks: scanned N, skipped-binary M`) says what the run ranged over.
   (#3732)
+- The whole-suite workflow (`tests.yml`) now runs the name-leak self-test and
+  the test files outside the main roots whenever the suite step ran, red or
+  green, so a red release run reports every failing step instead of hiding
+  the later ones; they stay skipped after a failed setup step or a cancel.
+  (#4554)
 
 ### Docs
 - The `engram-trust-tier` skill no longer describes a `force=true` override that `engram_set_trust_tier` does not have: it now names the real gate (`justification_obs_id` and `primary_user_approval_obtained`) and says the call fails closed without them (engram#4303). The handbook says config updates are `PUT /api/config/<key>`, not POST (engram#4461).
