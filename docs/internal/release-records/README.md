@@ -26,7 +26,7 @@ The first reference, made after the fact for v0.5.6 (`f2234796`), the release be
 
 ## `v0.5.7-skips.json`
 
-The skip set of the gate seat's G2 whole run on v0.5.7-rc2 (`96085799`, 2026-11-13; fresh public clone, five shards, the `tests.yml` knobs, Linux, Python 3.12): 38,817 ids, 38,341 passed, 476 skipped, 0 failed, reasons from a re-run of those ids at the same commit. The release commit `47328707` differs from rc2 only in `docs/CHANGELOG.md`; on 2026-11-14 the 476 ids were re-run there and all skipped again with the same reasons. It is the gate seat's run and not the hosted run on the release pull request, because the hosted runner skips more (592) and the next release's comparison must set like against like.
+The skip set of the gate seat's G2 whole run on v0.5.7-rc2 (`96085799`, 2026-11-13; fresh public clone, five shards, the `tests.yml` knobs including `ENGRAM_NO_EMBEDDINGS=1`, Linux, Python 3.12): 38,817 ids, 38,341 passed, 476 skipped, 0 failed, reasons from a re-run of those ids at the same commit. The release commit `47328707` differs from rc2 only in `docs/CHANGELOG.md`; on 2026-11-14 the 476 ids were re-run there and all skipped again with the same reasons. It is the gate seat's run and not the hosted run on the release pull request, because the hosted runner skips more (592) and the next release's comparison must set like against like.
 
 ## `vX.Y.Z.md`
 
