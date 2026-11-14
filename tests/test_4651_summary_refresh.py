@@ -328,6 +328,62 @@ def test_same_input_retry_clears_only_its_own_debt_and_diagnose_is_current_only(
     assert fake.texts[-1] == "retry A\nA retry one two three"
 
 
+@pytest.mark.parametrize("non_object_metadata", ["[1, 2, 3]", '"scalar"', "null"])
+def test_diagnose_ignores_non_object_metadata_while_counting_valid_refresh_debt(
+    monkeypatch, non_object_metadata,
+):
+    """Debt diagnosis is read-only and ignores valid JSON that is not an object."""
+    srv = fresh_server()
+    valid = add_obs(srv, "valid refresh debt")
+    non_object = add_obs(srv, "non-object metadata")
+    marker = json.dumps({
+        "embedding_refresh_pending": {
+            "reason": "unavailable", "stage": "strict_refresh", "at": "2026-01-01T00:00:00Z",
+        },
+    })
+    conn = srv._get_db()
+    try:
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (marker, valid))
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (non_object_metadata, non_object))
+        conn.commit()
+    finally:
+        conn.close()
+
+    diagnose = json.loads(srv.engram_diagnose())
+
+    debt = diagnose["embedding_refresh_debt"]
+    assert debt["count"] == 1 and debt["sample_ids"] == [valid] and debt["flare"] is True, debt
+    assert node_row(srv, non_object)["metadata"] == non_object_metadata
+
+
+def test_generic_reembed_preserves_summary_refresh_debt_marker(monkeypatch):
+    """Only strict summary refresh may clear its own pending-debt marker."""
+    srv = fresh_server()
+    node_id = add_obs(srv, "generic re-embed marked node")
+    marker = json.dumps({
+        "embedding_refresh_pending": {
+            "reason": "unavailable", "stage": "strict_refresh", "at": "2026-01-01T00:00:00Z",
+        },
+    })
+    conn = srv._get_db()
+    try:
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (marker, node_id))
+        conn.commit()
+    finally:
+        conn.close()
+    fake, core = install_fake_encoder(monkeypatch, srv)
+
+    conn = srv._get_db()
+    try:
+        counts = core._reembed_nodes(conn, [node_id], caller_name="test_generic_reembed")
+    finally:
+        conn.close()
+
+    assert counts == {"processed": 1, "embedded": 1, "skipped": 0, "failed": 0}
+    assert fake.texts == ["generic re-embed marked node"]
+    assert json.loads(node_row(srv, node_id)["metadata"])["embedding_refresh_pending"]["reason"] == "unavailable"
+
+
 def test_successful_real_vec_refresh_matches_fresh_float32_oracle(monkeypatch):
     """A strict success verifies both canonical JSON and the REAL vec mirror bytes."""
     srv = fresh_server()

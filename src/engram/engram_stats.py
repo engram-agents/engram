@@ -1035,7 +1035,8 @@ def _diagnose_impl() -> str:
             for r in conn.execute(
                 "SELECT id FROM nodes WHERE is_current = 1 "
                 "AND json_valid(metadata) "
-                "AND json_type(metadata, '$.embedding_refresh_pending') = 'object' "
+                "AND json_type(CASE WHEN json_valid(metadata) THEN metadata END, "
+                "'$.embedding_refresh_pending') = 'object' "
                 "ORDER BY id"
             ).fetchall()
         ]
