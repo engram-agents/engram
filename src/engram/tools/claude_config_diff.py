@@ -167,9 +167,14 @@ def _before(snap: Path, name: str):
     return False, None
 
 
+def _stamp() -> str:
+    """The backup-folder timestamp. A seam: tests patch this, never the stdlib clock."""
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+
 def _backup_dir(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    stamp = _stamp()
     n = 0
     while True:
         d = root / (f"pre-marketplace-add-{stamp}" + (f"-{n}" if n else ""))

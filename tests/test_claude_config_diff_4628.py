@@ -613,15 +613,36 @@ def test_s1_a_backup_that_cannot_be_written_is_said_not_silent(rig):
     assert "kept at" not in res.stdout
 
 
-def test_s3d_two_backups_in_the_same_second_get_two_folders(rig):
+def test_s3d_two_backups_in_the_same_second_get_two_folders(rig, monkeypatch):
     import importlib.util
     spec = importlib.util.spec_from_file_location("_ccd4628", HELPER)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    mod.time.strftime = lambda *a, **k: "20260101T000000Z"  # freeze the clock: same second, for certain
+    monkeypatch.setattr(mod, "_stamp", lambda: "20260101T000000Z")  # freeze the clock: same second, for certain
     a = mod._backup_dir(rig.backups)
     b = mod._backup_dir(rig.backups)
     assert a != b and a.is_dir() and b.is_dir()
+    assert a.name == "pre-marketplace-add-20260101T000000Z" and b.name == a.name + "-1"
+
+
+def test_s3d_freezing_the_helper_clock_does_not_leak_into_other_tests():
+    # Contract: the same-second cell must leave the stdlib clock alone. It used to assign
+    # over time.strftime for the whole process. Runs right after that cell, in file order.
+    import time
+    assert time.strftime("%Y") != "20260101T000000Z"
+    assert time.strftime("%Y") in (str(time.gmtime().tm_year), str(time.localtime().tm_year))
+
+
+def test_s3d_the_clock_patch_survives_a_combined_run_with_the_snapshot_cell():
+    # The reviewer's reproduction: this file's cell and an unrelated clock-reading cell, one process.
+    cell = "tests/test_engram_snapshot.py::TestJsonlSnapshotOutput::test_captured_at_is_utc_iso"
+    me = "tests/test_claude_config_diff_4628.py::test_s3d_two_backups_in_the_same_second_get_two_folders"
+    env = dict(os.environ, ENGRAM_NO_EMBEDDINGS="1", PYTHONDONTWRITEBYTECODE="1")
+    res = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", me, cell],
+                         cwd=REPO_ROOT, env=env, text=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    assert res.returncode == 0, res.stdout[-1500:]
+    assert "2 passed" in res.stdout, res.stdout[-500:]
 
 
 def test_s3d_two_real_reports_back_to_back_keep_both_backups(rig):
