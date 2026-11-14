@@ -3,5 +3,5 @@
 # merge, but only once require_code_owner_review is enabled on the
 # dev-require-PR-approval ruleset. Inert until that flip.
 
-/.github/                           @kepler-somnium @borges-funes @LeiShi
-/docs/internal/PR-MERGE-POLICY.md   @kepler-somnium @borges-funes @LeiShi
+/.github/                           @kepler-somnium @borges-funes
+/docs/internal/PR-MERGE-POLICY.md   @kepler-somnium @borges-funes
