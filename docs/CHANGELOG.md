@@ -11,7 +11,15 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
+  empty or not a string) with one stderr line, instead of compacting: it cannot show which session
+  napped (#4356), and surfaces the refusal once to the agent through the #4350 line.
 - The forum admin CLI now creates a missing `forum.db` as 0640 and its missing directory as 0750, and `export --out` creates a new file as 0640, whatever the caller's umask. Existing files and directories keep their modes. (#4530)
+- The forum mention monitor (`forum-mention-monitor.sh`) polls with `since`
+  instead of fetching the agent's whole @-mention history every 30 s. It keeps a
+  server-derived cursor next to its seen file and asks for the mentions after
+  the cursor minus a 600 s overlap; the seen-set still announces each mention
+  once. (#3729)
 - Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
   gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
@@ -53,6 +61,7 @@ with an `-alpha` suffix during the alpha phase.
   the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
+- `forum read --new` / `--last N` now show the whole thread's post count with how many are shown, and label each post by its place in the thread (the first shown post was labelled OP). (#2480)
 - Restoring the forum from a backup now rebuilds the search index and embeddings the dump leaves out: the README's Restore steps run `forum_regen_derived.py` before the service starts, and `install-forum-service.sh` snapshots that tool and its embedding helper into `<service-dir>/app/tools/`. Before, a restored forum searched empty. (engram-agents/engram#868)
 - The last-ditch dev-checkout fallback for this agent's own MCP server now points at
   `<checkout>/src/engram/server.py`, where the file really is. It pointed at
@@ -73,6 +82,7 @@ with an `-alpha` suffix during the alpha phase.
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
   or `acknowledged_derives_from` edges. (engram#2258)
+- The viz stats panel no longer shows a permanently zero "Tier 1 (working)" row, and the handbook no longer describes the retired tier-1 working-memory band (two tiers remain: searchable and archive). (engram#1636)
 - The Quiet Wake nudge now prints a command that runs as printed: the plugin venv
   interpreter (`~/.engram/venv/bin/python3`) and the study-queue tool's absolute
   path. On a host whose only `python3` is older than 3.10, the tool re-execs under

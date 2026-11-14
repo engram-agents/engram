@@ -117,10 +117,57 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
 
    **Inline methodology:**
    1. List open tasks: retrieve all `tk_*` nodes via `engram_list`. Inspect each for status; keep only `active`, `planned`, `blocked` statuses.
-   2. For each open task, extract GitHub references from the claim text. **Only repo-qualified `owner/repo#N` references are candidates** — a bare `#N` has no repo, and `gh` silently resolves it against whichever repo happens to be the current checkout, so a same-numbered PR/issue in the WRONG repo can read as MERGED/CLOSED with no error (alpha#3188, #3418, #3427). The extraction pattern below matches only the qualified shape, so a bare `#N` (including `PR #N`, `issue #N`, `closes #N`) is structurally unmatched, never a closure candidate. Each `gh` call takes `--repo` from the reference itself.
-   3. For each extracted reference, run (claim text on stdin). The first `grep` has a left boundary — the ref must start the line or follow a character that cannot be part of a path/ref — so a longer path like `a/b/c#5` is not mis-read as `b/c#5`; `sed` strips the boundary character. Each `gh` call takes `</dev/null` because it sits inside `while read` and would otherwise consume the loop's stdin. Each output line carries the **kind** (`pr` / `issue`) because an unmerged-closed PR also prints `CLOSED`:
+   2. For each open task, extract GitHub references from the claim text. **Candidates are repo-qualified `owner/repo#N` references and refs written in one of the seat's declared bare-repo aliases** — a bare `#N` has no repo, and `gh` silently resolves it against whichever repo happens to be the current checkout, so a same-numbered PR/issue in the WRONG repo can read as MERGED/CLOSED with no error. The two extraction stages below match the qualified shape and the declared aliases, so a bare `#N` (including `PR #N`, `issue #N`, `closes #N`) stays structurally unmatched, never a closure candidate. Each `gh` call takes `--repo` from the reference itself, after an alias has been resolved to its full `owner/repo`.
+
+   **The alias map is the seat's own file, and it is empty by default.** An install that declares no alias keeps exactly today's behaviour: only fully qualified `owner/repo#N` refs are candidates, every alias is unmatched, and every bare `#N` is unmatched. The map lives at `${ENGRAM_HOME:-$HOME/.engram}/repo-aliases` — one declaration per line, `alias=owner/repo`; comment lines beginning with `#` and blank lines are ignored. The key class is `[A-Za-z0-9_-]+` (ERE-safe) and the value must be exactly two path segments, each `[A-Za-z0-9_.-]+`. A line that does not match exactly — a wrong segment count, an empty segment, a bad character — is not a usable alias; and in any case an alias that does not resolve to a declared repository is dropped rather than becoming a reference — so no path can turn an undeclared or malformed alias into a `gh` call. A missing file and an empty file both declare no aliases.
+
+   **The map is a closed vocabulary, not a general any-token pattern.** Only aliases declared in the seat's `repo-aliases` file are resolved; anything else stays unmatched — never guessed against the cwd checkout. One alias does not stand in for another: two different repositories can share an issue-number range, so a token that no declaration names is not a reference to either and stays unmatched. Provenance: measured on the `agent-zephyr` graph at 2026-11-14T15:58Z, over the population step 1 produces (`type='task'`, status active/planned/blocked, `is_current=1`, n=39) — **4 with qualified refs alone, 7 after adding one declared alias.** The figure moves as the graph grows, so the population and the timestamp are part of the claim, not the number. An install that declares no alias sees the first number, which is today's behaviour.
+   3. For each extracted reference, run (claim text on stdin). Both extraction stages keep a left boundary — the ref must start the line or follow a character that cannot be part of a path/ref — so a longer path like `a/b/c#5` is not mis-read as `b/c#5`; `sed` strips the boundary character. Stage 1 passes already-qualified refs through unchanged. Stage 2 runs only when at least one alias is declared, matches those aliases (built from the seat's file), and rewrites each to its full `owner/repo` **inside that stage, before the merge** — the final `sort -u` must see full refs on both sides, or the same artifact arriving once as `alias#12` and once as `owner/repo#12` would be checked and printed twice. Stage 2 only ever matches keys built from the validated declarations, so an alias the file does not name never reaches the lookup and never becomes a malformed ref. `--repo` still comes from the resolved reference, never from the cwd, so nothing downstream can tell which stage a ref arrived by. Each `gh` call takes `</dev/null` because it sits inside `while read` and would otherwise consume the loop's stdin. Each output line carries the **kind** (`pr` / `issue`) because an unmerged-closed PR also prints `CLOSED`:
       ```bash
-      grep -oE '(^|[^A-Za-z0-9_./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+' | sed -E 's/^[^A-Za-z0-9_.-]//' | sort -u | while read -r ref; do
+      # Repo alias map — the seat's own file, EMPTY by default. An alias that file
+      # does not declare is UNMATCHED, never guessed against the cwd checkout.
+      # Written for bash 3.2 on purpose (stock macOS): no associative arrays, no
+      # mapfile, no namerefs. A line that is not exactly `key=owner/repo` with two
+      # safe segments is ignored, so the map fails closed.
+      ALIAS_FILE="${ENGRAM_HOME:-$HOME/.engram}/repo-aliases"
+      ALIASES=''
+      MAP=''
+      if [ -f "$ALIAS_FILE" ] && [ -r "$ALIAS_FILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in ''|\#*) continue ;; esac
+          key=${line%%=*}
+          val=${line#*=}
+          case "$key" in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+          case "$val" in ''|/*|*/|*/*/*) continue ;; esac
+          case "$val" in */*) ;; *) continue ;; esac
+          case "$val" in *[!A-Za-z0-9_./-]*) continue ;; esac
+          MAP="${MAP}${key} ${val}"$'\n'
+          ALIASES="${ALIASES:+$ALIASES|}${key}"
+        done < "$ALIAS_FILE"
+      fi
+      repo_for() {
+        printf '%s' "$MAP" | while IFS=' ' read -r k v; do
+          [ "$k" = "$1" ] || continue
+          printf '%s\n' "$v"
+          break
+        done
+      }
+      IN=$(cat)
+      {
+        # 1) already-qualified refs, passed through unchanged
+        printf '%s\n' "$IN" | grep -oE '(^|[^A-Za-z0-9_./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+' | sed -E 's/^[^A-Za-z0-9_.-]//'
+        # 2) declared aliases, resolved to a FULL ref here so the sort -u below sees both stages.
+        #    Guarded on a non-empty ALIASES: an empty alternation is NOT an empty match -- it
+        #    would make the alias group match a bare `#N`, the one thing this category must
+        #    never resolve. No alias declared => this stage does not run at all.
+        if [ -n "$ALIASES" ]; then
+          printf '%s\n' "$IN" | grep -oE "(^|[^A-Za-z0-9_./-])($ALIASES) ?#[0-9]+" | sed -E 's/^[^A-Za-z0-9_.-]//' | sed -E 's/ +#/#/' | while read -r a; do
+            full=$(repo_for "${a%#*}")
+            [ -n "$full" ] || continue
+            echo "$full#${a#*#}"
+          done
+        fi
+      } | sort -u | while read -r ref; do
         repo="${ref%#*}"
         n="${ref#*#}"
         if state=$(gh pr view "$n" --repo "$repo" --json state -q .state </dev/null 2>/dev/null); then kind=pr
@@ -137,7 +184,7 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
 
    **Snapshot contract:** include `status`, `claim`, and the live `gh` output for each flagged reference in `key_neighbors` (use an extra field `external_check` on the snapshot if needed — the snapshot shape is extensible). Suggest action: `"close task and mark done — external reference owner/repo#N <state>"` (this routes to `task_closures` bucket in the dream-master).
 
-   **Important `gh` guard:** Only repo-qualified `owner/repo#N` references are ever checked, and every `gh` call carries `--repo` from the reference. A bare `#N` is never a closure candidate and never produces a suggestion, not even a conservative one. You MAY mention a bare `#N` you noticed in a task claim as an ambiguous reference in your report prose (a note that the task cites an unqualified number), but never as a `task_closures` suggestion and never checked against `gh`. Forum post IDs, GitHub Projects IDs, and arbitrary numbers collide with real PR/issue numbers in whichever repo the cwd happens to be; the qualified-only pattern is what keeps them out.
+   **Important `gh` guard:** Only references that resolve to a full `owner/repo#N` — written qualified, or written in one of the seat's declared aliases — are ever checked, and every `gh` call carries `--repo` from that resolved reference. A bare `#N` is never a closure candidate and never produces a suggestion, not even a conservative one. You MAY mention a bare `#N` you noticed in a task claim as an ambiguous reference in your report prose (a note that the task cites an unqualified number), but never as a `task_closures` suggestion and never checked against `gh`. Forum post IDs, GitHub Projects IDs, and arbitrary numbers collide with real PR/issue numbers in whichever repo the cwd happens to be; resolving every ref to a full `owner/repo` before it is checked is what keeps them out.
 
 9. **Cornerstone auto-load surface coverage gaps.** Read the shipped instrument — `engram_diagnose`'s `cornerstone_coverage` — with read-only MCP tools.
 
@@ -373,7 +420,7 @@ Use this format:
 ... or "None this scan."
 
 ## Category 8 — Open tasks with stale external references
-- [tk_XXXX] (verified) status=<active|planned|blocked> — claim references owner/repo#N (<pr MERGED|issue CLOSED> as of <date>; always repo-qualified, never a bare `#N`; an unmerged `pr CLOSED` is never listed here) — suggested action: close task and mark done — external reference owner/repo#N <state>.
+- [tk_XXXX] (verified) status=<active|planned|blocked> — claim references owner/repo#N (<pr MERGED|issue CLOSED> as of <date>; always repo-qualified — a declared bare-repo alias is resolved to its full `owner/repo` before the finding is written, never a bare `#N`; an unmerged `pr CLOSED` is never listed here) — suggested action: close task and mark done — external reference owner/repo#N <state>.
 ... or "None this scan."
 
 ## Category 9 — Cornerstone auto-load surface coverage gaps
