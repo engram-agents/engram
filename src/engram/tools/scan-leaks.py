@@ -33,9 +33,14 @@ runs committed structural patterns only and prints one advisory line.
 
 See docs/internal/.scan-leaks-local.json.example for the config shape.
 
-Allowlist:
-  - LICENSE (copyright lines are intentional)
-  - .git/, __pycache__/, *.pyc
+Scope and exclusions (what "the tree" means here — NOT every published file):
+  - Candidate set: every git-tracked text file, whatever its extension
+    (extensionless executables included).  A binary (a NUL byte in its first
+    8 KiB) is skipped and counted.
+  - SKIP_FILES: LICENSE, .scan-leaks-local.json, scan-leaks.py,
+    test_release_cutover.py, RELEASING.md.
+  - SKIP_DIRS: .git, __pycache__, node_modules, .claude.
+  - A name in an excluded file is not scanned.
 
 Exit codes:
   0 — clean
@@ -163,13 +168,17 @@ def load_roster_file(path: Path) -> list[tuple[re.Pattern, str]]:
         sys.exit(2)
 
     patterns = []
+    supplied = 0
+    rejected = 0
     for lineno, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        supplied += 1
         try:
             patterns.append((re.compile(stripped), "roster file"))
         except (re.error, OverflowError, RecursionError) as exc:
+            rejected += 1
             # The roster file is a personal-name list: the line and
             # str(re.error) can both carry a name.  Report only the 1-based
             # line number, the exception class, and (for re.error) its offset
@@ -178,6 +187,18 @@ def load_roster_file(path: Path) -> list[tuple[re.Pattern, str]]:
                       else "")
             print(f"scan-leaks: warning — skipping bad roster line {lineno}: "
                   f"{type(exc).__name__}{detail}", file=sys.stderr)
+
+    if supplied and not patterns:
+        # An explicitly requested roster that supplied no usable pattern must
+        # not become a clean run against nothing.  CI pre-validates its own
+        # roster before invoking --roster-file, so this is the standalone
+        # flag's contract, not CI's.  The count only — never the pattern text.
+        print(
+            f"scan-leaks: all {rejected} roster line(s) were rejected as "
+            "invalid; refusing to scan against an empty roster",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     return patterns
 
 
@@ -402,6 +423,24 @@ def main():
             print(f"{rel}:{lineno}", file=sys.stderr)
         else:
             print(f"  {rel}:{lineno} [absolute home path] segment: {seg}", file=sys.stderr)
+    # The roster instruction is scoped to ROSTER/PATTERN hits: a roster entry
+    # names a string already published, so the fix is in the tree, never in the
+    # roster.  An absolute-home-path hit has nothing to do with the roster, so
+    # telling its operator to leave the roster alone is misdirection.
+    if leaks:
+        print(
+            "scan-leaks: a pattern hit means the string is already in the "
+            "published tree; fix it in the release PR; do not widen or edit "
+            "the roster to silence it.",
+            file=sys.stderr,
+        )
+    if home_findings:
+        print(
+            "scan-leaks: an absolute home path hit means a host path is in the "
+            "published tree; remove it in the release PR. The roster does not "
+            "apply to this finding.",
+            file=sys.stderr,
+        )
     sys.exit(1)
 
 

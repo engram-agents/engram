@@ -1,11 +1,17 @@
 name: name-leak-sweep
 
-# Issue #4780 — a whole-tree sweep of the published tree against the roster.
+# Issue #4780 — a sweep of the tracked text files against the roster.
 #
 # `tools/name_leak_warn.py` applies NAME_LEAK_ROSTER to the added lines of a
-# diff; `src/engram/tools/scan-leaks.py` reads a whole tree but, until now, only
+# diff; `src/engram/tools/scan-leaks.py` reads the tree but, until now, only
 # a gitignored LOCAL roster that CI does not have. Nothing in CI has ever
-# scanned the whole published tree against the real roster. This workflow does.
+# scanned the tracked text files against the real roster. This workflow does.
+#
+# "The tree" here is NOT every published file: the scanner skips binaries
+# (skipped and counted) and its declared exclusions — SKIP_FILES {LICENSE,
+# .scan-leaks-local.json, scan-leaks.py, test_release_cutover.py, RELEASING.md}
+# and SKIP_DIRS {.git, __pycache__, node_modules, .claude}. A name in an
+# excluded file is not covered by this job.
 #
 # The invariant, verbatim:
 #
@@ -375,20 +381,46 @@ jobs:
                   )
                   raise SystemExit(1)
 
-          probe_path = os.path.join(run_dir, "scan-leaks-probe.py")
-
           def _materialise_from(ref):
-              """Write `ref`'s copy of the scanner to `probe_path`; None when
-              that tree has no such path."""
-              proc = subprocess.run(
-                  ["git", "show", f"{ref}:{scanner_rel}"],
+              """Extract `ref`'s WHOLE TREE into a fresh directory and return
+              the scanner's path inside it; None when that tree has no such
+              path.
+
+              Never the scanner alone: the real scanner executes
+              `_load_home_path_class()` at module import and resolves
+              `home_path_class.py` relative to itself. A single-file copy sits
+              beside no sibling, so `<copy> --help` dies with ImportError and
+              the capability probe can never pass — which silently sent every
+              run to the checkout link with the roster in scope (#4782 r1). A
+              full extraction keeps whatever relative paths the ref's own code
+              resolves working as it would in a real checkout.
+              """
+              dest = tempfile.mkdtemp(dir=run_dir)
+              archive = subprocess.run(
+                  ["git", "archive", ref], capture_output=True
+              )
+              if archive.returncode != 0:
+                  return None
+              extract = subprocess.run(
+                  ["tar", "-x", "-C", dest],
+                  input=archive.stdout,
                   capture_output=True,
               )
-              if proc.returncode != 0:
+              if extract.returncode != 0:
                   return None
-              with open(probe_path, "wb") as fh:
-                  fh.write(proc.stdout)
-              return probe_path
+              candidate = os.path.join(dest, scanner_rel)
+              return candidate if os.path.isfile(candidate) else None
+
+          def _scanner_env():
+              """`os.environ` with the roster secret removed.
+
+              The roster reaches the scanner through `--roster-file`; an
+              environment copy is a second path to the secret, and the one a
+              contributor-controlled scanner copy would read.
+              """
+              env = dict(os.environ)
+              env.pop("NAME_LEAK_ROSTER", None)
+              return env
 
           def _has_capability(path):
               """True iff the copy accepts `--roster-file`.
@@ -401,6 +433,7 @@ jobs:
                   [sys.executable, "-P", path, "--help"],
                   capture_output=True,
                   text=True,
+                  env=_scanner_env(),
               )
               return proc.returncode == 0 and "--roster-file" in proc.stdout
 
@@ -489,6 +522,7 @@ jobs:
               ],
               capture_output=True,
               text=True,
+              env=_scanner_env(),
           )
           sys.stdout.write(scan.stdout)
           sys.stderr.write(scan.stderr)
@@ -529,10 +563,15 @@ jobs:
 
           if scan.returncode != 0:
               if scan.returncode == 1:
+                  # The type-specific duty lives in the scanner, which knows
+                  # whether the hit is a roster/pattern match or an absolute
+                  # home path. This branch cannot tell them apart (both are
+                  # exit 1), and telling a home-path hit to leave the roster
+                  # alone is operator misdirection.
                   print(
-                      "::error::a hit means the string is already in the "
-                      "published tree; fix it in the release PR; do not widen "
-                      "or edit the roster to silence it."
+                      "::error::a hit means the tree is not clean; fix it in "
+                      "the release PR. The scanner's lines above name the kind "
+                      "of hit and the fix it needs."
                   )
               else:
                   print(

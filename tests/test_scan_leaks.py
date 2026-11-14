@@ -1154,3 +1154,64 @@ def test_absent_roster_file_is_a_usage_error(tmp_path):
     )
     assert r.returncode == 2, r.stdout + r.stderr
 
+
+# ---------------------------------------------------------------------------
+# Test 16: type-scoped advice (R3-5) and an all-invalid roster (R3-7)
+# ---------------------------------------------------------------------------
+
+_ROSTER_ADVICE = "do not widen or edit the roster to silence it"
+_HOME_ADVICE = "The roster does not apply to this finding."
+
+
+def test_pattern_hit_gets_the_roster_sentence(tmp_path):
+    """Control: a pattern hit IS told not to edit the roster — so the absence
+    of that sentence for a home-path hit below is a property of the hit type,
+    not of the fixture."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
+    roster = _external_roster(tmp_path, _EXT_TOKEN + "\n")
+    r = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster), "--redact"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert _ROSTER_ADVICE in r.stderr, r.stderr
+    assert _HOME_ADVICE not in r.stderr, r.stderr
+
+
+def test_home_path_hit_gets_its_own_sentence_not_the_roster_one(tmp_path):
+    """R3-5: an absolute-home-path hit has nothing to do with the roster. It
+    must not be told to leave the roster alone, and it gets its own sentence."""
+    _commit_files(tmp_path, {"doc.md": "data in " + _home("zorblax") + "x\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert _HOME_ADVICE in r.stderr, r.stderr
+    assert _ROSTER_ADVICE not in r.stderr, r.stderr
+
+
+def test_all_invalid_roster_file_is_a_usage_error(tmp_path):
+    """R3-7: an explicitly requested roster that supplies no usable pattern is
+    a usage error (exit 2), not a clean run; the count of rejected lines is
+    named and the pattern text never is.
+
+    CI pre-validates its roster before invoking this flag, so this is the
+    standalone flag's contract, not CI's.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": "hello world\n"})
+    bad = f"(?P={_BAD_ROSTER_TOKEN})"
+    roster = _external_roster(tmp_path, bad + "\n" + bad + "x\n")
+    r = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "all 2 roster line(s) were rejected" in r.stderr, r.stderr
+    assert _BAD_ROSTER_TOKEN not in r.stdout + r.stderr
+

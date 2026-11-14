@@ -27,11 +27,13 @@ Discrimination for the mutations the specs name:
   `test_sweep_fails_when_zero_files_were_scanned` and nothing else;
 * making `--redact` print the label reddens the redact cell in
   `tests/test_scan_leaks.py`, not anything here;
-* making the capability probe always return True reddens
-  `test_the_capability_chain_refuses_a_copy_without_the_roster_file_flag`
-  and nothing else (the file-absence chain cells do not consult the probe);
-* removing the dispatch ref guard reddens
-  `test_workflow_dispatch_on_a_non_default_ref_fails_closed` and nothing else.
+* making the capability probe always return True reddens TWO cells:
+  `test_the_scanner_comes_from_the_capability_chain` (wiring, pins the probe's
+  source text) and `test_the_capability_chain_refuses_a_copy_without_the_roster_file_flag`
+  (behavioural); the file-absence chain cells do not consult the probe;
+* removing the dispatch ref guard reddens TWO cells:
+  `test_a_dispatch_must_run_from_the_default_branch` (wiring) and
+  `test_workflow_dispatch_on_a_non_default_ref_fails_closed` (behavioural).
 """
 
 from __future__ import annotations
@@ -109,6 +111,57 @@ _MARKER_SCANNER = (
     "import sys\n"
     'print("CHECKOUT_SCANNER_RAN")\n'
     "sys.exit(7)\n"
+)
+# R3-3: a REAL-SHAPED scanner. It resolves a sibling module at import time,
+# mirroring the real scanner's `_load_home_path_class()`
+# (`here.parent.parent / "build" / "engine" / ...`). Self-contained stubs
+# cannot exercise that dependency, which is why the single-file
+# materialisation passed every chain cell and failed in production.
+_REAL_SHAPED_SCANNER = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "\n"
+    "\n"
+    "def _load_sweep_fixture_helper():\n"
+    "    here = Path(__file__).resolve().parent\n"
+    "    candidate = (\n"
+    '        here.parent.parent / "build" / "engine"\n'
+    '        / "sweep_fixture_helper.py"\n'
+    "    )\n"
+    "    if not candidate.is_file():\n"
+    "        raise ImportError(\n"
+    '            "sweep_fixture_helper.py not found beside scan-leaks.py"\n'
+    "        )\n"
+    '    return candidate.read_text(encoding="utf-8")\n'
+    "\n"
+    "\n"
+    "_HELPER = _load_sweep_fixture_helper()\n"
+    'assert _HELPER.strip() == "FIXTURE_HELPER", _HELPER\n'
+    "\n"
+    'if "--help" in sys.argv:\n'
+    '    print("usage: scan-leaks.py [--roster-file PATH] [--redact]")\n'
+    "    sys.exit(0)\n"
+    "\n"
+    'print("scan-leaks: scanned 1, skipped-binary 0")\n'
+    "sys.exit(0)\n"
+)
+# R3-2: a scanner that reports if the roster secret is visible in its
+# environment. The workflow itself sets NAME_LEAK_ROSTER, so the only way this
+# stays silent is an explicit `env=` without it.
+_ENV_PROBE_SCANNER = (
+    "import os\n"
+    "import sys\n"
+    '_leaked = "NAME_LEAK_ROSTER" in os.environ\n'
+    'if "--help" in sys.argv:\n'
+    '    print("usage: scan-leaks.py [--roster-file PATH] [--redact]")\n'
+    "    if _leaked:\n"
+    '        print("PROBE_SAW_ROSTER")\n'
+    "    sys.exit(0)\n"
+    "if _leaked:\n"
+    '    print("SCAN_SAW_ROSTER")\n'
+    "    sys.exit(3)\n"
+    'print("scan-leaks: scanned 1, skipped-binary 0")\n'
+    "sys.exit(0)\n"
 )
 
 
@@ -536,6 +589,54 @@ def test_the_capability_chain_refuses_a_copy_without_the_roster_file_flag(
     assert "Never run a scanner against a roster without --roster-file" in out, out
 
 
+def test_a_real_scanner_with_import_time_dependencies_passes_the_base_link(
+    sweep_repo, tmp_path
+):
+    """R3-3: the cell that would have caught the single-file materialisation.
+
+    The base commit carries a REAL-SHAPED scanner — a loader at module import
+    resolving `here.parent.parent/"build"/"engine"/...`, mirroring
+    `_load_home_path_class()` — with the sibling committed at the path the
+    loader expects. The same tree is on `origin/dev`, so under a single-file
+    materialisation BOTH protected links fail the probe and the chain falls
+    through to the checkout copy (loudly, as BOOTSTRAP).
+
+    RED against 9e432d9b's `git show <ref>:<scanner>`; GREEN only when the
+    ref's WHOLE TREE is materialised, so its own relative paths resolve.
+    """
+    work, _base, g = sweep_repo
+    (work / "src" / "build" / "engine").mkdir(parents=True)
+    (work / "src" / "build" / "engine" / "sweep_fixture_helper.py").write_text(
+        "FIXTURE_HELPER\n", encoding="utf-8"
+    )
+    (work / "src" / "engram" / "tools" / "scan-leaks.py").write_text(
+        _REAL_SHAPED_SCANNER, encoding="utf-8"
+    )
+    g("add", "-A")
+    g("commit", "-qm", "real-shaped scanner")
+    base = g("rev-parse", "HEAD").stdout.strip()
+    g("push", "-q", "origin", "dev")
+    g("fetch", "-q", "origin", "dev")
+
+    proc, out = _run_sweep(work, base, tmp_path)
+    assert proc.returncode == 0, out
+    assert f"scanner read from {base}" in out, out
+    assert "BOOTSTRAP" not in out, out
+
+
+def test_the_probe_and_scan_do_not_inherit_the_roster_secret(sweep_repo, tmp_path):
+    """R3-2: the roster reaches the scanner through --roster-file. The
+    environment copy is a second path to the secret — the one a
+    contributor-controlled copy would read — so the `--help` probe and the scan
+    both run with NAME_LEAK_ROSTER removed."""
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _ENV_PROBE_SCANNER)
+    proc, out = _run_sweep(work, base, tmp_path)
+    assert proc.returncode == 0, out
+    assert "PROBE_SAW_ROSTER" not in out, out
+    assert "SCAN_SAW_ROSTER" not in out, out
+
+
 def test_fails_closed_when_the_base_does_not_resolve(sweep_repo, tmp_path):
     """An unreadable ref is a fact about the clone, never about the tree."""
     work, _base, _g = sweep_repo
@@ -584,6 +685,21 @@ def test_sweep_fails_when_the_scanner_exits_nonzero(sweep_repo, tmp_path):
     proc, out = _run_sweep(work, base, tmp_path)
     assert proc.returncode != 0, out
     assert "a hit means" in out, out
+
+
+def test_a_hit_does_not_tell_a_home_path_hit_to_edit_the_roster(
+    sweep_repo, tmp_path
+):
+    """R3-5: the roster instruction is irrelevant to an absolute-home-path hit,
+    and this branch cannot tell the two families apart (both are exit 1), so
+    the type-specific duty belongs to the scanner, which knows the type. The
+    workflow's own message must not carry the roster instruction at all."""
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _HIT_SCANNER)
+    proc, out = _run_sweep(work, base, tmp_path)
+    assert proc.returncode != 0, out
+    assert "a hit means" in out, out
+    assert "do not widen or edit the roster" not in out, out
 
 
 # ── the decision's failure rows, executed ───────────────────────────────────
