@@ -72,6 +72,7 @@ with an `-alpha` suffix during the alpha phase.
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
   or `acknowledged_derives_from` edges. (engram#2258)
+- The viz stats panel no longer shows a permanently zero "Tier 1 (working)" row, and the handbook no longer describes the retired tier-1 working-memory band (two tiers remain: searchable and archive). (engram#1636)
 - The Quiet Wake nudge now prints a command that runs as printed: the plugin venv
   interpreter (`~/.engram/venv/bin/python3`) and the study-queue tool's absolute
   path. On a host whose only `python3` is older than 3.10, the tool re-execs under
