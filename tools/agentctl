@@ -2087,6 +2087,7 @@ cmd_session() {
         # exec comes after the prologue.
         if command -v "$binary" >/dev/null 2>&1; then
             if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+                # cd word stays printf %q on purpose (#4416 ruling): as-self hands this string to `exec bash -c` as ONE argv word, no sudo rejoin, so nothing is escaped twice; do not change it to _oct_quote for consistency.
                 exec bash -c \
                     "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec $scope_words \"$binary\" \"\$@\"" \
                     -- "${tail_args[@]}"
@@ -2097,6 +2098,7 @@ cmd_session() {
             fi
         elif [[ -x "$HOME/.runtime/start.sh" ]]; then
             if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+                # cd word stays printf %q on purpose (#4416 ruling): as-self hands this string to `exec bash -c` as ONE argv word, no sudo rejoin, so nothing is escaped twice; do not change it to _oct_quote for consistency.
                 exec bash -c \
                     "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec $scope_words ~/.runtime/start.sh \"\$@\"" \
                     -- "${tail_args[@]}"
