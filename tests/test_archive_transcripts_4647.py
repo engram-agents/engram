@@ -374,13 +374,17 @@ def test_c8_a_file_that_grows_during_the_run_contributes_only_the_counted_bytes(
     _put(src, "a/one.jsonl", b"counted-bytes\n")
     _put(src, "b/two.jsonl", b"other\n")
     counted = (src / "a/one.jsonl").stat().st_size
+    counted_two = (src / "b/two.jsonl").stat().st_size
     real = at._read_chunk
     state = {"grown": False}
 
     def grow_then_read(f, n):
+        # The first read happens while a/one is being read: grow BOTH that file (growth during
+        # its own read) and b/two (growth after it was counted but before its read begins).
         if not state["grown"]:
             state["grown"] = True
             _append(src, "a/one.jsonl", b"GROWN-DURING-RUN\n")
+            _append(src, "b/two.jsonl", b"ALSO-GROWN\n")
         return real(f, n)
 
     monkeypatch.setattr(at, "_read_chunk", grow_then_read)
@@ -389,7 +393,8 @@ def test_c8_a_file_that_grows_during_the_run_contributes_only_the_counted_bytes(
     assert state["grown"]
     segs = {s.path: s for s in at.read_manifest(r1.archive_path)}
     assert (segs["a/one.jsonl"].start, segs["a/one.jsonl"].end) == (0, counted)
-    assert r1.bytes_in == counted + (src / "b/two.jsonl").stat().st_size
+    assert (segs["b/two.jsonl"].start, segs["b/two.jsonl"].end) == (0, counted_two)
+    assert r1.bytes_in == counted + counted_two
 
     r2 = at.archive_run(src, arc)  # the rest goes in the next run
     seg2 = {s.path: s for s in at.read_manifest(r2.archive_path)}
