@@ -15,6 +15,11 @@ with an `-alpha` suffix during the alpha phase.
   empty or not a string) with one stderr line, instead of compacting: it cannot show which session
   napped (#4356), and surfaces the refusal once to the agent through the #4350 line.
 - The forum admin CLI now creates a missing `forum.db` as 0640 and its missing directory as 0750, and `export --out` creates a new file as 0640, whatever the caller's umask. Existing files and directories keep their modes. (#4530)
+- The forum mention monitor (`forum-mention-monitor.sh`) polls with `since`
+  instead of fetching the agent's whole @-mention history every 30 s. It keeps a
+  server-derived cursor next to its seen file and asks for the mentions after
+  the cursor minus a 600 s overlap; the seen-set still announces each mention
+  once. (#3729)
 - Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
   gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
