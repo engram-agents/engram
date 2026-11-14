@@ -66,6 +66,15 @@ def test_c1_label_site_has_only_tiers_2_and_3(site):
     assert "#5cb85c" not in color
 
 
+@pytest.mark.parametrize("site", [0, 1])
+def test_c1_label_site_maps_tier2_to_searchable_and_tier3_to_archive(site):
+    # The cell above only checks both strings are present; a mutant that gives tier 2 the
+    # Tier 3 label (or swaps the colours) would pass it. Pin the mapping itself.
+    label, color = _label_sites()[site]
+    assert re.search(r"tier === 2 \? 'Tier 2 \(searchable\)' : 'Tier 3 \(archive\)'", label), label
+    assert re.search(r"tier === 2 \? '#f0ad4e' : '#e05252'", color), color
+
+
 def test_c1_tiercounts_has_no_tier1_key():
     assert re.search(r"const tierCounts = \{2: 0, 3: 0\};", GRAPH_JS)
 
