@@ -92,6 +92,10 @@ with an `-alpha` suffix during the alpha phase.
   no open PR looked like a reviewer leftover and was pruned. It is now kept, with
   the reason "deploy source". A missing or malformed deploy record changes
   nothing. (engram#4157)
+- The write-nudge and loop-arm Stop hooks now record the transcript size their own scan read
+  as the next scan's starting offset, instead of stat-ing the transcript a second time. A
+  transcript that grew in between no longer has those bytes skipped for every later turn.
+  (engram-agents/engram#1855)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
