@@ -3434,6 +3434,9 @@ ENGRAM_GITIGNORE_PATTERNS = [
     # refresh preserves only `!`-prefixed lines, so a hand-added line is dropped.
     "forum-token",
     "*.bak-*",
+    # #4628: the installer helper keeps a 0600 copy of the user's Claude settings.json
+    # here before a marketplace add; it can hold tokens and must never be staged.
+    "install-backups/",
     # #4208: hand-made binary copies (backups/, dated knowledge.db.<suffix>) and the
     # rotating rollback copies the backup tool writes must never be staged.
     "backups/",

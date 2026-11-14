@@ -20,6 +20,15 @@ with an `-alpha` suffix during the alpha phase.
   server-derived cursor next to its seen file and asks for the mentions after
   the cursor minus a 600 s overlap; the seen-set still announces each mention
   once. (#3729)
+- The marketplace installer now says what `claude plugin marketplace add` changed
+  in your own Claude files. It copies `plugins/known_marketplaces.json` and
+  `settings.json` before the call and compares them after it. It prints each key
+  that was added, removed or changed (never a string value), prints nothing for a
+  file that was only rewritten with the same content, and, when a key was removed
+  or changed, keeps the old file in `install-backups/` in the ENGRAM data folder
+  and prints its path. It does not run with `--skip-add`, with the Codex target,
+  or when `claude` is not on the PATH, and it never changes the installer's exit
+  code. The writes themselves are still Claude Code's (engram#4628)
 - Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
   gap), and that a `closingIssuesReferences` answer can stay stale for minutes,

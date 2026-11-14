@@ -99,6 +99,10 @@ die() { printf '[install-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 # venv block never flagged (the normal case).
 _venv_fail=0
 
+# The temp folder holding the pre-add snapshot of the user's Claude files (#4628); removed by the
+# EXIT trap on every path. Empty when no snapshot was taken.
+_cc_snap=""
+
 # Items the run could not do. The run goes on past each one and ends with a block that lists them
 # (see _report_not_done), then exits EXIT_NOT_DONE: neither a silent warning nor an abort half way.
 EXIT_NOT_DONE=10
@@ -135,6 +139,10 @@ EOF_ND
 # end-of-script check would be unreachable from those paths; the trap catches all exits.
 _exit_trap() {
   local rc=$?
+  if [[ -n "${_cc_snap:-}" ]]; then
+    # `|| true`: under set -e a failed rm would abort this trap and change the exit code
+    rm -rf "$_cc_snap" || true
+  fi
   _report_not_done "$rc"
   if [[ "${_venv_fail:-0}" == "1" ]]; then
     log ""
@@ -1073,8 +1081,32 @@ else
     exit 0
   fi
 
+  # #4628: `claude plugin marketplace add` rewrites two of the user's own files and prints nothing
+  # about it. Snapshot them first, name every key it changed or removed afterwards, and keep a copy
+  # of the old file when something would be lost. The helper never fails (it exits 0 whatever
+  # happens), and `claude`'s own exit status is still the script's: it is held across the report
+  # and re-raised, so `set -e` behaves as it did before. The CLI honours CLAUDE_CONFIG_DIR.
+  _cc_home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  _cc_files=("$_cc_home/plugins/known_marketplaces.json" "$_cc_home/settings.json")
+  _cc_diff="$(dirname "$_self")/claude_config_diff.py"
+  if [[ -f "$_cc_diff" ]] && command -v python3 >/dev/null 2>&1; then
+    if _cc_snap="$(mktemp -d "${TMPDIR:-/tmp}/install-local-marketplace-claude-snap.XXXXXX" 2>/dev/null)"; then
+      python3 "$_cc_diff" snapshot --dest "$_cc_snap" "${_cc_files[@]}" || true
+    else
+      _cc_snap=""
+    fi
+  fi
+
   log "Registering marketplace with Claude Code"
-  claude plugin marketplace add "$MARKETPLACE_ROOT"
+  _cc_rc=0
+  claude plugin marketplace add "$MARKETPLACE_ROOT" || _cc_rc=$?
+
+  if [[ -n "$_cc_snap" ]]; then
+    python3 "$_cc_diff" report --snapshot "$_cc_snap" --backup-root "$ENGRAM_HOME/install-backups" "${_cc_files[@]}" || true
+  fi
+  if [[ "$_cc_rc" -ne 0 ]]; then
+    exit "$_cc_rc"
+  fi
 fi
 
 log ""
