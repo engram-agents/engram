@@ -63,7 +63,10 @@ PHRASES = [
     "user decides which backup to restore",
     "may itself be a regenerated default",
     "cp -p <the backup you chose>",
-    "write-default-config.py --confirm-new-seat",
+    "write-default-config.py",
+    # R3-2: the rule on the READER, verbatim in both copies. No refusal message prints the flag itself.
+    "Do not pass its confirmation flag yourself: only the user can say this seat is new, and the flag "
+    "stands for their word; the tool cannot tell who typed it (see its --help).",
 ]
 NEW_SEAT_FLAG = "--confirm-new-seat"
 C9_LINE = (
@@ -696,7 +699,10 @@ def _moved_aside_template_ok(msg: str, home: Path) -> bool:
 
 def test_cell18_no_refusal_message_says_delete_or_rm(work, tmp_path):
     """The messages built below (C2, C3a, C3b, locked-DB, install.sh C8) ARE the whole population this
-    cell checks: a refusal message added later is not covered unless it is added to this list."""
+    cell checks: a refusal message added later is not covered unless it is added to this list.  It
+    checks two things on the RENDERED text (str(exc), the installer's captured output), never on source:
+    no message says delete or rm, and no message contains the new-seat confirmation flag
+    (--confirm-new-seat), which only a reader who has the user's word may type (R3-2)."""
     msgs = {}
     # C2: seeded, config absent
     h = work / "c2" / ".engram"
@@ -741,9 +747,31 @@ def test_cell18_no_refusal_message_says_delete_or_rm(work, tmp_path):
         low = res["msg"].lower()
         assert "delete" not in low, (name, res["msg"])
         assert "rm " not in low, (name, res["msg"])
+        assert NEW_SEAT_FLAG not in res["msg"], (name, res["msg"])
     # the two moved-aside messages carry the exact mv template
     assert _moved_aside_template_ok(msgs["C3b"]["msg"], work / "c3b" / ".engram"), msgs["C3b"]["msg"]
     assert _moved_aside_template_ok(msgs["C3a"]["msg"], work / "c3a" / ".engram"), msgs["C3a"]["msg"]
+
+
+def test_cell18c_refusal_remedies_start_with_stop_and_tell_the_user(work):
+    """R3-1: in the rendered C3a and C3b messages, the remedy's first sentence (the first sentence after
+    the blank line) starts with 'Stop and tell the user'; restoring or moving aside are the USER's options."""
+    h = work / "c3a" / ".engram"
+    h.mkdir(parents=True)
+    con = sqlite3.connect(str(h / "knowledge.db"))
+    con.execute("CREATE TABLE nodes (id TEXT, type TEXT)")
+    con.commit()
+    con.close()
+    c3a = _child(h, _CELL17)["r"]
+    h = work / "c3b" / ".engram"
+    h.mkdir(parents=True)
+    (h / "knowledge.db").write_bytes(b"")
+    c3b = _child(h, _CELL17)["r"]
+    for name, res in (("C3a", c3a), ("C3b", c3b)):
+        assert res["raised"] == "RuntimeError", (name, res)
+        parts = res["msg"].split("\n\n")
+        assert len(parts) >= 2, (name, res["msg"])
+        assert parts[1].startswith("Stop and tell the user"), (name, res["msg"])
 
 
 def test_cell18b_a_moved_aside_database_satisfies_the_guard_the_message_points_at(home):
