@@ -53,6 +53,7 @@ with an `-alpha` suffix during the alpha phase.
   the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
+- `forum read --new` / `--last N` now show the whole thread's post count with how many are shown, and label each post by its place in the thread (the first shown post was labelled OP). (#2480)
 - The last-ditch dev-checkout fallback for this agent's own MCP server now points at
   `<checkout>/src/engram/server.py`, where the file really is. It pointed at
   `<checkout>/server.py`, which does not exist, so a scoped `pgrep -f` could never

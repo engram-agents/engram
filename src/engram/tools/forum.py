@@ -759,7 +759,7 @@ def cmd_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         if pre_render_note:
             print(pre_render_note)
         if not skip_human_render:
-            _render_thread_human(thread, display_posts)
+            _render_thread_human(thread, display_posts, all_posts=posts)
 
     _advance_watermark(forum_url, args.thread_id, agent_name, posts)
 
@@ -778,8 +778,17 @@ def _advance_watermark(forum_url: str, thread_id: int, agent_name: str, posts: l
             )
 
 
-def _render_thread_human(thread: dict, posts: list) -> None:
-    """Render a thread + posts to stdout in human/agent-readable text."""
+def _render_thread_human(thread: dict, posts: list, all_posts: list | None = None) -> None:
+    """Render a thread + posts to stdout in human/agent-readable text.
+
+    ``posts`` are the posts to render; ``all_posts`` is the full thread as
+    fetched (default: ``posts``). The header counts ``all_posts`` and each
+    block is labelled by its post's position in ``all_posts``, so a
+    ``--new`` / ``--last N`` slice still reads as part of the whole thread
+    (#2480).
+    """
+    if all_posts is None:
+        all_posts = posts
     title = thread.get("title", "(no title)")
     cat = thread.get("category_slug", "?")
     author = thread.get("author", {}).get("name", "?")
@@ -792,8 +801,14 @@ def _render_thread_human(thread: dict, posts: list) -> None:
     if thread.get("unresolved"):
         flags += " [UNRESOLVED]"
 
-    post_count = len(posts)
+    # #2480 item 2: this is the number of posts in the fetched response. If
+    # the thread-read endpoint ever paginates server-side, this becomes a
+    # page count and must be redone.
+    post_count = len(all_posts)
     post_count_part = f"{post_count} post{'s' if post_count != 1 else ''}"
+    if len(posts) < post_count:
+        post_count_part += f" (showing {len(posts)})"
+    thread_pos = {p.get("id"): n for n, p in enumerate(all_posts)}
 
     sep = "=" * 72
     print(sep)
@@ -810,7 +825,8 @@ def _render_thread_human(thread: dict, posts: list) -> None:
         post_id = post.get("id", "?")
         edited = post.get("edited_at")
         edited_part = f"  (edited {_format_ts_short(edited)})" if edited else ""
-        label = "OP" if i == 0 else f"reply {i}"
+        pos = thread_pos.get(post.get("id"), i)  # fallback: position in `posts`
+        label = "OP" if pos == 0 else f"reply {pos}"
 
         print()
         print(f"--- [{label}] #{post_id} by {post_author}  {post_ts}{edited_part} ---")
