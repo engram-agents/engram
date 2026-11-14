@@ -135,8 +135,14 @@ def _set_age(wt, seconds):
 
 
 def _classify_real(root, wt, branch, *, pr_state=None, in_use=False, **kw):
+    # A detached worktree must carry its REAL head: the reachability check
+    # (#4509) asks git about it, and a made-up SHA is "cannot verify" -> SKIP.
+    head = "deadbeef"
+    if branch is None:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, check=True,
+                              capture_output=True, text=True).stdout.strip()
     t = _make_worktree(str(wt), branch=branch, detached=branch is None,
-                       head="deadbeef")
+                       head=head)
     with (
         patch.object(_mod, "_is_clean", return_value=True),
         patch.object(_mod, "_pr_state", return_value=pr_state),
@@ -233,6 +239,9 @@ def test_classify_detached_clean(tmp_path):
     with (
         patch.object(_mod, "_is_clean", return_value=True),
         patch.object(_mod, "_pr_for_sha", return_value=(True, None)),
+        # Fake root/SHA: stub reachability as "some ref holds it" (#4509); the
+        # real-repo cells in section 7 exercise the check itself.
+        patch.object(_mod, "_refs_containing", return_value=["refs/heads/main"]),
     ):
         action, reason = _mod.classify(t, ROOT)
     assert action == "PRUNE"
@@ -893,6 +902,152 @@ def test_is_clean_does_not_refresh_a_stale_index_4695(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 7. detached HEAD: a commit that lives only in the worktree is not prunable
+#    (#4509). Real repos: reachability is a git question, not a mockable one.
+# ---------------------------------------------------------------------------
+
+
+def _detached_at_unreferenced_commit(tmp_path):
+    """Real repo + clean detached worktree (old enough to pass the age guard)
+    whose HEAD is a commit contained in NO ref. Returns (root, wt, sha)."""
+    root, wt = _real_worktree(tmp_path, None)
+    (wt / "g").write_text("only here")
+    _git("add", "g", cwd=wt)
+    _git("commit", "-q", "-m", "local only", cwd=wt)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, check=True,
+                         capture_output=True, text=True).stdout.strip()
+    refs = subprocess.run(["git", "for-each-ref", "--contains", sha], cwd=root,
+                          check=True, capture_output=True, text=True).stdout
+    assert refs == "", "fixture must leave the commit unreferenced"
+    _set_age(wt, _mod.AGE_GUARD_SECONDS + 60)
+    return root, wt, sha
+
+
+def _classify_detached(root, wt, sha, *, in_use=False, pr_for_sha=(True, None)):
+    t = _make_worktree(str(wt), branch=None, detached=True, head=sha)
+    with (
+        patch.object(_mod, "_is_clean", return_value=True),
+        patch.object(_mod, "_is_in_use", return_value=in_use),
+        patch.object(_mod, "_pr_for_sha", return_value=pr_for_sha),
+    ):
+        return _mod.classify(t, root, main_path=root)
+
+
+def test_detached_commit_in_no_ref_is_skipped_4509(tmp_path):
+    """C1: pruning would leave the commit only in the reflog."""
+    root, wt, sha = _detached_at_unreferenced_commit(tmp_path)
+    action, reason = _classify_detached(root, wt, sha)
+    assert action == "SKIP", reason
+    assert sha[:7] in reason
+    assert "only in this worktree" in reason
+
+
+def test_detached_commit_on_a_branch_prunes_4509(tmp_path):
+    """C2: same worktree, commit now on a branch -> PRUNE, existing reason."""
+    root, wt, sha = _detached_at_unreferenced_commit(tmp_path)
+    _git("branch", "keep", sha, cwd=root)
+    action, reason = _classify_detached(root, wt, sha)
+    assert action == "PRUNE", reason
+    assert reason == "detached HEAD, clean (reviewer-fairy leftover)"
+
+
+def test_detached_commit_under_a_tag_prunes_4509(tmp_path):
+    root, wt, sha = _detached_at_unreferenced_commit(tmp_path)
+    _git("tag", "keep-tag", sha, cwd=root)
+    action, reason = _classify_detached(root, wt, sha)
+    assert action == "PRUNE", reason
+    assert reason == "detached HEAD, clean (reviewer-fairy leftover)"
+
+
+def test_detached_commit_under_a_remote_ref_prunes_4509(tmp_path):
+    root, wt, sha = _detached_at_unreferenced_commit(tmp_path)
+    _git("update-ref", "refs/remotes/origin/x", sha, cwd=root)
+    action, reason = _classify_detached(root, wt, sha)
+    assert action == "PRUNE", reason
+    assert reason == "detached HEAD, clean (reviewer-fairy leftover)"
+
+
+def test_detached_at_commit_already_on_main_prunes_4509(tmp_path):
+    """C3: the common case — detached at a commit a branch already holds."""
+    root, wt = _real_worktree(tmp_path, None)
+    _set_age(wt, _mod.AGE_GUARD_SECONDS + 60)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, check=True,
+                         capture_output=True, text=True).stdout.strip()
+    action, reason = _classify_detached(root, wt, sha)
+    assert action == "PRUNE", reason
+    assert reason == "detached HEAD, clean (reviewer-fairy leftover)"
+
+
+def _run_with_for_each_ref(fake):
+    real = _mod._run
+
+    def run(args, cwd=None):
+        if "for-each-ref" in args:
+            return fake(args, cwd)
+        return real(args, cwd=cwd)
+
+    return run
+
+
+def test_detached_reachability_nonzero_rc_fails_closed_4509(tmp_path):
+    """C4a: a failing for-each-ref is not 'reachable'."""
+    root, wt = _real_worktree(tmp_path, None)  # a reachable commit: only the
+    _set_age(wt, _mod.AGE_GUARD_SECONDS + 60)  # failed check can cause the SKIP
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, check=True,
+                         capture_output=True, text=True).stdout.strip()
+    with patch.object(_mod, "_run",
+                      _run_with_for_each_ref(lambda a, c: (128, "", "boom"))):
+        action, reason = _classify_detached(root, wt, sha)
+    assert action == "SKIP", reason
+    assert "could not be verified" in reason
+
+
+def test_detached_reachability_exception_fails_closed_4509(tmp_path):
+    """C4b: same, when the call raises."""
+    root, wt = _real_worktree(tmp_path, None)
+    _set_age(wt, _mod.AGE_GUARD_SECONDS + 60)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, check=True,
+                         capture_output=True, text=True).stdout.strip()
+
+    def boom(a, c):
+        raise OSError("git vanished")
+
+    with patch.object(_mod, "_run", _run_with_for_each_ref(boom)):
+        action, reason = _classify_detached(root, wt, sha)
+    assert action == "SKIP", reason
+    assert "could not be verified" in reason
+
+
+def test_detached_unreferenced_in_use_still_skips_for_in_use_4509(tmp_path):
+    """C5: in-use wins over the new check (fixture has an unreferenced commit,
+    so a reordered check would change the reason)."""
+    root, wt, sha = _detached_at_unreferenced_commit(tmp_path)
+    action, reason = _classify_detached(root, wt, sha, in_use=True)
+    assert action == "SKIP"
+    assert "process active" in reason
+    assert "only in this worktree" not in reason
+
+
+def test_detached_unreferenced_open_pr_keeps_its_reason_4509(tmp_path):
+    root, wt, sha = _detached_at_unreferenced_commit(tmp_path)
+    action, reason = _classify_detached(root, wt, sha, pr_for_sha=(True, 4496))
+    assert action == "SKIP"
+    assert "matches OPEN PR #4496" in reason
+
+
+def test_detached_unreferenced_gh_failure_keeps_its_reason_4509(tmp_path):
+    root, wt, sha = _detached_at_unreferenced_commit(tmp_path)
+    action, reason = _classify_detached(root, wt, sha, pr_for_sha=(False, None))
+    assert action == "SKIP"
+    assert "open-PR state unverified" in reason
+
+
+def test_detached_unreferenced_young_worktree_keeps_age_guard_reason_4509(tmp_path):
+    root, wt, sha = _detached_at_unreferenced_commit(tmp_path)
+    _set_age(wt, 120)
+    action, reason = _classify_detached(root, wt, sha)
+    assert action == "SKIP"
+    assert "age guard" in reason
 # 15. deploy source (#4157): the `deployed_from` worktree is load-bearing
 # ---------------------------------------------------------------------------
 
