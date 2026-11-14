@@ -15,6 +15,10 @@ with an `-alpha` suffix during the alpha phase.
   `nothing_written`, `restored` or `may_be_incomplete`), and `set_forum_url.py` and the installer's
   `install_tier` step word their message from it. When the write and the put-back both fail, they no
   longer say the file is unchanged; they say it may be incomplete and point at the backup. (#4631)
+- Maintainer docs: the #2652 migration ledger now records the session-start hook's real-store A6
+  re-run (2026-10-13, 0.118x PASS, posted on #3761 but never written into the ledger), and its
+  per-row `macOS` cells are swept for the `--owner` LaunchAgent (#3709, #3778, #3789); 33 cells
+  and three notes had still read "no Mac launcher yet". Docs only. (#2652)
 - The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
   empty or not a string) with one stderr line, instead of compacting: it cannot show which session
   napped (#4356), and surfaces the refusal once to the agent through the #4350 line.
