@@ -24,6 +24,7 @@ the real subprocess.run raise unless a test replaces it.
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
 import json
 import re
 import subprocess
@@ -34,9 +35,20 @@ from pathlib import Path
 import pytest
 
 _TOOLS = Path(__file__).resolve().parent.parent / "src" / "engram" / "tools"
-sys.path.insert(0, str(_TOOLS))
+_TOOL = _TOOLS / "triage_report.py"
+_MODNAME = "_triage_report_4779"
 
-import triage_report  # noqa: E402
+
+def _load():
+    """Load the tool by file path: a rank-0 sys.path insert would outrank src/ packages."""
+    spec = importlib.util.spec_from_file_location(_MODNAME, _TOOL)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[_MODNAME] = mod  # before exec_module: dataclasses resolve their module here
+    spec.loader.exec_module(mod)
+    return mod
+
+
+triage_report = _load()
 
 REPO = "engram-agents/engram"
 NOW_S = "2026-11-14T12:00:00Z"
