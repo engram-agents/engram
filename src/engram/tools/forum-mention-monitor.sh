@@ -431,11 +431,17 @@ POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
 #     the last windowed response, so a full poll would announce every mention
 #     older than the window as new. For that poll only, a mention counts as new
 #     if it is not in $SEEN AND its integer post_id is above the largest integer
-#     id in $SEEN (posts.id is INTEGER PRIMARY KEY, so ids grow with time); with
-#     no integer id in $SEEN nothing is announced and the poll just re-baselines.
-#     This fallback exists only for the lost-cursor case; with a cursor, the
-#     plain not-in-$SEEN rule applies, because the window, not the id, is what
-#     bounds the response.
+#     id in $SEEN (posts.id is INTEGER PRIMARY KEY, so ids grow with time). That
+#     high-water filter applies ONLY when $SEEN holds at least one integer id;
+#     with an empty $SEEN (or none with an integer id) every id not in $SEEN is
+#     announced, exactly as before #3729, so an agent's first-ever mention is
+#     never swallowed. Residual, stated honestly: if the cursor is lost while the
+#     last window was empty, a full poll can re-announce older mentions (loud
+#     duplicates, never silent loss). With a cursor, the plain not-in-$SEEN rule
+#     applies, because the window, not the id, is what bounds the response.
+#   - A seed whose response reports an EMPTY mentions list REMOVES any cursor file
+#     (and its .now temp): a stale cursor from before a forum DB restore must not
+#     suppress new mentions. Polls are full until the first mention sets a cursor.
 # A malformed / non-reporting 200 and a curl failure never reach the cursor
 # write: it sits behind the same guards as the $SEEN write.
 # ---------------------------------------------------------------------------
@@ -471,7 +477,8 @@ _poll_url() {
 # created_at), written atomically (tmp + replace, like $SEEN). Only called on a
 # body that reported a mentions list. Any trouble leaves the old cursor alone.
 # With the argument "seed" the old cursor is ignored: the cursor becomes the newest
-# created_at of THIS response alone (an empty list leaves the old cursor as is).
+# created_at of THIS response alone; an EMPTY list removes the cursor file (and
+# its .now temp) so a stale cursor cannot suppress later mentions.
 _cursor_advance() {
     python3 -c 'import json, os, sys
 from datetime import datetime, timezone
@@ -494,6 +501,13 @@ try:
         except Exception:
             best = None
     d = json.load(sys.stdin)
+    if len(sys.argv) > 2 and sys.argv[2] == "seed" and isinstance(d["mentions"], list) and not d["mentions"]:
+        for q in (path, path + ".now"):
+            try:
+                os.remove(q)
+            except FileNotFoundError:
+                pass
+        sys.exit(0)
     for m in d["mentions"]:
         try:
             c = m["created_at"]; k = key(c)
@@ -992,12 +1006,11 @@ while true; do
     *"&since="*) ;;
     *)
         # Steady-state poll WITHOUT a usable cursor (lost mid-run): see the
-        # since-cursor block. Only ids above the largest integer id in $SEEN count.
+        # since-cursor block. With integer ids in $SEEN, only ids above the largest count;
+        # with none, every id not in $SEEN counts (as before #3729).
         _max_seen="$(cut -f1 "$SEEN" | awk '$1 ~ /^[0-9]+$/ { if (!f || $1+0 > m) { m = $1+0; f = 1 } } END { if (f) printf "%d", m }')"
         if [ -n "$_max_seen" ]; then
             _new_pids="$(printf '%s\n' "$_new_pids" | awk -v m="$_max_seen" '$1 ~ /^[0-9]+$/ && $1+0 > m+0')"
-        else
-            _new_pids=""
         fi
         ;;
     esac

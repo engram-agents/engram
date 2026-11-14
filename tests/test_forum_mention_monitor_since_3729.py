@@ -455,3 +455,52 @@ def test_restart_with_existing_cursor_and_stale_seen_reannounces_nothing(tmp_pat
     got = announced(lines)
     assert len(got) == 1 and "#600" in got[0], lines
     assert cursor_of(seen) == ts(T0 + timedelta(seconds=30))
+
+
+# 10 ----------------------------------------------------------------------
+
+def test_empty_seen_and_no_cursor_first_ever_mention_is_announced_once(tmp_path):
+    # An agent with no mentions at all: $SEEN is empty and there is no cursor. The
+    # post_id high-water filter must NOT apply (nothing to measure against), so the
+    # first-ever mention is announced exactly once.
+    srv = Server([])
+
+    def hook(n, s):
+        if n == 3:
+            s.posts.append(post(1, T0, tid=700))
+
+    srv.on_request = hook
+    try:
+        lines, seen = run(tmp_path, srv, until=lambda s: len(s.paths) >= 6)
+    finally:
+        srv.stop()
+    got = announced(lines)
+    assert len(got) == 1 and "#700" in got[0], lines
+    assert cursor_of(seen) == ts(T0)
+
+
+def test_empty_seed_removes_a_stale_cursor_and_a_later_mention_is_announced(tmp_path):
+    # Stale cursor from before a forum DB restore (far in the future) + the restored
+    # forum has zero mentions: the seed must delete the cursor, or the new mention
+    # (created_at far below the cursor) would be filtered out by `since` forever.
+    future = ts(T0 + timedelta(days=30))
+    srv = Server([])
+    cursor_after_seed = []
+
+    def hook(n, s):
+        if n == 2:  # the first steady poll: the seed has finished by now
+            cursor_after_seed.append(cursor_of(tmp_path / "seen"))
+        if n == 3:
+            s.posts.append(post(1, T0, tid=800))
+
+    srv.on_request = hook
+    try:
+        lines, seen = run(tmp_path, srv, pre_cursor=future + "\n",
+                          until=lambda s: len(s.paths) >= 6)
+    finally:
+        srv.stop()
+    assert cursor_after_seed == [None], cursor_after_seed
+    assert since_of(srv.paths[1]) is None, srv.paths  # polls are full, not windowed
+    got = announced(lines)
+    assert len(got) == 1 and "#800" in got[0], lines
+    assert cursor_of(seen) == ts(T0)
