@@ -61,6 +61,10 @@ with an `-alpha` suffix during the alpha phase.
 - The install guide now says that an ACL or extended attribute on `~/.claude/settings.json` is lost during
   install: measured for `claude plugin marketplace add` on one Mac and on Linux, and for a full
   install on Linux (engram#4640, option 1).
+- `PR-MERGE-POLICY.md` now says a press guard must stop the press by explicit control flow
+  (`&&` into the merge, or `|| exit 1`), never by `set -e`: the Claude Code Bash tool
+  ignores `errexit`, measured on a merge seat on 2026-11-09 (#4545). The seat also reads
+  the gate's printed verdicts in a separate call before it presses.
 
 ## [v0.5.7] - 2026-11-12
 

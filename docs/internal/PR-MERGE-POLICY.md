@@ -422,6 +422,8 @@ seat can run it and any other seat can check that it ran.
    pressing: `--match-head-commit` pins only the head, never the base, so without
    this check two owners can each pass a scratch run on the same base and the second
    presses on a tree it never tested (the 2026-09-13 jointly-broken case, Borges).
+   The assertion is chained to the merge with `&&`, never left to `set -e` (see
+   *Merge-seat test rules*, rule 5).
    The release PR into `main` is **never merged with the button**: `main` is
    fast-forwarded to its head (`docs/internal/RELEASING.md`, steps 6 to 8), and there
    is no hotfix PR into `main`. A release branch that carries its own commits comes
@@ -874,6 +876,31 @@ In the same command as the press, the step:
   ceiling the press refuses and names the last state it read;
 - (c) after the press, asserts that the base's tree equals the tree the run predicted
   for that step.
+
+**Guards stop the press by control flow, not `set -e`.** In the Claude Code Bash
+tool, the command runs as one member of an `&&` list after the harness sources a shell
+snapshot, and bash ignores `errexit` there. Measured on a merge seat, 2026-11-09:
+`set -e; false; echo SURVIVED` printed `SURVIVED`. A press script that leans on
+`set -e` or `set -euo pipefail` to stop at a failed guard is therefore fail-open: on
+2026-11-09 a seat's script printed its own failure line and still ran `gh pr merge`,
+and #4545 landed past a red. A guard written as a bare `test ...` or `grep -q ...` on
+its own line stops nothing. So:
+- A guard stops the press only by explicit control flow: chained to the merge with
+  `&&`, or followed by `|| exit 1` (or `|| { echo "<NAME>-FAILED"; exit 1; }`).
+- The seat reads the gate's verdicts as printed text before pressing, in a separate
+  tool call from the press. The read prints one positive line per check (for example
+  `BASE-OK <sha>`, `CHECKS success`, `TREE <tree>`); the seat reads them, and only
+  then sends the press call. An exit status alone is not a verdict, because a
+  wrapper's `echo` after the command masks it.
+- The press call still re-asserts what can move: the base, chained with `&&` into
+  the merge. This keeps item 8's race closure, since the base can move between the
+  gate read and the press. (b)'s CI poll belongs to the gate read. (c)'s tree
+  assertion runs after the press, and its printed result is read too.
+
+```
+git fetch -q origin <base> && test "$(git rev-parse origin/<base>)" = <base-sha> \
+  && gh pr merge <N> --squash --match-head-commit <head-sha>
+```
 
 ```
 gh api 'repos/<owner>/<repo>/commits/<head-sha>/check-runs?filter=all&per_page=100' --jq '
