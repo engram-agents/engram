@@ -38,11 +38,30 @@ name: name-leak-sweep
 #
 # One change from the gate: the discriminator here is a CAPABILITY, not the
 # file's existence. A copy has the capability when `<copy> --help` exits 0 and
-# its output names `--roster-file`; we execute the copy for the scan anyway, so
-# probing it adds no trust surface, only evidence. The gate's POSITIVE
+# its output names `--roster-file`. Probing a copy EXECUTES it, so every probe
+# lives in the selection step, which holds no secret (#4782 r7); the sweep step
+# only ever runs the copy that step chose. The gate's POSITIVE
 # KNOWLEDGE rule carries over verbatim: a ref that does not RESOLVE is a fact
 # about the clone, never evidence that the tree lacks the capability, and it is
 # a hard failure rather than a reason to fall back.
+#
+# TWO STEPS, and the boundary between them is the security property (#4782 r7).
+# A `NAME_LEAK_ROSTER` in a step's environment is readable by any code that runs
+# as the same user — a child with a sanitized environment can still read its
+# parent's `/proc/<ppid>/environ` (measured on Linux with Yama
+# `ptrace_scope=1`). A roster file on disk is readable the same way. So:
+#
+#   select — no secret at all: extract the protected trees, run EVERY `--help`
+#            probe (including the checkout copy's), pick the scanner, export
+#            the choice. It must exit non-zero on every path that selects no
+#            scanner, because the next step runs only on its success.
+#   sweep  — the secret: validate the roster and the attestation, call
+#            `decide()`, write the roster file, run the SELECTED scanner,
+#            remove the file in a `finally`.
+#
+# After the split no probe of any copy runs while the roster exists anywhere on
+# the runner. The only contributor-controlled code that runs with the secret is
+# the BOOTSTRAP scan itself — the documented, by-design, loud exposure.
 #
 # Fork safety: a pull request whose head repository is not this repository
 # never receives the secret, so the job's status name carries the literal token
@@ -107,39 +126,48 @@ jobs:
           # base commit unreadable. fetch-depth: 0 removes that failure mode.
           fetch-depth: 0
 
-      # ── the decision, the roster, and the whole-tree scan ────────────────
-      # All I/O happens here (secret, roster canonicalisation, sha256,
-      # attestation read, scanner run); tools/name_leak_gate.py stays pure.
-      - name: decide, then sweep the whole tree
-        id: sweep
+      # ── Step A: SELECT the scanner. NO SECRET IN THIS STEP'S ENVIRONMENT ──
+      #
+      # Everything that EXECUTES a candidate copy happens here: extracting the
+      # protected trees and running every `<copy> --help` probe, including the
+      # BOOTSTRAP probe of the pull request's own copy. This step is given no
+      # secret, so contributor-controlled code running in it can read nothing
+      # from the environment (#4782 r7).
+      #
+      # A fork, or an event whose trust `decide()` will reject, therefore
+      # reaches extraction and probing too. That is harmless: this step holds
+      # no secret and the checkout token is read-only.
+      #
+      # Step B carries GitHub's default `success()` condition — this step has
+      # no `continue-on-error`, do not add one — so EVERY path that does not
+      # select a scanner must exit non-zero HERE. That exit invariant is what
+      # stops contributor code that ran in the BOOTSTRAP branch from leaving
+      # `GITHUB_ENV` / `GITHUB_PATH` / `GITHUB_OUTPUT` lines, or files under
+      # the run's temp dir, for a secret-bearing step to inherit.
+      - name: select the scanner
+        id: select
         env:
           EVENT_NAME: ${{ github.event_name }}
-          PR_IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository || false }}
-          NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
-          ATTESTATION_PATH: .github/name-leak-roster.attestation.json
-          # The tree the DECISION FUNCTION is read from. On a pull request
-          # that is the base commit, which the contributor cannot write; on a
-          # dispatch it is the commit being dispatched. The code being released
-          # must not influence the tool that scans it. (The scanner comes from
-          # the capability chain below, whose first link is this same base.)
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+          # Used by the workflow_dispatch guard below and by the chain's second
+          # link (`origin/<default_branch>`).
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           # Used only by the workflow_dispatch guard below: a dispatch can be
           # started on any branch, so the ref is part of the trust decision.
           GITHUB_REF: ${{ github.ref }}
+          # The first link of the scanner chain. On a pull request that is the
+          # base commit, which the contributor cannot write; on a dispatch it is
+          # the commit being dispatched.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
           # `-P`: do not prepend the cwd (or the script's directory) to
           # sys.path. Measured: without it `sys.path[0]` is `''` for a `-`
           # script, so a `json.py` committed at the repository root is imported
-          # in place of the standard library one — in this step, with the roster
-          # in the environment. With `-P` the import resolves to the stdlib.
+          # in place of the standard library one. That holds in BOTH steps; in
+          # THIS one the code that could shadow an import is a probed copy of
+          # the scanner, which on a pull request is contributor-controlled.
           python3 -P - <<'PY'
-          import hashlib
-          import importlib.util
-          import json
           import os
-          import re
           import subprocess
           import sys
           import tempfile
@@ -153,7 +181,6 @@ jobs:
           PROBE_TIMEOUT_SECONDS = 60
 
           event = os.environ.get("EVENT_NAME", "")
-          is_fork = os.environ.get("PR_IS_FORK", "false").strip().lower() == "true"
           default_branch = os.environ.get("DEFAULT_BRANCH", "dev")
 
           # ── the workflow_dispatch trust decision ─────────────────────────
@@ -183,92 +210,12 @@ jobs:
                   )
                   raise SystemExit(1)
 
-          raw = os.environ.get("NAME_LEAK_ROSTER", "")
-          roster_present = bool(raw.strip())
-
-          # Canonical roster text: ALL trailing newlines stripped and exactly
-          # one appended, so the attested sha256 is reproducible from any copy
-          # of the roster with the canonicalising one-liner documented in
-          # docs/internal/name-leak-gate-trusted-run.md. A plain `sha256sum`
-          # only agrees when the file already ends in exactly one newline.
-          # HASH THE WHOLE FILE, never per pattern: a per-pattern hash would be
-          # a membership oracle (a candidate name can be hashed and checked
-          # against it).
-          canonical = (raw.rstrip("\n") + "\n") if roster_present else ""
-          # The roster is a SECRET ON DISK, so it gets a private location, not a
-          # fixed one. A fixed path is wrong twice over: on a shared host the
-          # name is already taken by another user's file (so this step cannot
-          # write it), and a predictable world-readable path hands the roster to
-          # every account on the machine. `mkdtemp` creates the directory 0700;
-          # the file is created 0600 by open(2) rather than chmod'd afterwards,
-          # so there is no window in which it is readable.
+          # The run directory holds this step's full tree extractions and, in
+          # the NEXT step, the roster file. It is created under RUNNER_TEMP,
+          # which persists across steps within a job, so the selected scanner's
+          # path survives the step boundary. `mkdtemp` creates it 0700; the
+          # roster file the sweep step writes here is created 0600 by open(2).
           run_dir = tempfile.mkdtemp(dir=os.environ.get("RUNNER_TEMP") or None)
-          roster_path = os.path.join(run_dir, "roster.txt")
-          _fd = os.open(roster_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-          with os.fdopen(_fd, "w", encoding="utf-8") as fh:
-              fh.write(canonical)
-          actual_sha = (
-              hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-              if roster_present
-              else ""
-          )
-          pattern_count = (
-              sum(
-                  1
-                  for line in canonical.splitlines()
-                  if line.strip() and not line.strip().startswith("#")
-              )
-              if roster_present
-              else 0
-          )
-
-          # Validate every roster pattern HERE, before any scan step can run.
-          # scan-leaks.py can report a bad line by number, but validating first
-          # makes the echoed-text path unreachable by construction: on failure
-          # this step prints the LINE NUMBER only and fails. Never print the
-          # pattern text — this is a public log and the roster is a name list.
-          invalid_pattern_line = None
-          for lineno, line in enumerate(canonical.splitlines(), start=1):
-              stripped = line.strip()
-              if not stripped or stripped.startswith("#"):
-                  continue
-              try:
-                  re.compile(stripped)
-              except re.error:
-                  invalid_pattern_line = lineno
-                  break
-          if invalid_pattern_line is not None:
-              print(
-                  "::error::NAME_LEAK_ROSTER line "
-                  f"{invalid_pattern_line} is not a valid regular expression. "
-                  "Fix the secret; the pattern text is deliberately not printed."
-              )
-              raise SystemExit(1)
-
-          attestation_present = False
-          attestation_matches = False
-          attested_count = None
-          attested_sha = None
-          try:
-              with open(os.environ["ATTESTATION_PATH"], encoding="utf-8") as fh:
-                  attestation = json.load(fh)
-          except (OSError, ValueError):
-              attestation = None
-
-          if isinstance(attestation, dict):
-              attested_count = attestation.get("pattern_count")
-              attested_sha = attestation.get("roster_sha256")
-              # A valid attestation has schema 1, an integer pattern count and
-              # a 64-hex whole-file sha256. Anything else is "not present": a
-              # malformed or unset attestation must fail, never pass.
-              if (
-                  attestation.get("roster_format") == 1
-                  and isinstance(attested_count, int)
-                  and isinstance(attested_sha, str)
-                  and re.fullmatch(r"[0-9a-f]{64}", attested_sha) is not None
-              ):
-                  attestation_present = True
-                  attestation_matches = attested_sha == actual_sha
 
           base_sha = os.environ["BASE_SHA"]
           scanner_rel = "src/engram/tools/scan-leaks.py"
@@ -294,63 +241,6 @@ jobs:
                   "resolve in this clone, so the sweep cannot prove its own "
                   "code came from a protected tree. Failing closed."
               )
-              raise SystemExit(1)
-
-          def _blob_from_base(path):
-              proc = subprocess.run(
-                  ["git", "show", f"{base_sha}:{path}"],
-                  capture_output=True,
-              )
-              if proc.returncode != 0:
-                  print(
-                      f"::error::name-leak sweep: {path} is not readable from "
-                      f"{base_sha}. The code being released must not influence "
-                      "the tool that scans it. Failing closed."
-                  )
-                  raise SystemExit(1)
-              return proc.stdout
-
-          # The decision function comes from the base commit for the same
-          # reason the scanner does: on a same-repo pull request the branch is
-          # contributor-controlled, and this step holds the roster secret.
-          gate_path = os.path.join(run_dir, "name_leak_gate_base.py")
-          with open(gate_path, "wb") as fh:
-              fh.write(_blob_from_base("tools/name_leak_gate.py"))
-          gate_spec = importlib.util.spec_from_file_location(
-              "name_leak_gate", gate_path
-          )
-          gate = importlib.util.module_from_spec(gate_spec)
-          gate_spec.loader.exec_module(gate)
-
-          # decide() is the gate's contract, and its TRUSTED_EVENTS is
-          # {push, pull_request}. workflow_dispatch is the sweep's second
-          # trigger: it is not a fork PR and it carries exactly the same
-          # obligation (roster present, attestation matched), so it is
-          # presented to the contract under the trusted non-fork shape it has.
-          # Every other event keeps its own name and still fails closed — the
-          # `on:` block above prevents them at the trigger layer as well.
-          decision_event = "push" if event == "workflow_dispatch" else event
-          outcome = gate.decide(
-              decision_event,
-              is_fork,
-              roster_present,
-              attestation_present,
-              attestation_matches,
-          )
-
-          print(f"name-leak sweep: {outcome.conclusion} — {outcome.reason}")
-
-          if outcome.conclusion != gate.SUCCESS:
-              if event == "pull_request" and is_fork:
-                  print(
-                      "::error::The name-leak sweep did NOT scan this pull "
-                      "request: not scanned, roster unavailable. Fork PRs never "
-                      "receive the roster secret. Re-push the branch into this "
-                      "repository (a same-repo branch) so the sweep runs with "
-                      "the roster before merge."
-                  )
-              else:
-                  print(f"::error::name-leak sweep FAILED: {outcome.reason}")
               raise SystemExit(1)
 
           # ── the scanner: a capability-keyed three-link chain ──────────────
@@ -435,9 +325,17 @@ jobs:
           def _scanner_env():
               """`os.environ` with the roster secret removed.
 
-              The roster reaches the scanner through `--roster-file`; an
-              environment copy is a second path to the secret, and the one a
-              contributor-controlled scanner copy would read.
+              DEFENCE-IN-DEPTH, not a boundary. The boundary is the step split:
+              this step holds no secret at all, so there is nothing here for a
+              probed copy to read. The stripping is kept so that a future change
+              which gives this step the secret does not silently hand it to
+              contributor code.
+
+              Do NOT extend this to strip `GITHUB_ENV` / `GITHUB_PATH`: that
+              would be a partial defence that reads like a boundary, which is
+              the exact mistake this split fixes. The boundary is that the
+              selection step exits non-zero whenever it selects no scanner, so
+              the secret-bearing step never inherits what a probe left behind.
               """
               env = dict(os.environ)
               env.pop("NAME_LEAK_ROSTER", None)
@@ -468,8 +366,10 @@ jobs:
               none of them is evidence about the tree.
 
               Executed with `-P` for the same reason the scan is: the checkout
-              is not on sys.path. The copy is executed for the scan anyway, so
-              running `--help` adds no trust surface — only evidence.
+              is not on sys.path. Running `--help` EXECUTES the copy, so every
+              call site lives in this, the selection step, which holds no
+              secret (#4782 r7). Probing here costs no secret exposure; the
+              verdict is the only thing that crosses the step boundary.
               """
               try:
                   proc = subprocess.run(
@@ -576,6 +476,11 @@ jobs:
           # The over-approximation is deliberate (Clio ruled it fatal): a
           # later protected ref that would have supplied a usable scanner does
           # not excuse a link this run could not examine.
+          #
+          # This exit is also the INVARIANT the split depends on (#4782 r7):
+          # the code that ran in the BOOTSTRAP branch is contributor-controlled
+          # and can leave state for the next step to inherit. A non-zero exit
+          # here means the secret-bearing step never starts.
           if unexamined:
               print(
                   "::error::name-leak sweep: the sweep could not examine "
@@ -609,12 +514,18 @@ jobs:
                   # Probed once, and the verdict is kept rather than thrown
                   # away: the CONTROL FLOW and the OUTCOME below are unchanged
                   # — the checkout is the LAST link, so every non-capable
-                  # verdict ends at the fail-closed exit and no contributor
-                  # code runs — but the DIAGNOSIS must be truthful. A copy
-                  # that crashed, hung or could not be launched did not tell
-                  # us it lacks the flag; saying it did is the same
-                  # no-verdict-read-as-negative shape this round closes,
-                  # merely at a site where the outcome was already safe.
+                  # verdict ends at the fail-closed exit — but the DIAGNOSIS
+                  # must be truthful. A copy that crashed, hung or could not be
+                  # launched did not tell us it lacks the flag; saying it did
+                  # is the same no-verdict-read-as-negative shape this round
+                  # closes, merely at a site where the outcome was already
+                  # safe.
+                  #
+                  # THAT this call executes contributor code is the whole
+                  # reason for the step split, not an accident. It is safe HERE
+                  # and only here, because this step holds no secret: the
+                  # roster is created in the NEXT step, which runs only if this
+                  # one exits 0 having selected a scanner (#4782 r7).
                   checkout_verdict, checkout_detail = _probe_capability(
                       checkout_scanner
                   )
@@ -630,8 +541,10 @@ jobs:
                               "the pull request checkout's copy of "
                               f"{scanner_rel}: {checkout_detail}. The "
                               "checkout is the LAST link, so there is no "
-                              "fall-through to close and no contributor code "
-                              "runs: the sweep fails closed."
+                              "fall-through to close: the sweep fails closed, "
+                              "and the secret-bearing step never starts. The "
+                              "probe itself DID run contributor code — which "
+                              "is why it runs here, with no secret in scope."
                           )
                           lacking.append(
                               "the pull request checkout's "
@@ -655,6 +568,11 @@ jobs:
               # scanner without `--roster-file` cannot apply the roster, and
               # scanning the tree against nothing is a scan of nothing wearing
               # a green tick.
+              #
+              # This is the other half of the exit invariant (#4782 r7): no
+              # scanner selected means non-zero here, so the secret-bearing
+              # step never starts — even though contributor code (the
+              # checkout's `--help` probe) has just run.
               print(
                   "::error::name-leak sweep: no copy of "
                   f"{scanner_rel} with --roster-file could be found. Tried: "
@@ -664,88 +582,345 @@ jobs:
               )
               raise SystemExit(1)
 
+          # Export the selection for the sweep step. RUNNER_TEMP persists
+          # within a job, so `run_dir` and the scanner inside it are still
+          # there when that step runs. Only paths and a source string cross
+          # the boundary — nothing derived from the roster.
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"run_dir={run_dir}\n")
+              fh.write(f"scanner_path={scanner_path}\n")
+              fh.write(f"scanner_source={scanner_source}\n")
+          PY
+
+      # ── Step B: the roster, the decision, and the whole-tree scan ────────
+      #
+      # THE ONLY STEP THAT HOLDS THE SECRET. It performs the roster I/O and the
+      # scan; `tools/name_leak_gate.py` stays pure. It runs only on Step A's
+      # success, and it probes NOTHING: the scanner it runs was chosen and
+      # capability-checked by Step A, and the only contributor-controlled code
+      # that runs while the roster exists is that scanner's own scan — the
+      # documented, by-design, loud BOOTSTRAP exposure.
+      #
+      # The roster file is created here and removed in a `finally`, so it is
+      # gone on the success path and on every failure after creation.
+      - name: decide, then sweep the whole tree
+        id: sweep
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository || false }}
+          NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
+          ATTESTATION_PATH: .github/name-leak-roster.attestation.json
+          # The tree the DECISION FUNCTION is read from. On a pull request
+          # that is the base commit, which the contributor cannot write; on a
+          # dispatch it is the commit being dispatched. The code being released
+          # must not influence the tool that scans it. (The scanner itself was
+          # chosen by the previous step, from the same base first.)
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          # The selection Step A made. Its scanner is a full extraction under
+          # RUNNER_TEMP, so the path is valid in this step.
+          SELECTED_RUN_DIR: ${{ steps.select.outputs.run_dir }}
+          SELECTED_SCANNER: ${{ steps.select.outputs.scanner_path }}
+          SCANNER_SOURCE: ${{ steps.select.outputs.scanner_source }}
+        run: |
+          # `-P`: do not prepend the cwd (or the script's directory) to
+          # sys.path. Measured: without it `sys.path[0]` is `''` for a `-`
+          # script, so a `json.py` committed at the repository root is imported
+          # in place of the standard library one — in THIS step, with the
+          # roster in the environment. With `-P` the import resolves to the
+          # stdlib.
+          python3 -P - <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          event = os.environ.get("EVENT_NAME", "")
+          is_fork = os.environ.get("PR_IS_FORK", "false").strip().lower() == "true"
+
+          # The selection the previous step made. An empty or unusable
+          # selection is "no scanner", never a reason to guess: there would be
+          # nothing to scan with, and the roster file would be a secret on disk
+          # that no scan consumed. Fail closed.
+          run_dir = os.environ.get("SELECTED_RUN_DIR", "")
+          scanner_path = os.environ.get("SELECTED_SCANNER", "")
+          scanner_source = os.environ.get("SCANNER_SOURCE", "")
+          if not run_dir or not scanner_path or not os.path.isfile(scanner_path):
+              print(
+                  "::error::name-leak sweep: the selection step produced no "
+                  "usable scanner (run directory, scanner path or the file "
+                  "itself is missing). Failing closed before any scan."
+              )
+              raise SystemExit(1)
+
+          raw = os.environ.get("NAME_LEAK_ROSTER", "")
+          roster_present = bool(raw.strip())
+
+          # Canonical roster text: ALL trailing newlines stripped and exactly
+          # one appended, so the attested sha256 is reproducible from any copy
+          # of the roster with the canonicalising one-liner documented in
+          # docs/internal/name-leak-gate-trusted-run.md. A plain `sha256sum`
+          # only agrees when the file already ends in exactly one newline.
+          # HASH THE WHOLE FILE, never per pattern: a per-pattern hash would be
+          # a membership oracle (a candidate name can be hashed and checked
+          # against it).
+          canonical = (raw.rstrip("\n") + "\n") if roster_present else ""
+          actual_sha = (
+              hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+              if roster_present
+              else ""
+          )
+          pattern_count = (
+              sum(
+                  1
+                  for line in canonical.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              )
+              if roster_present
+              else 0
+          )
+
+          # Validate every roster pattern HERE, before any scan step can run.
+          # scan-leaks.py can report a bad line by number, but validating first
+          # makes the echoed-text path unreachable by construction: on failure
+          # this step prints the LINE NUMBER only and fails. Never print the
+          # pattern text — this is a public log and the roster is a name list.
+          invalid_pattern_line = None
+          for lineno, line in enumerate(canonical.splitlines(), start=1):
+              stripped = line.strip()
+              if not stripped or stripped.startswith("#"):
+                  continue
+              try:
+                  re.compile(stripped)
+              except re.error:
+                  invalid_pattern_line = lineno
+                  break
+          if invalid_pattern_line is not None:
+              print(
+                  "::error::NAME_LEAK_ROSTER line "
+                  f"{invalid_pattern_line} is not a valid regular expression. "
+                  "Fix the secret; the pattern text is deliberately not printed."
+              )
+              raise SystemExit(1)
+
+          attestation_present = False
+          attestation_matches = False
+          attested_count = None
+          attested_sha = None
+          try:
+              with open(os.environ["ATTESTATION_PATH"], encoding="utf-8") as fh:
+                  attestation = json.load(fh)
+          except (OSError, ValueError):
+              attestation = None
+
+          if isinstance(attestation, dict):
+              attested_count = attestation.get("pattern_count")
+              attested_sha = attestation.get("roster_sha256")
+              # A valid attestation has schema 1, an integer pattern count and
+              # a 64-hex whole-file sha256. Anything else is "not present": a
+              # malformed or unset attestation must fail, never pass.
+              if (
+                  attestation.get("roster_format") == 1
+                  and isinstance(attested_count, int)
+                  and isinstance(attested_sha, str)
+                  and re.fullmatch(r"[0-9a-f]{64}", attested_sha) is not None
+              ):
+                  attestation_present = True
+                  attestation_matches = attested_sha == actual_sha
+
+          base_sha = os.environ["BASE_SHA"]
+
+          def _blob_from_base(path):
+              proc = subprocess.run(
+                  ["git", "show", f"{base_sha}:{path}"],
+                  capture_output=True,
+              )
+              if proc.returncode != 0:
+                  print(
+                      f"::error::name-leak sweep: {path} is not readable from "
+                      f"{base_sha}. The code being released must not influence "
+                      "the tool that scans it. Failing closed."
+                  )
+                  raise SystemExit(1)
+              return proc.stdout
+
+          def _scanner_env():
+              """`os.environ` with the roster secret removed.
+
+              DEFENCE-IN-DEPTH, not a boundary. The roster reaches the scanner
+              through `--roster-file`; an environment copy is a second path to
+              the secret, and the one a contributor-controlled scanner copy
+              would read.
+
+              The boundary is the step split (#4782 r7): no probe of any copy
+              runs in this step at all, and the only contributor code that runs
+              while the secret is present is the BOOTSTRAP scan. Do NOT extend
+              this to strip `GITHUB_ENV` / `GITHUB_PATH`: that would be a
+              partial defence that reads like a boundary, which is the exact
+              mistake this split fixes.
+              """
+              env = dict(os.environ)
+              env.pop("NAME_LEAK_ROSTER", None)
+              return env
+
+          # The decision function comes from the base commit for the same
+          # reason the scanner does: on a same-repo pull request the branch is
+          # contributor-controlled, and this step holds the roster secret.
+          gate_path = os.path.join(run_dir, "name_leak_gate_base.py")
+          with open(gate_path, "wb") as fh:
+              fh.write(_blob_from_base("tools/name_leak_gate.py"))
+          gate_spec = importlib.util.spec_from_file_location(
+              "name_leak_gate", gate_path
+          )
+          gate = importlib.util.module_from_spec(gate_spec)
+          gate_spec.loader.exec_module(gate)
+
+          # decide() is the gate's contract, and its TRUSTED_EVENTS is
+          # {push, pull_request}. workflow_dispatch is the sweep's second
+          # trigger: it is not a fork PR and it carries exactly the same
+          # obligation (roster present, attestation matched), so it is
+          # presented to the contract under the trusted non-fork shape it has.
+          # Every other event keeps its own name and still fails closed — the
+          # `on:` block above prevents them at the trigger layer as well.
+          decision_event = "push" if event == "workflow_dispatch" else event
+          outcome = gate.decide(
+              decision_event,
+              is_fork,
+              roster_present,
+              attestation_present,
+              attestation_matches,
+          )
+
+          print(f"name-leak sweep: {outcome.conclusion} — {outcome.reason}")
+
+          if outcome.conclusion != gate.SUCCESS:
+              if event == "pull_request" and is_fork:
+                  print(
+                      "::error::The name-leak sweep did NOT scan this pull "
+                      "request: not scanned, roster unavailable. Fork PRs never "
+                      "receive the roster secret. Re-push the branch into this "
+                      "repository (a same-repo branch) so the sweep runs with "
+                      "the roster before merge."
+                  )
+              else:
+                  print(f"::error::name-leak sweep FAILED: {outcome.reason}")
+              raise SystemExit(1)
+
           # Printed on EVERY run, not only on the fallback: an operator reading
           # the log must be able to tell which tree the scanner came from.
           print(f"name-leak sweep: scanner read from {scanner_source}")
 
-          # The scanned tree is the CHECKOUT — on a pull request, GitHub's
-          # merge ref (base merged with head), not the head commit. That is the
-          # tree that would become `main`, which is the right subject for a
-          # whole-tree scan: a name in the head that is not in the merge result
-          # is not in the published tree.
+          # The roster is a SECRET ON DISK, so it gets a private location. The
+          # selection step made `run_dir` with `mkdtemp` (0700); the file is
+          # created 0600 by open(2) rather than chmod'd afterwards, so there is
+          # no window in which it is readable.
           #
-          # `-P` again, for the same reason: the checkout is not on sys.path.
-          # `--redact` is load-bearing in a public log — the unredacted finding
-          # form prints `path:line [label] snippet`, i.e. a name twice.
-          scan = subprocess.run(
-              [
-                  sys.executable,
-                  "-P",
-                  scanner_path,
-                  "--root",
-                  os.environ["GITHUB_WORKSPACE"],
-                  "--roster-file",
-                  roster_path,
-                  "--redact",
-              ],
-              capture_output=True,
-              text=True,
-              env=_scanner_env(),
-          )
-          sys.stdout.write(scan.stdout)
-          sys.stderr.write(scan.stderr)
-          sys.stdout.flush()
-          sys.stderr.flush()
-
-          # THE ASSERTION THAT MATTERS: a scan of nothing is not a clean scan.
-          # The summary line is printed on clean and dirty runs alike; if it is
-          # absent, duplicated, or says zero files were scanned, the sweep did
-          # not run and this is a failure, never a green tick.
-          summaries = re.findall(
-              r"^scan-leaks: scanned (\d+), skipped-binary (\d+)$",
-              scan.stdout,
-              re.MULTILINE,
-          )
-          if len(summaries) != 1:
-              print(
-                  "::error::the whole-tree sweep did not run: "
-                  "scan-leaks.py printed no single "
-                  "'scan-leaks: scanned N, skipped-binary M' line. "
-                  "A scan of nothing is not a clean scan."
+          # It is removed in a `finally`: it must not outlive this step, on the
+          # success path or on any failure after it is created — including an
+          # exception raised while the scan's output is read.
+          roster_path = os.path.join(run_dir, "roster.txt")
+          try:
+              _fd = os.open(
+                  roster_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
               )
-              raise SystemExit(1)
-          scanned = int(summaries[0][0])
-          if scanned == 0:
-              print(
-                  "::error::the whole-tree sweep did not run: the summary line "
-                  "reports 0 files scanned. A scan of nothing is not a clean "
-                  "scan."
+              with os.fdopen(_fd, "w", encoding="utf-8") as fh:
+                  fh.write(canonical)
+
+              # The scanned tree is the CHECKOUT — on a pull request, GitHub's
+              # merge ref (base merged with head), not the head commit. That is
+              # the tree that would become `main`, which is the right subject
+              # for a whole-tree scan: a name in the head that is not in the
+              # merge result is not in the published tree.
+              #
+              # `-P` again, for the same reason: the checkout is not on
+              # sys.path. `--redact` is load-bearing in a public log — the
+              # unredacted finding form prints `path:line [label] snippet`,
+              # i.e. a name twice.
+              #
+              # The environment is stripped of the secret as DEFENCE-IN-DEPTH,
+              # not as a boundary: the roster reaches the scanner through
+              # `--roster-file`, and a contributor-controlled scanner copy
+              # reading a second copy of the secret would be a second exposure.
+              # The boundary is the step split — no probe runs here at all, and
+              # the only contributor code that runs is the BOOTSTRAP scan.
+              scan = subprocess.run(
+                  [
+                      sys.executable,
+                      "-P",
+                      scanner_path,
+                      "--root",
+                      os.environ["GITHUB_WORKSPACE"],
+                      "--roster-file",
+                      roster_path,
+                      "--redact",
+                  ],
+                  capture_output=True,
+                  text=True,
+                  env=_scanner_env(),
               )
-              raise SystemExit(1)
+              sys.stdout.write(scan.stdout)
+              sys.stderr.write(scan.stderr)
+              sys.stdout.flush()
+              sys.stderr.flush()
 
-          print(
-              f"name-leak sweep: scanned {scanned} file(s) "
-              f"({summaries[0][1]} binary skipped) against "
-              f"{pattern_count} roster pattern(s)."
-          )
-
-          if scan.returncode != 0:
-              if scan.returncode == 1:
-                  # The type-specific duty lives in the scanner, which knows
-                  # whether the hit is a roster/pattern match or an absolute
-                  # home path. This branch cannot tell them apart (both are
-                  # exit 1), and telling a home-path hit to leave the roster
-                  # alone is operator misdirection.
-                  print(
-                      "::error::a hit means the tree is not clean; fix it in "
-                      "the release PR. The scanner's lines above name the kind "
-                      "of hit and the fix it needs."
-                  )
-              else:
+              # THE ASSERTION THAT MATTERS: a scan of nothing is not a clean
+              # scan. The summary line is printed on clean and dirty runs
+              # alike; if it is absent, duplicated, or says zero files were
+              # scanned, the sweep did not run and this is a failure, never a
+              # green tick.
+              summaries = re.findall(
+                  r"^scan-leaks: scanned (\d+), skipped-binary (\d+)$",
+                  scan.stdout,
+                  re.MULTILINE,
+              )
+              if len(summaries) != 1:
                   print(
                       "::error::the whole-tree sweep did not run: "
-                      f"scan-leaks.py exited {scan.returncode} "
-                      "(usage or root error)."
+                      "scan-leaks.py printed no single "
+                      "'scan-leaks: scanned N, skipped-binary M' line. "
+                      "A scan of nothing is not a clean scan."
                   )
-              raise SystemExit(1)
+                  raise SystemExit(1)
+              scanned = int(summaries[0][0])
+              if scanned == 0:
+                  print(
+                      "::error::the whole-tree sweep did not run: the summary "
+                      "line reports 0 files scanned. A scan of nothing is not a "
+                      "clean scan."
+                  )
+                  raise SystemExit(1)
+
+              print(
+                  f"name-leak sweep: scanned {scanned} file(s) "
+                  f"({summaries[0][1]} binary skipped) against "
+                  f"{pattern_count} roster pattern(s)."
+              )
+
+              if scan.returncode != 0:
+                  if scan.returncode == 1:
+                      # The type-specific duty lives in the scanner, which
+                      # knows whether the hit is a roster/pattern match or an
+                      # absolute home path. This branch cannot tell them apart
+                      # (both are exit 1), and telling a home-path hit to leave
+                      # the roster alone is operator misdirection.
+                      print(
+                          "::error::a hit means the tree is not clean; fix it "
+                          "in the release PR. The scanner's lines above name "
+                          "the kind of hit and the fix it needs."
+                      )
+                  else:
+                      print(
+                          "::error::the whole-tree sweep did not run: "
+                          f"scan-leaks.py exited {scan.returncode} "
+                          "(usage or root error)."
+                      )
+                  raise SystemExit(1)
+          finally:
+              try:
+                  os.unlink(roster_path)
+              except OSError:
+                  pass
           PY

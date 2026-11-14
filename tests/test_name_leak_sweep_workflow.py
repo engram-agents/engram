@@ -4,13 +4,20 @@ Two layers, the same shape `tests/test_name_leak_gate.py` uses:
 
 1. WIRING — the YAML is parsed and its contract is asserted: exactly the two
    triggers, no `schedule`, no `pull_request_target` use, the fork status name
-   carrying the literal token `NOT SCANNED`, no job-level skip, and a scan
-   invocation that passes `--roster-file` and `--redact`.
+   carrying the literal token `NOT SCANNED`, no job-level skip, the roster
+   secret reachable from the SWEEP step ONLY (by any route — step env, job or
+   workflow env, or a `GITHUB_ENV` write), and a scan invocation that passes
+   `--roster-file` and `--redact`.
 
-2. BEHAVIOUR — the sweep step's Python is extracted from the workflow verbatim
-   and RUN against a scratch git repository. The cells drive the one assertion
-   this workflow exists for: a scan which did not run must never report
-   success. A missing summary line, `scan-leaks: scanned 0`, a scanner that
+2. BEHAVIOUR — BOTH steps' Python is extracted from the workflow verbatim and
+   RUN in order against a scratch git repository, sharing a `RUNNER_TEMP` and
+   a `GITHUB_OUTPUT` file, so the STEP BOUNDARY is exercised rather than
+   assumed: `select` (no roster secret in its environment, every capability
+   probe, selects the scanner) then `sweep` (the secret, the roster file, the
+   decision, the scan). The cells drive the assertion this workflow exists
+   for: a scan which did not run must never report success — and no probe of
+   any copy may run while the roster exists anywhere on the runner
+   (#4782 r7). A missing summary line, `scan-leaks: scanned 0`, a scanner that
    exited, a missing roster or attestation, and a fork pull request are each a
    failure.
 
@@ -40,6 +47,19 @@ Discrimination for the mutations the specs name:
   `test_a_crashing_checkout_probe_is_not_reported_as_lacking` — every other
   cell's stub exits 0, and the timeout cell reaches the could-not-examine
   bucket through the separate `TimeoutExpired` arm.
+* R7: making the SELECTION step's fail-closed chain exit return 0 reddens the
+  two cells that read that step's OWN exit code,
+  `test_a_non_capable_bootstrap_verdict_never_starts_the_sweep` and
+  `test_step_a_fails_closed_when_the_checkout_probe_crashes`. The cells that
+  read the combined run stay green: the sweep step then starts on empty
+  outputs and dies, so the pair is still non-zero. That asymmetry is why the
+  exit invariant needs its own cell.
+* R7: putting `NAME_LEAK_ROSTER` into the selection step's `env:` reddens
+  `test_the_roster_secret_is_unreachable_from_the_selection_step` and no other
+  cell (the harness never passes the variable to that step regardless).
+* R7: dropping the `finally` around the scan reddens
+  `test_the_roster_file_is_removed_when_the_scan_raises` (the success path
+  removes the file too, so the normal-run cell cannot see it).
 """
 
 from __future__ import annotations
@@ -200,6 +220,38 @@ _HANGING_SCANNER = (
     "time.sleep(120)\n"
     'print("usage: scan-leaks.py [--roster-file PATH] [--redact]")\n'
 )
+# R7: an observer scanner. From INSIDE the scan it reports what the sweep step
+# handed it: the `--root` path and whether a readable roster file exists at the
+# `--roster-file` path. Those are the observables for "the scanned tree is
+# still the checkout" and "the roster file existed during the scan and is gone
+# afterwards" — neither is visible from the step's own output.
+_OBSERVER_SCANNER = _with_capability(
+    "import os\n"
+    'args = sys.argv[1:]\n'
+    'root = args[args.index("--root") + 1] if "--root" in args else "<absent>"\n'
+    "roster = (\n"
+    '    args[args.index("--roster-file") + 1]\n'
+    '    if "--roster-file" in args\n'
+    '    else "<absent>"\n'
+    ")\n"
+    'print(f"ROOT_AT_SCAN={root}")\n'
+    'print(f"ROSTER_FILE_IS_FILE_AT_SCAN={os.path.isfile(roster)}")\n'
+    "if os.path.isfile(roster):\n"
+    '    with open(roster, encoding="utf-8") as fh:\n'
+    '        print("ROSTER_TEXT_AT_SCAN=" + fh.read().strip())\n'
+    'print("scan-leaks: scanned 1, skipped-binary 0")\n'
+    "sys.exit(0)\n"
+)
+# R7: a scanner that emits invalid UTF-8 DURING THE SCAN. The sweep step reads
+# the child with `text=True`, so `subprocess.run` raises UnicodeDecodeError
+# after the roster file exists — the exception path the `finally` must clean up.
+# Its `--help` output stays valid, or the probe (which also decodes) would fail
+# and the chain would never select this copy.
+_INVALID_UTF8_SCANNER = _with_capability(
+    'sys.stdout.buffer.write(b"\\xff\\xfe not utf-8")\n'
+    "sys.stdout.buffer.flush()\n"
+    "sys.exit(0)\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -232,13 +284,23 @@ def _job(wf: dict) -> dict:
     return wf["jobs"]["name-leak-sweep"]
 
 
+def _step(wf: dict, step_id: str) -> dict:
+    return next(step for step in _job(wf)["steps"] if step.get("id") == step_id)
+
+
 def _sweep_step(wf: dict) -> dict:
-    return next(step for step in _job(wf)["steps"] if step.get("id") == "sweep")
+    """Step B: the step that holds the roster secret."""
+    return _step(wf, "sweep")
 
 
-def _sweep_script() -> str:
-    """The sweep step's Python, extracted from the workflow verbatim."""
-    step = _sweep_step(_workflow())
+def _select_step(wf: dict) -> dict:
+    """Step A: the secret-free selection step (#4782 r7)."""
+    return _step(wf, "select")
+
+
+def _step_script(step_id: str) -> str:
+    """One step's Python, extracted from the workflow verbatim."""
+    step = _step(_workflow(), step_id)
     lines = step["run"].splitlines()
     start = next(i for i, line in enumerate(lines) if "<<'PY'" in line)
     end = max(i for i, line in enumerate(lines) if line.strip() == "PY")
@@ -330,15 +392,16 @@ def test_scan_invocation_passes_roster_file_and_redact():
 
 def test_the_decision_function_is_read_from_the_base_commit():
     """The decision contract comes from BASE_SHA, never from the checkout: on
-    a same-repo pull request the branch is contributor-controlled and this
+    a same-repo pull request the branch is contributor-controlled and the sweep
     step holds the roster secret."""
-    step = _sweep_step(_workflow())
-    assert "BASE_SHA" in step["env"]
-    run = step["run"]
+    sweep = _sweep_step(_workflow())
+    assert "BASE_SHA" in sweep["env"]
+    run = sweep["run"]
     assert '_blob_from_base("tools/name_leak_gate.py")' in run
     assert 'f"{base_sha}:{path}"' in run
-    assert 'f"{ref}^{{commit}}"' in run, (
-        "an unresolvable base is a fact about the clone and must fail closed"
+    assert 'f"{ref}^{{commit}}"' in _select_step(_workflow())["run"], (
+        "an unresolvable base is a fact about the clone and must fail closed; "
+        "the selection step checks it before any probe runs"
     )
 
 
@@ -350,8 +413,11 @@ def test_the_scanner_comes_from_the_capability_chain():
     The second link is what makes the bootstrap claim reachable: on the first
     `dev -> main` release PR both protected refs predate `--roster-file`, so a
     base-only read could never pass the release that introduces the flag.
+
+    All of it lives in the SELECTION step (#4782 r7): the chain executes a
+    candidate copy for `--help`, so it may not run where a secret lives.
     """
-    step = _sweep_step(_workflow())
+    step = _select_step(_workflow())
     run = step["run"]
     assert "BASE_SHA" in step["env"]
     assert "DEFAULT_BRANCH" in step["env"]
@@ -374,8 +440,9 @@ def test_the_scanner_comes_from_the_capability_chain():
         "pull request checkout (BOOTSTRAP)"
     ), "the fail-closed check must run BEFORE the bootstrap fallback"
 
-    # The supplying link is printed on EVERY run, not only on the fallback.
-    assert "scanner read from {scanner_source}" in run
+    # The supplying link is printed on EVERY run, not only on the fallback —
+    # in the SWEEP step, next to the scan it describes.
+    assert "scanner read from {scanner_source}" in _sweep_step(_workflow())["run"]
 
 
 def test_the_capability_probe_is_bounded():
@@ -386,7 +453,7 @@ def test_the_capability_probe_is_bounded():
     constant so the timeout cell can shrink it for one run without editing the
     call, and the call site passes it.
     """
-    run = _sweep_step(_workflow())["run"]
+    run = _select_step(_workflow())["run"]
     assert re.search(r"^PROBE_TIMEOUT_SECONDS = \d+$", run, re.MULTILINE), (
         "the probe bound must be a module-level PROBE_TIMEOUT_SECONDS constant"
     )
@@ -401,7 +468,7 @@ def test_a_dispatch_must_run_from_the_default_branch():
     failure inside the step, never a job-level `if:` — a skip reports
     `skipped` under this job's name and supersedes the previous run on the
     same head, which is the false tick this file exists to prevent."""
-    step = _sweep_step(_workflow())
+    step = _select_step(_workflow())
     run = step["run"]
     assert "DEFAULT_BRANCH" in step["env"]
     assert "GITHUB_REF" in step["env"]
@@ -410,6 +477,129 @@ def test_a_dispatch_must_run_from_the_default_branch():
     assert "if" not in _job(_workflow()), (
         "the dispatch guard must not be a job-level `if:`"
     )
+
+
+# ---------------------------------------------------------------------------
+# R7 — the roster secret is unreachable from the selection step
+# ---------------------------------------------------------------------------
+
+def test_the_roster_secret_is_unreachable_from_the_selection_step():
+    """#4782 r7: the selection step must not carry `NAME_LEAK_ROSTER` BY ANY
+    ROUTE. A step-level check alone is the one that misses, so every route is
+    asserted on the PARSED YAML (a comment mentioning the name can neither
+    satisfy nor defeat a parsed check):
+
+    1. the step's own `env:` block;
+    2. the JOB-level `env:` block, which would put the secret into every step;
+    3. a `GITHUB_ENV` write in any step, which silently re-populates every
+       LATER step — including one whose own `env:` block is clean.
+
+    The workflow-level `env:` block is checked too: it is route 2 one level
+    up, and closing it costs nothing.
+    """
+    wf = _workflow()
+    job = _job(wf)
+    secret = "secrets.NAME_LEAK_ROSTER"
+
+    # Route 1 — the step's own env. The secret expression may be mapped in
+    # EXACTLY ONE step's env, and that step must be the sweep (Step B). This
+    # also catches a mapping under a DIFFERENT key name.
+    holders = {}
+    for step in job["steps"]:
+        keys = [
+            key
+            for key, value in (step.get("env") or {}).items()
+            if secret in str(value)
+        ]
+        if keys:
+            holders[step.get("id")] = keys
+    assert holders == {"sweep": ["NAME_LEAK_ROSTER"]}, (
+        "the roster secret must be mapped into the sweep step's environment "
+        f"and nowhere else; found {holders}"
+    )
+    assert "NAME_LEAK_ROSTER" not in (_select_step(wf).get("env") or {}), (
+        "the selection step's env must not name the roster secret at all"
+    )
+
+    # Route 2 — a job-level (or workflow-level) env would reach every step,
+    # the selection one included.
+    for scope, block in (("workflow", wf), ("job", job)):
+        block_env = block.get("env") or {}
+        assert "NAME_LEAK_ROSTER" not in block_env, (
+            f"{scope}-level env names NAME_LEAK_ROSTER, so every step receives it"
+        )
+        for key, value in block_env.items():
+            assert secret not in str(value), (
+                f"{scope}-level env {key!r} maps the roster secret, so every "
+                "step — including the selection step — receives it"
+            )
+
+    # Route 3 — a write to $GITHUB_ENV in ANY step reaches every LATER step.
+    # Only the WRITE FORMS are matched, so prose that merely names the variable
+    # (a comment saying it must not be used, say) can neither satisfy nor
+    # defeat the check. This job has no such write at all, which is the
+    # strongest form: a future one reddens this cell and has to be reasoned
+    # about.
+    shell_write = re.compile(r">>?\s*[\"']?\$\{?GITHUB_ENV\}?[\"']?")
+    python_write = re.compile(
+        r"os\.environ\[\s*[\"']GITHUB_ENV[\"']\s*\]|open\([^)]*GITHUB_ENV"
+    )
+    for step in job["steps"]:
+        label = step.get("id") or step.get("name") or "<unnamed step>"
+        run = step.get("run") or ""
+        assert not shell_write.search(run), (
+            f"step {label!r} redirects into $GITHUB_ENV; an export there "
+            "re-populates every later step, including the selection step"
+        )
+        assert not python_write.search(run), (
+            f"step {label!r} writes the GITHUB_ENV file; an export there "
+            "re-populates every later step, including the selection step"
+        )
+
+
+def test_the_selection_step_owns_every_capability_probe():
+    """#4782 r7: every probe runs in the secret-free step, and a failed
+    selection cannot reach the secret-bearing step.
+
+    Step B must contain NO `--help` probe: after the split, no probe of any
+    copy may run while the roster exists anywhere on the runner. The exit
+    invariant is the boundary that keeps it that way — Step B carries GitHub's
+    default `success()` condition (no `if:`, no `continue-on-error` on Step A),
+    so a non-zero Step A means Step B never starts.
+    """
+    select = _select_step(_workflow())
+    sweep = _sweep_step(_workflow())
+    select_run = select["run"]
+    sweep_run = sweep["run"]
+
+    # Both protected links AND the checkout link are probed in Step A.
+    assert "_probe_capability(candidate)" in select_run, (
+        "the protected-ref capability probe must run in the selection step"
+    )
+    assert "_probe_capability(" in select_run
+    assert "checkout_scanner" in select_run, (
+        "the checkout copy's probe must run in the selection step"
+    )
+    assert "pull request checkout (BOOTSTRAP)" in select_run
+
+    # ... and Step B probes nothing at all.
+    assert "--help" not in sweep_run, (
+        "no `--help` probe may run in the step that holds the roster secret"
+    )
+    assert "_probe_capability" not in sweep_run
+
+    # The invariant's mechanism: a failed selection stops the sweep.
+    assert "continue-on-error" not in select, (
+        "continue-on-error on the selection step would let a run that selected "
+        "no scanner reach the secret-bearing step"
+    )
+    assert "if" not in sweep, (
+        "the sweep step must keep GitHub's default success() condition"
+    )
+
+    # Declaration order: selection first, sweep second.
+    ids = [step.get("id") for step in _job(_workflow())["steps"]]
+    assert ids.index("select") < ids.index("sweep")
 
 
 # ---------------------------------------------------------------------------
@@ -549,11 +739,29 @@ def _failing_archive_git_dir(tmp_path: Path) -> Path:
     return shim_dir
 
 
-def _run_sweep(
+def _parse_github_output(path: Path) -> dict[str, str]:
+    """Parse a `GITHUB_OUTPUT` file written as `key=value` lines."""
+    outputs = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        key, sep, value = line.partition("=")
+        assert sep, f"GITHUB_OUTPUT line without '=': {line!r}"
+        outputs[key] = value
+    return outputs
+
+
+def _roster_files(root: Path) -> list[Path]:
+    """Every file named `roster.txt` under `root`, wherever it was created."""
+    return sorted(p for p in Path(root).rglob("roster.txt") if p.is_file())
+
+
+def _run_steps(
     work: Path,
     base: str,
     tmp_path: Path,
     *,
+    stop_after_select: bool = False,
     event: str = "pull_request",
     is_fork: str = "false",
     roster_value: str | None = None,
@@ -563,13 +771,31 @@ def _run_sweep(
     extra_path: Path | None = None,
     probe_timeout_seconds: int | None = None,
 ):
-    """Run the extracted sweep step; return (CompletedProcess, combined output).
+    """Run the workflow's TWO steps in order; return (proc, output, sweep_ran).
 
-    `probe_timeout_seconds` substitutes the step's `PROBE_TIMEOUT_SECONDS` for
-    one run. The shipped bound is sized for a real runner; a cell that provokes
-    a real timeout needs it small. Substituting the constant costs ~2s (two
-    links x 1s) and still exercises the SAME `TimeoutExpired` arm, message and
-    fail-closed routing that the shipped value reaches.
+    The step boundary IS the security property (#4782 r7), so the harness
+    models it rather than concatenating the two scripts into one run:
+
+    * `select` runs with NO `NAME_LEAK_ROSTER` in its environment. The
+      workflow's own step env does not carry it, and this harness pops it from
+      the inherited environment too, so an ambient value in the test process
+      cannot make the cells lie;
+    * the three values it writes to `GITHUB_OUTPUT` feed `sweep`, which runs
+      with the secret — the wiring the YAML declares;
+    * the sweep step is started only when the selection step exited 0, which
+      is GitHub's default `success()` condition;
+    * `sweep_ran` reports whether that second process was started at all, and
+      a `step-b-invoked` sentinel is left in `tmp_path` when it was. A cell
+      asserting "Step B never ran" needs this: on a wrongly-successful
+      selection the sweep step would start, find no outputs, and die — leaving
+      the combined run non-zero and the violation invisible.
+
+    `probe_timeout_seconds` substitutes the SELECTION step's
+    `PROBE_TIMEOUT_SECONDS` for one run. The shipped bound is sized for a real
+    runner; a cell that provokes a real timeout needs it small. Substituting
+    the constant costs ~2s (two links x 1s) and still exercises the SAME
+    `TimeoutExpired` arm, message and fail-closed routing that the shipped
+    value reaches.
     """
     if roster_value is None:
         roster_value = _ROSTER
@@ -580,45 +806,107 @@ def _run_sweep(
 
     runner_temp = tmp_path / "runner_temp"
     runner_temp.mkdir(exist_ok=True)
-    script_text = _sweep_script()
+    github_output = tmp_path / "github-output"
+    github_output.write_text("", encoding="utf-8")
+
+    select_text = _step_script("select")
     if probe_timeout_seconds is not None:
-        script_text, substituted = re.subn(
+        select_text, substituted = re.subn(
             r"^PROBE_TIMEOUT_SECONDS = \d+$",
             f"PROBE_TIMEOUT_SECONDS = {probe_timeout_seconds}",
-            script_text,
+            select_text,
             flags=re.MULTILINE,
         )
         assert substituted == 1, (
             "the probe bound must be a single module-level "
-            "'PROBE_TIMEOUT_SECONDS = <int>' line"
+            "'PROBE_TIMEOUT_SECONDS = <int>' line in the SELECTION step"
         )
-    script = tmp_path / "sweep.py"
-    script.write_text(script_text, encoding="utf-8")
+    select_py = tmp_path / "select.py"
+    select_py.write_text(select_text, encoding="utf-8")
 
-    env = dict(os.environ)
-    env.update(
+    common = dict(
         EVENT_NAME=event,
-        PR_IS_FORK=is_fork,
-        NAME_LEAK_ROSTER=roster_value,
-        ATTESTATION_PATH=".github/name-leak-roster.attestation.json",
         BASE_SHA=base,
-        DEFAULT_BRANCH=default_branch,
-        GITHUB_REF=git_ref,
         GITHUB_WORKSPACE=str(work),
         RUNNER_TEMP=str(runner_temp),
+        GITHUB_OUTPUT=str(github_output),
     )
+
+    # Each step gets the variables ITS OWN `env:` block declares (plus the
+    # runner-provided ones), so the harness cannot hand a step a key the
+    # workflow does not actually provide.
+    select_env = dict(os.environ)
+    select_env.update(common)
+    select_env.update(DEFAULT_BRANCH=default_branch, GITHUB_REF=git_ref)
+    # THE PROPERTY UNDER TEST: the selection step is given no secret. GitHub
+    # populates a step's environment from its own `env:` block, but
+    # `subprocess` inherits this test process's environment, so an ambient
+    # value is popped explicitly rather than left to chance.
+    select_env.pop("NAME_LEAK_ROSTER", None)
     if extra_path is not None:
-        # Prepend, so the shim shadows the real tool while `git` (and
-        # everything else the step calls) stays reachable.
-        env["PATH"] = f"{extra_path}{os.pathsep}{env.get('PATH', '')}"
-    proc = subprocess.run(
-        [sys.executable, "-P", str(script)],
+        select_env["PATH"] = f"{extra_path}{os.pathsep}{select_env.get('PATH', '')}"
+
+    proc_select = subprocess.run(
+        [sys.executable, "-P", str(select_py)],
         cwd=work,
-        env=env,
+        env=select_env,
         capture_output=True,
         text=True,
     )
-    return proc, proc.stdout + proc.stderr
+    out = proc_select.stdout + proc_select.stderr
+    if proc_select.returncode != 0:
+        return proc_select, out, False
+    if stop_after_select:
+        return proc_select, out, False
+
+    outputs = _parse_github_output(github_output)
+    sweep_py = tmp_path / "sweep.py"
+    sweep_py.write_text(_step_script("sweep"), encoding="utf-8")
+
+    sweep_env = dict(os.environ)
+    sweep_env.update(common)
+    sweep_env.update(
+        PR_IS_FORK=is_fork,
+        ATTESTATION_PATH=".github/name-leak-roster.attestation.json",
+        NAME_LEAK_ROSTER=roster_value,
+        SELECTED_RUN_DIR=outputs.get("run_dir", ""),
+        SELECTED_SCANNER=outputs.get("scanner_path", ""),
+        SCANNER_SOURCE=outputs.get("scanner_source", ""),
+    )
+    if extra_path is not None:
+        sweep_env["PATH"] = f"{extra_path}{os.pathsep}{sweep_env.get('PATH', '')}"
+
+    (tmp_path / "step-b-invoked").write_text("", encoding="utf-8")
+    proc_sweep = subprocess.run(
+        [sys.executable, "-P", str(sweep_py)],
+        cwd=work,
+        env=sweep_env,
+        capture_output=True,
+        text=True,
+    )
+    out += proc_sweep.stdout + proc_sweep.stderr
+    return proc_sweep, out, True
+
+
+def _run_sweep(work: Path, base: str, tmp_path: Path, **kwargs):
+    """Run both steps; return (proc, combined output) like a single step."""
+    proc, out, _sweep_ran = _run_steps(work, base, tmp_path, **kwargs)
+    return proc, out
+
+
+def _run_select(work: Path, base: str, tmp_path: Path, **kwargs):
+    """Run ONLY the selection step; return (proc, output).
+
+    The exit invariant — "the selection step exits non-zero on every path that
+    does not select a scanner" — is a fact about THIS step's own exit code.
+    Reading the combined run cannot test it: a wrongly-successful selection
+    starts the sweep step, which then dies on the missing outputs and leaves
+    the pair non-zero.
+    """
+    proc, out, _sweep_ran = _run_steps(
+        work, base, tmp_path, stop_after_select=True, **kwargs
+    )
+    return proc, out
 
 
 # ── positive control ────────────────────────────────────────────────────────
@@ -878,7 +1166,7 @@ def test_a_crashing_checkout_probe_is_not_reported_as_lacking(
 
     The outcome here was already safe — the checkout is the LAST link, so a
     crashed probe and a well-formed "lacks" both end at the same fail-closed
-    exit and no contributor code runs. The DIAGNOSIS was not: throwing the
+    exit. The DIAGNOSIS was not: throwing the
     verdict away (`...[0] != PROBE_CAPABLE`) appended "lacks --roster-file"
     for a copy the run could not examine, which is the no-verdict-read-as-
     negative sentence this round exists to remove.
@@ -941,28 +1229,190 @@ def test_a_hanging_probe_times_out_as_could_not_examine(sweep_repo, tmp_path):
     assert "'s src/engram/tools/scan-leaks.py lacks --roster-file" not in out, out
 
 
-def test_the_probe_and_scan_do_not_inherit_the_roster_secret(sweep_repo, tmp_path):
-    """R3-2 / R5-2: the roster reaches the scanner through --roster-file. The
-    environment copy is a second path to the secret — the one a
-    contributor-controlled copy would read — so the `--help` probe and the scan
-    both run with NAME_LEAK_ROSTER removed.
+# ── R7: the roster never exists while a probe runs ─────────────────────────
 
-    The stub's USAGE depends on whether it can see the secret, so the probe's
-    verdict is the observable at the probe call site: a leak makes the base
-    copy read as INCAPABLE and the chain falls to `origin/dev`, which is why
-    the source assertion below reddens when `env=_scanner_env()` is dropped
-    from the probe. (A marker printed by the probe could not: its stdout is
-    discarded.) At the scan call site a leak is directly visible — the stub
-    prints SCAN_SAW_ROSTER and exits 3.
+def test_a_non_capable_bootstrap_verdict_never_starts_the_sweep(
+    sweep_repo, tmp_path
+):
+    """#4782 r7 (the exit invariant): when the chain reaches the BOOTSTRAP link
+    and its copy is NOT capable, the selection step must exit non-zero — so the
+    secret-bearing step never starts.
+
+    The code that ran in the BOOTSTRAP branch is contributor-controlled, and it
+    can leave state for a later step to inherit: a `GITHUB_ENV` line (an
+    `LD_PRELOAD` or `PYTHONSTARTUP` applies to the next step's interpreter
+    before it runs a line), a `GITHUB_PATH` entry, a `GITHUB_OUTPUT` line, or
+    files under the run's temp dir. If the sweep step started after a
+    non-capable verdict it would begin with the roster in its environment AND
+    that state: finding 1, one step later.
+
+    Asserted on the SELECTION STEP'S OWN EXIT CODE as well as on the boundary,
+    because the combined run cannot tell the two apart (a wrongly-successful
+    selection makes the sweep step die on empty outputs).
+    """
+    work, _base, g = sweep_repo
+    # Both protected refs carry a scanner that lacks `--roster-file`, and so
+    # does the checkout: the chain reaches the BOOTSTRAP link and gets a
+    # non-capable verdict there.
+    base = _commit_scanner(work, g, _INCAPABLE_SCANNER)
+    g("push", "-q", "origin", "dev")
+    g("fetch", "-q", "origin", "dev")
+    (work / "src" / "engram" / "tools" / "scan-leaks.py").write_text(
+        _INCAPABLE_SCANNER, encoding="utf-8"
+    )
+
+    select_proc, select_out = _run_select(work, base, tmp_path)
+    assert select_proc.returncode != 0, select_out
+    assert (
+        "no copy of src/engram/tools/scan-leaks.py with --roster-file"
+        in select_out
+    ), select_out
+    assert _roster_files(tmp_path) == [], (
+        "the selection step must never create a roster file"
+    )
+
+    proc, out, sweep_ran = _run_steps(work, base, tmp_path)
+    assert proc.returncode != 0, out
+    assert sweep_ran is False, (
+        "the sweep step started after a selection that selected no scanner"
+    )
+    assert "scan-leaks: scanned" not in out, out
+    assert _roster_files(tmp_path) == []
+
+
+def test_step_a_fails_closed_when_the_checkout_probe_crashes(sweep_repo, tmp_path):
+    """#4782 r7 (the exit invariant, second shape): a CRASHING checkout probe is
+    still "no scanner selected", so the selection step must exit non-zero and
+    the sweep step must never start.
+
+    The crash is the no-verdict condition the chain records against the link;
+    the run must not fall through with a scanner it did not select.
+    """
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _INCAPABLE_SCANNER, push=True)
+    (work / "src" / "engram" / "tools" / "scan-leaks.py").write_text(
+        _CRASHING_SCANNER, encoding="utf-8"
+    )
+
+    select_proc, select_out = _run_select(work, base, tmp_path)
+    assert select_proc.returncode != 0, select_out
+    assert (
+        "could not examine the pull request checkout's copy of "
+        "src/engram/tools/scan-leaks.py" in select_out
+    ), select_out
+    assert _roster_files(tmp_path) == []
+
+    proc, out, sweep_ran = _run_steps(work, base, tmp_path)
+    assert proc.returncode != 0, out
+    assert sweep_ran is False, (
+        "the sweep step started after a selection that selected no scanner"
+    )
+    assert "scan-leaks: scanned" not in out, out
+    assert _roster_files(tmp_path) == []
+
+
+def test_the_sweep_step_writes_the_roster_file_and_removes_it(
+    sweep_repo, tmp_path
+):
+    """#4782 r7: the roster file is created in the SWEEP step, the scanner sees
+    it at `--roster-file` during the scan, and it is gone afterwards.
+
+    The observer scanner reports what it was handed from INSIDE the scan, so
+    "the file existed" is proven rather than assumed: a step that never wrote
+    it would still scan clean, which is not the same run.
+    """
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _OBSERVER_SCANNER)
+    proc, out = _run_sweep(work, base, tmp_path)
+
+    assert proc.returncode == 0, out
+    assert "ROSTER_FILE_IS_FILE_AT_SCAN=True" in out, out
+    assert f"ROSTER_TEXT_AT_SCAN={_ROSTER.strip()}" in out, out
+    assert _roster_files(tmp_path) == [], "the roster file outlived the sweep step"
+
+
+def test_the_roster_file_is_removed_when_the_scan_raises(sweep_repo, tmp_path):
+    """#4782 r7: the removal is in a `finally`, so it happens on the exception
+    path too.
+
+    The scanner emits invalid UTF-8 during the scan; the step reads the child's
+    output with `text=True`, so `subprocess.run` raises UnicodeDecodeError
+    AFTER the roster file exists. (The `--help` output stays valid, or the probe
+    — which also decodes — would fail and the chain would never select it.)
+    """
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _INVALID_UTF8_SCANNER)
+    proc, out = _run_sweep(work, base, tmp_path)
+
+    assert proc.returncode != 0, out
+    assert "UnicodeDecodeError" in out, out
+    assert _roster_files(tmp_path) == [], (
+        "the roster file survived an exception raised by the scan"
+    )
+
+
+def test_the_scanned_tree_is_still_the_checkout(sweep_repo, tmp_path):
+    """#4782 r7: the subject of the scan does not change in the split — it is
+    the CHECKOUT (on a pull request, GitHub's merge ref), never the head commit
+    and never one of the extracted protected trees.
+
+    Asserted twice: the observer scanner reports the `--root` it was handed,
+    and the checkout step must not pin a `ref:` that would make the workspace
+    something other than the merge ref.
+    """
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _OBSERVER_SCANNER)
+    proc, out = _run_sweep(work, base, tmp_path)
+    assert proc.returncode == 0, out
+    assert f"ROOT_AT_SCAN={work}" in out, out
+
+    # The scan invocation takes the root from GITHUB_WORKSPACE ...
+    sweep_run = _sweep_step(_workflow())["run"]
+    start = sweep_run.index("scan = subprocess.run(")
+    invocation = sweep_run[start:sweep_run.index("capture_output=True", start)]
+    assert '"--root"' in invocation
+    assert 'os.environ["GITHUB_WORKSPACE"]' in invocation
+
+    # ... and the checkout that sets GITHUB_WORKSPACE is not pinned to the
+    # pull request's head commit (the merge ref is what checkout defaults to).
+    checkout = next(
+        step
+        for step in _job(_workflow())["steps"]
+        if "checkout" in (step.get("uses") or "")
+    )
+    assert "ref" not in (checkout.get("with") or {}), (
+        "pinning the checkout to a ref would change the scan's subject away "
+        "from GitHub's merge ref"
+    )
+
+
+def test_the_probe_and_scan_do_not_inherit_the_roster_secret(sweep_repo, tmp_path):
+    """R3-2 / R5-2 / R7: the roster reaches the scanner through --roster-file.
+    The environment copy is a second path to the secret — the one a
+    contributor-controlled copy would read — so both call sites strip it.
+
+    After the split this is DEFENCE-IN-DEPTH, not the boundary (#4782 r7): the
+    probe runs in the selection step, which holds no secret to strip, so its
+    stripping is no longer observable here. The SCAN call site is, and its stub
+    prints SCAN_SAW_ROSTER and exits 3 on a leak. The probe call site is pinned
+    at the SOURCE instead of claimed as a behaviour.
     """
     work, _base, g = sweep_repo
     base = _commit_scanner(work, g, _ENV_PROBE_SCANNER)
     proc, out = _run_sweep(work, base, tmp_path)
     assert proc.returncode == 0, out
-    # The probe saw no secret, so the base copy qualified and supplied the
-    # scanner.
+    # The base copy qualified and supplied the scanner.
     assert f"scanner read from {base}" in out, out
     assert "SCAN_SAW_ROSTER" not in out, out
+
+    # Both call sites keep the stripping (defence-in-depth at the probe site,
+    # observable behaviour at the scan site).
+    assert "env=_scanner_env()" in _step_script("select"), (
+        "the probe's environment must keep stripping the roster name"
+    )
+    assert "env=_scanner_env()" in _step_script("sweep"), (
+        "the scan's environment must keep stripping the roster name"
+    )
 
 
 def test_fails_closed_when_the_base_does_not_resolve(sweep_repo, tmp_path):
