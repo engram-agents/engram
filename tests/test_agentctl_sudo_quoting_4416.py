@@ -32,7 +32,10 @@ The `tail_args` words after `--` are not touched here: tracked separately.
 
 The simulated sudo escaping is applied with a Python regex (the same rule as the sed one-liner
 `sed -z -E 's/([^A-Za-z0-9_$-])/\\\\\\1/g'`), so the cells also run where sed has no `-z`.
-Set ENGRAM_TEST_BASH to run the inner/outer bash cells against another bash (a Mac seat: /bin/bash).
+Set ENGRAM_TEST_BASH to run the inner/outer bash cells against another bash. tools/agentctl needs
+bash 4.3+ (`local -n`), so the cells that run it or its helper skip below that floor: on the macOS
+system bash 3.2 the helper prints sign-extended octal for bytes 0x80-0xFF, a path agentctl never
+reaches. A Mac seat runs these cells under a newer bash (for example Homebrew's).
 """
 from __future__ import annotations
 
@@ -47,6 +50,20 @@ import pytest
 AGENTCTL = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
 BASH = os.environ.get("ENGRAM_TEST_BASH", "bash")
 HAVE_DASH = shutil.which("dash") is not None
+
+
+def _bash_version():
+    try:
+        out = subprocess.run([BASH, "-c", 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"'],
+                             capture_output=True, text=True, timeout=20).stdout.split()
+        return int(out[0]), int(out[1])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return (0, 0)
+
+
+needs_bash43 = pytest.mark.skipif(
+    _bash_version() < (4, 3),
+    reason="tools/agentctl needs bash 4.3+ (local -n); below that the helper is unreachable")
 TEXT = AGENTCTL.read_text()
 LINES = TEXT.splitlines()
 
@@ -84,6 +101,7 @@ def _quote(word: bytes, how: str = "oct") -> bytes:
                           check=True).stdout
 
 
+@needs_bash43
 @pytest.mark.parametrize("name", list(HOSTILE))
 def test_c1_helper_roundtrips_bytes(name):
     word = HOSTILE[name]
@@ -125,6 +143,7 @@ def _outers():
                          marks=pytest.mark.skipif(not HAVE_DASH, reason="dash is not installed"))]
 
 
+@needs_bash43
 @pytest.mark.parametrize("outer", _outers())
 @pytest.mark.parametrize("name", list(SIM))
 def test_c2_octal_survives_simulated_sudo_i(outer, name):
@@ -132,6 +151,7 @@ def test_c2_octal_survives_simulated_sudo_i(outer, name):
     assert _simulate(outer, _quote(word)) == b"<" + word + b"><arg one><arg two>"
 
 
+@needs_bash43
 @pytest.mark.parametrize("outer", _outers())
 def test_c2_control_printf_q_loses_dollar_word(outer):
     word = SIM["dollar_home"]
@@ -207,6 +227,7 @@ def test_c3f_one_scope_words_builder_used_by_every_launch():
 
 # --- C4: end to end with a fake sudo -------------------------------------------------------
 
+@needs_bash43
 def test_c4_hostile_cd_dir_reaches_sudo_as_octal(tmp_path):
     rec, bindir = tmp_path / "rec", tmp_path / "bin"
     rec.mkdir()
