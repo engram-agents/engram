@@ -107,11 +107,11 @@ form that fires the parser.
    adjacent close keyword under negation, the trap documented above. An edit
    34 seconds later removed it. Six minutes after that edit,
    `closingIssuesReferences` still returned #699 (a captured response, not a
-   recollection). It cleared only at the next edit event, a title rename hours
-   later. So a stale answer is not bounded to a few seconds. This is one data
+   recollection). It appears to have cleared at the next edit event, a title
+   rename hours later; no read was captured at the rename itself. So a stale
+   answer is not bounded to a few seconds. This is one data
    point (n=1, one private repo), and whether the window is bound to the next
-   edit event or to time was not measured. When the answer matters, make a
-   small edit and query again rather than waiting longer.
+   edit event or to time was not measured.
 
    **No proximity gap: the grep's adjacency matches the parser.** #710 was
    first read as a proximity blind spot: the keyword and `#699` looked far
@@ -121,8 +121,8 @@ form that fires the parser.
    words between, a bracketed aside, a sentence break or a bare line break in
    the same paragraph all broke the link, and with two `#N` after one keyword
    only the adjacent one linked. Title text alone never populated
-   `closingIssuesReferences` before merge, and an exact replica of #710
-   reproduced 0 of 3. Reading the body's edit history
+   `closingIssuesReferences` before merge, and three replica constructions,
+   one of them an exact replica of #710, reproduced 0 of 3. Reading the body's edit history
    (`userContentEdits` in GraphQL) then found the negated adjacent keyword
    above. So the adjacent-only greps (checks 2 and 3 in `CLAUDE.md`) match the
    measured parser and need no widening on this evidence. The
