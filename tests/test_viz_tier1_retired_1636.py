@@ -18,6 +18,8 @@ Not touched (same word, other concepts): the retrieval-pipeline Tier 1, the
 recall-summary Tier 1, trust tiers, edge tiers.  These are source-text cells.
 """
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -127,3 +129,23 @@ def test_c3_compute_tiers_never_assigns_tier1():
     assert "tierMap" in body
     assert not re.search(r"tierMap\s*(\[[^\]]*\]|\.\w+)?\s*=\s*1\b(?!\.)", body)
     assert not re.search(r"\]\s*=\s*1\s*[;\n]", body)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed: the behavioural C3 cell is skipped")
+def test_c3_compute_tiers_returns_only_tiers_2_and_3_when_run():
+    """The source-text cell above only sees a literal `= 1`; an indirect value or an
+    Object.assign would pass it. Run the real function on 1500 nodes (some not current)
+    and assert the set of tiers it returns is exactly {2, 3}."""
+    js = (
+        "const src = require('fs').readFileSync(process.argv[1], 'utf8');"
+        "const i = src.indexOf('function computeTiers');"
+        "const fn = src.slice(i, src.indexOf('\\n}\\n', i) + 3);"
+        "const TIER2_MAX = 1000;"
+        "const nodes = [];"
+        "for (let k = 0; k < 1500; k++) nodes.push({id: 'n' + k, is_current: k % 7 !== 0, importance_score: (k * 37) % 1000});"
+        "const m = (new Function('TIER2_MAX', fn + '; return computeTiers;'))(TIER2_MAX)(nodes);"
+        "console.log(JSON.stringify([...new Set(Object.values(m))].sort()));"
+    )
+    out = subprocess.run(["node", "-e", js, str(ROOT / "src/engram/viz/static/graph.js")],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    assert out == "[2,3]", out
