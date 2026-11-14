@@ -824,12 +824,20 @@ _curl_detail() {
     printf 'curl %s: %s%s, %s' "$_CURL_RC" "$_m" "$_p" "$_t"
 }
 
+# Stage the ids parsed from $RESP into $SEEN.now. The pipefail SUBSHELL is what
+# lets ids()'s non-zero exit survive the `| sort` (a plain pipeline reports
+# sort's status, always 0); the function returns that subshell's status. Each
+# caller keeps its OWN failure branch (seed: retry; poll: skip the cycle).
+_stage_seen() {
+    ( set -o pipefail; printf '%s' "$RESP" | ids | sort > "$SEEN.now" )
+}
+
 _SEED_ANNOUNCED=0
 while true; do
     # Stage through $SEEN.now and mv, exactly as the poll loop does, so a
     # retrying seed never truncates a prior run's baseline on its way past.
     if _curl_fetch "$CURL_MAX_TIME" "$URL" \
-       && ( set -o pipefail; printf '%s' "$RESP" | ids | sort > "$SEEN.now" ); then
+       && _stage_seen; then
         mv "$SEEN.now" "$SEEN"
         printf '%s' "$RESP" | _cursor_advance seed
         if [ "$_SEED_ANNOUNCED" = 1 ]; then
@@ -999,12 +1007,12 @@ while true; do
     # A 200 whose body does not parse is NOT "zero mentions" (#2225). Left
     # alone it produces an empty $SEEN.now, and the unconditional mv below
     # overwrites $SEEN empty — after which the next GOOD poll marks every
-    # historical mention new. ids() exits non-zero there; run it under a
-    # pipefail SUBSHELL so that status survives the `| sort` (a plain
+    # historical mention new. ids() exits non-zero there; _stage_seen runs it
+    # under a pipefail SUBSHELL so that status survives the `| sort` (a plain
     # pipeline reports sort's status, which is always 0), then skip the cycle
     # exactly as a failed curl does. Remove $SEEN.now so no half-written
     # scratch file is left for a later cycle to pick up.
-    if ! ( set -o pipefail; printf '%s' "$RESP" | ids | sort > "$SEEN.now" ); then
+    if ! _stage_seen; then
         rm -f "$SEEN.now"
         continue
     fi
