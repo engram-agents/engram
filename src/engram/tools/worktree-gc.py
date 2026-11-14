@@ -15,6 +15,10 @@ This tool classifies each worktree and removes the safely-finished ones:
   PRUNE   detached-HEAD worktree, clean, whose head SHA matches NO open PR
           (reviewer-fairy leftover; nothing to lose)
   PRUNE   `worktree-agent-*` / `review-*` tmp-branch worktree, clean
+  KEEP    the worktree the deploy record names (`deployed_from` in
+          `<ENGRAM_HOME>/.deployed-version`): the upgrade flow's source tree,
+          load-bearing though it looks like a leftover (#4157); checked first
+          on every path that would otherwise prune it
   KEEP    branch worktree whose PR is OPEN (active work)
   KEEP    branch worktree with NO PR (pre-PR or abandoned — flagged for a human)
   SKIP    an AGENT-OWNED worktree (branch `worktree-agent-*` / `review-*`, or any
@@ -67,6 +71,16 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+# The ONE ENGRAM-home resolver for tools lives in tools/_owner_read.py (#3863);
+# resolve the package root through the symlink so `from tools import ...` works
+# run as a script, loaded by path, or from the flattened plugin layout (same
+# shim as deference_baseline.py).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+
+from tools import _owner_read as owner_read  # noqa: E402
 
 # #2808: an agent-owned worktree younger than this is never pruned. The /proc
 # in-use scan cannot see a running fairy (it is not a process holding a CWD).
@@ -122,6 +136,28 @@ def _is_clean(path: str) -> bool:
     # Untracked-only is still "has stuff" — but fairy worktrees commit their work,
     # so any porcelain output (tracked or untracked) means don't auto-remove.
     return rc == 0 and out.strip() == ""
+
+
+def _deploy_source() -> str | None:
+    """The realpath of the directory `<ENGRAM_HOME>/.deployed-version` names as
+    `deployed_from`, or None when it cannot be read (#4157).
+
+    The upgrade flow uses that directory as the SOURCE_DIR of the next upgrade,
+    so a worktree there is load-bearing even though it looks like a prunable
+    leftover. Fails open to None (today's classification) on a missing,
+    unreadable or malformed record, an empty value, or an unresolvable home.
+    """
+    try:
+        record = owner_read.engram_home() / ".deployed-version"
+        with open(record, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("deployed_from="):
+                    value = line.strip().partition("=")[2].strip()
+                    if value:
+                        return os.path.realpath(value)
+    except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
+        return None
+    return None
 
 
 def _is_in_use(path: str) -> bool:
@@ -320,6 +356,11 @@ def classify(t: dict, root: str, *, main_path: str | None = None,
     path = t["path"]
     if not Path(path).exists():
         return "PRUNE", "worktree directory missing (stale admin record)"
+    # Deploy source (#4157): before ANY prune return. The upgrade flow reads
+    # `deployed_from` and uses that directory as the next upgrade's source tree.
+    deploy_source = _deploy_source()
+    if deploy_source is not None and os.path.realpath(path) == deploy_source:
+        return "KEEP", "deploy source — the deploy record's deployed_from; the next upgrade needs it"
     if not _is_clean(path):
         return "SKIP", "DIRTY — uncommitted changes; not removing"
     branch = t.get("branch")

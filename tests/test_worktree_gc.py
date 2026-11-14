@@ -26,6 +26,11 @@ Coverage (all branches of classify()):
     worktrees are unchanged. These cells use REAL temp repos and worktrees
     (age is read from the worktree's git admin metadata) with os.utime.
 
+15. DEPLOY SOURCE (#4157): the directory `<ENGRAM_HOME>/.deployed-version`
+    names as `deployed_from` is the upgrade flow's SOURCE_DIR, so it is KEEP on
+    every path that would otherwise prune it (detached, tmp-branch, merged PR);
+    a missing / malformed record leaves the classification unchanged.
+
 classify() tests monkeypatch _is_clean, _pr_state, _is_in_use and (for the
 detached cases) _pr_for_sha on the loaded module. The direct _pr_for_sha unit
 cells patch _run instead (they exercise the real helper). Nothing here makes a
@@ -139,6 +144,16 @@ def _classify_real(root, wt, branch, *, pr_state=None, in_use=False, **kw):
         patch.object(_mod, "_pr_for_sha", return_value=(True, None)),
     ):
         return _mod.classify(t, root, **kw)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_engram_home(tmp_path, monkeypatch):
+    """classify() reads `<ENGRAM_HOME>/.deployed-version` (#4157); point it at an
+    empty scratch home so no cell depends on the live seat's deploy record."""
+    home = tmp_path / "_engram_home"
+    home.mkdir()
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    return home
 
 
 @pytest.fixture(autouse=True)
@@ -875,3 +890,140 @@ def test_is_clean_does_not_refresh_a_stale_index_4695(tmp_path):
     age_after = _mod._worktree_age_seconds(str(wt))
     assert age_after >= age_before
     assert age_after > _mod.AGE_GUARD_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# 15. deploy source (#4157): the `deployed_from` worktree is load-bearing
+# ---------------------------------------------------------------------------
+
+
+def _write_deployed(home, text):
+    (home / ".deployed-version").write_text(text)
+
+
+def _classify_detached(path):
+    t = _make_worktree(str(path), branch=None, detached=True, head="deadbeef")
+    with (
+        patch.object(_mod, "_is_clean", return_value=True),
+        patch.object(_mod, "_is_in_use", return_value=False),
+        patch.object(_mod, "_pr_for_sha", return_value=(True, None)),
+    ):
+        return _mod.classify(t, ROOT)
+
+
+def test_deploy_source_detached_clean_is_kept(tmp_path, _isolated_engram_home):
+    wt = tmp_path / "src-tree"
+    wt.mkdir()
+    # Control: no deploy record -> today's PRUNE.
+    assert _classify_detached(wt)[0] == "PRUNE"
+    _write_deployed(_isolated_engram_home, f"alpha_tag=v1\ndeployed_from={wt}\n")
+    action, reason = _classify_detached(wt)
+    assert action == "KEEP"
+    assert "deploy source" in reason
+
+
+def test_deploy_source_survives_symlinked_spelling(tmp_path, _isolated_engram_home):
+    real = tmp_path / "real-tree"
+    real.mkdir()
+    link = tmp_path / "link-tree"
+    link.symlink_to(real)
+    # record names the symlink, worktree listed by its real path ...
+    _write_deployed(_isolated_engram_home, f"deployed_from={link}\n")
+    assert _classify_detached(real)[0] == "KEEP"
+    # ... and the other way round.
+    _write_deployed(_isolated_engram_home, f"deployed_from={real}\n")
+    assert _classify_detached(link)[0] == "KEEP"
+
+
+@pytest.mark.parametrize("content", [
+    "alpha_tag=v1\n",                 # no deployed_from line
+    "deployed_from=\n",               # empty value
+    "deployed_from=   \n",            # blank value
+    "garbage without equals\n\x00\n",  # malformed
+    "",                                # empty file
+])
+def test_deploy_source_malformed_record_changes_nothing(
+        tmp_path, _isolated_engram_home, content):
+    wt = tmp_path / "src-tree"
+    wt.mkdir()
+    _write_deployed(_isolated_engram_home, content)
+    assert _classify_detached(wt)[0] == "PRUNE"
+
+
+def test_deploy_source_unreadable_record_changes_nothing(
+        tmp_path, _isolated_engram_home):
+    wt = tmp_path / "src-tree"
+    wt.mkdir()
+    # a directory where the file should be: read raises OSError
+    (_isolated_engram_home / ".deployed-version").mkdir()
+    assert _classify_detached(wt)[0] == "PRUNE"
+    # invalid UTF-8 bytes
+    (_isolated_engram_home / ".deployed-version").rmdir()
+    (_isolated_engram_home / ".deployed-version").write_bytes(b"deployed_from=\xff\xfe\n")
+    assert _classify_detached(wt)[0] == "PRUNE"
+
+
+def test_deploy_source_unresolvable_home_changes_nothing(tmp_path, monkeypatch):
+    wt = tmp_path / "src-tree"
+    wt.mkdir()
+    monkeypatch.setenv("ENGRAM_HOME", "relative/home")  # resolver raises ValueError
+    assert _classify_detached(wt)[0] == "PRUNE"
+
+
+def test_deploy_source_naming_a_different_directory_does_not_protect(
+        tmp_path, _isolated_engram_home):
+    wt = tmp_path / "src-tree"
+    wt.mkdir()
+    other = tmp_path / "other-tree"
+    other.mkdir()
+    _write_deployed(_isolated_engram_home, f"deployed_from={other}\n")
+    assert _classify_detached(wt)[0] == "PRUNE"
+    # a sibling sharing a string prefix is not the same directory either
+    longer = tmp_path / "src-tree-2"
+    longer.mkdir()
+    _write_deployed(_isolated_engram_home, f"deployed_from={longer}\n")
+    assert _classify_detached(wt)[0] == "PRUNE"
+
+
+@pytest.mark.parametrize("branch,pr_state", [
+    ("feat/done", "MERGED"),
+    ("feat/shut", "CLOSED"),
+    ("worktree-agent-xyz", None),
+    ("review-123", None),
+])
+def test_deploy_source_kept_on_every_prune_branch(
+        tmp_path, _isolated_engram_home, branch, pr_state):
+    wt = tmp_path / "src-tree"
+    wt.mkdir()
+    t = _make_worktree(str(wt), branch=branch)
+
+    def run():
+        with (
+            patch.object(_mod, "_is_clean", return_value=True),
+            patch.object(_mod, "_pr_state", return_value=pr_state),
+            patch.object(_mod, "_is_in_use", return_value=False),
+            patch.object(_mod, "_worktree_age_seconds", return_value=10**9),
+        ):
+            return _mod.classify(t, ROOT)
+
+    assert run()[0] == "PRUNE"
+    _write_deployed(_isolated_engram_home, f"deployed_from={wt}\n")
+    action, reason = run()
+    assert action == "KEEP"
+    assert "deploy source" in reason
+
+
+def test_deploy_source_keep_also_beats_age_guard_and_open_pr_paths(
+        tmp_path, _isolated_engram_home):
+    """Existing results elsewhere are untouched: with NO deploy record a dirty
+    worktree is still SKIP and an open-PR detached head still SKIP."""
+    wt = tmp_path / "src-tree"
+    wt.mkdir()
+    t = _make_worktree(str(wt), branch=None, detached=True, head="deadbeef")
+    with patch.object(_mod, "_is_clean", return_value=False):
+        assert _mod.classify(t, ROOT)[0] == "SKIP"
+    with (
+        patch.object(_mod, "_is_clean", return_value=True),
+        patch.object(_mod, "_pr_for_sha", return_value=(True, 7)),
+    ):
+        assert _mod.classify(t, ROOT)[0] == "SKIP"

@@ -281,7 +281,7 @@ Run the worktree garbage-collector once per day to remove worktrees whose PRs ha
 "$HOME/.engram/venv/bin/python3" tools/worktree-gc.py --apply
 ```
 
-Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), and never touches the main checkout. Dry-run mode (`"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py` without `--apply`) is available if you want to preview the plan first. Idempotent — a second run on a clean state is a no-op.
+Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), keeps the worktree the deploy record names as the upgrade source (`deployed_from`), and never touches the main checkout. Dry-run mode (`"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py` without `--apply`) is available if you want to preview the plan first. Idempotent — a second run on a clean state is a no-op.
 
 Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present (pre-T2 install or worktree GC not yet shipped).
 
