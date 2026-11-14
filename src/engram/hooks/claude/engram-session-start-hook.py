@@ -814,6 +814,30 @@ def _backup_push_health_line(engram_home: str):
     )
 
 
+_CONFIG_MISSING_LINE = (
+    "⚠️  ENGRAM substrate health: config.json is missing while knowledge.db exists; "
+    "ENGRAM tools refuse until it is restored from a backup you choose "
+    "(see the tool error for candidates)."
+)
+
+
+def _config_missing_health_line(engram_home: str):
+    """One loud line when knowledge.db exists and config.json does not (#4705, C9).
+
+    Two existence checks, no store open: the hook only reports, it never writes and never exits
+    non-zero for this. The tools refuse in that state (the tool error names the backup candidates)
+    and auto-surface returns nothing, so without this line the user would only meet it as a failing
+    tool call. An OSError on either check reads as "nothing to report" (advisory probe)."""
+    try:
+        if os.path.lexists(os.path.join(engram_home, "knowledge.db")) and not os.path.lexists(
+            os.path.join(engram_home, "config.json")
+        ):
+            return _CONFIG_MISSING_LINE
+    except OSError:
+        pass
+    return None
+
+
 def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
     """Check whether knowledge.sql is reasonably current relative to knowledge.db.
 
@@ -4174,6 +4198,9 @@ def _main_impl() -> None:
     _bp_line = _backup_push_health_line(ENGRAM_HOME)  # #4205: one bounded line, same emitter
     if _bp_line:
         _health_lines.append(_bp_line)
+    _cm_line = _config_missing_health_line(ENGRAM_HOME)  # #4705 C9: a lost config.json beside the DB
+    if _cm_line:
+        _health_lines.append(_cm_line)
     _health_text = "\n".join(_health_lines)
 
     if source == "startup":

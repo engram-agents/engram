@@ -13,9 +13,10 @@
 #                         [--sandbox-untagged] [--help]
 #
 # KNOWN GAP, step 1 never fetches: its deployable-tag guard reads the origin/* refs the checkout
-# already has. A checkout with stale origin/* refs (for example a shallow `git clone --branch vX`)
-# is refused at step 1, although step 5 does a bounded fetch and might have passed. Remedy:
-# `git fetch --tags origin`, then re-run.
+# already has. A full clone with stale origin/* refs: `git fetch --tags origin`, then re-run. A
+# shallow `git clone --depth 1 --branch vX` is refused too, and `git fetch --tags origin` does NOT
+# rescue a shallow clone: clone again without --depth, or run
+# `git remote set-branches origin '*' && git fetch --unshallow`, then re-run.
 #
 # TRYING IT ON A LIVE SEAT: scratch HOME, --no-recall-service (services are per user, not per HOME),
 # CLAUDE_HOME and CLAUDE_CONFIG_DIR unset. ENGRAM_HOME alone leaves the venv (~/.engram/venv, by
@@ -240,6 +241,53 @@ if os.path.lexists(path):
     existed = True
 else:
     d, existed = {}, False
+    # #4705 (C8): config.json absent while knowledge.db exists is a LOST config, not a new seat. Refuse
+    # BEFORE the buffer build, so nothing at all is written (no file, no backup). The same key phrases
+    # as engram_config_io.ConfigMissingError carry the same two remedies; a test asserts both copies.
+    data_dir = os.path.dirname(os.path.abspath(path))
+    if os.path.lexists(os.path.join(data_dir, "knowledge.db")):
+        import re, shlex
+        rx = re.compile(r"config\.json\.engram-backup\.(\d{8}T\d{6}Z)(?:-(\d+))?\Z")
+        found = []
+        try:
+            for name in os.listdir(data_dir):
+                m = rx.match(name)
+                if m:
+                    found.append(((m.group(1), int(m.group(2) or 0)), name))
+        except OSError:
+            pass
+        msg = ["ERR %s: config.json is missing while knowledge.db exists; the installer will not create it from "
+               "empty (the turn counter would restart and self_lineage would be blank). Nothing was written." % path]
+        if found:
+            msg.append("Backups beside it, newest first:")
+            for _, name in sorted(found, reverse=True):
+                label = ""
+                try:
+                    cand = os.path.join(data_dir, name)
+                    if os.path.getsize(cand) > 4 * 1024 * 1024:
+                        raise ValueError("too large")
+                    with open(cand, encoding="utf-8") as f:
+                        cd = json.load(f)
+                    if not isinstance(cd, dict):
+                        raise ValueError("not an object")
+                    lin = cd.get("self_lineage")
+                    if not (isinstance(lin, str) and lin.strip()):
+                        label = "  (no self_lineage)"
+                except (OSError, ValueError):
+                    label = "  (unreadable)"
+                msg.append("  %s  [%s]%s" % (shlex.quote(os.path.join(data_dir, name)), name[len("config.json.engram-backup."):], label))
+        else:
+            msg.append("No backup was found beside it (they are named config.json.engram-backup.<UTC stamp>); "
+                       "check the data dir's git history.")
+        msg.append("The user decides which backup to restore: the newest may itself be a regenerated default "
+                   "from before this fix, and restoring it sets whatever self_lineage it holds.")
+        msg.append("Once the user has chosen, run: cp -p <the backup you chose> %s" % shlex.quote(path))
+        msg.append("If the user confirms this seat is new, a tool writes the default (it refuses if "
+                   "config.json exists):")
+        msg.append("  python3 %s/write-default-config.py" % shlex.quote(os.path.join(guard_dir, "tools")))
+        msg.append("Do not pass its confirmation flag yourself: only the user can say this seat is new, and the flag stands for their word; the tool cannot tell who typed it (see its --help).")
+        print("\n".join(msg))
+        sys.exit(3)
 # An absent flag keeps the stored value (when it is a valid one), else the default applies.
 if tier_arg:
     tier = tier_arg
@@ -379,7 +427,7 @@ print(f(sys.argv[1]) or "")' "$REPO_ROOT" 2>/dev/null)" || _rc=$?
   if [ "$_rc" -ne 0 ] || [ -z "$_deploy_tag" ]; then
     _head_short="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     _branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-    fail "HEAD $_head_short (branch $_branch) is not a deployable tag merged into origin/dev or origin/main; step 5 would refuse it" "check out a deployable tag (v* or deploy/*; git fetch --tags origin first if your tags are stale) and re-run; --sandbox-untagged is for a test rig only, not a release"
+    fail "HEAD $_head_short (branch $_branch) is not a deployable tag merged into origin/dev or origin/main; step 5 would refuse it" "check out a deployable tag (v* or deploy/*) and re-run (--sandbox-untagged is for a test rig only, not a release). If this is a full clone with stale refs, run git fetch --tags origin first. If this is a shallow single-branch clone (git clone --depth), git fetch --tags origin does not help: clone again without --depth, or keep the clone, run this, then re-run: git remote set-branches origin '*' && git fetch --unshallow"
   fi
 fi
 
@@ -445,7 +493,12 @@ fi
 
 # ── Step 3: config.json ──────────────────────────────────────────────────────────────────────
 begin_step 3 "config.json"
-if ! _cfg_out="$(python3 -c "$PY_CONFIG" "$CONFIG_PATH" "$TIER_ARG" "$DEFAULT_TIER" "$REPO_ROOT/src/engram")"; then
+_cfg_rc=0
+_cfg_out="$(python3 -c "$PY_CONFIG" "$CONFIG_PATH" "$TIER_ARG" "$DEFAULT_TIER" "$REPO_ROOT/src/engram")" || _cfg_rc=$?
+if [ "$_cfg_rc" -eq 3 ]; then
+  # #4705 (C8): a lost config.json beside an existing knowledge.db. The helper's message carries the remedies.
+  fail "${_cfg_out#ERR }" "restore config.json as described above (this installer never creates one beside an existing knowledge.db), then re-run"
+elif [ "$_cfg_rc" -ne 0 ]; then
   fail "${_cfg_out#ERR }" "fix $CONFIG_PATH by hand, or move it aside ('mv $CONFIG_PATH $CONFIG_PATH.moved-aside'), and re-run (this installer never overwrites a config it cannot parse)"
 fi
 # Line 1 is "<status> <tier>" (the EFFECTIVE value: kept, changed or default);

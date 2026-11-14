@@ -15,6 +15,15 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- A lost `config.json` is no longer regenerated. When `knowledge.db` exists and `config.json` does not, ENGRAM now refuses instead of writing a default (a blank `self_lineage` silently turned the model-family gate off): a seat whose `config.json` is lost cannot open its memory or run the installer until the file is restored from a backup the user chooses. The refusal lists the backups, and a new `write-default-config.py` command writes the default for a genuinely new seat. The command needs the user's confirmation flag, and refusal messages do not print it. A fresh install, and a bootstrap, are unchanged. (#4705)
+- A refused in-place rewrite now reports which state the file is in as data (`WriteRefused.outcome`:
+  `nothing_written`, `restored` or `may_be_incomplete`), and `set_forum_url.py` and the installer's
+  `install_tier` step word their message from it. When the write and the put-back both fail, they no
+  longer say the file is unchanged; they say it may be incomplete and point at the backup. (#4631)
+- Maintainer docs: the #2652 migration ledger now records the session-start hook's real-store A6
+  re-run (2026-10-13, 0.118x PASS, posted on #3761 but never written into the ledger), and its
+  per-row `macOS` cells are swept for the `--owner` LaunchAgent (#3709, #3778, #3789); 33 cells
+  and three notes had still read "no Mac launcher yet". Docs only. (#2652)
 - The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
   empty or not a string) with one stderr line, instead of compacting: it cannot show which session
   napped (#4356), and surfaces the refusal once to the agent through the #4350 line.
@@ -24,10 +33,23 @@ with an `-alpha` suffix during the alpha phase.
   server-derived cursor next to its seen file and asks for the mentions after
   the cursor minus a 600 s overlap; the seen-set still announces each mention
   once. (#3729)
+- The marketplace installer now says what `claude plugin marketplace add` changed
+  in your own Claude files. It copies `plugins/known_marketplaces.json` and
+  `settings.json` before the call and compares them after it. It prints each key
+  that was added, removed or changed (never a string value), prints nothing for a
+  file that was only rewritten with the same content, and, when a key was removed
+  or changed, keeps the old file in `install-backups/` in the ENGRAM data folder
+  and prints its path. It does not run with `--skip-add`, with the Codex target,
+  or when `claude` is not on the PATH, and it never changes the installer's exit
+  code. The writes themselves are still Claude Code's (engram#4628)
 - Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
   gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
   until the next edit event. (#2213)
+- `ps -o command=` / `args=` now carries `-ww` at the six remaining sites (the daemon-start
+  holder diagnostic, the `engram-upgrade` and `engram-health-exam` skills' argv checks, and
+  three latency test/tool reads), so a pipe-width cut to 80 columns cannot shorten the argv.
+  (engram-agents/engram#4469)
 - `engram_derive` no longer returns an `independence_advisory` key. It duplicated
   the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
   or more lineages, and when the install has recorded its own lineage, that line
@@ -65,7 +87,9 @@ with an `-alpha` suffix during the alpha phase.
   the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
+- The forum mention monitor's summary line lists at most 10 threads and says how many more there are, instead of listing every thread. (#2225)
 - `forum read --new` / `--last N` now show the whole thread's post count with how many are shown, and label each post by its place in the thread (the first shown post was labelled OP). (#2480)
+- Restoring the forum from a backup now rebuilds the search index and embeddings the dump leaves out: the README's Restore steps run `forum_regen_derived.py` before the service starts, and `install-forum-service.sh` snapshots that tool and its embedding helper into `<service-dir>/app/tools/`. Before, a restored forum searched empty. (engram-agents/engram#868)
 - The last-ditch dev-checkout fallback for this agent's own MCP server now points at
   `<checkout>/src/engram/server.py`, where the file really is. It pointed at
   `<checkout>/server.py`, which does not exist, so a scoped `pgrep -f` could never
@@ -81,6 +105,10 @@ with an `-alpha` suffix during the alpha phase.
   no open PR looked like a reviewer leftover and was pruned. It is now kept, with
   the reason "deploy source". A missing or malformed deploy record changes
   nothing. (engram#4157)
+- The write-nudge and loop-arm Stop hooks now record the transcript size their own scan read
+  as the next scan's starting offset, instead of stat-ing the transcript a second time. A
+  transcript that grew in between no longer has those bytes skipped for every later turn.
+  (engram-agents/engram#1855)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
@@ -106,6 +134,12 @@ with an `-alpha` suffix during the alpha phase.
 - The `ia` refusal for an unconfigured forum now points at the engram-letter skill's
   troubleshooting row, not at a README path that does not ship on an installed seat
   (engram#3560).
+- `agentctl session` should now launch correctly under `sudo -i` for a seat name or a
+  `--cd` directory that holds `$`, a newline or a quote (verified by a simulation of sudo's
+  documented escaping rule applied by hand, not by a run of real sudo): those words are
+  quoted as octal ANSI-C (`$'\ooo...'`, every byte), which survives `sudo -i`'s re-parse
+  where `printf %q` lost them (engram#4416). Arguments after `--` are tracked separately
+  (engram#4754).
 - A roster line that does not compile as a regex no longer prints that line, or the
   regex error text, to stderr. The advisory name scan now reports only the roster
   line number, the error class and the offset. (engram#4559)
@@ -118,6 +152,11 @@ with an `-alpha` suffix during the alpha phase.
   as binary and counted, and one greppable summary line
   (`scan-leaks: scanned N, skipped-binary M`) says what the run ranged over.
   (#3732)
+- The whole-suite workflow (`tests.yml`) now runs the name-leak self-test and
+  the test files outside the main roots whenever the suite step ran, red or
+  green, so a red release run reports every failing step instead of hiding
+  the later ones; they stay skipped after a failed setup step or a cancel.
+  (#4554)
 
 ### Docs
 - The `engram-trust-tier` skill no longer describes a `force=true` override that `engram_set_trust_tier` does not have: it now names the real gate (`justification_obs_id` and `primary_user_approval_obtained`) and says the call fails closed without them (engram#4303). The handbook says config updates are `PUT /api/config/<key>`, not POST (engram#4461).

@@ -1488,7 +1488,11 @@ def _owner_only(home: Path) -> None:
 
 def _scenario(home, name):
     build_store(home)
-    set_flag(home, None)
+    # An empty config ("key absent"), not NO config file: #4705 C9 adds one health line to the hook
+    # when knowledge.db exists and config.json does not, and this cell compares the hook byte for byte
+    # with the pre-#4705 oracle. The flag reads OFF either way. The absent-file state is cell (i)
+    # `no_config_file`, which removes exactly the C9 line (below) and compares everything else.
+    set_flag(home, ...)
     db = home / "knowledge.db"
     source = "startup"
     marker = None
@@ -1706,6 +1710,22 @@ OFF_STATES = [
 ]
 
 
+_C9_PREFIX = "\u26a0\ufe0f  ENGRAM substrate health: config.json is missing while knowledge.db exists;"
+
+
+def _without_c9_line(stdout: str) -> str:
+    """#4705 C9 deliberately adds ONE health line when knowledge.db exists and config.json does not
+    (the state `no_config_file` builds); the pre-#4705 oracle cannot print it. Remove exactly that one
+    line from the new hook's output (exactly once, or fail) and compare every other byte unchanged."""
+    out = json.loads(stdout)
+    lines = out["hookSpecificOutput"]["additionalContext"].split("\n")
+    hits = [ln for ln in lines if ln.startswith(_C9_PREFIX)]
+    assert len(hits) == 1, ("the C9 line must appear exactly once", len(hits))
+    lines.remove(hits[0])
+    out["hookSpecificOutput"]["additionalContext"] = "\n".join(lines)
+    return json.dumps(out) + "\n"
+
+
 @pytest.mark.parametrize("state", [s[0] for s in OFF_STATES])
 def test_i_every_off_state_is_the_direct_path_and_never_touches_the_client(state, home, tmp_path, monkeypatch):
     """Only the JSON boolean true is ON. Absent / false / "true" / 1 / null / malformed / a missing
@@ -1726,7 +1746,10 @@ def test_i_every_off_state_is_the_direct_path_and_never_touches_the_client(state
     run = run_main(mod, new_home)
     assert run.exc is None, run.exc
     ref = run_main(load_ss(old_home, monkeypatch, oracle_hook(tmp_path)), old_home)
-    assert norm_home(run.stdout, new_home) == norm_home(ref.stdout, old_home)
+    new_out = run.stdout
+    if state == "no_config_file":
+        new_out = _without_c9_line(new_out)
+    assert norm_home(new_out, new_home) == norm_home(ref.stdout, old_home)
     assert "owner" not in run.stderr.lower()
     assert BLOCK_MARKERS["focus"] in run.ctx
 

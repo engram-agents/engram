@@ -428,6 +428,9 @@ for u in d.get("updates", []):
 #     `[ <big> -ge $_cur ]` exits 2 and that failure is swallowed by the
 #     existing `2>/dev/null`; and once seeded, every later REAL watermark
 #     fails the same comparison against it, so the cursor never recovers.
+#     The bound of this rung, stated plainly: it covers UNCOMPARABILITY only.
+#     An absurd but comparable value (1e18 is below 2**63-1) still passes and
+#     would still pin the cursor silently; the rung does not judge plausibility.
 #   - exit non-zero, print nothing: EITHER the body did not parse (200
 #     maintenance page, truncated JSON, empty string) OR it parsed and carries
 #     no usable watermark (a JSON array, a missing "as_of", a null one, a

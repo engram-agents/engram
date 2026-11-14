@@ -186,6 +186,57 @@ def test_write_offset_state_never_raises_on_bad_path():
     # No exception -- that's the whole assertion.
 
 
+def test_write_offset_state_explicit_offset_recorded_even_when_file_longer(tmp_path):
+    """engram-agents/engram#1855: the caller's scanned size is recorded verbatim,
+    NOT a fresh stat -- the transcript may have grown since the scan."""
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("hello world, plus bytes never scanned", encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    mod = _load_module()
+
+    mod.write_offset_state(str(state_file), str(transcript), offset=5)
+    stored_path, stored_offset = mod.read_offset_state(str(state_file))
+
+    assert stored_path == str(transcript)
+    assert stored_offset == 5
+
+
+def test_write_offset_state_explicit_zero_offset_is_honoured(tmp_path):
+    """0 is a valid scanned size (not 'falsy -> re-stat')."""
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("abc", encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    mod = _load_module()
+
+    mod.write_offset_state(str(state_file), str(transcript), offset=0)
+
+    assert mod.read_offset_state(str(state_file))[1] == 0
+
+
+def test_write_offset_state_offset_none_restats(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("abcdef", encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    mod = _load_module()
+
+    mod.write_offset_state(str(state_file), str(transcript), offset=None)
+
+    assert mod.read_offset_state(str(state_file))[1] == 6
+
+
+@pytest.mark.parametrize("bad", [-1, "7", 3.5, True, [1]])
+def test_write_offset_state_invalid_offset_falls_back_to_restat(tmp_path, bad):
+    """A negative or non-int offset never raises and never records garbage."""
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("abcdef", encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    mod = _load_module()
+
+    mod.write_offset_state(str(state_file), str(transcript), offset=bad)
+
+    assert mod.read_offset_state(str(state_file))[1] == 6
+
+
 # ---------------------------------------------------------------------------
 # read_delta()
 # ---------------------------------------------------------------------------

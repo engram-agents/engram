@@ -99,6 +99,10 @@ die() { printf '[install-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 # venv block never flagged (the normal case).
 _venv_fail=0
 
+# The temp folder holding the pre-add snapshot of the user's Claude files (#4628); removed by the
+# EXIT trap on every path. Empty when no snapshot was taken.
+_cc_snap=""
+
 # Items the run could not do. The run goes on past each one and ends with a block that lists them
 # (see _report_not_done), then exits EXIT_NOT_DONE: neither a silent warning nor an abort half way.
 EXIT_NOT_DONE=10
@@ -135,6 +139,10 @@ EOF_ND
 # end-of-script check would be unreachable from those paths; the trap catches all exits.
 _exit_trap() {
   local rc=$?
+  if [[ -n "${_cc_snap:-}" ]]; then
+    # `|| true`: under set -e a failed rm would abort this trap and change the exit code
+    rm -rf "$_cc_snap" || true
+  fi
   _report_not_done "$rc"
   if [[ "${_venv_fail:-0}" == "1" ]]; then
     log ""
@@ -584,7 +592,11 @@ if [[ $SKIP_BUILD -eq 0 ]] && [[ -n "${_cfg:-}" ]] && [[ -f "${_cfg}" ]] && comm
   # listed in the block at the end of the run (exit code 10). The tier is only remembered for the
   # next upgrade, so nothing else depends on it. The reason line is kept (stderr) for that block.
   _persist_err="$(mktemp "${TMPDIR:-/tmp}/install-local-marketplace-persist.XXXXXX")"
-  if ! python3 - "${_cfg}" "${_tier:-}" "$REPO_ROOT/src/engram" 2>"$_persist_err" <<'PY'
+  # Exit codes of the block: 0 saved or nothing to do; 1 refused (file untouched, or its old contents
+  # put back); 3 refused and the put-back failed too, so the file may be incomplete. The sentence in
+  # the block at the end follows the code, because "left exactly as it was" is false for 3.
+  _persist_rc=0
+  python3 - "${_cfg}" "${_tier:-}" "$REPO_ROOT/src/engram" 2>"$_persist_err" <<'PY' || _persist_rc=$?
 import sys
 path, tier, guard_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 if not tier:
@@ -595,18 +607,32 @@ import engram_file_guard as fg
 from pathlib import Path
 try:
     result = fg.apply_merge(Path(path), {'install_tier': tier}, filename='config.json')
+except fg.WriteRefused as exc:
+    # The guard says which state the file is in; this line must not claim more than that.
+    if exc.outcome == 'may_be_incomplete':
+        print(f"[install-local-marketplace] config.json may be incomplete: {exc}", file=sys.stderr)
+        sys.exit(3)
+    if exc.outcome == 'restored':
+        print(f"[install-local-marketplace] config.json write failed and its previous contents were put back: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"[install-local-marketplace] config.json left unchanged: {exc}", file=sys.stderr)
+    sys.exit(1)
 except (fg.MergeRefused, OSError, SystemExit) as exc:
     print(f"[install-local-marketplace] config.json left unchanged: {exc}", file=sys.stderr)
     sys.exit(1)
 if result != 'unchanged':
     print(f"[install-local-marketplace] config.json updated: install_tier={tier}")
 PY
-  then
+  if [[ $_persist_rc -eq 0 ]]; then
+    cat "$_persist_err" >&2
+  elif [[ $_persist_rc -eq 3 ]]; then
+    cat "$_persist_err" >&2
+    not_done "install_tier may not have been saved to ${_cfg} ($(tail -n 1 "$_persist_err" | sed 's/^\[install-local-marketplace\] //')). The file may be incomplete." \
+             "restore that file from the backup named above, then run this installer again; until then the next upgrade does not remember the tier."
+  else
     cat "$_persist_err" >&2
     not_done "install_tier was not saved to ${_cfg} ($(tail -n 1 "$_persist_err" | sed 's/^\[install-local-marketplace\] //')). The file was left exactly as it was." \
              "fix that file, or move it aside, then run this installer again; until then the next upgrade does not remember the tier."
-  else
-    cat "$_persist_err" >&2
   fi
   rm -f "$_persist_err"
 fi
@@ -1073,8 +1099,32 @@ else
     exit 0
   fi
 
+  # #4628: `claude plugin marketplace add` rewrites two of the user's own files and prints nothing
+  # about it. Snapshot them first, name every key it changed or removed afterwards, and keep a copy
+  # of the old file when something would be lost. The helper never fails (it exits 0 whatever
+  # happens), and `claude`'s own exit status is still the script's: it is held across the report
+  # and re-raised, so `set -e` behaves as it did before. The CLI honours CLAUDE_CONFIG_DIR.
+  _cc_home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  _cc_files=("$_cc_home/plugins/known_marketplaces.json" "$_cc_home/settings.json")
+  _cc_diff="$(dirname "$_self")/claude_config_diff.py"
+  if [[ -f "$_cc_diff" ]] && command -v python3 >/dev/null 2>&1; then
+    if _cc_snap="$(mktemp -d "${TMPDIR:-/tmp}/install-local-marketplace-claude-snap.XXXXXX" 2>/dev/null)"; then
+      python3 "$_cc_diff" snapshot --dest "$_cc_snap" "${_cc_files[@]}" || true
+    else
+      _cc_snap=""
+    fi
+  fi
+
   log "Registering marketplace with Claude Code"
-  claude plugin marketplace add "$MARKETPLACE_ROOT"
+  _cc_rc=0
+  claude plugin marketplace add "$MARKETPLACE_ROOT" || _cc_rc=$?
+
+  if [[ -n "$_cc_snap" ]]; then
+    python3 "$_cc_diff" report --snapshot "$_cc_snap" --backup-root "$ENGRAM_HOME/install-backups" "${_cc_files[@]}" || true
+  fi
+  if [[ "$_cc_rc" -ne 0 ]]; then
+    exit "$_cc_rc"
+  fi
 fi
 
 log ""

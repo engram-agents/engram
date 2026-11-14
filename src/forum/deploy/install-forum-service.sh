@@ -338,6 +338,12 @@ fi
 [ -f "$SRC/tools/forum_backup.py" ] || {
   echo "ERROR: $SRC/tools/forum_backup.py not found — the backup units run the snapshot of this script" >&2; exit 2;
 }
+[ -f "$SRC/tools/forum_regen_derived.py" ] || {
+  echo "ERROR: $SRC/tools/forum_regen_derived.py not found — a restore runs the snapshot of this script (#868)" >&2; exit 2;
+}
+[ -f "$SRC/tools/forum_backfill_embeddings.py" ] || {
+  echo "ERROR: $SRC/tools/forum_backfill_embeddings.py not found — the regen tool imports it (#868)" >&2; exit 2;
+}
 if [ "$DRY_RUN" -eq 0 ]; then
   command -v systemctl >/dev/null || {
     echo "ERROR: systemctl not found (this installer targets systemd --user)" >&2; exit 2;
@@ -835,6 +841,19 @@ if [ "$DRY_RUN" -eq 1 ]; then
 else
   cp -L "$SRC/tools/forum_backup.py" "$APP/tools/forum_backup.py"
 fi
+
+# The restore tools (#868). The backup dump has no search index and no embeddings,
+# so a restore runs forum_regen_derived.py (which imports forum_backfill_embeddings.py
+# from its own directory and the forum package from $APP/forum). Same rule as the
+# backup tool: run the snapshot, never a checkout.
+for _regen_tool in forum_regen_derived.py forum_backfill_embeddings.py; do
+  echo "==> Snapshotting restore tool → $APP/tools/$_regen_tool"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  [dry-run] cp -L $SRC/tools/$_regen_tool → $APP/tools/$_regen_tool (resolves any symlink)"
+  else
+    cp -L "$SRC/tools/$_regen_tool" "$APP/tools/$_regen_tool"
+  fi
+done
 
 # Build the venv ONLY if it isn't already a working one.
 if [ "$DRY_RUN" -eq 0 ] && [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import flask" 2>/dev/null; then
