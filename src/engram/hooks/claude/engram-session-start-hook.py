@@ -614,8 +614,8 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
          MCP server runs from the plugin tree, not from ENGRAM_HOME.
       2. $ENGRAM_HOME/server.py (legacy scatter-install pattern in case
          hooks were copied separately or the colocation is unusual)
-      3. ~/engram/server.py, else ~/engram-alpha/server.py (live-source dev fallback;
-         engram is the default name, engram-alpha the accepted old one)
+      3. ~/engram/src/engram/server.py, else ~/engram-alpha/src/engram/server.py (live-source
+         dev fallback; engram is the default name, engram-alpha the accepted old one)
     """
     # Hook lives at <runtime-dir>/hooks/engram-session-start-hook.py,
     # server.py lives at <runtime-dir>/server.py.
@@ -627,7 +627,7 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
     candidate = os.path.join(engram_home, "server.py")
     if os.path.exists(candidate):
         return candidate
-    return pick_checkout("/server.py") or os.path.expanduser("~/engram/server.py")
+    return pick_checkout("/src/engram/server.py") or os.path.expanduser("~/engram/src/engram/server.py")
 
 
 def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:

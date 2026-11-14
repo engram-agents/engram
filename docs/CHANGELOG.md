@@ -42,6 +42,11 @@ with an `-alpha` suffix during the alpha phase.
   removed. (#4358)
 
 ### Fixed
+- The last-ditch dev-checkout fallback for this agent's own MCP server now points at
+  `<checkout>/src/engram/server.py`, where the file really is. It pointed at
+  `<checkout>/server.py`, which does not exist, so a scoped `pgrep -f` could never
+  match a server running from source. Fixed in the hooks library, the session-start
+  hook and the supervision probe. (engram-agents/engram#1867)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
