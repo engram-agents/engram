@@ -408,8 +408,10 @@ def test_the_umask_alone_makes_the_new_db_0640_from_creation(tmp_path):
     """Zephyr's control: with an ambient umask of 022 and the block's chmod made a
     no-op, the new forum.db must still be 0640, so it is never wider than 0640 at
     any moment. Fails the moment the block's `umask 027` line goes."""
-    block = "umask 022\n" + _restore_block().replace('chmod 0640 "$D/forum.db"', ":")
-    assert block.count(":\n") >= 1  # the chmod really was replaced
+    src = _restore_block()
+    assert 'chmod 0640 "$D/forum.db"' in src  # the line to neutralise is there
+    block = "umask 022\n" + src.replace('chmod 0640 "$D/forum.db"', ":")
+    assert "chmod 0640" not in block  # and it really is gone
     x = _run_block(tmp_path, model=True, block=block)
     assert x.r.returncode == 0, x.both
     assert (x.live / "forum.db").stat().st_mode & 0o777 == 0o640
