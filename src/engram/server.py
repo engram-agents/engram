@@ -8050,7 +8050,10 @@ def engram_set_recall_summaries(payload_json: str) -> str:
     """Batch-write recall_summary + recall_keywords for multiple nodes.
 
     Best-effort: applies valid entries, returns per-item errors for invalid ones
-    (no all-or-nothing rollback). Use for sleep-cycle cohort writes and bulk
+    (no all-or-nothing rollback). Every applied entry attempts a fresh embedding of
+    the complete post-update canonical recipe, including an identical-input replay.
+    An unavailable or unverified vector keeps the summary but is reported as pending
+    and included in needs_reembed. Use for sleep-cycle cohort writes and bulk
     backfill operations.
 
     Args:
@@ -8077,10 +8080,12 @@ def engram_set_recall_summaries(payload_json: str) -> str:
 
     Returns:
         JSON: {
-            "ok": [{"node_id": "..."}, ...],
+            "ok": [{"node_id": "...", "embedding_refresh": "refreshed" | "pending",
+                    "embedding_refresh_reason": "..."}, ...],
             "errors": [{"node_id": "...", "error": "...", ...}, ...],
             "applied": N,
             "failed": M,
+            "needs_reembed": ["..."],  # unique targets whose latest applied entry is pending
             "summaries_file": "<path>"  # present only when summaries_file was used
         }
     """
