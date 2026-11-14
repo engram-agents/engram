@@ -877,31 +877,6 @@ In the same command as the press, the step:
 - (c) after the press, asserts that the base's tree equals the tree the run predicted
   for that step.
 
-**Guards stop the press by control flow, not `set -e`.** In the Claude Code Bash
-tool, the command runs as one member of an `&&` list after the harness sources a shell
-snapshot, and bash ignores `errexit` there. Measured on a merge seat, 2026-11-09:
-`set -e; false; echo SURVIVED` printed `SURVIVED`. A press script that leans on
-`set -e` or `set -euo pipefail` to stop at a failed guard is therefore fail-open: on
-2026-11-09 a seat's script printed its own failure line and still ran `gh pr merge`,
-and #4545 landed past a red. A guard written as a bare `test ...` or `grep -q ...` on
-its own line stops nothing. So:
-- A guard stops the press only by explicit control flow: chained to the merge with
-  `&&`, or followed by `|| exit 1` (or `|| { echo "<NAME>-FAILED"; exit 1; }`).
-- The seat reads the gate's verdicts as printed text before pressing, in a separate
-  tool call from the press. The read prints one positive line per check (for example
-  `BASE-OK <sha>`, `CHECKS success`, `TREE <tree>`); the seat reads them, and only
-  then sends the press call. An exit status alone is not a verdict, because a
-  wrapper's `echo` after the command masks it.
-- The press call still re-asserts what can move: the base, chained with `&&` into
-  the merge. This keeps item 8's race closure, since the base can move between the
-  gate read and the press. (b)'s CI poll belongs to the gate read. (c)'s tree
-  assertion runs after the press, and its printed result is read too.
-
-```
-git fetch -q origin <base> && test "$(git rev-parse origin/<base>)" = <base-sha> \
-  && gh pr merge <N> --squash --match-head-commit <head-sha>
-```
-
 ```
 gh api 'repos/<owner>/<repo>/commits/<head-sha>/check-runs?filter=all&per_page=100' --jq '
   if .total_count > 100 then "too-many"
@@ -942,6 +917,31 @@ runs, the same evidence the rollup summarises (and stricter: no dedupe), instead
 field GitHub has not recomputed, so it does not press past an unread state. `UNKNOWN` also covers mergeability (conflicts,
 approvals). The read does not check those; the press command itself does, because
 GitHub refuses a merge that the branch rules block.
+
+**Guards stop the press by control flow, not `set -e`.** In the Claude Code Bash
+tool, the command runs as one member of an `&&` list after the harness sources a shell
+snapshot, and bash ignores `errexit` there. Measured on a merge seat, 2026-11-09:
+`set -e; false; echo SURVIVED` printed `SURVIVED`. A press script that leans on
+`set -e` or `set -euo pipefail` to stop at a failed guard is therefore fail-open: on
+2026-11-09 a seat's script printed its own failure line and still ran `gh pr merge`,
+and #4545 landed past a red. A guard written as a bare `test ...` or `grep -q ...` on
+its own line stops nothing. So:
+- A guard stops the press only by explicit control flow: chained to the merge with
+  `&&`, or followed by `|| exit 1` (or `|| { echo "<NAME>-FAILED"; exit 1; }`).
+- The seat reads the gate's verdicts as printed text before pressing, in a separate
+  tool call from the press. The read prints one positive line per check (for example
+  `BASE-OK <sha>`, `CHECKS success`, `TREE <tree>`); the seat reads them, and only
+  then sends the press call. An exit status alone is not a verdict, because a
+  wrapper's `echo` after the command masks it.
+- The press call still re-asserts what can move: the base, chained with `&&` into
+  the merge. This keeps item 8's race closure, since the base can move between the
+  gate read and the press. (b)'s CI poll belongs to the gate read. (c)'s tree
+  assertion runs after the press, and its printed result is read too.
+
+```
+git fetch -q origin <base> && test "$(git rev-parse origin/<base>)" = <base-sha> \
+  && gh pr merge <N> --squash --match-head-commit <head-sha>
+```
 
 *Evidence:* #4092 (2026-10-23) and #4182 (2026-10-25) were each pressed on a printed
 `UNKNOWN` with no gate, four minutes and three seconds respectively after the base
