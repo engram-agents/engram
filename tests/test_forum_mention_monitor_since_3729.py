@@ -14,7 +14,11 @@ mis-compares here exactly as it would there.
 
 Contract cells: 1 cursor from server, 2 since with overlap (stored format,
 URL-encoded), 3 no cursor -> full poll, 4 exactly-once with the overlap,
-5 malformed / failed poll writes neither file, 6 empty list keeps the cursor.
+5 malformed / failed poll writes neither file, 6 empty list keeps the cursor,
+7 a cursor lost mid-run does not replay history, 8 the seed re-baselines the
+cursor (restart after a DB restore / clock step back), 9 a 500 whose body is a
+valid, newer mentions list leaves the cursor byte-identical, 10 restart with an
+existing cursor and a stale seen file re-announces nothing.
 """
 
 from __future__ import annotations
@@ -98,7 +102,8 @@ class Server:
         self._srv.server_close()
 
 
-def run(tmp_path, srv, *, until, extra_env=None, pre_seen=None, timeout=20.0):
+def run(tmp_path, srv, *, until, extra_env=None, pre_seen=None, pre_cursor=None,
+        timeout=20.0):
     """Arm the real script; stop once until(srv) is true (+ a short grace).
     Returns (stdout_lines, seen_path)."""
     home = tmp_path / "home"
@@ -108,6 +113,8 @@ def run(tmp_path, srv, *, until, extra_env=None, pre_seen=None, timeout=20.0):
     seen = tmp_path / "seen"
     if pre_seen is not None:
         seen.write_text(pre_seen)
+    if pre_cursor is not None:
+        Path(str(seen) + ".cursor").write_text(pre_cursor)
     env = os.environ.copy()
     env.update({
         "HOME": str(home), "ENGRAM_HOME": str(home / ".engram"),
@@ -335,4 +342,116 @@ def test_after_an_empty_answer_the_next_new_mention_is_still_announced(tmp_path)
         srv.stop()
     got = announced(lines)
     assert len(got) == 1 and "#300" in got[0], lines
+    assert cursor_of(seen) == ts(T0 + timedelta(seconds=30))
+
+
+# 7 -----------------------------------------------------------------------
+
+def test_cursor_lost_mid_run_does_not_replay_history(tmp_path):
+    srv = Server([post(1, T0 - timedelta(hours=5)), post(2, T0 - timedelta(hours=4)),
+                  post(3, T0)])
+    seen_path = tmp_path / "seen"
+    # Answer 3 carries post 3 WITHOUT a created_at, so cycle 3 cannot re-write the
+    # cursor that the hook removes while request 3 is in flight: poll 4 starts
+    # with no cursor, as after an outside cleanup or truncation.
+    nodate = post(3, T0)
+    del nodate["created_at"]
+    srv.script = {3: (200, json.dumps({"mentions": [nodate]}).encode())}.get
+
+    def hook(n, s):
+        if n == 3:
+            Path(str(seen_path) + ".cursor").unlink()
+        if n == 4:  # poll 4 is a FULL poll: history plus one genuinely new mention
+            s.posts.append(post(4, T0 + timedelta(seconds=30), tid=400))
+
+    srv.on_request = hook
+    try:
+        lines, seen = run(tmp_path, srv, until=lambda s: len(s.paths) >= 6)
+    finally:
+        srv.stop()
+    assert since_of(srv.paths[3]) is None, srv.paths  # the lost-cursor poll was full
+    got = announced(lines)
+    assert len(got) == 1 and "1 new @-mention across 1 thread: #400" in got[0], lines
+    assert cursor_of(seen) == ts(T0 + timedelta(seconds=30))
+
+
+# 8 -----------------------------------------------------------------------
+
+def test_seed_rebaselines_a_cursor_that_is_ahead_of_the_server(tmp_path):
+    # a DB restore / server clock step back: the stored cursor is far in the future
+    future = ts(T0 + timedelta(days=30))
+    srv = Server([post(1, T0)])
+
+    def hook(n, s):
+        if n == 3:
+            s.posts.append(post(2, T0 + timedelta(seconds=30), tid=500))
+
+    srv.on_request = hook
+    try:
+        lines, seen = run(tmp_path, srv, pre_cursor=future + "\n",
+                          until=lambda s: len(s.paths) >= 6)
+    finally:
+        srv.stop()
+    assert since_of(srv.paths[0]) is None  # the seed is a full poll
+    assert since_of(srv.paths[1]) == ts(T0 - timedelta(seconds=600)), srv.paths
+    got = announced(lines)
+    assert len(got) == 1 and "#500" in got[0], lines
+    assert cursor_of(seen) == ts(T0 + timedelta(seconds=30))
+
+
+def test_seed_sets_cursor_from_its_own_response_alone(tmp_path):
+    future = ts(T0 + timedelta(days=30))
+    srv = Server([post(1, T0)])
+    try:
+        _, seen = run(tmp_path, srv, pre_cursor=future + "\n",
+                      until=lambda s: len(s.paths) >= 1)
+    finally:
+        srv.stop()
+    assert cursor_of(seen) == ts(T0)
+
+
+# 9 -----------------------------------------------------------------------
+
+def test_a_500_carrying_a_valid_newer_mentions_list_leaves_the_cursor_untouched(tmp_path):
+    newer = T0 + timedelta(hours=2)
+    srv = Server([post(1, T0)])
+    srv.script = {
+        2: (500, json.dumps({"mentions": [post(7, newer)]}).encode()),
+    }.get
+    seen_path = tmp_path / "seen"
+    snaps: dict = {}
+
+    def hook(n, s):
+        cur = Path(str(seen_path) + ".cursor")
+        snaps[n] = (seen_path.read_bytes() if seen_path.exists() else None,
+                    cur.read_bytes() if cur.exists() else None)
+
+    srv.on_request = hook
+    try:
+        lines, seen = run(tmp_path, srv, until=lambda s: len(s.paths) >= 4)
+    finally:
+        srv.stop()
+    assert snaps[2][1] == ts(T0).encode() + b"\n"
+    assert snaps[3] == snaps[2]  # after the 500 cycle: seen and cursor byte-identical
+    assert cursor_of(seen) == ts(T0)
+    assert announced(lines) == [], lines
+
+
+# 10 ----------------------------------------------------------------------
+
+def test_restart_with_existing_cursor_and_stale_seen_reannounces_nothing(tmp_path):
+    srv = Server([post(1, T0 - timedelta(hours=5)), post(2, T0)])
+
+    def hook(n, s):
+        if n == 3:
+            s.posts.append(post(3, T0 + timedelta(seconds=30), tid=600))
+
+    srv.on_request = hook
+    try:
+        lines, seen = run(tmp_path, srv, pre_seen="2\tt100\n", pre_cursor=ts(T0) + "\n",
+                          until=lambda s: len(s.paths) >= 6)
+    finally:
+        srv.stop()
+    got = announced(lines)
+    assert len(got) == 1 and "#600" in got[0], lines
     assert cursor_of(seen) == ts(T0 + timedelta(seconds=30))

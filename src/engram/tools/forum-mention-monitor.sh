@@ -421,9 +421,21 @@ POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
 #     > '.'), so a bare-second since would drop same-second mentions. It is
 #     URL-encoded: a literal '+' in a query string decodes to a space.
 #   - No cursor (first arm, a fresh seen file, an upgrade from a version that
-#     had $SEEN but no cursor), or an unreadable one: full poll, exactly as
-#     before. The seed always takes the full poll too (it is the baseline), and
-#     then writes the cursor.
+#     had $SEEN but no cursor), or an unreadable one: full poll. The seed always
+#     takes the full poll too (it is the baseline), and then RE-BASELINES the
+#     cursor from its own full response alone (not max with the old cursor), so a
+#     restart recovers after a forum DB restore or a server clock step back. A
+#     steady-state poll keeps max(old, new), so the cursor never moves back
+#     within a run.
+#   - A cursor lost or unreadable MID-RUN is NOT "as before": $SEEN is now only
+#     the last windowed response, so a full poll would announce every mention
+#     older than the window as new. For that poll only, a mention counts as new
+#     if it is not in $SEEN AND its integer post_id is above the largest integer
+#     id in $SEEN (posts.id is INTEGER PRIMARY KEY, so ids grow with time); with
+#     no integer id in $SEEN nothing is announced and the poll just re-baselines.
+#     This fallback exists only for the lost-cursor case; with a cursor, the
+#     plain not-in-$SEEN rule applies, because the window, not the id, is what
+#     bounds the response.
 # A malformed / non-reporting 200 and a curl failure never reach the cursor
 # write: it sits behind the same guards as the $SEEN write.
 # ---------------------------------------------------------------------------
@@ -458,6 +470,8 @@ _poll_url() {
 # Advance the cursor from the response body on stdin: max(old, newest
 # created_at), written atomically (tmp + replace, like $SEEN). Only called on a
 # body that reported a mentions list. Any trouble leaves the old cursor alone.
+# With the argument "seed" the old cursor is ignored: the cursor becomes the newest
+# created_at of THIS response alone (an empty list leaves the old cursor as is).
 _cursor_advance() {
     python3 -c 'import json, os, sys
 from datetime import datetime, timezone
@@ -472,7 +486,9 @@ try:
     except Exception:
         pass
     best, bk = old, None
-    if old:
+    if len(sys.argv) > 2 and sys.argv[2] == "seed":
+        best = None
+    elif old:
         try:
             bk = key(old)
         except Exception:
@@ -491,7 +507,7 @@ try:
             f.write(best + "\n")
         os.replace(tmp, path)
 except Exception:
-    pass' "$CURSOR" 2>/dev/null
+    pass' "$CURSOR" "${1:-}" 2>/dev/null
 }
 
 # Path to the last-user-activity stamp (written by the time-bar hook on each
@@ -800,7 +816,7 @@ while true; do
     if _curl_fetch "$CURL_MAX_TIME" "$URL" \
        && ( set -o pipefail; printf '%s' "$RESP" | ids | sort > "$SEEN.now" ); then
         mv "$SEEN.now" "$SEEN"
-        printf '%s' "$RESP" | _cursor_advance
+        printf '%s' "$RESP" | _cursor_advance seed
         if [ "$_SEED_ANNOUNCED" = 1 ]; then
             echo "forum-mention-monitor.sh: seeded from the forum — now receiving"
         fi
@@ -947,7 +963,8 @@ while true; do
     # buffer/window still preserved, exactly as before) — only the EDGE is
     # now announced, once on entry and once on recovery, via
     # $_FORUM_REACHABLE (declared above the loop).
-    if ! _curl_fetch "$CURL_MAX_TIME" "$(_poll_url)"; then
+    _PURL="$(_poll_url)"
+    if ! _curl_fetch "$CURL_MAX_TIME" "$_PURL"; then
         if [ "$_FORUM_REACHABLE" = 1 ]; then
             echo "⚠️  forum-mention-monitor.sh: forum unreachable ($(_curl_detail)) — still armed, not receiving; will report when it returns"
             _FORUM_REACHABLE=0
@@ -971,6 +988,19 @@ while true; do
         continue
     fi
     _new_pids="$(comm -13 "$SEEN" "$SEEN.now" | cut -f1)"
+    case "$_PURL" in
+    *"&since="*) ;;
+    *)
+        # Steady-state poll WITHOUT a usable cursor (lost mid-run): see the
+        # since-cursor block. Only ids above the largest integer id in $SEEN count.
+        _max_seen="$(cut -f1 "$SEEN" | awk '$1 ~ /^[0-9]+$/ { if (!f || $1+0 > m) { m = $1+0; f = 1 } } END { if (f) printf "%d", m }')"
+        if [ -n "$_max_seen" ]; then
+            _new_pids="$(printf '%s\n' "$_new_pids" | awk -v m="$_max_seen" '$1 ~ /^[0-9]+$/ && $1+0 > m+0')"
+        else
+            _new_pids=""
+        fi
+        ;;
+    esac
     mv "$SEEN.now" "$SEEN"
     printf '%s' "$RESP" | _cursor_advance
     if [ -n "$_new_pids" ]; then
