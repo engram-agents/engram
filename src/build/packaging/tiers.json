@@ -580,6 +580,11 @@
       "note": "engram-alpha#4050 S2: single-purpose scorer for the team's pre-registered blind study (hash-first, planted controls first); a team study tool, not a user tool. Dev tier, and kept out of the public release by release-minus-set.txt. Reads local sheets, keys and returns that are never committed."
     },
     {
+      "path": "tools/triage_report.py",
+      "tier": "dev",
+      "note": "Read-only triage report over a repository's open issues (outside reports, security line, weekly label sweeps, rule 2B); it asserts that what it collected equals what the search said, and never writes, labels, comments or closes. A team tool, not a user tool."
+    },
+    {
       "path": "tools/weakest_load_bearing.py",
       "tier": "convenience"
     },
