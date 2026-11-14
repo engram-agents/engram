@@ -11,6 +11,9 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
+  empty or not a string) with one stderr line, instead of compacting: it cannot show which session
+  napped (#4356), and surfaces the refusal once to the agent through the #4350 line.
 - The forum admin CLI now creates a missing `forum.db` as 0640 and its missing directory as 0750, and `export --out` creates a new file as 0640, whatever the caller's umask. Existing files and directories keep their modes. (#4530)
 - Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
