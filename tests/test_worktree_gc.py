@@ -1141,6 +1141,9 @@ def test_deploy_source_naming_a_different_directory_does_not_protect(
     longer.mkdir()
     _write_deployed(_isolated_engram_home, f"deployed_from={longer}\n")
     assert _classify_deploy_target(wt)[0] == "PRUNE"
+    # ... in the other direction too: the worktree is the LONGER path
+    _write_deployed(_isolated_engram_home, f"deployed_from={wt}\n")
+    assert _classify_deploy_target(longer)[0] == "PRUNE"
 
 
 @pytest.mark.parametrize("branch,pr_state", [
