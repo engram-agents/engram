@@ -919,7 +919,13 @@ n = len(lines)
 counts = collections.OrderedDict()
 for tid in lines:
     counts[tid] = counts.get(tid, 0) + 1
-parts = ", ".join("#" + str(t) + "(×" + str(c) + ")" for t, c in counts.items())
+# #2225: list at most _MAX_LISTED threads (first-seen order), then ", +K more". 10 is a chosen
+# value, not measured: at ~12 chars per #NNNN(xN) entry it keeps the list near 120 characters.
+_MAX_LISTED = 10
+items = list(counts.items())
+parts = ", ".join("#" + str(t) + "(\u00d7" + str(c) + ")" for t, c in items[:_MAX_LISTED])
+if len(items) > _MAX_LISTED:
+    parts += ", +" + str(len(items) - _MAX_LISTED) + " more"
 mention_word = "mention" if n == 1 else "mentions"
 thread_word = "thread" if len(counts) == 1 else "threads"
 # #3613: the summary is fixed wrapper words plus thread ids -- nothing

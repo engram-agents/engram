@@ -463,7 +463,7 @@ NOW=$(date -u +%s); ET=$(ps -o etimes= -p "$P" | tr -d ' ')      # Linux; see ma
 [ -n "$ET" ] || { echo "FAIL: ps returned nothing for pid $P"; exit 1; }
 echo "server born at epoch $((NOW-ET)) -- must be AFTER your /mcp reconnect"
 
-ARGV=$(ps -p "$P" -o command=)
+ARGV=$(ps -ww -o command= -p "$P")
 [ -n "$ARGV" ] || { echo "FAIL: empty argv -- the checks below would report PASS without running"; exit 1; }
 echo "$ARGV" | grep -q 'plugins/engram' || { echo "FAIL control: pattern not live"; exit 1; }
 echo "$ARGV" | grep -q 'plugins/cache' && { echo "FAIL: server is running from the plugin CACHE, not the marketplace source"; exit 1; }

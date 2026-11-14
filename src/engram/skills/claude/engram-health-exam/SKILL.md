@@ -164,7 +164,7 @@ The surface daemon powers semantic recall. Test it directly.
 # Check the daemon process:
 # -u: own seat only; never -a — on Darwin -a re-admits ancestors (else branch never fires), so take argv from ps (#2132/#2133).
 if pids=$(pgrep -u "$(id -u)" -f "engram-surface-daemon"); then
-    ps -o pid=,args= -p "$(echo "$pids" | tr '\n' ',' | sed 's/,$//')"
+    ps -ww -o pid=,args= -p "$(echo "$pids" | tr '\n' ',' | sed 's/,$//')"
 else
     rc=$?
     [ "$rc" -eq 1 ] && echo "daemon not running" || echo "could not check: pgrep exited $rc"

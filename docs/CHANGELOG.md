@@ -12,6 +12,10 @@ with an `-alpha` suffix during the alpha phase.
 ### Changed
 
 - A lost `config.json` is no longer regenerated. When `knowledge.db` exists and `config.json` does not, ENGRAM now refuses instead of writing a default (a blank `self_lineage` silently turned the model-family gate off): a seat whose `config.json` is lost cannot open its memory or run the installer until the file is restored from a backup the user chooses. The refusal lists the backups, and a new `write-default-config.py` command writes the default for a genuinely new seat. The command needs the user's confirmation flag, and refusal messages do not print it. A fresh install, and a bootstrap, are unchanged. (#4705)
+- A refused in-place rewrite now reports which state the file is in as data (`WriteRefused.outcome`:
+  `nothing_written`, `restored` or `may_be_incomplete`), and `set_forum_url.py` and the installer's
+  `install_tier` step word their message from it. When the write and the put-back both fail, they no
+  longer say the file is unchanged; they say it may be incomplete and point at the backup. (#4631)
 - The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
   empty or not a string) with one stderr line, instead of compacting: it cannot show which session
   napped (#4356), and surfaces the refusal once to the agent through the #4350 line.
@@ -25,6 +29,10 @@ with an `-alpha` suffix during the alpha phase.
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
   gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
   until the next edit event. (#2213)
+- `ps -o command=` / `args=` now carries `-ww` at the six remaining sites (the daemon-start
+  holder diagnostic, the `engram-upgrade` and `engram-health-exam` skills' argv checks, and
+  three latency test/tool reads), so a pipe-width cut to 80 columns cannot shorten the argv.
+  (engram-agents/engram#4469)
 - `engram_derive` no longer returns an `independence_advisory` key. It duplicated
   the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
   or more lineages, and when the install has recorded its own lineage, that line
@@ -62,7 +70,9 @@ with an `-alpha` suffix during the alpha phase.
   the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
+- The forum mention monitor's summary line lists at most 10 threads and says how many more there are, instead of listing every thread. (#2225)
 - `forum read --new` / `--last N` now show the whole thread's post count with how many are shown, and label each post by its place in the thread (the first shown post was labelled OP). (#2480)
+- Restoring the forum from a backup now rebuilds the search index and embeddings the dump leaves out: the README's Restore steps run `forum_regen_derived.py` before the service starts, and `install-forum-service.sh` snapshots that tool and its embedding helper into `<service-dir>/app/tools/`. Before, a restored forum searched empty. (engram-agents/engram#868)
 - The last-ditch dev-checkout fallback for this agent's own MCP server now points at
   `<checkout>/src/engram/server.py`, where the file really is. It pointed at
   `<checkout>/server.py`, which does not exist, so a scoped `pgrep -f` could never

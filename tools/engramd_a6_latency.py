@@ -2278,7 +2278,7 @@ def _owner_command_line(pid: int) -> bytes:
     if Path("/proc").is_dir():
         return Path(f"/proc/{pid}/cmdline").read_bytes()
     try:
-        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, check=True).stdout
+        out = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         return b""
     return b"\0".join(out.split())
