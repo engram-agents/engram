@@ -89,6 +89,12 @@ EXCEPTIONS = {
     ("tests/test_s2_clause_check_4201.py", "d638538e"): (
         "a fixture seed for a synthetic sheet, not a commit reference"
     ),
+    ("tests/test_s2_clause_sheet_live_store_4286.py", "0123456789abcdef"): (
+        "a fixed 16-hex salt for fixtures, not a commit reference"
+    ),
+    ("tests/test_s2_clause_sheet_live_store_4286.py", "abc1234"): (
+        "a fixture value for --build-commit, pinned into the golden hashes, not a commit reference"
+    ),
     ("tests/test_s2_clause_sheet_4050.py", "d638538e"): (
         "a fixture seed for a synthetic sheet, not a commit reference"
     ),
