@@ -981,11 +981,11 @@ def test_use_git_false_fallback_scans_all_text_files(tmp_path):
 def test_tracked_directory_symlink_is_not_a_candidate(tmp_path):
     """A git-tracked symlink to a directory does not inflate either bucket.
 
-    What this pins, stated honestly: the symlink is excluded from the counts
-    whether it is filtered out as a candidate or dropped later by the OSError
-    arm, so it does not discriminate the ``is_file()`` filter itself.  It DOES
-    redden a plausible-wrong implementation that counts an unreadable entry as
-    binary — that is the variant it exists for."""
+    What this pins, stated by what it was measured to catch: it reddens only
+    the CONJUNCTION of a consumer that counts unreadable entries as binary AND
+    a scanner with the ``is_file()`` filter removed. With the filter in place
+    this fixture's OSError arm is unreachable, so the cell does not discriminate
+    the filter itself — keep it for the conjunction, not for the filter."""
     (tmp_path / "real-dir").mkdir()
     _commit_files(tmp_path, {"real/member.py": "// clean\n"})
     (tmp_path / "tools").mkdir()
