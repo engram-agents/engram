@@ -447,7 +447,7 @@ def _sandbox_run(sb: Sandbox):
 
 def test_cell11_install_sh_config_absent_db_present_refuses_before_anything_is_written(tmp_path):
     sb = Sandbox(tmp_path)
-    sb.make_db(6)
+    sb.make_db(6, config=False)
     r = _sandbox_run(sb)
     assert r.returncode != 0, r.all
     assert "FAIL" in r.all and "[step 3]" in r.all, r.all

@@ -285,8 +285,12 @@ exec "$REAL_PY" "$@"
     def calls_starting(self, prefix):
         return [c for c in self.call_lines() if c.startswith(prefix)]
 
-    def make_db(self, nodes):
+    def make_db(self, nodes, config=True):
+        """An installed seat's knowledge.db. It carries its config.json too (#4705: step 3 refuses a
+        database whose config.json is lost); ``config=False`` makes that lost-config state."""
         self.engram.mkdir(parents=True, exist_ok=True)
+        if config:
+            (self.engram / "config.json").write_text("{}\n")
         con = sqlite3.connect(str(self.engram / "knowledge.db"))
         con.execute("CREATE TABLE nodes (id TEXT)")
         con.executemany("INSERT INTO nodes VALUES (?)", [("n%d" % i,) for i in range(nodes)])
@@ -473,6 +477,7 @@ def test_db_non_empty_skips_bootstrap_and_prints_the_node_count(sb):
 def test_unreadable_db_fails_step_6_instead_of_guessing(sb):
     sb.engram.mkdir(parents=True, exist_ok=True)
     (sb.engram / "knowledge.db").write_text("this is not a sqlite file at all, just text padding " * 4)
+    (sb.engram / "config.json").write_text("{}\n")  # #4705: the DB is unreadable, the config is not lost
     r = sb.run("--yes")
     assert r.returncode != 0 and "FAIL: [step 6]" in r.stderr, r.all
     assert not sb.calls_starting("bootstrap")

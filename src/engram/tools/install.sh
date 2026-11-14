@@ -240,6 +240,52 @@ if os.path.lexists(path):
     existed = True
 else:
     d, existed = {}, False
+    # #4705 (C8): config.json absent while knowledge.db exists is a LOST config, not a new seat. Refuse
+    # BEFORE the buffer build, so nothing at all is written (no file, no backup). The same key phrases
+    # as engram_config_io.ConfigMissingError carry the same two remedies; a test asserts both copies.
+    data_dir = os.path.dirname(os.path.abspath(path))
+    if os.path.lexists(os.path.join(data_dir, "knowledge.db")):
+        import re, shlex
+        rx = re.compile(r"config\.json\.engram-backup\.(\d{8}T\d{6}Z)(?:-(\d+))?\Z")
+        found = []
+        try:
+            for name in os.listdir(data_dir):
+                m = rx.match(name)
+                if m:
+                    found.append(((m.group(1), int(m.group(2) or 0)), name))
+        except OSError:
+            pass
+        msg = ["ERR %s: config.json is missing while knowledge.db exists; the installer will not create it from "
+               "empty (the turn counter would restart and self_lineage would be blank). Nothing was written." % path]
+        if found:
+            msg.append("Backups beside it, newest first:")
+            for _, name in sorted(found, reverse=True):
+                label = ""
+                try:
+                    cand = os.path.join(data_dir, name)
+                    if os.path.getsize(cand) > 4 * 1024 * 1024:
+                        raise ValueError("too large")
+                    with open(cand, encoding="utf-8") as f:
+                        cd = json.load(f)
+                    if not isinstance(cd, dict):
+                        raise ValueError("not an object")
+                    lin = cd.get("self_lineage")
+                    if not (isinstance(lin, str) and lin.strip()):
+                        label = "  (no self_lineage)"
+                except (OSError, ValueError):
+                    label = "  (unreadable)"
+                msg.append("  %s  [%s]%s" % (shlex.quote(os.path.join(data_dir, name)), name[len("config.json.engram-backup."):], label))
+        else:
+            msg.append("No backup was found beside it (they are named config.json.engram-backup.<UTC stamp>); "
+                       "check the data dir's git history.")
+        msg.append("The user decides which backup to restore: the newest may itself be a regenerated default "
+                   "from before this fix, and restoring it sets whatever self_lineage it holds.")
+        msg.append("Once the user has chosen, run: cp -p <the backup you chose> %s" % shlex.quote(path))
+        msg.append("If the user confirms this seat is new, one command writes the default (it refuses if "
+                   "config.json exists): python3 %s/write-default-config.py --confirm-new-seat"
+                   % shlex.quote(os.path.join(guard_dir, "tools")))
+        print("\n".join(msg))
+        sys.exit(3)
 # An absent flag keeps the stored value (when it is a valid one), else the default applies.
 if tier_arg:
     tier = tier_arg
@@ -445,7 +491,12 @@ fi
 
 # ── Step 3: config.json ──────────────────────────────────────────────────────────────────────
 begin_step 3 "config.json"
-if ! _cfg_out="$(python3 -c "$PY_CONFIG" "$CONFIG_PATH" "$TIER_ARG" "$DEFAULT_TIER" "$REPO_ROOT/src/engram")"; then
+_cfg_rc=0
+_cfg_out="$(python3 -c "$PY_CONFIG" "$CONFIG_PATH" "$TIER_ARG" "$DEFAULT_TIER" "$REPO_ROOT/src/engram")" || _cfg_rc=$?
+if [ "$_cfg_rc" -eq 3 ]; then
+  # #4705 (C8): a lost config.json beside an existing knowledge.db. The helper's message carries the remedies.
+  fail "${_cfg_out#ERR }" "restore config.json as described above (this installer never creates one beside an existing knowledge.db), then re-run"
+elif [ "$_cfg_rc" -ne 0 ]; then
   fail "${_cfg_out#ERR }" "fix $CONFIG_PATH by hand, or move it aside ('mv $CONFIG_PATH $CONFIG_PATH.moved-aside'), and re-run (this installer never overwrites a config it cannot parse)"
 fi
 # Line 1 is "<status> <tier>" (the EFFECTIVE value: kept, changed or default);

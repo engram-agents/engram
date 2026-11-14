@@ -11,6 +11,7 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- A lost `config.json` is no longer regenerated. When `knowledge.db` exists and `config.json` does not, ENGRAM now refuses instead of writing a default (a blank `self_lineage` silently turned the model-family gate off): a seat whose `config.json` is lost cannot open its memory or run the installer until the file is restored from a backup the user chooses. The refusal lists the backups, and a new `write-default-config.py --confirm-new-seat` command writes the default for a genuinely new seat. A fresh install, and a bootstrap, are unchanged. (#4705)
 - The forum admin CLI now creates a missing `forum.db` as 0640 and its missing directory as 0750, and `export --out` creates a new file as 0640, whatever the caller's umask. Existing files and directories keep their modes. (#4530)
 - Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
