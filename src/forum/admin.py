@@ -81,7 +81,10 @@ def _open_db(db_path: str) -> sqlite3.Connection:
     # sqlite3.connect would create it at that umask (#4530, follow-up to #4499).
     # realpath: a dangling symlink counts as present to create_if_absent, so resolve it
     # and create the link's target 0640, as the export branch does.
-    create_if_absent(os.path.realpath(db_path))
+    # ":memory:" is sqlite's in-memory db, not a path: creating it would leave an
+    # empty file named ':memory:' in the cwd. (makedirs on its dirname is the cwd, a no-op.)
+    if db_path != ":memory:":
+        create_if_absent(os.path.realpath(db_path))
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -267,7 +270,11 @@ def cmd_export(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         out_path = os.path.expanduser(args.out)
         # Absent path (or dangling symlink's target): created 0640 first. An existing
         # file is still overwritten as before, mode untouched (#4530).
-        create_if_absent(os.path.realpath(out_path))
+        # exists() follows links: /dev/stdout (a pipe realpaths to a nonexistent
+        # /proc/<pid>/fd/pipe:[n]), /dev/null and an existing file skip the create; an
+        # absent path and a dangling link still get created.
+        if not os.path.exists(out_path):
+            create_if_absent(os.path.realpath(out_path))
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(out)
             fh.write("\n")

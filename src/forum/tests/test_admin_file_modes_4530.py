@@ -115,3 +115,39 @@ def test_export_missing_parent_raises_nothing_created(tmp_path, umask002):
 
 def _run_export(db, out) -> int:
     return admin_main(["--db", str(db), "export", "--out", str(out)])
+
+
+def test_memory_db_creates_nothing_in_cwd(tmp_path, monkeypatch):
+    # ":memory:" is sqlite's in-memory db, not a file name: no empty ':memory:' file
+    # may be left behind (dev creates nothing).
+    monkeypatch.chdir(tmp_path)
+    conn = _open_db(":memory:")
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    finally:
+        conn.close()
+    assert os.listdir(tmp_path) == []
+
+
+def test_export_to_dev_stdout_pipe(tmp_path):
+    # /dev/stdout under a pipe realpaths to a nonexistent /proc/<pid>/fd/pipe:[n]; the
+    # export must not try to create that (os.path.exists follows the link, so skip).
+    import json
+    import subprocess
+    import sys
+
+    src = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    code = (
+        "from forum.admin import main; "
+        "raise SystemExit(main(['--db', 'f.db', 'export', '--out', '/dev/stdout']))"
+    )
+    env = dict(os.environ, PYTHONPATH=src)
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert proc.returncode == 0, proc.stderr.decode()
+    text = proc.stdout.decode()
+    # main() prints a trailing "exported N categories to ..." line after the JSON
+    decoded, _ = json.JSONDecoder().raw_decode(text)
+    assert isinstance(decoded, list)
