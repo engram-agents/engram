@@ -35,10 +35,11 @@ Discrimination for the mutations the specs name:
   `test_a_dispatch_must_run_from_the_default_branch` (wiring) and
   `test_workflow_dispatch_on_a_non_default_ref_fails_closed` (behavioural);
 * R6: making the probe's NONZERO-EXIT branch fall back to "lacks the flag"
-  (the pre-round-6 semantics) reddens ONE cell,
-  `test_a_crashing_probe_blocks_the_checkout_link` — every other cell's stub
-  exits 0, and the timeout cell reaches the could-not-examine bucket through
-  the separate `TimeoutExpired` arm.
+  (the pre-round-6 semantics) reddens TWO cells,
+  `test_a_crashing_probe_blocks_the_checkout_link` and
+  `test_a_crashing_checkout_probe_is_not_reported_as_lacking` — every other
+  cell's stub exits 0, and the timeout cell reaches the could-not-examine
+  bucket through the separate `TimeoutExpired` arm.
 """
 
 from __future__ import annotations
@@ -867,6 +868,52 @@ def test_a_crashing_probe_blocks_the_checkout_link(sweep_repo, tmp_path):
     assert "origin/dev" in out, out
     # ... never as the benign "<ref>'s scanner lacks --roster-file" verdict.
     assert "'s src/engram/tools/scan-leaks.py lacks --roster-file" not in out, out
+
+
+def test_a_crashing_checkout_probe_is_not_reported_as_lacking(
+    sweep_repo, tmp_path
+):
+    """R6-3: the checkout link's own crash must not be described as a copy
+    that LACKS the flag.
+
+    The outcome here was already safe — the checkout is the LAST link, so a
+    crashed probe and a well-formed "lacks" both end at the same fail-closed
+    exit and no contributor code runs. The DIAGNOSIS was not: throwing the
+    verdict away (`...[0] != PROBE_CAPABLE`) appended "lacks --roster-file"
+    for a copy the run could not examine, which is the no-verdict-read-as-
+    negative sentence this round exists to remove.
+
+    Setup: both protected refs carry a WELL-FORMED incapable scanner (exit 0,
+    no flag), so the chain legitimately reaches the checkout link; the
+    checkout copy then crashes at import.
+
+    RED against fa1ae6d2 on the checkout assertions — the run already failed
+    closed there, but it said the checkout copy LACKED the flag.
+    """
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _INCAPABLE_SCANNER, push=True)
+    (work / "src" / "engram" / "tools" / "scan-leaks.py").write_text(
+        _CRASHING_SCANNER, encoding="utf-8"
+    )
+    proc, out = _run_sweep(work, base, tmp_path)
+
+    # Outcome unchanged: fail closed before any scan.
+    assert proc.returncode != 0, out
+    assert "scan-leaks: scanned" not in out, out
+    assert "scanner read from" not in out, out
+    # The protected refs genuinely lack the flag, and still say so.
+    assert f"{base}'s src/engram/tools/scan-leaks.py lacks --roster-file" in out, out
+    # The CHECKOUT's crash is a could-not-examine, in its own sentence ...
+    assert (
+        "could not examine the pull request checkout's copy of "
+        "src/engram/tools/scan-leaks.py" in out
+    ), out
+    assert "its --help probe exited 1" in out, out
+    # ... never the false "the checkout's copy lacks the flag" sentence.
+    assert (
+        "the pull request checkout's src/engram/tools/scan-leaks.py "
+        "lacks --roster-file" not in out
+    ), out
 
 
 def test_a_hanging_probe_times_out_as_could_not_examine(sweep_repo, tmp_path):

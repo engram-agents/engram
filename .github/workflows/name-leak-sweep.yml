@@ -605,27 +605,50 @@ jobs:
                   lacking.append(
                       "the pull request checkout has no " + scanner_rel
                   )
-              # The checkout is the LAST link, so there is no fall-through to
-              # close here: a "lacks" verdict and an unexaminable probe both
-              # end at the fail-closed exit below, and no contributor code
-              # runs either way. R6 leaves this call site's behaviour
-              # unchanged on purpose.
-              elif _probe_capability(checkout_scanner)[0] != PROBE_CAPABLE:
-                  lacking.append(
-                      "the pull request checkout's "
-                      f"{scanner_rel} lacks --roster-file"
-                  )
               else:
-                  scanner_path = checkout_scanner
-                  scanner_source = "pull request checkout (BOOTSTRAP)"
-                  print(
-                      "::warning::BOOTSTRAP: no copy of "
-                      f"{scanner_rel} with --roster-file exists at {base_sha} "
-                      f"or {default_ref}, so this run executes the pull "
-                      "request's own copy. No --roster-file is silently "
-                      "dropped: the capability was checked before this link "
-                      "was taken."
+                  # Probed once, and the verdict is kept rather than thrown
+                  # away: the CONTROL FLOW and the OUTCOME below are unchanged
+                  # — the checkout is the LAST link, so every non-capable
+                  # verdict ends at the fail-closed exit and no contributor
+                  # code runs — but the DIAGNOSIS must be truthful. A copy
+                  # that crashed, hung or could not be launched did not tell
+                  # us it lacks the flag; saying it did is the same
+                  # no-verdict-read-as-negative shape this round closes,
+                  # merely at a site where the outcome was already safe.
+                  checkout_verdict, checkout_detail = _probe_capability(
+                      checkout_scanner
                   )
+                  if checkout_verdict != PROBE_CAPABLE:
+                      if checkout_verdict == PROBE_LACKS:
+                          lacking.append(
+                              "the pull request checkout's "
+                              f"{scanner_rel} lacks --roster-file"
+                          )
+                      else:  # PROBE_UNEXAMINABLE
+                          print(
+                              "::error::name-leak sweep: could not examine "
+                              "the pull request checkout's copy of "
+                              f"{scanner_rel}: {checkout_detail}. The "
+                              "checkout is the LAST link, so there is no "
+                              "fall-through to close and no contributor code "
+                              "runs: the sweep fails closed."
+                          )
+                          lacking.append(
+                              "the pull request checkout's "
+                              f"{scanner_rel} could not be examined "
+                              f"({checkout_detail})"
+                          )
+                  else:
+                      scanner_path = checkout_scanner
+                      scanner_source = "pull request checkout (BOOTSTRAP)"
+                      print(
+                          "::warning::BOOTSTRAP: no copy of "
+                          f"{scanner_rel} with --roster-file exists at {base_sha} "
+                          f"or {default_ref}, so this run executes the pull "
+                          "request's own copy. No --roster-file is silently "
+                          "dropped: the capability was checked before this link "
+                          "was taken."
+                      )
 
           if scanner_path is None:
               # No link has the capability. Fail closed BEFORE scanning: a
