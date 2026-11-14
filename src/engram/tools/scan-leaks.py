@@ -26,9 +26,10 @@ Absolute home paths (default-deny, every git-tracked text file):
     Known limit: JSON-escaped paths (backslash-escaped slashes) are not matched.
 
 Personal-name and user-specific patterns are loaded at runtime from
-.scan-leaks-local.json in the repo root (gitignored). If this file is
-absent the scanner runs committed structural patterns only and prints one
-advisory line.
+.scan-leaks-local.json in the repo root (gitignored), and optionally from a
+--roster-file carrying the same newline-separated regex format as the
+NAME_LEAK_ROSTER CI secret. If NEITHER source supplies a pattern the scanner
+runs committed structural patterns only and prints one advisory line.
 
 See docs/internal/.scan-leaks-local.json.example for the config shape.
 
@@ -143,6 +144,41 @@ def load_local_patterns(root: Path, config_path: Path | None = None) -> tuple[li
             print(f"scan-leaks: warning — skipping bad pattern entry {i}: "
                   f"{type(exc).__name__}{detail}", file=sys.stderr)
     return patterns, True
+
+
+def load_roster_file(path: Path) -> list[tuple[re.Pattern, str]]:
+    """Load newline-separated regexes from an external roster file.
+
+    This is the SAME format as the ``NAME_LEAK_ROSTER`` CI secret: one regex
+    per line, with blank lines and lines whose first non-space character is
+    ``#`` ignored.  The label is fixed and generic; the file carries no labels.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        # An explicitly requested roster that cannot be read must not silently
+        # shrink the scan: that is an invocation error, not a clean run.
+        print(f"scan-leaks: cannot read roster file ({type(exc).__name__})",
+              file=sys.stderr)
+        sys.exit(2)
+
+    patterns = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        try:
+            patterns.append((re.compile(stripped), "roster file"))
+        except (re.error, OverflowError, RecursionError) as exc:
+            # The roster file is a personal-name list: the line and
+            # str(re.error) can both carry a name.  Report only the 1-based
+            # line number, the exception class, and (for re.error) its offset
+            # — never the pattern text.
+            detail = (f" at offset {exc.pos}" if isinstance(exc, re.error)
+                      else "")
+            print(f"scan-leaks: warning — skipping bad roster line {lineno}: "
+                  f"{type(exc).__name__}{detail}", file=sys.stderr)
+    return patterns
 
 
 def _git_tracked_files(root: Path) -> list[Path] | None:
@@ -296,6 +332,16 @@ def main():
     parser.add_argument("--config-path", default=None,
                         help=f"Explicit path to the local config file "
                              f"(default: <root>/{LOCAL_CONFIG_NAME})")
+    parser.add_argument("--roster-file", default=None,
+                        help="Newline-separated regexes, the same format as the "
+                             "NAME_LEAK_ROSTER secret (blank lines and #-comment "
+                             "lines ignored); scanned alongside the committed "
+                             "patterns and the local roster")
+    # A public CI log must not carry a name: `path:line [label] snippet`
+    # prints it twice, so --redact keeps only the repo-relative path and line.
+    parser.add_argument("--redact", action="store_true",
+                        help="Print each finding as repo-relative-path:line only "
+                             "(no label, no snippet, no home-path segment)")
     args = parser.parse_args()
 
     if args.root:
@@ -309,18 +355,31 @@ def main():
 
     config_path = Path(args.config_path).expanduser().resolve() if args.config_path else None
     local_patterns, config_present = load_local_patterns(root, config_path)
+    roster_file_patterns = (
+        load_roster_file(Path(args.roster_file).expanduser().resolve())
+        if args.roster_file else []
+    )
 
-    if not local_patterns:
-        # Advisory fires whenever the personal-name net didn't run — covers
-        # both "file absent" and "file present but malformed/empty".
-        reason = (f"{LOCAL_CONFIG_NAME} absent"
-                  if not config_present else f"{LOCAL_CONFIG_NAME} produced no patterns")
+    personal_patterns = local_patterns + roster_file_patterns
+    if not personal_patterns:
+        # Advisory fires only when NEITHER roster source produced a pattern —
+        # covers "file absent" and "file present but malformed/empty".  With
+        # --roster-file supplying patterns the personal-name net DID run, so
+        # claiming a skip here would be false and must not print.
+        if args.roster_file:
+            reason = (f"{LOCAL_CONFIG_NAME} absent"
+                      if not config_present
+                      else f"{LOCAL_CONFIG_NAME} produced no patterns")
+            reason += " and --roster-file produced no patterns"
+        else:
+            reason = (f"{LOCAL_CONFIG_NAME} absent"
+                      if not config_present else f"{LOCAL_CONFIG_NAME} produced no patterns")
         print(
             f"scan-leaks: no local roster ({reason})"
             " — personal-name scan skipped; structural patterns only"
         )
 
-    all_patterns = COMMITTED_PATTERNS + local_patterns
+    all_patterns = COMMITTED_PATTERNS + personal_patterns
 
     leaks, scanned, skipped_binary = scan(root, all_patterns)
     # One greppable summary line, on clean and dirty runs alike: a clean result
@@ -334,9 +393,15 @@ def main():
     print(f"scan-leaks: {len(leaks) + len(home_findings)} potential leak(s) in {root}",
           file=sys.stderr)
     for rel, lineno, label, snippet in leaks:
-        print(f"  {rel}:{lineno} [{label}] {snippet}", file=sys.stderr)
+        if args.redact:
+            print(f"{rel}:{lineno}", file=sys.stderr)
+        else:
+            print(f"  {rel}:{lineno} [{label}] {snippet}", file=sys.stderr)
     for rel, lineno, seg in home_findings:
-        print(f"  {rel}:{lineno} [absolute home path] segment: {seg}", file=sys.stderr)
+        if args.redact:
+            print(f"{rel}:{lineno}", file=sys.stderr)
+        else:
+            print(f"  {rel}:{lineno} [absolute home path] segment: {seg}", file=sys.stderr)
     sys.exit(1)
 
 

@@ -1,0 +1,347 @@
+name: name-leak-sweep
+
+# Issue #4780 — a whole-tree sweep of the published tree against the roster.
+#
+# `tools/name_leak_warn.py` applies NAME_LEAK_ROSTER to the added lines of a
+# diff; `src/engram/tools/scan-leaks.py` reads a whole tree but, until now, only
+# a gitignored LOCAL roster that CI does not have. Nothing in CI has ever
+# scanned the whole published tree against the real roster. This workflow does.
+#
+# The invariant, verbatim:
+#
+#   `conclusion == "success"` iff the event is trusted AND the roster was
+#   present AND the whole-tree scan ran over a non-empty tracked tree. There is
+#   no success case in which the sweep did not run.
+#
+# A green tick that means nothing is the defect (#4429): a missing secret, an
+# untrusted event, a scan that exited, or a scan that ranged over zero files is
+# a FAILURE, never a green skip.
+#
+# Fork safety: a pull request whose head repository is not this repository
+# never receives the secret, so the job's status name carries the literal token
+# `NOT SCANNED` — a reviewer must be able to tell it from "scanned clean". That
+# status name must NEVER be configured as a required check. Same-repo branches
+# are the supported path for outside contributions: re-push the fork branch
+# into this repository so the sweep runs before merge.
+#
+# `pull_request_target` is FORBIDDEN here: it would hand the roster secret to
+# contributor-controlled code. Measured: zero uses in this repo; keep it zero.
+#
+# The decision itself is the pure function in tools/name_leak_gate.py, reused
+# UNCHANGED. This workflow performs all I/O and hands it the same five facts the
+# gate hands it. The job's display name is the status context.
+
+on:
+  pull_request:
+    # `main` is the repository's default branch: the dev->main release PR is
+    # the release gate. Feature PRs target `dev` and are covered by the
+    # diff-only gate in name-leak-gate.yml, never by this whole-tree sweep.
+    branches: [main]
+  workflow_dispatch:
+    # On demand. Only offerable once this file is on the default branch
+    # (#4780): a dispatchable workflow runs the default branch's copy.
+  # No schedule until engram#4734 closes: the Actions API showed zero runs with
+  # event `schedule` on this repository for any workflow (measured 2026-11-14
+  # 13:22Z), so a cron line here would be a check that never runs.
+
+permissions:
+  contents: read
+
+jobs:
+  name-leak-sweep:
+    # The status context a reviewer sees. Fork PRs get the distinct name that
+    # says the sweep did not run; the token is load-bearing.
+    name: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'name-leak-sweep (NOT SCANNED - fork PR)' || 'name-leak-sweep' }}
+    # NO job-level `if:` here, deliberately, and do not add one to save a run.
+    #
+    # A skipped job still reports under this job's `name`, with conclusion
+    # `skipped`, and check runs key on the HEAD COMMIT — so the skip SUPERSEDES
+    # the previous run on the same head instead of sitting beside it. Measured
+    # on engram-agents/ci-probes#6: two failing runs, then a title edit, after
+    # which `gh pr checks` showed one line and both reds had disappeared. A red
+    # sweep that a typo fix in the title turns grey is the exact false tick this
+    # file exists to prevent.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The scanner is materialised with `git show <BASE_SHA>:...`, and the
+          # whole-tree scan walks this checkout; a shallow clone would make the
+          # base commit unreadable. fetch-depth: 0 removes that failure mode.
+          fetch-depth: 0
+
+      # ── the decision, the roster, and the whole-tree scan ────────────────
+      # All I/O happens here (secret, roster canonicalisation, sha256,
+      # attestation read, scanner run); tools/name_leak_gate.py stays pure.
+      - name: decide, then sweep the whole tree
+        id: sweep
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository || false }}
+          NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
+          ATTESTATION_PATH: .github/name-leak-roster.attestation.json
+          # The tree BOTH pieces of executable code are read from. On a pull
+          # request that is the base commit, which the contributor cannot
+          # write; on a dispatch it is the commit being dispatched. The code
+          # being released must not influence the tool that scans it.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+        run: |
+          # `-P`: do not prepend the cwd (or the script's directory) to
+          # sys.path. Measured: without it `sys.path[0]` is `''` for a `-`
+          # script, so a `json.py` committed at the repository root is imported
+          # in place of the standard library one — in this step, with the roster
+          # in the environment. With `-P` the import resolves to the stdlib.
+          python3 -P - <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+
+          event = os.environ.get("EVENT_NAME", "")
+          is_fork = os.environ.get("PR_IS_FORK", "false").strip().lower() == "true"
+
+          raw = os.environ.get("NAME_LEAK_ROSTER", "")
+          roster_present = bool(raw.strip())
+
+          # Canonical roster text: ALL trailing newlines stripped and exactly
+          # one appended, so the attested sha256 is reproducible from any copy
+          # of the roster with the canonicalising one-liner documented in
+          # docs/internal/name-leak-gate-trusted-run.md. A plain `sha256sum`
+          # only agrees when the file already ends in exactly one newline.
+          # HASH THE WHOLE FILE, never per pattern: a per-pattern hash would be
+          # a membership oracle (a candidate name can be hashed and checked
+          # against it).
+          canonical = (raw.rstrip("\n") + "\n") if roster_present else ""
+          # The roster is a SECRET ON DISK, so it gets a private location, not a
+          # fixed one. A fixed path is wrong twice over: on a shared host the
+          # name is already taken by another user's file (so this step cannot
+          # write it), and a predictable world-readable path hands the roster to
+          # every account on the machine. `mkdtemp` creates the directory 0700;
+          # the file is created 0600 by open(2) rather than chmod'd afterwards,
+          # so there is no window in which it is readable.
+          run_dir = tempfile.mkdtemp(dir=os.environ.get("RUNNER_TEMP") or None)
+          roster_path = os.path.join(run_dir, "roster.txt")
+          _fd = os.open(roster_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          with os.fdopen(_fd, "w", encoding="utf-8") as fh:
+              fh.write(canonical)
+          actual_sha = (
+              hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+              if roster_present
+              else ""
+          )
+          pattern_count = (
+              sum(
+                  1
+                  for line in canonical.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              )
+              if roster_present
+              else 0
+          )
+
+          # Validate every roster pattern HERE, before any scan step can run.
+          # scan-leaks.py can report a bad line by number, but validating first
+          # makes the echoed-text path unreachable by construction: on failure
+          # this step prints the LINE NUMBER only and fails. Never print the
+          # pattern text — this is a public log and the roster is a name list.
+          invalid_pattern_line = None
+          for lineno, line in enumerate(canonical.splitlines(), start=1):
+              stripped = line.strip()
+              if not stripped or stripped.startswith("#"):
+                  continue
+              try:
+                  re.compile(stripped)
+              except re.error:
+                  invalid_pattern_line = lineno
+                  break
+          if invalid_pattern_line is not None:
+              print(
+                  "::error::NAME_LEAK_ROSTER line "
+                  f"{invalid_pattern_line} is not a valid regular expression. "
+                  "Fix the secret; the pattern text is deliberately not printed."
+              )
+              raise SystemExit(1)
+
+          attestation_present = False
+          attestation_matches = False
+          attested_count = None
+          attested_sha = None
+          try:
+              with open(os.environ["ATTESTATION_PATH"], encoding="utf-8") as fh:
+                  attestation = json.load(fh)
+          except (OSError, ValueError):
+              attestation = None
+
+          if isinstance(attestation, dict):
+              attested_count = attestation.get("pattern_count")
+              attested_sha = attestation.get("roster_sha256")
+              # A valid attestation has schema 1, an integer pattern count and
+              # a 64-hex whole-file sha256. Anything else is "not present": a
+              # malformed or unset attestation must fail, never pass.
+              if (
+                  attestation.get("roster_format") == 1
+                  and isinstance(attested_count, int)
+                  and isinstance(attested_sha, str)
+                  and re.fullmatch(r"[0-9a-f]{64}", attested_sha) is not None
+              ):
+                  attestation_present = True
+                  attestation_matches = attested_sha == actual_sha
+
+          base_sha = os.environ["BASE_SHA"]
+
+          # POSITIVE KNOWLEDGE ONLY: a ref that does not resolve is a fact
+          # about this clone, not about the tree. Treating "cannot see" as
+          # "does not have the file" is the fail-open shape this job exists to
+          # remove, so it fails closed.
+          if (
+              subprocess.run(
+                  ["git", "cat-file", "-e", f"{base_sha}^{{commit}}"],
+                  capture_output=True,
+              ).returncode
+              != 0
+          ):
+              print(
+                  f"::error::name-leak sweep: base commit {base_sha} does not "
+                  "resolve in this clone, so the sweep cannot prove its own "
+                  "code came from a protected tree. Failing closed."
+              )
+              raise SystemExit(1)
+
+          def _blob_from_base(path):
+              proc = subprocess.run(
+                  ["git", "show", f"{base_sha}:{path}"],
+                  capture_output=True,
+              )
+              if proc.returncode != 0:
+                  print(
+                      f"::error::name-leak sweep: {path} is not readable from "
+                      f"{base_sha}. The code being released must not influence "
+                      "the tool that scans it. Failing closed."
+                  )
+                  raise SystemExit(1)
+              return proc.stdout
+
+          # The decision function comes from the base commit for the same
+          # reason the scanner does: on a same-repo pull request the branch is
+          # contributor-controlled, and this step holds the roster secret.
+          gate_path = os.path.join(run_dir, "name_leak_gate_base.py")
+          with open(gate_path, "wb") as fh:
+              fh.write(_blob_from_base("tools/name_leak_gate.py"))
+          gate_spec = importlib.util.spec_from_file_location(
+              "name_leak_gate", gate_path
+          )
+          gate = importlib.util.module_from_spec(gate_spec)
+          gate_spec.loader.exec_module(gate)
+
+          # decide() is the gate's contract, and its TRUSTED_EVENTS is
+          # {push, pull_request}. workflow_dispatch is the sweep's second
+          # trigger: it is not a fork PR and it carries exactly the same
+          # obligation (roster present, attestation matched), so it is
+          # presented to the contract under the trusted non-fork shape it has.
+          # Every other event keeps its own name and still fails closed — the
+          # `on:` block above prevents them at the trigger layer as well.
+          decision_event = "push" if event == "workflow_dispatch" else event
+          outcome = gate.decide(
+              decision_event,
+              is_fork,
+              roster_present,
+              attestation_present,
+              attestation_matches,
+          )
+
+          print(f"name-leak sweep: {outcome.conclusion} — {outcome.reason}")
+
+          if outcome.conclusion != gate.SUCCESS:
+              if event == "pull_request" and is_fork:
+                  print(
+                      "::error::The name-leak sweep did NOT scan this pull "
+                      "request: not scanned, roster unavailable. Fork PRs never "
+                      "receive the roster secret. Re-push the branch into this "
+                      "repository (a same-repo branch) so the sweep runs with "
+                      "the roster before merge."
+                  )
+              else:
+                  print(f"::error::name-leak sweep FAILED: {outcome.reason}")
+              raise SystemExit(1)
+
+          # The scanner comes from the base commit, never from the checkout:
+          # the code being released must not influence the tool that scans it.
+          scanner_path = os.path.join(run_dir, "scan-leaks-base.py")
+          with open(scanner_path, "wb") as fh:
+              fh.write(_blob_from_base("src/engram/tools/scan-leaks.py"))
+
+          # `-P` again, for the same reason: the checkout is not on sys.path.
+          # `--redact` is load-bearing in a public log — the unredacted finding
+          # form prints `path:line [label] snippet`, i.e. a name twice.
+          scan = subprocess.run(
+              [
+                  sys.executable,
+                  "-P",
+                  scanner_path,
+                  "--root",
+                  os.environ["GITHUB_WORKSPACE"],
+                  "--roster-file",
+                  roster_path,
+                  "--redact",
+              ],
+              capture_output=True,
+              text=True,
+          )
+          sys.stdout.write(scan.stdout)
+          sys.stderr.write(scan.stderr)
+          sys.stdout.flush()
+          sys.stderr.flush()
+
+          # THE ASSERTION THAT MATTERS: a scan of nothing is not a clean scan.
+          # The summary line is printed on clean and dirty runs alike; if it is
+          # absent, duplicated, or says zero files were scanned, the sweep did
+          # not run and this is a failure, never a green tick.
+          summaries = re.findall(
+              r"^scan-leaks: scanned (\d+), skipped-binary (\d+)$",
+              scan.stdout,
+              re.MULTILINE,
+          )
+          if len(summaries) != 1:
+              print(
+                  "::error::the whole-tree sweep did not run: "
+                  "scan-leaks.py printed no single "
+                  "'scan-leaks: scanned N, skipped-binary M' line. "
+                  "A scan of nothing is not a clean scan."
+              )
+              raise SystemExit(1)
+          scanned = int(summaries[0][0])
+          if scanned == 0:
+              print(
+                  "::error::the whole-tree sweep did not run: the summary line "
+                  "reports 0 files scanned. A scan of nothing is not a clean "
+                  "scan."
+              )
+              raise SystemExit(1)
+
+          print(
+              f"name-leak sweep: scanned {scanned} file(s) "
+              f"({summaries[0][1]} binary skipped) against "
+              f"{pattern_count} roster pattern(s)."
+          )
+
+          if scan.returncode != 0:
+              if scan.returncode == 1:
+                  print(
+                      "::error::a hit means the string is already in the "
+                      "published tree; fix it in the release PR; do not widen "
+                      "or edit the roster to silence it."
+                  )
+              else:
+                  print(
+                      "::error::the whole-tree sweep did not run: "
+                      f"scan-leaks.py exited {scan.returncode} "
+                      "(usage or root error)."
+                  )
+              raise SystemExit(1)
+          PY

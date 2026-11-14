@@ -996,3 +996,161 @@ def test_tracked_directory_symlink_is_not_a_candidate(tmp_path):
     r = _run_scan(tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert _summary(r.stdout) == (1, 0), f"stdout={r.stdout!r}"
+
+
+# ---------------------------------------------------------------------------
+# Test 15: --roster-file and --redact (whole-tree sweep support)
+# ---------------------------------------------------------------------------
+#
+# Contract (written before the implementation):
+#   - --roster-file takes newline-separated regexes in the SAME format as the
+#     NAME_LEAK_ROSTER secret: blank lines and first-non-space-'#' lines are
+#     ignored; valid lines are scanned alongside the committed patterns and the
+#     local roster.
+#   - an invalid line is reported by 1-based LINE NUMBER, exception class and
+#     (for re.error) offset — never by its text.
+#   - the "personal-name scan skipped" advisory fires only when BOTH roster
+#     sources produced no pattern.
+#   - --redact prints every finding as repo-relative-path:line only, for BOTH
+#     families (pattern hits and absolute-home-path hits), with neither the
+#     matched text nor a label/segment.
+#   - exit codes are unchanged (0 clean, 1 leaks, 2 usage/root error).
+#
+# The tokens below are invented for these cells, appear nowhere else, and the
+# home-path fixture is assembled by _home() so the committed test file never
+# carries a complete path.
+
+_EXT_TOKEN = "qlemvort8427"
+_EXT_LABEL = "plavrisk6013"
+_BAD_ROSTER_TOKEN = "ztokq9241"
+
+
+def _external_roster(tmp_path: Path, text: str) -> Path:
+    """Write a roster file OUTSIDE the scanned root (as CI does: RUNNER_TEMP)."""
+    roster = tmp_path / "external-roster.txt"
+    roster.write_text(text, encoding="utf-8")
+    return roster
+
+
+def test_roster_file_supplies_patterns_and_suppresses_the_skip_advisory(tmp_path):
+    """The external roster finds what the local roster would not, and no skip
+    is claimed while it is supplying patterns."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
+    roster = _external_roster(tmp_path, "# a comment\n\n" + _EXT_TOKEN + "\n")
+
+    # Control: local roster absent, no external file -> clean + skip advisory.
+    without = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json")],
+        capture_output=True, text=True,
+    )
+    assert without.returncode == 0, without.stdout + without.stderr
+    assert "personal-name scan skipped" in without.stdout
+
+    # With the external roster the hit is found and the skip claim is gone.
+    with_roster = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster)],
+        capture_output=True, text=True,
+    )
+    assert with_roster.returncode == 1, with_roster.stdout + with_roster.stderr
+    assert "doc.md:1" in with_roster.stderr
+    assert "personal-name scan skipped" not in with_roster.stdout
+    assert "personal-name scan skipped" not in with_roster.stderr
+
+
+def test_redact_prints_path_and_line_only(tmp_path):
+    """--redact prints path:line for a pattern hit and neither the matched text
+    nor the roster label. The unredacted run is the control: it carries both."""
+    _commit_files(tmp_path, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
+    (tmp_path / ".scan-leaks-local.json").write_text(json.dumps(
+        {"patterns": [{"regex": _EXT_TOKEN, "label": _EXT_LABEL}]}))
+
+    plain = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
+        capture_output=True, text=True,
+    )
+    assert plain.returncode == 1, plain.stdout + plain.stderr
+    # Control: the unredacted form really does carry both, so their absence
+    # below is a property of --redact and not of the fixture.
+    assert _EXT_TOKEN in plain.stderr and _EXT_LABEL in plain.stderr
+
+    redacted = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path), "--redact"],
+        capture_output=True, text=True,
+    )
+    assert redacted.returncode == 1, redacted.stdout + redacted.stderr
+    assert "doc.md:1" in redacted.stderr
+    combined = redacted.stdout + redacted.stderr
+    assert _EXT_TOKEN not in combined, combined
+    assert _EXT_LABEL not in combined, combined
+
+
+def test_redact_hides_the_home_path_segment(tmp_path):
+    """--redact applies to the absolute-home-path family too: the username
+    segment must not reach the log."""
+    _commit_files(tmp_path, {"doc.md": "data in " + _home("zorblax") + "x\n"})
+
+    plain = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
+        capture_output=True, text=True,
+    )
+    assert plain.returncode == 1, plain.stdout + plain.stderr
+    assert "segment: zorblax" in plain.stderr  # control
+
+    redacted = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path), "--redact"],
+        capture_output=True, text=True,
+    )
+    assert redacted.returncode == 1, redacted.stdout + redacted.stderr
+    assert "doc.md:1" in redacted.stderr
+    assert "zorblax" not in (redacted.stdout + redacted.stderr)
+
+
+def test_invalid_roster_line_reports_line_and_class_without_text(tmp_path):
+    """An invalid external roster line is reported by raw 1-based line number,
+    exception class and offset — never by its text; the valid lines still run."""
+    bad_line = f"(?P={_BAD_ROSTER_TOKEN})"
+    with pytest.raises(re.error) as probe:
+        re.compile(bad_line)
+    # Precondition: this CPython embeds the token in str(exc), so a loader that
+    # appended str(exc) would leak it.
+    assert _BAD_ROSTER_TOKEN in str(probe.value)
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
+    # Line 1 is valid, 2 a comment, 3 blank, 4 the bad line.
+    roster = _external_roster(
+        tmp_path, _EXT_TOKEN + "\n# a comment\n\n" + bad_line + "\n"
+    )
+
+    r = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster), "--redact"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 1, r.stdout + r.stderr  # the valid line still fires
+    assert "doc.md:1" in r.stderr
+    assert "bad roster line 4" in r.stderr, r.stderr
+    assert type(probe.value).__name__ in r.stderr, r.stderr
+    assert f"at offset {probe.value.pos}" in r.stderr, r.stderr
+    assert _BAD_ROSTER_TOKEN not in r.stderr, r.stderr
+    assert probe.value.msg not in r.stderr and "unknown group name" not in r.stderr
+
+
+def test_absent_roster_file_is_a_usage_error(tmp_path):
+    """An explicitly named roster that cannot be read must not silently shrink
+    the scan: it is a usage error (exit 2), never a clean run."""
+    (tmp_path / "clean.py").write_text("# nothing suspicious\n")
+    r = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path),
+         "--roster-file", str(tmp_path / "no-such-roster.txt")],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+
