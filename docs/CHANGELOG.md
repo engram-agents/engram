@@ -11,6 +11,10 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
+  close-keyword grep's adjacency rule matches GitHub's parser (no proximity
+  gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
+  until the next edit event. (#2213)
 - `engram_derive` no longer returns an `independence_advisory` key. It duplicated
   the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
   or more lineages, and when the install has recorded its own lineage, that line
@@ -40,8 +44,15 @@ with an `-alpha` suffix during the alpha phase.
   The "SUBSET green" line now says the full suite runs nightly and at the
   release cut. `--json` gains `layers` and `unreferenced` keys; no key is
   removed. (#4358)
+- tests: `test_bootstrap_fresh_db.py` no longer carries three setup loops that copied
+  runtime files from a path that does not exist, so they never copied anything. Bootstrap runs in place
+  at `src/engram/`, and the tests pass with and without the copy (engram#2173).
 
 ### Fixed
+- Test-only: the forum installer `--dry-run` cells (`test_installer.py`, `test_installer_baton_gate.py`)
+  now run with `HOME` and `XDG_CONFIG_HOME` in a scratch directory. On a seat whose real
+  forum unit carries a baton login map they failed on the installer's correct refusal;
+  the installer is unchanged. (#4393)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
@@ -53,17 +64,25 @@ with an `-alpha` suffix during the alpha phase.
   not reach a 3.10+ interpreter (a wrapper script, or a venv that is itself older)
   fails once rather than retrying. With no usable venv it refuses with one line on
   stderr and exit 3, before doing any work. (#4642)
+- The pipe-exit-warn hook's success-echo check is now case-insensitive and also recognises `passed`, so `| tail && echo DONE` and `echo PASSED` are caught like their lowercase forms (engram#2119).
 - `scan-leaks` no longer prints a bad entry from the local name roster. A roster
   entry that is malformed or has a regex that does not compile is now reported
   by its position in the list and the kind of error only, never by its contents,
   its label or the regex error text, so a terminal paste cannot carry a name.
   The entry is still skipped and loading continues.
+- `worktree-gc` no longer prunes a clean detached worktree whose HEAD commit is in
+  no ref (branch, tag, remote-tracking or other): removing it would leave that
+  commit only in the reflog. It skips with a reason naming the commit, and skips too when git cannot
+  say whether any ref holds it. (engram#4509)
 - The `ia` refusal for an unconfigured forum now points at the engram-letter skill's
   troubleshooting row, not at a README path that does not ship on an installed seat
   (engram#3560).
 - A roster line that does not compile as a regex no longer prints that line, or the
   regex error text, to stderr. The advisory name scan now reports only the roster
   line number, the error class and the offset. (engram#4559)
+- The contract test for the `baton merge` already-closed hint now rejects "retry later"
+  in any letter case. It compared case-sensitively, so a lowercase "retry later"
+  in the new hint passed every cell. (engram#3508)
 - `scan-leaks` now scans every git-tracked text file, not an extension allowlist,
   so its pattern gate reads `.js`, `.html`, `.ts`, `.css`, `.txt`, `.example` and
   extensionless scripts too. A file whose first 8 KiB hold a NUL byte is skipped
