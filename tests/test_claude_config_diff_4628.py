@@ -380,6 +380,8 @@ if sys.argv[1:4] == ["plugin", "marketplace", "add"]:
     with open(sp) as fh:
         settings = json.load(fh)
     reordered = dict(reversed(list(settings.items())))
+    if os.environ.get("STUB_DROP_SETTINGS_KEY"):
+        reordered.pop(os.environ["STUB_DROP_SETTINGS_KEY"], None)
     tmp = sp + ".tmp-stub"
     with open(tmp, "w") as fh:
         json.dump(reordered, fh)
@@ -388,7 +390,8 @@ if sys.argv[1:4] == ["plugin", "marketplace", "add"]:
 '''
 
 
-def _install(tmp_path, *, extra_args=(), with_claude=True, claude_exit=0, seed=True):
+def _install(tmp_path, *, extra_args=(), with_claude=True, claude_exit=0, seed=True,
+             env_extra=None, stubs_extra=None):
     build_root = tmp_path / "build" / "plugin"
     _write_fake_plugin(build_root)
     claude_home = tmp_path / "claude-config"
@@ -406,6 +409,9 @@ def _install(tmp_path, *, extra_args=(), with_claude=True, claude_exit=0, seed=T
         stub = stubs / "claude"
         stub.write_text(STUB.format(python=sys.executable))
         stub.chmod(0o755)
+    for stub_name, stub_text in (stubs_extra or {}).items():
+        (stubs / stub_name).write_text(stub_text)
+        (stubs / stub_name).chmod(0o755)
     # a PATH with no `claude` anywhere: every other executable symlinked into a private dir
     path = os.environ.get("PATH", "")
     if not with_claude:
@@ -432,6 +438,7 @@ def _install(tmp_path, *, extra_args=(), with_claude=True, claude_exit=0, seed=T
         path = str(stubs) + os.pathsep + path
     env = {**os.environ, "ENGRAM_HOME": str(tmp_path), "HOME": str(_login_home(tmp_path)),
            "CLAUDE_CONFIG_DIR": str(claude_home), "PATH": path, "STUB_CLAUDE_EXIT": str(claude_exit)}
+    env.update(env_extra or {})
     real_gitconfig = Path(os.environ.get("HOME", "")) / ".gitconfig"
     if real_gitconfig.is_file() and "GIT_CONFIG_GLOBAL" not in env:
         env["GIT_CONFIG_GLOBAL"] = str(real_gitconfig)
@@ -511,3 +518,174 @@ def test_c8_codex_target_takes_no_snapshot(tmp_path):
     assert "claude-config" not in res.stdout
     assert not (tmp_path / "install-backups").exists()
     assert not (tmp_path / "cc").exists()
+
+
+# ---------------------------------------------------------------- review round: gaps and fixes
+
+def test_s2_a_key_name_cannot_forge_a_line_of_the_report(rig):
+    evil = "a\n" + TAG + "FAKE backup kept at: /etc/passwd\r\x1b[2J z"
+    _jw(rig.f("k.json"), {evil: 1, "keep": 1, "dotted.name/with/slash": 1})
+    rig.snapshot("k.json")
+    _jw(rig.f("k.json"), {"keep": 1, "dotted.name/with/slash": 1})
+    res = rig.report("k.json")
+    assert res.returncode == 0
+    assert not [ln for ln in res.stdout.splitlines() if ln.startswith(TAG + "FAKE")]
+    assert "\x1b" not in res.stdout and "\r" not in res.stdout and " " not in res.stdout
+    assert "\\n" in res.stdout  # the newline is shown escaped, not dropped
+
+
+def test_s2_ordinary_key_names_stay_readable(rig):
+    _jw(rig.f("k.json"), {"a.b/c": {"d-e_f": 1}})
+    rig.snapshot("k.json")
+    _jw(rig.f("k.json"), {"a.b/c": {}})
+    assert "a.b/c.d-e_f: removed" in rig.report("k.json").stdout
+
+
+def test_s3a_removed_and_added_string_values_are_never_printed(rig):
+    _jw(rig.f("k.json"), {"gone": "OLDTOKEN-" + SECRET, "keep": 1})
+    rig.snapshot("k.json")
+    _jw(rig.f("k.json"), {"keep": 1, "fresh": "NEWTOKEN-" + SECRET})
+    res = rig.report("k.json")
+    assert "gone: removed" in res.stdout and "fresh: added" in res.stdout
+    assert "OLDTOKEN" not in res.stdout and "NEWTOKEN" not in res.stdout
+    assert "SECRETVALUE" not in res.stdout + res.stderr
+
+
+def test_s1_one_files_failure_does_not_hide_another_and_its_backup_is_kept_first(rig):
+    _jw(rig.f("known.json"), {"mk": {"autoUpdate": True, "src": 1}})
+    _jw(rig.f("settings.json"), {"model": "m"})
+    rig.snapshot("known.json", "settings.json")
+    _jw(rig.f("known.json"), {"mk": {"src": 1}})
+    rig.f("settings.json").unlink()
+    rig.f("settings.json").mkdir()  # reading it raises IsADirectoryError
+    res = rig.report("known.json", "settings.json")
+    assert res.returncode == 0
+    out = res.stdout
+    assert "mk.autoUpdate: removed" in out
+    (d,) = rig.backup_dirs()
+    assert json.loads((d / "known.json").read_text()) == {"mk": {"autoUpdate": True, "src": 1}}
+    assert f"your previous known.json is kept at: {d / 'known.json'}" in out
+    unavailable = [ln for ln in out.splitlines() if "claude-config diff unavailable: IsADirectoryError" in ln]
+    assert unavailable == [TAG + "claude-config diff unavailable: IsADirectoryError"]
+    # the first file's backup is announced BEFORE the second file's failure
+    assert out.index("is kept at") < out.index("diff unavailable")
+
+
+def test_s1_an_early_file_failing_does_not_stop_the_later_files(rig):
+    _jw(rig.f("settings.json"), {"model": "m"})
+    _jw(rig.f("known.json"), {"mk": {"autoUpdate": True}})
+    rig.snapshot("settings.json", "known.json")
+    rig.f("settings.json").unlink()
+    rig.f("settings.json").mkdir()
+    _jw(rig.f("known.json"), {"mk": {}})
+    res = rig.report("settings.json", "known.json")
+    assert res.returncode == 0
+    assert "diff unavailable: IsADirectoryError" in res.stdout
+    assert "mk.autoUpdate: removed" in res.stdout
+    (d,) = rig.backup_dirs()
+    assert (d / "known.json").is_file()
+
+
+def test_s1_a_backup_that_cannot_be_written_is_said_not_silent(rig):
+    _jw(rig.f("k.json"), {"mk": {"autoUpdate": True}})
+    rig.snapshot("k.json")
+    _jw(rig.f("k.json"), {"mk": {}})
+    rig.backups.write_text("a file where the backup folder should be")
+    res = rig.report("k.json")
+    assert res.returncode == 0
+    lines = res.stdout.splitlines()
+    removed = next(i for i, ln in enumerate(lines) if "mk.autoUpdate: removed" in ln)
+    assert lines[removed + 1].startswith(TAG + "no backup was kept (")
+    assert "kept at" not in res.stdout
+
+
+def test_s3d_two_backups_in_the_same_second_get_two_folders(rig):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_ccd4628", HELPER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.time.strftime = lambda *a, **k: "20260101T000000Z"  # freeze the clock: same second, for certain
+    a = mod._backup_dir(rig.backups)
+    b = mod._backup_dir(rig.backups)
+    assert a != b and a.is_dir() and b.is_dir()
+
+
+def test_s3d_two_real_reports_back_to_back_keep_both_backups(rig):
+    for n in (1, 2):
+        _jw(rig.f("k.json"), {"mk": {"autoUpdate": True, "n": n}})
+        rig.snapshot("k.json")
+        _jw(rig.f("k.json"), {"mk": {"n": n}})
+        res = rig.report("k.json")
+        assert "no backup was kept" not in res.stdout
+    assert len(rig.backup_dirs()) == 2
+    assert all((d / "k.json").is_file() for d in rig.backup_dirs())
+
+
+def test_s3e_a_backup_root_whose_parents_do_not_exist_is_created(rig, tmp_path):
+    rig.backups = tmp_path / "no" / "such" / "parents" / "install-backups"
+    _jw(rig.f("k.json"), {"mk": {"autoUpdate": True}})
+    rig.snapshot("k.json")
+    _jw(rig.f("k.json"), {"mk": {}})
+    res = rig.report("k.json")
+    assert "no backup was kept" not in res.stdout
+    (d,) = rig.backup_dirs()
+    assert (d / "k.json").is_file()
+
+
+_RM_STUB = """#!/bin/bash
+for a in "$@"; do
+  case "$(basename "$a")" in
+    install-local-marketplace-claude-snap.*) echo "$a" >> "$(dirname "$0")/rm-refused.log"; exit 1 ;;
+  esac
+done
+exec /bin/rm "$@"
+"""
+
+
+def test_b1_a_failing_snapshot_cleanup_does_not_change_the_exit_code(tmp_path):
+    base = tmp_path / "base"
+    base.mkdir()
+    ok, _ = _install(base)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    for name, claude_exit in (("rm-ok-run", 0), ("rm-fail-claude", 3)):
+        d = tmp_path / name
+        d.mkdir()
+        res, _ = _install(d, claude_exit=claude_exit, stubs_extra={"rm": _RM_STUB})
+        # the stub really refused the snapshot folder (otherwise this cell proves nothing)
+        assert (d / "stubbin" / "rm-refused.log").is_file()
+        assert res.returncode == claude_exit, res.stdout + res.stderr
+        assert "engram-local.autoUpdate" in res.stdout
+        if claude_exit == 0:
+            assert res.stdout.count("Marketplace registered. Next steps") == ok.stdout.count(
+                "Marketplace registered. Next steps") == 1
+            assert "ITEMS NOT DONE" not in res.stdout and "ERROR" not in res.stdout
+
+
+_PY_STUB = """#!/bin/bash
+case "$1" in
+  *claude_config_diff.py)
+    echo "$2" >> "$(dirname "$0")/helper-calls.log"
+    case ",$STUB_HELPER_FAILS," in *",$2,"*) exit 7 ;; esac ;;
+esac
+exec {python} "$@"
+"""
+
+
+@pytest.mark.parametrize("failing", ["snapshot", "report", "snapshot,report"])
+def test_s3b_a_helper_that_exits_nonzero_leaves_the_installer_exit_code_alone(tmp_path, failing):
+    stub = _PY_STUB.format(python=sys.executable)
+    res, _ = _install(tmp_path, env_extra={"STUB_HELPER_FAILS": failing}, stubs_extra={"python3": stub})
+    calls = (tmp_path / "stubbin" / "helper-calls.log").read_text().split()
+    assert "snapshot" in calls and "report" in calls  # the helper really ran, and really failed
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "Marketplace registered. Next steps" in res.stdout
+
+
+def test_s3c_both_files_are_watched_a_key_dropped_from_settings_is_reported(tmp_path):
+    res, claude_home = _install(tmp_path, env_extra={"STUB_DROP_SETTINGS_KEY": "theme"})
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "settings.json was changed by the marketplace add:" in res.stdout
+    assert "theme: removed" in res.stdout
+    (d,) = sorted((tmp_path / "install-backups").glob("pre-marketplace-add-*"))
+    assert json.loads((d / "settings.json").read_text())["theme"] == "dark"
+    assert "SECRETVALUE" not in res.stdout + res.stderr

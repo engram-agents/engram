@@ -17,20 +17,26 @@ Contract (pinned by tests/test_claude_config_diff_4628.py):
   C1  For a file that is a JSON object both before and after, one line per dotted key path that
       was ADDED, REMOVED or CHANGED. Objects are walked; a list is compared as a whole value.
       Key order and whitespace alone are not a change: a file rewritten with the same content in
-      another order prints nothing.
-  C2  A string value is never printed. A changed boolean or number prints `old -> new`; any other
-      changed value prints `changed (<type>)`, or `changed (<old type> -> <new type>)` when the
-      type itself changed.
+      another order prints nothing. Known limits: a key `a.b` and a key `a` holding `b` print the
+      same dotted path; `1` and `1.0` count as a change. Key names are printed escaped (control
+      characters and non-printables as \\uXXXX), so a name cannot forge a line.
+  C2  A string value is never printed (added, removed, changed or unchanged). A changed boolean
+      or number prints `old -> new`; any other changed value prints `changed (<type>)`, or
+      `changed (<old type> -> <new type>)` when the type itself changed.
   C3  A file absent before and present after prints `created: <name>`; present before and absent
       after prints `removed: <name>`. A file that is not a JSON object before or after is compared
       by sha256 and prints `changed (not parsed as JSON): <name>` only if the bytes differ.
   C4  If any key was REMOVED or CHANGED (or a file was removed, or an unparsed file changed), the
-      BEFORE bytes are copied to <backup-root>/pre-marketplace-add-<UTC stamp>/<name> (folder
-      0700, file 0600) and the path is printed. If the only differences are ADDED keys, or nothing
-      differs, no backup is kept and none is announced.
+      BEFORE bytes of that file are copied, right after that file's listing, to
+      <backup-root>/pre-marketplace-add-<UTC stamp>/<name> (folder 0700, file 0600) and the path
+      is printed. If the only differences are ADDED keys, or nothing
+      differs, no backup is kept and none is announced. If the backup cannot be written, the line
+      `no backup was kept (<exception class>)` follows the listing.
   C5  Neither subcommand ever fails the install: both always exit 0. Any exception prints one line
-      `claude-config diff unavailable: <exception class>`. A missing snapshot folder prints that no
-      snapshot was taken. Output goes to stdout; nothing goes to stderr on the normal path.
+      `claude-config diff unavailable: <exception class>` (report handles each file on its
+      own, so one file's error does not stop the others). A missing snapshot
+      folder prints that no snapshot was taken. Output goes to stdout; nothing goes to stderr on
+      the normal path. (A SIGKILL leaves the snapshot folder behind; nothing can clean that up.)
   C6  The Claude files are only READ. The helper writes inside the snapshot folder and the backup
       root, nowhere else.
 
@@ -174,54 +180,81 @@ def _backup_dir(root: Path) -> Path:
             n += 1
 
 
+def _esc(name: str) -> str:
+    """A key or file name for printing: control characters and non-printables are escaped
+    (JSON style), so a name can never start a line of its own. Ordinary names are unchanged."""
+    out = []
+    for ch in json.dumps(name, ensure_ascii=False)[1:-1]:
+        if ch.isprintable():
+            out.append(ch)
+        elif ord(ch) <= 0xFFFF:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append("\\U%08x" % ord(ch))
+    return "".join(out)
+
+
+def _keep(name: str, before: bytes, backup_root: Path, folder: list) -> None:
+    """Write one file's backup and announce it now. A failure is said, never silent."""
+    try:
+        if not folder:
+            folder.append(_backup_dir(backup_root))
+        target = folder[0] / name
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(before)
+        os.chmod(target, 0o600)
+        say(f"your previous {_esc(name)} is kept at: {target}")
+    except Exception as exc:  # noqa: BLE001 - say it, keep going (C5)
+        say(f"no backup was kept ({type(exc).__name__})")
+
+
+def _report_file(snap: Path, p: Path, backup_root: Path, folder: list) -> None:
+    name = p.name
+    shown = _esc(name)
+    known, before = _before(snap, name)
+    if not known:
+        say(f"no snapshot of {shown} was taken, so changes to it cannot be listed")
+        return
+    after = _read(p)
+    if before is None and after is None:
+        return
+    if before is None:
+        say(f"created: {shown}")
+        return
+    if after is None:
+        say(f"removed: {shown}")
+        _keep(name, before, backup_root, folder)
+        return
+    old, new = _parse_object(before), _parse_object(after)
+    if old is None or new is None:
+        if hashlib.sha256(before).digest() != hashlib.sha256(after).digest():
+            say(f"changed (not parsed as JSON): {shown}")
+            _keep(name, before, backup_root, folder)
+        return
+    diffs: list = []
+    _walk(old, new, "", diffs)
+    if not diffs:
+        return
+    say(f"{shown} was changed by the marketplace add:")
+    for kind, path, detail in diffs:
+        say(f"  {_esc(path)}: {detail or kind}")
+    if any(kind in ("removed", "changed") for kind, _, _ in diffs):
+        _keep(name, before, backup_root, folder)
+
+
 def report(snap_dir: str, backup_root: str, files: list) -> None:
     snap = Path(snap_dir)
     if not (snap / _FILES).is_dir():
         say("no snapshot was taken, so changes to your Claude files cannot be listed")
         return
-    to_save = []  # (name, before bytes)
+    folder: list = []  # the one backup folder of this report, made when the first backup is needed
     for f in files:
         p = Path(f)
-        name = p.name
-        known, before = _before(snap, name)
-        if not known:
-            say(f"no snapshot of {name} was taken, so changes to it cannot be listed")
-            continue
-        after = _read(p)
-        if before is None and after is None:
-            continue
-        if before is None:
-            say(f"created: {name}")
-            continue
-        if after is None:
-            say(f"removed: {name}")
-            to_save.append((name, before))
-            continue
-        old, new = _parse_object(before), _parse_object(after)
-        if old is None or new is None:
-            if hashlib.sha256(before).digest() != hashlib.sha256(after).digest():
-                say(f"changed (not parsed as JSON): {name}")
-                to_save.append((name, before))
-            continue
-        diffs: list = []
-        _walk(old, new, "", diffs)
-        if not diffs:
-            continue
-        say(f"{name} was changed by the marketplace add:")
-        for kind, path, detail in diffs:
-            say(f"  {path}: {detail or kind}")
-        if any(kind in ("removed", "changed") for kind, _, _ in diffs):
-            to_save.append((name, before))
-    if not to_save:
-        return
-    d = _backup_dir(Path(backup_root))
-    for name, before in to_save:
-        target = d / name
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(before)
-        os.chmod(target, 0o600)
-        say(f"your previous {name} is kept at: {target}")
+        try:  # each file stands alone: one file's error never hides another's changes or backup
+            _report_file(snap, p, Path(backup_root), folder)
+        except Exception as exc:  # noqa: BLE001 - never fail the install (C5)
+            say(f"claude-config diff unavailable: {type(exc).__name__}")
 
 
 def main(argv=None) -> int:

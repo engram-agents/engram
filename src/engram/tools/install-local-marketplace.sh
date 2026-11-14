@@ -140,7 +140,8 @@ EOF_ND
 _exit_trap() {
   local rc=$?
   if [[ -n "${_cc_snap:-}" ]]; then
-    rm -rf "$_cc_snap"
+    # `|| true`: under set -e a failed rm would abort this trap and change the exit code
+    rm -rf "$_cc_snap" || true
   fi
   _report_not_done "$rc"
   if [[ "${_venv_fail:-0}" == "1" ]]; then
