@@ -1015,6 +1015,35 @@ def test_c3_non_oserror_mid_walk_is_one_unexpected_entry_and_never_raises(tmp_pa
     assert stat.S_IMODE(os.stat(home / "diary" / "c.txt").st_mode) == 0o644
 
 
+def test_c3_outer_except_lets_interrupt_out(tmp_path, monkeypatch):
+    # The OTHER half of the same line as the cell above: `except Exception` is chosen
+    # because it does NOT catch BaseException. An interrupt is the operator's control
+    # signal, not a data anomaly -- it must reach the caller, never become an entry.
+    # (Cell supplied by the security seat's read of engram-agents/engram#4761.)
+    home = tmp_path / "h"
+    old = os.umask(0)
+    try:
+        home.mkdir()
+        os.chmod(home, 0o755)
+        (home / "diary").mkdir()
+        os.chmod(home / "diary", 0o755)
+        (home / "diary" / "b.txt").write_text("x")
+        os.chmod(home / "diary" / "b.txt", 0o644)
+    finally:
+        os.umask(old)
+    failing = os.path.join(os.path.realpath(home), "diary", "b.txt")
+    real_lstat = os.lstat
+
+    def fake_lstat(p, *a, **k):
+        if isinstance(p, (str, os.PathLike)) and os.fspath(p) == failing:
+            raise KeyboardInterrupt("injected")
+        return real_lstat(p, *a, **k)
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    with pytest.raises(KeyboardInterrupt):
+        _perms().tighten_data_home(home)
+
+
 def test_c3_hard_linked_file_is_skipped_and_outside_mode_kept(tmp_path):
     home = tmp_path / "h"
     _loose_tree(home)
