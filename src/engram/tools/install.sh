@@ -380,7 +380,7 @@ print(f(sys.argv[1]) or "")' "$REPO_ROOT" 2>/dev/null)" || _rc=$?
   if [ "$_rc" -ne 0 ] || [ -z "$_deploy_tag" ]; then
     _head_short="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     _branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-    fail "HEAD $_head_short (branch $_branch) is not a deployable tag merged into origin/dev or origin/main; step 5 would refuse it" "check out a deployable tag (v* or deploy/*) and re-run. If this is a full clone with stale refs, run git fetch --tags origin first. If this is a shallow single-branch clone (git clone --depth), git fetch --tags origin does not help: run git remote set-branches origin '*' && git fetch --unshallow, or clone again without --depth. --sandbox-untagged is for a test rig only, not a release"
+    fail "HEAD $_head_short (branch $_branch) is not a deployable tag merged into origin/dev or origin/main; step 5 would refuse it" "check out a deployable tag (v* or deploy/*) and re-run (--sandbox-untagged is for a test rig only, not a release). If this is a full clone with stale refs, run git fetch --tags origin first. If this is a shallow single-branch clone (git clone --depth), git fetch --tags origin does not help: clone again without --depth, or keep the clone, run this, then re-run: git remote set-branches origin '*' && git fetch --unshallow"
   fi
 fi
 
