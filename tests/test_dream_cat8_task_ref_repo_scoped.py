@@ -314,6 +314,14 @@ def test_alias_umwelt_resolves_to_full_ref(tmp_path):
     assert set(_repos(calls)) == {"engram-agents/umwelt"}, calls
 
 
+def test_alias_with_optional_space_resolves_to_full_ref(tmp_path):
+    # the dominant authoring style writes `umwelt #1069`; one optional space is
+    # accepted and joined before the map lookup, so the ref reaches gh qualified
+    lines, calls = _run_cat8(tmp_path, "see umwelt #1069 for context")
+    assert lines == ["engram-agents/umwelt#1069 - UNKNOWN"], lines
+    assert set(_repos(calls)) == {"engram-agents/umwelt"}, calls
+
+
 def test_unlisted_org_repo_is_not_an_alias(tmp_path):
     # `engram` and `engram-alpha` are different repos with overlapping numbers
     assert _refs("blocked on engram#5 landing") == []
@@ -369,15 +377,45 @@ def test_alias_and_qualified_forms_of_one_artifact_dedupe(tmp_path):
     assert len(calls) <= 2, calls  # one artifact: at most the pr + issue probe
 
 
+_BASH4_ONLY = (
+    "declare -A", "local -A", "mapfile", "readarray", "local -n", ",,}", "^^}",
+)
+
+
+def test_cat8_bash_block_has_no_bash4_only_constructs():
+    """Encode the block runs under stock macOS bash 3.2: an unsupported
+    declaration does not abort the script, it leaves the map unset and the
+    stage emits NOTHING with exit 0 -- the silent under-reporting this
+    category exists to prevent. Checks executable lines only, so a comment
+    naming a construct cannot satisfy or trip the cell."""
+    block = _bash_block()  # asserts the block exists; fails loudly if reshaped
+    executable = "\n".join(
+        line for line in block.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert executable.strip(), "no executable lines in the Category 8 bash block"
+    for construct in _BASH4_ONLY:
+        assert construct not in executable, (
+            f"bash-4-only construct {construct!r} in the Category 8 block; "
+            f"stock macOS ships bash 3.2")
+
+
 def test_repomap_keys_equal_aliases_alternation():
     block = _bash_block()
-    m = re.search(r"declare -A REPOMAP=\(\n(.*?)\n\)", block, re.DOTALL)
-    assert m, "REPOMAP declaration not found -- bash block reshaped?"
-    keys = set(re.findall(r"^\s*\[([^\]]+)\]=", m.group(1), re.MULTILINE))
+    m = re.search(r"^repo_for\(\) \{\n(.*?)^\}", block, re.DOTALL | re.MULTILINE)
+    assert m, "repo_for function not found -- bash block reshaped?"
+    arms = re.findall(
+        r"^\s*([A-Za-z0-9_.-]+)\)\s*echo\s+(\S+)", m.group(1), re.MULTILINE
+    )
+    keys = {key for key, _ in arms}
+    values = {value for _, value in arms}
     aliases = _aliases_literal().split("|")
-    assert keys, "REPOMAP declares no aliases"
+    assert keys, "repo_for declares no aliases"
     assert aliases and all(aliases), f"ALIASES is empty or malformed: {aliases!r}"
     assert keys == set(aliases), (keys, aliases)
+    for value in sorted(values):
+        assert re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value), (
+            f"map value is not a two-segment owner/repo: {value!r}")
 
 
 def test_report_cat8_finding_carries_full_qualified_ref():
