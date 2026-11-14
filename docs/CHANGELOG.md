@@ -62,6 +62,12 @@ with an `-alpha` suffix during the alpha phase.
   now run with `HOME` and `XDG_CONFIG_HOME` in a scratch directory. On a seat whose real
   forum unit carries a baton login map they failed on the installer's correct refusal;
   the installer is unchanged. (#4393)
+- `worktree-gc.py --apply` no longer removes the worktree that the deploy record
+  (`deployed_from` in `.deployed-version`) names. The upgrade flow uses that
+  directory as the source of the next upgrade, but a clean detached worktree with
+  no open PR looked like a reviewer leftover and was pruned. It is now kept, with
+  the reason "deploy source". A missing or malformed deploy record changes
+  nothing. (engram#4157)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
