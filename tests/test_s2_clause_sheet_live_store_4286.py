@@ -195,6 +195,44 @@ def test_missing_db_is_not_a_live_store_match(env, capsys, cmd):
     assert rc != 0
 
 
+def test_different_case_spelling_of_live_store_refused(env, capsys):
+    """On a case-insensitive filesystem (the macOS default) another spelling names the same file."""
+    upper = env["live"].with_name("KNOWLEDGE.DB")
+    if not upper.exists():
+        pytest.skip("case-sensitive filesystem: the other spelling is a different, absent file")
+    err = _refused_cleanly(env, "select", upper, capsys)
+    assert "live store" in err
+
+
+def test_dangling_symlink_is_not_a_live_store_match(env, capsys):
+    """A symlink to nothing names no store; it falls through like a missing --db."""
+    link = env["scratch"] / "dangling.db"
+    link.symlink_to(env["scratch"] / "nowhere.db")
+    out = _prepare(env, "select")
+    rc = None
+    try:
+        rc = env["tool"].main(_argv(env, "select", link, out))
+    except sqlite3.OperationalError:
+        pass  # today's behaviour: the read-only open fails
+    assert "live store" not in capsys.readouterr().err
+    assert rc != 0
+
+
+def test_samefile_failure_refuses_instead_of_passing(env, monkeypatch, capsys):
+    """If the same-file check itself fails, the tool cannot tell, so it refuses rather than reading."""
+    def boom(a, b):
+        raise PermissionError(13, "Permission denied")
+    out = _prepare(env, "select")
+    monkeypatch.setattr(os.path, "samefile", boom)
+    capsys.readouterr()
+    rc = env["tool"].main(_argv(env, "select", env["copy"], out))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert err.count("\n") == 1 and err.startswith("refused: cannot tell whether --db "), err
+    assert "Permission denied" in err
+    assert env["calls"] == []
+
+
 def test_missing_live_store_is_not_a_match(env, capsys):
     env["live"].unlink()
     out = _prepare(env, "select")

@@ -276,7 +276,8 @@ def _refuse_live_store(db_arg: str) -> None:
     """Refuse a --db that is the live store (engram_home()/knowledge.db, or a symlink or hard link to it),
     so the tool only ever reads copies (#4286). Runs before any read. A missing --db or a missing live
     store is not a match; those fall through to today's behaviour. If engram_home() itself refuses (a
-    relative ENGRAM_HOME) the check cannot run, so this refuses too."""
+    relative ENGRAM_HOME), or the same-file check itself fails (an OSError), the check cannot run, so this
+    refuses too."""
     try:
         live = engram_home_resolver.engram_home() / "knowledge.db"
     except ValueError as exc:
@@ -284,7 +285,11 @@ def _refuse_live_store(db_arg: str) -> None:
     given = Path(db_arg)
     if not (given.exists() and live.exists()):
         return
-    if os.path.realpath(given) == os.path.realpath(live) or os.path.samefile(given, live):
+    try:
+        same = os.path.realpath(given) == os.path.realpath(live) or os.path.samefile(given, live)
+    except OSError as exc:
+        raise Refusal(f"cannot tell whether --db {db_arg} is the live store: {exc}") from None
+    if same:
         raise Refusal(
             f"--db {db_arg} is the live store ({live}); this tool only reads copies. Take a backup-API "
             f"copy into a scratch directory (sqlite3 <live> \".backup <scratch>/copy.db\", or Python's "
