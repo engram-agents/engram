@@ -1095,8 +1095,9 @@ def test_deploy_source_survives_symlinked_spelling(tmp_path, _isolated_engram_ho
 
 def test_deploy_source_every_deployed_from_value_is_protected(
         tmp_path, _isolated_engram_home):
-    # The upgrade readers disagree on which `deployed_from` line wins (one
-    # keeps the first, one the last), so every value is protected.
+    # The upgrade readers do not agree on several `deployed_from` lines (flows.py
+    # keeps the last value; cli.py the last one naming an existing directory), so
+    # every value is protected.
     first = tmp_path / "first-tree"
     second = tmp_path / "second-tree"
     first.mkdir()

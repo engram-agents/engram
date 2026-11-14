@@ -19,10 +19,11 @@ This tool classifies each worktree and removes the safely-finished ones:
   PRUNE   `worktree-agent-*` / `review-*` tmp-branch worktree, clean
   KEEP    a worktree the deploy record names (`deployed_from` in
           `<ENGRAM_HOME>/.deployed-version`): the upgrade flow's source tree,
-          load-bearing though it looks like a leftover (#4157); checked first
-          on every path that would otherwise prune it. EVERY `deployed_from`
-          value is protected, because the readers of the record disagree on
-          which line wins when there are several
+          load-bearing though it looks like a leftover (#4157); checked before
+          any prune of an existing worktree. EVERY `deployed_from` value is
+          protected: the readers of the record do not agree when it has several
+          lines (flows.py keeps the last value; cli.py keeps the last one that
+          names an existing directory, and does not accept spaces around the key)
   KEEP    branch worktree whose PR is OPEN (active work)
   KEEP    branch worktree with NO PR (pre-PR or abandoned — flagged for a human)
   SKIP    an AGENT-OWNED worktree (branch `worktree-agent-*` / `review-*`, or any
@@ -151,9 +152,10 @@ def _deploy_sources() -> frozenset[str]:
 
     The upgrade flow uses a `deployed_from` directory as the SOURCE_DIR of the
     next upgrade, so a worktree there is load-bearing even though it looks like
-    a prunable leftover. The two readers of the record disagree on which line
-    wins when it carries more than one (one keeps the first, the other the
-    last), so every value is protected: that is right whichever reader runs.
+    a prunable leftover. The record's readers do not agree when it carries
+    several lines (flows.py keeps the last value; cli.py keeps the last one that
+    names an existing directory, and does not accept spaces around the key), so
+    every value is protected: that is right whichever reader runs.
     Fails open to the empty set (today's classification) on a missing,
     unreadable or malformed record, an empty value, or an unresolvable home.
     """
@@ -381,9 +383,10 @@ def classify(t: dict, root: str, *, main_path: str | None = None,
     path = t["path"]
     if not Path(path).exists():
         return "PRUNE", "worktree directory missing (stale admin record)"
-    # Deploy source (#4157): before ANY prune return. The upgrade flow reads
-    # `deployed_from` and uses that directory as the next upgrade's source tree;
-    # its readers disagree on which of several lines wins, so all are protected.
+    # Deploy source (#4157): before any prune of an existing worktree (a missing
+    # directory above is still PRUNEd: only its admin record goes). The upgrade
+    # flow reads `deployed_from` and uses that directory as the next upgrade's
+    # source tree; its readers do not agree on several lines, so all are protected.
     if os.path.realpath(path) in _deploy_sources():
         return "KEEP", "deploy source — the deploy record's deployed_from; the next upgrade needs it"
     if not _is_clean(path):
