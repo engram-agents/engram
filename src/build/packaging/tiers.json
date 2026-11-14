@@ -608,6 +608,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/archive_transcripts.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/build-plugin.sh",
       "tier": "convenience",
       "source": "src/build/build-plugin.sh"

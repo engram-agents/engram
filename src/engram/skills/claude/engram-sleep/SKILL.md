@@ -582,6 +582,48 @@ fi
 
 ---
 
+### Step 4.8 — Archive the day's transcripts (compressed, kept forever)
+
+Run the transcript archive tool and **capture the result for the sleep summary**. It
+archives every `.jsonl` transcript under `~/.claude/projects/` (subagent transcripts
+included) into `${ENGRAM_HOME:-$HOME/.engram}/transcript-archive/`: one xz-compressed file
+per run, holding only the bytes written since the last run (a per-file byte watermark, no
+timestamps). A run with nothing new writes no file.
+
+```bash
+transcript_archive_out=$("$HOME/.engram/venv/bin/python3" \
+    "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/archive_transcripts.py" \
+    2>&1)
+transcript_archive_rc=$?
+if [ $transcript_archive_rc -eq 0 ]; then
+    transcript_archive_status="✓ transcript archive OK: $transcript_archive_out"
+else
+    transcript_archive_status="⚠ transcript archive FAILED: $transcript_archive_out"
+fi
+```
+
+**This step has no off switch, no `--retain`, and it never deletes anything**: archives are
+kept forever, and sleep runs it every night. (Steps 4.6 and 4.7 are the older copies; a
+later change retires the 4.7 mirror.)
+
+**Non-blocking for sleep**: a failure does not abort sleep (the transcripts still exist in
+`~/.claude/projects/`), but it is **loud**: surface the status line in the history milestone
+(Step 4) so a recurring failure is visible, not silent. A failure means a transcript shrank
+below its archived size, an archive is unreadable, or a read failed; the tool writes nothing
+in that case and names the path and the numbers.
+
+```
+- transcript archive: $transcript_archive_status
+```
+
+**Skip if the source directory is absent** (the tool exits 0 with a `0 new bytes` summary).
+
+**Replay** (to restore or to check): `archive_transcripts.py --replay <empty dir>` rebuilds
+every archived transcript there, byte for byte. Raw transcripts stay on this machine: the
+archive folder is git-ignored and owner-only, and only `.jsonl` files are covered.
+
+---
+
 ## Phase B — Consolidation orchestration
 
 > **Phase B is MANDATORY whenever you reach it, and reaching it requires the sub-agent grant** (see the all-or-nothing invariant in
