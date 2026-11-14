@@ -367,6 +367,7 @@ seat can run it and any other seat can check that it ran.
    `tests/test_raw_home_read_gate_3863.py`, `tests/test_home_path_gate.py`,
    `tests/test_lesson_pattern_audit_shipped_3941.py` (it copies every shipped
    hook into its tree), `tests/test_docs_layout_guard.py`,
+   `tests/test_policy_guard_list_4487.py` (it reads this document and names no module),
    `tests/test_metadata_parse_drift_guard_3413.py`,
    `tests/test_json_extract_metadata_guard_3485.py` and
    `tests/test_no_retired_cascade_store_asserts.py` (it scans `tests/` itself) and
