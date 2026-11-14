@@ -186,8 +186,19 @@ def read_offset_state(state_file_path: str) -> tuple[Optional[str], int]:
     return state.get("transcript_path"), int(state.get("byte_offset", 0))
 
 
-def write_offset_state(state_file_path: str, transcript_path: str) -> None:
-    """Write `{"transcript_path": transcript_path, "byte_offset": <EOF size>}`.
+def write_offset_state(
+    state_file_path: str, transcript_path: str, offset: Optional[int] = None
+) -> None:
+    """Write `{"transcript_path": transcript_path, "byte_offset": <offset>}`.
+
+    `offset` is the size the caller's delta scan actually used (the single
+    `getsize()` it passed to `read_delta`). Recording THAT value, not a fresh
+    stat, is what keeps the offset equal to "scanned up to here": the harness
+    writes the transcript asynchronously, so a second stat taken after the
+    decision path can land past bytes no scan ever read, hiding them from every
+    future delta (engram-agents/engram#1855). A caller with no scan to record
+    (first run, seeding) passes nothing, and the transcript is stat'd here. A
+    negative or non-int `offset` (bool included) is treated as not given.
 
     Best-effort: any failure (can't stat the transcript, can't write the
     state file) is silenced, matching engram-stop-hook.py's pre-extraction
@@ -196,13 +207,16 @@ def write_offset_state(state_file_path: str, transcript_path: str) -> None:
     concurrent reader never observes a partial write.
     """
     try:
-        offset = 0
-        if transcript_path:
-            try:
-                offset = os.path.getsize(transcript_path)
-            except OSError:
-                pass
-        state = {"transcript_path": transcript_path, "byte_offset": offset}
+        if isinstance(offset, int) and not isinstance(offset, bool) and offset >= 0:
+            recorded = offset
+        else:
+            recorded = 0
+            if transcript_path:
+                try:
+                    recorded = os.path.getsize(transcript_path)
+                except OSError:
+                    pass
+        state = {"transcript_path": transcript_path, "byte_offset": recorded}
         atomic_write_json(state_file_path, state, encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass

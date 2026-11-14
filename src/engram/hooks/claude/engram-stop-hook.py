@@ -247,6 +247,8 @@ except Exception:
 # State file for idle suppression. Stores transcript_path + byte_offset from
 # the previous fire so we can read only the delta on the next fire.
 _NUDGE_STATE_FILE = os.path.join(ENGRAM_HOME, ".write-nudge-last-fire.json")
+# #1855: the transcript size the last delta scan in this invocation used (None = no scan ran).
+_SCANNED_SIZE: int | None = None
 
 CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")
 
@@ -922,6 +924,10 @@ def _should_suppress(transcript_path: str) -> bool:
             current_size = os.path.getsize(transcript_path)
         except OSError:
             return False  # can't stat → emit
+        # #1855: remember the size this scan used; _update_state records THAT,
+        # not a second stat the transcript may have outgrown.
+        global _SCANNED_SIZE
+        _SCANNED_SIZE = current_size
 
         # Stored offset beyond current size → rotation/compaction → emit.
         if stored_offset > current_size:
@@ -976,7 +982,8 @@ def _update_state(transcript_path: str) -> None:
     """Write the current EOF offset to the state file. Failure is silenced."""
     if not _STOPHOOKLIB_OK:
         return
-    _write_offset_state_impl(_NUDGE_STATE_FILE, transcript_path)
+    # #1855: record the scanned size; None (no scan ran) re-stats, as before.
+    _write_offset_state_impl(_NUDGE_STATE_FILE, transcript_path, offset=_SCANNED_SIZE)
 
 
 def _report_owner_failure(failure: "_OwnerReadFailure", stop_hook_active: bool) -> None:

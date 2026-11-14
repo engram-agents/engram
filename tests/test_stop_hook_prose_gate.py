@@ -690,3 +690,88 @@ def test_all_garbage_delta_emits(tmp_path):
     )
 
 
+
+
+# ===========================================================================
+# engram-agents/engram#1855: the recorded offset is the size the delta scan
+# used, not a second stat taken after the decision path.
+# ===========================================================================
+
+
+def _grow_after_each_scan_stat(monkeypatch, transcript: Path, extra: bytes):
+    """Patch os.path.getsize so the transcript grows by `extra` right AFTER every
+    stat made by the hook's scan (models the harness flushing asynchronously).
+    Stats made from inside write_offset_state are not scan stats: they see the
+    grown file but do not grow it further. Returns a controller with
+    `.scan_sizes` and `.on` (set False to stop growing)."""
+
+    class _Ctl:
+        pass
+
+    ctl = _Ctl()
+    ctl.on = True
+    ctl.scan_sizes = []
+    real = os.path.getsize
+
+    def fake(path):
+        size = real(path)
+        if ctl.on and os.fspath(path) == str(transcript):
+            if sys._getframe(1).f_code.co_name != "write_offset_state":
+                ctl.scan_sizes.append(size)
+                with open(transcript, "ab") as f:
+                    f.write(extra)
+        return size
+
+    monkeypatch.setattr(os.path, "getsize", fake)
+    return ctl
+
+
+def _race_setup(tmp_path, monkeypatch):
+    home = tmp_path / "engram"
+    home.mkdir()
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    mod = _load_hook_module()
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    _append_lines(transcript, _assistant_text_record(_LONG_PROSE))
+    state = Path(mod._NUDGE_STATE_FILE)
+    state.write_text(
+        json.dumps({"transcript_path": str(transcript), "byte_offset": 0}),
+        encoding="utf-8",
+    )
+    return mod, transcript, state
+
+
+def test_race_recorded_offset_is_scanned_size_1855(tmp_path, monkeypatch):
+    mod, transcript, state = _race_setup(tmp_path, monkeypatch)
+    ctl = _grow_after_each_scan_stat(monkeypatch, transcript, b'{"late":1}\n')
+
+    mod._should_suppress(str(transcript))
+    mod._update_state(str(transcript))
+
+    assert len(ctl.scan_sizes) == 1
+    recorded = json.loads(state.read_text(encoding="utf-8"))["byte_offset"]
+    assert recorded == ctl.scan_sizes[0]
+    assert os.path.getsize(transcript) > recorded  # the file really did grow
+
+
+def test_race_next_delta_contains_bytes_appended_in_window_1855(tmp_path, monkeypatch):
+    mod, transcript, state = _race_setup(tmp_path, monkeypatch)
+    late = b'{"type":"assistant","message":{"content":[]},"marker":"LATE-BYTES"}\n'
+    ctl = _grow_after_each_scan_stat(monkeypatch, transcript, late)
+    mod._should_suppress(str(transcript))
+    mod._update_state(str(transcript))
+    ctl.on = False
+
+    seen = []
+    real_read_delta = mod._read_delta
+
+    def spy(path, stored, current):
+        d = real_read_delta(path, stored, current)
+        seen.append(d)
+        return d
+
+    monkeypatch.setattr(mod, "_read_delta", spy)
+    mod._should_suppress(str(transcript))
+
+    assert seen and b"LATE-BYTES" in seen[0]
