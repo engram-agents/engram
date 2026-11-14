@@ -135,7 +135,8 @@ _DANGEROUS_CHAIN_RE = re.compile(
 # Dangerous context — success-word echo after the pipeline (semicolon or &&).
 _SUCCESS_ECHO_RE = re.compile(
     r'(?:;|&&)\s*echo\s+["\']?[^"\']*'
-    r'(?:done|✓|success|ok\b|OK\b|complete|sent|posted)',
+    r'(?:done|✓|success|ok\b|complete|sent|posted|passed)',
+    re.IGNORECASE,
 )
 
 
