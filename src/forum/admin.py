@@ -44,6 +44,7 @@ import stat
 import sys
 from typing import Any
 
+from .fileperms import create_if_absent
 from .db import (
     CATEGORY_KINDS,
     ForumConflict,
@@ -74,7 +75,11 @@ def _open_db(db_path: str) -> sqlite3.Connection:
     """
     db_path = os.path.expanduser(db_path)
     db_dir = os.path.dirname(os.path.abspath(db_path))
-    os.makedirs(db_dir, exist_ok=True)
+    # Leaf only: makedirs' mode does not reach intermediates; an existing dir is never chmodded.
+    os.makedirs(db_dir, mode=0o750, exist_ok=True)
+    # Create forum.db 0640 ourselves: the admin CLI runs at the caller's umask, and
+    # sqlite3.connect would create it at that umask (#4530, follow-up to #4499).
+    create_if_absent(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -258,6 +263,9 @@ def cmd_export(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
     if args.out:
         out_path = os.path.expanduser(args.out)
+        # Absent path (or dangling symlink's target): created 0640 first. An existing
+        # file is still overwritten as before, mode untouched (#4530).
+        create_if_absent(os.path.realpath(out_path))
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(out)
             fh.write("\n")

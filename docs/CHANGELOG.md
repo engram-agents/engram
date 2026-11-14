@@ -11,6 +11,7 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- The forum admin CLI now creates a missing `forum.db` as 0640 and its missing directory as 0750, and `export --out` creates a new file as 0640, whatever the caller's umask. Existing files and directories keep their modes. (#4530)
 - `engram_derive` no longer returns an `independence_advisory` key. It duplicated
   the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
   or more lineages, and when the install has recorded its own lineage, that line
