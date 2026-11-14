@@ -122,7 +122,7 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
    **The alias map is the seat's own file, and it is empty by default.** An install that declares no alias keeps exactly today's behaviour: only fully qualified `owner/repo#N` refs are candidates, every alias is unmatched, and every bare `#N` is unmatched. The map lives at `${ENGRAM_HOME:-$HOME/.engram}/repo-aliases` — one declaration per line, `alias=owner/repo`; comment lines beginning with `#` and blank lines are ignored. The key class is `[A-Za-z0-9_-]+` (ERE-safe) and the value must be exactly two path segments, each `[A-Za-z0-9_.-]+`. A line that does not match exactly — a wrong segment count, an empty segment, a bad character — is ignored and its key treated as undeclared: the map fails closed, never guessing a repository. A missing file and an empty file both declare no aliases.
 
    **The map is a closed vocabulary, not a general any-token pattern.** Only aliases declared in the seat's `repo-aliases` file are resolved; anything else stays unmatched — never guessed against the cwd checkout. One alias does not stand in for another: two different repositories can share an issue-number range, so a token that no declaration names is not a reference to either and stays unmatched. Provenance: measured on the `agent-zephyr` graph at 2026-11-14T15:58Z, over the population step 1 produces (`type='task'`, status active/planned/blocked, `is_current=1`, n=39) — **4 with qualified refs alone, 7 after adding one declared alias.** The figure moves as the graph grows, so the population and the timestamp are part of the claim, not the number. An install that declares no alias sees the first number, which is today's behaviour.
-   3. For each extracted reference, run (claim text on stdin). Both extraction stages keep a left boundary — the ref must start the line or follow a character that cannot be part of a path/ref — so a longer path like `a/b/c#5` is not mis-read as `b/c#5`; `sed` strips the boundary character. Stage 1 passes already-qualified refs through unchanged. Stage 2 runs only when at least one alias is declared, matches those aliases (built from the seat's file), and rewrites each to its full `owner/repo` **inside that stage, before the merge** — the final `sort -u` must see full refs on both sides, or the same artifact arriving once as `alias#12` and once as `owner/repo#12` would be checked and printed twice. The `[ -n "$full" ]` test emits nothing for an alias the map does not name, rather than a malformed ref. `--repo` still comes from the resolved reference, never from the cwd, so nothing downstream can tell which stage a ref arrived by. Each `gh` call takes `</dev/null` because it sits inside `while read` and would otherwise consume the loop's stdin. Each output line carries the **kind** (`pr` / `issue`) because an unmerged-closed PR also prints `CLOSED`:
+   3. For each extracted reference, run (claim text on stdin). Both extraction stages keep a left boundary — the ref must start the line or follow a character that cannot be part of a path/ref — so a longer path like `a/b/c#5` is not mis-read as `b/c#5`; `sed` strips the boundary character. Stage 1 passes already-qualified refs through unchanged. Stage 2 runs only when at least one alias is declared, matches those aliases (built from the seat's file), and rewrites each to its full `owner/repo` **inside that stage, before the merge** — the final `sort -u` must see full refs on both sides, or the same artifact arriving once as `alias#12` and once as `owner/repo#12` would be checked and printed twice. Stage 2 only ever matches keys built from the validated declarations, so an alias the file does not name never reaches the lookup and never becomes a malformed ref. `--repo` still comes from the resolved reference, never from the cwd, so nothing downstream can tell which stage a ref arrived by. Each `gh` call takes `</dev/null` because it sits inside `while read` and would otherwise consume the loop's stdin. Each output line carries the **kind** (`pr` / `issue`) because an unmerged-closed PR also prints `CLOSED`:
       ```bash
       # Repo alias map — the seat's own file, EMPTY by default. An alias that file
       # does not declare is UNMATCHED, never guessed against the cwd checkout.
@@ -138,13 +138,9 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
           key=${line%%=*}
           val=${line#*=}
           case "$key" in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+          case "$val" in ''|/*|*/|*/*/*) continue ;; esac
           case "$val" in */*) ;; *) continue ;; esac
-          seg1=${val%%/*}
-          seg2=${val#*/}
-          case "$seg2" in */*) continue ;; esac
-          [ -n "$seg1" ] && [ -n "$seg2" ] || continue
-          case "$seg1" in *[!A-Za-z0-9_.-]*) continue ;; esac
-          case "$seg2" in *[!A-Za-z0-9_.-]*) continue ;; esac
+          case "$val" in *[!A-Za-z0-9_./-]*) continue ;; esac
           MAP="${MAP}${key} ${val}"$'\n'
           ALIASES="${ALIASES:+$ALIASES|}${key}"
         done < "$ALIAS_FILE"
@@ -167,7 +163,7 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
         if [ -n "$ALIASES" ]; then
           printf '%s\n' "$IN" | grep -oE "(^|[^A-Za-z0-9_./-])($ALIASES) ?#[0-9]+" | sed -E 's/^[^A-Za-z0-9_.-]//' | sed -E 's/ +#/#/' | while read -r a; do
             full=$(repo_for "${a%#*}")
-            [ -n "$full" ] && echo "$full#${a#*#}"
+            echo "$full#${a#*#}"
           done
         fi
       } | sort -u | while read -r ref; do

@@ -356,8 +356,14 @@ def test_malformed_declaration_is_ignored(tmp_path, bad_line):
 
 
 def test_comment_and_blank_lines_declare_no_aliases(tmp_path):
-    """Cell 7 — a file whose only lines are comments/blank declares nothing."""
-    content = "# a comment\n\n   \n# another comment\n"
+    """Cell 7 — a file whose only lines are comments/blank declares nothing.
+
+    The commented-out declaration is the discriminating part: treating a `#`
+    line as a declaration (rather than skipping it) would activate it."""
+    content = (
+        "# a comment\n\n   \n# another comment\n"
+        "#alias-a=example-org/repo-a\n"
+    )
     lines, calls = _run_cat8(tmp_path, "alias-a#12 and alias-a #7", content)
     assert lines == [] and calls == [], (lines, calls)
 
