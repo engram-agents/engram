@@ -107,6 +107,8 @@ UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
 git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH" -- src/engram/templates/template.CLAUDE.md
 ```
 
+If `claude_md_profile` in `${ENGRAM_HOME:-$HOME/.engram}/config.json` is `lean` (a home bootstrapped with `--claude-md-profile lean`, for small-context models), the source is `src/engram/templates/template.CLAUDE.lean.md` instead; use that path in the check. No record means the full profile.
+
 **Checkpoint**: change-set summary surfaced + user confirmed proceed (or concern resolved) + CLAUDE.md-template-changed noted yes/no + pre-upgrade SHA saved to `${ENGRAM_HOME:-$HOME/.engram}/.upgrade-pre-sha`.
 
 ---
@@ -350,6 +352,8 @@ Scope the call with `?agent=` -- on a viz host that serves several agents' graph
 If Step 2 found the CLAUDE.md render source (`templates/template.CLAUDE.md`) changed in the range, **do not skip this**. The rendered `~/.claude/CLAUDE.md` is assembled from that single upstream source now (engram-alpha#2067 — `templates/compact-instructions.md` no longer feeds it; see `docs/compaction-continuity.md`). On Codex, also check `templates/compact-instructions.md` (now Codex-only — feeds `codex-compact-prompt.md` / `experimental_compact_prompt_file`), `templates/template.AGENTS.md`, and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so source-side additions may NOT have reached the running agent.
 
 **The "I'll come back to it" failure mode is real** (2026-05-16: a template discipline-change was deferred post-deploy, never merged, and misfired for days before diagnosis). Resolve it now or track it explicitly — never silent-defer.
+
+**Profiles.** The gate compares your file against the template of the profile your home **recorded** in `config.json` (`claude_md_profile`; no record means full), and never renders or offers the other profile: do not suggest a switch here. A recorded value the upgrade does not know means nothing was compared: ask the user which profile their file follows. The drift tool below diffs the full template, so on a `lean` home skip it and diff the lean template: `git -C "$SOURCE_DIR" diff "$DEPLOYED" "origin/$UPSTREAM_BRANCH" -- src/engram/templates/template.CLAUDE.lean.md`.
 
 Use the rendered-diff tool (catches changes to ALL render sources, not just the main template):
 

@@ -1,0 +1,16 @@
+{
+  "harness": "claude-code",
+  "surface": "CLAUDE.md",
+  "profile": "lean",
+  "components": [
+    { "id": "identity-opening", "anchor": "" },
+    { "id": "authority-structure-intro", "anchor": "Authority Structure (style-invariant)" },
+    { "id": "authority-structure-table-claude-code", "anchor": "Authority Structure (style-invariant)" },
+    { "id": "authority-structure-close", "anchor": "Authority Structure (style-invariant)" },
+    { "id": "trust-tier-pointer", "anchor": "External interactions" },
+    { "id": "engram-write-discipline", "anchor": "ENGRAM Write Discipline" },
+    { "id": "engram-read-discipline", "anchor": "ENGRAM Read Discipline" },
+    { "id": "confidence-anchors", "anchor": "Confidence calibration anchors" },
+    { "id": "engram-reference", "anchor": "ENGRAM Reference" }
+  ]
+}

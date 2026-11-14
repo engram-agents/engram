@@ -26,8 +26,9 @@ Steps map 1-to-1 with the skill's numbered sections:
   plugin-upgrade          Step 5:  [operator] /plugin → Installed → engram plugin entry → Update now
   mcp-reconnect           Step 6:  [operator, conditional] /mcp reconnect — only when
                                    server.py or engram_*.py changed in deployed..target range
-  template-gate           Step 7:  [agent, judgment] detect template.CLAUDE.md diff;
-                                   NEVER edits ~/.claude/CLAUDE.md — surfaces only
+  template-gate           Step 7:  [agent, judgment] detect a diff in the template of the
+                                   profile recorded in config.json (full unless recorded
+                                   otherwise); NEVER edits ~/.claude/CLAUDE.md — surfaces only
   stats-verify-instruction   Step 8: [operator] verify engram_stats via MCP
   record-reminder         Step 9:  [operator] remind agent to file the upgrade obs
 
@@ -48,7 +49,7 @@ Optional keys (computed by steps, stored back into ctx):
 
   _deployed_sha: str        SHA from .deployed-version
   _changeset_commits: list  git log lines deployed..target
-  _template_changed: bool   whether templates/template.CLAUDE.md changed
+  _template_changed: bool   whether the recorded profile's CLAUDE.md template changed
   _build_manifest: dict     loaded from built plugin .engram-build-manifest.json
   _built_plugin_root: str   path to the assembled plugin tree
 """
@@ -199,6 +200,47 @@ def _is_clean(source_dir: str) -> bool:
     """Return True if the working tree has no uncommitted changes."""
     result = _git(["status", "--short"], source_dir)
     return result.stdout.strip() == ""
+
+
+# The CLAUDE.md template each recorded profile follows (config.json key `claude_md_profile`;
+# no record = full). The upgrade compares a home against ITS profile's template only and never
+# offers the other one. A recorded value outside this table is "undetermined": nothing is compared.
+_CLAUDE_MD_PROFILE_KEY = "claude_md_profile"
+_CLAUDE_MD_TEMPLATE_DIR = "src/engram/templates"
+_CLAUDE_MD_TEMPLATES = {"full": "template.CLAUDE.md", "lean": "template.CLAUDE.lean.md"}
+_PROFILE_UNDETERMINED = "undetermined"
+
+
+def _recorded_claude_md_profile(engram_home: str) -> str:
+    """The CLAUDE.md profile this home recorded: "full", "lean" or "undetermined".
+
+    No config.json, no key, null, or "full" is the full profile. An unreadable config.json or
+    any other value is undetermined, so no template is offered (a guess could offer the wrong one).
+    Read-only; stdlib json, like the rest of this module.
+    """
+    if not engram_home:
+        return "full"
+    try:
+        with open(os.path.join(engram_home, "config.json"), encoding="utf-8") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        return "full"
+    except (OSError, ValueError):
+        return _PROFILE_UNDETERMINED
+    if not isinstance(config, dict):
+        return _PROFILE_UNDETERMINED
+    value = config.get(_CLAUDE_MD_PROFILE_KEY)
+    if value is None or value == "full":
+        return "full"
+    if value == "lean":
+        return "lean"
+    return _PROFILE_UNDETERMINED
+
+
+def _claude_md_template_rel(profile: str) -> str | None:
+    """Repo-relative path of the template for a profile, None when undetermined."""
+    name = _CLAUDE_MD_TEMPLATES.get(profile)
+    return f"{_CLAUDE_MD_TEMPLATE_DIR}/{name}" if name else None
 
 
 def _git_log_range(source_dir: str, from_sha: str, to_sha: str) -> list[str]:
@@ -522,15 +564,22 @@ def _apply_changeset_reviewed(ctx: dict[str, Any]) -> None:
         commits = _git_log_range(source_dir, deployed_sha, target_sha)
         ctx["_changeset_commits"] = commits
 
-        # Check whether a CLAUDE.md template changed (path from Phase 1 #1093;
-        # root compat symlink removed in Phase 4; renamed from CLAUDE.md.template).
-        # The agent-coordination rules live in template.CLAUDE.md itself (#4255), so
-        # this one file is the whole per-seat CLAUDE.md carrier.
+        # Check whether the CLAUDE.md template of THIS home's recorded profile changed
+        # (path from Phase 1 #1093; root compat symlink removed in Phase 4; renamed from
+        # CLAUDE.md.template). The agent-coordination rules live in the template itself
+        # (#4255), so that one file is the whole per-seat CLAUDE.md carrier. A change to the
+        # other profile's template is not this home's change.
         files = _files_in_range(source_dir, deployed_sha, target_sha)
-        ctx["_template_changed"] = any(
-            t in files
-            for t in ("src/engram/templates/template.CLAUDE.md",)
-        )
+        profile = _recorded_claude_md_profile(ctx.get("engram_home", ""))
+        template_rel = _claude_md_template_rel(profile)
+        ctx["_template_profile"] = profile
+        if profile == "full":
+            ctx["_template_changed"] = any(
+                t in files
+                for t in ("src/engram/templates/template.CLAUDE.md",)
+            )
+        else:
+            ctx["_template_changed"] = template_rel is not None and template_rel in files
         ctx["_changed_files"] = files
 
     # Note: we do NOT set ack_changeset here — that requires explicit operator
@@ -708,7 +757,11 @@ def _check_mcp_reconnect(ctx: dict[str, Any]) -> bool:
 
 
 def _apply_template_gate(ctx: dict[str, Any]) -> None:
-    """Detect template.CLAUDE.md diff; surface it; mark gate done.
+    """Detect a diff in the recorded profile's CLAUDE.md template; surface it; mark gate done.
+
+    The template is the one the home's config.json records (full when nothing is recorded);
+    the other profile's template is never read or offered. A recorded profile this module
+    does not know surfaces a note instead of a template.
 
     Hard boundary: this function NEVER edits ~/.claude/CLAUDE.md.
     It only reads the template and the live file, computes the diff,
@@ -718,6 +771,16 @@ def _apply_template_gate(ctx: dict[str, Any]) -> None:
     source_dir = ctx.get("source_dir", "")
     template_changed = ctx.get("_template_changed", False)
 
+    profile = _recorded_claude_md_profile(ctx.get("engram_home", ""))
+    if profile == _PROFILE_UNDETERMINED:
+        ctx["_template_diff"] = (
+            f"(the {_CLAUDE_MD_PROFILE_KEY} value in config.json is not one this upgrade "
+            "knows, or config.json could not be read, so no CLAUDE.md template was compared; "
+            "ask the user which profile their CLAUDE.md follows)"
+        )
+        ctx["_template_gate_done"] = True
+        return
+
     if not template_changed:
         # No template changes in range — gate trivially passed
         ctx["_template_diff"] = None
@@ -726,7 +789,7 @@ def _apply_template_gate(ctx: dict[str, Any]) -> None:
 
     # templates/ moved to src/engram/templates/ in Phase 1 #1093;
     # root compat symlink removed in Phase 4; renamed from CLAUDE.md.template.
-    template_path = os.path.join(source_dir, "src", "engram", "templates", "template.CLAUDE.md")
+    template_path = os.path.join(source_dir, *_claude_md_template_rel(profile).split("/"))
 
     # Compute a simple unified diff (stdlib only)
     import difflib

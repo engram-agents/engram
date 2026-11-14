@@ -1413,6 +1413,10 @@
       "tier": "essential"
     },
     {
+      "path": "templates/template.CLAUDE.lean.md",
+      "tier": "essential"
+    },
+    {
       "path": "templates/compact-instructions.md",
       "tier": "essential"
     },
