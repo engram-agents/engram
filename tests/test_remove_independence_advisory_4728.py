@@ -178,6 +178,10 @@ def test_b_line_fires_when_graph_holds_two_lineages():
 
 
 def test_c_line_silent_when_graph_holds_one_lineage():
+    """Builds: self_lineage set, two UNMARKED own observations, and no
+    lineage-marked observation anywhere (stored lineage count 0; null=self is
+    read-time only). The line stays silent because the graph holds fewer than
+    two lineages. Cell E covers the explicitly-marked single-lineage case."""
     c = fresh_client()
     _set_self_lineage("anthropic:opus")
     result = _generalize(c, [_obs(c, 1), _obs(c, 2)])
@@ -185,6 +189,44 @@ def test_c_line_silent_when_graph_holds_one_lineage():
         f"standpoint line must stay silent in a single-lineage graph: "
         f"{result.get('structure_warnings')}"
     )
+
+
+# -- Cell E ------------------------------------------------------------------
+
+def _stored_lineage_count():
+    import sqlite3
+    import server as _server
+    conn = sqlite3.connect(str(_server.core.DB_PATH))
+    try:
+        return conn.execute(
+            "SELECT COUNT(DISTINCT standpoint_lineage) FROM nodes "
+            "WHERE is_current = 1 AND type LIKE 'observation_%' "
+            "AND standpoint_lineage IS NOT NULL AND TRIM(standpoint_lineage) != ''"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_e_explicit_same_lineage_single_lineage_graph_is_silent():
+    """The one case where the removed advisory warned and nothing warns now:
+    two observations explicitly marked with the SAME lineage, in a graph whose
+    only lineage-marked observations carry that lineage (count exactly 1). The
+    standpoint line's gate deliberately stays silent when no cross-lineage
+    evidence exists to cite (#4728's table, last row)."""
+    c = fresh_client()
+    _set_self_lineage("anthropic:opus")
+    o1 = _obs(c, 1, lineage="anthropic:sonnet")
+    o2 = _obs(c, 2, lineage="anthropic:sonnet")
+    assert _stored_lineage_count() == 1, "precondition: exactly one stored lineage"
+    result = _generalize(c, [o1, o2])
+    assert "independence_advisory" not in result, sorted(result)
+    assert not _line(result), (
+        f"no standpoint line expected in a single-lineage graph: "
+        f"{result.get('structure_warnings')}"
+    )
+    blob = json.dumps(result, ensure_ascii=False)
+    for frag in _FOLD_FRAGMENTS:
+        assert frag not in blob, f"{frag!r} leaked into a silent response: {blob}"
 
 
 # -- Cell D ------------------------------------------------------------------
