@@ -40,10 +40,6 @@ with an `-alpha` suffix during the alpha phase.
   The "SUBSET green" line now says the full suite runs nightly and at the
   release cut. `--json` gains `layers` and `unreferenced` keys; no key is
   removed. (#4358)
-- `docs/internal/RELEASING.md` step 6 now states the rerun rule: when the
-  release pull request's whole-suite run is red only on a test already filed
-  as unreliable under load, the release seat may rerun that failed job once,
-  recorded on the pull request first; any other red stops the release. (#4655)
 
 ### Fixed
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
@@ -79,6 +75,7 @@ with an `-alpha` suffix during the alpha phase.
   ignores `errexit`, measured through the tool on a merge
   seat on 2026-11-09. The seat also reads
   the gate's printed verdicts in a separate call before it presses.
+- `docs/internal/RELEASING.md` step 6 now states the rerun rule (a red confined to a test already filed as unreliable under load gets one rerun of the failed job, recorded on the release pull request first; any other red stops the release, #4655) and checks that `main` is an ancestor of the candidate before the check is trusted, with the reason it is then valid and the remedy for a release pull request retargeted onto `main` (#4622).
 
 ## [v0.5.7] - 2026-11-12
 
