@@ -456,6 +456,18 @@ def _remove_scanner(work: Path, g, *, push: bool = False) -> str:
     return sha
 
 
+def _failing_tar_dir(tmp_path: Path) -> Path:
+    """A PATH entry whose `tar` always fails, so a ref that RESOLVES reaches
+    the extraction-failure branch of `_materialise_from` while `git` stays
+    reachable through the rest of PATH."""
+    shim_dir = tmp_path / "failing-tar"
+    shim_dir.mkdir()
+    tar_shim = shim_dir / "tar"
+    tar_shim.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    tar_shim.chmod(0o755)
+    return shim_dir
+
+
 def _run_sweep(
     work: Path,
     base: str,
@@ -467,6 +479,7 @@ def _run_sweep(
     attestation: dict | None = None,
     default_branch: str = "dev",
     git_ref: str = "refs/heads/dev",
+    extra_path: Path | None = None,
 ):
     """Run the extracted sweep step; return (CompletedProcess, combined output)."""
     if roster_value is None:
@@ -493,6 +506,10 @@ def _run_sweep(
         GITHUB_WORKSPACE=str(work),
         RUNNER_TEMP=str(runner_temp),
     )
+    if extra_path is not None:
+        # Prepend, so the shim shadows the real tool while `git` (and
+        # everything else the step calls) stays reachable.
+        env["PATH"] = f"{extra_path}{os.pathsep}{env.get('PATH', '')}"
     proc = subprocess.run(
         [sys.executable, "-P", str(script)],
         cwd=work,
@@ -622,6 +639,52 @@ def test_a_real_scanner_with_import_time_dependencies_passes_the_base_link(
     assert proc.returncode == 0, out
     assert f"scanner read from {base}" in out, out
     assert "BOOTSTRAP" not in out, out
+
+
+def test_an_extraction_failure_is_not_reported_as_a_tree_without_a_scanner(
+    sweep_repo, tmp_path
+):
+    """R4-1: `_materialise_from` returning None means one of TWO different
+    things, and they must not share a message.
+
+    Case 1 (this cell): the extraction FAILED — `git archive` or `tar` exited
+    nonzero — on a ref that RESOLVES (the resolution guard ran first, and
+    `git archive` succeeds here; only the PATH `tar` is made to exit 1). That
+    is a defect in this clone or the runner, never evidence about the tree.
+
+    Case 2 (the ``*_has_none`` cells): the extraction succeeded and the tree
+    genuinely has no scanner — the benign "this ref has no scanner" diagnosis.
+
+    The chain still falls through in both cases (behaviour unchanged). With the
+    checkout's copy removed as well, the run reaches the final fail-closed
+    message, which is where the per-ref ``lacking`` diagnoses are printed — so
+    the "is not reported as ``<ref> has no <scanner>``" half of the assertion
+    is about real output, not an absent string.
+    """
+    work, base, _g = sweep_repo
+    failing_tar = _failing_tar_dir(tmp_path)
+    # Fall through past the protected links to the final fail-closed message,
+    # where each link's diagnosis is printed.
+    (work / "src" / "engram" / "tools" / "scan-leaks.py").unlink()
+    proc, out = _run_sweep(work, base, tmp_path, extra_path=failing_tar)
+
+    # The failure is not the benign diagnosis, for either protected ref.
+    assert f"{base} has no src/engram/tools/scan-leaks.py" not in out, out
+    assert "origin/dev has no src/engram/tools/scan-leaks.py" not in out, out
+    # It says what actually happened, and names the ref.
+    assert f"extracting the tree at {base} failed" in out, out
+    assert "this is an extraction/runner failure" in out, out
+    # Behaviour still falls through, and the fall-through is visible: the
+    # final fail-closed message prints, and the checkout's absence is its own
+    # distinct diagnosis.
+    assert proc.returncode != 0, out
+    assert (
+        "no copy of src/engram/tools/scan-leaks.py with --roster-file"
+        in out
+    ), out
+    assert (
+        "the pull request checkout has no src/engram/tools/scan-leaks.py" in out
+    ), out
 
 
 def test_the_probe_and_scan_do_not_inherit_the_roster_secret(sweep_repo, tmp_path):

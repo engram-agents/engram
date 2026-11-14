@@ -7,11 +7,12 @@ name: name-leak-sweep
 # a gitignored LOCAL roster that CI does not have. Nothing in CI has ever
 # scanned the tracked text files against the real roster. This workflow does.
 #
-# "The tree" here is NOT every published file: the scanner skips binaries
-# (skipped and counted) and its declared exclusions — SKIP_FILES {LICENSE,
-# .scan-leaks-local.json, scan-leaks.py, test_release_cutover.py, RELEASING.md}
-# and SKIP_DIRS {.git, __pycache__, node_modules, .claude}. A name in an
-# excluded file is not covered by this job.
+# "The tree" here is NOT every published file: the pattern (roster) scan skips
+# binaries (skipped and counted) and its declared exclusions — SKIP_FILES
+# {LICENSE, .scan-leaks-local.json, scan-leaks.py, test_release_cutover.py,
+# RELEASING.md} and SKIP_DIRS {.git, __pycache__, node_modules, .claude}. The
+# absolute-home-path scan applies neither on the git path, so an excluded file
+# IS scanned for home paths.
 #
 # The invariant, verbatim:
 #
@@ -382,9 +383,21 @@ jobs:
                   raise SystemExit(1)
 
           def _materialise_from(ref):
-              """Extract `ref`'s WHOLE TREE into a fresh directory and return
-              the scanner's path inside it; None when that tree has no such
-              path.
+              """Extract `ref`'s WHOLE TREE into a fresh directory.
+
+              Returns (scanner_path, extraction_failure):
+
+              * `extraction_failure` is a non-empty string when `git archive`
+                or `tar` FAILED. The caller has already proven `ref` RESOLVES,
+                so that is a defect in this clone or the runner — never
+                evidence about the tree.
+              * When the extraction SUCCEEDED, `extraction_failure` is None and
+                `scanner_path` is the scanner inside that tree, or None when
+                the tree genuinely has no such path.
+
+              Two different situations must not be reported as one: a failed
+              extraction is a loud error, while an absent scanner is the
+              benign "this ref has no scanner" diagnosis.
 
               Never the scanner alone: the real scanner executes
               `_load_home_path_class()` at module import and resolves
@@ -400,16 +413,16 @@ jobs:
                   ["git", "archive", ref], capture_output=True
               )
               if archive.returncode != 0:
-                  return None
+                  return None, f"git archive {ref} exited {archive.returncode}"
               extract = subprocess.run(
                   ["tar", "-x", "-C", dest],
                   input=archive.stdout,
                   capture_output=True,
               )
               if extract.returncode != 0:
-                  return None
+                  return None, f"tar extraction of {ref} exited {extract.returncode}"
               candidate = os.path.join(dest, scanner_rel)
-              return candidate if os.path.isfile(candidate) else None
+              return (candidate if os.path.isfile(candidate) else None), None
 
           def _scanner_env():
               """`os.environ` with the roster secret removed.
@@ -441,7 +454,23 @@ jobs:
           scanner_source = None
           lacking = []
           for ref in (base_sha, default_ref):
-              candidate = _materialise_from(ref)
+              candidate, extraction_failure = _materialise_from(ref)
+              if extraction_failure is not None:
+                  # `ref` RESOLVES (guarded above), so a failed extraction is
+                  # not a fact about the tree. Say so loudly and fall through:
+                  # the chain still continues, but this must never read as the
+                  # benign "this ref has no scanner" diagnosis.
+                  print(
+                      "::error::name-leak sweep: extracting the tree at "
+                      f"{ref} failed ({extraction_failure}). That ref RESOLVES "
+                      "(checked above), so this is an extraction/runner "
+                      "failure, NOT evidence that its tree has no "
+                      f"{scanner_rel}. Falling through to the next link."
+                  )
+                  lacking.append(
+                      f"{ref} could not be extracted ({extraction_failure})"
+                  )
+                  continue
               if candidate is None:
                   lacking.append(f"{ref} has no {scanner_rel}")
                   continue
