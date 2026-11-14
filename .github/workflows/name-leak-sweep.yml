@@ -144,6 +144,14 @@ jobs:
           import sys
           import tempfile
 
+          # The `--help` probe is a usage read, not a scan: a sound copy
+          # answers it in well under a second. It is BOUNDED because a copy
+          # that hangs on `--help` must be DIAGNOSED, not left to hang until
+          # the job's own timeout-minutes ceiling. A timeout is a
+          # could-not-examine condition, never "this copy lacks
+          # --roster-file" (the two must not share an outcome).
+          PROBE_TIMEOUT_SECONDS = 60
+
           event = os.environ.get("EVENT_NAME", "")
           is_fork = os.environ.get("PR_IS_FORK", "false").strip().lower() == "true"
           default_branch = os.environ.get("DEFAULT_BRANCH", "dev")
@@ -435,25 +443,76 @@ jobs:
               env.pop("NAME_LEAK_ROSTER", None)
               return env
 
-          def _has_capability(path):
-              """True iff the copy accepts `--roster-file`.
+          # A capability probe has THREE outcomes, never two, and the
+          # distinction is the point of this shape. `capable` and `lacks` are
+          # both facts about the TREE: the copy RAN, and its usage did or did
+          # not name the flag. `unexaminable` is a fact about THIS RUN — the
+          # probe exited nonzero, timed out, or could not be launched. Reading
+          # it as `lacks` is round 5's fail-open shape one step later: it sends
+          # the chain to the pull request's own copy, which on a same-repo pull
+          # request is contributor-controlled and is handed
+          # `--roster-file <path>` (#4782 r6).
+          PROBE_CAPABLE = "capable"
+          PROBE_LACKS = "lacks"
+          PROBE_UNEXAMINABLE = "unexaminable"
+
+          def _probe_capability(path):
+              """Probe `path` for `--roster-file`, returning (verdict, detail).
+
+              `detail` names which failure happened when the verdict is
+              `PROBE_UNEXAMINABLE`, and is None otherwise.
+
+              A probe that dies produces NO verdict: an ImportError, a syntax
+              error, an unsupported interpreter flag and a timeout all look
+              identical at this call site (a nonzero exit or an exception), and
+              none of them is evidence about the tree.
 
               Executed with `-P` for the same reason the scan is: the checkout
               is not on sys.path. The copy is executed for the scan anyway, so
               running `--help` adds no trust surface — only evidence.
               """
-              proc = subprocess.run(
-                  [sys.executable, "-P", path, "--help"],
-                  capture_output=True,
-                  text=True,
-                  env=_scanner_env(),
-              )
-              return proc.returncode == 0 and "--roster-file" in proc.stdout
+              try:
+                  proc = subprocess.run(
+                      [sys.executable, "-P", path, "--help"],
+                      capture_output=True,
+                      text=True,
+                      env=_scanner_env(),
+                      timeout=PROBE_TIMEOUT_SECONDS,
+                  )
+              except subprocess.TimeoutExpired:
+                  return (
+                      PROBE_UNEXAMINABLE,
+                      "its --help probe did not finish within "
+                      f"{PROBE_TIMEOUT_SECONDS}s",
+                  )
+              except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                  # OSError: could not launch it (missing interpreter, EACCES).
+                  # ValueError: its output could not be decoded under
+                  # text=True. SubprocessError: anything else subprocess
+                  # raised. All three are "no verdict", never "no capability".
+                  return (
+                      PROBE_UNEXAMINABLE,
+                      "its --help probe could not be run "
+                      f"({type(exc).__name__}: {exc})",
+                  )
+              if proc.returncode != 0:
+                  return (
+                      PROBE_UNEXAMINABLE,
+                      f"its --help probe exited {proc.returncode}",
+                  )
+              if "--roster-file" in proc.stdout:
+                  return PROBE_CAPABLE, None
+              return PROBE_LACKS, None
 
           scanner_path = None
           scanner_source = None
           lacking = []
-          extraction_failures = []
+          # ONE accumulator for BOTH kinds of "this run could not examine
+          # <ref>": an extraction that failed (round 5) and a capability probe
+          # that produced no verdict (round 6). Two parallel lists that must
+          # both be empty is one more thing to forget, so there is exactly one
+          # gate on it, below.
+          unexamined = []
           for ref in (base_sha, default_ref):
               candidate, extraction_failure = _materialise_from(ref)
               if extraction_failure is not None:
@@ -472,43 +531,70 @@ jobs:
                       "failure, NOT evidence that its tree has no "
                       f"{scanner_rel}."
                   )
-                  extraction_failures.append(f"{ref} ({extraction_failure})")
+                  unexamined.append(f"{ref} ({extraction_failure})")
                   continue
               if candidate is None:
                   lacking.append(f"{ref} has no {scanner_rel}")
                   continue
-              if not _has_capability(candidate):
+              verdict, detail = _probe_capability(candidate)
+              if verdict == PROBE_UNEXAMINABLE:
+                  # No verdict. The ref RESOLVED and its tree WAS extracted
+                  # (both checked above), so this is a defect in the copy or
+                  # in the runner — never evidence that its tree lacks the
+                  # flag. RECORDED rather than absorbed: the chain may still
+                  # look at the next protected ref, but it must never reach
+                  # the checkout link on the strength of a ref this run could
+                  # not examine.
+                  print(
+                      "::error::name-leak sweep: could not examine the copy "
+                      f"of {scanner_rel} at {ref}: {detail}. That ref "
+                      "RESOLVES and its tree WAS extracted (both checked "
+                      "above), so this is a defect in the copy or the "
+                      "runner, NOT evidence that its tree lacks "
+                      "--roster-file. Recording it as unexaminable."
+                  )
+                  unexamined.append(f"{ref} ({scanner_rel}: {detail})")
+                  continue
+              if verdict == PROBE_LACKS:
                   lacking.append(f"{ref}'s {scanner_rel} lacks --roster-file")
                   continue
               scanner_path = candidate
               scanner_source = ref
               break
 
-          # R5-1: an extraction failure is a defect in this clone or the
-          # runner, never evidence about a tree, and it FAILS CLOSED before any
-          # scan. Falling through was the fail-open shape: a runner-wide
-          # failure (missing tar, full disk, any git problem) sent the chain to
+          # R5-1 + R6-1: a link this run could not EXAMINE — an extraction
+          # that failed, or a capability probe that produced no verdict — is a
+          # defect in this clone or the runner, never evidence about a tree,
+          # and it FAILS CLOSED before any scan. Falling through was the
+          # fail-open shape: a runner-wide failure (missing tar, full disk, any
+          # git problem, a crashing or hanging interpreter) sent the chain to
           # the pull request's own copy, which then received the roster as
-          # `--roster-file <path>`. The checkout link is unreachable unless
-          # every protected link this run TRIED was extracted and examined.
-          if extraction_failures:
+          # `--roster-file <path>`. ONE accumulator holds both kinds, so there
+          # is one gate: the checkout link is unreachable unless every
+          # protected link this run TRIED was extracted AND examined.
+          #
+          # The over-approximation is deliberate (Clio ruled it fatal): a
+          # later protected ref that would have supplied a usable scanner does
+          # not excuse a link this run could not examine.
+          if unexamined:
               print(
-                  "::error::name-leak sweep: the sweep could not extract the "
-                  "tree at " + "; ".join(extraction_failures) + ". An "
-                  "extraction failure is a defect in this clone or the "
-                  "runner, not evidence about a tree: the sweep will NOT fall "
-                  "through to the pull request's own copy, which on a "
-                  "same-repo pull request is contributor-controlled and would "
-                  "receive the roster path. Failing closed before any scan."
+                  "::error::name-leak sweep: the sweep could not examine "
+                  + "; ".join(unexamined) + ". A failed extraction or a "
+                  "capability probe that produced no verdict is a defect in "
+                  "this clone or the runner, not evidence about a tree: the "
+                  "sweep will NOT fall through to the pull request's own "
+                  "copy, which on a same-repo pull request is "
+                  "contributor-controlled and would receive the roster path. "
+                  "Failing closed before any scan."
               )
               raise SystemExit(1)
 
           if scanner_path is None:
               # BOOTSTRAP ONLY, by positive knowledge: both protected refs
               # RESOLVED, both were EXTRACTED and EXAMINED, and neither carries
-              # a copy with the capability. An extraction failure has already
-              # exited above, so a ref this run could not examine never reaches
-              # this link. That is the first `dev -> main` release PR, before
+              # a copy with the capability. A link this run could not examine
+              # has already exited above, so it never reaches this link. That
+              # is the first `dev -> main` release PR, before
               # the flags exist on `main`. On a same-repo pull request the
               # checkout is contributor-controlled, so this link is LOUD, never
               # silent.
@@ -519,7 +605,12 @@ jobs:
                   lacking.append(
                       "the pull request checkout has no " + scanner_rel
                   )
-              elif not _has_capability(checkout_scanner):
+              # The checkout is the LAST link, so there is no fall-through to
+              # close here: a "lacks" verdict and an unexaminable probe both
+              # end at the fail-closed exit below, and no contributor code
+              # runs either way. R6 leaves this call site's behaviour
+              # unchanged on purpose.
+              elif _probe_capability(checkout_scanner)[0] != PROBE_CAPABLE:
                   lacking.append(
                       "the pull request checkout's "
                       f"{scanner_rel} lacks --roster-file"

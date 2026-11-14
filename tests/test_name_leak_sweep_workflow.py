@@ -33,7 +33,12 @@ Discrimination for the mutations the specs name:
   (behavioural); the file-absence chain cells do not consult the probe;
 * removing the dispatch ref guard reddens TWO cells:
   `test_a_dispatch_must_run_from_the_default_branch` (wiring) and
-  `test_workflow_dispatch_on_a_non_default_ref_fails_closed` (behavioural).
+  `test_workflow_dispatch_on_a_non_default_ref_fails_closed` (behavioural);
+* R6: making the probe's NONZERO-EXIT branch fall back to "lacks the flag"
+  (the pre-round-6 semantics) reddens ONE cell,
+  `test_a_crashing_probe_blocks_the_checkout_link` — every other cell's stub
+  exits 0, and the timeout cell reaches the could-not-examine bucket through
+  the separate `TimeoutExpired` arm.
 """
 
 from __future__ import annotations
@@ -178,6 +183,21 @@ _CAPABLE_MARKER_SCANNER = _with_capability(
     'print("CHECKOUT_SCANNER_RAN")\n'
     'print("scan-leaks: scanned 1, skipped-binary 0")\n'
     "sys.exit(0)\n"
+)
+# R6: a scanner that CRASHES at import, so `<copy> --help` exits nonzero and
+# prints no usage at all. A probe that dies is NOT a copy that lacks
+# `--roster-file`; it is a copy this run could not EXAMINE, and the chain must
+# fail closed rather than fall through to the contributor-controlled checkout.
+_CRASHING_SCANNER = (
+    "raise ImportError('scanner import failure (round-6 fixture)')\n"
+)
+# R6: a scanner that HANGS at import, so `<copy> --help` never answers. The
+# sleep is far longer than the bound the timeout cell substitutes, and it
+# happens at import so the probe never reaches a usage to read.
+_HANGING_SCANNER = (
+    "import time\n"
+    "time.sleep(120)\n"
+    'print("usage: scan-leaks.py [--roster-file PATH] [--redact]")\n'
 )
 
 
@@ -357,6 +377,23 @@ def test_the_scanner_comes_from_the_capability_chain():
     assert "scanner read from {scanner_source}" in run
 
 
+def test_the_capability_probe_is_bounded():
+    """R6-1: the `--help` probe must carry a timeout.
+
+    Without one, a copy that hangs on `--help` hangs the job until the
+    job-level ceiling instead of being diagnosed. The bound is a module-level
+    constant so the timeout cell can shrink it for one run without editing the
+    call, and the call site passes it.
+    """
+    run = _sweep_step(_workflow())["run"]
+    assert re.search(r"^PROBE_TIMEOUT_SECONDS = \d+$", run, re.MULTILINE), (
+        "the probe bound must be a module-level PROBE_TIMEOUT_SECONDS constant"
+    )
+    assert "timeout=PROBE_TIMEOUT_SECONDS," in run, (
+        "the `--help` probe call must pass the bound"
+    )
+
+
 def test_a_dispatch_must_run_from_the_default_branch():
     """A dispatch can be started on any branch by a writer, so mapping it onto
     the contract's "push" shape is honest only with the ref checked. A hard
@@ -523,8 +560,16 @@ def _run_sweep(
     default_branch: str = "dev",
     git_ref: str = "refs/heads/dev",
     extra_path: Path | None = None,
+    probe_timeout_seconds: int | None = None,
 ):
-    """Run the extracted sweep step; return (CompletedProcess, combined output)."""
+    """Run the extracted sweep step; return (CompletedProcess, combined output).
+
+    `probe_timeout_seconds` substitutes the step's `PROBE_TIMEOUT_SECONDS` for
+    one run. The shipped bound is sized for a real runner; a cell that provokes
+    a real timeout needs it small. Substituting the constant costs ~2s (two
+    links x 1s) and still exercises the SAME `TimeoutExpired` arm, message and
+    fail-closed routing that the shipped value reaches.
+    """
     if roster_value is None:
         roster_value = _ROSTER
     if attestation is not None:
@@ -534,8 +579,20 @@ def _run_sweep(
 
     runner_temp = tmp_path / "runner_temp"
     runner_temp.mkdir(exist_ok=True)
+    script_text = _sweep_script()
+    if probe_timeout_seconds is not None:
+        script_text, substituted = re.subn(
+            r"^PROBE_TIMEOUT_SECONDS = \d+$",
+            f"PROBE_TIMEOUT_SECONDS = {probe_timeout_seconds}",
+            script_text,
+            flags=re.MULTILINE,
+        )
+        assert substituted == 1, (
+            "the probe bound must be a single module-level "
+            "'PROBE_TIMEOUT_SECONDS = <int>' line"
+        )
     script = tmp_path / "sweep.py"
-    script.write_text(_sweep_script(), encoding="utf-8")
+    script.write_text(script_text, encoding="utf-8")
 
     env = dict(os.environ)
     env.update(
@@ -777,6 +834,64 @@ def test_the_git_archive_failure_arm_is_exercised_and_fails_closed(
     assert "Failing closed before any scan" in out, out
     assert proc.returncode != 0, out
     assert "BOOTSTRAP" not in out, out
+
+
+def test_a_crashing_probe_blocks_the_checkout_link(sweep_repo, tmp_path):
+    """R6-2 (the blocker): a probe that DIES is not a copy that gave a
+    NEGATIVE verdict.
+
+    Clio's reproduction one step after round 5: a scanner that raises at
+    import at `base_sha` AND at `origin/dev`, with a capable copy in the
+    checkout. `returncode == 0 and ...` read both crashes as "lacks
+    --roster-file", took the checkout link, and ran the contributor-controlled
+    copy with `--roster-file <path>` — exit 0, BOOTSTRAP, green.
+
+    RED against 2da33562. The three verdicts must stay three: could-not-
+    examine is recorded against the ref and fails closed before any scan.
+    """
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _CRASHING_SCANNER, push=True)
+    (work / "src" / "engram" / "tools" / "scan-leaks.py").write_text(
+        _CAPABLE_MARKER_SCANNER, encoding="utf-8"
+    )
+    proc, out = _run_sweep(work, base, tmp_path)
+
+    assert proc.returncode != 0, out
+    assert "BOOTSTRAP" not in out, out
+    assert "CHECKOUT_SCANNER_RAN" not in out, out
+    # Diagnosed as a could-not-examine condition, naming both refs and the
+    # failure that happened ...
+    assert "could not examine" in out, out
+    assert "its --help probe exited 1" in out, out
+    assert base in out, out
+    assert "origin/dev" in out, out
+    # ... never as the benign "<ref>'s scanner lacks --roster-file" verdict.
+    assert "'s src/engram/tools/scan-leaks.py lacks --roster-file" not in out, out
+
+
+def test_a_hanging_probe_times_out_as_could_not_examine(sweep_repo, tmp_path):
+    """R6-1 (the bound): a copy that hangs on `--help` must be DIAGNOSED, not
+    left to hang the job until the 10-minute job ceiling.
+
+    The harness substitutes a 1s bound so the cell costs ~2s (two links); the
+    `TimeoutExpired` arm, its own message and the fail-closed routing are the
+    ones the shipped bound reaches. The message echoes the bound, which is
+    what proves the substituted value reached the probe rather than some
+    other timeout.
+    """
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _HANGING_SCANNER, push=True)
+    (work / "src" / "engram" / "tools" / "scan-leaks.py").write_text(
+        _CAPABLE_MARKER_SCANNER, encoding="utf-8"
+    )
+    proc, out = _run_sweep(work, base, tmp_path, probe_timeout_seconds=1)
+
+    assert proc.returncode != 0, out
+    assert "BOOTSTRAP" not in out, out
+    assert "CHECKOUT_SCANNER_RAN" not in out, out
+    assert "could not examine" in out, out
+    assert "did not finish within 1s" in out, out
+    assert "'s src/engram/tools/scan-leaks.py lacks --roster-file" not in out, out
 
 
 def test_the_probe_and_scan_do_not_inherit_the_roster_secret(sweep_repo, tmp_path):
