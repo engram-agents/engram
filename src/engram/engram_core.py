@@ -4241,11 +4241,12 @@ def _seed_missing_message() -> str:
     mid-run or the user manually created an empty knowledge.db).
     """
     return (
-        f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but has no seed nodes.\n\n"
-        "This usually means a bootstrap was started but never completed.\n"
-        "Run the engram-first-session skill to complete the bootstrap, or\n"
-        "Stop and tell the user. Only if THE USER decides this seat is new, move the file aside under a\n"
-        "dated name (never remove it), then re-run first-session for a clean retry:\n"
+        f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but has no seed nodes.\n"
+        "This usually means a bootstrap was started but never completed.\n\n"
+        "Stop and tell the user. The user decides what happens next. They can have you complete the "
+        "bootstrap through the engram-first-session skill. Only if the user decides this seat is new, "
+        "move the file aside under a dated name (never remove it), then run first-session for a clean "
+        "retry:\n"
         f"  {_MV_TEMPLATE}"
     )
 
@@ -4260,9 +4261,9 @@ def _db_damaged_message(reason: str) -> str:
     return (
         f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but is not a readable ENGRAM database "
         f"({reason}), and config.json is absent. Nothing was written.\n\n"
-        "Restore knowledge.db from a backup or snapshot. Stop and tell the user. Only if THE USER decides "
-        "this seat is genuinely new, move the file aside under a dated name (never remove it), then run "
-        "the engram-first-session skill:\n"
+        "Stop and tell the user. The user decides what happens next. They can have knowledge.db restored "
+        "from a backup or snapshot. Only if the user decides this seat is genuinely new, move the file "
+        "aside under a dated name (never remove it), then run the engram-first-session skill:\n"
         f"  {_MV_TEMPLATE}"
     )
 

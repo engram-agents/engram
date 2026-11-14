@@ -143,7 +143,12 @@ class ConfigShrinkError(ValueError):
 # phrases on purpose (a shell script cannot import this); tests/test_config_never_regenerated_4705.py
 # cell 12 asserts both copies hold them.
 NEW_SEAT_TOOL = "write-default-config.py"
-NEW_SEAT_FLAG = "--confirm-new-seat"
+NEW_SEAT_FLAG = "--confirm-new-seat"  # not printed by any refusal message (R3-2); the tool's --help names it
+# The rule on the READER, printed in place of the flag.  install.sh carries a hand-typed copy.
+NEW_SEAT_RULE = (
+    "Do not pass its confirmation flag yourself: only the user can say this seat is new, and the flag "
+    "stands for their word; the tool cannot tell who typed it (see its --help)."
+)
 _CANDIDATE_READ_CAP = 4 * 1024 * 1024  # a config is a few KB; a bigger "backup" is not one
 
 
@@ -192,8 +197,10 @@ class ConfigMissingError(FileNotFoundError):
                      "default from before this fix, and restoring it sets whatever self_lineage it holds.")
         parts.append(f"Once the user has chosen, run: cp -p <the backup you chose> {q}")
         tools = shlex.quote(str(Path(__file__).resolve().parent / "tools"))
-        parts.append(f"If the user confirms this seat is new, one command writes the default (it refuses "
-                     f"if config.json exists): {shlex.quote(sys.executable)} {tools}/{NEW_SEAT_TOOL} {NEW_SEAT_FLAG}")
+        parts.append("If the user confirms this seat is new, a tool writes the default (it refuses "
+                     "if config.json exists):")
+        parts.append(f"  {shlex.quote(sys.executable)} {tools}/{NEW_SEAT_TOOL}")
+        parts.append(NEW_SEAT_RULE)
         super().__init__("\n".join(parts))
 
 

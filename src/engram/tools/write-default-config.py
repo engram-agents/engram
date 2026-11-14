@@ -44,6 +44,9 @@ EXIT_EXISTS = 3
 
 FLAG = "--confirm-new-seat"
 
+# Unchanged on purpose.  A refusal message is PUSHED at a reader at the moment of failure, where whatever is
+# on screen gets copied, so it never prints this flag (it prints the rule instead); --help is PULLED by
+# someone who has already decided to act.  Do not "simplify" this text or add the flag to a refusal message.
 _FLAG_HELP = (
     "The human's word that this seat is NEW, not the agent's: pass it only after the user has said so "
     "in their own words. This tool cannot tell who typed it; the flag records an attestation, it does "

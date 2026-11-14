@@ -281,9 +281,10 @@ else:
         msg.append("The user decides which backup to restore: the newest may itself be a regenerated default "
                    "from before this fix, and restoring it sets whatever self_lineage it holds.")
         msg.append("Once the user has chosen, run: cp -p <the backup you chose> %s" % shlex.quote(path))
-        msg.append("If the user confirms this seat is new, one command writes the default (it refuses if "
-                   "config.json exists): python3 %s/write-default-config.py --confirm-new-seat"
-                   % shlex.quote(os.path.join(guard_dir, "tools")))
+        msg.append("If the user confirms this seat is new, a tool writes the default (it refuses if "
+                   "config.json exists):")
+        msg.append("  python3 %s/write-default-config.py" % shlex.quote(os.path.join(guard_dir, "tools")))
+        msg.append("Do not pass its confirmation flag yourself: only the user can say this seat is new, and the flag stands for their word; the tool cannot tell who typed it (see its --help).")
         print("\n".join(msg))
         sys.exit(3)
 # An absent flag keeps the stored value (when it is a valid one), else the default applies.
