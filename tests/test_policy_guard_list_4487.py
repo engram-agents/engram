@@ -16,7 +16,9 @@ Contract (one cell each; stdlib only; it reads this document and names no module
 - C4. A document missing the section heading, the item-4 start or the item-5
   line fails loudly with the missing anchor named; an item 4 holding no paths
   fails too.  A reformatted document never passes by finding zero paths.
-- C5. The existence check reports a missing path by name, and only that one.
+- C5. The message the existence check prints names a missing path, only that
+  one, and the document; it is None when nothing is missing.
+- C6. A later section's item 4 is not read when Owner merge has none.
 """
 
 from __future__ import annotations
@@ -69,17 +71,24 @@ def _missing(paths: list[str], root: Path) -> list[str]:
     return [p for p in paths if not (root / p).is_file()]
 
 
+def _missing_message(paths: list[str], root: Path) -> str | None:
+    """The exact failure message for missing paths, or None when all exist."""
+    missing = _missing(paths, root)
+    if not missing:
+        return None
+    return (
+        "Owner-merge item 4 in docs/internal/PR-MERGE-POLICY.md names files that "
+        "are not in the tree: " + ", ".join(missing)
+    )
+
+
 def _real_paths() -> list[str]:
     return _item4_paths(POLICY.read_text(encoding="utf-8"))
 
 
 def test_every_item4_path_exists():
-    paths = _real_paths()
-    missing = _missing(paths, REPO_ROOT)
-    assert not missing, (
-        "Owner-merge item 4 in docs/internal/PR-MERGE-POLICY.md names files that "
-        "are not in the tree: " + ", ".join(missing)
-    )
+    msg = _missing_message(_real_paths(), REPO_ROOT)
+    assert msg is None, msg
 
 
 def test_item4_extraction_is_not_empty_and_includes_this_file():
@@ -143,8 +152,27 @@ def test_a_missing_path_is_reported_by_name(tmp_path):
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_real_one.py").write_text("")
     paths = ["tests/test_real_one.py", "tests/test_bogus_one.py"]
-    missing = _missing(paths, tmp_path)
-    assert missing == ["tests/test_bogus_one.py"]
-    message = ", ".join(missing)
+    message = _missing_message(paths, tmp_path)
+    assert message is not None
     assert "tests/test_bogus_one.py" in message
     assert "tests/test_real_one.py" not in message
+    assert "PR-MERGE-POLICY.md" in message
+    (tmp_path / "tests" / "test_bogus_one.py").write_text("")
+    assert _missing_message(paths, tmp_path) is None
+
+
+_SYNTH_NO_ITEM4_HERE = """\
+## Owner merge
+3. **Third item** `tests/test_not_a_real_file_3.py`
+5. **The PR's changed or added tests** `tests/test_not_a_real_file_5.py`
+
+## Later section
+4. **The seat's own run, in a later section** `tests/test_not_a_real_file_9.py`
+5. **The PR's changed, in a later section**
+"""
+
+
+def test_a_later_sections_item4_is_not_read_when_owner_merge_has_none():
+    with pytest.raises(AssertionError) as exc:
+        _item4_paths(_SYNTH_NO_ITEM4_HERE)
+    assert "item-4 start" in str(exc.value)
