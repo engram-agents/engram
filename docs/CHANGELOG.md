@@ -48,6 +48,9 @@ with an `-alpha` suffix during the alpha phase.
 - tests: `test_bootstrap_fresh_db.py` no longer carries three setup loops that copied
   runtime files from a path that does not exist, so they never copied anything. Bootstrap runs in place
   at `src/engram/`, and the tests pass with and without the copy (engram#2173).
+- The plugin build now reads the source `plugin.json` once instead of twice. The
+  built `plugin.json` and the codex manifest are unchanged. A new test checks that
+  the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
 - The last-ditch dev-checkout fallback for this agent's own MCP server now points at
