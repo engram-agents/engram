@@ -1056,12 +1056,15 @@ def _write_deployed(home, text):
     (home / ".deployed-version").write_text(text)
 
 
-def _classify_detached(path):
+def _classify_deploy_target(path):
     t = _make_worktree(str(path), branch=None, detached=True, head="deadbeef")
     with (
         patch.object(_mod, "_is_clean", return_value=True),
         patch.object(_mod, "_is_in_use", return_value=False),
         patch.object(_mod, "_pr_for_sha", return_value=(True, None)),
+        # #4509: a detached HEAD no ref contains is no longer prunable; the
+        # control below needs a commit that some ref does contain.
+        patch.object(_mod, "_refs_containing", return_value=["refs/heads/dev"]),
     ):
         return _mod.classify(t, ROOT)
 
@@ -1070,9 +1073,9 @@ def test_deploy_source_detached_clean_is_kept(tmp_path, _isolated_engram_home):
     wt = tmp_path / "src-tree"
     wt.mkdir()
     # Control: no deploy record -> today's PRUNE.
-    assert _classify_detached(wt)[0] == "PRUNE"
+    assert _classify_deploy_target(wt)[0] == "PRUNE"
     _write_deployed(_isolated_engram_home, f"alpha_tag=v1\ndeployed_from={wt}\n")
-    action, reason = _classify_detached(wt)
+    action, reason = _classify_deploy_target(wt)
     assert action == "KEEP"
     assert "deploy source" in reason
 
@@ -1084,10 +1087,10 @@ def test_deploy_source_survives_symlinked_spelling(tmp_path, _isolated_engram_ho
     link.symlink_to(real)
     # record names the symlink, worktree listed by its real path ...
     _write_deployed(_isolated_engram_home, f"deployed_from={link}\n")
-    assert _classify_detached(real)[0] == "KEEP"
+    assert _classify_deploy_target(real)[0] == "KEEP"
     # ... and the other way round.
     _write_deployed(_isolated_engram_home, f"deployed_from={real}\n")
-    assert _classify_detached(link)[0] == "KEEP"
+    assert _classify_deploy_target(link)[0] == "KEEP"
 
 
 @pytest.mark.parametrize("content", [
@@ -1102,7 +1105,7 @@ def test_deploy_source_malformed_record_changes_nothing(
     wt = tmp_path / "src-tree"
     wt.mkdir()
     _write_deployed(_isolated_engram_home, content)
-    assert _classify_detached(wt)[0] == "PRUNE"
+    assert _classify_deploy_target(wt)[0] == "PRUNE"
 
 
 def test_deploy_source_unreadable_record_changes_nothing(
@@ -1111,18 +1114,18 @@ def test_deploy_source_unreadable_record_changes_nothing(
     wt.mkdir()
     # a directory where the file should be: read raises OSError
     (_isolated_engram_home / ".deployed-version").mkdir()
-    assert _classify_detached(wt)[0] == "PRUNE"
+    assert _classify_deploy_target(wt)[0] == "PRUNE"
     # invalid UTF-8 bytes
     (_isolated_engram_home / ".deployed-version").rmdir()
     (_isolated_engram_home / ".deployed-version").write_bytes(b"deployed_from=\xff\xfe\n")
-    assert _classify_detached(wt)[0] == "PRUNE"
+    assert _classify_deploy_target(wt)[0] == "PRUNE"
 
 
 def test_deploy_source_unresolvable_home_changes_nothing(tmp_path, monkeypatch):
     wt = tmp_path / "src-tree"
     wt.mkdir()
     monkeypatch.setenv("ENGRAM_HOME", "relative/home")  # resolver raises ValueError
-    assert _classify_detached(wt)[0] == "PRUNE"
+    assert _classify_deploy_target(wt)[0] == "PRUNE"
 
 
 def test_deploy_source_naming_a_different_directory_does_not_protect(
@@ -1132,12 +1135,12 @@ def test_deploy_source_naming_a_different_directory_does_not_protect(
     other = tmp_path / "other-tree"
     other.mkdir()
     _write_deployed(_isolated_engram_home, f"deployed_from={other}\n")
-    assert _classify_detached(wt)[0] == "PRUNE"
+    assert _classify_deploy_target(wt)[0] == "PRUNE"
     # a sibling sharing a string prefix is not the same directory either
     longer = tmp_path / "src-tree-2"
     longer.mkdir()
     _write_deployed(_isolated_engram_home, f"deployed_from={longer}\n")
-    assert _classify_detached(wt)[0] == "PRUNE"
+    assert _classify_deploy_target(wt)[0] == "PRUNE"
 
 
 @pytest.mark.parametrize("branch,pr_state", [
