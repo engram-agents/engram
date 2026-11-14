@@ -888,6 +888,7 @@ def test_cell17d_unknown_probe_error_gets_the_generic_sentence(seeded_no_config)
         "    if 'mode=ro' in str(a[0] if a else k.get('database')):\n"
         "        e = sqlite3.OperationalError('locking protocol')\n"
         "        e.sqlite_errorcode = sqlite3.SQLITE_PROTOCOL\n"
+        "        e.sqlite_errorname = 'SQLITE_PROTOCOL'\n"
         "        raise e\n"
         "    return _real(*a, **k)\n"
         "sqlite3.connect = _fake\n"

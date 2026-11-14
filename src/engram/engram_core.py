@@ -4275,6 +4275,20 @@ _BUSY_SENTENCE = (
 )
 
 
+_ACCESS_SENTENCE = (
+    "The database could not be opened read-only just now. That usually means the ENGRAM "
+    "directory or the database file is read-only, full or owned by another user. Nothing "
+    "about the database itself is known yet; fix that access and retry before restoring "
+    "anything."
+)
+
+_GENERIC_SENTENCE = (
+    "The database could not be read just now. Nothing about the database itself is known "
+    "yet. Check that the ENGRAM directory and the database file are readable by this "
+    "user, then retry; if it keeps happening, report this line."
+)
+
+
 def _is_busy_or_locked(exc: sqlite3.Error) -> bool:
     """#4705: True for an OperationalError whose SQLite error is BUSY or LOCKED (primary code, extended
     bits masked).  The error code is used where the interpreter has it (3.11+); the message text only
@@ -4288,13 +4302,57 @@ def _is_busy_or_locked(exc: sqlite3.Error) -> bool:
     return "locked" in text or "busy" in text
 
 
+def _is_positive_damage(exc: sqlite3.Error) -> bool:
+    """#4705 R5: True only for positive evidence the file is not a healthy SQLite database: primary code
+    NOTADB or CORRUPT.  Without sqlite_errorcode (before 3.11) only the two message texts count."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return (code & 0xFF) in (sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT)
+    text = str(exc).lower()
+    return "file is not a database" in text or "malformed" in text
+
+
+def _is_access_failure(exc: sqlite3.Error) -> bool:
+    """#4705 R5: True for an error that says the probe could not get at the file (read-only, cannot open,
+    permission, auth, I/O, disk full), which is a fact about access, not about the graph.  Needs
+    sqlite_errorcode (3.11+); without it the error falls to the generic sentence."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is None:
+        return False
+    return (code & 0xFF) in (
+        sqlite3.SQLITE_READONLY,  # 8
+        sqlite3.SQLITE_CANTOPEN,  # 14
+        sqlite3.SQLITE_PERM,  # 3
+        sqlite3.SQLITE_AUTH,  # 23
+        sqlite3.SQLITE_IOERR,  # 10
+        sqlite3.SQLITE_FULL,  # 13
+    )
+
+
+def _config_missing_with(sentence: str) -> "_config_io.ConfigMissingError":
+    """ConfigMissingError with one sentence placed before the remedies (R2-4a); a wrapper on the message,
+    same exception class."""
+    err = _config_io.ConfigMissingError(CONFIG_PATH)
+    lead, _, rest = str(err).partition("\n")
+    err.args = (lead + "\n" + sentence + "\n" + rest,)
+    return err
+
+
 def _refuse_config_missing() -> None:
     """config.json is absent and the guards are on: classify the existing knowledge.db read-only and
     raise the matching refusal (#4705).  Never returns, never writes.
 
     ConfigMissingError (C2) only for a DB that opens read-only and holds at least one axiom; a DB with
     no usable graph gets its own wording (C3a seed-missing + pack sentence, C3b damaged), so no message
-    states a fact the file contradicts.  The discriminator is the file, not a size threshold."""
+    states a fact the file contradicts.  The discriminator is the file, not a size threshold.
+
+    The two failure directions are not equal: a false "damaged" gets a good database moved aside, while
+    a false "not damaged" costs a retry.  So "damaged" (C3b) is an allowlist of positive evidence only:
+    SQLite NOTADB or CORRUPT, or a file that opens and has no nodes table.  A busy or locked database,
+    an access failure (read-only, cannot open, permission, auth, I/O, full) and any unknown sqlite3
+    error all land on ConfigMissingError with a sentence that says so; an unknown code lands on the
+    side that costs a retry.  Every non-damaged message names the SQLite error, so a human or an
+    agent can still act on it when the classification declines to."""
     kind, reason = "seeded", ""
     try:
         con = sqlite3.connect(f"{DB_PATH.absolute().as_uri()}?mode=ro", uri=True, timeout=5)
@@ -4307,14 +4365,16 @@ def _refuse_config_missing() -> None:
         finally:
             con.close()
     except sqlite3.Error as exc:
+        named = f"({type(exc).__name__}: {exc})"
         if _is_busy_or_locked(exc):
             # A locked/busy database is not a damaged one: the only fact known is that config.json is missing.
-            err = _config_io.ConfigMissingError(CONFIG_PATH)
-            lead, _, rest = str(err).partition("\n")
-            # One sentence before the remedies (R2-4a); a wrapper on the message, same exception class.
-            err.args = (lead + "\n" + _BUSY_SENTENCE + "\n" + rest,)
-            raise err
-        kind, reason = "damaged", f"{type(exc).__name__}: {exc}"
+            raise _config_missing_with(_BUSY_SENTENCE)
+        if _is_positive_damage(exc):
+            kind, reason = "damaged", f"{type(exc).__name__}: {exc}"
+        elif _is_access_failure(exc):
+            raise _config_missing_with(f"SQLite said {named}. {_ACCESS_SENTENCE}")
+        else:
+            raise _config_missing_with(f"SQLite said {named}. {_GENERIC_SENTENCE}")
     if kind == "damaged":
         raise RuntimeError(_db_damaged_message(reason))
     if kind == "seedless":
