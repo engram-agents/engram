@@ -11,6 +11,7 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- A lost `config.json` is no longer regenerated. When `knowledge.db` exists and `config.json` does not, ENGRAM now refuses instead of writing a default (a blank `self_lineage` silently turned the model-family gate off): a seat whose `config.json` is lost cannot open its memory or run the installer until the file is restored from a backup the user chooses. The refusal lists the backups, and a new `write-default-config.py` command writes the default for a genuinely new seat. The command needs the user's confirmation flag, and refusal messages do not print it. A fresh install, and a bootstrap, are unchanged. (#4705)
 - A refused in-place rewrite now reports which state the file is in as data (`WriteRefused.outcome`:
   `nothing_written`, `restored` or `may_be_incomplete`), and `set_forum_url.py` and the installer's
   `install_tier` step word their message from it. When the write and the put-back both fail, they no

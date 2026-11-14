@@ -777,6 +777,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/write-default-config.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/_status_derive.py",
       "tier": "convenience"
     },
