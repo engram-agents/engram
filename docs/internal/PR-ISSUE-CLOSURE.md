@@ -125,7 +125,8 @@ form that fires the parser.
    one of them an exact replica of #710, reproduced 0 of 3. Reading the body's edit history
    (`userContentEdits` in GraphQL) then found the negated adjacent keyword
    above. So the adjacent-only greps (checks 2 and 3 in `CLAUDE.md`) match the
-   measured parser and need no widening on this evidence. The
+   measured parser on adjacency and need no widening for distance; the
+   cross-repo `owner/repo#N` form is covered by check 3 only. The
    GraphQL query is still the only real pre-merge check, because of the stale
    window, not because of a distance rule. umwelt's `CLAUDE.md` carries the
    full record; this paragraph is its engram copy (#2213).
