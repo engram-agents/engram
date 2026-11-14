@@ -261,11 +261,13 @@ def _write_map(home: pathlib.Path, aliases) -> None:
     (home / "repo-aliases").write_text(content, encoding="utf-8")
 
 
-def _run_cat8(tmp_path, claim: str, aliases=None):
+def _run_cat8(tmp_path, claim: str, aliases=None, block=None, env_extra=None):
     """Run the fairy's bash block under the stub gh, against a temporary seat.
 
     ENGRAM_HOME always points at the temp dir, so the cell never reads the
     running seat's own map (this repo's test host sets ENGRAM_HOME globally).
+    `block` overrides the extracted block (the belt-removed probe uses this);
+    `env_extra` adds environment variables (e.g. a locale) for one run.
     """
     bash = shutil.which("bash")
     if bash is None:
@@ -273,7 +275,7 @@ def _run_cat8(tmp_path, claim: str, aliases=None):
     home = tmp_path / "home"
     _write_map(home, aliases)
     script = tmp_path / "cat8.sh"
-    script.write_text(_bash_block(), encoding="utf-8")
+    script.write_text(_bash_block() if block is None else block, encoding="utf-8")
     bindir = tmp_path / "bin"
     bindir.mkdir()
     gh = bindir / "gh"
@@ -285,6 +287,7 @@ def _run_cat8(tmp_path, claim: str, aliases=None):
     env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
     env["GH_ARGV_LOG"] = str(log)
     env["ENGRAM_HOME"] = str(home)
+    env.update(env_extra or {})
     proc = subprocess.run(
         [bash, str(script)], cwd=tmp_path, env=env, input=claim,
         capture_output=True, text=True, timeout=60,
@@ -366,6 +369,104 @@ def test_comment_and_blank_lines_declare_no_aliases(tmp_path):
     )
     lines, calls = _run_cat8(tmp_path, "alias-a#12 and alias-a #7", content)
     assert lines == [] and calls == [], (lines, calls)
+
+
+# --- the non-ASCII key: the path the fail-closed belt exists for -------------
+#
+# On stock macOS bash 3.2.57 under a UTF-8 locale the key check does NOT reject
+# a non-ASCII key (locale collation), so `é=example-org/repo-a` is "declared";
+# stage 2 matches `é #5`, `sed -E 's/^[^A-Za-z0-9_.-]//'` strips the key's own
+# first character as if it were the boundary, the lookup is empty, and only
+# `[ -n "$full" ] || continue` keeps the bare `#5` away from
+# `gh pr view 5 --repo ""` (which `gh` resolves against the checkout). Bash 5.x
+# and bash 3.2 in the C locale reject the key, so there the alias never exists
+# and the behavioural half of the cell cannot discriminate.
+
+_BELT_RE = re.compile(r'^[ \t]*\[ -n "\$full" \] \|\| continue\n', re.MULTILINE)
+_NON_ASCII_KEY = "é"
+
+
+def _belt_removed(block: str) -> str:
+    """The block with its fail-closed belt removed (no-op if already absent).
+
+    Used only as the new cell's skip gate: if even the belt-less block emits
+    nothing for the fixture, this bash/locale rejected the key and the cell
+    cannot discriminate here."""
+    return _BELT_RE.sub("", block, count=1)
+
+
+def _utf8_locale() -> str | None:
+    """The first installed UTF-8 locale, or None. Availability is a host fact."""
+    try:
+        out = subprocess.run(
+            ["locale", "-a"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    available = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    for cand in ("en_US.UTF-8", "en_US.utf8", "C.utf8", "C.UTF-8"):
+        if cand in available:
+            return cand
+    for name in sorted(available):
+        if re.search(r"\.utf-?8$", name, re.IGNORECASE):
+            return name
+    return None
+
+
+def _bash_version() -> str:
+    bash = shutil.which("bash")
+    if bash is None:
+        return "bash unavailable"
+    try:
+        out = subprocess.run(
+            [bash, "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "bash version unknown"
+    return out.stdout.splitlines()[0] if out.stdout else "bash version unknown"
+
+
+def test_non_ascii_alias_key_never_becomes_a_bare_ref(tmp_path):
+    """Cell 11 — the non-ASCII alias key, the path the fail-closed belt covers.
+
+    Fixture: a `repo-aliases` file declaring only `é=example-org/repo-a`, and a
+    claim `é #5`. On stock macOS bash 3.2.57 under a UTF-8 locale the key check
+    accepts `é` (locale collation), so the alias is added; stage 2 matches,
+    `sed` strips the key's own first character, the lookup is empty, and the
+    belt drops the bare `#5` instead of running `gh pr view 5 --repo ""`.
+
+    WHAT THIS PROVES ON EVERY HOST: the belt line is present in the shipped
+    block (the assertion before the skip). Removing it therefore reddens this
+    cell even where the key check rejects the key (mutation M5).
+
+    WHAT IT PROVES ONLY WHERE THE KEY IS ACCEPTED: that the fixture produces no
+    output line and no gh call. Acceptance depends on bash version and locale —
+    bash 5.x and bash 3.2 in the C locale reject the key. The gate is a probe of
+    this same block with the belt removed: if even that emits nothing, the
+    acceptance did not reproduce here, so the cell SKIPS (naming the bash
+    version and locale) rather than passing vacuously. It runs on stock bash 3.2
+    under a UTF-8 locale, i.e. the macOS seat.
+    """
+    block = _bash_block()
+    assert _BELT_RE.search(block), (
+        'the fail-closed belt `[ -n "$full" ] || continue` is missing from '
+        "Category 8 stage 2; an empty alias lookup would emit a bare `#N`")
+    locale_name = _utf8_locale()
+    env_extra = {"LC_ALL": locale_name} if locale_name else {}
+    map_body = f"{_NON_ASCII_KEY}=example-org/repo-a\n"
+    fixture = f"{_NON_ASCII_KEY} #5"
+    probe_lines, probe_calls = _run_cat8(
+        tmp_path / "probe", fixture, map_body,
+        block=_belt_removed(block), env_extra=env_extra)
+    if not probe_lines and not probe_calls:
+        pytest.skip(
+            "non-ASCII alias key not accepted by this bash "
+            f"({_bash_version()}) under {locale_name or 'the ambient locale'}: "
+            "the alias is never declared, the belt has nothing to drop, and the "
+            "behavioural half of this cell cannot discriminate here. It runs on "
+            "stock bash 3.2 under a UTF-8 locale (the macOS seat).")
+    lines, calls = _run_cat8(
+        tmp_path, fixture, map_body, env_extra=env_extra)
+    assert lines == [], f"non-ASCII alias key produced a reference: {lines!r}"
+    assert calls == [], f"non-ASCII alias key reached gh: {calls!r}"
 
 
 @pytest.mark.parametrize("aliases", [None, _MAP_AB])
