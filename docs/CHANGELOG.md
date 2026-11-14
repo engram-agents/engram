@@ -11,6 +11,10 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
+  close-keyword grep's adjacency rule matches GitHub's parser (no proximity
+  gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
+  until the next edit event. (#2213)
 - `engram_derive` no longer returns an `independence_advisory` key. It duplicated
   the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
   or more lineages, and when the install has recorded its own lineage, that line
@@ -42,10 +46,10 @@ with an `-alpha` suffix during the alpha phase.
   removed. (#4358)
 
 ### Fixed
-- `worktree-gc` no longer prunes a clean detached worktree whose HEAD commit is in
-  no ref (branch, tag, remote-tracking or other): removing it would leave that
-  commit only in the reflog. It skips with a reason naming the commit, and skips too when git cannot
-  say whether any ref holds it. (engram#4509)
+- Test-only: the forum installer `--dry-run` cells (`test_installer.py`, `test_installer_baton_gate.py`)
+  now run with `HOME` and `XDG_CONFIG_HOME` in a scratch directory. On a seat whose real
+  forum unit carries a baton login map they failed on the installer's correct refusal;
+  the installer is unchanged. (#4393)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
@@ -62,6 +66,10 @@ with an `-alpha` suffix during the alpha phase.
   by its position in the list and the kind of error only, never by its contents,
   its label or the regex error text, so a terminal paste cannot carry a name.
   The entry is still skipped and loading continues.
+- `worktree-gc` no longer prunes a clean detached worktree whose HEAD commit is in
+  no ref (branch, tag, remote-tracking or other): removing it would leave that
+  commit only in the reflog. It skips with a reason naming the commit, and skips too when git cannot
+  say whether any ref holds it. (engram#4509)
 - The `ia` refusal for an unconfigured forum now points at the engram-letter skill's
   troubleshooting row, not at a README path that does not ship on an installed seat
   (engram#3560).
