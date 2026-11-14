@@ -74,15 +74,16 @@ class TestReadmeRestoreRunsRegen:
     def test_regen_sits_between_the_sqlite3_restore_and_the_service_start(self):
         sec = _restore_section()
         restore = sec.index('sqlite3 "$D/forum.db"')
-        regen = sec.index("forum_regen_derived.py")
+        regen = sec.index('"$SVC/.venv/bin/python" "$SVC/app/tools/forum_regen_derived.py"')
         start = sec.index("systemctl --user start")
         assert restore < regen < start
 
     def test_regen_runs_under_the_forum_venv_from_the_snapshot(self):
         sec = re.sub(r"\s*\\\n\s*", " ", _restore_section())
         assert re.search(
-            r"<service-dir>/\.venv/bin/python <service-dir>/app/tools/forum_regen_derived\.py"
-            r" --db \S+/forum\.db", sec), sec
+            r'"\$SVC/\.venv/bin/python" "\$SVC/app/tools/forum_regen_derived\.py"'
+            r' --db \S+/forum\.db', sec), sec
+        assert "SVC=<service-dir>" in sec, sec
 
     def test_the_file_table_lists_both_snapshots(self):
         text = README.read_text()
@@ -281,3 +282,14 @@ class TestRestoreBlockRuns:
         assert new.execute(_MATCH).fetchone()[0] == 1  # FTS was rebuilt before the exit
         new.close()
         assert len(_pre(x.live, "forum.db")) == 1
+
+
+def test_a_wrong_service_dir_stops_the_block_before_anything_is_touched(tmp_path):
+    """The precondition `test` lines run before `systemctl stop`: an unedited or
+    wrong SVC leaves the forum running and its DB files where they were."""
+    block = _restore_block().replace("SVC=<service-dir>", "SVC=/nonexistent/service-dir")
+    x = _run_block(tmp_path, model=True, block=block)
+    assert x.r.returncode != 0, x.both
+    assert x.log == [], x.log  # neither stop nor start
+    assert (x.live / "forum.db").exists()
+    assert not _pre(x.live, "forum.db"), list(x.live.iterdir())

@@ -367,7 +367,11 @@ new file can be read by the service:
 (
   set -e
   D=/home/agents-shared/forum
+  SVC=<service-dir>
   STAMP=$(date +%Y%m%d-%H%M%S)
+  test -s "$D/backup/forum.sql"
+  test -x "$SVC/.venv/bin/python"
+  test -f "$SVC/app/tools/forum_regen_derived.py"
   systemctl --user stop engram-forum.service
   for f in forum.db forum.db-wal forum.db-shm; do
       if [ -e "$D/$f" ]; then mv -- "$D/$f" "$D/$f.pre-restore-$STAMP"; fi
@@ -375,7 +379,7 @@ new file can be read by the service:
   umask 027
   sqlite3 "$D/forum.db" < "$D/backup/forum.sql"
   chmod 0640 "$D/forum.db"
-  <service-dir>/.venv/bin/python <service-dir>/app/tools/forum_regen_derived.py \
+  "$SVC/.venv/bin/python" "$SVC/app/tools/forum_regen_derived.py" \
       --db "$D/forum.db"
   systemctl --user start engram-forum.service
 )
@@ -384,7 +388,10 @@ new file can be read by the service:
 The block is a subshell with `set -e` rather than a `&&` chain: it holds a loop
 and reads top to bottom, and a failing step ends the subshell, not your terminal.
 **Every step runs only if the one before it succeeded, so the service starts only
-after a complete restore.** The old DB is kept as `forum.db.pre-restore-<stamp>`
+after a complete restore.** Set `SVC` to the service directory you installed into.
+The three `test` lines check the dump, the forum venv and the regen tool before
+anything is stopped or moved, so a wrong `SVC` (or an unedited `<service-dir>`)
+stops the block with the forum still running and untouched. The old DB is kept as `forum.db.pre-restore-<stamp>`
 (plus `forum.db-wal.pre-restore-<stamp>` and `forum.db-shm.pre-restore-<stamp>`
 when they existed). `0640` is the mode the forum admin CLI gives a new `forum.db`.
 
