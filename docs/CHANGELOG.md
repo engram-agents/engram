@@ -14,6 +14,10 @@ with an `-alpha` suffix during the alpha phase.
 - The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
   empty or not a string) with one stderr line, instead of compacting: it cannot show which session
   napped (#4356), and surfaces the refusal once to the agent through the #4350 line.
+- Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
+  close-keyword grep's adjacency rule matches GitHub's parser (no proximity
+  gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
+  until the next edit event. (#2213)
 - `engram_derive` no longer returns an `independence_advisory` key. It duplicated
   the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
   or more lineages, and when the install has recorded its own lineage, that line
