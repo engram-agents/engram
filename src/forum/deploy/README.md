@@ -378,6 +378,7 @@ new file can be read by the service:
   done
   umask 027
   sqlite3 "$D/forum.db" < "$D/backup/forum.sql"
+  test "$(sqlite3 "$D/forum.db" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='posts'")" = 1
   chmod 0640 "$D/forum.db"
   "$SVC/.venv/bin/python" "$SVC/app/tools/forum_regen_derived.py" \
       --db "$D/forum.db"
@@ -390,8 +391,12 @@ and reads top to bottom, and a failing step ends the subshell, not your terminal
 **Every step runs only if the one before it succeeded, so the service starts only
 after a complete restore.** Set `SVC` to the service directory you installed into.
 The three `test` lines check the dump, the forum venv and the regen tool before
-anything is stopped or moved, so a wrong `SVC` (or an unedited `<service-dir>`)
-stops the block with the forum still running and untouched. The old DB is kept as `forum.db.pre-restore-<stamp>`
+anything is stopped or moved, so a wrong `SVC` stops the block with the forum
+still running and untouched. An unedited `<service-dir>` is a shell syntax error,
+so nothing in the block runs at all. The `test` line after the restore catches a
+dump cut short before its final `COMMIT`: `sqlite3` then exits 0 but leaves a
+database with no tables, and the block stops before starting the service on it.
+The block is plain POSIX shell; paste it into bash or any POSIX `sh`. The old DB is kept as `forum.db.pre-restore-<stamp>`
 (plus `forum.db-wal.pre-restore-<stamp>` and `forum.db-shm.pre-restore-<stamp>`
 when they existed). `0640` is the mode the forum admin CLI gives a new `forum.db`.
 

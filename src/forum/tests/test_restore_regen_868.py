@@ -183,7 +183,7 @@ def _make_dump(tmp_path: Path) -> Path:
 
 
 def _run_block(tmp_path: Path, *, model: bool, corrupt: bool = False,
-               block: str | None = None):
+               block: str | None = None, truncate: bool = False):
     live = _make_dump(tmp_path)
     # Reopen the live DB in WAL mode with an open writer, so -wal/-shm exist.
     keep = sqlite3.connect(live / "forum.db")
@@ -195,6 +195,11 @@ def _run_block(tmp_path: Path, *, model: bool, corrupt: bool = False,
     assert (live / "forum.db-wal").exists() and (live / "forum.db-shm").exists()
     if corrupt:
         (live / "backup" / "forum.sql").write_text("CREATE TABLE ((( not sql at all;\n")
+    if truncate:  # cut before the final COMMIT, at a statement boundary
+        dump = live / "backup" / "forum.sql"
+        lines = dump.read_text().splitlines(keepends=True)
+        cut = max(i for i, ln in enumerate(lines) if ln.strip() == "COMMIT;")
+        dump.write_text("".join(lines[:cut]))
 
     ctx = _install(tmp_path)
     assert ctx.r.returncode == 0, ctx.both
@@ -293,3 +298,12 @@ def test_a_wrong_service_dir_stops_the_block_before_anything_is_touched(tmp_path
     assert x.log == [], x.log  # neither stop nor start
     assert (x.live / "forum.db").exists()
     assert not _pre(x.live, "forum.db"), list(x.live.iterdir())
+
+
+def test_a_dump_cut_before_commit_does_not_start_the_service(tmp_path):
+    """sqlite3 exits 0 on a dump truncated before COMMIT and leaves no tables;
+    the post-restore schema check must stop the block before the start."""
+    x = _run_block(tmp_path, model=True, truncate=True)
+    assert x.r.returncode != 0, x.both
+    assert "start" not in " ".join(x.log), x.log
+    assert _pre(x.live, "forum.db"), list(x.live.iterdir())
