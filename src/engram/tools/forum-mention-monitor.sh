@@ -400,6 +400,100 @@ except Exception: pass'
 # uses it too.
 POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
 
+# ---------------------------------------------------------------------------
+# since-cursor (#3729). Every poll used to ask for the agent's WHOLE @-mention
+# history (~758 KB per poll on the real forum, growing forever). The server
+# already honours `since` (created_at > since, a TEXT comparison in SQL on the
+# stored %Y-%m-%dT%H:%M:%S.%fZ form), so the monitor keeps a cursor in the
+# sidecar "$SEEN.cursor" and polls with since = cursor - overlap.
+#   - The cursor comes ONLY from the server: after each poll that REPORTED a
+#     mentions list (the ids() exit-0 path), cursor = max(old cursor, newest
+#     created_at in that response). Never the local clock (skew), never moved
+#     backwards, never cleared by an empty list (an empty answer under `since`
+#     is a real answer and says nothing about the cursor).
+#   - The overlap (default 600 s, $FORUM_MENTION_SINCE_OVERLAP_SECONDS for tests)
+#     re-fetches a window behind the cursor so a late-committed mention whose
+#     created_at is older than the newest seen still arrives; the seen-set
+#     dedupe (unchanged: $SEEN is still a snapshot of the last response) keeps
+#     a mention that reappears inside the window from being announced twice.
+#   - `since` is formatted in EXACTLY the stored form (6-digit fraction, Z),
+#     because the server compares text: "...:00Z" sorts after "...:00.5Z" ('Z'
+#     > '.'), so a bare-second since would drop same-second mentions. It is
+#     URL-encoded: a literal '+' in a query string decodes to a space.
+#   - No cursor (first arm, a fresh seen file, an upgrade from a version that
+#     had $SEEN but no cursor), or an unreadable one: full poll, exactly as
+#     before. The seed always takes the full poll too (it is the baseline), and
+#     then writes the cursor.
+# A malformed / non-reporting 200 and a curl failure never reach the cursor
+# write: it sits behind the same guards as the $SEEN write.
+# ---------------------------------------------------------------------------
+SINCE_OVERLAP_SECONDS="${FORUM_MENTION_SINCE_OVERLAP_SECONDS:-600}"
+case "$SINCE_OVERLAP_SECONDS" in ''|*[!0-9]*) SINCE_OVERLAP_SECONDS=600 ;; esac
+CURSOR="$SEEN.cursor"
+
+# Prints the URL-encoded since value, or nothing when there is no usable cursor.
+_since_param() {
+    [ -s "$CURSOR" ] || return 0
+    python3 -c 'import sys, urllib.parse
+from datetime import datetime, timedelta, timezone
+try:
+    c = open(sys.argv[1]).read().strip()
+    d = datetime.fromisoformat(c.replace("Z", "+00:00"))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    d = d.astimezone(timezone.utc) - timedelta(seconds=int(sys.argv[2]))
+    print(urllib.parse.quote(d.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), safe=""))
+except Exception:
+    pass' "$CURSOR" "$SINCE_OVERLAP_SECONDS" 2>/dev/null
+}
+
+# The URL to poll: $URL, plus &since=... when a cursor exists. $URL itself stays
+# unchanged (the seen-file name is a cksum of it).
+_poll_url() {
+    local _s
+    _s="$(_since_param)"
+    if [ -n "$_s" ]; then printf '%s&since=%s' "$URL" "$_s"; else printf '%s' "$URL"; fi
+}
+
+# Advance the cursor from the response body on stdin: max(old, newest
+# created_at), written atomically (tmp + replace, like $SEEN). Only called on a
+# body that reported a mentions list. Any trouble leaves the old cursor alone.
+_cursor_advance() {
+    python3 -c 'import json, os, sys
+from datetime import datetime, timezone
+def key(s):
+    d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+path = sys.argv[1]
+try:
+    old = None
+    try:
+        old = open(path).read().strip() or None
+    except Exception:
+        pass
+    best, bk = old, None
+    if old:
+        try:
+            bk = key(old)
+        except Exception:
+            best = None
+    d = json.load(sys.stdin)
+    for m in d["mentions"]:
+        try:
+            c = m["created_at"]; k = key(c)
+        except Exception:
+            continue
+        if bk is None or k > bk:
+            best, bk = c, k
+    if best and best != old:
+        tmp = path + ".now"
+        with open(tmp, "w") as f:
+            f.write(best + "\n")
+        os.replace(tmp, path)
+except Exception:
+    pass' "$CURSOR" 2>/dev/null
+}
+
 # Path to the last-user-activity stamp (written by the time-bar hook on each
 # genuine human-typed prompt). Used to detect the 'engaged' / talking-to-user
 # state — same source as _status_derive._recently_engaged() in Python.
@@ -706,6 +800,7 @@ while true; do
     if _curl_fetch "$CURL_MAX_TIME" "$URL" \
        && ( set -o pipefail; printf '%s' "$RESP" | ids | sort > "$SEEN.now" ); then
         mv "$SEEN.now" "$SEEN"
+        printf '%s' "$RESP" | _cursor_advance
         if [ "$_SEED_ANNOUNCED" = 1 ]; then
             echo "forum-mention-monitor.sh: seeded from the forum — now receiving"
         fi
@@ -852,7 +947,7 @@ while true; do
     # buffer/window still preserved, exactly as before) — only the EDGE is
     # now announced, once on entry and once on recovery, via
     # $_FORUM_REACHABLE (declared above the loop).
-    if ! _curl_fetch "$CURL_MAX_TIME" "$URL"; then
+    if ! _curl_fetch "$CURL_MAX_TIME" "$(_poll_url)"; then
         if [ "$_FORUM_REACHABLE" = 1 ]; then
             echo "⚠️  forum-mention-monitor.sh: forum unreachable ($(_curl_detail)) — still armed, not receiving; will report when it returns"
             _FORUM_REACHABLE=0
@@ -877,6 +972,7 @@ while true; do
     fi
     _new_pids="$(comm -13 "$SEEN" "$SEEN.now" | cut -f1)"
     mv "$SEEN.now" "$SEEN"
+    printf '%s' "$RESP" | _cursor_advance
     if [ -n "$_new_pids" ]; then
         # Look up each newly-seen post's thread_id in the just-fetched $RESP
         # (no extra HTTP call) and append one line per mention to the buffer

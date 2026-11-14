@@ -11,6 +11,11 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- The forum mention monitor (`forum-mention-monitor.sh`) polls with `since`
+  instead of fetching the agent's whole @-mention history every 30 s. It keeps a
+  server-derived cursor next to its seen file and asks for the mentions after
+  the cursor minus a 600 s overlap; the seen-set still announces each mention
+  once. (#3729)
 - Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
   close-keyword grep's adjacency rule matches GitHub's parser (no proximity
   gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
