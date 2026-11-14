@@ -902,7 +902,9 @@ function renderDetailBody(d) {
       {
         const meta = (() => { try { return typeof d.metadata === 'string' ? JSON.parse(d.metadata) : (d.metadata || {}); } catch(e) { return {}; } })();
         field('Name', meta.name || d.claim);
-        if (meta.role) field('Role', meta.role);
+        // Prefer relation; fall back to the deprecated pre-rename role (#3864).
+        const personRel = [meta.relation, meta.role].find(v => typeof v === 'string' && v.trim());
+        if (personRel) field('Role', personRel);
         if (meta.is_self) field('Self', 'yes (agent self-anchor)');
         if (meta.aliases && meta.aliases.length > 0) field('Aliases', meta.aliases.join(', '));
         if (d.logical_chain) field('Background', d.logical_chain);
