@@ -671,3 +671,75 @@ def test_cell17_locked_db_with_config_missing_gets_config_missing_not_damaged(se
     assert locked["r"]["raised"] == "ConfigMissingError", locked
     assert "delete" not in locked["r"]["msg"].lower(), locked["r"]["msg"]
     assert locked["cfg"] is False
+
+
+# ----------------------------------------------------------------------------- cells 18, 18b (R2-3)
+
+def _moved_aside_template_ok(msg: str, home: Path) -> bool:
+    return "mv " in msg and ".moved-aside." in msg and str(home / "knowledge.db") in msg
+
+
+def test_cell18_no_refusal_message_says_delete_or_rm(work, tmp_path):
+    msgs = {}
+    # C2: seeded, config absent
+    h = work / "c2" / ".engram"
+    h.mkdir(parents=True)
+    _seed(h)
+    (h / "config.json").unlink()
+    msgs["C2"] = _child(h, _CELL17)["r"]
+    # C3a: readable SQLite, nodes table, zero axioms (the seed-missing text + pack sentence)
+    h = work / "c3a" / ".engram"
+    h.mkdir(parents=True)
+    con = sqlite3.connect(str(h / "knowledge.db"))
+    con.execute("CREATE TABLE nodes (id TEXT, type TEXT)")
+    con.commit()
+    con.close()
+    msgs["C3a"] = _child(h, _CELL17)["r"]
+    # C3b: zero-byte DB
+    h = work / "c3b" / ".engram"
+    h.mkdir(parents=True)
+    (h / "knowledge.db").write_bytes(b"")
+    msgs["C3b"] = _child(h, _CELL17)["r"]
+    # locked DB (R2-2)
+    h = work / "lk" / ".engram"
+    h.mkdir(parents=True)
+    _seed(h)
+    (h / "config.json").unlink()
+    _delete_mode(h)
+    holder = sqlite3.connect(str(h / "knowledge.db"), isolation_level=None)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+        msgs["locked"] = _child(h, _CELL17)["r"]
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    # C8: install.sh's refusal
+    sb = Sandbox(tmp_path)
+    sb.make_db(6, config=False)
+    r = _sandbox_run(sb)
+    assert r.returncode != 0, r.all
+    msgs["C8"] = {"raised": "install.sh", "msg": r.all}
+    for name, res in msgs.items():
+        assert res["raised"], (name, res)
+        low = res["msg"].lower()
+        assert "delete" not in low, (name, res["msg"])
+        assert "rm " not in low, (name, res["msg"])
+    # the two moved-aside messages carry the exact mv template
+    assert _moved_aside_template_ok(msgs["C3b"]["msg"], work / "c3b" / ".engram"), msgs["C3b"]["msg"]
+    assert _moved_aside_template_ok(msgs["C3a"]["msg"], work / "c3a" / ".engram"), msgs["C3a"]["msg"]
+
+
+def test_cell18b_a_moved_aside_database_satisfies_the_guard_the_message_points_at(home):
+    blob = b"this is not a sqlite database file, it is sixty-four bytes of text.\n"[:64].ljust(64, b".")
+    (home / "knowledge.db").write_bytes(blob)
+    aside = home / "knowledge.db.moved-aside.20261114T000000Z"
+    (home / "knowledge.db").rename(aside)  # the `mv` the message gives
+    out = _child(home, _DAMAGED)
+    assert out["r"]["raised"] == "RuntimeError" and "knowledge.db not found" in out["r"]["msg"], out
+    assert DAMAGED_PHRASE not in out["r"]["msg"] and PHRASES[0] not in out["r"]["msg"]
+    assert out["cfg"] is False and not (home / "knowledge.db").exists()
+    # first-session path (bootstrap mode): proceeds and writes the default
+    out = _child(home, _DAMAGED, bootstrap=True)
+    assert out["r"]["raised"] is None, out
+    assert out["cfg"] is True
+    assert aside.read_bytes() == blob, "the moved-aside file changed"
