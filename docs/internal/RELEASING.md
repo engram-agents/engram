@@ -226,11 +226,12 @@ the soak report. Read it again now, on the accepted candidate, in one shell:
 ```bash
 git fetch origin --tags
 C=$(git rev-parse --verify -q 'vX.Y.Z-rcN^{commit}')           # the accepted candidate
-if [ -n "$C" ] && [ "$C" = "$(git rev-parse origin/release/X.Y.Z)" ]; then
+if [ -n "$C" ] && [ "$C" = "$(git rev-parse origin/release/X.Y.Z)" ] \
+   && git merge-base --is-ancestor origin/main "$C"; then
     gh api "repos/engram-agents/engram/commits/$C/check-runs?per_page=100" \
       --jq '.check_runs[] | select(.name=="pytest (3.12)") | {conclusion, head_sha, run: .details_url}'
 else
-    echo "STOP: the release branch head is not the accepted candidate"
+    echo "STOP: C is empty, the release branch head is not the accepted candidate, or main is not an ancestor of C"
 fi
 gh run view <run-id> --repo engram-agents/engram --json event,headSha,conclusion
 ```
@@ -246,6 +247,19 @@ second command; the row that counts is the one whose `event` is
 be `success`. A green row from a hand-started run does not count, and `main`
 would refuse the push in step 7 if it were the only one. This check is gate
 G1.
+
+**Why the ancestry condition.** The pull request's run tests GitHub's merge
+of the head into `main`. When `main` is an ancestor of the head, that merge
+changes nothing, so the run tested exactly the tree `main` will hold after
+step 7, even if GitHub had not refreshed its merge since `main` last moved:
+`main` only moves forward (step 7: no force-move for anyone), so every earlier
+`main` is an ancestor too. If `main` is not an ancestor of `C`, another
+release has landed; stop, and cut a new candidate on top of it. A pull request
+retargeted onto `main` after its head was pushed has no run of this check at
+all (the workflow does not run on a retarget). For the release pull request,
+close and reopen it: that runs the check on the same head. Pushing an empty
+commit would move the release branch off the candidate, which makes a new
+candidate.
 
 **If the check is red, stop.** Read which cells failed and bring them to the
 maintainer with their cause. One exception, the maintainer's ruling of
