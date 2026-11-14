@@ -453,23 +453,26 @@ jobs:
           scanner_path = None
           scanner_source = None
           lacking = []
+          extraction_failures = []
           for ref in (base_sha, default_ref):
               candidate, extraction_failure = _materialise_from(ref)
               if extraction_failure is not None:
                   # `ref` RESOLVES (guarded above), so a failed extraction is
-                  # not a fact about the tree. Say so loudly and fall through:
-                  # the chain still continues, but this must never read as the
-                  # benign "this ref has no scanner" diagnosis.
+                  # not a fact about the tree. This must never read as the
+                  # benign "this ref has no scanner" diagnosis, and it is
+                  # RECORDED rather than absorbed: the chain may still look at
+                  # the next protected ref, but it must never reach the
+                  # checkout link on the strength of a ref this run could not
+                  # examine. On a same-repo pull request that copy is
+                  # contributor-controlled and is handed `--roster-file`.
                   print(
                       "::error::name-leak sweep: extracting the tree at "
                       f"{ref} failed ({extraction_failure}). That ref RESOLVES "
                       "(checked above), so this is an extraction/runner "
                       "failure, NOT evidence that its tree has no "
-                      f"{scanner_rel}. Falling through to the next link."
+                      f"{scanner_rel}."
                   )
-                  lacking.append(
-                      f"{ref} could not be extracted ({extraction_failure})"
-                  )
+                  extraction_failures.append(f"{ref} ({extraction_failure})")
                   continue
               if candidate is None:
                   lacking.append(f"{ref} has no {scanner_rel}")
@@ -481,12 +484,34 @@ jobs:
               scanner_source = ref
               break
 
+          # R5-1: an extraction failure is a defect in this clone or the
+          # runner, never evidence about a tree, and it FAILS CLOSED before any
+          # scan. Falling through was the fail-open shape: a runner-wide
+          # failure (missing tar, full disk, any git problem) sent the chain to
+          # the pull request's own copy, which then received the roster as
+          # `--roster-file <path>`. The checkout link is unreachable unless
+          # every protected link this run TRIED was extracted and examined.
+          if extraction_failures:
+              print(
+                  "::error::name-leak sweep: the sweep could not extract the "
+                  "tree at " + "; ".join(extraction_failures) + ". An "
+                  "extraction failure is a defect in this clone or the "
+                  "runner, not evidence about a tree: the sweep will NOT fall "
+                  "through to the pull request's own copy, which on a "
+                  "same-repo pull request is contributor-controlled and would "
+                  "receive the roster path. Failing closed before any scan."
+              )
+              raise SystemExit(1)
+
           if scanner_path is None:
               # BOOTSTRAP ONLY, by positive knowledge: both protected refs
-              # resolved and neither carries a copy with the capability. That
-              # is the first `dev -> main` release PR, before the flags exist
-              # on `main`. On a same-repo pull request the checkout is
-              # contributor-controlled, so this link is LOUD, never silent.
+              # RESOLVED, both were EXTRACTED and EXAMINED, and neither carries
+              # a copy with the capability. An extraction failure has already
+              # exited above, so a ref this run could not examine never reaches
+              # this link. That is the first `dev -> main` release PR, before
+              # the flags exist on `main`. On a same-repo pull request the
+              # checkout is contributor-controlled, so this link is LOUD, never
+              # silent.
               checkout_scanner = os.path.join(
                   os.environ["GITHUB_WORKSPACE"], scanner_rel
               )

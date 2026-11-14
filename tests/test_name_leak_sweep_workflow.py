@@ -145,21 +145,37 @@ _REAL_SHAPED_SCANNER = (
     'print("scan-leaks: scanned 1, skipped-binary 0")\n'
     "sys.exit(0)\n"
 )
-# R3-2: a scanner that reports if the roster secret is visible in its
-# environment. The workflow itself sets NAME_LEAK_ROSTER, so the only way this
-# stays silent is an explicit `env=` without it.
+# R3-2 / R5-2: a scanner whose USAGE depends on what it can see. The workflow
+# probes a copy by running `<copy> --help` and accepts it only when the output
+# names `--roster-file`, so a copy that can see NAME_LEAK_ROSTER advertises a
+# usage WITHOUT the flag and is judged INCAPABLE. That makes the capability
+# check itself the observable for the probe call site.
+#
+# R5-2: the previous stub printed the normal usage unconditionally and sent its
+# marker to a stdout the probe discards, so dropping `env=_scanner_env()` from
+# the probe reddened nothing. A marker is not observable here; the verdict is.
 _ENV_PROBE_SCANNER = (
     "import os\n"
     "import sys\n"
     '_leaked = "NAME_LEAK_ROSTER" in os.environ\n'
     'if "--help" in sys.argv:\n'
-    '    print("usage: scan-leaks.py [--roster-file PATH] [--redact]")\n'
     "    if _leaked:\n"
-    '        print("PROBE_SAW_ROSTER")\n'
+    '        print("usage: scan-leaks.py")\n'
+    "    else:\n"
+    '        print("usage: scan-leaks.py [--roster-file PATH] [--redact]")\n'
     "    sys.exit(0)\n"
     "if _leaked:\n"
     '    print("SCAN_SAW_ROSTER")\n'
     "    sys.exit(3)\n"
+    'print("scan-leaks: scanned 1, skipped-binary 0")\n'
+    "sys.exit(0)\n"
+)
+# R5-1: a CAPABLE scanner — the probe accepts it — which prints a marker and
+# then reports a clean scan, so a run that reaches it via BOOTSTRAP looks GREEN.
+# It stands in for the contributor-controlled checkout copy the roster must
+# never be handed to.
+_CAPABLE_MARKER_SCANNER = _with_capability(
+    'print("CHECKOUT_SCANNER_RAN")\n'
     'print("scan-leaks: scanned 1, skipped-binary 0")\n'
     "sys.exit(0)\n"
 )
@@ -468,6 +484,33 @@ def _failing_tar_dir(tmp_path: Path) -> Path:
     return shim_dir
 
 
+def _failing_archive_git_dir(tmp_path: Path) -> Path:
+    """A PATH entry whose `git` fails `archive` and delegates EVERY other
+    subcommand to the real git.
+
+    Mirrors `_failing_tar_dir`, but for the OTHER arm of `_materialise_from`:
+    that one leaves `git archive` succeeding and breaks only `tar`, this one
+    breaks the archive itself. Delegation is load-bearing — `rev-parse`,
+    `cat-file`, `show` and `fetch` must keep working or the run would fail at
+    the resolution guard instead of at the arm under test.
+    """
+    real_git = shutil.which("git")
+    assert real_git is not None, "git is required for this fixture"
+    shim_dir = tmp_path / "failing-git-archive"
+    shim_dir.mkdir()
+    git_shim = shim_dir / "git"
+    git_shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "archive" ]; then\n'
+        "    exit 1\n"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    git_shim.chmod(0o755)
+    return shim_dir
+
+
 def _run_sweep(
     work: Path,
     base: str,
@@ -647,25 +690,22 @@ def test_an_extraction_failure_is_not_reported_as_a_tree_without_a_scanner(
     """R4-1: `_materialise_from` returning None means one of TWO different
     things, and they must not share a message.
 
-    Case 1 (this cell): the extraction FAILED — `git archive` or `tar` exited
-    nonzero — on a ref that RESOLVES (the resolution guard ran first, and
-    `git archive` succeeds here; only the PATH `tar` is made to exit 1). That
-    is a defect in this clone or the runner, never evidence about the tree.
+    Case 1 (this cell): the extraction FAILED — `tar` exited nonzero — on a
+    ref that RESOLVES (the resolution guard ran first, and `git archive`
+    succeeds here; only the PATH `tar` is made to exit 1). That is a defect in
+    this clone or the runner, never evidence about the tree.
 
-    Case 2 (the ``*_has_none`` cells): the extraction succeeded and the tree
+    Case 2 (the chain cells above): the extraction succeeded and the tree
     genuinely has no scanner — the benign "this ref has no scanner" diagnosis.
 
-    The chain still falls through in both cases (behaviour unchanged). With the
-    checkout's copy removed as well, the run reaches the final fail-closed
-    message, which is where the per-ref ``lacking`` diagnoses are printed — so
-    the "is not reported as ``<ref> has no <scanner>``" half of the assertion
-    is about real output, not an absent string.
+    R5-1 moved where this lands: an extraction failure now fails closed BEFORE
+    the checkout/BOOTSTRAP link, so the run never reaches the final
+    "no copy ... with --roster-file" message. The distinction asserted here is
+    that the extraction message is its own, never the benign one, and that the
+    outcome is the fail-closed exit.
     """
     work, base, _g = sweep_repo
     failing_tar = _failing_tar_dir(tmp_path)
-    # Fall through past the protected links to the final fail-closed message,
-    # where each link's diagnosis is printed.
-    (work / "src" / "engram" / "tools" / "scan-leaks.py").unlink()
     proc, out = _run_sweep(work, base, tmp_path, extra_path=failing_tar)
 
     # The failure is not the benign diagnosis, for either protected ref.
@@ -673,30 +713,93 @@ def test_an_extraction_failure_is_not_reported_as_a_tree_without_a_scanner(
     assert "origin/dev has no src/engram/tools/scan-leaks.py" not in out, out
     # It says what actually happened, and names the ref.
     assert f"extracting the tree at {base} failed" in out, out
+    assert (
+        "extracting the tree at origin/dev failed (tar extraction of "
+        "origin/dev exited 1)" in out
+    ), out
     assert "this is an extraction/runner failure" in out, out
-    # Behaviour still falls through, and the fall-through is visible: the
-    # final fail-closed message prints, and the checkout's absence is its own
-    # distinct diagnosis.
+    # R5-1: fail closed before the checkout/BOOTSTRAP link, never through it.
     assert proc.returncode != 0, out
-    assert (
-        "no copy of src/engram/tools/scan-leaks.py with --roster-file"
-        in out
-    ), out
-    assert (
-        "the pull request checkout has no src/engram/tools/scan-leaks.py" in out
-    ), out
+    assert "Failing closed before any scan" in out, out
+    assert "BOOTSTRAP" not in out, out
+
+
+def test_extraction_failure_on_a_protected_ref_fails_closed_before_bootstrap(
+    sweep_repo, tmp_path
+):
+    """R5-1 (the blocker): when BOTH protected links fail to EXTRACT, the run
+    must fail closed BEFORE the checkout/BOOTSTRAP link.
+
+    `git archive` is made to fail for every ref, and the checkout carries a
+    CAPABLE scanner that prints a marker and then reports a clean scan — the
+    contributor-controlled copy, which the old chain ran with
+    `--roster-file <path>` and a GREEN job. Here the run must exit nonzero,
+    never print BOOTSTRAP, and never run the marker.
+    """
+    work, base, _g = sweep_repo
+    (work / "src" / "engram" / "tools" / "scan-leaks.py").write_text(
+        _CAPABLE_MARKER_SCANNER, encoding="utf-8"
+    )
+    failing_git = _failing_archive_git_dir(tmp_path)
+    proc, out = _run_sweep(work, base, tmp_path, extra_path=failing_git)
+
+    # The loud diagnosis names each ref and the extraction failure it hit.
+    assert f"extracting the tree at {base} failed" in out, out
+    assert "extracting the tree at origin/dev failed" in out, out
+    assert "Failing closed before any scan" in out, out
+    # The security property: the checkout link is never taken, so the
+    # contributor's scanner never sees `--roster-file`.
+    assert proc.returncode != 0, out
+    assert "BOOTSTRAP" not in out, out
+    assert "CHECKOUT_SCANNER_RAN" not in out, out
+
+
+def test_the_git_archive_failure_arm_is_exercised_and_fails_closed(
+    sweep_repo, tmp_path
+):
+    """R5-3: the `archive.returncode != 0` arm of `_materialise_from` had no
+    cell — making it dead left every test green (open finding 1).
+
+    The `git` shim fails `archive` and delegates every other subcommand, so the
+    resolution guard, the base-commit read of `tools/name_leak_gate.py` and the
+    fetch all still work; only the extraction fails, and it fails at the
+    `git archive` step rather than at `tar` (which `_failing_tar_dir` covers).
+    With R5-1 the run then fails closed instead of reaching the checkout's
+    capable scanner.
+    """
+    work, base, _g = sweep_repo
+    failing_git = _failing_archive_git_dir(tmp_path)
+    proc, out = _run_sweep(work, base, tmp_path, extra_path=failing_git)
+
+    # Named arm, not the tar arm: the message is `git archive <ref> exited 1`.
+    assert f"git archive {base} exited 1" in out, out
+    assert "git archive origin/dev exited 1" in out, out
+    assert "Failing closed before any scan" in out, out
+    assert proc.returncode != 0, out
+    assert "BOOTSTRAP" not in out, out
 
 
 def test_the_probe_and_scan_do_not_inherit_the_roster_secret(sweep_repo, tmp_path):
-    """R3-2: the roster reaches the scanner through --roster-file. The
+    """R3-2 / R5-2: the roster reaches the scanner through --roster-file. The
     environment copy is a second path to the secret — the one a
     contributor-controlled copy would read — so the `--help` probe and the scan
-    both run with NAME_LEAK_ROSTER removed."""
+    both run with NAME_LEAK_ROSTER removed.
+
+    The stub's USAGE depends on whether it can see the secret, so the probe's
+    verdict is the observable at the probe call site: a leak makes the base
+    copy read as INCAPABLE and the chain falls to `origin/dev`, which is why
+    the source assertion below reddens when `env=_scanner_env()` is dropped
+    from the probe. (A marker printed by the probe could not: its stdout is
+    discarded.) At the scan call site a leak is directly visible — the stub
+    prints SCAN_SAW_ROSTER and exits 3.
+    """
     work, _base, g = sweep_repo
     base = _commit_scanner(work, g, _ENV_PROBE_SCANNER)
     proc, out = _run_sweep(work, base, tmp_path)
     assert proc.returncode == 0, out
-    assert "PROBE_SAW_ROSTER" not in out, out
+    # The probe saw no secret, so the base copy qualified and supplied the
+    # scanner.
+    assert f"scanner read from {base}" in out, out
     assert "SCAN_SAW_ROSTER" not in out, out
 
 
