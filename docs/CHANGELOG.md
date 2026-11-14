@@ -33,6 +33,11 @@ with an `-alpha` suffix during the alpha phase.
   removed. (#4358)
 
 ### Fixed
+- Summary and keyword rewrites now refresh the complete canonical embedding,
+  including identical-input retries. Failed refreshes retain both old vector
+  stores and report persisted per-node debt through the write result and
+  `engram_diagnose`. This prevents new silent drift; existing stale vectors still
+  need the separately reviewed, explicit owner repair. (engram#4651, slice 1)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
