@@ -620,6 +620,51 @@ def test_c15_replayed_files_are_private(dirs, tmp_path):
     assert stat.S_IMODE((tmp_path / "out/p/q").stat().st_mode) == 0o700
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_c15_intermediate_folders_are_private_on_archive(dirs, tmp_path):
+    """The archive folder's missing PARENTS are 0o700 too, not only the leaf (permissive umask)."""
+    src, _ = dirs
+    arc = tmp_path / "fresh" / "home" / "archive"
+    _put(src, "p/a.jsonl", b"aaa\n")
+    old = os.umask(0o022)
+    try:
+        at.archive_run(src, arc)
+    finally:
+        os.umask(old)
+    for d in (tmp_path / "fresh", tmp_path / "fresh" / "home", arc):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_c15_intermediate_folders_are_private_on_replay(dirs, tmp_path):
+    """Replay: dest (created by the tool) and every folder between it and the file are 0o700."""
+    src, arc = dirs
+    _put(src, "p/q/f.jsonl", b"aaa\n")
+    at.archive_run(src, arc)
+    dest = tmp_path / "fresh" / "out"
+    old = os.umask(0o022)
+    try:
+        at.replay(arc, dest)
+    finally:
+        os.umask(old)
+    for d in (tmp_path / "fresh", dest, dest / "p", dest / "p" / "q"):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
+
+
+def test_replay_never_overwrites_an_existing_file(dirs, tmp_path):
+    """replay() itself refuses (the CLI's emptiness check is a second, separate guard)."""
+    src, arc = dirs
+    _put(src, "p/a.jsonl", b"archived\n")
+    at.archive_run(src, arc)
+    dest = tmp_path / "out"
+    (dest / "p").mkdir(parents=True)
+    existing = dest / "p" / "a.jsonl"
+    existing.write_bytes(b"precious\n")
+    with pytest.raises(at.ArchiveError, match="p/a.jsonl"):
+        at.replay(arc, dest)
+    assert existing.read_bytes() == b"precious\n"
+
+
 # ------------------------------------------------------------- F1: unrepresentable paths
 
 def _backslash_tree(src: Path) -> None:
@@ -696,6 +741,17 @@ def test_symlinks_and_non_jsonl_are_out_of_scope(dirs):
     os.symlink(outside, src / "p/link.jsonl")
     r = at.archive_run(src, arc)
     assert [(s.path) for s in at.read_manifest(r.archive_path)] == ["p/a.jsonl"]
+
+
+def test_symlinked_directory_inside_source_is_out_of_scope(dirs):
+    src, arc = dirs
+    _put(src, "p/a.jsonl", b"real\n")
+    outside = src.parent / "outside_dir"
+    outside.mkdir()
+    (outside / "x.jsonl").write_bytes(b"outside\n")
+    os.symlink(outside, src / "p/linkdir")
+    r = at.archive_run(src, arc)
+    assert [s.path for s in at.read_manifest(r.archive_path)] == ["p/a.jsonl"]
 
 
 def test_a_transcript_deleted_after_archiving_is_not_an_error(dirs, tmp_path):
