@@ -244,8 +244,10 @@ def test_d3b_the_classification_table_is_pinned():
         ("nodes", "claim"): wo, ("nodes", "quoted_text"): wo, ("nodes", "id"): wo, ("nodes", "created_at"): wo,
         ("nodes", "type"): wo, ("nodes", "evidence_id"): wo,
         ("nodes", "recall_count"): mu, ("nodes", "recall_turn"): mu, ("nodes", "importance_score"): mu,
-        ("nodes", "utility_score"): mu, ("nodes", "memory_status"): mu, ("nodes", "metadata"): mu,
-        ("nodes", "status"): mu, ("nodes", "is_current"): mu, ("nodes", "superseded_by"): mu,
+        ("nodes", "utility_score"): mu, ("nodes", "memory_status"): mu, ("nodes", "confidence"): mu,
+        ("nodes", "metadata"): rd.KEYED,
+        ("nodes", "status"): rd.LIFECYCLE, ("nodes", "is_current"): rd.LIFECYCLE,
+        ("nodes", "superseded_by"): rd.LIFECYCLE, ("nodes", "resolved_by"): rd.LIFECYCLE,
         ("edges", "source_id"): wo, ("edges", "target_id"): wo, ("edges", "relation"): wo,
         ("edit_history", "details"): wo, ("diagnostic_history", "metrics"): mu, ("diagnostic_history", "timestamp"): wo, ("tool_timing", "duration_ms"): wo,
         ("focus_state", "active_set_name"): mu, ("sequences", "last_num"): mu,
@@ -574,3 +576,411 @@ def test_d10_no_embed_skips_the_model_and_says_so(home, tmp_path, monkeypatch, c
         assert conn.execute("SELECT COUNT(*) FROM nodes WHERE embedding IS NOT NULL").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------- D11 lifecycle columns: forward only (round 2)
+# status, is_current, superseded_by, resolved_by pass only in the FORWARD direction (restored = earlier state,
+# live = later), with the stamp rule: the live row's own record of WHEN must be after the dump time.
+
+T_DUMP = "2026-06-01T00:00:00+00:00"
+T_BEFORE = "2026-05-01T00:00:00+00:00"
+T_AFTER = "2026-07-01T00:00:00+00:00"
+
+
+def mark_dump(home: Path, iso: str = T_DUMP) -> None:
+    """Prepend the dump-time marker line the drill reads (a SQL comment, so the dump still restores)."""
+    p = home / "knowledge.sql"
+    p.write_text(f"-- engram-dumped-at: {iso}\n" + p.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def retract_sql(at):
+    meta = {"retracted": True, "error_type": "wrong", "retraction_reason": "r"}
+    if at:
+        meta["retracted_at"] = at
+    return ("UPDATE nodes SET status='retracted', is_current=0, metadata=? WHERE id='ob_0001'", (json.dumps(meta),))
+
+
+def lc(rep, col):
+    return rep.lifecycle.get(col, {})
+
+
+def test_d11_forward_retraction_stamped_after_the_dump_passes_and_is_counted(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, *retract_sql(T_AFTER))
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "status")["forward"] == 1 and lc(rep, "is_current")["forward"] == 1
+    assert lc(rep, "status").get("backward", 0) == 0
+
+
+def test_d11_forward_retraction_stamped_before_the_dump_fails(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, *retract_sql(T_BEFORE))
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 1
+    assert lc(rep, "status")["stamped_before_dump"] == 1
+    hit = [f for f in rep.failures if "ob_0001" in f and "column status" in f and "before the dump" in f]
+    assert hit and "nodes" in hit[0], rep.failures
+
+
+def test_d11_forward_with_no_stamp_is_reported_on_its_own_line_not_failed(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, *retract_sql(None))
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "status")["forward_unstamped"] == 1
+    assert "forward, unstamped" in rd.format_report(rep)
+
+
+def _dump_with(home, sql, params=()):
+    live_exec(home, sql, params)
+    dump(home)
+    mark_dump(home)
+
+
+def test_d11_backward_status_names_table_key_column(home, tmp_path):
+    _dump_with(home, *retract_sql(T_BEFORE))  # the dump already shows ob_0001 retracted
+    live_exec(home, "UPDATE nodes SET status='active', is_current=1 WHERE id='ob_0001'")  # live says active
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 1
+    assert lc(rep, "status")["backward"] == 1
+    hit = [f for f in rep.failures if "nodes" in f and "ob_0001" in f and "column status" in f
+           and "retracted" in f and "active" in f]
+    assert hit, rep.failures
+
+
+def test_d11_is_current_forward_passes_backward_fails(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, "UPDATE nodes SET is_current=0 WHERE id='ob_0002'")
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "is_current")["forward_unstamped"] == 1  # no edit_history row to stamp it
+    # backward: restored 0, live 1
+    home2 = make_home(tmp_path, "home2")
+    _dump_with(home2, "UPDATE nodes SET is_current=0 WHERE id='ob_0002'")
+    live_exec(home2, "UPDATE nodes SET is_current=1 WHERE id='ob_0002'")
+    rep2 = drill(home2, tmp_path / "scratch2")
+    assert rep2.exit_code == 1
+    assert any("ob_0002" in f and "column is_current" in f for f in rep2.failures), rep2.failures
+    assert lc(rep2, "is_current")["backward"] == 1
+
+
+def test_d11_superseded_by_null_to_value_forward_value_to_null_backward_value_to_value_fails(tmp_path):
+    h1 = make_home(tmp_path, "h1")
+    mark_dump(h1)
+    live_exec(h1, "UPDATE nodes SET is_current=0, superseded_by='ob_0003' WHERE id='ob_0001'")
+    rep = drill(h1, tmp_path / "s1")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "superseded_by")["forward_unstamped"] == 1
+
+    h2 = make_home(tmp_path, "h2")
+    _dump_with(h2, "UPDATE nodes SET superseded_by='ob_0003' WHERE id='ob_0001'")
+    live_exec(h2, "UPDATE nodes SET superseded_by=NULL WHERE id='ob_0001'")
+    rep = drill(h2, tmp_path / "s2")
+    assert rep.exit_code == 1 and lc(rep, "superseded_by")["backward"] == 1
+    assert any("ob_0001" in f and "column superseded_by" in f for f in rep.failures)
+
+    h3 = make_home(tmp_path, "h3")
+    _dump_with(h3, "UPDATE nodes SET superseded_by='ob_0002' WHERE id='ob_0001'")
+    live_exec(h3, "UPDATE nodes SET superseded_by='ob_0003' WHERE id='ob_0001'")
+    rep = drill(h3, tmp_path / "s3")
+    assert rep.exit_code == 1
+    assert any("ob_0001" in f and "column superseded_by" in f and "ob_0002" in f and "ob_0003" in f
+               for f in rep.failures), rep.failures
+
+
+def _edit(home, action, node, ts):
+    live_exec(home, "INSERT INTO edit_history(timestamp,turn,action,node_id,node_type,details) "
+                    "VALUES(?,?,?,?,?,?)", (ts, 1, action, node, "observation", "{}"))
+
+
+def test_d11_supersede_stamp_comes_from_edit_history_and_must_be_after_the_dump(tmp_path):
+    for name, ts, want in (("after", T_AFTER, 0), ("before", T_BEFORE, 1)):
+        h = make_home(tmp_path, "h" + name)
+        mark_dump(h)
+        live_exec(h, "UPDATE nodes SET is_current=0, superseded_by='ob_0003' WHERE id='ob_0001'")
+        _edit(h, "superseded", "ob_0001", ts)
+        rep = drill(h, tmp_path / ("s" + name))
+        assert rep.exit_code == want, (name, rep.failures)
+        assert lc(rep, "superseded_by").get("forward_unstamped", 0) == 0
+        if want:
+            assert lc(rep, "superseded_by")["stamped_before_dump"] == 1
+
+
+def test_d11_resolution_transitions_are_named_and_allowed(tmp_path):
+    # the code paths that move status/resolved_by backward are NAMED (engram_core _recompute_resolution_target
+    # reopen; _resolve_impl): resolved -> open with resolved_by -> NULL passes and is listed with its reason.
+    h = make_home(tmp_path, "h")
+    _dump_with(h, "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'")
+    live_exec(h, "UPDATE nodes SET status='open', resolved_by=NULL WHERE id='ob_0001'")
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 0, rep.failures
+    assert "resolved -> open" in rep.lifecycle_transitions
+    assert "_recompute_resolution_target" in rep.lifecycle_transitions["resolved -> open"]["reason"]
+    assert lc(rep, "status")["allowed_transition"] == 1 and lc(rep, "resolved_by")["allowed_transition"] == 1
+    assert "resolved -> open" in rd.format_report(rep)
+
+
+def test_d11_resolved_by_cleared_while_status_is_not_open_fails(tmp_path):
+    h = make_home(tmp_path, "h")
+    _dump_with(h, "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'")
+    live_exec(h, "UPDATE nodes SET status='resolved', resolved_by=NULL WHERE id='ob_0001'")
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 1
+    assert any("ob_0001" in f and "column resolved_by" in f for f in rep.failures), rep.failures
+
+
+def test_d11_resolved_by_null_to_value_is_forward_and_unlisted_status_pairs_fail(tmp_path):
+    h = make_home(tmp_path, "h")
+    mark_dump(h)
+    live_exec(h, "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'")
+    rep = drill(h, tmp_path / "s")
+    # restored 'active' -> live 'resolved' is not a pair any code path writes: fails loud
+    assert rep.exit_code == 1
+    assert lc(rep, "resolved_by")["forward_unstamped"] == 1
+    assert any("column status" in f and "'active'" in f and "'resolved'" in f for f in rep.failures)
+
+
+def test_d11_status_task_family_transitions_pass(tmp_path):
+    h = make_home(tmp_path, "h")
+    _dump_with(h, "UPDATE nodes SET status='planned' WHERE id='ob_0001'")
+    live_exec(h, "UPDATE nodes SET status='done' WHERE id='ob_0001'")
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 0, rep.failures
+    assert "planned -> done" in rep.lifecycle_transitions
+
+
+# dump_time_source: the dump's own marker, then the commit time of knowledge.sql, then the file mtime
+
+def test_d11_dump_time_source_marker(home, tmp_path):
+    mark_dump(home, T_DUMP)
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.dump_time_source == "dump" and rep.dump_time.startswith("2026-06-01T00:00:00")
+    assert "dump_time_source" in rd.format_report(rep)
+
+
+def test_d11_dump_time_source_git_commit(home, tmp_path):
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+           "GIT_COMMITTER_DATE": "2026-03-04T05:06:07+00:00", "GIT_AUTHOR_DATE": "2026-03-04T05:06:07+00:00"}
+    for args in (["init", "-q"], ["add", "knowledge.sql"], ["commit", "-q", "-m", "dump"]):
+        subprocess.run(["git", "-C", str(home), *args], check=True, capture_output=True, env=env)
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.dump_time_source == "git-commit"
+    assert rep.dump_time.startswith("2026-03-04T05:06:07")
+    rep2 = drill(home, tmp_path / "scratch2", from_git=True)
+    assert rep2.dump_time_source == "git-commit" and rep2.dump_time.startswith("2026-03-04T05:06:07")
+
+
+def test_d11_dump_time_source_mtime_fallback(home, tmp_path):
+    os.utime(home / "knowledge.sql", (1_700_000_000, 1_700_000_000))
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.dump_time_source == "file-mtime"
+    assert rep.dump_time.startswith("2023-11-14T22:13:20")
+
+
+def test_d11_a_mutable_column_still_only_reported(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, "UPDATE nodes SET confidence = 0.1 WHERE id = 'ob_0001'")
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 0, rep.failures
+    assert rep.mutable_diffs.get("nodes.confidence") == 1
+
+
+# ---------------------------------------------------------------- D12 nodes.metadata key by key
+
+def _meta_both(home, dump_meta, live_meta, nid="ob_0001"):
+    live_exec(home, "UPDATE nodes SET metadata=? WHERE id=?", (json.dumps(dump_meta), nid))
+    dump(home)
+    mark_dump(home)
+    live_exec(home, "UPDATE nodes SET metadata=? WHERE id=?", (json.dumps(live_meta), nid))
+
+
+def test_d12_a_changed_write_once_metadata_key_fails_naming_the_key(home, tmp_path):
+    _meta_both(home, {"reasoning_type": "deductive_modus_ponens"}, {"reasoning_type": "abductive_best_explanation"})
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 1
+    assert any("nodes" in f and "ob_0001" in f and "column metadata" in f and "reasoning_type" in f
+               for f in rep.failures), rep.failures
+
+
+@pytest.mark.parametrize("key", ["reasoning_class", "warrant", "built_on_contested", "content_hash", "git_sha",
+                                 "source_class", "quote_verified"])
+def test_d12_every_write_once_key_is_pinned(key):
+    assert key in rd.WRITE_ONCE_METADATA_KEYS
+
+
+def test_d12_a_changed_mutable_metadata_key_is_reported_not_failed(home, tmp_path):
+    _meta_both(home, {"quote_history": []}, {"quote_history": [{"move": "x"}]})
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 0, rep.failures
+    assert rep.metadata_mutable_diffs == {"quote_history": 1}
+
+
+def test_d12_an_unknown_metadata_key_is_listed_and_a_difference_on_it_fails(home, tmp_path):
+    _meta_both(home, {"made_up_key_zz": 1}, {"made_up_key_zz": 2})
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 1
+    assert "made_up_key_zz" in rep.metadata_unknown
+    assert any("ob_0001" in f and "made_up_key_zz" in f for f in rep.failures), rep.failures
+    assert "made_up_key_zz" in rd.format_report(rep)
+
+
+def test_d12_an_unknown_key_is_listed_even_when_nothing_differs(home, tmp_path):
+    _meta_both(home, {"made_up_key_zz": 1}, {"made_up_key_zz": 1})
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 0, rep.failures
+    assert rep.metadata_unknown == {"made_up_key_zz": 1}
+
+
+def test_d12_the_retraction_stamp_keys_follow_the_lifecycle_stamp_rule(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, *retract_sql(T_AFTER))
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 0, rep.failures
+    assert "retracted_at" not in rep.metadata_unknown and "retracted" not in rep.metadata_unknown
+    assert rep.metadata_mutable_diffs == {}
+
+
+def test_d12_a_stamp_key_present_in_the_dump_but_changed_live_fails(home, tmp_path):
+    _meta_both(home, {"retracted_at": T_BEFORE}, {"retracted_at": T_AFTER})
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 1
+    assert any("ob_0001" in f and "retracted_at" in f for f in rep.failures), rep.failures
+
+
+def test_d12_invalid_json_on_either_side_fails_naming_the_node(home, tmp_path):
+    conn = sqlite3.connect(home / "knowledge.db")  # the server's own trigger refuses invalid JSON: drop it (live only)
+    for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND sql LIKE '%valid JSON%'").fetchall():
+        conn.execute(f'DROP TRIGGER "{name}"')
+    conn.execute("UPDATE nodes SET metadata='{not json' WHERE id='ob_0002'")
+    conn.commit()
+    conn.close()
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 1
+    assert any("ob_0002" in f and "metadata" in f and "JSON" in f for f in rep.failures), rep.failures
+
+
+# ---------------------------------------------------------------- D13 re-embed contract
+
+def _named(model, dim_extra=0):
+    def fn(texts, scratch=None):
+        out = rd.EmbedVectors([_stub_vec(t) + [0.0] * dim_extra for t in texts])
+        out.model = model
+        return out
+    return fn
+
+
+def test_d13_model_name_differs_between_passes_is_a_failure(home, tmp_path, monkeypatch):
+    calls = []
+
+    def fn(texts, scratch=None):
+        calls.append(1)
+        return _named("model-a" if len(calls) == 1 else "model-b")(texts)
+    monkeypatch.setattr(rd, "_embed_texts", fn)
+    rep = drill(home, tmp_path / "scratch", sample=2)
+    assert rep.exit_code == 1
+    assert any("model" in f and "model-a" in f and "model-b" in f for f in rep.failures), rep.failures
+
+
+def test_d13_dimension_differs_between_passes_is_a_failure(home, tmp_path, monkeypatch):
+    calls = []
+
+    def fn(texts, scratch=None):
+        calls.append(1)
+        return _named("m", dim_extra=0 if len(calls) == 1 else 2)(texts)
+    monkeypatch.setattr(rd, "_embed_texts", fn)
+    rep = drill(home, tmp_path / "scratch", sample=2)
+    assert rep.exit_code == 1
+    assert any("dimension" in f for f in rep.failures), rep.failures
+
+
+def test_d13_the_largest_difference_and_the_tolerance_unit_are_reported(home, tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def fn(texts, scratch=None):
+        calls.append(1)
+        v = _named("m")(texts)
+        if len(calls) > 1:
+            v2 = rd.EmbedVectors([[x + 4e-6 for x in vec] for vec in v])
+            v2.model = "m"
+            return v2
+        return v
+    monkeypatch.setattr(rd, "_embed_texts", fn)
+    rc = rd.main(["--home", str(home), "--scratch", str(tmp_path / "scratch"), "--source", str(tmp_path / "n"),
+                  "--json", "--sample", "3"])
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0, data["failures"]
+    assert data["vector_tolerance"]["value"] == 1e-05
+    assert "element" in data["vector_tolerance"]["unit"] and "absolute" in data["vector_tolerance"]["unit"]
+    assert 3e-6 < data["vector_max_diff"] < 5e-6
+    assert data["embedding_model"] == "m"
+
+
+def test_d13_an_unnamed_model_is_not_a_match():
+    assert rd.EmbedVectors([[0.0]]).model is None
+
+
+# ---------------------------------------------------------------- D14 the live-home open (R1) and sqlite errors (R3)
+
+def _listing(home):
+    return sorted(p.name for p in home.iterdir())
+
+
+def test_d14_wal_without_shm_is_refused_and_nothing_is_created(home, tmp_path):
+    (home / "knowledge.db-wal").write_bytes(b"")
+    before = tree_state(home)
+    listing = _listing(home)
+    with pytest.raises(rd.DrillRefused, match="has a -wal file but no -shm file: refusing to open it read-only"):
+        rd.run_drill(home=home, scratch=tmp_path / "scratch", source=home / "x")
+    assert tree_state(home) == before
+    assert _listing(home) == listing  # no -shm appeared
+    assert not (tmp_path / "scratch").exists()
+    assert rd.main(["--home", str(home), "--scratch", str(tmp_path / "s2")]) == 2
+    assert _listing(home) == listing
+
+
+def test_d14_shm_without_wal_is_refused_and_nothing_is_created(home, tmp_path):
+    (home / "knowledge.db-shm").write_bytes(b"\0" * 32768)
+    before = tree_state(home)
+    with pytest.raises(rd.DrillRefused, match="has a -shm file but no -wal file"):
+        rd.run_drill(home=home, scratch=tmp_path / "scratch", source=home / "x")
+    assert tree_state(home) == before
+
+
+def test_d14_a_sqlite_error_on_the_live_side_is_exit_2_without_a_traceback(home, tmp_path, monkeypatch, capsys):
+    real = rd._columns
+
+    def flaky(conn, table):
+        files = [r[2] for r in conn.execute("PRAGMA database_list").fetchall()]
+        if table == "edges" and not any("scratch" in f for f in files):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return real(conn, table)
+    monkeypatch.setattr(rd, "_columns", flaky)
+    rc = rd.main(["--home", str(home), "--scratch", str(tmp_path / "scratch"), "--source", str(tmp_path / "n")])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "Traceback" not in err and "edges" in err and "malformed" in err
+
+
+# ---------------------------------------------------------------- D15 the child environment (R4)
+
+def test_d15_the_child_env_is_an_allowlist_and_offline_flags_are_for_the_embed_step_only(monkeypatch, tmp_path):
+    for k, v in {"XDG_CACHE_HOME": "/x", "HF_TOKEN": "t", "HF_ENDPOINT": "e", "TRANSFORMERS_CACHE": "/t",
+                 "ENGRAMD_FOO": "1", "ENGRAM_HOME": "/live", "CLAUDE_PLUGIN_ROOT": "/p", "SOME_SECRET": "s",
+                 "LC_ALL": "C", "TZ": "UTC", "HF_HOME": "/hf"}.items():
+        monkeypatch.setenv(k, v)
+    scratch = str(tmp_path / "s")
+    embed = rd._scratch_env(scratch, embedder_off=False)
+    connect = rd._scratch_env(scratch, embedder_off=True)
+    for env in (embed, connect):
+        assert env["ENGRAM_HOME"] == scratch and env["HOME"] == scratch
+        for bad in ("XDG_CACHE_HOME", "HF_TOKEN", "HF_ENDPOINT", "TRANSFORMERS_CACHE", "ENGRAMD_FOO",
+                    "CLAUDE_PLUGIN_ROOT", "SOME_SECRET"):
+            assert bad not in env, bad
+        assert env["LC_ALL"] == "C" and env["TZ"] == "UTC"
+    assert embed["HF_HOME"] == "/hf"
+    assert embed["HF_HUB_OFFLINE"] == "1" and embed["TRANSFORMERS_OFFLINE"] == "1"
+    for k in ("HF_HOME", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        assert k not in connect, k
+    assert connect["ENGRAM_NO_EMBEDDINGS"] == "1" and "ENGRAM_NO_EMBEDDINGS" not in embed

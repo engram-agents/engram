@@ -18,9 +18,20 @@ What it does, in a SCRATCH directory (never in the live home):
      the output LISTS what was not compared. Each column is classified from the schema:
        write-once   claim text, quotes, ids, types, created_at, edge endpoints, log rows ...
                     A difference is a FAILURE, naming table, key and column.
-       mutable      recall counts, last-recalled times, importance and utility scores, lifecycle
-                    state, metadata and similar bookkeeping. A difference is REPORTED with
-                    per-column counts, never failed: a working seat changes them after the dump.
+       mutable      recall counts, last-recalled times, importance and utility scores, confidence and
+                    similar bookkeeping. A difference is REPORTED with per-column counts, never failed:
+                    a working seat changes them after the dump.
+       lifecycle    nodes.status, is_current, superseded_by, resolved_by. A difference passes only in the
+                    FORWARD direction (the dump shows the earlier state, live the later), and where the
+                    live row records WHEN it happened that time must be after the dump time. Every write
+                    to these columns in the shipped code was listed (see ``_check_status`` and
+                    ``_check_resolved_by``); the transitions that move a node BACK (a reopened resolution,
+                    a re-pointed resolver, task status moves) are named in ``_STATUS_TRANSITIONS`` and
+                    ``_RESOLVED_BY_RULES`` with the code path as the reason.
+       keyed        nodes.metadata, compared as parsed JSON KEY BY KEY (``_compare_node_metadata``):
+                    write-once keys fail on a difference, the retraction stamp keys follow the lifecycle
+                    rule, named mutable keys are reported, and any other key is UNKNOWN: listed, and a
+                    difference on it fails.
        unclassified a column this tool has no ruling for: treated as write-once, and listed, so
                     the design seat can rule on it.
      Rows written after the dump (in live, not in the dump) are REPORTED (``live_only``).
@@ -33,36 +44,49 @@ What it does, in a SCRATCH directory (never in the live home):
      connect itself never starts a background re-embed.
   5. Re-embeds every node that has embedding text (``_embed_texts``, the seam tests replace) and
      checks the restored copy: no node lacks a vector; a SAMPLE is embedded a second time and
-     must equal the restored vectors exactly. A live vector that differs from the restored one
+     must equal the restored vectors within 1e-5 per element (``vector_tolerance``; the real model is
+     not bit-repeatable across batch shapes). The model identity check is EXACT: the same model name
+     and the same vector dimension in both passes, or the drill fails. The report carries the largest
+     element difference seen (``vector_max_diff``). A live vector that differs from the restored one
      (embedded before its summary existed, and so on) is counted in ``live_vectors_stale``, never
-     failed: the live vectors are not the reference. "Differs" means any element off by more than
-     1e-5, so float noise between machines is not read as staleness.
+     failed: the live vectors are not the reference.
   6. Replays the daily transcript archive (``archive_transcripts.replay``) into
      ``<scratch>/transcripts`` and compares each replayed file with the live transcript up to the
      archived offset (sha256 of the first N bytes). Bytes past the offset are reported
      (``transcript_live_only_bytes``), not failed.
 
-The live graph is only READ. The live database is opened read-only (``mode=ro``); when it has no
-``-wal``/``-shm`` side files yet, ``immutable=1`` is used instead, because a read-only open of a
-quiescent WAL-mode database would itself create those files. The drill records the size and mtime of
+The drill never creates, modifies or deletes a file in the live home. The live database is opened
+read-only (``mode=ro``) when both ``-wal`` and ``-shm`` exist, and with ``immutable=1`` when neither does
+(a read-only open of a quiescent WAL-mode database would itself create them). When exactly one of the two
+exists the drill REFUSES (exit 2): measured, a read-only open of ``-wal`` without ``-shm`` creates ``-shm``,
+and of ``-shm`` without ``-wal`` creates ``-wal`` and reads stale data. The drill records the size and mtime of
 the live db, its side files and ``sessions/`` before and after. With ``--assert-quiescent`` (a
 fixture, or a seat that is stopped) any change fails the drill and the live db's sha256 must be
 unchanged; on a working seat the changes are listed as "observed during drill, not attributed".
 
 Exit codes: 0 pass; 1 the drill FAILED (a comparison failed); 2 it could not run (no dump, an
-unreadable db, a scratch that is not empty or lies in the live home). Nothing is written on exit 2.
+unreadable db, a live-side sqlite error, a scratch that is not empty or lies in the live home). Nothing is
+written to the live home on any exit.
 
-Cost: about two minutes on a real graph, almost all of it the re-embed; run on demand, not per sleep.
+Subprocess environment: an ALLOWLIST (``_scratch_env``), not a filter. The re-embed subprocess gets HF_HOME
+(the existing model cache), HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1, so it never downloads. Measured on one
+full run with the model cached (28.65 s): no file inside HF_HOME was created or modified. Anything it could
+still write is limited to HF_HOME (a library's own bookkeeping); nothing is written under the live ENGRAM home.
+
+Cost: 26.8 s on one seat with the model cached (a first run that has to load the model takes longer),
+almost all of it the re-embed; run on demand, not per sleep.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import hashlib
 import importlib.util
 import json
 import os
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -99,6 +123,9 @@ STALE_TOLERANCE = 1e-5
 # the same text is encoded in a different batch (measured on the live seat: 1 of a 50-node sample differed
 # from the first pass), so "exact" means: no element differs by more than this.
 SAMPLE_TOLERANCE = 1e-5
+# The unit of the tolerance, as `_max_abs_diff` computes it: the largest ABSOLUTE difference of any single
+# element (not a cosine distance, not a norm).
+VECTOR_TOLERANCE = {"value": SAMPLE_TOLERANCE, "unit": "maximum absolute difference per vector element"}
 _MAX_FAIL_LINES_PER_TABLE = 20
 _MARK = "@@DRILL@@"
 _CONNECT_TIMEOUT_S = 600
@@ -130,8 +157,7 @@ _WRITE_ONCE = {
 }
 _MUTABLE = {
     "nodes": (
-        "status", "resolved_by", "confidence", "confidence_history", "superseded_by", "is_current",
-        "metadata", "importance_base", "importance_score", "recall_turn", "recall_count",
+        "confidence", "confidence_history", "importance_base", "importance_score", "recall_turn", "recall_count",
         "memory_status", "utility_score", "last_assessed_turn", "last_assessed_at", "focused_at",
         "focus_reason", "recall_summary", "recall_keywords", "needs_tightening", "summary_missing",
     ),
@@ -147,13 +173,22 @@ _MUTABLE_TABLES = ("focus_state", "embedding_restore_state")
 
 WRITE_ONCE = "write_once"
 MUTABLE = "mutable"
+LIFECYCLE = "lifecycle"
+KEYED = "keyed"
 UNCLASSIFIED = "unclassified"
+
+_LIFECYCLE = {"nodes": ("status", "is_current", "superseded_by", "resolved_by")}
+_KEYED = {"nodes": ("metadata",)}
 
 
 def classify(table: str, column: str) -> str:
-    """write_once | mutable | unclassified (the last is TREATED as write-once by the comparison)."""
+    """write_once | mutable | lifecycle | keyed | unclassified (the last is TREATED as write-once)."""
     if table in _WRITE_ONCE_TABLES:
         return WRITE_ONCE
+    if column in _LIFECYCLE.get(table, ()):
+        return LIFECYCLE
+    if column in _KEYED.get(table, ()):
+        return KEYED
     if column in _WRITE_ONCE.get(table, ()):
         return WRITE_ONCE
     if column in _MUTABLE.get(table, ()) or table in _MUTABLE_TABLES:
@@ -174,6 +209,16 @@ class DrillReport:
     live_only: list = field(default_factory=list)  # node ids written after the dump
     live_only_counts: dict = field(default_factory=dict)  # table -> rows written after the dump
     mutable_diffs: dict = field(default_factory=dict)  # "table.column" -> rows that differ
+    # lifecycle columns: column -> {forward, forward_unstamped, backward, stamped_before_dump, allowed_transition}
+    lifecycle: dict = field(default_factory=dict)
+    lifecycle_transitions: dict = field(default_factory=dict)  # "a -> b" -> {count, reason}: the named moves
+    metadata_mutable_diffs: dict = field(default_factory=dict)  # metadata key -> rows that differ (reported)
+    metadata_unknown: dict = field(default_factory=dict)  # metadata key the classification does not know -> nodes
+    dump_time_source: str = ""  # "dump" | "git-commit" | "file-mtime"
+    dump_time: str = ""
+    vector_tolerance: dict = field(default_factory=lambda: dict(VECTOR_TOLERANCE))
+    vector_max_diff: float = 0.0  # the largest element difference seen between the two embedding passes
+    embedding_model: str = ""
     vectors_missing: list = field(default_factory=list)
     vectors_embedded: int = 0
     vector_sample_checked: int = 0
@@ -207,6 +252,312 @@ class DrillReport:
 
 def _fail(report: DrillReport, message: str) -> None:
     report.failures.append(message)
+
+
+# ------------------------------------------------------------------ lifecycle columns (forward only)
+#
+# Writes to nodes.status / is_current / superseded_by / resolved_by in the shipped tree (src/engram, searched
+# for every `UPDATE nodes` statement and every helper that builds one; there is no un-retract verb and no
+# migration or repair tool that resets them), with the direction of each transition:
+#   engram_revision.py  retract    (~4384, ~4546)  status X -> 'retracted', is_current 1 -> 0, metadata.retracted_at   FORWARD
+#   engram_revision.py  supersede  (~3624)         is_current 1 -> 0, superseded_by NULL -> new id                       FORWARD
+#   engram_cornerstone.py outgrow  (~515)          is_current 1 -> 0, superseded_by NULL -> new id                       FORWARD
+#   engram_core.py      _backfill_resolved_by (~4013)  resolved_by NULL -> resolver                                      FORWARD
+#   engram_core.py      _recompute_resolution_target (~4124/4128), run by retract / supersede / the startup
+#                       reconciler: status -> 'open' with resolved_by -> NULL when no live resolver remains (BACKWARD),
+#                       resolved_by A -> B and status resolved <-> partially_resolved when the best resolver changes
+#                       (SIDEWAYS)
+#   engram_revision.py  _resolve_impl (~3284) and its self-heal (~3223): status open/partially_resolved -> resolved /
+#                       partially_resolved / a prediction outcome, last writer wins between outcomes; resolved_by
+#                       NULL -> X or A -> B                                                    FORWARD and SIDEWAYS
+#   engram_tasks.py     engram_update_task (~543): task status planned/active/done/blocked, any order       SIDEWAYS
+#   tools/surgical.py  field_patch (~820): `status` is on its allowlist, arbitrary old -> new: an operator repair,
+#                       deliberately NOT allowed below (a restore that differs from live by a patch fails loud).
+# So "one way" holds for retraction and supersession, and does NOT hold for the resolution family or task status:
+# those moves are named below, keyed by the (restored, live) value pair, with the code path as the reason.
+
+_RESOLUTION_STATUSES = ("open", "partially_resolved", "resolved", "confirmed", "partially_confirmed", "refuted",
+                        "partially_refuted", "supported", "inconclusive")
+_TASK_STATUSES = ("planned", "active", "done", "blocked")
+_STATUS_TRANSITIONS = {}
+for _a in _RESOLUTION_STATUSES:
+    for _b in _RESOLUTION_STATUSES:
+        if _a != _b:
+            _STATUS_TRANSITIONS[(_a, _b)] = (
+                "resolution status moves with the live resolvers: engram_core._recompute_resolution_target "
+                "(reopen to 'open', threshold re-evaluation) and engram_revision._resolve_impl")
+for _a in _TASK_STATUSES:
+    for _b in _TASK_STATUSES:
+        if _a != _b:
+            _STATUS_TRANSITIONS[(_a, _b)] = "task status in any order: engram_tasks.engram_update_task"
+del _a, _b
+
+# resolved_by is a node id, so its rules are keyed by the SHAPE of the (restored, live) pair, each with a condition
+# on the live status that the writing code path also sets.
+_RESOLVED_BY_RULES = {
+    "value -> NULL": ("live status is 'open'", "engram_core._recompute_resolution_target reopen: "
+                      "no live resolver remains, status 'open', resolved_by NULL"),
+    "value -> other value": ("live status is a resolution status", "engram_core._recompute_resolution_target / "
+                             "engram_revision._resolve_impl self-heal: re-pointed to the best live resolver"),
+}
+
+_FWD, _FWD_UNSTAMPED, _BACK, _BEFORE, _ALLOWED = ("forward", "forward_unstamped", "backward",
+                                                    "stamped_before_dump", "allowed_transition")
+
+
+def _bump(report: DrillReport, column: str, what: str) -> None:
+    c = report.lifecycle.setdefault(column, {})
+    c[what] = c.get(what, 0) + 1
+
+
+def _parse_time(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        t = _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=_dt.timezone.utc)
+
+
+@dataclass
+class _Ctx:
+    """What the lifecycle checks need besides the two rows: the live connection (the stamp source) and the dump time."""
+    live: sqlite3.Connection
+    dump_time: object  # datetime | None
+    has_edit_history: bool = False
+    stamp_cache: dict = field(default_factory=dict)
+
+
+def _edit_stamp(ctx: _Ctx, node_id, actions: tuple):
+    """When the live db's own audit log says `actions` last happened to the node (edit_history is written by
+    the same code path as the change: engram_revision supersede/resolve, engram_core recompute)."""
+    if not ctx.has_edit_history:
+        return None
+    marks = ",".join("?" * len(actions))
+    row = ctx.live.execute(
+        f"SELECT timestamp FROM edit_history WHERE node_id = ? AND action IN ({marks}) ORDER BY id DESC LIMIT 1",
+        (node_id, *actions)).fetchone()
+    return _parse_time(row[0]) if row else None
+
+
+def _retract_stamp(live_meta: dict):
+    """engram_revision.py writes metadata.retracted_at on the retracted node itself (~4369 and, for a paired
+    prediction, ~4532). There is NO metadata stamp for supersede or resolve: those are read from edit_history."""
+    return _parse_time(live_meta.get("retracted_at"))
+
+
+def _judge_forward(ctx: _Ctx, report: DrillReport, column: str, stamp, desc: str) -> list:
+    """A forward difference: counted; failed only when its stamp is before the dump time."""
+    if stamp is None or ctx.dump_time is None:
+        _bump(report, column, _FWD_UNSTAMPED)
+        return []
+    if stamp < ctx.dump_time:
+        _bump(report, column, _BEFORE)
+        return [f"column {column}: {desc}: forward, but "
+                f"stamped {stamp.isoformat()}, before the dump time {ctx.dump_time.isoformat()} "
+                f"(the dump should already have had it)"]
+    _bump(report, column, _FWD)
+    return []
+
+
+def _check_status(ctx, report, rv, lv, live_meta) -> list:
+    if rv == lv:
+        return []
+    desc = f"restored {rv!r}, live {lv!r}"
+    if lv == "retracted":
+        return _judge_forward(ctx, report, "status", _retract_stamp(live_meta), desc)
+    if rv == "retracted":
+        _bump(report, "status", _BACK)
+        return [f"column status: {desc}: backward (a retraction in the dump is missing from live; "
+                f"no code path un-retracts a node)"]
+    reason = _STATUS_TRANSITIONS.get((rv, lv))
+    if reason:
+        _bump(report, "status", _ALLOWED)
+        t = report.lifecycle_transitions.setdefault(f"{rv} -> {lv}", {"count": 0, "reason": reason})
+        t["count"] += 1
+        return []
+    _bump(report, "status", _BACK)
+    return [f"column status: {desc}: not a transition any code path writes"]
+
+
+def _check_is_current(ctx, report, node_id, rv, lv, live_status, live_meta) -> list:
+    if rv == lv:
+        return []
+    desc = f"restored {rv!r}, live {lv!r}"
+    if rv == 1 and lv == 0:
+        if live_status == "retracted":
+            stamp = _retract_stamp(live_meta)
+        else:
+            stamp = _edit_stamp(ctx, node_id, ("superseded",))
+        return _judge_forward(ctx, report, "is_current", stamp, desc)
+    _bump(report, "is_current", _BACK)
+    return [f"column is_current: {desc}: backward" if (rv, lv) == (0, 1) else
+            f"column is_current: {desc}: not a transition any code path writes"]
+
+
+def _check_superseded_by(ctx, report, node_id, rv, lv) -> list:
+    if rv == lv:
+        return []
+    desc = f"restored {rv!r}, live {lv!r}"
+    if rv is None and lv is not None:
+        return _judge_forward(ctx, report, "superseded_by", _edit_stamp(ctx, node_id, ("superseded",)), desc)
+    _bump(report, "superseded_by", _BACK)
+    why = "backward (a supersession in the dump is missing from live)" if lv is None else \
+        "changed (a node is superseded once; no code path re-points it)"
+    return [f"column superseded_by: {desc}: {why}"]
+
+
+def _check_resolved_by(ctx, report, node_id, rv, lv, live_status) -> list:
+    if rv == lv:
+        return []
+    desc = f"restored {rv!r}, live {lv!r}"
+    if rv is None and lv is not None:
+        return _judge_forward(ctx, report, "resolved_by",
+                              _edit_stamp(ctx, node_id, ("resolved", "resolution_recomputed")), desc)
+    if lv is None:
+        shape, ok = "value -> NULL", live_status == "open"
+    else:
+        shape, ok = "value -> other value", live_status in _RESOLUTION_STATUSES
+    cond, reason = _RESOLVED_BY_RULES[shape]
+    if ok:
+        _bump(report, "resolved_by", _ALLOWED)
+        t = report.lifecycle_transitions.setdefault(f"resolved_by: {shape}", {"count": 0, "reason": reason})
+        t["count"] += 1
+        return []
+    _bump(report, "resolved_by", _BACK)
+    return [f"column resolved_by: {desc}: backward or changed, and not the named transition ({shape}: "
+            f"allowed only when {cond}; live status is {live_status!r})"]
+
+
+# ------------------------------------------------------------------ nodes.metadata, key by key
+#
+# One clearly named place to adjust the rulings (the design seat confirms the narrowing). Method: every
+# `UPDATE nodes SET metadata` statement in src/engram (17 sites) and every `meta[...] =` / `.pop(...)` /
+# `json_set` key it touches was read. Each writer reads the blob and changes only its own named keys, EXCEPT
+# tools/surgical.py metadata_patch (~734, an operator patch of any key: not allowed, a restore that differs
+# from live by a patch fails loud) and engram_core.py (~5003) which NULLs an invalid blob. No tool (requote,
+# supersede, retract, repair, the retype verb, which retypes EDGES only) rewrites a creation-time key below.
+
+LIFECYCLE_STAMP_METADATA_KEYS = {
+    # written when a node is withdrawn, by engram_revision.engram_retract (~4366-4375, and ~4526-4544 for a
+    # paired prediction retracted with its basis): absent in the dump and present live is FORWARD; `retracted_at`
+    # carries the stamp, the others ride with it.
+    "retracted": "engram_revision.py:4366", "error_type": "engram_revision.py:4367",
+    "retraction_reason": "engram_revision.py:4368", "retracted_at": "engram_revision.py:4369",
+    "initiation": "engram_revision.py:4371", "initiation_gate": "engram_revision.py:4373",
+    "initiation_ref": "engram_revision.py:4375", "retracted_via_basis_retraction": "engram_revision.py:4533",
+    "status_before_retraction": "engram_revision.py:4544",
+}
+
+# Written once, at node creation, and never rewritten by any tool found: a difference FAILS, naming the key.
+WRITE_ONCE_METADATA_KEYS = {
+    "reasoning_type": "engram_core.py:14097", "reasoning_class": "engram_core.py:14097",
+    "warrant": "engram_core.py:14111 (extra_meta, one call site)",
+    "built_on_contested": "engram_core.py:14109",
+    "built_on_stale": "retired writer (#2324, engram_core.py:14100 note); legacy stamps in old graphs",
+    "stale_by": "retired writer (#2013 cascade machine, server.py:7342); legacy", "tainted_by": "retired writer; legacy",
+    "stale_replacement": "retired writer (server.py:7342); legacy",
+    # found by the first real run (2026-11-14, 9 and 1 nodes): no code path in the shipped tree writes either one
+    # into nodes.metadata today, so they are legacy stamps
+    "role": "deprecated alias of `relation` (engram_trust.py:100/294, stored as relation): legacy person nodes only",
+    "supersede_reason": "no writer into node metadata in the shipped tree (the reason goes to the supersedes edge, "
+                        "engram_revision.py:3617, and edit_history): legacy, 1 prediction node",
+    "source_class": "engram_observation.py:2125", "quote_verified": "engram_observation.py:2125",
+    "git_sha": "engram_observation.py:2127", "content_hash": "engram_observation.py:2129",
+    "is_self_report": "engram_tasks.py:736", "epistemic_status": "engram_tasks.py:737",
+    "categorical_tag_disclaimer": "engram_tasks.py:740", "motivation": "engram_tasks.py:142",
+    "term": "engram_epistemic.py:374", "definition": "engram_epistemic.py:374",
+    "tag": "engram_cornerstone.py:158", "title": "engram_cornerstone.py:159",
+    "prior_frame": "engram_cornerstone.py:160", "new_frame": "engram_cornerstone.py:161",
+    "triggering_experience": "engram_cornerstone.py:162", "outgrew": "engram_cornerstone.py:367",
+    "scaffolding_nudge": "engram_epistemic.py:196 / 1246",
+    "name": "engram_trust.py:167", "relation": "engram_trust.py:173", "pronouns": "engram_trust.py:175",
+    "location_contact": "engram_trust.py:206", "birthday": "engram_trust.py:208", "lineage": "engram_trust.py:211",
+    "architecture": "engram_trust.py:213", "first_session_date": "engram_trust.py:215",
+}
+
+# Rewritten after creation by a named code path: a difference is REPORTED with a count, never failed.
+MUTABLE_METADATA_KEYS = {
+    "quote_history": "engram_observation.py:3174 (requote)",
+    "support_lost": "engram_core.py:11150/11159, engram_epistemic.py:1833",
+    "field_traces": "engram_epistemic.py:1632, engram_trust.py:450", "field_changed_flags": "engram_trust.py:547",
+    "aliases": "engram_trust.py:476", "special_moments": "engram_trust.py:687",
+    "special_moment_cursor": "engram_moment_cursor.py:80",
+    "model_provider": "engram_trust.py:925", "model_family": "engram_trust.py:926",
+    "model_version": "engram_trust.py:927", "is_self": "engram_revision.py:3715 (self-anchor transfer)",
+    "status_history": "engram_tasks.py:524", "scope": "engram_tasks.py:336",
+    "lifecycle_state": "engram_tasks.py:908/978", "deactivated_at": "engram_tasks.py:909",
+    "deactivation_reason": "engram_tasks.py:911", "reactivated_at": "engram_tasks.py:979",
+    "reactivation_reason": "engram_tasks.py:981",
+    "evidence_type": "engram_observation.py:2056 (set on the evidence node when first cited)",
+    "original_url": "engram_observation.py:2067",
+    "bypass_prose_check": "engram_epistemic.py:1659", "situation_pattern": "engram_epistemic.py:1651 (update_lesson)",
+    "prevention_type": "engram_epistemic.py:1651", "tripwire_priority": "engram_epistemic.py:1651",
+    "match_scope": "engram_epistemic.py:1651",
+}
+
+_ABSENT = object()
+
+
+def _parse_metadata(raw):
+    """(dict, error or None). NULL is an empty object; anything that is not a JSON object is an error."""
+    if raw is None:
+        return {}, None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        return {}, f"not valid JSON ({exc})"
+    if not isinstance(value, dict):
+        return {}, f"valid JSON but not an object ({type(value).__name__})"
+    return value, None
+
+
+def _note_unknown(report: DrillReport, keys) -> None:
+    for k in keys:
+        if k not in LIFECYCLE_STAMP_METADATA_KEYS and k not in WRITE_ONCE_METADATA_KEYS and k not in MUTABLE_METADATA_KEYS:
+            report.metadata_unknown[k] = report.metadata_unknown.get(k, 0) + 1
+
+
+def _scan_metadata_keys(report: DrillReport, node_id, raw) -> None:
+    """A row on one side only (written after the dump, or deleted): its keys are still listed."""
+    d, _ = _parse_metadata(raw)
+    _note_unknown(report, d)
+
+
+def _compare_node_metadata(ctx, report, node_id, rraw, lraw) -> list:
+    """nodes.metadata as parsed JSON, key by key. Returns failure fragments (without the row prefix)."""
+    r, rerr = _parse_metadata(rraw)
+    l, lerr = _parse_metadata(lraw)
+    out = []
+    for side, err in (("restored", rerr), ("live", lerr)):
+        if err:
+            out.append(f"column metadata: the {side} metadata of node {node_id} is {err}")
+    if rerr or lerr:
+        return out
+    keys = sorted(set(r) | set(l))
+    _note_unknown(report, keys)
+    for k in keys:
+        rv, lv = r.get(k, _ABSENT), l.get(k, _ABSENT)
+        if rv == lv:
+            continue
+        desc = f"restored {rv if rv is not _ABSENT else '(absent)'!r}, live {lv if lv is not _ABSENT else '(absent)'!r}"
+        if k in LIFECYCLE_STAMP_METADATA_KEYS:
+            if rv is _ABSENT:
+                if k == "retracted_at":
+                    out += _judge_forward(ctx, report, f"metadata.{k}", _parse_time(lv), desc)
+                else:
+                    _bump(report, f"metadata.{k}", _FWD)
+            else:
+                _bump(report, f"metadata.{k}", _BACK)
+                out.append(f"column metadata key {k}: {desc}: backward or changed (a withdrawal stamp is written once)")
+        elif k in WRITE_ONCE_METADATA_KEYS:
+            out.append(f"column metadata key {k}: {desc}: a write-once metadata key changed")
+        elif k in MUTABLE_METADATA_KEYS:
+            report.metadata_mutable_diffs[k] = report.metadata_mutable_diffs.get(k, 0) + 1
+        else:
+            out.append(f"column metadata key {k}: {desc} (unknown metadata key, treated as write-once)")
+    return out
 
 
 # ------------------------------------------------------------------ small helpers
@@ -270,11 +621,17 @@ def _state_diff(before: dict, after: dict) -> list:
 
 
 def _open_live_readonly(db: Path) -> sqlite3.Connection:
-    """Read-only. mode=ro when the side files already exist (a live seat); immutable=1 when they do not,
-    because a read-only open of a quiescent WAL-mode db creates -wal and -shm (measured)."""
+    """Read-only, and creating nothing. mode=ro when BOTH side files exist (a live seat); immutable=1 when
+    neither does, because a read-only open of a quiescent WAL-mode db creates -wal and -shm (measured).
+    Exactly one of the two: REFUSED. Measured on SQLite 3.53.4 and again here: mode=ro on -wal without -shm
+    creates -shm in the live home; on -shm without -wal it creates -wal and reads stale data."""
     base = db.resolve().as_uri()
-    has_side = os.path.exists(str(db) + "-wal") or os.path.exists(str(db) + "-shm")
-    uri = base + ("?mode=ro" if has_side else "?immutable=1")
+    has_wal, has_shm = os.path.exists(str(db) + "-wal"), os.path.exists(str(db) + "-shm")
+    if has_wal and not has_shm:
+        raise DrillRefused("live home has a -wal file but no -shm file: refusing to open it read-only")
+    if has_shm and not has_wal:
+        raise DrillRefused("live home has a -shm file but no -wal file: refusing to open it read-only")
+    uri = base + ("?mode=ro" if has_wal else "?immutable=1")
     conn = sqlite3.connect(uri, uri=True)
     conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
     return conn
@@ -322,10 +679,17 @@ print("@@DRILL@@" + json.dumps({"model": model, "vectors": vectors}))
 """
 
 
+_ENV_ALLOWLIST = ("PATH", "LANG", "LANGUAGE", "TMPDIR", "TZ", "__CF_USER_TEXT_ENCODING")
+_ENV_ALLOW_PREFIXES = ("LC_",)
+
+
 def _scratch_env(scratch: str, *, embedder_off: bool) -> dict:
-    """The subprocess environment: ENGRAM_HOME and HOME both the scratch dir. Every inherited ENGRAM_* and
-    CLAUDE_* variable is dropped (a test bypass or a live path must not ride in)."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("ENGRAM_", "CLAUDE_"))}
+    """The subprocess environment, built from an ALLOWLIST (nothing else is inherited: a test bypass, a live
+    path, XDG_*, HF_*, TRANSFORMERS_*, ENGRAMD_*, a token, must not ride in). ENGRAM_HOME and HOME are both the
+    scratch dir. The embed step additionally gets HF_HOME (the existing model cache, read from the parent's own
+    HF_HOME or its default location) with HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1 so it never downloads;
+    the connect step (embedder off) gets none of the three."""
+    env = {k: v for k, v in os.environ.items() if k in _ENV_ALLOWLIST or k.startswith(_ENV_ALLOW_PREFIXES)}
     env["ENGRAM_HOME"] = scratch
     env["HOME"] = scratch
     env["PYTHONPATH"] = _PKG_ROOT
@@ -333,8 +697,10 @@ def _scratch_env(scratch: str, *, embedder_off: bool) -> dict:
     if embedder_off:
         env["ENGRAM_NO_EMBEDDINGS"] = "1"
     else:
-        # HOME is the scratch dir, so the model cache must be named explicitly (a read of the existing cache).
-        env.setdefault("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+        # HOME is the scratch dir, so the model cache must be named explicitly.
+        env["HF_HOME"] = os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
     return env
 
 
@@ -354,15 +720,23 @@ def _run_scratch_python(script: str, args: list, scratch: str, *, embedder_off: 
     raise RuntimeError("subprocess printed no result line")
 
 
+class EmbedVectors(list):
+    """The seam's result: a list (one vector or None per text) that may also NAME the model that produced it.
+    A seam that returns a plain list names no model; the identity check then has nothing to compare."""
+    model = None
+
+
 def _embed_texts(texts: list, scratch: str) -> list:
-    """THE embedding seam. One vector (list of floats) or None per text, in order. The real
-    implementation runs the server's embedder in a subprocess rooted at the scratch home; tests replace
-    this function, so the model is never loaded in a test."""
+    """THE embedding seam. One vector (list of floats) or None per text, in order; an `EmbedVectors` carries the
+    model name. The real implementation runs the server's embedder in a subprocess rooted at the scratch home;
+    tests replace this function, so the model is never loaded in a test."""
     if not texts:
-        return []
+        return EmbedVectors()
     res = _run_scratch_python(_EMBED_SCRIPT, [], scratch, embedder_off=False,
                               stdin=json.dumps(texts), timeout=_EMBED_TIMEOUT_S)
-    return res["vectors"]
+    out = EmbedVectors(res["vectors"])
+    out.model = res.get("model")
+    return out
 
 
 # ------------------------------------------------------------------ the drill
@@ -397,6 +771,42 @@ def _iso(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+_DUMP_MARKER = re.compile(r"^--\s*engram-dumped-at:\s*(\S+)\s*$")
+
+
+def _git_out(home: Path, *args) -> str:
+    try:
+        p = subprocess.run(["git", "-C", str(home), *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def _dump_time(home: Path, dump_bytes: bytes, source: dict) -> tuple:
+    """(source name, datetime) of the dump being restored. In this order: a time the DUMP ITSELF carries (a
+    comment line `-- engram-dumped-at: <ISO time>` in its first lines; the dump engram_backup writes carries
+    none today, an iterdump has no header, so this is for a dump that does); the commit time of the
+    knowledge.sql being restored (`git log -1 --format=%cI`; for a working-tree file only when it is tracked and
+    unmodified, since a modified file is newer than its commit); the file's mtime. A commit time is an UPPER
+    bound on the dump time (the commit follows the dump), an mtime the best estimate for a working-tree file."""
+    for line in dump_bytes[:4096].decode("utf-8", "replace").splitlines()[:20]:
+        m = _DUMP_MARKER.match(line.strip())
+        if m and _parse_time(m.group(1)):
+            return "dump", _parse_time(m.group(1))
+    if source["kind"] == "git":
+        t = _parse_time(_git_out(home, "log", "-1", "--format=%cI", "HEAD", "--", "knowledge.sql"))
+        if t:
+            return "git-commit", t
+    elif source["kind"] == "working-tree":
+        committed = _git_out(home, "log", "-1", "--format=%cI", "--", "knowledge.sql")
+        if committed and not _git_out(home, "status", "--porcelain", "--", "knowledge.sql"):
+            t = _parse_time(committed)
+            if t:
+                return "git-commit", t
+    mtime = source.get("mtime") or _iso(time.time())
+    return "file-mtime", _parse_time(mtime)
+
+
 def _table_names(conn: sqlite3.Connection) -> list:
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
     return [r[0] for r in rows]
@@ -411,15 +821,29 @@ def _columns(conn: sqlite3.Connection, table: str) -> list:
     return [(r[1], r[5]) for r in conn.execute(f"PRAGMA table_info({_q(table)})").fetchall()]
 
 
-def _compare_tables(report: DrillReport, restored: sqlite3.Connection, live: sqlite3.Connection) -> None:
+def _compare_tables(report: DrillReport, restored: sqlite3.Connection, live: sqlite3.Connection,
+                    dump_time=None) -> None:
+    """A sqlite error on either side (a malformed page, a lock, a drifted schema) means the comparison could not
+    run: DrillRefused (exit 2) naming the table, never a traceback and never exit 1 ("the comparison failed")."""
+    progress = ["(listing the tables)"]
+    try:
+        _compare_tables_impl(report, restored, live, dump_time, progress)
+    except sqlite3.Error as exc:
+        raise DrillRefused(f"table {progress[0]}: the comparison could not run ({type(exc).__name__}: {exc})") from exc
+
+
+def _compare_tables_impl(report: DrillReport, restored: sqlite3.Connection, live: sqlite3.Connection,
+                         dump_time, progress: list) -> None:
     rtables = [t for t in _table_names(restored) if not _is_excluded_table(t)]
     ltables = set(_table_names(live))
+    ctx = _Ctx(live=live, dump_time=dump_time, has_edit_history="edit_history" in ltables)
     excluded_tables = sorted(t for t in _table_names(restored) if _is_excluded_table(t))
     excluded_tables += sorted(t for t in ltables if _is_excluded_table(t) and t not in excluded_tables)
     live_only_tables = sorted(t for t in ltables if not _is_excluded_table(t) and t not in rtables)
     report.excluded = {"columns": list(_EXCLUDED_COLUMNS), "tables": sorted(set(excluded_tables)),
                        "live_only_tables": live_only_tables}
     for table in rtables:
+        progress[0] = table
         if table not in ltables:
             _fail(report, f"table {table}: present in the dump, missing from the live db")
             continue
@@ -435,6 +859,8 @@ def _compare_tables(report: DrillReport, restored: sqlite3.Connection, live: sql
         report.classification[table] = {
             WRITE_ONCE: [c for c in common if classes[c] == WRITE_ONCE],
             MUTABLE: [c for c in common if classes[c] == MUTABLE],
+            LIFECYCLE: [c for c in common if classes[c] == LIFECYCLE],
+            KEYED: [c for c in common if classes[c] == KEYED],
             UNCLASSIFIED: [c for c in common if classes[c] == UNCLASSIFIED],
         }
         keycols = pk if pk else ["rowid"]
@@ -455,6 +881,14 @@ def _compare_tables(report: DrillReport, restored: sqlite3.Connection, live: sql
             report.live_only_counts[table] = len(lonly)
             if table == "nodes":
                 report.live_only = sorted(str(k[0]) for k in lonly)
+        has_meta = table == "nodes" and "metadata" in common
+        if has_meta:  # a row on one side only still has its metadata keys listed
+            mi = common.index("metadata")
+            for k in lonly:
+                _scan_metadata_keys(report, k[0], lrows[k][mi])
+            for k, rv in rrows.items():
+                if k not in lrows:
+                    _scan_metadata_keys(report, k[0], rv[mi])
         fails_here = 0
         for key, rvals in rrows.items():
             lvals = lrows.get(key)
@@ -464,10 +898,15 @@ def _compare_tables(report: DrillReport, restored: sqlite3.Connection, live: sql
                     _fail(report, f"{table} {_keystr(keycols, key)}: in the dump, missing from live (deleted)")
                 continue
             report.rows_compared += 1
+            if table == "nodes":
+                for msg in _check_node_row(ctx, report, key[0], dict(zip(common, rvals)), dict(zip(common, lvals))):
+                    fails_here += 1
+                    if fails_here <= _MAX_FAIL_LINES_PER_TABLE:
+                        _fail(report, f"{table} {_keystr(keycols, key)} {msg}")
             if rvals == lvals:
                 continue
             for c, rv, lv in zip(common, rvals, lvals):
-                if rv == lv:
+                if rv == lv or classes[c] in (LIFECYCLE, KEYED):
                     continue
                 if classes[c] == MUTABLE:
                     k = f"{table}.{c}"
@@ -480,6 +919,24 @@ def _compare_tables(report: DrillReport, restored: sqlite3.Connection, live: sql
         if fails_here > _MAX_FAIL_LINES_PER_TABLE:
             _fail(report, f"table {table}: {fails_here - _MAX_FAIL_LINES_PER_TABLE} more write-once "
                           f"or deleted-row failures not listed")
+
+
+def _check_node_row(ctx: _Ctx, report: DrillReport, node_id, r: dict, l: dict) -> list:
+    """The lifecycle columns and the metadata keys of one node present on both sides. Failure fragments."""
+    out: list = []
+    live_meta = _parse_metadata(l.get("metadata"))[0] if "metadata" in l else {}
+    live_status = l.get("status")
+    if "status" in r:
+        out += _check_status(ctx, report, r["status"], l["status"], live_meta)
+    if "is_current" in r:
+        out += _check_is_current(ctx, report, node_id, r["is_current"], l["is_current"], live_status, live_meta)
+    if "superseded_by" in r:
+        out += _check_superseded_by(ctx, report, node_id, r["superseded_by"], l["superseded_by"])
+    if "resolved_by" in r:
+        out += _check_resolved_by(ctx, report, node_id, r["resolved_by"], l["resolved_by"], live_status)
+    if "metadata" in r:
+        out += _compare_node_metadata(ctx, report, node_id, r["metadata"], l["metadata"])
+    return out
 
 
 def _keystr(keycols: list, key: tuple) -> str:
@@ -529,9 +986,24 @@ def _embed_and_check(report: DrillReport, db_path: str, texts: dict, scratch: st
             _fail(report, f"embedder returned {len(again)} vectors for the {len(picked)}-node sample")
             again = (list(again) + [None] * len(picked))[:len(picked)]
         report.vector_sample_checked = len(picked)
+        # Model identity is EXACT: the same model name and the same vector dimension in both passes.
+        first_model, second_model = getattr(vectors, "model", None), getattr(again, "model", None)
+        report.embedding_model = first_model or second_model or ""
+        if first_model != second_model:
+            _fail(report, f"embedding model differs between the passes: first {first_model!r}, sample {second_model!r}")
+        first_dims = {len(v) for v in vectors if v}
+        second_dims = {len(v) for v in again if v}
+        if first_dims and second_dims and first_dims != second_dims:
+            _fail(report, f"vector dimension differs between the passes: first {sorted(first_dims)}, "
+                          f"re-embedded {sorted(second_dims)}")
+        dim_bad = bool(first_dims and second_dims and first_dims != second_dims)
         for nid, vec in zip(picked, again):
             stored = json.loads(conn.execute("SELECT embedding FROM nodes WHERE id = ?", (nid,)).fetchone()[0])
+            if dim_bad:
+                break  # the dimension failure above says it; a per-node 'infinite difference' would repeat it
             diff = _max_abs_diff(vec, stored)
+            if diff != float("inf"):
+                report.vector_max_diff = max(report.vector_max_diff, diff)
             if diff > SAMPLE_TOLERANCE:
                 _fail(report, f"node {nid}: sample re-embed differs from the restored vector (max element difference {diff:g})")
         # Staleness of the LIVE vectors: counted, never failed.
@@ -657,6 +1129,9 @@ def _drill_body(report: DrillReport, home: Path, db: Path, scratch: Path, live: 
     src = report.dump_source
     where = f"commit {src['commit']}" if src["kind"] == "git" else f"{src['path']} (mtime {src['mtime']})"
     report.sections.append(f"dump: {src['kind']} {where}")
+    source_name, dump_time = _dump_time(home, dump_bytes, src)
+    report.dump_time_source, report.dump_time = source_name, dump_time.isoformat()
+    report.sections.append(f"dump_time_source: {source_name} ({report.dump_time})")
 
     sql_path = scratch / "knowledge.sql"
     with open(sql_path, "xb") as f:
@@ -679,7 +1154,7 @@ def _drill_body(report: DrillReport, home: Path, db: Path, scratch: Path, live: 
     if restored_ok:
         rconn = sqlite3.connect(db_path)
         try:
-            _compare_tables(report, rconn, live)
+            _compare_tables(report, rconn, live, dump_time)
         finally:
             rconn.close()
         nfail = len(report.failures)
@@ -687,6 +1162,10 @@ def _drill_body(report: DrillReport, home: Path, db: Path, scratch: Path, live: 
             f"rows: {report.nodes_restored} nodes restored; {report.rows_compared} rows compared; "
             f"{len(report.live_only)} live_only nodes; {sum(report.mutable_diffs.values())} mutable-column "
             f"differences reported; {nfail} failures")
+        report.sections.append(
+            "lifecycle (forward / forward, unstamped / backward / stamped before the dump / named transitions): " +
+            ("; ".join(f"{c} {v.get(_FWD, 0)}/{v.get(_FWD_UNSTAMPED, 0)}/{v.get(_BACK, 0)}/{v.get(_BEFORE, 0)}/"
+                       f"{v.get(_ALLOWED, 0)}" for c, v in sorted(report.lifecycle.items())) or "no differences"))
         _write_scratch_config(home, scratch)
         try:
             res = _run_scratch_python(_CONNECT_SCRIPT, ["1" if embed else "0"], str(scratch), embedder_off=True,
@@ -710,7 +1189,9 @@ def _drill_body(report: DrillReport, home: Path, db: Path, scratch: Path, live: 
                 report.embedding = "re-embedded"
                 report.sections.append(
                     f"vectors: {report.vectors_embedded} embedded; {len(report.vectors_missing)} missing; "
-                    f"sample {report.vector_sample_checked} re-embedded and equal to the restored copy (within {SAMPLE_TOLERANCE:g}); "
+                    f"sample {report.vector_sample_checked} re-embedded and equal to the restored copy (within "
+                    f"{SAMPLE_TOLERANCE:g}, {VECTOR_TOLERANCE['unit']}; largest difference seen "
+                    f"{report.vector_max_diff:.3g}; model {report.embedding_model or 'not named by the seam'}); "
                     f"live_vectors_stale {report.live_vectors_stale}")
             except Exception as exc:
                 _fail(report, f"re-embed failed: {type(exc).__name__}: {exc}")
@@ -758,10 +1239,24 @@ def _write_scratch_config(home: Path, scratch: Path) -> None:
 
 def format_report(report: DrillReport) -> str:
     lines = list(report.sections)
-    lines.append("classification (write-once failures / mutable reported / unclassified treated as write-once):")
+    lines.append("classification (write-once failures / mutable reported / lifecycle forward-only / keyed "
+                 "metadata / unclassified treated as write-once):")
     for table, c in sorted(report.classification.items()):
         lines.append(f"  {table}: write_once={','.join(c[WRITE_ONCE]) or '-'}; mutable={','.join(c[MUTABLE]) or '-'}; "
+                     f"lifecycle={','.join(c.get(LIFECYCLE, [])) or '-'}; keyed={','.join(c.get(KEYED, [])) or '-'}; "
                      f"unclassified={','.join(c[UNCLASSIFIED]) or '-'}")
+    unstamped = {c: v[_FWD_UNSTAMPED] for c, v in report.lifecycle.items() if v.get(_FWD_UNSTAMPED)}
+    if unstamped:
+        lines.append("forward, unstamped (the live row records no time for the change; reported, not failed): " +
+                     ", ".join(f"{c}={n}" for c, n in sorted(unstamped.items())))
+    for pair, t in sorted(report.lifecycle_transitions.items()):
+        lines.append(f"named transition {pair} x{t['count']} (reported, allowed): {t['reason']}")
+    if report.metadata_mutable_diffs:
+        lines.append("metadata keys that differ from live (named mutable, reported): " + ", ".join(
+            f"{k}={v}" for k, v in sorted(report.metadata_mutable_diffs.items())))
+    if report.metadata_unknown:
+        lines.append("UNKNOWN metadata keys (not classified; treated as write-once, a difference fails): " + ", ".join(
+            f"{k}={v}" for k, v in sorted(report.metadata_unknown.items())))
     if report.excluded:
         lines.append(f"not compared: columns {report.excluded.get('columns')}; tables "
                      f"{report.excluded.get('tables')}; live-only tables {report.excluded.get('live_only_tables')}; "
@@ -808,7 +1303,7 @@ def main(argv=None) -> int:
         report = run_drill(home=args.home, scratch=args.scratch, sample=args.sample, embed=not args.no_embed,
                            dump=args.dump, from_git=args.from_git, source=args.source,
                            assert_quiescent=args.assert_quiescent)
-    except (DrillRefused, ValueError, OSError) as exc:
+    except (DrillRefused, ValueError, OSError, sqlite3.Error) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(report.to_json(), indent=2, sort_keys=True) if args.json else format_report(report))
