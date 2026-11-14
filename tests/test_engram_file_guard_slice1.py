@@ -309,6 +309,79 @@ def test_pre_engram_dangling_link_or_directory_is_left_alone_and_the_run_proceed
         assert bak.is_symlink() == (how == "dangling") and not (d / "nowhere").exists()
 
 
+def test_same_file_answers_three_ways(tmp_path):
+    """The one predicate: SAME for another name of the file, DIFFERENT for another file or for
+    nothing there (missing, or a path through a non-directory), never an exception for those."""
+    f = tmp_path / "CLAUDE.md"
+    f.write_text("mine")
+    os.link(f, tmp_path / "hard")
+    (tmp_path / "other").write_text("mine")
+    assert fg.same_file(f, tmp_path / "hard") == (fg.SAME, None)
+    assert fg.same_file(f, tmp_path / "other") == (fg.DIFFERENT, None)
+    assert fg.same_file(f, tmp_path / "missing") == (fg.DIFFERENT, None)
+    assert fg.same_file(f, f / "under-a-file") == (fg.DIFFERENT, None)
+
+
+def test_missing_pre_engram_still_proceeds(tmp_path):
+    """The ordinary first install: no backup name yet. A missing name must read as DIFFERENT,
+    never as 'cannot tell', or every fresh install would be refused."""
+    f = tmp_path / "CLAUDE.md"
+    f.write_text("mine")
+    p = fg.plan([fg.Item(f, "new", first_identity=True)], STAMP)
+    assert p.entries[0].state == "differs"
+    fg.apply(p, fg.consent_for(True, []))
+    assert f.read_text() == "new"
+    assert (tmp_path / "CLAUDE.md.pre-engram").read_text() == "mine"
+
+
+@pytest.mark.parametrize("code", ["EACCES", "ELOOP", "EIO"])
+def test_first_backup_check_that_fails_is_refused_even_with_consent(tmp_path, monkeypatch, code):
+    """When the same-file check on `<name>.pre-engram` fails for any reason other than 'nothing
+    there', the run is refused with a message naming the path and the error: not a traceback,
+    and not a replace that might overwrite the only backup."""
+    import errno
+    f = tmp_path / "CLAUDE.md"
+    f.write_text("mine")
+    (tmp_path / "CLAUDE.md.pre-engram").write_text("older")
+    num = getattr(errno, code)
+
+    def boom(a, b):
+        raise OSError(num, os.strerror(num), str(b))
+
+    monkeypatch.setattr(fg.os.path, "samefile", boom)
+    p = fg.plan([fg.Item(f, "new", first_identity=True)], STAMP)
+    assert p.entries[0].state == "unreadable", p.entries[0]
+    msg = fg.refusal(p, fg.consent_for(True, []))
+    assert msg is not None and msg.count("REFUSED") == 1, msg
+    assert "could not tell" in msg and os.strerror(num) in msg and "CLAUDE.md.pre-engram" in msg, msg
+    with pytest.raises(fg.Refused):
+        fg.apply(p, fg.consent_for(True, []))
+    assert f.read_text() == "mine" and _backups(f) == []
+    assert (tmp_path / "CLAUDE.md.pre-engram").read_text() == "older"
+
+
+def test_fixed_backup_path_check_that_fails_is_a_clean_refusal(tmp_path, monkeypatch):
+    """The fixed-name backup (backup_path_problem / backup_once) uses the same predicate: a
+    failed check is a REFUSED line, not an OSError traceback; a missing backup name is fine."""
+    import errno
+    f = tmp_path / "settings.json"
+    f.write_text("{}")
+    bak = tmp_path / "settings.json.corrupt.20260101T000000Z"
+    assert fg.backup_path_problem(f, bak) is None  # nothing there yet: proceed
+    bak.write_text("{}")
+
+    def boom(a, b):
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(b))
+
+    monkeypatch.setattr(fg.os.path, "samefile", boom)
+    msg = fg.backup_path_problem(f, bak)
+    assert msg is not None and msg.startswith("[bootstrap] REFUSED: could not tell"), msg
+    assert str(bak) in msg and os.strerror(errno.EACCES) in msg, msg
+    with pytest.raises(SystemExit) as got:
+        fg.backup_once(f, bak)
+    assert "could not tell" in str(got.value)
+
+
 def test_obstructed_name_is_listed_in_the_same_one_refusal_as_the_other_paths(tmp_path):
     f = tmp_path / "CLAUDE.md"
     f.write_text("mine")

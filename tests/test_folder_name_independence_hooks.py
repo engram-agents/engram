@@ -169,14 +169,25 @@ def test_S9_S10_server_py_cases(tmp_path, monkeypatch, which):
             mod, _eh = _session_hook(t, monkeypatch)
         return home, _server_path(_fake_hooks_dir(t), mod, t)
 
-    home, got = run(["engram/server.py"], "a")
-    assert got == str(home / "engram" / "server.py")
-    home, got = run(["engram-alpha/server.py"], "b")
-    assert got == str(home / "engram-alpha" / "server.py")
-    home, got = run(["engram/server.py", "engram-alpha/server.py"], "c")
-    assert got == str(home / "engram" / "server.py")
+    home, got = run(["engram/src/engram/server.py"], "a")
+    assert got == str(home / "engram" / "src" / "engram" / "server.py")
+    home, got = run(["engram-alpha/src/engram/server.py"], "b")
+    assert got == str(home / "engram-alpha" / "src" / "engram" / "server.py")
+    home, got = run(["engram/src/engram/server.py", "engram-alpha/src/engram/server.py"], "c")
+    assert got == str(home / "engram" / "src" / "engram" / "server.py")
     home, got = run([], "d")
-    assert got == str(home / "engram" / "server.py")
+    assert got == str(home / "engram" / "src" / "engram" / "server.py")
+
+
+@pytest.mark.parametrize("which", ["hooklib", "session"])
+def test_1867_only_src_engram_server_py_is_returned_and_exists(tmp_path, monkeypatch, which):
+    """engram-agents/engram#1867: a checkout holding ONLY src/engram/server.py (the real repo layout)
+    resolves to that existing file, not to a nonexistent <checkout>/server.py."""
+    home = _home(tmp_path, monkeypatch, files=["engram/src/engram/server.py"])
+    mod = _hooklib() if which == "hooklib" else _session_hook(tmp_path, monkeypatch)[0]
+    got = _server_path(_fake_hooks_dir(tmp_path), mod, tmp_path)
+    assert got == str(home / "engram" / "src" / "engram" / "server.py")
+    assert os.path.exists(got)
 
 
 # ---- S11: lesson-tripwire ----------------------------------------------------
@@ -230,12 +241,20 @@ def _probe(tmp_path, monkeypatch):
 
 def test_S12_cases(tmp_path, monkeypatch):
     for sub, files, want in [
-        ("a", ["engram/server.py"], "engram/server.py"),
-        ("b", ["engram-alpha/server.py"], "engram-alpha/server.py"),
-        ("c", ["engram/server.py", "engram-alpha/server.py"], "engram/server.py"),
-        ("d", [], "engram/server.py"),
+        ("a", ["engram/src/engram/server.py"], "engram/src/engram/server.py"),
+        ("b", ["engram-alpha/src/engram/server.py"], "engram-alpha/src/engram/server.py"),
+        ("c", ["engram/src/engram/server.py", "engram-alpha/src/engram/server.py"], "engram/src/engram/server.py"),
+        ("d", [], "engram/src/engram/server.py"),
     ]:
         t = tmp_path / sub
         t.mkdir()
         home = _home(t, monkeypatch, files=files)
         assert _probe(t, monkeypatch) == str(home / want)
+
+
+def test_1867_supervision_only_src_engram_server_py_is_returned_and_exists(tmp_path, monkeypatch):
+    """engram-agents/engram#1867: same pin for supervision_probe's resolver."""
+    home = _home(tmp_path, monkeypatch, files=["engram/src/engram/server.py"])
+    got = _probe(tmp_path, monkeypatch)
+    assert got == str(home / "engram" / "src" / "engram" / "server.py")
+    assert os.path.exists(got)
