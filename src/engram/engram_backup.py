@@ -37,6 +37,11 @@ import sqlite3
 import stat
 import sys
 import tempfile
+from datetime import datetime, timezone
+
+# First line of every dump: a SQL comment (every reader that runs the dump skips it) that says WHEN the dump was
+# taken. The restore drill reads it to tell a difference made after the dump from one that is not.
+DUMP_MARKER_PREFIX = "-- engram-dumped-at: "
 
 
 # Tables whose contents are derived/regenerable and must never reach the dump.
@@ -172,11 +177,18 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
     failure the temp is removed, the previous ``out_sql_path`` is left
     byte-identical (or absent), and the error is raised.
 
+    The first line of the dump is the comment ``-- engram-dumped-at: <UTC ISO time>``
+    (``DUMP_MARKER_PREFIX``): when the dump was taken, read before the hot backup.
+
     Returns a stats dict: ``{statements, bytes, fts_excluded, vec_excluded,
-    verified_nodes}``.
+    verified_nodes, dumped_at}``.
     Raises on failure — callers MUST surface errors, never ``except: pass`` them
     (silent skip is the failure mode this module exists to eliminate).
     """
+    # The dump time is read BEFORE the hot backup, so it is never later than the data it stamps: a change made
+    # between this read and the backup is in the dump AND stamped after it, which only makes a later drill
+    # more lenient, never wrongly strict.
+    dumped_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     src = sqlite3.connect(src_db_path)
     fd, snap = tempfile.mkstemp(
         suffix=".snap.db", dir=os.path.dirname(os.path.abspath(src_db_path)), prefix=".engram-bk-"
@@ -259,6 +271,7 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
             ).fetchone()
             statements = 0
             with out_f as f:
+                f.write(DUMP_MARKER_PREFIX + dumped_at + "\n")  # a comment, not a statement: not counted
                 for line in bk.iterdump():
                     if not has_autoinc and line.startswith('DELETE FROM "sqlite_sequence"'):
                         continue
@@ -298,6 +311,7 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
         "fts_excluded": fts_excluded,
         "vec_excluded": vec_excluded,
         "verified_nodes": verified_nodes,
+        "dumped_at": dumped_at,
     }
 
 

@@ -21,13 +21,15 @@ What it does, in a SCRATCH directory (never in the live home):
        mutable      recall counts, last-recalled times, importance and utility scores, confidence and
                     similar bookkeeping. A difference is REPORTED with per-column counts, never failed:
                     a working seat changes them after the dump.
-       lifecycle    nodes.status, is_current, superseded_by, resolved_by. A difference passes only in the
-                    FORWARD direction (the dump shows the earlier state, live the later), and where the
-                    live row records WHEN it happened that time must be after the dump time. Every write
-                    to these columns in the shipped code was listed (see ``_check_status`` and
-                    ``_check_resolved_by``); the transitions that move a node BACK (a reopened resolution,
-                    a re-pointed resolver, task status moves) are named in ``_STATUS_TRANSITIONS`` and
-                    ``_RESOLVED_BY_RULES`` with the code path as the reason.
+       lifecycle    nodes.status, is_current, superseded_by, resolved_by, and the write-once column
+                    nodes.quoted_text. THE RULE: a difference is legal only if the live graph's own record
+                    explains it as a change made after the dump: (i) an ``edit_history`` row for that node (or
+                    the ``retracted_at`` stamp) dated after the dump time, AND (ii) the (restored, live) pair is a
+                    transition the code can make (``_STATUS_TRANSITIONS`` and ``_RESOLVED_BY_RULES``, each with
+                    the code path as the reason). Retraction and supersession are one way: retracted -> anything
+                    else fails, any change to ``superseded_by`` fails. A difference with no record FAILS, naming
+                    table, key and column. A record dated between the previous and this commit of an older
+                    dump is REPORTED as "ambiguous: dump time unknown" (``ambiguous_count``), not failed.
        keyed        nodes.metadata, compared as parsed JSON KEY BY KEY (``_compare_node_metadata``):
                     write-once keys fail on a difference, the retraction stamp keys follow the lifecycle
                     rule, named mutable keys are reported, and any other key is UNKNOWN: listed, and a
@@ -54,6 +56,18 @@ What it does, in a SCRATCH directory (never in the live home):
      ``<scratch>/transcripts`` and compares each replayed file with the live transcript up to the
      archived offset (sha256 of the first N bytes). Bytes past the offset are reported
      (``transcript_live_only_bytes``), not failed.
+
+Dump time (``dump_time_source`` in the report): the marker line ``-- engram-dumped-at: <UTC ISO time>`` that
+``engram_backup.dump_stripped`` writes as the first line of a dump (``marker``, exact, preferred); for an older dump
+with no marker, the window between the previous commit of ``knowledge.sql`` and this one (``commit-window``, no slack:
+a record before the previous commit fails, one between the two commits is ambiguous, one after this commit passes; a
+file with no previous commit has an UNKNOWN earlier bound, never an invented one); for a dump with no marker and no
+repo, the file's mtime (``mtime-fallback``, the weakest source).
+
+Known gaps (writers of the audited columns that leave NO ``edit_history`` row, see ``NO_AUDIT_WRITERS``): the startup
+``engram_core._backfill_resolved_by`` (NULL -> resolver) and the ``engram_revision._resolve_impl`` self-heal (re-points
+``resolved_by`` on a repeat resolve call). A ``resolved_by`` change they made is not told apart from corruption, so it
+fails; the columns are NOT classified mutable to absorb it.
 
 The drill never creates, modifies or deletes a file in the live home. The live database is opened
 read-only (``mode=ro``) when both ``-wal`` and ``-shm`` exist, and with ``immutable=1`` when neither does
@@ -178,6 +192,9 @@ KEYED = "keyed"
 UNCLASSIFIED = "unclassified"
 
 _LIFECYCLE = {"nodes": ("status", "is_current", "superseded_by", "resolved_by")}
+# Write-once columns whose difference is checked by `_check_node_row` against the audit record instead of failing
+# outright: a requote after the dump is legal, and the live graph says so.
+_AUDITED_WRITE_ONCE = {("nodes", "quoted_text")}
 _KEYED = {"nodes": ("metadata",)}
 
 
@@ -209,13 +226,20 @@ class DrillReport:
     live_only: list = field(default_factory=list)  # node ids written after the dump
     live_only_counts: dict = field(default_factory=dict)  # table -> rows written after the dump
     mutable_diffs: dict = field(default_factory=dict)  # "table.column" -> rows that differ
-    # lifecycle columns: column -> {forward, forward_unstamped, backward, stamped_before_dump, allowed_transition}
+    # the audited columns (lifecycle, quoted_text): column -> {passed, ambiguous, failed_no_record,
+    # failed_before_dump, failed_transition}
     lifecycle: dict = field(default_factory=dict)
     lifecycle_transitions: dict = field(default_factory=dict)  # "a -> b" -> {count, reason}: the named moves
+    # differences explained only by a record BETWEEN the two commits of knowledge.sql (dump time unknown):
+    # reported, not failed. Each: {table, key, column, recorded, difference}
+    ambiguous: list = field(default_factory=list)
+    known_gaps: list = field(default_factory=lambda: list(NO_AUDIT_WRITERS))  # writers that leave no audit row
     metadata_mutable_diffs: dict = field(default_factory=dict)  # metadata key -> rows that differ (reported)
     metadata_unknown: dict = field(default_factory=dict)  # metadata key the classification does not know -> nodes
-    dump_time_source: str = ""  # "dump" | "git-commit" | "file-mtime"
-    dump_time: str = ""
+    dump_time_source: str = ""  # "marker" | "commit-window" | "mtime-fallback"
+    dump_time: str = ""  # the latest time the dump can have been taken (the marker, this commit, the mtime)
+    dump_time_earliest: str = ""  # the earliest ("" = unknown: knowledge.sql has no previous commit)
+    dump_time_note: str = ""
     vector_tolerance: dict = field(default_factory=lambda: dict(VECTOR_TOLERANCE))
     vector_max_diff: float = 0.0  # the largest element difference seen between the two embedding passes
     embedding_model: str = ""
@@ -244,9 +268,14 @@ class DrillReport:
     def exit_code(self) -> int:
         return 1 if self.failures else 0
 
+    @property
+    def ambiguous_count(self) -> int:
+        return len(self.ambiguous)
+
     def to_json(self) -> dict:
         d = asdict(self)
         d["passed"] = not self.failures
+        d["ambiguous_count"] = self.ambiguous_count
         return d
 
 
@@ -254,43 +283,78 @@ def _fail(report: DrillReport, message: str) -> None:
     report.failures.append(message)
 
 
-# ------------------------------------------------------------------ lifecycle columns (forward only)
+# ------------------------------------------------------------------ lifecycle columns, gated by the audit record
 #
-# Writes to nodes.status / is_current / superseded_by / resolved_by in the shipped tree (src/engram, searched
-# for every `UPDATE nodes` statement and every helper that builds one; there is no un-retract verb and no
-# migration or repair tool that resets them), with the direction of each transition:
-#   engram_revision.py  retract    (~4384, ~4546)  status X -> 'retracted', is_current 1 -> 0, metadata.retracted_at   FORWARD
-#   engram_revision.py  supersede  (~3624)         is_current 1 -> 0, superseded_by NULL -> new id                       FORWARD
-#   engram_cornerstone.py outgrow  (~515)          is_current 1 -> 0, superseded_by NULL -> new id                       FORWARD
-#   engram_core.py      _backfill_resolved_by (~4013)  resolved_by NULL -> resolver                                      FORWARD
-#   engram_core.py      _recompute_resolution_target (~4124/4128), run by retract / supersede / the startup
+# THE RULE: a difference between the restore and live is legal ONLY if the live graph's own record explains it
+# as a change made after the dump. (i) The live audit trail (an `edit_history` row for that node, or the
+# `retracted_at` stamp a retraction writes) shows the change after the dump time; AND (ii) the (restored, live)
+# pair is a transition the code can make (the named tables below, each with its code path as the reason).
+# A difference with no such record FAILS, naming table, key and column.
+#
+# How edit_history is written: `engram_core._log_edit` (best effort: it swallows its own exception, so a row can
+# be missing even where a writer calls it) and a few direct INSERTs; one row per change with `timestamp` (UTC ISO,
+# `engram_core._now`), `action`, `node_id` (the node that CHANGED: the superseded node, the resolved target, the
+# retracted node), `node_type` and a `details` JSON (`field` for `surgical_field_patch`).
+#
+# Every write to nodes.status / is_current / superseded_by / resolved_by / quoted_text in the shipped tree
+# (src/engram, searched for every `UPDATE nodes` statement and every helper that builds one; there is no
+# un-retract verb and no migration or repair tool that resets them), with whether it writes an audit row:
+#   engram_revision.py  retract    (4384, 4546)  status X -> 'retracted', is_current 1 -> 0, metadata.retracted_at
+#                       AUDIT ROW: yes, action 'retracted' (4687; 4565 for a paired prediction)         FORWARD
+#   engram_revision.py  supersede  (3624)        is_current 1 -> 0, superseded_by NULL -> new id
+#                       AUDIT ROW: yes, action 'superseded' (3850)                                      FORWARD
+#   engram_cornerstone.py outgrow  (515)         is_current 1 -> 0, superseded_by NULL -> new id
+#                       AUDIT ROW: yes, action 'superseded' (527)                                       FORWARD
+#   engram_core.py      _backfill_resolved_by (4013)  resolved_by NULL -> resolver, run at startup
+#                       AUDIT ROW: NO. A KNOWN GAP (see NO_AUDIT_WRITERS).                              FORWARD
+#   engram_core.py      _recompute_resolution_target (4124/4128), run by retract / supersede / the startup
 #                       reconciler: status -> 'open' with resolved_by -> NULL when no live resolver remains (BACKWARD),
-#                       resolved_by A -> B and status resolved <-> partially_resolved when the best resolver changes
-#                       (SIDEWAYS)
-#   engram_revision.py  _resolve_impl (~3284) and its self-heal (~3223): status open/partially_resolved -> resolved /
-#                       partially_resolved / a prediction outcome, last writer wins between outcomes; resolved_by
-#                       NULL -> X or A -> B                                                    FORWARD and SIDEWAYS
-#   engram_tasks.py     engram_update_task (~543): task status planned/active/done/blocked, any order       SIDEWAYS
-#   tools/surgical.py  field_patch (~820): `status` is on its allowlist, arbitrary old -> new: an operator repair,
-#                       deliberately NOT allowed below (a restore that differs from live by a patch fails loud).
+#                       resolved_by A -> B and status resolved <-> partially_resolved (SIDEWAYS)
+#                       AUDIT ROW: yes, action 'resolution_recomputed' (4130); retract also writes 'reopened' (4692)
+#   engram_revision.py  _resolve_impl (3284): status open/partially_resolved -> resolved / partially_resolved / a
+#                       prediction outcome, last writer wins between outcomes; resolved_by NULL -> X or A -> B
+#                       AUDIT ROW: yes, action 'resolved' (3287)                                  FORWARD and SIDEWAYS
+#   engram_revision.py  _resolve_impl self-heal (3223): resolved_by re-pointed to the best live resolver on a repeat
+#                       resolve call
+#                       AUDIT ROW: NO. A KNOWN GAP (see NO_AUDIT_WRITERS).                                SIDEWAYS
+#   engram_tasks.py     engram_update_task (543): task status planned/active/done/blocked, any order
+#                       AUDIT ROW: yes, action 'status_<old>_to_<new>' (563)                              SIDEWAYS
+#   tools/surgical.py   field_patch (820): `status` is on its allowlist, arbitrary old -> new (so is quoted_text)
+#                       AUDIT ROW: yes, action 'surgical_field_patch' with details.field (824)
+#   engram_observation.py requote (3179): quoted_text old -> new, write-once otherwise
+#                       AUDIT ROW: yes, action 'requoted' (3190)
 # So "one way" holds for retraction and supersession, and does NOT hold for the resolution family or task status:
 # those moves are named below, keyed by the (restored, live) value pair, with the code path as the reason.
+
+NO_AUDIT_WRITERS = (
+    "engram_core._backfill_resolved_by (engram_core.py:4013): sets resolved_by NULL -> resolver at startup and "
+    "writes no edit_history row",
+    "engram_revision._resolve_impl self-heal (engram_revision.py:3223): re-points resolved_by on a repeat resolve "
+    "call and writes no edit_history row",
+)
+_NO_AUDIT_HINT = (" (known gap: " + "; and ".join(w.split(" (")[0] for w in NO_AUDIT_WRITERS) +
+                  " write resolved_by with no audit row, so such a change is not told apart from corruption)")
 
 _RESOLUTION_STATUSES = ("open", "partially_resolved", "resolved", "confirmed", "partially_confirmed", "refuted",
                         "partially_refuted", "supported", "inconclusive")
 _TASK_STATUSES = ("planned", "active", "done", "blocked")
-_STATUS_TRANSITIONS = {}
+_KIND_RESOLUTION, _KIND_TASK = "resolution", "task"
+# the audit actions that record each kind of status move
+_KIND_ACTIONS = {_KIND_RESOLUTION: (("resolved", "resolution_recomputed", "reopened"), ()),
+                 _KIND_TASK: ((), ("status_*_to_*",))}
+_STATUS_TRANSITIONS = {}  # (restored, live) -> (kind, reason)
 for _a in _RESOLUTION_STATUSES:
     for _b in _RESOLUTION_STATUSES:
         if _a != _b:
-            _STATUS_TRANSITIONS[(_a, _b)] = (
+            _STATUS_TRANSITIONS[(_a, _b)] = (_KIND_RESOLUTION,
                 "resolution status moves with the live resolvers: engram_core._recompute_resolution_target "
                 "(reopen to 'open', threshold re-evaluation) and engram_revision._resolve_impl")
 for _a in _TASK_STATUSES:
     for _b in _TASK_STATUSES:
         if _a != _b:
-            _STATUS_TRANSITIONS[(_a, _b)] = "task status in any order: engram_tasks.engram_update_task"
+            _STATUS_TRANSITIONS[(_a, _b)] = (_KIND_TASK, "task status in any order: engram_tasks.engram_update_task")
 del _a, _b
+_FIELD_PATCH_REASON = "operator repair: tools.surgical.field_patch (`status` is on its allowlist)"
 
 # resolved_by is a node id, so its rules are keyed by the SHAPE of the (restored, live) pair, each with a condition
 # on the live status that the writing code path also sets.
@@ -299,10 +363,13 @@ _RESOLVED_BY_RULES = {
                       "no live resolver remains, status 'open', resolved_by NULL"),
     "value -> other value": ("live status is a resolution status", "engram_core._recompute_resolution_target / "
                              "engram_revision._resolve_impl self-heal: re-pointed to the best live resolver"),
+    "NULL -> value": ("any live status", "engram_revision._resolve_impl, engram_core._recompute_resolution_target "
+                      "and engram_core._backfill_resolved_by: a resolver is recorded"),
 }
 
-_FWD, _FWD_UNSTAMPED, _BACK, _BEFORE, _ALLOWED = ("forward", "forward_unstamped", "backward",
-                                                    "stamped_before_dump", "allowed_transition")
+# counters, per column, in DrillReport.lifecycle
+_PASS, _AMB, _NOREC, _BEFORE, _NOTRANS = ("passed", "ambiguous", "failed_no_record", "failed_before_dump",
+                                          "failed_transition")
 
 
 def _bump(report: DrillReport, column: str, what: str) -> None:
@@ -321,64 +388,134 @@ def _parse_time(value):
 
 
 @dataclass
+class DumpTime:
+    """When the dump being restored was taken: the latest and the earliest time it can have been. A marker or an
+    mtime is one instant (earliest == latest). The commit window is (previous commit, this commit): the earliest is
+    None, UNKNOWN, when knowledge.sql has no previous commit. Never invented."""
+    source: str  # "marker" | "commit-window" | "mtime-fallback"
+    latest: object  # datetime
+    earliest: object = None  # datetime | None
+    note: str = ""
+
+    def describe(self) -> str:
+        if self.source == "commit-window":
+            lo = self.earliest.isoformat() if self.earliest else "unknown"
+            return f"between {lo} (previous commit of knowledge.sql) and {self.latest.isoformat()} (this commit)"
+        return self.latest.isoformat()
+
+
+@dataclass
 class _Ctx:
-    """What the lifecycle checks need besides the two rows: the live connection (the stamp source) and the dump time."""
+    """What the checks need besides the two rows: the live connection (the audit-record source) and the dump time."""
     live: sqlite3.Connection
-    dump_time: object  # datetime | None
+    dump_time: DumpTime
     has_edit_history: bool = False
-    stamp_cache: dict = field(default_factory=dict)
 
 
-def _edit_stamp(ctx: _Ctx, node_id, actions: tuple):
-    """When the live db's own audit log says `actions` last happened to the node (edit_history is written by
-    the same code path as the change: engram_revision supersede/resolve, engram_core recompute)."""
-    if not ctx.has_edit_history:
+def _when(dump: DumpTime, stamp) -> str:
+    """none | before | ambiguous | after: where the live record's time falls against the dump time."""
+    if stamp is None:
+        return "none"
+    if stamp >= dump.latest:
+        return "after"
+    if dump.earliest is not None and stamp < dump.earliest:
+        return "before"
+    return "ambiguous"  # only a window with an unknown or earlier bound than the stamp gets here
+
+
+def _latest(*stamps):
+    got = [s for s in stamps if s is not None]
+    return max(got) if got else None
+
+
+def _edit_stamp(ctx: _Ctx, node_id, actions: tuple = (), globs: tuple = (), field=None):
+    """When the live db's own audit log last recorded one of `actions` (exact) or `globs` (action patterns) for
+    the node; with `field`, only rows whose details.field is that column (surgical_field_patch)."""
+    if not ctx.has_edit_history or not (actions or globs):
         return None
-    marks = ",".join("?" * len(actions))
-    row = ctx.live.execute(
-        f"SELECT timestamp FROM edit_history WHERE node_id = ? AND action IN ({marks}) ORDER BY id DESC LIMIT 1",
-        (node_id, *actions)).fetchone()
-    return _parse_time(row[0]) if row else None
+    clauses = []
+    params: list = [node_id]
+    if actions:
+        clauses.append(f"action IN ({','.join('?' * len(actions))})")
+        params += list(actions)
+    for g in globs:
+        clauses.append("action GLOB ?")
+        params.append(g)
+    best = None
+    for ts, details in ctx.live.execute(
+            f"SELECT timestamp, details FROM edit_history WHERE node_id = ? AND ({' OR '.join(clauses)})", params):
+        if field is not None:
+            try:
+                d = json.loads(details)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(d, dict) or d.get("field") != field:
+                continue
+        best = _latest(best, _parse_time(ts))
+    return best
 
 
-def _retract_stamp(live_meta: dict):
-    """engram_revision.py writes metadata.retracted_at on the retracted node itself (~4369 and, for a paired
-    prediction, ~4532). There is NO metadata stamp for supersede or resolve: those are read from edit_history."""
-    return _parse_time(live_meta.get("retracted_at"))
+def _retract_stamp(ctx: _Ctx, node_id, live_meta: dict):
+    """When the node was retracted: the `retracted_at` that engram_revision writes on the retracted node itself, or
+    its 'retracted' edit_history row. There is NO metadata stamp for supersede or resolve: those are audit rows."""
+    return _latest(_parse_time(live_meta.get("retracted_at")), _edit_stamp(ctx, node_id, ("retracted",)))
 
 
-def _judge_forward(ctx: _Ctx, report: DrillReport, column: str, stamp, desc: str) -> list:
-    """A forward difference: counted; failed only when its stamp is before the dump time."""
-    if stamp is None or ctx.dump_time is None:
-        _bump(report, column, _FWD_UNSTAMPED)
-        return []
-    if stamp < ctx.dump_time:
+def _explain(ctx: _Ctx, report: DrillReport, node_id, column: str, stamp, desc: str, record: str,
+             hint: str = "") -> list:
+    """Rule part (i): is there a live record of this change, and is it after the dump? Failure fragments."""
+    when = _when(ctx.dump_time, stamp)
+    if when == "none":
+        _bump(report, column, _NOREC)
+        return [f"column {column}: {desc}: no audit record in the live graph ({record}); a difference nothing "
+                f"records cannot be told from corruption{hint}"]
+    if when == "before":
         _bump(report, column, _BEFORE)
-        return [f"column {column}: {desc}: forward, but "
-                f"stamped {stamp.isoformat()}, before the dump time {ctx.dump_time.isoformat()} "
-                f"(the dump should already have had it)"]
-    _bump(report, column, _FWD)
+        return [f"column {column}: {desc}: the live record is {stamp.isoformat()}, before the dump time "
+                f"({ctx.dump_time.describe()}), so the dump should already have had it"]
+    if when == "ambiguous":
+        _bump(report, column, _AMB)
+        report.ambiguous.append({"table": "nodes", "key": str(node_id), "column": column,
+                                 "recorded": stamp.isoformat(), "difference": desc})
+        return []  # ambiguous: reported, not failed
+    _bump(report, column, _PASS)
     return []
 
 
-def _check_status(ctx, report, rv, lv, live_meta) -> list:
+def _not_a_transition(report: DrillReport, column: str, desc: str, why: str) -> list:
+    _bump(report, column, _NOTRANS)
+    return [f"column {column}: {desc}: {why}"]
+
+
+def _note_transition(report: DrillReport, label: str, reason: str) -> None:
+    t = report.lifecycle_transitions.setdefault(label, {"count": 0, "reason": reason})
+    t["count"] += 1
+
+
+def _check_status(ctx, report, node_id, rv, lv, live_meta) -> list:
     if rv == lv:
         return []
     desc = f"restored {rv!r}, live {lv!r}"
-    if lv == "retracted":
-        return _judge_forward(ctx, report, "status", _retract_stamp(live_meta), desc)
     if rv == "retracted":
-        _bump(report, "status", _BACK)
-        return [f"column status: {desc}: backward (a retraction in the dump is missing from live; "
-                f"no code path un-retracts a node)"]
-    reason = _STATUS_TRANSITIONS.get((rv, lv))
-    if reason:
-        _bump(report, "status", _ALLOWED)
-        t = report.lifecycle_transitions.setdefault(f"{rv} -> {lv}", {"count": 0, "reason": reason})
-        t["count"] += 1
-        return []
-    _bump(report, "status", _BACK)
-    return [f"column status: {desc}: not a transition any code path writes"]
+        return _not_a_transition(report, "status", desc,
+                                 "backward (a retraction in the dump is missing from live; no code path un-retracts "
+                                 "a node, and a field_patch is not accepted as one either)")
+    if lv == "retracted":
+        return _explain(ctx, report, node_id, "status", _retract_stamp(ctx, node_id, live_meta), desc,
+                        "the retracted_at stamp or a 'retracted' edit_history row")
+    named = _STATUS_TRANSITIONS.get((rv, lv))
+    patch = _edit_stamp(ctx, node_id, ("surgical_field_patch",), field="status")
+    if named is None and patch is None:
+        return _not_a_transition(report, "status", desc, "not a transition any code path writes")
+    stamp = patch
+    if named:
+        actions, globs = _KIND_ACTIONS[named[0]]
+        stamp = _latest(_edit_stamp(ctx, node_id, actions, globs), patch)
+    out = _explain(ctx, report, node_id, "status", stamp, desc,
+                   "an edit_history row for this status move" + (" or a field_patch" if named else ", a field_patch"))
+    if not out:
+        _note_transition(report, f"{rv} -> {lv}", named[1] if named else _FIELD_PATCH_REASON)
+    return out
 
 
 def _check_is_current(ctx, report, node_id, rv, lv, live_status, live_meta) -> list:
@@ -387,13 +524,13 @@ def _check_is_current(ctx, report, node_id, rv, lv, live_status, live_meta) -> l
     desc = f"restored {rv!r}, live {lv!r}"
     if rv == 1 and lv == 0:
         if live_status == "retracted":
-            stamp = _retract_stamp(live_meta)
+            stamp, record = _retract_stamp(ctx, node_id, live_meta), "the retracted_at stamp or a 'retracted' row"
         else:
-            stamp = _edit_stamp(ctx, node_id, ("superseded",))
-        return _judge_forward(ctx, report, "is_current", stamp, desc)
-    _bump(report, "is_current", _BACK)
-    return [f"column is_current: {desc}: backward" if (rv, lv) == (0, 1) else
-            f"column is_current: {desc}: not a transition any code path writes"]
+            stamp, record = _edit_stamp(ctx, node_id, ("superseded",)), "a 'superseded' edit_history row"
+        return _explain(ctx, report, node_id, "is_current", stamp, desc, record)
+    return _not_a_transition(report, "is_current", desc,
+                             "backward (no code path makes a node current again)" if (rv, lv) == (0, 1)
+                             else "not a transition any code path writes")
 
 
 def _check_superseded_by(ctx, report, node_id, rv, lv) -> list:
@@ -401,33 +538,46 @@ def _check_superseded_by(ctx, report, node_id, rv, lv) -> list:
         return []
     desc = f"restored {rv!r}, live {lv!r}"
     if rv is None and lv is not None:
-        return _judge_forward(ctx, report, "superseded_by", _edit_stamp(ctx, node_id, ("superseded",)), desc)
-    _bump(report, "superseded_by", _BACK)
+        return _explain(ctx, report, node_id, "superseded_by", _edit_stamp(ctx, node_id, ("superseded",)), desc,
+                        "a 'superseded' edit_history row")
     why = "backward (a supersession in the dump is missing from live)" if lv is None else \
         "changed (a node is superseded once; no code path re-points it)"
-    return [f"column superseded_by: {desc}: {why}"]
+    return _not_a_transition(report, "superseded_by", desc, why)
 
 
 def _check_resolved_by(ctx, report, node_id, rv, lv, live_status) -> list:
     if rv == lv:
         return []
     desc = f"restored {rv!r}, live {lv!r}"
-    if rv is None and lv is not None:
-        return _judge_forward(ctx, report, "resolved_by",
-                              _edit_stamp(ctx, node_id, ("resolved", "resolution_recomputed")), desc)
-    if lv is None:
+    if rv is None:
+        shape, ok = "NULL -> value", True
+    elif lv is None:
         shape, ok = "value -> NULL", live_status == "open"
     else:
         shape, ok = "value -> other value", live_status in _RESOLUTION_STATUSES
     cond, reason = _RESOLVED_BY_RULES[shape]
-    if ok:
-        _bump(report, "resolved_by", _ALLOWED)
-        t = report.lifecycle_transitions.setdefault(f"resolved_by: {shape}", {"count": 0, "reason": reason})
-        t["count"] += 1
+    if not ok:
+        return _not_a_transition(report, "resolved_by", desc,
+                                 f"backward or changed, and not the named transition ({shape}: allowed only when "
+                                 f"{cond}; live status is {live_status!r})")
+    stamp = _edit_stamp(ctx, node_id, _KIND_ACTIONS[_KIND_RESOLUTION][0])
+    out = _explain(ctx, report, node_id, "resolved_by", stamp, desc, "a 'resolved' / 'resolution_recomputed' / "
+                   "'reopened' edit_history row", hint=_NO_AUDIT_HINT)
+    if not out and shape != "NULL -> value":
+        _note_transition(report, f"resolved_by: {shape}", reason)
+    return out
+
+
+def _check_quoted_text(ctx, report, node_id, rv, lv) -> list:
+    """quoted_text is WRITE-ONCE under the same rule: evidence, the most claim-bearing column there is. A difference
+    passes only when the live record shows a requote (or an operator field_patch of that column) after the dump."""
+    if rv == lv:
         return []
-    _bump(report, "resolved_by", _BACK)
-    return [f"column resolved_by: {desc}: backward or changed, and not the named transition ({shape}: "
-            f"allowed only when {cond}; live status is {live_status!r})"]
+    short = lambda v: repr(v if not isinstance(v, str) or len(v) <= 60 else v[:57] + "...")  # noqa: E731
+    stamp = _latest(_edit_stamp(ctx, node_id, ("requoted",)),
+                    _edit_stamp(ctx, node_id, ("surgical_field_patch",), field="quoted_text"))
+    return _explain(ctx, report, node_id, "quoted_text", stamp, f"restored {short(rv)}, live {short(lv)}",
+                    "a 'requoted' edit_history row or a field_patch of quoted_text")
 
 
 # ------------------------------------------------------------------ nodes.metadata, key by key
@@ -545,11 +695,12 @@ def _compare_node_metadata(ctx, report, node_id, rraw, lraw) -> list:
         if k in LIFECYCLE_STAMP_METADATA_KEYS:
             if rv is _ABSENT:
                 if k == "retracted_at":
-                    out += _judge_forward(ctx, report, f"metadata.{k}", _parse_time(lv), desc)
+                    out += _explain(ctx, report, node_id, f"metadata.{k}", _parse_time(lv), desc,
+                                    "the retracted_at stamp itself")
                 else:
-                    _bump(report, f"metadata.{k}", _FWD)
+                    _bump(report, f"metadata.{k}", _PASS)
             else:
-                _bump(report, f"metadata.{k}", _BACK)
+                _bump(report, f"metadata.{k}", _NOTRANS)
                 out.append(f"column metadata key {k}: {desc}: backward or changed (a withdrawal stamp is written once)")
         elif k in WRITE_ONCE_METADATA_KEYS:
             out.append(f"column metadata key {k}: {desc}: a write-once metadata key changed")
@@ -782,29 +933,45 @@ def _git_out(home: Path, *args) -> str:
     return p.stdout.strip() if p.returncode == 0 else ""
 
 
-def _dump_time(home: Path, dump_bytes: bytes, source: dict) -> tuple:
-    """(source name, datetime) of the dump being restored. In this order: a time the DUMP ITSELF carries (a
-    comment line `-- engram-dumped-at: <ISO time>` in its first lines; the dump engram_backup writes carries
-    none today, an iterdump has no header, so this is for a dump that does); the commit time of the
-    knowledge.sql being restored (`git log -1 --format=%cI`; for a working-tree file only when it is tracked and
-    unmodified, since a modified file is newer than its commit); the file's mtime. A commit time is an UPPER
-    bound on the dump time (the commit follows the dump), an mtime the best estimate for a working-tree file."""
+def _commit_window(home: Path, from_head: bool):
+    """(this commit time, previous commit time or None) of knowledge.sql in the home's repo, or None when there is
+    no git, no repo, or knowledge.sql has no commit. `git log -2` lists this commit and the one before it."""
+    args = ["log", "-2", "--format=%cI"] + (["HEAD"] if from_head else []) + ["--", "knowledge.sql"]
+    lines = [ln for ln in _git_out(home, *args).splitlines() if ln.strip()]
+    this = _parse_time(lines[0]) if lines else None
+    if this is None:
+        return None
+    return this, (_parse_time(lines[1]) if len(lines) > 1 else None)
+
+
+def _dump_time(home: Path, dump_bytes: bytes, source: dict) -> DumpTime:
+    """When the dump being restored was taken. In this order:
+      marker         a comment line `-- engram-dumped-at: <ISO time>` in the dump's first lines, written by
+                     engram_backup.dump_stripped: exact. PREFERRED.
+      commit-window  an older dump with no marker: the true time lies between the previous commit of
+                     knowledge.sql and this one (`git log -2 --format=%cI -- knowledge.sql` in the home's repo; for a
+                     working-tree file only when it is tracked and unmodified). NO slack window. With no previous
+                     commit the earlier bound is UNKNOWN (None), never invented.
+      mtime-fallback the file's mtime, for a dump with no marker and no repo (a --dump file, a home without
+                     git). The WEAKEST source: it treats the whole file time as the dump time."""
     for line in dump_bytes[:4096].decode("utf-8", "replace").splitlines()[:20]:
         m = _DUMP_MARKER.match(line.strip())
         if m and _parse_time(m.group(1)):
-            return "dump", _parse_time(m.group(1))
+            t = _parse_time(m.group(1))
+            return DumpTime("marker", t, t)
+    window = None
     if source["kind"] == "git":
-        t = _parse_time(_git_out(home, "log", "-1", "--format=%cI", "HEAD", "--", "knowledge.sql"))
-        if t:
-            return "git-commit", t
-    elif source["kind"] == "working-tree":
-        committed = _git_out(home, "log", "-1", "--format=%cI", "--", "knowledge.sql")
-        if committed and not _git_out(home, "status", "--porcelain", "--", "knowledge.sql"):
-            t = _parse_time(committed)
-            if t:
-                return "git-commit", t
-    mtime = source.get("mtime") or _iso(time.time())
-    return "file-mtime", _parse_time(mtime)
+        window = _commit_window(home, True)
+    elif source["kind"] == "working-tree" and not _git_out(home, "status", "--porcelain", "--", "knowledge.sql"):
+        window = _commit_window(home, False)
+    if window:
+        this, prev = window
+        note = ("knowledge.sql has no previous commit: the earlier bound of the dump time is unknown" if prev is None
+                else "")
+        return DumpTime("commit-window", this, prev, note)
+    t = _parse_time(source.get("mtime") or _iso(time.time()))
+    return DumpTime("mtime-fallback", t, t, "the weakest source: every difference with an audit row after the file's "
+                    "mtime passes, none before it does")
 
 
 def _table_names(conn: sqlite3.Connection) -> list:
@@ -906,7 +1073,7 @@ def _compare_tables_impl(report: DrillReport, restored: sqlite3.Connection, live
             if rvals == lvals:
                 continue
             for c, rv, lv in zip(common, rvals, lvals):
-                if rv == lv or classes[c] in (LIFECYCLE, KEYED):
+                if rv == lv or classes[c] in (LIFECYCLE, KEYED) or (table, c) in _AUDITED_WRITE_ONCE:
                     continue
                 if classes[c] == MUTABLE:
                     k = f"{table}.{c}"
@@ -927,13 +1094,15 @@ def _check_node_row(ctx: _Ctx, report: DrillReport, node_id, r: dict, l: dict) -
     live_meta = _parse_metadata(l.get("metadata"))[0] if "metadata" in l else {}
     live_status = l.get("status")
     if "status" in r:
-        out += _check_status(ctx, report, r["status"], l["status"], live_meta)
+        out += _check_status(ctx, report, node_id, r["status"], l["status"], live_meta)
     if "is_current" in r:
         out += _check_is_current(ctx, report, node_id, r["is_current"], l["is_current"], live_status, live_meta)
     if "superseded_by" in r:
         out += _check_superseded_by(ctx, report, node_id, r["superseded_by"], l["superseded_by"])
     if "resolved_by" in r:
         out += _check_resolved_by(ctx, report, node_id, r["resolved_by"], l["resolved_by"], live_status)
+    if "quoted_text" in r:
+        out += _check_quoted_text(ctx, report, node_id, r["quoted_text"], l["quoted_text"])
     if "metadata" in r:
         out += _compare_node_metadata(ctx, report, node_id, r["metadata"], l["metadata"])
     return out
@@ -1129,9 +1298,17 @@ def _drill_body(report: DrillReport, home: Path, db: Path, scratch: Path, live: 
     src = report.dump_source
     where = f"commit {src['commit']}" if src["kind"] == "git" else f"{src['path']} (mtime {src['mtime']})"
     report.sections.append(f"dump: {src['kind']} {where}")
-    source_name, dump_time = _dump_time(home, dump_bytes, src)
-    report.dump_time_source, report.dump_time = source_name, dump_time.isoformat()
-    report.sections.append(f"dump_time_source: {source_name} ({report.dump_time})")
+    dump_time = _dump_time(home, dump_bytes, src)
+    report.dump_time_source, report.dump_time = dump_time.source, dump_time.latest.isoformat()
+    report.dump_time_earliest = dump_time.earliest.isoformat() if dump_time.earliest else (
+        "" if dump_time.source == "commit-window" else report.dump_time)
+    report.dump_time_note = dump_time.note
+    if dump_time.source == "commit-window":
+        shown = (f"earliest {report.dump_time_earliest or 'unknown'}, latest {report.dump_time}"
+                 + (f"; {dump_time.note}" if dump_time.note else ""))
+    else:
+        shown = report.dump_time + (f"; {dump_time.note}" if dump_time.note else "")
+    report.sections.append(f"dump_time_source: {dump_time.source} ({shown})")
 
     sql_path = scratch / "knowledge.sql"
     with open(sql_path, "xb") as f:
@@ -1163,9 +1340,10 @@ def _drill_body(report: DrillReport, home: Path, db: Path, scratch: Path, live: 
             f"{len(report.live_only)} live_only nodes; {sum(report.mutable_diffs.values())} mutable-column "
             f"differences reported; {nfail} failures")
         report.sections.append(
-            "lifecycle (forward / forward, unstamped / backward / stamped before the dump / named transitions): " +
-            ("; ".join(f"{c} {v.get(_FWD, 0)}/{v.get(_FWD_UNSTAMPED, 0)}/{v.get(_BACK, 0)}/{v.get(_BEFORE, 0)}/"
-                       f"{v.get(_ALLOWED, 0)}" for c, v in sorted(report.lifecycle.items())) or "no differences"))
+            "audited columns (passed with a record after the dump / ambiguous / failed: no record / failed: record "
+            "before the dump / failed: not a transition): " +
+            ("; ".join(f"{c} {v.get(_PASS, 0)}/{v.get(_AMB, 0)}/{v.get(_NOREC, 0)}/{v.get(_BEFORE, 0)}/"
+                       f"{v.get(_NOTRANS, 0)}" for c, v in sorted(report.lifecycle.items())) or "no differences"))
         _write_scratch_config(home, scratch)
         try:
             res = _run_scratch_python(_CONNECT_SCRIPT, ["1" if embed else "0"], str(scratch), embedder_off=True,
@@ -1239,16 +1417,19 @@ def _write_scratch_config(home: Path, scratch: Path) -> None:
 
 def format_report(report: DrillReport) -> str:
     lines = list(report.sections)
-    lines.append("classification (write-once failures / mutable reported / lifecycle forward-only / keyed "
-                 "metadata / unclassified treated as write-once):")
+    lines.append("classification (write-once failures / mutable reported / lifecycle gated by the audit record / "
+                 "keyed metadata / unclassified treated as write-once):")
     for table, c in sorted(report.classification.items()):
         lines.append(f"  {table}: write_once={','.join(c[WRITE_ONCE]) or '-'}; mutable={','.join(c[MUTABLE]) or '-'}; "
                      f"lifecycle={','.join(c.get(LIFECYCLE, [])) or '-'}; keyed={','.join(c.get(KEYED, [])) or '-'}; "
                      f"unclassified={','.join(c[UNCLASSIFIED]) or '-'}")
-    unstamped = {c: v[_FWD_UNSTAMPED] for c, v in report.lifecycle.items() if v.get(_FWD_UNSTAMPED)}
-    if unstamped:
-        lines.append("forward, unstamped (the live row records no time for the change; reported, not failed): " +
-                     ", ".join(f"{c}={n}" for c, n in sorted(unstamped.items())))
+    if report.ambiguous:
+        lines.append(f"ambiguous: dump time unknown: {len(report.ambiguous)} difference(s) explained only by a record "
+                     f"between the two commits of knowledge.sql (reported, not failed): " + "; ".join(
+                         f"nodes id={a['key']!r} column {a['column']} recorded {a['recorded']}"
+                         for a in report.ambiguous[:20]) + (" ..." if len(report.ambiguous) > 20 else ""))
+    lines.append("known gap (a writer that leaves no audit row: a difference it makes fails, it is not told apart "
+                 "from corruption): " + " | ".join(report.known_gaps))
     for pair, t in sorted(report.lifecycle_transitions.items()):
         lines.append(f"named transition {pair} x{t['count']} (reported, allowed): {t['reason']}")
     if report.metadata_mutable_diffs:
@@ -1272,7 +1453,7 @@ def format_report(report: DrillReport) -> str:
         lines.append(f"FAILURE: {f}")
     lines.append(f"restore drill {'FAILED' if report.failures else 'PASSED'} in {report.seconds}s "
                  f"(nodes_restored={report.nodes_restored} rows_compared={report.rows_compared} "
-                 f"live_only={len(report.live_only)} vectors_missing={len(report.vectors_missing)} "
+                 f"live_only={len(report.live_only)} ambiguous={report.ambiguous_count} vectors_missing={len(report.vectors_missing)} "
                  f"live_vectors_stale={report.live_vectors_stale} transcripts_replayed={report.transcripts_replayed} "
                  f"transcript_live_only_bytes={report.transcript_live_only_bytes} failures={len(report.failures)}"
                  f"{'; embedding skipped' if report.embedding == 'skipped' else ''})")

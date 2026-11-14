@@ -578,19 +578,31 @@ def test_d10_no_embed_skips_the_model_and_says_so(home, tmp_path, monkeypatch, c
         conn.close()
 
 
-# ---------------------------------------------------------------- D11 lifecycle columns: forward only (round 2)
-# status, is_current, superseded_by, resolved_by pass only in the FORWARD direction (restored = earlier state,
-# live = later), with the stamp rule: the live row's own record of WHEN must be after the dump time.
+# ---------------------------------------------------------------- D11 lifecycle columns, gated by the audit record
+# The one rule: a difference between the restore and live is legal ONLY if the live graph's own record explains it
+# as a change made after the dump: (i) an edit_history row (or the retracted_at stamp) for that node, timestamped
+# after the dump time, AND (ii) a (restored, live) pair the code can make. No record: FAIL, naming table, key, column.
 
 T_DUMP = "2026-06-01T00:00:00+00:00"
 T_BEFORE = "2026-05-01T00:00:00+00:00"
 T_AFTER = "2026-07-01T00:00:00+00:00"
+_MARKER_LINE = "-- engram-dumped-at:"
+
+
+def _strip_marker(text: str) -> str:
+    return "".join(ln for ln in text.splitlines(keepends=True) if not ln.startswith(_MARKER_LINE))
 
 
 def mark_dump(home: Path, iso: str = T_DUMP) -> None:
-    """Prepend the dump-time marker line the drill reads (a SQL comment, so the dump still restores)."""
+    """Make the dump carry exactly ONE marker line, `iso` (dump_stripped already wrote one: replace it)."""
     p = home / "knowledge.sql"
-    p.write_text(f"-- engram-dumped-at: {iso}\n" + p.read_text(encoding="utf-8"), encoding="utf-8")
+    p.write_text(f"{_MARKER_LINE} {iso}\n" + _strip_marker(p.read_text(encoding="utf-8")), encoding="utf-8")
+
+
+def strip_marker(home: Path) -> None:
+    """An OLDER dump: no marker line at all."""
+    p = home / "knowledge.sql"
+    p.write_text(_strip_marker(p.read_text(encoding="utf-8")), encoding="utf-8")
 
 
 def retract_sql(at):
@@ -604,32 +616,9 @@ def lc(rep, col):
     return rep.lifecycle.get(col, {})
 
 
-def test_d11_forward_retraction_stamped_after_the_dump_passes_and_is_counted(home, tmp_path):
-    mark_dump(home)
-    live_exec(home, *retract_sql(T_AFTER))
-    rep = drill(home, tmp_path / "scratch")
-    assert rep.exit_code == 0, rep.failures
-    assert lc(rep, "status")["forward"] == 1 and lc(rep, "is_current")["forward"] == 1
-    assert lc(rep, "status").get("backward", 0) == 0
-
-
-def test_d11_forward_retraction_stamped_before_the_dump_fails(home, tmp_path):
-    mark_dump(home)
-    live_exec(home, *retract_sql(T_BEFORE))
-    rep = drill(home, tmp_path / "scratch")
-    assert rep.exit_code == 1
-    assert lc(rep, "status")["stamped_before_dump"] == 1
-    hit = [f for f in rep.failures if "ob_0001" in f and "column status" in f and "before the dump" in f]
-    assert hit and "nodes" in hit[0], rep.failures
-
-
-def test_d11_forward_with_no_stamp_is_reported_on_its_own_line_not_failed(home, tmp_path):
-    mark_dump(home)
-    live_exec(home, *retract_sql(None))
-    rep = drill(home, tmp_path / "scratch")
-    assert rep.exit_code == 0, rep.failures
-    assert lc(rep, "status")["forward_unstamped"] == 1
-    assert "forward, unstamped" in rd.format_report(rep)
+def _edit(home, action, node, ts, details="{}"):
+    live_exec(home, "INSERT INTO edit_history(timestamp,turn,action,node_id,node_type,details) "
+                    "VALUES(?,?,?,?,?,?)", (ts, 1, action, node, "observation", details))
 
 
 def _dump_with(home, sql, params=()):
@@ -638,145 +627,196 @@ def _dump_with(home, sql, params=()):
     mark_dump(home)
 
 
-def test_d11_backward_status_names_table_key_column(home, tmp_path):
-    _dump_with(home, *retract_sql(T_BEFORE))  # the dump already shows ob_0001 retracted
-    live_exec(home, "UPDATE nodes SET status='active', is_current=1 WHERE id='ob_0001'")  # live says active
-    rep = drill(home, tmp_path / "scratch")
-    assert rep.exit_code == 1
-    assert lc(rep, "status")["backward"] == 1
-    hit = [f for f in rep.failures if "nodes" in f and "ob_0001" in f and "column status" in f
-           and "retracted" in f and "active" in f]
-    assert hit, rep.failures
+def _hits(rep, *needles):
+    return [f for f in rep.failures if all(n in f for n in needles)]
 
 
-def test_d11_is_current_forward_passes_backward_fails(home, tmp_path):
+def test_d11_retraction_with_the_retracted_at_stamp_after_the_dump_passes_and_is_counted(home, tmp_path):
     mark_dump(home)
-    live_exec(home, "UPDATE nodes SET is_current=0 WHERE id='ob_0002'")
+    live_exec(home, *retract_sql(T_AFTER))
     rep = drill(home, tmp_path / "scratch")
     assert rep.exit_code == 0, rep.failures
-    assert lc(rep, "is_current")["forward_unstamped"] == 1  # no edit_history row to stamp it
-    # backward: restored 0, live 1
-    home2 = make_home(tmp_path, "home2")
-    _dump_with(home2, "UPDATE nodes SET is_current=0 WHERE id='ob_0002'")
-    live_exec(home2, "UPDATE nodes SET is_current=1 WHERE id='ob_0002'")
-    rep2 = drill(home2, tmp_path / "scratch2")
-    assert rep2.exit_code == 1
-    assert any("ob_0002" in f and "column is_current" in f for f in rep2.failures), rep2.failures
-    assert lc(rep2, "is_current")["backward"] == 1
+    assert lc(rep, "status")["passed"] == 1 and lc(rep, "is_current")["passed"] == 1
+    assert rep.ambiguous_count == 0
 
 
-def test_d11_superseded_by_null_to_value_forward_value_to_null_backward_value_to_value_fails(tmp_path):
-    h1 = make_home(tmp_path, "h1")
-    mark_dump(h1)
-    live_exec(h1, "UPDATE nodes SET is_current=0, superseded_by='ob_0003' WHERE id='ob_0001'")
-    rep = drill(h1, tmp_path / "s1")
-    assert rep.exit_code == 0, rep.failures
-    assert lc(rep, "superseded_by")["forward_unstamped"] == 1
-
-    h2 = make_home(tmp_path, "h2")
-    _dump_with(h2, "UPDATE nodes SET superseded_by='ob_0003' WHERE id='ob_0001'")
-    live_exec(h2, "UPDATE nodes SET superseded_by=NULL WHERE id='ob_0001'")
-    rep = drill(h2, tmp_path / "s2")
-    assert rep.exit_code == 1 and lc(rep, "superseded_by")["backward"] == 1
-    assert any("ob_0001" in f and "column superseded_by" in f for f in rep.failures)
-
-    h3 = make_home(tmp_path, "h3")
-    _dump_with(h3, "UPDATE nodes SET superseded_by='ob_0002' WHERE id='ob_0001'")
-    live_exec(h3, "UPDATE nodes SET superseded_by='ob_0003' WHERE id='ob_0001'")
-    rep = drill(h3, tmp_path / "s3")
+def test_d11_retraction_stamped_before_the_dump_fails(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, *retract_sql(T_BEFORE))
+    rep = drill(home, tmp_path / "scratch")
     assert rep.exit_code == 1
-    assert any("ob_0001" in f and "column superseded_by" in f and "ob_0002" in f and "ob_0003" in f
-               for f in rep.failures), rep.failures
+    assert lc(rep, "status")["failed_before_dump"] == 1
+    assert _hits(rep, "nodes", "ob_0001", "column status", "before the dump")
 
 
-def _edit(home, action, node, ts):
-    live_exec(home, "INSERT INTO edit_history(timestamp,turn,action,node_id,node_type,details) "
-                    "VALUES(?,?,?,?,?,?)", (ts, 1, action, node, "observation", "{}"))
+def test_d11_retraction_with_no_record_at_all_fails_naming_table_key_column(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, *retract_sql(None))  # no retracted_at, and no edit_history row
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 1
+    assert lc(rep, "status")["failed_no_record"] == 1
+    assert _hits(rep, "nodes", "id='ob_0001'", "column status", "no audit record")
 
 
-def test_d11_supersede_stamp_comes_from_edit_history_and_must_be_after_the_dump(tmp_path):
-    for name, ts, want in (("after", T_AFTER, 0), ("before", T_BEFORE, 1)):
+def test_d11_retraction_recorded_only_by_an_edit_history_row_after_the_dump_passes(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, *retract_sql(None))
+    _edit(home, "retracted", "ob_0001", T_AFTER)
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 0, rep.failures
+
+
+def test_d11_a_retraction_in_the_dump_that_is_active_live_fails_even_with_a_patch_row(home, tmp_path):
+    _dump_with(home, *retract_sql(T_BEFORE))  # the dump already shows ob_0001 retracted
+    live_exec(home, "UPDATE nodes SET status='active', is_current=1 WHERE id='ob_0001'")
+    _edit(home, "surgical_field_patch", "ob_0001", T_AFTER, json.dumps({"field": "status"}))
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 1
+    assert lc(rep, "status")["failed_transition"] == 1
+    assert _hits(rep, "nodes", "ob_0001", "column status", "retracted", "active")
+
+
+def _resolved_then_reopened(tmp_path, name, row_at):
+    h = make_home(tmp_path, name)
+    _dump_with(h, "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'")
+    live_exec(h, "UPDATE nodes SET status='open', resolved_by=NULL WHERE id='ob_0001'")
+    if row_at:
+        _edit(h, "resolution_recomputed", "ob_0001", row_at)
+    return h
+
+
+def test_d11_lifecycle_transition_with_an_audit_row_after_the_dump_passes_and_is_counted(tmp_path):
+    h = _resolved_then_reopened(tmp_path, "h", T_AFTER)
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "status")["passed"] == 1 and lc(rep, "resolved_by")["passed"] == 1
+    assert "resolved -> open" in rep.lifecycle_transitions
+    assert "_recompute_resolution_target" in rep.lifecycle_transitions["resolved -> open"]["reason"]
+    assert "resolved -> open" in rd.format_report(rep)
+
+
+def test_d11_lifecycle_transition_with_an_audit_row_before_the_dump_fails(tmp_path):
+    h = _resolved_then_reopened(tmp_path, "h", T_BEFORE)
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 1
+    assert lc(rep, "status")["failed_before_dump"] == 1 and lc(rep, "resolved_by")["failed_before_dump"] == 1
+    assert _hits(rep, "nodes", "ob_0001", "column status", "before the dump")
+
+
+def test_d11_lifecycle_transition_with_no_audit_row_fails_naming_table_key_column(tmp_path):
+    h = _resolved_then_reopened(tmp_path, "h", None)
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 1
+    assert _hits(rep, "nodes", "id='ob_0001'", "column status", "no audit record")
+    assert _hits(rep, "nodes", "id='ob_0001'", "column resolved_by", "no audit record")
+    assert lc(rep, "status")["failed_no_record"] == 1 and lc(rep, "resolved_by")["failed_no_record"] == 1
+
+
+def test_d11_an_unlisted_transition_fails_even_with_an_audit_row_after_the_dump(home, tmp_path):
+    mark_dump(home)
+    # restored 'active' -> live 'resolved' is not a pair any code path writes; a 'resolved' row does not make it one
+    live_exec(home, "UPDATE nodes SET status='resolved' WHERE id='ob_0001'")
+    _edit(home, "resolved", "ob_0001", T_AFTER)
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 1
+    assert lc(rep, "status")["failed_transition"] == 1
+    assert _hits(rep, "nodes", "ob_0001", "column status", "'active'", "'resolved'", "not a transition")
+
+
+def test_d11_a_resolution_move_is_not_explained_by_another_nodes_audit_row(home, tmp_path):
+    _dump_with(home, "UPDATE nodes SET status='resolved', resolved_by='ob_0003' WHERE id='ob_0002'")
+    live_exec(home, "UPDATE nodes SET status='open', resolved_by=NULL WHERE id='ob_0002'")
+    _edit(home, "resolution_recomputed", "ob_0003", T_AFTER)  # a row for a DIFFERENT node
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.exit_code == 1
+    assert _hits(rep, "ob_0002", "no audit record")
+
+
+def test_d11_task_status_move_needs_its_status_row_after_the_dump(tmp_path):
+    for name, row, want in (("yes", ("status_planned_to_done", T_AFTER), 0), ("no", None, 1),
+                            ("old", ("status_planned_to_done", T_BEFORE), 1)):
+        h = make_home(tmp_path, name)
+        _dump_with(h, "UPDATE nodes SET status='planned' WHERE id='ob_0001'")
+        live_exec(h, "UPDATE nodes SET status='done' WHERE id='ob_0001'")
+        if row:
+            _edit(h, row[0], "ob_0001", row[1])
+        rep = drill(h, tmp_path / ("s" + name))
+        assert rep.exit_code == want, (name, rep.failures)
+        if not want:
+            assert "planned -> done" in rep.lifecycle_transitions
+
+
+def test_d11_field_patch_on_status_passes_only_with_its_own_row_naming_that_field(tmp_path):
+    for name, details, want in (("status", {"field": "status"}, 0), ("claim", {"field": "claim"}, 1)):
+        h = make_home(tmp_path, name)
+        mark_dump(h)
+        live_exec(h, "UPDATE nodes SET status='blocked' WHERE id='ob_0001'")  # active -> blocked: not a listed pair
+        _edit(h, "surgical_field_patch", "ob_0001", T_AFTER, json.dumps(details))
+        rep = drill(h, tmp_path / ("s" + name))
+        assert rep.exit_code == want, (name, rep.failures)
+
+
+def test_d11_supersede_needs_its_superseded_row_after_the_dump(tmp_path):
+    for name, ts, want in (("after", T_AFTER, 0), ("before", T_BEFORE, 1), ("none", None, 1)):
         h = make_home(tmp_path, "h" + name)
         mark_dump(h)
         live_exec(h, "UPDATE nodes SET is_current=0, superseded_by='ob_0003' WHERE id='ob_0001'")
-        _edit(h, "superseded", "ob_0001", ts)
+        if ts:
+            _edit(h, "superseded", "ob_0001", ts)
         rep = drill(h, tmp_path / ("s" + name))
         assert rep.exit_code == want, (name, rep.failures)
-        assert lc(rep, "superseded_by").get("forward_unstamped", 0) == 0
         if want:
-            assert lc(rep, "superseded_by")["stamped_before_dump"] == 1
+            assert _hits(rep, "nodes", "ob_0001", "column superseded_by")
+        else:
+            assert lc(rep, "superseded_by")["passed"] == 1 and lc(rep, "is_current")["passed"] == 1
 
 
-def test_d11_resolution_transitions_are_named_and_allowed(tmp_path):
-    # the code paths that move status/resolved_by backward are NAMED (engram_core _recompute_resolution_target
-    # reopen; _resolve_impl): resolved -> open with resolved_by -> NULL passes and is listed with its reason.
-    h = make_home(tmp_path, "h")
-    _dump_with(h, "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'")
-    live_exec(h, "UPDATE nodes SET status='open', resolved_by=NULL WHERE id='ob_0001'")
-    rep = drill(h, tmp_path / "s")
-    assert rep.exit_code == 0, rep.failures
-    assert "resolved -> open" in rep.lifecycle_transitions
-    assert "_recompute_resolution_target" in rep.lifecycle_transitions["resolved -> open"]["reason"]
-    assert lc(rep, "status")["allowed_transition"] == 1 and lc(rep, "resolved_by")["allowed_transition"] == 1
-    assert "resolved -> open" in rd.format_report(rep)
+def test_d11_backward_is_current_and_changed_superseded_by_fail_even_with_a_row(tmp_path):
+    h = make_home(tmp_path, "h2")
+    _dump_with(h, "UPDATE nodes SET is_current=0, superseded_by='ob_0002' WHERE id='ob_0001'")
+    live_exec(h, "UPDATE nodes SET is_current=1, superseded_by='ob_0003' WHERE id='ob_0001'")
+    _edit(h, "superseded", "ob_0001", T_AFTER)
+    rep = drill(h, tmp_path / "s2")
+    assert rep.exit_code == 1
+    assert _hits(rep, "ob_0001", "column is_current")
+    assert _hits(rep, "ob_0001", "column superseded_by", "ob_0002", "ob_0003")
+    h3 = make_home(tmp_path, "h3")
+    _dump_with(h3, "UPDATE nodes SET superseded_by='ob_0003' WHERE id='ob_0001'")
+    live_exec(h3, "UPDATE nodes SET superseded_by=NULL WHERE id='ob_0001'")
+    rep = drill(h3, tmp_path / "s3")
+    assert rep.exit_code == 1 and any("ob_0001" in f and "column superseded_by" in f for f in rep.failures)
 
 
 def test_d11_resolved_by_cleared_while_status_is_not_open_fails(tmp_path):
     h = make_home(tmp_path, "h")
     _dump_with(h, "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'")
     live_exec(h, "UPDATE nodes SET status='resolved', resolved_by=NULL WHERE id='ob_0001'")
+    _edit(h, "resolution_recomputed", "ob_0001", T_AFTER)
     rep = drill(h, tmp_path / "s")
     assert rep.exit_code == 1
     assert any("ob_0001" in f and "column resolved_by" in f for f in rep.failures), rep.failures
 
 
-def test_d11_resolved_by_null_to_value_is_forward_and_unlisted_status_pairs_fail(tmp_path):
-    h = make_home(tmp_path, "h")
-    mark_dump(h)
-    live_exec(h, "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'")
-    rep = drill(h, tmp_path / "s")
-    # restored 'active' -> live 'resolved' is not a pair any code path writes: fails loud
+def test_d11_a_writer_with_no_audit_row_is_named_and_its_difference_fails(home, tmp_path):
+    mark_dump(home)
+    # restored resolved_by NULL -> live a resolver, with no edit_history row: what _backfill_resolved_by writes
+    live_exec(home, "UPDATE nodes SET resolved_by='ob_0002' WHERE id='ob_0001'")
+    rep = drill(home, tmp_path / "scratch")
     assert rep.exit_code == 1
-    assert lc(rep, "resolved_by")["forward_unstamped"] == 1
-    assert any("column status" in f and "'active'" in f and "'resolved'" in f for f in rep.failures)
+    hit = _hits(rep, "nodes", "ob_0001", "column resolved_by", "no audit record")
+    assert hit and "_backfill_resolved_by" in hit[0] and "_resolve_impl" in hit[0], rep.failures
+    gaps = " ".join(rd.NO_AUDIT_WRITERS)
+    assert "engram_core._backfill_resolved_by" in gaps and "engram_revision._resolve_impl" in gaps
+    assert "Known gaps" in rd.__doc__ and "_backfill_resolved_by" in rd.__doc__
+    assert "known gap" in rd.format_report(rep).lower()
 
 
-def test_d11_status_task_family_transitions_pass(tmp_path):
-    h = make_home(tmp_path, "h")
-    _dump_with(h, "UPDATE nodes SET status='planned' WHERE id='ob_0001'")
-    live_exec(h, "UPDATE nodes SET status='done' WHERE id='ob_0001'")
-    rep = drill(h, tmp_path / "s")
+def test_d11_the_same_difference_with_a_row_after_the_dump_passes(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, "UPDATE nodes SET resolved_by='ob_0002' WHERE id='ob_0001'")
+    _edit(home, "resolution_recomputed", "ob_0001", T_AFTER)
+    rep = drill(home, tmp_path / "scratch")
     assert rep.exit_code == 0, rep.failures
-    assert "planned -> done" in rep.lifecycle_transitions
-
-
-# dump_time_source: the dump's own marker, then the commit time of knowledge.sql, then the file mtime
-
-def test_d11_dump_time_source_marker(home, tmp_path):
-    mark_dump(home, T_DUMP)
-    rep = drill(home, tmp_path / "scratch")
-    assert rep.dump_time_source == "dump" and rep.dump_time.startswith("2026-06-01T00:00:00")
-    assert "dump_time_source" in rd.format_report(rep)
-
-
-def test_d11_dump_time_source_git_commit(home, tmp_path):
-    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
-           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
-           "GIT_COMMITTER_DATE": "2026-03-04T05:06:07+00:00", "GIT_AUTHOR_DATE": "2026-03-04T05:06:07+00:00"}
-    for args in (["init", "-q"], ["add", "knowledge.sql"], ["commit", "-q", "-m", "dump"]):
-        subprocess.run(["git", "-C", str(home), *args], check=True, capture_output=True, env=env)
-    rep = drill(home, tmp_path / "scratch")
-    assert rep.dump_time_source == "git-commit"
-    assert rep.dump_time.startswith("2026-03-04T05:06:07")
-    rep2 = drill(home, tmp_path / "scratch2", from_git=True)
-    assert rep2.dump_time_source == "git-commit" and rep2.dump_time.startswith("2026-03-04T05:06:07")
-
-
-def test_d11_dump_time_source_mtime_fallback(home, tmp_path):
-    os.utime(home / "knowledge.sql", (1_700_000_000, 1_700_000_000))
-    rep = drill(home, tmp_path / "scratch")
-    assert rep.dump_time_source == "file-mtime"
-    assert rep.dump_time.startswith("2023-11-14T22:13:20")
 
 
 def test_d11_a_mutable_column_still_only_reported(home, tmp_path):
@@ -785,6 +825,200 @@ def test_d11_a_mutable_column_still_only_reported(home, tmp_path):
     rep = drill(home, tmp_path / "scratch")
     assert rep.exit_code == 0, rep.failures
     assert rep.mutable_diffs.get("nodes.confidence") == 1
+
+
+# ---------------------------------------------------------------- D11b the dump time: marker, commit window, mtime
+
+_GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+
+def _git(home, *args, date=None):
+    env = {**os.environ, **_GIT_ENV}
+    if date:
+        env.update(GIT_COMMITTER_DATE=date, GIT_AUTHOR_DATE=date)
+    subprocess.run(["git", "-C", str(home), *args], check=True, capture_output=True, env=env)
+
+
+T_C1 = "2026-05-01T00:00:00+00:00"   # the previous commit of knowledge.sql
+T_C2 = "2026-06-01T00:00:00+00:00"   # this commit
+T_BETWEEN = "2026-05-15T00:00:00+00:00"
+T_BEFORE_C1 = "2026-04-01T00:00:00+00:00"
+T_AFTER_C2 = "2026-07-01T00:00:00+00:00"
+
+
+def two_commit_home(tmp_path, name="h"):
+    """An OLDER dump (no marker) committed twice, T_C1 then T_C2; ob_0001 is then retracted live."""
+    h = make_home(tmp_path, name)
+    strip_marker(h)
+    _git(h, "init", "-q")
+    _git(h, "add", "knowledge.sql")
+    _git(h, "commit", "-q", "-m", "one", date=T_C1)
+    live_exec(h, "UPDATE nodes SET confidence = 0.5 WHERE id = 'ob_0003'")
+    dump(h)
+    strip_marker(h)
+    _git(h, "add", "knowledge.sql")
+    _git(h, "commit", "-q", "-m", "two", date=T_C2)
+    live_exec(h, *retract_sql(None))
+    return h
+
+
+def test_d11b_marker_present_the_source_is_marker_even_with_commits(tmp_path):
+    h = two_commit_home(tmp_path)
+    mark_dump(h, T_DUMP)
+    _git(h, "add", "knowledge.sql")
+    _git(h, "commit", "-q", "-m", "three", date=T_AFTER_C2)
+    _edit(h, "retracted", "ob_0001", T_AFTER_C2)
+    rep = drill(h, tmp_path / "s")
+    assert rep.dump_time_source == "marker"
+    assert rep.dump_time.startswith("2026-06-01T00:00:00") and rep.dump_time_earliest == rep.dump_time
+    assert "dump_time_source: marker" in rd.format_report(rep)
+
+
+def test_d11b_no_marker_and_two_commits_the_window_is_the_two_commit_times(tmp_path):
+    h = two_commit_home(tmp_path)
+    _edit(h, "retracted", "ob_0001", T_AFTER_C2)
+    rep = drill(h, tmp_path / "s")
+    assert rep.dump_time_source == "commit-window"
+    assert rep.dump_time_earliest.startswith("2026-05-01T00:00:00") and rep.dump_time.startswith("2026-06-01T00:00:00")
+    assert "commit-window" in rd.format_report(rep)
+    rep2 = drill(h, tmp_path / "s2", from_git=True)
+    assert rep2.dump_time_source == "commit-window" and rep2.dump_time_earliest.startswith("2026-05-01")
+
+
+def test_d11b_a_change_after_this_commit_passes_before_the_previous_commit_fails(tmp_path):
+    h = two_commit_home(tmp_path, "ha")
+    _edit(h, "retracted", "ob_0001", T_AFTER_C2)
+    rep = drill(h, tmp_path / "sa")
+    assert rep.exit_code == 0, rep.failures
+    assert rep.ambiguous_count == 0 and lc(rep, "status")["passed"] == 1
+    h2 = two_commit_home(tmp_path, "hb")
+    _edit(h2, "retracted", "ob_0001", T_BEFORE_C1)
+    rep2 = drill(h2, tmp_path / "sb")
+    assert rep2.exit_code == 1
+    assert lc(rep2, "status")["failed_before_dump"] == 1 and rep2.ambiguous_count == 0
+
+
+def test_d11b_a_change_between_the_two_commits_is_reported_as_ambiguous_and_exits_0(tmp_path):
+    h = two_commit_home(tmp_path)
+    _edit(h, "retracted", "ob_0001", T_BETWEEN)
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 0, rep.failures
+    assert rep.failures == []
+    assert rep.ambiguous_count == 2  # status and is_current, both explained only by that row
+    assert {a["column"] for a in rep.ambiguous} == {"status", "is_current"}
+    assert all(a["key"] == "ob_0001" and a["table"] == "nodes" for a in rep.ambiguous)
+    out = rd.format_report(rep)
+    assert "ambiguous: dump time unknown" in out and "column status" in out
+    assert rep.to_json()["ambiguous_count"] == 2 and rep.to_json()["passed"] is True
+
+
+def test_d11b_a_single_commit_leaves_the_earlier_bound_unknown_never_invented(tmp_path):
+    h = make_home(tmp_path)
+    strip_marker(h)
+    _git(h, "init", "-q")
+    _git(h, "add", "knowledge.sql")
+    _git(h, "commit", "-q", "-m", "one", date=T_C2)
+    live_exec(h, *retract_sql(None))
+    _edit(h, "retracted", "ob_0001", T_BEFORE_C1)  # before the only commit: nothing says it predates the dump
+    rep = drill(h, tmp_path / "s")
+    assert rep.dump_time_source == "commit-window"
+    assert rep.dump_time_earliest == "" and "earliest unknown" in rd.format_report(rep)
+    assert rep.exit_code == 0 and rep.ambiguous_count == 2
+
+
+def test_d11b_mtime_fallback_for_a_dump_with_no_repo_and_no_marker(home, tmp_path):
+    strip_marker(home)
+    os.utime(home / "knowledge.sql", (1_700_000_000, 1_700_000_000))
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.dump_time_source == "mtime-fallback"
+    assert rep.dump_time.startswith("2023-11-14T22:13:20")
+    assert "weakest" in rd.format_report(rep)
+
+
+# ---------------------------------------------------------------- D11c the marker, written by dump_stripped
+
+def test_d11c_dump_stripped_writes_exactly_one_marker_line_first(home):
+    lines = (home / "knowledge.sql").read_text(encoding="utf-8").splitlines()
+    marks = [ln for ln in lines if ln.startswith(_MARKER_LINE)]
+    assert len(marks) == 1 and lines[0] == marks[0]
+    stamp = marks[0].split(":", 1)[1].strip()
+    t = rd._parse_time(stamp)
+    assert t is not None and t.utcoffset().total_seconds() == 0
+    stats = rd.engram_backup.dump_stripped(str(home / "knowledge.db"), str(home / "again.sql"))
+    assert stats["dumped_at"].startswith(stamp[:10])
+    assert sum(1 for ln in (home / "again.sql").read_text(encoding="utf-8").splitlines()
+               if ln.startswith(_MARKER_LINE)) == 1
+
+
+def test_d11c_the_stamp_is_taken_before_the_backup_so_it_never_post_dates_the_data(home):
+    import datetime as dt
+    before = dt.datetime.now(dt.timezone.utc)
+    dump(home)
+    after = dt.datetime.now(dt.timezone.utc)
+    first = (home / "knowledge.sql").read_text(encoding="utf-8").splitlines()[0]
+    t = rd._parse_time(first.split(":", 1)[1].strip())
+    assert before <= t <= after
+
+
+def test_d11c_every_dump_consumer_loads_a_dump_that_carries_the_marker(home, tmp_path):
+    db = str(home / "knowledge.db")
+    text = (home / "knowledge.sql").read_text(encoding="utf-8")
+    assert text.startswith(_MARKER_LINE)
+    # restore (the sqlite3 module, as the drill and a human restore do)
+    conn = sqlite3.connect(tmp_path / "r.db")
+    conn.executescript(text)
+    assert conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] == len(CLAIMS)
+    conn.close()
+    # engram_backup's own readers
+    assert rd.engram_backup._verify_dump_restores(str(home / "knowledge.sql"), len(CLAIMS)) == len(CLAIMS)
+    assert rd.engram_backup.verify_roundtrip(db) is not None
+    # the drill
+    assert drill(home, tmp_path / "scratch").exit_code == 0
+
+
+# ---------------------------------------------------------------- D16 requote: write-once under the same rule
+
+def _requote_pair(tmp_path, name):
+    h = make_home(tmp_path, name)
+    mark_dump(h)
+    live_exec(h, "UPDATE nodes SET quoted_text='a new quote' WHERE id='ob_0001'")
+    return h
+
+
+def test_d16_a_quoted_text_difference_with_a_requoted_row_after_the_dump_passes(tmp_path):
+    h = _requote_pair(tmp_path, "h")
+    _edit(h, "requoted", "ob_0001", T_AFTER)
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "quoted_text")["passed"] == 1
+
+
+def test_d16_a_quoted_text_difference_with_no_audit_row_fails_naming_the_column(tmp_path):
+    h = _requote_pair(tmp_path, "h")
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 1
+    assert _hits(rep, "nodes", "id='ob_0001'", "column quoted_text", "no audit record")
+
+
+def test_d16_a_requoted_row_before_the_dump_does_not_explain_the_difference(tmp_path):
+    h = _requote_pair(tmp_path, "h")
+    _edit(h, "requoted", "ob_0001", T_BEFORE)
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 1
+    assert _hits(rep, "column quoted_text", "before the dump")
+
+
+def test_d16_a_field_patch_on_quoted_text_also_records_it(tmp_path):
+    h = _requote_pair(tmp_path, "h")
+    _edit(h, "surgical_field_patch", "ob_0001", T_AFTER, json.dumps({"field": "quoted_text"}))
+    assert drill(h, tmp_path / "s").exit_code == 0
+
+
+def test_d16_requote_writes_an_audit_row_in_the_shipped_code():
+    src = (PKG_ROOT / "engram_observation.py").read_text(encoding="utf-8")
+    i = src.index("UPDATE nodes SET quoted_text = ?")
+    assert '_log_edit(conn, "requoted"' in src[i:i + 1500]
 
 
 # ---------------------------------------------------------------- D12 nodes.metadata key by key
