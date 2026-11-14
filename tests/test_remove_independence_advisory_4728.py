@@ -194,15 +194,13 @@ def test_c_line_silent_when_graph_holds_one_lineage():
 # -- Cell E ------------------------------------------------------------------
 
 def _stored_lineage_count():
+    """The gate's own counter (engram_core._graph_lineage_count) on the test DB."""
     import sqlite3
     import server as _server
     conn = sqlite3.connect(str(_server.core.DB_PATH))
+    conn.row_factory = sqlite3.Row
     try:
-        return conn.execute(
-            "SELECT COUNT(DISTINCT standpoint_lineage) FROM nodes "
-            "WHERE is_current = 1 AND type LIKE 'observation_%' "
-            "AND standpoint_lineage IS NOT NULL AND TRIM(standpoint_lineage) != ''"
-        ).fetchone()[0]
+        return _server.core._graph_lineage_count(conn)
     finally:
         conn.close()
 
@@ -227,6 +225,31 @@ def test_e_explicit_same_lineage_single_lineage_graph_is_silent():
     blob = json.dumps(result, ensure_ascii=False)
     for frag in _FOLD_FRAGMENTS:
         assert frag not in blob, f"{frag!r} leaked into a silent response: {blob}"
+
+
+# -- Cell F ------------------------------------------------------------------
+
+def test_f_unset_self_lineage_mixed_premises_nothing_warns():
+    """The named bound. self_lineage UNSET (fail-closed), a graph holding two or
+    more stored lineages, premises = two observations explicitly marked with the
+    SAME lineage plus one unmarked observation. On an install that never
+    recorded its own lineage an unmarked premise has no lineage, so the
+    standpoint line's lineage block is skipped and nothing warns where the
+    removed advisory fired. The CHANGELOG states this bound."""
+    c = fresh_client()
+    _set_self_lineage("")  # unset: null=self does not engage
+    _obs(c, 8, lineage="openai:gpt")         # not premises
+    _obs(c, 9, lineage="google:gemini")
+    o1 = _obs(c, 1, lineage="anthropic:sonnet")
+    o2 = _obs(c, 2, lineage="anthropic:sonnet")
+    o3 = _obs(c, 3)                          # unmarked
+    assert _stored_lineage_count() >= 2, "precondition: graph holds >= 2 lineages"
+    result = _generalize(c, [o1, o2, o3])
+    assert "independence_advisory" not in result, sorted(result)
+    assert not _line(result), (
+        f"no standpoint line expected when an unmarked premise has no lineage: "
+        f"{result.get('structure_warnings')}"
+    )
 
 
 # -- Cell D ------------------------------------------------------------------

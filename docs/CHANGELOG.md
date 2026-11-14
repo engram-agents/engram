@@ -13,7 +13,8 @@ with an `-alpha` suffix during the alpha phase.
 
 - `engram_derive` no longer returns an `independence_advisory` key. It duplicated
   the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
-  or more lineages that line covers every case the advisory did; in a graph
+  or more lineages, and when the install has recorded its own lineage, that line
+  covers every case the advisory did; in a graph
   with a single lineage, a generalization over same-lineage premises now gets
   no warning, because the line only warns when a cross-lineage observation
   exists to cite. That line now carries the same three options (add a
