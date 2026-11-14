@@ -422,6 +422,8 @@ seat can run it and any other seat can check that it ran.
    pressing: `--match-head-commit` pins only the head, never the base, so without
    this check two owners can each pass a scratch run on the same base and the second
    presses on a tree it never tested (the 2026-09-13 jointly-broken case, Borges).
+   The assertion is chained to the merge with `&&`, never left to `set -e` (see
+   *Merge-seat test rules*, rule 5).
    The release PR into `main` is **never merged with the button**: `main` is
    fast-forwarded to its head (`docs/internal/RELEASING.md`, steps 6 to 8), and there
    is no hotfix PR into `main`. A release branch that carries its own commits comes
@@ -864,14 +866,14 @@ recomputes `mergeStateStatus` asynchronously, so at that moment it commonly read
 `UNKNOWN`. Under the CI-green gate above, `UNKNOWN` means pending, never a value to
 echo and press past.
 
-In the same command as the press, the step:
-- (a) asserts the base is the SHA the run was built on, or the previous step's merge
+The step has three parts, in this order:
+- (a) in the press command itself, chained with `&&` into the merge, asserts the base is the SHA the run was built on, or the previous step's merge
   commit;
-- (b) polls until `mergeStateStatus` reads `CLEAN`, or until a read of every run of
+- (b) in the gate read, a separate tool call made before the press, polls until `mergeStateStatus` reads `CLEAN`, or until a read of every run of
   the repo's required check on the head (on engram's `dev` ruleset, which requires a PR, 1 approval, stale approvals
   dismissed on push, last-push approval and the status check `pr-checks`, that
   check is `pr-checks`) prints `success`. The poll is bounded at five minutes. Past that
-  ceiling the press refuses and names the last state it read;
+  ceiling the gate read prints the last state it read, and the seat does not press;
 - (c) after the press, asserts that the base's tree equals the tree the run predicted
   for that step.
 
@@ -915,6 +917,38 @@ runs, the same evidence the rollup summarises (and stricter: no dedupe), instead
 field GitHub has not recomputed, so it does not press past an unread state. `UNKNOWN` also covers mergeability (conflicts,
 approvals). The read does not check those; the press command itself does, because
 GitHub refuses a merge that the branch rules block.
+
+**Guards stop the press by control flow, not `set -e`.** In the Claude Code Bash
+tool, `set -e` does not stop a command: the tool runs the command inside an `&&` list,
+and bash ignores `errexit` in a command that is not the last member of such a list. Measured on a merge seat, 2026-11-09:
+`set -e; false; echo SURVIVED` printed `SURVIVED`. That was observed through the tool;
+in a plain terminal, `bash -c 'set -e; false; echo SURVIVED'` exits 1, so do not re-test
+it there. A press script that leans on
+`set -e` or `set -euo pipefail` to stop at a failed guard is therefore fail-open: on
+2026-11-09 a seat's script printed its own failure line and still ran `gh pr merge`,
+and the v0.5.6 CHANGELOG pull request (#4545) was merged past a failing test that printed
+in the same output. A guard written as a bare `test ...` or `grep -q ...` on
+its own line stops nothing. So:
+- A guard stops the press only by explicit control flow: chained to the merge with
+  `&&`, or followed by `|| exit 1` (or `|| { echo "<NAME>-FAILED"; exit 1; }`).
+- The seat reads the gate's verdicts as printed text before pressing, in a separate
+  tool call from the press. The read prints one positive line per check (for example
+  `BASE-OK <sha>`, `CHECKS success`, `TREE <tree>`); the seat reads them, and only
+  then sends the press call. An exit status alone is not a verdict, because a
+  wrapper's `echo` after the command masks it (`pytest ...; echo done` returns `echo`'s
+  status, 0, whatever pytest did).
+- The press call still re-asserts what can move: the base, chained with `&&` into
+  the merge. This keeps item 8's race closure, since the base can move between the
+  gate read and the press. (b)'s CI poll belongs to the gate read. (c)'s tree
+  assertion runs after the press, and its printed result is read too.
+
+```
+git fetch -q origin <base> \
+  && { test "$(git rev-parse origin/<base>)" = <base-sha> || { echo "BASE-MOVED: stop"; false; }; } \
+  && gh pr merge <N> --squash --match-head-commit <head-sha>
+```
+
+A failed assertion prints `BASE-MOVED: stop` and the merge does not run.
 
 *Evidence:* #4092 (2026-10-23) and #4182 (2026-10-25) were each pressed on a printed
 `UNKNOWN` with no gate, four minutes and three seconds respectively after the base
