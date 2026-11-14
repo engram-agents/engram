@@ -846,9 +846,11 @@
       "test_globs": [
         "tests/test_forum_mention_monitor_coalesce.py",
         "tests/test_forum_monitor_malformed_200.py",
-        "tests/test_shell_engram_home_3863.py"
+        "tests/test_shell_engram_home_3863.py",
+        "tests/test_forum_monitor_duplicate_warn.py",
+        "tests/test_pgrep_liveness_reap_patterns.py"
       ],
-      "note": "Both spawn the real script as a subprocess against a mock HTTP server. test_forum_mention_monitor_coalesce.py covers the cross-cycle coalesce window (#1616); test_forum_monitor_malformed_200.py covers ids()'s reported-vs-failed-to-report boundary and the seed/poll seen-set guards (#2225). engram-alpha#3863 PR 3b adds test_shell_engram_home_3863.py: the monitor is run against a scratch config under a custom ENGRAM_HOME (and under the default) with a stub curl, to show which config.json it read."
+      "note": "Both spawn the real script as a subprocess against a mock HTTP server. test_forum_mention_monitor_coalesce.py covers the cross-cycle coalesce window (#1616); test_forum_monitor_malformed_200.py covers ids()'s reported-vs-failed-to-report boundary and the seed/poll seen-set guards (#2225). engram-alpha#3863 PR 3b adds test_shell_engram_home_3863.py: the monitor is run against a scratch config under a custom ENGRAM_HOME (and under the default) with a stub curl, to show which config.json it read. For the mention monitor, test_forum_monitor_duplicate_warn.py spawns the real script to check the duplicate-instance warn-not-kill behavior (#1933), and test_pgrep_liveness_reap_patterns.py does not spawn it: it models the script's pgrep candidate pattern in pure Python against a synthetic process table (TestForumMentionMonitorCandidatePattern)."
     },
     {
       "path_prefix_or_glob": "tools/forum-updates-monitor.sh",
