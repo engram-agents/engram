@@ -94,6 +94,16 @@ def test_m1_missing_number_is_typed_count(cc):
     assert "4812" in r["missing"]
 
 
+def test_m1_verbatim_decimal_is_stated(cc):
+    # #4206 knock-on: the integer part of a decimal is no longer emitted as a
+    # second, separate token, so a verbatim decimal quote is fully contained.
+    # Before the span-containment fix this scored NOT: `1234567` was emitted
+    # first and its substring test failed against the `1234567.89` in the quote.
+    r = cc.check_m1("count 1234567.89", "count 1234567.89", 0.0)
+    assert r["verdict"] == "STATED"
+    assert r["missing"] == []
+
+
 def test_m1_missing_issue_ref_is_typed_ref(cc):
     r = cc.check_m1("the fix landed in the tracker", "the fix landed in #123", 0.0)
     assert (r["verdict"], r["missing_type"]) == ("NOT", "ref")
@@ -202,7 +212,11 @@ def test_b0_always_not(cc):
     ("Quillon wrote 4812 cells", "ran 4812 cells on 2026-10-01"),                     # one unanchored
     ("nothing numeric here", "no hard tokens in this clause"),                        # nothing to anchor
 ])
-def test_b1_matches_anchor_exactly(cc, anchoring, quote, clause):
+def test_b1_agrees_with_anchor_on_boundary_safe_fixtures(cc, anchoring, quote, clause):
+    # Renamed from test_b1_matches_anchor_exactly: that name was true only while check_b1 CALLED
+    # anchor(). Since #4206 they are different implementations by design -- B1 is the frozen
+    # pre-#4206 substring baseline, anchor() is boundary-aware -- and they agree only on fixtures
+    # where the two rules coincide, which is exactly what these three cases are.
     want_unanchored = anchoring.anchor(clause, quote).unanchored
     r = cc.check_b1(quote, clause)
     assert r["verdict"] == ("NOT" if want_unanchored else "STATED")
@@ -1008,6 +1022,25 @@ def test_b1_and_m1_differ_on_404_vs_4040(cc):
     assert cc.check_b1(quote, clause)["verdict"] == "STATED"       # B1 keeps anchor()'s substring behaviour
     assert cc.check_m1(quote, clause, 0.0)["verdict"] == "NOT"
     assert "substring" in cc.check_b1.__doc__
+
+
+def test_b1_is_the_pre_4206_baseline_while_anchor_moves(cc, anchoring):
+    # The baseline is implemented inside check_b1 precisely so it does NOT move when anchor()
+    # moves (#4206 made anchor() token-boundary-aware). This cell reddens if the baseline ever
+    # borrows anchor() again, or if anchor()'s older substring behaviour is restored.
+    quote, clause = "error 4040 returned", "error 404 returned"
+    r = cc.check_b1(quote, clause)
+    assert r["verdict"] == "STATED"
+    assert r["unanchored"] == []
+    assert anchoring.anchor(clause, quote).unanchored == ["404"]
+
+
+def test_b1_normalizes_a_none_quote_like_anchor_did(cc):
+    # anchor() used `quoted_text or ""`; check_b1 keeps that normalization, so a None quote
+    # yields a verdict rather than raising (round-1 review nit).
+    r = cc.check_b1(None, "error 404")
+    assert r["verdict"] == "NOT"
+    assert r["unanchored"] == ["404"]
 
 
 # ---- 2. the freeze covers the dependencies

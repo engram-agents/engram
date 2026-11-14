@@ -93,6 +93,13 @@ def _collect_all_text_content(root: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+
+def _planted_home(name: str, rest: str) -> str:
+    """A home path built at runtime.  The names are fictional; they are joined here
+    only so the repo's home-path scan does not flag this test's own plants."""
+    return "/".join(["", "home", name]) + rest
+
+
 class TestPlatformProfiles:
     """Platform profile files parse and load correctly."""
 
@@ -540,7 +547,7 @@ class TestIdentityAxis:
         """A planted identity leak causes the foreign build to fail.
 
         This is the negative test: if a file in the bundle contains a known
-        identity string (e.g. '/home/agent-borges'), the leak-scan VALIDATE
+        identity string (a home path outside the allowed set), the leak-scan VALIDATE
         step must fail the build.
         """
         from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
@@ -554,7 +561,7 @@ class TestIdentityAxis:
             "hooks": {
                 "UserPromptSubmit": [
                     {"hooks": [
-                        {"command": "python3 /home/agent-borges/hooks/some-hook.py"}
+                        {"command": "python3 " + _planted_home("agent-zed", "/hooks/some-hook.py")}
                     ]}
                 ]
             }
@@ -565,7 +572,7 @@ class TestIdentityAxis:
         # scan_for_leaks must find the leak
         leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
         assert leaks, (
-            "scan_for_leaks did not detect the planted '/home/agent-borges' leak"
+            "scan_for_leaks did not detect the planted home-path leak"
         )
         # Verify the hit is in the right file
         hit_files = {rel for rel, _lineno, _snippet in leaks}
@@ -574,19 +581,111 @@ class TestIdentityAxis:
         )
 
     def test_planted_agent_borges_identifier_detected(self, tmp_path):
-        """scan_for_leaks detects 'agent-borges' identifier pattern."""
+        """scan_for_leaks detects a home path naming any seat, in a JSON config."""
         from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
 
         bundle_dir = str(tmp_path / "bundle2")
         os.makedirs(bundle_dir)
 
-        # Plant an agent-borges identifier leak
-        leak_content = '{"engram_home": "/home/agent-borges/.engram"}\n'
+        # Plant a home-path identifier leak (a seat name outside the allowed set)
+        leak_content = '{"engram_home": "' + _planted_home("agent-zed", "/.engram") + '"}\n'
         with open(os.path.join(bundle_dir, "config.json"), "w") as f:
             f.write(leak_content)
 
         leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
-        assert leaks, "scan_for_leaks did not detect 'agent-borges' identifier leak"
+        assert leaks, "scan_for_leaks did not detect the home-path identifier leak"
+
+    def test_allowed_home_placeholder_is_not_a_leak(self, tmp_path):
+        """The class is default-deny with a declared allowed set: a placeholder
+        home path passes, a prefix-extended one does not."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "allowed")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "ok.md"), "w") as f:
+            f.write("data in " + _planted_home("someone", "/.engram") + " and "
+                    + _planted_home("agents-shared", "/forum") + "\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+
+        with open(os.path.join(bundle_dir, "bad.md"), "w") as f:
+            f.write("data in " + _planted_home("someone2", "/.engram") + "\n")
+        leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
+        assert [rel for rel, _n, _s in leaks] == ["bad.md"]
+
+    @pytest.mark.parametrize("form", [
+        "cd {p}",
+        'p = "{p}"',
+        "PATH={p}:/bin",
+        "see {p}.",
+        "cd {u}",
+        "cd {lu}/x",
+        "cd {d}/x",
+        "cd {_u}/x",
+    ])
+    def test_boundary_forms_are_leaks_in_the_build_scan(self, tmp_path, form):
+        """No trailing slash needed: the class is the whole segment, ended by any
+        non-segment character or end of string; Users is case-insensitive."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        text = form.format(
+            p=_planted_home("agent-zed", ""),
+            u="/".join(["", "Users", "agent-zed"]),
+            lu="/".join(["", "users", "agent-zed"]),
+            d=_planted_home("9zed", ""),
+            _u=_planted_home("_zed", ""),
+        )
+        bundle_dir = str(tmp_path / "boundary")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write(text + "\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS), text
+
+    def test_boundary_allowed_forms_stay_clean_in_the_build_scan(self, tmp_path):
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "boundary_ok")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("see " + _planted_home("someone", "") + ". and \""
+                    + _planted_home("agents-shared", "") + "\" and "
+                    + "/".join(["", "Users", "Shared"]) + ":/bin\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+
+    @pytest.mark.parametrize("seg", ["someone.x", "alice.smith"])
+    def test_allowed_name_plus_dot_plus_more_is_a_leak_in_the_build_scan(self, tmp_path, seg):
+        """A dot inside the segment is a segment character: an allowed name, a dot
+        and more characters is a different, undeclared name."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "dotted")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("cd " + _planted_home(seg, "/x") + "\ncd " + _planted_home(seg, "") + "\n")
+        leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
+        assert sorted(n for _r, n, _s in leaks) == [1, 2], leaks
+
+    def test_allowed_name_before_a_sentence_end_dot_is_clean_in_the_build_scan(self, tmp_path):
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "sentence_end")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("see " + _planted_home("someone", "") + ".\n"
+                    + "see " + _planted_home("alice", "") + ". Next.\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+
+    def test_home_prefix_is_case_sensitive_in_the_build_scan(self, tmp_path):
+        """Documented design: /home/ is case-sensitive, /Users/ is not."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "case")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("cd " + "/".join(["", "HOME", "agent-zed"]) + "/x\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+        with open(os.path.join(bundle_dir, "y.md"), "w") as f:
+            f.write("cd " + "/".join(["", "USERS", "agent-zed"]) + "/x\n")
+        assert [r for r, _n, _s in scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)] == ["y.md"]
 
     def test_clean_bundle_passes_leak_scan(self, tmp_path):
         """A bundle with no identity strings passes the leak scan."""
@@ -690,7 +789,7 @@ class TestIdentityAxis:
         os.makedirs(os.path.join(bundle_dir, "tools"))
 
         # Plant a leak inside a tools/ Python file (convenience-tier surface)
-        leak_content = '# installed at /home/' + 'agent-borges/.engram\n'
+        leak_content = '# installed at ' + _planted_home("agent-zed", "/.engram") + '\n'
         with open(os.path.join(bundle_dir, "tools", "config_schema.py"), "w") as f:
             f.write(leak_content)
 
@@ -705,7 +804,7 @@ class TestIdentityAxis:
 
         Regression test for the SCAN_EXTENSIONS gap closed in PR #896 / issue #814:
         build.py originally lacked '.service' in SCAN_EXTENSIONS, so a systemd
-        service template with a hardcoded builder identity (e.g. User=agent-borges)
+        service template with a hardcoded builder identity (e.g. User=agent-zed)
         was invisible to the foreign-bundle leak-scan.  Adding '.service' closed
         that class.  This test pins the fix: a planted .service leak must be detected.
         """
@@ -715,13 +814,12 @@ class TestIdentityAxis:
         os.makedirs(bundle_dir)
 
         # Plant the leak in a .service file using the same sentinel as the
-        # other planted-leak tests.  Concatenation keeps this source file
-        # itself clean (same discipline as FOREIGN_LEAK_PATTERNS above).
+        # other planted-leak tests.
         leak_content = (
             "[Service]\n"
-            "User=" + "agent-borges" + "\n"
-            "WorkingDirectory=/home/" + "agent-borges" + "/.engram\n"
-            "ExecStart=/home/" + "agent-borges" + "/.engram/venv/bin/python3 viz_server.py\n"
+            "User=agent-zed\n"
+            "WorkingDirectory=" + _planted_home("agent-zed", "/.engram") + "\n"
+            "ExecStart=" + _planted_home("agent-zed", "/.engram/venv/bin/python3 viz_server.py") + "\n"
         )
         with open(os.path.join(bundle_dir, "engram-viz.service"), "w") as f:
             f.write(leak_content)

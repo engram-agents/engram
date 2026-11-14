@@ -3170,16 +3170,17 @@ def engram_checkpoint(payload_json: str) -> str:
                 in this work-burst.
             session_id (str, optional): The current session's id (as
                 injected at session start — same value passed to
-                engram_add_observation's own session_id field). Accepted
-                for backward compatibility with existing callers, but as
-                of #3014 it is NOT used to compute the `warm_briefing`
-                advisory below — that advisory now anchors on the most
-                recent nap/sleep checkpoint already in session_log.md
-                (via `_last_checkpoint_timestamp`), independent of session
+                engram_add_observation's own session_id field). It does
+                NOT feed the `warm_briefing` advisory below (#3014): that
+                advisory anchors on the most recent nap/sleep checkpoint
+                already in session_log.md (via
+                `_last_checkpoint_timestamp`), independent of session
                 identity, which correctly re-arms after every nap and
                 covers the post-compaction case too (see
                 `_compute_warm_briefing_advisory`'s docstring for why the
-                anchor changed from session-start).
+                anchor changed from session-start). It IS recorded with
+                this checkpoint, by name, in `compact/last-checkpoint.json`
+                (#4012), so callers should pass it.
 
     Returns:
         JSON with previous_turn (unchanged from current_turn since no
@@ -3242,10 +3243,13 @@ def engram_checkpoint(payload_json: str) -> str:
     # session_id is consumed here (advisory-only, #2997) and passed to _nap_impl
     # by name below, where it is only recorded in compact/last-checkpoint.json
     # (#4012); it must not also reach **params.
-    # As of #3014, session_id is accepted-but-unused: the warm_briefing
-    # advisory no longer depends on session identity (see
-    # _compute_warm_briefing_advisory) — the pop is kept only so existing
-    # callers that still pass session_id don't hit an "unknown field" error.
+    # As of #3014 the warm_briefing advisory no longer depends on session
+    # identity (see _compute_warm_briefing_advisory), so session_id is not
+    # "used" for that purpose. It is NOT unused, though: it is passed to
+    # _nap_impl by name below and recorded in compact/last-checkpoint.json
+    # (#4012), which the two lines above already say. The pop exists so a
+    # caller that passes it does not hit an "unknown field" error; it must
+    # not also reach **params.
     session_id = params.pop("session_id", None)
     # Snapshot the last checkpoint's timestamp BEFORE _nap_impl runs.
     # _nap_impl -> _checkpoint_internal appends THIS nap's OWN header to
@@ -6955,7 +6959,9 @@ def engram_derive(payload_json: str) -> str:
                 (use deductive_modus_ponens if "if P then Q; P; therefore Q");
                 analogies (use inductive_analogy). The corroboration formula
                 1 - ∏(1-cᵢ) is mathematically valid only when premises are
-                genuinely independent.
+                genuinely independent. (The separate independence_advisory
+                response key was removed in #4728; the lineage check is the
+                standpoint ⚠ inductive_generalization line in structure_warnings.)
             derivation_mode (str, optional): LEGACY — use reasoning_type instead.
                 Kept for backward compatibility: "chain" or "corroboration".
             context_ids (str, optional): Comma-separated node IDs for context
@@ -8618,6 +8624,25 @@ def _embedding_cache_status(model_name: str) -> bool:
     if "\\" in model_name or model_name.count("/") > 1:
         return False
 
+    # Clause 3a -- a name the loader PINS (#4447/#4468, the default model). The
+    # loader never asks "is some revision of this repo cached"; it resolves one
+    # commit via core._resolve_pinned_snapshot, and a download by commit id
+    # writes snapshots/<sha>/ but no refs/main. So ask the loader's own
+    # question, with the loader's own resolver (G6 on v0.5.7-rc1: the by-name
+    # lookup below resolves through refs/main and said "not cached" right
+    # after a successful pinned download, so a fresh install died at the
+    # gate). No fallback to an unpinned lookup on a miss: a cached `main` at
+    # another revision must NOT satisfy a pin, because the loader will not
+    # load it. Presence only, same strength as clause 3: the hash check stays
+    # at load time (it reads ~90 MB; the gate runs before the MCP handshake).
+    if model_name in core.EMBEDDING_MODEL_PINS:
+        from huggingface_hub.errors import LocalEntryNotFoundError
+        try:
+            snap = core._resolve_pinned_snapshot(model_name, online=False)
+        except LocalEntryNotFoundError:
+            return False
+        return os.path.isfile(os.path.join(str(snap), "config.json"))
+
     # Clause 3 -- a hub repo id. The loader prepends the org prefix only when
     # the name contains no "/" AND is not one of the 68 legacy no-org names in
     # `basic_transformer_models`. That list is a FUNCTION-LOCAL variable inside
@@ -8654,6 +8679,35 @@ def _embedding_cache_status(model_name: str) -> bool:
             # for a CONFIGURATION mistake, not no traceback ever.
             continue
     return False
+
+
+def _embedding_prewarm_command(model_name: str) -> str:
+    """The one-liner that fills the cache the way the loader will read it.
+
+    A pinned model (the default) must be fetched by the loader's own pinned
+    path: `SentenceTransformer(name)` downloads whatever `main` is today, which
+    is not the pin once `main` moves, so the pinned check would still say no.
+    An unpinned (custom) model is the user's own choice and keeps the by-name
+    download.
+    """
+    import shlex
+    import sys
+    py = shlex.quote(sys.executable or "python")
+    if model_name in core.EMBEDDING_MODEL_PINS:
+        # shlex-quoted: a home directory with a space (common on macOS) or a
+        # quote in the plugin path must still paste and run.
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        payload = (
+            f"import sys; sys.path.insert(0, {plugin_dir!r}); "
+            f"import engram_core; engram_core._embedder._load_model({model_name!r})"
+        )
+        return f"{py} -c {shlex.quote(payload)}"
+    # repr + shlex.quote: the name is user config, and it is pasted into a shell.
+    payload = (
+        "from sentence_transformers import SentenceTransformer; "
+        f"SentenceTransformer({model_name!r})"
+    )
+    return f"{py} -c {shlex.quote(payload)}"
 
 
 def _looks_like_local_model_path(model_name: str) -> bool:
@@ -8894,11 +8948,7 @@ def _embedding_startup_gate() -> None:
             )
             print("", file=sys.stderr)
             print("  To fix, pre-warm the cache once:", file=sys.stderr)
-            print(
-                f"  python -c \"from sentence_transformers import "
-                f"SentenceTransformer; SentenceTransformer('{model_name}')\"",
-                file=sys.stderr,
-            )
+            print(f"  {_embedding_prewarm_command(model_name)}", file=sys.stderr)
         print("", file=sys.stderr)
         print(
             "  To start deliberately degraded (test/dev only): "

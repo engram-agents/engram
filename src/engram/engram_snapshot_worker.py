@@ -408,7 +408,7 @@ def _regenerate_derived_files(snapshot_path: Path) -> None:
     # immutable=1: the captured snapshot never changes, so tell SQLite to skip all
     # locking and WAL/-shm handling — otherwise a WAL-header'd snapshot leaves -wal/
     # -shm sidecars in .pending/ that outlive the unlinked snapshot (reviewer catch).
-    conn = sqlite3.connect(f"file:{snapshot_path}?mode=ro&immutable=1", uri=True)
+    conn = sqlite3.connect(Path(snapshot_path).absolute().as_uri() + "?mode=ro&immutable=1", uri=True)
     try:
         conn.row_factory = sqlite3.Row
         md = engram_core._generate_snapshot(conn)

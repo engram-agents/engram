@@ -683,7 +683,7 @@ def _compute_provenance_closure(
 
     Traversal rule (spec §3):
       - Follows all outgoing edges from each included node (derives_from,
-        supports, cites, evidence links, supersedes, contradicts, resolves).
+        supported_by, cites, evidence links, supersedes, contradicts, resolves).
       - Also includes incoming edges that touch included nodes (so the
         reader sees the node's epistemic status).
       - Stops at natural provenance leaves (axioms, definitions, evidence
@@ -1251,7 +1251,7 @@ def cmd_scope_export(args):
             # (a) Compute provenance closure from the source DB (read-only).
             source_conn = None
             try:
-                source_conn = sqlite3.connect(f"file:{read_db}?mode=ro", uri=True)
+                source_conn = sqlite3.connect(Path(read_db).absolute().as_uri() + "?mode=ro", uri=True)
                 source_conn.row_factory = sqlite3.Row
                 nodes, edges = _compute_provenance_closure(
                     source_conn, root_ids, max_nodes, max_edges
@@ -1391,7 +1391,7 @@ def _render_read_pkg_node(pkg_db_path: Path, node_id: str):
     without the full server round-trip, keeping render deterministic + offline).
     Opens the DB read-only (mode=ro) — render must never mutate the package.
     """
-    conn = sqlite3.connect(f"file:{pkg_db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(Path(pkg_db_path).absolute().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
@@ -1566,7 +1566,7 @@ def cmd_render(args):
     # The result is reused for both validation (4c) and the render cache (step 6),
     # halving the connection/read overhead compared to two separate passes.
     pkg_node_cache: dict[str, dict] = {}
-    _db_conn = sqlite3.connect(f"file:{pkg_db}?mode=ro", uri=True)
+    _db_conn = sqlite3.connect(Path(pkg_db).absolute().as_uri() + "?mode=ro", uri=True)
     _db_conn.row_factory = sqlite3.Row
     try:
         for nid in manifest_node_ids:

@@ -303,6 +303,7 @@ mv "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md "${ENGRAM_HOME:-$HOME/.engram
 ```
 engram_checkpoint(
     message="School day complete: [N] cycles, [summary of key findings]",
+    session_id="<this session's id, as injected at session start>",
 )
 ```
 

@@ -81,8 +81,9 @@ low wired share is not by itself a defect. Do not phrase any P5 output as
   cannot be seeded, so the draw happens in Python. Read the candidate ids with
   a read-only sqlite3 connection, sort them for stability, then sample:
   ```python
-  import random, sqlite3
-  con = sqlite3.connect("file:<db path>?mode=ro", uri=True)
+  import pathlib, random, sqlite3
+  # as_uri() percent-encodes ?, # and spaces; a raw "file:" string loses mode=ro on such a path (#3514)
+  con = sqlite3.connect(pathlib.Path("<db path>").absolute().as_uri() + "?mode=ro", uri=True)
   ids = sorted(r[0] for r in con.execute(
       "SELECT id FROM nodes WHERE is_current = 1 AND status != 'retracted' "
       "AND type IN ('observation_factual', 'observation_predictive')"

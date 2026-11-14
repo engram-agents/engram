@@ -695,8 +695,9 @@ _host_is_loopback() {
 if ! _host_is_loopback "$HOST"; then
   _live_tokens="$(python3 -B -c '
 import sqlite3, sys
+from pathlib import Path
 try:
-    c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+    c = sqlite3.connect(Path(sys.argv[1]).absolute().as_uri() + "?mode=ro", uri=True)
     print(c.execute("SELECT COUNT(*) FROM agent_tokens WHERE revoked_at IS NULL").fetchone()[0])
 except Exception:
     print(0)

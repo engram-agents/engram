@@ -383,7 +383,7 @@ class TestSimulatePgrepFRejectsGnuOnlyEscapes:
         POSIX-ERE-safe on real BSD pgrep -- \\. (literal dot) and \\$ (bash
         double-quote unescaping artifact, see _extract_reap_pattern) are
         the two other backslash-escapes this file's real patterns use."""
-        result = simulate_pgrep_f(r"engram-surface-daemon\.py.*/home/agentX$", table=[])
+        result = simulate_pgrep_f(r"engram-surface-daemon\.py.*/home/agent-alice$", table=[])
         assert result == []
 
 
@@ -466,8 +466,8 @@ class TestDaemonReapPatternEngramHomeAnchored:
         return template.format(engram_home=engram_home)
 
     def test_end_anchor_excludes_cotenant_and_charge_quoting_decoy(self):
-        engram_home = "/home/agentX/.engram"
-        other_home = "/home/agentY/.engram"
+        engram_home = "/home/agent-alice/.engram"
+        other_home = "/home/agent-bob/.engram"
         pattern = self._pattern_for(engram_home)
 
         target_pid, cotenant_pid, invoker_decoy_pid, wrapper_pid = 10, 20, 30, 40
@@ -556,7 +556,7 @@ class TestBootChargeMonitorVerifyPatternIsProcessNameAnchored:
                 "uid": 1000,
                 "cmdline": [
                     "bash",
-                    "/home/agentX/.engram/marketplace/plugins/engram/tools/forum-mention-monitor.sh",
+                    "/home/agent-alice/.engram/marketplace/plugins/engram/tools/forum-mention-monitor.sh",
                 ],
             },
             # co-tenant equivalent: same script, running for a DIFFERENT
@@ -567,7 +567,7 @@ class TestBootChargeMonitorVerifyPatternIsProcessNameAnchored:
                 "uid": 1001,
                 "cmdline": [
                     "bash",
-                    "/home/agentY/.engram/marketplace/plugins/engram/tools/forum-updates-monitor.sh",
+                    "/home/agent-bob/.engram/marketplace/plugins/engram/tools/forum-updates-monitor.sh",
                     "--kinds", "dm,baton",
                 ],
             },
@@ -593,7 +593,7 @@ class TestBootChargeMonitorVerifyPatternIsProcessNameAnchored:
                 "uid": 1000,
                 "cmdline": [
                     "/bin/bash",
-                    "/home/agentX/.engram/marketplace/plugins/engram/tools/forum-updates-monitor.sh",
+                    "/home/agent-alice/.engram/marketplace/plugins/engram/tools/forum-updates-monitor.sh",
                     "--kinds", "dm,baton",
                 ],
             },
@@ -972,14 +972,14 @@ class _TwoLayerMonitorFixture:
             {
                 "pid": target_pid,
                 "uid": 1000,
-                "cmdline": ["bash", f"/home/agentX/.engram/tools/{script_basename}", "--purpose", purpose],
+                "cmdline": ["bash", f"/home/agent-alice/.engram/tools/{script_basename}", "--purpose", purpose],
             },
             # co-tenant equivalent: same script, same purpose, DIFFERENT uid
             # -- must be excluded by -u before the regex is even applied.
             {
                 "pid": cotenant_pid,
                 "uid": 1001,
-                "cmdline": ["bash", f"/home/agentY/.engram/tools/{script_basename}", "--purpose", purpose],
+                "cmdline": ["bash", f"/home/agent-bob/.engram/tools/{script_basename}", "--purpose", purpose],
             },
             # invoking-process self-quote decoy: the real #1933 repro shape
             # -- a python process (e.g. standing in for `claude` with a boot
@@ -990,7 +990,7 @@ class _TwoLayerMonitorFixture:
                 "uid": 1000,
                 "cmdline": [
                     "python3", "-c", "import time; time.sleep(9)",
-                    f"Automatic morning boot charge: bash /home/agentX/.engram/tools/{script_basename} "
+                    f"Automatic morning boot charge: bash /home/agent-alice/.engram/tools/{script_basename} "
                     f"--kinds dm,baton (unrelated instructions) --purpose {purpose} "
                     "(padding to resemble real charge length) continue with the day's plan",
                 ],
@@ -1000,7 +1000,7 @@ class _TwoLayerMonitorFixture:
             {
                 "pid": wrapper_pid,
                 "uid": 1000,
-                "cmdline": ["-bash", f"/home/agentX/.engram/tools/{script_basename}", "--purpose", purpose],
+                "cmdline": ["-bash", f"/home/agent-alice/.engram/tools/{script_basename}", "--purpose", purpose],
             },
         ]
         return table, (target_pid, cotenant_pid, invoker_decoy_pid, wrapper_pid)

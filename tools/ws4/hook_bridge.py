@@ -89,7 +89,7 @@ def load_situation_patterns(db_path, hook_path: "Path | None" = None) -> dict:
     query = module._QUERY
     try:
         owner_read.check_store_path(db_path)  # #3962: only removes the FIFO hang; every class still answers {}
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=ro", uri=True, timeout=2.0)
         try:
             rows = conn.execute(query).fetchall()
         finally:

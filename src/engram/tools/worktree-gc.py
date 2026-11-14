@@ -17,6 +17,11 @@ This tool classifies each worktree and removes the safely-finished ones:
   PRUNE   `worktree-agent-*` / `review-*` tmp-branch worktree, clean
   KEEP    branch worktree whose PR is OPEN (active work)
   KEEP    branch worktree with NO PR (pre-PR or abandoned — flagged for a human)
+  SKIP    an AGENT-OWNED worktree (branch `worktree-agent-*` / `review-*`, or any
+          worktree under `<main>/.claude/worktrees/`) whose newest git-metadata
+          activity is younger than the age guard (6h; --age-guard-seconds), or
+          whose age cannot be read — a running fairy is not a process holding a
+          CWD, so /proc cannot see it (#2808)
   SKIP    any worktree that is DIRTY (uncommitted changes) — never destroy work
   SKIP    any worktree that has a live process with CWD inside it (in-use guard)
   SKIP    detached-HEAD worktree whose head SHA is an OPEN PR's head (a
@@ -37,6 +42,11 @@ Safety invariants:
     still writing to disk could be reaped out from under it — see
     classify() below, where the check runs before the MERGED/CLOSED PRUNE
     return.
+  * A young agent-owned worktree is never removed, on EVERY prune path
+    (detached-HEAD, tmp-branch, MERGED/CLOSED PR); an unreadable age keeps it
+    (fail closed). Age = newest mtime of HEAD / index / logs/HEAD in the
+    worktree's own admin dir under the main .git. Only a missing directory
+    (stale admin record) is exempt.
   * An OPEN-PR worktree is never removed.
   * A no-PR branch is never auto-removed (could be unpushed/abandoned work) —
     only reported, so a human decides.
@@ -44,6 +54,7 @@ Safety invariants:
 Usage:
     python tools/worktree-gc.py            # dry-run (default)
     python tools/worktree-gc.py --apply    # actually remove
+    python tools/worktree-gc.py --age-guard-seconds 3600   # override the 6h guard
     python tools/worktree-gc.py --json     # machine-readable plan
 """
 
@@ -54,7 +65,12 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+# #2808: an agent-owned worktree younger than this is never pruned. The /proc
+# in-use scan cannot see a running fairy (it is not a process holding a CWD).
+AGE_GUARD_SECONDS = 6 * 3600
 
 
 def _run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
@@ -102,7 +118,7 @@ def _list_worktrees(root: str) -> list[dict]:
 
 
 def _is_clean(path: str) -> bool:
-    rc, out, _ = _run(["git", "-C", path, "status", "--porcelain"])
+    rc, out, _ = _run(["git", "--no-optional-locks", "-C", path, "status", "--porcelain"])
     # Untracked-only is still "has stuff" — but fairy worktrees commit their work,
     # so any porcelain output (tracked or untracked) means don't auto-remove.
     return rc == 0 and out.strip() == ""
@@ -130,6 +146,90 @@ def _is_in_use(path: str) -> bool:
         except (OSError, PermissionError):
             continue
     return False
+
+
+def _main_checkout_path(path: str) -> str | None:
+    """The main checkout's directory, derived from a worktree's own `.git`
+    file (`gitdir: <main>/.git/worktrees/<name>`): the admin dir's common dir
+    (its `commondir` file, else two levels up) is `<main>/.git`, and the main
+    checkout is its parent. Reads files only (no subprocess). None if it cannot
+    be derived (no `.git` file, unreadable, or a common dir not named `.git`).
+    """
+    try:
+        line = (Path(path) / ".git").read_text().strip()
+        if not line.startswith("gitdir:"):
+            return None
+        admin = Path(line[len("gitdir:"):].strip())
+        if not admin.is_absolute():
+            admin = Path(path) / admin
+        cd = admin / "commondir"
+        common = (admin / cd.read_text().strip()) if cd.is_file() else admin.parent.parent
+        common = common.resolve()
+    except (OSError, ValueError):
+        return None
+    if common.name != ".git":
+        return None
+    return str(common.parent)
+
+
+def _is_agent_owned(t: dict, main_path: str | None) -> bool:
+    """True for a fairy/reviewer worktree: tmp-branch name, or under
+    `<main checkout>/.claude/worktrees/` whatever its branch (incl. detached).
+
+    The folder is the MAIN checkout's, whatever directory the tool runs from.
+    If `main_path` is None (it could not be derived) the under-folder test is
+    False and only the branch-name rule applies; it never falls back to the
+    run directory.
+    """
+    branch = t.get("branch")
+    if branch and (branch.startswith("worktree-agent-") or branch.startswith("review-")):
+        return True
+    if not main_path:
+        return False
+    try:
+        base = (Path(main_path) / ".claude" / "worktrees").resolve()
+        Path(t["path"]).resolve().relative_to(base)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _worktree_age_seconds(path: str) -> float | None:
+    """Seconds since the newest of HEAD / index / logs/HEAD in this worktree's
+    admin dir (`.git/worktrees/<name>/`, found via the worktree's `.git` file).
+
+    Returns None when the age cannot be read (fail closed: the caller keeps
+    the worktree). A future mtime reads as age 0.
+    """
+    try:
+        line = (Path(path) / ".git").read_text().strip()
+        if not line.startswith("gitdir:"):
+            return None
+        admin = Path(line[len("gitdir:"):].strip())
+        if not admin.is_absolute():
+            admin = Path(path) / admin
+        if not admin.is_dir():
+            return None
+        newest = None
+        for rel in ("HEAD", "index", "logs/HEAD"):
+            try:
+                m = (admin / rel).stat().st_mtime
+            except FileNotFoundError:
+                continue
+            newest = m if newest is None else max(newest, m)
+        if newest is None:
+            return None
+        return max(0.0, time.time() - newest)
+    except (OSError, ValueError):
+        return None
+
+
+def _fmt_guard(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
 
 
 def _pr_state(branch: str, root: str) -> str | None:
@@ -207,8 +307,14 @@ def _pr_for_sha(sha: str, root: str) -> tuple[bool, int | None]:
     return True, heads.get(sha)
 
 
-def classify(t: dict, root: str) -> tuple[str, str]:
-    """Return (action, reason). action in {PRUNE, KEEP, SKIP, MAIN}."""
+def classify(t: dict, root: str, *, main_path: str | None = None,
+             age_guard_seconds: int = AGE_GUARD_SECONDS) -> tuple[str, str]:
+    """Return (action, reason). action in {PRUNE, KEEP, SKIP, MAIN}.
+
+    `main_path` is the main checkout (the `.claude/worktrees/` folder the age
+    guard tests is ITS, not `root`'s); when None it is derived from the
+    worktree's own git common dir.
+    """
     if t.get("is_main"):
         return "MAIN", "main checkout — never touched"
     path = t["path"]
@@ -217,6 +323,16 @@ def classify(t: dict, root: str) -> tuple[str, str]:
     if not _is_clean(path):
         return "SKIP", "DIRTY — uncommitted changes; not removing"
     branch = t.get("branch")
+    # Age guard (#2808): before ANY prune return, for agent-owned worktrees.
+    if main_path is None:
+        main_path = _main_checkout_path(path)
+    if _is_agent_owned(t, main_path):
+        age = _worktree_age_seconds(path)
+        if age is None:
+            return "SKIP", "agent worktree age could not be read; not pruning (fail closed)"
+        if age < age_guard_seconds:
+            return "SKIP", (f"young agent worktree (age {round(age / 60)}m < "
+                            f"{_fmt_guard(age_guard_seconds)} age guard); not pruning")
     if branch is None:  # detached HEAD — reviewer-fairy leftover (unless still running)
         if _is_in_use(path):
             return "SKIP", "detached HEAD but process active (reviewer-fairy still running)"
@@ -291,14 +407,21 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="actually remove (default: dry-run)")
     ap.add_argument("--json", action="store_true", help="machine-readable plan")
+    ap.add_argument("--age-guard-seconds", type=int, default=AGE_GUARD_SECONDS,
+                    help="never prune an agent-owned worktree younger than this "
+                         f"(default {AGE_GUARD_SECONDS}s)")
     args = ap.parse_args()
 
     root = _repo_root()
     trees = _list_worktrees(root)
+    # The main checkout is trees[0] (is_main), NOT `root`: run from inside a
+    # linked worktree, `--show-toplevel` is that worktree.
+    main_path = trees[0]["path"] if trees else None
 
     plan = []
     for t in trees:
-        action, reason = classify(t, root)
+        action, reason = classify(t, root, main_path=main_path,
+                                  age_guard_seconds=args.age_guard_seconds)
         plan.append({"path": t["path"], "branch": t.get("branch"),
                      "action": action, "reason": reason})
 

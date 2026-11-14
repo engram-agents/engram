@@ -30,18 +30,18 @@ the unified payload_json signature as of 2026-05-27.
 ## Branching convention
 
 - **`dev`** is the merge target for ALL feature/fix PRs. Always open PRs
-  against `dev` unless an explicit release-cut is happening.
+  against `dev` (exceptions: a soak-fix copy, the release PR).
 - **`main`** is GitHub's default branch and holds releases (a plain clone lands
-  on a tagged release, which the installer needs). It moves only on explicit release
-  cuts; routine PRs do NOT target main. **A release cut = opening a formal
-  PR from `dev` → `main`** — this fires the full CI gate (`tests.yml` full
-  suite + `pr-checks`), the thorough pre-release
-  validation. See `docs/internal/RELEASING.md`.
+  on a tagged release, which the installer needs). Routine PRs do NOT target it.
+- **`release/X.Y.Z`** (Lei, 2026-11-13) is cut from `dev` at a candidate;
+  **`dev` is not frozen.** The release PR `release/X.Y.Z` → `main` runs the
+  full suite; `main` is fast-forwarded, never merged. See
+  `docs/internal/RELEASING.md`.
 - **CI cost model (#1597):** dev PRs run only the cheap combined `pr-checks`
   (static scrubs). The **full pytest suite does NOT run
   on dev PRs** — at agent-PR velocity it's too expensive; run **affected-tests
   locally** and paste the result in your review. The full suite runs nightly on
-  `dev` (`nightly.yml`) and on the dev→main release PR (above). `affected-tests.yml` is `workflow_dispatch`
+  `dev` (`nightly.yml`) and on the release PR into `main` (above). `affected-tests.yml` is `workflow_dispatch`
   only.
 - **No macOS runners in CI — ever (Lei, 2026-09-28).** A `runs-on: macos-*` job
   bills at **ten times** the Linux minute rate, and `pr-checks` fires on every

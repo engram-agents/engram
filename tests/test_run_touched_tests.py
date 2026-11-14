@@ -954,8 +954,12 @@ class TestFailOpenTriggers:
             "requirements-extra.in",
             "setup.cfg",
             "pyproject.toml",
-            "packaging/test-map.json",
-            "tools/run_touched_tests.py",
+            # Real repo paths (#4358): the bare logical forms
+            # "packaging/test-map.json" / "tools/run_touched_tests.py" only
+            # read as full before because the unresolved-file fallback caught
+            # them; ALWAYS_FULL_PATTERNS itself holds the src/engram paths.
+            "src/engram/packaging/test-map.json",
+            "src/engram/tools/run_touched_tests.py",
         ],
     )
     def test_always_full_triggers(self, tmp_path: Path, trigger_file: str):
@@ -971,17 +975,18 @@ class TestFailOpenTriggers:
             f"Expected {trigger_file!r} to appear in reasons; got {reasons}"
         )
 
-    def test_unresolved_file_triggers_full(self, tmp_path: Path):
-        """A changed file unresolved by both layers triggers full suite."""
+    def test_unresolved_file_does_not_trigger_full(self, tmp_path: Path):
+        """#4358: a changed file no layer resolves is reported, not full-suite."""
         repo = _make_tmp_repo(tmp_path)
 
-        # Change a file that has no test mapping and is not imported
+        detail: dict = {}
         selected, is_full, reasons, _map_sel = _runner.select_tests(
-            ["some/unknown/path.yaml"], str(repo)
+            ["some/unknown/path.yaml"], str(repo), detail=detail
         )
 
-        assert is_full
-        assert any("unresolved" in r for r in reasons)
+        assert not is_full
+        assert reasons == []
+        assert detail["unreferenced"] == ["some/unknown/path.yaml"]
 
 
 class TestOutputContract:
@@ -1017,7 +1022,8 @@ class TestOutputContract:
         out = capsys.readouterr().out
         assert "SUBSET green" in out
         assert "iteration signal, NOT a convergence claim" in out
-        assert "Full suite gates merge-readiness" in out
+        assert "merge-readiness" not in out  # #4358: points at nightly + release cut
+        assert "nightly" in out and "release cut" in out
         assert f"{n_selected}/{total}" in out
 
     def test_full_trigger_names_cause(self, tmp_path: Path):
@@ -1701,8 +1707,8 @@ class TestAuditPatches:
 
 _JSON_KEYS = [
     "base", "buckets", "changed_files", "full",
-    "full_reasons", "selected", "total_test_files",
-]
+    "full_reasons", "layers", "selected", "total_test_files", "unreferenced",
+]  # "layers"/"unreferenced" added additively by #4358
 
 
 def _run_json(monkeypatch, argv, *, changed=None, select_ret=None,
@@ -1713,7 +1719,7 @@ def _run_json(monkeypatch, argv, *, changed=None, select_ret=None,
         monkeypatch.setattr(_runner, "_changed_files", lambda base, root: changed)
     if select_ret is not None:
         monkeypatch.setattr(_runner, "select_tests",
-                            lambda c, r, verbose=False: select_ret)
+                            lambda c, r, verbose=False, detail=None: select_ret)
     if classify is not None:
         monkeypatch.setattr(_runner, "_classify_selection", lambda *a, **k: classify)
     monkeypatch.setattr(_runner, "_count_total_test_files", lambda root: total)
@@ -1784,7 +1790,7 @@ def test_json_stdout_is_single_line_pure_json(monkeypatch):
     import contextlib
     monkeypatch.setattr(_runner, "_changed_files", lambda b, r: ["engram_core.py"])
     monkeypatch.setattr(_runner, "select_tests",
-                        lambda c, r, verbose=False: (["tests/test_a.py"], False, [], set()))
+                        lambda c, r, verbose=False, detail=None: (["tests/test_a.py"], False, [], set()))
     monkeypatch.setattr(_runner, "_classify_selection", lambda *a, **k: (1, 0, 0))
     monkeypatch.setattr(_runner, "_count_total_test_files", lambda r: 5)
     monkeypatch.setattr(_runner, "_load_test_map", lambda r: {})

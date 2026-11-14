@@ -191,7 +191,7 @@ def make_env(tmp_path: Path):
     gitw.chmod(0o755)
     tmpd = tmp_path / "tmpd"
     tmpd.mkdir()
-    home = tmp_path / "home" / "agent-nb"
+    home = tmp_path / "home" / "agent-alice"
     home.mkdir(parents=True)
     hermetic_home = tmp_path / "hermetic"
     hermetic_home.mkdir()
@@ -220,7 +220,7 @@ def run_lib(env: dict, body: str) -> subprocess.CompletedProcess:
 
 
 def install_body(home: Path, src: Path, extra: str = "") -> str:
-    return (f'USER_NAME="agent-nb"; USER_HOME="{home}"; ALPHA_SOURCE="{src}"\n'
+    return (f'USER_NAME="agent-alice"; USER_HOME="{home}"; ALPHA_SOURCE="{src}"\n'
             f'TIER=""; FORUM_URL=""\n{extra}\n'
             'rc=0; ab_clone_and_install || rc=$?; echo "RC=$rc"; echo "TAG=${CLONE_TAG:-}"')
 
@@ -271,8 +271,8 @@ class TestB3RunsAsNewborn:
         assert _rc(proc) == 0, proc.stdout + proc.stderr
         sudo_lines = (tmp_path / "sudo.log").read_text().splitlines()
         assert sudo_lines, "nothing ran through sudo"
-        # EVERY privileged-shape call is `sudo -u agent-nb -H ...`; none runs as root.
-        assert all(ln.startswith("sudo -u agent-nb -H ") for ln in sudo_lines), sudo_lines
+        # EVERY privileged-shape call is `sudo -u agent-alice -H ...`; none runs as root.
+        assert all(ln.startswith("sudo -u agent-alice -H ") for ln in sudo_lines), sudo_lines
         install_calls = [ln for ln in sudo_lines if "install.sh" in ln]
         assert len(install_calls) == 1, sudo_lines
         call = install_calls[0]
@@ -411,7 +411,7 @@ class TestB4CloneOnDeployableTag:
         assert f"git -C {src} checkout dev && git -C {src} pull --ff-only" in proc.stderr[a:b]
         assert "detached at a tag" in proc.stderr[a:b]
         # the existing left-in-place note
-        assert "left in place" in proc.stderr and "userdel -r agent-nb" in proc.stderr
+        assert "left in place" in proc.stderr and "userdel -r agent-alice" in proc.stderr
 
     def test_tag_with_install_sh_proceeds_as_before(self, tmp_path):
         env, home = make_env(tmp_path)
@@ -453,7 +453,7 @@ class TestB4CloneOnDeployableTag:
         sudo_clone = [ln for ln in (tmp_path / "sudo.log").read_text().splitlines()
                       if " git clone " in ln]
         assert len(sudo_clone) == 1 and sudo_clone[0].startswith(
-            "sudo -u agent-nb -H env GIT_CONFIG_GLOBAL="), sudo_clone
+            "sudo -u agent-alice -H env GIT_CONFIG_GLOBAL="), sudo_clone
 
     def test_trust_file_is_exactly_one_entry_for_the_source_dot_git(self, tmp_path):
         env, home = make_env(tmp_path)
@@ -530,7 +530,7 @@ class TestB5ExitCode:
         assert _rc(proc) == 7, proc.stdout + proc.stderr
         assert "FAIL: [step 4] fake step" in proc.stderr, "install.sh's FAIL line must be shown"
         assert "exited 7" in proc.stderr
-        assert "userdel -r agent-nb" in proc.stderr
+        assert "userdel -r agent-alice" in proc.stderr
         assert "left in place" in proc.stderr
         assert str(home / ".engram" / "install-logs") in proc.stderr
 
@@ -552,7 +552,7 @@ class TestB5ExitCode:
 class TestB8NextSteps:
     def _steps(self, tmp_path, no_install):
         env, home = make_env(tmp_path)
-        proc = run_lib(env, (f'NAME=nb; USER_NAME=agent-nb; USER_HOME=/home/agent-nb; RUNTIME=claude\n'
+        proc = run_lib(env, (f'NAME=nb; USER_NAME=agent-alice; USER_HOME=/home/agent-alice; RUNTIME=claude\n'
                              f'HOME_MODE=0750; ALPHA_SOURCE=/x/alpha; NO_INSTALL={no_install}\n'
                              'ab_print_next_steps'))
         assert proc.returncode == 0, proc.stderr
@@ -564,7 +564,7 @@ class TestB8NextSteps:
         assert re.search(r"\n\s*\d\.\s.*\n\s+claude\b", out) or "\n       claude\n" in out
         assert "/login" in out
         assert "finalize-name nb" in out
-        assert "userdel -r agent-nb" in out
+        assert "userdel -r agent-alice" in out
         assert ".runtime/install.sh" not in out
         assert "curl -fsSL" not in out
 
@@ -631,7 +631,7 @@ class TestB7FinalizeNameClaudeSymlink:
         # the native installer's shape: ~/.local/bin/claude -> <home>/.local/share/claude/versions/X
         # (absolute). After `usermod -d -m` the old absolute home is gone, so it dangles.
         def link(home):
-            os.symlink("/home/agent-newborn-GONE/.local/share/claude/versions/2.1.0",
+            os.symlink("/home/agent-alice/.local/share/claude/versions/2.1.0",
                        home / ".local" / "bin" / "claude")
         home, proc = self._run(tmp_path, link)
         assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -660,7 +660,7 @@ RESOLVE = 'NO_INSTALL=0; declare -F ab_preflight_source >/dev/null && { ab_prefl
 
 
 def resolved_body(home: Path, source_text: str, extra: str = "") -> str:
-    return (f'USER_NAME="agent-nb"; USER_HOME="{home}"; ALPHA_SOURCE="{source_text}"\n'
+    return (f'USER_NAME="agent-alice"; USER_HOME="{home}"; ALPHA_SOURCE="{source_text}"\n'
             f'TIER=""; FORUM_URL=""\n{extra}\n{RESOLVE}\n'
             'rc=0; ab_clone_and_install || rc=$?; echo "RC=$rc"; echo "TAG=${CLONE_TAG:-}"')
 

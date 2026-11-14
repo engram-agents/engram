@@ -17,8 +17,8 @@ Contract (written before the implementation), in engram-surface-daemon.py:
      print the existing ONE stderr line (flushed), THEN wait, THEN exit with
      the same code.
   B2 The wait is interruptible by SIGTERM/SIGINT (prompt exit, well < 3 s).
-  B3 No wait on the FREE path, the recorded-pid-alive exit-0 path, or the
-     no-socket-file path.
+  B3 No wait on the FREE or no-socket-file paths. The recorded-pid-alive
+     exit-0 refusal instead releases its own lifetime lock, then waits.
   B4 Exit codes unchanged (75 / 76).
 
 Cells K1-K3 are in-process (wait helper stubbed); K5-K6 run the REAL daemon
@@ -150,6 +150,7 @@ class _InProcess(_Base):
         self.err = io.StringIO()
         code = None
         helper = unittest.mock.Mock(return_value=state)
+        self._holder_helper = helper
         # #4374: a cell may drive main() more than once in this one process; a
         # real second daemon is a second process, so drop the lock the previous
         # run took (else the second run exits 0 on "another process holds the
@@ -191,7 +192,21 @@ class _InProcess(_Base):
             os.close(fd)
             self.mod._lock_fd = None
 
-    def _refuse(self, state, env_value=None):
+    def _lock_is_free(self):
+        """Can a fresh contender acquire this run's lifetime lock now?"""
+        import fcntl
+
+        fd = os.open(self.mod.LOCK_PATH, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return True
+        finally:
+            os.close(fd)
+
+    def _refuse(self, state, env_value=None, wait_check=None):
         """Drive a refusal; return (code, err, wait_calls, err_at_each_call)."""
         self._touch_socket_file()
         self._write_dead_pidfile()
@@ -203,6 +218,8 @@ class _InProcess(_Base):
         def stub(seconds):
             calls.append(seconds)
             seen.append(self.err.getvalue())
+            if wait_check is not None:
+                wait_check()
 
         code, err = self._run_gate(state, stub)
         return code, err, calls, seen
@@ -232,6 +249,19 @@ class TestK1DefaultBackoff(_InProcess, unittest.TestCase):
 
     def test_k1_unproven_76_waits_60_after_the_line(self):
         self._check(UNKNOWN, 76)
+
+    def test_k1_75_and_76_keep_their_lifetime_lock_during_wait(self):
+        # #3495 deliberately releases only the known-live-pid exit-0 arm.
+        # These safety refusals retain the lock while they wait.
+        for state in (HELD, UNKNOWN):
+            with self.subTest(state=state[0]):
+                def held():
+                    self.assertIsNotNone(self.mod._lock_fd)
+                    self.assertFalse(self._lock_is_free())
+
+                code, _, calls, _ = self._refuse(state, wait_check=held)
+                self.assertIn(code, (75, 76))
+                self.assertEqual(calls, [60])
 
     def test_k1_constant_is_60(self):
         self.assertEqual(self.mod.REFUSAL_BACKOFF_S, 60)
@@ -292,13 +322,78 @@ class TestK3NoWaitElsewhere(_InProcess, unittest.TestCase):
         self.assertFalse(os.path.exists(self.sock))
         self.assertEqual(err, "")
 
-    def test_k3_recorded_pid_alive_exit_0_without_wait(self):
+    def test_k3_recorded_pid_alive_exit_0_releases_then_waits(self):
         self._touch_socket_file()
         Path(self.pid).write_text("1")
+        before = Path(self.pid).read_bytes()
+        calls = []
+
+        def wait(seconds):
+            calls.append(seconds)
+            # ORDER and availability: this branch has decided to refuse, so
+            # its own descriptor is closed before the backoff starts. A new
+            # contender can acquire it even if the legacy owner dies now.
+            self.assertIsNone(self.mod._lock_fd)
+            self.assertTrue(self._lock_is_free())
+
         with unittest.mock.patch.object(self.mod, "_recorded_pid_is_alive", return_value=True):
-            code, err = self._run_gate(HELD, self._boom)
+            code, err = self._run_gate(HELD, wait)
         self.assertEqual(code, 0)
         self.assertIn("a live daemon already owns", err)
+        self.assertEqual(calls, [60])
+        self.assertTrue(os.path.exists(self.sock), "refusal must not unlink the socket")
+        self.assertEqual(Path(self.pid).read_bytes(), before)
+        self._holder_helper.assert_not_called()
+
+    def test_k3_recorded_pid_alive_exit_0_passes_explicit_zero_backoff(self):
+        self._touch_socket_file()
+        Path(self.pid).write_text("1")
+        os.environ[ENV_VAR] = "0"
+        calls = []
+        with unittest.mock.patch.object(self.mod, "_recorded_pid_is_alive", return_value=True):
+            code, err = self._run_gate(HELD, calls.append)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, [0])
+        self._holder_helper.assert_not_called()
+
+    def test_k3_recorded_pid_alive_exit_0_passes_positive_override_backoff(self):
+        self._touch_socket_file()
+        Path(self.pid).write_text("1")
+        os.environ[ENV_VAR] = "7"
+        calls = []
+        with unittest.mock.patch.object(self.mod, "_recorded_pid_is_alive", return_value=True):
+            code, err = self._run_gate(HELD, calls.append)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, [7])
+        self._holder_helper.assert_not_called()
+
+    def test_k3_known_owner_supervisor_model_is_rate_limited(self):
+        """A virtual-clock model, not a measured launchd/systemd rate.
+
+        Model a supervisor that restarts five seconds after each exit. The
+        actual known-owner main() branch receives its configured default
+        backoff, so only the t=0 launch occurs in the half-open [0, 60) window.
+        Removing only that wait produces the old twelve launches instead.
+        """
+        self._touch_socket_file()
+        Path(self.pid).write_text("1")
+        clock = [0.0]
+        starts = 0
+
+        def wait(seconds):
+            clock[0] += seconds
+
+        while clock[0] < 60:
+            starts += 1
+            with unittest.mock.patch.object(self.mod, "_recorded_pid_is_alive", return_value=True):
+                code, _ = self._run_gate(HELD, wait)
+            self.assertEqual(code, 0)
+            # Each in-process call models a fresh process: the OS would close
+            # a remaining descriptor on exit, before its next supervised start.
+            self._drop_lock()
+            clock[0] += 5
+
+        self.assertEqual(starts, 1)
 
     def test_k3_no_socket_file_without_wait(self):
         self._write_dead_pidfile()

@@ -403,9 +403,9 @@ def bootstrap_tools_dir(marker_filename: str) -> Optional[Path]:
 # is _tag_shape below), so no field can forge or close the block. The delimiter is
 # read by SHAPE, not by column: a model that sees a fullwidth or CJK lookalike closer
 # mid-line, or an XML-style </forum data> closer, can take it for the real one, so the
-# whole class goes, not an enumerated pair. The class is 163 code points on Unicode
+# whole class goes, not an enumerated pair. The class is 164 code points on Unicode
 # 15.0, in two shapes handled differently on purpose:
-#   * BRACKET characters (names containing BRACKET; 149, which also takes the real
+#   * BRACKET characters (names containing BRACKET plus U+FE18, whose name misspells it; 150, which also takes the real
 #     delimiters) are DELETED. They are delimiter-shaped; deleting one inverts nothing.
 #   * ANGLE characters (names ending in LESS-THAN SIGN or GREATER-THAN SIGN, or
 #     containing ANGLE QUOTATION MARK; 14: < > « » ‹ › and lookalikes) are REPLACED
@@ -427,17 +427,20 @@ _FORUM_BLOCK_CLOSE = "\u27e7"  # ⟧
 _FORUM_FIELD_CAP = 120
 _FORUM_REPLACEMENT = "\ufffd"  # the Unicode replacement character
 _FORUM_PHRASE = re.compile(r"(forum)\s+(data)", re.IGNORECASE)
+# Closing brackets whose Unicode NAME misspells BRACKET, so the name test misses them (#4474):
+# U+FE18 is named "... WHITE LENTICULAR BRAKCET" (its partner U+FE17 is spelled right).
+_FORUM_MISSPELLED_BRACKETS = frozenset("\ufe18")
 
 
 def _tag_shape(ch: str) -> Optional[str]:
     """Classify ONE character for forum_field: "bracket" when its Unicode name
     contains "BRACKET" (deleted), "angle" when the name ends with "LESS-THAN SIGN" or
     "GREATER-THAN SIGN" or contains "ANGLE QUOTATION MARK" (replaced with U+FFFD),
-    else None. 149 + 14 = 163 code points on Unicode 15.0. Math relations (names
+    else None. 150 + 14 = 164 code points on Unicode 15.0. Math relations (names
     containing LESS-THAN but not ending in "SIGN") and parentheses are None.
     unicodedata.name() raises for unnamed code points, so it takes a default."""
     name = unicodedata.name(ch, "")
-    if "BRACKET" in name:
+    if "BRACKET" in name or ch in _FORUM_MISSPELLED_BRACKETS:
         return "bracket"
     if name.endswith(("LESS-THAN SIGN", "GREATER-THAN SIGN")) or "ANGLE QUOTATION MARK" in name:
         return "angle"

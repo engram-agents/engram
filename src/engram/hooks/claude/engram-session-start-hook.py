@@ -63,6 +63,7 @@ import os
 import re
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -1546,13 +1547,41 @@ AGENT_REGISTRY_DIR = os.path.join(AGENTS_SHARED_ROOT, "agents")
 def write_agent_registration(
     agent_name: str,
     registry_dir: str = AGENT_REGISTRY_DIR,
-) -> None:
+) -> dict:
     """Write/refresh the agent's registration file in the shared registry.
 
     Writes atomically via temp-file + os.replace so concurrent agents never
     read a partial JSON. Creates the registry dir (group-writable, setgid) if
-    it does not exist. Fails silently if the shared filesystem is absent or
-    unwritable — this only matters when /home/agents-shared/ exists, and is a convenience, not a blocker.
+    it does not exist, and asserts that mode explicitly afterwards (#4026):
+    ``os.makedirs`` applies its ``mode`` THROUGH the process umask, and
+    ``exist_ok=True`` never repairs a directory that already exists at the
+    wrong mode. The mode is set on the opened directory itself, never through
+    a path that may be a symlink (#4682): a group member can create the
+    ``agents`` entry pointing at a directory this user owns, so the entry is
+    opened with ``O_NOFOLLOW`` and, if that fails, NOTHING is chmodded and
+    nothing is written through it. The fd stays open for the whole call and
+    every later step — the chmod, the temp creation, the replace — is
+    fd-relative, so a co-tenant who swaps ``agents`` for a symlink AFTER the
+    check cannot redirect the chmod or the write either (#4682 TOCTOU).
+    ``agent_name`` must be a bare name (no separator, not ``.``/``..``): the
+    fd-bound writer accepts only a basename, and a separator would otherwise
+    join straight out of the directory. The shared directory ends up 0o2775
+    (group-writable, setgid) so each co-tenant can create its own file; the
+    registration file itself is 0o644 — group-readable, never group-writable,
+    since a writable record would let a co-tenant impersonate another agent in
+    peer topology. The file's mode is applied to the temp file before the
+    atomic replace, so there is no post-replace chmod to redirect. The 0o644
+    closes the WRITE vector, not the UNLINK vector: ``agents`` is
+    group-writable and not sticky, so a co-tenant can still unlink or rename
+    another agent's record whatever its mode — the file mode stops an in-place
+    rewrite, not removal.
+    Fails soft if the shared filesystem is absent or unwritable — this only
+    matters when /home/agents-shared/ exists, and is a convenience, not a
+    blocker. Never raises on Unix (the constants it needs — ``os.O_DIRECTORY``,
+    ``os.O_NOFOLLOW`` — are POSIX; the caller's broad ``except Exception`` is
+    what keeps SessionStart safe on a platform without them), and never prints
+    (the hook injects context on stdout); failures are reported in the returned
+    status.
 
     File path: <registry_dir>/<agent_name>.json
     Content   : {"agent_name": ..., "hostname": ..., "pid": ..., "registered_at": <ISO UTC>}
@@ -1561,34 +1590,127 @@ def write_agent_registration(
         agent_name   : The agent's own name (from config.json or env).
         registry_dir : Override for the default /home/agents-shared/agents/.
                        (Exposed for testing.)
+
+    Returns:
+        {"registered": bool, "dir_mode": int | None, "dir_error": str | None,
+         "file_path": str, "file_error": str | None}
+        ``dir_mode`` is the mode READ BACK with os.fstat on the opened
+        directory after the fchmod attempt (not the mode requested). The read
+        back happens EVEN IF the fchmod was refused, and ``dir_error`` is set
+        only when that read-back differs from 0o2775: EPERM on a directory
+        already at the right mode (every agent that does not own it) reports
+        no error, while a dropped setgid bit or an unusable/symlinked entry
+        does. ``registered`` is True only once the JSON file — including its
+        0o644 mode — was written.
     """
+    status = {
+        "registered": False,
+        "dir_mode": None,
+        "dir_error": None,
+        "file_path": "",
+        "file_error": None,
+    }
+
     if not agent_name:
-        return
+        return status
+
+    # #4682: the registration write is bound to the registry directory's fd, so
+    # a name carrying a path separator would join straight out of it. Refuse it
+    # before anything is created, chmodded or written.
+    if (
+        agent_name in (".", "..")
+        or os.sep in agent_name
+        or (os.altsep is not None and os.altsep in agent_name)
+    ):
+        status["file_error"] = (
+            f"refusing an agent name that would escape the registry: {agent_name!r}"
+        )
+        return status
 
     # Gate: the shared-fs root must exist and be a directory. If absent (single-
     # host install with no shared fs), skip silently — never break SessionStart.
     shared_root = os.path.dirname(registry_dir)
     if not os.path.isdir(shared_root):
-        return
+        return status
 
     try:
-        # Create the registry dir with group-writable, setgid permissions so
-        # co-tenant agents can each write their own file.
         os.makedirs(registry_dir, mode=0o2775, exist_ok=True)
+    except OSError as exc:
+        status["dir_error"] = f"could not create registry dir: {exc}"
+        return status
 
-        record = {
-            "agent_name": agent_name,
-            "hostname": socket.gethostname(),
-            "pid": os.getpid(),
-            "registered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
+    # Group-writable, setgid, whatever the umask and whoever created the dir
+    # first (#4026). Open the entry itself with O_NOFOLLOW and fchmod the fd
+    # (#4682): a path-based chmod follows a planted `agents` symlink and widens
+    # the VICTIM's directory. ELOOP (it is a symlink), ENOTDIR / ENOENT (not a
+    # usable directory) mean: chmod nothing AND write nothing through it.
+    try:
+        dir_fd = os.open(registry_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        status["dir_error"] = (
+            f"could not open registry dir without following a link: {exc}"
+        )
+        return status
+
+    # The single fd opened with O_NOFOLLOW above stays open across BOTH the
+    # chmod and the write; one finally closes it. Every step in between is
+    # fd-relative, so replacing the `agents` entry after this point can
+    # redirect neither.
+    try:
+        chmod_error = None
+        try:
+            os.fchmod(dir_fd, 0o2775)
+        except OSError as exc:
+            # EPERM when the directory belongs to another agent. That is not
+            # itself a failure: the mode we need may already be set, so keep
+            # going and let the read-back decide. Never raise.
+            chmod_error = exc
+        try:
+            dir_mode = stat.S_IMODE(os.fstat(dir_fd).st_mode)
+        except OSError as exc:
+            status["dir_error"] = f"could not read back registry dir mode: {exc}"
+        else:
+            status["dir_mode"] = dir_mode
+            if dir_mode != 0o2775:
+                # POSIX can silently drop setgid for a non-member caller, and a
+                # refused fchmod leaves the old mode: the requested mode is not
+                # proof the mode took, so report the READ-BACK mismatch (#4682).
+                status["dir_error"] = (
+                    f"could not set registry dir mode: {chmod_error}"
+                    if chmod_error is not None
+                    else f"registry dir mode is 0o{dir_mode:o}, expected 0o2775"
+                )
+
         dest = os.path.join(registry_dir, f"{agent_name}.json")
+        try:
+            record = {
+                "agent_name": agent_name,
+                "hostname": socket.gethostname(),
+                "pid": os.getpid(),
+                "registered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            # Atomic write, mode- and group-preserving (#4013), with the file
+            # mode applied to the TEMP file before the replace (#4682):
+            # group-READABLE, never group-writable — a writable <name>.json
+            # would let any co-tenant in `agents` rewrite another agent's
+            # record, which feeds peer topology and liveness. The shared
+            # DIRECTORY is group-writable so each agent can create its own
+            # file; the file itself needs no group write. The write is bound to
+            # the fd opened above: the temp is created inside THAT directory
+            # and the replace happens inside it, so a symlink swapped in after
+            # the check cannot redirect it. The bare basename is what dir_fd
+            # requires; an absolute path would silently ignore it.
+            atomic_write_json(f"{agent_name}.json", record, mode=0o644, dir_fd=dir_fd)
+        except Exception as exc:
+            # Fail-soft: never raise from a convenience side-effect.
+            status["file_error"] = f"could not write registration file: {exc}"
+            return status
+    finally:
+        os.close(dir_fd)
 
-        # Atomic write, mode- and group-preserving (#4013): peers read the registry through group.
-        atomic_write_json(dest, record)
-    except Exception:
-        # Fail-soft: never raise from a convenience side-effect.
-        pass
+    status["registered"] = True
+    status["file_path"] = dest
+    return status
 
 
 PEER_STALE_HOURS = 24  # mirror ia.py's default
@@ -3398,7 +3520,12 @@ def fairy_policy_block() -> str:
         ),
         "always": (
             "[Coder fairy policy: always] Every PR coding task gets a fairy — "
-            "no size exception, no quick-fix exception. Spec and dispatch."
+            "no size exception, no quick-fix exception. Spec and dispatch, once "
+            "sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
+            "(a dated grant line or a standing request); without it, do the work "
+            "directly and say so. "
+            "Where that section carries an \"ask each time\" line, ask the user "
+            "before each dispatch; a yes covers that task only."
         ),
         "auto": (
             "[Coder fairy policy: auto] Use judgment per task. Before deciding on "
@@ -3413,7 +3540,12 @@ def fairy_policy_block() -> str:
         ),
         "always": (
             "[Reviewer fairy policy: always] Every PR review task gets a "
-            "reviewer-fairy — no size exception, no quick-fix exception. Dispatch."
+            "reviewer-fairy — no size exception, no quick-fix exception. Dispatch, "
+            "once sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
+            "(a dated grant line or a standing request); without it, do the review "
+            "directly and say so. "
+            "Where that section carries an \"ask each time\" line, ask the user "
+            "before each dispatch; a yes covers that task only."
         ),
         "auto": (
             "[Reviewer fairy policy: auto] Use judgment per task. Before deciding on "
@@ -3762,8 +3894,13 @@ def _main_impl() -> None:
     # ── Agent registration (only when /home/agents-shared/ exists) ────────────
     # Write/refresh the agent's registration file in the shared registry so
     # peers can discover co-host vs cross-host topology. Fail-soft: the shared
-    # filesystem may not exist (single-host install), and write_agent_registration
-    # is wrapped in a broad try/except that swallows all errors silently.
+    # filesystem may not exist (single-host install), and the broad try/except
+    # below guarantees SessionStart itself cannot break. The status returned by
+    # write_agent_registration (registered / dir_error / file_error) is
+    # intentionally NOT consumed or surfaced here: it exists for tests and a
+    # future health line, and printing it would emit a line on EVERY session
+    # start for agents that do not own the shared registry directory (the
+    # normal case — the first agent to run owns /home/agents-shared/agents).
     _agent_name = ""
     try:
         _config_path = os.path.join(ENGRAM_HOME, "config.json")

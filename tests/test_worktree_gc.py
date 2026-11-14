@@ -19,6 +19,13 @@ Coverage (all branches of classify()):
  13. detached HEAD where the open-PR lookup fails / gh is unavailable → SKIP
      (a delete verb must fail toward keeping when the state is unknown).
 
+14. AGE GUARD (#2808): an agent-owned worktree (branch `worktree-agent-*` /
+    `review-*`, OR any worktree under `<main>/.claude/worktrees/`) younger than
+    AGE_GUARD_SECONDS is SKIPped on every prune path; age unreadable -> SKIP;
+    the /proc in-use guard is still honoured past the age; non-agent-owned
+    worktrees are unchanged. These cells use REAL temp repos and worktrees
+    (age is read from the worktree's git admin metadata) with os.utime.
+
 classify() tests monkeypatch _is_clean, _pr_state, _is_in_use and (for the
 detached cases) _pr_for_sha on the loaded module. The direct _pr_for_sha unit
 cells patch _run instead (they exercise the real helper). Nothing here makes a
@@ -28,6 +35,10 @@ real git or gh call.
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -68,6 +79,66 @@ def _make_worktree(
 
 
 ROOT = "/fake/repo"
+
+
+def _git(*args, cwd):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+
+def _real_worktree(tmp_path, branch, under_claude=True):
+    """Make a real main repo + one real worktree. Returns (main_root, wt_path).
+
+    branch=None -> detached HEAD. under_claude -> the worktree sits at
+    <main>/.claude/worktrees/<name>, else at a sibling directory outside it.
+    """
+    main = tmp_path / "main"
+    if not main.exists():
+        main.mkdir()
+        _git("init", "-q", "-b", "main", cwd=main)
+        (main / "f").write_text("x")
+        _git("add", "f", cwd=main)
+        _git("commit", "-q", "-m", "init", cwd=main)
+    name = (branch or "detached").replace("/", "_")
+    if under_claude:
+        wt = main / ".claude" / "worktrees" / name
+    else:
+        wt = tmp_path / "elsewhere" / name
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    if branch is None:
+        _git("worktree", "add", "-q", "--detach", str(wt), cwd=main)
+    else:
+        _git("worktree", "add", "-q", "-b", branch, str(wt), cwd=main)
+    return str(main), wt
+
+
+def _admin_dir(wt):
+    line = (wt / ".git").read_text().strip()
+    assert line.startswith("gitdir: ")
+    return Path(line[len("gitdir: "):])
+
+
+def _set_age(wt, seconds):
+    """Make every metadata file the guard may read exactly `seconds` old."""
+    admin = _admin_dir(wt)
+    when = time.time() - seconds
+    for rel in ("HEAD", "index", "logs/HEAD"):
+        f = admin / rel
+        if f.exists():
+            os.utime(f, (when, when))
+
+
+def _classify_real(root, wt, branch, *, pr_state=None, in_use=False, **kw):
+    t = _make_worktree(str(wt), branch=branch, detached=branch is None,
+                       head="deadbeef")
+    with (
+        patch.object(_mod, "_is_clean", return_value=True),
+        patch.object(_mod, "_pr_state", return_value=pr_state),
+        patch.object(_mod, "_is_in_use", return_value=in_use),
+        patch.object(_mod, "_pr_for_sha", return_value=(True, None)),
+    ):
+        return _mod.classify(t, root, **kw)
 
 
 @pytest.fixture(autouse=True)
@@ -213,7 +284,11 @@ def test_classify_detached_head_in_use_beats_open_pr_lookup(tmp_path):
 
 
 def test_classify_worktree_agent_branch(tmp_path):
-    t = _make_worktree(str(tmp_path), branch="worktree-agent-abc123")
+    # Agent-owned since #2808: needs a readable age, so a real worktree aged
+    # past the guard (the decision under test is unchanged: old + clean -> PRUNE).
+    _root, wt = _real_worktree(tmp_path, "worktree-agent-abc123", under_claude=False)
+    _set_age(wt, 6 * 3600 + 60)
+    t = _make_worktree(str(wt), branch="worktree-agent-abc123")
     with patch.object(_mod, "_is_clean", return_value=True):
         action, reason = _mod.classify(t, ROOT)
     assert action == "PRUNE"
@@ -226,7 +301,10 @@ def test_classify_worktree_agent_branch(tmp_path):
 
 
 def test_classify_review_branch(tmp_path):
-    t = _make_worktree(str(tmp_path), branch="review-456")
+    # Agent-owned since #2808 (see test_classify_worktree_agent_branch).
+    _root, wt = _real_worktree(tmp_path, "review-456", under_claude=False)
+    _set_age(wt, 6 * 3600 + 60)
+    t = _make_worktree(str(wt), branch="review-456")
     with patch.object(_mod, "_is_clean", return_value=True):
         action, reason = _mod.classify(t, ROOT)
     assert action == "PRUNE"
@@ -566,3 +644,234 @@ def test_pr_for_sha_does_not_cache_a_failed_lookup():
     assert second == (False, None)
     assert mock_run.call_count == 2
     assert ROOT not in _mod._OPEN_PR_HEADS
+
+
+# ---------------------------------------------------------------------------
+# 14. AGE GUARD (#2808)
+# ---------------------------------------------------------------------------
+
+# (id, branch, under_claude, pr_state) -- the four agent-owned shapes
+_AGENT_SHAPES = [
+    ("agent-branch", "worktree-agent-abc", True, None),
+    ("review-branch", "review-77", True, None),
+    ("detached-under-claude", None, True, None),
+    ("named-merged-under-claude", "fix/some-thing", True, "MERGED"),
+]
+_SHAPE_IDS = [x[0] for x in _AGENT_SHAPES]
+
+
+def test_age_guard_constant_is_six_hours():
+    assert _mod.AGE_GUARD_SECONDS == 6 * 3600
+
+
+@pytest.mark.parametrize("_id,branch,under,pr", _AGENT_SHAPES, ids=_SHAPE_IDS)
+def test_age_guard_young_agent_worktree_is_skipped(tmp_path, _id, branch, under, pr):
+    root, wt = _real_worktree(tmp_path, branch, under_claude=under)
+    _set_age(wt, _mod.AGE_GUARD_SECONDS - 60)
+    action, reason = _classify_real(root, wt, branch, pr_state=pr)
+    assert action == "SKIP"
+    assert "age guard" in reason
+    assert "6h" in reason
+    assert "359m" in reason  # age rounded to minutes
+
+
+@pytest.mark.parametrize("_id,branch,under,pr", _AGENT_SHAPES, ids=_SHAPE_IDS)
+def test_age_guard_old_agent_worktree_still_prunes(tmp_path, _id, branch, under, pr):
+    root, wt = _real_worktree(tmp_path, branch, under_claude=under)
+    _set_age(wt, _mod.AGE_GUARD_SECONDS + 60)
+    action, reason = _classify_real(root, wt, branch, pr_state=pr)
+    assert action == "PRUNE", reason
+
+
+def test_age_guard_is_newest_of_head_index_logs(tmp_path):
+    """The newest of HEAD / index / logs/HEAD counts: one young file keeps it."""
+    root, wt = _real_worktree(tmp_path, "worktree-agent-new")
+    _set_age(wt, _mod.AGE_GUARD_SECONDS + 3600)
+    young = time.time() - 120
+    os.utime(_admin_dir(wt) / "index", (young, young))
+    action, reason = _classify_real(root, wt, "worktree-agent-new")
+    assert action == "SKIP" and "age guard" in reason
+
+
+def test_age_guard_unreadable_age_fails_closed(tmp_path):
+    root, wt = _real_worktree(tmp_path, "worktree-agent-x")
+    _set_age(wt, _mod.AGE_GUARD_SECONDS + 3600)  # old, but we cannot see it
+    (wt / ".git").write_text("gitdir: " + str(tmp_path / "no-such-admin") + "\n")
+    action, reason = _classify_real(root, wt, "worktree-agent-x")
+    assert action == "SKIP"
+    assert "could not be read" in reason
+
+
+def test_age_guard_missing_dotgit_fails_closed(tmp_path):
+    root, wt = _real_worktree(tmp_path, None)
+    (wt / ".git").unlink()
+    # main() always passes main_path (trees[0]); without a `.git` file a direct
+    # caller cannot derive it, so pass it as main() does.
+    action, reason = _classify_real(root, wt, None, main_path=root)
+    assert action == "SKIP"
+    assert "could not be read" in reason
+
+
+@pytest.mark.parametrize("_id,branch,under,pr", _AGENT_SHAPES, ids=_SHAPE_IDS)
+def test_age_guard_old_but_in_use_is_still_skipped(tmp_path, _id, branch, under, pr):
+    root, wt = _real_worktree(tmp_path, branch, under_claude=under)
+    _set_age(wt, _mod.AGE_GUARD_SECONDS + 60)
+    action, reason = _classify_real(root, wt, branch, pr_state=pr, in_use=True)
+    assert action == "SKIP"
+    assert "process active" in reason
+
+
+def test_age_guard_named_merged_outside_claude_worktrees_unchanged(tmp_path):
+    """Not agent-owned (named branch, outside .claude/worktrees): young is fine."""
+    root, wt = _real_worktree(tmp_path, "feat/mine", under_claude=False)
+    _set_age(wt, 60)
+    action, reason = _classify_real(root, wt, "feat/mine", pr_state="MERGED")
+    assert action == "PRUNE", reason
+
+
+def test_age_guard_missing_dir_is_exempt(tmp_path):
+    root, _wt = _real_worktree(tmp_path, "worktree-agent-gone")
+    t = _make_worktree(str(tmp_path / "gone"), branch="worktree-agent-gone")
+    action, reason = _mod.classify(t, root)
+    assert action == "PRUNE" and "missing" in reason
+
+
+def test_age_guard_seconds_argument_overrides_default(tmp_path):
+    root, wt = _real_worktree(tmp_path, "worktree-agent-arg")
+    _set_age(wt, 600)
+    assert _classify_real(root, wt, "worktree-agent-arg")[0] == "SKIP"
+    assert _classify_real(root, wt, "worktree-agent-arg",
+                          age_guard_seconds=300)[0] == "PRUNE"
+
+
+def test_cli_flag_reaches_classify(tmp_path):
+    seen = {}
+
+    def fake_classify(t, root, **kw):
+        seen.update(kw)
+        return "KEEP", "stub"
+
+    with (
+        patch.object(sys, "argv", ["worktree-gc", "--age-guard-seconds", "1234"]),
+        patch.object(_mod, "_repo_root", return_value=str(tmp_path)),
+        patch.object(_mod, "_list_worktrees",
+                     return_value=[_make_worktree(str(tmp_path))]),
+        patch.object(_mod, "classify", side_effect=fake_classify),
+    ):
+        assert _mod.main() == 0
+    assert seen.get("age_guard_seconds") == 1234
+
+
+def test_main_passes_main_checkout_not_run_root_as_main_path(tmp_path):
+    """main() run from a sibling worktree must hand classify trees[0]'s path
+    (the main checkout), not the run root (#2808 round 3)."""
+    main_dir = str(tmp_path / "main-checkout")
+    run_root = str(tmp_path / "sibling-run-dir")
+    trees = [_make_worktree(main_dir), _make_worktree(run_root)]
+    seen = []
+
+    def fake_classify(t, root, **kw):
+        seen.append((root, kw))
+        return "KEEP", "stub"
+
+    with (
+        patch.object(sys, "argv", ["worktree-gc"]),
+        patch.object(_mod, "_repo_root", return_value=run_root),
+        patch.object(_mod, "_list_worktrees", return_value=trees),
+        patch.object(_mod, "classify", side_effect=fake_classify),
+    ):
+        assert _mod.main() == 0
+    assert len(seen) == len(trees)
+    for root, kw in seen:
+        assert root == run_root
+        assert kw["main_path"] == trees[0]["path"]
+        assert kw["main_path"] != run_root
+
+
+# ---------------------------------------------------------------------------
+# 15. AGE GUARD uses the MAIN checkout's folder, not the directory the tool
+#     runs from (#2808 round 2)
+# ---------------------------------------------------------------------------
+
+
+def _sibling_root(tmp_path, main):
+    """A second linked worktree OUTSIDE <main>/.claude/worktrees/: the
+    `--show-toplevel` a run from inside a linked worktree would report."""
+    sib = tmp_path / "sibling-run-dir"
+    _git("worktree", "add", "-q", "--detach", str(sib), cwd=main)
+    return str(sib)
+
+
+@pytest.mark.parametrize("branch,pr", [(None, None), ("fix/named-thing", "MERGED")],
+                         ids=["detached", "named-merged"])
+def test_age_guard_uses_main_checkout_when_run_from_sibling_worktree(tmp_path, branch, pr):
+    main, wt = _real_worktree(tmp_path, branch)
+    _set_age(wt, 120)
+    sib = _sibling_root(tmp_path, main)
+    action, reason = _classify_real(sib, wt, branch, pr_state=pr)
+    assert action == "SKIP", reason
+    assert "age guard" in reason
+
+
+@pytest.mark.parametrize("branch,pr", [(None, None), ("fix/named-thing", "MERGED")],
+                         ids=["detached", "named-merged"])
+def test_age_guard_explicit_main_path_beats_run_root(tmp_path, branch, pr):
+    main, wt = _real_worktree(tmp_path, branch)
+    _set_age(wt, 120)
+    sib = _sibling_root(tmp_path, main)
+    action, reason = _classify_real(sib, wt, branch, pr_state=pr, main_path=main)
+    assert action == "SKIP", reason
+
+
+def test_age_guard_main_path_underivable_means_branch_rule_only(tmp_path):
+    """No derivable main path: the under-folder test is False (never `root`)."""
+    main, wt = _real_worktree(tmp_path, None)
+    _set_age(wt, 120)
+    with patch.object(_mod, "_main_checkout_path", return_value=None):
+        action, reason = _classify_real(main, wt, None)
+    assert action == "PRUNE", reason
+
+
+def test_age_guard_boundary_age_equal_to_guard_prunes(tmp_path):
+    """The rule is `age < guard` keeps: age == guard is old enough to prune."""
+    root, wt = _real_worktree(tmp_path, "worktree-agent-edge")
+    _set_age(wt, 0)
+    newest = max(p.stat().st_mtime for p in
+                 (_admin_dir(wt) / r for r in ("HEAD", "index", "logs/HEAD"))
+                 if p.exists())
+    guard = 1000
+    with patch.object(_mod.time, "time", return_value=newest + guard):
+        action, reason = _classify_real(root, wt, "worktree-agent-edge",
+                                        age_guard_seconds=guard)
+    assert action == "PRUNE", reason
+    with patch.object(_mod.time, "time", return_value=newest + guard - 1):
+        action, reason = _classify_real(root, wt, "worktree-agent-edge",
+                                        age_guard_seconds=guard)
+    assert action == "SKIP", reason
+
+
+def test_is_clean_does_not_refresh_a_stale_index_4695(tmp_path):
+    """#4695: the gc's own clean check must not write the index. A plain
+    `git status` rewrites an index whose stat data is stale (index mtime older
+    than the files'), which would reset the measured age to zero."""
+    root, wt = _real_worktree(tmp_path, "worktree-agent-stale")
+    admin = _admin_dir(wt)
+    old = time.time() - (_mod.AGE_GUARD_SECONDS + 3 * 3600)
+    for rel in ("HEAD", "logs/HEAD"):
+        if (admin / rel).exists():
+            os.utime(admin / rel, (old, old))
+    # Files newer than the index: the racy shape a plain status refreshes.
+    recent = time.time() - 60
+    for f in wt.iterdir():
+        if f.is_file() and f.name != ".git":
+            os.utime(f, (recent, recent))
+    os.utime(admin / "index", (old, old))
+    index_before = (admin / "index").stat().st_mtime_ns
+    age_before = _mod._worktree_age_seconds(str(wt))
+
+    assert _mod._is_clean(str(wt)) is True
+
+    assert (admin / "index").stat().st_mtime_ns == index_before
+    age_after = _mod._worktree_age_seconds(str(wt))
+    assert age_after >= age_before
+    assert age_after > _mod.AGE_GUARD_SECONDS

@@ -193,8 +193,11 @@ class TestGetModeOverride:
         # Verify it's active immediately.
         mode, _ = mod.get_mode()
         assert mode == "user"
-        # Wait for expiry.
-        time.sleep(1.1)
+        # #4017: advance the clock get_mode reads instead of sleeping on the wall clock.
+        real_time = time.time
+        monkeypatch.setattr(
+            mod, "time", types.SimpleNamespace(time=lambda: real_time() + 5.0)
+        )
         mode, _ = mod.get_mode()
         assert mode == "auto"
 
@@ -574,7 +577,11 @@ class TestActiveOverride:
         mod.set_mode("user", ttl_seconds=1)
         # Confirm active while fresh.
         assert mod.active_override() is not None
-        time.sleep(1.1)
+        # #4017: advance the clock the module reads instead of sleeping on the wall clock.
+        real_time = time.time
+        monkeypatch.setattr(
+            mod, "time", types.SimpleNamespace(time=lambda: real_time() + 5.0)
+        )
         assert mod.active_override() is None
 
     def test_returns_none_for_corrupt_file(self, tmp_path, monkeypatch):
@@ -691,7 +698,11 @@ class TestGetModeRegressionAfterRefactor:
         _setup_presence(mod, tmp_path, monkeypatch)
         _write_stamp(tmp_path, 9999)
         mod.set_mode("user", ttl_seconds=1)
-        time.sleep(1.1)
+        # #4017: advance the clock the module reads instead of sleeping on the wall clock.
+        real_time = time.time
+        monkeypatch.setattr(
+            mod, "time", types.SimpleNamespace(time=lambda: real_time() + 5.0)
+        )
         mode, _ = mod.get_mode()
         assert mode == "auto"
 

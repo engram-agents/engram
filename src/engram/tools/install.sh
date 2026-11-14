@@ -334,7 +334,7 @@ command -v python3 >/dev/null 2>&1 \
   || fail "python3 not found on PATH" "install Python $MIN_PYTHON or newer (with the venv module) and re-run"
 python3 -c 'import sys; sys.exit(0 if sys.version_info[:3] >= (3, 10, 7) else 1)' \
   || fail "python3 is older than $MIN_PYTHON ($(python3 --version 2>&1))" "install Python $MIN_PYTHON or newer and re-run (3.10.0-3.10.6 are not supported)$(
-    [ "$(uname -s 2>/dev/null)" != "Darwin" ] || printf '; on macOS: brew install python@3.12')"
+    [ "$(uname -s 2>/dev/null)" != "Darwin" ] || printf '; on macOS: brew install python@3.12 (a versioned Homebrew Python links only python3.12, and this installer runs python3), then run: export PATH="$(brew --prefix python@3.12)/libexec/bin:$PATH"')"
 python3 -c 'import venv, ensurepip' >/dev/null 2>&1 \
   || fail "python3 has no venv/ensurepip module" "install it (Debian/Ubuntu: apt install python3-venv) and re-run"
 command -v git >/dev/null 2>&1 \

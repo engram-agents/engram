@@ -162,7 +162,7 @@ class TestPlantedDefinition:
         assert flagged_lines("```\nls ~/.engram-gemini/x ~/.engram_home\n```\n") == []
 
     def test_braced_quoted_home_and_absolute_paths_are_flagged(self):
-        for spelling in ('"${HOME}"/.engram/x', "/Users/lei/.engram/x", "/home/lei/.engram/x"):
+        for spelling in ('"${HOME}"/.engram/x', "/Users/someone/.engram/x", "/home/someone/.engram/x"):
             assert flagged_lines(f"```\ncat {spelling}\n```\n"), spelling
             assert flagged_lines(f"see `{spelling}` here\n"), spelling
 
@@ -263,7 +263,7 @@ def _home_sites(skill):
     return [s for s in _python_c_sites(text) if "ENGRAM_HOME" in s[2] or "$MARKER" in s[2]]
 
 
-EXPECTED_HOME_SITES = {"engram-health-exam": 6, "engram-sleep": 1, "engram-upgrade": 0}
+EXPECTED_HOME_SITES = {"engram-health-exam": 6, "engram-sleep": 1, "engram-upgrade": 1}
 
 
 def _scratch_home(home):

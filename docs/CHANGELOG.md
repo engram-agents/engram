@@ -9,6 +9,81 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+### Changed
+
+- `engram_derive` no longer returns an `independence_advisory` key. It duplicated
+  the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
+  or more lineages, and when the install has recorded its own lineage, that line
+  covers every case the advisory did; in a graph
+  with a single lineage, a generalization over same-lineage premises now gets
+  no warning, because the line only warns when a cross-lineage observation
+  exists to cite. That line now carries the same three options (add a
+  cross-lineage observation, use a weaker reasoning type, or proceed and say
+  why in `logical_chain`). Its firing conditions are unchanged. (#4728)
+- The write-time `anchoring_advisory` on every observation write now matches a
+  claim's hard tokens only at token boundaries. `#404` is no longer reported as
+  anchored by a quote containing `#4040`, nor `404` by `4040`, `4.404` or
+  `5,404`. A number that lies inside another hard token (the `1234` in
+  `ob_1234`, a digit run inside a hex sha, the year in a date) is part of that
+  token and is no longer counted separately, so a verbatim quote still anchors
+  fully. Seven-digit and longer all-decimal runs are classified as numbers, not
+  hex shas, and take the strict rule: an all-digit sha is no longer accepted as
+  the prefix of a longer all-digit sha, while a sha with letters still is. Hex
+  shas remain case-insensitive. (#4206)
+- The touched-test selector (`run_touched_tests.py`) now finds the tests for
+  changes under `src/engram`. Before, it only looked at the old repo-root layout,
+  so a change to `server.py` or `engram_core.py` fell back to the whole suite.
+  It now follows the import paths that `tests/conftest.py` sets up. It also
+  always adds every test whose text names a changed file, and always adds the
+  guard tests from the Owner merge list. A changed file that nothing refers to
+  no longer runs the whole suite: the selector prints its name as unreferenced.
+  The "SUBSET green" line now says the full suite runs nightly and at the
+  release cut. `--json` gains `layers` and `unreferenced` keys; no key is
+  removed. (#4358)
+
+### Fixed
+- The `cites` and `cited_by` filters in `engram_list` now match the whole citation
+  family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
+  They named a relation that does not exist, so they never matched `supported_by`
+  or `acknowledged_derives_from` edges. (engram#2258)
+- The Quiet Wake nudge now prints a command that runs as printed: the plugin venv
+  interpreter (`~/.engram/venv/bin/python3`) and the study-queue tool's absolute
+  path. On a host whose only `python3` is older than 3.10, the tool re-execs under
+  that venv instead of crashing while importing `engram_core`; a re-exec that does
+  not reach a 3.10+ interpreter (a wrapper script, or a venv that is itself older)
+  fails once rather than retrying. With no usable venv it refuses with one line on
+  stderr and exit 3, before doing any work. (#4642)
+- `scan-leaks` no longer prints a bad entry from the local name roster. A roster
+  entry that is malformed or has a regex that does not compile is now reported
+  by its position in the list and the kind of error only, never by its contents,
+  its label or the regex error text, so a terminal paste cannot carry a name.
+  The entry is still skipped and loading continues.
+- The `ia` refusal for an unconfigured forum now points at the engram-letter skill's
+  troubleshooting row, not at a README path that does not ship on an installed seat
+  (engram#3560).
+- A roster line that does not compile as a regex no longer prints that line, or the
+  regex error text, to stderr. The advisory name scan now reports only the roster
+  line number, the error class and the offset. (engram#4559)
+
+### Docs
+- The `engram-trust-tier` skill no longer describes a `force=true` override that `engram_set_trust_tier` does not have: it now names the real gate (`justification_obs_id` and `primary_user_approval_obtained`) and says the call fails closed without them (engram#4303). The handbook says config updates are `PUT /api/config/<key>`, not POST (engram#4461).
+- The install guide now says that an ACL or extended attribute on `~/.claude/settings.json` is lost during
+  install: measured for `claude plugin marketplace add` on one Mac and on Linux, and for a full
+  install on Linux (engram#4640, option 1).
+- `PR-MERGE-POLICY.md` now says a press guard must stop the press by explicit control flow
+  (`&&` into the merge, or `|| exit 1`), never by `set -e`: the Claude Code Bash tool
+  ignores `errexit`, measured through the tool on a merge
+  seat on 2026-11-09. The seat also reads
+  the gate's printed verdicts in a separate call before it presses.
+
+## [v0.5.7] - 2026-11-12
+
+A patch release. Its reason is one guarantee: ENGRAM's setup (the installer,
+`bootstrap.py` and the marketplace installer) never silently replaces or deletes
+a file that you or an earlier agent wrote. The first section below says exactly
+which files and settings this covers. The other changes merged on `dev` since
+v0.5.6 ship with it.
+
 ### Installer and setup safety
 
 - Setup never silently overwrites or deletes a file you or your agent wrote. It
@@ -19,22 +94,155 @@ with an `-alpha` suffix during the alpha phase.
   installer's question about an existing `CLAUDE.md` now defaults to No.
   `bootstrap.py` never seeds a new graph beside an existing agent's memory, even
   with `--force`. A fresh start is moving the whole data home aside.
-  A backup keeps the file's bytes, mode and modification time, not extended
-  attributes or ACLs. Backups accumulate, and nothing deletes them
-  automatically. When setup sets one of its own keys in a settings or config
-  file (`cleanupPeriodDays`, `install_tier`, `forum.url`), it backs the file
-  up first, keeps every other key in value and order, and leaves a file that
-  does not parse as it is. This now holds for all three writers of those keys
-  (the installer, the marketplace installer and `set_forum_url.py`). The
-  installer only asks about `CLAUDE.md`; the backups are made by
-  `bootstrap.py` before it writes. A Codex custom-agent file (`engram-*.toml`)
-  that differs from the one setup installs is backed up first, and one line per
-  file names the backup. Uninstall leaves both files as they are when
-  `<name>.pre-engram` is the same file as `<name>`. When the marketplace
-  installer finishes but skips an item (saving `install_tier` into a config it
-  would not change, or a Codex agent file it could not install), it no longer
-  hides this in a warning: it ends with a block that lists each item and what to
-  do, and exits with code 10, "finished, with items not done".
+  A backup keeps the file's bytes, mode and modification time. On macOS it
+  does not carry ACLs or extended attributes; on Linux it does (measured on one
+  machine each). Backups accumulate, and nothing deletes them automatically.
+  When setup sets one of its own keys in a settings or config file
+  (`cleanupPeriodDays`, `install_tier`, `forum.url`), it backs the file up
+  first, keeps every other key in value and order, and leaves a file that does
+  not parse as it is. This now holds for all three writers of those keys (the
+  installer, the marketplace installer and `set_forum_url.py`). The installer
+  only asks about `CLAUDE.md`; the backups are made by `bootstrap.py` before
+  it writes. A Codex custom-agent file (`engram-*.toml`) that differs from the
+  one setup installs is backed up first, and one line per file names the
+  backup. Uninstall leaves both files as they are when `<name>.pre-engram` is
+  the same file as `<name>`. When the marketplace installer finishes but skips
+  an item (saving `install_tier` into a config it would not change, or a Codex
+  agent file it could not install), it no longer hides this in a warning: it
+  ends with a block that lists each item and what to do, and exits with code
+  10, "finished, with items not done".
+
+- **Setup rewrites an existing file in place.** The file keeps its inode, so
+  its mode (except the setuid and setgid bits, which an unprivileged writer's
+  write clears; measured on Linux), owner, group, hard links, ACL entries and
+  extended attributes stay as they were
+  (one file is an exception whenever the installer runs: `settings.json`, see
+  Known limits below). The stamped backup is saved first; a file ENGRAM itself
+  owns has no backup, and a refusal for such a file says so. A write that
+  fails part-way puts the old bytes back into the same file. When the failure
+  is an error from the system, it is reported in one REFUSED line that names
+  the backup; an interruption such as Ctrl-C gets the same put-back and then
+  ends the run without that line. If putting the bytes back also fails, the
+  line says the file may be incomplete and gives the command that restores it.
+  A kill or a power loss during the write gets no put-back, so the file can be
+  left incomplete; the backup taken first restores its bytes. A program that
+  reads the file during the write can see it empty or partial. A file that
+  does not exist yet is created exclusively: a file that appears at that path
+  in the meantime is refused and left as it is, on a filesystem that supports
+  hard links; without them the new file is put in place by a rename.
+
+### Fixes
+
+- **A first install on a machine that has never downloaded the embedding model
+  now completes.** In v0.5.6 the installer downloaded the pinned model, the
+  server's check for it then looked the model up by name without the pin and
+  did not find it, the installer stopped at step 5 and the memory server refused
+  to start. The check now asks the same question the loader asks. A machine that
+  had downloaded the model before it was pinned was not affected by this fault.
+  The server's message and the installer's remedy for a missing pinned model
+  now name the pinned download.
+- **macOS: the installer's remedy for a `python3` that is too old now works as
+  printed.** A versioned Homebrew Python links `python3.12` but no `python3`, so
+  `brew install python@3.12` alone changed nothing. The message now adds the
+  `export PATH=...` command that makes `python3` resolve to the new
+  interpreter. The command lasts for that shell only, so run the installer
+  again in the same shell. Measured on one Mac with Homebrew; other Python
+  installs are not covered by this message.
+
+### Known limits
+
+The guarantee above is about what setup itself writes to an existing file. The
+first two limits below are writes outside it, and neither comes from a change
+in this release: the v0.5.6 installer runs the same Claude Code commands, and
+v0.5.6 rewrites `config.json` the same way. The last two are about setup's own
+messages.
+
+- **`settings.json` whenever the installer runs, and `~/.claude.json` on
+  Claude Code's first start.** Setup registers the plugin
+  with Claude Code's own commands. `claude plugin marketplace add` replaces
+  `~/.claude/settings.json` with a new file each time it runs, even when
+  nothing in the file changes, and `claude plugin install` rewrites it again
+  when it enables the plugin. Your own keys are kept, and Claude Code adds its
+  own (`extraKnownMarketplaces`, `enabledPlugins`). An ACL entry or an
+  extended attribute set on that file is not carried over, and nothing backs
+  the file up or prints a message for these writes. They are Claude Code's
+  writes, not ENGRAM's. The replace-on-every-run behaviour was measured on one
+  Linux machine and on one Mac (#4628). On a second Mac, with an older Claude
+  Code build, the first plugin command in a home with no `~/.claude.json`, or
+  with a hand-made one, also ran Claude Code's own first-start migration. It
+  changed `model` from `opus` to `opus[1m]` in `settings.json`, and it created
+  `~/.claude.json` or rewrote the hand-made one, which lost an ACL entry, an
+  extended attribute and one of its keys. With a copy of a `.claude.json` that
+  Claude Code had used for months, `model` stayed `opus`. A fresh home on one
+  Linux machine with a newer build did not reproduce the change, and that
+  difference is not explained (#4628). On that Linux machine both replaced
+  files kept their permission mode with no ACL set (`settings.json` at 600,
+  640 and 644; `~/.claude.json` at 600 and 644), and a newly created
+  `~/.claude.json` had mode 600. For a file that carried
+  an ACL entry, the kept mode is the ACL mask, so the entry is gone and the
+  file's own group has the permission the mask had: a file whose group had no
+  access, with a read entry for one other user, came out readable by its
+  group, and with a read-and-write entry, readable and writable by its group.
+  The mode after a replace, and this effect on the group, were not measured
+  on macOS. The marketplace step comes before the installer's question about
+  an existing `CLAUDE.md`, so a run that stops at that question has already
+  run that step (and any migration) and has created the data folder, but has
+  not run the plugin install; `CLAUDE.md` itself is untouched.
+- **`config.json` while an agent runs.** ENGRAM rewrites its own `config.json`
+  at least at every turn advance (at each sleep), by writing a new file and
+  renaming it over the old one, so that a concurrent reader never sees a
+  partial file. An ACL entry or an extended attribute set on the file itself
+  is lost in that rewrite; one that the folder supplies by default is applied
+  again. For an entry set on the file alone, where the ACL mask was wider than
+  the file's group permission, the rewrite also gives the file's own group
+  that permission (on a `config.json` with mode 0660: read and write) where it
+  had none; this was measured on Linux. ENGRAM stores no credentials in
+  `config.json`; the forum token is a separate file. Setup's writes are fixed
+  in this release; this runtime write is not (#4641).
+- **A shallow clone is refused, and the printed remedy does not help.** The
+  installer's first step refuses a clone made with
+  `git clone --depth 1 --branch <tag>`, and the remedy it prints
+  (`git fetch --tags origin`) does not rescue that clone. Clone without
+  `--depth`. To rescue a shallow clone, run
+  `git remote set-branches origin '*'` and then `git fetch --unshallow` in it
+  (#4645). Measured on one Mac with git 2.50.1.
+- **A wrong last sentence after a double failure.** When a write fails and
+  putting the old bytes back also fails, the file guard prints that the file
+  may be incomplete. `set_forum_url.py` and the marketplace installer then end
+  their own message with a sentence that says the file was left unchanged. In
+  that case the guard's line is the true one (#4631).
+
+### Other changes
+
+- **The local checkout folder is named `engram` by default.** Launchers, hooks
+  and tools look for a folder named `engram` first and `engram-alpha` second, so
+  a checkout under the old name keeps working and nothing needs renaming. If
+  both folders exist, a launcher, hook or tool uses the one it can tie to your
+  session (the trusted folder, or the folder the process runs from) and `engram`
+  otherwise, so an unused checkout left under the name `engram` can be picked
+  up by mistake.
+- **Lesson tripwires also fire when the agent dispatches a sub-agent.** A lesson
+  whose action moment is a dispatch through the `Agent` tool is now shown at
+  that call. For these calls the tripwire only advises; it never blocks.
+- **The example autostart runner starts the Claude session on the agent's own
+  model family, where it can tell.** It reads `self_lineage` from the agent's
+  config. If the settings' `model` already names that family, it passes nothing;
+  if it is missing, it passes the family; if it names another family, it passes
+  the recorded one and prints a warning. It passes nothing, and prints a line
+  saying why, when an `ANTHROPIC_DEFAULT_*_MODEL` variable is set (in the
+  environment or a settings `env` block), when a settings file cannot be read,
+  or when the recorded lineage is missing, not Anthropic, or not a family it
+  knows. The files under `deploy/autostart/` are a working example; no install
+  or upgrade puts them in place for you.
+- **Forum: the service stops creating group-writable files.** The installer and
+  the service units set a umask of 022, the installer removes group write from
+  what is already under the service directory and fails if any remains, and the
+  database and audit log are created with mode 0640. This takes effect when the
+  forum service is installed again from this version.
+- **Shipped skills, agent specs and templates no longer point you at the former
+  private development repository or a developer's own folder.** Where a skill
+  needs your checkout, it says "your ENGRAM source checkout". Citations of old
+  issue numbers under the former repository's name stay, as history.
 
 ## [v0.5.6] - 2026-11-10
 
@@ -3075,7 +3283,7 @@ ships in v0.6.0. [Added with v0.5.5: this did not hold. The changes merged on
   way. #3875 passes the path to Python snippets as `sys.argv[1]`: splicing it
   into a Python literal broke on a quote in the path (measured: two
   `SyntaxError`s and one `agent=$(...)` that returned empty with rc 0; the
-  default `$HOME` hits it too, for a home like `/Users/O'Brien`). The
+  default `$HOME` hits it too, for a home path whose name contains an apostrophe). The
   line-level test `tests/test_skill_home_paths_3863.py` now accepts only the
   canonical expression, and a runtime pin runs the 7 home-touching snippets
   under a home containing a quote and a space. Known limit: the test does not

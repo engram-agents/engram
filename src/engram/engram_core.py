@@ -5624,14 +5624,16 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                     "SKIPPED — in-memory or unattached-temp connection "
                     f"(empty PRAGMA database_list path); existing columns "
                     f"{_existing_fts_cols} != canonical {_canonical_fts_cols}, "
-                    "but there is no on-disk nodes_fts to repair. #2186."
+                    "but there is no on-disk nodes_fts to repair. #2186.",
+                    file=sys.stderr,
                 )
             else:
                 print(
                     f"[_run_db_one_time_setup] repairing stale nodes_fts on startup "
                     f"({_fts_db_path}): existing columns {_existing_fts_cols} != "
                     f"canonical {_canonical_fts_cols} — delegating to "
-                    "engram_backup.rebuild_fts_index."
+                    "engram_backup.rebuild_fts_index.",
+                    file=sys.stderr,
                 )
                 # rebuild_fts_index opens its OWN connection to the same file, so
                 # `conn`'s own pending writes (the trust-tier backfill UPDATE
@@ -5655,7 +5657,8 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
         # line that never got a follow-up (loud-not-fatal class).
         print(
             "[_run_db_one_time_setup] nodes_fts startup self-heal FAILED "
-            f"(continuing under-indexed until repaired): {_fts_selfheal_err!r}"
+            f"(continuing under-indexed until repaired): {_fts_selfheal_err!r}",
+            file=sys.stderr,
         )
 
     # FTS5 vocabulary table — required by engram_idf.extract_keywords for IDF
@@ -13586,7 +13589,10 @@ def _validate_reasoning_structure(
                             parts.append(
                                 f"⚠ inductive_generalization: independent cross-lineage instances "
                                 f"(excluding hypothesis-author lineage '{self_lin}') = {len(independent)}; "
-                                f"{n_cross_leaves} of {n_leaves} leaves cross-lineage — consider inductive_analogy"
+                                f"{n_cross_leaves} of {n_leaves} leaves cross-lineage — add a "
+                                f"cross-lineage observation, use a weaker reasoning type "
+                                f"(inductive_analogy or abductive_best_explanation), or proceed "
+                                f"and say why in logical_chain"
                             )
 
                 # Architecture axis: collect raw enum values directly from DB

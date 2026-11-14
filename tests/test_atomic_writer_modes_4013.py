@@ -227,6 +227,47 @@ def test_w5c_atomic_write_text_follow_symlinks_option(core, hooklib_mod, tmp_pat
 
 
 @pytest.mark.parametrize("which", ["core", "hooks"])
+def test_w7_mode_overrides_an_existing_files_mode(core, hooklib_mod, tmp_path, which):
+    """#4682: ``mode=`` is the FINAL word, also on the existing-file branch.
+
+    The old mode is copied onto the temp first (mode/group preservation) and
+    ``mode`` is applied after it, before the replace.  No cell covered that
+    branch: every existing-file cell read its mode back unchanged.
+    """
+    mod = core if which == "core" else hooklib_mod
+    p = tmp_path / "state.json"
+    p.write_text("old")
+    os.chmod(p, 0o660)
+    assert _mode(p) == 0o660
+
+    mod.atomic_write_text(p, "new", mode=0o644)
+
+    assert _mode(p) == 0o644, f"mode= did not override the preserved mode: {oct(_mode(p))}"
+
+
+@pytest.mark.parametrize("which", ["core", "hooks"])
+def test_w8_dir_fd_refuses_a_path_with_a_directory_component(core, hooklib_mod, tmp_path, which):
+    """#4682: ``dir_fd`` requires a bare basename.
+
+    os.open and os.replace SILENTLY IGNORE dir_fd for a path with a directory
+    component: no error, no pinning — an absolute path there would quietly
+    reintroduce the symlink-swap hole the option exists to close.  So the
+    writer refuses it, and refuses it BEFORE creating anything.
+    """
+    mod = core if which == "core" else hooklib_mod
+    d = tmp_path / "d"
+    d.mkdir()
+    dir_fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for bad in (str(d / "f.json"), os.path.join("sub", "f.json")):
+            with pytest.raises(ValueError):
+                mod.atomic_write_text(bad, "x", dir_fd=dir_fd)
+        assert os.listdir(d) == [], "a temp file was created before the refusal"
+    finally:
+        os.close(dir_fd)
+
+
+@pytest.mark.parametrize("which", ["core", "hooks"])
 def test_w5d_default_is_to_follow(core, hooklib_mod, tmp_path, which):
     """Not passing follow_symlinks keeps the reference behaviour (write_config_json
     relies on it): the link stays and its target is updated."""

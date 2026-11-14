@@ -143,7 +143,7 @@ Sonnet) on 2026-06-08:
    password into the OS/login prompt directly — never paste credentials into
    agent chat.*
 3. Get the `engram` repo into the new user's home (e.g.
-   `/Users/engram-sonnet/GitHub/engram`). The repo is public, so a plain clone
+   `~/GitHub/engram`). The repo is public, so a plain clone
    needs no GitHub auth. Copying the operator's existing clone is an optional
    shortcut (the operator may need to grant read access to it, or copy via a
    shared location).

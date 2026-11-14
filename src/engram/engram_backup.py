@@ -35,6 +35,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import tempfile
 
 
@@ -711,7 +712,8 @@ def rebuild_fts_index(db_path: str, *, conn: "sqlite3.Connection | None" = None)
             print(
                 f"[rebuild_fts_index] repairing under-indexed nodes_fts on {db_path}: "
                 f"existing columns {existing_cols} != canonical {target_cols} "
-                "— dropping and rebuilding from the canonical column list."
+                "— dropping and rebuilding from the canonical column list.",
+                file=sys.stderr,
             )
             conn.execute("DROP TABLE IF EXISTS nodes_fts_vocab")
             conn.execute("DROP TABLE IF EXISTS nodes_fts")
