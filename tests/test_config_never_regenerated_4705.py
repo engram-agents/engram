@@ -367,6 +367,7 @@ def test_cell8_64_byte_non_sqlite_db_no_config_gets_the_damaged_db_message(home)
     (home / "knowledge.db").write_bytes(blob)
     out = _child(home, _DAMAGED)
     _assert_damaged_message(out, home)
+    assert "file is not a database" in out["r"]["msg"], out  # the NOTADB error is named (positive evidence)
     assert (home / "knowledge.db").read_bytes() == blob
 
 
@@ -483,6 +484,8 @@ def test_cell11_control_config_present_the_merge_path_still_writes_install_tier(
 # ----------------------------------------------------------------------------- cell 12
 
 def test_cell12_remedy_phrases_appear_in_both_the_python_message_and_install_sh(tmp_path):
+    """Cell 12 reads install.sh's source on purpose (the phrase is a literal there); cell 18 is the
+    rendered backstop."""
     sys.path.insert(0, str(SRC_ENGRAM))
     import engram_config_io as cio
     (tmp_path / "knowledge.db").write_bytes(b"")  # the message states "knowledge.db exists" only when it does
@@ -788,3 +791,106 @@ def test_cell18b_a_moved_aside_database_satisfies_the_guard_the_message_points_a
     assert out["r"]["raised"] is None, out
     assert out["cfg"] is True
     assert aside.read_bytes() == blob, "the moved-aside file changed"
+
+
+# ----------------------------------------------------------------------------- cells 17b, 17c, 17d (round 5)
+# A failed probe carries no evidence about the graph: "damaged" needs POSITIVE evidence (NOTADB, CORRUPT,
+# or a readable file with no nodes table); an access failure and an unknown error both decline to classify.
+
+ACCESS_SENTENCE = ("The database could not be opened read-only just now. That usually means the ENGRAM "
+                   "directory or the database file is read-only, full or owned by another user. Nothing "
+                   "about the database itself is known yet; fix that access and retry before restoring "
+                   "anything.")
+GENERIC_SENTENCE = ("The database could not be read just now. Nothing about the database itself is known "
+                    "yet. Check that the ENGRAM directory and the database file are readable by this "
+                    "user, then retry; if it keeps happening, report this line.")
+
+
+def _wal_clean(home: Path) -> None:
+    """The seeded DB in WAL mode, closed cleanly: no -wal/-shm files remain (the shape that makes a
+    read-only probe need to write)."""
+    c = sqlite3.connect(str(home / "knowledge.db"))
+    try:
+        assert c.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        c.close()
+    assert not (home / "knowledge.db-wal").exists() and not (home / "knowledge.db-shm").exists()
+
+
+def _probe_ro(home: Path):
+    """Direct read-only probe of the DB, as _refuse_config_missing does it; returns the connect/read error."""
+    try:
+        c = sqlite3.connect(f"{(home / 'knowledge.db').absolute().as_uri()}?mode=ro", uri=True, timeout=0.1)
+        try:
+            c.execute("SELECT COUNT(*) FROM nodes").fetchone()
+        finally:
+            c.close()
+    except sqlite3.Error as exc:
+        return exc
+    return None
+
+
+def _assert_not_called_damaged(out, home: Path, sentence: str, label: str):
+    assert out["r"]["raised"] == "ConfigMissingError", out
+    msg = out["r"]["msg"]
+    assert sentence in msg, msg
+    assert label in msg, msg  # the message names the SQLite error
+    assert DAMAGED_PHRASE not in msg and "damaged" not in msg.lower(), msg
+    assert msg.index(sentence) < msg.index("The user decides which backup to restore"), msg
+    assert out["cfg"] is False and not (home / "config.json").exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="chmod 0555 does not stop root, so the cell would pass for the wrong reason")
+def test_cell17b_readonly_home_with_a_healthy_wal_db_is_not_called_damaged(seeded_no_config):
+    home = seeded_no_config
+    _wal_clean(home)
+    os.chmod(home, 0o555)
+    try:
+        err = _probe_ro(home)
+        assert err is not None, "precondition: the read-only probe must fail in a 0555 home"
+        code = getattr(err, "sqlite_errorcode", None)
+        assert code is None or (code & 0xFF) == sqlite3.SQLITE_READONLY, err
+        out = _child(home, _CELL17)
+        _assert_not_called_damaged(out, home, ACCESS_SENTENCE, "readonly database")
+        print("17b saw sqlite_errorcode", code, repr(err))
+    finally:
+        os.chmod(home, 0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="chmod 000 does not stop root, so the cell would pass for the wrong reason")
+def test_cell17c_unreadable_db_file_is_not_called_damaged(seeded_no_config):
+    home = seeded_no_config
+    _wal_clean(home)
+    db_file = home / "knowledge.db"
+    os.chmod(db_file, 0o000)
+    try:
+        err = _probe_ro(home)
+        assert err is not None, "precondition: the read-only probe must fail on a chmod 000 file"
+        code = getattr(err, "sqlite_errorcode", None)
+        print("17c saw sqlite_errorcode", code, repr(err))
+        assert code is None or (code & 0xFF) == sqlite3.SQLITE_CANTOPEN, err
+        out = _child(home, _CELL17)
+        _assert_not_called_damaged(out, home, ACCESS_SENTENCE, "unable to open database file")
+    finally:
+        os.chmod(db_file, 0o644)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="sqlite_errorcode needs Python 3.11+; the generic bucket is unexercised here")
+def test_cell17d_unknown_probe_error_gets_the_generic_sentence(seeded_no_config):
+    """The child makes the probe's sqlite3.connect raise OperationalError with SQLITE_PROTOCOL (15),
+    a code in no allowlist, without touching production code."""
+    home = seeded_no_config
+    body = (
+        "import sqlite3\n"
+        "_real = sqlite3.connect\n"
+        "def _fake(*a, **k):\n"
+        "    if 'mode=ro' in str(a[0] if a else k.get('database')):\n"
+        "        e = sqlite3.OperationalError('locking protocol')\n"
+        "        e.sqlite_errorcode = sqlite3.SQLITE_PROTOCOL\n"
+        "        raise e\n"
+        "    return _real(*a, **k)\n"
+        "sqlite3.connect = _fake\n"
+    ) + _CELL17
+    out = _child(home, body)
+    _assert_not_called_damaged(out, home, GENERIC_SENTENCE, "locking protocol")
