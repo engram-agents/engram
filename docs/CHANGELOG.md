@@ -50,6 +50,11 @@ with an `-alpha` suffix during the alpha phase.
   at `src/engram/`, and the tests pass with and without the copy (engram#2173).
 
 ### Fixed
+- The last-ditch dev-checkout fallback for this agent's own MCP server now points at
+  `<checkout>/src/engram/server.py`, where the file really is. It pointed at
+  `<checkout>/server.py`, which does not exist, so a scoped `pgrep -f` could never
+  match a server running from source. Fixed in the hooks library, the session-start
+  hook and the supervision probe. (engram-agents/engram#1867)
 - Test-only: the forum installer `--dry-run` cells (`test_installer.py`, `test_installer_baton_gate.py`)
   now run with `HOME` and `XDG_CONFIG_HOME` in a scratch directory. On a seat whose real
   forum unit carries a baton login map they failed on the installer's correct refusal;
