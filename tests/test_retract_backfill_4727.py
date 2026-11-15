@@ -447,10 +447,12 @@ def test_cell13_a_null_root_node_row_does_not_hide_every_old_retraction(g):
 
 
 def test_cell14_a_walk_too_deep_for_the_interpreter_rolls_back_like_a_database_error(g, monkeypatch, capsys):
-    """Clio, #4820: the walk recurses once per derivation level, so a chain deeper than the
-    recursion limit raises RecursionError, not a DatabaseError. The rung must treat it the
-    same way: version stays 10, no backfill marker survives, the ladder returns instead of
-    raising out of every start, and the next start retries."""
+    """Clio, #4820, kept as a GUARD after #4823 (Borges): the walk is iterative now, so a
+    deep chain no longer raises RecursionError (that property is
+    tests/test_cascade_walk_iterative_4823.py's). If it is raised anyway, the rung must
+    treat it like a DatabaseError: version stays 10, no backfill marker survives, the
+    ladder returns instead of raising out of every start, the stderr line asks for a
+    report, and the next start retries."""
     core = g["core"]
     real = core._walk_cascade_from_root
 
@@ -462,8 +464,8 @@ def test_cell14_a_walk_too_deep_for_the_interpreter_rolls_back_like_a_database_e
     assert _ladder(core) == RUNG - 1
     err = capsys.readouterr().err
     assert "FAILED, will retry" in err
-    assert "repeats at every start" in err and "#4823" in err, \
-        "a too-deep chain must say it fails every start until the walk is iterative"
+    assert "unexpected" in err and "please report" in err and "#4823" in err, \
+        "a RecursionError in the rung must be reported as unexpected"
     assert _retract_marked(core, g["R"]) == {}, "a failed rung must leave no backfill marker"
 
     monkeypatch.setattr(core, "_walk_cascade_from_root", real)
