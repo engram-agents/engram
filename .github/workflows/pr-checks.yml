@@ -1529,3 +1529,26 @@ jobs:
         if: (success() || failure()) && steps.stub-check.outputs.has_hits == 'true' && steps.setup-python-stub.outcome == 'success' && steps.install-deps-stub.outcome == 'success'
         run: python3 -m pytest $(cat /tmp/stub_affected_tests.txt) -v --tb=short
 
+      # ── 12. codeowners-gate ─────────────────────────────────────────────
+      # Cheap stdlib+pytest guard on the CODEOWNERS coverage that
+      # .github/CODEOWNERS records for gate machinery. INERT as a merge stop:
+      # GitHub only requires the owner approval once require_code_owner_review
+      # is enabled on the dev-require-PR-approval ruleset, and that flip is the
+      # repository owner's, not this workflow's. This cell fails only when the
+      # file stops covering every tracked workflow, or stops covering itself.
+      - name: Set up Python 3.12 (codeowners-gate)
+        id: setup-python-codeowners
+        if: success() || failure()
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: codeowners-gate — install pytest
+        id: install-pytest-codeowners
+        if: success() || failure()
+        run: pip install pytest
+
+      - name: codeowners-gate — run CODEOWNERS coverage guard
+        if: (success() || failure()) && steps.setup-python-codeowners.outcome == 'success' && steps.install-pytest-codeowners.outcome == 'success'
+        run: python3 -m pytest tests/test_codeowners_gate_scope.py -q
+
