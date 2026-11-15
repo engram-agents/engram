@@ -2089,6 +2089,27 @@ def _route_label() -> str:
     return f"{request.method} " + re.sub(r"<(?:[A-Za-z_]+(?:\([^)]*\))?:)?", "<", rule)
 
 
+def _auth_required_response() -> Response:
+    """The 401 the guard answers a guarded request that carries no valid token."""
+    resp = jsonify({
+        "error": "authentication required",
+        "hint": ("send 'Authorization: Bearer <token>'. Clients read the token from "
+                 "$ENGRAM_FORUM_TOKEN or <ENGRAM_HOME>/forum-token (mode 0600); the "
+                 "forum admin issues one with: python -m forum.admin token issue <agent>"),
+    })
+    resp.status_code = 401
+    resp.headers["WWW-Authenticate"] = "Bearer"
+    return resp
+
+
+def _identity_mismatch_response(token_agent, named: str) -> Response:
+    """The 403 the guard answers a request that names an identity other than its token's."""
+    resp = jsonify({"error": "identity mismatch",
+                    "token_agent": token_agent, "named_agent": named})
+    resp.status_code = 403
+    return resp
+
+
 def _names_identity(values) -> bool:
     return any(_identity_text(v) is not None for v in values)
 
@@ -2337,15 +2358,7 @@ def create_app(
         token = _bearer_token(request.headers.get("Authorization"))
         token_agent = db.resolve_token(g.conn, token) if token else None
         if token_agent is None:
-            resp = jsonify({
-                "error": "authentication required",
-                "hint": ("send 'Authorization: Bearer <token>'. Clients read the token from "
-                         "$ENGRAM_FORUM_TOKEN or <ENGRAM_HOME>/forum-token (mode 0600); the "
-                         "forum admin issues one with: python -m forum.admin token issue <agent>"),
-            })
-            resp.status_code = 401
-            resp.headers["WWW-Authenticate"] = "Bearer"
-            return resp
+            return _auth_required_response()
         body_ids = _body_identities()
         label = _route_label()
         for v in body_ids:
@@ -2357,10 +2370,7 @@ def create_app(
         for n in named:
             name = _identity_text(n)
             if name is not None and name != token_agent:
-                resp = jsonify({"error": "identity mismatch",
-                                "token_agent": token_agent, "named_agent": name})
-                resp.status_code = 403
-                return resp
+                return _identity_mismatch_response(token_agent, name)
         g.auth_agent = token_agent
         g.names_identity = _names_identity(named)
         return None
