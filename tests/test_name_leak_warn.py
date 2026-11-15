@@ -1340,6 +1340,67 @@ def test_c6_warn_tool_fails_loud_when_the_scanner_cannot_be_found(tmp_path):
     assert "Traceback" not in result.stderr, result.stderr
 
 
+def test_production_extraction_layout_resolves_the_sibling_scanner(tmp_path):
+    """The layout the gate's scan steps actually use must RESOLVE, not merely
+    avoid the symlink.
+
+    T12 pins that the workflow extracts `src/engram/tools/scan-leaks.py` rather
+    than the `tools/scan-leaks.py` symlink; C6 pins that a copy with no sibling
+    fails loud. Neither pins that the production layout WORKS: the scan steps
+    write the base commit's warn tool (under its extraction name) and the
+    scanner into one bare per-run directory and execute the tool with
+    `python3 -P`. This cell recreates exactly that directory — only the two
+    files, so neither fallback candidate can mask a broken sibling lookup — and
+    requires BOTH class labels back.
+
+    The interpreter is `sys.executable`, never a hardcoded `python3`: a
+    different interpreter would not be the one this suite runs on. `-P` keeps
+    the bare directory off `sys.path`, as the workflow does.
+    """
+    layout = tmp_path / "run"
+    layout.mkdir()
+    # The scanner under the name the scan steps extract it to, read from the
+    # real module and never through tools/scan-leaks.py (T12's reason).
+    scanner = layout / "scan-leaks.py"
+    scanner.write_text(
+        (REPO_ROOT / "src" / "engram" / "tools" / "scan-leaks.py").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    # The warn tool under the name the scan steps extract it to.
+    tool = layout / "name_leak_warn_base.py"
+    tool.write_text(TOOL_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    roster = layout / "roster.txt"
+    roster.write_text(_t6_format2_roster(), encoding="utf-8")
+    diff = layout / "pr.diff"
+    diff.write_text(
+        _fake_diff(
+            added_lines=[
+                f"# {_FMT2_TOKEN_A} was here",
+                f"# {_FMT2_TOKEN_B} was here",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-P", str(tool),
+         "--roster-file", str(roster),
+         "--diff-file", str(diff),
+         "--format", "json"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = json.loads(result.stdout)
+    classes = [match["class"] for match in data["matches"]]
+    assert "A" in classes and "B" in classes, (
+        "the bare-directory layout must resolve the sibling scanner and report "
+        f"both class labels; got {classes}"
+    )
+
+
 def test_format1_roster_still_behaves_as_before(tmp_path, capsys):
     """Control: the same consumer on a format-1 roster loads the pattern and
     reports a match exactly as it did before format inference landed."""
@@ -1360,6 +1421,98 @@ def test_format1_roster_still_behaves_as_before(tmp_path, capsys):
     assert "[class=" not in r.stdout, (
         "a format-1 roster's text output must stay byte-identical (no tag)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Class priority: a line that matches both classes reports class A (engram#4822)
+# ---------------------------------------------------------------------------
+#
+# Contract: ``scan_diff`` emits AT MOST ONE match per added line, and the
+# reported class is ``A`` whenever ANY matching pattern is class ``A``; only
+# when no class-A pattern matches is the first matching class-B pattern
+# reported. ``pattern_index`` is the roster position of the FIRST matching
+# pattern of the chosen class, so the output shape is unchanged.
+#
+# Why the class, not the roster order, decides: class A blocks and class B is
+# counted only, so reporting B on a line A matches turns a blocking hit into an
+# advisory one — and makes the reported class depend on where the roster happens
+# to list the patterns. #4816 fixed the same fail-open in the blocking scanner;
+# this function is a separate reader and kept it.
+
+_PRIORITY_B_THEN_A = (
+    "B\t\\b" + _FMT2_TOKEN_B + "\\b\n"
+    "A\t\\b" + _FMT2_TOKEN_A + "\\b\n"
+)
+_PRIORITY_A_THEN_B = (
+    "A\t\\b" + _FMT2_TOKEN_A + "\\b\n"
+    "B\t\\b" + _FMT2_TOKEN_B + "\\b\n"
+)
+
+
+def _priority_entries(roster_text: str):
+    entries, roster_format = load_roster(
+        roster_source=roster_text, roster_file=None
+    )
+    assert roster_format == 2, f"fixture must be a format-2 roster; got {roster_format}"
+    return entries
+
+
+def test_class_a_wins_when_b_precedes_a():
+    """A line matching BOTH classes reports A even when the roster lists B first.
+
+    The discriminating cell: with break-at-first-match the line reports B,
+    because the roster's first matching pattern is the class-B one."""
+    entries = _priority_entries(_PRIORITY_B_THEN_A)
+    diff = _fake_diff(
+        added_lines=[f"# {_FMT2_TOKEN_B} and {_FMT2_TOKEN_A}"]
+    )
+    matches = scan_diff(diff, entries)
+    assert len(matches) == 1, f"one match per line; got {matches}"
+    assert matches[0]["class"] == "A", (
+        f"a line a class-A pattern matches must report A; got {matches}"
+    )
+    assert matches[0]["pattern_index"] == 1, (
+        "pattern_index must be the first matching A's position (1 here); "
+        f"got {matches[0]['pattern_index']}"
+    )
+
+
+def test_class_a_wins_when_a_precedes_b():
+    """Control: with A listed before B the both-class line still reports A.
+
+    This cell passes before and after the fix — it pins that the rule is
+    "A wins", not "the first match wins with a different tie-break"."""
+    entries = _priority_entries(_PRIORITY_A_THEN_B)
+    diff = _fake_diff(
+        added_lines=[f"# {_FMT2_TOKEN_A} and {_FMT2_TOKEN_B}"]
+    )
+    matches = scan_diff(diff, entries)
+    assert len(matches) == 1, f"one match per line; got {matches}"
+    assert matches[0]["class"] == "A", matches
+    assert matches[0]["pattern_index"] == 0, matches
+
+
+def test_class_b_only_line_still_reports_b():
+    """A line matching only a class-B pattern reports B and that pattern's index."""
+    entries = _priority_entries(_PRIORITY_B_THEN_A)
+    diff = _fake_diff(added_lines=[f"# {_FMT2_TOKEN_B} was here"])
+    matches = scan_diff(diff, entries)
+    assert len(matches) == 1, matches
+    assert matches[0]["class"] == "B", matches
+    assert matches[0]["pattern_index"] == 0, matches
+
+
+def test_class_a_only_line_reports_a():
+    """A line matching only a class-A pattern reports A and that pattern's index.
+
+    The roster here lists B first, so this cell also pins that the A position is
+    reported rather than the first pattern that matched at all."""
+    entries = _priority_entries(_PRIORITY_B_THEN_A)
+    diff = _fake_diff(added_lines=[f"# {_FMT2_TOKEN_A} was here"])
+    matches = scan_diff(diff, entries)
+    assert len(matches) == 1, matches
+    assert matches[0]["class"] == "A", matches
+    assert matches[0]["pattern_index"] == 1, matches
 
 
 # ---------------------------------------------------------------------------

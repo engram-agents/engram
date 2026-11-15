@@ -44,6 +44,13 @@ from pathlib import Path
 _SCANNER_MODULE_NAME = "_name_leak_warn_scanner"
 _PARSER = None
 
+# The roster class letters, as the scanner defines them (``CLASS_A`` /
+# ``CLASS_B``). A blocks; B is counted and never blocks. This tool does not
+# import the scanner module at module level — it loads the parser by explicit
+# path (C1) — so the two letters it compares are named here.
+_CLASS_A = "A"
+_CLASS_B = "B"
+
 
 def _load_parser():
     """Locate and load the scanner's ``parse_roster_text`` by explicit path.
@@ -151,8 +158,14 @@ def scan_diff(
 
     ``entries`` is the roster loader's ``(compiled_pattern, class)`` list. Each
     match dict carries ``file``, ``line_number``, ``pattern_index``, ``line``
-    and ``class``. ONE finding per line is preserved (``break`` after the first
-    match).
+    and ``class``.
+
+    ONE finding per added line, and the CLASS decides before the roster order
+    does: a line any class-A pattern matches reports ``A`` (class A blocks),
+    with ``pattern_index`` set to that class's FIRST matching pattern; only when
+    no class-A pattern matches is the first class-B pattern reported. Taking the
+    roster's first matching pattern regardless of class would turn a blocking
+    hit into an advisory one whenever the roster lists B first.
     """
     matches = []
     current_file = ""
@@ -183,16 +196,31 @@ def scan_diff(
             # Added line — increment and check
             new_line_number += 1
             line_content = raw_line[1:]  # strip leading '+'
+            # One match per line, and the class decides before the roster order
+            # does: class A blocks, so an earlier class-B pattern must never
+            # downgrade a line a class-A pattern matches (#4822 — the same
+            # fail-open #4816 fixed in the blocking scanner). The first
+            # matching class-A index wins; the first matching class-B index is
+            # the fallback for a line no class-A pattern matches.
+            first_a = None
+            first_b = None
             for idx, (pattern, klass) in enumerate(entries):
-                if pattern.search(line_content):
-                    matches.append({
-                        "file": current_file,
-                        "line_number": new_line_number,
-                        "pattern_index": idx,
-                        "line": line_content,
-                        "class": klass,
-                    })
-                    break  # one match per line is enough
+                if not pattern.search(line_content):
+                    continue
+                if klass == _CLASS_A:
+                    first_a = idx
+                    break
+                if first_b is None:
+                    first_b = idx
+            chosen_index = first_a if first_a is not None else first_b
+            if chosen_index is not None:
+                matches.append({
+                    "file": current_file,
+                    "line_number": new_line_number,
+                    "pattern_index": chosen_index,
+                    "line": line_content,
+                    "class": _CLASS_A if first_a is not None else _CLASS_B,
+                })
         elif raw_line.startswith(" ") or raw_line == "":
             # Context line — counts toward new-file line numbers
             new_line_number += 1

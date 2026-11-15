@@ -166,8 +166,20 @@ jobs:
           #   none prefixed     -> format 1;
           #   some but not all  -> FAIL, naming the first non-prefixed line.
           # In format 2 a class letter other than exactly A or B cannot slip
-          # through: the `A<TAB>`/`B<TAB>` test is a strict prefix test, so
+          # through PROVIDED at least one other content line carries a proper
+          # prefix: the `A<TAB>`/`B<TAB>` test is a strict prefix test, so
           # `Z<TAB>x` is simply a non-prefixed line and fails the mixed check.
+          # The proviso is load-bearing. A roster whose EVERY content line is
+          # mistyped that way counts zero prefixed lines, so it is observed as
+          # format 1, no mixed failure is raised, and each mistyped prefix
+          # becomes pattern text (a near no-op regex): this gate goes GREEN.
+          # What refuses it instead: the release sweep's strict predicate and
+          # the scanner CLI's class-token check, both of which read format 2
+          # only. The attestation cross-check below catches it too, but only
+          # while the attestation still declares format 2 — a mistyped roster
+          # observed as format 1 agrees with a format-1 attestation. So the
+          # per-PR gate is the weaker of the three surfaces: a green here is
+          # not proof that the roster's lines are well formed.
           content_lines = 0
           prefixed_lines = 0
           a_prefixed = 0
@@ -311,10 +323,15 @@ jobs:
                   attested_count = count_a + count_b
 
               # THE FORMAT CROSS-CHECK. The whole-file sha256 is over BYTES and
-              # cannot see the grammar, so it still matches when the secret
-              # rotates without the attestation: only this comparison can see
-              # that mismatch. The attested format must equal the OBSERVED
-              # one, and a mismatch fails closed in BOTH directions.
+              # is blind to the grammar. Two distinct cases reach this check:
+              #   * a rotation that RE-ISSUES the sha but leaves roster_format
+              #     stale would PASS a sha-only check — only this comparison
+              #     sees the mismatch;
+              #   * a rotation that leaves the attestation untouched entirely
+              #     trips this check FIRST, so the sha is never compared here
+              #     (and would not have matched: the secret's bytes changed).
+              # The attested format must equal the OBSERVED one, and a mismatch
+              # fails closed in BOTH directions.
               if (
                   schema_ok
                   and roster_present
@@ -326,9 +343,11 @@ jobs:
                       f"{observed_format}. The secret and the attestation "
                       "rotate in one act: re-issue the attestation with the "
                       "matching roster_format (and, for format 2, both "
-                      "per-class counts). The whole-file sha256 can still "
-                      "match here, which is exactly why the format is "
-                      "cross-checked separately. Failing closed."
+                      "per-class counts). The whole-file sha256 is over bytes "
+                      "and blind to the grammar: a rotation that re-issues the "
+                      "sha but leaves roster_format stale would pass a "
+                      "sha-only check, and only this cross-check catches it. "
+                      "Failing closed."
                   )
               elif schema_ok:
                   attestation_present = True

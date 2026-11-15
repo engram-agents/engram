@@ -468,7 +468,11 @@ def parse_roster_text(
                FIRST line that disagrees with the detected grammar.
 
     A format-2 line always keeps the class it declares; no format-2 line ever
-    receives one it did not write.  A roster with no pattern at all returns
+    receives one it did not write.  A format-2 class-A pattern must declare a
+    boundary (``_declares_boundary``), while a format-1 line becomes
+    ``CLASS_A`` without passing through that check — the asymmetry is
+    deliberate, because format 1 predates the rule and the scanner cannot
+    rewrite a live roster.  A roster with no pattern at all returns
     ``([], roster_format)`` — zero patterns is not a parse error (C4a: the warn
     tool's skip-when-absent contract depends on it).
 
