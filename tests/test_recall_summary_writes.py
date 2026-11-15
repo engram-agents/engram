@@ -527,12 +527,12 @@ def test_batch_apply_clears_summary_missing_flag():
 
 
 # ---------------------------------------------------------------------------
-# Test 13 (batch): inline path unchanged — exact shape check
+# Test 13 (batch): inline path reports the strict refresh result
 # ---------------------------------------------------------------------------
 
-def test_batch_inline_still_works_exact_shape():
-    """Inline `summaries` path is byte-identical to the pre-file-support shape:
-    exact dict equality, no leaked `summaries_file` key or other new field."""
+def test_batch_inline_reports_strict_refresh_shape():
+    """Inline writes now expose their strict refresh/debt outcome; they still
+    do not leak the file-only summaries_file echo field."""
     srv = fresh_server()
     obs_id = _add_obs(srv, "inline unchanged claim")
     entry = _valid_entry(obs_id, "Inline summary, unchanged path.")
@@ -540,11 +540,16 @@ def test_batch_inline_still_works_exact_shape():
         payload_json=json.dumps({"summaries": [entry]})
     ))
     assert r == {
-        "ok": [{"node_id": obs_id}],
+        "ok": [{
+            "node_id": obs_id,
+            "embedding_refresh": "pending",
+            "embedding_refresh_reason": "unavailable",
+        }],
         "errors": [],
         "applied": 1,
         "failed": 0,
         "pre_flight_failures": [],
+        "needs_reembed": [obs_id],
     }, r
 
 
