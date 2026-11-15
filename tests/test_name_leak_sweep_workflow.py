@@ -86,9 +86,11 @@ REPO = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO / ".github" / "workflows" / "name-leak-sweep.yml"
 GATE_SOURCE = REPO / "tools" / "name_leak_gate.py"
 
-# A synthetic roster line for the harness. It is a regex, not a real name, and
-# it compiles. The attestation below pins the sha256 of its canonical text.
-_ROSTER = r"\bQuillonfex\b" + "\n"
+# A synthetic roster line for the harness, in the format-2 grammar: a class
+# token, a tab, then a regex. It is a regex, not a real name, and it compiles.
+# The attestation below pins the sha256 of its canonical text.
+_ROSTER = "A\t" + r"\bQuillonfex\b" + "\n"
+_ROSTER_COUNTS_LINE = "scan-leaks: roster patterns A=1, B=0\n"
 
 def _with_capability(body: str, *, capability: bool = True) -> str:
     """A scanner stub, optionally carrying the `--roster-file` capability.
@@ -113,9 +115,14 @@ def _with_capability(body: str, *, capability: bool = True) -> str:
 
 
 # Scanner stubs materialised by the chain. A stub is what actually runs.
+# A clean stub reports the per-class counts the scanner's parse produced, which
+# the sweep compares against the attestation (§2.5); a stub that exits 0
+# without them is a scan whose roster was never proven to parse, and the sweep
+# must fail closed on it.
 _CLEAN_SCANNER = _with_capability(
     'print("scan-leaks: scanned 1, skipped-binary 0")\n'
-    "sys.exit(0)\n"
+    + 'print("' + _ROSTER_COUNTS_LINE.strip() + '")\n'
+    + "sys.exit(0)\n"
 )
 _ZERO_SCANNER = _with_capability(
     'print("scan-leaks: scanned 0, skipped-binary 0")\n'
@@ -129,6 +136,15 @@ _HIT_SCANNER = _with_capability(
     'print("scan-leaks: scanned 1, skipped-binary 0")\n'
     'print("doc.md:1", file=sys.stderr)\n'
     "sys.exit(1)\n"
+)
+# A scanner that refuses the roster it was handed (an uncompilable regex is the
+# SCANNER'S call — the workflow compiles no roster line) exits 2 with a reason
+# that names a line and an offset, never the roster text. The sweep must fail
+# closed, and must not read exit 2 as a hit or as a pass.
+_ROSTER_REFUSED_SCANNER = _with_capability(
+    'print("scan-leaks: roster line 2 is not a valid regular expression: '
+    'error at offset 4", file=sys.stderr)\n'
+    "sys.exit(2)\n"
 )
 # #4752: no findings, but the scan could not read every candidate (or had
 # none). Exit 3 is "coverage incomplete" — distinct from a hit (exit 1) and
@@ -183,6 +199,7 @@ _REAL_SHAPED_SCANNER = (
     "    sys.exit(0)\n"
     "\n"
     'print("scan-leaks: scanned 1, skipped-binary 0")\n'
+    'print("' + _ROSTER_COUNTS_LINE.strip() + '")\n'
     "sys.exit(0)\n"
 )
 # R3-2 / R5-2: a scanner whose USAGE depends on what it can see. The workflow
@@ -208,6 +225,7 @@ _ENV_PROBE_SCANNER = (
     '    print("SCAN_SAW_ROSTER")\n'
     "    sys.exit(3)\n"
     'print("scan-leaks: scanned 1, skipped-binary 0")\n'
+    'print("' + _ROSTER_COUNTS_LINE.strip() + '")\n'
     "sys.exit(0)\n"
 )
 # R5-1: a CAPABLE scanner — the probe accepts it — which prints a marker and
@@ -217,7 +235,8 @@ _ENV_PROBE_SCANNER = (
 _CAPABLE_MARKER_SCANNER = _with_capability(
     'print("CHECKOUT_SCANNER_RAN")\n'
     'print("scan-leaks: scanned 1, skipped-binary 0")\n'
-    "sys.exit(0)\n"
+    + 'print("' + _ROSTER_COUNTS_LINE.strip() + '")\n'
+    + "sys.exit(0)\n"
 )
 # R6: a scanner that CRASHES at import, so `<copy> --help` exits nonzero and
 # prints no usage at all. A probe that dies is NOT a copy that lacks
@@ -254,6 +273,7 @@ _OBSERVER_SCANNER = _with_capability(
     '    with open(roster, encoding="utf-8") as fh:\n'
     '        print("ROSTER_TEXT_AT_SCAN=" + fh.read().strip())\n'
     'print("scan-leaks: scanned 1, skipped-binary 0")\n'
+    'print("' + _ROSTER_COUNTS_LINE.strip() + '")\n'
     "sys.exit(0)\n"
 )
 # R7: a scanner that emits invalid UTF-8 DURING THE SCAN. The sweep step reads
@@ -667,9 +687,11 @@ def sweep_repo(tmp_path):
     (work / ".github" / "name-leak-roster.attestation.json").write_text(
         json.dumps(
             {
-                "roster_format": 1,
-                "pattern_count": 1,
+                "roster_format": 2,
+                "pattern_count_a": 1,
+                "pattern_count_b": 0,
                 "roster_sha256": _canonical_sha(_ROSTER),
+                "updated_at": "2026-11-15T00:00:00Z",
             }
         ),
         encoding="utf-8",
@@ -1576,9 +1598,11 @@ def test_sweep_fails_when_the_attestation_does_not_match(sweep_repo, tmp_path):
         base,
         tmp_path,
         attestation={
-            "roster_format": 1,
-            "pattern_count": 1,
+            "roster_format": 2,
+            "pattern_count_a": 1,
+            "pattern_count_b": 0,
             "roster_sha256": "0" * 64,
+            "updated_at": "2026-11-15T00:00:00Z",
         },
     )
     assert proc.returncode != 0, out
@@ -1631,19 +1655,33 @@ def test_workflow_dispatch_on_a_non_default_ref_fails_closed(sweep_repo, tmp_pat
 
 # ── roster validation and the base-commit split, executed ───────────────────
 
-def test_invalid_roster_pattern_fails_without_printing_it(sweep_repo, tmp_path):
-    """An invalid roster line fails the step by LINE NUMBER; the pattern text
-    is never printed (this is a public log and the roster is a name list)."""
+def test_a_scanner_that_refuses_the_roster_fails_closed(sweep_repo, tmp_path):
+    """An UNCOMPILABLE regex is the scanner's call: the workflow's validation
+    block checks only the textual class prefix and compiles no roster line
+    (cell 11 pins that). A scanner that refuses the roster exits 2, and the
+    sweep must fail closed on it — never read it as a hit or a pass — with the
+    roster text absent from the log."""
     token = "qvollmex3311"
-    work, base, _g = sweep_repo
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _ROSTER_REFUSED_SCANNER)
+    roster = "A\t\\bQuillonfex\\b\nA\t(?P=" + token + ")\n"
     proc, out = _run_sweep(
         work,
         base,
         tmp_path,
-        roster_value=rf"\bQuillonfex\b" + "\n" + f"(?P={token})" + "\n",
+        roster_value=roster,
+        # A matching attestation, so the sweep reaches the scanner: the point
+        # of this cell is the exit-2 arm, not the decision.
+        attestation=_format2_attestation(
+            pattern_count_a=2,
+            roster_sha256=_canonical_sha(roster),
+        ),
     )
     assert proc.returncode != 0, out
-    assert "line 2 is not a valid regular expression" in out, out
+    # It exits 2 without printing the frozen summary line, so the "did not run"
+    # arm fails the sweep closed; it never reads as a hit or a pass.
+    assert "did not run" in out, out
+    assert "a hit means" not in out, out
     assert token not in out, out
 
 
@@ -1659,3 +1697,170 @@ def test_scanner_is_read_from_the_base_commit_not_the_checkout(sweep_repo, tmp_p
     assert proc.returncode == 0, out
     assert "CHECKOUT_SCANNER_RAN" not in out, out
     assert "scanned 1 file(s)" in out, out
+
+
+# ---------------------------------------------------------------------------
+# Format 2 — the attestation schema, the grammar check, one parser
+# (spec roster-format2-loader §1, §2.5, §4 cells 10-12)
+# ---------------------------------------------------------------------------
+#
+# Contract (written before the implementation):
+#   - the attestation is `roster_format: 2` + `pattern_count_a` +
+#     `pattern_count_b` + the whole-file sha; both counts must be integers >= 0,
+#     the sha must be 64 hex, and the two counts are compared with what the
+#     SCANNER reports after parsing. A mismatch of either count fails closed.
+#   - the validation block compiles NO roster regex and invokes no scanner: it
+#     asserts over the raw roster text that every non-blank non-comment line
+#     starts with `A<TAB>` or `B<TAB>`, and fails inside its own step before
+#     any scan.
+#   - `load_roster_file` is the only parser of the format-2 grammar.
+
+_EXPECTED_UPDATED_AT = "2026-11-15T00:00:00Z"
+
+
+def _format2_attestation(**overrides) -> dict:
+    """The fixture's attestation, matching `_ROSTER`, with overrides applied."""
+    attestation = {
+        "roster_format": 2,
+        "pattern_count_a": 1,
+        "pattern_count_b": 0,
+        "roster_sha256": _canonical_sha(_ROSTER),
+        "updated_at": _EXPECTED_UPDATED_AT,
+    }
+    attestation.update(overrides)
+    return attestation
+
+
+def test_cell10_matching_format2_attestation_passes(sweep_repo, tmp_path):
+    """Cell 10a: schema 2 + both counts matching + the sha matching -> success,
+    and the run reports the parsed class split."""
+    work, base, _g = sweep_repo
+    proc, out = _run_sweep(work, base, tmp_path,
+                           attestation=_format2_attestation())
+    assert proc.returncode == 0, out
+    assert "against 1 class-A and 0 class-B roster pattern(s)" in out, out
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("pattern_count_a", 2),
+        ("pattern_count_b", 1),
+    ],
+)
+def test_cell10_a_count_off_by_one_fails_closed(
+    sweep_repo, tmp_path, field, value
+):
+    """Cell 10b: an attested per-class count that the parsed roster does not
+    reproduce fails closed — the counts are compared inside the scan step,
+    where the scanner has already parsed the roster."""
+    work, base, _g = sweep_repo
+    proc, out = _run_sweep(
+        work, base, tmp_path,
+        attestation=_format2_attestation(**{field: value}),
+    )
+    assert proc.returncode != 0, out
+    assert "do not match the parsed roster" in out, out
+
+
+def test_cell10_roster_format_1_fails_closed(sweep_repo, tmp_path):
+    """Cell 10c: a format-1 attestation is not a schema-2 attestation. It is
+    treated as absent and fails closed, never as 'close enough'."""
+    work, base, _g = sweep_repo
+    proc, out = _run_sweep(
+        work,
+        base,
+        tmp_path,
+        attestation={
+            "roster_format": 1,
+            "pattern_count": 1,
+            "roster_sha256": _canonical_sha(_ROSTER),
+        },
+    )
+    assert proc.returncode != 0, out
+    assert "attestation absent or invalid" in out, out
+
+
+def test_cell11_the_validation_block_is_a_text_check_before_any_scan():
+    """Cell 11 (text/ordering): the roster validation the workflow performs is
+    a pure text predicate over `A<TAB>`/`B<TAB>` — it compiles no roster regex
+    and invokes no scanner — and it sits BEFORE the scan invocation, so a bad
+    class letter fails there and no scan runs."""
+    run = _step_script("sweep")
+
+    assert 'startswith("A\\t")' in run, run
+    assert 'startswith("B\\t")' in run, run
+    assert "re.compile" not in run, (
+        "the workflow must not compile roster regexes: that is the scanner's "
+        "loader's job, and a compile over roster lines is contributor-shaped "
+        "code near the secret"
+    )
+    assert 'split("\\t"' not in run, (
+        "the workflow must not PARSE the class token; it only asserts the "
+        "prefix, so the grammar has exactly one definition"
+    )
+
+    validation = min(
+        run.index('startswith("A\\t")'), run.index('startswith("B\\t")')
+    )
+    scan_call = run.index("scan = subprocess.run(")
+    assert validation < scan_call, (
+        "the grammar check must run before the scan invocation"
+    )
+
+
+def test_cell11_a_bad_class_letter_fails_before_any_scan(sweep_repo, tmp_path):
+    """Cell 11 (behavioural companion): a roster whose line 3 is `Z<TAB>x`
+    fails with the line number and the prefix instruction, and the clean
+    scanner stub's summary never appears — no scan ran."""
+    work, base, _g = sweep_repo
+    roster = "A\t\\bQuillonfex\\b\nB\tok\nZ\tx\n"
+    proc, out = _run_sweep(work, base, tmp_path, roster_value=roster)
+    assert proc.returncode != 0, out
+    assert "line 3" in out, out
+    assert "A<TAB>" in out and "B<TAB>" in out, out
+    assert "scan-leaks: scanned" not in out, out
+
+
+def test_cell12_exactly_one_roster_grammar_parser():
+    """Cell 12: the format-2 grammar has exactly one definition in the repo.
+    The class token is split only in the scanner's loader; the workflow holds a
+    prefix assertion (no split, no compile), so a second parser reddens this."""
+    scanner = (REPO / "src" / "engram" / "tools" / "scan-leaks.py").read_text(
+        encoding="utf-8"
+    )
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    assert scanner.count("def load_roster_file(") == 1, (
+        "the loader is the single parser"
+    )
+    assert scanner.count('.split("\\t", 1)') == 1, (
+        "the class token must be split in exactly one place"
+    )
+    assert '.split("\\t"' not in workflow, (
+        "a split in the workflow would be a second parser"
+    )
+    assert "re.compile" not in workflow, (
+        "a regex compile over roster lines in the workflow would be a second "
+        "implementation of the grammar"
+    )
+
+
+@pytest.mark.parametrize("field", ["pattern_count_a", "pattern_count_b"])
+def test_cell17_a_boolean_attestation_count_fails_closed(
+    sweep_repo, tmp_path, field
+):
+    """Cell 17: `pattern_count_a: true` (a JSON bool) is not an integer count.
+
+    `isinstance(True, int)` is True in Python, so the schema check alone lets a
+    bool through — and `True == 1`, so a one-pattern class even passes the
+    count comparison. The explicit bool guard is what fails it closed. The
+    second parameter covers the sibling field, which needs the same guard.
+    """
+    work, base, _g = sweep_repo
+    proc, out = _run_sweep(
+        work, base, tmp_path,
+        attestation=_format2_attestation(**{field: True}),
+    )
+    assert proc.returncode != 0, out
+    assert "attestation absent or invalid" in out, out

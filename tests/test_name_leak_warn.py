@@ -1160,6 +1160,89 @@ def test_load_roster_pos_none_error_reports_offset_unknown(capsys):
 
 
 # ---------------------------------------------------------------------------
+# Test 12: a roster FORMAT-2 line is refused, never compiled as a pattern
+# ---------------------------------------------------------------------------
+#
+# Contract (spec roster-format2-loader §3, cell 14): this consumer parses the
+# format-1 roster only. A line whose class prefix is `A<TAB>` or `B<TAB>` must
+# fail closed — one stderr line naming the file and the reason — instead of
+# compiling the class prefix into a pattern that would silently stop matching
+# once the secret is rotated to format 2. Format-1 behaviour is unchanged (the
+# control in the same cell).
+
+_FMT2_TOKEN = "Zqrosterfmt"
+
+
+def _run_warn(roster_text: str, tmp_path, added_lines: list[str]):
+    roster_file = tmp_path / "roster.txt"
+    roster_file.write_text(roster_text, encoding="utf-8")
+    diff_file = tmp_path / "pr.diff"
+    diff_file.write_text(_fake_diff(added_lines=added_lines), encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, str(TOOL_PATH),
+         "--roster-file", str(roster_file),
+         "--diff-file", str(diff_file)],
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize("class_token", ["A", "B"])
+def test_format2_roster_line_is_refused(tmp_path, capsys, class_token):
+    """Cell 14: a class-prefixed line exits non-zero with ONE line naming the
+    file and the reason, and never carries the roster text."""
+    roster_file = tmp_path / "roster.txt"
+    roster_file.write_text(
+        class_token + "\t" + _FMT2_TOKEN + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        load_roster(roster_source=None, roster_file=str(roster_file))
+
+    assert exc_info.value.code != 0, (
+        f"a format-2 roster line must refuse; got exit {exc_info.value.code!r}"
+    )
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1, f"exactly one stderr line; got {err!r}"
+    assert "format 2" in err, f"the message must name the format; got {err!r}"
+    assert "format 1" in err, f"the message must name the limitation; got {err!r}"
+    assert str(roster_file) in err, f"the message must name the file; got {err!r}"
+    assert _FMT2_TOKEN not in err, f"the roster line's text reached stderr: {err!r}"
+
+
+def test_format2_prefix_is_not_used_as_a_pattern(tmp_path):
+    """Cell 14 (behavioural): the class prefix is never compiled, so a diff
+    line that literally contains `A<TAB><token>` is neither matched nor
+    printed. Pre-change the whole line was a compiling regex that matched its
+    own text (exit 0, with the line echoed to stdout)."""
+    r = _run_warn(
+        "A\t" + _FMT2_TOKEN + "\n",
+        tmp_path,
+        added_lines=["# A\t" + _FMT2_TOKEN],
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert _FMT2_TOKEN not in out, out
+    assert "pattern_index" not in out, out
+
+
+def test_format1_roster_still_behaves_as_before(tmp_path, capsys):
+    """Cell 14 (control): the same consumer on a format-1 roster loads the
+    pattern and reports a match exactly as it did before the refusal."""
+    roster_file = tmp_path / "roster.txt"
+    roster_file.write_text(f"\\b{FAKE_NAME_A}\\b\n", encoding="utf-8")
+
+    patterns = load_roster(roster_source=None, roster_file=str(roster_file))
+    assert len(patterns) == 1
+    assert capsys.readouterr().err == ""
+
+    r = _run_warn(f"\\b{FAKE_NAME_A}\\b\n", tmp_path, [f"# {FAKE_NAME_A} was here"])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert FAKE_NAME_A in r.stdout, r.stdout
+    assert "pattern_index=0" in r.stdout, r.stdout
+
+
+# ---------------------------------------------------------------------------
 # Integration test: subprocess round-trip
 # ---------------------------------------------------------------------------
 
