@@ -756,3 +756,220 @@ def test_d6_without_a_caller_transaction_the_savepoint_commits(ctx):
     snap = ctx.snap(nid)
     assert snap[0][0] == json.dumps(new)
     assert snap[1] == ctx.fvec(new)
+
+
+# ---- A4 cells (the posted reviewer round: suggestions 1 to 3) --------------
+def _knn_distance(ctx, probe, target):
+    """The cosine distance vec0 reports for `target` when queried with `probe` (None when the row has none)."""
+    conn = ctx.db()
+    try:
+        rows = conn.execute(
+            "SELECT node_id, distance FROM vec_nodes WHERE embedding MATCH ? AND k = 50 ORDER BY distance",
+            (ctx.fvec(probe),)).fetchall()
+    finally:
+        conn.close()
+    return {node_id: distance for node_id, distance in rows}.get(target)
+
+
+def _break_config(ctx):
+    """The reviewer's repro: the config's `embedding` key is a string, so current_epoch() raises AttributeError."""
+    ctx.core.CONFIG_PATH.write_text(json.dumps({"embedding": "not-an-object"}), encoding="utf-8")
+
+
+# -------------------------------------------------------------------- E1 (S1: a failing check is a typed deferral)
+def test_e1_an_exception_inside_a_prepared_check_defers_as_check_failed_and_writes_nothing(ctx):
+    nid = ctx.node("e1 claim", seed=OLD, metadata=json.dumps({MARKER: {"reason": "x"}, "keep": 1}))
+    prepared = ctx.prep(nid)  # the epoch is taken while the config is still good
+    _break_config(ctx)
+    with pytest.raises(AttributeError):
+        ctx.pub.current_epoch()  # the repro really breaks the epoch read
+    before = ctx.snap(nid)
+    assert_deferred(ctx.publish(nid, prepared), nid, "check_failed")
+    assert ctx.snap(nid) == before  # both stores and the metadata (marker included) byte for byte
+
+
+def test_e1_an_exception_in_the_text_check_is_also_check_failed(ctx):
+    nid = ctx.node("e1b claim", seed=OLD)
+    prepared = ctx.prep(nid)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("text read exploded")
+
+    ctx.mp.setattr(ctx.core, "_embedding_text_for_node", boom)
+    before = ctx.snap(nid)
+    assert_deferred(ctx.publish(nid, prepared), nid, "check_failed")
+    assert ctx.snap(nid) == before
+
+
+def test_e1_a_failing_check_does_not_break_the_next_item_on_the_same_connection(ctx):
+    bad = ctx.node("e1c bad", seed=OLD)
+    good = ctx.node("e1c good", seed=OLD)
+    bad_prepared, good_prepared = ctx.prep(bad), ctx.prep(good)
+    real = ctx.core._embedding_text_for_node
+
+    def flaky(conn, node_id):
+        if node_id == bad:
+            raise RuntimeError("only this node")
+        return real(conn, node_id)
+
+    ctx.mp.setattr(ctx.core, "_embedding_text_for_node", flaky)
+    conn = ctx.db()
+    try:
+        first = ctx.pub.publish_embedding(conn, bad, prepared=bad_prepared)
+        second = ctx.pub.publish_embedding(conn, good, prepared=good_prepared)
+        conn.commit()
+    finally:
+        conn.close()
+    assert_deferred(first, bad, "check_failed")
+    assert second.status == "refreshed", second
+
+
+# -------------------------------------------------------------------- E2 (S1: the epoch can be read once by the caller)
+def test_e2_a_precomputed_epoch_is_used_and_current_epoch_is_not_read(ctx):
+    nid = ctx.node("e2 claim", seed=OLD)
+    calls = []
+    real = ctx.pub.current_epoch
+    ctx.mp.setattr(ctx.pub, "current_epoch", lambda: calls.append(1) or real())
+    prepared = ctx.prep(nid)  # prep reads the epoch once itself
+    calls.clear()
+    conn = ctx.db()
+    try:
+        result = ctx.pub.publish_embedding(conn, nid, prepared=prepared, epoch=real())
+        conn.commit()
+    finally:
+        conn.close()
+    assert result.status == "refreshed", result
+    assert calls == [], "a supplied epoch must not be re-read"
+
+
+def test_e2_the_supplied_epoch_is_what_the_prepared_epoch_is_compared_with(ctx):
+    nid = ctx.node("e2b claim", seed=OLD)
+    live = ctx.pub.current_epoch()
+    other = dataclasses.replace(live, model="supplied-other-model")
+    before = ctx.snap(nid)
+    conn = ctx.db()
+    try:
+        # prepared under the live epoch, compared with a supplied different one: epoch_changed
+        mismatch = ctx.pub.publish_embedding(conn, nid, prepared=ctx.prep(nid), epoch=other)
+        assert_deferred(mismatch, nid, "epoch_changed")
+        assert ctx.snap(nid) == before
+        # prepared under the supplied epoch although the live one differs: it publishes
+        match = ctx.pub.publish_embedding(conn, nid, prepared=ctx.prep(nid, epoch=other), epoch=other)
+        conn.commit()
+    finally:
+        conn.close()
+    assert match.status == "refreshed", match
+
+
+def test_e2_without_a_supplied_epoch_it_is_read_from_the_store(ctx):
+    nid = ctx.node("e2c claim", seed=OLD)
+    prepared = ctx.prep(nid, epoch=dataclasses.replace(ctx.pub.current_epoch(), model="elsewhere"))
+    assert_deferred(ctx.publish(nid, prepared), nid, "epoch_changed")
+
+
+# -------------------------------------------------------------------- E3 (S2: degenerate vectors defer)
+def _squared_norm(vector):
+    return math.fsum(float(x) * float(x) for x in vector)
+
+
+def _boundary_pair():
+    """Two single-element vectors `[x] + [0.0]*383`: `below` has the largest float64 x whose float64 square is <= the
+    float32 maximum; `above` is the next float64 up, whose square exceeds it. Built with math.nextafter, asserted exact."""
+    below = math.sqrt(F32_MAX)
+    while below * below > F32_MAX:
+        below = math.nextafter(below, 0.0)
+    while math.nextafter(below, math.inf) ** 2 <= F32_MAX:
+        below = math.nextafter(below, math.inf)
+    above = math.nextafter(below, math.inf)
+    return [below] + [0.0] * 383, [above] + [0.0] * 383
+
+
+def test_e3_the_boundary_pair_straddles_the_float32_maximum_exactly():
+    below, above = _boundary_pair()
+    assert _squared_norm(below) <= F32_MAX < _squared_norm(above)
+    assert below[0] != above[0] and math.nextafter(below[0], math.inf) == above[0]
+
+
+@pytest.mark.parametrize("name,vector", [
+    ("all_zero", [0.0] * 384),
+    ("all_zero_ints", [0] * 384),
+    ("all_overflow_3e38", [3.0e38] * 384),
+    ("one_overflow_element_last", [1.0] + [0.0] * 382 + [3.0e38]),
+    ("underflow_norm", [1e-320] * 384),
+])
+def test_e3_degenerate_vectors_defer_as_invalid_vector_and_write_nothing(ctx, name, vector):
+    assert ctx.pub._valid_vector(vector) is False
+    nid = ctx.node("e3 claim", seed=OLD, metadata=json.dumps({MARKER: {"reason": "x"}}))
+    prepared = ctx.prep(nid, vector=vector)
+    before = ctx.snap(nid)
+    assert_deferred(ctx.publish(nid, prepared), nid, "invalid_vector")
+    assert ctx.snap(nid) == before
+
+
+def test_e3_the_boundary_pair_squared_norm_just_below_publishes_and_just_above_defers(ctx):
+    below, above = _boundary_pair()
+    assert ctx.pub._valid_vector(below) is True and ctx.pub._valid_vector(above) is False
+    nid = ctx.node("e3b claim", seed=OLD)
+    result = ctx.publish(nid, ctx.prep(nid, vector=below))
+    assert result.status == "refreshed" and result.reason is None, result
+    assert ctx.snap(nid)[1] == ctx.fvec(below)
+    other = ctx.node("e3b other", seed=OLD)
+    before = ctx.snap(other)
+    assert_deferred(ctx.publish(other, ctx.prep(other, vector=above)), other, "invalid_vector")
+    assert ctx.snap(other) == before
+
+
+@pytest.mark.parametrize("name,vector", [
+    ("zero_first_element", [0.0] * 383 + [1.0]),
+    ("one_nonzero_in_the_middle", [0.0] * 100 + [2.5] + [0.0] * 283),
+])
+def test_e3_a_non_zero_norm_vector_with_zeros_in_it_still_publishes(ctx, name, vector):
+    assert ctx.pub._valid_vector(vector) is True
+    nid = ctx.node("e3c claim", seed=OLD)
+    result = ctx.publish(nid, ctx.prep(nid, vector=vector))
+    assert result.status == "refreshed", result
+
+
+def test_e3_a_normal_unit_norm_vector_publishes_and_vec0_returns_a_distance_for_it(ctx):
+    unit = [1.0 / math.sqrt(384)] * 384
+    nid = ctx.node("e3d claim", seed=OLD)
+    result = ctx.publish(nid, ctx.prep(nid, vector=unit))
+    assert result.status == "refreshed", result
+    distance = _knn_distance(ctx, unit, nid)
+    assert distance is not None and abs(distance) < 1e-3, distance
+
+
+def test_e3_the_degenerate_vectors_are_the_ones_vec0_gives_no_distance_for(ctx):
+    """Why the rule exists: the reviewer's two repros store fine and then have no KNN distance. Written directly into
+    vec_nodes (the primitive now refuses them), so the premise of the rule is itself pinned."""
+    nid = ctx.node("e3e claim", seed=OLD)
+    for vector in ([0.0] * 384, [3.0e38] * 384):
+        ctx.sql("DELETE FROM vec_nodes WHERE node_id = ?", (nid,))
+        ctx.sql("INSERT INTO vec_nodes VALUES (?, ?)", (nid, ctx.fvec(vector)))
+        assert _knn_distance(ctx, [1.0 / math.sqrt(384)] * 384, nid) is None
+
+
+def test_e3_the_valid_vector_docstring_says_what_valid_means():
+    import inspect
+    doc = " ".join(inspect.getdoc(importlib.import_module("engram_embedding_publish")._valid_vector).split())
+    for phrase in ("finite", "float32 range", "non-zero norm", "overflow"):
+        assert phrase in doc, phrase
+
+
+# -------------------------------------------------------------------- E4 (S3c: the prepared hash is compared exactly)
+def test_e4_an_uppercase_hex_hash_is_recipe_changed_even_when_the_digest_is_right(ctx):
+    nid = ctx.node("e4 claim", seed=OLD)
+    good = ctx.prep(nid)
+    upper = good.text_sha256.upper()
+    assert upper != good.text_sha256, "pick a node whose digest has a hex letter"
+    assert upper.lower() == good.text_sha256
+    before = ctx.snap(nid)
+    assert_deferred(ctx.publish(nid, ctx.prep(nid, text_sha256=upper)), nid, "recipe_changed")
+    assert ctx.snap(nid) == before
+    assert ctx.publish(nid, good).status == "refreshed"  # the lowercase hash of the same text publishes
+
+
+def test_e4_the_docstring_says_the_hash_is_compared_exactly():
+    import inspect
+    doc = " ".join(inspect.getdoc(importlib.import_module("engram_embedding_publish").publish_embedding).split())
+    assert "lowercase hex" in doc and "exactly" in doc

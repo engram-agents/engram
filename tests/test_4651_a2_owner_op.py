@@ -1543,3 +1543,150 @@ def test_k7_an_int_vector_is_stored_as_sent(owner, home):
     result = ok(call(owner, make_params(home, ["p0"], {"p0": ints})))
     assert statuses(result) == [("p0", "refreshed", None)]
     assert state(home, "p0")[0] == json.dumps(ints) and state(home, "p0")[0].startswith("[1, 1,")
+
+
+# =====================================================================================================  L (A4: the posted reviewer round)
+# Suggestion 1 (a failing check is a typed per-item deferral; the epoch is read once per call), suggestion 2 (degenerate
+# vectors defer), suggestion 3 (three cell gaps: the fingerprint covers node_id, the dedupe is LRU), suggestion 4 (a
+# replayed `ok` answers its stored `pending` items; a retry of those needs a FRESH request_id).
+
+def _break_epoch_config(home: Path) -> None:
+    """The reviewer's repro: the config's `embedding` key is a string, so `current_epoch()` raises AttributeError. The
+    routing flag stays JSON true so the gate is open."""
+    cfg = {"embedding": "not-an-object", "memory": {"current_turn": 3}, "engramd": {KEY: True}}
+    tmp = home / "config.json.tmp"
+    tmp.write_text(json.dumps(cfg), encoding="utf-8")
+    os.replace(tmp, home / "config.json")
+
+
+@requires_linux_owner
+def test_l1_an_unreadable_epoch_defers_every_item_as_check_failed_the_call_is_ok_nothing_written(owner, home):
+    """Mutant: the owner reads the epoch outside any guard (the whole batch is `internal_error`); the primitive's
+    checks are not guarded (see the primitive file)."""
+    params = make_params(home, ["p0", "p1"])  # the hashes do not need the epoch
+    before = all_state(home, ["p0", "p1", "p2"])
+    _break_epoch_config(home)
+    result = ok(call(owner, params))
+    assert statuses(result) == [("p0", "deferred", "check_failed"), ("p1", "deferred", "check_failed")]
+    assert result["counts"] == {"refreshed": 0, "pending": 0, "deferred": 2}
+    for item in result["items"]:
+        assert item["vector_changed"] is None and item["debt_cleared"] is False
+    assert all_state(home, ["p0", "p1", "p2"]) == before
+
+
+@requires_linux_owner
+def test_l1_the_epoch_is_read_once_per_call_not_once_per_item(owner, home, monkeypatch):
+    """Mutants: the owner stops passing the epoch (each item re-reads it); the primitive ignores a supplied epoch."""
+    reads = []
+    real = pub.current_epoch
+    monkeypatch.setattr(pub, "current_epoch", lambda: reads.append(1) or real())
+    ids = ["p0", "p1", "p2"]
+    result = ok(call(owner, make_params(home, ids)))
+    assert statuses(result) == [(nid, "refreshed", None) for nid in ids]
+    assert len(reads) == 1, f"expected one epoch read for a 3-item batch, got {len(reads)}"
+
+
+@requires_linux_owner
+def test_l1_the_per_item_outcomes_are_unchanged_by_reading_the_epoch_once(owner, home):
+    """The same mixed batch as before the change: one item per deferral kind, one refreshed. Mutant: the single epoch
+    read changes which check wins."""
+    sql(home, "UPDATE nodes SET is_current = 0 WHERE id = 'p1'")
+    params = make_params(home, ["p0", "p1", "p2"])
+    params["items"][2]["text_sha256"] = "0" * 64
+    result = ok(call(owner, params))
+    assert statuses(result) == [("p0", "refreshed", None), ("p1", "deferred", "not_current"),
+                                ("p2", "deferred", "recipe_changed")]
+
+
+@requires_linux_owner
+@pytest.mark.parametrize("name,bad", [("all_zero", [0.0] * 384), ("all_overflow_3e38", [3.0e38] * 384),
+                                      ("overflow_in_the_last_element", [1.0] + [0.0] * 382 + [3.0e38])])
+def test_l2_a_degenerate_vector_defers_as_invalid_vector_through_the_owner_stores_unchanged(owner, home, name, bad):
+    """The reviewer's two repros through the real owner. Mutants: the zero check dropped; the overflow check dropped;
+    the norm checked on the first item (or first element) only."""
+    ids = ["p0", "p1", "p2"]
+    vectors = {"p0": vec(1.0), "p1": bad, "p2": vec(3.0)}
+    before = state(home, "p1")
+    result = ok(call(owner, make_params(home, ids, vectors)))
+    assert statuses(result) == [("p0", "refreshed", None), ("p1", "deferred", "invalid_vector"), ("p2", "refreshed", None)]
+    assert result["counts"] == {"refreshed": 2, "pending": 0, "deferred": 1}
+    assert state(home, "p1") == before
+    assert state(home, "p0")[0] == json.dumps(vectors["p0"])
+
+
+@requires_linux_owner
+def test_l2_the_check_applies_to_every_item_not_only_the_first(owner, home):
+    """Mutant: the norm check runs for the first item of the call only. The degenerate items are 2nd and 3rd."""
+    ids = ["p0", "p1", "p2"]
+    vectors = {"p0": vec(1.0), "p1": [0.0] * 384, "p2": [3.0e38] * 384}
+    result = ok(call(owner, make_params(home, ids, vectors)))
+    assert statuses(result) == [("p0", "refreshed", None), ("p1", "deferred", "invalid_vector"),
+                                ("p2", "deferred", "invalid_vector")]
+
+
+@requires_linux_owner
+def test_l2_a_vector_with_a_zero_first_element_but_a_real_norm_still_publishes(owner, home):
+    """Mutant: the norm is taken from the first element only (this vector has a zero one)."""
+    vector = [0.0] * 383 + [1.0]
+    result = ok(call(owner, make_params(home, ["p0"], {"p0": vector})))
+    assert statuses(result) == [("p0", "refreshed", None)]
+    assert state(home, "p0")[0] == json.dumps(vector)
+
+
+@requires_linux_owner
+def test_l3a_the_fingerprint_covers_node_id_identical_text_and_vector_other_node(owner, home):
+    """Two nodes with IDENTICAL recipe text, an identical vector and the same request_id: the second call is
+    `request_id_reused`, not a replay of the first. Mutant: the fingerprint ignores node_id."""
+    sql(home, "UPDATE nodes SET claim = 'one shared claim' WHERE id IN ('p0', 'p1')")
+    assert recipe_sha(home, "p0") == recipe_sha(home, "p1")
+    shared = vec(1.5)
+    first = ok(call(owner, make_params(home, ["p0"], {"p0": shared}), rid="rid-l3a"))
+    assert statuses(first) == [("p0", "refreshed", None)]
+    after_first = all_state(home, ["p0", "p1", "p2"])
+    refused(call(owner, make_params(home, ["p1"], {"p1": shared}), rid="rid-l3a"), "invalid_params", "request_id_reused")
+    assert all_state(home, ["p0", "p1", "p2"]) == after_first  # nothing written for p1
+    assert state(home, "p1")[0] == json.dumps(OLD)
+
+
+@requires_linux_owner
+def test_l3b_the_dedupe_is_lru_a_replayed_id_survives_and_the_oldest_unreplayed_one_is_forgotten(owner, home, monkeypatch):
+    """Cap 2. A and B are recorded; A is REPLAYED (a hit refreshes it); C is recorded and pushes past the cap. The one
+    forgotten is B (the oldest not hit), and A still replays. Mutant: no `move_to_end` on a hit (FIFO: A is forgotten)."""
+    monkeypatch.setattr(eo, "USE_REWARD_DEDUPE_CAP", 2)
+    ok(call(owner, make_params(home, ["p0"]), rid="rid-l3b-a"))
+    ok(call(owner, make_params(home, ["p1"]), rid="rid-l3b-b"))
+    hit = ok(call(owner, make_params(home, ["p0"]), rid="rid-l3b-a"))
+    assert hit["duplicate"] is True
+    ok(call(owner, make_params(home, ["p2"]), rid="rid-l3b-c"))
+    assert list(owner._publish_prepared_seen) == ["rid-l3b-a", "rid-l3b-c"]
+    still = ok(call(owner, make_params(home, ["p0"]), rid="rid-l3b-a"))
+    assert still["duplicate"] is True  # A survived because the replay refreshed it
+    forgotten = ok(call(owner, make_params(home, ["p1"]), rid="rid-l3b-b"))
+    assert "duplicate" not in forgotten  # B, the oldest non-hit entry, was forgotten: it re-ran
+    assert statuses(forgotten) == [("p1", "refreshed", None)]
+
+
+@requires_linux_owner
+def test_l4_a_replay_of_an_ok_answers_the_stored_pending_item_a_retry_needs_a_fresh_request_id(owner, home, serialize_fails_for):
+    """A replay of a request that returned `ok` answers the STORED outcome, including a `pending` item, flagged
+    `duplicate: True`; nothing is retried. To retry the pending item the caller sends a FRESH request_id. Pins existing
+    behaviour (passes at once)."""
+    ids = ["p0", "p1"]
+    vectors = {"p0": vec(1.0), "p1": vec(2.0)}
+    serialize_fails_for(2.0)  # p1's vector cannot be mirrored: pending / mirror
+    params = make_params(home, ids, vectors)
+    first = ok(call(owner, params, rid="rid-l4"))
+    assert statuses(first) == [("p0", "refreshed", None), ("p1", "pending", "mirror")]
+    assert first["counts"] == {"refreshed": 1, "pending": 1, "deferred": 0}
+    after_first = all_state(home, ids)
+    stmts = trace(owner)
+    again = ok(call(owner, params, rid="rid-l4"))
+    assert again["duplicate"] is True
+    assert statuses(again) == [("p0", "refreshed", None), ("p1", "pending", "mirror")]  # the stored pending item, as is
+    assert again["counts"] == first["counts"]
+    assert all_state(home, ids) == after_first  # the replay wrote nothing
+    assert not any(s.startswith("BEGIN") for s in stmts), stmts
+    # A FRESH request_id retries the pending item (here with a vector the mirror can take) and it refreshes.
+    retry = ok(call(owner, make_params(home, ["p1"], {"p1": vec(5.0)}), rid="rid-l4-fresh"))
+    assert statuses(retry) == [("p1", "refreshed", None)] and "duplicate" not in retry
+    assert state(home, "p1")[0] == json.dumps(vec(5.0))
