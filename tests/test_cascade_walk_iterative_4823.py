@@ -237,3 +237,44 @@ def test_cell_c_a_cycle_terminates_and_each_node_fires_once(store):
     _edges(core, [(A, C)])  # closes A <- B <- C <- A
     assert _sequence(core, core._walk_cascade_downstream, A) == [A, B, C]
     assert _sequence(core, _reference(core), A) == [A, B, C]
+
+
+def _supersede_marked(core, root):
+    c = rb._raw(core)
+    try:
+        return {r["node_id"] for r in c.execute(
+            "SELECT node_id FROM cascade_markers WHERE root_op = 'supersede' AND root_node = ?",
+            (root,))}
+    finally:
+        c.close()
+
+
+def test_cell_b3_supersede_completes_on_a_deep_chain(store):
+    """Reviewer r1 on #4825: depth was pinned for retract and rung 11 but not for a
+    supersede, which the CHANGELOG also names. Supersede the root of the deep chain."""
+    core = store["core"]
+    root, levels = _chain(store, DEEP)
+    replacement = rb._ob(store["obs"], "deep-chain root premise, restated")
+    sup = rb.json.loads(store["rev"]._supersede_impl(
+        old_node_id=root, new_node_id=replacement, supersede_reason="fixture: deep chain"))
+    assert sup.get("status") == "superseded", sup
+    assert _supersede_marked(core, root) == set(levels)
+
+
+def test_cell_d_a_non_current_start_node_fires_nothing(store):
+    """Reviewer r1 on #4825: the walk's edge query is live-only, so a non-current node is
+    reached only as a START; there the is_current filter must stop the walk (a mutant that
+    drops it fired the callback and reached the dependents)."""
+    core, obs, derive = store["core"], store["obs"], store["derive"]
+    R = rb._ob(obs, "R: the premise that will stop being current.")
+    A = rb._dv(derive, "A rests on R.", [R])
+    B = rb._dv(derive, "B rests on A.", [A])
+    c = rb._raw(core)
+    try:
+        c.execute("UPDATE nodes SET is_current = 0 WHERE id = ?", (A,))
+        c.commit()
+    finally:
+        c.close()
+    assert _sequence(core, core._walk_cascade_downstream, A) == []
+    assert _sequence(core, _reference(core), A) == []
+    assert _sequence(core, core._walk_cascade_downstream, B) == [B], "fixture: B is live"

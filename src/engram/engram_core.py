@@ -13278,6 +13278,9 @@ class CascadeWalkTruncated(Exception):
         )
 
 
+_WALK_EXHAUSTED = object()  # sentinel: a node's child iterator is used up
+
+
 def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
     """Walk downstream from node_id following engram_core.CASCADE_RELATIONS
     edges (the relations whose EDGE_CLASSIFICATIONS entry sets cascade=True —
@@ -13340,9 +13343,6 @@ def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
             conn, _CASCADE_RELATIONS_SORTED, target_id=current)]))
 
 
-_WALK_EXHAUSTED = object()  # sentinel: a node's child iterator is used up
-
-
 def _walk_cascade_from_root(conn, root_id, *, on_live_node, extra_visited=()):
     """THE cascade walk from a root (#4727): every live claim-bearing node
     downstream of ``root_id`` over CASCADE_RELATIONS, each handed once to
@@ -13382,8 +13382,8 @@ def _walk_cascade_upstream(
     """Shared upstream (premise-direction) walk over ``CASCADE_RELATIONS``:
     follows each visited node's own outgoing cascade edges back toward its
     origins. Mirrors ``_walk_cascade_downstream``'s shape
-    (visited-set dedup, caller-supplied
-    per-node decision) for the inverse direction — that walker finds who
+    (visited-set dedup, caller-supplied per-node decision) for the inverse
+    direction — that walker finds who
     DEPENDS ON a node (``target_id = node_id``); this one finds what a node
     DEPENDS ON (``source_id = node_id``).
 
