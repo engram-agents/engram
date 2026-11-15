@@ -13,10 +13,8 @@ Cells:
      untouched.
   B. End to end through ``engram_query`` on a real temp graph.
 
-Not covered: the ``engram_query_pattern`` caller.  Its pattern builders
-hand-build candidate dicts that carry ``claim`` only (no ``predicted_event``
-key), so a prediction node cannot reach the new fallback through that caller.
-That is a separate blind spot, left unchanged here.
+Not covered here: the ``engram_query_pattern`` caller; its two affected
+builders are covered by test_query_pattern_predicted_event_4793.py (#4793).
 """
 
 import json

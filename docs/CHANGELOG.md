@@ -129,6 +129,7 @@ with an `-alpha` suffix during the alpha phase.
   fails once rather than retrying. With no usable venv it refuses with one line on
   stderr and exit 3, before doing any work. (#4642)
 - A prediction node with no stored summary showed a blank Tier-1 line in `engram_query` results, because the fallback read only `claim`, which a prediction leaves empty. It now shows the predicted event, cut at 160 characters like a claim. (#2328)
+- `engram_query_pattern` showed a blank summary for a prediction node in the `stale_load_bearing` and `tainted_still_valid` patterns, because both read only `claim`, which a prediction leaves empty. They now show the predicted event, cut at 160 characters like a claim. (#4793)
 - The pipe-exit-warn hook's success-echo check is now case-insensitive and also recognises `passed`, so `| tail && echo DONE` and `echo PASSED` are caught like their lowercase forms (engram#2119).
 - `scan-leaks` no longer prints a bad entry from the local name roster. A roster
   entry that is malformed or has a regex that does not compile is now reported
