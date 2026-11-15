@@ -1229,23 +1229,42 @@ def test_d15_the_child_env_is_an_allowlist_and_offline_flags_are_for_the_embed_s
 # knowledge.sql, so an unchanged graph must keep the OLD file (old marker, old bytes): the old content is still
 # true from the old marker time on. The paths are run for real, in a subprocess whose home is a throwaway repo.
 
+# One process runs the three steps, so the server's own start-up bookkeeping (embedding_restore_state.updated_at is
+# rewritten on every connect) does not make the graph "changed" between the two commit calls.
 _COMMIT_SCRIPT = r"""
-import json, sqlite3, sys
+import hashlib, json, sqlite3, subprocess, sys, time
 import engram_core as core
 home = core.DATA_DIR
-if sys.argv[1] == "worker":
-    import engram_snapshot_worker as w
-    snap = home / "captured.db"
-    if snap.exists():
-        snap.unlink()
-    s = sqlite3.connect(str(home / "knowledge.db")); d = sqlite3.connect(str(snap)); s.backup(d); d.close(); s.close()
-    w._regenerate_derived_files(snap)
-    res = w._commit_snapshot_files("nap", "m")
-else:
-    conn = core._get_db()
-    res = core._commit_snapshot_sync(conn, "m", "nap")
-    conn.close()
-print("RESULT " + json.dumps({"committed": res.get("git_committed"), "reason": res.get("reason")}))
+which = sys.argv[1]
+conn = core._get_db() if which == "sync" else None
+
+
+def commit():
+    if which == "worker":
+        import engram_snapshot_worker as w
+        snap = home / "captured.db"
+        if snap.exists():
+            snap.unlink()
+        s = sqlite3.connect(str(home / "knowledge.db")); d = sqlite3.connect(str(snap)); s.backup(d); d.close(); s.close()
+        w._regenerate_derived_files(snap)
+        res = w._commit_snapshot_files("nap", "m")
+    else:
+        res = core._commit_snapshot_sync(conn, "m", "nap")
+    n = subprocess.run(["git", "-C", str(home), "rev-list", "--count", "HEAD", "--", "knowledge.sql"],
+                       capture_output=True, text=True).stdout.strip()
+    data = (home / "knowledge.sql").read_bytes()
+    return {"committed": res.get("git_committed"), "sql_commits": int(n), "sha": hashlib.sha256(data).hexdigest(),
+            "marker": data.decode().splitlines()[0], "has_change": b"a claim that changed" in data}
+
+
+steps = [commit()]
+time.sleep(0.02)
+steps.append(commit())          # the same graph
+other = sqlite3.connect(str(home / "knowledge.db"))
+other.execute("UPDATE nodes SET claim = 'a claim that changed' WHERE id = 'ob_0003'"); other.commit(); other.close()
+time.sleep(0.02)
+steps.append(commit())          # a changed graph
+print("RESULT " + json.dumps(steps))
 """
 
 
@@ -1258,48 +1277,19 @@ def _result_line(p):
     return json.loads([ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")][-1][7:])
 
 
-def run_commit(home, which):
-    p = subprocess.run([sys.executable, "-c", _COMMIT_SCRIPT, which], env=_commit_env(home), capture_output=True,
-                       text=True, timeout=300)
-    return _result_line(p)
-
-
-def _git_out(home, *args):
-    return subprocess.run(["git", "-C", str(home), *args], capture_output=True, text=True).stdout.strip()
-
-
-def sql_commits(home) -> int:
-    p = subprocess.run(["git", "-C", str(home), "rev-list", "--count", "HEAD", "--", "knowledge.sql"],
-                       capture_output=True, text=True)
-    return int(p.stdout.strip()) if p.returncode == 0 else 0
-
-
-def marker_of(data: bytes) -> str:
-    first = data.decode("utf-8").splitlines()[0]
-    assert first.startswith(_MARKER_LINE), first
-    return first.split(":", 1)[1].strip()
-
-
 @pytest.mark.parametrize("which", ["worker", "sync"])
 def test_d17_an_unchanged_graph_makes_no_new_commit_and_keeps_the_old_file(home, which):
     _git(home, "init", "-q")
-    first = run_commit(home, which)
-    assert first["committed"] is True, first
-    assert sql_commits(home) == 1
-    before = (home / "knowledge.sql").read_bytes()
-    time.sleep(0.02)
-    again = run_commit(home, which)  # the same graph: its dump differs from the committed one by the marker only
-    assert sql_commits(home) == 1, "an unchanged graph made a new knowledge.sql commit"
-    assert (home / "knowledge.sql").read_bytes() == before, "the old file (old marker) was not kept"
-    assert _git_out(home, "status", "--porcelain", "--", "knowledge.sql") == ""
+    p = subprocess.run([sys.executable, "-c", _COMMIT_SCRIPT, which], env=_commit_env(home), capture_output=True,
+                       text=True, timeout=300)
+    first, again, changed = _result_line(p)
+    assert first["committed"] is True and first["sql_commits"] == 1, first
+    # the same graph: its dump differs from the committed one by the marker only
+    assert again["sql_commits"] == 1, "an unchanged graph made a new knowledge.sql commit"
+    assert again["sha"] == first["sha"] and again["marker"] == first["marker"], "the old file (old marker) was not kept"
     # a changed graph commits, and the new dump carries the new marker
-    live_exec(home, "UPDATE nodes SET claim = 'a claim that changed' WHERE id = 'ob_0003'")
-    time.sleep(0.02)
-    changed = run_commit(home, which)
-    assert sql_commits(home) == 2, (again, changed)
-    after = (home / "knowledge.sql").read_bytes()
-    assert b"a claim that changed" in after
-    assert marker_of(after) > marker_of(before)
+    assert changed["sql_commits"] == 2 and changed["has_change"] and not first["has_change"]
+    assert changed["marker"] > first["marker"]
 
 
 def test_d17_a_dump_that_differs_only_in_the_marker_is_unchanged(tmp_path):

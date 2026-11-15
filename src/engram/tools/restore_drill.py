@@ -30,6 +30,9 @@ What it does, in a SCRATCH directory (never in the live home):
                     else fails, any change to ``superseded_by`` fails. A difference with no record FAILS, naming
                     table, key and column. A record dated between the previous and this commit of an older
                     dump is REPORTED as "ambiguous: dump time unknown" (``ambiguous_count``), not failed.
+       audit_gated  nodes.trust_tier, nodes.source_type and the metadata key trust_tier (``AUDIT_GATED_COLUMNS``,
+                    one table, a PROVISIONAL ruling): shipped code changes them after creation, so a difference
+                    passes only with a live ``edit_history`` row for that node dated after the dump time.
        keyed        nodes.metadata, compared as parsed JSON KEY BY KEY (``_compare_node_metadata``):
                     write-once keys fail on a difference, the retraction stamp keys follow the lifecycle
                     rule, named mutable keys are reported, and any other key is UNKNOWN: listed, and a
@@ -58,16 +61,22 @@ What it does, in a SCRATCH directory (never in the live home):
      (``transcript_live_only_bytes``), not failed.
 
 Dump time (``dump_time_source`` in the report): the marker line ``-- engram-dumped-at: <UTC ISO time>`` that
-``engram_backup.dump_stripped`` writes as the first line of a dump (``marker``, exact, preferred); for an older dump
+``engram_backup.dump_stripped`` writes as the first line of a dump (``marker``, exact, preferred). The marker is
+the CAPTURE time: the moment the dump's content was true of the live graph (the snapshot worker, which dumps a
+captured copy later, stamps the time of the capture). A commit path that finds a new dump equal to the committed one
+except for the marker keeps the old file and its old marker; for an older dump
 with no marker, the window between the previous commit of ``knowledge.sql`` and this one (``commit-window``, no slack:
 a record before the previous commit fails, one between the two commits is ambiguous, one after this commit passes; a
 file with no previous commit has an UNKNOWN earlier bound, never an invented one); for a dump with no marker and no
 repo, the file's mtime (``mtime-fallback``, the weakest source).
 
-Known gaps (writers of the audited columns that leave NO ``edit_history`` row, see ``NO_AUDIT_WRITERS``): the startup
-``engram_core._backfill_resolved_by`` (NULL -> resolver) and the ``engram_revision._resolve_impl`` self-heal (re-points
-``resolved_by`` on a repeat resolve call). A ``resolved_by`` change they made is not told apart from corruption, so it
-fails; the columns are NOT classified mutable to absorb it.
+Known gaps (writers of the audited columns that leave NO ``edit_history`` row, see ``NO_AUDIT_WRITERS``, named by
+function): ``engram_core._backfill_resolved_by`` (startup, NULL -> resolver), the ``engram_revision._resolve_impl``
+self-heal (re-points ``resolved_by`` on a repeat resolve call), ``engram_core._run_db_one_time_setup`` (startup,
+person ``trust_tier`` NULL -> 'unknown') and ``engram_core._backfill_source_type`` (startup, evidence ``source_type``).
+A change they made is not told apart from corruption, so it fails; the columns are NOT classified mutable to absorb
+it, and the failure names these writers as possible causes. Failure text never prints graph content: a write-once or
+unknown metadata key and ``quoted_text`` are named with the value's type and length only.
 
 The drill never creates, modifies or deletes a file in the live home. The live database is opened
 read-only (``mode=ro``) when both ``-wal`` and ``-shm`` exist, and with ``immutable=1`` when neither does
@@ -188,6 +197,7 @@ _MUTABLE_TABLES = ("focus_state", "embedding_restore_state")
 WRITE_ONCE = "write_once"
 MUTABLE = "mutable"
 LIFECYCLE = "lifecycle"
+AUDIT_GATED = "audit_gated"
 KEYED = "keyed"
 UNCLASSIFIED = "unclassified"
 
@@ -197,13 +207,41 @@ _LIFECYCLE = {"nodes": ("status", "is_current", "superseded_by", "resolved_by")}
 _AUDITED_WRITE_ONCE = {("nodes", "quoted_text")}
 _KEYED = {"nodes": ("metadata",)}
 
+# THE ONE TABLE for the columns and metadata keys that shipped code changes after creation and that the design seat
+# has not (yet) ruled on (provisional, round 4). A difference passes ONLY with a live `edit_history` row for that node
+# (one of `actions`, any action for "*") dated after the dump time: the same audit-record rule as the lifecycle
+# columns, with no (restored, live) transition table. A metadata key is addressed as ("nodes.metadata", key). Moving a
+# line out of here (to `_MUTABLE`, say) is the whole change if the ruling differs.
+# Writers, and whether each leaves an audit row (function names; line numbers rot):
+#   trust_tier       engram_trust verb that sets a tier        'trust_tier_set'              audit row: yes
+#                    engram_revision.engram_supersede
+#                    self-anchor transfer (also is_current)    'self_anchor_transferred'     audit row: yes
+#                    engram_core._run_db_one_time_setup
+#                    NULL -> 'unknown' for person nodes         (none)                        audit row: NO, known gap
+#   source_type      engram_core._backfill_source_type
+#                    NULL -> inferred value for evidence nodes (none)                        audit row: NO, known gap
+#   metadata.trust_tier  written at person creation only (engram_trust); no shipped code rewrites it, but the
+#                    column it mirrors changes, so the key is gated with the column.
+# `source_type` has no writer that records an audit action, so any row for the node after the dump explains it
+# ("*"): a provisional weakness the ruling should tighten.
+# `no_audit` names the writers that change it with no audit row (the possible causes a failure names).
+AUDIT_GATED_COLUMNS = {
+    ("nodes", "trust_tier"): {"actions": ("trust_tier_set", "self_anchor_transferred"),
+                              "no_audit": ("engram_core._run_db_one_time_setup",)},
+    ("nodes", "source_type"): {"actions": ("*",), "no_audit": ("engram_core._backfill_source_type",)},
+    ("nodes.metadata", "trust_tier"): {"actions": ("trust_tier_set", "self_anchor_transferred"),
+                                       "no_audit": ("engram_core._run_db_one_time_setup",)},
+}
+
 
 def classify(table: str, column: str) -> str:
-    """write_once | mutable | lifecycle | keyed | unclassified (the last is TREATED as write-once)."""
+    """write_once | mutable | lifecycle | audit_gated | keyed | unclassified (the last is TREATED as write-once)."""
     if table in _WRITE_ONCE_TABLES:
         return WRITE_ONCE
     if column in _LIFECYCLE.get(table, ()):
         return LIFECYCLE
+    if (table, column) in AUDIT_GATED_COLUMNS:
+        return AUDIT_GATED
     if column in _KEYED.get(table, ()):
         return KEYED
     if column in _WRITE_ONCE.get(table, ()):
@@ -326,14 +364,27 @@ def _fail(report: DrillReport, message: str) -> None:
 # So "one way" holds for retraction and supersession, and does NOT hold for the resolution family or task status:
 # those moves are named below, keyed by the (restored, live) value pair, with the code path as the reason.
 
-NO_AUDIT_WRITERS = (
-    "engram_core._backfill_resolved_by (engram_core.py:4013): sets resolved_by NULL -> resolver at startup and "
-    "writes no edit_history row",
-    "engram_revision._resolve_impl self-heal (engram_revision.py:3223): re-points resolved_by on a repeat resolve "
-    "call and writes no edit_history row",
+_RESOLUTION_NO_AUDIT_WRITERS = (
+    "engram_core._backfill_resolved_by: sets resolved_by NULL -> resolver at startup and writes no edit_history row",
+    "engram_revision._resolve_impl self-heal: re-points resolved_by on a repeat resolve call and writes no "
+    "edit_history row",
 )
-_NO_AUDIT_HINT = (" (known gap: " + "; and ".join(w.split(" (")[0] for w in NO_AUDIT_WRITERS) +
-                  " write resolved_by with no audit row, so such a change is not told apart from corruption)")
+NO_AUDIT_WRITERS = _RESOLUTION_NO_AUDIT_WRITERS + (
+    "engram_core._run_db_one_time_setup: sets nodes.trust_tier NULL -> 'unknown' for person nodes at startup and "
+    "writes no edit_history row",
+    "engram_core._backfill_source_type: sets nodes.source_type NULL -> an inferred value for evidence nodes at "
+    "startup and writes no edit_history row",
+)
+
+
+def _names(writers) -> str:
+    return " and ".join(w.split(":")[0] for w in writers)
+
+
+# appended to a resolved_by (or resolve-path status) failure that has no audit row behind it, so "corruption" is not
+# the only explanation a reader is left with
+_NO_AUDIT_HINT = (f" (possible causes, writers that leave no audit row: {_names(_RESOLUTION_NO_AUDIT_WRITERS)}; "
+                  "this change is not told apart from corruption, and the column is not classified mutable to absorb it)")
 
 _RESOLUTION_STATUSES = ("open", "partially_resolved", "resolved", "confirmed", "partially_confirmed", "refuted",
                         "partially_refuted", "supported", "inconclusive")
@@ -428,6 +479,23 @@ def _latest(*stamps):
     return max(got) if got else None
 
 
+def _size(v) -> int:
+    return len(v) if isinstance(v, (str, bytes, list, dict)) else len(json.dumps(v))
+
+
+def _shape(v) -> str:
+    """The TYPE and LENGTH of a graph value, never the value (a failure pasted into a thread must not carry graph
+    content: a person node holds a birthday as a write-once key)."""
+    return "(absent)" if v is _ABSENT else f"<{type(v).__name__}, length {_size(v)}>"
+
+
+def _shape_pair(rv, lv) -> str:
+    """`restored <str, length 10>, live <str, length 10> (same length)` for two differing values."""
+    both = rv is not _ABSENT and lv is not _ABSENT
+    note = (" (same length, the values still differ)" if _size(rv) == _size(lv) else " (differ in length)") if both else ""
+    return f"restored {_shape(rv)}, live {_shape(lv)}{note}"
+
+
 def _edit_stamp(ctx: _Ctx, node_id, actions: tuple = (), globs: tuple = (), field=None):
     """When the live db's own audit log last recorded one of `actions` (exact) or `globs` (action patterns) for
     the node; with `field`, only rows whose details.field is that column (surgical_field_patch)."""
@@ -435,6 +503,8 @@ def _edit_stamp(ctx: _Ctx, node_id, actions: tuple = (), globs: tuple = (), fiel
         return None
     clauses = []
     params: list = [node_id]
+    if "*" in actions:  # any recorded change to the node
+        actions, globs = (), ("*",)
     if actions:
         clauses.append(f"action IN ({','.join('?' * len(actions))})")
         params += list(actions)
@@ -512,7 +582,8 @@ def _check_status(ctx, report, node_id, rv, lv, live_meta) -> list:
         actions, globs = _KIND_ACTIONS[named[0]]
         stamp = _latest(_edit_stamp(ctx, node_id, actions, globs), patch)
     out = _explain(ctx, report, node_id, "status", stamp, desc,
-                   "an edit_history row for this status move" + (" or a field_patch" if named else ", a field_patch"))
+                   "an edit_history row for this status move" + (" or a field_patch" if named else ", a field_patch"),
+                   hint=_NO_AUDIT_HINT if named and named[0] == _KIND_RESOLUTION else "")
     if not out:
         _note_transition(report, f"{rv} -> {lv}", named[1] if named else _FIELD_PATCH_REASON)
     return out
@@ -573,11 +644,23 @@ def _check_quoted_text(ctx, report, node_id, rv, lv) -> list:
     passes only when the live record shows a requote (or an operator field_patch of that column) after the dump."""
     if rv == lv:
         return []
-    short = lambda v: repr(v if not isinstance(v, str) or len(v) <= 60 else v[:57] + "...")  # noqa: E731
     stamp = _latest(_edit_stamp(ctx, node_id, ("requoted",)),
                     _edit_stamp(ctx, node_id, ("surgical_field_patch",), field="quoted_text"))
-    return _explain(ctx, report, node_id, "quoted_text", stamp, f"restored {short(rv)}, live {short(lv)}",
+    return _explain(ctx, report, node_id, "quoted_text", stamp, _shape_pair(rv, lv),
                     "a 'requoted' edit_history row or a field_patch of quoted_text")
+
+
+def _check_audit_gated(ctx, report, node_id, table, column, rv, lv) -> list:
+    """A column (or metadata key, table "nodes.metadata") in AUDIT_GATED_COLUMNS: a difference passes only with a
+    live audit row for the node after the dump time. The values are enumerated vocabulary (tiers, source types)."""
+    if rv == lv:
+        return []
+    spec = AUDIT_GATED_COLUMNS[(table, column)]
+    shown = column if table == "nodes" else f"metadata.{column}"
+    desc = f"restored {rv!r}, live {lv!r}"
+    return _explain(ctx, report, node_id, shown, _edit_stamp(ctx, node_id, spec["actions"]), desc,
+                    "an edit_history row for this change (" + ", ".join(spec["actions"]) + ")",
+                    hint=f" (possible cause, a writer that leaves no audit row: {_names(spec['no_audit'])})")
 
 
 # ------------------------------------------------------------------ nodes.metadata, key by key
@@ -665,7 +748,8 @@ def _parse_metadata(raw):
 
 def _note_unknown(report: DrillReport, keys) -> None:
     for k in keys:
-        if k not in LIFECYCLE_STAMP_METADATA_KEYS and k not in WRITE_ONCE_METADATA_KEYS and k not in MUTABLE_METADATA_KEYS:
+        if (k not in LIFECYCLE_STAMP_METADATA_KEYS and k not in WRITE_ONCE_METADATA_KEYS
+                and k not in MUTABLE_METADATA_KEYS and ("nodes.metadata", k) not in AUDIT_GATED_COLUMNS):
             report.metadata_unknown[k] = report.metadata_unknown.get(k, 0) + 1
 
 
@@ -691,7 +775,7 @@ def _compare_node_metadata(ctx, report, node_id, rraw, lraw) -> list:
         rv, lv = r.get(k, _ABSENT), l.get(k, _ABSENT)
         if rv == lv:
             continue
-        desc = f"restored {rv if rv is not _ABSENT else '(absent)'!r}, live {lv if lv is not _ABSENT else '(absent)'!r}"
+        desc = _shape_pair(rv, lv)  # the key is named, the value never is (graph content)
         if k in LIFECYCLE_STAMP_METADATA_KEYS:
             if rv is _ABSENT:
                 if k == "retracted_at":
@@ -702,6 +786,9 @@ def _compare_node_metadata(ctx, report, node_id, rraw, lraw) -> list:
             else:
                 _bump(report, f"metadata.{k}", _NOTRANS)
                 out.append(f"column metadata key {k}: {desc}: backward or changed (a withdrawal stamp is written once)")
+        elif ("nodes.metadata", k) in AUDIT_GATED_COLUMNS:
+            out += _check_audit_gated(ctx, report, node_id, "nodes.metadata", k,
+                                      None if rv is _ABSENT else rv, None if lv is _ABSENT else lv)
         elif k in WRITE_ONCE_METADATA_KEYS:
             out.append(f"column metadata key {k}: {desc}: a write-once metadata key changed")
         elif k in MUTABLE_METADATA_KEYS:
@@ -1027,6 +1114,7 @@ def _compare_tables_impl(report: DrillReport, restored: sqlite3.Connection, live
             WRITE_ONCE: [c for c in common if classes[c] == WRITE_ONCE],
             MUTABLE: [c for c in common if classes[c] == MUTABLE],
             LIFECYCLE: [c for c in common if classes[c] == LIFECYCLE],
+            AUDIT_GATED: [c for c in common if classes[c] == AUDIT_GATED],
             KEYED: [c for c in common if classes[c] == KEYED],
             UNCLASSIFIED: [c for c in common if classes[c] == UNCLASSIFIED],
         }
@@ -1073,7 +1161,7 @@ def _compare_tables_impl(report: DrillReport, restored: sqlite3.Connection, live
             if rvals == lvals:
                 continue
             for c, rv, lv in zip(common, rvals, lvals):
-                if rv == lv or classes[c] in (LIFECYCLE, KEYED) or (table, c) in _AUDITED_WRITE_ONCE:
+                if rv == lv or classes[c] in (LIFECYCLE, KEYED, AUDIT_GATED) or (table, c) in _AUDITED_WRITE_ONCE:
                     continue
                 if classes[c] == MUTABLE:
                     k = f"{table}.{c}"
@@ -1103,6 +1191,9 @@ def _check_node_row(ctx: _Ctx, report: DrillReport, node_id, r: dict, l: dict) -
         out += _check_resolved_by(ctx, report, node_id, r["resolved_by"], l["resolved_by"], live_status)
     if "quoted_text" in r:
         out += _check_quoted_text(ctx, report, node_id, r["quoted_text"], l["quoted_text"])
+    for (t, c) in AUDIT_GATED_COLUMNS:
+        if t == "nodes" and c in r:
+            out += _check_audit_gated(ctx, report, node_id, t, c, r[c], l[c])
     if "metadata" in r:
         out += _compare_node_metadata(ctx, report, node_id, r["metadata"], l["metadata"])
     return out
@@ -1417,11 +1508,12 @@ def _write_scratch_config(home: Path, scratch: Path) -> None:
 
 def format_report(report: DrillReport) -> str:
     lines = list(report.sections)
-    lines.append("classification (write-once failures / mutable reported / lifecycle gated by the audit record / "
-                 "keyed metadata / unclassified treated as write-once):")
+    lines.append("classification (write-once failures / mutable reported / lifecycle and audit_gated columns gated by the "
+                 "audit record / keyed metadata / unclassified treated as write-once):")
     for table, c in sorted(report.classification.items()):
         lines.append(f"  {table}: write_once={','.join(c[WRITE_ONCE]) or '-'}; mutable={','.join(c[MUTABLE]) or '-'}; "
-                     f"lifecycle={','.join(c.get(LIFECYCLE, [])) or '-'}; keyed={','.join(c.get(KEYED, [])) or '-'}; "
+                     f"lifecycle={','.join(c.get(LIFECYCLE, [])) or '-'}; "
+                     f"audit_gated={','.join(c.get(AUDIT_GATED, [])) or '-'}; keyed={','.join(c.get(KEYED, [])) or '-'}; "
                      f"unclassified={','.join(c[UNCLASSIFIED]) or '-'}")
     if report.ambiguous:
         lines.append(f"ambiguous: dump time unknown: {len(report.ambiguous)} difference(s) explained only by a record "
