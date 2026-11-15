@@ -1386,6 +1386,35 @@ def test_d18_the_snapshot_worker_stamps_the_capture_time_not_the_dump_time(home,
     assert lc(rep, "status")["passed"] == 1 and rep.dump_time_source == "marker"
 
 
+_JOB_SCRIPT = r"""
+import json, os, sqlite3
+import engram_core as core
+import engram_snapshot_worker as w
+home = core.DATA_DIR
+CAPTURED = "2026-03-04T05:06:07.123456Z"
+w.enqueue_job(7, 1, "m", "nap", captured_at=CAPTURED)
+job = [j for j in w._pending_jobs() if (j.get("turn"), j.get("seq")) == (7, 1)][0]
+snap = w._pending_dir() / job["snapshot"]
+snap.parent.mkdir(parents=True, exist_ok=True)
+s = sqlite3.connect(str(home / "knowledge.db")); d = sqlite3.connect(str(snap)); s.backup(d); d.close(); s.close()
+os.utime(snap, (1000000000, 1000000000))  # 2001-09-09: clearly not the capture time
+w._process_job(job)
+first = (home / "knowledge.sql").read_text(encoding="utf-8").splitlines()[0]
+print("RESULT " + json.dumps({"job_captured_at": job.get("captured_at"), "first": first, "expected": CAPTURED}))
+"""
+
+
+def test_d18_the_job_record_carries_captured_at_and_the_worker_stamps_exactly_that(home):
+    """enqueue_job writes the field; the dump's marker is the job's captured_at, never the file's mtime (which this
+    cell sets to a clearly different instant)."""
+    _git(home, "init", "-q")
+    p = subprocess.run([sys.executable, "-c", _JOB_SCRIPT], env=_commit_env(home), capture_output=True,
+                       text=True, timeout=300)
+    res = _result_line(p)
+    assert res["job_captured_at"] == res["expected"], "enqueue_job dropped captured_at"
+    assert res["first"] == _MARKER_LINE + " " + res["expected"], res["first"]
+
+
 # ---------------------------------------------------------------- D19 trust_tier and source_type are audit-gated (fold 3)
 
 def _col_pair(tmp_path, name, col, dump_value, live_value):
@@ -1594,6 +1623,7 @@ def test_d21_r17w_the_written_marker_is_the_captured_value_not_a_fresh_clock_rea
     stats = bk.dump_stripped(str(home / "knowledge.db"), str(out), dumped_at=given)
     assert out.read_text(encoding="utf-8").splitlines()[0] == _MARKER_LINE + " " + given
     assert stats["dumped_at"] == given
+    assert out.read_text(encoding="utf-8").splitlines()[0] == _MARKER_LINE + " " + stats["dumped_at"]
     assert reads == [], "a given dumped_at must not touch the clock at all"
     # dumped_at=None: the marker is the ONE clock read taken before the backup, however often the clock ticks
     ticks = iter(range(1, 100))
@@ -1607,6 +1637,7 @@ def test_d21_r17w_the_written_marker_is_the_captured_value_not_a_fresh_clock_rea
     first = out2.read_text(encoding="utf-8").splitlines()[0]
     assert first == _MARKER_LINE + " " + "2026-06-01T00:00:01.000000Z"
     assert stats2["dumped_at"] == "2026-06-01T00:00:01.000000Z"
+    assert first == _MARKER_LINE + " " + stats2["dumped_at"]
     assert reads == [], "the writer must not read the datetime clock either"
 
 
