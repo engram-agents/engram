@@ -44,13 +44,13 @@ BOOTSTRAP = SRC / "bootstrap.py"
 
 LEAN_IDS = [
     "identity-opening",
+    "user-notes-verbatim-lean",
     "authority-structure-intro",
     "authority-structure-table-claude-code",
     "authority-structure-close",
     "trust-tier-pointer",
     "model-identity-gate-lean",
     "engram-write-discipline",
-    "user-notes-verbatim-lean",
     "engram-read-discipline",
     "confidence-anchors",
     "native-tools-ban-lean",
@@ -136,8 +136,8 @@ def test_lean_manifest_is_the_twelve_ids_in_the_full_manifests_relative_order():
     # write discipline (the full file has model-identity-gate just before it), the notes sentence
     # between the write and read disciplines (cross-surface-persistence's place).
     assert lean_ids.index(GATE_ID) == lean_ids.index("engram-write-discipline") - 1
-    assert lean_ids.index(NOTES_ID) == lean_ids.index("engram-write-discipline") + 1
-    assert lean_ids.index(NOTES_ID) == lean_ids.index("engram-read-discipline") - 1
+    assert lean_ids.index(NOTES_ID) == lean_ids.index("identity-opening") + 1
+    assert lean_ids.index(NOTES_ID) == lean_ids.index("authority-structure-intro") - 1
 
 
 def test_lean_render_receipt_lists_the_twelve_ids():
@@ -170,9 +170,10 @@ def _full_ban_paragraph() -> str:
 def test_ban_lean_component_body_equals_the_full_components_paragraph_byte_for_byte():
     para = _full_ban_paragraph()
     assert para.strip() and "NATIVE deep-research" in para and "`Workflow`" in para
-    body = tcr._load_component(BAN_ID)[1]
+    fm, body = tcr._load_component(BAN_ID)
+    # heading rule: a lean-only component at an absent anchor renders as its own heading, then the paragraph;
     # the body owns its trailing blank line (whitespace-ownership rule): paragraph, then one "\n"
-    assert body == para + "\n"
+    assert body == "## " + fm["anchor"] + "\n\n" + para + "\n"
 
 
 def test_ban_lean_component_is_in_the_lean_manifest_and_not_in_the_full_manifest():
@@ -205,6 +206,17 @@ def _notes_sentence() -> str:
     return lines[0][len("3. ") :]
 
 
+SCOPE_LINE = "**warm-briefing.md:**"
+
+
+def _scope_line() -> str:
+    """The line heading the warm-briefing list in the FULL file, read at test time (exactly one occurrence)."""
+    text = (TEMPLATES / "components" / "cross-surface-persistence.md").read_text(encoding="utf-8")
+    lines = [ln for ln in text.split("\n") if ln == SCOPE_LINE]
+    assert len(lines) == 1
+    return lines[0]
+
+
 _SENTENCES = [
     pytest.param(GATE_ID, _gate_sentence, "silent swap", id="gate"),
     pytest.param(NOTES_ID, _notes_sentence, "Never edit or summarize them.", id="notes"),
@@ -215,9 +227,14 @@ _SENTENCES = [
 def test_lean_sentence_component_body_equals_the_full_files_sentence_byte_for_byte(cid, get_sentence, marker):
     sentence = get_sentence()
     assert sentence.strip() and marker in sentence and "\n" not in sentence
-    body = tcr._load_component(cid)[1]
-    # whitespace-ownership rule: the sentence, then one "\n" (the body owns its trailing blank line)
-    assert body == sentence + "\n"
+    fm, body = tcr._load_component(cid)
+    # whitespace-ownership rule: the body owns its trailing blank line, so it ends "\n" after the sentence.
+    if cid == GATE_ID:
+        # heading rule: the anchor heading is absent from the lean file, so the component brings its own
+        assert body == "## " + fm["anchor"] + "\n\n" + sentence + "\n"
+    else:
+        # the notes sentence keeps the source's scope line (the line heading its list), then the sentence
+        assert body == _scope_line() + "\n\n" + sentence + "\n"
 
 
 @pytest.mark.parametrize("cid,get_sentence,marker", _SENTENCES)
@@ -231,6 +248,53 @@ def test_lean_sentence_renders_exactly_once_in_lean_and_exactly_once_in_full(cid
     sentence = get_sentence()
     assert _lean().count(sentence) == 1
     assert _full().count(sentence) == 1
+
+
+# --- heading rule: a lean-only component at an absent anchor brings its own heading ----------
+
+_HEADED = [
+    pytest.param(GATE_ID, "Model Identity Gate", "External interactions", "trust-tier-pointer", _gate_sentence, id="gate"),
+    pytest.param(
+        BAN_ID, "Parallelization and Delegation", "Confidence calibration anchors", "confidence-anchors",
+        _full_ban_paragraph, id="ban",
+    ),
+]
+
+
+@pytest.mark.parametrize("cid,anchor,prev_section,prev_id,get_text", _HEADED)
+def test_heading_line_equals_the_components_own_anchor_field(cid, anchor, prev_section, prev_id, get_text):
+    fm, body = tcr._load_component(cid)
+    assert fm["anchor"] == anchor
+    assert body.split("\n", 1)[0] == "## " + fm["anchor"]
+
+
+@pytest.mark.parametrize("cid,anchor,prev_section,prev_id,get_text", _HEADED)
+def test_heading_appears_once_in_lean_with_the_text_directly_under_it(cid, anchor, prev_section, prev_id, get_text):
+    lean = _lean()
+    assert lean.split("\n").count("## " + anchor) == 1
+    assert ("## " + anchor + "\n\n" + get_text() + "\n") in lean
+    # the full render keeps its own single heading from the full components
+    assert _full().split("\n").count("## " + anchor) == 1
+
+
+@pytest.mark.parametrize("cid,anchor,prev_section,prev_id,get_text", _HEADED)
+def test_the_text_no_longer_sits_at_the_end_of_the_previous_section(cid, anchor, prev_section, prev_id, get_text):
+    lines = _lean().split("\n")
+    blanks, before = _blank_lines_before(lines, lines.index("## " + anchor))
+    assert blanks == 1
+    # the line before the blank is the previous lean component's last line, not the moved text
+    assert before == _last_line(prev_id)
+    assert before != get_text()
+
+
+def test_notes_scope_line_and_sentence_sit_after_my_goal_and_before_authority_structure():
+    lean = _lean()
+    block = _scope_line() + "\n\n" + _notes_sentence() + "\n"
+    assert lean.count(block) == 1
+    at = lean.index(block)
+    assert lean.index("## My Goal") < at < lean.index("## Authority Structure")
+    # directly before the Authority Structure heading: block, one blank line, heading
+    assert lean[at + len(block):].startswith("\n## Authority Structure")
 
 
 # --- (e) consent paragraph and authority table --------------------------------------------
@@ -410,11 +474,17 @@ def test_i_lean_is_strictly_shorter_and_has_none_of_the_dropped_headings():
     for cid in sorted(dropped):
         for h in _headings(_component_body(cid)):
             seen += 1
+            if h in ("## Model Identity Gate", "## Parallelization and Delegation"):
+                continue  # rendered by the lean-only components (heading rule), asserted below
             assert h not in lean_headings, f"{cid}: dropped heading {h!r} is in the lean render"
     assert seen >= 4
-    for named in ("Model Identity Gate", "Agent coordination", "Loop-mode policy", "Parallelization and Delegation"):
+    for named in ("Agent coordination", "Loop-mode policy"):
         assert named in full
         assert named not in lean, named
+    # the two lean-only components bring their own heading at their absent anchor (heading rule)
+    for named in ("Model Identity Gate", "Parallelization and Delegation"):
+        assert named in full
+        assert ("## " + named) in lean_headings
     assert "## ENGRAM Write Discipline" in lean_headings
     assert "## ENGRAM Read Discipline" in lean_headings
 
@@ -478,7 +548,7 @@ def _claude_md(home: Path) -> str:
 def test_c1_lean_option_records_the_profile_and_writes_the_lean_render(lean_home, full_home):
     assert _config(lean_home)["claude_md_profile"] == "lean"
     lean_md = _claude_md(lean_home)
-    assert "Model Identity Gate" not in lean_md
+    assert "Loop-mode policy" not in lean_md  # a dropped component; the gate's own heading now renders
     assert "## ENGRAM Write Discipline" in lean_md
     assert len(lean_md) < len(_claude_md(full_home))
 
@@ -575,7 +645,7 @@ def test_c1_the_option_needs_a_value(tmp_path):
 def test_h_lean_file_leaves_the_same_unresolved_placeholders_as_the_full_file(lean_home, full_home):
     lean_md, full_md = _claude_md(lean_home), _claude_md(full_home)
     # The run really rendered the lean file (an option that is ignored would pass the set check).
-    assert "Model Identity Gate" not in lean_md and "Model Identity Gate" in full_md
+    assert "Loop-mode policy" not in lean_md and "Loop-mode policy" in full_md
     lean_left = set(PLACEHOLDER.findall(lean_md))
     full_left = set(PLACEHOLDER.findall(full_md))
     assert lean_left == full_left, (lean_left, full_left)

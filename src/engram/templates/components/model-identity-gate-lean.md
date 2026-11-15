@@ -8,5 +8,7 @@ order: 10
 merge: replace
 version: 1
 ---
+## Model Identity Gate
+
 Changing family is an identity decision, never a silent swap.
 
