@@ -1132,3 +1132,247 @@ def test_o3_guard_outcome_not_the_handlers(owned_tmp):
     assert r.status_code == 400 and r.get_json() == {"error": "agent is required"}
     (rec,) = _lines(owned_tmp)
     assert rec["outcome"] == "proceeded"
+
+
+# ---- delta 4: the report holds no request text outside `named`; hardening ----
+
+def _unmatched_line(tmp, method, url, status, *, headers=None, json_body=None):
+    """One request that routing does not match; assert the status it has always had and that
+    exactly one line was written, with the fixed unmatched route."""
+    app = _make_app(tmp)
+    kw = {"headers": headers or {}}
+    if json_body is not None:
+        kw["json"] = json_body
+    r = app.test_client().open(url, method=method, **kw)
+    assert r.status_code == status, (r.status_code, r.get_data(as_text=True)[:200])
+    (rec,) = _lines(tmp)
+    assert _bytes(tmp).count(b"\n") == 1
+    assert rec["route"] == f"{method} <unmatched>", rec
+    return app, rec, _bytes(tmp)
+
+
+def test_c1_unmatched_path_with_a_hostile_name_is_one_line_with_the_fixed_route(owned_tmp):
+    _app, rec, data = _unmatched_line(
+        owned_tmp, "POST", f"/api/agent/{HOSTILE_Q}/nosuchleaf", 422, json_body={})
+    assert rec["named"] == [invalid_name(HOSTILE_LEN)]
+    for frag in (b"evil", b"x|y", b"|", b"\\u2028", b"nosuchleaf", b"/api"):
+        assert frag not in data, frag
+
+
+def test_c1_a_path_carrying_a_valid_token_text_never_reaches_the_file(owned_tmp):
+    app = _make_app(owned_tmp)
+    tok = _issue(app, "alice")
+    r = app.test_client().post(f"/api/nosuch/Bearer%20{tok}/x", json={})
+    assert r.status_code == 404
+    (rec,) = _lines(owned_tmp)
+    data = _bytes(owned_tmp)
+    assert rec["route"] == "POST <unmatched>" and data.count(b"\n") == 1
+    for frag in (tok.encode(), b"Bearer", b"nosuch"):
+        assert frag not in data, frag
+
+
+def test_c1_a_wrong_method_on_a_variable_route_is_405_and_holds_no_path_text(owned_tmp):
+    _app, rec, data = _unmatched_line(owned_tmp, "PUT", "/api/thread/7777", 405, json_body={})
+    assert rec["named"] == []
+    for frag in (b"7777", b"/api/thread", b"thread"):
+        assert frag not in data, frag
+
+
+def test_c1_a_wrong_method_with_a_hostile_path_segment_is_422_and_holds_no_path_text(owned_tmp):
+    _app, rec, data = _unmatched_line(
+        owned_tmp, "PUT", f"/api/agent/{HOSTILE_Q}/inbox", 422)
+    assert rec["named"] == [invalid_name(HOSTILE_LEN)]
+    for frag in (b"evil", b"x|y", b"|", b"\\u2028", b"inbox"):
+        assert frag not in data, frag
+
+
+def test_c1_a_wrong_method_naming_a_valid_agent_records_only_the_name(owned_tmp):
+    _app, rec, data = _unmatched_line(owned_tmp, "PUT", "/api/agent/zzmarkname/inbox", 405)
+    assert rec["named"] == ["zzmarkname"]
+    assert data.count(b"zzmarkname") == 1 and b"inbox" not in data
+
+
+def test_c1_a_3000_character_path_is_one_short_line_without_the_path(owned_tmp):
+    _app, rec, data = _unmatched_line(
+        owned_tmp, "POST", "/api/" + "q" * 3000, 404, json_body={})
+    assert b"qqqq" not in data and len(data) < 1024
+
+
+def test_c1_a_matched_route_keeps_its_rule_text_in_the_report(owned_tmp):
+    app = _make_app(owned_tmp)
+    app.test_client().get("/api/agent/alice/inbox")
+    (rec,) = _lines(owned_tmp)
+    assert rec["route"] == "GET /api/agent/<name>/inbox"
+
+
+# C2: a malformed identity wins over two differing identities (the order enforce uses) ----
+_C2_ROWS = [
+    ("absent-malformed-body-plus-query-name-422", "POST", "/api/post?agent=alice",
+     dict(POST_BODY, agent="bo\nb"), "none", "absent", 422),
+    ("absent-malformed-query-plus-body-name-422", "POST", f"/api/post?agent={HOSTILE_Q}",
+     dict(POST_BODY, agent="bob"), "none", "absent", 422),
+]
+
+
+def _no_threads(tmp) -> bool:
+    conn = sqlite3.connect(str(tmp / "forum.db"))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("row", _C2_ROWS, ids=[r[0] for r in _C2_ROWS])
+def test_c2_malformed_wins_over_two_differing_identities(owned_tmp, row):
+    r, recs = _o_run(owned_tmp, row)
+    (rec,) = recs
+    assert (rec["verdict"], rec["outcome"]) == ("absent", 422)
+    assert r.status_code == 422, (r.status_code, r.get_data(as_text=True))
+    assert _no_threads(owned_tmp)
+
+
+# C3: a name's length is capped in the report ----------------------------------
+def test_c3_the_cap_boundary_128_is_written_129_is_a_marker(owned_tmp):
+    (owned_tmp / "a").mkdir()
+    (owned_tmp / "b").mkdir()
+    n128, n129 = "a" * 128, "a" * 129
+    app = _make_app(owned_tmp / "a")
+    app.test_client().get(f"/api/updates?agent={n128}")
+    assert _lines(owned_tmp / "a")[0]["named"] == [n128]
+    app = _make_app(owned_tmp / "b")
+    app.test_client().get(f"/api/updates?agent={n129}")
+    rec = _lines(owned_tmp / "b")[0]
+    assert rec["named"] == ["<too-long> len=129"]
+    assert n129.encode() not in _bytes(owned_tmp / "b")
+
+
+def test_c3_a_3mb_body_name_and_a_60kb_query_name_leave_short_lines(owned_tmp):
+    (owned_tmp / "a").mkdir()
+    (owned_tmp / "b").mkdir()
+    app = _make_app(owned_tmp / "a")
+    big = "z" * (3 * 1024 * 1024)
+    app.test_client().post("/api/post", json=dict(POST_BODY, agent=big))
+    (rec,) = _lines(owned_tmp / "a")
+    assert rec["named"] == [f"<too-long> len={len(big)}"]
+    assert len(_bytes(owned_tmp / "a")) < 1024
+    app = _make_app(owned_tmp / "b")
+    app.test_client().get("/api/updates?agent=" + "y" * 60000)
+    (rec,) = _lines(owned_tmp / "b")
+    assert rec["named"] == ["<too-long> len=60000"]
+    assert len(_bytes(owned_tmp / "b")) < 1024
+
+
+# C4: the report is appended to, never truncated -------------------------------
+def test_c4a_a_recreated_app_on_the_same_path_appends(owned_tmp):
+    app = _make_app(owned_tmp)
+    app.test_client().get("/api/updates?agent=alice")
+    first = _bytes(owned_tmp)
+    assert first.count(b"\n") == 1
+    app2 = _make_app(owned_tmp)
+    app2.test_client().get("/api/updates?agent=bob")
+    data = _bytes(owned_tmp)
+    assert data.startswith(first) and data.count(b"\n") == 2
+    assert [r["named"] for r in _lines(owned_tmp)] == [["alice"], ["bob"]]
+
+
+def test_c4b_two_instances_on_one_path_and_an_external_truncate_leave_no_hole(owned_tmp):
+    p = _report_path(owned_tmp)
+    r1, r2 = server_mod._AuthReport(p), server_mod._AuthReport(p)
+    r1.record({"tag": "A"})
+    r2.record({"tag": "B"})
+    assert [json.loads(ln)["tag"] for ln in p.read_bytes().splitlines()] == ["A", "B"]
+    os.truncate(p, 0)
+    r1.record({"tag": "C"})
+    r2.record({"tag": "D"})
+    data = p.read_bytes()
+    assert b"\x00" not in data
+    assert [json.loads(ln)["tag"] for ln in data.splitlines()] == ["C", "D"]
+    assert r1.failures == 0 and r2.failures == 0
+
+
+# C5: no symlink, and a removed file is a failure ------------------------------
+@pytest.mark.parametrize("kind", ["to-a-file", "dangling"])
+def test_c5a_a_symlink_report_path_exits_78_at_startup(tmp_path, monkeypatch, capsys, kind):
+    target = tmp_path / "real.jsonl"
+    if kind == "to-a-file":
+        target.write_bytes(b"")
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(target)
+    booted, ran = _argv(tmp_path, monkeypatch, [
+        "--auth-mode", "report", "--auth-report", str(link), "--auth-report-until", _ts_until(1)])
+    with pytest.raises(SystemExit) as ei:
+        server_mod.main()
+    assert ei.value.code == 78 and ran == [] and booted == []
+    err = capsys.readouterr().err
+    assert len([ln for ln in err.splitlines() if ln.strip()]) == 1, err
+    assert "--auth-report" in err
+    assert (target.stat().st_size == 0) if kind == "to-a-file" else (not target.exists())
+
+
+def test_c5b_a_report_file_removed_after_start_counts_every_record_as_a_failure(
+        owned_tmp, capsys):
+    app = _make_app(owned_tmp)
+    c = app.test_client()
+    assert c.get("/api/updates?agent=alice").status_code == 200
+    _report_path(owned_tmp).unlink()
+    for _ in range(3):
+        assert c.get("/api/updates?agent=alice").status_code == 200     # still proceeds
+    h = c.get("/health").get_json()
+    assert h["auth_report_failures"] == 3
+    err = capsys.readouterr().err
+    assert len([ln for ln in err.splitlines() if "auth report" in ln]) == 1, err
+    assert not _report_path(owned_tmp).exists()
+
+
+# C6: a malformed name under a valid token is `mismatch` by a fixed rule --------
+@pytest.mark.parametrize("token_agent,bad,n", [("5", 5, 1), ("alice", None, 4), ("a", ["a"], 3)],
+                         ids=["int-equal-to-agent", "null", "list-equal-to-agent"])
+def test_c6_malformed_name_under_a_valid_token_is_mismatch_by_a_fixed_rule(
+        owned_tmp, token_agent, bad, n):
+    app = _make_app(owned_tmp)
+    tok = _issue(app, token_agent)
+    r = _post(app.test_client(), body=dict(POST_BODY, agent=bad), headers=_auth(tok))
+    assert r.status_code == 422, (r.status_code, r.get_data(as_text=True))
+    (rec,) = _lines(owned_tmp)
+    assert (rec["verdict"], rec["outcome"], rec["token_agent"]) == ("mismatch", 422, token_agent)
+    assert rec["named"] == [invalid_name(n)]
+
+
+# C7: the installer validates --auth-report-until -------------------------------
+def _install_until(tmp, until):
+    return _install(tmp, ["--auth-mode", "report", "--auth-report", "/srv/forum/auth-report.jsonl",
+                          "--auth-report-until", until])
+
+
+@pytest.mark.parametrize("until", [
+    "2026-99-99T99:99:99Z", "2026-02-30T00:00:00Z", "2026-00-10T00:00:00Z", "2026-13-01T00:00:00Z",
+    "2026-11-00T00:00:00Z", "2026-11-16T24:00:00Z", "2026-11-16T00:60:00Z", "2026-11-16T00:00:60Z",
+], ids=["all-99", "feb-30", "month-0", "month-13", "day-0", "hour-24", "minute-60", "second-60"])
+def test_c7_installer_refuses_an_impossible_until_with_one_line_and_writes_nothing(owned_tmp, until):
+    r = _install_until(owned_tmp, until)
+    assert r.returncode != 0, r.stdout
+    lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
+    assert len(lines) == 1 and "--auth-report-until" in lines[0], r.stderr
+    assert "rendered unit begin" not in r.stdout
+    assert not (owned_tmp / "forum").exists()
+
+
+@pytest.mark.parametrize("hours", [73, 72 + 5 / 60, 24 * 365])
+def test_c7_installer_refuses_an_until_more_than_72_hours_ahead(owned_tmp, hours):
+    r = _install_until(owned_tmp, _ts_until(hours))
+    assert r.returncode != 0, r.stdout
+    lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
+    assert len(lines) == 1 and "--auth-report-until" in lines[0] and "72" in lines[0], r.stderr
+    assert "rendered unit begin" not in r.stdout
+    assert not (owned_tmp / "forum").exists()
+
+
+@pytest.mark.parametrize("hours", [1, 72])
+def test_c7_installer_accepts_one_hour_and_exactly_72_hours_ahead(owned_tmp, hours):
+    # The until is computed BEFORE the installer reads its clock, so "now + 72h" here is
+    # never later than the installer's own now + 72h: the exact boundary is accepted.
+    until = _ts_until(hours)
+    r = _install_until(owned_tmp, until)
+    assert r.returncode == 0, r.stderr
+    argv = _exec_start(r.stdout)
+    assert argv[argv.index("--auth-report-until") + 1] == until
