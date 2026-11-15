@@ -10,53 +10,120 @@ Usage:
     python3 tools/name_leak_warn.py --diff-file DIFF --roster-file ROSTER
     python3 tools/name_leak_warn.py --diff-file DIFF --roster-file ROSTER --format json
 
-Roster file format (newline-separated regex patterns, blank lines and #-comments ignored):
-    \\bAlice Example\\b
-    \\bagentname-nick\\b
-
-A FORMAT-2 roster line (``A<TAB>...`` / ``B<TAB>...``) is refused with exit 1:
-this consumer parses format 1 only, and compiling a class prefix as pattern
-text would silently stop matching once the secret is rotated to format 2.
+Roster format: both formats are read through the scanner's parser
+(``src/engram/tools/scan-leaks.py: parse_roster_text``), with format
+inference. Format 2 — one ``A<TAB><regex>`` (blocking) or ``B<TAB><regex>``
+(report-only) per line — keeps the class each line declares. Format 1 — plain
+regex lines, blank lines and #-comments ignored — is still accepted during the
+transition, and every pattern in it is class A (the legacy format's own
+meaning). A roster that mixes the two is refused. This tool has no roster
+parser of its own.
 
 Output (text, default):
     path/to/file.py:42:[pattern_index=0] + the offending line content
+A format-2 roster adds `` [class=A|B]`` immediately after the
+``[pattern_index=N]`` tag; a format-1 roster's text output carries no tag and
+is unchanged.
 
 Output (JSON, --format json):
-    {"matches": [{"file": "...", "line_number": 42, "pattern_index": 0, "line": "..."}]}
+    {"matches": [{"file": "...", "line_number": 42, "pattern_index": 0,
+                  "class": "A"|"B", "line": "..."}]}
 
 Exit codes:
     0 — scan completed (matches found or not — this is warn-only)
-    1 — usage/IO error (bad arguments, unreadable file, invalid roster pattern),
-        including a roster line in the unsupported FORMAT 2 grammar
+    1 — usage/IO error (bad arguments, unreadable file, invalid roster pattern)
 """
 
 import argparse
+import importlib.util
 import json
 import re
 import sys
 from pathlib import Path
 
+_SCANNER_MODULE_NAME = "_name_leak_warn_scanner"
+_PARSER = None
 
-def load_roster(roster_source: str | None, roster_file: str | None) -> list[re.Pattern]:
-    """Load newline-separated regex patterns from a string or file path.
+# The roster class letters, as the scanner defines them (``CLASS_A`` /
+# ``CLASS_B``). A blocks; B is counted and never blocks. This tool does not
+# import the scanner module at module level — it loads the parser by explicit
+# path (C1) — so the two letters it compares are named here.
+_CLASS_A = "A"
+_CLASS_B = "B"
 
-    Blank lines and lines starting with '#' are skipped.
-    Raises SystemExit(1) on a line that fails to compile (``re.error``,
-    ``OverflowError`` or ``RecursionError``). The error line names the roster line
-    by its raw 1-based number (blank and comment lines count) plus the exception
-    class and ``.pos`` (``unknown`` when absent); it never echoes the line's text or ``str(exc)``, because
-    the roster is the NAME_LEAK_ROSTER secret (real names), CI stderr can reach a
-    public log, and ``re.error.__str__`` embeds part of the pattern.
 
-    Returns empty list if the source is None or empty (skip-when-absent).
+def _load_parser():
+    """Locate and load the scanner's ``parse_roster_text`` by explicit path.
 
-    A roster in FORMAT 2 (a line whose class prefix is ``A<TAB>`` or
-    ``B<TAB>``) is REFUSED: this consumer parses the format-1 roster only, and
-    compiling a class prefix as pattern text would make the pattern silently
-    stop matching once the secret is rotated to format 2. It exits 1 with one
-    line naming the file and the reason; it never compiles such a line. (The
-    scanner's ``load_roster_file`` is the one format-2 parser; migrating this
-    consumer to it is a follow-up, not part of the refusal.)
+    Two candidates, in order:
+
+    1. a SIBLING ``scan-leaks.py`` — in the repo ``tools/scan-leaks.py`` is a
+       symlink to the real module and ``spec_from_file_location`` reads
+       through it; in CI the workflow extracts the base commit's scanner next
+       to this file;
+    2. the source-tree path, for a copy of this tool that sits outside
+       ``tools/``.
+
+    Never ``sys.path``: a name lookup could resolve an unrelated module. If no
+    candidate loads, exit 1 with ONE line naming what could not be found and no
+    traceback — this tool never falls back to its own parsing (C6).
+    """
+    global _PARSER
+    if _PARSER is not None:
+        return _PARSER
+    candidates = [
+        Path(__file__).with_name("scan-leaks.py"),
+        Path(__file__).resolve().parent.parent
+        / "src" / "engram" / "tools" / "scan-leaks.py",
+    ]
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                _SCANNER_MODULE_NAME, candidate
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            parser = module.parse_roster_text
+        except Exception as exc:
+            print(
+                f"name_leak_warn: error — could not load the roster parser "
+                f"from {candidate} ({type(exc).__name__})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        _PARSER = parser
+        return parser
+    print(
+        "name_leak_warn: error — could not locate the roster parser "
+        f"(scan-leaks.py) beside {candidates[0]} or at {candidates[1]}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def load_roster(
+    roster_source: str | None, roster_file: str | None
+) -> tuple[list[tuple[re.Pattern, str]], int]:
+    """Load roster entries from a string or a file path.
+
+    Both paths are parsed by the scanner's ``parse_roster_text`` — the ONE
+    implementation of the roster grammar (C1) — with format inference
+    (``require_classes=False``): a format-2 roster keeps the classes its lines
+    declare; a format-1 roster is class A throughout. A roster that mixes the
+    two is refused.
+
+    Returns ``(entries, roster_format)`` where each entry is
+    ``(compiled_pattern, class)``. Blank lines and ``#``-comment lines are
+    skipped; an empty or absent source returns ``([], ...)`` (the
+    skip-when-absent contract).
+
+    Exit 1 on an unreadable file or a roster line the parser refuses. The
+    parser's message names the 1-based line number, the exception class and,
+    for ``re.error``, the offset — never the line, the pattern or ``str(exc)``:
+    the roster is the NAME_LEAK_ROSTER secret (real names), CI stderr can reach
+    a public log, and ``re.error.__str__`` embeds part of the pattern.
     """
     if roster_file is not None:
         try:
@@ -67,53 +134,38 @@ def load_roster(roster_source: str | None, roster_file: str | None) -> list[re.P
     elif roster_source is not None:
         text = roster_source
     else:
-        return []
+        return [], 1
 
-    source_name = str(roster_file) if roster_file is not None else "roster source"
-    patterns = []
-    for lineno, raw_line in enumerate(text.splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        # FORMAT 2: fail closed instead of compiling the class prefix. The
-        # roster is a name list and this consumer is only ever handed it where
-        # a silent non-match would be invisible (a green warn step), so a
-        # format it cannot read must be loud. Never echo the line.
-        if line.startswith("A\t") or line.startswith("B\t"):
-            print(
-                f"name_leak_warn: {source_name} is roster format 2 (a line "
-                "starts with A<TAB> or B<TAB>); this consumer parses format 1 "
-                "only, so the class prefix would be compiled as pattern text "
-                "and silently stop matching. Refusing.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        try:
-            patterns.append(re.compile(line))
-        except (re.error, OverflowError, RecursionError) as exc:
-            # Class name, offset and line number only: the line and str(exc)
-            # can each embed part of the secret roster line (engram#4559).
-            # ``pos`` is absent on OverflowError/RecursionError and None on some
-            # re.error values: report ``unknown`` rather than ``None``.
-            pos = getattr(exc, "pos", None)
-            offset = pos if isinstance(pos, int) else "unknown"
-            print(
-                f"name_leak_warn: invalid pattern at roster line {lineno}: "
-                f"{type(exc).__name__} at offset {offset}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-    return patterns
+    parse_roster_text = _load_parser()
+    patterns, roster_format = parse_roster_text(
+        text,
+        require_classes=False,
+        program="name_leak_warn",
+        exit_code=1,
+    )
+    # Keep the pattern and its class; the scanner's label is not part of this
+    # tool's output contract.
+    return [(pattern, klass) for pattern, _label, klass in patterns], roster_format
 
 
-def scan_diff(diff_text: str, patterns: list[re.Pattern]) -> list[dict]:
+def scan_diff(
+    diff_text: str, entries: list[tuple[re.Pattern, str]]
+) -> list[dict]:
     """Scan added lines in a unified diff for pattern matches.
 
     Added lines start with '+' but NOT '+++' (which are diff headers).
     Tracks the current file path and line number in the new file.
 
-    Returns a list of match dicts with keys:
-        file, line_number, pattern_index, line
+    ``entries`` is the roster loader's ``(compiled_pattern, class)`` list. Each
+    match dict carries ``file``, ``line_number``, ``pattern_index``, ``line``
+    and ``class``.
+
+    ONE finding per added line, and the CLASS decides before the roster order
+    does: a line any class-A pattern matches reports ``A`` (class A blocks),
+    with ``pattern_index`` set to that class's FIRST matching pattern; only when
+    no class-A pattern matches is the first class-B pattern reported. Taking the
+    roster's first matching pattern regardless of class would turn a blocking
+    hit into an advisory one whenever the roster lists B first.
     """
     matches = []
     current_file = ""
@@ -144,15 +196,31 @@ def scan_diff(diff_text: str, patterns: list[re.Pattern]) -> list[dict]:
             # Added line — increment and check
             new_line_number += 1
             line_content = raw_line[1:]  # strip leading '+'
-            for idx, pattern in enumerate(patterns):
-                if pattern.search(line_content):
-                    matches.append({
-                        "file": current_file,
-                        "line_number": new_line_number,
-                        "pattern_index": idx,
-                        "line": line_content,
-                    })
-                    break  # one match per line is enough
+            # One match per line, and the class decides before the roster order
+            # does: class A blocks, so an earlier class-B pattern must never
+            # downgrade a line a class-A pattern matches (#4822 — the same
+            # fail-open #4816 fixed in the blocking scanner). The first
+            # matching class-A index wins; the first matching class-B index is
+            # the fallback for a line no class-A pattern matches.
+            first_a = None
+            first_b = None
+            for idx, (pattern, klass) in enumerate(entries):
+                if not pattern.search(line_content):
+                    continue
+                if klass == _CLASS_A:
+                    first_a = idx
+                    break
+                if first_b is None:
+                    first_b = idx
+            chosen_index = first_a if first_a is not None else first_b
+            if chosen_index is not None:
+                matches.append({
+                    "file": current_file,
+                    "line_number": new_line_number,
+                    "pattern_index": chosen_index,
+                    "line": line_content,
+                    "class": _CLASS_A if first_a is not None else _CLASS_B,
+                })
         elif raw_line.startswith(" ") or raw_line == "":
             # Context line — counts toward new-file line numbers
             new_line_number += 1
@@ -161,15 +229,22 @@ def scan_diff(diff_text: str, patterns: list[re.Pattern]) -> list[dict]:
     return matches
 
 
-def format_text(matches: list[dict]) -> str:
-    """Format matches as human-readable text."""
+def format_text(matches: list[dict], roster_format: int) -> str:
+    """Format matches as human-readable text.
+
+    A ``[class=...]`` tag is appended immediately after the
+    ``[pattern_index=N]`` tag ONLY when the detected roster format is 2, so a
+    format-1 roster's text output stays byte-identical to the pre-inference
+    form.
+    """
     if not matches:
         return ""
     lines = []
     for m in matches:
-        lines.append(
-            f"{m['file']}:{m['line_number']}:[pattern_index={m['pattern_index']}] {m['line']}"
-        )
+        tagged = f"{m['file']}:{m['line_number']}:[pattern_index={m['pattern_index']}]"
+        if roster_format == 2:
+            tagged += f" [class={m['class']}]"
+        lines.append(f"{tagged} {m['line']}")
     return "\n".join(lines)
 
 
@@ -211,8 +286,10 @@ def main():
         )
         sys.exit(1)
 
-    # Load roster
-    patterns = load_roster(roster_source=None, roster_file=args.roster_file)
+    # Load roster — both formats, through the scanner's parser.
+    entries, roster_format = load_roster(
+        roster_source=None, roster_file=args.roster_file
+    )
 
     # Load diff
     if args.diff_file is not None:
@@ -225,14 +302,14 @@ def main():
         diff_text = sys.stdin.read()
 
     # Scan
-    matches = scan_diff(diff_text, patterns)
+    matches = scan_diff(diff_text, entries)
 
     # Output
     if args.format == "json":
         print(format_json(matches))
     else:
         if matches:
-            print(format_text(matches))
+            print(format_text(matches, roster_format))
 
     # Always exit 0 on scan completion (warn-only)
     sys.exit(0)
