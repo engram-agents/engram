@@ -12,8 +12,12 @@ ONE function, two entry modes, one verification:
   store step, the same verification, the same rollback and the same single
   debt-clearer as compute mode.
 
-The caller owns the transaction: this module never commits and never opens a
-transaction of its own. It uses a SAVEPOINT, so it nests inside the caller's.
+The CALLER must hold an open write transaction before calling (the owner opens
+BEGIN IMMEDIATE first); the checks and the write are atomic only under that
+lock. The module never issues BEGIN or COMMIT itself and uses a SAVEPOINT, which
+nests inside the caller's transaction. With no open caller transaction the
+SAVEPOINT is outermost and its RELEASE commits, so a later rollback does not
+undo the publish; that is a violated precondition, not a feature.
 
 HOUSE RULES (mirror engram_core.py § HOUSE RULES):
 - Access shared state ONLY via ``import engram_core as core; core.NAME`` — never
@@ -37,6 +41,8 @@ EMBED_NORMALISATION = "model-default"
 # The embedder calls model.encode(text, convert_to_numpy=True) with NO
 # normalize_embeddings argument (engram_core, EmbeddingManager.embed). The token
 # names that call. If that call changes, this token MUST change with it.
+
+_FLOAT32_MAX = 3.4028234663852886e38  # largest finite float32
 
 _EMBEDDING_REFRESH_PENDING = "embedding_refresh_pending"
 _SAVEPOINT = "recall_summary_vector_refresh"
@@ -142,7 +148,14 @@ def _valid_vector(vector) -> bool:
     for item in vector:
         if isinstance(item, bool) or not isinstance(item, (int, float)):
             return False
-        if not math.isfinite(item):
+        try:
+            finite = math.isfinite(item)
+        except OverflowError:  # an int too large to convert to float
+            return False
+        # Explicit magnitude bound on the float value (not a bytes round trip):
+        # a finite float64 beyond the float32 range would serialize to infinity.
+        # Underflow (e.g. 1e-320) goes to 0.0, which is finite, so it is accepted.
+        if not finite or abs(item) > _FLOAT32_MAX:
             return False
     return True
 
@@ -228,7 +241,14 @@ def publish_embedding(conn, node_id: str, *,
                       prepared: Optional[PreparedVector] = None) -> PublishResult:
     """Publish one node's embedding, strictly; see the module docstring.
 
-    Does not commit and does not open a transaction: the caller owns it.
+    Precondition: the caller holds an open write transaction (BEGIN IMMEDIATE);
+    the checks and the write are atomic only under that lock. This function
+    issues no BEGIN or COMMIT; it uses a SAVEPOINT that nests in the caller's
+    transaction. With no open caller transaction the SAVEPOINT is outermost and
+    RELEASE commits.
+
+    ``prepared`` must be a ``PreparedVector``; wire-shape validation of
+    untrusted input belongs to the caller (the owner op), not to this function.
     """
     expected_vector = None
     if prepared is not None:
