@@ -1,9 +1,8 @@
 # Gate-machinery owners: the workflows, this file itself, and the merge policy.
-# GitHub requires an approval from a listed owner before a PR touching them can
-# merge, but only once require_code_owner_review is enabled on the
-# dev-require-PR-approval ruleset. Not inert until then, though: GitHub
-# requests these owners as reviewers on any non-draft PR touching these paths,
-# and only the APPROVAL requirement waits for the flip.
+# GitHub requests these owners as reviewers on any non-draft PR touching these
+# paths, and an approval from a listed owner is now required before such a PR
+# can merge: require_code_owner_review was enabled on the
+# dev-require-PR-approval ruleset on 2026-11-15.
 
 /.github/                           @kepler-somnium @borges-funes
 /docs/internal/PR-MERGE-POLICY.md   @kepler-somnium @borges-funes

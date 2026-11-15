@@ -23,11 +23,12 @@ none hardcodes a SQL literal —
     `_trace_observation_leaves` and #2013's full-ancestor-set primitive)
     reads its own `_CASCADE_RELATIONS_SORTED`, derived from
     `core.CASCADE_RELATIONS`.
-  - All three cascade-relevant queries in `engram_revision.py`
-    (`_walk_cascade_downstream` itself, plus the "direct dependents"
-    queries in `_supersede_impl` and `_retract_impl` that seed it) share
-    one module-level `_CASCADE_RELATIONS_SORTED = sorted(core.CASCADE_RELATIONS)`
-    (that file's line 51), added by commit `4431e89` (2026-08-26) —
+  - The downstream walk's queries (`_walk_cascade_downstream` itself, plus
+    the "direct dependents" first hop that seeds it, one helper
+    `_walk_cascade_from_root` since #4727) live in `engram_core.py` and read
+    its module-level `_CASCADE_RELATIONS_SORTED = sorted(CASCADE_RELATIONS)`.
+    Before #4727 they lived in `engram_revision.py`, reading that module's
+    own copy of the same constant, added by commit `4431e89` (2026-08-26) —
     predating even this branch's base commit, so this was already true
     before `#2357` touched anything here.
 So the moment `acknowledged_derives_from` edges exist (once #2013 slice
@@ -51,7 +52,7 @@ viz_server.py, which reads it to choose solid-vs-dashed edge rendering in
 the graph visualiser.
 
 Nor does a cascade walk's termination depend on acyclicity. Each walker
-(e.g. `_walk_cascade_downstream` in engram_revision.py) carries its own
+(e.g. `_walk_cascade_downstream` in engram_core.py) carries its own
 `visited` set, checked BEFORE recursing, so a cycle in the underlying
 graph is visited once and then skipped — no hang, no RecursionError,
 regardless of acyclicity. And `temporal_causal`'s own init-time check
@@ -131,8 +132,9 @@ def test_cascade_implies_dag_check():
     consistency (module docstring above has the full, source-verified
     account — corrected in PR #2360 round 2 after an earlier draft here
     overstated it as still-pending groundwork). Every cascade-taint walker
-    (engram_core.py's `_walk_cascade_upstream`; engram_revision.py's
-    `_walk_cascade_downstream` and its two callers) already derives its
+    (engram_core.py's `_walk_cascade_upstream`, and its
+    `_walk_cascade_downstream` / `_walk_cascade_from_root`, whose callers are
+    in engram_revision.py) already derives its
     walked relations from `CASCADE_RELATIONS` at call time, not a
     hardcoded SQL literal, and each terminates via its own visited-set
     regardless of acyclicity — a cycle would be re-visited once and

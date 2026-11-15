@@ -17,6 +17,9 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- Internal, no behaviour change: the cascade walk from a retracted or superseded node is one helper,
+  `engram_core._walk_cascade_from_root` (with `_walk_cascade_downstream`, moved from `engram_revision`),
+  used by all four places that walked it, so a later migration can run the same walk. (#4727)
 - A lost `config.json` is no longer regenerated. When `knowledge.db` exists and `config.json` does not, ENGRAM now refuses instead of writing a default (a blank `self_lineage` silently turned the model-family gate off): a seat whose `config.json` is lost cannot open its memory or run the installer until the file is restored from a backup the user chooses. The refusal lists the backups, and a new `write-default-config.py` command writes the default for a genuinely new seat. The command needs the user's confirmation flag, and refusal messages do not print it. A fresh install, and a bootstrap, are unchanged. (#4705)
 - A refused in-place rewrite now reports which state the file is in as data (`WriteRefused.outcome`:
   `nothing_written`, `restored` or `may_be_incomplete`), and `set_forum_url.py` and the installer's
@@ -131,6 +134,7 @@ with an `-alpha` suffix during the alpha phase.
   fails once rather than retrying. With no usable venv it refuses with one line on
   stderr and exit 3, before doing any work. (#4642)
 - A prediction node with no stored summary showed a blank Tier-1 line in `engram_query` results, because the fallback read only `claim`, which a prediction leaves empty. It now shows the predicted event, cut at 160 characters like a claim. (#2328)
+- `engram_query_pattern` showed a blank summary for a prediction node in the `stale_load_bearing` and `tainted_still_valid` patterns, because both read only `claim`, which a prediction leaves empty. They now show the predicted event, cut at 160 characters like a claim. (#4793)
 - The pipe-exit-warn hook's success-echo check is now case-insensitive and also recognises `passed`, so `| tail && echo DONE` and `echo PASSED` are caught like their lowercase forms (engram#2119).
 - `scan-leaks` no longer prints a bad entry from the local name roster. A roster
   entry that is malformed or has a regex that does not compile is now reported

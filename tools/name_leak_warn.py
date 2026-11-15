@@ -14,6 +14,10 @@ Roster file format (newline-separated regex patterns, blank lines and #-comments
     \\bAlice Example\\b
     \\bagentname-nick\\b
 
+A FORMAT-2 roster line (``A<TAB>...`` / ``B<TAB>...``) is refused with exit 1:
+this consumer parses format 1 only, and compiling a class prefix as pattern
+text would silently stop matching once the secret is rotated to format 2.
+
 Output (text, default):
     path/to/file.py:42:[pattern_index=0] + the offending line content
 
@@ -22,7 +26,8 @@ Output (JSON, --format json):
 
 Exit codes:
     0 — scan completed (matches found or not — this is warn-only)
-    1 — usage/IO error (bad arguments, unreadable file, invalid roster pattern)
+    1 — usage/IO error (bad arguments, unreadable file, invalid roster pattern),
+        including a roster line in the unsupported FORMAT 2 grammar
 """
 
 import argparse
@@ -44,6 +49,14 @@ def load_roster(roster_source: str | None, roster_file: str | None) -> list[re.P
     public log, and ``re.error.__str__`` embeds part of the pattern.
 
     Returns empty list if the source is None or empty (skip-when-absent).
+
+    A roster in FORMAT 2 (a line whose class prefix is ``A<TAB>`` or
+    ``B<TAB>``) is REFUSED: this consumer parses the format-1 roster only, and
+    compiling a class prefix as pattern text would make the pattern silently
+    stop matching once the secret is rotated to format 2. It exits 1 with one
+    line naming the file and the reason; it never compiles such a line. (The
+    scanner's ``load_roster_file`` is the one format-2 parser; migrating this
+    consumer to it is a follow-up, not part of the refusal.)
     """
     if roster_file is not None:
         try:
@@ -56,11 +69,25 @@ def load_roster(roster_source: str | None, roster_file: str | None) -> list[re.P
     else:
         return []
 
+    source_name = str(roster_file) if roster_file is not None else "roster source"
     patterns = []
     for lineno, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        # FORMAT 2: fail closed instead of compiling the class prefix. The
+        # roster is a name list and this consumer is only ever handed it where
+        # a silent non-match would be invisible (a green warn step), so a
+        # format it cannot read must be loud. Never echo the line.
+        if line.startswith("A\t") or line.startswith("B\t"):
+            print(
+                f"name_leak_warn: {source_name} is roster format 2 (a line "
+                "starts with A<TAB> or B<TAB>); this consumer parses format 1 "
+                "only, so the class prefix would be compiled as pattern text "
+                "and silently stop matching. Refusing.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         try:
             patterns.append(re.compile(line))
         except (re.error, OverflowError, RecursionError) as exc:

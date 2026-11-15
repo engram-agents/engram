@@ -167,7 +167,10 @@ ALLOW_LIST: dict = {
     ('engram_revision.py', '_cascade_record_acknowledgement_edges'): (1, 'existence check before writing one acknowledgement edge; the cycle checks on that write go through dag_edge_set'),
     ('engram_revision.py', '_detect_zero_support'): (1, 'one-hop live-support recount for a cornerstone or lesson; not a walk'),
     ('engram_revision.py', '_retract_impl'): (4, _P),
-    ('engram_revision.py', '_supersede_impl'): (5, _P),
+    # #4727: 5 -> 2. The cascade hop moved to engram_core._walk_cascade_from_root,
+    # so this function no longer names a DAG constant, and its three K2-only
+    # sites (raw reads of other relations, flagged only by that co-occurrence) left.
+    ('engram_revision.py', '_supersede_impl'): (2, _P),
     ('engram_stats.py', '_diagnose_impl'): (9, 'diagnose metric counts (orphans, degree, uncited); the DAG audit in this function is check_dag_conformance, routed through dag_edge_set'),
     ('engram_trust.py', '_update_person_impl'): (1, 'one-hop listing of nodes that cite a person (about/cites/derives_from); not a walk'),
     ('health/engine.py', '_activity_diagnostics'): (1, 'activity count of supersedes edges since a cutoff; not a walk or judge'),
@@ -187,7 +190,7 @@ ALLOW_LIST: dict = {
 }
 
 # The ratchet: total sites the allow-list may excuse. Lower, never raise.
-_MAX_ALLOWED_SITES = 80
+_MAX_ALLOWED_SITES = 77
 
 
 # --------------------------------------------------------------------------
