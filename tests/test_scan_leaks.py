@@ -2069,19 +2069,23 @@ def test_r5_item2b_walk_fallback_scans_a_directory_symlink_home_text(tmp_path):
     """Cell: a directory symlink whose link text is an absolute home path.
 
     Pre-fix: the walk never enumerates it, so the host path sits in the
-    published link text and the run exits 0 `clean` (scanned 1, not 2).
-    Post-fix: both passes scan the link text and the finding is at the link's
-    own path.  A descended link would inflate the scanned count instead.
+    published link text and the run exits 0 `clean`.  Post-fix: the HOME pass
+    scans the link text and reports the finding at the link's own path; the
+    home-pass assertion below keeps this cell independent of the accounting
+    pass, and a descended link would show findings under `dir-link/` instead.
     """
     home = _home_target_dir()
     root = tmp_path / "walk-home"
     _non_git_tree_with_dir_link(root, str(home))
 
+    findings, unreadable = _mod.scan_home_paths(root, use_git=False)
+    assert [rel for rel, _, _ in findings] == ["dir-link"], findings
+    assert unreadable == [], unreadable
+
     r = _run_scan(root)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "dir-link:1" in r.stderr, r.stderr
     assert "absolute home path" in r.stderr, r.stderr
-    assert _summary(r.stdout) == (2, 0), r.stdout
 
 
 # U+2028 is a line break to str.splitlines() (as is the C1 U+0085, written
