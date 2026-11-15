@@ -897,6 +897,69 @@ def test_t12_both_scan_steps_extract_the_scanner_from_src():
     )
 
 
+def test_t_new_a_format2_pattern_count_is_the_observed_total(gate_repo, tmp_path):
+    """T-new-a (control for T-new-b): a correct schema-2 attestation succeeds,
+    and the emitted `pattern_count` is the OBSERVED total — the number this
+    cell computes from its own fixture, not one copied from the attestation."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = (
+        "A\t\\bZZAlphaHolder\\b\n"
+        "A\t\\bWWCharlieBadge\\b\n"
+        "B\t\\bYYBravoHandle\\b\n"
+    )
+    observed_total = 3  # three content lines: two class A, one class B
+    _write_gate_attestation(
+        work,
+        roster_format=2,
+        a=2,
+        b=1,
+        sha=hashlib.sha256(roster.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc == 0, out
+    assert "name-leak gate: success" in out, out
+    assert _gate_output(tmp_path, "pattern_count") == str(observed_total)
+
+
+def test_t_new_b_format2_count_mismatch_warns_and_verdict_holds(
+    gate_repo, tmp_path
+):
+    """T-new-b: with `pattern_count_b` off by one and the sha256 still
+    matching, the gate WARNS naming the attested and observed class-B counts,
+    keeps its conclusion, and emits the OBSERVED total.
+
+    Red before the fix: `pattern_count` was taken from the attestation, so the
+    warning compared the attestation's own number with itself and could never
+    fire, and the emitted count was the attested 2 rather than the observed 3.
+    """
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = (
+        "A\t\\bZZAlphaHolder\\b\n"
+        "A\t\\bWWCharlieBadge\\b\n"
+        "B\t\\bYYBravoHandle\\b\n"
+    )
+    observed_total = 3
+    _write_gate_attestation(
+        work,
+        roster_format=2,
+        a=2,
+        b=0,
+        sha=hashlib.sha256(roster.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc == 0, out
+    # A count mismatch is a warning, not a failure: the conclusion is unchanged.
+    assert "name-leak gate: success" in out, out
+    # The warning names BOTH numbers and the class, and only on the hash-matched
+    # path (the #4600 guard, preserved).
+    assert "records 0 class-B" in out, out
+    assert "the roster has 1" in out, out
+    assert _COUNT_WARNING in out, out
+    assert _gate_output(tmp_path, "pattern_count") == str(observed_total), (
+        "pattern_count must be the observed total, not the attested one"
+    )
+
+
 # ── the count-mismatch warning (#4600) ───────────────────────────────────────
 #
 # Contract: the "attestation records N pattern(s) but the roster has M" warning

@@ -936,6 +936,39 @@ def test_workflow_no_principal_marker_degrades_to_non_comment_only(monkeypatch):
     )
 
 
+def test_pr_checks_roster_comment_names_both_formats():
+    """The comment above the roster-check step must state BOTH roster formats.
+
+    Format 2 (``A<TAB>`` blocks, ``B<TAB>`` counted) is what the rotation makes
+    live; format 1 is the legacy plain-regex form. A comment true of one format
+    and false of the other is how the next reader concludes the opposite of the
+    truth, so the cell requires both halves in the SAME comment block. The block
+    is located by its format-2 token, not by its first line, so rewording the
+    opening line does not make the check vacuous."""
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in WORKFLOW_PATH.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            current.append(stripped)
+        elif current:
+            blocks.append("\n".join(current))
+            current = []
+    if current:
+        blocks.append("\n".join(current))
+
+    format2_blocks = [block for block in blocks if "A<TAB>" in block]
+    assert len(format2_blocks) == 1, (
+        "expected exactly one comment block naming the format-2 `A<TAB>` "
+        f"grammar; found {len(format2_blocks)}"
+    )
+    block = format2_blocks[0]
+    assert "legacy" in block.lower() or "format 1" in block.lower(), (
+        "the roster-format comment must name format 2 AND the legacy format 1; "
+        f"got {block!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 9: workflow hygiene — pr-checks.yml (hosts the name-leak-warn job)
 # ---------------------------------------------------------------------------

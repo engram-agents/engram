@@ -170,14 +170,25 @@ jobs:
           # `Z<TAB>x` is simply a non-prefixed line and fails the mixed check.
           content_lines = 0
           prefixed_lines = 0
+          a_prefixed = 0
+          b_prefixed = 0
           first_unprefixed = None
           for lineno, line in enumerate(canonical.splitlines(), start=1):
               stripped = line.strip()
               if not stripped or stripped.startswith("#"):
                   continue
               content_lines += 1
-              if stripped.startswith("A\t") or stripped.startswith("B\t"):
+              # SHAPE counting, not class parsing: the same `A<TAB>`/`B<TAB>`
+              # prefix test the format observation uses. The grammar still has
+              # one implementation, in the scanner (C1). These counts exist so
+              # `pattern_count` and the count warning read OBSERVED numbers,
+              # never the attestation's own.
+              if stripped.startswith("A\t"):
                   prefixed_lines += 1
+                  a_prefixed += 1
+              elif stripped.startswith("B\t"):
+                  prefixed_lines += 1
+                  b_prefixed += 1
               elif first_unprefixed is None:
                   first_unprefixed = lineno
           if content_lines == 0:
@@ -254,6 +265,8 @@ jobs:
           attested_format = None
           schema_ok = False
           attested_sha = None
+          count_a = None
+          count_b = None
           try:
               with open(os.environ["ATTESTATION_PATH"], encoding="utf-8") as fh:
                   attestation = json.load(fh)
@@ -321,12 +334,14 @@ jobs:
                   attestation_present = True
                   attestation_matches = attested_sha == actual_sha
 
-          # `pattern_count` keeps its output name (the scan steps echo it):
-          # format 1 is the observed content-line count, format 2 is the
-          # attested `a + b`.
+          # `pattern_count` keeps its output name (the scan steps echo it) and
+          # is OBSERVED, never attested: the content-line count for format 1,
+          # and the observed per-class sum for format 2. Reading it from the
+          # attestation would make the count-mismatch warning below compare the
+          # attestation with itself, so that control could never fire.
           pattern_count = (
-              attested_count
-              if observed_format == 2 and schema_ok and attested_format == 2
+              a_prefixed + b_prefixed
+              if observed_format == 2
               else content_lines
           )
 
@@ -470,16 +485,30 @@ jobs:
 
           # Only when the hash matched: the text below says "still matched", so
           # on a mismatch it would contradict the verdict (#4600).
-          if (
-              roster_present
-              and attestation_present
-              and attestation_matches
-              and attested_count != pattern_count
-          ):
-              print(
-                  f"::warning::the attestation records {attested_count} pattern(s) "
-                  f"but the roster has {pattern_count}; the sha256 still matched"
-              )
+          if roster_present and attestation_present and attestation_matches:
+              if observed_format == 2:
+                  # Per-class: the OBSERVED count against the attested count for
+                  # the SAME class. A total-only comparison could not see an
+                  # error in one class that another class compensates, and
+                  # reading the total from the attestation would compare the
+                  # attestation with itself, so the warning could never fire.
+                  if a_prefixed != count_a:
+                      print(
+                          f"::warning::the attestation records {count_a} class-A "
+                          f"pattern(s) but the roster has {a_prefixed}; the "
+                          "sha256 still matched"
+                      )
+                  if b_prefixed != count_b:
+                      print(
+                          f"::warning::the attestation records {count_b} class-B "
+                          f"pattern(s) but the roster has {b_prefixed}; the "
+                          "sha256 still matched"
+                      )
+              elif attested_count != pattern_count:
+                  print(
+                      f"::warning::the attestation records {attested_count} pattern(s) "
+                      f"but the roster has {pattern_count}; the sha256 still matched"
+                  )
 
           print(
               f"name-leak gate: {outcome.conclusion} — {outcome.reason} "
