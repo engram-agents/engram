@@ -278,15 +278,15 @@ after peer review**, and since 2026-10-22 the **project owner presses their own
 converged PR** under the policy's written *Owner merge* gate (Lei, in session: the
 colleague's recorded run on the exact head is the test gate; the owner's scratch
 merge on the current base and the base-SHA assertion stay; CI is the floor).
-**A merge seat, not the owner, presses for a seat with no standing merge
-grant from its user, and every security PR.** This gate is
+**A merge seat presses for a seat with no standing merge grant from its user.
+A security PR is pressed by the security seat that approved it (after a second
+security read if that seat wrote it), else by a merge seat.** This gate is
 **engram-only** — other repos (umwelt, soma) carry their own delegated
 authority. During an explicit Lei-absence day-grant, a settled substrate PR may
 be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
 
-This is a pointer, not the policy. The single source of truth — the full rule,
-the substrate/non-substrate discriminator, per-project scope, the day-grant
-carve-out, examples, gray-area calls, and the baton turn-target corollary — lives
+This is a pointer, not the policy. The single source of truth (the full rule,
+its scope, examples and gray-area calls) lives
 in **[`docs/internal/PR-MERGE-POLICY.md`](docs/internal/PR-MERGE-POLICY.md)**. Read it there.
 
 ## PR merge-readiness — CI-green gate
