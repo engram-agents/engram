@@ -1529,3 +1529,89 @@ def test_d20_a_status_failure_on_the_resolve_path_with_no_audit_row_names_them_t
     live_exec(h2, *retract_sql(None))
     hit2 = _hits(drill(h2, tmp_path / "s2"), "column status", "no audit record")
     assert hit2 and "_backfill_resolved_by" not in hit2[0]
+
+
+# ---------------------------------------------------------------- D21 cells for mutants a colleague's run left alive
+
+def test_d21_r17_the_capture_stamp_is_read_before_the_backup_not_after(home, monkeypatch):
+    """The stamp must never post-date the data it stamps: the clock is read BEFORE the hot backup. Observed through
+    the first step that runs on the backup copy (_derived_drop_plan), with a clock that ticks on every read."""
+    bk = rd.engram_backup
+    ticks = iter(range(1, 100))
+    events = []
+
+    def clock(epoch=None):
+        events.append("clock")
+        return f"2026-06-01T00:00:{next(ticks):02d}.000000Z"
+
+    real_plan = bk._derived_drop_plan
+
+    def plan(conn):
+        events.append("backup-copy-in-use")
+        return real_plan(conn)
+    monkeypatch.setattr(bk, "format_dump_time", clock)
+    monkeypatch.setattr(bk, "_derived_drop_plan", plan)
+    stats = bk.dump_stripped(str(home / "knowledge.db"), str(home / "again.sql"))
+    assert events[:2] == ["clock", "backup-copy-in-use"], events
+    assert stats["dumped_at"] == "2026-06-01T00:00:01.000000Z"  # the first reading, not a later one
+
+
+def test_d21_r4_a_resolved_by_move_between_values_needs_a_resolution_status_live(tmp_path):
+    h = make_home(tmp_path, "h")
+    _dump_with(h, "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'")
+    live_exec(h, "UPDATE nodes SET status='active', resolved_by='ob_0003' WHERE id='ob_0001'")
+    _edit(h, "resolution_recomputed", "ob_0001", T_AFTER)  # a row after the dump, but the pair is not a transition
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 1
+    assert lc(rep, "resolved_by")["failed_transition"] == 1
+    assert _hits(rep, "column resolved_by", "value -> other value")
+
+
+def _status_move(tmp_path, name, dump_sql, live_sql, action):
+    h = make_home(tmp_path, name)
+    _dump_with(h, dump_sql)
+    live_exec(h, live_sql)
+    _edit(h, action, "ob_0001", T_AFTER)
+    return drill(h, tmp_path / (name + "-s"))
+
+
+def test_d21_r6_a_reopened_row_alone_explains_a_reopen(tmp_path):
+    rep = _status_move(tmp_path, "h", "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'",
+                       "UPDATE nodes SET status='open', resolved_by=NULL WHERE id='ob_0001'", "reopened")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "status")["passed"] == 1 and lc(rep, "resolved_by")["passed"] == 1
+
+
+def test_d21_r7_a_resolved_row_alone_explains_a_resolution(tmp_path):
+    rep = _status_move(tmp_path, "h", "UPDATE nodes SET status='open' WHERE id='ob_0001'",
+                       "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'", "resolved")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "status")["passed"] == 1 and lc(rep, "resolved_by")["passed"] == 1
+
+
+def test_d21_r1_an_audit_row_stamped_at_exactly_the_dump_time_explains_the_change(home, tmp_path):
+    mark_dump(home, T_DUMP)
+    live_exec(home, *retract_sql(None))
+    _edit(home, "retracted", "ob_0001", T_DUMP)  # the very instant of the marker
+    rep = drill(home, tmp_path / "s")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "status")["passed"] == 1 and rep.ambiguous_count == 0
+
+
+def _retracted_at_only(home, stamp):
+    """status and is_current agree between the restored and live copies: only metadata.retracted_at differs."""
+    mark_dump(home, T_DUMP)
+    live_exec(home, "UPDATE nodes SET metadata=? WHERE id='ob_0001'", (json.dumps({"retracted_at": stamp}),))
+
+
+def test_d21_r9_a_retracted_at_stamp_alone_passes_after_the_dump_and_fails_before_it(home, tmp_path):
+    _retracted_at_only(home, T_AFTER)
+    rep = drill(home, tmp_path / "s1")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "metadata.retracted_at")["passed"] == 1
+    h2 = make_home(tmp_path, "h2")
+    _retracted_at_only(h2, T_BEFORE)
+    rep2 = drill(h2, tmp_path / "s2")
+    assert rep2.exit_code == 1
+    assert lc(rep2, "metadata.retracted_at")["failed_before_dump"] == 1
+    assert _hits(rep2, "ob_0001", "column metadata.retracted_at", "before the dump time")
