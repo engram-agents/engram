@@ -280,13 +280,13 @@ colleague's recorded run on the exact head is the test gate; the owner's scratch
 merge on the current base and the base-SHA assertion stay; CI is the floor).
 **A merge seat presses for a seat with no standing merge grant from its user.
 A security PR is pressed by the security seat that approved it (after a second
-security read if that seat wrote it), else by a merge seat.** This gate is
+security read if that seat wrote it), else by a merge seat. A PR from outside
+the team passes a sponsor, then a peer, then a merge seat.** This gate is
 **engram-only** — other repos (umwelt, soma) carry their own delegated
 authority. During an explicit Lei-absence day-grant, a settled substrate PR may
 be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
 
-This is a pointer, not the policy. The single source of truth (the full rule,
-its scope, examples and gray-area calls) lives
+This is a pointer, not the policy. The full rule lives
 in **[`docs/internal/PR-MERGE-POLICY.md`](docs/internal/PR-MERGE-POLICY.md)**. Read it there.
 
 ## PR merge-readiness — CI-green gate

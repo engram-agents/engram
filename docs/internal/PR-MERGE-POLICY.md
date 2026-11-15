@@ -236,23 +236,30 @@ mechanism, not luck:
   chore for a merge seat. A security PR **written by the security
   seat** gets a **second security read** from the **secondary security seat**
   before its author merges it: the author is never their own security reviewer.
-  The secondary security seat is Ariadne (Lei, the same morning, relayed by
-  Ariadne). Borges, or Kepler when his seat is cleared for security work, are
-  fallbacks, addressed only after the secondary seat says it cannot read. The
+  The secondary security seat is Ariadne (Lei, 2026-11-15). A merge seat cleared
+  for security work is the fallback, addressed only after the secondary seat says
+  it cannot read. The
   seat changes hands as a hand-over, not a share: a read in progress stays with
   the seat that began it until that PR merges, unless that seat hands it off in
   writing; every new read goes to the current seat. The two 2026-09-09
   directions stay available: a merge seat may still press a security PR on the
-  security seat's exact-head approval.
+  security seat's exact-head approval. For a PR the security seat wrote, that
+  approval is the secondary security seat's: nobody presses it, the author
+  included, without that second read on the exact head.
   **Pull requests from outside the team (Lei, 2026-11-15).** Nothing above changes
   for a PR written by one of the team's own seats. A PR from anyone else is treated
   as suspicious by default and passes two rounds before a merge seat sees it.
   **Round one, a sponsor:** one seat takes the PR as if it were its author: its own
-  whole read, a reviewer-fairy round or both, and as many exchanges with the
-  submitter as it takes to converge; it then writes its approval opinion on the PR.
+  whole read, and as many exchanges with the submitter as it takes to converge; it
+  then writes its approval opinion on the PR. The sponsor stands where an author
+  stands: its opinion is a written comment, not an approving review, and it does
+  not push to the PR; every change comes from the submitter.
   **Round two, a peer:** begins only after that opinion, and takes any change it
-  needs to the submitter directly. **Then a merge seat**, under the gates of this
-  document; an outside PR is never merged on the owner-merge path. Sponsor, peer
+  needs to the submitter directly; the approving review is the peer's. **Then a
+  merge seat**, under the gates of this document; an outside PR is never merged on
+  the owner-merge path, and the security rules above apply to it unchanged: an
+  outside security PR also carries the security seat's exact-head approval, and
+  the press is still a merge seat's. Sponsor, peer
   and merge seat are three different seats, and the sponsor's opinion covers
   everything that is merged: a commit added after it is read by the sponsor
   again before the merge seat acts. This paragraph
@@ -325,8 +332,7 @@ umwelt and soma, per *Scope* and *Who presses the button* above):
   once the record below is posted; the hand-off to a seat was clerical once the record
   existed, and the record is what any seat checks;
 - a seat with **no standing merge grant from its own user** (as of 2026-11-15: Aleph
-  and Clio, whose user has not granted it; Zephyr was on this list until Lei granted
-  it on 2026-11-15; for these seats a merge click is a destructive
+  and Clio, whose user has not granted it; for these seats a merge click is a destructive
   action outside this repo's delegation): that seat runs the gate and posts the
   record; a merge seat presses. Two questions are kept apart here. Whether the merge
   is **authorised** is for the seat's own table and its user. **Whose click** it is, is
