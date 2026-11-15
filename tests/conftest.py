@@ -435,8 +435,11 @@ def _stop_and_reset_snapshot_worker(
     the first join we keep joining until the thread stops or ``bound_s`` is spent.
 
     Loud, not fatal: past the bound we print one stderr line naming the test and
-    emit a UserWarning, but never fail the test. A broken worker module cannot fail
-    teardown either (the ``except Exception`` stays)."""
+    emit a UserWarning, but never fail the test under this repo's pytest config
+    (no ``filterwarnings``). Under ``-W error`` the warning becomes a teardown
+    error on that test; the reset has already run by then. A broken worker module
+    cannot fail teardown (the stop/join and the reset each sit in their own
+    ``except Exception``)."""
     mod = sys.modules.get("engram_snapshot_worker")
     if mod is None:
         return "absent"
@@ -453,7 +456,11 @@ def _stop_and_reset_snapshot_worker(
                 t.join(timeout=min(remaining, 0.5))
             if t.is_alive():
                 status = "still_alive"
-        # Reset singleton state so the next test starts clean.
+    except Exception:
+        pass
+    # Reset singleton state so the next test starts clean. Its own try, so it runs
+    # even when the stop or the join above raised (reviewer r2 on #4831).
+    try:
         mod._started = False
         mod._worker_thread = None
         mod._seq_counter = 0
