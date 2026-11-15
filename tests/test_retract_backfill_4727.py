@@ -370,3 +370,43 @@ def test_cell10_refusal_carries_the_backfill_event_and_only_for_backfill(g):
     assert r2.get("status") == "blocked_tainted", r2
     item2 = next(p for p in r2["tainted_premises"] if p["id"] == D4)
     assert all("cascade_event" not in x for x in item2["retracted_by"]), item2
+
+
+# ---------------------------------------------------------------------------
+# Round-2 cells (reviewer r1): the failure path and the fresh-store guard
+# ---------------------------------------------------------------------------
+
+def test_cell11_a_fault_after_the_inserts_rolls_back_markers_and_version(g, monkeypatch, capsys):
+    """A DatabaseError raised after the backfill wrote its markers, before the version bump:
+    the rung must roll back BOTH (version stays at 10, no backfill marker survives), and the
+    next start must succeed."""
+    core = g["core"]
+    real = core._backfill_pre_machine_retract_markers
+
+    def boom(conn):
+        real(conn)
+        raise sqlite3.OperationalError("injected fault after the backfill inserts")
+
+    monkeypatch.setattr(core, "_backfill_pre_machine_retract_markers", boom)
+    capsys.readouterr()
+    assert _ladder(core) == RUNG - 1
+    assert "FAILED, will retry" in capsys.readouterr().err
+    assert _retract_marked(core, g["R"]) == {}, "a failed rung must leave no backfill marker"
+
+    monkeypatch.setattr(core, "_backfill_pre_machine_retract_markers", real)
+    assert _ladder(core) == RUNG
+    assert set(_retract_marked(core, g["R"])) == {g["D1"], g["D2"], g["A"]}
+
+
+def test_cell12_the_rung_runs_when_edit_history_does_not_exist_yet(g):
+    """On a fresh store the ladder runs before edit_history is created. Markers are still
+    written; only the per-root history row is skipped."""
+    core = g["core"]
+    c = _raw(core)
+    try:
+        c.execute("DROP TABLE edit_history")
+        c.commit()
+    finally:
+        c.close()
+    assert _ladder(core) == RUNG
+    assert set(_retract_marked(core, g["R"])) == {g["D1"], g["D2"], g["A"]}

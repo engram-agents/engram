@@ -836,10 +836,16 @@ def test_cell8_the_owner_schema_gate_refuses_a_store_still_at_8():
         with pytest.raises(eo.OwnerStoreBehindSchema):   # 9 is the NUL guard's rung, not ours
             eo._require_store_schema_current(db)
         c = sqlite3.connect(str(db))
+        c.execute("PRAGMA user_version = 10")
+        c.commit()
+        c.close()
+        with pytest.raises(eo.OwnerStoreBehindSchema):   # 10 is behind once #4727's rung 11 exists
+            eo._require_store_schema_current(db)
+        c = sqlite3.connect(str(db))
         c.execute(f"PRAGMA user_version = {engram_core.LATEST_SCHEMA_VERSION}")
         c.commit()
         c.close()
-        eo._require_store_schema_current(db)        # at the latest version it passes (10 until #4727's rung 11)
+        eo._require_store_schema_current(db)        # at the latest version it passes
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
