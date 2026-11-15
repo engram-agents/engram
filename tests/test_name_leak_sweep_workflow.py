@@ -61,6 +61,10 @@ Discrimination for the mutations the specs name:
 * R7: dropping the `finally` around the scan reddens
   `test_the_roster_file_is_removed_when_the_scan_raises` (the success path
   removes the file too, so the normal-run cell cannot see it).
+* #4752: making the sweep's `scan.returncode == 3` arm unreachable (e.g.
+  `== 99`) reddens `test_sweep_reports_exit_3_as_coverage_incomplete`; the
+  exit-1 hit cell and its positive control stay green, because they are
+  separate arms and the generic "did not run" message is a third.
 """
 
 from __future__ import annotations
@@ -125,6 +129,15 @@ _HIT_SCANNER = _with_capability(
     'print("scan-leaks: scanned 1, skipped-binary 0")\n'
     'print("doc.md:1", file=sys.stderr)\n'
     "sys.exit(1)\n"
+)
+# #4752: no findings, but the scan could not read every candidate (or had
+# none). Exit 3 is "coverage incomplete" — distinct from a hit (exit 1) and
+# from a scanner that did not run (no summary line). The sweep must fail and
+# say coverage was incomplete, never call it a leak and never tick.
+_COVERAGE_INCOMPLETE_SCANNER = _with_capability(
+    'print("scan-leaks: scanned 1, skipped-binary 0")\n'
+    'print("scan-leaks: unreadable 1 (coverage incomplete): locked.txt")\n'
+    "sys.exit(3)\n"
 )
 # The pre-#4780 scanner shape: present, runnable, but without `--roster-file`.
 _INCAPABLE_SCANNER = _with_capability(
@@ -1516,6 +1529,34 @@ def test_a_hit_does_not_tell_a_home_path_hit_to_edit_the_roster(
     assert proc.returncode != 0, out
     assert "a hit means" in out, out
     assert "do not widen or edit the roster" not in out, out
+
+
+# ── exit 3 is coverage incomplete: not a hit, and never a green tick ────────
+
+def test_sweep_reports_exit_3_as_coverage_incomplete(sweep_repo, tmp_path):
+    """No findings + exit 3 → the sweep fails and names coverage, not a leak.
+
+    The scanner read a valid, non-zero summary and found nothing, but it could
+    not read every candidate. A tick here would claim coverage the run did not
+    have, and the hit message would claim a leak it did not find.
+    """
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _COVERAGE_INCOMPLETE_SCANNER)
+    proc, out = _run_sweep(work, base, tmp_path)
+    assert proc.returncode != 0, out
+    assert "did not cover the whole tree (coverage incomplete)" in out, out
+    assert "a hit means" not in out, out
+
+
+def test_a_hit_is_not_reported_as_coverage_incomplete(sweep_repo, tmp_path):
+    """Positive control for the exit-3 arm: exit 1 still takes the hit message,
+    so the new branch did not swallow the neighbouring one."""
+    work, _base, g = sweep_repo
+    base = _commit_scanner(work, g, _HIT_SCANNER)
+    proc, out = _run_sweep(work, base, tmp_path)
+    assert proc.returncode != 0, out
+    assert "a hit means" in out, out
+    assert "did not cover the whole tree (coverage incomplete)" not in out, out
 
 
 # ── the decision's failure rows, executed ───────────────────────────────────
