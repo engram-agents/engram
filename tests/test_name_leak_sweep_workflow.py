@@ -1844,3 +1844,23 @@ def test_cell12_exactly_one_roster_grammar_parser():
         "a regex compile over roster lines in the workflow would be a second "
         "implementation of the grammar"
     )
+
+
+@pytest.mark.parametrize("field", ["pattern_count_a", "pattern_count_b"])
+def test_cell17_a_boolean_attestation_count_fails_closed(
+    sweep_repo, tmp_path, field
+):
+    """Cell 17: `pattern_count_a: true` (a JSON bool) is not an integer count.
+
+    `isinstance(True, int)` is True in Python, so the schema check alone lets a
+    bool through — and `True == 1`, so a one-pattern class even passes the
+    count comparison. The explicit bool guard is what fails it closed. The
+    second parameter covers the sibling field, which needs the same guard.
+    """
+    work, base, _g = sweep_repo
+    proc, out = _run_sweep(
+        work, base, tmp_path,
+        attestation=_format2_attestation(**{field: True}),
+    )
+    assert proc.returncode != 0, out
+    assert "attestation absent or invalid" in out, out

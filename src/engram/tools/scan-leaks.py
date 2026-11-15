@@ -39,7 +39,9 @@ Class A blocks and prints as a COUNT ONLY (no path, line, label or snippet: a
 location in a public log is a lasting pointer to a protected name). Class B is
 permitted content, prints per line, and never blocks. COMMITTED_PATTERNS, the
 local roster and absolute-home-path findings are class A in code — they are
-the patterns this instrument has always blocked on.
+the patterns this instrument has always blocked on. When one line matches a
+class-B and a class-A pattern, the line is class A: a report-only pattern must
+never mask a blocking one, whatever order the roster lists them in.
 
 See docs/internal/.scan-leaks-local.json.example for the config shape.
 
@@ -467,14 +469,47 @@ def _git_tracked_files(root: Path) -> list[Path] | None:
     return [root / p.decode("utf-8", errors="replace") for p in raw.split(b"\x00") if p]
 
 
+def _attribute_line(line: str, leak_patterns: list
+                    ) -> tuple[str, str] | None:
+    """Attribute one line to a class, returning (label, class) or None.
+
+    CLASS A WINS ON A SHARED LINE. Every pattern is evaluated against the
+    line; if ANY class-A pattern matches, the line is class A and the first
+    class-A match supplies the label. Only when no class-A pattern matches
+    does the first matching pattern determine the reported label. One finding
+    per line is preserved.
+
+    Stopping at the first match is the fail-open this forbids: a class-B
+    pattern listed before a class-A pattern would mask the A hit entirely, and
+    a blocking gate a report-only pattern can mask is not a gate (measured
+    2026-11-15: a line holding both names reported `0 class-A and 2 class-B`
+    and exited 0).
+    """
+    first_label = None
+    first_class = None
+    first_a_label = None
+    for pattern, label, klass in leak_patterns:
+        if not pattern.search(line):
+            continue
+        if first_label is None:
+            first_label, first_class = label, klass
+        if klass == CLASS_A and first_a_label is None:
+            first_a_label = label
+    if first_a_label is not None:
+        return (first_a_label, CLASS_A)
+    if first_label is None:
+        return None
+    return (first_label, first_class)
+
+
 def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
     """Scan root for leak_patterns and return a ScanReport.
 
     ``leak_patterns`` is a list of (compiled, label, class) triples; each
     ``report.findings`` entry is (relpath, lineno, label, snippet, class).
-    A line that matches more than one pattern is attributed to the FIRST match
-    (one finding per line), the same line-level partition the two-class design
-    states.
+    A line that matches more than one pattern is ONE finding, attributed by
+    ``_attribute_line``: class A wins whenever any class-A pattern matches,
+    and only otherwise does the first match determine the label.
 
     Candidate set: every git-tracked file, whatever its extension
     (extensionless executables included), minus the SKIP_DIRS components and
@@ -582,12 +617,11 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
                 continue
             scanned += 1
             for i, line in enumerate(content.splitlines(), 1):
-                for pattern, label, klass in leak_patterns:
-                    if pattern.search(line):
-                        findings.append(
-                            (str(rel), i, label, line.strip()[:120], klass)
-                        )
-                        break
+                hit = _attribute_line(line, leak_patterns)
+                if hit is not None:
+                    findings.append(
+                        (str(rel), i, hit[0], line.strip()[:120], hit[1])
+                    )
             continue
         try:
             data = fpath.read_bytes()
@@ -605,12 +639,11 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
         content = data.decode("utf-8", errors="replace")
         scanned += 1
         for i, line in enumerate(content.splitlines(), 1):
-            for pattern, label, klass in leak_patterns:
-                if pattern.search(line):
-                    findings.append(
-                        (str(rel), i, label, line.strip()[:120], klass)
-                    )
-                    break
+            hit = _attribute_line(line, leak_patterns)
+            if hit is not None:
+                findings.append(
+                    (str(rel), i, hit[0], line.strip()[:120], hit[1])
+                )
 
     # A walk-time unreadable directory is one enumerated candidate covering a
     # subtree whose file count is unknown; it is an unreadable bucket entry,

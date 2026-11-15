@@ -531,7 +531,8 @@ def gate_repo(tmp_path):
     return work, base_sha, g
 
 
-def _run_gate(work, base_sha, tmp_path, default_branch="dev"):
+def _run_gate(work, base_sha, tmp_path, default_branch="dev",
+              roster="somepattern\n"):
     """Run the extracted decide step; return (returncode, combined output)."""
     import subprocess
 
@@ -544,7 +545,7 @@ def _run_gate(work, base_sha, tmp_path, default_branch="dev"):
         EVENT_NAME="pull_request",
         PR_IS_FORK="false",
         EXPECTED_STATUS_NAME="name-leak-gate",
-        NAME_LEAK_ROSTER="somepattern\n",
+        NAME_LEAK_ROSTER=roster,
         ATTESTATION_PATH=".github/name-leak-roster.attestation.json",
         BASE_SHA=base_sha,
         DEFAULT_BRANCH=default_branch,
@@ -681,6 +682,48 @@ def test_harness_puts_the_roster_in_a_private_per_run_directory(gate_repo, tmp_p
     second_rc, second_out = _run_gate(work, base_without_tool, tmp_path)
     assert second_rc == 0, second_out
     assert _roster_path(tmp_path) != first
+
+
+def test_a_format2_roster_line_fails_the_validation_step(gate_repo, tmp_path):
+    """Cell 15: this workflow parses roster format 1 only, so a class-prefixed
+    line (`A<TAB>` / `B<TAB>`) fails its validation step with one message and
+    is never compiled as a pattern. Format-1 behaviour is the control.
+
+    Executed, not read: the decide step is extracted from the workflow and run.
+    The failure is the step's own non-zero exit, which happens BEFORE the
+    scanner could ever apply the prefix as regex text.
+    """
+    work, base_without_tool, _g = gate_repo
+    (tmp_path / "decide.py").write_text(_decide_script())
+    (work / "tools" / "name_leak_gate.py").write_text(_STUB_TOOL)
+
+    token = "Zqgatefmt"
+    for class_token in ("A", "B"):
+        rc, out = _run_gate(
+            work, base_without_tool, tmp_path,
+            roster=class_token + "\t" + token + "\n",
+        )
+        assert rc != 0, out
+        assert "format 2" in out, out
+        assert token not in out, f"the roster line's text reached the log: {out!r}"
+        assert len(
+            [line for line in out.splitlines() if "format 2" in line]
+        ) == 1, f"exactly one message line; got {out!r}"
+
+    # Control: a format-1 roster still produces a verdict (the decide step
+    # exits 0 and the conclusion is reported), as before the refusal.
+    rc, out = _run_gate(work, base_without_tool, tmp_path,
+                        roster="somepattern\n")
+    assert rc == 0, out
+    assert "name-leak gate: failure" in out, out
+    assert "format 2" not in out, out
+
+    # The refusal is placed BEFORE the compile: a class prefix can never have
+    # been compiled as a pattern on the way to the message.
+    run = _decide_script()
+    assert run.index('startswith("A\\t")') < run.index("re.compile(stripped)"), (
+        "the format-2 refusal must precede the format-1 regex compile"
+    )
 
 
 # ── the count-mismatch warning (#4600) ───────────────────────────────────────

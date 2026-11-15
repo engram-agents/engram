@@ -729,8 +729,15 @@ jobs:
               # (both >= 0) and a 64-hex whole-file sha256. Anything else is
               # "not present": a malformed or unset attestation must fail,
               # never pass.
+              #
+              # The BOOL guard is explicit and load-bearing: `isinstance(True,
+              # int)` is True in Python, and `True == 1`, so a JSON `true`
+              # would otherwise satisfy the integer test AND a one-pattern
+              # count comparison.
               if (
                   attestation.get("roster_format") == 2
+                  and not isinstance(attested_count_a, bool)
+                  and not isinstance(attested_count_b, bool)
                   and isinstance(attested_count_a, int)
                   and attested_count_a >= 0
                   and isinstance(attested_count_b, int)

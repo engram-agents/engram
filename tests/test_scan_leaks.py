@@ -2425,3 +2425,44 @@ def test_cell9c_home_path_finding_is_class_a_without_a_roster_line(tmp_path):
     assert "zorbquux" not in out, out
     assert "segment:" not in out, out
 
+
+def test_cell13_class_a_wins_on_a_shared_line(tmp_path):
+    """Cell 13 (blocker): a line holding BOTH a class-B and a class-A name,
+    with the B roster line FIRST, is class A.
+
+    The fail-open this pins, measured on the first build: the scan loop broke
+    on the first matching pattern, so a B line listed before an A line masked
+    the A hit — the run reported `0 class-A ... and 2 class-B` and exited 0.
+    A blocking gate that a report-only pattern can mask is not a gate. The
+    contract: every pattern is evaluated; any class-A match makes the line
+    class A (first A match's label); only when no A pattern matches does the
+    first match determine the label. One finding per line is preserved.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_OTHER} and {_C2_NAME}\n"})
+    roster = _format2_roster(
+        tmp_path,
+        "B\t" + _C2_OTHER + "\n" + "A\t\\b" + _C2_NAME + "\\b\n",
+    )
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    # The A hit wins: exit 1, class-A count 1, class-B count 0.
+    assert r.returncode == 1, out
+    assert "1 class-A (blocking) and 0 class-B (report-only) hit(s)" in r.stderr, out
+    # One finding per line, and it is not a class-B line: neither the
+    # class-B location form nor either fixture token reaches the output.
+    assert "doc.md" not in out, out
+    assert _C2_NAME not in out and _C2_OTHER not in out, out
+
+    # In-process: exactly one finding, attributed to class A. A class-B
+    # attribution is the masked verdict this cell exists to forbid.
+    compiled = _mod.load_roster_file(roster)
+    report = _mod.scan(root, compiled, use_git=True)
+    assert len(report.findings) == 1, report.findings
+    rel, lineno, label, _snippet, klass = report.findings[0]
+    assert (rel, lineno, klass) == ("doc.md", 1, _mod.CLASS_A), report.findings
+    assert label == "roster file", report.findings
+
