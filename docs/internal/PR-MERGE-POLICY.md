@@ -290,10 +290,17 @@ umwelt and soma, per *Scope* and *Who presses the button* above):
   project owner goes to a merge seat for the press~~ — **the owner presses their own PR**
   once the record below is posted; the hand-off to a seat was clerical once the record
   existed, and the record is what any seat checks;
-- a seat whose **own user's authority table does not grant merge clicks** (as of
-  2026-10-22, Aleph and Clio, whose user has not granted it, so a merge click is a
-  destructive action outside this repo's delegation for them): that seat runs the
-  gate and posts the record; a merge seat presses.
+- a seat with **no standing merge grant from its own user** (as of 2026-11-14: Aleph
+  and Clio, whose user has not granted it, and Zephyr, whose table lists each merge as
+  a per-action decision of their user; for these seats a merge click is a destructive
+  action outside this repo's delegation): that seat runs the gate and posts the
+  record; a merge seat presses. Two questions are kept apart here. Whether the merge
+  is **authorised** is for the seat's own table and its user. **Whose click** it is, is
+  settled by this section: without a standing grant, a merge seat's, with one
+  exception: that user's own word for that PR, telling the seat to press, which the
+  seat quotes in the merge record with its time. A list a merge seat posted and the
+  summary in CLAUDE.md never settle either question; and when a record reaches a
+  merge seat, the seat asks whose click it is.
 
 **Nothing below widens the ⛔ list or touches the security read.** An owner never
 merges a ⛔-list (substrate-concept) PR: it goes to Lei first, or, when it implements a
@@ -303,7 +310,15 @@ with the merge seats. A security PR carries the security seat's exact-head appro
 its gate (Zephyr since Lei's 2026-10-06 ruling, Mira additive; see the seat note under
 *Who presses the button*) and
 is merged by the merge seats under the two directions in *Who presses the button*; an
-owner does not click it. The owner merges exactly what the merge seats could already
+owner does not click it. *(Nothing mechanical enforces these two exceptions. On
+2026-11-13 and 14 seats without the grant pressed their own PRs, security changes
+among them, reading the summary in CLAUDE.md, which then named neither exception;
+every one had a non-author approval and a recorded run, and all stand. The
+summary now names both. `.github/CODEOWNERS` (#4800) has GitHub request the merge seats
+as reviewers on changes to `/.github/` and to this file; the ruleset switch that would
+require their approval is a decision of the project lead and is not set. A security PR
+that touches only `src/` has no mechanical stop: that gap is open and named here.)*
+The owner merges exactly what the merge seats could already
 merge on a fix or non-substrate PR, by exactly the same gate.
 
 **The gate the owner runs, in full, before pressing the button.** The merge seat's
@@ -315,7 +330,12 @@ seat can run it and any other seat can check that it ran.
    Converged means one of three, and the merge comment states which: the round
    returned APPROVE; or it returned COMMENT with zero blockers and every actionable
    suggestion either folded (commit named, from 2026-11-04) or answered in writing on the PR; or the
-   three-round cap was reached with the open findings listed in the PR body. A
+   three-round cap was reached with the open findings listed in the PR body. The PR body
+   also names which of its commits a fairy made (or says none): the cap's reset test
+   reads the git author, and a fairy's commit under another name would otherwise read
+   as a contributor's and reset the count. When the body is silent, the merge seat
+   asks the author; an unfamiliar commit author is not read as a contributed tip
+   without that answer. A
    COMMENT round with an actionable suggestion neither folded nor answered is NOT
    converged, whatever its blocker count. *(Kepler, 2026-11-04, after two seats read
    this item and CLAUDE.md's merge-seat check differently. Ground: the reviewer-fairy
@@ -762,7 +782,21 @@ merged; main was red on three cells minutes later).
 GREEN on the base alone (or the PR adds it).** Otherwise it is the base's and goes to
 the seat that broke it, and must not be held against the PR. To tell the two apart, run the failing cell on the base tip.
 
+A cell can also be red on the base **on one seat only**, for a cause in that seat's
+environment (a network path, a missing tool), while it is green on the base elsewhere.
+It is still not the PR's: the merge record names the cell, its red on the base on the
+pressing seat, the other seat's green run on the same base (that green run is the
+control; the red seat's own base run shows only that the red is not the PR's), and the
+issue filed for the cell's dependence. One condition
+first: if the PR's diff touches code that cell exercises, **including code it only
+imports**, the cell must pass on the merged tree on a seat where it can run before the
+press.
+
 *Evidence:* Borges's run on umwelt #1021 (2026-10-06) kept main's own red off the PR.
+Alpha #4794 (2026-11-14): an installer cell timed out on one seat's network path on base
+and merged tree alike; the PR's changed module was imported by the code the cell runs,
+so the cell was run on the merged tree on a second seat (1 passed) before the press;
+the dependence is #4795.
 
 **3. A cancelled same-SHA run can block the merge even when another run passed.**
 Observed: a required status check can read as not-satisfied — the PR stays `BLOCKED`
