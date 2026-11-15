@@ -1154,13 +1154,23 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         report["tainted_nodes"] = []
         for t in tainted_rows:
             tainted_by, _ = core._classify_pending_markers(conn, t["id"])
-            report["tainted_nodes"].append({
+            entry = {
                 "id": t["id"],
                 "type": t["type"],
                 "claim": t["claim"],
                 "confidence": t["confidence"],
                 "tainted_by": tainted_by,
+            }
+            # #4727: name the roots whose marker came from the one-time backfill of
+            # pre-machine retractions, so the dream record can say so. Absent otherwise.
+            backfilled_by = sorted({
+                m["root_node"] for m in core._pending_markers_for_node(conn, t["id"])
+                if m["root_op"] == "retract"
+                and m["cascade_event"].startswith("backfill:retract:")
             })
+            if backfilled_by:
+                entry["backfilled_by"] = backfilled_by
+            report["tainted_nodes"].append(entry)
 
         # 10. Stale nodes (downstream of superseded premises). Same
         # migration. replacement_hint(s) is reconstructed from each root's

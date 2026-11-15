@@ -91,6 +91,18 @@ with an `-alpha` suffix during the alpha phase.
   the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
+- Retractions made before the cascade machine existed now mark the nodes built on them. A one-time
+  migration (schema 11) walks each retracted node that has no retract marker with the same walk a
+  retraction uses today, and writes one pending marker per live claim-bearing dependent
+  (`cascade_event` `backfill:retract:<root>`); it changes no node or edge and runs behind the
+  pre-migration backup. The marked nodes show in the cascade frontier, in reflect's
+  `tainted_nodes` (`backfilled_by`) and in the derivation refusal (`cascade_event`).
+  **Known behaviour change:** on graphs older than the cascade machine, the health score's
+  `pending_premise_rate` can rise at upgrade, because old retractions now mark the nodes built on
+  them. Unlike a live retraction, the backfill does not mark contradiction nodes that have the
+  retracted node as a side. If the migration fails, including on a derivation chain deeper than
+  Python's recursion limit, it rolls back, leaves the schema at 10 and retries at the next start.
+  (#4727)
 - Summary and keyword rewrites now refresh the complete canonical embedding,
   including identical-input retries. Failed refreshes retain both old vector
   stores and report persisted per-node debt through the write result and
