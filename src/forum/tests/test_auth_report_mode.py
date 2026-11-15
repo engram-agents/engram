@@ -1379,3 +1379,158 @@ def test_c7_installer_accepts_one_hour_and_exactly_72_hours_ahead(owned_tmp, hou
     assert r.returncode == 0, r.stderr
     argv = _exec_start(r.stdout)
     assert argv[argv.index("--auth-report-until") + 1] == until
+
+
+# ---- delta 5: the peer-read items ---------------------------------------------------
+# I1: a request whose body is over MAX_CONTENT_LENGTH gets one line, then the unchanged 413.
+_SMALL_MAX = 300
+_BIG_MARK = "OVERSIZE-MARKER"
+_BIG_BODY = dict(POST_BODY, body_md=_BIG_MARK + "x" * 2000)
+
+
+def _small_app(tmp, mode="report"):
+    app = _make_app(tmp, mode)
+    app.config["MAX_CONTENT_LENGTH"] = _SMALL_MAX
+    return app
+
+
+def _oversize(client, *, url="/api/post", headers=None):
+    return client.post(url, json=_BIG_BODY, headers=headers or {})
+
+
+def _control_then(tmp, app, headers=None):
+    """Positive control: a normal write under the cap gives exactly one line (so a zero-line
+    result for the oversize one cannot be a broken reader), then return the line count."""
+    r = app.test_client().post("/api/post", json=POST_BODY, headers=headers or {})
+    assert r.status_code not in (401, 403, 413, 422), r.status_code
+    assert len(_lines(tmp)) == 1
+    return 1
+
+
+def test_i1_tokenless_oversize_write_gets_one_413_line_and_the_response_is_413(owned_tmp):
+    app = _small_app(owned_tmp)
+    n = _control_then(owned_tmp, app)
+    r = _oversize(app.test_client())
+    assert r.status_code == 413
+    recs = _lines(owned_tmp)
+    assert len(recs) == n + 1
+    rec = recs[-1]
+    assert (rec["verdict"], rec["outcome"], rec["token_agent"]) == ("absent", 413, None)
+    assert type(rec["outcome"]) is int
+    assert rec["named"] == [] and rec["kind"] == "write"
+    assert _BIG_MARK.encode() not in _bytes(owned_tmp)
+
+
+def test_i1_tokenless_oversize_names_come_from_the_path_and_query_only(owned_tmp):
+    app = _small_app(owned_tmp)
+    r = app.test_client().post("/api/post?agent=carol", json=_BIG_BODY)
+    assert r.status_code == 413
+    (rec,) = _lines(owned_tmp)
+    assert (rec["verdict"], rec["outcome"], rec["named"]) == ("absent", 413, ["carol"])
+    assert b"alice" not in _bytes(owned_tmp)  # the body's agent was never read
+
+
+def test_i1_bad_token_oversize_is_invalid_413(owned_tmp):
+    app = _small_app(owned_tmp)
+    n = 0
+    r = _oversize(app.test_client(), headers=_auth("not-a-real-token"))
+    assert r.status_code == 413
+    recs = _lines(owned_tmp)
+    assert len(recs) == n + 1
+    rec = recs[-1]
+    assert (rec["verdict"], rec["outcome"], rec["token_agent"], rec["named"]) == (
+        "invalid", 413, None, [])
+    assert b"not-a-real-token" not in _bytes(owned_tmp)
+    assert _BIG_MARK.encode() not in _bytes(owned_tmp)
+
+
+def test_i1_valid_token_oversize_is_match_413(owned_tmp):
+    app = _small_app(owned_tmp)
+    tok = _issue(app, "alice")
+    n = _control_then(owned_tmp, app, _auth(tok))
+    r = _oversize(app.test_client(), headers=_auth(tok))
+    assert r.status_code == 413
+    recs = _lines(owned_tmp)
+    assert len(recs) == n + 1
+    rec = recs[-1]
+    assert (rec["verdict"], rec["outcome"], rec["token_agent"], rec["named"]) == (
+        "match", 413, "alice", [])
+    assert _BIG_MARK.encode() not in _bytes(owned_tmp)
+
+
+def test_i1_valid_token_oversize_with_another_name_in_the_path_is_mismatch_413(owned_tmp):
+    app = _small_app(owned_tmp)
+    tok = _issue(app, "bob")
+    r = _oversize(app.test_client(), url="/api/agent/alice/nosuchleaf", headers=_auth(tok))
+    assert r.status_code == 413
+    (rec,) = _lines(owned_tmp)
+    assert (rec["verdict"], rec["outcome"], rec["token_agent"], rec["named"]) == (
+        "mismatch", 413, "bob", ["alice"])
+    assert _BIG_MARK.encode() not in _bytes(owned_tmp)
+
+
+def test_i1_enforce_answers_are_unchanged(owned_tmp):
+    app = _small_app(owned_tmp, "enforce")
+    assert _oversize(app.test_client()).status_code == 401
+    tok = _issue(app, "alice")
+    assert _oversize(app.test_client(), headers=_auth(tok)).status_code == 413
+    assert not _report_path(owned_tmp).exists()
+
+
+# I2: `named` holds at most 8 entries; the rest is one "<more> n=K" entry.
+def _names_line(tmp, names):
+    app = _make_app(tmp)
+    app.test_client().get("/api/updates?" + "&".join(f"agent={n}" for n in names))
+    (rec,) = _lines(tmp)
+    return rec["named"], len(_bytes(tmp))
+
+
+def test_i2_exactly_eight_names_are_all_written(owned_tmp):
+    names = [f"n{i}" for i in range(8)]
+    got, _ = _names_line(owned_tmp, names)
+    assert got == names
+
+
+def test_i2_nine_names_are_eight_and_a_more_marker(owned_tmp):
+    names = [f"n{i}" for i in range(9)]
+    got, _ = _names_line(owned_tmp, names)
+    assert got == names[:8] + ["<more> n=1"]
+
+
+def test_i2_forty_names_are_eight_and_n_32(owned_tmp):
+    names = [f"n{i}" for i in range(40)]
+    got, _ = _names_line(owned_tmp, names)
+    assert got == names[:8] + ["<more> n=32"]
+
+
+def test_i2_the_first_eight_keep_request_order_not_sorted_order(owned_tmp):
+    names = [f"n{i:02d}" for i in range(20, 0, -1)]  # descending: sorted order would differ
+    got, _ = _names_line(owned_tmp, names)
+    assert got == names[:8] + ["<more> n=12"]
+
+
+def test_i2_duplicates_do_not_count_toward_the_cap(owned_tmp):
+    names = [f"n{i}" for i in range(8)] * 3
+    got, _ = _names_line(owned_tmp, names)
+    assert got == [f"n{i}" for i in range(8)]
+
+
+def test_i2_forty_maximum_length_names_stay_under_2kb(owned_tmp):
+    names = [("a" * 125) + f"{i:03d}" for i in range(40)]
+    assert all(len(n) == 128 for n in names)
+    got, size = _names_line(owned_tmp, names)
+    assert got == names[:8] + ["<more> n=32"]
+    assert size < 2048, size
+
+
+# I3: the installer refuses an --auth-report-until at or before now (exit 78).
+@pytest.mark.parametrize("until", [
+    _ts_until(-1 / 3600), _ts_until(-1), "2025-01-01T00:00:00Z",
+], ids=["one-second-ago", "one-hour-ago", "year-2025"])
+def test_i3_installer_refuses_a_past_until_with_exit_78_one_line_and_writes_nothing(owned_tmp, until):
+    r = _install_until(owned_tmp, until)
+    assert r.returncode == 78, (r.returncode, r.stdout, r.stderr)
+    lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
+    assert len(lines) == 1 and "--auth-report-until" in lines[0] and "past" in lines[0], r.stderr
+    assert "rendered unit begin" not in r.stdout
+    assert not (owned_tmp / "forum").exists()
