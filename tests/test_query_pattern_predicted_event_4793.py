@@ -186,3 +186,18 @@ def test_claim_only_node_is_byte_identical_to_the_old_output():
             cand = _run(server, qry, name, oid, prepare)
             old = (claim[:160] + "...") if len(claim) > 160 else claim
             assert cand["claim"] == old, (name, len(claim), cand["claim"])
+
+
+def test_engram_query_pattern_tier1_summary_shows_predicted_event():
+    # The user-visible path: the pattern's output carries no `claim` key, only
+    # the Tier-1 `summary` that _build_tiered_results derives from it.
+    for name, prepare in (("stale_load_bearing", _make_stale),
+                          ("tainted_still_valid", _make_tainted)):
+        server, qry = _fresh()
+        pid = _add_prediction(server, LONG_EVENT)
+        _set(server, pid, claim=None)
+        prepare(server, pid)
+        r = json.loads(qry._query_pattern_impl(pattern_name=name, preset="balanced"))
+        row = next((e for e in r["results"] if e["id"] == pid), None)
+        assert row is not None, (name, r)
+        assert row.get("summary") == LONG_EVENT[:160] + "...", (name, row)
