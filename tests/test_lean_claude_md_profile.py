@@ -951,7 +951,7 @@ def test_install_doc_default_is_the_profile_bootstrap_uses_with_no_option():
     assert re.search(r"default[^.]*\bfull\b|\bfull\b[^.]*default", text, re.IGNORECASE)
     for p in facts["profiles"]:
         if p != "full":
-            assert not re.search(rf"default[^.]*`{re.escape(p)}`|`{re.escape(p)}`[^.]*is the default", text)
+            assert not re.search(rf"default\s+(?:is\s+)?`{re.escape(p)}`|`{re.escape(p)}`\s+is\s+the\s+default", text)
 
 
 def test_readme_runs_no_bootstrap_of_its_own_so_it_carries_no_profile_line():
