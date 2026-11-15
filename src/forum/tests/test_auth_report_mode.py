@@ -9,7 +9,7 @@ Contract (written before the implementation; cell numbers follow the spec):
   identity and recorded; a PRESENTED token that is unknown/revoked is still 401, and a valid
   token for another agent than the one named is still 403, in BOTH modes. Every guarded
   request gets exactly one report line, written before any refusal is returned, with
-  exactly the fields ``ts, method, route, kind, named, verdict, token_agent``.
+  exactly the fields ``ts, method, route, kind, named, verdict, token_agent, outcome``.
 * The report never holds a token, a header, the body, the query string beyond validated
   identities, the source address, or the raw text of a malformed identity.
 * A report that cannot be opened exits 78; a failed append is counted (``/health``
