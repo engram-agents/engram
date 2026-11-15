@@ -1228,3 +1228,23 @@ def test_help_lists_the_claude_md_profile_flag_and_names_no_profile(sb):
     assert r.returncode == 0
     assert "--claude-md-profile" in r.stdout
     assert not re.search(r"\blean\b", r.stdout)
+
+
+_EMPTY_PROFILE_FORMS = [["--claude-md-profile", ""], ["--claude-md-profile="]]
+
+
+@pytest.mark.parametrize("given", _EMPTY_PROFILE_FORMS)
+def test_an_empty_claude_md_profile_is_forwarded_as_an_empty_argv_element(sb, given):
+    r = sb.run("--yes", *given)
+    assert r.returncode == 0, r.all  # the stub accepts anything; the installer judged nothing
+    assert _bootstrap_argvs(sb) == [["--claude-md-profile", ""]]
+
+
+@pytest.mark.parametrize("given", _EMPTY_PROFILE_FORMS)
+def test_an_empty_claude_md_profile_fails_loud_in_the_real_bootstrap_not_silently_full(sb, given):
+    sb.use_real_bootstrap()
+    r = sb.run("--yes", *given)
+    assert r.returncode != 0, r.all
+    assert "--claude-md-profile needs one of" in r.all and "got ''" in r.all
+    assert "bootstrap.py failed" in r.stderr
+    assert not (sb.claude_home / "CLAUDE.md").exists()

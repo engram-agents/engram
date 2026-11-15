@@ -895,6 +895,18 @@ def test_first_session_skill_does_not_say_the_lean_file_has_no_model_identity_ga
     assert "has no such section" not in skill
 
 
+def test_first_session_skill_pins_the_true_one_sentence_claim_against_the_lean_render():
+    """The skill says the lean gate section holds one sentence; the lean render must keep that true."""
+    skill = " ".join(FIRST_SESSION_SKILL.read_text(encoding="utf-8").split())
+    assert "in a lean-profile file that section holds one sentence" in skill
+    lines = _lean().splitlines()
+    start = lines.index("## Model Identity Gate") + 1
+    end = next(i for i in range(start, len(lines)) if lines[i].startswith("## "))
+    body = " ".join(" ".join(lines[start:end]).split())
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", body) if s]
+    assert len(sentences) == 1, sentences
+
+
 def _bootstrap_profile_facts() -> dict:
     """CLAUDE_MD_PROFILES and the profile an option-less parse yields, read from bootstrap.py."""
     code = (
