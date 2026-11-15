@@ -48,7 +48,9 @@ LEAN_IDS = [
     "authority-structure-table-claude-code",
     "authority-structure-close",
     "trust-tier-pointer",
+    "model-identity-gate-lean",
     "engram-write-discipline",
+    "user-notes-verbatim-lean",
     "engram-read-discipline",
     "confidence-anchors",
     "native-tools-ban-lean",
@@ -56,6 +58,10 @@ LEAN_IDS = [
 ]
 
 BAN_ID = "native-tools-ban-lean"
+GATE_ID = "model-identity-gate-lean"
+NOTES_ID = "user-notes-verbatim-lean"
+# every lean-only component: in the lean manifest, in no full manifest
+LEAN_ONLY_IDS = (BAN_ID, GATE_ID, NOTES_ID)
 
 PLACEHOLDER = re.compile(r"\{\{[^}]+\}\}")
 
@@ -114,21 +120,27 @@ def test_b_non_string_profile_raises():
 # --- the lean manifest and the committed lean template ------------------------------------
 
 
-def test_lean_manifest_is_the_ten_ids_in_the_full_manifests_relative_order():
+def test_lean_manifest_is_the_twelve_ids_in_the_full_manifests_relative_order():
     lean_ids = _manifest_ids(LEAN_MANIFEST)
     assert lean_ids == LEAN_IDS
     full_ids = _manifest_ids(FULL_MANIFEST)
-    # The one lean-only component has no place in the full manifest; the rest keep its relative order.
-    assert [i for i in lean_ids if i != BAN_ID] == [i for i in full_ids if i in set(lean_ids)], (
+    # The lean-only components have no place in the full manifest; the rest keep its relative order.
+    assert [i for i in lean_ids if i not in LEAN_ONLY_IDS] == [i for i in full_ids if i in set(lean_ids)], (
         "the lean manifest must keep the full manifest's relative order"
     )
     # The ban sits where its host section sits in the full file: after the confidence anchors,
     # before the ENGRAM Reference.
     assert lean_ids.index(BAN_ID) == lean_ids.index("confidence-anchors") + 1
     assert lean_ids.index(BAN_ID) == lean_ids.index("engram-reference") - 1
+    # Each sentence sits where its host section sits in the full file: the gate sentence before the
+    # write discipline (the full file has model-identity-gate just before it), the notes sentence
+    # between the write and read disciplines (cross-surface-persistence's place).
+    assert lean_ids.index(GATE_ID) == lean_ids.index("engram-write-discipline") - 1
+    assert lean_ids.index(NOTES_ID) == lean_ids.index("engram-write-discipline") + 1
+    assert lean_ids.index(NOTES_ID) == lean_ids.index("engram-read-discipline") - 1
 
 
-def test_lean_render_receipt_lists_the_ten_ids():
+def test_lean_render_receipt_lists_the_twelve_ids():
     _, receipt = tcr.render("claude-code", "CLAUDE.md", "lean")
     assert [c["id"] for c in receipt["components"]] == LEAN_IDS
     assert receipt["excluded"] == []
@@ -172,6 +184,53 @@ def test_ban_paragraph_renders_exactly_once_in_lean_and_exactly_once_in_full():
     para = _full_ban_paragraph()
     assert _lean().count(para) == 1
     assert _full().count(para) == 1
+
+
+# --- the two lean-only sentences (model identity gate; notes stay verbatim) ----------------
+
+
+def _gate_sentence() -> str:
+    """The last sentence of the Mismatch bullet, read at test time from the FULL component file."""
+    text = (TEMPLATES / "components" / "model-identity-gate.md").read_text(encoding="utf-8")
+    bullets = [ln for ln in text.split("\n") if ln.startswith("- **Mismatch**")]
+    assert len(bullets) == 1
+    return bullets[0].rsplit(". ", 1)[1]
+
+
+def _notes_sentence() -> str:
+    """Item 3 of the warm-briefing list, minus its list marker, read at test time from the FULL file."""
+    text = (TEMPLATES / "components" / "cross-surface-persistence.md").read_text(encoding="utf-8")
+    lines = [ln for ln in text.split("\n") if ln.startswith("3. ") and "stay VERBATIM" in ln]
+    assert len(lines) == 1
+    return lines[0][len("3. ") :]
+
+
+_SENTENCES = [
+    pytest.param(GATE_ID, _gate_sentence, "silent swap", id="gate"),
+    pytest.param(NOTES_ID, _notes_sentence, "Never edit or summarize them.", id="notes"),
+]
+
+
+@pytest.mark.parametrize("cid,get_sentence,marker", _SENTENCES)
+def test_lean_sentence_component_body_equals_the_full_files_sentence_byte_for_byte(cid, get_sentence, marker):
+    sentence = get_sentence()
+    assert sentence.strip() and marker in sentence and "\n" not in sentence
+    body = tcr._load_component(cid)[1]
+    # whitespace-ownership rule: the sentence, then one "\n" (the body owns its trailing blank line)
+    assert body == sentence + "\n"
+
+
+@pytest.mark.parametrize("cid,get_sentence,marker", _SENTENCES)
+def test_lean_sentence_component_is_in_the_lean_manifest_and_not_in_the_full_manifest(cid, get_sentence, marker):
+    assert cid in _manifest_ids(LEAN_MANIFEST)
+    assert cid not in _manifest_ids(FULL_MANIFEST)
+
+
+@pytest.mark.parametrize("cid,get_sentence,marker", _SENTENCES)
+def test_lean_sentence_renders_exactly_once_in_lean_and_exactly_once_in_full(cid, get_sentence, marker):
+    sentence = get_sentence()
+    assert _lean().count(sentence) == 1
+    assert _full().count(sentence) == 1
 
 
 # --- (e) consent paragraph and authority table --------------------------------------------
@@ -305,9 +364,9 @@ _PAIRS = list(zip(LEAN_IDS, LEAN_IDS[1:]))
 def test_g_boundary_shape_at_each_adjacency(prev_id, next_id):
     """One blank line between components, unless the full document differs at the same boundary."""
     full_ids = _manifest_ids(FULL_MANIFEST)
-    # the lean-only ban is in no full manifest, so no full-render boundary exists to compare with
+    # the lean-only components are in no full manifest, so no full-render boundary exists to compare with
     adjacent_in_full = (
-        BAN_ID not in (prev_id, next_id) and full_ids.index(next_id) == full_ids.index(prev_id) + 1
+        not {BAN_ID, GATE_ID, NOTES_ID} & {prev_id, next_id} and full_ids.index(next_id) == full_ids.index(prev_id) + 1
     )
     expected = 1
     if adjacent_in_full:
