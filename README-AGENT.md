@@ -378,6 +378,7 @@ The new session takes over, fully agent-driven:
    and arm the `first-run-pending` marker; validates the venv deps; then runs the
    **first-session dialogue with the human** — who they are, what to call you, what
    brought them here. You write the graph nodes as the conversation goes.
+   For a small-context model, run `bootstrap.py --claude-md-profile lean` for a shorter `CLAUDE.md` (the default is `full`; `lean` is recorded as `claude_md_profile` in `config.json`).
 
 ### Phase 3 — Steady state
 

@@ -175,7 +175,7 @@ step confirms it and records it, and is the safety net if they hadn't chosen yet
        json.dump(cfg, f, indent=2)
    ```
 
-   This arms the **Model Identity Gate** (in your CLAUDE.md; a lean-profile file has no such section, and recording `self_lineage` is still right) so a future
+   This arms the **Model Identity Gate** (in your CLAUDE.md; in a lean-profile file that section holds one sentence and the rest of the gate is not in the file, and recording `self_lineage` is still right) so a future
    cross-family session is caught, and it activates the standpoint `null=self`
    convention (your own unmarked observations now count as your own lineage). The
    value must be lowercase `provider:family`. There is **no write-time check** —

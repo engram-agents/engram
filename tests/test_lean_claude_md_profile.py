@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -878,3 +879,78 @@ def test_render_reads_the_named_template_even_if_the_sources_list_widens(tmp_pat
     assert tr.render_identity_surface(tmp_path, "lean") == "LEAN"
     for profile, name in tr.CLAUDE_MD_PROFILE_TEMPLATE.items():
         assert name in tr.CLAUDE_MD_PROFILE_SOURCES[profile]
+
+
+# --- docs pins (round 5: #4802 design-seat findings) ----------------------------------------
+
+README_AGENT = REPO_ROOT / "README-AGENT.md"
+README = REPO_ROOT / "README.md"
+FIRST_SESSION_SKILL = SRC / "skills" / "claude" / "engram-first-session" / "SKILL.md"
+
+
+def test_first_session_skill_does_not_say_the_lean_file_has_no_model_identity_gate_section():
+    """The lean render HAS a `## Model Identity Gate` section, so the skill must not deny it."""
+    assert "## Model Identity Gate" in _lean().splitlines()
+    skill = " ".join(FIRST_SESSION_SKILL.read_text(encoding="utf-8").split())
+    assert "has no such section" not in skill
+
+
+def _bootstrap_profile_facts() -> dict:
+    """CLAUDE_MD_PROFILES and the profile an option-less parse yields, read from bootstrap.py."""
+    code = (
+        "import importlib.util, json\n"
+        f"spec = importlib.util.spec_from_file_location('bootstrap_mod', {str(BOOTSTRAP)!r})\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "print(json.dumps({'profiles': list(m.CLAUDE_MD_PROFILES),"
+        " 'default': m._parse_args([]).claude_md_profile}))\n"
+    )
+    scratch = Path(tempfile.mkdtemp())
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(scratch), "ENGRAM_HOME": str(scratch / ".engram"),
+        "CLAUDE_HOME": str(scratch / ".claude"), "CODEX_HOME": str(scratch / ".codex"),
+        "ALPHA_DIR": str(REPO_ROOT), "ALPHA_TEMPLATES_DIR": str(TEMPLATES),
+        "PYTHON_BIN": sys.executable, "TARGET": "claude",
+    })
+    try:
+        r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def _install_doc_lines(path: Path) -> list[str]:
+    return [ln for ln in path.read_text(encoding="utf-8").splitlines() if "--claude-md-profile" in ln]
+
+
+def test_install_doc_names_the_flag_and_every_profile_bootstrap_accepts_and_no_other():
+    profiles = _bootstrap_profile_facts()["profiles"]
+    lines = _install_doc_lines(README_AGENT)
+    assert lines, "README-AGENT.md install steps must name --claude-md-profile"
+    text = " ".join(lines)
+    for p in profiles:
+        assert re.search(rf"--claude-md-profile\s+`?{re.escape(p)}\b|`{re.escape(p)}`", text), p
+    # every value written right after the flag is one bootstrap accepts
+    for value in re.findall(r"--claude-md-profile[ =]`?([A-Za-z0-9_-]+)", text):
+        assert value in profiles, f"doc names profile {value!r} that bootstrap refuses"
+    assert "claude_md_profile" in text
+
+
+def test_install_doc_default_is_the_profile_bootstrap_uses_with_no_option():
+    import template_render as tr
+
+    facts = _bootstrap_profile_facts()
+    assert facts["default"] is None  # no option -> no profile recorded -> the unprofiled render
+    default_profiles = [p for p, name in tr.CLAUDE_MD_PROFILE_TEMPLATE.items() if name == "template.CLAUDE.md"]
+    assert default_profiles == ["full"]
+    text = " ".join(_install_doc_lines(README_AGENT))
+    assert re.search(r"default[^.]*\bfull\b|\bfull\b[^.]*default", text, re.IGNORECASE)
+    for p in facts["profiles"]:
+        if p != "full":
+            assert not re.search(rf"default[^.]*`{re.escape(p)}`|`{re.escape(p)}`[^.]*is the default", text)
+
+
+def test_readme_runs_no_bootstrap_of_its_own_so_it_carries_no_profile_line():
+    """README.md has no bootstrap.py install step; if one appears it must name the flag too."""
+    assert "bootstrap.py" not in README.read_text(encoding="utf-8") or _install_doc_lines(README)
