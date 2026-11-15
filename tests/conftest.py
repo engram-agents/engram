@@ -453,18 +453,6 @@ def _stop_and_reset_snapshot_worker(
                 t.join(timeout=min(remaining, 0.5))
             if t.is_alive():
                 status = "still_alive"
-                print(
-                    f"[conftest] snapshot worker still alive {bound_s}s after "
-                    f"teardown of {nodeid}; the next test may hit ENOTEMPTY (#4826)",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                warnings.warn(
-                    f"snapshot worker still alive {bound_s}s after teardown of "
-                    f"{nodeid} (#4826)",
-                    UserWarning,
-                    stacklevel=2,
-                )
         # Reset singleton state so the next test starts clean.
         mod._started = False
         mod._worker_thread = None
@@ -473,6 +461,22 @@ def _stop_and_reset_snapshot_worker(
         mod._work_event.clear()
     except Exception:
         pass
+    # Report AFTER the reset and outside the try (reviewer r1 on #4831): under a
+    # `-W error` run the warning raises, and inside the try it would have been
+    # swallowed and skipped the reset.
+    if status == "still_alive":
+        print(
+            f"[conftest] snapshot worker still alive {bound_s}s after "
+            f"teardown of {nodeid}; the next test may hit ENOTEMPTY (#4826)",
+            file=sys.stderr,
+            flush=True,
+        )
+        warnings.warn(
+            f"snapshot worker still alive {bound_s}s after teardown of "
+            f"{nodeid} (#4826)",
+            UserWarning,
+            stacklevel=2,
+        )
     return status
 
 

@@ -17,6 +17,7 @@ import shutil
 import sys
 import threading
 import time
+import warnings
 
 import pytest
 
@@ -62,15 +63,25 @@ def writing_worker(tmp_path, monkeypatch):
         return True
 
     writer.seconds = 3.0
+    # Every worker thread a cell starts, so teardown can join it even after the
+    # helper under test has reset _worker_thread to None (reviewer r1 on #4831):
+    # a cell whose assertion fails before its own cleanup must not leak a live
+    # thread into later tests.
+    writer.threads = []
     monkeypatch.setattr(w, "_process_job", writer)
     yield data_dir, release, started, writer
     release.set()
+    w._stop.set()
+    w._work_event.set()
+    for t in writer.threads:
+        t.join(timeout=10.0)
     w.stop_worker(timeout=10.0)
     _reset_worker_state()
 
 
-def _run_one_job(started):
+def _run_one_job(started, writer):
     w.start_worker()
+    writer.threads.append(w._worker_thread)
     w.enqueue_job(1, 1, "m", "nap")
     assert started.wait(timeout=10.0), "job never started"
 
@@ -78,8 +89,8 @@ def _run_one_job(started):
 def test_race_helper_waits_for_writing_job_then_rmtree_succeeds(writing_worker):
     """A job that keeps writing past the 2 s first join must be waited out, so the
     thread is gone and rmtree of the store succeeds (no ENOTEMPTY)."""
-    data_dir, _release, started, _writer = writing_worker
-    _run_one_job(started)
+    data_dir, _release, started, writer = writing_worker
+    _run_one_job(started, writer)
     t = w._worker_thread
     assert t is not None
     status = _stop_and_reset_snapshot_worker("race-cell")
@@ -94,7 +105,7 @@ def test_still_alive_past_bound_is_loud_not_fatal(writing_worker, capsys):
     prints one stderr line naming the nodeid and the bound, and warns."""
     data_dir, release, started, writer = writing_worker
     writer.seconds = 3.0
-    _run_one_job(started)
+    _run_one_job(started, writer)
     t = w._worker_thread
     with pytest.warns(UserWarning, match="still alive"):
         status = _stop_and_reset_snapshot_worker(
@@ -112,6 +123,19 @@ def test_still_alive_past_bound_is_loud_not_fatal(writing_worker, capsys):
     w._work_event.set()
     t.join(timeout=10.0)
     assert not t.is_alive()
+
+
+def test_still_alive_under_warnings_as_errors_still_resets(writing_worker):
+    """Reviewer r1 on #4831: under a `-W error` run the warning raises. The reset
+    must already have happened by then (report after reset, outside the try), so
+    the next test still starts from a clean singleton."""
+    data_dir, release, started, writer = writing_worker
+    _run_one_job(started, writer)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(UserWarning, match="still alive"):
+            _stop_and_reset_snapshot_worker("tests/x.py::w_error", first_join_s=0.2, bound_s=0.5)
+    assert w._worker_thread is None and w._started is False, "reset skipped under -W error"
 
 
 def test_absent_module_returns_at_once(monkeypatch):
