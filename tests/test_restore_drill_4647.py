@@ -1534,8 +1534,8 @@ def test_d20_a_status_failure_on_the_resolve_path_with_no_audit_row_names_them_t
 # ---------------------------------------------------------------- D21 cells for mutants a colleague's run left alive
 
 def test_d21_r17_the_capture_stamp_is_read_before_the_backup_not_after(home, monkeypatch):
-    """The stamp must never post-date the data it stamps: the clock is read BEFORE the hot backup. Observed through
-    the first step that runs on the backup copy (_derived_drop_plan), with a clock that ticks on every read."""
+    """The stamp must never post-date the data it stamps: the clock is read BEFORE the hot backup. Observed at the
+    backup call itself, with a clock that ticks on every read."""
     bk = rd.engram_backup
     ticks = iter(range(1, 100))
     events = []
@@ -1544,15 +1544,28 @@ def test_d21_r17_the_capture_stamp_is_read_before_the_backup_not_after(home, mon
         events.append("clock")
         return f"2026-06-01T00:00:{next(ticks):02d}.000000Z"
 
-    real_plan = bk._derived_drop_plan
+    class _Conn:  # delegates everything to a real connection, and notes the one call that copies the data
+        def __init__(self, real):
+            self._c = real
 
-    def plan(conn):
-        events.append("backup-copy-in-use")
-        return real_plan(conn)
+        def backup(self, target):
+            events.append("backup")
+            return self._c.backup(getattr(target, "_c", target))
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    class _Sqlite3:
+        def __getattr__(self, name):
+            return getattr(sqlite3, name)
+
+        def connect(self, *a, **k):
+            return _Conn(sqlite3.connect(*a, **k))
+
     monkeypatch.setattr(bk, "format_dump_time", clock)
-    monkeypatch.setattr(bk, "_derived_drop_plan", plan)
+    monkeypatch.setattr(bk, "sqlite3", _Sqlite3())
     stats = bk.dump_stripped(str(home / "knowledge.db"), str(home / "again.sql"))
-    assert events[:2] == ["clock", "backup-copy-in-use"], events
+    assert events[:2] == ["clock", "backup"], events
     assert stats["dumped_at"] == "2026-06-01T00:00:01.000000Z"  # the first reading, not a later one
 
 
