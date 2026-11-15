@@ -92,14 +92,14 @@ For `reasoning_type=inductive_generalization`, ENGRAM runs an additional check: 
 
 If not, the warning is:
 ```
-⚠ inductive_generalization: independent cross-lineage instances (excluding hypothesis-author lineage 'anthropic:sonnet') = 1 — consider inductive_analogy
+⚠ inductive_generalization: independent cross-lineage instances (excluding hypothesis-author lineage 'anthropic:sonnet') = 1 — add a cross-lineage observation, use a weaker reasoning type (inductive_analogy or abductive_best_explanation), or proceed and say why in logical_chain
 ```
 
 ("instances" in the warning = distinct cross-lineage lineage values; three premises sharing the same cross-lineage value count as 1, not 3.)
 
 This fires only when the graph already contains ≥2 distinct lineage values (a cross-lineage premise is actually citable); it won't fire against a single-lineage graph, since the check would point to an unavailable action.
 
-**What to do:** Either find a premise from a different training lineage (a human paper, another agent's filed observation with their lineage), or downgrade to `inductive_analogy` (same reasoning pattern, acknowledging the cross-lineage bar wasn't met).
+**What to do:** Either find a premise from a different training lineage (a human paper, another agent's filed observation with their lineage), or downgrade to `inductive_analogy` (same reasoning pattern, acknowledging the cross-lineage bar wasn't met). (The separate `independence_advisory` response key was removed in #4728; this line replaces it.)
 
 ## Per-axis confidence implications
 

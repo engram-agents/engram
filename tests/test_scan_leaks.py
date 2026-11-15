@@ -732,3 +732,486 @@ def test_allowed_home_segment_set_is_pinned():
     assert all(isinstance(why, str) and why.strip() for why in _mod.ALLOWED_HOME_SEGMENTS.values()), (
         "every allowed home-path segment needs a non-empty reason"
     )
+
+
+# ---------------------------------------------------------------------------
+# A bad local-config entry is reported by position, never echoed
+# (the local roster is a personal-name list: regex and label can be names).
+# Tokens below are invented, carry no real name, and appear nowhere else.
+# ---------------------------------------------------------------------------
+
+_TOK_RE = "zqxtok7731"
+_TOK_LABEL = "vwjlab5519"
+
+
+def _load_with_entries(tmp_path, entries, capsys):
+    cfg = tmp_path / "roster.json"
+    cfg.write_text(json.dumps({"patterns": entries}))
+    patterns, present = _mod.load_local_patterns(tmp_path, cfg)
+    return patterns, present, capsys.readouterr().err
+
+
+def _good(label):
+    return {"regex": r"\b" + label + r"\b", "label": label}
+
+
+def _assert_reported_by_position(err, index, cls, entries):
+    assert f"skipping bad pattern entry {index}: {cls}" in err
+    assert _TOK_RE not in err
+    assert _TOK_LABEL not in err
+    for entry in entries:
+        assert repr(entry) not in err
+
+
+def test_bad_entry_missing_regex_reported_by_position(tmp_path, capsys):
+    bad = {"label": _TOK_LABEL}
+    entries = [_good("okone"), bad, _good("oktwo")]
+    patterns, present, err = _load_with_entries(tmp_path, entries, capsys)
+    assert present is True
+    assert [lbl for _, lbl in patterns] == ["okone", "oktwo"]
+    _assert_reported_by_position(err, 2, "KeyError", entries)
+    assert "missing key 'regex'" in err
+
+
+def test_bad_entry_missing_label_names_the_key_only(tmp_path, capsys):
+    bad = {"regex": _TOK_RE}
+    entries = [bad, _good("oktwo")]
+    patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
+    assert [lbl for _, lbl in patterns] == ["oktwo"]
+    _assert_reported_by_position(err, 1, "KeyError", entries)
+    assert "missing key 'label'" in err
+
+
+def test_bad_entry_re_error_does_not_echo_exception_text(tmp_path, capsys):
+    pattern = f"(?P={_TOK_RE})"
+    # Precondition: the re.error text really embeds the token, so a loader
+    # that appends str(exc) would leak it.
+    with pytest.raises(re.error) as info:
+        re.compile(pattern)
+    assert _TOK_RE in str(info.value)
+    # "error" on 3.12, "PatternError" on 3.13+.
+    cls = type(info.value).__name__
+    bad = {"regex": pattern, "label": "okbad"}
+    entries = [_good("okone"), bad, _good("oktwo")]
+    patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
+    assert [lbl for _, lbl in patterns] == ["okone", "oktwo"]
+    _assert_reported_by_position(err, 2, cls, entries)
+
+
+def test_bad_entry_label_is_not_echoed(tmp_path, capsys):
+    # Derive the class name ("error" on 3.12, "PatternError" on 3.13+).
+    with pytest.raises(re.error) as info:
+        re.compile(f"(?P={_TOK_RE})")
+    cls = type(info.value).__name__
+    bad = {"regex": f"(?P={_TOK_RE})", "label": _TOK_LABEL}
+    entries = [_good("okone"), bad]
+    patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
+    assert [lbl for _, lbl in patterns] == ["okone"]
+    _assert_reported_by_position(err, 2, cls, entries)
+
+
+def test_bad_entry_not_a_dict_reported_by_position(tmp_path, capsys):
+    entries = [_TOK_LABEL, _good("oktwo")]
+    patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
+    assert [lbl for _, lbl in patterns] == ["oktwo"]
+    _assert_reported_by_position(err, 1, "TypeError", entries)
+
+
+@pytest.mark.parametrize("exc_cls", [OverflowError, RecursionError])
+def test_bad_entry_other_compile_failures_are_skipped(tmp_path, capsys, monkeypatch, exc_cls):
+    real_compile = re.compile
+
+    def fake_compile(pat, *a, **k):
+        if pat == _TOK_RE:
+            raise exc_cls(_TOK_LABEL)
+        return real_compile(pat, *a, **k)
+
+    monkeypatch.setattr(_mod.re, "compile", fake_compile)
+    entries = [{"regex": _TOK_RE, "label": "okbad"}, _good("oktwo")]
+    patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
+    assert [lbl for _, lbl in patterns] == ["oktwo"]
+    _assert_reported_by_position(err, 1, exc_cls.__name__, entries)
+
+
+# ---------------------------------------------------------------------------
+# Test 14: the pattern scan reads every tracked text file (#3732)
+# ---------------------------------------------------------------------------
+#
+# Contract (written before the implementation):
+#   - scan()'s candidate set is every git-tracked file, honouring SKIP_DIRS and
+#     SKIP_FILES; the use_git=False os.walk fallback follows the same policy.
+#     An extension no longer selects a file.
+#   - a file is binary iff its first 8192 bytes hold a NUL byte; it is skipped
+#     and counted as skipped-binary.  Non-UTF-8 text is decoded with
+#     errors="replace" and IS scanned.
+#   - main() prints exactly one summary line
+#     "scan-leaks: scanned N, skipped-binary M", on clean and dirty runs, and
+#     N + M equals the number of files the scan considered.
+#   - findings and exit codes are unchanged.
+
+_ALICE_ROSTER = {"patterns": [{"regex": r"\bAlice\b", "label": "personal name"}]}
+
+_SUMMARY_RE = re.compile(r"^scan-leaks: scanned (\d+), skipped-binary (\d+)$", re.M)
+
+
+def _write_roster(root: Path) -> Path:
+    """Plant a local name roster in the fixture repo root (gitignored by name:
+    LOCAL_CONFIG_NAME is in SKIP_FILES, so it is not itself a candidate)."""
+    cfg = root / ".scan-leaks-local.json"
+    cfg.write_text(json.dumps(_ALICE_ROSTER))
+    return cfg
+
+
+def _run_scan_with_roster(root: Path):
+    """Run the scanner with the fixture's own roster (default config path)."""
+    return subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root)],
+        capture_output=True, text=True,
+    )
+
+
+def _summary(stdout: str) -> tuple[int, int]:
+    """Return (scanned, skipped-binary) from the single summary line."""
+    matches = _SUMMARY_RE.findall(stdout)
+    assert len(matches) == 1, (
+        f"expected exactly one 'scan-leaks: scanned N, skipped-binary M' line; "
+        f"stdout={stdout!r}"
+    )
+    return int(matches[0][0]), int(matches[0][1])
+
+
+def test_roster_hit_in_js_file_is_reported(tmp_path):
+    _commit_files(tmp_path, {"web/app.js": "// Alice wrote this\n"})
+    _write_roster(tmp_path)
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "web/app.js:1" in r.stderr
+    assert "personal name" in r.stderr
+
+
+def test_roster_hit_in_html_file_is_reported(tmp_path):
+    _commit_files(tmp_path, {"site/index.html": "<p>Alice</p>\n"})
+    _write_roster(tmp_path)
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "site/index.html:1" in r.stderr
+    assert "personal name" in r.stderr
+
+
+def test_roster_hit_in_extensionless_executable_is_reported(tmp_path):
+    _commit_files(
+        tmp_path,
+        {"tools/runner": "#!/bin/sh\n# Alice\n"},
+        mode={"tools/runner": 0o755},
+    )
+    _write_roster(tmp_path)
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "tools/runner:2" in r.stderr
+    assert "personal name" in r.stderr
+
+
+def test_roster_hit_in_non_utf8_text_file_is_reported(tmp_path):
+    """Non-UTF-8 text is decoded with errors="replace" and still scanned."""
+    _commit_files(tmp_path, {"notes.txt": b"caf\xe9 Alice\n"})
+    _write_roster(tmp_path)
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "notes.txt:1" in r.stderr
+    assert "personal name" in r.stderr
+
+
+def test_binary_files_are_skipped_and_counted(tmp_path):
+    _commit_files(tmp_path, {
+        "fonts/ui.ttf": b"\x00\x01\x00\x00Alice",
+        "img/logo.png": b"\x89PNG\r\n\x1a\n\x00Alice",
+        "web/app.js": "// a clean text file\n",
+    })
+    _write_roster(tmp_path)
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    scanned, skipped = _summary(r.stdout)
+    assert (scanned, skipped) == (1, 2), (
+        f"one text file scanned, two binaries skipped; stdout={r.stdout!r}"
+    )
+
+
+def test_summary_counts_partition_the_files_considered(tmp_path):
+    """N + M equals the candidate population: tracked files minus SKIP_DIRS
+    and SKIP_FILES entries."""
+    _commit_files(tmp_path, {
+        "app.js": "// js\n",
+        "page.html": "<p>x</p>\n",
+        "blob.bin": b"\x00binary",
+        "LICENSE": "MIT\n",
+        "node_modules/pkg/index.js": "// vendored\n",
+    })
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    scanned, skipped = _summary(r.stdout)
+    # app.js + page.html scanned; blob.bin binary; LICENSE (SKIP_FILES) and
+    # node_modules/ (SKIP_DIRS) are not candidates at all.
+    assert (scanned, skipped) == (2, 1), f"stdout={r.stdout!r}"
+
+
+def test_summary_line_prints_on_a_dirty_run(tmp_path):
+    _commit_files(tmp_path, {"bad.js": "path = '" + "kg_protocol" + "_for_ai" + "/x'\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "main repo path" in r.stderr
+    assert _summary(r.stdout) == (1, 0), f"stdout={r.stdout!r}"
+
+
+def test_use_git_false_fallback_scans_all_text_files(tmp_path):
+    """The os.walk fallback follows the same all-text policy (SKIP_DIRS and
+    SKIP_FILES still honoured)."""
+    (tmp_path / "app.js").write_text("Alice\n")
+    (tmp_path / "blob.bin").write_bytes(b"\x00Alice")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "vendored.js").write_text("Alice\n")
+    (tmp_path / "LICENSE").write_text("Alice\n")
+
+    leaks, scanned, skipped = _mod.scan(
+        tmp_path, [(re.compile(r"\bAlice\b"), "personal name")], use_git=False,
+    )
+    assert [rel for rel, _, _, _ in leaks] == ["app.js"]
+    assert (scanned, skipped) == (1, 1)
+
+
+def test_tracked_directory_symlink_is_not_a_candidate(tmp_path):
+    """A git-tracked symlink to a directory does not inflate either bucket.
+
+    What this pins, stated by what it was measured to catch: it reddens only
+    the CONJUNCTION of a consumer that counts unreadable entries as binary AND
+    a scanner with the ``is_file()`` filter removed. With the filter in place
+    this fixture's OSError arm is unreachable, so the cell does not discriminate
+    the filter itself — keep it for the conjunction, not for the filter."""
+    (tmp_path / "real-dir").mkdir()
+    _commit_files(tmp_path, {"real/member.py": "// clean\n"})
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "engine").symlink_to("../real-dir")
+    subprocess.run(["git", "add", "tools/engine"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "symlink"], cwd=tmp_path, check=True)
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _summary(r.stdout) == (1, 0), f"stdout={r.stdout!r}"
+
+
+# ---------------------------------------------------------------------------
+# Test 15: --roster-file and --redact (whole-tree sweep support)
+# ---------------------------------------------------------------------------
+#
+# Contract (written before the implementation):
+#   - --roster-file takes newline-separated regexes in the SAME format as the
+#     NAME_LEAK_ROSTER secret: blank lines and first-non-space-'#' lines are
+#     ignored; valid lines are scanned alongside the committed patterns and the
+#     local roster.
+#   - an invalid line is reported by 1-based LINE NUMBER, exception class and
+#     (for re.error) offset — never by its text.
+#   - the "personal-name scan skipped" advisory fires only when BOTH roster
+#     sources produced no pattern.
+#   - --redact prints every finding as repo-relative-path:line only, for BOTH
+#     families (pattern hits and absolute-home-path hits), with neither the
+#     matched text nor a label/segment.
+#   - exit codes are unchanged (0 clean, 1 leaks, 2 usage/root error).
+#
+# The tokens below are invented for these cells, appear nowhere else, and the
+# home-path fixture is assembled by _home() so the committed test file never
+# carries a complete path.
+
+_EXT_TOKEN = "qlemvort8427"
+_EXT_LABEL = "plavrisk6013"
+_BAD_ROSTER_TOKEN = "ztokq9241"
+
+
+def _external_roster(tmp_path: Path, text: str) -> Path:
+    """Write a roster file OUTSIDE the scanned root (as CI does: RUNNER_TEMP)."""
+    roster = tmp_path / "external-roster.txt"
+    roster.write_text(text, encoding="utf-8")
+    return roster
+
+
+def test_roster_file_supplies_patterns_and_suppresses_the_skip_advisory(tmp_path):
+    """The external roster finds what the local roster would not, and no skip
+    is claimed while it is supplying patterns."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
+    roster = _external_roster(tmp_path, "# a comment\n\n" + _EXT_TOKEN + "\n")
+
+    # Control: local roster absent, no external file -> clean + skip advisory.
+    without = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json")],
+        capture_output=True, text=True,
+    )
+    assert without.returncode == 0, without.stdout + without.stderr
+    assert "personal-name scan skipped" in without.stdout
+
+    # With the external roster the hit is found and the skip claim is gone.
+    with_roster = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster)],
+        capture_output=True, text=True,
+    )
+    assert with_roster.returncode == 1, with_roster.stdout + with_roster.stderr
+    assert "doc.md:1" in with_roster.stderr
+    assert "personal-name scan skipped" not in with_roster.stdout
+    assert "personal-name scan skipped" not in with_roster.stderr
+
+
+def test_redact_prints_path_and_line_only(tmp_path):
+    """--redact prints path:line for a pattern hit and neither the matched text
+    nor the roster label. The unredacted run is the control: it carries both."""
+    _commit_files(tmp_path, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
+    (tmp_path / ".scan-leaks-local.json").write_text(json.dumps(
+        {"patterns": [{"regex": _EXT_TOKEN, "label": _EXT_LABEL}]}))
+
+    plain = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
+        capture_output=True, text=True,
+    )
+    assert plain.returncode == 1, plain.stdout + plain.stderr
+    # Control: the unredacted form really does carry both, so their absence
+    # below is a property of --redact and not of the fixture.
+    assert _EXT_TOKEN in plain.stderr and _EXT_LABEL in plain.stderr
+
+    redacted = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path), "--redact"],
+        capture_output=True, text=True,
+    )
+    assert redacted.returncode == 1, redacted.stdout + redacted.stderr
+    assert "doc.md:1" in redacted.stderr
+    combined = redacted.stdout + redacted.stderr
+    assert _EXT_TOKEN not in combined, combined
+    assert _EXT_LABEL not in combined, combined
+
+
+def test_redact_hides_the_home_path_segment(tmp_path):
+    """--redact applies to the absolute-home-path family too: the username
+    segment must not reach the log."""
+    _commit_files(tmp_path, {"doc.md": "data in " + _home("zorblax") + "x\n"})
+
+    plain = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
+        capture_output=True, text=True,
+    )
+    assert plain.returncode == 1, plain.stdout + plain.stderr
+    assert "segment: zorblax" in plain.stderr  # control
+
+    redacted = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path), "--redact"],
+        capture_output=True, text=True,
+    )
+    assert redacted.returncode == 1, redacted.stdout + redacted.stderr
+    assert "doc.md:1" in redacted.stderr
+    assert "zorblax" not in (redacted.stdout + redacted.stderr)
+
+
+def test_invalid_roster_line_reports_line_and_class_without_text(tmp_path):
+    """An invalid external roster line is reported by raw 1-based line number,
+    exception class and offset — never by its text; the valid lines still run."""
+    bad_line = f"(?P={_BAD_ROSTER_TOKEN})"
+    with pytest.raises(re.error) as probe:
+        re.compile(bad_line)
+    # Precondition: this CPython embeds the token in str(exc), so a loader that
+    # appended str(exc) would leak it.
+    assert _BAD_ROSTER_TOKEN in str(probe.value)
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
+    # Line 1 is valid, 2 a comment, 3 blank, 4 the bad line.
+    roster = _external_roster(
+        tmp_path, _EXT_TOKEN + "\n# a comment\n\n" + bad_line + "\n"
+    )
+
+    r = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster), "--redact"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 1, r.stdout + r.stderr  # the valid line still fires
+    assert "doc.md:1" in r.stderr
+    assert "bad roster line 4" in r.stderr, r.stderr
+    assert type(probe.value).__name__ in r.stderr, r.stderr
+    assert f"at offset {probe.value.pos}" in r.stderr, r.stderr
+    assert _BAD_ROSTER_TOKEN not in r.stderr, r.stderr
+    assert probe.value.msg not in r.stderr and "unknown group name" not in r.stderr
+
+
+def test_absent_roster_file_is_a_usage_error(tmp_path):
+    """An explicitly named roster that cannot be read must not silently shrink
+    the scan: it is a usage error (exit 2), never a clean run."""
+    (tmp_path / "clean.py").write_text("# nothing suspicious\n")
+    r = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path),
+         "--roster-file", str(tmp_path / "no-such-roster.txt")],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Test 16: type-scoped advice (R3-5) and an all-invalid roster (R3-7)
+# ---------------------------------------------------------------------------
+
+_ROSTER_ADVICE = "do not widen or edit the roster to silence it"
+_HOME_ADVICE = "The roster does not apply to this finding."
+
+
+def test_pattern_hit_gets_the_roster_sentence(tmp_path):
+    """Control: a pattern hit IS told not to edit the roster — so the absence
+    of that sentence for a home-path hit below is a property of the hit type,
+    not of the fixture."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
+    roster = _external_roster(tmp_path, _EXT_TOKEN + "\n")
+    r = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster), "--redact"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert _ROSTER_ADVICE in r.stderr, r.stderr
+    assert _HOME_ADVICE not in r.stderr, r.stderr
+
+
+def test_home_path_hit_gets_its_own_sentence_not_the_roster_one(tmp_path):
+    """R3-5: an absolute-home-path hit has nothing to do with the roster. It
+    must not be told to leave the roster alone, and it gets its own sentence."""
+    _commit_files(tmp_path, {"doc.md": "data in " + _home("zorblax") + "x\n"})
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert _HOME_ADVICE in r.stderr, r.stderr
+    assert _ROSTER_ADVICE not in r.stderr, r.stderr
+
+
+def test_all_invalid_roster_file_is_a_usage_error(tmp_path):
+    """R3-7: an explicitly requested roster that supplies no usable pattern is
+    a usage error (exit 2), not a clean run; the count of rejected lines is
+    named and the pattern text never is.
+
+    CI pre-validates its roster before invoking this flag, so this is the
+    standalone flag's contract, not CI's.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": "hello world\n"})
+    bad = f"(?P={_BAD_ROSTER_TOKEN})"
+    roster = _external_roster(tmp_path, bad + "\n" + bad + "x\n")
+    r = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "all 2 roster line(s) were rejected" in r.stderr, r.stderr
+    assert _BAD_ROSTER_TOKEN not in r.stdout + r.stderr
+

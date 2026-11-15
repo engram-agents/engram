@@ -614,8 +614,8 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
          MCP server runs from the plugin tree, not from ENGRAM_HOME.
       2. $ENGRAM_HOME/server.py (legacy scatter-install pattern in case
          hooks were copied separately or the colocation is unusual)
-      3. ~/engram/server.py, else ~/engram-alpha/server.py (live-source dev fallback;
-         engram is the default name, engram-alpha the accepted old one)
+      3. ~/engram/src/engram/server.py, else ~/engram-alpha/src/engram/server.py (live-source
+         dev fallback; engram is the default name, engram-alpha the accepted old one)
     """
     # Hook lives at <runtime-dir>/hooks/engram-session-start-hook.py,
     # server.py lives at <runtime-dir>/server.py.
@@ -627,7 +627,7 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
     candidate = os.path.join(engram_home, "server.py")
     if os.path.exists(candidate):
         return candidate
-    return pick_checkout("/server.py") or os.path.expanduser("~/engram/server.py")
+    return pick_checkout("/src/engram/server.py") or os.path.expanduser("~/engram/src/engram/server.py")
 
 
 def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
@@ -812,6 +812,30 @@ def _backup_push_health_line(engram_home: str):
         f"⚠️  ENGRAM off-disk backup: {str(result)[:20]} since {str(since)[:30]}; "
         f"ahead {st.get('ahead')} behind {st.get('behind')}; {tail}"
     )
+
+
+_CONFIG_MISSING_LINE = (
+    "⚠️  ENGRAM substrate health: config.json is missing while knowledge.db exists; "
+    "ENGRAM tools refuse until it is restored from a backup you choose "
+    "(see the tool error for candidates)."
+)
+
+
+def _config_missing_health_line(engram_home: str):
+    """One loud line when knowledge.db exists and config.json does not (#4705, C9).
+
+    Two existence checks, no store open: the hook only reports, it never writes and never exits
+    non-zero for this. The tools refuse in that state (the tool error names the backup candidates)
+    and auto-surface returns nothing, so without this line the user would only meet it as a failing
+    tool call. An OSError on either check reads as "nothing to report" (advisory probe)."""
+    try:
+        if os.path.lexists(os.path.join(engram_home, "knowledge.db")) and not os.path.lexists(
+            os.path.join(engram_home, "config.json")
+        ):
+            return _CONFIG_MISSING_LINE
+    except OSError:
+        pass
+    return None
 
 
 def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
@@ -4174,6 +4198,9 @@ def _main_impl() -> None:
     _bp_line = _backup_push_health_line(ENGRAM_HOME)  # #4205: one bounded line, same emitter
     if _bp_line:
         _health_lines.append(_bp_line)
+    _cm_line = _config_missing_health_line(ENGRAM_HOME)  # #4705 C9: a lost config.json beside the DB
+    if _cm_line:
+        _health_lines.append(_cm_line)
     _health_text = "\n".join(_health_lines)
 
     if source == "startup":

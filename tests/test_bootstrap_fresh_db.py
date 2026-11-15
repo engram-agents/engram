@@ -52,24 +52,10 @@ def test_bootstrap_seeds_fresh_db_under_env_bypass():
         # bootstrap.py sets it itself; we're testing its own setting works.
         env.pop("ENGRAM_BOOTSTRAP", None)
 
-        # bootstrap.py imports server.py from $ENGRAM_HOME (it expects
-        # server.py to live alongside the install). For this E2E test we
-        # need to either copy server.py into engram_home (mirroring
-        # install.sh's step 4) OR run bootstrap from a place where it
-        # finds server.py. install.sh copies server.py to ENGRAM_HOME
-        # at step 4 BEFORE step 5 runs bootstrap.py. We replicate that
-        # minimal step here: copy server.py + engram_*.py runtime
-        # modules into engram_home.
+        # bootstrap.py runs in place at REPO_ROOT/src/engram/, where server.py
+        # and its runtime modules already live alongside it, so nothing is
+        # copied into engram_home.
         engram_home.mkdir(parents=True)
-        runtime_files = [
-            "server.py", "engram_client.py", "engram_confidence.py",
-            "engram_filter.py", "engram_idf.py", "engram_ids.py",
-            "engram_log_emitter.py", "engram_log_indexer.py",
-        ]
-        for fname in runtime_files:
-            src = REPO_ROOT / fname
-            if src.exists():
-                shutil.copy2(src, engram_home / fname)
 
         result = subprocess.run(
             [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
@@ -172,17 +158,6 @@ def _make_empty_db_env(workdir: Path) -> tuple[Path, dict]:
     engram_home = workdir / ".engram"
     engram_home.mkdir(parents=True)
     db_path = engram_home / "knowledge.db"
-
-    # Copy runtime modules so bootstrap can import server.py.
-    runtime_files = [
-        "server.py", "engram_client.py", "engram_confidence.py",
-        "engram_filter.py", "engram_idf.py", "engram_ids.py",
-        "engram_log_emitter.py", "engram_log_indexer.py",
-    ]
-    for fname in runtime_files:
-        src = REPO_ROOT / fname
-        if src.exists():
-            shutil.copy2(src, engram_home / fname)
 
     # Create the DB file but leave it with no nodes (no tables at all).
     conn = sqlite3.connect(str(db_path))
@@ -575,15 +550,6 @@ def _run_bootstrap_for_cleanup_test(
     claude_home.mkdir(parents=True)
     if pre_settings is not None:
         (claude_home / "settings.json").write_text(json.dumps(pre_settings))
-    runtime_files = [
-        "server.py", "engram_client.py", "engram_confidence.py",
-        "engram_filter.py", "engram_idf.py", "engram_ids.py",
-        "engram_log_emitter.py", "engram_log_indexer.py",
-    ]
-    for fname in runtime_files:
-        src = REPO_ROOT / fname
-        if src.exists():
-            shutil.copy2(src, engram_home / fname)
     env = os.environ.copy()
     env.update({
         "ALPHA_DIR": str(REPO_ROOT),
@@ -674,9 +640,7 @@ def _make_plugin_tree_env(workdir: Path) -> tuple[Path, Path, dict]:
     # is long, changes over time, and none of it needs restating here: the
     # other tests in this file run bootstrap.py IN PLACE at
     # REPO_ROOT/src/engram/, where every dependency already lives
-    # alongside it, so their own `runtime_files` copy list was always a
-    # silent no-op (src = REPO_ROOT / fname, a path that doesn't exist in
-    # this repo layout) -- it never needed to work. This test copies
+    # alongside it, so they copy nothing. This test copies
     # bootstrap.py OUT to a separate plugin-tree dir specifically to make
     # `plugin.json` presence controllable, so it genuinely needs the real
     # tree alongside it.

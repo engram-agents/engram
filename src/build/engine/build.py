@@ -1008,14 +1008,13 @@ def build_plugin(
     # outside the source_root tree (e.g. src/build/engine ships as bundle tools/engine).
     source_root = manifest.get("source_root", ".")
 
-    # Read the SSoT base version from plugin.json before stamping — this is a
-    # deliberately separate, compact read here rather than reusing the
-    # plugin_data load further down (§2. Manifests), which happens too late in
-    # execution order: build_version must exist before the copy/emit steps
-    # below that consume it.
-    base_version_plugin_json = os.path.join(repo_root, "plugin.json")
-    with open(base_version_plugin_json, encoding="utf-8") as f:
-        base_version = json.load(f).get("version", "0.1.0")
+    # Read the SSoT plugin.json ONCE, here: its "version" is the base for the
+    # build stamp, and the same dict feeds the written manifests in
+    # §2. Manifests below (which works on a copy, never the dict loaded here).
+    src_plugin_path = os.path.join(repo_root, "plugin.json")
+    with open(src_plugin_path, encoding="utf-8") as f:
+        source_plugin_data = json.load(f)
+    base_version = source_plugin_data.get("version", "0.1.0")
 
     # Compute build version once — threaded through to all version-bearing outputs
     # so all emitted files carry the same stamp within a single build invocation.
@@ -1083,9 +1082,7 @@ def build_plugin(
     # ── 2. Manifests ─────────────────────────────────────────────────────────
 
     _log(f"Writing plugin.json (version={build_version!r})")
-    src_plugin_path = os.path.join(repo_root, "plugin.json")
-    with open(src_plugin_path, encoding="utf-8") as f:
-        plugin_data = json.load(f)
+    plugin_data = dict(source_plugin_data)
     plugin_data["version"] = build_version
     with open(os.path.join(plugin_root, "plugin.json"), "w", encoding="utf-8") as f:
         json.dump(plugin_data, f, indent=2)

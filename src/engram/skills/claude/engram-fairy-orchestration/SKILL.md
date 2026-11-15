@@ -21,7 +21,7 @@ Fairies are contractors, not colleagues. The spec is the contract. A fairy has n
     ```
     tools/pre-dispatch-check.sh <NN>
     ```
-    Exit 0 (CLEAR) → safe to proceed. Exit 1 (DUPLICATE RISK) → review the listed hits before dispatching. Exit 3 (UNKNOWN) → gh unavailable; fall back to manual check. The script handles both checks — open PRs via `gh` and in-flight baton files — and uses an exact-token match so `#100` does not falsely hit when you search for `#1006`.
+    Exit 0 (CLEAR) → safe to proceed. Exit 1 (DUPLICATE RISK) → review the listed hits before dispatching. Exit 3 (UNKNOWN) → gh unavailable; fall back to manual check. The script handles both checks — open PRs via `gh` and in-flight baton files — and uses an exact-token match so `#100` does not falsely hit when you search for `#1006`. When the work belongs to an epic, run it with the epic number too: a `[part of #EPIC]` PR cites only the epic, and PR bodies are not searched. A CLEAR answer is about citations, not about work: it does not say nobody is already doing it.
   - Skipping this is the failure mode that produced PR-517 (issue #486) on 2026-05-30 — a duplicate of the counterpart's PR-502, which had already converged. Same lines, guaranteed merge conflict. The pre-check would have caught it in 5 seconds.
   - On a seat with no co-resident agent: the script notes "baton check skipped" when `/home/agents-shared/forum/projects/` is absent; the PR check still runs.
 - **Self-contained prompt.** Include repo path, branch baseline, template commit/PR to read, scope, validation step. Inline (don't link to) any node IDs or context-laden references the fairy needs.

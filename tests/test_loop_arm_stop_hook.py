@@ -918,3 +918,51 @@ def test_delta_isolation_prior_confirmation_does_not_bleed_into_later_turn(tmp_p
         f"Turn 2 with no new confirmation must EMIT -- the turn-1 "
         f"confirmation must not bleed into turn 2's delta; stdout={stdout2!r}"
     )
+
+
+# ===========================================================================
+# engram-agents/engram#1855: the recorded offset is the size the delta scan
+# used, not a second stat taken after the decision path.
+# ===========================================================================
+
+
+def test_race_recorded_offset_is_scanned_size_1855(tmp_path, monkeypatch):
+    import importlib.util
+    import io
+
+    home = tmp_path / "engram"
+    home.mkdir()
+    _write_loop_marker(home)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    sw, cl = _batched_arm_records(
+        "toolu_race_sw", "toolu_race_cl", _REAL_LOOP_PROMPT, "msg_race_1"
+    )
+    _append_lines(transcript, sw, cl)
+
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    spec = importlib.util.spec_from_file_location("loop_arm_hook_race_instance", HOOK_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    scan_sizes: list = []
+    real = os.path.getsize
+
+    def fake(path):
+        size = real(path)
+        if os.fspath(path) == str(transcript) and sys._getframe(1).f_code.co_name != "write_offset_state":
+            scan_sizes.append(size)
+            with open(transcript, "ab") as f:  # the harness flushes more after this stat
+                f.write(b'{"late":1}\n')
+        return size
+
+    monkeypatch.setattr(os.path, "getsize", fake)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(_make_stop_payload(str(transcript))))
+    mod.main()
+
+    recorded = json.loads(
+        Path(mod._LOOP_ARM_STATE_FILE).read_text(encoding="utf-8")
+    )["byte_offset"]
+    assert scan_sizes, "the hook never stat'd the transcript for a scan"
+    assert recorded == scan_sizes[-1]  # the size of the LAST scan, not a fresh stat
+    assert os.path.getsize(transcript) > recorded

@@ -281,7 +281,7 @@ Run the worktree garbage-collector once per day to remove worktrees whose PRs ha
 "$HOME/.engram/venv/bin/python3" tools/worktree-gc.py --apply
 ```
 
-Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), and never touches the main checkout. Dry-run mode (`"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py` without `--apply`) is available if you want to preview the plan first. Idempotent — a second run on a clean state is a no-op.
+Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), keeps the worktree the deploy record names as the upgrade source (`deployed_from`), and never touches the main checkout. Dry-run mode (`"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py` without `--apply`) is available if you want to preview the plan first. Idempotent — a second run on a clean state is a no-op.
 
 Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present (pre-T2 install or worktree GC not yet shipped).
 
@@ -579,6 +579,51 @@ fi
 **Skip if source directory is absent** (tool exits 0 with "0 copied" automatically).
 
 **Deduplication**: uncompressed — skips if size AND mtime match (within 1s); compressed (`--compress`) — skips if mtime matches (within 1s, size not compared since .gz wraps vary). Re-copies if the relevant check fails.
+
+---
+
+### Step 4.8 — Archive the day's transcripts (compressed, kept forever)
+
+Run the transcript archive tool and **capture the result for the sleep summary**. It
+archives every `.jsonl` transcript under `~/.claude/projects/` (subagent transcripts
+included) into `${ENGRAM_HOME:-$HOME/.engram}/transcript-archive/`: one xz-compressed file
+per run, holding only the bytes written since the last run (a per-file byte watermark, no
+timestamps). A run with nothing new writes no file.
+
+```bash
+transcript_archive_out=$("$HOME/.engram/venv/bin/python3" \
+    "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/archive_transcripts.py" \
+    2>&1)
+transcript_archive_rc=$?
+if [ $transcript_archive_rc -eq 0 ]; then
+    transcript_archive_status="✓ transcript archive OK: $transcript_archive_out"
+else
+    transcript_archive_status="⚠ transcript archive FAILED: $transcript_archive_out"
+fi
+```
+
+**This step has no off switch, no `--retain`, and it never deletes anything**: archives are
+kept forever, and sleep runs it every night. (Steps 4.6 and 4.7 are the older copies; a
+later change retires the 4.7 mirror.)
+
+**Non-blocking for sleep**: a failure does not abort sleep (the transcripts still exist in
+`~/.claude/projects/`), but it is **loud**: surface the status line in the history milestone
+(Step 4) so a recurring failure is visible, not silent. Two kinds. A **per-file problem**
+(a transcript shrank below its archived size, or a file name cannot be stored in the archive)
+is reported with the path and the numbers while **every other transcript is still archived**;
+the run exits 2. What you do next: look at the named file. The watermark is kept, and the file
+is archived again once the source grows past it. A **run failure** (an unreadable archive, or a
+file that came back short while being read) writes nothing and names the path.
+
+```
+- transcript archive: $transcript_archive_status
+```
+
+**Skip if the source directory is absent** (the tool exits 0 with a `0 new bytes` summary).
+
+**Replay** (to restore or to check): `archive_transcripts.py --replay <empty dir>` rebuilds
+every archived transcript there, byte for byte. Raw transcripts stay on this machine: the
+archive folder is git-ignored and owner-only, and only `.jsonl` files are covered.
 
 ---
 

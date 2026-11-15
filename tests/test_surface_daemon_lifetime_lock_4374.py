@@ -6,8 +6,11 @@ read: Zephyr, comment 6665696239.
 Contract (written before the implementation):
   * D1  main()'s FIRST act is a non-blocking exclusive lock on
         `LOCK_PATH` (= <ENGRAM_HOME>/recall-daemon.lockdir), taken with
-        engram_core._acquire_lock_dir, held until the process exits, and the
-        lock directory is never deleted.
+        engram_core._acquire_lock_dir, held until the process exits, except
+        the known-live-pid exit-0 refusal closes only its own descriptor
+        before its refusal backoff. The 75/76 safety refusals and every
+        serving path retain the lock for process life; the lock directory is
+        never deleted.
   * D2  lock held by another process -> a daemon of this version is alive:
         ONE stderr line saying "another process holds the daemon lock", exit 0,
         socket and pidfile untouched. Same when there is no socket file.
@@ -216,7 +219,7 @@ class _Base(unittest.TestCase):
         rows.extend(extra)
         return "".join(f"{pid:>6} {uid:>5} {cmd}\n" for pid, uid, cmd in rows)
 
-    def _run_gate(self, mod=None, darwin=True, lsof_rc=1, lsof_out="", ps=None, real_ps=False, force_proc=False):
+    def _run_gate(self, mod=None, darwin=True, lsof_rc=1, lsof_out="", ps=None, real_ps=False, force_proc=False, wait_stub=None):
         """Run the REAL main() up to the gate and no further.
 
         Returns (code, stderr_text): the SystemExit code if the gate exited,
@@ -237,7 +240,7 @@ class _Base(unittest.TestCase):
         code = None
         with self._env(darwin, lsof_rc, lsof_out, ps, real_ps, force_proc), unittest.mock.patch.dict(
             sys.modules, {"engram_client": fake}
-        ):
+        ), unittest.mock.patch.object(mod, "_wait_refusal_backoff", wait_stub) if wait_stub else contextlib.nullcontext():
             with contextlib.redirect_stderr(err):
                 try:
                     mod.main()
@@ -298,6 +301,30 @@ class TestT2LockHeldElsewhere(_Base):
         code, err = self._run_gate()
         self.assertEqual(code, 0, err)
         self.assertIn("another process holds the daemon lock", err)
+
+    def test_lock_held_elsewhere_exit_0_waits_with_default_backoff(self):
+        self._hold_lock_in_child()
+        os.environ.pop("ENGRAM_DAEMON_REFUSAL_BACKOFF_S", None)
+        calls = []
+        code, err = self._run_gate(wait_stub=calls.append)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, [60])
+
+    def test_lock_held_elsewhere_exit_0_passes_explicit_zero_backoff(self):
+        self._hold_lock_in_child()
+        os.environ["ENGRAM_DAEMON_REFUSAL_BACKOFF_S"] = "0"
+        calls = []
+        code, err = self._run_gate(wait_stub=calls.append)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, [0])
+
+    def test_lock_held_elsewhere_exit_0_passes_positive_override_backoff(self):
+        self._hold_lock_in_child()
+        os.environ["ENGRAM_DAEMON_REFUSAL_BACKOFF_S"] = "7"
+        calls = []
+        code, err = self._run_gate(wait_stub=calls.append)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, [7])
 
     def test_t2b_a_running_daemon_keeps_the_lock_after_the_gate(self):
         """m3 detector: a first daemon passes the gate and keeps running; a

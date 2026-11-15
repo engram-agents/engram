@@ -76,11 +76,12 @@ class Item(NamedTuple):
 class Entry(NamedTuple):
     path: Path
     new_text: "str | None"
-    state: str           # absent | identical | differs | owned | dangling | blocked | obstructed
+    state: str           # absent | identical | differs | owned | dangling | blocked | obstructed | unreadable
     backup: "Path | None"  # the stamped backup the current bytes would be saved to (differs only)
     first_backup: "Path | None" = None  # `<name>.pre-engram`, when it would also be written
     first_identity: bool = False
     owned: bool = False
+    note: str = ""       # unreadable: the error that stopped the same-file check
 
 
 class Plan(NamedTuple):
@@ -198,16 +199,24 @@ def classify(path: Path, new_text: "str | None") -> str:
     return "differs"
 
 
-def _backup_name_is_the_file_itself(path: Path, first: Path) -> bool:
-    """True if `first` (`<name>.pre-engram`) is the same file as `path`: a hard link, or a
-    symlink that resolves to it. Replacing `path` would then overwrite that backup too. A
-    dangling link or a directory at that name is a different case (never the same file)."""
-    if not target_present(first):
-        return False
+SAME, DIFFERENT, UNKNOWN = "same", "different", "unknown"
+
+
+def same_file(path: Path, other: Path) -> "tuple[str, OSError | None]":
+    """Is `other` the same file as `path`? One of three answers, with the error for UNKNOWN.
+
+    SAME: a hard link to `path`, or a link that resolves to it. DIFFERENT: another file, or
+    nothing there (a missing name or a path through a non-directory cannot be `path`; this is
+    the ordinary first-install case and must go ahead). UNKNOWN: something is there or cannot
+    be examined, and the check failed (permission, a link loop, an I/O error). Every caller
+    refuses on UNKNOWN with its own message: a yes/no answer would have to guess, and guessing
+    "different" lets a replace overwrite the only backup. This is the one place that decides."""
     try:
-        return os.path.samefile(path, first)
-    except OSError:
-        return False
+        return (SAME if os.path.samefile(path, other) else DIFFERENT), None
+    except (FileNotFoundError, NotADirectoryError):
+        return DIFFERENT, None
+    except OSError as e:
+        return UNKNOWN, e
 
 
 def _is_directly_in(path: Path, home: "Path | None") -> bool:
@@ -227,13 +236,18 @@ def plan(items: Iterable[Item], stamp: "str | None" = None, home: "Path | None" 
     entries = []
     for it in items:
         state = classify(it.path, it.new_text)
-        if state == "differs" and it.first_identity and _backup_name_is_the_file_itself(it.path, _pre_engram(it.path)):
-            state = "obstructed"
+        note = ""
+        if state == "differs" and it.first_identity:
+            verdict, err = same_file(it.path, _pre_engram(it.path))
+            if verdict == SAME:
+                state = "obstructed"
+            elif verdict == UNKNOWN:
+                state, note = "unreadable", str(err)
         if state == "differs" and it.owned and it.path.name in ENGRAM_OWNED_NAMES and _is_directly_in(it.path, home):
             state = "owned"
         backup = _next_backup_name(it.path, stamp) if state == "differs" else None
         first = _first_backup_name(it.path, it.first_identity) if state == "differs" else None
-        entries.append(Entry(it.path, it.new_text, state, backup, first, it.first_identity, it.owned))
+        entries.append(Entry(it.path, it.new_text, state, backup, first, it.first_identity, it.owned, note))
     return Plan(tuple(entries), stamp, home)
 
 
@@ -248,7 +262,7 @@ def refusal(p: Plan, consent: Consent = NO_CONSENT, context: str = "") -> "str |
     the same form `--replace PATH` is compared in.
     """
     need = [e for e in p.entries if e.state == "differs" and not consent.allows(e.path)]
-    stuck = [e for e in p.entries if e.state in ("dangling", "blocked", "obstructed")]
+    stuck = [e for e in p.entries if e.state in ("dangling", "blocked", "obstructed", "unreadable")]
     if not need and not stuck:
         return None
     lines = ["[bootstrap] REFUSED: no existing file was changed."]
@@ -283,6 +297,13 @@ def refusal(p: Plan, consent: Consent = NO_CONSENT, context: str = "") -> "str |
                 f"  - {where}: its backup name {first} is the same file as {where} (a hard "
                 f"link or a link to it), so replacing {where.name} would overwrite that backup "
                 f"too. Move that backup name aside (mv '{first}' '{first}.moved-aside'), then re-run."
+            )
+        elif e.state == "unreadable":
+            first = where.parent / (where.name + FIRST_BACKUP_SUFFIX)
+            lines.append(
+                f"  - {where}: could not tell whether its backup name {first} is the same file "
+                f"as {where} ({e.note}), so {where.name} was not replaced. Fix that, or move the "
+                f"backup name aside (mv '{first}' '{first}.moved-aside'), then re-run."
             )
         else:
             lines.append(
@@ -398,6 +419,23 @@ def _replace_contents(fd: int, data: bytes) -> None:
     os.fsync(fd)
 
 
+class WriteRefused(SystemExit):
+    """A refused `write_in_place`, carrying the state it left the file in as data.
+
+    `.outcome` is exactly one of "nothing_written" (the open, the regular-file check or the read
+    before the write failed; the file was never touched), "restored" (the write failed part-way
+    and the old bytes were put back) or "may_be_incomplete" (the write failed and the put-back
+    failed too). `.backup` is the Path (or None) that `write_in_place` was given. `str(exc)` is
+    the one REFUSED line, so a catch of SystemExit that only reads the text is unaffected; a
+    caller that adds its own sentence about the file's state reads `.outcome`, not the class.
+    """
+
+    def __init__(self, message: str, outcome: str, backup: "Path | None"):
+        super().__init__(message)
+        self.outcome = outcome
+        self.backup = backup
+
+
 def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     """Rewrite the EXISTING regular file `path` with `text`, in place. `backup` is the copy
     the caller already saved (None only for an ENGRAM-owned file, which is never backed up).
@@ -406,8 +444,8 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     file's ACL and extended attributes, its owner and group, and its other hard links. Writing
     into the same inode keeps all of them, as v0.5.6 did. What that gives up is atomicity, which
     is why every caller saves the stamped backup BEFORE calling this, and why a write that
-    fails part-way first puts the old bytes back. Every failure is a SystemExit with one
-    REFUSED line naming `backup`. The residual, accepted on purpose: a kill (SIGKILL, power
+    fails part-way first puts the old bytes back. Every failure is a WriteRefused (a SystemExit; `.outcome` says
+    which state the file is in) with one REFUSED line naming `backup`. The residual, accepted on purpose: a kill (SIGKILL, power
     loss) during the write gets no put-back and prints nothing, so the file can be left
     incomplete; the backup saved before the write is then the copy to restore from.
 
@@ -437,31 +475,36 @@ def write_in_place(path: Path, text: str, backup: "Path | None") -> None:
     try:
         fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as e:
-        raise SystemExit(f"[bootstrap] REFUSED: could not open {path} to write it ({e}); it was not changed. {saved}")
+        raise WriteRefused(f"[bootstrap] REFUSED: could not open {path} to write it ({e}); it was not changed. {saved}",
+                           "nothing_written", backup)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise SystemExit(f"[bootstrap] REFUSED: {path} is not a regular file, so it was not written. {saved}")
+            raise WriteRefused(f"[bootstrap] REFUSED: {path} is not a regular file, so it was not written. {saved}",
+                               "nothing_written", backup)
         old = b""
         try:
             while chunk := os.read(fd, 1 << 20):
                 old += chunk
         except OSError as e:
-            raise SystemExit(f"[bootstrap] REFUSED: could not read {path} before writing it ({e}); it was not changed. {saved}")
+            raise WriteRefused(f"[bootstrap] REFUSED: could not read {path} before writing it ({e}); it was not changed. {saved}",
+                                   "nothing_written", backup)
         try:
             _replace_contents(fd, data)
         except BaseException as e:  # Ctrl-C too: put the old bytes back, then let it go on
             try:
                 _replace_contents(fd, old)
             except BaseException as e2:
-                raise SystemExit(
+                raise WriteRefused(
                     f"[bootstrap] REFUSED: could not write {path} ({e!r}), and putting its previous "
-                    f"contents back also failed ({e2!r}), so it may be incomplete. {restore}"
+                    f"contents back also failed ({e2!r}), so it may be incomplete. {restore}",
+                    "may_be_incomplete", backup,
                 )
             if not isinstance(e, OSError):
                 raise
-            raise SystemExit(
+            raise WriteRefused(
                 f"[bootstrap] REFUSED: could not write {path} ({e}); its previous contents were "
-                f"put back. {saved}"
+                f"put back. {saved}",
+                "restored", backup,
             )
     finally:
         os.close(fd)
@@ -505,10 +548,17 @@ def backup_path_problem(path: Path, backup: Path) -> "str | None":
             f"does not exist ({os.readlink(backup)}), so {path} cannot be saved there. "
             f"Move the link aside or repair it, then re-run."
         )
-    if target_present(backup) and os.path.samefile(path, backup):
+    verdict, err = same_file(path, backup)
+    if verdict == SAME:
         return (
             f"[bootstrap] REFUSED: the backup path {backup} is the same file as {path} "
             f"(a hard link or link to it), so it would be overwritten too. Move "
+            f"'{backup}' away, then re-run."
+        )
+    if verdict == UNKNOWN:
+        return (
+            f"[bootstrap] REFUSED: could not tell whether the backup path {backup} is the same "
+            f"file as {path} ({err}), so nothing was written there. Fix that, or move "
             f"'{backup}' away, then re-run."
         )
     if target_present(backup) and not backup.is_file():

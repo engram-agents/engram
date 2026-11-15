@@ -285,8 +285,15 @@ exec "$REAL_PY" "$@"
     def calls_starting(self, prefix):
         return [c for c in self.call_lines() if c.startswith(prefix)]
 
-    def make_db(self, nodes):
+    def make_db(self, nodes, config=True):
+        """An installed seat's knowledge.db. It carries its config.json too (#4705: step 3 refuses a
+        database whose config.json is lost). ``config=True`` writes ``{}`` ONLY when config.json does not
+        exist; an existing config.json is left byte-identical (callers plant their own first).
+        ``config=False`` writes nothing to config.json and does not delete an existing one: the caller
+        owns that state."""
         self.engram.mkdir(parents=True, exist_ok=True)
+        if config and not (self.engram / "config.json").exists():
+            (self.engram / "config.json").write_text("{}\n")
         con = sqlite3.connect(str(self.engram / "knowledge.db"))
         con.execute("CREATE TABLE nodes (id TEXT)")
         con.executemany("INSERT INTO nodes VALUES (?)", [("n%d" % i,) for i in range(nodes)])
@@ -470,9 +477,19 @@ def test_db_non_empty_skips_bootstrap_and_prints_the_node_count(sb):
     assert sb.calls_starting("selfcheck") == ["selfcheck --phase installed"]
 
 
+def test_make_db_never_overwrites_a_planted_config_json(sb):
+    """#4705 r4: other test files plant their own config.json before make_db; the helper must leave it alone."""
+    sb.engram.mkdir(parents=True, exist_ok=True)
+    planted = b'{"self_lineage": "anthropic:opus", "k": [1, 2]}\n'
+    (sb.engram / "config.json").write_bytes(planted)
+    sb.make_db(3)
+    assert (sb.engram / "config.json").read_bytes() == planted
+
+
 def test_unreadable_db_fails_step_6_instead_of_guessing(sb):
     sb.engram.mkdir(parents=True, exist_ok=True)
     (sb.engram / "knowledge.db").write_text("this is not a sqlite file at all, just text padding " * 4)
+    (sb.engram / "config.json").write_text("{}\n")  # #4705: the DB is unreadable, the config is not lost
     r = sb.run("--yes")
     assert r.returncode != 0 and "FAIL: [step 6]" in r.stderr, r.all
     assert not sb.calls_starting("bootstrap")
@@ -942,6 +959,31 @@ def test_header_states_the_step_1_no_fetch_gap():
     assert "stale" in head and "origin/*" in head
     assert "--branch" in head and "shallow" in head
     assert "git fetch --tags origin" in head
+    # #4645: a shallow single-branch tag clone is NOT rescued by the tags-only fetch.
+    flat = " ".join(line.lstrip("# ").strip() for line in head.splitlines())  # undo comment wrapping
+    assert "does NOT rescue a shallow clone" in flat
+    assert "set-branches origin" in head and "--unshallow" in head
+    # The full-clone remedy must survive on its own: the shallow sentence also names the tags-only
+    # fetch, so a bare "git fetch --tags origin" check cannot tell if the full-clone case is dropped.
+    assert "full clone with stale origin/* refs: `git fetch --tags origin`" in flat
+
+
+def test_step_1_refusal_names_both_remedies_for_stale_and_shallow_clones(tmp_path):
+    """#4645: a HEAD that is not a deployable tag merged into origin/dev is refused at step 1. The
+    printed remedy must cover a full clone with stale refs (git fetch --tags origin) AND a shallow
+    single-branch clone (set-branches + --unshallow), for which the tags-only fetch does nothing."""
+    sb2 = Sandbox(tmp_path)
+    sb2.commit_on_branch("unmerged-feature")
+    r = sb2.run("--yes")
+    assert r.returncode != 0 and "FAIL: [step 1]" in r.stderr, r.all
+    assert "is not a deployable tag merged into origin/dev or origin/main" in r.stderr
+    # The full-clone remedy is pinned by its own sentence; the shallow sentence also names the
+    # tags-only fetch, so a bare substring check could not see the full-clone case dropped.
+    assert "full clone with stale refs, run git fetch --tags origin first" in r.stderr
+    assert "set-branches origin" in r.stderr and "--unshallow" in r.stderr
+    # The copyable command ends the message: no punctuation glued to it.
+    assert r.stderr.rstrip().endswith("git remote set-branches origin '*' && git fetch --unshallow")
+    assert "--sandbox-untagged is for a test rig only" in r.stderr
 
 
 # ═══ #4255 slice 1: the --multi-agent / --single-agent axis is retired ═════════════════════════

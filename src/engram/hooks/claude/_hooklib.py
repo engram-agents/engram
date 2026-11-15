@@ -368,7 +368,8 @@ def resolve_own_server_py_path(engram_home: str) -> str:
          bug class, not just re-reading the source.)
       2. `$ENGRAM_HOME/server.py` (legacy scatter-install pattern, in case
          hooks were copied separately from server.py).
-      3. `~/engram/server.py`, else `~/engram-alpha/server.py` (live-source dev fallback).
+      3. `~/engram/src/engram/server.py`, else `~/engram-alpha/src/engram/server.py`
+         (live-source dev fallback; server.py lives under `src/engram/` in the repo).
 
     Returns an absolute path suitable for a SCOPED `pgrep -f <path>` match.
     Never returns a bare "server.py" -- an unscoped pgrep -f server.py
@@ -385,7 +386,7 @@ def resolve_own_server_py_path(engram_home: str) -> str:
     candidate = os.path.join(engram_home, "server.py")
     if os.path.exists(candidate):
         return candidate
-    return pick_checkout("/server.py") or os.path.expanduser("~/engram/server.py")
+    return pick_checkout("/src/engram/server.py") or os.path.expanduser("~/engram/src/engram/server.py")
 
 
 def is_own_server_py_running(engram_home: str) -> bool:

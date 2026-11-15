@@ -13,8 +13,17 @@ This tool classifies each worktree and removes the safely-finished ones:
   PRUNE   branch worktree whose PR is MERGED or CLOSED (gh), worktree clean,
           AND no live process has its CWD inside it (fairy not still running)
   PRUNE   detached-HEAD worktree, clean, whose head SHA matches NO open PR
-          (reviewer-fairy leftover; nothing to lose)
+          AND whose head commit is reachable from some ref (any ref under refs/:
+          branch, tag, remote-tracking or other), so removing the worktree
+          loses no commit
   PRUNE   `worktree-agent-*` / `review-*` tmp-branch worktree, clean
+  KEEP    a worktree the deploy record names (`deployed_from` in
+          `<ENGRAM_HOME>/.deployed-version`): the upgrade flow's source tree,
+          load-bearing though it looks like a leftover (#4157); checked before
+          any prune of an existing worktree. EVERY `deployed_from` value is
+          protected: the readers of the record do not agree when it has several
+          lines (flows.py keeps the last value; cli.py keeps the last one that
+          names an existing directory, and does not accept spaces around the key)
   KEEP    branch worktree whose PR is OPEN (active work)
   KEEP    branch worktree with NO PR (pre-PR or abandoned — flagged for a human)
   SKIP    an AGENT-OWNED worktree (branch `worktree-agent-*` / `review-*`, or any
@@ -24,6 +33,9 @@ This tool classifies each worktree and removes the safely-finished ones:
           CWD, so /proc cannot see it (#2808)
   SKIP    any worktree that is DIRTY (uncommitted changes) — never destroy work
   SKIP    any worktree that has a live process with CWD inside it (in-use guard)
+  SKIP    detached-HEAD worktree whose head commit is in NO ref (it would
+          survive only in the reflog), or whose reachability could not be
+          verified (#4509)
   SKIP    detached-HEAD worktree whose head SHA is an OPEN PR's head (a
           reviewer's `refs/pr/<N>` checkout), or whose open-PR state could not
           be verified (gh unavailable) — never prune on unknown
@@ -67,6 +79,16 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+# The ONE ENGRAM-home resolver for tools lives in tools/_owner_read.py (#3863);
+# resolve the package root through the symlink so `from tools import ...` works
+# run as a script, loaded by path, or from the flattened plugin layout (same
+# shim as deference_baseline.py).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+
+from tools import _owner_read as owner_read  # noqa: E402
 
 # #2808: an agent-owned worktree younger than this is never pruned. The /proc
 # in-use scan cannot see a running fairy (it is not a process holding a CWD).
@@ -122,6 +144,34 @@ def _is_clean(path: str) -> bool:
     # Untracked-only is still "has stuff" — but fairy worktrees commit their work,
     # so any porcelain output (tracked or untracked) means don't auto-remove.
     return rc == 0 and out.strip() == ""
+
+
+def _deploy_sources() -> frozenset[str]:
+    """The realpaths of EVERY directory `<ENGRAM_HOME>/.deployed-version` names
+    as `deployed_from`; empty when the record cannot be read (#4157).
+
+    The upgrade flow uses a `deployed_from` directory as the SOURCE_DIR of the
+    next upgrade, so a worktree there is load-bearing even though it looks like
+    a prunable leftover. The record's readers do not agree when it carries
+    several lines (flows.py keeps the last value; cli.py keeps the last one that
+    names an existing directory, and does not accept spaces around the key), so
+    every value is protected: that is right whichever reader runs.
+    Fails open to the empty set (today's classification) on a missing,
+    unreadable or malformed record, an empty value, or an unresolvable home.
+    """
+    found: set[str] = set()
+    try:
+        record = owner_read.engram_home() / ".deployed-version"
+        with open(record, encoding="utf-8") as f:
+            for line in f:
+                # Same rule as the readers it must agree with: flows.py
+                # `_read_deployed_version` and the upgrade flow in cli.py.
+                key, sep, value = line.strip().partition("=")
+                if sep and key.strip() == "deployed_from" and value.strip():
+                    found.add(os.path.realpath(value.strip()))
+    except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
+        return frozenset()
+    return frozenset(found)
 
 
 def _is_in_use(path: str) -> bool:
@@ -307,6 +357,19 @@ def _pr_for_sha(sha: str, root: str) -> tuple[bool, int | None]:
     return True, heads.get(sha)
 
 
+def _refs_containing(sha: str, root: str) -> list[str]:
+    """Names of every ref (any ref under refs/, not only branches and tags) whose history holds
+    `sha`. Raises RuntimeError when git cannot answer; a worktree's HEAD is not
+    a ref, so an empty list means the commit lives only in the worktree."""
+    rc, out, err = _run(
+        ["git", "for-each-ref", "--contains", sha, "--format=%(refname)"],
+        cwd=root,
+    )
+    if rc != 0:
+        raise RuntimeError(f"git for-each-ref rc={rc}: {err.strip()}")
+    return [ln for ln in out.splitlines() if ln.strip()]
+
+
 def classify(t: dict, root: str, *, main_path: str | None = None,
              age_guard_seconds: int = AGE_GUARD_SECONDS) -> tuple[str, str]:
     """Return (action, reason). action in {PRUNE, KEEP, SKIP, MAIN}.
@@ -320,6 +383,12 @@ def classify(t: dict, root: str, *, main_path: str | None = None,
     path = t["path"]
     if not Path(path).exists():
         return "PRUNE", "worktree directory missing (stale admin record)"
+    # Deploy source (#4157): before any prune of an existing worktree (a missing
+    # directory above is still PRUNEd: only its admin record goes). The upgrade
+    # flow reads `deployed_from` and uses that directory as the next upgrade's
+    # source tree; its readers do not agree on several lines, so all are protected.
+    if os.path.realpath(path) in _deploy_sources():
+        return "KEEP", "deploy source — the deploy record's deployed_from; the next upgrade needs it"
     if not _is_clean(path):
         return "SKIP", "DIRTY — uncommitted changes; not removing"
     branch = t.get("branch")
@@ -342,14 +411,26 @@ def classify(t: dict, root: str, *, main_path: str | None = None,
         # only when the open-PR lookup ran successfully AND no open PR points
         # at this SHA. If the lookup failed we cannot tell, and a delete verb
         # must fail toward keeping.
+        head = t.get("head") or ""
         try:
-            verified, pr_number = _pr_for_sha(t.get("head") or "", root)
+            verified, pr_number = _pr_for_sha(head, root)
         except Exception:  # gh unavailable / subprocess error / unexpected output
             verified, pr_number = False, None
         if not verified:
             return "SKIP", "detached HEAD but open-PR state unverified (gh lookup failed); not pruning"
         if pr_number is not None:
             return "SKIP", f"detached HEAD matches OPEN PR #{pr_number}; not pruning"
+        # Pruning drops the worktree; a HEAD commit no ref contains would then
+        # survive only in the reflog (#4509). Fail closed if git cannot say.
+        try:
+            refs = _refs_containing(head, root)
+        except Exception:  # nonzero rc / OSError: reachability unknown
+            return "SKIP", (f"detached HEAD {head[:7]}: reachability could not be "
+                            "verified (git for-each-ref failed); not pruning")
+        if not refs:
+            return "SKIP", (f"detached HEAD commit {head[:7]} exists only in this "
+                            "worktree (no ref contains it); "
+                            "not pruning")
         return "PRUNE", "detached HEAD, clean (reviewer-fairy leftover)"
     if branch.startswith("worktree-agent-") or branch.startswith("review-"):
         if _is_in_use(path):

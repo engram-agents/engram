@@ -339,7 +339,11 @@ def _checkpoint_internal(message: str, advance_turn: bool, session_id=None) -> s
 
     if advance_turn:
         new_turn = old_turn + 1
-        core._set_current_turn(new_turn)
+        try:
+            core._set_current_turn(new_turn)
+        except engram_config_io.ConfigMissingError as exc:
+            # #1989: loud, named, process alive; str(exc), never a repr wrapper.
+            return json.dumps({"error": str(exc)})
     else:
         new_turn = old_turn  # no advancement
 
@@ -883,7 +887,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                 {
                     "id": p["id"],
                     "name": core._metadata_dict(p["metadata"]).get("name", ""),
-                    "role": core._metadata_dict(p["metadata"]).get("role", ""),
+                    "role": core.person_relation(core._metadata_dict(p["metadata"])),
                     "since": p["created_at"],
                 }
                 for p in people

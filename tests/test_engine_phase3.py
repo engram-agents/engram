@@ -1130,3 +1130,89 @@ class TestRootFileManifestDerivation:
             f"Root-level manifest entries missing from dev build: {missing} "
             "(manifest-derived root copy must ship every declared root entry)"
         )
+
+
+# ---------------------------------------------------------------------------
+# E. build_plugin() version wiring, end to end (#1624)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPluginVersionWiring:
+    """Contract: the plugin.json build_plugin() writes carries
+    '<source plugin.json version>-dev.<stamp>.<sha7 or unknown>', the codex
+    manifest carries the same stamp, and the source plugin.json is opened
+    exactly once per build_plugin() call.
+
+    The source version is a SENTINEL: the patched open() serves the real
+    plugin.json with only its "version" replaced by _SENTINEL_VERSION, so an
+    implementation that hardcodes any version string (including today's real
+    one) cannot pass. Only builtins.open() reads are counted and served: a
+    read through pathlib or io.open() is neither counted nor served, and would
+    see the real version.
+    """
+
+    _SENTINEL_VERSION = "97.98.99"
+
+    @classmethod
+    def _build_counting_opens(cls, plugin_root: str, target: str) -> int:
+        """Run build_plugin() against the real repo tree; return how many times
+        the source plugin.json was opened. That one file is served with the
+        sentinel version."""
+        import builtins
+        import io
+        from unittest import mock
+
+        from tools.engine.build import build_plugin
+
+        src = os.path.realpath(os.path.join(REPO_ROOT, "plugin.json"))
+        real_open = builtins.open
+        opens = []
+
+        def counting_open(file, *args, **kwargs):
+            try:
+                is_src = os.path.realpath(os.fspath(file)) == src
+            except TypeError:
+                is_src = False  # file descriptor, not a path
+            if not is_src:
+                return real_open(file, *args, **kwargs)
+            opens.append(file)
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if any(c in mode for c in "wax+b"):
+                return real_open(file, *args, **kwargs)
+            with real_open(file, *args, **kwargs) as f:
+                data = json.load(f)
+            data["version"] = cls._SENTINEL_VERSION
+            return io.StringIO(json.dumps(data))
+
+        with mock.patch.object(builtins, "open", counting_open):
+            build_plugin(
+                repo_root=REPO_ROOT,
+                plugin_root=plugin_root,
+                tier="essential",
+                target=target,
+            )
+        return len(opens)
+
+    def test_written_plugin_json_version_is_source_version_stamped(self, tmp_path):
+        bundle = str(tmp_path / "cc")
+        self._build_counting_opens(bundle, "claude-code")
+        with open(os.path.join(bundle, "plugin.json"), encoding="utf-8") as f:
+            written = json.load(f)
+        pattern = rf"^{re.escape(self._SENTINEL_VERSION)}-dev\.\d{{14}}\.(g?[0-9a-f]{{7,}}|unknown)$"
+        assert re.match(pattern, written["version"]), (
+            f"written version {written['version']!r} is not "
+            f"'{self._SENTINEL_VERSION}-dev.<stamp>.<sha|unknown>'"
+        )
+
+    def test_source_plugin_json_opened_exactly_once_claude_code(self, tmp_path):
+        assert self._build_counting_opens(str(tmp_path / "cc"), "claude-code") == 1
+
+    def test_codex_manifest_carries_same_build_version_and_single_read(self, tmp_path):
+        bundle = str(tmp_path / "cx")
+        assert self._build_counting_opens(bundle, "codex") == 1
+        with open(os.path.join(bundle, "plugin.json"), encoding="utf-8") as f:
+            written = json.load(f)
+        with open(os.path.join(bundle, ".codex-plugin", "plugin.json"), encoding="utf-8") as f:
+            codex = json.load(f)
+        assert codex["version"] == written["version"]
+        assert written["version"].startswith(self._SENTINEL_VERSION + "-dev.")

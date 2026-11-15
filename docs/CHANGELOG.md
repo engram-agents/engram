@@ -9,8 +9,57 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+### Added
+
+- A daily compressed transcript archive. Sleep now runs `tools/archive_transcripts.py` (Step 4.8) every night, with no option to turn it off. It saves every `.jsonl` Claude Code transcript (subagent transcripts included) under `~/.claude/projects` into `$ENGRAM_HOME/transcript-archive/` as one xz file per run, holding only the bytes added since the last run (a byte offset kept per file, no timestamps). Archives are never overwritten or deleted. `archive_transcripts.py --replay <empty dir>` rebuilds every transcript byte for byte, and a gap, an overlap, or a transcript that shrank is a loud failure (the run exits 2 and names the file), and the other transcripts are still archived. The archive folder is git-ignored and owner-only. What it does not protect: transcripts stay on the machine; files that are not `.jsonl` are not covered; a transcript replaced by a different file of the same size or larger is not detected, because the offsets prove length, not content. (part of #4647)
+
 ### Changed
 
+- A lost `config.json` is no longer regenerated. When `knowledge.db` exists and `config.json` does not, ENGRAM now refuses instead of writing a default (a blank `self_lineage` silently turned the model-family gate off): a seat whose `config.json` is lost cannot open its memory or run the installer until the file is restored from a backup the user chooses. The refusal lists the backups, and a new `write-default-config.py` command writes the default for a genuinely new seat. The command needs the user's confirmation flag, and refusal messages do not print it. A fresh install, and a bootstrap, are unchanged. (#4705)
+- A refused in-place rewrite now reports which state the file is in as data (`WriteRefused.outcome`:
+  `nothing_written`, `restored` or `may_be_incomplete`), and `set_forum_url.py` and the installer's
+  `install_tier` step word their message from it. When the write and the put-back both fail, they no
+  longer say the file is unchanged; they say it may be incomplete and point at the backup. (#4631)
+- Maintainer docs: the #2652 migration ledger now records the session-start hook's real-store A6
+  re-run (2026-10-13, 0.118x PASS, posted on #3761 but never written into the ledger), and its
+  per-row `macOS` cells are swept for the `--owner` LaunchAgent (#3709, #3778, #3789); 33 cells
+  and three notes had still read "no Mac launcher yet". Docs only. (#2652)
+- `s2_clause_sheet` now refuses a `--db` that is the live store (`$ENGRAM_HOME/knowledge.db`, or a symlink or hard link to it) with one `refused:` line that names the backup-copy recipe, so the tool only ever reads copies. Outputs on a copy are unchanged. (#4286)
+- The nap-compaction backstop now refuses a nap record that carries no `session_id` (null, absent,
+  empty or not a string) with one stderr line, instead of compacting: it cannot show which session
+  napped (#4356), and surfaces the refusal once to the agent through the #4350 line.
+- The forum admin CLI now creates a missing `forum.db` as 0640 and its missing directory as 0750, and `export --out` creates a new file as 0640, whatever the caller's umask. Existing files and directories keep their modes. (#4530)
+- The forum mention monitor (`forum-mention-monitor.sh`) polls with `since`
+  instead of fetching the agent's whole @-mention history every 30 s. It keeps a
+  server-derived cursor next to its seen file and asks for the mentions after
+  the cursor minus a 600 s overlap; the seen-set still announces each mention
+  once. (#3729)
+- The marketplace installer now says what `claude plugin marketplace add` changed
+  in your own Claude files. It copies `plugins/known_marketplaces.json` and
+  `settings.json` before the call and compares them after it. It prints each key
+  that was added, removed or changed (never a string value), prints nothing for a
+  file that was only rewritten with the same content, and, when a key was removed
+  or changed, keeps the old file in `install-backups/` in the ENGRAM data folder
+  and prints its path. It does not run with `--skip-add`, with the Codex target,
+  or when `claude` is not on the PATH, and it never changes the installer's exit
+  code. The writes themselves are still Claude Code's (engram#4628)
+- Maintainer docs: `docs/internal/PR-ISSUE-CLOSURE.md` now records that the
+  close-keyword grep's adjacency rule matches GitHub's parser (no proximity
+  gap), and that a `closingIssuesReferences` answer can stay stale for minutes,
+  until the next edit event. (#2213)
+- `ps -o command=` / `args=` now carries `-ww` at the six remaining sites (the daemon-start
+  holder diagnostic, the `engram-upgrade` and `engram-health-exam` skills' argv checks, and
+  three latency test/tool reads), so a pipe-width cut to 80 columns cannot shorten the argv.
+  (engram-agents/engram#4469)
+- `engram_derive` no longer returns an `independence_advisory` key. It duplicated
+  the standpoint `⚠ inductive_generalization:` line. In a graph that holds two
+  or more lineages, and when the install has recorded its own lineage, that line
+  covers every case the advisory did; in a graph
+  with a single lineage, a generalization over same-lineage premises now gets
+  no warning, because the line only warns when a cross-lineage observation
+  exists to cite. That line now carries the same three options (add a
+  cross-lineage observation, use a weaker reasoning type, or proceed and say
+  why in `logical_chain`). Its firing conditions are unchanged. (#4728)
 - The write-time `anchoring_advisory` on every observation write now matches a
   claim's hard tokens only at token boundaries. `#404` is no longer reported as
   anchored by a quote containing `#4040`, nor `404` by `4040`, `4.404` or
@@ -31,6 +80,12 @@ with an `-alpha` suffix during the alpha phase.
   The "SUBSET green" line now says the full suite runs nightly and at the
   release cut. `--json` gains `layers` and `unreferenced` keys; no key is
   removed. (#4358)
+- tests: `test_bootstrap_fresh_db.py` no longer carries three setup loops that copied
+  runtime files from a path that does not exist, so they never copied anything. Bootstrap runs in place
+  at `src/engram/`, and the tests pass with and without the copy (engram#2173).
+- The plugin build now reads the source `plugin.json` once instead of twice. The
+  built `plugin.json` and the codex manifest are unchanged. A new test checks that
+  the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
 - Summary and keyword rewrites now refresh the complete canonical embedding,
@@ -38,10 +93,33 @@ with an `-alpha` suffix during the alpha phase.
   stores and report persisted per-node debt through the write result and
   `engram_diagnose`. This prevents new silent drift; existing stale vectors still
   need the separately reviewed, explicit owner repair. (engram#4651, slice 1)
+- The forum mention monitor's summary line lists at most 10 threads and says how many more there are, instead of listing every thread. (#2225)
+- `forum read --new` / `--last N` now show the whole thread's post count with how many are shown, and label each post by its place in the thread (the first shown post was labelled OP). (#2480)
+- Restoring the forum from a backup now rebuilds the search index and embeddings the dump leaves out: the README's Restore steps run `forum_regen_derived.py` before the service starts, and `install-forum-service.sh` snapshots that tool and its embedding helper into `<service-dir>/app/tools/`. Before, a restored forum searched empty. (engram-agents/engram#868)
+- The last-ditch dev-checkout fallback for this agent's own MCP server now points at
+  `<checkout>/src/engram/server.py`, where the file really is. It pointed at
+  `<checkout>/server.py`, which does not exist, so a scoped `pgrep -f` could never
+  match a server running from source. Fixed in the hooks library, the session-start
+  hook and the supervision probe. (engram-agents/engram#1867)
+- Test-only: the forum installer `--dry-run` cells (`test_installer.py`, `test_installer_baton_gate.py`)
+  now run with `HOME` and `XDG_CONFIG_HOME` in a scratch directory. On a seat whose real
+  forum unit carries a baton login map they failed on the installer's correct refusal;
+  the installer is unchanged. (#4393)
+- `worktree-gc.py --apply` no longer removes the worktree that the deploy record
+  (`deployed_from` in `.deployed-version`) names. The upgrade flow uses that
+  directory as the source of the next upgrade, but a clean detached worktree with
+  no open PR looked like a reviewer leftover and was pruned. It is now kept, with
+  the reason "deploy source". A missing or malformed deploy record changes
+  nothing. (engram#4157)
+- The write-nudge and loop-arm Stop hooks now record the transcript size their own scan read
+  as the next scan's starting offset, instead of stat-ing the transcript a second time. A
+  transcript that grew in between no longer has those bytes skipped for every later turn.
+  (engram-agents/engram#1855)
 - The `cites` and `cited_by` filters in `engram_list` now match the whole citation
   family: `cites`, `derives_from`, `supported_by` and `acknowledged_derives_from`.
   They named a relation that does not exist, so they never matched `supported_by`
   or `acknowledged_derives_from` edges. (engram#2258)
+- The viz stats panel no longer shows a permanently zero "Tier 1 (working)" row, and the handbook no longer describes the retired tier-1 working-memory band (two tiers remain: searchable and archive). (engram#1636)
 - The Quiet Wake nudge now prints a command that runs as printed: the plugin venv
   interpreter (`~/.engram/venv/bin/python3`) and the study-queue tool's absolute
   path. On a host whose only `python3` is older than 3.10, the tool re-execs under
@@ -49,15 +127,55 @@ with an `-alpha` suffix during the alpha phase.
   not reach a 3.10+ interpreter (a wrapper script, or a venv that is itself older)
   fails once rather than retrying. With no usable venv it refuses with one line on
   stderr and exit 3, before doing any work. (#4642)
+- A prediction node with no stored summary showed a blank Tier-1 line in `engram_query` results, because the fallback read only `claim`, which a prediction leaves empty. It now shows the predicted event, cut at 160 characters like a claim. (#2328)
+- The pipe-exit-warn hook's success-echo check is now case-insensitive and also recognises `passed`, so `| tail && echo DONE` and `echo PASSED` are caught like their lowercase forms (engram#2119).
+- `scan-leaks` no longer prints a bad entry from the local name roster. A roster
+  entry that is malformed or has a regex that does not compile is now reported
+  by its position in the list and the kind of error only, never by its contents,
+  its label or the regex error text, so a terminal paste cannot carry a name.
+  The entry is still skipped and loading continues.
+- `worktree-gc` no longer prunes a clean detached worktree whose HEAD commit is in
+  no ref (branch, tag, remote-tracking or other): removing it would leave that
+  commit only in the reflog. It skips with a reason naming the commit, and skips too when git cannot
+  say whether any ref holds it. (engram#4509)
 - The `ia` refusal for an unconfigured forum now points at the engram-letter skill's
   troubleshooting row, not at a README path that does not ship on an installed seat
   (engram#3560).
+- `agentctl session` should now launch correctly under `sudo -i` for a seat name or a
+  `--cd` directory that holds `$`, a newline or a quote (verified by a simulation of sudo's
+  documented escaping rule applied by hand, not by a run of real sudo): those words are
+  quoted as octal ANSI-C (`$'\ooo...'`, every byte), which survives `sudo -i`'s re-parse
+  where `printf %q` lost them (engram#4416). Arguments after `--` are tracked separately
+  (engram#4754).
+- A roster line that does not compile as a regex no longer prints that line, or the
+  regex error text, to stderr. The advisory name scan now reports only the roster
+  line number, the error class and the offset. (engram#4559)
+- The contract test for the `baton merge` already-closed hint now rejects "retry later"
+  in any letter case. It compared case-sensitively, so a lowercase "retry later"
+  in the new hint passed every cell. (engram#3508)
+- `scan-leaks` now scans every git-tracked text file, not an extension allowlist,
+  so its pattern gate reads `.js`, `.html`, `.ts`, `.css`, `.txt`, `.example` and
+  extensionless scripts too. A file whose first 8 KiB hold a NUL byte is skipped
+  as binary and counted, and one greppable summary line
+  (`scan-leaks: scanned N, skipped-binary M`) says what the run ranged over.
+  (#3732)
+- The whole-suite workflow (`tests.yml`) now runs the name-leak self-test and
+  the test files outside the main roots whenever the suite step ran, red or
+  green, so a red release run reports every failing step instead of hiding
+  the later ones; they stay skipped after a failed setup step or a cancel.
+  (#4554)
 
 ### Docs
 - The `engram-trust-tier` skill no longer describes a `force=true` override that `engram_set_trust_tier` does not have: it now names the real gate (`justification_obs_id` and `primary_user_approval_obtained`) and says the call fails closed without them (engram#4303). The handbook says config updates are `PUT /api/config/<key>`, not POST (engram#4461).
 - The install guide now says that an ACL or extended attribute on `~/.claude/settings.json` is lost during
   install: measured for `claude plugin marketplace add` on one Mac and on Linux, and for a full
   install on Linux (engram#4640, option 1).
+- `PR-MERGE-POLICY.md` now says a press guard must stop the press by explicit control flow
+  (`&&` into the merge, or `|| exit 1`), never by `set -e`: the Claude Code Bash tool
+  ignores `errexit`, measured through the tool on a merge
+  seat on 2026-11-09. The seat also reads
+  the gate's printed verdicts in a separate call before it presses.
+- `docs/internal/RELEASING.md` step 6 now states the rerun rule (a red confined to a test already filed as unreliable under load gets one rerun of the failed job, recorded on the release pull request first; any other red stops the release, #4655) and checks that `main` is an ancestor of the candidate before the check is trusted, with the reason it is then valid and the remedy for a release pull request retargeted onto `main` (#4622).
 
 ## [v0.5.7] - 2026-11-12
 

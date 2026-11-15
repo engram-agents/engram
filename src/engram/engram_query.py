@@ -992,11 +992,27 @@ def _refresh_recall(conn: sqlite3.Connection, node_ids: list[str]):
     conn.commit()
 
 
+def _with_edge_metadata(entry: dict, raw) -> dict:
+    """Add the edge's stored metadata to a rendered edge entry (#2772).
+
+    Renders the WHOLE `edges.metadata` dict as stored, under the single key
+    `edge_metadata` (stored keys are `reason`, `note`, ..., never the tool
+    parameter names). The key is absent when the column is NULL, empty,
+    invalid JSON or not a JSON object: `core._metadata_dict` reads all of
+    those as {}, so nothing raw is ever rendered and nothing raises.
+    Additive: no other key of `entry` is touched.
+    """
+    meta = core._metadata_dict(raw)
+    if meta:
+        entry["edge_metadata"] = meta
+    return entry
+
+
 def _get_neighbors(conn: sqlite3.Connection, node_id: str) -> list[dict]:
     """Get all edges involving a node, with the connected node's basic info."""
     edges = conn.execute(
         """
-        SELECT e.relation, e.source_id, e.target_id,
+        SELECT e.relation, e.source_id, e.target_id, e.metadata AS edge_metadata,
                n.type as neighbor_type, n.claim as neighbor_claim,
                n.confidence as neighbor_confidence, n.is_current as neighbor_is_current,
                n.created_at as neighbor_created_at
@@ -1018,16 +1034,19 @@ def _get_neighbors(conn: sqlite3.Connection, node_id: str) -> list[dict]:
         direction = "outgoing" if e["source_id"] == node_id else "incoming"
         neighbor_created_at = e["neighbor_created_at"]
         result.append(
-            {
-                "relation": e["relation"],
-                "direction": direction,
-                "neighbor_id": neighbor_id,
-                "neighbor_type": e["neighbor_type"],
-                "neighbor_claim": e["neighbor_claim"],
-                "neighbor_confidence": e["neighbor_confidence"],
-                "neighbor_created_at": neighbor_created_at,
-                "neighbor_created_ago": core._humanized_ago(neighbor_created_at, now=now),
-            }
+            _with_edge_metadata(
+                {
+                    "relation": e["relation"],
+                    "direction": direction,
+                    "neighbor_id": neighbor_id,
+                    "neighbor_type": e["neighbor_type"],
+                    "neighbor_claim": e["neighbor_claim"],
+                    "neighbor_confidence": e["neighbor_confidence"],
+                    "neighbor_created_at": neighbor_created_at,
+                    "neighbor_created_ago": core._humanized_ago(neighbor_created_at, now=now),
+                },
+                e["edge_metadata"],
+            )
         )
     return result
 
@@ -1051,7 +1070,7 @@ def _get_neighbors_enriched(
     """
     edges = conn.execute(
         """
-        SELECT e.relation, e.source_id, e.target_id,
+        SELECT e.relation, e.source_id, e.target_id, e.metadata AS edge_metadata,
                n.type          AS neighbor_type,
                n.recall_summary   AS neighbor_recall_summary,
                n.recall_keywords  AS neighbor_recall_keywords,
@@ -1085,7 +1104,7 @@ def _get_neighbors_enriched(
             keywords = json.loads(kw_raw) if kw_raw else []
         except (json.JSONDecodeError, TypeError):
             keywords = []
-        result.append({
+        result.append(_with_edge_metadata({
             "id": neighbor_id,
             "type": e["neighbor_type"],
             "relation": e["relation"],
@@ -1094,7 +1113,7 @@ def _get_neighbors_enriched(
             "recall_keywords": keywords,
             "importance_score": e["neighbor_importance_score"],
             "recall_count": e["neighbor_recall_count"],
-        })
+        }, e["edge_metadata"]))
     return result, filtered_count
 
 
@@ -1195,26 +1214,32 @@ def _build_inspect_recall_view(
     # Build compact neighbor dicts for recall view (strip internal scoring fields).
     def _trim_logical(items: list[dict]) -> list[dict]:
         return [
-            {
-                "id": nb["id"],
-                "type": nb["type"],
-                "relation": nb["relation"],
-                "direction": nb["direction"],
-                "recall_summary": nb["recall_summary"],
-                "recall_keywords": nb["recall_keywords"],
-            }
+            _with_edge_metadata(
+                {
+                    "id": nb["id"],
+                    "type": nb["type"],
+                    "relation": nb["relation"],
+                    "direction": nb["direction"],
+                    "recall_summary": nb["recall_summary"],
+                    "recall_keywords": nb["recall_keywords"],
+                },
+                nb.get("edge_metadata"),
+            )
             for nb in items
         ]
 
     def _trim_contextual(items: list[dict]) -> list[dict]:
         return [
-            {
-                "id": nb["id"],
-                "type": nb["type"],
-                "relation": nb["relation"],
-                "direction": nb["direction"],
-                "recall_keywords": nb["recall_keywords"],
-            }
+            _with_edge_metadata(
+                {
+                    "id": nb["id"],
+                    "type": nb["type"],
+                    "relation": nb["relation"],
+                    "direction": nb["direction"],
+                    "recall_keywords": nb["recall_keywords"],
+                },
+                nb.get("edge_metadata"),
+            )
             for nb in items
         ]
 
@@ -1266,8 +1291,9 @@ def _build_inspect_recall_view(
     if node.get("type") == "person":
         if _meta.get("pronouns"):
             node_recall["pronouns"] = _meta["pronouns"]
-        if _meta.get("relation"):
-            node_recall["relation"] = _meta["relation"]
+        _rel = core.person_relation(_meta)
+        if _rel:
+            node_recall["relation"] = _rel
         _moments = _meta.get("special_moments")
         if isinstance(_moments, list) and _moments:
             _moment_text = _select_and_render_person_moment(conn, node_id)
@@ -1310,7 +1336,7 @@ def _build_topology_entries(
     """
     edges = conn.execute(
         """
-        SELECT e.relation, e.source_id, e.target_id,
+        SELECT e.relation, e.source_id, e.target_id, e.metadata AS edge_metadata,
                n.is_current AS neighbor_is_current
         FROM edges e
         LEFT JOIN nodes n ON (
@@ -1341,6 +1367,7 @@ def _build_topology_entries(
         else:  # incoming
             src, dst = neighbor_id, node_id
         entry: dict = {"src": src, "dst": dst, "relation": rel}
+        _with_edge_metadata(entry, e["edge_metadata"])
         edge_entries.append(entry)
         total += 1
 
@@ -2397,6 +2424,19 @@ def _select_and_render_person_moment(
     return description
 
 
+def _tier1_fallback_text(node: dict) -> str:
+    """Text a Tier-1 entry falls back to when the node has no recall_summary.
+
+    Prediction nodes keep their text in ``predicted_event`` and have a NULL
+    ``claim`` (#2328); every other node uses ``claim``.  Mirrors the
+    ``predicted_event or claim`` order used for prediction nodes in
+    engram_core.  A real claim still wins for non-prediction nodes.
+    """
+    if node.get("type") == "prediction":
+        return node.get("predicted_event") or node.get("claim") or ""
+    return node.get("claim") or ""
+
+
 def _build_tiered_results(
     results: list[dict],
     summary_top_k: int,
@@ -2464,10 +2504,12 @@ def _build_tiered_results(
                     person_fields["special_moment"] = moment_text
 
         if is_tier1:
-            # Tier 1: prefer recall_summary, fall back to truncated claim.
+            # Tier 1: prefer recall_summary, fall back to truncated claim
+            # (or, for a prediction node whose claim is NULL by design, the
+            # truncated predicted_event, #2328).
             summary = node.get("recall_summary") or None
             if not summary:
-                claim = node.get("claim") or ""
+                claim = _tier1_fallback_text(node)
                 summary = (claim[:160] + "...") if len(claim) > 160 else claim
             entry = {"id": node_id, "confidence": confidence, "summary": summary}
         else:
@@ -2644,8 +2686,9 @@ def _surface_impl(
                     _pmeta = core._metadata_dict(n.get("metadata"))
                     if _pmeta.get("pronouns"):
                         entry["pronouns"] = _pmeta["pronouns"]
-                    if _pmeta.get("relation"):
-                        entry["relation"] = _pmeta["relation"]
+                    _rel = core.person_relation(_pmeta)
+                    if _rel:
+                        entry["relation"] = _rel
                     if n.get("trust_tier"):
                         entry["trust_tier"] = n.get("trust_tier")
                     _moments = _pmeta.get("special_moments")
@@ -3077,8 +3120,9 @@ def _query_impl(
                 _pmeta = core._metadata_dict(node.get("metadata"))
                 if _pmeta.get("pronouns"):
                     node["pronouns"] = _pmeta["pronouns"]
-                if _pmeta.get("relation"):
-                    node["relation"] = _pmeta["relation"]
+                _rel = core.person_relation(_pmeta)
+                if _rel:
+                    node["relation"] = _rel
             node.pop("metadata", None)
             node["neighbors"] = _get_neighbors(conn, node["id"])
             if w:
@@ -3277,6 +3321,7 @@ def _subgraph_impl(
                 continue
             seen_edge_keys.add(key)
             edge_entry: dict = {"source_id": src, "target_id": tgt, "relation": rel}
+            _with_edge_metadata(edge_entry, e["metadata"])
             unique_edges.append(edge_entry)
 
         # Build adjacency-map topology: keyed by source node ID.
@@ -3286,6 +3331,9 @@ def _subgraph_impl(
             src, tgt, rel = e["source_id"], e["target_id"], e["relation"]
             entry_out: dict = {"to": tgt, "relation": rel, "direction": "outgoing"}
             entry_in: dict = {"to": src, "relation": rel, "direction": "incoming"}
+            if "edge_metadata" in e:
+                entry_out["edge_metadata"] = e["edge_metadata"]
+                entry_in["edge_metadata"] = e["edge_metadata"]
             topology[src].append(entry_out)
             topology[tgt].append(entry_in)
 

@@ -308,3 +308,27 @@ def test_n10d_a_non_failure_outcome_for_this_session_shows_nothing(outcome, tmp_
     rec = dict(t4012.backstop_last(home), outcome=outcome)
     t4012._write_json(home / "compact" / "backstop-last.json", rec)
     assert marker_lines(surface_context(home, session_id=t4012.SESSION)) == []
+
+
+# ---------------------------------------------------------------------------
+# N11 / N12  a record with no session_id is refused AND surfaced, once, to the refusing session (#4356)
+# ---------------------------------------------------------------------------
+def no_session_refused_home(tmp_path: Path) -> Path:
+    home = t4012.make_home(tmp_path, loop=False, record={"checkpoint_at": t4012.HEADER_TS, "session_id": None, "backup_ok": True})
+    done = t4012.real_stop(home)
+    assert done.returncode == 0, done.stderr
+    return home
+
+
+def test_n11_a_no_session_refusal_surfaces_once_to_the_refusing_session(tmp_path):
+    home = no_session_refused_home(tmp_path)
+    lines = marker_lines(surface_context(home))
+    assert len(lines) == 1
+    assert "the last nap's record carries no session_id" in lines[0]
+    assert marker_lines(surface_context(home)) == []
+
+
+def test_n12_a_no_session_refusal_is_not_shown_to_another_session(tmp_path):
+    home = no_session_refused_home(tmp_path)
+    assert marker_lines(surface_context(home, session_id="some-other-session")) == []
+    assert len(marker_lines(surface_context(home))) == 1

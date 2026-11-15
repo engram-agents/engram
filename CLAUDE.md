@@ -30,18 +30,18 @@ the unified payload_json signature as of 2026-05-27.
 ## Branching convention
 
 - **`dev`** is the merge target for ALL feature/fix PRs. Always open PRs
-  against `dev` unless an explicit release-cut is happening.
+  against `dev` (exceptions: a soak-fix copy, the release PR).
 - **`main`** is GitHub's default branch and holds releases (a plain clone lands
-  on a tagged release, which the installer needs). It moves only on explicit release
-  cuts; routine PRs do NOT target main. **A release cut = opening a formal
-  PR from `dev` → `main`** — this fires the full CI gate (`tests.yml` full
-  suite + `pr-checks`), the thorough pre-release
-  validation. See `docs/internal/RELEASING.md`.
+  on a tagged release, which the installer needs). Routine PRs do NOT target it.
+- **`release/X.Y.Z`** (Lei, 2026-11-13) is cut from `dev` at a candidate;
+  **`dev` is not frozen.** The release PR `release/X.Y.Z` → `main` runs the
+  full suite; `main` is fast-forwarded, never merged. See
+  `docs/internal/RELEASING.md`.
 - **CI cost model (#1597):** dev PRs run only the cheap combined `pr-checks`
   (static scrubs). The **full pytest suite does NOT run
   on dev PRs** — at agent-PR velocity it's too expensive; run **affected-tests
   locally** and paste the result in your review. The full suite runs nightly on
-  `dev` (`nightly.yml`) and on the dev→main release PR (above). `affected-tests.yml` is `workflow_dispatch`
+  `dev` (`nightly.yml`) and on the release PR into `main` (above). `affected-tests.yml` is `workflow_dispatch`
   only.
 - **No macOS runners in CI — ever (Lei, 2026-09-28).** A `runs-on: macos-*` job
   bills at **ten times** the Linux minute rate, and `pr-checks` fires on every
@@ -277,9 +277,9 @@ after a written conformance check); **fixes + non-substrate → the team merges
 after peer review**, and since 2026-10-22 the **project owner presses their own
 converged PR** under the policy's written *Owner merge* gate (Lei, in session: the
 colleague's recorded run on the exact head is the test gate; the owner's scratch
-merge on the current base and the base-SHA assertion stay; CI is the floor, since
-`pr-checks` runs only a fixed set of guard test files on `dev` PRs, never the full
-suite). This gate is
+merge on the current base and the base-SHA assertion stay; CI is the floor).
+**A merge seat, not the owner, presses for a seat with no standing merge
+grant from its user, and every security PR.** This gate is
 **engram-only** — other repos (umwelt, soma) carry their own delegated
 authority. During an explicit Lei-absence day-grant, a settled substrate PR may
 be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
@@ -327,7 +327,7 @@ CI-green must hold on the tip the maintainer would merge.
 head, never the head alone; a scratch-merge failure counts against the PR only if
 that cell is green on the base alone (or the PR adds it); and a `CANCELLED` same-SHA run can
 block the merge even when another run passed — rerun it (a fresh run instead if the PR body or title changed since that run). A red only the whole run produces
-(green on base and merged tree alone, in a file no PR touches) is a filed load flake, not a
+(green on base and merged tree alone and when co-run with each PR's added or changed test files, in a file no PR touches) is a filed load flake, not a
 PR red; and the press step never presses on a printed `UNKNOWN`: it waits for `CLEAN` or reads
 every run of the required check on the head. Commands and evidence:
 `docs/internal/PR-MERGE-POLICY.md` § "Merge-seat test rules".
@@ -371,16 +371,15 @@ enters the maintainer's merge queue:
    created it is review-authored, and a chain of those is the process
    reviewing itself.
    **Reset (v4):** a contributed tip is a NON-MERGE commit
-   (`git log --no-merges --format='%an'`) whose git author is not the PR
-   author, landed after the PR's first review object
+   (`git log --no-merges --format='%an'`) whose git author is neither the PR
+   author nor that author's fairy (the PR body names fairy commits; if it
+   is silent, ask), landed after the PR's first review object
    (`gh pr view --json reviews,comments`); it resets the three-round count.
-   Merge commits never count regardless of who clicked (a web-UI "Update
-   branch" is a merge), the committer field never counts (every squash merge
+   Merge commits never count regardless of who clicked, the committer field never counts (every squash merge
    here reads `GitHub`), and the author's own fold of a peer finding never
    resets. Named field, named anchor, both read off artifacts, never
-   recalled. One duty added when this was written into the repo on
-   2026-09-26, not part of the forum ruling: the merge seat records in its
-   merge comment when a PR merged under the cap. **This cap qualifies
+   recalled. The merge seat records in its merge comment when a PR merged
+   under the cap (added 2026-09-26). **This cap qualifies
    "iterate to convergence" above and the "converged" clause of the
    merge seat's mechanical check below:** a PR whose third round still
    returns REQUEST_CHANGES goes to the peer with its open findings listed,

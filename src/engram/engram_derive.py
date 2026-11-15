@@ -49,65 +49,6 @@ except Exception:  # pragma: no cover -- import-failure fallback
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _check_premise_independence(conn: "sqlite3.Connection", premise_ids: list[str]) -> "dict | None":
-    """Check whether premise observations share a single standpoint_lineage (collinear).
-
-    Returns an advisory dict when all known-lineage observation premises come
-    from one lineage — indicating that an inductive_generalization confidence
-    boost is unwarranted.  Returns None when premises are diverse or no
-    known-lineage observations exist (undetermined).
-
-    Only observation-type nodes carry meaningful standpoint_lineage.  Derived
-    nodes, axioms, and observations without standpoint_lineage are skipped.
-    If fewer than 2 observations with known lineage are found, the gate cannot
-    fire (not enough signal to conclude collinearity).
-    """
-    lineage_map: dict[str, list[str]] = {}  # lineage → [node_ids]
-    for nid in premise_ids:
-        row = conn.execute(
-            "SELECT type, standpoint_lineage FROM nodes WHERE id = ?", (nid,)
-        ).fetchone()
-        if not row:
-            continue
-        if not row["type"].startswith("observation"):
-            continue
-        lineage = (row["standpoint_lineage"] or "").strip()
-        if not lineage:
-            continue
-        lineage_map.setdefault(lineage, []).append(nid)
-
-    n_clusters = len(lineage_map)
-    if n_clusters != 1:
-        # 0 → undetermined (no known lineages); ≥2 → diverse. Both are fine.
-        return None
-
-    shared_lineage = next(iter(lineage_map))
-    collinear_ids = lineage_map[shared_lineage]
-    # Require ≥2 same-lineage obs: a single known-lineage premise with others
-    # having no lineage recorded is undetermined, not collinear.
-    if len(collinear_ids) < 2:
-        return None
-    return {
-        "collinear_verdict": "collinear",
-        "shared_lineage": shared_lineage,
-        "collinear_premise_ids": collinear_ids,
-        "message": (
-            f"independence_advisory: all {len(collinear_ids)} observation premise(s) "
-            f"share standpoint_lineage '{shared_lineage}'. "
-            "inductive_generalization confidence (0.95 level) assumes independent "
-            "sources — same-lineage premises are correlated, not independent. "
-            "Consider: (a) adding a cross-lineage observation before generalizing, "
-            "(b) downgrading to abductive_best_explanation (0.55) to reflect the "
-            "actual evidence strength, or (c) proceed if you have reasons to "
-            "believe independence holds despite shared lineage (note in logical_chain)."
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
 # B impls
 # ---------------------------------------------------------------------------
 
@@ -275,14 +216,6 @@ def _derive_impl(
                          f"If you want to reference a definition, use context_ids instead of supporting_ids.",
             })
 
-        # Independence advisory for inductive_generalization (#1313):
-        # A generalization over same-lineage premises inflates confidence beyond
-        # what the evidence warrants. Emit an advisory (not a hard-block) so the
-        # agent can reconsider the reasoning_type before the derivation is filed.
-        independence_advisory: dict | None = None
-        if reasoning_type == "inductive_generalization":
-            independence_advisory = _check_premise_independence(conn, ids)
-
         block, success = core._create_derivation(
             conn,
             claim=claim,
@@ -357,8 +290,6 @@ def _derive_impl(
                     )
                 except Exception:
                     pass
-            if independence_advisory:
-                block["independence_advisory"] = independence_advisory
             return json.dumps(block)
 
         conn.commit()
@@ -423,8 +354,6 @@ def _derive_impl(
             result["use_stale_retired"] = core.USE_STALE_RETIRED_NOTICE
         if use_contested and success["contested_ids"]:
             result["built_on_contested"] = success["contested_ids"]
-        if independence_advisory:
-            result["independence_advisory"] = independence_advisory
         if success.get("embedding_failure"):  # #345 PR3 B4 (R1: renamed key)
             result["embedding_failure"] = success["embedding_failure"]
         _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))

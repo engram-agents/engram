@@ -682,6 +682,26 @@ class TestGiantComponentFraction:
         _insert(conn, "ob_1", "observation_factual")
         assert hem.giant_component_fraction(conn) == 1.0
 
+    def test_mixed_component_sizes_reports_the_largest(self):
+        """A 3-node chain plus a separate 2-node component: the metric is the
+        LARGEST component's size over the population (3/5), not the smallest
+        (2/5) or whichever component happens to be visited last."""
+        conn = _make_conn()
+        for nid in ("dv_1", "dv_2", "dv_3", "dv_4", "dv_5"):
+            _insert(conn, nid, "derivation")
+        _insert_edge(conn, "dv_1", "dv_2", "derives_from")
+        _insert_edge(conn, "dv_2", "dv_3", "derives_from")
+        _insert_edge(conn, "dv_4", "dv_5", "derives_from")
+        assert hem.giant_component_fraction(conn) == 3 / 5
+
+    def test_largest_component_wins_over_several_singletons(self):
+        """One 2-node component plus three singletons: largest=2 of 5."""
+        conn = _make_conn()
+        for nid in ("dv_1", "dv_2", "dv_3", "dv_4", "dv_5"):
+            _insert(conn, nid, "derivation")
+        _insert_edge(conn, "dv_1", "dv_2", "derives_from")
+        assert hem.giant_component_fraction(conn) == 2 / 5
+
 
 # ---------------------------------------------------------------------------
 # Shared aspect scoring — aspect_geometric_mean_scoring

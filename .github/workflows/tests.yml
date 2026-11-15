@@ -71,6 +71,7 @@ jobs:
         run: pytest tests/ src/forum/tests/ --collect-only -q -p no:cacheprovider > "$RUNNER_TEMP/reference-collect.txt"
 
       - name: Run pytest — the full suite as sequential shards (#4420)
+        id: suite
         # One process over the whole suite died of memory on the hosted runner (the
         # nightly's finding, #4420), so this runs on the nightly's shard runner:
         # N sequential pytest processes, files split from pytest's own collection.
@@ -97,6 +98,8 @@ jobs:
         run: bash .github/ci/nightly_run_shards.sh
 
       - name: Run pytest — name-leak-warn self-test (real roster)
+        if: ${{ !cancelled() && steps.suite.conclusion != 'skipped' }}
+        # Runs after the suite step ran, red or green (#4554); skipped if setup failed (suite skipped) or the run was cancelled.
         # Deliberately a SEPARATE step from the full-suite run above, and a
         # multi-line block rather than a single-line `run: pytest` line: two
         # parsers (#2950's scan-roots gate in tools/test_id_set_check.py and
@@ -115,6 +118,8 @@ jobs:
           python3 -m pytest tests/test_name_leak_warn.py -v --tb=short --show-capture=no
 
       - name: Run pytest — test files outside the roots above (#3346)
+        if: ${{ !cancelled() && steps.suite.conclusion != 'skipped' }}
+        # Runs after the suite step ran, red or green (#4554); skipped if setup failed (suite skipped) or the run was cancelled.
         # Deliberately a SEPARATE step, not extra positionals on the line
         # above: tools/test_id_set_check.py's TEST_SCAN_ROOTS must equal that
         # line's roots (the #2950 sync gate), and it scans directories, not

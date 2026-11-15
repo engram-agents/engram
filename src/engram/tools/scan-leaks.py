@@ -26,15 +26,21 @@ Absolute home paths (default-deny, every git-tracked text file):
     Known limit: JSON-escaped paths (backslash-escaped slashes) are not matched.
 
 Personal-name and user-specific patterns are loaded at runtime from
-.scan-leaks-local.json in the repo root (gitignored). If this file is
-absent the scanner runs committed structural patterns only and prints one
-advisory line.
+.scan-leaks-local.json in the repo root (gitignored), and optionally from a
+--roster-file carrying the same newline-separated regex format as the
+NAME_LEAK_ROSTER CI secret. If NEITHER source supplies a pattern the scanner
+runs committed structural patterns only and prints one advisory line.
 
 See docs/internal/.scan-leaks-local.json.example for the config shape.
 
-Allowlist:
-  - LICENSE (copyright lines are intentional)
-  - .git/, __pycache__/, *.pyc
+Scope and exclusions (what "the tree" means here — NOT every published file):
+  - Candidate set: every git-tracked text file, whatever its extension
+    (extensionless executables included).  A binary (a NUL byte in its first
+    8 KiB) is skipped and counted.
+  - SKIP_FILES: LICENSE, .scan-leaks-local.json, scan-leaks.py,
+    test_release_cutover.py, RELEASING.md.
+  - SKIP_DIRS: .git, __pycache__, node_modules, .claude.
+  - A name in an excluded file is not scanned.
 
 Exit codes:
   0 — clean
@@ -56,8 +62,6 @@ COMMITTED_PATTERNS = [
 ]
 
 LOCAL_CONFIG_NAME = ".scan-leaks-local.json"
-
-SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service", ".timer", ".yml", ".yaml"}
 
 # --- Absolute home paths: default-deny -------------------------------------
 # The class definition (regex + declared allowed set with reasons) lives in ONE
@@ -133,13 +137,69 @@ def load_local_patterns(root: Path, config_path: Path | None = None) -> tuple[li
         return [], True  # file existed but malformed; treat as present
 
     patterns = []
-    for entry in raw.get("patterns", []):
+    for i, entry in enumerate(raw.get("patterns", []), start=1):
         try:
             patterns.append((re.compile(entry["regex"]), entry["label"]))
-        except (KeyError, re.error) as exc:
-            print(f"scan-leaks: warning — skipping bad pattern entry {entry!r}: {exc}",
-                  file=sys.stderr)
+        except (KeyError, TypeError, re.error, OverflowError, RecursionError) as exc:
+            # The roster is a personal-name list: the entry, its label and
+            # str(re.error) can all carry a name.  Report only the 1-based
+            # position, the exception class, and (for KeyError) the missing
+            # schema key, which is ours and not user data.
+            detail = f" (missing key {exc.args[0]!r})" if isinstance(exc, KeyError) else ""
+            print(f"scan-leaks: warning — skipping bad pattern entry {i}: "
+                  f"{type(exc).__name__}{detail}", file=sys.stderr)
     return patterns, True
+
+
+def load_roster_file(path: Path) -> list[tuple[re.Pattern, str]]:
+    """Load newline-separated regexes from an external roster file.
+
+    This is the SAME format as the ``NAME_LEAK_ROSTER`` CI secret: one regex
+    per line, with blank lines and lines whose first non-space character is
+    ``#`` ignored.  The label is fixed and generic; the file carries no labels.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        # An explicitly requested roster that cannot be read must not silently
+        # shrink the scan: that is an invocation error, not a clean run.
+        print(f"scan-leaks: cannot read roster file ({type(exc).__name__})",
+              file=sys.stderr)
+        sys.exit(2)
+
+    patterns = []
+    supplied = 0
+    rejected = 0
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        supplied += 1
+        try:
+            patterns.append((re.compile(stripped), "roster file"))
+        except (re.error, OverflowError, RecursionError) as exc:
+            rejected += 1
+            # The roster file is a personal-name list: the line and
+            # str(re.error) can both carry a name.  Report only the 1-based
+            # line number, the exception class, and (for re.error) its offset
+            # — never the pattern text.
+            detail = (f" at offset {exc.pos}" if isinstance(exc, re.error)
+                      else "")
+            print(f"scan-leaks: warning — skipping bad roster line {lineno}: "
+                  f"{type(exc).__name__}{detail}", file=sys.stderr)
+
+    if supplied and not patterns:
+        # An explicitly requested roster that supplied no usable pattern must
+        # not become a clean run against nothing.  CI pre-validates its own
+        # roster before invoking --roster-file, so this is the standalone
+        # flag's contract, not CI's.  The count only — never the pattern text.
+        print(
+            f"scan-leaks: all {rejected} roster line(s) were rejected as "
+            "invalid; refusing to scan against an empty roster",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return patterns
 
 
 def _git_tracked_files(root: Path) -> list[Path] | None:
@@ -167,8 +227,18 @@ def _git_tracked_files(root: Path) -> list[Path] | None:
     return [root / p.decode("utf-8", errors="replace") for p in raw.split(b"\x00") if p]
 
 
-def scan(root: Path, leak_patterns: list, use_git: bool = True) -> list[tuple[str, int, str, str]]:
-    """Scan root for leak_patterns and return a list of (relpath, lineno, label, snippet).
+def scan(root: Path, leak_patterns: list, use_git: bool = True
+         ) -> tuple[list[tuple[str, int, str, str]], int, int]:
+    """Scan root for leak_patterns.  Returns (findings, scanned, skipped_binary).
+
+    findings is a list of (relpath, lineno, label, snippet).
+
+    Candidate set: every git-tracked file, whatever its extension
+    (extensionless executables included), minus the SKIP_DIRS components and
+    SKIP_FILES names — the same all-text domain ``scan_home_paths`` uses.  An
+    extension allowlist used to select files here, so the release leak gate
+    never read shipped ``.js``/``.html``/``.ts``/``.css``/``.txt`` files or
+    extensionless scripts (#3732).
 
     When use_git is True (default), candidate files are enumerated via
     ``git ls-files -z`` so that untracked files — gitignored local notes,
@@ -182,14 +252,19 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> list[tuple[st
 
     When use_git is False (explicit-path invocation), the os.walk path is used
     unconditionally so that callers can target specific non-repo directories.
+
+    A file whose first 8 KiB contains a NUL byte is binary: skipped and counted
+    in ``skipped_binary``.  Everything else is decoded as UTF-8 with errors
+    replaced, so a non-UTF-8 text file is still scanned and ``scanned`` counts
+    it.  A file that cannot be read at all is skipped and counted in neither.
     """
     leaks = []
 
     tracked = _git_tracked_files(root) if use_git else None
 
     if tracked is not None:
-        # Git-tracked enumeration: skip SKIP_DIRS and SKIP_FILES by name,
-        # and apply the same extension filter as the os.walk path.
+        # Git-tracked enumeration: skip SKIP_DIRS and SKIP_FILES by name.
+        # Every remaining file is a candidate, whatever its extension.
         candidates = []
         for fpath in tracked:
             # Check every component for SKIP_DIRS membership
@@ -198,33 +273,41 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> list[tuple[st
                 continue
             if fpath.name in SKIP_FILES:
                 continue
-            if fpath.suffix not in SCAN_EXTENSIONS:
-                continue
             candidates.append(fpath)
     else:
-        # Fallback: os.walk (original behavior)
+        # Fallback: os.walk (same all-text policy)
         candidates = []
         for dirpath, dirs, files in os.walk(root):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             for fname in files:
                 if fname in SKIP_FILES:
                     continue
-                if Path(fname).suffix not in SCAN_EXTENSIONS:
-                    continue
                 candidates.append(Path(dirpath) / fname)
 
+    # A tracked symlink can point at a directory (tools/engine, tools/engram-pkg
+    # in this repo).  It is not a text file to scan, so it is not a candidate —
+    # which is what makes scanned + skipped_binary equal the files considered.
+    candidates = [f for f in candidates if f.is_file()]
+
+    scanned = 0
+    skipped_binary = 0
     for fpath in candidates:
         try:
-            content = fpath.read_text()
-        except (UnicodeDecodeError, OSError):
+            data = fpath.read_bytes()
+        except OSError:
             continue
+        if b"\x00" in data[:8192]:
+            skipped_binary += 1
+            continue
+        content = data.decode("utf-8", errors="replace")
+        scanned += 1
         rel = fpath.relative_to(root)
         for i, line in enumerate(content.splitlines(), 1):
             for pattern, label in leak_patterns:
                 if pattern.search(line):
                     leaks.append((str(rel), i, label, line.strip()[:120]))
                     break
-    return leaks
+    return leaks, scanned, skipped_binary
 
 
 def scan_home_paths(root: Path, use_git: bool = True) -> list[tuple[str, int, str]]:
@@ -270,6 +353,16 @@ def main():
     parser.add_argument("--config-path", default=None,
                         help=f"Explicit path to the local config file "
                              f"(default: <root>/{LOCAL_CONFIG_NAME})")
+    parser.add_argument("--roster-file", default=None,
+                        help="Newline-separated regexes, the same format as the "
+                             "NAME_LEAK_ROSTER secret (blank lines and #-comment "
+                             "lines ignored); scanned alongside the committed "
+                             "patterns and the local roster")
+    # A public CI log must not carry a name: `path:line [label] snippet`
+    # prints it twice, so --redact keeps only the repo-relative path and line.
+    parser.add_argument("--redact", action="store_true",
+                        help="Print each finding as repo-relative-path:line only "
+                             "(no label, no snippet, no home-path segment)")
     args = parser.parse_args()
 
     if args.root:
@@ -283,20 +376,36 @@ def main():
 
     config_path = Path(args.config_path).expanduser().resolve() if args.config_path else None
     local_patterns, config_present = load_local_patterns(root, config_path)
+    roster_file_patterns = (
+        load_roster_file(Path(args.roster_file).expanduser().resolve())
+        if args.roster_file else []
+    )
 
-    if not local_patterns:
-        # Advisory fires whenever the personal-name net didn't run — covers
-        # both "file absent" and "file present but malformed/empty".
-        reason = (f"{LOCAL_CONFIG_NAME} absent"
-                  if not config_present else f"{LOCAL_CONFIG_NAME} produced no patterns")
+    personal_patterns = local_patterns + roster_file_patterns
+    if not personal_patterns:
+        # Advisory fires only when NEITHER roster source produced a pattern —
+        # covers "file absent" and "file present but malformed/empty".  With
+        # --roster-file supplying patterns the personal-name net DID run, so
+        # claiming a skip here would be false and must not print.
+        if args.roster_file:
+            reason = (f"{LOCAL_CONFIG_NAME} absent"
+                      if not config_present
+                      else f"{LOCAL_CONFIG_NAME} produced no patterns")
+            reason += " and --roster-file produced no patterns"
+        else:
+            reason = (f"{LOCAL_CONFIG_NAME} absent"
+                      if not config_present else f"{LOCAL_CONFIG_NAME} produced no patterns")
         print(
             f"scan-leaks: no local roster ({reason})"
             " — personal-name scan skipped; structural patterns only"
         )
 
-    all_patterns = COMMITTED_PATTERNS + local_patterns
+    all_patterns = COMMITTED_PATTERNS + personal_patterns
 
-    leaks = scan(root, all_patterns)
+    leaks, scanned, skipped_binary = scan(root, all_patterns)
+    # One greppable summary line, on clean and dirty runs alike: a clean result
+    # says what it ranged over, so an empty finding list cannot hide a blind spot.
+    print(f"scan-leaks: scanned {scanned}, skipped-binary {skipped_binary}")
     home_findings = scan_home_paths(root)
     if not leaks and not home_findings:
         print(f"scan-leaks: clean ({root})")
@@ -305,9 +414,33 @@ def main():
     print(f"scan-leaks: {len(leaks) + len(home_findings)} potential leak(s) in {root}",
           file=sys.stderr)
     for rel, lineno, label, snippet in leaks:
-        print(f"  {rel}:{lineno} [{label}] {snippet}", file=sys.stderr)
+        if args.redact:
+            print(f"{rel}:{lineno}", file=sys.stderr)
+        else:
+            print(f"  {rel}:{lineno} [{label}] {snippet}", file=sys.stderr)
     for rel, lineno, seg in home_findings:
-        print(f"  {rel}:{lineno} [absolute home path] segment: {seg}", file=sys.stderr)
+        if args.redact:
+            print(f"{rel}:{lineno}", file=sys.stderr)
+        else:
+            print(f"  {rel}:{lineno} [absolute home path] segment: {seg}", file=sys.stderr)
+    # The roster instruction is scoped to ROSTER/PATTERN hits: a roster entry
+    # names a string already published, so the fix is in the tree, never in the
+    # roster.  An absolute-home-path hit has nothing to do with the roster, so
+    # telling its operator to leave the roster alone is misdirection.
+    if leaks:
+        print(
+            "scan-leaks: a pattern hit means the string is already in the "
+            "published tree; fix it in the release PR; do not widen or edit "
+            "the roster to silence it.",
+            file=sys.stderr,
+        )
+    if home_findings:
+        print(
+            "scan-leaks: an absolute home path hit means a host path is in the "
+            "published tree; remove it in the release PR. The roster does not "
+            "apply to this finding.",
+            file=sys.stderr,
+        )
     sys.exit(1)
 
 

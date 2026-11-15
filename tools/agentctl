@@ -1825,6 +1825,14 @@ cmd__scope_stop() {
 # runs (PR 4410 read), unreachable here because of that floor; bash 4.3 to 5.1 is NOT tested.
 _shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
+# Octal ANSI-C quoting for words that go through `sudo -i bash -c STRING` (#4416): prints $' +
+# EVERY byte of the word as \ooo (exactly 3 octal digits) + '. `sudo -i` backslash-escapes all
+# but [A-Za-z0-9_$-] and the login shell re-parses the words; printf %q and _shq lose words
+# holding $ (or a newline), this form survives under bash and dash as that outer shell. The
+# $'..' form is a bash extension: allowed only where the inner consumer is bash -c. Bytes, not
+# characters: LC_ALL=C. (Documented sudo escaping applied by hand, not a run of real sudo.)
+_oct_quote() { local s="$1" out="" i c o; local LC_ALL=C; for ((i=0;i<${#s};i++)); do c="${s:i:1}"; printf -v o '\\%03o' "'$c"; out+="$o"; done; printf "\$'%s'" "$out"; }
+
 cmd_session() {
     local name="${1:-}"; shift || true
     [[ -z "$name" ]] && {
@@ -2050,14 +2058,18 @@ cmd_session() {
     prologue="$(session_prologue_text)"
     # #4435: every launch below execs through `agentctl __scope-exec <seat>`
     # (own scope, OOMPolicy=continue). The two words are inserted by THIS shell
-    # with printf %q, so the string handed to `sudo -i bash -c` carries no
-    # `$ { } ( )` of its own (sudo -i escapes braces and parens).
+    # with _oct_quote, so the string handed to `sudo -i bash -c` carries no
+    # `{ } ( )` of its own (sudo -i escapes braces and parens).
     local agentctl_abs scope_words
     agentctl_abs="$(readlink -f "${BASH_SOURCE[0]:-$0}")" && [[ -f "$agentctl_abs" && -x "$agentctl_abs" ]] || {
         echo "ERROR: cannot resolve agentctl's own path to an executable file (needed for the scope launch)" >&2
         exit 1
     }
-    scope_words="$(printf '%q' "$agentctl_abs") __scope-exec $(printf '%q' "$name")"
+    # Built once, used by every launch below. Safe in both branches: as-self it is one argv word
+    # to `exec bash -c` (no rejoin); under sudo -i the words are rejoined and re-parsed, and the
+    # octal form survives that. The inner consumer is bash -c, so the $'..' form (a bash
+    # extension) is allowed here (#4416).
+    scope_words="$(_oct_quote "$agentctl_abs") __scope-exec $(_oct_quote "$name")"
     if [[ "$as_self" -eq 1 ]]; then
         # This shell already IS the target user, so no sudo -- but the launch
         # goes through the SAME form as the sudo branches below (bash -c,
@@ -2075,6 +2087,7 @@ cmd_session() {
         # exec comes after the prologue.
         if command -v "$binary" >/dev/null 2>&1; then
             if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+                # cd word stays printf %q on purpose (#4416 ruling): as-self hands this string to `exec bash -c` as ONE argv word, no sudo rejoin, so nothing is escaped twice; do not change it to _oct_quote for consistency.
                 exec bash -c \
                     "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec $scope_words \"$binary\" \"\$@\"" \
                     -- "${tail_args[@]}"
@@ -2085,6 +2098,7 @@ cmd_session() {
             fi
         elif [[ -x "$HOME/.runtime/start.sh" ]]; then
             if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+                # cd word stays printf %q on purpose (#4416 ruling): as-self hands this string to `exec bash -c` as ONE argv word, no sudo rejoin, so nothing is escaped twice; do not change it to _oct_quote for consistency.
                 exec bash -c \
                     "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec $scope_words ~/.runtime/start.sh \"\$@\"" \
                     -- "${tail_args[@]}"
@@ -2099,8 +2113,9 @@ cmd_session() {
         fi
     elif sudo -u "$user" -i bash -c "command -v \"$binary\"" >/dev/null 2>&1; then
         if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+            # inner consumer is bash -c: the octal $'..' cd word is a bash extension; that is why it is allowed here (#4416)
             sudo -u "$user" -i bash -c \
-                "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec $scope_words \"$binary\" \"\$@\"" \
+                "$prologue; cd $(_oct_quote "${cwd_arg[0]}") && exec $scope_words \"$binary\" \"\$@\"" \
                 -- "${tail_args[@]}"
         else
             sudo -u "$user" -i bash -c \
@@ -2111,8 +2126,9 @@ cmd_session() {
         # Fallback: ~/.runtime/start.sh adapter. Pass tail args only (not the
         # base binary word — the adapter knows what to launch).
         if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+            # inner consumer is bash -c: the octal $'..' cd word is a bash extension; that is why it is allowed here (#4416)
             sudo -u "$user" -i bash -c \
-                "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec $scope_words ~/.runtime/start.sh \"\$@\"" \
+                "$prologue; cd $(_oct_quote "${cwd_arg[0]}") && exec $scope_words ~/.runtime/start.sh \"\$@\"" \
                 -- "${tail_args[@]}"
         else
             sudo -u "$user" -i bash -c \

@@ -280,16 +280,27 @@ soma stays Ariadne's as principal approver and merger (*Scope* above). Two group
 to the **merge seats** instead (Kepler and Borges on all org repos, with Ariadne on
 umwelt and soma, per *Scope* and *Who presses the button* above):
 
-- a PR with **no project owner**, a **release cut** (a `dev`→`main` release PR or a
-  hotfix PR into `main`), and a **reconcile** PR;
+- a PR with **no project owner**, the **merge-back** of a release branch into `dev`
+  (`docs/internal/RELEASING.md` step 10), and a **reconcile** PR. The two release
+  actions that write to `main` or to `release/*` (the fast-forward of `main` to the
+  head of the release PR, and a soak-fix copy into `release/*`) are NOT a merge
+  seat's: the rulesets let only a release-team account make them, so they go to
+  **the release seat** (same page, steps 5 and 7);
 - *(retired 2026-10-22 23:31Z, see the Amendment above)* ~~a PR whose author is its
   project owner goes to a merge seat for the press~~ — **the owner presses their own PR**
   once the record below is posted; the hand-off to a seat was clerical once the record
   existed, and the record is what any seat checks;
-- a seat whose **own user's authority table does not grant merge clicks** (as of
-  2026-10-22, Aleph and Clio, whose user has not granted it, so a merge click is a
-  destructive action outside this repo's delegation for them): that seat runs the
-  gate and posts the record; a merge seat presses.
+- a seat with **no standing merge grant from its own user** (as of 2026-11-14: Aleph
+  and Clio, whose user has not granted it, and Zephyr, whose table lists each merge as
+  a per-action decision of their user; for these seats a merge click is a destructive
+  action outside this repo's delegation): that seat runs the gate and posts the
+  record; a merge seat presses. Two questions are kept apart here. Whether the merge
+  is **authorised** is for the seat's own table and its user. **Whose click** it is, is
+  settled by this section: without a standing grant, a merge seat's, with one
+  exception: that user's own word for that PR, telling the seat to press, which the
+  seat quotes in the merge record with its time. A list a merge seat posted and the
+  summary in CLAUDE.md never settle either question; and when a record reaches a
+  merge seat, the seat asks whose click it is.
 
 **Nothing below widens the ⛔ list or touches the security read.** An owner never
 merges a ⛔-list (substrate-concept) PR: it goes to Lei first, or, when it implements a
@@ -299,7 +310,15 @@ with the merge seats. A security PR carries the security seat's exact-head appro
 its gate (Zephyr since Lei's 2026-10-06 ruling, Mira additive; see the seat note under
 *Who presses the button*) and
 is merged by the merge seats under the two directions in *Who presses the button*; an
-owner does not click it. The owner merges exactly what the merge seats could already
+owner does not click it. *(Nothing mechanical enforces these two exceptions. On
+2026-11-13 and 14 seats without the grant pressed their own PRs, security changes
+among them, reading the summary in CLAUDE.md, which then named neither exception;
+every one had a non-author approval and a recorded run, and all stand. The
+summary now names both. `.github/CODEOWNERS` (#4800) has GitHub request the merge seats
+as reviewers on changes to `/.github/` and to this file; the ruleset switch that would
+require their approval is a decision of the project lead and is not set. A security PR
+that touches only `src/` has no mechanical stop: that gap is open and named here.)*
+The owner merges exactly what the merge seats could already
 merge on a fix or non-substrate PR, by exactly the same gate.
 
 **The gate the owner runs, in full, before pressing the button.** The merge seat's
@@ -311,7 +330,12 @@ seat can run it and any other seat can check that it ran.
    Converged means one of three, and the merge comment states which: the round
    returned APPROVE; or it returned COMMENT with zero blockers and every actionable
    suggestion either folded (commit named, from 2026-11-04) or answered in writing on the PR; or the
-   three-round cap was reached with the open findings listed in the PR body. A
+   three-round cap was reached with the open findings listed in the PR body. The PR body
+   also names which of its commits a fairy made (or says none): the cap's reset test
+   reads the git author, and a fairy's commit under another name would otherwise read
+   as a contributor's and reset the count. When the body is silent, the merge seat
+   asks the author; an unfamiliar commit author is not read as a contributed tip
+   without that answer. A
    COMMENT round with an actionable suggestion neither folded nor answered is NOT
    converged, whatever its blocker count. *(Kepler, 2026-11-04, after two seats read
    this item and CLAUDE.md's merge-seat check differently. Ground: the reviewer-fairy
@@ -363,6 +387,7 @@ seat can run it and any other seat can check that it ran.
    `tests/test_raw_home_read_gate_3863.py`, `tests/test_home_path_gate.py`,
    `tests/test_lesson_pattern_audit_shipped_3941.py` (it copies every shipped
    hook into its tree), `tests/test_docs_layout_guard.py`,
+   `tests/test_policy_guard_list_4487.py` (it reads this document and names no module),
    `tests/test_metadata_parse_drift_guard_3413.py`,
    `tests/test_json_extract_metadata_guard_3485.py` and
    `tests/test_no_retired_cascade_store_asserts.py` (it scans `tests/` itself) and
@@ -418,14 +443,18 @@ seat can run it and any other seat can check that it ran.
    pressing: `--match-head-commit` pins only the head, never the base, so without
    this check two owners can each pass a scratch run on the same base and the second
    presses on a tree it never tested (the 2026-09-13 jointly-broken case, Borges).
-   Every PR into `main`
-   (release cut, hotfix, reconcile) and a `main`→`dev` reconcile merge as a **merge
-   commit** (`docs/internal/RELEASING.md`); every other PR into `dev` squashes; a member of a
+   The assertion is chained to the merge with `&&`, never left to `set -e` (see
+   *Merge-seat test rules*, rule 5).
+   The release PR into `main` is **never merged with the button**: `main` is
+   fast-forwarded to its head (`docs/internal/RELEASING.md`, steps 6 to 8), and there
+   is no hotfix PR into `main`. A release branch that carries its own commits comes
+   back into `dev` as a **merge commit** (same page, step 10); every other PR into
+   `dev` squashes, and a soak-fix copy into `release/*` squashes; a member of a
    linked stack merges with `gh stack merge` (plain `gh pr merge` is refused there).
    On a repo with no `dev` branch (local-model-lab and gpu-broker, both read
-   2026-11-03), every PR targets `main` and merges as a **squash**. The merge-commit
-   rule above is engram's rule for release cuts, hotfixes and reconciles; it
-   does not apply there. Both of those repos set `squash_merge_commit_message` to
+   2026-11-03), every PR targets `main` and merges as a **squash**. The fast-forward
+   and merge-commit rules above are engram's rules for releases; they
+   do not apply there. Both of those repos set `squash_merge_commit_message` to
    `COMMIT_MESSAGES`, so the branch's commit messages ride into the squash and the
    close-keyword read covers them (CLAUDE.md § PR — issue closure, check 3).
 9. **On umwelt, merge does not promote** (Ariadne): prod promotion stays a separate,
@@ -464,7 +493,7 @@ change.
 *Queue status: NOT AVAILABLE on this repository (Team plan, private), measured 2026-10-22 16:05Z.*
 
 **What the merge seats still do.** Kepler and Borges (Ariadne on umwelt) keep the
-seat for ownerless PRs, release cuts, reconciles, the seats whose user has not granted
+seat for ownerless PRs, release merge-backs, reconciles, the seats whose user has not granted
 merge clicks (*Who* above), ⛔-list and security PRs, and any merge an owner declines ("I'd rather a second pair
 of eyes" is always allowed and never a demerit); the commander keeps the day-end
 sample of merge records. The seat is no longer the serial point; the written gate is.
@@ -753,7 +782,21 @@ merged; main was red on three cells minutes later).
 GREEN on the base alone (or the PR adds it).** Otherwise it is the base's and goes to
 the seat that broke it, and must not be held against the PR. To tell the two apart, run the failing cell on the base tip.
 
+A cell can also be red on the base **on one seat only**, for a cause in that seat's
+environment (a network path, a missing tool), while it is green on the base elsewhere.
+It is still not the PR's: the merge record names the cell, its red on the base on the
+pressing seat, the other seat's green run on the same base (that green run is the
+control; the red seat's own base run shows only that the red is not the PR's), and the
+issue filed for the cell's dependence. One condition
+first: if the PR's diff touches code that cell exercises, **including code it only
+imports**, the cell must pass on the merged tree on a seat where it can run before the
+press.
+
 *Evidence:* Borges's run on umwelt #1021 (2026-10-06) kept main's own red off the PR.
+Alpha #4794 (2026-11-14): an installer cell timed out on one seat's network path on base
+and merged tree alike; the PR's changed module was imported by the code the cell runs,
+so the cell was run on the merged tree on a second seat (1 passed) before the press;
+the dependence is #4795.
 
 **3. A cancelled same-SHA run can block the merge even when another run passed.**
 Observed: a required status check can read as not-satisfied — the PR stays `BLOCKED`
@@ -858,14 +901,14 @@ recomputes `mergeStateStatus` asynchronously, so at that moment it commonly read
 `UNKNOWN`. Under the CI-green gate above, `UNKNOWN` means pending, never a value to
 echo and press past.
 
-In the same command as the press, the step:
-- (a) asserts the base is the SHA the run was built on, or the previous step's merge
+The step has three parts, in this order:
+- (a) in the press command itself, chained with `&&` into the merge, asserts the base is the SHA the run was built on, or the previous step's merge
   commit;
-- (b) polls until `mergeStateStatus` reads `CLEAN`, or until a read of every run of
+- (b) in the gate read, a separate tool call made before the press, polls until `mergeStateStatus` reads `CLEAN`, or until a read of every run of
   the repo's required check on the head (on engram's `dev` ruleset, which requires a PR, 1 approval, stale approvals
   dismissed on push, last-push approval and the status check `pr-checks`, that
   check is `pr-checks`) prints `success`. The poll is bounded at five minutes. Past that
-  ceiling the press refuses and names the last state it read;
+  ceiling the gate read prints the last state it read, and the seat does not press;
 - (c) after the press, asserts that the base's tree equals the tree the run predicted
   for that step.
 
@@ -909,6 +952,38 @@ runs, the same evidence the rollup summarises (and stricter: no dedupe), instead
 field GitHub has not recomputed, so it does not press past an unread state. `UNKNOWN` also covers mergeability (conflicts,
 approvals). The read does not check those; the press command itself does, because
 GitHub refuses a merge that the branch rules block.
+
+**Guards stop the press by control flow, not `set -e`.** In the Claude Code Bash
+tool, `set -e` does not stop a command: the tool runs the command inside an `&&` list,
+and bash ignores `errexit` in a command that is not the last member of such a list. Measured on a merge seat, 2026-11-09:
+`set -e; false; echo SURVIVED` printed `SURVIVED`. That was observed through the tool;
+in a plain terminal, `bash -c 'set -e; false; echo SURVIVED'` exits 1, so do not re-test
+it there. A press script that leans on
+`set -e` or `set -euo pipefail` to stop at a failed guard is therefore fail-open: on
+2026-11-09 a seat's script printed its own failure line and still ran `gh pr merge`,
+and the v0.5.6 CHANGELOG pull request (#4545) was merged past a failing test that printed
+in the same output. A guard written as a bare `test ...` or `grep -q ...` on
+its own line stops nothing. So:
+- A guard stops the press only by explicit control flow: chained to the merge with
+  `&&`, or followed by `|| exit 1` (or `|| { echo "<NAME>-FAILED"; exit 1; }`).
+- The seat reads the gate's verdicts as printed text before pressing, in a separate
+  tool call from the press. The read prints one positive line per check (for example
+  `BASE-OK <sha>`, `CHECKS success`, `TREE <tree>`); the seat reads them, and only
+  then sends the press call. An exit status alone is not a verdict, because a
+  wrapper's `echo` after the command masks it (`pytest ...; echo done` returns `echo`'s
+  status, 0, whatever pytest did).
+- The press call still re-asserts what can move: the base, chained with `&&` into
+  the merge. This keeps item 8's race closure, since the base can move between the
+  gate read and the press. (b)'s CI poll belongs to the gate read. (c)'s tree
+  assertion runs after the press, and its printed result is read too.
+
+```
+git fetch -q origin <base> \
+  && { test "$(git rev-parse origin/<base>)" = <base-sha> || { echo "BASE-MOVED: stop"; false; }; } \
+  && gh pr merge <N> --squash --match-head-commit <head-sha>
+```
+
+A failed assertion prints `BASE-MOVED: stop` and the merge does not run.
 
 *Evidence:* #4092 (2026-10-23) and #4182 (2026-10-25) were each pressed on a printed
 `UNKNOWN` with no gate, four minutes and three seconds respectively after the base

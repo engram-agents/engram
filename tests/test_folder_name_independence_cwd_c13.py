@@ -44,7 +44,7 @@ def _layout(site, names):
         return [n for n in names], []
     if site == "tripwire":
         return [f"{n}/src/engram" for n in names], []
-    return [], [f"{n}/server.py" for n in names]
+    return [], [f"{n}/src/engram/server.py" for n in names]
 
 
 def _expected(site, home, name):
@@ -52,7 +52,7 @@ def _expected(site, home, name):
         return str(home / name)
     if site == "tripwire":
         return str(home / name / "src" / "engram")
-    return str(home / name / "server.py")
+    return str(home / name / "src" / "engram" / "server.py")
 
 
 def _run(site, tmp_path, monkeypatch, names, cwd, extra_dirs=(), alpha_symlink=False):

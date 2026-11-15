@@ -615,8 +615,8 @@ const tooltip = document.getElementById('tooltip');
 function showTooltip(event, d) {
   const tierMap = computeTiers(rawData.nodes);
   const tier = tierMap[d.id] || 3;
-  const tierLabel = tier === 1 ? 'Tier 1 (working)' : tier === 2 ? 'Tier 2 (searchable)' : 'Tier 3 (archive)';
-  const tierColor = tier === 1 ? '#5cb85c' : tier === 2 ? '#f0ad4e' : '#e05252';
+  const tierLabel = tier === 2 ? 'Tier 2 (searchable)' : 'Tier 3 (archive)';
+  const tierColor = tier === 2 ? '#f0ad4e' : '#e05252';
 
   let lines = [`<b>${escHtml(d.id)}</b> <span style="color:#7788aa">${escHtml(NODE_STYLE[d.type]?.label || d.type)}</span>`];
   const text = nodeDisplayText(d);
@@ -902,7 +902,9 @@ function renderDetailBody(d) {
       {
         const meta = (() => { try { return typeof d.metadata === 'string' ? JSON.parse(d.metadata) : (d.metadata || {}); } catch(e) { return {}; } })();
         field('Name', meta.name || d.claim);
-        if (meta.role) field('Role', meta.role);
+        // Prefer relation; fall back to the deprecated pre-rename role (#3864).
+        const personRel = [meta.relation, meta.role].find(v => typeof v === 'string' && v.trim());
+        if (personRel) field('Role', personRel);
         if (meta.is_self) field('Self', 'yes (agent self-anchor)');
         if (meta.aliases && meta.aliases.length > 0) field('Aliases', meta.aliases.join(', '));
         if (d.logical_chain) field('Background', d.logical_chain);
@@ -962,8 +964,8 @@ function renderDetailBody(d) {
   if (d.importance_score != null || d.importance_base != null) {
     const tierMap = computeTiers(rawData.nodes);
     const tier = tierMap[d.id] || 3;
-    const tierLabel = tier === 1 ? 'Tier 1 (working memory)' : tier === 2 ? 'Tier 2 (searchable)' : 'Tier 3 (archive)';
-    const tierColor = tier === 1 ? '#5cb85c' : tier === 2 ? '#f0ad4e' : '#e05252';
+    const tierLabel = tier === 2 ? 'Tier 2 (searchable)' : 'Tier 3 (archive)';
+    const tierColor = tier === 2 ? '#f0ad4e' : '#e05252';
 
     body.insertAdjacentHTML('beforeend',
       `<div class="detail-section">
@@ -1619,14 +1621,13 @@ async function fetchGraph() {
 
     // Memory tier distribution
     const tierMap = computeTiers(data.nodes);
-    const tierCounts = {1: 0, 2: 0, 3: 0};
+    const tierCounts = {2: 0, 3: 0};
     data.nodes.filter(n => n.is_current).forEach(n => {
       const t = tierMap[n.id] || 3;
       tierCounts[t]++;
     });
     sd.insertAdjacentHTML('beforeend',
       `<div style="margin-top:8px;padding-top:6px;border-top:1px solid #0f3460">
-        <div class="stat-row"><span class="k" style="color:#5cb85c">Tier 1 (working)</span><span class="v">${tierCounts[1]}</span></div>
         <div class="stat-row"><span class="k" style="color:#f0ad4e">Tier 2 (search)</span><span class="v">${tierCounts[2]}</span></div>
         <div class="stat-row"><span class="k" style="color:#e05252">Tier 3 (archive)</span><span class="v">${tierCounts[3]}</span></div>
       </div>`

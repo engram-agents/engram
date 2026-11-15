@@ -23,7 +23,9 @@ Cells:
   B5  no loop marker -> runs all the same (#4350 dropped the loop gate; was: no run)
   B6  a request since the checkpoint -> no run (pending: by requested_at; consumed tombstone: by mtime);
       older -> runs
-  B10 the record's session differs from the Stop payload's -> no run; a null record session -> runs
+  B10 the record's session differs from the Stop payload's -> no run; a record with no session
+      (null, absent, empty, non-string) -> no run, one stderr line, and a refused attempt recorded for
+      the Stop's own session so the #4350 surface shows it once (#4356)
   B7  stdin without session_id -> no run, one stderr line (only when otherwise due)
   B8  exits 0 even when compact-request is missing
   B9  the deployed (flattened) layout, CLAUDE_PLUGIN_ROOT unset: found by walk-parents
@@ -453,10 +455,74 @@ def test_b10_a_record_from_another_session_means_no_run(tmp_path, stub_plugin):
     assert not (home / "compact" / "backstop-last.json").exists()
 
 
-def test_b10b_a_record_without_a_session_keeps_todays_behaviour(tmp_path, stub_plugin):
+NO_SESSION_LINE = "engram nap-compact-backstop: the nap record carries no session_id; not requesting compaction"
+_ABSENT = object()
+NO_SESSION_REASON = (
+    "the last nap's record carries no session_id, so the backstop cannot tell which session napped "
+    "(a checkpoint call without session_id, or a nap skill older than this fix); nap again through the "
+    "current engram-nap skill, which passes it"
+)
+
+
+def _no_session_home(tmp_path, record_session):
+    record = {"checkpoint_at": HEADER_TS, "backup_ok": True}
+    if record_session is not _ABSENT:
+        record["session_id"] = record_session
+    return make_home(tmp_path, record=record)
+
+
+@pytest.mark.parametrize("record_session", [None, _ABSENT, "", 5], ids=["null", "absent", "empty", "non-string"])
+def test_b10b_a_record_without_a_session_means_no_run(record_session, tmp_path, stub_plugin):
+    home = _no_session_home(tmp_path, record_session)
+    done = stop(home, stub_plugin, session_id="whatever")
+    assert done.returncode == 0
+    assert stub_calls(home) == []
+    assert request(home) is None
+    assert done.stdout == ""
+    assert done.stderr.splitlines() == [NO_SESSION_LINE]
+    last = backstop_last(home)
+    assert last["outcome"] == "refused"
+    assert last["exit_code"] is None
+    assert last["session_id"] == "whatever"  # the Stop payload's session, not the record's
+    assert last["reason"] == NO_SESSION_REASON
+
+
+def test_b10e_a_second_stop_on_the_same_no_session_record_is_silent(tmp_path, stub_plugin):
+    home = _no_session_home(tmp_path, None)
+    assert stop(home, stub_plugin, session_id="whatever").stderr.splitlines() == [NO_SESSION_LINE]
+    path = home / "compact" / "backstop-last.json"
+    before = path.read_bytes()
+    again = stop(home, stub_plugin, session_id="whatever")
+    assert again.returncode == 0
+    assert again.stdout == "" and again.stderr == ""
+    assert path.read_bytes() == before
+    assert stub_calls(home) == []
+
+
+def test_b10f_a_second_session_on_the_same_no_session_record_is_silent(tmp_path, stub_plugin):
+    home = _no_session_home(tmp_path, None)
+    stop(home, stub_plugin, session_id="session-a")
+    path = home / "compact" / "backstop-last.json"
+    before = path.read_bytes()
+    other = stop(home, stub_plugin, session_id="session-b")
+    assert other.returncode == 0
+    assert other.stdout == "" and other.stderr == ""
+    assert path.read_bytes() == before
+    assert backstop_last(home)["session_id"] == "session-a"
+    assert stub_calls(home) == []
+
+
+def test_b10d_payload_without_session_and_record_without_session_prints_only_the_payload_line(tmp_path, stub_plugin):
+    """A precedence pin for guard 5 (payload without session_id), green on the base by design: it is not a
+    cell that catches the C1 change. With both sessions missing, only guard 5's line is printed."""
     home = make_home(tmp_path, record={"checkpoint_at": HEADER_TS, "session_id": None, "backup_ok": True})
-    stop(home, stub_plugin, session_id="whatever")
-    assert stub_calls(home) == [["--session", "whatever"]]
+    done = stop(home, stub_plugin, session_id=None)
+    assert done.returncode == 0
+    assert done.stdout == ""
+    assert done.stderr.splitlines() == [
+        "engram nap-compact-backstop: the Stop payload carries no session_id; not requesting compaction"
+    ]
+    assert stub_calls(home) == []
 
 
 def test_b10c_matching_sessions_run(tmp_path, stub_plugin):

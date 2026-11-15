@@ -405,5 +405,47 @@ class TestPipeExitWarn(unittest.TestCase):
         self.assertEqual(out.strip(), "", "prefix alone must not make ls consequential")
 
 
+class TestSuccessEchoCaseInsensitive(unittest.TestCase):
+    """#2119: the success-word echo alternation is case-insensitive and covers `passed`."""
+
+    WORDS = ["done", "success", "complete", "sent", "posted", "ok", "passed"]
+
+    def _fires(self, command: str) -> bool:
+        out = _run_hook(command)
+        if not out.strip():
+            return False
+        ctx = json.loads(out.strip())["hookSpecificOutput"]["additionalContext"]
+        return "pipe-exit-warn" in ctx
+
+    def test_word_forms_fire_for_both_joiners(self):
+        for joiner in ("&&", ";"):
+            for word in self.WORDS:
+                for form in (word.lower(), word.upper(), word.title()):
+                    cmd = f"pytest -q | tail -5 {joiner} echo {form}"
+                    with self.subTest(command=cmd):
+                        self.assertTrue(self._fires(cmd))
+
+    def test_check_mark_alternative_still_fires(self):
+        self.assertTrue(self._fires("pytest -q | tail -5 && echo '✓'"))
+        self.assertTrue(self._fires("pytest -q | tail -5; echo ✓"))
+
+    def test_negative_non_success_word(self):
+        self.assertFalse(self._fires("pytest -q | tail -5 && echo hello"))
+
+    def test_negative_echo_without_joiner(self):
+        # Existing behaviour: no preceding ; or && means no success-echo context.
+        self.assertFalse(self._fires("echo DONE"))
+        self.assertFalse(self._fires("pytest -q | tail -5\necho DONE"))
+
+    def test_ok_alternative_is_single_under_ignorecase(self):
+        # Pattern-string assertion: the duplicate-alternative property has no
+        # behavioural expression under IGNORECASE.
+        import re
+        rx = _load_hook_module()._SUCCESS_ECHO_RE
+        self.assertTrue(rx.flags & re.IGNORECASE)
+        self.assertEqual(rx.pattern.count(r"ok\b"), 1)
+        self.assertEqual(rx.pattern.lower().count(r"ok\b"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
