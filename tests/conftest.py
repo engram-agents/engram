@@ -10,11 +10,13 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 # #3784 (b): pre-import so a sys.modules clear in another thread (patch.dict
 # exit) cannot break pytest's lazy `import tracemalloc` in thread_exception_hook,
 # which masks the real thread exception. Must stay at module level.
 import tracemalloc  # noqa: F401
 import types
+import warnings
 
 import pytest
 
@@ -409,28 +411,78 @@ def _reset_telemetry_process_file_path(monkeypatch):
     yield
 
 
-@pytest.fixture(autouse=True)
-def _stop_snapshot_worker():
-    """Stop + reset the #1673 async snapshot worker after each test.
+# #4826: total wait (seconds) the snapshot-worker teardown allows a still-running
+# job before it gives up and says so loudly. Generous on purpose: a job that is
+# still alive after the first join is mid-write into the store directory, and the
+# next test's rmtree of that directory races it (OSError ENOTEMPTY).
+_SNAPSHOT_WORKER_JOIN_BOUND_S = 15.0
+
+
+def _stop_and_reset_snapshot_worker(
+    nodeid, *, first_join_s=2.0, bound_s=_SNAPSHOT_WORKER_JOIN_BOUND_S
+):
+    """Stop + reset the #1673 async snapshot worker; return what happened.
+
+    Returns "absent" (module never imported: no thread, no join, no sleep),
+    "stopped" (worker thread gone, singleton reset) or "still_alive" (thread
+    still running after ``bound_s``; reset anyway, loudly).
 
     engram_snapshot_worker runs a module-level singleton background thread that any
     test hitting the async _commit_snapshot path starts. Without this teardown the
-    thread (and its module globals) leak across tests, polluting later ones (e.g. a
-    thread still processing a torn-down tempdir's queue). Safe no-op when the module
-    was never imported or no worker started."""
-    yield
+    thread (and its module globals) leak across tests. A single 2 s join is not
+    enough (#4826): a job still writing into the store directory after it makes the
+    next test's ``fresh_server()`` rmtree fail with ``Directory not empty``. So after
+    the first join we keep joining until the thread stops or ``bound_s`` is spent.
+
+    Loud, not fatal: past the bound we print one stderr line naming the test and
+    emit a UserWarning, but never fail the test. A broken worker module cannot fail
+    teardown either (the ``except Exception`` stays)."""
     mod = sys.modules.get("engram_snapshot_worker")
-    if mod is not None:
-        try:
-            mod.stop_worker(timeout=2.0)
-            # Reset singleton state so the next test starts clean.
-            mod._started = False
-            mod._worker_thread = None
-            mod._seq_counter = 0
-            mod._stop.clear()
-            mod._work_event.clear()
-        except Exception:
-            pass
+    if mod is None:
+        return "absent"
+    status = "stopped"
+    try:
+        mod.stop_worker(timeout=first_join_s)
+        t = mod._worker_thread
+        if t is not None and t.is_alive():
+            deadline = time.monotonic() + max(0.0, bound_s - first_join_s)
+            while t.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                t.join(timeout=min(remaining, 0.5))
+            if t.is_alive():
+                status = "still_alive"
+                print(
+                    f"[conftest] snapshot worker still alive {bound_s}s after "
+                    f"teardown of {nodeid}; the next test may hit ENOTEMPTY (#4826)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                warnings.warn(
+                    f"snapshot worker still alive {bound_s}s after teardown of "
+                    f"{nodeid} (#4826)",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        # Reset singleton state so the next test starts clean.
+        mod._started = False
+        mod._worker_thread = None
+        mod._seq_counter = 0
+        mod._stop.clear()
+        mod._work_event.clear()
+    except Exception:
+        pass
+    return status
+
+
+@pytest.fixture(autouse=True)
+def _stop_snapshot_worker(request):
+    """Stop + reset the #1673 async snapshot worker after each test (#4826: join
+    until it stops, bounded, loud if it will not). See
+    _stop_and_reset_snapshot_worker. Safe no-op when the module was never imported."""
+    yield
+    _stop_and_reset_snapshot_worker(request.node.nodeid)
 
 
 @pytest.fixture(autouse=True)
