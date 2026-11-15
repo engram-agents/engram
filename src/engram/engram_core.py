@@ -5207,13 +5207,84 @@ def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
 # pre-migration backup, and engramd_owner's start() gate refuses a store whose
 # user_version is below it (read through this module attribute at call time, never
 # copied). Adding a rung means bumping this single line.
-LATEST_SCHEMA_VERSION = 10
+LATEST_SCHEMA_VERSION = 11
 
 
 # Migration rung of #4075 (the fourth cascade resolution kind). A renumber edits THREE places, as for
 # TEXT_NUL_GUARD_RUNG above: this constant, the literal `PRAGMA user_version = N` in the rung, and
 # LATEST_SCHEMA_VERSION; tests/test_cascade_resolved_kind_4075.py ties them together.
 CASCADE_RESOLVED_KIND_RUNG = 10
+
+
+# Migration rung of #4727 (retract markers for retractions older than the cascade machine). Same
+# three places as above; tests/test_retract_backfill_4727.py ties them together.
+RETRACT_BACKFILL_RUNG = 11
+
+
+def _backfill_pre_machine_retract_markers(conn: sqlite3.Connection) -> "tuple[int, int, int]":
+    """#4727: mark the live dependents of retractions made before the cascade machine.
+
+    A retracted node with NO retract-rooted marker either had no live claim-bearing
+    dependent when it was retracted, or was retracted before the machine existed and so
+    never marked the nodes built on it. The live walk (``_walk_cascade_from_root``,
+    the same helper every live retraction uses) tells the two apart: it finds nothing
+    for the first and the unmarked dependents for the second. Each gets one pending
+    marker, ``root_op='retract'``, ``cascade_event='backfill:retract:<root>'``,
+    ``backfill_provenance='migration_time'``.
+
+    Writes ONLY ``INSERT OR IGNORE`` rows into cascade_markers, plus one edit_history
+    row per root that gained markers (keyed to that root, as every edit_history row is
+    keyed to a node), and only when edit_history exists (a fresh store creates it after
+    the ladder). No node, edge, or existing marker row is changed.
+
+    Unlike a live retraction, this does NOT mark contradiction nodes with the root as a
+    side (the live path's parallel contradicts cascade): measured 0 across the team's
+    graphs on 2026-11-15, unmeasured on public installs.
+
+    Returns (roots that gained markers, markers written, distinct nodes marked).
+    """
+    now = _now()
+    roots = [r[0] for r in conn.execute(
+        "SELECT n.id FROM nodes n WHERE n.status = 'retracted' AND NOT EXISTS "
+        "(SELECT 1 FROM cascade_markers m WHERE m.root_op = 'retract' "
+        "AND m.root_node = n.id) ORDER BY n.id"
+    )]
+    has_history = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edit_history'"
+    ).fetchone() is not None
+    roots_marked = markers_written = 0
+    nodes_marked: set = set()
+    for root in roots:
+        event = f"backfill:retract:{root}"
+        written: list = []
+
+        def _mark(dep, _root=root, _event=event, _written=written):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO cascade_markers (node_id, cascade_event, root_node, "
+                "root_op, status, created_at, backfill_provenance) "
+                "VALUES (?, ?, ?, 'retract', 'pending', ?, 'migration_time')",
+                (dep["id"], _event, _root, now),
+            )
+            if cur.rowcount:
+                _written.append(dep["id"])
+
+        _walk_cascade_from_root(conn, root, on_live_node=_mark)
+        if not written:
+            continue
+        roots_marked += 1
+        markers_written += len(written)
+        nodes_marked.update(written)
+        if has_history:
+            row = conn.execute("SELECT type FROM nodes WHERE id = ?", (root,)).fetchone()
+            conn.execute(
+                "INSERT INTO edit_history (timestamp, action, node_id, node_type, details) "
+                "VALUES (?, 'retract_backfill', ?, ?, ?)",
+                (now, root, row[0] if row else "", json.dumps({
+                    "cascade_event": event, "markers_written": len(written),
+                    "nodes_marked": sorted(written), "issue": 4727,
+                })),
+            )
+    return roots_marked, markers_written, len(nodes_marked)
 
 
 # #4075 (schema v10): the cascade_markers table with its fourth resolution kind. SQLite cannot
@@ -6908,6 +6979,41 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 f"[_run_db_one_time_setup] migration {CASCADE_RESOLVED_KIND_RUNG} (#4075 cascade_markers "
                 "'resolved' kind) FAILED, will retry on next "
                 f"startup: {_migration10_err!r}",
+                file=sys.stderr,
+            )
+
+    # Migration version 11 (#4727; the number is RETRACT_BACKFILL_RUNG): retractions made before
+    # the cascade machine never marked the nodes built on them. One pass of the LIVE walk from
+    # every retracted root that has no retract marker writes the missing markers (insert-only;
+    # see _backfill_pre_machine_retract_markers). One transaction with the version bump; on
+    # failure it rolls back and retries next start; the pre-migration backup gate applies.
+    # RecursionError is caught with DatabaseError: the walk recurses once per derivation
+    # level, so a chain deeper than the interpreter's limit raises it. Caught, the server still
+    # starts, but the rung fails again at EVERY start (rolled back each time), the store stays
+    # at schema 10, and the engramd owner's schema gate refuses it until the walk is made
+    # iterative (#4823).
+    if _rung_ready(conn, RETRACT_BACKFILL_RUNG, _pre_migration_backup_ok):
+        try:
+            _bf_roots, _bf_markers, _bf_nodes = _backfill_pre_machine_retract_markers(conn)
+            conn.execute("PRAGMA user_version = 11")
+            conn.commit()
+            print(
+                f"[_run_db_one_time_setup] migration {RETRACT_BACKFILL_RUNG} (#4727 retract-marker "
+                f"backfill): {_bf_roots} old retraction(s), {_bf_markers} marker(s), "
+                f"{_bf_nodes} node(s) marked; they block derivation until adjudicated "
+                "(engram_cascade_frontier).",
+                file=sys.stderr,
+            )
+        except (sqlite3.DatabaseError, RecursionError) as _migration11_err:
+            conn.rollback()
+            print(
+                f"[_run_db_one_time_setup] migration {RETRACT_BACKFILL_RUNG} (#4727 retract-marker "
+                "backfill) FAILED, will retry on next "
+                f"startup: {_migration11_err!r}"
+                + ("; a derivation chain is deeper than the recursion limit, so this repeats at "
+                   "every start and the store stays at schema 10 (the engramd owner refuses it) "
+                   "until the cascade walk is iterative (#4823)"
+                   if isinstance(_migration11_err, RecursionError) else ""),
                 file=sys.stderr,
             )
 
@@ -12941,6 +13047,14 @@ def _validate_premises(
         open_ct_ids = [] if tainted_by else _open_contradiction_ids(conn, sid)
 
         if tainted_by:
+            # #4727: roots whose pending retract marker on this premise came from the
+            # one-time backfill of pre-machine retractions; their item names the event.
+            backfill_events = {
+                m["root_node"]: m["cascade_event"]
+                for m in _pending_markers_for_node(conn, sid)
+                if m["root_op"] == "retract"
+                and m["cascade_event"].startswith("backfill:retract:")
+            }
             retraction_info = []
             for rid in tainted_by:
                 rrow = conn.execute(
@@ -12949,10 +13063,13 @@ def _validate_premises(
                 r_reason = None
                 if rrow and rrow["metadata"]:
                     r_reason = _metadata_dict(rrow["metadata"]).get("retraction_reason")
-                retraction_info.append({
+                item = {
                     "retracted_by": rid,
                     "retraction_reason_excerpt": (r_reason or "")[:_WARNING_EXCERPT_LEN],
-                })
+                }
+                if rid in backfill_events:
+                    item["cascade_event"] = backfill_events[rid]
+                retraction_info.append(item)
             tainted_premises.append({
                 "id": sid,
                 "retracted_by": retraction_info,
