@@ -475,17 +475,19 @@ def run_G4b(repo_root: str, forbidden_teachings: list[dict]) -> dict[str, Any]:
 def run_G5(repo_root: str) -> dict[str, Any]:
     """G5 — de-personalisation scan (public-readiness dimension).
 
-    Runs tools/scan-leaks.py --root . and reports hit count.
+    Runs tools/scan-leaks.py --root . and reports the CLASS-A (blocking) hit
+    count from the scanner's own summary line.
     DEGRADED with count > 0.  PASS at 0 hits — except a scan that could not
     cover the whole tree (scanner exit 3) is DEGRADED with metric
     "coverage incomplete" even at 0 hits: not looking is not evidence of clean.
     A scanner that did not run at all (any other exit code, e.g. 2 for an
     internal or invocation error) is DEGRADED with metric "did not run" and
     the exit code in the detail — never the hit-count path, whose "0 hit(s)"
-    would read as a clean tree.
-    If roster absent → SKIP with advisory (spec language for future
-    #665 roster extension; current scan-leaks.py has no roster concept,
-    so we always run it and SKIP only if the script itself is missing).
+    would read as a clean tree. Exit 1 with no readable class-A summary line
+    is the same no-verdict case: DEGRADED "did not run", never "0 hit(s)".
+    The scan-leaks roster is optional here: this gate passes no roster, so
+    only COMMITTED_PATTERNS and the gitignored local roster can fire, both
+    class A in code.
     """
     scan_leaks = os.path.join(repo_root, "tools", "scan-leaks.py")
     if not os.path.isfile(scan_leaks):
@@ -542,19 +544,38 @@ def run_G5(repo_root: str) -> dict[str, Any]:
             "clean tree",
         )
 
-    # Count hits from stderr output.
-    # scan-leaks.py writes individual hit lines as "  path:lineno [label] snippet"
-    # (two leading spaces); the summary line is "scan-leaks: N potential..." with no indent.
-    # hit_count = number of hit lines (one per match, not unique files).
-    lines = proc.stderr.splitlines()
-    hit_lines = [l for l in lines if l.startswith("  ")]
-    hit_count = len(hit_lines)
-
+    # Count CLASS-A hits from the scanner's stderr summary line, never from
+    # indented hit lines: a class-A hit prints as a COUNT ONLY (no path, no
+    # line, no label), so counting `  ...` lines reports 0 for a real hit.
+    #   scan-leaks: <a> class-A (blocking) and <b> class-B (report-only) hit(s)
+    summary = re.search(
+        r"^scan-leaks: (\d+) class-A \(blocking\) and (\d+) class-B "
+        r"\(report-only\) hit\(s\)",
+        proc.stderr,
+        re.MULTILINE,
+    )
+    if summary is None:
+        # Exit 1 without the class split is a scan that produced no readable
+        # verdict. Never fall back to a line count, whose 0 reads as clean.
+        return make_result(
+            "G5", "public-readiness",
+            STATUS_DEGRADED, "did not run",
+            f"scan-leaks exited {proc.returncode} but printed no class-A "
+            "summary line, so the blocking hit count is unknown — this is not "
+            "evidence of a clean tree",
+        )
+    class_a = int(summary.group(1))
+    class_b = int(summary.group(2))
+    detail = (
+        f"scan-leaks found {class_a} potential leak(s) — review before release"
+    )
+    if class_b:
+        detail += f"; {class_b} class-B (report-only) mention(s) counted"
     return make_result(
         "G5", "public-readiness",
         STATUS_DEGRADED,
-        f"{hit_count} hit(s)",
-        f"scan-leaks found {hit_count} potential leak(s) — review before release",
+        f"{class_a} hit(s)",
+        detail,
     )
 
 

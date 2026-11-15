@@ -268,6 +268,11 @@ one-liner is the authoritative form on every seat.
 `updated_at` is an ISO-8601 UTC timestamp. A malformed or unset attestation is
 treated as absent and fails the gate; it never passes.
 
+**Custody line (roster format 2).** Under the two-class roster a class-A hit is
+printed as a count only, so locating one requires the roster text. Format 2 must
+therefore not gate a release until a **roster holder is named**; no artifact
+names one today, and the naming is Kepler's and Lei's.
+
 **Bootstrap note.** The attestation committed with this change carries the
 placeholder `roster_sha256` `"UNSET - ..."` because the roster is a repository
 secret and cannot be read from a checkout. It must be replaced with the real

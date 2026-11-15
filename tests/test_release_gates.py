@@ -1079,13 +1079,17 @@ class TestG5CoverageIncomplete:
         assert "coverage incomplete" in result["detail"], result
 
     def test_exit_1_still_takes_the_hit_count_path(self):
-        """Positive control: exit 1 still reports the hit count."""
+        """Positive control: exit 1 still takes the hit-count path (not the
+        coverage branch), and the count is the CLASS-A number.
+
+        The stderr shape is the format-2 one: class-A hits print no per-line
+        location, so the summary line is the only place the count exists.
+        """
         proc = self._fake_proc(
             stdout="scan-leaks: scanned 1, skipped-binary 0\n",
             stderr=(
-                "scan-leaks: 2 potential leak(s) in /repo\n"
-                "  doc.md:1 [personal name] Quillonfex\n"
-                "  src/x.py:9 [absolute home path] segment: /home/user\n"
+                "scan-leaks: 2 class-A (blocking) and 0 class-B (report-only) "
+                "hit(s) in /repo\n"
             ),
             returncode=1,
         )
@@ -1095,3 +1099,41 @@ class TestG5CoverageIncomplete:
         assert result["metric"] == "2 hit(s)", result
         assert "found 2 potential leak" in result["detail"], result
         assert "coverage incomplete" not in result["detail"], result
+
+    def test_exit_1_reads_the_class_a_count_from_the_summary(self):
+        """Cell 16: the reported count is the class-A number from the summary.
+
+        Class-A hits no longer print `  path:line ...` lines, so counting
+        indented stderr lines reports 0 for a real class-A hit. The fixture
+        discriminates: three class-A hits and one class-B line — a
+        line-counting implementation reports 1, the summary says 3.
+        """
+        proc = self._fake_proc(
+            stdout="scan-leaks: scanned 4, skipped-binary 0\n",
+            stderr=(
+                "scan-leaks: 3 class-A (blocking) and 1 class-B (report-only) "
+                "hit(s) in /repo\n"
+                "  doc.md:1 [roster file] Quillonfex\n"
+            ),
+            returncode=1,
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            result = run_G5(self._REPO_ROOT)
+        assert result["status"] == STATUS_DEGRADED, result
+        assert result["metric"] == "3 hit(s)", result
+        assert "found 3 potential leak" in result["detail"], result
+
+    def test_exit_1_with_no_verdict_is_degraded_not_zero_hits(self):
+        """Cell 16 (DEGRADED arm): exit 1 with no class-A summary line is a
+        scan that produced no verdict. It must not report "0 hit(s)", which
+        reads as a clean tree."""
+        proc = self._fake_proc(
+            stdout="scan-leaks: scanned 4, skipped-binary 0\n",
+            stderr="",
+            returncode=1,
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            result = run_G5(self._REPO_ROOT)
+        assert result["status"] == STATUS_DEGRADED, result
+        assert result["metric"] == "did not run", result
+        assert result["metric"] != "0 hit(s)", result

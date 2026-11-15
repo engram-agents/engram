@@ -171,11 +171,28 @@ jobs:
           # workflow validates first anyway, as defence in depth: on failure
           # this step prints the LINE NUMBER only and fails. Never print the
           # pattern text.
+          #
+          # A FORMAT-2 line (`A<TAB>` / `B<TAB>`) is REFUSED, not compiled:
+          # this workflow (and the warn tool it gates) parses the format-1
+          # roster only, so compiling the class prefix as pattern text would
+          # silently stop matching once the secret is rotated to format 2 —
+          # the list-membership oracle in reverse. One line, line number and
+          # reason only, never the line.
           invalid_pattern_line = None
           for lineno, line in enumerate(canonical.splitlines(), start=1):
               stripped = line.strip()
               if not stripped or stripped.startswith("#"):
                   continue
+              if stripped.startswith("A\t") or stripped.startswith("B\t"):
+                  print(
+                      "::error::NAME_LEAK_ROSTER line "
+                      f"{lineno} is roster format 2 (it starts with A<TAB> or "
+                      "B<TAB>). This workflow parses format 1, so the class "
+                      "prefix would be compiled as pattern text and silently "
+                      "stop matching. Fix the secret; the pattern text is "
+                      "deliberately not printed."
+                  )
+                  raise SystemExit(1)
               try:
                   re.compile(stripped)
               except re.error:
@@ -203,10 +220,13 @@ jobs:
               attested_sha = attestation.get("roster_sha256")
               # A valid attestation has schema 1, an integer pattern count and
               # a 64-hex whole-file sha256. Anything else is "not present": a
-              # malformed or unset attestation must fail, never pass.
+              # malformed or unset attestation must fail, never pass. The
+              # explicit bool guard is load-bearing: isinstance(True, int) is
+              # True in Python, so JSON `true` would otherwise pass as a count.
               if (
                   attestation.get("roster_format") == 1
                   and isinstance(attested_count, int)
+                  and not isinstance(attested_count, bool)
                   and isinstance(attested_sha, str)
                   and re.fullmatch(r"[0-9a-f]{64}", attested_sha) is not None
               ):
