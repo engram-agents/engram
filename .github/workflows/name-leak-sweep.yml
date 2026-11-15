@@ -927,7 +927,7 @@ jobs:
                       print(
                           "::error::the whole-tree sweep did not run: "
                           f"scan-leaks.py exited {scan.returncode} "
-                          "(usage or root error)."
+                          "(usage, root, or internal error)."
                       )
                   raise SystemExit(1)
           finally:

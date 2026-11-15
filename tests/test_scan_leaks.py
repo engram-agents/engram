@@ -979,14 +979,13 @@ def test_use_git_false_fallback_scans_all_text_files(tmp_path):
     assert (report.scanned, report.skipped_binary) == (1, 1)
 
 
-def test_tracked_directory_symlink_does_not_inflate_scanned_or_binary(tmp_path):
-    """A git-tracked symlink to a directory is neither scanned nor binary.
+def test_tracked_directory_symlink_is_scanned_by_its_link_text(tmp_path):
+    """A git-tracked symlink to a directory is scanned, by its link text.
 
-    It IS a candidate: enumeration happens before the file-type filter, so the
-    coverage invariant can reconcile.  It lands in the not-a-file bucket, whose
-    accounting and naming are pinned by
-    test_not_a_file_is_counted_and_named_not_counted_as_incomplete below.
-    What this cell adds is the summary-end: the frozen two numbers do not move.
+    Since #4805 round 4, classification uses lstat and a symlink's published
+    content is its link text (never followed): the symlink counts in
+    ``scanned`` and is not a not-a-file candidate.  The frozen summary line
+    therefore reports two scanned files (the regular file and the link).
     """
     (tmp_path / "real-dir").mkdir()
     _commit_files(tmp_path, {"real/member.py": "// clean\n"})
@@ -997,7 +996,7 @@ def test_tracked_directory_symlink_does_not_inflate_scanned_or_binary(tmp_path):
 
     r = _run_scan(tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert _summary(r.stdout) == (1, 0), f"stdout={r.stdout!r}"
+    assert _summary(r.stdout) == (2, 0), f"stdout={r.stdout!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -1235,9 +1234,9 @@ def test_all_invalid_roster_file_is_a_usage_error(tmp_path):
 #     findings keep exit 1 precedence (the dirty tree is the primary fact).
 #   - skipped binaries are named (up to 20, then "(+K more)") on their own
 #     line after the FROZEN "scan-leaks: scanned N, skipped-binary M" line.
-#   - scan_home_paths() returns (findings, unreadable_paths) and applies the
-#     same is_file() filter, so a tracked symlink to a directory is neither
-#     scanned nor called unreadable.
+#   - scan_home_paths() returns (findings, unreadable_paths) and classifies
+#     every candidate with the same lstat seam (since #4805 round 4 a symlink
+#     is scanned by its link text; an unreadable path is reported).
 
 _SKIPPED_NAMES_RE = re.compile(r"^scan-leaks: skipped-binary files: (.*)$", re.M)
 _UNREADABLE_LINE_RE = re.compile(
@@ -1419,15 +1418,15 @@ def test_positive_control_leak_takes_precedence_over_coverage(tmp_path):
         assert _UNREADABLE_LINE_RE.search(r.stdout), r.stdout
 
 
-def test_tracked_directory_symlink_is_not_unreadable(tmp_path):
-    """A tracked symlink to a directory is not unreadable and is not a hole.
+def test_tracked_directory_symlink_is_scanned_not_unreadable(tmp_path):
+    """A tracked symlink to a directory is scanned by its link text.
 
-    It is enumerated (a candidate), classified not-a-file, and named on the
-    not-a-file line; it does not make the tree exit 3.  Pre-fix: scan() returns
-    a tuple with no not_a_file_paths (reddens on the API shape), and candidates
-    is 1 rather than 2 (the old filter ran before the count).  M3
-    (scan_home_paths without the is_file()/classify filter) names the symlink
-    unreadable and exits 3 -> this reddens again.
+    It is not unreadable and not a coverage hole: readlink() text is scanned
+    in both passes, so the symlink counts in ``scanned`` and no not-a-file
+    line is printed.  Pre-#4805-round-4 it was classified not-a-file and named
+    on that line.  M2 (lstat reverted to stat) classifies it by its target
+    again, so it lands in not_a_file_paths and the CLI prints the not-a-file
+    line -> this reddens.
     """
     (tmp_path / "real-dir").mkdir()
     _commit_files(tmp_path, {"real/member.py": "// clean\n"})
@@ -1438,24 +1437,25 @@ def test_tracked_directory_symlink_is_not_unreadable(tmp_path):
 
     report = _mod.scan(tmp_path, [], use_git=True)
     assert report.candidates == 2
-    assert report.not_a_file_paths == ["tools/engine"]
+    assert report.not_a_file_paths == []
     assert report.unreadable_paths == []
+    assert report.scanned == 2
 
     r = _run_scan(tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert not _UNREADABLE_LINE_RE.search(r.stdout), r.stdout
-    m = _NOT_A_FILE_LINE_RE.search(r.stdout)
-    assert m, r.stdout
-    assert _named_paths(m.group(2)) == ["tools/engine"], r.stdout
+    assert not _NOT_A_FILE_LINE_RE.search(r.stdout), r.stdout
+    assert _summary(r.stdout) == (2, 0), r.stdout
 
 
-def test_scan_home_paths_reports_unreadable_but_not_directory_symlinks(tmp_path):
-    """scan_home_paths returns (findings, unreadable_paths) and applies the
-    same is_file() filter scan() does.
+def test_scan_home_paths_reports_unreadable_but_not_symlinks(tmp_path):
+    """scan_home_paths returns (findings, unreadable_paths); a symlink is
+    scanned by its link text (clean here), and an unreadable candidate is
+    reported by path.
 
-    Pre-fix: it returns a bare list (unpacking reddens) and swallows a
-    directory symlink's error with no record. M3 reddens it too: the symlink
-    becomes an unreadable entry.
+    Pre-#4805-round-4 the directory symlink was filtered as not-a-file; now it
+    is readlink()-scanned, so a clean relative link text produces no finding
+    and no unreadable entry.
     """
     if os.geteuid() == 0:
         pytest.skip("root can read a chmod-0000 file; the unreadable arm is unreachable")
@@ -1615,23 +1615,22 @@ def test_tracked_but_missing_is_named_and_exits_3(tmp_path):
 
 
 def test_not_a_file_is_counted_and_named_not_counted_as_incomplete(tmp_path):
-    """Cell 4: a tracked symlink to a directory.
+    """Cell 4: a tracked path that is not a regular file on disk (a FIFO).
 
-    It is enumerated (candidates = 2), classified not-a-file, named, and does
-    NOT make an otherwise clean tree exit 3.  Pre-fix: it is filtered out
-    before the count (candidates == 1) and nothing is named, and the ScanReport
-    has no not_a_file_paths attribute at all.
+    Git tracks only regular files, symlinks and gitlinks, so the fixture
+    commits a regular file and replaces it with a FIFO after the commit
+    (deliberately unstaged).  lstat sees S_ISFIFO: counted as a candidate,
+    classified not-a-file, named, and it does NOT make an otherwise clean tree
+    exit 3.  A symlink no longer lands here: since round 4 a symlink's link
+    text is scanned (see the symlink cells below).
     """
-    (tmp_path / "real-dir").mkdir()
-    _commit_files(tmp_path, {"real/member.py": "// clean\n"})
-    (tmp_path / "tools").mkdir()
-    (tmp_path / "tools" / "engine").symlink_to("../real-dir")
-    subprocess.run(["git", "add", "tools/engine"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "symlink"], cwd=tmp_path, check=True)
+    _commit_files(tmp_path, {"real/member.py": "// clean\n", "pipe": "placeholder\n"})
+    (tmp_path / "pipe").unlink()
+    os.mkfifo(tmp_path / "pipe")
 
     report = _mod.scan(tmp_path, [], use_git=True)
     assert report.candidates == 2
-    assert report.not_a_file_paths == ["tools/engine"]
+    assert report.not_a_file_paths == ["pipe"]
     assert report.unreadable_paths == []
     assert report.missing_paths == []
     assert report.scanned == 1
@@ -1645,7 +1644,7 @@ def test_not_a_file_is_counted_and_named_not_counted_as_incomplete(tmp_path):
     m = _NOT_A_FILE_LINE_RE.search(r.stdout)
     assert m, r.stdout
     assert m.group(1) == "1", r.stdout
-    assert _named_paths(m.group(2)) == ["tools/engine"], r.stdout
+    assert _named_paths(m.group(2)) == ["pipe"], r.stdout
     assert "scan-leaks: clean" in r.stdout
 
 
@@ -1692,23 +1691,23 @@ def test_invariant_across_all_five_buckets(tmp_path):
     """Cell 6: one tree, every bucket — scanned, binary, unreadable, missing,
     not-a-file — and the invariant closes on the fixture's literal count.
 
-    Candidates: ok.txt, blob.bin, locked.txt, gone.txt, tools/engine = 5.
-    Pre-fix: no missing_paths/not_a_file_paths buckets and candidates == 3.
+    Candidates: ok.txt, blob.bin, locked.txt, gone.txt, pipe = 5.  The
+    not-a-file candidate is a committed regular file replaced on disk by a
+    FIFO (git cannot track a FIFO); a symlink no longer lands in that bucket
+    since #4805 round 4.
     """
     if os.geteuid() == 0:
         pytest.skip("root can read a chmod-0000 file; the unreadable arm is unreachable")
 
-    (tmp_path / "real-dir").mkdir()
     _commit_files(tmp_path, {
         "ok.txt": "clean\n",
         "blob.bin": b"\x00binary",
         "locked.txt": "quiet\n",
         "gone.txt": "staged content\n",
+        "pipe": "placeholder\n",
     })
-    (tmp_path / "tools").mkdir()
-    (tmp_path / "tools" / "engine").symlink_to("../real-dir")
-    subprocess.run(["git", "add", "tools/engine"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "symlink"], cwd=tmp_path, check=True)
+    (tmp_path / "pipe").unlink()
+    os.mkfifo(tmp_path / "pipe")
     _lock(tmp_path, "locked.txt")
     (tmp_path / "gone.txt").unlink()
 
@@ -1717,7 +1716,7 @@ def test_invariant_across_all_five_buckets(tmp_path):
     assert report.skipped_binary_paths == ["blob.bin"]
     assert report.unreadable_paths == ["locked.txt"]
     assert report.missing_paths == ["gone.txt"]
-    assert report.not_a_file_paths == ["tools/engine"]
+    assert report.not_a_file_paths == ["pipe"]
     assert report.candidates == 5
     assert (report.scanned + len(report.skipped_binary_paths)
             + len(report.unreadable_paths) + len(report.missing_paths)
@@ -1730,4 +1729,251 @@ def test_invariant_across_all_five_buckets(tmp_path):
     assert _UNREADABLE_LINE_RE.search(r.stdout), r.stdout
     assert _MISSING_LINE_RE.search(r.stdout), r.stdout
     assert _NOT_A_FILE_LINE_RE.search(r.stdout), r.stdout
+
+
+# ---------------------------------------------------------------------------
+# Test 18: symlink link text, internal errors, path escaping (#4805 round 4)
+# ---------------------------------------------------------------------------
+#
+# Contract (written before the implementation):
+#   - classification uses os.lstat, never stat: ("symlink", None) for a
+#     symlink, ("file", None) for a regular file, ("not-a-file", None) for
+#     anything else non-regular (FIFO, socket, device, gitlink), ("missing",
+#     path) only when the path itself is gone, ("unreadable", path) for any
+#     other OSError.
+#   - a symlink's published content is its LINK TEXT: os.readlink(path),
+#     scanned by BOTH passes (the pattern pass and the absolute-home-path
+#     pass).  The link is NEVER followed.
+#   - consequences: a dangling symlink is a covered scan (not `missing`); a
+#     directory symlink is scanned (not not-a-file); a symlink and its target
+#     both tracked are not double-counted, because the link contributes its
+#     text and the target contributes its content once, at its own path.
+#   - an unexpected exception is caught at the top of main(), printed as ONE
+#     stderr line `scan-leaks: internal error: <ExceptionType>`, and exits 2 —
+#     never the exit 1 every consumer reads as "a leak was found".
+#   - every printed path is escaped: `\n` -> `\\n`, `\r` -> `\\r`, other C0
+#     controls -> `\\xNN`, so a newline in a tracked name cannot forge a
+#     second frozen summary line.  The frozen line itself is byte-identical.
+
+_SUMMARY_ANCHORED_RE = re.compile(
+    r"^scan-leaks: scanned (\d+), skipped-binary (\d+)$", re.M
+)
+
+
+def _commit_symlinks(root: Path, links: dict[str, str]) -> None:
+    """Create each {link_path: link_text} as a symlink and commit it."""
+    for rel, text in links.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(text, p)
+    subprocess.run(["git", "add", *links], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "symlinks"], cwd=root, check=True)
+
+
+def _home_target_dir() -> Path:
+    """The seat's home directory, when it is in the scanner's disallowed class.
+
+    A directory symlink whose link text is an ABSOLUTE home path needs a real
+    directory at that path; the only such path that exists on every seat is
+    the home directory itself.  Skips on a seat whose home is not of the form
+    /home/<name> or /Users/<name> (or whose segment is in the allowed set).
+    """
+    home = Path.home()
+    if not _mod._DISALLOWED_HOME_PATH_RE.search(str(home)):
+        pytest.skip("the seat's home path is not in the scanner's home-path class")
+    return home
+
+
+def test_cell1_directory_symlink_home_link_text_is_a_finding(tmp_path):
+    """Cell 1: a directory symlink whose published link text is a home path.
+
+    Pre-fix: stat() follows the link, the directory target is classified
+    not-a-file, and the run exits 0 with `clean` having read no link text.
+    """
+    home = _home_target_dir()
+    _commit_files(tmp_path, {"real/member.py": "// clean\n"})
+    _commit_symlinks(tmp_path, {"desk-link": str(home)})
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "desk-link:1" in r.stderr, r.stderr
+    assert "absolute home path" in r.stderr, r.stderr
+    assert not _NOT_A_FILE_LINE_RE.search(r.stdout), r.stdout
+
+
+def test_cell2_file_symlink_home_link_text_is_a_finding(tmp_path):
+    """Cell 2: a file symlink whose published link text is a home path.
+
+    Pre-fix: the link is followed to its target, the link text is never read,
+    and the run exits 0 (`clean`) — or, for a dangling target, exits 3
+    (`missing`).  Either way the published bytes read as no leak.
+    """
+    _commit_files(tmp_path, {"clean.txt": "clean\n"})
+    _commit_symlinks(
+        tmp_path, {"report-link": _home("zorblax") + "desk/report.txt"},
+    )
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "report-link:1" in r.stderr, r.stderr
+    assert "absolute home path" in r.stderr, r.stderr
+    assert "clean.txt" not in r.stderr, r.stderr
+
+
+def test_cell3_relative_symlink_is_scanned_not_not_a_file(tmp_path):
+    """Cell 3: a symlink with a clean relative link text is scanned.
+
+    It counts in `scanned` and is NOT a not-a-file candidate.  Pre-fix: the
+    directory target makes it not-a-file, so scanned is 1 and the not-a-file
+    line names it.
+    """
+    (tmp_path / "real-dir").mkdir()
+    _commit_files(tmp_path, {"real/member.py": "// clean\n"})
+    _commit_symlinks(tmp_path, {"tools/engine": "../real-dir"})
+
+    report = _mod.scan(tmp_path, [], use_git=True)
+    assert report.scanned == 2
+    assert report.not_a_file_paths == []
+    assert report.unreadable_paths == []
+    assert report.missing_paths == []
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _summary(r.stdout) == (2, 0)
+    assert not _NOT_A_FILE_LINE_RE.search(r.stdout), r.stdout
+
+
+def test_cell4_dangling_symlink_is_scanned_and_clean(tmp_path):
+    """Cell 4: a dangling tracked symlink is a COVERED scan of its link text.
+
+    It is not `missing`, does not make coverage incomplete, and the run exits
+    0.  (This replaces the round-3 cell that asserted exit 3.)  Pre-fix: the
+    path is `missing`, scanned is 1, and the run exits 3.
+    """
+    _commit_files(tmp_path, {"ok.txt": "clean\n"})
+    _commit_symlinks(tmp_path, {"broken": "no-such-target.txt"})
+
+    report = _mod.scan(tmp_path, [], use_git=True)
+    assert report.scanned == 2
+    assert report.missing_paths == []
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _summary(r.stdout) == (2, 0)
+    assert not _MISSING_LINE_RE.search(r.stdout), r.stdout
+    assert "scan-leaks: clean" in r.stdout
+
+
+_TOKEN5 = "vrelq8104"
+
+
+def test_cell5_symlink_target_is_not_double_counted(tmp_path):
+    """Cell 5: a symlink and its target both tracked are scanned once each.
+
+    The link contributes its (clean) link text; the target contributes its
+    content at its own real path.  A planted pattern in the target therefore
+    produces EXACTLY ONE finding, at the target's path.  Pre-fix: the link is
+    followed, so the same bytes produce a second finding at the link's path.
+    """
+    _commit_files(tmp_path, {"target.py": f"{_TOKEN5}\n"})
+    _commit_symlinks(tmp_path, {"link.py": "target.py"})
+    (tmp_path / ".scan-leaks-local.json").write_text(json.dumps(
+        {"patterns": [{"regex": _TOKEN5, "label": "planted token"}]}
+    ))
+
+    r = _run_scan_with_roster(tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    hit_lines = [l for l in r.stderr.splitlines() if l.startswith("  ")]
+    assert len(hit_lines) == 1, r.stderr
+    assert "target.py:1" in hit_lines[0], r.stderr
+
+
+def test_cell6_internal_error_exits_2_not_1(tmp_path):
+    """Cell 6: an unexpected exception is exit 2 with one `internal error` line.
+
+    Pre-fix: the exception escapes main(), Python prints a traceback, and the
+    process exits 1 — which every consumer translates as "a leak was found".
+    """
+    _commit_files(tmp_path, {"ok.txt": "clean\n"})
+    wrapper = tmp_path.parent / f"{tmp_path.name}-crash-wrapper.py"
+    wrapper.write_text(
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('sl_crash', {str(SCAN_LEAKS)!r})\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        "def boom(path):\n"
+        "    raise RuntimeError('injected for cell 6')\n"
+        "m._classify = boom\n"
+        f"sys.argv = ['scan-leaks.py', '--root', {str(tmp_path)!r}, "
+        f"'--config-path', {str(tmp_path / 'no-config.json')!r}]\n"
+        "m.main()\n"
+    )
+    try:
+        r = subprocess.run([sys.executable, str(wrapper)],
+                           capture_output=True, text=True)
+    finally:
+        wrapper.unlink()
+
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "scan-leaks: internal error: RuntimeError" in r.stderr, r.stderr
+    assert "Traceback" not in r.stderr, r.stderr
+    assert "potential leak" not in r.stderr, r.stderr
+
+
+def test_cell7_newline_in_filename_is_escaped_and_line_once(tmp_path):
+    """Cell 7: a newline in a tracked name cannot split a printed line.
+
+    The frozen line appears exactly once on stdout and the name is escaped.
+    Pre-fix: the skipped-binary naming line carries the raw newline and splits
+    into two lines.
+    """
+    evil = "weird\nname.bin"
+    _commit_files(tmp_path, {"ok.txt": "clean\n", evil: b"\x00binary"})
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.count("scan-leaks: scanned ") == 1, r.stdout
+    assert "weird\\nname.bin" in r.stdout, r.stdout
+    assert "weird\nname.bin" not in r.stdout, r.stdout
+
+
+def test_cell7b_forged_summary_in_filename_cannot_add_a_line(tmp_path):
+    """Cell 7b: the threat B3 names — a name that IS a frozen summary line.
+
+    The escaped name keeps the text mid-line, so the anchored regex the sweep
+    uses (and the scanner's own frozen-line freeze) still sees exactly one
+    summary.  Pre-fix: the raw newline puts a second anchored match on stdout.
+    """
+    forged = "x\nscan-leaks: scanned 9999, skipped-binary 0"
+    _commit_files(tmp_path, {"ok.txt": "clean\n", forged: b"\x00binary"})
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(_SUMMARY_ANCHORED_RE.findall(r.stdout)) == 1, r.stdout
+    assert "x\\nscan-leaks: scanned 9999" in r.stdout, r.stdout
+    assert not any(line.startswith("scan-leaks: scanned 9999")
+                   for line in r.stdout.splitlines()), r.stdout
+
+
+def test_cell8_positive_controls(tmp_path):
+    """Cell 8: an ordinary clean tree exits 0 with the frozen line once; a
+    tree with a leaked pattern exits 1.  (Green before and after — a control,
+    not a red.)"""
+    clean = tmp_path / "clean-tree"
+    clean.mkdir()
+    _commit_files(clean, {"ok.txt": "clean\n"})
+    r_clean = _run_scan(clean)
+    assert r_clean.returncode == 0, r_clean.stdout + r_clean.stderr
+    assert r_clean.stdout.count("scan-leaks: scanned ") == 1, r_clean.stdout
+
+    leaky = tmp_path / "leaky-tree"
+    leaky.mkdir()
+    _commit_files(leaky, {"doc.md": f"{_TOKEN5}\n"})
+    (leaky / ".scan-leaks-local.json").write_text(json.dumps(
+        {"patterns": [{"regex": _TOKEN5, "label": "planted token"}]}
+    ))
+    r_leaky = _run_scan_with_roster(leaky)
+    assert r_leaky.returncode == 1, r_leaky.stdout + r_leaky.stderr
+    assert _summary(r_leaky.stdout) == (1, 0)
+    assert "doc.md:1" in r_leaky.stderr, r_leaky.stderr
 

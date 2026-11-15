@@ -506,9 +506,17 @@ def main():
                       "(the scan did not cover the whole tree, which is not "
                       "evidence of a clean tree). Target NOT modified.",
                       file=sys.stderr)
-            else:
+            elif leak_result.returncode == 1:
                 print("\nERROR: scan-leaks found potential leaks — aborting. "
                       "Target NOT modified.", file=sys.stderr)
+            else:
+                # Exit 2 covers an internal error (a crash) and an invocation
+                # error. Neither is a verdict about the tree, so this must not
+                # read as "found potential leaks".
+                print(f"\nERROR: scan-leaks did not run — aborting (the "
+                      f"scanner exited {leak_result.returncode}, an internal or "
+                      "invocation error, not a leak). Target NOT modified.",
+                      file=sys.stderr)
             print(leak_result.stderr, file=sys.stderr)
             sys.exit(1)
         leak_gate_result = "PASS (roster patterns clean)"

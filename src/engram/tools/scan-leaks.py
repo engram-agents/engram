@@ -5,7 +5,9 @@ Flags committed structural patterns, absolute home paths, and a gitignored
 local roster of personal names. Run standalone or wire as a pre-commit hook.
 
 Standalone:
-    python3 tools/scan-leaks.py            # exit 0 clean, 1 if leaks, 3 if coverage incomplete
+    python3 tools/scan-leaks.py            # exit 0 clean, 1 if leaks, 2 on an
+                                           # internal or invocation error,
+                                           # 3 if coverage incomplete
 
 Pre-commit (from inside ~/engram-alpha):
     ln -s ../../tools/scan-leaks.py .git/hooks/pre-commit
@@ -45,10 +47,11 @@ Scope and exclusions (what "the tree" means here — NOT every published file):
     test_release_cutover.py, RELEASING.md.
   - SKIP_DIRS: .git, __pycache__, node_modules, .claude.
   - A name in an excluded file is not scanned.
-  - A tracked symlink is classified like any other candidate: one resolving
-    to a regular file is scanned through its target; one resolving to a
-    directory is a not-a-file candidate (counted and named, not scanned); a
-    dangling symlink is a missing candidate (coverage incomplete).
+  - A tracked symlink is scanned by its PUBLISHED CONTENT, which is its link
+    text (``os.readlink``), in both passes; the link is never followed.  A
+    dangling symlink is therefore a covered scan (not `missing`), a symlink to
+    a directory is scanned (not `not-a-file`), and a symlink whose target is
+    also tracked is not read twice.
 
 Coverage accounting (every candidate is accounted for):
   - scan() returns a ScanReport whose invariant is
@@ -57,7 +60,10 @@ Coverage accounting (every candidate is accounted for):
     A path that cannot be inspected or read is an unreadable path, and a path
     that is not there is a missing path — never a silent skip, and never
     counted as binary.  An unsearchable directory found by os.walk is one
-    candidate covering a subtree that could not be enumerated.
+    candidate covering a subtree that could not be enumerated.  "Missing"
+    means only that the path vanished between enumeration and classification
+    (a real race), not that a symlink dangles: a dangling symlink's link text
+    is readable and is scanned.
   - main() prints on stdout, exactly once, the frozen line
     "scan-leaks: scanned N, skipped-binary M" (.github/workflows/
     name-leak-sweep.yml parses it with an anchored regex — do not reformat
@@ -77,7 +83,10 @@ Exit codes:
   1 — leaks found (a pattern hit or an absolute home path); takes precedence
       over 3 when coverage is also incomplete, and the coverage lines still
       print
-  2 — invocation error
+  2 — invocation error, OR an internal error: the scanner crashed.  One
+      stderr line `scan-leaks: internal error: <ExceptionType>` says which,
+      so a crash never lands on exit 1, which every consumer reads as
+      "leaks found"
   3 — coverage incomplete: at least one candidate was unreadable or missing,
       or there were no candidate files at all, and nothing was found (a
       not-a-file candidate alone does not make coverage incomplete)
@@ -185,25 +194,31 @@ def _classify(path: Path) -> tuple[str, Path | None]:
     """Classify one enumerated candidate by what it is on disk.
 
     This is the ONE seam both passes use, so neither can crash on a path it
-    cannot inspect and neither invents its own filter.  ``path.stat()``
-    follows symlinks (a tracked symlink is classified by its target):
+    cannot inspect and neither invents its own filter.  ``path.lstat()`` does
+    NOT follow symlinks, so a symlink is classified as itself — its published
+    content is its link text, never its target's:
 
+        ("symlink", None)     a symlink; scan its os.readlink() text
         ("file", None)        a regular file; read it
-        ("not-a-file", None)  exists, but is not a regular file (symlink to a
-                              directory): carries no text to scan
-        ("missing", path)     the path is not there
+        ("not-a-file", None)  exists, but is not a regular file or a symlink
+                              (FIFO, socket, device, gitlink/directory):
+                              carries no text to scan
+        ("missing", path)     the path itself is not there
         ("unreadable", path)  any other stat failure (EACCES, ELOOP after a
                               race, ENAMETOOLONG, ...)
 
     Only ENOENT is "missing": every other OSError means the scanner could not
-    inspect the path, which is a coverage hole, not an absence.
+    inspect the path, which is a coverage hole, not an absence.  A dangling
+    symlink is NOT missing — lstat succeeds, and its link text is readable.
     """
     try:
-        info = path.stat()
+        info = path.lstat()
     except FileNotFoundError:
         return ("missing", path)
     except OSError:
         return ("unreadable", path)
+    if stat.S_ISLNK(info.st_mode):
+        return ("symlink", None)
     if not stat.S_ISREG(info.st_mode):
         return ("not-a-file", None)
     return ("file", None)
@@ -222,9 +237,31 @@ def _relative_dir(root: Path, directory) -> str:
     return "" if rel == "." else rel + "/"
 
 
+def _escape_path(path: str) -> str:
+    """Escape control characters so one path cannot forge or split a line.
+
+    A tracked name may contain a newline, and a printed name that carried it
+    raw would put a second `scan-leaks: scanned N, skipped-binary M` line (or
+    half a finding) on stdout.  ``\\n`` becomes ``\\\\n``, ``\\r`` becomes
+    ``\\\\r``, any other C0 control becomes ``\\\\xNN``; every other character
+    is unchanged.  The frozen summary line carries no path and is untouched.
+    """
+    escaped = []
+    for ch in path:
+        if ch == "\n":
+            escaped.append("\\n")
+        elif ch == "\r":
+            escaped.append("\\r")
+        elif ord(ch) < 0x20:
+            escaped.append(f"\\x{ord(ch):02x}")
+        else:
+            escaped.append(ch)
+    return "".join(escaped)
+
+
 def format_paths(paths: list[str], cap: int = NAMED_PATH_CAP) -> str:
     """Join paths for a log line: at most ``cap`` named, then '(+K more)'."""
-    shown = ", ".join(paths[:cap])
+    shown = ", ".join(_escape_path(p) for p in paths[:cap])
     more = len(paths) - cap
     if more > 0:
         shown += f" (+{more} more)"
@@ -372,10 +409,13 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
     A candidate whose first 8 KiB contains a NUL byte is binary: skipped,
     counted in ``skipped_binary_paths``, and named by the caller.  Everything
     else is decoded as UTF-8 with errors replaced, so a non-UTF-8 text file is
-    still scanned and ``scanned`` counts it.  A path that cannot be inspected
+    still scanned and ``scanned`` counts it.  A symlink is scanned by its
+    ``os.readlink`` text and never followed, so it contributes to ``scanned``
+    once, no matter what its target is.  A path that cannot be inspected
     or read lands in ``unreadable_paths``; a path that is not there lands in
     ``missing_paths`` — never dropped silently, and never counted as binary.
-    A candidate that is not a regular file lands in ``not_a_file_paths``.
+    A candidate that is not a regular file or a symlink lands in
+    ``not_a_file_paths``.
     """
     tracked = _git_tracked_files(root) if use_git else None
 
@@ -424,6 +464,27 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
             continue
         if kind == "not-a-file":
             not_a_file_paths.append(rel)
+            continue
+        if kind == "symlink":
+            # Git publishes a symlink's LINK TEXT, not its target's bytes, and
+            # the link text is what a reader of the published tree sees.  Scan
+            # it; NEVER follow the link (following reads the target twice, once
+            # under each path, and misses a home path in the link text).
+            try:
+                content = os.readlink(fpath)
+            except FileNotFoundError:
+                # Raced with the lstat above: the link itself vanished.
+                missing_paths.append(rel)
+                continue
+            except OSError:
+                unreadable_paths.append(rel)
+                continue
+            scanned += 1
+            for i, line in enumerate(content.splitlines(), 1):
+                for pattern, label in leak_patterns:
+                    if pattern.search(line):
+                        findings.append((str(rel), i, label, line.strip()[:120]))
+                        break
             continue
         try:
             data = fpath.read_bytes()
@@ -489,10 +550,11 @@ def scan_home_paths(root: Path, use_git: bool = True
 
     Domain: every git-tracked file (``git ls-files``), whatever its extension,
     including extensionless executables, classified by the same ``_classify``
-    seam ``scan()`` uses — a path that is missing or not a regular file is
-    skipped here (``scan()`` reports those buckets), while a path this pass
-    cannot inspect is unreadable.  A file whose first 8 KiB contains a NUL
-    byte is binary and skipped, as is any file in HOME_PATH_EXEMPT_FILES.
+    seam ``scan()`` uses — a path that is missing or is neither a regular file
+    nor a symlink is skipped here (``scan()`` reports those buckets), while a
+    path this pass cannot inspect is unreadable.  A symlink is scanned by its
+    ``os.readlink`` text, never followed.  A file whose first 8 KiB contains a
+    NUL byte is binary and skipped, as is any file in HOME_PATH_EXEMPT_FILES.
     Text is decoded as UTF-8 with errors replaced, so a non-UTF-8 file is
     still scanned.  The verdict (allowed or not) is made inside the shared
     regex.  Falls back to an os.walk of root when git is unavailable (scanning
@@ -522,11 +584,26 @@ def scan_home_paths(root: Path, use_git: bool = True
             # bucket for them and must not mislabel one as unreadable.
             continue
         if kind == "not-a-file":
-            # A symlink to a directory carries no text: not scanned, and not a
-            # coverage hole (scan() counts it in not_a_file_paths).
+            # A FIFO, socket, device or gitlink carries no text: not scanned,
+            # and not a coverage hole (scan() counts it in not_a_file_paths).
             continue
         if kind == "unreadable":
             unreadable_paths.append(rel)
+            continue
+        if kind == "symlink":
+            # A symlink's published content is its link text; scan that text
+            # (the same rule as scan()) and never follow the link.
+            try:
+                text = os.readlink(fpath)
+            except FileNotFoundError:
+                # Raced with the lstat above: the link itself vanished.
+                continue
+            except OSError:
+                unreadable_paths.append(rel)
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                for m in _DISALLOWED_HOME_PATH_RE.finditer(line):
+                    findings.append((rel, i, m.group(1).rstrip(".")))
             continue
         try:
             data = fpath.read_bytes()
@@ -544,6 +621,21 @@ def scan_home_paths(root: Path, use_git: bool = True
 
 
 def main():
+    """Run the scanner, turning an unexpected crash into exit 2.
+
+    Exit 2 already means "invocation error"; it now also covers an internal
+    error, so a crash cannot reach the exit-1 path every consumer reads as
+    "a leak was found".  SystemExit (a usage error, --help, or the exit codes
+    below) is not an Exception and passes through untouched.
+    """
+    try:
+        _run()
+    except Exception as exc:
+        print(f"scan-leaks: internal error: {type(exc).__name__}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _run():
     parser = argparse.ArgumentParser(description="Scan alpha for personal-info leaks")
     parser.add_argument("--root", default=None,
                         help="Root to scan (default: parent of tools/ dir, i.e., the alpha repo)")
@@ -568,7 +660,7 @@ def main():
         root = Path(__file__).resolve().parent.parent
 
     if not root.exists():
-        print(f"scan-leaks: root not found: {root}", file=sys.stderr)
+        print(f"scan-leaks: root not found: {_escape_path(str(root))}", file=sys.stderr)
         sys.exit(2)
 
     config_path = Path(args.config_path).expanduser().resolve() if args.config_path else None
@@ -629,29 +721,32 @@ def main():
     coverage_incomplete = (bool(unreadable) or bool(missing)
                            or report.candidates == 0)
     if report.candidates == 0:
-        print(f"scan-leaks: no coverage: 0 candidate files under {root}; "
-              "nothing was scanned")
+        print(f"scan-leaks: no coverage: 0 candidate files under "
+              f"{_escape_path(str(root))}; nothing was scanned")
     if not leaks and not home_findings:
         if coverage_incomplete:
             # A clean result that ranged over nothing (or over files it could
             # not read) is not evidence of a clean tree.  Distinct from 1 so a
             # caller can tell "dirty" from "did not look".
             sys.exit(3)
-        print(f"scan-leaks: clean ({root})")
+        print(f"scan-leaks: clean ({_escape_path(str(root))})")
         sys.exit(0)
 
-    print(f"scan-leaks: {len(leaks) + len(home_findings)} potential leak(s) in {root}",
-          file=sys.stderr)
+    print(f"scan-leaks: {len(leaks) + len(home_findings)} potential leak(s) in "
+          f"{_escape_path(str(root))}", file=sys.stderr)
     for rel, lineno, label, snippet in leaks:
+        shown_rel = _escape_path(rel)
         if args.redact:
-            print(f"{rel}:{lineno}", file=sys.stderr)
+            print(f"{shown_rel}:{lineno}", file=sys.stderr)
         else:
-            print(f"  {rel}:{lineno} [{label}] {snippet}", file=sys.stderr)
+            print(f"  {shown_rel}:{lineno} [{label}] {snippet}", file=sys.stderr)
     for rel, lineno, seg in home_findings:
+        shown_rel = _escape_path(rel)
         if args.redact:
-            print(f"{rel}:{lineno}", file=sys.stderr)
+            print(f"{shown_rel}:{lineno}", file=sys.stderr)
         else:
-            print(f"  {rel}:{lineno} [absolute home path] segment: {seg}", file=sys.stderr)
+            print(f"  {shown_rel}:{lineno} [absolute home path] segment: {seg}",
+                  file=sys.stderr)
     # The roster instruction is scoped to ROSTER/PATTERN hits: a roster entry
     # names a string already published, so the fix is in the tree, never in the
     # roster.  An absolute-home-path hit has nothing to do with the roster, so
