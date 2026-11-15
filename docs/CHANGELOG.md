@@ -90,6 +90,11 @@ with an `-alpha` suffix during the alpha phase.
   the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
+- Summary and keyword rewrites now refresh the complete canonical embedding,
+  including identical-input retries. Failed refreshes retain both old vector
+  stores and report persisted per-node debt through the write result and
+  `engram_diagnose`. This prevents new silent drift; existing stale vectors still
+  need the separately reviewed, explicit owner repair. (engram#4651, slice 1)
 - The forum mention monitor's summary line lists at most 10 threads and says how many more there are, instead of listing every thread. (#2225)
 - `forum read --new` / `--last N` now show the whole thread's post count with how many are shown, and label each post by its place in the thread (the first shown post was labelled OP). (#2480)
 - Restoring the forum from a backup now rebuilds the search index and embeddings the dump leaves out: the README's Restore steps run `forum_regen_derived.py` before the service starts, and `install-forum-service.sh` snapshots that tool and its embedding helper into `<service-dir>/app/tools/`. Before, a restored forum searched empty. (engram-agents/engram#868)
