@@ -17,9 +17,12 @@ Rulings this builds to:
 ## 1. The flag
 
 `engramd.overwrite_embeddings_via_owner` in config.json (JSON `true` only, read with `engramd_owner_flags.flag_on`).
-Default OFF. The name ends in `_via_owner` so `any_owner_flag_on` starts an owner for it. It is independent of
-`regen_embeddings_via_owner`: a seat that allowed NULL-filling has not allowed overwriting. (Name is a candidate until
-Zephyr and Kepler confirm; a rename before the PR opens is free.)
+Default OFF. The name ends in `_via_owner` so `any_owner_flag_on` starts an owner for it. It is a NEW flag,
+independent of `regen_embeddings_via_owner` (Kepler 30156). It is a ROUTING switch, not a consent: consent to overwrite
+vectors lives in the repair tool's preview-then-apply, the same in both routes (Kepler 30156, Borges 30160).
+Open, one line from Kepler or Borges: the name. `overwrite_embeddings_via_owner` was chosen under the consent reading,
+which was withdrawn; a unit name in the style of `regen_embeddings_via_owner`, for example
+`repair_embeddings_via_owner`, may fit the convention better. A rename before the PR opens is free.
 
 ## 2. The shared primitive (module `engram_embedding_publish`, Essential tier)
 
@@ -78,14 +81,14 @@ this extraction is acceptable semantics.
 
 Part B never reads the flag itself, never opens the store to publish, never reimplements validation or the debt-clearer.
 
-### 3a. One OFF/ON behaviour (PROPOSED by Sol; awaiting Kepler's ruling, raised by Mira at 30153)
+### 3a. One OFF/ON behaviour (SETTLED: Kepler 30156 withdrew the consent reading of 30138; Borges 30160)
 
-Two rulings can be read two ways. Borges (30127) says flag OFF means the install's configured in-process writer.
-Kepler (30138) says the new flag is finer consent for overwriting, and the owner refuses when it is off. Is OFF a global
-refusal for overwrite in every context, or only a refusal by the owner? The proposal: the flag is the OWNER's consent
-and a route selector; it is not a gate on the in-process writer, which already has full access to the user's own store
-and is not a boundary a flag can guard. The consent to overwrite, in every route, is the repair tool's explicit apply
-step (a user yes for shipped users).
+Mira (30153) found two rulings that read two ways: Borges 30127 (flag OFF means the install's configured in-process
+writer) and Kepler 30138 (the flag as finer consent). Kepler withdrew the consent reading in 30156: ONE contract,
+Borges's. The flag is a ROUTING switch; it is not a gate on the in-process writer. The consent to overwrite, in every
+route, is the repair tool's explicit preview-then-apply (a user yes for shipped users). The owner still refuses an op
+that arrives while the flag is OFF (Borges 30160), as route integrity and not as consent: with the flag OFF the tool never
+calls the owner, so such a call means the caller's route is stale.
 
 | flag | owner | what happens |
 |---|---|---|
