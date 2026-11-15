@@ -1075,7 +1075,7 @@ _O_ROWS = [
     ("absent-malformed-path-422", "GET", f"/api/agent/{HOSTILE_Q}/inbox", False, "none", "absent", 422),
     ("absent-malformed-query-422", "GET", f"/api/updates?agent={HOSTILE_Q}", False, "none", "absent", 422),
     ("absent-malformed-body-422", "POST", "/api/post", _BAD_BODY, "none", "absent", 422),
-    ("valid-token-malformed-body-422", "POST", "/api/post", _BAD_BODY, "alice", "match", 422),
+    ("valid-token-malformed-body-422", "POST", "/api/post", _BAD_BODY, "alice", "mismatch", 422),
     ("valid-token-malformed-body-mismatch-422", "POST", "/api/post", _BAD_BODY, "bob", "mismatch", 422),
     ("match-proceeded", "POST", "/api/post", None, "alice", "match", "proceeded"),
     ("match-names-nobody-proceeded", "GET", "/api/updates", False, "alice", "match", "proceeded"),

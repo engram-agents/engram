@@ -2509,7 +2509,7 @@ def create_app(
                   "--auth-report-until if the owner extends the window.", file=sys.stderr)
         return True
 
-    def _record_auth(write: bool, values, verdict: str, token_agent) -> None:
+    def _record_auth(write: bool, values, verdict: str, token_agent, outcome) -> None:
         _auth_overdue()
         auth_report.record({
             "ts": _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -2519,6 +2519,8 @@ def create_app(
             "named": _report_named(values),
             "verdict": verdict,
             "token_agent": token_agent if verdict in ("match", "mismatch") else None,
+            # The GUARD's outcome: "proceeded", or the HTTP status it returned (an int).
+            "outcome": outcome,
         })
 
     @app.before_request
@@ -2555,7 +2557,7 @@ def create_app(
             # line is written first); only the ABSENCE of one is let through, recorded.
             body_ids = _body_identities()
             if (auth_header or "").strip():
-                _record_auth(write, named + body_ids, "invalid", None)
+                _record_auth(write, named + body_ids, "invalid", None, 401)
                 return _auth_required_response()
             label = _route_label()
             refusal = None
@@ -2564,11 +2566,12 @@ def create_app(
                     _read_ident(label, "agent", v, lower=False)
                 except _RequestRefusal as exc:
                     refusal = refusal or exc
-            _record_auth(write, named + body_ids, "absent", None)
-            if refusal is not None:
-                raise refusal  # the handlers' own typed 422 (#3436), after the line
             names = list(dict.fromkeys(
                 t for t in (_identity_text(v) for v in named + body_ids) if t is not None))
+            _record_auth(write, named + body_ids, "absent", None,
+                         422 if refusal is not None else 403 if len(names) > 1 else "proceeded")
+            if refusal is not None:
+                raise refusal  # the handlers' own typed 422 (#3436), after the line
             if len(names) > 1:
                 return _identity_mismatch_response(None, names[1])
             g.auth_agent = names[0] if names else None
@@ -2585,17 +2588,17 @@ def create_app(
         except _RequestRefusal:
             if report_mode:
                 _record_auth(write, named + body_ids,
-                             _verdict_for_token(named + body_ids, token_agent), token_agent)
+                             _verdict_for_token(named + body_ids, token_agent), token_agent, 422)
             raise
         named.extend(body_ids)
         for n in named:
             name = _identity_text(n)
             if name is not None and name != token_agent:
                 if report_mode:
-                    _record_auth(write, named, "mismatch", token_agent)
+                    _record_auth(write, named, "mismatch", token_agent, 403)
                 return _identity_mismatch_response(token_agent, name)
         if report_mode:
-            _record_auth(write, named, "match", token_agent)
+            _record_auth(write, named, "match", token_agent, "proceeded")
         g.auth_agent = token_agent
         g.names_identity = _names_identity(named)
         return None
