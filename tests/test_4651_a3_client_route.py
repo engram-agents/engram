@@ -45,6 +45,7 @@ def _load():
     if "mod" not in _LOADED:
         spec = importlib.util.spec_from_file_location("p4651_a3_route", MODULE_PATH)
         mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod  # a dataclass resolves its string annotations through sys.modules
         spec.loader.exec_module(mod)
         _LOADED["mod"] = mod
     return _LOADED["mod"]
