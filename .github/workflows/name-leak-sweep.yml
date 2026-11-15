@@ -911,11 +911,23 @@ jobs:
                           "in the release PR. The scanner's lines above name "
                           "the kind of hit and the fix it needs."
                       )
+                  elif scan.returncode == 3:
+                      # Coverage incomplete with at least one file scanned.
+                      # candidates == 0 also exits 3, but it implies
+                      # scanned == 0, which the check above already failed on,
+                      # so only unreadable/missing can reach this arm.
+                      print(
+                          "::error::the whole-tree sweep did not cover the "
+                          "whole tree (coverage incomplete). The scanner's "
+                          "'scan-leaks: unreadable ...' or 'scan-leaks: "
+                          "missing ...' lines above name what it could not "
+                          "scan; fix those paths and re-run."
+                      )
                   else:
                       print(
                           "::error::the whole-tree sweep did not run: "
                           f"scan-leaks.py exited {scan.returncode} "
-                          "(usage or root error)."
+                          "(usage, root, or internal error)."
                       )
                   raise SystemExit(1)
           finally:

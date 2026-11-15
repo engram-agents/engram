@@ -476,7 +476,13 @@ def run_G5(repo_root: str) -> dict[str, Any]:
     """G5 — de-personalisation scan (public-readiness dimension).
 
     Runs tools/scan-leaks.py --root . and reports hit count.
-    DEGRADED with count > 0; PASS at 0.
+    DEGRADED with count > 0.  PASS at 0 hits — except a scan that could not
+    cover the whole tree (scanner exit 3) is DEGRADED with metric
+    "coverage incomplete" even at 0 hits: not looking is not evidence of clean.
+    A scanner that did not run at all (any other exit code, e.g. 2 for an
+    internal or invocation error) is DEGRADED with metric "did not run" and
+    the exit code in the detail — never the hit-count path, whose "0 hit(s)"
+    would read as a clean tree.
     If roster absent → SKIP with advisory (spec language for future
     #665 roster extension; current scan-leaks.py has no roster concept,
     so we always run it and SKIP only if the script itself is missing).
@@ -506,6 +512,34 @@ def run_G5(repo_root: str) -> dict[str, Any]:
         return make_result(
             "G5", "public-readiness",
             STATUS_PASS, "0 hits", "No personal-info leaks detected",
+        )
+
+    if proc.returncode == 3:
+        # Coverage incomplete: no findings, but the scan could not read every
+        # candidate file (or had none). The hit-count path below would report
+        # "found 0 potential leak(s)" — true of the findings and false of the
+        # coverage, since nothing was found because part of the tree was not
+        # read. Degraded, not a pass: a scan of part of the tree is not
+        # evidence of a clean tree.
+        return make_result(
+            "G5", "public-readiness",
+            STATUS_DEGRADED, "coverage incomplete",
+            "scan-leaks could not cover the whole tree (coverage incomplete) — "
+            "see the scanner's 'scan-leaks: unreadable ...', 'scan-leaks: "
+            "missing ...', or 'scan-leaks: no coverage ...' lines above; this "
+            "is not evidence of a clean tree",
+        )
+
+    if proc.returncode not in (0, 1, 3):
+        # The scanner did not run: exit 2 covers an internal error (a crash)
+        # and an invocation error. Counting stderr lines here would report
+        # "0 hit(s)" for a scan that produced no verdict at all.
+        return make_result(
+            "G5", "public-readiness",
+            STATUS_DEGRADED, "did not run",
+            f"scan-leaks exited {proc.returncode} — the scanner did not run "
+            "(internal or invocation error), so this is not evidence of a "
+            "clean tree",
         )
 
     # Count hits from stderr output.

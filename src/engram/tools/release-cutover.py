@@ -498,8 +498,25 @@ def main():
         leak_result = subprocess.run(leak_cmd, capture_output=True, text=True)
         print(leak_result.stdout, end="")
         if leak_result.returncode != 0:
-            print("\nERROR: scan-leaks found potential leaks — aborting. Target NOT modified.",
-                  file=sys.stderr)
+            if leak_result.returncode == 3:
+                # Coverage incomplete: the scan did not read every candidate,
+                # so "no leaks found" would be a claim it cannot support. Keep
+                # aborting; say what actually happened.
+                print("\nERROR: scan-leaks coverage was incomplete — aborting "
+                      "(the scan did not cover the whole tree, which is not "
+                      "evidence of a clean tree). Target NOT modified.",
+                      file=sys.stderr)
+            elif leak_result.returncode == 1:
+                print("\nERROR: scan-leaks found potential leaks — aborting. "
+                      "Target NOT modified.", file=sys.stderr)
+            else:
+                # Exit 2 covers an internal error (a crash) and an invocation
+                # error. Neither is a verdict about the tree, so this must not
+                # read as "found potential leaks".
+                print(f"\nERROR: scan-leaks did not run — aborting (the "
+                      f"scanner exited {leak_result.returncode}, an internal or "
+                      "invocation error, not a leak). Target NOT modified.",
+                      file=sys.stderr)
             print(leak_result.stderr, file=sys.stderr)
             sys.exit(1)
         leak_gate_result = "PASS (roster patterns clean)"
