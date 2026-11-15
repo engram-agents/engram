@@ -828,6 +828,14 @@ against #1002; #1016 was caught on a scratch merge, and #1017 is the head-only-r
 escape (the seat ran the PR's five test files on the head alone, 380 passed, and
 merged; main was red on three cells minutes later).
 
+**Sizing a memory-capped run (2026-11-15).** When the seat's run executes under a memory cap (for
+example a cgroup limit on a shared machine), the cap applies to the whole job, not to pytest alone.
+Size it from the job's measured peak (the cgroup's `memory.peak`, or at least pytest's peak RSS) on
+a run of a comparable selection, never from a smaller one. Measured on #4820: a 282-file selection
+peaked at 3.27 GB pytest RSS and 3,873 MiB for the whole job, and a cap sized from an earlier run of
+about 1.5 GB on a smaller selection stopped the run at 49%. A run stopped by its cap is not a
+verdict: read the run's own summary lines, not the wrapper's exit code, and re-run with a larger cap.
+
 **2. A failure seen on the scratch merge belongs to the PR only if that test cell is
 GREEN on the base alone (or the PR adds it).** Otherwise it is the base's and goes to
 the seat that broke it, and must not be held against the PR. To tell the two apart, run the failing cell on the base tip.
