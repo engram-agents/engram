@@ -11,6 +11,7 @@
     { "id": "engram-write-discipline", "anchor": "ENGRAM Write Discipline" },
     { "id": "engram-read-discipline", "anchor": "ENGRAM Read Discipline" },
     { "id": "confidence-anchors", "anchor": "Confidence calibration anchors" },
+    { "id": "native-tools-ban-lean", "anchor": "Parallelization and Delegation" },
     { "id": "engram-reference", "anchor": "ENGRAM Reference" }
   ]
 }

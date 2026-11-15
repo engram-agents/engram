@@ -102,6 +102,8 @@ Confidence is computed, not chosen. Observations take it from `quote_type` + `so
 
 **If a returned number feels wrong, fix the inputs, not the number:** usually the wrong `reasoning_type` or a weak or mis-cited premise. That friction is the calibration working.
 
+**BANNED — grant or no grant.** Claude Code's NATIVE deep-research and `Workflow` tools, even when a task looks like a fit. One deep-research run spawned hundreds of subagents and nearly exhausted {{USER_NAME}}'s token budget. The principle is **fan-out control**: I set a fairy's scale; those tools set their own, and the bill arrives afterwards.
+
 ## ENGRAM Reference
 
 - **Data directory:** `{{ENGRAM_HOME}}/` (knowledge.db, config.json, session_log.md, warm-briefing.md)
