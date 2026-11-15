@@ -19,6 +19,7 @@ from the code under test.
 import importlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -409,4 +410,37 @@ def test_cell12_the_rung_runs_when_edit_history_does_not_exist_yet(g):
     finally:
         c.close()
     assert _ladder(core) == RUNG
+    assert set(_retract_marked(core, g["R"])) == {g["D1"], g["D2"], g["A"]}
+
+
+def test_cell13_a_null_root_node_row_does_not_hide_every_old_retraction(g):
+    """Borges, #4820: with ``NOT IN (SELECT root_node ...)`` one NULL root_node row makes
+    the subquery's set contain NULL, so ``id NOT IN`` is never true and the backfill
+    selects zero roots and reports nothing to do. Rung 10 makes root_node NOT NULL, but
+    the roots query must not lean on ladder order: ``NOT EXISTS`` gives the right answer
+    either way. Here the table is rebuilt without the NOT NULL and one NULL row planted."""
+    core = g["core"]
+    c = _raw(core)
+    try:
+        table_sql = c.execute("SELECT sql FROM sqlite_master WHERE type = 'table' "
+                              "AND name = 'cascade_markers'").fetchone()[0]
+        index_sql = [r[0] for r in c.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'cascade_markers' AND sql IS NOT NULL")]
+        loose = re.sub(r"root_node(\s+)TEXT NOT NULL", r"root_node\1TEXT", table_sql)
+        assert loose != table_sql, "fixture: the root_node NOT NULL was not found to relax"
+        c.execute("ALTER TABLE cascade_markers RENAME TO cascade_markers_strict")
+        c.execute(loose)
+        c.execute("INSERT INTO cascade_markers SELECT * FROM cascade_markers_strict")
+        c.execute("DROP TABLE cascade_markers_strict")
+        for sql in index_sql:
+            c.execute(sql)
+        c.execute("INSERT INTO cascade_markers (node_id, cascade_event, root_node, root_op, "
+                  "status, created_at) VALUES (?, 'fixture:null-root', NULL, 'retract', "
+                  "'pending', ?)", (g["O"], core._now()))
+        roots_marked, _written, _nodes = core._backfill_pre_machine_retract_markers(c)
+        c.commit()
+    finally:
+        c.close()
+    assert roots_marked == 1, "the NULL row must not hide the one old retraction"
     assert set(_retract_marked(core, g["R"])) == {g["D1"], g["D2"], g["A"]}

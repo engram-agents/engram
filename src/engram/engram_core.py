@@ -5245,8 +5245,9 @@ def _backfill_pre_machine_retract_markers(conn: sqlite3.Connection) -> "tuple[in
     """
     now = _now()
     roots = [r[0] for r in conn.execute(
-        "SELECT id FROM nodes WHERE status = 'retracted' AND id NOT IN "
-        "(SELECT root_node FROM cascade_markers WHERE root_op = 'retract') ORDER BY id"
+        "SELECT n.id FROM nodes n WHERE n.status = 'retracted' AND NOT EXISTS "
+        "(SELECT 1 FROM cascade_markers m WHERE m.root_op = 'retract' "
+        "AND m.root_node = n.id) ORDER BY n.id"
     )]
     has_history = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edit_history'"
