@@ -40,9 +40,13 @@ scanner path as ``<repo>/.github/name-leak-roster.attestation.json``.
 Parser identity. A pre-two-class scanner also exposes ``load_roster_file`` (the
 format-1 one), and handed ``A<TAB>pattern`` it compiles the prefix as regex
 text and returns success. The tool therefore probes the loaded parser with two
-synthetic in-memory rosters -- an invalid class token and a class-A line with
-no declared boundary -- and refuses (exit 1, nothing written) if either is
-accepted: a parser that cannot reject them is not a validator.
+synthetic rosters -- an invalid class token and a class-A line with no declared
+boundary, both built from a fresh ``secrets.token_hex(8)`` per run so a scanner
+cannot recognise them -- and refuses (exit 1, nothing written) if either is
+accepted. It also checks the parser's RETURN VALUE for the produced roster: the
+entry count must equal the produced line count, and each entry's class must
+match the class produced for that line, in order. A parser that cannot pass
+those checks is not a validator.
 
 Class-A boundaries are audited on EVERY run, not only in a dry run: every
 produced class-A line is checked with the scanner's own ``_declares_boundary``,
@@ -78,6 +82,7 @@ import io
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
 from pathlib import Path
@@ -86,12 +91,14 @@ OUTPUT_NAME = "roster-format2.txt"
 ATTESTATION_REL = Path(".github") / "name-leak-roster.attestation.json"
 
 # Synthetic format-2 rosters for the parser positive control. The token is
-# invented and appears nowhere else; the probe text is never printed.
-PROBE_TOKEN = "ZZProbeName"
-PROBE_ROSTERS = (
-    ("an invalid class token", "C\t\\b" + PROBE_TOKEN + "\\b\n"),
-    ("a class-A line with no declared boundary", "A\t" + PROBE_TOKEN + "\n"),
-)
+# fresh per run (a scanner must not be able to recognise it) and the probe
+# text is never printed.
+def _probe_rosters():
+    token = secrets.token_hex(8)
+    return (
+        ("an invalid class token", "C\t\\b" + token + "\\b\n"),
+        ("a class-A line with no declared boundary", "A\t" + token + "\n"),
+    )
 
 NAME_KEY_RULE = (
     "strip -> drop a leading (?i) -> drop \\b only when BOTH ends carry it "
@@ -301,23 +308,25 @@ def _load_parser(scanner_path: Path):
 
 
 def _parse_capture(parse_roster, source):
-    """Call the real parser, capturing its line-number-only refusal.
+    """Call the real parser, capturing its refusal and its return value.
 
-    Returns ``(exit_code, stderr_text)`` on refusal, or ``(None, "")`` on
-    success. The captured text is re-emitted verbatim where appropriate, so
-    the parser's own reason is preserved.
+    Returns ``(exit_code, stderr_text, result)``: ``(code, text, None)`` on a
+    refusal, or ``(None, "", result)`` on success. The captured text is
+    re-emitted verbatim where appropriate, so the parser's own reason is
+    preserved.
     """
     buffer = io.StringIO()
     previous = sys.stderr
     sys.stderr = buffer
+    result = None
     try:
-        parse_roster(source)
+        result = parse_roster(source)
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 2
-        return code, buffer.getvalue()
+        return code, buffer.getvalue(), None
     finally:
         sys.stderr = previous
-    return None, ""
+    return None, "", result
 
 
 def _parse_text(parse_roster, text: str, *, out_dir: Path, use_file: bool):
@@ -345,9 +354,9 @@ def _assert_parser_understands_format2(
     parse_roster, scanner_path: Path, *, out_dir: Path, use_file: bool
 ) -> None:
     """Positive control: a stale format-1 parser accepts format-2 text."""
-    for _label, probe in PROBE_ROSTERS:
+    for _label, probe in _probe_rosters():
         try:
-            code, _refusal = _parse_text(
+            code, _refusal, _result = _parse_text(
                 parse_roster, probe, out_dir=out_dir, use_file=use_file
             )
         except Exception as exc:  # noqa: BLE001
@@ -363,6 +372,27 @@ def _assert_parser_understands_format2(
                 f"the scanner at {scanner_path} predates the two-class "
                 "format; an unvalidated roster is never emitted",
             )
+
+
+def _validate_parser_result(result, out_lines, scanner_path: Path) -> None:
+    """The produced roster's parse must describe exactly what was produced.
+
+    A parser that returns the wrong number of entries, or the wrong class for
+    a line, is not validating the two-class format. Refuse with the same
+    message as a parser that accepts the probes.
+    """
+    stale = (
+        f"the scanner at {scanner_path} predates the two-class format; "
+        "an unvalidated roster is never emitted"
+    )
+    expected = [line[0] for line in out_lines]   # "A" or "B"
+    if not isinstance(result, (list, tuple)) or len(result) != len(expected):
+        _fail(1, stale)
+    for entry, klass in zip(result, expected):
+        if not isinstance(entry, (list, tuple)) or len(entry) < 3:
+            _fail(1, stale)
+        if entry[2] != klass:
+            _fail(1, stale)
 
 
 def _pattern_is_wider_than_name(pattern: str, declares_boundary) -> bool:
@@ -418,9 +448,12 @@ def main(argv: "list[str] | None" = None) -> int:
             "the scanner path as <repo>/.github/name-leak-roster.attestation.json.\n"
             "\n"
             "Parser identity: the loaded parser is probed with two synthetic\n"
-            "format-2 rosters (an invalid class token; a class-A line with no\n"
-            "declared boundary). A parser that accepts either predates the\n"
-            "two-class format; the tool exits 1 and writes nothing.\n"
+            "format-2 rosters built from a fresh random token per run (an\n"
+            "invalid class token; a class-A line with no declared boundary),\n"
+            "and the produced roster's parse result is checked entry-by-entry\n"
+            "against the produced lines. A parser that accepts either probe\n"
+            "or returns a mismatched result predates the two-class format;\n"
+            "the tool exits 1 and writes nothing.\n"
             "\n"
             "Class-A boundaries: every class-A line is checked with the\n"
             "scanner's own _declares_boundary. If any lack one, the tool lists\n"
@@ -612,9 +645,11 @@ def main(argv: "list[str] | None" = None) -> int:
 
     # ---- dry run: report the whole audit, write nothing -------------------
     if args.dry_run:
-        code, refusal = _parse_text(
+        code, refusal, result = _parse_text(
             parse_roster, produced, out_dir=out_dir, use_file=False
         )
+        if code is None:
+            _validate_parser_result(result, out_lines, scanner_path)
         if refusal:
             # The parser's own reason, verbatim (line number only).
             sys.stderr.write(refusal)
@@ -652,9 +687,11 @@ def main(argv: "list[str] | None" = None) -> int:
         _fail(2, f"{out_path} already exists; pass --force to overwrite. "
                  "Nothing written.")
 
-    code, refusal = _parse_text(
+    code, refusal, result = _parse_text(
         parse_roster, produced, out_dir=out_dir, use_file=True
     )
+    if code is None:
+        _validate_parser_result(result, out_lines, scanner_path)
     if code is not None:
         if refusal:
             # The parser's own reason, verbatim (line number only).

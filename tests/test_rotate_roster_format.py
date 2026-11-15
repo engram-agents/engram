@@ -279,6 +279,10 @@ def _load_scanner():
     return _import_by_path("scan_leaks_for_rotation", SCAN_LEAKS)
 
 
+def _load_tool():
+    return _import_by_path("rotate_roster_format_mod", TOOL)
+
+
 def test_t5_produced_roster_parses_under_the_real_loader(tmp_path):
     roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
     r = _run(["--roster", str(roster), "--b-names", str(bnames),
@@ -718,3 +722,78 @@ def test_bounded_metachar_free_class_b_line_prints_no_width_warning(tmp_path):
     assert r.returncode == 0, (r.stdout, r.stderr)
     assert "b_wider_than_its_name" not in r.stdout, r.stdout
     assert (out / "roster-format2.txt").is_file()
+
+
+# ---------------------------------------------------------------------------
+# R1 -- the parser's RETURN VALUE is checked, not only its exit
+# ---------------------------------------------------------------------------
+
+def test_stub_returning_right_length_all_a_classes_is_refused(tmp_path):
+    """A stub that refuses the two probe strings but accepts the produced
+    roster and returns the right LENGTH with every class 'A' validates
+    nothing; the return-value check must refuse it."""
+    stub = tmp_path / "accepting-scanner.py"
+    stub.write_text(
+        r'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return [(None, "stub", "A") for _ in lines]
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "predates the two-class format" in combined, combined
+    assert "an unvalidated roster is never emitted" in combined, combined
+    # The message names nothing but the scanner path.
+    assert "\t" not in combined, combined
+    assert "\\b" not in combined, combined
+    assert "ZZProbeName" not in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_stub_returning_all_a_classes_control_real_scanner_proceeds(tmp_path):
+    """Control: the same fixture against the real scanner proceeds."""
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (out / "roster-format2.txt").is_file()
+
+
+# ---------------------------------------------------------------------------
+# R2 -- the probe token is fresh per run
+# ---------------------------------------------------------------------------
+
+def test_probe_token_is_randomised_per_build():
+    """Two builds in one process use different tokens; each is 16 hex chars.
+    The constructed probe text is asserted on, never printed."""
+    mod = _load_tool()
+    first = [text for _label, text in mod._probe_rosters()]
+    second = [text for _label, text in mod._probe_rosters()]
+
+    assert len(first) == 2 and len(second) == 2
+    assert first != second
+    for texts in (first, second):
+        for text in texts:
+            token = (
+                text.split("\t", 1)[1]
+                .strip()
+                .removeprefix("\\b")
+                .removesuffix("\\b")
+            )
+            assert re.fullmatch(r"[0-9a-f]{16}", token)
+            assert token != "ZZProbeName"
