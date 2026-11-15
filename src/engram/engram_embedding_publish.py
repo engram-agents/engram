@@ -143,6 +143,13 @@ def _deferred(node_id: str, reason: str) -> PublishResult:
 
 
 def _valid_vector(vector) -> bool:
+    """True iff `vector` is a usable prepared vector. "Valid" means all of: a list of exactly EMBED_DIMENSION
+    elements, each an int or a float and not a bool; each finite and within the float32 range; and a non-zero norm that
+    does not overflow float32 arithmetic. The norm rule is on the squared L2 norm computed in float64: it must be
+    greater than zero (an all-zero vector, or one whose squares all underflow, has no cosine distance) and no greater
+    than the largest finite float32 (the KNN distance squares in float32, so a larger one overflows and the row gets
+    no distance). A normal unit-norm vector, and any vector whose squared norm stays within the float32 maximum,
+    pass. One rule for both routes (the in-process caller and the owner op)."""
     if not isinstance(vector, list) or len(vector) != EMBED_DIMENSION:
         return False
     for item in vector:
@@ -157,11 +164,15 @@ def _valid_vector(vector) -> bool:
         # Underflow (e.g. 1e-320) goes to 0.0, which is finite, so it is accepted.
         if not finite or abs(item) > _FLOAT32_MAX:
             return False
-    return True
+    squared_norm = math.fsum(float(item) * float(item) for item in vector)
+    # Zero (or an underflow to zero) has no direction; above the float32 maximum the float32 arithmetic inside the KNN
+    # distance overflows. Either way the stored row would be unreachable by KNN while both read-backs say it is fine.
+    return 0.0 < squared_norm <= _FLOAT32_MAX
 
 
-def _epoch_matches(prepared_epoch) -> bool:
-    now = current_epoch()
+def _epoch_matches(prepared_epoch, now: Optional[EmbeddingEpoch] = None) -> bool:
+    if now is None:
+        now = current_epoch()
     missing = object()
     return (
         getattr(prepared_epoch, "model", missing) == now.model
@@ -181,8 +192,10 @@ def _metadata_is_object_or_null(raw) -> bool:
         return False
 
 
-def _prepared_deferral(conn, node_id: str, prepared: PreparedVector) -> Optional[str]:
-    """The six ordered prepared-mode checks; the first failure names the reason."""
+def _prepared_deferral(conn, node_id: str, prepared: PreparedVector,
+                       epoch: Optional[EmbeddingEpoch] = None) -> Optional[str]:
+    """The six ordered prepared-mode checks; the first failure names the reason. `epoch` is the caller's one read of
+    the current epoch for the whole call (None: read it here, lazily, at check 4)."""
     row = conn.execute(
         "SELECT is_current, metadata FROM nodes WHERE id = ?", (node_id,)
     ).fetchone()
@@ -193,7 +206,7 @@ def _prepared_deferral(conn, node_id: str, prepared: PreparedVector) -> Optional
         return "empty_text"
     if text_sha256(text) != prepared.text_sha256:
         return "recipe_changed"
-    if not _epoch_matches(prepared.epoch):
+    if not _epoch_matches(prepared.epoch, epoch):
         return "epoch_changed"
     if not _valid_vector(prepared.vector):
         return "invalid_vector"
@@ -238,7 +251,8 @@ def _row_metadata(conn, node_id: str):
 
 
 def publish_embedding(conn, node_id: str, *,
-                      prepared: Optional[PreparedVector] = None) -> PublishResult:
+                      prepared: Optional[PreparedVector] = None,
+                      epoch: Optional[EmbeddingEpoch] = None) -> PublishResult:
     """Publish one node's embedding, strictly; see the module docstring.
 
     Precondition: the caller holds an open write transaction (BEGIN IMMEDIATE);
@@ -249,10 +263,23 @@ def publish_embedding(conn, node_id: str, *,
 
     ``prepared`` must be a ``PreparedVector``; wire-shape validation of
     untrusted input belongs to the caller (the owner op), not to this function.
+
+    ``epoch`` (prepared mode only) is the caller's ONE read of ``current_epoch()``
+    for a whole batch; None means "read it here". The prepared ``text_sha256`` is
+    compared exactly against the lowercase hex digest ``text_sha256()`` returns: an
+    uppercase-hex but otherwise correct hash defers as ``recipe_changed`` (strict
+    on purpose; the caller computes the hash with the same function).
+
+    An exception raised inside a prepared-mode check (an unreadable or corrupt
+    config, a failing text read) does not escape: that item defers as
+    ``check_failed`` with nothing written, so one bad check never costs a batch.
     """
     expected_vector = None
     if prepared is not None:
-        reason = _prepared_deferral(conn, node_id, prepared)
+        try:
+            reason = _prepared_deferral(conn, node_id, prepared, epoch)
+        except Exception:
+            return _deferred(node_id, "check_failed")
         if reason is not None:
             return _deferred(node_id, reason)
         expected_vector = prepared.vector

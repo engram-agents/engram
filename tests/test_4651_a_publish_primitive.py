@@ -729,7 +729,9 @@ def test_d5_float_outside_float32_range_is_invalid_vector(ctx, bad, index):
     assert ctx.snap(nid) == before
 
 
-@pytest.mark.parametrize("edge", [F32_MAX, -F32_MAX, 1e-320], ids=["max", "min", "tiny"])
+# A4: a lone +-F32_MAX element used to be accepted here ("max" and "min"). Its float64 squared norm (1.2e77) exceeds the
+# float32 maximum, so since A4 it defers as invalid_vector (see the E3 cells); only the tiny value is still accepted.
+@pytest.mark.parametrize("edge", [1e-320], ids=["tiny"])
 def test_d5_boundary_values_are_accepted(ctx, edge):
     vector = [0.1] * 383 + [edge]
     nid = ctx.node("d5b claim", seed=OLD)

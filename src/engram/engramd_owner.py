@@ -5830,9 +5830,20 @@ class EngramdOwner:
                 return refusal
             # Opened up front so a competing direct writer is met here (busy) rather than half way through.
             conn.execute("BEGIN IMMEDIATE")
+            # The store's current epoch is read ONCE for the whole batch (it re-reads config.json from disk) and handed
+            # to the primitive. An unreadable epoch (a corrupt config) makes EVERY item `deferred / check_failed`: the
+            # call is still `ok` and nothing is written.
+            try:
+                epoch_now = pub.current_epoch()
+            except Exception:
+                epoch_now = None
             for nid, vector, sha in items:
+                if epoch_now is None:
+                    results.append(pub.PublishResult(node_id=nid, status="deferred", reason="check_failed",
+                                                     vector_changed=None, debt_cleared=False, warning=None))
+                    continue
                 results.append(pub.publish_embedding(
-                    conn, nid, prepared=pub.PreparedVector(vector=vector, text_sha256=sha, epoch=epoch)))
+                    conn, nid, prepared=pub.PreparedVector(vector=vector, text_sha256=sha, epoch=epoch), epoch=epoch_now))
                 if guard.denials:
                     break
             if guard.denials:
