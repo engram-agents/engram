@@ -1940,13 +1940,16 @@ def _acl_leftovers(entries: list[str]) -> list[str]:
 # default-deny at dispatch.
 METHOD_KINDS = frozenset({"read", "write"})
 # the 2nd write: #3856; the 3rd and 4th: #3879 (the regenerate-embeddings tool's `fill_embeddings` / `finish_embedding_regen`);
-# the 5th and 6th: #4421 (the unblock run's `cascade_unblock_start` / `cascade_unblock_end`: they write the run FILE, not the store)
+# the 5th and 6th: #4421 (the unblock run's `cascade_unblock_start` / `cascade_unblock_end`: they write the run FILE, not the store);
+# the 7th: #4651 part A (`publish_prepared_embeddings`: already-encoded vectors through the shared strict primitive)
+PUBLISH_PREPARED_EMBEDDINGS = "publish_prepared_embeddings"
 WRITE_METHODS = frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen",
-                           "cascade_unblock_start", "cascade_unblock_end"})
+                           "cascade_unblock_start", "cascade_unblock_end", PUBLISH_PREPARED_EMBEDDINGS})
 # Writes whose handler also receives the WIRE envelope's `request_id` (as a third argument): their params are a
 # closed key set that cannot carry one (`fill_embeddings`: exactly {model, items}). use_reward carries its own
 # request_id inside params and is not in this set.
-WIRE_REQUEST_ID_METHODS = frozenset({"fill_embeddings", "cascade_unblock_start", "cascade_unblock_end"})
+WIRE_REQUEST_ID_METHODS = frozenset({"fill_embeddings", "cascade_unblock_start", "cascade_unblock_end",
+                                     PUBLISH_PREPARED_EMBEDDINGS})
 
 # The closed action enum (today one action). Anything else is refused before the store is touched.
 USE_REWARD_ACTIONS = frozenset({"mention"})
@@ -2478,6 +2481,185 @@ def _finish_embedding_regen_allows(action_code, arg1, arg2, db_name, trigger_or_
     if action_code == sqlite3.SQLITE_TRANSACTION:
         return arg1 in ("BEGIN", "COMMIT", "ROLLBACK")
     return False
+
+
+# ---------------------------------------------------------------------------
+# The fifth write: `publish_prepared_embeddings` (#4651 part A, slice A2)
+# ---------------------------------------------------------------------------
+#
+# The owner publishes ALREADY-ENCODED vectors through the ONE shared primitive,
+# `engram_embedding_publish.publish_embedding` in prepared mode, on its own connection. The model stays out of the owner;
+# the compare-and-swap and ALL verification live in the primitive, identically in both contexts (in-process and owner),
+# so this op adds no second validator, no second debt-clearer and no encoding. The op is gated by the routing flag
+# `engramd.repair_embeddings_via_owner` (default OFF), read PER CALL from this owner's own config.
+PUBLISH_PREPARED_FLAG_KEY = "repair_embeddings_via_owner"
+# A STARTING POINT, not a claim: U16's fill cap, kept so the two ops hold the writer for a comparable time. A later
+# writer-hold measurement of a 50-item publish (each item also reads the recipe and verifies both vector stores) may
+# change it.
+PUBLISH_PREPARED_MAX_ITEMS = 50
+
+# MEASURED with a recording authorizer on the real schema (the nine pinned `nodes` triggers included), running the
+# primitive in prepared mode on a fresh vec0-loaded connection over: a refresh without a marker, a refresh that clears a
+# marker, a mirror failure (ROLLBACK TO + the marker SET), a malformed-metadata deferral and a recipe deferral. The
+# recorded set is pinned by tests/test_4651_a2_owner_op.py, which RE-MEASURES at test time, so a change to the primitive
+# reddens it with this code untouched.
+#   reads of `nodes`: the six recipe columns of `_embedding_text_for_node`, plus id, is_current, embedding, metadata;
+#   updates: `nodes.embedding` and `nodes.metadata` only;
+#   `sqlite_master`: the vec-store existence check, columns type and name only;
+#   the vec0 table family (a read, update, insert or delete on it), vec0's own constructor read of `x.node_id`, and the
+#   SQL function `max`;
+#   savepoint: the primitive's own name, BEGIN / RELEASE / ROLLBACK.
+# EXACTLY ONE trigger fires on `UPDATE OF metadata ON nodes`: `nodes_metadata_json_guard_update` (BEFORE UPDATE OF
+# metadata, `WHEN NEW.metadata IS NOT NULL AND NOT json_valid(NEW.metadata)`, body `SELECT RAISE(ABORT, ...)`). Its
+# statements are admitted by NAME and column-exact: a SELECT, a read of `nodes.metadata`, the function `json_valid`.
+# The trigger's SQL body is pinned (not its name) by the test: a body can write any table.
+PUBLISH_PREPARED_ADMITTED_TRIGGERS = frozenset({"nodes_metadata_json_guard_update"})
+PUBLISH_PREPARED_TRIGGER_FUNCTIONS = frozenset({"json_valid"})
+PUBLISH_PREPARED_NODES_READ_COLUMNS = frozenset({
+    "id", "is_current", "embedding", "metadata",
+    "type", "claim", "source_title", "predicted_event", "recall_summary", "recall_keywords",
+})
+PUBLISH_PREPARED_NODES_UPDATE_COLUMNS = frozenset({"embedding", "metadata"})
+PUBLISH_PREPARED_SQLITE_MASTER_READ_COLUMNS = frozenset({"type", "name"})
+PUBLISH_PREPARED_FUNCTIONS = frozenset({"max"})
+PUBLISH_PREPARED_SAVEPOINT = "recall_summary_vector_refresh"  # the primitive's own SAVEPOINT name
+
+
+def _publish_prepared_embeddings_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
+    """The op-scoped allowlist (pure) for `publish_prepared_embeddings`: True iff this authorizer call is one the
+    primitive's prepared mode (plus the op's own vec gate and read-back) makes. MEASURED, never copied from
+    `_fill_embeddings_allows`: it reads more (the six recipe columns, `metadata`, the `sqlite_master` check), writes
+    `nodes.metadata` too and names a different savepoint. Everything else (other columns, tables or databases, INSERT /
+    DELETE on `nodes`, every DDL action, PRAGMA, ATTACH, other functions, other savepoints) is False. A statement
+    originating in a trigger or view is admitted only if that trigger is NAMED in PUBLISH_PREPARED_ADMITTED_TRIGGERS,
+    and then only the three things its body does."""
+    if trigger_or_view is not None:
+        if trigger_or_view not in PUBLISH_PREPARED_ADMITTED_TRIGGERS:
+            return False
+        if action_code == sqlite3.SQLITE_SELECT:
+            return True
+        if action_code == sqlite3.SQLITE_READ:
+            return db_name == "main" and arg1 == "nodes" and arg2 == "metadata"
+        if action_code == sqlite3.SQLITE_FUNCTION:
+            return arg2 in PUBLISH_PREPARED_TRIGGER_FUNCTIONS
+        return False
+    if action_code == sqlite3.SQLITE_SELECT:
+        return True
+    if action_code == sqlite3.SQLITE_READ:
+        return db_name == "main" and (
+            (arg1 == "nodes" and arg2 in PUBLISH_PREPARED_NODES_READ_COLUMNS)
+            or (arg1 == "sqlite_master" and arg2 in PUBLISH_PREPARED_SQLITE_MASTER_READ_COLUMNS)
+            or (arg1 == "x" and arg2 == "node_id")  # vec0's constructor declares its schema under the name `x`
+            or _is_vec_table(arg1))
+    if action_code == sqlite3.SQLITE_UPDATE:
+        return db_name == "main" and (
+            (arg1 == "nodes" and arg2 in PUBLISH_PREPARED_NODES_UPDATE_COLUMNS) or _is_vec_table(arg1))
+    if action_code in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE):
+        return db_name == "main" and _is_vec_table(arg1)
+    if action_code == sqlite3.SQLITE_TRANSACTION:
+        return arg1 in ("BEGIN", "COMMIT", "ROLLBACK")
+    if action_code == sqlite3.SQLITE_SAVEPOINT:
+        return arg1 in ("BEGIN", "RELEASE", "ROLLBACK") and arg2 == PUBLISH_PREPARED_SAVEPOINT
+    if action_code == sqlite3.SQLITE_FUNCTION:
+        return arg2 in PUBLISH_PREPARED_FUNCTIONS
+    return False
+
+
+def _publish_prepared_param_refusal(params, dimension: int) -> "tuple[dict | None, dict, list]":
+    """Validate a `publish_prepared_embeddings` request over ALL items; -> (refusal | None, epoch, items), where items is
+    the list of `(node_id, vector, text_sha256)` in call order and `epoch` the `{model, dimension, normalisation}`
+    dict. A refusal means NOTHING may be written. `dimension` is the primitive's `EMBED_DIMENSION` (imported by the
+    handler at call time: one constant importing the other, no third literal). Check order (the first violated wins):
+    (1) params is a dict with exactly {epoch, items}; (2) epoch is a dict with exactly {model, dimension, normalisation}
+    (a str, an int that is not a bool, a str); (3) items is a list of 1 to PUBLISH_PREPARED_MAX_ITEMS; then per item in
+    order: (4) a dict with exactly {node_id, vector, text_sha256}; (5) node_id: a str, non-empty, at most
+    USE_REWARD_NODE_ID_MAX_BYTES UTF-8 bytes (counted with surrogatepass), no lone surrogate, not repeated in the call;
+    (6) text_sha256 a str; (7) vector: a list of exactly `dimension` elements, each an int or a float and NOT a bool,
+    each finite once converted to float (an int too large for a float is not finite). All refusals are
+    `invalid_params`, their detail BEGINNING with a stable machine token. The epoch is NOT compared with the store's
+    here: the primitive compares it per item (`deferred / epoch_changed`), never as a whole-call refusal. The vectors are
+    passed on exactly as sent (no normalisation), so the stored text is what the in-process primitive writes. Touches
+    no connection."""
+    p = "publish_prepared_embeddings params"
+    empty_epoch: dict = {}
+    if not isinstance(params, dict) or set(params) != {"epoch", "items"}:
+        return _fill_rejection("params_shape", f"{p} must be a dict with exactly the keys 'epoch' and 'items'",
+                               "send exactly {epoch, items}; the request_id travels on the wire, not in params"), empty_epoch, []
+    epoch = params["epoch"]
+    if not isinstance(epoch, dict) or set(epoch) != {"model", "dimension", "normalisation"}:
+        return _fill_rejection("epoch_shape", "'epoch' must be a dict with exactly the keys 'model', 'dimension' and "
+                               "'normalisation'", "send the epoch the vectors were encoded under"), empty_epoch, []
+    if not isinstance(epoch["model"], str) or not isinstance(epoch["normalisation"], str):
+        return _fill_rejection("epoch_field_type", "'epoch.model' and 'epoch.normalisation' must be strings",
+                               "send the model id and the normalisation token the vectors were encoded under"), empty_epoch, []
+    if isinstance(epoch["dimension"], bool) or not isinstance(epoch["dimension"], int):
+        return _fill_rejection("epoch_field_type", "'epoch.dimension' must be an integer",
+                               "send the vector dimension the vectors were encoded under"), empty_epoch, []
+    items = params["items"]
+    if not isinstance(items, list):
+        return _fill_rejection("items_not_list", f"'items' must be a list, got {type(items).__name__}",
+                               "send 'items' as a list"), empty_epoch, []
+    if not items:
+        return _fill_rejection("items_empty", "'items' is empty", "send at least one item"), empty_epoch, []
+    if len(items) > PUBLISH_PREPARED_MAX_ITEMS:
+        return _fill_rejection("items_too_many", f"'items' has more than {PUBLISH_PREPARED_MAX_ITEMS} entries",
+                               f"send at most {PUBLISH_PREPARED_MAX_ITEMS} items per call; split the batch"), empty_epoch, []
+    out: list = []
+    seen: set = set()
+    for i, item in enumerate(items):
+        if not isinstance(item, dict) or set(item) != {"node_id", "vector", "text_sha256"}:
+            return _fill_rejection("item_shape", f"items[{i}] must be a dict with exactly the keys 'node_id', 'vector' "
+                                   "and 'text_sha256'", "send each item as {node_id, vector, text_sha256}"), empty_epoch, []
+        nid, vector, sha = item["node_id"], item["vector"], item["text_sha256"]
+        if not isinstance(nid, str):
+            return _fill_rejection("node_id_not_str", f"items[{i}].node_id must be a string",
+                                   "send every node id as a string"), empty_epoch, []
+        if nid == "":
+            return _fill_rejection("node_id_empty", f"items[{i}].node_id is the empty string",
+                                   "send real node ids"), empty_epoch, []
+        if len(nid.encode("utf-8", "surrogatepass")) > USE_REWARD_NODE_ID_MAX_BYTES:
+            return _fill_rejection("node_id_too_long", f"items[{i}].node_id exceeds {USE_REWARD_NODE_ID_MAX_BYTES} UTF-8 bytes",
+                                   f"node ids are capped at {USE_REWARD_NODE_ID_MAX_BYTES} bytes; send the real id"), empty_epoch, []
+        try:
+            nid.encode("utf-8")
+        except UnicodeEncodeError:
+            return _fill_rejection("node_id_not_utf8", f"items[{i}].node_id contains a lone surrogate, which cannot be bound",
+                                   "send node ids that are valid text"), empty_epoch, []
+        if nid in seen:
+            return _fill_rejection("node_id_repeated", f"items[{i}].node_id repeats an earlier item",
+                                   "send each node once per call"), empty_epoch, []
+        seen.add(nid)
+        if not isinstance(sha, str):
+            return _fill_rejection("text_sha256_not_str", f"items[{i}].text_sha256 must be a string",
+                                   "send the sha256 hex of the text the vector was encoded from"), empty_epoch, []
+        if not isinstance(vector, list):
+            return _fill_rejection("vector_not_list", f"items[{i}].vector must be a list of numbers",
+                                   "send 'vector' as a list"), empty_epoch, []
+        if len(vector) != dimension:
+            return _fill_rejection("bad_dimension", f"items[{i}].vector must have exactly {dimension} elements",
+                                   f"send vectors of the store's dimension ({dimension}); the owner does not trust a client-supplied one"), empty_epoch, []
+        for j, x in enumerate(vector):
+            if isinstance(x, bool) or not isinstance(x, (int, float)):
+                return _fill_rejection("vector_element_type", f"items[{i}].vector[{j}] must be an int or a float (not a bool)",
+                                       "send every element as a finite number"), empty_epoch, []
+            try:
+                f = float(x)
+            except OverflowError:
+                f = math.inf  # an int too large to be a float: not a finite value
+            if not math.isfinite(f):
+                return _fill_rejection(
+                    "non_finite", f"items[{i}].vector[{j}] is not a finite number (NaN, Infinity or an int too large for a float)",
+                    "send finite numbers only"), empty_epoch, []
+        out.append((nid, vector, sha))
+    return None, dict(epoch), out
+
+
+def _publish_prepared_fingerprint(epoch: dict, items) -> bytes:
+    """SHA-256 over (the epoch, then per item in order: node_id, text_sha256, sha256 of the vector's canonical text): the
+    idempotency payload identity. The dedupe store keeps this 32-byte digest per request_id, never the vectors."""
+    body = [[epoch["model"], epoch["dimension"], epoch["normalisation"]],
+            [[nid, sha, hashlib.sha256(json.dumps(vector).encode("utf-8")).hexdigest()] for nid, vector, sha in items]]
+    return hashlib.sha256(json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode("ascii")).digest()
 
 
 def _fill_rejection(token: str, detail: str, remedy: str, reason: str = "invalid_params") -> dict:
@@ -3206,6 +3388,8 @@ class EngramdOwner:
             # #3879. `fill_embeddings` is in WIRE_REQUEST_ID_METHODS: `_dispatch` passes it the envelope's request_id.
             "fill_embeddings": lambda params, deadline, request_id=None: self._handle_fill_embeddings(params, deadline, request_id),
             "finish_embedding_regen": lambda params, deadline: self._handle_finish_embedding_regen(params, deadline),
+            # #4651 part A. In WIRE_REQUEST_ID_METHODS: `_dispatch` passes it the envelope's request_id.
+            PUBLISH_PREPARED_EMBEDDINGS: lambda params, deadline, request_id=None: self._handle_publish_prepared_embeddings(params, deadline, request_id),
             # #4421: the unblock run. start/end are in WIRE_REQUEST_ID_METHODS (the envelope's request_id is their idempotency key).
             "cascade_unblock_start": lambda params, deadline, request_id=None: self._handle_cascade_unblock_start(params, deadline, request_id),
             "cascade_unblock_end": lambda params, deadline, request_id=None: self._handle_cascade_unblock_end(params, deadline, request_id),
@@ -3217,7 +3401,7 @@ class EngramdOwner:
         self._method_kinds = {
             "ping": "read", "snapshot": "read", "read": "read", "df": "read", "chain": "read",
             "confidence_by_type": "read", "use_reward": "write", "advance_moment_cursor": "write",
-            "fill_embeddings": "write", "finish_embedding_regen": "write",
+            "fill_embeddings": "write", "finish_embedding_regen": "write", PUBLISH_PREPARED_EMBEDDINGS: "write",
             "cascade_unblock_start": "write", "cascade_unblock_end": "write", "cascade_unblock_get": "read",
         }
         # use_reward's dedupe store: request_id -> {"fp": (ids, action), "response": <first wire dict>}.
@@ -3227,6 +3411,8 @@ class EngramdOwner:
         # different ops): request_id -> {"fp": sha256 digest, "response": <first wire dict>}. Same bound and the same
         # KNOWN LIMIT as use_reward's (dies with the process; the oldest entry is forgotten past the cap).
         self._fill_embeddings_seen: "OrderedDict[str, dict]" = OrderedDict()
+        # publish_prepared_embeddings' own dedupe store (its own namespace; same bound and the same KNOWN LIMIT).
+        self._publish_prepared_seen: "OrderedDict[str, dict]" = OrderedDict()
         # #4421: the unblock run. `_unblock_lock` serialises every read-modify-write of the run file; `_unblock_seen` is the
         # start/end dedupe store, keyed (op, request_id) -> {"fp", "response"}: in-memory and LRU-bounded like use_reward's
         # (KNOWN BOUND, the same: it dies with the process, so a retry after an owner restart recomputes). `_unblock_now` is
@@ -5454,6 +5640,215 @@ class EngramdOwner:
                     "skipped_not_null": not_null,
                     "skipped_not_current_or_missing": missing,
                     "vec_mirrored": bool(mirrored),
+                },
+                "_committed": True,
+            }
+        except BaseException as exc:
+            unverified = {**_df_rejection(
+                "readback_mismatch",
+                f"COMMITTED but UNVERIFIED: the post-commit verification failed ({type(exc).__name__}); the commit stands and cannot be undone",
+                "do not retry with a new request_id; retry with the SAME request_id to replay this outcome, and inspect the nodes"),
+                "commit": "committed_unverified"}
+            record(unverified)
+            if not isinstance(exc, Exception):
+                raise
+            return {**unverified, "_committed": True}
+
+    # -- the owner's fifth write (#4651 part A, slice A2) -----------------------------------------------------------
+
+    def _publish_prepared_flag_refusal(self) -> "dict | None":
+        """None iff `engramd.repair_embeddings_via_owner` is the JSON boolean `true` in THIS owner's own config.json,
+        read fresh through `engramd_owner_flags.flag_on` (the one definition of "on"). EVERY other outcome (a missing key,
+        a string, a number, null, an absent, malformed, non-object or non-regular config, and any error from the read
+        itself) is OFF and refuses: the gate fails CLOSED, so an unreadable config is never a way to turn it on.
+        The flags module is imported HERE, lazily and outside the `try`: the owner's import set (and its start-up) does
+        not change, and a missing module is a loud failure of the call, not a silent `flag_off`."""
+        import engramd_owner_flags as eof
+
+        try:
+            on = eof.flag_on(PUBLISH_PREPARED_FLAG_KEY, self.engram_home / "config.json")
+        except Exception:
+            on = False
+        if on is True:
+            return None
+        return _df_rejection(
+            "flag_off",
+            f"engramd.{PUBLISH_PREPARED_FLAG_KEY} is not on in this owner's own config.json (JSON true only; a missing "
+            "key, another value or an unreadable config is off); the owner refuses this op because the caller's route "
+            "is stale, not because a consent is missing",
+            f"do not retry: with the flag off the repair tool publishes in-process; to route through the owner set "
+            f"engramd.{PUBLISH_PREPARED_FLAG_KEY} to true in config.json and start the repair again from a fresh preview")
+
+    def _publish_vec_gate(self, conn: sqlite3.Connection) -> "tuple[dict | None, object]":
+        """The vec gate, in ONE small function so it can be removed (the ruling on keeping it is Borges's): -> (refusal |
+        None, serializer | None). If the store has a `vec_nodes` table and THIS connection cannot write it (vec0 is not
+        loadable here), the WHOLE call is refused up front as `vec_unavailable`, with nothing written: the strict
+        primitive would otherwise answer every row `pending`. No `vec_nodes` table at all is not refused: the primitive's
+        own no-mirror rules apply. Runs under `_owner_lock` before `BEGIN IMMEDIATE`; the serializer is None when
+        there is no vec store."""
+        has_vec = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vec_nodes'").fetchone() is not None
+        if not has_vec:
+            return None, None
+        serialize = self._fill_vec_ready(conn)
+        if serialize is None:
+            return _df_rejection(
+                "vec_unavailable",
+                "the store has a vec_nodes table but this owner's connection cannot write it (vec0 is not loadable here); "
+                "nothing was written",
+                "install sqlite-vec for the owner's Python, or repair with the flag off so the repair tool writes in-process"), None
+        return None, serialize
+
+    def _handle_publish_prepared_embeddings(self, params: dict, deadline: float, request_id=None) -> dict:
+        """`regen_embeddings_via_owner` routes the writes that FILL vectors that are missing; `repair_embeddings_via_owner`,
+        the flag this op is gated by, routes the one-time repair that REWRITES vectors that already exist, and only after
+        the repair tool's explicit apply.
+
+        The typed `publish_prepared_embeddings` write (kind `write`). Wire: params exactly {epoch: {model, dimension,
+        normalisation}, items: [{node_id, vector, text_sha256}]}, 1 to PUBLISH_PREPARED_MAX_ITEMS items; `request_id` is
+        the envelope's (see WIRE_REQUEST_ID_METHODS). The op publishes already-encoded vectors through the ONE shared
+        primitive (`engram_embedding_publish.publish_embedding`, prepared mode), per item, in request order, in one
+        transaction; the owner never encodes, and adds no second validator and no second debt-clearer.
+
+        The flag guarantee is per CALL, not per statement: the flag is read fresh from this owner's own config on every
+        call (never latched, never a caller value or an environment override), and a flag turned OFF mid-call does not
+        abort that call. OFF, or any unreadable state, refuses `flag_off` (route integrity, a stale caller; not consent)
+        before the params are validated and before the store is touched.
+
+        Order: (1) the flag gate; (2) validate EVERY item, touching no connection (one bad item refuses the whole call,
+        nothing written); (3) the request_id; (4) the shared `_owner_write` scaffold with this op's own restrictive,
+        MEASURED authorizer, installed BEFORE `BEGIN IMMEDIATE` and restored on every exit; UNDER THE LOCK a dedupe check
+        by request_id (a replay answers the stored outcome with `duplicate: True`; the same id with a different payload is
+        refused), the vec gate (`vec_unavailable`), BEGIN IMMEDIATE, the primitive per item, COMMIT, then the READ-BACK of
+        every `refreshed` item's `nodes.embedding` text and its vec bytes.
+
+        The epoch is compared per item by the primitive (a mismatch is that item's `deferred / epoch_changed`); there is
+        no whole-call model mismatch. Outcomes: `ok` {items: [{node_id, status, reason, vector_changed, debt_cleared}],
+        counts: {refreshed, pending, deferred}}; `flag_off`; `invalid_params`; `vec_unavailable`; `write_denied` (the
+        whole op rolled back); `busy` (nothing committed); `publish_write_failed` (rolled back, a failed COMMIT included;
+        retry with the SAME request_id); `readback_mismatch` (COMMITTED but unverified, recorded so a replay re-reports
+        instead of re-writing)."""
+        refusal = self._publish_prepared_flag_refusal()
+        if refusal is not None:
+            return refusal
+        # Lazy, after the flag gate: engram_core is large and the owner's start-up must not pay for it. The primitive's
+        # `EMBED_DIMENSION` is THE dimension constant (no third literal here).
+        _engram_core(self.engram_home)
+        import engram_embedding_publish as pub
+
+        refusal, epoch, items = _publish_prepared_param_refusal(params, pub.EMBED_DIMENSION)
+        if refusal is not None:
+            return refusal
+        refusal = _fill_request_id_refusal(request_id)
+        if refusal is not None:
+            return refusal
+        fingerprint = _publish_prepared_fingerprint(epoch, items)
+        prepared_epoch = pub.EmbeddingEpoch(
+            model=epoch["model"], dimension=epoch["dimension"], normalisation=epoch["normalisation"])
+
+        def record(resp: dict) -> None:
+            """Remember a COMMITTED outcome (ok or committed_unverified) so a same-id retry replays it."""
+            self._publish_prepared_seen[request_id] = {"fp": fingerprint, "response": copy.deepcopy(resp)}
+            self._publish_prepared_seen.move_to_end(request_id)
+            while len(self._publish_prepared_seen) > USE_REWARD_DEDUPE_CAP:
+                self._publish_prepared_seen.popitem(last=False)
+
+        def dedupe_check() -> "dict | None":
+            prior = self._publish_prepared_seen.get(request_id)
+            if prior is None:
+                return None
+            self._publish_prepared_seen.move_to_end(request_id)
+            if prior["fp"] != fingerprint:
+                return _fill_rejection(
+                    "request_id_reused", "this request_id was already used for a different payload",
+                    "generate a fresh request_id per distinct operation; reuse one only to retry the SAME call")
+            replay = copy.deepcopy(prior["response"])
+            if replay.get("status") == "ok":
+                replay["result"]["duplicate"] = True
+            return replay
+
+        return self._owner_write(
+            "publish", deadline, lambda: _UseRewardGuard(allows=_publish_prepared_embeddings_allows),
+            lambda conn, guard: self._publish_prepared_execute(conn, guard, pub, prepared_epoch, items, record),
+            intercept=dedupe_check, after=record)
+
+    def _publish_prepared_readback(self, conn: sqlite3.Connection, ids, has_vec: bool) -> dict:
+        """{id: (stored `nodes.embedding` text, stored `vec_nodes` bytes)} for each of `ids`, read from the committed
+        store (None where NULL or the row is gone; the vec bytes are None when there is no vec store). Runs after COMMIT
+        under the op allowlist; a test replaces it to perturb the post-commit value."""
+        out: dict = {}
+        for nid in ids:
+            row = conn.execute("SELECT embedding FROM nodes WHERE id = ?", (nid,)).fetchone()
+            vbytes = None
+            if has_vec:
+                mirror = conn.execute("SELECT embedding FROM vec_nodes WHERE node_id = ?", (nid,)).fetchone()
+                vbytes = None if mirror is None else bytes(mirror[0])
+            out[nid] = (None if row is None else row[0], vbytes)
+        return out
+
+    def _publish_prepared_execute(self, conn: sqlite3.Connection, guard: "_UseRewardGuard", pub, epoch, items: list, record) -> dict:
+        """The transaction body of `_handle_publish_prepared_embeddings`; runs with the op allowlist installed and
+        `_owner_lock` held. `items` is [(node_id, vector, text_sha256)]. A response carrying `_committed: True` is one
+        whose COMMIT happened (the scaffold records it for dedupe and strips the marker)."""
+        op = "publish"
+        results: list = []
+        serialize = None
+        try:
+            refusal, serialize = self._publish_vec_gate(conn)  # before the transaction: a refusal writes nothing
+            if refusal is not None:
+                return refusal
+            # Opened up front so a competing direct writer is met here (busy) rather than half way through.
+            conn.execute("BEGIN IMMEDIATE")
+            for nid, vector, sha in items:
+                results.append(pub.publish_embedding(
+                    conn, nid, prepared=pub.PreparedVector(vector=vector, text_sha256=sha, epoch=epoch)))
+                if guard.denials:
+                    break
+            if guard.denials:
+                _write_abort(conn, guard, op)
+                return _write_denied(guard, op)
+            guard.allow_commit = True
+            conn.commit()
+            guard.allow_commit = False
+        except BaseException as exc:
+            guard.allow_commit = False
+            _write_abort(conn, guard, op)
+            if not isinstance(exc, Exception):
+                raise  # SystemExit / GeneratorExit / injected async exceptions: rolled back, then propagated
+            if guard.denials:
+                return _write_denied(guard, op)
+            if isinstance(exc, sqlite3.Error):
+                return _write_sqlite_error(
+                    exc, op, "retry once with the SAME request_id (nothing was written, so the retry runs fresh)",
+                    "retry with the SAME request_id; if it persists check the store's disk and permissions")
+            raise
+        # COMMITTED. From here the write cannot be undone: every failure below is committed-but-UNVERIFIED.
+        try:
+            vectors = {nid: vector for nid, vector, _sha in items}
+            ids = [r.node_id for r in results if r.status == "refreshed"]
+            actual = self._publish_prepared_readback(conn, ids, serialize is not None) if ids else {}
+            bad = [
+                nid for nid in ids
+                if actual.get(nid) != (json.dumps(vectors[nid]), serialize(vectors[nid]) if serialize is not None else None)
+            ]
+            if bad:
+                return {**_df_rejection(
+                    "readback_mismatch",
+                    f"COMMITTED but UNVERIFIED: the committed embedding or its vec mirror differs from the one written for id(s) {bad}; the commit cannot be undone",
+                    "do not retry with a new request_id; retry with the SAME request_id to replay this outcome, and inspect the named nodes"),
+                    "commit": "committed_unverified", "_committed": True}
+            counts = {"refreshed": 0, "pending": 0, "deferred": 0}
+            for r in results:
+                counts[r.status] += 1
+            return {
+                "status": "ok",
+                "result": {
+                    "items": [
+                        {"node_id": r.node_id, "status": r.status, "reason": r.reason,
+                         "vector_changed": r.vector_changed, "debt_cleared": r.debt_cleared}
+                        for r in results
+                    ],
+                    "counts": counts,
                 },
                 "_committed": True,
             }
