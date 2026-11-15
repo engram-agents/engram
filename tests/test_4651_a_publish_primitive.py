@@ -116,6 +116,12 @@ class Ctx:
                     "UPDATE nodes SET recall_summary = ?, recall_keywords = ? WHERE id = ?",
                     (summary, None if keywords is None else json.dumps(keywords), nid))
             if metadata is not None:
+                try:
+                    json.loads(metadata)
+                except ValueError:
+                    # A legacy damaged row: the write guard (#3425) refuses new
+                    # invalid JSON, so the fixture lifts it for this one test DB.
+                    conn.execute("DROP TRIGGER IF EXISTS nodes_metadata_json_guard_update")
                 conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (metadata, nid))
             if seed is not None:
                 conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (nid,))
