@@ -636,3 +636,72 @@ def test_d_the_new_shippables_are_tiered():
     lean = entries["templates/template.CLAUDE.lean.md"]
     assert lean["tier"] == full["tier"], "bootstrap reads the lean file, so it ships where the full one does"
     assert "templates/manifests" in entries
+
+
+# --- round 3: Codex ignores the option; the upgrade skill's Step 2 snippet ----------------------
+
+
+def test_c1_codex_target_with_lean_option_records_no_profile(tmp_path):
+    r = _bootstrap(tmp_path, ["--claude-md-profile", "lean"], extra_env={"TARGET": "codex"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ignored" in r.stdout + r.stderr
+    cfg_path = tmp_path / ".engram" / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {}
+    assert "claude_md_profile" not in cfg
+
+
+UPGRADE_SKILL = SRC / "skills" / "claude" / "engram-upgrade" / "SKILL.md"
+
+
+def _step2_snippet() -> str:
+    """The shell block in Step 2 that picks the template by the recorded profile, read from the skill text."""
+    text = UPGRADE_SKILL.read_text(encoding="utf-8")
+    for block in re.findall(r"```bash\n(.*?)```", text, flags=re.S):
+        if "TEMPLATE=template.CLAUDE.md" in block:
+            return block
+    raise AssertionError("Step 2 template-picking snippet not found in the upgrade SKILL.md")
+
+
+def _pick_template(shell: str, home: Path, config_text: str | None) -> str:
+    home.mkdir(parents=True, exist_ok=True)
+    if config_text is not None:
+        (home / "config.json").write_text(config_text, encoding="utf-8")
+    # Run only the picking lines; the git log line needs a source repo and is not under test.
+    lines = [ln for ln in _step2_snippet().splitlines() if ln.startswith(("TEMPLATE=", "grep -Eq"))]
+    assert len(lines) == 2, lines
+    script = "\n".join(lines) + '\nprintf %s "$TEMPLATE"\n'
+    env = os.environ.copy()
+    env["ENGRAM_HOME"] = str(home)
+    r = subprocess.run([shell, "-c", script], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+_STEP2_SHELLS = [s for s in ("/bin/bash", "/bin/sh") if os.path.exists(s)]
+
+
+@pytest.mark.parametrize("shell", _STEP2_SHELLS)
+@pytest.mark.parametrize(
+    "config_text, expected",
+    [
+        ('{"claude_md_profile": "lean"}', "template.CLAUDE.lean.md"),
+        ('{"install_tier": "convenience"}', "template.CLAUDE.md"),
+        (None, "template.CLAUDE.md"),
+        ('{"claude_md_profile": "tiny"}', "template.CLAUDE.md"),
+    ],
+    ids=["lean", "unrecorded", "no-config", "unrecognised"],
+)
+def test_upgrade_skill_step2_snippet_picks_the_template(tmp_path, shell, config_text, expected):
+    assert _pick_template(shell, tmp_path / "home", config_text) == expected
+
+
+def test_render_reads_the_named_template_even_if_the_sources_list_widens(tmp_path, monkeypatch):
+    import template_render as tr
+
+    (tmp_path / "template.CLAUDE.lean.md").write_text("LEAN", encoding="utf-8")
+    (tmp_path / "template.CLAUDE.md").write_text("FULL", encoding="utf-8")
+    (tmp_path / "other.md").write_text("OTHER", encoding="utf-8")
+    monkeypatch.setitem(tr.CLAUDE_MD_PROFILE_SOURCES, "lean", ["other.md", "template.CLAUDE.lean.md"])
+    assert tr.render_identity_surface(tmp_path, "lean") == "LEAN"
+    for profile, name in tr.CLAUDE_MD_PROFILE_TEMPLATE.items():
+        assert name in tr.CLAUDE_MD_PROFILE_SOURCES[profile]

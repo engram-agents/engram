@@ -160,7 +160,8 @@ def test_tool_and_upgrade_flow_read_the_same_profile(tmp_path):
     flows_reader = ns["_recorded_claude_md_profile"]
 
     cases = [None, "{not json", "[1]", "{}", '{"claude_md_profile": null}', '{"claude_md_profile": "full"}',
-             '{"claude_md_profile": "lean"}', '{"claude_md_profile": "tiny"}', '{"claude_md_profile": 3}']
+             '{"claude_md_profile": "lean"}', '{"claude_md_profile": "tiny"}', '{"claude_md_profile": 3}',
+             '{"claude_md_profile": "Lean"}', '{"claude_md_profile": "lean "}']
     for i, raw in enumerate(cases):
         h = tmp_path / f"h{i}"
         h.mkdir()
@@ -168,3 +169,8 @@ def test_tool_and_upgrade_flow_read_the_same_profile(tmp_path):
             (h / "config.json").write_text(raw, encoding="utf-8")
         assert template_render.recorded_claude_md_profile(str(h)) == flows_reader(str(h)), raw
     assert template_render.recorded_claude_md_profile("") == flows_reader("") == "full"
+    # Case-variant and padded values are not "lean": both readers must refuse them the same way.
+    for i, raw in enumerate(cases):
+        if raw and ("Lean" in raw or "lean \"" in raw):
+            h = tmp_path / f"h{i}"
+            assert template_render.recorded_claude_md_profile(str(h)) == flows_reader(str(h)) == "undetermined", raw

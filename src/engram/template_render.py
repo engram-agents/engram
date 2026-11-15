@@ -69,6 +69,12 @@ CLAUDE_MD_PROFILE_SOURCES: dict[str, list[str]] = {
     "full": CLAUDE_RENDER_SOURCES,
     "lean": ["template.CLAUDE.lean.md"],
 }
+#: The one template file each profile renders from (always a member of that
+#: profile's CLAUDE_MD_PROFILE_SOURCES list; the list may widen, this name does not move).
+CLAUDE_MD_PROFILE_TEMPLATE: dict[str, str] = {
+    "full": "template.CLAUDE.md",
+    "lean": "template.CLAUDE.lean.md",
+}
 PROFILE_UNDETERMINED = "undetermined"
 
 
@@ -126,5 +132,5 @@ def render_identity_surface(templates_dir: Path, profile: str = "full") -> str:
     str
         The raw template text, placeholders intact.
     """
-    template_path = templates_dir / CLAUDE_MD_PROFILE_SOURCES[profile][0]
+    template_path = templates_dir / CLAUDE_MD_PROFILE_TEMPLATE[profile]
     return template_path.read_text(encoding="utf-8")
