@@ -10,18 +10,24 @@ counts, the whole-file sha256, per-class line numbers, and the class-B names
 
 Classification (R4) -- the roster lines are regexes, so "exact match" between a
 pattern and a name is not string equality. Each roster line and each B-file
-entry is reduced to a NAME KEY:
+entry is reduced to a NAME by stripping ONLY wrappers that do not change which
+name is named:
 
-    strip -> drop a leading (?i) -> drop a leading and a trailing \\b
-          -> strip -> casefold
+    strip -> drop a leading (?i) -> drop \\b only when BOTH ends carry it
+          -> strip
 
-The key strips only wrappers that do not change which name is named (``\\b``,
-``(?i)``) and casefolds; it NEVER rewrites an emitted pattern -- the pattern
-text is carried through verbatim. A roster line is class B iff its key equals
-the name key of a B-file entry; everything else is class A. Any roster line
-whose key matches nothing is class A -- blocking -- so a failed match blocks a
-name unnecessarily and is visible, rather than classifying a private name as
-report-only.
+A one-sided \\b is NOT a wrapper: it makes the pattern a prefix or suffix
+match, a different pattern, so it is left in place and that line cannot be
+class B. Case is folded ONLY when the pattern declares case-insensitivity with
+a leading ``(?i)``; without it the comparison is case-sensitive, so a
+case-distinct name is not silently treated as the permitted one.
+
+The name is never used to rewrite an emitted pattern -- the pattern text is
+carried through verbatim. A roster line is class B iff its name equals a
+B-file entry's name under the rule above; everything else is class A. Any
+roster line that matches nothing is class A -- blocking -- so a failed match
+blocks a name unnecessarily and is visible, rather than classifying a private
+name as report-only.
 
 The produced roster is validated by the scanner's real format-2 parser
 (``load_roster_file``) before it is written; if the parser refuses, nothing is
@@ -36,7 +42,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import io
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -44,8 +52,8 @@ from pathlib import Path
 OUTPUT_NAME = "roster-format2.txt"
 
 NAME_KEY_RULE = (
-    "strip -> drop a leading (?i) -> drop a leading and a trailing \\b "
-    "-> strip -> casefold"
+    "strip -> drop a leading (?i) -> drop \\b only when BOTH ends carry it "
+    "(a one-sided \\b is kept) -> strip -> casefold only when (?i) is present"
 )
 
 
@@ -62,20 +70,34 @@ def _fail(code: int, message: str) -> "None":
     raise SystemExit(code)
 
 
-def name_key(text: str) -> str:
-    """The name key, applied identically to a roster line and a B-file entry.
+def _key_parts(text: str) -> "tuple[str, bool]":
+    """Return ``(name, ignore_case)`` after stripping only real wrappers.
 
-    strip -> drop a leading ``(?i)`` -> drop a leading and a trailing ``\\b``
-    -> strip -> casefold.
+    strip -> drop a leading ``(?i)`` -> drop ``\\b`` only when BOTH ends carry
+    it -> strip. A one-sided ``\\b`` is kept: it is a prefix/suffix match, not
+    a wrapper around the bare name.
     """
     key = text.strip()
+    ignore_case = False
     if key.startswith("(?i)"):
+        ignore_case = True
         key = key[4:]
-    if key.startswith("\\b"):
-        key = key[2:]
-    if key.endswith("\\b"):
-        key = key[:-2]
-    return key.strip().casefold()
+    if key.startswith("\\b") and key.endswith("\\b"):
+        key = key[2:-2]
+    return key.strip(), ignore_case
+
+
+def _names_match(roster_line: str, b_parts: "tuple[str, bool]") -> bool:
+    """Compare a roster line's name to a B entry's under the R4 rule.
+
+    Case is folded only when one side declares ``(?i)``; otherwise the
+    comparison is case-sensitive.
+    """
+    roster_name, roster_ci = _key_parts(roster_line)
+    b_name, b_ci = b_parts
+    if roster_ci or b_ci:
+        return roster_name.casefold() == b_name.casefold()
+    return roster_name == b_name
 
 
 def _skippable(stripped: str) -> bool:
@@ -143,7 +165,60 @@ def _load_parser(scanner_path: Path):
         )
         return None
     loader = getattr(module, "load_roster_file", None)
-    return loader if callable(loader) else None
+    if not callable(loader):
+        return None
+    # The parser's own boundary predicate, used only to explain a refusal.
+    boundary = getattr(module, "_declares_boundary", None)
+    return loader, (boundary if callable(boundary) else None)
+
+
+def _run_parser(parse_roster, path: Path):
+    """Call the real parser, catching its line-number-only refusal.
+
+    Returns ``(exit_code, stderr_text)`` on refusal, or ``(None, "")`` on
+    success. The message is re-emitted verbatim by the caller, so the parser's
+    own reason is preserved.
+    """
+    buffer = io.StringIO()
+    previous = sys.stderr
+    sys.stderr = buffer
+    try:
+        parse_roster(path)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 2
+        return code, buffer.getvalue()
+    finally:
+        sys.stderr = previous
+    return None, ""
+
+
+def _refusal_guidance(refusal_text, entries, out_lines, declares_boundary):
+    """Guidance when the parser refused a class-A line for no declared boundary.
+
+    Returns ``None`` for any other refusal kind, so the parser's own reason
+    stands alone.
+    """
+    if declares_boundary is None:
+        return None
+    match = re.search(r"roster line (\d+)\b", refusal_text)
+    if not match:
+        return None
+    produced_lineno = int(match.group(1))
+    if not 1 <= produced_lineno <= len(out_lines):
+        return None
+    produced = out_lines[produced_lineno - 1]
+    if not produced.startswith("A\t"):
+        return None
+    if declares_boundary(produced[2:]):
+        return None
+    source_lineno = entries[produced_lineno - 1][0]
+    return (
+        f"produced line {produced_lineno} (source roster line {source_lineno}) "
+        "is a class-A pattern that declares no boundary. This tool will NOT "
+        "rewrite the pattern: the roster must declare the boundary itself -- "
+        "\\b, a lookaround, or ^/$ -- on that source line. Fix the source "
+        "line and re-run."
+    )
 
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -157,17 +232,21 @@ def main(argv: "list[str] | None" = None) -> int:
             "roster line."
         ),
         epilog=(
-            "Name key (applied to each roster line and to each B-file entry):\n"
+            "Name rule (applied to each roster line and to each B-file entry):\n"
             f"  {NAME_KEY_RULE}\n"
             "\n"
-            "A roster line is class B iff its name key equals the name key of a\n"
-            "B-file entry; every other line is class A (blocking). Roster lines\n"
-            "are regexes, so 'exact match' between a pattern and a name is not\n"
-            "string equality: the key strips only wrappers that do not change\n"
-            "which name is named (\\b, (?i)) and casefolds. It never rewrites\n"
-            "the emitted pattern. A line whose key matches nothing is class A,\n"
-            "so a failed match blocks a name unnecessarily and is visible,\n"
-            "rather than classifying a private name as report-only.\n"
+            "A roster line is class B iff its name equals a B-file entry's name;\n"
+            "every other line is class A (blocking). Roster lines are regexes,\n"
+            "so 'exact match' between a pattern and a name is not string\n"
+            "equality: only wrappers that do not change which name is named are\n"
+            "stripped -- a leading (?i), and \\b only as a MATCHED PAIR. A\n"
+            "one-sided \\b is a prefix/suffix match, a different pattern, so it\n"
+            "is kept and that line stays class A. Case is folded only when the\n"
+            "pattern declares (?i); without it the comparison is case-sensitive.\n"
+            "The tool never rewrites the emitted pattern. A line that matches\n"
+            "nothing is class A, so a failed match blocks a name unnecessarily\n"
+            "and is visible, rather than classifying a private name as\n"
+            "report-only.\n"
             "\n"
             "Output: DIR/roster-format2.txt, created mode 0600 by os.open and\n"
             "refused when it already exists unless --force is passed. Nothing\n"
@@ -220,46 +299,55 @@ def main(argv: "list[str] | None" = None) -> int:
                 "double-prefix). Refusing; nothing written.",
             )
 
-    entries = []  # (input line number, pattern text, name key)
+    entries = []  # (input line number, pattern text)
     skipped = 0
     for lineno, raw in enumerate(raw_lines, start=1):
         stripped = raw.strip()
         if _skippable(stripped):
             skipped += 1
             continue
-        entries.append((lineno, stripped, name_key(stripped)))
+        entries.append((lineno, stripped))
 
     # ---- read the B names ------------------------------------------------
     b_text = _read_text(Path(args.b_names).expanduser(), "the B-names file")
-    b_entries = []  # (B-file line number, permitted name, name key)
+    b_entries = []  # (B-file line number, permitted name, _key_parts result)
     for b_lineno, raw in enumerate(b_text.splitlines(), start=1):
         stripped = raw.strip()
         if _skippable(stripped):
             continue
-        b_entries.append((b_lineno, stripped, name_key(stripped)))
+        b_entries.append((b_lineno, stripped, _key_parts(stripped)))
 
     # ---- classify --------------------------------------------------------
-    b_name_by_key = {}
-    for _b_lineno, name, key in b_entries:
-        b_name_by_key.setdefault(key, name)
-
     out_lines = []
     b_roster_matches = []  # (roster input line number, permitted B name)
-    matched_b_keys = set()
     class_a = 0
     class_b = 0
-    for lineno, pattern, key in entries:
-        if key in b_name_by_key:
+    for lineno, pattern in entries:
+        matched_name = None
+        for _b_lineno, b_name, b_parts in b_entries:
+            if _names_match(pattern, b_parts):
+                matched_name = b_name
+                break
+        if matched_name is not None:
             class_b += 1
-            matched_b_keys.add(key)
             out_lines.append("B\t" + pattern)
-            b_roster_matches.append((lineno, b_name_by_key[key]))
+            b_roster_matches.append((lineno, matched_name))
         else:
             class_a += 1
             out_lines.append("A\t" + pattern)
 
+    # A B entry is unmatched only if it matches NO roster line (so duplicate
+    # B entries and a line matching more than one entry are all reported
+    # correctly).
+    matched_b_linenos = set()
+    for b_lineno, _b_name, b_parts in b_entries:
+        for _lineno, pattern in entries:
+            if _names_match(pattern, b_parts):
+                matched_b_linenos.add(b_lineno)
+                break
     unmatched_b = [
-        name for _b_lineno, name, key in b_entries if key not in matched_b_keys
+        name for b_lineno, name, _parts in b_entries
+        if b_lineno not in matched_b_linenos
     ]
 
     produced = "".join(line + "\n" for line in out_lines)
@@ -280,13 +368,14 @@ def main(argv: "list[str] | None" = None) -> int:
             "no scanner found; the roster cannot be validated without the "
             f"parser, and an unvalidated roster is never emitted (tried: {tried})",
         )
-    parse_roster = _load_parser(scanner_path)
-    if parse_roster is None:
+    parser_fns = _load_parser(scanner_path)
+    if parser_fns is None:
         _fail(
             1,
             f"{scanner_path} has no usable load_roster_file; the roster cannot "
             "be validated without the parser. Nothing written.",
         )
+    parse_roster, declares_boundary = parser_fns
 
     # ---- validate from a 0600 temp file INSIDE --out-dir ------------------
     temp_path = None
@@ -298,19 +387,26 @@ def main(argv: "list[str] | None" = None) -> int:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(produced)
         try:
-            parse_roster(temp_path)
-        except SystemExit as exc:
-            # The parser has already printed its line-number-only refusal.
-            _fail(
-                2,
-                "the produced roster was refused by the parser "
-                f"(exit {exc.code}); nothing written.",
-            )
+            code, refusal = _run_parser(parse_roster, temp_path)
         except Exception as exc:  # noqa: BLE001
             _fail(
                 1,
                 "the scanner's load_roster_file raised "
                 f"{type(exc).__name__}; nothing written.",
+            )
+        if code is not None:
+            if refusal:
+                # The parser's own reason, verbatim (line number only).
+                sys.stderr.write(refusal)
+            guidance = _refusal_guidance(
+                refusal, entries, out_lines, declares_boundary
+            )
+            if guidance:
+                print(f"rotate_roster_format: {guidance}", file=sys.stderr)
+            _fail(
+                2,
+                "the produced roster was refused by the parser "
+                f"(exit {code}); nothing written.",
             )
     finally:
         if temp_path is not None:

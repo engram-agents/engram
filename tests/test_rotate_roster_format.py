@@ -8,11 +8,12 @@ Every fixture token is invented and appears nowhere else:
   ZZAlphaHolder, ZZDeltaSecret, YYBravoHandle, Lin Example.
 
 R1's one permitted exception is a class-B NAME (the caller's own input of
-permitted names). T6 therefore uses a class-B entry whose case differs from
-its roster line (``\\bYYBRAVOHANDLE\\b`` vs ``yybravohandle``) so the
-class-B name printed in the audit is a DIFFERENT literal string from the
-pattern text -- that lets the cell assert every pattern's distinctive token
-is absent from stdout AND stderr without contradicting the exception.
+permitted names). T6 therefore uses a class-B line that declares ``(?i)`` and
+whose case differs from its B entry (``(?i)\\bYYBRAVOHANDLE\\b`` vs
+``yybravohandle``) so the class-B name printed in the audit is a DIFFERENT
+literal string from the pattern text -- that lets the cell assert every
+pattern's distinctive token is absent from stdout AND stderr without
+contradicting the exception.
 """
 
 from __future__ import annotations
@@ -229,10 +230,6 @@ def _import_by_path(name, path):
     return mod
 
 
-def _load_tool():
-    return _import_by_path("rotate_roster_format_mod", TOOL)
-
-
 def _load_scanner():
     return _import_by_path("scan_leaks_for_rotation", SCAN_LEAKS)
 
@@ -256,12 +253,14 @@ def test_t5_produced_roster_parses_under_the_real_loader(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_t6_no_roster_pattern_text_reaches_stdout_or_stderr(tmp_path):
-    # The B entry is case-distinct from its roster line, so the printed
-    # class-B name (yybravohandle) is not the pattern's literal text.
+    # The class-B line declares (?i) and is case-distinct from its B entry, so
+    # the printed class-B name (yybravohandle) is not the pattern's literal
+    # text; that lets this cell assert every pattern token, including the
+    # class-B line's, is absent without contradicting R1's class-B exception.
     roster_lines = [
         r"\b" + A_ONE + r"\b",
         r"\b" + A_TWO + r"\b",
-        r"\b" + B_ONE.upper() + r"\b",
+        r"(?i)\b" + B_ONE.upper() + r"\b",
     ]
     roster, bnames, out = _scratch(tmp_path, roster_lines, [B_ONE.lower()])
 
@@ -378,28 +377,88 @@ def test_name_key_is_documented_in_help_and_printed_in_the_summary(tmp_path):
     help_run = _run(["--help"])
     assert help_run.returncode == 0
     help_text = help_run.stdout
-    for fragment in ("casefold", "(?i)", r"\b", "class B"):
+    for fragment in ("casefold", "(?i)", r"\b", "class B", "one-sided"):
         assert fragment in help_text, (fragment, help_text)
 
     roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
     r = _run(["--roster", str(roster), "--b-names", str(bnames),
               "--out-dir", str(out)])
     assert r.returncode == 0, (r.stdout, r.stderr)
-    assert re.search(r"^name_key: .*casefold.*$", r.stdout, re.M), r.stdout
+    assert re.search(r"^name_key: .*one-sided.*casefold.*$", r.stdout, re.M), r.stdout
 
 
-def test_name_key_collapses_one_sided_boundaries():
-    """The rule as specified: a LEADING and a TRAILING \\b are each dropped.
+# ---------------------------------------------------------------------------
+# R4 fix -- \b is a wrapper only as a MATCHED PAIR; casefold only with (?i)
+# ---------------------------------------------------------------------------
 
-    This pins the fail-open shape flagged in the ambiguous-decision log: a
-    one-sided boundary names a prefix/suffix match, but its key equals the
-    bare name's key, so such a line is classified class B (report-only).
-    """
-    mod = _load_tool()
-    key = mod.name_key
-    assert key(r"\b" + A_ONE) == key(A_ONE)
-    assert key(A_ONE + r"\b") == key(A_ONE)
-    assert key(r"\b" + A_ONE + r"\b") == key(A_ONE)
-    assert key("(?i)" + A_ONE) == key(A_ONE)
-    # Casefold is part of the rule.
-    assert key(A_ONE.upper()) == key(A_ONE.lower())
+@pytest.mark.parametrize("roster_line", [r"\b" + B_ONE, B_ONE + r"\b"])
+def test_one_sided_boundary_is_class_a(tmp_path, roster_line):
+    """A one-sided \\b is a prefix/suffix match, a different pattern from the
+    bare name: it must stay class A (blocking)."""
+    roster, bnames, out = _scratch(tmp_path, [roster_line], [B_ONE])
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert re.search(r"^class_a: 1$", r.stdout, re.M), r.stdout
+    assert re.search(r"^class_b: 0$", r.stdout, re.M), r.stdout
+    assert (out / "roster-format2.txt").read_text(encoding="utf-8").startswith("A\t")
+
+
+@pytest.mark.parametrize("roster_line", [r"\b" + B_ONE + r"\b", B_ONE])
+def test_matched_pair_or_bare_name_is_class_b(tmp_path, roster_line):
+    """Both boundaries (a matched pair) or neither is the bare name: class B."""
+    roster, bnames, out = _scratch(tmp_path, [roster_line], [B_ONE])
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert re.search(r"^class_a: 0$", r.stdout, re.M), r.stdout
+    assert re.search(r"^class_b: 1$", r.stdout, re.M), r.stdout
+    assert (out / "roster-format2.txt").read_text(encoding="utf-8").startswith("B\t")
+
+
+def test_case_differing_without_inline_flag_is_class_a(tmp_path):
+    """Without (?i) the pattern is case-sensitive, so a case-distinct name is
+    not the permitted name: class A."""
+    roster, bnames, out = _scratch(
+        tmp_path, [r"\b" + A_ONE.upper() + r"\b"], [A_ONE]
+    )
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert re.search(r"^class_a: 1$", r.stdout, re.M), r.stdout
+    assert re.search(r"^class_b: 0$", r.stdout, re.M), r.stdout
+
+
+def test_case_differing_with_inline_flag_is_class_b(tmp_path):
+    """The same pattern with (?i) is case-insensitive: class B."""
+    roster, bnames, out = _scratch(
+        tmp_path, [r"(?i)\b" + A_ONE.upper() + r"\b"], [A_ONE]
+    )
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert re.search(r"^class_a: 0$", r.stdout, re.M), r.stdout
+    assert re.search(r"^class_b: 1$", r.stdout, re.M), r.stdout
+
+
+def test_class_a_no_boundary_refusal_says_it_will_not_rewrite_and_names_line(tmp_path):
+    """R5's refusal message must tell the operator the tool will NOT rewrite the
+    pattern, that the roster must declare the boundary itself, and which source
+    line to look at -- while keeping the parser's own reason."""
+    roster, bnames, out = _scratch(
+        tmp_path, ["# a comment", "(?i)" + A_ONE], ["YVNoMatch"]
+    )
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    # The parser's own reason is preserved.
+    assert "no declared boundary" in combined, combined
+    # The operator-facing guidance.
+    assert "will NOT rewrite" in combined, combined
+    assert "lookaround" in combined and "^/$" in combined, combined
+    assert "source roster line 2" in combined, combined
+    assert "line" in combined, combined
+    assert list(out.iterdir()) == []
+    assert A_ONE not in combined, combined   # R1: never echo the pattern
