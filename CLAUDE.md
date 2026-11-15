@@ -277,10 +277,9 @@ after a written conformance check); **fixes + non-substrate → the team merges
 after peer review**, and since 2026-10-22 the **project owner presses their own
 converged PR** under the policy's written *Owner merge* gate (Lei, in session: the
 colleague's recorded run on the exact head is the test gate; the owner's scratch
-merge on the current base and the base-SHA assertion stay; CI is the floor:
-`pr-checks` runs guards only). **A merge seat, not the owner, presses for a
-seat whose user has not granted merge clicks, and every security PR.**
-This gate is
+merge on the current base and the base-SHA assertion stay; CI is the floor).
+**A merge seat, not the owner, presses for a seat with no standing merge
+grant from its user, and every security PR.** This gate is
 **engram-only** — other repos (umwelt, soma) carry their own delegated
 authority. During an explicit Lei-absence day-grant, a settled substrate PR may
 be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
@@ -373,8 +372,8 @@ enters the maintainer's merge queue:
    reviewing itself.
    **Reset (v4):** a contributed tip is a NON-MERGE commit
    (`git log --no-merges --format='%an'`) whose git author is neither the PR
-   author nor that author's fairy (the PR body names its fairy commits),
-   landed after the PR's first review object
+   author nor that author's fairy (the PR body names fairy commits; if it
+   is silent, ask), landed after the PR's first review object
    (`gh pr view --json reviews,comments`); it resets the three-round count.
    Merge commits never count regardless of who clicked, the committer field never counts (every squash merge
    here reads `GitHub`), and the author's own fold of a peer finding never

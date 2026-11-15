@@ -290,14 +290,17 @@ umwelt and soma, per *Scope* and *Who presses the button* above):
   project owner goes to a merge seat for the press~~ — **the owner presses their own PR**
   once the record below is posted; the hand-off to a seat was clerical once the record
   existed, and the record is what any seat checks;
-- a seat whose **own user's authority table does not grant merge clicks** (as of
-  2026-11-14: Aleph and Clio, whose user has not granted it, and Zephyr, whose table
-  lists each merge as a per-action decision of their user; for these seats a merge
-  click is a destructive action outside this repo's delegation): that seat runs the
-  gate and posts the record; a merge seat presses. **The seat's own table governs,
-  not a list a merge seat posted and not the summary in CLAUDE.md:** check your table
-  before you press, and when a record reaches a merge seat, the seat asks whose click
-  it is.
+- a seat with **no standing merge grant from its own user** (as of 2026-11-14: Aleph
+  and Clio, whose user has not granted it, and Zephyr, whose table lists each merge as
+  a per-action decision of their user; for these seats a merge click is a destructive
+  action outside this repo's delegation): that seat runs the gate and posts the
+  record; a merge seat presses. Two questions are kept apart here. Whether the merge
+  is **authorised** is for the seat's own table and its user. **Whose click** it is, is
+  settled by this section: without a standing grant, a merge seat's, with one
+  exception: that user's own word for that PR, telling the seat to press, which the
+  seat quotes in the merge record with its time. A list a merge seat posted and the
+  summary in CLAUDE.md never settle either question; and when a record reaches a
+  merge seat, the seat asks whose click it is.
 
 **Nothing below widens the ⛔ list or touches the security read.** An owner never
 merges a ⛔-list (substrate-concept) PR: it goes to Lei first, or, when it implements a
@@ -327,7 +330,12 @@ seat can run it and any other seat can check that it ran.
    Converged means one of three, and the merge comment states which: the round
    returned APPROVE; or it returned COMMENT with zero blockers and every actionable
    suggestion either folded (commit named, from 2026-11-04) or answered in writing on the PR; or the
-   three-round cap was reached with the open findings listed in the PR body. A
+   three-round cap was reached with the open findings listed in the PR body. The PR body
+   also names which of its commits a fairy made (or says none): the cap's reset test
+   reads the git author, and a fairy's commit under another name would otherwise read
+   as a contributor's and reset the count. When the body is silent, the merge seat
+   asks the author; an unfamiliar commit author is not read as a contributed tip
+   without that answer. A
    COMMENT round with an actionable suggestion neither folded nor answered is NOT
    converged, whatever its blocker count. *(Kepler, 2026-11-04, after two seats read
    this item and CLAUDE.md's merge-seat check differently. Ground: the reviewer-fairy
