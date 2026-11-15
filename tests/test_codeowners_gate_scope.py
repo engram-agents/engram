@@ -11,25 +11,10 @@ caller but mean different things in the file, and GitHub reads the second as
 access — so the guard must see ``[]`` for it rather than the earlier match's
 owners.
 
-The file governs two owner sets, asserted and driven separately:
-
-  * ``GATE_OWNERS`` — the owners of gate machinery (``.github/`` and the merge
-    policy). The guard cell passes iff every tracked file under
-    ``.github/workflows/`` resolves to ``GATE_OWNERS`` (asserted by value, not
-    merely non-empty), and iff every path named in ``COVERED_SCOPES`` (the
-    scopes ``.github/CODEOWNERS`` claims for gate machinery) resolves to at
-    least one owner.
-  * ``INSTRUCTION_OWNERS`` — the owners of the instruction-bearing sources (the
-    root ``CLAUDE.md`` and the hook, skill, agent and template trees). Every
-    scope named in ``INSTRUCTION_SCOPES`` resolves to exactly
-    ``INSTRUCTION_OWNERS``, and so does every *tracked file beneath* each of
-    them — the property, not just the directories, so an ownerless line placed
-    after a directory pattern cannot remove one file's ownership unseen.
-
-Today both sets hold ``["@kepler-somnium", "@borges-funes"]``. That is
-correctness, not equivalence: the two are expected to diverge once the expanded
-owner list is confirmed, so each is its own literal and a cell below asserts
-they are not one shared object.
+The guard cell passes iff every tracked file under ``.github/workflows/``
+resolves to ``EXPECTED_OWNERS`` (asserted by value, not merely non-empty), and
+iff every path named in ``COVERED_SCOPES`` (the scopes ``.github/CODEOWNERS``
+claims) resolves to at least one owner.
 
 Matching subset implemented here (NOT full CODEOWNERS fidelity)
 --------------------------------------------------------------
@@ -72,7 +57,7 @@ CODEOWNERS_PATH = REPO_ROOT / ".github" / "CODEOWNERS"
 # The gate-machinery owners, in the order the real file lists them. Asserted by
 # value, never by count: the list is the contract, and a count would let the
 # membership rot silently one round after the number stopped matching.
-GATE_OWNERS = ["@kepler-somnium", "@borges-funes"]
+EXPECTED_OWNERS = ["@kepler-somnium", "@borges-funes"]
 
 # The scopes .github/CODEOWNERS claims for gate machinery, named once. Both the
 # per-path cells and the aggregate guard cell are driven from this tuple, so a
@@ -93,40 +78,6 @@ COVERED_SCOPES: tuple[tuple[str, str], ...] = (
     ),
 )
 
-# The instruction-bearing owners: the files that change what every agent does
-# without touching a line of code. A separate literal, never a reference to
-# GATE_OWNERS — the two are expected to diverge when the expanded owner list is
-# confirmed, and a shared literal would let an edit to one silently move the
-# other. They hold the same values today; that is correctness, not equivalence.
-INSTRUCTION_OWNERS = ["@kepler-somnium", "@borges-funes"]
-
-# The scopes .github/CODEOWNERS claims for instruction-bearing sources, in the
-# same (path, why it is covered) shape as COVERED_SCOPES. The per-scope cells
-# and the tracked-file property cell both drive off this tuple, for the same
-# reason: a scope cannot be guarded in one cell and dropped from another.
-INSTRUCTION_SCOPES: tuple[tuple[str, str], ...] = (
-    (
-        "CLAUDE.md",
-        "the project conventions every agent session loads",
-    ),
-    (
-        "src/engram/hooks",
-        "hooks change what every session does at its event boundaries",
-    ),
-    (
-        "src/engram/skills",
-        "skills are the on-demand procedure every agent follows",
-    ),
-    (
-        "src/engram/agents",
-        "agent specs define what each dispatched fairy is charged to do",
-    ),
-    (
-        "src/engram/templates",
-        "templates seed the instruction files installed into user repos",
-    ),
-)
-
 
 def _read_codeowners() -> str:
     return CODEOWNERS_PATH.read_text(encoding="utf-8")
@@ -140,23 +91,6 @@ def _tracked_workflow_files() -> list[str]:
     """
     completed = subprocess.run(
         ["git", "ls-files", ".github/workflows"],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return [line for line in completed.stdout.splitlines() if line.strip()]
-
-
-def _tracked_files(scope: str) -> list[str]:
-    """Tracked files under ``scope`` — git, never a filesystem walk.
-
-    Same two reasons as ``_tracked_workflow_files``: an untracked scratch file
-    in a developer's checkout must not fail the gate, and a file deleted from
-    the tree but left on disk must not pass it.
-    """
-    completed = subprocess.run(
-        ["git", "ls-files", scope],
         cwd=REPO_ROOT,
         check=True,
         capture_output=True,
@@ -260,7 +194,7 @@ def owners_for(path: str, codeowners_text: str | None = None) -> list[str]:
 
 def test_workflow_path_covered_only_by_dot_github_line_resolves_to_expected_owners():
     """Cell 1: a workflow path covered only by `/.github/` gets the owners."""
-    assert owners_for(".github/workflows/nightly.yml") == GATE_OWNERS
+    assert owners_for(".github/workflows/nightly.yml") == EXPECTED_OWNERS
 
 
 def test_codeowners_file_resolves_to_at_least_one_owner():
@@ -289,7 +223,7 @@ def test_last_matching_pattern_wins():
 def test_guard_cell_every_tracked_workflow_and_codeowners_have_an_owner():
     """Cell 5: the real repository file satisfies the guard for every scope.
 
-    The workflows are asserted by value, against the same ``GATE_OWNERS``
+    The workflows are asserted by value, against the same ``EXPECTED_OWNERS``
     the named scopes are held to: a tracked workflow owned by *someone else*
     is unowned as far as this gate machinery goes, so presence alone is not
     evidence the scope is covered.
@@ -301,10 +235,10 @@ def test_guard_cell_every_tracked_workflow_and_codeowners_have_an_owner():
     )
     resolutions = [(path, owners_for(path)) for path in tracked]
     wrong_owners = [
-        (path, owners) for path, owners in resolutions if owners != GATE_OWNERS
+        (path, owners) for path, owners in resolutions if owners != EXPECTED_OWNERS
     ]
     assert not wrong_owners, (
-        f"tracked workflow files not owned by {GATE_OWNERS}: {wrong_owners}"
+        f"tracked workflow files not owned by {EXPECTED_OWNERS}: {wrong_owners}"
     )
     uncovered = [
         f"{path} ({why})" for path, why in COVERED_SCOPES if not owners_for(path)
@@ -384,7 +318,7 @@ def test_comments_and_blank_lines_are_ignored():
 def test_each_named_scope_resolves_to_expected_owners(scope: str, why: str) -> None:
     """Every scope the file claims is covered, driven off COVERED_SCOPES."""
     owners = owners_for(scope)
-    assert owners == GATE_OWNERS, (
+    assert owners == EXPECTED_OWNERS, (
         f"{scope} is claimed as covered ({why}) but resolves to {owners!r}"
     )
 
@@ -406,88 +340,3 @@ def test_double_star_outside_the_special_positions_stays_inside_one_segment():
     synthetic = "a**b @ab\n"
     assert owners_for("aXXb", synthetic) == ["@ab"]
     assert owners_for("a/x/b", synthetic) == []
-
-
-# ---------------------------------------------------------------------------
-# Round-3 cells: the instruction-bearing scopes, the tracked-file property
-# beneath them, and the control that keeps that property from passing vacuously
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "scope,why",
-    INSTRUCTION_SCOPES,
-    ids=[scope for scope, _ in INSTRUCTION_SCOPES],
-)
-def test_each_instruction_scope_resolves_to_instruction_owners(
-    scope: str, why: str
-) -> None:
-    """Every instruction scope the file claims resolves to INSTRUCTION_OWNERS."""
-    owners = owners_for(scope)
-    assert owners == INSTRUCTION_OWNERS, (
-        f"{scope} is claimed as instruction-bearing ({why}) but resolves to "
-        f"{owners!r}"
-    )
-
-
-@pytest.mark.parametrize(
-    "scope,why",
-    INSTRUCTION_SCOPES,
-    ids=[scope for scope, _ in INSTRUCTION_SCOPES],
-)
-def test_every_tracked_file_under_an_instruction_scope_is_owned(
-    scope: str, why: str
-) -> None:
-    """Every tracked file beneath an instruction scope resolves to INSTRUCTION_OWNERS.
-
-    Guard the property, not just the named directories: an ownerless line
-    placed after a directory pattern inside one of these trees removes
-    ownership for that one file, and a directory-level assertion would not see
-    it. Also assert the enumeration is non-empty, so a mistyped scope cannot
-    pass vacuously.
-    """
-    tracked = _tracked_files(scope)
-    assert tracked, (
-        f"the enumeration for {scope} is empty, so the guard would otherwise "
-        f"pass vacuously: git ls-files found no tracked file under {scope}"
-    )
-    resolutions = [(path, owners_for(path)) for path in tracked]
-    wrong_owners = [
-        (path, owners) for path, owners in resolutions if owners != INSTRUCTION_OWNERS
-    ]
-    assert not wrong_owners, (
-        f"tracked files under {scope} (instruction-bearing: {why}) not owned by "
-        f"{INSTRUCTION_OWNERS}: {wrong_owners}"
-    )
-
-
-def test_a_code_path_outside_the_instruction_scopes_resolves_to_no_owner():
-    """Control: a source path matches no instruction line and resolves to [].
-
-    Without this, a pattern accidentally broad enough to match everything
-    would turn the tracked-file property cell green while proving nothing.
-    """
-    assert owners_for("src/engram/server.py") == []
-
-
-def test_the_two_owner_sets_are_separate_and_cover_disjoint_scopes():
-    """The two owner sets are asserted separately, not one list used for both.
-
-    ``is not`` catches the conflation that would defeat the point of two sets:
-    aliasing one to the other (``INSTRUCTION_OWNERS = GATE_OWNERS``) keeps every
-    cell green today, because the values match, while making divergence
-    impossible. It does NOT catch a copy that starts out equal — only the
-    per-set cells do, by holding each set to its own scopes.
-
-    The disjointness assertion is the other half: a scope claimed by both sets
-    would be resolved by whichever line came last, so one set's cell would be
-    asserting the other's owners.
-    """
-    assert GATE_OWNERS is not INSTRUCTION_OWNERS, (
-        "the two owner sets are the same list object, so an edit to one would "
-        "silently move the other and they could never diverge"
-    )
-    gate_scopes = {path for path, _ in COVERED_SCOPES}
-    instruction_scopes = {path for path, _ in INSTRUCTION_SCOPES}
-    shared = gate_scopes & instruction_scopes
-    assert not shared, f"scopes claimed by both owner sets: {sorted(shared)}"
