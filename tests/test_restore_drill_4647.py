@@ -23,6 +23,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -251,7 +252,8 @@ def test_d3b_the_classification_table_is_pinned():
         ("edges", "source_id"): wo, ("edges", "target_id"): wo, ("edges", "relation"): wo,
         ("edit_history", "details"): wo, ("diagnostic_history", "metrics"): mu, ("diagnostic_history", "timestamp"): wo, ("tool_timing", "duration_ms"): wo,
         ("focus_state", "active_set_name"): mu, ("sequences", "last_num"): mu,
-        ("edges", "metadata"): rd.UNCLASSIFIED, ("nodes", "trust_tier"): rd.UNCLASSIFIED,
+        ("edges", "metadata"): rd.UNCLASSIFIED, ("nodes", "trust_tier"): rd.AUDIT_GATED,
+        ("nodes", "source_type"): rd.AUDIT_GATED,
         ("a_table_nobody_ruled_on", "any"): rd.UNCLASSIFIED,
     }
     for (t, c), want in pinned.items():
@@ -266,7 +268,9 @@ def test_d3b_every_real_nodes_column_is_classified_or_listed(home, tmp_path):
     assert set(c[rd.WRITE_ONCE]) >= {"claim", "quoted_text", "id", "type", "created_at"}
     assert set(c[rd.MUTABLE]) >= {"recall_count", "importance_score", "utility_score", "memory_status"}
     assert "claim" not in c[rd.UNCLASSIFIED] and "recall_count" not in c[rd.UNCLASSIFIED]
-    assert {"trust_tier", "standpoint_author_id", "source_type"} <= set(c[rd.UNCLASSIFIED])
+    assert {"standpoint_author_id"} <= set(c[rd.UNCLASSIFIED])
+    assert {"trust_tier", "source_type"} <= set(c[rd.AUDIT_GATED])
+    assert not {"trust_tier", "source_type"} & set(c[rd.UNCLASSIFIED])
 
 
 # ---------------------------------------------------------------- D4
@@ -1218,3 +1222,320 @@ def test_d15_the_child_env_is_an_allowlist_and_offline_flags_are_for_the_embed_s
     for k in ("HF_HOME", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
         assert k not in connect, k
     assert connect["ENGRAM_NO_EMBEDDINGS"] == "1" and "ENGRAM_NO_EMBEDDINGS" not in embed
+
+
+# ---------------------------------------------------------------- D17 skip an unchanged dump (round 4, fold 1)
+# The marker makes every dump differ by one line. Both commit paths skip a commit by the git status of
+# knowledge.sql, so an unchanged graph must keep the OLD file (old marker, old bytes): the old content is still
+# true from the old marker time on. The paths are run for real, in a subprocess whose home is a throwaway repo.
+
+_COMMIT_SCRIPT = r"""
+import json, sqlite3, sys
+import engram_core as core
+home = core.DATA_DIR
+if sys.argv[1] == "worker":
+    import engram_snapshot_worker as w
+    snap = home / "captured.db"
+    if snap.exists():
+        snap.unlink()
+    s = sqlite3.connect(str(home / "knowledge.db")); d = sqlite3.connect(str(snap)); s.backup(d); d.close(); s.close()
+    w._regenerate_derived_files(snap)
+    res = w._commit_snapshot_files("nap", "m")
+else:
+    conn = core._get_db()
+    res = core._commit_snapshot_sync(conn, "m", "nap")
+    conn.close()
+print("RESULT " + json.dumps({"committed": res.get("git_committed"), "reason": res.get("reason")}))
+"""
+
+
+def _commit_env(home):
+    return {**_clean_env(home), **_GIT_ENV, "GIT_TERMINAL_PROMPT": "0"}
+
+
+def _result_line(p):
+    assert p.returncode == 0, p.stderr[-2000:]
+    return json.loads([ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")][-1][7:])
+
+
+def run_commit(home, which):
+    p = subprocess.run([sys.executable, "-c", _COMMIT_SCRIPT, which], env=_commit_env(home), capture_output=True,
+                       text=True, timeout=300)
+    return _result_line(p)
+
+
+def _git_out(home, *args):
+    return subprocess.run(["git", "-C", str(home), *args], capture_output=True, text=True).stdout.strip()
+
+
+def sql_commits(home) -> int:
+    p = subprocess.run(["git", "-C", str(home), "rev-list", "--count", "HEAD", "--", "knowledge.sql"],
+                       capture_output=True, text=True)
+    return int(p.stdout.strip()) if p.returncode == 0 else 0
+
+
+def marker_of(data: bytes) -> str:
+    first = data.decode("utf-8").splitlines()[0]
+    assert first.startswith(_MARKER_LINE), first
+    return first.split(":", 1)[1].strip()
+
+
+@pytest.mark.parametrize("which", ["worker", "sync"])
+def test_d17_an_unchanged_graph_makes_no_new_commit_and_keeps_the_old_file(home, which):
+    _git(home, "init", "-q")
+    first = run_commit(home, which)
+    assert first["committed"] is True, first
+    assert sql_commits(home) == 1
+    before = (home / "knowledge.sql").read_bytes()
+    time.sleep(0.02)
+    again = run_commit(home, which)  # the same graph: its dump differs from the committed one by the marker only
+    assert sql_commits(home) == 1, "an unchanged graph made a new knowledge.sql commit"
+    assert (home / "knowledge.sql").read_bytes() == before, "the old file (old marker) was not kept"
+    assert _git_out(home, "status", "--porcelain", "--", "knowledge.sql") == ""
+    # a changed graph commits, and the new dump carries the new marker
+    live_exec(home, "UPDATE nodes SET claim = 'a claim that changed' WHERE id = 'ob_0003'")
+    time.sleep(0.02)
+    changed = run_commit(home, which)
+    assert sql_commits(home) == 2, (again, changed)
+    after = (home / "knowledge.sql").read_bytes()
+    assert b"a claim that changed" in after
+    assert marker_of(after) > marker_of(before)
+
+
+def test_d17_a_dump_that_differs_only_in_the_marker_is_unchanged(tmp_path):
+    bk = rd.engram_backup
+    body = b"BEGIN TRANSACTION;\nINSERT INTO t VALUES(1);\nCOMMIT;\nPRAGMA user_version = 3;\n"
+    old = b"-- engram-dumped-at: 2026-01-01T00:00:00.000000Z\n" + body
+    new = tmp_path / "new.sql"
+    new.write_bytes(b"-- engram-dumped-at: 2026-02-02T00:00:00.000000Z\n" + body)
+    assert bk.dump_matches_committed(new, old) is True
+    (tmp_path / "old.sql").write_bytes(old)
+    assert bk.dump_matches_committed(str(new), tmp_path / "old.sql") is True  # an old file by path
+    assert bk.dump_matches_committed(new, body) is True  # an older committed dump with no marker at all
+    new.write_bytes(b"-- engram-dumped-at: 2026-02-02T00:00:00.000000Z\n" + body.replace(b"VALUES(1)", b"VALUES(2)"))
+    assert bk.dump_matches_committed(new, old) is False  # any other change is a change
+    # only the FIRST line is the marker: the same text deeper in the file is content
+    new.write_bytes(b"-- engram-dumped-at: 2026-02-02T00:00:00.000000Z\n" + body + b"-- engram-dumped-at: x\n")
+    assert bk.dump_matches_committed(new, old) is False
+    assert bk.dump_matches_committed(new, None) is False
+    assert bk.dump_matches_committed(tmp_path / "absent.sql", old) is False
+
+
+# ---------------------------------------------------------------- D18 the marker is the CAPTURE time (fold 2)
+
+T_CAPTURE = "2026-06-01T00:00:00.000000Z"
+T_LIVE_RETRACT = "2026-06-01T00:00:01+00:00"  # live, after the capture, before any real dump time
+
+
+def _captured_then_retracted(tmp_path, name):
+    h = make_home(tmp_path, name)
+    cap = h / "captured.db"
+    src = sqlite3.connect(h / "knowledge.db")
+    dst = sqlite3.connect(cap)
+    src.backup(dst)
+    dst.close()
+    src.close()
+    live_exec(h, *retract_sql(T_LIVE_RETRACT))
+    _edit(h, "retracted", "ob_0001", T_LIVE_RETRACT)
+    return h, cap
+
+
+def test_d18_a_dump_stamped_with_the_capture_time_passes_where_the_dump_time_failed(tmp_path):
+    h, cap = _captured_then_retracted(tmp_path, "h")
+    bk = rd.engram_backup
+    bk.dump_stripped(str(cap), str(h / "knowledge.sql"))  # the old behaviour: stamped now, after the retract
+    rep = drill(h, tmp_path / "s1")
+    assert rep.exit_code == 1 and _hits(rep, "ob_0001", "column status", "before the dump time"), rep.failures
+    stats = bk.dump_stripped(str(cap), str(h / "knowledge.sql"), dumped_at=T_CAPTURE)
+    assert stats["dumped_at"] == T_CAPTURE
+    assert (h / "knowledge.sql").read_text(encoding="utf-8").splitlines()[0] == f"{_MARKER_LINE} {T_CAPTURE}"
+    rep = drill(h, tmp_path / "s2")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "status")["passed"] == 1 and rep.dump_time_source == "marker"
+
+
+@pytest.mark.parametrize("bad", ["", "yesterday", "2026-06-01", "2026-06-01T00:00:00.000000Z\nDROP TABLE nodes;",
+                                 "2026-06-01 00:00:00", 5])
+def test_d18_a_malformed_capture_time_is_refused_and_the_target_is_left_alone(home, bad):
+    before = (home / "knowledge.sql").read_bytes()
+    with pytest.raises((ValueError, TypeError)):
+        rd.engram_backup.dump_stripped(str(home / "knowledge.db"), str(home / "knowledge.sql"), dumped_at=bad)
+    assert (home / "knowledge.sql").read_bytes() == before
+    assert not [p for p in home.iterdir() if p.name.startswith((".engram-sql-", ".engram-bk-"))]
+
+
+_CAPTURE_SCRIPT = r"""
+import json, sqlite3, time
+import engram_core as core
+import engram_snapshot_worker as w
+w.start_worker = lambda: None            # no thread: the job stays pending until the drain below
+conn = core._get_db()
+assert core._commit_snapshot_async(conn, "m", "nap", False) is not None   # captures, enqueues
+time.sleep(0.05)
+stamp = core._now()                      # a live change AFTER the capture, with its audit row
+conn.execute("UPDATE nodes SET status='retracted', is_current=0, metadata=? WHERE id='ob_0001'",
+             (json.dumps({"retracted": True, "error_type": "wrong", "retraction_reason": "r", "retracted_at": stamp}),))
+conn.execute("INSERT INTO edit_history(timestamp,turn,action,node_id,node_type,details) VALUES(?,?,?,?,?,?)",
+             (stamp, 1, "retracted", "ob_0001", "observation", "{}"))
+conn.commit()
+time.sleep(0.05)
+w._drain_pending()                       # the worker dumps the captured copy, later than the capture
+print("RESULT " + json.dumps({"retracted_at": stamp}))
+"""
+
+
+def test_d18_the_snapshot_worker_stamps_the_capture_time_not_the_dump_time(home, tmp_path):
+    _git(home, "init", "-q")
+    p = subprocess.run([sys.executable, "-c", _CAPTURE_SCRIPT], env=_commit_env(home), capture_output=True,
+                       text=True, timeout=300)
+    stamp = _result_line(p)["retracted_at"]
+    marker = rd._parse_time((home / "knowledge.sql").read_text(encoding="utf-8").splitlines()[0].split(":", 1)[1].strip())
+    assert marker < rd._parse_time(stamp), "the marker is not earlier than a change made after the capture"
+    rep = drill(home, tmp_path / "s")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "status")["passed"] == 1 and rep.dump_time_source == "marker"
+
+
+# ---------------------------------------------------------------- D19 trust_tier and source_type are audit-gated (fold 3)
+
+def _col_pair(tmp_path, name, col, dump_value, live_value):
+    h = make_home(tmp_path, name)
+    live_exec(h, f"UPDATE nodes SET {col} = ? WHERE id = 'ob_0001'", (dump_value,))
+    dump(h)
+    mark_dump(h)
+    live_exec(h, f"UPDATE nodes SET {col} = ? WHERE id = 'ob_0001'", (live_value,))
+    return h
+
+
+def test_d19_the_table_names_each_gated_column_and_key():
+    t = rd.AUDIT_GATED_COLUMNS
+    assert {("nodes", "trust_tier"), ("nodes", "source_type"), ("nodes.metadata", "trust_tier")} <= set(t)
+    assert "trust_tier_set" in t[("nodes", "trust_tier")]["actions"]
+    assert "self_anchor_transferred" in t[("nodes", "trust_tier")]["actions"]
+
+
+@pytest.mark.parametrize("action", ["trust_tier_set", "self_anchor_transferred"])
+def test_d19_trust_tier_changed_with_an_audit_row_after_the_dump_passes(tmp_path, action):
+    h = _col_pair(tmp_path, "h", "trust_tier", "unknown", "our_side")
+    _edit(h, action, "ob_0001", T_AFTER)
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 0, rep.failures
+    assert lc(rep, "trust_tier")["passed"] == 1
+
+
+def test_d19_trust_tier_changed_without_a_row_fails_naming_table_key_column(tmp_path):
+    h = _col_pair(tmp_path, "h", "trust_tier", "unknown", "our_side")
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 1
+    assert lc(rep, "trust_tier")["failed_no_record"] == 1
+    assert _hits(rep, "nodes", "id='ob_0001'", "column trust_tier", "no audit record")
+
+
+def test_d19_a_row_before_the_dump_or_for_another_action_does_not_explain_trust_tier(tmp_path):
+    h = _col_pair(tmp_path, "h", "trust_tier", "unknown", "our_side")
+    _edit(h, "trust_tier_set", "ob_0001", T_BEFORE)
+    assert _hits(drill(h, tmp_path / "s"), "column trust_tier", "before the dump")
+    h2 = _col_pair(tmp_path, "h2", "trust_tier", "unknown", "our_side")
+    _edit(h2, "retracted", "ob_0001", T_AFTER)  # a row for the node, but not a trust-tier move
+    assert _hits(drill(h2, tmp_path / "s2"), "column trust_tier", "no audit record")
+
+
+def test_d19_the_trust_tier_metadata_key_follows_the_same_rule(home, tmp_path):
+    _meta_both(home, {"trust_tier": "unknown"}, {"trust_tier": "our_side"})
+    rep = drill(home, tmp_path / "s")
+    assert rep.exit_code == 1
+    assert "trust_tier" not in rep.metadata_unknown
+    assert _hits(rep, "nodes", "ob_0001", "metadata", "trust_tier", "no audit record")
+    _edit(home, "trust_tier_set", "ob_0001", T_AFTER)
+    rep2 = drill(home, tmp_path / "s2")
+    assert rep2.exit_code == 0, rep2.failures
+    assert lc(rep2, "metadata.trust_tier")["passed"] == 1
+
+
+def test_d19_source_type_changed_needs_an_audit_row_after_the_dump(tmp_path):
+    h = _col_pair(tmp_path, "h", "source_type", None, "web")
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 1
+    assert _hits(rep, "nodes", "id='ob_0001'", "column source_type", "no audit record")
+    _edit(h, "surgical_field_patch", "ob_0001", T_AFTER, json.dumps({"field": "source_type"}))
+    rep2 = drill(h, tmp_path / "s2")
+    assert rep2.exit_code == 0, rep2.failures
+    assert lc(rep2, "source_type")["passed"] == 1
+
+
+def test_d19_the_known_gaps_name_the_two_new_no_audit_writers_by_function():
+    gaps = " ".join(rd.NO_AUDIT_WRITERS)
+    assert "_run_db_one_time_setup" in gaps and "_backfill_source_type" in gaps
+    assert "_backfill_resolved_by" in gaps and "_resolve_impl" in gaps
+
+
+# ---------------------------------------------------------------- D20 failure text (fold 4)
+
+def test_d20_a_failing_quoted_text_message_prints_neither_text_but_its_type_and_length(tmp_path):
+    h = make_home(tmp_path, "h")
+    live_exec(h, "UPDATE nodes SET quoted_text = ? WHERE id = 'ob_0001'", ("the dumped secret quote text",))
+    dump(h)
+    mark_dump(h)
+    live_exec(h, "UPDATE nodes SET quoted_text = ? WHERE id = 'ob_0001'", ("a live quote that differs",))
+    rep = drill(h, tmp_path / "s")
+    assert rep.exit_code == 1
+    hit = _hits(rep, "ob_0001", "column quoted_text")
+    assert hit
+    text = " ".join(rep.failures) + rd.format_report(rep)
+    assert "secret quote" not in text and "live quote that" not in text
+    assert "str" in hit[0] and str(len("the dumped secret quote text")) in hit[0] and str(len("a live quote that differs")) in hit[0]
+    assert "differ in length" in hit[0]
+
+
+def test_d20_metadata_failures_print_the_key_and_the_value_shape_never_the_value(home, tmp_path):
+    _meta_both(home, {"birthday": "1990-04-02", "made_up_key_zz": "alpha-secret"},
+               {"birthday": "1991-05-03", "made_up_key_zz": "omega-secret"})
+    rep = drill(home, tmp_path / "s")
+    assert rep.exit_code == 1
+    text = " ".join(rep.failures)
+    assert _hits(rep, "ob_0001", "metadata key birthday") and _hits(rep, "ob_0001", "metadata key made_up_key_zz")
+    for leaked in ("1990", "1991", "alpha-secret", "omega-secret"):
+        assert leaked not in text, leaked
+    hit = _hits(rep, "metadata key birthday")[0]
+    assert "str" in hit and "10" in hit and "same length" in hit
+
+
+def test_d20_a_withdrawal_stamp_that_changed_does_not_print_the_reason_text(home, tmp_path):
+    _meta_both(home, {"retracted": True, "retraction_reason": "the private reason"},
+               {"retracted": True, "retraction_reason": "another private reason"})
+    rep = drill(home, tmp_path / "s")
+    assert rep.exit_code == 1
+    assert "private reason" not in " ".join(rep.failures)
+    assert _hits(rep, "metadata key retraction_reason")
+
+
+def test_d20_known_gap_strings_name_the_function_and_carry_no_source_line_numbers(home, tmp_path):
+    import re
+    for gap in rd.NO_AUDIT_WRITERS:
+        assert not re.search(r"\.py:\d+", gap), gap
+    mark_dump(home)
+    live_exec(home, "UPDATE nodes SET resolved_by='ob_0002' WHERE id='ob_0001'")
+    rep = drill(home, tmp_path / "s")
+    assert not re.search(r"\.py:\d+", " ".join(rep.failures) + rd.format_report(rep))
+
+
+def test_d20_a_resolved_by_failure_with_no_audit_row_names_the_two_no_audit_writers(home, tmp_path):
+    mark_dump(home)
+    live_exec(home, "UPDATE nodes SET resolved_by='ob_0002' WHERE id='ob_0001'")
+    hit = _hits(drill(home, tmp_path / "s"), "column resolved_by", "no audit record")
+    assert hit and "possible cause" in hit[0]
+    assert "_backfill_resolved_by" in hit[0] and "_resolve_impl" in hit[0]
+
+
+def test_d20_a_status_failure_on_the_resolve_path_with_no_audit_row_names_them_too(tmp_path):
+    h = make_home(tmp_path, "h")
+    _dump_with(h, "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'")
+    live_exec(h, "UPDATE nodes SET status='open', resolved_by=NULL WHERE id='ob_0001'")  # no audit row at all
+    hit = _hits(drill(h, tmp_path / "s"), "column status", "no audit record")
+    assert hit and "_backfill_resolved_by" in hit[0] and "_resolve_impl" in hit[0]
+    # a retraction is not the resolve path: its message does not carry the hint
+    h2 = make_home(tmp_path, "h2")
+    mark_dump(h2)
+    live_exec(h2, *retract_sql(None))
+    hit2 = _hits(drill(h2, tmp_path / "s2"), "column status", "no audit record")
+    assert hit2 and "_backfill_resolved_by" not in hit2[0]
