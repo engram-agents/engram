@@ -649,3 +649,53 @@ def test_c18_tier_entry_is_essential_like_recall_summaries():
     assert found.get("engram_embedding_publish.py") == ["essential"]
     assert found.get("engram_recall_summaries.py") == ["essential"]
     assert (PROJECT_ROOT / "src" / "engram" / "engram_embedding_publish.py").is_file()
+
+
+# ---- A1 delta cells (verifier survivors) ---------------------------------
+# -------------------------------------------------------------------- D1
+def test_d1_integer_valued_vector_is_a_valid_prepared_vector(ctx):
+    for vector in ([1] * 384, [1, 2.5] * 192):
+        nid = ctx.node("d1 claim", seed=OLD)
+        result = ctx.publish(nid, ctx.prep(nid, vector=vector))
+        assert result.status == "refreshed" and result.reason is None, result
+        snap = ctx.snap(nid)
+        assert snap[0][0] == json.dumps(vector)
+        assert snap[0][0].startswith("[1, ")
+        assert snap[1] == ctx.fvec(vector)
+
+
+# -------------------------------------------------------------------- D2
+def test_d2_vec_backend_flag_off_with_a_real_vec_table_is_pending_mirror(ctx):
+    nid = ctx.node("d2 claim", seed=OLD, metadata=json.dumps({"keep": "k"}))
+    prepared = ctx.prep(nid)
+    before = ctx.snap(nid)
+    ctx.mp.setattr(ctx.core, "_VEC_BACKEND_AVAILABLE", False)
+    result = ctx.publish(nid, prepared)
+    # Restore the flag before reading back: snap() opens a connection, and a
+    # connection opened with the flag off cannot load the vec0 module.
+    ctx.mp.setattr(ctx.core, "_VEC_BACKEND_AVAILABLE", True)
+    assert result.status == "pending" and result.reason == "mirror", result
+    assert result.vector_changed is None
+    after = ctx.snap(nid)
+    assert after[0][0] == before[0][0] and after[1] == before[1]
+    meta = ctx.marker(nid)
+    assert meta["keep"] == "k" and meta[MARKER]["reason"] == "mirror"
+
+
+# -------------------------------------------------------------------- D3
+def test_d3_a_raising_store_step_is_reported_not_propagated(ctx):
+    nid = ctx.node("d3 claim", seed=OLD, metadata=json.dumps({"keep": "k"}))
+    prepared = ctx.prep(nid)
+    before = ctx.snap(nid)
+
+    def store(_conn, _node_id, _vector):
+        raise RuntimeError("boom")
+
+    ctx.mp.setattr(ctx.core, "_store_embedding_vector", store)
+    result = ctx.publish(nid, prepared)
+    assert result.status == "pending" and result.reason == "embedding", result
+    assert result.vector_changed is None
+    after = ctx.snap(nid)
+    assert after[0][0] == before[0][0] and after[1] == before[1]
+    meta = ctx.marker(nid)
+    assert meta["keep"] == "k" and meta[MARKER]["reason"] == "embedding"
