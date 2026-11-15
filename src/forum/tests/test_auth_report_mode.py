@@ -866,3 +866,199 @@ def test_a_unit_started_without_the_flag_fails_to_start(owned_tmp):
                        capture_output=True, text=True, timeout=60)
     assert p.returncode == 78, (p.stdout, p.stderr)
     assert not (owned_tmp / "svc").exists()
+
+
+# ---- delta 1: tokenless reads, the PATCH verb, header shapes, path-named writes ----
+
+def _mk_thread(app, who="bob"):
+    r = _post(app.test_client(), body={**POST_BODY, "agent": who}, headers=_auth(_issue(app, who)))
+    assert r.status_code in (200, 201), r.get_data(as_text=True)
+
+
+def _mk_batons(app):
+    c = app.test_client()
+    tok = _issue(app, "bob")
+    for pid, turn, parts in (("pool-a", "alice", ["alice", "bob"]), ("pool-b", "bob", ["bob", "carol"])):
+        r = c.post("/api/projects", headers=_auth(tok), json={
+            "agent": "bob", "project_id": pid, "title": "x", "status": "in-progress",
+            "turn": turn, "participants": parts, "turn_reason": "r"})
+        assert r.status_code == 201, r.get_data(as_text=True)
+
+
+def _setup_thread_read(app):
+    _mk_thread(app)
+    conn = sqlite3.connect(app.config["DB_PATH"])
+    try:
+        db.mark_thread_read(conn, db.upsert_agent(conn, "alice"), 1, 1)
+    finally:
+        conn.close()
+
+
+def _obs_agent_row(app, r):
+    assert r.status_code == 200, r.get_data(as_text=True)
+    return _agent_row(app, "alice") is not None
+
+
+def _obs_watermark(app, r):
+    assert r.status_code == 200, r.get_data(as_text=True)
+    return r.get_json()["thread"]["last_read_post_id"]
+
+
+def _obs_registered(app, r):
+    assert r.status_code == 200, r.get_data(as_text=True)
+    return r.get_json()["registered"]
+
+
+def _obs_board_updates(app, r):
+    assert r.status_code == 200, r.get_data(as_text=True)
+    return sorted(u["project"] for u in r.get_json()["updates"])
+
+
+def _obs_projects(app, r):
+    assert r.status_code == 200, r.get_data(as_text=True)
+    return sorted(p["project_id"] for p in r.get_json()["projects"])
+
+
+# (id, route, setup, observable): the observable that differs between a named and an
+# un-named caller of that handler (the six readers of g.names_identity).
+_D1 = [
+    ("threads", "/api/threads", None, _obs_agent_row),
+    ("thread", "/api/thread/1", _setup_thread_read, _obs_watermark),
+    ("agents-online", "/api/agents/online", None, _obs_registered),
+    ("agents-board", "/api/agents/board", None, _obs_registered),
+    ("board-updates", "/api/board/updates", _mk_batons, _obs_board_updates),
+    ("projects", "/api/projects", _mk_batons, _obs_projects),
+]
+
+
+def _d1_call(tmp, route, setup, obs, how):
+    app = _make_app(tmp)
+    if setup:
+        setup(app)
+    headers = _auth(_issue(app, "alice")) if how == "token" else {}
+    url = route if how == "control" else route + "?agent=alice"
+    return obs(app, app.test_client().get(url, headers=headers))
+
+
+@pytest.mark.parametrize("row", _D1, ids=[r[0] for r in _D1])
+def test_d1_tokenless_named_read_reaches_the_handler_as_that_agent(owned_tmp, row):
+    _id, route, setup, obs = row
+    vals = {}
+    for how in ("control", "named", "token"):
+        d = owned_tmp / how
+        d.mkdir()
+        vals[how] = _d1_call(d, route, setup, obs, how)
+        if how == "named":
+            (rec,) = [r for r in _lines(d) if r["named"] == ["alice"]]
+            assert (rec["verdict"], rec["kind"], rec["token_agent"]) == ("absent", "read", None)
+    assert vals["named"] == vals["token"], vals
+    assert vals["named"] != vals["control"], vals
+
+
+def test_d1_tokenless_read_naming_alice_in_the_path_gets_the_same_answer_as_her_token(owned_tmp):
+    out = {}
+    for how in ("named", "token"):
+        d = owned_tmp / how
+        d.mkdir()
+        app = _make_app(d)
+        _mk_thread(app, "bob")
+        headers = _auth(_issue(app, "alice")) if how == "token" else {}
+        out[how] = []
+        for leaf in ("inbox", "mentions"):
+            r = app.test_client().get(f"/api/agent/alice/{leaf}", headers=headers)
+            assert r.status_code == 200, r.get_data(as_text=True)
+            out[how].append(r.get_json())
+    assert out["named"] == out["token"]
+    recs = [r for r in _lines(owned_tmp / "named") if r["named"] == ["alice"]]
+    assert [(r["route"], r["verdict"]) for r in recs] == [
+        ("GET /api/agent/<name>/inbox", "absent"),
+        ("GET /api/agent/<name>/mentions", "absent")]
+
+
+# D2: the PATCH verb (the only PUT/PATCH/DELETE route) ---------------------
+_PATCH_BODY = {"agent": "alice", "pair_initials": "AB"}
+
+
+def _patch(app, headers=None):
+    return app.test_client().patch("/api/agent/me", json=dict(_PATCH_BODY), headers=headers or {})
+
+
+def test_d2_tokenless_patch_naming_alice_is_served_as_alice_and_recorded_once(owned_tmp):
+    out = {}
+    for how in ("named", "token"):
+        d = owned_tmp / how
+        d.mkdir()
+        app = _make_app(d)
+        r = _patch(app, _auth(_issue(app, "alice")) if how == "token" else None)
+        out[how] = (r.status_code, r.get_json())
+    assert out["named"] == out["token"] == (200, {"agent": "alice", "pair_initials": "AB"})
+    (rec,) = _lines(owned_tmp / "named")
+    assert (rec["method"], rec["route"], rec["kind"], rec["verdict"], rec["named"],
+            rec["token_agent"]) == ("PATCH", "PATCH /api/agent/me", "write", "absent",
+                                    ["alice"], None)
+
+
+def test_d2_tokenless_patch_is_401_under_enforce(owned_tmp):
+    app = _make_app(owned_tmp, "enforce")
+    assert _patch(app).status_code == 401
+    assert _agent_row(app, "alice") is None
+
+
+def test_d2_patch_with_a_bad_token_is_401_and_recorded_invalid(owned_tmp):
+    app = _make_app(owned_tmp)
+    assert _patch(app, _auth("not-a-real-token")).status_code == 401
+    (rec,) = _lines(owned_tmp)
+    assert (rec["method"], rec["kind"], rec["verdict"], rec["token_agent"]) == (
+        "PATCH", "write", "invalid", None)
+    assert _agent_row(app, "alice") is None
+
+
+def test_d2_patch_with_bobs_token_naming_alice_is_403_and_recorded_mismatch(owned_tmp):
+    app = _make_app(owned_tmp)
+    r = _patch(app, _auth(_issue(app, "bob")))
+    assert r.status_code == 403
+    assert r.get_json() == {"error": "identity mismatch", "token_agent": "bob",
+                            "named_agent": "alice"}
+    (rec,) = _lines(owned_tmp)
+    assert (rec["method"], rec["kind"], rec["verdict"], rec["token_agent"]) == (
+        "PATCH", "write", "mismatch", "bob")
+    assert _agent_row(app, "alice") is None
+
+
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
+def test_d2_guard_treats_put_and_delete_like_the_other_writes(owned_tmp, method):
+    """No route takes PUT or DELETE, so the handler answers 405; what is under test is
+    the guard: in report mode it reaches routing (not 401) with one line, in enforce 401."""
+    (owned_tmp / "rep").mkdir()
+    rep = _make_app(owned_tmp / "rep")
+    assert rep.test_client().open("/api/agent/alice/inbox", method=method).status_code == 405
+    (rec,) = _lines(owned_tmp / "rep")
+    assert (rec["method"], rec["kind"], rec["verdict"], rec["named"]) == (
+        method, "write", "absent", ["alice"])
+    (owned_tmp / "enf").mkdir()
+    enf = _make_app(owned_tmp / "enf", "enforce")
+    assert enf.test_client().open("/api/agent/alice/inbox", method=method).status_code == 401
+
+
+# D3: Authorization header shapes ------------------------------------------
+@pytest.mark.parametrize("header,needle,status,verdict", [
+    ("", None, {200, 201}, "absent"),
+    ("   ", None, {200, 201}, "absent"),
+    ("Bearer", b"Bearer", {401}, "invalid"),
+    ("Bearer ", b"Bearer", {401}, "invalid"),
+    ("Basic x", b"Basic", {401}, "invalid"),
+], ids=["empty", "whitespace", "scheme-only", "scheme-space", "basic"])
+def test_d3_header_shapes(owned_tmp, header, needle, status, verdict):
+    app = _make_app(owned_tmp)
+    r = _post(app.test_client(), headers={"Authorization": header})
+    assert r.status_code in status, (r.status_code, r.get_data(as_text=True))
+    (rec,) = _lines(owned_tmp)
+    assert (rec["verdict"], rec["kind"], rec["named"], rec["token_agent"]) == (
+        verdict, "write", ["alice"], None)
+    assert _thread_authors(app) == (["alice"] if verdict == "absent" else [])
+    data = _bytes(owned_tmp)
+    assert b"Authorization" not in data and b"authorization" not in data
+    if needle:
+        assert needle not in data and needle.lower() not in data.lower()
+    if header.strip():
+        assert header.encode() not in data
