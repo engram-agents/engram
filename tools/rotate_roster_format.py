@@ -8,6 +8,10 @@ conversion on the machine of the person who holds the secret, and prints only
 counts, whole-file sha256 values, per-class line numbers, and the class-B names
 (the caller's own input of permitted names). It never prints a roster line.
 
+That guarantee covers every piece of text this tool emits, including any parser
+stderr it re-emits: a captured parser refusal that carries any produced roster
+pattern is withheld whole and reported by exit code alone.
+
 Classification (R4) -- the roster lines are regexes, so "exact match" between a
 pattern and a name is not string equality. Each roster line and each B-file
 entry is reduced to a NAME by stripping ONLY wrappers that do not change which
@@ -106,7 +110,8 @@ NAME_KEY_RULE = (
 )
 
 # Regex metacharacters (besides \b and a leading (?i)) that make a class-B
-# pattern wider than the bare name it matched.
+# pattern wider than the bare name it matched. A backslash escape other than
+# \b is handled separately: it widens a pattern just as these do.
 METACHARS = frozenset(".([|*+?{")
 
 
@@ -329,6 +334,24 @@ def _parse_capture(parse_roster, source):
     return None, "", result
 
 
+def _reemit_parser_refusal(refusal: str, code: int, patterns) -> None:
+    """Re-emit the parser's captured refusal, or withhold it whole.
+
+    The no-roster-text guarantee covers text this tool emits, and a re-emitted
+    parser stderr is such text. If the buffer carries any produced roster
+    pattern, nothing of it is written: exactly one line names the refusal by
+    exit code only.
+    """
+    if any(pattern and pattern in refusal for pattern in patterns):
+        print(
+            f"rotate_roster_format: the parser refused (exit {code}); its "
+            "output was withheld because it contained roster text",
+            file=sys.stderr,
+        )
+        return
+    sys.stderr.write(refusal)
+
+
 def _parse_text(parse_roster, text: str, *, out_dir: Path, use_file: bool):
     """Parse ``text``. The real run uses a 0600 temp file inside ``out_dir``
     (R5's required form); a dry run uses an in-memory path-like and writes
@@ -402,8 +425,27 @@ def _pattern_is_wider_than_name(pattern: str, declares_boundary) -> bool:
     text = pattern
     if text.startswith("(?i)"):
         text = text[4:]
+    # Every backslash escape other than \b (\s, \d, \w, \S, \D, \W, ...)
+    # widens the pattern exactly as '.' does.
+    for escape in re.finditer(r"\\(.)?", text):
+        if escape.group(1) != "b":
+            return True
     text = text.replace("\\b", "")
     return any(char in METACHARS for char in text)
+
+
+def _refuse_empty_name_key(lineno: int, what: str) -> None:
+    """An empty name key is a prefix match on everything: fail closed.
+
+    ``what`` names the caller's file; only the 1-based line number is said,
+    never the text.
+    """
+    _fail(
+        2,
+        f"{what} line {lineno} has an empty name key; an empty key is a "
+        "prefix match on everything, so no classification from it can be "
+        "trusted. Refusing; nothing written.",
+    )
 
 
 def _no_boundary_message(linenos: "list[int]") -> str:
@@ -581,6 +623,12 @@ def main(argv: "list[str] | None" = None) -> int:
             continue
         entries.append((lineno, stripped))
 
+    # An empty name key is a prefix match on everything: refuse it on either
+    # side, naming only the line number.
+    for lineno, pattern in entries:
+        if not _key_parts(pattern)[0]:
+            _refuse_empty_name_key(lineno, "roster")
+
     # ---- read the B names ------------------------------------------------
     b_text = _read_text(Path(args.b_names).expanduser(), "the B-names file")
     b_entries = []  # (B-file line number, permitted name, _key_parts result)
@@ -589,6 +637,9 @@ def main(argv: "list[str] | None" = None) -> int:
         if _skippable(stripped):
             continue
         b_entries.append((b_lineno, stripped, _key_parts(stripped)))
+    for b_lineno, _b_name, b_parts in b_entries:
+        if not b_parts[0]:
+            _refuse_empty_name_key(b_lineno, "B-names file")
 
     # ---- classify --------------------------------------------------------
     out_lines = []
@@ -624,6 +675,7 @@ def main(argv: "list[str] | None" = None) -> int:
     ]
 
     produced = "".join(line + "\n" for line in out_lines)
+    produced_patterns = [pattern for _lineno, pattern in entries]
     canonical = produced.rstrip("\n") + "\n"
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -651,8 +703,7 @@ def main(argv: "list[str] | None" = None) -> int:
         if code is None:
             _validate_parser_result(result, out_lines, scanner_path)
         if refusal:
-            # The parser's own reason, verbatim (line number only).
-            sys.stderr.write(refusal)
+            _reemit_parser_refusal(refusal, code, produced_patterns)
         print("dry_run: true")
         print(f"total_input_lines: {total_input_lines}")
         print(f"blank_or_comment_skipped: {skipped}")
@@ -694,15 +745,18 @@ def main(argv: "list[str] | None" = None) -> int:
         _validate_parser_result(result, out_lines, scanner_path)
     if code is not None:
         if refusal:
-            # The parser's own reason, verbatim (line number only).
-            sys.stderr.write(refusal)
+            _reemit_parser_refusal(refusal, code, produced_patterns)
         _fail(
             2,
             "the produced roster was refused by the parser "
             f"(exit {code}); nothing written.",
         )
 
-    if out_path.exists():  # --force was passed to get here
+    # Unlink ONLY with --force. Without it the pre-check above has already
+    # refused an existing file; a file that appeared since may belong to
+    # another writer, and deleting it here would destroy it before the
+    # O_EXCL create below refuses.
+    if args.force and out_path.exists():
         try:
             out_path.unlink()
         except OSError as exc:

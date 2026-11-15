@@ -5,7 +5,7 @@ Cells T1-T8 pin R1-R7; two extra cells pin R2's overwrite refusal and R7's
 usage-error code, which the cells below would otherwise leave to ordinary use.
 
 Every fixture token is invented and appears nowhere else:
-  ZZAlphaHolder, ZZDeltaSecret, YYBravoHandle, Lin Example.
+  ZZAlphaHolder, ZZDeltaSecret, YYBravoHandle, YYCharlie Badge.
 
 R1's one permitted exception is a class-B NAME (the caller's own input of
 permitted names). T6 therefore uses a class-B line that declares ``(?i)`` and
@@ -38,7 +38,7 @@ SCAN_LEAKS = REPO_ROOT / "src" / "engram" / "tools" / "scan-leaks.py"
 A_ONE = "ZZAlphaHolder"
 A_TWO = "ZZDeltaSecret"
 B_ONE = "YYBravoHandle"
-B_MULTI = "Lin Example"
+B_MULTI = "YYCharlie Badge"
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +239,7 @@ def test_t4_unmatched_b_entries_are_all_a_and_reported(tmp_path):
     #  - a multi-word name written as a regex (\s+) is not the plain name.
     roster_lines = [
         r"\bZZ(?i:" + A_ONE[2:] + r")\b",
-        r"\bLin\s+Example\b",
+        r"\bYYCharlie\s+Badge\b",
     ]
     b_names = [A_ONE, B_MULTI]
     roster, bnames, out = _scratch(tmp_path, roster_lines, b_names)
@@ -404,6 +404,40 @@ def test_existing_output_is_refused_without_force_and_overwritten_with_it(tmp_pa
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
+def test_concurrently_created_output_is_not_deleted_without_force(tmp_path):
+    """Chain of custody: a file created between the pre-check and the write
+    must not be unlinked when --force was not given -- destroying the
+    operator's output on a path the tool was only going to refuse to use."""
+    stub = tmp_path / "concurrent-scanner.py"
+    stub.write_text(
+        r'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    if len(lines) == 3:
+        (path.parent / "roster-format2.txt").write_text(
+            "CONCURRENT\n", encoding="utf-8")
+    return [(None, "stub", klass) for klass in ("A", "A", "B")]
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+    target = out / "roster-format2.txt"
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert target.read_text(encoding="utf-8") == "CONCURRENT\n"
+
+
 def test_usage_error_exits_1(tmp_path):
     r = _run(["--roster", str(tmp_path / "r.txt")])   # missing required args
     assert r.returncode == 1, (r.stdout, r.stderr)
@@ -488,6 +522,37 @@ def test_case_differing_with_inline_flag_is_class_b(tmp_path):
     assert r.returncode == 0, (r.stdout, r.stderr)
     assert re.search(r"^class_a: 0$", r.stdout, re.M), r.stdout
     assert re.search(r"^class_b: 1$", r.stdout, re.M), r.stdout
+
+
+@pytest.mark.parametrize("empty_line", [r"\b\b", "(?i)"])
+def test_empty_name_key_in_a_roster_line_is_refused_by_line(tmp_path, empty_line):
+    """An empty name key is a prefix match on everything: a B-file ``\\b``
+    keyed to ``""`` would classify the roster's ``\\b\\b`` line as class B and
+    emit it report-only. Fail closed, naming the source line and never text."""
+    roster, bnames, out = _scratch(tmp_path, [empty_line], [r"\b"])
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "roster line 1" in combined, combined
+    assert "empty name key" in combined, combined
+    assert list(out.iterdir()) == []
+
+
+@pytest.mark.parametrize("empty_line", [r"\b", "(?i)"])
+def test_empty_name_key_in_the_b_names_file_is_refused_by_line(tmp_path, empty_line):
+    """The B side alone is enough: name its 1-based line (the caller's own
+    file, safe to name) and write nothing."""
+    roster, bnames, out = _scratch(tmp_path, [BASE_ROSTER[0]], [empty_line])
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "B-names file line 1" in combined, combined
+    assert "empty name key" in combined, combined
+    assert list(out.iterdir()) == []
 
 
 def test_class_a_no_boundary_refusal_says_it_will_not_rewrite_and_names_line(tmp_path):
@@ -712,6 +777,23 @@ def test_class_b_wider_than_its_name_warns_but_succeeds(tmp_path, roster_line, b
     assert (out / "roster-format2.txt").is_file()
 
 
+@pytest.mark.parametrize("escape", ["s", "d", "w", "S", "D", "W"])
+def test_backslash_escape_makes_a_class_b_line_wider_than_its_name(tmp_path, escape):
+    """Every backslash escape other than ``\\b`` widens the pattern exactly as
+    ``.`` does, so it must draw ``b_wider_than_its_name``."""
+    roster_line = "\\b" + B_ONE + "\\" + escape + "\\b"
+    b_name = B_ONE + "\\" + escape
+    roster, bnames, out = _scratch(tmp_path, [roster_line], [b_name])
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (
+        f"b_wider_than_its_name: source roster line 1: {b_name}" in r.stdout
+    ), "a backslash escape drew no width warning"
+    assert (out / "roster-format2.txt").is_file()
+
+
 def test_bounded_metachar_free_class_b_line_prints_no_width_warning(tmp_path):
     roster, bnames, out = _scratch(
         tmp_path, [r"\b" + B_ONE + r"\b"], [B_ONE]
@@ -874,6 +956,126 @@ def load_roster_file(path):
               "--out-dir", str(out), "--scanner", str(stub)])
     assert r.returncode == 0, (r.stdout, r.stderr)
     assert (out / "roster-format2.txt").is_file()
+
+
+# ---------------------------------------------------------------------------
+# R1 -- captured parser stderr: withheld when it carries a produced pattern
+# ---------------------------------------------------------------------------
+
+def _echoing_refusal_scanner(tmp_path: Path) -> Path:
+    """A parser that refuses the probes and the produced roster, echoing the
+    first produced line (and so its pattern) to stderr first."""
+    stub = tmp_path / "echoing-refusal-scanner.py"
+    stub.write_text(
+        r'''
+import sys
+
+
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    sys.stderr.write("scan-leaks: roster line 1 refuses: " + lines[0] + "\n")
+    raise SystemExit(2)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    return stub
+
+
+def _ordinary_refusal_scanner(tmp_path: Path) -> Path:
+    """A parser that refuses the probes and the produced roster with an
+    ordinary message carrying no pattern text."""
+    stub = tmp_path / "ordinary-refusal-scanner.py"
+    stub.write_text(
+        r'''
+import sys
+
+
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    sys.stderr.write(
+        "scan-leaks: roster line 2 has no class token; every line needs a "
+        "class prefix\n")
+    raise SystemExit(2)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    return stub
+
+
+def test_parser_refusal_carrying_a_produced_pattern_is_withheld(tmp_path):
+    """The guarantee covers text this tool emits: a parser that echoes a
+    produced pattern is withheld entirely and reported by exit code only."""
+    stub = _echoing_refusal_scanner(tmp_path)
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "parser refused (exit 2)" in combined, combined
+    assert "withheld because it contained roster text" in combined, combined
+    assert A_ONE not in combined, "a produced roster pattern reached the operator"
+    assert list(out.iterdir()) == []
+
+
+def test_parser_refusal_without_a_pattern_is_passed_through_verbatim(tmp_path):
+    """Control: an ordinary refusal is re-emitted verbatim. This cell is green
+    both before and after the withholding guard, so it discriminates a guard
+    that simply suppresses every refusal."""
+    stub = _ordinary_refusal_scanner(tmp_path)
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert (
+        "scan-leaks: roster line 2 has no class token; every line needs a "
+        "class prefix" in r.stderr
+    ), combined
+    assert "withheld" not in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_real_scanner_refusal_message_reaches_the_operator(tmp_path):
+    """The real scanner refuses an uncompilable produced pattern; its own
+    message (line number and error class, never the pattern) still reaches the
+    operator."""
+    roster, bnames, out = _scratch(
+        tmp_path, [r"\b" + A_ONE + r"\b("], [B_ONE]
+    )
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "is not a valid regular expression" in r.stderr, combined
+    assert (
+        "the produced roster was refused by the parser (exit 2); nothing "
+        "written." in r.stderr
+    ), combined
+    assert "withheld" not in combined, combined
+    assert A_ONE not in combined, "a produced roster pattern reached the operator"
+    assert list(out.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
