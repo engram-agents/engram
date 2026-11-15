@@ -47,11 +47,13 @@ Scope and exclusions (what "the tree" means here — NOT every published file):
     test_release_cutover.py, RELEASING.md.
   - SKIP_DIRS: .git, __pycache__, node_modules, .claude.
   - A name in an excluded file is not scanned.
-  - A tracked symlink is scanned by its PUBLISHED CONTENT, which is its link
-    text (``os.readlink``), in both passes; the link is never followed.  A
-    dangling symlink is therefore a covered scan (not `missing`), a symlink to
-    a directory is scanned (not `not-a-file`), and a symlink whose target is
-    also tracked is not read twice.
+  - A symlink -- git-tracked, or listed by the ``os.walk`` fallback, which
+    yields a directory symlink in its ``dirs`` list -- is scanned by its
+    PUBLISHED CONTENT, which is its link text (``os.readlink``), in both
+    passes; the link is never followed or descended.  A dangling symlink is
+    therefore a covered scan (not `missing`), a symlink to a directory is
+    scanned (not `not-a-file`), and a symlink whose target is also tracked is
+    not read twice.
 
 Coverage accounting (every candidate is accounted for):
   - scan() returns a ScanReport whose invariant is
@@ -131,10 +133,22 @@ def _load_home_path_class():
                       + ", ".join(str(c) for c in candidates))
 
 
-_hpc = _load_home_path_class()
-HOME_PATH_RE = _hpc.HOME_PATH_RE
-ALLOWED_HOME_SEGMENTS = _hpc.ALLOWED_HOME_SEGMENTS
-_DISALLOWED_HOME_PATH_RE = _hpc.disallowed_home_path_regex()
+_HPC = None
+
+
+def _home_path_class():
+    """Load the shared home-path class module, once, on first use.
+
+    Reached from inside main()'s try (through ``_run``), never at import time:
+    a scanner deployed without its sibling ``engine/home_path_class.py`` exits
+    2 with one ``scan-leaks: internal error: ImportError`` line instead of
+    dying on import with a traceback and exit 1, which every consumer reads as
+    "leaks found".  The loader's search order and its message are unchanged.
+    """
+    global _HPC
+    if _HPC is None:
+        _HPC = _load_home_path_class()
+    return _HPC
 
 # Files exempt from the home-path check, by repo-relative path, each with a
 # reason.  Deliberately EMPTY: the scanner, its definition module and every test
@@ -238,13 +252,17 @@ def _relative_dir(root: Path, directory) -> str:
 
 
 def _escape_path(path: str) -> str:
-    """Escape control characters so one path cannot forge or split a line.
+    """Escape line-breaking characters so one path cannot forge or split a line.
 
     A tracked name may contain a newline, and a printed name that carried it
     raw would put a second `scan-leaks: scanned N, skipped-binary M` line (or
     half a finding) on stdout.  ``\\n`` becomes ``\\\\n``, ``\\r`` becomes
-    ``\\\\r``, any other C0 control becomes ``\\\\xNN``; every other character
-    is unchanged.  The frozen summary line carries no path and is untouched.
+    ``\\\\r``, any other C0 control becomes ``\\\\xNN``; C1 controls
+    (U+0080-U+009F) also become ``\\\\xNN``, and U+2028/U+2029 become
+    ``\\\\u2028``/``\\\\u2029`` -- every one of those is a line break to
+    ``str.splitlines()``, so no escaped name can split a printed line.  Every
+    other character is unchanged.  The frozen summary line carries no path and
+    is untouched.
     """
     escaped = []
     for ch in path:
@@ -254,6 +272,12 @@ def _escape_path(path: str) -> str:
             escaped.append("\\r")
         elif ord(ch) < 0x20:
             escaped.append(f"\\x{ord(ch):02x}")
+        elif 0x80 <= ord(ch) <= 0x9f:
+            escaped.append(f"\\x{ord(ch):02x}")
+        elif ch == chr(0x2028):
+            escaped.append("\\u2028")
+        elif ch == chr(0x2029):
+            escaped.append("\\u2029")
         else:
             escaped.append(ch)
     return "".join(escaped)
@@ -442,6 +466,16 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
 
         for dirpath, dirs, files in os.walk(root, onerror=_onerror):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            # os.walk lists a symlink to a directory in ``dirs`` and, with
+            # followlinks=False, never descends it -- so without this it is
+            # never a candidate either, and its link text is never scanned.
+            # Take it as a candidate BEFORE descent and drop it from the walk:
+            # order is SKIP_DIRS filter, symlink partition, descent.
+            link_dirs = [d for d in dirs
+                         if os.path.islink(os.path.join(dirpath, d))]
+            for d in link_dirs:
+                candidates.append(Path(dirpath) / d)
+            dirs[:] = [d for d in dirs if d not in link_dirs]
             for fname in files:
                 if fname in SKIP_FILES:
                     continue
@@ -564,6 +598,7 @@ def scan_home_paths(root: Path, use_git: bool = True
     tracked = _git_tracked_files(root) if use_git else None
     findings = []
     unreadable_paths = []
+    disallowed_home_path_re = _home_path_class().disallowed_home_path_regex()
     if tracked is None:
         tracked = []
 
@@ -572,6 +607,13 @@ def scan_home_paths(root: Path, use_git: bool = True
 
         for dirpath, dirs, files in os.walk(root, onerror=_onerror):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            # Same symlink partition as scan(): a directory symlink is listed
+            # in ``dirs`` and never descended, so take it as a candidate
+            # before descent or its link text is never scanned.
+            link_dirs = [d for d in dirs
+                         if os.path.islink(os.path.join(dirpath, d))]
+            tracked.extend(Path(dirpath) / d for d in link_dirs)
+            dirs[:] = [d for d in dirs if d not in link_dirs]
             tracked.extend(Path(dirpath) / f for f in files)
 
     for fpath in tracked:
@@ -602,7 +644,7 @@ def scan_home_paths(root: Path, use_git: bool = True
                 unreadable_paths.append(rel)
                 continue
             for i, line in enumerate(text.splitlines(), 1):
-                for m in _DISALLOWED_HOME_PATH_RE.finditer(line):
+                for m in disallowed_home_path_re.finditer(line):
                     findings.append((rel, i, m.group(1).rstrip(".")))
             continue
         try:
@@ -614,7 +656,7 @@ def scan_home_paths(root: Path, use_git: bool = True
             continue
         text = data.decode("utf-8", errors="replace")
         for i, line in enumerate(text.splitlines(), 1):
-            for m in _DISALLOWED_HOME_PATH_RE.finditer(line):
+            for m in disallowed_home_path_re.finditer(line):
                 findings.append((rel, i, m.group(1).rstrip(".")))
     unreadable_paths.sort()
     return findings, unreadable_paths
@@ -653,6 +695,11 @@ def _run():
                         help="Print each finding as repo-relative-path:line only "
                              "(no label, no snippet, no home-path segment)")
     args = parser.parse_args()
+
+    # Loaded here, inside main()'s try, before anything is scanned or printed:
+    # a missing or unreadable sibling module is an internal error (exit 2),
+    # never an import-time traceback on exit 1 with a partial stdout.
+    _home_path_class()
 
     if args.root:
         root = Path(args.root).expanduser().resolve()

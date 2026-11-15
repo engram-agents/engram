@@ -577,7 +577,7 @@ def test_binary_file_with_home_path_is_skipped(tmp_path):
 
 
 def test_allowed_set_entries_carry_reasons():
-    allowed = _mod.ALLOWED_HOME_SEGMENTS
+    allowed = _mod._home_path_class().ALLOWED_HOME_SEGMENTS
     assert {"someone", "agent-alice", "Shared", "agents-shared"} <= set(allowed)
     assert all(isinstance(why, str) and why.strip() for why in allowed.values())
     assert "open decision" in allowed["agents-shared"]
@@ -723,14 +723,14 @@ def test_allowed_home_segment_set_is_pinned():
         # system and shared directories
         "Shared", "agents-shared",
     }
-    actual = set(_mod.ALLOWED_HOME_SEGMENTS)
+    actual = set(_mod._home_path_class().ALLOWED_HOME_SEGMENTS)
     assert actual == expected, (
         "The allowed home-path segment set changed "
         f"(added: {sorted(actual - expected)}, removed: {sorted(expected - actual)}). "
         "Adding an entry needs a security-seat read, and a real person's or seat's "
         "folder name must never be added; the PR adding it must say why."
     )
-    assert all(isinstance(why, str) and why.strip() for why in _mod.ALLOWED_HOME_SEGMENTS.values()), (
+    assert all(isinstance(why, str) and why.strip() for why in _mod._home_path_class().ALLOWED_HOME_SEGMENTS.values()), (
         "every allowed home-path segment needs a non-empty reason"
     )
 
@@ -1779,7 +1779,7 @@ def _home_target_dir() -> Path:
     /home/<name> or /Users/<name> (or whose segment is in the allowed set).
     """
     home = Path.home()
-    if not _mod._DISALLOWED_HOME_PATH_RE.search(str(home)):
+    if not _mod._home_path_class().disallowed_home_path_regex().search(str(home)):
         pytest.skip("the seat's home path is not in the scanner's home-path class")
     return home
 
@@ -1976,4 +1976,142 @@ def test_cell8_positive_controls(tmp_path):
     assert r_leaky.returncode == 1, r_leaky.stdout + r_leaky.stderr
     assert _summary(r_leaky.stdout) == (1, 0)
     assert "doc.md:1" in r_leaky.stderr, r_leaky.stderr
+
+
+# ---------------------------------------------------------------------------
+# Test 19: the class module loads inside main()'s guard, the os.walk fallback
+#          scans a directory symlink, and C1/U+2028/U+2029 escape (#4805 r5)
+# ---------------------------------------------------------------------------
+#
+# Contract (written before the implementation):
+#   - the shared home-path class module is loaded from INSIDE main()'s try
+#     (through a call made from _run()), never at import time: a scanner
+#     deployed without its sibling `engine/home_path_class.py` exits 2 with
+#     one `scan-leaks: internal error: ImportError` line on stderr, prints no
+#     summary line and no traceback.  The loader's search order and message
+#     are unchanged.
+#   - in BOTH os.walk loops, after the SKIP_DIRS filter and BEFORE descent,
+#     each `dirs` entry that is a symlink becomes a candidate (classified
+#     `symlink` and scanned by its os.readlink text) and is removed from
+#     `dirs`, so the walk neither descends it nor loses it.  A real directory
+#     is untouched.
+#   - `_escape_path` also escapes C1 controls (U+0080-U+009F -> \\xNN) and
+#     U+2028/U+2029 (-> \\u2028/\\u2029): every one of them is a line break
+#     to str.splitlines(), so a tracked name carrying one cannot split a
+#     printed line.  The frozen summary line is byte-identical.
+
+
+def _non_git_tree_with_dir_link(root: Path, link_text: str) -> None:
+    """A non-git tree: one real file plus a symlink to a sibling directory.
+
+    The link target is a real directory inside the tree, so os.walk lists the
+    link in ``dirs`` (and, with followlinks=False, does not descend it).  The
+    tree is deliberately not a git repository: both passes fall back to
+    os.walk, which is the enumeration path these cells exercise.
+    """
+    (root / "real").mkdir(parents=True)
+    (root / "real" / "member.txt").write_text("clean\n")
+    os.symlink(link_text, root / "dir-link")
+
+
+def test_r5_item1_missing_sibling_module_exits_2_not_1(tmp_path):
+    """Cell: a scanner deployed without its sibling home-path class module.
+
+    Pre-fix: `_hpc = _load_home_path_class()` runs at import, before main()'s
+    try, so the process dies with a traceback and exit 1 -- which every
+    consumer reads as "leaks found", and which the module docstring says
+    cannot happen.  Post-fix: the load is reached from inside main()'s try,
+    so it is one stderr line and exit 2.
+    """
+    # Nested one level deeper than needed so the loader's second candidate
+    # (<here>.parent.parent / "build" / "engine" / "home_path_class.py)
+    # lands under tmp_path/a/build, which nothing creates: the "missing
+    # sibling" condition is provable rather than merely likely.
+    lone = tmp_path / "a" / "b" / "lone"
+    lone.mkdir(parents=True)
+    (lone / "scan-leaks.py").write_bytes(SCAN_LEAKS.read_bytes())
+
+    r = subprocess.run(
+        [sys.executable, str(lone / "scan-leaks.py"),
+         "--root", str(lone), "--config-path", str(lone / "no-config.json")],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "scan-leaks: internal error: ImportError" in r.stderr, r.stderr
+    assert "Traceback" not in r.stderr, r.stderr
+    assert "scan-leaks: scanned" not in r.stdout, r.stdout
+
+
+def test_r5_item2a_walk_fallback_scans_a_directory_symlink_clean_text(tmp_path):
+    """Cell: a directory symlink with clean relative link text is scanned.
+
+    Pre-fix: os.walk lists it in ``dirs``, followlinks=False does not descend
+    it, and it is never a file candidate -- so its link text is never scanned
+    (scanned 1, not 2): the hole this cell closes.  A walk that DID descend
+    the link would enumerate member.txt twice (candidates 3).
+    """
+    root = tmp_path / "walk-clean"
+    _non_git_tree_with_dir_link(root, "real")
+
+    report = _mod.scan(root, [], use_git=False)
+    assert report.scanned == 2, report
+    assert report.candidates == 2, report
+    assert report.not_a_file_paths == [], report
+    assert report.unreadable_paths == [], report
+
+    r = _run_scan(root)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _summary(r.stdout) == (2, 0), r.stdout
+    assert "scan-leaks: clean" in r.stdout, r.stdout
+
+
+def test_r5_item2b_walk_fallback_scans_a_directory_symlink_home_text(tmp_path):
+    """Cell: a directory symlink whose link text is an absolute home path.
+
+    Pre-fix: the walk never enumerates it, so the host path sits in the
+    published link text and the run exits 0 `clean` (scanned 1, not 2).
+    Post-fix: both passes scan the link text and the finding is at the link's
+    own path.  A descended link would inflate the scanned count instead.
+    """
+    home = _home_target_dir()
+    root = tmp_path / "walk-home"
+    _non_git_tree_with_dir_link(root, str(home))
+
+    r = _run_scan(root)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "dir-link:1" in r.stderr, r.stderr
+    assert "absolute home path" in r.stderr, r.stderr
+    assert _summary(r.stdout) == (2, 0), r.stdout
+
+
+# U+2028 is a line break to str.splitlines() (as is the C1 U+0085, written
+# \x85 below); a name carrying either must not split a printed line.
+_R5_LINE_SEP = chr(0x2028)
+
+
+def test_r5_item3_c1_and_unicode_line_breaks_are_escaped(tmp_path):
+    """Cell: U+2028 and C1 U+0085 in tracked names cannot split stdout.
+
+    Both are line breaks to str.splitlines(), and pre-fix neither is escaped,
+    so the one skipped-binary naming line splits into three: stdout gains two
+    lines and a consumer splitting stdout can read a forged second line.
+    Post-fix the count is the four lines this fixture prints anyway: the
+    advisory, the frozen summary, one naming line, and `clean`.
+    """
+    root = tmp_path / "escape-tree"
+    root.mkdir()
+    _commit_files(root, {
+        "ok.txt": "clean\n",
+        "evil" + _R5_LINE_SEP + "name.bin": b"\x00binary",
+        "evil\x85name.bin": b"\x00binary",
+    })
+
+    r = _run_scan(root)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(_SUMMARY_ANCHORED_RE.findall(r.stdout)) == 1, repr(r.stdout)
+    assert len(r.stdout.splitlines()) == 4, repr(r.stdout)
+    assert "evil\\u2028name.bin" in r.stdout, repr(r.stdout)
+    assert "evil\\x85name.bin" in r.stdout, repr(r.stdout)
+    assert _R5_LINE_SEP not in r.stdout, repr(r.stdout)
+    assert "\x85" not in r.stdout, repr(r.stdout)
 
