@@ -521,9 +521,9 @@ def run_G5(repo_root: str) -> dict[str, Any]:
             "G5", "public-readiness",
             STATUS_DEGRADED, "coverage incomplete",
             "scan-leaks could not cover the whole tree (coverage incomplete) — "
-            "see the scanner's 'scan-leaks: unreadable ...' or "
-            "'scan-leaks: no coverage ...' lines above; this is not evidence "
-            "of a clean tree",
+            "see the scanner's 'scan-leaks: unreadable ...', 'scan-leaks: "
+            "missing ...', or 'scan-leaks: no coverage ...' lines above; this "
+            "is not evidence of a clean tree",
         )
 
     # Count hits from stderr output.

@@ -1055,6 +1055,29 @@ class TestG5CoverageIncomplete:
         # The hit-count path's claim must not be what a caller reads here.
         assert "found 0 potential leak" not in result["detail"], result
 
+    def test_exit_3_detail_names_the_missing_line(self):
+        """The detail points at every coverage line, including "missing".
+
+        A file tracked in git but absent from the worktree is a "missing"
+        candidate, and the scanner says so on its own line. A detail that
+        omits it sends a reader whose only hit is that line to a line the
+        scanner never printed.
+        """
+        proc = self._fake_proc(
+            stdout=(
+                "scan-leaks: scanned 1, skipped-binary 0\n"
+                "scan-leaks: missing 1 (coverage incomplete): gone.txt\n"
+            ),
+            stderr="",
+            returncode=3,
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            result = run_G5(self._REPO_ROOT)
+        assert result["status"] == STATUS_DEGRADED, result
+        assert result["metric"] == "coverage incomplete", result
+        assert "missing" in result["detail"], result
+        assert "coverage incomplete" in result["detail"], result
+
     def test_exit_1_still_takes_the_hit_count_path(self):
         """Positive control: exit 1 still reports the hit count."""
         proc = self._fake_proc(
