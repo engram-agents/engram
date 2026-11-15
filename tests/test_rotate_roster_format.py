@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import stat
@@ -52,7 +53,20 @@ def _env(**overrides):
     return e
 
 
-def _run(args, *, cwd=None, env=None):
+def _run(args, *, cwd=None, env=None, attestation="auto"):
+    """Run the tool. ``attestation="auto"`` appends the fixture attestation
+    (``<out-dir parent>/attestation.json``) unless one is already named;
+    ``None`` injects nothing (used by the derivation cell)."""
+    args = list(args)
+    if attestation is not None and "--attestation" not in args:
+        if attestation == "auto":
+            if "--out-dir" in args:
+                out = Path(args[args.index("--out-dir") + 1])
+                candidate = out.parent / "attestation.json"
+                if candidate.exists():
+                    args += ["--attestation", str(candidate)]
+        else:
+            args += ["--attestation", str(attestation)]
     return subprocess.run(
         [sys.executable, str(TOOL), *args],
         capture_output=True, text=True, cwd=cwd, env=env if env is not None else _env(),
@@ -65,13 +79,44 @@ def _write_lines(path: Path, lines) -> Path:
     return path
 
 
-def _scratch(tmp_path: Path, roster_lines, b_lines, *, out_name="out"):
-    """Lay out inputs/ and out/ under tmp_path and return (roster, bnames, out)."""
+def _canonical_sha(data: bytes) -> str:
+    """The gate's canonical form: all trailing newlines stripped, one added."""
+    return hashlib.sha256(data.rstrip(b"\n") + b"\n").hexdigest()
+
+
+def _write_attestation(path: Path, roster_path: Path, *, raw_value=None) -> Path:
+    """Write a fixture attestation whose roster_sha256 is ``raw_value`` (or the
+    canonical hash of ``roster_path``)."""
+    value = raw_value if raw_value is not None else _canonical_sha(
+        roster_path.read_bytes()
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "roster_format": 1,
+            "pattern_count": 1,
+            "roster_sha256": value,
+            "updated_at": "2026-01-01T00:00:00Z",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _scratch(tmp_path: Path, roster_lines, b_lines, *, out_name="out",
+             roster_text=None):
+    """Lay out inputs/, out/ and a matching attestation.json under tmp_path."""
     inputs = tmp_path / "inputs"
     out = tmp_path / out_name
     out.mkdir(parents=True)
-    roster = _write_lines(inputs / "roster.txt", roster_lines)
+    if roster_text is None:
+        roster = _write_lines(inputs / "roster.txt", roster_lines)
+    else:
+        roster = inputs / "roster.txt"
+        roster.parent.mkdir(parents=True, exist_ok=True)
+        roster.write_text(roster_text, encoding="utf-8")
     bnames = _write_lines(inputs / "bnames.txt", b_lines)
+    _write_attestation(tmp_path / "attestation.json", roster)
     return roster, bnames, out
 
 
@@ -442,9 +487,9 @@ def test_case_differing_with_inline_flag_is_class_b(tmp_path):
 
 
 def test_class_a_no_boundary_refusal_says_it_will_not_rewrite_and_names_line(tmp_path):
-    """R5's refusal message must tell the operator the tool will NOT rewrite the
-    pattern, that the roster must declare the boundary itself, and which source
-    line to look at -- while keeping the parser's own reason."""
+    """The unconditional pre-check must tell the operator the tool will NOT
+    rewrite the pattern, that the roster must declare the boundary itself, and
+    which source line to look at (F2; the parser is not reached)."""
     roster, bnames, out = _scratch(
         tmp_path, ["# a comment", "(?i)" + A_ONE], ["YVNoMatch"]
     )
@@ -453,12 +498,223 @@ def test_class_a_no_boundary_refusal_says_it_will_not_rewrite_and_names_line(tmp
     combined = r.stdout + r.stderr
 
     assert r.returncode == 2, (r.stdout, r.stderr)
-    # The parser's own reason is preserved.
-    assert "no declared boundary" in combined, combined
-    # The operator-facing guidance.
+    assert "declare no boundary" in combined, combined
     assert "will NOT rewrite" in combined, combined
+    assert "declare the boundary itself" in combined, combined
     assert "lookaround" in combined and "^/$" in combined, combined
     assert "source roster line 2" in combined, combined
-    assert "line" in combined, combined
     assert list(out.iterdir()) == []
     assert A_ONE not in combined, combined   # R1: never echo the pattern
+
+
+# ---------------------------------------------------------------------------
+# Input identity: the canonical sha256 must match the attested live list
+# ---------------------------------------------------------------------------
+
+def test_attestation_match_proceeds(tmp_path):
+    """Control: a matching fixture attestation proceeds and writes the file."""
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (out / "roster-format2.txt").is_file()
+    assert "attested_roster_sha256:" in r.stdout
+
+
+def test_attestation_hash_mismatch_refuses_and_names_both_hashes(tmp_path):
+    """A copy that is not the live list is refused; both public hashes are
+    printed so the operator can see the difference."""
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+    wrong = "0" * 64
+    _write_attestation(tmp_path / "attestation.json", roster, raw_value=wrong)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert wrong in combined, combined
+    assert _canonical_sha(roster.read_bytes()) in combined, combined
+    assert "live list" in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_attestation_trailing_newline_difference_still_matches(tmp_path):
+    """The canonical form strips ALL trailing newlines before hashing, so a
+    copy that differs only in trailing newlines is the same live list."""
+    roster_text = "\n".join(BASE_ROSTER) + "\n\n\n"
+    roster, bnames, out = _scratch(
+        tmp_path, [], BASE_B, roster_text=roster_text
+    )
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (out / "roster-format2.txt").is_file()
+
+
+def test_attestation_placeholder_refuses_naming_the_file(tmp_path):
+    """A placeholder (anything not 64 hex) is not an attestation."""
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+    _write_attestation(
+        tmp_path / "attestation.json", roster, raw_value="UNSET - placeholder"
+    )
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert str(tmp_path / "attestation.json") in combined, combined
+    assert "cannot be confirmed as the live list" in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_attestation_default_is_derived_from_the_scanner_path(tmp_path):
+    """With no --attestation, the path is derived from the scanner's location:
+    <repo>/src/engram/tools/scan-leaks.py -> <repo>/.github/..."""
+    repo = tmp_path / "fake-repo"
+    scanner = repo / "src" / "engram" / "tools" / "scan-leaks.py"
+    scanner.parent.mkdir(parents=True)
+    scanner.write_bytes(SCAN_LEAKS.read_bytes())
+    (repo / ".github").mkdir(parents=True)
+
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+    (tmp_path / "attestation.json").replace(
+        repo / ".github" / "name-leak-roster.attestation.json"
+    )
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(scanner)],
+             attestation=None)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (out / "roster-format2.txt").is_file()
+
+
+# ---------------------------------------------------------------------------
+# F2 -- ALL unbounded class-A lines are listed on every run, not only the first
+# ---------------------------------------------------------------------------
+
+def test_all_unbounded_class_a_lines_are_reported_in_one_run(tmp_path):
+    """Three unbounded class-A lines: one run must name all three source lines
+    (the parser would stop at the first)."""
+    third = "ZZFoxtrotSecret"
+    roster_lines = ["# comment", "(?i)" + A_ONE, "", "(?i)" + A_TWO, "",
+                    "(?i)" + third]
+    roster, bnames, out = _scratch(tmp_path, roster_lines, ["YVNoMatch"])
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "2, 4, 6" in combined, combined
+    assert "will NOT rewrite" in combined, combined
+    for token in (A_ONE, A_TWO, third):
+        assert token not in combined, (token, combined)
+    assert list(out.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# --dry-run: the whole pipeline, no file
+# ---------------------------------------------------------------------------
+
+def test_dry_run_clean_roster_exits_0_and_writes_nothing(tmp_path):
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, [B_ONE, B_MULTI])
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--dry-run"])
+
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert "dry_run: true" in r.stdout, r.stdout
+    assert re.search(r"^total_input_lines: 3$", r.stdout, re.M), r.stdout
+    assert re.search(r"^class_a: 2$", r.stdout, re.M), r.stdout
+    assert re.search(r"^class_b: 1$", r.stdout, re.M), r.stdout
+    assert "unmatched_b_name: " + B_MULTI in r.stdout, r.stdout
+    assert "dry_run_result: would succeed" in r.stdout, r.stdout
+    assert list(out.iterdir()) == []
+
+
+def test_dry_run_reports_two_unbounded_lines_then_exits_2(tmp_path):
+    roster_lines = ["(?i)" + A_ONE, "", "(?i)" + A_TWO]
+    roster, bnames, out = _scratch(tmp_path, roster_lines, ["YVNoMatch"])
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--dry-run"])
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "class_a_without_boundary: 2" in r.stdout, r.stdout
+    assert "no_boundary_source_line: 1" in r.stdout, r.stdout
+    assert "no_boundary_source_line: 3" in r.stdout, r.stdout
+    assert "dry_run_result: would refuse" in r.stdout, r.stdout
+    assert list(out.iterdir()) == []
+    assert A_ONE not in (r.stdout + r.stderr)
+
+
+# ---------------------------------------------------------------------------
+# F1 -- a parser that predates format 2 must not be accepted as a validator
+# ---------------------------------------------------------------------------
+
+def _stub_scanner(tmp_path: Path) -> Path:
+    stub = tmp_path / "stub-scanner.py"
+    stub.write_text(
+        "def load_roster_file(path):\n"
+        "    path.read_text(encoding='utf-8')\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+    return stub
+
+
+def test_stale_format1_scanner_is_refused_and_writes_nothing(tmp_path):
+    """A format-1-era load_roster_file accepts anything; the positive control
+    must refuse it and write nothing."""
+    stub = _stub_scanner(tmp_path)
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "predates the two-class format" in combined, combined
+    assert "an unvalidated roster is never emitted" in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_stale_scanner_control_real_scanner_proceeds(tmp_path):
+    """Control: the same fixture against the real scanner proceeds."""
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (out / "roster-format2.txt").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Class-B width warning (warning only, never a refusal)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("roster_line,b_name", [
+    (B_ONE, B_ONE),                              # declares no boundary
+    (r"\bZZAlpha.Holder\b", "ZZAlpha.Holder"),   # bounded, but '.' is a meta
+])
+def test_class_b_wider_than_its_name_warns_but_succeeds(tmp_path, roster_line, b_name):
+    roster, bnames, out = _scratch(tmp_path, [roster_line], [b_name])
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (
+        f"b_wider_than_its_name: source roster line 1: {b_name}" in r.stdout
+    ), r.stdout
+    assert (out / "roster-format2.txt").is_file()
+
+
+def test_bounded_metachar_free_class_b_line_prints_no_width_warning(tmp_path):
+    roster, bnames, out = _scratch(
+        tmp_path, [r"\b" + B_ONE + r"\b"], [B_ONE]
+    )
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out)])
+
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert "b_wider_than_its_name" not in r.stdout, r.stdout
+    assert (out / "roster-format2.txt").is_file()

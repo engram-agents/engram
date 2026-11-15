@@ -5,7 +5,7 @@ The roster secret is a list of name *patterns*. Format 1 is one regex per line;
 format 2 prefixes every line with a class: ``A<TAB>pattern`` blocks, ``B<TAB>
 pattern`` is report-only (permitted content). This helper performs the
 conversion on the machine of the person who holds the secret, and prints only
-counts, the whole-file sha256, per-class line numbers, and the class-B names
+counts, whole-file sha256 values, per-class line numbers, and the class-B names
 (the caller's own input of permitted names). It never prints a roster line.
 
 Classification (R4) -- the roster lines are regexes, so "exact match" between a
@@ -29,10 +29,42 @@ roster line that matches nothing is class A -- blocking -- so a failed match
 blocks a name unnecessarily and is visible, rather than classifying a private
 name as report-only.
 
-The produced roster is validated by the scanner's real format-2 parser
-(``load_roster_file``) before it is written; if the parser refuses, nothing is
-written. The output is one file, ``DIR/roster-format2.txt``, created 0600 by
-``os.open``; nothing else is written anywhere.
+Input identity. A GitHub secret cannot be read back, so the operator may be
+holding a stale copy. The committed attestation carries the live roster's
+whole-file sha256 under the gate's canonical form (all trailing newlines
+stripped, exactly one appended). The tool computes the same value over the
+input and refuses (exit 2, nothing written) unless it matches the attested
+value. ``--attestation PATH`` overrides the default, which is derived from the
+scanner path as ``<repo>/.github/name-leak-roster.attestation.json``.
+
+Parser identity. A pre-two-class scanner also exposes ``load_roster_file`` (the
+format-1 one), and handed ``A<TAB>pattern`` it compiles the prefix as regex
+text and returns success. The tool therefore probes the loaded parser with two
+synthetic in-memory rosters -- an invalid class token and a class-A line with
+no declared boundary -- and refuses (exit 1, nothing written) if either is
+accepted: a parser that cannot reject them is not a validator.
+
+Class-A boundaries are audited on EVERY run, not only in a dry run: every
+produced class-A line is checked with the scanner's own ``_declares_boundary``,
+and if any lack one the tool lists ALL their source line numbers and refuses
+(exit 2) before parsing the produced roster. It never adds a boundary itself.
+
+A class-B line is reported as ``b_wider_than_its_name`` when its pattern is
+wider than the bare permitted name it matched -- no declared boundary, or
+regex metacharacters beyond ``\\b`` and a leading ``(?i)``. That is a warning,
+never a refusal: making a line class B makes everything it matches report-only,
+and only the operator can say whether that width is intended.
+
+``--dry-run`` runs the whole pipeline and writes nothing; it prints the audit,
+including every class-A line without a declared boundary (by source line
+number) and the unmatched permitted names, and exits 2 if the real run would
+be refused.
+
+The produced roster is validated by the scanner's real format-2 parser before
+it is written; the real run parses it from a 0600 temp file inside
+``--out-dir``. The output is one file, ``DIR/roster-format2.txt``, created 0600
+by ``os.open``; nothing else is written anywhere (a dry run writes no file at
+all).
 
 Stdlib only. No network. No subprocess.
 """
@@ -43,6 +75,7 @@ import argparse
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import re
 import sys
@@ -50,11 +83,24 @@ import tempfile
 from pathlib import Path
 
 OUTPUT_NAME = "roster-format2.txt"
+ATTESTATION_REL = Path(".github") / "name-leak-roster.attestation.json"
+
+# Synthetic format-2 rosters for the parser positive control. The token is
+# invented and appears nowhere else; the probe text is never printed.
+PROBE_TOKEN = "ZZProbeName"
+PROBE_ROSTERS = (
+    ("an invalid class token", "C\t\\b" + PROBE_TOKEN + "\\b\n"),
+    ("a class-A line with no declared boundary", "A\t" + PROBE_TOKEN + "\n"),
+)
 
 NAME_KEY_RULE = (
     "strip -> drop a leading (?i) -> drop \\b only when BOTH ends carry it "
     "(a one-sided \\b is kept) -> strip -> casefold only when (?i) is present"
 )
+
+# Regex metacharacters (besides \b and a leading (?i)) that make a class-B
+# pattern wider than the bare name it matched.
+METACHARS = frozenset(".([|*+?{")
 
 
 class _Parser(argparse.ArgumentParser):
@@ -63,6 +109,19 @@ class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> "None":
         self.print_usage(sys.stderr)
         self.exit(1, f"{self.prog}: error: {message}\n")
+
+
+class _TextSource:
+    """A read-only path-like source: the parser needs only ``read_text``.
+
+    Used by ``--dry-run`` so the whole pipeline can run with no file written.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def read_text(self, encoding: str = "utf-8") -> str:
+        return self._text
 
 
 def _fail(code: int, message: str) -> "None":
@@ -108,7 +167,7 @@ def _read_text(path: Path, what: str) -> str:
     try:
         return path.read_text(encoding="utf-8")
     except OSError as exc:
-        # The path is not secret; the roster text is. Report the class only.
+        # The path is not secret; the text is. Report the class only.
         _fail(1, f"cannot read {what} ({type(exc).__name__})")
     except UnicodeDecodeError as exc:
         _fail(1, f"cannot decode {what} as UTF-8 ({type(exc).__name__})")
@@ -138,11 +197,81 @@ def _resolve_scanner(cli_scanner: "str | None") -> "Path | None":
     return None
 
 
+def _derive_repo_root(scanner_path: Path) -> "Path | None":
+    """The repo root above a ``<repo>/src/engram/tools/scan-leaks.py`` path."""
+    parts = scanner_path.parts
+    if len(parts) >= 4 and Path(*parts[-4:]) == Path(
+        "src/engram/tools/scan-leaks.py"
+    ):
+        return Path(*parts[:-4])
+    return None
+
+
+def _resolve_attestation(
+    cli_attestation: "str | None", scanner_path: Path
+) -> "Path | None":
+    if cli_attestation:
+        return Path(cli_attestation).expanduser()
+    repo = _derive_repo_root(scanner_path)
+    if repo is None:
+        return None
+    return repo / ATTESTATION_REL
+
+
+def _read_attested_sha(path: Path) -> "tuple[str | None, str | None]":
+    """Return ``(sha, reason)``; reason names the file, never its content."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, (
+            f"cannot read an attestation at {path} ({type(exc).__name__})"
+        )
+    if not isinstance(document, dict):
+        return None, f"the attestation at {path} is not a JSON object"
+    value = document.get("roster_sha256")
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        return None, (
+            f"the attestation at {path} has no usable roster_sha256 "
+            "(missing or a placeholder)"
+        )
+    return value, None
+
+
+def _verify_attestation(
+    attestation_path: "Path | None", input_sha: str
+) -> str:
+    """Refuse unless the input's canonical sha256 equals the attested value."""
+    if attestation_path is None:
+        _fail(
+            2,
+            "cannot locate the roster attestation: the scanner path is not "
+            "shaped as <repo>/src/engram/tools/scan-leaks.py and --attestation "
+            "was not given. The input cannot be confirmed as the live list; "
+            "nothing written.",
+        )
+    attested, reason = _read_attested_sha(attestation_path)
+    if attested is None:
+        _fail(
+            2,
+            f"{reason}. The input cannot be confirmed as the live list; "
+            "nothing written.",
+        )
+    if attested != input_sha:
+        print(f"attestation_roster_sha256: {attested}", file=sys.stderr)
+        print(f"input_roster_sha256: {input_sha}", file=sys.stderr)
+        _fail(
+            2,
+            "the input roster does not match the attested live list; this "
+            "tool must run against the live roster copy. Nothing written.",
+        )
+    return attested
+
+
 def _load_parser(scanner_path: Path):
-    """Load ``load_roster_file`` by explicit file path (importlib).
+    """Load ``load_roster_file`` and ``_declares_boundary`` by explicit path.
 
     Bytecode caching is disabled for the duration: importing the scanner must
-    not create a ``__pycache__`` beside it (R2 -- nothing written outside
+    not create a ``__pycache__`` beside it (nothing is written outside
     ``--out-dir``).
     """
     try:
@@ -167,23 +296,22 @@ def _load_parser(scanner_path: Path):
     loader = getattr(module, "load_roster_file", None)
     if not callable(loader):
         return None
-    # The parser's own boundary predicate, used only to explain a refusal.
     boundary = getattr(module, "_declares_boundary", None)
     return loader, (boundary if callable(boundary) else None)
 
 
-def _run_parser(parse_roster, path: Path):
-    """Call the real parser, catching its line-number-only refusal.
+def _parse_capture(parse_roster, source):
+    """Call the real parser, capturing its line-number-only refusal.
 
     Returns ``(exit_code, stderr_text)`` on refusal, or ``(None, "")`` on
-    success. The message is re-emitted verbatim by the caller, so the parser's
-    own reason is preserved.
+    success. The captured text is re-emitted verbatim where appropriate, so
+    the parser's own reason is preserved.
     """
     buffer = io.StringIO()
     previous = sys.stderr
     sys.stderr = buffer
     try:
-        parse_roster(path)
+        parse_roster(source)
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 2
         return code, buffer.getvalue()
@@ -192,32 +320,70 @@ def _run_parser(parse_roster, path: Path):
     return None, ""
 
 
-def _refusal_guidance(refusal_text, entries, out_lines, declares_boundary):
-    """Guidance when the parser refused a class-A line for no declared boundary.
+def _parse_text(parse_roster, text: str, *, out_dir: Path, use_file: bool):
+    """Parse ``text``. The real run uses a 0600 temp file inside ``out_dir``
+    (R5's required form); a dry run uses an in-memory path-like and writes
+    no file at all."""
+    if not use_file:
+        return _parse_capture(parse_roster, _TextSource(text))
+    fd, name = tempfile.mkstemp(
+        prefix=".rotate-roster-parse-", suffix=".tmp", dir=str(out_dir)
+    )
+    path = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return _parse_capture(parse_roster, path)
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
-    Returns ``None`` for any other refusal kind, so the parser's own reason
-    stands alone.
-    """
-    if declares_boundary is None:
-        return None
-    match = re.search(r"roster line (\d+)\b", refusal_text)
-    if not match:
-        return None
-    produced_lineno = int(match.group(1))
-    if not 1 <= produced_lineno <= len(out_lines):
-        return None
-    produced = out_lines[produced_lineno - 1]
-    if not produced.startswith("A\t"):
-        return None
-    if declares_boundary(produced[2:]):
-        return None
-    source_lineno = entries[produced_lineno - 1][0]
+
+def _assert_parser_understands_format2(
+    parse_roster, scanner_path: Path, *, out_dir: Path, use_file: bool
+) -> None:
+    """Positive control: a stale format-1 parser accepts format-2 text."""
+    for _label, probe in PROBE_ROSTERS:
+        try:
+            code, _refusal = _parse_text(
+                parse_roster, probe, out_dir=out_dir, use_file=use_file
+            )
+        except Exception as exc:  # noqa: BLE001
+            _fail(
+                1,
+                f"the scanner at {scanner_path} could not validate the "
+                f"two-class format ({type(exc).__name__}); an unvalidated "
+                "roster is never emitted",
+            )
+        if code is None:
+            _fail(
+                1,
+                f"the scanner at {scanner_path} predates the two-class "
+                "format; an unvalidated roster is never emitted",
+            )
+
+
+def _pattern_is_wider_than_name(pattern: str, declares_boundary) -> bool:
+    """True when a class-B pattern is wider than the bare name it matched."""
+    if not declares_boundary(pattern):
+        return True
+    text = pattern
+    if text.startswith("(?i)"):
+        text = text[4:]
+    text = text.replace("\\b", "")
+    return any(char in METACHARS for char in text)
+
+
+def _no_boundary_message(linenos: "list[int]") -> str:
+    joined = ", ".join(str(n) for n in linenos)
+    noun = "line" if len(linenos) == 1 else "lines"
     return (
-        f"produced line {produced_lineno} (source roster line {source_lineno}) "
-        "is a class-A pattern that declares no boundary. This tool will NOT "
-        "rewrite the pattern: the roster must declare the boundary itself -- "
-        "\\b, a lookaround, or ^/$ -- on that source line. Fix the source "
-        "line and re-run."
+        f"{len(linenos)} class-A line(s) declare no boundary: source roster "
+        f"{noun} {joined}. This tool will NOT rewrite the pattern: the roster "
+        "must declare the boundary itself -- \\b, a lookaround, or ^/$ -- on "
+        "each such line. Nothing written."
     )
 
 
@@ -228,8 +394,8 @@ def main(argv: "list[str] | None" = None) -> int:
         description=(
             "Convert a format-1 roster (one regex per line) to format 2\n"
             "(A<TAB>pattern blocks, B<TAB>pattern is report-only), printing\n"
-            "only counts, the sha256 and the class-B names. Never prints a\n"
-            "roster line."
+            "only counts, sha256 values and the class-B names. Never prints\n"
+            "a roster line."
         ),
         epilog=(
             "Name rule (applied to each roster line and to each B-file entry):\n"
@@ -243,10 +409,32 @@ def main(argv: "list[str] | None" = None) -> int:
             "one-sided \\b is a prefix/suffix match, a different pattern, so it\n"
             "is kept and that line stays class A. Case is folded only when the\n"
             "pattern declares (?i); without it the comparison is case-sensitive.\n"
-            "The tool never rewrites the emitted pattern. A line that matches\n"
-            "nothing is class A, so a failed match blocks a name unnecessarily\n"
-            "and is visible, rather than classifying a private name as\n"
-            "report-only.\n"
+            "The tool never rewrites the emitted pattern.\n"
+            "\n"
+            "Input identity: the input roster's canonical sha256 (all trailing\n"
+            "newlines stripped, exactly one appended) must equal the attested\n"
+            "roster_sha256; otherwise the tool exits 2 and writes nothing.\n"
+            "--attestation PATH overrides the default, which is derived from\n"
+            "the scanner path as <repo>/.github/name-leak-roster.attestation.json.\n"
+            "\n"
+            "Parser identity: the loaded parser is probed with two synthetic\n"
+            "format-2 rosters (an invalid class token; a class-A line with no\n"
+            "declared boundary). A parser that accepts either predates the\n"
+            "two-class format; the tool exits 1 and writes nothing.\n"
+            "\n"
+            "Class-A boundaries: every class-A line is checked with the\n"
+            "scanner's own _declares_boundary. If any lack one, the tool lists\n"
+            "ALL their source line numbers and exits 2 without parsing or\n"
+            "writing. It never adds a boundary.\n"
+            "\n"
+            "Class-B width: a class-B line whose pattern declares no boundary,\n"
+            "or contains regex metacharacters beyond \\b and a leading (?i),\n"
+            "is reported as b_wider_than_its_name. A warning only.\n"
+            "\n"
+            "--dry-run runs the whole pipeline, prints counts, every class-A\n"
+            "line without a declared boundary (by source line number) and the\n"
+            "unmatched permitted names, and writes no file. It exits 2 if the\n"
+            "real run would be refused.\n"
             "\n"
             "Output: DIR/roster-format2.txt, created mode 0600 by os.open and\n"
             "refused when it already exists unless --force is passed. Nothing\n"
@@ -271,8 +459,19 @@ def main(argv: "list[str] | None" = None) -> int:
              "the script's sibling, then src/engram/tools/scan-leaks.py).",
     )
     parser.add_argument(
+        "--attestation", metavar="PATH", default=None,
+        help="Attestation JSON holding the live roster's canonical sha256 "
+             "(default: <repo>/.github/name-leak-roster.attestation.json, "
+             "derived from the scanner path).",
+    )
+    parser.add_argument(
         "--force", action="store_true",
         help="Overwrite an existing DIR/roster-format2.txt.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Run the whole pipeline and print the audit, but write no file. "
+             "Exits 2 if the real run would be refused.",
     )
     args = parser.parse_args(argv)
 
@@ -280,13 +479,54 @@ def main(argv: "list[str] | None" = None) -> int:
     if not out_dir.is_dir():
         _fail(1, "--out-dir is not an existing directory; refusing to create it")
 
-    # ---- read the roster -------------------------------------------------
-    roster_text = _read_text(Path(args.roster).expanduser(), "the roster")
+    # ---- read the roster: bytes for the canonical hash, text for parsing ---
+    roster_path = Path(args.roster).expanduser()
+    try:
+        roster_bytes = roster_path.read_bytes()
+    except OSError as exc:
+        _fail(1, f"cannot read the roster ({type(exc).__name__})")
+    try:
+        roster_text = roster_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _fail(1, f"cannot decode the roster as UTF-8 ({type(exc).__name__})")
+    input_sha = hashlib.sha256(roster_bytes.rstrip(b"\n") + b"\n").hexdigest()
     raw_lines = roster_text.splitlines()
     total_input_lines = len(raw_lines)
 
+    # ---- resolve and load the real parser, then prove it knows format 2 ----
+    scanner_path = _resolve_scanner(args.scanner)
+    if scanner_path is None:
+        tried = ", ".join(str(c) for c in _scanner_candidates(args.scanner))
+        _fail(
+            1,
+            "no scanner found; the roster cannot be validated without the "
+            f"parser, and an unvalidated roster is never emitted (tried: {tried})",
+        )
+    parser_fns = _load_parser(scanner_path)
+    if parser_fns is None:
+        _fail(
+            1,
+            f"{scanner_path} has no usable load_roster_file; the roster cannot "
+            "be validated without the parser. Nothing written.",
+        )
+    parse_roster, declares_boundary = parser_fns
+    _assert_parser_understands_format2(
+        parse_roster, scanner_path, out_dir=out_dir, use_file=not args.dry_run
+    )
+    if declares_boundary is None:
+        _fail(
+            1,
+            f"{scanner_path} has no _declares_boundary; class-A boundaries "
+            "cannot be audited, and an unvalidated roster is never emitted. "
+            "Nothing written.",
+        )
+
+    # ---- the input must be the live list ----------------------------------
+    attestation_path = _resolve_attestation(args.attestation, scanner_path)
+    attested_sha = _verify_attestation(attestation_path, input_sha)
+
     # R3: refuse a roster that is already class-prefixed, naming the first
-    # offending 1-based line. Do this before anything else touches the file.
+    # offending 1-based line.
     for lineno, raw in enumerate(raw_lines, start=1):
         stripped = raw.strip()
         if _skippable(stripped):
@@ -319,7 +559,7 @@ def main(argv: "list[str] | None" = None) -> int:
 
     # ---- classify --------------------------------------------------------
     out_lines = []
-    b_roster_matches = []  # (roster input line number, permitted B name)
+    b_lines = []  # (source line number, pattern text, permitted name)
     class_a = 0
     class_b = 0
     for lineno, pattern in entries:
@@ -331,7 +571,7 @@ def main(argv: "list[str] | None" = None) -> int:
         if matched_name is not None:
             class_b += 1
             out_lines.append("B\t" + pattern)
-            b_roster_matches.append((lineno, matched_name))
+            b_lines.append((lineno, pattern, matched_name))
         else:
             class_a += 1
             out_lines.append("A\t" + pattern)
@@ -354,68 +594,77 @@ def main(argv: "list[str] | None" = None) -> int:
     canonical = produced.rstrip("\n") + "\n"
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    # ---- resolve and load the real parser --------------------------------
+    # ---- audit EVERY class-A line's boundary, all of them -----------------
+    no_boundary = [
+        entries[index][0]
+        for index, line in enumerate(out_lines)
+        if line.startswith("A\t")
+        and not declares_boundary(entries[index][1])
+    ]
+    if no_boundary and not args.dry_run:
+        _fail(2, _no_boundary_message(no_boundary))
+
+    wider_b = [
+        (lineno, name)
+        for lineno, pattern, name in b_lines
+        if _pattern_is_wider_than_name(pattern, declares_boundary)
+    ]
+
+    # ---- dry run: report the whole audit, write nothing -------------------
+    if args.dry_run:
+        code, refusal = _parse_text(
+            parse_roster, produced, out_dir=out_dir, use_file=False
+        )
+        if refusal:
+            # The parser's own reason, verbatim (line number only).
+            sys.stderr.write(refusal)
+        print("dry_run: true")
+        print(f"total_input_lines: {total_input_lines}")
+        print(f"blank_or_comment_skipped: {skipped}")
+        print(f"class_a: {class_a}")
+        print(f"class_b: {class_b}")
+        for lineno, name in ((ln, nm) for ln, _pat, nm in b_lines):
+            print(f"  line {lineno}: {name}")
+        for lineno, name in wider_b:
+            print(f"b_wider_than_its_name: source roster line {lineno}: {name}")
+        print(f"class_a_without_boundary: {len(no_boundary)}")
+        for lineno in no_boundary:
+            print(f"  no_boundary_source_line: {lineno}")
+        print(f"b_names_with_no_match: {len(unmatched_b)} of {len(b_entries)}")
+        for name in unmatched_b:
+            print(f"  unmatched_b_name: {name}")
+        print(f"roster_sha256: {digest}")
+        print(f"attestation: {attestation_path}")
+        print(f"attested_roster_sha256: {attested_sha}")
+        print("roster_format: 2")
+        print(f"pattern_count_a: {class_a}")
+        print(f"pattern_count_b: {class_b}")
+        print(f"name_key: {NAME_KEY_RULE}")
+        print(f"scanner: {scanner_path}")
+        print("output: none (dry run)")
+        refused = bool(no_boundary) or code is not None
+        print(f"dry_run_result: {'would refuse' if refused else 'would succeed'}")
+        return 2 if refused else 0
+
+    # ---- real run: one output file, validated first -----------------------
     out_path = out_dir / OUTPUT_NAME
     if out_path.exists() and not args.force:
         _fail(2, f"{out_path} already exists; pass --force to overwrite. "
                  "Nothing written.")
 
-    scanner_path = _resolve_scanner(args.scanner)
-    if scanner_path is None:
-        tried = ", ".join(str(c) for c in _scanner_candidates(args.scanner))
+    code, refusal = _parse_text(
+        parse_roster, produced, out_dir=out_dir, use_file=True
+    )
+    if code is not None:
+        if refusal:
+            # The parser's own reason, verbatim (line number only).
+            sys.stderr.write(refusal)
         _fail(
-            1,
-            "no scanner found; the roster cannot be validated without the "
-            f"parser, and an unvalidated roster is never emitted (tried: {tried})",
+            2,
+            "the produced roster was refused by the parser "
+            f"(exit {code}); nothing written.",
         )
-    parser_fns = _load_parser(scanner_path)
-    if parser_fns is None:
-        _fail(
-            1,
-            f"{scanner_path} has no usable load_roster_file; the roster cannot "
-            "be validated without the parser. Nothing written.",
-        )
-    parse_roster, declares_boundary = parser_fns
 
-    # ---- validate from a 0600 temp file INSIDE --out-dir ------------------
-    temp_path = None
-    try:
-        fd, temp_name = tempfile.mkstemp(
-            prefix=".rotate-roster-validate-", suffix=".tmp", dir=str(out_dir)
-        )
-        temp_path = Path(temp_name)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(produced)
-        try:
-            code, refusal = _run_parser(parse_roster, temp_path)
-        except Exception as exc:  # noqa: BLE001
-            _fail(
-                1,
-                "the scanner's load_roster_file raised "
-                f"{type(exc).__name__}; nothing written.",
-            )
-        if code is not None:
-            if refusal:
-                # The parser's own reason, verbatim (line number only).
-                sys.stderr.write(refusal)
-            guidance = _refusal_guidance(
-                refusal, entries, out_lines, declares_boundary
-            )
-            if guidance:
-                print(f"rotate_roster_format: {guidance}", file=sys.stderr)
-            _fail(
-                2,
-                "the produced roster was refused by the parser "
-                f"(exit {code}); nothing written.",
-            )
-    finally:
-        if temp_path is not None:
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-
-    # ---- write the one output file, 0600 by os.open ----------------------
     if out_path.exists():  # --force was passed to get here
         try:
             out_path.unlink()
@@ -440,12 +689,16 @@ def main(argv: "list[str] | None" = None) -> int:
     print(f"blank_or_comment_skipped: {skipped}")
     print(f"class_a: {class_a}")
     print(f"class_b: {class_b}")
-    for lineno, name in b_roster_matches:
+    for lineno, name in ((ln, nm) for ln, _pat, nm in b_lines):
         print(f"  line {lineno}: {name}")
+    for lineno, name in wider_b:
+        print(f"b_wider_than_its_name: source roster line {lineno}: {name}")
     print(f"b_names_with_no_match: {len(unmatched_b)} of {len(b_entries)}")
     for name in unmatched_b:
         print(f"  unmatched_b_name: {name}")
     print(f"roster_sha256: {digest}")
+    print(f"attestation: {attestation_path}")
+    print(f"attested_roster_sha256: {attested_sha}")
     print("roster_format: 2")
     print(f"pattern_count_a: {class_a}")
     print(f"pattern_count_b: {class_b}")
