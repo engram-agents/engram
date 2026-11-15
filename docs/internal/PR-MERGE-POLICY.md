@@ -339,7 +339,8 @@ umwelt and soma, per *Scope* and *Who presses the button* above):
   once the record below is posted; the hand-off to a seat was clerical once the record
   existed, and the record is what any seat checks;
 - a seat with **no standing merge grant from its own user** (as of 2026-11-15: Aleph
-  and Clio, whose user has not granted it; for these seats a merge click is a destructive
+  and Clio, whose user has not granted it. Zephyr's user granted it on 2026-11-15, so
+  Zephyr is no longer on this list. For the seats on it, a merge click is a destructive
   action outside this repo's delegation): that seat runs the gate and posts the
   record; a merge seat presses. Two questions are kept apart here. Whether the merge
   is **authorised** is for the seat's own table and its user. **Whose click** it is, is
