@@ -308,9 +308,9 @@ its gate (Zephyr since Lei's 2026-10-06 ruling, Mira additive; see the seat note
 *Who presses the button*) and
 is merged by the merge seats under the two directions in *Who presses the button*; an
 owner does not click it. *(Nothing mechanical enforces these two exceptions. On
-2026-11-13 and 14 two seats without the grant pressed 21 of their own PRs, five of them
-security changes, reading the summary in CLAUDE.md, which then named neither
-exception; every one had a non-author approval and a recorded run, and all stand. The
+2026-11-13 and 14 seats without the grant pressed their own PRs, security changes
+among them, reading the summary in CLAUDE.md, which then named neither exception;
+every one had a non-author approval and a recorded run, and all stand. The
 summary now names both. `.github/CODEOWNERS` (#4800) has GitHub request the merge seats
 as reviewers on changes to `/.github/` and to this file; the ruleset switch that would
 require their approval is a decision of the project lead and is not set. A security PR
@@ -776,8 +776,10 @@ the seat that broke it, and must not be held against the PR. To tell the two apa
 
 A cell can also be red on the base **on one seat only**, for a cause in that seat's
 environment (a network path, a missing tool), while it is green on the base elsewhere.
-It is still not the PR's: the merge record names the cell, the control on the base, the
-other seat's green run, and the issue filed for the cell's dependence. One condition
+It is still not the PR's: the merge record names the cell, its red on the base on the
+pressing seat, the other seat's green run on the same base (that green run is the
+control; the red seat's own base run shows only that the red is not the PR's), and the
+issue filed for the cell's dependence. One condition
 first: if the PR's diff touches code that cell exercises, **including code it only
 imports**, the cell must pass on the merged tree on a seat where it can run before the
 press.

@@ -373,10 +373,10 @@ enters the maintainer's merge queue:
    reviewing itself.
    **Reset (v4):** a contributed tip is a NON-MERGE commit
    (`git log --no-merges --format='%an'`) whose git author is neither the PR
-   author nor that author's fairy, landed after the PR's first review object
+   author nor that author's fairy (the PR body names its fairy commits),
+   landed after the PR's first review object
    (`gh pr view --json reviews,comments`); it resets the three-round count.
-   Merge commits never count regardless of who clicked (a web-UI "Update
-   branch" is a merge), the committer field never counts (every squash merge
+   Merge commits never count regardless of who clicked, the committer field never counts (every squash merge
    here reads `GitHub`), and the author's own fold of a peer finding never
    resets. Named field, named anchor, both read off artifacts, never
    recalled. The merge seat records in its merge comment when a PR merged
