@@ -2131,6 +2131,8 @@ def _body_identities() -> list:
 AUTH_MODES = ("report", "enforce")
 AUTH_REPORT_MAX_HOURS = 72
 _INVALID_NAME = "<invalid-name>"
+_TOO_LONG_NAME = "<too-long>"
+_AUTH_NAME_MAX = 128  # a longer name is written as "<too-long> len=N", never as text
 _AUTH_UNTIL_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z")
 _AUTH_OVERDUE_EVERY = 3600  # seconds between the loud overdue lines
 
@@ -2188,21 +2190,27 @@ class _AuthReport:
     """The append-only auth report: one JSON line per guarded request.
 
     Opened at startup (create-if-absent 0640; any failure is an OSError for the caller to
-    refuse on). ``record`` writes each line with ONE ``os.write`` on an ``O_APPEND``
+    refuse on). The open is append-only (``O_APPEND``, never ``O_TRUNC``) and refuses a
+    symlink (``O_NOFOLLOW``). ``record`` writes each line with ONE ``os.write`` on that
     descriptor, so concurrent requests cannot interleave a line, and NEVER raises: a failed
     append is counted (``failures``, shown on /health), logged to stderr on the first
-    failure and then every 100th, and the request proceeds."""
+    failure and then every 100th, and the request proceeds. A file that was deleted after
+    start (``st_nlink == 0``) makes every record a failure, since nobody could read it."""
 
     def __init__(self, path) -> None:
         self.path = str(path)
         create_if_absent(self.path)
-        self.fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0))
+        self.fd = os.open(
+            self.path,
+            os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
         self.failures = 0
         self._lock = threading.Lock()
 
     def record(self, rec: dict) -> None:
         try:
             line = (json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+            if os.fstat(self.fd).st_nlink == 0:
+                raise OSError(errno.ENOENT, "the report file was deleted after start")
             if os.write(self.fd, line) != len(line):
                 raise OSError(errno.EIO, "short write")
         except Exception as exc:  # noqa: BLE001 -- the report must never refuse a request
@@ -2225,7 +2233,10 @@ def _report_identity(value):
     except _RequestRefusal:
         n = len(value) if isinstance(value, str) else len(str(value))
         return f"{_INVALID_NAME} len={n}"
-    return _identity_text(text)
+    name = _identity_text(text)
+    if name is not None and len(name) > _AUTH_NAME_MAX:
+        return f"{_TOO_LONG_NAME} len={len(name)}"
+    return name
 
 
 def _report_named(values) -> list:
@@ -2239,8 +2250,13 @@ def _report_named(values) -> list:
 
 def _verdict_for_token(values, token_agent) -> str:
     """``mismatch`` when any named value differs from the token's agent (the guard's own
-    rule), else ``match``."""
+    rule), else ``match``. A MALFORMED value (the same check the handlers apply) is never the
+    token's agent, whatever its ``str()`` reads: it is ``mismatch`` by a fixed rule."""
     for v in values:
+        try:
+            _read_ident("", "agent", v, lower=False)
+        except _RequestRefusal:
+            return "mismatch"
         name = _identity_text(v)
         if name is not None and name != token_agent:
             return "mismatch"
@@ -2488,7 +2504,9 @@ def create_app(
     # resolve is still 401, a valid token for another agent is still 403, and several
     # differing identities on a tokenless request are 403. Every guarded request gets
     # one report line, written before any refusal is returned. On a valid token the
-    # two modes run the same code.
+    # two modes run the same code. The line holds no request text outside ``named``
+    # (validated identities, length-capped); the route is the matched rule or the fixed
+    # "<METHOD> <unmatched>", never the raw path.
     # ------------------------------------------------------------------
     report_mode = auth_mode == "report"
     overdue_state = {"logged": None}
@@ -2509,12 +2527,19 @@ def create_app(
                   "--auth-report-until if the owner extends the window.", file=sys.stderr)
         return True
 
+    def _report_route() -> str:
+        """The route as the REPORT may hold it: the matched rule (normalised), or the fixed
+        ``<METHOD> <unmatched>`` when routing matched none. Never the raw request path."""
+        if request.url_rule is None:
+            return f"{request.method} <unmatched>"
+        return _route_label()
+
     def _record_auth(write: bool, values, verdict: str, token_agent, outcome) -> None:
         _auth_overdue()
         auth_report.record({
             "ts": _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "method": request.method,
-            "route": _route_label(),
+            "route": _report_route(),
             "kind": "write" if write else "read",
             "named": _report_named(values),
             "verdict": verdict,

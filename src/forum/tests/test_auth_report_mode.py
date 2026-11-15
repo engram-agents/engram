@@ -10,8 +10,11 @@ Contract (written before the implementation; cell numbers follow the spec):
   token for another agent than the one named is still 403, in BOTH modes. Every guarded
   request gets exactly one report line, written before any refusal is returned, with
   exactly the fields ``ts, method, route, kind, named, verdict, token_agent, outcome``.
-* The report never holds a token, a header, the body, the query string beyond validated
-  identities, the source address, or the raw text of a malformed identity.
+* The report holds no request text outside its ``named`` field: no token, header, body,
+  query string, source address or path (an unmatched route is the fixed ``<METHOD>
+  <unmatched>``). ``named`` holds only validated identities of at most 128 characters; a
+  malformed one is ``<invalid-name> len=N`` and a longer one ``<too-long> len=N``. (The
+  method is written as the server read it.)
 * A report that cannot be opened exits 78; a failed append is counted (``/health``
   ``auth_report_failures``), logged, and the request proceeds.
 * ``--auth-report-until`` (at most 72 h ahead) is required with ``report``; past it the
@@ -1325,7 +1328,7 @@ def test_c5b_a_report_file_removed_after_start_counts_every_record_as_a_failure(
 
 
 # C6: a malformed name under a valid token is `mismatch` by a fixed rule --------
-@pytest.mark.parametrize("token_agent,bad,n", [("5", 5, 1), ("alice", None, 4), ("a", ["a"], 3)],
+@pytest.mark.parametrize("token_agent,bad,n", [("5", 5, 1), ("alice", None, 4), ("a", ["a"], 5)],
                          ids=["int-equal-to-agent", "null", "list-equal-to-agent"])
 def test_c6_malformed_name_under_a_valid_token_is_mismatch_by_a_fixed_rule(
         owned_tmp, token_agent, bad, n):

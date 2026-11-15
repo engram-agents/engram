@@ -93,8 +93,11 @@
 #                       line per guarded request to. Letters, digits and / . _ - only.
 #   --auth-report-until TIME
 #                       with `--auth-mode report` only (required there, refused with
-#                       enforce): UTC time like 2026-11-16T00:00:00Z. The server refuses to
-#                       start when it is more than 72 hours after start, and past it keeps
+#                       enforce): UTC time like 2026-11-16T00:00:00Z. The installer refuses
+#                       (exit 2, nothing written) a time that is not a real date and time or
+#                       is more than 72 hours from now, because the server would then exit 78
+#                       and the unit would stay down. The server checks it again at start,
+#                       and past it keeps
 #                       serving but logs one loud line per hour and shows
 #                       auth_report_overdue on /health.
 #   --dry-run           print every action without executing (CI-safe)
@@ -769,6 +772,27 @@ if [ "$AUTH_MODE" = "report" ]; then
     echo "ERROR: --auth-mode report requires --auth-report PATH and --auth-report-until TIME. Nothing was written." >&2
     exit 2
   fi
+  # The server refuses to start on an impossible date or one more than 72 hours ahead
+  # (exit 78), and the unit's RestartPreventExitStatus=78 would then leave the live forum
+  # down. So refuse here, before any write. python3 is already this installer's own
+  # dependency (the venv step, the loopback probe), and it avoids a GNU-only `date -d`.
+  _until_rc=0
+  python3 -B -c '
+import datetime as d, re, sys
+m = re.fullmatch(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z", sys.argv[1])
+try:
+    t = d.datetime(*map(int, m.groups()))
+except (ValueError, AttributeError):
+    sys.exit(3)
+now = d.datetime.now(d.timezone.utc).replace(tzinfo=None)
+sys.exit(4 if t - now > d.timedelta(hours=72) else 0)
+' "$AUTH_UNTIL" >/dev/null 2>&1 || _until_rc=$?
+  case "$_until_rc" in
+    0) ;;
+    3) echo "ERROR: --auth-report-until must be a real UTC date and time like 2026-11-16T00:00:00Z (got '$AUTH_UNTIL'). Nothing was written." >&2; exit 2 ;;
+    4) echo "ERROR: --auth-report-until '$AUTH_UNTIL' is more than 72 hours from now; the server would refuse to start. Nothing was written." >&2; exit 2 ;;
+    *) echo "ERROR: could not check --auth-report-until (python3 failed, status $_until_rc). Nothing was written." >&2; exit 2 ;;
+  esac
 else
   if [ -n "$AUTH_REPORT" ] || [ -n "$AUTH_UNTIL" ]; then
     echo "ERROR: --auth-report and --auth-report-until are only for --auth-mode report. Nothing was written." >&2

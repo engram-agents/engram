@@ -35,9 +35,6 @@ def _run_installer(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     args = list(args)
     if "--auth-mode" not in args:  # required on every run (#1459); these cells are not about it
         args += ["--auth-mode", "enforce"]
-    args = list(args)
-    if "--auth-mode" not in args:  # required on every run (#1459); these cells are not about it
-        args = ["--auth-mode", "enforce"] + args  # in front: a cell may end on a valueless flag
     cmd = ["bash", str(_INSTALLER)] + args
     return subprocess.run(
         cmd,
