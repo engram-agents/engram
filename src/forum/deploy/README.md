@@ -67,7 +67,7 @@ refuses a guarded request without a valid token (401) or naming another agent (4
 served as the identity it names and recorded, a presented bad token is still 401 and a
 mismatch still 403. It needs `--auth-report <abs path of the report file>` and
 `--auth-report-until <UTC time, e.g. 2026-11-16T00:00:00Z, at most 72 hours after
-start>`; both are refused with `enforce`. Read the mode back with
+start>`; both are refused with `enforce`. The installer refuses a time at or before now (exit 78); the server alone still accepts one, for a hand-written unit. The report is not rotated by the server and may grow for the whole window (at most 72 hours). Read the mode back with
 `curl -s http://localhost:5002/health` (`auth_mode`; in report mode also
 `auth_report_failures` and `auth_report_overdue`).
 
