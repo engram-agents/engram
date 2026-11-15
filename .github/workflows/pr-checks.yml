@@ -1531,11 +1531,15 @@ jobs:
 
       # ── 12. codeowners-gate ─────────────────────────────────────────────
       # Cheap stdlib+pytest guard on the CODEOWNERS coverage that
-      # .github/CODEOWNERS records for gate machinery. INERT as a merge stop:
-      # GitHub only requires the owner approval once require_code_owner_review
-      # is enabled on the dev-require-PR-approval ruleset, and that flip is the
-      # repository owner's, not this workflow's. This cell fails only when the
-      # file stops covering every tracked workflow, or stops covering itself.
+      # .github/CODEOWNERS records for gate machinery and for the
+      # instruction-bearing sources (the root CLAUDE.md, hooks, skills, agents
+      # and templates). require_code_owner_review was enabled on the
+      # dev-require-PR-approval ruleset on 2026-11-15, so an approval from a
+      # listed owner is now required before a PR touching a covered path can
+      # merge; this cell is the coverage check behind that requirement. It
+      # fails when the file stops covering every tracked workflow, stops
+      # covering any tracked file under an instruction scope, or stops
+      # covering itself.
       - name: Set up Python 3.12 (codeowners-gate)
         id: setup-python-codeowners
         if: success() || failure()
