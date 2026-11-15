@@ -708,7 +708,7 @@ def core(monkeypatch):
 
 
 def test_cell8_latest_schema_version_is_10_and_the_rung_constant_is_tied_to_the_ladder():
-    assert engram_core.LATEST_SCHEMA_VERSION == 10
+    assert engram_core.LATEST_SCHEMA_VERSION == 11
     assert engram_core.CASCADE_RESOLVED_KIND_RUNG == 10 > engram_core.TEXT_NUL_GUARD_RUNG == 9
     src = Path(engram_core.__file__).read_text(encoding="utf-8")
     block = src.split("# Migration version 10 (#4075", 1)[1].split("# #2732 (A)", 1)[0]
@@ -720,13 +720,13 @@ def test_cell8_rung_preserves_every_marker_row_and_reaches_version_10(core):
     _v8_store(core)
     before = _marker_dump(core)
     assert len(before) == len(_OLD_ROWS)
-    assert _ladder(core) == 10
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION
     assert _marker_dump(core) == before            # every column of every row, ids included
 
 
 def test_cell8_the_migrated_table_accepts_the_new_kind_and_keeps_its_constraints(core):
     _v8_store(core)
-    assert _ladder(core) == 10
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION
     c = _raw(core)
     try:
         c.execute("INSERT INTO cascade_markers (node_id, cascade_event, root_node, root_op, "
@@ -755,9 +755,9 @@ def test_cell8_the_migrated_table_accepts_the_new_kind_and_keeps_its_constraints
 
 def test_cell8_running_the_migration_twice_is_a_no_op(core):
     _v8_store(core)
-    assert _ladder(core) == 10
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION
     sql_once, rows_once = _table_sql(core), _marker_dump(core)
-    assert _ladder(core) == 10
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION
     assert _table_sql(core) == sql_once
     assert _marker_dump(core) == rows_once
 
@@ -806,7 +806,7 @@ def test_cell8_a_failed_pre_migration_backup_blocks_rung_10(core, capsys):
 
 def test_cell8_a_populated_v8_store_gets_a_pre_migration_backup_first(core):
     _v8_store(core)
-    assert _ladder(core) == 10
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION
     backups = sorted((Path(core.DATA_DIR) / "db-backup").glob("pre-migration-v8-*.db"))
     assert len(backups) == 1, [p.name for p in backups]
     b = sqlite3.connect(str(backups[0]))
@@ -836,10 +836,10 @@ def test_cell8_the_owner_schema_gate_refuses_a_store_still_at_8():
         with pytest.raises(eo.OwnerStoreBehindSchema):   # 9 is the NUL guard's rung, not ours
             eo._require_store_schema_current(db)
         c = sqlite3.connect(str(db))
-        c.execute("PRAGMA user_version = 10")
+        c.execute(f"PRAGMA user_version = {engram_core.LATEST_SCHEMA_VERSION}")
         c.commit()
         c.close()
-        eo._require_store_schema_current(db)        # at 10 it passes
+        eo._require_store_schema_current(db)        # at the latest version it passes (10 until #4727's rung 11)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -861,7 +861,7 @@ def test_rung_order_a_store_at_9_with_the_nul_guard_migrates_to_10_keeping_every
     assert _nul_triggers(core) == set(core._TEXT_NUL_GUARD_TRIGGER_NAMES)   # the dev-shaped store
     assert "'retracted', 'resolved')" not in _structural_sql(_table_sql(core))
     before = _marker_dump(core)
-    assert _ladder(core) == 10
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION
     assert _marker_dump(core) == before
     assert "'retracted', 'resolved')" in _structural_sql(_table_sql(core))
     assert _nul_triggers(core) == set(core._TEXT_NUL_GUARD_TRIGGER_NAMES)   # untouched
@@ -871,14 +871,14 @@ def test_rung_order_a_store_at_8_gets_both_rungs_in_order(core):
     _v8_store(core, version=8)
     assert _nul_triggers(core) == set()                                     # neither rung has run
     before = _marker_dump(core)
-    assert _ladder(core) == 10
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION
     assert _nul_triggers(core) == set(core._TEXT_NUL_GUARD_TRIGGER_NAMES)   # rung 9 applied
     assert "'retracted', 'resolved')" in _structural_sql(_table_sql(core))  # rung 10 applied
     assert _marker_dump(core) == before
 
 
 def test_rung_order_a_fresh_store_lands_at_10_with_the_guard_and_the_four_kind_check(core):
-    assert _ladder(core) == 10
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION
     assert _nul_triggers(core) == set(core._TEXT_NUL_GUARD_TRIGGER_NAMES)
     assert "'superseded', 'acknowledged', 'retracted', 'resolved'" in _structural_sql(_table_sql(core))
 
@@ -926,7 +926,7 @@ def test_round2_the_autoincrement_counter_is_carried_over_when_the_top_marker_wa
     assert c.execute("SELECT MAX(id) FROM cascade_markers").fetchone()[0] == 9
     assert _seq(c) == 12
     c.close()
-    assert _ladder(core) == 10
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION
     c = _raw(core)
     try:
         assert _seq(c) == 12
@@ -950,7 +950,7 @@ def test_round2_a_copy_whose_row_count_differs_rolls_back_and_the_next_start_suc
     conn.close()
     assert _marker_dump(core) == before
     assert _table_sql(core) == sql_before
-    assert _ladder(core) == 10                      # the retry on the next start works
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION                      # the retry on the next start works
     assert _marker_dump(core) == before
 
 
@@ -969,7 +969,7 @@ def test_round2_foreign_keys_are_off_around_the_copy_so_an_orphan_marker_survive
     core._rebuild_cascade_markers_for_resolved_kind(conn, _bump10(conn))
     assert [tuple(r) for r in conn.execute("PRAGMA foreign_key_check")] == fk_before
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1        # restored
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 10       # rung 10's own bump, called directly
     conn.close()
     assert _marker_dump(core) == before
 
@@ -1002,7 +1002,7 @@ def test_round2_a_fault_mid_rebuild_rolls_back_everything_and_the_next_start_suc
     conn.close()
     assert _marker_dump(core) == before
     assert _table_sql(core) == sql_before
-    assert _ladder(core) == 10                                              # next start succeeds
+    assert _ladder(core) == core.LATEST_SCHEMA_VERSION                                              # next start succeeds
     assert _marker_dump(core) == before
     assert "'retracted', 'resolved')" in _structural_sql(_table_sql(core))
 

@@ -157,10 +157,10 @@ def g(monkeypatch):
                       "VALUES (?, ?, 'acknowledged_derives_from', ?)", (A, R, core._now()))
             # N: a non-claim-bearing node that only CITES R; cites is not a cascade relation.
             c.execute("INSERT INTO nodes (id, type, created_at, claim, status, is_current) "
-                      "VALUES ('fl_4727', 'feeling_report', ?, 'N cites R', 'active', 1)",
+                      "VALUES ('fl_fixture_n', 'feeling_report', ?, 'N cites R', 'active', 1)",
                       (core._now(),))
             c.execute("INSERT INTO edges (source_id, target_id, relation, created_at) "
-                      "VALUES ('fl_4727', ?, 'cites', ?)", (R, core._now()))
+                      "VALUES ('fl_fixture_n', ?, 'cites', ?)", (R, core._now()))
             c.commit()
         finally:
             c.close()
@@ -171,7 +171,7 @@ def g(monkeypatch):
         _set_version(core, RUNG - 1)
         core._db_setup_done_paths.clear()
         yield dict(rev=rev, derive=derive, lifecycle=lifecycle, core=core, dir=d,
-                   R=R, O=O, D1=D1, D2=D2, A=A, S=S, S2=S2, N="fl_4727", live=live)
+                   R=R, O=O, D1=D1, D2=D2, A=A, S=S, S2=S2, N="fl_fixture_n", live=live)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -212,19 +212,22 @@ def test_cell1_marks_exactly_the_live_claim_bearing_dependents(g):
     assert {(r["status"], r["backfill_provenance"]) for r in rows} == {("pending", "migration_time")}
 
 
-def test_cell1b_one_summary_row_in_edit_history(g):
+def test_cell1b_one_edit_history_row_per_backfilled_root(g):
+    """One row per root that gained markers, keyed to that root (every edit_history
+    row is keyed to a node; node_id is NOT NULL)."""
     core = g["core"]
     _ladder(core)
     c = _raw(core)
     try:
-        rows = c.execute("SELECT details FROM edit_history WHERE action = 'retract_backfill'").fetchall()
+        rows = c.execute(
+            "SELECT node_id, details FROM edit_history WHERE action = 'retract_backfill'").fetchall()
     finally:
         c.close()
-    assert len(rows) == 1, rows
+    assert [r["node_id"] for r in rows] == [g["R"]], [tuple(r) for r in rows]
     details = json.loads(rows[0]["details"])
-    assert details["roots_found"] == 1, details
+    assert details["cascade_event"] == f"backfill:retract:{g['R']}", details
     assert details["markers_written"] == 3, details
-    assert details["nodes_marked"] == 3, details
+    assert details["nodes_marked"] == sorted([g["D1"], g["D2"], g["A"]]), details
 
 
 # ---------------------------------------------------------------------------
@@ -309,15 +312,15 @@ def test_cell6b_contradiction_nodes_are_not_backfilled(g):
     c = _raw(core)
     try:
         c.execute("INSERT INTO nodes (id, type, created_at, claim, status, is_current) "
-                  "VALUES ('ct_4727', 'contradiction', ?, 'R vs O', 'open', 1)", (core._now(),))
+                  "VALUES ('ct_fixture_x', 'contradiction', ?, 'R vs O', 'open', 1)", (core._now(),))
         for side in (g["R"], g["O"]):
             c.execute("INSERT INTO edges (source_id, target_id, relation, created_at) "
-                      "VALUES ('ct_4727', ?, 'contradicts', ?)", (side, core._now()))
+                      "VALUES ('ct_fixture_x', ?, 'contradicts', ?)", (side, core._now()))
         c.commit()
     finally:
         c.close()
     _ladder(core)
-    assert "ct_4727" not in _retract_marked(core, g["R"])
+    assert "ct_fixture_x" not in _retract_marked(core, g["R"])
 
 
 # ---------------------------------------------------------------------------
