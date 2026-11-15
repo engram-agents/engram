@@ -673,42 +673,47 @@ jobs:
               if roster_present
               else ""
           )
-          pattern_count = (
-              sum(
-                  1
-                  for line in canonical.splitlines()
-                  if line.strip() and not line.strip().startswith("#")
-              )
-              if roster_present
-              else 0
-          )
 
-          # Validate every roster pattern HERE, before any scan step can run.
-          # scan-leaks.py can report a bad line by number, but validating first
-          # makes the echoed-text path unreachable by construction: on failure
-          # this step prints the LINE NUMBER only and fails. Never print the
-          # pattern text — this is a public log and the roster is a name list.
-          invalid_pattern_line = None
+          # GRAMMAR CHECK ONLY — a pure text predicate over the raw roster,
+          # and nothing else. Do NOT compile a regex over roster lines and do
+          # NOT call the scanner's loader here: this step holds the roster
+          # secret, and on a same-repo pull request the scanner copy is
+          # contributor-controlled. The header's TWO-STEP split exists so that
+          # no contributor code runs while the secret is present (beyond the
+          # BOOTSTRAP scan itself). The scanner's `load_roster_file` stays the
+          # ONE parser — the class token, the no-default-class rule, the
+          # refuse-on-any-bad-line rule and the class-A boundary rule are its
+          # job; the per-class counts it reports after parsing are compared
+          # with the attestation below, inside this step, where the scanner is
+          # already running.
+          #
+          # This predicate only proves that every non-blank non-comment line
+          # starts with `A<TAB>` or `B<TAB>`, so a bad class letter fails
+          # BEFORE any scan. The pattern text is never printed — this is a
+          # public log and the roster is a name list: report the 1-based line
+          # number only.
+          bad_prefix_line = None
           for lineno, line in enumerate(canonical.splitlines(), start=1):
               stripped = line.strip()
               if not stripped or stripped.startswith("#"):
                   continue
-              try:
-                  re.compile(stripped)
-              except re.error:
-                  invalid_pattern_line = lineno
+              if not (stripped.startswith("A\t") or stripped.startswith("B\t")):
+                  bad_prefix_line = lineno
                   break
-          if invalid_pattern_line is not None:
+          if bad_prefix_line is not None:
               print(
                   "::error::NAME_LEAK_ROSTER line "
-                  f"{invalid_pattern_line} is not a valid regular expression. "
-                  "Fix the secret; the pattern text is deliberately not printed."
+                  f"{bad_prefix_line} does not start with A<TAB> or B<TAB>. "
+                  "Every roster line needs a class prefix (format 2); a line "
+                  "without one would be read by nothing. The pattern text is "
+                  "deliberately not printed."
               )
               raise SystemExit(1)
 
           attestation_present = False
           attestation_matches = False
-          attested_count = None
+          attested_count_a = None
+          attested_count_b = None
           attested_sha = None
           try:
               with open(os.environ["ATTESTATION_PATH"], encoding="utf-8") as fh:
@@ -717,14 +722,19 @@ jobs:
               attestation = None
 
           if isinstance(attestation, dict):
-              attested_count = attestation.get("pattern_count")
+              attested_count_a = attestation.get("pattern_count_a")
+              attested_count_b = attestation.get("pattern_count_b")
               attested_sha = attestation.get("roster_sha256")
-              # A valid attestation has schema 1, an integer pattern count and
-              # a 64-hex whole-file sha256. Anything else is "not present": a
-              # malformed or unset attestation must fail, never pass.
+              # A valid attestation has schema 2, an integer per-class count
+              # (both >= 0) and a 64-hex whole-file sha256. Anything else is
+              # "not present": a malformed or unset attestation must fail,
+              # never pass.
               if (
-                  attestation.get("roster_format") == 1
-                  and isinstance(attested_count, int)
+                  attestation.get("roster_format") == 2
+                  and isinstance(attested_count_a, int)
+                  and attested_count_a >= 0
+                  and isinstance(attested_count_b, int)
+                  and attested_count_b >= 0
                   and isinstance(attested_sha, str)
                   and re.fullmatch(r"[0-9a-f]{64}", attested_sha) is not None
               ):
@@ -885,6 +895,7 @@ jobs:
                   )
                   raise SystemExit(1)
               scanned = int(summaries[0][0])
+              skipped_binary = int(summaries[0][1])
               if scanned == 0:
                   print(
                       "::error::the whole-tree sweep did not run: the summary "
@@ -892,12 +903,6 @@ jobs:
                       "clean scan."
                   )
                   raise SystemExit(1)
-
-              print(
-                  f"name-leak sweep: scanned {scanned} file(s) "
-                  f"({summaries[0][1]} binary skipped) against "
-                  f"{pattern_count} roster pattern(s)."
-              )
 
               if scan.returncode != 0:
                   if scan.returncode == 1:
@@ -930,6 +935,47 @@ jobs:
                           "(usage, root, or internal error)."
                       )
                   raise SystemExit(1)
+
+              # THE ATTESTATION'S PER-CLASS COUNTS ARE CHECKED HERE, against
+              # the SCANNER'S parse — not against a count this step performed.
+              # `load_roster_file` is the one parser (header, and §2.7 of the
+              # format-2 spec), so this step may not re-implement the grammar
+              # and must not compile roster lines. A scanner that does not
+              # report the counts has not proven it parsed format 2, and a count
+              # that disagrees with the attestation means the roster the gate
+              # ran against is not the attested one; both fail closed. Counts
+              # are safe to print (per-class HASHES would be a membership
+              # oracle); the pattern text never is.
+              parsed_counts = re.findall(
+                  r"^scan-leaks: roster patterns A=(\d+), B=(\d+)$",
+                  scan.stdout,
+                  re.MULTILINE,
+              )
+              if len(parsed_counts) != 1:
+                  print(
+                      "::error::name-leak sweep: the scanner did not print one "
+                      "per-class roster count line "
+                      "('scan-leaks: roster patterns A=N, B=M'), so its parse "
+                      "of the roster cannot be compared with the attestation. "
+                      "Failing closed."
+                  )
+                  raise SystemExit(1)
+              parsed_a = int(parsed_counts[0][0])
+              parsed_b = int(parsed_counts[0][1])
+              if parsed_a != attested_count_a or parsed_b != attested_count_b:
+                  print(
+                      "::error::name-leak sweep: the attested per-class counts "
+                      "do not match the parsed roster "
+                      f"(attested A={attested_count_a}, B={attested_count_b}; "
+                      f"parsed A={parsed_a}, B={parsed_b}). Failing closed."
+                  )
+                  raise SystemExit(1)
+
+              print(
+                  f"name-leak sweep: scanned {scanned} file(s) "
+                  f"({skipped_binary} binary skipped) against "
+                  f"{parsed_a} class-A and {parsed_b} class-B roster pattern(s)."
+              )
           finally:
               try:
                   os.unlink(roster_path)
