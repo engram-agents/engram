@@ -1547,13 +1547,9 @@ def _cascade_recompute_confidence_transitive(conn, node_id: str) -> dict:
         seen.add(node_id)
         order.append(node_id)
 
-    # live_only=False: the subject may already be non-live (a retract / supersede
-    # root), and its own edges are then provenance by construction (#3542).
-    visited = {node_id}
-    for dep_id, _t, _r in core.dag_edge_set(
-            conn, _CASCADE_RELATIONS_SORTED, live_only=False, target_id=node_id):
-        _walk_cascade_downstream(conn, dep_id,
-                                 visited=visited, on_live_node=_collect)
+    # The subject may already be non-live (a retract / supersede root); the
+    # helper's first hop reads its edges with live_only=False (#3542, #4727).
+    core._walk_cascade_from_root(conn, node_id, on_live_node=_collect)
 
     changes = []
     skipped = []
@@ -1965,13 +1961,9 @@ def _cascade_auto_resolve_trivial(conn, node_id: str, now: str) -> list:
             seen.add(row["id"])
             candidates.append(row["id"])
 
-    # live_only=False: the subject may already be non-live (a retract / supersede
-    # root), and its own edges are then provenance by construction (#3542).
-    visited = {node_id}
-    for dep_id, _t, _r in core.dag_edge_set(
-            conn, _CASCADE_RELATIONS_SORTED, live_only=False, target_id=node_id):
-        _walk_cascade_downstream(conn, dep_id,
-                                 visited=visited, on_live_node=_collect)
+    # The subject may already be non-live (a retract / supersede root); the
+    # helper's first hop reads its edges with live_only=False (#3542, #4727).
+    core._walk_cascade_from_root(conn, node_id, on_live_node=_collect)
 
     auto = []
     resolved_here = set()
@@ -2592,48 +2584,11 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
 # ---------------------------------------------------------------------------
 
 
-def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
-    """Walk downstream from node_id following engram_core.CASCADE_RELATIONS
-    edges (the relations whose EDGE_CLASSIFICATIONS entry sets cascade=True —
-    today derives_from and acknowledged_derives_from, the latter
-    cascade-bearing by design per #2013 §12.5; the constant is the source of
-    truth, not this list). supported_by lost its cascade flag in #2252
-    Stage 1.3, and the W6 pairing edge predicted_by was minted cascade:False
-    from the start, so neither ever reaches this walk. Visits each
-    downstream node at most once. For each live
-    claim-bearing node visited, calls on_live_node(node) — the caller
-    decides what to write. Stops cascade at retracted/superseded nodes
-    (node not is_current) AND at any non-claim-bearing (NCB) node — an NCB
-    node has no claim to re-adjudicate, so cascade reaching it accomplishes
-    nothing (#2252 W0). Cornerstones/lessons are the vote-accumulator
-    *instance* of this rule, not the rule itself.
-
-    Visit pattern (Lei 2026-05-28): visited check is at the top of the call,
-    BEFORE on_live_node fires. This guarantees on_live_node fires exactly
-    once per downstream node regardless of how many paths reach it. The
-    caller seeds the cascade root into `visited` before calling so the root
-    isn't re-processed.
-    """
-    if node_id in visited:
-        return
-    visited.add(node_id)
-
-    node = conn.execute(
-        "SELECT id, type, claim, metadata FROM nodes "
-        "WHERE id = ? AND is_current = 1",
-        (node_id,),
-    ).fetchone()
-    if not node:
-        return  # retracted/superseded — stop cascade (parity with old _flag_stale)
-    if not core._is_claim_bearing(node["type"]):
-        return  # NCB: no claim to re-adjudicate, so nothing to taint (#2252 W0)
-
-    on_live_node(node)
-
-    for dep_id, _tgt, _rel in core.dag_edge_set(
-            conn, _CASCADE_RELATIONS_SORTED, target_id=node_id):
-        _walk_cascade_downstream(conn, dep_id,
-                                 visited=visited, on_live_node=on_live_node)
+# Promoted to engram_core (#4727): the walker and the two-step walk from a
+# root (core._walk_cascade_from_root) live there so a migration rung can run
+# the same walk; the four callers below go through the helper. The old name
+# stays bound here for server.py and the tests that import it from this module.
+_walk_cascade_downstream = core._walk_cascade_downstream
 
 
 # ---------------------------------------------------------------------------
@@ -3782,9 +3737,6 @@ def _supersede_impl(
         cascade_event = None
         if cascade_triggering:
             cascade_event = _new_cascade_event()
-            visited = {old_node_id}  # seed superseded node so walker won't process it
-            visited.add(new_node_id)  # also don't process the replacement
-
             def _on_live_for_supersede(dep):
                 _write_cascade_marker(conn, dep["id"], cascade_event,
                                        old_node_id, "supersede", now)
@@ -3796,15 +3748,12 @@ def _supersede_impl(
                     "replacement": new_node_id,
                 })
 
-            # Walk direct dependents of the superseded node.
-            # live_only=False: old_node_id has just stopped being live, so its
-            # own edges are provenance by construction (#3542).
-            for dep_id, _t, _r in core.dag_edge_set(
-                    conn, _CASCADE_RELATIONS_SORTED, live_only=False,
-                    target_id=old_node_id):
-                _walk_cascade_downstream(conn, dep_id,
-                                         visited=visited,
-                                         on_live_node=_on_live_for_supersede)
+            # Walk from the superseded node (direct dependents with
+            # live_only=False, then the walker; #3542, #4727). The superseded
+            # node and its replacement are both seeded so neither is processed.
+            core._walk_cascade_from_root(conn, old_node_id,
+                                         on_live_node=_on_live_for_supersede,
+                                         extra_visited=(new_node_id,))
 
             # Cascade to contradiction nodes that have old as a contradicting side
             # (issue #229): mark each affected contradiction with the SAME
@@ -4610,8 +4559,6 @@ def _retract_impl(
         cascade_event = None
         if cascade_triggering:
             cascade_event = _new_cascade_event()
-            visited = {node_id}  # seed retracted node so walker won't process it
-
             def _on_live_for_retract(dep):
                 _write_cascade_marker(conn, dep["id"], cascade_event,
                                        node_id, "retract", now)
@@ -4621,14 +4568,9 @@ def _retract_impl(
                     "claim": dep["claim"],
                 })
 
-            # Walk direct dependents of the retracted node.
-            # live_only=False: node_id has just stopped being live, so its own
-            # edges are provenance by construction (#3542).
-            for dep_id, _t, _r in core.dag_edge_set(
-                    conn, _CASCADE_RELATIONS_SORTED, live_only=False,
-                    target_id=node_id):
-                _walk_cascade_downstream(conn, dep_id,
-                                         visited=visited,
+            # Walk from the retracted node (direct dependents with
+            # live_only=False, then the walker; #3542, #4727).
+            core._walk_cascade_from_root(conn, node_id,
                                          on_live_node=_on_live_for_retract)
 
             # Cascade to contradiction nodes that have the retracted node as a
