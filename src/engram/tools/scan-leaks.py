@@ -35,8 +35,10 @@ ignored. Every line must carry a class; there is no default, and one bad line
 refuses the whole roster (exit 2). If NEITHER source supplies a pattern the
 scanner runs committed structural patterns only and prints one advisory line.
 
-Class A blocks and prints as a COUNT ONLY (no path, line, label or snippet: a
-location in a public log is a lasting pointer to a protected name). Class B is
+Class A blocks and prints as a COUNT ONLY by default (no path, line, label or
+snippet: a location in a public log is a lasting pointer to a protected name);
+`--show-class-a-locations` prints `path:line` only and refuses to run when
+GITHUB_ACTIONS is set. Class B is
 permitted content, prints per line, and never blocks. COMMITTED_PATTERNS, the
 local roster and absolute-home-path findings are class A in code — they are
 the patterns this instrument has always blocked on. When one line matches a
@@ -136,7 +138,57 @@ COMMITTED_PATTERNS = [
 # A class-A pattern must DECLARE a boundary — `\b`, a lookaround, or an anchor.
 # Refuse it otherwise, never rewrite it: a silently altered pattern is one
 # whose meaning differs from what its author wrote.  Class B is exempt.
-_A_BOUNDARY_MARKERS = ("\\b", "(?=", "(?!", "(?<=", "(?<!", "^", "$")
+def _declares_boundary(pattern_text: str) -> bool:
+    """True when the pattern DECLARES a boundary: ``\\b``, a lookaround, or an
+    unescaped ``^``/``$`` outside a character class.
+
+    The test is SYNTACTIC, not a substring scan (Ariadne's read, measured): the
+    walk tracks backslash escapes and character-class depth, and a marker
+    counts only at class-depth 0.  Inside ``[...]`` a ``^`` is a negated class,
+    ``\\b`` is a backspace, and ``(?=`` is literal text, so counting any of
+    them would accept a class-A pattern that declares no boundary at all.  The
+    two measured cases the old substring scan accepted are ``[^x]foo`` (a
+    negated class) and ``foo\\$`` (an escaped literal dollar).
+    """
+    depth = 0
+    i = 0
+    n = len(pattern_text)
+    while i < n:
+        ch = pattern_text[i]
+        if ch == "\\":
+            # An escape consumes the next character: `\\b` is an escaped
+            # backslash followed by a literal `b`, not a word boundary, and
+            # `\$` is a literal dollar, not an anchor.
+            if depth == 0 and i + 1 < n and pattern_text[i + 1] == "b":
+                return True
+            i += 2
+            continue
+        if depth:
+            # Inside a character class only an unescaped `]` closes it; `[` is
+            # a literal member (Python does not nest classes), never a new one.
+            if ch == "]":
+                depth = 0
+            i += 1
+            continue
+        if ch == "[":
+            depth = 1
+            i += 1
+            # `]` immediately after `[` or `[^` is a literal member, not the
+            # class terminator.
+            if i < n and pattern_text[i] == "^":
+                i += 1
+            if i < n and pattern_text[i] == "]":
+                i += 1
+            continue
+        if ch in "^$":
+            return True
+        if (pattern_text.startswith("(?=", i)
+                or pattern_text.startswith("(?!", i)
+                or pattern_text.startswith("(?<=", i)
+                or pattern_text.startswith("(?<!", i)):
+            return True
+        i += 1
+    return False
 
 LOCAL_CONFIG_NAME = ".scan-leaks-local.json"
 
@@ -392,6 +444,11 @@ def load_roster_file(path: Path) -> list[tuple[re.Pattern, str, str]]:
     Returns (compiled_regex, label, class) triples.  A format-1 roster — plain
     regex lines with no tab — is refused as "no class token"; that is intended,
     and the message tells the operator the line needs a class prefix.
+
+    ``str.splitlines()`` also splits on ``\\x0b``, ``\\x0c``, ``\\x1c``-``\\x1e``,
+    ``\\x85``, U+2028 and U+2029, so a roster line containing one becomes two
+    and the second is refused as having no class token — fail-closed, and no
+    parser change.
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -432,9 +489,7 @@ def load_roster_file(path: Path) -> list[tuple[re.Pattern, str, str]]:
             if isinstance(exc, re.error):
                 detail += f" at offset {exc.pos}"
             _refuse_roster(lineno, detail)
-        if class_token == CLASS_A and not any(
-            marker in pattern_text for marker in _A_BOUNDARY_MARKERS
-        ):
+        if class_token == CLASS_A and not _declares_boundary(pattern_text):
             _refuse_roster(
                 lineno,
                 "is a class-A pattern with no declared boundary; add \\b, a "
@@ -797,13 +852,28 @@ def _scan_leaks_cli():
                              "local roster")
     # A public CI log must not carry a name: `path:line [label] snippet`
     # prints it twice, so --redact keeps only the repo-relative path and line.
-    # Class A never prints a location at all, under any flag.
+    # Class A is count-only by default; the locator below is opt-in and OFF CI.
     parser.add_argument("--redact", action="store_true",
                         help="Print each class-B finding as "
                              "repo-relative-path:line only (no label, no "
                              "snippet); a no-op for class A, already "
-                             "count-only")
+                             "count-only by default")
+    parser.add_argument("--show-class-a-locations", action="store_true",
+                        help="Print each class-A hit as "
+                             "repo-relative-path:line only (never a snippet, a "
+                             "label or pattern text). Refused while "
+                             "GITHUB_ACTIONS is set, so it cannot be switched "
+                             "on in a public CI log")
     args = parser.parse_args()
+
+    # The locator is for a roster holder running off-CI.  A class-A location in
+    # a public CI log is a lasting pointer to a protected name, so the flag
+    # refuses the whole run rather than quietly printing locations.
+    if args.show_class_a_locations and "GITHUB_ACTIONS" in os.environ:
+        print("scan-leaks: --show-class-a-locations is refused while "
+              "GITHUB_ACTIONS is set: a class-A location in a public CI log "
+              "is a lasting pointer to a protected name", file=sys.stderr)
+        sys.exit(2)
 
     # Loaded here, inside main()'s try, before anything is scanned or printed:
     # a missing or unreadable sibling module is an internal error (exit 2),
@@ -905,9 +975,18 @@ def _scan_leaks_cli():
     print(f"scan-leaks: {class_a} class-A (blocking) and {class_b} "
           f"class-B (report-only) hit(s) in {_escape_path(str(root))}",
           file=sys.stderr)
-    # A class-A hit is a COUNT ONLY: no path, no line, no label, no snippet,
-    # under every flag.  A location in a public log is a lasting pointer to a
-    # name, and the log outlives the fix that removes it.
+    # A class-A hit is a COUNT ONLY by default: no path, no line, no label, no
+    # snippet.  A location in a public log is a lasting pointer to a name, and
+    # the log outlives the fix that removes it.  --show-class-a-locations is
+    # opt-in and off-CI (checked above) and prints `path:line` only; a
+    # class-A pattern hit and a home-path finding follow the same split.
+    if args.show_class_a_locations:
+        for rel, lineno, _label, _snippet, _klass in class_a_patterns:
+            print(f"{_escape_path(rel)}:{lineno}", file=sys.stderr)
+        for rel, lineno, _segment in home_findings:
+            print(f"{_escape_path(rel)}:{lineno}", file=sys.stderr)
+    # Class B is permitted content: it prints per line as `path:line [label]
+    # snippet`, or `path:line` under --redact.
     for rel, lineno, label, snippet, _klass in class_b_patterns:
         # Class B is permitted content by construction, so it keeps its tag.
         shown_rel = _escape_path(rel)
@@ -919,19 +998,23 @@ def _scan_leaks_cli():
     # entry names a string already published, so the fix is in the tree, never
     # in the roster.  Class B is permitted content and gets no "fix it" advice;
     # an absolute-home-path hit has nothing to do with the roster, so telling
-    # its operator to leave the roster alone is misdirection.
+    # its operator to leave the roster alone is misdirection.  Both class-A
+    # messages name the locator in EVERY mode: a count alone gives the operator
+    # nothing to fix and pushes them at the roster, which the tool forbids.
     if class_a_patterns:
         print(
             "scan-leaks: a class-A pattern hit means the string is already in "
             "the published tree; fix it in the release PR; do not widen or "
-            "edit the roster to silence it.",
+            "edit the roster to silence it. Run locally with "
+            "--show-class-a-locations to print path:line for these hits.",
             file=sys.stderr,
         )
     if home_findings:
         print(
             "scan-leaks: an absolute home path hit means a host path is in the "
             "published tree; remove it in the release PR. The roster does not "
-            "apply to this finding.",
+            "apply to this finding. Run locally with --show-class-a-locations "
+            "to print path:line for these hits.",
             file=sys.stderr,
         )
     if class_a:

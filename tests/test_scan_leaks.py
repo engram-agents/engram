@@ -1039,7 +1039,9 @@ def test_tracked_directory_symlink_is_scanned_by_its_link_text(tmp_path):
 #     NUMBER, exception class and (for re.error) offset — never by its text.
 #   - the "personal-name scan skipped" advisory fires only when BOTH roster
 #     sources produced no pattern.
-#   - class A prints a COUNT ONLY under every flag (including --redact);
+#   - class A prints a COUNT ONLY by default and under --redact;
+#     --show-class-a-locations (cell 18) is the only opt-in locator and turns
+#     itself off where GITHUB_ACTIONS is set;
 #     --redact keeps its meaning for class B: repo-relative-path:line only,
 #     with neither the matched text nor the label.
 #   - exit codes: 0 no class-A hit, 1 a class-A hit, 2 usage/roster parse.
@@ -2504,4 +2506,155 @@ def test_cell13_class_a_wins_on_a_shared_line(tmp_path, class_order):
     rel, lineno, label, _snippet, klass = report.findings[0]
     assert (rel, lineno, klass) == ("doc.md", 1, _mod.CLASS_A), report.findings
     assert label == "roster file", report.findings
+
+
+# ---------------------------------------------------------------------------
+# Test 21: the class-A locator (cell 18) and the syntactic boundary test
+# (cell 19) — round 4, from the second security read on the PR
+# ---------------------------------------------------------------------------
+#
+# Contract (spec roster-format2-loader §2.1, §2.3 and §4 cells 18-19):
+#   - a class-A hit prints a count only by default, and the class-A message
+#     NAMES `--show-class-a-locations` in every mode — a count alone leaves the
+#     operator with nothing to fix and pushes them at the roster;
+#   - `--show-class-a-locations` prints class-A hits as `path:line` only —
+#     never a snippet, a label or pattern text — for a class-A pattern hit AND
+#     for a home-path finding (the two class-A families follow the same split);
+#   - with `GITHUB_ACTIONS` set the flag REFUSES the run: exit 2, one line
+#     naming the reason, no location printed — it cannot be switched on in a
+#     public CI log;
+#   - the class-A boundary test is SYNTACTIC, not a substring scan: `[^x]foo`
+#     (a negated character class) and `foo\$` (an escaped literal dollar)
+#     declare NO boundary and are refused — they were accepted by the
+#     substring version, so they are this cell's discriminating inputs;
+#     `\bfoo\b`, `(?i)foo(?![a-z])`, `^foo` and `foo$` are accepted.
+#
+# Every fixture token below is invented and appears nowhere else.
+
+_LOCATOR_FLAG = "--show-class-a-locations"
+
+
+def _run_with_env(args, env_extra):
+    env = dict(os.environ)
+    env.update(env_extra)
+    return subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), *args],
+        capture_output=True, text=True, env=env,
+    )
+
+
+def test_cell18_class_a_locator_is_opt_in_and_refused_under_ci(tmp_path):
+    """Cell 18: the locator is opt-in, prints `path:line` and nothing else,
+    and turns itself off wherever GITHUB_ACTIONS is set."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    roster = _format2_roster(tmp_path, "A\t\\b" + _C2_NAME + "\\b\n")
+
+    # Default: count only, but the message names the locator so the operator
+    # knows how to find the hit without editing the roster.
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "1 class-A (blocking) and " + _C2_CLASS_SPLIT in r.stderr, out
+    assert "doc.md" not in out, out
+    assert _C2_NAME not in out, out
+    assert "[roster file]" not in out, out
+    assert _LOCATOR_FLAG in r.stderr, out
+
+    # Opted in: path:line only. The snippet ("hello") and the label must not
+    # appear, and the message still names the flag.
+    rl = _run_with_roster(root, roster, _LOCATOR_FLAG)
+    out_l = rl.stdout + rl.stderr
+    assert rl.returncode == 1, out_l
+    assert "doc.md:1" in rl.stderr, out_l
+    assert "hello" not in out_l, out_l
+    assert _C2_NAME not in out_l, out_l
+    assert "[roster file]" not in out_l, out_l
+    assert _LOCATOR_FLAG in rl.stderr, out_l
+
+    # CI: the flag refuses the whole run, one line, and no location.
+    rc = _run_with_env(
+        ["--root", str(root), "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster), _LOCATOR_FLAG],
+        {"GITHUB_ACTIONS": "true"},
+    )
+    out_c = rc.stdout + rc.stderr
+    assert rc.returncode == 2, out_c
+    lines = [ln for ln in rc.stderr.strip().splitlines() if ln.strip()]
+    assert len(lines) == 1, out_c
+    assert "GITHUB_ACTIONS" in rc.stderr, out_c
+    assert "doc.md" not in out_c, out_c
+    assert _C2_NAME not in out_c, out_c
+
+
+def test_cell18_home_path_locator_follows_the_same_split(tmp_path):
+    """Cell 18, home-path family: count-only by default with the flag named,
+    `path:line` under the flag, refused under CI. The segment never prints."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": "data in " + _home("zorbquux") + "x\n"})
+
+    r = _run_scan(root)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "doc.md" not in out, out
+    assert "zorbquux" not in out, out
+    assert _LOCATOR_FLAG in r.stderr, out
+
+    rl = _run_with_env(
+        ["--root", str(root), "--config-path", str(root / "no-config.json"),
+         _LOCATOR_FLAG],
+        {},
+    )
+    out_l = rl.stdout + rl.stderr
+    assert rl.returncode == 1, out_l
+    assert "doc.md:1" in rl.stderr, out_l
+    assert "zorbquux" not in out_l, out_l
+
+    rc = _run_with_env(
+        ["--root", str(root), "--config-path", str(root / "no-config.json"),
+         _LOCATOR_FLAG],
+        {"GITHUB_ACTIONS": "true"},
+    )
+    out_c = rc.stdout + rc.stderr
+    assert rc.returncode == 2, out_c
+    assert "doc.md" not in out_c, out_c
+    assert "zorbquux" not in out_c, out_c
+
+
+@pytest.mark.parametrize(
+    "pattern_text, accepted",
+    [
+        ("[^x]foo", False),
+        ("foo\\$", False),
+        ("\\bfoo\\b", True),
+        ("(?i)foo(?![a-z])", True),
+        ("^foo", True),
+        ("foo$", True),
+    ],
+)
+def test_cell19_boundary_test_is_syntactic(tmp_path, pattern_text, accepted):
+    """Cell 19: a boundary marker counts only where it IS one. `[^x]foo` holds
+    a negated class and `foo\\$` an escaped literal dollar; both were accepted
+    by the old substring scan and declare no boundary, so both are refused.
+    The four accepted rows are the real forms (word boundary, lookaround, and
+    the two anchors), and the tree is non-empty so exit 0 is a real clean run,
+    not "did not look"."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": "nothing here\n"})
+    roster = _format2_roster(tmp_path, "A\t" + pattern_text + "\n")
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    if accepted:
+        assert r.returncode == 0, out
+        assert "boundary" not in r.stderr, out
+    else:
+        assert r.returncode == 2, out
+        assert "line 1" in r.stderr, out
+        assert "boundary" in r.stderr, out
+        assert pattern_text not in out, out
 
