@@ -50,7 +50,7 @@ _SRC = _REPO / "src"
 _INSTALLER = _REPO / "src" / "forum" / "deploy" / "install-forum-service.sh"
 _TEMPLATE = _REPO / "src" / "forum" / "deploy" / "engram-forum.service.template"
 
-FIELDS = {"ts", "method", "route", "kind", "named", "verdict", "token_agent"}
+FIELDS = {"ts", "method", "route", "kind", "named", "verdict", "token_agent", "outcome"}
 POST_BODY = {"agent": "alice", "category_slug": "inter-agent", "title": "t", "body_md": "hello"}
 HOSTILE = "evil\u2028x|y"          # a `|` and a line-break character
 HOSTILE_Q = "evil%E2%80%A8x%7Cy"    # the same text, URL-encoded
@@ -1062,3 +1062,73 @@ def test_d3_header_shapes(owned_tmp, header, needle, status, verdict):
         assert needle not in data and needle.lower() not in data.lower()
     if header.strip():
         assert header.encode() not in data
+
+
+# ---- delta 2: outcome ----
+# (id, method, url, body, token, verdict, outcome)
+_BAD_BODY = dict(POST_BODY, agent="a\nb")
+_O_ROWS = [
+    ("invalid-401", "POST", "/api/post", None, "bad", "invalid", 401),
+    ("mismatch-403", "POST", "/api/post", None, "bob", "mismatch", 403),
+    ("absent-two-names-403", "POST", "/api/post?agent=alice", dict(POST_BODY, agent="bob"), "none",
+     "absent", 403),
+    ("absent-malformed-path-422", "GET", f"/api/agent/{HOSTILE_Q}/inbox", False, "none", "absent", 422),
+    ("absent-malformed-query-422", "GET", f"/api/updates?agent={HOSTILE_Q}", False, "none", "absent", 422),
+    ("absent-malformed-body-422", "POST", "/api/post", _BAD_BODY, "none", "absent", 422),
+    ("valid-token-malformed-body-422", "POST", "/api/post", _BAD_BODY, "alice", "match", 422),
+    ("valid-token-malformed-body-mismatch-422", "POST", "/api/post", _BAD_BODY, "bob", "mismatch", 422),
+    ("match-proceeded", "POST", "/api/post", None, "alice", "match", "proceeded"),
+    ("match-names-nobody-proceeded", "GET", "/api/updates", False, "alice", "match", "proceeded"),
+    ("absent-one-name-proceeded", "POST", "/api/post", None, "none", "absent", "proceeded"),
+    ("absent-names-nobody-proceeded", "POST", "/api/thread/1/accept", {"post_id": 1}, "none",
+     "absent", "proceeded"),
+]
+
+
+def _o_run(tmp, row):
+    _id, method, url, body, token, verdict, outcome = row
+    app = _make_app(tmp)
+    headers = {}
+    if token == "bad":
+        headers = _auth("not-a-real-token")
+    elif token in ("alice", "bob"):
+        headers = _auth(_issue(app, token))
+    kwargs: dict = {"headers": headers}
+    if method == "POST":
+        kwargs["json"] = dict(POST_BODY) if body is None else body
+    r = app.test_client().open(url, method=method, **kwargs)
+    return r, _lines(tmp)
+
+
+@pytest.mark.parametrize("row", _O_ROWS, ids=[r[0] for r in _O_ROWS])
+def test_o1_outcome_table(owned_tmp, row):
+    r, recs = _o_run(owned_tmp, row)
+    (rec,) = recs
+    assert rec["verdict"] == row[5]
+    assert rec["outcome"] == row[6] and type(rec["outcome"]) is type(row[6])
+    if isinstance(row[6], int):
+        assert r.status_code == row[6], (r.status_code, r.get_data(as_text=True))
+    else:
+        assert r.status_code not in (401, 403, 422), r.status_code
+
+
+def test_o2_outcome_type_pin(owned_tmp):
+    seen = []
+    for i, row in enumerate(_O_ROWS):
+        tmp = owned_tmp / f"o2-{i}"
+        tmp.mkdir()
+        _r, (rec,) = _o_run(tmp, row)
+        seen.append(rec["outcome"])
+    for o in seen:
+        assert o == "proceeded" or (isinstance(o, int) and not isinstance(o, bool)), o
+        assert o in ("proceeded", 401, 403, 422), o
+    assert not [o for o in seen if isinstance(o, str) and o != "proceeded"]
+    assert {"proceeded", 401, 403, 422} <= set(seen)
+
+
+def test_o3_guard_outcome_not_the_handlers(owned_tmp):
+    app = _make_app(owned_tmp)
+    r = app.test_client().post("/api/thread/1/accept", json={"post_id": 1})
+    assert r.status_code == 400 and r.get_json() == {"error": "agent is required"}
+    (rec,) = _lines(owned_tmp)
+    assert rec["outcome"] == "proceeded"
