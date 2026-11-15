@@ -96,7 +96,9 @@
 #                       enforce): UTC time like 2026-11-16T00:00:00Z. The installer refuses
 #                       (exit 2, nothing written) a time that is not a real date and time or
 #                       is more than 72 hours from now, because the server would then exit 78
-#                       and the unit would stay down. The server checks it again at start,
+#                       and the unit would stay down. It also refuses (exit 78, nothing
+#                       written) a time at or before now; the server itself still accepts
+#                       a past time, for a hand-written unit. The server checks it again at start,
 #                       and past it keeps
 #                       serving but logs one loud line per hour and shows
 #                       auth_report_overdue on /health.
@@ -785,12 +787,13 @@ try:
 except (ValueError, AttributeError):
     sys.exit(3)
 now = d.datetime.now(d.timezone.utc).replace(tzinfo=None)
-sys.exit(4 if t - now > d.timedelta(hours=72) else 0)
+sys.exit(5 if t <= now else 4 if t - now > d.timedelta(hours=72) else 0)
 ' "$AUTH_UNTIL" >/dev/null 2>&1 || _until_rc=$?
   case "$_until_rc" in
     0) ;;
     3) echo "ERROR: --auth-report-until must be a real UTC date and time like 2026-11-16T00:00:00Z (got '$AUTH_UNTIL'). Nothing was written." >&2; exit 2 ;;
     4) echo "ERROR: --auth-report-until '$AUTH_UNTIL' is more than 72 hours from now; the server would refuse to start. Nothing was written." >&2; exit 2 ;;
+    5) echo "ERROR: --auth-report-until '$AUTH_UNTIL' is in the past (at or before now); give a time up to 72 hours ahead. Nothing was written." >&2; exit 78 ;;
     *) echo "ERROR: could not check --auth-report-until (python3 failed, status $_until_rc). Nothing was written." >&2; exit 2 ;;
   esac
 else

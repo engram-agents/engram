@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 from flask import Flask, Response, abort, g, jsonify, render_template, request, send_file
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from . import audit, board_projects, board_theme, db, embeddings as emb_mod, packs as packs_mod, seed
 from .avatar import avatar_svg
@@ -2133,6 +2134,7 @@ AUTH_REPORT_MAX_HOURS = 72
 _INVALID_NAME = "<invalid-name>"
 _TOO_LONG_NAME = "<too-long>"
 _AUTH_NAME_MAX = 128  # a longer name is written as "<too-long> len=N", never as text
+_AUTH_NAMED_MAX = 8   # entries kept in a line's ``named``; the rest is one "<more> n=K"
 _AUTH_UNTIL_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z")
 _AUTH_OVERDUE_EVERY = 3600  # seconds between the loud overdue lines
 
@@ -2240,11 +2242,15 @@ def _report_identity(value):
 
 
 def _report_named(values) -> list:
+    """The distinct report identities of ``values`` in request order, at most
+    ``_AUTH_NAMED_MAX`` of them; any further distinct ones are one ``<more> n=K`` entry."""
     out: list = []
     for v in values:
         item = _report_identity(v)
         if item is not None and item not in out:
             out.append(item)
+    if len(out) > _AUTH_NAMED_MAX:
+        out = out[:_AUTH_NAMED_MAX] + [f"<more> n={len(out) - _AUTH_NAMED_MAX}"]
     return out
 
 
@@ -2548,6 +2554,22 @@ def create_app(
             "outcome": outcome,
         })
 
+    def _guard_body_identities(write: bool, named, token_agent, presented: bool) -> list:
+        """``_body_identities()``, except that in report mode a body over
+        ``MAX_CONTENT_LENGTH`` first gets its one line (``named`` from the path and query
+        only: the body was not read; ``verdict`` from what was presented), then the 413 is
+        re-raised unchanged."""
+        try:
+            return _body_identities()
+        except RequestEntityTooLarge:
+            if report_mode:
+                if token_agent is not None:
+                    verdict = _verdict_for_token(named, token_agent)
+                else:
+                    verdict = "invalid" if presented else "absent"
+                _record_auth(write, named, verdict, token_agent, 413)
+            raise
+
     @app.before_request
     def _auth_guard():
         # Bearer-header auth (not cookies) is deliberate: a DNS-rebound page is
@@ -2580,8 +2602,9 @@ def create_app(
                 return _auth_required_response()
             # Report mode: a PRESENTED credential that does not resolve is still 401 (the
             # line is written first); only the ABSENCE of one is let through, recorded.
-            body_ids = _body_identities()
-            if (auth_header or "").strip():
+            presented = bool((auth_header or "").strip())
+            body_ids = _guard_body_identities(write, named, None, presented)
+            if presented:
                 _record_auth(write, named + body_ids, "invalid", None, 401)
                 return _auth_required_response()
             label = _route_label()
@@ -2602,7 +2625,7 @@ def create_app(
             g.auth_agent = names[0] if names else None
             g.names_identity = bool(names)
             return None
-        body_ids = _body_identities()
+        body_ids = _guard_body_identities(write, named, token_agent, True)
         label = _route_label()
         try:
             for v in body_ids:
