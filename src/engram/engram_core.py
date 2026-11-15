@@ -8516,6 +8516,84 @@ class EmbeddingOutcome(NamedTuple):
 EMBED_REVIVE_COOLDOWN_S = 300
 
 
+def _store_embedding_vector(
+    conn: sqlite3.Connection, node_id: str, vector: list,
+) -> "EmbeddingOutcome":
+    """Persist an already-computed vector: the STORE step of
+    _compute_and_store_embedding, extracted (#4651 part A) so the compute path
+    and the prepared-vector publication path write through ONE function.
+
+    Returns EmbeddingOutcome(status="failed", stage="store") when the
+    nodes.embedding UPDATE raises (WARNING logged), else
+    EmbeddingOutcome(status="embedded", vec_mirror_ok=...). The vec mirror keeps
+    its tolerated-degradation rules (see the inline comments). Never raises for
+    a store/mirror failure; does not commit.
+    """
+    # Stage "store" (#345 PR3 R2): the vector computed fine; only
+    # persisting it failed (e.g. "database is locked") -- not an
+    # embedder-health signal, so no revive/cooldown either.
+    try:
+        conn.execute(
+            "UPDATE nodes SET embedding = ? WHERE id = ?",
+            (json.dumps(vector), node_id),
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "embedding STORE FAILED for node %s: %r — vector computed "
+            "but not persisted; node left without an embedding.",
+            node_id, exc,
+        )
+        return EmbeddingOutcome(
+            status="failed", node_id=node_id, detail=repr(exc), stage="store",
+        )
+    vec_mirror_ok = True
+    # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
+    # virtual tables, so delete-then-insert handles the rare re-embed.
+    if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(vector) == 384:
+        try:
+            conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
+            conn.execute(
+                "INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)",
+                (node_id, _sqlite_vec.serialize_float32(vector)),
+            )
+        except sqlite3.OperationalError:
+            # vec_nodes missing/locked -- the LONG-TOLERATED #3075
+            # contract (#3075 C2 explicitly keeps this non-fatal):
+            # SILENT degradation, no WARNING. Round 4 (M3, Mira's own
+            # regression on her round-3 R-S2 fix below): #3075's own
+            # minimal test fixtures have no vec_nodes table at all, so
+            # on any seat where sqlite-vec IS actually available this
+            # exact exception fires on EVERY write in those fixtures
+            # -- R-S2's single widened `except Exception` logged a
+            # WARNING here too, which turned two previously-green
+            # #3075 tests (test_enabled_false_is_ignored_still_embeds,
+            # test_all_succeed) red on such a seat. Kept separate from
+            # the branch below so this one specific, long-tolerated
+            # exception type stays exactly as quiet as it always was.
+            vec_mirror_ok = False
+        except Exception as exc:
+            # Any OTHER exception from this step (round 3, R-S2 --
+            # e.g. _sqlite_vec.serialize_float32 raising) — JSON still
+            # canonical either way. Still a TOLERATED degradation
+            # (#3075 C2), but now visible via a WARNING instead of
+            # being silently swallowed. Narrowed to only
+            # sqlite3.OperationalError before R-S2 — any OTHER
+            # exception type here fell through to the outer catch-all
+            # below, which defaults stage="embed" and wrongly implies
+            # the embedder (not the vec mirror) is unhealthy, even
+            # though both the embedder and the canonical
+            # nodes.embedding write already succeeded.
+            logging.getLogger(__name__).warning(
+                "vec_nodes mirror write failed for node %s: %r -- the "
+                "canonical nodes.embedding write succeeded; KNN index "
+                "degraded for this node.", node_id, exc,
+            )
+            vec_mirror_ok = False
+    return EmbeddingOutcome(
+        status="embedded", node_id=node_id, vec_mirror_ok=vec_mirror_ok,
+    )
+
+
 def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "EmbeddingOutcome":
     """Compute embedding for a node and store it.
 
@@ -8587,70 +8665,8 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "Emb
                 detail="embed() returned empty/None", stage="embed",
             )
 
-        # Stage "store" (#345 PR3 R2): the vector computed fine; only
-        # persisting it failed (e.g. "database is locked") -- not an
-        # embedder-health signal, so no revive/cooldown either.
-        try:
-            conn.execute(
-                "UPDATE nodes SET embedding = ? WHERE id = ?",
-                (json.dumps(vector), node_id),
-            )
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "embedding STORE FAILED for node %s: %r — vector computed "
-                "but not persisted; node left without an embedding.",
-                node_id, exc,
-            )
-            return EmbeddingOutcome(
-                status="failed", node_id=node_id, detail=repr(exc), stage="store",
-            )
-        vec_mirror_ok = True
-        # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
-        # virtual tables, so delete-then-insert handles the rare re-embed.
-        if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(vector) == 384:
-            try:
-                conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
-                conn.execute(
-                    "INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)",
-                    (node_id, _sqlite_vec.serialize_float32(vector)),
-                )
-            except sqlite3.OperationalError:
-                # vec_nodes missing/locked -- the LONG-TOLERATED #3075
-                # contract (#3075 C2 explicitly keeps this non-fatal):
-                # SILENT degradation, no WARNING. Round 4 (M3, Mira's own
-                # regression on her round-3 R-S2 fix below): #3075's own
-                # minimal test fixtures have no vec_nodes table at all, so
-                # on any seat where sqlite-vec IS actually available this
-                # exact exception fires on EVERY write in those fixtures
-                # -- R-S2's single widened `except Exception` logged a
-                # WARNING here too, which turned two previously-green
-                # #3075 tests (test_enabled_false_is_ignored_still_embeds,
-                # test_all_succeed) red on such a seat. Kept separate from
-                # the branch below so this one specific, long-tolerated
-                # exception type stays exactly as quiet as it always was.
-                vec_mirror_ok = False
-            except Exception as exc:
-                # Any OTHER exception from this step (round 3, R-S2 --
-                # e.g. _sqlite_vec.serialize_float32 raising) — JSON still
-                # canonical either way. Still a TOLERATED degradation
-                # (#3075 C2), but now visible via a WARNING instead of
-                # being silently swallowed. Narrowed to only
-                # sqlite3.OperationalError before R-S2 — any OTHER
-                # exception type here fell through to the outer catch-all
-                # below, which defaults stage="embed" and wrongly implies
-                # the embedder (not the vec mirror) is unhealthy, even
-                # though both the embedder and the canonical
-                # nodes.embedding write already succeeded.
-                logging.getLogger(__name__).warning(
-                    "vec_nodes mirror write failed for node %s: %r -- the "
-                    "canonical nodes.embedding write succeeded; KNN index "
-                    "degraded for this node.", node_id, exc,
-                )
-                vec_mirror_ok = False
-
-        return EmbeddingOutcome(
-            status="embedded", node_id=node_id, vec_mirror_ok=vec_mirror_ok,
-        )
+        # Stage "store" (#345 PR3 R2): see _store_embedding_vector.
+        return _store_embedding_vector(conn, node_id, vector)
     except Exception as exc:
         # Anything NOT already attributed to "text"/"embed"/"store" above
         # (e.g. a config-read error ahead of all three) -- defaulted to
