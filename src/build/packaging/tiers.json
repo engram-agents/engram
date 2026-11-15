@@ -842,6 +842,12 @@
       "tier": "dev"
     },
     {
+      "path": "tools/rotate_roster_format.py",
+      "tier": "dev",
+      "source": "tools/rotate_roster_format.py",
+      "note": "one-time format-1 -> format-2 roster migration helper the roster holder runs on their own machine; ENGRAM-development/operations tooling, the same tier as its sibling tools/scan-leaks.py (the scanner whose parser it validates against). Not an essential/convenience user surface. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/coverage-diff.sh."
+    },
+    {
       "path": "tools/os-harness-check.py",
       "tier": "dev"
     },
