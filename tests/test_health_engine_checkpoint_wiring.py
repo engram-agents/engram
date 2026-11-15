@@ -85,11 +85,10 @@ def _stop_leaked_snapshot_worker():
     self-caught: join(timeout=2.0) can return with the thread still alive
     (e.g. a slow git commit inside _process_job), and the reset below doesn't
     check is_alive() afterward -- if that happens, the race isn't actually
-    closed for that call. This is inherited verbatim from conftest.py's own
-    _stop_snapshot_worker fixture (this helper mirrors it exactly), not a gap
-    introduced here; hardening both call sites together (e.g. logging/
-    asserting on a post-join is_alive()) is tracked as a follow-up rather than
-    done in this test-file-only PR.
+    closed for that call. conftest.py's autouse fixture has since been
+    hardened (#4826): it now joins until the worker stops (bounded, loud if the
+    thread is still alive). THIS helper still uses the single 2 s join and has
+    not been hardened.
     """
     _sw = sys.modules.get("engram_snapshot_worker")
     if _sw is None:
