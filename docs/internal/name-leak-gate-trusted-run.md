@@ -268,10 +268,8 @@ one-liner is the authoritative form on every seat.
 `updated_at` is an ISO-8601 UTC timestamp. A malformed or unset attestation is
 treated as absent and fails the gate; it never passes.
 
-**Custody line (roster format 2).** Under the two-class roster a class-A hit is
-printed as a count only, so locating one requires the roster text. Format 2 must
-therefore not gate a release until a **roster holder is named**; no artifact
-names one today, and the naming is Kepler's and Lei's.
+**Locating a class-A hit.** Under the two-class roster a class-A hit is
+printed as a count only, so locating one requires the roster text.
 
 **Bootstrap note.** The attestation committed with this change carries the
 placeholder `roster_sha256` `"UNSET - ..."` because the roster is a repository
@@ -288,6 +286,21 @@ Commit those two values to the attestation (with `roster_format: 1` and a fresh
 `updated_at`) and the next run goes green. The hash is public by design — it is
 what the committed attestation exists to publish — while the roster never is:
 the gate prints no pattern, no roster line, and no substring of either.
+
+### Rotating to format 2
+
+The rotation is one act: swap the `NAME_LEAK_ROSTER` secret to the format-2
+text, and in the same commit re-issue the attestation with `roster_format: 2`
+and the two per-class counts (`pattern_count_a`, `pattern_count_b`).
+
+The gate **observes** the roster's format from its shape and requires the
+attestation to agree. A rotation that swaps the secret and forgets the
+attestation commit goes red: the whole-file hash still matches, and only the
+format cross-check can see the mismatch.
+
+The repository's project lead holds the roster: the secret's source text is
+theirs, the rotation in this section is performed by them, and the attestation
+commit that records it is made from their act.
 
 ## Tests
 

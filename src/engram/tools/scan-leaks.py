@@ -413,7 +413,10 @@ def load_local_patterns(root: Path, config_path: Path | None = None) -> tuple[li
     return patterns, True
 
 
-def _refuse_roster(lineno: int, detail: str) -> None:
+def _refuse_roster(
+    lineno: int, detail: str, *,
+    program: str = "scan-leaks", exit_code: int = 2,
+) -> None:
     """Refuse the WHOLE roster, naming the 1-based line number and nothing else.
 
     The roster is a name list and CI stderr can reach a public log, so no
@@ -421,65 +424,138 @@ def _refuse_roster(lineno: int, detail: str) -> None:
     even through ``re.error.__str__``, which embeds part of the pattern.  A
     roster that does not parse is exit 2 (invocation error), never 1 (which
     every consumer reads as "leaks found") and never 3 ("did not look").
+
+    ``program`` and ``exit_code`` are threaded from the caller (C5): the
+    scanner passes the defaults; ``tools/name_leak_warn.py`` passes its own
+    name and exit 1.
     """
-    print(f"scan-leaks: roster line {lineno} {detail}", file=sys.stderr)
-    sys.exit(2)
+    print(f"{program}: roster line {lineno} {detail}", file=sys.stderr)
+    sys.exit(exit_code)
 
 
-def load_roster_file(path: Path) -> list[tuple[re.Pattern, str, str]]:
-    """Load a FORMAT-2 roster: ``A<TAB><regex>`` or ``B<TAB><regex>`` per line.
+def parse_roster_text(
+    text: str, *, require_classes: bool = True,
+    program: str = "scan-leaks", exit_code: int = 2,
+) -> tuple[list[tuple[re.Pattern, str, str]], int]:
+    """Parse roster text, returning ``(patterns, roster_format)``.
 
-    This is the ONLY parser of the format-2 grammar in the repository.  Each
-    line is stripped, then split on its FIRST tab; the class token is the whole
-    prefix before that tab and must be exactly ``A`` or ``B`` (case-sensitive).
-    Blank lines and lines whose first non-space character is ``#`` are ignored.
-    There is NO default class.
+    Each pattern is a ``(compiled_regex, label, class)`` triple and
+    ``roster_format`` is 1 or 2.
 
-    A line with no tab, an unknown class token, a tab after the first, a regex
+    ``require_classes=True`` (the default, and every existing call site) parses
+    FORMAT 2 only, exactly as merged in #4816: ``A<TAB><regex>`` or
+    ``B<TAB><regex>`` per line.  Each line is stripped, then split on its FIRST
+    tab; the class token is the whole prefix before that tab and must be
+    exactly ``A`` or ``B`` (case-sensitive).  Blank lines and lines whose first
+    non-space character is ``#`` are ignored.  There is NO default class: a
+    line with no tab, an unknown class token, a tab after the first, a regex
     that does not compile, or a class-A pattern that declares no boundary is a
-    HARD parse error naming the 1-based line number.  ANY bad line refuses the
-    WHOLE roster (exit 2): a scan against a subset of the roster is a scan of
-    the wrong thing, which is the old skip-and-warn path this replaces.
+    HARD parse error naming the 1-based line number, and ANY bad line refuses
+    the WHOLE roster.
 
-    Returns (compiled_regex, label, class) triples.  A format-1 roster — plain
-    regex lines with no tab — is refused as "no class token"; that is intended,
-    and the message tells the operator the line needs a class prefix.
+    ``require_classes=False`` opts into FORMAT inference, never class
+    inference.  Detection is over the whole roster and order-independent:
+
+        every non-blank non-comment line starts with ``A<TAB>`` or ``B<TAB>``
+            -> format 2, parsed exactly as the default path;
+        no such line
+            -> format 1: each line is a plain regex returned with class
+               ``CLASS_A`` and label ``"roster file (format 1)"``.  The legacy
+               format has always blocked, so that is its own meaning, not a
+               default class;
+        some but not all
+            -> the WHOLE roster is refused, naming the 1-based number of the
+               FIRST line that disagrees with the detected grammar.
+
+    A format-2 line always keeps the class it declares; no format-2 line ever
+    receives one it did not write.  A roster with no pattern at all returns
+    ``([], roster_format)`` — zero patterns is not a parse error (C4a: the warn
+    tool's skip-when-absent contract depends on it).
 
     ``str.splitlines()`` also splits on ``\\x0b``, ``\\x0c``, ``\\x1c``-``\\x1e``,
     ``\\x85``, U+2028 and U+2029, so a roster line containing one becomes two
-    and the second is refused as having no class token — fail-closed, and no
-    parser change.
+    and the second takes its own place in detection and parsing — fail-closed,
+    and no parser change.
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        # An explicitly requested roster that cannot be read must not silently
-        # shrink the scan: that is an invocation error, not a clean run.
-        print(f"scan-leaks: cannot read roster file ({type(exc).__name__})",
-              file=sys.stderr)
-        sys.exit(2)
+    lines = list(enumerate(text.splitlines(), start=1))
+
+    def _is_content(stripped: str) -> bool:
+        return bool(stripped) and not stripped.startswith("#")
+
+    roster_format = 2
+    if not require_classes:
+        content_linenos: list[int] = []
+        prefixed = 0
+        first_unprefixed = None
+        for lineno, raw_line in lines:
+            stripped = raw_line.strip()
+            if not _is_content(stripped):
+                continue
+            content_linenos.append(lineno)
+            if stripped.startswith("A\t") or stripped.startswith("B\t"):
+                prefixed += 1
+            elif first_unprefixed is None:
+                first_unprefixed = lineno
+        if not content_linenos:
+            # No line to observe.  The legacy format is the honest default
+            # here: there is no prefixed line, and an empty roster yields no
+            # pattern either way (C4a).
+            roster_format = 1
+        elif prefixed == len(content_linenos):
+            roster_format = 2
+        elif prefixed == 0:
+            roster_format = 1
+        else:
+            _refuse_roster(
+                first_unprefixed,
+                "mixes roster formats: the rest of the roster carries an "
+                "A<TAB> or B<TAB> class prefix and this line does not. One bad "
+                "line is the end of the roster",
+                program=program, exit_code=exit_code,
+            )
 
     patterns = []
-    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+    for lineno, raw_line in lines:
         stripped = raw_line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not _is_content(stripped):
+            continue
+        if roster_format == 1:
+            try:
+                compiled = re.compile(stripped)
+            except (re.error, OverflowError, RecursionError) as exc:
+                # Class name, offset and line number only: the line and
+                # str(exc) can each embed part of the secret roster line.
+                # ``pos`` is absent on OverflowError/RecursionError and None on
+                # some re.error values: report ``unknown`` rather than ``None``.
+                pos = getattr(exc, "pos", None)
+                offset = pos if isinstance(pos, int) else "unknown"
+                _refuse_roster(
+                    lineno,
+                    f"is not a valid regular expression: "
+                    f"{type(exc).__name__} at offset {offset}",
+                    program=program, exit_code=exit_code,
+                )
+            patterns.append((compiled, "roster file (format 1)", CLASS_A))
             continue
         if "\t" not in stripped:
             _refuse_roster(
                 lineno,
                 "has no class token; every line needs an A<TAB> or B<TAB> "
                 "prefix",
+                program=program, exit_code=exit_code,
             )
         class_token, pattern_text = stripped.split("\t", 1)
         if class_token not in ROSTER_CLASSES:
             _refuse_roster(
-                lineno, "has an invalid class token; expected A or B"
+                lineno, "has an invalid class token; expected A or B",
+                program=program, exit_code=exit_code,
             )
         if "\t" in pattern_text:
             _refuse_roster(
                 lineno,
                 "contains a tab after the class token; a pattern cannot "
                 "contain a tab",
+                program=program, exit_code=exit_code,
             )
         try:
             compiled = re.compile(pattern_text)
@@ -488,15 +564,46 @@ def load_roster_file(path: Path) -> list[tuple[re.Pattern, str, str]]:
                       f"{type(exc).__name__}")
             if isinstance(exc, re.error):
                 detail += f" at offset {exc.pos}"
-            _refuse_roster(lineno, detail)
+            _refuse_roster(lineno, detail, program=program, exit_code=exit_code)
         if class_token == CLASS_A and not _declares_boundary(pattern_text):
             _refuse_roster(
                 lineno,
                 "is a class-A pattern with no declared boundary; add \\b, a "
                 "lookaround, or ^/$",
+                program=program, exit_code=exit_code,
             )
         patterns.append((compiled, "roster file", class_token))
-    return patterns
+    return patterns, roster_format
+
+
+def load_roster_file(
+    path: Path, *, require_classes: bool = True,
+    program: str = "scan-leaks", exit_code: int = 2,
+) -> tuple[list[tuple[re.Pattern, str, str]], int]:
+    """Read a roster file and delegate to ``parse_roster_text``.
+
+    This is the file entry point and the ONLY parser of the roster grammar in
+    the repository.  Its defaults keep every existing call site identical: the
+    scanner's CLI and the sweep workflow pass no new argument, so they get
+    format 2 only and exit 2 with a ``scan-leaks:`` prefix (C2).
+
+    An explicitly requested roster that cannot be read is an invocation error,
+    not a clean run: it prints
+    ``<program>: cannot read roster file (<ExceptionType>)`` and exits
+    ``exit_code``.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"{program}: cannot read roster file ({type(exc).__name__})",
+              file=sys.stderr)
+        sys.exit(exit_code)
+    return parse_roster_text(
+        text,
+        require_classes=require_classes,
+        program=program,
+        exit_code=exit_code,
+    )
 
 
 def _git_tracked_files(root: Path) -> list[Path] | None:
@@ -891,10 +998,14 @@ def _scan_leaks_cli():
 
     config_path = Path(args.config_path).expanduser().resolve() if args.config_path else None
     local_patterns, config_present = load_local_patterns(root, config_path)
-    roster_file_patterns = (
-        load_roster_file(Path(args.roster_file).expanduser().resolve())
-        if args.roster_file else []
-    )
+    if args.roster_file:
+        # Defaults on purpose: the CLI reads format 2 only (C2). The loader
+        # also returns the detected format; this call site does not need it.
+        roster_file_patterns, _roster_format = load_roster_file(
+            Path(args.roster_file).expanduser().resolve()
+        )
+    else:
+        roster_file_patterns = []
 
     personal_patterns = local_patterns + roster_file_patterns
     if not personal_patterns:

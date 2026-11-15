@@ -684,45 +684,216 @@ def test_harness_puts_the_roster_in_a_private_per_run_directory(gate_repo, tmp_p
     assert _roster_path(tmp_path) != first
 
 
-def test_a_format2_roster_line_fails_the_validation_step(gate_repo, tmp_path):
-    """Cell 15: this workflow parses roster format 1 only, so a class-prefixed
-    line (`A<TAB>` / `B<TAB>`) fails its validation step with one message and
-    is never compiled as a pattern. Format-1 behaviour is the control.
+def _write_gate_attestation(
+    work, *, roster_format, sha, pattern_count=None, a=None, b=None
+):
+    """Write the attestation the decide step reads, in schema 1 or schema 2."""
+    attestation = {"roster_format": roster_format, "roster_sha256": sha}
+    if roster_format == 1:
+        attestation["pattern_count"] = pattern_count
+    else:
+        attestation["pattern_count_a"] = a
+        attestation["pattern_count_b"] = b
+    (work / ".github" / "name-leak-roster.attestation.json").write_text(
+        json.dumps(attestation), encoding="utf-8"
+    )
 
-    Executed, not read: the decide step is extracted from the workflow and run.
-    The failure is the step's own non-zero exit, which happens BEFORE the
-    scanner could ever apply the prefix as regex text.
-    """
-    work, base_without_tool, _g = gate_repo
+
+def _gate_output(tmp_path, key):
+    """One value from the decide step's GITHUB_OUTPUT file."""
+    outputs = (tmp_path / "gh_output.txt").read_text(encoding="utf-8")
+    for line in outputs.splitlines():
+        if line.startswith(key + "="):
+            return line.split("=", 1)[1]
+    raise AssertionError(f"no {key}= line in the gate's GITHUB_OUTPUT: {outputs!r}")
+
+
+def _prepare_gate(gate_repo, tmp_path):
+    """Extract the decide step and give the checkout a runnable gate tool."""
+    work, base, _g = gate_repo
     (tmp_path / "decide.py").write_text(_decide_script())
     (work / "tools" / "name_leak_gate.py").write_text(_STUB_TOOL)
+    return work, base
 
-    token = "Zqgatefmt"
-    for class_token in ("A", "B"):
-        rc, out = _run_gate(
-            work, base_without_tool, tmp_path,
-            roster=class_token + "\t" + token + "\n",
-        )
-        assert rc != 0, out
-        assert "format 2" in out, out
-        assert token not in out, f"the roster line's text reached the log: {out!r}"
-        assert len(
-            [line for line in out.splitlines() if "format 2" in line]
-        ) == 1, f"exactly one message line; got {out!r}"
 
-    # Control: a format-1 roster still produces a verdict (the decide step
-    # exits 0 and the conclusion is reported), as before the refusal.
-    rc, out = _run_gate(work, base_without_tool, tmp_path,
-                        roster="somepattern\n")
+# ── the format cross-check (engram#4817) ─────────────────────────────────────
+#
+# Contract: the gate OBSERVES the roster's grammar by line shape and requires
+# the attestation's `roster_format` to agree, both directions. A mismatch is a
+# loud failure even when the whole-file sha256 still matches — the hash is over
+# bytes and cannot see the grammar. Both schemas are accepted: schema 1
+# (`roster_format: 1`, `pattern_count`) and schema 2 (`roster_format: 2`,
+# `pattern_count_a`/`pattern_count_b`); the format field itself must be an
+# integer that is not a bool, because `True == 1` in Python.
+
+
+def test_t8_format1_roster_and_format1_attestation_succeed(gate_repo, tmp_path):
+    """T8: today's world — a format-1 roster with a schema-1 attestation."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = "somepattern\n"
+    _write_gate_attestation(
+        work,
+        roster_format=1,
+        pattern_count=1,
+        sha=hashlib.sha256(roster.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc == 0, out
+    assert "name-leak gate: success" in out, out
+    assert _gate_output(tmp_path, "pattern_count") == "1"
+
+
+def test_t9_format2_roster_and_format2_attestation_succeed(gate_repo, tmp_path):
+    """T9: a format-2 roster with a schema-2 attestation succeeds and emits
+    `pattern_count` as `a + b`. T10's control: same roster, only the
+    attestation differs."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = (
+        "A\t\\bZZAlphaHolder\\b\n"
+        "B\t\\bYYBravoHandle\\b\n"
+    )
+    _write_gate_attestation(
+        work,
+        roster_format=2,
+        a=1,
+        b=1,
+        sha=hashlib.sha256(roster.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc == 0, out
+    assert "name-leak gate: success" in out, out
+    assert _gate_output(tmp_path, "pattern_count") == "2"
+
+
+def test_t10_the_attested_format_must_equal_the_observed_format(gate_repo, tmp_path):
+    """T10: a format mismatch fails closed in BOTH directions, naming the
+    disagreement, even though the whole-file sha256 matches in each case."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster2 = (
+        "A\t\\bZZAlphaHolder\\b\n"
+        "B\t\\bYYBravoHandle\\b\n"
+    )
+    roster1 = "somepattern\n"
+
+    # Format-2 roster, format-1 attestation.
+    _write_gate_attestation(
+        work,
+        roster_format=1,
+        pattern_count=2,
+        sha=hashlib.sha256(roster2.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster2)
     assert rc == 0, out
     assert "name-leak gate: failure" in out, out
-    assert "format 2" not in out, out
+    assert "declares roster_format 1" in out, out
+    assert "shape is format 2" in out, out
 
-    # The refusal is placed BEFORE the compile: a class prefix can never have
-    # been compiled as a pattern on the way to the message.
-    run = _decide_script()
-    assert run.index('startswith("A\\t")') < run.index("re.compile(stripped)"), (
-        "the format-2 refusal must precede the format-1 regex compile"
+    # The mirror: format-1 roster, format-2 attestation.
+    _write_gate_attestation(
+        work,
+        roster_format=2,
+        a=0,
+        b=1,
+        sha=hashlib.sha256(roster1.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster1)
+    assert rc == 0, out
+    assert "name-leak gate: failure" in out, out
+    assert "declares roster_format 2" in out, out
+    assert "shape is format 1" in out, out
+
+
+def test_t11_mixed_roster_fails_naming_the_first_non_prefixed_line(
+    gate_repo, tmp_path
+):
+    """T11: a roster that mixes the grammars fails inside the decide step,
+    naming the first non-prefixed line — before any scan step can run (the
+    scan steps are conditioned on the decision's success, and this step exits
+    non-zero)."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = (
+        "A\t\\bZZAlphaHolder\\b\n"
+        "\\bYYBravoHandle\\b\n"
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc != 0, out
+    assert "line 2" in out, out
+    assert "ZZAlphaHolder" not in out and "YYBravoHandle" not in out, out
+
+
+@pytest.mark.parametrize("roster_format", [1, 2])
+def test_gate_refuses_a_present_roster_with_zero_patterns(
+    gate_repo, tmp_path, roster_format
+):
+    """C4a: a roster that is PRESENT but parses to no pattern is a gate
+    failure in both schemas, before any scan. The warn tool keeps its
+    skip-when-absent contract; the blocking surface must not pass by having
+    nothing to apply."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = "# only a comment\n\n"
+    sha = hashlib.sha256(roster.encode("utf-8")).hexdigest()
+    if roster_format == 1:
+        _write_gate_attestation(
+            work, roster_format=1, pattern_count=0, sha=sha
+        )
+    else:
+        _write_gate_attestation(work, roster_format=2, a=0, b=0, sha=sha)
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc != 0, out
+    assert "contains no pattern" in out, out
+
+
+def test_gate_rejects_a_boolean_attested_roster_format(gate_repo, tmp_path):
+    """`isinstance(True, int)` is True and `True == 1`, so a JSON `true` in
+    `roster_format` must be excluded EXPLICITLY before the value is compared
+    with 1 or 2 — the same bool guard the pattern counts already carry.
+
+    The rest of the attestation is valid and its sha256 matches, so only the
+    bool guard can fail this run; without it `true` passes as format 1."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = "somepattern\n"
+    _write_gate_attestation(
+        work,
+        roster_format=True,
+        pattern_count=1,
+        sha=hashlib.sha256(roster.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc == 0, out
+    assert "name-leak gate: failure" in out, out
+    assert "name-leak gate: success" not in out, out
+
+
+def test_t12_both_scan_steps_extract_the_scanner_from_src():
+    """T12: the warn tool loads the scanner as a SIBLING file, so both scan
+    steps must extract it next to `name_leak_warn_base.py` — from
+    `src/engram/tools/scan-leaks.py`, NEVER `tools/scan-leaks.py`, which is a
+    symlink in the tree and would make `git show` return the link's target
+    text rather than the file."""
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    job = workflow["jobs"]["name-leak-gate"]
+    scan_steps = [
+        step
+        for step in job["steps"]
+        if isinstance(step.get("run"), str)
+        and "name_leak_warn_base.py" in step["run"]
+    ]
+    assert len(scan_steps) == 2, (
+        f"expected the push-range and pull-request scan steps; got "
+        f"{len(scan_steps)}"
+    )
+    for step in scan_steps:
+        run = step["run"]
+        assert (
+            'git show "${BASE_SHA}:src/engram/tools/scan-leaks.py"'
+            in run
+        ), run
+        assert '> "${RUN_DIR}/scan-leaks.py"' in run, run
+
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert ":tools/scan-leaks.py" not in text, (
+        "a git show reads the symlink path tools/scan-leaks.py; git show "
+        "returns the link's target text, not the file"
     )
 
 

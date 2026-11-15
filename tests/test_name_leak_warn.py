@@ -87,6 +87,18 @@ scan_diff = _mod.scan_diff
 load_roster = _mod.load_roster
 format_json = _mod.format_json
 
+
+def _entries(roster_source=None, roster_file=None):
+    """The parsed pattern entries of a roster.
+
+    ``load_roster`` returns ``(entries, roster_format)``; most cells only need
+    the entries. The cells that pin the format unpack it directly.
+    """
+    entries, _roster_format = load_roster(
+        roster_source=roster_source, roster_file=roster_file
+    )
+    return entries
+
 # ---------------------------------------------------------------------------
 # Fake names used in tests — obviously-fake placeholders only, no real names.
 # ---------------------------------------------------------------------------
@@ -129,7 +141,7 @@ def _require_roster() -> str:
     roster.
     """
     roster = roster_text()
-    if roster is None or not load_roster(roster_source=roster, roster_file=None):
+    if roster is None or not _entries(roster_source=roster, roster_file=None):
         pytest.skip(_SKIP_REASON)
     return roster
 
@@ -433,7 +445,7 @@ def _fake_diff(added_lines: list[str], removed_lines: list[str] | None = None,
 
 def test_removed_lines_not_scanned():
     """Removed lines (starting with '-') must not trigger matches."""
-    patterns = load_roster(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
+    patterns = _entries(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
     diff = _fake_diff(
         added_lines=["# nothing here"],
         removed_lines=[f"# old comment mentioning {FAKE_NAME_A}"],
@@ -444,7 +456,7 @@ def test_removed_lines_not_scanned():
 
 def test_context_lines_not_scanned():
     """Context lines (starting with ' ') must not trigger matches."""
-    patterns = load_roster(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
+    patterns = _entries(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
     diff = _fake_diff(
         added_lines=["# new clean line"],
         context_lines=[f"# context mentioning {FAKE_NAME_A}"],
@@ -455,7 +467,7 @@ def test_context_lines_not_scanned():
 
 def test_added_line_fires():
     """Added lines that match the pattern ARE reported."""
-    patterns = load_roster(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
+    patterns = _entries(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
     diff = _fake_diff(added_lines=[f"# Author: {FAKE_NAME_A}"])
     matches = scan_diff(diff, patterns)
     assert len(matches) == 1, f"expected 1 match; got {matches}"
@@ -470,7 +482,7 @@ def test_added_line_fires():
 def test_word_boundary_no_false_positive():
     """Pattern \\bAlice\\b must NOT match 'Malice' or 'aliceblue'."""
     # Use just the first word of FAKE_NAME_A to test boundary sensitivity
-    patterns = load_roster(roster_source=r"\bAlice\b", roster_file=None)
+    patterns = _entries(roster_source=r"\bAlice\b", roster_file=None)
     diff = _fake_diff(added_lines=["color = 'aliceblue'  # or Malice"])
     matches = scan_diff(diff, patterns)
     assert matches == [], f"\\b anchors should prevent false positive; got {matches}"
@@ -478,7 +490,7 @@ def test_word_boundary_no_false_positive():
 
 def test_word_boundary_does_match_standalone():
     """Pattern \\bAlice\\b DOES match 'Alice' standing alone."""
-    patterns = load_roster(roster_source=r"\bAlice\b", roster_file=None)
+    patterns = _entries(roster_source=r"\bAlice\b", roster_file=None)
     diff = _fake_diff(added_lines=["# Alice wrote this"])
     matches = scan_diff(diff, patterns)
     assert len(matches) == 1
@@ -490,7 +502,7 @@ def test_word_boundary_does_match_standalone():
 
 def test_json_format_shape():
     """--format json output has required top-level key and match fields."""
-    patterns = load_roster(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
+    patterns = _entries(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
     diff = _fake_diff(added_lines=[f"author = '{FAKE_NAME_A}'"])
     matches = scan_diff(diff, patterns)
     output = format_json(matches)
@@ -517,7 +529,7 @@ def test_json_format_empty_matches():
 
 def test_empty_roster_no_matches():
     """Empty patterns list produces zero matches regardless of diff content."""
-    patterns = load_roster(roster_source="", roster_file=None)
+    patterns = _entries(roster_source="", roster_file=None)
     diff = _fake_diff(added_lines=["any content here including anything"])
     matches = scan_diff(diff, patterns)
     assert matches == [], f"empty roster should produce no matches; got {matches}"
@@ -525,7 +537,7 @@ def test_empty_roster_no_matches():
 
 def test_none_roster_no_matches():
     """None roster source with no file also produces zero matches."""
-    patterns = load_roster(roster_source=None, roster_file=None)
+    patterns = _entries(roster_source=None, roster_file=None)
     diff = _fake_diff(added_lines=["some added line"])
     matches = scan_diff(diff, patterns)
     assert matches == []
@@ -538,7 +550,7 @@ def test_none_roster_no_matches():
 def test_multi_pattern_correct_index():
     """Second pattern in roster reports pattern_index=1."""
     roster_text = f"\\b{FAKE_NAME_A}\\b\n\\b{FAKE_NAME_B}\\b"
-    patterns = load_roster(roster_source=roster_text, roster_file=None)
+    patterns = _entries(roster_source=roster_text, roster_file=None)
     assert len(patterns) == 2
     diff = _fake_diff(added_lines=[f"# config for {FAKE_NAME_B}"])
     matches = scan_diff(diff, patterns)
@@ -549,7 +561,7 @@ def test_multi_pattern_correct_index():
 def test_multi_pattern_first_pattern_wins():
     """When a line matches both patterns, pattern_index=0 (first match wins, one per line)."""
     roster_text = f"\\b{FAKE_NAME_A}\\b\n\\b{FAKE_NAME_B}\\b"
-    patterns = load_roster(roster_source=roster_text, roster_file=None)
+    patterns = _entries(roster_source=roster_text, roster_file=None)
     diff = _fake_diff(added_lines=[f"# {FAKE_NAME_A} and {FAKE_NAME_B}"])
     matches = scan_diff(diff, patterns)
     assert len(matches) == 1, "one match per line (break after first hit)"
@@ -1026,16 +1038,16 @@ def test_load_roster_absent_file_exits_1(tmp_path):
 
 
 def test_load_roster_empty_string_returns_empty():
-    """Empty string roster source returns empty list without error."""
-    patterns = load_roster(roster_source="", roster_file=None)
-    assert patterns == []
+    """Empty string roster source returns an empty pattern list without error."""
+    entries, _roster_format = load_roster(roster_source="", roster_file=None)
+    assert entries == []
 
 
 def test_load_roster_comment_and_blank_lines_skipped():
     """Blank lines and #-comment lines are skipped in roster parsing."""
     roster = "\n# this is a comment\n\n\\bAlice\\b\n"
-    patterns = load_roster(roster_source=roster, roster_file=None)
-    assert len(patterns) == 1
+    entries, _roster_format = load_roster(roster_source=roster, roster_file=None)
+    assert len(entries) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1160,17 +1172,21 @@ def test_load_roster_pos_none_error_reports_offset_unknown(capsys):
 
 
 # ---------------------------------------------------------------------------
-# Test 12: a roster FORMAT-2 line is refused, never compiled as a pattern
+# Test 12: roster format 2 is read through the scanner's parser (engram#4817)
 # ---------------------------------------------------------------------------
 #
-# Contract (spec roster-format2-loader §3, cell 14): this consumer parses the
-# format-1 roster only. A line whose class prefix is `A<TAB>` or `B<TAB>` must
-# fail closed — one stderr line naming the file and the reason — instead of
-# compiling the class prefix into a pattern that would silently stop matching
-# once the secret is rotated to format 2. Format-1 behaviour is unchanged (the
-# control in the same cell).
+# Contract (spec roster-consumers-migration §1 C1/C4/C4a, §2.5 T6–T7, as
+# amended): this consumer has no parser of its own. Both roster paths go
+# through the scanner's `parse_roster_text(require_classes=False)`:
+#   - a format-2 roster keeps the classes its lines declare;
+#   - a format-1 roster is class A (the legacy format's own meaning);
+#   - JSON output always carries `"class"`;
+#   - TEXT output carries a `[class=...]` tag only when the detected format is
+#     2, so format-1 text stays byte-identical to today's.
+# The old format-2 refusal is gone with the local parser.
 
-_FMT2_TOKEN = "Zqrosterfmt"
+_FMT2_TOKEN_A = "ZZAlphaHolder"
+_FMT2_TOKEN_B = "YYBravoHandle"
 
 
 def _run_warn(roster_text: str, tmp_path, added_lines: list[str]):
@@ -1187,59 +1203,130 @@ def _run_warn(roster_text: str, tmp_path, added_lines: list[str]):
     )
 
 
-@pytest.mark.parametrize("class_token", ["A", "B"])
-def test_format2_roster_line_is_refused(tmp_path, capsys, class_token):
-    """Cell 14: a class-prefixed line exits non-zero with ONE line naming the
-    file and the reason, and never carries the roster text."""
-    roster_file = tmp_path / "roster.txt"
-    roster_file.write_text(
-        class_token + "\t" + _FMT2_TOKEN + "\n", encoding="utf-8"
+def _run_warn_json(roster_text: str, tmp_path, added_lines: list[str]):
+    roster_file = tmp_path / "roster-json.txt"
+    roster_file.write_text(roster_text, encoding="utf-8")
+    diff_file = tmp_path / "pr-json.diff"
+    diff_file.write_text(_fake_diff(added_lines=added_lines), encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, str(TOOL_PATH),
+         "--roster-file", str(roster_file),
+         "--diff-file", str(diff_file),
+         "--format", "json"],
+        capture_output=True,
+        text=True,
     )
 
-    with pytest.raises(SystemExit) as exc_info:
-        load_roster(roster_source=None, roster_file=str(roster_file))
 
-    assert exc_info.value.code != 0, (
-        f"a format-2 roster line must refuse; got exit {exc_info.value.code!r}"
+def _t6_format2_roster() -> str:
+    return (
+        "A\t\\b" + _FMT2_TOKEN_A + "\\b\n"
+        "B\t\\b" + _FMT2_TOKEN_B + "\\b\n"
     )
-    err = capsys.readouterr().err
-    assert len(err.splitlines()) == 1, f"exactly one stderr line; got {err!r}"
-    assert "format 2" in err, f"the message must name the format; got {err!r}"
-    assert "format 1" in err, f"the message must name the limitation; got {err!r}"
-    assert str(roster_file) in err, f"the message must name the file; got {err!r}"
-    assert _FMT2_TOKEN not in err, f"the roster line's text reached stderr: {err!r}"
 
 
-def test_format2_prefix_is_not_used_as_a_pattern(tmp_path):
-    """Cell 14 (behavioural): the class prefix is never compiled, so a diff
-    line that literally contains `A<TAB><token>` is neither matched nor
-    printed. Pre-change the whole line was a compiling regex that matched its
-    own text (exit 0, with the line echoed to stdout)."""
-    r = _run_warn(
-        "A\t" + _FMT2_TOKEN + "\n",
-        tmp_path,
-        added_lines=["# A\t" + _FMT2_TOKEN],
+def test_t6_format2_end_to_end_and_format1_output_unchanged(tmp_path):
+    """T6: through the tool, a class-B match reports `"class": "B"` and a
+    class-A match reports `"A"`; a format-1 roster reports `"class": "A"` in
+    JSON and its TEXT output is byte-identical to today's assertion."""
+    format2 = _t6_format2_roster()
+
+    rb = _run_warn_json(format2, tmp_path, [f"# {_FMT2_TOKEN_B} was here"])
+    assert rb.returncode == 0, rb.stdout + rb.stderr
+    data_b = json.loads(rb.stdout)
+    assert len(data_b["matches"]) == 1, data_b
+    assert data_b["matches"][0]["class"] == "B", data_b
+
+    ra = _run_warn_json(format2, tmp_path, [f"# {_FMT2_TOKEN_A} was here"])
+    assert ra.returncode == 0, ra.stdout + ra.stderr
+    data_a = json.loads(ra.stdout)
+    assert len(data_a["matches"]) == 1, data_a
+    assert data_a["matches"][0]["class"] == "A", data_a
+
+    # The TEXT tag sits immediately after the [pattern_index=N] tag, and only
+    # a format-2 roster produces one.
+    rt = _run_warn(format2, tmp_path, [f"# {_FMT2_TOKEN_B} was here"])
+    assert rt.returncode == 0, rt.stdout + rt.stderr
+    assert "[pattern_index=1] [class=B]" in rt.stdout, rt.stdout
+
+    # Format 1: JSON says class A; TEXT is byte-identical to today's form.
+    format1 = "\\b" + _FMT2_TOKEN_A + "\\b\n"
+    rf = _run_warn_json(format1, tmp_path, [f"# {_FMT2_TOKEN_A} was here"])
+    assert rf.returncode == 0, rf.stdout + rf.stderr
+    data_f = json.loads(rf.stdout)
+    assert len(data_f["matches"]) == 1, data_f
+    assert data_f["matches"][0]["class"] == "A", data_f
+
+    text = _run_warn(format1, tmp_path, [f"# {_FMT2_TOKEN_A} was here"])
+    assert text.returncode == 0, text.stdout + text.stderr
+    assert text.stdout.strip() == (
+        f"path/to/file.py:1:[pattern_index=0] # {_FMT2_TOKEN_A} was here"
+    ), text.stdout
+
+
+def test_t7_string_path_parses_format2_without_exiting():
+    """T7: ``load_roster(roster_source=<format-2 text>, roster_file=None)``
+    parses and returns entries — it does not `SystemExit`.
+
+    This is the third consumer: ``_require_roster()`` feeds the real secret
+    through this path, so post-rotation a `SystemExit` here would kill the
+    pytest run instead of skipping."""
+    entries, roster_format = load_roster(
+        roster_source=_t6_format2_roster(), roster_file=None
     )
-    out = r.stdout + r.stderr
-    assert r.returncode != 0, out
-    assert _FMT2_TOKEN not in out, out
-    assert "pattern_index" not in out, out
+    assert roster_format == 2
+    assert [klass for _pattern, klass in entries] == ["A", "B"]
+
+
+def test_c6_warn_tool_fails_loud_when_the_scanner_cannot_be_found(tmp_path):
+    """C6: the tool never silently degrades.
+
+    A copy with neither a sibling ``scan-leaks.py`` nor the source-tree path
+    exits 1 with ONE line naming what it could not find, and no traceback. It
+    never falls back to parsing the roster itself."""
+    isolated = tmp_path / "isolated"
+    isolated.mkdir()
+    tool = isolated / "name_leak_warn.py"
+    tool.write_text(TOOL_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    roster = isolated / "roster.txt"
+    roster.write_text("\\b" + _FMT2_TOKEN_A + "\\b\n", encoding="utf-8")
+    diff = isolated / "pr.diff"
+    diff.write_text(_fake_diff(added_lines=["# a clean line"]), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(tool),
+         "--roster-file", str(roster),
+         "--diff-file", str(diff)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.count("could not locate the roster parser") == 1, (
+        result.stderr
+    )
+    assert "Traceback" not in result.stderr, result.stderr
 
 
 def test_format1_roster_still_behaves_as_before(tmp_path, capsys):
-    """Cell 14 (control): the same consumer on a format-1 roster loads the
-    pattern and reports a match exactly as it did before the refusal."""
+    """Control: the same consumer on a format-1 roster loads the pattern and
+    reports a match exactly as it did before format inference landed."""
     roster_file = tmp_path / "roster.txt"
     roster_file.write_text(f"\\b{FAKE_NAME_A}\\b\n", encoding="utf-8")
 
-    patterns = load_roster(roster_source=None, roster_file=str(roster_file))
-    assert len(patterns) == 1
+    entries, roster_format = load_roster(
+        roster_source=None, roster_file=str(roster_file)
+    )
+    assert roster_format == 1
+    assert len(entries) == 1
     assert capsys.readouterr().err == ""
 
     r = _run_warn(f"\\b{FAKE_NAME_A}\\b\n", tmp_path, [f"# {FAKE_NAME_A} was here"])
     assert r.returncode == 0, r.stdout + r.stderr
     assert FAKE_NAME_A in r.stdout, r.stdout
     assert "pattern_index=0" in r.stdout, r.stdout
+    assert "[class=" not in r.stdout, (
+        "a format-1 roster's text output must stay byte-identical (no tag)"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -2525,7 +2525,8 @@ def test_cell13_class_a_wins_on_a_shared_line(tmp_path, class_order):
 
     # In-process: exactly one finding, attributed to class A. A class-B
     # attribution is the masked verdict this cell exists to forbid.
-    compiled = _mod.load_roster_file(roster)
+    compiled, roster_format = _mod.load_roster_file(roster)
+    assert roster_format == 2, "this roster declares class prefixes"
     report = _mod.scan(root, compiled, use_git=True)
     assert len(report.findings) == 1, report.findings
     rel, lineno, label, _snippet, klass = report.findings[0]
@@ -2721,4 +2722,179 @@ def test_cell19_boundary_test_is_syntactic(tmp_path, pattern_text, accepted):
         assert "line 1" in r.stderr, out
         assert "boundary" in r.stderr, out
         assert pattern_text not in out, out
+
+
+# ---------------------------------------------------------------------------
+# Test 22: roster-format inference and the shared parser (engram#4817)
+# ---------------------------------------------------------------------------
+#
+# Contract (spec roster-consumers-migration §1 C2–C5, §2.5 T1–T5, as amended):
+#   - `load_roster_file(path, *, require_classes=True, program="scan-leaks",
+#     exit_code=2)` and `parse_roster_text(text, ...)` return
+#     `(patterns, roster_format)`; each pattern is a
+#     `(compiled, label, class)` triple and `roster_format` is 1 or 2.
+#   - `require_classes=True` (the default, and every existing call site) is
+#     byte-identical to #4816: format 2 only, a non-comment line with no class
+#     token refuses the whole roster.
+#   - `require_classes=False` infers the GRAMMAR over the whole roster and
+#     never the class: every content line prefixed -> format 2 with the
+#     declared classes; none prefixed -> format 1, whose patterns are CLASS_A
+#     by the legacy format's own meaning; mixed -> the whole roster refuses,
+#     naming the 1-based number of the FIRST line that disagrees.
+#   - every refusal prints `<program>: ...` and exits `<exit_code>`.
+#
+# Every fixture token below is invented and appears nowhere else.
+
+_T22_A = "ZZAlphaHolder"
+_T22_B = "YYBravoHandle"
+
+
+def _t22_format1_text() -> str:
+    """A format-1 roster: two patterns, a blank line and a comment line."""
+    return (
+        "# a comment\n"
+        "\n"
+        "\\b" + _T22_A + "\\b\n"
+        "\\b" + _T22_B + "\\b\n"
+    )
+
+
+def test_t1_format1_inference_is_class_a_and_reports_format_1(tmp_path):
+    """T1: format inference never invents a class — a format-1 roster is class
+    A throughout (the legacy format's own meaning), the detected format is
+    reported, and a caller that blocks only on CLASS_A still blocks.
+
+    The second half is the fail-closed control: a consumer that reacts only to
+    CLASS_A is the shape that would silently stop blocking if format-1 patterns
+    were ever returned with a class the blocking path does not know."""
+    entries, roster_format = _mod.parse_roster_text(
+        _t22_format1_text(), require_classes=False
+    )
+    assert roster_format == 1
+    assert [klass for _pattern, _label, klass in entries] == [
+        _mod.CLASS_A,
+        _mod.CLASS_A,
+    ], "a format-1 pattern is class A"
+    assert [label for _pattern, label, _klass in entries] == [
+        "roster file (format 1)",
+        "roster file (format 1)",
+    ]
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_T22_A} world\n"})
+    report = _mod.scan(root, entries, use_git=True)
+    assert len(report.findings) == 1, report.findings
+    rel, lineno, _label, _snippet, klass = report.findings[0]
+    assert (rel, lineno, klass) == ("doc.md", 1, _mod.CLASS_A), (
+        "a format-1 pattern must still block through the CLASS_A path"
+    )
+
+
+@pytest.mark.parametrize("order", ["b-first", "a-first"])
+def test_t2_format2_inference_keeps_declared_classes_and_a_wins(tmp_path, order):
+    """T2: through the inferred branch a format-2 roster keeps the classes its
+    lines declare, and a line holding BOTH a class-B and a class-A name is
+    class A — the #4816 rule, reached through the new path.
+
+    BOTH orders are pinned: the rule it guards is an ordering bug, so a
+    single-order fixture passes on an order-dependent implementation."""
+    b_line = "B\t\\b" + _T22_B + "\\b"
+    a_line = "A\t\\b" + _T22_A + "\\b"
+    if order == "b-first":
+        lines, expected = [b_line, a_line], [_mod.CLASS_B, _mod.CLASS_A]
+    else:
+        lines, expected = [a_line, b_line], [_mod.CLASS_A, _mod.CLASS_B]
+
+    entries, roster_format = _mod.parse_roster_text(
+        "\n".join(lines) + "\n", require_classes=False
+    )
+    assert roster_format == 2
+    assert [klass for _pattern, _label, klass in entries] == expected
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_T22_B} and {_T22_A}\n"})
+    report = _mod.scan(root, entries, use_git=True)
+    assert len(report.findings) == 1, report.findings
+    assert report.findings[0][4] == _mod.CLASS_A, report.findings
+
+
+@pytest.mark.parametrize("prefix_first", [True, False])
+def test_t3_mixed_roster_refuses_naming_the_first_disagreeing_line(
+    capsys, prefix_first
+):
+    """T3: a roster that mixes the two grammars refuses the WHOLE roster,
+    naming the 1-based number of the FIRST line that disagrees — and never
+    the line's text. Both orders: whichever line lacks the prefix is the
+    offender, wherever it sits."""
+    prefixed = "A\t\\b" + _T22_A + "\\b"
+    bare = "\\b" + _T22_B + "\\b"
+    lines = [prefixed, bare] if prefix_first else [bare, prefixed]
+    offending = 2 if prefix_first else 1
+
+    with pytest.raises(SystemExit) as exc_info:
+        _mod.parse_roster_text("\n".join(lines) + "\n", require_classes=False)
+
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert f"line {offending}" in err, err
+    # The refusal must be the MIXED-GRAMMAR rule, not the format-2 parser
+    # rejecting the bare line as "no class token": dropping the mixed rule and
+    # falling through to format 2 would raise at the same line number, so the
+    # line number alone does not discriminate it.
+    assert "mix" in err.lower(), (
+        f"the refusal must name the mixed grammar, not a format-2 parse error; "
+        f"got {err!r}"
+    )
+    assert _T22_A not in err and _T22_B not in err, (
+        f"the refusal echoed a roster line: {err!r}"
+    )
+
+
+def test_t4_default_still_refuses_a_format1_roster(capsys):
+    """T4 (the control for T1/T3): the DEFAULT (`require_classes=True`, which
+    the sweep workflow and the scanner CLI pass) did not loosen. The same
+    format-1 roster T1 parses under inference is still refused with the #4816
+    wording and exit 2."""
+    with pytest.raises(SystemExit) as exc_info:
+        _mod.parse_roster_text(_t22_format1_text())
+
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith("scan-leaks:"), (
+        f"the scanner's own refusal keeps its default program prefix; got {err!r}"
+    )
+    assert "line 3" in err, err
+    assert "A<TAB>" in err and "B<TAB>" in err, err
+    assert _T22_A not in err and _T22_B not in err, err
+
+
+def test_t5_program_and_exit_code_are_honoured(tmp_path):
+    """T5: every refusal names the calling program and exits its code. Run in
+    a subprocess so the exit code is the process's own."""
+    roster = tmp_path / "roster.txt"
+    roster.write_text("\\b" + _T22_A + "\\b\n", encoding="utf-8")
+    code = (
+        "import importlib.util, sys\n"
+        "from pathlib import Path\n"
+        "spec = importlib.util.spec_from_file_location("
+        f"'sl_t5', {str(SCAN_LEAKS)!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "module.load_roster_file("
+        "Path(sys.argv[1]), program='tester', exit_code=1)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(roster)],
+        capture_output=True,
+        text=True,
+        env=_scanner_env(),
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert proc.stderr.startswith("tester:"), proc.stderr
+    assert "line 1" in proc.stderr, proc.stderr
+    assert _T22_A not in proc.stdout + proc.stderr, (
+        "the refusal echoed the roster line"
+    )
 

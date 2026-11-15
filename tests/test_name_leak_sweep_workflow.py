@@ -1864,3 +1864,24 @@ def test_cell17_a_boolean_attestation_count_fails_closed(
     )
     assert proc.returncode != 0, out
     assert "attestation absent or invalid" in out, out
+
+
+# ---------------------------------------------------------------------------
+# T13 (engram#4817): the sweep did NOT opt into format inference
+# ---------------------------------------------------------------------------
+
+def test_t13_the_sweep_still_refuses_a_format_1_roster(sweep_repo, tmp_path):
+    """The whole-tree sweep's roster must still be format 2.
+
+    The sweep's own grammar check is a pure text predicate over the raw
+    roster; it fires before the scanner is invoked. The scanner's default
+    (`require_classes=True`) is the same rule one level down, so a loosened
+    default must never become reachable from this workflow — a format-1
+    roster here is a failure, and no scan runs.
+    """
+    work, base, _g = sweep_repo
+    roster = "\\bQuillonfex\\b\n"
+    proc, out = _run_sweep(work, base, tmp_path, roster_value=roster)
+    assert proc.returncode != 0, out
+    assert "does not start with A<TAB> or B<TAB>" in out, out
+    assert "scan-leaks: scanned" not in out, out
