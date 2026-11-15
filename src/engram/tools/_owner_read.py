@@ -430,6 +430,18 @@ def snapshot(spec: OwnerReadSpec, dest_path: Path) -> Path:
     return Path(dest)
 
 
+def _tagged(exc: Exception, owner_reason, owner_commit) -> Exception:
+    """Set `owner_reason` and `owner_commit` on an exception `write` is about to raise, and return it (#4651 A3). A caller
+    that must tell one owner outcome from another reads these and never matches the message text. `owner_reason` is the
+    owner's Rejected/Unavailable reason ("down" for a down owner), or None when the failure carries none; `owner_commit` is the
+    Rejected `commit` value, or "indeterminate" for the failures whose own message says the outcome is INDETERMINATE and
+    which carry no Rejected (an Unavailable that is not "down", a client that raised, an answer that is not an object).
+    Nothing else about the exception changes."""
+    exc.owner_reason = owner_reason
+    exc.owner_commit = owner_commit
+    return exc
+
+
 def write(spec: OwnerReadSpec, method: str, params: dict, request_id: str | None = None):
     """One typed owner WRITE (U16, #3879). Returns the owner's `result` ONLY for an `Ok` whose result is a
     dict; every other outcome RAISES spec.error_cls, so a caller can never mistake a failed or unknown write
@@ -448,54 +460,54 @@ def write(spec: OwnerReadSpec, method: str, params: dict, request_id: str | None
     try:
         client = import_runtime("engramd_client")
     except Exception as exc:
-        raise err(
+        raise _tagged(err(
             f"engramd.{key} is on but engramd_client could not be loaded "
             f"({type(exc).__name__}: {exc}); not writing the store directly. Fix the plugin install, or set "
             f"the flag to false."
-        ) from exc
+        ), None, None) from exc
     try:
         result = client.write(
             method, params, request_id=request_id, timeout=spec.write_timeout, socket_path=_socket(client, spec)
         )
     except (Exception, SystemExit) as exc:  # client.write does not raise by contract (#3717); belt, as ping
-        raise err(
+        raise _tagged(err(
             f"the engramd owner {method} failed ({type(exc).__name__}); the outcome is INDETERMINATE. Not "
             f"writing the store directly. Start the owner, or set engramd.{key} to false."
-        ) from exc
+        ), None, "indeterminate") from exc
     if isinstance(result, client.Unavailable):
         if result.reason == "down":
-            raise err(
+            raise _tagged(err(
                 f"the engramd owner is DOWN (owner unavailable: down); the {method} request did not reach it "
                 f"and nothing was written. Not writing the store directly. Start the owner and retry, or set "
                 f"engramd.{key} to false."
-            )
-        raise err(
+            ), "down", None)
+        raise _tagged(err(
             f"the engramd owner {method} outcome is INDETERMINATE (owner unavailable: "
             f"{result.reason or 'unavailable'}); the write may or may not have committed. Not writing the "
             f"store directly. Retry once the owner is healthy, or set engramd.{key} to false."
-        )
+        ), result.reason or "unavailable", "indeterminate")
     if isinstance(result, client.Rejected):
         commit = getattr(result, "commit", None)
         if commit == "indeterminate":
-            raise err(
+            raise _tagged(err(
                 f"the engramd owner {method} outcome is INDETERMINATE ({result.reason}: {result.detail}); the "
                 f"write may or may not have committed. Not writing the store directly. Retry once the owner "
                 f"is healthy, or set engramd.{key} to false."
-            )
+            ), result.reason, commit)
         if commit == "committed_unverified":
-            raise err(
+            raise _tagged(err(
                 f"the engramd owner {method} COMMITTED but could not verify it ({result.reason}: "
                 f"{result.detail}); {result.remedy}. Not writing the store directly."
-            )
-        raise err(
+            ), result.reason, commit)
+        raise _tagged(err(
             f"the engramd owner refused the {method} write ({result.reason}: {result.detail}); "
             f"{result.remedy}. Nothing was written. Not writing the store directly. If that does not help, "
             f"set engramd.{key} to false."
-        )
+        ), result.reason, commit)
     if not isinstance(result, client.Ok) or not isinstance(result.result, dict):
-        raise err(
+        raise _tagged(err(
             f"the engramd owner answered the {method} write malformed (the result is not an object); the "
             f"outcome is INDETERMINATE. Not writing the store directly. Check the owner build, or set "
             f"engramd.{key} to false."
-        )
+        ), None, "indeterminate")
     return result.result
