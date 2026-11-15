@@ -265,17 +265,36 @@ grep -cve '^[[:space:]]*$' -e '^[[:space:]]*#' roster.txt   # -> pattern_count
 `sha256sum` is GNU (Linux); macOS seats have `shasum -a 256`. The Python
 one-liner is the authoritative form on every seat.
 
+A **format-2** roster records `pattern_count_a` and `pattern_count_b` instead of
+`pattern_count`. Count them by the rule the gate itself applies — strip the line,
+drop blanks and `#`-comments, then test the prefix:
+
+```bash
+python3 -c 'import sys;L=[l.strip() for l in open(sys.argv[1],encoding="utf-8")];L=[l for l in L if l and not l.startswith("#")];print(sum(l.startswith("A\t") for l in L), sum(l.startswith("B\t") for l in L))' roster.txt
+# -> pattern_count_a pattern_count_b
+```
+
+`grep '^A<TAB>'` is not equivalent: the gate strips each line first, so an
+indented line counts for the gate and not for the grep.
+
 `updated_at` is an ISO-8601 UTC timestamp. A malformed or unset attestation is
 treated as absent and fails the gate; it never passes.
 
-**Locating a class-A hit.** Under the two-class roster a class-A hit is
-printed as a count only, so locating one requires the roster text.
+**Custody line (roster format 2).** Under the two-class roster a class-A hit is
+printed as a count only, so locating one requires the roster text. Format 2 must
+therefore not gate a release until a **roster holder is named**. A holder is
+named, and that naming is recorded in the team's own record rather than in this
+repository. A release may therefore be cut on the two-class roster's green once
+the holder's own copy of the list has passed the tool's live-list check — the
+act that confirms the text is still held.
 
-**Bootstrap note.** The attestation committed with this change carries the
-placeholder `roster_sha256` `"UNSET - ..."` because the roster is a repository
-secret and cannot be read from a checkout. It must be replaced with the real
-hash by a roster holder before the gate can go green; until then the gate fails
-loud (which is the intended failure direction).
+**Bootstrap note.** The attestation must carry the real `roster_sha256`, because
+the roster is a repository secret and cannot be read from a checkout: whoever
+sets the secret fills it in. A placeholder or `UNSET` value fails the gate
+loudly, which is the intended failure direction. (An earlier draft of this note
+said the committed attestation carries such a placeholder. It does not — every
+version ever committed to this repository carries a real digest — and a reader
+who checked the file would have found the note false.)
 
 ### Filling or rotating the attestation
 
@@ -294,13 +313,17 @@ text, and in the same commit re-issue the attestation with `roster_format: 2`
 and the two per-class counts (`pattern_count_a`, `pattern_count_b`).
 
 The gate **observes** the roster's format from its shape and requires the
-attestation to agree. A rotation that swaps the secret and forgets the
-attestation commit goes red: the whole-file hash still matches, and only the
-format cross-check can see the mismatch.
+attestation to agree. The whole-file sha256 is over bytes and is blind to the
+grammar, so it cannot stand in for this check. A rotation can stop half-done in
+two ways, and they fail in different places:
 
-The repository's project lead holds the roster: the secret's source text is
-theirs, the rotation in this section is performed by them, and the attestation
-commit that records it is made from their act.
+- **The attestation is left entirely untouched.** The format cross-check fires
+  first and fails the run. The sha comparison is never reached, and it would not
+  have matched anyway, because the secret changed.
+- **The hash is re-issued but `roster_format` is left stale.** The sha matches,
+  and the format cross-check is the only thing that sees the mismatch.
+
+Both fail closed. The second is the case a sha-only gate would have passed.
 
 ## Tests
 
