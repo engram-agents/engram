@@ -6,7 +6,8 @@ routing flag `engramd.repair_embeddings_via_owner` (default OFF). The flag is a 
 owner's own config; consent to overwrite lives in the repair tool's preview-then-apply, not here.
 
 Every store is built with the real schema under a temp dir. Real sqlite-vec must RUN here: a store without a loadable
-vec0 is a hard failure, never a skip. The authorizer admissions are MEASURED (a recording authorizer on the real schema);
+vec0 is a hard failure, never a skip. The authorizer admissions are MEASURED (a recording authorizer on the real
+schema), and the vec0 family is admitted EXACTLY as measured;
 cell A2 re-measures at test time and compares against the recorded set below, so a change to the primitive reddens it
 with the op's own code untouched.
 
@@ -837,7 +838,8 @@ def test_r3_a_failed_commit_rolls_the_whole_batch_back_and_a_same_id_retry_runs(
 # part of the record), over five scenarios: refreshed without a marker, refreshed with a marker (the metadata UPDATE and
 # its trigger), a mirror failure (ROLLBACK TO + the marker SET), a malformed-metadata deferral and a recipe deferral.
 # Recorded from the primitive at A1 (SQLite 3.45.1, sqlite_vec 0.1.9, venv python); a change here is a change to the
-# surface the owner's allowlist must admit.
+# surface the owner's allowlist must admit. A different SQLite or sqlite-vec build reddens `test_a2` by design:
+# re-record from the new build and review the diff before changing the owner's allowlist.
 S = sqlite3
 EXPECTED_EVENTS = frozenset({
     (S.SQLITE_DELETE, "vec_nodes", None, "main", None),

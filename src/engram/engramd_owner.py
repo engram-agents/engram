@@ -2484,7 +2484,7 @@ def _finish_embedding_regen_allows(action_code, arg1, arg2, db_name, trigger_or_
 
 
 # ---------------------------------------------------------------------------
-# The fifth write: `publish_prepared_embeddings` (#4651 part A, slice A2)
+# The seventh write: `publish_prepared_embeddings` (#4651 part A, slice A2)
 # ---------------------------------------------------------------------------
 #
 # The owner publishes ALREADY-ENCODED vectors through the ONE shared primitive,
@@ -2506,8 +2506,10 @@ PUBLISH_PREPARED_MAX_ITEMS = 50
 #   reads of `nodes`: the six recipe columns of `_embedding_text_for_node`, plus id, is_current, embedding, metadata;
 #   updates: `nodes.embedding` and `nodes.metadata` only;
 #   `sqlite_master`: the vec-store existence check, columns type and name only;
-#   the vec0 table family (a read, update, insert or delete on it), vec0's own constructor read of `x.node_id`, and the
-#   SQL function `max`;
+#   the vec0 family EXACTLY as measured, not by name (see the PUBLISH_PREPARED_VEC_* tables below: the recorded
+#   reads, the two recorded updates and the recorded inserts and deletes; the other shadow tables, `vec_nodes_info`,
+#   `_auxiliary`, `_vector_chunks00`, `_metadatachunks00` and `_metadatatext00`, are denied), vec0's own constructor read
+#   of `x.node_id` (no other column of `x`), and the SQL function `max`;
 #   savepoint: the primitive's own name, BEGIN / RELEASE / ROLLBACK.
 # EXACTLY ONE trigger fires on `UPDATE OF metadata ON nodes`: `nodes_metadata_json_guard_update` (BEFORE UPDATE OF
 # metadata, `WHEN NEW.metadata IS NOT NULL AND NOT json_valid(NEW.metadata)`, body `SELECT RAISE(ABORT, ...)`). Its
@@ -2522,13 +2524,37 @@ PUBLISH_PREPARED_NODES_READ_COLUMNS = frozenset({
 PUBLISH_PREPARED_NODES_UPDATE_COLUMNS = frozenset({"embedding", "metadata"})
 PUBLISH_PREPARED_SQLITE_MASTER_READ_COLUMNS = frozenset({"type", "name"})
 PUBLISH_PREPARED_FUNCTIONS = frozenset({"max"})
+# The vec0 family, EXACTLY the recorded tuples (db `main`, outside any trigger). `_is_vec_table` is NOT used here: it
+# admits the whole shadow family by name, and this op never touches most of it. The empty-string column is the
+# `count(*)`-style read of a table. A SQLite or sqlite-vec build whose measured set differs reddens
+# tests/test_4651_a2_owner_op.py (`test_a2`) by design; re-record there before widening any of this.
+PUBLISH_PREPARED_VEC_READ_COLUMNS = {
+    "vec_nodes": frozenset({"embedding", "node_id"}),
+    "vec_nodes_chunks": frozenset({"", "chunk_id"}),
+    "vec_nodes_rowids": frozenset({"chunk_id", "chunk_offset", "id", "rowid"}),
+}
+PUBLISH_PREPARED_VEC_UPDATE_COLUMNS = {"vec_nodes_rowids": frozenset({"chunk_id", "chunk_offset"})}
+PUBLISH_PREPARED_VEC_WRITE_TABLES = frozenset({"vec_nodes", "vec_nodes_rowids"})  # INSERT and DELETE, column None
 PUBLISH_PREPARED_SAVEPOINT = "recall_summary_vector_refresh"  # the primitive's own SAVEPOINT name
+
+
+def _publish_prepared_vec_allows(action_code, arg1, arg2) -> bool:
+    """The vec0-family admissions of `publish_prepared_embeddings` (pure; the caller has already required db `main`
+    and no trigger): exactly the recorded tuples, table by table and column by column. Not `_is_vec_table`."""
+    if action_code == sqlite3.SQLITE_READ:
+        return arg2 in PUBLISH_PREPARED_VEC_READ_COLUMNS.get(arg1, ())
+    if action_code == sqlite3.SQLITE_UPDATE:
+        return arg2 in PUBLISH_PREPARED_VEC_UPDATE_COLUMNS.get(arg1, ())
+    if action_code in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE):
+        return arg2 is None and arg1 in PUBLISH_PREPARED_VEC_WRITE_TABLES
+    return False
 
 
 def _publish_prepared_embeddings_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
     """The op-scoped allowlist (pure) for `publish_prepared_embeddings`: True iff this authorizer call is one the
     primitive's prepared mode (plus the op's own vec gate and read-back) makes. MEASURED, never copied from
-    `_fill_embeddings_allows`: it reads more (the six recipe columns, `metadata`, the `sqlite_master` check), writes
+    `_fill_embeddings_allows`, and the vec0 family is admitted EXACTLY as measured (its own predicate, not the shadow
+    family by name): it reads more (the six recipe columns, `metadata`, the `sqlite_master` check), writes
     `nodes.metadata` too and names a different savepoint. Everything else (other columns, tables or databases, INSERT /
     DELETE on `nodes`, every DDL action, PRAGMA, ATTACH, other functions, other savepoints) is False. A statement
     originating in a trigger or view is admitted only if that trigger is NAMED in PUBLISH_PREPARED_ADMITTED_TRIGGERS,
@@ -2550,12 +2576,13 @@ def _publish_prepared_embeddings_allows(action_code, arg1, arg2, db_name, trigge
             (arg1 == "nodes" and arg2 in PUBLISH_PREPARED_NODES_READ_COLUMNS)
             or (arg1 == "sqlite_master" and arg2 in PUBLISH_PREPARED_SQLITE_MASTER_READ_COLUMNS)
             or (arg1 == "x" and arg2 == "node_id")  # vec0's constructor declares its schema under the name `x`
-            or _is_vec_table(arg1))
+            or _publish_prepared_vec_allows(action_code, arg1, arg2))
     if action_code == sqlite3.SQLITE_UPDATE:
         return db_name == "main" and (
-            (arg1 == "nodes" and arg2 in PUBLISH_PREPARED_NODES_UPDATE_COLUMNS) or _is_vec_table(arg1))
+            (arg1 == "nodes" and arg2 in PUBLISH_PREPARED_NODES_UPDATE_COLUMNS)
+            or _publish_prepared_vec_allows(action_code, arg1, arg2))
     if action_code in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE):
-        return db_name == "main" and _is_vec_table(arg1)
+        return db_name == "main" and _publish_prepared_vec_allows(action_code, arg1, arg2)
     if action_code == sqlite3.SQLITE_TRANSACTION:
         return arg1 in ("BEGIN", "COMMIT", "ROLLBACK")
     if action_code == sqlite3.SQLITE_SAVEPOINT:
@@ -2575,11 +2602,14 @@ def _publish_prepared_param_refusal(params, dimension: int) -> "tuple[dict | Non
     order: (4) a dict with exactly {node_id, vector, text_sha256}; (5) node_id: a str, non-empty, at most
     USE_REWARD_NODE_ID_MAX_BYTES UTF-8 bytes (counted with surrogatepass), no lone surrogate, not repeated in the call;
     (6) text_sha256 a str; (7) vector: a list of exactly `dimension` elements, each an int or a float and NOT a bool,
-    each finite once converted to float (an int too large for a float is not finite). All refusals are
+    each finite once converted to float (an int too large for a float is not finite). FINITE, AND WITHIN THE FLOAT32
+    RANGE, ELSE THAT ITEM DEFERS: this validation only requires a finite float64, so a finite value beyond the float32
+    range (for example 1e39) passes here and the primitive defers THAT item as `deferred / invalid_vector` (the call is
+    still `ok` and the other items refresh); that is kept behaviour, pinned by a cell. All refusals are
     `invalid_params`, their detail BEGINNING with a stable machine token. The epoch is NOT compared with the store's
     here: the primitive compares it per item (`deferred / epoch_changed`), never as a whole-call refusal. The vectors are
-    passed on exactly as sent (no normalisation), so the stored text is what the in-process primitive writes. Touches
-    no connection."""
+    passed on exactly as sent (no normalisation): an int vector is stored as sent (`[1, 1, ...]`), which is what the
+    in-process primitive writes when it is given ints, not a float rendering. Touches no connection."""
     p = "publish_prepared_embeddings params"
     empty_epoch: dict = {}
     if not isinstance(params, dict) or set(params) != {"epoch", "items"}:
@@ -5654,7 +5684,7 @@ class EngramdOwner:
                 raise
             return {**unverified, "_committed": True}
 
-    # -- the owner's fifth write (#4651 part A, slice A2) -----------------------------------------------------------
+    # -- the owner's seventh write (#4651 part A, slice A2) -----------------------------------------------------------
 
     def _publish_prepared_flag_refusal(self) -> "dict | None":
         """None iff `engramd.repair_embeddings_via_owner` is the JSON boolean `true` in THIS owner's own config.json,
@@ -5716,14 +5746,15 @@ class EngramdOwner:
         before the params are validated and before the store is touched.
 
         Order: (1) the flag gate; (2) validate EVERY item, touching no connection (one bad item refuses the whole call,
-        nothing written); (3) the request_id; (4) the shared `_owner_write` scaffold with this op's own restrictive,
-        MEASURED authorizer, installed BEFORE `BEGIN IMMEDIATE` and restored on every exit; UNDER THE LOCK a dedupe check
+        nothing written); (3) the request_id; (4) the shared `_owner_write` scaffold with this op's own restrictive
+        authorizer (the vec0 family admitted EXACTLY as measured), installed BEFORE `BEGIN IMMEDIATE` and restored on every exit; UNDER THE LOCK a dedupe check
         by request_id (a replay answers the stored outcome with `duplicate: True`; the same id with a different payload is
         refused), the vec gate (`vec_unavailable`), BEGIN IMMEDIATE, the primitive per item, COMMIT, then the READ-BACK of
         every `refreshed` item's `nodes.embedding` text and its vec bytes.
 
         The epoch is compared per item by the primitive (a mismatch is that item's `deferred / epoch_changed`); there is
-        no whole-call model mismatch. Outcomes: `ok` {items: [{node_id, status, reason, vector_changed, debt_cleared}],
+        no whole-call model mismatch. A vector must be finite and within the float32 range, else that item defers
+        (`deferred / invalid_vector`; the call is still `ok`, the other items refresh); an int vector is stored as sent. Outcomes: `ok` {items: [{node_id, status, reason, vector_changed, debt_cleared}],
         counts: {refreshed, pending, deferred}}; `flag_off`; `invalid_params`; `vec_unavailable`; `write_denied` (the
         whole op rolled back); `busy` (nothing committed); `publish_write_failed` (rolled back, a failed COMMIT included;
         retry with the SAME request_id); `readback_mismatch` (COMMITTED but unverified, recorded so a replay re-reports
