@@ -100,7 +100,9 @@ with an `-alpha` suffix during the alpha phase.
   **Known behaviour change:** on graphs older than the cascade machine, the health score's
   `pending_premise_rate` can rise at upgrade, because old retractions now mark the nodes built on
   them. Unlike a live retraction, the backfill does not mark contradiction nodes that have the
-  retracted node as a side. (#4727)
+  retracted node as a side. If the migration fails, including on a derivation chain deeper than
+  Python's recursion limit, it rolls back, leaves the schema at 10 and retries at the next start.
+  (#4727)
 - Summary and keyword rewrites now refresh the complete canonical embedding,
   including identical-input retries. Failed refreshes retain both old vector
   stores and report persisted per-node debt through the write result and

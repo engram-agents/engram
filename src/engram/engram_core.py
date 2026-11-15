@@ -6987,6 +6987,8 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # every retracted root that has no retract marker writes the missing markers (insert-only;
     # see _backfill_pre_machine_retract_markers). One transaction with the version bump; on
     # failure it rolls back and retries next start; the pre-migration backup gate applies.
+    # RecursionError is caught with DatabaseError: the walk recurses once per derivation
+    # level, and a chain deeper than the interpreter's limit must not fail every start.
     if _rung_ready(conn, RETRACT_BACKFILL_RUNG, _pre_migration_backup_ok):
         try:
             _bf_roots, _bf_markers, _bf_nodes = _backfill_pre_machine_retract_markers(conn)
@@ -6999,7 +7001,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 "(engram_cascade_frontier).",
                 file=sys.stderr,
             )
-        except sqlite3.DatabaseError as _migration11_err:
+        except (sqlite3.DatabaseError, RecursionError) as _migration11_err:
             conn.rollback()
             print(
                 f"[_run_db_one_time_setup] migration {RETRACT_BACKFILL_RUNG} (#4727 retract-marker "

@@ -444,3 +444,25 @@ def test_cell13_a_null_root_node_row_does_not_hide_every_old_retraction(g):
         c.close()
     assert roots_marked == 1, "the NULL row must not hide the one old retraction"
     assert set(_retract_marked(core, g["R"])) == {g["D1"], g["D2"], g["A"]}
+
+
+def test_cell14_a_walk_too_deep_for_the_interpreter_rolls_back_like_a_database_error(g, monkeypatch, capsys):
+    """Clio, #4820: the walk recurses once per derivation level, so a chain deeper than the
+    recursion limit raises RecursionError, not a DatabaseError. The rung must treat it the
+    same way: version stays 10, no backfill marker survives, the ladder returns instead of
+    raising out of every start, and the next start retries."""
+    core = g["core"]
+    real = core._walk_cascade_from_root
+
+    def too_deep(*a, **k):
+        raise RecursionError("injected: maximum recursion depth exceeded")
+
+    monkeypatch.setattr(core, "_walk_cascade_from_root", too_deep)
+    capsys.readouterr()
+    assert _ladder(core) == RUNG - 1
+    assert "FAILED, will retry" in capsys.readouterr().err
+    assert _retract_marked(core, g["R"]) == {}, "a failed rung must leave no backfill marker"
+
+    monkeypatch.setattr(core, "_walk_cascade_from_root", real)
+    assert _ladder(core) == RUNG
+    assert set(_retract_marked(core, g["R"])) == {g["D1"], g["D2"], g["A"]}
