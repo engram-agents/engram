@@ -699,3 +699,60 @@ def test_d3_a_raising_store_step_is_reported_not_propagated(ctx):
     assert after[0][0] == before[0][0] and after[1] == before[1]
     meta = ctx.marker(nid)
     assert meta["keep"] == "k" and meta[MARKER]["reason"] == "embedding"
+
+
+# ---- A1 delta 2 cells (reviewer findings) --------------------------------
+F32_MAX = 3.4028234663852886e38
+
+
+# -------------------------------------------------------------------- D4
+@pytest.mark.parametrize("big", [10**400, -(10**400)], ids=["pos", "neg"])
+def test_d4_int_too_large_for_float_is_invalid_vector_and_never_raises(ctx, big):
+    assert ctx.pub._valid_vector([big] * 384) is False
+    nid = ctx.node("d4 claim", seed=OLD, metadata=json.dumps({MARKER: {"reason": "x"}}))
+    prepared = ctx.prep(nid, vector=[0.1] * 383 + [big])
+    before = ctx.snap(nid)
+    assert_deferred(ctx.publish(nid, prepared), nid, "invalid_vector")
+    assert ctx.snap(nid) == before
+
+
+# -------------------------------------------------------------------- D5
+@pytest.mark.parametrize("index", [0, 383])
+@pytest.mark.parametrize("bad", [1e39, -1e39, 1e300])
+def test_d5_float_outside_float32_range_is_invalid_vector(ctx, bad, index):
+    vector = [0.1] * 384
+    vector[index] = bad
+    nid = ctx.node("d5 claim", seed=OLD, metadata=json.dumps({MARKER: {"reason": "x"}}))
+    prepared = ctx.prep(nid, vector=vector)
+    before = ctx.snap(nid)
+    assert_deferred(ctx.publish(nid, prepared), nid, "invalid_vector")
+    assert ctx.snap(nid) == before
+
+
+@pytest.mark.parametrize("edge", [F32_MAX, -F32_MAX, 1e-320], ids=["max", "min", "tiny"])
+def test_d5_boundary_values_are_accepted(ctx, edge):
+    vector = [0.1] * 383 + [edge]
+    nid = ctx.node("d5b claim", seed=OLD)
+    result = ctx.publish(nid, ctx.prep(nid, vector=vector))
+    assert result.status == "refreshed" and result.reason is None, result
+    assert ctx.snap(nid)[1] == ctx.fvec(vector)
+
+
+# -------------------------------------------------------------------- D6
+def test_d6_without_a_caller_transaction_the_savepoint_commits(ctx):
+    # Documented precondition, not a feature: the caller must hold an open
+    # write transaction. With none, the SAVEPOINT is outermost and RELEASE
+    # commits, so a later rollback() does not undo the publish.
+    new = [0.3] * 384
+    nid = ctx.node("d6 claim", seed=OLD)
+    conn = ctx.db()
+    try:
+        assert not conn.in_transaction
+        result = ctx.pub.publish_embedding(conn, nid, prepared=ctx.prep(nid, vector=new))
+        assert result.status == "refreshed", result
+        conn.rollback()
+    finally:
+        conn.close()
+    snap = ctx.snap(nid)
+    assert snap[0][0] == json.dumps(new)
+    assert snap[1] == ctx.fvec(new)
