@@ -5753,12 +5753,20 @@ class EngramdOwner:
         every `refreshed` item's `nodes.embedding` text and its vec bytes.
 
         The epoch is compared per item by the primitive (a mismatch is that item's `deferred / epoch_changed`); there is
-        no whole-call model mismatch. A vector must be finite and within the float32 range, else that item defers
+        no whole-call model mismatch. The store's current epoch is read ONCE per call and handed to the primitive; if it
+        cannot be read, every item is `deferred / check_failed` (the call is still `ok`, nothing written), and an
+        exception inside any other prepared check defers that one item the same way. A vector must be finite, within
+        the float32 range and of a non-zero norm that does not overflow float32 arithmetic, else that item defers
         (`deferred / invalid_vector`; the call is still `ok`, the other items refresh); an int vector is stored as sent. Outcomes: `ok` {items: [{node_id, status, reason, vector_changed, debt_cleared}],
         counts: {refreshed, pending, deferred}}; `flag_off`; `invalid_params`; `vec_unavailable`; `write_denied` (the
         whole op rolled back); `busy` (nothing committed); `publish_write_failed` (rolled back, a failed COMMIT included;
         retry with the SAME request_id); `readback_mismatch` (COMMITTED but unverified, recorded so a replay re-reports
-        instead of re-writing)."""
+        instead of re-writing).
+
+        RETRYING `pending` ITEMS: a replay of a request that returned `ok` answers the STORED outcome, `pending` items
+        included, flagged `duplicate: True`; nothing is retried. To retry pending items the caller sends a FRESH
+        request_id. The same-id retry rule is for `readback_mismatch` and for an indeterminate outcome (no answer at
+        all), and for `publish_write_failed`, which recorded nothing so the same id runs fresh; it is never for an `ok`."""
         refusal = self._publish_prepared_flag_refusal()
         if refusal is not None:
             return refusal

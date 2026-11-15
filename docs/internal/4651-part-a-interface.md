@@ -46,9 +46,14 @@ the old vectors and any debt marker intact:
    a hash);
 3. sha256 of the current text equals `text_sha256`, else `recipe_changed` (the primitive never accepts caller text);
 4. the epoch fields equal the current ones, compared as separate fields, else `epoch_changed`;
-5. the vector is 384 finite numbers, else `invalid_vector`;
+5. the vector is 384 finite numbers within the float32 range, with a non-zero norm whose float64 square does not exceed
+   the float32 maximum (an all-zero vector and a vector that overflows float32 arithmetic have no KNN distance), else
+   `invalid_vector`;
 6. the metadata is SQL NULL, absent, or a JSON object, else `malformed_metadata` (compute mode keeps its legacy
    behaviour; prepared mode never silently normalises).
+
+An exception raised inside any of these checks (a corrupt config, a failing text read) does not escape: that item
+defers as `check_failed`, nothing written. The caller may pass the current epoch it read once for the whole batch.
 
 Then publish: write both vector stores, verify the complete canonical JSON and the expected sqlite-vec mirror bytes,
 and clear the debt marker only after that verification. A failure here restores both old stores and returns `pending`
