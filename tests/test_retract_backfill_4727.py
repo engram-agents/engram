@@ -460,7 +460,10 @@ def test_cell14_a_walk_too_deep_for_the_interpreter_rolls_back_like_a_database_e
     monkeypatch.setattr(core, "_walk_cascade_from_root", too_deep)
     capsys.readouterr()
     assert _ladder(core) == RUNG - 1
-    assert "FAILED, will retry" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "FAILED, will retry" in err
+    assert "repeats at every start" in err and "#4823" in err, \
+        "a too-deep chain must say it fails every start until the walk is iterative"
     assert _retract_marked(core, g["R"]) == {}, "a failed rung must leave no backfill marker"
 
     monkeypatch.setattr(core, "_walk_cascade_from_root", real)

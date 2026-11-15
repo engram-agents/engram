@@ -6988,7 +6988,10 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # see _backfill_pre_machine_retract_markers). One transaction with the version bump; on
     # failure it rolls back and retries next start; the pre-migration backup gate applies.
     # RecursionError is caught with DatabaseError: the walk recurses once per derivation
-    # level, and a chain deeper than the interpreter's limit must not fail every start.
+    # level, so a chain deeper than the interpreter's limit raises it. Caught, the server still
+    # starts, but the rung fails again at EVERY start (rolled back each time), the store stays
+    # at schema 10, and the engramd owner's schema gate refuses it until the walk is made
+    # iterative (#4823).
     if _rung_ready(conn, RETRACT_BACKFILL_RUNG, _pre_migration_backup_ok):
         try:
             _bf_roots, _bf_markers, _bf_nodes = _backfill_pre_machine_retract_markers(conn)
@@ -7006,7 +7009,11 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
             print(
                 f"[_run_db_one_time_setup] migration {RETRACT_BACKFILL_RUNG} (#4727 retract-marker "
                 "backfill) FAILED, will retry on next "
-                f"startup: {_migration11_err!r}",
+                f"startup: {_migration11_err!r}"
+                + ("; a derivation chain is deeper than the recursion limit, so this repeats at "
+                   "every start and the store stays at schema 10 (the engramd owner refuses it) "
+                   "until the cascade walk is iterative (#4823)"
+                   if isinstance(_migration11_err, RecursionError) else ""),
                 file=sys.stderr,
             )
 
