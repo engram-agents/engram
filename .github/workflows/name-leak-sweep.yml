@@ -912,16 +912,16 @@ jobs:
                           "the kind of hit and the fix it needs."
                       )
                   elif scan.returncode == 3:
-                      # Coverage incomplete: the scanner could not read every
-                      # candidate file (or had none). The sweep did not cover
-                      # the whole tree, so a green tick would claim coverage
-                      # it does not have.
+                      # Coverage incomplete with at least one file scanned.
+                      # candidates == 0 also exits 3, but it implies
+                      # scanned == 0, which the check above already failed on,
+                      # so only unreadable/missing can reach this arm.
                       print(
                           "::error::the whole-tree sweep did not cover the "
                           "whole tree (coverage incomplete). The scanner's "
-                          "'scan-leaks: unreadable ...' or 'scan-leaks: no "
-                          "coverage ...' lines above name what it could not "
-                          "scan; fix the unreadable files and re-run."
+                          "'scan-leaks: unreadable ...' or 'scan-leaks: "
+                          "missing ...' lines above name what it could not "
+                          "scan; fix those paths and re-run."
                       )
                   else:
                       print(

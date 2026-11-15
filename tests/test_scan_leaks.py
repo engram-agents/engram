@@ -979,14 +979,15 @@ def test_use_git_false_fallback_scans_all_text_files(tmp_path):
     assert (report.scanned, report.skipped_binary) == (1, 1)
 
 
-def test_tracked_directory_symlink_is_not_a_candidate(tmp_path):
-    """A git-tracked symlink to a directory does not inflate either bucket.
+def test_tracked_directory_symlink_does_not_inflate_scanned_or_binary(tmp_path):
+    """A git-tracked symlink to a directory is neither scanned nor binary.
 
-    What this pins, stated by what it was measured to catch: it reddens only
-    the CONJUNCTION of a consumer that counts unreadable entries as binary AND
-    a scanner with the ``is_file()`` filter removed. With the filter in place
-    this fixture's OSError arm is unreachable, so the cell does not discriminate
-    the filter itself — keep it for the conjunction, not for the filter."""
+    It IS a candidate: enumeration happens before the file-type filter, so the
+    coverage invariant can reconcile.  It lands in the not-a-file bucket, whose
+    accounting and naming are pinned by
+    test_not_a_file_is_counted_and_named_not_counted_as_incomplete below.
+    What this cell adds is the summary-end: the frozen two numbers do not move.
+    """
     (tmp_path / "real-dir").mkdir()
     _commit_files(tmp_path, {"real/member.py": "// clean\n"})
     (tmp_path / "tools").mkdir()
@@ -1285,9 +1286,16 @@ def test_scan_report_reconciles_every_candidate(tmp_path):
     assert report.scanned == 1
     assert report.skipped_binary_paths == ["blob.bin"]
     assert report.unreadable_paths == ["locked.txt"]
+    assert report.missing_paths == []
+    assert report.not_a_file_paths == []
     assert report.candidates == 3
+    # The spec's invariant, closed with a LITERAL: three enumerated candidates
+    # (the fixture's tracked files).  Written as the literal rather than as
+    # report.candidates so this line cannot move with the implementation's own
+    # arithmetic — the bucket assertions above are what discriminate.
     assert (report.scanned + len(report.skipped_binary_paths)
-            + len(report.unreadable_paths)) == report.candidates
+            + len(report.unreadable_paths) + len(report.missing_paths)
+            + len(report.not_a_file_paths)) == 3
     assert report.skipped_binary == 1
 
 
@@ -1385,6 +1393,8 @@ def test_positive_control_clean_tree_exits_0_with_line_a_once(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert r.stdout.count("scan-leaks: scanned 1, skipped-binary 0\n") == 1, r.stdout
     assert "scan-leaks: clean" in r.stdout
+    # "named only when non-zero": a clean tree prints no not-a-file line.
+    assert not _NOT_A_FILE_LINE_RE.search(r.stdout), r.stdout
 
 
 def test_positive_control_leak_takes_precedence_over_coverage(tmp_path):
@@ -1410,11 +1420,14 @@ def test_positive_control_leak_takes_precedence_over_coverage(tmp_path):
 
 
 def test_tracked_directory_symlink_is_not_unreadable(tmp_path):
-    """A tracked symlink to a directory is not a candidate and not unreadable.
+    """A tracked symlink to a directory is not unreadable and is not a hole.
 
-    Pre-fix: scan() returns a tuple (no ScanReport) -> this reddens on the API
-    shape. Under M3 (scan_home_paths without the is_file() filter) the CLI
-    names the symlink unreadable and exits 3 -> this reddens again.
+    It is enumerated (a candidate), classified not-a-file, and named on the
+    not-a-file line; it does not make the tree exit 3.  Pre-fix: scan() returns
+    a tuple with no not_a_file_paths (reddens on the API shape), and candidates
+    is 1 rather than 2 (the old filter ran before the count).  M3
+    (scan_home_paths without the is_file()/classify filter) names the symlink
+    unreadable and exits 3 -> this reddens again.
     """
     (tmp_path / "real-dir").mkdir()
     _commit_files(tmp_path, {"real/member.py": "// clean\n"})
@@ -1424,12 +1437,16 @@ def test_tracked_directory_symlink_is_not_unreadable(tmp_path):
     subprocess.run(["git", "commit", "-q", "-m", "symlink"], cwd=tmp_path, check=True)
 
     report = _mod.scan(tmp_path, [], use_git=True)
-    assert report.candidates == 1
+    assert report.candidates == 2
+    assert report.not_a_file_paths == ["tools/engine"]
     assert report.unreadable_paths == []
 
     r = _run_scan(tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert not _UNREADABLE_LINE_RE.search(r.stdout), r.stdout
+    m = _NOT_A_FILE_LINE_RE.search(r.stdout)
+    assert m, r.stdout
+    assert _named_paths(m.group(2)) == ["tools/engine"], r.stdout
 
 
 def test_scan_home_paths_reports_unreadable_but_not_directory_symlinks(tmp_path):
@@ -1456,4 +1473,261 @@ def test_scan_home_paths_reports_unreadable_but_not_directory_symlinks(tmp_path)
     findings, unreadable = _mod.scan_home_paths(tmp_path, use_git=True)
     assert findings == []
     assert unreadable == ["locked.txt"]
+
+
+# ---------------------------------------------------------------------------
+# Test 17: enumeration and classification accounting (#4805 round 3)
+# ---------------------------------------------------------------------------
+#
+# Contract (written before the implementation):
+#   - one classifier, `_classify(path)`, gates BOTH passes: stat follows
+#     symlinks; FileNotFoundError -> missing; any other OSError -> unreadable;
+#     a stat that succeeds but is not a regular file -> not-a-file;
+#     otherwise a file.  A path the scanner cannot inspect is a coverage hole,
+#     never a crash and never a silent drop.
+#   - candidates is the ENUMERATED set (git ls-files, or os.walk output) minus
+#     SKIP_DIRS components and SKIP_FILES names — BEFORE the file-type filter.
+#   - the invariant scans every bucket:
+#         scanned + len(skipped_binary_paths) + len(unreadable_paths)
+#                 + len(missing_paths) + len(not_a_file_paths) == candidates
+#   - os.walk takes an onerror that records the failing directory (posix,
+#     trailing "/") as unreadable and counts it as one enumerated candidate —
+#     the subtree is unknown, so it is one coverage hole, not zero.
+#   - coverage is incomplete when unreadable or missing is non-empty, or
+#     candidates == 0.  not-a-file alone is NOT incomplete (a symlink to a
+#     directory carries no text), but it is named when non-zero.
+#   - stdout gains "scan-leaks: missing K (coverage incomplete): <paths>" and
+#     "scan-leaks: not-a-file N (not scanned): <paths>", 20-path cap.  The
+#     frozen "scan-leaks: scanned N, skipped-binary M" line is unchanged.
+
+_MISSING_LINE_RE = re.compile(
+    r"^scan-leaks: missing (\d+) \(coverage incomplete\): (.*)$", re.M
+)
+_NOT_A_FILE_LINE_RE = re.compile(
+    r"^scan-leaks: not-a-file (\d+) \(not scanned\): (.*)$", re.M
+)
+
+
+def test_cli_eacces_on_a_non_skip_candidate_exits_3_without_traceback(tmp_path):
+    """Cell 1: a non-SKIP_FILES tracked candidate under a chmod-000 directory.
+
+    Pre-fix: Path.is_file() re-raises PermissionError -> traceback, exit 1,
+    which every consumer reads as "leaks found".  Post-fix: the path is
+    classified unreadable, named, and the run exits 3 with no traceback.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can read a chmod-000 directory; the EACCES arm is unreachable")
+
+    _commit_files(tmp_path, {
+        "ok.txt": "clean\n",
+        "lockeddir/secret.txt": "quiet\n",
+    })
+    (tmp_path / "lockeddir").chmod(0o000)
+    try:
+        r = _run_scan(tmp_path)
+    finally:
+        (tmp_path / "lockeddir").chmod(0o755)
+
+    assert "Traceback" not in r.stderr, r.stderr
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert _summary(r.stdout) == (1, 0)
+    m = _UNREADABLE_LINE_RE.search(r.stdout)
+    assert m, r.stdout
+    assert m.group(1) == "1", r.stdout
+    assert _named_paths(m.group(2)) == ["lockeddir/secret.txt"], r.stdout
+    assert "scan-leaks: clean" not in r.stdout
+
+
+def test_cli_eacces_on_a_skip_files_member_scanned_by_the_home_pass(tmp_path):
+    """Cell 2: a SKIP_FILES member whose STAT is denied by a 000 parent dir.
+
+    The pattern pass drops LICENSE by name before touching the filesystem, so
+    the home pass is the only one that can see it — a coverage hole the pattern
+    pass cannot report.  Pre-fix: traceback at scan_home_paths' is_file().
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can read a chmod-000 directory; the EACCES arm is unreachable")
+
+    _commit_files(tmp_path, {
+        "ok.txt": "clean\n",
+        "lockeddir/LICENSE": "MIT\n",
+    })
+    (tmp_path / "lockeddir").chmod(0o000)
+    try:
+        r = _run_scan(tmp_path)
+    finally:
+        (tmp_path / "lockeddir").chmod(0o755)
+
+    assert "Traceback" not in r.stderr, r.stderr
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert _summary(r.stdout) == (1, 0)
+    m = _UNREADABLE_LINE_RE.search(r.stdout)
+    assert m, r.stdout
+    assert m.group(1) == "1", r.stdout
+    assert _named_paths(m.group(2)) == ["lockeddir/LICENSE"], r.stdout
+    assert "scan-leaks: clean" not in r.stdout
+
+
+def test_locked_license_is_reported_only_by_the_home_pass(tmp_path):
+    """Item 3's discriminating cell: the ONLY unreadable file is a SKIP_FILES
+    member, in an otherwise clean tree.
+
+    The pattern pass never sees LICENSE by name; the home pass is its sole
+    reporter.  This cell is GREEN pre-fix (the home pass already has a
+    read_bytes() OSError arm) — its discriminating mutation is M3, dropping
+    `home_unreadable` from the union, which turns this into `clean`, exit 0.
+    That is the half-branch the review found no cell for.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can read a chmod-0000 file; the unreadable arm is unreachable")
+
+    _commit_files(tmp_path, {"ok.txt": "clean\n", "LICENSE": "MIT\n"})
+    _lock(tmp_path, "LICENSE")
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert _summary(r.stdout) == (1, 0)
+    m = _UNREADABLE_LINE_RE.search(r.stdout)
+    assert m, r.stdout
+    assert m.group(1) == "1", r.stdout
+    assert _named_paths(m.group(2)) == ["LICENSE"], r.stdout
+    assert "scan-leaks: clean" not in r.stdout
+
+
+def test_tracked_but_missing_is_named_and_exits_3(tmp_path):
+    """Cell 3: a tracked file absent from the worktree, deletion not staged.
+
+    The pre-commit path reads the index, so the committed tree still carries
+    this file's content.  Pre-fix: dropped by is_file(), `scanned 1`, `clean`,
+    exit 0 — the file is neither scanned, named, nor counted.
+    """
+    _commit_files(tmp_path, {"ok.txt": "clean\n", "gone.txt": "staged content\n"})
+    (tmp_path / "gone.txt").unlink()  # deliberately NOT staged
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert _summary(r.stdout) == (1, 0)
+    m = _MISSING_LINE_RE.search(r.stdout)
+    assert m, r.stdout
+    assert m.group(1) == "1", r.stdout
+    assert _named_paths(m.group(2)) == ["gone.txt"], r.stdout
+    assert "scan-leaks: clean" not in r.stdout
+
+
+def test_not_a_file_is_counted_and_named_not_counted_as_incomplete(tmp_path):
+    """Cell 4: a tracked symlink to a directory.
+
+    It is enumerated (candidates = 2), classified not-a-file, named, and does
+    NOT make an otherwise clean tree exit 3.  Pre-fix: it is filtered out
+    before the count (candidates == 1) and nothing is named, and the ScanReport
+    has no not_a_file_paths attribute at all.
+    """
+    (tmp_path / "real-dir").mkdir()
+    _commit_files(tmp_path, {"real/member.py": "// clean\n"})
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "engine").symlink_to("../real-dir")
+    subprocess.run(["git", "add", "tools/engine"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "symlink"], cwd=tmp_path, check=True)
+
+    report = _mod.scan(tmp_path, [], use_git=True)
+    assert report.candidates == 2
+    assert report.not_a_file_paths == ["tools/engine"]
+    assert report.unreadable_paths == []
+    assert report.missing_paths == []
+    assert report.scanned == 1
+    assert (report.scanned + len(report.skipped_binary_paths)
+            + len(report.unreadable_paths) + len(report.missing_paths)
+            + len(report.not_a_file_paths)) == 2
+
+    r = _run_scan(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _summary(r.stdout) == (1, 0)
+    m = _NOT_A_FILE_LINE_RE.search(r.stdout)
+    assert m, r.stdout
+    assert m.group(1) == "1", r.stdout
+    assert _named_paths(m.group(2)) == ["tools/engine"], r.stdout
+    assert "scan-leaks: clean" in r.stdout
+
+
+def test_cli_use_git_false_unsearchable_directory_is_reported(tmp_path):
+    """Cell 5: the os.walk path (no git repo) with a chmod-000 directory.
+
+    os.walk without onerror prunes the directory silently: the subtree is never
+    seen and the counts reconcile against a candidate set that already lost it.
+    Post-fix: the directory is enumerated as one candidate, recorded unreadable
+    with a trailing "/", named, and the run exits 3.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can read a chmod-000 directory; the EACCES arm is unreachable")
+
+    # Deliberately NOT a git repo: both passes fall back to os.walk.
+    (tmp_path / "ok.txt").write_text("clean\n")
+    (tmp_path / "lockeddir").mkdir()
+    (tmp_path / "lockeddir" / "f.txt").write_text("clean\n")
+    (tmp_path / "lockeddir").chmod(0o000)
+    try:
+        report = _mod.scan(tmp_path, [], use_git=False)
+        r = _run_scan(tmp_path)
+    finally:
+        (tmp_path / "lockeddir").chmod(0o755)
+
+    assert report.scanned == 1
+    assert report.unreadable_paths == ["lockeddir/"]
+    assert report.candidates == 2  # ok.txt + the one unenumerated subtree
+    assert (report.scanned + len(report.skipped_binary_paths)
+            + len(report.unreadable_paths) + len(report.missing_paths)
+            + len(report.not_a_file_paths)) == report.candidates
+
+    assert "Traceback" not in r.stderr, r.stderr
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert _summary(r.stdout) == (1, 0)
+    m = _UNREADABLE_LINE_RE.search(r.stdout)
+    assert m, r.stdout
+    assert m.group(1) == "1", r.stdout
+    assert _named_paths(m.group(2)) == ["lockeddir/"], r.stdout
+    assert "scan-leaks: clean" not in r.stdout
+
+
+def test_invariant_across_all_five_buckets(tmp_path):
+    """Cell 6: one tree, every bucket — scanned, binary, unreadable, missing,
+    not-a-file — and the invariant closes on the fixture's literal count.
+
+    Candidates: ok.txt, blob.bin, locked.txt, gone.txt, tools/engine = 5.
+    Pre-fix: no missing_paths/not_a_file_paths buckets and candidates == 3.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can read a chmod-0000 file; the unreadable arm is unreachable")
+
+    (tmp_path / "real-dir").mkdir()
+    _commit_files(tmp_path, {
+        "ok.txt": "clean\n",
+        "blob.bin": b"\x00binary",
+        "locked.txt": "quiet\n",
+        "gone.txt": "staged content\n",
+    })
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "engine").symlink_to("../real-dir")
+    subprocess.run(["git", "add", "tools/engine"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "symlink"], cwd=tmp_path, check=True)
+    _lock(tmp_path, "locked.txt")
+    (tmp_path / "gone.txt").unlink()
+
+    report = _mod.scan(tmp_path, [], use_git=True)
+    assert report.scanned == 1
+    assert report.skipped_binary_paths == ["blob.bin"]
+    assert report.unreadable_paths == ["locked.txt"]
+    assert report.missing_paths == ["gone.txt"]
+    assert report.not_a_file_paths == ["tools/engine"]
+    assert report.candidates == 5
+    assert (report.scanned + len(report.skipped_binary_paths)
+            + len(report.unreadable_paths) + len(report.missing_paths)
+            + len(report.not_a_file_paths)) == 5
+
+    r = _run_scan(tmp_path)
+    assert "Traceback" not in r.stderr, r.stderr
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert _summary(r.stdout) == (1, 1)
+    assert _UNREADABLE_LINE_RE.search(r.stdout), r.stdout
+    assert _MISSING_LINE_RE.search(r.stdout), r.stdout
+    assert _NOT_A_FILE_LINE_RE.search(r.stdout), r.stdout
 

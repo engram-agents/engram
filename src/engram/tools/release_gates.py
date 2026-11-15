@@ -476,7 +476,9 @@ def run_G5(repo_root: str) -> dict[str, Any]:
     """G5 — de-personalisation scan (public-readiness dimension).
 
     Runs tools/scan-leaks.py --root . and reports hit count.
-    DEGRADED with count > 0; PASS at 0.
+    DEGRADED with count > 0.  PASS at 0 hits — except a scan that could not
+    cover the whole tree (scanner exit 3) is DEGRADED with metric
+    "coverage incomplete" even at 0 hits: not looking is not evidence of clean.
     If roster absent → SKIP with advisory (spec language for future
     #665 roster extension; current scan-leaks.py has no roster concept,
     so we always run it and SKIP only if the script itself is missing).

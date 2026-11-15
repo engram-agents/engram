@@ -5,7 +5,7 @@ Flags committed structural patterns, absolute home paths, and a gitignored
 local roster of personal names. Run standalone or wire as a pre-commit hook.
 
 Standalone:
-    python3 tools/scan-leaks.py            # exit 0 clean, 1 if leaks
+    python3 tools/scan-leaks.py            # exit 0 clean, 1 if leaks, 3 if coverage incomplete
 
 Pre-commit (from inside ~/engram-alpha):
     ln -s ../../tools/scan-leaks.py .git/hooks/pre-commit
@@ -34,32 +34,41 @@ runs committed structural patterns only and prints one advisory line.
 See docs/internal/.scan-leaks-local.json.example for the config shape.
 
 Scope and exclusions (what "the tree" means here — NOT every published file):
-  - Candidate set: every git-tracked file, whatever its extension
-    (extensionless executables included), minus the SKIP_DIRS components and
-    SKIP_FILES names below, after the is_file() filter.  There is no
-    extension allowlist.
+  - Candidate set: every enumerated path — every git-tracked file, whatever
+    its extension (extensionless executables included), or the os.walk output
+    when git is unavailable — minus the SKIP_DIRS components and SKIP_FILES
+    names below, BEFORE the file-type filter.  There is no extension
+    allowlist.  Every candidate is then classified exactly once (see
+    Coverage accounting).
   - A binary (a NUL byte in its first 8 KiB) is skipped, counted, and named.
   - SKIP_FILES: LICENSE, .scan-leaks-local.json, scan-leaks.py,
     test_release_cutover.py, RELEASING.md.
   - SKIP_DIRS: .git, __pycache__, node_modules, .claude.
   - A name in an excluded file is not scanned.
-  - Known limit: a tracked symlink is a candidate only when it resolves to a
-    regular file.  A symlink to a directory, or a dangling symlink, is not a
-    candidate and is not reported unreadable — is_file() is the filter.
+  - A tracked symlink is classified like any other candidate: one resolving
+    to a regular file is scanned through its target; one resolving to a
+    directory is a not-a-file candidate (counted and named, not scanned); a
+    dangling symlink is a missing candidate (coverage incomplete).
 
 Coverage accounting (every candidate is accounted for):
   - scan() returns a ScanReport whose invariant is
-    scanned + len(skipped_binary_paths) + len(unreadable_paths) == candidates.
-    A file that cannot be read at all is an unreadable path — never a silent
-    skip, and never counted as binary.
+    scanned + len(skipped_binary_paths) + len(unreadable_paths)
+            + len(missing_paths) + len(not_a_file_paths) == candidates.
+    A path that cannot be inspected or read is an unreadable path, and a path
+    that is not there is a missing path — never a silent skip, and never
+    counted as binary.  An unsearchable directory found by os.walk is one
+    candidate covering a subtree that could not be enumerated.
   - main() prints on stdout, exactly once, the frozen line
     "scan-leaks: scanned N, skipped-binary M" (.github/workflows/
     name-leak-sweep.yml parses it with an anchored regex — do not reformat
     it).  When M > 0 it follows with one line naming up to 20 skipped-binary
     paths and a "(+K more)" tail; when any candidate was unreadable it prints
     "scan-leaks: unreadable K (coverage incomplete): <paths>" (the union over
-    both passes, deduped by path, same 20-path cap); when there are no
-    candidates at all it prints
+    both passes, deduped by path); when any was missing it prints
+    "scan-leaks: missing K (coverage incomplete): <paths>"; when any was not
+    a regular file it prints
+    "scan-leaks: not-a-file N (not scanned): <paths>" (same 20-path cap).
+    When there are no candidates at all it prints
     "scan-leaks: no coverage: 0 candidate files under <root>; nothing was
     scanned" and does NOT print `clean`.
 
@@ -69,17 +78,19 @@ Exit codes:
       over 3 when coverage is also incomplete, and the coverage lines still
       print
   2 — invocation error
-  3 — coverage incomplete: at least one candidate was unreadable, or there
-      were no candidate files at all, and nothing was found
+  3 — coverage incomplete: at least one candidate was unreadable or missing,
+      or there were no candidate files at all, and nothing was found (a
+      not-a-file candidate alone does not make coverage incomplete)
 """
 
 import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Structural patterns with NO personal data — safe to commit.
@@ -148,22 +159,67 @@ NAMED_PATH_CAP = 20
 class ScanReport:
     """What a scan ranged over, as well as what it found.
 
-    Every candidate file is accounted for exactly once — scanned, skipped as
-    binary, or unreadable — and ``scan()`` asserts that invariant:
+    Every candidate path is accounted for exactly once — scanned, skipped as
+    binary, unreadable, missing, or not a regular file — and ``scan()``
+    asserts that invariant:
 
-        scanned + len(skipped_binary_paths) + len(unreadable_paths) == candidates
+        scanned + len(skipped_binary_paths) + len(unreadable_paths)
+                + len(missing_paths) + len(not_a_file_paths) == candidates
     """
     findings: list[tuple[str, int, str, str]]
     scanned: int
     skipped_binary_paths: list[str]
     unreadable_paths: list[str]
     candidates: int
+    missing_paths: list[str] = field(default_factory=list)
+    not_a_file_paths: list[str] = field(default_factory=list)
 
     @property
     def skipped_binary(self) -> int:
         """The skipped-binary count, derived from the paths (the source of
         truth), so the number can never disagree with the names it prints."""
         return len(self.skipped_binary_paths)
+
+
+def _classify(path: Path) -> tuple[str, Path | None]:
+    """Classify one enumerated candidate by what it is on disk.
+
+    This is the ONE seam both passes use, so neither can crash on a path it
+    cannot inspect and neither invents its own filter.  ``path.stat()``
+    follows symlinks (a tracked symlink is classified by its target):
+
+        ("file", None)        a regular file; read it
+        ("not-a-file", None)  exists, but is not a regular file (symlink to a
+                              directory): carries no text to scan
+        ("missing", path)     the path is not there
+        ("unreadable", path)  any other stat failure (EACCES, ELOOP after a
+                              race, ENAMETOOLONG, ...)
+
+    Only ENOENT is "missing": every other OSError means the scanner could not
+    inspect the path, which is a coverage hole, not an absence.
+    """
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return ("missing", path)
+    except OSError:
+        return ("unreadable", path)
+    if not stat.S_ISREG(info.st_mode):
+        return ("not-a-file", None)
+    return ("file", None)
+
+
+def _relative_dir(root: Path, directory) -> str:
+    """A failed directory as a repo-relative posix path with a trailing '/'.
+
+    One entry covers the whole subtree that could not be enumerated: its file
+    count is unknown, so it is one coverage hole, not zero.
+    """
+    try:
+        rel = Path(directory).relative_to(root).as_posix()
+    except ValueError:
+        rel = os.path.relpath(directory, root).replace(os.sep, "/")
+    return "" if rel == "." else rel + "/"
 
 
 def format_paths(paths: list[str], cap: int = NAMED_PATH_CAP) -> str:
@@ -313,21 +369,23 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
     When use_git is False (explicit-path invocation), the os.walk path is used
     unconditionally so that callers can target specific non-repo directories.
 
-    A file whose first 8 KiB contains a NUL byte is binary: skipped, counted
-    in ``skipped_binary_paths``, and named by the caller.  Everything else is
-    decoded as UTF-8 with errors replaced, so a non-UTF-8 text file is still
-    scanned and ``scanned`` counts it.  A file that cannot be read at all is
-    recorded in ``unreadable_paths`` — never dropped silently, and never
-    counted as binary.
+    A candidate whose first 8 KiB contains a NUL byte is binary: skipped,
+    counted in ``skipped_binary_paths``, and named by the caller.  Everything
+    else is decoded as UTF-8 with errors replaced, so a non-UTF-8 text file is
+    still scanned and ``scanned`` counts it.  A path that cannot be inspected
+    or read lands in ``unreadable_paths``; a path that is not there lands in
+    ``missing_paths`` — never dropped silently, and never counted as binary.
+    A candidate that is not a regular file lands in ``not_a_file_paths``.
     """
     tracked = _git_tracked_files(root) if use_git else None
 
+    # Enumeration happens BEFORE any file-type filter: the candidate set is
+    # what the scan considered, so a path dropped later must still be counted.
+    walk_unreadable: list[str] = []
+    candidates: list[Path] = []
     if tracked is not None:
         # Git-tracked enumeration: skip SKIP_DIRS and SKIP_FILES by name.
-        # Every remaining file is a candidate, whatever its extension.
-        candidates = []
         for fpath in tracked:
-            # Check every component for SKIP_DIRS membership
             parts = fpath.relative_to(root).parts
             if any(p in SKIP_DIRS for p in parts):
                 continue
@@ -335,35 +393,50 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
                 continue
             candidates.append(fpath)
     else:
-        # Fallback: os.walk (same all-text policy)
-        candidates = []
-        for dirpath, dirs, files in os.walk(root):
+        # Fallback: os.walk (same all-text policy).  onerror records a
+        # directory that cannot be listed: without it the whole subtree is
+        # pruned silently and the counts reconcile against a set that already
+        # lost it.
+        def _onerror(exc):
+            walk_unreadable.append(_relative_dir(root, exc.filename))
+
+        for dirpath, dirs, files in os.walk(root, onerror=_onerror):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             for fname in files:
                 if fname in SKIP_FILES:
                     continue
                 candidates.append(Path(dirpath) / fname)
 
-    # A tracked symlink can point at a directory (tools/engine, tools/engram-pkg
-    # in this repo).  It is not a text file to scan, so it is not a candidate —
-    # which is what makes the three buckets partition the files considered.
-    # A dangling symlink falls out here too: is_file() is False, so it is not
-    # a candidate and not unreadable (the documented known limit).
-    candidates = [f for f in candidates if f.is_file()]
-
     findings = []
     scanned = 0
     skipped_binary_paths = []
     unreadable_paths = []
+    missing_paths = []
+    not_a_file_paths = []
     for fpath in candidates:
-        rel = fpath.relative_to(root)
+        rel = fpath.relative_to(root).as_posix()
+        kind, _ = _classify(fpath)
+        if kind == "missing":
+            missing_paths.append(rel)
+            continue
+        if kind == "unreadable":
+            unreadable_paths.append(rel)
+            continue
+        if kind == "not-a-file":
+            not_a_file_paths.append(rel)
+            continue
         try:
             data = fpath.read_bytes()
+        except FileNotFoundError:
+            # Raced with the stat above: an absence the scan did not cover,
+            # never a crash and never a silent skip.
+            missing_paths.append(rel)
+            continue
         except OSError:
-            unreadable_paths.append(rel.as_posix())
+            unreadable_paths.append(rel)
             continue
         if b"\x00" in data[:8192]:
-            skipped_binary_paths.append(rel.as_posix())
+            skipped_binary_paths.append(rel)
             continue
         content = data.decode("utf-8", errors="replace")
         scanned += 1
@@ -373,25 +446,35 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
                     findings.append((str(rel), i, label, line.strip()[:120]))
                     break
 
+    # A walk-time unreadable directory is one enumerated candidate covering a
+    # subtree whose file count is unknown; it is an unreadable bucket entry,
+    # so it must also be counted on the candidates side of the invariant.
+    unreadable_paths.extend(walk_unreadable)
     skipped_binary_paths.sort()
     unreadable_paths.sort()
+    missing_paths.sort()
+    not_a_file_paths.sort()
     report = ScanReport(
         findings=findings,
         scanned=scanned,
         skipped_binary_paths=skipped_binary_paths,
         unreadable_paths=unreadable_paths,
-        candidates=len(candidates),
+        candidates=len(candidates) + len(walk_unreadable),
+        missing_paths=missing_paths,
+        not_a_file_paths=not_a_file_paths,
     )
     # The invariant is the contract: a count that does not reconcile is a
     # scanner bug, never something to print and move past.
     accounted = (report.scanned + len(report.skipped_binary_paths)
-                 + len(report.unreadable_paths))
+                 + len(report.unreadable_paths) + len(report.missing_paths)
+                 + len(report.not_a_file_paths))
     if accounted != report.candidates:
         raise AssertionError(
             f"scan-leaks coverage does not reconcile: scanned {report.scanned} + "
             f"skipped-binary {len(report.skipped_binary_paths)} + unreadable "
-            f"{len(report.unreadable_paths)} = {accounted}, candidates "
-            f"{report.candidates}"
+            f"{len(report.unreadable_paths)} + missing {len(report.missing_paths)} "
+            f"+ not-a-file {len(report.not_a_file_paths)} = {accounted}, "
+            f"candidates {report.candidates}"
         )
     return report
 
@@ -405,28 +488,45 @@ def scan_home_paths(root: Path, use_git: bool = True
     raised OSError, so the caller can say a pass did not cover them.
 
     Domain: every git-tracked file (``git ls-files``), whatever its extension,
-    including extensionless executables, after the same ``is_file()`` filter
-    ``scan()`` applies — a tracked symlink to a directory is not a file to
-    read and is not unreadable.  A file whose first 8 KiB contains a NUL byte
-    is binary and skipped, as is any file in HOME_PATH_EXEMPT_FILES.  Text is
-    decoded as UTF-8 with errors replaced, so a non-UTF-8 file is still
-    scanned.  The verdict (allowed or not) is made inside the shared regex.
-    Falls back to an os.walk of root
-    when git is unavailable (scanning too much beats scanning nothing).
+    including extensionless executables, classified by the same ``_classify``
+    seam ``scan()`` uses — a path that is missing or not a regular file is
+    skipped here (``scan()`` reports those buckets), while a path this pass
+    cannot inspect is unreadable.  A file whose first 8 KiB contains a NUL
+    byte is binary and skipped, as is any file in HOME_PATH_EXEMPT_FILES.
+    Text is decoded as UTF-8 with errors replaced, so a non-UTF-8 file is
+    still scanned.  The verdict (allowed or not) is made inside the shared
+    regex.  Falls back to an os.walk of root when git is unavailable (scanning
+    too much beats scanning nothing); an unsearchable directory is recorded
+    unreadable rather than pruned silently.
     """
     tracked = _git_tracked_files(root) if use_git else None
-    if tracked is None:
-        tracked = []
-        for dirpath, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-            tracked.extend(Path(dirpath) / f for f in files)
-    tracked = [f for f in tracked if f.is_file()]
-
     findings = []
     unreadable_paths = []
+    if tracked is None:
+        tracked = []
+
+        def _onerror(exc):
+            unreadable_paths.append(_relative_dir(root, exc.filename))
+
+        for dirpath, dirs, files in os.walk(root, onerror=_onerror):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            tracked.extend(Path(dirpath) / f for f in files)
+
     for fpath in tracked:
         rel = fpath.relative_to(root).as_posix()
         if rel in HOME_PATH_EXEMPT_FILES:
+            continue
+        kind, _ = _classify(fpath)
+        if kind == "missing":
+            # The accounting pass (scan()) reports absences; this pass has no
+            # bucket for them and must not mislabel one as unreadable.
+            continue
+        if kind == "not-a-file":
+            # A symlink to a directory carries no text: not scanned, and not a
+            # coverage hole (scan() counts it in not_a_file_paths).
+            continue
+        if kind == "unreadable":
+            unreadable_paths.append(rel)
             continue
         try:
             data = fpath.read_bytes()
@@ -504,19 +604,30 @@ def main():
     # One greppable summary line, on clean and dirty runs alike: a clean result
     # says what it ranged over, so an empty finding list cannot hide a blind spot.
     # FROZEN SHAPE: .github/workflows/name-leak-sweep.yml parses this line with
-    # an anchored regex and the release docs quote it.  New information goes on
-    # the lines below, never into this one.
+    # an anchored regex, and docs/CHANGELOG.md quotes it.  New information goes
+    # on the lines below, never into this one.
     print(f"scan-leaks: scanned {report.scanned}, skipped-binary {report.skipped_binary}")
     if report.skipped_binary_paths:
         print("scan-leaks: skipped-binary files: "
               + format_paths(report.skipped_binary_paths))
     home_findings, home_unreadable = scan_home_paths(root)
-    # The union is deduped by path: two passes over one file are one file.
+    # The unreadable UNION is deduped by path: two passes over one file are one
+    # file.  missing and not-a-file come from the accounting pass only, but are
+    # deduped and sorted the same way so each class prints one canonical list.
     unreadable = sorted(set(report.unreadable_paths) | set(home_unreadable))
+    missing = sorted(set(report.missing_paths))
+    not_a_file = sorted(set(report.not_a_file_paths))
     if unreadable:
         print(f"scan-leaks: unreadable {len(unreadable)} (coverage incomplete): "
               + format_paths(unreadable))
-    coverage_incomplete = bool(unreadable) or report.candidates == 0
+    if missing:
+        print(f"scan-leaks: missing {len(missing)} (coverage incomplete): "
+              + format_paths(missing))
+    if not_a_file:
+        print(f"scan-leaks: not-a-file {len(not_a_file)} (not scanned): "
+              + format_paths(not_a_file))
+    coverage_incomplete = (bool(unreadable) or bool(missing)
+                           or report.candidates == 0)
     if report.candidates == 0:
         print(f"scan-leaks: no coverage: 0 candidate files under {root}; "
               "nothing was scanned")
