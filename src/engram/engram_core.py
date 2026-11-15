@@ -6987,11 +6987,10 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # every retracted root that has no retract marker writes the missing markers (insert-only;
     # see _backfill_pre_machine_retract_markers). One transaction with the version bump; on
     # failure it rolls back and retries next start; the pre-migration backup gate applies.
-    # RecursionError is caught with DatabaseError: the walk recurses once per derivation
-    # level, so a chain deeper than the interpreter's limit raises it. Caught, the server still
-    # starts, but the rung fails again at EVERY start (rolled back each time), the store stays
-    # at schema 10, and the engramd owner's schema gate refuses it until the walk is made
-    # iterative (#4823).
+    # RecursionError is caught with DatabaseError as a GUARD: the cascade walk is iterative
+    # since #4823, so a deep derivation chain no longer raises it. If it is raised anyway,
+    # something below the rung recursed unexpectedly; the rung rolls back and retries, the
+    # server still starts, and the stderr line asks for a report.
     if _rung_ready(conn, RETRACT_BACKFILL_RUNG, _pre_migration_backup_ok):
         try:
             _bf_roots, _bf_markers, _bf_nodes = _backfill_pre_machine_retract_markers(conn)
@@ -7010,9 +7009,8 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 f"[_run_db_one_time_setup] migration {RETRACT_BACKFILL_RUNG} (#4727 retract-marker "
                 "backfill) FAILED, will retry on next "
                 f"startup: {_migration11_err!r}"
-                + ("; a derivation chain is deeper than the recursion limit, so this repeats at "
-                   "every start and the store stays at schema 10 (the engramd owner refuses it) "
-                   "until the cascade walk is iterative (#4823)"
+                + ("; RecursionError here is unexpected (the cascade walk is iterative since "
+                   "#4823), please report it with this line"
                    if isinstance(_migration11_err, RecursionError) else ""),
                 file=sys.stderr,
             )
@@ -13280,6 +13278,9 @@ class CascadeWalkTruncated(Exception):
         )
 
 
+_WALK_EXHAUSTED = object()  # sentinel: a node's child iterator is used up
+
+
 def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
     """Walk downstream from node_id following engram_core.CASCADE_RELATIONS
     edges (the relations whose EDGE_CLASSIFICATIONS entry sets cascade=True —
@@ -13305,27 +13306,41 @@ def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
     Promoted from engram_revision (#4727) so a migration rung in this module
     can run the same walk; engram_revision binds its old name to this one.
     Callers starting from a ROOT use _walk_cascade_from_root, not this.
+
+    Iterative since #4823: it used to recurse once per derivation level, so a
+    chain deeper than the interpreter's recursion limit raised RecursionError
+    in a live retraction and in migration rung 11. It is the same preorder with
+    an explicit stack of child iterators: each dependent is explored fully
+    before the next, the visited check runs when a node is taken, and a node's
+    child list is built right after its on_live_node call, as before, so a
+    callback that writes cannot reorder anything. The visit sequence is pinned
+    against a copy of the recursive walk in
+    tests/test_cascade_walk_iterative_4823.py.
     """
-    if node_id in visited:
-        return
-    visited.add(node_id)
+    stack = [iter((node_id,))]
+    while stack:
+        current = next(stack[-1], _WALK_EXHAUSTED)
+        if current is _WALK_EXHAUSTED:
+            stack.pop()
+            continue
+        if current in visited:
+            continue
+        visited.add(current)
 
-    node = conn.execute(
-        "SELECT id, type, claim, metadata FROM nodes "
-        "WHERE id = ? AND is_current = 1",
-        (node_id,),
-    ).fetchone()
-    if not node:
-        return  # retracted/superseded — stop cascade (parity with old _flag_stale)
-    if not _is_claim_bearing(node["type"]):
-        return  # NCB: no claim to re-adjudicate, so nothing to taint (#2252 W0)
+        node = conn.execute(
+            "SELECT id, type, claim, metadata FROM nodes "
+            "WHERE id = ? AND is_current = 1",
+            (current,),
+        ).fetchone()
+        if not node:
+            continue  # retracted/superseded — stop cascade (parity with old _flag_stale)
+        if not _is_claim_bearing(node["type"]):
+            continue  # NCB: no claim to re-adjudicate, so nothing to taint (#2252 W0)
 
-    on_live_node(node)
+        on_live_node(node)
 
-    for dep_id, _tgt, _rel in dag_edge_set(
-            conn, _CASCADE_RELATIONS_SORTED, target_id=node_id):
-        _walk_cascade_downstream(conn, dep_id,
-                                 visited=visited, on_live_node=on_live_node)
+        stack.append(iter([dep_id for dep_id, _tgt, _rel in dag_edge_set(
+            conn, _CASCADE_RELATIONS_SORTED, target_id=current)]))
 
 
 def _walk_cascade_from_root(conn, root_id, *, on_live_node, extra_visited=()):
@@ -13367,8 +13382,8 @@ def _walk_cascade_upstream(
     """Shared upstream (premise-direction) walk over ``CASCADE_RELATIONS``:
     follows each visited node's own outgoing cascade edges back toward its
     origins. Mirrors ``_walk_cascade_downstream``'s shape
-    (visited-set dedup, per-dequeue budget decrement, caller-supplied
-    per-node decision) for the inverse direction — that walker finds who
+    (visited-set dedup, caller-supplied per-node decision) for the inverse
+    direction — that walker finds who
     DEPENDS ON a node (``target_id = node_id``); this one finds what a node
     DEPENDS ON (``source_id = node_id``).
 
