@@ -21,6 +21,7 @@ import inspect
 import json
 import math
 import os
+import re
 import shutil
 import socket as _socket
 import sqlite3
@@ -1278,3 +1279,242 @@ def test_n2_the_docstring_says_the_flag_guarantee_is_per_call():
     assert "per CALL, not per statement" in doc
     assert "does not abort that call" in doc
     assert "flag_off" in doc
+
+
+# =====================================================================================================  K (A2 delta)
+# Cells added after the independent review of the owner op: the vec0 allowlist width (K1), the idempotency fingerprint
+# (K2), replay of a raising read-back (K3), the dedupe cap (K4), validation edges (K5), a competing writer and an injected
+# KeyboardInterrupt (K6), and two kept behaviours of the vector validation (K7).
+VEC_FAMILY = ["vec_nodes", "vec_nodes_chunks", "vec_nodes_rowids", "vec_nodes_info", "vec_nodes_auxiliary",
+              "vec_nodes_vector_chunks00", "vec_nodes_metadatachunks00", "vec_nodes_metadatatext00"]
+ADMITTED_TRIGGER = "nodes_metadata_json_guard_update"
+
+
+def test_k1_the_allowlist_admits_exactly_the_measured_events_not_the_vec0_shadow_family():
+    """Positive controls: every measured tuple is admitted. Sweep: over a generated grid of (action, table, column, db,
+    trigger), the allowlist says yes to a combination iff it is one of the measured tuples. Mutants: the vec0 family
+    admitted by name (`vec_nodes_info`, `_auxiliary`, ... pass), `x.<any column>`, UPDATE for any db."""
+    allows = eo._publish_prepared_embeddings_allows
+    for event in sorted(EXPECTED_EVENTS, key=repr):
+        assert allows(*event), event
+    tables = VEC_FAMILY + ["x", "nodes", "sqlite_master", "edges"]
+    columns = [None, "", "embedding", "node_id", "chunk_id", "chunk_offset", "id", "rowid", "validity", "vectors",
+               "metadata", "claim", "is_current", "type", "name", "quoted_text", "status", "other"]
+    dbs = ["main", "temp", "attached", None]
+    triggers = [None, ADMITTED_TRIGGER, "some_other_trigger"]
+    wrong = []
+    checked = 0
+    for action in (S.SQLITE_READ, S.SQLITE_UPDATE, S.SQLITE_INSERT, S.SQLITE_DELETE):
+        for table in tables:
+            for column in columns:
+                for db in dbs:
+                    for trig in triggers:
+                        event = (action, table, column, db, trig)
+                        checked += 1
+                        if allows(*event) != (event in EXPECTED_EVENTS):
+                            wrong.append(event)
+    assert checked == 4 * len(tables) * len(columns) * len(dbs) * len(triggers)
+    assert wrong == [], wrong[:12]
+    # From INSIDE the admitted trigger: a FUNCTION other than json_valid, and an UPDATE, are denied; a function the op
+    # allows OUTSIDE a trigger (`max`) is denied inside it.
+    for fn in ("json_valid", "max", "load_extension", "random", "json_extract", "printf"):
+        event = (S.SQLITE_FUNCTION, None, fn, None, ADMITTED_TRIGGER)
+        assert allows(*event) == (event in EXPECTED_EVENTS), event
+        assert allows(S.SQLITE_FUNCTION, None, fn, None, "some_other_trigger") is False, fn
+    for table, column in (("nodes", "metadata"), ("nodes", "embedding"), ("vec_nodes_rowids", "chunk_id")):
+        assert allows(S.SQLITE_UPDATE, table, column, "main", ADMITTED_TRIGGER) is False, (table, column)
+
+
+# ---- K2: the fingerprint covers text_sha256 and each epoch field -----------------------------------------------------
+
+@requires_linux_owner
+@pytest.mark.parametrize("what", ["text_sha256", "epoch_model", "epoch_dimension", "epoch_normalisation"])
+def test_k2_the_same_request_id_with_a_changed_field_is_request_id_reused_and_writes_nothing(owner, home, what):
+    """Mutants: the fingerprint ignores `text_sha256`; the fingerprint ignores the epoch (one cell per field)."""
+    params = make_params(home, ["p0"])
+    first = ok(call(owner, params, rid="rid-k2"))
+    assert statuses(first) == [("p0", "refreshed", None)]
+    after_first = all_state(home, ["p0", "p1", "p2"])
+    changed = json.loads(json.dumps(params))
+    if what == "text_sha256":
+        changed["items"][0]["text_sha256"] = "0" * 64
+    elif what == "epoch_model":
+        changed["epoch"]["model"] = "some-other-model"
+    elif what == "epoch_dimension":
+        changed["epoch"]["dimension"] = 385
+    else:
+        changed["epoch"]["normalisation"] = "unit"
+    refused(call(owner, changed, rid="rid-k2"), "invalid_params", "request_id_reused")
+    assert all_state(home, ["p0", "p1", "p2"]) == after_first
+    again = ok(call(owner, params, rid="rid-k2"))  # the original payload still replays
+    assert again["duplicate"] is True
+
+
+# ---- K3: a replayed raising read-back ---------------------------------------------------------------------------------
+
+@requires_linux_owner
+def test_k3_a_raising_readback_is_recorded_and_a_same_id_retry_replays_it_without_writing(owner, home):
+    """Mutant: the raising-read-back path does not record its outcome (the retry re-runs and answers ok)."""
+    real = owner._publish_prepared_readback
+
+    def boom(*_a, **_k):
+        raise RuntimeError("readback exploded")
+
+    owner._publish_prepared_readback = boom
+    params = make_params(home, ["p0"])
+    first = refused(call(owner, params, rid="rid-k3"), "readback_mismatch")
+    assert first.commit == "committed_unverified"
+    assert state(home, "p0")[0] == json.dumps(params["items"][0]["vector"])  # the commit stands
+    owner._publish_prepared_readback = real
+    sql(home, "UPDATE nodes SET embedding = ? WHERE id = 'p0'", (json.dumps(vec(9.0)),))
+    stmts = trace(owner)
+    again = refused(call(owner, params, rid="rid-k3"), "readback_mismatch")
+    assert again.commit == "committed_unverified"
+    assert state(home, "p0")[0] == json.dumps(vec(9.0))  # the retry wrote nothing
+    assert not any(s.startswith("BEGIN") for s in stmts), stmts
+
+
+# ---- K4: the dedupe store is bounded ---------------------------------------------------------------------------------
+
+@requires_linux_owner
+def test_k4_past_the_cap_the_oldest_request_id_is_forgotten_and_a_recent_one_replays(owner, home, monkeypatch):
+    """Mutant: no eviction (the oldest id still replays)."""
+    monkeypatch.setattr(eo, "USE_REWARD_DEDUPE_CAP", 2)
+    for rid, nid in (("rid-k4-a", "p0"), ("rid-k4-b", "p1"), ("rid-k4-c", "p2")):
+        ok(call(owner, make_params(home, [nid]), rid=rid))
+    assert len(owner._publish_prepared_seen) == 2
+    recent = ok(call(owner, make_params(home, ["p2"]), rid="rid-k4-c"))
+    assert recent["duplicate"] is True  # a recent id replays
+    oldest = ok(call(owner, make_params(home, ["p0"]), rid="rid-k4-a"))
+    assert "duplicate" not in oldest  # the oldest was forgotten: it re-ran
+    assert statuses(oldest) == [("p0", "refreshed", None)]
+
+
+# ---- K5: validation edges ---------------------------------------------------------------------------------------------
+
+@requires_linux_owner
+def test_k5a_a_repeated_node_id_in_one_call_is_refused_and_nothing_is_written(owner, home):
+    """Mutant: the repeated-node-id check is removed."""
+    params = make_params(home, ["p0", "p1"])
+    params["items"][1] = dict(params["items"][1], node_id="p0")
+    before = all_state(home, ["p0", "p1", "p2"])
+    refused(call(owner, params), "invalid_params", "node_id_repeated")
+    assert all_state(home, ["p0", "p1", "p2"]) == before
+
+
+@requires_linux_owner
+def test_k5b_the_node_id_limit_is_in_bytes_not_characters(owner, home):
+    """Mutant: the byte limit is swapped for a character limit (a multi-byte id of fewer characters slips through)."""
+    limit = eo.USE_REWARD_NODE_ID_MAX_BYTES
+    assert limit % 2 == 0
+    good = make_params(home, ["p0"])
+
+    def with_id(nid):
+        return dict(good, items=[dict(good["items"][0], node_id=nid)])
+
+    over = "é" * (limit // 2 + 1)  # limit + 2 bytes, but only limit/2 + 1 characters
+    assert len(over) < limit and len(over.encode("utf-8")) > limit
+    before = all_state(home, ["p0", "p1", "p2"])
+    refused(call(owner, with_id(over)), "invalid_params", "node_id_too_long")
+    assert all_state(home, ["p0", "p1", "p2"]) == before
+    exactly = "é" * (limit // 2)  # exactly `limit` bytes in limit/2 characters: within the byte limit
+    assert len(exactly.encode("utf-8")) == limit
+    for nid in (exactly, "a" * limit):  # and `limit` characters that are `limit` bytes: also within it
+        result = ok(call(owner, with_id(nid)))  # accepted by validation (the node does not exist: it defers per item)
+        assert result["counts"]["deferred"] == 1, nid[:3]
+    refused(call(owner, with_id("a" * (limit + 1))), "invalid_params", "node_id_too_long")
+
+
+@requires_linux_owner
+def test_k5c_a_lone_surrogate_node_id_is_refused_by_name_not_as_a_generic_failure(owner, home):
+    """Mutant: the lone-surrogate check is removed (the id reaches SQL binding and fails there)."""
+    params = make_params(home, ["p0"])
+    params["items"][0] = dict(params["items"][0], node_id="p\ud800x")
+    before = all_state(home, ["p0", "p1", "p2"])
+    refused(raw_write(owner, params), "invalid_params", "node_id_not_utf8")
+    assert all_state(home, ["p0", "p1", "p2"]) == before
+
+
+# ---- K6: a competing writer; a KeyboardInterrupt ----------------------------------------------------------------------
+
+@requires_linux_owner
+def test_k6_a_competing_writer_past_the_wait_budget_is_busy_nothing_committed_and_the_retry_succeeds(owner, home):
+    """The write lock is held by another connection for longer than OWNER_WRITE_LOCK_WAIT: `busy`, determinate. Mutant:
+    `BEGIN IMMEDIATE` becomes `BEGIN` (the collision is then met half way through, after reads ran): so no statement that
+    names `nodes` may have run before the refusal."""
+    params = make_params(home, ["p0"])
+    before = all_state(home, ["p0", "p1", "p2"])
+    rival = sqlite3.connect(str(home / "knowledge.db"), timeout=0)
+    stmts = trace(owner)
+    try:
+        rival.execute("BEGIN IMMEDIATE")
+        refused(call(owner, params, rid="rid-k6", timeout=10.0), "busy")
+        busy_stmts = list(stmts)  # what ran during the refused call only (the retry below adds its own)
+    finally:
+        rival.rollback()
+        rival.close()
+    assert all_state(home, ["p0", "p1", "p2"]) == before  # nothing committed
+    assert any(s.startswith("BEGIN IMMEDIATE") for s in busy_stmts), busy_stmts
+    # the collision was met at BEGIN, before any statement named the `nodes` table (`vec_nodes` does not count)
+    assert not any(re.search(r"\bnodes\b", s) for s in busy_stmts), busy_stmts
+    assert not owner._owner_conn.in_transaction
+    result = ok(call(owner, params, rid="rid-k6"))  # busy is not recorded: the same call runs once the lock is free
+    assert statuses(result) == [("p0", "refreshed", None)]
+    assert result.get("duplicate") is not True
+
+
+@requires_linux_owner
+def test_k6_a_keyboard_interrupt_from_the_primitive_propagates_leaves_no_transaction_and_the_next_call_works(owner, home, monkeypatch):
+    """Mutant: the BaseException is swallowed or converted (the interrupt does not propagate), or the transaction is
+    left open. Item 2 of 3 raises; item 1's write is rolled back with it."""
+    warm(owner, home)
+    prev_busy = owner._owner_conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    ids = ["p0", "p1", "p2"]
+    params = make_params(home, ids)
+    before = all_state(home, ids)
+    real = pub.publish_embedding
+    seen = []
+
+    def interrupting(conn, nid, **kw):
+        seen.append(nid)
+        if len(seen) == 2:
+            raise KeyboardInterrupt()
+        return real(conn, nid, **kw)
+
+    monkeypatch.setattr(pub, "publish_embedding", interrupting)
+    with pytest.raises(KeyboardInterrupt):
+        owner._handle_publish_prepared_embeddings(params, time.monotonic() + 10, "rid-k6-ki")
+    assert seen == ["p0", "p1"]
+    assert not owner._owner_conn.in_transaction
+    assert all_state(home, ids) == before  # item 1 (written before the interrupt) stays old: rolled back
+    monkeypatch.setattr(pub, "publish_embedding", real)
+    _assert_restored(owner, prev_busy)
+    result = ok(call(owner, params, rid="rid-k6-ki"))  # nothing was recorded: the same id runs fresh
+    assert statuses(result) == [(nid, "refreshed", None) for nid in ids]
+    assert result.get("duplicate") is not True
+
+
+# ---- K7: two kept behaviours of the vector validation -----------------------------------------------------------------
+
+@requires_linux_owner
+def test_k7_a_finite_float64_beyond_the_float32_range_defers_that_item_and_the_call_is_ok(owner, home):
+    """KEPT behaviour: the owner's validation (finite float64) passes 1e39; the primitive defers THAT item as
+    `deferred / invalid_vector`, and the other items refresh."""
+    ids = ["p0", "p1", "p2"]
+    vectors = {"p0": vec(1.0), "p1": [1e39] + vec(2.0)[1:], "p2": vec(3.0)}
+    assert math.isfinite(vectors["p1"][0])
+    result = ok(call(owner, make_params(home, ids, vectors)))
+    assert statuses(result) == [("p0", "refreshed", None), ("p1", "deferred", "invalid_vector"), ("p2", "refreshed", None)]
+    assert result["counts"] == {"refreshed": 2, "pending": 0, "deferred": 1}
+    assert state(home, "p1")[0] == json.dumps(OLD) and state(home, "p1")[2] == fvec(OLD)  # the deferred item is untouched
+    assert state(home, "p0")[0] == json.dumps(vectors["p0"]) and state(home, "p2")[0] == json.dumps(vectors["p2"])
+
+
+@requires_linux_owner
+def test_k7_an_int_vector_is_stored_as_sent(owner, home):
+    """KEPT behaviour: ints are passed on as sent (the stored text is `[1, 1, ...]`, as the in-process primitive writes
+    it when given ints), not normalised to floats."""
+    ints = [1] * 384
+    result = ok(call(owner, make_params(home, ["p0"], {"p0": ints})))
+    assert statuses(result) == [("p0", "refreshed", None)]
+    assert state(home, "p0")[0] == json.dumps(ints) and state(home, "p0")[0].startswith("[1, 1,")
