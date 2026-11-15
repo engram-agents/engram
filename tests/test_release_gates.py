@@ -69,6 +69,7 @@ from tools.release_gates import (
     run_G1,
     run_G3a,
     run_G4b,
+    run_G5,
     run_G6,
     run_scorecard,
 )
@@ -1010,3 +1011,64 @@ class TestPluginVersionHasChangelogSection(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertEqual(_check_version_vs_changelog(version, changelog), [])
+
+
+# ---------------------------------------------------------------------------
+# G5 — coverage incomplete (scan-leaks exit 3) is its own verdict (#4752)
+# ---------------------------------------------------------------------------
+
+class TestG5CoverageIncomplete:
+    """G5 must distinguish "did not look" from "looked and found hits".
+
+    scan-leaks exits 3 when no findings were found but the scan could not read
+    every candidate (or had none). Before #4752 that code fell through to the
+    hit-count path, which reports "found 0 potential leak(s)" — true of the
+    findings, false of the coverage. These cells pin the new branch and the
+    neighbouring hit-count path, so the branch cannot swallow the latter.
+    """
+
+    _REPO_ROOT = str(PROJECT_ROOT)
+
+    def _fake_proc(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+        """Build a mock CompletedProcess-alike (same shape as TestG3aParser)."""
+        p = mock.MagicMock()
+        p.stdout = stdout
+        p.stderr = stderr
+        p.returncode = returncode
+        return p
+
+    def test_exit_3_is_degraded_and_names_coverage(self):
+        """No findings + exit 3 → DEGRADED naming coverage, never "0 leaks"."""
+        proc = self._fake_proc(
+            stdout=(
+                "scan-leaks: scanned 1, skipped-binary 0\n"
+                "scan-leaks: unreadable 1 (coverage incomplete): locked.txt\n"
+            ),
+            stderr="",
+            returncode=3,
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            result = run_G5(self._REPO_ROOT)
+        assert result["status"] == STATUS_DEGRADED, result
+        assert result["metric"] == "coverage incomplete", result
+        assert "coverage incomplete" in result["detail"], result
+        # The hit-count path's claim must not be what a caller reads here.
+        assert "found 0 potential leak" not in result["detail"], result
+
+    def test_exit_1_still_takes_the_hit_count_path(self):
+        """Positive control: exit 1 still reports the hit count."""
+        proc = self._fake_proc(
+            stdout="scan-leaks: scanned 1, skipped-binary 0\n",
+            stderr=(
+                "scan-leaks: 2 potential leak(s) in /repo\n"
+                "  doc.md:1 [personal name] Quillonfex\n"
+                "  src/x.py:9 [absolute home path] segment: /home/user\n"
+            ),
+            returncode=1,
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            result = run_G5(self._REPO_ROOT)
+        assert result["status"] == STATUS_DEGRADED, result
+        assert result["metric"] == "2 hit(s)", result
+        assert "found 2 potential leak" in result["detail"], result
+        assert "coverage incomplete" not in result["detail"], result
