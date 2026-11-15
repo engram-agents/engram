@@ -935,6 +935,9 @@ def test_install_doc_names_the_flag_and_every_profile_bootstrap_accepts_and_no_o
     for value in re.findall(r"--claude-md-profile[ =]`?([A-Za-z0-9_-]+)", text):
         assert value in profiles, f"doc names profile {value!r} that bootstrap refuses"
     assert "claude_md_profile" in text
+    # the line names the INSTALLER's flag, and says bootstrap is what checks the value
+    assert "install.sh --claude-md-profile" in text
+    assert re.search(r"bootstrap[^.;]*\bchecks\b", text)
 
 
 def test_install_doc_default_is_the_profile_bootstrap_uses_with_no_option():

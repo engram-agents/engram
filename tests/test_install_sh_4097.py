@@ -1138,3 +1138,93 @@ def test_forum_url_hint_names_the_tier_not_the_retired_flag(sb):
     assert r.returncode != 0 and "FAIL: [step 8]" in r.stderr, r.all
     assert "--multi-agent" not in r.stderr
     assert "convenience or dev" in r.stderr
+
+
+# ── #4802: --claude-md-profile is passed straight through to bootstrap.py ─────────────────────
+def _bootstrap_argvs(sb):
+    return [json.loads(c[len("argv-of-bootstrap "):]) for c in sb.calls_starting("argv-of-bootstrap")]
+
+
+@pytest.mark.parametrize("given", [["--claude-md-profile", "lean"], ["--claude-md-profile=lean"]])
+def test_claude_md_profile_flag_is_forwarded_to_bootstrap(sb, given):
+    r = sb.run("--yes", *given)
+    assert r.returncode == 0, r.all
+    assert _bootstrap_argvs(sb) == [["--claude-md-profile", "lean"]]
+
+
+def test_claude_md_profile_value_is_forwarded_verbatim_not_hardcoded(sb):
+    r = sb.run("--yes", "--claude-md-profile", "whatever-bootstrap-decides")
+    assert r.returncode == 0, r.all  # the fake bootstrap accepts anything: the installer judged nothing
+    assert _bootstrap_argvs(sb) == [["--claude-md-profile", "whatever-bootstrap-decides"]]
+
+
+def test_claude_md_profile_forwards_beside_replace(sb):
+    sb.claude_home.mkdir(parents=True)
+    (sb.claude_home / "CLAUDE.md").write_text("mine\n")
+    r = sb.run("--yes", "--claude-md-profile", "lean")
+    assert r.returncode == 0, r.all
+    assert _bootstrap_argvs(sb) == [["--replace", str(sb.claude_home / "CLAUDE.md"), "--claude-md-profile", "lean"]]
+
+
+def test_without_the_flag_the_bootstrap_argv_is_unchanged(sb):
+    assert sb.run("--yes").returncode == 0
+    assert _bootstrap_argvs(sb) == [[]]
+
+
+def test_without_the_flag_the_replace_argv_is_unchanged(sb):
+    sb.claude_home.mkdir(parents=True)
+    (sb.claude_home / "CLAUDE.md").write_text("mine\n")
+    assert sb.run("--yes").returncode == 0
+    assert _bootstrap_argvs(sb) == [["--replace", str(sb.claude_home / "CLAUDE.md")]]
+
+
+def test_both_bootstrap_command_lines_are_byte_identical_to_before():
+    src = REAL_INSTALL_SH.read_text()
+    line = '"$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" ${_bootstrap_flags[@]+"${_bootstrap_flags[@]}"} \\'
+    assert src.count("      " + line + "\n") == 2
+
+
+def test_claude_md_profile_without_a_value_fails_loud_and_runs_nothing(sb):
+    r = sb.run("--yes", "--claude-md-profile")
+    assert r.returncode == 2, r.all
+    assert "--claude-md-profile requires a value" in r.stderr and "(see --help)" in r.stderr
+    assert not sb.calls.exists() or sb.call_lines() == []
+
+
+def test_a_bad_value_is_refused_by_bootstrap_not_by_the_installer(sb):
+    sb.use_real_bootstrap()
+    r = sb.run("--yes", "--claude-md-profile", "tiny")
+    assert r.returncode != 0, r.all
+    assert "--claude-md-profile needs one of" in r.all  # bootstrap's own message
+    assert "bootstrap.py failed" in r.stderr
+    assert "install.sh: invalid" not in r.all
+
+
+def test_installer_source_holds_no_profile_list_of_its_own():
+    src = REAL_INSTALL_SH.read_text()
+    assert not re.search(r"\blean\b", src)
+    assert not re.search(r"""(?:^|[\s"'(|])full\s*[|)]""", src, re.MULTILINE)
+    assert not re.search(r"""[|(]\s*full\b|"full"|'full'""", src)
+
+
+def test_the_real_bootstrap_renders_and_records_the_lean_profile_through_the_installer(sb):
+    sb.use_real_bootstrap()
+    r = sb.run("--yes", "--claude-md-profile", "lean")
+    assert r.returncode == 0, r.all
+    assert json.loads((sb.engram / "config.json").read_text()).get("claude_md_profile") == "lean"
+    assert "## Model Identity Gate" in (sb.claude_home / "CLAUDE.md").read_text()
+
+
+def test_a_profile_given_on_a_seeded_home_is_reported_ignored_not_silently_dropped(sb):
+    sb.make_db(6)
+    r = sb.run("--yes", "--claude-md-profile", "lean")
+    assert r.returncode == 0, r.all
+    assert sb.calls_starting("argv-of-bootstrap") == []
+    assert "--claude-md-profile lean ignored" in r.stdout
+
+
+def test_help_lists_the_claude_md_profile_flag_and_names_no_profile(sb):
+    r = sb.run("--help")
+    assert r.returncode == 0
+    assert "--claude-md-profile" in r.stdout
+    assert not re.search(r"\blean\b", r.stdout)
