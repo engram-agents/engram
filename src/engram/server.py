@@ -7336,7 +7336,8 @@ def engram_resolve(payload_json: str) -> str:
 # Compat forwarder above in wave-6 compat block.
 
 
-# _walk_cascade_downstream body moved to engram_revision.py (family E) in #872 wave 6.
+# _walk_cascade_downstream body moved to engram_revision.py (family E) in #872 wave 6,
+# then to engram_core.py in #4727 (revision binds the old name to core's).
 # Compat forwarder above in wave-6 compat block.
 #
 # _add_stale_replacement retired (#2013/#2009 slice 1, cascade machine):

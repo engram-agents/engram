@@ -2250,13 +2250,14 @@ PROVENANCE_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c
 _PROVENANCE_RELATIONS_SORTED = sorted(PROVENANCE_RELATIONS)
 _PROVENANCE_RELATION_PLACEHOLDERS = ",".join("?" * len(_PROVENANCE_RELATIONS_SORTED))
 
-# Same pattern, for the upstream (premise-direction) cascade walk used by
-# _walk_cascade_upstream / _trace_observation_leaves below. engram_revision.py
-# has its own copy (`_CASCADE_RELATIONS_SORTED`) for the downstream taint
-# walker — this is engram_core's own derivation of the same upstream
-# constant, not an import of revision's, since core has no dependency on
-# revision (#2298, superseding #2255's "leave enumerated" doctrine for this
-# specific walk — see _walk_cascade_upstream's docstring).
+# Same pattern, for the cascade walks in this module: the upstream
+# (premise-direction) walk used by _walk_cascade_upstream /
+# _trace_observation_leaves, and since #4727 the downstream taint walk too
+# (_walk_cascade_downstream / _walk_cascade_from_root, promoted from
+# engram_revision). engram_revision.py keeps its own copy of this constant for
+# its remaining walks (_cascade_reaches); core has no dependency on revision
+# (#2298, superseding #2255's "leave enumerated" doctrine for this specific
+# walk — see _walk_cascade_upstream's docstring).
 _CASCADE_RELATIONS_SORTED = sorted(CASCADE_RELATIONS)
 _CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
 
@@ -13162,6 +13163,81 @@ class CascadeWalkTruncated(Exception):
         )
 
 
+def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
+    """Walk downstream from node_id following engram_core.CASCADE_RELATIONS
+    edges (the relations whose EDGE_CLASSIFICATIONS entry sets cascade=True —
+    today derives_from and acknowledged_derives_from, the latter
+    cascade-bearing by design per #2013 §12.5; the constant is the source of
+    truth, not this list). supported_by lost its cascade flag in #2252
+    Stage 1.3, and the W6 pairing edge predicted_by was minted cascade:False
+    from the start, so neither ever reaches this walk. Visits each
+    downstream node at most once. For each live
+    claim-bearing node visited, calls on_live_node(node) — the caller
+    decides what to write. Stops cascade at retracted/superseded nodes
+    (node not is_current) AND at any non-claim-bearing (NCB) node — an NCB
+    node has no claim to re-adjudicate, so cascade reaching it accomplishes
+    nothing (#2252 W0). Cornerstones/lessons are the vote-accumulator
+    *instance* of this rule, not the rule itself.
+
+    Visit pattern (Lei 2026-05-28): visited check is at the top of the call,
+    BEFORE on_live_node fires. This guarantees on_live_node fires exactly
+    once per downstream node regardless of how many paths reach it. The
+    caller seeds the cascade root into `visited` before calling so the root
+    isn't re-processed.
+
+    Promoted from engram_revision (#4727) so a migration rung in this module
+    can run the same walk; engram_revision binds its old name to this one.
+    Callers starting from a ROOT use _walk_cascade_from_root, not this.
+    """
+    if node_id in visited:
+        return
+    visited.add(node_id)
+
+    node = conn.execute(
+        "SELECT id, type, claim, metadata FROM nodes "
+        "WHERE id = ? AND is_current = 1",
+        (node_id,),
+    ).fetchone()
+    if not node:
+        return  # retracted/superseded — stop cascade (parity with old _flag_stale)
+    if not _is_claim_bearing(node["type"]):
+        return  # NCB: no claim to re-adjudicate, so nothing to taint (#2252 W0)
+
+    on_live_node(node)
+
+    for dep_id, _tgt, _rel in dag_edge_set(
+            conn, _CASCADE_RELATIONS_SORTED, target_id=node_id):
+        _walk_cascade_downstream(conn, dep_id,
+                                 visited=visited, on_live_node=on_live_node)
+
+
+def _walk_cascade_from_root(conn, root_id, *, on_live_node, extra_visited=()):
+    """THE cascade walk from a root (#4727): every live claim-bearing node
+    downstream of ``root_id`` over CASCADE_RELATIONS, each handed once to
+    ``on_live_node``. Two steps, and both are the walk:
+
+    1. the root's DIRECT dependents, with ``live_only=False`` — the root has
+       usually just stopped being live (a retract / supersede root), so its
+       own edges are provenance by construction (#3542), and the default
+       live-only set would drop them;
+    2. ``_walk_cascade_downstream`` on each, with the root (and
+       ``extra_visited``, e.g. a supersede's replacement) seeded into
+       ``visited`` so neither is processed.
+
+    Calling ``_walk_cascade_downstream`` on the root itself with the root
+    seeded marks nothing (it returns at the visited check), which is why
+    every caller goes through this one helper instead of restating the two
+    steps. Chosen over a rung-local copy: a second copy of a shape this easy
+    to get wrong is the larger risk.
+    """
+    visited = {root_id, *extra_visited}
+    for dep_id, _t, _r in dag_edge_set(
+            conn, _CASCADE_RELATIONS_SORTED, live_only=False,
+            target_id=root_id):
+        _walk_cascade_downstream(conn, dep_id,
+                                 visited=visited, on_live_node=on_live_node)
+
+
 def _walk_cascade_upstream(
     conn: sqlite3.Connection,
     node_id: str,
@@ -13173,7 +13249,7 @@ def _walk_cascade_upstream(
 ) -> set:
     """Shared upstream (premise-direction) walk over ``CASCADE_RELATIONS``:
     follows each visited node's own outgoing cascade edges back toward its
-    origins. Mirrors ``engram_revision._walk_cascade_downstream``'s shape
+    origins. Mirrors ``_walk_cascade_downstream``'s shape
     (visited-set dedup, per-dequeue budget decrement, caller-supplied
     per-node decision) for the inverse direction — that walker finds who
     DEPENDS ON a node (``target_id = node_id``); this one finds what a node
