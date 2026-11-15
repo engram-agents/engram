@@ -60,6 +60,22 @@ def _make_tree(files: dict[str, str]) -> Path:
     return tmp
 
 
+def _scanner_env(env_extra=None):
+    """The environment a scanner invocation runs under.
+
+    GITHUB_ACTIONS is REMOVED from the inherited environment and is re-added
+    only when a cell asks for it by name. The suite's default is therefore
+    "not in CI", which is the only way a positive arm stays a positive arm on
+    a CI runner: at 8fc74ec9 both cell-18 locator arms silently exercised the
+    refusal path on GitHub Actions and asserted the locator path.
+    """
+    env = dict(os.environ)
+    env.pop("GITHUB_ACTIONS", None)
+    if env_extra:
+        env.update(env_extra)
+    return env
+
+
 # ---------------------------------------------------------------------------
 # Test 1: config-absent — advisory message, structural patterns only, exit 0
 # ---------------------------------------------------------------------------
@@ -73,6 +89,7 @@ def test_config_absent_prints_advisory_and_exits_clean(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, f"expected exit 0, got {result.returncode}\nstdout:{result.stdout}\nstderr:{result.stderr}"
     assert ".scan-leaks-local.json absent" in result.stdout, (
@@ -93,6 +110,7 @@ def test_config_absent_structural_pattern_still_fires(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 1, (
         f"expected exit 1 (leak found), got {result.returncode}\nstdout:{result.stdout}\nstderr:{result.stderr}"
@@ -120,6 +138,7 @@ def test_config_present_patterns_load_and_match(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 1, (
         f"expected exit 1 (personal name detected), got {result.returncode}\nstdout:{result.stdout}\nstderr:{result.stderr}"
@@ -145,6 +164,7 @@ def test_config_present_no_match_exits_clean(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, (
         f"expected exit 0, got {result.returncode}\nstdout:{result.stdout}\nstderr:{result.stderr}"
@@ -203,7 +223,7 @@ def test_mutation_planted_name_detected(tmp_path):
 
     clean_result = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert clean_result.returncode == 0, "pre-plant should be clean"
 
@@ -212,7 +232,7 @@ def test_mutation_planted_name_detected(tmp_path):
 
     dirty_result = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert dirty_result.returncode == 1, (
         f"planted name should trigger leak; returncode={dirty_result.returncode}\n"
@@ -283,6 +303,7 @@ def test_malformed_config_fires_advisory(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, (
         f"expected exit 0 on clean tree with malformed config, "
@@ -317,6 +338,7 @@ def test_real_repo_scan_no_config_exits_clean(tmp_path):
         ],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, (
         f"Real-repo scan with structural patterns only must exit 0.\n"
@@ -383,6 +405,7 @@ def test_repo_mode_ignores_untracked_hit(tmp_path):
         ],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, (
         f"Repo-mode scan must exit 0: untracked hit in dirty.py must be invisible.\n"
@@ -434,6 +457,7 @@ def test_repo_mode_detects_tracked_hit(tmp_path):
         ],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 1, (
         f"Repo-mode scan must exit 1 when a tracked file contains the structural hit.\n"
@@ -478,6 +502,7 @@ def test_archived_dev_repo_url_is_not_flagged(tmp_path):
         ],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, (
         "Scanner must not flag a link to the archived development repository.\n"
@@ -521,7 +546,7 @@ def _run_scan(root: Path):
     return subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json")],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
 
 
@@ -902,7 +927,7 @@ def _run_scan_with_roster(root: Path):
     """Run the scanner with the fixture's own roster (default config path)."""
     return subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
 
 
@@ -1076,7 +1101,7 @@ def test_roster_file_supplies_patterns_and_suppresses_the_skip_advisory(tmp_path
     without = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json")],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert without.returncode == 0, without.stdout + without.stderr
     assert "personal-name scan skipped" in without.stdout
@@ -1087,7 +1112,7 @@ def test_roster_file_supplies_patterns_and_suppresses_the_skip_advisory(tmp_path
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json"),
          "--roster-file", str(roster)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     _assert_class_a_finding(with_roster, "doc.md", count=1)
     assert "personal-name scan skipped" not in with_roster.stdout
@@ -1105,7 +1130,7 @@ def test_redact_prints_path_and_line_only(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path),
          "--config-path", str(tmp_path / "no-config.json"),
          "--roster-file", str(roster)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert plain.returncode == 0, plain.stdout + plain.stderr
     # Control: the unredacted form really does carry both, so their absence
@@ -1117,7 +1142,7 @@ def test_redact_prints_path_and_line_only(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path),
          "--config-path", str(tmp_path / "no-config.json"),
          "--roster-file", str(roster), "--redact"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert redacted.returncode == 0, redacted.stdout + redacted.stderr
     assert "doc.md:1" in redacted.stderr
@@ -1139,7 +1164,7 @@ def test_redact_hides_the_home_path_segment(tmp_path):
     for extra in ((), ("--redact",)):
         r = subprocess.run(
             [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path), *extra],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=_scanner_env(),
         )
         out = _assert_class_a_finding(r, "doc.md", count=1)
         assert "zorblax" not in out, out
@@ -1170,7 +1195,7 @@ def test_invalid_roster_line_reports_line_and_class_without_text(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json"),
          "--roster-file", str(roster), "--redact"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert r.returncode == 2, r.stdout + r.stderr  # no partial scan -> never 1
     assert "roster line 4" in r.stderr, r.stderr
@@ -1188,7 +1213,7 @@ def test_absent_roster_file_is_a_usage_error(tmp_path):
     r = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path),
          "--roster-file", str(tmp_path / "no-such-roster.txt")],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert r.returncode == 2, r.stdout + r.stderr
 
@@ -1213,7 +1238,7 @@ def test_pattern_hit_gets_the_roster_sentence(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json"),
          "--roster-file", str(roster), "--redact"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     _assert_class_a_finding(r, count=1)
     assert _ROSTER_ADVICE in r.stderr, r.stderr
@@ -1245,7 +1270,7 @@ def test_one_bad_line_refuses_the_whole_roster(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json"),
          "--roster-file", str(roster)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert r.returncode == 2, r.stdout + r.stderr
     assert "roster line 2" in r.stderr, r.stderr
@@ -2187,7 +2212,7 @@ def _run_with_roster(root: Path, roster: Path, *extra: str):
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json"),
          "--roster-file", str(roster), *extra],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
 
 
@@ -2432,7 +2457,7 @@ def test_cell9b_local_roster_is_class_a_without_a_roster_line(tmp_path):
 
     r = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     out = r.stdout + r.stderr
 
@@ -2535,17 +2560,18 @@ _LOCATOR_FLAG = "--show-class-a-locations"
 
 
 def _run_with_env(args, env_extra):
-    env = dict(os.environ)
-    env.update(env_extra)
     return subprocess.run(
         [sys.executable, str(SCAN_LEAKS), *args],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=_scanner_env(env_extra),
     )
 
 
 def test_cell18_class_a_locator_is_opt_in_and_refused_under_ci(tmp_path):
     """Cell 18: the locator is opt-in, prints `path:line` and nothing else,
-    and turns itself off wherever GITHUB_ACTIONS is set."""
+    and turns itself off wherever GITHUB_ACTIONS is set. The positive arms
+    run with that variable cleared by `_scanner_env`, because a runner's
+    ambient CI flag would otherwise turn the locator arm into its own
+    refusal arm."""
     root = tmp_path / "root"
     root.mkdir()
     _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
@@ -2621,6 +2647,44 @@ def test_cell18_home_path_locator_follows_the_same_split(tmp_path):
     assert rc.returncode == 2, out_c
     assert "doc.md" not in out_c, out_c
     assert "zorbquux" not in out_c, out_c
+
+
+def test_cell18_harness_clears_ambient_github_actions(tmp_path, monkeypatch):
+    """Cell 18, harness: the suite's default is "not in CI".
+
+    The positive locator arms above assert what the scanner does when CI is
+    NOT watching, so they must not depend on whether CI happens to be
+    watching the test runner: on GitHub Actions the ambient GITHUB_ACTIONS
+    turned both of them into their own negative arm (`2 == 1`). The first two
+    arms pin the helper itself; the last two are the end-to-end split, and the
+    final arm proves the helper is a default rather than a mute.
+    """
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert "GITHUB_ACTIONS" not in _scanner_env()
+    assert _scanner_env({"GITHUB_ACTIONS": "true"})["GITHUB_ACTIONS"] == "true"
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    roster = _format2_roster(tmp_path, "A\t\\b" + _C2_NAME + "\\b\n")
+
+    # Ambient CI is set above, yet the locator arm is a locator arm: exit 1
+    # and path:line, never the refusal.
+    rl = _run_with_roster(root, roster, _LOCATOR_FLAG)
+    out_l = rl.stdout + rl.stderr
+    assert rl.returncode == 1, out_l
+    assert "doc.md:1" in rl.stderr, out_l
+    assert _C2_NAME not in out_l, out_l
+
+    # The explicit ask still reaches the scanner, so the refusal is intact.
+    rc = _run_with_env(
+        ["--root", str(root), "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster), _LOCATOR_FLAG],
+        {"GITHUB_ACTIONS": "true"},
+    )
+    out_c = rc.stdout + rc.stderr
+    assert rc.returncode == 2, out_c
+    assert "doc.md" not in out_c, out_c
 
 
 @pytest.mark.parametrize(
