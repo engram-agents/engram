@@ -508,6 +508,22 @@ def run_G5(repo_root: str) -> dict[str, Any]:
             STATUS_PASS, "0 hits", "No personal-info leaks detected",
         )
 
+    if proc.returncode == 3:
+        # Coverage incomplete: no findings, but the scan could not read every
+        # candidate file (or had none). The hit-count path below would report
+        # "found 0 potential leak(s)" — true of the findings and false of the
+        # coverage, since nothing was found because part of the tree was not
+        # read. Degraded, not a pass: a scan of part of the tree is not
+        # evidence of a clean tree.
+        return make_result(
+            "G5", "public-readiness",
+            STATUS_DEGRADED, "coverage incomplete",
+            "scan-leaks could not cover the whole tree (coverage incomplete) — "
+            "see the scanner's 'scan-leaks: unreadable ...' or "
+            "'scan-leaks: no coverage ...' lines above; this is not evidence "
+            "of a clean tree",
+        )
+
     # Count hits from stderr output.
     # scan-leaks.py writes individual hit lines as "  path:lineno [label] snippet"
     # (two leading spaces); the summary line is "scan-leaks: N potential..." with no indent.

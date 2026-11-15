@@ -34,18 +34,43 @@ runs committed structural patterns only and prints one advisory line.
 See docs/internal/.scan-leaks-local.json.example for the config shape.
 
 Scope and exclusions (what "the tree" means here — NOT every published file):
-  - Candidate set: every git-tracked text file, whatever its extension
-    (extensionless executables included).  A binary (a NUL byte in its first
-    8 KiB) is skipped and counted.
+  - Candidate set: every git-tracked file, whatever its extension
+    (extensionless executables included), minus the SKIP_DIRS components and
+    SKIP_FILES names below, after the is_file() filter.  There is no
+    extension allowlist.
+  - A binary (a NUL byte in its first 8 KiB) is skipped, counted, and named.
   - SKIP_FILES: LICENSE, .scan-leaks-local.json, scan-leaks.py,
     test_release_cutover.py, RELEASING.md.
   - SKIP_DIRS: .git, __pycache__, node_modules, .claude.
   - A name in an excluded file is not scanned.
+  - Known limit: a tracked symlink is a candidate only when it resolves to a
+    regular file.  A symlink to a directory, or a dangling symlink, is not a
+    candidate and is not reported unreadable — is_file() is the filter.
+
+Coverage accounting (every candidate is accounted for):
+  - scan() returns a ScanReport whose invariant is
+    scanned + len(skipped_binary_paths) + len(unreadable_paths) == candidates.
+    A file that cannot be read at all is an unreadable path — never a silent
+    skip, and never counted as binary.
+  - main() prints on stdout, exactly once, the frozen line
+    "scan-leaks: scanned N, skipped-binary M" (.github/workflows/
+    name-leak-sweep.yml parses it with an anchored regex — do not reformat
+    it).  When M > 0 it follows with one line naming up to 20 skipped-binary
+    paths and a "(+K more)" tail; when any candidate was unreadable it prints
+    "scan-leaks: unreadable K (coverage incomplete): <paths>" (the union over
+    both passes, deduped by path, same 20-path cap); when there are no
+    candidates at all it prints
+    "scan-leaks: no coverage: 0 candidate files under <root>; nothing was
+    scanned" and does NOT print `clean`.
 
 Exit codes:
-  0 — clean
-  1 — leaks found
+  0 — clean, and the scan covered at least one candidate file
+  1 — leaks found (a pattern hit or an absolute home path); takes precedence
+      over 3 when coverage is also incomplete, and the coverage lines still
+      print
   2 — invocation error
+  3 — coverage incomplete: at least one candidate was unreadable, or there
+      were no candidate files at all, and nothing was found
 """
 
 import argparse
@@ -54,6 +79,7 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 # Structural patterns with NO personal data — safe to commit.
@@ -113,6 +139,40 @@ SKIP_FILES = {"LICENSE", LOCAL_CONFIG_NAME, "scan-leaks.py", "test_release_cutov
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".claude"}
 # .claude: harness-internal (agent worktrees + transcripts) — stale fairy
 # worktrees carry pre-fix file copies that read as false-positive leaks.
+
+# How many paths a naming line shows before its "(+K more)" tail.
+NAMED_PATH_CAP = 20
+
+
+@dataclass
+class ScanReport:
+    """What a scan ranged over, as well as what it found.
+
+    Every candidate file is accounted for exactly once — scanned, skipped as
+    binary, or unreadable — and ``scan()`` asserts that invariant:
+
+        scanned + len(skipped_binary_paths) + len(unreadable_paths) == candidates
+    """
+    findings: list[tuple[str, int, str, str]]
+    scanned: int
+    skipped_binary_paths: list[str]
+    unreadable_paths: list[str]
+    candidates: int
+
+    @property
+    def skipped_binary(self) -> int:
+        """The skipped-binary count, derived from the paths (the source of
+        truth), so the number can never disagree with the names it prints."""
+        return len(self.skipped_binary_paths)
+
+
+def format_paths(paths: list[str], cap: int = NAMED_PATH_CAP) -> str:
+    """Join paths for a log line: at most ``cap`` named, then '(+K more)'."""
+    shown = ", ".join(paths[:cap])
+    more = len(paths) - cap
+    if more > 0:
+        shown += f" (+{more} more)"
+    return shown
 
 
 def load_local_patterns(root: Path, config_path: Path | None = None) -> tuple[list, bool]:
@@ -227,18 +287,18 @@ def _git_tracked_files(root: Path) -> list[Path] | None:
     return [root / p.decode("utf-8", errors="replace") for p in raw.split(b"\x00") if p]
 
 
-def scan(root: Path, leak_patterns: list, use_git: bool = True
-         ) -> tuple[list[tuple[str, int, str, str]], int, int]:
-    """Scan root for leak_patterns.  Returns (findings, scanned, skipped_binary).
+def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
+    """Scan root for leak_patterns and return a ScanReport.
 
-    findings is a list of (relpath, lineno, label, snippet).
+    ``report.findings`` is a list of (relpath, lineno, label, snippet).
 
     Candidate set: every git-tracked file, whatever its extension
     (extensionless executables included), minus the SKIP_DIRS components and
-    SKIP_FILES names — the same all-text domain ``scan_home_paths`` uses.  An
-    extension allowlist used to select files here, so the release leak gate
-    never read shipped ``.js``/``.html``/``.ts``/``.css``/``.txt`` files or
-    extensionless scripts (#3732).
+    SKIP_FILES names, after the ``is_file()`` filter — the same all-text
+    domain ``scan_home_paths`` uses.  An extension allowlist used to select
+    files here, so the release leak gate never read shipped
+    ``.js``/``.html``/``.ts``/``.css``/``.txt`` files or extensionless scripts
+    (#3732).
 
     When use_git is True (default), candidate files are enumerated via
     ``git ls-files -z`` so that untracked files — gitignored local notes,
@@ -253,13 +313,13 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True
     When use_git is False (explicit-path invocation), the os.walk path is used
     unconditionally so that callers can target specific non-repo directories.
 
-    A file whose first 8 KiB contains a NUL byte is binary: skipped and counted
-    in ``skipped_binary``.  Everything else is decoded as UTF-8 with errors
-    replaced, so a non-UTF-8 text file is still scanned and ``scanned`` counts
-    it.  A file that cannot be read at all is skipped and counted in neither.
+    A file whose first 8 KiB contains a NUL byte is binary: skipped, counted
+    in ``skipped_binary_paths``, and named by the caller.  Everything else is
+    decoded as UTF-8 with errors replaced, so a non-UTF-8 text file is still
+    scanned and ``scanned`` counts it.  A file that cannot be read at all is
+    recorded in ``unreadable_paths`` — never dropped silently, and never
+    counted as binary.
     """
-    leaks = []
-
     tracked = _git_tracked_files(root) if use_git else None
 
     if tracked is not None:
@@ -286,37 +346,70 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True
 
     # A tracked symlink can point at a directory (tools/engine, tools/engram-pkg
     # in this repo).  It is not a text file to scan, so it is not a candidate —
-    # which is what makes scanned + skipped_binary equal the files considered.
+    # which is what makes the three buckets partition the files considered.
+    # A dangling symlink falls out here too: is_file() is False, so it is not
+    # a candidate and not unreadable (the documented known limit).
     candidates = [f for f in candidates if f.is_file()]
 
+    findings = []
     scanned = 0
-    skipped_binary = 0
+    skipped_binary_paths = []
+    unreadable_paths = []
     for fpath in candidates:
+        rel = fpath.relative_to(root)
         try:
             data = fpath.read_bytes()
         except OSError:
+            unreadable_paths.append(rel.as_posix())
             continue
         if b"\x00" in data[:8192]:
-            skipped_binary += 1
+            skipped_binary_paths.append(rel.as_posix())
             continue
         content = data.decode("utf-8", errors="replace")
         scanned += 1
-        rel = fpath.relative_to(root)
         for i, line in enumerate(content.splitlines(), 1):
             for pattern, label in leak_patterns:
                 if pattern.search(line):
-                    leaks.append((str(rel), i, label, line.strip()[:120]))
+                    findings.append((str(rel), i, label, line.strip()[:120]))
                     break
-    return leaks, scanned, skipped_binary
+
+    skipped_binary_paths.sort()
+    unreadable_paths.sort()
+    report = ScanReport(
+        findings=findings,
+        scanned=scanned,
+        skipped_binary_paths=skipped_binary_paths,
+        unreadable_paths=unreadable_paths,
+        candidates=len(candidates),
+    )
+    # The invariant is the contract: a count that does not reconcile is a
+    # scanner bug, never something to print and move past.
+    accounted = (report.scanned + len(report.skipped_binary_paths)
+                 + len(report.unreadable_paths))
+    if accounted != report.candidates:
+        raise AssertionError(
+            f"scan-leaks coverage does not reconcile: scanned {report.scanned} + "
+            f"skipped-binary {len(report.skipped_binary_paths)} + unreadable "
+            f"{len(report.unreadable_paths)} = {accounted}, candidates "
+            f"{report.candidates}"
+        )
+    return report
 
 
-def scan_home_paths(root: Path, use_git: bool = True) -> list[tuple[str, int, str]]:
-    """Return (relpath, lineno, segment) for every disallowed absolute home path.
+def scan_home_paths(root: Path, use_git: bool = True
+                    ) -> tuple[list[tuple[str, int, str]], list[str]]:
+    """Return (findings, unreadable_paths) for the absolute-home-path check.
+
+    findings is (relpath, lineno, segment) for every disallowed absolute home
+    path.  unreadable_paths is the sorted repo-relative posix paths whose read
+    raised OSError, so the caller can say a pass did not cover them.
 
     Domain: every git-tracked file (``git ls-files``), whatever its extension,
-    including extensionless executables.  A file whose first 8 KiB contains a
-    NUL byte is binary and skipped, as is any file in HOME_PATH_EXEMPT_FILES.
-    Text is decoded as UTF-8 with errors replaced, so a non-UTF-8 file is still
+    including extensionless executables, after the same ``is_file()`` filter
+    ``scan()`` applies — a tracked symlink to a directory is not a file to
+    read and is not unreadable.  A file whose first 8 KiB contains a NUL byte
+    is binary and skipped, as is any file in HOME_PATH_EXEMPT_FILES.  Text is
+    decoded as UTF-8 with errors replaced, so a non-UTF-8 file is still
     scanned.  The verdict (allowed or not) is made inside the shared regex.
     Falls back to an os.walk of root
     when git is unavailable (scanning too much beats scanning nothing).
@@ -327,8 +420,10 @@ def scan_home_paths(root: Path, use_git: bool = True) -> list[tuple[str, int, st
         for dirpath, dirs, files in os.walk(root):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             tracked.extend(Path(dirpath) / f for f in files)
+    tracked = [f for f in tracked if f.is_file()]
 
     findings = []
+    unreadable_paths = []
     for fpath in tracked:
         rel = fpath.relative_to(root).as_posix()
         if rel in HOME_PATH_EXEMPT_FILES:
@@ -336,6 +431,7 @@ def scan_home_paths(root: Path, use_git: bool = True) -> list[tuple[str, int, st
         try:
             data = fpath.read_bytes()
         except OSError:
+            unreadable_paths.append(rel)
             continue
         if b"\x00" in data[:8192]:
             continue
@@ -343,7 +439,8 @@ def scan_home_paths(root: Path, use_git: bool = True) -> list[tuple[str, int, st
         for i, line in enumerate(text.splitlines(), 1):
             for m in _DISALLOWED_HOME_PATH_RE.finditer(line):
                 findings.append((rel, i, m.group(1).rstrip(".")))
-    return findings
+    unreadable_paths.sort()
+    return findings, unreadable_paths
 
 
 def main():
@@ -402,12 +499,33 @@ def main():
 
     all_patterns = COMMITTED_PATTERNS + personal_patterns
 
-    leaks, scanned, skipped_binary = scan(root, all_patterns)
+    report = scan(root, all_patterns)
+    leaks = report.findings
     # One greppable summary line, on clean and dirty runs alike: a clean result
     # says what it ranged over, so an empty finding list cannot hide a blind spot.
-    print(f"scan-leaks: scanned {scanned}, skipped-binary {skipped_binary}")
-    home_findings = scan_home_paths(root)
+    # FROZEN SHAPE: .github/workflows/name-leak-sweep.yml parses this line with
+    # an anchored regex and the release docs quote it.  New information goes on
+    # the lines below, never into this one.
+    print(f"scan-leaks: scanned {report.scanned}, skipped-binary {report.skipped_binary}")
+    if report.skipped_binary_paths:
+        print("scan-leaks: skipped-binary files: "
+              + format_paths(report.skipped_binary_paths))
+    home_findings, home_unreadable = scan_home_paths(root)
+    # The union is deduped by path: two passes over one file are one file.
+    unreadable = sorted(set(report.unreadable_paths) | set(home_unreadable))
+    if unreadable:
+        print(f"scan-leaks: unreadable {len(unreadable)} (coverage incomplete): "
+              + format_paths(unreadable))
+    coverage_incomplete = bool(unreadable) or report.candidates == 0
+    if report.candidates == 0:
+        print(f"scan-leaks: no coverage: 0 candidate files under {root}; "
+              "nothing was scanned")
     if not leaks and not home_findings:
+        if coverage_incomplete:
+            # A clean result that ranged over nothing (or over files it could
+            # not read) is not evidence of a clean tree.  Distinct from 1 so a
+            # caller can tell "dirty" from "did not look".
+            sys.exit(3)
         print(f"scan-leaks: clean ({root})")
         sys.exit(0)
 
