@@ -79,7 +79,7 @@ class TestServerVerifyOnly:
 
     def test_same_env_without_verify_only_still_exits_78_for_real(self, tmp_path):
         """The normal start is unchanged -- a real run, not a dry run."""
-        r = _server(tmp_path, {"FORUM_GITHUB_INTEGRATION": "on"})
+        r = _server(tmp_path, {"FORUM_GITHUB_INTEGRATION": "on"}, "--auth-mode", "enforce")
         assert r.returncode == 78, r.stdout + r.stderr
         assert "refusing to start" in r.stderr and "GH_TOKEN" in r.stderr
         assert NOT_CHECKED not in r.stderr

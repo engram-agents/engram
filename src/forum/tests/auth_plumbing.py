@@ -1,5 +1,7 @@
-"""TEST-ONLY plumbing for the #1459 auth guard. Lives under tests; production code has no
-switch that disables the guard.
+"""TEST-ONLY plumbing for the #1459 auth guard. Lives under tests. Production code has ONE
+setting, the process-start ``--auth-mode {report,enforce}`` (no default where the process
+starts; ``create_app`` defaults to ``enforce``), and nothing a request or the environment
+supplies changes it. This plumbing never touches that setting: it only attaches tokens.
 
 The server's one ``before_request`` guard refuses writes (and reads naming an agent)
 without a bearer token for that agent. Test suites that predate it call the Flask test

@@ -221,11 +221,22 @@ def test_cell4_valid_token_for_bob_naming_alice_is_403_and_recorded(owned_tmp):
 # 5 ------------------------------------------------------------------
 def test_cell5_tokenless_updates_read_is_served_and_recorded(owned_tmp):
     app = _make_app(owned_tmp)
-    r = app.test_client().get("/api/updates")
+    r = app.test_client().get("/api/updates?agent=alice")
     assert r.status_code == 200, r.get_data(as_text=True)
     (rec,) = _lines(owned_tmp)
     assert (rec["kind"], rec["verdict"], rec["named"], rec["route"], rec["token_agent"]) == (
-        "read", "absent", [], "GET /api/updates", None)
+        "read", "absent", ["alice"], "GET /api/updates", None)
+
+
+def test_cell5_tokenless_updates_read_naming_nobody_is_recorded_and_left_to_the_handler(owned_tmp):
+    """/api/updates is a token-required read that need not name an agent: the guard lets a
+    tokenless one through and records it; the handler's own 'agent is required' (400) is
+    what answers it, exactly as it does for a valid token that names nobody."""
+    app = _make_app(owned_tmp)
+    r = app.test_client().get("/api/updates")
+    assert r.status_code == 400 and r.get_json() == {"error": "agent is required"}
+    (rec,) = _lines(owned_tmp)
+    assert (rec["kind"], rec["verdict"], rec["named"]) == ("read", "absent", [])
 
 
 # 6 ------------------------------------------------------------------
@@ -825,6 +836,7 @@ def test_cell12_installer_renders_enforce_with_no_report_flags(owned_tmp):
 def test_template_carries_the_flags_as_a_placeholder_and_no_default_mode_text():
     text = _TEMPLATE.read_text(encoding="utf-8")
     assert "{{AUTH_MODE_ARGS}}" in text
+    text = text.replace("/health report backup age", "")  # pre-existing prose about /health
     assert not re.search(r"\b(report|enforce)\b", text, re.IGNORECASE), \
         "the template must hold no mode text; the installer renders the operator's choice"
 

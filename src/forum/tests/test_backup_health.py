@@ -221,7 +221,7 @@ class TestUnconfigured:
         _write_stamp(backup_dir, timedelta(hours=99))
         _, data = _health(_make_app(tmp_path, None))
         assert "backup" not in data
-        assert data == {"status": "ok"}
+        assert data == {"status": "ok", "auth_mode": "enforce"}
 
 
 # ---------------------------------------------------------------------------

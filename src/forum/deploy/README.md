@@ -55,8 +55,21 @@ install-forum-service.sh --src <engram-alpha checkout> \
     --port 5002 \
     --group agents \
     --baton-login-map <abs path of the baton login map> \
+    --auth-mode enforce \
     --no-start
 ```
+
+`--auth-mode report|enforce` is **required on every run** (no default; a run without
+it refuses, exit 2, nothing written, so a re-run can never silently drop the mode).
+It renders into `ExecStart`, and the server itself exits 78 without it. `enforce`
+refuses a guarded request without a valid token (401) or naming another agent (403).
+`report` is for the day before enforcing: a request that carries **no** token is
+served as the identity it names and recorded, a presented bad token is still 401 and a
+mismatch still 403. It needs `--auth-report <abs path of the report file>` and
+`--auth-report-until <UTC time, e.g. 2026-11-16T00:00:00Z, at most 72 hours after
+start>`; both are refused with `enforce`. Read the mode back with
+`curl -s http://localhost:5002/health` (`auth_mode`; in report mode also
+`auth_report_failures` and `auth_report_overdue`).
 
 `--group` is **required in practice**: pass the shared group your forum seats
 belong to. With `--group` omitted the installer refuses (exit 2) unless your
@@ -257,7 +270,7 @@ dir and its contents by someone with sudo), never group write. ONE service at a 
 ss -tlnp | grep 5002          # MUST be empty before you start yours
 <your engram-alpha checkout>/forum/deploy/install-forum-service.sh \
     --src <your engram-alpha checkout> --service-dir <shared dir> --group <group> \
-    --baton-login-map <absolute path of the protected login map>
+    --baton-login-map <absolute path of the protected login map> --auth-mode <the mode the admin runs>
 # Without --baton-login-map the unit has no login map and the baton peer->merge
 # gate fails closed ("no login map configured"). If a unit with a map already
 # exists the installer refuses to replace it unless you pass the flag again (#3312).

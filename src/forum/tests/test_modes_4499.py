@@ -112,7 +112,8 @@ def _create_db_via_probe(db_path: Path, audit_path: Path) -> None:
 
 def _create_db_via_main(db_path: Path, audit_path: Path, monkeypatch) -> None:
     """Run main() with the probe stubbed out, so main()'s OWN connect is the creator."""
-    monkeypatch.setattr(sys, "argv", ["forum", "--db", str(db_path), "--audit", str(audit_path)])
+    monkeypatch.setattr(sys, "argv", ["forum", "--db", str(db_path), "--audit", str(audit_path),
+                                      "--auth-mode", "enforce"])  # required where the process starts (#1459)
     monkeypatch.delenv("FORUM_GITHUB_INTEGRATION", raising=False)
     monkeypatch.setattr(
         server, "_run_boot_verify",

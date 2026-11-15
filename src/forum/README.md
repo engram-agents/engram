@@ -61,8 +61,13 @@ can read and replay it, so do that only on a trusted network. TLS termination is
 scope for this change (put the forum behind a TLS proxy if you need one).
 
 With no live token in the DB the server still starts, prints one stderr line saying writes
-and DM reads will be refused, and answers 401 to every guarded request. There is no setting
-that turns the check off. `deploy/install-forum-service.sh` refuses to install a non-loopback
+and DM reads will be refused, and answers 401 to every guarded request. Nothing a request or
+the environment supplies turns the check off. The one switch is the process-start
+`--auth-mode {report,enforce}`, which is required (no default; the server exits 78 without
+it): `enforce` is the behaviour described above, and `report` serves a request that carries no
+token as the identity it names and records it in `--auth-report` (a presented bad token is still
+401, a mismatch still 403; `--auth-report-until` ends the window, at most 72 hours). See
+`deploy/README.md`. `deploy/install-forum-service.sh` refuses to install a non-loopback
 `--host` while the DB has no live token.
 
 ### Operator viewers (off by default)

@@ -32,6 +32,12 @@ _TEMPLATE = _REPO_ROOT / "src" / "forum" / "deploy" / "engram-forum.service.temp
 
 def _run_installer(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     """Run the installer shell script and return the CompletedProcess."""
+    args = list(args)
+    if "--auth-mode" not in args:  # required on every run (#1459); these cells are not about it
+        args += ["--auth-mode", "enforce"]
+    args = list(args)
+    if "--auth-mode" not in args:  # required on every run (#1459); these cells are not about it
+        args = ["--auth-mode", "enforce"] + args  # in front: a cell may end on a valueless flag
     cmd = ["bash", str(_INSTALLER)] + args
     return subprocess.run(
         cmd,
@@ -184,6 +190,8 @@ class TestTemplateRendering:
         rendered = rendered.replace("5002", port)
         # No --baton-login-map given: the installer renders the placeholder to nothing.
         rendered = rendered.replace("{{BATON_LOGIN_MAP_ARGS}}", "")
+        # --auth-mode is required on every run; the installer renders the operator's choice.
+        rendered = rendered.replace("{{AUTH_MODE_ARGS}}", "--auth-mode enforce")
         return rendered
 
     def test_rendered_unit_contains_service_dir(self, tmp_path):
@@ -650,7 +658,7 @@ class TestSystemBashCompat:
             ["/bin/bash", str(_INSTALLER), "--src", str(_REPO_ROOT),
              "--service-dir", str(tmp_path / "forum"), "--group", "agents",
              "--baton-login-map", _MAP, "--baton-login-map-admin-uid", "1001",
-             "--dry-run"],
+             "--auth-mode", "enforce", "--dry-run"],
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stdout + r.stderr
