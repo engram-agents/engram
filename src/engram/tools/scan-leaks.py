@@ -671,13 +671,13 @@ def main():
     below) is not an Exception and passes through untouched.
     """
     try:
-        _run()
+        _scan_leaks_cli()
     except Exception as exc:
         print(f"scan-leaks: internal error: {type(exc).__name__}", file=sys.stderr)
         sys.exit(2)
 
 
-def _run():
+def _scan_leaks_cli():
     parser = argparse.ArgumentParser(description="Scan alpha for personal-info leaks")
     parser.add_argument("--root", default=None,
                         help="Root to scan (default: parent of tools/ dir, i.e., the alpha repo)")
