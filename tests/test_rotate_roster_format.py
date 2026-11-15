@@ -774,6 +774,108 @@ def test_stub_returning_all_a_classes_control_real_scanner_proceeds(tmp_path):
     assert (out / "roster-format2.txt").is_file()
 
 
+def test_stub_returning_too_few_entries_is_refused(tmp_path):
+    """A stub that refuses both probes but returns fewer entries than there
+    were produced lines has validated nothing: the entry COUNT check must
+    refuse it, not let a truncated result through to be written."""
+    stub = tmp_path / "short-count-scanner.py"
+    stub.write_text(
+        r'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return [(None, "stub", "A"), (None, "stub", "A")]
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+    assert len(BASE_ROSTER) == 3          # the stub returns one fewer
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "predates the two-class format" in combined, combined
+    assert "an unvalidated roster is never emitted" in combined, combined
+    # The message names nothing but the scanner path.
+    assert "\t" not in combined, combined
+    assert "\\b" not in combined, combined
+    assert "ZZProbeName" not in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_stub_returning_entries_too_short_to_index_is_refused(tmp_path):
+    """A stub returning the right NUMBER of entries whose entries are too
+    short to index ``entry[2]`` is not a validator either. The assertion is
+    the MESSAGE: an unguarded ``entry[2]`` raises IndexError, which also exits
+    non-zero, but with the internal-error text rather than this refusal."""
+    stub = tmp_path / "short-entry-scanner.py"
+    stub.write_text(
+        r'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return [(None, "stub"), (None, "stub"), (None, "stub")]
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "predates the two-class format" in combined, combined
+    assert "an unvalidated roster is never emitted" in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_stub_returning_exactly_what_was_produced_proceeds(tmp_path):
+    """Control for the two cells above: a stub that refuses both probes and
+    returns exactly the produced classes (A, A, B) proceeds and writes the
+    file. Without it, "refused" is indistinguishable from "refuses
+    everything"."""
+    stub = tmp_path / "exact-scanner.py"
+    stub.write_text(
+        r'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return [(None, "stub", klass) for klass in ("A", "A", "B")]
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (out / "roster-format2.txt").is_file()
+
+
 # ---------------------------------------------------------------------------
 # R2 -- the probe token is fresh per run
 # ---------------------------------------------------------------------------
