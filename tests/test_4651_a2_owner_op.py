@@ -1376,6 +1376,29 @@ def test_k3_a_raising_readback_is_recorded_and_a_same_id_retry_replays_it_withou
     assert not any(s.startswith("BEGIN") for s in stmts), stmts
 
 
+@requires_linux_owner
+def test_k3_a_keyboard_interrupt_from_the_readback_still_records_the_committed_outcome(owner, home):
+    """The scaffold records an outcome only when the handler RETURNS one (`after`); a non-Exception raised by the
+    read-back propagates instead, so the inner `record(unverified)` is the only recorder on that path. Mutant: that
+    inner record is dropped (the ordinary-exception cell above stays green, because `after` records there)."""
+    real = owner._publish_prepared_readback
+
+    def interrupt(*_a, **_k):
+        raise KeyboardInterrupt()
+
+    owner._publish_prepared_readback = interrupt
+    params = make_params(home, ["p0"])
+    with pytest.raises(KeyboardInterrupt):
+        owner._handle_publish_prepared_embeddings(params, time.monotonic() + 10, "rid-k3-ki")
+    assert state(home, "p0")[0] == json.dumps(params["items"][0]["vector"])  # the commit stands
+    assert not owner._owner_conn.in_transaction
+    owner._publish_prepared_readback = real
+    sql(home, "UPDATE nodes SET embedding = ? WHERE id = 'p0'", (json.dumps(vec(9.0)),))
+    again = refused(call(owner, params, rid="rid-k3-ki"), "readback_mismatch")  # replayed, not re-run
+    assert again.commit == "committed_unverified"
+    assert state(home, "p0")[0] == json.dumps(vec(9.0))
+
+
 # ---- K4: the dedupe store is bounded ---------------------------------------------------------------------------------
 
 @requires_linux_owner
