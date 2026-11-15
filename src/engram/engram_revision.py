@@ -5,7 +5,10 @@ Extracted from server.py as part of #872 wave 6.
 Family E covers the transactional retraction-cascade invariant — the most
 delicate wave.  Moved atomically per D6 ("never split _walk_cascade_downstream
 from its callers"): all three cascade helpers and all three impls ship together
-in one commit.
+in one commit.  Since #4727 the walker itself, and the two-step walk from a
+root (``_walk_cascade_from_root``), live in engram_core so a migration rung
+there can run the same walk; every caller here moved to the helper in one
+commit, which keeps D6's atomicity.
 
 NOTE: module name ``engram_revision`` was chosen because the three obvious
 alternatives collide with @mcp.tool function names in server.py:
