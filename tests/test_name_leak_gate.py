@@ -764,6 +764,10 @@ def _run_with_attestation(gate_repo, tmp_path, *, count, sha):
         pytest.param(5, "0" * 64, False, "failure", id="hash-mismatch-count-differs"),
         pytest.param(1, _ROSTER_ONE_PATTERN_SHA, False, "success", id="hash-match-count-equal"),
         pytest.param(1, "0" * 64, False, "failure", id="hash-mismatch-count-equal"),
+        # isinstance(True, int) is True in Python, so a bare isinstance guard
+        # accepts JSON `true` as a valid count. The attestation schema says an
+        # integer; a bool is not one, and it must fail closed.
+        pytest.param(True, _ROSTER_ONE_PATTERN_SHA, False, "failure", id="bool-count"),
         pytest.param(None, None, False, "failure", id="attestation-absent"),
     ],
 )

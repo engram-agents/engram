@@ -2318,6 +2318,38 @@ def test_cell6_class_b_hit_prints_per_line_and_does_not_block(tmp_path):
     assert "doc.md" not in out_a, out_a
 
 
+def test_cell6b_class_b_only_with_incomplete_coverage_exits_3(tmp_path):
+    """Cell 6b (§2.4): a class-B-only run over an incomplete tree still exits 3
+    and still prints its class-B count, with the class-A count 0.
+
+    `test_cell6_class_b_hit_prints_per_line_and_does_not_block` is the paired
+    control: the same B-only shape over a FULLY readable tree exits 0. The
+    contract: "did not look" is never a green tick, but a class-B hit must not
+    turn an incomplete run into exit 1 either — class B is report-only, so the
+    coverage verdict is what governs. The missing path is a tracked file
+    deleted from the worktree (portable: no chmod, no root skip).
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {
+        "doc.md": f"hello {_C2_NAME} world\n",
+        "gone.txt": "clean\n",
+    })
+    (root / "gone.txt").unlink()  # tracked, absent from the worktree
+
+    roster = _format2_roster(tmp_path, "B\t" + _C2_NAME + "\n")
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 3, out
+    # Both counts print: class B is non-zero, class A is zero.
+    assert "0 class-A (blocking) and 1 class-B (report-only) hit(s)" in r.stderr, out
+    # The class-B hit keeps its per-line form and the coverage hole is named.
+    assert "doc.md:1" in r.stderr, out
+    assert _MISSING_LINE_RE.search(r.stdout), r.stdout
+    assert "gone.txt" in r.stdout, r.stdout
+
+
 def test_cell7_format_1_roster_is_refused_not_reclassified(tmp_path):
     """Cell 7: a valid-looking plain regex list is refused with the prefix
     instruction; never silently reclassified to A."""
@@ -2426,9 +2458,10 @@ def test_cell9c_home_path_finding_is_class_a_without_a_roster_line(tmp_path):
     assert "segment:" not in out, out
 
 
-def test_cell13_class_a_wins_on_a_shared_line(tmp_path):
-    """Cell 13 (blocker): a line holding BOTH a class-B and a class-A name,
-    with the B roster line FIRST, is class A.
+@pytest.mark.parametrize("class_order", ["b-line-first", "a-line-first"])
+def test_cell13_class_a_wins_on_a_shared_line(tmp_path, class_order):
+    """Cell 13 (blocker): a line holding BOTH a class-B and a class-A name is
+    class A in EITHER roster order.
 
     The fail-open this pins, measured on the first build: the scan loop broke
     on the first matching pattern, so a B line listed before an A line masked
@@ -2437,14 +2470,20 @@ def test_cell13_class_a_wins_on_a_shared_line(tmp_path):
     contract: every pattern is evaluated; any class-A match makes the line
     class A (first A match's label); only when no A pattern matches does the
     first match determine the label. One finding per line is preserved.
+
+    BOTH orders are required (Borges): the bug is an ORDERING bug, so a
+    single-order cell passes on a scanner that is still order-dependent in
+    the other direction. The B-first arm catches first-match-wins; the
+    A-first arm catches last-match-wins. Each arm fails alone under its own
+    mutation, so neither order is redundant.
     """
     root = tmp_path / "root"
     root.mkdir()
     _commit_files(root, {"doc.md": f"hello {_C2_OTHER} and {_C2_NAME}\n"})
-    roster = _format2_roster(
-        tmp_path,
-        "B\t" + _C2_OTHER + "\n" + "A\t\\b" + _C2_NAME + "\\b\n",
-    )
+    lines = ["B\t" + _C2_OTHER, "A\t\\b" + _C2_NAME + "\\b"]
+    if class_order == "a-line-first":
+        lines.reverse()
+    roster = _format2_roster(tmp_path, "\n".join(lines) + "\n")
 
     r = _run_with_roster(root, roster)
     out = r.stdout + r.stderr

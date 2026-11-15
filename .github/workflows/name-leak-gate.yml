@@ -220,10 +220,13 @@ jobs:
               attested_sha = attestation.get("roster_sha256")
               # A valid attestation has schema 1, an integer pattern count and
               # a 64-hex whole-file sha256. Anything else is "not present": a
-              # malformed or unset attestation must fail, never pass.
+              # malformed or unset attestation must fail, never pass. The
+              # explicit bool guard is load-bearing: isinstance(True, int) is
+              # True in Python, so JSON `true` would otherwise pass as a count.
               if (
                   attestation.get("roster_format") == 1
                   and isinstance(attested_count, int)
+                  and not isinstance(attested_count, bool)
                   and isinstance(attested_sha, str)
                   and re.fullmatch(r"[0-9a-f]{64}", attested_sha) is not None
               ):
