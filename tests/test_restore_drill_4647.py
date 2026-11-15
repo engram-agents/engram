@@ -1569,6 +1569,47 @@ def test_d21_r17_the_capture_stamp_is_read_before_the_backup_not_after(home, mon
     assert stats["dumped_at"] == "2026-06-01T00:00:01.000000Z"  # the first reading, not a later one
 
 
+def _later_clock(monkeypatch, bk):
+    """Every way the module can read the clock now answers a DIFFERENT, later instant, and ticks per read."""
+    import datetime as dt
+    reads = []
+
+    class _Later(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            reads.append("datetime.now")
+            return dt.datetime(2099, 1, 1, 0, 0, len(reads) % 60, tzinfo=dt.timezone.utc)
+
+    monkeypatch.setattr(bk, "datetime", _Later)
+    return reads
+
+
+def test_d21_r17w_the_written_marker_is_the_captured_value_not_a_fresh_clock_read(home, monkeypatch):
+    """The marker LINE is the value captured/passed in: a writer that re-reads the clock when it writes (stamped
+    right at capture, wrong on disk) is red. The clock is moved to a different instant before the write."""
+    bk = rd.engram_backup
+    given = "2026-06-01T00:00:07.000000Z"
+    reads = _later_clock(monkeypatch, bk)
+    out = home / "given.sql"
+    stats = bk.dump_stripped(str(home / "knowledge.db"), str(out), dumped_at=given)
+    assert out.read_text(encoding="utf-8").splitlines()[0] == _MARKER_LINE + " " + given
+    assert stats["dumped_at"] == given
+    assert reads == [], "a given dumped_at must not touch the clock at all"
+    # dumped_at=None: the marker is the ONE clock read taken before the backup, however often the clock ticks
+    ticks = iter(range(1, 100))
+
+    def clock(epoch=None):
+        return f"2026-06-01T00:00:{next(ticks):02d}.000000Z"
+
+    monkeypatch.setattr(bk, "format_dump_time", clock)
+    out2 = home / "none.sql"
+    stats2 = bk.dump_stripped(str(home / "knowledge.db"), str(out2))
+    first = out2.read_text(encoding="utf-8").splitlines()[0]
+    assert first == _MARKER_LINE + " " + "2026-06-01T00:00:01.000000Z"
+    assert stats2["dumped_at"] == "2026-06-01T00:00:01.000000Z"
+    assert reads == [], "the writer must not read the datetime clock either"
+
+
 def test_d21_r4_a_resolved_by_move_between_values_needs_a_resolution_status_live(tmp_path):
     h = make_home(tmp_path, "h")
     _dump_with(h, "UPDATE nodes SET status='resolved', resolved_by='ob_0002' WHERE id='ob_0001'")
