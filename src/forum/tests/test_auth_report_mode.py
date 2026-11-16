@@ -1534,3 +1534,134 @@ def test_i3_installer_refuses_a_past_until_with_exit_78_one_line_and_writes_noth
     assert len(lines) == 1 and "--auth-report-until" in lines[0] and "past" in lines[0], r.stderr
     assert "rendered unit begin" not in r.stdout
     assert not (owned_tmp / "forum").exists()
+
+
+# ---- delta 5: caller-supplied names in the report column -----------------------------------
+# A name a caller supplies is written with `<` as `&lt;` and `"` as `&quot;`, so it can never
+# equal or imitate one of the server's own markers; the request is served exactly as before.
+_MARKER_INPUTS = ["<more> n=3", "<invalid-name> len=5", "<too-long> len=9"]
+_MARKER_IDS = ["more", "invalid-name", "too-long"]
+_SERVER_MARKERS = (b'"<more> n=', b'"<invalid-name> len=', b'"<too-long> len=')
+
+
+def _esc(name: str) -> str:
+    return name.replace("<", "&lt;").replace('"', "&quot;")
+
+
+def _q(name: str) -> str:
+    from urllib.parse import quote
+    return quote(name, safe="")
+
+
+@pytest.mark.parametrize("how", ["read", "write"])
+@pytest.mark.parametrize("name", _MARKER_INPUTS, ids=_MARKER_IDS)
+def test_f1_a_marker_shaped_caller_name_is_written_escaped_and_the_request_is_unchanged(
+        owned_tmp, name, how):
+    app = _make_app(owned_tmp)
+    c = app.test_client()
+
+    def call(n):
+        if how == "read":
+            return c.get(f"/api/updates?agent={_q(n)}")
+        return c.post("/api/post", json=dict(POST_BODY, agent=n))
+
+    r_marker = call(name)
+    r_plain = call("zed")  # positive control: a plain name is written as it always was
+    recs = _lines(owned_tmp)
+    assert len(recs) == 2
+    marker_rec, plain_rec = recs
+    # (1) the written entry is the escaped form, byte-checked in the file
+    assert marker_rec["named"] == [_esc(name)] and _esc(name) != name
+    data = _bytes(owned_tmp)
+    assert _esc(name).encode("ascii") in data
+    for m in _SERVER_MARKERS:
+        assert m not in data, m
+    # (2) the outcome AND the status are what a plain name gets
+    assert (marker_rec["verdict"], marker_rec["outcome"], marker_rec["kind"]) == (
+        "absent", "proceeded", plain_rec["kind"])
+    assert (plain_rec["verdict"], plain_rec["outcome"]) == ("absent", "proceeded")
+    assert r_marker.status_code == r_plain.status_code, (
+        r_marker.status_code, r_plain.status_code)
+    # (3) a plain name is byte-identical to today
+    assert plain_rec["named"] == ["zed"]
+
+
+@pytest.mark.parametrize("name", _MARKER_INPUTS, ids=_MARKER_IDS)
+def test_f1_a_marker_shaped_name_counts_as_one_entry_toward_the_cap(owned_tmp, name):
+    seven = [f"n{i}" for i in range(7)]
+    got, _ = _names_line(owned_tmp, seven + [_q(name)])
+    assert got == seven + [_esc(name)]
+    (owned_tmp / "b").mkdir()
+    eight = [f"n{i}" for i in range(8)]
+    got, _ = _names_line(owned_tmp / "b", eight + [_q(name)])
+    assert got == eight + ["<more> n=1"]
+
+
+def test_f1_a_genuine_server_marker_is_still_written_unescaped(owned_tmp):
+    forged = "<more> n=3"
+    names = [_q(forged)] + [f"n{i}" for i in range(9)]  # 10 distinct: 8 kept, 2 over
+    got, _ = _names_line(owned_tmp, names)
+    assert got == [_esc(forged)] + [f"n{i}" for i in range(7)] + ["<more> n=2"]
+    assert b'"<more> n=2"' in _bytes(owned_tmp)
+    (owned_tmp / "b").mkdir()
+    app = _make_app(owned_tmp / "b")
+    app.test_client().get(f"/api/updates?agent={HOSTILE_Q}")
+    (rec,) = _lines(owned_tmp / "b")
+    assert rec["named"] == [invalid_name(HOSTILE_LEN)]
+    assert b'"<invalid-name> len=' in _bytes(owned_tmp / "b")
+    (owned_tmp / "c").mkdir()
+    app = _make_app(owned_tmp / "c")
+    app.test_client().get(f"/api/updates?agent={'a' * 129}")
+    assert _lines(owned_tmp / "c")[0]["named"] == ["<too-long> len=129"]
+    assert b'"<too-long> len=129"' in _bytes(owned_tmp / "c")
+
+
+def test_f1_a_name_with_a_double_quote_only_is_escaped(owned_tmp):
+    app = _make_app(owned_tmp)
+    r = app.test_client().get(f"/api/updates?agent={_q('a\"b')}")
+    assert r.status_code != 401
+    (rec,) = _lines(owned_tmp)
+    assert rec["named"] == ["a&quot;b"]
+    data = _bytes(owned_tmp)
+    assert b"a&quot;b" in data and b'a\\"b' not in data
+
+
+def test_f1_every_name_of_a_line_is_escaped_not_only_the_first(owned_tmp):
+    got, _ = _names_line(owned_tmp, ["plain", _q("<a>"), _q("x<y"), _q('q"')])
+    assert got == ["plain", "&lt;a>", "x&lt;y", "q&quot;"]
+
+
+def test_f1_the_cap_counts_the_written_form_so_a_128_name_with_a_bracket_is_a_marker(owned_tmp):
+    name = "<" + "a" * 127  # 128 characters as typed, 131 as written
+    got, _ = _names_line(owned_tmp, [_q(name)])
+    assert got == ["<too-long> len=131"]
+    assert b"&lt;aaaa" not in _bytes(owned_tmp)
+
+
+def test_f1_a_plain_name_with_an_ampersand_is_unchanged(owned_tmp):
+    got, _ = _names_line(owned_tmp, [_q("a&b")])
+    assert got == ["a&b"]
+
+
+# ---- delta 5: --verify-only binds nothing, so it takes the serving flags and an until ----
+
+def test_f3_verify_only_with_the_serving_flags_and_an_until_is_not_refused(
+        tmp_path, monkeypatch, capsys):
+    booted, ran = _argv(tmp_path, monkeypatch, [
+        "--verify-only", "--host", "127.0.0.1", "--port", "5099",
+        "--auth-mode", "report", "--auth-report", str(tmp_path / "r.jsonl"),
+        "--auth-report-until", _ts_until(1)])
+    server_mod.main()
+    assert booted == [1] and len(ran) == 1
+    assert ran[0].config["AUTH_MODE"] == "enforce"
+    assert ran[0].config["AUTH_REPORT_UNTIL"] is None
+    err = capsys.readouterr().err
+    assert "--auth-report" not in err and "refusing" not in err, err
+
+
+def test_f3_a_serving_run_with_a_bad_until_is_still_refused(tmp_path, monkeypatch, capsys):
+    line = _refuses(tmp_path, monkeypatch, capsys, [
+        "--host", "127.0.0.1", "--port", "5099",
+        "--auth-mode", "report", "--auth-report", str(tmp_path / "r.jsonl"),
+        "--auth-report-until", _ts_until(73)])
+    assert "--auth-report-until" in line and "72" in line
