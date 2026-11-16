@@ -2327,6 +2327,19 @@ def _net_events(log: Path) -> list[str]:
     return log.read_text().splitlines() if log.exists() else []
 
 
+def _loaded_argv0s(loaded: Path) -> list[str]:
+    return loaded.read_text().splitlines() if loaded.exists() else []
+
+
+def _assert_hook_loaded_in_the_run_own_process(loaded: Path) -> None:
+    """S1: the planted-call control proves the hook loads in a plain python, not in the bootstrap the
+    run itself started. The hook writes one line (argv0) per python process that loads it; the run's
+    own process is bootstrap.py."""
+    lines = _loaded_argv0s(loaded)
+    assert any(ln.endswith("bootstrap.py") for ln in lines), (
+        "the audit hook never loaded in the run's own bootstrap process; loaded in: %r" % lines)
+
+
 def _assert_audit_hook_sees_a_planted_call(run_env: dict[str, str], log: Path) -> None:
     """Positive control: a planted getaddrinfo, run under the SAME env dict the bootstrap run was
     given (its PYTHONPATH included), is logged by the hook. Without it a zero count proves nothing
@@ -2352,7 +2365,7 @@ def test_real_bootstrap_installer_cell_makes_no_network_call(tmp_path, tmp_path_
     """#4795 A1: install.sh over the REAL bootstrap seeds a graph; seeding must not download the
     embedding model (a temp HOME has no cache)."""
     monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)  # CI sets it for the whole run; the cell must not lean on that
-    audit_dir, log = _net_audit(tmp_path_factory.mktemp("net-audit"))
+    audit_dir, log, loaded = _net_audit(tmp_path_factory.mktemp("net-audit"))
     sb = _installer_with_real_bootstrap(tmp_path)
     run_env = {"PYTHONPATH": str(audit_dir)}
     r = sb.run("--yes", env=run_env)
@@ -2360,17 +2373,33 @@ def test_real_bootstrap_installer_cell_makes_no_network_call(tmp_path, tmp_path_
     assert _graph_nodes(sb.engram) > 0, "the real bootstrap did not seed a graph, so a zero proves nothing"
     events = _net_events(log)
     assert events == [], f"the real-bootstrap installer run made {len(events)} network events: {events[:3]}"
+    _assert_hook_loaded_in_the_run_own_process(loaded)
     _assert_audit_hook_sees_a_planted_call(run_env, log)
 
 
 def test_a_seeding_bootstrap_run_makes_no_network_call(tmp_path, tmp_path_factory, monkeypatch):
     """#4795 A2: one `_run_env` bootstrap run into a fresh home (it seeds) makes no network call."""
     monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)
-    audit_dir, log = _net_audit(tmp_path_factory.mktemp("net-audit"))
+    audit_dir, log, loaded = _net_audit(tmp_path_factory.mktemp("net-audit"))
     run_env = {"PYTHONPATH": str(audit_dir)}
     r = _run_env(tmp_path, extra_env=run_env)
     assert r.returncode == 0, _text(r)
     assert _graph_nodes(tmp_path / ".engram") > 0, "bootstrap did not seed a graph, so a zero proves nothing"
     events = _net_events(log)
     assert events == [], f"a seeding bootstrap run made {len(events)} network events: {events[:3]}"
+    _assert_hook_loaded_in_the_run_own_process(loaded)
     _assert_audit_hook_sees_a_planted_call(run_env, log)
+
+
+def test_the_loaded_log_has_a_bootstrap_line_only_when_the_hook_is_on_pythonpath(tmp_path, tmp_path_factory):
+    """S1 unit cell (a tiny python child, not the installer): with the hook NOT on PYTHONPATH no line
+    reaches the loaded log; with it, a line whose argv0 ends with bootstrap.py does."""
+    _audit_dir, _log, loaded = _net_audit(tmp_path_factory.mktemp("net-audit"))
+    child = tmp_path / "bootstrap.py"
+    child.write_text("pass\n")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    subprocess.run([sys.executable, str(child)], env=env, check=True, capture_output=True, timeout=60)
+    assert not any(ln.endswith("bootstrap.py") for ln in _loaded_argv0s(loaded)), _loaded_argv0s(loaded)
+    subprocess.run([sys.executable, str(child)], env={**env, "PYTHONPATH": str(_audit_dir)},
+                   check=True, capture_output=True, timeout=60)
+    assert any(ln.endswith("bootstrap.py") for ln in _loaded_argv0s(loaded)), _loaded_argv0s(loaded)

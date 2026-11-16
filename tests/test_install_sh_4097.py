@@ -1222,3 +1222,29 @@ def test_sandbox_run_sets_the_embedding_opt_out_by_default_and_a_caller_can_over
         assert out.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
         seen[label] = out.read_text()
     assert seen == {"default": "1", "override": "0"}, seen
+
+
+def test_sandbox_run_timeout_is_bounded_when_a_descendant_left_the_group_holding_the_pipes(tmp_path):
+    """#4795 review S2: a descendant that left the process group (setsid) and holds stdout/stderr must
+    not block the timeout path on pipe EOF; the old subprocess.run(timeout=2) returned in 2 s."""
+    sb = Sandbox(tmp_path)
+    pidfile = tmp_path / "escaper.pid"
+    _write(sb.plugin_src / "bootstrap.py", (
+        "import subprocess, time\n"
+        "p = subprocess.Popen(['sleep', '20'], start_new_session=True)\n"
+        "open(%r, 'w').write(str(p.pid))\n"
+        "time.sleep(60)\n" % str(pidfile)
+    ), 0o644)
+    try:
+        started = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            sb.run("--yes", timeout=2)
+        elapsed = time.monotonic() - started
+        assert pidfile.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
+        assert elapsed < 10, "the timeout path took %.1fs: it waited on a descendant holding the pipes" % elapsed
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
