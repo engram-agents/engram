@@ -1168,6 +1168,50 @@ def load_roster_file(path):
     return stub
 
 
+def _case_changed_echo_refusal_scanner(tmp_path: Path, echo_case: str) -> Path:
+    """A parser that refuses the probes and the produced roster, echoing the
+    first produced line's BARE NAME KEY in a different case to stderr.
+
+    ``echo_case`` is ``"lower"`` or ``"upper"``. Both must be withheld: a
+    guard that folds the key but not the text it is matched against catches
+    the lowercased echo (already folded by accident) and lets the uppercased
+    one through.
+    """
+    stub = tmp_path / f"{echo_case}case-echo-refusal-scanner.py"
+    stub.write_text(
+        r'''
+import sys
+
+
+def _declares_boundary(pattern):
+    return True
+
+
+def _key_parts(text):
+    key = text.strip()
+    if key.startswith("(?i)"):
+        key = key[4:]
+    if key.startswith("\\b") and key.endswith("\\b"):
+        key = key[2:-2]
+    return key.strip()
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    pattern = lines[0].split("\t", 1)[1]
+    sys.stderr.write(
+        "scan-leaks: roster line 1 refuses: " + _key_parts(pattern).{case}() + "\n")
+    raise SystemExit(2)
+'''.lstrip().replace("{case}", echo_case),
+        encoding="utf-8",
+    )
+    return stub
+
+
 def _ordinary_refusal_scanner(tmp_path: Path) -> Path:
     """A parser that refuses the probes and the produced roster with an
     ordinary message carrying no pattern text."""
@@ -1248,6 +1292,67 @@ def test_parser_refusal_carrying_only_a_bare_name_key_is_withheld(tmp_path):
     assert "parser refused (exit 2)" in combined, combined
     assert "withheld because it contained roster text" in combined, combined
     assert A_ONE not in combined, "a produced name key reached the operator"
+    assert list(out.iterdir()) == []
+
+
+@pytest.mark.parametrize("echo_case", ["lower", "upper"])
+def test_parser_refusal_carrying_a_case_changed_name_key_is_withheld(
+    tmp_path, echo_case,
+):
+    """A parser that echoes a produced line's bare name key in a different
+    case -- lowercased or uppercased -- still carries name text. A
+    case-sensitive name-key test passes it straight to the operator, and a
+    one-sided fold (the key folded, the text not) catches only the lowercase
+    echo; the case-insensitive form on both sides must withhold it whole."""
+    stub = _case_changed_echo_refusal_scanner(tmp_path, echo_case)
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    echoed_key = A_ONE.lower() if echo_case == "lower" else A_ONE.upper()
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "parser refused (exit 2)" in combined, combined
+    assert "withheld because it contained roster text" in combined, combined
+    assert echoed_key not in combined, (
+        "a case-changed name key reached the operator"
+    )
+    assert A_ONE not in combined, "a produced roster pattern reached the operator"
+    assert list(out.iterdir()) == []
+
+
+@pytest.mark.parametrize("echo_case", ["lower", "upper"])
+def test_parser_refusal_carrying_a_case_changed_inline_flag_name_is_withheld(
+    tmp_path, echo_case,
+):
+    """The ``(?i)`` B shape is where case differs naturally: the roster line is
+    ``(?i)\\bYYBRAVOHANDLE\\b`` and its permitted name is ``yybravohandle``, so
+    a parser echoing the name in either case prints a literal that differs
+    from the pattern's own text. Neither the whole pattern nor the
+    case-sensitive name key matches; the case-insensitive form on both sides
+    must still withhold it whole."""
+    stub = _case_changed_echo_refusal_scanner(tmp_path, echo_case)
+    roster, bnames, out = _scratch(
+        tmp_path,
+        [r"(?i)\b" + B_ONE.upper() + r"\b"],
+        [B_ONE.lower()],
+    )
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    echoed_key = B_ONE.lower() if echo_case == "lower" else B_ONE.upper()
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "parser refused (exit 2)" in combined, combined
+    assert "withheld because it contained roster text" in combined, combined
+    assert echoed_key not in combined, (
+        "a case-changed name key reached the operator"
+    )
+    assert B_ONE.upper() not in combined, (
+        "the pattern's name text reached the operator"
+    )
     assert list(out.iterdir()) == []
 
 
