@@ -500,6 +500,12 @@ MODE_AWARE = {
     "tools/engramd_batch_a_acceptance.py": (
         "explicit chmod 0o644 on the --report output; a report path inside the live ENGRAM home is refused"
     ),
+    "src/engram/tools/secret-put": (
+        "explicit os.fchmod 0o600 on the temp before os.replace: the mode is set per callsite rather than preserved, "
+        "because the store's invariant is 0600 always and preserving a destination's old mode (or a named ACL entry on "
+        "it) is the failure, not the fix; the temp is staged inside secrets/ so it inherits no foreign or default ACL, "
+        "and the folder is re-checked after the write"
+    ),
     "tools/forum_backup.py": (
         "hand-written tmp + os.replace (no mkstemp, so G1's scan does not reach it): the temp is opened "
         "0o640 and fchmod'd BEFORE the rename for forum.sql and .last-success.json (#4499 B1)"
