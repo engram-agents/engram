@@ -958,3 +958,25 @@ def test_f2_a_lone_unselected_file_is_unreferenced_beside_a_forum_universe(tmp_p
     assert rc == 0
     d = json.loads(out)
     assert d["unreferenced"] == ["notes.md"] and d["forum_selected"] == []
+
+
+def test_f2_a_forum_tree_file_no_test_references_is_still_unreferenced(tmp_path, capsys):
+    # The filter drops what the forum universe SELECTED, not everything under
+    # src/forum/: an orphan forum module no forum test and no tests/ test names
+    # must still be reported (a path-prefix filter would silently hide it).
+    repo = _forum_repo(tmp_path)
+    (Path(repo) / "src/forum/orphan.py").write_text("O = 1\n")
+    changed = ["src/forum/orphan.py"]
+
+    def run(mode):
+        with mock.patch.object(_runner, "guard_set", return_value=([], [])), \
+             mock.patch.object(_runner, "_changed_files", return_value=changed):
+            return _main([*mode, "--base", "HEAD", "--repo-root", repo], capsys)
+
+    rc, out, _e = run(["--json"])
+    assert rc == 0
+    d = json.loads(out)
+    assert d["unreferenced"] == ["src/forum/orphan.py"] and d["forum_selected"] == []
+    rc, out, _e = run(["--dry-run"])
+    line = next(l for l in out.splitlines() if l.startswith("[unreferenced]"))
+    assert "src/forum/orphan.py" in line
