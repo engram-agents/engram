@@ -308,6 +308,7 @@ def test_d_viz_server_py_does_not_stop_the_walk(site, flavour, tmp_path):
 def test_e_no_marker_searches_own_dir_and_parent_only(site, flavour, tmp_path):
     if site.marker_is_target:
         pytest.skip("the marker is the target: covered by cell (b)")
+    _skip_if_marker_above(tmp_path)   # #4625: the no-marker layout needs none above tmp_path
     lay = build_layout(tmp_path, flavour, site, with_marker=False)
     near = lay.file_dir if site.kind != "root" else lay.root
     parent_dir = near.parent
@@ -386,6 +387,7 @@ def _copies():
 def test_every_local_copy_of_bounded_parents_behaves_identically(tmp_path):
     copies = _copies()
     assert len(copies) >= 8, sorted(copies)
+    _skip_if_marker_above(tmp_path)   # #4625: the bare layout below needs none above tmp_path
     marked = tmp_path / "a" / "root"
     (marked / "x" / "y").mkdir(parents=True)
     (marked / MARKER).write_text("")
@@ -445,6 +447,35 @@ def test_every_copy_skips_an_unreadable_ancestor_and_keeps_walking(tmp_path, mon
 #   C6 several markers above: the message names the NEAREST.
 #   C7 end to end in a subprocess with ``TMPDIR`` holding a marker.
 
+def _marker_above(path):
+    """The nearest ancestor STRICTLY above ``path`` holding an entry named
+    ``engram_core.py`` (a file or a symlink, even a dangling one), else None.
+    Never raises: an ancestor that cannot be read is skipped and the walk goes on."""
+    for ancestor in Path(path).parents:
+        try:
+            os.lstat(ancestor / MARKER)
+        except OSError:
+            continue    # absent, or unreadable: no marker we can name here
+        return ancestor
+    return None
+
+
+def _precondition_message(path):
+    """The reason the no-marker layout cannot be built under ``path``, or None."""
+    above = _marker_above(path)
+    if above is None:
+        return None
+    return (f"a tree-root marker {MARKER} sits above this test's temp folder at "
+            f"{above / MARKER}; the no-marker layout cannot be built here")
+
+
+def _skip_if_marker_above(path):
+    msg = _precondition_message(path)
+    if msg:
+        pytest.skip(msg)
+
+
+_REAL_LSTAT = os.lstat
 _FAKE = "/zz-fake-root"   # a path that exists nowhere: the unit cells never touch the host's tree
 
 
@@ -452,7 +483,7 @@ def _fake_fs(monkeypatch, present=(), unreadable=()):
     """Make ``os.lstat`` answer for the named paths only: ``present`` exist,
     ``unreadable`` raise PermissionError, everything else is absent.  The unit
     cells use it so they hold whatever sits above the real temp folder."""
-    real = os.lstat
+    real = _REAL_LSTAT
     present, unreadable = {str(p) for p in present}, {str(p) for p in unreadable}
 
     def lstat(p, *a, **kw):
