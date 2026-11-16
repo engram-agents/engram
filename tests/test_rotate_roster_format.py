@@ -1022,6 +1022,53 @@ def load_roster_file(path):
     assert list(out.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    "returned_classes",
+    [
+        pytest.param(("A", "A", "A"), id="produced-B-line-says-A"),
+        pytest.param(("A", "A"), id="one-entry-short"),
+    ],
+)
+def test_stub_returning_bad_entries_in_format_int_tuple_is_refused(
+    tmp_path, returned_classes
+):
+    """The ``(entries, 2)`` pair must not short-circuit validation of the
+    entries. A parser that reports format 2 and then returns the right NUMBER
+    of entries with one class wrong, or too FEW entries, has validated
+    nothing and must be refused exactly as the bare-entries shapes are.
+
+    The assertion is the MESSAGE: an unchecked ``entry[2]`` raises IndexError
+    (also non-zero) rather than this refusal, so the exit code alone would not
+    tell the guard firing from a crash inside it."""
+    stub = tmp_path / "bad-pair-scanner.py"
+    stub.write_text(
+        rf'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return ([(None, "stub", klass) for klass in {returned_classes!r}], 2)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "predates the two-class format" in combined, combined
+    assert "an unvalidated roster is never emitted" in combined, combined
+    assert list(out.iterdir()) == []
+
+
 # ---------------------------------------------------------------------------
 # R1 -- captured parser stderr: withheld when it carries a produced pattern
 # ---------------------------------------------------------------------------
