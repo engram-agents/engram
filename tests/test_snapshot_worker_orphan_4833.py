@@ -292,3 +292,25 @@ def test_no_test_or_src_file_clears_a_worker_token():
                     hits.append(f"{p.relative_to(_REPO_ROOT)}:{n}: {line.strip()}")
     assert scanned > 100, f"scan looked at only {scanned} files"
     assert hits == [], "a stop token must never be cleared (#4833):\n" + "\n".join(hits)
+
+
+# ── Cell 7 (per-job stop check; Clio's colleague read, mutant M3) ───────────
+def test_drain_stops_before_the_next_job_once_the_token_is_set(monkeypatch):
+    """With two pending jobs and the worker's token set DURING the first, the second
+    job must not run: an orphan exits after at most the job it is in, also for a
+    queue of 2+ jobs. Mutation: drop the per-job token check in _drain_pending ->
+    both jobs run -> red."""
+    token = threading.Event()
+    jobs = [{"type": "job", "turn": 1, "seq": 1}, {"type": "job", "turn": 2, "seq": 1}]
+    ran = []
+
+    def process(job):
+        ran.append(job["turn"])
+        token.set()  # the stop arrives while the first job is in flight
+        return True
+
+    monkeypatch.setattr(w, "_pending_jobs", lambda *a, **k: list(jobs))
+    monkeypatch.setattr(w, "_process_job", process)
+    done = w._drain_pending(token)
+    assert ran == [1], f"jobs run after the stop: {ran}"
+    assert done == 1
