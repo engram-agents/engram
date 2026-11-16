@@ -26,9 +26,11 @@ import os
 import platform
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -240,7 +242,7 @@ exec "$REAL_PY" "$@"
         return self
 
     # -- running -----------------------------------------------------------------------------
-    def run(self, *args, env=None, stdin=subprocess.DEVNULL):
+    def run(self, *args, env=None, stdin=subprocess.DEVNULL, timeout=120):
         e = {
             "PATH": "%s:%s" % (self.fakebin, self.safebin),
             "HOME": str(self.home),
@@ -254,12 +256,37 @@ exec "$REAL_PY" "$@"
             "REAL_PY": sys.executable,
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
+            # #4795: a cell that runs the REAL bootstrap seeds a graph, and seeding downloads the
+            # embedding model into the temp HOME. Off by default; a caller's env can override.
+            "ENGRAM_NO_EMBEDDINGS": "1",
         }
         e.update(env or {})
-        proc = subprocess.run(
+        # The installer runs in its own session so a timeout can kill the whole tree: bootstrap is
+        # bash's child, and subprocess.run(timeout=) kills only bash and leaves it an orphan.
+        proc = subprocess.Popen(
             ["bash", str(self.repo / "tools" / "install.sh"), *args],
-            cwd=str(self.root), env=e, stdin=stdin, capture_output=True, text=True, timeout=120,
+            cwd=str(self.root), env=e, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
         )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as first:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            # Reap, but not on pipe EOF forever: a descendant that left the group (setsid) and holds
+            # stdout/stderr would block here. Bounded; the FIRST TimeoutExpired is the one re-raised.
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+            raise first
+        proc = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         proc.all = proc.stdout + proc.stderr
         return proc
 
@@ -1138,3 +1165,98 @@ def test_forum_url_hint_names_the_tier_not_the_retired_flag(sb):
     assert r.returncode != 0 and "FAIL: [step 8]" in r.stderr, r.all
     assert "--multi-agent" not in r.stderr
     assert "convenience or dev" in r.stderr
+
+
+# --------------------------------------------------------------------- #4795: a timeout kills the tree
+
+def _pid_alive(pid):
+    """True while the pid is a live process; a zombie (dead, awaiting its reaper) counts as gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        state = Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state != "Z"
+
+
+def test_sandbox_run_timeout_kills_the_whole_process_tree(tmp_path):
+    """#4795: on a timeout the installer's whole process group dies, not just the bash that was
+    started. The fake bootstrap (bash's child) writes its pid, ignores SIGTERM and sleeps; before the
+    fix it outlived the TimeoutExpired as an orphan under PID 1."""
+    sb = Sandbox(tmp_path)
+    pidfile = tmp_path / "bootstrap.pid"
+    _write(sb.plugin_src / "bootstrap.py", (
+        "import os, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "open(%r, 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n" % str(pidfile)
+    ), 0o644)
+    pid = None
+    try:
+        started = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            sb.run("--yes", timeout=8)
+        elapsed = time.monotonic() - started
+        assert pidfile.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 2
+        while _pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _pid_alive(pid), "the bootstrap (pid %d) outlived the timeout" % pid
+        assert elapsed < 8 + 10, "the timeout path took %.1fs: the kill did not reach the whole group" % elapsed
+    finally:
+        if pid is None and pidfile.exists():
+            pid = int(pidfile.read_text())
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_sandbox_run_sets_the_embedding_opt_out_by_default_and_the_caller_env_wins_even_with_an_empty_string(tmp_path):
+    """#4795: the bootstrap a Sandbox run starts sees ENGRAM_NO_EMBEDDINGS=1 unless the caller's env
+    says otherwise (the caller's env wins). The override is the empty string, the only falsy value of
+    this variable (engram_core treats any non-empty string, "0" included, as the opt-out); the cell
+    pins that the caller's value, even an empty one, replaces the default, not what it does downstream."""
+    seen = {}
+    for label, env in (("default", None), ("override", {"ENGRAM_NO_EMBEDDINGS": ""})):
+        sb = Sandbox(tmp_path / label)
+        out = tmp_path / ("seen-" + label)
+        _write(sb.plugin_src / "bootstrap.py", (
+            "import os\nopen(%r, 'w').write(os.environ.get('ENGRAM_NO_EMBEDDINGS', 'unset'))\n" % str(out)
+        ), 0o644)
+        sb.run("--yes", env=env)
+        assert out.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
+        seen[label] = out.read_text()
+    assert seen == {"default": "1", "override": ""}, seen
+
+
+def test_sandbox_run_timeout_is_bounded_when_a_descendant_left_the_group_holding_the_pipes(tmp_path):
+    """#4795 review S2: a descendant that left the process group (setsid) and holds stdout/stderr must
+    not block the timeout path on pipe EOF; the old subprocess.run(timeout=2) returned in 2 s."""
+    sb = Sandbox(tmp_path)
+    pidfile = tmp_path / "escaper.pid"
+    _write(sb.plugin_src / "bootstrap.py", (
+        "import subprocess, time\n"
+        "p = subprocess.Popen(['sleep', '20'], start_new_session=True)\n"
+        "open(%r, 'w').write(str(p.pid))\n"
+        "time.sleep(60)\n" % str(pidfile)
+    ), 0o644)
+    try:
+        started = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired) as ei:
+            sb.run("--yes", timeout=2)
+        elapsed = time.monotonic() - started
+        assert ei.value.timeout == 2, "the re-raised TimeoutExpired is not the first one: %r" % ei.value.timeout
+        assert pidfile.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
+        assert elapsed < 10, "the timeout path took %.1fs: it waited on a descendant holding the pipes" % elapsed
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
