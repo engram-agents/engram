@@ -311,6 +311,8 @@ while [ $# -gt 0 ]; do
         /*) ;;
         *) echo "ERROR: --auth-report must be an absolute path (got '$AUTH_REPORT'). Nothing was written." >&2; exit 2 ;;
       esac
+      # Not only a path check: the value is substituted into a unit file with sed, so
+      # excluding | & and backslash closes the sed-replacement injection class. Do not widen.
       case "$AUTH_REPORT" in
         *[!A-Za-z0-9/._-]*)
           echo "ERROR: --auth-report may contain only letters, digits and / . _ - (it lands in a unit file); got '$AUTH_REPORT'. Nothing was written." >&2; exit 2 ;;

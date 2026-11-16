@@ -2084,6 +2084,8 @@ def _identity_text(value) -> str | None:
 def _route_label() -> str:
     """``METHOD /api/x/<pid>/y`` for error text: the matched rule with converters dropped
     (``<int:tid>`` -> ``<tid>``), the shape every handler's own refusal text already uses."""
+    # The path fallback for an unmatched route reaches only the CLIENT (as a refusal label),
+    # never the auth report file (``_report_route`` writes the fixed unmatched text); keep it so.
     rule = request.url_rule.rule if request.url_rule is not None else request.path
     if request.method == "POST" and rule == "/api/projects":
         return "POST /api/projects (init)"  # the label the init handler's own refusals carry
