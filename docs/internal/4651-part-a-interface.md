@@ -1,11 +1,13 @@
-# #4651 part A: declared interface (v0, Sol)
+# #4651 part A: the interface (v1, Sol)
 
-Status: a DECLARATION, not an implementation. It is the interface Mira's contract (rev 2, hash 46798986) asks part A to
-declare before any part B code is dispatched: the routing flag, the callable API and result contract, and a durable
-branch and base. Everything here is subject to Zephyr's security read of the owner-side pieces; where a point is
-still open it says so.
+Status: a design note, kept in step with the code. It began as the interface Mira's contract (rev 2, hash 46798986)
+asked part A to declare before any part B code is dispatched: the routing flag, the callable API and result contract, and
+a durable branch and base. Sections 2 and 4 describe the shared primitive and the owner op as they shipped (slices A1 and
+A2); section 3 is the client route (slice A3), whose contract is pinned by `tests/test_4651_a3_client_route.py`. Everything
+owner-side is subject to Zephyr's security read; where a point is still open it says so.
 
-Branch: `sol/4651-a-shared-primitive`. Base: dev `ec8f2483`. Part A is one PR (Kepler's split, 30112). No code yet.
+Branch: `sol/4651-a-shared-primitive`. Base: dev `ec8f2483`. Part A is one PR (Kepler's split, 30112); the client route
+is its third slice.
 
 Rulings this builds to:
 - Borges 30125/30127/30149: flag OFF runs the shared strict primitive in-process; flag ON runs it through the owner;
@@ -16,13 +18,14 @@ Rulings this builds to:
 
 ## 1. The flag
 
-`engramd.overwrite_embeddings_via_owner` in config.json (JSON `true` only, read with `engramd_owner_flags.flag_on`).
-Default OFF. The name ends in `_via_owner` so `any_owner_flag_on` starts an owner for it. It is a NEW flag,
+`engramd.repair_embeddings_via_owner` in config.json (JSON `true` only, read with `engramd_owner_flags.flag_on`; the
+client route reads it through `_owner_read.flag_applies`, which calls the same function). Default OFF. The name ends in `_via_owner` so `any_owner_flag_on` starts an owner for it. It is a NEW flag,
 independent of `regen_embeddings_via_owner` (Kepler 30156). It is a ROUTING switch, not a consent: consent to overwrite
 vectors lives in the repair tool's preview-then-apply, the same in both routes (Kepler 30156, Borges 30160).
-Open, one line from Kepler or Borges: the name. `overwrite_embeddings_via_owner` was chosen under the consent reading,
-which was withdrawn; a unit name in the style of `regen_embeddings_via_owner`, for example
-`repair_embeddings_via_owner`, may fit the convention better. A rename before the PR opens is free.
+The name is decided: `repair_embeddings_via_owner`, in the style of `regen_embeddings_via_owner`. An earlier draft
+named it for the overwrite it permits, under the consent reading, which was withdrawn. The two flags sit side by
+side and route different writes: `regen_embeddings_via_owner` the writes that FILL vectors that are missing,
+`repair_embeddings_via_owner` the one-time repair that REWRITES vectors that already exist.
 
 ## 2. The shared primitive (module `engram_embedding_publish`, Essential tier)
 
@@ -73,18 +76,36 @@ this extraction is acceptable semantics.
 ## 3. What part B calls (and nothing else)
 
     open_route(engram_home) -> Route            # reads the flag once; "direct" or "owner"; fixed for the run
-    publish_batch(route, items) -> list[PublishResult]
+    publish_batch(route, items, request_id=None) -> list[PublishResult]
 
-- `items`: a list of `{node_id, PreparedVector}`; the batch cap is set after the writer-hold measurement (U16's 50 is
-  the starting point, not a claim).
-- `publish_batch` re-reads the flag before EACH batch. If it changed in either direction, or the owner answers
-  `flag_off`, it raises `RouteChanged` / `OwnerFlagOff` and part B stops loudly with the rest pending; a rerun takes a
-  fresh preview. It never switches route mid-run.
-- Route "direct": calls `publish_embedding` in-process, one transaction per row.
-- Route "owner": sends the owner op below. Owner down, refusing, malformed answer or indeterminate outcome raises
-  `OwnerUnavailable` and never touches the store directly.
+Module `tools/_embedding_repair_route.py` (Essential tier, beside `_owner_read.py`).
+
+- `items`: a list of `(node_id, PreparedVector)` pairs, 1 to `MAX_BATCH` = 50, all carrying an equal epoch. The 50 is
+  U16's cap, kept as a starting point and not a claim; a test pins it equal to the owner's `PUBLISH_PREPARED_MAX_ITEMS`.
+  A bad batch (empty, over the cap, a non-pair, a repeated node_id, a non-`PreparedVector`, mixed epochs) is a
+  `ValueError` before the flag is read or anything is opened.
+- `request_id` (optional): the idempotency key sent with the owner op; a fresh uuid when absent. Part B passes the same
+  id to retry the same batch, which the owner replays instead of re-writing.
+- `publish_batch` re-reads the flag before EACH batch. If it no longer matches the route (either direction; an
+  unreadable flag reads OFF), it raises `RouteChanged`; if the owner answers `flag_off`, it raises `OwnerFlagOff`. Part B
+  stops loudly with the rest pending; a rerun takes a fresh preview. It never switches route mid-run.
+- Route "direct": one connection to the store per batch, then per row in request order `BEGIN IMMEDIATE`,
+  `publish_embedding` in prepared mode, `COMMIT` (one transaction per row). An error mid-batch rolls that row back and
+  stops; `DirectWriteError` carries the rows already committed (`.results`) and the cause. Two failures do NOT raise: a
+  vec0 load failure shows up as every item `pending` / `mirror`, and an unreadable epoch as every item `deferred` /
+  `check_failed`; the repair tool must treat an all-pending or all-deferred batch as a STOP signal (the store is
+  unwritten or only marked, and every later batch would do the same), never as progress.
+- Route "owner": sends the owner op below through `_owner_read.write`. The answer is checked strictly (one entry per
+  item sent, in order, valid fields, `counts` equal to the tally); a malformed answer is INDETERMINATE, because the owner
+  may have committed. Owner down, refusing, malformed or indeterminate raises `OwnerUnavailable` (with `.reason`,
+  `.commit` and `.request_id`) and never touches the store directly. `PublishResult.warning` is None on this route.
+  `flag_off` is told apart from the other refusals by the `owner_reason` attribute `_owner_read.write` sets on what it
+  raises, never by message text.
 
 Part B never reads the flag itself, never opens the store to publish, never reimplements validation or the debt-clearer.
+
+One difference between the routes, deliberate: the direct route commits one row at a time; the owner op publishes the
+whole call in ONE transaction. The per-row `PublishResult`s are the same either way (a parity cell pins it).
 
 ### 3a. One OFF/ON behaviour (SETTLED: Kepler 30156 withdrew the consent reading of 30138; Borges 30160)
 
@@ -114,15 +135,23 @@ add protection there, and this note does not claim it does.
   closed-key parameter validator over ALL items before any write, the envelope's request_id as idempotency key, and its
   own column-exact authorizer allowlist MEASURED for this op (it reads six `nodes` columns for the recipe and updates
   `nodes.embedding`), not copied from the NULL-only fill op.
-- Flag gate at the top of the handler: read the flag fresh with `flag_on` on the owner's own config path; OFF answers
-  `{status: rejected, reason: flag_off, detail naming engramd.overwrite_embeddings_via_owner, remedy}`. The owner does
-  not read the per-unit flags today, so this is new owner behaviour in this PR.
-- Open for Zephyr: a per-call config read, or a flag latched at owner start. Per-call matches the fresh-read precedent
-  and makes a mid-run flip stop the next batch loudly; latching would not.
-- The op runs `publish_embedding` in prepared mode per item; per-item outcomes are returned as `PublishResult` data.
+- Flag gate at the top of the handler: read the flag fresh with `flag_on` on the owner's own config path; OFF, or any
+  unreadable state, answers `{status: rejected, reason: flag_off, detail naming engramd.repair_embeddings_via_owner,
+  remedy}` before the params are validated and before the store is touched. The owner did not read per-unit flags before
+  this op, so this is new owner behaviour in this PR.
+- The flag is read PER CALL, never latched at owner start: a mid-run flip stops the next batch loudly. The guarantee is
+  per call, not per statement: a flag turned OFF while a call runs does not abort that call.
+- The op runs `publish_embedding` in prepared mode per item, in request order, in one transaction. Besides the flag
+  gate it has a vec gate (a store with a `vec_nodes` table whose vec0 this connection cannot load is refused whole as
+  `vec_unavailable`, nothing written) and a read-back after COMMIT of every `refreshed` item's embedding text and vec
+  bytes (a difference answers `readback_mismatch`, `commit: committed_unverified`, recorded so a same-id retry replays
+  it). Per-item outcomes come back as `{node_id, status, reason, vector_changed, debt_cleared}` plus `counts`; `warning`
+  is not carried, and `vector_changed` is null unless the item is `refreshed`.
 
 ## 5. Not decided here
 
-The batch cap (needs the writer-hold measurement); the exact refusal wording; whether the new owner op shares the
-fill op's lock-wait budget; the flag name (candidate). Nothing in this note changes the NULL-only fill, the summary-write
-defaults, or any health or confidence calculation.
+The writer-hold measurement of a 50-item publish: the cap of 50 stands as a starting point, not a claim, and a
+measurement may change it (in both places at once, a test pins them equal). Decided since the first draft: the flag name
+(`repair_embeddings_via_owner`), the batch cap (50), the refusal wording (the handler's own), per-call flag reads, and
+the op running through the shared owner write scaffold. Nothing in this note changes the NULL-only fill, the
+summary-write defaults, or any health or confidence calculation.

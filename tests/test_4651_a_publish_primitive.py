@@ -592,6 +592,34 @@ def test_c16_current_epoch(ctx):
     assert ctx.pub.current_epoch().model == ctx.core.DEFAULT_EMBEDDING_MODEL
 
 
+# -------------------------------------------------------------------- C16b
+def test_c16b_embed_dimension_is_the_dimension_the_real_vec0_schema_declares(ctx):
+    """Contract (#4651 A3): `EMBED_DIMENSION` equals the N in `embedding float[N]` of the vec0 table the REAL store
+    creates (parsed from sqlite_master, not a copy of 384 here), and the owner's duplicated literal
+    `FILL_EMBEDDINGS_DIM` equals it, and the owner's publish op takes its dimension from `pub.EMBED_DIMENSION`
+    (pinned by identity: the handler's source passes that attribute, no literal). This pins existing behaviour, so
+    it passes at once; it exists so a model change that edits one number and not the others fails loudly.
+    The `ctx` fixture asserts a real sqlite-vec store, so without vec0 this errors loudly rather than passing."""
+    import inspect
+    import re
+
+    import engramd_owner
+
+    conn = ctx.db()
+    try:
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'vec_nodes'").fetchone()
+    finally:
+        conn.close()
+    assert row is not None and row[0], "the real store must carry the vec_nodes vec0 table"
+    found = re.findall(r"embedding\s+float\[(\d+)\]", row[0])
+    assert len(found) == 1, row[0]
+    schema_dim = int(found[0])
+    assert ctx.pub.EMBED_DIMENSION == schema_dim
+    assert engramd_owner.FILL_EMBEDDINGS_DIM == schema_dim
+    handler_src = inspect.getsource(engramd_owner.EngramdOwner._handle_publish_prepared_embeddings)
+    assert "_publish_prepared_param_refusal(params, pub.EMBED_DIMENSION)" in handler_src
+
+
 # -------------------------------------------------------------------- C17
 def test_c17_compute_mode_through_the_new_function_keeps_the_old_shape(ctx):
     nid = ctx.node("c17 claim", summary="s", keywords=["a", "b", "c"])

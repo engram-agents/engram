@@ -605,6 +605,11 @@ NOT_BATCHED_FLAGS = {
         "install-time diagnostic, not on any hook path; its ON output differs from OFF by design (it names "
         "the path taken and FAILs on an unhealthy owner); flips as its own one-flag step after #4118 lands"
     ),
+    "repair_embeddings_via_owner": (
+        "a ROUTING flag for the embedding repair's publish write through the owner op publish_prepared_embeddings "
+        "(default OFF); no tool row until part B ships the repair tool (#4651); the module "
+        "tools/_embedding_repair_route.py is a library that publish_batch routes on this flag"
+    ),
 }
 
 

@@ -533,6 +533,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/_embedding_repair_route.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/archive_transcripts.py",
       "tier": "essential"
     },
