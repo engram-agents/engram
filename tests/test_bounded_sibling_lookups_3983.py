@@ -423,3 +423,174 @@ def test_every_copy_skips_an_unreadable_ancestor_and_keeps_walking(tmp_path, mon
     for rel, fn in copies.items():
         got = [Path(p) for p in fn(f)]
         assert got == [root / "x" / "y", root / "x", root], f"{rel}: stopped at the unreadable dir: {got}"
+
+
+# ------------------------------------------------- the no-marker precondition (#4625 ask 1)
+#
+# Cells (e) and the identical-copies test build a layout with NO ``engram_core.py``
+# under ``tmp_path`` and assume none exists ABOVE it.  A marker in any ancestor of
+# ``tmp_path`` becomes the nearest tree root and the grandparent falls inside the
+# bound, so 31 cells go red though the product is right.  The contract below makes
+# that precondition explicit: ONE red that names the file, and the dependents skip.
+#
+#   C1 ``_marker_above(path)``: nearest ancestor STRICTLY above ``path`` holding an
+#      entry named ``engram_core.py`` (file or symlink, even dangling), else None.
+#      Never raises: an unreadable ancestor is skipped and the walk goes on.
+#   C2 marker above ``tmp_path``: the dependents SKIP with the exact reason, and
+#      ``test_precondition_...`` FAILS with the same text.
+#   C3 no marker above: everything runs as before, the precondition test passes.
+#   C4 a marker AT or BELOW ``path`` never trips the guard.
+#   C5 the ancestors are those of the path given (the per-test ``tmp_path``), not
+#      of the repo or the cwd.
+#   C6 several markers above: the message names the NEAREST.
+#   C7 end to end in a subprocess with ``TMPDIR`` holding a marker.
+
+_FAKE = "/zz-fake-root"   # a path that exists nowhere: the unit cells never touch the host's tree
+
+
+def _fake_fs(monkeypatch, present=(), unreadable=()):
+    """Make ``os.lstat`` answer for the named paths only: ``present`` exist,
+    ``unreadable`` raise PermissionError, everything else is absent.  The unit
+    cells use it so they hold whatever sits above the real temp folder."""
+    real = os.lstat
+    present, unreadable = {str(p) for p in present}, {str(p) for p in unreadable}
+
+    def lstat(p, *a, **kw):
+        if str(p) in present:
+            return real(os.devnull)
+        if str(p) in unreadable:
+            raise PermissionError(13, "Permission denied", str(p))
+        raise FileNotFoundError(2, "No such file or directory", str(p))
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+def _reason(at) -> str:
+    return (f"a tree-root marker {MARKER} sits above this test's temp folder at {at}; "
+            "the no-marker layout cannot be built here")
+
+
+def test_c1_marker_above_is_none_when_no_ancestor_holds_one(monkeypatch):
+    _fake_fs(monkeypatch)
+    assert _marker_above(Path(_FAKE) / "a" / "b" / "c") is None
+
+
+def test_c1_marker_above_names_the_nearest_ancestor_strictly_above(monkeypatch):
+    _fake_fs(monkeypatch, present=[f"{_FAKE}/a/{MARKER}", f"{_FAKE}/{MARKER}"])
+    assert _marker_above(Path(_FAKE) / "a" / "b" / "c") == Path(_FAKE) / "a"
+
+
+def test_c1_a_dangling_symlink_named_engram_core_counts(tmp_path):
+    holder = tmp_path / "s"
+    (holder / "a" / "b").mkdir(parents=True)
+    try:
+        os.symlink(tmp_path / "nowhere", holder / MARKER)
+    except (OSError, NotImplementedError):
+        pytest.skip("cannot create a symlink here")
+    assert _marker_above(holder / "a" / "b") == holder
+
+
+def test_c1_an_unreadable_ancestor_is_skipped_and_the_walk_continues(monkeypatch):
+    _fake_fs(monkeypatch, present=[f"{_FAKE}/{MARKER}"],
+             unreadable=[f"{_FAKE}/a/b/{MARKER}", f"{_FAKE}/a/{MARKER}"])
+    assert _marker_above(Path(_FAKE) / "a" / "b" / "c") == Path(_FAKE)
+
+
+def test_c1_never_raises_even_when_every_ancestor_is_unreadable(monkeypatch):
+    _fake_fs(monkeypatch, unreadable=[f"{_FAKE}/a/b/{MARKER}", f"{_FAKE}/a/{MARKER}",
+                                      f"{_FAKE}/{MARKER}", f"/{MARKER}"])
+    assert _marker_above(Path(_FAKE) / "a" / "b" / "c") is None
+
+
+def test_c2_the_message_names_the_marker_and_has_the_exact_text(monkeypatch):
+    _fake_fs(monkeypatch, present=[f"{_FAKE}/a/{MARKER}"])
+    assert _precondition_message(Path(_FAKE) / "a" / "b" / "c") == _reason(f"{_FAKE}/a/{MARKER}")
+
+
+def test_c2_a_marker_above_makes_the_dependents_skip_with_that_reason(monkeypatch):
+    _fake_fs(monkeypatch, present=[f"{_FAKE}/a/{MARKER}"])
+    with pytest.raises(pytest.skip.Exception) as info:
+        _skip_if_marker_above(Path(_FAKE) / "a" / "b" / "c")
+    assert info.value.msg == _reason(f"{_FAKE}/a/{MARKER}")
+
+
+def test_c3_no_marker_above_the_message_is_none_and_nothing_skips(monkeypatch):
+    _fake_fs(monkeypatch)
+    assert _precondition_message(Path(_FAKE) / "a" / "b" / "c") is None
+    _skip_if_marker_above(Path(_FAKE) / "a" / "b" / "c")   # returns, no skip
+
+
+def test_c4_a_marker_at_or_below_the_path_never_trips_the_guard(monkeypatch):
+    here = Path(_FAKE) / "a" / "b"
+    _fake_fs(monkeypatch, present=[here / MARKER, here / "c" / MARKER, here / "c" / "d" / MARKER])
+    assert _marker_above(here) is None
+    assert _precondition_message(here) is None
+
+
+def test_c5_the_ancestors_are_those_of_the_path_given_not_the_repo_or_the_cwd(monkeypatch):
+    repo_parent = Path(__file__).resolve().parent.parent.parent
+    _fake_fs(monkeypatch, present=[repo_parent / MARKER, Path.cwd().parent / MARKER,
+                                   Path(__file__).resolve().parent / MARKER])
+    assert _marker_above(Path(_FAKE) / "a" / "b") is None
+
+
+def test_c6_several_markers_above_the_message_names_the_nearest(monkeypatch):
+    _fake_fs(monkeypatch, present=[f"{_FAKE}/a/{MARKER}", f"{_FAKE}/{MARKER}", f"/{MARKER}"])
+    msg = _precondition_message(Path(_FAKE) / "a" / "b" / "c" / "d")
+    assert msg == _reason(f"{_FAKE}/a/{MARKER}")
+    # and a marker two levels up is found, not only one on the direct parent
+    _fake_fs(monkeypatch, present=[f"{_FAKE}/a/{MARKER}"])
+    assert _marker_above(Path(_FAKE) / "a" / "b" / "c" / "d") == Path(_FAKE) / "a"
+
+
+def test_precondition_no_tree_root_marker_above_the_temp_folder(tmp_path):
+    """The one red for a stray marker: it names the file, so nobody hunts 31 failures."""
+    msg = _precondition_message(tmp_path)
+    if msg:
+        pytest.fail(msg, pytrace=False)
+
+
+_DEPENDENTS = ("test_e_no_marker_searches_own_dir_and_parent_only",
+               "test_every_local_copy_of_bounded_parents_behaves_identically",
+               "test_precondition_no_tree_root_marker_above_the_temp_folder")
+
+
+def _run_dependents(tmpdir: Path, junit: Path) -> "tuple[int, list]":
+    """Run the dependents of THIS file in a clean subprocess with ``TMPDIR`` = tmpdir;
+    return (exit code, [(testname, outcome, message)])."""
+    import xml.etree.ElementTree as ET
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PLUGIN_ROOT", "PYTHONPATH")}
+    env["TMPDIR"] = str(tmpdir)
+    me = str(Path(__file__).resolve())
+    proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                           f"--junitxml={junit}", *[f"{me}::{n}" for n in _DEPENDENTS]],
+                          capture_output=True, text=True, env=env, timeout=300)
+    cases = []
+    for tc in ET.parse(junit).getroot().iter("testcase"):
+        kids = {c.tag: c for c in tc}
+        tag = next((t for t in ("failure", "error", "skipped") if t in kids), "passed")
+        msg = kids[tag].get("message", "") if tag != "passed" else ""
+        cases.append((tc.get("name"), tag, msg))
+    return proc.returncode, cases
+
+
+def test_c7_end_to_end_a_stray_marker_gives_one_red_and_skips_the_dependents(tmp_path):
+    _skip_if_marker_above(tmp_path)   # the clean leg below needs a host without a stray marker
+    stray = tmp_path / "stray_tmp"
+    stray.mkdir()
+    (stray / MARKER).write_text("")
+    code, cases = _run_dependents(stray, tmp_path / "with.xml")
+    failed = [c for c in cases if c[1] in ("failure", "error")]
+    skipped = [c for c in cases if c[1] == "skipped"]
+    passed = [c for c in cases if c[1] == "passed"]
+    assert code != 0
+    assert [c[0] for c in failed] == ["test_precondition_no_tree_root_marker_above_the_temp_folder"], cases
+    assert str(stray / MARKER) in failed[0][2], failed
+    guarded = [c for c in skipped if _reason(stray / MARKER) in c[2]]
+    # the 2 cites_step3 cells of (e) skip on their own, earlier, reason: 33 skips in all
+    assert len(guarded) == 31 and len(skipped) == 33 and not passed, (len(guarded), len(skipped), len(passed))
+    clean = tmp_path / "clean_tmp"
+    clean.mkdir()
+    code, cases = _run_dependents(clean, tmp_path / "without.xml")
+    assert code == 0, cases
+    assert [c for c in cases if c[1] in ("failure", "error")] == []
