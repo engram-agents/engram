@@ -16,7 +16,7 @@ Cells:
   3. guard: a concurrent duplicate of one REAL job leaves exactly one commit
   4. guard: stop_worker is loud when the thread outlives the join
   5. guard: plain start/stop, and start twice leaves one worker
-  6. guard: no test or src file clears a worker token (class rule)
+  6. guard: no test or src file clears a worker token by a known spelling (tripwire)
 """
 
 import json
@@ -173,6 +173,9 @@ def _make_job(server):
 
 def test_concurrent_duplicate_of_one_real_job_commits_once(monkeypatch):
     monkeypatch.setenv("ENGRAM_NO_EMBEDDINGS", "1")
+    # Importing `server` sets env vars at import time (e.g. HF_HUB_ETAG_TIMEOUT);
+    # put the whole environment back so nothing leaks into later modules.
+    env_before = dict(os.environ)
     path_before = list(sys.path)
     mods_before = {k: v for k, v in sys.modules.items()
                    if k == "server" or k.startswith("engram_")}
@@ -210,6 +213,8 @@ def test_concurrent_duplicate_of_one_real_job_commits_once(monkeypatch):
             del sys.modules[k]
         sys.modules.update(mods_before)
         sys.path[:] = path_before
+        os.environ.clear()
+        os.environ.update(env_before)
         for d in dirs:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -255,9 +260,10 @@ def test_start_twice_without_stop_leaves_exactly_one_worker(rig):
     assert len(_worker_threads()) - baseline == 1
 
 
-# ── Cell 6 (class rule) ────────────────────────────────────────────────────
+# ── Cell 6 (tripwire for known spellings) ──────────────────────────────────
 # Matches `<alias>._stop.clear(` and a bare `_stop.clear(`, but not `self._stop`
-# (other classes' own flags).
+# (other classes' own flags). It cannot see `getattr(w, "_stop").clear()` or a token
+# first bound to another name; the contract itself is pinned by cells 1 and 2.
 _CLEAR_RE = re.compile(r"(?<!self\.)(?<!\w)_stop\s*\.\s*clear\s*\(")
 
 
