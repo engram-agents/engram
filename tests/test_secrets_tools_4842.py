@@ -419,3 +419,210 @@ def test_c15_non_linux_prints_note_and_still_enforces_modes(tmp_path, monkeypatc
     err = capsys.readouterr().err
     assert "secrets ACL not checked on this platform" in err
     assert any("loose" in p for p in res.problems)
+
+
+# ---------------------------------------------------------------- round 2 (R1-R7)
+
+import importlib.machinery  # noqa: E402
+import io  # noqa: E402
+import shlex  # noqa: E402
+import signal  # noqa: E402
+import stat  # noqa: E402
+
+
+def _load_tool(path, modname):
+    """Load an extension-less tool as a module (its __main__ guard keeps main() from running)."""
+    loader = importlib.machinery.SourceFileLoader(modname, str(path))
+    spec = importlib.util.spec_from_loader(modname, loader)
+    mod = importlib.util.module_from_spec(spec)
+    saved = list(sys.path)  # the tools put their own directory on sys.path at import (#4023 guard)
+    try:
+        loader.exec_module(mod)
+    finally:
+        sys.path[:] = saved
+    return mod
+
+
+@needs_acl
+def test_r1_remediation_lines_are_shell_quoted(tmp_path):
+    home = tmp_path / "ho me's"  # a space and a quote: an unquoted line cannot survive shlex
+    sec = home / "secrets"
+    sec.mkdir(parents=True)
+    os.chmod(sec, 0o700)
+    f = sec / "loose-key"
+    _write(f, "v\n")
+    _setfacl("-m", f"u:{OTHER_UID}:r-x", str(sec))
+    _setfacl("-m", f"u:{OTHER_UID}:r--", str(f))
+    r = _check_cli(home)
+    assert r.returncode == 1
+    split = [
+        shlex.split(ln.strip())
+        for ln in r.stdout.splitlines()
+        if ln.strip().startswith(("setfacl ", "chmod "))
+    ]
+    assert ["setfacl", "-b", "-k", str(sec)] in split
+    assert ["setfacl", "-b", str(f)] in split
+    chmods = [s for s in split if s[0] == "chmod"]
+    assert chmods and all(len(s) == 3 and s[2] in (str(sec), str(f)) for s in chmods)
+
+
+@needs_acl
+def test_r2_getfacl_gets_double_dash_so_a_dash_leading_relative_home_works(tmp_path):
+    sec = tmp_path / "-dashhome" / "home" / "secrets"
+    sec.mkdir(parents=True)
+    os.chmod(sec, 0o700)
+    _write(sec / "k", "v\n")
+    r = _run(CHECK_PY, ["--home", "-dashhome/home"], cwd=str(tmp_path))
+    assert r.returncode == 0
+
+
+def test_r3_put_validates_stdin_before_creating_secrets_dir(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    for stdin in ("", "\n", "a\x00b\n"):
+        r = _run(SECRET_PUT, ["--home", str(home), "k"], stdin=stdin)
+        assert r.returncode == 1
+        assert not (home / "secrets").exists()
+
+
+@needs_acl
+def test_r4_put_fsyncs_the_secrets_dir_after_replace(tmp_path, monkeypatch):
+    mod = _load_tool(SECRET_PUT, "secret_put_r4")
+    home = _clean_home(tmp_path, files=())
+    sec_ino = os.stat(home / "secrets").st_ino
+    events = []
+    real_replace, real_fsync = os.replace, os.fsync
+
+    def spy_replace(a, b, *args, **kw):
+        events.append("replace")
+        return real_replace(a, b, *args, **kw)
+
+    def spy_fsync(fd):
+        st = os.fstat(fd)
+        events.append("fsync-dir" if stat.S_ISDIR(st.st_mode) and st.st_ino == sec_ino else "fsync-other")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"v\n")))
+    assert mod.main(["--home", str(home), "k"]) == 0
+    assert "replace" in events and "fsync-dir" in events
+    assert events.index("fsync-dir") > events.index("replace")
+
+
+def _r5_refused(tmp_path, args, names_to_make, var):
+    home = _clean_home(tmp_path, files=())
+    for n in names_to_make:
+        _write(home / "secrets" / n, "x-" + n + "\n")
+    sentinel = tmp_path / "ran"
+    r = _run(
+        SECRET_ENV,
+        ["--home", str(home), *args, "--", sys.executable, "-c",
+         f"open({str(sentinel)!r}, 'w').close()"],
+    )
+    assert r.returncode == 1
+    assert not sentinel.exists()
+    assert var in _out(r)
+    assert "would override a variable that changes how programs start" in _out(r)
+    assert "x-" not in _out(r)
+
+
+@needs_acl
+def test_r5_default_mapping_to_path_refused(tmp_path):
+    _r5_refused(tmp_path, ["path"], ["path"], "PATH")
+
+
+@needs_acl
+def test_r5_default_mapping_with_dash_refused(tmp_path):
+    _r5_refused(tmp_path, ["bash-env"], ["bash-env"], "BASH_ENV")
+
+
+@needs_acl
+@pytest.mark.parametrize(
+    "var",
+    ["LD_PRELOAD", "PYTHONPATH", "DYLD_INSERT_LIBRARIES", "BASH_FUNC_FOO", "NODE_OPTIONS", "HOME", "PS4"],
+)
+def test_r5_as_override_to_dangerous_var_refused(tmp_path, var):
+    _r5_refused(tmp_path, ["--as", f"{var}=k", "k"], ["k"], var)
+
+
+@needs_acl
+def test_r5_ordinary_name_still_passes(tmp_path):
+    home = _clean_home(tmp_path, files=())
+    _write(home / "secrets" / "anthropic-api-key", "v\n")
+    r = _run(
+        SECRET_ENV,
+        ["--home", str(home), "anthropic-api-key", "--", sys.executable, "-c",
+         "import os;print('set' if 'ANTHROPIC_API_KEY' in os.environ else 'unset')"],
+    )
+    assert r.returncode == 0
+    assert r.stdout.split() == ["set"]
+
+
+def test_r6_read_secret_refuses_a_non_regular_file_without_blocking(tmp_path):
+    mod = _load_tool(SECRET_ENV, "secret_env_r6")
+    fifo = tmp_path / "pipe-secret"
+    os.mkfifo(fifo)
+    reg = tmp_path / "plain"
+    reg.write_text(MARKER + "\n")
+
+    class _Blocked(BaseException):  # not an OSError/Exception, so the helper cannot swallow it
+        pass
+
+    def _timeout(signum, frame):
+        raise _Blocked()
+
+    old = signal.signal(signal.SIGALRM, _timeout)
+    signal.alarm(10)
+    refused = named = False
+    try:
+        try:
+            mod.read_secret(fifo)
+        except Exception as exc:  # the helper's own refusal type
+            refused = "not a regular file" in str(exc)
+            named = "pipe-secret" in str(exc) and MARKER not in str(exc)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+    assert refused
+    assert named
+    assert mod.read_secret(reg) == MARKER  # a regular file still reads (one newline dropped)
+
+
+def _home_env(tmp_path, engram_home):
+    fake = tmp_path / "fakehome"
+    fake.mkdir(exist_ok=True)
+    return {"HOME": str(fake), "ENGRAM_HOME": str(engram_home)}
+
+
+@needs_acl
+def test_r7_default_home_comes_from_engram_home(tmp_path):
+    home = _marker_home(tmp_path)
+    env = _home_env(tmp_path, home)
+    assert _run(CHECK_PY, [], env_extra=env).returncode == 0
+    r = _run(
+        SECRET_ENV,
+        ["anthropic-api-key.acct", "--", sys.executable, "-c",
+         "import os;print('set' if 'ANTHROPIC_API_KEY_ACCT' in os.environ else 'unset')"],
+        env_extra=env,
+    )
+    assert r.returncode == 0
+    assert r.stdout.split() == ["set"]
+    r = _run(SECRET_PUT, ["put-via-env"], stdin="v\n", env_extra=env)
+    assert r.returncode == 0
+    assert (home / "secrets" / "put-via-env").exists()
+    assert not (tmp_path / "fakehome" / ".engram").exists()
+
+
+@needs_acl
+def test_r7_relative_engram_home_refused_by_all_three(tmp_path):
+    env = _home_env(tmp_path, "relative/home")
+    outs = [
+        _run(CHECK_PY, [], env_extra=env),
+        _run(SECRET_ENV, ["anthropic-api-key.acct", "--", sys.executable, "-c", "pass"], env_extra=env),
+        _run(SECRET_PUT, ["k"], stdin="v\n", env_extra=env),
+    ]
+    for r in outs:
+        assert r.returncode == 1
+        assert "ENGRAM_HOME must be an absolute path" in _out(r)
+    assert not (tmp_path / "fakehome" / ".engram").exists()

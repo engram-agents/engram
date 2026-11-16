@@ -22,6 +22,7 @@ the mode bits and the regular-file rule are still enforced.
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -50,7 +51,7 @@ def _acl_defects(path: str, is_dir: bool) -> list:
     """ACL defects of `path` as short phrases. Raises _CannotTell when getfacl cannot answer."""
     try:
         r = subprocess.run(
-            ["getfacl", "-p", "--absolute-names", path],
+            ["getfacl", "-p", "--absolute-names", "--", path],
             capture_output=True,
             text=True,
             timeout=30,
@@ -115,7 +116,7 @@ def check(home) -> Result:
         nonlocal fix_acl_dir
         if stat.S_IMODE(st_mode) != want:
             res.problems.append("%s: mode %o, want %o" % (name, stat.S_IMODE(st_mode), want))
-            chmod_lines.append("chmod %o %s" % (want, path))
+            chmod_lines.append("chmod %o %s" % (want, shlex.quote(str(path))))
         if linux:
             try:
                 defects = _acl_defects(str(path), is_dir)
@@ -158,9 +159,9 @@ def check(home) -> Result:
     if res.code == 1:
         lines = []
         if fix_acl_dir:
-            lines.append("setfacl -b -k %s" % sec)
+            lines.append("setfacl -b -k %s" % shlex.quote(str(sec)))
         for p in fix_acl_files:
-            lines.append("setfacl -b %s" % p)
+            lines.append("setfacl -b %s" % shlex.quote(str(p)))
         lines.extend(chmod_lines)
         lines.append("re-run the check")
         lines.extend([NOTE_CHMOD, NOTE_WIDEN])
