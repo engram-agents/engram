@@ -43,8 +43,12 @@ def test_exactly_one_secrets_row_with_required_terms():
         "git-ignored",
         "one file per secret",
         "{{ENGRAM_HOME}}/forum-token",
+        "one known exception",
     ):
         assert term in row, term
+    # Not the only credential outside secrets/ (install-backups/ can hold
+    # tokens too): the row must not claim a sole exception.
+    assert "the one exception" not in row
 
 
 def test_secrets_row_is_inside_the_locations_table():
