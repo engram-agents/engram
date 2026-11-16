@@ -989,6 +989,35 @@ def load_roster_file(path):
     return stub
 
 
+def _doubled_echo_refusal_scanner(tmp_path: Path) -> Path:
+    """A parser that refuses the probes and the produced roster, echoing the
+    first produced line backslash-doubled (as ``repr`` renders it) to stderr."""
+    stub = tmp_path / "doubled-echo-refusal-scanner.py"
+    stub.write_text(
+        r'''
+import sys
+
+
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    sys.stderr.write(
+        "scan-leaks: roster line 1 refuses: "
+        + lines[0].replace("\\", "\\\\") + "\n")
+    raise SystemExit(2)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    return stub
+
+
 def _ordinary_refusal_scanner(tmp_path: Path) -> Path:
     """A parser that refuses the probes and the produced roster with an
     ordinary message carrying no pattern text."""
@@ -1032,6 +1061,24 @@ def test_parser_refusal_carrying_a_produced_pattern_is_withheld(tmp_path):
     assert "parser refused (exit 2)" in combined, combined
     assert "withheld because it contained roster text" in combined, combined
     assert A_ONE not in combined, "a produced roster pattern reached the operator"
+    assert list(out.iterdir()) == []
+
+
+def test_parser_refusal_carrying_a_backslash_doubled_pattern_is_withheld(tmp_path):
+    """A parser that echoes a produced pattern backslash-doubled (as ``repr``
+    renders it) must be withheld whole too: a literal-only containment test
+    misses the doubled text and the pattern reaches the operator."""
+    stub = _doubled_echo_refusal_scanner(tmp_path)
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert A_ONE not in combined, "a produced roster pattern reached the operator"
+    assert "parser refused (exit 2)" in combined, combined
+    assert "withheld because it contained roster text" in combined, combined
     assert list(out.iterdir()) == []
 
 

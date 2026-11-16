@@ -8,9 +8,16 @@ conversion on the machine of the person who holds the secret, and prints only
 counts, whole-file sha256 values, per-class line numbers, and the class-B names
 (the caller's own input of permitted names). It never prints a roster line.
 
-That guarantee covers every piece of text this tool emits, including any parser
-stderr it re-emits: a captured parser refusal that carries any produced roster
-pattern is withheld whole and reported by exit code alone.
+A captured parser refusal that carries a produced roster pattern is withheld
+whole and reported by exit code alone. The test is containment of the pattern
+verbatim, or with every backslash doubled -- the rendering repr() produces, so
+an echoed exception object is covered too. Two limits bound that, and both are
+real: text the parser writes to stdout, or directly to file descriptor 2, is
+not captured (this tool redirects only sys.stderr), and a PARTIAL echo is not
+detected, so a parser that prints half a pattern can still carry name text to
+the operator. Neither limit fires with the repo's own scanner, which prints a
+line number and an exception class and nothing else; they matter only for a
+parser supplied by someone else.
 
 Classification (R4) -- the roster lines are regexes, so "exact match" between a
 pattern and a name is not string equality. Each roster line and each B-file
@@ -334,6 +341,16 @@ def _parse_capture(parse_roster, source):
     return None, "", result
 
 
+def _pattern_present(text: str, pattern: str) -> bool:
+    """True when ``text`` carries ``pattern`` verbatim or backslash-doubled.
+
+    Contract: if the captured parser stderr contains a produced pattern
+    verbatim or backslash-doubled, nothing of that buffer is re-emitted and
+    exactly one line naming the parser's exit code is written instead.
+    """
+    return pattern in text or pattern.replace("\\", "\\\\") in text
+
+
 def _reemit_parser_refusal(refusal: str, code: int, patterns) -> None:
     """Re-emit the parser's captured refusal, or withhold it whole.
 
@@ -342,7 +359,7 @@ def _reemit_parser_refusal(refusal: str, code: int, patterns) -> None:
     pattern, nothing of it is written: exactly one line names the refusal by
     exit code only.
     """
-    if any(pattern and pattern in refusal for pattern in patterns):
+    if any(pattern and _pattern_present(refusal, pattern) for pattern in patterns):
         print(
             f"rotate_roster_format: the parser refused (exit {code}); its "
             "output was withheld because it contained roster text",
