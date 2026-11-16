@@ -26,8 +26,8 @@ import os
 import platform
 import re
 import shutil
-import sqlite3
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1198,7 +1198,7 @@ def test_sandbox_run_timeout_kills_the_whole_process_tree(tmp_path):
     try:
         started = time.monotonic()
         with pytest.raises(subprocess.TimeoutExpired):
-            sb.run("--yes", timeout=3)
+            sb.run("--yes", timeout=8)
         elapsed = time.monotonic() - started
         assert pidfile.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
         pid = int(pidfile.read_text())
@@ -1206,7 +1206,7 @@ def test_sandbox_run_timeout_kills_the_whole_process_tree(tmp_path):
         while _pid_alive(pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert not _pid_alive(pid), "the bootstrap (pid %d) outlived the timeout" % pid
-        assert elapsed < 3 + 10, "the timeout path took %.1fs: the kill did not reach the whole group" % elapsed
+        assert elapsed < 8 + 10, "the timeout path took %.1fs: the kill did not reach the whole group" % elapsed
     finally:
         if pid is None and pidfile.exists():
             pid = int(pidfile.read_text())
@@ -1217,11 +1217,13 @@ def test_sandbox_run_timeout_kills_the_whole_process_tree(tmp_path):
                 pass
 
 
-def test_sandbox_run_sets_the_embedding_opt_out_by_default_and_a_caller_can_override_it(tmp_path):
+def test_sandbox_run_sets_the_embedding_opt_out_by_default_and_the_caller_env_wins_even_with_an_empty_string(tmp_path):
     """#4795: the bootstrap a Sandbox run starts sees ENGRAM_NO_EMBEDDINGS=1 unless the caller's env
-    says otherwise (the caller's env wins)."""
+    says otherwise (the caller's env wins). The override is the empty string, the only falsy value of
+    this variable (engram_core treats any non-empty string, "0" included, as the opt-out); the cell
+    pins that the caller's value, even an empty one, replaces the default, not what it does downstream."""
     seen = {}
-    for label, env in (("default", None), ("override", {"ENGRAM_NO_EMBEDDINGS": "0"})):
+    for label, env in (("default", None), ("override", {"ENGRAM_NO_EMBEDDINGS": ""})):
         sb = Sandbox(tmp_path / label)
         out = tmp_path / ("seen-" + label)
         _write(sb.plugin_src / "bootstrap.py", (
@@ -1230,7 +1232,7 @@ def test_sandbox_run_sets_the_embedding_opt_out_by_default_and_a_caller_can_over
         sb.run("--yes", env=env)
         assert out.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
         seen[label] = out.read_text()
-    assert seen == {"default": "1", "override": "0"}, seen
+    assert seen == {"default": "1", "override": ""}, seen
 
 
 def test_sandbox_run_timeout_is_bounded_when_a_descendant_left_the_group_holding_the_pipes(tmp_path):

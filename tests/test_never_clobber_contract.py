@@ -2373,7 +2373,9 @@ def _graph_nodes(engram_home: Path) -> int:
 def test_real_bootstrap_installer_cell_makes_no_network_call(tmp_path, tmp_path_factory, monkeypatch):
     """#4795 A1: install.sh over the REAL bootstrap seeds a graph; seeding must not download the
     embedding model (a temp HOME has no cache)."""
-    monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)  # CI sets it for the whole run; the cell must not lean on that
+    # CI sets this for the whole run. Sandbox.run builds its env from scratch, so this matters only for
+    # _run_env's os.environ copy; it stays to document that the cells do not lean on CI.
+    monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)
     audit_dir, log, loaded = _net_audit(tmp_path_factory.mktemp("net-audit"))
     sb = _installer_with_real_bootstrap(tmp_path)
     run_env = {"PYTHONPATH": str(audit_dir)}
@@ -2388,6 +2390,7 @@ def test_real_bootstrap_installer_cell_makes_no_network_call(tmp_path, tmp_path_
 
 def test_a_seeding_bootstrap_run_makes_no_network_call(tmp_path, tmp_path_factory, monkeypatch):
     """#4795 A2: one `_run_env` bootstrap run into a fresh home (it seeds) makes no network call."""
+    # Same note as A1: Sandbox.run builds its env from scratch; only _run_env copies os.environ.
     monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)
     audit_dir, log, loaded = _net_audit(tmp_path_factory.mktemp("net-audit"))
     run_env = {"PYTHONPATH": str(audit_dir)}
