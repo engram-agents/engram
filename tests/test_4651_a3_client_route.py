@@ -407,6 +407,66 @@ def test_c3_a_missing_store_is_a_direct_write_error_and_creates_no_file(rt, spy,
     assert not (d / "knowledge.db").exists()
 
 
+@pytest.fixture
+def vec_backend_off():
+    """A context manager that forces the process-wide vec0 backend flag False (so `_load_vec_extension` returns False) and ALWAYS
+    restores it: the flag is module state that every later connection in the process reads, and `_load_vec_extension` never
+    recovers it by itself. It is entered AFTER the store is built (the schema setup would otherwise create no `vec_nodes`)."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def off():
+        saved = core._VEC_BACKEND_AVAILABLE
+        core._VEC_BACKEND_AVAILABLE = False
+        try:
+            yield
+        finally:
+            core._VEC_BACKEND_AVAILABLE = saved
+
+    return off
+
+
+def test_c3_a_vec0_load_failure_is_every_item_pending_mirror_and_raises_nothing(rt, spy, pubm, tmp_path, vec_backend_off):
+    """Pins EXISTING behaviour (the reviewer's probe). `_load_vec_extension` returning False is ignored by the direct route; the
+    primitive then refuses each mirror, so a 2-row batch is two `pending` / `mirror` results, no raise, and `nodes.embedding`
+    is as the primitive leaves a pending row (the OLD text; the debt marker is written). Mutants: a direct route that raises
+    DirectWriteError on a pending result (this cell red, no other); one that writes the new text through anyway."""
+    d, route = _direct_setup(rt, tmp_path, ids=("a", "b"))
+    items = _prepared(pubm, d, ["a", "b"])
+    before = all_state(d, ["a", "b"])
+    with vec_backend_off():
+        probe = sqlite3.connect(":memory:")
+        assert core._load_vec_extension(probe) is False  # the backend really is unavailable inside the block
+        probe.close()
+        results = rt.publish_batch(route, items)  # raises nothing, DirectWriteError included
+    assert [(r.node_id, r.status, r.reason) for r in results] == [("a", "pending", "mirror"), ("b", "pending", "mirror")]
+    after = all_state(d, ["a", "b"])
+    for nid in ("a", "b"):
+        assert after[nid][0] == before[nid][0]                      # nodes.embedding: the OLD text, not the new vector
+        assert after[nid][2] == before[nid][2]                      # the vec0 mirror untouched
+        assert json.loads(after[nid][1])[MARKER]["reason"] == "mirror"  # the debt is recorded, not hidden
+
+
+def test_c3_an_unreadable_epoch_defers_every_item_check_failed_writes_nothing_and_raises_nothing(rt, spy, pubm, tmp_path, monkeypatch):
+    """Pins EXISTING behaviour (the reviewer's probe). `current_epoch` raising on every call: the primitive reads it per item
+    and defers that item as `check_failed`, so every item is `deferred` / `check_failed`, no raise, the store byte-identical.
+    Mutant: a direct route that raises when a result's reason is `check_failed` (this cell red, no other)."""
+    d, route = _direct_setup(rt, tmp_path, ids=("a", "b"))
+    items = _prepared(pubm, d, ["a", "b"])
+    before = all_state(d, ["a", "b"])
+    calls = []
+
+    def unreadable():
+        calls.append(1)
+        raise OSError("injected: the config is unreadable")
+
+    monkeypatch.setattr(pubm, "current_epoch", unreadable)
+    results = rt.publish_batch(route, items)
+    assert [(r.node_id, r.status, r.reason) for r in results] == [("a", "deferred", "check_failed"), ("b", "deferred", "check_failed")]
+    assert calls, "the injected failure was never reached: the cell would pass on any epoch"
+    assert all_state(d, ["a", "b"]) == before
+
+
 # =====================================================================================================  C4
 def _wire(spy, pubm_items):
     return spy.writes[-1]
