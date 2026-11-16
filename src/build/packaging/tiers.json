@@ -735,6 +735,18 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/secret-env",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/secret-put",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/secrets_check.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/forum-mention-monitor.sh",
       "tier": "convenience"
     },
