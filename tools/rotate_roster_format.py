@@ -10,15 +10,23 @@ counts, whole-file sha256 values, per-class line numbers, and the class-B names
 
 A captured parser refusal that carries roster text is withheld whole and
 reported by exit code alone. The test is containment of a produced pattern, or
-of a produced line's bare name key, verbatim or with every backslash doubled --
-the rendering repr() produces, so an echoed exception object is covered too.
-Two limits bound that, and both are real: text the parser writes to stdout, or
-directly to file descriptor 2, is not captured (this tool redirects only
-sys.stderr), and a PARTIAL echo is still not detected unless it is exactly a
-produced line's bare name key, so a parser that prints any other fragment of a
-pattern can still carry name text to the operator. Neither limit fires with the
-repo's own scanner, which prints a line number and an exception class and
-nothing else; they matter only for a parser supplied by someone else.
+of a produced line's bare name key, verbatim, with every backslash doubled --
+the rendering repr() produces, so an echoed exception object is covered too --
+or case-insensitively. Case folding widens the test, and that width has a cost:
+a short name key can coincide case-insensitively inside an unrelated longer
+word (a key like ``Ann`` sits inside ``Announcement``), so a refusal carrying
+no roster text at all can be withheld, with the message still saying it
+contained roster text. That failure direction is the fail-closed one --
+over-withholding costs the operator ergonomics, while under-withholding would
+put roster text in a public log. Two limits still bound the test, and both are
+real: text the parser writes to stdout, or directly to file descriptor 2, is
+not captured (this tool redirects only sys.stderr), and a PARTIAL echo is still
+not detected unless it is exactly a produced line's bare name key or a case
+variant of one, so a parser that prints any other fragment of a pattern --
+neither a whole pattern, a bare name key, nor a case variant of one -- can
+still carry name text to the operator. Neither limit fires with the repo's own
+scanner, which prints a line number and an exception class and nothing else;
+they matter only for a parser supplied by someone else.
 
 Classification (R4) -- the roster lines are regexes, so "exact match" between a
 pattern and a name is not string equality. Each roster line and each B-file
@@ -348,16 +356,18 @@ def _pattern_present(text: str, pattern: str) -> bool:
 
 
 def _name_key_present(text: str, pattern: str) -> bool:
-    """True when ``text`` carries the name key of ``pattern`` verbatim or
-    backslash-doubled.
+    """True when ``text`` carries the name key of ``pattern`` verbatim,
+    backslash-doubled, or case-insensitively.
 
     The name key is ``_key_parts(pattern)[0]``: the pattern minus only its
-    wrappers. A parser that echoes the name without the ``\\b`` pair is a
-    partial echo that a whole-pattern containment test misses. An empty key
-    matches nothing (the tool refuses one elsewhere).
+    wrappers. A parser that echoes the name without the ``\\b`` pair, or in a
+    different case, is a partial echo that a whole-pattern containment test
+    misses. An empty key matches nothing (the tool refuses one elsewhere).
     """
     key = _key_parts(pattern)[0]
-    return bool(key) and _pattern_present(text, key)
+    return bool(key) and (
+        _pattern_present(text, key) or key.casefold() in text.casefold()
+    )
 
 
 def _reemit_parser_refusal(refusal: str, code: int, patterns) -> None:
@@ -366,8 +376,9 @@ def _reemit_parser_refusal(refusal: str, code: int, patterns) -> None:
     The no-roster-text guarantee covers text this tool emits, and a re-emitted
     parser stderr is such text. If the buffer carries (a) any produced roster
     pattern verbatim or backslash-doubled, or (b) the name key of any produced
-    pattern (non-empty) verbatim or backslash-doubled, nothing of it is
-    written: exactly one line names the refusal by exit code only.
+    pattern (non-empty) verbatim, backslash-doubled, or case-insensitively,
+    nothing of it is written: exactly one line names the refusal by exit code
+    only.
     """
     if any(
         pattern
