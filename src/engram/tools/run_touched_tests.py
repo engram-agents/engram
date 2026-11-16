@@ -769,7 +769,7 @@ def _name_patterns(cf: str, index: dict[str, set[str]]) -> tuple[re.Pattern, re.
     rule_a = re.compile(r"(?<![A-Za-z0-9_.\-])" + re.escape(name) + r"(?![A-Za-z0-9_])")
     parent = os.path.basename(os.path.dirname(cf))
     unique = not (index.get(name, set()) - {cf})
-    rule_b = None if (unique or not parent) else re.compile(r"\b" + re.escape(parent) + r"\b")
+    rule_b = None if (unique or not parent) else re.compile(r"(?<![A-Za-z0-9_])" + re.escape(parent) + r"(?![A-Za-z0-9_])")
     return rule_a, rule_b
 
 

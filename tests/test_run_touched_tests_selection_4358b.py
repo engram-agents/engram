@@ -448,6 +448,32 @@ def test_c7_parent_named_only_inside_a_variable_path_selects(tmp_path):
     assert "tests/test_v.py" in selected
 
 
+def test_c7_parent_starting_with_a_non_word_char_is_matched(tmp_path):
+    # `.claude-plugin` starts with "." so a `\b` before it never matches
+    repo = _repo(tmp_path, {
+        "tools/mods/m1/.claude-plugin/plugin.json": "{}\n",
+        "tools/probes/p1/.claude-plugin/plugin.json": "{}\n",
+        "tests/test_pl.py": 'P = ".claude-plugin" / "plugin.json"\n',
+    })
+    selected, _f, _r, _m = _select(["tools/mods/m1/.claude-plugin/plugin.json"], repo)
+    assert "tests/test_pl.py" in selected
+
+
+@pytest.mark.parametrize("text,selects", [
+    ('P = "forums"\nN = "server.py"\n', False),
+    ('my_forum = 1\nN = "server.py"\n', False),
+    ('P = "forum"\nN = "server.py"\n', True),
+])
+def test_c7_the_parent_word_stays_whole(tmp_path, text, selects):
+    repo = _repo(tmp_path, {
+        "forum/server.py": "S = 1\n",
+        "beta/server.py": "S = 2\n",
+        "tests/test_pw.py": text,
+    })
+    selected, _f, _r, _m = _select(["forum/server.py"], repo)
+    assert ("tests/test_pw.py" in selected) is selects
+
+
 def test_c7_unique_basename_needs_rule_a_alone(tmp_path):
     repo = _repo(tmp_path, {
         "zeta/solo.py": "S = 1\n",
