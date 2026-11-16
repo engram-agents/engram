@@ -1248,9 +1248,10 @@ def test_sandbox_run_timeout_is_bounded_when_a_descendant_left_the_group_holding
     ), 0o644)
     try:
         started = time.monotonic()
-        with pytest.raises(subprocess.TimeoutExpired):
+        with pytest.raises(subprocess.TimeoutExpired) as ei:
             sb.run("--yes", timeout=2)
         elapsed = time.monotonic() - started
+        assert ei.value.timeout == 2, "the re-raised TimeoutExpired is not the first one: %r" % ei.value.timeout
         assert pidfile.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
         assert elapsed < 10, "the timeout path took %.1fs: it waited on a descendant holding the pipes" % elapsed
     finally:
