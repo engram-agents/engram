@@ -43,6 +43,11 @@ linux_only = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="start-time identity uses /proc (Linux)"
 )
 
+# #4834: `_load_daemon_module()` runs the hook's module-level sys.path.insert in
+# this process; the shared window puts sys.path and sys.modules back when the
+# module ends, so a lone run (no earlier module loaded the hook) ends clean.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads_module")
+
 
 @pytest.fixture
 def home():

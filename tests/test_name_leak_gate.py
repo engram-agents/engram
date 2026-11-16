@@ -531,7 +531,8 @@ def gate_repo(tmp_path):
     return work, base_sha, g
 
 
-def _run_gate(work, base_sha, tmp_path, default_branch="dev"):
+def _run_gate(work, base_sha, tmp_path, default_branch="dev",
+              roster="somepattern\n"):
     """Run the extracted decide step; return (returncode, combined output)."""
     import subprocess
 
@@ -544,7 +545,7 @@ def _run_gate(work, base_sha, tmp_path, default_branch="dev"):
         EVENT_NAME="pull_request",
         PR_IS_FORK="false",
         EXPECTED_STATUS_NAME="name-leak-gate",
-        NAME_LEAK_ROSTER="somepattern\n",
+        NAME_LEAK_ROSTER=roster,
         ATTESTATION_PATH=".github/name-leak-roster.attestation.json",
         BASE_SHA=base_sha,
         DEFAULT_BRANCH=default_branch,
@@ -683,6 +684,282 @@ def test_harness_puts_the_roster_in_a_private_per_run_directory(gate_repo, tmp_p
     assert _roster_path(tmp_path) != first
 
 
+def _write_gate_attestation(
+    work, *, roster_format, sha, pattern_count=None, a=None, b=None
+):
+    """Write the attestation the decide step reads, in schema 1 or schema 2."""
+    attestation = {"roster_format": roster_format, "roster_sha256": sha}
+    if roster_format == 1:
+        attestation["pattern_count"] = pattern_count
+    else:
+        attestation["pattern_count_a"] = a
+        attestation["pattern_count_b"] = b
+    (work / ".github" / "name-leak-roster.attestation.json").write_text(
+        json.dumps(attestation), encoding="utf-8"
+    )
+
+
+def _gate_output(tmp_path, key):
+    """One value from the decide step's GITHUB_OUTPUT file."""
+    outputs = (tmp_path / "gh_output.txt").read_text(encoding="utf-8")
+    for line in outputs.splitlines():
+        if line.startswith(key + "="):
+            return line.split("=", 1)[1]
+    raise AssertionError(f"no {key}= line in the gate's GITHUB_OUTPUT: {outputs!r}")
+
+
+def _prepare_gate(gate_repo, tmp_path):
+    """Extract the decide step and give the checkout a runnable gate tool."""
+    work, base, _g = gate_repo
+    (tmp_path / "decide.py").write_text(_decide_script())
+    (work / "tools" / "name_leak_gate.py").write_text(_STUB_TOOL)
+    return work, base
+
+
+# ── the format cross-check (engram#4817) ─────────────────────────────────────
+#
+# Contract: the gate OBSERVES the roster's grammar by line shape and requires
+# the attestation's `roster_format` to agree, both directions. A mismatch is a
+# loud failure even when the whole-file sha256 still matches — the hash is over
+# bytes and cannot see the grammar. Both schemas are accepted: schema 1
+# (`roster_format: 1`, `pattern_count`) and schema 2 (`roster_format: 2`,
+# `pattern_count_a`/`pattern_count_b`); the format field itself must be an
+# integer that is not a bool, because `True == 1` in Python.
+
+
+def test_t8_format1_roster_and_format1_attestation_succeed(gate_repo, tmp_path):
+    """T8: today's world — a format-1 roster with a schema-1 attestation."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = "somepattern\n"
+    _write_gate_attestation(
+        work,
+        roster_format=1,
+        pattern_count=1,
+        sha=hashlib.sha256(roster.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc == 0, out
+    assert "name-leak gate: success" in out, out
+    assert _gate_output(tmp_path, "pattern_count") == "1"
+
+
+def test_t9_format2_roster_and_format2_attestation_succeed(gate_repo, tmp_path):
+    """T9: a format-2 roster with a schema-2 attestation succeeds and emits
+    `pattern_count` as `a + b`. T10's control: same roster, only the
+    attestation differs."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = (
+        "A\t\\bZZAlphaHolder\\b\n"
+        "B\t\\bYYBravoHandle\\b\n"
+    )
+    _write_gate_attestation(
+        work,
+        roster_format=2,
+        a=1,
+        b=1,
+        sha=hashlib.sha256(roster.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc == 0, out
+    assert "name-leak gate: success" in out, out
+    assert _gate_output(tmp_path, "pattern_count") == "2"
+
+
+def test_t10_the_attested_format_must_equal_the_observed_format(gate_repo, tmp_path):
+    """T10: a format mismatch fails closed in BOTH directions, naming the
+    disagreement, even though the whole-file sha256 matches in each case."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster2 = (
+        "A\t\\bZZAlphaHolder\\b\n"
+        "B\t\\bYYBravoHandle\\b\n"
+    )
+    roster1 = "somepattern\n"
+
+    # Format-2 roster, format-1 attestation.
+    _write_gate_attestation(
+        work,
+        roster_format=1,
+        pattern_count=2,
+        sha=hashlib.sha256(roster2.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster2)
+    assert rc == 0, out
+    assert "name-leak gate: failure" in out, out
+    assert "declares roster_format 1" in out, out
+    assert "shape is format 2" in out, out
+
+    # The mirror: format-1 roster, format-2 attestation.
+    _write_gate_attestation(
+        work,
+        roster_format=2,
+        a=0,
+        b=1,
+        sha=hashlib.sha256(roster1.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster1)
+    assert rc == 0, out
+    assert "name-leak gate: failure" in out, out
+    assert "declares roster_format 2" in out, out
+    assert "shape is format 1" in out, out
+
+
+def test_t11_mixed_roster_fails_naming_the_first_non_prefixed_line(
+    gate_repo, tmp_path
+):
+    """T11: a roster that mixes the grammars fails inside the decide step,
+    naming the first non-prefixed line — before any scan step can run (the
+    scan steps are conditioned on the decision's success, and this step exits
+    non-zero)."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = (
+        "A\t\\bZZAlphaHolder\\b\n"
+        "\\bYYBravoHandle\\b\n"
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc != 0, out
+    assert "line 2" in out, out
+    assert "ZZAlphaHolder" not in out and "YYBravoHandle" not in out, out
+
+
+@pytest.mark.parametrize("roster_format", [1, 2])
+def test_gate_refuses_a_present_roster_with_zero_patterns(
+    gate_repo, tmp_path, roster_format
+):
+    """C4a: a roster that is PRESENT but parses to no pattern is a gate
+    failure in both schemas, before any scan. The warn tool keeps its
+    skip-when-absent contract; the blocking surface must not pass by having
+    nothing to apply."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = "# only a comment\n\n"
+    sha = hashlib.sha256(roster.encode("utf-8")).hexdigest()
+    if roster_format == 1:
+        _write_gate_attestation(
+            work, roster_format=1, pattern_count=0, sha=sha
+        )
+    else:
+        _write_gate_attestation(work, roster_format=2, a=0, b=0, sha=sha)
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc != 0, out
+    assert "contains no pattern" in out, out
+
+
+def test_gate_rejects_a_boolean_attested_roster_format(gate_repo, tmp_path):
+    """`isinstance(True, int)` is True and `True == 1`, so a JSON `true` in
+    `roster_format` must be excluded EXPLICITLY before the value is compared
+    with 1 or 2 — the same bool guard the pattern counts already carry.
+
+    The rest of the attestation is valid and its sha256 matches, so only the
+    bool guard can fail this run; without it `true` passes as format 1."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = "somepattern\n"
+    _write_gate_attestation(
+        work,
+        roster_format=True,
+        pattern_count=1,
+        sha=hashlib.sha256(roster.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc == 0, out
+    assert "name-leak gate: failure" in out, out
+    assert "name-leak gate: success" not in out, out
+
+
+def test_t12_both_scan_steps_extract_the_scanner_from_src():
+    """T12: the warn tool loads the scanner as a SIBLING file, so both scan
+    steps must extract it next to `name_leak_warn_base.py` — from
+    `src/engram/tools/scan-leaks.py`, NEVER `tools/scan-leaks.py`, which is a
+    symlink in the tree and would make `git show` return the link's target
+    text rather than the file."""
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    job = workflow["jobs"]["name-leak-gate"]
+    scan_steps = [
+        step
+        for step in job["steps"]
+        if isinstance(step.get("run"), str)
+        and "name_leak_warn_base.py" in step["run"]
+    ]
+    assert len(scan_steps) == 2, (
+        f"expected the push-range and pull-request scan steps; got "
+        f"{len(scan_steps)}"
+    )
+    for step in scan_steps:
+        run = step["run"]
+        assert (
+            'git show "${BASE_SHA}:src/engram/tools/scan-leaks.py"'
+            in run
+        ), run
+        assert '> "${RUN_DIR}/scan-leaks.py"' in run, run
+
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert ":tools/scan-leaks.py" not in text, (
+        "a git show reads the symlink path tools/scan-leaks.py; git show "
+        "returns the link's target text, not the file"
+    )
+
+
+def test_t_new_a_format2_pattern_count_is_the_observed_total(gate_repo, tmp_path):
+    """T-new-a (control for T-new-b): a correct schema-2 attestation succeeds,
+    and the emitted `pattern_count` is the OBSERVED total — the number this
+    cell computes from its own fixture, not one copied from the attestation."""
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = (
+        "A\t\\bZZAlphaHolder\\b\n"
+        "A\t\\bWWCharlieBadge\\b\n"
+        "B\t\\bYYBravoHandle\\b\n"
+    )
+    observed_total = 3  # three content lines: two class A, one class B
+    _write_gate_attestation(
+        work,
+        roster_format=2,
+        a=2,
+        b=1,
+        sha=hashlib.sha256(roster.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc == 0, out
+    assert "name-leak gate: success" in out, out
+    assert _gate_output(tmp_path, "pattern_count") == str(observed_total)
+
+
+def test_t_new_b_format2_count_mismatch_warns_and_verdict_holds(
+    gate_repo, tmp_path
+):
+    """T-new-b: with `pattern_count_b` off by one and the sha256 still
+    matching, the gate WARNS naming the attested and observed class-B counts,
+    keeps its conclusion, and emits the OBSERVED total.
+
+    Red before the fix: `pattern_count` was taken from the attestation, so the
+    warning compared the attestation's own number with itself and could never
+    fire, and the emitted count was the attested 2 rather than the observed 3.
+    """
+    work, base = _prepare_gate(gate_repo, tmp_path)
+    roster = (
+        "A\t\\bZZAlphaHolder\\b\n"
+        "A\t\\bWWCharlieBadge\\b\n"
+        "B\t\\bYYBravoHandle\\b\n"
+    )
+    observed_total = 3
+    _write_gate_attestation(
+        work,
+        roster_format=2,
+        a=2,
+        b=0,
+        sha=hashlib.sha256(roster.encode("utf-8")).hexdigest(),
+    )
+    rc, out = _run_gate(work, base, tmp_path, roster=roster)
+    assert rc == 0, out
+    # A count mismatch is a warning, not a failure: the conclusion is unchanged.
+    assert "name-leak gate: success" in out, out
+    # The warning names BOTH numbers and the class, and only on the hash-matched
+    # path (the #4600 guard, preserved).
+    assert "records 0 class-B" in out, out
+    assert "the roster has 1" in out, out
+    assert _COUNT_WARNING in out, out
+    assert _gate_output(tmp_path, "pattern_count") == str(observed_total), (
+        "pattern_count must be the observed total, not the attested one"
+    )
+
+
 # ── the count-mismatch warning (#4600) ───────────────────────────────────────
 #
 # Contract: the "attestation records N pattern(s) but the roster has M" warning
@@ -721,6 +998,10 @@ def _run_with_attestation(gate_repo, tmp_path, *, count, sha):
         pytest.param(5, "0" * 64, False, "failure", id="hash-mismatch-count-differs"),
         pytest.param(1, _ROSTER_ONE_PATTERN_SHA, False, "success", id="hash-match-count-equal"),
         pytest.param(1, "0" * 64, False, "failure", id="hash-mismatch-count-equal"),
+        # isinstance(True, int) is True in Python, so a bare isinstance guard
+        # accepts JSON `true` as a valid count. The attestation schema says an
+        # integer; a bool is not one, and it must fail closed.
+        pytest.param(True, _ROSTER_ONE_PATTERN_SHA, False, "failure", id="bool-count"),
         pytest.param(None, None, False, "failure", id="attestation-absent"),
     ],
 )

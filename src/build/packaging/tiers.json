@@ -17,13 +17,13 @@
       },
       {
         "file": "tools/release_gates.py",
-        "line": 829,
+        "line": 850,
         "reason": "Release-scorecard gate-runner dispatch table (local lambdas closing over run_G2/etc.); this file contains zero emit()/emit_if_initialized() calls and is not on any site's backward-walk path.",
         "zero_emit_file": true
       },
       {
         "file": "tools/release_gates.py",
-        "line": 831,
+        "line": 852,
         "reason": "Same dispatch table as :829 (list-comprehension form); same exclusion rationale.",
         "zero_emit_file": true
       },
@@ -70,6 +70,10 @@
     },
     {
       "path": "engram_focus.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_embedding_publish.py",
       "tier": "essential"
     },
     {
@@ -526,6 +530,10 @@
     },
     {
       "path": "tools/_owner_read.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/_embedding_repair_route.py",
       "tier": "essential"
     },
     {
