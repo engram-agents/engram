@@ -1012,6 +1012,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/policy_guard_list.py",
+      "tier": "dev"
+    },
+    {
       "path": "tools/perf",
       "tier": "dev",
       "source": "tools/perf",

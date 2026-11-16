@@ -16,15 +16,31 @@ Three-layer union, deterministic, stateless (#4358):
     via a checked-in JSON file. Entries map path prefixes / globs to test globs.
 
   Layer 3 — Name reference (ALWAYS runs; not a fallback):
-    Every changed file selects every tests/test_*.py whose text contains the
-    changed file's BASENAME (substring, `grep -F` style). It runs even when
-    layer 1 or 2 resolved the file: a test that only reads a file's text is
-    invisible to both of them. Basename, not path: over-selection is accepted
-    (it costs time, not coverage).
+    A changed file `f` selects every tests/test_*.py that names it, by two
+    rules that must both hold: (a) f's basename occurs as a WHOLE name (not
+    preceded by a letter, digit, `_`, `-` or `.`, not followed by a letter,
+    digit or `_`); (b') if that basename is not unique among `git ls-files`,
+    the test file must also contain f's parent directory name as a whole word.
+    It runs even when layer 1 or 2 resolved the file: a test that only reads a
+    file's text is invisible to both of them.
 
-  Guard set (GUARD_SET_TESTS):
-    The whole-tree guard tests of PR-MERGE-POLICY "Owner merge" item 4 run in
-    every non-full selection that has at least one changed file.
+  Layer 1 identity is (import root, stem): a changed .py maps to a module only
+    when its directory is one of the module dirs (`_module_dirs`).
+
+  Guard set (`guard_set`):
+    The whole-tree guard tests of PR-MERGE-POLICY "Owner merge" item 4 are READ
+    from that document (no hand-copied list) and run in every non-full
+    selection that has at least one changed file.  The scanners it names
+    (tools/*.py) are printed as commands.
+
+  Forum universe: src/forum/tests/test_*.py is a separate universe (layers 1
+    and 3 plus "a changed test selects itself"), reported separately and never
+    put into the tests/ pytest command: it runs in the forum's own environment.
+
+  Exit codes: 0 ok / test result; 2 unknown ref or bad arguments; 3 a guard
+    path named by the policy is absent from the tree; 4 the policy document or
+    its anchors are missing; 5 no changed files; 6 a non-full selection equals
+    the whole tests/ universe (this is not a subset: run the suite).
 
   Full-suite triggers (unchanged):
     Changes to conftest.py, pytest.ini, requirements*, test-map.json itself,
@@ -44,8 +60,9 @@ Output honesty (the green-is-not-ground-truth discipline):
   Full suite trigger: names the triggering file(s).
 
 Usage:
-  python3 tools/run_touched_tests.py [--base REF] [--full] [--dry-run]
+  python3 tools/run_touched_tests.py --base REF [--head REF] [--dry-run]
                                      [--repo-root PATH] [-- pytest args...]
+  python3 tools/run_touched_tests.py --full [--dry-run]
   python3 tools/run_touched_tests.py --audit-imports [--strict]
   python3 tools/run_touched_tests.py --audit-patches [--strict]
 """
@@ -58,6 +75,7 @@ import fnmatch
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -82,38 +100,70 @@ ALWAYS_FULL_PATTERNS: list[str] = [
     "src/engram/tools/run_touched_tests.py",
 ]
 
-# The guard set: whole-tree guard tests that no changed file names, so layers
-# 1-3 never pick them (they enumerate or scan shipped files). Source of truth is
-# docs/internal/PR-MERGE-POLICY.md, "Owner merge" item 4 — copy from there, do
-# not invent members. tests/test_run_touched_tests_4358.py pins that every entry
-# exists in the tree, so this list cannot rot silently.
-#
-# NOT listed on purpose: tools/scan-leaks.py and tools/test_id_set_check.py are
-# named by that policy item but are scanners, not tests; they run outside this
-# tool (the merge seat runs them by hand / CI runs them).
-GUARD_SET_TESTS: tuple[str, ...] = (
-    "tests/test_syspath_shadow_guard.py",
-    "tests/test_tiers_manifest.py",
-    "tests/test_run_touched_tests.py",
-    "tests/test_ci_wiring_guard.py",
-    "tests/test_engramd_read_scan.py",
-    "tests/test_atomic_writer_modes_4013.py",
-    "tests/test_truncating_writes_ratchet_4380.py",
-    "tests/test_forum_process_spawn_ratchet_3518.py",
-    "tests/test_no_db_creation_before_bootstrap_4107.py",
-    "tests/test_no_unbounded_upward_walks_3983.py",
-    "tests/test_prose_home_sweep_3863.py",
-    "tests/test_prose_tail_6c_venv.py",
-    "tests/test_raw_home_read_gate_3863.py",
-    "tests/test_home_path_gate.py",
-    "tests/test_lesson_pattern_audit_shipped_3941.py",
-    "tests/test_docs_layout_guard.py",
-    "tests/test_policy_guard_list_4487.py",
-    "tests/test_metadata_parse_drift_guard_3413.py",
-    "tests/test_json_extract_metadata_guard_3485.py",
-    "tests/test_no_retired_cascade_store_asserts.py",
-    "tests/test_forum_redirect_origin_1459.py",
-)
+FORUM_TESTS_DIR = "src/forum/tests"
+POLICY_PATH = "docs/internal/PR-MERGE-POLICY.md"
+
+
+class RefError(Exception):
+    """A git ref given as --base / --head does not resolve to a commit (exit 2)."""
+
+
+class GuardSetError(Exception):
+    """The guard set cannot be read from the policy.  ``code`` is the exit code:
+    3 = a named path is absent from the tree, 4 = document or anchor missing."""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _load_policy_parser():
+    """Load the sibling policy_guard_list.py by file path (never via sys.path)."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "policy_guard_list.py"
+    spec = importlib.util.spec_from_file_location("policy_guard_list_rtt", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def guard_set(repo_root: str) -> tuple[list[str], list[str]]:
+    """Return ``(guard_tests, tool_checks)`` read from PR-MERGE-POLICY item 4.
+
+    guard_tests are the ``tests/*.py`` paths, tool_checks the ``tools/*.py``
+    paths.  The document is the source of truth (no copy here to rot).  Raises
+    GuardSetError(4) when the document, an anchor, or any test path is missing
+    from it, and GuardSetError(3) naming EVERY path it lists that is absent from
+    the tree.  There is no quiet filter: a missing guard is a loud failure.
+    """
+    policy = os.path.join(repo_root, POLICY_PATH)
+    try:
+        with open(policy, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        raise GuardSetError(
+            4, f"guard set: cannot read {POLICY_PATH} (anchor for Owner-merge item 4): {exc}"
+        ) from exc
+    parser = _load_policy_parser()
+    try:
+        paths = parser.item4_paths(text)
+    except parser.PolicyAnchorError as exc:
+        raise GuardSetError(4, f"guard set: {POLICY_PATH}: {exc}") from exc
+    tests = [p for p in paths if p.startswith("tests/")]
+    tools = [p for p in paths if p.startswith("tools/")]
+    if not tests:
+        raise GuardSetError(
+            4, f"guard set: {POLICY_PATH} Owner-merge item 4 names no tests/ paths"
+        )
+    missing = [p for p in paths if not os.path.isfile(os.path.join(repo_root, p))]
+    if missing:
+        raise GuardSetError(
+            3,
+            f"guard set: {POLICY_PATH} Owner-merge item 4 names files that are not in "
+            "the tree: " + ", ".join(missing),
+        )
+    return tests, tools
 
 
 # ---------------------------------------------------------------------------
@@ -145,19 +195,41 @@ def _find_repo_root(start: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _changed_files(base: str, repo_root: str) -> list[str]:
-    """Return list of changed files (relative to repo root) vs base ref.
-
-    Combines:
-      - git diff --name-only <base>...HEAD  (committed changes on branch)
-      - git status --porcelain              (working-tree untracked/modified)
-    """
-    changed: set[str] = set()
-
-    # Committed diff vs base
+def _verify_ref(ref: str, repo_root: str) -> None:
+    """Raise RefError unless *ref* resolves to a commit in the repo."""
     try:
         result = subprocess.run(
-            ["git", "diff", "--name-only", f"{base}...HEAD"],
+            ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RefError(f"cannot resolve ref {ref!r}: git is not available") from exc
+    if result.returncode != 0:
+        raise RefError(f"unknown ref {ref!r}: does not resolve to a commit")
+
+
+def _changed_files(base: str, repo_root: str, head: str | None = None) -> list[str]:
+    """Return list of changed files (relative to repo root).
+
+    Both refs are verified first; an unknown one raises RefError (exit 2 in
+    main), never an empty list that would read as "nothing changed" (#3410).
+
+    *head* given:  exactly ``git diff --name-only <base>...<head>`` — a
+      reproducible scope, independent of the working tree.
+    *head* None:   ``<base>...HEAD`` plus the working-tree files from
+      ``git status --porcelain`` (an author iterating locally sees uncommitted
+      edits; fairies run pre-commit).
+    """
+    _verify_ref(base, repo_root)
+    if head is not None:
+        _verify_ref(head, repo_root)
+    changed: set[str] = set()
+
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", f"{base}...{head or 'HEAD'}"],
             cwd=repo_root,
             capture_output=True,
             text=True,
@@ -169,6 +241,9 @@ def _changed_files(base: str, repo_root: str) -> list[str]:
                     changed.add(line)
     except FileNotFoundError:
         pass  # git not available
+
+    if head is not None:
+        return sorted(changed)
 
     # Working-tree status: untracked + modified (fairies run pre-commit)
     try:
@@ -258,7 +333,7 @@ def _eval_path_expr(node: ast.AST, env: dict[str, str]) -> str | None:
     return None
 
 
-def _import_roots(repo_root: str) -> list[str]:
+def _import_roots(repo_root: str, tests_dir: str = TESTS_DIR) -> list[str]:
     """Return the import roots the tests actually use (#4358).
 
     Derived by parsing ``tests/conftest.py`` (ast only — no import, no exec):
@@ -268,14 +343,22 @@ def _import_roots(repo_root: str) -> list[str]:
     the repo root alone is used (the pre-#4358 behaviour for repos with no
     conftest).  If conftest's roots change, discovery follows — there is no
     hand-written directory list here.
+
+    *tests_dir* (repo-relative) picks the universe whose conftest is read; for
+    any universe other than ``tests/`` the fallback is the directory that holds
+    that tests directory (``src/forum`` for ``src/forum/tests``), not the repo
+    root.
     """
     repo = os.path.abspath(repo_root)
-    conftest = os.path.join(repo, TESTS_DIR, "conftest.py")
+    fallback = repo if tests_dir == TESTS_DIR else os.path.dirname(
+        os.path.join(repo, tests_dir)
+    )
+    conftest = os.path.join(repo, tests_dir, "conftest.py")
     try:
         with open(conftest, encoding="utf-8", errors="replace") as f:
             tree = ast.parse(f.read(), filename=conftest)
     except (SyntaxError, OSError):
-        return [repo]
+        return [fallback]
 
     # Resolve simple `NAME = <path expr>` bindings; repeat so use-before-def
     # order inside the walk (BFS) cannot hide a binding.
@@ -321,24 +404,24 @@ def _import_roots(repo_root: str) -> list[str]:
         inside = val == repo or val.startswith(repo + os.sep)
         if inside and os.path.isdir(val) and val not in roots:
             roots.append(val)
-    return roots or [repo]
+    return roots or [fallback]
 
 
-def _module_dirs(repo_root: str) -> list[str]:
+def _module_dirs(repo_root: str, tests_dir: str = TESTS_DIR) -> list[str]:
     """Directories whose ``*.py`` files are importable by stem in the tests.
 
     Each import root, plus its ``tools/`` sub-directory (the ``tools`` package
     is also put on the path by the tests that ``import baton`` directly).
     """
     dirs: list[str] = []
-    for root in _import_roots(repo_root):
+    for root in _import_roots(repo_root, tests_dir):
         for d in (root, os.path.join(root, "tools")):
             if os.path.isdir(d) and d not in dirs:
                 dirs.append(d)
     return dirs
 
 
-def _discover_repo_modules(repo_root: str) -> set[str]:
+def _discover_repo_modules(repo_root: str, tests_dir: str = TESTS_DIR) -> set[str]:
     """Return the set of Python module stems defined in the repo.
 
     Scans ``*.py`` in every directory of `_module_dirs` (each import root that
@@ -358,7 +441,7 @@ def _discover_repo_modules(repo_root: str) -> set[str]:
     key reachable for tools/engine/*.py and tools/migration/*.py changes.
     """
     modules: set[str] = set()
-    for d in _module_dirs(repo_root):
+    for d in _module_dirs(repo_root, tests_dir):
         for p in Path(d).glob("*.py"):
             # "__init__" is never a useful lookup key (no test imports it) and
             # would pollute module_deps with a dead entry.
@@ -377,6 +460,19 @@ def _path_to_module_stem(path: str) -> str | None:
     if path.endswith(".py"):
         return Path(path).stem
     return None
+
+
+def _in_module_dirs(path: str, repo_root: str, module_dirs: set[str]) -> bool:
+    """True when the repo-relative .py *path* sits directly in a module dir.
+
+    *module_dirs* holds real paths (`_module_dirs`, realpath'd); the file's own
+    directory is real-pathed the same way, so a symlinked tools/ entry and its
+    src/engram/tools target compare equal.
+    """
+    if not path.endswith(".py"):
+        return False
+    d = os.path.realpath(os.path.dirname(os.path.join(repo_root, path)))
+    return d in module_dirs
 
 
 def _package_root_stem(path: str, roots_rel: tuple[str, ...] = ("",)) -> str | None:
@@ -415,7 +511,9 @@ def _package_root_stem(path: str, roots_rel: tuple[str, ...] = ("",)) -> str | N
     return None
 
 
-def _build_import_graph(repo_root: str) -> dict[str, set[str]]:
+def _build_import_graph(
+    repo_root: str, tests_dir: str = TESTS_DIR
+) -> dict[str, set[str]]:
     """Build the reverse import graph: module_stem → set of test files.
 
     Parses all tests/test_*.py files and all source modules under the import roots
@@ -425,15 +523,15 @@ def _build_import_graph(repo_root: str) -> dict[str, set[str]]:
 
     Returns {module_stem: {relative_test_file_path, ...}}.
     """
-    tests_dir = Path(repo_root) / TESTS_DIR
-    if not tests_dir.is_dir():
+    tests_path = Path(repo_root) / tests_dir
+    if not tests_path.is_dir():
         return {}
 
-    repo_module_stems = _discover_repo_modules(repo_root)
+    repo_module_stems = _discover_repo_modules(repo_root, tests_dir)
 
     # Map: test_file → directly-imported repo module stems
     test_direct: dict[str, set[str]] = {}
-    for tf in sorted(tests_dir.glob("test_*.py")):
+    for tf in sorted(tests_path.glob("test_*.py")):
         rel = str(tf.relative_to(repo_root))
         raw = _parse_imports(str(tf))
         test_direct[rel] = raw & repo_module_stems
@@ -442,7 +540,7 @@ def _build_import_graph(repo_root: str) -> dict[str, set[str]]:
     # Same stem in two directories (e.g. a repo-root tools/ symlink and its
     # src/engram/tools target): union the deps rather than let one overwrite.
     module_deps: dict[str, set[str]] = {}
-    for d in _module_dirs(repo_root):
+    for d in _module_dirs(repo_root, tests_dir):
         for p in Path(d).glob("*.py"):
             raw = _parse_imports(str(p))
             module_deps.setdefault(p.stem, set()).update(raw & repo_module_stems)
@@ -628,29 +726,78 @@ def _matches_full_trigger(changed_file: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _name_reference_hits(
-    changed_files: list[str], repo_root: str
-) -> dict[str, set[str]]:
-    """Layer 3: changed file → tests/test_*.py whose text contains its basename.
+def _basename_index(repo_root: str) -> dict[str, set[str]]:
+    """basename -> repo-relative paths that carry it, from ``git ls-files``.
 
-    Substring match on the BASENAME (``grep -F`` style), deliberately not the
-    repo-relative path: tests build paths (no test spells out
-    ``engram-nap/SKILL.md``), so a path match under-selects.  Generic basenames
-    over-select; that costs time, not coverage.  Each test file is read once.
+    This reads the CHECKOUT, not ``--head``: the merge seat runs the tool in the
+    scratch tree, where checkout == head.  Outside a git repo (synthetic
+    fixtures) it falls back to walking the filesystem, skipping ``.git``.
     """
-    tests_dir = Path(repo_root) / TESTS_DIR
+    paths: list[str] = []
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=repo_root, capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            paths = [p for p in (result.stdout or "").split("\0") if p]
+        else:
+            result = None
+    except FileNotFoundError:
+        result = None
+    if result is None:
+        for dirpath, dirnames, filenames in os.walk(repo_root):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                paths.append(os.path.relpath(full, repo_root).replace(os.sep, "/"))
+    index: dict[str, set[str]] = {}
+    for p in paths:
+        index.setdefault(os.path.basename(p), set()).add(p)
+    return index
+
+
+def _name_patterns(cf: str, index: dict[str, set[str]]) -> tuple[re.Pattern, re.Pattern | None]:
+    """The two name rules for changed file *cf*: (a) pattern, (b') pattern or None.
+
+    (a) the basename occurs as a whole name: not preceded by a letter, digit,
+        ``_``, ``-`` or ``.``; not followed by a letter, digit or ``_``.
+    (b') when the basename is NOT unique (another tracked path carries it), the
+        test must also contain the parent directory's name as a whole word,
+        anywhere in the file.  A unique basename needs (a) only.
+    """
+    name = os.path.basename(cf)
+    rule_a = re.compile(r"(?<![A-Za-z0-9_.\-])" + re.escape(name) + r"(?![A-Za-z0-9_])")
+    parent = os.path.basename(os.path.dirname(cf))
+    unique = not (index.get(name, set()) - {cf})
+    rule_b = None if (unique or not parent) else re.compile(r"\b" + re.escape(parent) + r"\b")
+    return rule_a, rule_b
+
+
+def _name_reference_hits(
+    changed_files: list[str], repo_root: str, tests_dir: str = TESTS_DIR
+) -> dict[str, set[str]]:
+    """Layer 3: changed file → test files (in *tests_dir*) that name it.
+
+    A test names a changed file when rule (a) AND (b') hold (see
+    `_name_patterns`).  Basename-with-parent, not path: tests build paths (no
+    test spells out ``engram-nap/SKILL.md``), so a path match under-selects, and
+    a bare substring over-selects (``viz_server.py`` is not ``server.py``).
+    Each test file is read once.
+    """
+    tests_path = Path(repo_root) / tests_dir
     hits: dict[str, set[str]] = {cf: set() for cf in changed_files}
-    if not tests_dir.is_dir() or not changed_files:
+    if not tests_path.is_dir() or not changed_files:
         return hits
-    names = {cf: os.path.basename(cf) for cf in changed_files}
-    for tf in sorted(tests_dir.glob("test_*.py")):
+    index = _basename_index(repo_root)
+    pats = {cf: _name_patterns(cf, index) for cf in changed_files if os.path.basename(cf)}
+    for tf in sorted(tests_path.glob("test_*.py")):
         try:
             text = tf.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         rel = str(tf.relative_to(repo_root))
-        for cf, name in names.items():
-            if name and name in text:
+        for cf, (rule_a, rule_b) in pats.items():
+            if rule_a.search(text) and (rule_b is None or rule_b.search(text)):
                 hits[cf].add(rel)
     return hits
 
@@ -715,6 +862,8 @@ def select_tests(
         for r in _import_roots(repo_root)
     )
 
+    module_dirs = {os.path.realpath(d) for d in _module_dirs(repo_root)}
+
     # Load layer-2 convention map
     test_map = _load_test_map(repo_root)
 
@@ -736,7 +885,10 @@ def select_tests(
         l1_hits: set[str] = set()
 
         # — Layer 1: import graph —
-        stem = _path_to_module_stem(cf)
+        # Identity is (import root, stem): the changed .py must sit in one of the
+        # module dirs, compared as real paths.  A same-stem file elsewhere (a
+        # second server.py off the import roots) gives layer 1 nothing.
+        stem = _path_to_module_stem(cf) if _in_module_dirs(cf, repo_root, module_dirs) else None
         if stem and stem in import_graph:
             l1_hits = import_graph[stem]
             selected |= l1_hits
@@ -744,7 +896,7 @@ def select_tests(
             resolved = True
             if verbose:
                 print(f"  [L1] {cf} → {len(l1_hits)} test(s) via import graph")
-        elif stem:
+        elif cf.endswith(".py"):
             # Fallback: for tools sub-package files (tools/engine/build.py → stem
             # "build", absent from graph), check the package root key "tools".
             # import_graph["tools"] holds all tests that import any tools.* module.
@@ -810,11 +962,10 @@ def select_tests(
             if verbose:
                 print(f"  [unreferenced] {cf} → no layer resolves it")
 
-    # Guard set: always runs (skipped quietly when an entry is absent from the
-    # tree; tests/test_run_touched_tests_4358.py fails if the constant rots).
-    guard = {
-        g for g in GUARD_SET_TESTS if os.path.exists(os.path.join(repo_root, g))
-    }
+    # Guard set: always runs, read from the policy (GuardSetError → main exits
+    # 3 or 4; there is no quiet existence filter here).
+    guard_tests, _tool_checks = guard_set(repo_root)
+    guard = set(guard_tests)
     selected |= guard
 
     # Filter to only existing files
@@ -840,6 +991,41 @@ def select_tests(
     return existing, False, [], map_selected_existing
 
 
+def select_forum_tests(changed_files: list[str], repo_root: str) -> list[str]:
+    """Select from the SEPARATE forum universe (``src/forum/tests/test_*.py``).
+
+    Layers 1 and 3 plus "a changed test selects itself" (no convention map, no
+    guard set).  Layer 1 uses the import roots ``src/forum/tests/conftest.py``
+    puts on sys.path, falling back to ``src/forum`` when that conftest is absent
+    or yields nothing.  Bound: the forum tests mostly spell their imports
+    ``from forum import X``, which layer 1 cannot map to a module stem, so layer
+    3 (name reference) carries most of this selection.  Forum files are reported
+    on their own and never enter the tests/ pytest command: they run in the
+    forum's own environment.
+    """
+    tests_path = Path(repo_root) / FORUM_TESTS_DIR
+    if not tests_path.is_dir() or not changed_files:
+        return []
+    import_graph = _build_import_graph(repo_root, FORUM_TESTS_DIR)
+    module_dirs = {os.path.realpath(d) for d in _module_dirs(repo_root, FORUM_TESTS_DIR)}
+    name_hits = _name_reference_hits(changed_files, repo_root, FORUM_TESTS_DIR)
+    selected: set[str] = set()
+    for cf in changed_files:
+        if _in_module_dirs(cf, repo_root, module_dirs):
+            stem = _path_to_module_stem(cf)
+            if stem and stem in import_graph:
+                selected |= import_graph[stem]
+        selected |= name_hits.get(cf, set())
+        if (
+            cf.startswith(f"{FORUM_TESTS_DIR}/")
+            and cf.endswith(".py")
+            and os.path.basename(cf).startswith("test_")
+            and os.path.exists(os.path.join(repo_root, cf))
+        ):
+            selected.add(cf)
+    return sorted(t for t in selected if os.path.exists(os.path.join(repo_root, t)))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -851,6 +1037,58 @@ def _count_total_test_files(repo_root: str) -> int:
     if not tests_dir.is_dir():
         return 0
     return len(list(tests_dir.glob("test_*.py")))
+
+
+def _count_forum_test_files(repo_root: str) -> int:
+    """Count test_*.py files in the forum universe (src/forum/tests/)."""
+    forum_dir = Path(repo_root) / FORUM_TESTS_DIR
+    if not forum_dir.is_dir():
+        return 0
+    return len(list(forum_dir.glob("test_*.py")))
+
+
+def _test_universe(repo_root: str) -> set[str]:
+    """Every tests/test_*.py of the tests/ universe, repo-relative."""
+    tests_dir = Path(repo_root) / TESTS_DIR
+    if not tests_dir.is_dir():
+        return set()
+    return {str(p.relative_to(repo_root)) for p in tests_dir.glob("test_*.py")}
+
+
+def _tool_check_commands(tools: list[str], base: str, head: str | None) -> list[str]:
+    """The policy's tools/*.py scanners as printable commands.
+
+    scan-leaks takes ``--root .``; test_id_set_check takes the merge-base of
+    base and head as ``--base`` (its --help: never the target branch's tip) and
+    the head as ``--head``.  Any other tool is printed bare.
+    """
+    h = head or "HEAD"
+    cmds: list[str] = []
+    for t in tools:
+        name = os.path.basename(t)
+        if name == "scan-leaks.py":
+            cmds.append(f"python3 {t} --root .")
+        elif name == "test_id_set_check.py":
+            cmds.append(f"python3 {t} --base $(git merge-base {base} {h}) --head {h}")
+        else:
+            cmds.append(f"python3 {t}")
+    return cmds
+
+
+_FORUM_LINE = "forum tests: run in the forum's own environment"
+
+
+def _forum_lines(forum_selected: list[str], forum_total: int) -> list[str]:
+    """Human block for the separate forum universe, with its pytest command."""
+    lines = [f"[forum] {_FORUM_LINE}"]
+    if forum_selected:
+        lines.append(f"[forum] {len(forum_selected)}/{forum_total} forum test files selected:")
+        for t in forum_selected:
+            lines.append(f"  {t}")
+        lines.append("[forum] command: python -m pytest " + " ".join(forum_selected))
+    else:
+        lines.append(f"[forum] 0/{forum_total} forum test files selected")
+    return lines
 
 
 _FULL_SUITE_NOTE = (
@@ -1040,6 +1278,78 @@ def _empty_extra() -> dict:
     return {"layers": dict(_EMPTY_LAYERS), "unreferenced": []}
 
 
+def _err(msg: str) -> None:
+    print(f"run_touched_tests: {msg}", file=sys.stderr)
+
+
+def _compute_selection(args, repo_root: str, verbose: bool):
+    """Diff, select, and apply the refusal exits.  Returns an int exit code (a
+    refusal, already reported on stderr, nothing selected) or a dict:
+
+      {changed, selected, is_full, reasons, map_selected, detail,
+       forum_selected, tool_checks}
+
+    Refusals: 2 unknown ref, 3/4 guard set unreadable, 5 no changed files,
+    6 a non-full selection that is the whole tests/ universe.
+    """
+    try:
+        if args.head is None:
+            changed = _changed_files(args.base, repo_root)
+        else:
+            changed = _changed_files(args.base, repo_root, head=args.head)
+    except RefError as exc:
+        _err(str(exc))
+        return 2
+
+    head_label = args.head or "HEAD"
+    if not changed:
+        _err(
+            f"no changed files between {args.base} and {head_label}: nothing to "
+            "select (the guard set is not a selection)"
+        )
+        return 5
+
+    if verbose:
+        print(f"[run_touched_tests] changed files vs {args.base} ({len(changed)} total):")
+        for cf in changed:
+            print(f"  {cf}")
+
+    detail: dict = {}
+    try:
+        selected, is_full, reasons, map_selected = select_tests(
+            changed, repo_root, verbose=verbose, detail=detail
+        )
+    except GuardSetError as exc:
+        _err(str(exc))
+        return exc.code
+
+    out = {
+        "changed": changed, "selected": selected, "is_full": is_full,
+        "reasons": reasons, "map_selected": map_selected, "detail": detail,
+        "forum_selected": [], "tool_checks": [],
+    }
+    if is_full:
+        return out
+
+    universe = _test_universe(repo_root)
+    if universe and set(selected) == universe:
+        _err(
+            f"the selection for {args.base}...{head_label} is every one of the "
+            f"{len(universe)} tests/ test files: that is not a subset, run the whole "
+            "suite (--full)"
+        )
+        return 6
+
+    try:
+        _tests, tools = guard_set(repo_root)
+    except GuardSetError as exc:
+        _err(str(exc))
+        return exc.code
+    out["tool_checks"] = _tool_check_commands(tools, args.base, args.head)
+    out["forum_selected"] = select_forum_tests(changed, repo_root)
+    return out
+
+
 def _emit_json_selection(args, repo_root: str) -> int:
     """Emit the touched-test selection as a single JSON object on stdout.
 
@@ -1053,24 +1363,30 @@ def _emit_json_selection(args, repo_root: str) -> int:
           "changed_files":    [<repo-relative paths>],
           "full":             <bool — whole suite selected>,
           "full_reasons":     [<trigger descriptions when full>],
-          "selected":         [<test files>; [] when full or none>],
-          "total_test_files": <int>,
+          "selected":         [<tests/ test files>; [] when full or none>],
+          "total_test_files": <int — tests/ universe>,
           "buckets":          {"internals": N, "contract": N, "map_residue": N},
           "layers":           {"l1_import_graph": N, "l2_map": N,
                                "l3_name_reference": N, "guard_set": N},
-          "unreferenced":     [<changed files no layer resolved>]
+          "unreferenced":     [<changed files no layer resolved>],
+          "forum_selected":   [<src/forum/tests files>; the separate forum universe],
+          "forum_total_test_files": <int>,
+          "tool_checks":      [<commands: the policy's tools/*.py scanners>]
         }
 
-    "layers" and "unreferenced" were added in #4358 (additive; no key removed).
-    Layer counts overlap (they are not a partition of "selected").
+    "layers" and "unreferenced" were added in #4358; "forum_selected",
+    "forum_total_test_files" and "tool_checks" in the selection-fixes follow-up
+    (additive; no key removed).  Layer counts overlap (not a partition).
 
     full=true means the convergence-gate whole suite is selected (selected is []
     then — the consumer runs `pytest tests/`, not the listed subset). Buckets are
     zero when full or when nothing is selected. select_tests runs with
     verbose=False so no banner prose leaks onto stdout and corrupts the JSON.
+    A refusal (exit 2-6) prints nothing on stdout.
     """
     empty_buckets = {"internals": 0, "contract": 0, "map_residue": 0}
     total_test_files = _count_total_test_files(repo_root)
+    forum_total = _count_forum_test_files(repo_root)
 
     if args.full:
         out = {
@@ -1078,26 +1394,33 @@ def _emit_json_selection(args, repo_root: str) -> int:
             "full_reasons": ["--full flag"], "selected": [],
             "total_test_files": total_test_files, "buckets": empty_buckets,
             **_empty_extra(),
+            "forum_selected": [], "forum_total_test_files": forum_total,
+            "tool_checks": [],
         }
         print(json.dumps(out))
         return 0
 
-    changed = _changed_files(args.base, repo_root)
-    detail: dict = {}
-    selected, is_full, reasons, map_selected = select_tests(
-        changed, repo_root, verbose=False, detail=detail
-    )
+    res = _compute_selection(args, repo_root, verbose=False)
+    if isinstance(res, int):
+        return res
+    changed, selected = res["changed"], res["selected"]
+    detail = res["detail"]
     extra = {
         "layers": detail.get("layers") or dict(_EMPTY_LAYERS),
         "unreferenced": detail.get("unreferenced") or [],
     }
+    tail = {
+        "forum_selected": res["forum_selected"],
+        "forum_total_test_files": forum_total,
+        "tool_checks": res["tool_checks"],
+    }
 
-    if is_full:
+    if res["is_full"]:
         out = {
             "base": args.base, "changed_files": changed, "full": True,
-            "full_reasons": reasons, "selected": [],
+            "full_reasons": res["reasons"], "selected": [],
             "total_test_files": total_test_files, "buckets": empty_buckets,
-            **extra,
+            **extra, **tail,
         }
         print(json.dumps(out))
         return 0
@@ -1106,7 +1429,7 @@ def _emit_json_selection(args, repo_root: str) -> int:
         test_map = _load_test_map(repo_root)
         allowlist = _get_server_import_allowlist(test_map)
         n_internals, n_contract, n_map_residue = _classify_selection(
-            selected, map_selected, allowlist
+            selected, res["map_selected"], allowlist
         )
         buckets = {
             "internals": n_internals,
@@ -1120,7 +1443,7 @@ def _emit_json_selection(args, repo_root: str) -> int:
         "base": args.base, "changed_files": changed, "full": False,
         "full_reasons": [], "selected": selected,
         "total_test_files": total_test_files, "buckets": buckets,
-        **extra,
+        **extra, **tail,
     }
     print(json.dumps(out))
     return 0
@@ -1129,24 +1452,38 @@ def _emit_json_selection(args, repo_root: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Import-graph test selection for fast PR iteration. "
-            "Full suite remains the convergence gate."
+            "Import-graph test selection: the per-PR test scope of "
+            "docs/internal/PR-MERGE-POLICY.md. The whole suite runs nightly on "
+            "dev and at the release cut."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  python3 tools/run_touched_tests.py --base origin/dev\n"
-            "  python3 tools/run_touched_tests.py --dry-run\n"
-            "  python3 tools/run_touched_tests.py -- -x -v\n"
+            "  python3 tools/run_touched_tests.py --base origin/dev --head my-branch --dry-run\n"
+            "  python3 tools/run_touched_tests.py --base origin/dev -- -x -v\n"
             "  python3 tools/run_touched_tests.py --audit-imports\n"
             "  python3 tools/run_touched_tests.py --audit-patches --strict\n"
         ),
     )
     parser.add_argument(
         "--base",
-        default="origin/dev",
+        default=None,
         metavar="REF",
-        help="Base git ref for diff (default: origin/dev)",
+        help=(
+            "Base git ref for the diff (REQUIRED for selection; not needed for "
+            "--full or the audits). An unknown ref exits 2."
+        ),
+    )
+    parser.add_argument(
+        "--head",
+        default=None,
+        metavar="REF",
+        help=(
+            "Head git ref (default: HEAD, plus uncommitted working-tree files). "
+            "When given, the changed files are exactly `git diff --name-only "
+            "BASE...HEAD_REF`."
+        ),
     )
     parser.add_argument(
         "--full",
@@ -1198,7 +1535,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Emit the selection as a single JSON object on stdout and exit 0 "
             "(machine-readable interface for run_matrix.py / CI — no pytest run, "
-            "no human banner). Composes with --base; ignores --dry-run/passthrough. "
+            "no human banner). Composes with --base/--head; ignores --dry-run/passthrough. "
             "With --full the diff is skipped, so changed_files is emitted as []."
         ),
     )
@@ -1259,49 +1596,48 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    # --base is required for the selection modes (they diff); --full and the
+    # audits never diff, so they do not need it.
+    if not args.full and args.base is None:
+        parser.error("--base REF is required (selection diffs BASE...HEAD)")
+
     # --json: machine-readable selection for run_matrix.py / CI (no pytest run,
     # no human banner — structured output, never scraped prose).
     if args.json:
         return _emit_json_selection(args, repo_root)
 
     total_test_files = _count_total_test_files(repo_root)
+    forum_total = _count_forum_test_files(repo_root)
+    full_forum_lines = [
+        f"[forum] {_FORUM_LINE}",
+        f"[forum] command: python -m pytest {FORUM_TESTS_DIR}",
+    ]
 
     # --full: bypass selection entirely
     if args.full:
         print("[run_touched_tests] --full: running complete test suite")
+        for line in full_forum_lines:
+            print(line)
         if args.dry_run:
             print("[dry-run] would run: pytest tests/")
             return 0
         cmd = [sys.executable, "-m", "pytest", "tests/"] + passthrough
         return subprocess.run(cmd, cwd=repo_root).returncode
 
-    # Collect changed files
-    changed = _changed_files(args.base, repo_root)
+    res = _compute_selection(args, repo_root, verbose=args.dry_run)
+    if isinstance(res, int):
+        return res
+    changed, selected = res["changed"], res["selected"]
+    detail, map_selected = res["detail"], res["map_selected"]
 
-    if args.dry_run:
-        print(f"[run_touched_tests] changed files vs {args.base} ({len(changed)} total):")
-        for cf in changed:
-            print(f"  {cf}")
-
-    # Run selection pipeline
-    detail: dict = {}
-    selected, is_full, reasons, map_selected = select_tests(
-        changed, repo_root, verbose=args.dry_run, detail=detail
-    )
-
-    if is_full:
-        trigger_desc = "; ".join(reasons)
+    if res["is_full"]:
+        trigger_desc = "; ".join(res["reasons"])
         print(f"[run_touched_tests] FULL MAIN SUITE triggered by: {trigger_desc}")
-        # Honesty note (colleague-review catch): "full" here means tests/ —
-        # forum/tests/ deliberately NOT included: those run against the forum
-        # venv (bs4 et al. are version-pinned there; the plugin venv produces
-        # dozens of env-skew false failures). Until the forum-deploy epic's
-        # per-target test runner lands, forum changes need a manual
-        # forum-venv pytest run — say so loudly instead of implying coverage.
-        print(
-            "[run_touched_tests] NOTE: forum/tests/ NOT included — run them "
-            "against the forum venv separately (see the forum-deploy epic)."
-        )
+        # The forum tests are a separate universe: they run in the forum's own
+        # environment (bs4 et al. are version-pinned there; the plugin venv
+        # produces env-skew false failures), never in the tests/ command.
+        for line in full_forum_lines:
+            print(line)
         if args.dry_run:
             print("[dry-run] would run: pytest tests/")
             return 0
@@ -1312,6 +1648,11 @@ def main(argv: list[str] | None = None) -> int:
     test_map = _load_test_map(repo_root)
     allowlist = _get_server_import_allowlist(test_map)
 
+    forum_lines = _forum_lines(res["forum_selected"], forum_total)
+    tool_lines = ["[tool checks] run these too (the policy's scanners):"] + [
+        f"  {c}" for c in res["tool_checks"]
+    ]
+
     if not selected:
         msg = (
             f"SUBSET green (0/{total_test_files} selected for "
@@ -1319,7 +1660,7 @@ def main(argv: list[str] | None = None) -> int:
             f"convergence claim. {_FULL_SUITE_NOTE}"
         )
         print("[run_touched_tests] no tests selected (no changed files resolve to tests)")
-        for line in _layer_lines(detail):
+        for line in _layer_lines(detail) + forum_lines + tool_lines:
             print(line)
         print(msg)
         return 0
@@ -1347,11 +1688,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {tf}")
         print(f"\n{subset_msg}")
         print(bucket_line)
-        for line in layer_lines:
+        for line in layer_lines + forum_lines + tool_lines:
             print(line)
         return 0
 
-    for line in layer_lines:
+    for line in layer_lines + forum_lines + tool_lines:
         print(line)
     cmd = [sys.executable, "-m", "pytest"] + selected + passthrough
     rc = subprocess.run(cmd, cwd=repo_root).returncode

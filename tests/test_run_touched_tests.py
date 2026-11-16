@@ -61,6 +61,15 @@ _runner = importlib.util.module_from_spec(_runner_spec)
 _runner_spec.loader.exec_module(_runner)
 
 
+@pytest.fixture(autouse=True)
+def _no_policy_guard_set(monkeypatch):
+    """These cells build tmp repos that have no PR-MERGE-POLICY.md; the guard
+    set is read from that document (exit 4 when absent), so patch the reader.
+    Guard-set behaviour has its own cells in test_run_touched_tests_4358.py and
+    test_run_touched_tests_selection_4358b.py."""
+    monkeypatch.setattr(_runner, "guard_set", lambda repo_root: ([], []))
+
+
 # ---------------------------------------------------------------------------
 # Helper: load tiers.json
 # ---------------------------------------------------------------------------
@@ -1706,9 +1715,11 @@ class TestAuditPatches:
 # ---------------------------------------------------------------------------
 
 _JSON_KEYS = [
-    "base", "buckets", "changed_files", "full",
-    "full_reasons", "layers", "selected", "total_test_files", "unreferenced",
-]  # "layers"/"unreferenced" added additively by #4358
+    "base", "buckets", "changed_files", "forum_selected", "forum_total_test_files",
+    "full", "full_reasons", "layers", "selected", "tool_checks", "total_test_files",
+    "unreferenced",
+]  # "layers"/"unreferenced" added additively by #4358; "forum_selected",
+# "forum_total_test_files" and "tool_checks" by the selection-fixes follow-up
 
 
 def _run_json(monkeypatch, argv, *, changed=None, select_ret=None,
@@ -1725,6 +1736,8 @@ def _run_json(monkeypatch, argv, *, changed=None, select_ret=None,
     monkeypatch.setattr(_runner, "_count_total_test_files", lambda root: total)
     monkeypatch.setattr(_runner, "_load_test_map", lambda root: {})
     monkeypatch.setattr(_runner, "_get_server_import_allowlist", lambda m: set())
+    if "--full" not in argv and "--base" not in argv:
+        argv = [*argv, "--base", "HEAD"]  # --base is required for selection (C1)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = _runner.main(argv)
@@ -1797,7 +1810,7 @@ def test_json_stdout_is_single_line_pure_json(monkeypatch):
     monkeypatch.setattr(_runner, "_get_server_import_allowlist", lambda m: set())
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        _runner.main(["--json"])
+        _runner.main(["--json", "--base", "HEAD"])
     out = buf.getvalue().strip()
     assert out.count("\n") == 0, f"--json stdout must be a single line, got: {out!r}"
     json.loads(out)

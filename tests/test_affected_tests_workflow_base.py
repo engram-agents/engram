@@ -102,6 +102,17 @@ def repo_with_origin(tmp_path: Path) -> Path:
     (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
     (repo / "tests" / "test_x.py").write_text("def test_x():\n    pass\n", encoding="utf-8")
     (repo / "tests" / "test_y.py").write_text("def test_y():\n    pass\n", encoding="utf-8")
+    # The guard set is read from the policy document (exit 4 without it); the
+    # fixture carries a one-test item 4 so the selection is [test_x, test_guard].
+    (repo / "tests" / "test_guard.py").write_text("def test_guard():\n    pass\n", encoding="utf-8")
+    (repo / "docs" / "internal").mkdir(parents=True)
+    (repo / "docs" / "internal" / "PR-MERGE-POLICY.md").write_text(
+        "## Owner merge\n"
+        "4. **The seat's own run, on a scratch merge**\n"
+        "   `tests/test_guard.py`\n"
+        "5. **The PR's changed or added tests**\n",
+        encoding="utf-8",
+    )
     pm = repo / "src" / "engram" / "packaging"
     pm.mkdir(parents=True)
     (pm / "test-map.json").write_text(
@@ -123,14 +134,18 @@ def repo_with_origin(tmp_path: Path) -> Path:
     return repo
 
 
-def _selection(repo: Path, base: str) -> dict:
-    out = subprocess.run(
+def _run_tool(repo: Path, base: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
         [sys.executable, str(TOOL), "--repo-root", str(repo), "--base", base, "--json"],
         cwd=str(repo),
         capture_output=True,
         text=True,
-        check=True,
     )
+
+
+def _selection(repo: Path, base: str) -> dict:
+    out = _run_tool(repo, base)
+    assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
 
 
@@ -151,11 +166,15 @@ def test_dispatch_selects_the_changed_test(repo_with_origin: Path):
     base = _render(_base_argument(), base_ref="", default_branch="dev")
     sel = _selection(repo_with_origin, base)
     assert sel["changed_files"] == ["tests/test_x.py"]
-    assert sel["selected"] == ["tests/test_x.py"]
+    # the changed test plus the policy's guard test (C3)
+    assert sel["selected"] == ["tests/test_guard.py", "tests/test_x.py"]
 
 
-def test_empty_base_selects_nothing_control(repo_with_origin: Path):
-    """Control: the defective ``--base origin/`` selects nothing (the #3410 defect)."""
-    sel = _selection(repo_with_origin, "origin/")
-    assert sel["selected"] == []
-    assert sel["changed_files"] == []
+def test_empty_base_refuses_control(repo_with_origin: Path):
+    """Control: the defective ``--base origin/`` used to select nothing and exit 0
+    (the #3410 defect, a vacuous green); an unknown ref now refuses, exit 2, with
+    no selection on stdout (C2)."""
+    out = _run_tool(repo_with_origin, "origin/")
+    assert out.returncode == 2
+    assert "origin/" in out.stderr
+    assert out.stdout == ""

@@ -6,7 +6,7 @@ guard tests and scanners the merge seat runs on every PR, and closes with
 file reads the document, takes the ``tests/*.py`` and ``tools/*.py`` paths
 named inside item 4 and only item 4, and asserts each one is on disk.
 
-Contract (one cell each; stdlib only; it reads this document and names no module):
+Contract (one cell each; stdlib only; it reads this document and loads only the parser module):
 
 - C1. On the real document every path item 4 names exists; a failure names
   each missing path.
@@ -23,7 +23,7 @@ Contract (one cell each; stdlib only; it reads this document and names no module
 
 from __future__ import annotations
 
-import re
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -31,40 +31,14 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 POLICY = REPO_ROOT / "docs" / "internal" / "PR-MERGE-POLICY.md"
 
-_HEADING = "## Owner merge"
-_ITEM4_START = re.compile(r"^4\. \*\*The seat's own run")
-_ITEM5_START = re.compile(r"^5\. \*\*The PR's changed")
-_PATH = re.compile(r"`((?:tests|tools)/[A-Za-z0-9_.\-]+\.py)`")
+_PARSER_PATH = REPO_ROOT / "src" / "engram" / "tools" / "policy_guard_list.py"
+_pspec = importlib.util.spec_from_file_location("policy_guard_list_4487", str(_PARSER_PATH))
+_parser = importlib.util.module_from_spec(_pspec)
+_pspec.loader.exec_module(_parser)
 
-
-def _item4_paths(text: str) -> list[str]:
-    """Return the unique tests/ and tools/ paths named in Owner-merge item 4."""
-    lines = text.splitlines()
-    head = next((i for i, ln in enumerate(lines) if ln.startswith(_HEADING)), None)
-    assert head is not None, f"anchor missing: no line starting {_HEADING!r}"
-    end = len(lines)
-    for i in range(head + 1, len(lines)):
-        if lines[i].startswith("## "):
-            end = i
-            break
-    section = lines[head + 1 : end]
-    start = next((i for i, ln in enumerate(section) if _ITEM4_START.match(ln)), None)
-    assert start is not None, (
-        "anchor missing: no item-4 start line matching '4. **The seat's own run' "
-        f"inside the section {_HEADING!r}"
-    )
-    stop = next(
-        (i for i in range(start + 1, len(section)) if _ITEM5_START.match(section[i])),
-        None,
-    )
-    assert stop is not None, (
-        "anchor missing: no item-5 line matching '5. **The PR's changed' "
-        "after item 4"
-    )
-    span = "\n".join(section[start:stop])
-    paths = list(dict.fromkeys(_PATH.findall(span)))
-    assert paths, "the item-4 span held no paths (no backticked tests/ or tools/ .py names)"
-    return paths
+# The parser moved out of this file into src/engram/tools/policy_guard_list.py
+# (#4358: run_touched_tests.py reads the same item 4); the cells below stay.
+_item4_paths = _parser.item4_paths
 
 
 def _missing(paths: list[str], root: Path) -> list[str]:
