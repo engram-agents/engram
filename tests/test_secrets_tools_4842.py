@@ -36,7 +36,14 @@ HAVE_ACL = (
     and shutil.which("setfacl") is not None
     and shutil.which("getfacl") is not None
 )
+# Cells that themselves call setfacl/getfacl (or exercise the Linux-only getfacl path): Linux only.
 needs_acl = pytest.mark.skipif(not HAVE_ACL, reason="needs Linux setfacl/getfacl")
+# Cells that only run the tools: on Linux the tools need getfacl; on darwin they use ls; so a Mac
+# run covers them. Skipped only on a Linux box without getfacl.
+needs_backend = pytest.mark.skipif(
+    sys.platform == "linux" and shutil.which("getfacl") is None,
+    reason="the Linux check needs getfacl",
+)
 
 MARKER = "SECRETMARKER-4842-b7f3c9e1d2a8"
 OTHER_UID = str(os.getuid() + 1)  # numeric uid with no account is accepted by setfacl
@@ -99,7 +106,7 @@ def _out(r) -> str:
 # ---------------------------------------------------------------- C1-C8 the check
 
 
-@needs_acl
+@needs_backend
 def test_c1_clean_passes(tmp_path):
     home = _clean_home(tmp_path)
     assert _load().check(home).code == 0
@@ -159,7 +166,7 @@ def test_c6_dir_mode_reads_0700_but_acl_has_mask_and_named_entry(tmp_path):
     assert _check_cli(home).returncode == 1
 
 
-@needs_acl
+@needs_backend
 def test_c7_file_mode_0644_refuses(tmp_path):
     home = _clean_home(tmp_path)
     os.chmod(home / "secrets" / "alpha-key", 0o644)
@@ -168,14 +175,14 @@ def test_c7_file_mode_0644_refuses(tmp_path):
     assert "alpha-key" in _out(r)
 
 
-@needs_acl
+@needs_backend
 def test_c7b_dir_mode_wrong_refuses(tmp_path):
     home = _clean_home(tmp_path)
     os.chmod(home / "secrets", 0o750)
     assert _check_cli(home).returncode == 1
 
 
-@needs_acl
+@needs_backend
 def test_c8_symlink_refuses_named_and_target_not_read(tmp_path):
     home = _clean_home(tmp_path)
     target = tmp_path / "outside"
@@ -187,7 +194,7 @@ def test_c8_symlink_refuses_named_and_target_not_read(tmp_path):
     assert MARKER not in _out(r)
 
 
-@needs_acl
+@needs_backend
 def test_non_regular_entries_refuse(tmp_path):
     home = _clean_home(tmp_path)
     os.mkdir(home / "secrets" / "subdir")
@@ -255,7 +262,7 @@ def _marker_home(tmp_path, content=MARKER + "\n"):
     return home
 
 
-@needs_acl
+@needs_backend
 def test_c10_secret_env_never_echoes(tmp_path):
     home = _marker_home(tmp_path)
     r = _run(
@@ -268,7 +275,7 @@ def test_c10_secret_env_never_echoes(tmp_path):
     assert MARKER not in _out(r)
 
 
-@needs_acl
+@needs_backend
 def test_c11_child_sees_value_and_name_mapping(tmp_path):
     home = _marker_home(tmp_path)
     child = (
@@ -283,7 +290,7 @@ def test_c11_child_sees_value_and_name_mapping(tmp_path):
     assert MARKER not in r.stderr
 
 
-@needs_acl
+@needs_backend
 def test_c11b_as_override_and_one_newline_only(tmp_path):
     home = _marker_home(tmp_path, content=MARKER + "\n\n")
     child = (
@@ -299,7 +306,7 @@ def test_c11b_as_override_and_one_newline_only(tmp_path):
     assert r.stdout.split() == ["match"]
 
 
-@needs_acl
+@needs_backend
 def test_c12_secret_env_refuses_when_check_refuses(tmp_path):
     home = _marker_home(tmp_path)
     os.chmod(home / "secrets" / "anthropic-api-key.acct", 0o644)
@@ -315,7 +322,7 @@ def test_c12_secret_env_refuses_when_check_refuses(tmp_path):
     assert MARKER not in _out(r)
 
 
-@needs_acl
+@needs_backend
 def test_c13_missing_secret_names_it_exit_1(tmp_path):
     home = _marker_home(tmp_path)
     sentinel = tmp_path / "ran"
@@ -341,7 +348,7 @@ def test_name_validation_refuses(tmp_path, bad):
     assert "must match" in _out(r2)
 
 
-@needs_acl
+@needs_backend
 def test_non_utf8_secret_refuses_without_content(tmp_path):
     home = _clean_home(tmp_path, files=())
     p = home / "secrets" / "binary"
@@ -394,7 +401,7 @@ def test_put_refuses_existing_dirty_folder_and_does_not_repair(tmp_path):
     assert _load().check(home).code == 1  # still dirty: not silently repaired
 
 
-@needs_acl
+@needs_backend
 def test_put_overwrites_atomically_and_leaves_no_temp(tmp_path):
     home = _clean_home(tmp_path, files=())
     assert _run(SECRET_PUT, ["--home", str(home), "k"], stdin="one\n").returncode == 0
@@ -409,10 +416,13 @@ def test_put_overwrites_atomically_and_leaves_no_temp(tmp_path):
 def test_c15_non_linux_prints_note_and_still_enforces_modes(tmp_path, monkeypatch, capsys):
     mod = _load()
     home = _clean_home(tmp_path, files=("good",))
-    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "platform", "freebsd")  # neither linux nor darwin: the ACL half is not checked
     res = mod.check(home)
     assert res.code == 0
     assert capsys.readouterr().err.splitlines().count("secrets ACL not checked on this platform") == 1
+    # L1(c): the stdout verdict itself says the ACL half was not checked
+    assert mod.main(["--home", str(home)]) == 0
+    assert "secrets check: pass (modes only; ACL not checked on this platform)" in capsys.readouterr().out.splitlines()
 
     _write(home / "secrets" / "loose", "v\n", mode=0o644)
     res = mod.check(home)
@@ -467,7 +477,7 @@ def test_r1_remediation_lines_are_shell_quoted(tmp_path):
     assert chmods and all(len(s) == 3 and s[2] in (str(sec), str(f)) for s in chmods)
 
 
-@needs_acl
+@needs_backend
 def test_r2_getfacl_gets_double_dash_so_a_dash_leading_relative_home_works(tmp_path):
     sec = tmp_path / "-dashhome" / "home" / "secrets"
     sec.mkdir(parents=True)
@@ -486,7 +496,7 @@ def test_r3_put_validates_stdin_before_creating_secrets_dir(tmp_path):
         assert not (home / "secrets").exists()
 
 
-@needs_acl
+@needs_backend
 def test_r4_put_fsyncs_the_secrets_dir_after_replace(tmp_path, monkeypatch):
     mod = _load_tool(SECRET_PUT, "secret_put_r4")
     home = _clean_home(tmp_path, files=())
@@ -511,7 +521,7 @@ def test_r4_put_fsyncs_the_secrets_dir_after_replace(tmp_path, monkeypatch):
     assert events.index("fsync-dir") > events.index("replace")
 
 
-@needs_acl
+@needs_backend
 def test_f2_dir_fsync_failure_is_reported_not_a_traceback(tmp_path, monkeypatch, capsys):
     mod = _load_tool(SECRET_PUT, "secret_put_f2")
     home = _clean_home(tmp_path, files=())
@@ -556,17 +566,17 @@ def _r5_refused(tmp_path, args, names_to_make, var):
     assert "x-" not in _out(r)
 
 
-@needs_acl
+@needs_backend
 def test_r5_default_mapping_to_path_refused(tmp_path):
     _r5_refused(tmp_path, ["path"], ["path"], "PATH")
 
 
-@needs_acl
+@needs_backend
 def test_r5_default_mapping_with_dash_refused(tmp_path):
     _r5_refused(tmp_path, ["bash-env"], ["bash-env"], "BASH_ENV")
 
 
-@needs_acl
+@needs_backend
 @pytest.mark.parametrize(
     "var",
     ["LD_PRELOAD", "PYTHONPATH", "DYLD_INSERT_LIBRARIES", "BASH_FUNC_FOO", "NODE_OPTIONS", "HOME", "PS4"],
@@ -575,7 +585,7 @@ def test_r5_as_override_to_dangerous_var_refused(tmp_path, var):
     _r5_refused(tmp_path, ["--as", f"{var}=k", "k"], ["k"], var)
 
 
-@needs_acl
+@needs_backend
 @pytest.mark.parametrize(
     "var",
     ["GIT_SSH_COMMAND", "LC_ALL", "JAVA_TOOL_OPTIONS", "HTTPS_PROXY", "GIT_CONFIG_COUNT", "CARGO_HOME",
@@ -588,7 +598,7 @@ def test_f1_round3_added_startup_vars_refused_and_message_says_how_to_proceed(tm
     assert "choose another variable with --as VAR=NAME" in _out(r)
 
 
-@needs_acl
+@needs_backend
 def test_f1_round3_default_mapping_via_python_prefix_message_names_as(tmp_path):
     _r5_refused(tmp_path, ["python-token"], ["python-token"], "PYTHON_TOKEN")
     r = _run(SECRET_ENV, ["--home", str(tmp_path / "home"), "python-token", "--", sys.executable, "-c", "pass"])
@@ -602,7 +612,7 @@ def test_f1_round3_prefix_and_name_sets_cover_the_additions():
     assert not mod.is_startup_var("ANTHROPIC_API_KEY")
 
 
-@needs_acl
+@needs_backend
 def test_f3_name_to_var_mapping_computed_once(tmp_path, monkeypatch):
     mod = _load_tool(SECRET_ENV, "secret_env_f3")
     home = _clean_home(tmp_path, files=())
@@ -615,7 +625,7 @@ def test_f3_name_to_var_mapping_computed_once(tmp_path, monkeypatch):
     assert calls == ["tok"]
 
 
-@needs_acl
+@needs_backend
 def test_r5_ordinary_name_still_passes(tmp_path):
     home = _clean_home(tmp_path, files=())
     _write(home / "secrets" / "anthropic-api-key", "v\n")
@@ -665,7 +675,7 @@ def _home_env(tmp_path, engram_home):
     return {"HOME": str(fake), "ENGRAM_HOME": str(engram_home)}
 
 
-@needs_acl
+@needs_backend
 def test_r7_default_home_comes_from_engram_home(tmp_path):
     home = _marker_home(tmp_path)
     env = _home_env(tmp_path, home)
@@ -684,7 +694,7 @@ def test_r7_default_home_comes_from_engram_home(tmp_path):
     assert not (tmp_path / "fakehome" / ".engram").exists()
 
 
-@needs_acl
+@needs_backend
 def test_r7_relative_engram_home_refused_by_all_three(tmp_path):
     env = _home_env(tmp_path, "relative/home")
     outs = [
@@ -720,7 +730,7 @@ def test_z1_read_secret_refuses_a_non_0600_regular_file_and_reads_a_0600_one(tmp
     assert mod.read_secret(f) == MARKER
 
 
-@needs_acl
+@needs_backend
 def test_z3a_dotfile_leftover_refuses_named_with_remediation(tmp_path):
     home = _clean_home(tmp_path)
     leftover = home / "secrets" / ".put-abc123"
@@ -734,7 +744,7 @@ def test_z3a_dotfile_leftover_refuses_named_with_remediation(tmp_path):
     assert MARKER not in out
 
 
-@needs_acl
+@needs_backend
 def test_z3b_normal_put_leaves_no_dotfile_and_the_folder_still_passes(tmp_path):
     home = _clean_home(tmp_path, files=())
     r = _run(SECRET_PUT, ["--home", str(home), "k"], stdin=MARKER + "\n")
@@ -744,7 +754,7 @@ def test_z3b_normal_put_leaves_no_dotfile_and_the_folder_still_passes(tmp_path):
     assert _check_cli(home).returncode == 0
 
 
-@needs_acl
+@needs_backend
 def test_z3c_secret_env_refuses_when_a_leftover_is_present(tmp_path):
     home = _marker_home(tmp_path)
     _write(home / "secrets" / ".put-zz9", MARKER + "\n")
@@ -758,3 +768,222 @@ def test_z3c_secret_env_refuses_when_a_leftover_is_present(tmp_path):
     assert ".put-zz9" in _out(r)
     assert not sentinel.exists()
     assert MARKER not in _out(r)
+
+
+# ---------------------------------------------------------------- L1-L5 colleague-read fold (PR #4856)
+# Darwin behaviour is tested on Linux through a monkeypatched sys.platform and PATH shims for `ls` and
+# `chmod`; the one real-macOS cell skips unless sys.platform == "darwin".
+
+_LS_SHIM = """#!/bin/sh
+[ -n "$SHIM_LOG" ] && echo "ls $*" >> "$SHIM_LOG"
+if [ -n "$SHIM_LS_RC" ] && [ "$SHIM_LS_RC" != 0 ]; then exit "$SHIM_LS_RC"; fi
+if [ -n "$SHIM_LS_GARBAGE" ]; then echo "$SHIM_LS_GARBAGE"; exit 0; fi
+case "$1" in
+  -ld) echo "$SHIM_DIR_MODE 2 user group 64 Jan  1 00:00 x";;
+  -l) echo "$SHIM_FILE_MODE 1 user group 3 Jan  1 00:00 x";;
+  *) exit 9;;
+esac
+"""
+_CHMOD_SHIM = """#!/bin/sh
+echo "chmod $*" >> "$SHIM_LOG"
+exit "${SHIM_CHMOD_RC:-0}"
+"""
+
+
+def _darwin(tmp_path, monkeypatch, dir_mode="drwx------", file_mode="-rw-------", **extra):
+    """Pretend to be macOS: platform patched, `ls` and `chmod` shims first on PATH, controlled mode lines."""
+    shim = tmp_path / "darwinshim"
+    shim.mkdir()
+    for name, body in (("ls", _LS_SHIM), ("chmod", _CHMOD_SHIM)):
+        (shim / name).write_text(body)
+        os.chmod(shim / name, 0o755)
+    log = tmp_path / "shim.log"
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("SHIM_LOG", str(log))
+    monkeypatch.setenv("SHIM_DIR_MODE", dir_mode)
+    monkeypatch.setenv("SHIM_FILE_MODE", file_mode)
+    for k, v in extra.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    return log
+
+
+def test_l1a_darwin_plus_on_dir_refuses_and_names_chmod_N(tmp_path, monkeypatch, capsys):
+    mod = _load()
+    home = _clean_home(tmp_path)
+    _darwin(tmp_path, monkeypatch, dir_mode="drwx------+")
+    assert mod.main(["--home", str(home)]) == 1
+    out = capsys.readouterr().out
+    assert "secrets: extended ACL" in out
+    assert "chmod -N " + shlex.quote(str(home / "secrets")) in out
+
+
+def test_l1a_darwin_plus_on_file_refuses_named_with_quoted_remediation(tmp_path, monkeypatch, capsys):
+    mod = _load()
+    home = _clean_home(tmp_path / "ho me's", files=("only-key",))
+    _darwin(tmp_path, monkeypatch, file_mode="-rw-------+")
+    assert mod.main(["--home", str(home)]) == 1
+    out = capsys.readouterr().out
+    assert "only-key: extended ACL" in out
+    lines = [shlex.split(ln.strip()) for ln in out.splitlines() if ln.strip().startswith("chmod ")]
+    assert ["chmod", "-N", str(home / "secrets" / "only-key")] in lines
+
+
+def test_l1a_darwin_clean_passes_without_the_not_checked_note(tmp_path, monkeypatch, capsys):
+    mod = _load()
+    home = _clean_home(tmp_path)
+    log = _darwin(tmp_path, monkeypatch)
+    assert mod.main(["--home", str(home)]) == 0
+    cap = capsys.readouterr()
+    assert cap.out.splitlines() == ["secrets check: pass"]
+    assert "not checked" not in cap.err
+    calls = log.read_text().splitlines()
+    assert any(c.startswith("ls -ld -- ") for c in calls)  # the directory
+    assert any(c.startswith("ls -l -- ") for c in calls)  # each file
+
+
+@pytest.mark.parametrize("extra", [{"SHIM_LS_RC": "1"}, {"SHIM_LS_GARBAGE": "not a listing"}])
+def test_l1a_darwin_ls_failing_or_unparseable_is_exit_2(tmp_path, monkeypatch, capsys, extra):
+    mod = _load()
+    home = _clean_home(tmp_path)
+    _darwin(tmp_path, monkeypatch, **extra)
+    assert mod.main(["--home", str(home)]) == 2
+    assert "cannot tell" in capsys.readouterr().out
+
+
+def _put_in_process(mod, home, data=b"v\n", args=()):
+    old = sys.stdin
+    sys.stdin = io.TextIOWrapper(io.BytesIO(data))
+    try:
+        return mod.main(["--home", str(home), *args, "k"])
+    finally:
+        sys.stdin = old
+
+
+def test_l1b_put_on_darwin_runs_chmod_N_on_the_folder_it_creates(tmp_path, monkeypatch):
+    mod = _load_tool(SECRET_PUT, "secret_put_l1b")
+    home = tmp_path / "home"
+    home.mkdir()
+    log = _darwin(tmp_path, monkeypatch)
+    assert _put_in_process(mod, home) == 0
+    sec = home / "secrets"
+    assert "chmod -N " + str(sec) in log.read_text().splitlines()
+    assert (sec / "k").exists() and stat.S_IMODE(sec.stat().st_mode) == 0o700
+
+
+def test_l1b_put_on_darwin_does_not_chmod_N_an_existing_folder(tmp_path, monkeypatch):
+    mod = _load_tool(SECRET_PUT, "secret_put_l1b2")
+    home = _clean_home(tmp_path, files=())
+    log = _darwin(tmp_path, monkeypatch)
+    assert _put_in_process(mod, home) == 0
+    assert "chmod -N" not in (log.read_text() if log.exists() else "")
+
+
+def test_l1b_put_on_darwin_chmod_failure_removes_the_folder_exit_2(tmp_path, monkeypatch, capsys):
+    mod = _load_tool(SECRET_PUT, "secret_put_l1b3")
+    home = tmp_path / "home"
+    home.mkdir()
+    _darwin(tmp_path, monkeypatch, SHIM_CHMOD_RC="1")
+    assert _put_in_process(mod, home) == 2
+    assert not (home / "secrets").exists()
+    assert "Traceback" not in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="real macOS ACL inheritance")
+def test_l1_real_mac_inherited_acl_refused_and_fresh_put_is_clean(tmp_path):
+    acl = "everyone allow list,search,file_inherit,directory_inherit"
+
+    def ls_has_plus(path, flag):
+        out = subprocess.run(["ls", flag, "--", str(path)], capture_output=True, text=True).stdout
+        return "+" in out.split()[0]
+
+    # Luria's measurement: a folder made under an inheritable-ACL home inherits the ACE and must be refused.
+    home1 = tmp_path / "home1"
+    home1.mkdir()
+    subprocess.run(["chmod", "+a", acl, str(home1)], check=True)
+    os.mkdir(home1 / "secrets", 0o700)
+    _write(home1 / "secrets" / "k", "v\n")
+    assert ls_has_plus(home1 / "secrets", "-ld")
+    assert _check_cli(home1).returncode == 1
+
+    # A folder secret-put creates itself under the same kind of home must come out clean and pass.
+    home2 = tmp_path / "home2"
+    home2.mkdir()
+    subprocess.run(["chmod", "+a", acl, str(home2)], check=True)
+    r = _run(SECRET_PUT, ["--home", str(home2), "k"], stdin="v\n")
+    assert r.returncode == 0
+    assert not ls_has_plus(home2 / "secrets", "-ld")
+    assert not ls_has_plus(home2 / "secrets" / "k", "-l")
+    assert _check_cli(home2).returncode == 0
+
+
+def _child_cmp(var, expected):
+    return ("import os;v=os.environ.get(%r);" % var) + "print('match' if v == %r else 'differ')" % expected
+
+
+@needs_backend
+def test_l2_raw_round_trips_trailing_newlines_byte_for_byte(tmp_path):
+    home = _clean_home(tmp_path, files=())
+    r = _run(SECRET_PUT, ["--home", str(home), "--raw", "keyfile"], stdin="abc\n\n")
+    assert r.returncode == 0
+    assert (home / "secrets" / "keyfile").read_bytes() == b"abc\n\n"
+    r = _run(SECRET_ENV, ["--home", str(home), "--raw", "keyfile", "--",
+                          sys.executable, "-c", _child_cmp("KEYFILE", "abc\n\n")])
+    assert r.returncode == 0 and r.stdout.split() == ["match"]
+    # without --raw on the way out, ONE newline is still removed
+    r = _run(SECRET_ENV, ["--home", str(home), "keyfile", "--",
+                          sys.executable, "-c", _child_cmp("KEYFILE", "abc\n")])
+    assert r.stdout.split() == ["match"]
+
+
+@needs_backend
+def test_l2_without_raw_behaviour_is_unchanged(tmp_path):
+    home = _clean_home(tmp_path, files=())
+    assert _run(SECRET_PUT, ["--home", str(home), "plain"], stdin="abc\n\n").returncode == 0
+    assert (home / "secrets" / "plain").read_bytes() == b"abc\n"
+    r = _run(SECRET_ENV, ["--home", str(home), "plain", "--",
+                          sys.executable, "-c", _child_cmp("PLAIN", "abc")])
+    assert r.stdout.split() == ["match"]
+
+
+@needs_backend
+def test_l2_secret_env_raw_applies_to_every_name(tmp_path):
+    home = _clean_home(tmp_path, files=())
+    for n in ("one", "two"):
+        assert _run(SECRET_PUT, ["--home", str(home), "--raw", n], stdin=n + "\n").returncode == 0
+    child = ("import os;print('match' if (os.environ['ONE'], os.environ['TWO']) == ('one\\n', 'two\\n') "
+             "else 'differ')")
+    r = _run(SECRET_ENV, ["--home", str(home), "--raw", "one", "two", "--", sys.executable, "-c", child])
+    assert r.returncode == 0 and r.stdout.split() == ["match"]
+
+
+def test_l2_docstrings_say_plainly_that_a_key_file_needs_raw():
+    for tool in (SECRET_PUT, SECRET_ENV):
+        doc = _load_tool(tool, "doc_" + tool.name.replace("-", "_")).__doc__
+        assert "--raw" in doc and "OpenSSH private key" in doc
+
+
+@needs_backend
+def test_l3_default_variable_name_is_validated(tmp_path):
+    home = _clean_home(tmp_path, files=())
+    _write(home / "secrets" / "9lives", "v\n")
+    sentinel = tmp_path / "ran"
+    r = _run(SECRET_ENV, ["--home", str(home), "9lives", "--", sys.executable, "-c",
+                          f"open({str(sentinel)!r}, 'w').close()"])
+    assert r.returncode == 1
+    assert not sentinel.exists()
+    assert "9LIVES" in _out(r) and "--as VAR=NAME" in _out(r)
+    r = _run(SECRET_ENV, ["--home", str(home), "--as", "LIVES=9lives", "9lives", "--",
+                          sys.executable, "-c", _child_cmp("LIVES", "v")])
+    assert r.returncode == 0 and r.stdout.split() == ["match"]
+
+
+@needs_acl
+def test_l4_getfacl_not_found_names_the_package_not_an_exception_class(tmp_path):
+    home = _clean_home(tmp_path)
+    empty = tmp_path / "emptybin"
+    empty.mkdir()
+    r = _run(CHECK_PY, ["--home", str(home)], path=str(empty))
+    assert r.returncode == 2
+    assert "getfacl not found (install the acl package)" in _out(r)
+    assert "FileNotFoundError" not in _out(r)

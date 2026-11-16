@@ -16,13 +16,18 @@ each regular file passes only if mode 0600 and base entries only. Anything that 
 regular file (symlink, fifo, subdirectory, socket) refuses, and so does any entry whose name
 begins with "." (a suspected leftover of an interrupted secret-put), judged with lstat and never
 followed. getfacl missing or failing -> exit 2 (never a pass).
-Other platforms: the ACL half is not implemented; a note goes to stderr every time and
-the mode bits and the regular-file rule are still enforced.
+macOS (darwin): an extended ACL shows as a trailing "+" in the mode field of `ls -ld <dir>` and
+`ls -l <file>` (run with "--" before the path); any "+" refuses, named by basename, with the
+remediation `chmod -N <path>`. If ls fails or its output cannot be parsed -> exit 2.
+Other platforms: the ACL half is not implemented; a note goes to stderr every time, the stdout
+verdict says "modes only; ACL not checked on this platform", and the mode bits and the
+regular-file rule are still enforced.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -30,6 +35,8 @@ import sys
 from pathlib import Path
 
 NON_LINUX_NOTE = "secrets ACL not checked on this platform"
+PASS_MODES_ONLY = "secrets check: pass (modes only; ACL not checked on this platform)"
+_LS_MODE_RE = re.compile(r"^[-bcdlpsDw?][-rwxsStTlL]{9}[+@.:]?$")
 NOTE_CHMOD = "note: 'chmod g-w' changes only the ACL mask, not a named entry."
 NOTE_WIDEN = "note: removing one ACL entry can widen the mask; read the full ACL before and after."
 
@@ -38,8 +45,9 @@ class Result:
     """code 0 pass / 1 refuse / 2 cannot tell; problems and remediation are lists of lines.
     A plain class (not a dataclass) so any importlib loader can load this file."""
 
-    def __init__(self, code=0, problems=None, remediation=None):
+    def __init__(self, code=0, problems=None, remediation=None, acl_checked=True):
         self.code = code
+        self.acl_checked = acl_checked  # False: only modes and the regular-file rule were judged
         self.problems = [] if problems is None else problems
         self.remediation = [] if remediation is None else remediation
 
@@ -57,6 +65,8 @@ def _acl_defects(path: str, is_dir: bool) -> list:
             text=True,
             timeout=30,
         )
+    except FileNotFoundError:
+        raise _CannotTell("getfacl not found (install the acl package)")
     except (OSError, subprocess.SubprocessError) as exc:
         raise _CannotTell(type(exc).__name__)
     if r.returncode != 0:
@@ -86,13 +96,37 @@ def _acl_defects(path: str, is_dir: bool) -> list:
     return sorted(set(defects))
 
 
+def _darwin_acl_defects(path: str, is_dir: bool) -> list:
+    """macOS: an extended ACL is the trailing "+" of the mode field of ls -ld (dir) / ls -l (file).
+    Raises _CannotTell when ls fails or its first field is not a mode field."""
+    try:
+        r = subprocess.run(
+            ["ls", "-ld" if is_dir else "-l", "--", path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        raise _CannotTell("ls not found")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _CannotTell(type(exc).__name__)
+    if r.returncode != 0:
+        raise _CannotTell("ls exit %d" % r.returncode)
+    fields = r.stdout.split(None, 1)
+    if not fields or not _LS_MODE_RE.match(fields[0]):
+        raise _CannotTell("unparseable ls output")
+    return ["extended ACL"] if fields[0].endswith("+") else []
+
+
 def check(home) -> Result:
     home = Path(home)
     sec = home / "secrets"
     linux = sys.platform == "linux"
-    if not linux:
+    darwin = sys.platform == "darwin"
+    acl_checked = linux or darwin
+    if not acl_checked:
         print(NON_LINUX_NOTE, file=sys.stderr)
-    res = Result()
+    res = Result(acl_checked=acl_checked)
     try:
         st = os.lstat(sec)
     except FileNotFoundError:
@@ -118,9 +152,9 @@ def check(home) -> Result:
         if stat.S_IMODE(st_mode) != want:
             res.problems.append("%s: mode %o, want %o" % (name, stat.S_IMODE(st_mode), want))
             chmod_lines.append("chmod %o %s" % (want, shlex.quote(str(path))))
-        if linux:
+        if acl_checked:
             try:
-                defects = _acl_defects(str(path), is_dir)
+                defects = (_acl_defects if linux else _darwin_acl_defects)(str(path), is_dir)
             except _CannotTell as exc:
                 cannot_tell.append("%s: cannot tell (%s)" % (name, exc))
                 return
@@ -166,12 +200,13 @@ def check(home) -> Result:
     if res.code == 1:
         lines = []
         if fix_acl_dir:
-            lines.append("setfacl -b -k %s" % shlex.quote(str(sec)))
+            lines.append(("setfacl -b -k %s" if linux else "chmod -N %s") % shlex.quote(str(sec)))
         for p in fix_acl_files:
-            lines.append("setfacl -b %s" % shlex.quote(str(p)))
+            lines.append(("setfacl -b %s" if linux else "chmod -N %s") % shlex.quote(str(p)))
         lines.extend(chmod_lines)
         lines.append("re-run the check")
-        lines.extend([NOTE_CHMOD, NOTE_WIDEN])
+        if not darwin:  # the mask notes are about Linux ACLs; chmod -N removes the whole ACL
+            lines.extend([NOTE_CHMOD, NOTE_WIDEN])
         res.remediation = lines
     return res
 
@@ -179,7 +214,7 @@ def check(home) -> Result:
 def render(res: Result) -> str:
     out = []
     if res.code == 0:
-        return "secrets check: pass"
+        return "secrets check: pass" if res.acl_checked else PASS_MODES_ONLY
     out.append("secrets check: %s" % ("refuse" if res.code == 1 else "cannot tell"))
     out.extend("  " + p for p in res.problems)
     out.extend(res.remediation)
