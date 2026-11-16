@@ -34,7 +34,15 @@ def test_exactly_one_secrets_row_with_required_terms():
     rows = _secrets_rows(_rendered_lines())
     assert len(rows) == 1, rows
     row = rows[0][1]
-    for term in ("{{ENGRAM_HOME}}/secrets/", "0700", "0600", "value-blind"):
+    for term in (
+        "{{ENGRAM_HOME}}/secrets/",
+        "0700",
+        "0600",
+        "value-blind",
+        "git-ignored",
+        "one file per secret",
+        "{{ENGRAM_HOME}}/forum-token",
+    ):
         assert term in row, term
 
 
