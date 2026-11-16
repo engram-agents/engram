@@ -8,16 +8,17 @@ conversion on the machine of the person who holds the secret, and prints only
 counts, whole-file sha256 values, per-class line numbers, and the class-B names
 (the caller's own input of permitted names). It never prints a roster line.
 
-A captured parser refusal that carries a produced roster pattern is withheld
-whole and reported by exit code alone. The test is containment of the pattern
-verbatim, or with every backslash doubled -- the rendering repr() produces, so
-an echoed exception object is covered too. Two limits bound that, and both are
-real: text the parser writes to stdout, or directly to file descriptor 2, is
-not captured (this tool redirects only sys.stderr), and a PARTIAL echo is not
-detected, so a parser that prints half a pattern can still carry name text to
-the operator. Neither limit fires with the repo's own scanner, which prints a
-line number and an exception class and nothing else; they matter only for a
-parser supplied by someone else.
+A captured parser refusal that carries roster text is withheld whole and
+reported by exit code alone. The test is containment of a produced pattern, or
+of a produced line's bare name key, verbatim or with every backslash doubled --
+the rendering repr() produces, so an echoed exception object is covered too.
+Two limits bound that, and both are real: text the parser writes to stdout, or
+directly to file descriptor 2, is not captured (this tool redirects only
+sys.stderr), and a PARTIAL echo is still not detected unless it is exactly a
+produced line's bare name key, so a parser that prints any other fragment of a
+pattern can still carry name text to the operator. Neither limit fires with the
+repo's own scanner, which prints a line number and an exception class and
+nothing else; they matter only for a parser supplied by someone else.
 
 Classification (R4) -- the roster lines are regexes, so "exact match" between a
 pattern and a name is not string equality. Each roster line and each B-file
@@ -342,24 +343,40 @@ def _parse_capture(parse_roster, source):
 
 
 def _pattern_present(text: str, pattern: str) -> bool:
-    """True when ``text`` carries ``pattern`` verbatim or backslash-doubled.
-
-    Contract: if the captured parser stderr contains a produced pattern
-    verbatim or backslash-doubled, nothing of that buffer is re-emitted and
-    exactly one line naming the parser's exit code is written instead.
-    """
+    """True when ``text`` carries ``pattern`` verbatim or backslash-doubled."""
     return pattern in text or pattern.replace("\\", "\\\\") in text
+
+
+def _name_key_present(text: str, pattern: str) -> bool:
+    """True when ``text`` carries the name key of ``pattern`` verbatim or
+    backslash-doubled.
+
+    The name key is ``_key_parts(pattern)[0]``: the pattern minus only its
+    wrappers. A parser that echoes the name without the ``\\b`` pair is a
+    partial echo that a whole-pattern containment test misses. An empty key
+    matches nothing (the tool refuses one elsewhere).
+    """
+    key = _key_parts(pattern)[0]
+    return bool(key) and _pattern_present(text, key)
 
 
 def _reemit_parser_refusal(refusal: str, code: int, patterns) -> None:
     """Re-emit the parser's captured refusal, or withhold it whole.
 
     The no-roster-text guarantee covers text this tool emits, and a re-emitted
-    parser stderr is such text. If the buffer carries any produced roster
-    pattern, nothing of it is written: exactly one line names the refusal by
-    exit code only.
+    parser stderr is such text. If the buffer carries (a) any produced roster
+    pattern verbatim or backslash-doubled, or (b) the name key of any produced
+    pattern (non-empty) verbatim or backslash-doubled, nothing of it is
+    written: exactly one line names the refusal by exit code only.
     """
-    if any(pattern and _pattern_present(refusal, pattern) for pattern in patterns):
+    if any(
+        pattern
+        and (
+            _pattern_present(refusal, pattern)
+            or _name_key_present(refusal, pattern)
+        )
+        for pattern in patterns
+    ):
         print(
             f"rotate_roster_format: the parser refused (exit {code}); its "
             "output was withheld because it contained roster text",
