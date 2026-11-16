@@ -1422,3 +1422,181 @@ def test_probe_token_is_randomised_per_build():
             )
             assert re.fullmatch(r"[0-9a-f]{16}", token)
             assert token != "ZZProbeName"
+
+
+# ---------------------------------------------------------------------------
+# The six semantic refusals: each cell pins ONE site's message and exit code
+# ---------------------------------------------------------------------------
+#
+# A cell that asserts only a non-zero exit is satisfied by whichever guard
+# runs first, so deleting one guard's ``_fail`` leaves it green -- six
+# refusals that mostly exit 1 are not interchangeable. Each cell below names
+# the message text of exactly one site, which is what tells them apart.
+
+# The loader both scanner stubs embed. They differ only in whether they also
+# declare the boundary hook, which each helper shows at its own definition.
+_STUB_LOAD_ROSTER_FILE = r'''
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return [(None, "stub", klass) for klass in ("A", "A", "B")]
+'''.lstrip()
+
+
+def _probe_accepting_scanner(tmp_path: Path) -> Path:
+    """A parser that refuses both probes; its ``load_roster_file`` would
+    return a stub roster, which no cell here exercises."""
+    stub = tmp_path / "probe-accepting-scanner.py"
+    stub.write_text(
+        "def _declares_boundary(pattern):\n"
+        "    return True\n"
+        "\n"
+        "\n"
+        + _STUB_LOAD_ROSTER_FILE,
+        encoding="utf-8",
+    )
+    return stub
+
+
+def _scanner_that_raises_on_the_probe(tmp_path: Path) -> Path:
+    """A parser whose ``load_roster_file`` raises something other than
+    ``SystemExit``: it crashes instead of judging the probe."""
+    stub = tmp_path / "raising-scanner.py"
+    stub.write_text(
+        "def _declares_boundary(pattern):\n"
+        "    return True\n"
+        "\n"
+        "\n"
+        "def load_roster_file(path):\n"
+        "    raise ValueError('probe')\n",
+        encoding="utf-8",
+    )
+    return stub
+
+
+def _scanner_without_load_roster_file(tmp_path: Path) -> Path:
+    """A parser that loads but exposes no ``load_roster_file``."""
+    stub = tmp_path / "no-loader-scanner.py"
+    stub.write_text(
+        "def _declares_boundary(pattern):\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    return stub
+
+
+def _scanner_without_declares_boundary(tmp_path: Path) -> Path:
+    """A parser that passes the probe control but declares no
+    ``_declares_boundary`` hook."""
+    stub = tmp_path / "no-boundary-scanner.py"
+    stub.write_text(_STUB_LOAD_ROSTER_FILE, encoding="utf-8")
+    return stub
+
+
+def test_attestation_not_locatable_is_exit_2_naming_the_guard(tmp_path):
+    """No --attestation, and a scanner not shaped
+    <repo>/src/engram/tools/scan-leaks.py: the input cannot be confirmed as the
+    live list, so exit 2 names exactly that reason."""
+    scanner = _probe_accepting_scanner(tmp_path)
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(scanner)],
+             attestation=None)
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "cannot locate the roster attestation" in combined, combined
+    assert "cannot be confirmed as the live list" in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_scanner_that_raises_in_the_probe_is_exit_1_naming_the_guard(tmp_path):
+    """A parser that crashes while judging the two-class probes did not
+    validate the format: exit 1 names the exception class and the reason."""
+    scanner = _scanner_that_raises_on_the_probe(tmp_path)
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(scanner)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert (
+        "could not validate the two-class format (ValueError)" in combined
+    ), combined
+    assert "an unvalidated roster is never emitted" in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_missing_out_dir_is_exit_1_naming_the_refusal(tmp_path):
+    """A non-existent --out-dir is refused, never created. The cell asserts the
+    guard's own message: a later write failure also exits 1, so the code alone
+    cannot tell the two apart."""
+    roster, bnames, _out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+    missing = tmp_path / "does-not-exist"
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(missing)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert (
+        "--out-dir is not an existing directory; refusing to create it"
+        in combined
+    ), combined
+    assert not missing.exists(), "the refused --out-dir was created"
+
+
+def test_no_scanner_found_is_exit_1_naming_the_guard_and_the_tried_path(tmp_path):
+    """With no scanner at the named path the roster cannot be validated:
+    exit 1 names the guard and every path it tried."""
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+    missing = tmp_path / "no-such-scanner.py"
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(missing)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "no scanner found" in combined, combined
+    assert f"(tried: {missing})" in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_scanner_without_load_roster_file_is_exit_1_naming_the_guard(tmp_path):
+    """A scanner that loads but cannot parse is not a validator: exit 1 names
+    the missing hook and the scanner path."""
+    scanner = _scanner_without_load_roster_file(tmp_path)
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(scanner)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert (
+        f"{scanner.resolve()} has no usable load_roster_file" in combined
+    ), combined
+    assert list(out.iterdir()) == []
+
+
+def test_scanner_without_declares_boundary_is_exit_1_naming_the_guard(tmp_path):
+    """A scanner with no ``_declares_boundary`` cannot audit class-A
+    boundaries: exit 1 names the missing hook and the scanner path."""
+    scanner = _scanner_without_declares_boundary(tmp_path)
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(scanner)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert (
+        f"{scanner.resolve()} has no _declares_boundary" in combined
+    ), combined
+    assert "class-A boundaries cannot be audited" in combined, combined
+    assert list(out.iterdir()) == []
