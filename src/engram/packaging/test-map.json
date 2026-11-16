@@ -702,6 +702,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/rotate_roster_format.py",
+      "test_globs": [
+        "tests/test_rotate_roster_format.py"
+      ],
+      "note": "One-time format-1 -> format-2 roster migration helper the roster holder runs on their own machine. The test runs the file as a subprocess and loads it by path (spec_from_file_location), invisible to the layer-1 import graph; it also loads src/engram/tools/scan-leaks.py by path as the parser whose behaviour it pins."
+    },
+    {
       "path_prefix_or_glob": "tools/os-harness-check.py",
       "test_globs": [
         "tests/test_os_harness_check.py"
