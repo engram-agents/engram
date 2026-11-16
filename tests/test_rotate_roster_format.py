@@ -290,7 +290,9 @@ def test_t5_produced_roster_parses_under_the_real_loader(tmp_path):
     assert r.returncode == 0, (r.stdout, r.stderr)
 
     scanner = _load_scanner()
-    parsed = scanner.load_roster_file(out / "roster-format2.txt")
+    parsed, _roster_format = scanner.load_roster_file(
+        out / "roster-format2.txt"
+    )
     assert [klass for _compiled, _label, klass in parsed] == ["A", "A", "B"]
     assert parsed[0][0].search(A_ONE)
     assert parsed[1][0].search(A_TWO)
@@ -985,6 +987,39 @@ def load_roster_file(path):
               "--out-dir", str(out), "--scanner", str(stub)])
     assert r.returncode == 0, (r.stdout, r.stderr)
     assert (out / "roster-format2.txt").is_file()
+
+
+def test_stub_returning_entries_with_wrong_format_int_is_refused(tmp_path):
+    """Format 2 is the only format this tool emits. A parser that reports
+    ``(entries, 1)`` is a stale parser, and correct entries do not excuse the
+    format it declares; the return-value check must refuse it."""
+    stub = tmp_path / "wrong-format-scanner.py"
+    stub.write_text(
+        r'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return ([(None, "stub", klass) for klass in ("A", "A", "B")], 1)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "predates the two-class format" in combined, combined
+    assert "an unvalidated roster is never emitted" in combined, combined
+    assert list(out.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------

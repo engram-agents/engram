@@ -438,17 +438,22 @@ def _validate_parser_result(result, out_lines, scanner_path: Path) -> None:
     a line, is not validating the two-class format. Refuse with the same
     message as a parser that accepts the probes.
     """
-    # The scanner gained a format field; this tool validates the entries.
+    stale = (
+        f"the scanner at {scanner_path} predates the two-class format; "
+        "an unvalidated roster is never emitted"
+    )
+    # Format 2 is the only format this tool emits, so an int other than 2 is a
+    # stale parser; a bare entries sequence is still accepted because the probe
+    # control independently proves the parser understands format 2 -- the shape
+    # is not the evidence.
     if (
         isinstance(result, (list, tuple))
         and len(result) == 2
         and isinstance(result[1], int)
     ):
+        if result[1] != 2:
+            _fail(1, stale)
         result = result[0]
-    stale = (
-        f"the scanner at {scanner_path} predates the two-class format; "
-        "an unvalidated roster is never emitted"
-    )
     expected = [line[0] for line in out_lines]   # "A" or "B"
     if not isinstance(result, (list, tuple)) or len(result) != len(expected):
         _fail(1, stale)
