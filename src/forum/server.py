@@ -2236,8 +2236,13 @@ def _report_identity(value):
         n = len(value) if isinstance(value, str) else len(str(value))
         return f"{_INVALID_NAME} len={n}"
     name = _identity_text(text)
-    if name is not None and len(name) > _AUTH_NAME_MAX:
-        return f"{_TOO_LONG_NAME} len={len(name)}"
+    if name is not None:
+        # A caller-supplied name is escaped BEFORE the cap and before the entry cap, so it
+        # can never equal or imitate one of the server's own markers (the only unescaped
+        # ``<`` in the column); the cap then bounds what is actually written.
+        name = name.replace("<", "\\u003c").replace('"', "\\u0022")
+        if len(name) > _AUTH_NAME_MAX:
+            return f"{_TOO_LONG_NAME} len={len(name)}"
     return name
 
 
@@ -5883,7 +5888,7 @@ def main() -> None:
         bind_host=args.host,
         auth_mode=auth_mode,
         auth_report=auth_report,
-        auth_report_until=args.auth_report_until,
+        auth_report_until=None if args.verify_only else args.auth_report_until,
     )
     # #3283: the gate's own, dedicated read-only GitHub identity, kept beside the
     # service data (the unit sets FORUM_HOME; else the dir holding the DB).
