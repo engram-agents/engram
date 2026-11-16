@@ -270,13 +270,22 @@ exec "$REAL_PY" "$@"
         )
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as first:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            proc.communicate()
-            raise
+            # Reap, but not on pipe EOF forever: a descendant that left the group (setsid) and holds
+            # stdout/stderr would block here. Bounded; the FIRST TimeoutExpired is the one re-raised.
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+            raise first
         proc = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         proc.all = proc.stdout + proc.stderr
         return proc

@@ -2304,13 +2304,22 @@ def test_install_sh_step_5_says_so_in_its_own_words_when_the_marketplace_step_ex
 
 def _net_audit(root: Path):
     """A sitecustomize audit hook on PYTHONPATH: every socket.connect / socket.getaddrinfo event
-    in any python child is appended to a log. Returns (dir for PYTHONPATH, log path)."""
+    in any python child is appended to a log. It also appends sys.argv[0] to a SEPARATE loaded log
+    (not the network log, which the cells assert is empty) once per process that loads it.
+    Returns (dir for PYTHONPATH, network log path, loaded log path)."""
     d = Path(root)
     d.mkdir(parents=True, exist_ok=True)
     log = d / "net-events.log"
+    loaded = d / "loaded.log"
     (d / "sitecustomize.py").write_text(
         "import sys\n"
         f"_LOG = {str(log)!r}\n"
+        f"_LOADED = {str(loaded)!r}\n"
+        "try:\n"
+        "    with open(_LOADED, 'a') as _f:\n"
+        "        _f.write((sys.argv[0] if sys.argv else '') + '\\n')\n"
+        "except Exception:\n"
+        "    pass\n"
         "def _hook(event, args):\n"
         "    if event in ('socket.connect', 'socket.getaddrinfo'):\n"
         "        try:\n"
@@ -2320,7 +2329,7 @@ def _net_audit(root: Path):
         "            pass\n"
         "sys.addaudithook(_hook)\n"
     )
-    return d, log
+    return d, log, loaded
 
 
 def _net_events(log: Path) -> list[str]:
