@@ -91,7 +91,10 @@ Module `tools/_embedding_repair_route.py` (Essential tier, beside `_owner_read.p
   stops loudly with the rest pending; a rerun takes a fresh preview. It never switches route mid-run.
 - Route "direct": one connection to the store per batch, then per row in request order `BEGIN IMMEDIATE`,
   `publish_embedding` in prepared mode, `COMMIT` (one transaction per row). An error mid-batch rolls that row back and
-  stops; `DirectWriteError` carries the rows already committed (`.results`) and the cause.
+  stops; `DirectWriteError` carries the rows already committed (`.results`) and the cause. Two failures do NOT raise: a
+  vec0 load failure shows up as every item `pending` / `mirror`, and an unreadable epoch as every item `deferred` /
+  `check_failed`; the repair tool must treat an all-pending or all-deferred batch as a STOP signal (the store is
+  unwritten or only marked, and every later batch would do the same), never as progress.
 - Route "owner": sends the owner op below through `_owner_read.write`. The answer is checked strictly (one entry per
   item sent, in order, valid fields, `counts` equal to the tally); a malformed answer is INDETERMINATE, because the owner
   may have committed. Owner down, refusing, malformed or indeterminate raises `OwnerUnavailable` (with `.reason`,

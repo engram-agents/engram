@@ -17,6 +17,10 @@ route is fixed for a run: a flag that no longer matches the route raises `RouteC
                   on any path: an owner that is down, refusing, indeterminate or answering malformed raises, and nothing is
                   written directly.
 
+Two direct-route failures do NOT raise: a vec0 load failure shows up as every item `pending` / `mirror`, and an unreadable epoch
+as every item `deferred` / `check_failed`. The repair tool must treat an all-pending or all-deferred batch as a STOP signal (the
+store is unwritten or only marked, and every later batch would do the same), never as progress.
+
 Failures are typed (all subclass `RouteError`, which carries `.results`):
   RouteChanged       the flag no longer matches the route this run opened with.
   OwnerFlagOff       the owner refused `flag_off`: this caller's route is stale (the owner's route-integrity refusal).
@@ -80,7 +84,8 @@ class OwnerFlagOff(RouteError):
 
 
 class OwnerUnavailable(RouteError):
-    """Every other owner-route failure. `.reason` is the owner's reason, or "down" / "indeterminate" / "malformed"; `.commit` is
+    """Every other owner-route failure. `.reason` is the owner's reason, or "down" / "indeterminate" / "malformed" ("down" also
+    stands for an owner answer that carried no reason: nothing here distinguishes the two); `.commit` is
     None, "indeterminate" or "committed_unverified"; `.request_id` is the id the batch was sent with (None only when `open_route`'s
     ping failed). The message is built from `_owner_read`'s own, which `owner_read.ping` and `owner_read.write` raise as this
     class (it is the spec's `error_cls`), so a bare `OwnerUnavailable(message)` is valid."""
