@@ -14,12 +14,19 @@ name: affected-tests
 # (Layer 1: static import graph; Layer 2: packaging/test-map.json convention
 # map).
 #
-# Fail-open: any changed file unresolved by both layers triggers the full
-# suite so a new surface can never silently escape coverage.
+# Full-suite triggers STOP, they no longer run the suite: a changed
+# conftest.py, pytest.ini, requirements file, the test map, or the selector
+# itself makes run_touched_tests.py print the triggers and exit 7 without
+# running anything (PR-MERGE-POLICY, merge-seat test rules item 1: the whole
+# suite is not a per-PR run). The one explicit way to run it is the selector's
+# --full flag. This workflow's step does not pass --full and has no dispatch
+# input for it, so a dispatch on such a range fails with exit 7; run the
+# selector with --full locally (or via tests.yml / nightly.yml) when the whole
+# suite is wanted.
 #
 # This gate intentionally does NOT replace the full suite (tests.yml,
-# main-only). Its output — "SUBSET green" or "Full suite green (fallback)"
-# — is an iteration signal, not a convergence claim. The full suite gates
+# main-only). Its output — "SUBSET green" — is an iteration signal, not a
+# convergence claim. The full suite gates
 # merge-readiness at main-merge time.
 #
 # Decision (Lei 2026-06-23, issue #1358): mechanical gate > vigilance for

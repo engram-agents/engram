@@ -790,15 +790,31 @@ git -C <scratch> merge --no-edit refs/pr/N
 directory is **not** run per PR, by any seat: the author, the colleague or the merge seat. Each
 seat's run is:
 
-1. **The selected tests.** Select every test file that imports a changed module, or whose text
-   names a changed file by its basename (`grep -rlF --include='*.py' <basename> tests`). Docs,
-   skills, templates and configs are test inputs in this repo: on `dev` `786194ee` that grep finds
-   4 test files naming `docs/compaction-continuity.md`, 9 naming
-   `tools/engramd_read_scan.config.json` and 14 naming `template.CLAUDE.md`. So a doc change
-   selects the tests that name it. A changed file that no test names selects nothing beyond the
-   guard set. The selection is never the whole suite. Until #4358 lands,
-   `tools/run_touched_tests.py` still falls back to the full suite for a file it cannot resolve,
-   so a seat applies the name selection by hand.
+1. **The selected tests.** `tools/run_touched_tests.py --base <base> --head <head>` prints this
+   selection, and every seat runs that tool rather than selecting by hand. It is every test file
+   that imports a changed module (imports are parsed, and the module must sit where the tests'
+   `conftest.py` puts it on `sys.path`), or whose text names a changed file. A test names a file
+   when it contains the file's basename as a whole name, not inside a longer name (`viz_server.py`
+   does not name `server.py`); when that basename is shared by more than one tracked file, the
+   test must also contain the file's parent directory name as a whole word, so
+   `src/forum/server.py` does not select every test that mentions ENGRAM's `server.py`
+   (Kepler, 2026-11-16). A changed test file selects itself. Docs, skills, templates and configs
+   are test inputs in this repo, so a doc change selects the tests that name it. A changed file
+   that no test names selects nothing beyond the guard set. The selection is never the whole
+   suite. **The forum's tests** (`src/forum/tests/`) are a separate selection by the same rule,
+   run in the forum's own environment and never mixed into the `tests/` run. The tool refuses
+   instead of printing an empty selection: exit 2 for an unknown ref, 3 for a guard file named in
+   item 4 of *Owner merge* that is missing, 4 when it cannot read that list here, 5 when nothing
+   changed between base and head, 6 when the selection would be the whole `tests/` suite. It
+   reads the guard set from item 4, so the list has one home. A change to a file that always
+   triggers the whole suite (`conftest.py`, `pytest.ini`, the requirements, the test map, the
+   tool itself) makes the tool run nothing: it names each triggering file and its universe,
+   prints the guard set and the scanner commands, and exits 7. The seat then chooses what to run
+   (for example the changed test files, the tests that name the trigger, and the guard set) and
+   records that choice in its review or gate record. One option the merge seat has used
+   (2026-11-16, #4844): commit the triggering change onto the base, on a tree byte-equal to the
+   merge, and run the tool from there, so the rest of the PR gets a normal selection. `--full`
+   stays the one explicit way to run the whole suite.
 2. **The guard set** of item 4 in *Owner merge*: the whole-tree scanners and guards that no
    changed file names. They always run. Run `tools/scan-leaks.py` with `--root .`: its default root is
    `src/engram` only, so a bare run misses `tests/` and `docs/`, while CI's
