@@ -13,7 +13,8 @@ BASENAME only. No output of this module ever contains a secret value: no file is
 Linux: directory passes only if mode 0700 and its access ACL is exactly the three base
 entries (no named user/group entry, no mask line) and it has no default ACL line at all;
 each regular file passes only if mode 0600 and base entries only. Anything that is not a
-regular file (symlink, fifo, subdirectory, socket) refuses, judged with lstat and never
+regular file (symlink, fifo, subdirectory, socket) refuses, and so does any entry whose name
+begins with "." (a suspected leftover of an interrupted secret-put), judged with lstat and never
 followed. getfacl missing or failing -> exit 2 (never a pass).
 Other platforms: the ACL half is not implemented; a note goes to stderr every time and
 the mode bits and the regular-file rule are still enforced.
@@ -143,6 +144,12 @@ def check(home) -> Result:
             est = os.lstat(p)
         except OSError as exc:
             cannot_tell.append("%s: cannot tell (lstat %s)" % (name, type(exc).__name__))
+            continue
+        if name.startswith("."):
+            # secret-put's temp files are mkstemp(prefix=".put-"): a dotfile is the residue of a
+            # secret-put killed between the write and the replace, and it holds the whole value.
+            res.problems.append("%s: suspected leftover temporary file from an interrupted secret-put; remove it" % name)
+            chmod_lines.append("rm -- %s" % shlex.quote(str(p)))
             continue
         if not stat.S_ISREG(est.st_mode):
             kind = "symlink" if stat.S_ISLNK(est.st_mode) else "not a regular file"

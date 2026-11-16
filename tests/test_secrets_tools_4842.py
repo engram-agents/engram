@@ -18,6 +18,7 @@ assertions are on booleans. Every home is a tmp_path home, never the real ENGRAM
 
 import importlib.util
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -633,6 +634,7 @@ def test_r6_read_secret_refuses_a_non_regular_file_without_blocking(tmp_path):
     os.mkfifo(fifo)
     reg = tmp_path / "plain"
     reg.write_text(MARKER + "\n")
+    os.chmod(reg, 0o600)  # read_secret now judges the mode too (Z1)
 
     class _Blocked(BaseException):  # not an OSError/Exception, so the helper cannot swallow it
         pass
@@ -694,3 +696,65 @@ def test_r7_relative_engram_home_refused_by_all_three(tmp_path):
         assert r.returncode == 1
         assert "ENGRAM_HOME must be an absolute path" in _out(r)
     assert not (tmp_path / "fakehome" / ".engram").exists()
+
+
+# ---------------------------------------------------------------- Z1-Z3 security-read fold (PR #4856)
+
+
+def test_z1_read_secret_refuses_a_non_0600_regular_file_and_reads_a_0600_one(tmp_path):
+    mod = _load_tool(SECRET_ENV, "secret_env_z1")
+    f = tmp_path / "loose-secret"
+    f.write_text(MARKER + "\n")
+    os.chmod(f, 0o644)
+    refused = named = clean = False
+    try:
+        mod.read_secret(f)
+    except mod.SecretRefused as exc:
+        refused = "mode" in str(exc)
+        named = "loose-secret" in str(exc)
+        clean = MARKER not in str(exc)
+    assert refused
+    assert named
+    assert clean
+    os.chmod(f, 0o600)
+    assert mod.read_secret(f) == MARKER
+
+
+@needs_acl
+def test_z3a_dotfile_leftover_refuses_named_with_remediation(tmp_path):
+    home = _clean_home(tmp_path)
+    leftover = home / "secrets" / ".put-abc123"
+    _write(leftover, MARKER + "\n")
+    r = _check_cli(home)
+    out = _out(r)
+    assert r.returncode == 1
+    assert ".put-abc123" in out
+    assert "suspected leftover temporary file from an interrupted secret-put; remove it" in out
+    assert "rm -- " + shlex.quote(str(leftover)) in out
+    assert MARKER not in out
+
+
+@needs_acl
+def test_z3b_normal_put_leaves_no_dotfile_and_the_folder_still_passes(tmp_path):
+    home = _clean_home(tmp_path, files=())
+    r = _run(SECRET_PUT, ["--home", str(home), "k"], stdin=MARKER + "\n")
+    assert r.returncode == 0
+    assert MARKER not in _out(r)
+    assert [p.name for p in (home / "secrets").iterdir() if p.name.startswith(".")] == []
+    assert _check_cli(home).returncode == 0
+
+
+@needs_acl
+def test_z3c_secret_env_refuses_when_a_leftover_is_present(tmp_path):
+    home = _marker_home(tmp_path)
+    _write(home / "secrets" / ".put-zz9", MARKER + "\n")
+    sentinel = tmp_path / "ran"
+    r = _run(
+        SECRET_ENV,
+        ["--home", str(home), "anthropic-api-key.acct", "--", sys.executable, "-c",
+         f"open({str(sentinel)!r}, 'w').close()"],
+    )
+    assert r.returncode == 1
+    assert ".put-zz9" in _out(r)
+    assert not sentinel.exists()
+    assert MARKER not in _out(r)
