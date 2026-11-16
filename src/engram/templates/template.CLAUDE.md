@@ -298,7 +298,7 @@ If the SessionStart context includes `⚠️ ENGRAM substrate health:` lines, te
 | Plugin marketplace + enable state | marketplace `engram-local` registered in `~/.claude/settings.json`; Claude-managed plugin data and cache in `~/.claude/plugins/` |
 | Warm briefing | `{{ENGRAM_HOME}}/warm-briefing.md` |
 | Private diary | `{{ENGRAM_HOME}}/diary/` |
-| Secrets (API keys, bot and service tokens) | `{{ENGRAM_HOME}}/secrets/`, one file per secret, directory 0700, files 0600, git-ignored. Read value-blind only: load a secret into the one process that needs it, never print it. Look here first for any credential question; the forum token is the one exception for now, at `{{ENGRAM_HOME}}/forum-token`. |
+| Secrets (API keys, bot and service tokens) | `{{ENGRAM_HOME}}/secrets/`, one file per secret, git-ignored; keep the directory 0700 and each file 0600. Read value-blind only: load a secret into the one process that needs it, never print it. Look here first for any credential kept under `{{ENGRAM_HOME}}`; the forum token is the one exception for now, at `{{ENGRAM_HOME}}/forum-token`. Other plugins may keep their own credentials in their own homes. |
 | Per-session marker | `{{ENGRAM_HOME}}/sessions/<session_id>.json`, written by the SessionStart hook, one per session. Hooks take `session_id` and `transcript_path` from their stdin payload first; this file is the fallback. To cite the current session, use the `transcript_path` SessionStart injects. |
 
 ## Agent coordination

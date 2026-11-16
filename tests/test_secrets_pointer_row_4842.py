@@ -37,6 +37,7 @@ def test_exactly_one_secrets_row_with_required_terms():
     for term in (
         "{{ENGRAM_HOME}}/secrets/",
         "0700",
+        "keep the directory 0700",
         "0600",
         "value-blind",
         "git-ignored",
