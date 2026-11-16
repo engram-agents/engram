@@ -510,6 +510,34 @@ def test_r4_put_fsyncs_the_secrets_dir_after_replace(tmp_path, monkeypatch):
     assert events.index("fsync-dir") > events.index("replace")
 
 
+@needs_acl
+def test_f2_dir_fsync_failure_is_reported_not_a_traceback(tmp_path, monkeypatch, capsys):
+    mod = _load_tool(SECRET_PUT, "secret_put_f2")
+    home = _clean_home(tmp_path, files=())
+    rechecks = []
+    real_check = mod.secrets_check.check
+
+    def spy_check(h):
+        rechecks.append(h)
+        return real_check(h)
+
+    def boom(path):
+        raise OSError(5, "boom")
+
+    monkeypatch.setattr(mod, "_fsync_dir", boom)
+    monkeypatch.setattr(mod.secrets_check, "check", spy_check)
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"v-f2\n")))
+    rc = mod.main(["--home", str(home), "k"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert ("stored, but the secrets folder could not be synced to disk; "
+            "the value may not survive a crash") in err
+    assert "Traceback" not in err and "v-f2" not in err
+    f = home / "secrets" / "k"
+    assert f.exists() and stat.S_IMODE(f.stat().st_mode) == 0o600
+    assert len(rechecks) == 2  # pre-write check and the post-write re-check
+
+
 def _r5_refused(tmp_path, args, names_to_make, var):
     home = _clean_home(tmp_path, files=())
     for n in names_to_make:
@@ -544,6 +572,46 @@ def test_r5_default_mapping_with_dash_refused(tmp_path):
 )
 def test_r5_as_override_to_dangerous_var_refused(tmp_path, var):
     _r5_refused(tmp_path, ["--as", f"{var}=k", "k"], ["k"], var)
+
+
+@needs_acl
+@pytest.mark.parametrize(
+    "var",
+    ["GIT_SSH_COMMAND", "LC_ALL", "JAVA_TOOL_OPTIONS", "HTTPS_PROXY", "GIT_CONFIG_COUNT", "CARGO_HOME",
+     "SHELLOPTS", "SSL_CERT_FILE", "EDITOR", "NPM_CONFIG_REGISTRY", "GOFLAGS"],
+)
+def test_f1_round3_added_startup_vars_refused_and_message_says_how_to_proceed(tmp_path, var):
+    _r5_refused(tmp_path, ["--as", f"{var}=k", "k"], ["k"], var)
+    home = tmp_path / "home"
+    r = _run(SECRET_ENV, ["--home", str(home), "--as", f"{var}=k", "k", "--", sys.executable, "-c", "pass"])
+    assert "choose another variable with --as VAR=NAME" in _out(r)
+
+
+@needs_acl
+def test_f1_round3_default_mapping_via_python_prefix_message_names_as(tmp_path):
+    _r5_refused(tmp_path, ["python-token"], ["python-token"], "PYTHON_TOKEN")
+    r = _run(SECRET_ENV, ["--home", str(tmp_path / "home"), "python-token", "--", sys.executable, "-c", "pass"])
+    assert "--as" in _out(r)
+
+
+def test_f1_round3_prefix_and_name_sets_cover_the_additions():
+    mod = _load_tool(SECRET_ENV, "secret_env_f1")
+    for v in ("GIT_CONFIG_KEY_0", "CARGO_HOME", "NPM_CONFIG_PREFIX", "LC_MESSAGES"):
+        assert mod.is_startup_var(v)
+    assert not mod.is_startup_var("ANTHROPIC_API_KEY")
+
+
+@needs_acl
+def test_f3_name_to_var_mapping_computed_once(tmp_path, monkeypatch):
+    mod = _load_tool(SECRET_ENV, "secret_env_f3")
+    home = _clean_home(tmp_path, files=())
+    _write(home / "secrets" / "tok", "v\n")
+    calls = []
+    real = mod.default_var
+    monkeypatch.setattr(mod, "default_var", lambda n: calls.append(n) or real(n))
+    monkeypatch.setattr(mod.os, "execvpe", lambda *a, **k: (_ for _ in ()).throw(OSError("stop")))
+    assert mod.main(["--home", str(home), "tok", "--", "true"]) == 127
+    assert calls == ["tok"]
 
 
 @needs_acl
