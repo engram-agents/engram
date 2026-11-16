@@ -1723,7 +1723,7 @@ _JSON_KEYS = [
 
 
 def _run_json(monkeypatch, argv, *, changed=None, select_ret=None,
-              classify=None, total=172):
+              classify=None, total=172, expect_rc=0):
     import io
     import contextlib
     if changed is not None:
@@ -1741,7 +1741,7 @@ def _run_json(monkeypatch, argv, *, changed=None, select_ret=None,
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = _runner.main(argv)
-    assert rc == 0, f"--json must exit 0, got {rc}"
+    assert rc == expect_rc, f"--json must exit {expect_rc}, got {rc}"
     return json.loads(buf.getvalue())  # also asserts stdout is pure, valid JSON
 
 
@@ -1760,6 +1760,7 @@ def test_json_trigger_full(monkeypatch):
         monkeypatch, ["--json"],
         changed=["packaging/test-map.json"],
         select_ret=([], True, ["packaging/test-map.json changed → full"], {}),
+        expect_rc=7,  # a full-suite trigger without --full is a named stop (PR #4848)
     )
     assert d["full"] is True
     assert "test-map.json" in d["full_reasons"][0]

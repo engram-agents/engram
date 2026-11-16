@@ -101,6 +101,10 @@ ALWAYS_FULL_PATTERNS: list[str] = [
 ]
 
 FORUM_TESTS_DIR = "src/forum/tests"
+
+# A full-suite trigger without --full: nothing runs, the triggering files are
+# named, the seat chooses what to run (PR-MERGE-POLICY: tests/ is not run per PR).
+EXIT_FULL_TRIGGER = 7
 POLICY_PATH = "docs/internal/PR-MERGE-POLICY.md"
 
 
@@ -1055,6 +1059,12 @@ def _test_universe(repo_root: str) -> set[str]:
     return {str(p.relative_to(repo_root)) for p in tests_dir.glob("test_*.py")}
 
 
+def _trigger_universe(reason: str) -> str:
+    """The test universe a full-suite trigger belongs to, by path: a path under
+    src/forum/tests/ is the forum universe, anything else is tests/."""
+    return f"{FORUM_TESTS_DIR}/" if f"{FORUM_TESTS_DIR}/" in reason else f"{TESTS_DIR}/"
+
+
 def _tool_check_commands(tools: list[str], base: str, head: str | None) -> list[str]:
     """The policy's tools/*.py scanners as printable commands.
 
@@ -1290,7 +1300,9 @@ def _compute_selection(args, repo_root: str, verbose: bool):
        forum_selected, tool_checks}
 
     Refusals: 2 unknown ref, 3/4 guard set unreadable, 5 no changed files,
-    6 a non-full selection that is the whole tests/ universe.
+    6 a non-full selection that is the whole tests/ universe.  A full-suite
+    trigger is returned as a dict (is_full=True, guard set read); the caller
+    turns it into exit 7.
     """
     try:
         if args.head is None:
@@ -1329,6 +1341,15 @@ def _compute_selection(args, repo_root: str, verbose: bool):
         "forum_selected": [], "tool_checks": [],
     }
     if is_full:
+        # A trigger still owes the guard set and the scanners, so the guard set
+        # is read here too (exit 3/4 apply); the caller then stops with exit 7.
+        try:
+            _tests, tools = guard_set(repo_root)
+        except GuardSetError as exc:
+            _err(str(exc))
+            return exc.code
+        out["tool_checks"] = _tool_check_commands(tools, args.base, args.head)
+        out["guard_tests"] = _tests
         return out
 
     universe = _test_universe(repo_root)
@@ -1382,7 +1403,8 @@ def _emit_json_selection(args, repo_root: str) -> int:
     then — the consumer runs `pytest tests/`, not the listed subset). Buckets are
     zero when full or when nothing is selected. select_tests runs with
     verbose=False so no banner prose leaks onto stdout and corrupts the JSON.
-    A refusal (exit 2-6) prints nothing on stdout.
+    A refusal (exit 2-6) prints nothing on stdout.  A full-suite trigger prints
+    the object (full=true) and exits 7; --full prints it and exits 0.
     """
     empty_buckets = {"internals": 0, "contract": 0, "map_residue": 0}
     total_test_files = _count_total_test_files(repo_root)
@@ -1423,7 +1445,7 @@ def _emit_json_selection(args, repo_root: str) -> int:
             **extra, **tail,
         }
         print(json.dumps(out))
-        return 0
+        return EXIT_FULL_TRIGGER
 
     if selected:
         test_map = _load_test_map(repo_root)
@@ -1534,6 +1556,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Emit the selection as a single JSON object on stdout and exit 0 "
+            "(exit 7 when a full-suite trigger is selected) "
             "(machine-readable interface for run_matrix.py / CI — no pytest run, "
             "no human banner). Composes with --base/--head; ignores --dry-run/passthrough. "
             "With --full the diff is skipped, so changed_files is emitted as []."
@@ -1631,18 +1654,26 @@ def main(argv: list[str] | None = None) -> int:
     detail, map_selected = res["detail"], res["map_selected"]
 
     if res["is_full"]:
-        trigger_desc = "; ".join(res["reasons"])
-        print(f"[run_touched_tests] FULL MAIN SUITE triggered by: {trigger_desc}")
-        # The forum tests are a separate universe: they run in the forum's own
-        # environment (bs4 et al. are version-pinned there; the plugin venv
-        # produces env-skew false failures), never in the tests/ command.
+        # Exit 7: a full-suite trigger runs nothing.  --full is the one explicit
+        # way to run the whole tests/ suite.  The forum tests are a separate
+        # universe (their own environment), named by path below.
+        print(
+            "[run_touched_tests] FULL-SUITE TRIGGER: nothing run (exit 7). "
+            "The whole suite is not a per-PR run; choose what to run "
+            "(the changed tests, the tests naming the trigger, the guard set) "
+            "and record the choice, or pass --full."
+        )
+        for reason in res["reasons"]:
+            print(f"  trigger: {reason}  [universe: {_trigger_universe(reason)}]")
+        print("[guard set] run these tests too (PR-MERGE-POLICY item 4):")
+        for t in res["guard_tests"]:
+            print(f"  {t}")
         for line in full_forum_lines:
             print(line)
-        if args.dry_run:
-            print("[dry-run] would run: pytest tests/")
-            return 0
-        cmd = [sys.executable, "-m", "pytest", "tests/"] + passthrough
-        return subprocess.run(cmd, cwd=repo_root).returncode
+        print("[tool checks] run these too (the policy's scanners):")
+        for c in res["tool_checks"]:
+            print(f"  {c}")
+        return EXIT_FULL_TRIGGER
 
     # Load test-map and allowlist for banner classification
     test_map = _load_test_map(repo_root)

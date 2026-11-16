@@ -14,7 +14,7 @@ Written BEFORE the implementation (contract-first). The contract, by cell group:
       are exactly the 21 pinned here.
   C4  no changed files -> exit 5, the guard set is not printed as a selection.
   C5  a non-full selection equal to the whole tests/ universe -> exit 6; the
-      full-suite triggers keep their behaviour.
+      full-suite triggers stop with exit 7 (E1-E5 at the end of this file).
   C6  layer 1 identity is (import root, stem).
   C7  name rule (a) whole-name basename + (b') parent directory word when the
       basename is not unique.
@@ -346,13 +346,14 @@ def test_c5_a_proper_subset_is_not_exit_6(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("mode", [["--json"], ["--dry-run"]], ids=["json", "human"])
-def test_c5_full_trigger_keeps_its_behaviour_and_exit_code(tmp_path, capsys, mode):
+def test_c5_full_trigger_is_a_named_stop_with_exit_7(tmp_path, capsys, mode):
+    # E1/E2 (PR #4848 review): a trigger without --full runs nothing and exits 7.
     repo = _repo(tmp_path, {"tests/test_a.py": "a = 1\n"})
     with mock.patch.object(_runner, "guard_set", return_value=([], [])), \
          mock.patch.object(_runner, "_changed_files", return_value=["tests/conftest.py"]):
         rc, out, _err = _main([*mode, "--base", "HEAD", "--repo-root", repo], capsys)
-    assert rc == 0
-    assert ("FULL MAIN SUITE" in out) or json.loads(out)["full"] is True
+    assert rc == 7
+    assert ("FULL-SUITE TRIGGER" in out) or json.loads(out)["full"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -735,3 +736,106 @@ def test_c12_todays_case_selects_a_small_scoped_set(tmp_path):
     assert changed_forum_tests
     assert changed_forum_tests <= set(d["forum_selected"])
     assert not any(s.startswith("src/forum/") for s in selected)
+
+
+# ---------------------------------------------------------------------------
+# E1-E5 — a full-suite TRIGGER without --full stops with exit 7 and runs nothing
+#   (code-owner review of PR #4848: the policy says the whole tests/ suite is
+#   not run per PR; the tool must not start it on a conftest.py change).
+#   --full stays the one explicit way to run the whole suite.
+# ---------------------------------------------------------------------------
+
+_E_GUARD = ["tests/test_guard.py"]
+_E_TOOLS = ["tools/scan-leaks.py", "tools/test_id_set_check.py"]
+
+
+def _assert_no_pytest(run):
+    """No pytest subprocess started (git ls-files etc. may still run for layer 3)."""
+    for call in run.call_args_list:
+        assert "pytest" not in " ".join(str(c) for c in call[0][0]), call
+
+
+def _trigger_run(tmp_path, capsys, changed, extra, guard=(_E_GUARD, _E_TOOLS)):
+    """Run main on a trigger with subprocess.run patched; return (rc, out, err, run_mock)."""
+    repo = _repo(tmp_path, {"tests/test_a.py": "a = 1\n"})
+    with mock.patch.object(_runner, "guard_set", return_value=guard), \
+         mock.patch.object(_runner, "_changed_files", return_value=changed), \
+         mock.patch.object(_runner.subprocess, "run") as run:
+        rc, out, err = _main([*extra, "--base", "HEAD", "--repo-root", repo], capsys)
+    return rc, out, err, run
+
+
+@pytest.mark.parametrize("extra", [[], ["--dry-run"]], ids=["real", "dry-run"])
+def test_e1_trigger_without_full_runs_nothing_and_exits_7(tmp_path, capsys, extra):
+    rc, out, _err, run = _trigger_run(tmp_path, capsys, ["tests/conftest.py"], extra)
+    _assert_no_pytest(run)
+    assert rc == 7
+    assert "tests/conftest.py" in out
+    assert "tests/" in out and "universe" in out
+    # the guard set and the tool checks print, as on a normal selection
+    assert "tests/test_guard.py" in out
+    assert "[tool checks]" in out
+    assert "python3 tools/scan-leaks.py --root ." in out
+    assert "test_id_set_check.py --base $(git merge-base HEAD HEAD) --head HEAD" in out
+
+
+def test_e1_map_full_signal_is_a_trigger_too(tmp_path, capsys):
+    repo = _repo(tmp_path, {"tests/test_a.py": "a = 1\n"})
+    entry = {"path_prefix_or_glob": "special/", "test_globs": [], "full_suite_fallback": True}
+    with mock.patch.object(_runner, "guard_set", return_value=(_E_GUARD, _E_TOOLS)), \
+         mock.patch.object(_runner, "_load_test_map",
+                           return_value={"mappings": [entry]}), \
+         mock.patch.object(_runner, "_changed_files", return_value=["special/x.dat"]), \
+         mock.patch.object(_runner.subprocess, "run") as run:
+        rc, out, _err = _main(["--base", "HEAD", "--repo-root", repo], capsys)
+    _assert_no_pytest(run)
+    assert rc == 7
+    assert "special/x.dat" in out
+
+
+def test_e2_json_trigger_prints_the_object_and_exits_7(tmp_path, capsys):
+    rc, out, _err, run = _trigger_run(tmp_path, capsys, ["tests/conftest.py"], ["--json"])
+    _assert_no_pytest(run)
+    assert rc == 7
+    d = json.loads(out)
+    assert d["full"] is True
+    assert any("tests/conftest.py" in r for r in d["full_reasons"])
+    assert d["tool_checks"] and any("scan-leaks.py" in c for c in d["tool_checks"])
+
+
+@pytest.mark.parametrize("extra", [[], ["--dry-run"], ["--json"]], ids=["real", "dry-run", "json"])
+def test_e3_guard_set_refusal_still_applies_on_the_trigger_path(tmp_path, capsys, extra):
+    repo = _policy_repo(
+        tmp_path, "   `tests/test_a.py` `tests/test_gone1.py`", {"tests/test_a.py": "a = 1\n"},
+    )
+    with mock.patch.object(_runner, "_changed_files", return_value=["tests/conftest.py"]), \
+         mock.patch.object(_runner.subprocess, "run") as run:
+        rc, out, err = _main([*extra, "--base", "HEAD", "--repo-root", repo], capsys)
+    _assert_no_pytest(run)
+    assert rc == 3
+    assert "tests/test_gone1.py" in err
+    assert "{" not in out
+
+
+def test_e4_full_flag_still_runs_the_whole_suite_without_base(tmp_path, capsys):
+    repo = _repo(tmp_path, {})
+    with mock.patch.object(_runner.subprocess, "run") as run:
+        run.return_value.returncode = 5
+        rc, _out, _err = _main(["--full", "--repo-root", repo], capsys)
+    assert rc == 5
+    run.assert_called_once()
+    cmd = run.call_args[0][0]
+    assert cmd[-1] == "tests/" and cmd[1:3] == ["-m", "pytest"]
+
+
+def test_e5_forum_trigger_is_named_with_its_universe(tmp_path, capsys):
+    rc, out, _err, run = _trigger_run(
+        tmp_path, capsys, ["src/forum/tests/conftest.py"], ["--dry-run"]
+    )
+    _assert_no_pytest(run)
+    assert rc == 7
+    line = next(l for l in out.splitlines() if "src/forum/tests/conftest.py" in l)
+    assert "src/forum/tests/" in line
+    rc2, out2, _e, _r = _trigger_run(tmp_path / "x", capsys, ["tests/conftest.py"], ["--dry-run"])
+    line2 = next(l for l in out2.splitlines() if "tests/conftest.py" in l)
+    assert "src/forum/tests/" not in line2
