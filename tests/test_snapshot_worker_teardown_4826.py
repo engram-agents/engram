@@ -31,7 +31,6 @@ def _reset_worker_state():
     w._started = False
     w._worker_thread = None
     w._seq_counter = 0
-    w._stop.clear()
     w._work_event.clear()
 
 
@@ -116,8 +115,8 @@ def test_still_alive_past_bound_is_loud_not_fatal(writing_worker, capsys):
     lines = [ln for ln in err.splitlines() if "tests/x.py::the_nodeid" in ln]
     assert len(lines) == 1
     assert "0.5" in lines[0]
-    # Clean up: the helper's reset cleared _stop (as the old fixture did), so the
-    # orphan would idle in its loop for 30 s. End the writer, re-signal stop, join.
+    # Clean up: the orphan's token stays set (#4833: a stop is never undone), so it
+    # exits after its job. End the writer, re-signal stop, join.
     release.set()
     w._stop.set()
     w._work_event.set()
