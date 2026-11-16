@@ -22,6 +22,8 @@ macOS (darwin): the ACL is read from the entry lines of `ls -ldeq <dir>` / `ls -
 extended attributes. Any entry line, or a "+" suffix, refuses, named by basename, with the
 remediation `chmod -N <path>`; "@" alone passes (macOS adds com.apple.provenance to ordinary files).
 If ls fails, the suffix is anything else, or a later line is not an entry -> exit 2.
+ls is called by absolute path (/bin/ls, part of macOS), never through PATH, so a GNU coreutils `ls`
+earlier on PATH (it rejects -e) is never used; a missing /bin/ls is "cannot tell" (exit 2).
 Other platforms: the ACL half is not implemented; a note goes to stderr every time, the stdout
 verdict says "modes only; ACL not checked on this platform", and the mode bits and the
 regular-file rule are still enforced.
@@ -39,6 +41,7 @@ from pathlib import Path
 
 NON_LINUX_NOTE = "secrets ACL not checked on this platform"
 PASS_MODES_ONLY = "secrets check: pass (modes only; ACL not checked on this platform)"
+DARWIN_LS = "/bin/ls"  # absolute path on purpose: no PATH lookup, no env override, no fallback
 _LS_MODE_RE = re.compile(r"^[-bcdlpsDw?][-rwxsStTlL]{9}[+@]?$")  # darwin: only none, "@" or "+" is understood
 _ACL_ENTRY_RE = re.compile(r"^\s*\d+: \S")
 NOTE_CHMOD = "note: 'chmod g-w' changes only the ACL mask, not a named entry."
@@ -104,13 +107,15 @@ def _darwin_acl_defects(path: str, is_dir: bool) -> list:
     """macOS: the ACL is read from the entry lines of `ls -ldeq` (dir) / `ls -leq` (file), because the
     mode suffix shows "@" instead of "+" when the file also has extended attributes (ls prints ONE suffix).
     -q prints non-printable name characters as "?", so a name cannot fake an entry line.
+    ls is DARWIN_LS (/bin/ls, part of macOS), called by absolute path so a GNU coreutils `ls` earlier on
+    PATH, which rejects -e, is never used; if that file is missing this is _CannotTell, never a PATH fallback.
     Line 1 is the long line: its mode field must end in nothing, "@" or "+" (anything else, e.g. "%", is
     not understood). Every later non-empty line must be an ACL entry (" 0: group:everyone allow read").
     Returns ["extended ACL"] for at least one entry line or a "+" suffix, else [].
     Raises _CannotTell when ls fails or its output does not have that shape."""
     try:
         r = subprocess.run(
-            ["ls", "-ldeq" if is_dir else "-leq", "--", path],
+            [DARWIN_LS, "-ldeq" if is_dir else "-leq", "--", path],
             capture_output=True,
             text=True,
             timeout=30,

@@ -772,8 +772,8 @@ def test_z3c_secret_env_refuses_when_a_leftover_is_present(tmp_path):
 
 
 # ---------------------------------------------------------------- L1-L5 colleague-read fold (PR #4856)
-# Darwin behaviour is tested on Linux through a monkeypatched sys.platform and PATH shims for `ls` and
-# `chmod`; the one real-macOS cell skips unless sys.platform == "darwin".
+# Darwin behaviour is tested on Linux through a monkeypatched sys.platform and shims for `ls` and `chmod`
+# that the DARWIN_LS / DARWIN_CHMOD constants are pointed at (the tools call /bin/ls and /bin/chmod by absolute path); the one real-macOS cell skips unless sys.platform == "darwin".
 
 _LS_SHIM = """#!/bin/sh
 [ -n "$SHIM_LOG" ] && echo "ls $*" >> "$SHIM_LOG"
@@ -792,15 +792,20 @@ exit "${SHIM_CHMOD_RC:-0}"
 """
 
 
-def _darwin(tmp_path, monkeypatch, dir_mode="drwx------", file_mode="-rw-------", dir_after="", file_after="", **extra):
-    """Pretend to be macOS: platform patched, `ls` and `chmod` shims first on PATH, controlled mode lines."""
+def _darwin(tmp_path, monkeypatch, mod, dir_mode="drwx------", file_mode="-rw-------", dir_after="", file_after="", **extra):
+    """Pretend to be macOS: platform patched and the tools' absolute-path constants (DARWIN_LS, DARWIN_CHMOD)
+    pointed at shims, so PATH is not involved. `mod` is the loaded secrets_check or secret-put module."""
     shim = tmp_path / "darwinshim"
     shim.mkdir()
     for name, body in (("ls", _LS_SHIM), ("chmod", _CHMOD_SHIM)):
         (shim / name).write_text(body)
         os.chmod(shim / name, 0o755)
+    for target in (mod, getattr(mod, "secrets_check", None)):  # secret-put re-checks through its own import
+        if target is not None and hasattr(target, "DARWIN_LS"):
+            monkeypatch.setattr(target, "DARWIN_LS", str(shim / "ls"))
+    if hasattr(mod, "DARWIN_CHMOD"):
+        monkeypatch.setattr(mod, "DARWIN_CHMOD", str(shim / "chmod"))
     log = tmp_path / "shim.log"
-    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("SHIM_LOG", str(log))
     monkeypatch.setenv("SHIM_DIR_MODE", dir_mode)
     monkeypatch.setenv("SHIM_FILE_MODE", file_mode)
@@ -820,7 +825,7 @@ FILE_ENTRY = " 0: group:everyone allow read"
 def test_l1a_darwin_plus_on_dir_refuses_and_names_chmod_N(tmp_path, monkeypatch, capsys):
     mod = _load()
     home = _clean_home(tmp_path)
-    _darwin(tmp_path, monkeypatch, dir_mode="drwx------+")
+    _darwin(tmp_path, monkeypatch, mod, dir_mode="drwx------+")
     assert mod.main(["--home", str(home)]) == 1
     out = capsys.readouterr().out
     assert "secrets: extended ACL" in out
@@ -830,7 +835,7 @@ def test_l1a_darwin_plus_on_dir_refuses_and_names_chmod_N(tmp_path, monkeypatch,
 def test_l1a_darwin_plus_on_file_refuses_named_with_quoted_remediation(tmp_path, monkeypatch, capsys):
     mod = _load()
     home = _clean_home(tmp_path / "ho me's", files=("only-key",))
-    _darwin(tmp_path, monkeypatch, file_mode="-rw-------+")
+    _darwin(tmp_path, monkeypatch, mod, file_mode="-rw-------+")
     assert mod.main(["--home", str(home)]) == 1
     out = capsys.readouterr().out
     assert "only-key: extended ACL" in out
@@ -841,7 +846,7 @@ def test_l1a_darwin_plus_on_file_refuses_named_with_quoted_remediation(tmp_path,
 def test_l1a_darwin_clean_passes_without_the_not_checked_note(tmp_path, monkeypatch, capsys):
     mod = _load()
     home = _clean_home(tmp_path)
-    log = _darwin(tmp_path, monkeypatch)
+    log = _darwin(tmp_path, monkeypatch, mod)
     assert mod.main(["--home", str(home)]) == 0
     cap = capsys.readouterr()
     assert cap.out.splitlines() == ["secrets check: pass"]
@@ -855,7 +860,7 @@ def test_l1a_darwin_clean_passes_without_the_not_checked_note(tmp_path, monkeypa
 def test_l1a_darwin_ls_failing_or_unparseable_is_exit_2(tmp_path, monkeypatch, capsys, extra):
     mod = _load()
     home = _clean_home(tmp_path)
-    _darwin(tmp_path, monkeypatch, **extra)
+    _darwin(tmp_path, monkeypatch, mod, **extra)
     assert mod.main(["--home", str(home)]) == 2
     assert "cannot tell" in capsys.readouterr().out
 
@@ -864,7 +869,7 @@ def test_l1a_darwin_xattr_and_acl_entry_refuses_and_names_chmod_N_on_file(tmp_pa
     """The defect: ls prints '@' (not '+') when an xattr exists, so the ACL is only in the entry lines."""
     mod = _load()
     home = _clean_home(tmp_path)
-    _darwin(tmp_path, monkeypatch, file_mode="-rw-------@", file_after=FILE_ENTRY)
+    _darwin(tmp_path, monkeypatch, mod, file_mode="-rw-------@", file_after=FILE_ENTRY)
     assert mod.main(["--home", str(home)]) == 1
     out = capsys.readouterr().out
     assert "alpha-key: extended ACL" in out
@@ -874,7 +879,7 @@ def test_l1a_darwin_xattr_and_acl_entry_refuses_and_names_chmod_N_on_file(tmp_pa
 def test_l1a_darwin_xattr_and_acl_entry_on_dir_refuses(tmp_path, monkeypatch, capsys):
     mod = _load()
     home = _clean_home(tmp_path)
-    _darwin(tmp_path, monkeypatch, dir_mode="drwx------@", dir_after=DIR_ENTRY)
+    _darwin(tmp_path, monkeypatch, mod, dir_mode="drwx------@", dir_after=DIR_ENTRY)
     assert mod.main(["--home", str(home)]) == 1
     out = capsys.readouterr().out
     assert "secrets: extended ACL" in out
@@ -885,7 +890,7 @@ def test_l1a_darwin_at_alone_passes(tmp_path, monkeypatch, capsys):
     """macOS adds com.apple.provenance to ordinary files: '@' with no entry line is clean."""
     mod = _load()
     home = _clean_home(tmp_path)
-    _darwin(tmp_path, monkeypatch, dir_mode="drwx------@", file_mode="-rw-------@")
+    _darwin(tmp_path, monkeypatch, mod, dir_mode="drwx------@", file_mode="-rw-------@")
     assert mod.main(["--home", str(home)]) == 0
     assert capsys.readouterr().out.splitlines() == ["secrets check: pass"]
 
@@ -904,7 +909,7 @@ def test_l1a_darwin_at_alone_passes(tmp_path, monkeypatch, capsys):
 def test_l1a_darwin_plus_or_entry_line_refuses(tmp_path, monkeypatch, capsys, kw):
     mod = _load()
     home = _clean_home(tmp_path)
-    _darwin(tmp_path, monkeypatch, **kw)
+    _darwin(tmp_path, monkeypatch, mod, **kw)
     assert mod.main(["--home", str(home)]) == 1
     assert "extended ACL" in capsys.readouterr().out
 
@@ -913,7 +918,7 @@ def test_l1a_darwin_plus_or_entry_line_refuses(tmp_path, monkeypatch, capsys, kw
 def test_l1a_darwin_other_suffix_is_exit_2(tmp_path, monkeypatch, capsys, suffix):
     mod = _load()
     home = _clean_home(tmp_path)
-    _darwin(tmp_path, monkeypatch, file_mode="-rw-------" + suffix)
+    _darwin(tmp_path, monkeypatch, mod, file_mode="-rw-------" + suffix)
     assert mod.main(["--home", str(home)]) == 2
     assert "cannot tell" in capsys.readouterr().out
 
@@ -923,7 +928,7 @@ def test_l1a_darwin_trailing_non_entry_line_is_exit_2_never_clean(tmp_path, monk
     """One clean line passes (cell below); the same line plus a later non-entry line must not."""
     mod = _load()
     home = _clean_home(tmp_path)
-    _darwin(tmp_path, monkeypatch, file_after=junk)
+    _darwin(tmp_path, monkeypatch, mod, file_after=junk)
     assert mod.main(["--home", str(home)]) == 2
     assert "cannot tell" in capsys.readouterr().out
 
@@ -931,7 +936,7 @@ def test_l1a_darwin_trailing_non_entry_line_is_exit_2_never_clean(tmp_path, monk
 def test_l1a_darwin_clean_listing_is_exactly_one_line_and_passes(tmp_path, monkeypatch, capsys):
     mod = _load()
     home = _clean_home(tmp_path)
-    _darwin(tmp_path, monkeypatch)
+    _darwin(tmp_path, monkeypatch, mod)
     assert mod.main(["--home", str(home)]) == 0
 
 
@@ -941,7 +946,7 @@ def test_l1a_darwin_name_split_into_an_entry_shaped_line_never_passes(tmp_path, 
     that split; the result is exit 1 (refuse), never 0. The real tool passes -q so ls prints '?' instead."""
     mod = _load()
     home = _clean_home(tmp_path, files=("alpha-key",))
-    log = _darwin(tmp_path, monkeypatch, file_after=FILE_ENTRY)
+    log = _darwin(tmp_path, monkeypatch, mod, file_after=FILE_ENTRY)
     assert mod.main(["--home", str(home)]) == 1
     assert any(c.startswith("ls -leq -- ") for c in log.read_text().splitlines())  # -q is in the flags
 
@@ -972,7 +977,7 @@ def test_l1b_put_on_darwin_runs_chmod_N_on_the_folder_it_creates(tmp_path, monke
     mod = _load_tool(SECRET_PUT, "secret_put_l1b")
     home = tmp_path / "home"
     home.mkdir()
-    log = _darwin(tmp_path, monkeypatch)
+    log = _darwin(tmp_path, monkeypatch, mod)
     assert _put_in_process(mod, home) == 0
     sec = home / "secrets"
     assert "chmod -N " + str(sec) in log.read_text().splitlines()
@@ -982,7 +987,7 @@ def test_l1b_put_on_darwin_runs_chmod_N_on_the_folder_it_creates(tmp_path, monke
 def test_l1b_put_on_darwin_does_not_chmod_N_an_existing_folder(tmp_path, monkeypatch):
     mod = _load_tool(SECRET_PUT, "secret_put_l1b2")
     home = _clean_home(tmp_path, files=())
-    log = _darwin(tmp_path, monkeypatch)
+    log = _darwin(tmp_path, monkeypatch, mod)
     assert _put_in_process(mod, home) == 0
     assert "chmod -N" not in (log.read_text() if log.exists() else "")
 
@@ -991,7 +996,71 @@ def test_l1b_put_on_darwin_chmod_failure_removes_the_folder_exit_2(tmp_path, mon
     mod = _load_tool(SECRET_PUT, "secret_put_l1b3")
     home = tmp_path / "home"
     home.mkdir()
-    _darwin(tmp_path, monkeypatch, SHIM_CHMOD_RC="1")
+    _darwin(tmp_path, monkeypatch, mod, SHIM_CHMOD_RC="1")
+    assert _put_in_process(mod, home) == 2
+    assert not (home / "secrets").exists()
+    assert "Traceback" not in capsys.readouterr().err
+
+
+# --- #4842 slice 2: the darwin tools are called by absolute path, never through PATH
+_GNU_LS = """#!/bin/sh
+echo "ls: invalid option -- 'e'" >&2
+exit 2
+"""
+_GNU_CHMOD = """#!/bin/sh
+echo "chmod: invalid option -- 'N'" >&2
+exit 1
+"""
+
+
+def _gnu_first_on_path(tmp_path, monkeypatch):
+    gnu = tmp_path / "gnufirst"
+    gnu.mkdir()
+    for name, body in (("ls", _GNU_LS), ("chmod", _GNU_CHMOD)):
+        (gnu / name).write_text(body)
+        os.chmod(gnu / name, 0o755)
+    monkeypatch.setenv("PATH", str(gnu) + os.pathsep + os.environ["PATH"])
+
+
+def test_l6a_darwin_check_ignores_a_gnu_ls_first_on_path(tmp_path, monkeypatch, capsys):
+    mod = _load()
+    home = _clean_home(tmp_path)
+    log = _darwin(tmp_path, monkeypatch, mod)
+    _gnu_first_on_path(tmp_path, monkeypatch)
+    assert mod.main(["--home", str(home)]) == 0
+    assert capsys.readouterr().out.splitlines() == ["secrets check: pass"]
+    assert log.read_text()  # the DARWIN_LS shim, not the PATH one, answered
+
+
+def test_l6b_darwin_put_ignores_a_gnu_chmod_first_on_path(tmp_path, monkeypatch):
+    mod = _load_tool(SECRET_PUT, "secret_put_l6b")
+    home = tmp_path / "home"
+    home.mkdir()
+    log = _darwin(tmp_path, monkeypatch, mod)
+    _gnu_first_on_path(tmp_path, monkeypatch)
+    assert _put_in_process(mod, home) == 0
+    assert "chmod -N " + str(home / "secrets") in log.read_text().splitlines()
+    assert (home / "secrets" / "k").exists()
+
+
+def test_l6c_darwin_ls_missing_at_the_absolute_path_is_exit_2_with_no_path_fallback(tmp_path, monkeypatch, capsys):
+    mod = _load()
+    home = _clean_home(tmp_path)
+    _darwin(tmp_path, monkeypatch, mod)
+    # a working ls shim IS on PATH, so a fallback to PATH would pass
+    monkeypatch.setenv("PATH", str(tmp_path / "darwinshim") + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(mod, "DARWIN_LS", str(tmp_path / "no-such-dir" / "ls"))
+    assert mod.main(["--home", str(home)]) == 2
+    assert "cannot tell" in capsys.readouterr().out
+
+
+def test_l6d_darwin_chmod_missing_at_the_absolute_path_removes_the_folder_exit_2(tmp_path, monkeypatch, capsys):
+    mod = _load_tool(SECRET_PUT, "secret_put_l6d")
+    home = tmp_path / "home"
+    home.mkdir()
+    _darwin(tmp_path, monkeypatch, mod)
+    monkeypatch.setenv("PATH", str(tmp_path / "darwinshim") + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(mod, "DARWIN_CHMOD", str(tmp_path / "no-such-dir" / "chmod"))
     assert _put_in_process(mod, home) == 2
     assert not (home / "secrets").exists()
     assert "Traceback" not in capsys.readouterr().err
