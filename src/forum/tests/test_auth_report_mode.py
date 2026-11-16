@@ -1537,15 +1537,22 @@ def test_i3_installer_refuses_a_past_until_with_exit_78_one_line_and_writes_noth
 
 
 # ---- delta 5: caller-supplied names in the report column -----------------------------------
-# A name a caller supplies is written with `<` as `&lt;` and `"` as `&quot;`, so it can never
-# equal or imitate one of the server's own markers; the request is served exactly as before.
+# A name a caller supplies is written with `<` as the six characters backslash-u-0-0-3-c and
+# `"` as backslash-u-0-0-2-2, so it can never equal or imitate one of the server's own markers;
+# the request is served exactly as before.
 _MARKER_INPUTS = ["<more> n=3", "<invalid-name> len=5", "<too-long> len=9"]
 _MARKER_IDS = ["more", "invalid-name", "too-long"]
+_LT, _DQ = "\\u003c", "\\u0022"  # the six literal characters each
 _SERVER_MARKERS = (b'"<more> n=', b'"<invalid-name> len=', b'"<too-long> len=')
 
 
 def _esc(name: str) -> str:
-    return name.replace("<", "&lt;").replace('"', "&quot;")
+    return name.replace("<", _LT).replace('"', _DQ)
+
+
+def _in_file(text: str) -> bytes:
+    """``text`` as the JSON file holds it (the backslashes of an escaped name are doubled)."""
+    return json.dumps(text)[1:-1].encode("ascii")
 
 
 def _q(name: str) -> str:
@@ -1557,6 +1564,11 @@ def _q(name: str) -> str:
 @pytest.mark.parametrize("name", _MARKER_INPUTS, ids=_MARKER_IDS)
 def test_f1_a_marker_shaped_caller_name_is_written_escaped_and_the_request_is_unchanged(
         owned_tmp, name, how):
+    """The status is the one the SAME request gets on the base (902c3e61), measured: 400
+    for a name holding `<` or `"` (the handlers' agent-name check, ``db.is_valid_agent_name``,
+    answers ``invalid agent name``), against 200 (read) / 201 (write) for the plain name.
+    The row is counted (guard outcome ``proceeded``), then the handler answers 400: report
+    mode, with the escape, changes nothing about the request."""
     app = _make_app(owned_tmp)
     c = app.test_client()
 
@@ -1573,17 +1585,17 @@ def test_f1_a_marker_shaped_caller_name_is_written_escaped_and_the_request_is_un
     # (1) the written entry is the escaped form, byte-checked in the file
     assert marker_rec["named"] == [_esc(name)] and _esc(name) != name
     data = _bytes(owned_tmp)
-    assert _esc(name).encode("ascii") in data
+    assert _in_file(_esc(name)) in data
     for m in _SERVER_MARKERS:
         assert m not in data, m
-    # (2) the outcome AND the status are what a plain name gets
-    assert (marker_rec["verdict"], marker_rec["outcome"], marker_rec["kind"]) == (
-        "absent", "proceeded", plain_rec["kind"])
-    assert (plain_rec["verdict"], plain_rec["outcome"]) == ("absent", "proceeded")
-    assert r_marker.status_code == r_plain.status_code, (
-        r_marker.status_code, r_plain.status_code)
-    # (3) a plain name is byte-identical to today
+    # (2) the guard outcome and the status are the base's
+    assert (marker_rec["verdict"], marker_rec["outcome"]) == ("absent", "proceeded")
+    assert marker_rec["kind"] == ("read" if how == "read" else "write")
+    assert r_marker.status_code == 400
+    # (3) a plain name is byte-identical to today, and still served
     assert plain_rec["named"] == ["zed"]
+    assert (plain_rec["verdict"], plain_rec["outcome"]) == ("absent", "proceeded")
+    assert r_plain.status_code == (200 if how == "read" else 201)
 
 
 @pytest.mark.parametrize("name", _MARKER_INPUTS, ids=_MARKER_IDS)
@@ -1619,28 +1631,35 @@ def test_f1_a_genuine_server_marker_is_still_written_unescaped(owned_tmp):
 def test_f1_a_name_with_a_double_quote_only_is_escaped(owned_tmp):
     app = _make_app(owned_tmp)
     r = app.test_client().get(f"/api/updates?agent={_q('a\"b')}")
-    assert r.status_code != 401
+    assert r.status_code == 400  # the base's status for a name with a quote
     (rec,) = _lines(owned_tmp)
-    assert rec["named"] == ["a&quot;b"]
+    assert rec["named"] == ["a" + _DQ + "b"]
     data = _bytes(owned_tmp)
-    assert b"a&quot;b" in data and b'a\\"b' not in data
+    assert _in_file("a" + _DQ + "b") in data and b'a\\"b' not in data
 
 
 def test_f1_every_name_of_a_line_is_escaped_not_only_the_first(owned_tmp):
     got, _ = _names_line(owned_tmp, ["plain", _q("<a>"), _q("x<y"), _q('q"')])
-    assert got == ["plain", "&lt;a>", "x&lt;y", "q&quot;"]
+    assert got == ["plain", _LT + "a>", "x" + _LT + "y", "q" + _DQ]
 
 
 def test_f1_the_cap_counts_the_written_form_so_a_128_name_with_a_bracket_is_a_marker(owned_tmp):
-    name = "<" + "a" * 127  # 128 characters as typed, 131 as written
+    name = "<" + "a" * 127  # 128 characters as typed, 133 as written
     got, _ = _names_line(owned_tmp, [_q(name)])
-    assert got == ["<too-long> len=131"]
-    assert b"&lt;aaaa" not in _bytes(owned_tmp)
+    assert got == ["<too-long> len=133"]
+    assert b"u003caaaa" not in _bytes(owned_tmp)
 
 
 def test_f1_a_plain_name_with_an_ampersand_is_unchanged(owned_tmp):
     got, _ = _names_line(owned_tmp, [_q("a&b")])
     assert got == ["a&b"]
+
+
+def test_f1_a_name_that_already_holds_the_escape_text_is_written_as_it_is(owned_tmp):
+    """Measured, not a rule: no extra escape for a backslash, so a typed backslash-u-0-0-3-c
+    reads the same in the report as an escaped `<` (neither equals a server marker)."""
+    got, _ = _names_line(owned_tmp, [_q("a" + _LT + "b")])
+    assert got == ["a" + _LT + "b"]
 
 
 # ---- delta 5: --verify-only binds nothing, so it takes the serving flags and an until ----
