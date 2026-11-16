@@ -817,7 +817,7 @@ def test_cell12_installer_refuses_bad_auth_shapes(owned_tmp, extra):
 
 
 def test_cell12_installer_renders_report_flags_into_execstart(owned_tmp):
-    until = "2026-11-16T00:00:00Z"
+    until = _ts_until(24)  # computed now: a fixed date goes stale and the installer refuses a past one
     r = _install(owned_tmp, ["--auth-mode", "report", "--auth-report", "/srv/forum/auth-report.jsonl",
                              "--auth-report-until", until])
     assert r.returncode == 0, r.stderr
