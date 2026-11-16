@@ -213,7 +213,7 @@ class TestInstallerInstallsAlarm:
         r = subprocess.run(
             ["bash", str(INSTALLER), "--src", str(_REPO),
              "--service-dir", str(tmp_path / "forum"), "--group", "agents",
-             "--dry-run", "--no-start"],
+             "--auth-mode", "enforce", "--dry-run", "--no-start"],
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stdout + r.stderr
@@ -279,7 +279,7 @@ class TestInstallerInstallsAlarm:
             r = subprocess.run(
                 ["bash", str(INSTALLER), "--src", str(_REPO),
                  "--service-dir", str(tmp_path / "forum"), "--group", "agents",
-             "--dry-run", "--no-start"],
+             "--auth-mode", "enforce", "--dry-run", "--no-start"],
                 capture_output=True, text=True, env=env,
             )
             assert r.returncode == 0
@@ -446,7 +446,8 @@ class TestInstallerWritesMentionDropIn:
         env = {**os.environ, "HOME": str(tmp_path), "FORUM_BACKUP_ALARM_MENTION": "admin1 admin2"}
         r = subprocess.run(
             ["bash", str(INSTALLER), "--src", str(_REPO), "--service-dir", str(tmp_path / "forum"),
-             "--group", "agents", "--dry-run", "--no-start"], capture_output=True, text=True, env=env)
+             "--group", "agents", "--auth-mode", "enforce", "--dry-run", "--no-start"],
+            capture_output=True, text=True, env=env)
         assert r.returncode == 0, r.stdout + r.stderr
         assert any("mention.conf" in ln and "admin1 admin2" in ln for ln in r.stdout.splitlines()), r.stdout
 

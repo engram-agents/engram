@@ -21,11 +21,12 @@ import sys
 import tarfile
 import tempfile
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from flask import Flask, Response, abort, g, jsonify, render_template, request, send_file
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from . import audit, board_projects, board_theme, db, embeddings as emb_mod, packs as packs_mod, seed
 from .avatar import avatar_svg
@@ -2083,10 +2084,33 @@ def _identity_text(value) -> str | None:
 def _route_label() -> str:
     """``METHOD /api/x/<pid>/y`` for error text: the matched rule with converters dropped
     (``<int:tid>`` -> ``<tid>``), the shape every handler's own refusal text already uses."""
+    # The path fallback for an unmatched route reaches only the CLIENT (as a refusal label),
+    # never the auth report file (``_report_route`` writes the fixed unmatched text); keep it so.
     rule = request.url_rule.rule if request.url_rule is not None else request.path
     if request.method == "POST" and rule == "/api/projects":
         return "POST /api/projects (init)"  # the label the init handler's own refusals carry
     return f"{request.method} " + re.sub(r"<(?:[A-Za-z_]+(?:\([^)]*\))?:)?", "<", rule)
+
+
+def _auth_required_response() -> Response:
+    """The 401 the guard answers a guarded request that carries no valid token."""
+    resp = jsonify({
+        "error": "authentication required",
+        "hint": ("send 'Authorization: Bearer <token>'. Clients read the token from "
+                 "$ENGRAM_FORUM_TOKEN or <ENGRAM_HOME>/forum-token (mode 0600); the "
+                 "forum admin issues one with: python -m forum.admin token issue <agent>"),
+    })
+    resp.status_code = 401
+    resp.headers["WWW-Authenticate"] = "Bearer"
+    return resp
+
+
+def _identity_mismatch_response(token_agent, named: str) -> Response:
+    """The 403 the guard answers a request that names an identity other than its token's."""
+    resp = jsonify({"error": "identity mismatch",
+                    "token_agent": token_agent, "named_agent": named})
+    resp.status_code = 403
+    return resp
 
 
 def _names_identity(values) -> bool:
@@ -2102,6 +2126,154 @@ def _body_identities() -> list:
     if request.mimetype in ("application/x-www-form-urlencoded", "multipart/form-data"):
         out.extend(request.form.getlist("agent"))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Auth report mode: the process-start --auth-mode and the recording report
+# ---------------------------------------------------------------------------
+AUTH_MODES = ("report", "enforce")
+AUTH_REPORT_MAX_HOURS = 72
+_INVALID_NAME = "<invalid-name>"
+_TOO_LONG_NAME = "<too-long>"
+_AUTH_NAME_MAX = 128  # a longer name is written as "<too-long> len=N", never as text
+_AUTH_NAMED_MAX = 8   # entries kept in a line's ``named``; the rest is one "<more> n=K"
+_AUTH_UNTIL_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z")
+_AUTH_OVERDUE_EVERY = 3600  # seconds between the loud overdue lines
+
+
+class AuthConfigError(ValueError):
+    """The auth-mode settings are missing, inconsistent or unusable. ``main()`` answers
+    this with exit 78 and one stderr line; ``create_app`` lets the ValueError out."""
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_auth_until(text) -> datetime:
+    bad = AuthConfigError(
+        "--auth-report-until must be a UTC time like 2026-11-16T00:00:00Z (ISO-8601, ending in Z)")
+    if not isinstance(text, str) or not _AUTH_UNTIL_RE.fullmatch(text):
+        raise bad
+    try:
+        return datetime.fromisoformat(text[:-1] + "+00:00")
+    except ValueError:
+        raise bad from None
+
+
+def _resolve_auth_config(mode, report, until, now=None):
+    """Validate the three auth settings; return ``(mode, report_path, until_datetime)``.
+
+    ``mode`` has no default: anything but exactly ``report`` or ``enforce`` (empty, wrong
+    case, padded, None) is refused. ``report`` needs a destination and an end at most
+    ``AUTH_REPORT_MAX_HOURS`` ahead; ``enforce`` takes neither. Raises AuthConfigError
+    with a one-line message."""
+    if mode not in AUTH_MODES:
+        got = f" (got {mode!r})" if isinstance(mode, str) and mode else ""
+        raise AuthConfigError(
+            f"--auth-mode is required and must be exactly 'report' or 'enforce'{got}; "
+            "there is no default and no environment fallback")
+    if mode == "enforce":
+        if report is not None:
+            raise AuthConfigError("--auth-report is only for --auth-mode report")
+        if until is not None:
+            raise AuthConfigError("--auth-report-until is only for --auth-mode report")
+        return mode, None, None
+    if not report:
+        raise AuthConfigError("--auth-mode report requires --auth-report PATH")
+    if until is None or until == "":
+        raise AuthConfigError("--auth-mode report requires --auth-report-until <UTC time>")
+    end = _parse_auth_until(until)
+    if end - (now or _utcnow()) > timedelta(hours=AUTH_REPORT_MAX_HOURS):
+        raise AuthConfigError(
+            f"--auth-report-until is more than {AUTH_REPORT_MAX_HOURS} hours ahead")
+    return mode, str(report), end
+
+
+class _AuthReport:
+    """The append-only auth report: one JSON line per guarded request.
+
+    Opened at startup (create-if-absent 0640; any failure is an OSError for the caller to
+    refuse on). The open is append-only (``O_APPEND``, never ``O_TRUNC``) and refuses a
+    symlink (``O_NOFOLLOW``). ``record`` writes each line with ONE ``os.write`` on that
+    descriptor, so concurrent requests cannot interleave a line, and NEVER raises: a failed
+    append is counted (``failures``, shown on /health), logged to stderr on the first
+    failure and then every 100th, and the request proceeds. A file that was deleted after
+    start (``st_nlink == 0``) makes every record a failure, since nobody could read it."""
+
+    def __init__(self, path) -> None:
+        self.path = str(path)
+        create_if_absent(self.path)
+        self.fd = os.open(
+            self.path,
+            os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        self.failures = 0
+        self._lock = threading.Lock()
+
+    def record(self, rec: dict) -> None:
+        try:
+            line = (json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+            if os.fstat(self.fd).st_nlink == 0:
+                raise OSError(errno.ENOENT, "the report file was deleted after start")
+            if os.write(self.fd, line) != len(line):
+                raise OSError(errno.EIO, "short write")
+        except Exception as exc:  # noqa: BLE001 -- the report must never refuse a request
+            with self._lock:
+                self.failures += 1
+                count = self.failures
+            if count == 1 or count % 100 == 0:
+                why = getattr(exc, "strerror", None) or type(exc).__name__
+                print(f"[forum] auth report: append to {self.path} failed ({count} so far): {why}",
+                      file=sys.stderr)
+
+
+def _report_identity(value):
+    """One named value as the report may hold it: the guard's normalised identity text, or
+    None when it names nothing, or the fixed ``<invalid-name>`` text plus its length when it
+    fails the handlers' identifier check (a non-string, a lone surrogate, a line-break or
+    control character). The raw text of a value that fails is never returned."""
+    try:
+        text = _read_ident("", "agent", value, lower=False)
+    except _RequestRefusal:
+        n = len(value) if isinstance(value, str) else len(str(value))
+        return f"{_INVALID_NAME} len={n}"
+    name = _identity_text(text)
+    if name is not None:
+        # A caller-supplied name is escaped BEFORE the cap and before the entry cap, so it
+        # can never equal or imitate one of the server's own markers (the only unescaped
+        # ``<`` in the column); the cap then bounds what is actually written.
+        name = name.replace("<", "\\u003c").replace('"', "\\u0022")
+        if len(name) > _AUTH_NAME_MAX:
+            return f"{_TOO_LONG_NAME} len={len(name)}"
+    return name
+
+
+def _report_named(values) -> list:
+    """The distinct report identities of ``values`` in request order, at most
+    ``_AUTH_NAMED_MAX`` of them; any further distinct ones are one ``<more> n=K`` entry."""
+    out: list = []
+    for v in values:
+        item = _report_identity(v)
+        if item is not None and item not in out:
+            out.append(item)
+    if len(out) > _AUTH_NAMED_MAX:
+        out = out[:_AUTH_NAMED_MAX] + [f"<more> n={len(out) - _AUTH_NAMED_MAX}"]
+    return out
+
+
+def _verdict_for_token(values, token_agent) -> str:
+    """``mismatch`` when any named value differs from the token's agent (the guard's own
+    rule), else ``match``. A MALFORMED value (the same check the handlers apply) is never the
+    token's agent, whatever its ``str()`` reads: it is ``mismatch`` by a fixed rule."""
+    for v in values:
+        try:
+            _read_ident("", "agent", v, lower=False)
+        except _RequestRefusal:
+            return "mismatch"
+        name = _identity_text(v)
+        if name is not None and name != token_agent:
+            return "mismatch"
+    return "match"
 
 
 
@@ -2157,6 +2329,9 @@ def create_app(
     enable_dm_viewer: bool = False,
     enable_board_viewer: bool = False,
     bind_host: str | None = None,
+    auth_mode: str = "enforce",
+    auth_report=None,
+    auth_report_until: str | None = None,
 ) -> Flask:
     """Create and configure the Flask application.
 
@@ -2214,14 +2389,34 @@ def create_app(
             passes it). The operator viewers answer 403 unless the request's ``Host`` header
             names a loopback host or exactly this value (see ``_viewer_host_ok``).
 
+        auth_mode:         ``"enforce"`` (the default here, so every test that calls
+            create_app() directly keeps testing enforcement) or ``"report"``. There is NO
+            default where the process starts: ``main()`` requires ``--auth-mode`` and exits
+            78 without it. In ``report`` mode a request that carries NO token is served as
+            the identity it names and recorded; a presented token that is unknown or revoked
+            is still 401, and a valid token for another agent than the one named is still
+            403. ``auth_report`` (a path, or an open ``_AuthReport``) and
+            ``auth_report_until`` (``...Z``, at most 72 h ahead) are required with
+            ``report`` and refused with ``enforce`` (ValueError).
+
     Auth (#1459): one ``before_request`` guard (``_auth_guard``) is the ONLY auth
-    mechanism; there is deliberately no configuration that disables it.
+    mechanism. Nothing a request or the environment supplies can change how it behaves: no
+    environment variable read after start, no config key, no per-route or per-agent
+    override, no query parameter. The one switch is the process-start ``--auth-mode
+    {report,enforce}`` (here ``auth_mode``), fixed for the life of the process.
 
     Returns:
         A configured Flask application instance.
     """
     if github_integration not in (None, "on", "off"):
         raise ValueError(f"github_integration must be 'on', 'off' or None, got {github_integration!r}")
+    _report_arg = auth_report.path if isinstance(auth_report, _AuthReport) else auth_report
+    auth_mode, _report_path, _report_until = _resolve_auth_config(
+        auth_mode, _report_arg, auth_report_until)
+    if auth_mode == "report":
+        auth_report = auth_report if isinstance(auth_report, _AuthReport) else _AuthReport(_report_path)
+    else:
+        auth_report = None
     if packs_dir is None:
         packs_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "packs")
 
@@ -2244,6 +2439,9 @@ def create_app(
     app.config["ENABLE_DM_VIEWER"] = bool(enable_dm_viewer)
     app.config["ENABLE_BOARD_VIEWER"] = bool(enable_board_viewer)
     app.config["BIND_HOST"] = bind_host  # #1459 round 2: the one non-loopback Host a viewer accepts
+    app.config["AUTH_MODE"] = auth_mode
+    app.config["AUTH_REPORT"] = auth_report
+    app.config["AUTH_REPORT_UNTIL"] = _report_until
 
     @app.context_processor
     def _inject_dm_viewer_flag():
@@ -2298,8 +2496,11 @@ def create_app(
         db._load_vec_extension(g.conn)
 
     # ------------------------------------------------------------------
-    # #1459: THE auth guard. One before_request, no per-handler checks, and no
-    # config key / env var / flag that turns it off.
+    # #1459: THE auth guard. One before_request, no per-handler checks. Nothing a
+    # request or the environment supplies changes it: no env var read after start, no
+    # config key, no per-route or per-agent override, no query parameter. The one
+    # switch is the process-start --auth-mode {report,enforce} (create_app's
+    # ``auth_mode``), which has no default where the process starts.
     #
     # GUARDED iff the method is POST/PUT/PATCH/DELETE (any route), or the path is
     # under /api/ and names an agent identity (an ``agent`` key in the query
@@ -2309,7 +2510,73 @@ def create_app(
     # from a named identity (strip().lower()) -> 403, never silently
     # substituted. Targets (to_agent, counterpart, colleague, ...) are not
     # identity. Public reads naming no agent proceed with g.auth_agent = None.
+    #
+    # REPORT mode changes ONE thing: a guarded request that carries NO Authorization
+    # header is served as the identity it names (validated like the handlers' own
+    # identifier check) instead of answered 401. A PRESENTED token that does not
+    # resolve is still 401, a valid token for another agent is still 403, and several
+    # differing identities on a tokenless request are 403. Every guarded request gets
+    # one report line, written before any refusal is returned. On a valid token the
+    # two modes run the same code. The line holds no request text outside ``named``
+    # (validated identities, length-capped); the route is the matched rule or the fixed
+    # "<METHOD> <unmatched>", never the raw path.
     # ------------------------------------------------------------------
+    report_mode = auth_mode == "report"
+    overdue_state = {"logged": None}
+
+    def _auth_overdue() -> bool:
+        """Report mode only: is --auth-report-until in the past? Logs one loud line per
+        hour while it is (called per guarded request and per /health; no timer thread)."""
+        if not report_mode or _report_until is None or _utcnow() < _report_until:
+            return False
+        last = overdue_state["logged"]
+        now = _utcnow()
+        if last is None or (now - last).total_seconds() >= _AUTH_OVERDUE_EVERY:
+            overdue_state["logged"] = now
+            print("[forum] auth: REPORT MODE IS OVERDUE: --auth-report-until "
+                  f"{_report_until.strftime('%Y-%m-%dT%H:%M:%SZ')} has passed and the forum is "
+                  "still serving unauthenticated requests as the identity they name; "
+                  "re-run the installer with --auth-mode enforce, or with a new "
+                  "--auth-report-until if the owner extends the window.", file=sys.stderr)
+        return True
+
+    def _report_route() -> str:
+        """The route as the REPORT may hold it: the matched rule (normalised), or the fixed
+        ``<METHOD> <unmatched>`` when routing matched none. Never the raw request path."""
+        if request.url_rule is None:
+            return f"{request.method} <unmatched>"
+        return _route_label()
+
+    def _record_auth(write: bool, values, verdict: str, token_agent, outcome) -> None:
+        _auth_overdue()
+        auth_report.record({
+            "ts": _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "method": request.method,
+            "route": _report_route(),
+            "kind": "write" if write else "read",
+            "named": _report_named(values),
+            "verdict": verdict,
+            "token_agent": token_agent if verdict in ("match", "mismatch") else None,
+            # The GUARD's outcome: "proceeded", or the HTTP status it returned (an int).
+            "outcome": outcome,
+        })
+
+    def _guard_body_identities(write: bool, named, token_agent, presented: bool) -> list:
+        """``_body_identities()``, except that in report mode a body over
+        ``MAX_CONTENT_LENGTH`` first gets its one line (``named`` from the path and query
+        only: the body was not read; ``verdict`` from what was presented), then the 413 is
+        re-raised unchanged."""
+        try:
+            return _body_identities()
+        except RequestEntityTooLarge:
+            if report_mode:
+                if token_agent is not None:
+                    verdict = _verdict_for_token(named, token_agent)
+                else:
+                    verdict = "invalid" if presented else "absent"
+                _record_auth(write, named, verdict, token_agent, 413)
+            raise
+
     @app.before_request
     def _auth_guard():
         # Bearer-header auth (not cookies) is deliberate: a DNS-rebound page is
@@ -2334,33 +2601,59 @@ def create_app(
         if not write and not internal_read and not _names_identity(named) and not (
                 has_body and _names_identity(_body_identities())):
             return None  # a public read that names no agent
-        token = _bearer_token(request.headers.get("Authorization"))
+        auth_header = request.headers.get("Authorization")
+        token = _bearer_token(auth_header)
         token_agent = db.resolve_token(g.conn, token) if token else None
         if token_agent is None:
-            resp = jsonify({
-                "error": "authentication required",
-                "hint": ("send 'Authorization: Bearer <token>'. Clients read the token from "
-                         "$ENGRAM_FORUM_TOKEN or <ENGRAM_HOME>/forum-token (mode 0600); the "
-                         "forum admin issues one with: python -m forum.admin token issue <agent>"),
-            })
-            resp.status_code = 401
-            resp.headers["WWW-Authenticate"] = "Bearer"
-            return resp
-        body_ids = _body_identities()
+            if not report_mode:
+                return _auth_required_response()
+            # Report mode: a PRESENTED credential that does not resolve is still 401 (the
+            # line is written first); only the ABSENCE of one is let through, recorded.
+            presented = bool((auth_header or "").strip())
+            body_ids = _guard_body_identities(write, named, None, presented)
+            if presented:
+                _record_auth(write, named + body_ids, "invalid", None, 401)
+                return _auth_required_response()
+            label = _route_label()
+            refusal = None
+            for v in named + body_ids:
+                try:
+                    _read_ident(label, "agent", v, lower=False)
+                except _RequestRefusal as exc:
+                    refusal = refusal or exc
+            names = list(dict.fromkeys(
+                t for t in (_identity_text(v) for v in named + body_ids) if t is not None))
+            _record_auth(write, named + body_ids, "absent", None,
+                         422 if refusal is not None else 403 if len(names) > 1 else "proceeded")
+            if refusal is not None:
+                raise refusal  # the handlers' own typed 422 (#3436), after the line
+            if len(names) > 1:
+                return _identity_mismatch_response(None, names[1])
+            g.auth_agent = names[0] if names else None
+            g.names_identity = bool(names)
+            return None
+        body_ids = _guard_body_identities(write, named, token_agent, True)
         label = _route_label()
-        for v in body_ids:
-            # The same typed refusals the handlers used to apply to `agent` (#3436, #3294,
-            # #3318): a non-string, a lone surrogate or a line-break/control character is a
-            # 422 naming route + field, never str()-coerced and never compared.
-            _read_ident(label, "agent", v, lower=False)
+        try:
+            for v in body_ids:
+                # The same typed refusals the handlers used to apply to `agent` (#3436, #3294,
+                # #3318): a non-string, a lone surrogate or a line-break/control character is a
+                # 422 naming route + field, never str()-coerced and never compared.
+                _read_ident(label, "agent", v, lower=False)
+        except _RequestRefusal:
+            if report_mode:
+                _record_auth(write, named + body_ids,
+                             _verdict_for_token(named + body_ids, token_agent), token_agent, 422)
+            raise
         named.extend(body_ids)
         for n in named:
             name = _identity_text(n)
             if name is not None and name != token_agent:
-                resp = jsonify({"error": "identity mismatch",
-                                "token_agent": token_agent, "named_agent": name})
-                resp.status_code = 403
-                return resp
+                if report_mode:
+                    _record_auth(write, named, "mismatch", token_agent, 403)
+                return _identity_mismatch_response(token_agent, name)
+        if report_mode:
+            _record_auth(write, named, "match", token_agent, "proceeded")
         g.auth_agent = token_agent
         g.names_identity = _names_identity(named)
         return None
@@ -2380,7 +2673,9 @@ def create_app(
     # Existing integrations that read /health need no changes.
     #
     # Response shape:
-    #   {"status": "ok"|"degraded", "deps": {"<dep>": "ok"|"degraded"|"missing"}}
+    #   {"status": "ok"|"degraded", "auth_mode": "report"|"enforce",
+    #    "deps": {"<dep>": "ok"|"degraded"|"missing"}}
+    # plus, in report mode only, "auth_report_failures" (int) and "auth_report_overdue" (bool).
     # ------------------------------------------------------------------
     @app.route("/health")
     def health() -> Response:
@@ -2406,7 +2701,10 @@ def create_app(
             if v != "ok":
                 overall = "degraded"
                 break
-        payload: dict = {"status": overall}
+        payload: dict = {"status": overall, "auth_mode": auth_mode}
+        if report_mode:
+            payload["auth_report_failures"] = auth_report.failures
+            payload["auth_report_overdue"] = _auth_overdue()
         if deps_public:
             payload["deps"] = deps_public
         if backup_block is not None:
@@ -5323,6 +5621,19 @@ def _parse_args(argv=None, environ=None):
     p.add_argument("--host", default="127.0.0.1",
                    help="Bind address (default 127.0.0.1, loopback). LAN exposure is an explicit "
                         "choice, --host 0.0.0.0, and is safe only with tokens on every seat (#1459).")
+    p.add_argument("--auth-mode", default=None,
+                   help="REQUIRED, no default, no environment fallback: 'report' or 'enforce'. "
+                        "enforce refuses a guarded request without a valid token (401) or naming "
+                        "another agent (403). report serves a request that carries NO token as the "
+                        "identity it names and records it; a presented bad token is still 401 and "
+                        "a mismatch still 403. report needs --auth-report and --auth-report-until.")
+    p.add_argument("--auth-report", default=None,
+                   help="Report mode only: the file the report is appended to, one JSON line per "
+                        "guarded request (created 0640 if absent).")
+    p.add_argument("--auth-report-until", default=None,
+                   help="Report mode only: UTC time like 2026-11-16T00:00:00Z, at most 72 hours "
+                        "after start. Past it the server keeps serving, logs one loud line per "
+                        "hour, and /health shows auth_report_overdue.")
     p.add_argument("--enable-board-viewer", action="store_true",
                    help="Serve the HTML project board (/board). OFF by default: when on, every baton's "
                         "title, participants and turn state are readable by anyone who can reach this port.")
@@ -5496,6 +5807,25 @@ def _report_auth_startup(conn, enable_dm_viewer: bool, file=None,
 def main() -> None:
     args = _parse_args()
 
+    # The auth mode is chosen where the process starts and has no default, so it is
+    # checked FIRST, before any other work or write: a missing, empty or unknown
+    # --auth-mode (or an inconsistent report setting, or a report file that cannot be
+    # opened) refuses with exit 78 and nothing bound. --verify-only binds nothing and the
+    # installer runs it without the serving flags, so it is the one exemption.
+    auth_mode, auth_report = "enforce", None
+    if not args.verify_only:
+        try:
+            auth_mode, report_path, _until = _resolve_auth_config(
+                args.auth_mode, args.auth_report, args.auth_report_until)
+            auth_report = _AuthReport(report_path) if auth_mode == "report" else None
+        except AuthConfigError as exc:
+            print(f"[forum] refusing to start: {exc}", file=sys.stderr)
+            sys.exit(EXIT_CONFIG_REFUSED)
+        except OSError as exc:
+            print(f"[forum] refusing to start: --auth-report {report_path}: cannot be opened for "
+                  f"append ({exc.strerror or type(exc).__name__})", file=sys.stderr)
+            sys.exit(EXIT_CONFIG_REFUSED)
+
     # #3568: resolve the GitHub-integration switch FIRST, from the environment,
     # once. A contradiction (on without a token, an invalid value) refuses here --
     # before boot-verify, any data-dir write, or serving.
@@ -5558,6 +5888,9 @@ def main() -> None:
         enable_dm_viewer=args.enable_dm_viewer,
         enable_board_viewer=args.enable_board_viewer,
         bind_host=args.host,
+        auth_mode=auth_mode,
+        auth_report=auth_report,
+        auth_report_until=None if args.verify_only else args.auth_report_until,
     )
     # #3283: the gate's own, dedicated read-only GitHub identity, kept beside the
     # service data (the unit sets FORUM_HOME; else the dir holding the DB).
@@ -5570,6 +5903,11 @@ def main() -> None:
         print("[forum] baton login map: not configured -- `baton advance` (peer->merge) "
               "will refuse until --baton-login-map / $ENGRAM_BATON_LOGIN_MAP is set.",
               file=sys.stderr)
+    if auth_mode == "report":
+        print(f"forum auth: mode=report (refusing nothing; recording to {auth_report.path})",
+              flush=True)
+    else:
+        print("forum auth: mode=enforce", flush=True)
     app.run(host=args.host, port=args.port)
 
 
