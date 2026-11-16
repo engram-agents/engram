@@ -212,6 +212,7 @@ RUNTIME_FILES = {
     "engram_cornerstone.py": "src/engram/engram_cornerstone.py",
     "engram_dag_conformance.py": "src/engram/engram_dag_conformance.py",
     "engram_derive.py": "src/engram/engram_derive.py",
+    "engram_embedding_publish.py": "src/engram/engram_embedding_publish.py",
     "engram_epistemic.py": "src/engram/engram_epistemic.py",
     "engram_focus.py": "src/engram/engram_focus.py",
     "engram_lifecycle.py": "src/engram/engram_lifecycle.py",

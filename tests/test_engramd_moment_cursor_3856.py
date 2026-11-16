@@ -126,7 +126,7 @@ def cursor_of(db, nid):
 
 
 def test_write_set_is_exactly_the_two_ops_and_the_version_is_1_3():  # name kept for a stable test id; the set is now the four ops
-    assert eo.WRITE_METHODS == frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen", "cascade_unblock_start", "cascade_unblock_end"})  # fill_embeddings / finish_embedding_regen: #3879; cascade_unblock_*: #4421
+    assert eo.WRITE_METHODS == frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen", "cascade_unblock_start", "cascade_unblock_end", "publish_prepared_embeddings"})  # #4651: publish_prepared_embeddings; fill_embeddings / finish_embedding_regen: #3879; cascade_unblock_*: #4421
     assert ec.CONTRACT_VERSION == "1.3"
     assert eo.METHOD_KINDS == frozenset({"read", "write"})
 

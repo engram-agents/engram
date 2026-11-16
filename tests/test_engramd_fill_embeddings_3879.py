@@ -331,7 +331,7 @@ def test_the_dimension_constant_is_the_one_the_server_stores():
 
 def test_the_closed_write_set_is_exactly_the_four_ops():
     assert eo.WRITE_METHODS == frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen",
-                                          "cascade_unblock_start", "cascade_unblock_end"})  # the last two: #4421
+                                          "cascade_unblock_start", "cascade_unblock_end", "publish_prepared_embeddings"})  # #4421; #4651
 
 
 @requires_linux_owner
