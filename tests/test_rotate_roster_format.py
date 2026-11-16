@@ -290,7 +290,9 @@ def test_t5_produced_roster_parses_under_the_real_loader(tmp_path):
     assert r.returncode == 0, (r.stdout, r.stderr)
 
     scanner = _load_scanner()
-    parsed = scanner.load_roster_file(out / "roster-format2.txt")
+    parsed, _roster_format = scanner.load_roster_file(
+        out / "roster-format2.txt"
+    )
     assert [klass for _compiled, _label, klass in parsed] == ["A", "A", "B"]
     assert parsed[0][0].search(A_ONE)
     assert parsed[1][0].search(A_TWO)
@@ -958,6 +960,115 @@ def load_roster_file(path):
     assert (out / "roster-format2.txt").is_file()
 
 
+def test_stub_returning_entries_with_format_int_tuple_proceeds(tmp_path):
+    """The current scanner returns ``(entries, roster_format)``, not the bare
+    entries sequence. The same entries in that shape must validate exactly as
+    the bare sequence does; refusing the shape refuses the real scanner."""
+    stub = tmp_path / "format-tuple-scanner.py"
+    stub.write_text(
+        r'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return ([(None, "stub", klass) for klass in ("A", "A", "B")], 2)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (out / "roster-format2.txt").is_file()
+
+
+def test_stub_returning_entries_with_wrong_format_int_is_refused(tmp_path):
+    """Format 2 is the only format this tool emits. A parser that reports
+    ``(entries, 1)`` is a stale parser, and correct entries do not excuse the
+    format it declares; the return-value check must refuse it."""
+    stub = tmp_path / "wrong-format-scanner.py"
+    stub.write_text(
+        r'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return ([(None, "stub", klass) for klass in ("A", "A", "B")], 1)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "predates the two-class format" in combined, combined
+    assert "an unvalidated roster is never emitted" in combined, combined
+    assert list(out.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "returned_classes",
+    [
+        pytest.param(("A", "A", "A"), id="produced-B-line-says-A"),
+        pytest.param(("A", "A"), id="one-entry-short"),
+    ],
+)
+def test_stub_returning_bad_entries_in_format_int_tuple_is_refused(
+    tmp_path, returned_classes
+):
+    """The ``(entries, 2)`` pair must not short-circuit validation of the
+    entries. A parser that reports format 2 and then returns the right NUMBER
+    of entries with one class wrong, or too FEW entries, has validated
+    nothing and must be refused exactly as the bare-entries shapes are.
+
+    The assertion is the MESSAGE: an unchecked ``entry[2]`` raises IndexError
+    (also non-zero) rather than this refusal, so the exit code alone would not
+    tell the guard firing from a crash inside it."""
+    stub = tmp_path / "bad-pair-scanner.py"
+    stub.write_text(
+        rf'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return ([(None, "stub", klass) for klass in {returned_classes!r}], 2)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "predates the two-class format" in combined, combined
+    assert "an unvalidated roster is never emitted" in combined, combined
+    assert list(out.iterdir()) == []
+
+
 # ---------------------------------------------------------------------------
 # R1 -- captured parser stderr: withheld when it carries a produced pattern
 # ---------------------------------------------------------------------------
@@ -1011,6 +1122,45 @@ def load_roster_file(path):
     sys.stderr.write(
         "scan-leaks: roster line 1 refuses: "
         + lines[0].replace("\\", "\\\\") + "\n")
+    raise SystemExit(2)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    return stub
+
+
+def _bare_name_echo_refusal_scanner(tmp_path: Path) -> Path:
+    """A parser that refuses the probes and the produced roster, echoing only
+    the first produced line's BARE NAME KEY -- the pattern without its ``\\b``
+    pair -- to stderr."""
+    stub = tmp_path / "bare-name-echo-refusal-scanner.py"
+    stub.write_text(
+        r'''
+import sys
+
+
+def _declares_boundary(pattern):
+    return True
+
+
+def _key_parts(text):
+    key = text.strip()
+    if key.startswith("(?i)"):
+        key = key[4:]
+    if key.startswith("\\b") and key.endswith("\\b"):
+        key = key[2:-2]
+    return key.strip()
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    pattern = lines[0].split("\t", 1)[1]
+    sys.stderr.write(
+        "scan-leaks: roster line 1 refuses: " + _key_parts(pattern) + "\n")
     raise SystemExit(2)
 '''.lstrip(),
         encoding="utf-8",
@@ -1079,6 +1229,25 @@ def test_parser_refusal_carrying_a_backslash_doubled_pattern_is_withheld(tmp_pat
     assert A_ONE not in combined, "a produced roster pattern reached the operator"
     assert "parser refused (exit 2)" in combined, combined
     assert "withheld because it contained roster text" in combined, combined
+    assert list(out.iterdir()) == []
+
+
+def test_parser_refusal_carrying_only_a_bare_name_key_is_withheld(tmp_path):
+    """A parser that echoes only a produced line's bare name key -- the pattern
+    without its ``\\b`` pair -- still carries name text. A containment test on
+    the whole pattern passes this text straight to the operator, so the
+    name-key rule must withhold it whole."""
+    stub = _bare_name_echo_refusal_scanner(tmp_path)
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    combined = r.stdout + r.stderr
+
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "parser refused (exit 2)" in combined, combined
+    assert "withheld because it contained roster text" in combined, combined
+    assert A_ONE not in combined, "a produced name key reached the operator"
     assert list(out.iterdir()) == []
 
 
