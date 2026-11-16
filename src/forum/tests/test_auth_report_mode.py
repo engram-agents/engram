@@ -1662,6 +1662,33 @@ def test_f1_a_name_that_already_holds_the_escape_text_is_written_as_it_is(owned_
     assert got == ["a" + _LT + "b"]
 
 
+@pytest.mark.parametrize("how", ["read", "write"])
+@pytest.mark.parametrize("name", _MARKER_INPUTS + ['a"b'], ids=_MARKER_IDS + ["quote-only"])
+def test_f1_a_valid_token_naming_a_marker_shaped_other_agent_is_written_escaped(
+        owned_tmp, name, how):
+    """A VALID token for alice naming another agent. Measured on the base (902c3e61): the
+    guard answers 403 ``identity mismatch`` (before any handler), so the status is 403 and the
+    guard outcome 403 for every one of these names, read or write; the base wrote the name
+    unescaped. Pins that the escape also holds when a token is presented (verdict mismatch)."""
+    app = _make_app(owned_tmp)
+    c = app.test_client()
+    hdr = _auth(_issue(app, "alice"))
+    if how == "read":
+        r = c.get(f"/api/updates?agent={_q(name)}", headers=hdr)
+    else:
+        r = c.post("/api/post", json=dict(POST_BODY, agent=name), headers=hdr)
+    assert r.status_code == 403
+    (rec,) = _lines(owned_tmp)
+    assert rec["named"] == [_esc(name)] and _esc(name) != name
+    assert (rec["verdict"], rec["token_agent"], rec["outcome"]) == ("mismatch", "alice", 403)
+    assert rec["kind"] == ("read" if how == "read" else "write")
+    data = _bytes(owned_tmp)
+    assert _in_file(_esc(name)) in data
+    for m in _SERVER_MARKERS:
+        assert m not in data, m
+    assert b'a\\"b' not in data
+
+
 # ---- delta 5: --verify-only binds nothing, so it takes the serving flags and an until ----
 
 def test_f3_verify_only_with_the_serving_flags_and_an_until_is_not_refused(
