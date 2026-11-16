@@ -464,7 +464,6 @@ def _stop_and_reset_snapshot_worker(
         mod._started = False
         mod._worker_thread = None
         mod._seq_counter = 0
-        mod._stop.clear()
         mod._work_event.clear()
     except Exception:
         pass

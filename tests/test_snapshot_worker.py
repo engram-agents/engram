@@ -17,6 +17,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 
 import pytest
@@ -38,7 +39,7 @@ def _isolated(tmp_path, monkeypatch):
     w._seq_counter = 0
     w._started = False
     w._worker_thread = None
-    w._stop.clear()
+    w._stop = threading.Event()  # fresh token; never clear one a live thread may hold (#4833)
     w._work_event.clear()
     yield tmp_path
     w.stop_worker(timeout=1.0)

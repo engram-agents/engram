@@ -78,6 +78,10 @@ _INDEX_LOCK_STALE_SECS = 120
 _lock = threading.Lock()          # serializes ALL queue-file writes + seq handout
 _work_event = threading.Event()   # set when a new job is enqueued
 _worker_thread: Optional[threading.Thread] = None
+# The CURRENT worker's stop token (#4833). Each worker thread owns its own token: it is
+# only ever SET, never cleared, and start_worker() REBINDS this name to a fresh Event
+# instead of clearing the old one, so a stop given to a worker is never undone (an
+# orphan still in a job exits after it, whatever starts later).
 _stop = threading.Event()
 _seq_counter = 0                  # monotonic per-process; seeded from disk on start
 _started = False
@@ -553,12 +557,16 @@ def _seed_seq_counter() -> None:
     _seq_counter = max_seq
 
 
-def _drain_pending() -> int:
+def _drain_pending(stop: Optional[threading.Event] = None) -> int:
     """Process all currently-pending jobs FIFO. Returns count successfully done.
-    Stops early on a job that stays pending (failure) to avoid a tight retry loop."""
+    Stops early on a job that stays pending (failure) to avoid a tight retry loop.
+    ``stop`` is the calling worker's own token, checked before each job; the default
+    is the current module token (#4833)."""
+    if stop is None:
+        stop = _stop
     done = 0
     for job in _pending_jobs():
-        if _stop.is_set():
+        if stop.is_set():
             break
         if _process_job(job):
             done += 1
@@ -567,14 +575,17 @@ def _drain_pending() -> int:
     return done
 
 
-def _worker_loop() -> None:
-    while not _stop.is_set():
+def _worker_loop(stop: threading.Event) -> None:
+    """One worker thread's loop. ``stop`` is THIS worker's own token (#4833): only this
+    token is checked, and nobody ever clears it, so the thread exits after at most the
+    job it is in once the token is set."""
+    while not stop.is_set():
         _work_event.wait(timeout=30.0)
         _work_event.clear()
-        if _stop.is_set():
+        if stop.is_set():
             break
         try:
-            _drain_pending()
+            _drain_pending(stop)
             with _lock:
                 if len(_read_queue_lines()) > _QUEUE_COMPACT_THRESHOLD:
                     _compact_queue_locked()
@@ -584,31 +595,39 @@ def _worker_loop() -> None:
 
 def start_worker() -> None:
     """Idempotent: seed seq, clear a stale index-lock, compact + replay pending
-    jobs, then start the singleton worker thread. Call once at server startup."""
-    global _worker_thread, _started
+    jobs, then start the singleton worker thread with a fresh stop token of its own.
+    Call once at server startup."""
+    global _worker_thread, _started, _stop
     with _lock:
         if _started and _worker_thread and _worker_thread.is_alive():
             return
         _started = True
+    # A fresh token per worker (#4833); an earlier worker's token is never touched.
+    token = threading.Event()
+    _stop = token
     _clear_stale_index_lock()
     _seed_seq_counter()
     _reclaim_orphan_snapshots()  # drop snapshots from a crash between capture and enqueue
     with _lock:
         _compact_queue_locked()
-    replayed = _drain_pending()
+    replayed = _drain_pending(token)
     if replayed:
         _log(f"replayed {replayed} pending snapshot job(s) on startup")
-    _stop.clear()
     _worker_thread = threading.Thread(
-        target=_worker_loop, name="engram-snapshot-worker", daemon=True
+        target=_worker_loop, args=(token,), name="engram-snapshot-worker", daemon=True
     )
     _worker_thread.start()
 
 
 def stop_worker(timeout: float = 5.0) -> None:
-    """Signal the worker to stop and join (used by tests / clean shutdown)."""
+    """Signal the worker to stop and join (used by tests / clean shutdown). Sets the
+    current worker's token and never clears any token (#4833). A thread still alive
+    after the join (a job past the bound) is logged loudly."""
     _stop.set()
     _work_event.set()
     t = _worker_thread
     if t and t.is_alive():
         t.join(timeout=timeout)
+        if t.is_alive():
+            _log(f"stop_worker: worker thread still alive after {timeout}s join "
+                 f"(a job past the bound); it will exit after its current job")

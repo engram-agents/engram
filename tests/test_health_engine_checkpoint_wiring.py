@@ -98,7 +98,6 @@ def _stop_leaked_snapshot_worker():
         _sw._started = False
         _sw._worker_thread = None
         _sw._seq_counter = 0
-        _sw._stop.clear()
         _sw._work_event.clear()
     except Exception:
         pass
