@@ -1433,16 +1433,9 @@ def test_probe_token_is_randomised_per_build():
 # refusals that mostly exit 1 are not interchangeable. Each cell below names
 # the message text of exactly one site, which is what tells them apart.
 
-def _probe_accepting_scanner(tmp_path: Path) -> Path:
-    """A parser that refuses both probes and accepts a well-formed produced
-    roster -- i.e. one that passes the positive control."""
-    stub = tmp_path / "probe-accepting-scanner.py"
-    stub.write_text(
-        r'''
-def _declares_boundary(pattern):
-    return True
-
-
+# The loader both scanner stubs embed. They differ only in whether they also
+# declare the boundary hook, which each helper shows at its own definition.
+_STUB_LOAD_ROSTER_FILE = r'''
 def load_roster_file(path):
     text = path.read_text(encoding="utf-8")
     lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
@@ -1450,7 +1443,19 @@ def load_roster_file(path):
         if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
             raise SystemExit(2)
     return [(None, "stub", klass) for klass in ("A", "A", "B")]
-'''.lstrip(),
+'''.lstrip()
+
+
+def _probe_accepting_scanner(tmp_path: Path) -> Path:
+    """A parser that refuses both probes; its ``load_roster_file`` would
+    return a stub roster, which no cell here exercises."""
+    stub = tmp_path / "probe-accepting-scanner.py"
+    stub.write_text(
+        "def _declares_boundary(pattern):\n"
+        "    return True\n"
+        "\n"
+        "\n"
+        + _STUB_LOAD_ROSTER_FILE,
         encoding="utf-8",
     )
     return stub
@@ -1487,18 +1492,7 @@ def _scanner_without_declares_boundary(tmp_path: Path) -> Path:
     """A parser that passes the probe control but declares no
     ``_declares_boundary`` hook."""
     stub = tmp_path / "no-boundary-scanner.py"
-    stub.write_text(
-        r'''
-def load_roster_file(path):
-    text = path.read_text(encoding="utf-8")
-    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    for ln in lines:
-        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
-            raise SystemExit(2)
-    return [(None, "stub", klass) for klass in ("A", "A", "B")]
-'''.lstrip(),
-        encoding="utf-8",
-    )
+    stub.write_text(_STUB_LOAD_ROSTER_FILE, encoding="utf-8")
     return stub
 
 
