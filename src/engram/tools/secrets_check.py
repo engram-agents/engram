@@ -14,11 +14,14 @@ Linux: directory passes only if mode 0700 and its access ACL is exactly the thre
 entries (no named user/group entry, no mask line) and it has no default ACL line at all;
 each regular file passes only if mode 0600 and base entries only. Anything that is not a
 regular file (symlink, fifo, subdirectory, socket) refuses, and so does any entry whose name
-begins with "." (a suspected leftover of an interrupted secret-put), judged with lstat and never
+begins with "." (".put-*" is a suspected leftover of an interrupted secret-put; any other dotfile,
+such as .DS_Store, is an unexpected hidden file), judged with lstat and never
 followed. getfacl missing or failing -> exit 2 (never a pass).
-macOS (darwin): an extended ACL shows as a trailing "+" in the mode field of `ls -ld <dir>` and
-`ls -l <file>` (run with "--" before the path); any "+" refuses, named by basename, with the
-remediation `chmod -N <path>`. If ls fails or its output cannot be parsed -> exit 2.
+macOS (darwin): the ACL is read from the entry lines of `ls -ldeq <dir>` / `ls -leq <file>` (run with
+"--" before the path), because the mode suffix shows "@" instead of "+" when the file also has
+extended attributes. Any entry line, or a "+" suffix, refuses, named by basename, with the
+remediation `chmod -N <path>`; "@" alone passes (macOS adds com.apple.provenance to ordinary files).
+If ls fails, the suffix is anything else, or a later line is not an entry -> exit 2.
 Other platforms: the ACL half is not implemented; a note goes to stderr every time, the stdout
 verdict says "modes only; ACL not checked on this platform", and the mode bits and the
 regular-file rule are still enforced.
@@ -36,7 +39,8 @@ from pathlib import Path
 
 NON_LINUX_NOTE = "secrets ACL not checked on this platform"
 PASS_MODES_ONLY = "secrets check: pass (modes only; ACL not checked on this platform)"
-_LS_MODE_RE = re.compile(r"^[-bcdlpsDw?][-rwxsStTlL]{9}[+@.:]?$")
+_LS_MODE_RE = re.compile(r"^[-bcdlpsDw?][-rwxsStTlL]{9}[+@]?$")  # darwin: only none, "@" or "+" is understood
+_ACL_ENTRY_RE = re.compile(r"^\s*\d+: \S")
 NOTE_CHMOD = "note: 'chmod g-w' changes only the ACL mask, not a named entry."
 NOTE_WIDEN = "note: removing one ACL entry can widen the mask; read the full ACL before and after."
 
@@ -97,11 +101,16 @@ def _acl_defects(path: str, is_dir: bool) -> list:
 
 
 def _darwin_acl_defects(path: str, is_dir: bool) -> list:
-    """macOS: an extended ACL is the trailing "+" of the mode field of ls -ld (dir) / ls -l (file).
-    Raises _CannotTell when ls fails or its first field is not a mode field."""
+    """macOS: the ACL is read from the entry lines of `ls -ldeq` (dir) / `ls -leq` (file), because the
+    mode suffix shows "@" instead of "+" when the file also has extended attributes (ls prints ONE suffix).
+    -q prints non-printable name characters as "?", so a name cannot fake an entry line.
+    Line 1 is the long line: its mode field must end in nothing, "@" or "+" (anything else, e.g. "%", is
+    not understood). Every later non-empty line must be an ACL entry (" 0: group:everyone allow read").
+    Returns ["extended ACL"] for at least one entry line or a "+" suffix, else [].
+    Raises _CannotTell when ls fails or its output does not have that shape."""
     try:
         r = subprocess.run(
-            ["ls", "-ld" if is_dir else "-l", "--", path],
+            ["ls", "-ldeq" if is_dir else "-leq", "--", path],
             capture_output=True,
             text=True,
             timeout=30,
@@ -112,10 +121,18 @@ def _darwin_acl_defects(path: str, is_dir: bool) -> list:
         raise _CannotTell(type(exc).__name__)
     if r.returncode != 0:
         raise _CannotTell("ls exit %d" % r.returncode)
-    fields = r.stdout.split(None, 1)
+    lines = r.stdout.splitlines()
+    fields = lines[0].split(None, 1) if lines else []
     if not fields or not _LS_MODE_RE.match(fields[0]):
         raise _CannotTell("unparseable ls output")
-    return ["extended ACL"] if fields[0].endswith("+") else []
+    entries = 0
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        if not _ACL_ENTRY_RE.match(line):
+            raise _CannotTell("unparseable ls output")
+        entries += 1
+    return ["extended ACL"] if entries or fields[0].endswith("+") else []
 
 
 def check(home) -> Result:
@@ -180,9 +197,13 @@ def check(home) -> Result:
             cannot_tell.append("%s: cannot tell (lstat %s)" % (name, type(exc).__name__))
             continue
         if name.startswith("."):
-            # secret-put's temp files are mkstemp(prefix=".put-"): a dotfile is the residue of a
+            # secret-put's temp files are mkstemp(prefix=".put-"): such a dotfile is the residue of a
             # secret-put killed between the write and the replace, and it holds the whole value.
-            res.problems.append("%s: suspected leftover temporary file from an interrupted secret-put; remove it" % name)
+            # Any other dotfile (.DS_Store from Finder, ...) is refused too, with its own message.
+            if name.startswith(".put-"):
+                res.problems.append("%s: suspected leftover temporary file from an interrupted secret-put; remove it" % name)
+            else:
+                res.problems.append("%s: unexpected hidden file in secrets/ (for example .DS_Store from Finder); remove it" % name)
             chmod_lines.append("rm -- %s" % shlex.quote(str(p)))
             continue
         if not stat.S_ISREG(est.st_mode):

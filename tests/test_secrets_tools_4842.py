@@ -18,6 +18,7 @@ assertions are on booleans. Every home is a tmp_path home, never the real ENGRAM
 
 import importlib.util
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -779,10 +780,11 @@ _LS_SHIM = """#!/bin/sh
 if [ -n "$SHIM_LS_RC" ] && [ "$SHIM_LS_RC" != 0 ]; then exit "$SHIM_LS_RC"; fi
 if [ -n "$SHIM_LS_GARBAGE" ]; then echo "$SHIM_LS_GARBAGE"; exit 0; fi
 case "$1" in
-  -ld) echo "$SHIM_DIR_MODE 2 user group 64 Jan  1 00:00 x";;
-  -l) echo "$SHIM_FILE_MODE 1 user group 3 Jan  1 00:00 x";;
+  -ldeq) echo "$SHIM_DIR_MODE 2 user staff 64 Nov 16 16:25 x"; [ -n "$SHIM_DIR_AFTER" ] && printf '%s\\n' "$SHIM_DIR_AFTER";;
+  -leq) echo "$SHIM_FILE_MODE 1 user staff 3 Nov 16 16:25 x"; [ -n "$SHIM_FILE_AFTER" ] && printf '%s\\n' "$SHIM_FILE_AFTER";;
   *) exit 9;;
 esac
+exit 0
 """
 _CHMOD_SHIM = """#!/bin/sh
 echo "chmod $*" >> "$SHIM_LOG"
@@ -790,7 +792,7 @@ exit "${SHIM_CHMOD_RC:-0}"
 """
 
 
-def _darwin(tmp_path, monkeypatch, dir_mode="drwx------", file_mode="-rw-------", **extra):
+def _darwin(tmp_path, monkeypatch, dir_mode="drwx------", file_mode="-rw-------", dir_after="", file_after="", **extra):
     """Pretend to be macOS: platform patched, `ls` and `chmod` shims first on PATH, controlled mode lines."""
     shim = tmp_path / "darwinshim"
     shim.mkdir()
@@ -802,10 +804,17 @@ def _darwin(tmp_path, monkeypatch, dir_mode="drwx------", file_mode="-rw-------"
     monkeypatch.setenv("SHIM_LOG", str(log))
     monkeypatch.setenv("SHIM_DIR_MODE", dir_mode)
     monkeypatch.setenv("SHIM_FILE_MODE", file_mode)
+    monkeypatch.setenv("SHIM_DIR_AFTER", dir_after)
+    monkeypatch.setenv("SHIM_FILE_AFTER", file_after)
     for k, v in extra.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(sys, "platform", "darwin")
     return log
+
+
+# What `ls -le` prints under a real ACL entry (Luria, macOS 27.0.1, with neutral names).
+DIR_ENTRY = " 0: group:everyone allow list"
+FILE_ENTRY = " 0: group:everyone allow read"
 
 
 def test_l1a_darwin_plus_on_dir_refuses_and_names_chmod_N(tmp_path, monkeypatch, capsys):
@@ -838,8 +847,8 @@ def test_l1a_darwin_clean_passes_without_the_not_checked_note(tmp_path, monkeypa
     assert cap.out.splitlines() == ["secrets check: pass"]
     assert "not checked" not in cap.err
     calls = log.read_text().splitlines()
-    assert any(c.startswith("ls -ld -- ") for c in calls)  # the directory
-    assert any(c.startswith("ls -l -- ") for c in calls)  # each file
+    assert any(c.startswith("ls -ldeq -- ") for c in calls)  # the directory
+    assert any(c.startswith("ls -leq -- ") for c in calls)  # each file
 
 
 @pytest.mark.parametrize("extra", [{"SHIM_LS_RC": "1"}, {"SHIM_LS_GARBAGE": "not a listing"}])
@@ -849,6 +858,105 @@ def test_l1a_darwin_ls_failing_or_unparseable_is_exit_2(tmp_path, monkeypatch, c
     _darwin(tmp_path, monkeypatch, **extra)
     assert mod.main(["--home", str(home)]) == 2
     assert "cannot tell" in capsys.readouterr().out
+
+
+def test_l1a_darwin_xattr_and_acl_entry_refuses_and_names_chmod_N_on_file(tmp_path, monkeypatch, capsys):
+    """The defect: ls prints '@' (not '+') when an xattr exists, so the ACL is only in the entry lines."""
+    mod = _load()
+    home = _clean_home(tmp_path)
+    _darwin(tmp_path, monkeypatch, file_mode="-rw-------@", file_after=FILE_ENTRY)
+    assert mod.main(["--home", str(home)]) == 1
+    out = capsys.readouterr().out
+    assert "alpha-key: extended ACL" in out
+    assert "chmod -N " + shlex.quote(str(home / "secrets" / "alpha-key")) in out
+
+
+def test_l1a_darwin_xattr_and_acl_entry_on_dir_refuses(tmp_path, monkeypatch, capsys):
+    mod = _load()
+    home = _clean_home(tmp_path)
+    _darwin(tmp_path, monkeypatch, dir_mode="drwx------@", dir_after=DIR_ENTRY)
+    assert mod.main(["--home", str(home)]) == 1
+    out = capsys.readouterr().out
+    assert "secrets: extended ACL" in out
+    assert "chmod -N " + shlex.quote(str(home / "secrets")) in out
+
+
+def test_l1a_darwin_at_alone_passes(tmp_path, monkeypatch, capsys):
+    """macOS adds com.apple.provenance to ordinary files: '@' with no entry line is clean."""
+    mod = _load()
+    home = _clean_home(tmp_path)
+    _darwin(tmp_path, monkeypatch, dir_mode="drwx------@", file_mode="-rw-------@")
+    assert mod.main(["--home", str(home)]) == 0
+    assert capsys.readouterr().out.splitlines() == ["secrets check: pass"]
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"dir_mode": "drwx------+", "dir_after": DIR_ENTRY},
+        {"dir_mode": "drwx------+"},  # '+' with no entry line still refuses
+        {"file_mode": "-rw-------+", "file_after": FILE_ENTRY},
+        {"file_mode": "-rw-------+"},
+        {"dir_after": DIR_ENTRY},  # no suffix, entry line present
+        {"file_after": FILE_ENTRY},
+    ],
+)
+def test_l1a_darwin_plus_or_entry_line_refuses(tmp_path, monkeypatch, capsys, kw):
+    mod = _load()
+    home = _clean_home(tmp_path)
+    _darwin(tmp_path, monkeypatch, **kw)
+    assert mod.main(["--home", str(home)]) == 1
+    assert "extended ACL" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("suffix", ["%", ".", ":"])
+def test_l1a_darwin_other_suffix_is_exit_2(tmp_path, monkeypatch, capsys, suffix):
+    mod = _load()
+    home = _clean_home(tmp_path)
+    _darwin(tmp_path, monkeypatch, file_mode="-rw-------" + suffix)
+    assert mod.main(["--home", str(home)]) == 2
+    assert "cannot tell" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("junk", ["garbage", "total 8", " 0 no-colon-entry"])
+def test_l1a_darwin_trailing_non_entry_line_is_exit_2_never_clean(tmp_path, monkeypatch, capsys, junk):
+    """One clean line passes (cell below); the same line plus a later non-entry line must not."""
+    mod = _load()
+    home = _clean_home(tmp_path)
+    _darwin(tmp_path, monkeypatch, file_after=junk)
+    assert mod.main(["--home", str(home)]) == 2
+    assert "cannot tell" in capsys.readouterr().out
+
+
+def test_l1a_darwin_clean_listing_is_exactly_one_line_and_passes(tmp_path, monkeypatch, capsys):
+    mod = _load()
+    home = _clean_home(tmp_path)
+    _darwin(tmp_path, monkeypatch)
+    assert mod.main(["--home", str(home)]) == 0
+
+
+def test_l1a_darwin_name_split_into_an_entry_shaped_line_never_passes(tmp_path, monkeypatch, capsys):
+    """What ls WITHOUT -q could print for a file named "x<newline> 0: group:everyone allow read": the name's
+    second half is an entry-shaped line. check() has no name rule, so the name reaches ls. The shim prints
+    that split; the result is exit 1 (refuse), never 0. The real tool passes -q so ls prints '?' instead."""
+    mod = _load()
+    home = _clean_home(tmp_path, files=("alpha-key",))
+    log = _darwin(tmp_path, monkeypatch, file_after=FILE_ENTRY)
+    assert mod.main(["--home", str(home)]) == 1
+    assert any(c.startswith("ls -leq -- ") for c in log.read_text().splitlines())  # -q is in the flags
+
+
+@needs_backend
+def test_d3_other_dotfile_is_refused_as_an_unexpected_hidden_file(tmp_path):
+    home = _clean_home(tmp_path)
+    ds = home / "secrets" / ".DS_Store"
+    _write(ds, "x\n")
+    r = _check_cli(home)
+    out = _out(r)
+    assert r.returncode == 1
+    assert ".DS_Store: unexpected hidden file in secrets/ (for example .DS_Store from Finder); remove it" in out
+    assert "interrupted secret-put" not in out
+    assert "rm -- " + shlex.quote(str(ds)) in out
 
 
 def _put_in_process(mod, home, data=b"v\n", args=()):
@@ -893,9 +1001,13 @@ def test_l1b_put_on_darwin_chmod_failure_removes_the_folder_exit_2(tmp_path, mon
 def test_l1_real_mac_inherited_acl_refused_and_fresh_put_is_clean(tmp_path):
     acl = "everyone allow list,search,file_inherit,directory_inherit"
 
-    def ls_has_plus(path, flag):
-        out = subprocess.run(["ls", flag, "--", str(path)], capture_output=True, text=True).stdout
-        return "+" in out.split()[0]
+    def acl_entries(path, is_dir):
+        """ACL entry lines of `ls -le` / `ls -lde`: the mode suffix shows '@' instead of '+' when an
+        xattr exists, so the entry lines are the only reliable reading."""
+        out = subprocess.run(
+            ["ls", "-lde" if is_dir else "-le", "--", str(path)], capture_output=True, text=True
+        ).stdout
+        return [ln for ln in out.splitlines()[1:] if re.match(r"^\s*\d+: \S", ln)]
 
     # Luria's measurement: a folder made under an inheritable-ACL home inherits the ACE and must be refused.
     home1 = tmp_path / "home1"
@@ -903,7 +1015,7 @@ def test_l1_real_mac_inherited_acl_refused_and_fresh_put_is_clean(tmp_path):
     subprocess.run(["chmod", "+a", acl, str(home1)], check=True)
     os.mkdir(home1 / "secrets", 0o700)
     _write(home1 / "secrets" / "k", "v\n")
-    assert ls_has_plus(home1 / "secrets", "-ld")
+    assert acl_entries(home1 / "secrets", True)
     assert _check_cli(home1).returncode == 1
 
     # A folder secret-put creates itself under the same kind of home must come out clean and pass.
@@ -912,9 +1024,29 @@ def test_l1_real_mac_inherited_acl_refused_and_fresh_put_is_clean(tmp_path):
     subprocess.run(["chmod", "+a", acl, str(home2)], check=True)
     r = _run(SECRET_PUT, ["--home", str(home2), "k"], stdin="v\n")
     assert r.returncode == 0
-    assert not ls_has_plus(home2 / "secrets", "-ld")
-    assert not ls_has_plus(home2 / "secrets" / "k", "-l")
+    assert not acl_entries(home2 / "secrets", True)
+    assert not acl_entries(home2 / "secrets" / "k", False)
     assert _check_cli(home2).returncode == 0
+
+    # Third half: the same inherited ACL AND an extended attribute on the folder and the file. `ls -l`
+    # then prints '@' (not '+'), so a suffix-only check would pass; the entry lines must be seen.
+    home3 = tmp_path / "home3"
+    home3.mkdir()
+    subprocess.run(["chmod", "+a", acl, str(home3)], check=True)
+    os.mkdir(home3 / "secrets", 0o700)
+    _write(home3 / "secrets" / "k", "v\n")
+    for path in (home3 / "secrets", home3 / "secrets" / "k"):
+        subprocess.run(["xattr", "-w", "user.test", "1", str(path)], check=True)
+    assert acl_entries(home3 / "secrets", True)
+    assert acl_entries(home3 / "secrets" / "k", False)
+    assert _check_cli(home3).returncode == 1
+
+    # A file named with a newline and an entry-shaped second half. check() has no name rule, so it reaches
+    # ls; `ls -q` prints the newline as '?': one line, no injected entry. The file has no ACL, so the
+    # EXPECTED outcome is exit 0 (a name cannot forge a refusal, and cannot hide an entry either).
+    home4 = _clean_home(tmp_path / "home4", files=())
+    _write(home4 / "secrets" / "x\n 0: group:everyone allow read", "v\n")
+    assert _check_cli(home4).returncode == 0
 
 
 def _child_cmp(var, expected):
