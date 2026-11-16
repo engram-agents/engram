@@ -27,8 +27,10 @@ import platform
 import re
 import shutil
 import sqlite3
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -240,7 +242,7 @@ exec "$REAL_PY" "$@"
         return self
 
     # -- running -----------------------------------------------------------------------------
-    def run(self, *args, env=None, stdin=subprocess.DEVNULL):
+    def run(self, *args, env=None, stdin=subprocess.DEVNULL, timeout=120):
         e = {
             "PATH": "%s:%s" % (self.fakebin, self.safebin),
             "HOME": str(self.home),
@@ -258,7 +260,7 @@ exec "$REAL_PY" "$@"
         e.update(env or {})
         proc = subprocess.run(
             ["bash", str(self.repo / "tools" / "install.sh"), *args],
-            cwd=str(self.root), env=e, stdin=stdin, capture_output=True, text=True, timeout=120,
+            cwd=str(self.root), env=e, stdin=stdin, capture_output=True, text=True, timeout=timeout,
         )
         proc.all = proc.stdout + proc.stderr
         return proc
@@ -1138,3 +1140,53 @@ def test_forum_url_hint_names_the_tier_not_the_retired_flag(sb):
     assert r.returncode != 0 and "FAIL: [step 8]" in r.stderr, r.all
     assert "--multi-agent" not in r.stderr
     assert "convenience or dev" in r.stderr
+
+
+# --------------------------------------------------------------------- #4795: a timeout kills the tree
+
+def _pid_alive(pid):
+    """True while the pid is a live process; a zombie (dead, awaiting its reaper) counts as gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        state = Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state != "Z"
+
+
+def test_sandbox_run_timeout_kills_the_whole_process_tree(tmp_path):
+    """#4795: on a timeout the installer's whole process group dies, not just the bash that was
+    started. The fake bootstrap (bash's child) writes its pid, ignores SIGTERM and sleeps; before the
+    fix it outlived the TimeoutExpired as an orphan under PID 1."""
+    sb = Sandbox(tmp_path)
+    pidfile = tmp_path / "bootstrap.pid"
+    _write(sb.plugin_src / "bootstrap.py", (
+        "import os, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "open(%r, 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n" % str(pidfile)
+    ), 0o644)
+    pid = None
+    try:
+        started = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            sb.run("--yes", timeout=3)
+        elapsed = time.monotonic() - started
+        assert pidfile.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 2
+        while _pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _pid_alive(pid), "the bootstrap (pid %d) outlived the timeout" % pid
+        assert elapsed < 3 + 10, "the timeout path took %.1fs: the kill did not reach the whole group" % elapsed
+    finally:
+        if pid is None and pidfile.exists():
+            pid = int(pidfile.read_text())
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass

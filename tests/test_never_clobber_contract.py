@@ -2289,3 +2289,75 @@ def test_install_sh_step_5_says_so_in_its_own_words_when_the_marketplace_step_ex
     other = Sandbox(tmp_path / "other").run("--yes", env={"FAKE_MARKET_RC": "1"})
     generic = next(ln for ln in other.stderr.splitlines() if ln.startswith("FAIL: [step 5]"))
     assert "exited non-zero" in generic and "items it did not do" not in generic, generic
+
+
+# --------------------------------------------------------------------- #4795: no network call
+
+def _net_audit(root: Path):
+    """A sitecustomize audit hook on PYTHONPATH: every socket.connect / socket.getaddrinfo event
+    in any python child is appended to a log. Returns (dir for PYTHONPATH, log path)."""
+    d = Path(root)
+    d.mkdir(parents=True, exist_ok=True)
+    log = d / "net-events.log"
+    (d / "sitecustomize.py").write_text(
+        "import sys\n"
+        f"_LOG = {str(log)!r}\n"
+        "def _hook(event, args):\n"
+        "    if event in ('socket.connect', 'socket.getaddrinfo'):\n"
+        "        try:\n"
+        "            with open(_LOG, 'a') as f:\n"
+        "                f.write('%s %r\\n' % (event, args[1] if event == 'socket.connect' else args[:2]))\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "sys.addaudithook(_hook)\n"
+    )
+    return d, log
+
+
+def _net_events(log: Path) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _assert_audit_hook_sees_a_planted_call(audit_dir: Path, log: Path) -> None:
+    """Positive control: the SAME hook on the SAME PYTHONPATH logs a planted getaddrinfo. Without it
+    a zero count proves nothing (a hook that never loaded logs zero too)."""
+    before = len(_net_events(log))
+    env = {**os.environ, "PYTHONPATH": str(audit_dir)}
+    subprocess.run([sys.executable, "-c", "import socket; socket.getaddrinfo('localhost', 0)"],
+                   env=env, check=True, capture_output=True, timeout=60)
+    after = _net_events(log)
+    assert len(after) > before, "the audit hook never logged a planted getaddrinfo: it is not loaded"
+
+
+def _graph_nodes(engram_home: Path) -> int:
+    con = sqlite3.connect(str(engram_home / "knowledge.db"))
+    try:
+        return con.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_real_bootstrap_installer_cell_makes_no_network_call(tmp_path, tmp_path_factory, monkeypatch):
+    """#4795 A1: install.sh over the REAL bootstrap seeds a graph; seeding must not download the
+    embedding model (a temp HOME has no cache)."""
+    monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)  # CI sets it for the whole run; the cell must not lean on that
+    audit_dir, log = _net_audit(tmp_path_factory.mktemp("net-audit"))
+    sb = _installer_with_real_bootstrap(tmp_path)
+    r = sb.run("--yes", env={"PYTHONPATH": str(audit_dir)})
+    assert r.returncode == 0, r.all
+    assert _graph_nodes(sb.engram) > 0, "the real bootstrap did not seed a graph, so a zero proves nothing"
+    events = _net_events(log)
+    assert events == [], f"the real-bootstrap installer run made {len(events)} network events: {events[:3]}"
+    _assert_audit_hook_sees_a_planted_call(audit_dir, log)
+
+
+def test_a_seeding_bootstrap_run_makes_no_network_call(tmp_path, tmp_path_factory, monkeypatch):
+    """#4795 A2: one `_run_env` bootstrap run into a fresh home (it seeds) makes no network call."""
+    monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)
+    audit_dir, log = _net_audit(tmp_path_factory.mktemp("net-audit"))
+    r = _run_env(tmp_path, extra_env={"PYTHONPATH": str(audit_dir)})
+    assert r.returncode == 0, _text(r)
+    assert _graph_nodes(tmp_path / ".engram") > 0, "bootstrap did not seed a graph, so a zero proves nothing"
+    events = _net_events(log)
+    assert events == [], f"a seeding bootstrap run made {len(events)} network events: {events[:3]}"
+    _assert_audit_hook_sees_a_planted_call(audit_dir, log)
