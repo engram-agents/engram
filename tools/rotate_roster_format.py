@@ -438,6 +438,13 @@ def _validate_parser_result(result, out_lines, scanner_path: Path) -> None:
     a line, is not validating the two-class format. Refuse with the same
     message as a parser that accepts the probes.
     """
+    # The scanner gained a format field; this tool validates the entries.
+    if (
+        isinstance(result, (list, tuple))
+        and len(result) == 2
+        and isinstance(result[1], int)
+    ):
+        result = result[0]
     stale = (
         f"the scanner at {scanner_path} predates the two-class format; "
         "an unvalidated roster is never emitted"

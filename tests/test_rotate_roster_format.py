@@ -958,6 +958,35 @@ def load_roster_file(path):
     assert (out / "roster-format2.txt").is_file()
 
 
+def test_stub_returning_entries_with_format_int_tuple_proceeds(tmp_path):
+    """The current scanner returns ``(entries, roster_format)``, not the bare
+    entries sequence. The same entries in that shape must validate exactly as
+    the bare sequence does; refusing the shape refuses the real scanner."""
+    stub = tmp_path / "format-tuple-scanner.py"
+    stub.write_text(
+        r'''
+def _declares_boundary(pattern):
+    return True
+
+
+def load_roster_file(path):
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    for ln in lines:
+        if ln.startswith("C\t") or (ln.startswith("A\t") and "\\b" not in ln):
+            raise SystemExit(2)
+    return ([(None, "stub", klass) for klass in ("A", "A", "B")], 2)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    roster, bnames, out = _scratch(tmp_path, BASE_ROSTER, BASE_B)
+
+    r = _run(["--roster", str(roster), "--b-names", str(bnames),
+              "--out-dir", str(out), "--scanner", str(stub)])
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (out / "roster-format2.txt").is_file()
+
+
 # ---------------------------------------------------------------------------
 # R1 -- captured parser stderr: withheld when it carries a produced pattern
 # ---------------------------------------------------------------------------
