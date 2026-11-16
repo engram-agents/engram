@@ -1065,13 +1065,23 @@ def _trigger_universe(reason: str) -> str:
     return f"{FORUM_TESTS_DIR}/" if f"{FORUM_TESTS_DIR}/" in reason else f"{TESTS_DIR}/"
 
 
-def _tool_check_commands(tools: list[str], base: str, head: str | None) -> list[str]:
+_BASE_PLACEHOLDER = "<base>"
+_BASE_NOTE = (
+    "[tool checks] no --base given: fill in the base in the commands above "
+    f"(replace {_BASE_PLACEHOLDER}; the tool never guesses one)"
+)
+
+
+def _tool_check_commands(tools: list[str], base: str | None, head: str | None) -> list[str]:
     """The policy's tools/*.py scanners as printable commands.
 
     scan-leaks takes ``--root .``; test_id_set_check takes the merge-base of
     base and head as ``--base`` (its --help: never the target branch's tip) and
-    the head as ``--head``.  Any other tool is printed bare.
+    the head as ``--head``.  Any other tool is printed bare.  With no ``base``
+    (an explicit --full run needs none) the base is the literal placeholder
+    ``<base>``: never an invented default.
     """
+    base = base or _BASE_PLACEHOLDER
     h = head or "HEAD"
     cmds: list[str] = []
     for t in tools:
@@ -1368,6 +1378,12 @@ def _compute_selection(args, repo_root: str, verbose: bool):
         return exc.code
     out["tool_checks"] = _tool_check_commands(tools, args.base, args.head)
     out["forum_selected"] = select_forum_tests(changed, repo_root)
+    # A file the forum universe selected (a forum test selecting itself included)
+    # was resolved: it is not "unreferenced".  The tests/ layers are untouched.
+    forum_hit = set(out["forum_selected"])
+    detail["unreferenced"] = [
+        f for f in detail.get("unreferenced") or [] if f not in forum_hit
+    ]
     return out
 
 
@@ -1411,13 +1427,18 @@ def _emit_json_selection(args, repo_root: str) -> int:
     forum_total = _count_forum_test_files(repo_root)
 
     if args.full:
+        try:
+            _tests, tools = guard_set(repo_root)
+        except GuardSetError as exc:
+            _err(str(exc))
+            return exc.code
         out = {
             "base": args.base, "changed_files": [], "full": True,
             "full_reasons": ["--full flag"], "selected": [],
             "total_test_files": total_test_files, "buckets": empty_buckets,
             **_empty_extra(),
             "forum_selected": [], "forum_total_test_files": forum_total,
-            "tool_checks": [],
+            "tool_checks": _tool_check_commands(tools, args.base, args.head),
         }
         print(json.dumps(out))
         return 0
@@ -1638,9 +1659,21 @@ def main(argv: list[str] | None = None) -> int:
 
     # --full: bypass selection entirely
     if args.full:
+        # The policy's scanners are owed on a full run too; a guard file the
+        # policy names but the tree lacks refuses here (exit 3/4), before pytest.
+        try:
+            _tests, tools = guard_set(repo_root)
+        except GuardSetError as exc:
+            _err(str(exc))
+            return exc.code
         print("[run_touched_tests] --full: running complete test suite")
         for line in full_forum_lines:
             print(line)
+        print("[tool checks] run these too (the policy's scanners):")
+        for c in _tool_check_commands(tools, args.base, args.head):
+            print(f"  {c}")
+        if args.base is None:
+            print(_BASE_NOTE)
         if args.dry_run:
             print("[dry-run] would run: pytest tests/")
             return 0

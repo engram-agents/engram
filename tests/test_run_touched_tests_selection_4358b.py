@@ -172,7 +172,9 @@ def test_c1_base_is_required_for_selection_modes(tmp_path, capsys):
 
 def test_c1_base_not_required_for_full_or_audits(tmp_path, capsys):
     repo = _repo(tmp_path, {})
-    rc, out, _err = _main(["--json", "--full", "--repo-root", repo], capsys)
+    # F1 (#4849): --full reads the guard set, so the scratch repo gets one patched in.
+    with mock.patch.object(_runner, "guard_set", return_value=(list(GUARD_PATCH), [])):
+        rc, out, _err = _main(["--json", "--full", "--repo-root", repo], capsys)
     assert rc == 0 and json.loads(out)["full"] is True
     rc, _out, _err = _main(["--audit-imports", "--repo-root", repo], capsys)
     assert rc == 0
@@ -819,7 +821,9 @@ def test_e3_guard_set_refusal_still_applies_on_the_trigger_path(tmp_path, capsys
 
 def test_e4_full_flag_still_runs_the_whole_suite_without_base(tmp_path, capsys):
     repo = _repo(tmp_path, {})
-    with mock.patch.object(_runner.subprocess, "run") as run:
+    # F1 (#4849): --full reads the guard set, so the scratch repo gets one patched in.
+    with mock.patch.object(_runner, "guard_set", return_value=(list(_E_GUARD), [])), \
+         mock.patch.object(_runner.subprocess, "run") as run:
         run.return_value.returncode = 5
         rc, _out, _err = _main(["--full", "--repo-root", repo], capsys)
     assert rc == 5
@@ -839,3 +843,118 @@ def test_e5_forum_trigger_is_named_with_its_universe(tmp_path, capsys):
     rc2, out2, _e, _r = _trigger_run(tmp_path / "x", capsys, ["tests/conftest.py"], ["--dry-run"])
     line2 = next(l for l in out2.splitlines() if "tests/conftest.py" in l)
     assert "src/forum/tests/" not in line2
+
+
+# ---------------------------------------------------------------------------
+# F1-F2 (#4849) — --full prints the policy's tool checks; a forum test that the
+# forum universe selected (itself included) is not listed as unreferenced.
+# ---------------------------------------------------------------------------
+
+_F_SCAN = "python3 tools/scan-leaks.py --root ."
+
+
+def _full_human(tmp_path, capsys, extra, returncode=0):
+    """Human --full with the guard set and subprocess.run patched (never a real pytest)."""
+    repo = _repo(tmp_path, {})
+    with mock.patch.object(_runner, "guard_set", return_value=(list(_E_GUARD), list(_E_TOOLS))), \
+         mock.patch.object(_runner.subprocess, "run") as run:
+        run.return_value.returncode = returncode
+        rc, out, err = _main(["--full", *extra, "--repo-root", repo], capsys)
+    return rc, out, err, run
+
+
+def test_f1_full_json_lists_the_tool_checks(tmp_path, capsys):
+    repo = _repo(tmp_path, {})
+    with mock.patch.object(_runner, "guard_set", return_value=(list(_E_GUARD), list(_E_TOOLS))):
+        rc, out, _e = _main(["--json", "--full", "--base", "origin/dev", "--repo-root", repo], capsys)
+    assert rc == 0
+    d = json.loads(out)
+    assert d["full"] is True
+    assert _F_SCAN in d["tool_checks"]
+    assert (
+        "python3 tools/test_id_set_check.py --base $(git merge-base origin/dev HEAD) --head HEAD"
+        in d["tool_checks"]
+    )
+
+
+def test_f1_full_without_base_prints_placeholders_never_a_default(tmp_path, capsys):
+    repo = _repo(tmp_path, {})
+    with mock.patch.object(_runner, "guard_set", return_value=(list(_E_GUARD), list(_E_TOOLS))):
+        rc, out, _e = _main(["--json", "--full", "--repo-root", repo], capsys)
+    assert rc == 0
+    cmds = json.loads(out)["tool_checks"]
+    assert "python3 tools/test_id_set_check.py --base $(git merge-base <base> HEAD) --head HEAD" in cmds
+    rc, out, _e, _run = _full_human(tmp_path / "h", capsys, [])
+    assert rc == 0
+    assert "fill in the base" in out
+    assert "--base $(git merge-base <base> HEAD)" in out
+
+
+def test_f1_human_full_prints_scanners_and_still_runs_pytest_once(tmp_path, capsys):
+    rc, out, _e, run = _full_human(tmp_path, capsys, ["--base", "origin/dev"])
+    assert rc == 0
+    assert "[tool checks]" in out
+    assert _F_SCAN in out
+    run.assert_called_once()
+    cmd = run.call_args[0][0]
+    assert cmd[1:3] == ["-m", "pytest"] and cmd[-1] == "tests/"
+
+
+def test_f1_human_full_still_returns_pytests_exit_code(tmp_path, capsys):
+    rc, _o, _e, run = _full_human(tmp_path, capsys, [], returncode=5)
+    assert rc == 5
+    run.assert_called_once()
+
+
+@pytest.mark.parametrize("extra", [[], ["--dry-run"], ["--json"]], ids=["real", "dry-run", "json"])
+def test_f1_full_with_a_missing_guard_file_exits_3_and_starts_no_pytest(tmp_path, capsys, extra):
+    repo = _policy_repo(
+        tmp_path, "   `tests/test_a.py` `tests/test_gone1.py`", {"tests/test_a.py": "a = 1\n"},
+    )
+    with mock.patch.object(_runner.subprocess, "run") as run:
+        rc, out, err = _main(["--full", *extra, "--repo-root", repo], capsys)
+    _assert_no_pytest(run)
+    assert rc == 3
+    assert "tests/test_gone1.py" in err
+    assert "{" not in out
+
+
+def _f2_run(tmp_path, capsys, changed, mode):
+    repo = _forum_repo(tmp_path)
+    with mock.patch.object(_runner, "guard_set", return_value=([], [])), \
+         mock.patch.object(_runner, "_changed_files", return_value=changed):
+        return _main([*mode, "--base", "HEAD", "--repo-root", repo], capsys)
+
+
+def test_f2_a_changed_forum_test_that_selects_itself_is_not_unreferenced(tmp_path, capsys):
+    changed = ["src/forum/tests/test_unrelated.py"]
+    rc, out, _e = _f2_run(tmp_path, capsys, changed, ["--json"])
+    assert rc == 0
+    d = json.loads(out)
+    assert "src/forum/tests/test_unrelated.py" in d["forum_selected"]
+    assert "src/forum/tests/test_unrelated.py" not in d["unreferenced"]
+    rc, out, _e = _f2_run(tmp_path / "h", capsys, changed, ["--dry-run"])
+    assert rc == 0
+    # the summary line is gone; the verbose per-layer trace ("  [unreferenced] f -> no
+    # layer resolves it", printed inside select_tests) is a tests/-layers line and stays
+    assert not any(l.startswith("[unreferenced]") for l in out.splitlines())
+    assert "src/forum/tests/test_unrelated.py" in out  # still named in the [forum] block
+
+
+def test_f2_a_file_neither_universe_selects_is_still_unreferenced(tmp_path, capsys):
+    changed = ["src/forum/tests/test_unrelated.py", "notes.md"]
+    rc, out, _e = _f2_run(tmp_path, capsys, changed, ["--json"])
+    assert rc == 0
+    d = json.loads(out)
+    assert d["unreferenced"] == ["notes.md"]
+    assert d["forum_selected"] == ["src/forum/tests/test_unrelated.py"]
+    rc, out, _e = _f2_run(tmp_path / "h", capsys, changed, ["--dry-run"])
+    line = next(l for l in out.splitlines() if l.startswith("[unreferenced]"))
+    assert "notes.md" in line and "test_unrelated.py" not in line
+
+
+def test_f2_a_lone_unselected_file_is_unreferenced_beside_a_forum_universe(tmp_path, capsys):
+    rc, out, _e = _f2_run(tmp_path, capsys, ["notes.md"], ["--json"])
+    assert rc == 0
+    d = json.loads(out)
+    assert d["unreferenced"] == ["notes.md"] and d["forum_selected"] == []
