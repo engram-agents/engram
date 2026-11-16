@@ -109,7 +109,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_bootstrap_no_clobber_4440 import (  # noqa: E402
-    REPO_ROOT, RUNTIME_FILES, SRC, _db, _home, _run, _run_uninstall,
+    REPO_ROOT, RUNTIME_FILES, SRC, _db, _home, _run_uninstall,
 )
 from test_install_sh_4097 import Sandbox  # noqa: E402
 
@@ -143,6 +143,9 @@ def _run_env(tmp_path: Path, target: str = "claude", args: list[str] | None = No
         "CODEX_HOME": str(tmp_path / ".codex"),
         "PYTHON_BIN": sys.executable,
         "TARGET": target,
+        # #4795: seeding the graph must not download the embedding model into the temp HOME.
+        # Set here, not at import; an extra_env entry overrides it.
+        "ENGRAM_NO_EMBEDDINGS": "1",
     })
     for k in ("ENGRAM_BOOTSTRAP", "FORCE", "FORCE_RESEED_EMPTY"):
         env.pop(k, None)
@@ -151,6 +154,12 @@ def _run_env(tmp_path: Path, target: str = "claude", args: list[str] | None = No
         [sys.executable, str(BOOTSTRAP_PY), *(args or [])],
         env=env, capture_output=True, text=True, timeout=300,
     )
+
+
+def _run(tmp_path: Path, target: str = "claude", args: list[str] | None = None) -> subprocess.CompletedProcess:
+    """The shared `_run` of the #4440 file, hermetic (#4795): that one copies os.environ and does not
+    set the embedding opt-out, so every cell and fixture that called it downloaded the model."""
+    return _run_env(tmp_path, target=target, args=args)
 
 
 def _text(r: subprocess.CompletedProcess) -> str:

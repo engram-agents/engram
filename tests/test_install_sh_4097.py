@@ -256,12 +256,28 @@ exec "$REAL_PY" "$@"
             "REAL_PY": sys.executable,
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
+            # #4795: a cell that runs the REAL bootstrap seeds a graph, and seeding downloads the
+            # embedding model into the temp HOME. Off by default; a caller's env can override.
+            "ENGRAM_NO_EMBEDDINGS": "1",
         }
         e.update(env or {})
-        proc = subprocess.run(
+        # The installer runs in its own session so a timeout can kill the whole tree: bootstrap is
+        # bash's child, and subprocess.run(timeout=) kills only bash and leaves it an orphan.
+        proc = subprocess.Popen(
             ["bash", str(self.repo / "tools" / "install.sh"), *args],
-            cwd=str(self.root), env=e, stdin=stdin, capture_output=True, text=True, timeout=timeout,
+            cwd=str(self.root), env=e, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
         )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+            raise
+        proc = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         proc.all = proc.stdout + proc.stderr
         return proc
 
