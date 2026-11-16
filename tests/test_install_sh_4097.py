@@ -1206,3 +1206,19 @@ def test_sandbox_run_timeout_kills_the_whole_process_tree(tmp_path):
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_sandbox_run_sets_the_embedding_opt_out_by_default_and_a_caller_can_override_it(tmp_path):
+    """#4795: the bootstrap a Sandbox run starts sees ENGRAM_NO_EMBEDDINGS=1 unless the caller's env
+    says otherwise (the caller's env wins)."""
+    seen = {}
+    for label, env in (("default", None), ("override", {"ENGRAM_NO_EMBEDDINGS": "0"})):
+        sb = Sandbox(tmp_path / label)
+        out = tmp_path / ("seen-" + label)
+        _write(sb.plugin_src / "bootstrap.py", (
+            "import os\nopen(%r, 'w').write(os.environ.get('ENGRAM_NO_EMBEDDINGS', 'unset'))\n" % str(out)
+        ), 0o644)
+        sb.run("--yes", env=env)
+        assert out.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
+        seen[label] = out.read_text()
+    assert seen == {"default": "1", "override": "0"}, seen
