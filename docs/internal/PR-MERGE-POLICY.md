@@ -806,7 +806,15 @@ seat's run is:
    instead of printing an empty selection: exit 2 for an unknown ref, 3 for a guard file named in
    item 4 of *Owner merge* that is missing, 4 when it cannot read that list here, 5 when nothing
    changed between base and head, 6 when the selection would be the whole `tests/` suite. It
-   reads the guard set from item 4, so the list has one home.
+   reads the guard set from item 4, so the list has one home. A change to a file that always
+   triggers the whole suite (`conftest.py`, `pytest.ini`, the requirements, the test map, the
+   tool itself) makes the tool run nothing: it names each triggering file and its universe,
+   prints the guard set and the scanner commands, and exits 7. The seat then chooses what to run
+   (for example the changed test files, the tests that name the trigger, and the guard set) and
+   records that choice in its review or gate record. One option the merge seat has used
+   (2026-11-16, #4844): commit the triggering change onto the base, on a tree byte-equal to the
+   merge, and run the tool from there, so the rest of the PR gets a normal selection. `--full`
+   stays the one explicit way to run the whole suite.
 2. **The guard set** of item 4 in *Owner merge*: the whole-tree scanners and guards that no
    changed file names. They always run. Run `tools/scan-leaks.py` with `--root .`: its default root is
    `src/engram` only, so a bare run misses `tests/` and `docs/`, while CI's
