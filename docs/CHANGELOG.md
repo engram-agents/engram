@@ -18,6 +18,7 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Changed
 
+- The CLAUDE.md template's "ENGRAM Read Discipline" section (component `engram-read-discipline`, version 4) now describes recall as it works: the auto-surface and `engram_query` are one search with one ranking and both return hints (summaries for the top results, keywords below); only `engram_inspect` returns a node's full record; a query resets the forgetting clock of the nodes it returns, while utility comes from use (inspecting a node, citing it as a premise, or naming its id in a reply). The previous text said deliberate recall "returns full content" and that the auto-surface returns "node IDs and themes". Each claim is bound to the code by `tests/test_read_discipline_claims.py`. An existing install picks the text up through the upgrade skill's template merge step.
 - Internal, no behaviour change: the cascade walk from a retracted or superseded node is one helper,
   `engram_core._walk_cascade_from_root` (with `_walk_cascade_downstream`, moved from `engram_revision`),
   used by all four places that walked it, so a later migration can run the same walk. (#4727)

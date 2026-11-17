@@ -2380,13 +2380,14 @@ _QUERY_FIELDS = frozenset({
 # you want to recall something SPECIFICALLY ("I know I worked on X before — let
 # me actually find it"), not just notice that something might be relevant.
 #
-# Two recall surfaces, by design (Tulving's noetic/autonoetic dissociation):
-#   - engram_surface (noetic)   — "this sounds familiar"; ambient hints, no refresh.
-#   - engram_query   (autonoetic) — "I want to recall this clearly"; full nodes,
-#                                   refreshes recall, strengthens memory.
-#
-# For tracing a specific node's chain after either entry point, use
-# engram_inspect (single node) or engram_get_subgraph (multi-hop).
+# Two entry points onto ONE search (`_search_nodes`: same ranking for both):
+#   - engram_surface — ambient, run by the prompt hook; hints, no refresh.
+#   - engram_query   — the same search on a query the agent chooses; the same
+#                      kind of hint (tiered summaries/keywords, see below), and
+#                      it restamps recall on every node it returns.
+# Neither returns a node's full content. For that, and for tracing a node's
+# chain, use engram_inspect (single node, full record) or engram_get_subgraph
+# (multi-hop, hints).
 #
 # Implementation: combines FTS5 keyword search with semantic (embedding)
 # similarity for comprehensive retrieval. Keyword results appear first; semantic-
