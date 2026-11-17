@@ -38,8 +38,12 @@ Nothing else qualifies. A `direct-by-design` cell with no phase, or with a phase
 outside the set, fails naming the row (`row N: direct-by-design needs a phase
 ...`). The row still tallies under `direct-by-design`.
 
-DIRECT CEILING. Section 1 carries exactly one `- **direct ceiling:** N` line,
-N opening the text after the colon (free text may follow). The plain `direct`
+DIRECT CEILING. Section 1 carries exactly one `- **direct ceiling:** N` line.
+N is read strictly: the text after the colon must OPEN with N in ASCII digits
+(free text may follow, e.g. `18. Only the epic owner raises it`). A line that
+opens with anything else fails even if an integer appears later: `eighteen
+(was 3)` is a parse failure, never a ceiling of 3, so a typo cannot silently
+move the ceiling. A decimal (`3.5`) and a sign (`-3`) also fail. The plain `direct`
 count derived from the rows (`direct-by-design: <phase>` is not `direct`) must
 equal N. A PR that adds a `direct` row and bumps both tallies to match is
 otherwise green, so the ceiling makes every new direct open of the live store a
