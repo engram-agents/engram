@@ -76,6 +76,8 @@ The `nap` mode:
 
 **After calling `engram_checkpoint()`, read the backup verdict.** The checkpoint records it in `compact/last-checkpoint.json` (under `$ENGRAM_HOME`) as `backup_ok`, computed by one helper in the server; read it there and do not re-derive it from the return value (#2680 and #4012 explain why a hand-written copy of that rule drifted). Use the record only if its `checkpoint_at` equals `result["checkpoint_at"]`, the timestamp of the nap header this call just wrote; if it differs or the file is missing, treat the backup verdict as not ok and print the warning, so a failed record write can never surface the previous nap's ✓. Print `✓ backup ok` when `backup_ok` is true. Otherwise print `⚠ backup FAILED: <reason>`, taking the reason from the `error` text in `result["version_control"]["db_backup"]` and `["binary_backup"]` (join both, so a dual failure shows both). Log the line alongside the nap summary so a recurring outage is visible, not buried in the return dict.
 
+**Then read `snapshot_backlog` from the same record** (same `checkpoint_at` match rule; #4843). If its `line` is set, print `⚠ {line}` on its own line, after the backup verdict. A set line means snapshot commits are not reaching git history; `backup_ok` does not cover that.
+
 **Also check the return value for the warm-briefing advisory (#2997):**
 
 ```python

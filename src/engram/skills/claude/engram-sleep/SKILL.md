@@ -509,6 +509,18 @@ Binary copies that git already tracks (`backups/**`, `db-backup/**`, `*.db.*`, `
 
 **Never `git commit --amend`, `git reset`, or `git rebase` inside `${ENGRAM_HOME:-$HOME/.engram}/`** (engram-alpha#4205): the worker pushes each snapshot commit, so a rewrite diverges the remote for good. Make a new commit instead — e.g. the finalized dream record after `engram_advance_turn` is committed as `git commit -m "dream <date>: record finalized"`, never an amend. An installed `reference-transaction` hook refuses a rewrite of a pushed commit.
 
+**Snapshot commit backlog (#4843).** Right after the backup, run the reader (stdlib only; the venv python like the steps above) and put its result in the summary:
+
+```bash
+snap_line=$("$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/engram_snapshot_backlog.py")
+```
+
+```
+- snapshot commits: ${snap_line:-none pending}
+```
+
+Exit 0 means none pending; non-zero means the printed line is the warning. Non-blocking, like the backup.
+
 ### Step 4.6 — Back up main session logs (skip subagents/)
 
 Run the session-log backup tool and **capture the result for the sleep summary**.
