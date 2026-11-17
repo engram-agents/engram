@@ -80,20 +80,20 @@ low wired share is not by itself a defect. Do not phrase any P5 output as
 - **Sample uniformly at random, in Python (not SQL).** SQLite `random()`
   cannot be seeded, so the draw happens in Python. Read the candidate ids with
   the store tool (`store_read.py ids`, read-only, through the engramd owner when
-  that is on), then sample:
+  that is on), then sample. First the ids, into a file (`WINDOW_SINCE` empty =
+  the whole graph):
+  ```bash
+  IDS="$(mktemp)"
+  python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/store_read.py" \
+    ids --since "${WINDOW_SINCE:-}" > "$IDS" || echo "store_read failed with exit $?: NO ids; stop and report its stderr line"
+  ```
+  The tool prints one id per line, already sorted, and names the path it took
+  on stderr (`store_read: path=owner` or `path=direct-ro`). A non-zero exit
+  means NO ids, never an empty population: 1 store unusable, 2 a bad home
+  setting, 3 refused. Then sample in Python from that file:
   ```python
-  import os, random, subprocess, sys
-  # The tool prints one id per line, already sorted. It names the path it took on stderr
-  # (`store_read: path=owner` or `path=direct-ro`). A non-zero exit means NO ids, never an empty
-  # population: stop and report its stderr line (1 store unusable, 2 bad ENGRAM_HOME, 3 refused).
-  home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
-  root = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.join(home, "marketplace", "plugins", "engram")
-  r = subprocess.run([sys.executable, os.path.join(root, "tools", "store_read.py"),
-                      "ids", "--since", window_since or ""],      # null window = full graph
-                     capture_output=True, text=True)
-  if r.returncode != 0:
-      raise SystemExit(f"store_read exit {r.returncode}: {r.stderr.strip()}")
-  ids = r.stdout.splitlines()
+  import random
+  ids = open(IDS_PATH).read().splitlines()   # IDS_PATH: the file written above
   seed = <choose one>
   sample = random.Random(seed).sample(ids, min(400, len(ids)))
   ```
