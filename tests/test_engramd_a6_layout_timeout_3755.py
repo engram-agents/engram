@@ -589,3 +589,32 @@ def test_alive_reads_a_process_that_exits_between_open_and_read_as_gone(monkeypa
 
     monkeypatch.setattr(builtins, "open", fake_open)
     assert _alive(424242) is False
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self"), reason="the /proc branch of _alive (Linux)")
+def test_alive_does_not_read_a_permission_error_as_gone(monkeypatch):
+    """#4865 bound: only an exited process reads as gone. A PermissionError on the /proc read
+    must propagate; a broad `except OSError` would report a live, unreadable survivor as gone
+    and let the timeout cell pass on a real leak."""
+    import builtins
+
+    real_open = builtins.open
+
+    class _Denied:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, *a):
+            raise PermissionError(13, "Permission denied")
+
+    def fake_open(path, *a, **k):
+        if str(path).startswith("/proc/") and str(path).endswith("/stat"):
+            return _Denied()
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    with pytest.raises(PermissionError):
+        _alive(424242)
