@@ -85,15 +85,19 @@ low wired share is not by itself a defect. Do not phrase any P5 output as
   ```bash
   IDS="$(mktemp)"
   python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/store_read.py" \
-    ids --since "${WINDOW_SINCE:-}" > "$IDS" || echo "store_read failed with exit $?: NO ids; stop and report its stderr line"
+    ids --since "${WINDOW_SINCE:-}" > "$IDS" \
+    || { echo "store_read failed with exit $?: NO ids; stop and report its stderr line"; exit 1; }
+  echo "ids file: $IDS ($(wc -l < "$IDS") ids)"
   ```
   The tool prints one id per line, already sorted, and names the path it took
   on stderr (`store_read: path=owner` or `path=direct-ro`). A non-zero exit
   means NO ids, never an empty population: 1 store unusable, 2 a bad home
-  setting, 3 refused. Then sample in Python from that file:
+  setting, 3 refused; the block stops there and no sample is drawn. Then
+  sample in Python from that file:
   ```python
   import random
-  ids = open(IDS_PATH).read().splitlines()   # IDS_PATH: the file written above
+  IDS_PATH = "<the path the block above printed after 'ids file:'>"
+  ids = open(IDS_PATH).read().splitlines()
   seed = <choose one>
   sample = random.Random(seed).sample(ids, min(400, len(ids)))
   ```
