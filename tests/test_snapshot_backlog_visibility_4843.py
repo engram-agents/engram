@@ -481,3 +481,113 @@ def test_v9d_nap_record_both_sides_of_the_threshold(monkeypatch):
         rec = _record(d)
         assert rec["snapshot_backlog"]["status"] == "backlog" and LINE_RE.match(rec["snapshot_backlog"]["line"])
         assert rec["backup_ok"] is True
+
+
+# ── Colleague review folds (Sol, PR comment 6952630402) ────────────────────
+def _deep_json_line(depth=200_000):
+    return "[" * depth + "]" * depth
+
+
+def test_v5e_a_line_that_makes_the_parser_raise_is_unreadable_not_a_crash(tmp_path):
+    """Sol F1(a): RecursionError (deeply nested JSON) is not an OSError/UnicodeDecodeError/
+    JSONDecodeError; read_backlog must still return, as unreadable."""
+    bl = _bl()
+    _write_queue(tmp_path, [_job(1, 1, time.time() - 5000)], raw_lines=[_deep_json_line()])
+    r = bl.read_backlog(str(tmp_path))
+    assert r["status"] == "unreadable" and r["line"].startswith(UNREADABLE_PREFIX), r
+
+
+def test_v6c_cli_on_a_parser_crashing_queue_exits_2_with_the_line(tmp_path):
+    _write_queue(tmp_path, [_job(1, 1, time.time() - 5000)], raw_lines=[_deep_json_line()])
+    r = _cli(tmp_path)
+    assert r.returncode == 2 and r.stdout.strip().startswith(UNREADABLE_PREFIX), r
+
+
+def test_v6d_cli_main_turns_any_exception_into_exit_2(tmp_path, monkeypatch):
+    """Sol F1(b): whatever read_backlog raises, main() prints the unreadable line and
+    returns 2, never 1 (the backlog code) and never an empty stdout."""
+    bl = _bl()
+
+    def boom(*a, **k):
+        raise RuntimeError("reader exploded")
+
+    monkeypatch.setattr(bl, "read_backlog", boom)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = bl.main([str(tmp_path)])
+    assert rc == 2 and buf.getvalue().strip().startswith(UNREADABLE_PREFIX), (rc, buf.getvalue())
+    assert "RuntimeError" in buf.getvalue()
+
+
+@pytest.mark.parametrize("ts", [None, "yesterday"])
+def test_v3e_pending_job_without_a_numeric_ts_is_unreadable(tmp_path, ts):
+    """Sol F3: a pending job whose age cannot be read must not let the status read ok."""
+    bl = _bl()
+    job = _job(1, 1, 0)
+    if ts is None:
+        del job["ts"]
+    else:
+        job["ts"] = ts
+    _write_queue(tmp_path, [job])
+    r = bl.read_backlog(str(tmp_path))
+    assert r["status"] == "unreadable" and r["line"].startswith(UNREADABLE_PREFIX), r
+    assert "timestamp" in r["line"]
+
+
+@pytest.mark.usefixtures("isolate_hook_loads")
+def test_v7e_session_start_survives_a_reader_that_raises(tmp_path):
+    """Sol F2: pins the guard in _check_snapshot_backlog. A reader that raises must give the
+    unreadable line inside a normal SessionStart context, never an empty hook output."""
+    home = tmp_path / "engram"
+    (home / "sessions").mkdir(parents=True)
+    mod = _load_hook(home)
+
+    def boom(*a, **k):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    mod._read_snapshot_backlog = boom
+    client = MagicMock()
+    client.call.side_effect = lambda *a, **k: {}
+    buf = io.StringIO()
+    payload = json.dumps({"session_id": "v7e-4843", "transcript_path": str(tmp_path / "t.jsonl"),
+                          "source": "startup"})
+    with patch.dict("sys.modules", {"engram_client": MagicMock(EngramClient=MagicMock(return_value=client))}):
+        with patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(payload.encode()))):
+            with contextlib.redirect_stdout(buf):
+                mod.main()
+    ctx = json.loads(buf.getvalue().strip())["hookSpecificOutput"]["additionalContext"]
+    assert UNREADABLE_PREFIX in ctx and "RecursionError" in ctx
+
+
+def _sleep_snippet() -> str:
+    text = (_SRC / "skills" / "claude" / "engram-sleep" / "SKILL.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"```bash\n(.*?)```", text, re.S)
+    hits = [b for b in blocks if "engram_snapshot_backlog.py" in b]
+    assert len(hits) == 1, f"expected one bash block running the reader, found {len(hits)}"
+    return hits[0]
+
+
+@pytest.mark.parametrize("rc,out,expect", [
+    (0, "", "none pending"),
+    (1, "Snapshot commits: 2 job(s) pending, oldest 900s old, 10 bytes held; git history is not advancing",
+     "Snapshot commits: 2 job(s) pending"),
+    (2, "Snapshot commits: queue could not be read (OSError: x)", "Snapshot commits: queue could not be read"),
+    (1, "", "unknown"),
+    (3, "", "unknown"),
+])
+def test_v10c_sleep_snippet_never_reads_a_failed_run_as_none_pending(tmp_path, rc, out, expect):
+    """Sol F1(c): the sleep skill's snippet, EXECUTED, with a stub reader. An empty line with a
+    non-zero exit (a crashed reader) must read as unknown, never as 'none pending'."""
+    root = tmp_path / "plugin"
+    root.mkdir()
+    (root / "engram_snapshot_backlog.py").write_text(
+        f"import sys\nprint({out!r}) if {out!r} else None\nsys.exit({rc})\n")
+    home = tmp_path / "home"
+    (home / ".engram" / "venv" / "bin").mkdir(parents=True)
+    (home / ".engram" / "venv" / "bin" / "python3").symlink_to(sys.executable)
+    script = _sleep_snippet() + '\nprintf "%s" "$snap_status"\n'
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                       env={"HOME": str(home), "CLAUDE_PLUGIN_ROOT": str(root), "PATH": os.environ["PATH"]})
+    assert expect in r.stdout, (r.stdout, r.stderr)
+    if expect != "none pending":
+        assert "none pending" not in r.stdout
