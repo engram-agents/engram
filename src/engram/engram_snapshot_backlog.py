@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -66,8 +67,20 @@ def read_backlog(engram_home, now: Optional[float] = None,
     pending_dir = Path(engram_home) / "db-backup" / ".pending"
     queue = pending_dir / "queue.jsonl"
     try:
-        if not queue.exists():
+        # lstat first: opening a FIFO for read blocks forever, and a symlink, socket or
+        # device is not the regular file the worker writes. Never open anything else.
+        try:
+            st = os.lstat(queue)
+        except (FileNotFoundError, NotADirectoryError):
             return _result("ok")
+        if not stat.S_ISREG(st.st_mode):
+            kind = ("directory" if stat.S_ISDIR(st.st_mode) else
+                    "symlink" if stat.S_ISLNK(st.st_mode) else
+                    "FIFO" if stat.S_ISFIFO(st.st_mode) else
+                    "socket" if stat.S_ISSOCK(st.st_mode) else
+                    "device" if (stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode)) else
+                    "non-regular file")
+            return _unreadable(OSError(f"queue is a {kind}, not a regular file"))
         text = queue.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return _unreadable(exc)
@@ -103,7 +116,12 @@ def read_backlog(engram_home, now: Optional[float] = None,
             age = now - ts
             oldest = age if oldest is None else max(oldest, age)
         name = j.get("snapshot") or f"snapshot-{j.get('turn')}-{j.get('seq')}.db"
-        snap = pending_dir / str(name)
+        # Confine to the pending dir: only the final path component of the name counts;
+        # an empty, "." or ".." name counts 0 bytes.
+        base = Path(str(name)).name
+        if base in ("", ".", ".."):
+            continue
+        snap = pending_dir / base
         nbytes += (_size(snap) + _size(snap.with_name(snap.name + "-wal"))
                    + _size(snap.with_name(snap.name + "-shm")))
 

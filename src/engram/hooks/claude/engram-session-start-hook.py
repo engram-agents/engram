@@ -4173,9 +4173,14 @@ def _main_impl() -> None:
             _health_lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
         if backlog_status != "ok":
             _health_lines.append(f"  {backlog_line}")
-            _health_lines.append(
-                "  → The snapshot worker cannot commit; its reason is in the server log "
-                "([engram snapshot-worker] lines).")
+            if backlog_status == "unreadable":
+                _health_lines.append(
+                    "  → The pending-commit queue could not be checked; whether commits "
+                    "are landing is unknown.")
+            else:
+                _health_lines.append(
+                    "  → The snapshot worker cannot commit; its reason is in the server log "
+                    "([engram snapshot-worker] lines).")
         if viz_down:
             _health_lines.append(f"  Viz server: DOWN ({viz_reason})")
             _health_lines.append("  → Tell the user; the health dashboard is unreachable.")

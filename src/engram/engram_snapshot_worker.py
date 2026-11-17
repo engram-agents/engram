@@ -494,7 +494,13 @@ def _process_job(job: dict) -> bool:
                 _log(f"could not unlink {p.name}: {e}")
         return True
     except Exception as e:
-        _log(f"job turn={turn},seq={seq} raised, leaving pending: {e}")
+        # Same log-once-per-(job, reason) rule as the commit-failure path (#4843).
+        first = (str(e).split("\n", 1) or [""])[0]
+        reason = f"raised: {type(e).__name__}: {first}"
+        key = (turn, seq, reason)
+        if key not in _logged_failures:
+            _logged_failures.add(key)
+            _log(f"job turn={turn},seq={seq} {reason} — leaving job pending")
         return False
 
 
