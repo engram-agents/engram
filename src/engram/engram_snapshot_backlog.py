@@ -84,7 +84,13 @@ def read_backlog(engram_home, now: Optional[float] = None,
         text = queue.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return _unreadable(exc)
+    try:
+        return _scan(text, pending_dir, now, threshold)
+    except Exception as exc:  # total: a crash here must read as unreadable, never as ok or a traceback
+        return _unreadable(exc)
 
+
+def _scan(text: str, pending_dir: Path, now: Optional[float], threshold: float) -> dict:
     done: set = set()
     jobs: list = []
     for raw in text.splitlines():
@@ -112,9 +118,13 @@ def read_backlog(engram_home, now: Optional[float] = None,
     nbytes = 0
     for j in pending:
         ts = j.get("ts")
-        if isinstance(ts, (int, float)):
-            age = now - ts
-            oldest = age if oldest is None else max(oldest, age)
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            # A pending job whose age cannot be read must not let the status read ok.
+            return _result("unreadable", line=_clip(
+                f"{_UNREADABLE_PREFIX}pending job turn={j.get('turn')},seq={j.get('seq')} "
+                "has no readable timestamp)"))
+        age = now - ts
+        oldest = age if oldest is None else max(oldest, age)
         name = j.get("snapshot") or f"snapshot-{j.get('turn')}-{j.get('seq')}.db"
         # Confine to the pending dir: only the final path component of the name counts;
         # an empty, "." or ".." name counts 0 bytes.
@@ -146,7 +156,11 @@ def main(argv: Optional[list] = None) -> int:
         except ValueError as exc:
             print(_clip(f"{_UNREADABLE_PREFIX}{type(exc).__name__}: {exc})"))
             return 2
-    r = read_backlog(home)
+    try:
+        r = read_backlog(home)
+    except Exception as exc:
+        print(_clip(f"{_UNREADABLE_PREFIX}{type(exc).__name__}: {exc})"))
+        return 2
     if r["line"] is not None:
         print(r["line"])
     return {"ok": 0, "backlog": 1}.get(r["status"], 2)
