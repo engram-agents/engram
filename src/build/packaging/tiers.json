@@ -545,6 +545,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/store_read.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/install.sh",
       "tier": "essential"
     },

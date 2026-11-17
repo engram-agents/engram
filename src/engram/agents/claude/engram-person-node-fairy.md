@@ -79,15 +79,18 @@ low wired share is not by itself a defect. Do not phrase any P5 output as
 
 - **Sample uniformly at random, in Python (not SQL).** SQLite `random()`
   cannot be seeded, so the draw happens in Python. Read the candidate ids with
-  a read-only sqlite3 connection, sort them for stability, then sample:
+  the store tool (`store_read.py ids`, read-only, through the engramd owner when
+  that is on), then sample:
   ```python
-  import pathlib, random, sqlite3
-  # as_uri() percent-encodes ?, # and spaces; a raw "file:" string loses mode=ro on such a path (#3514)
-  con = sqlite3.connect(pathlib.Path("<db path>").absolute().as_uri() + "?mode=ro", uri=True)
-  ids = sorted(r[0] for r in con.execute(
-      "SELECT id FROM nodes WHERE is_current = 1 AND status != 'retracted' "
-      "AND type IN ('observation_factual', 'observation_predictive')"
-      "  AND created_at >= ?", (window_since or "",)))   # null window = full graph
+  import os, random, subprocess, sys
+  # The tool prints one id per line, already sorted. It names the path it took on stderr
+  # (`store_read: path=owner` or `path=direct-ro`); a non-zero exit (check=True raises) means no ids.
+  home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+  root = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.join(home, "marketplace", "plugins", "engram")
+  out = subprocess.run([sys.executable, os.path.join(root, "tools", "store_read.py"),
+                        "ids", "--since", window_since or ""],      # null window = full graph
+                       check=True, capture_output=True, text=True).stdout
+  ids = out.splitlines()
   seed = <choose one>
   sample = random.Random(seed).sample(ids, min(400, len(ids)))
   ```
