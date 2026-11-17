@@ -141,7 +141,7 @@ TARGET_LINE = re.compile(r"^\s*-\s+\*\*target:\*\*(.*)$")
 UNIT_LINE = re.compile(r"^\s*-\s+\*\*unit:\*\*(.*)$")
 UNIT_CALLS = re.compile(r"the\s+(\d+)\s+`call`\s+rows\s+are\s+(\d+)\s+lines")
 CEILING_LINE = re.compile(r"^\s*-\s+\*\*direct ceiling:\*\*(.*)$")
-CEILING_VALUE = re.compile(r"^\s*(\d+)(?!\d|[.,]\d)")
+CEILING_VALUE = re.compile(r"^\s*([0-9]+)(?![0-9]|[.,][0-9])")
 SECTION2 = re.compile(r"^##\s+2\.")
 ANY_SECTION = re.compile(r"^##\s")
 

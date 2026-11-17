@@ -1080,7 +1080,7 @@ def test_dc5_ceiling_line_twice_fails_loudly(tmp_path):
 
 
 def test_dc6_ceiling_without_a_number_fails_loudly(tmp_path):
-    for i, value in enumerate(("eighteen", "eighteen (was 3)", "", "3.5", "-3")):
+    for i, value in enumerate(("eighteen", "eighteen (was 3)", "", "3.5", "-3", "٣")):
         r = _run3(tmp_path / str(i), ["direct"] * 3,
                   ceiling_line=f"- **direct ceiling:** {value}\n")
         assert r.returncode == 1, value
