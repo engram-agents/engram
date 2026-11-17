@@ -396,3 +396,45 @@ def test_v10_nap_and_sleep_skills_read_the_backlog():
     sleep = (_SRC / "skills" / "claude" / "engram-sleep" / "SKILL.md").read_text(encoding="utf-8")
     assert "engram_snapshot_backlog.py" in sleep, "sleep Phase A must run the backlog reader"
     assert "snapshot commits:" in sleep
+
+
+# ── Review folds (Halley's review of 641d78a6) ─────────────────────────────
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
+def test_v5d_queue_that_is_a_fifo_is_unreadable_and_does_not_block(tmp_path):
+    """SessionStart runs this reader; a FIFO at the queue path must not hang it."""
+    import threading
+    bl = _bl()
+    d = _pending_dir(tmp_path)
+    d.mkdir(parents=True)
+    os.mkfifo(d / "queue.jsonl")
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", bl.read_backlog(str(tmp_path))), daemon=True)
+    t.start()
+    t.join(5)
+    if t.is_alive():
+        # unblock the reader so the thread can exit, then fail
+        fd = os.open(d / "queue.jsonl", os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        t.join(5)
+        pytest.fail("read_backlog blocked on a FIFO at the queue path")
+    assert out["r"]["status"] == "unreadable" and out["r"]["line"].startswith(UNREADABLE_PREFIX)
+
+
+def test_v3d_snapshot_name_is_confined_to_the_pending_dir(tmp_path):
+    bl = _bl()
+    now = 2_000_000.0
+    _write_queue(tmp_path, [_job(1, 1, now - 900, snapshot="../outside.db")])
+    (tmp_path / "db-backup" / "outside.db").write_bytes(b"x" * 999)
+    r = bl.read_backlog(str(tmp_path), now=now)
+    assert r["status"] == "backlog" and r["bytes"] == 0, "a name may not reach outside .pending"
+
+
+@pytest.mark.usefixtures("isolate_hook_loads")
+def test_v7d_unreadable_queue_arrow_does_not_claim_a_commit_failure(tmp_path):
+    home = tmp_path / "engram"
+    (home / "sessions").mkdir(parents=True)
+    (_pending_dir(home) / "queue.jsonl").mkdir(parents=True)
+    ctx = _hook_context(tmp_path, home)
+    i = ctx.index(UNREADABLE_PREFIX)
+    following = ctx[i:].splitlines()[1]
+    assert "cannot commit" not in following, following

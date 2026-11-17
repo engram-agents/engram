@@ -307,3 +307,20 @@ def test_c9_add_failed_shape_is_visible_to_the_backlog_reader(store):
     r = bl.read_backlog(str(d), now=time.time() + bl.BACKLOG_THRESHOLD_SECS + 1)
     assert r["status"] == "backlog" and r["pending"] == 1, r
     assert r["bytes"] == snap.stat().st_size
+
+
+# ── Review fold (Halley's review of 641d78a6) ──────────────────────────────
+def test_c10_an_exception_is_logged_once_per_job_too(store, monkeypatch):
+    """Kepler's rule is one line per job per failure reason, not per drain; a job whose
+    processing raises is retried every wake like any other pending job."""
+    server, d = store
+    wk, job, snap = _make_job(server)
+
+    def boom(_):
+        raise RuntimeError("regen exploded")
+
+    monkeypatch.setattr(wk, "_regenerate_derived_files", boom)
+    lines = _drain(wk) + _drain(wk) + _drain(wk)
+    hits = [l for l in lines if "regen exploded" in l]
+    assert len(hits) == 1, lines
+    assert snap.exists() and len(wk._pending_jobs()) == 1
