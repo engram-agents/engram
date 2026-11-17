@@ -264,6 +264,8 @@ def test_secret_only_in_merge_resolution_refuses_and_names_the_merge(amended):
     r = run(h, "--repair")
     assert r.returncode == 2
     assert merge in r.stdout + r.stderr
+    # `-m` prints the merge's diff once per parent; the per-commit dedupe must list the merge once.
+    assert (r.stdout + r.stderr).count(f"commit {merge}") == 1
     assert git(bare, "rev-parse", "master") == before
 
 
