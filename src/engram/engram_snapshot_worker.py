@@ -438,10 +438,15 @@ def _is_benign_no_commit(reason: str) -> bool:
         "all stageable files are gitignored",
     ):
         return True
-    # S1 no repository. Read from git 2.43.0: `git add` in a directory that is not a
-    # repository prints `fatal: not a git repository (or any of the parent directories): .git`.
+    # S1 no repository. Two conditions, both required. (a) Read from git 2.43.0: `git add`
+    # in a directory that is not a repository prints `fatal: not a git repository (or any of
+    # the parent directories): .git`. (b) DATA_DIR/.git does not exist (os.path.lexists, so a
+    # broken symlink counts as existing). A DAMAGED repository (garbage, empty or missing
+    # .git/HEAD; missing .git/objects) prints the same text, and it can be repaired, so its
+    # job must stay pending rather than be retired.
     if reason.startswith("git add failed: fatal: not a git repository"):
-        return True
+        import engram_core  # lazy
+        return not os.path.lexists(engram_core.DATA_DIR / ".git")
     # S2 no git binary. Read from engram_core._git, which turns the FileNotFoundError into
     # stderr = str(e); for a missing executable that is `[Errno 2] No such file or
     # directory: '<GIT_EXE>'`. It must name the git executable itself: a
