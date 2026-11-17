@@ -438,3 +438,21 @@ def test_v7d_unreadable_queue_arrow_does_not_claim_a_commit_failure(tmp_path):
     i = ctx.index(UNREADABLE_PREFIX)
     following = ctx[i:].splitlines()[1]
     assert "cannot commit" not in following, following
+
+
+def test_v6b_cli_default_home_goes_through_the_resolver(tmp_path):
+    """No argument: the home comes from engram_home_resolver.engram_home() (the raw-home
+    gate). A relative ENGRAM_HOME is refused there; the CLI reports it as unreadable
+    (exit 2), never as a backlog (1) and never as healthy (0)."""
+    env = dict(os.environ, ENGRAM_HOME="relative/home")
+    r = subprocess.run([sys.executable, str(_MODULE_PATH)], capture_output=True, text=True,
+                       timeout=60, env=env, cwd=str(tmp_path))
+    assert r.returncode == 2, r
+    assert r.stdout.strip().startswith(UNREADABLE_PREFIX) and "ValueError" in r.stdout, r
+
+    home = tmp_path / "abs-home"
+    _write_queue(home, [_job(1, 1, time.time() - 5000)])
+    env = dict(os.environ, ENGRAM_HOME=str(home))
+    r = subprocess.run([sys.executable, str(_MODULE_PATH)], capture_output=True, text=True,
+                       timeout=60, env=env)
+    assert r.returncode == 1 and LINE_RE.match(r.stdout.strip()), r
