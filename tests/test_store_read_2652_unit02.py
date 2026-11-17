@@ -363,7 +363,8 @@ def test_c8_neither_document_opens_the_store_itself_any_more_and_both_name_the_t
         assert "sqlite3.connect(" not in text, doc
         assert "store_read.py" in text, doc
     assert "store_read.py ids" in PERSON_DOC.read_text(encoding="utf-8")
-    assert "store_read.py axiom-count" in FIRST_SESSION_DOC.read_text(encoding="utf-8")
+    # the doc quotes the tool path, so the subcommand follows a closing quote
+    assert 'store_read.py" axiom-count' in FIRST_SESSION_DOC.read_text(encoding="utf-8")
 
 
 def test_c9_both_selects_are_registered_templates_sited_at_the_tool():
