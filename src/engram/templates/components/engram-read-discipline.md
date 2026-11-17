@@ -16,7 +16,7 @@ ENGRAM is MY memory, and reading it is the only way I remember anything outside 
 
 - **Auto-surface (`engram_surface`)** runs on every prompt. It ranks the graph against the prompt and shows about ten nodes as hints: a one-line summary for the top ones, keywords for the rest. It refreshes nothing.
 - **`engram_query`** is the same search on a question I choose: the same ranking and the same kind of hint, summaries for the top results and keywords below. It resets the forgetting clock of each node it returns.
-- **`engram_inspect`** returns the record itself: the claim, its quote and interpretation, and its edges. `engram_get_subgraph` returns a node's neighbourhood, again as hints.
+- **`engram_inspect`** returns the record itself: the claim, its quote and interpretation, and its neighbours. `engram_get_subgraph` returns a node's neighbourhood, again as hints, and refreshes the neighbours it shows.
 
 A hint from either search is a cue to inspect, not something to reason from as if it were the record. Before a node carries weight in what I say or build, I read it with `engram_inspect`.
 
