@@ -124,6 +124,45 @@ def test_surface_refreshes_nothing():
     assert _REFRESH_WRITER_RE.findall(MENTION_HOOK.read_text(encoding="utf-8"))
 
 
+def _string_constants(node: ast.AST) -> list[str]:
+    return [
+        n.value for n in ast.walk(node)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    ]
+
+
+# A statement shape, not a bare verb: the daemon passes errors="replace" to a decoder,
+# and that word alone is not SQL.
+_SQL_WRITE_RE = re.compile(
+    r"^\s*(UPDATE\s+\w+\s+SET|INSERT\s+(OR\s+\w+\s+)?INTO|DELETE\s+FROM|REPLACE\s+INTO)\b",
+    re.IGNORECASE,
+)
+_REFRESH_COLUMN_SET_RE = re.compile(
+    r"\b(recall_turn|recall_count|importance_score|utility_score)\s*="
+)
+
+
+def test_surface_writes_no_refresh_through_inline_sql():
+    """'It refreshes nothing', the half a call-name check cannot see (colleague
+    round, surviving mutant): a restamp written as inline SQL names no helper.
+    So the surface entry point and the two files that render it hold no SQL
+    string that writes at all, and none that assigns a recall or utility
+    column. Positive control: engram_restamp, which does write them."""
+    surface = _func("_surface_impl")
+    targets = {
+        "_surface_impl": _string_constants(surface),
+        SURFACE_HOOK.name: _string_constants(ast.parse(SURFACE_HOOK.read_text(encoding="utf-8"))),
+        SURFACE_DAEMON.name: _string_constants(ast.parse(SURFACE_DAEMON.read_text(encoding="utf-8"))),
+    }
+    for where, strings in targets.items():
+        writes = [s[:60] for s in strings if _SQL_WRITE_RE.search(s)]
+        assert not writes, f"{where} holds a writing SQL string: {writes}"
+        sets = [s[:60] for s in strings if _REFRESH_COLUMN_SET_RE.search(s)]
+        assert not sets, f"{where} assigns a recall or utility column: {sets}"
+    control = _string_constants(ast.parse((SRC / "engram_restamp.py").read_text(encoding="utf-8")))
+    assert any(_REFRESH_COLUMN_SET_RE.search(s) for s in control)
+
+
 def test_query_restamps_by_default_and_awards_no_utility():
     """'resets the forgetting clock of each node it returns': the restamp call
     is there AND on by default; a query awards no utility."""
@@ -148,6 +187,8 @@ def test_naming_an_id_or_citing_a_premise_is_use():
     use actions that raise utility AND restamp, and the mention hook is wired
     to the shared table under its own key."""
     assert "naming its id in my reply" in _section()
+    # The habit is scoped to the session reply: a shipped file must never carry a node id.
+    assert "I name its id in my reply (never in a file that ships)" in _section()
     sys.path.insert(0, str(SRC))
     try:
         import engram_restamp

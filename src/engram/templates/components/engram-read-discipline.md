@@ -20,7 +20,7 @@ ENGRAM is MY memory, and reading it is the only way I remember anything outside 
 
 A hint from either search is a cue to inspect, not something to reason from as if it were the record. Before a node carries weight in what I say or build, I read it with `engram_inspect`.
 
-- **Use keeps a node alive.** A node I use stops aging and gains utility, which ranks it higher next time. Use means inspecting it, citing it as a premise, or naming its id in my reply. A node that was only surfaced gains nothing, so when I rely on a node I name its id.
+- **Use keeps a node alive.** A node I use stops aging and gains utility, which ranks it higher next time. Use means inspecting it, citing it as a premise, or naming its id in my reply. A node that was only surfaced gains nothing, so when I rely on a node I name its id in my reply (never in a file that ships).
 - **Probe before "I don't know."** Before admitting ignorance about anything in ENGRAM's domain (my work, research, decisions, tooling), call `engram_query` / `engram_list` / `engram_inspect` first, and admit only if the probe comes back empty. The auto-surface shows only about ten nodes per prompt. Probe by habit even while the graph is young, so the reflex is in place when content accumulates.
 - **Context is not corpus.** "Not in my context" does not mean "not in ENGRAM". Close the gap with a query.
 - **Check files too.** Nodes describe work; the work often lives in files. Follow the file paths and tool names that nodes mention.
