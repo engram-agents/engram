@@ -80,11 +80,13 @@ low wired share is not by itself a defect. Do not phrase any P5 output as
 - **Sample uniformly at random, in Python (not SQL).** SQLite `random()`
   cannot be seeded, so the draw happens in Python. Read the candidate ids with
   the store tool (`store_read.py ids`, read-only, through the engramd owner when
-  that is on), then sample. First the ids, into a file (`WINDOW_SINCE` empty =
-  the whole graph):
+  that is on), then sample. First the ids, into a file. Set `WINDOW_SINCE` to the
+  parent-injected `window_since` (or leave it empty for the whole graph, and say so
+  in the report, since an empty value is not an error); the venv interpreter, never a bare
+  `python3` (on a Mac that is 3.9, too old for the owner client):
   ```bash
   IDS="$(mktemp)"
-  python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/store_read.py" \
+  "$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/store_read.py" \
     ids --since "${WINDOW_SINCE:-}" > "$IDS" \
     || { echo "store_read failed with exit $?: NO ids; stop and report its stderr line"; exit 1; }
   echo "ids file: $IDS ($(wc -l < "$IDS") ids)"
