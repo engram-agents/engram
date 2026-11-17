@@ -85,7 +85,8 @@ class OwnerFlagOff(RouteError):
 
 class OwnerUnavailable(RouteError):
     """Every other owner-route failure. `.reason` is the owner's reason, or "down" / "indeterminate" / "malformed" ("down" also
-    stands for an owner answer that carried no reason: nothing here distinguishes the two); `.commit` is
+    stands for an owner answer that carried no reason: nothing here distinguishes the two). "path_too_long" (#4868) is the
+    client's own code for a socket path it cannot address: nothing was sent, so `.commit` is None; `.commit` is
     None, "indeterminate" or "committed_unverified"; `.request_id` is the id the batch was sent with (None only when `open_route`'s
     ping failed). The message is built from `_owner_read`'s own, which `owner_read.ping` and `owner_read.write` raise as this
     class (it is the spec's `error_cls`), so a bare `OwnerUnavailable(message)` is valid."""

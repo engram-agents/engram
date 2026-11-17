@@ -19,6 +19,7 @@ Contract (each cell written before the change):
   K4  _owner_read.write: path_too_long says nothing was written (not INDETERMINATE), names the code, and tags
       owner_reason="path_too_long", owner_commit=None
   K4b _owner_read.snapshot: path_too_long says nothing was archived (not INDETERMINATE) and names the code
+  K4c the embedding-repair route types that write failure as OwnerUnavailable(reason="path_too_long", commit=None)
   K5  a DEAD owner (a stale socket file, a pidfile naming a dead pid) over an UNCHECKPOINTED WAL: the ping is
       `down`, and the direct `mode=ro` read of each caller sees the rows committed only in the WAL
 """
@@ -323,6 +324,20 @@ def test_k4b_snapshot_path_too_long_reached_nothing(monkeypatch, tmp_path):
     msg = str(e.value)
     assert "path_too_long" in msg and "nothing was archived" in msg, msg
     assert "INDETERMINATE" not in msg, msg
+
+
+def test_k4c_the_repair_route_types_a_path_too_long_write_as_nothing_written(monkeypatch, tmp_path):
+    # Loaded by path, as its own cells do; registered first, since its dataclasses look their module up.
+    spec = importlib.util.spec_from_file_location("embedding_repair_route_4868", str(SRC / "tools" / "_embedding_repair_route.py"))
+    route = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, route)
+    spec.loader.exec_module(route)
+    monkeypatch.setattr(ec, "write", lambda *a, **k: _un("path_too_long"))
+    with pytest.raises(route.OwnerUnavailable) as e:
+        owner_read.write(route._spec(tmp_path), route.OP, {}, request_id="r")
+    typed = route._from_owner(e.value, "r")
+    assert isinstance(typed, route.OwnerUnavailable), typed
+    assert (typed.reason, typed.commit, typed.request_id) == ("path_too_long", None, "r")
 
 
 # ------------------------------------------------------------------------------------------ K5: dead owner, WAL
