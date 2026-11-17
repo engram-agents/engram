@@ -169,7 +169,7 @@ def _alive(pid: int) -> bool:
         try:
             with open(f"/proc/{pid}/stat") as f:
                 return f.read().rsplit(")", 1)[1].split()[0] != "Z"
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return False
     out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return bool(out) and not out.startswith("Z")
