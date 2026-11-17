@@ -297,6 +297,16 @@ def _write_last_checkpoint_record(checkpoint_at: str, session_id, version_contro
     checkpoint's result untouched and costs one stderr line (the reader then finds no record and refuses).
     """
     try:
+        # #4843: the backlog verdict rides beside backup_ok, never inside it.
+        try:
+            import engram_snapshot_backlog
+            _bl = engram_snapshot_backlog.read_backlog(core.DATA_DIR)
+            snapshot_backlog = {"status": _bl["status"], "line": _bl["line"]}
+        except Exception as bl_exc:  # noqa: BLE001
+            snapshot_backlog = {
+                "status": "unreadable",
+                "line": f"Snapshot commits: queue could not be read ({type(bl_exc).__name__}: {bl_exc})"[:300],
+            }
         directory = core.DATA_DIR / "compact"
         directory.mkdir(parents=True, exist_ok=True)
         engram_config_io.write_config_json(
@@ -305,6 +315,7 @@ def _write_last_checkpoint_record(checkpoint_at: str, session_id, version_contro
                 "checkpoint_at": checkpoint_at,
                 "session_id": session_id if isinstance(session_id, str) else None,
                 "backup_ok": _backup_ok(version_control),
+                "snapshot_backlog": snapshot_backlog,
             },
         )
     except Exception as exc:  # noqa: BLE001 - never fails the checkpoint

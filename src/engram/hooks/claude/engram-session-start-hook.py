@@ -496,6 +496,19 @@ except Exception:
     def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
         return False
 
+# #4843: own resolver call for engram_snapshot_backlog.py (gh#2570: one call per module
+# imported; never a fixed parents[N] path -- the plugin build flattens hooks/claude/* to
+# hooks/*). An import failure is kept and reported as an "unreadable" line, never silent.
+_BACKLOG_IMPORT_ERROR = None
+try:
+    _BACKLOG_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_snapshot_backlog.py")
+    if _BACKLOG_RUNTIME_DIR not in sys.path:
+        sys.path.insert(0, _BACKLOG_RUNTIME_DIR)
+    from engram_snapshot_backlog import read_backlog as _read_snapshot_backlog
+except Exception as _backlog_exc:  # noqa: BLE001
+    _read_snapshot_backlog = None
+    _BACKLOG_IMPORT_ERROR = _backlog_exc
+
 # alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
 # manifest_id) for engram.telemetry.reached -- see main()'s first line.
 _MAIN_MANIFEST_ID = "hooks/claude/engram-session-start-hook.py:main"
@@ -836,6 +849,26 @@ def _config_missing_health_line(engram_home: str):
     except OSError:
         pass
     return None
+
+
+def _check_snapshot_backlog(engram_home: str) -> tuple[str, str | None]:
+    """#4843: (status, line) for the snapshot worker's pending queue.
+
+    status is "ok" | "backlog" | "unreadable". An unavailable reader or any exception
+    is "unreadable" with its class named: a failed read is never reported as healthy.
+    """
+    if _read_snapshot_backlog is None:
+        _cls = type(_BACKLOG_IMPORT_ERROR).__name__
+        return "unreadable", (
+            "Snapshot commits: queue could not be read "
+            f"(reader unavailable: {_cls})")
+    try:
+        _r = _read_snapshot_backlog(engram_home)
+        return _r["status"], _r["line"]
+    except Exception as _exc:  # noqa: BLE001
+        return "unreadable", (
+            "Snapshot commits: queue could not be read "
+            f"({type(_exc).__name__}: {_exc})")[:300]
 
 
 def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
@@ -4091,6 +4124,7 @@ def _main_impl() -> None:
     global _OWNER_RUN
     _OWNER_RUN = _fresh_owner_run(_owner_reads_enabled())
     stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
+    backlog_status, backlog_line = _check_snapshot_backlog(ENGRAM_HOME)  # #4843
     viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
     embed_restore_ok, embed_restore_reason = _check_embedding_restore_flag(ENGRAM_HOME)
     if embed_restore_ok is None:
@@ -4127,7 +4161,7 @@ def _main_impl() -> None:
     # (a local list instead of a direct `lines.append`).
     _health_lines: list[str] = []
     if (
-        mcp_offline or not stale_ok or viz_down
+        mcp_offline or not stale_ok or backlog_status != "ok" or viz_down
         or viz_inconclusive or embed_restore_ok is False or json1_missing
     ):
         _health_lines.append("⚠️  ENGRAM substrate health:")
@@ -4137,6 +4171,16 @@ def _main_impl() -> None:
         if not stale_ok:
             _health_lines.append(f"  Git backup: {stale_reason}")
             _health_lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
+        if backlog_status != "ok":
+            _health_lines.append(f"  {backlog_line}")
+            if backlog_status == "unreadable":
+                _health_lines.append(
+                    "  → The pending-commit queue could not be checked; whether commits "
+                    "are landing is unknown.")
+            else:
+                _health_lines.append(
+                    "  → The snapshot worker cannot commit; its reason is in the server log "
+                    "([engram snapshot-worker] lines).")
         if viz_down:
             _health_lines.append(f"  Viz server: DOWN ({viz_reason})")
             _health_lines.append("  → Tell the user; the health dashboard is unreachable.")
