@@ -93,10 +93,14 @@ def _unit_line(ncall, nlines=None, nconnects=None):
     )
 
 
+def _ceiling_line(n):
+    return f"- **direct ceiling:** {n} (free text: who may raise it)\n"
+
+
 def _ledger(rows, states=None, summary=None, state_line=None, kinds=None, targets=None,
-            kind_line=None, target_line=None, unit_line=None):
-    """summary/state_line/kind_line/target_line/unit_line: None = consistent
-    default, "" = omit, else verbatim."""
+            kind_line=None, target_line=None, unit_line=None, ceiling_line=None):
+    """summary/state_line/kind_line/target_line/unit_line/ceiling_line: None =
+    consistent default, "" = omit, else verbatim."""
     states = list(states) if states is not None else ["direct"] * len(rows)
     kinds = list(kinds) if kinds is not None else ["call"] * len(rows)
     targets = list(targets) if targets is not None else ["live store"] * len(rows)
@@ -106,8 +110,9 @@ def _ledger(rows, states=None, summary=None, state_line=None, kinds=None, target
     kl = _kind_line(_count(kinds, KINDS)) if kind_line is None else kind_line
     tl = _target_line(_count(targets, TARGETS)) if target_line is None else target_line
     ul = _unit_line(kinds.count("call")) if unit_line is None else unit_line
+    cl = _ceiling_line(c["direct"]) if ceiling_line is None else ceiling_line
     head = (
-        f"# ledger\n\n## Summary\n\n{sm}\n## 1. Population\n\ntext\n{ul}{kl}{tl}{sl}\n"
+        f"# ledger\n\n## Summary\n\n{sm}\n## 1. Population\n\ntext\n{ul}{kl}{tl}{sl}{cl}\n"
         "## 2. The ledger\n\n" + TABLE_HEAD
     )
     body = "".join(
@@ -390,7 +395,7 @@ def test_c6c_state_found_by_header_name_not_index(tmp_path):
         "# l\n\n## Summary\n\n" + _summary_line(_tally(["direct", "owner"]))
         + "\n## 1. P\n\n" + _unit_line(2) + _kind_line({"call": 2, "prose": 0})
         + _target_line(_count(["live store"] * 2, TARGETS))
-        + _state_line(_tally(["direct", "owner"]))
+        + _state_line(_tally(["direct", "owner"])) + _ceiling_line(1)
         + "\n## 2. The ledger\n\n| # | site | kind | target | state | note |\n|---|---|---|---|---|---|\n"
     )
     body = (
@@ -470,7 +475,7 @@ def test_k5_kind_found_by_header_name_and_not_by_substring(tmp_path):
         + "\n## 1. P\n\n" + _unit_line(1) + _kind_line({"call": 1, "prose": 1})
         + _target_line({"live store": 1, "parameter": 0, "other DB": 0,
                         "n/a (prose)": 1, "unresolved": 0})
-        + _state_line(_tally(["direct", "direct"]))
+        + _state_line(_tally(["direct", "direct"])) + _ceiling_line(2)
         + "\n## 2. The ledger\n\n| # | site | note | target | state | kind |\n|---|---|---|---|---|---|\n"
     )
     body = (
@@ -1001,3 +1006,117 @@ def test_l1f_direct_by_design_is_its_own_state_in_both_section1_lines(tmp_path):
     r = _run(_make_repo(tmp_path / "m", files, [], ledger_text=bad_sum))
     assert r.returncode == 1
     assert "section 1 summary sentence: direct-by-design says 0, rows give 1" in r.stdout
+
+
+# ---- direct ceiling: a new plain `direct` row is a visible decision (#2652 unit 01) ----
+# Contract: Section 1 carries exactly one `- **direct ceiling:** N` line; the
+# plain-`direct` count derived from the rows must equal N. Above -> a new
+# direct open (three ways out named); below -> lower the ceiling; missing,
+# repeated or non-numeric -> could not parse. `direct-by-design` is not counted.
+
+
+def _three(states, ceiling_line=None):
+    files = {"a.py": L(1, 2, 3)}
+    rows = [C("a.py", 1), C("a.py", 2), C("a.py", 3)]
+    return files, _ledger(rows, states=states, ceiling_line=ceiling_line)
+
+
+def _run3(tmp_path, states, ceiling_line=None):
+    files, text = _three(states, ceiling_line)
+    return _run(_make_repo(tmp_path, files, [], ledger_text=text))
+
+
+def test_dc1_real_ledger_carries_one_ceiling_equal_to_its_direct_rows():
+    text = (REPO / "docs" / "internal" / "2652-migration-ledger.md").read_text(encoding="utf-8")
+    section1 = text.split("\n## 2.", 1)[0]
+    lines = [l for l in section1.splitlines() if l.lstrip().startswith("- **direct ceiling:**")]
+    assert len(lines) == 1, lines
+    r = _run(REPO)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "direct ceiling" not in r.stdout
+
+
+def test_dc1b_ceiling_equal_to_direct_rows_passes(tmp_path):
+    r = _run3(tmp_path, ["direct", "direct", "behind-flag"])
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_dc2_new_direct_row_with_tallies_bumped_but_ceiling_kept_fails(tmp_path):
+    # The discriminating cell: the tallies agree with the rows (3 direct), so
+    # before the ceiling existed this ledger was green.
+    r = _run3(tmp_path, ["direct"] * 3, ceiling_line=_ceiling_line(2))
+    assert r.returncode == 1
+    assert (
+        "section 1 direct ceiling: rows give 3 direct, ceiling is 2: "
+        "a new direct open of the live store"
+    ) in r.stdout
+    assert "`engramd.*_via_owner`" in r.stdout
+    assert "`direct-by-design: <phase>`" in r.stdout
+    assert "raise the ceiling in the same PR" in r.stdout
+    assert "says" not in r.stdout  # no tally line disagrees
+
+
+def test_dc3_direct_row_moved_behind_flag_without_lowering_the_ceiling_fails(tmp_path):
+    r = _run3(tmp_path, ["direct", "direct", "behind-flag"], ceiling_line=_ceiling_line(3))
+    assert r.returncode == 1
+    assert (
+        "section 1 direct ceiling: rows give 2 direct, ceiling is 3: lower the ceiling to 2"
+    ) in r.stdout
+    assert "a new direct open" not in r.stdout
+
+
+def test_dc4_missing_ceiling_line_fails_loudly(tmp_path):
+    r = _run3(tmp_path, ["direct"] * 3, ceiling_line="")
+    assert r.returncode == 1
+    assert "could not parse section 1 tally: no `- **direct ceiling:**` line" in r.stdout
+
+
+def test_dc5_ceiling_line_twice_fails_loudly(tmp_path):
+    r = _run3(tmp_path, ["direct"] * 3, ceiling_line=_ceiling_line(3) * 2)
+    assert r.returncode == 1
+    assert (
+        "could not parse section 1 tally: more than one `- **direct ceiling:**` line"
+    ) in r.stdout
+
+
+def test_dc6_ceiling_without_a_number_fails_loudly(tmp_path):
+    for i, value in enumerate(("eighteen", "eighteen (was 3)", "", "3.5", "-3")):
+        r = _run3(tmp_path / str(i), ["direct"] * 3,
+                  ceiling_line=f"- **direct ceiling:** {value}\n")
+        assert r.returncode == 1, value
+        assert "`- **direct ceiling:**` line lacks a number" in r.stdout, value
+
+
+def test_dc6b_free_text_after_the_number_is_allowed(tmp_path):
+    for i, value in enumerate(("3", "3.", "3. Only the epic owner raises it", "3 (was 2)")):
+        r = _run3(tmp_path / str(i), ["direct"] * 3,
+                  ceiling_line=f"- **direct ceiling:** {value}\n")
+        assert r.returncode == 0, value + ": " + r.stdout
+
+
+def test_dc7_direct_by_design_row_is_not_counted_against_the_ceiling(tmp_path):
+    r = _run3(tmp_path, ["direct", "direct", "direct-by-design: pre-owner"],
+              ceiling_line=_ceiling_line(2))
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_dc8_ceiling_failure_does_not_hide_a_disagreeing_tally(tmp_path):
+    states = ["direct"] * 3
+    c = _tally(states)
+    c["owner"] = 5
+    files = {"a.py": L(1, 2, 3)}
+    rows = [C("a.py", 1), C("a.py", 2), C("a.py", 3)]
+    text = _ledger(rows, states=states, state_line=_state_line(c), ceiling_line=_ceiling_line(2))
+    r = _run(_make_repo(tmp_path, files, [], ledger_text=text))
+    assert r.returncode == 1
+    assert "section 1 direct ceiling: rows give 3 direct, ceiling is 2" in r.stdout
+    assert "section 1 state line: owner says 5, rows give 0" in r.stdout
+
+
+def test_dc9_the_phrase_in_prose_is_not_a_ceiling_line(tmp_path):
+    files, text = _three(["direct"] * 3)
+    text = text.replace("## 1. Population\n\ntext\n",
+                        "## 1. Population\n\nThe direct ceiling: 99 is mentioned here.\n"
+                        "Also **direct ceiling:** 99 mid-line.\n", 1)
+    r = _run(_make_repo(tmp_path, files, [], ledger_text=text))
+    assert r.returncode == 0, r.stdout + r.stderr

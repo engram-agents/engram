@@ -37,6 +37,7 @@ The two are different populations measured by different instruments at different
 - **kind:** call 68 · prose 11
 - **target:** live store 26 · parameter 16 · other DB 30 · n/a (prose) 7 · unresolved 0
 - **state:** owner 3 · direct 18 · direct-by-design 10 · behind-flag 11 · flag-on 0 · retired 0 · out of scope 37
+- **direct ceiling:** 18. The plain `direct` count above may not exceed this; `tools/check_2652_ledger.py` fails a PR whose rows give more (a new direct open of the live store) or fewer (lower the ceiling to the new count in the same PR, a free edit). Only the #2652 epic owner may raise it, in writing, linked in the PR body.
 - Of the 18 `direct` lines, 14 are calls and 4 are documents instructing an agent to open the store (rows 1, 42, 43 and 44: `engram-person-node-fairy.md`, `engram-first-session/SKILL.md`, and `engram-health-exam/SKILL.md` twice). Design §4.2 counts such documents as channels because following them regenerates the channel; they are kind `prose` and state `direct`.
 - Three further prose channels (the dream master's safety row, coverage and null-embedding reads, U17 #3880) are listed by hand in Section 2b and are not in these tallies.
 - `parameter` rows are counted live when at least one caller passes the seat's store (named in each row). `engram_backup.py` `verify_roundtrip` (row 6) is the one judgement call: its only in-tree caller is its own CLI, so it is counted `direct` on the basis that an operator may pass the live store.
