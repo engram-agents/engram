@@ -266,7 +266,7 @@ def test_c6b_every_unavailable_reason_but_down_is_refused_with_zero_direct_opens
     set_flag(home)
     _in_proc_ping(monkeypatch, _unavailable(reason))
     rc, out, err, opens = run(home, ["ids", "--since", ""], capsys)
-    assert rc != 0 and out == "", (rc, out)
+    assert rc == 3 and out == "", (rc, out)
     lines = stderr_lines(err)
     assert len(lines) == 1 and lines[0].startswith("store_read: refused (") and reason in lines[0], err
     assert opens == [], "an owner that is present but %s is not 'no live owner': no direct open" % reason
@@ -277,7 +277,7 @@ def test_c6b_a_rejected_ping_is_refused_with_zero_direct_opens(home, capsys, mon
     set_flag(home)
     _in_proc_ping(monkeypatch, lambda c: c.Rejected(reason="contract_mismatch", detail="old", remedy="restart it"))
     rc, out, err, opens = run(home, ["axiom-count"], capsys)
-    assert rc != 0 and out == ""
+    assert rc == 3 and out == ""
     assert stderr_lines(err)[0].startswith("store_read: refused (") and "contract_mismatch" in err
     assert opens == []
 
@@ -301,7 +301,7 @@ def test_c6b_a_malformed_owner_answer_is_refused_with_zero_direct_opens(home, ca
     set_flag(home)
     with GarbageOwner(home):
         rc, out, err, opens = run(home, ["ids", "--since", ""], capsys)
-    assert rc != 0 and out == ""
+    assert rc == 3 and out == ""
     assert stderr_lines(err)[0].startswith("store_read: refused (")
     assert opens == []
 
@@ -316,14 +316,14 @@ def test_c6b_the_store_path_is_never_checked_or_opened_when_refused(home, capsys
     real = owner_read.check_store_path
     monkeypatch.setattr(owner_read, "check_store_path", lambda p: (seen.append(p), real(p))[1])
     rc, _, err, opens = run(home, ["ids", "--since", ""], capsys)
-    assert rc != 0 and seen == [] and opens == []
+    assert rc == 3 and seen == [] and opens == []
 
 
 # ------------------------------------------------------------------------------------------ C7
 
 def test_c7_a_missing_db_exits_nonzero_naming_the_class(home, capsys):
     rc, out, err, opens = run(home, ["axiom-count", "--db", str(home / "nope.db")], capsys)
-    assert rc != 0 and out == ""
+    assert rc == 1 and out == ""
     assert "FileNotFoundError" in err and not (home / "nope.db").exists() and opens == []
 
 
@@ -331,14 +331,36 @@ def test_c7_a_directory_is_not_a_store(home, capsys):
     d = home / "adir"
     d.mkdir()
     rc, out, err, _ = run(home, ["ids", "--since", "", "--db", str(d)], capsys)
-    assert rc != 0 and out == "" and "StoreNotAStore" in err
+    assert rc == 1 and out == "" and "StoreNotAStore" in err
 
 
 def test_c7_a_file_that_is_not_a_database_exits_nonzero_naming_the_class(home, capsys):
     bad = home / "bad.db"
     bad.write_text("this is not a database, just text, long enough to not be an empty file" * 4)
     rc, out, err, _ = run(home, ["axiom-count", "--db", str(bad)], capsys)
-    assert rc != 0 and out == "" and "DatabaseError" in err
+    assert rc == 1 and out == "" and "DatabaseError" in err
+
+
+def test_c7_a_relative_engram_home_exits_2_and_opens_nothing(home, capsys, monkeypatch):
+    """The documents teach exit 2 for a bad ENGRAM_HOME; pin it (a relative value is refused)."""
+    build_store(home)
+    monkeypatch.setenv("ENGRAM_HOME", "relative/engram-home")
+    rc, out, err, opens = run(home, ["axiom-count"], capsys)
+    assert rc == 2 and out == "" and opens == [], (rc, err)
+    assert "ENGRAM_HOME must be an absolute path" in err
+
+
+@pytest.mark.parametrize("answer", [[(True,)], [(False,)], [("3",)], [(3, 4)], [], [(3,), (4,)]])
+def test_the_count_reader_refuses_any_answer_that_is_not_one_integer(answer):
+    """A bool is an int in Python, so a `True` row would print as 1 without the guard."""
+    class _Con:
+        def execute(self, sql, params=()):
+            class _Cur:
+                def fetchall(_self):
+                    return answer
+            return _Cur()
+    with pytest.raises(ValueError):
+        load_tool().read_axiom_count(_Con())
 
 
 def test_the_explicit_db_is_accepted(home, capsys):
