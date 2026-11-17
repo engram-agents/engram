@@ -134,7 +134,18 @@ def read_backlog(engram_home, now: Optional[float] = None,
 
 def main(argv: Optional[list] = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    home = argv[0] if argv else os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+    if argv:
+        home = argv[0]
+    else:
+        # The home comes from the one resolver (raw-home-read gate, #3863); imported here so read_backlog
+        # stays importable with no extra module.
+        import engram_home_resolver
+
+        try:
+            home = str(engram_home_resolver.engram_home())
+        except ValueError as exc:
+            print(_clip(f"{_UNREADABLE_PREFIX}{type(exc).__name__}: {exc})"))
+            return 2
     r = read_backlog(home)
     if r["line"] is not None:
         print(r["line"])

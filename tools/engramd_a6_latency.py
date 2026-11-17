@@ -163,6 +163,7 @@ RUNTIME_FILES = {
     "engramd_read_registry.py": "src/engram/engramd_read_registry.py",
     "engramd_read_templates.json": "src/engram/engramd_read_templates.json",
     "engram_walguard.py": "src/engram/engram_walguard.py",
+    "engram_snapshot_backlog.py": "src/engram/engram_snapshot_backlog.py",
     "hooks/engram-stop-hook.py": "src/engram/hooks/claude/engram-stop-hook.py",
     "hooks/engram-user-identity-hook.py": "src/engram/hooks/claude/engram-user-identity-hook.py",
     "hooks/_hooklib.py": "src/engram/hooks/claude/_hooklib.py",
