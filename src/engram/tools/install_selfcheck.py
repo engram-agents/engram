@@ -602,6 +602,9 @@ def _graph_decision(ctx):
 
     An owner that has not yet bound its socket (mid-startup) reads as `down`, so for that moment the
     tool takes the direct read-only path. That is inside the ruling ("no live owner") and it only reads.
+
+    An owner socket path over the AF_UNIX limit is reason `path_too_long`, never `down` (#4868), so it is
+    REFUSED: an owner started under a shorter spelling of the same ENGRAM_HOME can be live.
     """
     if ctx.graph_decision is not None:
         return ctx.graph_decision
