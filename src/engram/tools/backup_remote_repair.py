@@ -22,8 +22,9 @@ current branch against its upstream (local refs only, no network).
      -> exit 4, paths printed.  This tool never rewrites history.
   4. fetch, then every remote-only commit must be a same-message "twin" of a local-only commit
      (the amend signature) -> otherwise exit 3, the non-twin commits printed.
-  4b. the ADDED lines of the not-yet-pushed commits (``git log -p upstream..branch``) get the
-     same secret scan, so a key committed then deleted still refuses (exit 2).
+  4b. the ADDED lines of the not-yet-pushed commits (``git log -p -m upstream..branch``, merge
+     commits included) get the same secret scan, so a key committed then deleted, or added
+     only in a merge resolution, still refuses (exit 2).
   5. ``git push --force-with-lease=<branch>:<upstream> <remote> <branch>`` (a plain ``git push``
      when nothing is behind), re-fetch, print ahead/behind and update the status file.
 
@@ -122,8 +123,11 @@ def _secret_hits(home):
 
 def _added_line_hits(home, rng):
     """Commits in `rng` whose ADDED lines match a secret pattern, so a key committed and
-    then deleted inside the not-yet-pushed range is still caught. -> [short sha]."""
-    r = _git(home, "log", "-p", "-U0", "--format=@@commit %H", rng)
+    then deleted inside the not-yet-pushed range is still caught. -> [short sha].
+    `-m` makes `git log -p` print a merge commit's diff against each parent (without it a
+    merge prints none, so a key added only in a conflict resolution is invisible); never
+    `--first-parent`, which would skip commits that arrived through the merged-in side."""
+    r = _git(home, "log", "-p", "-m", "-U0", "--format=@@commit %H", rng)
     if r.returncode != 0:
         raise RuntimeError(f"git log -p {rng} failed: {r.stderr.strip()}")
     regs = [re.compile(p) for p in SECRET_PATTERNS]

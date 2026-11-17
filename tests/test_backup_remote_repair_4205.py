@@ -235,6 +235,89 @@ def test_secret_committed_then_deleted_in_ahead_range_still_refuses(amended):
     assert "token" not in r.stdout + r.stderr
 
 
+# -- #4214: the ahead-range scan must read merge commits ---------------------------
+def _short(h, rev="HEAD"):
+    return git(h, "rev-parse", "--short=8", rev)
+
+
+def test_secret_only_in_merge_resolution_refuses_and_names_the_merge(amended):
+    h, bare = amended
+    git(h, "branch", "side")
+    (h / "c.txt").write_text("main\n")
+    git(h, "add", "c.txt")
+    git(h, "commit", "-q", "-m", "main edits c")
+    git(h, "checkout", "-q", "side")
+    (h / "c.txt").write_text("side\n")
+    git(h, "add", "c.txt")
+    git(h, "commit", "-q", "-m", "side edits c")
+    git(h, "checkout", "-q", "master")
+    m = subprocess.run(["git", "merge", "--no-edit", "side"], cwd=h, capture_output=True, text=True)
+    assert m.returncode != 0  # a real conflict
+    (h / "c.txt").write_text("token = " + _synthetic_key() + "\n")  # in neither parent
+    git(h, "add", "c.txt")
+    git(h, "commit", "-q", "--no-edit")
+    merge = _short(h)
+    git(h, "rm", "-q", "c.txt")
+    git(h, "commit", "-q", "-m", "drop c")
+    assert "c.txt" not in git(h, "ls-files")  # tree clean; only the merge's diff carries it
+    before = git(bare, "rev-parse", "master")
+    r = run(h, "--repair")
+    assert r.returncode == 2
+    assert merge in r.stdout + r.stderr
+    assert git(bare, "rev-parse", "master") == before
+
+
+def test_secret_on_side_branch_then_merged_refuses(amended):
+    h, bare = amended
+    git(h, "checkout", "-q", "-b", "side")
+    (h / "k.txt").write_text("token = " + _synthetic_key() + "\n")
+    git(h, "add", "k.txt")
+    git(h, "commit", "-q", "-m", "side adds key")
+    git(h, "checkout", "-q", "master")
+    (h / "m.txt").write_text("main\n")
+    git(h, "add", "m.txt")
+    git(h, "commit", "-q", "-m", "main work")
+    git(h, "merge", "-q", "--no-edit", "side")
+    git(h, "rm", "-q", "k.txt")
+    git(h, "commit", "-q", "-m", "drop key")
+    assert run(h, "--repair").returncode == 2
+
+
+def test_clean_merge_in_ahead_range_does_not_refuse(amended):
+    h, bare = amended
+    git(h, "checkout", "-q", "-b", "side")
+    (h / "s.txt").write_text("side\n")
+    git(h, "add", "s.txt")
+    git(h, "commit", "-q", "-m", "side work")
+    git(h, "checkout", "-q", "master")
+    (h / "m.txt").write_text("main\n")
+    git(h, "add", "m.txt")
+    git(h, "commit", "-q", "-m", "main work")
+    git(h, "merge", "-q", "--no-edit", "side")
+    r = run(h, "--repair")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_secret_on_side_branch_deleted_by_merge_resolution_refuses(amended):
+    """Discriminates `-m` from `--first-parent -m`: the key lives only on a side-branch
+    commit, and the merge resolution drops it."""
+    h, bare = amended
+    git(h, "checkout", "-q", "-b", "side")
+    (h / "k.txt").write_text("token = " + _synthetic_key() + "\n")
+    git(h, "add", "k.txt")
+    git(h, "commit", "-q", "-m", "side adds key")
+    side = _short(h)
+    git(h, "checkout", "-q", "master")
+    (h / "m.txt").write_text("main\n")
+    git(h, "add", "m.txt")
+    git(h, "commit", "-q", "-m", "main work")
+    git(h, "merge", "-q", "--no-edit", "-s", "ours", "side")
+    assert "k.txt" not in git(h, "ls-files")
+    r = run(h, "--repair")
+    assert r.returncode == 2
+    assert side in r.stdout + r.stderr
+
+
 @pytest.fixture
 def ahead_only(tmp_path):
     bare = tmp_path / "remote.git"
