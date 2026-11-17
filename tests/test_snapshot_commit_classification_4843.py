@@ -324,3 +324,24 @@ def test_c10_an_exception_is_logged_once_per_job_too(store, monkeypatch):
     hits = [l for l in lines if "regen exploded" in l]
     assert len(hits) == 1, lines
     assert snap.exists() and len(wk._pending_jobs()) == 1
+
+
+# ── Review fold (reviewer round 1 question, measured by Halley) ────────────
+@pytest.mark.parametrize("damage", ["head_garbage", "head_missing", "objects_missing"])
+def test_c2d_damaged_repository_is_pending_not_retired(store, damage):
+    """A damaged repo prints the same `fatal: not a git repository` text as no repo
+    (git 2.43.0: garbage, empty or missing .git/HEAD, missing .git/objects). It can be
+    repaired and then commit, so its job must stay pending; only a store with no .git
+    at all is the benign S1 case."""
+    server, d = store
+    wk, job, snap = _make_job(server)
+    git_dir = d / ".git"
+    if damage == "head_garbage":
+        (git_dir / "HEAD").write_text("garbage\n")
+    elif damage == "head_missing":
+        (git_dir / "HEAD").unlink()
+    else:
+        (git_dir / "objects").rename(git_dir / "objects.moved")
+    ok, lines = _process(wk, job)
+    _assert_pending(wk, job, snap, ok)
+    assert len(lines) == 1 and "not a git repository" in lines[0], lines

@@ -456,3 +456,10 @@ def test_v6b_cli_default_home_goes_through_the_resolver(tmp_path):
     r = subprocess.run([sys.executable, str(_MODULE_PATH)], capture_output=True, text=True,
                        timeout=60, env=env)
     assert r.returncode == 1 and LINE_RE.match(r.stdout.strip()), r
+
+
+def test_v10b_nap_skill_is_loud_when_the_record_cannot_be_used():
+    """Reviewer round 1: a missing or mismatched checkpoint record must not silently drop
+    the backlog line; the nap skill prints that the backlog is unknown."""
+    nap = (_SRC / "skills" / "claude" / "engram-nap" / "SKILL.md").read_text(encoding="utf-8")
+    assert "snapshot backlog unknown" in nap
