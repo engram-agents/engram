@@ -463,3 +463,21 @@ def test_v10b_nap_skill_is_loud_when_the_record_cannot_be_used():
     the backlog line; the nap skill prints that the backlog is unknown."""
     nap = (_SRC / "skills" / "claude" / "engram-nap" / "SKILL.md").read_text(encoding="utf-8")
     assert "snapshot backlog unknown" in nap
+
+
+def test_v9d_nap_record_both_sides_of_the_threshold(monkeypatch):
+    """Kepler 31339 condition: the nap surface uses the session-start rule. A pending job
+    younger than the threshold (a nap's own fresh job, or a failure under five minutes
+    old) gives no line; one older than the threshold gives the line."""
+    with _real_store(monkeypatch, "v9d") as (server, d):
+        import engram_lifecycle as lc
+        bl = _bl()
+        vc = {"db_backup": {"path": "x"}, "binary_backup": {"path": "y"}}
+        _write_queue(Path(d), [_job(0, 97, time.time() - (bl.BACKLOG_THRESHOLD_SECS - 60))])
+        lc._write_last_checkpoint_record("2026-11-17T00:00:01", None, vc)
+        assert _record(d)["snapshot_backlog"] == {"status": "ok", "line": None}
+        _write_queue(Path(d), [_job(0, 97, time.time() - (bl.BACKLOG_THRESHOLD_SECS + 60))])
+        lc._write_last_checkpoint_record("2026-11-17T00:00:02", None, vc)
+        rec = _record(d)
+        assert rec["snapshot_backlog"]["status"] == "backlog" and LINE_RE.match(rec["snapshot_backlog"]["line"])
+        assert rec["backup_ok"] is True
