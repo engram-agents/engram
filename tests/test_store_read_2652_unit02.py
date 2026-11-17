@@ -260,7 +260,7 @@ def _in_proc_ping(monkeypatch, answer):
     monkeypatch.setattr(client, "read", lambda method, params, **kw: answer(client))
 
 
-@pytest.mark.parametrize("reason", ["timeout", "busy", "busy_or_stuck", "protocol", "local", "internal"])
+@pytest.mark.parametrize("reason", ["path_too_long", "timeout", "busy", "busy_or_stuck", "protocol", "local", "internal"])
 def test_c6b_every_unavailable_reason_but_down_is_refused_with_zero_direct_opens(home, capsys, monkeypatch, reason):
     build_store(home)
     set_flag(home)

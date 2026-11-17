@@ -489,7 +489,8 @@
         "tests/test_inspect_raw_owner_2652.py",
         "tests/test_anchoring_report_owner_3881.py",
         "tests/test_tools_engram_home_3863.py",
-        "tests/test_store_path_precheck_3960.py"
+        "tests/test_store_path_precheck_3960.py",
+        "tests/test_owner_path_too_long_4868.py"
       ],
       "note": "engram-alpha#3862, #3872, #3879, #2652 (tools-7). The shared owner-read helper for tools/: the tools that use it load by path (spec_from_file_location) in their cells, so the layer-1 import graph does not see it; a change here must rerun every consumer's cells."
     },
@@ -832,7 +833,8 @@
     {
       "path_prefix_or_glob": "tools/store_read.py",
       "test_globs": [
-        "tests/test_store_read_2652_unit02.py"
+        "tests/test_store_read_2652_unit02.py",
+        "tests/test_owner_path_too_long_4868.py"
       ]
     },
     {
@@ -840,7 +842,8 @@
       "test_globs": [
         "tests/test_install_selfcheck.py",
         "tests/test_install_selfcheck_owner_read_4118.py",
-        "tests/test_install_selfcheck_stat_4299.py"
+        "tests/test_install_selfcheck_stat_4299.py",
+        "tests/test_owner_path_too_long_4868.py"
       ]
     },
     {

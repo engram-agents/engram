@@ -22,6 +22,10 @@ Which path a run takes (the install self-check's ruled shape, #4118), decided on
   fails after a good ping              -> store_read: refused (<the owner's answer>), exit 3, and the store is
                                           never opened: no direct open beside a live owner
 
+An owner socket path over the AF_UNIX limit is reason `path_too_long`, never `down` (#4868), so it is refused
+like the rest: an owner started under a shorter spelling of the same ENGRAM_HOME (a symlink) can be live while
+this spelling's socket path cannot be addressed.
+
 The tool never writes: every direct open is `mode=ro`.
 
 Exit codes: 0 ok; 1 the store path is not a usable store (missing, uncheckable, not a regular file, or a file

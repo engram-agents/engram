@@ -241,12 +241,14 @@ def test_client_overlong_path_is_unavailable_with_same_reason_and_no_socket(
     monkeypatch.setattr(ec.socket, "socket", _no_socket)
     res = ec.read("ping", {}, timeout=1.0, socket_path=sp)
     assert isinstance(res, ec.Unavailable)
+    assert res.reason == "path_too_long", res  # #4868: never `down`
     assert str(SHORTEST_FAILING_BYTES) in res.detail
     assert str(LONGEST_BINDABLE_BYTES) in res.detail
     assert "ENGRAM_HOME" in res.detail
     assert res.detail == ec.socket_path_too_long_reason(sp)
     res_w = ec.write("noop", {}, timeout=1.0, socket_path=sp)
     assert isinstance(res_w, ec.Unavailable)
+    assert res_w.reason == "path_too_long", res_w
     assert res_w.detail == res.detail
 
 

@@ -396,6 +396,14 @@ def snapshot(spec: OwnerReadSpec, dest_path: Path) -> Path:
                 "nothing was archived. Not reading the store directly. "
                 f"Start the owner and retry, or set engramd.{key} to false."
             )
+        if result.reason == "path_too_long":
+            # #4868: the socket path cannot be addressed, so no request was sent: nothing reached the owner, as
+            # for "down", but this says nothing about whether an owner runs, so the remedy is not "start it".
+            raise err(
+                "the engramd owner socket path is too long (owner unavailable: path_too_long); no snapshot request "
+                "was sent and nothing was archived. Not reading the store directly. "
+                f"Shorten ENGRAM_HOME and retry, or set engramd.{key} to false."
+            )
         raise err(
             f"the engramd owner snapshot outcome is INDETERMINATE (owner unavailable: {result.reason or 'unavailable'}); "
             f"nothing was archived and the snapshot file was not trusted. Not reading the store directly. "
@@ -481,6 +489,13 @@ def write(spec: OwnerReadSpec, method: str, params: dict, request_id: str | None
                 f"and nothing was written. Not writing the store directly. Start the owner and retry, or set "
                 f"engramd.{key} to false."
             ), "down", None)
+        if result.reason == "path_too_long":
+            # #4868: nothing was sent, so nothing was written (not indeterminate); tagged with its own reason.
+            raise _tagged(err(
+                f"the engramd owner socket path is too long (owner unavailable: path_too_long); the {method} request "
+                f"was not sent and nothing was written. Not writing the store directly. Shorten ENGRAM_HOME and "
+                f"retry, or set engramd.{key} to false."
+            ), "path_too_long", None)
         raise _tagged(err(
             f"the engramd owner {method} outcome is INDETERMINATE (owner unavailable: "
             f"{result.reason or 'unavailable'}); the write may or may not have committed. Not writing the "
