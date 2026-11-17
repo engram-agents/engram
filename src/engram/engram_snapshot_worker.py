@@ -87,6 +87,12 @@ _seq_counter = 0                  # monotonic per-process; seeded from disk on s
 _started = False
 
 
+# Failure keys already logged by _process_job: (turn, seq, first line of reason). A job that
+# stays pending is retried every wake (<= 30 s); logging each retry would flood the server
+# log, so a given reason is logged once per job per process, and a new reason logs again.
+_logged_failures: set = set()
+
+
 def _log(msg: str) -> None:
     """Loud, unconditional stderr log — a silent durability failure (a backup/commit
     that fails with no one noticing) is exactly the class this module exists to
@@ -421,6 +427,31 @@ def _regenerate_derived_files(snapshot_path: Path) -> None:
     (engram_core.DATA_DIR / "graph_snapshot.md").write_text(md, encoding="utf-8")
 
 
+def _is_benign_no_commit(reason: str) -> bool:
+    """True iff ``reason`` (from _commit_snapshot_files, git_committed False) means there is
+    nothing more a retry could commit, so the job may be retired. An ALLOW-list: an
+    unlisted reason is NOT benign."""
+    # Read from _commit_snapshot_files' own return values (the literals above).
+    if reason in (
+        "no changes since last commit",
+        "no tracked files exist",
+        "all stageable files are gitignored",
+    ):
+        return True
+    # S1 no repository. Read from git 2.43.0: `git add` in a directory that is not a
+    # repository prints `fatal: not a git repository (or any of the parent directories): .git`.
+    if reason.startswith("git add failed: fatal: not a git repository"):
+        return True
+    # S2 no git binary. Read from engram_core._git, which turns the FileNotFoundError into
+    # stderr = str(e); for a missing executable that is `[Errno 2] No such file or
+    # directory: '<GIT_EXE>'`. It must name the git executable itself: a
+    # FileNotFoundError naming any other path (a missing data dir) is not this case.
+    if reason.startswith("git add failed: [Errno 2]"):
+        import engram_core  # lazy
+        return reason.endswith(repr(engram_core.GIT_EXE))
+    return False
+
+
 def _process_job(job: dict) -> bool:
     """Process one pending job: regenerate derived files from its captured snapshot,
     commit, mark done, unlink the snapshot. Returns True on success (job done),
@@ -437,12 +468,23 @@ def _process_job(job: dict) -> bool:
             return False
         _regenerate_derived_files(snap)
         commit = _commit_snapshot_files(job.get("mode", "nap"), job.get("message", ""))
-        if not commit.get("git_committed") and commit.get("reason", "").startswith("git commit failed"):
-            _log(f"commit FAILED for turn={turn},seq={seq}: {commit['reason']} — leaving job pending")
+        if not commit.get("git_committed") and not _is_benign_no_commit(commit.get("reason", "")):
+            # Allow-list (#4843): ONLY the reasons in _is_benign_no_commit retire a job
+            # that did not commit. Everything else (index.lock held, timeout, any other
+            # add error, commit failed, an unknown reason) leaves it pending with its
+            # snapshot kept, so the commit is retried; the backlog reader makes a stuck
+            # job visible once it is older than its threshold.
+            reason = commit.get("reason", "")
+            key = (turn, seq, reason.split("\n", 1)[0])
+            if key not in _logged_failures:
+                _logged_failures.add(key)
+                _log(f"commit FAILED for turn={turn},seq={seq}: {reason} — leaving job pending")
             return False
-        # git_committed True, or a benign no-op ("no changes"/"gitignored"/git unavailable):
-        # the snapshot has been processed as far as it can be — mark done + reclaim.
+        # git_committed True, or a benign no-op: the snapshot has been processed as far as
+        # it can be — mark done + reclaim.
         _mark_done(turn, seq)
+        for k in [k for k in _logged_failures if k[:2] == (turn, seq)]:
+            _logged_failures.discard(k)
         # Reclaim the snapshot AND any -wal/-shm sidecars (dump_stripped opens its own
         # connection to the snapshot; a WAL-header'd image can spawn sidecars).
         for p in (snap, snap.with_name(snap.name + "-wal"), snap.with_name(snap.name + "-shm")):
