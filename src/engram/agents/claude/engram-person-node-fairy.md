@@ -84,13 +84,16 @@ low wired share is not by itself a defect. Do not phrase any P5 output as
   ```python
   import os, random, subprocess, sys
   # The tool prints one id per line, already sorted. It names the path it took on stderr
-  # (`store_read: path=owner` or `path=direct-ro`); a non-zero exit (check=True raises) means no ids.
+  # (`store_read: path=owner` or `path=direct-ro`). A non-zero exit means NO ids, never an empty
+  # population: stop and report its stderr line (1 store unusable, 2 bad ENGRAM_HOME, 3 refused).
   home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
   root = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.join(home, "marketplace", "plugins", "engram")
-  out = subprocess.run([sys.executable, os.path.join(root, "tools", "store_read.py"),
-                        "ids", "--since", window_since or ""],      # null window = full graph
-                       check=True, capture_output=True, text=True).stdout
-  ids = out.splitlines()
+  r = subprocess.run([sys.executable, os.path.join(root, "tools", "store_read.py"),
+                      "ids", "--since", window_since or ""],      # null window = full graph
+                     capture_output=True, text=True)
+  if r.returncode != 0:
+      raise SystemExit(f"store_read exit {r.returncode}: {r.stderr.strip()}")
+  ids = r.stdout.splitlines()
   seed = <choose one>
   sample = random.Random(seed).sample(ids, min(400, len(ids)))
   ```
