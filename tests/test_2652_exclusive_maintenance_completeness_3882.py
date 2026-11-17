@@ -6,6 +6,10 @@ Every shipped tool that opens the live store directly must be exactly one of:
   (c) `direct-by-design: exclusive-maintenance` AND take the store-maintenance lock in its own source.
 A tool that is in none of the three fails here. `direct` (not yet migrated) is a fourth state only for the
 tools named in KNOWN_DIRECT, each with the reason; the allowlist is itself checked, so it cannot go stale.
+`out of scope` on a live-store or parameter row (the ledger's judgement that no caller hands the opener
+the seat's store) is a fifth, allowed only for the tools named in KNOWN_NO_LIVE_CALLER with the reason,
+checked for staleness the same way: this instrument cannot verify "no live caller", so each one must be a
+visible, reviewed entry (#2652 owner, 2026-11-17).
 
 The instrument (`unguarded_direct_openers`) is a pure function of (tools dir, ledger text), so the cells
 below can PLANT a tool that opens the store directly without the lock and watch it go red.
@@ -46,8 +50,14 @@ LOCK_CALLS = ("acquire_store_maint_lock", "acquire_store_maint_lock_or_report")
 OPENER_ATTRS = ("connect", "_get_db")
 
 # Tools whose live-store rows are still plain `direct` today, with the reason they are allowed to be.
-KNOWN_DIRECT = {
-    "anchoring_report.py": "read-only report; its own unit moves it onto the owner path",
+KNOWN_DIRECT: dict = {}
+
+# Tools whose live-or-parameter rows say `out of scope` because no in-tree caller can hand the opener the
+# seat's store, with the reason. Passed explicitly by the real-tree test (the function's default is empty,
+# so planted cells see only what they plant).
+KNOWN_NO_LIVE_CALLER = {
+    "anchoring_report.py": "`_open_readonly`'s only runtime caller, s2_clause_sheet.py, refuses a "
+                           "live-store --db in main() before any read (#4286); ledger row 46",
 }
 
 
@@ -135,11 +145,14 @@ def _live(target_cell: str) -> bool:
     return chk.target_category(target_cell) in ("live store", "parameter")
 
 
-def unguarded_direct_openers(tools_dir: Path, ledger_text: str, known_direct=KNOWN_DIRECT) -> list:
+def unguarded_direct_openers(tools_dir: Path, ledger_text: str, known_direct=KNOWN_DIRECT,
+                             known_no_live_caller=None) -> list:
     """Problem lines; empty when every tool that opens the live store directly is accounted for."""
+    known_no_live_caller = {} if known_no_live_caller is None else known_no_live_caller
     by_file = _ledger_by_file(ledger_text)
     problems = []
     seen_direct = set()
+    seen_no_live = set()
     for path in sorted(Path(tools_dir).glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         rows = by_file.get(path.name, [])
@@ -175,12 +188,21 @@ def unguarded_direct_openers(tools_dir: Path, ledger_text: str, known_direct=KNO
                                     f"onto the owner path or make it exclusive-maintenance with the lock")
                     bad = True
                 continue
+            if head == "out of scope":
+                seen_no_live.add(path.name)
+                if path.name not in known_no_live_caller:
+                    problems.append(f"{path.name}: `out of scope` on a live-store or parameter row and not on "
+                                    f"the no-live-caller list: name it there with the reason, or fix the row")
+                    bad = True
+                continue
             problems.append(f"{path.name}: unclassified state {s!r}")
             bad = True
         if bad:
             continue
     for name in sorted(set(known_direct) - seen_direct):
         problems.append(f"{name}: on the known-direct list but no longer `direct` in the ledger: drop it")
+    for name in sorted(set(known_no_live_caller) - seen_no_live):
+        problems.append(f"{name}: on the no-live-caller list but no longer `out of scope` in the ledger: drop it")
     return problems
 
 
@@ -189,7 +211,8 @@ def unguarded_direct_openers(tools_dir: Path, ledger_text: str, known_direct=KNO
 # ---------------------------------------------------------------------------
 
 def test_real_tools_tree_every_direct_opener_is_accounted_for():
-    problems = unguarded_direct_openers(TOOLS, LEDGER.read_text(encoding="utf-8"))
+    problems = unguarded_direct_openers(TOOLS, LEDGER.read_text(encoding="utf-8"),
+                                        known_no_live_caller=KNOWN_NO_LIVE_CALLER)
     assert problems == [], "\n".join(problems)
 
 
@@ -292,6 +315,22 @@ def test_c6_plain_direct_is_red_unless_on_the_known_direct_list_and_a_stale_entr
     moved = _ledger([("old.py", "live store", "behind-flag")])
     stale = unguarded_direct_openers(d, moved, known_direct={"old.py": "why"})
     assert any("old.py" in p and "no longer" in p for p in stale), stale
+
+
+
+def test_c6_out_of_scope_live_row_is_red_unless_on_the_no_live_caller_list_and_a_stale_entry_is_red(tmp_path):
+    """A row on a live-store or parameter target may say `out of scope` only when its tool is named,
+    with the reason, in the no-live-caller list (the ledger's claim that no caller hands it the
+    store is a judgement this instrument cannot check, so it must be a visible, reviewed entry)."""
+    d = _tools(tmp_path, {"copyonly.py": OPENS})
+    led = _ledger([("copyonly.py", "parameter — opener for copies only", "out of scope")])
+    red = unguarded_direct_openers(d, led, known_direct={}, known_no_live_caller={})
+    assert any("copyonly.py" in p and "no-live-caller" in p for p in red), red
+    assert unguarded_direct_openers(d, led, known_direct={}, known_no_live_caller={"copyonly.py": "why"}) == []
+    back = _ledger([("copyonly.py", "parameter — opener for copies only", "direct")])
+    stale = unguarded_direct_openers(d, back, known_direct={"copyonly.py": "why"},
+                                     known_no_live_caller={"copyonly.py": "why"})
+    assert any("copyonly.py" in p and "no longer" in p for p in stale), stale
 
 
 def test_c6_owner_path_pre_owner_and_other_db_tools_are_green(tmp_path):
