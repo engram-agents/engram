@@ -605,6 +605,10 @@ NOT_BATCHED_FLAGS = {
         "install-time diagnostic, not on any hook path; its ON output differs from OFF by design (it names "
         "the path taken and FAILs on an unhealthy owner); flips as its own one-flag step after #4118 lands"
     ),
+    "store_read_reads_via_owner": (
+        "new in #2652 unit 02 (tools/store_read.py, the person-node fairy's id read and first-session's axiom "
+        "count); default OFF; not yet assigned to a batch, which is the epic owner's call"
+    ),
     "repair_embeddings_via_owner": (
         "a ROUTING flag for the embedding repair's publish write through the owner op publish_prepared_embeddings "
         "(default OFF); no tool row until part B ships the repair tool (#4651); the module "
