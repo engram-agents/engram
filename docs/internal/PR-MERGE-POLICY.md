@@ -450,8 +450,10 @@ seat can run it and any other seat can check that it ran.
    with its own rows never reached this test through the map, and the PR's seat run was green. It
    was first seen red in a hand-started whole-suite run on `dev` later on 2026-11-18 (the
    scheduled nightly of that date ran before #4613 merged). A new file under
-   `src/engram/hooks/claude/` selects the guard set and nothing else (measured with the selector
-   at `dev` `9174f642`).
+   `src/engram/hooks/claude/` selected the guard set and nothing else (measured with the selector
+   at `dev` `9174f642`); with the union of matching rows and the census directory rows it selects the
+   guard set plus the three tests that scan the hook directories (measured at the head of the
+   union change).
    The list is a floor, not a census: a PR that adds a test with this property adds
    its name here in the same PR, and a seat that finds one missing adds it. Verify
    the list with `git ls-files` **in a checkout of the base tip**, not the seat's
