@@ -285,6 +285,18 @@ def test_c7_db_absent_never_calls_store_read(sb):
     assert len(boot) == 1
 
 
+@pytest.mark.parametrize("printed", ["", "ERR not a number"])
+def test_installer_refuses_an_answer_that_is_not_a_count(sb, printed):
+    """Exit 0 with no count is not 'non-empty': the installer fails instead of skipping or re-seeding."""
+    (sb.tools_src / "store_read.py").write_text("import sys\nprint(%r)\nsys.exit(0)\n" % printed)
+    sb.make_db(0)
+    r, boot = _install(sb)
+    assert r.returncode != 0, r.all
+    fail_line = [l for l in r.stderr.splitlines() if l.startswith("FAIL: [step 6]")][0]
+    assert "no node count" in fail_line, fail_line
+    assert boot == []
+
+
 def test_c9_the_path_line_reaches_the_installer_output(sb):
     sb.make_db(4)
     r, boot = _install(sb)
