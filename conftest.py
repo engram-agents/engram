@@ -261,6 +261,171 @@ def _service_manager_guard(service_manager_shim_dir, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #4475 -- suite-wide guard: no test may connect to the LIVE forum.
+#
+# Origin: a whole-suite measurement run reached the real forum service on the host (tokenless
+# requests, five of them `POST /api/agents/status`) through test cells whose stub configs carry
+# the live URL. With the live port refused every one of those cells still passes (the code reads a
+# refused connect as "unreachable"), so the guard needs no change to any cell.
+#
+# `socket.socket.connect` and `connect_ex` are wrapped for every test. A connect to a live forum
+# endpoint raises a ConnectionRefusedError subclass naming this guard (`connect_ex` returns
+# ECONNREFUSED); everything else passes to the real method (other loopback ports, unix sockets).
+# The live endpoints are those the CODE resolves: `forum.url` of $ENGRAM_HOME/config.json,
+# `$FORUM_URL`, and the default constant READ from the two source files that define it. A loopback
+# endpoint refuses every loopback spelling (localhost, 127.0.0.0/8, ::1) on its port; a non-loopback
+# endpoint refuses that host and port.
+#
+# This definition is shared: src/forum/tests/conftest.py loads THIS file by path and installs the
+# same guard (the forum tests may run on their own), and the cell files load it by path too.
+# Installing twice is a no-op. No opt-out: a test that needs the live forum is a finding.
+#
+# NOT COVERED (unmeasured routes): a C-level `_socket.socket` used directly, connects made by a
+# subprocess (curl, a child python), and non-forum services (the world servers on 5003 / 5005).
+import errno
+import ipaddress
+import json
+import re
+import socket
+from pathlib import Path
+from urllib.parse import urlsplit
+
+_LFG_ATTR = "_live_forum_guard_4475"
+_LFG_REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_URL_SOURCES = (
+    "src/engram/hooks/claude/engram-forum-prompt-hook.py",
+    "src/engram/tools/_status_derive.py",
+)
+_DEFAULT_URL_RE = re.compile(r"""^_DEFAULT_FORUM_URL\b[^=\n]*=\s*["']([^"'\n]+)["']""", re.M)
+
+
+class LiveForumConnectionRefused(ConnectionRefusedError):
+    """Raised by the #4475 guard in place of a connect to the live forum."""
+
+
+def _lfg_endpoint(url):
+    """(host, port) of a forum URL, host lower-cased; None when it has none."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+    if "://" not in url:
+        url = "http://" + url
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    if port is None:
+        port = 443 if parts.scheme == "https" else 80
+    return (host.lower(), port)
+
+
+def live_forum_endpoints(environ, config_json_path, repo_root=None):
+    """The set of (host, port) pairs the code may resolve as the forum: the config file's
+    `forum.url` (when readable), `$FORUM_URL`, and the `_DEFAULT_FORUM_URL` constant read from the
+    source files in DEFAULT_URL_SOURCES (never retyped). Pure: reads only what it is handed."""
+    urls = []
+    try:
+        data = json.loads(Path(config_json_path).read_text(encoding="utf-8"))
+        forum_cfg = data.get("forum") if isinstance(data, dict) else None
+        if isinstance(forum_cfg, dict):
+            urls.append(forum_cfg.get("url"))
+    except (OSError, ValueError, TypeError):
+        pass
+    urls.append((environ or {}).get("FORUM_URL"))
+    root = Path(repo_root) if repo_root is not None else _LFG_REPO_ROOT
+    for rel in DEFAULT_URL_SOURCES:
+        text = (root / rel).read_text(encoding="utf-8")
+        m = _DEFAULT_URL_RE.search(text)
+        if m is None:
+            raise RuntimeError(f"#4475 guard: no _DEFAULT_FORUM_URL constant found in {rel}")
+        urls.append(m.group(1))
+    return {ep for ep in map(_lfg_endpoint, urls) if ep is not None}
+
+
+def _lfg_is_loopback(host):
+    h = host.strip().lower().split("%", 1)[0]
+    if h == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return ip.is_loopback or bool(mapped is not None and mapped.is_loopback)
+
+
+def is_live_forum_target(addr, endpoints):
+    """True when a socket address (a (host, port, ...) tuple; unix addresses never) is a live forum."""
+    if not isinstance(addr, tuple) or len(addr) < 2:
+        return False
+    host, port = addr[0], addr[1]
+    if not isinstance(host, str) or not isinstance(port, int):
+        return False
+    if _lfg_is_loopback(host):
+        return any(p == port for h, p in endpoints if _lfg_is_loopback(h))
+    return (host.lower(), port) in endpoints
+
+
+_LFG_SESSION_ENDPOINTS = None
+
+
+def session_live_forum_endpoints():
+    """The endpoints for the REAL environment, resolved once (before any test edits the env)."""
+    global _LFG_SESSION_ENDPOINTS
+    if _LFG_SESSION_ENDPOINTS is None:
+        home = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
+        _LFG_SESSION_ENDPOINTS = live_forum_endpoints(os.environ, os.path.join(home, "config.json"))
+    return _LFG_SESSION_ENDPOINTS
+
+
+def install_live_forum_guard(monkeypatch, endpoints=None):
+    """Wrap socket.socket.connect / connect_ex (undone by `monkeypatch`). Idempotent: a second
+    install while the wrappers are in place does nothing."""
+    if getattr(socket.socket.connect, _LFG_ATTR, None) is not None and getattr(
+        socket.socket.connect_ex, _LFG_ATTR, None
+    ) is not None:
+        return
+    eps = session_live_forum_endpoints() if endpoints is None else endpoints
+    real_connect, real_connect_ex = socket.socket.connect, socket.socket.connect_ex
+    refused = []
+
+    def _refusal(addr):
+        refused.append(addr)
+        return LiveForumConnectionRefused(
+            errno.ECONNREFUSED,
+            f"[conftest.py guard #4475] refused connect to {addr[0]}:{addr[1]}: tests must not "
+            "reach the live forum (running test: "
+            f"{os.environ.get('PYTEST_CURRENT_TEST', 'unknown')})",
+        )
+
+    def connect(self, address):
+        if is_live_forum_target(address, eps):
+            raise _refusal(address)
+        return real_connect(self, address)
+
+    def connect_ex(self, address):
+        if is_live_forum_target(address, eps):
+            _refusal(address)
+            return errno.ECONNREFUSED
+        return real_connect_ex(self, address)
+
+    connect.__doc__, connect_ex.__doc__ = real_connect.__doc__, real_connect_ex.__doc__
+    setattr(connect, _LFG_ATTR, refused)
+    setattr(connect_ex, _LFG_ATTR, refused)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+
+
+@pytest.fixture(autouse=True)
+def _live_forum_guard(monkeypatch):
+    """#4475: no test may connect to the live forum (see the block comment above)."""
+    install_live_forum_guard(monkeypatch)
+
+
+# ---------------------------------------------------------------------------
 # #3784 -- the `timing` marker: a cell that asserts a measured ratio or latency
 # bound judges the TRACER under coverage (the stage-accounting cell read ~0.118
 # against its 10% bound, 0.072-0.076 without). The nightly deselects them from the

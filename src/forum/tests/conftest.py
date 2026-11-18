@@ -10,9 +10,33 @@ The stub is set on the module object `forum.server._load_baton_gate()` returns,
 which is the one the server actually calls.
 """
 import importlib
+import importlib.util
 import sys
+from pathlib import Path
 
 import pytest
+
+
+# #4475: the live-forum connect guard. Its ONE definition is the repo-root conftest.py (see the
+# #4475 block there). The forum tests may be run from inside src/forum, a separate universe that
+# may not load the root conftest, so this tree loads it BY FILE PATH (never sys.path) and installs
+# the same guard. The fixture has the root fixture's name, so under the root universe this one
+# overrides that one (one guard, installed once); installing twice is a no-op anyway.
+def _load_root_conftest_4475():
+    root = Path(__file__).resolve().parent.parent.parent.parent / "conftest.py"
+    spec = importlib.util.spec_from_file_location("_root_conftest_live_forum_guard_4475", root)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_ROOT_CONFTEST_4475 = _load_root_conftest_4475()
+
+
+@pytest.fixture(autouse=True)
+def _live_forum_guard(monkeypatch):
+    """#4475: no test may connect to the live forum."""
+    _ROOT_CONFTEST_4475.install_live_forum_guard(monkeypatch)
 
 
 @pytest.fixture(autouse=True)

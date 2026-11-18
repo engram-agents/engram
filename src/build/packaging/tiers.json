@@ -1620,6 +1620,10 @@
       "reason": "test file for tools/forum.py — CI tooling only, never ships"
     },
     {
+      "path": "tools/test_live_forum_guard.py",
+      "reason": "test file for the #4475 live-forum connect guard in the repo-root conftest.py — CI tooling only, never ships"
+    },
+    {
       "path": "tools/test_tripwire.py",
       "reason": "test file for tools/tripwire.py — CI tooling only, never ships"
     },
@@ -1867,7 +1871,7 @@
     },
     {
       "path": "conftest.py",
-      "reason": "repo-root pytest conftest holding the one definition of the #3519 launchctl/systemctl guard shims, loaded for all three test roots (tests/, src/forum/tests/, tools/test_*.py) — dev test config, never shipped"
+      "reason": "repo-root pytest conftest holding the one definition of the #3519 launchctl/systemctl guard shims and of the #4475 live-forum connect guard, loaded for all three test roots (tests/, src/forum/tests/, tools/test_*.py) — dev test config, never shipped"
     },
     {
       "path": ".coveragerc",
