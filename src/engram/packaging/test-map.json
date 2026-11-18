@@ -290,7 +290,8 @@
     {
       "path_prefix_or_glob": "hooks/claude/engram-model-gate-pretool.py",
       "test_globs": [
-        "tests/test_model_gate_4596.py"
+        "tests/test_model_gate_4596.py",
+        "tests/test_hook_injection_bounds.py"
       ],
       "note": "#4596 model-family gate, write block: loaded via importlib (hyphenated name) and run as a subprocess against a temp ENGRAM_HOME (source and flattened deployed layouts), so the layer-1 AST import graph cannot trace it to a test."
     },
@@ -355,6 +356,13 @@
       "path_prefix_or_glob": "hooks/claude/start-engram-daemon.sh",
       "full_suite_fallback": true,
       "note": "No dedicated test file for start-engram-daemon.sh"
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/",
+      "test_globs": [
+        "tests/test_hook_injection_bounds.py"
+      ],
+      "note": "Catch-all for a hook file with no row of its own: every hook that builds additionalContext must go through _hooklib.emit_context (CLAUDE.md, Hook injection budget), and tests/test_hook_injection_bounds.py is the glob test that checks it. Selection is FIRST-MATCH-WINS, so this entry sits AFTER every specific hooks/claude/ row and covers only a hook that has none (a new hook); a hook that already has a row must list the bounds test itself (the model-gate pretool row does). The row that was missing when the model-gate hook (engram-alpha#4613) left dev red."
     },
     {
       "path_prefix_or_glob": "tools/__init__.py",

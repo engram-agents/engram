@@ -189,15 +189,30 @@ def pay(tool="mcp__engram__engram_add_observation", tid="toolu_01", tpath=None, 
     return p
 
 
-def out(res):
-    """(permissionDecision | 'allow-context', text) of a pretool decision (None result = silent allow)."""
+TRAILER_RE = re.compile(r"\A▸ \d+ shown · \d+ cut\n")
+
+
+def out(res, trailer=True):
+    """(permissionDecision | 'allow-context', text) of a pretool decision (None result = silent allow).
+
+    An allow-with-context notice from site A (`_unverified`) is rendered by `_hooklib.emit_context`, which
+    puts ONE trailer line first.  `trailer=True` (the default) asserts it is there and strips exactly that one
+    line, so the cells keep comparing the notice text for EQUALITY.  Site B (`_emit_import_failure`, the
+    stdlib-only path) has no trailer: its cells pass `trailer=False` and compare the raw text."""
     if res is None:
         return None, ""
     o = res["hookSpecificOutput"]
     assert o["hookEventName"] == "PreToolUse"
     if "permissionDecision" in o:
         return o["permissionDecision"], o["permissionDecisionReason"]
-    return "allow-context", o["additionalContext"]
+    text = o["additionalContext"]
+    if trailer:
+        m = TRAILER_RE.match(text)
+        assert m, f"site A notice lacks the emit_context trailer line: {text!r}"
+        text = text[m.end():]
+    else:
+        assert not TRAILER_RE.match(text), f"site B notice unexpectedly carries a trailer: {text!r}"
+    return "allow-context", text
 
 
 def server_tools():
@@ -756,7 +771,7 @@ def test_c4_every_allow_unverified_output_carries_text_2_2_with_its_code(fast, h
         res = fast.decide(payload, home)
         assert res is not None, code
         assert set(res["hookSpecificOutput"]) == {"hookEventName", "additionalContext"}, code
-        assert res["hookSpecificOutput"]["additionalContext"] == unverified_text(code), code
+        assert out(res) == ("allow-context", unverified_text(code)), code
 
 
 # ====================================================================== C5 polling / C6 budget
@@ -1050,11 +1065,11 @@ def _hook_with_hooklib_only(tmp_path):
     return d / PRETOOL_FILE.name
 
 
-def test_r3_c18a_helper_module_missing_is_unverified_gate_import_failed(home, tmp_path):
+def test_r3_c18a_helper_module_missing_is_unverified_gate_import_failed(hook, home, tmp_path):
     t = write_jsonl(tmp_path / "t.jsonl", [call_row("claude-sonnet-5-5", "toolu_01")])
     done = run_hook(home, pay(tpath=t), _hook_without_helper(tmp_path))
     assert done.returncode == 0
-    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+    assert out(json.loads(done.stdout), trailer=False) == ("allow-context", hook._IMPORT_FAILED_TEXT)
     assert "helper import failed" in done.stderr   # the stderr line is kept
 
 
@@ -1069,10 +1084,10 @@ def test_r3_c18b_helper_module_missing_with_a_dormant_config_is_silent(home, tmp
 
 
 @pytest.mark.parametrize("body", ["{not json", "[]", '{"self_lineage": 5}'])
-def test_r3_c18c_helper_module_missing_with_an_unusable_config_is_unverified(home, tmp_path, body):
+def test_r3_c18c_helper_module_missing_with_an_unusable_config_is_unverified(hook, home, tmp_path, body):
     (home / "config.json").write_text(body, encoding="utf-8")
     done = run_hook(home, pay(), _hook_with_hooklib_only(tmp_path))
-    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+    assert out(json.loads(done.stdout), trailer=False) == ("allow-context", hook._IMPORT_FAILED_TEXT)
 
 
 # -- Round 4: no raw ENGRAM_HOME read; the import-failure path asks `_hooklib.engram_home`
@@ -1083,29 +1098,29 @@ def test_r4_a_helper_import_fails_hooklib_importable_dormant_config_is_silent(ho
     assert (done.returncode, done.stdout) == (0, "")
 
 
-def test_r4_b_helper_import_fails_hooklib_importable_set_lineage_is_unverified(home, tmp_path):
+def test_r4_b_helper_import_fails_hooklib_importable_set_lineage_is_unverified(hook, home, tmp_path):
     (home / "config.json").write_text(json.dumps({"self_lineage": SELF}), encoding="utf-8")
     done = run_hook(home, pay(), _hook_with_hooklib_only(tmp_path))
     assert done.returncode == 0
-    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+    assert out(json.loads(done.stdout), trailer=False) == ("allow-context", hook._IMPORT_FAILED_TEXT)
 
 
-def test_r4_c_both_imports_fail_is_unverified_even_with_a_dormant_config(home, tmp_path):
+def test_r4_c_both_imports_fail_is_unverified_even_with_a_dormant_config(hook, home, tmp_path):
     (home / "config.json").write_text("{}", encoding="utf-8")
     done = run_hook(home, pay(), _hook_without_helper(tmp_path))
-    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+    assert out(json.loads(done.stdout), trailer=False) == ("allow-context", hook._IMPORT_FAILED_TEXT)
 
 
-def test_r4_d_relative_engram_home_on_the_import_failure_path_is_unverified(home, tmp_path):
-    hook = _hook_with_hooklib_only(tmp_path)
+def test_r4_d_relative_engram_home_on_the_import_failure_path_is_unverified(hook, home, tmp_path):
+    lonely = _hook_with_hooklib_only(tmp_path)
     (tmp_path / "rel").mkdir()
     (tmp_path / "rel" / "config.json").write_text("{}", encoding="utf-8")   # dormant, if it were read
     env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
     env["ENGRAM_HOME"] = "rel"
-    done = subprocess.run([sys.executable, str(hook)], input=json.dumps(pay()), text=True, capture_output=True,
+    done = subprocess.run([sys.executable, str(lonely)], input=json.dumps(pay()), text=True, capture_output=True,
                           env=env, cwd=str(tmp_path), timeout=60)
     assert done.returncode == 0
-    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+    assert out(json.loads(done.stdout), trailer=False) == ("allow-context", hook._IMPORT_FAILED_TEXT)
 
 
 # -- Round 5: the MAIN path agrees with the import-failure path on a relative ENGRAM_HOME.  `_hooklib` exits
@@ -1118,12 +1133,12 @@ def _run_real_hook_with_home(tmp_path, home_value):
                           capture_output=True, env=env, cwd=str(tmp_path), timeout=60)
 
 
-def test_r5_a_relative_engram_home_on_the_main_path_is_unverified_not_silent(tmp_path):
+def test_r5_a_relative_engram_home_on_the_main_path_is_unverified_not_silent(hook, tmp_path):
     (tmp_path / "rel").mkdir()
     (tmp_path / "rel" / "config.json").write_text(json.dumps({"self_lineage": SELF}), encoding="utf-8")
     done = _run_real_hook_with_home(tmp_path, "rel")
     assert done.returncode == 0
-    assert out(json.loads(done.stdout)) == ("allow-context", unverified_text("gate_import_failed"))
+    assert out(json.loads(done.stdout), trailer=False) == ("allow-context", hook._IMPORT_FAILED_TEXT)
     # round 6: ONE stderr line in total, `_hooklib`'s refusal naming the value (the #3863 rule); the hook's own
     # "helper import failed" line is not added on top, and the dormancy re-import does not repeat the refusal
     assert [ln for ln in done.stderr.splitlines() if ln.strip()] == [
@@ -1492,3 +1507,132 @@ def test_r7_a_direct_server_start_on_a_relative_engram_home_refuses_non_zero_and
     assert done.stdout == "", done.stdout[:300]
     assert "ENGRAM_HOME must be an absolute path, got 'rel/home'" in done.stderr, done.stderr[-400:]
     assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == ["cwd", "home"]
+
+
+# ====================================================================== bounded additionalContext (dev red from #4613)
+# Contract (written before the fix).  Site A (`_unverified`) renders its notice with `_hooklib.emit_context`
+# (trailer first, notice whole).  Site B (`_emit_import_failure`) stays stdlib-only and writes ONE constant
+# sentence, `_IMPORT_FAILED_TEXT`, whose length is pinned here because the bounded renderer is unavailable there.
+
+IMPORT_FAILED_TEXT = (
+    "ENGRAM model-family gate: this write went through UNVERIFIED (`gate_import_failed`): the gate's own "
+    "helper modules failed to import, so it could not check which model made the call. Tell the human: the "
+    "ENGRAM plugin install may be broken.")
+
+SITE_A_CODES = [
+    "config_unreadable", "self_lineage_malformed", "transcript_path_missing", "transcript_not_found",
+    "transcript_unreadable", "budget_expired_no_row", "no_model_row", "window_exceeded", "internal_error",
+    "unmapped_model", "fallback_newest_row", "subagent_transcript_missing", "subagent_transcript_unreadable",
+    "subagent_id_invalid",
+]
+
+
+def _head_budget_floor():
+    """UNMEASURED_HARNESS_FLOOR["head_budget"], read from `_harness` at TEST time."""
+    return _load(HOOK_DIR / "_harness.py", "engram_harness_for_gate_test").UNMEASURED_HARNESS_FLOOR["head_budget"]
+
+
+def _site_a_payload(code, fast, home, tmp_path, monkeypatch):
+    """A payload that makes `fast.decide` reach `_unverified(code)` (one scenario per code `decide()` can emit)."""
+    one_call = write_jsonl(tmp_path / "t.jsonl", [call_row("claude-sonnet-5-5", "toolu_01")])
+    if code == "config_unreadable":
+        (home / "config.json").write_text("{not json", encoding="utf-8")
+        return pay(tpath=one_call)
+    if code == "self_lineage_malformed":
+        set_lineage(home, "opus")
+        return pay(tpath=one_call)
+    if code == "transcript_path_missing":
+        return pay()
+    if code == "transcript_not_found":
+        return pay(tpath=tmp_path / "nope")
+    if code == "transcript_unreadable":
+        return pay(tpath=tmp_path)
+    if code == "budget_expired_no_row":
+        return pay(tpath=write_jsonl(tmp_path / "a.jsonl", [user()]))
+    if code == "no_model_row":
+        return pay(tpath=write_jsonl(tmp_path / "b.jsonl", [call_row(None, "toolu_01")]))
+    if code == "window_exceeded":
+        return pay(tpath=write_jsonl(tmp_path / "c.jsonl", [user("p" * 300_000)]))
+    if code == "internal_error":
+        fast._load_runtime()
+
+        def boom(*a, **k):
+            raise RuntimeError("forced")
+
+        monkeypatch.setattr(fast, "model_of_call", boom)
+        return pay(tpath=one_call)
+    if code == "unmapped_model":
+        return pay(tpath=_call(tmp_path, "claude-opus-5 beta"))
+    if code == "fallback_newest_row":
+        return pay(tpath=write_jsonl(tmp_path / "d.jsonl", [asst("claude-opus-5-5"), user()]))
+    parent = write_jsonl(tmp_path / "sess-1.jsonl", [asst("claude-haiku-5-5")])
+    if code == "subagent_transcript_missing":
+        return sub_pay(parent)
+    if code == "subagent_transcript_unreadable":
+        (tmp_path / "sess-1" / "subagents" / f"agent-{AGENT_ID}.jsonl").mkdir(parents=True)
+        return sub_pay(parent)
+    if code == "subagent_id_invalid":
+        return sub_pay(parent, agent_id="../x")
+    raise AssertionError(code)
+
+
+@pytest.mark.parametrize("code", SITE_A_CODES)
+def test_k1_site_a_block_starts_with_the_trailer_and_carries_the_whole_notice(fast, home, tmp_path, monkeypatch,
+                                                                              code):
+    res = fast.decide(_site_a_payload(code, fast, home, tmp_path, monkeypatch), home)
+    assert res is not None, code
+    text = res["hookSpecificOutput"]["additionalContext"]
+    assert TRAILER_RE.match(text), (code, text)
+    assert unverified_text(code) in text, (code, text)                 # never silent: the notice is NOT cut
+    assert fast._unverified_text(code) == unverified_text(code)
+    assert len(unverified_text(code)) < _head_budget_floor(), code     # fits the floor head budget
+
+
+def test_k2_site_b_constant_is_exact_short_and_the_function_is_stdlib_only(hook):
+    assert hook._IMPORT_FAILED_TEXT == IMPORT_FAILED_TEXT
+    assert len(hook._IMPORT_FAILED_TEXT) <= _head_budget_floor()
+    tree = ast.parse(PRETOOL_FILE.read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_emit_import_failure")
+    seen = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Name):
+            seen.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            seen.add(n.attr)
+        elif isinstance(n, ast.Import):
+            seen.update(a.name for a in n.names)
+        elif isinstance(n, ast.ImportFrom):
+            seen.add(n.module or "")
+            seen.update(a.name for a in n.names)
+    banned = [x for x in seen if any(b in x for b in ("_harness", "_hooklib", "emit_context", "get_harness_budgets",
+                                                      "detect_harness"))]
+    assert not banned, banned
+
+
+@pytest.mark.parametrize("code", SITE_A_CODES)
+def test_k2b_healthy_imports_never_take_site_b_and_every_notice_carries_the_trailer(
+        fast, home, tmp_path, monkeypatch, capsys, code):
+    import io
+    assert fast._IMPORT_ERROR is None
+    calls = []
+    monkeypatch.setattr(fast, "_emit_import_failure", lambda *a, **k: calls.append((a, k)))
+    payload = _site_a_payload(code, fast, home, tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    assert fast.main() == 0
+    assert calls == [], code
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    assert len(lines) == 1, (code, lines)
+    text = json.loads(lines[0])["hookSpecificOutput"]["additionalContext"]
+    assert TRAILER_RE.match(text) and unverified_text(code) in text, (code, text)
+
+
+def test_k4_the_test_map_selects_the_bounds_test_for_the_model_gate_hook_and_for_a_new_hook():
+    spec = importlib.util.spec_from_file_location("rtt_for_gate_test", str(REPO / "src/engram/tools/run_touched_tests.py"))
+    rtt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rtt)
+    tmap = json.loads((SRC_ENGRAM / "packaging" / "test-map.json").read_text(encoding="utf-8"))
+    for changed in ("src/engram/hooks/claude/engram-model-gate-pretool.py",
+                    "src/engram/hooks/claude/engram-a-hook-nobody-has-written-yet.py"):
+        selected, full = rtt._resolve_convention_map(changed, tmap, str(REPO))
+        assert not full, changed
+        assert "tests/test_hook_injection_bounds.py" in selected, (changed, sorted(selected))

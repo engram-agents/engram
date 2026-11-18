@@ -71,7 +71,8 @@ _DEFAULT_PREFIXES = ("mcp__engram__", "mcp__plugin_engram_engram__")
 
 try:
     import _model_gatelib as _gate
-    from _hooklib import engram_home_or_exit as _engram_home_or_exit
+    from _hooklib import emit_context as _emit_context, engram_home_or_exit as _engram_home_or_exit
+    from _harness import detect_harness, get_harness_budgets
     _IMPORT_ERROR = None
 except (Exception, SystemExit) as _exc:  # noqa: BLE001 - `_hooklib` exits (SystemExit) at import on a relative ENGRAM_HOME; main() reports it on stderr and still exits 0
     _IMPORT_ERROR = type(_exc).__name__
@@ -163,8 +164,11 @@ def _deny(text):
 
 
 def _unverified(code):
-    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-                                   "additionalContext": _unverified_text(code)}}
+    """Allow, but say so.  The notice is rendered by the bounded renderer (trailer first, notice whole), as in
+    engram-model-gate-prompt.py; the notice is far under the head budget, so it is never cut."""
+    budget = get_harness_budgets(detect_harness())["budget"]
+    block = _emit_context(_unverified_text(code), [], budget=budget, target=budget)
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": block}}
 
 
 # --------------------------------------------------------------- tool list
@@ -335,18 +339,24 @@ def _stdlib_dormant():
         return False
 
 
+# This path runs because a helper import (possibly `_hooklib`) failed, so it cannot use the bounded renderer;
+# its length is pinned by a test instead (tests/test_model_gate_4596.py, K2).
+_IMPORT_FAILED_TEXT = (
+    "ENGRAM model-family gate: this write went through UNVERIFIED (`gate_import_failed`): the gate's own "
+    "helper modules failed to import, so it could not check which model made the call. Tell the human: the "
+    "ENGRAM plugin install may be broken.")
+
+
 def _emit_import_failure(skip_dormancy=False):
     """An import failure is never silent (code ``gate_import_failed``), unless the gate is dormant.  Standard
-    library plus `_hooklib.engram_home` (imported on its own): it must not depend on the import that failed.  The text is ``_unverified_text``'s.
+    library plus `_hooklib.engram_home` (imported on its own): it must not depend on the import that failed.  The text is the constant ``_IMPORT_FAILED_TEXT``.
     ``skip_dormancy``: the failed import was a refusal (``SystemExit``), so the home is known to be refused and
     the answer is "not dormant" without a second `_hooklib` import, which would print the refusal line again."""
     try:
         if not skip_dormancy and _stdlib_dormant():
             return
-        text = ("ENGRAM model-family gate: this write went through UNVERIFIED (`gate_import_failed`): the "
-                "gate could not confirm which model made the call.")
         sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
-                                                            "additionalContext": text}}) + "\n")
+                                                            "additionalContext": _IMPORT_FAILED_TEXT}}) + "\n")
     except Exception:  # noqa: BLE001 - a hook never raises
         pass
 
