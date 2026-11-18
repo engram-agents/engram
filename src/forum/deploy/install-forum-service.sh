@@ -1391,7 +1391,10 @@ elif [ ! -f "$DB_PATH" ]; then
   fi
 else
   mkdir -p "$ALARM_HOME"
-  chmod 0700 "$ALARM_HOME"   # four digits: also clears the setgid bit the setgid service dir hands down
+  # 0700: no group or world access. A numeric chmod keeps a directory's setgid bit, so the home
+  # may read 2700 when the service dir is setgid; that is harmless here (no group access bits)
+  # and the mode check below compares access bits only.
+  chmod 0700 "$ALARM_HOME"
   _alarm_admin token revoke forum-backup \
     || { echo "ERROR: could not revoke the old forum-backup token (forum.admin token revoke forum-backup)." >&2; exit 2; }
   rm -f "$ALARM_TOKEN"
