@@ -530,3 +530,58 @@ def test_clean_file_containing_a_form_feed_does_not_refuse(amended):
     git(h, "commit", "-q", "-m", "form feed")
     r = run(h, "--repair")
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+# -- #4214: the log output must reach the parser byte for byte --------------------------
+def test_key_after_a_lone_carriage_return_is_flagged(amended):
+    # text-mode pipes translate a lone "\r" into "\n", which strips the "+" off the key line
+    h, bare = amended
+    _expect_refused(h, bare, _plant_then_delete(h, "k.txt", b"pad\r" + (_key_line() + "\n").encode()))
+
+
+def test_key_after_several_carriage_returns_is_flagged(amended):
+    h, bare = amended
+    _expect_refused(h, bare, _plant_then_delete(h, "k.txt", b"a\rb\r" + (_key_line() + "\n").encode()))
+
+
+def test_clean_cr_only_file_does_not_refuse(amended):
+    h, bare = amended
+    (h / "cr.txt").write_bytes(b"one\rtwo\rthree\n")
+    git(h, "add", "cr.txt")
+    git(h, "commit", "-q", "-m", "cr only")
+    r = run(h, "--repair")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def _load_tool():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("backup_remote_repair_under_test", TOOL)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_every_byte_value_before_a_key_line_still_flags_the_commit(tmp_path):
+    """The class cell: one repo, one file replaced in each of 255 commits (every byte value but
+    "\\n", followed at once by a key line), one scan.  Every commit must be flagged, whatever
+    the byte layer does with that byte (decoding, newline translation, line splitting)."""
+    h = tmp_path / "repo"
+    h.mkdir()
+    git(h, "init", "-q", "-b", "master")
+    git(h, "config", "user.email", "t@example.invalid")
+    git(h, "config", "user.name", "t")
+    git(h, "config", "commit.gpgsign", "false")
+    (h / "base.txt").write_text("base\n")
+    git(h, "add", "base.txt")
+    git(h, "commit", "-q", "-m", "base")
+    key_line = (_key_line() + "\n").encode()
+    values = [b for b in range(256) if b != 0x0A]
+    for b in values:
+        (h / "f.bin").write_bytes(bytes([b]) + key_line)
+        git(h, "add", "f.bin")
+        git(h, "commit", "-q", "-m", f"byte {b:#04x}")
+    shas = git(h, "rev-list", "--reverse", "master", "^master~255").split("\n")
+    assert len(shas) == 255
+    hits = set(_load_tool()._added_line_hits(str(h), "master~255..master"))
+    missed = [f"{b:#04x}" for b, s in zip(values, shas) if s[:8] not in hits]
+    assert not missed, f"commits not flagged for bytes: {missed}"
