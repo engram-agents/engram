@@ -1639,25 +1639,27 @@ def test_k4_the_test_map_selects_the_bounds_test_for_the_model_gate_hook_and_for
         assert "tests/test_hook_injection_bounds.py" in selected, (changed, sorted(selected))
 
 
-def test_k5_the_catch_all_is_last_and_no_specific_hook_row_changed_its_selection():
-    """First-match-wins: a `hooks/claude/` catch-all placed before a specific `hooks/claude/` row shadows it.
-    The catch-all must follow every such row, and every specific row must select what origin/dev's map selects,
-    plus the bounds test for the two model-gate rows only."""
+def test_k5_the_catch_all_row_exists_and_every_specific_hook_row_selects_dev_plus_the_bounds_test():
+    """The runner takes the UNION of every matching row, so the catch-all's position no longer matters and a
+    specific `hooks/claude/` row also selects the catch-all's test. Every specific row must therefore select
+    what origin/dev's map selected for its hook, plus the bounds test, plus the narrow-directory enumerators the
+    2026-11-18 census directory rows select for a file under `src/engram/hooks/` (read off the census fixture)."""
     bounds = "tests/test_hook_injection_bounds.py"
     spec = importlib.util.spec_from_file_location("rtt_for_gate_test_k5", str(REPO / "src/engram/tools/run_touched_tests.py"))
     rtt = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rtt)
     tmap = json.loads((SRC_ENGRAM / "packaging" / "test-map.json").read_text(encoding="utf-8"))
     pats = [r.get("path_prefix_or_glob", "") for r in tmap["mappings"]]
-    ci = pats.index("hooks/claude/")
-    shadowed = [p for p in pats[ci + 1:] if p.startswith("hooks/claude/")]
-    assert not shadowed, f"specific hooks/claude/ rows after the catch-all (shadowed by it): {shadowed}"
+    catch_all = [r for r in tmap["mappings"] if r.get("path_prefix_or_glob") == "hooks/claude/"]
+    assert len(catch_all) == 1, "the hooks/claude/ catch-all row must exist exactly once"
+    assert bounds in catch_all[0]["test_globs"], catch_all[0]
     done = subprocess.run(["git", "show", "origin/dev:src/engram/packaging/test-map.json"], cwd=str(REPO),
                           capture_output=True, text=True, timeout=60)
     if done.returncode != 0:
         pytest.skip("origin/dev is not available in this checkout")
     dev = json.loads(done.stdout)
-    gate_rows = {"hooks/claude/engram-model-gate-pretool.py", "hooks/claude/engram-model-gate-prompt.py"}
+    census = json.loads((REPO / "tests" / "fixtures" / "narrow_enumerators_census_2026-11-18.json")
+                        .read_text(encoding="utf-8"))["tests"]
     checked = 0
     for p in pats:
         if not p.startswith("hooks/claude/") or p == "hooks/claude/":
@@ -1665,7 +1667,9 @@ def test_k5_the_catch_all_is_last_and_no_specific_hook_row_changed_its_selection
         path = "src/engram/" + p
         got = rtt._resolve_convention_map(path, tmap, str(REPO))
         was = rtt._resolve_convention_map(path, dev, str(REPO))
-        want = (was[0] | ({bounds} if p in gate_rows else set()), was[1])
+        by_directory = {t for t, info in census.items() if any(path.startswith(d + "/") for d in info["dirs"])}
+        # A full-suite request carries no selection; everything else gains the bounds test and the directory tests.
+        want = (set(), True) if was[1] else (was[0] | {bounds} | by_directory, False)
         assert got == want, (p, sorted(got[0]), sorted(want[0]))
         checked += 1
     assert checked >= 30, checked

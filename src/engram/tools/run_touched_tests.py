@@ -14,6 +14,9 @@ Three-layer union, deterministic, stateless (#4358):
   Layer 2 — Convention map (packaging/test-map.json):
     Non-imported surfaces (hooks, skills, templates, shell scripts) are mapped
     via a checked-in JSON file. Entries map path prefixes / globs to test globs.
+    A changed file selects the UNION of every matching row (row order does not
+    matter); a matching row with full_suite_fallback requests the full suite
+    wherever it sits.
 
   Layer 3 — Name reference (ALWAYS runs; not a fallback):
     A changed file `f` selects every tests/test_*.py that names it, by two
@@ -678,10 +681,13 @@ def _resolve_convention_map(
     """Look up changed_file in the convention map.
 
     Returns (selected_test_files, full_suite_requested).
-    full_suite_requested=True when the map entry specifies a full-suite fallback.
+    The selection is the UNION of the test globs of every matching row; row
+    order does not matter. full_suite_requested=True when ANY matching row
+    specifies a full-suite fallback, wherever it sits among the matching rows.
     """
     mappings = test_map.get("mappings", [])
     selected: set[str] = set()
+    full_requested = False
     candidates = _shipped_path_candidates(changed_file)
 
     for entry in mappings:
@@ -700,7 +706,8 @@ def _resolve_convention_map(
             continue
 
         if full_fallback:
-            return set(), True
+            full_requested = True
+            continue
 
         # Expand test globs relative to repo_root
         for tglob in test_globs:
@@ -708,9 +715,10 @@ def _resolve_convention_map(
                 rel = str(Path(m).relative_to(repo_root))
                 selected.add(rel)
 
-        # First matching entry wins
-        break
+        # No break: every matching row contributes (union of matching rows).
 
+    if full_requested:
+        return set(), True
     return selected, False
 
 
