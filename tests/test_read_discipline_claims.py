@@ -182,6 +182,15 @@ def test_inspect_is_use_and_subgraph_refreshes_neighbours():
     assert "_refresh_recall" in _called_names(_func("_subgraph_impl"))
 
 
+def test_an_id_goes_beside_plain_words_never_in_their_place():
+    """Version 5 (Lei, 2026-11-17): naming an id is use, but a reply must read
+    on its own. This is a form rule with no code behind it, so the cell only
+    pins that the sentence and its worked example stay in the section."""
+    section = _section()
+    assert "beside the plain words it stands for, never in their place" in section
+    assert "a chain of bare ids does not" in section
+
+
 def test_naming_an_id_or_citing_a_premise_is_use():
     """'... citing it as a premise, or naming its id in my reply': both are
     use actions that raise utility AND restamp, and the mention hook is wired
