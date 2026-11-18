@@ -285,9 +285,20 @@ def test_K2_alarm_posts_as_forum_backup_in_enforce_mode(tmp_path, live):
     server = live.start("enforce")
     ctx = _install_live(tmp_path, server.port)
     assert ctx.r.returncode == 0, ctx.both
+    # The production situation: the forum owner's OWN token sits in the default home the
+    # alarm would fall back to. Without the unit's ENGRAM_HOME the alarm would send it
+    # under the name forum-backup, and the server answers 403 identity mismatch.
+    import sqlite3
+    from forum.db import issue_token
+    conn = sqlite3.connect(str(live.svc / "forum.db"))
+    owner_tok = issue_token(conn, "owner-seat")
+    conn.close()
+    owner_home = tmp_path / "home" / ".engram"
+    owner_home.mkdir(parents=True, exist_ok=True)
+    (owner_home / "forum-token").write_text(owner_tok + "\n")
+    (owner_home / "forum-token").chmod(0o600)
     r = _run_alarm(ctx, tmp_path, server.url)
     assert r.returncode == 0, r.stdout + r.stderr
-    import sqlite3
     conn = sqlite3.connect(str(live.svc / "forum.db"))
     posts = conn.execute("SELECT body_md FROM posts").fetchall()
     conn.close()
