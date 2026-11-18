@@ -417,6 +417,7 @@ class TestInstallerWritesMentionDropIn:
         run(env={"USER": "plainuser"})
         assert self._value(unit_dir) == "plainuser"
 
+    # Removed-test: src/forum/tests/test_backup_alarm_units.py::TestInstallerWritesMentionDropIn::test_neither_env_nor_user_writes_an_empty_value — #4886 C5 changed the contract on purpose (an empty effective mention is now refused); replaced by test_neither_env_nor_user_is_refused_and_writes_nothing below
     @pytest.mark.parametrize("env", [{}, {"FORUM_BACKUP_ALARM_MENTION": ""},
                                      {"FORUM_BACKUP_ALARM_MENTION": " , "}],
                              ids=["neither", "empty", "separators-only"])
