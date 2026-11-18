@@ -1637,3 +1637,35 @@ def test_k4_the_test_map_selects_the_bounds_test_for_the_model_gate_hook_and_for
         selected, full = rtt._resolve_convention_map(changed, tmap, str(REPO))
         assert not full, changed
         assert "tests/test_hook_injection_bounds.py" in selected, (changed, sorted(selected))
+
+
+def test_k5_the_catch_all_is_last_and_no_specific_hook_row_changed_its_selection():
+    """First-match-wins: a `hooks/claude/` catch-all placed before a specific `hooks/claude/` row shadows it.
+    The catch-all must follow every such row, and every specific row must select what origin/dev's map selects,
+    plus the bounds test for the two model-gate rows only."""
+    bounds = "tests/test_hook_injection_bounds.py"
+    spec = importlib.util.spec_from_file_location("rtt_for_gate_test_k5", str(REPO / "src/engram/tools/run_touched_tests.py"))
+    rtt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rtt)
+    tmap = json.loads((SRC_ENGRAM / "packaging" / "test-map.json").read_text(encoding="utf-8"))
+    pats = [r.get("path_prefix_or_glob", "") for r in tmap["mappings"]]
+    ci = pats.index("hooks/claude/")
+    shadowed = [p for p in pats[ci + 1:] if p.startswith("hooks/claude/")]
+    assert not shadowed, f"specific hooks/claude/ rows after the catch-all (shadowed by it): {shadowed}"
+    done = subprocess.run(["git", "show", "origin/dev:src/engram/packaging/test-map.json"], cwd=str(REPO),
+                          capture_output=True, text=True, timeout=60)
+    if done.returncode != 0:
+        pytest.skip("origin/dev is not available in this checkout")
+    dev = json.loads(done.stdout)
+    gate_rows = {"hooks/claude/engram-model-gate-pretool.py", "hooks/claude/engram-model-gate-prompt.py"}
+    checked = 0
+    for p in pats:
+        if not p.startswith("hooks/claude/") or p == "hooks/claude/":
+            continue
+        path = "src/engram/" + p
+        got = rtt._resolve_convention_map(path, tmap, str(REPO))
+        was = rtt._resolve_convention_map(path, dev, str(REPO))
+        want = (was[0] | ({bounds} if p in gate_rows else set()), was[1])
+        assert got == want, (p, sorted(got[0]), sorted(want[0]))
+        checked += 1
+    assert checked >= 30, checked
