@@ -270,6 +270,8 @@ def test_secret_only_in_merge_resolution_refuses_and_names_the_merge(amended):
 
 
 def test_secret_on_side_branch_then_merged_refuses(amended):
+    """A regression guard, not a `-m` discriminator: the side commit is an ordinary commit in the
+    range, so this passes with or without `-m`. The next cells carry the discrimination."""
     h, bare = amended
     git(h, "checkout", "-q", "-b", "side")
     (h / "k.txt").write_text("token = " + _synthetic_key() + "\n")
@@ -286,6 +288,8 @@ def test_secret_on_side_branch_then_merged_refuses(amended):
 
 
 def test_clean_merge_in_ahead_range_does_not_refuse(amended):
+    """A control for the false-positive direction (a clean merge is not refused and is not listed
+    twice). No mutant of the log flags reddened it, so it guards the property; it does not discriminate."""
     h, bare = amended
     git(h, "checkout", "-q", "-b", "side")
     (h / "s.txt").write_text("side\n")
