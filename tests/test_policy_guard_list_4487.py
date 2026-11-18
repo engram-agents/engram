@@ -162,9 +162,10 @@ def test_the_hook_directory_scanner_is_in_the_guard_set():
     """tests/test_hook_injection_bounds.py globs src/engram/hooks/claude/*.py and names only the
     hooks of its own exemption list.
 
-    A PR that adds a hook changes a file that this test does not name, and the test-map rows are
-    first-match-wins, so a hook with its own row never reaches it by the map. It is therefore in
-    the guard set, which the runner reads from the policy and runs on every non-empty selection.
+    A PR that adds a hook changes a file that this test does not name. The test-map rows were
+    first-match-wins when this cell was written, so a hook with its own row never reached it by the
+    map; the runner now takes the union of matching rows. It stays in the guard set, which the
+    runner reads from the policy and runs on every non-empty selection.
     Three assertions in one cell: the policy names it, the runner's own reader returns it, and a
     NEW hook file selects it (the claim itself, through select_tests; the runner is what a seat runs).
     """
