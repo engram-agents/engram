@@ -826,17 +826,20 @@ seat's run is:
    scripts, until subprocess coverage is configured.
 
 **The scope is the union, and what each half covers (ruled 2026-11-18).** A seat's per-PR run is
-item 1's selection, **plus** item 2's guard set, **plus** two directory-level halves the selection
-does not reach — a run of `src/forum/tests/` for a changed file under `src/forum/`, and the
-`tools/test_*.py` files that cover a changed file under `tools/`. That is the whole union. `tests/`
-is **flat** (945 files, no per-module subdirectories), so there is no "owning directory" inside it:
+item 1's selection, **plus** item 2's guard set, **plus** two halves the selection
+does not reach — a directory run of `src/forum/tests/` for a changed file under `src/forum/`, and
+the `tools/test_*.py` files that cover a changed file under `tools/`. That is the whole union.
+`tests/` is **flat** (945 top-level `test_*.py` files — the tool's universe — with no per-module
+subdirectories), so there is no "owning directory" inside it:
 a directory run there is the whole suite this section forbids, and it is not part of the gate. The
 structural case that made this rule necessary is carried by item 4's list instead, not by a
 directory run.
 
 Measured, so the halves are not guesses: a change to `tools/forum_backup.py` selects **no** file
-under `tools/` (the selection returns the 22 guard tests and nothing else), and those tool tests run
-only in the full-suite workflow, which names them explicitly (`tests.yml`). A forum-installer change
+under `tools/` — 22 files, 21 of them the guard set and the 22nd (`tests/test_forum_backup.py`)
+selected because it imports the changed module. Those tool tests are named explicitly by two
+workflows: the full suite (`tests.yml`) and the per-PR `pr-checks.yml`, which runs the same set on
+every pull request with the forum-dependent cells skipping. A forum-installer change
 selects 25 files, none of them in `src/forum/tests/`.
 
 **Why the forum half is a directory run and the hooks half is a guard-set entry.** Both are tests
@@ -845,14 +848,14 @@ different places.
 
 - **Borrowed path (forum).** `src/forum/tests/test_verify_probe_env_3597.py` gets the installer's
   path from `from forum.tests.test_installer import _INSTALLER` and never spells the filename, so
-  the two files that do spell it (`test_installer.py:29`, `test_deploy_shape_3568.py:44`) are
+  the two files it imports from (`test_installer.py:29`, `test_deploy_shape_3568.py:44`) are
   selected and their consumers are not. The selection does not close transitively over
   test-to-test imports; that is #4891, and the forum directory run is the cover until it lands.
 - **Glob over a shipped directory (hooks).** `tests/test_hook_injection_bounds.py` globs
-  `src/engram/hooks/claude/*.py`; it names only the hooks of its own exclusion list, and it named
-  `engram-model-gate-pretool.py` **zero** times — that hook is what reddened `dev` after #4613, and
-  that PR's seat ran a hand-picked 26-file set (it could not use the selection: that range is a
-  full-suite trigger and the tool exits 7). A test with this property belongs on item 4's list,
+  `src/engram/hooks/claude/*.py`, and it names `engram-model-gate-pretool.py` **zero** times — that
+  hook is what reddened `dev` after #4613. That PR's seat (me) ran a hand-picked set rather than the
+  selection, because the range is a full-suite trigger and the tool exits 7; the selection never had
+  a chance. A test with this property belongs on item 4's list,
   which already says "a seat that finds one missing adds it"; #4894 adds this one.
 
 **The two misses on that day are the discriminating evidence**, and they rule out "just run the
@@ -865,10 +868,12 @@ red only that directory run caught. Each instrument caught what the other missed
 selects a test that borrows an artifact's path by import. The guard-set half stays: it covers a
 different shape, and no selection tool can see a glob.
 
-*Memory caution:* the forum-directory run executes more of the tree than the selection does, so run
-it under `memrun`. A test that reaches a real environment build allocates far past a test run's
-expectable footprint. `memrun` bounds **memory**; the build's *disk* cost is a separate hazard that
-`memrun` does not bound.
+*Memory and disk caution:* the forum-directory run executes more of the tree than the selection does,
+so run it under `memrun`. A test that reaches a real environment build allocates far past a test
+run's expectable footprint. `memrun` caps memory hard (a cgroup `MemoryMax`); its disk protection is
+a **pre-flight floor**, not a cap — it refuses to launch (exit 75) when free space minus
+`--disk-need` minus other claims would fall below `max(5% of the volume, 20 GiB)` — so it bounds
+disk only for a job launched through it, and only as well as the `--disk-need` it was given.
 
 The **whole suite** runs in two places only: the scheduled nightly on `dev`
 (`.github/workflows/nightly.yml`), which is the backstop for what per-PR selection misses, and the
