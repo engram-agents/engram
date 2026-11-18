@@ -63,8 +63,8 @@ NO_HOME = {"engram-bash-pipe-exit-warn.py"}
 # rule by being added here; every other hook, and the prompt-side gate hook, stays silent on stdout.
 WRITE_GATE_HOOKS = frozenset({"engram-model-gate-pretool.py"})
 GATE_IMPORT_FAILED_NOTICE = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": (
-    "ENGRAM model-family gate: this write went through UNVERIFIED (`gate_import_failed`): the gate could not "
-    "confirm which model made the call.")}}
+    "ENGRAM model-family gate: this write went through UNVERIFIED (`gate_import_failed`): the gate's own helper modules failed to import, so it could not check "
+    "which model made the call. Tell the human: the ENGRAM plugin install may be broken.")}}
 WRITE_PAYLOAD = json.dumps({"session_id": "s1", "hook_event_name": "PreToolUse",
                             "tool_name": "mcp__engram__engram_add_observation", "tool_use_id": "toolu_01",
                             "transcript_path": "/nonexistent/t.jsonl", "cwd": "/tmp", "tool_input": {}})
