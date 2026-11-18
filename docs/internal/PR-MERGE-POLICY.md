@@ -826,21 +826,28 @@ seat's run is:
    scripts, until subprocess coverage is configured.
 
 **The scope is the union, and what each half covers (ruled 2026-11-18).** A seat's per-PR run is
-item 1's selection, **plus** item 2's guard set, **plus** two halves the selection
-does not reach — a directory run of `src/forum/tests/` for a changed file under `src/forum/`, and
-the `tools/test_*.py` files that cover a changed file under `tools/`. That is the whole union.
-`tests/` is **flat** (945 top-level `test_*.py` files — the tool's universe — with no per-module
-subdirectories), so there is no "owning directory" inside it:
-a directory run there is the whole suite this section forbids, and it is not part of the gate. The
-structural case that made this rule necessary is carried by item 4's list instead, not by a
-directory run.
+item 1's selection, **plus** item 2's guard set, **plus** two halves the selection does not reach —
+a directory run of `src/forum/tests/` for a changed file under `src/forum/` (**until #4891 lands**;
+see the removal condition below), and the `tools/test_*.py` files that cover a changed file under
+`tools/`. That is the union for the shapes we have observed. `tests/` is **flat at the top level**
+(945 `test_*.py` files — the tool's universe, which is
+non-recursive), so there is no per-module subdirectory to run: a directory run there is the whole
+suite this section forbids, and it is not part of the gate. The structural case that made this rule
+necessary is carried by item 4's list instead, not by a directory run.
 
-Measured, so the halves are not guesses: a change to `tools/forum_backup.py` selects **no** file
-under `tools/` — 22 files, 21 of them the guard set and the 22nd (`tests/test_forum_backup.py`)
-selected because it imports the changed module. Those tool tests are named explicitly by two
-workflows: the full suite (`tests.yml`) and the per-PR `pr-checks.yml`, which runs the same set on
-every pull request with the forum-dependent cells skipping. A forum-installer change
-selects 25 files, none of them in `src/forum/tests/`.
+**Two test homes sit outside every half** (found by the round-3 review, verified):
+`tests/cascade_scenarios/` — 10 nested files the non-recursive universe never names, so a change to
+`src/engram/engram_derive.py` selects 260 files and none of them — and
+`src/engram/tools/test_tripwire.py`. Neither is a hole: `pr-checks` runs both on every PR. They are
+named so a reader does not take the union as exhaustive.
+
+Measured with the selector at dev `9174f642`, so the halves are not guesses: a change to
+`tools/forum_backup.py` selects **no** file under `tools/` — 22 files, 21 of them the guard set and
+the 22nd (`tests/test_forum_backup.py`) selected because it imports the changed module. (The count
+moves with item 4's list: #4894 adds a guard, so this reads 23 once it merges.) Those tool tests are
+named explicitly by two workflows: the full suite (`tests.yml`) and the per-PR `pr-checks.yml`,
+which runs the same set on every pull request with the forum-dependent cells skipping. A
+forum-installer change selects 25 files, none of them in `src/forum/tests/`.
 
 **Why the forum half is a directory run and the hooks half is a guard-set entry.** Both are tests
 that discover their subject **structurally**, so item 1 cannot select them — but they are fixed in
@@ -849,13 +856,14 @@ different places.
 - **Borrowed path (forum).** `src/forum/tests/test_verify_probe_env_3597.py` gets the installer's
   path from `from forum.tests.test_installer import _INSTALLER` and never spells the filename, so
   the two files it imports from (`test_installer.py:29`, `test_deploy_shape_3568.py:44`) are
-  selected and their consumers are not. The selection does not close transitively over
-  test-to-test imports; that is #4891, and the forum directory run is the cover until it lands.
+  selected; a consumer that only imports their constant is not. The selection does not close
+  transitively over test-to-test imports; that is #4891, and the forum directory run is the cover
+  until it lands.
 - **Glob over a shipped directory (hooks).** `tests/test_hook_injection_bounds.py` globs
   `src/engram/hooks/claude/*.py`, and it names `engram-model-gate-pretool.py` **zero** times — that
-  hook is what reddened `dev` after #4613. That PR's seat (me) ran a hand-picked set rather than the
-  selection, because the range is a full-suite trigger and the tool exits 7; the selection never had
-  a chance. A test with this property belongs on item 4's list,
+  hook is what reddened `dev` after #4613. The seat that pressed that PR ran a hand-picked set
+  rather than the selection, because the range is a full-suite trigger and the tool exits 7; the
+  selection never had a chance. A test with this property belongs on item 4's list,
   which already says "a seat that finds one missing adds it"; #4894 adds this one.
 
 **The two misses on that day are the discriminating evidence**, and they rule out "just run the
