@@ -30,7 +30,9 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,12 +62,16 @@ def _hermetic_env(home: Path, path_prefix: Path | None = None, **extra) -> dict:
     """The ONE environment every subprocess here runs under."""
     env = dict(os.environ)
     env.pop("ENGRAM_HOME", None)
-    env.pop("FORUM_BACKUP_ALARM_MENTION", None)
+    env["FORUM_BACKUP_ALARM_MENTION"] = "testseat"  # #4886: the installer refuses an empty mention; USER may be unset in CI
     env["HOME"] = str(home)
     env["XDG_CONFIG_HOME"] = str(home / ".config")
     if path_prefix is not None:
         env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
-    env.update(extra)
+    for k, v in extra.items():
+        if v is None:   # #4886: a cell can UNSET a variable (the installer's mention default)
+            env.pop(k, None)
+        else:
+            env[k] = v
     return env
 
 
@@ -83,6 +89,23 @@ def _stubs(tmp_path: Path, primary_group: str | None = None) -> tuple[Path, Path
         f = stub / name
         f.write_text(f'#!/bin/sh\necho "{name} $*" >> "{log}"\nexit 0\n')
         f.chmod(0o755)
+    # Disk guard (#4886): the installer reuses a venv only if `<venv>/bin/python -c "import flask"`
+    # succeeds, and the wrapper pythons some cells install exec the TEST interpreter, so on a host
+    # whose pytest python cannot import flask the installer falls through to `python3 -m venv` +
+    # `pip install -r requirements.txt` (sentence-transformers: tens of GB). A python3 first on
+    # PATH refuses both, loudly (exit 97; it logs ONLY the refused call, so cells that assert an
+    # empty stub log stay valid), and runs the real python3 for everything else.
+    real_py3 = shutil.which("python3") or sys.executable
+    guard = stub / "python3"
+    guard.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in *"-m venv"*|*"-m pip"*)\n'
+        f'  echo "python3 $*" >> "{log}"\n'
+        '  echo "REFUSED: a test must never build a venv or pip-install (python3 $*)" >&2\n'
+        "  exit 97;; esac\n"
+        f'exec {shlex.quote(real_py3)} "$@"\n'
+    )
+    guard.chmod(0o755)
     if primary_group is not None:
         real_id = subprocess.run(["which", "id"], capture_output=True, text=True).stdout.strip()
         idf = stub / "id"
@@ -133,7 +156,7 @@ def _install(tmp_path: Path, *, service_dir_arg: bool = True, dry_run: bool = Fa
              primary_group: str | None = None, group: str | None = "auto",
              extra_args: tuple = (), svc_name: str = "forum",
              service_dir_value: str | None = None, env_extra: dict | None = None,
-             cwd: Path | None = None) -> SimpleNamespace:
+             cwd: Path | None = None, expect_build_refusal: bool = False) -> SimpleNamespace:
     home = tmp_path / "home"
     unit_dir = home / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
@@ -161,8 +184,24 @@ def _install(tmp_path: Path, *, service_dir_arg: bool = True, dry_run: bool = Fa
     r = subprocess.run(args, capture_output=True, text=True,
                        env=_hermetic_env(home, stub, **(env_extra or {})), cwd=cwd,
                        timeout=60)  # a hang is a red cell, not a stuck suite (#3600)
-    return SimpleNamespace(r=r, home=home, unit_dir=unit_dir, svc=svc, log=log,
-                           out=r.stdout, err=r.stderr, both=r.stdout + r.stderr)
+    ctx = SimpleNamespace(r=r, home=home, unit_dir=unit_dir, svc=svc, log=log,
+                          out=r.stdout, err=r.stderr, both=r.stdout + r.stderr)
+    if not expect_build_refusal:
+        _assert_no_venv_build(ctx, dry_run)
+    return ctx
+
+
+def _assert_no_venv_build(ctx, dry_run: bool = False) -> None:
+    """Disk guard (#4886): a real run that reached the installer's venv-build branch means the
+    wrapper venv python could not `import flask` under this env (e.g. flask only in a USER
+    site-packages while HOME is pinned to a temp dir). Fail with the reason; the python3 stub
+    in `_stubs` has already refused the build itself (exit 97)."""
+    if dry_run:  # --dry-run prints the build line and runs nothing
+        return
+    assert "Building self-contained venv" not in ctx.both and "REFUSED:" not in ctx.both, (
+        "the installer reached its venv-build branch: the test interpreter cannot import flask "
+        "under the hermetic env (is flask only in a user site-packages?). Nothing was built. "
+        "Run pytest with an interpreter that has flask in a non-user site.\n" + ctx.both)
 
 
 def _log(ctx) -> str:
@@ -337,6 +376,9 @@ class TestKeptBackupUnit:
 # The check itself, driven through the marked region (parse + parent cells)
 # ---------------------------------------------------------------------------
 
+# #4886: the alarm mention is resolved in its own marked region (the installer's argument
+# stage); the backup-units region only consumes `_mention`, so the harness runs both.
+_MENTION_REGION = re.compile(r"^# >>> alarm-mention\n(.*?)^# <<< alarm-mention\n", re.S | re.M)
 _REGION = re.compile(r"^# >>> backup-units\n(.*?)^# <<< backup-units\n", re.S | re.M)
 
 
@@ -360,7 +402,7 @@ def _check(tmp_path: Path, unit_text: str, *, home_files: tuple = ()) -> SimpleN
         "set -euo pipefail\n"
         f"SRC={shlex.quote(str(_REPO))}\nUNIT_DIR={shlex.quote(str(unit_dir))}\n"
         f"SERVICE_DIR={shlex.quote(str(svc))}\nDRY_RUN=0\n"
-        'RUN() { "$@"; }\n' + m.group(1) +
+        'RUN() { "$@"; }\n' + _MENTION_REGION.search(text).group(1) + m.group(1) +
         f'\n_check_backup_exec_paths "$UNIT_DIR/{PROBE}"\necho CHECK-PASSED\n'
     )
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
@@ -1267,3 +1309,47 @@ class TestNameFlags3603:
         # Structural pin on the extracted line: -F and the `--` end-of-options guard.
         line = [l for l in INSTALLER.read_text().splitlines() if "grep -qx" in l]
         assert len(line) == 1 and "grep -qxF -- " in line[0], line
+
+
+# ---------------------------------------------------------------------------
+# Disk guard (#4886): no cell can ever build a real venv, whatever interpreter runs pytest
+# ---------------------------------------------------------------------------
+
+class TestNoRealVenvBuild:
+
+    def _flaskless_venv(self, tmp_path: Path) -> None:
+        """A venv python that cannot `import flask` (a flask-less pytest host, simulated)."""
+        py = tmp_path / "forum" / ".venv" / "bin" / "python"
+        py.parent.mkdir(parents=True)
+        py.write_text('#!/bin/sh\ncase "$*" in *"import flask"*) exit 1;; esac\nexit 0\n')
+        py.chmod(0o755)
+        (tmp_path / "forum" / "app").mkdir(parents=True)
+
+    def test_stub_refuses_venv_and_pip_and_passes_everything_else(self, tmp_path):
+        stub, log = _stubs(tmp_path)
+        env = {**os.environ, "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}"}
+        for argv in (["-m", "venv", str(tmp_path / "v")], ["-m", "pip", "install", "x"],
+                     ["-B", "-m", "venv", str(tmp_path / "v")]):
+            r = subprocess.run(["python3", *argv], capture_output=True, text=True, env=env)
+            assert r.returncode == 97, (argv, r.stdout, r.stderr)
+            assert "REFUSED" in r.stderr
+        assert not (tmp_path / "v").exists()
+        ok = subprocess.run(["python3", "-c", "print('real-ran')"], capture_output=True,
+                            text=True, env=env)
+        assert ok.returncode == 0 and ok.stdout.strip() == "real-ran", ok.stderr
+
+    def test_installer_on_a_flaskless_host_fails_loudly_instead_of_building(self, tmp_path):
+        self._flaskless_venv(tmp_path)
+        ctx = _install(tmp_path, prep=False, expect_build_refusal=True)
+        assert ctx.r.returncode != 0, ctx.both
+        assert "Building self-contained venv" in ctx.both   # the branch was reached ...
+        assert "REFUSED: a test must never build a venv" in ctx.both  # ... and refused
+        assert "python3 -m venv" in _log(ctx)              # the stub saw (and logged) the call
+        assert not any("pip" in ln and "REFUSED" not in ln for ln in _log(ctx).splitlines()
+                       if ln.startswith("python3") and "-m venv" not in ln), _log(ctx)
+        assert not (ctx.svc / ".venv" / "bin" / "pip").exists()  # nothing real was built
+
+    def test_a_cell_that_reaches_the_build_branch_is_reported_with_the_reason(self, tmp_path):
+        self._flaskless_venv(tmp_path)
+        with pytest.raises(AssertionError, match="cannot import flask"):
+            _install(tmp_path, prep=False)

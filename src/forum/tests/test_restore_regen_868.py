@@ -202,7 +202,15 @@ def _run_block(tmp_path: Path, *, model: bool, corrupt: bool = False,
         cut = max(i for i, ln in enumerate(lines) if ln.strip() == "COMMIT;")
         dump.write_text("".join(lines[:cut]))
 
-    ctx = _install(tmp_path)
+    # #4886: with a forum.db present the installer issues the alarm's token through the venv
+    # python, so that python must be a real interpreter (a stub that exits 0 issues nothing
+    # and the installer refuses on the missing token file).
+    (tmp_path / "forum" / "app").mkdir(parents=True)
+    pre_py = tmp_path / "forum" / ".venv" / "bin" / "python"
+    pre_py.parent.mkdir(parents=True)
+    pre_py.write_text(f'#!/bin/sh\nexec {sys.executable} "$@"\n')
+    pre_py.chmod(0o755)
+    ctx = _install(tmp_path, prep=False)
     assert ctx.r.returncode == 0, ctx.both
     svc = ctx.svc
     if model:  # the model is available: the embedding phase is a stand-in that succeeds
