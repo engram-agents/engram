@@ -825,6 +825,36 @@ seat's run is:
    coverage cannot see code that runs as a subprocess, which covers this repo's hooks and shell
    scripts, until subprocess coverage is configured.
 
+**The scope is the union, not the selection (ruled 2026-11-18).** Until #4891 lands, a seat's
+per-PR run is the **union** of item 1's selection, item 2's guard set, the scanners, and **a run
+of the test directory that owns each changed file**. The selection is not a superset of that
+directory: a test that discovers its subject **structurally** names no changed file, so item 1
+cannot select it. Two shapes, both measured on 2026-11-18:
+
+- it **globs a directory** — `tests/test_hook_injection_bounds.py` walks `src/engram/hooks/claude/*.py`
+  and names no hook, so a hook PR selects nothing for it;
+- it **borrows an artifact's path by import** —
+  `src/forum/tests/test_verify_probe_env_3597.py` gets the installer's path from
+  `from forum.tests.test_installer import _INSTALLER` and never spells the filename, so only the
+  file that spells it (`test_deploy_shape_3568.py`) is selected, not its consumers. That second
+  shape is #4891; the selection does not close transitively over test-to-test imports.
+
+The two misses on that day are the discriminating evidence, and they rule out "just run the wider
+one" — on the same PR, in the same range, each instrument caught what the other missed:
+#4890's selection listed `tests/test_forum_redirect_origin_1459.py`, a red the press missed because
+it ran only the owning directory, while the selection omitted
+`src/forum/tests/test_verify_probe_env_3597.py`, a red only the directory run caught; and #4613's
+directory-scanning bounds test was in neither the author's 26-file selection nor the guard set, and
+`dev` went red.
+
+**Re-read this clause when #4891 merges**, and delete the directory-run half then if the selection
+has closed the gap — otherwise the union becomes an unbounded habit rather than a bound on a known
+hole.
+
+*Disk caution:* an owning-directory run executes more of the tree than the selection does, so run
+it under `memrun`. A test that reaches a real environment build can allocate far past a test run's
+expectable footprint — tens of GB, measured on this host on 2026-11-18.
+
 The **whole suite** runs in two places only: the scheduled nightly on `dev`
 (`.github/workflows/nightly.yml`), which is the backstop for what per-PR selection misses, and the
 release cut, before a tag. A red the nightly finds goes to the PR that caused it.
