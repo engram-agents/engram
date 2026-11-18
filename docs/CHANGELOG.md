@@ -94,7 +94,7 @@ with an `-alpha` suffix during the alpha phase.
   the written version is the source version plus the `-dev.` stamp. (engram#1624)
 
 ### Fixed
-- The backup repair tool's ahead-range secret scan (step 4b) now reads merge commits. `git log -p` prints no diff for a merge unless `-m` is given, so a key added only in a merge resolution was missed. It uses `-m` alone, not `--first-parent`, so commits that arrived through the merged-in side are still scanned. The rewrite guard's docstring and hook header now say what it protects: it refuses rewriting a commit still reachable from `refs/remotes/origin/*`, not one that was ever pushed. (part of #4214)
+- The backup repair tool's ahead-range secret scan (step 4b) now reads merge commits. `git log -p` prints no diff for a merge unless `-m` is given, so a key added only in a merge resolution was missed. It uses `-m` alone, not `--first-parent`, so commits that arrived through the merged-in side are still scanned. The rewrite guard's docstring and hook header now say what it protects: it refuses rewriting a commit still reachable from `refs/remotes/origin/*`, not one that was ever pushed. (engram#4214)
 - Retractions made before the cascade machine existed now mark the nodes built on them. A one-time
   migration (schema 11) walks each retracted node that has no retract marker with the same walk a
   retraction uses today, and writes one pending marker per live claim-bearing dependent
