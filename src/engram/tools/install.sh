@@ -338,27 +338,6 @@ notes.extend(l.strip() for l in buf.getvalue().splitlines() if l.strip())
 out({"created": "created", "merged": "updated", "unchanged": "unchanged"}[result])
 PY
 
-read -r -d '' PY_NODE_COUNT <<'PY' || true
-import sqlite3, sys
-from pathlib import Path
-db = sys.argv[1]
-try:
-    con = sqlite3.connect(Path(db).absolute().as_uri() + "?mode=ro", uri=True, timeout=5)
-    try:
-        try:
-            n = con.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
-        except sqlite3.OperationalError as exc:
-            if "no such table" not in str(exc).lower():
-                raise
-            n = 0
-    finally:
-        con.close()
-except Exception as exc:
-    print("ERR %s: %s" % (db, exc))
-    sys.exit(1)
-print(n)
-PY
-
 # Reads `claude plugin list --json` from a file; exit 0 only if engram@engram-local is listed
 # with enabled == true. The JSON shape is not documented, so any object that carries an
 # `enabled` key and names the plugin (the id string, or name + marketplace) counts.
@@ -579,6 +558,9 @@ step_ok
 #   present, 0 nodes        -> run it with FORCE_RESEED_EMPTY=1 (an aborted run, or the empty
 #                              file a daemon created) and say so
 #   present, non-empty      -> skip it and print the node count (the upgrade case)
+# The count is tools/store_read.py node-count (#2652 unit 04): through the engramd owner when its flag is ON and
+# an owner answers, else a mode=ro open; it names the path it took on one stderr line. Exit 3 is an owner
+# refusal and stops here: a refused count is never read as 0, because 0 means re-seed.
 begin_step 6 "bootstrap"
 BOOTSTRAP_RAN=0
 _run_bootstrap=0
@@ -588,9 +570,19 @@ if [ ! -e "$DB_PATH" ]; then
   _run_bootstrap=1
   _state_note="knowledge.db absent: seeding"
 else
-  if ! _nodes="$(python3 -c "$PY_NODE_COUNT" "$DB_PATH")"; then
-    fail "${_nodes#ERR }" "release any lock on the database, or restore it from backup, and re-run"
+  _count_rc=0
+  _nodes="$(python3 "$TOOLS_DIR/store_read.py" node-count --db "$DB_PATH")" || _count_rc=$?
+  if [ "$_count_rc" -eq 3 ]; then
+    fail "the engramd owner refused the node count of $DB_PATH (the store_read line above names why); nothing was re-seeded" \
+      "start or restart the owner, or set engramd.store_read_reads_via_owner to false in $ENGRAM_HOME/config.json, and re-run"
+  elif [ "$_count_rc" -ne 0 ]; then
+    fail "could not count the nodes in $DB_PATH (store_read exit $_count_rc; the line above names why)" \
+      "release any lock on the database, or restore it from backup, and re-run"
   fi
+  case "$_nodes" in
+    ''|*[!0-9]*) fail "store_read printed no node count for $DB_PATH (got '$_nodes')" \
+      "release any lock on the database, or restore it from backup, and re-run" ;;
+  esac
   if [ "$_nodes" = "0" ]; then
     _run_bootstrap=1
     _force_empty=1

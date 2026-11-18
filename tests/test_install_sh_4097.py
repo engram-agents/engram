@@ -84,6 +84,11 @@ class Sandbox:
         # Step 3 writes install_tier through the checkout's file guard (stdlib only), so a
         # repo-shaped tree carries it beside tools/.
         shutil.copy(REPO_ROOT / "src" / "engram" / "engram_file_guard.py", self.tools_src.parent / "engram_file_guard.py")
+        # Step 6 counts nodes with the checkout's own tools/store_read.py (#2652 unit 04), which needs its
+        # owner-read helper and, with the owner flag ON, the runtime client beside tools/.
+        for rel in ("tools/store_read.py", "tools/_owner_read.py", "tools/__init__.py", "engramd_client.py",
+                    "engramd_owner_flags.py", "engram_home_resolver.py", "engram_pidfile.py", "engram_regular_io.py"):
+            shutil.copy(REPO_ROOT / "src" / "engram" / rel, self.tools_src.parent / rel)
         (self.repo / "tools").mkdir()
         (self.repo / "tools" / "install.sh").symlink_to("../src/engram/tools/install.sh")
         (self.repo / "requirements").mkdir()

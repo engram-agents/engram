@@ -252,7 +252,8 @@
       "key": "a81aff5ee1cfc444b6044abc808bcd8573b6e94d771e505c5119ca6678b91046",
       "sql": "SELECT COUNT(*) FROM nodes",
       "sites": [
-        "hooks/claude/engram-session-start-hook.py:sleep_status_block"
+        "hooks/claude/engram-session-start-hook.py:sleep_status_block",
+        "tools/store_read.py:read_node_count"
       ]
     },
     {
