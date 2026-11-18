@@ -183,6 +183,68 @@ def test_the_hook_directory_scanner_is_in_the_guard_set():
     assert name in selected, f"a new hook file does not select {name}"
 
 
+# The whole-tree enumerators the 2026-11-18 census found outside the guard set (Kepler's ruling, 2026-11-18):
+# each enumerates the shipped tree or the tracked tree and asserts something about every file, so a change to
+# a file it never names can redden it.  Scope of the census: scans done in-process and through git ls-files /
+# git grep; a scan done in any other subprocess is unseen, and 601 test files that list no directory were not read.
+WHOLE_TREE_ENUMERATORS = [
+    "tests/test_3765_nul_guard.py",
+    "tests/test_boot_charge_loop_prompt_4139a.py",
+    "tests/test_changed_concurrently_fold_4188.py",
+    "tests/test_cites_evidence_only_2243.py",
+    "tests/test_clear_stale_daemon_3493.py",
+    "tests/test_conftest_service_manager_guard_3519.py",
+    "tests/test_edge_liveness_ssot_3542.py",
+    "tests/test_engram_client_isolation.py",
+    "tests/test_engram_core_seam.py",
+    "tests/test_engram_core_sys_bound_3222.py",
+    "tests/test_fix_git_backup_canonical_gitignore_4506.py",
+    "tests/test_full_length_hashes_resolve.py",
+    "tests/test_launchers_relative_engram_home_3863.py",
+    "tests/test_metricgate_adapter.py",
+    "tests/test_never_clobber_contract.py",
+    "tests/test_os_harness_check.py",
+    "tests/test_readme_dev_trees_section.py",
+    "tests/test_recall_summary_writes.py",
+    "tests/test_relative_engram_home_step3a_3863.py",
+    "tests/test_retire_runtime_keys_4255s2.py",
+    "tests/test_retired_axis_residue_4255s7.py",
+    "tests/test_retired_multi_agent_axis_4255s3.py",
+    "tests/test_ro_uri_quoting_3514.py",
+    "tests/test_run_touched_tests_4358.py",
+    "tests/test_scan_leaks.py",
+    "tests/test_session_start_no_starred_4272.py",
+    "tests/test_sleep_skill_cohort_boundary.py",
+    "tests/test_snapshot_worker_orphan_4833.py",
+    "tests/test_stray_baton_path_check.py",
+    "tests/test_surface_label_keyed_4305.py",
+    "tests/test_ws3_telemetry_resolver.py",
+]
+
+
+def _runner_module():
+    rtt_path = REPO_ROOT / "src" / "engram" / "tools" / "run_touched_tests.py"
+    rspec = importlib.util.spec_from_file_location("run_touched_tests_4487_wt", str(rtt_path))
+    rtt = importlib.util.module_from_spec(rspec)
+    rspec.loader.exec_module(rtt)
+    return rtt
+
+
+def test_the_whole_tree_enumerator_list_has_thirty_one_distinct_files_that_exist():
+    """A silently shortened list must not pass: 31 distinct names, each a file on disk."""
+    assert len(WHOLE_TREE_ENUMERATORS) == len(set(WHOLE_TREE_ENUMERATORS)) == 31
+    missing = [n for n in WHOLE_TREE_ENUMERATORS if not (REPO_ROOT / n).is_file()]
+    assert not missing, f"listed but not on disk: {missing}"
+
+
+@pytest.mark.parametrize("name", WHOLE_TREE_ENUMERATORS)
+def test_each_whole_tree_enumerator_is_named_by_the_policy_and_returned_by_the_runner(name):
+    """Policy names it AND the runner's own guard_set() returns it (the runner is what a seat runs)."""
+    assert name in _real_paths(), f"item 4 does not name {name}"
+    guard_tests, _tool_checks = _runner_module().guard_set(str(REPO_ROOT))
+    assert name in guard_tests, f"the runner's guard set does not return {name}"
+
+
 def test_a_directory_with_a_listed_name_does_not_count_as_a_file(tmp_path):
     (tmp_path / "tests" / "test_dirlike.py").mkdir(parents=True)
     message = _missing_message(["tests/test_dirlike.py"], tmp_path)

@@ -467,6 +467,40 @@ seat can run it and any other seat can check that it ran.
    which was already among the five the seat ran by name, and
    `test_prose_tail_6c_venv.py`, which sat in no guard list and reached the run
    only because the ratchets were by then in it by name.
+   **Whole-tree enumerators added by the 2026-11-18 census** (Kepler's ruling, same day). A
+   measurement of every test file (each run alone, the directories it listed recorded, each
+   candidate then read) found 31 more tests that enumerate the shipped tree or the tracked tree
+   and assert something about every file, and that no changed file selects. A directory row for
+   them would fire on nearly every PR, so they are guard tests by the definition above. Run alone,
+   in order, on one seat, they took 142 s in all (31 separate pytest starts); the four longest
+   were `tests/test_never_clobber_contract.py` (30 s), `tests/test_run_touched_tests_4358.py` (20 s),
+   `tests/test_retire_runtime_keys_4255s2.py` (17 s),
+   `tests/test_snapshot_worker_orphan_4833.py` (9 s). If the per-PR run grows uncomfortable, the
+   repair is to make those four faster, not to drop them (#4900). By what they scan:
+   - the tracked tree, through `git ls-files` or `git grep`:
+     `tests/test_launchers_relative_engram_home_3863.py`, `tests/test_os_harness_check.py`,
+     `tests/test_readme_dev_trees_section.py`, `tests/test_retired_multi_agent_axis_4255s3.py`,
+     `tests/test_ro_uri_quoting_3514.py`, `tests/test_scan_leaks.py`,
+     `tests/test_stray_baton_path_check.py`.
+   - `src/`, `tools/`, `deploy/` or `docs/`: `tests/test_boot_charge_loop_prompt_4139a.py`,
+     `tests/test_clear_stale_daemon_3493.py`, `tests/test_conftest_service_manager_guard_3519.py`,
+     `tests/test_fix_git_backup_canonical_gitignore_4506.py`, `tests/test_metricgate_adapter.py`,
+     `tests/test_never_clobber_contract.py`, `tests/test_recall_summary_writes.py`,
+     `tests/test_relative_engram_home_step3a_3863.py`,
+     `tests/test_retired_axis_residue_4255s7.py`, `tests/test_run_touched_tests_4358.py`,
+     `tests/test_session_start_no_starred_4272.py`, `tests/test_snapshot_worker_orphan_4833.py`,
+     `tests/test_surface_label_keyed_4305.py`.
+   - `src/engram/`: `tests/test_3765_nul_guard.py`,
+     `tests/test_changed_concurrently_fold_4188.py`, `tests/test_cites_evidence_only_2243.py`,
+     `tests/test_edge_liveness_ssot_3542.py`, `tests/test_engram_client_isolation.py`,
+     `tests/test_engram_core_seam.py`, `tests/test_engram_core_sys_bound_3222.py`,
+     `tests/test_retire_runtime_keys_4255s2.py`, `tests/test_sleep_skill_cohort_boundary.py`,
+     `tests/test_ws3_telemetry_resolver.py`.
+   - `tests/` itself: `tests/test_full_length_hashes_resolve.py`.
+   Scope of the census, wherever it is cited: scans done in-process and through `git ls-files` or
+   `git grep` were seen; a scan done in any other subprocess was not, and 601 test files that list
+   no directory were not read. Narrow-directory enumerators (23 more) are a separate change to the
+   runner, not this list.
    **Record the base SHA the scratch merge used** (`git rev-parse origin/<base>` at
    the time of the run, after a fetch); item 8 asserts against it and item 10 names
    it (Borges, 2026-10-22).
