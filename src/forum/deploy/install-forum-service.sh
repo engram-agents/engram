@@ -236,9 +236,14 @@ _refuse_bad_name() {
 
 # The arguments this run received, kept for the first-install WARN (#4886), which prints the
 # exact re-run. Quoted with printf %q so the printed line can be pasted back into a shell.
-_RERUN_CMD="bash $(printf '%q' "$0")"
-for _a in "$@"; do _RERUN_CMD="$_RERUN_CMD $(printf '%q' "$_a")"; done
-unset _a
+# Only when $0 names a readable file: under `bash -s` / stdin it is just "bash", and a command
+# built from it would not run, so the command is left empty and the WARN says so instead.
+_RERUN_CMD=""
+if [ -f "$0" ] && [ -r "$0" ]; then
+  _RERUN_CMD="bash $(printf '%q' "$0")"
+  for _a in "$@"; do _RERUN_CMD="$_RERUN_CMD $(printf '%q' "$_a")"; done
+  unset _a
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1371,8 +1376,19 @@ if [ "$DRY_RUN" -eq 1 ]; then
 elif [ ! -f "$DB_PATH" ]; then
   echo "    WARN: no forum.db at $DB_PATH yet, so no alarm token was issued and none was verified." >&2
   echo "          The failure alarm cannot post until then (it refuses to run with no token)." >&2
-  echo "          After the DB cutover, re-run this installer, exactly:" >&2
-  echo "            $_RERUN_CMD" >&2
+  if [ -z "$_RERUN_CMD" ]; then
+    echo "          After the DB cutover, re-run this installer. The command could not be reconstructed" >&2
+    echo "          (it was not started from a file); re-run it the way it was started, with the same" >&2
+    echo "          arguments and the same FORUM_BACKUP_ALARM_MENTION if you set one." >&2
+  else
+    # A mention that came from the environment must ride along, or the pasted line rewrites
+    # mention.conf with the default and the alarm pages the wrong person.
+    if [ -n "${FORUM_BACKUP_ALARM_MENTION+x}" ]; then
+      _RERUN_CMD="FORUM_BACKUP_ALARM_MENTION=$(printf '%q' "$FORUM_BACKUP_ALARM_MENTION") $_RERUN_CMD"
+    fi
+    echo "          After the DB cutover, re-run this installer, exactly:" >&2
+    echo "            $_RERUN_CMD" >&2
+  fi
 else
   mkdir -p "$ALARM_HOME"
   chmod 0700 "$ALARM_HOME"   # four digits: also clears the setgid bit the setgid service dir hands down
@@ -1416,7 +1432,7 @@ PY
   )" || _res="error error"
   _a="${_res%% *}"; _b="${_res##* }"
   if [ "$_a" != "200" ] || [ "$_b" != "401" ]; then
-    echo "ERROR: alarm identity check FAILED: GET $_path with the real token answered HTTP $_a (want 200); with an invalid token answered HTTP $_b (want 401). The token in $ALARM_TOKEN does not resolve to forum-backup on the live forum, or the forum does not refuse a bad token." >&2
+    echo "ERROR: alarm identity check FAILED: GET $_path with the real token answered HTTP $_a (want 200); with an invalid token answered HTTP $_b (want 401). The token in $ALARM_TOKEN does not resolve to forum-backup on the live forum, or the forum does not refuse a bad token. The install is otherwise in place (units written, token rotated and saved in $ALARM_TOKEN), but the alarm cannot post until this check passes. To re-check, re-run this installer (it rotates the token and repeats the check)." >&2
     exit 2
   fi
   echo "    OK: alarm token resolves to forum-backup (GET $_path: real token 200, invalid token 401)"

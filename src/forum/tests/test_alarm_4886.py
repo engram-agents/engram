@@ -50,8 +50,8 @@ from types import SimpleNamespace
 import pytest
 
 from .test_deploy_shape_3568 import (ALARM, ALARM_TEMPLATE, DEPLOY, INSTALLER, _digest,
-                                     _hermetic_env, _prep_service_dir,
-                                     _install)
+                                     _hermetic_env, _my_group, _prep_service_dir,
+                                     _install, _stubs)
 
 _REPO = Path(__file__).resolve().parents[3]
 MENTIONS = "/api/agent/forum-backup/mentions"
@@ -513,6 +513,15 @@ def test_K11_revocation_is_written_down_and_the_unit_is_wired():
     assert re.search(r"^Environment=FORUM_BACKUP_ALARM_AGENT=forum-backup$", unit, re.M)
 
 
+def _rerun_argv(err: str) -> list:
+    """The re-run command line the WARN printed, split as a shell would (so a leading
+    VAR=value assignment, if any, is argv[0])."""
+    cmd_lines = [ln.strip() for ln in err.splitlines()
+                 if "--service-dir" in ln and ("bash " in ln)]
+    assert len(cmd_lines) == 1, err
+    return shlex.split(cmd_lines[0])
+
+
 # ------------------------------------------------------------------ K13 ------
 # Round 2, change 1(a): the first-install dark window is visible. With no forum.db the
 # installer still WARNs (refusing would block the cutover install), and the WARN names the
@@ -522,9 +531,9 @@ def test_K13_the_no_db_warn_names_the_exact_rerun_command(tmp_path):
     ctx = _install(tmp_path, env_extra={"FORUM_BACKUP_ALARM_MENTION": "someone"})
     assert ctx.r.returncode == 0, ctx.both
     assert not (ctx.svc / "alarm-home" / "forum-token").exists()
-    cmd_lines = [ln.strip() for ln in ctx.err.splitlines() if ln.strip().startswith("bash ")]
-    assert len(cmd_lines) == 1, ctx.err
-    argv = shlex.split(cmd_lines[0])
+    argv = _rerun_argv(ctx.err)
+    assert argv[0] == "FORUM_BACKUP_ALARM_MENTION=someone", argv  # K15 owns the prefix itself
+    argv = argv[1:]
     assert argv[:2] == ["bash", str(INSTALLER)], argv
     assert argv[argv.index("--service-dir") + 1] == str(ctx.svc), argv
     assert argv[argv.index("--auth-mode") + 1] == "enforce", argv
@@ -554,3 +563,73 @@ def test_K14_empty_mention_refusal_writes_nothing(tmp_path, effective):
     assert "FORUM_BACKUP_ALARM_MENTION" in ctx.err
     assert ctx.err.rstrip().splitlines()[-1].endswith("Nothing was written."), ctx.err
     assert (_digest(home), _digest(svc)) == before
+
+
+# ------------------------------------------------------------------ K15 ------
+# Round-1 review, suggestion 1: a mention set from the environment must survive into the
+# printed re-run command, or pasting the line rewrites mention.conf with the default and the
+# alarm pages the wrong person without a word.
+
+def test_K15_rerun_command_carries_a_mention_set_in_the_environment(tmp_path):
+    ctx = _install(tmp_path, env_extra={"FORUM_BACKUP_ALARM_MENTION": "alice bob"})
+    assert ctx.r.returncode == 0, ctx.both
+    argv = _rerun_argv(ctx.err)
+    assert argv[0] == "FORUM_BACKUP_ALARM_MENTION=alice bob", argv
+    assert argv[1:3] == ["bash", str(INSTALLER)], argv
+
+
+def test_K15_rerun_command_has_no_mention_prefix_when_the_default_was_used(tmp_path):
+    ctx = _install(tmp_path, env_extra={"FORUM_BACKUP_ALARM_MENTION": None, "USER": "agent-zed"})
+    assert ctx.r.returncode == 0, ctx.both
+    argv = _rerun_argv(ctx.err)
+    assert argv[0] == "bash", argv
+    assert "FORUM_BACKUP_ALARM_MENTION" not in ctx.err.split("re-run this installer")[-1], ctx.err
+
+
+# ------------------------------------------------------------------ K16 ------
+# Suggestion 2: run as `bash -s < installer`, $0 is "bash", so a command built from it is
+# not runnable. The WARN must say it could not rebuild the command instead of printing one.
+
+def test_K16_stdin_run_does_not_print_a_broken_rerun_command(tmp_path):
+    home = tmp_path / "home"
+    (home / ".config" / "systemd" / "user").mkdir(parents=True)
+    svc = tmp_path / "forum"
+    _prep_service_dir(svc)
+    stub, _log = _stubs(tmp_path)
+    args = ["bash", "-s", "--", "--src", str(_REPO), "--service-dir", str(svc),
+            "--group", _my_group(), "--no-start", "--auth-mode", "enforce"]
+    with open(INSTALLER) as fh:
+        r = subprocess.run(args, stdin=fh, capture_output=True, text=True, cwd=tmp_path,
+                           env=_hermetic_env(home, stub), timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "no alarm token was issued" in r.stderr
+    assert "could not be reconstructed" in r.stderr, r.stderr
+    assert "the way it was started" in r.stderr, r.stderr
+    assert not [ln for ln in r.stderr.splitlines() if ln.strip().startswith("bash ")], r.stderr
+
+
+# ------------------------------------------------------------------ K17 ------
+# Suggestion 3: gate 3 fails with the install largely in place; the message says so.
+
+def test_K17_identity_failure_says_the_install_is_otherwise_in_place(tmp_path, live, recorder):
+    rec = recorder(200)
+    ctx = _install_live(tmp_path, rec.port)
+    assert ctx.r.returncode != 0, ctx.both
+    assert "otherwise in place" in ctx.err, ctx.err
+    assert "units written" in ctx.err and "token rotated" in ctx.err, ctx.err
+    assert "cannot post until this check passes" in ctx.err, ctx.err
+    assert "re-run this installer" in ctx.err, ctx.err
+
+
+# ------------------------------------------------------------------ K18 ------
+# Suggestion 4: a FIRST install creates the alarm home 0700 and the token 0600, asserted
+# directly (K6 only reaches it on a re-install's way through).
+
+def test_K18_first_install_creates_home_0700_and_token_0600(tmp_path, live):
+    assert not (live.svc / "alarm-home").exists()
+    ctx = _install_live(tmp_path, 1, no_start=True)
+    assert ctx.r.returncode == 0, ctx.both
+    # permission bits (& 0o777), as K5/K6 and the installer's own check read them: GNU chmod
+    # keeps a directory's setgid bit under a numeric mode, so the full mode may read 2700.
+    assert (live.svc / "alarm-home").stat().st_mode & 0o777 == 0o700
+    assert (live.svc / "alarm-home" / "forum-token").stat().st_mode & 0o777 == 0o600

@@ -358,6 +358,8 @@ token can be issued: the installer WARNs, prints the exact command to re-run (re
 from the arguments that run received), and you run it after the cutover. Until then the
 alarm cannot post: with a missing or empty token file it exits non-zero before any
 network call, with the line `no forum-backup token; re-run the forum installer`.
+The printed command carries `FORUM_BACKUP_ALARM_MENTION` when you set it. If the installer was
+started from stdin (`bash -s`), no command can be rebuilt: the WARN says so, and you re-run it the way you started it.
 
 After a live start the installer checks the identity by behaviour, not by the file's
 existence: `GET /api/agent/forum-backup/mentions` with the token read from the file must
