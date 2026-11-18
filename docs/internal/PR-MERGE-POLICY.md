@@ -841,13 +841,25 @@ necessary is carried by item 4's list instead, not by a directory run.
 `src/engram/tools/test_tripwire.py`. Neither is a hole: `pr-checks` runs both on every PR. They are
 named so a reader does not take the union as exhaustive.
 
-Measured with the selector at dev `9174f642`, so the halves are not guesses: a change to
-`tools/forum_backup.py` selects **no** file under `tools/` — 22 files, 21 of them the guard set and
-the 22nd (`tests/test_forum_backup.py`) selected because it imports the changed module. (The count
-moves with item 4's list: #4894 adds a guard, so this reads 23 once it merges.) Those tool tests are
-named explicitly by two workflows: the full suite (`tests.yml`) and the per-PR `pr-checks.yml`,
-which runs the same set on every pull request with the forum-dependent cells skipping. A
-forum-installer change selects 25 files, none of them in `src/forum/tests/`.
+**When the tool exits 7, the union above is unavailable — the seat chooses a scope, and the choice
+has a floor.** A full-suite trigger means no selection at all, and the union does not by itself say
+what to run instead. The minimum: the changed test files; **every `tests/` file that names a changed
+file by basename or imports a changed module** — run that search with `git grep` or
+`/usr/bin/grep`, because a wrapped shell `grep` can skip ignored paths; the guard set; the scanners;
+and the forum and `tools/` halves above where they apply. The seat records the list it ran. Two
+misses on one day, both in the gap between "the changed files" and "the tests that name them": #4613
+left `tests/test_hook_injection_bounds.py` red, which selects from no changed file, and #4895 — run
+with a scope of the changed test, the scanner test and the guard set — left two cells red in
+`tests/test_relative_engram_home_refused_3863.py`, which names the changed hook by basename and sits
+in no other half. `git grep -l` for that hook's name finds exactly two files; one of them was run.
+
+Measured with the selector at dev `2a2da4d3`, so the halves are not guesses: a change to
+`tools/forum_backup.py` selects **no** file under `tools/` — 23 files, 22 of them the guard set and
+the 23rd (`tests/test_forum_backup.py`) selected because it imports the changed module. The count
+moves whenever item 4's list does, so read it as measured at that commit, never as a constant. Those
+tool tests are named explicitly by two workflows: the full suite (`tests.yml`) and the per-PR
+`pr-checks.yml`, which runs the same set on every pull request with the forum-dependent cells
+skipping. A forum-installer change selects 25 files, none of them in `src/forum/tests/`.
 
 **Why the forum half is a directory run and the hooks half is a guard-set entry.** Both are tests
 that discover their subject **structurally**, so item 1 cannot select them — but they are fixed in
