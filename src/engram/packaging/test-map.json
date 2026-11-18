@@ -290,14 +290,16 @@
     {
       "path_prefix_or_glob": "hooks/claude/engram-model-gate-pretool.py",
       "test_globs": [
-        "tests/test_model_gate_4596.py"
+        "tests/test_model_gate_4596.py",
+        "tests/test_hook_injection_bounds.py"
       ],
       "note": "#4596 model-family gate, write block: loaded via importlib (hyphenated name) and run as a subprocess against a temp ENGRAM_HOME (source and flattened deployed layouts), so the layer-1 AST import graph cannot trace it to a test."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-model-gate-prompt.py",
       "test_globs": [
-        "tests/test_model_gate_4596.py"
+        "tests/test_model_gate_4596.py",
+        "tests/test_hook_injection_bounds.py"
       ],
       "note": "#4596 model-family gate, next-turn warning: loaded via importlib (hyphenated name) and run as a subprocess against a temp ENGRAM_HOME (source and flattened deployed layouts), so the layer-1 AST import graph cannot trace it to a test."
     },
@@ -1193,6 +1195,13 @@
         "tests/test_tools_engram_home_3863.py"
       ],
       "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/",
+      "test_globs": [
+        "tests/test_hook_injection_bounds.py"
+      ],
+      "note": "Catch-all for a hook file with no row of its own: every hook that builds additionalContext must go through _hooklib.emit_context (CLAUDE.md, Hook injection budget), and tests/test_hook_injection_bounds.py is the glob test that checks it. Selection is FIRST-MATCH-WINS, so this entry is the LAST row of the whole map, after every specific hooks/claude/ row (tests/test_model_gate_4596.py K5 pins that), and covers only a hook that has none (a new hook); a hook that already has a row must list the bounds test itself (both model-gate rows do). The row that was missing when the model-gate hook (engram-alpha#4613) left dev red."
     }
   ],
   "unmapped": [
