@@ -22,10 +22,32 @@ from pathlib import Path
 from .sqlite_ro import connect_ro
 
 
+def get_sql_backup_capability() -> dict:
+    """Return the dashboard interpreter's real SQL-backup capability.
+
+    This is intentionally a fresh probe for each explicit health request: a
+    selected agent's graph or a remote backup worker cannot establish the
+    dashboard process's capability.
+    """
+    try:
+        from engram_backup import probe_sql_backup_capability
+        return probe_sql_backup_capability()
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": "%s: %s" % (type(exc).__name__, exc),
+            "backend_sqlite_version": None,
+            "python_version": None,
+            "interpreter": None,
+            "iterator_kind": None,
+        }
+
+
 def get_health_data(db_path: str) -> dict:
     """Compute live health metrics + trend from diagnostic_history."""
+    backup_capability = get_sql_backup_capability()
     if not os.path.exists(db_path):
-        return {"error": f"Database not found: {db_path}"}
+        return {"error": f"Database not found: {db_path}", "backup_capability": backup_capability}
     try:
         # Read-only via mode=ro; peer-DB safety (several agents' graphs on one host) is enforced by
         # OS file permissions (owner UID writes; group=agents reads), not by
@@ -34,7 +56,7 @@ def get_health_data(db_path: str) -> dict:
         conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row
 
-        data: dict = {}
+        data: dict = {"backup_capability": backup_capability}
 
         # ── Live metrics ─────────────────────────────────────────────
         # Node counts by type
@@ -219,7 +241,7 @@ def get_health_data(db_path: str) -> dict:
 
     except sqlite3.OperationalError as e:
         if "no such table" in str(e):
-            return {"error": "Schema not initialised yet"}
-        return {"error": str(e)}
+            return {"error": "Schema not initialised yet", "backup_capability": backup_capability}
+        return {"error": str(e), "backup_capability": backup_capability}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "backup_capability": backup_capability}

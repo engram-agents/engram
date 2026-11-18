@@ -31,12 +31,15 @@ nodes_fts or `iterdump` itself raises `no such fts5 table: main.nodes_fts`.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import sqlite3
 import stat
 import sys
+import sysconfig
 import tempfile
+from pathlib import Path
 
 
 # Tables whose contents are derived/regenerable and must never reach the dump.
@@ -44,6 +47,64 @@ import tempfile
 # (nodes_fts_data/idx/docsize/config) and the fts5vocab table (nodes_fts_vocab).
 _DERIVED_TABLE_PREFIXES = ("nodes_fts",)
 _DERIVED_TABLE_NAMES = ("vec_nodes",)
+
+
+class BackupCapabilityError(RuntimeError):
+    """This interpreter cannot make a verified SQL backup."""
+
+
+def _load_stdlib_iterdump():
+    """Return CPython's installed private ``_iterdump`` helper.
+
+    Some supported SQLite bindings expose ``Connection.backup`` but not
+    ``Connection.iterdump``. The bounded fallback is the helper installed
+    with *this* interpreter, measured on CPython 3.12. It is intentionally
+    loaded from this exact stdlib path rather than imported through the active
+    ``sqlite3`` module: an embedding process may have aliased that module to a
+    different binding. This is a private CPython API, not a version promise;
+    unavailable, unloadable, or incompatible helpers refuse the backup.
+    """
+    try:
+        helper_path = Path(sysconfig.get_path("stdlib")) / "sqlite3" / "dump.py"
+        spec = importlib.util.spec_from_file_location("_engram_stdlib_sqlite3_dump", helper_path)
+        if spec is None or spec.loader is None:
+            raise ImportError("no loader")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        helper = getattr(module, "_iterdump", None)
+    except Exception as exc:
+        raise BackupCapabilityError(
+            "SQL backup capability unavailable: could not load CPython stdlib "
+            "sqlite3/dump.py (%s: %s)" % (type(exc).__name__, exc)
+        ) from exc
+    if not callable(helper):
+        raise BackupCapabilityError(
+            "SQL backup capability unavailable: CPython stdlib sqlite3/dump.py "
+            "does not provide callable _iterdump"
+        )
+    return helper
+
+
+def _select_dump_iterator(connection):
+    """Return ``(iterator_factory, kind)`` for one already-open connection.
+
+    Native ``iterdump`` is preferred. The fallback is selected only when it
+    is genuinely absent/non-callable; once a choice is made, generation or
+    restore failure is not retried through another iterator.
+    """
+    try:
+        native = getattr(connection, "iterdump")
+    except AttributeError:
+        native = None
+    except Exception as exc:
+        raise BackupCapabilityError(
+            "SQL backup capability unavailable: could not inspect native "
+            "Connection.iterdump (%s: %s)" % (type(exc).__name__, exc)
+        ) from exc
+    if callable(native):
+        return native, "native"
+    helper = _load_stdlib_iterdump()
+    return lambda: helper(connection), "stdlib-helper"
 
 
 # Canonical nodes_fts column list — SINGLE SOURCE OF TRUTH (#2077).
@@ -233,6 +294,11 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
             bk.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] if has_nodes else None
         )
 
+        # Resolve capability before creating a SQL temp file. A backend with
+        # neither native iterdump nor the bounded stdlib helper must leave the
+        # destination wholly untouched.
+        dump_iterator, iterator_kind = _select_dump_iterator(bk)
+
         # Atomic write (#3951): dump to a temp file beside the target, verify it
         # restores, and only then replace the target. A failure at any point
         # leaves the previous out_sql_path untouched and no temp behind.
@@ -259,7 +325,7 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
             ).fetchone()
             statements = 0
             with out_f as f:
-                for line in bk.iterdump():
+                for line in dump_iterator():
                     if not has_autoinc and line.startswith('DELETE FROM "sqlite_sequence"'):
                         continue
                     f.write(line + "\n")
@@ -298,7 +364,61 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
         "fts_excluded": fts_excluded,
         "vec_excluded": vec_excluded,
         "verified_nodes": verified_nodes,
+        "iterator_kind": iterator_kind,
     }
+
+
+def probe_sql_backup_capability() -> dict:
+    """Exercise this interpreter's actual SQL backup path on a scratch DB.
+
+    The result describes this running interpreter and backend only. It is not
+    cached or persisted: health and install callers need a real round-trip,
+    not a backend-name or method-presence guess.
+    """
+    result = {
+        "available": False,
+        "error": None,
+        "backend_sqlite_version": getattr(sqlite3, "sqlite_version", None),
+        "python_version": ".".join(str(p) for p in sys.version_info[:3]),
+        "interpreter": sys.executable,
+        "iterator_kind": None,
+    }
+    try:
+        with tempfile.TemporaryDirectory(prefix="engram-sql-backup-probe-") as directory:
+            source = os.path.join(directory, "probe.db")
+            dump = os.path.join(directory, "probe.sql")
+            conn = sqlite3.connect(source)
+            try:
+                conn.execute("CREATE TABLE nodes(id TEXT PRIMARY KEY, claim TEXT, embedding BLOB)")
+                conn.execute(
+                    "INSERT INTO nodes(id, claim, embedding) VALUES (?, ?, ?)",
+                    ("ob_backup_probe", "SQL backup capability probe", b"probe-embedding"),
+                )
+                conn.execute("PRAGMA user_version = 4888")
+                conn.commit()
+            finally:
+                conn.close()
+
+            stats = dump_stripped(source, dump)
+            result["iterator_kind"] = stats.get("iterator_kind")
+            restored = sqlite3.connect(":memory:")
+            try:
+                with open(dump, "r", encoding="utf-8") as fh:
+                    restored.executescript(fh.read())
+                row = restored.execute(
+                    "SELECT id, claim, embedding FROM nodes WHERE id = ?", ("ob_backup_probe",)
+                ).fetchone()
+                if row != ("ob_backup_probe", "SQL backup capability probe", None):
+                    raise RuntimeError("restored probe row or stripped embedding did not match")
+                if restored.execute("PRAGMA user_version").fetchone()[0] != 4888:
+                    raise RuntimeError("restored probe user_version did not match")
+            finally:
+                restored.close()
+    except Exception as exc:
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return result
+    result["available"] = True
+    return result
 
 
 def _existing_fts_columns(conn: sqlite3.Connection) -> list | None:
