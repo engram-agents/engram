@@ -709,12 +709,20 @@ _T7_NODEID = ("tests/test_retype_cites_widening_2243.py"
     (_T7_NODEID, "8 passed"),
 ], ids=["single_cell_alone", "t7_group_alone"])
 def test_t7_passes_in_isolation_4736(nodeid, expected):
+    import re
     import subprocess
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Neither the environment nor ini may add flags (e.g. PYTEST_ADDOPTS="-q -q"
+    # would drop the summary line): the child reports exactly as asked here.
+    env = {k: v for k, v in os.environ.items() if k != "PYTEST_ADDOPTS"}
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", nodeid],
-        cwd=repo_root, capture_output=True, text=True, timeout=300,
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "-o", "addopts=", nodeid],
+        cwd=repo_root, capture_output=True, text=True, timeout=300, env=env,
     )
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out
-    assert expected in out, out
+    summary = [ln for ln in out.splitlines() if re.search(r"\bpassed\b", ln)]
+    assert summary, out
+    assert re.search(r"\b" + re.escape(expected) + r"\b", summary[-1]), out
+    assert "failed" not in summary[-1], out
