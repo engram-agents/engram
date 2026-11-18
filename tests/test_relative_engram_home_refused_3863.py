@@ -5,6 +5,8 @@ and the MCP server would each land in a different home, silently. It is unsuppor
 
   * every shipped Python hook exits 0, writes nothing and prints ONE stderr line naming the value
     (fail open: Claude Code treats any other non-zero exit as a non-blocking error and shows the trace);
+    stdout is empty, except for a WRITE-GATE HOOK (WRITE_GATE_HOOKS below), which also announces on
+    stdout that it could not run (Borges's amendment of this rule, PR #4613 round 6);
   * a tool that resolves the home at import exits non-zero with the message;
   * the probe mod refuses too (tools/probes/mods-recall step.test.ts) and is pinned in
     tests/test_route_probe_dir_parity_3863.py.
@@ -54,6 +56,20 @@ HOOKS = _shipped_python_hooks()
 NO_HOME = {"engram-bash-pipe-exit-warn.py"}
 
 
+# The one exception to "silent stdout", scoped by REASON, not only by file name (Borges, #4613 review thread,
+# amending the #3863 rule): a hook whose job is to GATE A WRITE announces on stdout that it could not run,
+# because a safety check that silently does not run reads as health.  It still fails open (exit 0, allow,
+# writes nothing) and still prints ONE stderr line naming the value.  The next write gate inherits this
+# rule by being added here; every other hook, and the prompt-side gate hook, stays silent on stdout.
+WRITE_GATE_HOOKS = frozenset({"engram-model-gate-pretool.py"})
+GATE_IMPORT_FAILED_NOTICE = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": (
+    "ENGRAM model-family gate: this write went through UNVERIFIED (`gate_import_failed`): the gate could not "
+    "confirm which model made the call.")}}
+WRITE_PAYLOAD = json.dumps({"session_id": "s1", "hook_event_name": "PreToolUse",
+                            "tool_name": "mcp__engram__engram_add_observation", "tool_use_id": "toolu_01",
+                            "transcript_path": "/nonexistent/t.jsonl", "cwd": "/tmp", "tool_input": {}})
+
+
 def _run(script: Path, tmp_path: Path, args=(), stdin="{}"):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
@@ -70,7 +86,7 @@ def test_the_shipped_hook_list_is_found():
     assert len(HOOKS) >= 14, HOOKS
 
 
-@pytest.mark.parametrize("hook", HOOKS)
+@pytest.mark.parametrize("hook", [h for h in HOOKS if h not in WRITE_GATE_HOOKS])
 def test_a_relative_engram_home_is_a_fail_open_refusal(hook, tmp_path):
     r, written = _run(HOOKS_DIR / hook, tmp_path)
     assert r.returncode == 0, (r.returncode, r.stderr[-600:])
@@ -79,6 +95,28 @@ def test_a_relative_engram_home_is_a_fail_open_refusal(hook, tmp_path):
     assert written == ["cwd", "home"], written
     if hook in NO_HOME:
         return
+    lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
+    assert len(lines) == 1 and VALUE in lines[0] and "ENGRAM_HOME" in lines[0], r.stderr
+
+
+def test_the_write_gate_exception_set_is_exactly_the_expected_members():
+    """The exception cannot widen silently: adding a hook to WRITE_GATE_HOOKS is a deliberate edit of this
+    cell, and so of the rule.  The prompt-side gate hook (a warning, not a write gate) is not a member."""
+    assert WRITE_GATE_HOOKS == {"engram-model-gate-pretool.py"}
+    assert "engram-model-gate-prompt.py" not in WRITE_GATE_HOOKS
+    assert WRITE_GATE_HOOKS <= set(HOOKS) and not (WRITE_GATE_HOOKS & NO_HOME)
+
+
+@pytest.mark.parametrize("stdin", ["", WRITE_PAYLOAD], ids=["empty-stdin", "realistic-payload"])
+@pytest.mark.parametrize("hook", sorted(WRITE_GATE_HOOKS))
+def test_a_write_gate_hook_on_a_relative_engram_home_fails_open_and_says_so_on_stdout(hook, stdin, tmp_path):
+    """The whole shape: exit 0; nothing written; stdout is EXACTLY the documented `gate_import_failed` notice
+    and nothing else; exactly ONE stderr line, the refusal naming the value (not a second hook-own line, not
+    the refusal twice)."""
+    r, written = _run(HOOKS_DIR / hook, tmp_path, stdin=stdin)
+    assert r.returncode == 0, (r.returncode, r.stderr[-600:])
+    assert written == ["cwd", "home"], written
+    assert r.stdout == json.dumps(GATE_IMPORT_FAILED_NOTICE) + "\n", r.stdout
     lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
     assert len(lines) == 1 and VALUE in lines[0] and "ENGRAM_HOME" in lines[0], r.stderr
 
