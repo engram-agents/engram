@@ -11,7 +11,7 @@ Written BEFORE the implementation (contract-first). The contract, by cell group:
   C3  the guard set is read from the policy document (guard_set(repo_root)):
       anchor missing or no test paths -> exit 4; any named path absent from the
       tree -> every missing path named, exit 3; the real document's guard tests
-      are exactly the 21 pinned here.
+      are exactly the 22 pinned here.
   C4  no changed files -> exit 5, the guard set is not printed as a selection.
   C5  a non-full selection equal to the whole tests/ universe -> exit 6; the
       full-suite triggers stop with exit 7 (E1-E5 at the end of this file).
@@ -47,10 +47,11 @@ _spec = importlib.util.spec_from_file_location("run_touched_tests_4358b", str(RU
 _runner = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_runner)
 
-# The 21 guard tests of PR-MERGE-POLICY "Owner merge" item 4 at the time this
-# contract was written. A policy edit that drops one goes red in
-# test_c3_real_document_guard_tests_are_exactly_the_21.
-GUARD_21 = {
+# The 22 guard tests of PR-MERGE-POLICY "Owner merge" item 4 (21 when this contract was
+# written; tests/test_hook_injection_bounds.py was added with its own cell in
+# tests/test_policy_guard_list_4487.py). A policy edit that drops or adds one goes red in
+# test_c3_real_document_guard_tests_are_exactly_the_22.
+GUARD_22 = {
     "tests/test_syspath_shadow_guard.py",
     "tests/test_tiers_manifest.py",
     "tests/test_run_touched_tests.py",
@@ -72,6 +73,7 @@ GUARD_21 = {
     "tests/test_json_extract_metadata_guard_3485.py",
     "tests/test_no_retired_cascade_store_asserts.py",
     "tests/test_forum_redirect_origin_1459.py",
+    "tests/test_hook_injection_bounds.py",
 }
 
 _CONFTEST_A_ROOT = textwrap.dedent(
@@ -233,10 +235,10 @@ def test_c3_the_hand_copied_constant_is_gone():
     assert not hasattr(_runner, "GUARD_SET_TESTS")
 
 
-def test_c3_real_document_guard_tests_are_exactly_the_21():
+def test_c3_real_document_guard_tests_are_exactly_the_22():
     tests, tools = _runner.guard_set(str(REPO_ROOT))
-    assert set(tests) == GUARD_21
-    assert len(tests) == len(set(tests)) == 21
+    assert set(tests) == GUARD_22
+    assert len(tests) == len(set(tests)) == 22
     assert "tools/scan-leaks.py" in tools and "tools/test_id_set_check.py" in tools
     assert all(t.startswith("tools/") for t in tools)
 

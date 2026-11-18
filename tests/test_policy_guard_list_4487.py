@@ -158,6 +158,31 @@ def test_real_item4_names_the_tools_scanners_too():
         assert expected in paths, f"item 4 no longer yields {expected}"
 
 
+def test_the_hook_directory_scanner_is_in_the_guard_set():
+    """tests/test_hook_injection_bounds.py globs src/engram/hooks/claude/*.py and names only the
+    hooks of its own exemption list.
+
+    A PR that adds a hook changes a file that this test does not name, and the test-map rows are
+    first-match-wins, so a hook with its own row never reaches it by the map. It is therefore in
+    the guard set, which the runner reads from the policy and runs on every non-empty selection.
+    Three assertions in one cell: the policy names it, the runner's own reader returns it, and a
+    NEW hook file selects it (the claim itself, through select_tests; the runner is what a seat runs).
+    """
+    name = "tests/test_hook_injection_bounds.py"
+    assert name in _real_paths(), f"item 4 does not name {name}"
+    rtt_path = REPO_ROOT / "src" / "engram" / "tools" / "run_touched_tests.py"
+    rspec = importlib.util.spec_from_file_location("run_touched_tests_4487", str(rtt_path))
+    rtt = importlib.util.module_from_spec(rspec)
+    rspec.loader.exec_module(rtt)
+    guard_tests, _tool_checks = rtt.guard_set(str(REPO_ROOT))
+    assert name in guard_tests, f"the runner's guard set does not return {name}"
+    # A hook added by a PR: a file no test names and no map row lists.
+    new_hook = "src/engram/hooks/claude/engram-a-hook-added-later-hook.py"
+    selected, is_full, _reasons, _map = rtt.select_tests([new_hook], str(REPO_ROOT))
+    assert not is_full, "a new hook file became a full-suite trigger; the policy line says it selects only the guard set"
+    assert name in selected, f"a new hook file does not select {name}"
+
+
 def test_a_directory_with_a_listed_name_does_not_count_as_a_file(tmp_path):
     (tmp_path / "tests" / "test_dirlike.py").mkdir(parents=True)
     message = _missing_message(["tests/test_dirlike.py"], tmp_path)
