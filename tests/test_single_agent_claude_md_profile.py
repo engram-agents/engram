@@ -192,12 +192,31 @@ def test_ban_paragraph_renders_exactly_once_in_single_agent_and_exactly_once_in_
 # --- the two single-agent-only sentences (model identity gate; notes stay verbatim) ----------------
 
 
-def _gate_sentence() -> str:
-    """The last sentence of the Mismatch bullet, read at test time from the FULL component file."""
-    text = (TEMPLATES / "components" / "model-identity-gate.md").read_text(encoding="utf-8")
-    bullets = [ln for ln in text.split("\n") if ln.startswith("- **Mismatch**")]
-    assert len(bullets) == 1
-    return bullets[0].rsplit(". ", 1)[1]
+GATE_PARAGRAPH_START = "My trusted family is recorded once, at the first session"
+GATE_MISMATCH_START = "- **Mismatch**"
+GATE_FULL_COMPONENT = TEMPLATES / "components" / "model-identity-gate.md"
+
+
+def _gate_lines_of(text: str) -> tuple[str, str]:
+    paragraphs = [ln for ln in text.split("\n") if ln.startswith(GATE_PARAGRAPH_START)]
+    bullets = [ln for ln in text.split("\n") if ln.startswith(GATE_MISMATCH_START)]
+    assert len(paragraphs) == 1 and len(bullets) == 1, (len(paragraphs), len(bullets))
+    return paragraphs[0], bullets[0]
+
+
+def _gate_paragraph() -> str:
+    """The paragraph that introduces the match / mismatch bullets, read at test time from the FULL component file."""
+    return _gate_lines_of(GATE_FULL_COMPONENT.read_text(encoding="utf-8"))[0]
+
+
+def _gate_mismatch_bullet() -> str:
+    """The whole Mismatch bullet (the action on a mismatch), read at test time from the FULL component file."""
+    return _gate_lines_of(GATE_FULL_COMPONENT.read_text(encoding="utf-8"))[1]
+
+
+def _gate_text() -> str:
+    """The two lines the single-agent gate carries, as the full file lays them out: the paragraph, a blank line, the bullet."""
+    return _gate_paragraph() + "\n\n" + _gate_mismatch_bullet()
 
 
 def _notes_sentence() -> str:
@@ -220,7 +239,6 @@ def _scope_line() -> str:
 
 
 _SENTENCES = [
-    pytest.param(GATE_ID, _gate_sentence, "silent swap", id="gate"),
     pytest.param(NOTES_ID, _notes_sentence, "Never edit or summarize them.", id="notes"),
 ]
 
@@ -231,16 +249,12 @@ def test_single_agent_sentence_component_body_equals_the_full_files_sentence_byt
     assert sentence.strip() and marker in sentence and "\n" not in sentence
     fm, body = tcr._load_component(cid)
     # whitespace-ownership rule: the body owns its trailing blank line, so it ends "\n" after the sentence.
-    if cid == GATE_ID:
-        # heading rule: the anchor heading is absent from the single-agent file, so the component brings its own
-        assert body == "## " + fm["anchor"] + "\n\n" + sentence + "\n"
-    else:
-        # the notes sentence keeps the source's scope line (the line heading its list), then the sentence
-        assert body == _scope_line() + "\n\n" + sentence + "\n"
+    # the notes sentence keeps the source's scope line (the line heading its list), then the sentence
+    assert body == _scope_line() + "\n\n" + sentence + "\n"
 
 
-@pytest.mark.parametrize("cid,get_sentence,marker", _SENTENCES)
-def test_single_agent_sentence_component_is_in_the_single_agent_manifest_and_not_in_the_full_manifest(cid, get_sentence, marker):
+@pytest.mark.parametrize("cid", [GATE_ID, NOTES_ID], ids=["gate", "notes"])
+def test_single_agent_sentence_component_is_in_the_single_agent_manifest_and_not_in_the_full_manifest(cid):
     assert cid in _manifest_ids(SINGLE_AGENT_MANIFEST)
     assert cid not in _manifest_ids(FULL_MANIFEST)
 
@@ -252,10 +266,56 @@ def test_single_agent_sentence_renders_exactly_once_in_single_agent_and_exactly_
     assert _full().count(sentence) == 1
 
 
+
+# --- the model gate's action: the full file's paragraph and Mismatch bullet, byte for byte --------
+
+
+def test_gate_lines_are_the_ones_the_ruling_names():
+    para, bullet = _gate_paragraph(), _gate_mismatch_bullet()
+    assert "\n" not in para and "\n" not in bullet
+    # (a) the paragraph that tells the agent to compare the model family at session start
+    assert para.startswith("My trusted family is recorded once, at the first session")
+    assert "read the model tag in the system prompt, map it to its family, and compare against `self_lineage`" in para
+    # (b) the action on a mismatch: stop, tell the user
+    assert bullet.startswith("- **Mismatch** (e.g. a Sonnet tag against")
+    assert "STOP autonomous and loop work immediately. Greet the user" in bullet
+    assert bullet.endswith("Changing family is an identity decision, never a silent swap.")
+
+
+def test_gate_component_body_is_the_heading_and_the_two_full_file_lines_byte_for_byte():
+    fm, body = tcr._load_component(GATE_ID)
+    # heading rule: the anchor heading is absent from the single-agent file, so the component brings its own;
+    # the lines are laid out as the full file lays them out (paragraph, blank line, bullet); the body owns its
+    # trailing blank line (whitespace-ownership rule).
+    assert body == "## " + fm["anchor"] + "\n\n" + _gate_paragraph() + "\n\n" + _gate_mismatch_bullet() + "\n"
+
+
+def test_gate_component_version_was_bumped_past_the_one_sentence_version():
+    fm, _ = tcr._load_component(GATE_ID)
+    assert fm["version"] >= 2, "the component's text changed; its version must move"
+
+
+def test_gate_lines_render_once_each_in_single_agent_and_once_each_in_the_full_template_and_render():
+    para, bullet = _gate_paragraph(), _gate_mismatch_bullet()
+    single_agent = _single_agent()
+    for line in (para, bullet):
+        assert single_agent.split("\n").count(line) == 1
+        assert _full().split("\n").count(line) == 1
+        # the committed full template carries them too, so a drift in the template alone is caught here as well
+        assert FULL_TEMPLATE.read_text(encoding="utf-8").split("\n").count(line) == 1
+    assert ("## Model Identity Gate\n\n" + para + "\n\n" + bullet + "\n") in single_agent
+
+
+def test_gate_section_in_the_single_agent_render_holds_exactly_the_two_lines():
+    lines = _single_agent().splitlines()
+    start = lines.index("## Model Identity Gate") + 1
+    end = next(i for i in range(start, len(lines)) if lines[i].startswith("## "))
+    assert [ln for ln in lines[start:end] if ln.strip()] == [_gate_paragraph(), _gate_mismatch_bullet()]
+
 # --- heading rule: a single-agent-only component at an absent anchor brings its own heading ----------
 
 _HEADED = [
-    pytest.param(GATE_ID, "Model Identity Gate", "External interactions", "trust-tier-pointer", _gate_sentence, id="gate"),
+    pytest.param(GATE_ID, "Model Identity Gate", "External interactions", "trust-tier-pointer", _gate_text, id="gate"),
     pytest.param(
         BAN_ID, "Parallelization and Delegation", "Confidence calibration anchors", "confidence-anchors",
         _full_ban_paragraph, id="ban",
@@ -962,16 +1022,15 @@ def test_first_session_skill_does_not_say_the_single_agent_file_has_no_model_ide
     assert "has no such section" not in skill
 
 
-def test_first_session_skill_pins_the_true_one_sentence_claim_against_the_single_agent_render():
-    """The skill says the single-agent gate section holds one sentence; the single-agent render must keep that true."""
+def test_first_session_skill_pins_the_true_two_lines_claim_against_the_single_agent_render():
+    """The skill says the single-agent gate section holds two lines; the single-agent render must keep that true."""
     skill = " ".join(FIRST_SESSION_SKILL.read_text(encoding="utf-8").split())
-    assert "in a single-agent-profile file that section holds one sentence" in skill
+    assert "in a single-agent-profile file that section holds two lines" in skill
+    assert "one sentence" not in skill.split("Model Identity Gate", 1)[1][:400]
     lines = _single_agent().splitlines()
     start = lines.index("## Model Identity Gate") + 1
     end = next(i for i in range(start, len(lines)) if lines[i].startswith("## "))
-    body = " ".join(" ".join(lines[start:end]).split())
-    sentences = [s for s in re.split(r"(?<=[.!?])\s+", body) if s]
-    assert len(sentences) == 1, sentences
+    assert len([ln for ln in lines[start:end] if ln.strip()]) == 2
 
 
 def _bootstrap_profile_facts() -> dict:
