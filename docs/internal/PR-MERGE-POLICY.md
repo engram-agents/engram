@@ -443,8 +443,9 @@ seat can run it and any other seat can check that it ran.
    `tests/test_no_retired_cascade_store_asserts.py` (it scans `tests/` itself) and
    `tests/test_forum_redirect_origin_1459.py` (it derives the forum's sender set with
    `git ls-files` and a walk of `src/` and `tools/`) and
-   `tests/test_hook_injection_bounds.py` (it globs `src/engram/hooks/claude/*.py` and names no
-   hook; about 0.2 s, 27 cells). *Evidence:* #4613 added a hook that built its
+   `tests/test_hook_injection_bounds.py` (it globs `src/engram/hooks/claude/*.py` and names only
+   the 13 files of its own exemption list, so a hook it does not name never selects it; about
+   0.2 s, 27 cells when measured on 2026-11-18). *Evidence:* #4613 added a hook that built its
    `additionalContext` without `emit_context()`; the test-map rows are first-match-wins, so a hook
    with its own rows never reaches this test through the map, and the PR's seat run was green. It
    went red only in the nightly of 2026-11-18. A new file under `src/engram/hooks/claude/` selects
