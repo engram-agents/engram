@@ -470,8 +470,9 @@ seat can run it and any other seat can check that it ran.
    **Whole-tree enumerators added by the 2026-11-18 census** (Kepler's ruling, same day). A
    measurement of every test file (each run alone, the directories it listed recorded, each
    candidate then read) found 31 more tests that enumerate the shipped tree or the tracked tree
-   and assert something about every file, and that no changed file selects. A directory row for
-   them would fire on nearly every PR, so they are guard tests by the definition above. Run alone,
+   and assert something about every file; a change to a file they scan but never name does not select
+   them (some are selected by the import graph for a few changed modules, none for a file they only
+   scan). A directory row for them would fire on nearly every PR, so they are guard tests by the definition above. Run alone,
    in order, on one seat, they took 142 s in all (31 separate pytest starts); the four longest
    were `tests/test_never_clobber_contract.py` (30 s), `tests/test_run_touched_tests_4358.py` (20 s),
    `tests/test_retire_runtime_keys_4255s2.py` (17 s),

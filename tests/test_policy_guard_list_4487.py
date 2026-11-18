@@ -185,7 +185,7 @@ def test_the_hook_directory_scanner_is_in_the_guard_set():
 
 # The whole-tree enumerators the 2026-11-18 census found outside the guard set (Kepler's ruling, 2026-11-18):
 # each enumerates the shipped tree or the tracked tree and asserts something about every file, so a change to
-# a file it never names can redden it.  Scope of the census: scans done in-process and through git ls-files /
+# a file it scans but never names can redden it.  Scope of the census: scans done in-process and through git ls-files /
 # git grep; a scan done in any other subprocess is unseen, and 601 test files that list no directory were not read.
 WHOLE_TREE_ENUMERATORS = [
     "tests/test_3765_nul_guard.py",
@@ -230,6 +230,13 @@ def _runner_module():
     return rtt
 
 
+@pytest.fixture(scope="module")
+def _runner_guard_tests():
+    """The runner's own guard_set(), read once for the module (the runner is what a seat runs)."""
+    guard_tests, _tool_checks = _runner_module().guard_set(str(REPO_ROOT))
+    return guard_tests
+
+
 def test_the_whole_tree_enumerator_list_has_thirty_one_distinct_files_that_exist():
     """A silently shortened list must not pass: 31 distinct names, each a file on disk."""
     assert len(WHOLE_TREE_ENUMERATORS) == len(set(WHOLE_TREE_ENUMERATORS)) == 31
@@ -238,11 +245,10 @@ def test_the_whole_tree_enumerator_list_has_thirty_one_distinct_files_that_exist
 
 
 @pytest.mark.parametrize("name", WHOLE_TREE_ENUMERATORS)
-def test_each_whole_tree_enumerator_is_named_by_the_policy_and_returned_by_the_runner(name):
+def test_each_whole_tree_enumerator_is_named_by_the_policy_and_returned_by_the_runner(name, _runner_guard_tests):
     """Policy names it AND the runner's own guard_set() returns it (the runner is what a seat runs)."""
     assert name in _real_paths(), f"item 4 does not name {name}"
-    guard_tests, _tool_checks = _runner_module().guard_set(str(REPO_ROOT))
-    assert name in guard_tests, f"the runner's guard set does not return {name}"
+    assert name in _runner_guard_tests, f"the runner's guard set does not return {name}"
 
 
 def test_a_directory_with_a_listed_name_does_not_count_as_a_file(tmp_path):
