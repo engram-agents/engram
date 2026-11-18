@@ -365,3 +365,126 @@ def test_control_with_no_secrets_dir_is_also_unproven(ahead_only):
     h, _ = ahead_only
     r = run(h, "--repair")
     assert "pattern unproven on this seat" in r.stdout
+
+
+# -- #4214 / #4875: added lines the ahead-range scan must still see ---------------
+def _key_line():
+    return "token = " + _synthetic_key()
+
+
+def _plant_then_delete(h, name, content, msg="add key"):
+    """Commit `content` (bytes) as `name` in the ahead range, delete it in a LATER commit, so the
+    tracked-tree scan cannot see it and only the history scan can.  -> short sha of the add."""
+    (h / name).write_bytes(content)
+    git(h, "add", name)
+    git(h, "commit", "-q", "-m", msg)
+    added = _short(h)
+    git(h, "rm", "-q", name)
+    git(h, "commit", "-q", "-m", "remove " + name)
+    assert name not in git(h, "ls-files").split("\n")
+    return added
+
+
+def _expect_refused(h, bare, added):
+    before = git(bare, "rev-parse", "master")
+    r = run(h, "--repair")
+    out = r.stdout + r.stderr
+    assert r.returncode == 2, out
+    assert added in out
+    assert "token" not in out
+    assert git(bare, "rev-parse", "master") == before
+
+
+def test_added_ordinary_key_line_is_flagged_control(amended):
+    h, bare = amended
+    _expect_refused(h, bare, _plant_then_delete(h, "k.txt", (_key_line() + "\n").encode()))
+
+
+def test_added_line_starting_with_two_plus_is_flagged(amended):
+    # the diff line is `+++token = ...`, which the old `not startswith("+++")` filter dropped
+    h, bare = amended
+    _expect_refused(h, bare, _plant_then_delete(h, "k.txt", ("++" + _key_line() + "\n").encode()))
+
+
+def test_added_line_starting_with_three_plus_is_flagged(amended):
+    h, bare = amended
+    _expect_refused(h, bare, _plant_then_delete(h, "k.txt", ("+++" + _key_line() + "\n").encode()))
+
+
+@pytest.mark.parametrize("setting", ["color.ui", "color.diff"])
+def test_key_is_flagged_when_repo_config_forces_colour(amended, setting):
+    h, bare = amended
+    git(h, "config", setting, "always")
+    _expect_refused(h, bare, _plant_then_delete(h, "k.txt", (_key_line() + "\n").encode()))
+
+
+def test_forced_colour_on_a_clean_history_does_not_refuse(amended):
+    h, bare = amended
+    git(h, "config", "color.ui", "always")
+    (h / "ok.txt").write_text("plain text\n")
+    git(h, "add", "ok.txt")
+    git(h, "commit", "-q", "-m", "clean work")
+    r = run(h, "--repair")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_key_in_a_binary_file_is_flagged(amended):
+    h, bare = amended
+    _expect_refused(h, bare, _plant_then_delete(h, "k.bin", b"\x00\n" + (_key_line() + "\n").encode()))
+
+
+def test_binary_file_without_a_key_does_not_refuse(amended):
+    h, bare = amended
+    (h / "k.bin").write_bytes(b"\x00\nnothing here\n")
+    git(h, "add", "k.bin")
+    git(h, "commit", "-q", "-m", "binary, clean")
+    r = run(h, "--repair")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_key_is_flagged_when_a_textconv_driver_prints_nothing(amended):
+    # `diff.<name>.textconv` plus an attributes line (not committed) changes what `git log -p` prints
+    h, bare = amended
+    git(h, "config", "diff.hide.textconv", "true")  # `true` ignores its argument and prints nothing
+    with open(h / ".git" / "info" / "attributes", "a") as fh:
+        fh.write("*.txt diff=hide\n")
+    _expect_refused(h, bare, _plant_then_delete(h, "k.txt", (_key_line() + "\n").encode()))
+
+
+# header-parse controls: green before and after, they pin that header skipping eats no hunk line
+def test_key_as_first_added_line_of_a_new_file_is_flagged(amended):
+    h, bare = amended
+    _expect_refused(h, bare, _plant_then_delete(h, "k.txt", (_key_line() + "\nsecond\n").encode()))
+
+
+def test_key_in_the_second_file_of_a_commit_is_flagged(amended):
+    h, bare = amended
+    (h / "a1.txt").write_text("harmless\n")
+    (h / "b1.txt").write_text(_key_line() + "\n")
+    git(h, "add", "a1.txt", "b1.txt")
+    git(h, "commit", "-q", "-m", "two files")
+    added = _short(h)
+    git(h, "rm", "-q", "a1.txt", "b1.txt")
+    git(h, "commit", "-q", "-m", "remove both")
+    _expect_refused(h, bare, added)
+
+
+def test_header_state_does_not_leak_into_the_next_commit(amended):
+    """A mutant that forgets to reset at `@@commit` keeps header state across commits.  One
+    commit is a pure rename (its diff ends in a header with no hunk).  `git log` prints newest
+    first, so the rename is printed right BEFORE the key commit; a leaked header state would
+    swallow the key commit's first hunk line."""
+    h, bare = amended
+    (h / "r1.txt").write_text("same\n")
+    git(h, "add", "r1.txt")
+    git(h, "commit", "-q", "-m", "add r1")
+    (h / "k.txt").write_text(_key_line() + "\n")
+    git(h, "add", "k.txt")
+    git(h, "commit", "-q", "-m", "add key")
+    added = _short(h)
+    git(h, "mv", "r1.txt", "r2.txt")
+    git(h, "commit", "-q", "-m", "pure rename")
+    git(h, "rm", "-q", "k.txt")
+    git(h, "commit", "-q", "-m", "remove key")
+    assert "k.txt" not in git(h, "ls-files").split("\n")
+    _expect_refused(h, bare, added)

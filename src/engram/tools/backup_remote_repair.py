@@ -24,7 +24,9 @@ current branch against its upstream (local refs only, no network).
      (the amend signature) -> otherwise exit 3, the non-twin commits printed.
   4b. the ADDED lines of the not-yet-pushed commits (``git log -p -m upstream..branch``, merge
      commits included) get the same secret scan, so a key committed then deleted, or added
-     only in a merge resolution, still refuses (exit 2).
+     only in a merge resolution, still refuses (exit 2).  The diff is read as plain text: binary
+     files via ``--text``, colour, textconv and external diff off, and file headers skipped by
+     state, so a key on a line that itself starts with ``++`` is still seen.
   5. ``git push --force-with-lease=<branch>:<upstream> <remote> <branch>`` (a plain ``git push``
      when nothing is behind), re-fetch, print ahead/behind and update the status file.
 
@@ -126,16 +128,30 @@ def _added_line_hits(home, rng):
     then deleted inside the not-yet-pushed range is still caught. -> [short sha].
     `-m` makes `git log -p` print a merge commit's diff against each parent (without it a
     merge prints none, so a key added only in a conflict resolution is invisible); never
-    `--first-parent`, which would skip commits that arrived through the merged-in side."""
-    r = _git(home, "log", "-p", "-m", "-U0", "--format=@@commit %H", rng)
+    `--first-parent`, which would skip commits that arrived through the merged-in side.
+    The diff is read as plain text whatever the repo or user config says: `--text` so a file git
+    treats as binary still prints its lines, `--no-color` so a forced `color.ui`/`color.diff`
+    does not prefix every line with ANSI codes, `--no-textconv` and `--no-ext-diff` so a
+    converter or external driver cannot change or hide the lines.
+    The output is parsed by state, not by a `+` prefix filter: a `diff --git`/`diff --cc` line
+    opens a file header, the header lasts until the next `@@ ` hunk line, and inside a hunk
+    every `+` line is an added line whatever follows the `+` (a content line `++x` prints as
+    `+++x`).  `@@commit <sha>` is checked first and resets the state."""
+    r = _git(home, "log", "-p", "-m", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
+             "-U0", "--format=@@commit %H", rng)
     if r.returncode != 0:
         raise RuntimeError(f"git log -p {rng} failed: {r.stderr.strip()}")
     regs = [re.compile(p) for p in SECRET_PATTERNS]
-    hits, cur = [], None
+    hits, cur, in_header = [], None, False
     for ln in r.stdout.splitlines():
         if ln.startswith("@@commit "):
-            cur = ln[9:17]
-        elif ln.startswith("+") and not ln.startswith("+++") and cur and cur not in hits:
+            cur, in_header = ln[9:17], False
+        elif ln.startswith(("diff --git ", "diff --cc ")):
+            in_header = True
+        elif in_header:
+            if ln.startswith("@@ "):
+                in_header = False
+        elif ln.startswith("+") and cur and cur not in hits:
             if any(rg.search(ln) for rg in regs):
                 hits.append(cur)
     return hits
