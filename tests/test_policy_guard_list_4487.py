@@ -158,6 +158,24 @@ def test_real_item4_names_the_tools_scanners_too():
         assert expected in paths, f"item 4 no longer yields {expected}"
 
 
+def test_the_hook_directory_scanner_is_in_the_guard_set():
+    """tests/test_hook_injection_bounds.py globs src/engram/hooks/claude/*.py and names no hook.
+
+    A PR that adds a hook changes a file that no test names, and the test-map rows are first-match-wins,
+    so a hook with its own row never reaches this test by the map. It is therefore in the guard set,
+    which the runner reads from the policy and runs on every non-empty selection.  Two cells in one:
+    the policy names it, and the runner's own reader returns it (the runner is what a seat runs).
+    """
+    name = "tests/test_hook_injection_bounds.py"
+    assert name in _real_paths(), f"item 4 does not name {name}"
+    rtt_path = REPO_ROOT / "src" / "engram" / "tools" / "run_touched_tests.py"
+    rspec = importlib.util.spec_from_file_location("run_touched_tests_4487", str(rtt_path))
+    rtt = importlib.util.module_from_spec(rspec)
+    rspec.loader.exec_module(rtt)
+    guard_tests, _tool_checks = rtt.guard_set(str(REPO_ROOT))
+    assert name in guard_tests, f"the runner's guard set does not return {name}"
+
+
 def test_a_directory_with_a_listed_name_does_not_count_as_a_file(tmp_path):
     (tmp_path / "tests" / "test_dirlike.py").mkdir(parents=True)
     message = _missing_message(["tests/test_dirlike.py"], tmp_path)

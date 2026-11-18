@@ -442,7 +442,13 @@ seat can run it and any other seat can check that it ran.
    `tests/test_json_extract_metadata_guard_3485.py` and
    `tests/test_no_retired_cascade_store_asserts.py` (it scans `tests/` itself) and
    `tests/test_forum_redirect_origin_1459.py` (it derives the forum's sender set with
-   `git ls-files` and a walk of `src/` and `tools/`).
+   `git ls-files` and a walk of `src/` and `tools/`) and
+   `tests/test_hook_injection_bounds.py` (it globs `src/engram/hooks/claude/*.py` and names no
+   hook; about 0.2 s, 27 cells). *Evidence:* #4613 added a hook that built its
+   `additionalContext` without `emit_context()`; the test-map rows are first-match-wins, so a hook
+   with its own rows never reaches this test through the map, and the PR's seat run was green. It
+   went red only in the nightly of 2026-11-18. A new file under `src/engram/hooks/claude/` selects
+   the guard set and nothing else (measured with the selector at `dev` `9174f642`).
    The list is a floor, not a census: a PR that adds a test with this property adds
    its name here in the same PR, and a seat that finds one missing adds it. Verify
    the list with `git ls-files` **in a checkout of the base tip**, not the seat's
