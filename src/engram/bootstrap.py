@@ -611,10 +611,22 @@ _FIXED_SEED_IDS = _seed_ids_on_empty_graph()
 
 
 # The CLAUDE.md profiles bootstrap can render. `full` is the default and is never recorded;
-# `single-agent` is the same identity template with fewer components, for one agent working with one user. (TODO(single-agent-purpose): the full purpose-and-limits text is written in a later commit.)
+# `single-agent` is the same identity template with fewer components, for one agent working with one user
+# on one machine (the purpose and limits text: SINGLE_AGENT_PROFILE_NOTICE below).
 CLAUDE_MD_PROFILES = ("full", "single-agent")
 CLAUDE_MD_PROFILE_CONFIG_KEY = "claude_md_profile"
 _CLAUDE_MD_TEMPLATE_NAMES = {"full": "template.CLAUDE.md", "single-agent": "template.CLAUDE.single-agent.md"}
+
+# What bootstrap prints when that profile is chosen: the facts the README, the installer's
+# --help and the changelog state too, in at most six lines.
+SINGLE_AGENT_PROFILE_NOTICE = (
+    "  CLAUDE.md profile: single-agent. A shorter CLAUDE.md designed for one agent working with one user on one machine,",
+    "  with no agent team and no long-running autonomous loop. It keeps the authority table, the trust-tier pointer and the",
+    "  signature rule for outward messages. It does not carry agent coordination, the loop-mode policy, the fairy and delegation",
+    "  sections (the ban on the native deep-research and Workflow tools stays), \"Who I Am\", \"My Collaborator\" or the infrastructure",
+    "  locations. NOT fully tested: not measured with a real bootstrap on a fresh home, a real upgrade, or the whole test suite.",
+    "  Made for the team's local benchmark work: https://github.com/engram-agents/engram-benchmarks. The full profile stays the default.",
+)
 
 
 def _claude_template_path(profile: "str | None") -> Path:
@@ -1202,6 +1214,11 @@ def main() -> None:
             print(f"  {item.path.name} → {item.path}", flush=True)
         else:
             print(f"  {item.path.name} unchanged (already holds what ENGRAM would write)", flush=True)
+    if TARGET == "claude" and profile == "single-agent":
+        print("", flush=True)
+        for line in SINGLE_AGENT_PROFILE_NOTICE:
+            print(line, flush=True)
+        print("", flush=True)
 
     # Owner-only data home (#4445), both targets. Runs BEFORE the settings step below so a
     # refusal there never skips it.

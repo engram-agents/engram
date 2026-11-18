@@ -2,6 +2,7 @@
   "harness": "claude-code",
   "surface": "CLAUDE.md",
   "profile": "single-agent",
+  "header": "> Profile: single-agent. Written for one agent working with one user on one machine, with no agent team and no long-running autonomous loop. Not fully tested; see README-AGENT.md.",
   "components": [
     { "id": "identity-opening", "anchor": "" },
     { "id": "user-notes-verbatim-single-agent", "anchor": "" },

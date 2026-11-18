@@ -1076,7 +1076,9 @@ def test_retired_flag_with_a_failing_pip_fails_the_same_way(tmp_path):
 def test_help_does_not_list_either_retired_flag(sb):
     r = sb.run("--help")
     assert r.returncode == 0
-    assert "multi-agent" not in r.stdout.lower() and "single-agent" not in r.stdout.lower()
+    # The retired FLAGS are not listed. The single-agent CLAUDE.md profile's name (a value of
+    # --claude-md-profile, #4802) is not the retired flag and may appear, so only the flag form is refused.
+    assert "multi-agent" not in r.stdout.lower() and "--single-agent" not in r.stdout.lower()
     assert "multi_agent" not in r.stdout
     head = REAL_INSTALL_SH.read_text().split("set -euo pipefail", 1)[0]
     assert "multi-agent" not in head and "single-agent" not in head
@@ -1227,9 +1229,21 @@ def test_a_bad_value_is_refused_by_bootstrap_not_by_the_installer(sb):
     assert "install.sh: invalid" not in r.all
 
 
+def _usage_block(src: str) -> str:
+    """The text of the usage() function: from `usage() {` to its closing brace line."""
+    start = src.index("usage() {")
+    return src[start : src.index("\n}\n", start)]
+
+
 def test_installer_source_holds_no_profile_list_of_its_own():
+    # Rule (#4802 rework): the --help text may NAME the single-agent profile (its purpose and its limit), but
+    # the installer keeps no profile list and judges no value: every mention of the profile name sits in the
+    # usage text, and no code path compares against it.
     src = REAL_INSTALL_SH.read_text()
-    assert not re.search(r"(?<![-\w])single-agent\b", src)
+    usage = _usage_block(src)
+    outside_usage = src.replace(usage, "")
+    assert not re.search(r"(?<![-\w])single-agent\b", outside_usage)
+    assert not re.search(r"""(?<![-\w])single-agent\s*[|)]|[|(]\s*single-agent""", src)
     assert not re.search(r"""(?:^|[\s"'(|])full\s*[|)]""", src, re.MULTILINE)
     assert not re.search(r"""[|(]\s*full\b|"full"|'full'""", src)
 
@@ -1250,11 +1264,29 @@ def test_a_profile_given_on_a_seeded_home_is_reported_ignored_not_silently_dropp
     assert "--claude-md-profile single-agent ignored" in r.stdout
 
 
-def test_help_lists_the_claude_md_profile_flag_and_names_no_profile(sb):
+def _flag_help_lines(stdout: str) -> list[str]:
+    """The help text of --claude-md-profile: from its option line to the next option line."""
+    lines = stdout.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip().startswith("--claude-md-profile"))
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("--")), len(lines))
+    return [ln.strip() for ln in lines[start + 1 : end] if ln.strip()]
+
+
+def test_help_names_the_single_agent_profile_with_its_purpose_and_limit_in_at_most_four_lines(sb):
     r = sb.run("--help")
     assert r.returncode == 0
     assert "--claude-md-profile" in r.stdout
-    assert not re.search(r"(?<![-\w])single-agent\b", r.stdout)
+    block = _flag_help_lines(r.stdout)
+    assert 1 <= len(block) <= 4, block
+    text = " ".join(block)
+    assert re.search(r"(?<![-\w])single-agent\b", text)
+    assert "one agent" in text and "one user" in text and "one machine" in text
+    assert re.search(r"not fully tested", text, re.IGNORECASE)
+    assert "https://github.com/engram-agents/engram-benchmarks" in text
+    # the installer still passes the value through: the help says bootstrap checks it
+    assert "bootstrap.py" in text and "checks it" in text
+    for banned in (r"small[- ]context", r"\blean\b", r"local[- ]only"):
+        assert not re.search(banned, text, re.IGNORECASE), banned
 
 
 _EMPTY_PROFILE_FORMS = [["--claude-md-profile", ""], ["--claude-md-profile="]]

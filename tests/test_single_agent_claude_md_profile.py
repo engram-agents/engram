@@ -1097,6 +1097,217 @@ def test_readme_runs_no_bootstrap_of_its_own_so_it_carries_no_profile_line():
     assert "bootstrap.py" not in README.read_text(encoding="utf-8") or _install_doc_lines(README)
 
 
+
+# --- the one-line header: a manifest-level field, not a component (#4802 rework) ----------------
+
+HEADER = (
+    "> Profile: single-agent. Written for one agent working with one user on one machine, with no agent team "
+    "and no long-running autonomous loop. Not fully tested; see README-AGENT.md."
+)
+
+
+def _scratch_with_manifest_edit(tmp_path, monkeypatch, edit):
+    """A scratch copy of the templates whose single-agent manifest is passed through `edit` (a dict -> None)."""
+    scratch = _scratch(tmp_path, monkeypatch)
+    path = scratch / "manifests" / "claude-code.CLAUDE.md.single-agent.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    edit(manifest)
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_the_manifest_carries_the_header_and_the_header_is_one_line_naming_profile_and_purpose():
+    header = json.loads(SINGLE_AGENT_MANIFEST.read_text(encoding="utf-8"))["header"]
+    assert header == HEADER
+    assert "\n" not in header and "\r" not in header
+    assert header.startswith("> Profile: single-agent. ")
+
+
+def test_the_rendered_files_first_line_is_the_header_then_a_blank_line_then_the_identity_opening():
+    lines = _single_agent().split("\n")
+    assert lines[0] == HEADER
+    assert lines[1] == ""
+    assert lines[2].startswith("# ")
+    # and the committed file starts the same way
+    assert SINGLE_AGENT_TEMPLATE.read_text(encoding="utf-8").split("\n")[0] == HEADER
+
+
+def test_the_header_sentence_is_pinned_word_for_word():
+    text = SINGLE_AGENT_TEMPLATE.read_text(encoding="utf-8")
+    assert (
+        "Written for one agent working with one user on one machine, with no agent team and no long-running "
+        "autonomous loop. Not fully tested; see README-AGENT.md."
+    ) in text.split("\n")[0]
+
+
+def test_the_header_is_in_no_component_and_not_in_the_full_render_or_full_manifest():
+    assert "header" not in json.loads(FULL_MANIFEST.read_text(encoding="utf-8"))
+    assert "Profile: single-agent" not in _full()
+    assert not _full().startswith(">")
+    for path in (TEMPLATES / "components").glob("*.md"):
+        assert "Profile: single-agent" not in path.read_text(encoding="utf-8"), path.name
+    assert [c["id"] for c in tcr.render("claude-code", "CLAUDE.md", "single-agent")[1]["components"]] == SINGLE_AGENT_IDS
+
+
+def test_a_manifest_without_a_header_renders_exactly_as_before(tmp_path, monkeypatch):
+    with_header = _single_agent()
+    _scratch_with_manifest_edit(tmp_path, monkeypatch, lambda m: m.pop("header"))
+    without = tcr.render("claude-code", "CLAUDE.md", "single-agent")[0]
+    assert without == with_header[len(HEADER) + 2 :]
+    assert without.startswith("# ") and not without.startswith(">")
+    # the default manifest has none: its render is the committed full template, byte for byte
+    assert tcr.render("claude-code", "CLAUDE.md")[0] == FULL_TEMPLATE.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "> two\nlines",
+        "> carriage\rreturn",
+        "",
+        "   ",
+        7,
+        None,
+        ["> a list"],
+        "> a made-up placeholder {{NOT_A_REAL_PLACEHOLDER}}",
+    ],
+    ids=["newline", "cr", "empty", "blank", "int", "null", "list", "unknown-placeholder"],
+)
+def test_a_malformed_header_is_a_build_failure_not_a_silent_render(tmp_path, monkeypatch, bad):
+    _scratch_with_manifest_edit(tmp_path, monkeypatch, lambda m: m.__setitem__("header", bad))
+    with pytest.raises(tcr.TemplateComponentError, match="header"):
+        tcr.render("claude-code", "CLAUDE.md", "single-agent")
+
+
+def test_a_header_may_use_a_placeholder_the_components_already_use(tmp_path, monkeypatch):
+    _scratch_with_manifest_edit(
+        tmp_path, monkeypatch, lambda m: m.__setitem__("header", "> Profile: single-agent, for {{USER_NAME}}.")
+    )
+    assert tcr.render("claude-code", "CLAUDE.md", "single-agent")[0].split("\n")[0] == (
+        "> Profile: single-agent, for {{USER_NAME}}."
+    )
+
+
+def test_the_default_manifest_with_a_header_is_refused_so_the_full_render_cannot_change(tmp_path, monkeypatch):
+    scratch = _scratch(tmp_path, monkeypatch)
+    path = scratch / "manifests" / "claude-code.CLAUDE.md.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["header"] = "> a header on the full manifest"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(tcr.TemplateComponentError, match="header"):
+        tcr.render("claude-code", "CLAUDE.md")
+
+
+# --- the purpose-and-limits text: four places, the same facts ---------------------------------------
+
+BENCH_URL = "https://github.com/engram-agents/engram-benchmarks"
+_BANNED_IN_PURPOSE_TEXT = (r"small[- ]context", r"\blean\b", r"local[- ]only")
+_KEPT_TERMS = ("authority table", "trust-tier pointer", "signature rule")
+
+
+def _purpose_text_readme() -> str:
+    """README-AGENT.md's profile section: from the install line naming the flag to the next heading."""
+    lines = README_AGENT.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, ln in enumerate(lines) if "install.sh --claude-md-profile" in ln)
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("#")), len(lines))
+    return "\n".join(lines[start:end])
+
+
+def _purpose_text_help() -> str:
+    r = subprocess.run(
+        ["bash", str(SRC / "tools" / "install.sh"), "--help"], capture_output=True, text=True, timeout=60
+    )
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip().startswith("--claude-md-profile"))
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("--")), len(lines))
+    return "\n".join(lines[start:end])
+
+
+@pytest.fixture(scope="module")
+def single_agent_run(tmp_path_factory):
+    home = tmp_path_factory.mktemp("single-agent-run")
+    r = _bootstrap(home, ["--claude-md-profile", "single-agent"])
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r
+
+
+def _purpose_text_bootstrap(run) -> str:
+    """The paragraph bootstrap prints when the profile is chosen: from its first line to the first blank line."""
+    lines = run.stdout.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip().startswith("CLAUDE.md profile: single-agent"))
+    end = next((i for i in range(start + 1, len(lines)) if not lines[i].strip()), len(lines))
+    return "\n".join(lines[start:end])
+
+
+def _purpose_text_changelog() -> str:
+    text = (REPO_ROOT / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
+    entries = [e for e in re.split(r"\n(?=- )", text) if e.startswith("- A `single-agent` CLAUDE.md profile")]
+    assert len(entries) == 1, len(entries)
+    return entries[0]
+
+
+_PLACES = ["readme", "help", "bootstrap", "changelog"]
+
+
+def _place_text(place, single_agent_run) -> str:
+    if place == "readme":
+        return _purpose_text_readme()
+    if place == "help":
+        return _purpose_text_help()
+    if place == "bootstrap":
+        return _purpose_text_bootstrap(single_agent_run)
+    return _purpose_text_changelog()
+
+
+@pytest.mark.parametrize("place", _PLACES)
+def test_purpose_text_names_one_agent_one_user_one_machine_not_fully_tested_and_the_benchmark_repo(place, single_agent_run):
+    text = " ".join(_place_text(place, single_agent_run).split())
+    low = text.lower()
+    assert "one agent" in low and "one user" in low and "one machine" in low, text
+    assert "not fully tested" in low, text
+    assert BENCH_URL in text, text
+
+
+@pytest.mark.parametrize("place", _PLACES)
+def test_purpose_text_never_says_small_context_lean_or_local_only(place, single_agent_run):
+    text = _place_text(place, single_agent_run)
+    for banned in _BANNED_IN_PURPOSE_TEXT:
+        assert not re.search(banned, text, re.IGNORECASE), (place, banned)
+
+
+@pytest.mark.parametrize("place", ["readme", "bootstrap", "changelog"])
+def test_purpose_text_says_the_authority_table_trust_tier_pointer_and_signature_rule_are_kept(place, single_agent_run):
+    text = " ".join(_place_text(place, single_agent_run).split())
+    low = text.lower()
+    for term in _KEPT_TERMS:
+        assert term in low, (place, term)
+    assert re.search(r"\b(keeps|kept)\b", low), place
+
+
+@pytest.mark.parametrize("place", ["readme", "bootstrap", "changelog"])
+def test_purpose_text_says_what_the_profile_does_not_carry_and_what_it_was_not_measured_with(place, single_agent_run):
+    low = " ".join(_place_text(place, single_agent_run).split()).lower()
+    for named in ("agent coordination", "loop-mode policy", "who i am", "my collaborator", "infrastructure locations"):
+        assert named in low, (place, named)
+    for unmeasured in ("fresh home", "real upgrade", "whole test suite"):
+        assert unmeasured in low, (place, unmeasured)
+    # restored by the Session Start Reading ruling: it is carried, so it is never listed as dropped
+    dropped_part = low.split("does not carry", 1)[1] if "does not carry" in low else ""
+    assert "session start reading" not in dropped_part.split("not fully tested")[0], place
+
+
+def test_the_bootstrap_paragraph_is_at_most_six_lines_and_only_for_the_single_agent_choice(single_agent_run, tmp_path):
+    assert len(_purpose_text_bootstrap(single_agent_run).splitlines()) <= 6
+    default = _bootstrap(tmp_path)
+    assert default.returncode == 0, default.stdout + default.stderr
+    assert "CLAUDE.md profile: single-agent" not in default.stdout
+
+
+def test_the_bootstrap_paragraph_is_not_printed_for_a_codex_run_that_ignores_the_option(tmp_path):
+    r = _bootstrap(tmp_path, ["--claude-md-profile", "single-agent"], extra_env={"TARGET": "codex"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "CLAUDE.md profile: single-agent" not in r.stdout
+
 # --- the working name `lean` is retired, not aliased (#4802 rework) -------------------------------
 
 

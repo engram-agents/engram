@@ -96,6 +96,12 @@ ALLOWED = (
     ('src/engram/templates/manifests/claude-code.CLAUDE.md.single-agent.json', '"id": "model-identity-gate-single-agent"', _PROFILE),
     ('src/engram/templates/manifests/claude-code.CLAUDE.md.single-agent.json', '"id": "native-tools-ban-single-agent"', _PROFILE),
     ('src/engram/tools/check-claude-md-drift.py', '(single-agent -> template.CLAUDE.single-agent.md)', _PROFILE),
+    ('src/engram/templates/manifests/claude-code.CLAUDE.md.single-agent.json', '"header": "> Profile: single-agent.', _PROFILE),
+    ('src/engram/templates/template.CLAUDE.single-agent.md', '> Profile: single-agent.', _PROFILE),
+    ('src/engram/bootstrap.py', 'SINGLE_AGENT_PROFILE_NOTICE', _PROFILE),
+    ('src/engram/bootstrap.py', 'profile == "single-agent"', _PROFILE),
+    ('src/engram/bootstrap.py', 'CLAUDE.md profile: single-agent.', _PROFILE),
+    ('src/engram/tools/install.sh', 'single-agent is a', _PROFILE),
     # -- a real historical artifact --------------------------------------------------------------------
     ("src/engram/viz/agents.py", "viz-server-multi-agent-2026-05-04.md", "the real filename of a dated design note (active-work/); renaming it in prose would cite a file that does not exist"),
     # -- a fixture of the past -------------------------------------------------------------------------
@@ -295,6 +301,7 @@ DOC_ALLOWED = (
     ("docs/internal/2574-telemetry-design.md", "multi_agent", "a design record: it quotes the tiers.json entry shape as it stood when the design was written"),
     ("docs/internal/864-multi-env-harness-design.md", "single / multi-agent", "a design record: the harness matrix as it stood when #864 was designed"),
     ("README-AGENT.md", "install.sh --claude-md-profile single-agent", _PROFILE),
+    ("README-AGENT.md", "**What the `single-agent` profile is.**", _PROFILE),
     # the block "Moved from CLAUDE.md ... Verbatim; moved, not edited" (Ariadne's ruling B): a dated verbatim record, pinned by
     # tools/claude_md_moves.json; the live rule sits in CLAUDE.md. One entry per quoted line that carries the words.
     ("docs/internal/PR-MERGE-POLICY.md", "it holds identically in single-agent and", "verbatim move record (2026-10-03, #3322): the quoted rule text"),
