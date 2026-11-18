@@ -325,11 +325,23 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
             ).fetchone()
             statements = 0
             with out_f as f:
-                for line in dump_iterator():
-                    if not has_autoinc and line.startswith('DELETE FROM "sqlite_sequence"'):
-                        continue
-                    f.write(line + "\n")
-                    statements += 1
+                try:
+                    lines = dump_iterator()
+                    if iterator_kind == "stdlib-helper":
+                        lines = iter(lines)
+                    for line in lines:
+                        if not has_autoinc and line.startswith('DELETE FROM "sqlite_sequence"'):
+                            continue
+                        f.write(line + "\n")
+                        statements += 1
+                except TypeError as exc:
+                    if iterator_kind != "stdlib-helper":
+                        raise
+                    raise BackupCapabilityError(
+                        "SQL backup capability unavailable: CPython stdlib sqlite3/dump.py "
+                        "_iterdump is incompatible with this connection (%s: %s)"
+                        % (type(exc).__name__, exc)
+                    ) from exc
                 # Append user_version after the COMMIT so it executes on restore.
                 f.write(f"PRAGMA user_version = {src_user_version};\n")
                 statements += 1

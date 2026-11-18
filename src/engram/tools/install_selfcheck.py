@@ -231,7 +231,7 @@ def check_venv_imports(ctx):
 _SQL_BACKUP_SNIPPET = """
 import json
 import sys
-sys.path.insert(0, sys.argv[1])
+sys.path.append(sys.argv[1])
 import engram_backup
 print(json.dumps(engram_backup.probe_sql_backup_capability()))
 """

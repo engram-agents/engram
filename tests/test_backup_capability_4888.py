@@ -132,6 +132,90 @@ def test_invalid_native_iterator_is_not_masked_by_helper_retry(tmp_path, monkeyp
     assert out.read_bytes() == before
 
 
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_incompatible_stdlib_helper_invocation_is_a_named_atomic_capability_error(
+    tmp_path, monkeypatch, target_exists,
+):
+    """A callable helper with the wrong signature must not leak TypeError."""
+    src, out = tmp_path / "source.db", tmp_path / "backup.sql"
+    _source_db(src)
+    if target_exists:
+        out.write_bytes(b"old verified backup\n")
+
+    monkeypatch.setattr(engram_backup, "sqlite3", _Proxy(_WithoutIterdump))
+
+    def wrong_signature_helper():
+        return iter(())
+
+    monkeypatch.setattr(engram_backup, "_load_stdlib_iterdump", lambda: wrong_signature_helper)
+    with pytest.raises(engram_backup.BackupCapabilityError, match="incompatible") as raised:
+        engram_backup.dump_stripped(str(src), str(out))
+
+    assert isinstance(raised.value.__cause__, TypeError)
+    if target_exists:
+        assert out.read_bytes() == b"old verified backup\n"
+    else:
+        assert not out.exists()
+    assert not list(tmp_path.glob(".engram-sql-*.sql.tmp"))
+
+
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_incompatible_stdlib_helper_iteration_is_a_named_atomic_capability_error(
+    tmp_path, monkeypatch, target_exists,
+):
+    """A TypeError deferred by the helper iterator has the same named refusal."""
+    src, out = tmp_path / "source.db", tmp_path / "backup.sql"
+    _source_db(src)
+    if target_exists:
+        out.write_bytes(b"old verified backup\n")
+
+    monkeypatch.setattr(engram_backup, "sqlite3", _Proxy(_WithoutIterdump))
+
+    def deferred_type_error_helper(connection):
+        def lines():
+            yield "BEGIN TRANSACTION;"
+            raise TypeError("synthetic deferred helper incompatibility")
+
+        return lines()
+
+    monkeypatch.setattr(engram_backup, "_load_stdlib_iterdump", lambda: deferred_type_error_helper)
+    with pytest.raises(engram_backup.BackupCapabilityError, match="incompatible") as raised:
+        engram_backup.dump_stripped(str(src), str(out))
+
+    assert isinstance(raised.value.__cause__, TypeError)
+    if target_exists:
+        assert out.read_bytes() == b"old verified backup\n"
+    else:
+        assert not out.exists()
+    assert not list(tmp_path.glob(".engram-sql-*.sql.tmp"))
+
+
+def test_native_iterator_type_error_stays_native_and_does_not_retry_helper(tmp_path, monkeypatch):
+    src, out = tmp_path / "source.db", tmp_path / "backup.sql"
+    _source_db(src)
+    out.write_bytes(b"old verified backup\n")
+
+    class NativeTypeErrorConnection(sqlite3.Connection):
+        def iterdump(self):
+            def lines():
+                yield "BEGIN TRANSACTION;"
+                raise TypeError("synthetic native iterator failure")
+
+            return lines()
+
+    monkeypatch.setattr(engram_backup, "sqlite3", _Proxy(NativeTypeErrorConnection))
+
+    def helper_must_not_run():
+        raise AssertionError("native iterator errors must not retry through the helper")
+
+    monkeypatch.setattr(engram_backup, "_load_stdlib_iterdump", helper_must_not_run)
+    with pytest.raises(TypeError, match="synthetic native iterator failure"):
+        engram_backup.dump_stripped(str(src), str(out))
+
+    assert out.read_bytes() == b"old verified backup\n"
+    assert not list(tmp_path.glob(".engram-sql-*.sql.tmp"))
+
+
 def test_alias_before_import_uses_exact_helper_without_rewriting_alias(tmp_path):
     """An alias installed before import must not make us depend on sqlite3.dump."""
     code = r'''

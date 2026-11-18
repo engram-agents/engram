@@ -374,6 +374,13 @@ def test_venv_imports_runs_in_the_venv_not_the_callers_python(seat):
 
 # ── 3 sql-backup ─────────────────────────────────────────────────────────────
 
+def test_sql_backup_snippet_appends_the_plugin_path():
+    """The installed plugin is added without taking precedence over the venv."""
+    mod = _load_tool("install_selfcheck_sql_backup_snippet")
+    assert "sys.path.append(sys.argv[1])" in mod._SQL_BACKUP_SNIPPET
+    assert "sys.path.insert(0, sys.argv[1])" not in mod._SQL_BACKUP_SNIPPET
+
+
 def test_sql_backup_fails_when_the_installed_runtime_reports_no_real_capability(seat):
     (seat.plugin / "engram_backup.py").write_text(
         "def probe_sql_backup_capability():\n"
