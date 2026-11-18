@@ -2703,20 +2703,15 @@ def run_cycle(
 
 
 def install_signal_handlers(paths: RuntimePaths, started_at: str) -> None:
+    """Request shutdown from a signal; normal ``cmd_run`` finalization writes status.
+
+    A signal can interrupt ``atomic_write_json`` at its replace boundary, so the
+    handler must not perform status I/O that could consume the in-flight temp file.
+    ``paths`` and ``started_at`` remain parameters for call compatibility.
+    """
     def _handle(signum, _frame):
         global _STOP_REQUESTED
         _STOP_REQUESTED = True
-        status = current_status(paths)
-        status.update(
-            {
-                "status_version": STATUS_VERSION,
-                "started_at": started_at,
-                "last_cycle_at": utc_now(),
-                "mode": "stopping",
-                "detail": f"received signal {signum}",
-            }
-        )
-        update_status(paths, status)
 
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
