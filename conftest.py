@@ -273,8 +273,10 @@ def _service_manager_guard(service_manager_shim_dir, monkeypatch):
 # ECONNREFUSED); everything else passes to the real method (other loopback ports, unix sockets).
 # The live endpoints are those the CODE resolves: `forum.url` of $ENGRAM_HOME/config.json,
 # `$FORUM_URL`, and the default constant READ from the two source files that define it. A loopback
-# endpoint refuses every loopback spelling (localhost, 127.0.0.0/8, ::1) on its port; a non-loopback
-# endpoint refuses that host and port.
+# endpoint refuses every loopback spelling (localhost, 127.0.0.0/8, ::1, the unspecified address and
+# the inet_aton forms such as 127.1) on its port; a non-loopback endpoint refuses that host and port
+# EXACTLY AS WRITTEN: stdlib clients resolve a name first and connect by IP, so a host NAME in
+# forum.url is matched only by a direct connect by that name, an IP literal is matched either way.
 #
 # This definition is shared: src/forum/tests/conftest.py loads THIS file by path and installs the
 # same guard (the forum tests may run on their own), and the cell files load it by path too.
@@ -345,16 +347,35 @@ def live_forum_endpoints(environ, config_json_path, repo_root=None):
     return {ep for ep in map(_lfg_endpoint, urls) if ep is not None}
 
 
-def _lfg_is_loopback(host):
-    h = host.strip().lower().split("%", 1)[0]
-    if h == "localhost":
-        return True
+def _lfg_ip(h):
+    """An ipaddress object for a host spelling, or None. Besides canonical literals this accepts the
+    spellings `socket.connect` itself accepts through inet_aton (`127.1`, `0x7f.0.0.1`, `2130706433`)."""
     try:
-        ip = ipaddress.ip_address(h)
+        return ipaddress.ip_address(h)
     except ValueError:
+        pass
+    try:
+        return ipaddress.ip_address(socket.inet_aton(h))
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def _lfg_is_loopback(host):
+    if isinstance(host, (bytes, bytearray)):
+        try:
+            host = bytes(host).decode("ascii")
+        except UnicodeDecodeError:
+            return False
+    h = host.strip().lower().split("%", 1)[0].rstrip(".")
+    if h in ("localhost", "ip6-localhost", "ip6-loopback"):
+        return True
+    if h == "":
+        return True  # connect(("", port)) means the unspecified address, which reaches this host
+    ip = _lfg_ip(h)
+    if ip is None:
         return False
     mapped = getattr(ip, "ipv4_mapped", None)
-    return ip.is_loopback or bool(mapped is not None and mapped.is_loopback)
+    return ip.is_loopback or ip.is_unspecified or bool(mapped is not None and (mapped.is_loopback or mapped.is_unspecified))
 
 
 def is_live_forum_target(addr, endpoints):
@@ -362,6 +383,11 @@ def is_live_forum_target(addr, endpoints):
     if not isinstance(addr, tuple) or len(addr) < 2:
         return False
     host, port = addr[0], addr[1]
+    if isinstance(host, (bytes, bytearray)):
+        try:
+            host = bytes(host).decode("ascii")
+        except UnicodeDecodeError:
+            return False
     if not isinstance(host, str) or not isinstance(port, int):
         return False
     if _lfg_is_loopback(host):
@@ -370,21 +396,40 @@ def is_live_forum_target(addr, endpoints):
 
 
 _LFG_SESSION_ENDPOINTS = None
+_LFG_SNAPSHOT_KEY = "ENGRAM_LIVE_FORUM_ENDPOINTS_4475"
+
+
+def resolve_endpoints_from_environ(environ):
+    """The live endpoints for the environment `environ` describes: its ENGRAM_HOME (or ~/.engram)
+    config.json, its FORUM_URL, and the default constant."""
+    home = environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
+    return live_forum_endpoints(environ, os.path.join(home, "config.json"))
 
 
 def session_live_forum_endpoints():
-    """The endpoints for the REAL environment, resolved once (before any test edits the env)."""
+    """The endpoints for the REAL environment, resolved ONCE, at the first import of this file.
+    tests/conftest.py repoints ENGRAM_HOME at a throwaway directory when it is unset, so a later
+    resolution would miss the real config. The snapshot is also kept in the environment so a second
+    load of this file (src/forum/tests/conftest.py loads it by path) reuses it."""
     global _LFG_SESSION_ENDPOINTS
     if _LFG_SESSION_ENDPOINTS is None:
-        home = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
-        _LFG_SESSION_ENDPOINTS = live_forum_endpoints(os.environ, os.path.join(home, "config.json"))
+        raw = os.environ.get(_LFG_SNAPSHOT_KEY)
+        if raw:
+            _LFG_SESSION_ENDPOINTS = {(h, p) for h, p in json.loads(raw)}
+        else:
+            _LFG_SESSION_ENDPOINTS = resolve_endpoints_from_environ(os.environ)
+            os.environ[_LFG_SNAPSHOT_KEY] = json.dumps(sorted(_LFG_SESSION_ENDPOINTS))
     return _LFG_SESSION_ENDPOINTS
 
 
-def install_live_forum_guard(monkeypatch, endpoints=None):
+session_live_forum_endpoints()  # take the snapshot now, before tests/conftest.py touches ENGRAM_HOME
+
+
+def install_live_forum_guard(monkeypatch, endpoints=None, force=False):
     """Wrap socket.socket.connect / connect_ex (undone by `monkeypatch`). Idempotent: a second
-    install while the wrappers are in place does nothing."""
-    if getattr(socket.socket.connect, _LFG_ATTR, None) is not None and getattr(
+    install while the wrappers are in place does nothing, unless `force` (the cells use it to wrap
+    on top with a custom endpoint set)."""
+    if not force and getattr(socket.socket.connect, _LFG_ATTR, None) is not None and getattr(
         socket.socket.connect_ex, _LFG_ATTR, None
     ) is not None:
         return

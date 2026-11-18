@@ -229,6 +229,8 @@ def test_G7_a_unix_socket_is_not_refused():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# NOTE: the inner subprocess below has no recorder beneath it. It is safe only because `_require_guard()` is the FIRST line
+# of each inner cell (an unwired tree fails there, before any connect). Keep that ordering.
 def test_wiring_does_not_depend_on_the_root_conftest():
     """The forum tests may be run from inside src/forum, where the runner treats them as a separate
     universe: the forum conftest must install the guard by itself. Run two cells with the conftest
@@ -250,3 +252,65 @@ def test_wiring_does_not_depend_on_the_root_conftest():
     )
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-1000:]
 
+
+
+# ---------------------------------------------------------------- fairy round 1 on #4903: pins for the config path,
+# the real connect_ex answer, non-canonical spellings and teardown
+
+
+def test_endpoints_resolved_from_an_environment_read_its_config_and_its_forum_url(tmp_path):
+    """The session endpoints come from the ENVIRONMENT's config.json and FORUM_URL (the real ones, taken at import)."""
+    import json as _json
+
+    (tmp_path / "config.json").write_text(_json.dumps({"forum": {"url": "http://localhost:5099"}}))
+    eps = G.resolve_endpoints_from_environ({"ENGRAM_HOME": str(tmp_path), "FORUM_URL": "http://127.0.0.1:5088"})
+    assert ("localhost", 5099) in eps and ("127.0.0.1", 5088) in eps and ("localhost", 5002) in eps
+
+
+def test_a_second_load_of_the_conftest_reuses_the_snapshot_kept_in_the_environment(tmp_path, monkeypatch):
+    """The forum tree loads the root conftest by path a second time; it must reuse the first snapshot, not re-resolve
+    from whatever ENGRAM_HOME is by then (tests/conftest.py repoints it at a throwaway directory)."""
+    import json as _json
+
+    planted = [["localhost", 5002], ["forum.example.test", 5055]]
+    monkeypatch.setenv(G._LFG_SNAPSHOT_KEY, _json.dumps(planted))
+    monkeypatch.setenv("ENGRAM_HOME", str(tmp_path))  # an empty home: a fresh resolution could not produce 5055
+    again = _load_guard_module().session_live_forum_endpoints()
+    assert again == {("localhost", 5002), ("forum.example.test", 5055)}
+
+
+def test_a_listed_loopback_listener_is_really_refused_by_connect_and_connect_ex(monkeypatch):
+    """Pins the connect_ex ANSWER without any recorder: a live listener reports 0 unless the guard refuses."""
+    import errno as _errno
+
+    listed, unlisted = socket.socket(), socket.socket()
+    try:
+        for srv in (listed, unlisted):
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+        port_listed, port_unlisted = listed.getsockname()[1], unlisted.getsockname()[1]
+        G.install_live_forum_guard(monkeypatch, endpoints={("127.0.0.1", port_listed)}, force=True)
+        with socket.socket() as c:
+            assert c.connect_ex(("127.0.0.1", port_listed)) == _errno.ECONNREFUSED
+        with socket.socket() as c, pytest.raises(G.LiveForumConnectionRefused):
+            c.connect(("127.0.0.1", port_listed))
+        with socket.socket() as c:  # the other listener is not listed: the real answer (0) comes through
+            assert c.connect_ex(("127.0.0.1", port_unlisted)) == 0
+    finally:
+        listed.close()
+        unlisted.close()
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "", "::", "127.1", "0x7f.0.0.1", "2130706433", "localhost.", "ip6-localhost", b"127.0.0.1"])
+def test_non_canonical_loopback_spellings_are_matched(host):
+    assert G.is_live_forum_target((host, 5002), {("localhost", 5002)}), host
+    assert not G.is_live_forum_target((host, 5003), {("localhost", 5002)}), host
+
+
+def test_the_wrappers_are_undone_when_their_monkeypatch_context_ends():
+    """Teardown is pinned: after the context the original connect and connect_ex are back."""
+    before = (socket.socket.connect, socket.socket.connect_ex)
+    with pytest.MonkeyPatch.context() as mp:
+        G.install_live_forum_guard(mp, endpoints=set(), force=True)
+        assert (socket.socket.connect, socket.socket.connect_ex) != before
+    assert (socket.socket.connect, socket.socket.connect_ex) == before
