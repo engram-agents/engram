@@ -129,6 +129,11 @@ def _added_line_hits(home, rng):
     `-m` makes `git log -p` print a merge commit's diff against each parent (without it a
     merge prints none, so a key added only in a conflict resolution is invisible); never
     `--first-parent`, which would skip commits that arrived through the merged-in side.
+    The merge diff format is pinned with `-c log.diffMerges=separate` because `-m` honours that
+    config key (`off`/`none` print no diff for a merge, `dense-combined`/`cc` print a `@@@` form
+    the parser does not read); the key exists from git 2.31, an older git ignores the unknown
+    `-c` key and `-m` alone already prints separate diffs there.  (The `--diff-merges=separate`
+    flag is not used: an older git would reject it.)
     The diff is read as plain text whatever the repo or user config says: `--text` so a file git
     treats as binary still prints its lines, `--no-color` so a forced `color.ui`/`color.diff`
     does not prefix every line with ANSI codes, `--no-textconv` and `--no-ext-diff` so a
@@ -143,7 +148,7 @@ def _added_line_hits(home, rng):
     # \x1c-\x1e, \x85 and U+2028/9, which lets a content line fake a `diff --git ` header line.
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     r = subprocess.run(
-        ["git", "log", "-p", "-m", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
+        ["git", "-c", "log.diffMerges=separate", "log", "-p", "-m", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
          "-U0", "--format=@@commit %H", rng],
         cwd=home, capture_output=True, env=env,
     )

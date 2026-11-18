@@ -571,6 +571,9 @@ def test_every_byte_value_before_a_key_line_still_flags_the_commit(tmp_path):
     git(h, "config", "user.email", "t@example.invalid")
     git(h, "config", "user.name", "t")
     git(h, "config", "commit.gpgsign", "false")
+    # 255 commits trip the automatic background gc / maintenance, which repacks while we commit and scan
+    git(h, "config", "gc.auto", "0")
+    git(h, "config", "maintenance.auto", "false")
     (h / "base.txt").write_text("base\n")
     git(h, "add", "base.txt")
     git(h, "commit", "-q", "-m", "base")
@@ -585,3 +588,71 @@ def test_every_byte_value_before_a_key_line_still_flags_the_commit(tmp_path):
     hits = set(_load_tool()._added_line_hits(str(h), "master~255..master"))
     missed = [f"{b:#04x}" for b, s in zip(values, shas) if s[:8] not in hits]
     assert not missed, f"commits not flagged for bytes: {missed}"
+
+
+# -- #4214: the merge diff format must not depend on the repo's log.diffMerges -----------
+def _conflict_merge(h, resolution):
+    """A conflicting merge in the ahead range; `resolution` (text) is the resolved file.  -> short
+    sha of the merge."""
+    git(h, "branch", "side")
+    (h / "c.txt").write_text("main\n")
+    git(h, "add", "c.txt")
+    git(h, "commit", "-q", "-m", "main edits c")
+    git(h, "checkout", "-q", "side")
+    (h / "c.txt").write_text("side\n")
+    git(h, "add", "c.txt")
+    git(h, "commit", "-q", "-m", "side edits c")
+    git(h, "checkout", "-q", "master")
+    m = subprocess.run(["git", "merge", "--no-edit", "side"], cwd=h, capture_output=True, text=True)
+    assert m.returncode != 0  # a real conflict
+    (h / "c.txt").write_text(resolution)
+    git(h, "add", "c.txt")
+    git(h, "commit", "-q", "--no-edit")
+    return _short(h)
+
+
+_DIFF_MERGES_BLINDING = ["off", "none", "dense-combined", "cc"]
+_DIFF_MERGES_CONTROLS = ["on", "m", "1", "first-parent", "separate", "combined", "c", "remerge", "r"]
+
+
+@pytest.mark.parametrize("value", ["unset"] + _DIFF_MERGES_CONTROLS + _DIFF_MERGES_BLINDING)
+def test_resolution_only_key_in_a_merge_is_flagged_under_any_log_diff_merges(amended, value):
+    h, bare = amended
+    if value != "unset":
+        git(h, "config", "log.diffMerges", value)
+    merge = _conflict_merge(h, _key_line() + "\n")  # in neither parent
+    git(h, "rm", "-q", "c.txt")
+    git(h, "commit", "-q", "-m", "drop c")
+    assert "c.txt" not in git(h, "ls-files").split("\n")
+    before = git(bare, "rev-parse", "master")
+    r = run(h, "--repair")
+    out = r.stdout + r.stderr
+    assert r.returncode == 2, out
+    assert merge in out
+    assert git(bare, "rev-parse", "master") == before
+
+
+def test_clean_merge_under_dense_combined_does_not_refuse(amended):
+    h, bare = amended
+    git(h, "config", "log.diffMerges", "dense-combined")
+    _conflict_merge(h, "resolved\n")
+    r = run(h, "--repair")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_invalid_log_diff_merges_value_refuses_loudly_and_pushes_nothing(amended):
+    """An invalid value makes git itself refuse every `git log` (the twin check at step 4 runs
+    before the history scan and fails first), so the tool exits 1 with git's message.  Pinned as
+    fail-closed: never a push, never a traceback.  Green before and after the pin."""
+    h, bare = amended
+    git(h, "config", "log.diffMerges", "fp")
+    _conflict_merge(h, _key_line() + "\n")
+    git(h, "rm", "-q", "c.txt")
+    git(h, "commit", "-q", "-m", "drop c")
+    before = git(bare, "rev-parse", "master")
+    r = run(h, "--repair")
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "bad config variable" in r.stderr
+    assert "Traceback" not in r.stderr
+    assert git(bare, "rev-parse", "master") == before
