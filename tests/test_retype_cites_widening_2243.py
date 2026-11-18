@@ -63,6 +63,9 @@ def srv():
     import server
     server._configure_paths(TEST_DIR)
     server._ensure_data_dir()
+    # #4736: fire the once-per-process startup gate (it rebuilds principle
+    # triggers, #1740) before any test installs spies.
+    server._ensure_schema_bootstrap()
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
     return server
 
@@ -688,3 +691,30 @@ def test_t12_insert_cites_edge_unchanged(srv):
                         "cites carries observation->evidence only; source is "
                         "not an observation node: <S>"),
     }
+
+
+# ---------------------------------------------------------------------------
+# #4736 -- the T7 spies must count only rebuilds caused by the retype under
+# test, so the cells pass in any order and alone. The startup gate
+# (`_ensure_schema_bootstrap`, #1740) rebuilds principle triggers once per DB
+# path per process; the `srv` fixture fires it before any spy is installed.
+# ---------------------------------------------------------------------------
+
+_T7_NODEID = ("tests/test_retype_cites_widening_2243.py"
+              "::test_t7_side_effects_by_relation")
+
+
+@pytest.mark.parametrize("nodeid,expected", [
+    (_T7_NODEID + "[bears_on]", "1 passed"),
+    (_T7_NODEID, "8 passed"),
+], ids=["single_cell_alone", "t7_group_alone"])
+def test_t7_passes_in_isolation_4736(nodeid, expected):
+    import subprocess
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", nodeid],
+        cwd=repo_root, capture_output=True, text=True, timeout=300,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert expected in out, out
