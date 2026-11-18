@@ -1516,7 +1516,7 @@ if [ "$START" -eq 1 ]; then
     fi
 
     # The alarm's token, last: rotation already ran, this is the token that stays installed.
-    if [ "$ALARM_TOKEN_ISSUED" -eq 1 ]; then
+    if [ "${ALARM_TOKEN_ISSUED:-0}" -eq 1 ]; then
       echo "==> Post-install gate 3: the alarm's token resolves to forum-backup"
       _alarm_assert_token_file
       _alarm_verify_identity
