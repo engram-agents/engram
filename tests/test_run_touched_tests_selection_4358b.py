@@ -683,8 +683,8 @@ def test_c11_help_points_at_the_policy_not_the_convergence_gate(capsys):
 # C12 — today's case on the real tree
 # ---------------------------------------------------------------------------
 
-_BASE_C12 = "60d7b811"
-_HEAD_C12 = "8488d0d4"
+_BASE_C12 = "96dda6c7"
+_HEAD_C12 = "e5ccd97e"
 
 
 def _have(commit: str) -> bool:
@@ -696,11 +696,13 @@ def _have(commit: str) -> bool:
 
 @pytest.mark.skipif(
     not (_have(_BASE_C12) and _have(_HEAD_C12)),
-    reason="commits 60d7b811 / 8488d0d4 (PR #4845 range) are not in this clone",
+    reason="commits 96dda6c7 / e5ccd97e (PR #4845 squash commit and its parent) are not in this clone",
 )
 def test_c12_todays_case_selects_a_small_scoped_set(tmp_path):
-    # 8488d0d4 is a merge of dev 60d7b811 into the PR branch, so its checkout IS
-    # the scratch merge the merge seat runs in (checkout == head).
+    # e5ccd97e is the squash commit of PR #4845 and 96dda6c7 its parent on dev; the pair
+    # is the same 22-file change that C12 first measured as the PR branch range
+    # 60d7b811..8488d0d4 (that merge commit is not on dev, so it cannot be pinned).
+    # The head checkout IS the scratch merge the merge seat runs in (checkout == head).
     wt = tmp_path / "wt"
     subprocess.run(
         ["git", "worktree", "add", "--detach", str(wt), _HEAD_C12],
