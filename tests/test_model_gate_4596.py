@@ -1632,6 +1632,7 @@ def test_k4_the_test_map_selects_the_bounds_test_for_the_model_gate_hook_and_for
     spec.loader.exec_module(rtt)
     tmap = json.loads((SRC_ENGRAM / "packaging" / "test-map.json").read_text(encoding="utf-8"))
     for changed in ("src/engram/hooks/claude/engram-model-gate-pretool.py",
+                    "src/engram/hooks/claude/engram-model-gate-prompt.py",
                     "src/engram/hooks/claude/engram-a-hook-nobody-has-written-yet.py"):
         selected, full = rtt._resolve_convention_map(changed, tmap, str(REPO))
         assert not full, changed
