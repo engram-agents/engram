@@ -61,7 +61,10 @@ def test_every_api_route_naming_an_agent_is_401_without_a_token(owned_tmp):
 
 # (1) structural: the guard is the only reader of a caller identity from the request ----
 SERVER_SRC = Path(__file__).resolve().parents[1] / "server.py"
-ALLOWED_READERS = {"_auth_guard", "_body_identities"}
+# `_report_identity` (auth report mode) is the guard's own name check for the report file: it
+# receives values the guard collected and reads nothing from the request; so does
+# `_verdict_for_token`, which applies the same identifier check to those values.
+ALLOWED_READERS = {"_auth_guard", "_body_identities", "_report_identity", "_verdict_for_token"}
 
 # R7 (round 2): any key that could carry "who is calling", not only the literal "agent".
 IDENTITY_KEYS = frozenset({"agent", "sender", "from", "from_agent", "as_agent", "actor",
@@ -308,7 +311,7 @@ def _install(owned_tmp, *extra, db_tokens=0, revoke=False, path_prefix=None, uni
     repo = Path(__file__).resolve().parents[3]
     return subprocess.run(
         ["bash", str(INSTALLER), "--dry-run", "--src", str(repo), "--service-dir", str(svc),
-         "--group", "agents", *extra],
+         "--group", "agents", "--auth-mode", "enforce", *extra],
         capture_output=True, text=True, env=env)
 
 

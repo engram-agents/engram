@@ -79,15 +79,27 @@ low wired share is not by itself a defect. Do not phrase any P5 output as
 
 - **Sample uniformly at random, in Python (not SQL).** SQLite `random()`
   cannot be seeded, so the draw happens in Python. Read the candidate ids with
-  a read-only sqlite3 connection, sort them for stability, then sample:
+  the store tool (`store_read.py ids`, read-only, through the engramd owner when
+  that is on), then sample. First the ids, into a file. Set `WINDOW_SINCE` to the
+  parent-injected `window_since` (or leave it empty for the whole graph, and say so
+  in the report, since an empty value is not an error); the venv interpreter, never a bare
+  `python3` (on a Mac that is 3.9, too old for the owner client):
+  ```bash
+  IDS="$(mktemp)"
+  "$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/store_read.py" \
+    ids --since "${WINDOW_SINCE:-}" > "$IDS" \
+    || { echo "store_read failed with exit $?: NO ids; stop and report its stderr line"; exit 1; }
+  echo "ids file: $IDS ($(wc -l < "$IDS") ids)"
+  ```
+  The tool prints one id per line, already sorted, and names the path it took
+  on stderr (`store_read: path=owner` or `path=direct-ro`). A non-zero exit
+  means NO ids, never an empty population: 1 store unusable, 2 a bad home
+  setting, 3 refused; the block stops there and no sample is drawn. Then
+  sample in Python from that file:
   ```python
-  import pathlib, random, sqlite3
-  # as_uri() percent-encodes ?, # and spaces; a raw "file:" string loses mode=ro on such a path (#3514)
-  con = sqlite3.connect(pathlib.Path("<db path>").absolute().as_uri() + "?mode=ro", uri=True)
-  ids = sorted(r[0] for r in con.execute(
-      "SELECT id FROM nodes WHERE is_current = 1 AND status != 'retracted' "
-      "AND type IN ('observation_factual', 'observation_predictive')"
-      "  AND created_at >= ?", (window_since or "",)))   # null window = full graph
+  import random
+  IDS_PATH = "<the path the block above printed after 'ids file:'>"
+  ids = open(IDS_PATH).read().splitlines()
   seed = <choose one>
   sample = random.Random(seed).sample(ids, min(400, len(ids)))
   ```

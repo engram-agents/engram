@@ -38,6 +38,21 @@ Nothing else qualifies. A `direct-by-design` cell with no phase, or with a phase
 outside the set, fails naming the row (`row N: direct-by-design needs a phase
 ...`). The row still tallies under `direct-by-design`.
 
+DIRECT CEILING. Section 1 carries exactly one `- **direct ceiling:** N` line.
+N is read strictly: the text after the colon must OPEN with N in ASCII digits
+(free text may follow, e.g. `18. Only the epic owner raises it`). A line that
+opens with anything else fails even if an integer appears later: `eighteen
+(was 3)` is a parse failure, never a ceiling of 3, so a typo cannot silently
+move the ceiling. A decimal (`3.5`) and a sign (`-3`) also fail. The plain `direct`
+count derived from the rows (`direct-by-design: <phase>` is not `direct`) must
+equal N. A PR that adds a `direct` row and bumps both tallies to match is
+otherwise green, so the ceiling makes every new direct open of the live store a
+visible decision: it fails until the row moves behind an owner flag, is
+classified `direct-by-design`, or the ceiling is raised with the #2652 epic
+owner's written OK. Below N it also fails, naming the lower value: a migration
+that removes a direct row tightens the ceiling in the same PR, so the freed room
+cannot be reused silently.
+
 It derives the `kind` (call, prose) and `target` (live store, parameter, other
 DB, n/a (prose), unresolved) tallies the same way, each column read BY HEADER
 NAME, and compares them with the `- **kind:**` and `- **target:**` lines. A
@@ -70,7 +85,11 @@ N, ...`), `row N: unknown state '<value>'` per unknown state (likewise
 "could not parse Section 2 states" when no row carries a recognised live-store
 state, "could not parse Section 2 kinds/targets" when that header column is
 absent, and "could not parse section 1 tally" naming the line when the state,
-summary, kind, target or unit line is missing, repeated, or lacks a number; exit 1
+summary, kind, target, unit or direct ceiling line is missing, repeated, or lacks a
+number; exit 1 with `section 1 direct ceiling: rows give N direct, ceiling is C:
+a new direct open of the live store` and a line naming the three ways out when
+N > C, or `section 1 direct ceiling: rows give N direct, ceiling is C: lower the
+ceiling to N` when N < C; exit 1
 with one `row N: ...` line per bad citation; and exit 1 ("could not read <path>: <error>", one per file) when a tracked file
 cannot be read, so an unread file can never read as consistent. Outside a
 checkout it exits 1 with the single line "not a git checkout: <root>".
@@ -125,6 +144,8 @@ KIND_LINE = re.compile(r"^\s*-\s+\*\*kind:\*\*(.*)$")
 TARGET_LINE = re.compile(r"^\s*-\s+\*\*target:\*\*(.*)$")
 UNIT_LINE = re.compile(r"^\s*-\s+\*\*unit:\*\*(.*)$")
 UNIT_CALLS = re.compile(r"the\s+(\d+)\s+`call`\s+rows\s+are\s+(\d+)\s+lines")
+CEILING_LINE = re.compile(r"^\s*-\s+\*\*direct ceiling:\*\*(.*)$")
+CEILING_VALUE = re.compile(r"^\s*([0-9]+)(?![0-9]|[.,][0-9])")
 SECTION2 = re.compile(r"^##\s+2\.")
 ANY_SECTION = re.compile(r"^##\s")
 
@@ -136,6 +157,12 @@ TALLY_REMEDY = (
 REMEDY = (
     "add/remove a Section-2 row in docs/internal/2652-migration-ledger.md "
     "for each connect line you added/removed"
+)
+CEILING_REMEDY = (
+    "route it through the owner behind an `engramd.*_via_owner` flag (state `behind-flag`); "
+    "or classify it `direct-by-design: <phase>` if it truly is pre-owner or "
+    "exclusive-maintenance; or raise the ceiling in the same PR, with the #2652 epic "
+    "owner's written OK linked in the PR body"
 )
 CITE_REMEDY = (
     "cite each row as `path` `function()` `anchor` in docs/internal/2652-migration-ledger.md "
@@ -404,12 +431,55 @@ def section1_tallies(text):
     return found, problems
 
 
+def section1_ceiling(text):
+    """Return (ceiling, problem) for the one `- **direct ceiling:** N` line of
+    Section 1. N must open the text after the colon; free text may follow."""
+    before = _lines(text.split("\n## 2.", 1)[0])
+    lines = [m.group(1) for m in map(CEILING_LINE.match, before) if m]
+    if len(lines) != 1:
+        return None, (
+            "could not parse section 1 tally: no `- **direct ceiling:**` line"
+            if not lines
+            else "could not parse section 1 tally: more than one `- **direct ceiling:**` line"
+        )
+    m = CEILING_VALUE.match(lines[0])
+    if not m:
+        return None, (
+            "could not parse section 1 tally: `- **direct ceiling:**` line lacks a number "
+            "after the colon"
+        )
+    return int(m.group(1)), None
+
+
+def ceiling_problems(text, direct):
+    """The ceiling check: the derived plain-`direct` count must equal the ceiling.
+    Above it is a new direct open; below it the ceiling must be lowered, so the
+    freed room cannot be reused silently by a later PR."""
+    ceiling, problem = section1_ceiling(text)
+    if problem:
+        return [problem]
+    if direct > ceiling:
+        return [
+            f"section 1 direct ceiling: rows give {direct} direct, ceiling is {ceiling}: "
+            "a new direct open of the live store",
+            CEILING_REMEDY,
+        ]
+    if direct < ceiling:
+        return [
+            f"section 1 direct ceiling: rows give {direct} direct, ceiling is {ceiling}: "
+            f"lower the ceiling to {direct}"
+        ]
+    return []
+
+
 def tally_problems(text):
     states, problems = row_states(text)
     if problems and any(p.startswith("could not parse") for p in problems):
         return problems
     tally, more = derived_tally(states)
     problems += more
+    if not any(p.startswith("could not parse") for p in more):
+        problems += ceiling_problems(text, tally["direct"])
     found, sec_problems = section1_tallies(text)
     problems += sec_problems
     for name, vals in found.items():

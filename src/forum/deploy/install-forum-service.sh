@@ -83,6 +83,25 @@
 #                       (the map also backs a check that is not a GitHub read).
 #                       Cannot be combined with --github-token-file. `on` is not
 #                       accepted: --github-token-file already means on.
+#   --auth-mode MODE    REQUIRED on every run, no default: `report` or `enforce`. Rendered
+#                       into ExecStart as `--auth-mode MODE`. A run without it refuses
+#                       (exit 2, nothing written), so a re-run can never silently drop the
+#                       mode, the shape #3593 gave the GitHub drop-in. The server itself also
+#                       refuses to start without the flag (exit 78).
+#   --auth-report PATH  with `--auth-mode report` only (required there, refused with
+#                       enforce): absolute path of the report file the server appends one JSON
+#                       line per guarded request to. Letters, digits and / . _ - only.
+#   --auth-report-until TIME
+#                       with `--auth-mode report` only (required there, refused with
+#                       enforce): UTC time like 2026-11-16T00:00:00Z. The installer refuses
+#                       (exit 2, nothing written) a time that is not a real date and time or
+#                       is more than 72 hours from now, because the server would then exit 78
+#                       and the unit would stay down. It also refuses (exit 78, nothing
+#                       written) a time at or before now; the server itself still accepts
+#                       a past time, for a hand-written unit. The server checks it again at start,
+#                       and past it keeps
+#                       serving but logs one loud line per hour and shows
+#                       auth_report_overdue on /health.
 #   --dry-run           print every action without executing (CI-safe)
 #   --no-start          install + enable but don't start
 #
@@ -122,6 +141,9 @@ BATON_MAP=""
 BATON_UIDS=""   # space-separated, validated integers
 GITHUB_TOKEN_FILE=""
 GITHUB_OFF=0     # --github-integration off (#3583)
+AUTH_MODE=""     # --auth-mode: required on every run, no default
+AUTH_REPORT=""   # --auth-report PATH (with report only)
+AUTH_UNTIL=""    # --auth-report-until TIME (with report only)
 SRC=""
 START=1
 DRY_RUN=0
@@ -214,7 +236,7 @@ _refuse_bad_name() {
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port|--admin-user|--group|--host)
+    --port|--admin-user|--group|--host|--auth-mode|--auth-report|--auth-report-until)
       [ $# -ge 2 ] || { echo "ERROR: $1 requires a value. Nothing was written." >&2; exit 2; } ;;
   esac
   case "$1" in
@@ -275,6 +297,32 @@ while [ $# -gt 0 ]; do
         off) GITHUB_OFF=1 ;;
         on) echo "ERROR: --github-integration on is not accepted: --github-token-file <path> already means on" >&2; exit 2 ;;
         *) echo "ERROR: --github-integration must be 'off' (got '$2')" >&2; exit 2 ;;
+      esac
+      shift 2 ;;
+    --auth-mode)
+      case "$2" in
+        report|enforce) AUTH_MODE="$2" ;;
+        *) echo "ERROR: --auth-mode must be exactly 'report' or 'enforce' (got '$2'); it has no default. Nothing was written." >&2; exit 2 ;;
+      esac
+      shift 2 ;;
+    --auth-report)
+      AUTH_REPORT="$2"
+      case "$AUTH_REPORT" in
+        /*) ;;
+        *) echo "ERROR: --auth-report must be an absolute path (got '$AUTH_REPORT'). Nothing was written." >&2; exit 2 ;;
+      esac
+      # Not only a path check: the value is substituted into a unit file with sed, so
+      # excluding | & and backslash closes the sed-replacement injection class. Do not widen.
+      case "$AUTH_REPORT" in
+        *[!A-Za-z0-9/._-]*)
+          echo "ERROR: --auth-report may contain only letters, digits and / . _ - (it lands in a unit file); got '$AUTH_REPORT'. Nothing was written." >&2; exit 2 ;;
+      esac
+      shift 2 ;;
+    --auth-report-until)
+      AUTH_UNTIL="$2"
+      case "$AUTH_UNTIL" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+        *) echo "ERROR: --auth-report-until must be a UTC time like 2026-11-16T00:00:00Z (got '$AUTH_UNTIL'). Nothing was written." >&2; exit 2 ;;
       esac
       shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
@@ -715,6 +763,48 @@ except Exception:
   fi
 fi
 
+# --auth-mode is required on every run: with no default here and none in the template, a
+# re-run can never silently change the mode, and the unit always states it. This sits
+# after every other refusal and before the first write. (The server refuses to start
+# without the flag as well, exit 78, for a hand-written or stale unit.)
+if [ -z "$AUTH_MODE" ]; then
+  echo "ERROR: --auth-mode is required on every run: 'report' or 'enforce' (no default). Nothing was written." >&2
+  exit 2
+fi
+if [ "$AUTH_MODE" = "report" ]; then
+  if [ -z "$AUTH_REPORT" ] || [ -z "$AUTH_UNTIL" ]; then
+    echo "ERROR: --auth-mode report requires --auth-report PATH and --auth-report-until TIME. Nothing was written." >&2
+    exit 2
+  fi
+  # The server refuses to start on an impossible date or one more than 72 hours ahead
+  # (exit 78), and the unit's RestartPreventExitStatus=78 would then leave the live forum
+  # down. So refuse here, before any write. python3 is already this installer's own
+  # dependency (the venv step, the loopback probe), and it avoids a GNU-only `date -d`.
+  _until_rc=0
+  python3 -B -c '
+import datetime as d, re, sys
+m = re.fullmatch(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z", sys.argv[1])
+try:
+    t = d.datetime(*map(int, m.groups()))
+except (ValueError, AttributeError):
+    sys.exit(3)
+now = d.datetime.now(d.timezone.utc).replace(tzinfo=None)
+sys.exit(5 if t <= now else 4 if t - now > d.timedelta(hours=72) else 0)
+' "$AUTH_UNTIL" >/dev/null 2>&1 || _until_rc=$?
+  case "$_until_rc" in
+    0) ;;
+    3) echo "ERROR: --auth-report-until must be a real UTC date and time like 2026-11-16T00:00:00Z (got '$AUTH_UNTIL'). Nothing was written." >&2; exit 2 ;;
+    4) echo "ERROR: --auth-report-until '$AUTH_UNTIL' is more than 72 hours from now; the server would refuse to start. Nothing was written." >&2; exit 2 ;;
+    5) echo "ERROR: --auth-report-until '$AUTH_UNTIL' is in the past (at or before now); give a time up to 72 hours ahead. Nothing was written." >&2; exit 78 ;;
+    *) echo "ERROR: could not check --auth-report-until (python3 failed, status $_until_rc). Nothing was written." >&2; exit 2 ;;
+  esac
+else
+  if [ -n "$AUTH_REPORT" ] || [ -n "$AUTH_UNTIL" ]; then
+    echo "ERROR: --auth-report and --auth-report-until are only for --auth-mode report. Nothing was written." >&2
+    exit 2
+  fi
+fi
+
 APP="$SERVICE_DIR/app"
 VENV="$SERVICE_DIR/.venv"
 PYTHON="$VENV/bin/python"
@@ -880,6 +970,11 @@ if [ -n "$BATON_MAP" ]; then
     BATON_ARGS="$BATON_ARGS \\"$'\n'"    --baton-login-map-admin-uid $_u"
   done
 fi
+# The auth flags (one ExecStart continuation line): only what the operator passed.
+AUTH_ARGS="--auth-mode $AUTH_MODE"
+if [ "$AUTH_MODE" = "report" ]; then
+  AUTH_ARGS="$AUTH_ARGS --auth-report $AUTH_REPORT --auth-report-until $AUTH_UNTIL"
+fi
 _TOKEN_PLACEHOLDER='@@GITHUB_TOKEN_ENVFILE_LINE@@'
 _PLACEHOLDER='{{BATON_LOGIN_MAP_ARGS}}'
 # Replace the baton-args placeholder line by line. A FUNCTION, deliberately: inline
@@ -921,6 +1016,7 @@ _fill_token_placeholder() {
 RENDERED="$(sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$SRC/src/forum/deploy/engram-forum.service.template" \
     | sed "s|{{FORUM_HOME}}|$SERVICE_DIR|g" \
     | sed "s|{{HOST}}|$HOST|g" \
+    | sed "s|{{AUTH_MODE_ARGS}}|$AUTH_ARGS|g" \
     | sed "s|--port 5002|--port $PORT|" \
     | sed "s|Flask, port 5002|Flask, port $PORT|" \
     | _fill_baton_placeholder \

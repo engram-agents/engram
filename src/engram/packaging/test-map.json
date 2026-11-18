@@ -489,7 +489,8 @@
         "tests/test_inspect_raw_owner_2652.py",
         "tests/test_anchoring_report_owner_3881.py",
         "tests/test_tools_engram_home_3863.py",
-        "tests/test_store_path_precheck_3960.py"
+        "tests/test_store_path_precheck_3960.py",
+        "tests/test_owner_path_too_long_4868.py"
       ],
       "note": "engram-alpha#3862, #3872, #3879, #2652 (tools-7). The shared owner-read helper for tools/: the tools that use it load by path (spec_from_file_location) in their cells, so the layer-1 import graph does not see it; a change here must rerun every consumer's cells."
     },
@@ -702,6 +703,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/rotate_roster_format.py",
+      "test_globs": [
+        "tests/test_rotate_roster_format.py"
+      ],
+      "note": "One-time format-1 -> format-2 roster migration helper the roster holder runs on their own machine. The test runs the file as a subprocess and loads it by path (spec_from_file_location), invisible to the layer-1 import graph; it also loads src/engram/tools/scan-leaks.py by path as the parser whose behaviour it pins."
+    },
+    {
       "path_prefix_or_glob": "tools/os-harness-check.py",
       "test_globs": [
         "tests/test_os_harness_check.py"
@@ -823,11 +831,19 @@
       "note": "engram#4628: the before/after report of what the marketplace add changed in the user's Claude files. The test runs it as a subprocess and drives the installer with a stub claude, invisible to the layer-1 import graph."
     },
     {
+      "path_prefix_or_glob": "tools/store_read.py",
+      "test_globs": [
+        "tests/test_store_read_2652_unit02.py",
+        "tests/test_owner_path_too_long_4868.py"
+      ]
+    },
+    {
       "path_prefix_or_glob": "tools/install_selfcheck.py",
       "test_globs": [
         "tests/test_install_selfcheck.py",
         "tests/test_install_selfcheck_owner_read_4118.py",
-        "tests/test_install_selfcheck_stat_4299.py"
+        "tests/test_install_selfcheck_stat_4299.py",
+        "tests/test_owner_path_too_long_4868.py"
       ]
     },
     {

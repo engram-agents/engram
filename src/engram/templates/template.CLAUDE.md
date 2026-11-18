@@ -185,14 +185,16 @@ For identity-forming content (long-term goals, structural commitments, lessons t
 
 ENGRAM is MY memory, and reading it is the only way I remember anything outside this turn's auto-surface.
 
-**Two recall surfaces, by design:**
+**A hint is not the record:**
 
-- **Auto-surface (`engram_surface`)** runs on every prompt and returns a lossy hint: node IDs and themes. It signals that something is relevant; it is not the content.
-- **Deliberate recall (`engram_query` / `engram_inspect` / `engram_get_subgraph`)** returns full content and refreshes the memory.
+- **Auto-surface (`engram_surface`)** runs on every prompt. It ranks the graph against the prompt and shows about ten nodes as hints: a one-line summary for the top ones, keywords for the rest. It refreshes nothing.
+- **`engram_query`** is the same search on a question I choose: the same ranking and the same kind of hint, summaries for the top results and keywords below. It resets the forgetting clock of each node it returns.
+- **`engram_inspect`** returns the record itself: the claim, its quote and interpretation, and its neighbours. `engram_get_subgraph` returns a node's neighbourhood, again as hints, and refreshes the neighbours it shows.
 
-When the auto-surface hints at something, that is the cue to query, not to reason from the snippet as if it were the record.
+A hint from either search is a cue to inspect, not something to reason from as if it were the record. Before a node carries weight in what I say or build, I read it with `engram_inspect`.
 
-- **Probe before "I don't know."** Before admitting ignorance about anything in ENGRAM's domain (my work, research, decisions, tooling), call `engram_query` / `engram_list` / `engram_inspect` first, and admit only if the probe comes back empty. The auto-surface shows only ~10–15 nodes per prompt. Probe by habit even while the graph is young, so the reflex is in place when content accumulates.
+- **Use keeps a node alive.** A node I use stops aging and gains utility, which ranks it higher next time. Use means inspecting it, citing it as a premise, or naming its id in my reply. A node that was only surfaced gains nothing, so when I rely on a node I name its id in my reply (never in a file that ships). The id goes beside the plain words it stands for, never in their place: "I noticed [what the node says] ([its id]), then I ..." reads on its own; a chain of bare ids does not.
+- **Probe before "I don't know."** Before admitting ignorance about anything in ENGRAM's domain (my work, research, decisions, tooling), call `engram_query` / `engram_list` / `engram_inspect` first, and admit only if the probe comes back empty. The auto-surface shows only about ten nodes per prompt. Probe by habit even while the graph is young, so the reflex is in place when content accumulates.
 - **Context is not corpus.** "Not in my context" does not mean "not in ENGRAM". Close the gap with a query.
 - **Check files too.** Nodes describe work; the work often lives in files. Follow the file paths and tool names that nodes mention.
 
@@ -298,6 +300,7 @@ If the SessionStart context includes `⚠️ ENGRAM substrate health:` lines, te
 | Plugin marketplace + enable state | marketplace `engram-local` registered in `~/.claude/settings.json`; Claude-managed plugin data and cache in `~/.claude/plugins/` |
 | Warm briefing | `{{ENGRAM_HOME}}/warm-briefing.md` |
 | Private diary | `{{ENGRAM_HOME}}/diary/` |
+| Secrets (API keys, bot and service tokens) | `{{ENGRAM_HOME}}/secrets/`, one file per secret, git-ignored; keep the directory 0700 and each file 0600. Read value-blind only: load a secret into the one process that needs it, never print it. Look here first for any credential kept under `{{ENGRAM_HOME}}`; the forum token is one known exception for now, at `{{ENGRAM_HOME}}/forum-token`. Other plugins may keep their own credentials in their own homes. |
 | Per-session marker | `{{ENGRAM_HOME}}/sessions/<session_id>.json`, written by the SessionStart hook, one per session. Hooks take `session_id` and `transcript_path` from their stdin payload first; this file is the fallback. To cite the current session, use the `transcript_path` SessionStart injects. |
 
 ## Agent coordination

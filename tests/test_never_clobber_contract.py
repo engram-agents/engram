@@ -109,7 +109,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_bootstrap_no_clobber_4440 import (  # noqa: E402
-    REPO_ROOT, RUNTIME_FILES, SRC, _db, _home, _run, _run_uninstall,
+    REPO_ROOT, RUNTIME_FILES, SRC, _db, _home, _run_uninstall,
 )
 from test_install_sh_4097 import Sandbox  # noqa: E402
 
@@ -143,6 +143,9 @@ def _run_env(tmp_path: Path, target: str = "claude", args: list[str] | None = No
         "CODEX_HOME": str(tmp_path / ".codex"),
         "PYTHON_BIN": sys.executable,
         "TARGET": target,
+        # #4795: seeding the graph must not download the embedding model into the temp HOME.
+        # Set here, not at import; an extra_env entry overrides it.
+        "ENGRAM_NO_EMBEDDINGS": "1",
     })
     for k in ("ENGRAM_BOOTSTRAP", "FORCE", "FORCE_RESEED_EMPTY"):
         env.pop(k, None)
@@ -151,6 +154,12 @@ def _run_env(tmp_path: Path, target: str = "claude", args: list[str] | None = No
         [sys.executable, str(BOOTSTRAP_PY), *(args or [])],
         env=env, capture_output=True, text=True, timeout=300,
     )
+
+
+def _run(tmp_path: Path, target: str = "claude", args: list[str] | None = None) -> subprocess.CompletedProcess:
+    """The shared `_run` of the #4440 file, hermetic (#4795): that one copies os.environ and does not
+    set the embedding opt-out, so every cell and fixture that called it downloaded the model."""
+    return _run_env(tmp_path, target=target, args=args)
 
 
 def _text(r: subprocess.CompletedProcess) -> str:
@@ -2289,3 +2298,120 @@ def test_install_sh_step_5_says_so_in_its_own_words_when_the_marketplace_step_ex
     other = Sandbox(tmp_path / "other").run("--yes", env={"FAKE_MARKET_RC": "1"})
     generic = next(ln for ln in other.stderr.splitlines() if ln.startswith("FAIL: [step 5]"))
     assert "exited non-zero" in generic and "items it did not do" not in generic, generic
+
+
+# --------------------------------------------------------------------- #4795: no network call
+
+def _net_audit(root: Path):
+    """A sitecustomize audit hook on PYTHONPATH: every socket.connect / socket.getaddrinfo event
+    in any python child is appended to a log. It also appends sys.argv[0] to a SEPARATE loaded log
+    (not the network log, which the cells assert is empty) once per process that loads it.
+    Returns (dir for PYTHONPATH, network log path, loaded log path)."""
+    d = Path(root)
+    d.mkdir(parents=True, exist_ok=True)
+    log = d / "net-events.log"
+    loaded = d / "loaded.log"
+    (d / "sitecustomize.py").write_text(
+        "import sys\n"
+        f"_LOG = {str(log)!r}\n"
+        f"_LOADED = {str(loaded)!r}\n"
+        "try:\n"
+        "    with open(_LOADED, 'a') as _f:\n"
+        "        _f.write((sys.argv[0] if sys.argv else '') + '\\n')\n"
+        "except Exception:\n"
+        "    pass\n"
+        "def _hook(event, args):\n"
+        "    if event in ('socket.connect', 'socket.getaddrinfo'):\n"
+        "        try:\n"
+        "            with open(_LOG, 'a') as f:\n"
+        "                f.write('%s %r\\n' % (event, args[1] if event == 'socket.connect' else args[:2]))\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "sys.addaudithook(_hook)\n"
+    )
+    return d, log, loaded
+
+
+def _net_events(log: Path) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _loaded_argv0s(loaded: Path) -> list[str]:
+    return loaded.read_text().splitlines() if loaded.exists() else []
+
+
+def _assert_hook_loaded_in_the_run_own_process(loaded: Path) -> None:
+    """S1: the planted-call control proves the hook loads in a plain python, not in the bootstrap the
+    run itself started. The hook writes one line (argv0) per python process that loads it; the run's
+    own process is bootstrap.py."""
+    lines = _loaded_argv0s(loaded)
+    assert any(ln.endswith("bootstrap.py") for ln in lines), (
+        "the audit hook never loaded in the run's own bootstrap process; loaded in: %r" % lines)
+
+
+def _assert_audit_hook_sees_a_planted_call(run_env: dict[str, str], log: Path) -> None:
+    """Positive control: a planted getaddrinfo, run under the SAME env dict the bootstrap run was
+    given (its PYTHONPATH included), is logged by the hook. Without it a zero count proves nothing
+    (a hook that never loaded logs zero too); taking the dict, not the directory, means a run env that
+    lost its PYTHONPATH loses it in the control as well."""
+    before = len(_net_events(log))
+    env = {**os.environ, **run_env}
+    subprocess.run([sys.executable, "-c", "import socket; socket.getaddrinfo('localhost', 0)"],
+                   env=env, check=True, capture_output=True, timeout=60)
+    after = _net_events(log)
+    assert len(after) > before, "the audit hook never logged a planted getaddrinfo: it is not loaded"
+
+
+def _graph_nodes(engram_home: Path) -> int:
+    con = sqlite3.connect(str(engram_home / "knowledge.db"))
+    try:
+        return con.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_real_bootstrap_installer_cell_makes_no_network_call(tmp_path, tmp_path_factory, monkeypatch):
+    """#4795 A1: install.sh over the REAL bootstrap seeds a graph; seeding must not download the
+    embedding model (a temp HOME has no cache)."""
+    # CI sets this for the whole run. Sandbox.run builds its env from scratch, so this matters only for
+    # _run_env's os.environ copy; it stays to document that the cells do not lean on CI.
+    monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)
+    audit_dir, log, loaded = _net_audit(tmp_path_factory.mktemp("net-audit"))
+    sb = _installer_with_real_bootstrap(tmp_path)
+    run_env = {"PYTHONPATH": str(audit_dir)}
+    r = sb.run("--yes", env=run_env)
+    assert r.returncode == 0, r.all
+    assert _graph_nodes(sb.engram) > 0, "the real bootstrap did not seed a graph, so a zero proves nothing"
+    events = _net_events(log)
+    assert events == [], f"the real-bootstrap installer run made {len(events)} network events: {events[:3]}"
+    _assert_hook_loaded_in_the_run_own_process(loaded)
+    _assert_audit_hook_sees_a_planted_call(run_env, log)
+
+
+def test_a_seeding_bootstrap_run_makes_no_network_call(tmp_path, tmp_path_factory, monkeypatch):
+    """#4795 A2: one `_run_env` bootstrap run into a fresh home (it seeds) makes no network call."""
+    # Same note as A1: Sandbox.run builds its env from scratch; only _run_env copies os.environ.
+    monkeypatch.delenv("ENGRAM_NO_EMBEDDINGS", raising=False)
+    audit_dir, log, loaded = _net_audit(tmp_path_factory.mktemp("net-audit"))
+    run_env = {"PYTHONPATH": str(audit_dir)}
+    r = _run_env(tmp_path, extra_env=run_env)
+    assert r.returncode == 0, _text(r)
+    assert _graph_nodes(tmp_path / ".engram") > 0, "bootstrap did not seed a graph, so a zero proves nothing"
+    events = _net_events(log)
+    assert events == [], f"a seeding bootstrap run made {len(events)} network events: {events[:3]}"
+    _assert_hook_loaded_in_the_run_own_process(loaded)
+    _assert_audit_hook_sees_a_planted_call(run_env, log)
+
+
+def test_the_loaded_log_has_a_bootstrap_line_only_when_the_hook_is_on_pythonpath(tmp_path, tmp_path_factory):
+    """S1 unit cell (a tiny python child, not the installer): with the hook NOT on PYTHONPATH no line
+    reaches the loaded log; with it, a line whose argv0 ends with bootstrap.py does."""
+    _audit_dir, _log, loaded = _net_audit(tmp_path_factory.mktemp("net-audit"))
+    child = tmp_path / "bootstrap.py"
+    child.write_text("pass\n")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    subprocess.run([sys.executable, str(child)], env=env, check=True, capture_output=True, timeout=60)
+    assert not any(ln.endswith("bootstrap.py") for ln in _loaded_argv0s(loaded)), _loaded_argv0s(loaded)
+    subprocess.run([sys.executable, str(child)], env={**env, "PYTHONPATH": str(_audit_dir)},
+                   check=True, capture_output=True, timeout=60)
+    assert any(ln.endswith("bootstrap.py") for ln in _loaded_argv0s(loaded)), _loaded_argv0s(loaded)

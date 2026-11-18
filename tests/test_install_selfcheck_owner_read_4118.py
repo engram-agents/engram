@@ -426,7 +426,8 @@ def _unavailable(reason):
     return make
 
 
-@pytest.mark.parametrize("reason", ["timeout", "busy", "busy_or_stuck", "protocol", "local", "internal"])
+@pytest.mark.parametrize("reason", ["path_too_long", "timeout", "busy", "busy_or_stuck", "protocol", "local",
+                                    "internal"])
 def test_d3_every_unavailable_reason_but_down_fails_with_zero_direct_opens(home, monkeypatch, reason):
     build_store(home)
     set_flag(home)

@@ -155,6 +155,8 @@ def _install(tmp_path: Path, *, service_dir_arg: bool = True, dry_run: bool = Fa
         args.append("--dry-run")
     if no_start:
         args.append("--no-start")
+    if "--auth-mode" not in extra_args:  # required on every run (#1459); these cells are not about it
+        args += ["--auth-mode", "enforce"]  # before extra_args: a cell may end on a valueless flag
     args += list(extra_args)
     r = subprocess.run(args, capture_output=True, text=True,
                        env=_hermetic_env(home, stub, **(env_extra or {})), cwd=cwd,

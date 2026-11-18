@@ -551,11 +551,11 @@ jobs:
       # (secrets are unavailable in fork contexts); that is exactly why they are
       # red THERE.
       #
-      # NAME_LEAK_ROSTER format: newline-separated regex patterns, applied as-written.
-      # Authors encode their own word boundaries / case handling per pattern.
-      # Example:
-      #   \bAlice Example\b
-      #   \bagentname-nick\b
+      # NAME_LEAK_ROSTER has two shapes, inferred from the roster's own structure:
+      # format 2 is `A<TAB>pattern` per line (class A blocks) or `B<TAB>pattern`
+      # (class B is counted only; permitted by Lei's 2026-08-15 ruling), and a
+      # format-2 class-A pattern must declare a boundary. Format 1 is the legacy
+      # plain-regex form, applied as-written.
       # skipped on merge_group: reads the PR payload, which the queue ref does not carry; the gate already ran on the PR's own head
       - name: name-leak-warn — check for name-leak roster secret
         id: roster-check
@@ -1060,10 +1060,13 @@ jobs:
       # docs/internal/2652-migration-ledger.md lists every `sqlite3.connect(` line in
       # tracked src/engram, one Section-2 row each. Dev PRs do not run the
       # pytest suite, so a test alone would not gate them: this runs the
-      # stdlib-only check directly (git + python, ~0.1s). Three checks: per-file
+      # stdlib-only check directly (git + python, ~0.1s). Four checks: per-file
       # row counts (so line drift from unrelated edits stays green), the
-      # Section-1 state tallies against the Section-2 `state` column, and the
-      # Section-2 citations (function + anchor, verified in the named function).
+      # Section-1 state tallies against the Section-2 `state` column, the
+      # Section-1 direct ceiling (a new plain `direct` row fails until it moves
+      # behind a flag, is classified direct-by-design, or the epic owner raises
+      # the ceiling), and the Section-2 citations (function + anchor, verified
+      # in the named function).
       - name: stdlib-only guards — 2652 migration-ledger completeness
         if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success'
         run: python3 tools/check_2652_ledger.py

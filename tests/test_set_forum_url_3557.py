@@ -622,7 +622,7 @@ def _real_dry_run(tmp_path, engram_home, *, port):
     return subprocess.run(
         ["bash", str(INSTALLER), "--src", str(REPO), "--service-dir",
          str(tmp_path / "forum"), "--group", "agents", "--port", port,
-         "--dry-run"], capture_output=True, text=True,
+         "--auth-mode", "enforce", "--dry-run"], capture_output=True, text=True,
         env=_hermetic_env(ENGRAM_HOME=str(engram_home)))
 
 

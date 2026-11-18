@@ -11,9 +11,9 @@ HOUSE RULES (mirror engram_core.py § HOUSE RULES):
 
 import json
 import os
-from datetime import datetime, timezone
 
 import engram_core as core
+import engram_embedding_publish as publish
 from tools.recall_summary_validator import validate_summary_entry
 
 
@@ -64,103 +64,22 @@ from tools.recall_summary_validator import validate_summary_entry
 # a loud, ambiguous-input error; neither present is the existing
 # missing-"summaries" error.
 
-_EMBEDDING_REFRESH_PENDING = "embedding_refresh_pending"
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _vec_store_exists(conn) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vec_nodes'"
-    ).fetchone() is not None
-
-
-def _set_embedding_refresh_marker(conn, node_id: str, metadata_raw, *, reason: str) -> str | None:
-    """Persist strict-refresh debt while preserving unrelated metadata keys."""
-    metadata, warning = core._metadata_dict_for_write(
-        metadata_raw, node_id, "engram_set_recall_summaries"
-    )
-    metadata[_EMBEDDING_REFRESH_PENDING] = {
-        "reason": reason, "stage": "strict_refresh", "at": _utc_now(),
-    }
-    if conn.execute(
-        "UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(metadata), node_id)
-    ).rowcount != 1:
-        raise RuntimeError("could not persist embedding refresh debt marker")
-    return warning
-
-
-def _clear_embedding_refresh_marker(conn, node_id: str, metadata_raw) -> str | None:
-    """The sole debt-clearer: a verified strict refresh of this one node."""
-    if _EMBEDDING_REFRESH_PENDING not in core._metadata_dict(metadata_raw):
-        return None
-    metadata, warning = core._metadata_dict_for_write(
-        metadata_raw, node_id, "engram_set_recall_summaries"
-    )
-    metadata.pop(_EMBEDDING_REFRESH_PENDING, None)
-    if conn.execute(
-        "UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(metadata), node_id)
-    ).rowcount != 1:
-        raise RuntimeError("could not clear embedding refresh debt marker")
-    return warning
-
-
-def _pending_reason(outcome) -> str:
-    if outcome.status == "skipped":
-        return "unavailable"
-    if outcome.stage in {"text", "embed", "store"}:
-        return outcome.stage
-    return "embedding"
-
-
 def _strict_refresh_embedding(conn, node_id: str, metadata_raw) -> tuple[dict, str | None]:
     """Refresh and verify one full recipe; restore both vector stores on failure.
 
-    This is intentionally the single per-node marker-clearing path which a
-    later explicit repair operation must reuse.
+    Thin wrapper over the shared primitive (#4651 part A) in compute mode: the
+    strict refresh, its savepoint, the verification and the single
+    marker-clearing path now live in engram_embedding_publish. ``metadata_raw``
+    is kept only so the caller does not change; the primitive reads the row's
+    metadata itself inside the same transaction (the summary UPDATE does not
+    touch metadata, so it equals the value passed in).
     """
-    conn.execute("SAVEPOINT recall_summary_vector_refresh")
-    reason = None
-    try:
-        outcome = core._compute_and_store_embedding(conn, node_id)
-        if outcome.status != "embedded":
-            reason = _pending_reason(outcome)
-        elif not outcome.vec_mirror_ok:
-            reason = "mirror"
-        else:
-            row = conn.execute("SELECT embedding FROM nodes WHERE id = ?", (node_id,)).fetchone()
-            try:
-                vector = json.loads(row[0]) if row else None
-            except (TypeError, json.JSONDecodeError):
-                vector = None
-            if not isinstance(vector, list) or not vector:
-                reason = "canonical"
-            elif _vec_store_exists(conn):
-                # Do not accept the core helper's normal-write tolerance or
-                # its wrong-dimension mirror bypass in this strict path.
-                if (not core._VEC_BACKEND_AVAILABLE or core._sqlite_vec is None
-                        or len(vector) != 384):
-                    reason = "mirror"
-                else:
-                    mirror = conn.execute(
-                        "SELECT embedding FROM vec_nodes WHERE node_id = ?", (node_id,)
-                    ).fetchone()
-                    if mirror is None or mirror[0] != core._sqlite_vec.serialize_float32(vector):
-                        reason = "mirror"
-    except Exception:  # savepoint makes unexpected compute/verify failure non-destructive
-        reason = "embedding"
-
-    if reason is not None:
-        conn.execute("ROLLBACK TO recall_summary_vector_refresh")
-        conn.execute("RELEASE recall_summary_vector_refresh")
-        warning = _set_embedding_refresh_marker(conn, node_id, metadata_raw, reason=reason)
-        return {"embedding_refresh": "pending", "embedding_refresh_reason": reason}, warning
-
-    conn.execute("RELEASE recall_summary_vector_refresh")
-    warning = _clear_embedding_refresh_marker(conn, node_id, metadata_raw)
-    return {"embedding_refresh": "refreshed"}, warning
+    result = publish.publish_embedding(conn, node_id)
+    if result.status == "refreshed":
+        return {"embedding_refresh": "refreshed"}, result.warning
+    return {
+        "embedding_refresh": "pending", "embedding_refresh_reason": result.reason,
+    }, result.warning
 
 
 def _set_recall_summaries_impl(payload_json: str) -> str:

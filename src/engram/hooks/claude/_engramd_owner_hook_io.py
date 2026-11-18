@@ -193,8 +193,8 @@ def maintlock(home: str) -> str:
 
 def _probe_why(ec, result) -> str:
     """One short ASCII token for a ping that did not come back healthy: the client's own
-    Unavailable reason code (`down`, `timeout`, `protocol`, `busy`, `busy_or_stuck`, `local`,
-    `internal`), or `rejected-<reason>` when the owner answered and refused the ping. Sanitised:
+    Unavailable reason code (`down`, `path_too_long`, `timeout`, `protocol`, `busy`,
+    `busy_or_stuck`, `local`, `internal`), or `rejected-<reason>` when the owner answered and refused the ping. Sanitised:
     this token lands in a one-line report, and a hostile or broken owner must not be able to
     break the line."""
     reason = getattr(result, "reason", None)

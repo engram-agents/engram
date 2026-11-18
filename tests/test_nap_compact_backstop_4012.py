@@ -786,7 +786,8 @@ def test_c1_checkpoint_writes_the_record_with_the_header_timestamp_and_session()
     result = _checkpoint(server, OK_VC)
     assert "error" not in result
     rec = _record(server)
-    assert rec == {"checkpoint_at": _header_ts(server), "session_id": "sess-c1", "backup_ok": True}
+    assert rec == {"checkpoint_at": _header_ts(server), "session_id": "sess-c1", "backup_ok": True,
+                   "snapshot_backlog": {"status": "ok", "line": None}}  # #4843 adds the key
     # the call's return exposes the same value, so the skill can tell this nap's record from the last one's
     assert result["checkpoint_at"] == rec["checkpoint_at"]
 

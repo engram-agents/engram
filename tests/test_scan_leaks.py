@@ -60,6 +60,22 @@ def _make_tree(files: dict[str, str]) -> Path:
     return tmp
 
 
+def _scanner_env(env_extra=None):
+    """The environment a scanner invocation runs under.
+
+    GITHUB_ACTIONS is REMOVED from the inherited environment and is re-added
+    only when a cell asks for it by name. The suite's default is therefore
+    "not in CI", which is the only way a positive arm stays a positive arm on
+    a CI runner: at 8fc74ec9 both cell-18 locator arms silently exercised the
+    refusal path on GitHub Actions and asserted the locator path.
+    """
+    env = dict(os.environ)
+    env.pop("GITHUB_ACTIONS", None)
+    if env_extra:
+        env.update(env_extra)
+    return env
+
+
 # ---------------------------------------------------------------------------
 # Test 1: config-absent — advisory message, structural patterns only, exit 0
 # ---------------------------------------------------------------------------
@@ -73,6 +89,7 @@ def test_config_absent_prints_advisory_and_exits_clean(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, f"expected exit 0, got {result.returncode}\nstdout:{result.stdout}\nstderr:{result.stderr}"
     assert ".scan-leaks-local.json absent" in result.stdout, (
@@ -93,11 +110,13 @@ def test_config_absent_structural_pattern_still_fires(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 1, (
         f"expected exit 1 (leak found), got {result.returncode}\nstdout:{result.stdout}\nstderr:{result.stderr}"
     )
-    assert "main repo path" in result.stderr
+    assert _class_counts(result.stderr)[0] == 1, result.stderr
+    assert "main repo path" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +138,16 @@ def test_config_present_patterns_load_and_match(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 1, (
         f"expected exit 1 (personal name detected), got {result.returncode}\nstdout:{result.stdout}\nstderr:{result.stderr}"
     )
-    assert "personal name" in result.stderr
+    # Class A is count-only: the detection shows up as the count, never as the
+    # label or the location (the local roster is class A in code).
+    assert _class_counts(result.stderr)[0] == 1, result.stderr
+    assert "personal name" not in result.stderr
+    assert "offending.py" not in (result.stdout + result.stderr)
 
 
 def test_config_present_no_match_exits_clean(tmp_path):
@@ -140,6 +164,7 @@ def test_config_present_no_match_exits_clean(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, (
         f"expected exit 0, got {result.returncode}\nstdout:{result.stdout}\nstderr:{result.stderr}"
@@ -198,7 +223,7 @@ def test_mutation_planted_name_detected(tmp_path):
 
     clean_result = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert clean_result.returncode == 0, "pre-plant should be clean"
 
@@ -207,13 +232,15 @@ def test_mutation_planted_name_detected(tmp_path):
 
     dirty_result = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert dirty_result.returncode == 1, (
         f"planted name should trigger leak; returncode={dirty_result.returncode}\n"
         f"stderr: {dirty_result.stderr}"
     )
-    assert "personal name" in dirty_result.stderr
+    assert _class_counts(dirty_result.stderr)[0] >= 1, dirty_result.stderr
+    assert "personal name" not in dirty_result.stderr
+    assert "planted.py" not in (dirty_result.stdout + dirty_result.stderr)
 
     # Remove the planted file (cleanup)
     target.write_text("# clean again\n")
@@ -256,8 +283,9 @@ def test_load_local_patterns_present(tmp_path):
     patterns, present = _mod.load_local_patterns(tmp_path)
     assert present is True
     assert len(patterns) == 1
-    regex_obj, label = patterns[0]
+    regex_obj, label, klass = patterns[0]
     assert label == "test"
+    assert klass == "A"  # the local roster is class A in code (§2.2)
     assert regex_obj.search("Hello Alice world")
 
 
@@ -275,6 +303,7 @@ def test_malformed_config_fires_advisory(tmp_path):
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, (
         f"expected exit 0 on clean tree with malformed config, "
@@ -309,6 +338,7 @@ def test_real_repo_scan_no_config_exits_clean(tmp_path):
         ],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, (
         f"Real-repo scan with structural patterns only must exit 0.\n"
@@ -375,6 +405,7 @@ def test_repo_mode_ignores_untracked_hit(tmp_path):
         ],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, (
         f"Repo-mode scan must exit 0: untracked hit in dirty.py must be invisible.\n"
@@ -426,6 +457,7 @@ def test_repo_mode_detects_tracked_hit(tmp_path):
         ],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 1, (
         f"Repo-mode scan must exit 1 when a tracked file contains the structural hit.\n"
@@ -433,13 +465,14 @@ def test_repo_mode_detects_tracked_hit(tmp_path):
         f"stdout: {result.stdout}\n"
         f"stderr: {result.stderr}"
     )
-    assert "main repo path" in result.stderr, (
-        "Expected 'main repo path' label in stderr for the tracked hit; "
-        f"got stderr: {result.stderr!r}"
+    # Class A is count-only: the tracked hit shows up as the count, and the
+    # label and the filename never reach the report.
+    assert _class_counts(result.stderr)[0] == 1, result.stderr
+    assert "main repo path" not in result.stderr, (
+        f"the class-A label must not print; got stderr: {result.stderr!r}"
     )
-    assert "bad.py" in result.stderr, (
-        "Expected the filename bad.py to appear in the leak report; "
-        f"got stderr: {result.stderr!r}"
+    assert "bad.py" not in (result.stdout + result.stderr), (
+        f"the class-A location must not print; got stderr: {result.stderr!r}"
     )
 
 
@@ -469,6 +502,7 @@ def test_archived_dev_repo_url_is_not_flagged(tmp_path):
         ],
         capture_output=True,
         text=True,
+        env=_scanner_env(),
     )
     assert result.returncode == 0, (
         "Scanner must not flag a link to the archived development repository.\n"
@@ -488,7 +522,8 @@ def test_archived_dev_repo_url_is_not_flagged(tmp_path):
 #     still a finding
 #   - domain: every git-tracked text file whatever its extension; a file whose
 #     first 8 KiB holds a NUL byte is skipped
-#   - a finding exits 1 and names file:line and the segment
+#   - a finding exits 1 and prints a CLASS-A COUNT ONLY: no file, line or
+#     segment (format-2 roster; see Test 20)
 # Planted names are fictional; verdicts are asserted on scratch git repos,
 # never on counts read from the real tree.
 
@@ -511,8 +546,34 @@ def _run_scan(root: Path):
     return subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json")],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
+
+
+_CLASS_SPLIT_RE = re.compile(
+    r"scan-leaks: (\d+) class-A \(blocking\) and (\d+) class-B \(report-only\)"
+)
+
+
+def _class_counts(stderr: str) -> tuple[int, int]:
+    """(class-A, class-B) hit counts from the stderr split line."""
+    m = _CLASS_SPLIT_RE.search(stderr)
+    assert m is not None, stderr
+    return int(m.group(1)), int(m.group(2))
+
+
+def _assert_class_a_finding(r, path: str | None = None, count: int | None = None):
+    """The output contract for a class-A hit: exit 1, a count line, and — when
+    `path` is given — no location for it anywhere in stdout or stderr."""
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    class_a, _class_b = _class_counts(r.stderr)
+    assert class_a >= 1, out
+    if count is not None:
+        assert class_a == count, out
+    if path is not None:
+        assert path not in out, out
+    return out
 
 
 def _home(seg: str, base: str = "home") -> str:
@@ -523,9 +584,8 @@ def _home(seg: str, base: str = "home") -> str:
 def test_home_path_in_md_is_a_finding(tmp_path):
     _commit_files(tmp_path, {"doc.md": f"data in {_home('zorblax')}.engram\n"})
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "doc.md:1" in r.stderr
-    assert "zorblax" in r.stderr
+    out = _assert_class_a_finding(r, "doc.md", count=1)
+    assert "zorblax" not in out
 
 
 def test_home_path_in_extensionless_executable_is_a_finding(tmp_path):
@@ -535,17 +595,15 @@ def test_home_path_in_extensionless_executable_is_a_finding(tmp_path):
         mode={"tools/runner": 0o755},
     )
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "tools/runner:2" in r.stderr
-    assert "zorblax" in r.stderr
+    out = _assert_class_a_finding(r, "tools/runner", count=1)
+    assert "zorblax" not in out
 
 
 def test_home_path_in_yml_is_a_finding(tmp_path):
     _commit_files(tmp_path, {".github/workflows/ci.yml": f"run: ls {_home('zorblax', 'Users')}\n"})
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "ci.yml:1" in r.stderr
-    assert "zorblax" in r.stderr
+    out = _assert_class_a_finding(r, "ci.yml", count=1)
+    assert "zorblax" not in out
 
 
 def test_home_path_in_yaml_is_a_finding(tmp_path):
@@ -565,8 +623,8 @@ def test_allowed_placeholders_and_system_dirs_are_clean(tmp_path):
 def test_prefix_of_allowed_name_is_still_a_finding(tmp_path):
     _commit_files(tmp_path, {"a.md": f"see {_home('alice2')}x\n"})
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "alice2" in r.stderr
+    out = _assert_class_a_finding(r, count=1)
+    assert "alice2" not in out
 
 
 def test_binary_file_with_home_path_is_skipped(tmp_path):
@@ -617,8 +675,7 @@ _BOUNDARY_FORMS = {
 def test_boundary_form_is_a_finding(tmp_path, form):
     _commit_files(tmp_path, {"doc.md": _BOUNDARY_FORMS[form]() + "\n"})
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, (form, r.stdout + r.stderr)
-    assert "doc.md:1" in r.stderr
+    _assert_class_a_finding(r, "doc.md", count=1)
 
 
 def test_sentence_end_dot_is_stripped_before_the_allowed_check(tmp_path):
@@ -632,30 +689,31 @@ def test_sentence_end_dot_is_stripped_before_the_allowed_check(tmp_path):
     subprocess.run(["git", "commit", "-q", "-m", "more"], cwd=tmp_path, check=True)
     r = _run_scan(tmp_path)
     assert r.returncode == 1
-    assert "segment: zed" in r.stderr and "segment: zed." not in r.stderr
+    # The segment value is no longer printed (class A is count-only), so assert
+    # the stripped segment on the pass that returns it.
+    findings, _unreadable = _mod.scan_home_paths(tmp_path)
+    assert [seg for _rel, _n, seg in findings] == ["zed"], findings
 
 
 def test_whole_segment_without_trailing_slash_is_not_prefix_allowed(tmp_path):
     _commit_files(tmp_path, {"a.md": "cd " + _bare("someone2") + "\n"})
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "someone2" in r.stderr
+    out = _assert_class_a_finding(r, count=1)
+    assert "someone2" not in out
 
 
 def test_real_looking_name_in_an_ordinary_tests_file_is_a_finding(tmp_path):
     """Pins the exemption scope: only declared files are exempt, never a directory."""
     _commit_files(tmp_path, {"tests/test_ordinary.py": 'p = "' + _home("zed") + '"\n'})
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "tests/test_ordinary.py:1" in r.stderr
+    _assert_class_a_finding(r, "tests/test_ordinary.py", count=1)
 
 
 def test_non_utf8_file_is_still_scanned(tmp_path):
     payload = b"caf\xe9 " + _home("zed").encode() + b"x\n"
     _commit_files(tmp_path, {"latin1.md": payload})
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "latin1.md:1" in r.stderr
+    _assert_class_a_finding(r, "latin1.md", count=1)
 
 
 def test_no_file_is_exempt_from_the_home_path_check():
@@ -676,7 +734,8 @@ def test_seat_home_convention_prefixes_are_clean_but_a_real_name_is_not(tmp_path
     subprocess.run(["git", "add", "b.sh"], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "name"], cwd=tmp_path, check=True)
     r = _run_scan(tmp_path)
-    assert r.returncode == 1 and "agent-zed" in r.stderr
+    assert r.returncode == 1
+    assert "agent-zed" not in (r.stdout + r.stderr)
 
 
 @pytest.mark.parametrize("seg", ["someone.x", "alice.smith"])
@@ -685,9 +744,8 @@ def test_allowed_name_plus_dot_plus_more_is_a_different_segment(tmp_path, seg):
     a dot and more characters is a different, undeclared name."""
     _commit_files(tmp_path, {"a.md": "cd " + _home(seg) + "x\n" + "cd " + _bare(seg) + "\n"})
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "a.md:1" in r.stderr and "a.md:2" in r.stderr
-    assert "segment: " + seg in r.stderr
+    out = _assert_class_a_finding(r, "a.md", count=2)
+    assert seg not in out
 
 
 def test_allowed_name_before_a_sentence_end_dot_is_clean(tmp_path):
@@ -705,7 +763,8 @@ def test_home_prefix_is_case_sensitive_but_users_is_not(tmp_path):
     subprocess.run(["git", "add", "b.md"], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "users"], cwd=tmp_path, check=True)
     r = _run_scan(tmp_path)
-    assert r.returncode == 1 and "b.md:1" in r.stderr
+    assert r.returncode == 1
+    assert "b.md" not in (r.stdout + r.stderr)
 
 
 def test_allowed_home_segment_set_is_pinned():
@@ -769,7 +828,7 @@ def test_bad_entry_missing_regex_reported_by_position(tmp_path, capsys):
     entries = [_good("okone"), bad, _good("oktwo")]
     patterns, present, err = _load_with_entries(tmp_path, entries, capsys)
     assert present is True
-    assert [lbl for _, lbl in patterns] == ["okone", "oktwo"]
+    assert [lbl for _p, lbl, _k in patterns] ==["okone", "oktwo"]
     _assert_reported_by_position(err, 2, "KeyError", entries)
     assert "missing key 'regex'" in err
 
@@ -778,7 +837,7 @@ def test_bad_entry_missing_label_names_the_key_only(tmp_path, capsys):
     bad = {"regex": _TOK_RE}
     entries = [bad, _good("oktwo")]
     patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
-    assert [lbl for _, lbl in patterns] == ["oktwo"]
+    assert [lbl for _p, lbl, _k in patterns] ==["oktwo"]
     _assert_reported_by_position(err, 1, "KeyError", entries)
     assert "missing key 'label'" in err
 
@@ -795,7 +854,7 @@ def test_bad_entry_re_error_does_not_echo_exception_text(tmp_path, capsys):
     bad = {"regex": pattern, "label": "okbad"}
     entries = [_good("okone"), bad, _good("oktwo")]
     patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
-    assert [lbl for _, lbl in patterns] == ["okone", "oktwo"]
+    assert [lbl for _p, lbl, _k in patterns] ==["okone", "oktwo"]
     _assert_reported_by_position(err, 2, cls, entries)
 
 
@@ -807,14 +866,14 @@ def test_bad_entry_label_is_not_echoed(tmp_path, capsys):
     bad = {"regex": f"(?P={_TOK_RE})", "label": _TOK_LABEL}
     entries = [_good("okone"), bad]
     patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
-    assert [lbl for _, lbl in patterns] == ["okone"]
+    assert [lbl for _p, lbl, _k in patterns] ==["okone"]
     _assert_reported_by_position(err, 2, cls, entries)
 
 
 def test_bad_entry_not_a_dict_reported_by_position(tmp_path, capsys):
     entries = [_TOK_LABEL, _good("oktwo")]
     patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
-    assert [lbl for _, lbl in patterns] == ["oktwo"]
+    assert [lbl for _p, lbl, _k in patterns] ==["oktwo"]
     _assert_reported_by_position(err, 1, "TypeError", entries)
 
 
@@ -830,7 +889,7 @@ def test_bad_entry_other_compile_failures_are_skipped(tmp_path, capsys, monkeypa
     monkeypatch.setattr(_mod.re, "compile", fake_compile)
     entries = [{"regex": _TOK_RE, "label": "okbad"}, _good("oktwo")]
     patterns, _, err = _load_with_entries(tmp_path, entries, capsys)
-    assert [lbl for _, lbl in patterns] == ["oktwo"]
+    assert [lbl for _p, lbl, _k in patterns] ==["oktwo"]
     _assert_reported_by_position(err, 1, exc_cls.__name__, entries)
 
 
@@ -848,7 +907,8 @@ def test_bad_entry_other_compile_failures_are_skipped(tmp_path, capsys, monkeypa
 #   - main() prints exactly one summary line
 #     "scan-leaks: scanned N, skipped-binary M", on clean and dirty runs, and
 #     N + M equals the number of files the scan considered.
-#   - findings and exit codes are unchanged.
+#   - findings are exit 1 and, being class A here, print a COUNT ONLY (see
+#     Test 20 for the two-class output contract).
 
 _ALICE_ROSTER = {"patterns": [{"regex": r"\bAlice\b", "label": "personal name"}]}
 
@@ -867,7 +927,7 @@ def _run_scan_with_roster(root: Path):
     """Run the scanner with the fixture's own roster (default config path)."""
     return subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
 
 
@@ -885,18 +945,14 @@ def test_roster_hit_in_js_file_is_reported(tmp_path):
     _commit_files(tmp_path, {"web/app.js": "// Alice wrote this\n"})
     _write_roster(tmp_path)
     r = _run_scan_with_roster(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "web/app.js:1" in r.stderr
-    assert "personal name" in r.stderr
+    _assert_class_a_finding(r, "web/app.js", count=1)
 
 
 def test_roster_hit_in_html_file_is_reported(tmp_path):
     _commit_files(tmp_path, {"site/index.html": "<p>Alice</p>\n"})
     _write_roster(tmp_path)
     r = _run_scan_with_roster(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "site/index.html:1" in r.stderr
-    assert "personal name" in r.stderr
+    _assert_class_a_finding(r, "site/index.html", count=1)
 
 
 def test_roster_hit_in_extensionless_executable_is_reported(tmp_path):
@@ -907,9 +963,7 @@ def test_roster_hit_in_extensionless_executable_is_reported(tmp_path):
     )
     _write_roster(tmp_path)
     r = _run_scan_with_roster(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "tools/runner:2" in r.stderr
-    assert "personal name" in r.stderr
+    _assert_class_a_finding(r, "tools/runner", count=1)
 
 
 def test_roster_hit_in_non_utf8_text_file_is_reported(tmp_path):
@@ -917,9 +971,7 @@ def test_roster_hit_in_non_utf8_text_file_is_reported(tmp_path):
     _commit_files(tmp_path, {"notes.txt": b"caf\xe9 Alice\n"})
     _write_roster(tmp_path)
     r = _run_scan_with_roster(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "notes.txt:1" in r.stderr
-    assert "personal name" in r.stderr
+    _assert_class_a_finding(r, "notes.txt", count=1)
 
 
 def test_binary_files_are_skipped_and_counted(tmp_path):
@@ -958,8 +1010,8 @@ def test_summary_counts_partition_the_files_considered(tmp_path):
 def test_summary_line_prints_on_a_dirty_run(tmp_path):
     _commit_files(tmp_path, {"bad.js": "path = '" + "kg_protocol" + "_for_ai" + "/x'\n"})
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "main repo path" in r.stderr
+    out = _assert_class_a_finding(r, "bad.js", count=1)
+    assert "main repo path" not in out
     assert _summary(r.stdout) == (1, 0), f"stdout={r.stdout!r}"
 
 
@@ -973,9 +1025,10 @@ def test_use_git_false_fallback_scans_all_text_files(tmp_path):
     (tmp_path / "LICENSE").write_text("Alice\n")
 
     report = _mod.scan(
-        tmp_path, [(re.compile(r"\bAlice\b"), "personal name")], use_git=False,
+        tmp_path, [(re.compile(r"\bAlice\b"), "personal name", "A")],
+        use_git=False,
     )
-    assert [rel for rel, _, _, _ in report.findings] == ["app.js"]
+    assert [rel for rel, _, _, _, _ in report.findings] == ["app.js"]
     assert (report.scanned, report.skipped_binary) == (1, 1)
 
 
@@ -1003,19 +1056,20 @@ def test_tracked_directory_symlink_is_scanned_by_its_link_text(tmp_path):
 # Test 15: --roster-file and --redact (whole-tree sweep support)
 # ---------------------------------------------------------------------------
 #
-# Contract (written before the implementation):
-#   - --roster-file takes newline-separated regexes in the SAME format as the
-#     NAME_LEAK_ROSTER secret: blank lines and first-non-space-'#' lines are
-#     ignored; valid lines are scanned alongside the committed patterns and the
-#     local roster.
-#   - an invalid line is reported by 1-based LINE NUMBER, exception class and
-#     (for re.error) offset — never by its text.
+# Contract (updated for roster format 2 — see §2 of
+# roster-format2-loader.md):
+#   - --roster-file takes `A<TAB>regex` / `B<TAB>regex` lines, blank lines and
+#     first-non-space-'#' lines ignored; every line must carry a class.
+#   - one bad line refuses the WHOLE roster (exit 2), reported by 1-based LINE
+#     NUMBER, exception class and (for re.error) offset — never by its text.
 #   - the "personal-name scan skipped" advisory fires only when BOTH roster
 #     sources produced no pattern.
-#   - --redact prints every finding as repo-relative-path:line only, for BOTH
-#     families (pattern hits and absolute-home-path hits), with neither the
-#     matched text nor a label/segment.
-#   - exit codes are unchanged (0 clean, 1 leaks, 2 usage/root error).
+#   - class A prints a COUNT ONLY by default and under --redact;
+#     --show-class-a-locations (cell 18) is the only opt-in locator and turns
+#     itself off where GITHUB_ACTIONS is set;
+#     --redact keeps its meaning for class B: repo-relative-path:line only,
+#     with neither the matched text nor the label.
+#   - exit codes: 0 no class-A hit, 1 a class-A hit, 2 usage/roster parse.
 #
 # The tokens below are invented for these cells, appear nowhere else, and the
 # home-path fixture is assembled by _home() so the committed test file never
@@ -1039,81 +1093,88 @@ def test_roster_file_supplies_patterns_and_suppresses_the_skip_advisory(tmp_path
     root = tmp_path / "root"
     root.mkdir()
     _commit_files(root, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
-    roster = _external_roster(tmp_path, "# a comment\n\n" + _EXT_TOKEN + "\n")
+    roster = _external_roster(
+        tmp_path, "# a comment\n\nA\t\\b" + _EXT_TOKEN + "\\b\n"
+    )
 
     # Control: local roster absent, no external file -> clean + skip advisory.
     without = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json")],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert without.returncode == 0, without.stdout + without.stderr
     assert "personal-name scan skipped" in without.stdout
 
-    # With the external roster the hit is found and the skip claim is gone.
+    # With the external roster the hit is found (class A: a count, no location)
+    # and the skip claim is gone.
     with_roster = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json"),
          "--roster-file", str(roster)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
-    assert with_roster.returncode == 1, with_roster.stdout + with_roster.stderr
-    assert "doc.md:1" in with_roster.stderr
+    _assert_class_a_finding(with_roster, "doc.md", count=1)
     assert "personal-name scan skipped" not in with_roster.stdout
     assert "personal-name scan skipped" not in with_roster.stderr
 
 
 def test_redact_prints_path_and_line_only(tmp_path):
-    """--redact prints path:line for a pattern hit and neither the matched text
-    nor the roster label. The unredacted run is the control: it carries both."""
+    """--redact prints path:line for a CLASS-B hit and neither the matched text
+    nor the roster label. The unredacted run is the control: it carries both.
+    (Class A is already count-only, so --redact is a no-op there.)"""
     _commit_files(tmp_path, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
-    (tmp_path / ".scan-leaks-local.json").write_text(json.dumps(
-        {"patterns": [{"regex": _EXT_TOKEN, "label": _EXT_LABEL}]}))
+    roster = _external_roster(tmp_path, "B\t" + _EXT_TOKEN + "\n")
 
     plain = subprocess.run(
-        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
-        capture_output=True, text=True,
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path),
+         "--config-path", str(tmp_path / "no-config.json"),
+         "--roster-file", str(roster)],
+        capture_output=True, text=True, env=_scanner_env(),
     )
-    assert plain.returncode == 1, plain.stdout + plain.stderr
+    assert plain.returncode == 0, plain.stdout + plain.stderr
     # Control: the unredacted form really does carry both, so their absence
     # below is a property of --redact and not of the fixture.
-    assert _EXT_TOKEN in plain.stderr and _EXT_LABEL in plain.stderr
+    assert "doc.md:1" in plain.stderr, plain.stderr
+    assert _EXT_TOKEN in plain.stderr and "roster file" in plain.stderr
 
     redacted = subprocess.run(
-        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path), "--redact"],
-        capture_output=True, text=True,
+        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path),
+         "--config-path", str(tmp_path / "no-config.json"),
+         "--roster-file", str(roster), "--redact"],
+        capture_output=True, text=True, env=_scanner_env(),
     )
-    assert redacted.returncode == 1, redacted.stdout + redacted.stderr
+    assert redacted.returncode == 0, redacted.stdout + redacted.stderr
     assert "doc.md:1" in redacted.stderr
     combined = redacted.stdout + redacted.stderr
     assert _EXT_TOKEN not in combined, combined
-    assert _EXT_LABEL not in combined, combined
+    assert "roster file" not in combined, combined
 
 
 def test_redact_hides_the_home_path_segment(tmp_path):
-    """--redact applies to the absolute-home-path family too: the username
-    segment must not reach the log."""
+    """--redact is a NO-OP for a class-A home-path finding, because class A is
+    already count-only: the username segment must never reach the log, with or
+    without the flag. The in-process positive control proves the fixture really
+    carries a finding whose segment would have printed before this change."""
     _commit_files(tmp_path, {"doc.md": "data in " + _home("zorblax") + "x\n"})
 
-    plain = subprocess.run(
-        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path)],
-        capture_output=True, text=True,
-    )
-    assert plain.returncode == 1, plain.stdout + plain.stderr
-    assert "segment: zorblax" in plain.stderr  # control
+    findings, _unreadable = _mod.scan_home_paths(tmp_path)
+    assert [seg for _rel, _n, seg in findings] == ["zorblax"], findings
 
-    redacted = subprocess.run(
-        [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path), "--redact"],
-        capture_output=True, text=True,
-    )
-    assert redacted.returncode == 1, redacted.stdout + redacted.stderr
-    assert "doc.md:1" in redacted.stderr
-    assert "zorblax" not in (redacted.stdout + redacted.stderr)
+    for extra in ((), ("--redact",)):
+        r = subprocess.run(
+            [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path), *extra],
+            capture_output=True, text=True, env=_scanner_env(),
+        )
+        out = _assert_class_a_finding(r, "doc.md", count=1)
+        assert "zorblax" not in out, out
+        assert "segment:" not in out, out
 
 
 def test_invalid_roster_line_reports_line_and_class_without_text(tmp_path):
-    """An invalid external roster line is reported by raw 1-based line number,
-    exception class and offset — never by its text; the valid lines still run."""
+    """A bad roster line refuses the WHOLE roster (exit 2) — it is reported by
+    raw 1-based line number, exception class and offset, never by its text, and
+    the valid line that would have matched is not scanned at all."""
     bad_line = f"(?P={_BAD_ROSTER_TOKEN})"
     with pytest.raises(re.error) as probe:
         re.compile(bad_line)
@@ -1124,23 +1185,24 @@ def test_invalid_roster_line_reports_line_and_class_without_text(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     _commit_files(root, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
-    # Line 1 is valid, 2 a comment, 3 blank, 4 the bad line.
+    # Line 1 is valid and WOULD match, 2 a comment, 3 blank, 4 the bad line.
     roster = _external_roster(
-        tmp_path, _EXT_TOKEN + "\n# a comment\n\n" + bad_line + "\n"
+        tmp_path,
+        "A\t\\b" + _EXT_TOKEN + "\\b\n# a comment\n\n" + "A\t" + bad_line + "\n",
     )
 
     r = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json"),
          "--roster-file", str(roster), "--redact"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
-    assert r.returncode == 1, r.stdout + r.stderr  # the valid line still fires
-    assert "doc.md:1" in r.stderr
-    assert "bad roster line 4" in r.stderr, r.stderr
+    assert r.returncode == 2, r.stdout + r.stderr  # no partial scan -> never 1
+    assert "roster line 4" in r.stderr, r.stderr
     assert type(probe.value).__name__ in r.stderr, r.stderr
     assert f"at offset {probe.value.pos}" in r.stderr, r.stderr
-    assert _BAD_ROSTER_TOKEN not in r.stderr, r.stderr
+    assert _BAD_ROSTER_TOKEN not in r.stdout + r.stderr, r.stderr
+    assert _EXT_TOKEN not in r.stdout + r.stderr, r.stderr
     assert probe.value.msg not in r.stderr and "unknown group name" not in r.stderr
 
 
@@ -1151,7 +1213,7 @@ def test_absent_roster_file_is_a_usage_error(tmp_path):
     r = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(tmp_path),
          "--roster-file", str(tmp_path / "no-such-roster.txt")],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert r.returncode == 2, r.stdout + r.stderr
 
@@ -1171,14 +1233,14 @@ def test_pattern_hit_gets_the_roster_sentence(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     _commit_files(root, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
-    roster = _external_roster(tmp_path, _EXT_TOKEN + "\n")
+    roster = _external_roster(tmp_path, "A\t\\b" + _EXT_TOKEN + "\\b\n")
     r = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json"),
          "--roster-file", str(roster), "--redact"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
-    assert r.returncode == 1, r.stdout + r.stderr
+    _assert_class_a_finding(r, count=1)
     assert _ROSTER_ADVICE in r.stderr, r.stderr
     assert _HOME_ADVICE not in r.stderr, r.stderr
 
@@ -1193,28 +1255,27 @@ def test_home_path_hit_gets_its_own_sentence_not_the_roster_one(tmp_path):
     assert _ROSTER_ADVICE not in r.stderr, r.stderr
 
 
-def test_all_invalid_roster_file_is_a_usage_error(tmp_path):
-    """R3-7: an explicitly requested roster that supplies no usable pattern is
-    a usage error (exit 2), not a clean run; the count of rejected lines is
-    named and the pattern text never is.
-
-    CI pre-validates its roster before invoking this flag, so this is the
-    standalone flag's contract, not CI's.
-    """
+def test_one_bad_line_refuses_the_whole_roster(tmp_path):
+    """Any bad line refuses the ENTIRE roster: a roster whose line 1 would
+    match the tree still exits 2 — never 1 — so no partial scan happens. The
+    pattern text is never echoed."""
     root = tmp_path / "root"
     root.mkdir()
-    _commit_files(root, {"doc.md": "hello world\n"})
+    _commit_files(root, {"doc.md": f"hello {_EXT_TOKEN} world\n"})
     bad = f"(?P={_BAD_ROSTER_TOKEN})"
-    roster = _external_roster(tmp_path, bad + "\n" + bad + "x\n")
+    roster = _external_roster(
+        tmp_path, "A\t\\b" + _EXT_TOKEN + "\\b\n" + "A\t" + bad + "\n"
+    )
     r = subprocess.run(
         [sys.executable, str(SCAN_LEAKS), "--root", str(root),
          "--config-path", str(root / "no-config.json"),
          "--roster-file", str(roster)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_scanner_env(),
     )
     assert r.returncode == 2, r.stdout + r.stderr
-    assert "all 2 roster line(s) were rejected" in r.stderr, r.stderr
+    assert "roster line 2" in r.stderr, r.stderr
     assert _BAD_ROSTER_TOKEN not in r.stdout + r.stderr
+    assert _EXT_TOKEN not in r.stdout + r.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -1795,9 +1856,7 @@ def test_cell1_directory_symlink_home_link_text_is_a_finding(tmp_path):
     _commit_symlinks(tmp_path, {"desk-link": str(home)})
 
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "desk-link:1" in r.stderr, r.stderr
-    assert "absolute home path" in r.stderr, r.stderr
+    _assert_class_a_finding(r, "desk-link", count=1)
     assert not _NOT_A_FILE_LINE_RE.search(r.stdout), r.stdout
 
 
@@ -1814,10 +1873,8 @@ def test_cell2_file_symlink_home_link_text_is_a_finding(tmp_path):
     )
 
     r = _run_scan(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "report-link:1" in r.stderr, r.stderr
-    assert "absolute home path" in r.stderr, r.stderr
-    assert "clean.txt" not in r.stderr, r.stderr
+    out = _assert_class_a_finding(r, "report-link", count=1)
+    assert "clean.txt" not in out, out
 
 
 def test_cell3_relative_symlink_is_scanned_not_not_a_file(tmp_path):
@@ -1882,10 +1939,9 @@ def test_cell5_symlink_target_is_not_double_counted(tmp_path):
     ))
 
     r = _run_scan_with_roster(tmp_path)
-    assert r.returncode == 1, r.stdout + r.stderr
-    hit_lines = [l for l in r.stderr.splitlines() if l.startswith("  ")]
-    assert len(hit_lines) == 1, r.stderr
-    assert "target.py:1" in hit_lines[0], r.stderr
+    # Class A is count-only, so the finding COUNT is the observable: exactly
+    # one, not two.  A followed link would make it two.
+    _assert_class_a_finding(r, "target.py", count=1)
 
 
 def test_cell6_internal_error_exits_2_not_1(tmp_path):
@@ -1973,9 +2029,8 @@ def test_cell8_positive_controls(tmp_path):
         {"patterns": [{"regex": _TOKEN5, "label": "planted token"}]}
     ))
     r_leaky = _run_scan_with_roster(leaky)
-    assert r_leaky.returncode == 1, r_leaky.stdout + r_leaky.stderr
+    _assert_class_a_finding(r_leaky, "doc.md", count=1)
     assert _summary(r_leaky.stdout) == (1, 0)
-    assert "doc.md:1" in r_leaky.stderr, r_leaky.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -2083,9 +2138,7 @@ def test_r5_item2b_walk_fallback_scans_a_directory_symlink_home_text(tmp_path):
     assert unreadable == [], unreadable
 
     r = _run_scan(root)
-    assert r.returncode == 1, r.stdout + r.stderr
-    assert "dir-link:1" in r.stderr, r.stderr
-    assert "absolute home path" in r.stderr, r.stderr
+    _assert_class_a_finding(r, "dir-link", count=1)
 
 
 # U+2028 is a line break to str.splitlines() (as is the C1 U+0085, written
@@ -2118,4 +2171,730 @@ def test_r5_item3_c1_and_unicode_line_breaks_are_escaped(tmp_path):
     assert "evil\\x85name.bin" in r.stdout, repr(r.stdout)
     assert _R5_LINE_SEP not in r.stdout, repr(r.stdout)
     assert "\x85" not in r.stdout, repr(r.stdout)
+
+
+# ---------------------------------------------------------------------------
+# Test 20: two-class roster, format 2 — the loader and the output split
+# ---------------------------------------------------------------------------
+#
+# Contract (spec roster-format2-loader §2 and §4; written before the
+# implementation):
+#   - every non-blank non-comment roster line is `A<TAB><regex>` or
+#     `B<TAB><regex>`; blank lines and `#` comments keep their meaning;
+#   - NO default class: no tab, a class token other than exactly `A`/`B`
+#     (case-sensitive), a regex that does not compile, a second tab, and a
+#     class-A pattern that declares no boundary are each a HARD parse error
+#     naming the 1-based line number — and never the line, the pattern or any
+#     substring of either;
+#   - ANY bad line refuses the WHOLE roster, exit 2 (never 1, never 3);
+#   - class-A hits print a COUNT ONLY — no path, line, label or snippet, under
+#     every flag. Class-B hits print per line (`path:line [label] snippet`;
+#     `path:line` under --redact);
+#   - COMMITTED_PATTERNS, the local roster and home-path findings are class A
+#     declared in code (no roster line declares them).
+#
+# Every fixture token below is invented and appears nowhere else.
+
+_C2_NAME = "ZZTestName"
+_C2_OTHER = "ZZOtherName"
+_C2_CLASS_SPLIT = "0 class-B (report-only)"
+
+
+def _format2_roster(tmp_path: Path, text: str) -> Path:
+    """Write a format-2 roster OUTSIDE the scanned root (as CI does)."""
+    roster = tmp_path / "roster-format2.txt"
+    roster.write_text(text, encoding="utf-8")
+    return roster
+
+
+def _run_with_roster(root: Path, roster: Path, *extra: str):
+    return subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root),
+         "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster), *extra],
+        capture_output=True, text=True, env=_scanner_env(),
+    )
+
+
+def test_cell1_no_class_token_refuses_the_roster(tmp_path):
+    """Cell 1: a bare regex line is a hard parse error naming its line number;
+    the pattern text (and every substring of it) stays out of the output."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    roster = _format2_roster(
+        tmp_path, "# a comment\n\n\\b" + _C2_NAME + "\\b\n"
+    )
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 2, out
+    assert "line 3" in r.stderr, out
+    assert _C2_NAME not in out, out
+    assert "A<TAB>" in r.stderr and "B<TAB>" in r.stderr, out
+
+
+@pytest.mark.parametrize("class_token", ["C", "a"])
+def test_cell2_unknown_class_letter_refuses_the_roster(tmp_path, class_token):
+    """Cell 2: a class token other than exactly `A` or `B` (case-sensitive) is
+    refused by line number only, never echoed."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    roster = _format2_roster(
+        tmp_path, class_token + "\t\\b" + _C2_NAME + "\\b\n"
+    )
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 2, out
+    assert "line 1" in r.stderr, out
+    assert _C2_NAME not in out, out
+    assert class_token + "\t" not in out, out
+
+
+def test_cell3_uncompilable_regex_refuses_the_roster(tmp_path):
+    """Cell 3: an uncompilable regex is refused by line number, exception class
+    and offset — never by the line, whose text `re.error.__str__` embeds."""
+    bad_regex = f"(?P={_C2_NAME})"
+    with pytest.raises(re.error) as probe:
+        re.compile(bad_regex)
+    # Precondition: this CPython embeds the token in str(exc), so a loader that
+    # appended str(exc) would leak it.
+    assert _C2_NAME in str(probe.value)
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": "clean\n"})
+    roster = _format2_roster(
+        tmp_path,
+        "A\t\\b" + _C2_OTHER + "\\b\nB\tok\nA\t" + bad_regex + "\n",
+    )
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 2, out
+    assert "line 3" in r.stderr, out
+    assert type(probe.value).__name__ in r.stderr, out
+    assert f"offset {probe.value.pos}" in r.stderr, out
+    assert _C2_NAME not in out, out
+
+
+def test_cell4_a_tab_inside_the_regex_is_a_parse_error_not_a_truncation(tmp_path):
+    """Cell 4: `A<TAB>foo<TAB>bar` is a parse error, never a silent truncation
+    to `foo`. The fixture discriminates: the pattern before the second tab is
+    bounded and DOES match this tree, so a loader that truncated would exit 1
+    (a hit) while the contract exits 2 (refused)."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    roster = _format2_roster(
+        tmp_path, "A\t\\b" + _C2_NAME + "\\b\t" + _C2_OTHER + "\n"
+    )
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 2, out
+    assert "line 1" in r.stderr, out
+    assert _C2_NAME not in out, out
+    assert _C2_OTHER not in out, out
+
+
+def test_cell5_class_a_hit_prints_a_count_and_no_location(tmp_path):
+    """Cell 5 (#4 in the design): an A hit exits 1 and prints a count only —
+    no path, no line number, no label, no snippet."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    roster = _format2_roster(tmp_path, "A\t\\b" + _C2_NAME + "\\b\n")
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 1, out
+    assert "1 class-A (blocking) and " + _C2_CLASS_SPLIT in r.stderr, out
+    assert "doc.md" not in out, out
+    assert _C2_NAME not in out, out
+    assert "[roster file]" not in out, out
+
+
+def test_cell6_class_b_hit_prints_per_line_and_does_not_block(tmp_path):
+    """Cell 6: the SAME tree and pattern moved to B prints per line, reports a
+    non-zero class-B count, and leaves the scanner at exit 0. The A run is the
+    control in the same cell: failure, and count-only."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+
+    roster_b = _format2_roster(tmp_path, "B\t" + _C2_NAME + "\n")
+    rb = _run_with_roster(root, roster_b)
+    out_b = rb.stdout + rb.stderr
+    assert rb.returncode == 0, out_b
+    assert "doc.md:1" in rb.stderr, out_b
+    assert "0 class-A (blocking) and 1 class-B (report-only) hit(s)" in rb.stderr, out_b
+
+    roster_a = tmp_path / "roster-format2-a.txt"
+    roster_a.write_text("A\t\\b" + _C2_NAME + "\\b\n", encoding="utf-8")
+    ra = _run_with_roster(root, roster_a)
+    out_a = ra.stdout + ra.stderr
+    assert ra.returncode == 1, out_a
+    assert "doc.md" not in out_a, out_a
+
+
+def test_cell6b_class_b_only_with_incomplete_coverage_exits_3(tmp_path):
+    """Cell 6b (§2.4): a class-B-only run over an incomplete tree still exits 3
+    and still prints its class-B count, with the class-A count 0.
+
+    `test_cell6_class_b_hit_prints_per_line_and_does_not_block` is the paired
+    control: the same B-only shape over a FULLY readable tree exits 0. The
+    contract: "did not look" is never a green tick, but a class-B hit must not
+    turn an incomplete run into exit 1 either — class B is report-only, so the
+    coverage verdict is what governs. The missing path is a tracked file
+    deleted from the worktree (portable: no chmod, no root skip).
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {
+        "doc.md": f"hello {_C2_NAME} world\n",
+        "gone.txt": "clean\n",
+    })
+    (root / "gone.txt").unlink()  # tracked, absent from the worktree
+
+    roster = _format2_roster(tmp_path, "B\t" + _C2_NAME + "\n")
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 3, out
+    # Both counts print: class B is non-zero, class A is zero.
+    assert "0 class-A (blocking) and 1 class-B (report-only) hit(s)" in r.stderr, out
+    # The class-B hit keeps its per-line form and the coverage hole is named.
+    assert "doc.md:1" in r.stderr, out
+    assert _MISSING_LINE_RE.search(r.stdout), r.stdout
+    assert "gone.txt" in r.stdout, r.stdout
+
+
+def test_cell7_format_1_roster_is_refused_not_reclassified(tmp_path):
+    """Cell 7: a valid-looking plain regex list is refused with the prefix
+    instruction; never silently reclassified to A."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    roster = _format2_roster(tmp_path, "\\b" + _C2_NAME + "\\b\n")
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 2, out
+    assert "line 1" in r.stderr, out
+    assert "A<TAB>" in r.stderr and "B<TAB>" in r.stderr, out
+    assert _C2_NAME not in out, out
+
+
+@pytest.mark.parametrize(
+    "roster_line, accepted",
+    [
+        ("A\t" + _C2_NAME, False),
+        ("A\t\\b" + _C2_NAME + "\\b", True),
+        ("A\t(?i)zztestname(?![a-z])", True),
+        ("B\t" + _C2_NAME, True),
+    ],
+)
+def test_cell8_class_a_must_declare_a_boundary(
+    tmp_path, roster_line, accepted
+):
+    """Cell 8: an A pattern with no `\\b`, lookaround or anchor is REFUSED by
+    line number (never rewritten); a bounded A pattern and an unbounded B
+    pattern are accepted. The tree carries the name, so an accepted pattern is
+    proven to match rather than assumed to."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    roster = _format2_roster(tmp_path, roster_line + "\n")
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    if accepted:
+        assert r.returncode in (0, 1), out
+        assert "boundary" not in r.stderr, out
+        if roster_line.startswith("A\t"):
+            assert r.returncode == 1, out
+    else:
+        assert r.returncode == 2, out
+        assert "line 1" in r.stderr, out
+        assert "boundary" in r.stderr, out
+        assert _C2_NAME not in out, out
+
+
+def test_cell9a_committed_pattern_is_class_a_without_a_roster_line(tmp_path):
+    """Cell 9a: a committed pattern is class A in code — count only."""
+    root = tmp_path / "root"
+    root.mkdir()
+    structural_hit = "kg_protocol" + "_for_ai"
+    _commit_files(root, {"doc.md": f"path = '{structural_hit}/x'\n"})
+
+    r = _run_scan(root)
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 1, out
+    assert "1 class-A (blocking) and " + _C2_CLASS_SPLIT in r.stderr, out
+    assert "doc.md" not in out, out
+    assert "main repo path" not in out, out
+
+
+def test_cell9b_local_roster_is_class_a_without_a_roster_line(tmp_path):
+    """Cell 9b: a local-roster pattern is class A in code — count only."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    (root / ".scan-leaks-local.json").write_text(json.dumps(
+        {"patterns": [{"regex": "\\b" + _C2_NAME + "\\b",
+                       "label": "ZZLocalLabel"}]}))
+
+    r = subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), "--root", str(root)],
+        capture_output=True, text=True, env=_scanner_env(),
+    )
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 1, out
+    assert "1 class-A (blocking) and " + _C2_CLASS_SPLIT in r.stderr, out
+    assert "doc.md" not in out, out
+    assert _C2_NAME not in out, out
+    assert "ZZLocalLabel" not in out, out
+
+
+def test_cell9c_home_path_finding_is_class_a_without_a_roster_line(tmp_path):
+    """Cell 9c: an absolute-home-path finding is class A in code — count only,
+    with neither the path, the line nor the segment printed."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": "data in " + _home("zorbquux") + "x\n"})
+
+    r = _run_scan(root)
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 1, out
+    assert "1 class-A (blocking) and " + _C2_CLASS_SPLIT in r.stderr, out
+    assert "doc.md" not in out, out
+    assert "zorbquux" not in out, out
+    assert "segment:" not in out, out
+
+
+@pytest.mark.parametrize("class_order", ["b-line-first", "a-line-first"])
+def test_cell13_class_a_wins_on_a_shared_line(tmp_path, class_order):
+    """Cell 13 (blocker): a line holding BOTH a class-B and a class-A name is
+    class A in EITHER roster order.
+
+    The fail-open this pins, measured on the first build: the scan loop broke
+    on the first matching pattern, so a B line listed before an A line masked
+    the A hit — the run reported `0 class-A ... and 2 class-B` and exited 0.
+    A blocking gate that a report-only pattern can mask is not a gate. The
+    contract: every pattern is evaluated; any class-A match makes the line
+    class A (first A match's label); only when no A pattern matches does the
+    first match determine the label. One finding per line is preserved.
+
+    BOTH orders are required (Borges): the bug is an ORDERING bug, so a
+    single-order cell passes on a scanner that is still order-dependent in
+    the other direction. The B-first arm catches first-match-wins; the
+    A-first arm catches last-match-wins. Each arm fails alone under its own
+    mutation, so neither order is redundant.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_OTHER} and {_C2_NAME}\n"})
+    lines = ["B\t" + _C2_OTHER, "A\t\\b" + _C2_NAME + "\\b"]
+    if class_order == "a-line-first":
+        lines.reverse()
+    roster = _format2_roster(tmp_path, "\n".join(lines) + "\n")
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    # The A hit wins: exit 1, class-A count 1, class-B count 0.
+    assert r.returncode == 1, out
+    assert "1 class-A (blocking) and 0 class-B (report-only) hit(s)" in r.stderr, out
+    # One finding per line, and it is not a class-B line: neither the
+    # class-B location form nor either fixture token reaches the output.
+    assert "doc.md" not in out, out
+    assert _C2_NAME not in out and _C2_OTHER not in out, out
+
+    # In-process: exactly one finding, attributed to class A. A class-B
+    # attribution is the masked verdict this cell exists to forbid.
+    compiled, roster_format = _mod.load_roster_file(roster)
+    assert roster_format == 2, "this roster declares class prefixes"
+    report = _mod.scan(root, compiled, use_git=True)
+    assert len(report.findings) == 1, report.findings
+    rel, lineno, label, _snippet, klass = report.findings[0]
+    assert (rel, lineno, klass) == ("doc.md", 1, _mod.CLASS_A), report.findings
+    assert label == "roster file", report.findings
+
+
+# ---------------------------------------------------------------------------
+# Test 21: the class-A locator (cell 18) and the syntactic boundary test
+# (cell 19) — round 4, from the second security read on the PR
+# ---------------------------------------------------------------------------
+#
+# Contract (spec roster-format2-loader §2.1, §2.3 and §4 cells 18-19):
+#   - a class-A hit prints a count only by default, and the class-A message
+#     NAMES `--show-class-a-locations` in every mode — a count alone leaves the
+#     operator with nothing to fix and pushes them at the roster;
+#   - `--show-class-a-locations` prints class-A hits as `path:line` only —
+#     never a snippet, a label or pattern text — for a class-A pattern hit AND
+#     for a home-path finding (the two class-A families follow the same split);
+#   - with `GITHUB_ACTIONS` set the flag REFUSES the run: exit 2, one line
+#     naming the reason, no location printed — it cannot be switched on in a
+#     public CI log;
+#   - the class-A boundary test is SYNTACTIC, not a substring scan: `[^x]foo`
+#     (a negated character class) and `foo\$` (an escaped literal dollar)
+#     declare NO boundary and are refused — they were accepted by the
+#     substring version, so they are this cell's discriminating inputs;
+#     `\bfoo\b`, `(?i)foo(?![a-z])`, `^foo` and `foo$` are accepted.
+#
+# Every fixture token below is invented and appears nowhere else.
+
+_LOCATOR_FLAG = "--show-class-a-locations"
+
+
+def _run_with_env(args, env_extra):
+    return subprocess.run(
+        [sys.executable, str(SCAN_LEAKS), *args],
+        capture_output=True, text=True, env=_scanner_env(env_extra),
+    )
+
+
+def test_cell18_class_a_locator_is_opt_in_and_refused_under_ci(tmp_path):
+    """Cell 18: the locator is opt-in, prints `path:line` and nothing else,
+    and turns itself off wherever GITHUB_ACTIONS is set. The positive arms
+    run with that variable cleared by `_scanner_env`, because a runner's
+    ambient CI flag would otherwise turn the locator arm into its own
+    refusal arm."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    roster = _format2_roster(tmp_path, "A\t\\b" + _C2_NAME + "\\b\n")
+
+    # Default: count only, but the message names the locator so the operator
+    # knows how to find the hit without editing the roster.
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "1 class-A (blocking) and " + _C2_CLASS_SPLIT in r.stderr, out
+    assert "doc.md" not in out, out
+    assert _C2_NAME not in out, out
+    assert "[roster file]" not in out, out
+    assert _LOCATOR_FLAG in r.stderr, out
+
+    # Opted in: path:line only. The snippet ("hello") and the label must not
+    # appear, and the message still names the flag.
+    rl = _run_with_roster(root, roster, _LOCATOR_FLAG)
+    out_l = rl.stdout + rl.stderr
+    assert rl.returncode == 1, out_l
+    assert "doc.md:1" in rl.stderr, out_l
+    assert "hello" not in out_l, out_l
+    assert _C2_NAME not in out_l, out_l
+    assert "[roster file]" not in out_l, out_l
+    assert _LOCATOR_FLAG in rl.stderr, out_l
+
+    # CI: the flag refuses the whole run, one line, and no location.
+    rc = _run_with_env(
+        ["--root", str(root), "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster), _LOCATOR_FLAG],
+        {"GITHUB_ACTIONS": "true"},
+    )
+    out_c = rc.stdout + rc.stderr
+    assert rc.returncode == 2, out_c
+    lines = [ln for ln in rc.stderr.strip().splitlines() if ln.strip()]
+    assert len(lines) == 1, out_c
+    assert "GITHUB_ACTIONS" in rc.stderr, out_c
+    assert "doc.md" not in out_c, out_c
+    assert _C2_NAME not in out_c, out_c
+
+
+def test_cell18_home_path_locator_follows_the_same_split(tmp_path):
+    """Cell 18, home-path family: count-only by default with the flag named,
+    `path:line` under the flag, refused under CI. The segment never prints."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": "data in " + _home("zorbquux") + "x\n"})
+
+    r = _run_scan(root)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "doc.md" not in out, out
+    assert "zorbquux" not in out, out
+    assert _LOCATOR_FLAG in r.stderr, out
+
+    rl = _run_with_env(
+        ["--root", str(root), "--config-path", str(root / "no-config.json"),
+         _LOCATOR_FLAG],
+        {},
+    )
+    out_l = rl.stdout + rl.stderr
+    assert rl.returncode == 1, out_l
+    assert "doc.md:1" in rl.stderr, out_l
+    assert "zorbquux" not in out_l, out_l
+
+    rc = _run_with_env(
+        ["--root", str(root), "--config-path", str(root / "no-config.json"),
+         _LOCATOR_FLAG],
+        {"GITHUB_ACTIONS": "true"},
+    )
+    out_c = rc.stdout + rc.stderr
+    assert rc.returncode == 2, out_c
+    assert "doc.md" not in out_c, out_c
+    assert "zorbquux" not in out_c, out_c
+
+
+def test_cell18_harness_clears_ambient_github_actions(tmp_path, monkeypatch):
+    """Cell 18, harness: the suite's default is "not in CI".
+
+    The positive locator arms above assert what the scanner does when CI is
+    NOT watching, so they must not depend on whether CI happens to be
+    watching the test runner: on GitHub Actions the ambient GITHUB_ACTIONS
+    turned both of them into their own negative arm (`2 == 1`). The first two
+    arms pin the helper itself; the last two are the end-to-end split, and the
+    final arm proves the helper is a default rather than a mute.
+    """
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert "GITHUB_ACTIONS" not in _scanner_env()
+    assert _scanner_env({"GITHUB_ACTIONS": "true"})["GITHUB_ACTIONS"] == "true"
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_C2_NAME} world\n"})
+    roster = _format2_roster(tmp_path, "A\t\\b" + _C2_NAME + "\\b\n")
+
+    # Ambient CI is set above, yet the locator arm is a locator arm: exit 1
+    # and path:line, never the refusal.
+    rl = _run_with_roster(root, roster, _LOCATOR_FLAG)
+    out_l = rl.stdout + rl.stderr
+    assert rl.returncode == 1, out_l
+    assert "doc.md:1" in rl.stderr, out_l
+    assert _C2_NAME not in out_l, out_l
+
+    # The explicit ask still reaches the scanner, so the refusal is intact.
+    rc = _run_with_env(
+        ["--root", str(root), "--config-path", str(root / "no-config.json"),
+         "--roster-file", str(roster), _LOCATOR_FLAG],
+        {"GITHUB_ACTIONS": "true"},
+    )
+    out_c = rc.stdout + rc.stderr
+    assert rc.returncode == 2, out_c
+    assert "doc.md" not in out_c, out_c
+
+
+@pytest.mark.parametrize(
+    "pattern_text, accepted",
+    [
+        ("[^x]foo", False),
+        ("foo\\$", False),
+        ("\\bfoo\\b", True),
+        ("(?i)foo(?![a-z])", True),
+        ("^foo", True),
+        ("foo$", True),
+    ],
+)
+def test_cell19_boundary_test_is_syntactic(tmp_path, pattern_text, accepted):
+    """Cell 19: a boundary marker counts only where it IS one. `[^x]foo` holds
+    a negated class and `foo\\$` an escaped literal dollar; both were accepted
+    by the old substring scan and declare no boundary, so both are refused.
+    The four accepted rows are the real forms (word boundary, lookaround, and
+    the two anchors), and the tree is non-empty so exit 0 is a real clean run,
+    not "did not look"."""
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": "nothing here\n"})
+    roster = _format2_roster(tmp_path, "A\t" + pattern_text + "\n")
+
+    r = _run_with_roster(root, roster)
+    out = r.stdout + r.stderr
+
+    if accepted:
+        assert r.returncode == 0, out
+        assert "boundary" not in r.stderr, out
+    else:
+        assert r.returncode == 2, out
+        assert "line 1" in r.stderr, out
+        assert "boundary" in r.stderr, out
+        assert pattern_text not in out, out
+
+
+# ---------------------------------------------------------------------------
+# Test 22: roster-format inference and the shared parser (engram#4817)
+# ---------------------------------------------------------------------------
+#
+# Contract (spec roster-consumers-migration §1 C2–C5, §2.5 T1–T5, as amended):
+#   - `load_roster_file(path, *, require_classes=True, program="scan-leaks",
+#     exit_code=2)` and `parse_roster_text(text, ...)` return
+#     `(patterns, roster_format)`; each pattern is a
+#     `(compiled, label, class)` triple and `roster_format` is 1 or 2.
+#   - `require_classes=True` (the default, and every existing call site) is
+#     byte-identical to #4816: format 2 only, a non-comment line with no class
+#     token refuses the whole roster.
+#   - `require_classes=False` infers the GRAMMAR over the whole roster and
+#     never the class: every content line prefixed -> format 2 with the
+#     declared classes; none prefixed -> format 1, whose patterns are CLASS_A
+#     by the legacy format's own meaning; mixed -> the whole roster refuses,
+#     naming the 1-based number of the FIRST line that disagrees.
+#   - every refusal prints `<program>: ...` and exits `<exit_code>`.
+#
+# Every fixture token below is invented and appears nowhere else.
+
+_T22_A = "ZZAlphaHolder"
+_T22_B = "YYBravoHandle"
+
+
+def _t22_format1_text() -> str:
+    """A format-1 roster: two patterns, a blank line and a comment line."""
+    return (
+        "# a comment\n"
+        "\n"
+        "\\b" + _T22_A + "\\b\n"
+        "\\b" + _T22_B + "\\b\n"
+    )
+
+
+def test_t1_format1_inference_is_class_a_and_reports_format_1(tmp_path):
+    """T1: format inference never invents a class — a format-1 roster is class
+    A throughout (the legacy format's own meaning), the detected format is
+    reported, and a caller that blocks only on CLASS_A still blocks.
+
+    The second half is the fail-closed control: a consumer that reacts only to
+    CLASS_A is the shape that would silently stop blocking if format-1 patterns
+    were ever returned with a class the blocking path does not know."""
+    entries, roster_format = _mod.parse_roster_text(
+        _t22_format1_text(), require_classes=False
+    )
+    assert roster_format == 1
+    assert [klass for _pattern, _label, klass in entries] == [
+        _mod.CLASS_A,
+        _mod.CLASS_A,
+    ], "a format-1 pattern is class A"
+    assert [label for _pattern, label, _klass in entries] == [
+        "roster file (format 1)",
+        "roster file (format 1)",
+    ]
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_T22_A} world\n"})
+    report = _mod.scan(root, entries, use_git=True)
+    assert len(report.findings) == 1, report.findings
+    rel, lineno, _label, _snippet, klass = report.findings[0]
+    assert (rel, lineno, klass) == ("doc.md", 1, _mod.CLASS_A), (
+        "a format-1 pattern must still block through the CLASS_A path"
+    )
+
+
+@pytest.mark.parametrize("order", ["b-first", "a-first"])
+def test_t2_format2_inference_keeps_declared_classes_and_a_wins(tmp_path, order):
+    """T2: through the inferred branch a format-2 roster keeps the classes its
+    lines declare, and a line holding BOTH a class-B and a class-A name is
+    class A — the #4816 rule, reached through the new path.
+
+    BOTH orders are pinned: the rule it guards is an ordering bug, so a
+    single-order fixture passes on an order-dependent implementation."""
+    b_line = "B\t\\b" + _T22_B + "\\b"
+    a_line = "A\t\\b" + _T22_A + "\\b"
+    if order == "b-first":
+        lines, expected = [b_line, a_line], [_mod.CLASS_B, _mod.CLASS_A]
+    else:
+        lines, expected = [a_line, b_line], [_mod.CLASS_A, _mod.CLASS_B]
+
+    entries, roster_format = _mod.parse_roster_text(
+        "\n".join(lines) + "\n", require_classes=False
+    )
+    assert roster_format == 2
+    assert [klass for _pattern, _label, klass in entries] == expected
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _commit_files(root, {"doc.md": f"hello {_T22_B} and {_T22_A}\n"})
+    report = _mod.scan(root, entries, use_git=True)
+    assert len(report.findings) == 1, report.findings
+    assert report.findings[0][4] == _mod.CLASS_A, report.findings
+
+
+@pytest.mark.parametrize("prefix_first", [True, False])
+def test_t3_mixed_roster_refuses_naming_the_first_disagreeing_line(
+    capsys, prefix_first
+):
+    """T3: a roster that mixes the two grammars refuses the WHOLE roster,
+    naming the 1-based number of the FIRST line that disagrees — and never
+    the line's text. Both orders: whichever line lacks the prefix is the
+    offender, wherever it sits."""
+    prefixed = "A\t\\b" + _T22_A + "\\b"
+    bare = "\\b" + _T22_B + "\\b"
+    lines = [prefixed, bare] if prefix_first else [bare, prefixed]
+    offending = 2 if prefix_first else 1
+
+    with pytest.raises(SystemExit) as exc_info:
+        _mod.parse_roster_text("\n".join(lines) + "\n", require_classes=False)
+
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert f"line {offending}" in err, err
+    # The refusal must be the MIXED-GRAMMAR rule, not the format-2 parser
+    # rejecting the bare line as "no class token": dropping the mixed rule and
+    # falling through to format 2 would raise at the same line number, so the
+    # line number alone does not discriminate it.
+    assert "mix" in err.lower(), (
+        f"the refusal must name the mixed grammar, not a format-2 parse error; "
+        f"got {err!r}"
+    )
+    assert _T22_A not in err and _T22_B not in err, (
+        f"the refusal echoed a roster line: {err!r}"
+    )
+
+
+def test_t4_default_still_refuses_a_format1_roster(capsys):
+    """T4 (the control for T1/T3): the DEFAULT (`require_classes=True`, which
+    the sweep workflow and the scanner CLI pass) did not loosen. The same
+    format-1 roster T1 parses under inference is still refused with the #4816
+    wording and exit 2."""
+    with pytest.raises(SystemExit) as exc_info:
+        _mod.parse_roster_text(_t22_format1_text())
+
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith("scan-leaks:"), (
+        f"the scanner's own refusal keeps its default program prefix; got {err!r}"
+    )
+    assert "line 3" in err, err
+    assert "A<TAB>" in err and "B<TAB>" in err, err
+    assert _T22_A not in err and _T22_B not in err, err
+
+
+def test_t5_program_and_exit_code_are_honoured(tmp_path):
+    """T5: every refusal names the calling program and exits its code. Run in
+    a subprocess so the exit code is the process's own."""
+    roster = tmp_path / "roster.txt"
+    roster.write_text("\\b" + _T22_A + "\\b\n", encoding="utf-8")
+    code = (
+        "import importlib.util, sys\n"
+        "from pathlib import Path\n"
+        "spec = importlib.util.spec_from_file_location("
+        f"'sl_t5', {str(SCAN_LEAKS)!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "module.load_roster_file("
+        "Path(sys.argv[1]), program='tester', exit_code=1)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(roster)],
+        capture_output=True,
+        text=True,
+        env=_scanner_env(),
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert proc.stderr.startswith("tester:"), proc.stderr
+    assert "line 1" in proc.stderr, proc.stderr
+    assert _T22_A not in proc.stdout + proc.stderr, (
+        "the refusal echoed the roster line"
+    )
 

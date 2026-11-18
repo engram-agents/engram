@@ -576,10 +576,11 @@ def test_j_defaults_keep_positional_construction():
 # down: no owner listening ---------------------------------------------------
 
 
-def test_j_too_long_path_is_down(tmp_path):
+def test_j_too_long_path_is_path_too_long(tmp_path):
+    # #4868: not `down` -- an over-long path says nothing about whether an owner runs.
     long = tmp_path / ("x" * 200) / "engramd.sock"
     res = ec.read("ping", {}, timeout=TIMEOUT, socket_path=long)
-    _assert_down(res)
+    _assert_down(res, reason="path_too_long")
 
 
 def test_j_enoent_is_down(home):
@@ -1051,7 +1052,7 @@ def test_l_protocol_does_not_get_the_down_steps():
 
 def test_l_every_reason_has_a_row_and_the_set_agrees_with_the_builders():
     assert set(ec.UNAVAILABLE_REASONS) == {
-        "down", "timeout", "protocol", "local", "internal", "busy", "busy_or_stuck"
+        "down", "path_too_long", "timeout", "protocol", "local", "internal", "busy", "busy_or_stuck"
     }
     for reason in ec.UNAVAILABLE_REASONS:
         if reason not in ec._BUILDER_REASONS:

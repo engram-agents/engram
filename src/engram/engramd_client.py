@@ -211,8 +211,12 @@ class Unavailable:
     request_id: str | None = None
     # Why the owner was unavailable, as a code a caller can act on without
     # parsing prose (#3707), by MEANING:
-    #   "down"          no owner listening (ENOENT/ENOTSOCK/refused, no live owner;
-    #                   socket path over the AF_UNIX limit); restart it.
+    #   "down"          no owner listening (ENOENT/ENOTSOCK/refused, no live owner);
+    #                   restart it.
+    #   "path_too_long" the socket path is over the AF_UNIX limit, so nothing was sent
+    #                   and NOTHING is known about the owner (#4868): one started under a
+    #                   shorter spelling of the same ENGRAM_HOME may be live. Never read
+    #                   this as "no owner"; shorten ENGRAM_HOME.
     #   "timeout"       no valid reply within the bound; the owner may be alive.
     #   "protocol"      the owner was reached, but the exchange failed without a valid
     #                   answer (response over the cap, empty, unparseable, an
@@ -420,6 +424,9 @@ def socket_path_too_long_reason(
 #   local     the CLIENT process could not create a socket (EMFILE / ENFILE /
 #             ENOBUFS, #3717). Nothing is known about the owner: no claim that it
 #             is up or down, and no restart-the-owner step.
+#   path_too_long  the socket path cannot be addressed (#4868). No request was sent;
+#             nothing is known about the owner, and restarting it cannot help, so
+#             the remedy is a shorter ENGRAM_HOME, never a restart.
 # `busy` and `busy_or_stuck` keep their own builders (the latter has pid
 # variants); `_BUILDER_REASONS` names them so the reason set stays complete.
 _REMEDY_STEPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
@@ -471,6 +478,20 @@ _REMEDY_STEPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "restarting it will not help.",
         ),
     ),
+    "path_too_long": (
+        (
+            "The owner socket path for this ENGRAM_HOME is over the AF_UNIX limit (the "
+            "detail gives the byte counts), so no request was sent and nothing is known "
+            "about the owner. An owner started under a shorter spelling of the same "
+            "directory may be running. Use a shorter ENGRAM_HOME (or the spelling the "
+            "running owner uses), then retry. Do not restart the owner for this: no "
+            "owner can listen on this path.",
+        ),
+        (
+            "Set ENGRAM_HOME to a shorter path (the detail gives the limit), or to the "
+            "spelling the running owner uses; restarting the owner will not help.",
+        ),
+    ),
     # #3717: the last-resort guard in _call(). A CLIENT defect: an exception no
     # mapped clause expected. It says nothing about the owner and carries no
     # restart step; it is a signal to report, not a state to recover from.
@@ -501,7 +522,7 @@ def _unavailable(
     SS5.5: guidance travels in the payload, not a log line, and the two kinds
     -- agent-actionable vs. human-only -- are distinguishable without parsing
     prose). `reason` is REQUIRED (no default): it is set by what the site
-    MEANS -- "down", "timeout", "protocol", "local" or "internal" (see
+    MEANS -- "down", "path_too_long", "timeout", "protocol", "local" or "internal" (see
     Unavailable.reason) -- so a new call site cannot silently inherit the wrong
     code (#3707).
 
@@ -670,8 +691,8 @@ def _call(
 ) -> EngramdResult:
     """The one place that touches the socket. NEVER RAISES (#3717): it returns Ok,
     Unavailable or Rejected on every path, by construction. Every transport
-    failure maps to Unavailable (seven reason codes: down, timeout, protocol,
-    busy, busy_or_stuck, local, internal); a request that cannot be serialized,
+    failure maps to Unavailable (eight reason codes: down, path_too_long, timeout,
+    protocol, busy, busy_or_stuck, local, internal); a request that cannot be serialized,
     or a `timeout` that is not a finite number, maps to Rejected
     (request_not_serializable / invalid_timeout) before any socket exists; every
     owner-sent {"status":"rejected",...} maps to Rejected; every
@@ -691,7 +712,7 @@ def _call(
         int over the digit limit), RecursionError       -> Rejected(request_not_serializable)
       .encode("utf-8")                                  -> cannot raise (ensure_ascii)
       len(payload) > MAX_REQUEST_BYTES                  -> Rejected(request_too_large)
-      socket_path_too_long_reason                       -> Unavailable(down) when too long;
+      socket_path_too_long_reason                       -> Unavailable(path_too_long) when too long;
         a str path with a lone surrogate raises UnicodeEncodeError in os.fsencode
         -> `internal` (a caller defect; paths from the environment use
         surrogateescape and never reach it)
@@ -829,12 +850,13 @@ def _call_mapped(
         )
 
     # #3696: an over-long path can never connect; say why (same text as the
-    # owner's refusal) before any socket exists.
+    # owner's refusal) before any socket exists. #4868: its own reason, never
+    # `down` -- an owner under a shorter alias of this home may be live.
     too_long = socket_path_too_long_reason(socket_path)
     if too_long is not None:
         return _unavailable(
             socket_path=sp, bound=timeout, detail=too_long, request_id=request_id,
-            reason="down",
+            reason="path_too_long",
         )
 
     # #3717: a zero or negative timeout means "already out of budget" (immediate
