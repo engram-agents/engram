@@ -447,6 +447,11 @@ def test_non_invocations_are_not_counted_as_pgrep_invocations(line: str) -> None
 # to the selector shows up as this test failing, not as a mirror that
 # silently agrees with itself. A hardcoded count of entries would pass for
 # exactly the change that breaks it.
+#
+# Under the union this cell guards the MAP CONTENT: that the rows matching a skill
+# doc, taken together, name this gate (the broad skills/claude/ row carries it). The
+# runner's matching semantics (union of every matching row, a full-suite row winning
+# wherever it sits) are pinned by tests/test_run_touched_tests_union_rows.py.
 TEST_MAP_JSON = REPO_ROOT / "src" / "engram" / "packaging" / "test-map.json"
 RUNNER_PY = REPO_ROOT / "src" / "engram" / "tools" / "run_touched_tests.py"
 THIS_GATE = "tests/test_skill_docs_shell_hygiene.py"

@@ -135,8 +135,10 @@ def test_a_union_of_every_matching_row_in_every_row_order(tmp_path, order):
 
 
 def test_a_real_map_hook_selects_its_own_row_and_the_catch_all():
+    # Against the map WITHOUT the census rows: the census row for this directory
+    # also names the bounds test, so with it present the catch-all would be redundant here.
     sel, full = rtt._resolve_convention_map(
-        "src/engram/hooks/claude/engram-stop-hook.py", REAL_MAP, str(REPO)
+        "src/engram/hooks/claude/engram-stop-hook.py", _without_census_rows(REAL_MAP), str(REPO)
     )
     assert not full
     own = [

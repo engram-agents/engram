@@ -1201,7 +1201,7 @@
       "test_globs": [
         "tests/test_hook_injection_bounds.py"
       ],
-      "note": "Catch-all for a hook file with no row of its own: every hook that builds additionalContext must go through _hooklib.emit_context (CLAUDE.md, Hook injection budget), and tests/test_hook_injection_bounds.py is the glob test that checks it. Selection takes the union of every matching row, so this row applies to every hook file, whether or not the hook also has a row of its own, and its position in the map does not matter (it was first-match-wins, with this row last, until the runner changed; tests/test_model_gate_4596.py K5 now pins that the row exists and names the bounds test). The row that was missing when the model-gate hook (engram-alpha#4613) left dev red."
+      "note": "Catch-all that every hook file also matches (under the union it adds this test to a hook that has a row of its own as well): every hook that builds additionalContext must go through _hooklib.emit_context (CLAUDE.md, Hook injection budget), and tests/test_hook_injection_bounds.py is the glob test that checks it. Selection takes the union of every matching row, so this row applies to every hook file, whether or not the hook also has a row of its own, and its position in the map does not matter (it was first-match-wins, with this row last, until the runner changed; tests/test_model_gate_4596.py K5 now pins that the row exists and names the bounds test). The row that was missing when the model-gate hook (engram-alpha#4613) left dev red."
     },
     {
       "path_prefix_or_glob": ".github/workflows/",
