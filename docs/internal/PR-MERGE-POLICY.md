@@ -853,13 +853,14 @@ with a scope of the changed test, the scanner test and the guard set — left tw
 `tests/test_relative_engram_home_refused_3863.py`, which names the changed hook by basename and sits
 in no other half. `git grep -l` for that hook's name finds exactly two files; one of them was run.
 
-Measured with the selector at dev `2a2da4d3`, so the halves are not guesses: a change to
+Measured with the selector at dev `c3a013ab`, so the halves are not guesses: a change to
 `tools/forum_backup.py` selects **no** file under `tools/` — 23 files, 22 of them the guard set and
-the 23rd (`tests/test_forum_backup.py`) selected because it imports the changed module. The count
-moves whenever item 4's list does, so read it as measured at that commit, never as a constant. Those
+the 23rd (`tests/test_forum_backup.py`) selected because it imports the changed module. The counts
+move whenever item 4's list does, so read them as measured at that commit, never as constants. Those
 tool tests are named explicitly by two workflows: the full suite (`tests.yml`) and the per-PR
 `pr-checks.yml`, which runs the same set on every pull request with the forum-dependent cells
-skipping. A forum-installer change selects 25 files, none of them in `src/forum/tests/`.
+skipping. A forum-installer change selects 26 files at the same commit, none of them in
+`src/forum/tests/`.
 
 **Why the forum half is a directory run and the hooks half is a guard-set entry.** Both are tests
 that discover their subject **structurally**, so item 1 cannot select them — but they are fixed in
