@@ -448,8 +448,10 @@ seat can run it and any other seat can check that it ran.
    0.2 s, 27 cells when measured on 2026-11-18). *Evidence:* #4613 added a hook that built its
    `additionalContext` without `emit_context()`; the test-map rows are first-match-wins, so a hook
    with its own rows never reaches this test through the map, and the PR's seat run was green. It
-   went red only in the nightly of 2026-11-18. A new file under `src/engram/hooks/claude/` selects
-   the guard set and nothing else (measured with the selector at `dev` `9174f642`).
+   was first seen red in a hand-started whole-suite run on `dev` later on 2026-11-18 (the
+   scheduled nightly of that date ran before #4613 merged). A new file under
+   `src/engram/hooks/claude/` selects the guard set and nothing else (measured with the selector
+   at `dev` `9174f642`).
    The list is a floor, not a census: a PR that adds a test with this property adds
    its name here in the same PR, and a seat that finds one missing adds it. Verify
    the list with `git ls-files` **in a checkout of the base tip**, not the seat's

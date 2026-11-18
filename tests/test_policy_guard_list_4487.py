@@ -179,7 +179,8 @@ def test_the_hook_directory_scanner_is_in_the_guard_set():
     # A hook added by a PR: a file no test names and no map row lists.
     new_hook = "src/engram/hooks/claude/engram-a-hook-added-later-hook.py"
     selected, is_full, _reasons, _map = rtt.select_tests([new_hook], str(REPO_ROOT))
-    assert is_full or name in selected, f"a new hook file does not select {name}"
+    assert not is_full, "a new hook file became a full-suite trigger; the policy line says it selects only the guard set"
+    assert name in selected, f"a new hook file does not select {name}"
 
 
 def test_a_directory_with_a_listed_name_does_not_count_as_a_file(tmp_path):
