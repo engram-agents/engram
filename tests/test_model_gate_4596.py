@@ -1159,7 +1159,7 @@ def test_r5_b_absolute_dormant_home_on_the_main_path_stays_silent(tmp_path):
 # transcript is <dirname(transcript_path)>/<session_id>/subagents/agent-<agent_id>.jsonl and records the
 # call under the sub-agent's own model.  Contracts C13-C17, written before the implementation.
 
-AGENT_ID = "a1b2c3d4e5f6"
+AGENT_ID = "a1b2c3d4e5f6ghij"
 AGENT_TYPE = "engram:engram-dream-master"
 
 
