@@ -65,10 +65,27 @@ def test_signal_at_status_replace_only_requests_stop(
             nonlocal replacement_calls
             replacement_calls += 1
             if replacement_calls == 1:
-                for signum in received_signals:
-                    handler = signal.getsignal(signum)
-                    assert callable(handler)
-                    handler(signum, None)
+                # Status I/O remains available to the outer write, but neither a
+                # read nor a write is permitted while the signal callback runs.
+                with monkeypatch.context() as handler_io:
+                    handler_io.setattr(
+                        wake,
+                        "current_status",
+                        lambda *_args, **_kwargs: pytest.fail(
+                            "signal handler must not read status"
+                        ),
+                    )
+                    handler_io.setattr(
+                        wake,
+                        "update_status",
+                        lambda *_args, **_kwargs: pytest.fail(
+                            "signal handler must not write status"
+                        ),
+                    )
+                    for signum in received_signals:
+                        handler = signal.getsignal(signum)
+                        assert callable(handler)
+                        handler(signum, None)
             return real_replace(source, destination)
 
         monkeypatch.setattr(wake.os, "replace", replace_at_boundary)
