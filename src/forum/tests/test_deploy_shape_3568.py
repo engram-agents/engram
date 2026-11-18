@@ -65,7 +65,11 @@ def _hermetic_env(home: Path, path_prefix: Path | None = None, **extra) -> dict:
     env["XDG_CONFIG_HOME"] = str(home / ".config")
     if path_prefix is not None:
         env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
-    env.update(extra)
+    for k, v in extra.items():
+        if v is None:   # #4886: a cell can UNSET a variable (the installer's mention default)
+            env.pop(k, None)
+        else:
+            env[k] = v
     return env
 
 
@@ -337,6 +341,9 @@ class TestKeptBackupUnit:
 # The check itself, driven through the marked region (parse + parent cells)
 # ---------------------------------------------------------------------------
 
+# #4886: the alarm mention is resolved in its own marked region (the installer's argument
+# stage); the backup-units region only consumes `_mention`, so the harness runs both.
+_MENTION_REGION = re.compile(r"^# >>> alarm-mention\n(.*?)^# <<< alarm-mention\n", re.S | re.M)
 _REGION = re.compile(r"^# >>> backup-units\n(.*?)^# <<< backup-units\n", re.S | re.M)
 
 
@@ -360,7 +367,7 @@ def _check(tmp_path: Path, unit_text: str, *, home_files: tuple = ()) -> SimpleN
         "set -euo pipefail\n"
         f"SRC={shlex.quote(str(_REPO))}\nUNIT_DIR={shlex.quote(str(unit_dir))}\n"
         f"SERVICE_DIR={shlex.quote(str(svc))}\nDRY_RUN=0\n"
-        'RUN() { "$@"; }\n' + m.group(1) +
+        'RUN() { "$@"; }\n' + _MENTION_REGION.search(text).group(1) + m.group(1) +
         f'\n_check_backup_exec_paths "$UNIT_DIR/{PROBE}"\necho CHECK-PASSED\n'
     )
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,

@@ -234,6 +234,12 @@ _refuse_bad_name() {
   esac
 }
 
+# The arguments this run received, kept for the first-install WARN (#4886), which prints the
+# exact re-run. Quoted with printf %q so the printed line can be pasted back into a shell.
+_RERUN_CMD="bash $(printf '%q' "$0")"
+for _a in "$@"; do _RERUN_CMD="$_RERUN_CMD $(printf '%q' "$_a")"; done
+unset _a
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --port|--admin-user|--group|--host|--auth-mode|--auth-report|--auth-report-until)
@@ -808,6 +814,28 @@ else
   fi
 fi
 
+# The alarm's @mention (#4886) is resolved and validated HERE, with the other arguments, so
+# a refusal happens before any write. $FORUM_BACKUP_ALARM_MENTION if set, else the
+# installing admin's forum agent name ($USER minus a leading "agent-"). An alarm that
+# @mentions nobody wakes nobody, so an empty EFFECTIVE value is refused; the value lands in
+# a unit file, so its characters are checked too. The backup-units block below writes it.
+# >>> alarm-mention
+_mention="${FORUM_BACKUP_ALARM_MENTION-}"
+if [ -z "${FORUM_BACKUP_ALARM_MENTION+x}" ]; then
+  _mention="${USER-}"
+  _mention="${_mention#agent-}"
+fi
+if [ -z "$(printf '%s' "$_mention" | tr -d ' ,')" ]; then
+  echo "ERROR: FORUM_BACKUP_ALARM_MENTION is empty (and there is no installing user name to default to); the failure alarm would @mention nobody and wake nobody. Set it to the forum agent name(s) to page, e.g. FORUM_BACKUP_ALARM_MENTION=\"alice bob\". Nothing was written." >&2
+  exit 2
+fi
+case "$_mention" in
+  *[!A-Za-z0-9_\ ,-]*)
+    echo "ERROR: FORUM_BACKUP_ALARM_MENTION may contain only letters, digits, '_', '-', ',' and spaces (got an invalid character); refusing to write it into a unit file. Nothing was written." >&2
+    exit 2 ;;
+esac
+# <<< alarm-mention
+
 APP="$SERVICE_DIR/app"
 VENV="$SERVICE_DIR/.venv"
 PYTHON="$VENV/bin/python"
@@ -1102,25 +1130,9 @@ fi
 # the daemon-reload below picks everything up.
 # The alarm's @mention is per-install, never shipped: it is written into the
 # alarm unit's drop-in mention.conf from $FORUM_BACKUP_ALARM_MENTION if set, else
-# the installing admin's forum agent name ($USER minus a leading "agent-"), else
-# empty (the alarm then posts without a mention). The value lands in a unit file,
-# so it is validated BEFORE anything is written.
+# the installing admin's forum agent name ($USER minus a leading "agent-"). The
+# value is resolved and validated in the argument-validation stage (see _mention above).
 # >>> backup-units
-_mention="${FORUM_BACKUP_ALARM_MENTION-}"
-if [ -z "${FORUM_BACKUP_ALARM_MENTION+x}" ]; then
-  _mention="${USER-}"
-  _mention="${_mention#agent-}"
-fi
-# An alarm that @mentions nobody wakes nobody (#4886): refuse an empty effective value.
-if [ -z "$(printf '%s' "$_mention" | tr -d ' ,')" ]; then
-  echo "ERROR: FORUM_BACKUP_ALARM_MENTION is empty (and there is no installing user name to default to); the failure alarm would @mention nobody and wake nobody. Set it to the forum agent name(s) to page, e.g. FORUM_BACKUP_ALARM_MENTION=\"alice bob\"." >&2
-  exit 2
-fi
-case "$_mention" in
-  *[!A-Za-z0-9_\ ,-]*)
-    echo "ERROR: FORUM_BACKUP_ALARM_MENTION may contain only letters, digits, '_', '-', ',' and spaces (got an invalid character); refusing to write it into a unit file." >&2
-    exit 2 ;;
-esac
 echo "==> Installing backup + failure-alarm units → $UNIT_DIR"
 _BU_DEPLOY="$SRC/src/forum/deploy"
 for _bu in engram-forum-backup.service.template engram-forum-backup.timer engram-forum-backup-alarm.service.template; do
@@ -1358,7 +1370,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
   [ ! -e "$ALARM_TOKEN" ] || _alarm_assert_token_file
 elif [ ! -f "$DB_PATH" ]; then
   echo "    WARN: no forum.db at $DB_PATH yet, so no alarm token was issued and none was verified." >&2
-  echo "          After the DB cutover, re-run this installer: it issues the alarm token then." >&2
+  echo "          The failure alarm cannot post until then (it refuses to run with no token)." >&2
+  echo "          After the DB cutover, re-run this installer, exactly:" >&2
+  echo "            $_RERUN_CMD" >&2
 else
   mkdir -p "$ALARM_HOME"
   chmod 0700 "$ALARM_HOME"   # four digits: also clears the setgid bit the setgid service dir hands down

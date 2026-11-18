@@ -296,13 +296,17 @@ def run_block(tmp_path):
     text = INSTALLER.read_text(encoding="utf-8")
     m = re.search(r"^# >>> backup-units\n(.*?)^# <<< backup-units\n", text, re.S | re.M)
     assert m, "installer must delimit the backup-unit block with '# >>> backup-units' / '# <<< backup-units'"
+    # #4886: the mention is resolved and validated in the installer's argument stage, in
+    # its own marked region that runs BEFORE the backup-unit block; run both, in order.
+    mm = re.search(r"^# >>> alarm-mention\n(.*?)^# <<< alarm-mention\n", text, re.S | re.M)
+    assert mm, "installer must delimit the mention check with '# >>> alarm-mention' / '# <<< alarm-mention'"
     unit_dir = tmp_path / "units"
     unit_dir.mkdir()
     script = (
         "set -euo pipefail\n"
         f"SRC={shlex.quote(str(_REPO))}\nUNIT_DIR={shlex.quote(str(unit_dir))}\nDRY_RUN=0\n"
         f"SERVICE_DIR={shlex.quote(str(tmp_path / 'forum'))}\n"
-        'RUN() { "$@"; }\n' + m.group(1)
+        'RUN() { "$@"; }\n' + mm.group(1) + m.group(1)
     )
 
     def _run(env: dict | None = None, check: bool = True):

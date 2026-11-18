@@ -49,7 +49,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from .test_deploy_shape_3568 import (ALARM, ALARM_TEMPLATE, DEPLOY, INSTALLER, _hermetic_env,
+from .test_deploy_shape_3568 import (ALARM, ALARM_TEMPLATE, DEPLOY, INSTALLER, _digest,
+                                     _hermetic_env, _prep_service_dir,
                                      _install)
 
 _REPO = Path(__file__).resolve().parents[3]
@@ -216,6 +217,15 @@ def _run_alarm(ctx, tmp_path: Path, url: str, *, env_over: dict | None = None,
         capture_output=True, text=True, env=env, cwd=clean, timeout=60)
 
 
+def _plant_token(ctx, text: str = "planted-token") -> None:
+    """A token file in the alarm home the unit names, for cells about what happens AFTER
+    the alarm's own no-token refusal (K12)."""
+    home = Path(_unit_env(ctx)["ENGRAM_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "forum-token").write_text(text + "\n")
+    (home / "forum-token").chmod(0o600)
+
+
 def _token(ctx) -> str:
     return (ctx.svc / "alarm-home" / "forum-token").read_text().strip()
 
@@ -337,6 +347,7 @@ def test_K4_installer_refuses_an_empty_mention(tmp_path):
 def test_K4_the_alarm_exits_nonzero_and_posts_nothing_with_zero_mentions(tmp_path, recorder):
     ctx = _install(tmp_path, env_extra={"FORUM_BACKUP_ALARM_MENTION": "someone"})
     assert ctx.r.returncode == 0, ctx.both
+    _plant_token(ctx)
     rec = recorder(200)
     r = _run_alarm(ctx, tmp_path, rec.url, env_over={"FORUM_BACKUP_ALARM_MENTION": ""})
     assert r.returncode != 0, r.stdout + r.stderr
@@ -450,15 +461,42 @@ def test_K9_dry_run_refuses_an_empty_or_wide_token_file(tmp_path, live):
     assert ctx.r.returncode != 0 and "0640" in ctx.err, ctx.both
 
 
+# ------------------------------------------------------------------ K12 ------
+# Round 2, change 1(b): the alarm refuses locally when its token file is missing or empty.
+# The stub answers 200 to a request with NO Authorization header, as the forum's REPORT
+# mode would (it serves a tokenless request as the identity it names), so a tokenless
+# alarm that reached the network would POST unauthenticated and look like a success.
+
+_NO_TOKEN_LINE = "no forum-backup token; re-run the forum installer"
+
+
+@pytest.mark.parametrize("token_text", [None, "", "  \n\t\n"], ids=["missing", "empty", "blank"])
+def test_K12_the_alarm_with_no_token_sends_nothing_even_where_the_server_would_accept(
+        tmp_path, recorder, token_text):
+    ctx = _install(tmp_path, env_extra={"FORUM_BACKUP_ALARM_MENTION": "someone"})
+    assert ctx.r.returncode == 0, ctx.both
+    home = tmp_path / "bare-alarm-home"
+    home.mkdir(mode=0o700)
+    if token_text is not None:
+        (home / "forum-token").write_text(token_text)
+        (home / "forum-token").chmod(0o600)
+    rec = recorder(200)   # accepts everything, tokenless included (report-mode behaviour)
+    r = _run_alarm(ctx, tmp_path, rec.url, env_over={"ENGRAM_HOME": str(home)})
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert r.stderr.count(_NO_TOKEN_LINE) == 1, r.stderr
+    assert len([ln for ln in r.stderr.splitlines() if ln.strip()]) == 1, r.stderr
+    assert rec.seen == [], "a request reached the server: %r" % (rec.seen,)
+
+
 # ------------------------------------------------------------------ K10 ------
 
 @pytest.mark.parametrize("status", [403, 500])
 def test_K10_the_alarm_exits_nonzero_with_a_log_line_on_any_non_2xx(tmp_path, recorder, status):
     ctx = _install(tmp_path, env_extra={"FORUM_BACKUP_ALARM_MENTION": "someone"})
     assert ctx.r.returncode == 0, ctx.both
-    (ctx.svc / "alarm-home").mkdir(exist_ok=True, mode=0o700)
+    _plant_token(ctx)
     rec = recorder(status)
-    r = _run_alarm(ctx, tmp_path, rec.url, env_over={"ENGRAM_FORUM_TOKEN": "t"})
+    r = _run_alarm(ctx, tmp_path, rec.url)
     assert r.returncode != 0
     assert "alarm post failed" in r.stderr and str(status) in r.stderr, r.stderr
     assert len(rec.seen) == 1
@@ -473,3 +511,46 @@ def test_K11_revocation_is_written_down_and_the_unit_is_wired():
     unit = ALARM_TEMPLATE.read_text()
     assert re.search(r"^Environment=ENGRAM_HOME=\{\{FORUM_HOME\}\}/alarm-home$", unit, re.M)
     assert re.search(r"^Environment=FORUM_BACKUP_ALARM_AGENT=forum-backup$", unit, re.M)
+
+
+# ------------------------------------------------------------------ K13 ------
+# Round 2, change 1(a): the first-install dark window is visible. With no forum.db the
+# installer still WARNs (refusing would block the cutover install), and the WARN names the
+# exact re-run, rebuilt from the arguments this run actually received.
+
+def test_K13_the_no_db_warn_names_the_exact_rerun_command(tmp_path):
+    ctx = _install(tmp_path, env_extra={"FORUM_BACKUP_ALARM_MENTION": "someone"})
+    assert ctx.r.returncode == 0, ctx.both
+    assert not (ctx.svc / "alarm-home" / "forum-token").exists()
+    cmd_lines = [ln.strip() for ln in ctx.err.splitlines() if ln.strip().startswith("bash ")]
+    assert len(cmd_lines) == 1, ctx.err
+    argv = shlex.split(cmd_lines[0])
+    assert argv[:2] == ["bash", str(INSTALLER)], argv
+    assert argv[argv.index("--service-dir") + 1] == str(ctx.svc), argv
+    assert argv[argv.index("--auth-mode") + 1] == "enforce", argv
+    assert argv[argv.index("--src") + 1] == str(_REPO), argv
+    assert "--no-start" in argv, argv
+    assert "no alarm token was issued" in ctx.err
+
+
+# ------------------------------------------------------------------ K14 ------
+# Round 2, change 2: the empty-mention refusal is an argument-validation refusal, so it
+# comes before ANY write, and its "Nothing was written" is true.
+
+@pytest.mark.parametrize("effective", [
+    {"FORUM_BACKUP_ALARM_MENTION": ""},
+    {"FORUM_BACKUP_ALARM_MENTION": " , "},
+    {"FORUM_BACKUP_ALARM_MENTION": None, "USER": "agent-"},  # unset: the default (USER minus "agent-") is empty
+], ids=["empty", "separators-only", "empty-default"])
+def test_K14_empty_mention_refusal_writes_nothing(tmp_path, effective):
+    home = tmp_path / "home"
+    (home / ".config" / "systemd" / "user").mkdir(parents=True)
+    svc = tmp_path / "forum"
+    _prep_service_dir(svc)
+    before = (_digest(home), _digest(svc))
+    env = dict(effective)
+    ctx = _install(tmp_path, prep=False, env_extra=env)
+    assert ctx.r.returncode == 2, ctx.both
+    assert "FORUM_BACKUP_ALARM_MENTION" in ctx.err
+    assert ctx.err.rstrip().splitlines()[-1].endswith("Nothing was written."), ctx.err
+    assert (_digest(home), _digest(svc)) == before

@@ -354,7 +354,10 @@ So each re-install **rotates** the token: the one a previous run left behind sto
 working, and the unit (`Environment=ENGRAM_HOME=<service-dir>/alarm-home`) reads the new
 one. An existing alarm home wider than 0700, or a token file wider than 0600, is refused
 (exit 2, naming the path and the mode). With no `forum.db` yet (before the DB cutover) no
-token can be issued: the installer says so and you re-run it after the cutover.
+token can be issued: the installer WARNs, prints the exact command to re-run (rebuilt
+from the arguments that run received), and you run it after the cutover. Until then the
+alarm cannot post: with a missing or empty token file it exits non-zero before any
+network call, with the line `no forum-backup token; re-run the forum installer`.
 
 After a live start the installer checks the identity by behaviour, not by the file's
 existence: `GET /api/agent/forum-backup/mentions` with the token read from the file must

@@ -207,8 +207,16 @@ class TestAlarmCli:
     """``forum_backup.py --alarm --unit X``: journal gathered by the CLI, then
     alarm(). journalctl and alarm() are mocked; no real journal or network."""
 
-    def _run(self, monkeypatch, *, env_mention, alarm_rc=0, argv_extra=()):
+    def _run(self, monkeypatch, tmp_path, *, env_mention, alarm_rc=0, argv_extra=(),
+             token="a-token"):
         monkeypatch.setenv("FORUM_URL", "http://127.0.0.1:1")  # never contacted
+        # The alarm refuses before any work when its token file is missing or empty
+        # (#4886), so the harness gives it a private ENGRAM_HOME holding one.
+        monkeypatch.setenv("ENGRAM_HOME", str(tmp_path))
+        monkeypatch.delenv("ENGRAM_FORUM_TOKEN", raising=False)
+        if token is not None:
+            (tmp_path / "forum-token").write_text(token + "\n")
+            (tmp_path / "forum-token").chmod(0o600)
         if env_mention is None:
             monkeypatch.delenv("FORUM_BACKUP_ALARM_MENTION", raising=False)
         else:
@@ -233,18 +241,18 @@ class TestAlarmCli:
             rc = fb.main()
         return rc, captured, seen_cmds
 
-    def test_alarm_mode_does_not_need_a_db_and_calls_alarm(self, monkeypatch):
-        rc, captured, _ = self._run(monkeypatch, env_mention="ariadne-calvino")
+    def test_alarm_mode_does_not_need_a_db_and_calls_alarm(self, monkeypatch, tmp_path):
+        rc, captured, _ = self._run(monkeypatch, tmp_path, env_mention="ariadne-calvino")
         assert rc == 0, "--alarm must not run the backup (default DB path does not exist here)"
         assert captured["unit"] == UNIT
         assert "client" in captured
 
-    def test_main_returns_alarms_exit_code(self, monkeypatch):
-        rc, _, _ = self._run(monkeypatch, env_mention="a", alarm_rc=3)
+    def test_main_returns_alarms_exit_code(self, monkeypatch, tmp_path):
+        rc, _, _ = self._run(monkeypatch, tmp_path, env_mention="a", alarm_rc=3)
         assert rc == 3, "a failed post must surface as a non-zero unit exit"
 
-    def test_journalctl_asks_for_last_20_lines_of_the_unit(self, monkeypatch):
-        _, captured, cmds = self._run(monkeypatch, env_mention="a")
+    def test_journalctl_asks_for_last_20_lines_of_the_unit(self, monkeypatch, tmp_path):
+        _, captured, cmds = self._run(monkeypatch, tmp_path, env_mention="a")
         jc = [c for c in cmds if c and c[0].endswith("journalctl")]
         assert len(jc) == 1, f"one journalctl call expected, saw {cmds}"
         cmd = jc[0]
@@ -261,11 +269,21 @@ class TestAlarmCli:
          " ariadne-calvino , kepler-somnium "],
         ids=["comma", "space", "padded-comma"],
     )
-    def test_mention_env_is_split_into_a_list(self, monkeypatch, raw):
-        _, captured, _ = self._run(monkeypatch, env_mention=raw)
+    def test_mention_env_is_split_into_a_list(self, monkeypatch, tmp_path, raw):
+        _, captured, _ = self._run(monkeypatch, tmp_path, env_mention=raw)
         assert captured["mention"] == ["ariadne-calvino", "kepler-somnium"]
 
-    def test_unset_mention_env_gives_empty_list_not_crash(self, monkeypatch):
-        rc, captured, _ = self._run(monkeypatch, env_mention=None)
+    def test_unset_mention_env_gives_empty_list_not_crash(self, monkeypatch, tmp_path):
+        rc, captured, _ = self._run(monkeypatch, tmp_path, env_mention=None)
         assert rc == 0
         assert captured["mention"] == []
+
+    @pytest.mark.parametrize("token", [None, "", "  \n"], ids=["missing", "empty", "blank"])
+    def test_missing_or_empty_token_refuses_before_any_work(self, monkeypatch, tmp_path,
+                                                            capsys, token):
+        """#4886: no token file (or an empty one) -> exit non-zero with the one line, and
+        neither the journal read nor alarm() (hence no network) happens."""
+        rc, captured, cmds = self._run(monkeypatch, tmp_path, env_mention="a", token=token)
+        assert rc != 0
+        assert "no forum-backup token; re-run the forum installer" in capsys.readouterr().err
+        assert captured == {} and cmds == []
