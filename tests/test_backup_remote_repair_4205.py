@@ -488,3 +488,45 @@ def test_header_state_does_not_leak_into_the_next_commit(amended):
     git(h, "commit", "-q", "-m", "remove key")
     assert "k.txt" not in git(h, "ls-files").split("\n")
     _expect_refused(h, bare, added)
+
+
+# -- #4214: bytes that are not valid UTF-8, and separators that are not newlines -----
+_BAD_BYTES = bytes(range(128, 256)) * 4 + b"\x00"
+
+
+def test_invalid_utf8_binary_file_without_a_key_does_not_crash_or_refuse(amended):
+    h, bare = amended
+    _plant_then_delete(h, "blob.bin", _BAD_BYTES)
+    r = run(h, "--repair")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Traceback" not in r.stderr
+
+
+def test_key_after_invalid_utf8_bytes_is_flagged(amended):
+    h, bare = amended
+    added = _plant_then_delete(h, "blob.bin", _BAD_BYTES + b"\xff\xfe\n" + (_key_line() + "\n").encode())
+    _expect_refused(h, bare, added)
+
+
+@pytest.mark.parametrize("sep", [b"\x0c", b"\x0b", b"\x1c", b"\xc2\x85", b"\xe2\x80\xa8"],
+                         ids=["ff", "vt", "fs", "nel", "ls"])
+def test_key_after_a_line_ending_in_a_diff_header_lookalike_is_flagged(amended, sep):
+    # `str.splitlines()` also breaks at these separators, which would turn the tail of the first
+    # line into a standalone `diff --git ` line and open the header state over the key line
+    h, bare = amended
+    content = b"harmless" + sep + b"diff --git a/x b/x\n" + (_key_line() + "\n").encode()
+    _expect_refused(h, bare, _plant_then_delete(h, "k.txt", content))
+
+
+def test_crlf_file_with_a_key_line_is_flagged(amended):
+    h, bare = amended
+    _expect_refused(h, bare, _plant_then_delete(h, "k.txt", ("harmless\r\n" + _key_line() + "\r\n").encode()))
+
+
+def test_clean_file_containing_a_form_feed_does_not_refuse(amended):
+    h, bare = amended
+    (h / "ff.txt").write_bytes(b"page one\x0cpage two\n")
+    git(h, "add", "ff.txt")
+    git(h, "commit", "-q", "-m", "form feed")
+    r = run(h, "--repair")
+    assert r.returncode == 0, r.stdout + r.stderr

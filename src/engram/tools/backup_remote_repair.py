@@ -137,13 +137,20 @@ def _added_line_hits(home, rng):
     opens a file header, the header lasts until the next `@@ ` hunk line, and inside a hunk
     every `+` line is an added line whatever follows the `+` (a content line `++x` prints as
     `+++x`).  `@@commit <sha>` is checked first and resets the state."""
-    r = _git(home, "log", "-p", "-m", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
-             "-U0", "--format=@@commit %H", rng)
+    # `--text` pushes raw file bytes through, so decode lossily (a binary file that is not valid
+    # UTF-8 must not raise), and split on "\n" only: `str.splitlines()` also breaks at \x0c, \x0b,
+    # \x1c-\x1e, \x85 and U+2028/9, which lets a content line fake a `diff --git ` header line.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    r = subprocess.run(
+        ["git", "log", "-p", "-m", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
+         "-U0", "--format=@@commit %H", rng],
+        cwd=home, capture_output=True, encoding="utf-8", errors="replace", env=env,
+    )
     if r.returncode != 0:
         raise RuntimeError(f"git log -p {rng} failed: {r.stderr.strip()}")
     regs = [re.compile(p) for p in SECRET_PATTERNS]
     hits, cur, in_header = [], None, False
-    for ln in r.stdout.splitlines():
+    for ln in r.stdout.split("\n"):
         if ln.startswith("@@commit "):
             cur, in_header = ln[9:17], False
         elif ln.startswith(("diff --git ", "diff --cc ")):
