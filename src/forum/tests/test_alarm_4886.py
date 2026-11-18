@@ -482,10 +482,10 @@ def test_K12_the_alarm_with_no_token_sends_nothing_even_where_the_server_would_a
         (home / "forum-token").chmod(0o600)
     rec = recorder(200)   # accepts everything, tokenless included (report-mode behaviour)
     r = _run_alarm(ctx, tmp_path, rec.url, env_over={"ENGRAM_HOME": str(home)})
+    assert rec.seen == [], "a request reached the server: %r" % (rec.seen,)
     assert r.returncode != 0, r.stdout + r.stderr
     assert r.stderr.count(_NO_TOKEN_LINE) == 1, r.stderr
     assert len([ln for ln in r.stderr.splitlines() if ln.strip()]) == 1, r.stderr
-    assert rec.seen == [], "a request reached the server: %r" % (rec.seen,)
 
 
 # ------------------------------------------------------------------ K10 ------
