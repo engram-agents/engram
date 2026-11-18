@@ -60,7 +60,7 @@ def _hermetic_env(home: Path, path_prefix: Path | None = None, **extra) -> dict:
     """The ONE environment every subprocess here runs under."""
     env = dict(os.environ)
     env.pop("ENGRAM_HOME", None)
-    env.pop("FORUM_BACKUP_ALARM_MENTION", None)
+    env["FORUM_BACKUP_ALARM_MENTION"] = "testseat"  # #4886: the installer refuses an empty mention; USER may be unset in CI
     env["HOME"] = str(home)
     env["XDG_CONFIG_HOME"] = str(home / ".config")
     if path_prefix is not None:

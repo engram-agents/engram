@@ -144,22 +144,28 @@ class TestAlarmPost:
         assert "@zed-seat" in body
         assert "@ariadne-calvino" not in body and "@kepler-somnium" not in body
 
-    def test_empty_mention_list_is_safe(self):
+    def test_empty_mention_list_posts_nothing_and_exits_nonzero(self):
+        """#4886 (C5, changed on purpose): an alarm that mentions nobody wakes nobody, so
+        zero mentions is a refusal, not a post. This replaces the old 'empty mention is safe'."""
         c = FakeClient()
-        assert _alarm(c, mention=[]) == 0
-        body = _only_post(c)[1]["body_md"]
-        assert "@" not in body, "no mentions requested -> no stray @"
+        assert _alarm(c, mention=[]) != 0
+        assert c.calls == []
 
-    def test_empty_mention_still_posts_and_notes_it_once_on_stderr(self, capsys):
-        """No mention configured must not skip the alarm: the thread is posted
-        (no mention line) and exactly ONE stderr line says so (one journal line)."""
+    def test_empty_mention_logs_one_line_on_stderr(self, capsys):
+        """#4886 (C5, changed on purpose; was: still posts and notes it once). Exactly ONE
+        stderr line says why the alarm refused, and nothing was posted."""
         c = FakeClient()
-        assert _alarm(c, mention=[]) == 0
-        assert len(c.calls) == 1
-        assert "@" not in c.calls[0][1]["body_md"]
+        assert _alarm(c, mention=[]) == 1
+        assert c.calls == []
         err_lines = [ln for ln in capsys.readouterr().err.splitlines() if ln.strip()]
         assert len(err_lines) == 1, err_lines
         assert "FORUM_BACKUP_ALARM_MENTION" in err_lines[0] and "empty" in err_lines[0]
+
+    def test_body_first_line_names_the_service(self):
+        """#4886 (C6): the thread body opens `forum-backup:`."""
+        c = FakeClient()
+        _alarm(c)
+        assert _only_post(c)[1]["body_md"].splitlines()[0].startswith("forum-backup:")
 
     def test_nonempty_mention_emits_no_note(self, capsys):
         _alarm(FakeClient(), mention=["admin1"])

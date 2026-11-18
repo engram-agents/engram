@@ -310,7 +310,9 @@ def run_block(tmp_path):
         pass a dict to set exactly those two."""
         base = {k: v for k, v in os.environ.items()
                 if k not in ("FORUM_BACKUP_ALARM_MENTION", "USER")}
-        base.update(env or {})
+        if env is None:  # #4886: an empty effective mention is refused, so give the block one
+            env = {"FORUM_BACKUP_ALARM_MENTION": "testseat"}
+        base.update(env)
         r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=base)
         if check:
             assert r.returncode == 0, r.stdout + r.stderr
@@ -415,10 +417,18 @@ class TestInstallerWritesMentionDropIn:
         run(env={"USER": "plainuser"})
         assert self._value(unit_dir) == "plainuser"
 
-    def test_neither_env_nor_user_writes_an_empty_value(self, run_block):
+    @pytest.mark.parametrize("env", [{}, {"FORUM_BACKUP_ALARM_MENTION": ""},
+                                     {"FORUM_BACKUP_ALARM_MENTION": " , "}],
+                             ids=["neither", "empty", "separators-only"])
+    def test_neither_env_nor_user_is_refused_and_writes_nothing(self, run_block, env):
+        """#4886 (C5, changed on purpose; was: writes an empty value). An alarm that
+        mentions nobody wakes nobody, so an empty effective value is refused."""
         unit_dir, run = run_block
-        run(env={})
-        assert self._value(unit_dir) == ""
+        r = run(env=env, check=False)
+        assert r.returncode != 0
+        assert "FORUM_BACKUP_ALARM_MENTION" in r.stderr and "empty" in r.stderr
+        assert not self._mention_conf(unit_dir).exists()
+        assert not (unit_dir / "engram-forum-backup-alarm.service").exists()
 
     def test_dropin_is_rewritten_on_every_run(self, run_block):
         unit_dir, run = run_block

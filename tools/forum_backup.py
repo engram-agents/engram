@@ -515,17 +515,21 @@ def alarm(*, client, mention: list, unit: str, journal_lines: list) -> int:
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     tail = list(journal_lines)[-ALARM_JOURNAL_LINES:]
-    parts = [f"`{unit}` failed. Last {ALARM_JOURNAL_LINES} journal lines:", "", "```"]
-    parts.extend(tail if tail else ["(no journal output captured)"])
-    parts.append("```")
-    if mention:
-        parts.extend(["", " ".join(f"@{m}" for m in mention)])
-    else:
-        # Never skip the post over a missing mention; say so once (one journal line).
+    if not mention:
+        # An alarm nobody is @mentioned in wakes nobody (#4886): exit non-zero with one
+        # log line so the unit shows in `systemctl --user --failed`, and post nothing.
         print(
-            "NOTE: FORUM_BACKUP_ALARM_MENTION is empty; posting without a mention",
+            "ERROR: FORUM_BACKUP_ALARM_MENTION is empty; refusing to post an alarm "
+            "that mentions nobody",
             file=sys.stderr,
         )
+        return 1
+    # First line names the service (#4886), so the thread reads as the backup's own alarm.
+    parts = [f"forum-backup: `{unit}` failed {today}. Last {ALARM_JOURNAL_LINES} journal lines:",
+             "", "```"]
+    parts.extend(tail if tail else ["(no journal output captured)"])
+    parts.append("```")
+    parts.extend(["", " ".join(f"@{m}" for m in mention)])
     payload = {
         "agent": agent,
         "thread_id": None,

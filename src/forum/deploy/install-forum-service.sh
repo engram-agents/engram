@@ -386,6 +386,9 @@ fi
 [ -f "$SRC/tools/forum_backup.py" ] || {
   echo "ERROR: $SRC/tools/forum_backup.py not found — the backup units run the snapshot of this script" >&2; exit 2;
 }
+[ -f "$SRC/tools/forum_api.py" ] || {
+  echo "ERROR: $SRC/tools/forum_api.py not found — the backup tool's --alarm mode imports ForumClient from it (#4886)" >&2; exit 2;
+}
 [ -f "$SRC/tools/forum_regen_derived.py" ] || {
   echo "ERROR: $SRC/tools/forum_regen_derived.py not found — a restore runs the snapshot of this script (#868)" >&2; exit 2;
 }
@@ -863,6 +866,38 @@ _assert_no_group_write() {
 }
 # <<< service-modes
 
+# The alarm's own home and token (#4886). The alarm posts as `forum-backup`; the server
+# only accepts that name with a token FOR it, so the alarm gets its own ENGRAM_HOME
+# (<service-dir>/alarm-home, 0700) holding its own token (<alarm-home>/forum-token, 0600),
+# rotated on every run. The modes are CHECKED, not just created: an existing home or
+# token wider than 0700 / 0600 is refused here, before anything is written. Reads only.
+ALARM_HOME="$SERVICE_DIR/alarm-home"
+ALARM_TOKEN="$ALARM_HOME/forum-token"
+_mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+# $1 path, $2 widest allowed octal (700 or 600), $3 what it is.
+_refuse_if_wider() {
+  local _m _p
+  _m="$(_mode_of "$1")" || { echo "ERROR: cannot read the mode of $1. Nothing was written." >&2; exit 2; }
+  _p="$(printf '%04d' "$_m")"
+  if [ $(( 8#$_m & 8#777 & ~8#$2 )) -ne 0 ]; then   # access bits only: a setgid dir is not wider access
+    echo "ERROR: $3 $1 has mode $_p, wider than 0$2 (the alarm's token must not be readable by anyone else). Nothing was written. Fix: chmod $2 $1" >&2
+    exit 2
+  fi
+}
+if [ -e "$ALARM_HOME" ] || [ -L "$ALARM_HOME" ]; then
+  if [ -L "$ALARM_HOME" ] || [ ! -d "$ALARM_HOME" ]; then
+    echo "ERROR: $ALARM_HOME exists but is not a plain directory. Nothing was written." >&2; exit 2
+  fi
+  [ -O "$ALARM_HOME" ] || { echo "ERROR: $ALARM_HOME is not owned by the installing user. Nothing was written." >&2; exit 2; }
+  _refuse_if_wider "$ALARM_HOME" 700 "alarm home"
+fi
+if [ -e "$ALARM_TOKEN" ] || [ -L "$ALARM_TOKEN" ]; then
+  if [ -L "$ALARM_TOKEN" ] || [ ! -f "$ALARM_TOKEN" ]; then
+    echo "ERROR: $ALARM_TOKEN exists but is not a plain file. Nothing was written." >&2; exit 2
+  fi
+  _refuse_if_wider "$ALARM_TOKEN" 600 "alarm token file"
+fi
+
 echo "==> Forum service dir: $SERVICE_DIR (port $PORT, group $GROUP); admin: $ADMIN_USER"
 _set_service_modes
 
@@ -930,6 +965,19 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "  [dry-run] cp -L $SRC/tools/forum_backup.py → $APP/tools/forum_backup.py (resolves any symlink)"
 else
   cp -L "$SRC/tools/forum_backup.py" "$APP/tools/forum_backup.py"
+fi
+
+# The alarm's HTTP client (#4886). forum_backup.py --alarm imports ForumClient from
+# forum_api LAZILY (inside _alarm_cli), so a missing copy only shows when a backup has
+# already failed: the alarm dies on ImportError exactly when it is needed. The installer
+# ships every module the shipped tools import, lazy imports included (a test enforces it).
+# tools/forum_api.py is a symlink in source, so copy the RESOLVED file (cp -L).
+echo "==> Snapshotting forum client → $APP/tools/forum_api.py"
+RUN mkdir -p "$APP/tools"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] cp -L $SRC/tools/forum_api.py → $APP/tools/forum_api.py (resolves the symlink)"
+else
+  cp -L "$SRC/tools/forum_api.py" "$APP/tools/forum_api.py"
 fi
 
 # The restore tools (#868). The backup dump has no search index and no embeddings,
@@ -1062,6 +1110,11 @@ _mention="${FORUM_BACKUP_ALARM_MENTION-}"
 if [ -z "${FORUM_BACKUP_ALARM_MENTION+x}" ]; then
   _mention="${USER-}"
   _mention="${_mention#agent-}"
+fi
+# An alarm that @mentions nobody wakes nobody (#4886): refuse an empty effective value.
+if [ -z "$(printf '%s' "$_mention" | tr -d ' ,')" ]; then
+  echo "ERROR: FORUM_BACKUP_ALARM_MENTION is empty (and there is no installing user name to default to); the failure alarm would @mention nobody and wake nobody. Set it to the forum agent name(s) to page, e.g. FORUM_BACKUP_ALARM_MENTION=\"alice bob\"." >&2
+  exit 2
 fi
 case "$_mention" in
   *[!A-Za-z0-9_\ ,-]*)
@@ -1275,6 +1328,93 @@ EOF_BCE
   echo "    backup unit ExecStart paths all exist: $_unit"
 }
 # <<< backup-units
+
+# The alarm's own token (#4886): ROTATED on every run. Make the alarm home (0700), revoke
+# any live `forum-backup` token, remove the old token file, issue a fresh one with
+# `token issue --write-to` (O_EXCL, 0600). Revoking first means the token a previous run
+# left behind stops working the moment the new one exists; nothing keeps "the same token".
+# Revocation: the alarm's token is revoked by name: `forum.admin token revoke forum-backup`
+# This installer has NO uninstall path (tracked in #4887), so removing the alarm is manual:
+# that revoke, then remove the token file. The admin CLI opens the forum DB directly, the
+# way the rest of this script reaches it ($DB_PATH); it runs from $APP like gate 2 below.
+_alarm_admin() { ( cd "$APP" && "$PYTHON" -m forum.admin --db "$DB_PATH" "$@" ); }
+# (a) The token file is there, a plain file, at most 0600, and not empty. Never prints it.
+_alarm_assert_token_file() {
+  if [ ! -f "$ALARM_TOKEN" ] || [ -L "$ALARM_TOKEN" ]; then
+    echo "ERROR: the alarm token file $ALARM_TOKEN is missing or not a plain file." >&2; exit 2
+  fi
+  _refuse_if_wider "$ALARM_TOKEN" 600 "alarm token file"
+  if ! grep -q '[^[:space:]]' "$ALARM_TOKEN"; then
+    echo "ERROR: the alarm token file $ALARM_TOKEN is empty." >&2; exit 2
+  fi
+}
+echo "==> Alarm token: rotating the forum-backup token → $ALARM_TOKEN"
+ALARM_TOKEN_ISSUED=0
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] mkdir -p $ALARM_HOME; chmod 0700 $ALARM_HOME"
+  echo "  [dry-run] python -m forum.admin --db $DB_PATH token revoke forum-backup"
+  echo "  [dry-run] rm -f $ALARM_TOKEN"
+  echo "  [dry-run] python -m forum.admin --db $DB_PATH token issue forum-backup --write-to $ALARM_TOKEN"
+  [ ! -e "$ALARM_TOKEN" ] || _alarm_assert_token_file
+elif [ ! -f "$DB_PATH" ]; then
+  echo "    WARN: no forum.db at $DB_PATH yet, so no alarm token was issued and none was verified." >&2
+  echo "          After the DB cutover, re-run this installer: it issues the alarm token then." >&2
+else
+  mkdir -p "$ALARM_HOME"
+  chmod 0700 "$ALARM_HOME"   # four digits: also clears the setgid bit the setgid service dir hands down
+  _alarm_admin token revoke forum-backup \
+    || { echo "ERROR: could not revoke the old forum-backup token (forum.admin token revoke forum-backup)." >&2; exit 2; }
+  rm -f "$ALARM_TOKEN"
+  _alarm_admin token issue forum-backup --write-to "$ALARM_TOKEN" >/dev/null \
+    || { echo "ERROR: could not issue the forum-backup token into $ALARM_TOKEN." >&2; exit 2; }
+  _alarm_assert_token_file
+  ALARM_TOKEN_ISSUED=1
+  echo "    issued a fresh forum-backup token (mode 0600); any earlier one is revoked"
+fi
+
+# (C3) The identity is verified by BEHAVIOUR, not by the file. The one endpoint used:
+# GET /api/agent/forum-backup/mentions. No who-am-I read exists (`forum.py whoami` is
+# local only; /api/agent/me is PATCH-only), so this is the cheapest authenticated read
+# that makes the server compare the token's agent with a NAMED agent: a token for any
+# other agent answers 403, an unknown or revoked one 401, the right one 200. In report
+# mode a request with NO Authorization header is served as the agent it names, so the
+# 200 alone proves nothing there; this check therefore sends the token it read from the
+# file ITSELF (not through ForumClient's auto-load) and pairs it with a control: the same
+# GET with a deliberately invalid token must answer 401. It passes only on 200 AND 401.
+ALARM_IDENT_PATH="/api/agent/forum-backup/mentions"
+_alarm_verify_identity() {
+  local _path="$ALARM_IDENT_PATH" _res _a _b
+  _res="$(python3 -B - "$ALARM_TOKEN" "http://127.0.0.1:${PORT}${_path}" <<'PY'
+import sys, urllib.error, urllib.request
+tokfile, url = sys.argv[1], sys.argv[2]
+token = open(tokfile, encoding="utf-8").read().strip()
+def status(t):
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + t})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception as e:
+        return "unreachable-" + type(e).__name__
+print(status(token), status("not-a-real-token-4886"))
+PY
+  )" || _res="error error"
+  _a="${_res%% *}"; _b="${_res##* }"
+  if [ "$_a" != "200" ] || [ "$_b" != "401" ]; then
+    echo "ERROR: alarm identity check FAILED: GET $_path with the real token answered HTTP $_a (want 200); with an invalid token answered HTTP $_b (want 401). The token in $ALARM_TOKEN does not resolve to forum-backup on the live forum, or the forum does not refuse a bad token." >&2
+    exit 2
+  fi
+  echo "    OK: alarm token resolves to forum-backup (GET $_path: real token 200, invalid token 401)"
+}
+_alarm_identity_unverified() {
+  echo "    NOTE: alarm identity NOT verified: no live server (--no-start or --dry-run); only the token file's properties were checked. After starting, run this installer again or GET $ALARM_IDENT_PATH with the token."
+}
+# No live server to ask under --dry-run or --no-start: say so, never a bare "skipped". With a
+# live start the check runs after the gates below (the forum must be up with the new code).
+if [ "$DRY_RUN" -eq 1 ] || { [ "$ALARM_TOKEN_ISSUED" -eq 1 ] && [ "$START" -eq 0 ]; }; then
+  _alarm_identity_unverified
+fi
 _check_backup_exec_paths "$UNIT_DIR/engram-forum-backup.service"
 
 LINGER_OK=1
@@ -1340,6 +1480,13 @@ if [ "$START" -eq 1 ]; then
     else
       echo "ERROR: verify-only probe returned non-zero — dep check failed; service may be degraded." >&2
       exit 2
+    fi
+
+    # The alarm's token, last: rotation already ran, this is the token that stays installed.
+    if [ "$ALARM_TOKEN_ISSUED" -eq 1 ]; then
+      echo "==> Post-install gate 3: the alarm's token resolves to forum-backup"
+      _alarm_assert_token_file
+      _alarm_verify_identity
     fi
 
     # The probe above cannot say whether GitHub integration is on: it runs in THIS
