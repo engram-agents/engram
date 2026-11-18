@@ -56,6 +56,7 @@ SINGLE_AGENT_IDS = [
     "confidence-anchors",
     "native-tools-ban-single-agent",
     "engram-reference",
+    "session-start-reading",
 ]
 
 BAN_ID = "native-tools-ban-single-agent"
@@ -121,7 +122,7 @@ def test_b_non_string_profile_raises():
 # --- the single-agent manifest and the committed single-agent template ------------------------------------
 
 
-def test_single_agent_manifest_is_the_twelve_ids_in_the_full_manifests_relative_order():
+def test_single_agent_manifest_is_the_listed_ids_in_the_full_manifests_relative_order():
     single_agent_ids = _manifest_ids(SINGLE_AGENT_MANIFEST)
     assert single_agent_ids == SINGLE_AGENT_IDS
     full_ids = _manifest_ids(FULL_MANIFEST)
@@ -141,7 +142,7 @@ def test_single_agent_manifest_is_the_twelve_ids_in_the_full_manifests_relative_
     assert single_agent_ids.index(NOTES_ID) == single_agent_ids.index("authority-structure-intro") - 1
 
 
-def test_single_agent_render_receipt_lists_the_twelve_ids():
+def test_single_agent_render_receipt_lists_the_manifest_ids():
     _, receipt = tcr.render("claude-code", "CLAUDE.md", "single-agent")
     assert [c["id"] for c in receipt["components"]] == SINGLE_AGENT_IDS
     assert receipt["excluded"] == []
@@ -489,6 +490,71 @@ def test_i_single_agent_is_strictly_shorter_and_has_none_of_the_dropped_headings
     assert "## ENGRAM Write Discipline" in single_agent_headings
     assert "## ENGRAM Read Discipline" in single_agent_headings
 
+
+
+# --- the Session Start Reading section is restored (ruling: cross-compaction continuity) -------
+
+SSR_ID = "session-start-reading"
+SSR_HEADING = "## Session Start Reading"
+
+
+def _section(text: str, heading: str) -> str:
+    """The lines from `heading` to the next `## ` heading (exclusive), outside code fences."""
+    lines = text.split("\n")
+    start = lines.index(heading)
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    return "\n".join(lines[start:end]).rstrip("\n")
+
+
+def test_session_start_reading_renders_with_its_heading_and_its_three_numbered_items():
+    text = _single_agent()
+    assert text.split("\n").count(SSR_HEADING) == 1
+    section = _section(text, SSR_HEADING)
+    numbered = [ln for ln in section.split("\n") if re.match(r"\d+\. ", ln)]
+    assert [ln.split(". ", 1)[0] for ln in numbered] == ["1", "2", "3"], numbered
+
+
+def test_session_start_reading_section_is_the_full_files_section_byte_for_byte():
+    assert _section(_single_agent(), SSR_HEADING) == _section(_full(), SSR_HEADING)
+
+
+def test_session_start_reading_is_the_existing_full_component_not_a_new_one():
+    assert SSR_ID in _manifest_ids(FULL_MANIFEST)
+    assert _manifest_ids(SINGLE_AGENT_MANIFEST).count(SSR_ID) == 1
+    assert not (TEMPLATES / "components" / f"{SSR_ID}-single-agent.md").exists()
+
+
+def test_session_start_reading_sits_where_the_full_manifest_puts_it():
+    full_ids, ids = _manifest_ids(FULL_MANIFEST), _manifest_ids(SINGLE_AGENT_MANIFEST)
+    # the full manifest puts it right after the ENGRAM Reference; so does the single-agent one
+    assert full_ids.index(SSR_ID) == full_ids.index("engram-reference") + 1
+    assert ids.index(SSR_ID) == ids.index("engram-reference") + 1
+    # and its place among the components the two manifests share is the full manifest's place
+    shared = [i for i in ids if i in set(full_ids)]
+    assert shared == [i for i in full_ids if i in set(shared)]
+    assert shared.index(SSR_ID) == shared.index("engram-reference") + 1
+
+
+# --- the profile is a SUBSET of the full template: every component is a full component or a bound variant of one
+
+# the profile-only components and the full component each is bound to (the binding cells above compare bytes)
+BOUND_VARIANT_OF = {
+    GATE_ID: "model-identity-gate",
+    BAN_ID: "fairy-tool-policy-claude-code",
+    NOTES_ID: "cross-surface-persistence",
+}
+
+
+def test_every_single_agent_component_is_a_full_component_or_a_bound_variant_of_one():
+    full_ids = set(_manifest_ids(FULL_MANIFEST))
+    ids = _manifest_ids(SINGLE_AGENT_MANIFEST)
+    not_in_full = [i for i in ids if i not in full_ids]
+    # the components that are not full components are exactly the ones declared as bound variants
+    assert sorted(not_in_full) == sorted(BOUND_VARIANT_OF), not_in_full
+    for variant, source in BOUND_VARIANT_OF.items():
+        assert variant in ids
+        assert source in full_ids, f"{variant} is bound to {source}, which is not a full-manifest component"
+        assert (TEMPLATES / "components" / f"{source}.md").is_file()
 
 # --- (c1) and (h): bootstrap ---------------------------------------------------------------
 
