@@ -1,5 +1,5 @@
 ---
-id: model-identity-gate-lean
+id: model-identity-gate-single-agent
 kind: rule
 harnesses: [claude-code]
 surfaces: [CLAUDE.md]

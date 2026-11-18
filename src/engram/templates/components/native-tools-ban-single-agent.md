@@ -1,5 +1,5 @@
 ---
-id: native-tools-ban-lean
+id: native-tools-ban-single-agent
 kind: rule
 harnesses: [claude-code]
 surfaces: [CLAUDE.md]

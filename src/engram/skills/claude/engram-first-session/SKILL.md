@@ -175,7 +175,7 @@ step confirms it and records it, and is the safety net if they hadn't chosen yet
        json.dump(cfg, f, indent=2)
    ```
 
-   This arms the **Model Identity Gate** (in your CLAUDE.md; in a lean-profile file that section holds one sentence and the rest of the gate is not in the file, and recording `self_lineage` is still right) so a future
+   This arms the **Model Identity Gate** (in your CLAUDE.md; in a single-agent-profile file that section holds one sentence and the rest of the gate is not in the file, and recording `self_lineage` is still right) so a future
    cross-family session is caught, and it activates the standpoint `null=self`
    convention (your own unmarked observations now count as your own lineage). The
    value must be lowercase `provider:family`. There is **no write-time check** —
@@ -604,7 +604,7 @@ Then ask two questions, one at a time, and wait for each answer:
 1. Is there any of that outward work they want done without being told first? If so, which, in their own words.
 2. May you start ENGRAM's own helper sub-agents (used by the nightly memory consolidation, which runs only its first half without them, and by code review; they spend the user's token budget)? Yes, no, or ask each time.
 
-Record each grant as a dated line in the user's CLAUDE.md, quoting the user's own words: `Granted by <user> on <date>: <their words>`. Outward grants go under the authority table; the sub-agent grant goes in the tool-policy section. A lean-profile CLAUDE.md has no tool-policy section: put the sub-agent line under the authority table too.
+Record each grant as a dated line in the user's CLAUDE.md, quoting the user's own words: `Granted by <user> on <date>: <their words>`. Outward grants go under the authority table; the sub-agent grant goes in the tool-policy section. A single-agent-profile CLAUDE.md has no tool-policy section: put the sub-agent line under the authority table too.
 
 On "no" or on no answer: write nothing; the default stands. On "ask each time": write one dated line in the tool-policy section, `<user> on <date>: ask each time`, so a later session asks before each task that needs sub-agents instead of skipping. Never pre-fill an answer, never paraphrase a grant into something broader than the user said.
 

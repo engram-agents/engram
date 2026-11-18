@@ -38,7 +38,7 @@ Arguments
           exclusive with --base.
 --engram-home (both modes)
           The home whose config.json records ``claude_md_profile``.  The tool diffs
-          THAT profile's template (lean -> template.CLAUDE.lean.md); no record, or no
+          THAT profile's template (single-agent -> template.CLAUDE.single-agent.md); no record, or no
           flag, is the full template.  An unrecognised recorded value exits 2 with an
           "undetermined" message and compares nothing.
 --user-name / --agent-name / --self-node-id / --engram-home

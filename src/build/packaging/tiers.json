@@ -1451,7 +1451,7 @@
       "tier": "essential"
     },
     {
-      "path": "templates/template.CLAUDE.lean.md",
+      "path": "templates/template.CLAUDE.single-agent.md",
       "tier": "essential"
     },
     {

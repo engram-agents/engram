@@ -104,9 +104,9 @@ git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH"
 
 ```bash
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
-# The template of the profile this home recorded (no record = full; lean = bootstrapped with --claude-md-profile lean):
+# The template of the profile this home recorded (no record = full; single-agent = bootstrapped with --claude-md-profile single-agent):
 TEMPLATE=template.CLAUDE.md
-grep -Eq '"claude_md_profile"[[:space:]]*:[[:space:]]*"lean"' "${ENGRAM_HOME:-$HOME/.engram}/config.json" 2>/dev/null && TEMPLATE=template.CLAUDE.lean.md
+grep -Eq '"claude_md_profile"[[:space:]]*:[[:space:]]*"single-agent"' "${ENGRAM_HOME:-$HOME/.engram}/config.json" 2>/dev/null && TEMPLATE=template.CLAUDE.single-agent.md
 git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH" -- "src/engram/templates/$TEMPLATE"
 ```
 

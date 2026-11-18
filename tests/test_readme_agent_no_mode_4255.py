@@ -163,18 +163,30 @@ def _tier_of(tiers: dict, path: str):
 # A. the retired spellings are gone, everywhere (prose, tables, code spans)
 # --------------------------------------------------------------------------
 
+# The one place README-AGENT.md may say the word: the NAME of the single-agent CLAUDE.md profile (#4802), written as the
+# code span `single-agent` or as the value after the installer flag. Exactly those two spellings are set aside before the
+# scan; the word anywhere else (prose, a heading, a table cell) still fails.
+PROFILE_NAME_PHRASES = ("--claude-md-profile single-agent", "`single-agent`")
+
+
+def _without_profile_name(text: str) -> str:
+    for phrase in PROFILE_NAME_PHRASES:
+        text = text.replace(phrase, "")
+    return text
+
+
 def test_A_no_retired_spellings(readme):
     hits = [
         f"line {i}: {line.strip()[:100]}"
         for i, line in enumerate(readme.splitlines(), 1)
-        if FORBIDDEN.search(line)
+        if FORBIDDEN.search(_without_profile_name(line))
     ]
     assert not hits, "retired mode wording in README-AGENT.md:\n" + "\n".join(hits)
 
 
 def test_A_no_retired_spelling_split_across_a_line_break(readme):
     # The per-line scan above cannot see 'multi-' / 'agent' broken over two lines.
-    flat = re.sub(r"\s+", " ", readme)
+    flat = re.sub(r"\s+", " ", _without_profile_name(readme))
     assert not FORBIDDEN.search(flat)
 
 

@@ -1172,11 +1172,11 @@ def _bootstrap_argvs(sb):
     return [json.loads(c[len("argv-of-bootstrap "):]) for c in sb.calls_starting("argv-of-bootstrap")]
 
 
-@pytest.mark.parametrize("given", [["--claude-md-profile", "lean"], ["--claude-md-profile=lean"]])
+@pytest.mark.parametrize("given", [["--claude-md-profile", "single-agent"], ["--claude-md-profile=single-agent"]])
 def test_claude_md_profile_flag_is_forwarded_to_bootstrap(sb, given):
     r = sb.run("--yes", *given)
     assert r.returncode == 0, r.all
-    assert _bootstrap_argvs(sb) == [["--claude-md-profile", "lean"]]
+    assert _bootstrap_argvs(sb) == [["--claude-md-profile", "single-agent"]]
 
 
 def test_claude_md_profile_value_is_forwarded_verbatim_not_hardcoded(sb):
@@ -1188,9 +1188,9 @@ def test_claude_md_profile_value_is_forwarded_verbatim_not_hardcoded(sb):
 def test_claude_md_profile_forwards_beside_replace(sb):
     sb.claude_home.mkdir(parents=True)
     (sb.claude_home / "CLAUDE.md").write_text("mine\n")
-    r = sb.run("--yes", "--claude-md-profile", "lean")
+    r = sb.run("--yes", "--claude-md-profile", "single-agent")
     assert r.returncode == 0, r.all
-    assert _bootstrap_argvs(sb) == [["--replace", str(sb.claude_home / "CLAUDE.md"), "--claude-md-profile", "lean"]]
+    assert _bootstrap_argvs(sb) == [["--replace", str(sb.claude_home / "CLAUDE.md"), "--claude-md-profile", "single-agent"]]
 
 
 def test_without_the_flag_the_bootstrap_argv_is_unchanged(sb):
@@ -1229,32 +1229,32 @@ def test_a_bad_value_is_refused_by_bootstrap_not_by_the_installer(sb):
 
 def test_installer_source_holds_no_profile_list_of_its_own():
     src = REAL_INSTALL_SH.read_text()
-    assert not re.search(r"\blean\b", src)
+    assert not re.search(r"(?<![-\w])single-agent\b", src)
     assert not re.search(r"""(?:^|[\s"'(|])full\s*[|)]""", src, re.MULTILINE)
     assert not re.search(r"""[|(]\s*full\b|"full"|'full'""", src)
 
 
-def test_the_real_bootstrap_renders_and_records_the_lean_profile_through_the_installer(sb):
+def test_the_real_bootstrap_renders_and_records_the_single_agent_profile_through_the_installer(sb):
     sb.use_real_bootstrap()
-    r = sb.run("--yes", "--claude-md-profile", "lean")
+    r = sb.run("--yes", "--claude-md-profile", "single-agent")
     assert r.returncode == 0, r.all
-    assert json.loads((sb.engram / "config.json").read_text()).get("claude_md_profile") == "lean"
+    assert json.loads((sb.engram / "config.json").read_text()).get("claude_md_profile") == "single-agent"
     assert "## Model Identity Gate" in (sb.claude_home / "CLAUDE.md").read_text()
 
 
 def test_a_profile_given_on_a_seeded_home_is_reported_ignored_not_silently_dropped(sb):
     sb.make_db(6)
-    r = sb.run("--yes", "--claude-md-profile", "lean")
+    r = sb.run("--yes", "--claude-md-profile", "single-agent")
     assert r.returncode == 0, r.all
     assert sb.calls_starting("argv-of-bootstrap") == []
-    assert "--claude-md-profile lean ignored" in r.stdout
+    assert "--claude-md-profile single-agent ignored" in r.stdout
 
 
 def test_help_lists_the_claude_md_profile_flag_and_names_no_profile(sb):
     r = sb.run("--help")
     assert r.returncode == 0
     assert "--claude-md-profile" in r.stdout
-    assert not re.search(r"\blean\b", r.stdout)
+    assert not re.search(r"(?<![-\w])single-agent\b", r.stdout)
 
 
 _EMPTY_PROFILE_FORMS = [["--claude-md-profile", ""], ["--claude-md-profile="]]

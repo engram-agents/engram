@@ -1,8 +1,8 @@
 """The CLAUDE.md drift tool diffs the profile the home RECORDED, not always the full template.
 
 Contract (config.json `claude_md_profile`; no record = full):
-  - a lean home reports NO drift against the lean template and never reports the full
-    template's extra sections as missing; a change to the full template alone is not lean drift;
+  - a single-agent home reports NO drift against the single-agent template and never reports the full
+    template's extra sections as missing; a change to the full template alone is not single-agent drift;
   - a full home (record "full", null, or none) behaves as before;
   - an unrecognised recorded value is "undetermined": exit 2, a message, nothing compared,
     and no fallback to the full template.
@@ -20,8 +20,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI_PATH = REPO_ROOT / "src" / "engram" / "tools" / "check-claude-md-drift.py"
 
-_LEAN = "# Identity\n\nLean paragraph one.\n\nLean paragraph two.\n"
-_FULL = _LEAN + "\n## Full only section\n\nFull-only paragraph about fairies.\n"
+_SINGLE_AGENT = "# Identity\n\nSingle-agent paragraph one.\n\nSingle-agent paragraph two.\n"
+_FULL = _SINGLE_AGENT + "\n## Full only section\n\nFull-only paragraph about fairies.\n"
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -42,7 +42,7 @@ def repo(tmp_path: Path) -> Path:
     _git(r, "config", "user.email", "t@t.invalid")
     _git(r, "config", "user.name", "T")
     (d / "template.CLAUDE.md").write_text(_FULL, encoding="utf-8")
-    (d / "template.CLAUDE.lean.md").write_text(_LEAN, encoding="utf-8")
+    (d / "template.CLAUDE.single-agent.md").write_text(_SINGLE_AGENT, encoding="utf-8")
     _commit(r, "base")
     return r
 
@@ -75,9 +75,9 @@ def _two_ref(repo, home):
 
 # ---- live mode -------------------------------------------------------------
 
-def test_lean_home_live_no_drift_and_no_full_sections_missing(repo, tmp_path):
-    home = _home(tmp_path, {"claude_md_profile": "lean"})
-    rc, out, err = _live(repo, home, _LEAN, tmp_path)
+def test_single_agent_home_live_no_drift_and_no_full_sections_missing(repo, tmp_path):
+    home = _home(tmp_path, {"claude_md_profile": "single-agent"})
+    rc, out, err = _live(repo, home, _SINGLE_AGENT, tmp_path)
     assert rc == 0, (out, err)
     assert "Full only" not in out and "fairies" not in out
     assert "0 missing" in out
@@ -86,46 +86,46 @@ def test_lean_home_live_no_drift_and_no_full_sections_missing(repo, tmp_path):
 def test_full_home_live_still_reports_full_sections_missing(repo, tmp_path):
     for record in (None, {}, {"claude_md_profile": "full"}, {"claude_md_profile": None}):
         home = _home(tmp_path, record)
-        rc, out, _ = _live(repo, home, _LEAN, tmp_path)
+        rc, out, _ = _live(repo, home, _SINGLE_AGENT, tmp_path)
         assert rc == 1, record
         assert "Full-only paragraph" in out, record
 
 
-def test_lean_home_live_reports_a_missing_lean_paragraph(repo, tmp_path):
-    home = _home(tmp_path, {"claude_md_profile": "lean"})
-    rc, out, _ = _live(repo, home, "# Identity\n\nLean paragraph one.\n", tmp_path)
-    assert rc == 1 and "Lean paragraph two" in out
+def test_single_agent_home_live_reports_a_missing_single_agent_paragraph(repo, tmp_path):
+    home = _home(tmp_path, {"claude_md_profile": "single-agent"})
+    rc, out, _ = _live(repo, home, "# Identity\n\nSingle-agent paragraph one.\n", tmp_path)
+    assert rc == 1 and "Single-agent paragraph two" in out
 
 
 # ---- two-ref mode ----------------------------------------------------------
 
-def test_lean_home_ignores_a_full_only_template_change(repo, tmp_path):
+def test_single_agent_home_ignores_a_full_only_template_change(repo, tmp_path):
     t = repo / "src" / "engram" / "templates" / "template.CLAUDE.md"
     t.write_text(_FULL + "\nMore full text.\n", encoding="utf-8")
     _commit(repo, "full change")
-    assert _two_ref(repo, _home(tmp_path, {"claude_md_profile": "lean"}))[0] == 0
+    assert _two_ref(repo, _home(tmp_path, {"claude_md_profile": "single-agent"}))[0] == 0
     rc, out, _ = _two_ref(repo, _home(tmp_path, None))
     assert rc == 1 and "More full text" in out
 
 
-def test_lean_home_sees_a_lean_template_change(repo, tmp_path):
-    t = repo / "src" / "engram" / "templates" / "template.CLAUDE.lean.md"
-    t.write_text(_LEAN + "\nNew lean text.\n", encoding="utf-8")
-    _commit(repo, "lean change")
-    rc, out, _ = _two_ref(repo, _home(tmp_path, {"claude_md_profile": "lean"}))
-    assert rc == 1 and "New lean text" in out
+def test_single_agent_home_sees_a_single_agent_template_change(repo, tmp_path):
+    t = repo / "src" / "engram" / "templates" / "template.CLAUDE.single-agent.md"
+    t.write_text(_SINGLE_AGENT + "\nNew single-agent text.\n", encoding="utf-8")
+    _commit(repo, "single-agent change")
+    rc, out, _ = _two_ref(repo, _home(tmp_path, {"claude_md_profile": "single-agent"}))
+    assert rc == 1 and "New single-agent text" in out
     assert _two_ref(repo, _home(tmp_path, None))[0] == 0
 
 
 # ---- undetermined ----------------------------------------------------------
 
-@pytest.mark.parametrize("record", [{"claude_md_profile": "tiny"}, {"claude_md_profile": 3}, ["not", "a", "dict"]])
+@pytest.mark.parametrize("record", [{"claude_md_profile": "tiny"}, {"claude_md_profile": "lean"}, {"claude_md_profile": 3}, ["not", "a", "dict"]])
 def test_unrecognised_record_is_undetermined_in_both_modes(repo, tmp_path, record):
     home = _home(tmp_path, record)
     t = repo / "src" / "engram" / "templates" / "template.CLAUDE.md"
     t.write_text(_FULL + "\nMore full text.\n", encoding="utf-8")
     _commit(repo, "full change")
-    for rc, out, err in (_two_ref(repo, home), _live(repo, home, _LEAN, tmp_path)):
+    for rc, out, err in (_two_ref(repo, home), _live(repo, home, _SINGLE_AGENT, tmp_path)):
         assert rc == 2
         assert "undetermined" in err and "ask the user" in err.lower()
         assert out == ""  # nothing compared, no fallback to the full template
@@ -160,8 +160,9 @@ def test_tool_and_upgrade_flow_read_the_same_profile(tmp_path):
     flows_reader = ns["_recorded_claude_md_profile"]
 
     cases = [None, "{not json", "[1]", "{}", '{"claude_md_profile": null}', '{"claude_md_profile": "full"}',
-             '{"claude_md_profile": "lean"}', '{"claude_md_profile": "tiny"}', '{"claude_md_profile": 3}',
-             '{"claude_md_profile": "Lean"}', '{"claude_md_profile": "lean "}']
+             '{"claude_md_profile": "single-agent"}', '{"claude_md_profile": "tiny"}', '{"claude_md_profile": 3}',
+             '{"claude_md_profile": "Single-agent"}', '{"claude_md_profile": "single-agent "}',
+             '{"claude_md_profile": "lean"}']
     for i, raw in enumerate(cases):
         h = tmp_path / f"h{i}"
         h.mkdir()
@@ -169,8 +170,9 @@ def test_tool_and_upgrade_flow_read_the_same_profile(tmp_path):
             (h / "config.json").write_text(raw, encoding="utf-8")
         assert template_render.recorded_claude_md_profile(str(h)) == flows_reader(str(h)), raw
     assert template_render.recorded_claude_md_profile("") == flows_reader("") == "full"
-    # Case-variant and padded values are not "lean": both readers must refuse them the same way.
+    # Case-variant and padded values are not "single-agent", and the retired working name "lean" is no
+    # alias for it: both readers must refuse them the same way.
     for i, raw in enumerate(cases):
-        if raw and ("Lean" in raw or "lean \"" in raw):
+        if raw and ("Single-agent" in raw or "single-agent \"" in raw or "lean" in raw):
             h = tmp_path / f"h{i}"
             assert template_render.recorded_claude_md_profile(str(h)) == flows_reader(str(h)) == "undetermined", raw

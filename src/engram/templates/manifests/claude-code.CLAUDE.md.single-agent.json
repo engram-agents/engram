@@ -1,19 +1,19 @@
 {
   "harness": "claude-code",
   "surface": "CLAUDE.md",
-  "profile": "lean",
+  "profile": "single-agent",
   "components": [
     { "id": "identity-opening", "anchor": "" },
-    { "id": "user-notes-verbatim-lean", "anchor": "" },
+    { "id": "user-notes-verbatim-single-agent", "anchor": "" },
     { "id": "authority-structure-intro", "anchor": "Authority Structure (style-invariant)" },
     { "id": "authority-structure-table-claude-code", "anchor": "Authority Structure (style-invariant)" },
     { "id": "authority-structure-close", "anchor": "Authority Structure (style-invariant)" },
     { "id": "trust-tier-pointer", "anchor": "External interactions" },
-    { "id": "model-identity-gate-lean", "anchor": "Model Identity Gate" },
+    { "id": "model-identity-gate-single-agent", "anchor": "Model Identity Gate" },
     { "id": "engram-write-discipline", "anchor": "ENGRAM Write Discipline" },
     { "id": "engram-read-discipline", "anchor": "ENGRAM Read Discipline" },
     { "id": "confidence-anchors", "anchor": "Confidence calibration anchors" },
-    { "id": "native-tools-ban-lean", "anchor": "Parallelization and Delegation" },
+    { "id": "native-tools-ban-single-agent", "anchor": "Parallelization and Delegation" },
     { "id": "engram-reference", "anchor": "ENGRAM Reference" }
   ]
 }
