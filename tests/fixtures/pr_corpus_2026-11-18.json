@@ -1,0 +1,420 @@
+{
+ "source": "the 40 most recent merged PRs on dev at 2026-11-18 ~17:40Z, changed-file lists as GitHub reported them",
+ "prs": [
+  {
+   "pr": 4897,
+   "files": [
+    "tests/test_forum_redirect_origin_1459.py"
+   ]
+  },
+  {
+   "pr": 4895,
+   "files": [
+    "src/engram/hooks/claude/engram-model-gate-pretool.py",
+    "src/engram/packaging/test-map.json",
+    "tests/test_model_gate_4596.py"
+   ]
+  },
+  {
+   "pr": 4890,
+   "files": [
+    "src/forum/deploy/README.md",
+    "src/forum/deploy/engram-forum-backup-alarm.service.template",
+    "src/forum/deploy/install-forum-service.sh",
+    "src/forum/tests/test_alarm_4886.py",
+    "src/forum/tests/test_backup_alarm_units.py",
+    "src/forum/tests/test_deploy_shape_3568.py",
+    "src/forum/tests/test_installer_modes_4499.py",
+    "src/forum/tests/test_restore_regen_868.py",
+    "tools/forum_backup.py",
+    "tools/test_forum_backup_alarm.py"
+   ]
+  },
+  {
+   "pr": 4885,
+   "files": [
+    "tests/test_retype_cites_widening_2243.py"
+   ]
+  },
+  {
+   "pr": 4879,
+   "files": [
+    "docs/CHANGELOG.md",
+    "src/engram/templates/components/engram-read-discipline.md",
+    "src/engram/templates/template.CLAUDE.md",
+    "tests/test_read_discipline_claims.py"
+   ]
+  },
+  {
+   "pr": 4876,
+   "files": [
+    "docs/CHANGELOG.md",
+    "src/engram/engram_core.py",
+    "src/engram/tools/backup_remote_repair.py",
+    "tests/test_backup_remote_repair_4205.py"
+   ]
+  },
+  {
+   "pr": 4872,
+   "files": [
+    "docs/CHANGELOG.md",
+    "src/engram/server.py",
+    "src/engram/templates/components/engram-read-discipline.md",
+    "src/engram/templates/template.CLAUDE.md",
+    "tests/test_read_discipline_claims.py"
+   ]
+  },
+  {
+   "pr": 4869,
+   "files": [
+    "src/engram/engramd_client.py",
+    "src/engram/hooks/claude/_engramd_owner_hook_io.py",
+    "src/engram/packaging/test-map.json",
+    "src/engram/tools/_embedding_repair_route.py",
+    "src/engram/tools/_owner_read.py",
+    "src/engram/tools/install_selfcheck.py",
+    "src/engram/tools/store_read.py",
+    "tests/test_engramd_client_darwin_refused_3707.py",
+    "tests/test_engramd_socket_path_limit_3696.py",
+    "tests/test_install_selfcheck_owner_read_4118.py",
+    "tests/test_owner_path_too_long_4868.py",
+    "tests/test_session_start_owner_read_3735.py",
+    "tests/test_store_read_2652_unit02.py"
+   ]
+  },
+  {
+   "pr": 4867,
+   "files": [
+    "docs/internal/2652-migration-ledger.md",
+    "src/build/packaging/tiers.json",
+    "src/engram/agents/claude/engram-person-node-fairy.md",
+    "src/engram/engramd_read_templates.json",
+    "src/engram/packaging/test-map.json",
+    "src/engram/skills/claude/engram-first-session/SKILL.md",
+    "src/engram/tools/store_read.py",
+    "tests/test_dream_safety_owner_read_3880.py",
+    "tests/test_engramd_batch_a_acceptance.py",
+    "tests/test_engramd_read_scan.py",
+    "tests/test_store_read_2652_unit02.py",
+    "tools/engramd_read_scan.config.json",
+    "tools/store_read.py"
+   ]
+  },
+  {
+   "pr": 4866,
+   "files": [
+    "tests/test_engramd_a6_layout_timeout_3755.py"
+   ]
+  },
+  {
+   "pr": 4863,
+   "files": [
+    "src/build/packaging/tiers.json",
+    "src/engram/engram_lifecycle.py",
+    "src/engram/engram_snapshot_backlog.py",
+    "src/engram/engram_snapshot_worker.py",
+    "src/engram/hooks/claude/engram-session-start-hook.py",
+    "src/engram/skills/claude/engram-nap/SKILL.md",
+    "src/engram/skills/claude/engram-sleep/SKILL.md",
+    "tests/test_nap_compact_backstop_4012.py",
+    "tests/test_snapshot_backlog_visibility_4843.py",
+    "tests/test_snapshot_commit_classification_4843.py",
+    "tools/engramd_a6_latency.py",
+    "tools/engramd_read_scan.config.json"
+   ]
+  },
+  {
+   "pr": 4862,
+   "files": [
+    "docs/internal/2652-migration-ledger.md",
+    "tests/test_2652_exclusive_maintenance_completeness_3882.py"
+   ]
+  },
+  {
+   "pr": 4861,
+   "files": [
+    ".github/workflows/pr-checks.yml",
+    "docs/internal/2652-migration-ledger.md",
+    "tests/test_2652_ledger_completeness.py",
+    "tools/check_2652_ledger.py"
+   ]
+  },
+  {
+   "pr": 4859,
+   "files": [
+    "tests/test_atomic_writer_modes_4013.py"
+   ]
+  },
+  {
+   "pr": 4858,
+   "files": [
+    "src/engram/tools/run_touched_tests.py",
+    "tests/test_run_touched_tests_selection_4358b.py"
+   ]
+  },
+  {
+   "pr": 4857,
+   "files": [
+    "tests/test_rotate_roster_format.py"
+   ]
+  },
+  {
+   "pr": 4856,
+   "files": [
+    "src/build/packaging/tiers.json",
+    "src/engram/tools/secret-env",
+    "src/engram/tools/secret-put",
+    "src/engram/tools/secrets_check.py",
+    "tests/test_secrets_tools_4842.py"
+   ]
+  },
+  {
+   "pr": 4855,
+   "files": [
+    "tests/test_rotate_roster_format.py",
+    "tools/rotate_roster_format.py"
+   ]
+  },
+  {
+   "pr": 4853,
+   "files": [
+    "src/engram/templates/components/infra-locations-claude-code.md",
+    "src/engram/templates/template.CLAUDE.md",
+    "tests/test_secrets_pointer_row_4842.py"
+   ]
+  },
+  {
+   "pr": 4851,
+   "files": [
+    "tests/test_rotate_roster_format.py",
+    "tools/rotate_roster_format.py"
+   ]
+  },
+  {
+   "pr": 4848,
+   "files": [
+    ".github/workflows/affected-tests.yml",
+    "docs/internal/PR-MERGE-POLICY.md",
+    "src/build/packaging/tiers.json",
+    "src/engram/tools/policy_guard_list.py",
+    "src/engram/tools/run_matrix.py",
+    "src/engram/tools/run_touched_tests.py",
+    "tests/test_affected_tests_workflow_base.py",
+    "tests/test_policy_guard_list_4487.py",
+    "tests/test_run_matrix.py",
+    "tests/test_run_touched_tests.py",
+    "tests/test_run_touched_tests_4358.py",
+    "tests/test_run_touched_tests_selection_4358b.py"
+   ]
+  },
+  {
+   "pr": 4845,
+   "files": [
+    "docs/CHANGELOG.md",
+    "docs/FORUM-SERVER.md",
+    "src/forum/README.md",
+    "src/forum/deploy/README.md",
+    "src/forum/deploy/engram-forum.service.template",
+    "src/forum/deploy/install-forum-service.sh",
+    "src/forum/server.py",
+    "src/forum/spec.md",
+    "src/forum/tests/auth_plumbing.py",
+    "src/forum/tests/test_auth_report_mode.py",
+    "src/forum/tests/test_backup_alarm_units.py",
+    "src/forum/tests/test_backup_health.py",
+    "src/forum/tests/test_deploy_shape_3568.py",
+    "src/forum/tests/test_forum_auth_1459_coverage.py",
+    "src/forum/tests/test_gate_service_identity_3283.py",
+    "src/forum/tests/test_github_integration_switch_3568.py",
+    "src/forum/tests/test_installer.py",
+    "src/forum/tests/test_installer_baton_gate.py",
+    "src/forum/tests/test_installer_modes_4499.py",
+    "src/forum/tests/test_modes_4499.py",
+    "src/forum/tests/test_verify_probe_env_3597.py",
+    "tests/test_set_forum_url_3557.py"
+   ]
+  },
+  {
+   "pr": 4844,
+   "files": [
+    "src/engram/engram_snapshot_worker.py",
+    "tests/conftest.py",
+    "tests/test_health_engine_checkpoint_wiring.py",
+    "tests/test_health_series_hook.py",
+    "tests/test_snapshot_worker.py",
+    "tests/test_snapshot_worker_orphan_4833.py",
+    "tests/test_snapshot_worker_teardown_4826.py"
+   ]
+  },
+  {
+   "pr": 4841,
+   "files": [
+    "tests/test_install_sh_4097.py",
+    "tests/test_never_clobber_contract.py"
+   ]
+  },
+  {
+   "pr": 4838,
+   "files": [
+    "tests/test_engram_pidfile_identity_3240.py",
+    "tests/test_pidfile_identity_alone_4834.py"
+   ]
+  },
+  {
+   "pr": 4837,
+   "files": [
+    "tests/test_bounded_sibling_lookups_3983.py"
+   ]
+  },
+  {
+   "pr": 4835,
+   "files": [
+    "docs/internal/2652-migration-ledger.md",
+    "docs/internal/4651-part-a-interface.md",
+    "src/build/packaging/tiers.json",
+    "src/engram/tools/_embedding_repair_route.py",
+    "src/engram/tools/_owner_read.py",
+    "tests/test_4651_a3_client_route.py",
+    "tests/test_4651_a3_owner_read_attrs.py",
+    "tests/test_4651_a_publish_primitive.py",
+    "tests/test_engramd_batch_a_acceptance.py"
+   ]
+  },
+  {
+   "pr": 4831,
+   "files": [
+    "tests/conftest.py",
+    "tests/test_health_engine_checkpoint_wiring.py",
+    "tests/test_snapshot_worker_teardown_4826.py"
+   ]
+  },
+  {
+   "pr": 4830,
+   "files": [
+    "docs/CHANGELOG.md",
+    "docs/internal/2652-migration-ledger.md",
+    "docs/internal/4651-part-a-interface.md",
+    "src/build/packaging/tiers.json",
+    "src/engram/engram_core.py",
+    "src/engram/engram_embedding_publish.py",
+    "src/engram/engram_recall_summaries.py",
+    "src/engram/engramd_owner.py",
+    "tests/test_4651_a2_owner_op.py",
+    "tests/test_4651_a_publish_primitive.py",
+    "tests/test_engramd_chain_3740.py",
+    "tests/test_engramd_fill_embeddings_3879.py",
+    "tests/test_engramd_moment_cursor_3856.py",
+    "tests/test_engramd_use_reward_3822.py",
+    "tools/engramd_a6_latency.py"
+   ]
+  },
+  {
+   "pr": 4829,
+   "files": [
+    "docs/internal/PR-MERGE-POLICY.md"
+   ]
+  },
+  {
+   "pr": 4825,
+   "files": [
+    "docs/CHANGELOG.md",
+    "src/engram/engram_core.py",
+    "tests/test_cascade_walk_iterative_4823.py",
+    "tests/test_retract_backfill_4727.py"
+   ]
+  },
+  {
+   "pr": 4824,
+   "files": [
+    "src/build/packaging/tiers.json",
+    "src/engram/packaging/test-map.json",
+    "tests/test_rotate_roster_format.py",
+    "tools/rotate_roster_format.py"
+   ]
+  },
+  {
+   "pr": 4822,
+   "files": [
+    ".github/workflows/name-leak-gate.yml",
+    ".github/workflows/pr-checks.yml",
+    "docs/internal/name-leak-gate-trusted-run.md",
+    "src/engram/tools/scan-leaks.py",
+    "tests/test_name_leak_gate.py",
+    "tests/test_name_leak_sweep_workflow.py",
+    "tests/test_name_leak_warn.py",
+    "tests/test_scan_leaks.py",
+    "tools/name_leak_warn.py"
+   ]
+  },
+  {
+   "pr": 4820,
+   "files": [
+    "docs/CHANGELOG.md",
+    "src/engram/engram_core.py",
+    "src/engram/engram_lifecycle.py",
+    "tests/test_cascade_resolved_kind_4075.py",
+    "tests/test_retract_backfill_4727.py"
+   ]
+  },
+  {
+   "pr": 4816,
+   "files": [
+    ".github/workflows/name-leak-gate.yml",
+    ".github/workflows/name-leak-sweep.yml",
+    "docs/internal/name-leak-gate-trusted-run.md",
+    "src/build/packaging/tiers.json",
+    "src/engram/tools/release_gates.py",
+    "src/engram/tools/scan-leaks.py",
+    "tests/test_name_leak_gate.py",
+    "tests/test_name_leak_sweep_workflow.py",
+    "tests/test_name_leak_warn.py",
+    "tests/test_release_gates.py",
+    "tests/test_scan_leaks.py",
+    "tools/name_leak_warn.py"
+   ]
+  },
+  {
+   "pr": 4815,
+   "files": [
+    "docs/CHANGELOG.md",
+    "docs/handbook/01-substrate.md",
+    "src/engram/engram_core.py",
+    "src/engram/engram_revision.py",
+    "src/engram/server.py",
+    "tests/test_cascade_dag_check_audit.py",
+    "tests/test_cascade_derived_sets.py",
+    "tests/test_cascade_walk_from_root_4727.py",
+    "tests/test_edge_liveness_ssot_3542.py"
+   ]
+  },
+  {
+   "pr": 4814,
+   "files": [
+    "CLAUDE.md",
+    "docs/internal/PR-MERGE-POLICY.md"
+   ]
+  },
+  {
+   "pr": 4813,
+   "files": [
+    "docs/CHANGELOG.md",
+    "src/engram/engram_query.py",
+    "tests/test_query_pattern_predicted_event_4793.py",
+    "tests/test_query_tier1_predicted_event_2328.py"
+   ]
+  },
+  {
+   "pr": 4811,
+   "files": [
+    ".github/CODEOWNERS",
+    ".github/workflows/pr-checks.yml"
+   ]
+  },
+  {
+   "pr": 4808,
+   "files": [
+    "docs/internal/2652-migration-ledger.md"
+   ]
+  }
+ ]
+}

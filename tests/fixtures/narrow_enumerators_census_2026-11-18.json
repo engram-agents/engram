@@ -1,0 +1,156 @@
+{
+ "census": "2026-11-18",
+ "dev_commit": "9174f642",
+ "note": "narrow-directory enumerators: each lists the files of these repo directories and asserts something about each; selected by no changed file in them before the change",
+ "tests": {
+  "tests/test_2652_exclusive_maintenance_completeness_3882.py": {
+   "dirs": [
+    "src/engram/tools"
+   ],
+   "redden_by": "new tools/*.py that opens the live store directly, absent from the migration ledger, not on the known-direct list, and taking no maintenance lock"
+  },
+  "tests/test_agent_specs_no_user_name_placeholder.py": {
+   "dirs": [
+    "src/engram/agents"
+   ],
+   "redden_by": "a new agent spec file containing an unsubstituted {{UPPER_CASE}} placeholder"
+  },
+  "tests/test_codeowners_gate_scope.py": {
+   "dirs": [
+    ".github/workflows"
+   ],
+   "redden_by": "a new tracked .github/workflows file that CODEOWNERS does not give an owner"
+  },
+  "tests/test_default_profile_wording_4442.py": {
+   "dirs": [
+    "deploy/autostart",
+    "src/engram/output-styles/claude",
+    "src/engram/skills/claude",
+    "src/engram/templates/components"
+   ],
+   "redden_by": "new skill/style with a banned pre-authorization phrase, or a skill/component gating on the sub-agent grant without 'ask each time'"
+  },
+  "tests/test_docs_retired_axis_4255s5.py": {
+   "dirs": [
+    "docs/handbook"
+   ],
+   "redden_by": "a new docs/handbook/*.md containing multi-agent, single-agent or +MA (not in ALLOWED)"
+  },
+  "tests/test_dream_master_tools_list_4323.py": {
+   "dirs": [
+    "src/engram/agents"
+   ],
+   "redden_by": "new agent spec .md whose frontmatter tools: line contains '*'"
+  },
+  "tests/test_engramd_batch_a_acceptance.py": {
+   "dirs": [
+    "src/engram/hooks",
+    "src/engram/tools"
+   ],
+   "redden_by": "a new tool or hook declaring a *_via_owner flag (FLAG_KEY=, flag_key=, flag_on()) with no table row"
+  },
+  "tests/test_first_session_forum_hint_3563.py": {
+   "dirs": [
+    "src/engram/hooks",
+    "src/engram/tools"
+   ],
+   "redden_by": "new hook or tool file (.py/.sh/no suffix) mentioning forum-url.hint"
+  },
+  "tests/test_hook_injection_bounds.py": {
+   "dirs": [
+    "src/engram/hooks/claude"
+   ],
+   "redden_by": "new hook .py with a literal \"additionalContext\": key and no emit_context( call (not in _EXCLUDED)"
+  },
+  "tests/test_hooks_sqlite_regular_3628s2d.py": {
+   "dirs": [
+    "src/engram/hooks/claude"
+   ],
+   "redden_by": "a new hook .py with a literal sqlite3.connect('file:...mode=ro') call"
+  },
+  "tests/test_loop_marker_set_4025.py": {
+   "dirs": [
+    "deploy/autostart",
+    "src/engram/skills"
+   ],
+   "redden_by": "new skill/autostart file with a fenced block replacing loop-mode.json via new file (jq/mv), or an ALLOW entry going stale"
+  },
+  "tests/test_model_gate_4596.py": {
+   "dirs": [
+    "src/engram/agents/claude"
+   ],
+   "redden_by": "new agent spec .md that names an ENGRAM write tool (or has no tools: line) and also pins model:"
+  },
+  "tests/test_name_leak_warn.py": {
+   "dirs": [
+    ".github/workflows"
+   ],
+   "redden_by": "new workflow yaml binding NAME_LEAK_ROSTER at workflow/job/container/service env or step with:"
+  },
+  "tests/test_no_mcp_schema_load_time_claim.py": {
+   "dirs": [
+    "src/engram/templates"
+   ],
+   "redden_by": "a new file anywhere under src/engram/templates containing the phrase 'loaded once per session'"
+  },
+  "tests/test_probe_mods_recall.py": {
+   "dirs": [
+    "tools/probes/mods-recall/hooks"
+   ],
+   "redden_by": "new hooks/*.ts (not *.test.ts) containing a _REAL_ASYNC_TOKENS token (await/async/Promise etc.) outside comments"
+  },
+  "tests/test_spec_python_interpreter_4313.py": {
+   "dirs": [
+    "src/engram/agents",
+    "src/engram/skills"
+   ],
+   "redden_by": "new skill/agent .md with a command line starting a repo tool with bare python3 or using a bare $CLAUDE_PLUGIN_ROOT as a path root, not allow-listed"
+  },
+  "tests/test_stray_master_ref_check.py": {
+   "dirs": [
+    ".github/workflows",
+    "src/engram/tools",
+    "src/forum/deploy"
+   ],
+   "redden_by": "new workflow yml/yaml, or .sh under src/engram/tools or src/forum/deploy, with a load-bearing 'master' branch ref"
+  },
+  "tests/test_template_components.py": {
+   "dirs": [
+    "src/engram/templates"
+   ],
+   "redden_by": "a new templates/template.* file with the '## ENGRAM Write Discipline' heading but a missing, duplicated or misordered write-more bullet"
+  },
+  "tests/test_viz_d3_local_4447.py": {
+   "dirs": [
+    "src/engram/viz/static",
+    "src/engram/viz/templates"
+   ],
+   "redden_by": "a new .html in viz/templates or viz/static with a remote http(s)/protocol-relative script or link lacking an integrity attribute"
+  },
+  "tests/test_viz_quickfix_2257_2566_2770.py": {
+   "dirs": [
+    "src/engram/viz/static",
+    "src/engram/viz/templates"
+   ],
+   "redden_by": "new .css/.html/.js in viz static or templates containing a .nav-agent-label / .nav-agent-select / #nav-agent-wrapper rule"
+  },
+  "tests/test_viz_server_select_control.py": {
+   "dirs": [
+    "src/engram/viz"
+   ],
+   "redden_by": "new .css/.html under viz containing a '.nav {' rule opener (a page-local .nav rule)"
+  },
+  "tests/test_viz_sqlite_ro.py": {
+   "dirs": [
+    "src/engram/viz"
+   ],
+   "redden_by": "a new .py under viz/ calling sqlite3.connect(..., uri=True) (not uri=False)"
+  },
+  "tests/test_viz_url_for.py": {
+   "dirs": [
+    "src/engram/viz/static"
+   ],
+   "redden_by": "new static file with an extension missing from _CONTENT_TYPES (KeyError), or one served with the wrong headers or body"
+  }
+ }
+}

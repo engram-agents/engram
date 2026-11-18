@@ -8,8 +8,7 @@ skill-doc shell rules here rather than in a second file, so the population gate
 does not fork into half-gates.
 """
 
-import fnmatch
-import glob
+import importlib.util
 import json
 import os
 import re
@@ -432,129 +431,75 @@ def test_non_invocations_are_not_counted_as_pgrep_invocations(line: str) -> None
 #
 # Every assertion in this file is inert if tools/run_touched_tests.py never
 # picks the file for a skill-doc change. Layer-2 selection through
-# src/engram/packaging/test-map.json is FIRST-MATCH-WINS —
-# `_resolve_convention_map()` `break`s on the first entry whose
-# `path_prefix_or_glob` matches the changed path — so a narrow
+# src/engram/packaging/test-map.json used to be FIRST-MATCH-WINS — a narrow
 # `skills/claude/<name>/` entry placed ABOVE the broad `skills/claude/` entry
-# SHADOWS it and silently drops every gate the broad entry carries. The narrow
-# entry's own test_globs run and go green; nothing anywhere reports that the
-# broad entry was skipped. That is the same shape of false CLEAN as an omitted
-# command position, one layer out in the build system.
+# SHADOWED it and silently dropped every gate the broad entry carries, with
+# the narrow entry's own tests green and nothing reporting the omission. The
+# runner now takes the UNION of every matching entry, so a narrow entry can no
+# longer drop a gate the broad one carries.
 #
-# Both #3070 review rounds flagged that nothing asserted this. It is asserted
-# CORPUS-DRIVEN rather than as a count of entries: the invariant is "whichever
-# entry WINS for a skill doc runs this gate", which happens to be satisfied by
-# two entries today (one for engram-loop/SKILL.md, one for the other 28) and
-# must still be satisfied by a third narrow entry added tomorrow. A hardcoded
-# `== 2` would pass for exactly the change that breaks it.
+# Both #3070 review rounds flagged that nothing asserted selection. It is
+# still asserted CORPUS-DRIVEN rather than as a count of entries: the
+# invariant is "whatever the runner selects for a skill doc runs this gate",
+# and it is checked by calling the runner's own `_resolve_convention_map`
+# (loaded by file path, because tools/ is not importable as a package from the
+# suite) rather than by re-implementing the matching here, so a future change
+# to the selector shows up as this test failing, not as a mirror that
+# silently agrees with itself. A hardcoded count of entries would pass for
+# exactly the change that breaks it.
 TEST_MAP_JSON = REPO_ROOT / "src" / "engram" / "packaging" / "test-map.json"
+RUNNER_PY = REPO_ROOT / "src" / "engram" / "tools" / "run_touched_tests.py"
 THIS_GATE = "tests/test_skill_docs_shell_hygiene.py"
 
 
-def _shipped_path_candidates(changed_file: str) -> tuple[str, ...]:
-    """Mirror of the same-named helper in tools/run_touched_tests.py.
-
-    Map entries are written in the manifest's shipped-path convention
-    (`skills/claude/...`), while a changed file is reported at its real path
-    (`src/engram/skills/claude/...`), so the selector matches against the
-    literal path AND its de-prefixed form. Mirrored rather than imported
-    because tools/ is not importable as a package from the suite; the mirror is
-    deliberately a transcription, so a future divergence in the selector shows
-    up as this test asserting an invariant the selector no longer has, rather
-    than as a subtly different matching rule invented here.
-    """
-    candidates = [changed_file]
-    for prefix in ("src/engram/", "src/build/"):
-        if changed_file.startswith(prefix):
-            candidates.append(changed_file[len(prefix) :])
-    if changed_file.startswith("src/build/"):
-        candidates.append("tools/" + changed_file[len("src/build/") :])
-    return tuple(candidates)
+def _load_runner():
+    spec = importlib.util.spec_from_file_location("rtt_for_skill_docs_gate", str(RUNNER_PY))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def _winning_map_entry(changed_file: str, mappings: list[dict]) -> dict | None:
-    """The one entry the selector would use for *changed_file*: first, then stop.
-
-    None when no entry matches at all. That case does NOT drop the gate — the
-    selector's `unresolved` branch falls through to the full suite (`pytest
-    tests/`), which includes this file — so it is not treated as a violation
-    below; it simply contributes no winning entry to check.
-    """
-    candidates = _shipped_path_candidates(changed_file)
-    for entry in mappings:
-        pattern = entry.get("path_prefix_or_glob", "")
-        if any(
-            c.startswith(pattern) or fnmatch.fnmatch(c, pattern) for c in candidates
-        ):
-            return entry
-    return None
-
-
-def _entry_runs_this_gate(entry: dict) -> bool:
-    """Whether *entry*, if it wins, actually runs this file.
-
-    Two ways it can, both mirroring the selector: one of its `test_globs`
-    expands onto this path (the selector globs them relative to the repo root,
-    so a literal path and any glob covering it are the same thing to it), or it
-    sets `full_suite_fallback`, which short-circuits to `pytest tests/` and
-    therefore includes this file. Anything else drops the gate.
-    """
-    if entry.get("full_suite_fallback", False):
-        return True
-    for tglob in entry.get("test_globs", []):
-        for match in glob.glob(str(REPO_ROOT / tglob)):
-            if str(Path(match).relative_to(REPO_ROOT)) == THIS_GATE:
-                return True
-    return False
-
-
-def test_every_winning_test_map_entry_for_a_skill_doc_runs_this_gate() -> None:
-    """#3070 — first-match-wins makes a narrow map entry able to disable this
-    whole file for the doc it covers, silently and with the suite green."""
-    mappings = json.loads(TEST_MAP_JSON.read_text(encoding="utf-8")).get(
-        "mappings", []
-    )
-    assert mappings, f"no mappings found in {TEST_MAP_JSON}"
+def test_the_runner_selects_this_gate_for_every_skill_doc() -> None:
+    """#3070 — whatever the map's rows are, the runner's selection for a skill
+    doc must run this whole file, either by naming it or by requesting the full
+    suite (which includes it)."""
+    runner = _load_runner()
+    test_map = json.loads(TEST_MAP_JSON.read_text(encoding="utf-8"))
+    assert test_map.get("mappings"), f"no mappings found in {TEST_MAP_JSON}"
 
     docs = _skill_docs()
     assert docs, f"no skill docs found under {SKILLS_ROOT}"
 
-    winners: dict[str, list[str]] = {}
-    offenders: dict[str, list[str]] = {}
+    matched = 0
+    offenders: list[str] = []
     for doc in docs:
-        entry = _winning_map_entry(_rel(doc), mappings)
-        if entry is None:
-            continue  # no map entry → full-suite fallback, see _winning_map_entry
-        pattern = entry.get("path_prefix_or_glob", "")
-        winners.setdefault(pattern, []).append(_rel(doc))
-        if not _entry_runs_this_gate(entry):
-            offenders.setdefault(pattern, []).append(_rel(doc))
+        selected, full = runner._resolve_convention_map(_rel(doc), test_map, str(REPO_ROOT))
+        if not selected and not full:
+            # No row matches at all: the selector's `unresolved` branch falls
+            # through to the full suite (`pytest tests/`), which includes this
+            # file, so it is not a violation; it just contributes nothing here.
+            continue
+        matched += 1
+        if not full and THIS_GATE not in selected:
+            offenders.append(_rel(doc))
 
     # Vacuity guard, for the same reason as
     # test_skill_docs_are_discoverable_and_invoke_pgrep: if the shipped-path
     # convention changes and nothing matches any more, the loop above would
     # find no offenders and pass while asserting nothing at all.
-    assert winners, (
+    assert matched, (
         "no test-map entry matches ANY skill doc, so this test would pass "
         "vacuously — either the shipped-path convention in test-map.json or "
         "the selector's matching rule in tools/run_touched_tests.py has moved "
-        "away from what _shipped_path_candidates above mirrors (#3070)"
+        "(#3070)"
     )
 
     assert not offenders, (
-        "test-map.json entry wins for a skill doc but does not run "
-        f"{THIS_GATE} (#3070):\n"
-        + "\n".join(
-            f"    {pattern}  ->  {len(docs_for)} doc(s), e.g. {docs_for[0]}"
-            for pattern, docs_for in sorted(offenders.items())
-        )
-        + "\n  Selection in tools/run_touched_tests.py is FIRST-MATCH-WINS: it "
-        "stops at the first matching entry, so a narrow entry SHADOWS the "
-        "broad `skills/claude/` one for the paths it covers and every gate "
-        "listed only on the broad entry never runs for those paths — the suite "
-        "stays green and nothing reports the omission. Add "
-        f"{THIS_GATE} to the offending entry's test_globs (the broad entry's "
-        "note says the same), or move the narrow entry below the broad one."
+        f"the runner's selection for {len(offenders)} skill doc(s) does not run "
+        f"{THIS_GATE} (#3070), e.g. {offenders[0]}.\n"
+        "  Selection in tools/run_touched_tests.py is the UNION of every "
+        "matching test-map row, so the broad `skills/claude/` row should carry "
+        f"this gate for every skill doc: list {THIS_GATE} in its test_globs."
     )
 
 
