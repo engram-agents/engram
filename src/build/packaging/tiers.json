@@ -17,14 +17,14 @@
       },
       {
         "file": "tools/release_gates.py",
-        "line": 795,
+        "line": 850,
         "reason": "Release-scorecard gate-runner dispatch table (local lambdas closing over run_G2/etc.); this file contains zero emit()/emit_if_initialized() calls and is not on any site's backward-walk path.",
         "zero_emit_file": true
       },
       {
         "file": "tools/release_gates.py",
-        "line": 797,
-        "reason": "Same dispatch table as :795 (list-comprehension form); same exclusion rationale.",
+        "line": 852,
+        "reason": "Same dispatch table as :829 (list-comprehension form); same exclusion rationale.",
         "zero_emit_file": true
       },
       {
@@ -65,11 +65,19 @@
       "tier": "essential"
     },
     {
+      "path": "engram_snapshot_backlog.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_core.py",
       "tier": "essential"
     },
     {
       "path": "engram_focus.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_embedding_publish.py",
       "tier": "essential"
     },
     {
@@ -270,6 +278,11 @@
       "path": "engram_home_perms.py",
       "tier": "essential",
       "note": "engram-alpha#4445: tighten_data_home(), the owner-only permission rule for the ENGRAM data home (0700 dirs, no group/other bits on files, ACL-aware, never follows symlinks). Stdlib-only. Essential because bootstrap.py and the SessionStart hook run it; both degrade to 'not tightened' if the module is missing, but a privacy control that silently ships absent is worse than one that is loud, so it is not Convenience."
+    },
+    {
+      "path": "engram_file_guard.py",
+      "tier": "essential",
+      "note": "The one place that decides, backs up and writes a protected file during setup (plan / refusal / apply; stamped backup, exclusive copy, atomic write). Stdlib-only. Essential because bootstrap.py imports it at module level (a hard dependency): without it setup cannot run, and a copy that silently went missing must not fall back to writing without the guard."
     },
     {
       "path": "engram_home_registry.py",
@@ -524,7 +537,19 @@
       "tier": "essential"
     },
     {
+      "path": "tools/_embedding_repair_route.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/archive_transcripts.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/install_selfcheck.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/store_read.py",
       "tier": "essential"
     },
     {
@@ -575,6 +600,11 @@
       "note": "engram-alpha#4050 S2: single-purpose scorer for the team's pre-registered blind study (hash-first, planted controls first); a team study tool, not a user tool. Dev tier, and kept out of the public release by release-minus-set.txt. Reads local sheets, keys and returns that are never committed."
     },
     {
+      "path": "tools/triage_report.py",
+      "tier": "dev",
+      "note": "Read-only triage report over a repository's open issues (outside reports, security line, weekly label sweeps, rule 2B); it asserts that what it collected equals what the search said, and never writes, labels, comments or closes. A team tool, not a user tool."
+    },
+    {
       "path": "tools/weakest_load_bearing.py",
       "tier": "convenience"
     },
@@ -584,6 +614,10 @@
     },
     {
       "path": "tools/check_stale_processes.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/claude_config_diff.py",
       "tier": "convenience"
     },
     {
@@ -709,6 +743,18 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/secret-env",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/secret-put",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/secrets_check.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/forum-mention-monitor.sh",
       "tier": "convenience"
     },
@@ -772,6 +818,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/write-default-config.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/_status_derive.py",
       "tier": "convenience"
     },
@@ -818,6 +868,12 @@
     {
       "path": "tools/scan-leaks.py",
       "tier": "dev"
+    },
+    {
+      "path": "tools/rotate_roster_format.py",
+      "tier": "dev",
+      "source": "tools/rotate_roster_format.py",
+      "note": "one-time format-1 -> format-2 roster migration helper the roster holder runs on their own machine; ENGRAM-development/operations tooling, the same tier as its sibling tools/scan-leaks.py (the scanner whose parser it validates against). Not an essential/convenience user surface. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/coverage-diff.sh."
     },
     {
       "path": "tools/os-harness-check.py",
@@ -979,6 +1035,10 @@
     },
     {
       "path": "tools/run_touched_tests.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/policy_guard_list.py",
       "tier": "dev"
     },
     {

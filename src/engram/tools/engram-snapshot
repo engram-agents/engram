@@ -1247,7 +1247,7 @@ def _forum_read_rendered(thread_id: int, config: dict, agent_name: str) -> str:
 
     # Capture _render_thread_human's stdout into a string. We call _api_get +
     # _render_thread_human directly rather than forum.py's cmd_read ON PURPOSE:
-    # cmd_read posts a read-watermark (advances the forum read cursor), and a
+    # cmd_read posts a server-side read watermark (marks the thread read), and a
     # snapshotter must NOT mutate read state. If forum.py is ever refactored so
     # the watermark moves into the render path, this invariant breaks — keep the
     # two calls split.

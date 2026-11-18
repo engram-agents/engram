@@ -1606,8 +1606,9 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
             _configure_paths(sandbox_path)
             _SANDBOX_ACTIVE = True
 
-            # Write default config
-            if not CONFIG_PATH.exists():
+            # Write default config -- under the same rule as _ensure_data_dir (#4705): not into a
+            # data dir that already holds a knowledge.db (C5); the sandbox keeps its own literal.
+            if not CONFIG_PATH.exists() and _may_write_default_config():
                 _config_io.write_config_json(CONFIG_PATH, {
                     "trust_pool": [],
                     "confidence_map": CONFIDENCE_MAP,
@@ -2249,13 +2250,14 @@ PROVENANCE_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c
 _PROVENANCE_RELATIONS_SORTED = sorted(PROVENANCE_RELATIONS)
 _PROVENANCE_RELATION_PLACEHOLDERS = ",".join("?" * len(_PROVENANCE_RELATIONS_SORTED))
 
-# Same pattern, for the upstream (premise-direction) cascade walk used by
-# _walk_cascade_upstream / _trace_observation_leaves below. engram_revision.py
-# has its own copy (`_CASCADE_RELATIONS_SORTED`) for the downstream taint
-# walker — this is engram_core's own derivation of the same upstream
-# constant, not an import of revision's, since core has no dependency on
-# revision (#2298, superseding #2255's "leave enumerated" doctrine for this
-# specific walk — see _walk_cascade_upstream's docstring).
+# Same pattern, for the cascade walks in this module: the upstream
+# (premise-direction) walk used by _walk_cascade_upstream /
+# _trace_observation_leaves, and since #4727 the downstream taint walk too
+# (_walk_cascade_downstream / _walk_cascade_from_root, promoted from
+# engram_revision). engram_revision.py keeps its own copy of this constant for
+# its remaining walks (_cascade_reaches); core has no dependency on revision
+# (#2298, superseding #2255's "leave enumerated" doctrine for this specific
+# walk — see _walk_cascade_upstream's docstring).
 _CASCADE_RELATIONS_SORTED = sorted(CASCADE_RELATIONS)
 _CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
 
@@ -3412,6 +3414,8 @@ ENGRAM_GITIGNORE_PATTERNS = [
     "*.bak",
     "*.bak.*",
     "config.json.bak*",
+    # #1989: guarded-writer backups (and the .partial-* temp a killed copy leaves).
+    "config.json.engram-backup.*",
     "*.backfill-snapshot-*",
     "*.log",
     "marketplace/",
@@ -3421,6 +3425,7 @@ ENGRAM_GITIGNORE_PATTERNS = [
     "db-backup/",
     "claude-projects-archive/",
     "session-logs-archive/",
+    "transcript-archive/",
     "session_log.md",
     # #4205: key material and dated backup copies must never ride into the off-disk
     # remote (a tracked secrets/ dir and two 157 MB knowledge.db.bak-<date> blobs
@@ -3432,6 +3437,9 @@ ENGRAM_GITIGNORE_PATTERNS = [
     # refresh preserves only `!`-prefixed lines, so a hand-added line is dropped.
     "forum-token",
     "*.bak-*",
+    # #4628: the installer helper keeps a 0600 copy of the user's Claude settings.json
+    # here before a marketplace add; it can hold tokens and must never be staged.
+    "install-backups/",
     # #4208: hand-made binary copies (backups/, dated knowledge.db.<suffix>) and the
     # rotating rollback copies the backup tool writes must never be staged.
     "backups/",
@@ -3453,7 +3461,7 @@ _TRACKED_BINARY_PREFIXES = ("backups/", "db-backup/")
 # and engram_stats (engram_diagnose) both import them, so the two cannot drift.
 BACKUP_ARCHIVE_RE = re.compile(r"^knowledge-(\d{4}-\d{2}-\d{2})(-\d+)?\.sql$")
 BACKUP_BINARY_RE = re.compile(r"^knowledge-\d{4}-\d{2}-\d{2}T\d{6}Z\.db$")
-_TRACKED_BINARY_GLOBS = ("*.db.*", "*.bak-*")
+_TRACKED_BINARY_GLOBS = ("*.db.*", "*.bak-*", "config.json.engram-backup.*")
 
 
 def _tracked_binary_paths(engram_home: "Path") -> list:
@@ -3521,6 +3529,10 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
       session-logs-archive/ — same class of local archive as claude-projects-archive/
           (Lei, 2026-08-15): a rotation of session-log snapshots kept for local
           reference, not a thing a full-history git backup should carry.
+      transcript-archive/ — the compressed daily transcript archive (#4647 part 2):
+          raw chat transcripts, which stay on the machine and never ride into the
+          off-disk remote (#1098 item 2). Kept forever and append-only, so a git
+          history of it would store every byte again for no gain.
       session_log.md — strictly append-only (verified monotonic size across history:
           8.11 MB on 2026-06-02 to 9.75 MB on 2026-08-15). Committing every version of
           an append-only file stores the same information once per commit; the single
@@ -3727,62 +3739,87 @@ def _untrack_gitignored_paths(data_dir: "Path", patterns: list) -> list:
     return removed
 
 
+def default_config_dict() -> dict:
+    """The one default ``config.json`` a NEW seat gets.  Shared by ``_ensure_data_dir`` and the
+    human-invoked new-seat command (tools/write-default-config.py) so the two writers cannot drift
+    (#4705 C6).  The sandbox's own minimal literal (engram_sandbox) is the deliberate exception."""
+    return {
+        # Schema v2 (2026-05-05): adds cadence block. Migration from
+        # v1 → v2 is in tools/migration/migrate_config_v2.py for existing installs.
+        "schema_version": 2,
+        # Empty by default — users set their own trusted sources via the
+        # config tab (#1228); source-based confidence calibration is
+        # future-work (#1230).
+        "trust_pool": [],
+        "confidence_map": CONFIDENCE_MAP,
+        "predictive_confidence_cap": PREDICTIVE_CONFIDENCE_CAP,
+        "chain_decay": 0.95,
+        "corroboration_decay": 0.98,
+        "resolution_confidence_threshold": DEFAULT_RESOLUTION_THRESHOLD,
+        "memory": {
+            "decay_base": 1.014,
+            "current_turn": 0,
+            "tier2_max_nodes": 1000,
+        },
+        "embedding": {
+            "model": DEFAULT_EMBEDDING_MODEL,
+            "enabled": True,
+        },
+        "cadence": {
+            # Drowsiness meter + in-session auto-sleep scheduler tunables.
+            # drowsiness_caution_pct / drowsiness_urgent_pct trigger
+            # context_tracker warnings as the session fills.
+            # auto_sleep_enabled / auto_sleep_time are consumed by the
+            # SessionStart hook to register a nightly in-session CronCreate
+            # that fires /engram-sleep at the configured time.
+            # Changes take effect next session (restart_required).
+            "drowsiness_caution_pct": 80,
+            "drowsiness_urgent_pct": 90,
+            "auto_sleep_enabled": False,
+            "auto_sleep_time": "03:00",
+        },
+        # Standpoint v3 null=self (D1 §2): the install's OWN training lineage
+        # (provider:family, e.g. "anthropic:opus"). Read by _self_lineage()
+        # so an unmarked observation counts as the filer's own lineage, which
+        # is what makes the standpoint/F-S advisory fire on own-unmarked
+        # derivations. Default "" = feature ships DARK (safe degradation —
+        # gate stays closed, same as pre-feature); the first-session skill
+        # prompts the user to set it. NOT auto-detected — the agent declares it.
+        "self_lineage": "",
+        # Fairy delegation policies — consumed by SessionStart hook per-decision.
+        # Three modes per policy: "explicit", "auto", "always".
+        # "auto" uses the named judgement skill; "explicit" only spawns on
+        # direct user request; "always" unconditionally delegates to fairy.
+        # Changes take effect immediately (read per-decision, restart_required=False).
+        "coder_fairy_policy": "auto",
+        "reviewer_fairy_policy": "auto",
+    }
+
+
+def _bootstrap_mode() -> bool:
+    """True when the DB guards are bypassed: ENGRAM_BOOTSTRAP=1 (bootstrap.py, first-session re-run)
+    or ENGRAM_NO_DB_GUARDS=1 (test mode).  The one definition ``_get_db`` and the config write rule share."""
+    return (
+        os.environ.get("ENGRAM_BOOTSTRAP") == "1"
+        or os.environ.get("ENGRAM_NO_DB_GUARDS") == "1"
+    )
+
+
+def _may_write_default_config() -> bool:
+    """#4705: the default config is written ONLY when knowledge.db does not exist (a new seat) or in
+    bootstrap mode.  With a database present and config.json lost, writing a plausible default would
+    blank ``self_lineage`` (the model-family gate goes dormant, silently) and restart the turn counter."""
+    return _bootstrap_mode() or not DB_PATH.exists()
+
+
 def _ensure_data_dir():
-    """Create data directory and config file if needed. Git is handled separately."""
+    """Create data directory and config file if needed. Git is handled separately.
+
+    The default config is written only under ``_may_write_default_config`` (#4705); a lost config.json
+    beside an existing knowledge.db is refused by ``_get_db``, never regenerated here."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not CONFIG_PATH.exists():
-        default_config = {
-            # Schema v2 (2026-05-05): adds cadence block. Migration from
-            # v1 → v2 is in tools/migration/migrate_config_v2.py for existing installs.
-            "schema_version": 2,
-            # Empty by default — users set their own trusted sources via the
-            # config tab (#1228); source-based confidence calibration is
-            # future-work (#1230).
-            "trust_pool": [],
-            "confidence_map": CONFIDENCE_MAP,
-            "predictive_confidence_cap": PREDICTIVE_CONFIDENCE_CAP,
-            "chain_decay": 0.95,
-            "corroboration_decay": 0.98,
-            "resolution_confidence_threshold": DEFAULT_RESOLUTION_THRESHOLD,
-            "memory": {
-                "decay_base": 1.014,
-                "current_turn": 0,
-                "tier2_max_nodes": 1000,
-            },
-            "embedding": {
-                "model": DEFAULT_EMBEDDING_MODEL,
-                "enabled": True,
-            },
-            "cadence": {
-                # Drowsiness meter + in-session auto-sleep scheduler tunables.
-                # drowsiness_caution_pct / drowsiness_urgent_pct trigger
-                # context_tracker warnings as the session fills.
-                # auto_sleep_enabled / auto_sleep_time are consumed by the
-                # SessionStart hook to register a nightly in-session CronCreate
-                # that fires /engram-sleep at the configured time.
-                # Changes take effect next session (restart_required).
-                "drowsiness_caution_pct": 80,
-                "drowsiness_urgent_pct": 90,
-                "auto_sleep_enabled": False,
-                "auto_sleep_time": "03:00",
-            },
-            # Standpoint v3 null=self (D1 §2): the install's OWN training lineage
-            # (provider:family, e.g. "anthropic:opus"). Read by _self_lineage()
-            # so an unmarked observation counts as the filer's own lineage, which
-            # is what makes the standpoint/F-S advisory fire on own-unmarked
-            # derivations. Default "" = feature ships DARK (safe degradation —
-            # gate stays closed, same as pre-feature); the first-session skill
-            # prompts the user to set it. NOT auto-detected — the agent declares it.
-            "self_lineage": "",
-            # Fairy delegation policies — consumed by SessionStart hook per-decision.
-            # Three modes per policy: "explicit", "auto", "always".
-            # "auto" uses the named judgement skill; "explicit" only spawns on
-            # direct user request; "always" unconditionally delegates to fairy.
-            # Changes take effect immediately (read per-decision, restart_required=False).
-            "coder_fairy_policy": "auto",
-            "reviewer_fairy_policy": "auto",
-        }
-        _config_io.write_config_json(CONFIG_PATH, default_config)
+    if not CONFIG_PATH.exists() and _may_write_default_config():
+        _config_io.write_config_json(CONFIG_PATH, default_config_dict())
 
 
 VALID_SOURCE_TYPES = {"document", "conversation", "file", "web_page"}
@@ -4201,6 +4238,10 @@ def _db_missing_message() -> str:
     )
 
 
+# Placeholders, never a ready-to-run path (#4705 R2-4c; same reason C10 rejects a pre-filled cp -p).
+_MV_TEMPLATE = "mv <path to knowledge.db> <path to knowledge.db>.moved-aside.<UTC stamp>"
+
+
 def _seed_missing_message() -> str:
     """Actionable error message when the DB exists but has no seed nodes.
 
@@ -4209,12 +4250,145 @@ def _seed_missing_message() -> str:
     mid-run or the user manually created an empty knowledge.db).
     """
     return (
-        f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but has no seed nodes.\n\n"
-        "This usually means a bootstrap was started but never completed.\n"
-        "Run the engram-first-session skill to complete the bootstrap, or\n"
-        f"delete {DB_PATH} (verify it's empty first!) and re-run first-session\n"
-        "for a clean retry."
+        f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but has no seed nodes.\n"
+        "This usually means a bootstrap was started but never completed.\n\n"
+        "Stop and tell the user. The user decides what happens next. They can have you complete the "
+        "bootstrap through the engram-first-session skill. Only if the user decides this seat is new, "
+        "move the file aside under a dated name (never remove it), then run first-session for a clean "
+        "retry:\n"
+        f"  {_MV_TEMPLATE}"
     )
+
+
+_PACK_SENTENCE = (
+    "Note: if this is a knowledge pack, its config.json is missing too; restore it from backup."
+)
+
+
+def _db_damaged_message(reason: str) -> str:
+    """#4705 C3b: knowledge.db exists but is not a readable ENGRAM database, and config.json is absent."""
+    return (
+        f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but is not a readable ENGRAM database "
+        f"({reason}), and config.json is absent. Nothing was written.\n\n"
+        "Stop and tell the user. The user decides what happens next. They can have knowledge.db restored "
+        "from a backup or snapshot. Only if the user decides this seat is genuinely new, move the file "
+        "aside under a dated name (never remove it), then run the engram-first-session skill:\n"
+        f"  {_MV_TEMPLATE}"
+    )
+
+
+_BUSY_SENTENCE = (
+    "The database could not be read just now because another process (for example a running "
+    "ENGRAM server) holds it; stop that process and retry first, which costs nothing, before "
+    "restoring anything."
+)
+
+
+_ACCESS_SENTENCE = (
+    "The database could not be opened read-only just now. That usually means the ENGRAM "
+    "directory or the database file is read-only, full or owned by another user. Nothing "
+    "about the database itself is known yet; fix that access and retry before restoring "
+    "anything."
+)
+
+_GENERIC_SENTENCE = (
+    "The database could not be read just now. Nothing about the database itself is known "
+    "yet. Check that the ENGRAM directory and the database file are readable by this "
+    "user, then retry; if it keeps happening, report this line."
+)
+
+
+def _is_busy_or_locked(exc: sqlite3.Error) -> bool:
+    """#4705: True for an OperationalError whose SQLite error is BUSY or LOCKED (primary code, extended
+    bits masked).  The error code is used where the interpreter has it (3.11+); the message text only
+    where it does not."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def _is_positive_damage(exc: sqlite3.Error) -> bool:
+    """#4705 R5: True only for positive evidence the file is not a healthy SQLite database: primary code
+    NOTADB or CORRUPT.  Without sqlite_errorcode (before 3.11) only the two message texts count."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return (code & 0xFF) in (sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT)
+    text = str(exc).lower()
+    return "file is not a database" in text or "malformed" in text
+
+
+def _is_access_failure(exc: sqlite3.Error) -> bool:
+    """#4705 R5: True for an error that says the probe could not get at the file (read-only, cannot open,
+    permission, auth, I/O, disk full), which is a fact about access, not about the graph.  Needs
+    sqlite_errorcode (3.11+); without it the error falls to the generic sentence."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is None:
+        return False
+    return (code & 0xFF) in (
+        sqlite3.SQLITE_READONLY,  # 8
+        sqlite3.SQLITE_CANTOPEN,  # 14
+        sqlite3.SQLITE_PERM,  # 3
+        sqlite3.SQLITE_AUTH,  # 23
+        sqlite3.SQLITE_IOERR,  # 10
+        sqlite3.SQLITE_FULL,  # 13
+    )
+
+
+def _config_missing_with(sentence: str) -> "_config_io.ConfigMissingError":
+    """ConfigMissingError with one sentence placed before the remedies (R2-4a); a wrapper on the message,
+    same exception class."""
+    err = _config_io.ConfigMissingError(CONFIG_PATH)
+    lead, _, rest = str(err).partition("\n")
+    err.args = (lead + "\n" + sentence + "\n" + rest,)
+    return err
+
+
+def _refuse_config_missing() -> None:
+    """config.json is absent and the guards are on: classify the existing knowledge.db read-only and
+    raise the matching refusal (#4705).  Never returns, never writes.
+
+    ConfigMissingError (C2) only for a DB that opens read-only and holds at least one axiom; a DB with
+    no usable graph gets its own wording (C3a seed-missing + pack sentence, C3b damaged), so no message
+    states a fact the file contradicts.  The discriminator is the file, not a size threshold.
+
+    The two failure directions are not equal: a false "damaged" gets a good database moved aside, while
+    a false "not damaged" costs a retry.  So "damaged" (C3b) is an allowlist of positive evidence only:
+    SQLite NOTADB or CORRUPT, or a file that opens and has no nodes table.  A busy or locked database,
+    an access failure (read-only, cannot open, permission, auth, I/O, full) and any unknown sqlite3
+    error all land on ConfigMissingError with a sentence that says so; an unknown code lands on the
+    side that costs a retry.  Every non-damaged message names the SQLite error, so a human or an
+    agent can still act on it when the classification declines to."""
+    kind, reason = "seeded", ""
+    try:
+        con = sqlite3.connect(f"{DB_PATH.absolute().as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "nodes" not in tables:
+                kind, reason = "damaged", "no nodes table"
+            elif con.execute("SELECT COUNT(*) FROM nodes WHERE type='axiom'").fetchone()[0] == 0:
+                kind = "seedless"
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        named = f"({type(exc).__name__}: {exc})"
+        if _is_busy_or_locked(exc):
+            # A locked/busy database is not a damaged one: the only fact known is that config.json is missing.
+            raise _config_missing_with(_BUSY_SENTENCE)
+        if _is_positive_damage(exc):
+            kind, reason = "damaged", f"{type(exc).__name__}: {exc}"
+        elif _is_access_failure(exc):
+            raise _config_missing_with(f"SQLite said {named}. {_ACCESS_SENTENCE}")
+        else:
+            raise _config_missing_with(f"SQLite said {named}. {_GENERIC_SENTENCE}")
+    if kind == "damaged":
+        raise RuntimeError(_db_damaged_message(reason))
+    if kind == "seedless":
+        raise RuntimeError(_seed_missing_message() + "\n\n" + _PACK_SENTENCE)
+    raise _config_io.ConfigMissingError(CONFIG_PATH)
 
 
 def _walguard_startup_clear(conn: sqlite3.Connection) -> None:
@@ -5033,13 +5207,84 @@ def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
 # pre-migration backup, and engramd_owner's start() gate refuses a store whose
 # user_version is below it (read through this module attribute at call time, never
 # copied). Adding a rung means bumping this single line.
-LATEST_SCHEMA_VERSION = 10
+LATEST_SCHEMA_VERSION = 11
 
 
 # Migration rung of #4075 (the fourth cascade resolution kind). A renumber edits THREE places, as for
 # TEXT_NUL_GUARD_RUNG above: this constant, the literal `PRAGMA user_version = N` in the rung, and
 # LATEST_SCHEMA_VERSION; tests/test_cascade_resolved_kind_4075.py ties them together.
 CASCADE_RESOLVED_KIND_RUNG = 10
+
+
+# Migration rung of #4727 (retract markers for retractions older than the cascade machine). Same
+# three places as above; tests/test_retract_backfill_4727.py ties them together.
+RETRACT_BACKFILL_RUNG = 11
+
+
+def _backfill_pre_machine_retract_markers(conn: sqlite3.Connection) -> "tuple[int, int, int]":
+    """#4727: mark the live dependents of retractions made before the cascade machine.
+
+    A retracted node with NO retract-rooted marker either had no live claim-bearing
+    dependent when it was retracted, or was retracted before the machine existed and so
+    never marked the nodes built on it. The live walk (``_walk_cascade_from_root``,
+    the same helper every live retraction uses) tells the two apart: it finds nothing
+    for the first and the unmarked dependents for the second. Each gets one pending
+    marker, ``root_op='retract'``, ``cascade_event='backfill:retract:<root>'``,
+    ``backfill_provenance='migration_time'``.
+
+    Writes ONLY ``INSERT OR IGNORE`` rows into cascade_markers, plus one edit_history
+    row per root that gained markers (keyed to that root, as every edit_history row is
+    keyed to a node), and only when edit_history exists (a fresh store creates it after
+    the ladder). No node, edge, or existing marker row is changed.
+
+    Unlike a live retraction, this does NOT mark contradiction nodes with the root as a
+    side (the live path's parallel contradicts cascade): measured 0 across the team's
+    graphs on 2026-11-15, unmeasured on public installs.
+
+    Returns (roots that gained markers, markers written, distinct nodes marked).
+    """
+    now = _now()
+    roots = [r[0] for r in conn.execute(
+        "SELECT n.id FROM nodes n WHERE n.status = 'retracted' AND NOT EXISTS "
+        "(SELECT 1 FROM cascade_markers m WHERE m.root_op = 'retract' "
+        "AND m.root_node = n.id) ORDER BY n.id"
+    )]
+    has_history = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edit_history'"
+    ).fetchone() is not None
+    roots_marked = markers_written = 0
+    nodes_marked: set = set()
+    for root in roots:
+        event = f"backfill:retract:{root}"
+        written: list = []
+
+        def _mark(dep, _root=root, _event=event, _written=written):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO cascade_markers (node_id, cascade_event, root_node, "
+                "root_op, status, created_at, backfill_provenance) "
+                "VALUES (?, ?, ?, 'retract', 'pending', ?, 'migration_time')",
+                (dep["id"], _event, _root, now),
+            )
+            if cur.rowcount:
+                _written.append(dep["id"])
+
+        _walk_cascade_from_root(conn, root, on_live_node=_mark)
+        if not written:
+            continue
+        roots_marked += 1
+        markers_written += len(written)
+        nodes_marked.update(written)
+        if has_history:
+            row = conn.execute("SELECT type FROM nodes WHERE id = ?", (root,)).fetchone()
+            conn.execute(
+                "INSERT INTO edit_history (timestamp, action, node_id, node_type, details) "
+                "VALUES (?, 'retract_backfill', ?, ?, ?)",
+                (now, root, row[0] if row else "", json.dumps({
+                    "cascade_event": event, "markers_written": len(written),
+                    "nodes_marked": sorted(written), "issue": 4727,
+                })),
+            )
+    return roots_marked, markers_written, len(nodes_marked)
 
 
 # #4075 (schema v10): the cascade_markers table with its fourth resolution kind. SQLite cannot
@@ -5624,14 +5869,16 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                     "SKIPPED — in-memory or unattached-temp connection "
                     f"(empty PRAGMA database_list path); existing columns "
                     f"{_existing_fts_cols} != canonical {_canonical_fts_cols}, "
-                    "but there is no on-disk nodes_fts to repair. #2186."
+                    "but there is no on-disk nodes_fts to repair. #2186.",
+                    file=sys.stderr,
                 )
             else:
                 print(
                     f"[_run_db_one_time_setup] repairing stale nodes_fts on startup "
                     f"({_fts_db_path}): existing columns {_existing_fts_cols} != "
                     f"canonical {_canonical_fts_cols} — delegating to "
-                    "engram_backup.rebuild_fts_index."
+                    "engram_backup.rebuild_fts_index.",
+                    file=sys.stderr,
                 )
                 # rebuild_fts_index opens its OWN connection to the same file, so
                 # `conn`'s own pending writes (the trust-tier backfill UPDATE
@@ -5655,7 +5902,8 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
         # line that never got a follow-up (loud-not-fatal class).
         print(
             "[_run_db_one_time_setup] nodes_fts startup self-heal FAILED "
-            f"(continuing under-indexed until repaired): {_fts_selfheal_err!r}"
+            f"(continuing under-indexed until repaired): {_fts_selfheal_err!r}",
+            file=sys.stderr,
         )
 
     # FTS5 vocabulary table — required by engram_idf.extract_keywords for IDF
@@ -6734,6 +6982,39 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 file=sys.stderr,
             )
 
+    # Migration version 11 (#4727; the number is RETRACT_BACKFILL_RUNG): retractions made before
+    # the cascade machine never marked the nodes built on them. One pass of the LIVE walk from
+    # every retracted root that has no retract marker writes the missing markers (insert-only;
+    # see _backfill_pre_machine_retract_markers). One transaction with the version bump; on
+    # failure it rolls back and retries next start; the pre-migration backup gate applies.
+    # RecursionError is caught with DatabaseError as a GUARD: the cascade walk is iterative
+    # since #4823, so a deep derivation chain no longer raises it. If it is raised anyway,
+    # something below the rung recursed unexpectedly; the rung rolls back and retries, the
+    # server still starts, and the stderr line asks for a report.
+    if _rung_ready(conn, RETRACT_BACKFILL_RUNG, _pre_migration_backup_ok):
+        try:
+            _bf_roots, _bf_markers, _bf_nodes = _backfill_pre_machine_retract_markers(conn)
+            conn.execute("PRAGMA user_version = 11")
+            conn.commit()
+            print(
+                f"[_run_db_one_time_setup] migration {RETRACT_BACKFILL_RUNG} (#4727 retract-marker "
+                f"backfill): {_bf_roots} old retraction(s), {_bf_markers} marker(s), "
+                f"{_bf_nodes} node(s) marked; they block derivation until adjudicated "
+                "(engram_cascade_frontier).",
+                file=sys.stderr,
+            )
+        except (sqlite3.DatabaseError, RecursionError) as _migration11_err:
+            conn.rollback()
+            print(
+                f"[_run_db_one_time_setup] migration {RETRACT_BACKFILL_RUNG} (#4727 retract-marker "
+                "backfill) FAILED, will retry on next "
+                f"startup: {_migration11_err!r}"
+                + ("; RecursionError here is unexpected (the cascade walk is iterative since "
+                   "#4823), please report it with this line"
+                   if isinstance(_migration11_err, RecursionError) else ""),
+                file=sys.stderr,
+            )
+
     # #2732 (A): a rung that landed leaves its new index (or any DDL) with no
     # planner statistics, and the next plain `PRAGMA optimize` -- which every
     # checkpoint runs -- then re-analyzes that WHOLE table under SQLite's
@@ -6963,13 +7244,14 @@ def _get_db(setup_wait: str = SETUP_WAIT_SERVER) -> sqlite3.Connection:
     SETUP_LOCK_HOOK_WAIT_S then raises DbSetupLockBusy. Only consulted when
     this process still has to run the one-time setup.
     """
-    bootstrap_mode = (
-        os.environ.get("ENGRAM_BOOTSTRAP") == "1"
-        or os.environ.get("ENGRAM_NO_DB_GUARDS") == "1"
-    )
+    bootstrap_mode = _bootstrap_mode()
     if not DB_PATH.exists() and not bootstrap_mode:
         raise RuntimeError(_db_missing_message())
     _ensure_data_dir()
+    # #4705: config.json lost beside an existing knowledge.db. _ensure_data_dir() wrote nothing (the
+    # DB exists); refuse here, before any write to the store, instead of running on a guessed config.
+    if not bootstrap_mode and not CONFIG_PATH.exists():
+        _refuse_config_missing()
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
@@ -7250,6 +7532,23 @@ def changed_concurrently_refusal(conn, kind: str, node_id: str, *,
     })
 
 
+def person_relation(meta) -> str:
+    """A person node's relation from its metadata dict (#3864).
+
+    `metadata.relation` if it is a non-empty string after strip, else the
+    deprecated pre-rename `metadata.role` under the same test, else "".
+    Non-dict input or non-string values give "" (never raises). Mirrors the
+    prefer-relation-then-role rule in viz/data/moments.py.
+    """
+    if not isinstance(meta, dict):
+        return ""
+    for key in ("relation", "role"):
+        v = meta.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
 def _metadata_dict_for_write(raw, node_id, tool) -> "tuple[dict, Optional[str]]":
     """Write-side twin of `_metadata_dict` (#3413): returns (dict, warning).
 
@@ -7437,12 +7736,18 @@ def _get_current_turn() -> int:
 
 
 def _set_current_turn(turn: int):
-    """Update the turn counter in config."""
+    """Update the turn counter in config.
+
+    An absent config.json raises ``ConfigMissingError`` (never regenerated from
+    empty: the caller reads the old turn with default 0, so the counter would
+    silently restart, #1989).  The write is the guarded ``write_engram_config``."""
+    if not CONFIG_PATH.exists():
+        raise _config_io.ConfigMissingError(CONFIG_PATH)
     config = _config_io.read_config_json(CONFIG_PATH)
     if "memory" not in config:
         config["memory"] = {}
     config["memory"]["current_turn"] = turn
-    _config_io.write_config_json(CONFIG_PATH, config)
+    _config_io.write_engram_config(CONFIG_PATH, config)
 
 
 def _write_feeling_nudge(source: str) -> bool:
@@ -8316,6 +8621,84 @@ class EmbeddingOutcome(NamedTuple):
 EMBED_REVIVE_COOLDOWN_S = 300
 
 
+def _store_embedding_vector(
+    conn: sqlite3.Connection, node_id: str, vector: list,
+) -> "EmbeddingOutcome":
+    """Persist an already-computed vector: the STORE step of
+    _compute_and_store_embedding, extracted (#4651 part A) so the compute path
+    and the prepared-vector publication path write through ONE function.
+
+    Returns EmbeddingOutcome(status="failed", stage="store") when the
+    nodes.embedding UPDATE raises (WARNING logged), else
+    EmbeddingOutcome(status="embedded", vec_mirror_ok=...). The vec mirror keeps
+    its tolerated-degradation rules (see the inline comments). Never raises for
+    a store/mirror failure; does not commit.
+    """
+    # Stage "store" (#345 PR3 R2): the vector computed fine; only
+    # persisting it failed (e.g. "database is locked") -- not an
+    # embedder-health signal, so no revive/cooldown either.
+    try:
+        conn.execute(
+            "UPDATE nodes SET embedding = ? WHERE id = ?",
+            (json.dumps(vector), node_id),
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "embedding STORE FAILED for node %s: %r — vector computed "
+            "but not persisted; node left without an embedding.",
+            node_id, exc,
+        )
+        return EmbeddingOutcome(
+            status="failed", node_id=node_id, detail=repr(exc), stage="store",
+        )
+    vec_mirror_ok = True
+    # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
+    # virtual tables, so delete-then-insert handles the rare re-embed.
+    if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(vector) == 384:
+        try:
+            conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
+            conn.execute(
+                "INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)",
+                (node_id, _sqlite_vec.serialize_float32(vector)),
+            )
+        except sqlite3.OperationalError:
+            # vec_nodes missing/locked -- the LONG-TOLERATED #3075
+            # contract (#3075 C2 explicitly keeps this non-fatal):
+            # SILENT degradation, no WARNING. Round 4 (M3, Mira's own
+            # regression on her round-3 R-S2 fix below): #3075's own
+            # minimal test fixtures have no vec_nodes table at all, so
+            # on any seat where sqlite-vec IS actually available this
+            # exact exception fires on EVERY write in those fixtures
+            # -- R-S2's single widened `except Exception` logged a
+            # WARNING here too, which turned two previously-green
+            # #3075 tests (test_enabled_false_is_ignored_still_embeds,
+            # test_all_succeed) red on such a seat. Kept separate from
+            # the branch below so this one specific, long-tolerated
+            # exception type stays exactly as quiet as it always was.
+            vec_mirror_ok = False
+        except Exception as exc:
+            # Any OTHER exception from this step (round 3, R-S2 --
+            # e.g. _sqlite_vec.serialize_float32 raising) — JSON still
+            # canonical either way. Still a TOLERATED degradation
+            # (#3075 C2), but now visible via a WARNING instead of
+            # being silently swallowed. Narrowed to only
+            # sqlite3.OperationalError before R-S2 — any OTHER
+            # exception type here fell through to the outer catch-all
+            # below, which defaults stage="embed" and wrongly implies
+            # the embedder (not the vec mirror) is unhealthy, even
+            # though both the embedder and the canonical
+            # nodes.embedding write already succeeded.
+            logging.getLogger(__name__).warning(
+                "vec_nodes mirror write failed for node %s: %r -- the "
+                "canonical nodes.embedding write succeeded; KNN index "
+                "degraded for this node.", node_id, exc,
+            )
+            vec_mirror_ok = False
+    return EmbeddingOutcome(
+        status="embedded", node_id=node_id, vec_mirror_ok=vec_mirror_ok,
+    )
+
+
 def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "EmbeddingOutcome":
     """Compute embedding for a node and store it.
 
@@ -8387,70 +8770,8 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "Emb
                 detail="embed() returned empty/None", stage="embed",
             )
 
-        # Stage "store" (#345 PR3 R2): the vector computed fine; only
-        # persisting it failed (e.g. "database is locked") -- not an
-        # embedder-health signal, so no revive/cooldown either.
-        try:
-            conn.execute(
-                "UPDATE nodes SET embedding = ? WHERE id = ?",
-                (json.dumps(vector), node_id),
-            )
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "embedding STORE FAILED for node %s: %r — vector computed "
-                "but not persisted; node left without an embedding.",
-                node_id, exc,
-            )
-            return EmbeddingOutcome(
-                status="failed", node_id=node_id, detail=repr(exc), stage="store",
-            )
-        vec_mirror_ok = True
-        # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
-        # virtual tables, so delete-then-insert handles the rare re-embed.
-        if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(vector) == 384:
-            try:
-                conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
-                conn.execute(
-                    "INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)",
-                    (node_id, _sqlite_vec.serialize_float32(vector)),
-                )
-            except sqlite3.OperationalError:
-                # vec_nodes missing/locked -- the LONG-TOLERATED #3075
-                # contract (#3075 C2 explicitly keeps this non-fatal):
-                # SILENT degradation, no WARNING. Round 4 (M3, Mira's own
-                # regression on her round-3 R-S2 fix below): #3075's own
-                # minimal test fixtures have no vec_nodes table at all, so
-                # on any seat where sqlite-vec IS actually available this
-                # exact exception fires on EVERY write in those fixtures
-                # -- R-S2's single widened `except Exception` logged a
-                # WARNING here too, which turned two previously-green
-                # #3075 tests (test_enabled_false_is_ignored_still_embeds,
-                # test_all_succeed) red on such a seat. Kept separate from
-                # the branch below so this one specific, long-tolerated
-                # exception type stays exactly as quiet as it always was.
-                vec_mirror_ok = False
-            except Exception as exc:
-                # Any OTHER exception from this step (round 3, R-S2 --
-                # e.g. _sqlite_vec.serialize_float32 raising) — JSON still
-                # canonical either way. Still a TOLERATED degradation
-                # (#3075 C2), but now visible via a WARNING instead of
-                # being silently swallowed. Narrowed to only
-                # sqlite3.OperationalError before R-S2 — any OTHER
-                # exception type here fell through to the outer catch-all
-                # below, which defaults stage="embed" and wrongly implies
-                # the embedder (not the vec mirror) is unhealthy, even
-                # though both the embedder and the canonical
-                # nodes.embedding write already succeeded.
-                logging.getLogger(__name__).warning(
-                    "vec_nodes mirror write failed for node %s: %r -- the "
-                    "canonical nodes.embedding write succeeded; KNN index "
-                    "degraded for this node.", node_id, exc,
-                )
-                vec_mirror_ok = False
-
-        return EmbeddingOutcome(
-            status="embedded", node_id=node_id, vec_mirror_ok=vec_mirror_ok,
-        )
+        # Stage "store" (#345 PR3 R2): see _store_embedding_vector.
+        return _store_embedding_vector(conn, node_id, vector)
     except Exception as exc:
         # Anything NOT already attributed to "text"/"embed"/"store" above
         # (e.g. a config-read error ahead of all three) -- defaulted to
@@ -10034,7 +10355,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
             elif ntype == "person":
                 meta = _metadata_dict(n["metadata"])
                 person_name = meta.get("name", "")
-                person_role = meta.get("role", "")
+                person_role = person_relation(meta)
                 lines.append(f"### {n['id']} [{status_tag}]")
                 lines.append(f"Person: {person_name}")
                 if person_role:
@@ -12724,6 +13045,14 @@ def _validate_premises(
         open_ct_ids = [] if tainted_by else _open_contradiction_ids(conn, sid)
 
         if tainted_by:
+            # #4727: roots whose pending retract marker on this premise came from the
+            # one-time backfill of pre-machine retractions; their item names the event.
+            backfill_events = {
+                m["root_node"]: m["cascade_event"]
+                for m in _pending_markers_for_node(conn, sid)
+                if m["root_op"] == "retract"
+                and m["cascade_event"].startswith("backfill:retract:")
+            }
             retraction_info = []
             for rid in tainted_by:
                 rrow = conn.execute(
@@ -12732,10 +13061,13 @@ def _validate_premises(
                 r_reason = None
                 if rrow and rrow["metadata"]:
                     r_reason = _metadata_dict(rrow["metadata"]).get("retraction_reason")
-                retraction_info.append({
+                item = {
                     "retracted_by": rid,
                     "retraction_reason_excerpt": (r_reason or "")[:_WARNING_EXCERPT_LEN],
-                })
+                }
+                if rid in backfill_events:
+                    item["cascade_event"] = backfill_events[rid]
+                retraction_info.append(item)
             tainted_premises.append({
                 "id": sid,
                 "retracted_by": retraction_info,
@@ -12962,6 +13294,98 @@ class CascadeWalkTruncated(Exception):
         )
 
 
+_WALK_EXHAUSTED = object()  # sentinel: a node's child iterator is used up
+
+
+def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
+    """Walk downstream from node_id following engram_core.CASCADE_RELATIONS
+    edges (the relations whose EDGE_CLASSIFICATIONS entry sets cascade=True —
+    today derives_from and acknowledged_derives_from, the latter
+    cascade-bearing by design per #2013 §12.5; the constant is the source of
+    truth, not this list). supported_by lost its cascade flag in #2252
+    Stage 1.3, and the W6 pairing edge predicted_by was minted cascade:False
+    from the start, so neither ever reaches this walk. Visits each
+    downstream node at most once. For each live
+    claim-bearing node visited, calls on_live_node(node) — the caller
+    decides what to write. Stops cascade at retracted/superseded nodes
+    (node not is_current) AND at any non-claim-bearing (NCB) node — an NCB
+    node has no claim to re-adjudicate, so cascade reaching it accomplishes
+    nothing (#2252 W0). Cornerstones/lessons are the vote-accumulator
+    *instance* of this rule, not the rule itself.
+
+    Visit pattern (Lei 2026-05-28): visited check is at the top of the call,
+    BEFORE on_live_node fires. This guarantees on_live_node fires exactly
+    once per downstream node regardless of how many paths reach it. The
+    caller seeds the cascade root into `visited` before calling so the root
+    isn't re-processed.
+
+    Promoted from engram_revision (#4727) so a migration rung in this module
+    can run the same walk; engram_revision binds its old name to this one.
+    Callers starting from a ROOT use _walk_cascade_from_root, not this.
+
+    Iterative since #4823: it used to recurse once per derivation level, so a
+    chain deeper than the interpreter's recursion limit raised RecursionError
+    in a live retraction and in migration rung 11. It is the same preorder with
+    an explicit stack of child iterators: each dependent is explored fully
+    before the next, the visited check runs when a node is taken, and a node's
+    child list is built right after its on_live_node call, as before, so a
+    callback that writes cannot reorder anything. The visit sequence is pinned
+    against a copy of the recursive walk in
+    tests/test_cascade_walk_iterative_4823.py.
+    """
+    stack = [iter((node_id,))]
+    while stack:
+        current = next(stack[-1], _WALK_EXHAUSTED)
+        if current is _WALK_EXHAUSTED:
+            stack.pop()
+            continue
+        if current in visited:
+            continue
+        visited.add(current)
+
+        node = conn.execute(
+            "SELECT id, type, claim, metadata FROM nodes "
+            "WHERE id = ? AND is_current = 1",
+            (current,),
+        ).fetchone()
+        if not node:
+            continue  # retracted/superseded — stop cascade (parity with old _flag_stale)
+        if not _is_claim_bearing(node["type"]):
+            continue  # NCB: no claim to re-adjudicate, so nothing to taint (#2252 W0)
+
+        on_live_node(node)
+
+        stack.append(iter([dep_id for dep_id, _tgt, _rel in dag_edge_set(
+            conn, _CASCADE_RELATIONS_SORTED, target_id=current)]))
+
+
+def _walk_cascade_from_root(conn, root_id, *, on_live_node, extra_visited=()):
+    """THE cascade walk from a root (#4727): every live claim-bearing node
+    downstream of ``root_id`` over CASCADE_RELATIONS, each handed once to
+    ``on_live_node``. Two steps, and both are the walk:
+
+    1. the root's DIRECT dependents, with ``live_only=False`` — the root has
+       usually just stopped being live (a retract / supersede root), so its
+       own edges are provenance by construction (#3542), and the default
+       live-only set would drop them;
+    2. ``_walk_cascade_downstream`` on each, with the root (and
+       ``extra_visited``, e.g. a supersede's replacement) seeded into
+       ``visited`` so neither is processed.
+
+    Calling ``_walk_cascade_downstream`` on the root itself with the root
+    seeded marks nothing (it returns at the visited check), which is why
+    every caller goes through this one helper instead of restating the two
+    steps. Chosen over a rung-local copy: a second copy of a shape this easy
+    to get wrong is the larger risk.
+    """
+    visited = {root_id, *extra_visited}
+    for dep_id, _t, _r in dag_edge_set(
+            conn, _CASCADE_RELATIONS_SORTED, live_only=False,
+            target_id=root_id):
+        _walk_cascade_downstream(conn, dep_id,
+                                 visited=visited, on_live_node=on_live_node)
+
+
 def _walk_cascade_upstream(
     conn: sqlite3.Connection,
     node_id: str,
@@ -12973,9 +13397,9 @@ def _walk_cascade_upstream(
 ) -> set:
     """Shared upstream (premise-direction) walk over ``CASCADE_RELATIONS``:
     follows each visited node's own outgoing cascade edges back toward its
-    origins. Mirrors ``engram_revision._walk_cascade_downstream``'s shape
-    (visited-set dedup, per-dequeue budget decrement, caller-supplied
-    per-node decision) for the inverse direction — that walker finds who
+    origins. Mirrors ``_walk_cascade_downstream``'s shape
+    (visited-set dedup, caller-supplied per-node decision) for the inverse
+    direction — that walker finds who
     DEPENDS ON a node (``target_id = node_id``); this one finds what a node
     DEPENDS ON (``source_id = node_id``).
 
@@ -13586,7 +14010,10 @@ def _validate_reasoning_structure(
                             parts.append(
                                 f"⚠ inductive_generalization: independent cross-lineage instances "
                                 f"(excluding hypothesis-author lineage '{self_lin}') = {len(independent)}; "
-                                f"{n_cross_leaves} of {n_leaves} leaves cross-lineage — consider inductive_analogy"
+                                f"{n_cross_leaves} of {n_leaves} leaves cross-lineage — add a "
+                                f"cross-lineage observation, use a weaker reasoning type "
+                                f"(inductive_analogy or abductive_best_explanation), or proceed "
+                                f"and say why in logical_chain"
                             )
 
                 # Architecture axis: collect raw enum values directly from DB

@@ -28,9 +28,11 @@ own record ``compact/last-checkpoint.json`` supplies the verdict) only when ALL 
      ``compact/backstop-last.json``. Every attempt, success or refusal, is recorded there, so a
      refusal is not retried on every turn; a new checkpoint or a new briefing write re-arms it;
   5. the stdin payload carries a ``session_id`` (checked last, so a Stop with nothing due is silent);
-  6. the record's ``session_id`` and the payload's are not two different non-empty strings (a
-     shared ENGRAM_HOME must not compact a session that did not nap); if either is null or empty
-     the guard does not apply.
+  6. the record's ``session_id`` is a non-empty string equal to the payload's (a shared ENGRAM_HOME
+     must not compact a session that did not nap). A record without one (null, absent, empty,
+     non-string) is refused with one stderr line, because it cannot show which session napped (#4356),
+     AND recorded in ``backstop-last.json`` as a refused attempt for the Stop's own session, so the
+     #4350 surface shows it once to that session. An other-session record is not written there.
 
 Every rider (warm-briefing anchor, non-empty arc, briefing mtime at or after the checkpoint, the
 backup verdict) stays in ``compact-request.py``; none is restated here. This hook never reads or
@@ -156,6 +158,11 @@ def _briefing_mtime_ns() -> int | None:
 
 
 REASON_MAX_CHARS = 300
+REASON_NO_SESSION = (
+    "the last nap's record carries no session_id, so the backstop cannot tell which session napped "
+    "(a checkpoint call without session_id, or a nap skill older than this fix); nap again through the "
+    "current engram-nap skill, which passes it"
+)
 
 
 def _record_attempt(checkpoint_at: str, mtime_ns, outcome: str, exit_code, reason: str | None = None,
@@ -227,10 +234,17 @@ def main() -> None:
     if session_id is None:
         _say("the Stop payload carries no session_id; not requesting compaction")
         return
-    if isinstance(record_session, str) and record_session and record_session != session_id:
+    has_record_session = isinstance(record_session, str) and bool(record_session)
+    if has_record_session and record_session != session_id:
         return  # another session's nap on a shared ENGRAM_HOME: not this Stop's to compact
     if write_config_json is None:
         _say("engram_config_io is not importable; not requesting compaction (the attempt could not be recorded)")
+        return
+    if not has_record_session:
+        # cannot show which session napped (#4356): refuse, never guess. The refusal is recorded for THIS
+        # Stop's session, so guard 4 holds the pair and the #4350 surface shows it once, to that session.
+        _say("the nap record carries no session_id; not requesting compaction")
+        _record_attempt(checkpoint_at, mtime_ns, "refused", None, REASON_NO_SESSION, session_id=session_id)
         return
     tool = _find_tool()
     if tool is None:

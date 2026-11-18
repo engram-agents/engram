@@ -144,8 +144,10 @@ fi
 # block on a first-run "trust this folder?" dialog before remote-control
 # registration.
 BOOT_CWD_FILE="$HOME/.engram/boot-cwd"
-if [[ -d "$HOME/GitHub/engram-alpha" ]]; then
-    cd_target="$HOME/GitHub/engram-alpha"
+if [[ -d "$HOME/GitHub/engram" ]]; then
+    cd_target="$HOME/GitHub/engram"
+elif [[ -d "$HOME/GitHub/engram-alpha" ]]; then
+    cd_target="$HOME/GitHub/engram-alpha"   # accepted old folder name
 else
     cd_target="$HOME"
 fi

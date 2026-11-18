@@ -325,6 +325,23 @@ def _read_text_nofollow(path: Path) -> str:
     raise InvalidDmPath(f"dm thread path is not a regular file: {path.name!r}")
 
 
+def _ensure_private_dm_dir(dm_dir: Path) -> None:
+    """Create ``dm/`` owner-only IF IT DOES NOT EXIST (#4499 S3); never touch an existing one.
+
+    mkdir's mode is masked by the umask (and a setgid parent or a default ACL can still
+    leave extra bits), so the chmod after our own create is what pins 0700. An existing
+    ``dm/`` is deliberately NOT chmod'd here: the live one is managed by the installer
+    (``setfacl -b`` then ``chmod 2700``), and a server must not silently re-mode a
+    directory an admin set up. A chmod that fails is loud and nothing is written.
+    """
+    dm_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(dm_dir, 0o700)
+    except FileExistsError:
+        return
+    os.chmod(dm_dir, 0o700)
+
+
 class FileStore(CoordinationStore):
     """Concrete file-backed coordination store (fork-1 default impl)."""
 
@@ -559,6 +576,7 @@ class FileStore(CoordinationStore):
         except OSError:
             existing = f"<!-- dm thread: {dm_thread_key(sender, recipient)} -->\n"
         # DM threads are read only by the forum server: owner-only (#4501).
+        _ensure_private_dm_dir(path.parent)
         _atomic_write(path, existing + block, mode=0o600)
         return DmMessage(
             seq=seq, sender=sender, recipient=recipient, body=body, ts=ts

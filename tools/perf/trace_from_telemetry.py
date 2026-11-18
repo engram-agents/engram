@@ -85,7 +85,7 @@ def _connect_ro(db_path: Path) -> sqlite3.Connection:
     pointed at a live directory rather than the read-only copy this harness
     recommends (see replay_bench.py's _copy_data_dir docstring for the
     parallel caveat on the copy side)."""
-    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    return sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=ro", uri=True)
 
 
 def _load_call_mix(db_path: Path, tools=READ_TOOLS) -> list[str]:

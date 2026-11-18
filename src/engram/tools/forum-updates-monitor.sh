@@ -369,6 +369,8 @@ import unicodedata
 # whitespace; then cap the length (at most cap characters, as PR B). Unlike PR B this has NO
 # phrase breaker: the monitor marker brackets are already deleted, and breaking the common
 # word ENGRAM would mangle ordinary text. \u escapes keep this source ASCII.
+# #4474: U+FE18 is a closing bracket whose Unicode name misspells BRACKET (BRAKCET); treat it as one.
+_MISSPELLED_BRACKETS = frozenset("\ufe18")
 def forum_field(x, cap=64):
     s = "".join(" " if unicodedata.category(c) in ("Cc", "Cf") else c for c in str(x))
     out = []
@@ -376,7 +378,7 @@ def forum_field(x, cap=64):
         n = unicodedata.name(c, "")
         if n.endswith("LESS-THAN SIGN") or n.endswith("GREATER-THAN SIGN") or "ANGLE QUOTATION MARK" in n:
             out.append("\ufffd")
-        elif "BRACKET" not in n:
+        elif "BRACKET" not in n and c not in _MISSPELLED_BRACKETS:
             out.append(c)
     s = " ".join("".join(out).split())
     return s[: cap - 1].rstrip() + "\u2026" if len(s) > cap else s
@@ -426,6 +428,9 @@ for u in d.get("updates", []):
 #     `[ <big> -ge $_cur ]` exits 2 and that failure is swallowed by the
 #     existing `2>/dev/null`; and once seeded, every later REAL watermark
 #     fails the same comparison against it, so the cursor never recovers.
+#     The bound of this rung, stated plainly: it covers UNCOMPARABILITY only.
+#     An absurd but comparable value (1e18 is below 2**63-1) still passes and
+#     would still pin the cursor silently; the rung does not judge plausibility.
 #   - exit non-zero, print nothing: EITHER the body did not parse (200
 #     maintenance page, truncated JSON, empty string) OR it parsed and carries
 #     no usable watermark (a JSON array, a missing "as_of", a null one, a

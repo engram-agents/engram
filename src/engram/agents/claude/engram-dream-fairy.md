@@ -58,7 +58,7 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
 
    Full decision tree lives in the `engram-contradiction-resolution` skill — reference it in your report so the parent can follow the canonical steps.
 
-3. **Stale-but-load-bearing nodes.** `engram_query_pattern(pattern_name='stale_load_bearing')` as primary; or inline: cross-reference `engram_list(sort_by='recalls', limit=200)` ascending with `sort_by='importance', limit=50` descending. Nodes appearing in both sets are high-importance + low-recent-recall — candidates for the parent to either re-engage with or supersede. Distinguish *cornerstone* nodes (which by design are anchored against forgetting and should not be flagged as stale) from *non-cornerstone* high-importance nodes **by the node's own type** — mirror what the pattern does: `type NOT IN ('cornerstone', 'feeling_report')`. **Do NOT use focus-list membership as the discriminator.** The focus list holds current work, not a standing inventory of principles (it is capped at 15 slots and is normally full), so membership answers "is this hot right now", not "is this a cornerstone" — keying the exemption on it both flags unpinned cornerstones as stale and exempts whatever happens to be pinned this week. Additionally, **seed axioms** (identifiable by `basis` containing `"Seed axiom installed with ENGRAM"`) and **all definition nodes** (`df_*`) are exempt from this scan — seed axioms' high-importance + low-recall profile is structural (foundational bedrock installed at bootstrap, not stale), and definitions are structural anchors with no claim-bearing role. Skip both.
+3. **Stale-but-load-bearing nodes.** `engram_query_pattern(pattern_name='stale_load_bearing')` as primary; or inline: cross-reference `engram_list(sort_by='recalls', limit=200)` ascending with `sort_by='importance', limit=50` descending. Nodes appearing in both sets are high-importance + low-recent-recall — candidates for the parent to either re-engage with or supersede. Distinguish *cornerstone* nodes (which by design are anchored against forgetting and should not be flagged as stale) from *non-cornerstone* high-importance nodes **by the node's own type** — mirror what the pattern does: `type NOT IN ('cornerstone', 'feeling_report')`. **Do NOT use focus-list membership as the discriminator.** The focus list holds current work, not a standing inventory of principles (it is capped at 15 slots and is normally full), so membership answers "is this hot right now", not "is this a cornerstone" — keying the exemption on it both flags unpinned cornerstones as stale and exempts whatever happens to be pinned this week. Additionally, **seed axioms** (identifiable by `basis` containing `"Seed axiom installed with ENGRAM"`) and **all definition nodes** (`df_*`) are exempt from this scan — seed axioms' high-importance + low-recall profile is structural (foundational bedrock installed at bootstrap, not stale), and definitions are structural anchors with no claim-bearing role. Skip both. **"Load-bearing" here means high importance, not edge fan-in.** Do not rank candidates by how many nodes cite them: the pattern ranks by the node's own importance, and fan-in is not what it measures. **Read its silence correctly, because the cut is not where the name suggests.** The score is `inflation_gap = importance_base * decay_base^current_turn - importance_score`, so a node's gap GROWS the longer it goes un-recalled — a quiet node ranks higher, not lower — and `importance_base` is time-invariant. The real cut happens before that sort: the pool is the **top 200 nodes by `importance_base`**. Identity-anchored node types — axioms, definitions, goals, lessons, person nodes, and tasks while they are active or planned — are stamped at a base of 2.0 or above, far above any derivation (which top out near 0.95). **Cornerstones and feeling reports are also stamped at 2.0, but they never enter the pool at all**: the `SELECT` excludes both by type, before the `ORDER BY`, so they cannot count toward the 200 — counting them overstates the room available to everything else. Definitions DO enter and DO count toward the 200 even though this scan exempts them from being reported, so they consume slots without ever appearing in your results. **Where a graph carries 200 or more of the eligible anchors, the 200th row falls above the derivation band and derivations are excluded by the pre-sort however large their gap would be.** On a younger or smaller graph the 200th row is lower, and a derivation can enter the pool and rank. The code names this an accepted approximation cost. Questions are eligible (their base clears the 0.7 floor) but are cut by the same 200-row pool plus the protection-channel floor, so on a smaller graph a cold unprotected question can appear. **If you see only observations here, say so and say which cut produced it** — do not report an empty category as if it had ranged over everything.
 
 4. **Cornerstone candidates.** `engram_query_pattern(pattern_name='cornerstone_candidate')` as primary. Inline fallback (only when the pattern tool is unavailable — not an equal alternative, and not for padding; to examine a returned candidate use `engram_inspect`; see below): run `engram_list_focused()` and `engram_focus_sets()` for the agent's current working set (a *signal source* for where practice-derived principles are surfacing — not a cornerstone inventory), run `engram_list(sort_by='importance', limit=20)`.
 
@@ -117,10 +117,57 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
 
    **Inline methodology:**
    1. List open tasks: retrieve all `tk_*` nodes via `engram_list`. Inspect each for status; keep only `active`, `planned`, `blocked` statuses.
-   2. For each open task, extract GitHub references from the claim text. **Only repo-qualified `owner/repo#N` references are candidates** — a bare `#N` has no repo, and `gh` silently resolves it against whichever repo happens to be the current checkout, so a same-numbered PR/issue in the WRONG repo can read as MERGED/CLOSED with no error (alpha#3188, #3418, #3427). The extraction pattern below matches only the qualified shape, so a bare `#N` (including `PR #N`, `issue #N`, `closes #N`) is structurally unmatched, never a closure candidate. Each `gh` call takes `--repo` from the reference itself.
-   3. For each extracted reference, run (claim text on stdin). The first `grep` has a left boundary — the ref must start the line or follow a character that cannot be part of a path/ref — so a longer path like `a/b/c#5` is not mis-read as `b/c#5`; `sed` strips the boundary character. Each `gh` call takes `</dev/null` because it sits inside `while read` and would otherwise consume the loop's stdin. Each output line carries the **kind** (`pr` / `issue`) because an unmerged-closed PR also prints `CLOSED`:
+   2. For each open task, extract GitHub references from the claim text. **Candidates are repo-qualified `owner/repo#N` references and refs written in one of the seat's declared bare-repo aliases** — a bare `#N` has no repo, and `gh` silently resolves it against whichever repo happens to be the current checkout, so a same-numbered PR/issue in the WRONG repo can read as MERGED/CLOSED with no error. The two extraction stages below match the qualified shape and the declared aliases, so a bare `#N` (including `PR #N`, `issue #N`, `closes #N`) stays structurally unmatched, never a closure candidate. Each `gh` call takes `--repo` from the reference itself, after an alias has been resolved to its full `owner/repo`.
+
+   **The alias map is the seat's own file, and it is empty by default.** An install that declares no alias keeps exactly today's behaviour: only fully qualified `owner/repo#N` refs are candidates, every alias is unmatched, and every bare `#N` is unmatched. The map lives at `${ENGRAM_HOME:-$HOME/.engram}/repo-aliases` — one declaration per line, `alias=owner/repo`; comment lines beginning with `#` and blank lines are ignored. The key class is `[A-Za-z0-9_-]+` (ERE-safe) and the value must be exactly two path segments, each `[A-Za-z0-9_.-]+`. A line that does not match exactly — a wrong segment count, an empty segment, a bad character — is not a usable alias; and in any case an alias that does not resolve to a declared repository is dropped rather than becoming a reference — so no path can turn an undeclared or malformed alias into a `gh` call. A missing file and an empty file both declare no aliases.
+
+   **The map is a closed vocabulary, not a general any-token pattern.** Only aliases declared in the seat's `repo-aliases` file are resolved; anything else stays unmatched — never guessed against the cwd checkout. One alias does not stand in for another: two different repositories can share an issue-number range, so a token that no declaration names is not a reference to either and stays unmatched. Provenance: measured on the `agent-zephyr` graph at 2026-11-14T15:58Z, over the population step 1 produces (`type='task'`, status active/planned/blocked, `is_current=1`, n=39) — **4 with qualified refs alone, 7 after adding one declared alias.** The figure moves as the graph grows, so the population and the timestamp are part of the claim, not the number. An install that declares no alias sees the first number, which is today's behaviour.
+   3. For each extracted reference, run (claim text on stdin). Both extraction stages keep a left boundary — the ref must start the line or follow a character that cannot be part of a path/ref — so a longer path like `a/b/c#5` is not mis-read as `b/c#5`; `sed` strips the boundary character. Stage 1 passes already-qualified refs through unchanged. Stage 2 runs only when at least one alias is declared, matches those aliases (built from the seat's file), and rewrites each to its full `owner/repo` **inside that stage, before the merge** — the final `sort -u` must see full refs on both sides, or the same artifact arriving once as `alias#12` and once as `owner/repo#12` would be checked and printed twice. Stage 2 only ever matches keys built from the validated declarations, so an alias the file does not name never reaches the lookup and never becomes a malformed ref. `--repo` still comes from the resolved reference, never from the cwd, so nothing downstream can tell which stage a ref arrived by. Each `gh` call takes `</dev/null` because it sits inside `while read` and would otherwise consume the loop's stdin. Each output line carries the **kind** (`pr` / `issue`) because an unmerged-closed PR also prints `CLOSED`:
       ```bash
-      grep -oE '(^|[^A-Za-z0-9_./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+' | sed -E 's/^[^A-Za-z0-9_.-]//' | sort -u | while read -r ref; do
+      # Repo alias map — the seat's own file, EMPTY by default. An alias that file
+      # does not declare is UNMATCHED, never guessed against the cwd checkout.
+      # Written for bash 3.2 on purpose (stock macOS): no associative arrays, no
+      # mapfile, no namerefs. A line that is not exactly `key=owner/repo` with two
+      # safe segments is ignored, so the map fails closed.
+      ALIAS_FILE="${ENGRAM_HOME:-$HOME/.engram}/repo-aliases"
+      ALIASES=''
+      MAP=''
+      if [ -f "$ALIAS_FILE" ] && [ -r "$ALIAS_FILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in ''|\#*) continue ;; esac
+          key=${line%%=*}
+          val=${line#*=}
+          case "$key" in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+          case "$val" in ''|/*|*/|*/*/*) continue ;; esac
+          case "$val" in */*) ;; *) continue ;; esac
+          case "$val" in *[!A-Za-z0-9_./-]*) continue ;; esac
+          MAP="${MAP}${key} ${val}"$'\n'
+          ALIASES="${ALIASES:+$ALIASES|}${key}"
+        done < "$ALIAS_FILE"
+      fi
+      repo_for() {
+        printf '%s' "$MAP" | while IFS=' ' read -r k v; do
+          [ "$k" = "$1" ] || continue
+          printf '%s\n' "$v"
+          break
+        done
+      }
+      IN=$(cat)
+      {
+        # 1) already-qualified refs, passed through unchanged
+        printf '%s\n' "$IN" | grep -oE '(^|[^A-Za-z0-9_./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+' | sed -E 's/^[^A-Za-z0-9_.-]//'
+        # 2) declared aliases, resolved to a FULL ref here so the sort -u below sees both stages.
+        #    Guarded on a non-empty ALIASES: an empty alternation is NOT an empty match -- it
+        #    would make the alias group match a bare `#N`, the one thing this category must
+        #    never resolve. No alias declared => this stage does not run at all.
+        if [ -n "$ALIASES" ]; then
+          printf '%s\n' "$IN" | grep -oE "(^|[^A-Za-z0-9_./-])($ALIASES) ?#[0-9]+" | sed -E 's/^[^A-Za-z0-9_.-]//' | sed -E 's/ +#/#/' | while read -r a; do
+            full=$(repo_for "${a%#*}")
+            [ -n "$full" ] || continue
+            echo "$full#${a#*#}"
+          done
+        fi
+      } | sort -u | while read -r ref; do
         repo="${ref%#*}"
         n="${ref#*#}"
         if state=$(gh pr view "$n" --repo "$repo" --json state -q .state </dev/null 2>/dev/null); then kind=pr
@@ -137,7 +184,7 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
 
    **Snapshot contract:** include `status`, `claim`, and the live `gh` output for each flagged reference in `key_neighbors` (use an extra field `external_check` on the snapshot if needed — the snapshot shape is extensible). Suggest action: `"close task and mark done — external reference owner/repo#N <state>"` (this routes to `task_closures` bucket in the dream-master).
 
-   **Important `gh` guard:** Only repo-qualified `owner/repo#N` references are ever checked, and every `gh` call carries `--repo` from the reference. A bare `#N` is never a closure candidate and never produces a suggestion, not even a conservative one. You MAY mention a bare `#N` you noticed in a task claim as an ambiguous reference in your report prose (a note that the task cites an unqualified number), but never as a `task_closures` suggestion and never checked against `gh`. Forum post IDs, GitHub Projects IDs, and arbitrary numbers collide with real PR/issue numbers in whichever repo the cwd happens to be; the qualified-only pattern is what keeps them out.
+   **Important `gh` guard:** Only references that resolve to a full `owner/repo#N` — written qualified, or written in one of the seat's declared aliases — are ever checked, and every `gh` call carries `--repo` from that resolved reference. A bare `#N` is never a closure candidate and never produces a suggestion, not even a conservative one. You MAY mention a bare `#N` you noticed in a task claim as an ambiguous reference in your report prose (a note that the task cites an unqualified number), but never as a `task_closures` suggestion and never checked against `gh`. Forum post IDs, GitHub Projects IDs, and arbitrary numbers collide with real PR/issue numbers in whichever repo the cwd happens to be; resolving every ref to a full `owner/repo` before it is checked is what keeps them out.
 
 9. **Cornerstone auto-load surface coverage gaps.** Read the shipped instrument — `engram_diagnose`'s `cornerstone_coverage` — with read-only MCP tools.
 
@@ -300,9 +347,15 @@ needs to see), emit `"key_neighbors": []` rather than omitting the field.
 
 - **Never omit `rationale`.** It is the human-readable audit trail for the
   dream record and morning review.
-- **Always use `dream_mode=True`** on `engram_inspect` calls during your scan.
-  Snapshot fields are derived from that call's output; the `verification_state`
-  string must confirm this.
+- **Never refresh recall during your scan.** A maintenance pass must not
+  strengthen whatever it happened to touch. Pass `dream_mode=True` on every
+  `engram_inspect` call, and pass `dream_mode=True` on every
+  `engram_get_subgraph` call (it skips the refresh on visited neighbours; the root node's utility bump still happens
+  regardless), and pass `refresh_recall=False` on every `engram_query` call
+  (results and ranking are unchanged; surfaced nodes are not re-stamped).
+  `engram_query_pattern` never refreshes recall, so it needs no flag. Snapshot
+  fields are derived from the `engram_inspect` call's output; the
+  `verification_state` string must confirm this.
 - **Snapshot is a point-in-time copy.**  Between fairy dispatch and dream-master
   invocation, the parent may have acted on some nodes.  The dream-master calls
   `check_snapshot_divergence` (from `tools/dream_master_batch.py`) before each
@@ -312,6 +365,12 @@ needs to see), emit `"key_neighbors": []` rather than omitting the field.
   current state through one CLI, `"$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/dream_master_batch.py" safety-row <node_id>`
   (it prints one JSON object, or `null` for a missing node).  You never run it
   and never connect to the store: use `engram_inspect` for everything you read.
+- **Supersede chains are linear.** A cluster of N duplicates consolidates as ONE
+  `engram_supersede` plus (N−1) `engram_retract` calls carrying `error_type='duplicate'` **and** `replacement_absent_because='NONE_BECAUSE_DUPLICATE'` — a retract is refused without a replacement decision, so `error_type` alone is not an executable instruction.
+  Never propose superseding two nodes with a single successor: the second `supersede` call
+  is refused, because a node cannot be the successor of more than one chain. This applies
+  to the suggested actions you write in Categories 1, 3 and 4 — phrase every duplicate
+  cluster that way, or the parent receives an instruction it cannot execute.
 
 # Output contract
 
@@ -331,7 +390,7 @@ Use this format:
 
 ## Category 1 — Open questions with sufficient answers nearby
 **Status scope this scan:** `open, partially_resolved` (or the actual set you ranged over, if you fell back to a narrower query — state it plainly, never let a null result imply full-domain coverage it didn't have; #1860).
-- [qu_XXXX] (verified) <one-line question summary> — RESOLVES via <evidence chain> — suggest parent composes resolving derivation via `engram_derive`, then wires via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_YYYY)`.
+- [qu_XXXX] (verified) <one-line question summary> — RESOLVES via <evidence chain> — suggest parent composes resolving derivation via `engram_derive`, then wires via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_YYYY)` (duplicate clusters: one supersede + N−1 retract-duplicates — see Invariants).
 ... or "None this scan."
 
 ## Category 2 — Contradictions ready for resolution
@@ -339,11 +398,11 @@ Use this format:
 ... or "None this scan."
 
 ## Category 3 — Stale-but-load-bearing nodes
-- [node_id] (pattern-match) high-importance + low-recent-recall — last recalled <when> — suggested action: re-engage on <topic> OR supersede with <fresher framing>.
+- [node_id] (pattern-match) high-importance + low-recent-recall — last recalled <when> — suggested action: re-engage on <topic> OR supersede with <fresher framing> (duplicate clusters: one supersede + N−1 retract-duplicates — see Invariants).
 ... or "None this scan."
 
 ## Category 4 — Cornerstone candidates
-- [node_id] (verified: principle-test passed) recently cited by ≥3 distinct current nodes in the window + load-bearing for <thread> — suggested action: anchor as cornerstone via `engram_add_cornerstone` or `engram_focus`.
+- [node_id] (verified: principle-test passed) recently cited by ≥3 distinct current nodes in the window + load-bearing for <thread> — suggested action: anchor as cornerstone via `engram_add_cornerstone` or `engram_focus` (duplicate clusters: one supersede + N−1 retract-duplicates — see Invariants).
   <!-- pattern-match is not used here: the principle-guides-execution test IS the semantic-verification step, so a candidate that passes it is verified, not merely pattern-matched. -->
 ... or "None this scan."
 
@@ -361,7 +420,7 @@ Use this format:
 ... or "None this scan."
 
 ## Category 8 — Open tasks with stale external references
-- [tk_XXXX] (verified) status=<active|planned|blocked> — claim references owner/repo#N (<pr MERGED|issue CLOSED> as of <date>; always repo-qualified, never a bare `#N`; an unmerged `pr CLOSED` is never listed here) — suggested action: close task and mark done — external reference owner/repo#N <state>.
+- [tk_XXXX] (verified) status=<active|planned|blocked> — claim references owner/repo#N (<pr MERGED|issue CLOSED> as of <date>; always repo-qualified — a declared bare-repo alias is resolved to its full `owner/repo` before the finding is written, never a bare `#N`; an unmerged `pr CLOSED` is never listed here) — suggested action: close task and mark done — external reference owner/repo#N <state>.
 ... or "None this scan."
 
 ## Category 9 — Cornerstone auto-load surface coverage gaps

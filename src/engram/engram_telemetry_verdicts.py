@@ -630,7 +630,7 @@ def summary_line(db_path, window: Optional[str] = None) -> str:
             pass  # a missing store falls through to the connect below: it stays "not aggregated"
         # (a StoreUnusable propagates: an unusable path is "unavailable" to the caller, not "not aggregated")
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=ro", uri=True)
         except sqlite3.OperationalError:
             return _SUMMARY_NOT_AGGREGATED_MISSING
 

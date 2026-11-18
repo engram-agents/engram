@@ -26,9 +26,11 @@ import os
 import platform
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -79,6 +81,9 @@ class Sandbox:
         self.tools_src.mkdir(parents=True)
         if REAL_INSTALL_SH.exists():
             shutil.copy(REAL_INSTALL_SH, self.tools_src / "install.sh")
+        # Step 3 writes install_tier through the checkout's file guard (stdlib only), so a
+        # repo-shaped tree carries it beside tools/.
+        shutil.copy(REPO_ROOT / "src" / "engram" / "engram_file_guard.py", self.tools_src.parent / "engram_file_guard.py")
         (self.repo / "tools").mkdir()
         (self.repo / "tools" / "install.sh").symlink_to("../src/engram/tools/install.sh")
         (self.repo / "requirements").mkdir()
@@ -123,6 +128,8 @@ e = os.environ
 open(e["CALLS_LOG"], "a").write("bootstrap FORCE_RESEED_EMPTY=%s FORCE=%s TARGET=%s ALPHA_DIR=%s TEMPLATES=%s PYTHON_BIN=%s\\n" % (
     e.get("FORCE_RESEED_EMPTY", "unset"), e.get("FORCE", "unset"), e.get("TARGET"), e.get("ALPHA_DIR"),
     e.get("ALPHA_TEMPLATES_DIR"), e.get("PYTHON_BIN")))
+import json
+open(e["CALLS_LOG"], "a").write("argv-of-bootstrap " +json.dumps(sys.argv[1:]) + "\\n")
 if int(e.get("FAKE_BOOTSTRAP_RC", "0")):
     print("bootstrap fake: failing")
     sys.exit(int(e["FAKE_BOOTSTRAP_RC"]))
@@ -222,8 +229,20 @@ fi
 exec "$REAL_PY" "$@"
 """)
 
+    def use_real_bootstrap(self):
+        """Replace the fake bootstrap.py by a thin wrapper that execs the repo's REAL one, with the
+        real templates beside it. The installer only ASKS about CLAUDE.md; the real bootstrap makes
+        the backups, so the cells about backups need it."""
+        shutil.copytree(REPO_ROOT / "src" / "engram" / "templates", self.plugin_src / "templates", dirs_exist_ok=True)
+        (self.plugin_src / "bootstrap.py").write_text(
+            "import os, sys\n"
+            "open(os.environ['CALLS_LOG'], 'a').write('bootstrap (real) ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+            f"os.execv(sys.executable, [sys.executable, {str(REPO_ROOT / 'src' / 'engram' / 'bootstrap.py')!r}, *sys.argv[1:]])\n"
+        )
+        return self
+
     # -- running -----------------------------------------------------------------------------
-    def run(self, *args, env=None, stdin=subprocess.DEVNULL):
+    def run(self, *args, env=None, stdin=subprocess.DEVNULL, timeout=120):
         e = {
             "PATH": "%s:%s" % (self.fakebin, self.safebin),
             "HOME": str(self.home),
@@ -237,12 +256,37 @@ exec "$REAL_PY" "$@"
             "REAL_PY": sys.executable,
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
+            # #4795: a cell that runs the REAL bootstrap seeds a graph, and seeding downloads the
+            # embedding model into the temp HOME. Off by default; a caller's env can override.
+            "ENGRAM_NO_EMBEDDINGS": "1",
         }
         e.update(env or {})
-        proc = subprocess.run(
+        # The installer runs in its own session so a timeout can kill the whole tree: bootstrap is
+        # bash's child, and subprocess.run(timeout=) kills only bash and leaves it an orphan.
+        proc = subprocess.Popen(
             ["bash", str(self.repo / "tools" / "install.sh"), *args],
-            cwd=str(self.root), env=e, stdin=stdin, capture_output=True, text=True, timeout=120,
+            cwd=str(self.root), env=e, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
         )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as first:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            # Reap, but not on pipe EOF forever: a descendant that left the group (setsid) and holds
+            # stdout/stderr would block here. Bounded; the FIRST TimeoutExpired is the one re-raised.
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+            raise first
+        proc = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         proc.all = proc.stdout + proc.stderr
         return proc
 
@@ -268,8 +312,15 @@ exec "$REAL_PY" "$@"
     def calls_starting(self, prefix):
         return [c for c in self.call_lines() if c.startswith(prefix)]
 
-    def make_db(self, nodes):
+    def make_db(self, nodes, config=True):
+        """An installed seat's knowledge.db. It carries its config.json too (#4705: step 3 refuses a
+        database whose config.json is lost). ``config=True`` writes ``{}`` ONLY when config.json does not
+        exist; an existing config.json is left byte-identical (callers plant their own first).
+        ``config=False`` writes nothing to config.json and does not delete an existing one: the caller
+        owns that state."""
         self.engram.mkdir(parents=True, exist_ok=True)
+        if config and not (self.engram / "config.json").exists():
+            (self.engram / "config.json").write_text("{}\n")
         con = sqlite3.connect(str(self.engram / "knowledge.db"))
         con.execute("CREATE TABLE nodes (id TEXT)")
         con.executemany("INSERT INTO nodes VALUES (?)", [("n%d" % i,) for i in range(nodes)])
@@ -398,12 +449,12 @@ def test_claude_that_does_not_run_fails_step_1(tmp_path):
 def test_git_that_cannot_read_the_checkout_gets_the_safe_directory_remedy(tmp_path):
     sb2 = Sandbox(tmp_path)
     _write(sb2.fakebin / "git", """#!/bin/sh
-echo "fatal: detected dubious ownership in repository at '/some/other/users/checkout'" >&2
+echo "fatal: detected dubious ownership in repository at '/some/other/clone/checkout'" >&2
 exit 128
 """)
     r = sb2.run("--yes")
     assert r.returncode != 0 and "FAIL: [step 1]" in r.stderr, r.all
-    assert "safe.directory '/some/other/users/checkout'" in r.stderr
+    assert "safe.directory '/some/other/clone/checkout'" in r.stderr
     assert not sb2.calls_starting("pip")
 
 
@@ -453,9 +504,19 @@ def test_db_non_empty_skips_bootstrap_and_prints_the_node_count(sb):
     assert sb.calls_starting("selfcheck") == ["selfcheck --phase installed"]
 
 
+def test_make_db_never_overwrites_a_planted_config_json(sb):
+    """#4705 r4: other test files plant their own config.json before make_db; the helper must leave it alone."""
+    sb.engram.mkdir(parents=True, exist_ok=True)
+    planted = b'{"self_lineage": "anthropic:opus", "k": [1, 2]}\n'
+    (sb.engram / "config.json").write_bytes(planted)
+    sb.make_db(3)
+    assert (sb.engram / "config.json").read_bytes() == planted
+
+
 def test_unreadable_db_fails_step_6_instead_of_guessing(sb):
     sb.engram.mkdir(parents=True, exist_ok=True)
     (sb.engram / "knowledge.db").write_text("this is not a sqlite file at all, just text padding " * 4)
+    (sb.engram / "config.json").write_text("{}\n")  # #4705: the DB is unreadable, the config is not lost
     r = sb.run("--yes")
     assert r.returncode != 0 and "FAIL: [step 6]" in r.stderr, r.all
     assert not sb.calls_starting("bootstrap")
@@ -503,61 +564,89 @@ def test_config_created_when_absent_with_install_tier_only(sb):
 
 
 # ── Cell 5: CLAUDE.md backup ───────────────────────────────────────────────────────────────
+def _stamped_backups(claude_home):
+    return sorted(claude_home.glob("CLAUDE.md.engram-backup.*"))
+
+
 def test_existing_claude_md_is_backed_up_with_its_original_bytes(sb):
+    """The installer only ASKS; the real bootstrap makes the backups: the first-ever `.pre-engram`
+    and a stamped copy, both holding the original bytes. The step-6 line names the file and both
+    backup names."""
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     original = b"my own rules \xe2\x80\x94 do not lose me\r\nline two\n"
     (sb.claude_home / "CLAUDE.md").write_bytes(original)
     r = sb.run("--yes")
     assert r.returncode == 0, r.all
     assert (sb.claude_home / "CLAUDE.md.pre-engram").read_bytes() == original
-    assert (sb.claude_home / "CLAUDE.md").read_text() == "rendered by ENGRAM bootstrap\n"
+    stamped = _stamped_backups(sb.claude_home)
+    assert len(stamped) == 1 and stamped[0].read_bytes() == original
+    assert (sb.claude_home / "CLAUDE.md").read_bytes() != original
+    assert sb.calls_starting("argv-of-bootstrap") == [] and sb.calls_starting("bootstrap (real) --replace ")
     assert str(sb.claude_home / "CLAUDE.md") in r.stdout and str(sb.claude_home / "CLAUDE.md.pre-engram") in r.stdout
 
 
-def test_existing_backup_is_left_byte_identical(sb):
+def test_the_installer_makes_no_copy_of_claude_md_itself(sb):
+    """With the fake bootstrap (which copies nothing) an existing CLAUDE.md gets NO backup file:
+    the only code that copies it is bootstrap's guard. A copy made by install.sh would show here."""
     sb.claude_home.mkdir(parents=True)
-    (sb.claude_home / "CLAUDE.md").write_bytes(b"ENGRAM's own rendered file from an earlier run\n")
+    (sb.claude_home / "CLAUDE.md").write_bytes(b"the user's file\n")
+    r = sb.run("--yes")
+    assert r.returncode == 0, r.all
+    assert not (sb.claude_home / "CLAUDE.md.pre-engram").exists()
+    assert _stamped_backups(sb.claude_home) == []
+
+
+def test_existing_backup_is_left_byte_identical(sb):
+    sb.use_real_bootstrap()
+    sb.claude_home.mkdir(parents=True)
+    current = b"ENGRAM's own rendered file from an earlier run\n"
+    (sb.claude_home / "CLAUDE.md").write_bytes(current)
     users_original = b"the user's real original, backed up on the first run\n"
     (sb.claude_home / "CLAUDE.md.pre-engram").write_bytes(users_original)
     r = sb.run("--yes")
     assert r.returncode == 0, r.all
     assert (sb.claude_home / "CLAUDE.md.pre-engram").read_bytes() == users_original
-    assert (sb.claude_home / "CLAUDE.md").read_text() == "rendered by ENGRAM bootstrap\n"
+    stamped = _stamped_backups(sb.claude_home)
+    assert len(stamped) == 1 and stamped[0].read_bytes() == current, "the current file must get its own stamped backup"
+    assert (sb.claude_home / "CLAUDE.md").read_bytes() not in (current, users_original)
     assert str(sb.claude_home / "CLAUDE.md.pre-engram") in r.stdout
 
 
-def test_dangling_backup_link_fails_step_6_before_bootstrap_and_without_force(sb):
+def test_dangling_backup_link_is_left_alone_and_the_current_file_gets_a_stamped_backup(sb):
+    """The backup-name checks moved from the shell to bootstrap's guard: a dangling link at
+    `.pre-engram` is not written through; the stamped backup is made and the run goes on."""
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     original = b"the user's file, must survive\n"
     (sb.claude_home / "CLAUDE.md").write_bytes(original)
     bak = sb.claude_home / "CLAUDE.md.pre-engram"
     bak.symlink_to(sb.root / "nowhere-backup.md")
     r = sb.run("--yes")
-    assert r.returncode != 0
-    assert "FAIL: [step 6]" in r.all and str(bak) in r.all
-    assert "kept untouched" not in r.all
-    assert (sb.claude_home / "CLAUDE.md").read_bytes() == original
-    assert bak.is_symlink() and not (sb.root / "nowhere-backup.md").exists()
-    assert not sb.calls_starting("bootstrap"), sb.call_lines()
+    assert r.returncode == 0, r.all
+    assert bak.is_symlink() and not (sb.root / "nowhere-backup.md").exists(), "the link was written through"
+    stamped = _stamped_backups(sb.claude_home)
+    assert len(stamped) == 1 and stamped[0].read_bytes() == original
 
 
-def test_directory_at_backup_path_fails_step_6_before_bootstrap_and_without_force(sb):
+def test_directory_at_backup_path_is_left_alone_and_the_current_file_gets_a_stamped_backup(sb):
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     original = b"the user's file, must survive\n"
     (sb.claude_home / "CLAUDE.md").write_bytes(original)
     bak = sb.claude_home / "CLAUDE.md.pre-engram"
     bak.mkdir()
     r = sb.run("--yes")
-    assert r.returncode != 0
-    assert "FAIL: [step 6]" in r.all and str(bak) in r.all
-    assert "not a regular file" in r.all
-    assert "kept untouched" not in r.all
-    assert (sb.claude_home / "CLAUDE.md").read_bytes() == original
+    assert r.returncode == 0, r.all
     assert bak.is_dir() and not list(bak.iterdir())
-    assert not sb.calls_starting("bootstrap"), sb.call_lines()
+    stamped = _stamped_backups(sb.claude_home)
+    assert len(stamped) == 1 and stamped[0].read_bytes() == original
 
 
-def test_hard_link_at_backup_path_fails_step_6_before_bootstrap_and_without_force(sb):
+def test_hard_link_at_backup_path_fails_step_6_and_nothing_is_replaced(sb):
+    """bootstrap's guard refuses (the backup name is the same file as CLAUDE.md, so replacing it
+    would overwrite the backup too); the installer reports it as a step-6 failure."""
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     original = b"the user's file, must survive\n"
     md = sb.claude_home / "CLAUDE.md"
@@ -568,22 +657,30 @@ def test_hard_link_at_backup_path_fails_step_6_before_bootstrap_and_without_forc
     assert r.returncode != 0
     assert "FAIL: [step 6]" in r.all and str(bak) in r.all and str(md) in r.all
     assert "same file" in r.all
-    assert "kept untouched" not in r.all
     assert md.read_bytes() == original and bak.read_bytes() == original
-    assert not sb.calls_starting("bootstrap"), sb.call_lines()
+    assert _stamped_backups(sb.claude_home) == []
 
 
 def test_second_run_after_aborted_seed_does_not_overwrite_the_backup(sb):
+    """First run (real bootstrap) saves the original to `.pre-engram`. The seed is then undone
+    (graph and memory markers removed) and CLAUDE.md is edited; the second run replaces CLAUDE.md after a
+    stamped backup of that edit, and `.pre-engram` is not touched."""
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     original = b"user original\n"
     (sb.claude_home / "CLAUDE.md").write_bytes(original)
-    first = sb.run("--yes", env={"FAKE_BOOTSTRAP_RC": "1"})  # backup made, bootstrap then fails
-    assert first.returncode != 0
+    first = sb.run("--yes")
+    assert first.returncode == 0, first.all
     assert (sb.claude_home / "CLAUDE.md.pre-engram").read_bytes() == original
-    (sb.claude_home / "CLAUDE.md").write_bytes(b"something ENGRAM wrote meanwhile\n")
+    # undo the seed (graph and the files that mark an existing agent), keep CLAUDE.md
+    for name in ("knowledge.db", "warm-briefing.md", "seed-manifest.json", "first-run-pending"):
+        (sb.engram / name).unlink()
+    edited = b"something ENGRAM wrote meanwhile\n"
+    (sb.claude_home / "CLAUDE.md").write_bytes(edited)
     second = sb.run("--yes")
     assert second.returncode == 0, second.all
     assert (sb.claude_home / "CLAUDE.md.pre-engram").read_bytes() == original
+    assert edited in [p.read_bytes() for p in _stamped_backups(sb.claude_home)]
 
 
 def test_no_backup_is_made_when_bootstrap_is_skipped(sb):
@@ -704,7 +801,7 @@ def test_the_three_ruled_defaults_are_named_constants_near_the_top():
     head = REAL_INSTALL_SH.read_text().splitlines()[:60]
     text = "\n".join(head)
     assert "DEFAULT_INSTALL_CLAUDE_CODE=0" in text
-    assert "DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD=1" in text
+    assert "DEFAULT_BACKUP_AND_REPLACE_CLAUDE_MD=0" in text
     assert "DEFAULT_RECALL_SERVICE=1" in text
 
 
@@ -861,13 +958,14 @@ def test_dangling_claude_md_symlink_fails_step_1_before_any_real_work(sb):
     (sb.claude_home / "CLAUDE.md").symlink_to(sb.root / "nowhere" / "CLAUDE.md")
     r = sb.run("--yes")
     assert r.returncode != 0 and "FAIL: [step 1]" in r.stderr, r.all
-    assert str(sb.claude_home / "CLAUDE.md") in r.stderr and "remove" in r.stderr.lower()
+    assert str(sb.claude_home / "CLAUDE.md") in r.stderr and "move the link aside" in r.stderr.lower()
     for prefix in ("pip", "marketplace", "bootstrap", "claude plugin", "selfcheck"):
         assert not sb.calls_starting(prefix), sb.call_lines()
     assert (sb.claude_home / "CLAUDE.md").is_symlink()  # untouched
 
 
 def test_live_claude_md_symlink_still_has_its_target_bytes_backed_up(sb):
+    sb.use_real_bootstrap()
     sb.claude_home.mkdir(parents=True)
     target = sb.root / "dotfiles" / "CLAUDE.md"
     target.parent.mkdir()
@@ -888,6 +986,31 @@ def test_header_states_the_step_1_no_fetch_gap():
     assert "stale" in head and "origin/*" in head
     assert "--branch" in head and "shallow" in head
     assert "git fetch --tags origin" in head
+    # #4645: a shallow single-branch tag clone is NOT rescued by the tags-only fetch.
+    flat = " ".join(line.lstrip("# ").strip() for line in head.splitlines())  # undo comment wrapping
+    assert "does NOT rescue a shallow clone" in flat
+    assert "set-branches origin" in head and "--unshallow" in head
+    # The full-clone remedy must survive on its own: the shallow sentence also names the tags-only
+    # fetch, so a bare "git fetch --tags origin" check cannot tell if the full-clone case is dropped.
+    assert "full clone with stale origin/* refs: `git fetch --tags origin`" in flat
+
+
+def test_step_1_refusal_names_both_remedies_for_stale_and_shallow_clones(tmp_path):
+    """#4645: a HEAD that is not a deployable tag merged into origin/dev is refused at step 1. The
+    printed remedy must cover a full clone with stale refs (git fetch --tags origin) AND a shallow
+    single-branch clone (set-branches + --unshallow), for which the tags-only fetch does nothing."""
+    sb2 = Sandbox(tmp_path)
+    sb2.commit_on_branch("unmerged-feature")
+    r = sb2.run("--yes")
+    assert r.returncode != 0 and "FAIL: [step 1]" in r.stderr, r.all
+    assert "is not a deployable tag merged into origin/dev or origin/main" in r.stderr
+    # The full-clone remedy is pinned by its own sentence; the shallow sentence also names the
+    # tags-only fetch, so a bare substring check could not see the full-clone case dropped.
+    assert "full clone with stale refs, run git fetch --tags origin first" in r.stderr
+    assert "set-branches origin" in r.stderr and "--unshallow" in r.stderr
+    # The copyable command ends the message: no punctuation glued to it.
+    assert r.stderr.rstrip().endswith("git remote set-branches origin '*' && git fetch --unshallow")
+    assert "--sandbox-untagged is for a test rig only" in r.stderr
 
 
 # ═══ #4255 slice 1: the --multi-agent / --single-agent axis is retired ═════════════════════════
@@ -1042,3 +1165,98 @@ def test_forum_url_hint_names_the_tier_not_the_retired_flag(sb):
     assert r.returncode != 0 and "FAIL: [step 8]" in r.stderr, r.all
     assert "--multi-agent" not in r.stderr
     assert "convenience or dev" in r.stderr
+
+
+# --------------------------------------------------------------------- #4795: a timeout kills the tree
+
+def _pid_alive(pid):
+    """True while the pid is a live process; a zombie (dead, awaiting its reaper) counts as gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        state = Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state != "Z"
+
+
+def test_sandbox_run_timeout_kills_the_whole_process_tree(tmp_path):
+    """#4795: on a timeout the installer's whole process group dies, not just the bash that was
+    started. The fake bootstrap (bash's child) writes its pid, ignores SIGTERM and sleeps; before the
+    fix it outlived the TimeoutExpired as an orphan under PID 1."""
+    sb = Sandbox(tmp_path)
+    pidfile = tmp_path / "bootstrap.pid"
+    _write(sb.plugin_src / "bootstrap.py", (
+        "import os, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "open(%r, 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n" % str(pidfile)
+    ), 0o644)
+    pid = None
+    try:
+        started = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            sb.run("--yes", timeout=8)
+        elapsed = time.monotonic() - started
+        assert pidfile.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 2
+        while _pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _pid_alive(pid), "the bootstrap (pid %d) outlived the timeout" % pid
+        assert elapsed < 8 + 10, "the timeout path took %.1fs: the kill did not reach the whole group" % elapsed
+    finally:
+        if pid is None and pidfile.exists():
+            pid = int(pidfile.read_text())
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_sandbox_run_sets_the_embedding_opt_out_by_default_and_the_caller_env_wins_even_with_an_empty_string(tmp_path):
+    """#4795: the bootstrap a Sandbox run starts sees ENGRAM_NO_EMBEDDINGS=1 unless the caller's env
+    says otherwise (the caller's env wins). The override is the empty string, the only falsy value of
+    this variable (engram_core treats any non-empty string, "0" included, as the opt-out); the cell
+    pins that the caller's value, even an empty one, replaces the default, not what it does downstream."""
+    seen = {}
+    for label, env in (("default", None), ("override", {"ENGRAM_NO_EMBEDDINGS": ""})):
+        sb = Sandbox(tmp_path / label)
+        out = tmp_path / ("seen-" + label)
+        _write(sb.plugin_src / "bootstrap.py", (
+            "import os\nopen(%r, 'w').write(os.environ.get('ENGRAM_NO_EMBEDDINGS', 'unset'))\n" % str(out)
+        ), 0o644)
+        sb.run("--yes", env=env)
+        assert out.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
+        seen[label] = out.read_text()
+    assert seen == {"default": "1", "override": ""}, seen
+
+
+def test_sandbox_run_timeout_is_bounded_when_a_descendant_left_the_group_holding_the_pipes(tmp_path):
+    """#4795 review S2: a descendant that left the process group (setsid) and holds stdout/stderr must
+    not block the timeout path on pipe EOF; the old subprocess.run(timeout=2) returned in 2 s."""
+    sb = Sandbox(tmp_path)
+    pidfile = tmp_path / "escaper.pid"
+    _write(sb.plugin_src / "bootstrap.py", (
+        "import subprocess, time\n"
+        "p = subprocess.Popen(['sleep', '20'], start_new_session=True)\n"
+        "open(%r, 'w').write(str(p.pid))\n"
+        "time.sleep(60)\n" % str(pidfile)
+    ), 0o644)
+    try:
+        started = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired) as ei:
+            sb.run("--yes", timeout=2)
+        elapsed = time.monotonic() - started
+        assert ei.value.timeout == 2, "the re-raised TimeoutExpired is not the first one: %r" % ei.value.timeout
+        assert pidfile.exists(), "the installer never reached the fake bootstrap: %s" % sb.call_lines()
+        assert elapsed < 10, "the timeout path took %.1fs: it waited on a descendant holding the pipes" % elapsed
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass

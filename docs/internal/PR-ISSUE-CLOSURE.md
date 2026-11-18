@@ -102,6 +102,35 @@ form that fires the parser.
    A single-shot check right after editing is not evidence either way, and
    do not assume the delay is short just because it resolved quickly once.
 
+   **The stale window can last minutes, until the next edit event.** One case,
+   umwelt#710 (2026-08-23): its body first carried `Does not close #699`, an
+   adjacent close keyword under negation, the trap documented above. An edit
+   34 seconds later removed it. Six minutes after that edit,
+   `closingIssuesReferences` still returned #699 (a captured response, not a
+   recollection). It appears to have cleared at the next edit event, a title
+   rename hours later; no read was captured at the rename itself. So a stale
+   answer is not bounded to a few seconds. This is one data
+   point (n=1, one repo; public repos not measured), and whether the window is bound to the next
+   edit event or to time was not measured.
+
+   **No proximity gap: the grep's adjacency matches the parser.** #710 was
+   first read as a proximity blind spot: the keyword and `#699` looked far
+   apart in the title, yet the issue would close. Three probe sets on a scratch
+   repo (umwelt#744, 2026-08-26) tested that and found the opposite. The parser
+   linked a keyword to `#N` only when the reference immediately followed it;
+   words between, a bracketed aside, a sentence break or a bare line break in
+   the same paragraph all broke the link, and with two `#N` after one keyword
+   only the adjacent one linked. Title text alone never populated
+   `closingIssuesReferences` before merge, and three replica constructions,
+   one of them an exact replica of #710, reproduced 0 of 3. Reading the body's edit history
+   (`userContentEdits` in GraphQL) then found the negated adjacent keyword
+   above. So the adjacent-only greps (checks 2 and 3 in `CLAUDE.md`) match the
+   measured parser on adjacency and need no widening for distance; the
+   cross-repo `owner/repo#N` form is covered by check 3 only. The
+   GraphQL query is still the only real pre-merge check, because of the stale
+   window, not because of a distance rule. umwelt's `CLAUDE.md` carries the
+   full record; this paragraph is its engram copy (#2213).
+
 3. **No commit-message auto-close** (always): `closingIssuesReferences` reads
    the PR BODY only — a merge commit's own message is a THIRD close surface
    GitHub's parser reads independently, invisible to checks 1 and 2. **This

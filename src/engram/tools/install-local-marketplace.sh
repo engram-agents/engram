@@ -51,6 +51,17 @@
 #   marketplace is registered.
 #
 # IDEMPOTENT: re-running cleans + reassembles the marketplace tree.
+#
+# EXIT CODES:
+#   0   finished; nothing was left undone.
+#   1   failed (an error line says why; a venv or embedding-model failure also exits 1).
+#   2   ENGRAM_HOME is not an absolute path.
+#   10  FINISHED, WITH ITEMS NOT DONE. The marketplace was assembled, but one or more steps were
+#       skipped (the install_tier persist step refused to change config.json; a Codex agent file
+#       could not be installed). The run does not stop at the first one: it collects them and ends
+#       with a block that lists each item and what the user should do. Code 10 is not a "retry"
+#       signal: running the installer again changes nothing until the cause in the block is fixed.
+#       A caller shows the user that block; it does not loop on this code.
 
 set -euo pipefail
 
@@ -87,7 +98,52 @@ die() { printf '[install-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 # (Lei, 2026-08-10). The trap catches all exits; it is a no-op when the
 # venv block never flagged (the normal case).
 _venv_fail=0
-_venv_fail_trap() {
+
+# The temp folder holding the pre-add snapshot of the user's Claude files (#4628); removed by the
+# EXIT trap on every path. Empty when no snapshot was taken.
+_cc_snap=""
+
+# Items the run could not do. The run goes on past each one and ends with a block that lists them
+# (see _report_not_done), then exits EXIT_NOT_DONE: neither a silent warning nor an abort half way.
+EXIT_NOT_DONE=10
+_not_done=""
+_not_done_n=0
+# not_done "<what was not done>" "<what the user should do about it>"
+not_done() {
+  _not_done_n=$((_not_done_n + 1))
+  _not_done="${_not_done}  ${_not_done_n}. $1"$'\n'"     What to do: $2"$'\n'
+}
+_report_not_done() {
+  [[ -n "${_not_done:-}" ]] || return 0
+  log ""
+  log "═══════════════════════════════════════════════════════════════════"
+  log " ITEMS NOT DONE ($_not_done_n)"
+  log "═══════════════════════════════════════════════════════════════════"
+  log "The marketplace step finished, but these items were not done:"
+  log ""
+  # Strip the trailing newline here, not inside the heredoc: bash 3.2 does not expand $'\n' in a
+  # heredoc body, so the list would end with an extra empty line there.
+  local _nd_body="${_not_done%$'\n'}"
+  while IFS= read -r _nd_line; do log "$_nd_line"; done <<EOF_ND
+${_nd_body}
+EOF_ND
+  log ""
+  log "Show this list to the user. Running the installer again does not fix an item until its cause is fixed."
+  if [[ "${1:-0}" -eq 0 && "${_venv_fail:-0}" != "1" ]]; then
+    log "Exit code $EXIT_NOT_DONE means: finished, with items not done."
+  fi
+}
+
+# One EXIT trap for every path. The installer has several early `exit 0` short-circuits
+# (--skip-add, codex-not-found, the codex plugin path) that fire BEFORE the end of the script, so an
+# end-of-script check would be unreachable from those paths; the trap catches all exits.
+_exit_trap() {
+  local rc=$?
+  if [[ -n "${_cc_snap:-}" ]]; then
+    # `|| true`: under set -e a failed rm would abort this trap and change the exit code
+    rm -rf "$_cc_snap" || true
+  fi
+  _report_not_done "$rc"
   if [[ "${_venv_fail:-0}" == "1" ]]; then
     log ""
     log "ERROR: venv runtime-requirements provisioning failed."
@@ -95,8 +151,11 @@ _venv_fail_trap() {
     log "       Re-run this installer to retry, or inspect the pip output above."
     exit 1
   fi
+  if [[ "$rc" -eq 0 && -n "${_not_done:-}" ]]; then
+    exit "$EXIT_NOT_DONE"
+  fi
 }
-trap _venv_fail_trap EXIT
+trap _exit_trap EXIT
 
 usage() {
   cat <<'EOF'
@@ -122,6 +181,15 @@ Options:
                     gate (#2563) treats as the deployable predecessors. Use only for
                     a deliberate untagged deploy (e.g. certifying an unreleased
                     merge commit); .deployed-version records alpha_tag=none.
+
+Exit codes:
+  0    finished; nothing left undone.
+  1    failed (an error line says why).
+  10   finished, WITH ITEMS NOT DONE: the marketplace was assembled, but a step was skipped (the
+       install_tier persist step refused to change config.json, or a Codex agent file could not
+       be installed). The run ends with a block that lists each item and what to do. Show that
+       block to the user. Code 10 is not a retry signal: running again fixes nothing until the
+       cause in the block is fixed.
 
 After running:
   $ENGRAM_HOME/marketplace/.claude-plugin/marketplace.json
@@ -517,24 +585,56 @@ fi
 # Only runs in the non-skip-build path: --skip-build callers managed their own
 # flags and their choices are not visible here.
 if [[ $SKIP_BUILD -eq 0 ]] && [[ -n "${_cfg:-}" ]] && [[ -f "${_cfg}" ]] && command -v python3 &>/dev/null; then
-  python3 - "${_cfg}" "${_tier:-}" <<'PY'
-import json, sys
-path, tier = sys.argv[1], sys.argv[2]
-try:
-    with open(path) as f:
-        d = json.load(f)
-except (OSError, json.JSONDecodeError):
+  # The write goes through the one file guard of this checkout (MERGE class: install_tier is the
+  # one key written, every other key keeps its value and order, a changed file is backed up
+  # first, an unchanged one is not touched, a file that does not parse is refused and left as is).
+  # A refusal does not stop the run and is not hidden: it is collected as an item NOT done and
+  # listed in the block at the end of the run (exit code 10). The tier is only remembered for the
+  # next upgrade, so nothing else depends on it. The reason line is kept (stderr) for that block.
+  _persist_err="$(mktemp "${TMPDIR:-/tmp}/install-local-marketplace-persist.XXXXXX")"
+  # Exit codes of the block: 0 saved or nothing to do; 1 refused (file untouched, or its old contents
+  # put back); 3 refused and the put-back failed too, so the file may be incomplete. The sentence in
+  # the block at the end follows the code, because "left exactly as it was" is false for 3.
+  _persist_rc=0
+  python3 - "${_cfg}" "${_tier:-}" "$REPO_ROOT/src/engram" 2>"$_persist_err" <<'PY' || _persist_rc=$?
+import sys
+path, tier, guard_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+if not tier:
     sys.exit(0)
-changed = False
-if tier and d.get('install_tier') != tier:
-    d['install_tier'] = tier
-    changed = True
-if changed:
-    with open(path, 'w') as f:
-        json.dump(d, f, indent=2)
-        f.write('\n')
-    print(f"[install-local-marketplace] config.json updated: install_tier={tier or 'unset'}")
+sys.dont_write_bytecode = True
+sys.path.insert(0, guard_dir)
+import engram_file_guard as fg
+from pathlib import Path
+try:
+    result = fg.apply_merge(Path(path), {'install_tier': tier}, filename='config.json')
+except fg.WriteRefused as exc:
+    # The guard says which state the file is in; this line must not claim more than that.
+    if exc.outcome == 'may_be_incomplete':
+        print(f"[install-local-marketplace] config.json may be incomplete: {exc}", file=sys.stderr)
+        sys.exit(3)
+    if exc.outcome == 'restored':
+        print(f"[install-local-marketplace] config.json write failed and its previous contents were put back: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"[install-local-marketplace] config.json left unchanged: {exc}", file=sys.stderr)
+    sys.exit(1)
+except (fg.MergeRefused, OSError, SystemExit) as exc:
+    print(f"[install-local-marketplace] config.json left unchanged: {exc}", file=sys.stderr)
+    sys.exit(1)
+if result != 'unchanged':
+    print(f"[install-local-marketplace] config.json updated: install_tier={tier}")
 PY
+  if [[ $_persist_rc -eq 0 ]]; then
+    cat "$_persist_err" >&2
+  elif [[ $_persist_rc -eq 3 ]]; then
+    cat "$_persist_err" >&2
+    not_done "install_tier may not have been saved to ${_cfg} ($(tail -n 1 "$_persist_err" | sed 's/^\[install-local-marketplace\] //')). The file may be incomplete." \
+             "restore that file from the backup named above, then run this installer again; until then the next upgrade does not remember the tier."
+  else
+    cat "$_persist_err" >&2
+    not_done "install_tier was not saved to ${_cfg} ($(tail -n 1 "$_persist_err" | sed 's/^\[install-local-marketplace\] //')). The file was left exactly as it was." \
+             "fix that file, or move it aside, then run this installer again; until then the next upgrade does not remember the tier."
+  fi
+  rm -f "$_persist_err"
 fi
 
 # ── Tier-aware venv provisioning (Lei 2026-08-10, #576/#578) ──────────────────
@@ -600,10 +700,17 @@ def cache_dir():
 
 
 def remedy(model):
+    # The server's own helper: a pinned model is fetched by the loader's
+    # pinned path, an unpinned one by name (a by-name fetch would not satisfy
+    # the pinned cache check).
+    helper = getattr(server, "_embedding_prewarm_command", None)
+    if helper is not None:
+        return helper(model)
+    import shlex
     return (
-        venv_py + " -c "
-        + chr(34) + "from sentence_transformers import SentenceTransformer; "
-        + "SentenceTransformer(" + repr(model) + ")" + chr(34)
+        shlex.quote(venv_py) + " -c "
+        + shlex.quote("from sentence_transformers import SentenceTransformer; "
+                      + "SentenceTransformer(" + repr(model) + ")")
     )
 
 
@@ -942,23 +1049,45 @@ PY
   if compgen -G "$MARKETPLACE_ROOT/plugins/engram/agents/*.toml" > /dev/null; then
     log "Installing Codex custom-agent TOML files -> $CODEX_AGENTS_DIR"
     mkdir -p "$CODEX_AGENTS_DIR"
-    cp -a "$MARKETPLACE_ROOT/plugins/engram/agents/"*.toml "$CODEX_AGENTS_DIR/"
 
     # Codex custom agents are config layers.  Plugin MCP tool allow/deny policy
     # must target the plugin-provided server namespace, not top-level
-    # [mcp_servers.*] transport tables.  Rewrite older built TOMLs defensively.
-    python3 - "$CODEX_AGENTS_DIR" <<'PY'
-import pathlib
+    # [mcp_servers.*] transport tables.  The text is rewritten for that BEFORE it
+    # is written, then written through the one file guard of this checkout: a
+    # file that is already there and differs from what would be written may hold
+    # the user's edits, so it is saved to a time-stamped backup first, and each
+    # backup is printed as "backup: <file> -> <backup>". These are ENGRAM's own
+    # file names, so no question is asked (one per upgrade would train a reflex yes).
+    _codex_err="$(mktemp "${TMPDIR:-/tmp}/install-local-marketplace-codex.XXXXXX")"
+    if ! python3 - "$MARKETPLACE_ROOT/plugins/engram/agents" "$CODEX_AGENTS_DIR" "$REPO_ROOT/src/engram" 2>"$_codex_err" <<'PY'
 import sys
-agents_dir = pathlib.Path(sys.argv[1])
-for path in agents_dir.glob("engram-*.toml"):
-    text = path.read_text(encoding="utf-8")
-    text = text.replace(
-        "[mcp_servers.engram]",
-        "[plugins.\"engram@engram-local\".mcp_servers.engram]",
-    )
-    path.write_text(text, encoding="utf-8")
+from pathlib import Path
+src_dir, dest_dir, guard_dir = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+sys.dont_write_bytecode = True
+sys.path.insert(0, guard_dir)
+import engram_file_guard as fg
+OLD = "[mcp_servers.engram]"
+NEW = "[plugins.\"engram@engram-local\".mcp_servers.engram]"
+items = []
+for src in sorted(src_dir.glob("*.toml")):
+    text = src.read_text(encoding="utf-8")
+    if src.name.startswith("engram-"):
+        text = text.replace(OLD, NEW)
+    items.append(fg.Item(dest_dir / src.name, text))
+try:
+    fg.apply(fg.plan(items), fg.Consent(all_paths=True))
+except (fg.Refused, SystemExit) as exc:
+    print(f"[install-local-marketplace] Codex agent files NOT installed: {exc}", file=sys.stderr)
+    sys.exit(1)
 PY
+    then
+      cat "$_codex_err" >&2
+      not_done "the Codex custom-agent files were not all installed into ${CODEX_AGENTS_DIR} ($(tail -n 1 "$_codex_err" | sed 's/^\[install-local-marketplace\] //')). Nothing was overwritten without a backup." \
+               "fix the cause named there (for example, a folder sitting where a file should be), then run: bash tools/install-local-marketplace.sh --target codex"
+    else
+      cat "$_codex_err" >&2
+    fi
+    rm -f "$_codex_err"
   else
     log "WARN: no Codex custom-agent TOML files found in $MARKETPLACE_ROOT/plugins/engram/agents"
   fi
@@ -970,8 +1099,32 @@ else
     exit 0
   fi
 
+  # #4628: `claude plugin marketplace add` rewrites two of the user's own files and prints nothing
+  # about it. Snapshot them first, name every key it changed or removed afterwards, and keep a copy
+  # of the old file when something would be lost. The helper never fails (it exits 0 whatever
+  # happens), and `claude`'s own exit status is still the script's: it is held across the report
+  # and re-raised, so `set -e` behaves as it did before. The CLI honours CLAUDE_CONFIG_DIR.
+  _cc_home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  _cc_files=("$_cc_home/plugins/known_marketplaces.json" "$_cc_home/settings.json")
+  _cc_diff="$(dirname "$_self")/claude_config_diff.py"
+  if [[ -f "$_cc_diff" ]] && command -v python3 >/dev/null 2>&1; then
+    if _cc_snap="$(mktemp -d "${TMPDIR:-/tmp}/install-local-marketplace-claude-snap.XXXXXX" 2>/dev/null)"; then
+      python3 "$_cc_diff" snapshot --dest "$_cc_snap" "${_cc_files[@]}" || true
+    else
+      _cc_snap=""
+    fi
+  fi
+
   log "Registering marketplace with Claude Code"
-  claude plugin marketplace add "$MARKETPLACE_ROOT"
+  _cc_rc=0
+  claude plugin marketplace add "$MARKETPLACE_ROOT" || _cc_rc=$?
+
+  if [[ -n "$_cc_snap" ]]; then
+    python3 "$_cc_diff" report --snapshot "$_cc_snap" --backup-root "$ENGRAM_HOME/install-backups" "${_cc_files[@]}" || true
+  fi
+  if [[ "$_cc_rc" -ne 0 ]]; then
+    exit "$_cc_rc"
+  fi
 fi
 
 log ""

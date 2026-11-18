@@ -1,7 +1,7 @@
 # ENGRAM Performance Diagnostic — Telemetry Analysis (Agent: borges)
 
-Data sources: `/home/agent-borges/.engram/knowledge.db` (`tool_timing`, 28,675 rows,
-2026-04-16 → 2026-07-06) and `/home/agent-borges/.engram/logs/index.db` (`events`
+Data sources: `~/.engram/knowledge.db` (`tool_timing`, 28,675 rows,
+2026-04-16 → 2026-07-06) and `~/.engram/logs/index.db` (`events`
 table, 37,040 rows, 2026-05-17 → 2026-07-06). `index.db` had to be copied to scratch
 before opening (the live handle refused read-only open — likely an in-progress
 writer holding the file open; no `-wal`/`-shm` sidecars existed at copy time).

@@ -501,6 +501,8 @@ _LINE_KEY = _re.compile(r":\d+$")
 # #4118: the install self-check's three graph reads, tools/install_selfcheck.py:_read_counts (the per-type node
 # count 25c988d6..., the edge count e5aee287...) and :_read_present_ids (the seed ids present, the registry's
 # json_each form, cce0379e...).
+# #2652 (unit 02): the store tool's two typed reads, tools/store_read.py:read_ids (the person-node fairy's
+# id population, 23ce2be5...) and :read_axiom_count (first-session's seed-empty count, 5ee7819d...).
 # #4616: the model-switch read's keyset-paged whole-graph read, tools/model_switch_read.py:fetch_nodes (73de74c4...).
 _FROZEN_TEMPLATE_KEYS = frozenset({
     "73de74c4aad9014d7752a64207a73e615cfc75f43c27b2e211be956f8a575503",
@@ -563,6 +565,8 @@ _FROZEN_TEMPLATE_KEYS = frozenset({
     "e3872e7780af9a2fb346d7019adb7f9bd36fd49794c534d74c2f96e364c9d129",
     "f3fb3410d99851f0e833a131cbdc574e9e676b124dd85d9841250a21f8e05c0a",
     "f80855b47d7d7e10bf3fc0b5d045906133299e4433da52de0ea75c0fa5a851fe",
+    "23ce2be5ab613fe531483b0f047b05a731e7813baed3249a46ea2dd752f3251b",  # tools/store_read.py:read_ids (#2652 unit 02)
+    "5ee7819d148c8b57d0b45742b7d0196d6113ac76275d0423ffbc5f01b542d7f4",  # tools/store_read.py:read_axiom_count (#2652 unit 02)
 })
 
 

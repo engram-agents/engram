@@ -3,7 +3,7 @@
 Part 2 installer promotion tests:
 - --dry-run flag: action plan lines printed, no systemd/filesystem side-effects.
 - Template rendering: rendered unit contains substituted service-dir + port,
-  retains UMask=002 and the ONE-INSTANCE invariant comment.
+  carries UMask=0022 (#4499) and the ONE-INSTANCE invariant comment.
 - Foreign-dir guard: abort if --service-dir exists, is non-empty, and has no app/.
 - DB preservation: forum.db not overwritten.
 
@@ -32,6 +32,9 @@ _TEMPLATE = _REPO_ROOT / "src" / "forum" / "deploy" / "engram-forum.service.temp
 
 def _run_installer(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     """Run the installer shell script and return the CompletedProcess."""
+    args = list(args)
+    if "--auth-mode" not in args:  # required on every run (#1459); these cells are not about it
+        args += ["--auth-mode", "enforce"]
     cmd = ["bash", str(_INSTALLER)] + args
     return subprocess.run(
         cmd,
@@ -39,6 +42,18 @@ def _run_installer(args: list[str], **kwargs) -> subprocess.CompletedProcess:
         text=True,
         **kwargs,
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path_factory, monkeypatch):
+    """#4393: the installer's --dry-run reads the CALLER's real unit under
+    $HOME/.config/systemd/user. Point HOME and XDG_CONFIG_HOME at a per-test
+    scratch dir (outside tmp_path, which cells inspect) so a seat's real unit
+    never reaches these cells. Cells that pass their own env=HOME still win."""
+    h = tmp_path_factory.mktemp("isolated-home")
+    monkeypatch.setenv("HOME", str(h))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(h / ".config"))
+    return h
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +187,8 @@ class TestTemplateRendering:
         rendered = rendered.replace("5002", port)
         # No --baton-login-map given: the installer renders the placeholder to nothing.
         rendered = rendered.replace("{{BATON_LOGIN_MAP_ARGS}}", "")
+        # --auth-mode is required on every run; the installer renders the operator's choice.
+        rendered = rendered.replace("{{AUTH_MODE_ARGS}}", "--auth-mode enforce")
         return rendered
 
     def test_rendered_unit_contains_service_dir(self, tmp_path):
@@ -188,11 +205,13 @@ class TestTemplateRendering:
             f"Rendered unit does not contain port 5099:\n{rendered}"
         )
 
-    def test_rendered_unit_retains_umask_002(self, tmp_path):
+    def test_rendered_unit_carries_umask_0022(self, tmp_path):
+        # #4499: no group write. A LINE match: the substring "UMask=002" is also in "UMask=0022".
         service_dir = str(tmp_path / "custom_forum")
         rendered = self._render_template(service_dir)
-        assert "UMask=002" in rendered, (
-            f"Rendered unit must retain UMask=002 (group-writable files):\n{rendered}"
+        lines = [ln.strip() for ln in rendered.splitlines()]
+        assert "UMask=0022" in lines and "UMask=002" not in lines, (
+            f"Rendered unit must carry UMask=0022 (no group write, #4499):\n{rendered}"
         )
 
     def test_rendered_unit_retains_one_instance_comment(self, tmp_path):
@@ -545,6 +564,15 @@ class TestExistingMapNotSilentlyDropped:
         assert not log.exists(), f"refusal must precede every action: {log.read_text()}"
         assert not (tmp_path / "forum").exists()
 
+    def test_refusal_reached_under_isolated_home_4393(self, tmp_path):
+        """#4393 guard stays exercised: a unit carrying a login map, planted in the
+        scratch HOME, still makes --dry-run refuse with the drop-warning text."""
+        r, unit, log = _install(tmp_path, [], unit=_EXISTING_EXEC)
+        assert r.returncode != 0, r.stdout + r.stderr
+        assert "already carries a baton login map" in r.stderr
+        assert str(unit).startswith(str(tmp_path))
+
+
     def test_same_path_flag_proceeds(self, tmp_path):
         r, unit, _ = _install(tmp_path, ["--baton-login-map", "/old/map.json"],
                               unit=_EXISTING_EXEC)
@@ -627,7 +655,7 @@ class TestSystemBashCompat:
             ["/bin/bash", str(_INSTALLER), "--src", str(_REPO_ROOT),
              "--service-dir", str(tmp_path / "forum"), "--group", "agents",
              "--baton-login-map", _MAP, "--baton-login-map-admin-uid", "1001",
-             "--dry-run"],
+             "--auth-mode", "enforce", "--dry-run"],
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stdout + r.stderr

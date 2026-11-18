@@ -29,6 +29,14 @@ Coverage:
      post-#1598 consolidation) satisfies the (a)/(b)/(c) rule above.
   10. load_roster: absent file is an IO error — exits 1 (SystemExit(1)).
   11. load_roster: invalid regex in roster triggers exit 1 (usage error).
+  12. Roster secret scope: no workflow binds NAME_LEAK_ROSTER outside a step's
+     ``env`` (workflow-level env, job-level env, job ``container.env``,
+     ``services.*.env``, and step ``with`` are flagged; a step ``env`` is the
+     one legal location), the step-level bindings are non-vacuous and include
+     tests.yml and pr-checks.yml, and a synthetic table pins each flagged
+     path. Only the allowlisted step-env sites may carry the secret, compared
+     as a multiset so a duplicate identity is still a surplus binding; a
+     surplus binding and a stale allowlist entry both fail. alpha#4568.
 
 Principal marker: the principal set is declared in a separate
 ``NAME_LEAK_PRINCIPAL`` variable (same regex-line convention as the roster:
@@ -46,6 +54,7 @@ policy-allowed — but it still flags a roster name on a ``run:`` line, a step
 ``name:``, an env value, or in an ``@``-mention anywhere.
 """
 
+from collections import Counter
 import importlib.util
 import json
 import os
@@ -77,6 +86,18 @@ _spec.loader.exec_module(_mod)
 scan_diff = _mod.scan_diff
 load_roster = _mod.load_roster
 format_json = _mod.format_json
+
+
+def _entries(roster_source=None, roster_file=None):
+    """The parsed pattern entries of a roster.
+
+    ``load_roster`` returns ``(entries, roster_format)``; most cells only need
+    the entries. The cells that pin the format unpack it directly.
+    """
+    entries, _roster_format = load_roster(
+        roster_source=roster_source, roster_file=roster_file
+    )
+    return entries
 
 # ---------------------------------------------------------------------------
 # Fake names used in tests — obviously-fake placeholders only, no real names.
@@ -120,7 +141,7 @@ def _require_roster() -> str:
     roster.
     """
     roster = roster_text()
-    if roster is None or not load_roster(roster_source=roster, roster_file=None):
+    if roster is None or not _entries(roster_source=roster, roster_file=None):
         pytest.skip(_SKIP_REASON)
     return roster
 
@@ -424,7 +445,7 @@ def _fake_diff(added_lines: list[str], removed_lines: list[str] | None = None,
 
 def test_removed_lines_not_scanned():
     """Removed lines (starting with '-') must not trigger matches."""
-    patterns = load_roster(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
+    patterns = _entries(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
     diff = _fake_diff(
         added_lines=["# nothing here"],
         removed_lines=[f"# old comment mentioning {FAKE_NAME_A}"],
@@ -435,7 +456,7 @@ def test_removed_lines_not_scanned():
 
 def test_context_lines_not_scanned():
     """Context lines (starting with ' ') must not trigger matches."""
-    patterns = load_roster(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
+    patterns = _entries(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
     diff = _fake_diff(
         added_lines=["# new clean line"],
         context_lines=[f"# context mentioning {FAKE_NAME_A}"],
@@ -446,7 +467,7 @@ def test_context_lines_not_scanned():
 
 def test_added_line_fires():
     """Added lines that match the pattern ARE reported."""
-    patterns = load_roster(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
+    patterns = _entries(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
     diff = _fake_diff(added_lines=[f"# Author: {FAKE_NAME_A}"])
     matches = scan_diff(diff, patterns)
     assert len(matches) == 1, f"expected 1 match; got {matches}"
@@ -461,7 +482,7 @@ def test_added_line_fires():
 def test_word_boundary_no_false_positive():
     """Pattern \\bAlice\\b must NOT match 'Malice' or 'aliceblue'."""
     # Use just the first word of FAKE_NAME_A to test boundary sensitivity
-    patterns = load_roster(roster_source=r"\bAlice\b", roster_file=None)
+    patterns = _entries(roster_source=r"\bAlice\b", roster_file=None)
     diff = _fake_diff(added_lines=["color = 'aliceblue'  # or Malice"])
     matches = scan_diff(diff, patterns)
     assert matches == [], f"\\b anchors should prevent false positive; got {matches}"
@@ -469,7 +490,7 @@ def test_word_boundary_no_false_positive():
 
 def test_word_boundary_does_match_standalone():
     """Pattern \\bAlice\\b DOES match 'Alice' standing alone."""
-    patterns = load_roster(roster_source=r"\bAlice\b", roster_file=None)
+    patterns = _entries(roster_source=r"\bAlice\b", roster_file=None)
     diff = _fake_diff(added_lines=["# Alice wrote this"])
     matches = scan_diff(diff, patterns)
     assert len(matches) == 1
@@ -481,7 +502,7 @@ def test_word_boundary_does_match_standalone():
 
 def test_json_format_shape():
     """--format json output has required top-level key and match fields."""
-    patterns = load_roster(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
+    patterns = _entries(roster_source=f"\\b{FAKE_NAME_A}\\b", roster_file=None)
     diff = _fake_diff(added_lines=[f"author = '{FAKE_NAME_A}'"])
     matches = scan_diff(diff, patterns)
     output = format_json(matches)
@@ -508,7 +529,7 @@ def test_json_format_empty_matches():
 
 def test_empty_roster_no_matches():
     """Empty patterns list produces zero matches regardless of diff content."""
-    patterns = load_roster(roster_source="", roster_file=None)
+    patterns = _entries(roster_source="", roster_file=None)
     diff = _fake_diff(added_lines=["any content here including anything"])
     matches = scan_diff(diff, patterns)
     assert matches == [], f"empty roster should produce no matches; got {matches}"
@@ -516,7 +537,7 @@ def test_empty_roster_no_matches():
 
 def test_none_roster_no_matches():
     """None roster source with no file also produces zero matches."""
-    patterns = load_roster(roster_source=None, roster_file=None)
+    patterns = _entries(roster_source=None, roster_file=None)
     diff = _fake_diff(added_lines=["some added line"])
     matches = scan_diff(diff, patterns)
     assert matches == []
@@ -529,7 +550,7 @@ def test_none_roster_no_matches():
 def test_multi_pattern_correct_index():
     """Second pattern in roster reports pattern_index=1."""
     roster_text = f"\\b{FAKE_NAME_A}\\b\n\\b{FAKE_NAME_B}\\b"
-    patterns = load_roster(roster_source=roster_text, roster_file=None)
+    patterns = _entries(roster_source=roster_text, roster_file=None)
     assert len(patterns) == 2
     diff = _fake_diff(added_lines=[f"# config for {FAKE_NAME_B}"])
     matches = scan_diff(diff, patterns)
@@ -540,7 +561,7 @@ def test_multi_pattern_correct_index():
 def test_multi_pattern_first_pattern_wins():
     """When a line matches both patterns, pattern_index=0 (first match wins, one per line)."""
     roster_text = f"\\b{FAKE_NAME_A}\\b\n\\b{FAKE_NAME_B}\\b"
-    patterns = load_roster(roster_source=roster_text, roster_file=None)
+    patterns = _entries(roster_source=roster_text, roster_file=None)
     diff = _fake_diff(added_lines=[f"# {FAKE_NAME_A} and {FAKE_NAME_B}"])
     matches = scan_diff(diff, patterns)
     assert len(matches) == 1, "one match per line (break after first hit)"
@@ -915,6 +936,39 @@ def test_workflow_no_principal_marker_degrades_to_non_comment_only(monkeypatch):
     )
 
 
+def test_pr_checks_roster_comment_names_both_formats():
+    """The comment above the roster-check step must state BOTH roster formats.
+
+    Format 2 (``A<TAB>`` blocks, ``B<TAB>`` counted) is what the rotation makes
+    live; format 1 is the legacy plain-regex form. A comment true of one format
+    and false of the other is how the next reader concludes the opposite of the
+    truth, so the cell requires both halves in the SAME comment block. The block
+    is located by its format-2 token, not by its first line, so rewording the
+    opening line does not make the check vacuous."""
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in WORKFLOW_PATH.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            current.append(stripped)
+        elif current:
+            blocks.append("\n".join(current))
+            current = []
+    if current:
+        blocks.append("\n".join(current))
+
+    format2_blocks = [block for block in blocks if "A<TAB>" in block]
+    assert len(format2_blocks) == 1, (
+        "expected exactly one comment block naming the format-2 `A<TAB>` "
+        f"grammar; found {len(format2_blocks)}"
+    )
+    block = format2_blocks[0]
+    assert "legacy" in block.lower() or "format 1" in block.lower(), (
+        "the roster-format comment must name format 2 AND the legacy format 1; "
+        f"got {block!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 9: workflow hygiene — pr-checks.yml (hosts the name-leak-warn job)
 # ---------------------------------------------------------------------------
@@ -1017,16 +1071,16 @@ def test_load_roster_absent_file_exits_1(tmp_path):
 
 
 def test_load_roster_empty_string_returns_empty():
-    """Empty string roster source returns empty list without error."""
-    patterns = load_roster(roster_source="", roster_file=None)
-    assert patterns == []
+    """Empty string roster source returns an empty pattern list without error."""
+    entries, _roster_format = load_roster(roster_source="", roster_file=None)
+    assert entries == []
 
 
 def test_load_roster_comment_and_blank_lines_skipped():
     """Blank lines and #-comment lines are skipped in roster parsing."""
     roster = "\n# this is a comment\n\n\\bAlice\\b\n"
-    patterns = load_roster(roster_source=roster, roster_file=None)
-    assert len(patterns) == 1
+    entries, _roster_format = load_roster(roster_source=roster, roster_file=None)
+    assert len(entries) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1041,6 +1095,424 @@ def test_load_roster_invalid_regex_exits_1(tmp_path):
     with pytest.raises(SystemExit) as exc_info:
         load_roster(roster_source=None, roster_file=str(roster_file))
     assert exc_info.value.code == 1
+
+
+# Contract for ``load_roster`` on an uncompilable roster line (engram#4559): exit
+# 1 before returning any pattern; write exactly ONE stderr line naming the
+# failing line by its RAW 1-based number in the roster text (blank and comment
+# lines count, the numbering ``name-leak-gate.yml`` prints) plus the exception
+# class and ``.pos``; write NOTHING derived from the line's text (not the line,
+# not a truncation, not ``repr``, not ``str(exc)``, not ``exc.msg``). The roster
+# is the NAME_LEAK_ROSTER secret and ``pr-checks.yml`` leaves stderr unredirected.
+@pytest.mark.parametrize("entry_point", ["roster_file", "roster_source"])
+def test_load_roster_compile_error_names_the_line_not_its_text(
+    tmp_path, capsys, entry_point
+):
+    """A bad roster line exits 1 naming raw line 4, echoing none of its text.
+
+    The bad line is ``(?P=<token>)``: CPython raises "unknown group name
+    '<token>'", so ``str(exc)`` and ``exc.msg`` both embed the invented token.
+    That is asserted below, so a green cell proves the ``str(exc)`` leak is
+    covered and not only the ``repr(line)`` leak. The token appears nowhere else
+    in the repository.
+    """
+    token = "Zvimbrelq"
+    bad_line = f"(?P={token})"
+    with pytest.raises(re.error) as probe:
+        re.compile(bad_line)
+    assert token in str(probe.value) and token in probe.value.msg, (
+        "precondition: this CPython must embed the token in str(exc) and exc.msg"
+    )
+
+    # Raw numbering: valid line, comment, blank, then the bad line = line 4.
+    roster = "\\bQuillonfex\\b\n# a comment\n\n" + bad_line + "\n"
+    if entry_point == "roster_file":
+        roster_file = tmp_path / "roster.txt"
+        roster_file.write_text(roster, encoding="utf-8")
+        kwargs = {"roster_source": None, "roster_file": str(roster_file)}
+    else:
+        kwargs = {"roster_source": roster, "roster_file": None}
+
+    with pytest.raises(SystemExit) as exc_info:
+        load_roster(**kwargs)
+
+    assert exc_info.value.code == 1, (
+        f"an uncompilable roster line must exit 1; got {exc_info.value.code!r}"
+    )
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1, f"exactly one stderr line; got {err!r}"
+    assert "roster line 4" in err, (
+        f"the message must name the raw 1-based line number 4; got {err!r}"
+    )
+    assert f"offset {probe.value.pos}" in err, (
+        f"the message must carry exc.pos ({probe.value.pos}); got {err!r}"
+    )
+    assert type(probe.value).__name__ in err, (
+        f"the message must carry the exception class name; got {err!r}"
+    )
+    assert token not in err, f"the roster line's text reached stderr: {err!r}"
+    assert bad_line not in err, f"the roster line reached stderr: {err!r}"
+    assert probe.value.msg not in err and "unknown group name" not in err, (
+        f"str(exc) / exc.msg reached stderr: {err!r}"
+    )
+
+
+# The one-line contract also holds for compile failures that are not ``re.error``
+# or whose ``.pos`` is None (#4711 review). ``RecursionError`` (deeply nested
+# parentheses) is caught by the same clause but has no cell here: provoking it is
+# slow and depends on the interpreter's recursion limit.
+def _assert_one_line_unknown_offset(capsys, bad_line, token, class_name):
+    with pytest.raises(SystemExit) as exc_info:
+        load_roster(roster_source="\\bQuillonfex\\b\n" + bad_line + "\n", roster_file=None)
+    assert exc_info.value.code == 1, f"must exit 1; got {exc_info.value.code!r}"
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1, f"exactly one stderr line; got {err!r}"
+    assert "roster line 2" in err, f"must name raw line 2; got {err!r}"
+    assert class_name in err, f"must carry {class_name}; got {err!r}"
+    assert "offset unknown" in err, f"no int pos, so 'offset unknown'; got {err!r}"
+    assert token not in err, f"the roster line's text reached stderr: {err!r}"
+
+
+def test_load_roster_overflow_error_is_one_line_without_text(capsys):
+    """``<Token>{99999999999}`` raises OverflowError (no ``.pos``), not re.error."""
+    token = "Xelvandroq"
+    bad_line = f"{token}{{99999999999}}"
+    try:
+        re.compile(bad_line)
+    except OverflowError:
+        pass
+    except re.error:
+        pytest.skip("this Python raises re.error, not OverflowError, for the line")
+    else:
+        pytest.skip("this Python compiles the line; no OverflowError to test")
+    _assert_one_line_unknown_offset(capsys, bad_line, token, "OverflowError")
+
+
+def test_load_roster_pos_none_error_reports_offset_unknown(capsys):
+    """A re.error whose ``.pos`` is None prints ``offset unknown``, not ``None``."""
+    token = "Ysparnovik"
+    bad_line = f"(?<={token}+)x"
+    try:
+        re.compile(bad_line)
+    except re.error as probe:
+        if probe.pos is not None:
+            pytest.skip(f"this Python sets pos={probe.pos!r} for the line")
+        # The class name is "error" on 3.12 and "PatternError" on 3.13+.
+        class_name = type(probe).__name__
+    else:
+        pytest.skip("this Python compiles the line; no re.error to test")
+    _assert_one_line_unknown_offset(capsys, bad_line, token, class_name)
+
+
+# ---------------------------------------------------------------------------
+# Test 12: roster format 2 is read through the scanner's parser (engram#4817)
+# ---------------------------------------------------------------------------
+#
+# Contract (spec roster-consumers-migration §1 C1/C4/C4a, §2.5 T6–T7, as
+# amended): this consumer has no parser of its own. Both roster paths go
+# through the scanner's `parse_roster_text(require_classes=False)`:
+#   - a format-2 roster keeps the classes its lines declare;
+#   - a format-1 roster is class A (the legacy format's own meaning);
+#   - JSON output always carries `"class"`;
+#   - TEXT output carries a `[class=...]` tag only when the detected format is
+#     2, so format-1 text stays byte-identical to today's.
+# The old format-2 refusal is gone with the local parser.
+
+_FMT2_TOKEN_A = "ZZAlphaHolder"
+_FMT2_TOKEN_B = "YYBravoHandle"
+
+
+def _run_warn(roster_text: str, tmp_path, added_lines: list[str]):
+    roster_file = tmp_path / "roster.txt"
+    roster_file.write_text(roster_text, encoding="utf-8")
+    diff_file = tmp_path / "pr.diff"
+    diff_file.write_text(_fake_diff(added_lines=added_lines), encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, str(TOOL_PATH),
+         "--roster-file", str(roster_file),
+         "--diff-file", str(diff_file)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _run_warn_json(roster_text: str, tmp_path, added_lines: list[str]):
+    roster_file = tmp_path / "roster-json.txt"
+    roster_file.write_text(roster_text, encoding="utf-8")
+    diff_file = tmp_path / "pr-json.diff"
+    diff_file.write_text(_fake_diff(added_lines=added_lines), encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, str(TOOL_PATH),
+         "--roster-file", str(roster_file),
+         "--diff-file", str(diff_file),
+         "--format", "json"],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _t6_format2_roster() -> str:
+    return (
+        "A\t\\b" + _FMT2_TOKEN_A + "\\b\n"
+        "B\t\\b" + _FMT2_TOKEN_B + "\\b\n"
+    )
+
+
+def test_t6_format2_end_to_end_and_format1_output_unchanged(tmp_path):
+    """T6: through the tool, a class-B match reports `"class": "B"` and a
+    class-A match reports `"A"`; a format-1 roster reports `"class": "A"` in
+    JSON and its TEXT output is byte-identical to today's assertion."""
+    format2 = _t6_format2_roster()
+
+    rb = _run_warn_json(format2, tmp_path, [f"# {_FMT2_TOKEN_B} was here"])
+    assert rb.returncode == 0, rb.stdout + rb.stderr
+    data_b = json.loads(rb.stdout)
+    assert len(data_b["matches"]) == 1, data_b
+    assert data_b["matches"][0]["class"] == "B", data_b
+
+    ra = _run_warn_json(format2, tmp_path, [f"# {_FMT2_TOKEN_A} was here"])
+    assert ra.returncode == 0, ra.stdout + ra.stderr
+    data_a = json.loads(ra.stdout)
+    assert len(data_a["matches"]) == 1, data_a
+    assert data_a["matches"][0]["class"] == "A", data_a
+
+    # The TEXT tag sits immediately after the [pattern_index=N] tag, and only
+    # a format-2 roster produces one.
+    rt = _run_warn(format2, tmp_path, [f"# {_FMT2_TOKEN_B} was here"])
+    assert rt.returncode == 0, rt.stdout + rt.stderr
+    assert "[pattern_index=1] [class=B]" in rt.stdout, rt.stdout
+
+    # Format 1: JSON says class A; TEXT is byte-identical to today's form.
+    format1 = "\\b" + _FMT2_TOKEN_A + "\\b\n"
+    rf = _run_warn_json(format1, tmp_path, [f"# {_FMT2_TOKEN_A} was here"])
+    assert rf.returncode == 0, rf.stdout + rf.stderr
+    data_f = json.loads(rf.stdout)
+    assert len(data_f["matches"]) == 1, data_f
+    assert data_f["matches"][0]["class"] == "A", data_f
+
+    text = _run_warn(format1, tmp_path, [f"# {_FMT2_TOKEN_A} was here"])
+    assert text.returncode == 0, text.stdout + text.stderr
+    assert text.stdout.strip() == (
+        f"path/to/file.py:1:[pattern_index=0] # {_FMT2_TOKEN_A} was here"
+    ), text.stdout
+
+
+def test_t7_string_path_parses_format2_without_exiting():
+    """T7: ``load_roster(roster_source=<format-2 text>, roster_file=None)``
+    parses and returns entries — it does not `SystemExit`.
+
+    This is the third consumer: ``_require_roster()`` feeds the real secret
+    through this path, so post-rotation a `SystemExit` here would kill the
+    pytest run instead of skipping."""
+    entries, roster_format = load_roster(
+        roster_source=_t6_format2_roster(), roster_file=None
+    )
+    assert roster_format == 2
+    assert [klass for _pattern, klass in entries] == ["A", "B"]
+
+
+def test_c6_warn_tool_fails_loud_when_the_scanner_cannot_be_found(tmp_path):
+    """C6: the tool never silently degrades.
+
+    A copy with neither a sibling ``scan-leaks.py`` nor the source-tree path
+    exits 1 with ONE line naming what it could not find, and no traceback. It
+    never falls back to parsing the roster itself."""
+    isolated = tmp_path / "isolated"
+    isolated.mkdir()
+    tool = isolated / "name_leak_warn.py"
+    tool.write_text(TOOL_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    roster = isolated / "roster.txt"
+    roster.write_text("\\b" + _FMT2_TOKEN_A + "\\b\n", encoding="utf-8")
+    diff = isolated / "pr.diff"
+    diff.write_text(_fake_diff(added_lines=["# a clean line"]), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(tool),
+         "--roster-file", str(roster),
+         "--diff-file", str(diff)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.count("could not locate the roster parser") == 1, (
+        result.stderr
+    )
+    assert "Traceback" not in result.stderr, result.stderr
+
+
+def test_production_extraction_layout_resolves_the_sibling_scanner(tmp_path):
+    """The layout the gate's scan steps actually use must RESOLVE, not merely
+    avoid the symlink.
+
+    T12 pins that the workflow extracts `src/engram/tools/scan-leaks.py` rather
+    than the `tools/scan-leaks.py` symlink; C6 pins that a copy with no sibling
+    fails loud. Neither pins that the production layout WORKS: the scan steps
+    write the base commit's warn tool (under its extraction name) and the
+    scanner into one bare per-run directory and execute the tool with
+    `python3 -P`. This cell recreates exactly that directory — only the two
+    files, so neither fallback candidate can mask a broken sibling lookup — and
+    requires BOTH class labels back.
+
+    The interpreter is `sys.executable`, never a hardcoded `python3`: a
+    different interpreter would not be the one this suite runs on. `-P` keeps
+    the bare directory off `sys.path`, as the workflow does.
+    """
+    layout = tmp_path / "run"
+    layout.mkdir()
+    # The scanner under the name the scan steps extract it to, read from the
+    # real module and never through tools/scan-leaks.py (T12's reason).
+    scanner = layout / "scan-leaks.py"
+    scanner.write_text(
+        (REPO_ROOT / "src" / "engram" / "tools" / "scan-leaks.py").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    # The warn tool under the name the scan steps extract it to.
+    tool = layout / "name_leak_warn_base.py"
+    tool.write_text(TOOL_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    roster = layout / "roster.txt"
+    roster.write_text(_t6_format2_roster(), encoding="utf-8")
+    diff = layout / "pr.diff"
+    diff.write_text(
+        _fake_diff(
+            added_lines=[
+                f"# {_FMT2_TOKEN_A} was here",
+                f"# {_FMT2_TOKEN_B} was here",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-P", str(tool),
+         "--roster-file", str(roster),
+         "--diff-file", str(diff),
+         "--format", "json"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = json.loads(result.stdout)
+    classes = [match["class"] for match in data["matches"]]
+    assert "A" in classes and "B" in classes, (
+        "the bare-directory layout must resolve the sibling scanner and report "
+        f"both class labels; got {classes}"
+    )
+
+
+def test_format1_roster_still_behaves_as_before(tmp_path, capsys):
+    """Control: the same consumer on a format-1 roster loads the pattern and
+    reports a match exactly as it did before format inference landed."""
+    roster_file = tmp_path / "roster.txt"
+    roster_file.write_text(f"\\b{FAKE_NAME_A}\\b\n", encoding="utf-8")
+
+    entries, roster_format = load_roster(
+        roster_source=None, roster_file=str(roster_file)
+    )
+    assert roster_format == 1
+    assert len(entries) == 1
+    assert capsys.readouterr().err == ""
+
+    r = _run_warn(f"\\b{FAKE_NAME_A}\\b\n", tmp_path, [f"# {FAKE_NAME_A} was here"])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert FAKE_NAME_A in r.stdout, r.stdout
+    assert "pattern_index=0" in r.stdout, r.stdout
+    assert "[class=" not in r.stdout, (
+        "a format-1 roster's text output must stay byte-identical (no tag)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Class priority: a line that matches both classes reports class A (engram#4822)
+# ---------------------------------------------------------------------------
+#
+# Contract: ``scan_diff`` emits AT MOST ONE match per added line, and the
+# reported class is ``A`` whenever ANY matching pattern is class ``A``; only
+# when no class-A pattern matches is the first matching class-B pattern
+# reported. ``pattern_index`` is the roster position of the FIRST matching
+# pattern of the chosen class, so the output shape is unchanged.
+#
+# Why the class, not the roster order, decides: class A blocks and class B is
+# counted only, so reporting B on a line A matches turns a blocking hit into an
+# advisory one — and makes the reported class depend on where the roster happens
+# to list the patterns. #4816 fixed the same fail-open in the blocking scanner;
+# this function is a separate reader and kept it.
+
+_PRIORITY_B_THEN_A = (
+    "B\t\\b" + _FMT2_TOKEN_B + "\\b\n"
+    "A\t\\b" + _FMT2_TOKEN_A + "\\b\n"
+)
+_PRIORITY_A_THEN_B = (
+    "A\t\\b" + _FMT2_TOKEN_A + "\\b\n"
+    "B\t\\b" + _FMT2_TOKEN_B + "\\b\n"
+)
+
+
+def _priority_entries(roster_text: str):
+    entries, roster_format = load_roster(
+        roster_source=roster_text, roster_file=None
+    )
+    assert roster_format == 2, f"fixture must be a format-2 roster; got {roster_format}"
+    return entries
+
+
+def test_class_a_wins_when_b_precedes_a():
+    """A line matching BOTH classes reports A even when the roster lists B first.
+
+    The discriminating cell: with break-at-first-match the line reports B,
+    because the roster's first matching pattern is the class-B one."""
+    entries = _priority_entries(_PRIORITY_B_THEN_A)
+    diff = _fake_diff(
+        added_lines=[f"# {_FMT2_TOKEN_B} and {_FMT2_TOKEN_A}"]
+    )
+    matches = scan_diff(diff, entries)
+    assert len(matches) == 1, f"one match per line; got {matches}"
+    assert matches[0]["class"] == "A", (
+        f"a line a class-A pattern matches must report A; got {matches}"
+    )
+    assert matches[0]["pattern_index"] == 1, (
+        "pattern_index must be the first matching A's position (1 here); "
+        f"got {matches[0]['pattern_index']}"
+    )
+
+
+def test_class_a_wins_when_a_precedes_b():
+    """Control: with A listed before B the both-class line still reports A.
+
+    This cell passes before and after the fix — it pins that the rule is
+    "A wins", not "the first match wins with a different tie-break"."""
+    entries = _priority_entries(_PRIORITY_A_THEN_B)
+    diff = _fake_diff(
+        added_lines=[f"# {_FMT2_TOKEN_A} and {_FMT2_TOKEN_B}"]
+    )
+    matches = scan_diff(diff, entries)
+    assert len(matches) == 1, f"one match per line; got {matches}"
+    assert matches[0]["class"] == "A", matches
+    assert matches[0]["pattern_index"] == 0, matches
+
+
+def test_class_b_only_line_still_reports_b():
+    """A line matching only a class-B pattern reports B and that pattern's index."""
+    entries = _priority_entries(_PRIORITY_B_THEN_A)
+    diff = _fake_diff(added_lines=[f"# {_FMT2_TOKEN_B} was here"])
+    matches = scan_diff(diff, entries)
+    assert len(matches) == 1, matches
+    assert matches[0]["class"] == "B", matches
+    assert matches[0]["pattern_index"] == 0, matches
+
+
+def test_class_a_only_line_reports_a():
+    """A line matching only a class-A pattern reports A and that pattern's index.
+
+    The roster here lists B first, so this cell also pins that the A position is
+    reported rather than the first pattern that matched at all."""
+    entries = _priority_entries(_PRIORITY_B_THEN_A)
+    diff = _fake_diff(added_lines=[f"# {_FMT2_TOKEN_A} was here"])
+    matches = scan_diff(diff, entries)
+    assert len(matches) == 1, matches
+    assert matches[0]["class"] == "A", matches
+    assert matches[0]["pattern_index"] == 1, matches
 
 
 # ---------------------------------------------------------------------------
@@ -1108,3 +1580,571 @@ def test_subprocess_json_output(tmp_path):
     m = data["matches"][0]
     assert m["pattern_index"] == 0
     assert FAKE_NAME_A in m["line"]
+
+
+# ---------------------------------------------------------------------------
+# Roster secret scope guard: NAME_LEAK_ROSTER binds only in a step's `env`
+# ---------------------------------------------------------------------------
+#
+# The roster holds real personal names. A step-level `env:` hands it to exactly
+# the step that needs it; a workflow- or job-level `env:` hands it to every step
+# in that scope, including steps that dump their environment or run third-party
+# actions. The cells elsewhere in this file read the variable's VALUE; none of
+# them reads where the YAML binds it, so moving a binding up a level would leave
+# every one of them green. These cells read the binding's location.
+#
+# The sweep is over a glob of .github/workflows/ rather than the three-file
+# tuple used by the CI-flags guard, so a workflow added later is covered the
+# day it lands. The check is deliberately key-based: it flags a literal
+# `NAME_LEAK_ROSTER` key and never scans a value that embeds or aliases the
+# name. The secret's value is never read here — only the key's location.
+
+_ROSTER_VAR = "NAME_LEAK_ROSTER"
+_WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
+_WORKFLOW_FILES = tuple(
+    sorted(
+        path
+        for path in _WORKFLOWS_DIR.glob("*")
+        if path.suffix in (".yml", ".yaml")
+    )
+)
+
+
+def _roster_bindings_outside_steps(doc: dict) -> list[str]:
+    """Dotted paths where a workflow doc binds NAME_LEAK_ROSTER outside a step env.
+
+    Returns [] for a clean doc. Each entry is a JSON-ish path a human can grep:
+      "env.NAME_LEAK_ROSTER"                            (workflow-level env)
+      "jobs.<job_id>.env.NAME_LEAK_ROSTER"              (job-level env)
+      "jobs.<job_id>.container.env.NAME_LEAK_ROSTER"    (job container env)
+      "jobs.<job_id>.services.<svc>.env.NAME_LEAK_ROSTER" (service env)
+      "jobs.<job_id>.steps[3].with.NAME_LEAK_ROSTER"    (step `with`)
+      "jobs.<job_id>.steps[3].env.NAME_LEAK_ROSTER"      -> NOT reported (legal)
+    A step's `env` is the only legal location. A step's `with` is reported,
+    because a `with:` value is action input, not an environment binding, and
+    this check is about the environment. A job's ``container.env`` and each
+    ``services.<id>.env`` apply the variable to the job's containers rather
+    than to one step, so they are outside a step in the same sense — a service
+    container is often a third-party image, so handing it the roster is an
+    exposure surface. No workflow uses ``container:`` or ``services:`` today;
+    those legs are latent coverage. The check is key-based: it flags a literal
+    ``NAME_LEAK_ROSTER`` key and does not scan a value that embeds or aliases
+    the name.
+    """
+    found: list[str] = []
+
+    workflow_env = doc.get("env")
+    if isinstance(workflow_env, dict) and _ROSTER_VAR in workflow_env:
+        found.append(f"env.{_ROSTER_VAR}")
+
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict):
+        return found
+
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        job_env = job.get("env")
+        if isinstance(job_env, dict) and _ROSTER_VAR in job_env:
+            found.append(f"jobs.{job_id}.env.{_ROSTER_VAR}")
+        container = job.get("container")
+        if isinstance(container, dict):
+            container_env = container.get("env")
+            if isinstance(container_env, dict) and _ROSTER_VAR in container_env:
+                found.append(f"jobs.{job_id}.container.env.{_ROSTER_VAR}")
+        services = job.get("services")
+        if isinstance(services, dict):
+            for service_id, service in services.items():
+                if not isinstance(service, dict):
+                    continue
+                service_env = service.get("env")
+                if isinstance(service_env, dict) and _ROSTER_VAR in service_env:
+                    found.append(
+                        f"jobs.{job_id}.services.{service_id}.env.{_ROSTER_VAR}"
+                    )
+        for index, step in enumerate(job.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            step_with = step.get("with")
+            if isinstance(step_with, dict) and _ROSTER_VAR in step_with:
+                found.append(f"jobs.{job_id}.steps[{index}].with.{_ROSTER_VAR}")
+
+    return found
+
+
+# Synthetic docs for the scope table. Each must-flag case names the exact dotted
+# path it expects; the last case is the positive control — a step-level `env` is
+# the one legal location and must return [] so the function cannot reject
+# everything and still look green.
+_ROSTER_BINDING_CASES = (
+    pytest.param(
+        {"env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"}},
+        ["env.NAME_LEAK_ROSTER"],
+        id="workflow-env",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                }
+            }
+        },
+        ["jobs.build.env.NAME_LEAK_ROSTER"],
+        id="job-env",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "container": {
+                        "image": "example/image:1",
+                        "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                    }
+                }
+            }
+        },
+        ["jobs.build.container.env.NAME_LEAK_ROSTER"],
+        id="job-container-env",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "services": {
+                        "db": {
+                            "image": "example/postgres:1",
+                            "env": {
+                                _ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"
+                            },
+                        }
+                    }
+                }
+            }
+        },
+        ["jobs.build.services.db.env.NAME_LEAK_ROSTER"],
+        id="job-service-env",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {"run": "echo first"},
+                        {
+                            "uses": "example/action@v1",
+                            "with": {
+                                _ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"
+                            },
+                        },
+                    ]
+                }
+            }
+        },
+        ["jobs.build.steps[1].with.NAME_LEAK_ROSTER"],
+        id="step-with",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {
+                            "run": "echo legal",
+                            "env": {
+                                _ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+        [],
+        id="step-env-is-legal",
+    ),
+)
+
+
+@pytest.mark.parametrize("path", _WORKFLOW_FILES, ids=lambda path: path.name)
+def test_real_workflows_bind_roster_only_in_step_env(path):
+    """No workflow may bind NAME_LEAK_ROSTER outside a step's `env`.
+
+    Covers every *.yml / *.yaml in .github/workflows/ by glob, so a workflow
+    added after this test was written is still checked.
+    """
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(doc, dict), (
+        f"{path.name}: yaml.safe_load did not return a mapping (got "
+        f"{type(doc).__name__}); refusing to read that as a clean pass"
+    )
+    offenders = _roster_bindings_outside_steps(doc)
+    assert offenders == [], (
+        f"{path.name} binds {_ROSTER_VAR} outside a step env: "
+        f"{', '.join(offenders)}. A workflow- or job-level env hands the "
+        "secret to every step in that scope; bind it on the one step that "
+        "needs it."
+    )
+
+
+def test_roster_step_env_bindings_are_non_vacuous():
+    """The scope guard must be checking real bindings, not an empty set.
+
+    Half (a): at least one step-level binding exists somewhere in the workflow
+    set, so a wholesale rename cannot leave the sweep green over nothing.
+    Half (b): tests.yml and pr-checks.yml each still bind it at step level —
+    those are the two workflows that must keep running the real-roster
+    self-test.
+    """
+    assert _WORKFLOW_FILES, (
+        f"no *.yml/*.yaml found under {_WORKFLOWS_DIR}; the scope guard is "
+        "vacuous"
+    )
+
+    step_env_files: dict[str, int] = {}
+    for path in _WORKFLOW_FILES:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert isinstance(doc, dict), (
+            f"{path.name}: yaml.safe_load did not return a mapping (got "
+            f"{type(doc).__name__}); refusing to read that as a clean pass"
+        )
+        count = len(_roster_step_env_keys(doc))
+        if count:
+            step_env_files[path.name] = count
+
+    assert step_env_files, (
+        f"no workflow binds {_ROSTER_VAR} at step level; the scope guard "
+        "would pass over nothing and a wholesale rename would go unnoticed"
+    )
+    for required in ("tests.yml", "pr-checks.yml"):
+        assert step_env_files.get(required, 0) >= 1, (
+            f"{required} no longer carries a step-level {_ROSTER_VAR} "
+            "binding; those are the two workflows that must keep the "
+            "real-roster self-test running"
+        )
+
+
+@pytest.mark.parametrize("doc,expected", _ROSTER_BINDING_CASES)
+def test_roster_bindings_outside_steps_scope_table(doc, expected):
+    """Flag workflow env, job env, job container/service env and step `with`;
+    allow a step `env`."""
+    assert _roster_bindings_outside_steps(doc) == expected
+
+
+# ---------------------------------------------------------------------------
+# Roster step-env allowlist: only the named steps may carry the secret
+# ---------------------------------------------------------------------------
+#
+# The scope sweeper above rejects every location but a step's `env`. Within a
+# step's `env`, the issue's closing condition is narrower still: only the steps
+# that actually need the roster may carry it. This allowlist names the six
+# sites that existed when it was written, derived from the YAML itself.
+#
+# A step identity is the step's `name` when it has one, else its `id`, else its
+# 0-based index — the same precedence applied by the scan below.
+#
+# The comparison is over MULTISETS, not sets: two steps in one job that resolve
+# to the same identity are two bindings, so the second fails as a surplus
+# instead of collapsing into the first. Equality is asserted in BOTH
+# directions: a surplus step-level binding fails (the closing condition), and
+# an allowlisted entry with no matching step also fails, so deleting a step
+# cannot silently leave a stale permission behind.
+
+_ROSTER_STEP_ALLOWLIST: dict[str, frozenset[tuple[str, str | int]]] = {
+    "name-leak-gate.yml": frozenset(
+        {
+            ("name-leak-gate", "decide the gate verdict"),
+        }
+    ),
+    "name-leak-sweep.yml": frozenset(
+        {("name-leak-sweep", "decide, then sweep the whole tree")}
+    ),
+    "nightly.yml": frozenset(
+        {
+            ("pytest", "Name-leak-warn self-test (real roster)"),
+        }
+    ),
+    "pr-checks.yml": frozenset(
+        {
+            ("pr-checks", "name-leak-warn — check for name-leak roster secret"),
+            ("pr-checks", "name-leak-warn — compute diff and scan for name mentions"),
+            (
+                "pr-checks",
+                "invariant-checks — name-leak-warn self-test with the real roster",
+            ),
+        }
+    ),
+    "tests.yml": frozenset(
+        {
+            ("pytest", "Run pytest — name-leak-warn self-test (real roster)"),
+        }
+    ),
+}
+
+
+def _roster_step_env_keys(doc: dict) -> dict[tuple[str, str | int], list[int]]:
+    """Map each step-env binding's (job_id, step_identity) to its step indices.
+
+    Step identity is the step's ``name`` when it has one, else its ``id``, else
+    its 0-based index. The value is the list of 0-based indices that resolved to
+    that key — a list rather than a count so a duplicate identity can be named
+    by the index of the surplus occurrence. Only a step's own ``env`` counts
+    here: workflow-level and job-level env, a job ``container.env`` and a
+    ``services.*.env`` are the sweeper's concern.
+    """
+    occurrences: dict[tuple[str, str | int], list[int]] = {}
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict):
+        return occurrences
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        for index, step in enumerate(job.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            env = step.get("env")
+            if not (isinstance(env, dict) and _ROSTER_VAR in env):
+                continue
+            if step.get("name"):
+                identity: str | int = step["name"]
+            elif step.get("id"):
+                identity = step["id"]
+            else:
+                identity = index
+            occurrences.setdefault((job_id, identity), []).append(index)
+    return occurrences
+
+
+def _format_step(identity: str | int, index: int | None = None) -> str:
+    """Render a step identity for a failure message.
+
+    An index-identified step is printed as "step index N (0-based)" rather than
+    a bare integer. When ``index`` is given, it is the step's 0-based position
+    in the job — load-bearing for a duplicate identity, where the identity is
+    shared and only the index tells the two steps apart.
+    """
+    if isinstance(identity, int):
+        return f"step index {identity} (0-based)"
+    if index is None:
+        return f"step {identity!r}"
+    return f"step {identity!r} at step index {index}"
+
+
+def _roster_step_env_mismatches(
+    doc: dict,
+    allowed: frozenset[tuple[str, str | int]] | set[tuple[str, str | int]],
+) -> tuple[list[tuple[str, str | int, int]], list[tuple[str, str | int]]]:
+    """Return (surplus, missing) step-env keys relative to ``allowed``.
+
+    The comparison is a MULTISET one (``collections.Counter`` on both sides):
+    two steps that resolve to the same identity are two bindings. ``surplus``
+    holds one ``(job_id, identity, step_index)`` per binding beyond the allowed
+    count, so a second step reusing an allowlisted identity is named by its own
+    index. ``missing`` holds one ``(job_id, identity)`` per allowlisted entry
+    with no matching step.
+    """
+    occurrences = _roster_step_env_keys(doc)
+    actual = Counter(
+        {key: len(indices) for key, indices in occurrences.items()}
+    )
+    expected = Counter(allowed)
+
+    surplus: list[tuple[str, str | int, int]] = []
+    for key in actual - expected:
+        job_id, identity = key
+        allowed_count = expected.get(key, 0)
+        for index in sorted(occurrences[key])[allowed_count:]:
+            surplus.append((job_id, identity, index))
+
+    missing: list[tuple[str, str | int]] = []
+    for key, shortfall in (expected - actual).items():
+        job_id, identity = key
+        for _ in range(shortfall):
+            missing.append((job_id, identity))
+
+    surplus.sort(key=repr)
+    missing.sort(key=repr)
+    return surplus, missing
+
+
+# Synthetic docs for the allowlist comparison. The first case is the positive
+# control: a doc whose step-env binding IS allowlisted returns clean, so the
+# check cannot pass by rejecting every doc. The remaining cases pin each
+# mismatch direction and the name -> id -> index identity precedence.
+_ROSTER_STEP_ENV_CASES = (
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {
+                            "name": "allowed",
+                            "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                        }
+                    ]
+                }
+            }
+        },
+        frozenset({("build", "allowed")}),
+        [],
+        [],
+        id="allowlisted-step-env-is-clean",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {
+                            "name": "unlisted",
+                            "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                        }
+                    ]
+                }
+            }
+        },
+        frozenset(),
+        [("build", "unlisted", 0)],
+        [],
+        id="unlisted-step-env-flagged",
+    ),
+    pytest.param(
+        {"jobs": {"build": {"steps": [{"run": "echo nothing"}]}}},
+        frozenset({("build", "gone")}),
+        [],
+        [("build", "gone")],
+        id="stale-allowlist-entry-flagged",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {
+                            "name": "the-name",
+                            "id": "the-id",
+                            "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                        }
+                    ]
+                }
+            }
+        },
+        frozenset({("build", "the-name")}),
+        [],
+        [],
+        id="identity-prefers-name",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {
+                            "id": "the-id",
+                            "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                        }
+                    ]
+                }
+            }
+        },
+        frozenset({("build", "the-id")}),
+        [],
+        [],
+        id="identity-falls-back-to-id",
+    ),
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {"run": "first"},
+                        {
+                            "run": "second",
+                            "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                        },
+                    ]
+                }
+            }
+        },
+        frozenset({("build", 1)}),
+        [],
+        [],
+        id="identity-falls-back-to-index",
+    ),
+    # A duplicate identity is a second binding, not a set collision: the
+    # allowlist permits one step named "dup", so the step at index 1 is surplus.
+    pytest.param(
+        {
+            "jobs": {
+                "build": {
+                    "steps": [
+                        {
+                            "name": "dup",
+                            "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                        },
+                        {
+                            "name": "dup",
+                            "env": {_ROSTER_VAR: "${{ secrets.NAME_LEAK_ROSTER }}"},
+                        },
+                    ]
+                }
+            }
+        },
+        frozenset({("build", "dup")}),
+        [("build", "dup", 1)],
+        [],
+        id="duplicate-identity-flagged",
+    ),
+)
+
+
+def test_roster_step_env_bindings_match_allowlist():
+    """Only allowlisted steps may bind NAME_LEAK_ROSTER in their own env.
+
+    The comparison is a multiset, so a second step that reuses an allowlisted
+    identity is a surplus binding and fails, named by its own step index. An
+    allowlisted entry with no matching step (or a missing allowlisted workflow
+    file) fails as a stale permission.
+    """
+    present = {path.name: path for path in _WORKFLOW_FILES}
+    problems: list[str] = []
+    for name in sorted(set(present) | set(_ROSTER_STEP_ALLOWLIST)):
+        allowed = _ROSTER_STEP_ALLOWLIST.get(name, frozenset())
+        if name not in present:
+            for job_id, identity in sorted(allowed, key=repr):
+                problems.append(
+                    f"{name}: allowlisted workflow file is missing "
+                    f"(expected job {job_id!r}, {_format_step(identity)})"
+                )
+            continue
+        doc = yaml.safe_load(present[name].read_text(encoding="utf-8"))
+        assert isinstance(doc, dict), (
+            f"{name}: yaml.safe_load did not return a mapping (got "
+            f"{type(doc).__name__}); refusing to read that as a clean pass"
+        )
+        surplus, missing = _roster_step_env_mismatches(doc, allowed)
+        for job_id, identity, index in surplus:
+            problems.append(
+                f"{name}: {_format_step(identity, index)} in job {job_id!r} "
+                f"binds {_ROSTER_VAR} beyond what the allowlist permits"
+            )
+        for job_id, identity in missing:
+            problems.append(
+                f"{name}: allowlisted {_format_step(identity)} in job "
+                f"{job_id!r} no longer exists"
+            )
+    assert problems == [], (
+        f"{_ROSTER_VAR} step-env allowlist mismatch:\n  " + "\n  ".join(problems)
+    )
+
+
+@pytest.mark.parametrize(
+    "doc,allowed,expected_surplus,expected_missing", _ROSTER_STEP_ENV_CASES
+)
+def test_roster_step_env_allowlist_table(
+    doc, allowed, expected_surplus, expected_missing
+):
+    """The allowlist comparison flags both directions and accepts a legal doc."""
+    assert _roster_step_env_mismatches(doc, allowed) == (
+        expected_surplus,
+        expected_missing,
+    )

@@ -149,12 +149,46 @@ except Exception:
 # bring the false human stamp back.
 _PEER_MESSAGE_PREAMBLE = "Another Claude session sent a message:"
 
+# Pinned equal to engram-deference-detector-prompt.py's copy by
+# tests/test_nonhuman_prompt_vocabulary_4686.py: add a member to one, add it to
+# both, or the test reddens. This tuple is the ONLY place a shape is listed
+# (#4719 round 2 -- the detector's per-shape branches were folded into its copy).
+# The reasons, kept with the shapes so a later cleanup does not delete one:
+#   - "<task-notification" / "<command-message" / "<command-name" /
+#     "<local-command": the harness envelopes #4686 enumerated -- monitor task
+#     notifications and slash-command / local-command blocks.
+#   - "Stop hook feedback": a blocking Stop-hook re-invocation is not a human
+#     message (#2451) -- e.g. engram-loop-arm-stop-hook.py's own nudge.
+#   - "Loop continuation.": the canonical ScheduleWakeup stub prefix, for loop
+#     continuations that do not set loop_prompt in the marker (the standard
+#     engram-loop skill uses the stub "Loop continuation. Read ...").
+#   - "<<autonomous-loop>>" / "<<autonomous-loop-dynamic>>": autonomous-loop
+#     sentinels kept for back-compat with loops that predate the
+#     format_loop_prompt SSoT (#1594).
+#   - _LOOP_WAKE_MARKER: format_loop_prompt prepends it (tools/loop_prompt.py).
+#   - _PEER_MESSAGE_PREAMBLE: the cross-session peer-message envelope (#4369;
+#     see its comment above, including its English-wording brittleness).
+#
+# Matching is by PREFIX on the raw prompt (after html.unescape + lstrip), so
+# the sentinels widen ("<<autonomous-loop>>junk" matches too -- acceptable: a
+# prompt beginning with the sentinel is machine-sent either way), and a human
+# prompt literally beginning with an envelope classifies non-human, so no
+# `last-user-activity` stamp is written. src/engram/tools/presence.py derives
+# `user` only while that stamp is fresh and fails OPEN to `auto` otherwise, so
+# the direction is that the seat reads as LESS engaged, not more -- the loop
+# keeps running when it could have narrowed. That is the fail-open the presence
+# spine is designed around (#1469's discipline: degrade toward more autonomy),
+# so it is acceptable here. Note this hook has no cooldown; only the deference
+# detector does.
 _NON_HUMAN_PREFIXES = (
     "<task-notification",
     "<command-message",
     "<command-name",
     "<local-command",
     "Stop hook feedback",
+    "Loop continuation.",
+    "<<autonomous-loop>>",
+    "<<autonomous-loop-dynamic>>",
     _LOOP_WAKE_MARKER,
     _PEER_MESSAGE_PREAMBLE,
 )

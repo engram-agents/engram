@@ -93,6 +93,13 @@ def _collect_all_text_content(root: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+
+def _planted_home(name: str, rest: str) -> str:
+    """A home path built at runtime.  The names are fictional; they are joined here
+    only so the repo's home-path scan does not flag this test's own plants."""
+    return "/".join(["", "home", name]) + rest
+
+
 class TestPlatformProfiles:
     """Platform profile files parse and load correctly."""
 
@@ -540,7 +547,7 @@ class TestIdentityAxis:
         """A planted identity leak causes the foreign build to fail.
 
         This is the negative test: if a file in the bundle contains a known
-        identity string (e.g. '/home/agent-borges'), the leak-scan VALIDATE
+        identity string (a home path outside the allowed set), the leak-scan VALIDATE
         step must fail the build.
         """
         from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
@@ -554,7 +561,7 @@ class TestIdentityAxis:
             "hooks": {
                 "UserPromptSubmit": [
                     {"hooks": [
-                        {"command": "python3 /home/agent-borges/hooks/some-hook.py"}
+                        {"command": "python3 " + _planted_home("agent-zed", "/hooks/some-hook.py")}
                     ]}
                 ]
             }
@@ -565,7 +572,7 @@ class TestIdentityAxis:
         # scan_for_leaks must find the leak
         leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
         assert leaks, (
-            "scan_for_leaks did not detect the planted '/home/agent-borges' leak"
+            "scan_for_leaks did not detect the planted home-path leak"
         )
         # Verify the hit is in the right file
         hit_files = {rel for rel, _lineno, _snippet in leaks}
@@ -574,19 +581,111 @@ class TestIdentityAxis:
         )
 
     def test_planted_agent_borges_identifier_detected(self, tmp_path):
-        """scan_for_leaks detects 'agent-borges' identifier pattern."""
+        """scan_for_leaks detects a home path naming any seat, in a JSON config."""
         from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
 
         bundle_dir = str(tmp_path / "bundle2")
         os.makedirs(bundle_dir)
 
-        # Plant an agent-borges identifier leak
-        leak_content = '{"engram_home": "/home/agent-borges/.engram"}\n'
+        # Plant a home-path identifier leak (a seat name outside the allowed set)
+        leak_content = '{"engram_home": "' + _planted_home("agent-zed", "/.engram") + '"}\n'
         with open(os.path.join(bundle_dir, "config.json"), "w") as f:
             f.write(leak_content)
 
         leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
-        assert leaks, "scan_for_leaks did not detect 'agent-borges' identifier leak"
+        assert leaks, "scan_for_leaks did not detect the home-path identifier leak"
+
+    def test_allowed_home_placeholder_is_not_a_leak(self, tmp_path):
+        """The class is default-deny with a declared allowed set: a placeholder
+        home path passes, a prefix-extended one does not."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "allowed")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "ok.md"), "w") as f:
+            f.write("data in " + _planted_home("someone", "/.engram") + " and "
+                    + _planted_home("agents-shared", "/forum") + "\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+
+        with open(os.path.join(bundle_dir, "bad.md"), "w") as f:
+            f.write("data in " + _planted_home("someone2", "/.engram") + "\n")
+        leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
+        assert [rel for rel, _n, _s in leaks] == ["bad.md"]
+
+    @pytest.mark.parametrize("form", [
+        "cd {p}",
+        'p = "{p}"',
+        "PATH={p}:/bin",
+        "see {p}.",
+        "cd {u}",
+        "cd {lu}/x",
+        "cd {d}/x",
+        "cd {_u}/x",
+    ])
+    def test_boundary_forms_are_leaks_in_the_build_scan(self, tmp_path, form):
+        """No trailing slash needed: the class is the whole segment, ended by any
+        non-segment character or end of string; Users is case-insensitive."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        text = form.format(
+            p=_planted_home("agent-zed", ""),
+            u="/".join(["", "Users", "agent-zed"]),
+            lu="/".join(["", "users", "agent-zed"]),
+            d=_planted_home("9zed", ""),
+            _u=_planted_home("_zed", ""),
+        )
+        bundle_dir = str(tmp_path / "boundary")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write(text + "\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS), text
+
+    def test_boundary_allowed_forms_stay_clean_in_the_build_scan(self, tmp_path):
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "boundary_ok")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("see " + _planted_home("someone", "") + ". and \""
+                    + _planted_home("agents-shared", "") + "\" and "
+                    + "/".join(["", "Users", "Shared"]) + ":/bin\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+
+    @pytest.mark.parametrize("seg", ["someone.x", "alice.smith"])
+    def test_allowed_name_plus_dot_plus_more_is_a_leak_in_the_build_scan(self, tmp_path, seg):
+        """A dot inside the segment is a segment character: an allowed name, a dot
+        and more characters is a different, undeclared name."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "dotted")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("cd " + _planted_home(seg, "/x") + "\ncd " + _planted_home(seg, "") + "\n")
+        leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
+        assert sorted(n for _r, n, _s in leaks) == [1, 2], leaks
+
+    def test_allowed_name_before_a_sentence_end_dot_is_clean_in_the_build_scan(self, tmp_path):
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "sentence_end")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("see " + _planted_home("someone", "") + ".\n"
+                    + "see " + _planted_home("alice", "") + ". Next.\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+
+    def test_home_prefix_is_case_sensitive_in_the_build_scan(self, tmp_path):
+        """Documented design: /home/ is case-sensitive, /Users/ is not."""
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "case")
+        os.makedirs(bundle_dir)
+        with open(os.path.join(bundle_dir, "x.md"), "w") as f:
+            f.write("cd " + "/".join(["", "HOME", "agent-zed"]) + "/x\n")
+        assert scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS) == []
+        with open(os.path.join(bundle_dir, "y.md"), "w") as f:
+            f.write("cd " + "/".join(["", "USERS", "agent-zed"]) + "/x\n")
+        assert [r for r, _n, _s in scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)] == ["y.md"]
 
     def test_clean_bundle_passes_leak_scan(self, tmp_path):
         """A bundle with no identity strings passes the leak scan."""
@@ -690,7 +789,7 @@ class TestIdentityAxis:
         os.makedirs(os.path.join(bundle_dir, "tools"))
 
         # Plant a leak inside a tools/ Python file (convenience-tier surface)
-        leak_content = '# installed at /home/' + 'agent-borges/.engram\n'
+        leak_content = '# installed at ' + _planted_home("agent-zed", "/.engram") + '\n'
         with open(os.path.join(bundle_dir, "tools", "config_schema.py"), "w") as f:
             f.write(leak_content)
 
@@ -705,7 +804,7 @@ class TestIdentityAxis:
 
         Regression test for the SCAN_EXTENSIONS gap closed in PR #896 / issue #814:
         build.py originally lacked '.service' in SCAN_EXTENSIONS, so a systemd
-        service template with a hardcoded builder identity (e.g. User=agent-borges)
+        service template with a hardcoded builder identity (e.g. User=agent-zed)
         was invisible to the foreign-bundle leak-scan.  Adding '.service' closed
         that class.  This test pins the fix: a planted .service leak must be detected.
         """
@@ -715,13 +814,12 @@ class TestIdentityAxis:
         os.makedirs(bundle_dir)
 
         # Plant the leak in a .service file using the same sentinel as the
-        # other planted-leak tests.  Concatenation keeps this source file
-        # itself clean (same discipline as FOREIGN_LEAK_PATTERNS above).
+        # other planted-leak tests.
         leak_content = (
             "[Service]\n"
-            "User=" + "agent-borges" + "\n"
-            "WorkingDirectory=/home/" + "agent-borges" + "/.engram\n"
-            "ExecStart=/home/" + "agent-borges" + "/.engram/venv/bin/python3 viz_server.py\n"
+            "User=agent-zed\n"
+            "WorkingDirectory=" + _planted_home("agent-zed", "/.engram") + "\n"
+            "ExecStart=" + _planted_home("agent-zed", "/.engram/venv/bin/python3 viz_server.py") + "\n"
         )
         with open(os.path.join(bundle_dir, "engram-viz.service"), "w") as f:
             f.write(leak_content)
@@ -1032,3 +1130,89 @@ class TestRootFileManifestDerivation:
             f"Root-level manifest entries missing from dev build: {missing} "
             "(manifest-derived root copy must ship every declared root entry)"
         )
+
+
+# ---------------------------------------------------------------------------
+# E. build_plugin() version wiring, end to end (#1624)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPluginVersionWiring:
+    """Contract: the plugin.json build_plugin() writes carries
+    '<source plugin.json version>-dev.<stamp>.<sha7 or unknown>', the codex
+    manifest carries the same stamp, and the source plugin.json is opened
+    exactly once per build_plugin() call.
+
+    The source version is a SENTINEL: the patched open() serves the real
+    plugin.json with only its "version" replaced by _SENTINEL_VERSION, so an
+    implementation that hardcodes any version string (including today's real
+    one) cannot pass. Only builtins.open() reads are counted and served: a
+    read through pathlib or io.open() is neither counted nor served, and would
+    see the real version.
+    """
+
+    _SENTINEL_VERSION = "97.98.99"
+
+    @classmethod
+    def _build_counting_opens(cls, plugin_root: str, target: str) -> int:
+        """Run build_plugin() against the real repo tree; return how many times
+        the source plugin.json was opened. That one file is served with the
+        sentinel version."""
+        import builtins
+        import io
+        from unittest import mock
+
+        from tools.engine.build import build_plugin
+
+        src = os.path.realpath(os.path.join(REPO_ROOT, "plugin.json"))
+        real_open = builtins.open
+        opens = []
+
+        def counting_open(file, *args, **kwargs):
+            try:
+                is_src = os.path.realpath(os.fspath(file)) == src
+            except TypeError:
+                is_src = False  # file descriptor, not a path
+            if not is_src:
+                return real_open(file, *args, **kwargs)
+            opens.append(file)
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if any(c in mode for c in "wax+b"):
+                return real_open(file, *args, **kwargs)
+            with real_open(file, *args, **kwargs) as f:
+                data = json.load(f)
+            data["version"] = cls._SENTINEL_VERSION
+            return io.StringIO(json.dumps(data))
+
+        with mock.patch.object(builtins, "open", counting_open):
+            build_plugin(
+                repo_root=REPO_ROOT,
+                plugin_root=plugin_root,
+                tier="essential",
+                target=target,
+            )
+        return len(opens)
+
+    def test_written_plugin_json_version_is_source_version_stamped(self, tmp_path):
+        bundle = str(tmp_path / "cc")
+        self._build_counting_opens(bundle, "claude-code")
+        with open(os.path.join(bundle, "plugin.json"), encoding="utf-8") as f:
+            written = json.load(f)
+        pattern = rf"^{re.escape(self._SENTINEL_VERSION)}-dev\.\d{{14}}\.(g?[0-9a-f]{{7,}}|unknown)$"
+        assert re.match(pattern, written["version"]), (
+            f"written version {written['version']!r} is not "
+            f"'{self._SENTINEL_VERSION}-dev.<stamp>.<sha|unknown>'"
+        )
+
+    def test_source_plugin_json_opened_exactly_once_claude_code(self, tmp_path):
+        assert self._build_counting_opens(str(tmp_path / "cc"), "claude-code") == 1
+
+    def test_codex_manifest_carries_same_build_version_and_single_read(self, tmp_path):
+        bundle = str(tmp_path / "cx")
+        assert self._build_counting_opens(bundle, "codex") == 1
+        with open(os.path.join(bundle, "plugin.json"), encoding="utf-8") as f:
+            written = json.load(f)
+        with open(os.path.join(bundle, ".codex-plugin", "plugin.json"), encoding="utf-8") as f:
+            codex = json.load(f)
+        assert codex["version"] == written["version"]
+        assert written["version"].startswith(self._SENTINEL_VERSION + "-dev.")

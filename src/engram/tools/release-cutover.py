@@ -23,8 +23,10 @@ Produces a clean public-release snapshot from the private engram-alpha repo:
 The minus-set (release-minus-set.txt) is the ONLY hand-maintained input.
 Everything else is derived.
 
-NOTE on scan-leaks coverage: scan-leaks skips extensionless files and does not
-carry all personal-name patterns unless .scan-leaks-local.json is configured.
+NOTE on scan-leaks coverage: scan-leaks reads every tracked text file, whatever
+its extension (binary files are skipped and counted in its summary line), and
+does not carry all personal-name patterns unless .scan-leaks-local.json is
+configured.
 This gate is necessary-but-not-sufficient: it catches the roster patterns.
 Structural review of the snapshot still matters — this tool surfaces the caveat
 in its final summary.
@@ -34,6 +36,10 @@ Usage:
     python3 tools/release-cutover.py --version v0.1.0 --target /path/to/public/repo --push
     python3 tools/release-cutover.py --version v0.1.0 --target /path/to/public/repo \\
         --source /path/to/other/checkout --scan-leaks /path/to/scan-leaks.py
+
+A standalone --scan-leaks copy must have engine/home_path_class.py beside it
+(<dir of scan-leaks.py>/engine/home_path_class.py): the scanner loads its
+home-path class from there and aborts with ImportError without it.
 """
 
 import argparse
@@ -285,7 +291,8 @@ def main():
                              "A path that is not a regular file warns on stderr.")
     parser.add_argument("--scan-leaks", default=None, metavar="PATH",
                         help="Path to the leak-scanner script used for the gate. "
-                             "Default: <source>/tools/scan-leaks.py.")
+                             "Default: <source>/tools/scan-leaks.py. A standalone copy "
+                             "needs engine/home_path_class.py beside it.")
     parser.add_argument("--author", default=None,
                         help='Author for the release commit, e.g. "Jane Doe <jane@example.com>". '
                              "Default: parsed from LICENSE copyright line.")
@@ -491,8 +498,25 @@ def main():
         leak_result = subprocess.run(leak_cmd, capture_output=True, text=True)
         print(leak_result.stdout, end="")
         if leak_result.returncode != 0:
-            print("\nERROR: scan-leaks found potential leaks — aborting. Target NOT modified.",
-                  file=sys.stderr)
+            if leak_result.returncode == 3:
+                # Coverage incomplete: the scan did not read every candidate,
+                # so "no leaks found" would be a claim it cannot support. Keep
+                # aborting; say what actually happened.
+                print("\nERROR: scan-leaks coverage was incomplete — aborting "
+                      "(the scan did not cover the whole tree, which is not "
+                      "evidence of a clean tree). Target NOT modified.",
+                      file=sys.stderr)
+            elif leak_result.returncode == 1:
+                print("\nERROR: scan-leaks found potential leaks — aborting. "
+                      "Target NOT modified.", file=sys.stderr)
+            else:
+                # Exit 2 covers an internal error (a crash) and an invocation
+                # error. Neither is a verdict about the tree, so this must not
+                # read as "found potential leaks".
+                print(f"\nERROR: scan-leaks did not run — aborting (the "
+                      f"scanner exited {leak_result.returncode}, an internal or "
+                      "invocation error, not a leak). Target NOT modified.",
+                      file=sys.stderr)
             print(leak_result.stderr, file=sys.stderr)
             sys.exit(1)
         leak_gate_result = "PASS (roster patterns clean)"
@@ -645,7 +669,8 @@ def main():
             print("  After --push, three public steps remain (Releases entry, website entry, newsletter); see docs/internal/RELEASING.md \"Announcing\" + \"Tell the public\".")
         print()
         print("CAVEAT: scan-leaks is necessary-but-not-sufficient — it catches the configured")
-        print("roster patterns and committed structural patterns. Extensionless files are skipped.")
+        print("roster patterns and committed structural patterns. It reads every tracked text")
+        print("file; binary files are skipped and counted in the scanner's own summary line.")
         print("Structural review of the snapshot is still recommended before making the repo public.")
 
     finally:

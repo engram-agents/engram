@@ -10,7 +10,7 @@ running the tests myself (not just trusting the fairy's report) — the
 diagnosis is correct. This spec's only job is disposing of those 17 tests.
 
 **Branch: continue on the EXISTING branch** `sol/1698-slice2-unified-hook-check`
-(worktree `/home/agent-sol/engram-alpha/.claude/worktrees/agent-ac66250a6016b20e0`,
+(worktree `.claude/worktrees/agent-ac66250a6016b20e0` of that clone,
 tip commit `75c50df`). Do not create a new branch. Commit on top.
 
 **Do not re-touch** the 4 files round 1 already changed

@@ -184,6 +184,13 @@ restore_identity_file() {
     warn "$backup is a dangling symlink — $file left untouched."
     return 0
   fi
+  # The backup name resolves to the file itself (a hard link, or a link to it): restoring would
+  # copy a file onto itself, and the saved copy of the current file would be the backup too.
+  # Leave both files as they are and say why.
+  if [[ -e "$file" && "$file" -ef "$backup" ]]; then
+    warn "$backup is the same file as $file (a hard link or a link to it) - not restoring; both files left untouched. Move '$backup' aside yourself if you want a restore."
+    return 0
+  fi
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   saved="$file.pre-uninstall.$stamp"
   if [[ -e "$file" || -L "$file" ]]; then

@@ -1,360 +1,444 @@
 # Releasing ENGRAM
 
-> **Out of date since v0.5.6 (2026-11-10), kept until it is rewritten.** This
-> document describes the two-repository model used through v0.5.5: development
-> in a private repository, and one squashed snapshot per release copied to the
-> public one. From v0.5.6 on, development and releases both happen in the public
-> repository, on one history; the old snapshots are archived on the branch
-> `release-snapshots`. The current branch and tag rules are in
-> [`docs/VERSIONING.md`](../VERSIONING.md). Where the two disagree, that page
-> is right.
->
-> **The procedure for cutting a release is not currently written down in this
-> file.** Its next version lands with
-> [engram-agents/engram#4592](https://github.com/engram-agents/engram/issues/4592).
-> Do not use the steps below as a fallback: the publishing steps run a tool
-> (`tools/release-cutover.py`) and an exclusion list (`release-minus-set.txt`)
-> that are both retired, and the list now excludes nothing.
+This is the procedure for cutting an ENGRAM release. It replaces the
+two-repository procedure used through v0.5.5 (development in a private
+repository, one copied snapshot per release in the public one). Since v0.5.6
+development and releases happen in this repository, on one history. Branch and
+tag names are defined in [`docs/VERSIONING.md`](../VERSIONING.md); where this
+page and that one disagree about names, that page is right.
 
-engram-alpha is a **private** repo. There is a separate **public** repo,
-[`engram-agents/engram`](https://github.com/engram-agents/engram), that holds
-user-facing release snapshots — one squashed commit per version. A release
-has two stages:
+A release has three parts, in this order:
 
-1. **Private rc cut** — `dev → main` in this (private) repo, full CI gate,
-   tagged `vMAJOR.MINOR.PATCH-rc<N>` on `main`.
-2. **Public release** (historical; see the note at the top) — after a dogfood window on the rc, `tools/release-cutover.py`
-   publishes a clean, leak-scrubbed squashed snapshot to the public repo,
-   tagged with the **clean** `vMAJOR.MINOR.PATCH` (no `-rc`).
+1. **Candidate.** A release branch `release/X.Y.Z` is cut from `dev` at the
+   candidate commit and tagged `vX.Y.Z-rcN`. `dev` stays open. The candidate is
+   gated and the team lives on it (the soak).
+2. **Release.** A pull request from the release branch into `main` runs the
+   whole test suite. When it is green, `main` is fast-forwarded to the soaked
+   commit, that commit is tagged `vX.Y.Z`, and the Releases entry is created.
+3. **Tell the public.** Website, then newsletter. A version is *released* only
+   when all three public surfaces are live (definition below).
 
-Both stages are documented below.
+## Who does what
 
-> **This doc was rewritten 2026-07-02 from the first real end-to-end `dev→master`
-> cut (`v0.2.0-rc2`).** That cut surfaced nine process gaps the previous
-> dev-only doc didn't cover — each is now folded in below. The load-bearing
-> lesson: the full CI gate runs *only* on the release PR, so the release cut is
-> the first time many things are exercised end-to-end. Expect it to catch real
-> issues (the rc2 cut caught two pre-existing test failures latent on `dev`);
-> that is the gate working, not a setback.
+| Role | Does |
+|---|---|
+| Release seat | Runs this procedure, cuts the release branch, pushes tags, merges soak fixes into the release branch, moves `main`, writes the soak report and the release record. One seat per release, named when the candidate is cut. |
+| Gate seat | Runs the whole test suite on the candidate commit and the skip-set comparison, and the install checks (gates G2, G3, G6). Not the release seat. |
+| Security seat | Reads the candidate for the release (gate G5) and says so in writing on the record. |
+| Surfaces | Website Versions entry in both languages, then the newsletter. |
+| Maintainer (human) | Says go for the release tag. Nothing in part 2 happens before that word. |
 
-## Version scheme
+## What changed from the two-repository procedure
 
-Semver pre-1.0, split by which repo the tag lives in:
+- There is no cutover tool and no exclusion list. `tests/`, `.github/` and the
+  development documents are part of the repository a user clones.
+- The name-leak scan runs on every pull request, and GitHub secret scanning
+  covers code and issue text continuously. A release adds no scan of its own;
+  it checks that those are green (gate G4).
+- Candidate tags (`-rcN`) are public. A plain clone lands on `main`, which only
+  ever holds a release commit, so a user following the install guide gets the
+  release. The installer itself accepts any tag beginning with `v`, so never
+  point a user at a candidate tag.
+- `main` moves only by a fast-forward to the release commit. A pull request
+  from the release branch into `main` exists to run the whole suite on that
+  commit (step 6); it is never merged with the button. A merge commit, a squash
+  or a rebase would put a commit on `main` that no tag names, and the installer
+  requires that the commit a plain clone lands on carries a release tag.
+- Since v0.5.7 there is no freeze of `dev` (maintainer's ruling, 2026-11-13).
+  The candidate lives on its own branch `release/X.Y.Z`, so `dev` keeps taking
+  pull requests while the candidate is gated and soaked.
+- Because `main` is the default branch, a pull request into `dev` does not
+  close its issue by itself. Whoever merges closes the issue by hand, naming the
+  pull request and the merge commit.
 
-- **Private (`main`, this repo)**: `vMAJOR.MINOR.PATCH-rc<N>` — e.g.
-  `v0.2.0-rc1`, `v0.2.0-rc2`. `<N>` increments if a fix round is needed before
-  the cut is ready to promote publicly (e.g. `v0.1.3-rc1` → `v0.1.3-rc2`).
-  Applies to any release regardless of MAJOR/MINOR/PATCH size — the `-rc`
-  suffix marks "cut to main, under dogfood validation," not a version-size
-  class.
-- **Public (`engram-agents/engram`)**: clean `vMAJOR.MINOR.PATCH` — e.g.
-  `v0.2.0`, `v0.1.3`. **No `-rc` suffix ever reaches the public repo.**
-  Through v0.5.5, `tools/release-cutover.py`'s `VERSION_RE` (`^v\d+\.\d+\.\d+$`) enforced this
-  mechanically — it rejected a `--version` argument carrying `-rc` or any
-  other suffix.
-
-Historical private tags (for calibration — no `-alpha` anywhere): `v0.1.0`,
-`v0.1.2-rc1`, `v0.1.2-rc2`, `v0.1.3`, `v0.1.3-rc1`, `v0.1.3-rc2`, `v0.1.4`,
-`v0.2.0-rc1`, `v0.2.0-rc2`. *(`v0.1.3` is a clean, no-`-rc` private tag —
-it predates this two-repo model; a `git tag -l` will show it. Since the split,
-private `main` tags always carry `-rc<N>`.)*
-
-When MINOR/MAJOR bumps happen: MINOR for feature waves (new node type, new
-hook architecture, new MCP-tool category), PATCH for bugfixes + small
-improvements within a wave. MAJOR bump to `v1.0.0` marks promotion out of
-alpha to a backward-compatibility commitment — not yet reached.
-
-## Branch model
-
-- **`dev`** is the active development branch. All feature/fix PRs merge here.
-  Dev PRs run only the cheap `pr-checks` (combined static scrubs) — the **full pytest suite does NOT run on dev PRs**
-  (run affected-tests **locally** as a review requirement; at agent-PR
-  velocity, per-PR test CI is too expensive). See `CLAUDE.md`.
-- **`dev` is a protected branch — direct pushes are rejected in practice.**
-  Every change to `dev`, including release bookkeeping (CHANGELOG updates,
-  version bumps), goes through a PR like any other change. There is no "just
-  commit it directly to dev" shortcut for release prep.
-  *(Mechanism note, 2026-07-02: a direct push to `dev` is declined
-  ("protected branch hook declined"), but the repo-level ruleset "Protect dev
-  branch" shows `enforcement: disabled` and `rules/branches/dev` returns no
-  active rules — so the enforcement is almost certainly an **org-level ruleset**
-  on `engram-agents`, invisible without org-admin. Don't be misled by the
-  repo-level API showing "disabled": the empirical behavior is what governs —
-  always PR.)*
-- **`main`** holds tagged release points only. A release is cut by opening a
-  **PR from `dev` → `main`**, which fires the **full CI gate** (`tests.yml`
-  full suite + `pr-checks`) — the thorough pre-release
-  validation. Routine PRs do NOT target main (see `CLAUDE.md` Branching
-  convention section).
-- **The `dev→main` PR merges as a MERGE COMMIT, not a fast-forward or a
-  squash.** The merge commit on `main` has two parents (previous `main` +
-  the `dev` tip), so `dev`'s content — and its tip as a parent — is captured on
-  `main`, and the release tag points at that merge commit. This requires
-  **"Allow merge commits" to be enabled** in the repo's merge settings (see the
-  merge-settings section below); a squash-merge would collapse the history and
-  drop the ancestry link, and is wrong for a release cut.
-- **Private release tags** (`vMAJOR.MINOR.PATCH-rc<N>`) point at that `main`
-  merge commit. **Public release tags** (`vMAJOR.MINOR.PATCH`, no `-rc`) live in
-  the separate `engram-agents/engram` repo, cut from a validated rc — see
-  "Publishing to the public repo" below.
-
-### Repo merge settings — must allow merge commits
-
-The `dev→main` release model needs a **merge commit** (above). GitHub merge
-settings are **repo-wide**, so confirm **"Allow merge commits"** is enabled in
-Settings → General → Pull Requests before cutting:
-
-```bash
-gh api repos/engram-agents/engram-alpha --jq '{merge: .allow_merge_commit, squash: .allow_squash_merge, rebase: .allow_rebase_merge}'
-```
-
-`merge: true` is required. *(Gap hit live on the `v0.2.0-rc2` cut: the repo was
-**squash-only** (`allow_merge_commit: false`), which is fine for keeping `dev`
-history linear but silently incompatible with the release model — GitHub offered
-only squash for the `dev→master` PR, which would have dropped `master`'s ancestry
-and left the next cut still conflicting. Fix: an admin enabled merge commits.
-Policy after: squash for routine `dev` PRs (discipline — keeps `dev` linear),
-merge-commit for the release PR.)*
-
-## Keeping `main` and `dev` from diverging
-
-`main` and `dev` must not accumulate **independent** history, or the
-`dev→main` release PR conflicts. The failure mode is a fix authored *separately*
-on each branch (two different commits touching the same lines) — that is a real
-merge conflict. The disciplines that prevent it:
-
-- **All changes land on `dev` first**, via the normal PR workflow — including
-  fixes. `main` only advances via the `dev→main` release merge. If you never
-  commit directly to `main`, the release PR never CONFLICTS — but every
-  merge-commit release still leaves `main` one merge commit ahead of `dev`,
-  so `main` is an ancestor of `dev` only after the reconcile pre-step (see
-  "Open the release PR", step 4, below). This is the default; prefer it.
-- **A hotfix needed on an already-released `main`** (can't wait for the next
-  full cut): author the fix on `dev` first (normal PR), then **cherry-pick that
-  commit onto `main`** via a hotfix PR + a patch-tag bump. Cherry-pick copies
-  the fix's content *identically* to `main`, so the next `dev→main` merge
-  sees the same change already applied on both sides → **no conflict**. (It does
-  create a new SHA on `main`, so the merge still produces a merge commit rather
-  than a fast-forward, but it won't conflict — which is the part that hurts.)
-  This is strictly better than authoring the hotfix independently on `main`.
-- **Fallback — if a fix ever *does* land directly on `main`** (emergency,
-  bypassing dev-first): **immediately `git merge main → dev`** (via a PR) to
-  re-sync, before `dev` accumulates more and the divergence compounds.
-
-*(One-time reconciliation, 2026-07-02: before the `v0.2.0-rc2` cut, `master` had
-diverged from `dev` by 8 un-back-merged hotfixes (the `v0.1.3`/`v0.1.4` line),
-authored independently on `master`. The `v0.2.0-rc2` cut reconciled this once —
-merged `origin/master` into `dev` (a merge commit preserving `master`'s ancestry),
-so `master` became an ancestor of `dev` and the release PR went clean. Future cuts
-start from that clean-ancestor state; the disciplines above keep it that way.)*
-
-## Cutting a release (private rc cut)
-
-These steps assume `dev` is at the SHA you want to release and CI is green.
-
-**Before you start:**
-- `git pull` (fast-forward your local `dev`/`main` to `origin`) before running
-  any build tooling (`tools/install-local-marketplace.sh` etc.) as part of this
-  process. The build stamps whatever is in your **local working tree** — it does
-  not fetch or check freshness against `origin`. A stale local checkout silently
-  ships a build that is behind what was actually merged (hit live during the
-  `v0.2.0-rc2` cut: a build went out one commit behind `origin/dev`).
-- Confirm **"Allow merge commits"** is enabled (see "Repo merge settings" above).
+## Part 1: the candidate
 
 ### 1. Choose the version
 
-Look at the changes since the previous release tag:
+```bash
+git fetch origin --tags
+git log --oneline <previous-release-tag>..origin/dev
+```
+
+Group the changes by theme. The middle number changes for a wave of new
+features, the last number for fixes and small improvements. The first candidate
+is `-rc1`; each fix round adds one.
+
+### 2. Bump the plugin version and move the CHANGELOG, in one pull request
+
+Root `plugin.json` carries the clean version (`X.Y.Z`, never `-rc`). It is the
+single source the build reads: the build engine (`src/build/engine/build.py`)
+loads that version and `compute_build_version()` stamps every artifact from it.
+
+The changelog is `docs/CHANGELOG.md`. Check `[Unreleased]` against the last
+release tag and remove anything already released. Move what remains to a new
+section `## [vX.Y.Z] - YYYY-MM-DD` and leave a fresh, empty `[Unreleased]`
+above it.
+
+Both changes go to `dev` in **one** pull request through the normal review
+path. `TestPluginVersionHasChangelogSection` in `tests/test_release_gates.py`
+fails unless `plugin.json`'s version equals the newest changelog heading, so
+`dev` is red between two separate pull requests.
+
+### 3. Cut the release branch and tag the candidate
+
+When that pull request has merged, cut the branch at **its merge commit** and
+tag. `dev` is open, so its tip may already hold a later change that is not in
+the changelog's `vX.Y.Z` section; do not cut at the tip without reading what
+landed after the bump.
 
 ```bash
-git log --oneline <previous-tag>..dev
+git fetch origin
+H=<full id of the bump pull request's merge commit>   # gh pr view <N> --json mergeCommit
+git merge-base --is-ancestor "$H" origin/dev \
+  && git push origin "$H":refs/heads/release/X.Y.Z \
+  && git tag -a vX.Y.Z-rcN "$H" -m "vX.Y.Z-rcN" \
+  && git push origin vX.Y.Z-rcN
+git ls-remote origin refs/heads/release/X.Y.Z 'refs/tags/vX.Y.Z-rcN^{}'   # both must print H
 ```
 
-Group by theme. Pick the next version per the scheme above (MINOR for
-feature waves, PATCH for fixes). Decide the rc suffix (`-rc1` for the first
-cut attempt at this version; bump to `-rc2`, `-rc3`, ... if a fix round is
-needed before the version is ready to promote to the public repo).
+The commands are chained on purpose: a candidate tag cannot be deleted, so it
+must not be created when the branch push before it failed.
 
-### 2. Bump the plugin version (SSoT)
-
-Bump root `plugin.json`'s `"version"` field to the target `MAJOR.MINOR.PATCH`
-(no `-rc` suffix here — `plugin.json` carries the clean base version).
-
-```json
-{
-  "name": "engram",
-  "version": "0.2.0",
-  ...
-}
-```
-
-This is the single source of truth the build reads: `compute_build_version()`
-(`src/build/engine/build.py`) loads `plugin.json`'s `"version"` as the base
-and stamps every build artifact from it. **Skipping this step means every
-build in this release cycle mis-stamps its version** — this is the gap that
-let a stale `0.1.0` hardcode ship unnoticed for a while (reported in #1607,
-fixed by #1623). Bump this in the same PR as the CHANGELOG update (step 3).
-
-### 3. Update the CHANGELOG
-
-The changelog lives at **`docs/CHANGELOG.md`** (not root `CHANGELOG.md`).
-
-Before cutting, **prune `[Unreleased]`**: check it against what's already
-shipped in a previous release (diff against `origin/main`'s CHANGELOG
-section, or the last release tag) and remove anything that's actually already
-released — the `[Unreleased]` section should only ever contain changes that
-landed on `dev` since the last cut. (This file has drifted before — stale
-already-shipped entries left in `[Unreleased]`, and some patch releases
-never got their own `## [vX.Y.Z] - DATE` section. Check for both when you
-touch this file. If `main` has release sections `dev` lacks — from hotfixes
-— **union** them in when reconciling, don't drop either side.)
-
-Move the `Unreleased` section to a new versioned section: `## [vMAJOR.MINOR.PATCH]
-- YYYY-MM-DD` (use the **clean** version here, no `-rc` — the CHANGELOG
-describes the release content, not the private rc cycle it took to validate
-it). Add a fresh `Unreleased` heading above it for the next cycle.
-
-**This goes to `dev` via a PR, like any other change** — `dev` is a
-protected branch; there is no direct-push path. Bundle the `plugin.json`
-version bump (step 2) into the same PR:
+Then open the release pull request, so the whole suite runs on the candidate
+while the team soaks it (its check is gate G1, read in step 6):
 
 ```bash
-git checkout -b docs/changelog-vMAJOR.MINOR.PATCH
-git add docs/CHANGELOG.md plugin.json
-git commit -m "docs: CHANGELOG + version bump for vMAJOR.MINOR.PATCH"
-git push -u origin docs/changelog-vMAJOR.MINOR.PATCH
-gh pr create --base dev --head docs/changelog-vMAJOR.MINOR.PATCH \
-  --title "docs: CHANGELOG + version bump for vMAJOR.MINOR.PATCH"
+gh pr create --repo engram-agents/engram --base main --head release/X.Y.Z \
+  --title "release: vX.Y.Z" --body "Release gate for vX.Y.Z. Never merged with the button: main is fast-forwarded to the head after the maintainer's go (docs/internal/RELEASING.md)."
 ```
 
-**A test enforces this pairing.** `TestPluginVersionHasChangelogSection` in `tests/test_release_gates.py` (#4259) fails unless `plugin.json`'s version is plain `X.Y.Z` and equals the newest `## [vX.Y.Z] - YYYY-MM-DD` heading in `docs/CHANGELOG.md`. If the bump and the section land in separate PRs, `dev` is red between them: the nightly full-suite run or the dev→main release PR catches it. `pr-checks` does not run this file for a version-bump or CHANGELOG-only change.
+Opening it moves nothing. **Never press the merge button on it.**
 
-Get this PR reviewed and merged into `dev` through the normal review path
-(reviewer-fairy / colleague, per `CLAUDE.md`) before proceeding to step 4.
+Post where the team reads orders: `release/X.Y.Z` is cut at `H`, `dev` is open,
+and new work goes under the changelog's `[Unreleased]` heading, never under the
+version that now has a release branch.
 
-*__Note on the initial cut:__ when cutting the very first release, the
-`Unreleased` section starts empty. Survey the historical commits since
-project inception (e.g. `git log --oneline --no-merges`) and populate
-`Unreleased` with notable changes before moving to step 4. Subsequent cuts
-accumulate the changelog incrementally as PRs land.*
+**`dev` is not frozen.** From this point the candidate and `dev` are two
+branches. What merges into `dev` rides the next release unless it is copied to
+the release branch by the rule in step 5.
 
-### 4. Open the release PR (dev → main) — the full CI gate
+The release branch and every tag beginning with `v` or `deploy/` are protected
+by rulesets (table in step 7): only the release team can create such a tag or
+update an existing release branch, the branch cannot be deleted or force-moved
+by anyone, and a new commit reaches it only through a pull request. One limit,
+read from the rule types and not tested: no rule restricts *creating* a branch
+named `release/...`, so any writer could create one, and could then neither
+update nor delete it. Cut release branches only from this procedure. The branch is
+never deleted. It stays as the record of what was released.
 
-**First, reconcile `main` into `dev` (every cut).** Before opening the
-release PR, check whether `main` holds any commit `dev` lacks:
+### 4. Gates on the candidate commit
+
+Every gate is read on the commit the candidate tag points at, and its result
+goes into the release record (step 10) with the run's identifier.
+
+| Gate | What must be true | Who |
+|---|---|---|
+| G1 | The hosted full suite is green on the release pull request (opened in step 3, read as described in step 6): the `pytest (3.12)` check on the pull request's head, produced by a `pull_request` run, with the head equal to the candidate commit. It runs again when a soak fix moves the release branch. A hand-started run on the candidate tag (`gh workflow run tests.yml --ref vX.Y.Z-rcN`) is useful early corroboration and cannot substitute: `main` requires the check, and a check produced by a hand-started run on a tag did not satisfy it when measured (2026-11-13). | Release seat |
+| G2 | A whole-suite run on a fresh full clone checked out at the candidate tag, with the project's own interpreter, is green. The full output is kept. | Gate seat |
+| G3 | The skip-set comparison below shows no unexplained new skip. | Gate seat |
+| G4 | `name-leak-gate` is green on the candidate commit. For the first candidate that is its run on the push to `dev`; for a later candidate, whose commit lives only on the release branch and has no run of its own, it is the run on the soak-fix pull request that produced it, with that pull request's head tree equal to the candidate's tree (the workflow runs on pushes to `dev` and on pull requests, not on pushes to a release branch). `pr-checks` is green on the pull request whose merge produced the candidate, and that pull request's head tree equals the candidate's tree (`pr-checks` runs on pull requests only, so no run exists on the squash commit itself). The secret-scanning alert list has no open alert; this covers code and issue text, and it is a read at one moment: if scanning was enabled or the candidate was pushed within the hour, this part is "not run" until the list has settled. | Release seat |
+| G5 | The security seat reads the net change `vPREV..vCAND`, the diff plus the list of merge commits, and records on the candidate commit, by its full id, either "no objection" or an objection naming the change and the reason. The record states what was read and its bound: files reviewed against files changed. If the security seat could not make the read, the gate is not run; it is not an implied pass. | Security seat |
+| G6 | An install from a plain clone at the candidate tag into an empty home passes `install_selfcheck.py`; and an install over a copy of an existing home leaves every file of that home byte-identical or backed up. | Gate seat |
+| G7 | On macOS, the tests that skip on Linux pass on a seat that runs a real Mac, on the candidate commit. The record names the `bash` that ran them: the stock `/bin/bash` (3.2) and a newer one differ (#4620). | A Mac seat |
+
+A gate that cannot be run is not a pass. Write "not run" with the reason, and
+the maintainer decides whether the release goes without it.
+
+#### G3: the skip-set comparison
+
+A green run says which tests failed. It does not say which tests stopped
+running. For v0.5.6 a green run hid 84 tests that were skipped because they
+pinned commits this repository did not have; only a comparison of skip sets
+showed them.
+
+1. **Two runs are compared:** the gate seat's whole run on this candidate (G2)
+   and the recorded run of the previous release. The reference is the file
+   `docs/internal/release-records/vA.B.C-skips.json` of the previous release
+   `vA.B.C`. If no such file exists (the case for the first release cut
+   by this procedure), the gate seat first makes it from the recorded run of
+   the previous release and commits it in its own pull request; G3 is "not
+   run" until a reference exists.
+2. **What is recorded** for each run: the commit, the interpreter and platform,
+   the number of tests collected, passed, failed and skipped, and the skipped
+   tests by full id, grouped by skip reason.
+3. **The rule:** every test that is skipped now and was not skipped in the
+   reference is either named in the release record with its expected reason
+   (platform, optional dependency) or it blocks the release. A test that
+   disappeared from collection altogether is treated the same way.
+4. **Where it is stored:** the new run's skip set is committed as
+   `docs/internal/release-records/vX.Y.Z-skips.json` in the release-record
+   pull request (step 10), so the next release can read it.
+
+The release record states both skip counts and the list of differences, even
+when that list is empty.
+
+### 5. Soak: live on the candidate
+
+The soak seats upgrade to the candidate and work on it for the soak period.
+The maintainer names the seats and the period when the candidate is cut; the
+starting rule is **one day on the team's own seats, including one night's
+sleep cycle on each** (2026-11-13), to be adjusted from practice. Each soak
+seat checks out the candidate tag and rebuilds:
 
 ```bash
-git fetch origin && git log --oneline origin/dev..origin/main
+git fetch origin --tags && git checkout vX.Y.Z-rcN
+tools/install-local-marketplace.sh
 ```
 
-This must print nothing. It usually isn't empty: the previous release's
-merge commit lives on `main` only, and under `main`'s strict status-check
-ruleset the release PR would read `BEHIND` and cannot merge.
+then runs the activation steps of the `engram-upgrade` skill and reports its
+own read-back (version, the stale-process check, the store's counts).
 
-If it lists commits, reconcile first: on a branch off `origin/dev` named
-`reconcile/<short-name>` (e.g. `reconcile/rc3-merge-commit-into-dev`, as in
-#3257), run `git merge --no-ff origin/main`. Verify `git rev-parse
-HEAD^{tree}` equals `git rev-parse origin/dev^{tree}` — history only, no
-file change. If they differ, STOP: `main` has independent content, which is
-the `DIRTY` case below. PR the reconcile branch to `dev` and merge it **as a
-merge commit** (not squash, not rebase, or the ancestry it exists to create
-is lost); one fresh-eye approval on the tree identity is the whole review,
-no fairy round. Re-run the check above; it must now print nothing. Only then
-open the release PR.
+**A soak finding** is posted at once, marked as such, and comes before other
+work. A seat that checks something and finds it is not caused by the candidate
+posts that too, so it is not asked again.
 
-Cut the release by opening a **PR from `dev` → `main`** (not a direct
-push). This PR **is** the release gate: the full `tests.yml` suite +
-`pr-checks` run on it — the thorough validation that
-deliberately does NOT run per-dev-PR.
+**A fix found in soak goes to `dev` first**, through the normal review path,
+with its changelog line in the same pull request, under `[Unreleased]`. Its
+copy for the candidate then **arrives as a pull request into
+`release/X.Y.Z`**, squash-merged, where the changelog line goes under the
+`vX.Y.Z` section, not under `[Unreleased]` (expect to place that line by hand;
+the two branches differ exactly there). A hand-pushed
+cherry-pick is refused by rule: the release branch requires the `pr-checks`
+check and a directly pushed commit has no such run. The release seat merges
+that pull request, tags the next candidate on the new tip of the release
+branch, and the gates of step 4 run again on it. There is no fix on `main`
+and no fix on a tag.
+
+**The soak report.** Before asking for the go, the release seat gives the
+maintainer one report: the soak seats and when each started, every finding and
+every checked non-finding, each gate's result, and the known limits that go
+into the release notes. The candidate is accepted when every gate is recorded,
+the soak seats have reported and the maintainer has read that report. A fix
+for a defect that loses user data does not wait for a soak it does not need;
+that is the maintainer's call.
+
+## Part 2: the release
+
+Nothing in this part that moves a branch or creates a tag happens before the
+maintainer's go. Step 6 only reads.
+
+### 6. Read the release pull request's check
+
+The release pull request was opened in step 3 and its check has been read for
+the soak report. Read it again now, on the accepted candidate, in one shell:
 
 ```bash
-gh pr create --base main --head dev \
-  --title "release: vMAJOR.MINOR.PATCH-rc<N> — short summary" \
-  --body "Release cut to main. The full CI gate runs on this PR."
+git fetch origin --tags
+C=$(git rev-parse --verify -q 'vX.Y.Z-rcN^{commit}')           # the accepted candidate
+if [ -n "$C" ] && [ "$C" = "$(git rev-parse origin/release/X.Y.Z)" ] \
+   && git merge-base --is-ancestor origin/main "$C"; then
+    gh api "repos/engram-agents/engram/commits/$C/check-runs?per_page=100" \
+      --jq '.check_runs[] | select(.name=="pytest (3.12)") | {conclusion, head_sha, run: .details_url}'
+else
+    echo "STOP: C is empty, the release branch head is not the accepted candidate, or main is not an ancestor of C"
+fi
+gh run view <run-id> --repo engram-agents/engram --json event,headSha,conclusion
 ```
 
-**If the release PR reads `BEHIND`:** the reconcile pre-step above was
-skipped. Run it now; the release PR updates once `main` is merged back into
-`dev`.
+The first command prints one line for **every** run of the check on that
+commit; the run id for the second command is the number after `/runs/` in each
+line's `run` URL. More than one line is normal: a hand-started run on the candidate tag
+shows up under the same name (measured on v0.5.7-rc3: two rows, one from a
+hand-started run on the tag and one from the release pull request). **Pick the
+row by its event, not by its colour.** For each row, read its run with the
+second command; the row that counts is the one whose `event` is
+`pull_request`. That row's `head_sha` must equal `C` and its conclusion must
+be `success`. A green row from a hand-started run does not count, and `main`
+would refuse the push in step 7 if it were the only one. This check is gate
+G1.
 
-**If the release PR is CONFLICTING** (`mergeStateStatus: DIRTY`): this is the
-different case — `main` has diverged from `dev` with real independent
-content (the tree is NOT identical, unlike the reconcile above). Reconcile
-it once — merge `origin/main` into `dev` on a branch (a **merge commit**, so
-`main` becomes an ancestor of `dev`; union any CHANGELOG sections), PR that
-to `dev`, then the release PR goes clean. See "Keeping `main` and `dev` from
-diverging" above.
+**Why the ancestry condition.** The pull request's run tests GitHub's merge
+of the head into `main`. When `main` is an ancestor of the head, that merge
+changes nothing, so the run tested exactly the tree `main` will hold after
+step 7, even if GitHub had not refreshed its merge since `main` last moved:
+`main` only moves forward (step 7: no force-move for anyone), so every earlier
+`main` is an ancestor too. If `main` is not an ancestor of `C`, another
+release has landed; stop, and cut a new candidate on top of it. A pull request
+retargeted onto `main` after its head was pushed has no run of this check at
+all (the workflow does not run on a retarget). For the release pull request,
+close and reopen it: that runs the check on the same head. Pushing an empty
+commit would move the release branch off the candidate, which makes a new
+candidate.
 
-**If CI is red on the release PR**: treat it exactly like any blocked PR — fix
-on `dev` via a normal PR, and the release PR re-runs the full gate on the new
-tip. Note that the fix PR (a `dev` PR) runs **only `pr-checks`, not the full
-suite** — so **run the affected tests locally** and paste the result in the
-review before merging; the full-suite verification happens when the release PR
-re-runs, not on the fix PR. Never tag on red.
+**If the check is red, stop.** Read which cells failed and bring them to the
+maintainer with their cause. One exception, the maintainer's ruling of
+2026-11-14 on #4655: if the red is confined to a test already filed as
+unreliable under load, the release seat may rerun that one failed job once.
+Before the rerun starts, record on the release pull request that it is a rerun
+and the filed issue it rests on. The rerun is not repeated: if it is red, or
+if any other cell is red, the release stops and goes to the maintainer with its
+cause. (The suite's memory use on the hosted runner, and the plan that keeps it
+from blocking a release, are tracked in #4655.)
 
-Once the full gate is green **and** a colleague has given a fresh-eye approval,
-merge the PR **as a merge commit** and tag the release SHA on `main`:
+### 7. Fast-forward `main` to the release commit
+
+Run this in one shell. `C` is set again here on purpose: with `C` empty the
+push below would name no source, which git reads as a request to delete `main`.
 
 ```bash
-gh pr merge <PR-number> --merge        # MERGE COMMIT — not --squash
-git fetch origin main
-git tag -a "vMAJOR.MINOR.PATCH-rc<N>" -m "vMAJOR.MINOR.PATCH-rc<N> — short summary" origin/main
-git push origin "vMAJOR.MINOR.PATCH-rc<N>"
-git ls-remote --tags origin "vMAJOR.MINOR.PATCH-rc<N>"   # verify the tag landed on origin (not local HEAD)
+git fetch origin --tags
+C=$(git rev-parse --verify -q 'vX.Y.Z-rcN^{commit}')           # the commit whose check was read in step 6
+if [ -n "$C" ] && [ "$C" = "$(git rev-parse origin/release/X.Y.Z)" ] \
+   && git merge-base --is-ancestor origin/main "$C"; then
+    git push origin "$C":refs/heads/main           # never with --force
+else
+    echo "STOP: C is empty, the release branch moved, or main is not an ancestor of C; nothing was pushed"
+fi
+git ls-remote origin refs/heads/main               # must print C
+gh pr view <N> --repo engram-agents/engram --json state,mergedAt   # must say MERGED
 ```
 
-### 5. Publish the GitHub Release (private repo)
+If the block prints STOP, nothing was pushed. Either the candidate tag did not
+resolve, or the release branch moved after its check was read (a soak fix
+merged: that is a new candidate, back to step 4), or `main` holds a commit the
+release branch lacks. Find out which.
 
-**A tag push does NOT create a Releases entry here either — create it explicitly.**
-This section claimed the opposite until 2026-08-27; the public-repo half of the
-same mistake is documented under *Announcing the public release* below. Measured
-on this private repo 2026-08-27: **16 tags, 3 releases** — eleven version tags
-(`v0.1.0`, `v0.1.3`, `v0.1.4`, `v0.2.0-rc1/rc2`, `v0.3.2`, `v0.3.2-rc1` among
-them) carry no entry at all. Those are the releases nobody noticed were missing,
-which is what the false claim cost. Both figures are a snapshot supporting the
-sentence above them, not a live count.
+**If the push is refused for any reason** (the check is not accepted, `main`
+moved meanwhile, the account is not exempt): stop and report to the
+maintainer. Never force, and never suspend a rule to get past a refusal.
+`main` is never moved back: its history rule allows no force-move for anyone,
+so a bad release is repaired by a new release, not by moving `main`.
 
-Create it:
+The pull request is expected to read `MERGED` once `main` contains its head
+(GitHub's documented behaviour; not yet observed on this repository, so the
+first release cut this way records what it actually read). If it reads
+`CLOSED`, the record would say the release pull request was abandoned; find
+out why before going on.
+
+**Why a fast-forward and not the merge button.** The installer's first step
+requires that the commit a plain clone lands on carries a release tag. So
+`main` must end exactly on the tagged commit, not on a merge commit with an
+equal tree. Do not simplify this step into a merge.
+
+**Who may run this step, and how to check.** Only an account in the
+repository's release team (the organization team `release-bypass`). Adding a
+member to it is an organization-owner action, and that is the actual
+protection: whoever is on that team can move `main`, push to a release branch
+and create a release tag. Name the account in the release record. The
+rulesets, each separate so that one can be read or suspended alone:
+
+| Ruleset | Covers | Rule | Exempt |
+|---|---|---|---|
+| `main-protect-history` | `main` | no deletion, no force-move | nobody |
+| `main-release-seat-only` | `main` | no update | release team |
+| `main-require-full-suite` | `main` | required check `pytest (3.12)` | nobody |
+| `release-branches-protect-history` | `release/*` | no deletion, no force-move | nobody |
+| `release-branches-release-seat-only` | `release/*` | no update | release team |
+| `release-branches-require-pr-checks` | `release/*` | required check `pr-checks`, not enforced when the branch is created | nobody |
+| `deployable-tags-release-seat-only` | tags `v*` and `deploy/*` | no creation | release team |
+| `protect-release-tags` | all tags | no deletion, no move | nobody |
+
+The tag rule covers both prefixes because the installer accepts a tag that
+begins with `v` or with `deploy/`. Two more rulesets exist and are not release
+rules: `dev-require-PR-approval` (it matters once here: the merge-back of
+step 10 needs an approval, including after its last push, so its author cannot
+merge it alone) and `protect-release-snapshots` (the branch of the releases up
+to v0.5.5).
+
+A non-admin account reads every exemption list as empty, so the list is not
+evidence from such an account. The field that is evidence from any account is
+`current_user_can_bypass`, read from the account that will act:
 
 ```bash
-gh release create <tag> --repo engram-agents/engram-alpha \
-  --notes-file <changelog-section> --prerelease
+gh api repos/engram-agents/engram/rulesets/<id> --jq .current_user_can_bypass
 ```
 
-`--prerelease` is the flag, not a follow-up edit: an rc is a pre-release because
-the public repo's clean tag is the non-prerelease surface. Then open the entry and
-confirm two things render — the CHANGELOG notes you passed, and the source-code
-tarball link GitHub attaches on its own.
+From a release-team account it must print `always` on the three rules that
+name the release team as exempt (`main-release-seat-only`,
+`release-branches-release-seat-only`, `deployable-tags-release-seat-only`) and
+`never` on the five other rules of the table. Measured 2026-11-13 from both
+sides: that pattern from a release-team account, and `never` on every ruleset
+of the repository from an account outside the team. **Never test these rules with a real push.** A tag or a
+release branch that slipped through could never be deleted.
 
-## Dogfood-before-public
+What the rules buy is narrow, and it should not be read as more. Another
+account can no longer publish unreleased code by moving `main` or by creating
+a tag the installer accepts. They do not protect against a release-team
+account that is itself compromised, and they do not protect `dev`. No ruleset
+can say "`main` only ever equals a release tag"; the checks in this step and
+the next carry that.
 
-**Do not cut the public release immediately after the rc tag.** The rc tag on
-`main` is the validation window: the whole agent family upgrades to the rc
-and dogfoods it (at least a day) before the release is published (through
-v0.5.5, by running `release-cutover.py` against the public repo). Concretely:
+**A lasting effect to know.** The required check on `main` applies to every
+future write to `main`, not only to releases. Any commit pushed there needs a
+green `pytest (3.12)` from a pull request or push run on that commit.
 
-- Every agent (and human) on the rc pool runs
-  `git pull origin main && tools/install-local-marketplace.sh` (or checks
-  out the rc tag) to get onto the new build.
-- Normal work continues on this build; anything that surfaces (a broken
-  hook, a mis-stamped version, an unexpected migration issue) is a **fix
-  round on `dev`**, followed by a new `-rc<N+1>` cut (repeat from step 1
-  above with the incremented rc suffix) — not a hotfix to a public tag that
-  doesn't exist yet.
-- Only once the rc has held up under real use does it graduate to a public
-  cut (below). The clean `vMAJOR.MINOR.PATCH` public tag is the artifact of
-  a *validated* rc, not the artifact of a green CI run alone.
+### 8. Tag the release
 
-## Publishing to the public repo
+```bash
+git fetch origin --tags
+C=$(git rev-parse --verify -q 'vX.Y.Z-rcN^{commit}')           # the accepted candidate
+if [ -n "$C" ] && [ "$C" = "$(git rev-parse origin/main)" ] \
+   && [ "$C" = "$(git rev-parse origin/release/X.Y.Z)" ]; then
+    git tag -a vX.Y.Z "$C" -m "vX.Y.Z" && git push origin vX.Y.Z
+else
+    echo "STOP: main, the release branch and the candidate are not one commit; nothing was tagged"
+fi
+git ls-remote origin 'refs/tags/vX.Y.Z^{}' refs/heads/main refs/heads/release/X.Y.Z   # three equal ids
+```
 
-> **Historical — through v0.5.5.** This section and its subsections *One-time
-> setup*, *Running the cutover* and *Dry-run first, then push* describe the
-> retired cutover tool and its exclusion list. They are not the current
-> procedure; see the note at the top of this file.
+The tag and its push sit inside the check on purpose. If step 7 stopped and
+`main` is still the previous release, this block must tag nothing: a release
+tag on the wrong commit could never be corrected.
 
-Once the rc has dogfooded clean, publish it to the public repo,
-[`engram-agents/engram`](https://github.com/engram-agents/engram). The public
-repo carries **one squashed commit per version** — it is a clean, leak-scrubbed
-release snapshot, not a mirror of this repo's full history.
+Between step 7 and this step `main` sits on a commit that carries only a
+candidate tag, so a plain clone in that window lands on `vX.Y.Z-rcN`. The
+content is the release's and the installer accepts it; the window is expected
+and should be minutes. (The old order, tag before fast-forward, had no such
+window, but could tag a commit `main` then failed to reach.)
+
+Before the tag, `main` must equal the release pull request's head. After it,
+the commit the tag peels to, `main` and the release branch head must be one
+id. Release tags are protected: once pushed, a release tag cannot be moved or
+deleted. Read `C` twice before pushing.
+
+### 9. Create the Releases entry
+
+A tag push does not create a Releases entry.
+
+Copy the `## [vX.Y.Z]` section of `docs/CHANGELOG.md`, without its heading,
+into a file first; `--notes-file` takes a file, not a section.
+
+```bash
+gh release create vX.Y.Z --repo engram-agents/engram --verify-tag \
+  --title "vX.Y.Z" --notes-file release-notes-vX.Y.Z.md --latest
+gh release view vX.Y.Z --repo engram-agents/engram
+```
+
+Open the page logged out and confirm it renders before anything links to it.
+This completes surface (1) of the definition below, and only that one.
+
+### 10. Write the release record, and bring the release branch home
+
+Open one pull request into `dev` that
+adds `docs/internal/release-records/vX.Y.Z.md` and the skip-set file of G3.
+The record names: the release seat, gate seat and security seat; the candidate
+tags and their commits; each gate with its run identifier and result; both
+skip counts and the differences; the full ids of the release tag object and
+the release commit; the time `main` moved; the account that pushed; the soak seats and the soak
+report; and anything that was not run.
+
+**If the release branch carries a commit that `dev` lacks** (a soak fix copied
+onto it), `main` now holds that commit too, and the next release branch, cut
+from `dev`, would not contain it: the next fast-forward of `main` would be
+impossible. So before the next release branch is cut, open a pull request
+from `release/X.Y.Z` into `dev` and merge it **with a merge commit, not a
+squash**. The repository allows a merge commit into `dev`; this pull request
+and the release pull request are the two exceptions to "every pull request
+into `dev` squashes" (`PR-MERGE-POLICY.md`). The fix is already on `dev` as its
+own squash, so the merge usually changes nothing but history. If `dev` has
+since touched the same lines, or on the changelog (the line sits under two
+headings), GitHub reports a conflict: resolve it on a branch cut from `dev`
+that merges the release branch locally, keeping `dev`'s content, and open the
+pull request from that branch, still merged with a merge commit. Then remove
+from `[Unreleased]` on `dev` anything the release already shipped (step 2
+does the same check at the next release). Check afterwards that
+`git merge-base --is-ancestor origin/main origin/dev` succeeds. Measured in a
+local repository only (2026-11-13): without the back-merge, and with a squash,
+the next fast-forward of `main` is refused; with a merge commit it succeeds. When no soak fix was needed, the release branch is
+already inside `dev`'s history and this step is only that check.
+
+## Part 3: tell the public
 
 > **Definition of released (Lei, 2026-10-02).** A version is reported as
 > *released* only when all three public surfaces are live, in this order:
@@ -370,161 +454,23 @@ release snapshot, not a mirror of this repo's full history.
 > pending", never "released". Origin: v0.5.2 was reported released at
 > 2026-10-02 00:1xZ with (2) and (3) undone; the doc already carried both
 > steps, so the fix is the definition and the print, not a third copy.
->
-> *Historical part, marked 2026-11-10:* how the tag in step (1) is made ("the
-> cutover tool", "the tool does the tag half", its `--push` summary) describes
-> the retired tool. Steps (2) and (3) are unchanged. How the tag is made now is
-> not written here yet; see the note at the top of this file.
 
-### One-time setup
-
-Clone the public repo locally somewhere outside this checkout — this is the
-`--target` for the cutover tool:
-
-```bash
-git clone git@github.com:engram-agents/engram.git /path/to/public/engram
-```
-
-### Running the cutover
-
-`tools/release-cutover.py` produces the snapshot and publishes it. Per its
-own docstring, it:
-
-1. `git-archive`s the source ref into a temp dir (tracked files only).
-2. Applies the minus-set (`release-minus-set.txt`) — drops excluded paths.
-3. Runs the scan-leaks gate — **fail-closed** on any leak.
-4. Runs sanity gates — LICENSE + README disclaimer present.
-5. Publishes to the public target repo as **one squashed commit + annotated
-   tag**.
-6. Optionally pushes (`--push` flag; **default off**).
-
-```bash
-python3 tools/release-cutover.py --version v0.2.0 --target /path/to/public/engram
-```
-
-Key flags (from `--help`):
-- `--version` — the **clean** release version, e.g. `v0.2.0`. Required.
-  `VERSION_RE` (`^v\d+\.\d+\.\d+$`) rejects anything with a suffix — no
-  `-rc`, no `-alpha`.
-- `--target` — path to the local clone of the public repo. Required.
-- `--source` — path to the source repo (this repo). Defaults to walking up
-  from the script location to the enclosing `.git` root; pass it explicitly
-  only if that heuristic misfires (e.g. running from an unusual checkout).
-- `--source-ref` — git ref to snapshot (tag/branch/sha); default `HEAD`.
-  Point this at the validated **rc tag** on `main`
-  (`--source-ref v0.2.0-rc2`), not just whatever `HEAD` happens to be.
-- `--minus-set` — path to the minus-set file; default
-  `<source>/release-minus-set.txt`. **This file is the only hand-maintained
-  input to the whole cutover** — everything else the tool derives. It
-  currently excludes the dev workspace (`CLAUDE.md`, `.claude/`),
-  persona-specific dev tools, the `tests/` tree, and `.github/` (private CI).
-  Review it if new private-only paths appear.
-- `--leak-roster` — path to `.scan-leaks-local.json` for the personal-name
-  pattern gate; default `<source>/.scan-leaks-local.json` if present. When
-  neither resolves, or the resolved path is not a regular file (mistyped
-  path, directory), the tool prints `WARNING: name-roster half of the leak
-  gate did NOT run ...` to stderr (non-fatal: structural patterns only). A
-  roster file that exists but is unusable (`{}` or malformed JSON) draws no
-  WARNING line; the final summary's `leak gate` label reading `PASS (structural
-  patterns only; personal-name scan skipped ...)` is the signal (measured for
-  both cases, 2026-10-12).
-- `--scan-leaks` — path to the leak-scanner script; default
-  `<source>/tools/scan-leaks.py`. Use it when `--source` is a repo that does
-  not carry that script. A path that is not an existing file (nonexistent, or
-  a directory) fails closed before the target is touched; the path must be a
-  Python scanner, and the tool does not inspect its contents.
-- `--author` — commit author; defaults to whatever's parsed from the LICENSE
-  copyright line.
-- `--push` — push the branch + tag to the target's origin after committing.
-  **Default off.**
-- `--yes` — skip the interactive confirm before writing to target.
-- `--force` — if the version tag already exists in target, delete and re-tag
-  (does not force-push; push manually after).
-
-### Dry-run first, then push
-
-**Run without `--push` first.** The tool writes the squashed commit + tag to
-your local clone of the target repo and prints a summary (file counts,
-minus-set removals, the scan-leaks result, LICENSE/README gate results)
-without touching the remote. Review that output — especially the scan-leaks
-section — before pushing:
-
-```bash
-# 1. Dry run — writes locally to the target clone, does not push.
-python3 tools/release-cutover.py --version v0.2.0 --target /path/to/public/engram \
-  --source-ref v0.2.0-rc2
-
-# 2. Inspect the target clone: git log, git show, review the scan-leaks
-#    output printed above for anything unexpected.
-
-# 3. Once satisfied, re-run with --push (or push the target clone manually).
-python3 tools/release-cutover.py --version v0.2.0 --target /path/to/public/engram \
-  --source-ref v0.2.0-rc2 --push
-```
-
-**Two footguns measured on the v0.5.0 cut (2026-09-02), both in the dry-run
-step, both silent:**
-
-- **A re-run stacks a SECOND release commit on the first.** The tool commits
-  on top of whatever the target clone's `main` currently is; after one dry
-  run that is your own first "Release vX.Y.Z" commit, so a second run (for
-  example after adding a minus-set entry) leaves the clone `ahead 2` — two
-  commits for one version, which `--push` would publish as-is. `--force`
-  only re-points the tag; it does not undo the earlier commit. Before every
-  re-run: `git -C <target> tag -d vX.Y.Z; git -C <target> reset --hard
-  origin/main`, then read `git status -sb` back and require `ahead 1`.
-- **`source sha` in the Final summary is the annotated TAG object, not the
-  commit.** With `--source-ref v0.5.0-rc3` it printed `12da9347` (the tag)
-  while the release commit everyone was quoting was `4ae2b947`
-  (`git rev-parse v0.5.0-rc3^{commit}`). Both are correct; they are
-  different objects. Compare against `^{commit}`, not the summary line.
-
-**Reproduce the tree from a second seat before pushing.** The artifact is
-deterministic from `<source-ref>` + the minus-set, so a colleague can rebuild
-it into a scratch clone (never the real remote, never `--push`) and compare
-`git rev-parse vX.Y.Z^{tree}`. Commits will differ (author, date); the tree
-must not. **Two runs, because they cannot be combined:** (a) **roster-less**
-(`--leak-roster /nonexistent/none.json`; expect the `WARNING: name-roster half
-... did NOT run` line on stderr, which is this run working as intended)
-produces the tree to compare;
-(b) **with your own roster** the gate fires on every roster hit and aborts
-*before the target is written* — that run yields the personal-name axis and
-deliberately produces no tree. Expect the abort in (b); it is the gate
-working, not a mistake in the recipe. Measured on v0.5.0 (2026-09-02): two
-colleagues reproduced `874087b9` byte-identically from run (a), and each ran
-the can-it-fail control themselves (one appended character in the scratch
-clone changes the tree hash) — a control that was executed, not inferred
-from how git works.
-
-The scan-leaks gate is **fail-closed**: any hit aborts before the target is
-touched. Per the tool's own docstring, it is *necessary-but-not-sufficient*
-— it skips extensionless files and doesn't carry all personal-name patterns
-unless `.scan-leaks-local.json` is configured, so a clean scan-leaks pass is
-not a substitute for actually reading the dry-run output.
-
-### Announcing the public release
-
-After `--push`, the public repo has the clean `vMAJOR.MINOR.PATCH` tag.
-
-**⚠️ A tag push does NOT create a Releases entry — you must create it
-explicitly.** This document claimed otherwise until 2026-08-20, when the
-v0.4.0 cut proved it: the tag pushed and no entry appeared, and the release
-had to be created by hand with the CHANGELOG section as its notes. Measured
-on the public repo the same day: **10 tags, 9 releases** — `v0.1.0` still
-carries a tag with no release, which is the residue of exactly this
-mistake. Create it with `gh release create <tag> --repo engram-agents/engram
---notes-file <changelog-section>` and confirm it renders before announcing
-anything that links to it.
-Notify users (see below) pointing at the **public** repo's release page, not
-the private rc.
-Creating the Releases entry completes surface (1) only; see *Definition of released* above.
+*How surface (1) is made since v0.5.6.* The block above is kept as it was
+written. Its words "the cutover tool", "the tool does the tag half" and "the
+cutover tool's `--push` summary" describe the retired two-repository tool, and
+*Announcing the public release* was a section of the old procedure. Surface (1)
+is now made by steps 6 to 9 of this page: the fast-forward of `main`, the
+release tag, and `gh release create`. Surfaces (2) and (3), their order and their
+owners are unchanged.
 
 ## Notify users
 
 For alpha-tester pool (agents, users, or counterparts on other hosts):
 - Brief release announcement summarizing what's in the version
 - Pointer to the public GitHub Release page (`engram-agents/engram`)
-- Upgrade instruction: `git pull origin dev && tools/install-local-marketplace.sh`,
+- Upgrade instruction: `git fetch origin --tags && git checkout vX.Y.Z &&
+  tools/install-local-marketplace.sh` (the release tag; `dev` is ahead of the
+  release and is for development, not for upgrading to it),
   then `/plugin marketplace update engram-local`, then /plugin -> Installed ->
   engram plugin -> Update now, inside Claude Code (or `git checkout` the tag
   if they prefer pinning)
@@ -600,7 +546,7 @@ from, not where you send.
 
 **⚠️ ORDER MATTERS — send AFTER the public release exists, never before.**
 The email links the public repo's Releases entry, which you created by hand
-under *Announcing the public release* above (the subsection carrying the
+in step 9 (the subsection carrying the
 `gh release create` command) — it is not created by the tag push. Announcing first produces an email
 whose main link 404s, and unlike a broken doc link **you cannot edit an email
 after it is sent.** Load every link once before sending.
@@ -624,7 +570,7 @@ after it is sent.** Load every link once before sending.
   or reconnect steps. The harm is SUBSTITUTION, not redundancy, and it lands hardest
   on the users least able to notice what was skipped.
 - Links to the **public** GitHub Release page (`engram-agents/engram`), not
-  the private rc, and to the Versions entry from step 1.
+  a candidate (`-rcN`) tag, and to the Versions entry from step 1.
 
 **Do NOT hand-roll an unsubscribe link.** Buttondown states that every email
 it sends is one-click-unsubscribe compliant (RFC 8058) and injects the headers
@@ -672,50 +618,42 @@ maintainer the actual text, send on their word. And note the asymmetry that make
 this worth the extra step — a merge can be reverted, a sent email cannot be edited
 or recalled.
 
-## After the cut
+## After the release
 
-- Record the release in ENGRAM via `engram_add_observation` (the tag SHA +
-  `main` state make good `hard_data` evidence).
-- Append the milestone to `~/.engram/history/YYYY-MM-DD.md`.
-- Continue normal dev work on `dev`. `main` sits at the new tag until the
-  next cut.
+- Record the release in your own memory with the tag object, the release
+  commit and the time `main` moved as evidence.
+- `main` sits at the release tag until the next release. Development continues
+  on `dev`.
+- A defect found after the release is fixed on `dev` and shipped as the next
+  patch release through this whole procedure. There is no hotfix on `main`.
+- The release branch stays. Nobody deletes it.
 
 ## Anti-patterns
 
-- **Don't open the release PR before `git log origin/dev..origin/main` is
-  empty.** See the reconcile pre-step at the top of "Open the release PR"
-  (step 4).
-- **Don't squash-merge the `dev→main` release PR.** Use `--merge` (a merge
-  commit). Squash collapses the release history into one commit and drops the
-  ancestry link to `dev`, so the *next* cut conflicts. (This needs "Allow merge
-  commits" enabled — see Repo merge settings.)
-- **Don't author a fix independently on `main`.** That is what makes
-  `main` and `dev` diverge. Fixes go to `dev` first; a needed `main`
-  hotfix is a **cherry-pick** of the `dev` commit (identical content → no future
-  conflict). See "Keeping `main` and `dev` from diverging."
-- **Don't skip the CHANGELOG update.** Users read this; future-self also
-  reads this to remember what was in each version. When reconciling with
-  `main`'s hotfix sections, **union** — never drop a side.
-- **Don't tag while CI is red.** A tag points at a specific SHA; if that
-  SHA's tests fail, users hit broken state. In CI the full suite runs on the
-  release PR and in the nightly on `dev`; the release PR's run is the one that gates
-  a tag — take it seriously.
-- **Don't trust the fix-PR's green as full-suite green.** A `dev` fix PR runs
-  only `pr-checks`; run the affected tests locally, and let the release PR's
-  re-run be the full-suite verification.
-- **Don't push release bookkeeping directly to `dev`.** It's protected in
-  practice — the CHANGELOG update and version bump go through a PR like any
-  other change.
-- **Don't build from a stale local working tree.** `git pull` before running
-  `install-local-marketplace.sh` (or any build step) — the build stamps your
-  local checkout, not `origin`.
-- **Don't skip the dogfood window.** The rc tag exists to be lived with
-  before it's promoted to a public, clean-tagged release — don't publish
-  it the same day as the rc cut.
-- **Don't let a `-rc` suffix reach the public repo.** Through v0.5.5
-  `release-cutover.py`'s `VERSION_RE` rejected it, but don't rely on a gate — the version
-  passed to `--version` should already be the clean `vMAJOR.MINOR.PATCH` you
-  intend to publish.
-- **Don't infer a pushed tag from local state.** Verify with
-  `git ls-remote --tags origin <tag>` — local `HEAD` / `-q` silence is not
-  proof the tag reached `origin`.
+- **Don't move `main` with the merge button, a merge commit, a squash or a
+  rebase.** Each puts an untagged commit on `main`. `main` moves by
+  fast-forward to the release commit and in no other way; the release pull
+  request exists for its check.
+- **Don't push a fix straight to a release branch, and don't fix only there.**
+  A soak fix lands on `dev` first and reaches the release branch by pull
+  request. A fix that exists only on the release branch is lost at the next
+  release.
+- **Don't cut the next release branch while `main` holds a commit `dev`
+  lacks.** Merge the previous release branch back first (step 10).
+- **Don't delete a release branch.** It is the record, and the rules refuse it.
+- **Don't treat a hand-started suite run as the gate.** The gate is the check
+  on the release pull request.
+- **Don't tag a release on a commit whose gates were read on another commit.**
+  Read the commit's full id from the tag, not from memory, at every gate.
+- **Don't take a green run as proof that the tests ran.** Compare the skip
+  sets (G3).
+- **Don't split the version bump and the changelog section into two pull
+  requests.**
+- **Don't build from a stale checkout.** Fetch and check out the tag before
+  any build step; the build stamps the local tree, not `origin`.
+- **Don't infer a pushed tag or a moved branch from local state.** Read it
+  back with `git ls-remote`.
+- **Don't force-push `main` or try to move a release tag.** If either looks
+  necessary, stop and bring it to the maintainer.
+- **Don't report "released" after part 2.** Until the newsletter has gone out,
+  the report says "repository released; website and newsletter pending".

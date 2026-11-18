@@ -94,6 +94,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .manifest import select_shippables, load_manifest, resolve_tier
+from .home_path_class import disallowed_home_path_regex
 
 
 # ---------------------------------------------------------------------------
@@ -118,23 +119,16 @@ SPECIAL_COPY_PREFIXES = (
     "output-styles/claude/",
 )
 
-# Patterns that must not appear in a foreign bundle.
-# These catch PERSONAL IDENTITY strings — the builder's specific home path and
-# agent identifier.  They do NOT include 'agents-shared' because that string
-# appears in hook source files as a configurable environment-variable default
-# (os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/...")) which is a
-# legitimate deployment configuration default, not a personal identity leak.
-#
-# IMPORTANT: these patterns are built via concatenation rather than written as
-# plain string literals.  If the literals appeared here verbatim, this source
-# file would match its own patterns when it is shipped at the convenience tier
-# (tools/engine is a shipped tools/ entry), causing the foreign leak-scan to
-# flag three self-inflicted hits.  Concatenation produces identical regex
-# semantics while keeping this file clean.
-_AB = "agent-" + "borges"  # personal agent identifier — do NOT expand inline
+# Patterns that must not appear in a foreign bundle: the absolute-home-path
+# class (default-deny), defined once in home_path_class.py and shared with
+# scan-leaks.py.  Any /home/<name>/ or /Users/<name>/ whose <name> is not in the
+# declared allowed set is a leak, so no seat is protected by name only.  The
+# deployment default under the shared coordination folder is in that allowed set
+# (a configurable environment-variable default, not a personal identity).
+# Bare names (a seat name with no path around it) are deliberately NOT scanned
+# here: that is the name-leak gate's domain, which scans with a roster in CI.
 FOREIGN_LEAK_PATTERNS: list[re.Pattern[str]] = [
-    re.compile("/home/" + _AB),
-    re.compile(r"\b" + _AB + r"\b"),
+    disallowed_home_path_regex(),
 ]
 
 SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service"}
@@ -1014,14 +1008,13 @@ def build_plugin(
     # outside the source_root tree (e.g. src/build/engine ships as bundle tools/engine).
     source_root = manifest.get("source_root", ".")
 
-    # Read the SSoT base version from plugin.json before stamping — this is a
-    # deliberately separate, compact read here rather than reusing the
-    # plugin_data load further down (§2. Manifests), which happens too late in
-    # execution order: build_version must exist before the copy/emit steps
-    # below that consume it.
-    base_version_plugin_json = os.path.join(repo_root, "plugin.json")
-    with open(base_version_plugin_json, encoding="utf-8") as f:
-        base_version = json.load(f).get("version", "0.1.0")
+    # Read the SSoT plugin.json ONCE, here: its "version" is the base for the
+    # build stamp, and the same dict feeds the written manifests in
+    # §2. Manifests below (which works on a copy, never the dict loaded here).
+    src_plugin_path = os.path.join(repo_root, "plugin.json")
+    with open(src_plugin_path, encoding="utf-8") as f:
+        source_plugin_data = json.load(f)
+    base_version = source_plugin_data.get("version", "0.1.0")
 
     # Compute build version once — threaded through to all version-bearing outputs
     # so all emitted files carry the same stamp within a single build invocation.
@@ -1089,9 +1082,7 @@ def build_plugin(
     # ── 2. Manifests ─────────────────────────────────────────────────────────
 
     _log(f"Writing plugin.json (version={build_version!r})")
-    src_plugin_path = os.path.join(repo_root, "plugin.json")
-    with open(src_plugin_path, encoding="utf-8") as f:
-        plugin_data = json.load(f)
+    plugin_data = dict(source_plugin_data)
     plugin_data["version"] = build_version
     with open(os.path.join(plugin_root, "plugin.json"), "w", encoding="utf-8") as f:
         json.dump(plugin_data, f, indent=2)

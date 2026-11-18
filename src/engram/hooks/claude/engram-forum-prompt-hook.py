@@ -78,6 +78,7 @@ Design doc: forum/spec.md
 
 import http.client
 import json
+import math
 import os
 import socket
 import sys
@@ -605,7 +606,18 @@ def _load_cache() -> Optional[dict]:
     try:
         raw = _hooklib_io().read_regular_text(HOOK_CACHE_PATH)
         data = json.loads(raw)
-        age = time.time() - data.get("fetched_at", 0)
+        # #3535: a cache that is not a JSON object, or whose `fetched_at` is not a
+        # finite number (bool counts as not a number), is an INVALID cache -- the
+        # same as an unparsable one -- never an AttributeError / TypeError that
+        # exits the hook rc=1 with no forum signal. A non-finite stamp is invalid
+        # too: NaN/Infinity would make `age > TTL` False and serve it as fresh.
+        if not isinstance(data, dict):
+            return None
+        fetched_at = data.get("fetched_at", 0)
+        if (isinstance(fetched_at, bool) or not isinstance(fetched_at, (int, float))
+                or not math.isfinite(fetched_at)):
+            return None
+        age = time.time() - fetched_at
         if age > CACHE_TTL_SECONDS:
             return None
         return data
@@ -1041,7 +1053,20 @@ def _cached_mentions(data: dict) -> Optional[list]:
     if "mentions" not in data:
         return []
     value = data["mentions"]
-    return value if isinstance(value, list) else None
+    if not isinstance(value, list):
+        return None
+    # #3535: an item that is not a JSON object (`[1, "a", null]`) would raise
+    # AttributeError in the formatter. DROP such items; valid ones still render, and
+    # a list with none left renders no mention line.
+    return [m for m in value if isinstance(m, dict)]
+
+
+def _cached_threads(data: dict) -> list:
+    """The threads out of a cache payload: a list, else [] (#3535). The hook only
+    counts them, so a non-list value (`"threads": 5` raised TypeError in len())
+    is treated as no threads."""
+    value = data.get("threads", [])
+    return value if isinstance(value, list) else []
 
 
 def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
@@ -1243,7 +1268,7 @@ def main() -> None:
         # cursor past posts made AFTER that fetch but before cache-expiry, so
         # the next live fetch's since=cursor would exclude them and they'd
         # never surface. (Twin of the unreachable-no-cache guard below.)
-        threads = cached.get("threads", [])
+        threads = _cached_threads(cached)
         # Backward-compat: old cache files have no "mentions" key → [].
         # `"mentions": null` is the #3521 marker for "the inbox failed".
         mentions = _cached_mentions(cached)
@@ -1288,7 +1313,7 @@ def main() -> None:
             try:
                 raw = _hooklib_io().read_regular_text(HOOK_CACHE_PATH)
                 stale = json.loads(raw)
-                threads = stale.get("threads", [])
+                threads = _cached_threads(stale)
                 mentions = _cached_mentions(stale)
                 cache_served = True
             except (OSError, ValueError, AttributeError):

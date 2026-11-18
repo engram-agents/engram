@@ -127,6 +127,62 @@ try:
 except Exception:
     _LOOP_WAKE_MARKER = _LOOP_WAKE_MARKER_FALLBACK
 
+# #4369: Claude Code delivers a cross-session peer message as a UserPromptSubmit
+# prompt whose body begins with this harness line. It is not a human keystroke.
+_PEER_MESSAGE_PREAMBLE = "Another Claude session sent a message:"
+
+# The machine-sent prompt vocabulary. engram-time-bar-hook.py carries its own
+# copy of this tuple ON PURPOSE (its header explains: it must run when a
+# sibling lib cannot import), so the two lists are kept equal by
+# tests/test_nonhuman_prompt_vocabulary_4686.py rather than by a shared
+# import. Add a member to one, add it to both, or the test reddens.
+#
+# This tuple is the ONLY place a shape is listed (#4719 round 2). _is_cron_prompt
+# used to carry a per-shape `if` for five of these members across four
+# branches; they are folded in here because a branch is invisible to the equality
+# pin -- a sixth shape added as another branch would have reddened nothing.
+# The reasons those branches recorded, moved here so they cannot be lost:
+#   - "<task-notification" / "<command-message" / "<command-name" /
+#     "<local-command": the harness envelopes #4686 enumerated -- monitor task
+#     notifications and slash-command / local-command blocks.
+#   - "Stop hook feedback": a blocking Stop-hook re-invocation is not a human
+#     message (#2451) -- e.g. engram-loop-arm-stop-hook.py's own nudge.
+#   - "Loop continuation.": the canonical ScheduleWakeup stub prefix, for loop
+#     continuations that do not set loop_prompt in the marker (the standard
+#     engram-loop skill uses the stub "Loop continuation. Read ...").
+#   - "<<autonomous-loop>>" / "<<autonomous-loop-dynamic>>": autonomous-loop
+#     sentinels kept for back-compat with loops that predate the
+#     format_loop_prompt SSoT (#1594).
+#   - _LOOP_WAKE_MARKER: format_loop_prompt prepends it (tools/loop_prompt.py).
+#   - _PEER_MESSAGE_PREAMBLE: the cross-session peer-message envelope (#4369;
+#     see its own comment above).
+#
+# Matching is by PREFIX on the raw prompt (after html.unescape + strip). Two
+# consequences, both stated rather than left for a reader to find:
+#   - the sentinels widen: startswith("<<autonomous-loop>>") also matches
+#     "<<autonomous-loop>>junk". Acceptable -- a prompt beginning with the
+#     sentinel is machine-sent either way.
+#   - a human prompt that literally BEGINS with one of these envelopes is
+#     classified non-human, so no cooldown marker is written -- and the
+#     cooldown is what SUPPRESSES detection (engram-deference-detector-stop.py
+#     exits early when a real user message landed inside the window). The
+#     failure direction is therefore a FALSE POSITIVE: the detector keeps
+#     firing on a turn where the human was present. Noisy, not silent, and
+#     that is the safe side of this hook -- a spurious nudge costs a sentence,
+#     a missed one costs the catch.
+_NON_HUMAN_PREFIXES = (
+    "<task-notification",
+    "<command-message",
+    "<command-name",
+    "<local-command",
+    "Stop hook feedback",
+    "Loop continuation.",
+    "<<autonomous-loop>>",
+    "<<autonomous-loop-dynamic>>",
+    _LOOP_WAKE_MARKER,
+    _PEER_MESSAGE_PREAMBLE,
+)
+
 
 def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
     """Return True if the prompt looks like a cron-fired heartbeat, not a real user message."""
@@ -135,20 +191,18 @@ def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
     # instead of real angle brackets) still classifies identically to the
     # plain form. One normalize here covers every check below (gh#1649).
     stripped = html.unescape(prompt).strip()
-    # SSoT loop-wake marker (format_loop_prompt prepends this; see tools/loop_prompt.py).
-    if stripped.startswith(_LOOP_WAKE_MARKER):
-        return True
-    # Autonomous-loop sentinels — kept for back-compat with loops that predate
-    # the format_loop_prompt SSoT (#1594).
-    if stripped in ("<<autonomous-loop>>", "<<autonomous-loop-dynamic>>"):
-        return True
-    # Canonical ScheduleWakeup stub prefix — loop continuations that don't set
-    # loop_prompt in the marker (covers markers written by the standard
-    # engram-loop skill which uses the stub "Loop continuation. Read ...").
-    if stripped.startswith("Loop continuation."):
+    # Machine-sent prompt vocabulary (#4686, #4719 round 2): task notifications,
+    # slash-command blocks, local-command blocks, Stop-hook feedback, the
+    # canonical ScheduleWakeup stub, the autonomous-loop sentinels, loop wakes
+    # and the cross-session peer preamble. The tuple above is the ONLY place a
+    # shape is listed -- do not re-add a per-shape branch here, because a branch
+    # is invisible to the equality pin in tests/test_nonhuman_prompt_vocabulary_4686.py.
+    if stripped.startswith(_NON_HUMAN_PREFIXES):
         return True
     # Compare against stored loop_prompt in loop-mode.json (present if loop started
-    # with the updated engram-loop skill that writes loop_prompt to the marker)
+    # with the updated engram-loop skill that writes loop_prompt to the marker).
+    # Kept separate on purpose: this is an equality test against a value read from
+    # disk, not a vocabulary member, so no tuple can express it.
     try:
         with open_regular_text(loop_marker_path) as f:
             marker = json.load(f)

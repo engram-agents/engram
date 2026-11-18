@@ -44,6 +44,13 @@
       ]
     },
     {
+      "key": "23ce2be5ab613fe531483b0f047b05a731e7813baed3249a46ea2dd752f3251b",
+      "sql": "SELECT id FROM nodes WHERE is_current = 1 AND status != 'retracted' AND type IN ('observation_factual', 'observation_predictive') AND created_at >= ?",
+      "sites": [
+        "tools/store_read.py:read_ids"
+      ]
+    },
+    {
       "key": "25c988d6449b53650b086cf16e62444881dde4258eefc476a78f1b701e23f857",
       "sql": "SELECT type, COUNT(*) FROM nodes GROUP BY type",
       "sites": [
@@ -133,6 +140,13 @@
       "sql": "SELECT source_url, source_title FROM nodes WHERE id = ?",
       "sites": [
         "tools/weakest_load_bearing.py:_evidence_label"
+      ]
+    },
+    {
+      "key": "5ee7819d148c8b57d0b45742b7d0196d6113ac76275d0423ffbc5f01b542d7f4",
+      "sql": "SELECT COUNT(*) FROM nodes WHERE type='axiom'",
+      "sites": [
+        "tools/store_read.py:read_axiom_count"
       ]
     },
     {

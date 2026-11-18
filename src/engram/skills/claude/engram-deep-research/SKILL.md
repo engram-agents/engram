@@ -105,6 +105,7 @@ When wrapping up (context limit or natural stopping point):
 ```
 engram_checkpoint(
     message="<summary: question investigated, depth reached, sub-questions registered, key findings>",
+    session_id="<this session's id, as injected at session start>",
 )
 ```
 

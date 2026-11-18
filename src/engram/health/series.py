@@ -3753,7 +3753,7 @@ def export(
     )
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
     except sqlite3.Error as e:
         return {"error": str(e), "reason": "unreadable"}

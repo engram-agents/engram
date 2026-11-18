@@ -1068,13 +1068,13 @@ def test_attempt_delivery_skips_newest_stale_marker_and_uses_newest_loaded_live_
     sessions_dir.mkdir()
     (sessions_dir / "older.json").write_text(json.dumps({
         "session_id": "thread-live",
-        "transcript_path": "/home/agent-mira/.codex/sessions/2026/07/21/live.jsonl",
+        "transcript_path": "/home/agent-alice/.codex/sessions/2026/07/21/live.jsonl",
         "role": "interactive",
         "started_at": "2026-07-21T10:00:00+00:00",
     }))
     (sessions_dir / "newer.json").write_text(json.dumps({
         "session_id": "thread-stale",
-        "transcript_path": "/home/agent-mira/.codex/sessions/2026/07/22/stale.jsonl",
+        "transcript_path": "/home/agent-alice/.codex/sessions/2026/07/22/stale.jsonl",
         "role": "interactive",
         "started_at": "2026-07-22T10:00:00+00:00",
     }))
@@ -1837,19 +1837,19 @@ def test_discover_codex_thread_id_prefers_newest_interactive_codex_marker_and_ov
 
     (sessions / "older.json").write_text(json.dumps({
         "session_id": "thread-old",
-        "transcript_path": "/home/agent-mira/.codex/sessions/2026/07/21/old.jsonl",
+        "transcript_path": "/home/agent-alice/.codex/sessions/2026/07/21/old.jsonl",
         "role": "interactive",
         "started_at": "2026-07-21T10:00:00+00:00",
     }))
     (sessions / "newer.json").write_text(json.dumps({
         "session_id": "thread-new",
-        "transcript_path": "/home/agent-mira/.codex/sessions/2026/07/22/new.jsonl",
+        "transcript_path": "/home/agent-alice/.codex/sessions/2026/07/22/new.jsonl",
         "role": "interactive",
         "started_at": "2026-07-22T10:00:00+00:00",
     }))
     (sessions / "claude.json").write_text(json.dumps({
         "session_id": "not-codex",
-        "transcript_path": "/home/agent-mira/.claude/projects/ignored.jsonl",
+        "transcript_path": "/home/agent-alice/.claude/projects/ignored.jsonl",
         "role": "interactive",
         "started_at": "2026-07-22T11:00:00+00:00",
     }))

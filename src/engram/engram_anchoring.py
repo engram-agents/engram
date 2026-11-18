@@ -16,19 +16,21 @@ see engram_observation.py's call site and #2602's own sequencing, which
 reserves refusal for facet 3 after a week of logged distribution).
 
 Bound, stated once here rather than re-derived at each call site: anchoring
-is a LITERAL SUBSTRING match, so it under-counts a quote that carries the
+is a literal, token-boundary match (#4206 -- a token inside a longer number
+or identifier does not count), so it under-counts a quote that carries the
 same fact in a different surface form (`5,121` in the claim vs `5121` in
 the quote; a spelled-out date vs ISO form). This is the issue's own
 accepted bound, not a defect to route around.
 
-Known overlap (also accepted, not filtered): the five token classes below
-are independent regexes over the same text, so a single span can
-contribute more than one token -- a date like `2026-09-06` also matches
+Known overlap (accepted, and suppressed once by the tokenizer): the five
+token classes below are independent regexes over the same text, so a single
+span can match more than one class -- a date like `2026-09-06` also matches
 the number class as `2026` (digit count 4 >= 3), and a hex sha with an
-embedded digit run can likewise also surface as its own number token.
-Both tokens are real substrings of the claim and both get anchored (or
-not) independently; the class list is "exactly these five" per the
-issue's build spec, with no cross-class suppression.
+embedded digit run can likewise also surface as a number token. A NUMBER
+token whose span lies inside another emitted token's span is dropped
+(#4206): it is part of that token, not a separate count. The class list is
+"exactly these five" per the issue's build spec; the containment drop is
+not a sixth class.
 """
 
 from __future__ import annotations
@@ -66,6 +68,124 @@ _TIME_RE = re.compile(r"\d{1,2}:\d{2}(?::\d{2})?Z?")
 # -- git often renders the same sha in mixed case across surfaces).
 _HEX_SHA_CLASS = "hex_sha"
 
+# Token-boundary alphabet (#4206): a hard token anchors only when the
+# characters immediately around its occurrence are each absent or outside
+# this set. `#` and punctuation are boundaries; letters, digits and `_` are
+# not, so `404` does not anchor inside `#4040`, `x404`, or the numeric
+# tail of a node id.
+_WORD_CHARS = frozenset(
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
+)
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+# Numeric separators (#4206 review): a '.' or ',' that touches a digit is
+# part of the number, not a boundary -- the same rule s2_clause_check's
+# _token_present (M1) applies. 404 is not in 4.404, 404.5 or 5,404, but it
+# is in "error 404." and "404, then".
+_NUMERIC_SEPARATORS = frozenset(".,")
+
+
+def _token_is_anchored(tok: str, quote: str, *, hex_class: bool) -> bool:
+    """True when `tok` occurs in `quote` at a token boundary.
+
+    Non-hex tokens need a non-word character (or the quote's edge) on both
+    sides. For a token that starts with a digit, a '.' or ',' touching a
+    digit is not a boundary (M1's rule): `404` is not in `4.404`, `404.5`
+    or `5,404`, but is in `error 404.`. Hex tokens are matched
+    case-insensitively and their right side is deliberately looser (#4206):
+    a 7-character sha is usually written as the prefix of the longer sha it
+    names, so an occurrence followed by more hex digits anchors -- but only
+    if the whole remainder of the word is hex (`abcdef1c0ffee9` anchors
+    `abcdef1`; `abcdef1zz` does not).
+    """
+    if not tok:
+        return False
+    haystack = quote.lower() if hex_class else quote
+    needle = tok.lower() if hex_class else tok
+    digit_leading = tok[:1].isdigit()
+
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        left_ok = start == 0 or haystack[start - 1] not in _WORD_CHARS
+        if (
+            left_ok
+            and digit_leading
+            and start >= 2
+            and haystack[start - 1] in _NUMERIC_SEPARATORS
+            and haystack[start - 2].isdigit()
+        ):
+            # `4.404` / `5,404`: the separator joins the token to a number.
+            left_ok = False
+        if left_ok:
+            right = haystack[end] if end < len(haystack) else None
+            separator_tail = (
+                digit_leading
+                and right in _NUMERIC_SEPARATORS
+                and end + 1 < len(haystack)
+                and haystack[end + 1].isdigit()
+            )
+            if not separator_tail:
+                if right is None or right not in _WORD_CHARS:
+                    return True
+                if hex_class:
+                    # The next character is a word character: the token
+                    # anchors only if what follows is a longer all-hex word
+                    # (a sha prefix) and not a non-hex extension (`zz`,
+                    # `x`, `_`).
+                    i = end
+                    while i < len(haystack) and haystack[i] in _HEX_DIGITS:
+                        i += 1
+                    if i == len(haystack) or haystack[i] not in _WORD_CHARS:
+                        return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
+def _glued_sides(text: str, start: int, end: int) -> tuple[bool, bool]:
+    """(left, right): whether a word or number unit glues onto the occurrence
+    ``text[start:end]`` on each side.
+
+    A side is glued when the adjacent character is a word character, or a
+    '.'/',' standing between two digits (the number-separator rule). A text
+    edge is never glued. This mirrors the boundary alphabet ``_token_is_anchored``
+    uses, but measures the occurrence's own neighbourhood rather than a
+    fixed per-token rule -- so the same (left, right) pair means "the
+    tokenizer cut this token out of the same kind of surroundings".
+    """
+    tok = text[start:end]
+    left = False
+    if start > 0:
+        ch = text[start - 1]
+        left = ch in _WORD_CHARS or (
+            ch in _NUMERIC_SEPARATORS
+            and tok[:1].isdigit()
+            and start >= 2
+            and text[start - 2].isdigit()
+        )
+    right = False
+    if end < len(text):
+        ch = text[end]
+        right = ch in _WORD_CHARS or (
+            ch in _NUMERIC_SEPARATORS
+            and tok[-1:].isdigit()
+            and end + 1 < len(text)
+            and text[end + 1].isdigit()
+        )
+    return left, right
+
+
+def _boundary_signatures(text: str, tok: str) -> set[tuple[bool, bool]]:
+    """Every (left, right) glue signature `tok` takes at any occurrence in
+    `text`. Used for the #4678 union: the quote must carry the token with the
+    same boundary structure the claim has, not merely the same characters."""
+    signatures: set[tuple[bool, bool]] = set()
+    start = text.find(tok)
+    while start != -1:
+        signatures.add(_glued_sides(text, start, start + len(tok)))
+        start = text.find(tok, start + 1)
+    return signatures
+
 
 def _digit_count(token: str) -> int:
     return sum(ch.isdigit() for ch in token)
@@ -73,32 +193,66 @@ def _digit_count(token: str) -> int:
 
 def _hard_tokens_with_class(text: str) -> list[tuple[str, str]]:
     """Internal: hard tokens paired with their class tag, in first-
-    appearance document order, de-duplicated by exact token string."""
+    appearance document order, de-duplicated by exact token string.
+
+    A NUMBER token whose SPAN lies inside another emitted token's span (the
+    `1234` in a node id (`xx_NNNN`), the digit run in a hex sha, the year in a
+    date, the integer part of `1234567.89`) is part of that token, not a separate
+    count. This is deliberately span containment, NOT the substring test
+    s2_clause_check._clause_hard_tokens uses for M1: substring containment
+    would drop a standalone `404` merely because `#4040` appears elsewhere in
+    the text, while span containment keeps both (`hard_tokens("404 and
+    #4040")` -> `["404", "#4040"]`). Do not "align" this to the broader rule.
+    An all-digit 7+-character token is a number, not a hex sha (#4206: decimal
+    digits are hex digits, so the sha regex matches them too, and the sha
+    class's loose right side would re-open the 404-in-4040 defect one digit
+    count up).
+    """
     if not text:
         return []
 
-    candidates: list[tuple[int, str, str]] = []  # (start, token, class)
+    candidates: list[tuple[int, int, str, str]] = []  # (start, end, token, class)
 
     for m in _NODE_ID_RE.finditer(text):
-        candidates.append((m.start(), m.group(0), "node_id"))
+        candidates.append((m.start(), m.end(), m.group(0), "node_id"))
     for m in _ISSUE_REF_RE.finditer(text):
-        candidates.append((m.start(), m.group(0), "issue_ref"))
+        candidates.append((m.start(), m.end(), m.group(0), "issue_ref"))
     for m in _HEX_SHA_RE.finditer(text):
-        candidates.append((m.start(), m.group(0), _HEX_SHA_CLASS))
+        tok = m.group(0)
+        cls = "number" if tok.isdigit() else _HEX_SHA_CLASS
+        candidates.append((m.start(), m.end(), tok, cls))
     for m in _NUMBER_RE.finditer(text):
         tok = m.group(0)
         if _digit_count(tok) >= 3:
-            candidates.append((m.start(), tok, "number"))
+            candidates.append((m.start(), m.end(), tok, "number"))
     for m in _DATE_RE.finditer(text):
-        candidates.append((m.start(), m.group(0), "date"))
+        candidates.append((m.start(), m.end(), m.group(0), "date"))
     for m in _TIME_RE.finditer(text):
-        candidates.append((m.start(), m.group(0), "time"))
+        candidates.append((m.start(), m.end(), m.group(0), "time"))
+
+    # Span containment for NUMBER tokens only; endpoints may coincide (the
+    # numeric tail of a node id ends where the node id ends). ALL candidate
+    # spans are outer spans, including other numbers': the integer part of a
+    # decimal is its own number-regex match ("1234567" inside
+    # "1234567.89"), and dropping only non-number outers would leave it as a
+    # separate token that the separator rule then refuses inside its own
+    # decimal. The self-exclusion keeps every candidate that IS the span.
+    outer_spans = [(s, e) for s, e, _tok, _cls in candidates]
+    candidates = [
+        c
+        for c in candidates
+        if c[3] != "number"
+        or not any(
+            s <= c[0] and c[1] <= e and (s, e) != (c[0], c[1])
+            for s, e in outer_spans
+        )
+    ]
 
     candidates.sort(key=lambda c: c[0])
 
     seen: set[str] = set()
     ordered: list[tuple[str, str]] = []
-    for _start, tok, cls in candidates:
+    for _start, _end, tok, cls in candidates:
         if tok in seen:
             continue
         seen.add(tok)
@@ -116,7 +270,9 @@ def hard_tokens(text: str) -> list[str]:
                                  'owner/repo#123' cross-repo form is what
                                  matches; the owner/repo prefix is not
                                  part of the token)
-      3. hex shas             -- 7-40 hex characters
+      3. hex shas             -- 7-40 hex characters (all-decimal runs of
+                                 that length are classified as numbers,
+                                 so they take the strict boundary rule)
       4. numbers, >= 3 digits -- glued units are dropped by the regex
                                  boundary (19.3s -> 19.3, 82089B -> 82089);
                                  a comma-grouped number (5,121) counts its
@@ -143,30 +299,51 @@ class AnchoringResult:
 
 
 def anchor(claim: str, quoted_text: str) -> AnchoringResult:
-    """Compute how many of `claim`'s hard tokens are literal substrings of
-    `quoted_text`.
+    """Compute how many of `claim`'s hard tokens appear in `quoted_text` at
+    a token boundary (engram-alpha#4206: a token inside a longer number or
+    identifier does not count).
 
     `ratio` is `None` when there are zero hard tokens -- "nothing to
     anchor" is a different state than "fully anchored" (which would read
     1.0), so a caller must be able to tell the two apart rather than
     treating an empty-tokens claim as trivially well-anchored.
 
-    Anchoring is a literal substring check, case-insensitive only for the
-    hex-sha class (git renders the same sha in mixed case across
-    surfaces); every other class is matched case-sensitively.
+    Matching is case-sensitive except for the hex-sha class (git renders
+    the same sha in mixed case across surfaces); see `_token_is_anchored`
+    for the exact boundary rule, including the hex class's looser right
+    side so a short sha still anchors as the prefix of the full one.
+
+    A token also anchors when it is in the quote's own hard-token set AND
+    the quote carries it with the same boundary structure the claim has
+    (#4678). Two strings agree iff the same tokenizer finds the same token
+    in both: membership in the quote's token set is the tokenizer's own
+    verdict, and it cannot produce a token the tokenizer would not have cut
+    there. That union is what makes a verbatim quote anchor every token --
+    the claim tokenizer drops a glued unit (`19.3s` -> `19.3`) and
+    membership recovers it. Membership alone is not enough: the number
+    regex has no left boundary, so the tokenizer also cuts `404` out of
+    `x404`; requiring the quote occurrence to share the claim occurrence's
+    boundary structure keeps `404` out of `x404`, `404x` and `#4040` (the
+    #4206 regressions this must not reopen).
     """
     tokens = _hard_tokens_with_class(claim)
     if not tokens:
         return AnchoringResult(hard_tokens=0, anchored=0, ratio=None, unanchored=[])
 
     quote = quoted_text or ""
-    quote_lower = quote.lower()
+    # The quote's own hard-token set, computed once (engram-alpha#4678).
+    quote_tokens = set(hard_tokens(quote))
 
     unanchored: list[str] = []
     anchored_count = 0
     for tok, cls in tokens:
-        hit = tok.lower() in quote_lower if cls == _HEX_SHA_CLASS else tok in quote
-        if hit:
+        anchored = _token_is_anchored(tok, quote, hex_class=cls == _HEX_SHA_CLASS)
+        if not anchored and tok in quote_tokens:
+            anchored = bool(
+                _boundary_signatures(claim, tok)
+                & _boundary_signatures(quote, tok)
+            )
+        if anchored:
             anchored_count += 1
         else:
             unanchored.append(tok)

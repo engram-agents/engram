@@ -1541,7 +1541,7 @@
         state.agent = urlAgentName || agentsResp.default || (state.agents[0] && state.agents[0].name);
         var sel = qs("#wb-agent");
         sel.innerHTML = state.agents.map(function (a) {
-          return '<option value="' + a.name + '"' + (a.name === state.agent ? " selected" : "") + ">" + (a.label || a.name) + "</option>";
+          return '<option value="' + escAttr(a.name) + '"' + (a.name === state.agent ? " selected" : "") + ">" + escAttr(a.label || a.name) + "</option>";
         }).join("");
         return loadForAgent();
       }).then(render);

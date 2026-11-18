@@ -615,16 +615,16 @@ const tooltip = document.getElementById('tooltip');
 function showTooltip(event, d) {
   const tierMap = computeTiers(rawData.nodes);
   const tier = tierMap[d.id] || 3;
-  const tierLabel = tier === 1 ? 'Tier 1 (working)' : tier === 2 ? 'Tier 2 (searchable)' : 'Tier 3 (archive)';
-  const tierColor = tier === 1 ? '#5cb85c' : tier === 2 ? '#f0ad4e' : '#e05252';
+  const tierLabel = tier === 2 ? 'Tier 2 (searchable)' : 'Tier 3 (archive)';
+  const tierColor = tier === 2 ? '#f0ad4e' : '#e05252';
 
-  let lines = [`<b>${d.id}</b> <span style="color:#7788aa">${NODE_STYLE[d.type]?.label || d.type}</span>`];
+  let lines = [`<b>${escHtml(d.id)}</b> <span style="color:#7788aa">${escHtml(NODE_STYLE[d.type]?.label || d.type)}</span>`];
   const text = nodeDisplayText(d);
-  if (text !== d.id) lines.push(truncate(text, 80));
+  if (text !== d.id) lines.push(escHtml(truncate(text, 80)));
   if (d.confidence != null) lines.push(`Confidence: ${(d.confidence * 100).toFixed(0)}%`);
   if (d.importance_score != null) lines.push(`Importance: ${d.importance_score.toFixed(4)} · <span style="color:${tierColor}">${tierLabel}</span>`);
   if (d.status && d.status !== 'active' && d.status !== 'open')
-    lines.push(`Status: <span style="color:${d.status === 'retracted' ? '#e05252' : '#f0ad4e'}">${d.status}</span>`);
+    lines.push(`Status: <span style="color:${d.status === 'retracted' ? '#e05252' : '#f0ad4e'}">${escHtml(d.status)}</span>`);
   if (isRetracted(d)) lines.push('<span style="color:#e05252">⊘ Retracted</span>');
   else if (!d.is_current) lines.push('<span style="color:#f0ad4e">⚠ Superseded</span>');
   if (isTainted(d)) lines.push('<span style="color:#ff9800">⚠ Tainted</span>');
@@ -902,7 +902,9 @@ function renderDetailBody(d) {
       {
         const meta = (() => { try { return typeof d.metadata === 'string' ? JSON.parse(d.metadata) : (d.metadata || {}); } catch(e) { return {}; } })();
         field('Name', meta.name || d.claim);
-        if (meta.role) field('Role', meta.role);
+        // Prefer relation; fall back to the deprecated pre-rename role (#3864).
+        const personRel = [meta.relation, meta.role].find(v => typeof v === 'string' && v.trim());
+        if (personRel) field('Role', personRel);
         if (meta.is_self) field('Self', 'yes (agent self-anchor)');
         if (meta.aliases && meta.aliases.length > 0) field('Aliases', meta.aliases.join(', '));
         if (d.logical_chain) field('Background', d.logical_chain);
@@ -962,8 +964,8 @@ function renderDetailBody(d) {
   if (d.importance_score != null || d.importance_base != null) {
     const tierMap = computeTiers(rawData.nodes);
     const tier = tierMap[d.id] || 3;
-    const tierLabel = tier === 1 ? 'Tier 1 (working memory)' : tier === 2 ? 'Tier 2 (searchable)' : 'Tier 3 (archive)';
-    const tierColor = tier === 1 ? '#5cb85c' : tier === 2 ? '#f0ad4e' : '#e05252';
+    const tierLabel = tier === 2 ? 'Tier 2 (searchable)' : 'Tier 3 (archive)';
+    const tierColor = tier === 2 ? '#f0ad4e' : '#e05252';
 
     body.insertAdjacentHTML('beforeend',
       `<div class="detail-section">
@@ -1026,9 +1028,9 @@ function renderDetailBody(d) {
         chip.innerHTML =
           `<div style="display:flex;align-items:center;gap:5px">
             <span style="color:${color};font-size:10px">${isOutgoing ? '→' : '←'}</span>
-            <span class="relation-tag" style="color:${color}">${edgeDirectionLabel(e.relation, isOutgoing)}</span>
-            <span style="font-family:monospace;color:#aaccff">${otherId}</span>
-            <span style="font-size:9px;color:${otherColor};opacity:0.7">${otherType}</span>
+            <span class="relation-tag" style="color:${color}">${escHtml(edgeDirectionLabel(e.relation, isOutgoing))}</span>
+            <span style="font-family:monospace;color:#aaccff">${escHtml(otherId)}</span>
+            <span style="font-size:9px;color:${otherColor};opacity:0.7">${escHtml(otherType)}</span>
           </div>
           ${otherClaim ? '<span class="chip-claim">' + escHtml(otherClaim) + '</span>' : ''}`;
         chip.onclick = () => {
@@ -1114,7 +1116,8 @@ function confBar(container, value) {
 }
 
 function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1618,14 +1621,13 @@ async function fetchGraph() {
 
     // Memory tier distribution
     const tierMap = computeTiers(data.nodes);
-    const tierCounts = {1: 0, 2: 0, 3: 0};
+    const tierCounts = {2: 0, 3: 0};
     data.nodes.filter(n => n.is_current).forEach(n => {
       const t = tierMap[n.id] || 3;
       tierCounts[t]++;
     });
     sd.insertAdjacentHTML('beforeend',
       `<div style="margin-top:8px;padding-top:6px;border-top:1px solid #0f3460">
-        <div class="stat-row"><span class="k" style="color:#5cb85c">Tier 1 (working)</span><span class="v">${tierCounts[1]}</span></div>
         <div class="stat-row"><span class="k" style="color:#f0ad4e">Tier 2 (search)</span><span class="v">${tierCounts[2]}</span></div>
         <div class="stat-row"><span class="k" style="color:#e05252">Tier 3 (archive)</span><span class="v">${tierCounts[3]}</span></div>
       </div>`

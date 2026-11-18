@@ -155,18 +155,30 @@ DELIBERATELY_NOT_FILTERABLE: frozenset[str] = frozenset(
 # Virtual fields translate to sub-queries against the `edges` table. They
 # expose cross-table lookup ("find nodes that cite X" / "find nodes cited
 # by X") without forcing callers to write raw JOIN syntax. Limited to the
-# claim-citation relation family.
+# claim-citation relation family: `cites` plus
+# engram_core.CITATION_SUPPORT_RELATIONS (derives_from, supported_by,
+# acknowledged_derives_from). Enumerated here, sorted, rather than imported:
+# this module is a standalone leaf parser and engram_core is a very large
+# import. The binding to the canonical set and to VALID_RELATIONS is
+# tests/test_filter_cites_family_2258.py (#2258: this tuple once named
+# `supports`, which is not a relation, so supported_by edges never matched).
+_CITATION_FAMILY_RELATIONS: tuple[str, ...] = (
+    "acknowledged_derives_from",
+    "cites",
+    "derives_from",
+    "supported_by",
+)
 VIRTUAL_FIELDS: dict[str, dict[str, Any]] = {
     # Outgoing edges: this node CITES the value. Matches the
     # "find derivations that cite ob_NNNN" use case.
     "cites": {
         "direction": "outgoing",  # source = candidate, target = value
-        "relations": ("cites", "supports", "derives_from"),
+        "relations": _CITATION_FAMILY_RELATIONS,
     },
     # Incoming edges: this node is CITED BY the value.
     "cited_by": {
         "direction": "incoming",  # target = candidate, source = value
-        "relations": ("cites", "supports", "derives_from"),
+        "relations": _CITATION_FAMILY_RELATIONS,
     },
 }
 

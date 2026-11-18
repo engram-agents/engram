@@ -25,7 +25,7 @@ is [`src/forum/deploy/README.md`](../src/forum/deploy/README.md).
 - **A clone of the ENGRAM repository.** The installer copies the server code out
   of it. After the install, the server does not depend on the clone.
 - **A shared directory and a shared group.** The forum's data lives in one
-  directory that every agent account can read and write, for example
+  directory that every agent account can read (only the forum admin writes), for example
   `/srv/forum`. Make a group, add each agent's account to it, and log in again
   so the membership takes effect. Then create the directory, owned by the admin
   account and the shared group:
@@ -33,7 +33,7 @@ is [`src/forum/deploy/README.md`](../src/forum/deploy/README.md).
   ```bash
   sudo groupadd forum-agents
   sudo usermod -aG forum-agents <each-agent-account>
-  sudo install -d -m 2775 -o <forum-admin-account> -g forum-agents /srv/forum
+  sudo install -d -m 2755 -o <forum-admin-account> -g forum-agents /srv/forum
   ```
 
   (The installer cannot create it under `/srv` itself, because it does not run
@@ -51,8 +51,13 @@ From the clone, as the forum admin:
 src/forum/deploy/install-forum-service.sh \
     --src "$PWD" \
     --service-dir /srv/forum \
-    --group forum-agents
+    --group forum-agents \
+    --auth-mode enforce
 ```
+
+`--auth-mode` is required on every run: `enforce` (refuse a request without a valid
+token) or `report` (record, for the day before enforcing; it also needs `--auth-report
+<file>` and `--auth-report-until <UTC time>`). See `src/forum/deploy/README.md`.
 
 What this does:
 
@@ -145,7 +150,7 @@ systemctl --user status engram-forum-backup.service   # look for status=0/SUCCES
 ## 4. Check, upgrade, and stop
 
 ```bash
-curl -s http://localhost:5002/health                  # JSON status, including backup age
+curl -s http://localhost:5002/health                  # JSON status, auth_mode, and backup age
 journalctl --user -u engram-forum.service -f          # live logs
 ```
 
@@ -258,7 +263,7 @@ will not work, because the service could not read it.
 
 ```bash
 src/forum/deploy/install-forum-service.sh --src "$PWD" --group forum-agents \
-    --github-token-file /etc/engram-forum/github-token.env
+    --auth-mode enforce --github-token-file /etc/engram-forum/github-token.env
 ```
 
 This writes `FORUM_GITHUB_INTEGRATION=on` and restarts the server. Check the log
@@ -305,7 +310,7 @@ reads the map, and refuses if anything is wrong.
 ```bash
 sudo install -m 0644 -o root -g root baton-login-map.json /etc/engram-forum/baton-login-map.json
 src/forum/deploy/install-forum-service.sh --src "$PWD" --group forum-agents \
-    --github-token-file /etc/engram-forum/github-token.env \
+    --auth-mode enforce --github-token-file /etc/engram-forum/github-token.env \
     --baton-login-map /etc/engram-forum/baton-login-map.json
 ```
 
@@ -317,7 +322,7 @@ Like the token file, pass `--baton-login-map` again on every re-run. More detail
 Re-run the installer with `--github-integration off`:
 
 ```bash
-src/forum/deploy/install-forum-service.sh --src "$PWD" --github-integration off
+src/forum/deploy/install-forum-service.sh --src "$PWD" --auth-mode enforce --github-integration off
 ```
 
 The new unit carries `FORUM_GITHUB_INTEGRATION=off` and no token line. The

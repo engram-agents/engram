@@ -246,6 +246,11 @@ def cache_dir():
         return str(constants.HF_HUB_CACHE)
     except Exception:
         return os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+# The remedy comes from the server's own helper: a pinned model is fetched by the
+# loader's pinned path (a by-name fetch gets main, which is not the pin once main moves).
+helper = getattr(server, "_embedding_prewarm_command", None)
+import shlex
+print(helper(model) if helper else shlex.quote(sys.executable) + " -c " + shlex.quote("from sentence_transformers import SentenceTransformer; SentenceTransformer(" + repr(model) + ")"))
 print(model)
 print(cache_dir())
 print("CACHED" if server._embedding_cache_status(model) else "MISSING")
@@ -260,14 +265,12 @@ def check_model_cached(ctx):
         return problem
     proc = _run_venv(ctx, _MODEL_SNIPPET, str(ctx.plugin_dir))
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
-    if proc.returncode != 0 or len(lines) < 3:
+    if proc.returncode != 0 or len(lines) < 4:
         return _fail("could not evaluate the model cache (rc=%s): %s" % (proc.returncode, _tail(proc.stderr)),
                      "check the plugin tree at %s and the venv imports above" % ctx.plugin_dir)
-    model, cache, verdict = lines[-3], lines[-2], lines[-1]
+    remedy, model, cache, verdict = lines[-4], lines[-3], lines[-2], lines[-1]
     if verdict != "CACHED":
-        return _fail("embedding model %s is not cached (HuggingFace cache under %s)" % (model, cache),
-                     "%s -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('%s')\""
-                     % (ctx.venv_py, model))
+        return _fail("embedding model %s is not cached (HuggingFace cache under %s)" % (model, cache), remedy)
     return PASS, "%s (HuggingFace cache %s)" % (model, cache)
 
 
@@ -599,6 +602,9 @@ def _graph_decision(ctx):
 
     An owner that has not yet bound its socket (mid-startup) reads as `down`, so for that moment the
     tool takes the direct read-only path. That is inside the ruling ("no live owner") and it only reads.
+
+    An owner socket path over the AF_UNIX limit is reason `path_too_long`, never `down` (#4868), so it is
+    REFUSED: an owner started under a shorter spelling of the same ENGRAM_HOME can be live.
     """
     if ctx.graph_decision is not None:
         return ctx.graph_decision

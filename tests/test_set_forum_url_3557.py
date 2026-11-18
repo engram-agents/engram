@@ -115,8 +115,13 @@ def _cli(args, env_home=None):
                           capture_output=True, text=True, env=_hermetic_env(**extra))
 
 
-def _no_temp_left(directory, keep):
-    return sorted(p.name for p in directory.iterdir()) == sorted(keep)
+def _no_temp_left(directory, keep, with_backups=False):
+    """The directory holds exactly `keep`. With `with_backups=True`, stamped backups
+    (`<name>.engram-backup.<UTC>`) are allowed too: a write that changes the file saves the old
+    bytes there first. Anything else is a leftover. A refused run passes no `with_backups`, so a
+    backup it should not have made still fails."""
+    names = sorted(p.name for p in directory.iterdir() if with_backups is False or ".engram-backup." not in p.name)
+    return names == sorted(keep)
 
 
 # ---------------------------------------------------------------- S1 ----
@@ -402,10 +407,16 @@ class TestS4ForumKey:
         assert _tool().set_forum_url(p, URL).status == "written"
         assert json.loads(p.read_text())["forum"] == {"url": URL}
 
-    def test_null(self, tmp_path):
+    def test_null(self, tmp_path, capsys):
+        # An explicit null counts as absent: no flag is needed. The write still takes a stamped
+        # backup first and prints its "backup:" line, so the file as it was is kept.
         p = _cfg(tmp_path, {"forum": None})
+        old = p.read_bytes()
         assert _tool().set_forum_url(p, URL).status == "written"
         assert json.loads(p.read_text())["forum"] == {"url": URL}
+        backups = [q for q in tmp_path.iterdir() if ".engram-backup." in q.name]
+        assert len(backups) == 1 and backups[0].read_bytes() == old
+        assert f"backup: {p} -> {backups[0]}" in capsys.readouterr().out
 
     def test_dict_with_other_keys(self, tmp_path):
         p = _cfg(tmp_path, {"forum": {"poll": 30, "url": "", "z": [1]}})
@@ -469,19 +480,31 @@ class TestS5Preservation:
 # ---------------------------------------------------------------- S6 ----
 
 class TestS6Atomic:
-    def test_replace_failure_leaves_original_and_no_temp(self, tmp_path, monkeypatch):
+    def test_failed_write_leaves_original_in_same_inode_and_no_temp(self, tmp_path, monkeypatch):
+        """An existing config.json is rewritten in place (the guard keeps its inode, so its ACL
+        and xattrs survive). A write that fails part-way puts the old bytes back in that same
+        inode; nothing is left beside it but the stamped backup."""
         p = _cfg(tmp_path, {"agent_name": "n"})
-        before = p.read_bytes()
+        before, inode = p.read_bytes(), p.stat().st_ino
         mod = _tool()
+        real, calls = mod.fg._write_all, []
 
-        def boom(*a, **k):
-            raise OSError("simulated replace failure")
+        def fail_first(fd, data):
+            calls.append(len(data))
+            if len(calls) == 1:
+                os.write(fd, data[: len(data) // 2])
+                raise OSError("simulated write failure")
+            real(fd, data)
 
-        monkeypatch.setattr(mod.os, "replace", boom)
+        monkeypatch.setattr(mod.fg, "_write_all", fail_first)
         r = mod.set_forum_url(p, URL)
         assert r.status != "written", r
-        assert p.read_bytes() == before
-        assert _no_temp_left(tmp_path, ["config.json"])
+        assert p.read_bytes() == before and p.stat().st_ino == inode
+        assert _no_temp_left(tmp_path, ["config.json"], with_backups=True)
+        # The stamped backup is a copy taken BEFORE the write, so exactly one exists and it holds
+        # the old bytes; a second file is a stray.
+        backups = [x for x in tmp_path.iterdir() if ".engram-backup." in x.name]
+        assert len(backups) == 1 and backups[0].read_bytes() == before, backups
 
     def test_mode_preserved(self, tmp_path):
         p = _cfg(tmp_path, {})
@@ -492,21 +515,28 @@ class TestS6Atomic:
     def test_no_temp_file_after_success(self, tmp_path):
         p = _cfg(tmp_path, {})
         _tool().set_forum_url(p, URL)
-        assert _no_temp_left(tmp_path, ["config.json"])
+        assert _no_temp_left(tmp_path, ["config.json"], with_backups=True)
 
-    def test_temp_is_in_same_directory(self, tmp_path, monkeypatch):
+    def test_existing_file_keeps_its_inode(self, tmp_path):
+        p = _cfg(tmp_path, {"agent_name": "n"})
+        inode = p.stat().st_ino
+        assert _tool().set_forum_url(p, URL).status == "written"
+        assert p.stat().st_ino == inode and json.loads(p.read_text())["forum"] == {"url": URL}
+
+    def test_existing_file_is_written_without_a_temp_or_rename(self, tmp_path, monkeypatch):
+        """set_forum_url only ever changes an existing config.json (a missing one is refused), so
+        no temp file and no rename take part: either would give the file a new inode."""
         p = _cfg(tmp_path, {})
         mod = _tool()
-        seen = {}
-        real = os.replace
-
-        def spy(src, dst):
-            seen["src"], seen["dst"] = Path(src), Path(dst)
-            return real(src, dst)
-
-        monkeypatch.setattr(mod.os, "replace", spy)
-        mod.set_forum_url(p, URL)
-        assert seen["src"].parent == seen["dst"].parent == tmp_path
+        used = []
+        for name in ("replace", "rename", "link"):
+            real = getattr(os, name)
+            monkeypatch.setattr(mod.fg.os, name,
+                                lambda *a, _n=name, _r=real, **k: (used.append((_n, Path(a[1]).name)), _r(*a, **k))[1])
+        assert mod.set_forum_url(p, URL).status == "written"
+        # The only publish is the stamped backup's (a copy taken first); config.json itself is
+        # never the target of a rename or link.
+        assert len(used) == 1 and used[0][0] == "link" and ".engram-backup." in used[0][1], used
 
     def test_symlink_written_through_link_kept(self, tmp_path):
         real_dir = tmp_path / "real"
@@ -520,8 +550,8 @@ class TestS6Atomic:
         assert r.status == "written"
         assert link.is_symlink() and os.readlink(link) == str(target)
         assert json.loads(target.read_text())["forum"] == {"url": URL}
-        assert _no_temp_left(link_dir, ["config.json"])
-        assert _no_temp_left(real_dir, ["cfg-target.json"])
+        assert _no_temp_left(link_dir, ["config.json"], with_backups=True)
+        assert _no_temp_left(real_dir, ["cfg-target.json"], with_backups=True)
 
 
 # ---------------------------------------------------------------- S7 ----
@@ -592,7 +622,7 @@ def _real_dry_run(tmp_path, engram_home, *, port):
     return subprocess.run(
         ["bash", str(INSTALLER), "--src", str(REPO), "--service-dir",
          str(tmp_path / "forum"), "--group", "agents", "--port", port,
-         "--dry-run"], capture_output=True, text=True,
+         "--auth-mode", "enforce", "--dry-run"], capture_output=True, text=True,
         env=_hermetic_env(ENGRAM_HOME=str(engram_home)))
 
 
@@ -697,6 +727,8 @@ class TestS8Installer:
         # tools/ dir carries it (and the package marker) beside the tool.
         for sibling in ("__init__.py", "_owner_read.py"):
             (tool_dir / sibling).write_text((TOOL.parent / sibling).read_text())
+        # The write goes through the file guard, which sits beside tools/ in a checkout.
+        (tool_dir.parent / "engram_file_guard.py").write_text((TOOL.parent.parent / "engram_file_guard.py").read_text())
         _write(tmp_path / "config.json", {"forum": {"url": "http://other:5002"}})
         before = (tmp_path / "config.json").read_bytes()
         script = (
@@ -720,3 +752,53 @@ class TestS8Installer:
                                 env=_hermetic_env(ENGRAM_HOME=str(tmp_path)))
         assert manual.returncode == 3, (cmds[0], manual.stdout, manual.stderr)
         assert (tmp_path / "config.json").read_bytes() == before
+
+
+# ---------------------------------------------------------------- #4631 ----
+
+class TestRefusalStateIsTruthful:
+    """A refused rewrite ends in one of three states; the tool's sentence follows the guard's
+    `.outcome` and never assumes the file is unchanged."""
+
+    def _fail(self, mod, monkeypatch, *, put_back_works):
+        real, calls = mod.fg._replace_contents, []
+
+        def fake(fd, data):
+            calls.append(data)
+            if len(calls) == 1 or not put_back_works:
+                raise OSError("simulated write failure")
+            real(fd, data)
+
+        monkeypatch.setattr(mod.fg, "_replace_contents", fake)
+
+    def test_state_3_does_not_claim_the_file_is_unchanged_and_names_the_backup(self, tmp_path, monkeypatch):
+        p = _cfg(tmp_path, {"agent_name": "n"})
+        mod = _tool()
+        self._fail(mod, monkeypatch, put_back_works=False)
+        r = mod.set_forum_url(p, URL)
+        assert r.status != "written", r
+        backups = [x for x in tmp_path.iterdir() if ".engram-backup." in x.name]
+        assert len(backups) == 1
+        assert "unchanged" not in r.message and "left as it was" not in r.message, r.message
+        assert "may be incomplete" in r.message and str(backups[0]) in r.message, r.message
+
+    def test_state_2_stays_truthful_about_the_restored_file(self, tmp_path, monkeypatch):
+        p = _cfg(tmp_path, {"agent_name": "n"})
+        before = p.read_bytes()
+        mod = _tool()
+        self._fail(mod, monkeypatch, put_back_works=True)
+        r = mod.set_forum_url(p, URL)
+        assert r.status != "written" and p.read_bytes() == before, r
+        assert "previous contents were put back" in r.message and "unchanged" in r.message, r.message
+        assert "incomplete" not in r.message, r.message
+
+    def test_a_refusal_before_the_target_is_touched_keeps_the_unchanged_wording(self, tmp_path, monkeypatch):
+        p = _cfg(tmp_path, {"agent_name": "n"})
+        mod = _tool()
+
+        def no_backup(*a, **k):
+            raise SystemExit("[bootstrap] REFUSED: could not save it to the backup path (x), so nothing was written there.")
+
+        monkeypatch.setattr(mod.fg, "save_backup", no_backup)
+        r = mod.set_forum_url(p, URL)
+        assert r.status != "written" and r.message.endswith("; file unchanged"), r.message

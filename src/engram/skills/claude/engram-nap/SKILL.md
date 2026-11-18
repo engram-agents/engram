@@ -51,6 +51,7 @@ For each candidate, write NOW. Don't defer. Don't batch mentally. Use the right 
 ```
 engram_checkpoint(
     message="<1-3 sentence summary of what this burst covered and what was written>",
+    session_id="<this session's id, as injected at session start>",
 )
 ```
 
@@ -65,7 +66,7 @@ own hot-reload takes effect immediately, but the running server does not
 until a `/mcp` reconnect). Call `engram_nap` instead until the reconnect
 lands; both names take identical arguments and return identical shapes.
 
-`session_id` is still accepted (kept for backward compatibility with older callers) but no longer does anything for the `warm_briefing` advisory below — as of #3014 that advisory anchors on the **last nap/sleep checkpoint already in `session_log.md`**, not on session identity. `warm_briefing.written_since_last_nap` resolves to `true`/`false` on its own, with no `session_id` needed; it's `null` only when there's no prior checkpoint in the file yet (e.g. this is the very first nap ever) or the warm-briefing file itself is missing.
+Pass `session_id` (the id injected at session start): it is recorded in `compact/last-checkpoint.json` so the #4012 backstop can tell sessions apart on a shared `ENGRAM_HOME` (#4356). It no longer does anything for the `warm_briefing` advisory below — as of #3014 that advisory anchors on the **last nap/sleep checkpoint already in `session_log.md`**, not on session identity. `warm_briefing.written_since_last_nap` resolves to `true`/`false` on its own, with no `session_id` needed; it's `null` only when there's no prior checkpoint in the file yet (e.g. this is the very first nap ever) or the warm-briefing file itself is missing.
 
 The `nap` mode:
 - Logs the summary to `~/.engram/session_log.md` (under `$ENGRAM_HOME`, default `~/.engram`) with a "Nap (turn N)" header
@@ -74,6 +75,8 @@ The `nap` mode:
 - Arms the `nap_checkpoint` feeling-nudge marker (TTL=5 turns) — the return JSON includes `feeling_report_nudge` text asking whether any moment in this burst produced a distinct internal state worth marking
 
 **After calling `engram_checkpoint()`, read the backup verdict.** The checkpoint records it in `compact/last-checkpoint.json` (under `$ENGRAM_HOME`) as `backup_ok`, computed by one helper in the server; read it there and do not re-derive it from the return value (#2680 and #4012 explain why a hand-written copy of that rule drifted). Use the record only if its `checkpoint_at` equals `result["checkpoint_at"]`, the timestamp of the nap header this call just wrote; if it differs or the file is missing, treat the backup verdict as not ok and print the warning, so a failed record write can never surface the previous nap's ✓. Print `✓ backup ok` when `backup_ok` is true. Otherwise print `⚠ backup FAILED: <reason>`, taking the reason from the `error` text in `result["version_control"]["db_backup"]` and `["binary_backup"]` (join both, so a dual failure shows both). Log the line alongside the nap summary so a recurring outage is visible, not buried in the return dict.
+
+**Then read `snapshot_backlog` from the same record** (same `checkpoint_at` match rule; #4843). If its `line` is set, print `⚠ {line}` on its own line, after the backup verdict. A set line means snapshot commits are not reaching git history; `backup_ok` does not cover that. If the record is missing or its `checkpoint_at` does not match this nap, print exactly `⚠ snapshot backlog unknown (no usable checkpoint record)` instead of printing nothing.
 
 **Also check the return value for the warm-briefing advisory (#2997):**
 
@@ -105,7 +108,7 @@ Run the worktree garbage-collector to remove orphaned coder/reviewer-fairy workt
 "$HOME/.engram/venv/bin/python3" tools/worktree-gc.py --apply
 ```
 
-Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), and never touches the main checkout. Dry-run mode (`"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py` without `--apply`) is available to preview the plan first. Idempotent — a second run on a clean state is a no-op.
+Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), keeps the worktree the deploy record names as the upgrade source (`deployed_from`), and never touches the main checkout. Dry-run mode (`"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py` without `--apply`) is available to preview the plan first. Idempotent — a second run on a clean state is a no-op.
 
 Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present (pre-T2 install or worktree GC not yet shipped).
 

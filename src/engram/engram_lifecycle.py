@@ -297,6 +297,16 @@ def _write_last_checkpoint_record(checkpoint_at: str, session_id, version_contro
     checkpoint's result untouched and costs one stderr line (the reader then finds no record and refuses).
     """
     try:
+        # #4843: the backlog verdict rides beside backup_ok, never inside it.
+        try:
+            import engram_snapshot_backlog
+            _bl = engram_snapshot_backlog.read_backlog(core.DATA_DIR)
+            snapshot_backlog = {"status": _bl["status"], "line": _bl["line"]}
+        except Exception as bl_exc:  # noqa: BLE001
+            snapshot_backlog = {
+                "status": "unreadable",
+                "line": f"Snapshot commits: queue could not be read ({type(bl_exc).__name__}: {bl_exc})"[:300],
+            }
         directory = core.DATA_DIR / "compact"
         directory.mkdir(parents=True, exist_ok=True)
         engram_config_io.write_config_json(
@@ -305,6 +315,7 @@ def _write_last_checkpoint_record(checkpoint_at: str, session_id, version_contro
                 "checkpoint_at": checkpoint_at,
                 "session_id": session_id if isinstance(session_id, str) else None,
                 "backup_ok": _backup_ok(version_control),
+                "snapshot_backlog": snapshot_backlog,
             },
         )
     except Exception as exc:  # noqa: BLE001 - never fails the checkpoint
@@ -339,7 +350,11 @@ def _checkpoint_internal(message: str, advance_turn: bool, session_id=None) -> s
 
     if advance_turn:
         new_turn = old_turn + 1
-        core._set_current_turn(new_turn)
+        try:
+            core._set_current_turn(new_turn)
+        except engram_config_io.ConfigMissingError as exc:
+            # #1989: loud, named, process alive; str(exc), never a repr wrapper.
+            return json.dumps({"error": str(exc)})
     else:
         new_turn = old_turn  # no advancement
 
@@ -883,7 +898,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                 {
                     "id": p["id"],
                     "name": core._metadata_dict(p["metadata"]).get("name", ""),
-                    "role": core._metadata_dict(p["metadata"]).get("role", ""),
+                    "role": core.person_relation(core._metadata_dict(p["metadata"])),
                     "since": p["created_at"],
                 }
                 for p in people
@@ -1150,13 +1165,23 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         report["tainted_nodes"] = []
         for t in tainted_rows:
             tainted_by, _ = core._classify_pending_markers(conn, t["id"])
-            report["tainted_nodes"].append({
+            entry = {
                 "id": t["id"],
                 "type": t["type"],
                 "claim": t["claim"],
                 "confidence": t["confidence"],
                 "tainted_by": tainted_by,
+            }
+            # #4727: name the roots whose marker came from the one-time backfill of
+            # pre-machine retractions, so the dream record can say so. Absent otherwise.
+            backfilled_by = sorted({
+                m["root_node"] for m in core._pending_markers_for_node(conn, t["id"])
+                if m["root_op"] == "retract"
+                and m["cascade_event"].startswith("backfill:retract:")
             })
+            if backfilled_by:
+                entry["backfilled_by"] = backfilled_by
+            report["tainted_nodes"].append(entry)
 
         # 10. Stale nodes (downstream of superseded premises). Same
         # migration. replacement_hint(s) is reconstructed from each root's

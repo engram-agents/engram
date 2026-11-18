@@ -227,6 +227,47 @@ def test_w5c_atomic_write_text_follow_symlinks_option(core, hooklib_mod, tmp_pat
 
 
 @pytest.mark.parametrize("which", ["core", "hooks"])
+def test_w7_mode_overrides_an_existing_files_mode(core, hooklib_mod, tmp_path, which):
+    """#4682: ``mode=`` is the FINAL word, also on the existing-file branch.
+
+    The old mode is copied onto the temp first (mode/group preservation) and
+    ``mode`` is applied after it, before the replace.  No cell covered that
+    branch: every existing-file cell read its mode back unchanged.
+    """
+    mod = core if which == "core" else hooklib_mod
+    p = tmp_path / "state.json"
+    p.write_text("old")
+    os.chmod(p, 0o660)
+    assert _mode(p) == 0o660
+
+    mod.atomic_write_text(p, "new", mode=0o644)
+
+    assert _mode(p) == 0o644, f"mode= did not override the preserved mode: {oct(_mode(p))}"
+
+
+@pytest.mark.parametrize("which", ["core", "hooks"])
+def test_w8_dir_fd_refuses_a_path_with_a_directory_component(core, hooklib_mod, tmp_path, which):
+    """#4682: ``dir_fd`` requires a bare basename.
+
+    os.open and os.replace SILENTLY IGNORE dir_fd for a path with a directory
+    component: no error, no pinning — an absolute path there would quietly
+    reintroduce the symlink-swap hole the option exists to close.  So the
+    writer refuses it, and refuses it BEFORE creating anything.
+    """
+    mod = core if which == "core" else hooklib_mod
+    d = tmp_path / "d"
+    d.mkdir()
+    dir_fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for bad in (str(d / "f.json"), os.path.join("sub", "f.json")):
+            with pytest.raises(ValueError):
+                mod.atomic_write_text(bad, "x", dir_fd=dir_fd)
+        assert os.listdir(d) == [], "a temp file was created before the refusal"
+    finally:
+        os.close(dir_fd)
+
+
+@pytest.mark.parametrize("which", ["core", "hooks"])
 def test_w5d_default_is_to_follow(core, hooklib_mod, tmp_path, which):
     """Not passing follow_symlinks keeps the reference behaviour (write_config_json
     relies on it): the link stays and its target is updated."""
@@ -452,14 +493,24 @@ MODE_AWARE = {
     "src/engram/engram_backup.py": "chmods the temp to the old target's mode (comment names the default-ACL case)",
     "src/engram/engram_home_registry.py": "fchmod 0o644",
     "src/forum/coordination/store_file.py": "explicit mode per callsite: 0o644 batons (read off disk by seats), 0o600 DM threads (#4501)",
-    "src/engram/tools/set_forum_url.py": "copies the old mode onto the temp",
+    "src/engram/tools/set_forum_url.py": "writes through engram_file_guard.apply_merge, which keeps the old mode",
     "src/engram/tools/dream_pickup.py": "copies the old mode onto the temp",
     "src/engram/tools/engram-pkg/engram-pkg": "explicit chmod 0o644 on both outputs",
     "src/engram/tools/lesson-pattern-audit.py": "old mode (0o640 new) and best-effort ACL",
     "tools/engramd_batch_a_acceptance.py": (
         "explicit chmod 0o644 on the --report output; a report path inside the live ENGRAM home is refused"
     ),
-    "src/engram/bootstrap.py": "_copy_exclusive: shutil.copystat copies the source's mode onto the temp before publish (backup keeps the original's mode)",
+    "src/engram/tools/secret-put": (
+        "explicit os.fchmod 0o600 on the temp before os.replace: the mode is set per callsite rather than preserved, "
+        "because the store's invariant is 0600 always and preserving a destination's old mode (or a named ACL entry on "
+        "it) is the failure, not the fix; the temp is staged inside secrets/ so it inherits no foreign or default ACL, "
+        "and the folder is re-checked after the write"
+    ),
+    "tools/forum_backup.py": (
+        "hand-written tmp + os.replace (no mkstemp, so G1's scan does not reach it): the temp is opened "
+        "0o640 and fchmod'd BEFORE the rename for forum.sql and .last-success.json (#4499 B1)"
+    ),
+    "src/engram/engram_file_guard.py": "copy_exclusive: shutil.copystat copies the source's mode onto the temp before publish (backup keeps the original's mode)",
 }
 
 # Private on purpose: only the owner reads it, and the file says so.

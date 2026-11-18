@@ -35,6 +35,18 @@ on:
     # convention"); update this filter if the default branch ever moves.
     branches: [dev]
   pull_request:
+    # `edited` is load-bearing, not a convenience. What this workflow scans is
+    # `git diff "$BASE_SHA"...HEAD` — the pull request's diff — so a base-branch
+    # retarget replaces the entire subject of the scan. Without `edited` the
+    # gate does not re-run, and the previous run's success stays attached to the
+    # head commit: check runs bind to the commit, not to the base. The status
+    # list then shows a green tick describing a diff that no longer exists. That
+    # is the same false tick this file's header (#4429) exists to forbid, via a
+    # route the header did not name.
+    #
+    # There is deliberately NO job-level `if` to trim the title/body case.
+    # See the job block below for why a skip is a false tick.
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -44,6 +56,24 @@ jobs:
     # The status context a reviewer sees. Fork PRs get the distinct name that
     # says the gate did not run; the token is load-bearing.
     name: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'name-leak-gate (NOT SCANNED - fork PR)' || 'name-leak-gate' }}
+    # NO job-level `if:` here, deliberately, and do not add one to save a run.
+    #
+    # `edited` also fires for a title or body change, so it is tempting to skip
+    # everything except a base move. That skip is a false tick. A skipped job
+    # still reports under this job's `name`, with conclusion `skipped`, and
+    # check runs key on the HEAD COMMIT — so the skip SUPERSEDES the previous
+    # run on the same head rather than sitting beside it. Measured on
+    # engram-agents/ci-probes#6 at head 1f7aacfe: two failing runs and then a
+    # title edit, after which `gh pr checks` showed one line, `name-leak-gate
+    # skipping`, and both reds had disappeared from the pull request's check
+    # list. A red gate that a typo fix in the title turns grey is the same
+    # failure this file exists to prevent, reached by a third route.
+    #
+    # Running on every `edited` re-scans the current base...head diff and
+    # reproduces the true verdict, so it can neither mask a red nor invent a
+    # green. The cost is one runner start per title or body edit, about 11
+    # seconds of wall time. It is not a billing cost: this repository is
+    # public, so standard Actions minutes are free.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -125,29 +155,100 @@ jobs:
               if roster_present
               else ""
           )
-          pattern_count = (
-              sum(
-                  1
-                  for line in canonical.splitlines()
-                  if line.strip() and not line.strip().startswith("#")
+          # ── observe the roster's own grammar, by line SHAPE ──────────────
+          # The roster declares its format by shape. This step OBSERVES that
+          # shape and never parses a class token into a class: the grammar has
+          # ONE implementation, in src/engram/tools/scan-leaks.py (C1). Two
+          # facts are counted over the canonical text — how many non-blank
+          # non-comment lines there are, and how many start with `A<TAB>` or
+          # `B<TAB>`:
+          #   all prefixed      -> format 2;
+          #   none prefixed     -> format 1;
+          #   some but not all  -> FAIL, naming the first non-prefixed line.
+          # In format 2 a class letter other than exactly A or B cannot slip
+          # through PROVIDED at least one other content line carries a proper
+          # prefix: the `A<TAB>`/`B<TAB>` test is a strict prefix test, so
+          # `Z<TAB>x` is simply a non-prefixed line and fails the mixed check.
+          # The proviso is load-bearing. A roster whose EVERY content line is
+          # mistyped that way counts zero prefixed lines, so it is observed as
+          # format 1, no mixed failure is raised, and each mistyped prefix
+          # becomes pattern text (a near no-op regex): this gate goes GREEN.
+          # What refuses it instead: the release sweep's strict predicate and
+          # the scanner CLI's class-token check, both of which read format 2
+          # only. The attestation cross-check below catches it too, but only
+          # while the attestation still declares format 2 — a mistyped roster
+          # observed as format 1 agrees with a format-1 attestation. So the
+          # per-PR gate is the weaker of the three surfaces: a green here is
+          # not proof that the roster's lines are well formed.
+          content_lines = 0
+          prefixed_lines = 0
+          a_prefixed = 0
+          b_prefixed = 0
+          first_unprefixed = None
+          for lineno, line in enumerate(canonical.splitlines(), start=1):
+              stripped = line.strip()
+              if not stripped or stripped.startswith("#"):
+                  continue
+              content_lines += 1
+              # SHAPE counting, not class parsing: the same `A<TAB>`/`B<TAB>`
+              # prefix test the format observation uses. The grammar still has
+              # one implementation, in the scanner (C1). These counts exist so
+              # `pattern_count` and the count warning read OBSERVED numbers,
+              # never the attestation's own.
+              if stripped.startswith("A\t"):
+                  prefixed_lines += 1
+                  a_prefixed += 1
+              elif stripped.startswith("B\t"):
+                  prefixed_lines += 1
+                  b_prefixed += 1
+              elif first_unprefixed is None:
+                  first_unprefixed = lineno
+          if content_lines == 0:
+              observed_format = 1
+          elif prefixed_lines == content_lines:
+              observed_format = 2
+          elif prefixed_lines == 0:
+              observed_format = 1
+          else:
+              print(
+                  "::error::NAME_LEAK_ROSTER line "
+                  f"{first_unprefixed} does not carry the `A<TAB>` or "
+                  "`B<TAB>` class prefix the rest of the roster uses, so the "
+                  "roster mixes format 1 and format 2. One bad line is the "
+                  "end of the roster; the pattern text is deliberately not "
+                  "printed."
               )
-              if roster_present
-              else 0
-          )
+              raise SystemExit(1)
 
-          # Validate every roster pattern HERE, before any scan step can run.
-          # tools/name_leak_warn.py prints the offending pattern text to stderr
-          # on an invalid pattern, and this workflow does not redirect it, so an
-          # unvalidated roster could echo one line into the CI log. Validating
-          # first makes that path unreachable: on failure this step prints the
-          # LINE NUMBER only and fails. Never print the pattern text.
+          # C4a: a roster that is PRESENT but yields zero patterns is refused
+          # here, before any scan, in both formats. A comment-only secret is a
+          # gate that would pass by having nothing to apply; the advisory warn
+          # tool keeps its skip-when-absent contract, the blocking surface
+          # does not.
+          if roster_present and content_lines == 0:
+              print(
+                  "::error::NAME_LEAK_ROSTER is present but contains no "
+                  "pattern (only blank or #-comment lines). A gate with an "
+                  "empty roster cannot scan; fix the secret."
+              )
+              raise SystemExit(1)
+
+          # Compile-check the PATTERN TEXT only (never a class token): format
+          # 1 is the stripped line, format 2 is the text after the first tab.
+          # Failures keep the existing wording — the line number and nothing
+          # else, because this is a public log and the roster is a name list.
           invalid_pattern_line = None
           for lineno, line in enumerate(canonical.splitlines(), start=1):
               stripped = line.strip()
               if not stripped or stripped.startswith("#"):
                   continue
+              pattern_text = (
+                  stripped.split("\t", 1)[1]
+                  if observed_format == 2
+                  else stripped
+              )
               try:
-                  re.compile(stripped)
+                  re.compile(pattern_text)
               except re.error:
                   invalid_pattern_line = lineno
                   break
@@ -159,9 +260,25 @@ jobs:
               )
               raise SystemExit(1)
 
+          # The attestation is a CLAIM read from the branch, so a malformed or
+          # contradictory one only ever fails the gate.
+          #
+          # Schema 1: `roster_format: 1` + one integer `pattern_count`.
+          # Schema 2: `roster_format: 2` + two integer per-class counts, both
+          # >= 0. Both require the 64-hex whole-file sha256.
+          #
+          # EVERY count AND the format field are bool-guarded explicitly:
+          # `isinstance(True, int)` is True and `True == 1` in Python, so a
+          # JSON `true` would otherwise pass as an integer count or as
+          # `roster_format: 1`.
           attestation_present = False
           attestation_matches = False
           attested_count = None
+          attested_format = None
+          schema_ok = False
+          attested_sha = None
+          count_a = None
+          count_b = None
           try:
               with open(os.environ["ATTESTATION_PATH"], encoding="utf-8") as fh:
                   attestation = json.load(fh)
@@ -169,19 +286,83 @@ jobs:
               attestation = None
 
           if isinstance(attestation, dict):
-              attested_count = attestation.get("pattern_count")
+              attested_format = attestation.get("roster_format")
               attested_sha = attestation.get("roster_sha256")
-              # A valid attestation has schema 1, an integer pattern count and
-              # a 64-hex whole-file sha256. Anything else is "not present": a
-              # malformed or unset attestation must fail, never pass.
-              if (
-                  attestation.get("roster_format") == 1
-                  and isinstance(attested_count, int)
-                  and isinstance(attested_sha, str)
+              format_ok = (
+                  isinstance(attested_format, int)
+                  and not isinstance(attested_format, bool)
+                  and attested_format in (1, 2)
+              )
+              sha_ok = (
+                  isinstance(attested_sha, str)
                   and re.fullmatch(r"[0-9a-f]{64}", attested_sha) is not None
+              )
+              count_a = attestation.get("pattern_count_a")
+              count_b = attestation.get("pattern_count_b")
+              if (
+                  format_ok
+                  and attested_format == 1
+                  and isinstance(attestation.get("pattern_count"), int)
+                  and not isinstance(attestation.get("pattern_count"), bool)
+                  and sha_ok
               ):
+                  schema_ok = True
+                  attested_count = attestation["pattern_count"]
+              elif (
+                  format_ok
+                  and attested_format == 2
+                  and isinstance(count_a, int)
+                  and not isinstance(count_a, bool)
+                  and count_a >= 0
+                  and isinstance(count_b, int)
+                  and not isinstance(count_b, bool)
+                  and count_b >= 0
+                  and sha_ok
+              ):
+                  schema_ok = True
+                  attested_count = count_a + count_b
+
+              # THE FORMAT CROSS-CHECK. The whole-file sha256 is over BYTES and
+              # is blind to the grammar. Two distinct cases reach this check:
+              #   * a rotation that RE-ISSUES the sha but leaves roster_format
+              #     stale would PASS a sha-only check — only this comparison
+              #     sees the mismatch;
+              #   * a rotation that leaves the attestation untouched entirely
+              #     trips this check FIRST, so the sha is never compared here
+              #     (and would not have matched: the secret's bytes changed).
+              # The attested format must equal the OBSERVED one, and a mismatch
+              # fails closed in BOTH directions.
+              if (
+                  schema_ok
+                  and roster_present
+                  and attested_format != observed_format
+              ):
+                  print(
+                      "::error::the roster attestation declares roster_format "
+                      f"{attested_format}, but the roster's own shape is format "
+                      f"{observed_format}. The secret and the attestation "
+                      "rotate in one act: re-issue the attestation with the "
+                      "matching roster_format (and, for format 2, both "
+                      "per-class counts). The whole-file sha256 is over bytes "
+                      "and blind to the grammar: a rotation that re-issues the "
+                      "sha but leaves roster_format stale would pass a "
+                      "sha-only check, and only this cross-check catches it. "
+                      "Failing closed."
+                  )
+              elif schema_ok:
                   attestation_present = True
                   attestation_matches = attested_sha == actual_sha
+
+          # `pattern_count` keeps its output name (the scan steps echo it) and
+          # is OBSERVED, never attested: the content-line count for format 1,
+          # and the observed per-class sum for format 2. Reading it from the
+          # attestation would make the count-mismatch warning below compare the
+          # attestation with itself, so that control could never fire.
+          pattern_count = (
+              a_prefixed + b_prefixed
+              if observed_format == 2
+              else content_lines
+          )
 
           # Execute the gate's code from a tree the PR author cannot write, never
           # from the pull request's checkout. On a same-repo pull request the
@@ -323,16 +504,30 @@ jobs:
 
           # Only when the hash matched: the text below says "still matched", so
           # on a mismatch it would contradict the verdict (#4600).
-          if (
-              roster_present
-              and attestation_present
-              and attestation_matches
-              and attested_count != pattern_count
-          ):
-              print(
-                  f"::warning::the attestation records {attested_count} pattern(s) "
-                  f"but the roster has {pattern_count}; the sha256 still matched"
-              )
+          if roster_present and attestation_present and attestation_matches:
+              if observed_format == 2:
+                  # Per-class: the OBSERVED count against the attested count for
+                  # the SAME class. A total-only comparison could not see an
+                  # error in one class that another class compensates, and
+                  # reading the total from the attestation would compare the
+                  # attestation with itself, so the warning could never fire.
+                  if a_prefixed != count_a:
+                      print(
+                          f"::warning::the attestation records {count_a} class-A "
+                          f"pattern(s) but the roster has {a_prefixed}; the "
+                          "sha256 still matched"
+                      )
+                  if b_prefixed != count_b:
+                      print(
+                          f"::warning::the attestation records {count_b} class-B "
+                          f"pattern(s) but the roster has {b_prefixed}; the "
+                          "sha256 still matched"
+                      )
+              elif attested_count != pattern_count:
+                  print(
+                      f"::warning::the attestation records {attested_count} pattern(s) "
+                      f"but the roster has {pattern_count}; the sha256 still matched"
+                  )
 
           print(
               f"name-leak gate: {outcome.conclusion} — {outcome.reason} "
@@ -406,6 +601,13 @@ jobs:
           # `-P` keeps the checkout off sys.path. Both measured; see the doc.
           # Every path here is per-run: nothing touches a fixed /tmp name.
           git show "${BASE_SHA}:tools/name_leak_warn.py" > "${RUN_DIR}/name_leak_warn_base.py"
+          # The warn tool loads the roster parser from a SIBLING scan-leaks.py,
+          # so the scanner must be extracted next to it. Use
+          # `src/engram/tools/scan-leaks.py`, NEVER `tools/scan-leaks.py`: the
+          # latter is a symlink in the tree, so `git show` returns the link's
+          # target text rather than the file. `set -euo pipefail` makes a
+          # failed extraction fail this step closed.
+          git show "${BASE_SHA}:src/engram/tools/scan-leaks.py" > "${RUN_DIR}/scan-leaks.py"
           git diff "$BEFORE_SHA" "$AFTER_SHA" > "${RUN_DIR}/push.diff"
           python3 -P "${RUN_DIR}/name_leak_warn_base.py" \
             --roster-file "$ROSTER_PATH" \
@@ -451,6 +653,13 @@ jobs:
           # Scanner from the base commit, `-P` to keep the checkout off
           # sys.path — same two reasons as the push step above.
           git show "${BASE_SHA}:tools/name_leak_warn.py" > "${RUN_DIR}/name_leak_warn_base.py"
+          # The warn tool loads the roster parser from a SIBLING scan-leaks.py,
+          # so the scanner must be extracted next to it. Use
+          # `src/engram/tools/scan-leaks.py`, NEVER `tools/scan-leaks.py`: the
+          # latter is a symlink in the tree, so `git show` returns the link's
+          # target text rather than the file. `set -euo pipefail` makes a
+          # failed extraction fail this step closed.
+          git show "${BASE_SHA}:src/engram/tools/scan-leaks.py" > "${RUN_DIR}/scan-leaks.py"
           python3 -P "${RUN_DIR}/name_leak_warn_base.py" \
             --roster-file "$ROSTER_PATH" \
             --diff-file "${RUN_DIR}/pr.diff" \

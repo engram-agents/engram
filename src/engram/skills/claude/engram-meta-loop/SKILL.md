@@ -249,6 +249,7 @@ mv "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md "${ENGRAM_HOME:-$HOME/.engram
 ```
 engram_checkpoint(
     message="<meta-loop summary: goals, iterations, modalities used, key outputs>",
+    session_id="<this session's id, as injected at session start>",
 )
 ```
 

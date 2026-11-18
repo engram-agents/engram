@@ -201,7 +201,7 @@ IA_REFUSAL_DETAIL = "(no forum.url set in config.json)"
 IA_REFUSAL_LINES = [
     f"ia: no forum configured {IA_REFUSAL_DETAIL}; ia requires a configured forum.",
     "To enable: set forum.url in config.json and restart MCP.",
-    "See: inter-agent/README.md §2 (Mode gate).",
+    'See: the engram-letter skill, troubleshooting table, row "ia exits 3 with no forum configured".',
 ]
 BATON_REFUSAL_LINE = (
     "baton: no forum configured (set forum.url in config.json); "

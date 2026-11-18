@@ -304,16 +304,19 @@ to the JSONL only after this Stop hook has already read it (transcript-
 flush lag is a known prior in this codebase's Stop hooks -- previously
 documented against the `tool_result` shape, and the same lag risk applies
 identically to a `tool_use` block, since both land in the same JSONL
-stream). The over-fire this can cause is NOT bounded to one self-correcting
-turn: `_stophooklib.write_offset_state` re-stats the transcript
-independently of the stat this hook's own scan used, and if the file grows
-in between -- exactly the flush-lag window above -- the recorded offset
-advances past bytes this scan never read. Those bytes are then permanently
-invisible to every future delta, so the nudge can recur on turns where the
-agent did re-arm and verify correctly (see #1855). This cannot cause a
-false SUPPRESSION, though: the offset only ever advances, so the failure
-strictly under-counts evidence -- it can miss a real re-arm, never fabricate
-one. The failure direction stays safe; only the "one turn" bound was wrong.
+stream). A turn whose re-arm flushes after this hook has read the delta can
+therefore draw one extra nudge. The offset this hook records is the
+transcript size its own delta scan used (the largest size any scan in the
+invocation stat'd, passed as `_stophooklib.write_offset_state(..., offset=)`),
+not a second stat taken after the decision path, so bytes that land after the
+scan stay in the next turn's delta instead of being skipped for good (the
+earlier re-stat did skip them, which made the over-fire unbounded: #1855,
+fixed). That has a second, equally bounded cost in the other direction: the
+late record is read by the NEXT turn's scan, so that turn can be SUPPRESSED by
+an arm that belongs to the turn before it (a one-turn false suppression, not
+only an extra nudge). Both effects last one turn.
+The one path with no scan to record (the managed-Codex pacer nudge, which
+returns before any delta is read) still stats the transcript when it writes.
 
 Best-effort: any failure fails toward EMITTING the nudge (evidence, not
 testimony -- the absence of provable evidence is itself the trigger to
@@ -375,6 +378,11 @@ LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 # engram-stop-hook.py's `.write-nudge-last-fire.json` or
 # engram-deference-detector-stop.py's `deference-detected.json`.
 _LOOP_ARM_STATE_FILE = os.path.join(ENGRAM_HOME, ".loop-arm-nudge-last-fire.json")
+
+# #1855: the largest transcript size any delta scan in this invocation used
+# (None = no scan ran). The offset written to the state file is THIS, not a
+# second stat the transcript may have outgrown.
+_SCANNED_SIZE: int | None = None
 
 # alpha #3919 M2: the quiet-wake counter's OWN state file. Deliberately NOT the
 # loop marker: `loop_prompt.py --rearm-delay` rewrites the marker, and a second
@@ -902,6 +910,8 @@ def _delta_has_arm_confirmation(transcript_path: str) -> bool:
         current_size = os.path.getsize(transcript_path)
     except OSError:
         return False
+    global _SCANNED_SIZE  # #1855
+    _SCANNED_SIZE = max(_SCANNED_SIZE or 0, current_size)
 
     stored_offset = 0
     try:
@@ -959,11 +969,57 @@ QUIET_WAKE_OBSERVE_OR_ARM_TOOLS = frozenset({
     "Read", "Glob", "Grep",
 }) | _UMWELT_READ_VERBS
 
+# #4642: the printed study-queue command must RUN AS PRINTED.  Two things are
+# resolved rather than assumed:
+#
+#  * the interpreter: the plugin venv, an INSTALLATION ARTIFACT at ~/.engram/venv,
+#    independent of ENGRAM_HOME (CLAUDE.md "Infrastructure Locations"; install.sh
+#    VENV_DIR="$HOME/.engram/venv"; tools/home_path_gate.py's
+#    'engram_home_derived_venv' class), so it is NOT built from this hook's
+#    engram_home() result above -- that would name a path that does not exist on a
+#    non-default home;
+#  * the script: `tools/study_queue.py` does not exist at the repo root (source:
+#    src/engram/tools/; deployed: the plugin root's tools/), so a bare relative path
+#    resolves in NO cwd.  Same policy as `_loop_prompt_helper_path` above:
+#    $CLAUDE_PLUGIN_ROOT first, then this file's own tree up to and including its
+#    tree root (#3983), and the relative form only when nothing resolves.
+#
+# `{n}` stays a literal placeholder: only the command fragment is an f-string, the
+# surrounding message is unchanged.
+_VENV_PYTHON = os.path.expanduser("~/.engram/venv/bin/python3")
+
+_sq_candidates = []
+_sq_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+if _sq_plugin_root:
+    _sq_candidates.append(Path(_sq_plugin_root) / "tools")
+for _sq_parent in _bounded_parents(Path(__file__).resolve()):
+    _sq_candidates.append(_sq_parent / "tools")
+_SQ_TOOLS_DIR = None
+for _sq_candidate in _sq_candidates:
+    try:
+        _sq_found = (_sq_candidate / "study_queue.py").exists()
+    except OSError:
+        continue
+    if _sq_found:
+        _SQ_TOOLS_DIR = _sq_candidate
+        break
+
+
+def _study_queue_helper_path() -> str:
+    """The printed path of tools/study_queue.py: the directory this hook's own tree
+    resolution found, absolute and shell-quoted; else the relative form (never a
+    broken absolute path)."""
+    if _SQ_TOOLS_DIR is not None:
+        return shlex.quote(str(Path(_SQ_TOOLS_DIR) / "study_queue.py"))
+    return "tools/study_queue.py"
+
+
 _QUIET_NUDGE_TEXT = (
     "[Quiet Wake Check: {n} quiet wakes in a row (no work done, only looking "
     "and re-arming). Take an OWNER step from your board, or run ONE study unit: "
     "one target, one method, one written ENGRAM result. Next act: run "
-    "`python3 tools/study_queue.py` once it exists (alpha #3919 M3); until "
+    f"`{shlex.quote(_VENV_PYTHON)} {_study_queue_helper_path()}` once it exists "
+    "(alpha #3919 M3); until "
     "then read the latest dream report's `For the awake seat` section "
     "(`~/.engram/history/dream/`, most recent file).]"
 )
@@ -1250,6 +1306,8 @@ def _read_turn_delta(transcript_path: str) -> bytes | None:
         current_size = os.path.getsize(transcript_path)
     except OSError:
         return None
+    global _SCANNED_SIZE  # #1855
+    _SCANNED_SIZE = max(_SCANNED_SIZE or 0, current_size)
     stored_offset = 0
     try:
         stored_path, offset = _read_offset_state(_LOOP_ARM_STATE_FILE)
@@ -1765,6 +1823,8 @@ def _emit_hook_fire(session_id: str, transcript_path: str, _t0: float) -> None:
 
 
 def main() -> None:
+    global _SCANNED_SIZE  # #1855
+    _SCANNED_SIZE = None  # reset per run: a stale value from an earlier call must not become this run's offset
     # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
     # return in this function.
     write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
@@ -1877,7 +1937,7 @@ def main() -> None:
         _quiet_wake_step(transcript_path, can_nudge=False)  # keep the counter honest
         print(json.dumps({"decision": "block", "reason": _REPLY_NOT_RENDERED_TEXT}))
         if _STOPHOOKLIB_OK:
-            _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+            _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path, offset=_SCANNED_SIZE)
         _emit_hook_fire(session_id, transcript_path, _t0)
         return
 
@@ -1892,7 +1952,7 @@ def main() -> None:
         if pending:
             _quiet_wake_step(transcript_path, can_nudge=False)
             if _STOPHOOKLIB_OK:
-                _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+                _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path, offset=_SCANNED_SIZE)
             return
 
     # alpha #3919 M2: runs BEFORE the confirmed-early-return (a quiet turn
@@ -1902,7 +1962,7 @@ def main() -> None:
 
     if confirmed:
         if _STOPHOOKLIB_OK:
-            _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+            _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path, offset=_SCANNED_SIZE)
         if quiet_result is not None:
             reason, is_block = quiet_result
             if is_block:
@@ -1919,7 +1979,7 @@ def main() -> None:
     # print statement is the only emit channel, lib available or not.
     print(json.dumps({"decision": "block", "reason": _nudge_text_for_marker(LOOP_MARKER_PATH)}))
     if _STOPHOOKLIB_OK:
-        _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+        _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path, offset=_SCANNED_SIZE)
     # Lib unavailable -- no offset state to write without it, so skip that
     # bookkeeping (nothing else to do with it); the nudge above still fired.
 

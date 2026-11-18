@@ -179,13 +179,13 @@ sys.exit(0 if ok else 1)
 #   1. an explicit first line of ~/.engram/boot-cwd (normalised), if it names an
 #      existing directory, WINS EVEN IF UNTRUSTED (still launches, with the
 #      preflight ERROR below);
-#   2. else the FIRST EXISTING directory among $HOME/engram-alpha, $HOME/umwelt,
-#      $HOME that is TRUSTED (cwd_trust_status == 0);
+#   2. else the FIRST EXISTING directory among $HOME/engram (the default name),
+#      $HOME/engram-alpha (the accepted old name), $HOME/umwelt, $HOME that is TRUSTED (cwd_trust_status == 0);
 #   3. else none is trusted: the first existing one in that same order, and the
 #      preflight below prints its ERROR.
 # When trust is unverifiable (CLAUDE_CONFIG_DIR set, python3 missing) every
-# candidate counts as untrusted, so rule 3 applies: engram-alpha > umwelt >
-# $HOME, with the existing ERROR wording for those causes.
+# candidate counts as untrusted, so rule 3 applies: engram > engram-alpha >
+# umwelt > $HOME, with the existing ERROR wording for those causes.
 # Rationale: a seat with both ~/engram-alpha and ~/umwelt where only ~/umwelt is
 # trusted used to boot cleanly; plain order would stall it on the dialog.
 # Without an explicit --cd the session would inherit the systemd unit's cwd —
@@ -218,7 +218,7 @@ fi
 if [[ -z "$cd_target" ]]; then
     first_existing=""
     first_existing_arm=""
-    for cand_arm in '$HOME/engram-alpha' '$HOME/umwelt' '$HOME'; do
+    for cand_arm in '$HOME/engram' '$HOME/engram-alpha' '$HOME/umwelt' '$HOME'; do
         cand="$HOME${cand_arm#\$HOME}"   # not ${x/#pat/$HOME}: bash patsub_replacement turns "&" in $HOME into the match
         [[ -d "$cand" ]] || continue
         if [[ -z "$first_existing" ]]; then

@@ -164,7 +164,7 @@ The surface daemon powers semantic recall. Test it directly.
 # Check the daemon process:
 # -u: own seat only; never -a — on Darwin -a re-admits ancestors (else branch never fires), so take argv from ps (#2132/#2133).
 if pids=$(pgrep -u "$(id -u)" -f "engram-surface-daemon"); then
-    ps -o pid=,args= -p "$(echo "$pids" | tr '\n' ',' | sed 's/,$//')"
+    ps -ww -o pid=,args= -p "$(echo "$pids" | tr '\n' ',' | sed 's/,$//')"
 else
     rc=$?
     [ "$rc" -eq 1 ] && echo "daemon not running" || echo "could not check: pgrep exited $rc"
@@ -251,10 +251,11 @@ term (engram-alpha#2678, forum #398).
 ```bash
 python3 -c "
 import sys, sqlite3, os
+from pathlib import Path
 sys.path.insert(0, sys.argv[1] + '/marketplace/plugins/engram')
 import engram_backup
 p = sys.argv[1] + '/knowledge.db'
-conn = sqlite3.connect(f'file:{p}?mode=ro', uri=True)  # read-only -- this step reads a possibly-corrupt graph
+conn = sqlite3.connect(Path(p).absolute().as_uri() + '?mode=ro', uri=True)  # read-only -- this step reads a possibly-corrupt graph
 print(engram_backup.check_fts_integrity(conn))
 " "${ENGRAM_HOME:-$HOME/.engram}"
 ```
@@ -269,7 +270,7 @@ verdict once `problems` is non-empty. A real, actionable finding. Consider `engr
 (own-substrate authority — snapshot `knowledge.db` first, then rebuild, then re-run this check to confirm)
 — though note the repair's effectiveness against this failure class is not yet verified; confirm rather
 than assume. This is a footnote fix for one seat, not a substitute for reporting it — the cause (how the
-corruption happened) is worth a forum post regardless.
+corruption happened) is worth reporting to the user regardless. Report it to the user first; whether it then goes to other agents (the forum or a letter) is an outward message, so it follows the inform-before step in the user's authority table, not this skill.
 
 **PARTIAL (an unknown, not a confirmed problem — investigate, don't treat as FAIL):**
 `{'status': 'partial', 'unprobed': [{'term': ..., 'error': ..., 'stage': 'plain_match'}, ...], 'probed_terms': N}`

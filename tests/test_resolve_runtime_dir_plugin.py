@@ -121,6 +121,15 @@ _HARNESS_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "_harness.p
 _HARNESS_SRC = _HARNESS_PATH.read_text()
 
 
+def _last_ditch_checkout(suffix: str = "") -> str:
+    """The last-ditch fallback: first existing of ~/engram, ~/engram-alpha (the default
+    name first, the old name accepted); neither exists -> the ~/engram path."""
+    for name in ("~/engram", "~/engram-alpha"):
+        if os.path.isdir(os.path.expanduser(name + suffix)):
+            return os.path.expanduser(name + suffix)
+    return os.path.expanduser("~/engram" + suffix)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -613,7 +622,7 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
             ),
             sentinel="engram_idf.py",
             takes_engram_home_arg=False,
-            expected_last_ditch=os.path.expanduser("~/engram-alpha/src/engram"),
+            expected_last_ditch=_last_ditch_checkout("/src/engram"),
         ),
         _WalkParentsSubject(
             label="_hooklib.resolve_runtime_dir, sentinel=engram_client.py "
@@ -625,7 +634,7 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
             real_source_path=_HOOKLIB_PATH,
             sentinel="engram_client.py",
             takes_engram_home_arg=True,
-            expected_last_ditch=os.path.expanduser("~/engram-alpha"),
+            expected_last_ditch=_last_ditch_checkout(),
         ),
         _WalkParentsSubject(
             label="_hooklib.resolve_runtime_dir, sentinel=engram_ids.py "
@@ -634,7 +643,7 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
             real_source_path=_HOOKLIB_PATH,
             sentinel="engram_ids.py",
             takes_engram_home_arg=True,
-            expected_last_ditch=os.path.expanduser("~/engram-alpha"),
+            expected_last_ditch=_last_ditch_checkout(),
         ),
     ]
 

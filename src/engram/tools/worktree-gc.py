@@ -13,12 +13,29 @@ This tool classifies each worktree and removes the safely-finished ones:
   PRUNE   branch worktree whose PR is MERGED or CLOSED (gh), worktree clean,
           AND no live process has its CWD inside it (fairy not still running)
   PRUNE   detached-HEAD worktree, clean, whose head SHA matches NO open PR
-          (reviewer-fairy leftover; nothing to lose)
+          AND whose head commit is reachable from some ref (any ref under refs/:
+          branch, tag, remote-tracking or other), so removing the worktree
+          loses no commit
   PRUNE   `worktree-agent-*` / `review-*` tmp-branch worktree, clean
+  KEEP    a worktree the deploy record names (`deployed_from` in
+          `<ENGRAM_HOME>/.deployed-version`): the upgrade flow's source tree,
+          load-bearing though it looks like a leftover (#4157); checked before
+          any prune of an existing worktree. EVERY `deployed_from` value is
+          protected: the readers of the record do not agree when it has several
+          lines (flows.py keeps the last value; cli.py keeps the last one that
+          names an existing directory, and does not accept spaces around the key)
   KEEP    branch worktree whose PR is OPEN (active work)
   KEEP    branch worktree with NO PR (pre-PR or abandoned — flagged for a human)
+  SKIP    an AGENT-OWNED worktree (branch `worktree-agent-*` / `review-*`, or any
+          worktree under `<main>/.claude/worktrees/`) whose newest git-metadata
+          activity is younger than the age guard (6h; --age-guard-seconds), or
+          whose age cannot be read — a running fairy is not a process holding a
+          CWD, so /proc cannot see it (#2808)
   SKIP    any worktree that is DIRTY (uncommitted changes) — never destroy work
   SKIP    any worktree that has a live process with CWD inside it (in-use guard)
+  SKIP    detached-HEAD worktree whose head commit is in NO ref (it would
+          survive only in the reflog), or whose reachability could not be
+          verified (#4509)
   SKIP    detached-HEAD worktree whose head SHA is an OPEN PR's head (a
           reviewer's `refs/pr/<N>` checkout), or whose open-PR state could not
           be verified (gh unavailable) — never prune on unknown
@@ -37,6 +54,11 @@ Safety invariants:
     still writing to disk could be reaped out from under it — see
     classify() below, where the check runs before the MERGED/CLOSED PRUNE
     return.
+  * A young agent-owned worktree is never removed, on EVERY prune path
+    (detached-HEAD, tmp-branch, MERGED/CLOSED PR); an unreadable age keeps it
+    (fail closed). Age = newest mtime of HEAD / index / logs/HEAD in the
+    worktree's own admin dir under the main .git. Only a missing directory
+    (stale admin record) is exempt.
   * An OPEN-PR worktree is never removed.
   * A no-PR branch is never auto-removed (could be unpushed/abandoned work) —
     only reported, so a human decides.
@@ -44,6 +66,7 @@ Safety invariants:
 Usage:
     python tools/worktree-gc.py            # dry-run (default)
     python tools/worktree-gc.py --apply    # actually remove
+    python tools/worktree-gc.py --age-guard-seconds 3600   # override the 6h guard
     python tools/worktree-gc.py --json     # machine-readable plan
 """
 
@@ -54,7 +77,22 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+# The ONE ENGRAM-home resolver for tools lives in tools/_owner_read.py (#3863);
+# resolve the package root through the symlink so `from tools import ...` works
+# run as a script, loaded by path, or from the flattened plugin layout (same
+# shim as deference_baseline.py).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+
+from tools import _owner_read as owner_read  # noqa: E402
+
+# #2808: an agent-owned worktree younger than this is never pruned. The /proc
+# in-use scan cannot see a running fairy (it is not a process holding a CWD).
+AGE_GUARD_SECONDS = 6 * 3600
 
 
 def _run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
@@ -102,10 +140,38 @@ def _list_worktrees(root: str) -> list[dict]:
 
 
 def _is_clean(path: str) -> bool:
-    rc, out, _ = _run(["git", "-C", path, "status", "--porcelain"])
+    rc, out, _ = _run(["git", "--no-optional-locks", "-C", path, "status", "--porcelain"])
     # Untracked-only is still "has stuff" — but fairy worktrees commit their work,
     # so any porcelain output (tracked or untracked) means don't auto-remove.
     return rc == 0 and out.strip() == ""
+
+
+def _deploy_sources() -> frozenset[str]:
+    """The realpaths of EVERY directory `<ENGRAM_HOME>/.deployed-version` names
+    as `deployed_from`; empty when the record cannot be read (#4157).
+
+    The upgrade flow uses a `deployed_from` directory as the SOURCE_DIR of the
+    next upgrade, so a worktree there is load-bearing even though it looks like
+    a prunable leftover. The record's readers do not agree when it carries
+    several lines (flows.py keeps the last value; cli.py keeps the last one that
+    names an existing directory, and does not accept spaces around the key), so
+    every value is protected: that is right whichever reader runs.
+    Fails open to the empty set (today's classification) on a missing,
+    unreadable or malformed record, an empty value, or an unresolvable home.
+    """
+    found: set[str] = set()
+    try:
+        record = owner_read.engram_home() / ".deployed-version"
+        with open(record, encoding="utf-8") as f:
+            for line in f:
+                # Same rule as the readers it must agree with: flows.py
+                # `_read_deployed_version` and the upgrade flow in cli.py.
+                key, sep, value = line.strip().partition("=")
+                if sep and key.strip() == "deployed_from" and value.strip():
+                    found.add(os.path.realpath(value.strip()))
+    except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
+        return frozenset()
+    return frozenset(found)
 
 
 def _is_in_use(path: str) -> bool:
@@ -130,6 +196,90 @@ def _is_in_use(path: str) -> bool:
         except (OSError, PermissionError):
             continue
     return False
+
+
+def _main_checkout_path(path: str) -> str | None:
+    """The main checkout's directory, derived from a worktree's own `.git`
+    file (`gitdir: <main>/.git/worktrees/<name>`): the admin dir's common dir
+    (its `commondir` file, else two levels up) is `<main>/.git`, and the main
+    checkout is its parent. Reads files only (no subprocess). None if it cannot
+    be derived (no `.git` file, unreadable, or a common dir not named `.git`).
+    """
+    try:
+        line = (Path(path) / ".git").read_text().strip()
+        if not line.startswith("gitdir:"):
+            return None
+        admin = Path(line[len("gitdir:"):].strip())
+        if not admin.is_absolute():
+            admin = Path(path) / admin
+        cd = admin / "commondir"
+        common = (admin / cd.read_text().strip()) if cd.is_file() else admin.parent.parent
+        common = common.resolve()
+    except (OSError, ValueError):
+        return None
+    if common.name != ".git":
+        return None
+    return str(common.parent)
+
+
+def _is_agent_owned(t: dict, main_path: str | None) -> bool:
+    """True for a fairy/reviewer worktree: tmp-branch name, or under
+    `<main checkout>/.claude/worktrees/` whatever its branch (incl. detached).
+
+    The folder is the MAIN checkout's, whatever directory the tool runs from.
+    If `main_path` is None (it could not be derived) the under-folder test is
+    False and only the branch-name rule applies; it never falls back to the
+    run directory.
+    """
+    branch = t.get("branch")
+    if branch and (branch.startswith("worktree-agent-") or branch.startswith("review-")):
+        return True
+    if not main_path:
+        return False
+    try:
+        base = (Path(main_path) / ".claude" / "worktrees").resolve()
+        Path(t["path"]).resolve().relative_to(base)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _worktree_age_seconds(path: str) -> float | None:
+    """Seconds since the newest of HEAD / index / logs/HEAD in this worktree's
+    admin dir (`.git/worktrees/<name>/`, found via the worktree's `.git` file).
+
+    Returns None when the age cannot be read (fail closed: the caller keeps
+    the worktree). A future mtime reads as age 0.
+    """
+    try:
+        line = (Path(path) / ".git").read_text().strip()
+        if not line.startswith("gitdir:"):
+            return None
+        admin = Path(line[len("gitdir:"):].strip())
+        if not admin.is_absolute():
+            admin = Path(path) / admin
+        if not admin.is_dir():
+            return None
+        newest = None
+        for rel in ("HEAD", "index", "logs/HEAD"):
+            try:
+                m = (admin / rel).stat().st_mtime
+            except FileNotFoundError:
+                continue
+            newest = m if newest is None else max(newest, m)
+        if newest is None:
+            return None
+        return max(0.0, time.time() - newest)
+    except (OSError, ValueError):
+        return None
+
+
+def _fmt_guard(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
 
 
 def _pr_state(branch: str, root: str) -> str | None:
@@ -207,16 +357,51 @@ def _pr_for_sha(sha: str, root: str) -> tuple[bool, int | None]:
     return True, heads.get(sha)
 
 
-def classify(t: dict, root: str) -> tuple[str, str]:
-    """Return (action, reason). action in {PRUNE, KEEP, SKIP, MAIN}."""
+def _refs_containing(sha: str, root: str) -> list[str]:
+    """Names of every ref (any ref under refs/, not only branches and tags) whose history holds
+    `sha`. Raises RuntimeError when git cannot answer; a worktree's HEAD is not
+    a ref, so an empty list means the commit lives only in the worktree."""
+    rc, out, err = _run(
+        ["git", "for-each-ref", "--contains", sha, "--format=%(refname)"],
+        cwd=root,
+    )
+    if rc != 0:
+        raise RuntimeError(f"git for-each-ref rc={rc}: {err.strip()}")
+    return [ln for ln in out.splitlines() if ln.strip()]
+
+
+def classify(t: dict, root: str, *, main_path: str | None = None,
+             age_guard_seconds: int = AGE_GUARD_SECONDS) -> tuple[str, str]:
+    """Return (action, reason). action in {PRUNE, KEEP, SKIP, MAIN}.
+
+    `main_path` is the main checkout (the `.claude/worktrees/` folder the age
+    guard tests is ITS, not `root`'s); when None it is derived from the
+    worktree's own git common dir.
+    """
     if t.get("is_main"):
         return "MAIN", "main checkout — never touched"
     path = t["path"]
     if not Path(path).exists():
         return "PRUNE", "worktree directory missing (stale admin record)"
+    # Deploy source (#4157): before any prune of an existing worktree (a missing
+    # directory above is still PRUNEd: only its admin record goes). The upgrade
+    # flow reads `deployed_from` and uses that directory as the next upgrade's
+    # source tree; its readers do not agree on several lines, so all are protected.
+    if os.path.realpath(path) in _deploy_sources():
+        return "KEEP", "deploy source — the deploy record's deployed_from; the next upgrade needs it"
     if not _is_clean(path):
         return "SKIP", "DIRTY — uncommitted changes; not removing"
     branch = t.get("branch")
+    # Age guard (#2808): before ANY prune return, for agent-owned worktrees.
+    if main_path is None:
+        main_path = _main_checkout_path(path)
+    if _is_agent_owned(t, main_path):
+        age = _worktree_age_seconds(path)
+        if age is None:
+            return "SKIP", "agent worktree age could not be read; not pruning (fail closed)"
+        if age < age_guard_seconds:
+            return "SKIP", (f"young agent worktree (age {round(age / 60)}m < "
+                            f"{_fmt_guard(age_guard_seconds)} age guard); not pruning")
     if branch is None:  # detached HEAD — reviewer-fairy leftover (unless still running)
         if _is_in_use(path):
             return "SKIP", "detached HEAD but process active (reviewer-fairy still running)"
@@ -226,14 +411,26 @@ def classify(t: dict, root: str) -> tuple[str, str]:
         # only when the open-PR lookup ran successfully AND no open PR points
         # at this SHA. If the lookup failed we cannot tell, and a delete verb
         # must fail toward keeping.
+        head = t.get("head") or ""
         try:
-            verified, pr_number = _pr_for_sha(t.get("head") or "", root)
+            verified, pr_number = _pr_for_sha(head, root)
         except Exception:  # gh unavailable / subprocess error / unexpected output
             verified, pr_number = False, None
         if not verified:
             return "SKIP", "detached HEAD but open-PR state unverified (gh lookup failed); not pruning"
         if pr_number is not None:
             return "SKIP", f"detached HEAD matches OPEN PR #{pr_number}; not pruning"
+        # Pruning drops the worktree; a HEAD commit no ref contains would then
+        # survive only in the reflog (#4509). Fail closed if git cannot say.
+        try:
+            refs = _refs_containing(head, root)
+        except Exception:  # nonzero rc / OSError: reachability unknown
+            return "SKIP", (f"detached HEAD {head[:7]}: reachability could not be "
+                            "verified (git for-each-ref failed); not pruning")
+        if not refs:
+            return "SKIP", (f"detached HEAD commit {head[:7]} exists only in this "
+                            "worktree (no ref contains it); "
+                            "not pruning")
         return "PRUNE", "detached HEAD, clean (reviewer-fairy leftover)"
     if branch.startswith("worktree-agent-") or branch.startswith("review-"):
         if _is_in_use(path):
@@ -291,14 +488,21 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="actually remove (default: dry-run)")
     ap.add_argument("--json", action="store_true", help="machine-readable plan")
+    ap.add_argument("--age-guard-seconds", type=int, default=AGE_GUARD_SECONDS,
+                    help="never prune an agent-owned worktree younger than this "
+                         f"(default {AGE_GUARD_SECONDS}s)")
     args = ap.parse_args()
 
     root = _repo_root()
     trees = _list_worktrees(root)
+    # The main checkout is trees[0] (is_main), NOT `root`: run from inside a
+    # linked worktree, `--show-toplevel` is that worktree.
+    main_path = trees[0]["path"] if trees else None
 
     plan = []
     for t in trees:
-        action, reason = classify(t, root)
+        action, reason = classify(t, root, main_path=main_path,
+                                  age_guard_seconds=args.age_guard_seconds)
         plan.append({"path": t["path"], "branch": t.get("branch"),
                      "action": action, "reason": reason})
 

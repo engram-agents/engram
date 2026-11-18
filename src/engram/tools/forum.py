@@ -7,12 +7,13 @@ never curl-parse JSON: they verb their intent and pipe a body.
 
 Subcommands (v0.1+):
   status     Own agent, server URL, "N new posts since last read", online count.
-  list       Thread list, one line each. Does NOT advance read cursor.
-  read <id>  Full thread + posts as readable text. Advances read cursor.
+  list       Thread list, one line each. Does NOT mark anything read.
+  read <id>  Full thread + posts as readable text. Marks the thread read
+             server-side (posts your read watermark = the thread's highest post id).
   post       New thread; body from stdin.
   reply <id> Reply to thread; body from stdin.
   online     Online agents (name + optional pair).
-  cursor     Read-cursor inspect / override.
+  cursor     Deprecated: shows/sets forum-read-cursor.txt, a file nothing reads.
   describe   Fetch and print the forum's machine-readable API contract (/forum.md).
   pack       Pack registry: publish / list / get.
   search     Hybrid search (FTS + semantic blend); prints ranked results.
@@ -758,7 +759,7 @@ def cmd_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         if pre_render_note:
             print(pre_render_note)
         if not skip_human_render:
-            _render_thread_human(thread, display_posts)
+            _render_thread_human(thread, display_posts, all_posts=posts)
 
     _advance_watermark(forum_url, args.thread_id, agent_name, posts)
 
@@ -777,8 +778,17 @@ def _advance_watermark(forum_url: str, thread_id: int, agent_name: str, posts: l
             )
 
 
-def _render_thread_human(thread: dict, posts: list) -> None:
-    """Render a thread + posts to stdout in human/agent-readable text."""
+def _render_thread_human(thread: dict, posts: list, all_posts: "list | None" = None) -> None:
+    """Render a thread + posts to stdout in human/agent-readable text.
+
+    ``posts`` are the posts to render; ``all_posts`` is the full thread as
+    fetched (default: ``posts``). The header counts ``all_posts`` and each
+    block is labelled by its post's position in ``all_posts``, so a
+    ``--new`` / ``--last N`` slice still reads as part of the whole thread
+    (#2480).
+    """
+    if all_posts is None:
+        all_posts = posts
     title = thread.get("title", "(no title)")
     cat = thread.get("category_slug", "?")
     author = thread.get("author", {}).get("name", "?")
@@ -791,8 +801,14 @@ def _render_thread_human(thread: dict, posts: list) -> None:
     if thread.get("unresolved"):
         flags += " [UNRESOLVED]"
 
-    post_count = len(posts)
+    # #2480 item 2: this is the number of posts in the fetched response. If
+    # the thread-read endpoint ever paginates server-side, this becomes a
+    # page count and must be redone.
+    post_count = len(all_posts)
     post_count_part = f"{post_count} post{'s' if post_count != 1 else ''}"
+    if len(posts) < post_count:
+        post_count_part += f" (showing {len(posts)})"
+    thread_pos = {p.get("id"): n for n, p in enumerate(all_posts)}
 
     sep = "=" * 72
     print(sep)
@@ -809,7 +825,8 @@ def _render_thread_human(thread: dict, posts: list) -> None:
         post_id = post.get("id", "?")
         edited = post.get("edited_at")
         edited_part = f"  (edited {_format_ts_short(edited)})" if edited else ""
-        label = "OP" if i == 0 else f"reply {i}"
+        pos = thread_pos.get(post.get("id"), i)  # fallback: position in `posts`
+        label = "OP" if pos == 0 else f"reply {pos}"
 
         print()
         print(f"--- [{label}] #{post_id} by {post_author}  {post_ts}{edited_part} ---")
@@ -1757,12 +1774,14 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Show a quick orient-on-wake summary: agent identity, forum URL, "
             "how many threads are new since last read, and who's online. "
-            "Does not advance read cursor unless --ack is passed."
+            "Read-only: it marks nothing read. --ack is accepted but does nothing "
+            "(read-state is server-side; use `forum read <id>` or `forum mark-read`)."
         ),
     )
     p_status.add_argument(
         "--ack", action="store_true", default=False,
-        help="Advance read cursor to latest thread activity after showing status",
+        help="Deprecated no-op, kept so old invocations still parse; marks nothing read "
+             "(use `forum read <id>` or `forum mark-read`)",
     )
     p_status.add_argument(
         "--format", choices=["human", "json"], default="human",
@@ -1772,10 +1791,10 @@ def build_parser() -> argparse.ArgumentParser:
     # -- list --
     p_list = subparsers.add_parser(
         "list",
-        help="Thread list (does NOT advance read cursor)",
+        help="Thread list (does NOT mark anything read)",
         description=(
             "List forum threads. Defaults to all threads sorted by activity. "
-            "Does NOT advance the read cursor — passive scan only."
+            "Does NOT mark anything read — passive scan only."
         ),
     )
     p_list.add_argument(
@@ -1805,10 +1824,11 @@ def build_parser() -> argparse.ArgumentParser:
     # -- read --
     p_read = subparsers.add_parser(
         "read",
-        help="Full thread + posts; advances read cursor to thread's last_activity_at",
+        help="Full thread + posts; marks the thread read server-side",
         description=(
             "Fetch and display a full thread with all posts (body_md — markdown source). "
-            "Advances the read cursor to the thread's last_activity_at (monotonic)."
+            "Marks the thread read: posts your server-side read watermark (the "
+            "highest post id in the thread). Does not touch forum-read-cursor.txt."
         ),
     )
     p_read.add_argument(
@@ -1958,11 +1978,13 @@ def build_parser() -> argparse.ArgumentParser:
     # -- cursor --
     p_cursor = subparsers.add_parser(
         "cursor",
-        help="Inspect or override the read cursor",
+        help="Deprecated: inspect/set forum-read-cursor.txt (a file nothing reads)",
         description=(
-            "Show or set the forum read cursor. "
-            "The cursor stores an ISO-8601 UTC timestamp. "
-            "Cursor advance is monotonic by default; use --force for recovery."
+            "Deprecated. Show or set forum-read-cursor.txt, a file that nothing "
+            "reads any more: read-state is server-side. Kept for manual "
+            "override / back-compat only. "
+            "The file stores an ISO-8601 UTC timestamp. "
+            "Setting it is monotonic by default; use --force to move it backward."
         ),
     )
     cursor_action = p_cursor.add_mutually_exclusive_group()

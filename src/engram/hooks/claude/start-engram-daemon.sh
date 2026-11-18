@@ -1031,7 +1031,7 @@ def lsof_main():
             print('holder pid ' + pid + ' was signaled but is still alive')
             sys.exit(1)
         try:
-            cmd = clean_cmd(subprocess.run(['ps', '-o', 'command=', '-p', pid], capture_output=True, text=True, timeout=5).stdout)
+            cmd = clean_cmd(subprocess.run(['ps', '-ww', '-o', 'command=', '-p', pid], capture_output=True, text=True, timeout=5).stdout)
         except (OSError, subprocess.SubprocessError):
             cmd = ''
         print('held by pid ' + pid + ' (' + (cmd or '(cmdline unavailable)') + '), not matched by the reap loop for this invocation')

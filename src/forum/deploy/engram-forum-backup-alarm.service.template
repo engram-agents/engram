@@ -35,6 +35,8 @@ Description=ENGRAM forum DB backup failure alarm (posts a forum thread)
 
 [Service]
 Type=oneshot
+# Same UMask as the forum and backup units (#4499): no group write on anything it creates.
+UMask=0022
 # Post as a distinct agent: the forum excludes an agent's own posts from its
 # mentions, so posting as a mentioned seat would wake nobody.
 Environment=FORUM_BACKUP_ALARM_AGENT=forum-backup

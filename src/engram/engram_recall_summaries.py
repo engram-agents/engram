@@ -13,6 +13,7 @@ import json
 import os
 
 import engram_core as core
+import engram_embedding_publish as publish
 from tools.recall_summary_validator import validate_summary_entry
 
 
@@ -40,7 +41,9 @@ from tools.recall_summary_validator import validate_summary_entry
 # entries apply, invalid entries return per-item errors. Doesn't roll back
 # the whole batch on one bad row.
 #
-# Idempotent: re-writing the same node with the same summary is a no-op.
+# Idempotent at the curated-field level: re-writing the same node leaves the
+# same summary/keywords, but still performs a strict embedding refresh so a
+# same-input replay can repair stale vector data.
 # Constants + per-entry validation live in tools/recall_summary_validator.py
 # (single source of truth — used both here and by the batch-summary-fairy).
 #
@@ -60,6 +63,25 @@ from tools.recall_summary_validator import validate_summary_entry
 # resolve to an unrelated file. "summaries" and "summaries_file" together is
 # a loud, ambiguous-input error; neither present is the existing
 # missing-"summaries" error.
+
+def _strict_refresh_embedding(conn, node_id: str, metadata_raw) -> tuple[dict, str | None]:
+    """Refresh and verify one full recipe; restore both vector stores on failure.
+
+    Thin wrapper over the shared primitive (#4651 part A) in compute mode: the
+    strict refresh, its savepoint, the verification and the single
+    marker-clearing path now live in engram_embedding_publish. ``metadata_raw``
+    is kept only so the caller does not change; the primitive reads the row's
+    metadata itself inside the same transaction (the summary UPDATE does not
+    touch metadata, so it equals the value passed in).
+    """
+    result = publish.publish_embedding(conn, node_id)
+    if result.status == "refreshed":
+        return {"embedding_refresh": "refreshed"}, result.warning
+    return {
+        "embedding_refresh": "pending", "embedding_refresh_reason": result.reason,
+    }, result.warning
+
+
 def _set_recall_summaries_impl(payload_json: str) -> str:
     """Impl for engram_set_recall_summaries — takes raw payload_json string."""
     # -- Parse payload --
@@ -150,18 +172,26 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
         else:
             valid_entries.append(entry)
 
-    # -- Apply valid entries in a single transaction --
+    # -- Apply valid entries with independent per-entry transactions --
     ok: list[dict] = []
+    # Per-entry `ok` retains every attempt.  The response-level debt is instead
+    # one stable-order state per target, overwritten only by a successfully
+    # applied entry, so a later strict refresh can resolve earlier batch debt.
+    response_debt_by_node: dict[str, bool] = {}
+    warnings: list[str] = []
     conn = core._get_db()
     try:
+        # Each outermost entry savepoint commits independently on RELEASE.
+        # This is the best-effort peer-isolation transaction boundary.
         with conn:
             for entry in valid_entries:
                 node_id = entry["node_id"].strip()
                 recall_summary = entry["recall_summary"]
                 recall_keywords = entry["recall_keywords"]
+                conn.execute("SAVEPOINT recall_summary_entry")
                 try:
                     row = conn.execute(
-                        "SELECT id, is_current FROM nodes WHERE id = ?",
+                        "SELECT id, is_current, metadata FROM nodes WHERE id = ?",
                         (node_id,),
                     ).fetchone()
                     if row is None:
@@ -169,12 +199,14 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
                             "node_id": node_id,
                             "error": "node not found",
                         })
+                        conn.execute("RELEASE recall_summary_entry")
                         continue
                     if row["is_current"] != 1:
                         errors.append({
                             "node_id": node_id,
                             "error": "node is not current (superseded)",
                         })
+                        conn.execute("RELEASE recall_summary_entry")
                         continue
                     # Clear needs_tightening/summary_missing on successful apply
                     # (#1952 PR3): both flags exist to queue a node into the
@@ -196,19 +228,35 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
                         "needs_tightening = 0, summary_missing = 0 WHERE id = ?",
                         (recall_summary, json.dumps(recall_keywords), node_id),
                     )
-                    ok.append({"node_id": node_id})
+                    refresh, warning = _strict_refresh_embedding(conn, node_id, row["metadata"])
+                    if warning is not None:
+                        warnings.append(warning)
+                    conn.execute("RELEASE recall_summary_entry")
+                    item = {"node_id": node_id, **refresh}
+                    ok.append(item)
+                    response_debt_by_node[node_id] = (
+                        refresh["embedding_refresh"] == "pending"
+                    )
                 except Exception as exc:  # noqa: BLE001
+                    conn.execute("ROLLBACK TO recall_summary_entry")
+                    conn.execute("RELEASE recall_summary_entry")
                     errors.append({"node_id": node_id, "error": str(exc)})
     finally:
         conn.close()
 
+    needs_reembed = [
+        node_id for node_id, is_pending in response_debt_by_node.items() if is_pending
+    ]
     result = {
         "ok": ok,
         "errors": errors,
         "applied": len(ok),
         "failed": len(errors),
         "pre_flight_failures": pre_flight_failures,
+        "needs_reembed": needs_reembed,
     }
+    if warnings:
+        result["warnings"] = warnings
     # File-based responses always echo the resolved path, even when applied=0 —
     # so a genuinely-empty final_payload.json ("nothing to summarize tonight")
     # is distinguishable in the response from a misread/empty file, and never

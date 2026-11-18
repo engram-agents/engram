@@ -8,7 +8,7 @@ Coverage:
   1. Happy path — well-formed payload removes an existing `about` edge.
   2. Idempotency — removing a non-existent edge returns no_op_not_found.
   3. Whitelist enforcement — cascade-bearing / structural / provenance
-     relations are rejected (derives_from, supports, supersedes, retracts,
+     relations are rejected (derives_from, supported_by, supersedes, retracts,
      contradicts, resolves, cites).
   4. Schema enforcement — invalid JSON, non-object, unknown fields.
   5. Required-field validation — missing source_id / target_id / relation.
@@ -134,7 +134,7 @@ def test_blocked_relations_rejected():
     """All cascade / structural / provenance relations must be rejected."""
     server = fresh_server()
     person_id, obs_id = _seed_self_anchor_and_obs(server)
-    blocked = ["derives_from", "supports", "supersedes", "retracts",
+    blocked = ["derives_from", "supported_by", "supersedes", "retracts",
                "contradicts", "resolves", "cites"]
     for relation in blocked:
         r = json.loads(server.engram_remove_edge(payload_json=json.dumps({

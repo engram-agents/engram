@@ -8,6 +8,7 @@ Agreement of the two is the check; the migration's count alone is circular.
 Never touches your live DB. Never touches another seat's graph.
 """
 import json, os, shutil, sqlite3, subprocess, sys, tempfile
+from pathlib import Path
 
 # The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (#3863). The repo root (the parent of this
 # file's directory) is appended, never inserted at [0] (#2565, #4054).
@@ -41,10 +42,22 @@ except ValueError as _exc:
     ENGRAM_HOME = None
     _HOME_REFUSAL = str(_exc)
 if _HOME_REFUSAL is None:
-    REPO = _first([os.environ.get("ENGRAM_REPO"),
-                   os.path.expanduser("~/engram-alpha"),
-                   os.path.expanduser("~/src/engram-alpha"),
-                   os.path.expanduser("~/GitHub/engram-alpha")], "the engram-alpha checkout")
+    _repo_cands = [os.path.expanduser(p) for p in
+                   ("~/engram", "~/engram-alpha", "~/src/engram", "~/src/engram-alpha",
+                    "~/GitHub/engram", "~/GitHub/engram-alpha")]
+    # A checkout the cwd is inside of (a linked worktree counts) wins over the order; ENGRAM_REPO first.
+    # Same rule as _hooklib.pick_checkout and supervision_probe.py; keep the copies in step.
+    try:
+        _cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        _cwd = ""
+    for _c in _repo_cands:
+        _r = os.path.realpath(_c)
+        if os.path.isdir(_c) and _cwd and (_cwd == _r or _cwd.startswith(_r.rstrip(os.sep) + os.sep)):
+            _repo_cands.remove(_c)
+            _repo_cands.insert(0, _c)
+            break
+    REPO = _first([os.environ.get("ENGRAM_REPO")] + _repo_cands, "the engram checkout")
     LIVE = _first([os.path.join(ENGRAM_HOME, "knowledge.db")], "your knowledge.db")
     PY   = _first([os.environ.get("ENGRAM_PY"),
                    os.path.join(os.path.expanduser("~"), ".engram", "venv", "bin", "python3"),
@@ -149,7 +162,7 @@ def precount(db):
     """Structured key-presence. NOT truthiness (eats empty lists, under-counts).
     NOT substring (eats the phrase in prose, over-counts). Both were measured
     wrong today, in opposite directions."""
-    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True); c.row_factory = sqlite3.Row
+    c = sqlite3.connect(Path(db).absolute().as_uri() + "?mode=ro", uri=True); c.row_factory = sqlite3.Row
     nodes, entries, roots, by_op = set(), 0, set(), {"supersede": 0, "retract": 0}
     for r in c.execute("SELECT id, is_current, metadata FROM nodes "
                        "WHERE metadata LIKE '%stale_by%' OR metadata LIKE '%tainted_by%'"):
@@ -192,7 +205,7 @@ def main():
         assert os.path.realpath(copy) != os.path.realpath(LIVE), "refusing to run on the live DB"
 
         exp_nodes, exp_entries, exp_events, by_op = precount(copy)
-        pre = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
+        pre = sqlite3.connect(Path(copy).absolute().as_uri() + "?mode=ro", uri=True)
         had_table = bool(pre.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                                      "AND name='cascade_markers'").fetchone())
         pre.close()

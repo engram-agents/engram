@@ -29,9 +29,9 @@ A FAILED scan is not an envelope state on S1 and S3 (fairy round 1, PR #4533):
   advances its cursor on any 200 carrying a usable ``as_of``, so a degraded
   envelope would move the cursor past baton events that were never read; a
   non-200 leaves the cursor where it was.
-- S2 ``GET /api/board/updates`` keeps the fail-soft it had BEFORE this branch
-  (200 with ``null``/``false``). That exposure predates this work and is not
-  widened here.
+- S2 ``GET /api/board/updates`` kept the fail-soft it had BEFORE this branch
+  (200 with ``null``/``false``) when it merged. #4534 then closed that gap: a
+  failed read is a 503 with no ``as_of``, so a cursor poller never advances.
 
 S4 (``_refuse_existing_id``'s documented fail-open) has no count; its behaviour
 is pinned by C8: ``init`` still succeeds beside a refused entry.
@@ -227,9 +227,9 @@ def test_c2_planted_symlink_is_counted_on_all_four_surfaces(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# C3: S2 keeps the fail-soft it had BEFORE this branch (UNKNOWN, 200)
+# C3: S2 fails LOUD (#4534) -- a 503 with no watermark, no longer a degraded 200
 # ---------------------------------------------------------------------------
-def test_c3_board_updates_keeps_its_pre_existing_fail_soft(tmp_path, monkeypatch):
+def test_c3_board_updates_fails_loud_on_a_failed_scan(tmp_path, monkeypatch):
     store, allocator = _seeded_store(tmp_path)
 
     def boom(*, active_only=True):
@@ -240,12 +240,13 @@ def test_c3_board_updates_keeps_its_pre_existing_fail_soft(tmp_path, monkeypatch
 
     resp = client.get("/api/board/updates")
 
-    assert resp.status_code == 200
+    # `FileStore.read_projects` IS the scan, so the fallback read fails too: nothing
+    # was read, so the answer is an error, and it carries no `as_of` for a poller
+    # to advance its cursor to (#4534).
+    assert resp.status_code == 503
     data = json.loads(resp.data)
-    assert data["refused"] is None       # UNKNOWN, not a clean-store 0
-    assert data["scan_ok"] is False
-    # `FileStore.read_projects` IS the scan, so the fallback read fails too.
-    assert data["updates"] == []
+    assert "scan exploded" in data["error"]
+    assert "as_of" not in data and "updates" not in data
 
 
 # ---------------------------------------------------------------------------
@@ -411,10 +412,9 @@ def test_c7_key_pair_same_types_on_every_surface(tmp_path, monkeypatch):
         raise RuntimeError("scan exploded")
 
     monkeypatch.setattr(store, "scan_projects", boom)
-    # Only the two board JSON routes still return an envelope on a scan failure:
-    # S1 is a 500 (C3b) and S3 raises (C3a).
+    # Only the board JSON route still returns an envelope on a scan failure:
+    # S1 is a 500 (C3b), S3 raises (C3a) and S2 is a 503 (C3, #4534).
     failed = {
-        "S2": json.loads(client.get("/api/board/updates").data),
         "BOARD": json.loads(client.get("/api/board/projects").data),
     }
     for name, data in failed.items():

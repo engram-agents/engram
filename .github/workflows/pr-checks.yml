@@ -35,7 +35,8 @@ name: pr-checks
 #      hooks-stdout-audit below: a gate positioned outside the path where
 #      the decision is made cannot protect the thing it audits.)
 #   9. hooks-stdout-audit         (#2718 — BLOCKING when the diff touches
-#      src/engram/hooks/ or hooks.json, self-skips otherwise; the audit
+#      src/engram/hooks/, hooks.json or the audit's own test file (#2733),
+#      self-skips otherwise; the audit
 #      (tests/test_hooks_json_stdout_audit.py) previously ran ONLY in the
 #      nightly full suite, so a plaintext-stdout regression to a shipped
 #      hook (#2700) went green through pr-checks and broke hours later in
@@ -550,11 +551,11 @@ jobs:
       # (secrets are unavailable in fork contexts); that is exactly why they are
       # red THERE.
       #
-      # NAME_LEAK_ROSTER format: newline-separated regex patterns, applied as-written.
-      # Authors encode their own word boundaries / case handling per pattern.
-      # Example:
-      #   \bAlice Example\b
-      #   \bagentname-nick\b
+      # NAME_LEAK_ROSTER has two shapes, inferred from the roster's own structure:
+      # format 2 is `A<TAB>pattern` per line (class A blocks) or `B<TAB>pattern`
+      # (class B is counted only; permitted by Lei's 2026-08-15 ruling), and a
+      # format-2 class-A pattern must declare a boundary. Format 1 is the legacy
+      # plain-regex form, applied as-written.
       # skipped on merge_group: reads the PR payload, which the queue ref does not carry; the gate already ran on the PR's own head
       - name: name-leak-warn — check for name-leak roster secret
         id: roster-check
@@ -1059,10 +1060,13 @@ jobs:
       # docs/internal/2652-migration-ledger.md lists every `sqlite3.connect(` line in
       # tracked src/engram, one Section-2 row each. Dev PRs do not run the
       # pytest suite, so a test alone would not gate them: this runs the
-      # stdlib-only check directly (git + python, ~0.1s). Three checks: per-file
+      # stdlib-only check directly (git + python, ~0.1s). Four checks: per-file
       # row counts (so line drift from unrelated edits stays green), the
-      # Section-1 state tallies against the Section-2 `state` column, and the
-      # Section-2 citations (function + anchor, verified in the named function).
+      # Section-1 state tallies against the Section-2 `state` column, the
+      # Section-1 direct ceiling (a new plain `direct` row fails until it moves
+      # behind a flag, is classified direct-by-design, or the epic owner raises
+      # the ceiling), and the Section-2 citations (function + anchor, verified
+      # in the named function).
       - name: stdlib-only guards — 2652 migration-ledger completeness
         if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success'
         run: python3 tools/check_2652_ledger.py
@@ -1339,11 +1343,13 @@ jobs:
           # break the audit. --no-renames forces both the old and new path
           # to appear as separate entries so the predicate still matches.
           CHANGED=$(git diff --no-renames --name-only "$BASE_REF...HEAD")
-          if echo "$CHANGED" | grep -qE '^src/engram/hooks/|(^|/)hooks\.json$'; then
-            echo "Diff touches src/engram/hooks/ or hooks.json — audit will run."
+          # #2733: the audit's OWN file is in the predicate too. A PR that weakens,
+          # skip-lists or disables the audit must run it, not skip it.
+          if echo "$CHANGED" | grep -qE '^src/engram/hooks/|(^|/)hooks\.json$|^tests/test_hooks_json_stdout_audit\.py$'; then
+            echo "Diff touches src/engram/hooks/, hooks.json or the audit's own test file — audit will run."
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Diff does not touch src/engram/hooks/ or hooks.json — audit self-skips."
+            echo "Diff does not touch src/engram/hooks/, hooks.json or the audit's own test file — audit self-skips."
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -1525,4 +1531,28 @@ jobs:
       - name: check-stubbed-signatures — run stub-affected tests
         if: (success() || failure()) && steps.stub-check.outputs.has_hits == 'true' && steps.setup-python-stub.outcome == 'success' && steps.install-deps-stub.outcome == 'success'
         run: python3 -m pytest $(cat /tmp/stub_affected_tests.txt) -v --tb=short
+
+      # ── 12. codeowners-gate ─────────────────────────────────────────────
+      # Cheap stdlib+pytest guard on the CODEOWNERS coverage that
+      # .github/CODEOWNERS records for gate machinery. require_code_owner_review
+      # was enabled on the dev-require-PR-approval ruleset on 2026-11-15, so an
+      # approval from a listed owner is now required before a PR touching a
+      # covered path can merge, and this cell is the coverage check behind that
+      # requirement. It fails when the file stops covering every tracked
+      # workflow, or stops covering itself.
+      - name: Set up Python 3.12 (codeowners-gate)
+        id: setup-python-codeowners
+        if: success() || failure()
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: codeowners-gate — install pytest
+        id: install-pytest-codeowners
+        if: success() || failure()
+        run: pip install pytest
+
+      - name: codeowners-gate — run CODEOWNERS coverage guard
+        if: (success() || failure()) && steps.setup-python-codeowners.outcome == 'success' && steps.install-pytest-codeowners.outcome == 'success'
+        run: python3 -m pytest tests/test_codeowners_gate_scope.py -q
 

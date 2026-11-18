@@ -32,7 +32,8 @@
 #                       (no sign, no leading zero). Default: 5002
 #   --admin-user USER   systemd --user account running the service.
 #                       Default: current user ($(whoami))
-#   --group NAME        group that co-admins share (group-writable data).
+#   --group NAME        group that co-admins share (group-READABLE data; no group
+#                       write, #4498/#4499: a hand-off is an owner change, not group write).
 #                       Pass the shared group your forum seats belong to. If
 #                       omitted, the installer REFUSES (exit 2) unless your primary
 #                       group (`id -gn`) is literally `agents` -- it never silently
@@ -82,6 +83,25 @@
 #                       (the map also backs a check that is not a GitHub read).
 #                       Cannot be combined with --github-token-file. `on` is not
 #                       accepted: --github-token-file already means on.
+#   --auth-mode MODE    REQUIRED on every run, no default: `report` or `enforce`. Rendered
+#                       into ExecStart as `--auth-mode MODE`. A run without it refuses
+#                       (exit 2, nothing written), so a re-run can never silently drop the
+#                       mode, the shape #3593 gave the GitHub drop-in. The server itself also
+#                       refuses to start without the flag (exit 78).
+#   --auth-report PATH  with `--auth-mode report` only (required there, refused with
+#                       enforce): absolute path of the report file the server appends one JSON
+#                       line per guarded request to. Letters, digits and / . _ - only.
+#   --auth-report-until TIME
+#                       with `--auth-mode report` only (required there, refused with
+#                       enforce): UTC time like 2026-11-16T00:00:00Z. The installer refuses
+#                       (exit 2, nothing written) a time that is not a real date and time or
+#                       is more than 72 hours from now, because the server would then exit 78
+#                       and the unit would stay down. It also refuses (exit 78, nothing
+#                       written) a time at or before now; the server itself still accepts
+#                       a past time, for a hand-written unit. The server checks it again at start,
+#                       and past it keeps
+#                       serving but logs one loud line per hour and shows
+#                       auth_report_overdue on /health.
 #   --dry-run           print every action without executing (CI-safe)
 #   --no-start          install + enable but don't start
 #
@@ -121,6 +141,9 @@ BATON_MAP=""
 BATON_UIDS=""   # space-separated, validated integers
 GITHUB_TOKEN_FILE=""
 GITHUB_OFF=0     # --github-integration off (#3583)
+AUTH_MODE=""     # --auth-mode: required on every run, no default
+AUTH_REPORT=""   # --auth-report PATH (with report only)
+AUTH_UNTIL=""    # --auth-report-until TIME (with report only)
 SRC=""
 START=1
 DRY_RUN=0
@@ -213,7 +236,7 @@ _refuse_bad_name() {
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port|--admin-user|--group|--host)
+    --port|--admin-user|--group|--host|--auth-mode|--auth-report|--auth-report-until)
       [ $# -ge 2 ] || { echo "ERROR: $1 requires a value. Nothing was written." >&2; exit 2; } ;;
   esac
   case "$1" in
@@ -276,6 +299,32 @@ while [ $# -gt 0 ]; do
         *) echo "ERROR: --github-integration must be 'off' (got '$2')" >&2; exit 2 ;;
       esac
       shift 2 ;;
+    --auth-mode)
+      case "$2" in
+        report|enforce) AUTH_MODE="$2" ;;
+        *) echo "ERROR: --auth-mode must be exactly 'report' or 'enforce' (got '$2'); it has no default. Nothing was written." >&2; exit 2 ;;
+      esac
+      shift 2 ;;
+    --auth-report)
+      AUTH_REPORT="$2"
+      case "$AUTH_REPORT" in
+        /*) ;;
+        *) echo "ERROR: --auth-report must be an absolute path (got '$AUTH_REPORT'). Nothing was written." >&2; exit 2 ;;
+      esac
+      # Not only a path check: the value is substituted into a unit file with sed, so
+      # excluding | & and backslash closes the sed-replacement injection class. Do not widen.
+      case "$AUTH_REPORT" in
+        *[!A-Za-z0-9/._-]*)
+          echo "ERROR: --auth-report may contain only letters, digits and / . _ - (it lands in a unit file); got '$AUTH_REPORT'. Nothing was written." >&2; exit 2 ;;
+      esac
+      shift 2 ;;
+    --auth-report-until)
+      AUTH_UNTIL="$2"
+      case "$AUTH_UNTIL" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+        *) echo "ERROR: --auth-report-until must be a UTC time like 2026-11-16T00:00:00Z (got '$AUTH_UNTIL'). Nothing was written." >&2; exit 2 ;;
+      esac
+      shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
     --no-start)     START=0; shift ;;
     -h|--help)
@@ -336,6 +385,12 @@ fi
 }
 [ -f "$SRC/tools/forum_backup.py" ] || {
   echo "ERROR: $SRC/tools/forum_backup.py not found — the backup units run the snapshot of this script" >&2; exit 2;
+}
+[ -f "$SRC/tools/forum_regen_derived.py" ] || {
+  echo "ERROR: $SRC/tools/forum_regen_derived.py not found — a restore runs the snapshot of this script (#868)" >&2; exit 2;
+}
+[ -f "$SRC/tools/forum_backfill_embeddings.py" ] || {
+  echo "ERROR: $SRC/tools/forum_backfill_embeddings.py not found — the regen tool imports it (#868)" >&2; exit 2;
 }
 if [ "$DRY_RUN" -eq 0 ]; then
   command -v systemctl >/dev/null || {
@@ -694,8 +749,9 @@ _host_is_loopback() {
 if ! _host_is_loopback "$HOST"; then
   _live_tokens="$(python3 -B -c '
 import sqlite3, sys
+from pathlib import Path
 try:
-    c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+    c = sqlite3.connect(Path(sys.argv[1]).absolute().as_uri() + "?mode=ro", uri=True)
     print(c.execute("SELECT COUNT(*) FROM agent_tokens WHERE revoked_at IS NULL").fetchone()[0])
 except Exception:
     print(0)
@@ -707,22 +763,113 @@ except Exception:
   fi
 fi
 
+# --auth-mode is required on every run: with no default here and none in the template, a
+# re-run can never silently change the mode, and the unit always states it. This sits
+# after every other refusal and before the first write. (The server refuses to start
+# without the flag as well, exit 78, for a hand-written or stale unit.)
+if [ -z "$AUTH_MODE" ]; then
+  echo "ERROR: --auth-mode is required on every run: 'report' or 'enforce' (no default). Nothing was written." >&2
+  exit 2
+fi
+if [ "$AUTH_MODE" = "report" ]; then
+  if [ -z "$AUTH_REPORT" ] || [ -z "$AUTH_UNTIL" ]; then
+    echo "ERROR: --auth-mode report requires --auth-report PATH and --auth-report-until TIME. Nothing was written." >&2
+    exit 2
+  fi
+  # The server refuses to start on an impossible date or one more than 72 hours ahead
+  # (exit 78), and the unit's RestartPreventExitStatus=78 would then leave the live forum
+  # down. So refuse here, before any write. python3 is already this installer's own
+  # dependency (the venv step, the loopback probe), and it avoids a GNU-only `date -d`.
+  _until_rc=0
+  python3 -B -c '
+import datetime as d, re, sys
+m = re.fullmatch(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z", sys.argv[1])
+try:
+    t = d.datetime(*map(int, m.groups()))
+except (ValueError, AttributeError):
+    sys.exit(3)
+now = d.datetime.now(d.timezone.utc).replace(tzinfo=None)
+sys.exit(5 if t <= now else 4 if t - now > d.timedelta(hours=72) else 0)
+' "$AUTH_UNTIL" >/dev/null 2>&1 || _until_rc=$?
+  case "$_until_rc" in
+    0) ;;
+    3) echo "ERROR: --auth-report-until must be a real UTC date and time like 2026-11-16T00:00:00Z (got '$AUTH_UNTIL'). Nothing was written." >&2; exit 2 ;;
+    4) echo "ERROR: --auth-report-until '$AUTH_UNTIL' is more than 72 hours from now; the server would refuse to start. Nothing was written." >&2; exit 2 ;;
+    5) echo "ERROR: --auth-report-until '$AUTH_UNTIL' is in the past (at or before now); give a time up to 72 hours ahead. Nothing was written." >&2; exit 78 ;;
+    *) echo "ERROR: could not check --auth-report-until (python3 failed, status $_until_rc). Nothing was written." >&2; exit 2 ;;
+  esac
+else
+  if [ -n "$AUTH_REPORT" ] || [ -n "$AUTH_UNTIL" ]; then
+    echo "ERROR: --auth-report and --auth-report-until are only for --auth-mode report. Nothing was written." >&2
+    exit 2
+  fi
+fi
+
 APP="$SERVICE_DIR/app"
 VENV="$SERVICE_DIR/.venv"
 PYTHON="$VENV/bin/python"
 
-# Group-writable creations so a counterpart admin in $GROUP can also write data.
-RUN umask 002
+# >>> service-modes
+# No group write anywhere under the service dir (#4498/#4499): the group may READ
+# (co-admins), nobody but the owner writes. Admin hand-off is an explicit owner
+# change (a chown, or a fresh install by the new admin), never group write.
+# Three functions so the mode phase can be run on its own against a scratch tree
+# (src/forum/tests/test_installer_modes_4499.py extracts this block).
+_set_service_modes() {
+  RUN umask 022
+  RUN mkdir -p "$SERVICE_DIR"
+  RUN chgrp "$GROUP" "$SERVICE_DIR" 2>/dev/null || true
+  RUN chmod 2755 "$SERVICE_DIR" 2>/dev/null || true   # setgid: new files inherit $GROUP
+}
+
+# Run AFTER everything is written: takes group write off whatever an earlier install
+# (or a UMask=002 unit) left behind, and pins an existing dm/ to 2700 with no ACL.
+# find -H follows only SERVICE_DIR itself when it is a symlink (else find lists nothing and the
+# assertion is vacuous); symlinks inside the tree are still not followed.
+# Symlinks are skipped: a venv's python links always read 777 and chmod would follow them.
+_normalize_service_modes() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  [dry-run] find -H $SERVICE_DIR -xdev ! -type l -exec chmod g-w {} +"
+    echo "  [dry-run] if $SERVICE_DIR/dm exists: setfacl -b, then chmod 2700"
+    return 0
+  fi
+  [ -d "$SERVICE_DIR" ] || return 0
+  # Best effort: a path owned by someone else cannot be changed by this account; the
+  # assertion below names every such path rather than letting it pass.
+  find -H "$SERVICE_DIR" -xdev ! -type l -exec chmod g-w {} + 2>/dev/null || true
+  if [ -d "$SERVICE_DIR/dm" ] && [ ! -L "$SERVICE_DIR/dm" ]; then
+    # setfacl -b alone lands 2750 (measured); the chmod is what pins 2700.
+    if command -v setfacl >/dev/null 2>&1; then setfacl -b "$SERVICE_DIR/dm" 2>/dev/null || true; fi
+    chmod 2700 "$SERVICE_DIR/dm" 2>/dev/null || true
+  fi
+}
+
+# The post-install assertion: nothing but symlinks may carry the group-write bit.
+# Prints every offending path to stderr and returns 2. Also fails when find itself
+# could not finish (an uninspected subtree is not a clean one).
+_assert_no_group_write() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  [dry-run] assert: find -H $SERVICE_DIR -xdev -perm -g+w ! -type l lists nothing"
+    return 0
+  fi
+  local _bad="" _rc=0
+  _bad="$(find -H "$SERVICE_DIR" -xdev -perm -g+w ! -type l 2>/dev/null)" || _rc=$?
+  if [ -n "$_bad" ] || [ "$_rc" -ne 0 ]; then
+    echo "ERROR: path(s) under $SERVICE_DIR carry the group-write bit after install (#4499):" >&2
+    [ -z "$_bad" ] || printf '  %s\n' "$_bad" >&2
+    [ "$_rc" -eq 0 ] || echo "  (find exited $_rc: part of the tree could not be inspected)" >&2
+    return 2
+  fi
+}
+# <<< service-modes
 
 echo "==> Forum service dir: $SERVICE_DIR (port $PORT, group $GROUP); admin: $ADMIN_USER"
-RUN mkdir -p "$SERVICE_DIR"
-RUN chgrp "$GROUP" "$SERVICE_DIR" 2>/dev/null || true
-RUN chmod 2775 "$SERVICE_DIR" 2>/dev/null || true   # setgid: new files inherit $GROUP
+_set_service_modes
 
 if [ "$DRY_RUN" -eq 0 ]; then
   # Verify the group AND the setgid bit actually took.
   ACT_GRP="$(stat -c '%G' "$SERVICE_DIR" 2>/dev/null || echo '?')"
-  [ "$ACT_GRP" = "$GROUP" ] || echo "    WARN: $SERVICE_DIR group is '$ACT_GRP', not '$GROUP' — a counterpart admin may not be able to write."
+  [ "$ACT_GRP" = "$GROUP" ] || echo "    WARN: $SERVICE_DIR group is '$ACT_GRP', not '$GROUP' — a counterpart admin may not be able to read."
   find "$SERVICE_DIR" -maxdepth 0 -perm -2000 >/dev/null 2>&1 || echo "    WARN: setgid bit not set on $SERVICE_DIR — new files won't inherit group '$GROUP'."
 fi
 
@@ -785,6 +932,19 @@ else
   cp -L "$SRC/tools/forum_backup.py" "$APP/tools/forum_backup.py"
 fi
 
+# The restore tools (#868). The backup dump has no search index and no embeddings,
+# so a restore runs forum_regen_derived.py (which imports forum_backfill_embeddings.py
+# from its own directory and the forum package from $APP/forum). Same rule as the
+# backup tool: run the snapshot, never a checkout.
+for _regen_tool in forum_regen_derived.py forum_backfill_embeddings.py; do
+  echo "==> Snapshotting restore tool → $APP/tools/$_regen_tool"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  [dry-run] cp -L $SRC/tools/$_regen_tool → $APP/tools/$_regen_tool (resolves any symlink)"
+  else
+    cp -L "$SRC/tools/$_regen_tool" "$APP/tools/$_regen_tool"
+  fi
+done
+
 # Build the venv ONLY if it isn't already a working one.
 if [ "$DRY_RUN" -eq 0 ] && [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import flask" 2>/dev/null; then
   echo "==> Reusing existing venv → $VENV ($("$VENV/bin/python" -c 'import flask;print("flask",flask.__version__)'))"
@@ -809,6 +969,11 @@ if [ -n "$BATON_MAP" ]; then
   for _u in $BATON_UIDS; do
     BATON_ARGS="$BATON_ARGS \\"$'\n'"    --baton-login-map-admin-uid $_u"
   done
+fi
+# The auth flags (one ExecStart continuation line): only what the operator passed.
+AUTH_ARGS="--auth-mode $AUTH_MODE"
+if [ "$AUTH_MODE" = "report" ]; then
+  AUTH_ARGS="$AUTH_ARGS --auth-report $AUTH_REPORT --auth-report-until $AUTH_UNTIL"
 fi
 _TOKEN_PLACEHOLDER='@@GITHUB_TOKEN_ENVFILE_LINE@@'
 _PLACEHOLDER='{{BATON_LOGIN_MAP_ARGS}}'
@@ -851,6 +1016,7 @@ _fill_token_placeholder() {
 RENDERED="$(sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$SRC/src/forum/deploy/engram-forum.service.template" \
     | sed "s|{{FORUM_HOME}}|$SERVICE_DIR|g" \
     | sed "s|{{HOST}}|$HOST|g" \
+    | sed "s|{{AUTH_MODE_ARGS}}|$AUTH_ARGS|g" \
     | sed "s|--port 5002|--port $PORT|" \
     | sed "s|Flask, port 5002|Flask, port $PORT|" \
     | _fill_baton_placeholder \
@@ -1228,9 +1394,13 @@ echo "    Other seats on THIS host:       python3 $_FU_TOOL_Q http://localhost:$
 echo "    Seats on ANOTHER host (LAN):    python3 $_FU_TOOL_Q http://<this-host-address>:$PORT"
 # <<< forum-url-step
 
+echo "==> Checking that no path under $SERVICE_DIR carries the group-write bit"
+_normalize_service_modes
+_assert_no_group_write || exit 2
+
 echo "==> Done."
 echo "    Manage: systemctl --user {status,restart,stop} $UNIT  ·  Logs: journalctl --user -u $UNIT -f"
-echo "    Shared data: $SERVICE_DIR/forum.db (group $GROUP, group-writable)"
+echo "    Shared data: $SERVICE_DIR/forum.db (group $GROUP, group-readable; only the owner writes)"
 if [ "$DRY_RUN" -eq 0 ] && [ "$LINGER_OK" -eq 0 ]; then
   echo "    REMAINING STEP for reboot-survival (one-time, needs sudo):  sudo loginctl enable-linger $ADMIN_USER"
 fi

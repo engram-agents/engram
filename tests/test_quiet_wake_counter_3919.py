@@ -612,7 +612,7 @@ def test_round1_common_read_only_commands_are_accepted(hook, cmd):
 
 HELPER_CALLS = [
     # the REAL forms from a live seat's transcript (a quoted path is what the loop skill's snippet produces)
-    'python3 "/Users/engram-sonnet/.engram/marketplace/plugins/engram/tools/loop_prompt.py" --rearm-delay --wake-kind other',
+    'python3 "/Users/someone/.engram/marketplace/plugins/engram/tools/loop_prompt.py" --rearm-delay --wake-kind other',
     "python3 /Users/x/.engram/marketplace/plugins/engram/tools/loop_prompt.py --rearm-delay --wake-kind heartbeat",
     "python3 loop_prompt.py --rearm-delay --wake-kind other",
     "delay=$(python3 ~/.engram/marketplace/plugins/engram/tools/loop_prompt.py --rearm-delay --wake-kind other)",

@@ -380,11 +380,34 @@ def _dump_to_sql(snap_path: str, keep_derived: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
+BACKUP_FILE_MODE = 0o640
+
+
+def _write_private_tmp(tmp: Path, content: str) -> None:
+    """Write *tmp* at its FINAL mode, 0640 (#4499 B1), before the caller renames it.
+
+    The mode is set on the open fd before any data is written, so the file never holds
+    content at a wider mode, and the rename (``os.replace``) then publishes a file that
+    is already right: a chmod after the rename would leave a window on the new inode.
+    ``fchmod`` also covers a stale temp left by a killed run (``O_CREAT`` keeps its mode).
+    A refused chmod raises; the caller's ``except`` removes the temp.
+    """
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, BACKUP_FILE_MODE)
+    try:
+        os.fchmod(fd, BACKUP_FILE_MODE)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1  # fdopen owns it now
+            fh.write(content)
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
 def _write_atomic(content: str, dest: Path) -> None:
     """Write *content* to *dest* atomically (tmp -> os.replace)."""
     tmp = dest.with_suffix(".tmp")
     try:
-        tmp.write_text(content, encoding="utf-8")
+        _write_private_tmp(tmp, content)
         os.replace(str(tmp), str(dest))
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -469,7 +492,7 @@ def _write_success_stamp(backup_dir: Path, committed: bool) -> None:
     dest = backup_dir / STAMP_NAME
     tmp = backup_dir / (STAMP_NAME + ".tmp")
     try:
-        tmp.write_text(json.dumps(stamp), encoding="utf-8")
+        _write_private_tmp(tmp, json.dumps(stamp))
         os.replace(str(tmp), str(dest))
     except Exception:
         tmp.unlink(missing_ok=True)

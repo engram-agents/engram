@@ -68,7 +68,7 @@ class TestPlistTemplate:
         # convention as the launch-script path, not a real path.
         text = PLIST.read_text(encoding="utf-8")
         assert "__HOME__" in text
-        assert "/Users/engram-sonnet" not in text
+        assert not re.search(r"/Users/[A-Za-z]", text)
 
 
 class TestLaunchQuietSkip:
@@ -537,7 +537,7 @@ class TestCredentialProbePlistTemplate:
         assert "__CLIO_ACCOUNT__" in text
         assert "__CREDENTIAL_PROBE_SH__" in text
         assert "__HOME__" in text
-        assert "/Users/engram-sonnet" not in text
+        assert not re.search(r"/Users/[A-Za-z]", text)
 
     def test_username_field_is_the_account_placeholder_not_a_literal_username(self) -> None:
         # The UserName key specifically must carry the placeholder, not a

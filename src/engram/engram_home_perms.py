@@ -27,7 +27,7 @@ Rules, per path, never following a symlink (a symlink is skipped, its target nev
     (listed in `errors` as "hard-linked, skipped"), so nothing outside the tree changes mode.
   * `home` itself and the data directories in `DATA_DIRS` (`diary`, `sessions`, `compact`,
     `history`, `health-snapshots`, `session-logs-archive`, `claude-projects-archive`,
-    `db-backup`, `evidence-archive`, `logs`, `telemetry`, `session-start-overflow`,
+    `transcript-archive`, `db-backup`, `evidence-archive`, `logs`, `telemetry`, `session-start-overflow`,
     `tripwire-overflow`; recursively): directories and regular files lose group and
     other bits (`mode & ~0o077`: 0644 becomes 0600, an owner-executable 0755 becomes 0700).
   * Regular files directly inside `home` (not recursive): the same file rule. This
@@ -63,8 +63,8 @@ from dataclasses import dataclass, field
 # creates it. Code and git objects (.git, marketplace, venv, tools) are NEVER_TOUCH.
 DATA_DIRS = (
     "diary", "sessions", "compact", "history", "health-snapshots",
-    "session-logs-archive", "claude-projects-archive", "db-backup", "evidence-archive",
-    "logs", "telemetry", "session-start-overflow", "tripwire-overflow",
+    "session-logs-archive", "claude-projects-archive", "transcript-archive", "db-backup",
+    "evidence-archive", "logs", "telemetry", "session-start-overflow", "tripwire-overflow",
 )
 NEVER_TOUCH = (".git", "marketplace", "venv", "tools")
 _ACL_ACCESS = "system.posix_acl_access"

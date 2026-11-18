@@ -601,6 +601,19 @@ class TestRead:
         assert "Reply number 1" not in stdout
         assert "Initial post body" not in stdout
 
+    def test_last_n_header_counts_whole_thread_and_labels_by_position(self, wired_cli):
+        """#2480: 5-post thread, --last 2 -> header total 5 (showing 2),
+        blocks labelled reply 3 and reply 4 (not OP / reply 1)."""
+        tid = self._make_thread(wired_cli)
+        for i in range(4):
+            with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+                wired_cli(["reply", str(tid)], stdin_text=f"Reply number {i}.")
+        stdout, stderr, code = wired_cli(["read", str(tid), "--last", "2"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "5 posts (showing 2)" in stdout
+        assert "[reply 3]" in stdout and "[reply 4]" in stdout
+        assert "[OP]" not in stdout and "[reply 1]" not in stdout
+
 
 @SKIP_INTEGRATION
 class TestStatus:
@@ -1800,6 +1813,69 @@ class TestRenderThreadHumanPostCount:
         out = capsys.readouterr().out
         header = "\n".join(out.splitlines()[:5])
         assert "29 posts" in header, header
+
+    # -- #2480: header counts the whole thread; labels follow thread position --
+
+    @staticmethod
+    def _posts(n):
+        return [
+            {"id": 100 + i, "author": {"name": "alice"}, "body_md": f"body {i}"}
+            for i in range(1, n + 1)
+        ]
+
+    @staticmethod
+    def _blocks(out):
+        """Parse the rendered text: list of (label, id) from each block line."""
+        import re
+        return re.findall(r"^--- \[([^\]]+)\] #(\d+) ", out, flags=re.MULTILINE)
+
+    @staticmethod
+    def _header_count(out):
+        import re
+        m = re.search(r"\|  (\d+) posts?(?: \(showing (\d+)\))?  \|", out)
+        assert m, out
+        return int(m.group(1)), (int(m.group(2)) if m.group(2) else None)
+
+    @pytest.mark.parametrize("n", [1, 2, 5, 12])
+    def test_unnarrowed_header_count_equals_blocks_and_labels_in_order(self, capsys, n):
+        forum_cli._render_thread_human(self._thread(), self._posts(n))
+        out = capsys.readouterr().out
+        blocks = self._blocks(out)
+        count, showing = self._header_count(out)
+        assert showing is None
+        assert count == len(blocks) == n
+        assert [b[0] for b in blocks] == ["OP"] + [f"reply {i}" for i in range(1, n)]
+
+    def test_narrowed_last_two_of_five(self, capsys):
+        allp = self._posts(5)
+        forum_cli._render_thread_human(self._thread(), allp[-2:], all_posts=allp)
+        out = capsys.readouterr().out
+        assert "5 posts (showing 2)" in out
+        assert self._blocks(out) == [("reply 3", "104"), ("reply 4", "105")]
+
+    def test_narrowed_new_style_subset_last_three_of_five(self, capsys):
+        allp = self._posts(5)
+        forum_cli._render_thread_human(self._thread(), allp[-3:], all_posts=allp)
+        out = capsys.readouterr().out
+        assert "5 posts (showing 3)" in out
+        assert self._blocks(out) == [
+            ("reply 2", "103"), ("reply 3", "104"), ("reply 4", "105")
+        ]
+
+    def test_single_post_not_narrowed(self, capsys):
+        allp = self._posts(1)
+        forum_cli._render_thread_human(self._thread(), allp, all_posts=allp)
+        out = capsys.readouterr().out
+        assert self._header_count(out) == (1, None)
+        assert "1 posts" not in out
+        assert self._blocks(out) == [("OP", "101")]
+
+    def test_post_id_missing_from_all_posts_falls_back_to_position_in_posts(self, capsys):
+        allp = self._posts(3)
+        stray = [{"id": 999, "author": {"name": "bob"}, "body_md": "x"}]
+        forum_cli._render_thread_human(self._thread(), stray, all_posts=allp)
+        out = capsys.readouterr().out
+        assert self._blocks(out) == [("OP", "999")]
 
 
 # ---------------------------------------------------------------------------

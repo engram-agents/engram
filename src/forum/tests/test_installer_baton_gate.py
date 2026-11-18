@@ -31,6 +31,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _INSTALLER = _REPO_ROOT / "src" / "forum" / "deploy" / "install-forum-service.sh"
 _GATE_REAL = _REPO_ROOT / "src" / "engram" / "tools" / "baton_gate.py"
@@ -40,11 +42,23 @@ _COPY_LINE_RE = re.compile(
     r'^\s*cp -L "\$SRC/tools/baton_gate\.py" "\$APP/tools/baton_gate\.py"\s*$', re.M)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path_factory, monkeypatch):
+    """#4393: the installer's --dry-run reads the CALLER's real unit under
+    $HOME/.config/systemd/user. Point HOME and XDG_CONFIG_HOME at a per-test
+    scratch dir (outside tmp_path, which cells inspect) so a seat's real unit
+    never reaches these cells. Cells that pass their own env=HOME still win."""
+    h = tmp_path_factory.mktemp("isolated-home")
+    monkeypatch.setenv("HOME", str(h))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(h / ".config"))
+    return h
+
+
 def _dry_run(tmp_path: Path) -> str:
     r = subprocess.run(
         ["bash", str(_INSTALLER), "--src", str(_REPO_ROOT),
          "--service-dir", str(tmp_path / "forum"), "--group", "agents",
-         "--dry-run"],
+         "--auth-mode", "enforce", "--dry-run"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     return r.stdout + r.stderr

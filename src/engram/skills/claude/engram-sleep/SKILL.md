@@ -11,7 +11,7 @@ description: Use at the natural end-of-day moment when wrapping work. Single end
 
 Confirm ONE of the following is true before proceeding — each is sufficient on its own:
 
-(a) **User end-of-day phrase** — the user just said something like "good night", "call it a day", "wrap up the day", "done for today", "ending for tonight", or similar explicit day-close signal.  
+(a) **User end-of-day phrase** — the user just said something like "good night", "call it a day", "wrap up the day", "done for today", "ending for tonight", or similar explicit day-close signal. It must be said in a turn that is not a loop-wake: a turn whose prompt starts with the `<loop-wake>` marker is never path (a), even if it contains such a phrase.  
 (b) **Commander-relayed sleep order** (Lei's ruling, 2026-08-30) — the acting commander broadcast or sent a wind-down/sleep order that **states the user's authority** (e.g. "Lei orders this broadcast: … run engram-sleep as your last action") — via a Square broadcast, an Office crossing, or an `ia` letter. Cite that crossing/letter as your instruction and run engram-sleep to completion. **Do NOT wait for the human's direct per-seat word after a relayed order — that waiting is the measured failure mode (2026-08-25: every seat reported and then held awake all night), not the safe default.** A relay that does not state the user's authority is the commander's suggestion, not an order — ask or hold.  
 (c) **Auto-sleep cron** — the configured `sleep_hour`/`sleep_minute` cron fired; you see an explicit sleep nudge from the end-of-day-detector hook in your current context.
 
@@ -281,7 +281,7 @@ Run the worktree garbage-collector once per day to remove worktrees whose PRs ha
 "$HOME/.engram/venv/bin/python3" tools/worktree-gc.py --apply
 ```
 
-Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), and never touches the main checkout. Dry-run mode (`"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py` without `--apply`) is available if you want to preview the plan first. Idempotent — a second run on a clean state is a no-op.
+Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), keeps the worktree the deploy record names as the upgrade source (`deployed_from`), and never touches the main checkout. Dry-run mode (`"$HOME/.engram/venv/bin/python3" tools/worktree-gc.py` without `--apply`) is available if you want to preview the plan first. Idempotent — a second run on a clean state is a no-op.
 
 Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present (pre-T2 install or worktree GC not yet shipped).
 
@@ -509,6 +509,23 @@ Binary copies that git already tracks (`backups/**`, `db-backup/**`, `*.db.*`, `
 
 **Never `git commit --amend`, `git reset`, or `git rebase` inside `${ENGRAM_HOME:-$HOME/.engram}/`** (engram-alpha#4205): the worker pushes each snapshot commit, so a rewrite diverges the remote for good. Make a new commit instead — e.g. the finalized dream record after `engram_advance_turn` is committed as `git commit -m "dream <date>: record finalized"`, never an amend. An installed `reference-transaction` hook refuses a rewrite of a pushed commit.
 
+**Snapshot commit backlog (#4843).** Right after the backup, run the reader (stdlib only; the venv python like the steps above) and put its result in the summary:
+
+```bash
+snap_line=$("$HOME/.engram/venv/bin/python3" "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/engram_snapshot_backlog.py"); snap_rc=$?
+case "$snap_rc:$snap_line" in
+  0:*) snap_status="none pending" ;;
+  [12]:?*) snap_status="$snap_line" ;;
+  *) snap_status="unknown (reader exit $snap_rc, no line)" ;;
+esac
+```
+
+```
+- snapshot commits: ${snap_status}
+```
+
+Exit 0 means none pending; exit 1 or 2 means the printed line is the warning. An empty line with a non-zero exit, or any other exit code, is a crashed reader and reads as `unknown`, never as none pending. Non-blocking, like the backup.
+
 ### Step 4.6 — Back up main session logs (skip subagents/)
 
 Run the session-log backup tool and **capture the result for the sleep summary**.
@@ -579,6 +596,51 @@ fi
 **Skip if source directory is absent** (tool exits 0 with "0 copied" automatically).
 
 **Deduplication**: uncompressed — skips if size AND mtime match (within 1s); compressed (`--compress`) — skips if mtime matches (within 1s, size not compared since .gz wraps vary). Re-copies if the relevant check fails.
+
+---
+
+### Step 4.8 — Archive the day's transcripts (compressed, kept forever)
+
+Run the transcript archive tool and **capture the result for the sleep summary**. It
+archives every `.jsonl` transcript under `~/.claude/projects/` (subagent transcripts
+included) into `${ENGRAM_HOME:-$HOME/.engram}/transcript-archive/`: one xz-compressed file
+per run, holding only the bytes written since the last run (a per-file byte watermark, no
+timestamps). A run with nothing new writes no file.
+
+```bash
+transcript_archive_out=$("$HOME/.engram/venv/bin/python3" \
+    "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/archive_transcripts.py" \
+    2>&1)
+transcript_archive_rc=$?
+if [ $transcript_archive_rc -eq 0 ]; then
+    transcript_archive_status="✓ transcript archive OK: $transcript_archive_out"
+else
+    transcript_archive_status="⚠ transcript archive FAILED: $transcript_archive_out"
+fi
+```
+
+**This step has no off switch, no `--retain`, and it never deletes anything**: archives are
+kept forever, and sleep runs it every night. (Steps 4.6 and 4.7 are the older copies; a
+later change retires the 4.7 mirror.)
+
+**Non-blocking for sleep**: a failure does not abort sleep (the transcripts still exist in
+`~/.claude/projects/`), but it is **loud**: surface the status line in the history milestone
+(Step 4) so a recurring failure is visible, not silent. Two kinds. A **per-file problem**
+(a transcript shrank below its archived size, or a file name cannot be stored in the archive)
+is reported with the path and the numbers while **every other transcript is still archived**;
+the run exits 2. What you do next: look at the named file. The watermark is kept, and the file
+is archived again once the source grows past it. A **run failure** (an unreadable archive, or a
+file that came back short while being read) writes nothing and names the path.
+
+```
+- transcript archive: $transcript_archive_status
+```
+
+**Skip if the source directory is absent** (the tool exits 0 with a `0 new bytes` summary).
+
+**Replay** (to restore or to check): `archive_transcripts.py --replay <empty dir>` rebuilds
+every archived transcript there, byte for byte. Raw transcripts stay on this machine: the
+archive folder is git-ignored and owner-only, and only `.jsonl` files are covered.
 
 ---
 

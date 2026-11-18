@@ -50,8 +50,8 @@ SKIP_ROOTS = (".git", "marketplace", "venv", "tools")
 # was dropped: no shipped code creates it.
 DATA_DIRS = (
     "diary", "sessions", "compact", "history", "health-snapshots",
-    "session-logs-archive", "claude-projects-archive", "db-backup", "evidence-archive",
-    "logs", "telemetry", "session-start-overflow", "tripwire-overflow",
+    "session-logs-archive", "claude-projects-archive", "transcript-archive", "db-backup",
+    "evidence-archive", "logs", "telemetry", "session-start-overflow", "tripwire-overflow",
 )
 
 
@@ -183,7 +183,9 @@ def test_c1d_atomic_write_leaves_no_temp_sibling(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     names = {p.name for p in (tmp_path / ".claude").iterdir()}
     stray = [n for n in names if n != "settings.json" and "settings" in n]
-    assert not stray, stray
+    # The merge (MERGE class) takes ONE stamped backup of the file before changing it; nothing else.
+    assert len(stray) == 1 and ".engram-backup." in stray[0], stray
+    assert (tmp_path / ".claude" / stray[0]).read_bytes() == b'{"model": "x"}\n'
     assert not [n for n in names if "tmp" in n.lower() or n.endswith(".partial")]
 
 
@@ -460,8 +462,8 @@ def test_c3_data_dirs_set_is_pinned():
 
 
 @pytest.mark.parametrize("name", [
-    "session-logs-archive", "claude-projects-archive", "db-backup", "evidence-archive",
-    "logs", "telemetry", "session-start-overflow", "tripwire-overflow",
+    "session-logs-archive", "claude-projects-archive", "transcript-archive", "db-backup",
+    "evidence-archive", "logs", "telemetry", "session-start-overflow", "tripwire-overflow",
 ])
 def test_c3_archive_dir_with_nested_content_fully_tightened(tmp_path, name):
     home = tmp_path / "h"
@@ -976,6 +978,72 @@ def test_c3_directory_is_never_widened(tmp_path):
         os.chmod(ro, 0o700)
 
 
+def test_c3_non_oserror_mid_walk_is_one_unexpected_entry_and_never_raises(tmp_path, monkeypatch):
+    # engram-agents/engram#4485: pins the outer `except Exception` of tighten_data_home. The
+    # inner handlers catch OSError only, so a NON-OSError from os.lstat on one child reaches
+    # the outer handler: one `unexpected:` entry, `changed` as it stood, the walk aborted.
+    home = tmp_path / "h"
+    old = os.umask(0)
+    try:
+        home.mkdir()
+        os.chmod(home, 0o755)
+        (home / "diary").mkdir()
+        os.chmod(home / "diary", 0o755)
+        for n in ("a.txt", "b.txt", "c.txt"):  # walked in this (sorted) order; b.txt fails
+            (home / "diary" / n).write_text("x")
+            os.chmod(home / "diary" / n, 0o644)
+    finally:
+        os.umask(old)
+    failing = os.path.join(os.path.realpath(home), "diary", "b.txt")
+    real_lstat = os.lstat
+
+    def fake_lstat(p, *a, **k):
+        if isinstance(p, (str, os.PathLike)) and os.fspath(p) == failing:
+            raise RuntimeError("injected")
+        return real_lstat(p, *a, **k)
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    res = _perms().tighten_data_home(home)  # nothing may escape
+    monkeypatch.undo()
+    assert len(res.errors) == 1, res.errors
+    assert res.errors[0].startswith("unexpected: RuntimeError"), res.errors
+    # Tightened before the failure: the root, diary, then diary/a.txt (b.txt never completed).
+    assert res.changed == [".", "diary", "diary/a.txt"], res.changed
+    assert stat.S_IMODE(os.stat(home / "diary" / "a.txt").st_mode) == 0o600
+    # The failing child and the one after it were not reached: modes unchanged.
+    assert stat.S_IMODE(os.stat(home / "diary" / "b.txt").st_mode) == 0o644
+    assert stat.S_IMODE(os.stat(home / "diary" / "c.txt").st_mode) == 0o644
+
+
+def test_c3_outer_except_lets_interrupt_out(tmp_path, monkeypatch):
+    # The OTHER half of the same line as the cell above: `except Exception` is chosen
+    # because it does NOT catch BaseException. An interrupt is the operator's control
+    # signal, not a data anomaly -- it must reach the caller, never become an entry.
+    # (Cell supplied by the security seat's read of engram-agents/engram#4761.)
+    home = tmp_path / "h"
+    old = os.umask(0)
+    try:
+        home.mkdir()
+        os.chmod(home, 0o755)
+        (home / "diary").mkdir()
+        os.chmod(home / "diary", 0o755)
+        (home / "diary" / "b.txt").write_text("x")
+        os.chmod(home / "diary" / "b.txt", 0o644)
+    finally:
+        os.umask(old)
+    failing = os.path.join(os.path.realpath(home), "diary", "b.txt")
+    real_lstat = os.lstat
+
+    def fake_lstat(p, *a, **k):
+        if isinstance(p, (str, os.PathLike)) and os.fspath(p) == failing:
+            raise KeyboardInterrupt("injected")
+        return real_lstat(p, *a, **k)
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    with pytest.raises(KeyboardInterrupt):
+        _perms().tighten_data_home(home)
+
+
 def test_c3_hard_linked_file_is_skipped_and_outside_mode_kept(tmp_path):
     home = tmp_path / "h"
     _loose_tree(home)
@@ -1000,15 +1068,27 @@ def test_c6_merge_keeps_non_ascii_literal_utf8(tmp_path):
 
 
 def test_c6_final_write_oserror_is_refused_with_install_otherwise_complete(tmp_path):
+    """The settings.json write is the guard's in-place rewrite; fail it part-way. The guard puts
+    the old bytes back in the same file (its mtime moves: it was written twice) and says so; the
+    step adds that the rest of the install is complete."""
     p = _seed_settings(tmp_path, b'{"model": "x"}\n')
-    before = _snap(p)
+    before_bytes, before_mode, before_ino = p.read_bytes(), stat.S_IMODE(p.stat().st_mode), p.stat().st_ino
     code = (
         "import sys, importlib.util\n"
         f"sys.argv = [{str(BOOTSTRAP)!r}, '--retention-days', '90']\n"
         f"spec = importlib.util.spec_from_file_location('bootstrap_4445w', {str(BOOTSTRAP)!r})\n"
         "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
-        "def boom(*a, **k): raise OSError(28, 'No space left on device')\n"
-        "m._atomic_write_text = boom\n"
+        # The settings.json write happens inside the guard's merge, in place; fail its first
+        # write part-way (half the bytes, then a full disk). The put-back that follows succeeds.
+        "import os\n"
+        "real = m.fg._write_all\n"
+        "calls = []\n"
+        "def boom(fd, data):\n"
+        "    calls.append(1)\n"
+        "    if len(calls) == 1:\n"
+        "        os.write(fd, data[: len(data) // 2]); raise OSError(28, 'No space left on device')\n"
+        "    return real(fd, data)\n"
+        "m.fg._write_all = boom\n"
         "m.main()\n"
     )
     env = os.environ.copy()
@@ -1017,8 +1097,9 @@ def test_c6_final_write_oserror_is_refused_with_install_otherwise_complete(tmp_p
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
     out = r.stdout + r.stderr
     assert r.returncode != 0, out
-    assert "REFUSED" in out and "otherwise complete" in out and "No space left" in out
-    assert _snap(p) == before
+    assert "REFUSED" in out and "otherwise complete" in out and "No space left" in out and "put back" in out
+    assert p.read_bytes() == before_bytes and stat.S_IMODE(p.stat().st_mode) == before_mode
+    assert p.stat().st_ino == before_ino
     assert (tmp_path / ".engram" / "knowledge.db").exists()
 
 
@@ -1061,14 +1142,17 @@ def test_c3_directory_loses_exactly_group_and_other_bits(tmp_path, mode, want):
 
 
 def test_c6_lone_surrogate_in_settings_is_refused_not_a_traceback(tmp_path):
+    """Content that cannot be encoded is refused before the file is opened or backed up: bytes,
+    mode, mtime and inode all unchanged, and no stamped backup."""
     p = _seed_settings(tmp_path, b'{"note": "\\ud800"}\n')
-    before = _snap(p)
+    before, before_ino = _snap(p), p.stat().st_ino
     r = _run(tmp_path, ["--retention-days", "90"])
     out = r.stdout + r.stderr
     assert r.returncode != 0, out
     assert "Traceback" not in out, out
     assert "REFUSED" in out and "otherwise complete" in out
-    assert _snap(p) == before
+    assert _snap(p) == before and p.stat().st_ino == before_ino
+    assert list(p.parent.glob("settings.json.engram-backup.*")) == []
     assert (tmp_path / ".engram" / "knowledge.db").exists()
 
 

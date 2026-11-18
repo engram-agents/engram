@@ -497,7 +497,8 @@
         "tests/test_inspect_raw_owner_2652.py",
         "tests/test_anchoring_report_owner_3881.py",
         "tests/test_tools_engram_home_3863.py",
-        "tests/test_store_path_precheck_3960.py"
+        "tests/test_store_path_precheck_3960.py",
+        "tests/test_owner_path_too_long_4868.py"
       ],
       "note": "engram-alpha#3862, #3872, #3879, #2652 (tools-7). The shared owner-read helper for tools/: the tools that use it load by path (spec_from_file_location) in their cells, so the layer-1 import graph does not see it; a change here must rerun every consumer's cells."
     },
@@ -710,6 +711,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/rotate_roster_format.py",
+      "test_globs": [
+        "tests/test_rotate_roster_format.py"
+      ],
+      "note": "One-time format-1 -> format-2 roster migration helper the roster holder runs on their own machine. The test runs the file as a subprocess and loads it by path (spec_from_file_location), invisible to the layer-1 import graph; it also loads src/engram/tools/scan-leaks.py by path as the parser whose behaviour it pins."
+    },
+    {
       "path_prefix_or_glob": "tools/os-harness-check.py",
       "test_globs": [
         "tests/test_os_harness_check.py"
@@ -819,7 +827,22 @@
     {
       "path_prefix_or_glob": "tools/install-local-marketplace.sh",
       "test_globs": [
-        "tests/test_install_local_marketplace.py"
+        "tests/test_install_local_marketplace.py",
+        "tests/test_claude_config_diff_4628.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/claude_config_diff.py",
+      "test_globs": [
+        "tests/test_claude_config_diff_4628.py"
+      ],
+      "note": "engram#4628: the before/after report of what the marketplace add changed in the user's Claude files. The test runs it as a subprocess and drives the installer with a stub claude, invisible to the layer-1 import graph."
+    },
+    {
+      "path_prefix_or_glob": "tools/store_read.py",
+      "test_globs": [
+        "tests/test_store_read_2652_unit02.py",
+        "tests/test_owner_path_too_long_4868.py"
       ]
     },
     {
@@ -827,7 +850,8 @@
       "test_globs": [
         "tests/test_install_selfcheck.py",
         "tests/test_install_selfcheck_owner_read_4118.py",
-        "tests/test_install_selfcheck_stat_4299.py"
+        "tests/test_install_selfcheck_stat_4299.py",
+        "tests/test_owner_path_too_long_4868.py"
       ]
     },
     {
@@ -854,9 +878,11 @@
       "test_globs": [
         "tests/test_forum_mention_monitor_coalesce.py",
         "tests/test_forum_monitor_malformed_200.py",
-        "tests/test_shell_engram_home_3863.py"
+        "tests/test_shell_engram_home_3863.py",
+        "tests/test_forum_monitor_duplicate_warn.py",
+        "tests/test_pgrep_liveness_reap_patterns.py"
       ],
-      "note": "Both spawn the real script as a subprocess against a mock HTTP server. test_forum_mention_monitor_coalesce.py covers the cross-cycle coalesce window (#1616); test_forum_monitor_malformed_200.py covers ids()'s reported-vs-failed-to-report boundary and the seed/poll seen-set guards (#2225). engram-alpha#3863 PR 3b adds test_shell_engram_home_3863.py: the monitor is run against a scratch config under a custom ENGRAM_HOME (and under the default) with a stub curl, to show which config.json it read."
+      "note": "The first two spawn the real script as a subprocess against a mock HTTP server. test_forum_mention_monitor_coalesce.py covers the cross-cycle coalesce window (#1616); test_forum_monitor_malformed_200.py covers ids()'s reported-vs-failed-to-report boundary and the seed/poll seen-set guards (#2225). engram-alpha#3863 PR 3b adds test_shell_engram_home_3863.py: the monitor is run against a scratch config under a custom ENGRAM_HOME (and under the default) with a stub curl, to show which config.json it read. For the mention monitor, test_forum_monitor_duplicate_warn.py spawns the real script to check the duplicate-instance warn-not-kill behavior (#1933), and test_pgrep_liveness_reap_patterns.py does not spawn it: it models the script's pgrep candidate pattern in pure Python against a synthetic process table (TestForumMentionMonitorCandidatePattern)."
     },
     {
       "path_prefix_or_glob": "tools/forum-updates-monitor.sh",
@@ -1069,6 +1095,13 @@
         "tests/test_health_engine_fresh_server_order.py"
       ],
       "note": "engram-alpha#2609: carries the identical health.* sys.modules-clearing fresh_server() pattern as test_health_engine_checkpoint_wiring.py -- the same ordering regression class applies to this file too."
+    },
+    {
+      "path_prefix_or_glob": "tools/archive_transcripts.py",
+      "test_globs": [
+        "tests/test_archive_transcripts_4647.py"
+      ],
+      "note": "engram-alpha#4647 part 2: tests/test_archive_transcripts_4647.py loads the tool by path (spec_from_file_location), so the import graph cannot see it; the same file also pins the sleep skill's Step 4.8 text."
     },
     {
       "path_prefix_or_glob": "tools/backup_claude_projects.py",

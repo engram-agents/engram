@@ -46,7 +46,8 @@ owner down, refusing or answering malformed the entry RAISES ``StudyQueueOwnerRe
 never an empty queue, never a direct fallback.  This module has no ``connect`` call of its
 own.  The CLI prints the queue and exits 0, or prints NOTHING on stdout, one
 ``<ClassName>: <message>`` line on stderr, and exits 1.  An empty queue is a valid answer
-(exit 0).
+(exit 0).  A pre-3.10 interpreter with no usable venv interpreter is refused BEFORE any
+work (the interpreter guard below): one line on stderr, exit 3.
 
 Every statement is a module-level literal (the read-template scanner resolves literals, not
 f-strings); they are registered byte for byte in src/engram/engramd_read_templates.json
@@ -56,14 +57,87 @@ tests/test_engramd_read_scan.py.
 
 from __future__ import annotations
 
-import argparse
-import importlib.util
-import json
 import os
-import re
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Interpreter guard (#4642).
+#
+# A stock macOS `python3` is 3.9.6, and the sibling load below
+# (weakest_load_bearing -> engram_core) evaluates `str | Path` at module scope, which
+# raises TypeError on 3.10-.  So the decision is made BEFORE any import that can pull
+# in engram_core -- only os/sys are imported above this point.  It either re-execs
+# under the plugin venv interpreter or exits 3 with one line and does nothing at all.
+#
+# The venv is an INSTALLATION ARTIFACT at ~/.engram/venv, independent of ENGRAM_HOME
+# (CLAUDE.md "Infrastructure Locations"; install.sh VENV_DIR="$HOME/.engram/venv";
+# README-AGENT.md "must still end up at ~/.engram/venv").  Building it from
+# engram_home() would be wrong on a seat whose ENGRAM_HOME is elsewhere AND is its own
+# violation class in tools/home_path_gate.py ('engram_home_derived_venv', #3863 6c).
+# ---------------------------------------------------------------------------
+
+def _reexec_plan(version_info: tuple[int, ...],
+                 venv_python: str,
+                 executable: str | None = None,
+                 already_reexeced: bool = False) -> tuple[str, str | None]:
+    """('run', None) to continue in-process; ('exec', path) to re-exec;
+       ('fail', message) when a re-exec is needed and impossible.
+
+    `executable` is the running interpreter (default: sys.executable), a parameter so
+    the realpath comparison is testable without touching the process.  `already_reexeced`
+    is the loop sentinel: a re-exec has already been attempted and the interpreter is
+    STILL too old (a wrapper script that re-execs an under-powered python, or a venv
+    that is itself <3.10) — that is "needed and impossible", never "not needed".
+
+    Three distinct states, never a boolean: "not needed" and "needed but impossible"
+    are different outcomes and the second says so, in one line, and exits 3."""
+    if executable is None:
+        executable = sys.executable
+    if version_info >= (3, 10):
+        return ("run", None)
+    version = ".".join(str(part) for part in version_info[:3])
+    if already_reexeced:
+        return ("fail",
+                f"study_queue: this python is {version} (needs 3.10+); a re-exec under "
+                f"{venv_python} did not reach a 3.10+ interpreter — run the installer "
+                f"with a 3.10+ python3")
+    if executable and os.path.realpath(venv_python) == os.path.realpath(executable):
+        return ("run", None)  # never loop: the venv interpreter IS this process
+    if not (os.path.isfile(venv_python) and os.access(venv_python, os.X_OK)):
+        return ("fail",
+                f"study_queue: this python is {version} (needs 3.10+); the venv interpreter "
+                f"{venv_python} is missing or not executable — run the installer")
+    return ("exec", venv_python)
+
+
+if sys.version_info < (3, 10):
+    _VENV_PYTHON = os.path.expanduser("~/.engram/venv/bin/python3")
+    _action, _detail = _reexec_plan(
+        tuple(sys.version_info[:3]), _VENV_PYTHON,
+        already_reexeced=bool(os.environ.get("ENGRAM_STUDY_QUEUE_REEXEC")))
+    if _action == "exec":
+        # Loop sentinel, set immediately before the exec: a wrapper script whose
+        # realpath never equals the child's sys.executable, or a venv that is itself
+        # <3.10, would otherwise retry forever or fall through to the raw TypeError.
+        os.environ["ENGRAM_STUDY_QUEUE_REEXEC"] = "1"
+        try:
+            os.execv(_detail, [_detail, __file__, *sys.argv[1:]])
+        except OSError as _exc:  # the plan said usable; a race is still one line, never a traceback
+            sys.stderr.write(
+                "study_queue: could not re-exec under %s (%s); this python is %s (needs 3.10+)\n"
+                % (_detail, _exc, ".".join(str(p) for p in sys.version_info[:3])))
+            sys.exit(3)
+    elif _action == "fail":
+        sys.stderr.write(_detail + "\n")
+        sys.exit(3)
+
+
+import argparse  # noqa: E402
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+import re  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Locate SSoT modules -- support both "run as module" and direct invocation
@@ -520,7 +594,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="study_queue.py",
         description="This seat's top study targets: one id or file reference, why, and one method each. "
                     "Read-only. The queue on stdout and exit 0, or NOTHING on stdout and exit 1 with the "
-                    "error class on stderr.",
+                    "error class on stderr. A pre-3.10 interpreter with no usable venv refuses before "
+                    "any work: one stderr line, exit 3.",
     )
     ap.add_argument("--n", type=_positive_int, default=3, help="how many targets, at least 1 (default 3)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")

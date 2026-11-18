@@ -384,10 +384,14 @@ def store_pack(packs_dir: Path, pack_id: str, tarball_path: Path) -> Path:
     Returns the pack directory path.
     """
     pack_dir = packs_dir / pack_id
-    pack_dir.mkdir(parents=True, exist_ok=True)
+    # #4499: packs are content meant to be READ, never written by group or other. An
+    # explicit mode on the dir (an existing dir is left as it is), and copyfile + chmod
+    # in place of copy2, which would carry the upload's own mode (0664 under a lax umask).
+    pack_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
 
     dest = pack_dir / "package.tar.gz"
-    shutil.copy2(str(tarball_path), str(dest))
+    shutil.copyfile(str(tarball_path), str(dest))
+    os.chmod(dest, 0o644)
 
     return pack_dir
 
@@ -414,7 +418,9 @@ def write_pack_meta(
         "node_count": node_count,
         "edge_count": edge_count,
     }
-    (pack_dir / "meta.json").write_text(
+    meta_path = pack_dir / "meta.json"
+    meta_path.write_text(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    os.chmod(meta_path, 0o644)  # #4499: readable, never group- or other-writable

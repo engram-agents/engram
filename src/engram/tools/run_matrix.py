@@ -46,6 +46,7 @@ from pathlib import Path
 REPO_ROOT_DEFAULT = str(Path(__file__).resolve().parents[3])
 IMAGE_TAG_PREFIX = "engram-test"
 STAMP_LABEL = "engram.test.stamp"
+EMITTER_EXIT_FULL_TRIGGER = 7  # run_touched_tests.EXIT_FULL_TRIGGER
 
 
 # ---------------------------------------------------------------------------
@@ -113,11 +114,30 @@ def _envs_by_name() -> dict[str, EnvSpec]:
 # ---------------------------------------------------------------------------
 # Selection — compose run_touched_tests.py --json (once, on the host)
 # ---------------------------------------------------------------------------
+class FullTriggerStop(RuntimeError):
+    """The selector exited 7: a full-suite trigger changed, and no --full was given.
+
+    The whole suite is not a per-PR run (PR-MERGE-POLICY, merge-seat test rules
+    item 1); --full is the one explicit way to run it. Carries the trigger
+    reasons so the message names every triggering file.
+    """
+
+    def __init__(self, reasons: list[str]):
+        self.reasons = list(reasons)
+        super().__init__(
+            "full-suite trigger: no environment was run. Triggers: "
+            + "; ".join(self.reasons)
+            + ". Pass --full to run the whole suite."
+        )
+
+
 def compute_selection(base: str, full: bool, repo_root: str,
                       runner=subprocess.run) -> dict:
     """Run `run_touched_tests.py --json` on the host and return the parsed dict.
 
-    Raises RuntimeError if the emitter fails or emits non-JSON — we never scrape
+    Raises FullTriggerStop (a RuntimeError) when the emitter exits 7 with a
+    full:true JSON object (a full-suite trigger without --full). Raises
+    RuntimeError if the emitter fails or emits non-JSON — we never scrape
     prose, and a corrupt selection must fail loudly rather than silently run the
     wrong suite.
     """
@@ -126,6 +146,13 @@ def compute_selection(base: str, full: bool, repo_root: str,
     if full:
         cmd.append("--full")
     proc = runner(cmd, capture_output=True, text=True)
+    if proc.returncode == EMITTER_EXIT_FULL_TRIGGER:
+        try:
+            body = json.loads((proc.stdout or "").strip())
+        except json.JSONDecodeError:
+            body = None
+        if isinstance(body, dict) and body.get("full") is True:
+            raise FullTriggerStop([str(r) for r in body.get("full_reasons") or []])
     if proc.returncode != 0:
         raise RuntimeError(
             f"selection emitter exited {proc.returncode}: {proc.stderr.strip()}"

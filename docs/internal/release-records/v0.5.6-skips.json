@@ -1,0 +1,634 @@
+{
+ "release": "v0.5.6",
+ "commit": "f2234796329ae9cfc48c31de6011dda5e715df2a",
+ "interpreter": "Python 3.12.3 (venv)",
+ "platform": "Linux 6.6.87.2-microsoft-standard-WSL2 x86_64",
+ "run": "full-20261110T161005Z",
+ "reason_source": "skip set from the recorded whole run of v0.5.6 (2026-11-10, 5 shards, the tests.yml knobs); reasons from a re-run of exactly those 471 ids at the same commit on 2026-11-12, all 471 skipped again",
+ "collected": 38143,
+ "counts": {
+  "passed": 37672,
+  "failed": 0,
+  "skipped": 471,
+  "xfail": 0,
+  "xpass": 0,
+  "error": 0
+ },
+ "skipped_total": 471,
+ "skipped_without_reason": 0,
+ "skipped_by_reason": {
+  "/bin/bash is not bash 3.x here (the macOS system bash); the 3.2-compat cell is meaningful only where /bin/bash is 3.x": [
+   "tests/test_clear_stale_daemon_3493.py::test_T10_runs_under_bin_bash_3"
+  ],
+  "/run/user/<uid> exists on this host, so the 'missing' branch of the default base cannot be reached": [
+   "tests/test_agentctl_claude_scope_4435.py::test_se_exec_xdg_unset_default_base_missing_names_run_user_uid"
+  ],
+  "Darwin ECONNREFUSED semantics; real-Mac cells only": [
+   "tests/test_engramd_client_darwin_refused_3707.py::test_a_live_owner_with_full_backlog_is_busy_or_stuck",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_b2_stale_socket_and_no_pidfile_is_down",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_b_dead_owner_with_stale_socket_is_down",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_c_live_owner_with_closed_listener_is_busy_or_stuck",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_d_reused_pid_is_down",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_e_darwin_gate_follows_the_platform_arm",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_f_never_called_on_enoent",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_f_never_called_on_enotsock",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_f_never_called_on_timeout",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_h_unknown_pidfile_location_is_busy_or_stuck_without_a_pid",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_j_sigstopped_live_owner_never_reads_down",
+   "tests/test_engramd_client_darwin_refused_3707.py::test_n_refused_stale_socket_under_run_with_another_name_is_busy_or_stuck_without_pid"
+  ],
+  "Darwin arm of the owner permission layer (#3666): needs a real Mac": [
+   "tests/test_engramd_owner_darwin_3666.py::test_a_hung_strip_refuses_with_a_named_reason",
+   "tests/test_engramd_owner_darwin_3666.py::test_a_real_mac_with_every_prerequisite_is_supported",
+   "tests/test_engramd_owner_darwin_3666.py::test_darwin_socket_path_limit_is_the_measured_103",
+   "tests/test_engramd_owner_darwin_3666.py::test_full_backlog_connect_reads_as_unavailable_with_a_reason",
+   "tests/test_engramd_owner_darwin_3666.py::test_home_outside_the_tcc_folders_starts",
+   "tests/test_engramd_owner_darwin_3666.py::test_home_under_a_tcc_folder_refuses_without_creating_anything[Desktop]",
+   "tests/test_engramd_owner_darwin_3666.py::test_home_under_a_tcc_folder_refuses_without_creating_anything[Documents]",
+   "tests/test_engramd_owner_darwin_3666.py::test_home_under_a_tcc_folder_refuses_without_creating_anything[Downloads]",
+   "tests/test_engramd_owner_darwin_3666.py::test_nonzero_chmod_exit_refuses_like_the_linux_setfacl_failure",
+   "tests/test_engramd_owner_darwin_3666.py::test_owner_starts_on_this_mac_serves_ping_and_stop_cleans_up",
+   "tests/test_engramd_owner_darwin_3666.py::test_peercred_correct_call_and_same_uid_accepts",
+   "tests/test_engramd_owner_darwin_3666.py::test_peercred_overlong_buffer_refuses",
+   "tests/test_engramd_owner_darwin_3666.py::test_peercred_real_socket_wrong_level_is_four_bytes_and_refused",
+   "tests/test_engramd_owner_darwin_3666.py::test_peercred_short_buffer_refuses_rather_than_reading_uid_0",
+   "tests/test_engramd_owner_darwin_3666.py::test_peercred_uid_mismatch_is_rejected_peer_identity",
+   "tests/test_engramd_owner_darwin_3666.py::test_peercred_uid_zero_is_never_accepted",
+   "tests/test_engramd_owner_darwin_3666.py::test_peercred_wrong_cr_version_refuses",
+   "tests/test_engramd_owner_darwin_3666.py::test_peercred_wrong_level_never_yields_an_accept",
+   "tests/test_engramd_owner_darwin_3666.py::test_readback_refuses_on_an_acl_get_errno_other_than_enoent",
+   "tests/test_engramd_owner_darwin_3666.py::test_readback_refuses_when_libc_cannot_be_loaded",
+   "tests/test_engramd_owner_darwin_3666.py::test_readback_refuses_when_the_acl_cannot_be_rendered_and_frees_it",
+   "tests/test_engramd_owner_darwin_3666.py::test_readback_refuses_when_the_strip_leaves_an_entry",
+   "tests/test_engramd_owner_darwin_3666.py::test_refusal_and_marker_agree_when_each_prerequisite_is_missing[/bin/chmod]",
+   "tests/test_engramd_owner_darwin_3666.py::test_refusal_and_marker_agree_when_each_prerequisite_is_missing[/dev/fd]",
+   "tests/test_engramd_owner_darwin_3666.py::test_refusal_and_marker_agree_when_each_prerequisite_is_missing[LOCAL_PEERCRED]",
+   "tests/test_engramd_owner_darwin_3666.py::test_run_dir_is_0700_with_no_acl_under_an_inheriting_parent",
+   "tests/test_engramd_owner_darwin_3666.py::test_strip_acts_on_the_fd_target_not_the_path",
+   "tests/test_engramd_owner_darwin_3666.py::test_strip_refuses_if_the_mode_is_widened",
+   "tests/test_engramd_owner_darwin_3666.py::test_strip_uses_bin_chmod_by_absolute_path_never_path",
+   "tests/test_engramd_owner_darwin_3666.py::test_tcc_prefix_match_is_case_insensitive_like_the_default_volume",
+   "tests/test_engramd_owner_darwin_3666.py::test_the_shared_marker_reads_the_same_function",
+   "tests/test_engramd_owner_darwin_3666.py::test_xucred_layout_is_76_bytes_native_aligned"
+  ],
+  "Darwin pid-identity arm (libproc / KERN_PROCARGS2); real-Mac cells only": [
+   "tests/test_engram_pidfile_darwin_3714.py::test_a_reused_pid_reads_dead",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[-0]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[-1]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[-2]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[-3]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[-4]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[-5]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[-6]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[-7]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[abcdefghij-0]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[abcdefghij-1]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[abcdefghij-2]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[abcdefghij-3]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[abcdefghij-4]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[abcdefghij-5]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[abcdefghij-6]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[abcdefghij-7]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[x-0]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[x-1]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[x-2]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[x-3]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[x-4]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[x-5]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[x-6]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_exact_across_exec_path_alignments[x-7]",
+   "tests/test_engram_pidfile_darwin_3714.py::test_argv_reader_returns_real_argv",
+   "tests/test_engram_pidfile_darwin_3714.py::test_b_live_writer_reads_alive",
+   "tests/test_engram_pidfile_darwin_3714.py::test_c_dead_pid_reads_dead",
+   "tests/test_engram_pidfile_darwin_3714.py::test_ctypes_signatures_are_declared",
+   "tests/test_engram_pidfile_darwin_3714.py::test_d_start_time_matches_ps_lstart",
+   "tests/test_engram_pidfile_darwin_3714.py::test_e_esrch_after_successful_kill_reads_dead",
+   "tests/test_engram_pidfile_darwin_3714.py::test_empty_argv0_is_unreadable_not_parsed",
+   "tests/test_engram_pidfile_darwin_3714.py::test_empty_entry_in_the_middle_still_parses_exactly",
+   "tests/test_engram_pidfile_darwin_3714.py::test_eperm_zero_bytes_does_not_warn_or_burn_the_slot",
+   "tests/test_engram_pidfile_darwin_3714.py::test_f2_real_pid1_argv_is_unreadable",
+   "tests/test_engram_pidfile_darwin_3714.py::test_f_cross_uid_argv_einval_reads_alive",
+   "tests/test_engram_pidfile_darwin_3714.py::test_g2_pid_mismatch_is_not_parsed",
+   "tests/test_engram_pidfile_darwin_3714.py::test_g_size_mismatch_is_conservative_alive_never_parsed",
+   "tests/test_engram_pidfile_darwin_3714.py::test_h_marker_in_argv_reads_alive",
+   "tests/test_engram_pidfile_darwin_3714.py::test_inconsistent_padding_is_unreadable",
+   "tests/test_engram_pidfile_darwin_3714.py::test_negative_argc_is_unreadable",
+   "tests/test_engram_pidfile_darwin_3714.py::test_reuse_shaped_child_with_empty_argv0_reads_alive",
+   "tests/test_engram_pidfile_darwin_3714.py::test_short_argv_is_unreadable",
+   "tests/test_engram_pidfile_darwin_3714.py::test_wellformed_synthetic_buffer_parses",
+   "tests/test_engram_pidfile_darwin_3714.py::test_wider_padding_than_measured_is_unreadable"
+  ],
+  "HEAD is already contained in origin/dev: no change to compare": [
+   "tests/test_principle_trigger_state_unknown_3521.py::test_s9_healthy_path_byte_identical_to_merge_base[absent]",
+   "tests/test_principle_trigger_state_unknown_3521.py::test_s9_healthy_path_byte_identical_to_merge_base[valid_dict]",
+   "tests/test_principle_trigger_state_writers_3521.py::TestCoreUnknown::test_c2_healthy_state_is_byte_identical_to_merge_base[absent]",
+   "tests/test_principle_trigger_state_writers_3521.py::TestCoreUnknown::test_c2_healthy_state_is_byte_identical_to_merge_base[valid_dict]",
+   "tests/test_principle_trigger_state_writers_3521.py::TestUtilityUnknown::test_u2_healthy_state_is_byte_identical_to_merge_base[absent]",
+   "tests/test_principle_trigger_state_writers_3521.py::TestUtilityUnknown::test_u2_healthy_state_is_byte_identical_to_merge_base[valid_dict]"
+  ],
+  "HEAD is already contained in origin/dev: nothing to compare against": [
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[hooklib_focused_ids-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[hooklib_focused_ids-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[hooklib_focused_ids-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[hooklib_focused_ids-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_embedding_restore_flag-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_embedding_restore_flag-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_embedding_restore_flag-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_embedding_restore_flag-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_focus_block-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_focus_block-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_focus_block-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_focus_block-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_saved_focus_sets_block-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_saved_focus_sets_block-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_saved_focus_sets_block-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_saved_focus_sets_block-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_session_checkpoint_block-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_session_checkpoint_block-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_session_checkpoint_block-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[sessionstart_session_checkpoint_block-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[stop_maturity_muted-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[stop_maturity_muted-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[stop_maturity_muted-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[stop_maturity_muted-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_check_db_liveness-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_check_db_liveness-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_check_db_liveness-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_check_db_liveness-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_check_embedding_restore_flag-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_check_embedding_restore_flag-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_check_embedding_restore_flag-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_check_embedding_restore_flag-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_dormant_focus_set_candidates-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_dormant_focus_set_candidates-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_dormant_focus_set_candidates-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_dormant_focus_set_candidates-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_main_idf_gate-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_main_idf_gate-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_main_idf_gate-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_main_idf_gate-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_query_attached_packs-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_query_attached_packs-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_query_attached_packs-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_query_attached_packs-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_render_triggered_principles_section-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_render_triggered_principles_section-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_render_triggered_principles_section-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[surface_render_triggered_principles_section-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_in_turn_recall-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_in_turn_recall-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_in_turn_recall-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_in_turn_recall-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_load_prevention_lessons-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_load_prevention_lessons-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_load_prevention_lessons-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_load_prevention_lessons-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_load_tripwires-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_load_tripwires-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_load_tripwires-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_load_tripwires-regular]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_render_triggered_principles-dangling]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_render_triggered_principles-missing]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_render_triggered_principles-regular000]",
+   "tests/test_hooks_sqlite_regular_3628s2d.py::test_regular_file_parity_with_dev[tripwire_render_triggered_principles-regular]"
+  ],
+  "HEAD is already in origin/dev: nothing to compare against": [
+   "tests/test_utility_state_lock_3658.py::test_L6_healthy_path_final_bytes_match_merge_base[absent]",
+   "tests/test_utility_state_lock_3658.py::test_L6_healthy_path_final_bytes_match_merge_base[dict]"
+  ],
+  "NAME_LEAK_ROSTER not set \u2014 real-name hygiene not checked": [
+   "tests/test_name_leak_warn.py::test_tool_file_no_real_names",
+   "tests/test_name_leak_warn.py::test_workflow_file_no_real_names"
+  ],
+  "OPT-IN seat cell, not run by default: set ENGRAM_OWNER_BACKOFF_LIVE=1 on a Linux seat with a `systemd --user` bus. It creates REAL transient units and cannot tear them down (`systemctl --user stop|reset-failed` -> exit 99), and the suite-wide #3519 guard (repo-root conftest.py, keyed on the tool CLASS since #3837) shims `systemd-run` itself -- it refuses everything but --help/--version -- so a default pytest run can neither create the unit nor clear it up. Reaching the real service manager inside the suite is what #3519 and the #3663 file's own discipline both forbid. This skip launched nothing.": [
+   "tests/test_owner_unit_backoff_3831.py::test_c2_a_crash_loop_never_reaches_failed_and_the_backoff_is_real",
+   "tests/test_owner_unit_backoff_3831.py::test_c2_control_the_old_five_in_three_hundred_policy_caps_and_ends"
+  ],
+  "SKILL.md retired in #1149 \u2014 moved to docs/internal/archive/SKILL.md, no longer shipped. Tool documentation now lives in MCP tool docstrings and the engram-* skills.": [
+   "tests/test_skill_server_sync.py::test_allowlist_entries_have_reasons",
+   "tests/test_skill_server_sync.py::test_no_phantom_tools_in_full_prose",
+   "tests/test_skill_server_sync.py::test_no_phantom_tools_in_skill_md",
+   "tests/test_skill_server_sync.py::test_skill_md_documents_every_server_tool"
+  ],
+  "SQLite < 3.46.0: PRAGMA optimize has no temporary analysis limit (bit 0x10), so it never writes sampled statistics (3.46.0 release note; measured 3.45.1)": [
+   "tests/test_planner_stats_2732.py::test_s9_large_growth_then_nap_keeps_is_current_stats_full"
+  ],
+  "SQLite < 3.46.0: PRAGMA optimize has no temporary analysis limit, so a new index does not get the table re-analyzed with sampled statistics (3.46.0 release note)": [
+   "tests/test_planner_stats_2732.py::test_s1_new_index_then_nap_keeps_is_current_stats_full"
+  ],
+  "a NUL byte cannot be passed in argv; covered by the function cell": [
+   "tests/test_set_forum_url_3557.py::TestS1UrlValidity::test_bad_url_cli_exit_2['http://h:5002\\\\x00']"
+  ],
+  "bc845fac is not available in this clone": [
+   "tests/test_surface_owner_read_3821.py::test_c6_a_healthy_fire_makes_one_call_fewer_than_the_pre_amendment_build"
+  ],
+  "claude IS on PATH in this environment -- covered by the zero-match test instead": [
+   "tests/test_agentctl_mac.py::test_attach_claude_not_on_path_errors"
+  ],
+  "could not import 'metricgate': No module named 'metricgate'": [
+   "tests/test_a6_attempts_ledger_metricgate.py::test_a_timeout_then_six_clean_runs_keeps_the_verdict_and_shows_one_tagged_line",
+   "tests/test_a6_attempts_ledger_metricgate.py::test_non_violation_attempts_leave_the_verdict_and_add_one_tagged_line_each",
+   "tests/test_a6_metricgate_emitter_metricgate.py::test_gate_with_the_library_present_prints_the_report_under_its_heading",
+   "tests/test_metricgate_adapter.py::test_appended_records_are_readable_by_the_library",
+   "tests/test_metricgate_adapter.py::test_have_metricgate_is_true_when_the_library_imports",
+   "tests/test_metricgate_adapter.py::test_judge_cell_on_a_real_gate_without_n_planned_is_a_value_error",
+   "tests/test_metricgate_adapter.py::test_judge_cell_returns_the_verdict_name_and_the_markdown_table[1.0-PASS]",
+   "tests/test_metricgate_adapter.py::test_judge_cell_returns_the_verdict_name_and_the_markdown_table[1.5-BLOCK]",
+   "tests/test_metricgate_adapter.py::test_require_metricgate_returns_the_module_when_present",
+   "tests/test_metricgate_gate_files.py::test_the_library_accepts_the_committed_file_as_a_spec[session-start]",
+   "tests/test_metricgate_gate_files.py::test_the_library_accepts_the_committed_file_as_a_spec[stop]",
+   "tests/test_metricgate_gate_files.py::test_the_library_accepts_the_committed_file_as_a_spec[surface]",
+   "tests/test_metricgate_gate_files.py::test_the_library_accepts_the_committed_file_as_a_spec[tripwire]",
+   "tests/test_metricgate_gate_files.py::test_the_library_accepts_the_committed_file_as_a_spec[user-identity]"
+  ],
+  "covered by test_d_client_non_dict_config_file": [
+   "tests/test_cli_forum_gate_3552.py::test_a_gate_total_over_non_dict_config[client-bool]",
+   "tests/test_cli_forum_gate_3552.py::test_a_gate_total_over_non_dict_config[client-float]",
+   "tests/test_cli_forum_gate_3552.py::test_a_gate_total_over_non_dict_config[client-int]",
+   "tests/test_cli_forum_gate_3552.py::test_a_gate_total_over_non_dict_config[client-list-empty]",
+   "tests/test_cli_forum_gate_3552.py::test_a_gate_total_over_non_dict_config[client-list]",
+   "tests/test_cli_forum_gate_3552.py::test_a_gate_total_over_non_dict_config[client-str]"
+  ],
+  "cross-uid control needs passwordless sudo: `sudo -n true` failed (exit 1) -- runs on GitHub runners, skips on agent seats (#3197)": [
+   "tests/test_engramd_owner.py::test_peer_uid_mismatch_is_rejected"
+  ],
+  "de_DE.UTF-8 not installed on this host": [
+   "tests/test_forum_monitor_curl_rc.py::test_time_formats_as_dot_decimal_under_buggy_bash[mention-forum-mention-monitor.sh-{\"mentions\": []}]",
+   "tests/test_forum_monitor_curl_rc.py::test_time_formats_as_dot_decimal_under_buggy_bash[updates-forum-updates-monitor.sh-{\"updates\": [], \"as_of\": 7095}]",
+   "tests/test_forum_monitor_curl_rc.py::test_time_formats_under_comma_decimal_locale[mention-forum-mention-monitor.sh-{\"mentions\": []}]",
+   "tests/test_forum_monitor_curl_rc.py::test_time_formats_under_comma_decimal_locale[updates-forum-updates-monitor.sh-{\"updates\": [], \"as_of\": 7095}]"
+  ],
+  "dev already carries the visible import failure": [
+   "tests/test_prompthooklib_import_visible_3521.py::test_forum_broken_lib_is_silent_at_dev",
+   "tests/test_prompthooklib_import_visible_3521.py::test_other_broken_lib_is_silent_at_dev[engram-baton-prompt-hook.py-UCS unreachable]",
+   "tests/test_prompthooklib_import_visible_3521.py::test_other_broken_lib_is_silent_at_dev[engram-inter-agent-prompt-hook.py-DM unread check unavailable]"
+  ],
+  "documentation-only placeholder; run by hand, see comment above": [
+   "tests/test_recall_harness.py::test_mutation_control_placeholder"
+  ],
+  "engram-pkg init templates shell out to sqlite3 CLI (#799); skip until pure-Python port": [
+   "tests/test_engram_pkg_json_payload.py::test_add_evidence_json_payload",
+   "tests/test_engram_pkg_json_payload.py::test_add_evidence_stdin_payload",
+   "tests/test_engram_pkg_json_payload.py::test_add_observation_flags_still_work",
+   "tests/test_engram_pkg_json_payload.py::test_add_observation_json_payload",
+   "tests/test_engram_pkg_json_payload.py::test_derive_json_payload",
+   "tests/test_engram_pkg_json_payload.py::test_flags_still_work",
+   "tests/test_engram_pkg_json_payload.py::test_json_payload_missing_required_field",
+   "tests/test_engram_pkg_json_payload.py::test_supersede_json_payload"
+  ],
+  "engram_add_observation has no context_ids parameter \u2014 the tool's schema does not include a context citation field. Wiring not possible without a schema addition. Tracked in issue #915.": [
+   "tests/test_utility_use_sites_expansion.py::test_engram_add_observation_bumps_context_ids"
+  ],
+  "engram_add_observation_batch has no context_ids parameter \u2014 same as engram_add_observation. Wiring not possible without a schema addition. Tracked in issue #915.": [
+   "tests/test_utility_use_sites_expansion.py::test_engram_add_observation_batch_bumps_context_ids_per_record"
+  ],
+  "got empty parameter set for (label, text)": [
+   "tests/test_bootstrap_privacy_4445.py::test_getfacl_parse_real_fixture_texts[NOTSET]"
+  ],
+  "host has /proc; the lsof branch is only reached without it": [
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c3b_lsof_rc0_no_pid_live_decoy_holder_is_kept",
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c3b_lsof_rc0_no_pid_orphan_socket_is_kept",
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c5_i_lsof_rc1_empty_stdout_with_stderr_live_holder_is_kept",
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c5_ii_lsof_blind_rc1_empty_both_live_holder_is_kept",
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c5_iii_lsof_rc1_empty_both_genuine_orphan_is_kept_and_daemon_launched",
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c5_iv_lsof_rc0_with_an_unmatched_holder_still_refuses_and_does_not_launch",
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c6_iv_killed_pid_that_ignores_sigterm_is_still_a_live_holder",
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c6_v_killed_pid_that_exits_is_exempt_and_socket_removed",
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c8b_ps_huge_holder_command_is_capped_and_restore_text_survives",
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c8b_ps_multiline_holder_command_is_one_log_line"
+  ],
+  "host has /proc; this cell is the no-/proc-no-lsof case": [
+   "tests/test_socket_ownership_guard.py::TestSocketGuardPortableContract::test_c3_no_proc_and_no_lsof_refuses_fail_closed"
+  ],
+  "macOS only: /bin/bash is 3.2 there": [
+   "tests/test_seat_run_tool.py::test_runs_under_bash_3_2_on_a_mac"
+  ],
+  "needs a CUDA device and the cached embedder model; runs on the GPU host": [
+   "tests/test_3898_embedding_device.py::test_c8_cpu_cuda_vector_parity"
+  ],
+  "needs a Mac seat; no macOS runners in CI": [
+   "tests/test_pidfile_fifo_tools_3773.py::test_darwin_supervisor_start_refuses_a_real_socket_file",
+   "tests/test_regular_io_pidfile_write_3773.py::test_darwin_socket_file_open_gives_eopnotsupp_and_is_refused"
+  ],
+  "needs a REAL systemd --user / launchd gui domain; set ENGRAM_REAL_SERVICE_MANAGER_4305=1 (the parent runs these; they register a keyed job for a TEMP home and remove it)": [
+   "tests/test_surface_label_keyed_4305.py::test_Sa_deleted_home_no_restart_loop",
+   "tests/test_surface_label_keyed_4305.py::test_Sb_home_present_sigkill_is_restarted"
+  ],
+  "needs root: a real directory owned by another uid can only be made with chown, which an unprivileged account cannot do; the unit cell above covers the logic (as #3791's j5/j6 do)": [
+   "tests/test_store_maint_lock_3882.py::test_c4_real_directory_owned_by_another_uid_is_refused"
+  ],
+  "needs root: a real directory owned by another uid can only be made with chown, which an unprivileged account cannot do; the unit-level cell j5 covers the logic": [
+   "tests/test_3767_setup_lock_contract.py::test_j6_real_directory_owned_by_another_uid_is_refused"
+  ],
+  "no brew bash (/opt/homebrew/bin/bash, /usr/local/bin/bash)": [
+   "tests/test_owner_launchd_3709.py::test_a1_hook_finds_its_plugin_root_and_python_with_utf8_paths_byte_exact[brew-bash-path-fallback]",
+   "tests/test_owner_launchd_3709.py::test_a1_hook_finds_its_plugin_root_and_python_with_utf8_paths_byte_exact[brew-bash-venv]",
+   "tests/test_owner_launchd_3709.py::test_a2_daemon_real_keeps_a_utf8_install_path_exact[brew-bash-plain]",
+   "tests/test_owner_launchd_3709.py::test_a2_daemon_real_keeps_a_utf8_install_path_exact[brew-bash-symlink-chain]",
+   "tests/test_owner_launchd_3709.py::test_a3_a_name_the_function_cannot_assign_is_never_silently_dropped[helper-physical-path-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_a_name_the_function_cannot_assign_is_never_silently_dropped[hook-physical-dir-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_a_name_the_function_cannot_assign_is_never_silently_dropped[hook-pinned-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_a_name_the_function_cannot_assign_is_never_silently_dropped[installer-physical-dir-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_a_name_the_function_cannot_assign_is_never_silently_dropped[installer-physical-path-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_a_name_the_function_cannot_assign_is_never_silently_dropped[installer-pinned-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_control_the_names_the_callers_really_pass_still_work[helper-physical-path-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_control_the_names_the_callers_really_pass_still_work[hook-physical-dir-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_control_the_names_the_callers_really_pass_still_work[hook-pinned-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_control_the_names_the_callers_really_pass_still_work[installer-physical-dir-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_control_the_names_the_callers_really_pass_still_work[installer-physical-path-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_control_the_names_the_callers_really_pass_still_work[installer-pinned-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_pinned_into_returns_the_commands_rc_and_assigns_its_value[0-hook-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_pinned_into_returns_the_commands_rc_and_assigns_its_value[0-installer-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_pinned_into_returns_the_commands_rc_and_assigns_its_value[3-hook-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_pinned_into_returns_the_commands_rc_and_assigns_its_value[3-installer-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_the_functions_own_local_names_are_refused_with_one_stderr_line[helper-physical-path-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_the_functions_own_local_names_are_refused_with_one_stderr_line[hook-physical-dir-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_the_functions_own_local_names_are_refused_with_one_stderr_line[hook-pinned-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_the_functions_own_local_names_are_refused_with_one_stderr_line[installer-physical-dir-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_the_functions_own_local_names_are_refused_with_one_stderr_line[installer-physical-path-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a3_the_functions_own_local_names_are_refused_with_one_stderr_line[installer-pinned-into-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_a4_owner_plist_content_is_byte_exact_with_utf8_home_plugin_and_python_paths[brew-bash-path-fallback]",
+   "tests/test_owner_launchd_3709.py::test_a4_owner_plist_content_is_byte_exact_with_utf8_home_plugin_and_python_paths[brew-bash-venv]",
+   "tests/test_owner_launchd_3709.py::test_k2b_c1_char_in_the_home_is_not_a_control_byte_under_a_utf8_caller_locale[Darwin-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_c1_char_in_the_home_is_not_a_control_byte_under_a_utf8_caller_locale[Linux-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_control_non_ascii_and_ordinary_names_are_not_taken_for_control_bytes[default-env-Darwin-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_control_non_ascii_and_ordinary_names_are_not_taken_for_control_bytes[default-env-Linux-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_control_non_ascii_and_ordinary_names_are_not_taken_for_control_bytes[hostile-locale-Darwin-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_control_non_ascii_and_ordinary_names_are_not_taken_for_control_bytes[hostile-locale-Linux-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x01-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x01-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x01-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x01-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x02-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x02-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x02-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x02-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x03-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x03-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x03-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x03-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x04-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x04-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x04-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x04-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x05-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x05-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x05-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x05-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x06-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x06-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x06-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x06-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x07-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x07-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x07-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x07-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x08-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x08-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x08-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x08-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x09-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x09-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x09-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x09-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0A-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0A-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0A-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0A-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0B-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0B-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0B-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0B-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0C-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0C-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0C-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0C-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0D-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0D-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0D-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0D-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0E-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0E-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0E-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0E-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0F-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0F-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0F-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x0F-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x10-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x10-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x10-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x10-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x11-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x11-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x11-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x11-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x12-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x12-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x12-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x12-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x13-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x13-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x13-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x13-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x14-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x14-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x14-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x14-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x15-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x15-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x15-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x15-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x16-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x16-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x16-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x16-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x17-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x17-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x17-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x17-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x18-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x18-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x18-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x18-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x19-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x19-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x19-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x19-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1A-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1A-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1A-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1A-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1B-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1B-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1B-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1B-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1C-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1C-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1C-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1C-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1D-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1D-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1D-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1D-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1E-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1E-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1E-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1E-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1F-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1F-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1F-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x1F-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x7F-Darwin-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x7F-Darwin-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x7F-Linux-default-env-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written[0x7F-Linux-hostile-locale-brew-bash]",
+   "tests/test_owner_launchd_3709.py::test_k2b_utf8_home_gets_the_same_label_from_the_installer_and_the_hook[default-env-brew-bash-existing-home]",
+   "tests/test_owner_launchd_3709.py::test_k2b_utf8_home_gets_the_same_label_from_the_installer_and_the_hook[default-env-brew-bash-existing-utf8-parent]",
+   "tests/test_owner_launchd_3709.py::test_k2b_utf8_home_gets_the_same_label_from_the_installer_and_the_hook[default-env-brew-bash-fresh-home]",
+   "tests/test_owner_launchd_3709.py::test_k2b_utf8_home_gets_the_same_label_from_the_installer_and_the_hook[hostile-locale-brew-bash-existing-home]",
+   "tests/test_owner_launchd_3709.py::test_k2b_utf8_home_gets_the_same_label_from_the_installer_and_the_hook[hostile-locale-brew-bash-existing-utf8-parent]",
+   "tests/test_owner_launchd_3709.py::test_k2b_utf8_home_gets_the_same_label_from_the_installer_and_the_hook[hostile-locale-brew-bash-fresh-home]"
+  ],
+  "no viz file changed": [
+   "tests/test_viz_comments_only_4255s7.py::test_a_changed_viz_file_differs_only_in_comments_and_docstrings[None]"
+  ],
+  "plutil only exists on macOS": [
+   "tests/test_owner_launchd_3709.py::test_k2_rendered_plist_passes_plutil_lint"
+  ],
+  "real launchd exists only on macOS": [
+   "tests/test_owner_launchd_3709.py::test_r1_real_launchd_restart_semantics_and_parser"
+  ],
+  "real macOS system bash 3.2.x not available: /bin/bash is 5.2.21, not 3.2.x -- this host's system bash isn't the frozen Apple build #2979 is about": [
+   "tests/test_install_local_marketplace.py::test_shipped_shell_scripts_parse_under_macos_bash32"
+  ],
+  "requires live forum server; multi-step state chain can't be reproduced with mocks alone (mine/status/show read server-written state). Individual write operations are covered by the other Integration tests.": [
+   "tests/test_baton.py::TestIntegration::test_full_round_trip"
+  ],
+  "set CODEX_WAKE_LIVE=1 to run live Codex app-server transport smokes": [
+   "tests/test_codex_umwelt_wake.py::test_live_proxy_transport_smoke",
+   "tests/test_codex_umwelt_wake.py::test_live_unix_transport_smoke",
+   "tests/test_codex_umwelt_wake.py::test_live_ws_transport_smoke"
+  ],
+  "site does not consult CLAUDE_PLUGIN_ROOT": [
+   "tests/test_bounded_sibling_lookups_3983.py::test_c_plugin_root_checked_first[engram-surface-hook-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_c_plugin_root_checked_first[engram-surface-hook-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_c_plugin_root_checked_first[viz/data/config-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_c_plugin_root_checked_first[viz/data/config-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_c_plugin_root_checked_first[viz/data/stats-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_c_plugin_root_checked_first[viz/data/stats-source]"
+  ],
+  "site has one candidate shape": [
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[_hooklib.resolve_tools_dir-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[_hooklib.resolve_tools_dir-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[_owner_read-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[_owner_read-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engram-deference-detector-prompt-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engram-deference-detector-prompt-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engram-loop-arm-stop-hook-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engram-loop-arm-stop-hook-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engram-sign-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engram-sign-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engram-time-bar-hook-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engram-time-bar-hook-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engram_signature-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engram_signature-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engramd_owner-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[engramd_owner-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[viz/data/config-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[viz/data/config-source]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[viz/data/stats-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_b2_alt_shape_above_tree_root_is_absent[viz/data/stats-source]"
+  ],
+  "src/engram/agents/claude/engram-dream-fairy.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[agents/claude/engram-dream-fairy.md]"
+  ],
+  "src/engram/agents/claude/engram-person-node-fairy.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[agents/claude/engram-person-node-fairy.md]"
+  ],
+  "src/engram/skills/claude/engram-collaborating-loop/SKILL.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[skills/claude/engram-collaborating-loop/SKILL.md]"
+  ],
+  "src/engram/skills/claude/engram-fairy-orchestration/SKILL.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[skills/claude/engram-fairy-orchestration/SKILL.md]"
+  ],
+  "src/engram/skills/claude/engram-forum/SKILL.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[skills/claude/engram-forum/SKILL.md]"
+  ],
+  "src/engram/skills/claude/engram-learn-from-error/SKILL.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[skills/claude/engram-learn-from-error/SKILL.md]"
+  ],
+  "src/engram/skills/claude/engram-letter/SKILL.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[skills/claude/engram-letter/SKILL.md]"
+  ],
+  "src/engram/skills/claude/engram-loop/SKILL.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[skills/claude/engram-loop/SKILL.md]"
+  ],
+  "src/engram/skills/claude/engram-meta-loop/SKILL.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[skills/claude/engram-meta-loop/SKILL.md]"
+  ],
+  "src/engram/skills/claude/engram-nap/SKILL.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[skills/claude/engram-nap/SKILL.md]"
+  ],
+  "src/engram/skills/claude/engram-observe/SKILL.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[skills/claude/engram-observe/SKILL.md]"
+  ],
+  "src/engram/skills/claude/engram-school-day/SKILL.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[skills/claude/engram-school-day/SKILL.md]"
+  ],
+  "src/engram/templates/components/model-identity-gate.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[templates/components/model-identity-gate.md]"
+  ],
+  "src/engram/templates/template.CLAUDE.md differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_twin_changed_exactly_one_line_and_it_is_the_component_line"
+  ],
+  "src/engram/viz/templates/config.html differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c4_only_the_required_lines_changed[viz/templates/config.html]",
+   "tests/test_prose_home_sweep_3863.py::test_c6_html_tags_attributes_and_scripts_are_unchanged[viz/templates/config.html]"
+  ],
+  "sweep merged as 5c5d9e13; concurrent-edit guard no longer applies": [
+   "tests/test_prose_home_sweep_3863.py::test_c5_baseline_diff_from_dev_is_exactly_our_23",
+   "tests/test_prose_home_sweep_3863.py::test_disjoint_from_pr_3a_none_of_its_files_is_in_this_diff",
+   "tests/test_prose_home_sweep_3863.py::test_disjoint_from_pr_3b_none_of_its_files_is_in_this_diff",
+   "tests/test_prose_home_sweep_3863.py::test_scope_only_the_23_the_twin_the_baseline_and_this_test_changed"
+  ],
+  "test process is outside agent-session@<seat>.service (tmux-relaunched seat); this cell needs the unit cgroup": [
+   "tests/test_agentctl_oom_status.py::TestRequestedVsEffective::test_disagreement_names_accepted_not_applied"
+  ],
+  "the forum hook imports _hooklib unconditionally at module load": [
+   "tests/test_prompthooklib_config_unknown_3521.py::test_flattened_layout_without_hooklib_still_not_silent[forum]"
+  ],
+  "the hostile locale is not available here (preferred encoding 'utf-8'): the cell would prove nothing": [
+   "tests/test_owner_launchd_3709.py::test_b_a_script_call_decodes_under_a_non_utf8_pytest_process_locale"
+  ],
+  "the marker is the target: covered by cell (b)": [
+   "tests/test_bounded_sibling_lookups_3983.py::test_e_no_marker_searches_own_dir_and_parent_only[cites_step3-installed]",
+   "tests/test_bounded_sibling_lookups_3983.py::test_e_no_marker_searches_own_dir_and_parent_only[cites_step3-source]"
+  ],
+  "the owner's TCC check keys on its Darwin arm (_owner_arm)": [
+   "tests/test_owner_launchd_3709.py::test_k6_owner_mode_tcc_home_is_refused_before_mkdir_plist_or_launchctl",
+   "tests/test_owner_launchd_3709.py::test_k6y_owner_mode_new_home_through_symlink_into_tcc_folder_is_refused_before_any_mkdir"
+  ],
+  "the owner's TCC check keys on its Darwin arm (_owner_arm), which a uname stub cannot reach": [
+   "tests/test_owner_launchd_3709.py::test_k6_tcc_protected_home_is_refused_with_the_owners_reason_and_a_healthy_control_passes"
+  ],
+  "the stock bash 3.2 is a macOS thing; elsewhere /bin/bash is already modern": [
+   "tests/test_owner_launchd_3709.py::test_k1_helper_runs_under_the_stock_bash_3_2"
+  ],
+  "the suite-wide #3519 guard refuses `systemd-run` in tests, so a real holder scope cannot be created here (checked by hand outside pytest)": [
+   "tests/test_agentctl_claude_scope_4435.py::test_c6_real_systemd_refuses_live_claude_and_warns_for_plain_sleep"
+  ],
+  "this Python can load vec0; the default path is covered by the real-vec0 cell": [
+   "tests/test_engramd_fill_embeddings_3879.py::test_where_this_python_cannot_load_vec0_the_real_default_reports_vec_mirrored_false"
+  ],
+  "this test host's own process is not inside an agent-session@ slice -- the injectable-path test above already covers this state deterministically regardless": [
+   "tests/test_start_daemon_probe_branch_logging.py::TestCgroupSupervisionStateUnsupervised::test_real_own_process_cgroup_on_this_host"
+  ],
+  "tools/home_path_baseline.json differs from the sweep commit; snapshot check retired": [
+   "tests/test_prose_home_sweep_3863.py::test_c5_baseline_is_exactly_the_base_minus_the_23_before_pr_3a_lands"
+  ],
+  "zsh not available on this host": [
+   "tests/test_skill_docs_shell_hygiene.py::test_step0_does_not_destroy_PATH_under_zsh"
+  ]
+ }
+}

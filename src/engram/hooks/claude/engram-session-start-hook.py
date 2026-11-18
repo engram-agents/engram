@@ -63,6 +63,7 @@ import os
 import re
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -71,6 +72,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
+from _hooklib import pick_checkout
 from _hooklib import atomic_write_json, atomic_write_text, resolve_runtime_dir, emit_context, _trim_to_line_boundary
 from _hooklib import _open_regular_fd
 from _hooklib import prune_shown_records
@@ -494,6 +496,19 @@ except Exception:
     def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
         return False
 
+# #4843: own resolver call for engram_snapshot_backlog.py (gh#2570: one call per module
+# imported; never a fixed parents[N] path -- the plugin build flattens hooks/claude/* to
+# hooks/*). An import failure is kept and reported as an "unreadable" line, never silent.
+_BACKLOG_IMPORT_ERROR = None
+try:
+    _BACKLOG_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_snapshot_backlog.py")
+    if _BACKLOG_RUNTIME_DIR not in sys.path:
+        sys.path.insert(0, _BACKLOG_RUNTIME_DIR)
+    from engram_snapshot_backlog import read_backlog as _read_snapshot_backlog
+except Exception as _backlog_exc:  # noqa: BLE001
+    _read_snapshot_backlog = None
+    _BACKLOG_IMPORT_ERROR = _backlog_exc
+
 # alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
 # manifest_id) for engram.telemetry.reached -- see main()'s first line.
 _MAIN_MANIFEST_ID = "hooks/claude/engram-session-start-hook.py:main"
@@ -612,7 +627,8 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
          MCP server runs from the plugin tree, not from ENGRAM_HOME.
       2. $ENGRAM_HOME/server.py (legacy scatter-install pattern in case
          hooks were copied separately or the colocation is unusual)
-      3. ~/engram-alpha/server.py (live-source dev fallback)
+      3. ~/engram/src/engram/server.py, else ~/engram-alpha/src/engram/server.py (live-source
+         dev fallback; engram is the default name, engram-alpha the accepted old one)
     """
     # Hook lives at <runtime-dir>/hooks/engram-session-start-hook.py,
     # server.py lives at <runtime-dir>/server.py.
@@ -624,7 +640,7 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
     candidate = os.path.join(engram_home, "server.py")
     if os.path.exists(candidate):
         return candidate
-    return os.path.expanduser("~/engram-alpha/server.py")
+    return pick_checkout("/src/engram/server.py") or os.path.expanduser("~/engram/src/engram/server.py")
 
 
 def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
@@ -809,6 +825,50 @@ def _backup_push_health_line(engram_home: str):
         f"⚠️  ENGRAM off-disk backup: {str(result)[:20]} since {str(since)[:30]}; "
         f"ahead {st.get('ahead')} behind {st.get('behind')}; {tail}"
     )
+
+
+_CONFIG_MISSING_LINE = (
+    "⚠️  ENGRAM substrate health: config.json is missing while knowledge.db exists; "
+    "ENGRAM tools refuse until it is restored from a backup you choose "
+    "(see the tool error for candidates)."
+)
+
+
+def _config_missing_health_line(engram_home: str):
+    """One loud line when knowledge.db exists and config.json does not (#4705, C9).
+
+    Two existence checks, no store open: the hook only reports, it never writes and never exits
+    non-zero for this. The tools refuse in that state (the tool error names the backup candidates)
+    and auto-surface returns nothing, so without this line the user would only meet it as a failing
+    tool call. An OSError on either check reads as "nothing to report" (advisory probe)."""
+    try:
+        if os.path.lexists(os.path.join(engram_home, "knowledge.db")) and not os.path.lexists(
+            os.path.join(engram_home, "config.json")
+        ):
+            return _CONFIG_MISSING_LINE
+    except OSError:
+        pass
+    return None
+
+
+def _check_snapshot_backlog(engram_home: str) -> tuple[str, str | None]:
+    """#4843: (status, line) for the snapshot worker's pending queue.
+
+    status is "ok" | "backlog" | "unreadable". An unavailable reader or any exception
+    is "unreadable" with its class named: a failed read is never reported as healthy.
+    """
+    if _read_snapshot_backlog is None:
+        _cls = type(_BACKLOG_IMPORT_ERROR).__name__
+        return "unreadable", (
+            "Snapshot commits: queue could not be read "
+            f"(reader unavailable: {_cls})")
+    try:
+        _r = _read_snapshot_backlog(engram_home)
+        return _r["status"], _r["line"]
+    except Exception as _exc:  # noqa: BLE001
+        return "unreadable", (
+            "Snapshot commits: queue could not be read "
+            f"({type(_exc).__name__}: {_exc})")[:300]
 
 
 def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
@@ -1544,13 +1604,41 @@ AGENT_REGISTRY_DIR = os.path.join(AGENTS_SHARED_ROOT, "agents")
 def write_agent_registration(
     agent_name: str,
     registry_dir: str = AGENT_REGISTRY_DIR,
-) -> None:
+) -> dict:
     """Write/refresh the agent's registration file in the shared registry.
 
     Writes atomically via temp-file + os.replace so concurrent agents never
     read a partial JSON. Creates the registry dir (group-writable, setgid) if
-    it does not exist. Fails silently if the shared filesystem is absent or
-    unwritable — this only matters when /home/agents-shared/ exists, and is a convenience, not a blocker.
+    it does not exist, and asserts that mode explicitly afterwards (#4026):
+    ``os.makedirs`` applies its ``mode`` THROUGH the process umask, and
+    ``exist_ok=True`` never repairs a directory that already exists at the
+    wrong mode. The mode is set on the opened directory itself, never through
+    a path that may be a symlink (#4682): a group member can create the
+    ``agents`` entry pointing at a directory this user owns, so the entry is
+    opened with ``O_NOFOLLOW`` and, if that fails, NOTHING is chmodded and
+    nothing is written through it. The fd stays open for the whole call and
+    every later step — the chmod, the temp creation, the replace — is
+    fd-relative, so a co-tenant who swaps ``agents`` for a symlink AFTER the
+    check cannot redirect the chmod or the write either (#4682 TOCTOU).
+    ``agent_name`` must be a bare name (no separator, not ``.``/``..``): the
+    fd-bound writer accepts only a basename, and a separator would otherwise
+    join straight out of the directory. The shared directory ends up 0o2775
+    (group-writable, setgid) so each co-tenant can create its own file; the
+    registration file itself is 0o644 — group-readable, never group-writable,
+    since a writable record would let a co-tenant impersonate another agent in
+    peer topology. The file's mode is applied to the temp file before the
+    atomic replace, so there is no post-replace chmod to redirect. The 0o644
+    closes the WRITE vector, not the UNLINK vector: ``agents`` is
+    group-writable and not sticky, so a co-tenant can still unlink or rename
+    another agent's record whatever its mode — the file mode stops an in-place
+    rewrite, not removal.
+    Fails soft if the shared filesystem is absent or unwritable — this only
+    matters when /home/agents-shared/ exists, and is a convenience, not a
+    blocker. Never raises on Unix (the constants it needs — ``os.O_DIRECTORY``,
+    ``os.O_NOFOLLOW`` — are POSIX; the caller's broad ``except Exception`` is
+    what keeps SessionStart safe on a platform without them), and never prints
+    (the hook injects context on stdout); failures are reported in the returned
+    status.
 
     File path: <registry_dir>/<agent_name>.json
     Content   : {"agent_name": ..., "hostname": ..., "pid": ..., "registered_at": <ISO UTC>}
@@ -1559,34 +1647,127 @@ def write_agent_registration(
         agent_name   : The agent's own name (from config.json or env).
         registry_dir : Override for the default /home/agents-shared/agents/.
                        (Exposed for testing.)
+
+    Returns:
+        {"registered": bool, "dir_mode": int | None, "dir_error": str | None,
+         "file_path": str, "file_error": str | None}
+        ``dir_mode`` is the mode READ BACK with os.fstat on the opened
+        directory after the fchmod attempt (not the mode requested). The read
+        back happens EVEN IF the fchmod was refused, and ``dir_error`` is set
+        only when that read-back differs from 0o2775: EPERM on a directory
+        already at the right mode (every agent that does not own it) reports
+        no error, while a dropped setgid bit or an unusable/symlinked entry
+        does. ``registered`` is True only once the JSON file — including its
+        0o644 mode — was written.
     """
+    status = {
+        "registered": False,
+        "dir_mode": None,
+        "dir_error": None,
+        "file_path": "",
+        "file_error": None,
+    }
+
     if not agent_name:
-        return
+        return status
+
+    # #4682: the registration write is bound to the registry directory's fd, so
+    # a name carrying a path separator would join straight out of it. Refuse it
+    # before anything is created, chmodded or written.
+    if (
+        agent_name in (".", "..")
+        or os.sep in agent_name
+        or (os.altsep is not None and os.altsep in agent_name)
+    ):
+        status["file_error"] = (
+            f"refusing an agent name that would escape the registry: {agent_name!r}"
+        )
+        return status
 
     # Gate: the shared-fs root must exist and be a directory. If absent (single-
     # host install with no shared fs), skip silently — never break SessionStart.
     shared_root = os.path.dirname(registry_dir)
     if not os.path.isdir(shared_root):
-        return
+        return status
 
     try:
-        # Create the registry dir with group-writable, setgid permissions so
-        # co-tenant agents can each write their own file.
         os.makedirs(registry_dir, mode=0o2775, exist_ok=True)
+    except OSError as exc:
+        status["dir_error"] = f"could not create registry dir: {exc}"
+        return status
 
-        record = {
-            "agent_name": agent_name,
-            "hostname": socket.gethostname(),
-            "pid": os.getpid(),
-            "registered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
+    # Group-writable, setgid, whatever the umask and whoever created the dir
+    # first (#4026). Open the entry itself with O_NOFOLLOW and fchmod the fd
+    # (#4682): a path-based chmod follows a planted `agents` symlink and widens
+    # the VICTIM's directory. ELOOP (it is a symlink), ENOTDIR / ENOENT (not a
+    # usable directory) mean: chmod nothing AND write nothing through it.
+    try:
+        dir_fd = os.open(registry_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        status["dir_error"] = (
+            f"could not open registry dir without following a link: {exc}"
+        )
+        return status
+
+    # The single fd opened with O_NOFOLLOW above stays open across BOTH the
+    # chmod and the write; one finally closes it. Every step in between is
+    # fd-relative, so replacing the `agents` entry after this point can
+    # redirect neither.
+    try:
+        chmod_error = None
+        try:
+            os.fchmod(dir_fd, 0o2775)
+        except OSError as exc:
+            # EPERM when the directory belongs to another agent. That is not
+            # itself a failure: the mode we need may already be set, so keep
+            # going and let the read-back decide. Never raise.
+            chmod_error = exc
+        try:
+            dir_mode = stat.S_IMODE(os.fstat(dir_fd).st_mode)
+        except OSError as exc:
+            status["dir_error"] = f"could not read back registry dir mode: {exc}"
+        else:
+            status["dir_mode"] = dir_mode
+            if dir_mode != 0o2775:
+                # POSIX can silently drop setgid for a non-member caller, and a
+                # refused fchmod leaves the old mode: the requested mode is not
+                # proof the mode took, so report the READ-BACK mismatch (#4682).
+                status["dir_error"] = (
+                    f"could not set registry dir mode: {chmod_error}"
+                    if chmod_error is not None
+                    else f"registry dir mode is 0o{dir_mode:o}, expected 0o2775"
+                )
+
         dest = os.path.join(registry_dir, f"{agent_name}.json")
+        try:
+            record = {
+                "agent_name": agent_name,
+                "hostname": socket.gethostname(),
+                "pid": os.getpid(),
+                "registered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            # Atomic write, mode- and group-preserving (#4013), with the file
+            # mode applied to the TEMP file before the replace (#4682):
+            # group-READABLE, never group-writable — a writable <name>.json
+            # would let any co-tenant in `agents` rewrite another agent's
+            # record, which feeds peer topology and liveness. The shared
+            # DIRECTORY is group-writable so each agent can create its own
+            # file; the file itself needs no group write. The write is bound to
+            # the fd opened above: the temp is created inside THAT directory
+            # and the replace happens inside it, so a symlink swapped in after
+            # the check cannot redirect it. The bare basename is what dir_fd
+            # requires; an absolute path would silently ignore it.
+            atomic_write_json(f"{agent_name}.json", record, mode=0o644, dir_fd=dir_fd)
+        except Exception as exc:
+            # Fail-soft: never raise from a convenience side-effect.
+            status["file_error"] = f"could not write registration file: {exc}"
+            return status
+    finally:
+        os.close(dir_fd)
 
-        # Atomic write, mode- and group-preserving (#4013): peers read the registry through group.
-        atomic_write_json(dest, record)
-    except Exception:
-        # Fail-soft: never raise from a convenience side-effect.
-        pass
+    status["registered"] = True
+    status["file_path"] = dest
+    return status
 
 
 PEER_STALE_HOURS = 24  # mirror ia.py's default
@@ -2691,15 +2872,22 @@ DEFAULT_PURPOSES = {
 }
 # Repos scanned for Piece C (recent commit cross-check at startup).
 # ENGRAM_HOME is always included. Extra repos via ENGRAM_PIECE_C_REPOS env var
-# (colon-separated). Default extra: ~/engram-alpha if it exists (the agent's dev checkout, if present);
+# (colon-separated). Default extras: ~/engram then ~/engram-alpha (old name) if they exist (the agent's dev checkout, if present);
 # for agents installed without a local alpha clone, silently
 # no-ops because the isdir guard returns False.
 _PIECE_C_EXTRA = os.environ.get("ENGRAM_PIECE_C_REPOS", "").strip()
 if _PIECE_C_EXTRA:
     PIECE_C_REPOS = [os.path.expanduser(p) for p in _PIECE_C_EXTRA.split(":") if p] + [ENGRAM_HOME]
 else:
-    _default_extra = os.path.expanduser("~/engram-alpha")
-    PIECE_C_REPOS = ([_default_extra] if os.path.isdir(_default_extra) else []) + [ENGRAM_HOME]
+    # `engram` is the default checkout name, `engram-alpha` the accepted old one; a symlink from
+    # one to the other (same realpath) is listed once.
+    _default_extras = []
+    for _name in ("~/engram", "~/engram-alpha"):
+        _cand = os.path.expanduser(_name)
+        if os.path.isdir(_cand) and os.path.realpath(_cand) not in [
+                os.path.realpath(_x) for _x in _default_extras]:
+            _default_extras.append(_cand)
+    PIECE_C_REPOS = _default_extras + [ENGRAM_HOME]
 PIECE_C_WINDOW = "2 days ago"
 PIECE_C_MAX_LINES = 20
 PIECE_C_MAX_LINE_CHARS = 140
@@ -3389,7 +3577,12 @@ def fairy_policy_block() -> str:
         ),
         "always": (
             "[Coder fairy policy: always] Every PR coding task gets a fairy — "
-            "no size exception, no quick-fix exception. Spec and dispatch."
+            "no size exception, no quick-fix exception. Spec and dispatch, once "
+            "sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
+            "(a dated grant line or a standing request); without it, do the work "
+            "directly and say so. "
+            "Where that section carries an \"ask each time\" line, ask the user "
+            "before each dispatch; a yes covers that task only."
         ),
         "auto": (
             "[Coder fairy policy: auto] Use judgment per task. Before deciding on "
@@ -3404,7 +3597,12 @@ def fairy_policy_block() -> str:
         ),
         "always": (
             "[Reviewer fairy policy: always] Every PR review task gets a "
-            "reviewer-fairy — no size exception, no quick-fix exception. Dispatch."
+            "reviewer-fairy — no size exception, no quick-fix exception. Dispatch, "
+            "once sub-agent dispatch is granted in CLAUDE.md's Tool policy section "
+            "(a dated grant line or a standing request); without it, do the review "
+            "directly and say so. "
+            "Where that section carries an \"ask each time\" line, ask the user "
+            "before each dispatch; a yes covers that task only."
         ),
         "auto": (
             "[Reviewer fairy policy: auto] Use judgment per task. Before deciding on "
@@ -3753,8 +3951,13 @@ def _main_impl() -> None:
     # ── Agent registration (only when /home/agents-shared/ exists) ────────────
     # Write/refresh the agent's registration file in the shared registry so
     # peers can discover co-host vs cross-host topology. Fail-soft: the shared
-    # filesystem may not exist (single-host install), and write_agent_registration
-    # is wrapped in a broad try/except that swallows all errors silently.
+    # filesystem may not exist (single-host install), and the broad try/except
+    # below guarantees SessionStart itself cannot break. The status returned by
+    # write_agent_registration (registered / dir_error / file_error) is
+    # intentionally NOT consumed or surfaced here: it exists for tests and a
+    # future health line, and printing it would emit a line on EVERY session
+    # start for agents that do not own the shared registry directory (the
+    # normal case — the first agent to run owns /home/agents-shared/agents).
     _agent_name = ""
     try:
         _config_path = os.path.join(ENGRAM_HOME, "config.json")
@@ -3921,6 +4124,7 @@ def _main_impl() -> None:
     global _OWNER_RUN
     _OWNER_RUN = _fresh_owner_run(_owner_reads_enabled())
     stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
+    backlog_status, backlog_line = _check_snapshot_backlog(ENGRAM_HOME)  # #4843
     viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
     embed_restore_ok, embed_restore_reason = _check_embedding_restore_flag(ENGRAM_HOME)
     if embed_restore_ok is None:
@@ -3957,7 +4161,7 @@ def _main_impl() -> None:
     # (a local list instead of a direct `lines.append`).
     _health_lines: list[str] = []
     if (
-        mcp_offline or not stale_ok or viz_down
+        mcp_offline or not stale_ok or backlog_status != "ok" or viz_down
         or viz_inconclusive or embed_restore_ok is False or json1_missing
     ):
         _health_lines.append("⚠️  ENGRAM substrate health:")
@@ -3967,6 +4171,16 @@ def _main_impl() -> None:
         if not stale_ok:
             _health_lines.append(f"  Git backup: {stale_reason}")
             _health_lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
+        if backlog_status != "ok":
+            _health_lines.append(f"  {backlog_line}")
+            if backlog_status == "unreadable":
+                _health_lines.append(
+                    "  → The pending-commit queue could not be checked; whether commits "
+                    "are landing is unknown.")
+            else:
+                _health_lines.append(
+                    "  → The snapshot worker cannot commit; its reason is in the server log "
+                    "([engram snapshot-worker] lines).")
         if viz_down:
             _health_lines.append(f"  Viz server: DOWN ({viz_reason})")
             _health_lines.append("  → Tell the user; the health dashboard is unreachable.")
@@ -4028,6 +4242,9 @@ def _main_impl() -> None:
     _bp_line = _backup_push_health_line(ENGRAM_HOME)  # #4205: one bounded line, same emitter
     if _bp_line:
         _health_lines.append(_bp_line)
+    _cm_line = _config_missing_health_line(ENGRAM_HOME)  # #4705 C9: a lost config.json beside the DB
+    if _cm_line:
+        _health_lines.append(_cm_line)
     _health_text = "\n".join(_health_lines)
 
     if source == "startup":

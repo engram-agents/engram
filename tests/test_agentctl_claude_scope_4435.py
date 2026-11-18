@@ -475,17 +475,20 @@ def test_sudo_launch_strings_carry_scope_exec_without_expansion_chars(
     prologue = _prologue().rstrip("\n")
     assert s.startswith(prologue + ";"), s
     rest = s[len(prologue) + 1:]
-    assert f" __scope-exec zed " in rest
-    assert str(AGENTCTL.resolve()) in rest
+    # the path and the seat are octal-quoted (#4416): decode before reading them
+    plain = re.sub(r"\$'((?:\\[0-7]{3})*)'", lambda m: bytes(
+        int(x, 8) for x in re.findall(r"[0-7]{3}", m.group(1))).decode(), rest)
+    assert f" __scope-exec zed " in plain
+    assert str(AGENTCTL.resolve()) in plain
     # Everything the outer shell inserted must be free of $ { } ( ) -- sudo -i
     # backslash-escapes braces and parens. Only the pre-existing quoted "$@"
-    # token is allowed to carry a `$`.
-    check = rest.replace('"$@"', "")
+    # token and the octal `$'\ooo..'` words (#4416; `$` survives sudo -i) may carry a `$`.
+    check = re.sub(r"\$'(?:\\[0-7]{3})*'", "", rest.replace('"$@"', ""))
     for ch in "${}()":
         assert ch not in check, (ch, rest)
     # The exec word is the scope verb for the right target.
     target = '"claude"' if binary_on_path else "~/.runtime/start.sh"
-    assert re.search(r"exec \S+ __scope-exec zed " + re.escape(target) + r" ", rest), rest
+    assert re.search(r"exec \S+ __scope-exec zed " + re.escape(target) + r" ", plain), rest
 
 
 # --- T9: the as-self e2e goes through systemd-run ----------------------------

@@ -113,6 +113,158 @@ def test_compute_selection_raises_on_bad_json():
         assert "valid JSON" in str(e)
 
 
+# ---------------------------------------------------------------------------
+# Full-suite trigger stop (#4358 / PR-MERGE-POLICY merge-seat test rules item 1)
+# ---------------------------------------------------------------------------
+TRIGGER_SEL = {
+    "base": "origin/dev", "changed_files": ["pytest.ini", "tests/conftest.py"],
+    "full": True,
+    "full_reasons": ["pytest.ini changed", "tests/conftest.py changed"],
+    "selected": [], "total_test_files": 100,
+    "buckets": {"internals": 0, "contract": 0, "map_residue": 0},
+}
+
+
+def test_compute_selection_trigger_exit7_raises_named_stop():
+    # M1: exit 7 + a full:true JSON object -> FullTriggerStop naming every
+    # triggering file and pointing at --full; never a returned selection.
+    runner, _ = make_runner(selection=TRIGGER_SEL, selection_rc=7)
+    try:
+        rm.compute_selection("origin/dev", False, rm.REPO_ROOT_DEFAULT, runner=runner)
+        assert False, "expected FullTriggerStop"
+    except rm.FullTriggerStop as e:
+        msg = str(e)
+        assert isinstance(e, RuntimeError)
+        assert "pytest.ini changed" in msg and "tests/conftest.py changed" in msg
+        assert "--full" in msg
+        assert "emit boom" not in msg
+
+
+def test_run_matrix_trigger_exit7_runs_no_environment(monkeypatch):
+    # M1: run_matrix stops; no docker command of any kind is issued.
+    monkeypatch.setattr(rm, "docker_available", lambda: True)
+    inner, _ = make_runner(selection=TRIGGER_SEL, selection_rc=7)
+    docker_calls = []
+
+    def runner(cmd, **kw):
+        if cmd and cmd[0] == "docker":
+            docker_calls.append(cmd)
+        return inner(cmd, **kw)
+
+    try:
+        rm.run_matrix(Args(), runner=runner)
+        assert False, "expected FullTriggerStop"
+    except rm.FullTriggerStop:
+        pass
+    assert docker_calls == []
+
+
+def test_main_trigger_stop_names_files_and_exits_3(monkeypatch, capsys):
+    def stop(*a, **k):
+        raise rm.FullTriggerStop(["pytest.ini changed"])
+    monkeypatch.setattr(rm, "compute_selection", stop)
+    monkeypatch.setattr(rm, "docker_available", lambda: True)
+    assert rm.main(["--envs", "p0"]) == 3
+    err = capsys.readouterr().err
+    assert "pytest.ini changed" in err and "--full" in err
+
+
+def test_compute_selection_exit7_without_json_object_is_plain_error():
+    # M2: exit 7 whose stdout is not a full:true object is still an error
+    # naming exit 7 (no silent success), and not the trigger stop.
+    for bad in ("", "not json", json.dumps([1]), json.dumps({"full": False}),
+                json.dumps({"selected": ["tests/a.py"]})):
+        runner, _ = make_runner(selection_rc=7, selection_stdout=bad)
+        try:
+            rm.compute_selection("origin/dev", False, rm.REPO_ROOT_DEFAULT, runner=runner)
+            assert False, f"expected RuntimeError for stdout {bad!r}"
+        except rm.FullTriggerStop:
+            assert False, f"must not be the trigger stop for stdout {bad!r}"
+        except RuntimeError as e:
+            assert "exited 7" in str(e)
+
+
+def test_compute_selection_other_nonzero_unchanged():
+    # M3: any other non-zero exit keeps the old message, even with a trigger-
+    # shaped body on stdout.
+    for rc in (1, 2, 4, 6):
+        runner, _ = make_runner(selection=TRIGGER_SEL, selection_rc=rc)
+        try:
+            rm.compute_selection("origin/dev", False, rm.REPO_ROOT_DEFAULT, runner=runner)
+            assert False, "expected RuntimeError"
+        except rm.FullTriggerStop:
+            assert False, f"exit {rc} must not be the trigger stop"
+        except RuntimeError as e:
+            assert f"emitter exited {rc}: emit boom" in str(e)
+
+
+def test_run_matrix_full_flag_passes_full_and_never_stops(monkeypatch):
+    # M4: --full is forwarded to the emitter, which then exits 0 with the
+    # full object; the stop is never reached. A fake emitter that would exit 7
+    # without --full proves the flag is what avoids the stop.
+    monkeypatch.setattr(rm, "docker_available", lambda: False)
+    full_sel = dict(TRIGGER_SEL, full_reasons=["--full flag"], changed_files=[])
+    seen = []
+
+    def runner(cmd, **kw):
+        assert any("run_touched_tests.py" in c for c in cmd)
+        seen.append(cmd)
+        if "--full" in cmd:
+            return FakeProc(0, json.dumps(full_sel))
+        return FakeProc(7, json.dumps(TRIGGER_SEL))
+
+    assert rm.run_matrix(Args(full=True, dry_run=True), runner=runner) == 0
+    assert "--full" in seen[0]
+    sel = rm.compute_selection("origin/dev", True, rm.REPO_ROOT_DEFAULT, runner=runner)
+    assert rm.pytest_targets(sel) == ["tests/"]
+
+
+def _vcs(cwd, *args):
+    import subprocess
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+
+
+def test_compute_selection_real_emitter_trigger_stops_naming_file(tmp_path):
+    # M5: drive the REAL emitter against a scratch repo whose head commit
+    # changes pytest.ini (a full-suite trigger).
+    import shutil
+    import pytest
+    if shutil.which("git") is None:
+        pytest.skip("git is not available; the real-emitter cell needs a scratch repo")
+    repo = tmp_path / "work"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tools").mkdir()
+    emitter = Path(rm.__file__).resolve().parent / "run_touched_tests.py"
+    (repo / "tools" / "run_touched_tests.py").symlink_to(emitter)
+    (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (repo / "tests" / "test_x.py").write_text("def test_x():\n    pass\n", encoding="utf-8")
+    (repo / "tests" / "test_guard.py").write_text("def test_guard():\n    pass\n", encoding="utf-8")
+    (repo / "docs" / "internal").mkdir(parents=True)
+    (repo / "docs" / "internal" / "PR-MERGE-POLICY.md").write_text(
+        "## Owner merge\n"
+        "4. **The seat's own run, on a scratch merge**\n"
+        "   `tests/test_guard.py`\n"
+        "5. **The PR's changed or added tests**\n",
+        encoding="utf-8",
+    )
+    pm = repo / "src" / "engram" / "packaging"
+    pm.mkdir(parents=True)
+    (pm / "test-map.json").write_text(
+        json.dumps({"schema_version": 1, "mappings": [], "unmapped": []}), encoding="utf-8")
+    _vcs(repo, "init", "-b", "dev")
+    _vcs(repo, "config", "user.email", "t@example.com")
+    _vcs(repo, "config", "user.name", "T")
+    _vcs(repo, "add", ".")
+    _vcs(repo, "commit", "-m", "base")
+    (repo / "pytest.ini").write_text("[pytest]\naddopts = -q\n", encoding="utf-8")
+    _vcs(repo, "commit", "-am", "change a trigger file")
+    try:
+        rm.compute_selection("HEAD~1", False, str(repo))
+        assert False, "expected FullTriggerStop"
+    except rm.FullTriggerStop as e:
+        assert "pytest.ini" in str(e) and "--full" in str(e)
+
+
 def test_pytest_targets_full_vs_selected_vs_empty():
     assert rm.pytest_targets({"full": True, "selected": []}) == ["tests/"]
     assert rm.pytest_targets({"full": False, "selected": ["tests/x.py"]}) == ["tests/x.py"]

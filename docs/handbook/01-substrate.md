@@ -103,22 +103,22 @@ Embedding stored at creation via `_compute_and_store_embedding()` (called by `_s
 
 ## **5. Memory Tiers, Importance Decay & Recall Surfaces**
 
-**what** — Three-tier memory architecture based on importance scores (confidence × surprise × exponential decay). Tier 1 (working memory, ~200 nodes) surfaces in reflect/checkpoint; Tier 2 (searchable, ~1000 nodes) filters retrieval candidates; Tier 3 (total archive). Exponential decay driven by turn counter: `importance_score = importance_base × decay_base^turn` (default decay_base=1.014). Nodes acquire `importance_base` at creation (from confidence + surprise), then decay exponentially as turns accumulate. Recall events (surface/query/inspect) update `recall_turn` and `recall_count`, boosting the node's importance_score back up.
+**what** — Two-tier memory architecture based on importance scores (confidence × surprise × exponential decay). Tier 1, the old working-memory band, is retired (#1220). Tier 2 (searchable, ~1000 nodes) filters retrieval candidates; Tier 3 (total archive) holds the rest. Exponential decay driven by turn counter: `importance_score = importance_base × decay_base^turn` (default decay_base=1.014). Nodes acquire `importance_base` at creation (from confidence + surprise), then decay exponentially as turns accumulate. Recall events (surface/query/inspect) update `recall_turn` and `recall_count`, boosting the node's importance_score back up.
 
 **how** — Core functions:
 - `_compute_importance()` in `engram_core.py:1900`: `base × decay_base^turn`
 - `_importance_base_for_node()` in `engram_core.py:1907`: `confidence × (1 + surprise)`
-- `_get_tier_threshold()` in `engram_core.py:1919`: dynamic percentile-based threshold, targets tier1_max_nodes=200, tier2_max_nodes=1000
+- `_get_tier_threshold()` in `engram_core.py:1919`: dynamic percentile-based threshold, targets tier2_max_nodes=1000
 - `_refresh_recall()` in `engram_query.py:576`: re-stamps recalled nodes with current turn's importance
 - `_stamp_new_node()` in `engram_core.py:1959`: sets importance_base and importance_score on creation
 
-Columns: `nodes.importance_base`, `nodes.importance_score`, `nodes.recall_turn`, `nodes.recall_count`, `nodes.memory_status` (TEXT: active/faded). Config keys: `memory_config.decay_base`, `current_turn`, `tier1_max_nodes`, `tier2_max_nodes` (from CONFIG_PATH).
+Columns: `nodes.importance_base`, `nodes.importance_score`, `nodes.recall_turn`, `nodes.recall_count`, `nodes.memory_status` (TEXT: active/faded). Config keys: `memory_config.decay_base`, `current_turn`, `tier2_max_nodes` (from CONFIG_PATH).
 
 **status-candidate** — **prod-presumed** (active in every retrieval; turn counter drives time passage).
 
 **files** — `engram_core.py` (core mechanics: `_compute_importance()` :1900, `_importance_base_for_node()` :1907, `_get_tier_threshold()` :1919, `_stamp_new_node()` :1959; `_get_memory_config()` :1747). `engram_query.py` (`_refresh_recall()` :576; threshold in `_search_nodes()` :1150).
 
-**key constants** — Default decay_base=1.014 (lei 2026-05-19 calibration). Tier 1 max nodes 200, Tier 2 max nodes 1000 (defaults in `engram_core.py:1753`). Decay formula preserves semantic memory indefinitely but down-weights old observations (asymptotic forgetting curve).
+**key constants** — Default decay_base=1.014 (lei 2026-05-19 calibration). Tier 2 max nodes 1000 (defaults in `engram_core.py:1753`). Decay formula preserves semantic memory indefinitely but down-weights old observations (asymptotic forgetting curve).
 
 **tests** — Implicit in all recall-related tests; explicit decay testing in integration suites.
 
@@ -164,13 +164,13 @@ Observation confidence computed in `_add_observation_impl()` in `engram_observat
 
 **what** — Immutability via supersession: old versions are never deleted, only marked superseded (is_current→0, superseded_by field set). A new derivation can supersede an older one; retraction removes a node from all query results and the FTS index but preserves it for audit. Cascade deletion is NOT used; instead, edges to superseded/retracted nodes are preserved (ancestors remain visible for forensics). The "cascade" edge relation (`retracts`, `supersedes`) is not confidence-propagating (DAG-exempt).
 
-**how** — Supersede entry: `engram_supersede()` (server.py wrapper at :4552 → `_supersede_impl()` in `engram_revision.py:440`) creates a supersedes edge, updates is_current/superseded_by on old node. Retract entry: `engram_retract()` (server.py wrapper at :4647 → `_retract_impl()` in `engram_revision.py:783`) sets status='retracted', removes from FTS via trigger. Cascade downstream walk: `_walk_cascade_downstream()` in `engram_revision.py:97` traverses edges to find dependent nodes, but does NOT auto-cascade retract/supersede (manual sweep only).
+**how** — Supersede entry: `engram_supersede()` (server.py wrapper at :4552 → `_supersede_impl()` in `engram_revision.py:440`) creates a supersedes edge, updates is_current/superseded_by on old node. Retract entry: `engram_retract()` (server.py wrapper at :4647 → `_retract_impl()` in `engram_revision.py:783`) sets status='retracted', removes from FTS via trigger. Cascade downstream walk: `_walk_cascade_from_root()` / `_walk_cascade_downstream()` in `engram_core.py` (promoted from `engram_revision.py`, #4727) traverses edges to find dependent nodes, but does NOT auto-cascade retract/supersede (manual sweep only).
 
 Columns: `nodes.is_current` (1=current, 0=superseded), `nodes.superseded_by` (target node ID), `nodes.status` (active/retracted). Retract trigger fires on status transition into 'retracted' (1625–1635).
 
 **status-candidate** — **prod-presumed** (used in every lifecycle story; retract/supersede are critical cleanup tools).
 
-**files** — `engram_revision.py` (`_walk_cascade_downstream()` :97; `_retract_impl()` :783; `_supersede_impl()` :440). server.py (wrappers: `engram_supersede` :4552; `engram_retract` :4647). `engram_core.py` (retract trigger in DB init).
+**files** — `engram_core.py` (`_walk_cascade_from_root()`, `_walk_cascade_downstream()`); `engram_revision.py` (`_retract_impl()` :783; `_supersede_impl()` :440). server.py (wrappers: `engram_supersede` :4552; `engram_retract` :4647). `engram_core.py` (retract trigger in DB init).
 
 **key constants** — `DAG_EXEMPT_RELATIONS` in `engram_core.py:506`: {"retracts", "supersedes", "about"} (non-confidence-propagating; derived from EDGE_CLASSIFICATIONS where dag_check=False).
 
@@ -508,7 +508,7 @@ Seed nodes:
 
 **what** — Standalone HTTP server rendering D3.js force-directed graph visualization of the knowledge graph. It auto-detects agents (and layers an `agents.json` from `--config` on top), with a dropdown selector; with `--db`, or when nothing is found, it serves one default agent on ~/.engram/knowledge.db (`viz/agents.py` startup modes `single_db`, `discover_*`, `config_only`). Endpoints: `/` (graph view), `/health` (dashboard), `/stats` (metrics), `/config` (config UI). Stdlib-only (no external JS deps); reads DB on each request.
 
-**how** — Entry point: `viz_server.py` (standalone script). Usage: `python viz_server.py [--db PATH] [--config agents.json] [--port 5001]`. HTTP server via `http.server.BaseHTTPRequestHandler` (stdlib). D3 graph data endpoints: `/api/nodes`, `/api/edges`, `/api/agents` (multi-mode). Config endpoints: `/api/config/schema` (GET), `/api/config` (POST for updates).
+**how** — Entry point: `viz_server.py` (standalone script). Usage: `python viz_server.py [--db PATH] [--config agents.json] [--port 5001]`. HTTP server via `http.server.BaseHTTPRequestHandler` (stdlib). D3 graph data endpoints: `/api/nodes`, `/api/edges`, `/api/agents` (multi-mode). Config endpoints: `/api/config/schema` (GET), `/api/config` (GET), and `PUT /api/config/<key>?agent=<name>` for updates (the body is `{"value": ...}`; the request must prove same origin before the body is read; `src/engram/viz/server.py` `do_PUT`). There is no POST route for config.
 
 **status-candidate** — **PARKED on #770** (code complete; manual/daemon launch only, live on the dogfood host at :5001; ship-vs-demote is the open #770 decision). `[verified 2026-06-05]`
 

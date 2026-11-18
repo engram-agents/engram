@@ -8,6 +8,7 @@ Behaviors covered:
     3. <<autonomous-loop-dynamic>> sentinel → still True (back-compat).
     4. 'Loop continuation.' prefix → still True (back-compat).
     5. Plain human message → False.
+    12. 'Stop hook feedback' prefix → True; mid-text mention → False (#2451).
 
   _is_cron_prompt — HTML-entity normalization (gh#1646, Layer 2):
     9. Escaped &lt;loop-wake&gt; → True (the incident case).
@@ -89,6 +90,24 @@ class TestIsCronPrompt:
             "instructions, and current state."
         )
         assert ddp._is_cron_prompt(stub, loop_marker) is True
+
+    def test_stop_hook_feedback_prefix_is_cron(self, tmp_path):
+        """'Stop hook feedback' prefix → True (#2451): a blocking Stop-hook
+        re-invocation is not a human message and must not write the cooldown."""
+        loop_marker = str(tmp_path / "loop-mode.json")
+        body = "Stop hook feedback: [Loop Arm Check: no wake armed for this loop.]"
+        assert ddp._is_cron_prompt(body, loop_marker) is True
+
+    def test_stop_hook_feedback_with_leading_whitespace_is_cron(self, tmp_path):
+        """Leading whitespace/newlines before 'Stop hook feedback' → still True (#2451)."""
+        loop_marker = str(tmp_path / "loop-mode.json")
+        body = "  \n\tStop hook feedback: [Loop Arm Check: no wake armed for this loop.]"
+        assert ddp._is_cron_prompt(body, loop_marker) is True
+
+    def test_stop_hook_feedback_mid_text_is_not_cron(self, tmp_path):
+        """The words later in a human sentence → False (prefix match only, #2451)."""
+        loop_marker = str(tmp_path / "loop-mode.json")
+        assert ddp._is_cron_prompt("please read: Stop hook feedback was noisy", loop_marker) is False
 
     def test_plain_human_prompt_is_not_cron(self, tmp_path):
         """A plain human message → False (no file present → OSError swallowed → False)."""

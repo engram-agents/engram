@@ -80,7 +80,9 @@ def get_primary_user() -> str:
     try:
         with open_regular_text(CONFIG_PATH) as f:
             config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError, RecursionError):
+        return ""
+    if not isinstance(config, dict):
         return ""
     return (config.get("primary_user") or "").lower()
 
@@ -314,7 +316,14 @@ def detect_speaker(prompt: str, people: list[dict]) -> dict | None:
             meta = {}
         name = meta.get("name", "").lower()
         aliases = [a.lower() for a in meta.get("aliases", [])]
-        role = meta.get("role", "")
+        # Prefer `relation`; fall back to the deprecated pre-rename `role` (#3864).
+        # Inlined: hooks are standalone files and must not import engram_core.
+        role = ""
+        for _key in ("relation", "role"):
+            _val = meta.get(_key)
+            if isinstance(_val, str) and _val.strip():
+                role = _val
+                break
 
         # Check against full name and each alias
         all_names = [name] + aliases
