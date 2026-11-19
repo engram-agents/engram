@@ -561,6 +561,10 @@ step_ok
 # The count is tools/store_read.py node-count (#2652 unit 04): through the engramd owner when its flag is ON and
 # an owner answers, else a mode=ro open; it names the path it took on one stderr line. Exit 3 is an owner
 # refusal and stops here: a refused count is never read as 0, because 0 means re-seed.
+# With the owner flag ON, an owner can serve a zero-byte store (its start() creates the file and builds no schema), so
+# that case stops at the owner refusal (exit 3) first; the remedy's flag-false re-run then re-seeds as before.
+# Exit 4 is a store the reader cannot open because a WAL store's folder cannot be written: fix that first; restore
+# only if the read still fails after that (the open fails before any page is read, so damage is not ruled out).
 begin_step 6 "bootstrap"
 BOOTSTRAP_RAN=0
 _run_bootstrap=0
@@ -575,6 +579,9 @@ else
   if [ "$_count_rc" -eq 3 ]; then
     fail "the engramd owner refused the node count of $DB_PATH (the store_read line above names why); nothing was re-seeded" \
       "start or restart the owner, or set engramd.store_read_reads_via_owner to false in $ENGRAM_HOME/config.json, and re-run"
+  elif [ "$_count_rc" -eq 4 ]; then
+    fail "the store at $DB_PATH looks healthy but could not be read here (store_read exit 4; the line above names why); it is not shown to be damaged, nothing was re-seeded" \
+      "do NOT restore it from backup yet: fix the permissions of $ENGRAM_HOME so this user can write the folder, or start the engramd owner so the read goes through it, and re-run; if the read still fails, the line it prints then names the damage"
   elif [ "$_count_rc" -ne 0 ]; then
     fail "could not count the nodes in $DB_PATH (store_read exit $_count_rc; the line above names why)" \
       "release any lock on the database, or restore it from backup, and re-run"

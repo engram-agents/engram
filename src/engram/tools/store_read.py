@@ -33,13 +33,16 @@ The tool never writes: every direct open is `mode=ro`.
 
 Exit codes: 0 ok; 1 the store path is not a usable store (missing, uncheckable, not a regular file, or a file
 sqlite cannot read as a store; the class is named on stderr); 2 usage (argparse) or a RELATIVE ENGRAM_HOME;
-3 the owner refused or its answer could not be used.
+3 the owner refused or its answer could not be used; 4 the store looks healthy but a read-only open cannot read it
+(a WAL store, no -shm beside it, and a folder the reader cannot write: the cause is named on stderr; fix the
+folder or read through the owner first, and restore only if the read still fails after that).
 
 Stdlib only. Python 3.10+: the flag-ON path imports the runtime client, which needs 3.10 (the scripted
 installer already refuses a python3 older than 3.10.7 before its step 6 calls node-count).
 """
 
 import argparse
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -56,6 +59,7 @@ FLAG_KEY = "store_read_reads_via_owner"
 STORE_UNUSABLE_EXIT = 1
 BAD_HOME_EXIT = 2
 REFUSED_EXIT = 3
+HEALTHY_UNREADABLE_EXIT = 4
 
 
 class StoreReadOwnerError(Exception):
@@ -81,6 +85,43 @@ def _open_ro(db_path):
     """The one direct open: read-only, the path percent-encoded so a `?` or `#` cannot read as a uri parameter."""
     uri = Path(db_path).resolve().as_uri() + "?mode=ro"
     return sqlite3.connect(uri, uri=True, timeout=5)
+
+
+def _is_wal_store(db_path) -> bool:
+    """True when the file's header says WAL (bytes 18 and 19 are both 2)."""
+    try:
+        with open(db_path, "rb") as fh:
+            head = fh.read(20)
+    except OSError:
+        return False
+    return len(head) == 20 and head[18:20] == b"\x02\x02"
+
+
+def unreadable_but_healthy(exc, db_path):
+    """The one stderr line for a store that is probably healthy but a `mode=ro` open cannot read, else None.
+
+    A WAL store needs its -wal/-shm beside it; a read-only open that cannot create them fails. Two shapes (measured):
+    SQLITE_READONLY (base code 8, 1544 SQLITE_READONLY_DIRECTORY here) in a folder the reader cannot write, and
+    SQLITE_CANTOPEN (14) where the build cannot create the -shm. 14 is NOT a permissions signal by itself (one build
+    raises it in a writable folder too), so it counts only for a WAL header with no -shm beside the store.
+    `sqlite_errorcode` exists only on Python 3.11+, so it is read with getattr and the message is the fallback."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    message = str(exc)
+    readonly = (code & 0xFF) == 8 if code is not None else message == "attempt to write a readonly database"
+    cantopen = code == 14 if code is not None else message == "unable to open database file"
+    if not (readonly or cantopen):
+        return None
+    store = Path(db_path)
+    if not _is_wal_store(store) or Path(str(store) + "-shm").exists():
+        return None
+    folder = store.resolve().parent
+    if readonly:
+        if os.access(folder, os.W_OK | os.X_OK):
+            return None
+        return ("%s: the folder %s cannot be written, and a WAL store needs its -wal/-shm beside it to be read; "
+                "the store itself is not shown to be damaged" % (store, folder))
+    return ("%s: a read-only open could not create the -shm a WAL store needs beside it; "
+            "the store itself is not shown to be damaged" % store)
 
 
 def _decide(spec, db_path):
@@ -196,6 +237,10 @@ def main(argv=None) -> int:
         _say("%s: %s" % (type(exc).__name__, _one_line(exc)))
         return STORE_UNUSABLE_EXIT
     except sqlite3.Error as exc:
+        healthy = unreadable_but_healthy(exc, db_path) if mode == "direct" else None
+        if healthy is not None:
+            _say(healthy)
+            return HEALTHY_UNREADABLE_EXIT
         _say("%s: %s does not read as a store (%s)" % (type(exc).__name__, db_path, _one_line(exc)))
         return STORE_UNUSABLE_EXIT
     finally:
