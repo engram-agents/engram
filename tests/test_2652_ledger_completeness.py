@@ -46,8 +46,8 @@ def _target_cell(cat):
     return "n/a — comment text" if cat == "n/a (prose)" else f"{cat}: free text"
 
 
-def _row(n, spec, state="direct", kind="call", target="live store"):
-    return f"| {n} | {spec} | {kind} | {_target_cell(target)} | rw | x | {state} | — | — |\n"
+def _row(n, spec, state="direct", kind="call", target="live store", access="rw"):
+    return f"| {n} | {spec} | {kind} | {_target_cell(target)} | {access} | x | {state} | — | — |\n"
 
 
 def _tally(states):
@@ -98,12 +98,14 @@ def _ceiling_line(n):
 
 
 def _ledger(rows, states=None, summary=None, state_line=None, kinds=None, targets=None,
-            kind_line=None, target_line=None, unit_line=None, ceiling_line=None):
+            kind_line=None, target_line=None, unit_line=None, ceiling_line=None,
+            accesses=None):
     """summary/state_line/kind_line/target_line/unit_line/ceiling_line: None =
     consistent default, "" = omit, else verbatim."""
     states = list(states) if states is not None else ["direct"] * len(rows)
     kinds = list(kinds) if kinds is not None else ["call"] * len(rows)
     targets = list(targets) if targets is not None else ["live store"] * len(rows)
+    accesses = list(accesses) if accesses is not None else ["rw"] * len(rows)
     c = _tally(states)
     sm = _summary_line(c) if summary is None else summary
     sl = _state_line(c) if state_line is None else state_line
@@ -116,7 +118,7 @@ def _ledger(rows, states=None, summary=None, state_line=None, kinds=None, target
         "## 2. The ledger\n\n" + TABLE_HEAD
     )
     body = "".join(
-        _row(i + 1, r, states[i], kinds[i], targets[i]) for i, r in enumerate(rows)
+        _row(i + 1, r, states[i], kinds[i], targets[i], accesses[i]) for i, r in enumerate(rows)
     )
     return head + body + FOOTER
 
@@ -1120,3 +1122,144 @@ def test_dc9_the_phrase_in_prose_is_not_a_ceiling_line(tmp_path):
                         "Also **direct ceiling:** 99 mid-line.\n", 1)
     r = _run(_make_repo(tmp_path, files, [], ledger_text=text))
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+# ---- direct-by-design: independent-check, the third phase (#4799, part of #4647) ----
+# Contract (the #2652 epic owner's ruling on #4799): the phase set stays CLOSED,
+# now three. `independent-check` is allowed ONLY on a row whose `access` column
+# (read by header name) is `ro`, and only with a REASON in the state cell after
+# the phase: `direct-by-design: independent-check — <reason>`. The two older
+# phases keep their behaviour, access and all. The ceiling stays 15.
+
+REASON = "reads the live store to compare it with the copy: through the owner it would check itself"
+
+
+def _ic(reason=REASON, sep=" — "):
+    return "direct-by-design: independent-check" + (sep + reason if reason is not None else "")
+
+
+def _ic_run(tmp_path, state, access="ro"):
+    text = _ledger([C("a.py", 1)], states=[state], accesses=[access])
+    return _run_ledger(tmp_path, text)
+
+
+def test_i1_independent_check_on_a_ro_row_with_a_reason_passes(tmp_path):
+    r = _ic_run(tmp_path, _ic(), "ro")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_i2_independent_check_on_a_non_ro_row_fails_whatever_the_reason_says(tmp_path):
+    for n, access in enumerate(("rw", "—", "ro, rw", "RO", "")):
+        r = _ic_run(tmp_path / f"a{n}", _ic("it only reads, honest"), access)
+        assert r.returncode == 1, access + r.stdout
+        assert "row 1: direct-by-design: independent-check needs access `ro`" in r.stdout, access
+        assert f"(got '{access}')" in r.stdout, access
+
+
+def test_i3_independent_check_without_a_reason_fails_naming_the_row(tmp_path):
+    for n, state in enumerate((
+        "direct-by-design: independent-check",
+        "direct-by-design: independent-check —",
+        "direct-by-design: independent-check — ",
+    )):
+        r = _ic_run(tmp_path / f"r{n}", state, "ro")
+        assert r.returncode == 1, state + r.stdout
+        assert "row 1: direct-by-design: independent-check needs a reason" in r.stdout, state
+
+
+def test_i4_unknown_phase_still_fails_and_the_failure_names_all_three(tmp_path):
+    for n, bad in enumerate((
+        "direct-by-design: slower",
+        "direct-by-design: independent-checks — " + REASON,
+        "direct-by-design: independent-check-ish — " + REASON,
+        "direct-by-design: Independent-Check — " + REASON,
+        "direct-by-design: independent — " + REASON,
+    )):
+        r = _ic_run(tmp_path / f"u{n}", bad, "ro")
+        assert r.returncode == 1, bad + r.stdout
+        assert "row 1: direct-by-design needs a phase" in r.stdout, bad
+        for phase in ("pre-owner", "exclusive-maintenance", "independent-check"):
+            assert phase in r.stdout, (bad, phase)
+
+
+def test_i5_the_two_older_phases_are_unaffected_by_the_ro_rule(tmp_path):
+    # Not `ro`, and still green: the ro rule applies to the new phase only.
+    for n, state in enumerate(("direct-by-design: pre-owner",
+                               "direct-by-design: exclusive-maintenance")):
+        r = _ic_run(tmp_path / f"o{n}", state, "rw")
+        assert r.returncode == 0, state + r.stdout + r.stderr
+    # And they still take no reason text (l1e), the new phase's separator included.
+    r = _ic_run(tmp_path / "x", "direct-by-design: pre-owner — because", "ro")
+    assert r.returncode == 1
+    assert "row 1: direct-by-design needs a phase" in r.stdout
+
+
+def test_i6_access_is_read_by_header_name_not_by_index(tmp_path):
+    # `access` sits at a different position and a neighbouring cell says `ro`
+    # (or `rw`) in free text: a fixed index would read the wrong cell.
+    files = {"a.py": L(1)}
+
+    def ledger(access, note):
+        c = _tally(["direct-by-design"])
+        head = (
+            "# l\n\n## Summary\n\n" + _summary_line(c)
+            + "\n## 1. P\n\n" + _unit_line(1) + _kind_line({"call": 1, "prose": 0})
+            + _target_line(_count(["live store"], TARGETS))
+            + _state_line(c) + _ceiling_line(0)
+            + "\n## 2. The ledger\n\n| # | site | kind | target | state | access | note |\n"
+            "|---|---|---|---|---|---|---|\n"
+        )
+        body = f"| 1 | {C('a.py', 1)} | call | live store | {_ic()} | {access} | {note} |\n"
+        return head + body + FOOTER
+
+    ok = _run(_make_repo(tmp_path / "ok", files, [], ledger_text=ledger("ro", "rw")))
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    bad = _run(_make_repo(tmp_path / "bad", files, [], ledger_text=ledger("rw", "ro")))
+    assert bad.returncode == 1
+    assert "row 1: direct-by-design: independent-check needs access `ro`" in bad.stdout
+    assert "(got 'rw')" in bad.stdout
+
+
+def test_i7_independent_check_row_is_not_counted_against_the_ceiling(tmp_path):
+    files = {"a.py": L(1, 2, 3)}
+    text = _ledger([C("a.py", 1), C("a.py", 2), C("a.py", 3)],
+                   states=["direct", "direct", _ic()], accesses=["rw", "rw", "ro"])
+    r = _run(_make_repo(tmp_path, files, [], ledger_text=text))
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def _real_ledger_text():
+    return (REPO / "docs" / "internal" / "2652-migration-ledger.md").read_text(encoding="utf-8")
+
+
+def _real_checker():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("check_2652_ledger_real", TOOL)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_i8_real_ledger_direct_count_is_15_and_equals_the_ceiling_unchanged():
+    # The decision on #4799 was ROUTE 1: the ceiling stays 15. Population: the
+    # Section-2 rows whose state cell is exactly plain `direct`.
+    mod = _real_checker()
+    text = _real_ledger_text()
+    states, problems = mod.row_states(text)
+    assert not problems, problems
+    plain_direct = [n for n, v in states if v == "direct"]
+    ceiling, problem = mod.section1_ceiling(text)
+    assert problem is None, problem
+    assert len(plain_direct) == 15, plain_direct
+    assert ceiling == 15
+
+
+def test_i9_real_row_87_is_direct_by_design_under_independent_check_and_ro():
+    mod = _real_checker()
+    text = _real_ledger_text()
+    states = dict(mod.row_states(text)[0])
+    access = dict(mod.row_column(text, "access", "access", report_width=False)[0])
+    assert states["87"].startswith("direct-by-design: independent-check"), states["87"]
+    assert access["87"] == "ro"
+    assert _run(REPO).returncode == 0

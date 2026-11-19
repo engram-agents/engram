@@ -32,11 +32,23 @@ HEADER NAME, and compares it with the two places Section 1 states it: the bold
 `- **state:**` line. A state value outside the known set fails, naming the row.
 
 `direct-by-design` is a live-store state whose cell names its PHASE after a
-colon, from a CLOSED set: `pre-owner` (bootstrap/install, before any owner can
-exist) or `exclusive-maintenance` (needs the store with no owner running).
-Nothing else qualifies. A `direct-by-design` cell with no phase, or with a phase
-outside the set, fails naming the row (`row N: direct-by-design needs a phase
-...`). The row still tallies under `direct-by-design`.
+colon, from a CLOSED set of three: `pre-owner` (bootstrap/install, before any
+owner can exist), `exclusive-maintenance` (needs the store with no owner
+running) or `independent-check` (a read-only open of the live store by an
+operator tool whose job is to check the store or its backups, where going
+through the owner would make the check depend on what it checks; writes never
+qualify). Nothing else qualifies. A `direct-by-design` cell with no phase, or
+with a phase outside the set, fails naming the row (`row N: direct-by-design
+needs a phase ...`). The row still tallies under `direct-by-design`.
+
+The first two phases are the whole cell. `independent-check` carries its REASON
+in the cell after an em dash, `direct-by-design: independent-check — <what the
+read checks and why routing it through the owner would defeat the check>`, and
+fails without non-empty reason text (`row N: direct-by-design: independent-check
+needs a reason ...`). It is allowed ONLY on a row whose `access` column, read BY
+HEADER NAME like `state`, is exactly `ro`; any other access fails whatever the
+reason says (`row N: direct-by-design: independent-check needs access `ro``).
+The `ro` rule applies to this phase only: the other two keep their behaviour.
 
 DIRECT CEILING. Section 1 carries exactly one `- **direct ceiling:** N` line.
 N is read strictly: the text after the colon must OPEN with N in ASCII digits
@@ -115,7 +127,12 @@ OLD_CITE = re.compile(r"^`([^`]+:\d+)`")
 MODULE = "<module>"
 NO_FUNC = "—"
 DIRECT_BY_DESIGN = "direct-by-design"
-DBD_PHASES = ("pre-owner", "exclusive-maintenance")
+INDEPENDENT_CHECK = "independent-check"
+PLAIN_PHASES = ("pre-owner", "exclusive-maintenance")
+DBD_PHASES = PLAIN_PHASES + (INDEPENDENT_CHECK,)
+# The phase text after `direct-by-design:`; group 1 is the reason after an em
+# dash. `independent-checks` or `independent-check-ish` do not match.
+IC_PHASE = re.compile(re.escape(INDEPENDENT_CHECK) + r"(?:\s*—(.*))?", re.S)
 LIVE_STATES = ("owner", "direct", DIRECT_BY_DESIGN, "behind-flag", "flag-on", "retired")
 OUT_OF_SCOPE = "out of scope"
 ALL_STATES = LIVE_STATES + (OUT_OF_SCOPE,)
@@ -160,8 +177,8 @@ REMEDY = (
 )
 CEILING_REMEDY = (
     "route it through the owner behind an `engramd.*_via_owner` flag (state `behind-flag`); "
-    "or classify it `direct-by-design: <phase>` if it truly is pre-owner or "
-    "exclusive-maintenance; or raise the ceiling in the same PR, with the #2652 epic "
+    "or classify it `direct-by-design: <phase>` if it truly is pre-owner, "
+    "exclusive-maintenance or an independent-check (read-only, by a tool that checks the store); or raise the ceiling in the same PR, with the #2652 epic "
     "owner's written OK linked in the PR body"
 )
 CITE_REMEDY = (
@@ -272,19 +289,36 @@ def row_states(text):
     return row_column(text, "state", "states")
 
 
-def derived_tally(states):
-    """Return (tally, problems) from (row, value) pairs."""
+def derived_tally(states, access=None):
+    """Return (tally, problems) from (row, value) pairs. `access` maps a row
+    number to its `access` cell; a row missing from it has none, and an
+    `independent-check` row with no `ro` access fails."""
     tally = Counter()
     problems = []
+    access = access or {}
     for num, value in states:
         base, _, phase = value.partition(":")
         if base.strip() == DIRECT_BY_DESIGN:
             tally[DIRECT_BY_DESIGN] += 1
-            if not (":" in value and phase.strip() in DBD_PHASES):
+            phase = phase.strip()
+            ic = IC_PHASE.fullmatch(phase) if ":" in value else None
+            if ic:
+                if not (ic.group(1) or "").strip():
+                    problems.append(
+                        f"row {num}: direct-by-design: {INDEPENDENT_CHECK} needs a reason "
+                        f"after the phase: `{INDEPENDENT_CHECK} — <what the read checks, "
+                        "and why going through the owner would defeat the check>`"
+                    )
+                if access.get(num) != "ro":
+                    problems.append(
+                        f"row {num}: direct-by-design: {INDEPENDENT_CHECK} needs access `ro` "
+                        f"(got '{access.get(num, '')}'): writes never qualify"
+                    )
+            elif not (":" in value and phase in PLAIN_PHASES):
                 problems.append(
                     f"row {num}: direct-by-design needs a phase, one of: "
                     + ", ".join(DBD_PHASES)
-                    + f" (got '{phase.strip()}')"
+                    + f" (got '{phase}')"
                 )
         elif value in ALL_STATES:
             tally[value] += 1
@@ -476,7 +510,8 @@ def tally_problems(text):
     states, problems = row_states(text)
     if problems and any(p.startswith("could not parse") for p in problems):
         return problems
-    tally, more = derived_tally(states)
+    access, _ap = row_column(text, "access", "access", report_width=False)
+    tally, more = derived_tally(states, dict(access))
     problems += more
     if not any(p.startswith("could not parse") for p in more):
         problems += ceiling_problems(text, tally["direct"])
