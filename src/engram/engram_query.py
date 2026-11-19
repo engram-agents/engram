@@ -565,7 +565,8 @@ def _pattern_stale_load_bearing(
     # the final ranking is by gap and the pool is wide enough (200) to catch
     # typical cases. If empirical signal shows misses, raise the limit.
     rows = conn.execute(
-        "SELECT id, type, claim, importance_base, importance_score, recall_count, metadata "
+        "SELECT id, type, claim, importance_base, importance_score, recall_count, metadata, "
+        "predicted_event "
         "FROM nodes "
         "WHERE is_current=1 "
         "AND type NOT IN ('cornerstone', 'feeling_report') "
@@ -575,7 +576,11 @@ def _pattern_stale_load_bearing(
     ).fetchall()
 
     candidates: list[dict] = []
-    for nid, ntype, claim, imp_base, imp_score, recalls, meta_json in rows:
+    for nid, ntype, claim, imp_base, imp_score, recalls, meta_json, predicted_event in rows:
+        # A prediction keeps its text in predicted_event (claim is NULL, #2328/#4793).
+        claim = _tier1_fallback_text(
+            {"type": ntype, "claim": claim, "predicted_event": predicted_event}
+        ) or claim
         meta = core._metadata_dict(meta_json)
         # Protection-channel floor: skip nodes kept live by any channel other
         # than deliberate recall — their inflation gap is benign, not erosion.
@@ -823,13 +828,17 @@ def _pattern_tainted_still_valid(
     # taint-severity marker: distinct node_id, joined to nodes for the
     # candidate fields.
     rows = conn.execute(
-        "SELECT DISTINCT n.id, n.type, n.claim, n.confidence FROM nodes n "
+        "SELECT DISTINCT n.id, n.type, n.claim, n.confidence, n.predicted_event FROM nodes n "
         "JOIN cascade_markers cm ON cm.node_id = n.id "
         "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"
     ).fetchall()
 
     candidates: list[dict] = []
-    for nid, ntype, claim, conf in rows:
+    for nid, ntype, claim, conf, predicted_event in rows:
+        # A prediction keeps its text in predicted_event (claim is NULL, #2328/#4793).
+        claim = _tier1_fallback_text(
+            {"type": ntype, "claim": claim, "predicted_event": predicted_event}
+        ) or claim
         # min_confidence is a CB-only predicate (#2252 Stage 1.7): ask "is
         # this claim-bearing" before applying the threshold, rather than
         # letting absent-confidence collapse to zero. NCB nodes and CB

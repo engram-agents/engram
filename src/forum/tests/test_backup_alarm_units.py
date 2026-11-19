@@ -213,7 +213,7 @@ class TestInstallerInstallsAlarm:
         r = subprocess.run(
             ["bash", str(INSTALLER), "--src", str(_REPO),
              "--service-dir", str(tmp_path / "forum"), "--group", "agents",
-             "--dry-run", "--no-start"],
+             "--auth-mode", "enforce", "--dry-run", "--no-start"],
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stdout + r.stderr
@@ -279,7 +279,7 @@ class TestInstallerInstallsAlarm:
             r = subprocess.run(
                 ["bash", str(INSTALLER), "--src", str(_REPO),
                  "--service-dir", str(tmp_path / "forum"), "--group", "agents",
-             "--dry-run", "--no-start"],
+             "--auth-mode", "enforce", "--dry-run", "--no-start"],
                 capture_output=True, text=True, env=env,
             )
             assert r.returncode == 0
@@ -296,13 +296,17 @@ def run_block(tmp_path):
     text = INSTALLER.read_text(encoding="utf-8")
     m = re.search(r"^# >>> backup-units\n(.*?)^# <<< backup-units\n", text, re.S | re.M)
     assert m, "installer must delimit the backup-unit block with '# >>> backup-units' / '# <<< backup-units'"
+    # #4886: the mention is resolved and validated in the installer's argument stage, in
+    # its own marked region that runs BEFORE the backup-unit block; run both, in order.
+    mm = re.search(r"^# >>> alarm-mention\n(.*?)^# <<< alarm-mention\n", text, re.S | re.M)
+    assert mm, "installer must delimit the mention check with '# >>> alarm-mention' / '# <<< alarm-mention'"
     unit_dir = tmp_path / "units"
     unit_dir.mkdir()
     script = (
         "set -euo pipefail\n"
         f"SRC={shlex.quote(str(_REPO))}\nUNIT_DIR={shlex.quote(str(unit_dir))}\nDRY_RUN=0\n"
         f"SERVICE_DIR={shlex.quote(str(tmp_path / 'forum'))}\n"
-        'RUN() { "$@"; }\n' + m.group(1)
+        'RUN() { "$@"; }\n' + mm.group(1) + m.group(1)
     )
 
     def _run(env: dict | None = None, check: bool = True):
@@ -310,7 +314,9 @@ def run_block(tmp_path):
         pass a dict to set exactly those two."""
         base = {k: v for k, v in os.environ.items()
                 if k not in ("FORUM_BACKUP_ALARM_MENTION", "USER")}
-        base.update(env or {})
+        if env is None:  # #4886: an empty effective mention is refused, so give the block one
+            env = {"FORUM_BACKUP_ALARM_MENTION": "testseat"}
+        base.update(env)
         r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=base)
         if check:
             assert r.returncode == 0, r.stdout + r.stderr
@@ -415,10 +421,19 @@ class TestInstallerWritesMentionDropIn:
         run(env={"USER": "plainuser"})
         assert self._value(unit_dir) == "plainuser"
 
-    def test_neither_env_nor_user_writes_an_empty_value(self, run_block):
+    # Removed-test: src/forum/tests/test_backup_alarm_units.py::TestInstallerWritesMentionDropIn::test_neither_env_nor_user_writes_an_empty_value — #4886 C5 changed the contract on purpose (an empty effective mention is now refused); replaced by test_neither_env_nor_user_is_refused_and_writes_nothing below
+    @pytest.mark.parametrize("env", [{}, {"FORUM_BACKUP_ALARM_MENTION": ""},
+                                     {"FORUM_BACKUP_ALARM_MENTION": " , "}],
+                             ids=["neither", "empty", "separators-only"])
+    def test_neither_env_nor_user_is_refused_and_writes_nothing(self, run_block, env):
+        """#4886 (C5, changed on purpose; was: writes an empty value). An alarm that
+        mentions nobody wakes nobody, so an empty effective value is refused."""
         unit_dir, run = run_block
-        run(env={})
-        assert self._value(unit_dir) == ""
+        r = run(env=env, check=False)
+        assert r.returncode != 0
+        assert "FORUM_BACKUP_ALARM_MENTION" in r.stderr and "empty" in r.stderr
+        assert not self._mention_conf(unit_dir).exists()
+        assert not (unit_dir / "engram-forum-backup-alarm.service").exists()
 
     def test_dropin_is_rewritten_on_every_run(self, run_block):
         unit_dir, run = run_block
@@ -446,7 +461,8 @@ class TestInstallerWritesMentionDropIn:
         env = {**os.environ, "HOME": str(tmp_path), "FORUM_BACKUP_ALARM_MENTION": "admin1 admin2"}
         r = subprocess.run(
             ["bash", str(INSTALLER), "--src", str(_REPO), "--service-dir", str(tmp_path / "forum"),
-             "--group", "agents", "--dry-run", "--no-start"], capture_output=True, text=True, env=env)
+             "--group", "agents", "--auth-mode", "enforce", "--dry-run", "--no-start"],
+            capture_output=True, text=True, env=env)
         assert r.returncode == 0, r.stdout + r.stderr
         assert any("mention.conf" in ln and "admin1 admin2" in ln for ln in r.stdout.splitlines()), r.stdout
 

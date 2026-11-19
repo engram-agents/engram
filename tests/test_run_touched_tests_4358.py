@@ -10,8 +10,8 @@ Written BEFORE the implementation (contract-first). The contract:
      named as unreferenced, and the guard set runs. Always-full triggers and
      the convention map's own full-suite signal are unchanged.
   5. server.py has no special case.
-  6. The guard set (PR-MERGE-POLICY "Owner merge" item 4 test files) always
-     runs in a non-full, non-empty-change selection.
+  6. The guard set (PR-MERGE-POLICY "Owner merge" item 4 test files, read by
+     `guard_set`) always runs in a non-full, non-empty-change selection.
   7. Output names per-layer counts and the unreferenced files; the SUBSET
      green line points at the nightly and the release cut.
 
@@ -69,7 +69,7 @@ def _repo(tmp_path: Path, files: dict[str, str]) -> str:
 
 
 def _select(changed, repo, guard=(), detail=None):
-    with mock.patch.object(_runner, "GUARD_SET_TESTS", tuple(guard)):
+    with mock.patch.object(_runner, "guard_set", return_value=(list(guard), [])):
         return _runner.select_tests(changed, repo, detail=detail)
 
 
@@ -106,7 +106,7 @@ def test_c2_unreferenced_file_selects_only_guard_and_is_named(tmp_path, capsys):
     assert selected == ["tests/test_guard.py"]
     assert detail["unreferenced"] == ["data/zzz_nowhere.cfg"]
     # and the human output names it
-    with mock.patch.object(_runner, "GUARD_SET_TESTS", ("tests/test_guard.py",)), \
+    with mock.patch.object(_runner, "guard_set", return_value=(["tests/test_guard.py"], [])), \
          mock.patch.object(_runner, "_changed_files", return_value=["data/zzz_nowhere.cfg"]):
         rc = _runner.main(["--dry-run", "--base", "HEAD", "--repo-root", repo])
     assert rc == 0
@@ -266,8 +266,9 @@ def test_subset_green_line_points_at_nightly_and_release(tmp_path, capsys):
     repo = _repo(tmp_path, {
         "module_a.py": "A = 1\n",
         "tests/test_b.py": "import module_a\n",
+        "tests/test_unrelated.py": "x = 1\n",  # selection must not be the whole universe (C5, exit 6)
     })
-    with mock.patch.object(_runner, "GUARD_SET_TESTS", ()), \
+    with mock.patch.object(_runner, "guard_set", return_value=([], [])), \
          mock.patch.object(_runner, "_changed_files", return_value=["module_a.py"]):
         _runner.main(["--dry-run", "--base", "HEAD", "--repo-root", repo])
     out = capsys.readouterr().out
@@ -283,13 +284,15 @@ def test_json_carries_new_fields_additively(tmp_path, capsys):
     repo = _repo(tmp_path, {
         "tests/test_a.py": 'D = "notes.md"\n',
         "tests/test_guard.py": "y = 1\n",
+        "tests/test_unrelated.py": "x = 1\n",  # selection must not be the whole universe (C5, exit 6)
     })
-    with mock.patch.object(_runner, "GUARD_SET_TESTS", ("tests/test_guard.py",)), \
+    with mock.patch.object(_runner, "guard_set", return_value=(["tests/test_guard.py"], [])), \
          mock.patch.object(_runner, "_changed_files", return_value=["notes.md", "lost.zz"]):
         _runner.main(["--json", "--base", "HEAD", "--repo-root", repo])
     d = json.loads(capsys.readouterr().out)
     for key in ("base", "buckets", "changed_files", "full", "full_reasons",
-                "selected", "total_test_files"):
+                "selected", "total_test_files",
+                "forum_selected", "forum_total_test_files", "tool_checks"):
         assert key in d  # existing keys not removed
     assert d["unreferenced"] == ["lost.zz"]
     assert d["layers"] == {
@@ -399,14 +402,16 @@ def test_c8_server_py_is_not_full_suite():
 
 
 def test_c9_every_guard_set_path_exists():
-    assert _runner.GUARD_SET_TESTS, "guard set must not be empty"
-    assert len(set(_runner.GUARD_SET_TESTS)) == len(_runner.GUARD_SET_TESTS)
-    missing = [p for p in _runner.GUARD_SET_TESTS if not (REPO_ROOT / p).is_file()]
+    # guard_set() itself refuses (exit 3) when a named path is absent; this pins
+    # that the real document is readable and every path it names is on disk.
+    guard_tests, tool_checks = _runner.guard_set(str(REPO_ROOT))
+    assert guard_tests, "guard set must not be empty"
+    assert len(set(guard_tests)) == len(guard_tests)
+    missing = [p for p in guard_tests + tool_checks if not (REPO_ROOT / p).is_file()]
     assert not missing, f"guard-set entries missing from the tree: {missing}"
-    assert all(p.startswith("tests/test_") and p.endswith(".py")
-               for p in _runner.GUARD_SET_TESTS)
+    assert all(p.startswith("tests/test_") and p.endswith(".py") for p in guard_tests)
 
 
 def test_guard_set_runs_in_real_tree_selection():
     selected, _f, _r, _m = _runner.select_tests(["docs/compaction-continuity.md"], str(REPO_ROOT))
-    assert set(_runner.GUARD_SET_TESTS) <= set(selected)
+    assert set(_runner.guard_set(str(REPO_ROOT))[0]) <= set(selected)

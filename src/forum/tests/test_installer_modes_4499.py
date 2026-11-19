@@ -170,8 +170,9 @@ def test_i1_the_dry_run_plan_prints_the_new_modes_and_not_the_old(tmp_path, mask
     svc = tmp_path / "forum"
     r = subprocess.run(
         ["bash", "-c", f"umask {mask:04o}; bash {INSTALLER} --src {_REPO} --service-dir {svc} "
-                       f"--group agents --dry-run"],
-        capture_output=True, text=True, env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)},
+                       f"--group agents --auth-mode enforce --dry-run"],
+        capture_output=True, text=True, env={"PATH": os.environ["PATH"], "HOME": str(tmp_path),
+             "FORUM_BACKUP_ALARM_MENTION": "testseat"},  # #4886: an empty mention is refused; no USER here
     )
     assert r.returncode == 0, r.stderr
     out = r.stdout + r.stderr
@@ -338,8 +339,9 @@ def test_i3_the_installer_body_normalizes_before_it_asserts(tmp_path, mask):
     svc = tmp_path / "forum"
     r = subprocess.run(
         ["bash", "-c", f"umask {mask:04o}; bash {INSTALLER} --src {_REPO} --service-dir {svc} "
-                       f"--group agents --dry-run"],
-        capture_output=True, text=True, env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)},
+                       f"--group agents --auth-mode enforce --dry-run"],
+        capture_output=True, text=True, env={"PATH": os.environ["PATH"], "HOME": str(tmp_path),
+             "FORUM_BACKUP_ALARM_MENTION": "testseat"},  # #4886: an empty mention is refused; no USER here
     )
     assert r.returncode == 0, r.stderr
     out = r.stdout + r.stderr

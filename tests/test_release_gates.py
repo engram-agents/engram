@@ -69,6 +69,7 @@ from tools.release_gates import (
     run_G1,
     run_G3a,
     run_G4b,
+    run_G5,
     run_G6,
     run_scorecard,
 )
@@ -1010,3 +1011,129 @@ class TestPluginVersionHasChangelogSection(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertEqual(_check_version_vs_changelog(version, changelog), [])
+
+
+# ---------------------------------------------------------------------------
+# G5 — coverage incomplete (scan-leaks exit 3) is its own verdict (#4752)
+# ---------------------------------------------------------------------------
+
+class TestG5CoverageIncomplete:
+    """G5 must distinguish "did not look" from "looked and found hits".
+
+    scan-leaks exits 3 when no findings were found but the scan could not read
+    every candidate (or had none). Before #4752 that code fell through to the
+    hit-count path, which reports "found 0 potential leak(s)" — true of the
+    findings, false of the coverage. These cells pin the new branch and the
+    neighbouring hit-count path, so the branch cannot swallow the latter.
+    """
+
+    _REPO_ROOT = str(PROJECT_ROOT)
+
+    def _fake_proc(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+        """Build a mock CompletedProcess-alike (same shape as TestG3aParser)."""
+        p = mock.MagicMock()
+        p.stdout = stdout
+        p.stderr = stderr
+        p.returncode = returncode
+        return p
+
+    def test_exit_3_is_degraded_and_names_coverage(self):
+        """No findings + exit 3 → DEGRADED naming coverage, never "0 leaks"."""
+        proc = self._fake_proc(
+            stdout=(
+                "scan-leaks: scanned 1, skipped-binary 0\n"
+                "scan-leaks: unreadable 1 (coverage incomplete): locked.txt\n"
+            ),
+            stderr="",
+            returncode=3,
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            result = run_G5(self._REPO_ROOT)
+        assert result["status"] == STATUS_DEGRADED, result
+        assert result["metric"] == "coverage incomplete", result
+        assert "coverage incomplete" in result["detail"], result
+        # The hit-count path's claim must not be what a caller reads here.
+        assert "found 0 potential leak" not in result["detail"], result
+
+    def test_exit_3_detail_names_the_missing_line(self):
+        """The detail points at every coverage line, including "missing".
+
+        A file tracked in git but absent from the worktree is a "missing"
+        candidate, and the scanner says so on its own line. A detail that
+        omits it sends a reader whose only hit is that line to a line the
+        scanner never printed.
+        """
+        proc = self._fake_proc(
+            stdout=(
+                "scan-leaks: scanned 1, skipped-binary 0\n"
+                "scan-leaks: missing 1 (coverage incomplete): gone.txt\n"
+            ),
+            stderr="",
+            returncode=3,
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            result = run_G5(self._REPO_ROOT)
+        assert result["status"] == STATUS_DEGRADED, result
+        assert result["metric"] == "coverage incomplete", result
+        assert "missing" in result["detail"], result
+        assert "coverage incomplete" in result["detail"], result
+
+    def test_exit_1_still_takes_the_hit_count_path(self):
+        """Positive control: exit 1 still takes the hit-count path (not the
+        coverage branch), and the count is the CLASS-A number.
+
+        The stderr shape is the format-2 one: class-A hits print no per-line
+        location, so the summary line is the only place the count exists.
+        """
+        proc = self._fake_proc(
+            stdout="scan-leaks: scanned 1, skipped-binary 0\n",
+            stderr=(
+                "scan-leaks: 2 class-A (blocking) and 0 class-B (report-only) "
+                "hit(s) in /repo\n"
+            ),
+            returncode=1,
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            result = run_G5(self._REPO_ROOT)
+        assert result["status"] == STATUS_DEGRADED, result
+        assert result["metric"] == "2 hit(s)", result
+        assert "found 2 potential leak" in result["detail"], result
+        assert "coverage incomplete" not in result["detail"], result
+
+    def test_exit_1_reads_the_class_a_count_from_the_summary(self):
+        """Cell 16: the reported count is the class-A number from the summary.
+
+        Class-A hits no longer print `  path:line ...` lines, so counting
+        indented stderr lines reports 0 for a real class-A hit. The fixture
+        discriminates: three class-A hits and one class-B line — a
+        line-counting implementation reports 1, the summary says 3.
+        """
+        proc = self._fake_proc(
+            stdout="scan-leaks: scanned 4, skipped-binary 0\n",
+            stderr=(
+                "scan-leaks: 3 class-A (blocking) and 1 class-B (report-only) "
+                "hit(s) in /repo\n"
+                "  doc.md:1 [roster file] Quillonfex\n"
+            ),
+            returncode=1,
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            result = run_G5(self._REPO_ROOT)
+        assert result["status"] == STATUS_DEGRADED, result
+        assert result["metric"] == "3 hit(s)", result
+        assert "found 3 potential leak" in result["detail"], result
+
+    def test_exit_1_with_no_verdict_is_degraded_not_zero_hits(self):
+        """Cell 16 (DEGRADED arm): exit 1 with no class-A summary line is a
+        scan that produced no verdict. It must not report "0 hit(s)", which
+        reads as a clean tree."""
+        proc = self._fake_proc(
+            stdout="scan-leaks: scanned 4, skipped-binary 0\n",
+            stderr="",
+            returncode=1,
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            result = run_G5(self._REPO_ROOT)
+        assert result["status"] == STATUS_DEGRADED, result
+        assert result["metric"] == "did not run", result
+        assert result["metric"] != "0 hit(s)", result

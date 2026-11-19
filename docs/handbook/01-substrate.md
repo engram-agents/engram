@@ -164,13 +164,13 @@ Observation confidence computed in `_add_observation_impl()` in `engram_observat
 
 **what** — Immutability via supersession: old versions are never deleted, only marked superseded (is_current→0, superseded_by field set). A new derivation can supersede an older one; retraction removes a node from all query results and the FTS index but preserves it for audit. Cascade deletion is NOT used; instead, edges to superseded/retracted nodes are preserved (ancestors remain visible for forensics). The "cascade" edge relation (`retracts`, `supersedes`) is not confidence-propagating (DAG-exempt).
 
-**how** — Supersede entry: `engram_supersede()` (server.py wrapper at :4552 → `_supersede_impl()` in `engram_revision.py:440`) creates a supersedes edge, updates is_current/superseded_by on old node. Retract entry: `engram_retract()` (server.py wrapper at :4647 → `_retract_impl()` in `engram_revision.py:783`) sets status='retracted', removes from FTS via trigger. Cascade downstream walk: `_walk_cascade_downstream()` in `engram_revision.py:97` traverses edges to find dependent nodes, but does NOT auto-cascade retract/supersede (manual sweep only).
+**how** — Supersede entry: `engram_supersede()` (server.py wrapper at :4552 → `_supersede_impl()` in `engram_revision.py:440`) creates a supersedes edge, updates is_current/superseded_by on old node. Retract entry: `engram_retract()` (server.py wrapper at :4647 → `_retract_impl()` in `engram_revision.py:783`) sets status='retracted', removes from FTS via trigger. Cascade downstream walk: `_walk_cascade_from_root()` / `_walk_cascade_downstream()` in `engram_core.py` (promoted from `engram_revision.py`, #4727) traverses edges to find dependent nodes, but does NOT auto-cascade retract/supersede (manual sweep only).
 
 Columns: `nodes.is_current` (1=current, 0=superseded), `nodes.superseded_by` (target node ID), `nodes.status` (active/retracted). Retract trigger fires on status transition into 'retracted' (1625–1635).
 
 **status-candidate** — **prod-presumed** (used in every lifecycle story; retract/supersede are critical cleanup tools).
 
-**files** — `engram_revision.py` (`_walk_cascade_downstream()` :97; `_retract_impl()` :783; `_supersede_impl()` :440). server.py (wrappers: `engram_supersede` :4552; `engram_retract` :4647). `engram_core.py` (retract trigger in DB init).
+**files** — `engram_core.py` (`_walk_cascade_from_root()`, `_walk_cascade_downstream()`); `engram_revision.py` (`_retract_impl()` :783; `_supersede_impl()` :440). server.py (wrappers: `engram_supersede` :4552; `engram_retract` :4647). `engram_core.py` (retract trigger in DB init).
 
 **key constants** — `DAG_EXEMPT_RELATIONS` in `engram_core.py:506`: {"retracts", "supersedes", "about"} (non-confidence-propagating; derived from EDGE_CLASSIFICATIONS where dag_check=False).
 

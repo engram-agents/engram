@@ -78,9 +78,19 @@ _INDEX_LOCK_STALE_SECS = 120
 _lock = threading.Lock()          # serializes ALL queue-file writes + seq handout
 _work_event = threading.Event()   # set when a new job is enqueued
 _worker_thread: Optional[threading.Thread] = None
+# The CURRENT worker's stop token (#4833). Each worker thread owns its own token: it is
+# only ever SET, never cleared, and start_worker() REBINDS this name to a fresh Event
+# instead of clearing the old one, so a stop given to a worker is never undone (an
+# orphan still in a job exits after it, whatever starts later).
 _stop = threading.Event()
 _seq_counter = 0                  # monotonic per-process; seeded from disk on start
 _started = False
+
+
+# Failure keys already logged by _process_job: (turn, seq, first line of reason). A job that
+# stays pending is retried every wake (<= 30 s); logging each retry would flood the server
+# log, so a given reason is logged once per job per process, and a new reason logs again.
+_logged_failures: set = set()
 
 
 def _log(msg: str) -> None:
@@ -441,6 +451,36 @@ def _regenerate_derived_files(snapshot_path: Path, captured_at: Optional[str] = 
     (engram_core.DATA_DIR / "graph_snapshot.md").write_text(md, encoding="utf-8")
 
 
+def _is_benign_no_commit(reason: str) -> bool:
+    """True iff ``reason`` (from _commit_snapshot_files, git_committed False) means there is
+    nothing more a retry could commit, so the job may be retired. An ALLOW-list: an
+    unlisted reason is NOT benign."""
+    # Read from _commit_snapshot_files' own return values (the literals above).
+    if reason in (
+        "no changes since last commit",
+        "no tracked files exist",
+        "all stageable files are gitignored",
+    ):
+        return True
+    # S1 no repository. Two conditions, both required. (a) Read from git 2.43.0: `git add`
+    # in a directory that is not a repository prints `fatal: not a git repository (or any of
+    # the parent directories): .git`. (b) DATA_DIR/.git does not exist (os.path.lexists, so a
+    # broken symlink counts as existing). A DAMAGED repository (garbage, empty or missing
+    # .git/HEAD; missing .git/objects) prints the same text, and it can be repaired, so its
+    # job must stay pending rather than be retired.
+    if reason.startswith("git add failed: fatal: not a git repository"):
+        import engram_core  # lazy
+        return not os.path.lexists(engram_core.DATA_DIR / ".git")
+    # S2 no git binary. Read from engram_core._git, which turns the FileNotFoundError into
+    # stderr = str(e); for a missing executable that is `[Errno 2] No such file or
+    # directory: '<GIT_EXE>'`. It must name the git executable itself: a
+    # FileNotFoundError naming any other path (a missing data dir) is not this case.
+    if reason.startswith("git add failed: [Errno 2]"):
+        import engram_core  # lazy
+        return reason.endswith(repr(engram_core.GIT_EXE))
+    return False
+
+
 def _process_job(job: dict) -> bool:
     """Process one pending job: regenerate derived files from its captured snapshot,
     commit, mark done, unlink the snapshot. Returns True on success (job done),
@@ -457,12 +497,23 @@ def _process_job(job: dict) -> bool:
             return False
         _regenerate_derived_files(snap, captured_at=job.get("captured_at"))
         commit = _commit_snapshot_files(job.get("mode", "nap"), job.get("message", ""))
-        if not commit.get("git_committed") and commit.get("reason", "").startswith("git commit failed"):
-            _log(f"commit FAILED for turn={turn},seq={seq}: {commit['reason']} — leaving job pending")
+        if not commit.get("git_committed") and not _is_benign_no_commit(commit.get("reason", "")):
+            # Allow-list (#4843): ONLY the reasons in _is_benign_no_commit retire a job
+            # that did not commit. Everything else (index.lock held, timeout, any other
+            # add error, commit failed, an unknown reason) leaves it pending with its
+            # snapshot kept, so the commit is retried; the backlog reader makes a stuck
+            # job visible once it is older than its threshold.
+            reason = commit.get("reason", "")
+            key = (turn, seq, reason.split("\n", 1)[0])
+            if key not in _logged_failures:
+                _logged_failures.add(key)
+                _log(f"commit FAILED for turn={turn},seq={seq}: {reason} — leaving job pending")
             return False
-        # git_committed True, or a benign no-op ("no changes"/"gitignored"/git unavailable):
-        # the snapshot has been processed as far as it can be — mark done + reclaim.
+        # git_committed True, or a benign no-op: the snapshot has been processed as far as
+        # it can be — mark done + reclaim.
         _mark_done(turn, seq)
+        for k in [k for k in _logged_failures if k[:2] == (turn, seq)]:
+            _logged_failures.discard(k)
         # Reclaim the snapshot AND any -wal/-shm sidecars (dump_stripped opens its own
         # connection to the snapshot; a WAL-header'd image can spawn sidecars).
         for p in (snap, snap.with_name(snap.name + "-wal"), snap.with_name(snap.name + "-shm")):
@@ -472,7 +523,13 @@ def _process_job(job: dict) -> bool:
                 _log(f"could not unlink {p.name}: {e}")
         return True
     except Exception as e:
-        _log(f"job turn={turn},seq={seq} raised, leaving pending: {e}")
+        # Same log-once-per-(job, reason) rule as the commit-failure path (#4843).
+        first = (str(e).split("\n", 1) or [""])[0]
+        reason = f"raised: {type(e).__name__}: {first}"
+        key = (turn, seq, reason)
+        if key not in _logged_failures:
+            _logged_failures.add(key)
+            _log(f"job turn={turn},seq={seq} {reason} — leaving job pending")
         return False
 
 
@@ -577,12 +634,16 @@ def _seed_seq_counter() -> None:
     _seq_counter = max_seq
 
 
-def _drain_pending() -> int:
+def _drain_pending(stop: Optional[threading.Event] = None) -> int:
     """Process all currently-pending jobs FIFO. Returns count successfully done.
-    Stops early on a job that stays pending (failure) to avoid a tight retry loop."""
+    Stops early on a job that stays pending (failure) to avoid a tight retry loop.
+    ``stop`` is the calling worker's own token, checked before each job; the default
+    is the current module token (#4833)."""
+    if stop is None:
+        stop = _stop
     done = 0
     for job in _pending_jobs():
-        if _stop.is_set():
+        if stop.is_set():
             break
         if _process_job(job):
             done += 1
@@ -591,14 +652,17 @@ def _drain_pending() -> int:
     return done
 
 
-def _worker_loop() -> None:
-    while not _stop.is_set():
+def _worker_loop(stop: threading.Event) -> None:
+    """One worker thread's loop. ``stop`` is THIS worker's own token (#4833): only this
+    token is checked, and nobody ever clears it, so the thread exits after at most the
+    job it is in once the token is set."""
+    while not stop.is_set():
         _work_event.wait(timeout=30.0)
         _work_event.clear()
-        if _stop.is_set():
+        if stop.is_set():
             break
         try:
-            _drain_pending()
+            _drain_pending(stop)
             with _lock:
                 if len(_read_queue_lines()) > _QUEUE_COMPACT_THRESHOLD:
                     _compact_queue_locked()
@@ -608,31 +672,39 @@ def _worker_loop() -> None:
 
 def start_worker() -> None:
     """Idempotent: seed seq, clear a stale index-lock, compact + replay pending
-    jobs, then start the singleton worker thread. Call once at server startup."""
-    global _worker_thread, _started
+    jobs, then start the singleton worker thread with a fresh stop token of its own.
+    Call once at server startup."""
+    global _worker_thread, _started, _stop
     with _lock:
         if _started and _worker_thread and _worker_thread.is_alive():
             return
         _started = True
+    # A fresh token per worker (#4833); an earlier worker's token is never touched.
+    token = threading.Event()
+    _stop = token
     _clear_stale_index_lock()
     _seed_seq_counter()
     _reclaim_orphan_snapshots()  # drop snapshots from a crash between capture and enqueue
     with _lock:
         _compact_queue_locked()
-    replayed = _drain_pending()
+    replayed = _drain_pending(token)
     if replayed:
         _log(f"replayed {replayed} pending snapshot job(s) on startup")
-    _stop.clear()
     _worker_thread = threading.Thread(
-        target=_worker_loop, name="engram-snapshot-worker", daemon=True
+        target=_worker_loop, args=(token,), name="engram-snapshot-worker", daemon=True
     )
     _worker_thread.start()
 
 
 def stop_worker(timeout: float = 5.0) -> None:
-    """Signal the worker to stop and join (used by tests / clean shutdown)."""
+    """Signal the worker to stop and join (used by tests / clean shutdown). Sets the
+    current worker's token and never clears any token (#4833). A thread still alive
+    after the join (a job past the bound) is logged loudly."""
     _stop.set()
     _work_event.set()
     t = _worker_thread
     if t and t.is_alive():
         t.join(timeout=timeout)
+        if t.is_alive():
+            _log(f"stop_worker: worker thread still alive after {timeout}s join "
+                 f"(a job past the bound); it will exit after its current job")

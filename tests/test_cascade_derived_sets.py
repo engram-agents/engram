@@ -488,6 +488,11 @@ def test_retract_cascade_derives_from_CASCADE_RELATIONS_not_hardcoded(monkeypatc
     rev, obs, derive, core = _make_fresh_mods()
     monkeypatch.setattr(rev, "_CASCADE_RELATIONS_SORTED", ["cites"])
     monkeypatch.setattr(rev, "_CASCADE_RELATION_PLACEHOLDERS", "?")
+    # #4727: the downstream walk and its first hop moved to engram_core
+    # (_walk_cascade_from_root) and read core's constants, so the flip must
+    # reach them there too.
+    monkeypatch.setattr(core, "_CASCADE_RELATIONS_SORTED", ["cites"])
+    monkeypatch.setattr(core, "_CASCADE_RELATION_PLACEHOLDERS", "?")
 
     ob_id2 = _seed_ob(obs, "Retract-path premise (patched constants).")
     dv_id2 = _seed_dv(derive, "Retract-path derivation, patched.", ob_id2)
@@ -529,6 +534,11 @@ def test_supersede_cascade_derives_from_CASCADE_RELATIONS_not_hardcoded(monkeypa
     rev, obs, derive, core = _make_fresh_mods()
     monkeypatch.setattr(rev, "_CASCADE_RELATIONS_SORTED", ["cites"])
     monkeypatch.setattr(rev, "_CASCADE_RELATION_PLACEHOLDERS", "?")
+    # #4727: the downstream walk and its first hop moved to engram_core
+    # (_walk_cascade_from_root) and read core's constants, so the flip must
+    # reach them there too.
+    monkeypatch.setattr(core, "_CASCADE_RELATIONS_SORTED", ["cites"])
+    monkeypatch.setattr(core, "_CASCADE_RELATION_PLACEHOLDERS", "?")
 
     ob_id2 = _seed_ob(obs, "Supersede-path premise (patched constants).")
     dv_old2 = _seed_dv(derive, "Old derivation, patched.", ob_id2)

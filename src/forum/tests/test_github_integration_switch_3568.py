@@ -173,7 +173,8 @@ class TestMainStartup:
             monkeypatch.setenv("GH_TOKEN", TOKEN)
         monkeypatch.setattr(sys, "argv", [
             "forum.server", "--db", str(tmp_path / "svc" / "forum.db"),
-            "--audit", str(tmp_path / "svc" / "audit.jsonl")])
+            "--audit", str(tmp_path / "svc" / "audit.jsonl"),
+            "--auth-mode", "enforce"])  # required where the process starts (#1459)
         booted = []
         monkeypatch.setattr(server_mod, "_run_boot_verify",
                             lambda *a, **k: booted.append(1) or {})
@@ -809,7 +810,7 @@ class TestInstaller:
         env = dict(os.environ, HOME=str(home), PATH=f"{stub}{os.pathsep}{os.environ['PATH']}")
         return subprocess.run(
             ["bash", str(_INSTALLER), "--src", str(src), "--service-dir", str(tmp_path / "forum"),
-             "--group", "agents", "--dry-run", *extra],
+             "--group", "agents", "--auth-mode", "enforce", "--dry-run", *extra],
             capture_output=True, text=True, env=env)
 
     def test_installer_refuses_a_template_that_never_had_the_switch_placeholder(self, tmp_path):

@@ -5,7 +5,9 @@ Flags committed structural patterns, absolute home paths, and a gitignored
 local roster of personal names. Run standalone or wire as a pre-commit hook.
 
 Standalone:
-    python3 tools/scan-leaks.py            # exit 0 clean, 1 if leaks
+    python3 tools/scan-leaks.py            # exit 0 clean, 1 if leaks, 2 on an
+                                           # internal or invocation error,
+                                           # 3 if coverage incomplete
 
 Pre-commit (from inside ~/engram-alpha):
     ln -s ../../tools/scan-leaks.py .git/hooks/pre-commit
@@ -27,39 +29,166 @@ Absolute home paths (default-deny, every git-tracked text file):
 
 Personal-name and user-specific patterns are loaded at runtime from
 .scan-leaks-local.json in the repo root (gitignored), and optionally from a
---roster-file carrying the same newline-separated regex format as the
-NAME_LEAK_ROSTER CI secret. If NEITHER source supplies a pattern the scanner
-runs committed structural patterns only and prints one advisory line.
+--roster-file in one shared two-class format: one `A<TAB><regex>` (blocking) or
+`B<TAB><regex>` (report-only) per line, blank lines and #-comment lines
+ignored. Every line must carry a class; there is no default, and one bad line
+refuses the whole roster (exit 2). If NEITHER source supplies a pattern the
+scanner runs committed structural patterns only and prints one advisory line.
+
+Class A blocks and prints as a COUNT ONLY by default (no path, line, label or
+snippet: a location in a public log is a lasting pointer to a protected name);
+`--show-class-a-locations` prints `path:line` only and refuses to run when
+GITHUB_ACTIONS is set. Class B is
+permitted content, prints per line, and never blocks. COMMITTED_PATTERNS, the
+local roster and absolute-home-path findings are class A in code — they are
+the patterns this instrument has always blocked on. When one line matches a
+class-B and a class-A pattern, the line is class A: a report-only pattern must
+never mask a blocking one, whatever order the roster lists them in.
 
 See docs/internal/.scan-leaks-local.json.example for the config shape.
 
 Scope and exclusions (what "the tree" means here — NOT every published file):
-  - Candidate set: every git-tracked text file, whatever its extension
-    (extensionless executables included).  A binary (a NUL byte in its first
-    8 KiB) is skipped and counted.
+  - Candidate set: every enumerated path — every git-tracked file, whatever
+    its extension (extensionless executables included), or the os.walk output
+    when git is unavailable — minus the SKIP_DIRS components and SKIP_FILES
+    names below, BEFORE the file-type filter.  There is no extension
+    allowlist.  Every candidate is then classified exactly once (see
+    Coverage accounting).
+  - A binary (a NUL byte in its first 8 KiB) is skipped, counted, and named.
   - SKIP_FILES: LICENSE, .scan-leaks-local.json, scan-leaks.py,
     test_release_cutover.py, RELEASING.md.
   - SKIP_DIRS: .git, __pycache__, node_modules, .claude.
   - A name in an excluded file is not scanned.
+  - A symlink -- git-tracked, or listed by the ``os.walk`` fallback, which
+    yields a directory symlink in its ``dirs`` list -- is scanned by its
+    PUBLISHED CONTENT, which is its link text (``os.readlink``), in both
+    passes; the link is never followed or descended.  A dangling symlink is
+    therefore a covered scan (not `missing`), a symlink to a directory is
+    scanned (not `not-a-file`), and a symlink whose target is also tracked is
+    not read twice.
+
+Coverage accounting (every candidate is accounted for):
+  - scan() returns a ScanReport whose invariant is
+    scanned + len(skipped_binary_paths) + len(unreadable_paths)
+            + len(missing_paths) + len(not_a_file_paths) == candidates.
+    A path that cannot be inspected or read is an unreadable path, and a path
+    that is not there is a missing path — never a silent skip, and never
+    counted as binary.  An unsearchable directory found by os.walk is one
+    candidate covering a subtree that could not be enumerated.  "Missing"
+    means only that the path vanished between enumeration and classification
+    (a real race), not that a symlink dangles: a dangling symlink's link text
+    is readable and is scanned.
+  - main() prints on stdout, exactly once, the frozen line
+    "scan-leaks: scanned N, skipped-binary M" (.github/workflows/
+    name-leak-sweep.yml parses it with an anchored regex — do not reformat
+    it).  When --roster-file was supplied, the line
+    "scan-leaks: roster patterns A=<n>, B=<m>" follows it and reports the
+    per-class counts of the PARSED roster, which name-leak-sweep.yml compares
+    against the attestation; new information goes BELOW the frozen line,
+    never into it.  When M > 0 the frozen line is followed with one line
+    naming up to 20 skipped-binary
+    paths and a "(+K more)" tail; when any candidate was unreadable it prints
+    "scan-leaks: unreadable K (coverage incomplete): <paths>" (the union over
+    both passes, deduped by path); when any was missing it prints
+    "scan-leaks: missing K (coverage incomplete): <paths>"; when any was not
+    a regular file it prints
+    "scan-leaks: not-a-file N (not scanned): <paths>" (same 20-path cap).
+    When there are no candidates at all it prints
+    "scan-leaks: no coverage: 0 candidate files under <root>; nothing was
+    scanned" and does NOT print `clean`.
 
 Exit codes:
-  0 — clean
-  1 — leaks found
-  2 — invocation error
+  0 — no class-A hit and the scan covered at least one candidate file (a
+      class-B hit alone does NOT block: B is permitted content, counted and
+      printed, never a failure)
+  1 — class-A hits: a class-A pattern hit or an absolute home path
+  2 — invocation error, including a roster that does not parse (format 2: no
+      class token, an unknown class letter, an uncompilable regex, a tab
+      after the first, or a class-A pattern with no declared boundary), OR an
+      internal error: the scanner crashed.  One stderr line
+      `scan-leaks: internal error: <ExceptionType>` says which, so a crash
+      never lands on exit 1, which every consumer reads as "leaks found"
+  3 — coverage incomplete: at least one candidate was unreadable or missing,
+      or there were no candidate files at all, and no class-A hit (a
+      not-a-file candidate alone does not make coverage incomplete)
 """
 
 import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
-# Structural patterns with NO personal data — safe to commit.
+# The two roster classes.  A blocks; B is counted and never blocks.
+CLASS_A = "A"
+CLASS_B = "B"
+ROSTER_CLASSES = (CLASS_A, CLASS_B)
+
+# Structural patterns with NO personal data — safe to commit.  Class A is
+# declared in CODE, never inferred from a label: these are the patterns this
+# instrument has always blocked on.
 COMMITTED_PATTERNS = [
-    (re.compile(r"kg_protocol_for_ai"), "main repo path"),
+    (re.compile(r"kg_protocol_for_ai"), "main repo path", CLASS_A),
 ]
+
+# A class-A pattern must DECLARE a boundary — `\b`, a lookaround, or an anchor.
+# Refuse it otherwise, never rewrite it: a silently altered pattern is one
+# whose meaning differs from what its author wrote.  Class B is exempt.
+def _declares_boundary(pattern_text: str) -> bool:
+    """True when the pattern DECLARES a boundary: ``\\b``, a lookaround, or an
+    unescaped ``^``/``$`` outside a character class.
+
+    The test is SYNTACTIC, not a substring scan (Ariadne's read, measured): the
+    walk tracks backslash escapes and character-class depth, and a marker
+    counts only at class-depth 0.  Inside ``[...]`` a ``^`` is a negated class,
+    ``\\b`` is a backspace, and ``(?=`` is literal text, so counting any of
+    them would accept a class-A pattern that declares no boundary at all.  The
+    two measured cases the old substring scan accepted are ``[^x]foo`` (a
+    negated class) and ``foo\\$`` (an escaped literal dollar).
+    """
+    depth = 0
+    i = 0
+    n = len(pattern_text)
+    while i < n:
+        ch = pattern_text[i]
+        if ch == "\\":
+            # An escape consumes the next character: `\\b` is an escaped
+            # backslash followed by a literal `b`, not a word boundary, and
+            # `\$` is a literal dollar, not an anchor.
+            if depth == 0 and i + 1 < n and pattern_text[i + 1] == "b":
+                return True
+            i += 2
+            continue
+        if depth:
+            # Inside a character class only an unescaped `]` closes it; `[` is
+            # a literal member (Python does not nest classes), never a new one.
+            if ch == "]":
+                depth = 0
+            i += 1
+            continue
+        if ch == "[":
+            depth = 1
+            i += 1
+            # `]` immediately after `[` or `[^` is a literal member, not the
+            # class terminator.
+            if i < n and pattern_text[i] == "^":
+                i += 1
+            if i < n and pattern_text[i] == "]":
+                i += 1
+            continue
+        if ch in "^$":
+            return True
+        if (pattern_text.startswith("(?=", i)
+                or pattern_text.startswith("(?!", i)
+                or pattern_text.startswith("(?<=", i)
+                or pattern_text.startswith("(?<!", i)):
+            return True
+        i += 1
+    return False
 
 LOCAL_CONFIG_NAME = ".scan-leaks-local.json"
 
@@ -85,10 +214,22 @@ def _load_home_path_class():
                       + ", ".join(str(c) for c in candidates))
 
 
-_hpc = _load_home_path_class()
-HOME_PATH_RE = _hpc.HOME_PATH_RE
-ALLOWED_HOME_SEGMENTS = _hpc.ALLOWED_HOME_SEGMENTS
-_DISALLOWED_HOME_PATH_RE = _hpc.disallowed_home_path_regex()
+_HPC = None
+
+
+def _home_path_class():
+    """Load the shared home-path class module, once, on first use.
+
+    Reached from inside main()'s try (through ``_run``), never at import time:
+    a scanner deployed without its sibling ``engine/home_path_class.py`` exits
+    2 with one ``scan-leaks: internal error: ImportError`` line instead of
+    dying on import with a traceback and exit 1, which every consumer reads as
+    "leaks found".  The loader's search order and its message are unchanged.
+    """
+    global _HPC
+    if _HPC is None:
+        _HPC = _load_home_path_class()
+    return _HPC
 
 # Files exempt from the home-path check, by repo-relative path, each with a
 # reason.  Deliberately EMPTY: the scanner, its definition module and every test
@@ -114,15 +255,134 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".claude"}
 # .claude: harness-internal (agent worktrees + transcripts) — stale fairy
 # worktrees carry pre-fix file copies that read as false-positive leaks.
 
+# How many paths a naming line shows before its "(+K more)" tail.
+NAMED_PATH_CAP = 20
+
+
+@dataclass
+class ScanReport:
+    """What a scan ranged over, as well as what it found.
+
+    Every candidate path is accounted for exactly once — scanned, skipped as
+    binary, unreadable, missing, or not a regular file — and ``scan()``
+    asserts that invariant:
+
+        scanned + len(skipped_binary_paths) + len(unreadable_paths)
+                + len(missing_paths) + len(not_a_file_paths) == candidates
+    """
+    findings: list[tuple[str, int, str, str, str]]
+    scanned: int
+    skipped_binary_paths: list[str]
+    unreadable_paths: list[str]
+    candidates: int
+    missing_paths: list[str] = field(default_factory=list)
+    not_a_file_paths: list[str] = field(default_factory=list)
+
+    @property
+    def skipped_binary(self) -> int:
+        """The skipped-binary count, derived from the paths (the source of
+        truth), so the number can never disagree with the names it prints."""
+        return len(self.skipped_binary_paths)
+
+
+def _classify(path: Path) -> tuple[str, Path | None]:
+    """Classify one enumerated candidate by what it is on disk.
+
+    This is the ONE seam both passes use, so neither can crash on a path it
+    cannot inspect and neither invents its own filter.  ``path.lstat()`` does
+    NOT follow symlinks, so a symlink is classified as itself — its published
+    content is its link text, never its target's:
+
+        ("symlink", None)     a symlink; scan its os.readlink() text
+        ("file", None)        a regular file; read it
+        ("not-a-file", None)  exists, but is not a regular file or a symlink
+                              (FIFO, socket, device, gitlink/directory):
+                              carries no text to scan
+        ("missing", path)     the path itself is not there
+        ("unreadable", path)  any other stat failure (EACCES, ELOOP after a
+                              race, ENAMETOOLONG, ...)
+
+    Only ENOENT is "missing": every other OSError means the scanner could not
+    inspect the path, which is a coverage hole, not an absence.  A dangling
+    symlink is NOT missing — lstat succeeds, and its link text is readable.
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return ("missing", path)
+    except OSError:
+        return ("unreadable", path)
+    if stat.S_ISLNK(info.st_mode):
+        return ("symlink", None)
+    if not stat.S_ISREG(info.st_mode):
+        return ("not-a-file", None)
+    return ("file", None)
+
+
+def _relative_dir(root: Path, directory) -> str:
+    """A failed directory as a repo-relative posix path with a trailing '/'.
+
+    One entry covers the whole subtree that could not be enumerated: its file
+    count is unknown, so it is one coverage hole, not zero.
+    """
+    try:
+        rel = Path(directory).relative_to(root).as_posix()
+    except ValueError:
+        rel = os.path.relpath(directory, root).replace(os.sep, "/")
+    return "" if rel == "." else rel + "/"
+
+
+def _escape_path(path: str) -> str:
+    """Escape line-breaking characters so one path cannot forge or split a line.
+
+    A tracked name may contain a newline, and a printed name that carried it
+    raw would put a second `scan-leaks: scanned N, skipped-binary M` line (or
+    half a finding) on stdout.  ``\\n`` becomes ``\\\\n``, ``\\r`` becomes
+    ``\\\\r``, any other C0 control becomes ``\\\\xNN``; C1 controls
+    (U+0080-U+009F) also become ``\\\\xNN``, and U+2028/U+2029 become
+    ``\\\\u2028``/``\\\\u2029`` -- every one of those is a line break to
+    ``str.splitlines()``, so no escaped name can split a printed line.  Every
+    other character is unchanged.  The frozen summary line carries no path and
+    is untouched.
+    """
+    escaped = []
+    for ch in path:
+        if ch == "\n":
+            escaped.append("\\n")
+        elif ch == "\r":
+            escaped.append("\\r")
+        elif ord(ch) < 0x20:
+            escaped.append(f"\\x{ord(ch):02x}")
+        elif 0x80 <= ord(ch) <= 0x9f:
+            escaped.append(f"\\x{ord(ch):02x}")
+        elif ch == chr(0x2028):
+            escaped.append("\\u2028")
+        elif ch == chr(0x2029):
+            escaped.append("\\u2029")
+        else:
+            escaped.append(ch)
+    return "".join(escaped)
+
+
+def format_paths(paths: list[str], cap: int = NAMED_PATH_CAP) -> str:
+    """Join paths for a log line: at most ``cap`` named, then '(+K more)'."""
+    shown = ", ".join(_escape_path(p) for p in paths[:cap])
+    more = len(paths) - cap
+    if more > 0:
+        shown += f" (+{more} more)"
+    return shown
+
 
 def load_local_patterns(root: Path, config_path: Path | None = None) -> tuple[list, bool]:
     """Load personal-name patterns from the gitignored local config.
 
     Returns (patterns, config_present) where patterns is a list of
-    (compiled_regex, label) tuples.  config_present is False when the file
-    does not exist at all; True even when the file exists but is malformed or
-    has no valid patterns (so the caller can distinguish "no file" from
-    "file exists but produced nothing").
+    (compiled_regex, label, class) tuples — every local pattern is class A in
+    code, because it is one of the patterns this instrument has always blocked
+    on.  config_present is False when the file does not exist at all; True
+    even when the file exists but is malformed or has no valid patterns (so
+    the caller can distinguish "no file" from "file exists but produced
+    nothing").
     """
     if config_path is None:
         config_path = root / LOCAL_CONFIG_NAME
@@ -139,7 +399,9 @@ def load_local_patterns(root: Path, config_path: Path | None = None) -> tuple[li
     patterns = []
     for i, entry in enumerate(raw.get("patterns", []), start=1):
         try:
-            patterns.append((re.compile(entry["regex"]), entry["label"]))
+            patterns.append(
+                (re.compile(entry["regex"]), entry["label"], CLASS_A)
+            )
         except (KeyError, TypeError, re.error, OverflowError, RecursionError) as exc:
             # The roster is a personal-name list: the entry, its label and
             # str(re.error) can all carry a name.  Report only the 1-based
@@ -151,55 +413,201 @@ def load_local_patterns(root: Path, config_path: Path | None = None) -> tuple[li
     return patterns, True
 
 
-def load_roster_file(path: Path) -> list[tuple[re.Pattern, str]]:
-    """Load newline-separated regexes from an external roster file.
+def _refuse_roster(
+    lineno: int, detail: str, *,
+    program: str = "scan-leaks", exit_code: int = 2,
+) -> None:
+    """Refuse the WHOLE roster, naming the 1-based line number and nothing else.
 
-    This is the SAME format as the ``NAME_LEAK_ROSTER`` CI secret: one regex
-    per line, with blank lines and lines whose first non-space character is
-    ``#`` ignored.  The label is fixed and generic; the file carries no labels.
+    The roster is a name list and CI stderr can reach a public log, so no
+    message may carry the line, the pattern, or any substring of either — not
+    even through ``re.error.__str__``, which embeds part of the pattern.  A
+    roster that does not parse is exit 2 (invocation error), never 1 (which
+    every consumer reads as "leaks found") and never 3 ("did not look").
+
+    ``program`` and ``exit_code`` are threaded from the caller (C5): the
+    scanner passes the defaults; ``tools/name_leak_warn.py`` passes its own
+    name and exit 1.
+    """
+    print(f"{program}: roster line {lineno} {detail}", file=sys.stderr)
+    sys.exit(exit_code)
+
+
+def parse_roster_text(
+    text: str, *, require_classes: bool = True,
+    program: str = "scan-leaks", exit_code: int = 2,
+) -> tuple[list[tuple[re.Pattern, str, str]], int]:
+    """Parse roster text, returning ``(patterns, roster_format)``.
+
+    Each pattern is a ``(compiled_regex, label, class)`` triple and
+    ``roster_format`` is 1 or 2.
+
+    ``require_classes=True`` (the default, and every existing call site) parses
+    FORMAT 2 only, exactly as merged in #4816: ``A<TAB><regex>`` or
+    ``B<TAB><regex>`` per line.  Each line is stripped, then split on its FIRST
+    tab; the class token is the whole prefix before that tab and must be
+    exactly ``A`` or ``B`` (case-sensitive).  Blank lines and lines whose first
+    non-space character is ``#`` are ignored.  There is NO default class: a
+    line with no tab, an unknown class token, a tab after the first, a regex
+    that does not compile, or a class-A pattern that declares no boundary is a
+    HARD parse error naming the 1-based line number, and ANY bad line refuses
+    the WHOLE roster.
+
+    ``require_classes=False`` opts into FORMAT inference, never class
+    inference.  Detection is over the whole roster and order-independent:
+
+        every non-blank non-comment line starts with ``A<TAB>`` or ``B<TAB>``
+            -> format 2, parsed exactly as the default path;
+        no such line
+            -> format 1: each line is a plain regex returned with class
+               ``CLASS_A`` and label ``"roster file (format 1)"``.  The legacy
+               format has always blocked, so that is its own meaning, not a
+               default class;
+        some but not all
+            -> the WHOLE roster is refused, naming the 1-based number of the
+               FIRST line that disagrees with the detected grammar.
+
+    A format-2 line always keeps the class it declares; no format-2 line ever
+    receives one it did not write.  A format-2 class-A pattern must declare a
+    boundary (``_declares_boundary``), while a format-1 line becomes
+    ``CLASS_A`` without passing through that check — the asymmetry is
+    deliberate, because format 1 predates the rule and the scanner cannot
+    rewrite a live roster.  A roster with no pattern at all returns
+    ``([], roster_format)`` — zero patterns is not a parse error (C4a: the warn
+    tool's skip-when-absent contract depends on it).
+
+    ``str.splitlines()`` also splits on ``\\x0b``, ``\\x0c``, ``\\x1c``-``\\x1e``,
+    ``\\x85``, U+2028 and U+2029, so a roster line containing one becomes two
+    and the second takes its own place in detection and parsing — fail-closed,
+    and no parser change.
+    """
+    lines = list(enumerate(text.splitlines(), start=1))
+
+    def _is_content(stripped: str) -> bool:
+        return bool(stripped) and not stripped.startswith("#")
+
+    roster_format = 2
+    if not require_classes:
+        content_linenos: list[int] = []
+        prefixed = 0
+        first_unprefixed = None
+        for lineno, raw_line in lines:
+            stripped = raw_line.strip()
+            if not _is_content(stripped):
+                continue
+            content_linenos.append(lineno)
+            if stripped.startswith("A\t") or stripped.startswith("B\t"):
+                prefixed += 1
+            elif first_unprefixed is None:
+                first_unprefixed = lineno
+        if not content_linenos:
+            # No line to observe.  The legacy format is the honest default
+            # here: there is no prefixed line, and an empty roster yields no
+            # pattern either way (C4a).
+            roster_format = 1
+        elif prefixed == len(content_linenos):
+            roster_format = 2
+        elif prefixed == 0:
+            roster_format = 1
+        else:
+            _refuse_roster(
+                first_unprefixed,
+                "mixes roster formats: the rest of the roster carries an "
+                "A<TAB> or B<TAB> class prefix and this line does not. One bad "
+                "line is the end of the roster",
+                program=program, exit_code=exit_code,
+            )
+
+    patterns = []
+    for lineno, raw_line in lines:
+        stripped = raw_line.strip()
+        if not _is_content(stripped):
+            continue
+        if roster_format == 1:
+            try:
+                compiled = re.compile(stripped)
+            except (re.error, OverflowError, RecursionError) as exc:
+                # Class name, offset and line number only: the line and
+                # str(exc) can each embed part of the secret roster line.
+                # ``pos`` is absent on OverflowError/RecursionError and None on
+                # some re.error values: report ``unknown`` rather than ``None``.
+                pos = getattr(exc, "pos", None)
+                offset = pos if isinstance(pos, int) else "unknown"
+                _refuse_roster(
+                    lineno,
+                    f"is not a valid regular expression: "
+                    f"{type(exc).__name__} at offset {offset}",
+                    program=program, exit_code=exit_code,
+                )
+            patterns.append((compiled, "roster file (format 1)", CLASS_A))
+            continue
+        if "\t" not in stripped:
+            _refuse_roster(
+                lineno,
+                "has no class token; every line needs an A<TAB> or B<TAB> "
+                "prefix",
+                program=program, exit_code=exit_code,
+            )
+        class_token, pattern_text = stripped.split("\t", 1)
+        if class_token not in ROSTER_CLASSES:
+            _refuse_roster(
+                lineno, "has an invalid class token; expected A or B",
+                program=program, exit_code=exit_code,
+            )
+        if "\t" in pattern_text:
+            _refuse_roster(
+                lineno,
+                "contains a tab after the class token; a pattern cannot "
+                "contain a tab",
+                program=program, exit_code=exit_code,
+            )
+        try:
+            compiled = re.compile(pattern_text)
+        except (re.error, OverflowError, RecursionError) as exc:
+            detail = (f"is not a valid regular expression: "
+                      f"{type(exc).__name__}")
+            if isinstance(exc, re.error):
+                detail += f" at offset {exc.pos}"
+            _refuse_roster(lineno, detail, program=program, exit_code=exit_code)
+        if class_token == CLASS_A and not _declares_boundary(pattern_text):
+            _refuse_roster(
+                lineno,
+                "is a class-A pattern with no declared boundary; add \\b, a "
+                "lookaround, or ^/$",
+                program=program, exit_code=exit_code,
+            )
+        patterns.append((compiled, "roster file", class_token))
+    return patterns, roster_format
+
+
+def load_roster_file(
+    path: Path, *, require_classes: bool = True,
+    program: str = "scan-leaks", exit_code: int = 2,
+) -> tuple[list[tuple[re.Pattern, str, str]], int]:
+    """Read a roster file and delegate to ``parse_roster_text``.
+
+    This is the file entry point and the ONLY parser of the roster grammar in
+    the repository.  Its defaults keep every existing call site identical: the
+    scanner's CLI and the sweep workflow pass no new argument, so they get
+    format 2 only and exit 2 with a ``scan-leaks:`` prefix (C2).
+
+    An explicitly requested roster that cannot be read is an invocation error,
+    not a clean run: it prints
+    ``<program>: cannot read roster file (<ExceptionType>)`` and exits
+    ``exit_code``.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        # An explicitly requested roster that cannot be read must not silently
-        # shrink the scan: that is an invocation error, not a clean run.
-        print(f"scan-leaks: cannot read roster file ({type(exc).__name__})",
+        print(f"{program}: cannot read roster file ({type(exc).__name__})",
               file=sys.stderr)
-        sys.exit(2)
-
-    patterns = []
-    supplied = 0
-    rejected = 0
-    for lineno, line in enumerate(text.splitlines(), start=1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        supplied += 1
-        try:
-            patterns.append((re.compile(stripped), "roster file"))
-        except (re.error, OverflowError, RecursionError) as exc:
-            rejected += 1
-            # The roster file is a personal-name list: the line and
-            # str(re.error) can both carry a name.  Report only the 1-based
-            # line number, the exception class, and (for re.error) its offset
-            # — never the pattern text.
-            detail = (f" at offset {exc.pos}" if isinstance(exc, re.error)
-                      else "")
-            print(f"scan-leaks: warning — skipping bad roster line {lineno}: "
-                  f"{type(exc).__name__}{detail}", file=sys.stderr)
-
-    if supplied and not patterns:
-        # An explicitly requested roster that supplied no usable pattern must
-        # not become a clean run against nothing.  CI pre-validates its own
-        # roster before invoking --roster-file, so this is the standalone
-        # flag's contract, not CI's.  The count only — never the pattern text.
-        print(
-            f"scan-leaks: all {rejected} roster line(s) were rejected as "
-            "invalid; refusing to scan against an empty roster",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    return patterns
+        sys.exit(exit_code)
+    return parse_roster_text(
+        text,
+        require_classes=require_classes,
+        program=program,
+        exit_code=exit_code,
+    )
 
 
 def _git_tracked_files(root: Path) -> list[Path] | None:
@@ -227,18 +635,55 @@ def _git_tracked_files(root: Path) -> list[Path] | None:
     return [root / p.decode("utf-8", errors="replace") for p in raw.split(b"\x00") if p]
 
 
-def scan(root: Path, leak_patterns: list, use_git: bool = True
-         ) -> tuple[list[tuple[str, int, str, str]], int, int]:
-    """Scan root for leak_patterns.  Returns (findings, scanned, skipped_binary).
+def _attribute_line(line: str, leak_patterns: list
+                    ) -> tuple[str, str] | None:
+    """Attribute one line to a class, returning (label, class) or None.
 
-    findings is a list of (relpath, lineno, label, snippet).
+    CLASS A WINS ON A SHARED LINE. Every pattern is evaluated against the
+    line; if ANY class-A pattern matches, the line is class A and the first
+    class-A match supplies the label. Only when no class-A pattern matches
+    does the first matching pattern determine the reported label. One finding
+    per line is preserved.
+
+    Stopping at the first match is the fail-open this forbids: a class-B
+    pattern listed before a class-A pattern would mask the A hit entirely, and
+    a blocking gate a report-only pattern can mask is not a gate (measured
+    2026-11-15: a line holding both names reported `0 class-A and 2 class-B`
+    and exited 0).
+    """
+    first_label = None
+    first_class = None
+    first_a_label = None
+    for pattern, label, klass in leak_patterns:
+        if not pattern.search(line):
+            continue
+        if first_label is None:
+            first_label, first_class = label, klass
+        if klass == CLASS_A and first_a_label is None:
+            first_a_label = label
+    if first_a_label is not None:
+        return (first_a_label, CLASS_A)
+    if first_label is None:
+        return None
+    return (first_label, first_class)
+
+
+def scan(root: Path, leak_patterns: list, use_git: bool = True) -> ScanReport:
+    """Scan root for leak_patterns and return a ScanReport.
+
+    ``leak_patterns`` is a list of (compiled, label, class) triples; each
+    ``report.findings`` entry is (relpath, lineno, label, snippet, class).
+    A line that matches more than one pattern is ONE finding, attributed by
+    ``_attribute_line``: class A wins whenever any class-A pattern matches,
+    and only otherwise does the first match determine the label.
 
     Candidate set: every git-tracked file, whatever its extension
     (extensionless executables included), minus the SKIP_DIRS components and
-    SKIP_FILES names — the same all-text domain ``scan_home_paths`` uses.  An
-    extension allowlist used to select files here, so the release leak gate
-    never read shipped ``.js``/``.html``/``.ts``/``.css``/``.txt`` files or
-    extensionless scripts (#3732).
+    SKIP_FILES names, after the ``is_file()`` filter — the same all-text
+    domain ``scan_home_paths`` uses.  An extension allowlist used to select
+    files here, so the release leak gate never read shipped
+    ``.js``/``.html``/``.ts``/``.css``/``.txt`` files or extensionless scripts
+    (#3732).
 
     When use_git is True (default), candidate files are enumerated via
     ``git ls-files -z`` so that untracked files — gitignored local notes,
@@ -253,21 +698,26 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True
     When use_git is False (explicit-path invocation), the os.walk path is used
     unconditionally so that callers can target specific non-repo directories.
 
-    A file whose first 8 KiB contains a NUL byte is binary: skipped and counted
-    in ``skipped_binary``.  Everything else is decoded as UTF-8 with errors
-    replaced, so a non-UTF-8 text file is still scanned and ``scanned`` counts
-    it.  A file that cannot be read at all is skipped and counted in neither.
+    A candidate whose first 8 KiB contains a NUL byte is binary: skipped,
+    counted in ``skipped_binary_paths``, and named by the caller.  Everything
+    else is decoded as UTF-8 with errors replaced, so a non-UTF-8 text file is
+    still scanned and ``scanned`` counts it.  A symlink is scanned by its
+    ``os.readlink`` text and never followed, so it contributes to ``scanned``
+    once, no matter what its target is.  A path that cannot be inspected
+    or read lands in ``unreadable_paths``; a path that is not there lands in
+    ``missing_paths`` — never dropped silently, and never counted as binary.
+    A candidate that is not a regular file or a symlink lands in
+    ``not_a_file_paths``.
     """
-    leaks = []
-
     tracked = _git_tracked_files(root) if use_git else None
 
+    # Enumeration happens BEFORE any file-type filter: the candidate set is
+    # what the scan considered, so a path dropped later must still be counted.
+    walk_unreadable: list[str] = []
+    candidates: list[Path] = []
     if tracked is not None:
         # Git-tracked enumeration: skip SKIP_DIRS and SKIP_FILES by name.
-        # Every remaining file is a candidate, whatever its extension.
-        candidates = []
         for fpath in tracked:
-            # Check every component for SKIP_DIRS membership
             parts = fpath.relative_to(root).parts
             if any(p in SKIP_DIRS for p in parts):
                 continue
@@ -275,78 +725,229 @@ def scan(root: Path, leak_patterns: list, use_git: bool = True
                 continue
             candidates.append(fpath)
     else:
-        # Fallback: os.walk (same all-text policy)
-        candidates = []
-        for dirpath, dirs, files in os.walk(root):
+        # Fallback: os.walk (same all-text policy).  onerror records a
+        # directory that cannot be listed: without it the whole subtree is
+        # pruned silently and the counts reconcile against a set that already
+        # lost it.
+        def _onerror(exc):
+            walk_unreadable.append(_relative_dir(root, exc.filename))
+
+        for dirpath, dirs, files in os.walk(root, onerror=_onerror):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            # os.walk lists a symlink to a directory in ``dirs`` and, with
+            # followlinks=False, never descends it -- so without this it is
+            # never a candidate either, and its link text is never scanned.
+            # Take it as a candidate BEFORE descent and drop it from the walk:
+            # order is SKIP_DIRS filter, symlink partition, descent.
+            link_dirs = [d for d in dirs
+                         if os.path.islink(os.path.join(dirpath, d))]
+            for d in link_dirs:
+                candidates.append(Path(dirpath) / d)
+            dirs[:] = [d for d in dirs if d not in link_dirs]
             for fname in files:
                 if fname in SKIP_FILES:
                     continue
                 candidates.append(Path(dirpath) / fname)
 
-    # A tracked symlink can point at a directory (tools/engine, tools/engram-pkg
-    # in this repo).  It is not a text file to scan, so it is not a candidate —
-    # which is what makes scanned + skipped_binary equal the files considered.
-    candidates = [f for f in candidates if f.is_file()]
-
+    findings = []
     scanned = 0
-    skipped_binary = 0
+    skipped_binary_paths = []
+    unreadable_paths = []
+    missing_paths = []
+    not_a_file_paths = []
     for fpath in candidates:
+        rel = fpath.relative_to(root).as_posix()
+        kind, _ = _classify(fpath)
+        if kind == "missing":
+            missing_paths.append(rel)
+            continue
+        if kind == "unreadable":
+            unreadable_paths.append(rel)
+            continue
+        if kind == "not-a-file":
+            not_a_file_paths.append(rel)
+            continue
+        if kind == "symlink":
+            # Git publishes a symlink's LINK TEXT, not its target's bytes, and
+            # the link text is what a reader of the published tree sees.  Scan
+            # it; NEVER follow the link (following reads the target twice, once
+            # under each path, and misses a home path in the link text).
+            try:
+                content = os.readlink(fpath)
+            except FileNotFoundError:
+                # Raced with the lstat above: the link itself vanished.
+                missing_paths.append(rel)
+                continue
+            except OSError:
+                unreadable_paths.append(rel)
+                continue
+            scanned += 1
+            for i, line in enumerate(content.splitlines(), 1):
+                hit = _attribute_line(line, leak_patterns)
+                if hit is not None:
+                    findings.append(
+                        (str(rel), i, hit[0], line.strip()[:120], hit[1])
+                    )
+            continue
         try:
             data = fpath.read_bytes()
+        except FileNotFoundError:
+            # Raced with the stat above: an absence the scan did not cover,
+            # never a crash and never a silent skip.
+            missing_paths.append(rel)
+            continue
         except OSError:
+            unreadable_paths.append(rel)
             continue
         if b"\x00" in data[:8192]:
-            skipped_binary += 1
+            skipped_binary_paths.append(rel)
             continue
         content = data.decode("utf-8", errors="replace")
         scanned += 1
-        rel = fpath.relative_to(root)
         for i, line in enumerate(content.splitlines(), 1):
-            for pattern, label in leak_patterns:
-                if pattern.search(line):
-                    leaks.append((str(rel), i, label, line.strip()[:120]))
-                    break
-    return leaks, scanned, skipped_binary
+            hit = _attribute_line(line, leak_patterns)
+            if hit is not None:
+                findings.append(
+                    (str(rel), i, hit[0], line.strip()[:120], hit[1])
+                )
+
+    # A walk-time unreadable directory is one enumerated candidate covering a
+    # subtree whose file count is unknown; it is an unreadable bucket entry,
+    # so it must also be counted on the candidates side of the invariant.
+    unreadable_paths.extend(walk_unreadable)
+    skipped_binary_paths.sort()
+    unreadable_paths.sort()
+    missing_paths.sort()
+    not_a_file_paths.sort()
+    report = ScanReport(
+        findings=findings,
+        scanned=scanned,
+        skipped_binary_paths=skipped_binary_paths,
+        unreadable_paths=unreadable_paths,
+        candidates=len(candidates) + len(walk_unreadable),
+        missing_paths=missing_paths,
+        not_a_file_paths=not_a_file_paths,
+    )
+    # The invariant is the contract: a count that does not reconcile is a
+    # scanner bug, never something to print and move past.
+    accounted = (report.scanned + len(report.skipped_binary_paths)
+                 + len(report.unreadable_paths) + len(report.missing_paths)
+                 + len(report.not_a_file_paths))
+    if accounted != report.candidates:
+        raise AssertionError(
+            f"scan-leaks coverage does not reconcile: scanned {report.scanned} + "
+            f"skipped-binary {len(report.skipped_binary_paths)} + unreadable "
+            f"{len(report.unreadable_paths)} + missing {len(report.missing_paths)} "
+            f"+ not-a-file {len(report.not_a_file_paths)} = {accounted}, "
+            f"candidates {report.candidates}"
+        )
+    return report
 
 
-def scan_home_paths(root: Path, use_git: bool = True) -> list[tuple[str, int, str]]:
-    """Return (relpath, lineno, segment) for every disallowed absolute home path.
+def scan_home_paths(root: Path, use_git: bool = True
+                    ) -> tuple[list[tuple[str, int, str]], list[str]]:
+    """Return (findings, unreadable_paths) for the absolute-home-path check.
+
+    findings is (relpath, lineno, segment) for every disallowed absolute home
+    path.  unreadable_paths is the sorted repo-relative posix paths whose read
+    raised OSError, so the caller can say a pass did not cover them.
 
     Domain: every git-tracked file (``git ls-files``), whatever its extension,
-    including extensionless executables.  A file whose first 8 KiB contains a
+    including extensionless executables, classified by the same ``_classify``
+    seam ``scan()`` uses — a path that is missing or is neither a regular file
+    nor a symlink is skipped here (``scan()`` reports those buckets), while a
+    path this pass cannot inspect is unreadable.  A symlink is scanned by its
+    ``os.readlink`` text, never followed.  A file whose first 8 KiB contains a
     NUL byte is binary and skipped, as is any file in HOME_PATH_EXEMPT_FILES.
-    Text is decoded as UTF-8 with errors replaced, so a non-UTF-8 file is still
-    scanned.  The verdict (allowed or not) is made inside the shared regex.
-    Falls back to an os.walk of root
-    when git is unavailable (scanning too much beats scanning nothing).
+    Text is decoded as UTF-8 with errors replaced, so a non-UTF-8 file is
+    still scanned.  The verdict (allowed or not) is made inside the shared
+    regex.  Falls back to an os.walk of root when git is unavailable (scanning
+    too much beats scanning nothing); an unsearchable directory is recorded
+    unreadable rather than pruned silently.
     """
     tracked = _git_tracked_files(root) if use_git else None
+    findings = []
+    unreadable_paths = []
+    disallowed_home_path_re = _home_path_class().disallowed_home_path_regex()
     if tracked is None:
         tracked = []
-        for dirpath, dirs, files in os.walk(root):
+
+        def _onerror(exc):
+            unreadable_paths.append(_relative_dir(root, exc.filename))
+
+        for dirpath, dirs, files in os.walk(root, onerror=_onerror):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            # Same symlink partition as scan(): a directory symlink is listed
+            # in ``dirs`` and never descended, so take it as a candidate
+            # before descent or its link text is never scanned.
+            link_dirs = [d for d in dirs
+                         if os.path.islink(os.path.join(dirpath, d))]
+            tracked.extend(Path(dirpath) / d for d in link_dirs)
+            dirs[:] = [d for d in dirs if d not in link_dirs]
             tracked.extend(Path(dirpath) / f for f in files)
 
-    findings = []
     for fpath in tracked:
         rel = fpath.relative_to(root).as_posix()
         if rel in HOME_PATH_EXEMPT_FILES:
             continue
+        kind, _ = _classify(fpath)
+        if kind == "missing":
+            # The accounting pass (scan()) reports absences; this pass has no
+            # bucket for them and must not mislabel one as unreadable.
+            continue
+        if kind == "not-a-file":
+            # A FIFO, socket, device or gitlink carries no text: not scanned,
+            # and not a coverage hole (scan() counts it in not_a_file_paths).
+            continue
+        if kind == "unreadable":
+            unreadable_paths.append(rel)
+            continue
+        if kind == "symlink":
+            # A symlink's published content is its link text; scan that text
+            # (the same rule as scan()) and never follow the link.
+            try:
+                text = os.readlink(fpath)
+            except FileNotFoundError:
+                # Raced with the lstat above: the link itself vanished.
+                continue
+            except OSError:
+                unreadable_paths.append(rel)
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                for m in disallowed_home_path_re.finditer(line):
+                    findings.append((rel, i, m.group(1).rstrip(".")))
+            continue
         try:
             data = fpath.read_bytes()
         except OSError:
+            unreadable_paths.append(rel)
             continue
         if b"\x00" in data[:8192]:
             continue
         text = data.decode("utf-8", errors="replace")
         for i, line in enumerate(text.splitlines(), 1):
-            for m in _DISALLOWED_HOME_PATH_RE.finditer(line):
+            for m in disallowed_home_path_re.finditer(line):
                 findings.append((rel, i, m.group(1).rstrip(".")))
-    return findings
+    unreadable_paths.sort()
+    return findings, unreadable_paths
 
 
 def main():
+    """Run the scanner, turning an unexpected crash into exit 2.
+
+    Exit 2 already means "invocation error"; it now also covers an internal
+    error, so a crash cannot reach the exit-1 path every consumer reads as
+    "a leak was found".  SystemExit (a usage error, --help, or the exit codes
+    below) is not an Exception and passes through untouched.
+    """
+    try:
+        _scan_leaks_cli()
+    except Exception as exc:
+        print(f"scan-leaks: internal error: {type(exc).__name__}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _scan_leaks_cli():
     parser = argparse.ArgumentParser(description="Scan alpha for personal-info leaks")
     parser.add_argument("--root", default=None,
                         help="Root to scan (default: parent of tools/ dir, i.e., the alpha repo)")
@@ -354,16 +955,41 @@ def main():
                         help=f"Explicit path to the local config file "
                              f"(default: <root>/{LOCAL_CONFIG_NAME})")
     parser.add_argument("--roster-file", default=None,
-                        help="Newline-separated regexes, the same format as the "
-                             "NAME_LEAK_ROSTER secret (blank lines and #-comment "
-                             "lines ignored); scanned alongside the committed "
-                             "patterns and the local roster")
+                        help="Format-2 roster, the same format as the "
+                             "NAME_LEAK_ROSTER secret: one 'A<TAB>regex' "
+                             "(blocking) or 'B<TAB>regex' (report-only) per "
+                             "line (blank lines and #-comment lines ignored); "
+                             "scanned alongside the committed patterns and the "
+                             "local roster")
     # A public CI log must not carry a name: `path:line [label] snippet`
     # prints it twice, so --redact keeps only the repo-relative path and line.
+    # Class A is count-only by default; the locator below is opt-in and OFF CI.
     parser.add_argument("--redact", action="store_true",
-                        help="Print each finding as repo-relative-path:line only "
-                             "(no label, no snippet, no home-path segment)")
+                        help="Print each class-B finding as "
+                             "repo-relative-path:line only (no label, no "
+                             "snippet); a no-op for class A, already "
+                             "count-only by default")
+    parser.add_argument("--show-class-a-locations", action="store_true",
+                        help="Print each class-A hit as "
+                             "repo-relative-path:line only (never a snippet, a "
+                             "label or pattern text). Refused while "
+                             "GITHUB_ACTIONS is set, so it cannot be switched "
+                             "on in a public CI log")
     args = parser.parse_args()
+
+    # The locator is for a roster holder running off-CI.  A class-A location in
+    # a public CI log is a lasting pointer to a protected name, so the flag
+    # refuses the whole run rather than quietly printing locations.
+    if args.show_class_a_locations and "GITHUB_ACTIONS" in os.environ:
+        print("scan-leaks: --show-class-a-locations is refused while "
+              "GITHUB_ACTIONS is set: a class-A location in a public CI log "
+              "is a lasting pointer to a protected name", file=sys.stderr)
+        sys.exit(2)
+
+    # Loaded here, inside main()'s try, before anything is scanned or printed:
+    # a missing or unreadable sibling module is an internal error (exit 2),
+    # never an import-time traceback on exit 1 with a partial stdout.
+    _home_path_class()
 
     if args.root:
         root = Path(args.root).expanduser().resolve()
@@ -371,15 +997,19 @@ def main():
         root = Path(__file__).resolve().parent.parent
 
     if not root.exists():
-        print(f"scan-leaks: root not found: {root}", file=sys.stderr)
+        print(f"scan-leaks: root not found: {_escape_path(str(root))}", file=sys.stderr)
         sys.exit(2)
 
     config_path = Path(args.config_path).expanduser().resolve() if args.config_path else None
     local_patterns, config_present = load_local_patterns(root, config_path)
-    roster_file_patterns = (
-        load_roster_file(Path(args.roster_file).expanduser().resolve())
-        if args.roster_file else []
-    )
+    if args.roster_file:
+        # Defaults on purpose: the CLI reads format 2 only (C2). The loader
+        # also returns the detected format; this call site does not need it.
+        roster_file_patterns, _roster_format = load_roster_file(
+            Path(args.roster_file).expanduser().resolve()
+        )
+    else:
+        roster_file_patterns = []
 
     personal_patterns = local_patterns + roster_file_patterns
     if not personal_patterns:
@@ -402,46 +1032,115 @@ def main():
 
     all_patterns = COMMITTED_PATTERNS + personal_patterns
 
-    leaks, scanned, skipped_binary = scan(root, all_patterns)
+    report = scan(root, all_patterns)
+    leaks = report.findings
     # One greppable summary line, on clean and dirty runs alike: a clean result
     # says what it ranged over, so an empty finding list cannot hide a blind spot.
-    print(f"scan-leaks: scanned {scanned}, skipped-binary {skipped_binary}")
-    home_findings = scan_home_paths(root)
+    # FROZEN SHAPE: .github/workflows/name-leak-sweep.yml parses this line with
+    # an anchored regex, and docs/CHANGELOG.md quotes it.  New information goes
+    # on the lines below, never into this one.
+    print(f"scan-leaks: scanned {report.scanned}, skipped-binary {report.skipped_binary}")
+    if args.roster_file:
+        # The per-class counts of the PARSED roster, below the frozen line.
+        # name-leak-sweep.yml compares them against the attestation, so a
+        # scanner that never parsed format 2 cannot be mistaken for one that
+        # did.  Counts only — never a pattern, never a per-class hash (that
+        # would be a membership oracle).
+        roster_a = sum(1 for _c, _l, k in roster_file_patterns if k == CLASS_A)
+        roster_b = len(roster_file_patterns) - roster_a
+        print(f"scan-leaks: roster patterns A={roster_a}, B={roster_b}")
+    if report.skipped_binary_paths:
+        print("scan-leaks: skipped-binary files: "
+              + format_paths(report.skipped_binary_paths))
+    home_findings, home_unreadable = scan_home_paths(root)
+    # The unreadable UNION is deduped by path: two passes over one file are one
+    # file.  missing and not-a-file come from the accounting pass only, but are
+    # deduped and sorted the same way so each class prints one canonical list.
+    unreadable = sorted(set(report.unreadable_paths) | set(home_unreadable))
+    missing = sorted(set(report.missing_paths))
+    not_a_file = sorted(set(report.not_a_file_paths))
+    if unreadable:
+        print(f"scan-leaks: unreadable {len(unreadable)} (coverage incomplete): "
+              + format_paths(unreadable))
+    if missing:
+        print(f"scan-leaks: missing {len(missing)} (coverage incomplete): "
+              + format_paths(missing))
+    if not_a_file:
+        print(f"scan-leaks: not-a-file {len(not_a_file)} (not scanned): "
+              + format_paths(not_a_file))
+    coverage_incomplete = (bool(unreadable) or bool(missing)
+                           or report.candidates == 0)
+    if report.candidates == 0:
+        print(f"scan-leaks: no coverage: 0 candidate files under "
+              f"{_escape_path(str(root))}; nothing was scanned")
     if not leaks and not home_findings:
-        print(f"scan-leaks: clean ({root})")
+        if coverage_incomplete:
+            # A clean result that ranged over nothing (or over files it could
+            # not read) is not evidence of a clean tree.  Distinct from 1 so a
+            # caller can tell "dirty" from "did not look".
+            sys.exit(3)
+        print(f"scan-leaks: clean ({_escape_path(str(root))})")
         sys.exit(0)
 
-    print(f"scan-leaks: {len(leaks) + len(home_findings)} potential leak(s) in {root}",
+    # Split the hits by class.  Home-path findings are class A in code.
+    class_a_patterns = [f for f in leaks if f[4] == CLASS_A]
+    class_b_patterns = [f for f in leaks if f[4] == CLASS_B]
+    class_a = len(class_a_patterns) + len(home_findings)
+    class_b = len(class_b_patterns)
+    print(f"scan-leaks: {class_a} class-A (blocking) and {class_b} "
+          f"class-B (report-only) hit(s) in {_escape_path(str(root))}",
           file=sys.stderr)
-    for rel, lineno, label, snippet in leaks:
+    # A class-A hit is a COUNT ONLY by default: no path, no line, no label, no
+    # snippet.  A location in a public log is a lasting pointer to a name, and
+    # the log outlives the fix that removes it.  --show-class-a-locations is
+    # opt-in and off-CI (checked above) and prints `path:line` only; a
+    # class-A pattern hit and a home-path finding follow the same split.
+    if args.show_class_a_locations:
+        for rel, lineno, _label, _snippet, _klass in class_a_patterns:
+            print(f"{_escape_path(rel)}:{lineno}", file=sys.stderr)
+        for rel, lineno, _segment in home_findings:
+            print(f"{_escape_path(rel)}:{lineno}", file=sys.stderr)
+    # Class B is permitted content: it prints per line as `path:line [label]
+    # snippet`, or `path:line` under --redact.
+    for rel, lineno, label, snippet, _klass in class_b_patterns:
+        # Class B is permitted content by construction, so it keeps its tag.
+        shown_rel = _escape_path(rel)
         if args.redact:
-            print(f"{rel}:{lineno}", file=sys.stderr)
+            print(f"{shown_rel}:{lineno}", file=sys.stderr)
         else:
-            print(f"  {rel}:{lineno} [{label}] {snippet}", file=sys.stderr)
-    for rel, lineno, seg in home_findings:
-        if args.redact:
-            print(f"{rel}:{lineno}", file=sys.stderr)
-        else:
-            print(f"  {rel}:{lineno} [absolute home path] segment: {seg}", file=sys.stderr)
-    # The roster instruction is scoped to ROSTER/PATTERN hits: a roster entry
-    # names a string already published, so the fix is in the tree, never in the
-    # roster.  An absolute-home-path hit has nothing to do with the roster, so
-    # telling its operator to leave the roster alone is misdirection.
-    if leaks:
+            print(f"  {shown_rel}:{lineno} [{label}] {snippet}", file=sys.stderr)
+    # The roster instruction is scoped to CLASS-A ROSTER/PATTERN hits: a roster
+    # entry names a string already published, so the fix is in the tree, never
+    # in the roster.  Class B is permitted content and gets no "fix it" advice;
+    # an absolute-home-path hit has nothing to do with the roster, so telling
+    # its operator to leave the roster alone is misdirection.  Both class-A
+    # messages name the locator in EVERY mode: a count alone gives the operator
+    # nothing to fix and pushes them at the roster, which the tool forbids.
+    if class_a_patterns:
         print(
-            "scan-leaks: a pattern hit means the string is already in the "
-            "published tree; fix it in the release PR; do not widen or edit "
-            "the roster to silence it.",
+            "scan-leaks: a class-A pattern hit means the string is already in "
+            "the published tree; fix it in the release PR; do not widen or "
+            "edit the roster to silence it. Run locally with "
+            "--show-class-a-locations to print path:line for these hits.",
             file=sys.stderr,
         )
     if home_findings:
         print(
             "scan-leaks: an absolute home path hit means a host path is in the "
             "published tree; remove it in the release PR. The roster does not "
-            "apply to this finding.",
+            "apply to this finding. Run locally with --show-class-a-locations "
+            "to print path:line for these hits.",
             file=sys.stderr,
         )
-    sys.exit(1)
+    if class_a:
+        sys.exit(1)
+    if coverage_incomplete:
+        # A class-B-only run over a tree the scan could not fully read is still
+        # "did not look" for the blocking class: never a green tick.
+        sys.exit(3)
+    # Class B never blocks: it is counted, printed, and reaches the record —
+    # the exit is 0 when no class-A hit fired (§2.6 of the format-2 spec).
+    sys.exit(0)
 
 
 if __name__ == "__main__":

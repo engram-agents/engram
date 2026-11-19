@@ -6,7 +6,7 @@ guard tests and scanners the merge seat runs on every PR, and closes with
 file reads the document, takes the ``tests/*.py`` and ``tools/*.py`` paths
 named inside item 4 and only item 4, and asserts each one is on disk.
 
-Contract (one cell each; stdlib only; it reads this document and names no module):
+Contract (one cell each; stdlib only; it reads this document and loads only the parser module):
 
 - C1. On the real document every path item 4 names exists; a failure names
   each missing path.
@@ -23,7 +23,7 @@ Contract (one cell each; stdlib only; it reads this document and names no module
 
 from __future__ import annotations
 
-import re
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -31,40 +31,14 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 POLICY = REPO_ROOT / "docs" / "internal" / "PR-MERGE-POLICY.md"
 
-_HEADING = "## Owner merge"
-_ITEM4_START = re.compile(r"^4\. \*\*The seat's own run")
-_ITEM5_START = re.compile(r"^5\. \*\*The PR's changed")
-_PATH = re.compile(r"`((?:tests|tools)/[A-Za-z0-9_.\-]+\.py)`")
+_PARSER_PATH = REPO_ROOT / "src" / "engram" / "tools" / "policy_guard_list.py"
+_pspec = importlib.util.spec_from_file_location("policy_guard_list_4487", str(_PARSER_PATH))
+_parser = importlib.util.module_from_spec(_pspec)
+_pspec.loader.exec_module(_parser)
 
-
-def _item4_paths(text: str) -> list[str]:
-    """Return the unique tests/ and tools/ paths named in Owner-merge item 4."""
-    lines = text.splitlines()
-    head = next((i for i, ln in enumerate(lines) if ln.startswith(_HEADING)), None)
-    assert head is not None, f"anchor missing: no line starting {_HEADING!r}"
-    end = len(lines)
-    for i in range(head + 1, len(lines)):
-        if lines[i].startswith("## "):
-            end = i
-            break
-    section = lines[head + 1 : end]
-    start = next((i for i, ln in enumerate(section) if _ITEM4_START.match(ln)), None)
-    assert start is not None, (
-        "anchor missing: no item-4 start line matching '4. **The seat's own run' "
-        f"inside the section {_HEADING!r}"
-    )
-    stop = next(
-        (i for i in range(start + 1, len(section)) if _ITEM5_START.match(section[i])),
-        None,
-    )
-    assert stop is not None, (
-        "anchor missing: no item-5 line matching '5. **The PR's changed' "
-        "after item 4"
-    )
-    span = "\n".join(section[start:stop])
-    paths = list(dict.fromkeys(_PATH.findall(span)))
-    assert paths, "the item-4 span held no paths (no backticked tests/ or tools/ .py names)"
-    return paths
+# The parser moved out of this file into src/engram/tools/policy_guard_list.py
+# (#4358: run_touched_tests.py reads the same item 4); the cells below stay.
+_item4_paths = _parser.item4_paths
 
 
 def _missing(paths: list[str], root: Path) -> list[str]:
@@ -182,6 +156,100 @@ def test_real_item4_names_the_tools_scanners_too():
     paths = _real_paths()
     for expected in ("tools/scan-leaks.py", "tools/test_id_set_check.py"):
         assert expected in paths, f"item 4 no longer yields {expected}"
+
+
+def test_the_hook_directory_scanner_is_in_the_guard_set():
+    """tests/test_hook_injection_bounds.py globs src/engram/hooks/claude/*.py and names only the
+    hooks of its own exemption list.
+
+    A PR that adds a hook changes a file that this test does not name. The test-map rows were
+    first-match-wins when this cell was written, so a hook with its own row never reached it by the
+    map; the runner now takes the union of matching rows. It stays in the guard set, which the
+    runner reads from the policy and runs on every non-empty selection.
+    Three assertions in one cell: the policy names it, the runner's own reader returns it, and a
+    NEW hook file selects it (the claim itself, through select_tests; the runner is what a seat runs).
+    """
+    name = "tests/test_hook_injection_bounds.py"
+    assert name in _real_paths(), f"item 4 does not name {name}"
+    rtt_path = REPO_ROOT / "src" / "engram" / "tools" / "run_touched_tests.py"
+    rspec = importlib.util.spec_from_file_location("run_touched_tests_4487", str(rtt_path))
+    rtt = importlib.util.module_from_spec(rspec)
+    rspec.loader.exec_module(rtt)
+    guard_tests, _tool_checks = rtt.guard_set(str(REPO_ROOT))
+    assert name in guard_tests, f"the runner's guard set does not return {name}"
+    # A hook added by a PR: a file no test names and no map row lists.
+    new_hook = "src/engram/hooks/claude/engram-a-hook-added-later-hook.py"
+    selected, is_full, _reasons, _map = rtt.select_tests([new_hook], str(REPO_ROOT))
+    assert not is_full, "a new hook file became a full-suite trigger; the policy line says it selects only the guard set"
+    assert name in selected, f"a new hook file does not select {name}"
+
+
+# The whole-tree enumerators the 2026-11-18 census found outside the guard set (Kepler's ruling, 2026-11-18):
+# each enumerates the shipped tree or the tracked tree and asserts something about every file, so a change to
+# a file it scans but never names can redden it.  Scope of the census: scans done in-process and through git ls-files /
+# git grep; a scan done in any other subprocess is unseen, and 601 test files that list no directory were not read.
+WHOLE_TREE_ENUMERATORS = [
+    "tests/test_3765_nul_guard.py",
+    "tests/test_boot_charge_loop_prompt_4139a.py",
+    "tests/test_changed_concurrently_fold_4188.py",
+    "tests/test_cites_evidence_only_2243.py",
+    "tests/test_clear_stale_daemon_3493.py",
+    "tests/test_conftest_service_manager_guard_3519.py",
+    "tests/test_edge_liveness_ssot_3542.py",
+    "tests/test_engram_client_isolation.py",
+    "tests/test_engram_core_seam.py",
+    "tests/test_engram_core_sys_bound_3222.py",
+    "tests/test_fix_git_backup_canonical_gitignore_4506.py",
+    "tests/test_full_length_hashes_resolve.py",
+    "tests/test_launchers_relative_engram_home_3863.py",
+    "tests/test_metricgate_adapter.py",
+    "tests/test_never_clobber_contract.py",
+    "tests/test_os_harness_check.py",
+    "tests/test_readme_dev_trees_section.py",
+    "tests/test_recall_summary_writes.py",
+    "tests/test_relative_engram_home_step3a_3863.py",
+    "tests/test_retire_runtime_keys_4255s2.py",
+    "tests/test_retired_axis_residue_4255s7.py",
+    "tests/test_retired_multi_agent_axis_4255s3.py",
+    "tests/test_ro_uri_quoting_3514.py",
+    "tests/test_run_touched_tests_4358.py",
+    "tests/test_scan_leaks.py",
+    "tests/test_session_start_no_starred_4272.py",
+    "tests/test_sleep_skill_cohort_boundary.py",
+    "tests/test_snapshot_worker_orphan_4833.py",
+    "tests/test_stray_baton_path_check.py",
+    "tests/test_surface_label_keyed_4305.py",
+    "tests/test_ws3_telemetry_resolver.py",
+]
+
+
+def _runner_module():
+    rtt_path = REPO_ROOT / "src" / "engram" / "tools" / "run_touched_tests.py"
+    rspec = importlib.util.spec_from_file_location("run_touched_tests_4487_wt", str(rtt_path))
+    rtt = importlib.util.module_from_spec(rspec)
+    rspec.loader.exec_module(rtt)
+    return rtt
+
+
+@pytest.fixture(scope="module")
+def _runner_guard_tests():
+    """The runner's own guard_set(), read once for the module (the runner is what a seat runs)."""
+    guard_tests, _tool_checks = _runner_module().guard_set(str(REPO_ROOT))
+    return guard_tests
+
+
+def test_the_whole_tree_enumerator_list_has_thirty_one_distinct_files_that_exist():
+    """A silently shortened list must not pass: 31 distinct names, each a file on disk."""
+    assert len(WHOLE_TREE_ENUMERATORS) == len(set(WHOLE_TREE_ENUMERATORS)) == 31
+    missing = [n for n in WHOLE_TREE_ENUMERATORS if not (REPO_ROOT / n).is_file()]
+    assert not missing, f"listed but not on disk: {missing}"
+
+
+@pytest.mark.parametrize("name", WHOLE_TREE_ENUMERATORS)
+def test_each_whole_tree_enumerator_is_named_by_the_policy_and_returned_by_the_runner(name, _runner_guard_tests):
+    """Policy names it AND the runner's own guard_set() returns it (the runner is what a seat runs)."""
+    assert name in _real_paths(), f"item 4 does not name {name}"
+    assert name in _runner_guard_tests, f"the runner's guard set does not return {name}"
 
 
 def test_a_directory_with_a_listed_name_does_not_count_as_a_file(tmp_path):

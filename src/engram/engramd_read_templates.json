@@ -44,6 +44,13 @@
       ]
     },
     {
+      "key": "23ce2be5ab613fe531483b0f047b05a731e7813baed3249a46ea2dd752f3251b",
+      "sql": "SELECT id FROM nodes WHERE is_current = 1 AND status != 'retracted' AND type IN ('observation_factual', 'observation_predictive') AND created_at >= ?",
+      "sites": [
+        "tools/store_read.py:read_ids"
+      ]
+    },
+    {
       "key": "25c988d6449b53650b086cf16e62444881dde4258eefc476a78f1b701e23f857",
       "sql": "SELECT type, COUNT(*) FROM nodes GROUP BY type",
       "sites": [
@@ -136,6 +143,13 @@
       ]
     },
     {
+      "key": "5ee7819d148c8b57d0b45742b7d0196d6113ac76275d0423ffbc5f01b542d7f4",
+      "sql": "SELECT COUNT(*) FROM nodes WHERE type='axiom'",
+      "sites": [
+        "tools/store_read.py:read_axiom_count"
+      ]
+    },
+    {
       "key": "605333c4d1e12407862ff5f039a4a27289380a1f01469e87456170af0f921842",
       "sql": "SELECT id FROM nodes WHERE is_current=1 AND embedding IS NULL ORDER BY id",
       "sites": [
@@ -169,6 +183,13 @@
       "sites": [
         "hooks/claude/engram-session-start-hook.py:saved_focus_sets_block",
         "hooks/claude/engram-surface-hook.py:_dormant_focus_set_candidates"
+      ]
+    },
+    {
+      "key": "73de74c4aad9014d7752a64207a73e615cfc75f43c27b2e211be956f8a575503",
+      "sql": "SELECT id, type, claim, created_at, quoted_text, interpretation, is_current, metadata FROM nodes WHERE id > ? ORDER BY id LIMIT 200",
+      "sites": [
+        "tools/model_switch_read.py:fetch_nodes"
       ]
     },
     {

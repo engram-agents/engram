@@ -65,8 +65,12 @@ UMask=0022
 @@GITHUB_TOKEN_ENVFILE_LINE@@
 # Self-contained venv (Flask + deps) in the shared dir — group-readable so any
 # admin can run it; does not depend on the system python having Flask.
+# The auth settings on the argument line below come from the installer's REQUIRED
+# --auth-mode flag and the flags it names. This template holds NO default for them, and
+# the server refuses to start (exit 78) when its unit lacks the flag (#1459).
 ExecStart={{FORUM_HOME}}/.venv/bin/python -m forum.server \
     --host {{HOST}} \
+    {{AUTH_MODE_ARGS}} \
     --port 5002 \
     --db {{FORUM_HOME}}/forum.db \
     --audit {{FORUM_HOME}}/forum-audit.jsonl{{BATON_LOGIN_MAP_ARGS}}

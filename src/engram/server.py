@@ -2380,13 +2380,14 @@ _QUERY_FIELDS = frozenset({
 # you want to recall something SPECIFICALLY ("I know I worked on X before — let
 # me actually find it"), not just notice that something might be relevant.
 #
-# Two recall surfaces, by design (Tulving's noetic/autonoetic dissociation):
-#   - engram_surface (noetic)   — "this sounds familiar"; ambient hints, no refresh.
-#   - engram_query   (autonoetic) — "I want to recall this clearly"; full nodes,
-#                                   refreshes recall, strengthens memory.
-#
-# For tracing a specific node's chain after either entry point, use
-# engram_inspect (single node) or engram_get_subgraph (multi-hop).
+# Two entry points onto ONE search (`_search_nodes`: same ranking for both):
+#   - engram_surface — ambient, run by the prompt hook; hints, no refresh.
+#   - engram_query   — the same search on a query the agent chooses; the same
+#                      kind of hint (tiered summaries/keywords, see below), and
+#                      it restamps recall on every node it returns.
+# Neither returns a node's full content. For that, and for tracing a node's
+# chain, use engram_inspect (single node, full record) or engram_get_subgraph
+# (multi-hop, hints).
 #
 # Implementation: combines FTS5 keyword search with semantic (embedding)
 # similarity for comprehensive retrieval. Keyword results appear first; semantic-
@@ -7336,7 +7337,8 @@ def engram_resolve(payload_json: str) -> str:
 # Compat forwarder above in wave-6 compat block.
 
 
-# _walk_cascade_downstream body moved to engram_revision.py (family E) in #872 wave 6.
+# _walk_cascade_downstream body moved to engram_revision.py (family E) in #872 wave 6,
+# then to engram_core.py in #4727 (revision binds the old name to core's).
 # Compat forwarder above in wave-6 compat block.
 #
 # _add_stale_replacement retired (#2013/#2009 slice 1, cascade machine):
@@ -8052,7 +8054,10 @@ def engram_set_recall_summaries(payload_json: str) -> str:
     """Batch-write recall_summary + recall_keywords for multiple nodes.
 
     Best-effort: applies valid entries, returns per-item errors for invalid ones
-    (no all-or-nothing rollback). Use for sleep-cycle cohort writes and bulk
+    (no all-or-nothing rollback). Every applied entry attempts a fresh embedding of
+    the complete post-update canonical recipe, including an identical-input replay.
+    An unavailable or unverified vector keeps the summary but is reported as pending
+    and included in needs_reembed. Use for sleep-cycle cohort writes and bulk
     backfill operations.
 
     Args:
@@ -8079,10 +8084,12 @@ def engram_set_recall_summaries(payload_json: str) -> str:
 
     Returns:
         JSON: {
-            "ok": [{"node_id": "..."}, ...],
+            "ok": [{"node_id": "...", "embedding_refresh": "refreshed" | "pending",
+                    "embedding_refresh_reason": "..."}, ...],
             "errors": [{"node_id": "...", "error": "...", ...}, ...],
             "applied": N,
             "failed": M,
+            "needs_reembed": ["..."],  # unique targets whose latest applied entry is pending
             "summaries_file": "<path>"  # present only when summaries_file was used
         }
     """

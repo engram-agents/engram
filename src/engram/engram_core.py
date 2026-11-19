@@ -2250,13 +2250,14 @@ PROVENANCE_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c
 _PROVENANCE_RELATIONS_SORTED = sorted(PROVENANCE_RELATIONS)
 _PROVENANCE_RELATION_PLACEHOLDERS = ",".join("?" * len(_PROVENANCE_RELATIONS_SORTED))
 
-# Same pattern, for the upstream (premise-direction) cascade walk used by
-# _walk_cascade_upstream / _trace_observation_leaves below. engram_revision.py
-# has its own copy (`_CASCADE_RELATIONS_SORTED`) for the downstream taint
-# walker — this is engram_core's own derivation of the same upstream
-# constant, not an import of revision's, since core has no dependency on
-# revision (#2298, superseding #2255's "leave enumerated" doctrine for this
-# specific walk — see _walk_cascade_upstream's docstring).
+# Same pattern, for the cascade walks in this module: the upstream
+# (premise-direction) walk used by _walk_cascade_upstream /
+# _trace_observation_leaves, and since #4727 the downstream taint walk too
+# (_walk_cascade_downstream / _walk_cascade_from_root, promoted from
+# engram_revision). engram_revision.py keeps its own copy of this constant for
+# its remaining walks (_cascade_reaches); core has no dependency on revision
+# (#2298, superseding #2255's "leave enumerated" doctrine for this specific
+# walk — see _walk_cascade_upstream's docstring).
 _CASCADE_RELATIONS_SORTED = sorted(CASCADE_RELATIONS)
 _CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
 
@@ -3295,6 +3296,10 @@ _REWRITE_GUARD_MIN_GIT = (2, 28)
 _REWRITE_GUARD_MARKER = b"# engram: refuse to rewrite a pushed commit (#4205)"
 REWRITE_GUARD_SCRIPT = r"""#!/bin/sh
 # engram: refuse to rewrite a pushed commit (#4205). Managed file: _init_git rewrites it.
+# Scope: this refuses rewriting a commit still reachable from refs/remotes/origin/*, not one
+# that was ever pushed. After a fetch from a remote rewritten elsewhere (a sanctioned repair),
+# the local branch may be reset onto the new history without the override. Intended for a
+# single-writer memory repo; it is not a "never lose a pushed commit" guarantee.
 [ "$1" = "prepared" ] || exit 0
 while read -r old new ref; do
   case "$ref" in refs/heads/*) ;; *) continue ;; esac
@@ -3327,7 +3332,13 @@ def _git_version():
 def _install_rewrite_guard() -> str:
     """Idempotently install the reference-transaction hook; -> the status-file
     rewrite_guard value: "installed" | "unsupported" | "opt-out" | "foreign-hook" (an
-    existing hook without our marker is left alone). Never raises."""
+    existing hook without our marker is left alone). Never raises.
+
+    What the hook protects: it refuses rewriting a commit that is still reachable from
+    refs/remotes/origin/*, not a commit that was ever pushed. After a fetch from a remote
+    someone rewrote elsewhere (a sanctioned repair), the local branch can be reset onto the
+    new history without ENGRAM_ALLOW_HISTORY_REWRITE=1, dropping commits that had been
+    pushed. For a single-writer memory repo that is intended."""
     try:
         ver = _git_version()
         if ver is None or ver[:2] < _REWRITE_GUARD_MIN_GIT:
@@ -5206,13 +5217,84 @@ def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
 # pre-migration backup, and engramd_owner's start() gate refuses a store whose
 # user_version is below it (read through this module attribute at call time, never
 # copied). Adding a rung means bumping this single line.
-LATEST_SCHEMA_VERSION = 10
+LATEST_SCHEMA_VERSION = 11
 
 
 # Migration rung of #4075 (the fourth cascade resolution kind). A renumber edits THREE places, as for
 # TEXT_NUL_GUARD_RUNG above: this constant, the literal `PRAGMA user_version = N` in the rung, and
 # LATEST_SCHEMA_VERSION; tests/test_cascade_resolved_kind_4075.py ties them together.
 CASCADE_RESOLVED_KIND_RUNG = 10
+
+
+# Migration rung of #4727 (retract markers for retractions older than the cascade machine). Same
+# three places as above; tests/test_retract_backfill_4727.py ties them together.
+RETRACT_BACKFILL_RUNG = 11
+
+
+def _backfill_pre_machine_retract_markers(conn: sqlite3.Connection) -> "tuple[int, int, int]":
+    """#4727: mark the live dependents of retractions made before the cascade machine.
+
+    A retracted node with NO retract-rooted marker either had no live claim-bearing
+    dependent when it was retracted, or was retracted before the machine existed and so
+    never marked the nodes built on it. The live walk (``_walk_cascade_from_root``,
+    the same helper every live retraction uses) tells the two apart: it finds nothing
+    for the first and the unmarked dependents for the second. Each gets one pending
+    marker, ``root_op='retract'``, ``cascade_event='backfill:retract:<root>'``,
+    ``backfill_provenance='migration_time'``.
+
+    Writes ONLY ``INSERT OR IGNORE`` rows into cascade_markers, plus one edit_history
+    row per root that gained markers (keyed to that root, as every edit_history row is
+    keyed to a node), and only when edit_history exists (a fresh store creates it after
+    the ladder). No node, edge, or existing marker row is changed.
+
+    Unlike a live retraction, this does NOT mark contradiction nodes with the root as a
+    side (the live path's parallel contradicts cascade): measured 0 across the team's
+    graphs on 2026-11-15, unmeasured on public installs.
+
+    Returns (roots that gained markers, markers written, distinct nodes marked).
+    """
+    now = _now()
+    roots = [r[0] for r in conn.execute(
+        "SELECT n.id FROM nodes n WHERE n.status = 'retracted' AND NOT EXISTS "
+        "(SELECT 1 FROM cascade_markers m WHERE m.root_op = 'retract' "
+        "AND m.root_node = n.id) ORDER BY n.id"
+    )]
+    has_history = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edit_history'"
+    ).fetchone() is not None
+    roots_marked = markers_written = 0
+    nodes_marked: set = set()
+    for root in roots:
+        event = f"backfill:retract:{root}"
+        written: list = []
+
+        def _mark(dep, _root=root, _event=event, _written=written):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO cascade_markers (node_id, cascade_event, root_node, "
+                "root_op, status, created_at, backfill_provenance) "
+                "VALUES (?, ?, ?, 'retract', 'pending', ?, 'migration_time')",
+                (dep["id"], _event, _root, now),
+            )
+            if cur.rowcount:
+                _written.append(dep["id"])
+
+        _walk_cascade_from_root(conn, root, on_live_node=_mark)
+        if not written:
+            continue
+        roots_marked += 1
+        markers_written += len(written)
+        nodes_marked.update(written)
+        if has_history:
+            row = conn.execute("SELECT type FROM nodes WHERE id = ?", (root,)).fetchone()
+            conn.execute(
+                "INSERT INTO edit_history (timestamp, action, node_id, node_type, details) "
+                "VALUES (?, 'retract_backfill', ?, ?, ?)",
+                (now, root, row[0] if row else "", json.dumps({
+                    "cascade_event": event, "markers_written": len(written),
+                    "nodes_marked": sorted(written), "issue": 4727,
+                })),
+            )
+    return roots_marked, markers_written, len(nodes_marked)
 
 
 # #4075 (schema v10): the cascade_markers table with its fourth resolution kind. SQLite cannot
@@ -6910,6 +6992,39 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 file=sys.stderr,
             )
 
+    # Migration version 11 (#4727; the number is RETRACT_BACKFILL_RUNG): retractions made before
+    # the cascade machine never marked the nodes built on them. One pass of the LIVE walk from
+    # every retracted root that has no retract marker writes the missing markers (insert-only;
+    # see _backfill_pre_machine_retract_markers). One transaction with the version bump; on
+    # failure it rolls back and retries next start; the pre-migration backup gate applies.
+    # RecursionError is caught with DatabaseError as a GUARD: the cascade walk is iterative
+    # since #4823, so a deep derivation chain no longer raises it. If it is raised anyway,
+    # something below the rung recursed unexpectedly; the rung rolls back and retries, the
+    # server still starts, and the stderr line asks for a report.
+    if _rung_ready(conn, RETRACT_BACKFILL_RUNG, _pre_migration_backup_ok):
+        try:
+            _bf_roots, _bf_markers, _bf_nodes = _backfill_pre_machine_retract_markers(conn)
+            conn.execute("PRAGMA user_version = 11")
+            conn.commit()
+            print(
+                f"[_run_db_one_time_setup] migration {RETRACT_BACKFILL_RUNG} (#4727 retract-marker "
+                f"backfill): {_bf_roots} old retraction(s), {_bf_markers} marker(s), "
+                f"{_bf_nodes} node(s) marked; they block derivation until adjudicated "
+                "(engram_cascade_frontier).",
+                file=sys.stderr,
+            )
+        except (sqlite3.DatabaseError, RecursionError) as _migration11_err:
+            conn.rollback()
+            print(
+                f"[_run_db_one_time_setup] migration {RETRACT_BACKFILL_RUNG} (#4727 retract-marker "
+                "backfill) FAILED, will retry on next "
+                f"startup: {_migration11_err!r}"
+                + ("; RecursionError here is unexpected (the cascade walk is iterative since "
+                   "#4823), please report it with this line"
+                   if isinstance(_migration11_err, RecursionError) else ""),
+                file=sys.stderr,
+            )
+
     # #2732 (A): a rung that landed leaves its new index (or any DDL) with no
     # planner statistics, and the next plain `PRAGMA optimize` -- which every
     # checkpoint runs -- then re-analyzes that WHOLE table under SQLite's
@@ -8516,6 +8631,84 @@ class EmbeddingOutcome(NamedTuple):
 EMBED_REVIVE_COOLDOWN_S = 300
 
 
+def _store_embedding_vector(
+    conn: sqlite3.Connection, node_id: str, vector: list,
+) -> "EmbeddingOutcome":
+    """Persist an already-computed vector: the STORE step of
+    _compute_and_store_embedding, extracted (#4651 part A) so the compute path
+    and the prepared-vector publication path write through ONE function.
+
+    Returns EmbeddingOutcome(status="failed", stage="store") when the
+    nodes.embedding UPDATE raises (WARNING logged), else
+    EmbeddingOutcome(status="embedded", vec_mirror_ok=...). The vec mirror keeps
+    its tolerated-degradation rules (see the inline comments). Never raises for
+    a store/mirror failure; does not commit.
+    """
+    # Stage "store" (#345 PR3 R2): the vector computed fine; only
+    # persisting it failed (e.g. "database is locked") -- not an
+    # embedder-health signal, so no revive/cooldown either.
+    try:
+        conn.execute(
+            "UPDATE nodes SET embedding = ? WHERE id = ?",
+            (json.dumps(vector), node_id),
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "embedding STORE FAILED for node %s: %r — vector computed "
+            "but not persisted; node left without an embedding.",
+            node_id, exc,
+        )
+        return EmbeddingOutcome(
+            status="failed", node_id=node_id, detail=repr(exc), stage="store",
+        )
+    vec_mirror_ok = True
+    # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
+    # virtual tables, so delete-then-insert handles the rare re-embed.
+    if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(vector) == 384:
+        try:
+            conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
+            conn.execute(
+                "INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)",
+                (node_id, _sqlite_vec.serialize_float32(vector)),
+            )
+        except sqlite3.OperationalError:
+            # vec_nodes missing/locked -- the LONG-TOLERATED #3075
+            # contract (#3075 C2 explicitly keeps this non-fatal):
+            # SILENT degradation, no WARNING. Round 4 (M3, Mira's own
+            # regression on her round-3 R-S2 fix below): #3075's own
+            # minimal test fixtures have no vec_nodes table at all, so
+            # on any seat where sqlite-vec IS actually available this
+            # exact exception fires on EVERY write in those fixtures
+            # -- R-S2's single widened `except Exception` logged a
+            # WARNING here too, which turned two previously-green
+            # #3075 tests (test_enabled_false_is_ignored_still_embeds,
+            # test_all_succeed) red on such a seat. Kept separate from
+            # the branch below so this one specific, long-tolerated
+            # exception type stays exactly as quiet as it always was.
+            vec_mirror_ok = False
+        except Exception as exc:
+            # Any OTHER exception from this step (round 3, R-S2 --
+            # e.g. _sqlite_vec.serialize_float32 raising) — JSON still
+            # canonical either way. Still a TOLERATED degradation
+            # (#3075 C2), but now visible via a WARNING instead of
+            # being silently swallowed. Narrowed to only
+            # sqlite3.OperationalError before R-S2 — any OTHER
+            # exception type here fell through to the outer catch-all
+            # below, which defaults stage="embed" and wrongly implies
+            # the embedder (not the vec mirror) is unhealthy, even
+            # though both the embedder and the canonical
+            # nodes.embedding write already succeeded.
+            logging.getLogger(__name__).warning(
+                "vec_nodes mirror write failed for node %s: %r -- the "
+                "canonical nodes.embedding write succeeded; KNN index "
+                "degraded for this node.", node_id, exc,
+            )
+            vec_mirror_ok = False
+    return EmbeddingOutcome(
+        status="embedded", node_id=node_id, vec_mirror_ok=vec_mirror_ok,
+    )
+
+
 def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "EmbeddingOutcome":
     """Compute embedding for a node and store it.
 
@@ -8587,70 +8780,8 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "Emb
                 detail="embed() returned empty/None", stage="embed",
             )
 
-        # Stage "store" (#345 PR3 R2): the vector computed fine; only
-        # persisting it failed (e.g. "database is locked") -- not an
-        # embedder-health signal, so no revive/cooldown either.
-        try:
-            conn.execute(
-                "UPDATE nodes SET embedding = ? WHERE id = ?",
-                (json.dumps(vector), node_id),
-            )
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "embedding STORE FAILED for node %s: %r — vector computed "
-                "but not persisted; node left without an embedding.",
-                node_id, exc,
-            )
-            return EmbeddingOutcome(
-                status="failed", node_id=node_id, detail=repr(exc), stage="store",
-            )
-        vec_mirror_ok = True
-        # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
-        # virtual tables, so delete-then-insert handles the rare re-embed.
-        if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(vector) == 384:
-            try:
-                conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
-                conn.execute(
-                    "INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)",
-                    (node_id, _sqlite_vec.serialize_float32(vector)),
-                )
-            except sqlite3.OperationalError:
-                # vec_nodes missing/locked -- the LONG-TOLERATED #3075
-                # contract (#3075 C2 explicitly keeps this non-fatal):
-                # SILENT degradation, no WARNING. Round 4 (M3, Mira's own
-                # regression on her round-3 R-S2 fix below): #3075's own
-                # minimal test fixtures have no vec_nodes table at all, so
-                # on any seat where sqlite-vec IS actually available this
-                # exact exception fires on EVERY write in those fixtures
-                # -- R-S2's single widened `except Exception` logged a
-                # WARNING here too, which turned two previously-green
-                # #3075 tests (test_enabled_false_is_ignored_still_embeds,
-                # test_all_succeed) red on such a seat. Kept separate from
-                # the branch below so this one specific, long-tolerated
-                # exception type stays exactly as quiet as it always was.
-                vec_mirror_ok = False
-            except Exception as exc:
-                # Any OTHER exception from this step (round 3, R-S2 --
-                # e.g. _sqlite_vec.serialize_float32 raising) — JSON still
-                # canonical either way. Still a TOLERATED degradation
-                # (#3075 C2), but now visible via a WARNING instead of
-                # being silently swallowed. Narrowed to only
-                # sqlite3.OperationalError before R-S2 — any OTHER
-                # exception type here fell through to the outer catch-all
-                # below, which defaults stage="embed" and wrongly implies
-                # the embedder (not the vec mirror) is unhealthy, even
-                # though both the embedder and the canonical
-                # nodes.embedding write already succeeded.
-                logging.getLogger(__name__).warning(
-                    "vec_nodes mirror write failed for node %s: %r -- the "
-                    "canonical nodes.embedding write succeeded; KNN index "
-                    "degraded for this node.", node_id, exc,
-                )
-                vec_mirror_ok = False
-
-        return EmbeddingOutcome(
-            status="embedded", node_id=node_id, vec_mirror_ok=vec_mirror_ok,
-        )
+        # Stage "store" (#345 PR3 R2): see _store_embedding_vector.
+        return _store_embedding_vector(conn, node_id, vector)
     except Exception as exc:
         # Anything NOT already attributed to "text"/"embed"/"store" above
         # (e.g. a config-read error ahead of all three) -- defaulted to
@@ -12931,6 +13062,14 @@ def _validate_premises(
         open_ct_ids = [] if tainted_by else _open_contradiction_ids(conn, sid)
 
         if tainted_by:
+            # #4727: roots whose pending retract marker on this premise came from the
+            # one-time backfill of pre-machine retractions; their item names the event.
+            backfill_events = {
+                m["root_node"]: m["cascade_event"]
+                for m in _pending_markers_for_node(conn, sid)
+                if m["root_op"] == "retract"
+                and m["cascade_event"].startswith("backfill:retract:")
+            }
             retraction_info = []
             for rid in tainted_by:
                 rrow = conn.execute(
@@ -12939,10 +13078,13 @@ def _validate_premises(
                 r_reason = None
                 if rrow and rrow["metadata"]:
                     r_reason = _metadata_dict(rrow["metadata"]).get("retraction_reason")
-                retraction_info.append({
+                item = {
                     "retracted_by": rid,
                     "retraction_reason_excerpt": (r_reason or "")[:_WARNING_EXCERPT_LEN],
-                })
+                }
+                if rid in backfill_events:
+                    item["cascade_event"] = backfill_events[rid]
+                retraction_info.append(item)
             tainted_premises.append({
                 "id": sid,
                 "retracted_by": retraction_info,
@@ -13169,6 +13311,98 @@ class CascadeWalkTruncated(Exception):
         )
 
 
+_WALK_EXHAUSTED = object()  # sentinel: a node's child iterator is used up
+
+
+def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
+    """Walk downstream from node_id following engram_core.CASCADE_RELATIONS
+    edges (the relations whose EDGE_CLASSIFICATIONS entry sets cascade=True —
+    today derives_from and acknowledged_derives_from, the latter
+    cascade-bearing by design per #2013 §12.5; the constant is the source of
+    truth, not this list). supported_by lost its cascade flag in #2252
+    Stage 1.3, and the W6 pairing edge predicted_by was minted cascade:False
+    from the start, so neither ever reaches this walk. Visits each
+    downstream node at most once. For each live
+    claim-bearing node visited, calls on_live_node(node) — the caller
+    decides what to write. Stops cascade at retracted/superseded nodes
+    (node not is_current) AND at any non-claim-bearing (NCB) node — an NCB
+    node has no claim to re-adjudicate, so cascade reaching it accomplishes
+    nothing (#2252 W0). Cornerstones/lessons are the vote-accumulator
+    *instance* of this rule, not the rule itself.
+
+    Visit pattern (Lei 2026-05-28): visited check is at the top of the call,
+    BEFORE on_live_node fires. This guarantees on_live_node fires exactly
+    once per downstream node regardless of how many paths reach it. The
+    caller seeds the cascade root into `visited` before calling so the root
+    isn't re-processed.
+
+    Promoted from engram_revision (#4727) so a migration rung in this module
+    can run the same walk; engram_revision binds its old name to this one.
+    Callers starting from a ROOT use _walk_cascade_from_root, not this.
+
+    Iterative since #4823: it used to recurse once per derivation level, so a
+    chain deeper than the interpreter's recursion limit raised RecursionError
+    in a live retraction and in migration rung 11. It is the same preorder with
+    an explicit stack of child iterators: each dependent is explored fully
+    before the next, the visited check runs when a node is taken, and a node's
+    child list is built right after its on_live_node call, as before, so a
+    callback that writes cannot reorder anything. The visit sequence is pinned
+    against a copy of the recursive walk in
+    tests/test_cascade_walk_iterative_4823.py.
+    """
+    stack = [iter((node_id,))]
+    while stack:
+        current = next(stack[-1], _WALK_EXHAUSTED)
+        if current is _WALK_EXHAUSTED:
+            stack.pop()
+            continue
+        if current in visited:
+            continue
+        visited.add(current)
+
+        node = conn.execute(
+            "SELECT id, type, claim, metadata FROM nodes "
+            "WHERE id = ? AND is_current = 1",
+            (current,),
+        ).fetchone()
+        if not node:
+            continue  # retracted/superseded — stop cascade (parity with old _flag_stale)
+        if not _is_claim_bearing(node["type"]):
+            continue  # NCB: no claim to re-adjudicate, so nothing to taint (#2252 W0)
+
+        on_live_node(node)
+
+        stack.append(iter([dep_id for dep_id, _tgt, _rel in dag_edge_set(
+            conn, _CASCADE_RELATIONS_SORTED, target_id=current)]))
+
+
+def _walk_cascade_from_root(conn, root_id, *, on_live_node, extra_visited=()):
+    """THE cascade walk from a root (#4727): every live claim-bearing node
+    downstream of ``root_id`` over CASCADE_RELATIONS, each handed once to
+    ``on_live_node``. Two steps, and both are the walk:
+
+    1. the root's DIRECT dependents, with ``live_only=False`` — the root has
+       usually just stopped being live (a retract / supersede root), so its
+       own edges are provenance by construction (#3542), and the default
+       live-only set would drop them;
+    2. ``_walk_cascade_downstream`` on each, with the root (and
+       ``extra_visited``, e.g. a supersede's replacement) seeded into
+       ``visited`` so neither is processed.
+
+    Calling ``_walk_cascade_downstream`` on the root itself with the root
+    seeded marks nothing (it returns at the visited check), which is why
+    every caller goes through this one helper instead of restating the two
+    steps. Chosen over a rung-local copy: a second copy of a shape this easy
+    to get wrong is the larger risk.
+    """
+    visited = {root_id, *extra_visited}
+    for dep_id, _t, _r in dag_edge_set(
+            conn, _CASCADE_RELATIONS_SORTED, live_only=False,
+            target_id=root_id):
+        _walk_cascade_downstream(conn, dep_id,
+                                 visited=visited, on_live_node=on_live_node)
+
+
 def _walk_cascade_upstream(
     conn: sqlite3.Connection,
     node_id: str,
@@ -13180,9 +13414,9 @@ def _walk_cascade_upstream(
 ) -> set:
     """Shared upstream (premise-direction) walk over ``CASCADE_RELATIONS``:
     follows each visited node's own outgoing cascade edges back toward its
-    origins. Mirrors ``engram_revision._walk_cascade_downstream``'s shape
-    (visited-set dedup, per-dequeue budget decrement, caller-supplied
-    per-node decision) for the inverse direction — that walker finds who
+    origins. Mirrors ``_walk_cascade_downstream``'s shape
+    (visited-set dedup, caller-supplied per-node decision) for the inverse
+    direction — that walker finds who
     DEPENDS ON a node (``target_id = node_id``); this one finds what a node
     DEPENDS ON (``source_id = node_id``).
 

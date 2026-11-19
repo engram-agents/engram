@@ -1333,3 +1333,69 @@ class TestScanLeaksFlagAndRosterWarning:
         assert str(a_dir) in result.stderr
         assert "not found at" in result.stderr
         assert _target_state(tgt) == before
+
+
+# ---------------------------------------------------------------------------
+# 13. Leak gate: exit 3 ("coverage incomplete") is not a leak — both still abort
+# ---------------------------------------------------------------------------
+
+def _scanner_stub(path: Path, *, returncode: int, body: str) -> Path:
+    """A scanner stub that exits with ``returncode`` after printing ``body``."""
+    path.write_text("import sys\n" + body + f"sys.exit({returncode})\n",
+                    encoding="utf-8")
+    return path
+
+
+class TestLeakGateCoverageIncomplete:
+    """The leak gate aborts on any nonzero scan result, but says what happened.
+
+    scan-leaks exits 3 when no findings were found yet the scan could not read
+    every candidate (or had none). Before #4752 the tool called that "found
+    potential leaks" — a false claim about the tree. Exit 1 keeps its own
+    message; both still abort and leave the target untouched.
+    """
+
+    def test_exit_3_aborts_naming_incomplete_coverage(self, tmp_path):
+        src = _make_source_repo(tmp_path)
+        tgt = _make_target_repo(tmp_path)
+        before = _target_state(tgt)
+        stub = _scanner_stub(
+            tmp_path / "stub-scan-3.py",
+            returncode=3,
+            body=(
+                'print("scan-leaks: scanned 1, skipped-binary 0")\n'
+                'print("scan-leaks: unreadable 1 (coverage incomplete): '
+                'locked.txt")\n'
+            ),
+        )
+        result = _run_tool(_BASE_ARGS + ["--source", str(src),
+                                         "--target", str(tgt),
+                                         "--scan-leaks", str(stub)])
+        assert result.returncode != 0, result.stdout
+        assert "coverage was incomplete" in result.stderr, result.stderr
+        assert "found potential leaks" not in result.stderr, result.stderr
+        assert _target_state(tgt) == before
+
+    def test_exit_1_still_aborts_naming_potential_leaks(self, tmp_path):
+        """Positive control: exit 1 keeps the leak message and still aborts."""
+        src = _make_source_repo(tmp_path)
+        tgt = _make_target_repo(tmp_path)
+        before = _target_state(tgt)
+        stub = _scanner_stub(
+            tmp_path / "stub-scan-1.py",
+            returncode=1,
+            body=(
+                'print("scan-leaks: scanned 1, skipped-binary 0")\n'
+                'print("scan-leaks: 1 potential leak(s) in /repo", '
+                'file=sys.stderr)\n'
+                'print("  doc.md:1 [personal name] Quillonfex", '
+                'file=sys.stderr)\n'
+            ),
+        )
+        result = _run_tool(_BASE_ARGS + ["--source", str(src),
+                                         "--target", str(tgt),
+                                         "--scan-leaks", str(stub)])
+        assert result.returncode != 0, result.stdout
+        assert "found potential leaks" in result.stderr, result.stderr
+        assert "coverage was incomplete" not in result.stderr, result.stderr
+        assert _target_state(tgt) == before

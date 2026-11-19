@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field as _dc_field
 from pathlib import Path
 
@@ -98,10 +99,18 @@ class SignatureResult:
 
 
 class _Refusal(Exception):
-    def __init__(self, field_name: str, reason: str):
+    def __init__(self, field_name: str, reason: str, code: str | None = None,
+                 model_id: str | None = None):
         super().__init__(reason)
         self.field = field_name
         self.reason = reason
+        # Machine-readable kind, set only where a caller other than the signature
+        # (the #4596 detector) must tell refusals apart: "mixed_harness",
+        # "unmapped_model", "no_model_row", "no_usable_model".  None elsewhere.
+        self.code = code
+        # The offending id of an "unmapped_model" refusal, so the #4596 gate can tell which provider
+        # it belongs to; None elsewhere.
+        self.model_id = model_id
 
 
 # ---------------------------------------------------------------- config
@@ -225,14 +234,27 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
         raw = transcript.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         raise _Refusal("transcript", f"cannot read transcript {transcript}: {e}")
+    return _model_from_rows(_parse_rows(raw.splitlines()), transcript)
+
+
+def _parse_rows(lines) -> list:
+    """The JSON-object rows among ``lines``; a malformed line or a non-object is skipped."""
     rows = []
-    for ln in raw.splitlines():
+    for ln in lines:
         try:
             r = json.loads(ln)
         except ValueError:
             continue
         if isinstance(r, dict):
             rows.append(r)
+    return rows
+
+
+def _model_from_rows(rows: list, transcript) -> tuple[str, str | None]:
+    """The row-level model rules, over already-parsed rows (shared by ``_read_model``,
+    which reads the whole file, and ``read_model_tail``, which reads a window).
+    ``transcript`` is only the name used in refusal messages.  See ``_read_model``
+    for the precedence rules; raises ``_Refusal`` exactly as it always has."""
     turns = [r for r in rows if r.get("type") == "turn_context"]
     if turns:
         if _has_claude_source(rows):
@@ -240,7 +262,8 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
                 "model",
                 f"transcript {transcript} holds both Claude model evidence and "
                 "Codex turn_context records (mixed-harness): cannot determine "
-                "the running model, refusing rather than ranking the sources")
+                "the running model, refusing rather than ranking the sources",
+                code="mixed_harness")
         payload = turns[-1].get("payload")
         mid = payload.get("model") if isinstance(payload, dict) else None
         if isinstance(mid, str) and mid.strip():
@@ -249,7 +272,8 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
             "model",
             f"the newest turn_context record in {transcript} has no usable "
             "payload.model (missing, non-string or blank): refusing rather "
-            "than falling back to an older turn or a nested model key")
+            "than falling back to an older turn or a nested model key",
+            code="no_usable_model")
     # Primary: harness model attachment (id + marketing name).
     for r in reversed(rows):
         att = r.get("attachment")
@@ -285,17 +309,256 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
             f"the newest assistant row with a usable model id in {transcript} "
             f"has model id {mid!r}, "
             "which does not map to a lineage: refusing rather than signing "
-            "with an older row's model")
+            "with an older row's model", code="unmapped_model", model_id=mid)
     if saw_assistant:
         raise _Refusal(
             "model",
             f"every assistant row in {transcript} has a placeholder, blank or "
             "non-string model (no usable model id): cannot determine the "
-            "running model")
+            "running model", code="no_usable_model")
     raise _Refusal(
         "model",
         f"transcript {transcript} has neither a model attachment row nor an "
-        "assistant row with message.model: cannot determine the running model")
+        "assistant row with message.model: cannot determine the running model",
+        code="no_model_row")
+
+
+# ------------------------------------------------------- bounded tail read
+
+@dataclass
+class TailResult:
+    """``read_model_tail``'s answer: ``reason is None`` means ``model_id`` is the
+    running model of the newest turn in the window (``marketing_name`` or None);
+    otherwise ``reason`` is the UNKNOWN reason (the #4596 closed set):
+    ``transcript_not_found``, ``transcript_unreadable``, ``no_model_row``,
+    ``window_exceeded``, ``unmapped_model`` or ``mixed_harness``.  For ``unmapped_model``
+    (and only that reason) ``model_id`` carries the offending id, so a caller can tell which
+    provider it belongs to."""
+    model_id: str | None = None
+    marketing_name: str | None = None
+    reason: str | None = None
+
+
+def read_model_tail(transcript, max_bytes: int) -> TailResult:
+    """``_read_model`` over at most ``max_bytes`` taken from the END of the file (#4596).
+
+    Same row rules (``_model_from_rows``), different window.  When the read starts
+    past offset 0 the first, partial line is discarded; a malformed line is
+    skipped as always.  A window with no complete line, or whose rows carry no
+    model while the file is larger than the window, is ``window_exceeded`` (a
+    newest entry larger than the bound lands here): never an older row's id, and
+    never a guess.  Never raises.  Opens non-blocking and refuses anything that is
+    not a regular file, so a FIFO cannot hang a hook."""
+    import errno
+    import stat
+    try:
+        fd = os.open(os.fspath(transcript), os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return TailResult(reason="transcript_not_found")
+    except NotADirectoryError:
+        return TailResult(reason="transcript_not_found")
+    except OSError:
+        return TailResult(reason="transcript_unreadable")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return TailResult(reason="transcript_unreadable")
+        size = st.st_size
+        start = max(0, size - max(0, int(max_bytes)))
+        os.lseek(fd, start, os.SEEK_SET)
+        chunks, left = [], size - start
+        while left > 0:
+            b = os.read(fd, min(left, 1 << 20))
+            if not b:
+                break
+            chunks.append(b)
+            left -= len(b)
+        data = b"".join(chunks)
+    except OSError as e:
+        return TailResult(reason="transcript_unreadable" if e.errno != errno.ENOENT else "transcript_not_found")
+    finally:
+        os.close(fd)
+    truncated = start > 0
+    if truncated:
+        nl = data.find(b"\n")
+        data = b"" if nl < 0 else data[nl + 1:]
+    text = data.decode("utf-8", errors="replace")
+    if not text.strip():
+        return TailResult(reason="window_exceeded" if truncated else "no_model_row")
+    try:
+        model_id, name = _model_from_rows(_parse_rows(text.splitlines()), transcript)
+    except _Refusal as r:
+        code = r.code
+        if code in ("no_model_row", "no_usable_model"):
+            code = "window_exceeded" if truncated else "no_model_row"
+        elif code not in ("mixed_harness", "unmapped_model"):
+            code = "internal_error"  # a refusal this reader does not recognise (or one with no code)
+        return TailResult(model_id=r.model_id if code == "unmapped_model" else None, reason=code)
+    return TailResult(model_id=model_id, marketing_name=name)
+
+
+# ----------------------------------------------- the calling entry (#4596)
+
+CALL_WINDOW_BYTES = 262144  # the tail window both the calling-row scan and its fallback read
+
+
+def _read_window(transcript) -> tuple:
+    """(data, truncated, reason): the last ``CALL_WINDOW_BYTES`` of ``transcript``, opened non-blocking
+    and refused unless a regular file (a FIFO cannot hang a hook).  When ``truncated`` the first, partial
+    line is already dropped.  ``reason`` is ``transcript_not_found`` / ``transcript_unreadable`` or None."""
+    import errno
+    import stat
+    try:
+        fd = os.open(os.fspath(transcript), os.O_RDONLY | os.O_NONBLOCK)
+    except (FileNotFoundError, NotADirectoryError):
+        return b"", False, "transcript_not_found"
+    except OSError:
+        return b"", False, "transcript_unreadable"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return b"", False, "transcript_unreadable"
+        size = st.st_size
+        start = max(0, size - CALL_WINDOW_BYTES)
+        os.lseek(fd, start, os.SEEK_SET)
+        chunks, left = [], size - start
+        while left > 0:
+            b = os.read(fd, min(left, 1 << 20))
+            if not b:
+                break
+            chunks.append(b)
+            left -= len(b)
+        data = b"".join(chunks)
+    except OSError as e:
+        return b"", False, ("transcript_not_found" if e.errno == errno.ENOENT else "transcript_unreadable")
+    finally:
+        os.close(fd)
+    truncated = start > 0
+    if truncated:
+        nl = data.find(b"\n")
+        data = b"" if nl < 0 else data[nl + 1:]
+    return data, truncated, None
+
+
+def _calling_row_model(data: bytes, needle: bytes, tool_use_id: str):
+    """(found, model_id_or_None): the newest assistant row in ``data`` holding a ``tool_use`` block whose id
+    is ``tool_use_id``.  Bytes prefilter first (``needle`` is the id's bytes); only a matching line is parsed.
+    ``model_id`` is None when that row carries no usable ``message.model`` (missing, blank, or the harness
+    placeholder ``<synthetic>``)."""
+    for line in reversed(data.split(b"\n")):
+        if needle not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        msg = row.get("message") if isinstance(row, dict) else None
+        if not isinstance(msg, dict) or (row.get("type") != "assistant" and msg.get("role") != "assistant"):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        if not any(isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") == tool_use_id
+                   for b in content):
+            continue
+        mid = msg.get("model")
+        mid = mid.strip() if isinstance(mid, str) else ""
+        return True, (mid if mid and mid != "<synthetic>" else None)
+    return False, None
+
+
+def model_of_call(transcript_path, tool_use_id, budget_s, step_s, agent_id=None, session_id=None) -> tuple:
+    """``(model_id | None, source, reason | None)``: the model that made one tool call (#4596).
+
+    The harness starts a PreToolUse hook before the calling assistant row reaches the transcript, so a
+    single read never sees it.  This polls every ``step_s`` seconds, for up to ``budget_s``, a seek-bounded
+    read of the last ``CALL_WINDOW_BYTES`` for the assistant row holding a ``tool_use`` block with id
+    ``tool_use_id`` (the id's bytes first, then parse only that line) and returns its ``message.model`` with
+    source ``calling_entry``.  The scan always runs at least once.
+
+    * A found row with no usable model returns ``(None, "calling_entry", "no_model_row")`` at once: waiting
+      would not change it.
+    * On budget expiry it falls back to the newest model row of the same window (``read_model_tail``) with
+      source ``fallback_newest_row``: that is the PREVIOUS reply's model, not this call's.  A fallback that
+      finds no model row after a poll reports ``budget_expired_no_row``.  An unmapped id is returned WITH its
+      id and reason ``unmapped_model``.
+    * A calling row larger than the window cannot be found by the scan; it ends in the fallback.
+    * A missing or unreadable transcript returns at once (the fallback would say the same).
+    * A helper-agent (sub-agent) call (``agent_id`` is a non-empty string, or any non-None non-string, which
+      is invalid): the transcript read is the helper's own, ``<dirname(transcript_path)>/<session_id>/
+      subagents/agent-<agent_id>.jsonl`` (``transcript_path`` and ``session_id`` are the PARENT's, as the
+      harness sends them), never the parent's file: same poll, budget and fallback, the fallback's newest
+      row taken from that file.  Its extra reason codes: ``subagent_id_invalid`` (an id that is not a string,
+      or holds ``/``, ``\\``, NUL or ``..``; ``session_id`` empty or absent too), ``subagent_transcript_missing``,
+      ``subagent_transcript_unreadable``.
+    * Never raises: every failure is a reason code (the closed set of ``read_model_tail``, plus
+      ``transcript_path_missing``, ``budget_expired_no_row``, ``internal_error`` and the three above)."""
+    try:
+        return _model_of_call(transcript_path, tool_use_id, budget_s, step_s, agent_id, session_id)
+    except Exception:  # noqa: BLE001
+        return None, "fallback_newest_row", "internal_error"
+
+
+def _bad_id(v) -> bool:
+    return (not isinstance(v, str) or not v or "/" in v or "\\" in v or "\x00" in v or ".." in v)
+
+
+def _subagent_transcript(transcript_path, agent_id, session_id):
+    """``(path | None, reason | None)``: the helper agent's own transcript, built only from the parent's
+    ``transcript_path`` directory and the two payload ids (each checked for a path separator, NUL, ``..``)."""
+    if _bad_id(agent_id) or _bad_id(session_id):
+        return None, "subagent_id_invalid"
+    return (Path(os.fspath(transcript_path)).parent / session_id / "subagents" / f"agent-{agent_id}.jsonl"), None
+
+
+_SUBAGENT_CODES = {"transcript_not_found": "subagent_transcript_missing",
+                   "transcript_unreadable": "subagent_transcript_unreadable"}
+
+
+def _model_of_call(transcript_path, tool_use_id, budget_s, step_s, agent_id=None, session_id=None) -> tuple:
+    fb = "fallback_newest_row"
+    if isinstance(transcript_path, str):
+        if not transcript_path.strip():
+            return None, fb, "transcript_path_missing"
+    elif not isinstance(transcript_path, os.PathLike):
+        return None, fb, "transcript_path_missing"
+    helper = agent_id is not None and agent_id != ""
+    if helper:
+        transcript_path, bad = _subagent_transcript(transcript_path, agent_id, session_id)
+        if bad:
+            return None, fb, bad
+    try:
+        budget = max(0.0, float(budget_s))
+    except (TypeError, ValueError):
+        budget = 0.0
+    try:
+        step = max(0.001, float(step_s))
+    except (TypeError, ValueError):
+        step = 0.02
+    polled = False
+    if isinstance(tool_use_id, str) and tool_use_id:
+        needle = tool_use_id.encode("utf-8", errors="replace")
+        deadline = time.monotonic() + budget
+        while True:
+            data, _truncated, reason = _read_window(transcript_path)
+            if reason is not None:
+                return None, fb, (_SUBAGENT_CODES.get(reason, reason) if helper else reason)
+            found, mid = _calling_row_model(data, needle, tool_use_id)
+            if found:
+                return (mid, "calling_entry", None) if mid else (None, "calling_entry", "no_model_row")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(step, remaining))
+        polled = True
+    res = read_model_tail(transcript_path, CALL_WINDOW_BYTES)
+    if res.reason is None:
+        return res.model_id, fb, None
+    if res.reason == "unmapped_model":
+        return res.model_id, fb, "unmapped_model"
+    if res.reason == "no_model_row" and polled:
+        return None, fb, "budget_expired_no_row"
+    return None, fb, (_SUBAGENT_CODES.get(res.reason, res.reason) if helper else res.reason)
 
 
 # --------------------------------------------------------------- version

@@ -10,11 +10,13 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 # #3784 (b): pre-import so a sys.modules clear in another thread (patch.dict
 # exit) cannot break pytest's lazy `import tracemalloc` in thread_exception_hook,
 # which masks the real thread exception. Must stay at module level.
 import tracemalloc  # noqa: F401
 import types
+import warnings
 
 import pytest
 
@@ -327,29 +329,38 @@ def pytest_collectstart(collector) -> None:
 # files that import server at module load time see it.
 os.environ.setdefault("ENGRAM_NO_DB_GUARDS", "1")
 
-# #2126 — engram_core.DATA_DIR is `Path(os.environ.get("ENGRAM_HOME") or
-# "~/.engram")`, resolved ONCE at import time. On a developer clone that
-# self-hosts its own ENGRAM data inside this very checkout (ENGRAM_HOME ==
-# this repo), any test that reaches a git-writing code path
-# (_init_git()/_git() in src/engram/engram_core.py) before rerouting DATA_DIR
-# via server._configure_paths() silently commits into the AMBIENT REPO — the
-# #2122 incident that #2124 only stopped from firing automatically, without
-# fixing. Give every test process a throwaway ENGRAM_HOME by default
-# (setdefault — a test's own explicit ENGRAM_HOME, set via monkeypatch or
-# server._configure_paths(), still wins) so a fixture that forgets its own
-# isolation lands in a scratch dir, never the checkout. Set at collection
-# time, before any test module's own `import server` can run.
+# #2126 / #4906 — engram_core.DATA_DIR is `Path(os.environ.get("ENGRAM_HOME") or
+# "~/.engram")`, resolved ONCE at import time. Any test that reaches a write
+# path before rerouting DATA_DIR via server._configure_paths() writes wherever
+# ENGRAM_HOME points: on a developer clone that self-hosts its ENGRAM data
+# inside this checkout it commits into the AMBIENT REPO (the #2122 incident
+# #2124 only stopped from firing automatically), and on a seat it writes into
+# the seat's LIVE graph (#4881: three fixture claims filed into a real graph
+# on three separate runs).
+#
+# Every test process therefore gets a throwaway ENGRAM_HOME, set
+# UNCONDITIONALLY. It used to be set only when ENGRAM_HOME was absent
+# (`if "ENGRAM_HOME" not in os.environ`) -- wrong, because every seat's shell
+# EXPORTS ENGRAM_HOME, so the guard was a no-op on exactly the machines the
+# suite runs on; an ambient export is also indistinguishable, after the fact,
+# from a deliberate choice, and ENGRAM_HOME exported as the empty string
+# counted as "present" and then resolved to ~/.engram. A test that wants a
+# specific home sets it itself (monkeypatch.setenv or
+# server._configure_paths()), which still wins over this default. The ambient
+# value is kept in _AMBIENT_ENGRAM_HOME (None = was absent, else the exact
+# string, "" included) so a cell can assert the session is NOT running in it.
+# Set at collection time, before any test module's own `import server` can run.
 # Per-invocation private dir (0700, unique) rather than a shared named /tmp
 # parent: a fixed uid-agnostic path is created 0755 by the FIRST uid to run the
 # suite on a shared host, and every other uid then dies with PermissionError at
 # conftest import — nothing collects, and the error names a /tmp path so it
 # reads as a broken repo rather than a permissions collision (caught live by
 # the merge seat on this PR's own review, reproduced cross-uid).
-if "ENGRAM_HOME" not in os.environ:
-    _FALLBACK_ENGRAM_HOME = tempfile.mkdtemp(
-        prefix="engram-alpha-test-fallback-home-"
-    )
-    os.environ["ENGRAM_HOME"] = _FALLBACK_ENGRAM_HOME
+_AMBIENT_ENGRAM_HOME = os.environ.get("ENGRAM_HOME")
+_FALLBACK_ENGRAM_HOME = tempfile.mkdtemp(
+    prefix="engram-alpha-test-fallback-home-"
+)
+os.environ["ENGRAM_HOME"] = _FALLBACK_ENGRAM_HOME
 
 
 # #3328 -- keys that test helpers write straight into os.environ (not via
@@ -409,28 +420,88 @@ def _reset_telemetry_process_file_path(monkeypatch):
     yield
 
 
-@pytest.fixture(autouse=True)
-def _stop_snapshot_worker():
-    """Stop + reset the #1673 async snapshot worker after each test.
+# #4826: total wait (seconds) the snapshot-worker teardown allows a still-running
+# job before it gives up and says so loudly. Generous on purpose: a job that is
+# still alive after the first join is mid-write into the store directory, and the
+# next test's rmtree of that directory races it (OSError ENOTEMPTY).
+_SNAPSHOT_WORKER_JOIN_BOUND_S = 15.0
+
+
+def _stop_and_reset_snapshot_worker(
+    nodeid, *, first_join_s=2.0, bound_s=_SNAPSHOT_WORKER_JOIN_BOUND_S
+):
+    """Stop + reset the #1673 async snapshot worker; return what happened.
+
+    Returns "absent" (module never imported: no thread, no join, no sleep),
+    "stopped" (worker thread gone, singleton reset) or "still_alive" (thread
+    still running after ``bound_s``; reset anyway, loudly).
 
     engram_snapshot_worker runs a module-level singleton background thread that any
     test hitting the async _commit_snapshot path starts. Without this teardown the
-    thread (and its module globals) leak across tests, polluting later ones (e.g. a
-    thread still processing a torn-down tempdir's queue). Safe no-op when the module
-    was never imported or no worker started."""
-    yield
+    thread (and its module globals) leak across tests. A single 2 s join is not
+    enough (#4826): a job still writing into the store directory after it makes the
+    next test's ``fresh_server()`` rmtree fail with ``Directory not empty``. So after
+    the first join we keep joining until the thread stops or ``bound_s`` is spent.
+
+    Loud, not fatal: past the bound we print one stderr line naming the test and
+    emit a UserWarning, but never fail the test under this repo's pytest config
+    (no ``filterwarnings``). Under ``-W error`` the warning becomes a teardown
+    error on that test; the reset has already run by then. A broken worker module
+    cannot fail teardown (the stop/join and the reset each sit in their own
+    ``except Exception``)."""
     mod = sys.modules.get("engram_snapshot_worker")
-    if mod is not None:
-        try:
-            mod.stop_worker(timeout=2.0)
-            # Reset singleton state so the next test starts clean.
-            mod._started = False
-            mod._worker_thread = None
-            mod._seq_counter = 0
-            mod._stop.clear()
-            mod._work_event.clear()
-        except Exception:
-            pass
+    if mod is None:
+        return "absent"
+    status = "stopped"
+    try:
+        mod.stop_worker(timeout=first_join_s)
+        t = mod._worker_thread
+        if t is not None and t.is_alive():
+            deadline = time.monotonic() + max(0.0, bound_s - first_join_s)
+            while t.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                t.join(timeout=min(remaining, 0.5))
+            if t.is_alive():
+                status = "still_alive"
+    except Exception:
+        pass
+    # Reset singleton state so the next test starts clean. Its own try, so it runs
+    # even when the stop or the join above raised (reviewer r2 on #4831).
+    try:
+        mod._started = False
+        mod._worker_thread = None
+        mod._seq_counter = 0
+        mod._work_event.clear()
+    except Exception:
+        pass
+    # Report AFTER the reset and outside the try (reviewer r1 on #4831): under a
+    # `-W error` run the warning raises, and inside the try it would have been
+    # swallowed and skipped the reset.
+    if status == "still_alive":
+        print(
+            f"[conftest] snapshot worker still alive {bound_s}s after "
+            f"teardown of {nodeid}; the next test may hit ENOTEMPTY (#4826)",
+            file=sys.stderr,
+            flush=True,
+        )
+        warnings.warn(
+            f"snapshot worker still alive {bound_s}s after teardown of "
+            f"{nodeid} (#4826)",
+            UserWarning,
+            stacklevel=2,
+        )
+    return status
+
+
+@pytest.fixture(autouse=True)
+def _stop_snapshot_worker(request):
+    """Stop + reset the #1673 async snapshot worker after each test (#4826: join
+    until it stops, bounded, loud if it will not). See
+    _stop_and_reset_snapshot_worker. Safe no-op when the module was never imported."""
+    yield
+    _stop_and_reset_snapshot_worker(request.node.nodeid)
 
 
 @pytest.fixture(autouse=True)

@@ -83,6 +83,25 @@
 #                       (the map also backs a check that is not a GitHub read).
 #                       Cannot be combined with --github-token-file. `on` is not
 #                       accepted: --github-token-file already means on.
+#   --auth-mode MODE    REQUIRED on every run, no default: `report` or `enforce`. Rendered
+#                       into ExecStart as `--auth-mode MODE`. A run without it refuses
+#                       (exit 2, nothing written), so a re-run can never silently drop the
+#                       mode, the shape #3593 gave the GitHub drop-in. The server itself also
+#                       refuses to start without the flag (exit 78).
+#   --auth-report PATH  with `--auth-mode report` only (required there, refused with
+#                       enforce): absolute path of the report file the server appends one JSON
+#                       line per guarded request to. Letters, digits and / . _ - only.
+#   --auth-report-until TIME
+#                       with `--auth-mode report` only (required there, refused with
+#                       enforce): UTC time like 2026-11-16T00:00:00Z. The installer refuses
+#                       (exit 2, nothing written) a time that is not a real date and time or
+#                       is more than 72 hours from now, because the server would then exit 78
+#                       and the unit would stay down. It also refuses (exit 78, nothing
+#                       written) a time at or before now; the server itself still accepts
+#                       a past time, for a hand-written unit. The server checks it again at start,
+#                       and past it keeps
+#                       serving but logs one loud line per hour and shows
+#                       auth_report_overdue on /health.
 #   --dry-run           print every action without executing (CI-safe)
 #   --no-start          install + enable but don't start
 #
@@ -122,6 +141,9 @@ BATON_MAP=""
 BATON_UIDS=""   # space-separated, validated integers
 GITHUB_TOKEN_FILE=""
 GITHUB_OFF=0     # --github-integration off (#3583)
+AUTH_MODE=""     # --auth-mode: required on every run, no default
+AUTH_REPORT=""   # --auth-report PATH (with report only)
+AUTH_UNTIL=""    # --auth-report-until TIME (with report only)
 SRC=""
 START=1
 DRY_RUN=0
@@ -212,9 +234,20 @@ _refuse_bad_name() {
   esac
 }
 
+# The arguments this run received, kept for the first-install WARN (#4886), which prints the
+# exact re-run. Quoted with printf %q so the printed line can be pasted back into a shell.
+# Only when $0 names a readable file: under `bash -s` / stdin it is just "bash", and a command
+# built from it would not run, so the command is left empty and the WARN says so instead.
+_RERUN_CMD=""
+if [ -f "$0" ] && [ -r "$0" ]; then
+  _RERUN_CMD="bash $(printf '%q' "$0")"
+  for _a in "$@"; do _RERUN_CMD="$_RERUN_CMD $(printf '%q' "$_a")"; done
+  unset _a
+fi
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port|--admin-user|--group|--host)
+    --port|--admin-user|--group|--host|--auth-mode|--auth-report|--auth-report-until)
       [ $# -ge 2 ] || { echo "ERROR: $1 requires a value. Nothing was written." >&2; exit 2; } ;;
   esac
   case "$1" in
@@ -277,6 +310,32 @@ while [ $# -gt 0 ]; do
         *) echo "ERROR: --github-integration must be 'off' (got '$2')" >&2; exit 2 ;;
       esac
       shift 2 ;;
+    --auth-mode)
+      case "$2" in
+        report|enforce) AUTH_MODE="$2" ;;
+        *) echo "ERROR: --auth-mode must be exactly 'report' or 'enforce' (got '$2'); it has no default. Nothing was written." >&2; exit 2 ;;
+      esac
+      shift 2 ;;
+    --auth-report)
+      AUTH_REPORT="$2"
+      case "$AUTH_REPORT" in
+        /*) ;;
+        *) echo "ERROR: --auth-report must be an absolute path (got '$AUTH_REPORT'). Nothing was written." >&2; exit 2 ;;
+      esac
+      # Not only a path check: the value is substituted into a unit file with sed, so
+      # excluding | & and backslash closes the sed-replacement injection class. Do not widen.
+      case "$AUTH_REPORT" in
+        *[!A-Za-z0-9/._-]*)
+          echo "ERROR: --auth-report may contain only letters, digits and / . _ - (it lands in a unit file); got '$AUTH_REPORT'. Nothing was written." >&2; exit 2 ;;
+      esac
+      shift 2 ;;
+    --auth-report-until)
+      AUTH_UNTIL="$2"
+      case "$AUTH_UNTIL" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+        *) echo "ERROR: --auth-report-until must be a UTC time like 2026-11-16T00:00:00Z (got '$AUTH_UNTIL'). Nothing was written." >&2; exit 2 ;;
+      esac
+      shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
     --no-start)     START=0; shift ;;
     -h|--help)
@@ -337,6 +396,9 @@ fi
 }
 [ -f "$SRC/tools/forum_backup.py" ] || {
   echo "ERROR: $SRC/tools/forum_backup.py not found — the backup units run the snapshot of this script" >&2; exit 2;
+}
+[ -f "$SRC/tools/forum_api.py" ] || {
+  echo "ERROR: $SRC/tools/forum_api.py not found — the backup tool's --alarm mode imports ForumClient from it (#4886)" >&2; exit 2;
 }
 [ -f "$SRC/tools/forum_regen_derived.py" ] || {
   echo "ERROR: $SRC/tools/forum_regen_derived.py not found — a restore runs the snapshot of this script (#868)" >&2; exit 2;
@@ -715,6 +777,70 @@ except Exception:
   fi
 fi
 
+# --auth-mode is required on every run: with no default here and none in the template, a
+# re-run can never silently change the mode, and the unit always states it. This sits
+# after every other refusal and before the first write. (The server refuses to start
+# without the flag as well, exit 78, for a hand-written or stale unit.)
+if [ -z "$AUTH_MODE" ]; then
+  echo "ERROR: --auth-mode is required on every run: 'report' or 'enforce' (no default). Nothing was written." >&2
+  exit 2
+fi
+if [ "$AUTH_MODE" = "report" ]; then
+  if [ -z "$AUTH_REPORT" ] || [ -z "$AUTH_UNTIL" ]; then
+    echo "ERROR: --auth-mode report requires --auth-report PATH and --auth-report-until TIME. Nothing was written." >&2
+    exit 2
+  fi
+  # The server refuses to start on an impossible date or one more than 72 hours ahead
+  # (exit 78), and the unit's RestartPreventExitStatus=78 would then leave the live forum
+  # down. So refuse here, before any write. python3 is already this installer's own
+  # dependency (the venv step, the loopback probe), and it avoids a GNU-only `date -d`.
+  _until_rc=0
+  python3 -B -c '
+import datetime as d, re, sys
+m = re.fullmatch(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z", sys.argv[1])
+try:
+    t = d.datetime(*map(int, m.groups()))
+except (ValueError, AttributeError):
+    sys.exit(3)
+now = d.datetime.now(d.timezone.utc).replace(tzinfo=None)
+sys.exit(5 if t <= now else 4 if t - now > d.timedelta(hours=72) else 0)
+' "$AUTH_UNTIL" >/dev/null 2>&1 || _until_rc=$?
+  case "$_until_rc" in
+    0) ;;
+    3) echo "ERROR: --auth-report-until must be a real UTC date and time like 2026-11-16T00:00:00Z (got '$AUTH_UNTIL'). Nothing was written." >&2; exit 2 ;;
+    4) echo "ERROR: --auth-report-until '$AUTH_UNTIL' is more than 72 hours from now; the server would refuse to start. Nothing was written." >&2; exit 2 ;;
+    5) echo "ERROR: --auth-report-until '$AUTH_UNTIL' is in the past (at or before now); give a time up to 72 hours ahead. Nothing was written." >&2; exit 78 ;;
+    *) echo "ERROR: could not check --auth-report-until (python3 failed, status $_until_rc). Nothing was written." >&2; exit 2 ;;
+  esac
+else
+  if [ -n "$AUTH_REPORT" ] || [ -n "$AUTH_UNTIL" ]; then
+    echo "ERROR: --auth-report and --auth-report-until are only for --auth-mode report. Nothing was written." >&2
+    exit 2
+  fi
+fi
+
+# The alarm's @mention (#4886) is resolved and validated HERE, with the other arguments, so
+# a refusal happens before any write. $FORUM_BACKUP_ALARM_MENTION if set, else the
+# installing admin's forum agent name ($USER minus a leading "agent-"). An alarm that
+# @mentions nobody wakes nobody, so an empty EFFECTIVE value is refused; the value lands in
+# a unit file, so its characters are checked too. The backup-units block below writes it.
+# >>> alarm-mention
+_mention="${FORUM_BACKUP_ALARM_MENTION-}"
+if [ -z "${FORUM_BACKUP_ALARM_MENTION+x}" ]; then
+  _mention="${USER-}"
+  _mention="${_mention#agent-}"
+fi
+if [ -z "$(printf '%s' "$_mention" | tr -d ' ,')" ]; then
+  echo "ERROR: FORUM_BACKUP_ALARM_MENTION is empty (and there is no installing user name to default to); the failure alarm would @mention nobody and wake nobody. Set it to the forum agent name(s) to page, e.g. FORUM_BACKUP_ALARM_MENTION=\"alice bob\". Nothing was written." >&2
+  exit 2
+fi
+case "$_mention" in
+  *[!A-Za-z0-9_\ ,-]*)
+    echo "ERROR: FORUM_BACKUP_ALARM_MENTION may contain only letters, digits, '_', '-', ',' and spaces (got an invalid character); refusing to write it into a unit file. Nothing was written." >&2
+    exit 2 ;;
+esac
+# <<< alarm-mention
+
 APP="$SERVICE_DIR/app"
 VENV="$SERVICE_DIR/.venv"
 PYTHON="$VENV/bin/python"
@@ -772,6 +898,38 @@ _assert_no_group_write() {
   fi
 }
 # <<< service-modes
+
+# The alarm's own home and token (#4886). The alarm posts as `forum-backup`; the server
+# only accepts that name with a token FOR it, so the alarm gets its own ENGRAM_HOME
+# (<service-dir>/alarm-home, 0700) holding its own token (<alarm-home>/forum-token, 0600),
+# rotated on every run. The modes are CHECKED, not just created: an existing home or
+# token wider than 0700 / 0600 is refused here, before anything is written. Reads only.
+ALARM_HOME="$SERVICE_DIR/alarm-home"
+ALARM_TOKEN="$ALARM_HOME/forum-token"
+_mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+# $1 path, $2 widest allowed octal (700 or 600), $3 what it is.
+_refuse_if_wider() {
+  local _m _p
+  _m="$(_mode_of "$1")" || { echo "ERROR: cannot read the mode of $1. Nothing was written." >&2; exit 2; }
+  _p="$(printf '%04d' "$_m")"
+  if [ $(( 8#$_m & 8#777 & ~8#$2 )) -ne 0 ]; then   # access bits only: a setgid dir is not wider access
+    echo "ERROR: $3 $1 has mode $_p, wider than 0$2 (the alarm's token must not be readable by anyone else). Nothing was written. Fix: chmod $2 $1" >&2
+    exit 2
+  fi
+}
+if [ -e "$ALARM_HOME" ] || [ -L "$ALARM_HOME" ]; then
+  if [ -L "$ALARM_HOME" ] || [ ! -d "$ALARM_HOME" ]; then
+    echo "ERROR: $ALARM_HOME exists but is not a plain directory. Nothing was written." >&2; exit 2
+  fi
+  [ -O "$ALARM_HOME" ] || { echo "ERROR: $ALARM_HOME is not owned by the installing user. Nothing was written." >&2; exit 2; }
+  _refuse_if_wider "$ALARM_HOME" 700 "alarm home"
+fi
+if [ -e "$ALARM_TOKEN" ] || [ -L "$ALARM_TOKEN" ]; then
+  if [ -L "$ALARM_TOKEN" ] || [ ! -f "$ALARM_TOKEN" ]; then
+    echo "ERROR: $ALARM_TOKEN exists but is not a plain file. Nothing was written." >&2; exit 2
+  fi
+  _refuse_if_wider "$ALARM_TOKEN" 600 "alarm token file"
+fi
 
 echo "==> Forum service dir: $SERVICE_DIR (port $PORT, group $GROUP); admin: $ADMIN_USER"
 _set_service_modes
@@ -842,6 +1000,19 @@ else
   cp -L "$SRC/tools/forum_backup.py" "$APP/tools/forum_backup.py"
 fi
 
+# The alarm's HTTP client (#4886). forum_backup.py --alarm imports ForumClient from
+# forum_api LAZILY (inside _alarm_cli), so a missing copy only shows when a backup has
+# already failed: the alarm dies on ImportError exactly when it is needed. The installer
+# ships every module the shipped tools import, lazy imports included (a test enforces it).
+# tools/forum_api.py is a symlink in source, so copy the RESOLVED file (cp -L).
+echo "==> Snapshotting forum client → $APP/tools/forum_api.py"
+RUN mkdir -p "$APP/tools"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] cp -L $SRC/tools/forum_api.py → $APP/tools/forum_api.py (resolves the symlink)"
+else
+  cp -L "$SRC/tools/forum_api.py" "$APP/tools/forum_api.py"
+fi
+
 # The restore tools (#868). The backup dump has no search index and no embeddings,
 # so a restore runs forum_regen_derived.py (which imports forum_backfill_embeddings.py
 # from its own directory and the forum package from $APP/forum). Same rule as the
@@ -879,6 +1050,11 @@ if [ -n "$BATON_MAP" ]; then
   for _u in $BATON_UIDS; do
     BATON_ARGS="$BATON_ARGS \\"$'\n'"    --baton-login-map-admin-uid $_u"
   done
+fi
+# The auth flags (one ExecStart continuation line): only what the operator passed.
+AUTH_ARGS="--auth-mode $AUTH_MODE"
+if [ "$AUTH_MODE" = "report" ]; then
+  AUTH_ARGS="$AUTH_ARGS --auth-report $AUTH_REPORT --auth-report-until $AUTH_UNTIL"
 fi
 _TOKEN_PLACEHOLDER='@@GITHUB_TOKEN_ENVFILE_LINE@@'
 _PLACEHOLDER='{{BATON_LOGIN_MAP_ARGS}}'
@@ -921,6 +1097,7 @@ _fill_token_placeholder() {
 RENDERED="$(sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$SRC/src/forum/deploy/engram-forum.service.template" \
     | sed "s|{{FORUM_HOME}}|$SERVICE_DIR|g" \
     | sed "s|{{HOST}}|$HOST|g" \
+    | sed "s|{{AUTH_MODE_ARGS}}|$AUTH_ARGS|g" \
     | sed "s|--port 5002|--port $PORT|" \
     | sed "s|Flask, port 5002|Flask, port $PORT|" \
     | _fill_baton_placeholder \
@@ -958,20 +1135,9 @@ fi
 # the daemon-reload below picks everything up.
 # The alarm's @mention is per-install, never shipped: it is written into the
 # alarm unit's drop-in mention.conf from $FORUM_BACKUP_ALARM_MENTION if set, else
-# the installing admin's forum agent name ($USER minus a leading "agent-"), else
-# empty (the alarm then posts without a mention). The value lands in a unit file,
-# so it is validated BEFORE anything is written.
+# the installing admin's forum agent name ($USER minus a leading "agent-"). The
+# value is resolved and validated in the argument-validation stage (see _mention above).
 # >>> backup-units
-_mention="${FORUM_BACKUP_ALARM_MENTION-}"
-if [ -z "${FORUM_BACKUP_ALARM_MENTION+x}" ]; then
-  _mention="${USER-}"
-  _mention="${_mention#agent-}"
-fi
-case "$_mention" in
-  *[!A-Za-z0-9_\ ,-]*)
-    echo "ERROR: FORUM_BACKUP_ALARM_MENTION may contain only letters, digits, '_', '-', ',' and spaces (got an invalid character); refusing to write it into a unit file." >&2
-    exit 2 ;;
-esac
 echo "==> Installing backup + failure-alarm units → $UNIT_DIR"
 _BU_DEPLOY="$SRC/src/forum/deploy"
 for _bu in engram-forum-backup.service.template engram-forum-backup.timer engram-forum-backup-alarm.service.template; do
@@ -1179,6 +1345,109 @@ EOF_BCE
   echo "    backup unit ExecStart paths all exist: $_unit"
 }
 # <<< backup-units
+
+# The alarm's own token (#4886): ROTATED on every run. Make the alarm home (0700), revoke
+# any live `forum-backup` token, remove the old token file, issue a fresh one with
+# `token issue --write-to` (O_EXCL, 0600). Revoking first means the token a previous run
+# left behind stops working the moment the new one exists; nothing keeps "the same token".
+# Revocation: the alarm's token is revoked by name: `forum.admin token revoke forum-backup`
+# This installer has NO uninstall path (tracked in #4887), so removing the alarm is manual:
+# that revoke, then remove the token file. The admin CLI opens the forum DB directly, the
+# way the rest of this script reaches it ($DB_PATH); it runs from $APP like gate 2 below.
+_alarm_admin() { ( cd "$APP" && "$PYTHON" -m forum.admin --db "$DB_PATH" "$@" ); }
+# (a) The token file is there, a plain file, at most 0600, and not empty. Never prints it.
+_alarm_assert_token_file() {
+  if [ ! -f "$ALARM_TOKEN" ] || [ -L "$ALARM_TOKEN" ]; then
+    echo "ERROR: the alarm token file $ALARM_TOKEN is missing or not a plain file." >&2; exit 2
+  fi
+  _refuse_if_wider "$ALARM_TOKEN" 600 "alarm token file"
+  if ! grep -q '[^[:space:]]' "$ALARM_TOKEN"; then
+    echo "ERROR: the alarm token file $ALARM_TOKEN is empty." >&2; exit 2
+  fi
+}
+echo "==> Alarm token: rotating the forum-backup token → $ALARM_TOKEN"
+ALARM_TOKEN_ISSUED=0
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] mkdir -p $ALARM_HOME; chmod 0700 $ALARM_HOME"
+  echo "  [dry-run] python -m forum.admin --db $DB_PATH token revoke forum-backup"
+  echo "  [dry-run] rm -f $ALARM_TOKEN"
+  echo "  [dry-run] python -m forum.admin --db $DB_PATH token issue forum-backup --write-to $ALARM_TOKEN"
+  [ ! -e "$ALARM_TOKEN" ] || _alarm_assert_token_file
+elif [ ! -f "$DB_PATH" ]; then
+  echo "    WARN: no forum.db at $DB_PATH yet, so no alarm token was issued and none was verified." >&2
+  echo "          The failure alarm cannot post until then (it refuses to run with no token)." >&2
+  if [ -z "$_RERUN_CMD" ]; then
+    echo "          After the DB cutover, re-run this installer. The command could not be reconstructed" >&2
+    echo "          (it was not started from a file); re-run it the way it was started, with the same" >&2
+    echo "          arguments and the same FORUM_BACKUP_ALARM_MENTION if you set one." >&2
+  else
+    # A mention that came from the environment must ride along, or the pasted line rewrites
+    # mention.conf with the default and the alarm pages the wrong person.
+    if [ -n "${FORUM_BACKUP_ALARM_MENTION+x}" ]; then
+      _RERUN_CMD="FORUM_BACKUP_ALARM_MENTION=$(printf '%q' "$FORUM_BACKUP_ALARM_MENTION") $_RERUN_CMD"
+    fi
+    echo "          After the DB cutover, re-run this installer, exactly:" >&2
+    echo "            $_RERUN_CMD" >&2
+  fi
+else
+  mkdir -p "$ALARM_HOME"
+  # 0700: no group or world access. A numeric chmod keeps a directory's setgid bit, so the home
+  # may read 2700 when the service dir is setgid; that is harmless here (no group access bits)
+  # and the mode check below compares access bits only.
+  chmod 0700 "$ALARM_HOME"
+  _alarm_admin token revoke forum-backup \
+    || { echo "ERROR: could not revoke the old forum-backup token (forum.admin token revoke forum-backup)." >&2; exit 2; }
+  rm -f "$ALARM_TOKEN"
+  _alarm_admin token issue forum-backup --write-to "$ALARM_TOKEN" >/dev/null \
+    || { echo "ERROR: could not issue the forum-backup token into $ALARM_TOKEN." >&2; exit 2; }
+  _alarm_assert_token_file
+  ALARM_TOKEN_ISSUED=1
+  echo "    issued a fresh forum-backup token (mode 0600); any earlier one is revoked"
+fi
+
+# (C3) The identity is verified by BEHAVIOUR, not by the file. The one endpoint used:
+# GET /api/agent/forum-backup/mentions. No who-am-I read exists (`forum.py whoami` is
+# local only; /api/agent/me is PATCH-only), so this is the cheapest authenticated read
+# that makes the server compare the token's agent with a NAMED agent: a token for any
+# other agent answers 403, an unknown or revoked one 401, the right one 200. In report
+# mode a request with NO Authorization header is served as the agent it names, so the
+# 200 alone proves nothing there; this check therefore sends the token it read from the
+# file ITSELF (not through ForumClient's auto-load) and pairs it with a control: the same
+# GET with a deliberately invalid token must answer 401. It passes only on 200 AND 401.
+ALARM_IDENT_PATH="/api/agent/forum-backup/mentions"
+_alarm_verify_identity() {
+  local _path="$ALARM_IDENT_PATH" _res _a _b
+  _res="$(python3 -B - "$ALARM_TOKEN" "http://127.0.0.1:${PORT}${_path}" <<'PY'
+import sys, urllib.error, urllib.request
+tokfile, url = sys.argv[1], sys.argv[2]
+token = open(tokfile, encoding="utf-8").read().strip()
+def status(t):
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + t})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception as e:
+        return "unreachable-" + type(e).__name__
+print(status(token), status("not-a-real-token-4886"))
+PY
+  )" || _res="error error"
+  _a="${_res%% *}"; _b="${_res##* }"
+  if [ "$_a" != "200" ] || [ "$_b" != "401" ]; then
+    echo "ERROR: alarm identity check FAILED: GET $_path with the real token answered HTTP $_a (want 200); with an invalid token answered HTTP $_b (want 401). The token in $ALARM_TOKEN does not resolve to forum-backup on the live forum, or the forum does not refuse a bad token. The install is otherwise in place (units written, token rotated and saved in $ALARM_TOKEN), but the alarm cannot post until this check passes. To re-check, re-run this installer (it rotates the token and repeats the check)." >&2
+    exit 2
+  fi
+  echo "    OK: alarm token resolves to forum-backup (GET $_path: real token 200, invalid token 401)"
+}
+_alarm_identity_unverified() {
+  echo "    NOTE: alarm identity NOT verified: no live server (--no-start or --dry-run); only the token file's properties were checked. After starting, run this installer again or GET $ALARM_IDENT_PATH with the token."
+}
+# No live server to ask under --dry-run or --no-start: say so, never a bare "skipped". With a
+# live start the check runs after the gates below (the forum must be up with the new code).
+if [ "$DRY_RUN" -eq 1 ] || { [ "$ALARM_TOKEN_ISSUED" -eq 1 ] && [ "$START" -eq 0 ]; }; then
+  _alarm_identity_unverified
+fi
 _check_backup_exec_paths "$UNIT_DIR/engram-forum-backup.service"
 
 LINGER_OK=1
@@ -1244,6 +1513,13 @@ if [ "$START" -eq 1 ]; then
     else
       echo "ERROR: verify-only probe returned non-zero — dep check failed; service may be degraded." >&2
       exit 2
+    fi
+
+    # The alarm's token, last: rotation already ran, this is the token that stays installed.
+    if [ "${ALARM_TOKEN_ISSUED:-0}" -eq 1 ]; then
+      echo "==> Post-install gate 3: the alarm's token resolves to forum-backup"
+      _alarm_assert_token_file
+      _alarm_verify_identity
     fi
 
     # The probe above cannot say whether GitHub integration is on: it runs in THIS

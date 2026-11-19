@@ -22,8 +22,11 @@ current branch against its upstream (local refs only, no network).
      -> exit 4, paths printed.  This tool never rewrites history.
   4. fetch, then every remote-only commit must be a same-message "twin" of a local-only commit
      (the amend signature) -> otherwise exit 3, the non-twin commits printed.
-  4b. the ADDED lines of the not-yet-pushed commits (``git log -p upstream..branch``) get the
-     same secret scan, so a key committed then deleted still refuses (exit 2).
+  4b. the ADDED lines of the not-yet-pushed commits (``git log -p -m upstream..branch``, merge
+     commits included) get the same secret scan, so a key committed then deleted, or added
+     only in a merge resolution, still refuses (exit 2).  The diff is read as plain text: binary
+     files via ``--text``, colour, textconv and external diff off, and file headers skipped by
+     state, so a key on a line that itself starts with ``++`` is still seen.
   5. ``git push --force-with-lease=<branch>:<upstream> <remote> <branch>`` (a plain ``git push``
      when nothing is behind), re-fetch, print ahead/behind and update the status file.
 
@@ -122,16 +125,47 @@ def _secret_hits(home):
 
 def _added_line_hits(home, rng):
     """Commits in `rng` whose ADDED lines match a secret pattern, so a key committed and
-    then deleted inside the not-yet-pushed range is still caught. -> [short sha]."""
-    r = _git(home, "log", "-p", "-U0", "--format=@@commit %H", rng)
+    then deleted inside the not-yet-pushed range is still caught. -> [short sha].
+    `-m` makes `git log -p` print a merge commit's diff against each parent (without it a
+    merge prints none, so a key added only in a conflict resolution is invisible); never
+    `--first-parent`, which would skip commits that arrived through the merged-in side.
+    The merge diff format is pinned with `-c log.diffMerges=separate` because `-m` honours that
+    config key (`off`/`none` print no diff for a merge, `dense-combined`/`cc` print a `@@@` form
+    the parser does not read); the key exists from git 2.31, an older git ignores the unknown
+    `-c` key and `-m` alone already prints separate diffs there.  (The `--diff-merges=separate`
+    flag is not used: an older git would reject it.)
+    The diff is read as plain text whatever the repo or user config says: `--text` so a file git
+    treats as binary still prints its lines, `--no-color` so a forced `color.ui`/`color.diff`
+    does not prefix every line with ANSI codes, `--no-textconv` and `--no-ext-diff` so a
+    converter or external driver cannot change or hide the lines.
+    The output is parsed by state, not by a `+` prefix filter: a `diff --git`/`diff --cc` line
+    opens a file header, the header lasts until the next `@@ ` hunk line, and inside a hunk
+    every `+` line is an added line whatever follows the `+` (a content line `++x` prints as
+    `+++x`).  `@@commit <sha>` is checked first and resets the state."""
+    # `--text` pushes raw file bytes through, so read BYTES (a text-mode pipe would translate a
+    # lone "\r" into "\n" and strip the "+" off the line after it), decode lossily (a binary file
+    # that is not valid UTF-8 must not raise), and split on "\n" only: `str.splitlines()` also breaks at \x0c, \x0b,
+    # \x1c-\x1e, \x85 and U+2028/9, which lets a content line fake a `diff --git ` header line.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    r = subprocess.run(
+        ["git", "-c", "log.diffMerges=separate", "log", "-p", "-m", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
+         "-U0", "--format=@@commit %H", rng],
+        cwd=home, capture_output=True, env=env,
+    )
     if r.returncode != 0:
-        raise RuntimeError(f"git log -p {rng} failed: {r.stderr.strip()}")
+        err = r.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git log -p {rng} failed: {err}")
     regs = [re.compile(p) for p in SECRET_PATTERNS]
-    hits, cur = [], None
-    for ln in r.stdout.splitlines():
+    hits, cur, in_header = [], None, False
+    for ln in r.stdout.decode("utf-8", errors="replace").split("\n"):
         if ln.startswith("@@commit "):
-            cur = ln[9:17]
-        elif ln.startswith("+") and not ln.startswith("+++") and cur and cur not in hits:
+            cur, in_header = ln[9:17], False
+        elif ln.startswith(("diff --git ", "diff --cc ")):
+            in_header = True
+        elif in_header:
+            if ln.startswith("@@ "):
+                in_header = False
+        elif ln.startswith("+") and cur and cur not in hits:
             if any(rg.search(ln) for rg in regs):
                 hits.append(cur)
     return hits

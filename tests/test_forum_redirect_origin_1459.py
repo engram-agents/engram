@@ -854,9 +854,25 @@ def test_monitor_curl_never_follows_redirects(script):
     code = [ln for ln in script.read_text().splitlines()
             if not ln.lstrip().startswith("#")]
     invocations = [ln for ln in code if re.search(r"(^|[|(\s])curl\s+-", ln)]
-    assert len(invocations) == 2, invocations   # the token arm and the no-token arm; not vacuous
+    assert invocations, name    # non-vacuity for every member; the two-arm shape is pinned by name below
     follow = re.compile(r"\s-[A-Za-z]*L[A-Za-z]*(\s|$)")
     for ln in invocations:      # `[ -L file ]` (a symlink test) elsewhere is not a curl flag
         assert not follow.search(ln), f"{name}: {ln.strip()}"
     for ln in code:
         assert "--location" not in ln, f"{name}: {ln.strip()}"
+
+
+_MONITOR_NAMES = ("forum-updates-monitor.sh", "forum-mention-monitor.sh")
+
+
+@pytest.mark.parametrize("name", _MONITOR_NAMES)
+def test_monitor_script_has_exactly_the_token_arm_and_the_no_token_arm(name):
+    """The shape fact the redirect cell used to carry: each monitor script has exactly two curl
+    invocations, the token arm (``curl -K -``) and the no-token arm. Pinned by name, so a third
+    or a missing arm fails here and does not move the redirect invariant's per-member count."""
+    found = [p for p in _monitor_scripts() if p.name == name]
+    assert found, f"{name} is not in the derived monitor set"
+    code = [ln for ln in found[0].read_text().splitlines() if not ln.lstrip().startswith("#")]
+    invocations = [ln for ln in code if re.search(r"(^|[|(\s])curl\s+-", ln)]
+    assert len(invocations) == 2, invocations
+    assert sum("curl -K -" in ln for ln in invocations) == 1, invocations   # the token arm

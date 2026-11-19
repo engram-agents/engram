@@ -277,16 +277,16 @@ after a written conformance check); **fixes + non-substrate → the team merges
 after peer review**, and since 2026-10-22 the **project owner presses their own
 converged PR** under the policy's written *Owner merge* gate (Lei, in session: the
 colleague's recorded run on the exact head is the test gate; the owner's scratch
-merge on the current base and the base-SHA assertion stay; CI is the floor, since
-`pr-checks` runs only a fixed set of guard test files on `dev` PRs, never the full
-suite). This gate is
+merge on the current base and the base-SHA assertion stay; CI is the floor).
+**A merge seat presses for a seat with no standing merge grant from its user.
+A security PR is pressed by the security seat that approved it (after a second
+security read if that seat wrote it), else by a merge seat. A PR from outside
+the team passes a sponsor, then a peer, then a merge seat.** This gate is
 **engram-only** — other repos (umwelt, soma) carry their own delegated
 authority. During an explicit Lei-absence day-grant, a settled substrate PR may
 be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
 
-This is a pointer, not the policy. The single source of truth — the full rule,
-the substrate/non-substrate discriminator, per-project scope, the day-grant
-carve-out, examples, gray-area calls, and the baton turn-target corollary — lives
+This is a pointer, not the policy. The full rule lives
 in **[`docs/internal/PR-MERGE-POLICY.md`](docs/internal/PR-MERGE-POLICY.md)**. Read it there.
 
 ## PR merge-readiness — CI-green gate
@@ -371,16 +371,15 @@ enters the maintainer's merge queue:
    created it is review-authored, and a chain of those is the process
    reviewing itself.
    **Reset (v4):** a contributed tip is a NON-MERGE commit
-   (`git log --no-merges --format='%an'`) whose git author is not the PR
-   author, landed after the PR's first review object
+   (`git log --no-merges --format='%an'`) whose git author is neither the PR
+   author nor that author's fairy (the PR body names fairy commits; if it
+   is silent, ask), landed after the PR's first review object
    (`gh pr view --json reviews,comments`); it resets the three-round count.
-   Merge commits never count regardless of who clicked (a web-UI "Update
-   branch" is a merge), the committer field never counts (every squash merge
+   Merge commits never count regardless of who clicked, the committer field never counts (every squash merge
    here reads `GitHub`), and the author's own fold of a peer finding never
    resets. Named field, named anchor, both read off artifacts, never
-   recalled. One duty added when this was written into the repo on
-   2026-09-26, not part of the forum ruling: the merge seat records in its
-   merge comment when a PR merged under the cap. **This cap qualifies
+   recalled. The merge seat records in its merge comment when a PR merged
+   under the cap (added 2026-09-26). **This cap qualifies
    "iterate to convergence" above and the "converged" clause of the
    merge seat's mechanical check below:** a PR whose third round still
    returns REQUEST_CHANGES goes to the peer with its open findings listed,

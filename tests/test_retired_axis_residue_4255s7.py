@@ -261,6 +261,7 @@ DOC_ALLOWED = (
     ("docs/internal/PR-MERGE-POLICY.md", "multi-agent mode. (Multi-agent: it gates the", "verbatim move record (2026-10-03, #3322): the quoted rule text"),
     ("docs/internal/PR-MERGE-POLICY.md", "Single-agent: it gates surfacing the PR as ready", "verbatim move record (2026-10-03, #3322): the quoted rule text"),
     ("docs/internal/PR-MERGE-POLICY.md", "maintainer. Same rule, different surface", "verbatim move record (2026-10-03, #3322): the quoted rule text, also the pin's last sentence"),
+    ("docs/internal/PR-MERGE-POLICY.md", "tests/test_retired_multi_agent_axis_4255s3.py", "a guard-set entry: item 4 must name the test by its exact filename, which carries the retired word, and the runner reads that name from the policy"),
 )
 
 

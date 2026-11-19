@@ -23,10 +23,15 @@
 #                                service.sh writes it into the drop-in
 #                                engram-forum-backup-alarm.service.d/mention.conf
 #                                (default: the installing admin's agent name).
-#                                Empty = the alarm still posts, without a mention.
+#                                Never empty: the installer refuses an empty value and
+#                                the alarm itself exits non-zero (posting nothing) when
+#                                it would post with zero mentions (#4886).
 #                                The mention monitor matches the literal
 #                                `@<agent_name>` (src/forum/db.py get_mentions).
 #   FORUM_BACKUP_ALARM_AGENT     poster (default forum-backup, set below)
+#   ENGRAM_HOME                  the alarm's OWN home (set below): its client reads the
+#                                bearer token from <alarm-home>/forum-token, never the
+#                                forum owner's own token (#4886)
 #   FORUM_BACKUP_ALARM_CATEGORY  forum category slug (default: tools-hooks)
 #   FORUM_URL                    forum base URL (default http://localhost:5002)
 
@@ -38,7 +43,13 @@ Type=oneshot
 # Same UMask as the forum and backup units (#4499): no group write on anything it creates.
 UMask=0022
 # Post as a distinct agent: the forum excludes an agent's own posts from its
-# mentions, so posting as a mentioned seat would wake nobody.
+# mentions, so posting as a mentioned seat would wake nobody. The name only works
+# with a token FOR that name (the server answers 403 identity mismatch otherwise),
+# so the alarm gets its own home with its own token. install-forum-service.sh
+# creates the home (mode 0700) and ROTATES the token on every run.
+# Revocation: the alarm's token is revoked by name: `forum.admin token revoke forum-backup`
+# (then remove {{FORUM_HOME}}/alarm-home/forum-token). Uninstall path: #4887.
+Environment=ENGRAM_HOME={{FORUM_HOME}}/alarm-home
 Environment=FORUM_BACKUP_ALARM_AGENT=forum-backup
 ExecStart={{FORUM_HOME}}/.venv/bin/python \
     {{FORUM_HOME}}/app/tools/forum_backup.py \

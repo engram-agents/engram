@@ -100,7 +100,8 @@ OWNER_STDERR_RE = re.compile(
     r"^engram-session-start-hook: owner read failed: (\w+) at (\w+)"
     r"(?:, bound \d+ ms)?(?:; failed \d+ ms into the \d+ ms fire budget)?$", re.M)
 WAIT_PHRASE = "was not ready at the first read"
-UNAVAILABLE_REASONS_NO_WAIT = ["timeout", "protocol", "busy", "busy_or_stuck", "local", "internal", "contract_version"]
+UNAVAILABLE_REASONS_NO_WAIT = ["path_too_long", "timeout", "protocol", "busy", "busy_or_stuck", "local", "internal",
+                               "contract_version"]
 
 SQL_BACKUP = "SELECT count(*) FROM nodes"
 SQL_EMBED = "SELECT not_fully_restored, null_count, cause FROM embedding_restore_state WHERE singleton_key = 1"

@@ -79,7 +79,8 @@ class TestMainWiring:
             monkeypatch.setenv("GH_TOKEN", TOKEN)
         monkeypatch.setattr(sys, "argv", [
             "forum.server", "--db", str(tmp_path / "svc" / "forum.db"),
-            "--audit", str(tmp_path / "svc" / "audit.jsonl")])
+            "--audit", str(tmp_path / "svc" / "audit.jsonl"),
+            "--auth-mode", "enforce"])  # required where the process starts (#1459)
         monkeypatch.setattr(server_mod, "_run_boot_verify", lambda *a, **k: {})
         ran = []
         monkeypatch.setattr(server_mod.Flask, "run", lambda self, *a, **k: ran.append(1))
