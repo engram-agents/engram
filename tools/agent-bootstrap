@@ -551,9 +551,11 @@ unset _src
 # Guards:
 #   • $SUDO_USER empty or "root" → skip silently (no non-root operator).
 #   • setfacl not on PATH → warn clearly (acl package); do NOT fail bootstrap.
-#   • Idempotent: setfacl with the same entry is a no-op on re-run, and a
-#     re-run on a seat that already carries rw NARROWS it to rX (the mask is
-#     recomputed by setfacl, never set here).
+#   • Idempotent: setfacl with the same entry is a no-op on re-run. A re-run
+#     narrows config.json and the home default ACL only (the mask is
+#     recomputed by setfacl, never set here); other files that already
+#     inherited u:<op>:rw keep it, because the call is not recursive. It does
+#     nothing when SUDO_USER is empty or root, or when setfacl is missing.
 #
 # Optional re-bootstrap guard:
 #   If config.json already exists (re-bootstrap on an existing install), also

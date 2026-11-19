@@ -173,11 +173,11 @@ else
 fi
 
 # Also verify that a file created INSIDE the dir inherits the default ACL
-# (this is the core mechanism: new files get operator rw without a stub).
+# (this is the core mechanism: new files get the default ACL without a stub).
 INNER_FILE="$TMP_DIR/config.json"
 touch "$INNER_FILE"
 if getfacl "$INNER_FILE" 2>/dev/null | grep -q "user:root:rw"; then
-    echo "  ✓ operator-present: new file inside dir inherits operator rw ACL"
+    echo "  ✓ operator-present: new file inside dir inherits the default ACL (mechanics only)"
 else
     echo "FAIL: operator-present: new file did not inherit default ACL" >&2
     getfacl "$INNER_FILE" >&2 || true

@@ -3855,8 +3855,12 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
                 return  # leave marker
 
             # config.json read-only (#341: the operator never gets write). Explicit
-            # even though the recursive rX above covers it, so a seat that
-            # already carries rw is NARROWED. Best-effort: return code not checked.
+            # even though the recursive rX above covers it. This narrows an
+            # rw entry only when this code is reached; the idempotency check
+            # above returns early (and removes the marker) when getfacl shows
+            # `user:<op>:` anywhere, including `default:user:<op>:rw-`, so a
+            # seat that already carries an operator entry is NOT narrowed here.
+            # Best-effort: return code not checked.
             _config_json = os.path.join(engram_home, "config.json")
             if os.path.isfile(_config_json):
                 subprocess.run(
