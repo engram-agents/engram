@@ -1263,3 +1263,29 @@ def test_i9_real_row_87_is_direct_by_design_under_independent_check_and_ro():
     assert states["87"].startswith("direct-by-design: independent-check"), states["87"]
     assert access["87"] == "ro"
     assert _run(REPO).returncode == 0
+
+
+def _section_1(text):
+    start = text.index("## 1. ")
+    return text[start:text.index("\n## 2. ", start)]
+
+
+def test_i10_section_1_defines_independent_check_in_one_sentence():
+    # The epic owner's point 4 on #4799: Section 1 (not only the Section 2 column notes) defines the phase in one
+    # sentence: what it is, who may use it, and that writes never qualify.
+    sec1 = _section_1(_real_ledger_text())
+    lines = [ln for ln in sec1.splitlines() if "independent-check" in ln]
+    assert lines, "Section 1 does not mention the independent-check phase"
+    line = " ".join(lines)
+    assert "a read-only open of the live store by an operator tool whose job is to check the store or its backups" in line
+    assert "going through the owner would make the check depend on what it checks" in line
+    assert "writes never qualify" in line
+    assert "`ro`" in line and "em dash" in line, "the definition states the ro-only rule and where the reason goes"
+
+
+def test_i10_the_access_column_text_does_not_say_ro_is_only_mode_ro():
+    # `ro` also covers the restore drill's immutable=1 open of a store with no -wal file.
+    text = _real_ledger_text()
+    assert "`ro` is `mode=ro`;" not in text
+    assert "`immutable=1`" in text.split("**access:**", 1)[1].split("**state**", 1)[0]
+

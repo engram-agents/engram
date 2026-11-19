@@ -569,6 +569,27 @@ def test_d8_mode_ro_open_and_a_hook_write_mid_read_is_recorded_not_failed(home, 
         keeper.close()
 
 
+@pytest.mark.parametrize("name", ["knowledge.db", "knowledge.db-wal", "knowledge.db-shm", "knowledge.db-journal"])
+def test_d8_a_change_to_any_one_of_the_stores_files_on_an_immutable_open_fails(home, tmp_path, monkeypatch, name):
+    """Each of the four files counts as the store's own (the colleague's mutant dropped the -journal one and every
+    other cell stayed green): the before/after home state differs in that one file only."""
+    real = rd._home_state
+    calls = []
+
+    def state(h):
+        out = dict(real(h))
+        calls.append(1)
+        if len(calls) > 1:
+            out[name] = (123456, len(calls))
+        return out
+
+    monkeypatch.setattr(rd, "_home_state", state)
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.live_open_mode == "immutable"
+    assert rep.exit_code == 1
+    assert any("changed while it was read with immutable=1" in f and name in f for f in rep.failures), rep.failures
+
+
 def test_d8_a_change_to_a_non_store_file_on_an_immutable_open_is_recorded_not_failed(home, tmp_path, monkeypatch):
     _touch_live_during_drill(monkeypatch, home)  # sessions/during.json: not the store
     rep = drill(home, tmp_path / "scratch")
