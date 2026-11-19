@@ -329,29 +329,38 @@ def pytest_collectstart(collector) -> None:
 # files that import server at module load time see it.
 os.environ.setdefault("ENGRAM_NO_DB_GUARDS", "1")
 
-# #2126 — engram_core.DATA_DIR is `Path(os.environ.get("ENGRAM_HOME") or
-# "~/.engram")`, resolved ONCE at import time. On a developer clone that
-# self-hosts its own ENGRAM data inside this very checkout (ENGRAM_HOME ==
-# this repo), any test that reaches a git-writing code path
-# (_init_git()/_git() in src/engram/engram_core.py) before rerouting DATA_DIR
-# via server._configure_paths() silently commits into the AMBIENT REPO — the
-# #2122 incident that #2124 only stopped from firing automatically, without
-# fixing. Give every test process a throwaway ENGRAM_HOME by default
-# (setdefault — a test's own explicit ENGRAM_HOME, set via monkeypatch or
-# server._configure_paths(), still wins) so a fixture that forgets its own
-# isolation lands in a scratch dir, never the checkout. Set at collection
-# time, before any test module's own `import server` can run.
+# #2126 / #4906 — engram_core.DATA_DIR is `Path(os.environ.get("ENGRAM_HOME") or
+# "~/.engram")`, resolved ONCE at import time. Any test that reaches a write
+# path before rerouting DATA_DIR via server._configure_paths() writes wherever
+# ENGRAM_HOME points: on a developer clone that self-hosts its ENGRAM data
+# inside this checkout it commits into the AMBIENT REPO (the #2122 incident
+# #2124 only stopped from firing automatically), and on a seat it writes into
+# the seat's LIVE graph (#4881: three fixture claims filed into a real graph
+# on three separate runs).
+#
+# Every test process therefore gets a throwaway ENGRAM_HOME, set
+# UNCONDITIONALLY. It used to be set only when ENGRAM_HOME was absent
+# (`if "ENGRAM_HOME" not in os.environ`) -- wrong, because every seat's shell
+# EXPORTS ENGRAM_HOME, so the guard was a no-op on exactly the machines the
+# suite runs on; an ambient export is also indistinguishable, after the fact,
+# from a deliberate choice, and ENGRAM_HOME exported as the empty string
+# counted as "present" and then resolved to ~/.engram. A test that wants a
+# specific home sets it itself (monkeypatch.setenv or
+# server._configure_paths()), which still wins over this default. The ambient
+# value is kept in _AMBIENT_ENGRAM_HOME (None = was absent, else the exact
+# string, "" included) so a cell can assert the session is NOT running in it.
+# Set at collection time, before any test module's own `import server` can run.
 # Per-invocation private dir (0700, unique) rather than a shared named /tmp
 # parent: a fixed uid-agnostic path is created 0755 by the FIRST uid to run the
 # suite on a shared host, and every other uid then dies with PermissionError at
 # conftest import — nothing collects, and the error names a /tmp path so it
 # reads as a broken repo rather than a permissions collision (caught live by
 # the merge seat on this PR's own review, reproduced cross-uid).
-if "ENGRAM_HOME" not in os.environ:
-    _FALLBACK_ENGRAM_HOME = tempfile.mkdtemp(
-        prefix="engram-alpha-test-fallback-home-"
-    )
-    os.environ["ENGRAM_HOME"] = _FALLBACK_ENGRAM_HOME
+_AMBIENT_ENGRAM_HOME = os.environ.get("ENGRAM_HOME")
+_FALLBACK_ENGRAM_HOME = tempfile.mkdtemp(
+    prefix="engram-alpha-test-fallback-home-"
+)
+os.environ["ENGRAM_HOME"] = _FALLBACK_ENGRAM_HOME
 
 
 # #3328 -- keys that test helpers write straight into os.environ (not via
