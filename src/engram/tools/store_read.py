@@ -131,9 +131,11 @@ def read_axiom_count(con):
 def read_node_count(con):
     """The installer's row-81 count of all rows in `nodes`.
 
-    A store with no `nodes` table (a zero-byte file, an aborted seed) counts 0: such a file is an empty store, and
-    re-seeding it is what the installer has always done. That is the ONE read problem that yields 0. Every other
-    failure raises, because 0 means re-seed, and a store we could not read must never be re-seeded over."""
+    On the direct path, a store with no `nodes` table (a zero-byte file, an aborted seed) counts 0: such a file is an
+    empty store, and re-seeding it is what the installer has always done. That is the ONE read problem that yields 0.
+    Every other failure raises, because 0 means re-seed, and a store we could not read must never be re-seeded over.
+    Through the owner the same missing table is the owner's error, so it is a refusal (exit 3), never 0: the safe
+    side."""
     try:
         rows = con.execute("SELECT COUNT(*) FROM nodes").fetchall()
     except sqlite3.OperationalError as exc:
