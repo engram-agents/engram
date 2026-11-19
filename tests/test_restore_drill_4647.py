@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -522,10 +523,15 @@ def test_d8_a_change_on_a_live_run_is_recorded_not_attributed_and_not_failed(hom
 def test_d8_an_old_schema_is_migrated_in_the_scratch_and_reported(home, tmp_path):
     sql = home / "knowledge.sql"
     text = sql.read_text(encoding="utf-8")
-    assert "PRAGMA user_version = 10;" in text
-    sql.write_text(text.replace("PRAGMA user_version = 10;", "PRAGMA user_version = 9;"), encoding="utf-8")
+    # The fixture dump is taken at the code's latest schema version, which moves with dev: read it, never hard-code it.
+    found = re.findall(r"PRAGMA user_version = (\d+);", text)
+    assert len(found) == 1, found
+    current = int(found[0])
+    sql.write_text(text.replace(f"PRAGMA user_version = {current};", f"PRAGMA user_version = {current - 1};"),
+                   encoding="utf-8")
     rep = drill(home, tmp_path / "scratch")
-    assert rep.schema["dump_user_version"] == 9
+    assert rep.schema["latest"] == current, "the fixture dump is at the latest version, so one step back is an old schema"
+    assert rep.schema["dump_user_version"] == current - 1
     assert rep.schema["user_version_after"] == rep.schema["latest"]
     assert rep.schema["migrated_in_scratch"] is True
     assert "migrated in the scratch copy" in rd.format_report(rep)
