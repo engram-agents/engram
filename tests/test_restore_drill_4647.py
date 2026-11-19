@@ -520,6 +520,62 @@ def test_d8_a_change_on_a_live_run_is_recorded_not_attributed_and_not_failed(hom
     assert "observed during drill, not attributed" in rd.format_report(rep)
 
 
+def _a_hook_writes_to_the_live_db_before_the_comparison(monkeypatch, home):
+    """One hook-sized write, committed AND CLOSED (live_exec: open, insert, commit, close) after the drill opened
+    its live handle and before the rows are compared: on the last close SQLite checkpoints into the main file."""
+    real = rd._compare_tables
+
+    def writing(report, restored, live, dump_time=None):
+        live_exec(home, "INSERT INTO nodes(id,type,claim,created_at,is_current,status) VALUES(?,?,?,?,1,'active')",
+                  ("ob_0097", "observation", "written by a hook while the drill ran", "2026-02-01"))
+        return real(report, restored, live, dump_time)
+
+    monkeypatch.setattr(rd, "_compare_tables", writing)
+
+
+# The epic owner's ruling on #4799 (Borges, crossing 32693): immutable=1 tells SQLite the file cannot change, so if
+# the live store changes while it is read that way the comparison is not trustworthy and the run FAILS; the
+# mode=ro path (both side files present, SQLite's locks taken) keeps record-not-fail.
+
+def test_d8_immutable_open_and_a_hook_write_mid_read_fails_exit_1_naming_the_cause(home, tmp_path, monkeypatch):
+    _a_hook_writes_to_the_live_db_before_the_comparison(monkeypatch, home)
+    rep = drill(home, tmp_path / "scratch")  # the default run, not --assert-quiescent
+    assert rep.live_open_mode == "immutable"
+    assert rep.exit_code == 1
+    assert any("changed while it was read with immutable=1" in f and "rerun" in f for f in rep.failures), rep.failures
+
+
+def test_d8_immutable_open_and_no_change_is_todays_result(home, tmp_path):
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.live_open_mode == "immutable"
+    assert rep.exit_code == 0, rep.failures
+    assert not any("immutable" in f for f in rep.failures)
+
+
+def test_d8_mode_ro_open_and_a_hook_write_mid_read_is_recorded_not_failed(home, tmp_path, monkeypatch):
+    keeper = sqlite3.connect(home / "knowledge.db")  # a live seat: another connection holds the WAL open
+    keeper.execute("PRAGMA journal_mode=WAL")
+    keeper.execute("UPDATE nodes SET recall_count = 9 WHERE id = 'ob_0001'")
+    keeper.commit()
+    try:
+        assert _side_files(home) == ["knowledge.db-shm", "knowledge.db-wal"]
+        _a_hook_writes_to_the_live_db_before_the_comparison(monkeypatch, home)
+        rep = drill(home, tmp_path / "scratch")
+        assert rep.live_open_mode == "ro"
+        assert rep.exit_code == 0, rep.failures
+        assert any(c.startswith("knowledge.db") for c in rep.live_home_observed), rep.live_home_observed
+        assert not any("immutable" in f for f in rep.failures)
+    finally:
+        keeper.close()
+
+
+def test_d8_a_change_to_a_non_store_file_on_an_immutable_open_is_recorded_not_failed(home, tmp_path, monkeypatch):
+    _touch_live_during_drill(monkeypatch, home)  # sessions/during.json: not the store
+    rep = drill(home, tmp_path / "scratch")
+    assert rep.live_open_mode == "immutable"
+    assert rep.exit_code == 0, rep.failures
+
+
 def test_d8_an_old_schema_is_migrated_in_the_scratch_and_reported(home, tmp_path):
     sql = home / "knowledge.sql"
     text = sql.read_text(encoding="utf-8")

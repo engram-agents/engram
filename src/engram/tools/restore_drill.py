@@ -296,6 +296,7 @@ class DrillReport:
     dump_source: dict = field(default_factory=dict)
     schema: dict = field(default_factory=dict)
     live_home_observed: list = field(default_factory=list)  # changes seen during the drill, not attributed
+    live_open_mode: str = ""  # "immutable" or "ro": how the live store was opened (see _open_live_readonly)
     live_sha256_before: str = ""
     live_sha256_after: str = ""
     scratch: str = ""
@@ -825,10 +826,13 @@ def _q(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+_LIVE_STORE_FILES = ("knowledge.db", "knowledge.db-wal", "knowledge.db-shm", "knowledge.db-journal")
+
+
 def _home_state(home: Path) -> dict:
     """size and mtime of the live db, its side files and sessions/ (a read, no side effect)."""
     out: dict = {}
-    for name in ("knowledge.db", "knowledge.db-wal", "knowledge.db-shm", "knowledge.db-journal"):
+    for name in _LIVE_STORE_FILES:
         p = home / name
         try:
             st = os.stat(p)
@@ -858,11 +862,22 @@ def _state_diff(before: dict, after: dict) -> list:
     return changes
 
 
-def _open_live_readonly(db: Path) -> sqlite3.Connection:
+def _open_live_readonly(db: Path, report=None) -> sqlite3.Connection:
     """Read-only, and creating nothing. mode=ro when BOTH side files exist (a live seat); immutable=1 when
     neither does, because a read-only open of a quiescent WAL-mode db creates -wal and -shm (measured).
     Exactly one of the two: REFUSED. Measured on SQLite 3.53.4 and again here: mode=ro on -wal without -shm
-    creates -shm in the live home; on -shm without -wal it creates -wal and reads stale data."""
+    creates -shm in the live home; on -shm without -wal it creates -wal and reads stale data.
+
+    immutable=1 tells SQLite the file cannot change, and takes none of its locks. A writer that starts
+    afterwards breaks that promise: a hook-style writer (open, write, commit, CLOSE) makes SQLite checkpoint
+    into the main file under this reader on its last close, so the reader sees whatever pages the file holds
+    when it reads each one (measured here: the new row appeared in the live view; and a writer that commits
+    and checkpoints repeatedly made the read fail with "database disk image is malformed", 6 of 6 trials). A
+    sqlite error becomes DrillRefused (exit 2) in _compare_tables; a read that SQLite does not notice cannot
+    be told apart from a good one, so the drill treats ANY change to the store's own files during an
+    immutable read as a failed comparison (see _drill_body). The mode=ro open takes SQLite's locks and keeps
+    record-not-fail. `report`, when given, receives the mode in `live_open_mode`. A change between this open
+    and the drill's first state read is not seen. (The epic owner's ruling on #4799, 2026-11-19.)"""
     base = db.resolve().as_uri()
     has_wal, has_shm = os.path.exists(str(db) + "-wal"), os.path.exists(str(db) + "-shm")
     if has_wal and not has_shm:
@@ -870,6 +885,8 @@ def _open_live_readonly(db: Path) -> sqlite3.Connection:
     if has_shm and not has_wal:
         raise DrillRefused("live home has a -shm file but no -wal file: refusing to open it read-only")
     uri = base + ("?mode=ro" if has_wal else "?immutable=1")
+    if report is not None:
+        report.live_open_mode = "ro" if has_wal else "immutable"
     conn = sqlite3.connect(uri, uri=True)
     conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
     return conn
@@ -1355,7 +1372,7 @@ def run_drill(home=None, scratch=None, sample: int = DEFAULT_SAMPLE, embed: bool
             raise DrillRefused(f"{scratch_p}: the scratch directory is not empty")
     dump_bytes, dump_source = _resolve_dump(home_p, dump, from_git)
     try:
-        live = _open_live_readonly(db)
+        live = _open_live_readonly(db, report)
     except sqlite3.Error as exc:
         raise DrillRefused(f"{db}: the live db cannot be read ({exc})") from exc
     try:
@@ -1479,6 +1496,11 @@ def _drill_body(report: DrillReport, home: Path, db: Path, scratch: Path, live: 
 
     after = _home_state(home)
     report.live_home_observed = _state_diff(before, after)
+    if report.live_open_mode == "immutable":
+        changed = [c for c in report.live_home_observed if c.split(":", 1)[0] in _LIVE_STORE_FILES]
+        if changed:
+            _fail(report, "the live store changed while it was read with immutable=1; the comparison is not "
+                          "trustworthy; rerun: " + "; ".join(changed))
     if assert_quiescent:
         report.live_sha256_after = _sha256_file(db)
         if report.live_sha256_after != report.live_sha256_before:
