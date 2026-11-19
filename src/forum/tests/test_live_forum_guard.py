@@ -137,16 +137,74 @@ def test_G1_connect_ex_to_the_live_port_returns_econnrefused(host, monkeypatch):
     assert _refused_count() == before + 1
 
 
+def _stubs_beneath_the_guard(monkeypatch):
+    """Put a recording stub UNDER the guard: call this BEFORE `G.install_live_forum_guard(.., force=True)`, which
+    captures whatever connect/connect_ex is in place as the layer it falls through to. The list holds every
+    (host, port) that got past the guard; the stub raises, so it never touches the network either."""
+    reached = []
+
+    def _connect(self, address):
+        reached.append(tuple(address[:2]))
+        raise OSError("reached the network")
+
+    def _connect_ex(self, address):
+        reached.append(tuple(address[:2]))
+        raise OSError("reached the network")
+
+    monkeypatch.setattr(socket.socket, "connect", _connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", _connect_ex)
+    return reached
+
+
 def test_G4_unmocked_urlopen_of_the_default_forum_url_is_refused_by_the_guard(monkeypatch):
+    # The promise is: refused by the guard, and nothing reached the layer beneath it. How MANY refusals it took
+    # is the resolver's business (a name with two addresses is tried twice), so the count is only `>= 1` here;
+    # the exact two-address count is pinned by the G4b cell below, under a resolver it controls.
     _require_guard()
+    reached = _stubs_beneath_the_guard(monkeypatch)
     G.install_live_forum_guard(monkeypatch, force=True)  # own wrapper, own list: the session list stays clean
     before = _refused_count()
     with pytest.raises(urllib.error.URLError) as ei:
         urllib.request.urlopen("http://localhost:5002/api/agents/status", timeout=2)
+    assert reached == [], "the live-port connect reached the layer beneath the guard"
     reason = ei.value.reason
     assert isinstance(reason, ConnectionRefusedError)
     assert "#4475" in str(reason) and "guard" in str(reason)
-    assert _refused_count() == before + 1  # the guard refused it; no connect ever ran
+    assert _refused_count() - before >= 1  # the guard refused it; no connect ever ran
+
+
+def test_G4b_every_connect_attempt_of_a_two_address_name_is_refused_by_the_guard(monkeypatch):
+    # The hosted runner resolves `localhost` to ::1 and 127.0.0.1; urlopen tries each in turn, so the guard
+    # refuses twice. The resolver is stubbed here (after any autouse pin of names to 127.0.0.1) so the count is
+    # the same on every host: one refusal per address tried, and none of them reaches the layer beneath.
+    _require_guard()
+    try:
+        socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close()
+    except OSError:
+        pytest.skip("no IPv6 sockets on this host")
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _two_address_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        if host == "localhost":
+            out = []
+            for fam, addr in ((socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")):
+                if family in (0, fam):
+                    sockaddr = (addr, port, 0, 0) if fam == socket.AF_INET6 else (addr, port)
+                    out.append((fam, type or socket.SOCK_STREAM, proto, "", sockaddr))
+            return out
+        return real_getaddrinfo(host, port, family, type, proto, flags)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _two_address_getaddrinfo)
+    reached = _stubs_beneath_the_guard(monkeypatch)
+    G.install_live_forum_guard(monkeypatch, force=True)  # own wrapper, own list: the session list stays clean
+    before = _refused_count()
+    with pytest.raises(urllib.error.URLError) as ei:
+        urllib.request.urlopen("http://localhost:5002/api/agents/status", timeout=2)
+    assert reached == [], "a live-port connect reached the layer beneath the guard"
+    reason = ei.value.reason
+    assert isinstance(reason, ConnectionRefusedError)
+    assert "#4475" in str(reason) and "guard" in str(reason)
+    assert _refused_count() - before == 2  # ::1, then 127.0.0.1: one refusal per address tried
 
 
 def test_other_stdlib_connect_paths_are_refused(monkeypatch):
