@@ -376,8 +376,8 @@ ALLOW = [
     ("agent-bootstrap", 'cat >>"$USER_HOME/.bashrc" <<\'VENV\'', "CREATED: " + _NB),
     ("agent-bootstrap", 'cp "$_src" "$USER_HOME/.local/bin/"', "CREATED: " + _NB),
     ("agent-bootstrap", 'chmod 0755 "$USER_HOME/.local/bin/claude-remote"', "CREATED: " + _NB),
-    ("agent-bootstrap", 'setfacl -d -m "u:${OPERATOR}:rw" "$ENGRAM_HOME"', "CREATED: " + _NB),
-    ("agent-bootstrap", 'setfacl -m "u:${OPERATOR}:rw" "$CONFIG_JSON"', "CREATED: " + _NB),
+    ("agent-bootstrap", 'setfacl -d -m "u:${OPERATOR}:rX" "$ENGRAM_HOME"', "CREATED: " + _NB),
+    ("agent-bootstrap", 'setfacl -m "u:${OPERATOR}:rX" "$CONFIG_JSON"', "CREATED: " + _NB),
     ("agent-bootstrap", 'chgrp -R agents "$SHARED_ROOT"',
      "OWN: chgrp -R does not follow links (measured by the security seat); spec C9 keeps it"),
     ("agent-bootstrap", 'chown -h "$USER_NAME:agents" "$SHARED_ROOT/health/$NAME"',
@@ -640,7 +640,7 @@ class TestStatic:
             'chown "$u" "$chosen_home/m"',
             # round 3: lines that name none of the old path tokens
             'setfacl -R -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir"',
-            '[[ -f "$_cfg" ]] && setfacl -m "u:${VIZ_OPERATOR}:rw" "$_cfg"',
+            '[[ -f "$_cfg" ]] && setfacl -m "u:${VIZ_OPERATOR}:rX" "$_cfg"',
             'chmod 777 "$d"',
             'mkdir -p "$d"',
             'rm -f "$whatever"',
@@ -686,7 +686,7 @@ class TestStatic:
     @pytest.mark.parametrize("needle", [
         'setfacl -R -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir"',
         'setfacl -R -d -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir"',
-        'setfacl -m "u:${VIZ_OPERATOR}:rw" "$_cfg"',
+        'setfacl -m "u:${VIZ_OPERATOR}:rX" "$_cfg"',
     ])
     def test_G4_mutant_the_viz_setfacl_run_as_root_goes_red(self, needle):
         text = AGENTCTL.read_text()

@@ -3052,14 +3052,15 @@ JSON
                 && sudo -u "$chosen_user" setfacl -R -d -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir" 2>/dev/null \
                 && (( ++_viz_ok )) \
                 || { echo "  WARN: setfacl rX failed on $_engram_dir: $_setfacl_err" >&2; continue; }
-            # Write on config.json (only when rX succeeded — traversal is prerequisite).
+            # Read-only on config.json (#341; only when rX succeeded — traversal is prerequisite).
+            # Also NARROWS a seat that already carries rw.
             local _cfg="$_engram_dir/config.json"
-            [[ -f "$_cfg" ]] && sudo -u "$chosen_user" setfacl -m "u:${VIZ_OPERATOR}:rw" "$_cfg" 2>/dev/null \
+            [[ -f "$_cfg" ]] && sudo -u "$chosen_user" setfacl -m "u:${VIZ_OPERATOR}:rX" "$_cfg" 2>/dev/null \
                 && (( _viz_cfg_ok++ )) || true
         done
         if (( _viz_ok > 0 )); then
             _viz_acl_result="${VIZ_OPERATOR}: rX on ${_viz_ok} engram dir(s)"
-            (( _viz_cfg_ok > 0 )) && _viz_acl_result+=" + rw on ${_viz_cfg_ok} config.json"
+            (( _viz_cfg_ok > 0 )) && _viz_acl_result+=" + r on ${_viz_cfg_ok} config.json"
         elif (( _viz_skipped > 0 )); then
             _viz_acl_result="no ~/.engram* dir found yet — run 'sudo agentctl share ${chosen} ~/.engram --mode ro' after first session installs ENGRAM"
         else

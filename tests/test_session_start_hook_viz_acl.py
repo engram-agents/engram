@@ -170,17 +170,22 @@ class TestMarkerAppliesAcl:
         )
         assert default_call is not None, f"Expected setfacl -R -d -m u:spt:rX call, got: {calls}"
 
-    def test_calls_setfacl_config_rw(self, tmp_path, monkeypatch):
-        """setfacl -m u:<op>:rw config.json is called when config.json exists."""
+    def test_calls_setfacl_config_read_only(self, tmp_path, monkeypatch):
+        """#341: setfacl -m u:<op>:rX config.json is called, and NO call grants write."""
         mod, engram_home, marker, home = self._setup(tmp_path, monkeypatch)
         mod._apply_pending_viz_acl(str(engram_home))
         calls = [c.args[0] for c in mod.subprocess.run.call_args_list]
-        config_call = next(
-            (c for c in calls if "setfacl" in c and "rw" in " ".join(c)
-             and "config.json" in " ".join(str(x) for x in c)),
-            None,
-        )
-        assert config_call is not None, f"Expected setfacl -m u:spt:rw config.json call, got: {calls}"
+        config_calls = [
+            c for c in calls
+            if "setfacl" in c and "-R" not in c and "config.json" in " ".join(str(x) for x in c)
+        ]
+        assert config_calls, f"Expected a direct setfacl call on config.json, got: {calls}"
+        for c in config_calls:
+            assert c[:2] == ["setfacl", "-m"], c
+            assert c[2] == "u:spt:rX", f"config.json grant must be exactly u:spt:rX, got: {c}"
+        for c in calls:
+            joined = " ".join(str(x) for x in c)
+            assert not re.search(r":rwx?\b|m::rw", joined), f"no setfacl call may grant write: {c}"
 
     def test_marker_removed_on_success(self, tmp_path, monkeypatch):
         """Pending marker is removed after successful ACL application."""

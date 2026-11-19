@@ -145,7 +145,9 @@ if [ -L "$NEWBORN_HOME/.local/bin/claude" ]; then
 fi
 echo "  ✓ no claude symlink into another home"
 
-# Synthetic ACL tests: exercise the three behavioral paths of step 5.7.
+# Synthetic ACL tests: exercise the three behavioral paths of step 5.7
+# (operator READ-ONLY per #341; the u:root:rw cells below only exercise setfacl
+# mechanics, they are not what 5.7 grants).
 # The spawn test runs as root with SUDO_USER unset (Docker CMD), so the
 # operator-absent path fires for the real spawn above. We verify all three
 # paths synthetically below using temp directories.

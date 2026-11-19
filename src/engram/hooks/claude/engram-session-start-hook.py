@@ -3854,13 +3854,13 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
             if _r2.returncode != 0:
                 return  # leave marker
 
-            # config.json rw (viz config-edit tab). Best-effort: its return code
-            # is intentionally not checked — marker removal is tied to the rX
-            # grant above (the load-bearing read access), not the rw upgrade.
+            # config.json read-only (#341: the operator never gets write). Explicit
+            # even though the recursive rX above covers it, so a seat that
+            # already carries rw is NARROWED. Best-effort: return code not checked.
             _config_json = os.path.join(engram_home, "config.json")
             if os.path.isfile(_config_json):
                 subprocess.run(
-                    ["setfacl", "-m", f"u:{viz_operator}:rw", _config_json],
+                    ["setfacl", "-m", f"u:{viz_operator}:rX", _config_json],
                     capture_output=True,
                     timeout=10,
                 )
