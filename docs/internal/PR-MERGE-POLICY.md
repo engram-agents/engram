@@ -442,7 +442,18 @@ seat can run it and any other seat can check that it ran.
    `tests/test_json_extract_metadata_guard_3485.py` and
    `tests/test_no_retired_cascade_store_asserts.py` (it scans `tests/` itself) and
    `tests/test_forum_redirect_origin_1459.py` (it derives the forum's sender set with
-   `git ls-files` and a walk of `src/` and `tools/`).
+   `git ls-files` and a walk of `src/` and `tools/`) and
+   `tests/test_hook_injection_bounds.py` (it globs `src/engram/hooks/claude/*.py` and names only
+   the 13 files of its own exemption list, so a hook it does not name never selects it; about
+   0.2 s, 27 cells when measured on 2026-11-18). *Evidence:* #4613 added a hook that built its
+   `additionalContext` without `emit_context()`; the test-map rows were first-match-wins until the runner took the union of matching rows, so a hook
+   with its own rows never reached this test through the map, and the PR's seat run was green. It
+   was first seen red in a hand-started whole-suite run on `dev` later on 2026-11-18 (the
+   scheduled nightly of that date ran before #4613 merged). A new file under
+   `src/engram/hooks/claude/` selected the guard set and nothing else (measured with the selector
+   at `dev` `9174f642`); with the union of matching rows and the census directory rows it selects the
+   guard set plus the three tests that scan the hook directories (measured at the head of the
+   union change).
    The list is a floor, not a census: a PR that adds a test with this property adds
    its name here in the same PR, and a seat that finds one missing adds it. Verify
    the list with `git ls-files` **in a checkout of the base tip**, not the seat's
@@ -458,6 +469,41 @@ seat can run it and any other seat can check that it ran.
    which was already among the five the seat ran by name, and
    `test_prose_tail_6c_venv.py`, which sat in no guard list and reached the run
    only because the ratchets were by then in it by name.
+   **Whole-tree enumerators added by the 2026-11-18 census** (Kepler's ruling, same day). A
+   measurement of every test file (each run alone, the directories it listed recorded, each
+   candidate then read) found 31 more tests that enumerate the shipped tree or the tracked tree
+   and assert something about every file; a change to a file they scan but never name does not select
+   them (some are selected by the import graph for a few changed modules, none for a file they only
+   scan). A directory row for them would fire on nearly every PR, so they are guard tests by the definition above. Run alone,
+   in order, on one seat, they took 142 s in all (31 separate pytest starts); the four longest
+   were `tests/test_never_clobber_contract.py` (30 s), `tests/test_run_touched_tests_4358.py` (20 s),
+   `tests/test_retire_runtime_keys_4255s2.py` (17 s),
+   `tests/test_snapshot_worker_orphan_4833.py` (9 s). If the per-PR run grows uncomfortable, the
+   repair is to make those four faster, not to drop them (#4900). By what they scan:
+   - the tracked tree, through `git ls-files` or `git grep`:
+     `tests/test_launchers_relative_engram_home_3863.py`, `tests/test_os_harness_check.py`,
+     `tests/test_readme_dev_trees_section.py`, `tests/test_retired_multi_agent_axis_4255s3.py`,
+     `tests/test_ro_uri_quoting_3514.py`, `tests/test_scan_leaks.py`,
+     `tests/test_stray_baton_path_check.py`.
+   - `src/`, `tools/`, `deploy/` or `docs/`: `tests/test_boot_charge_loop_prompt_4139a.py`,
+     `tests/test_clear_stale_daemon_3493.py`, `tests/test_conftest_service_manager_guard_3519.py`,
+     `tests/test_fix_git_backup_canonical_gitignore_4506.py`, `tests/test_metricgate_adapter.py`,
+     `tests/test_never_clobber_contract.py`, `tests/test_recall_summary_writes.py`,
+     `tests/test_relative_engram_home_step3a_3863.py`,
+     `tests/test_retired_axis_residue_4255s7.py`, `tests/test_run_touched_tests_4358.py`,
+     `tests/test_session_start_no_starred_4272.py`, `tests/test_snapshot_worker_orphan_4833.py`,
+     `tests/test_surface_label_keyed_4305.py`.
+   - `src/engram/`: `tests/test_3765_nul_guard.py`,
+     `tests/test_changed_concurrently_fold_4188.py`, `tests/test_cites_evidence_only_2243.py`,
+     `tests/test_edge_liveness_ssot_3542.py`, `tests/test_engram_client_isolation.py`,
+     `tests/test_engram_core_seam.py`, `tests/test_engram_core_sys_bound_3222.py`,
+     `tests/test_retire_runtime_keys_4255s2.py`, `tests/test_sleep_skill_cohort_boundary.py`,
+     `tests/test_ws3_telemetry_resolver.py`.
+   - `tests/` itself: `tests/test_full_length_hashes_resolve.py`.
+   Scope of the census, wherever it is cited: scans done in-process and through `git ls-files` or
+   `git grep` were seen; a scan done in any other subprocess was not, and 601 test files that list
+   no directory were not read. Narrow-directory enumerators (23 more) are a separate change to the
+   runner, not this list.
    **Record the base SHA the scratch merge used** (`git rev-parse origin/<base>` at
    the time of the run, after a fetch); item 8 asserts against it and item 10 names
    it (Borges, 2026-10-22).
@@ -824,6 +870,77 @@ seat's run is:
    test reaches is a red flag for the reviewer to answer on the PR. It is not a gate because
    coverage cannot see code that runs as a subprocess, which covers this repo's hooks and shell
    scripts, until subprocess coverage is configured.
+
+**The scope is the union, and what each half covers (ruled 2026-11-18).** A seat's per-PR run is
+item 1's selection, **plus** item 2's guard set, **plus** two halves the selection does not reach —
+a directory run of `src/forum/tests/` for a changed file under `src/forum/` (**until #4891 lands**;
+see the removal condition below), and the `tools/test_*.py` files that cover a changed file under
+`tools/`. That is the union for the shapes we have observed. `tests/` is **flat at the top level**
+(945 `test_*.py` files — the tool's universe, which is
+non-recursive), so there is no per-module subdirectory to run: a directory run there is the whole
+suite this section forbids, and it is not part of the gate. The structural case that made this rule
+necessary is carried by item 4's list instead, not by a directory run.
+
+**Two test homes sit outside every half** (found by the round-3 review, verified):
+`tests/cascade_scenarios/` — 10 nested files the non-recursive universe never names, so a change to
+`src/engram/engram_derive.py` selects 260 files and none of them — and
+`src/engram/tools/test_tripwire.py`. Neither is a hole: `pr-checks` runs both on every PR. They are
+named so a reader does not take the union as exhaustive.
+
+**When the tool exits 7, the union above is unavailable — the seat chooses a scope, and the choice
+has a floor.** A full-suite trigger means no selection at all, and the union does not by itself say
+what to run instead. The minimum: the changed test files; **every `tests/` file that names a changed
+file by basename or imports a changed module** — run that search with `git grep` or
+`/usr/bin/grep`, because a wrapped shell `grep` can skip ignored paths; the guard set; the scanners;
+and the forum and `tools/` halves above where they apply. The seat records the list it ran. Two
+misses on one day, both in the gap between "the changed files" and "the tests that name them": #4613
+left `tests/test_hook_injection_bounds.py` red, which selects from no changed file, and #4895 — run
+with a scope of the changed test, the scanner test and the guard set — left two cells red in
+`tests/test_relative_engram_home_refused_3863.py`, which names the changed hook by basename and sits
+in no other half. `git grep -l` for that hook's name finds exactly two files; one of them was run.
+
+Measured with the selector at dev `c3a013ab`, so the halves are not guesses: a change to
+`tools/forum_backup.py` selects **no** file under `tools/` — 23 files, 22 of them the guard set and
+the 23rd (`tests/test_forum_backup.py`) selected because it imports the changed module. The counts
+move whenever item 4's list does, so read them as measured at that commit, never as constants. Those
+tool tests are named explicitly by two workflows: the full suite (`tests.yml`) and the per-PR
+`pr-checks.yml`, which runs the same set on every pull request with the forum-dependent cells
+skipping. A forum-installer change selects 26 files at the same commit, none of them in
+`src/forum/tests/`.
+
+**Why the forum half is a directory run and the hooks half is a guard-set entry.** Both are tests
+that discover their subject **structurally**, so item 1 cannot select them — but they are fixed in
+different places.
+
+- **Borrowed path (forum).** `src/forum/tests/test_verify_probe_env_3597.py` gets the installer's
+  path from `from forum.tests.test_installer import _INSTALLER` and never spells the filename, so
+  the two files it imports from (`test_installer.py:29`, `test_deploy_shape_3568.py:44`) are
+  selected; a consumer that only imports their constant is not. The selection does not close
+  transitively over test-to-test imports; that is #4891, and the forum directory run is the cover
+  until it lands.
+- **Glob over a shipped directory (hooks).** `tests/test_hook_injection_bounds.py` globs
+  `src/engram/hooks/claude/*.py`, and it names `engram-model-gate-pretool.py` **zero** times — that
+  hook is what reddened `dev` after #4613. The seat that pressed that PR ran a hand-picked set
+  rather than the selection, because the range is a full-suite trigger and the tool exits 7; the
+  selection never had a chance. A test with this property belongs on item 4's list,
+  which already says "a seat that finds one missing adds it"; #4894 adds this one.
+
+**The two misses on that day are the discriminating evidence**, and they rule out "just run the
+wider one": on #4890's 10 changed files, the selection listed
+`tests/test_forum_redirect_origin_1459.py` — a red the press missed because it ran only the forum
+directory — while the forum selection omitted `src/forum/tests/test_verify_probe_env_3597.py`, a
+red only that directory run caught. Each instrument caught what the other missed, on the same PR.
+
+**Re-read this clause when #4891 merges** — delete the forum-directory half then, if the selection
+selects a test that borrows an artifact's path by import. The guard-set half stays: it covers a
+different shape, and no selection tool can see a glob.
+
+*Memory and disk caution:* the forum-directory run executes more of the tree than the selection does,
+so run it under `memrun`. A test that reaches a real environment build allocates far past a test
+run's expectable footprint. `memrun` caps memory hard (a cgroup `MemoryMax`); its disk protection is
+a **pre-flight floor**, not a cap — it refuses to launch (exit 75) when free space minus
+`--disk-need` minus other claims would fall below `max(5% of the volume, 20 GiB)` — so it bounds
+disk only for a job launched through it, and only as well as the `--disk-need` it was given.
 
 The **whole suite** runs in two places only: the scheduled nightly on `dev`
 (`.github/workflows/nightly.yml`), which is the backstop for what per-PR selection misses, and the

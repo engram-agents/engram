@@ -515,17 +515,21 @@ def alarm(*, client, mention: list, unit: str, journal_lines: list) -> int:
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     tail = list(journal_lines)[-ALARM_JOURNAL_LINES:]
-    parts = [f"`{unit}` failed. Last {ALARM_JOURNAL_LINES} journal lines:", "", "```"]
-    parts.extend(tail if tail else ["(no journal output captured)"])
-    parts.append("```")
-    if mention:
-        parts.extend(["", " ".join(f"@{m}" for m in mention)])
-    else:
-        # Never skip the post over a missing mention; say so once (one journal line).
+    if not mention:
+        # An alarm nobody is @mentioned in wakes nobody (#4886): exit non-zero with one
+        # log line so the unit shows in `systemctl --user --failed`, and post nothing.
         print(
-            "NOTE: FORUM_BACKUP_ALARM_MENTION is empty; posting without a mention",
+            "ERROR: FORUM_BACKUP_ALARM_MENTION is empty; refusing to post an alarm "
+            "that mentions nobody",
             file=sys.stderr,
         )
+        return 1
+    # First line names the service (#4886), so the thread reads as the backup's own alarm.
+    parts = [f"forum-backup: `{unit}` failed {today}. Last {ALARM_JOURNAL_LINES} journal lines:",
+             "", "```"]
+    parts.extend(tail if tail else ["(no journal output captured)"])
+    parts.append("```")
+    parts.extend(["", " ".join(f"@{m}" for m in mention)])
     payload = {
         "agent": agent,
         "thread_id": None,
@@ -544,6 +548,22 @@ def alarm(*, client, mention: list, unit: str, journal_lines: list) -> int:
 
 def _alarm_cli(unit: str) -> int:
     """CLI half of --alarm: gather the journal, build the client, call alarm()."""
+    # The alarm's own token (#4886): refuse BEFORE any network call when it is missing or
+    # empty. In the forum's report mode a request with no Authorization header is served as
+    # the identity it names, so a tokenless alarm would otherwise POST unauthenticated.
+    # forum_api is imported only here so the backup path stays stdlib-only and
+    # independent of it. Script run: tools/ is sys.path[0]; package run: tools.*.
+    try:
+        from forum_api import ForumClient, forum_token_path  # type: ignore
+    except ImportError:
+        from tools.forum_api import ForumClient, forum_token_path  # type: ignore
+    try:
+        _tok = forum_token_path().read_text()
+    except (OSError, ValueError):
+        _tok = ""
+    if not _tok.strip():
+        print("ERROR: no forum-backup token; re-run the forum installer", file=sys.stderr)
+        return 1
     try:
         out = subprocess.run(
             ["journalctl", "--user", "-u", unit, "-n", str(ALARM_JOURNAL_LINES), "-o", "cat"],
@@ -556,12 +576,6 @@ def _alarm_cli(unit: str) -> int:
 
     mention = os.environ.get("FORUM_BACKUP_ALARM_MENTION", "").replace(",", " ").split()
 
-    # forum_api is imported only here so the backup path stays stdlib-only and
-    # independent of it. Script run: tools/ is sys.path[0]; package run: tools.*.
-    try:
-        from forum_api import ForumClient  # type: ignore
-    except ImportError:
-        from tools.forum_api import ForumClient  # type: ignore
     client = ForumClient(os.environ.get("FORUM_URL", "").strip() or "http://localhost:5002")
     return alarm(client=client, mention=mention, unit=unit, journal_lines=journal_lines)
 

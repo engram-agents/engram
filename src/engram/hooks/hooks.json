@@ -34,6 +34,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-model-gate-prompt.py\"",
+            "timeout": 3
+          },
+          {
+            "type": "command",
             "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-time-bar-hook.py\"",
             "timeout": 3,
             "statusMessage": "Stamping ambient time..."
@@ -111,6 +116,16 @@
             "type": "command",
             "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
             "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "^(?:mcp__engram__|mcp__plugin_engram_engram__)(?:engram_activate_goal|engram_add_axiom|engram_add_conjecture|engram_add_cornerstone|engram_add_definition|engram_add_edge|engram_add_goal|engram_add_lesson|engram_add_observation|engram_add_observation_batch|engram_add_person|engram_add_special_moment|engram_add_task|engram_add_trust_signal|engram_advance_turn|engram_ask|engram_cascade_end_unblock|engram_cascade_resolve|engram_cascade_start_unblock|engram_checkpoint|engram_contradict|engram_deactivate_goal|engram_derive|engram_focus|engram_focus_delete_set|engram_focus_load|engram_focus_save|engram_focus_swap|engram_goal_tension|engram_lesson_register_incident|engram_link_about|engram_nap|engram_outgrow_cornerstone|engram_reflect|engram_register_exemplar|engram_remove_edge|engram_report_feeling|engram_requote|engram_resolve|engram_retract|engram_retype_edge|engram_set_person_lineage|engram_set_recall_summaries|engram_set_trust_tier|engram_supersede|engram_unfocus|engram_update_lesson|engram_update_person|engram_update_task)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-model-gate-pretool.py\"",
+            "timeout": 5
           }
         ]
       },

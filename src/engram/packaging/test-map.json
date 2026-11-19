@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Convention map for non-imported surfaces \u2014 hooks, shells, skills, templates, packaging. Layer 2 of tools/run_touched_tests.py selection. All test_globs verified to exist at seeding time (2026-06-06). Aspirational or non-existent test targets must use full_suite_fallback=true rather than invented paths.",
+  "description": "Convention map for non-imported surfaces \u2014 hooks, shells, skills, templates, packaging. Layer 2 of tools/run_touched_tests.py selection. All test_globs verified to exist at seeding time (2026-06-06). Aspirational or non-existent test targets must use full_suite_fallback=true rather than invented paths. A changed file selects the UNION of the test_globs of every matching row (row order does not matter); a matching row with full_suite_fallback requests the full suite wherever it sits.",
   "mappings": [
     {
       "path_prefix_or_glob": "hooks/claude/context_tracker.py",
@@ -288,6 +288,43 @@
       "note": "engram-alpha#3822 (U11 Stage B): test_utility_credit_owner_write_3822.py added -- the flagged owner-write path (differential at the write, zero opens, owner-down / skew / readback / indeterminate-retry cells); the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
     {
+      "path_prefix_or_glob": "hooks/claude/engram-model-gate-pretool.py",
+      "test_globs": [
+        "tests/test_model_gate_4596.py",
+        "tests/test_hook_injection_bounds.py"
+      ],
+      "note": "#4596 model-family gate, write block: loaded via importlib (hyphenated name) and run as a subprocess against a temp ENGRAM_HOME (source and flattened deployed layouts), so the layer-1 AST import graph cannot trace it to a test."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-model-gate-prompt.py",
+      "test_globs": [
+        "tests/test_model_gate_4596.py",
+        "tests/test_hook_injection_bounds.py"
+      ],
+      "note": "#4596 model-family gate, next-turn warning: loaded via importlib (hyphenated name) and run as a subprocess against a temp ENGRAM_HOME (source and flattened deployed layouts), so the layer-1 AST import graph cannot trace it to a test."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/_model_gatelib.py",
+      "test_globs": [
+        "tests/test_model_gate_4596.py"
+      ],
+      "note": "#4596: helper imported by the two model-gate hooks (themselves loaded via importlib)."
+    },
+    {
+      "path_prefix_or_glob": "model_gate_write_tools.json",
+      "test_globs": [
+        "tests/test_model_gate_4596.py"
+      ],
+      "note": "#4596: the generated write-tool list; C8 compares it with hooks.json and server.py's annotations."
+    },
+    {
+      "path_prefix_or_glob": "tools/gen_model_gate_write_tools.py",
+      "test_globs": [
+        "tests/test_model_gate_4596.py"
+      ],
+      "note": "#4596: generator for the write-tool list and the pretool matcher (loaded via importlib by C8)."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-nap-compact-backstop-stop.py",
       "test_globs": [
         "tests/test_nap_compact_backstop_4012.py"
@@ -335,6 +372,14 @@
         "tests/test_baton_autopull.py",
         "tests/test_baton_hook.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/model_switch_read.py",
+      "test_globs": [
+        "tests/test_model_switch_read_owner_4616.py",
+        "tests/test_model_switch_read_tool.py"
+      ],
+      "note": "#4616: the blinding tool for the model-switch read. The tests run it as a subprocess, so the layer-1 import graph cannot see the link; it reads the graph through tools/_owner_read.py (the owner for the seat's own store), so its registered read template also ties it to tests/test_engramd_read_scan.py."
     },
     {
       "path_prefix_or_glob": "tools/baton_gate.py",
@@ -985,7 +1030,7 @@
         "tests/test_skill_docs_shell_hygiene.py",
         "tests/test_loop_rearm_3005.py"
       ],
-      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates. The skill-doc shell-hygiene gate is listed here as well as on the broader skills/claude/ entry because selection is FIRST-MATCH-WINS: this entry shadows that one for this path, so a gate omitted here simply never runs for this doc. engram-alpha#3005 round 2 adds test_loop_rearm_3005.py: its sweep cell walks EVERY skill doc for the retired full-cadence arm phrase, and this doc is the primary carrier of that instruction."
+      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates. The skill-doc shell-hygiene gate is listed here as well as on the broader skills/claude/ entry; selection takes the union of every matching row (it was first-match-wins until the runner changed), so listing it here is no longer required for it to run but is harmless. engram-alpha#3005 round 2 adds test_loop_rearm_3005.py: its sweep cell walks EVERY skill doc for the retired full-cadence arm phrase, and this doc is the primary carrier of that instruction."
     },
     {
       "path_prefix_or_glob": "skills/claude/",
@@ -997,7 +1042,7 @@
         "tests/test_loop_rearm_3005.py",
         "tests/test_skill_home_paths_3863.py"
       ],
-      "note": "Any change to a skill directory triggers skill lint + tiers manifest, plus the skill-doc shell-hygiene gate (test_skill_docs_shell_hygiene.py), whose population is EVERY shipped skill doc. Adding a more specific skills/claude/<name>/ entry above this one shadows it (first-match-wins), so such an entry must repeat this gate. engram-alpha#3005 round 3 adds test_loop_rearm_3005.py: its sweep cell walks EVERY swept root for the retired full-cadence arm phrase, and any skill doc (not only engram-loop's) is a carrier of that instruction. engram-alpha#3863 PR 2 adds test_skill_home_paths_3863.py: a line-level check that engram-health-exam, engram-upgrade and engram-sleep carry no command-position hard-coded ENGRAM home path (the file-level home-path gate cannot see a skill that names ENGRAM_HOME once and pastes ~/.engram elsewhere)."
+      "note": "Any change to a skill directory triggers skill lint + tiers manifest, plus the skill-doc shell-hygiene gate (test_skill_docs_shell_hygiene.py), whose population is EVERY shipped skill doc. A more specific skills/claude/<name>/ entry no longer shadows this one: selection takes the union of every matching row (it was first-match-wins until the runner changed). engram-alpha#3005 round 3 adds test_loop_rearm_3005.py: its sweep cell walks EVERY swept root for the retired full-cadence arm phrase, and any skill doc (not only engram-loop's) is a carrier of that instruction. engram-alpha#3863 PR 2 adds test_skill_home_paths_3863.py: a line-level check that engram-health-exam, engram-upgrade and engram-sleep carry no command-position hard-coded ENGRAM home path (the file-level home-path gate cannot see a skill that names ENGRAM_HOME once and pastes ~/.engram elsewhere)."
     },
     {
       "path_prefix_or_glob": "templates/",
@@ -1152,9 +1197,162 @@
         "tests/test_tools_engram_home_3863.py"
       ],
       "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/",
+      "test_globs": [
+        "tests/test_hook_injection_bounds.py"
+      ],
+      "note": "Catch-all that every hook file also matches (under the union it adds this test to a hook that has a row of its own as well): every hook that builds additionalContext must go through _hooklib.emit_context (CLAUDE.md, Hook injection budget), and tests/test_hook_injection_bounds.py is the glob test that checks it. Selection takes the union of every matching row, so this row applies to every hook file, whether or not the hook also has a row of its own, and its position in the map does not matter (it was first-match-wins, with this row last, until the runner changed; tests/test_model_gate_4596.py K5 now pins that the row exists and names the bounds test). The row that was missing when the model-gate hook (engram-alpha#4613) left dev red."
+    },
+    {
+      "path_prefix_or_glob": ".github/workflows/",
+      "test_globs": [
+        "tests/test_codeowners_gate_scope.py",
+        "tests/test_name_leak_warn.py",
+        "tests/test_stray_master_ref_check.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "deploy/autostart/",
+      "test_globs": [
+        "tests/test_default_profile_wording_4442.py",
+        "tests/test_loop_marker_set_4025.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "docs/handbook/",
+      "test_globs": [
+        "tests/test_docs_retired_axis_4255s5.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/agents/",
+      "test_globs": [
+        "tests/test_agent_specs_no_user_name_placeholder.py",
+        "tests/test_dream_master_tools_list_4323.py",
+        "tests/test_spec_python_interpreter_4313.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/agents/claude/",
+      "test_globs": [
+        "tests/test_model_gate_4596.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/hooks/",
+      "test_globs": [
+        "tests/test_engramd_batch_a_acceptance.py",
+        "tests/test_first_session_forum_hint_3563.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/hooks/claude/",
+      "test_globs": [
+        "tests/test_hook_injection_bounds.py",
+        "tests/test_hooks_sqlite_regular_3628s2d.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/output-styles/claude/",
+      "test_globs": [
+        "tests/test_default_profile_wording_4442.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/skills/",
+      "test_globs": [
+        "tests/test_loop_marker_set_4025.py",
+        "tests/test_spec_python_interpreter_4313.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/skills/claude/",
+      "test_globs": [
+        "tests/test_default_profile_wording_4442.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/templates/",
+      "test_globs": [
+        "tests/test_no_mcp_schema_load_time_claim.py",
+        "tests/test_template_components.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/templates/components/",
+      "test_globs": [
+        "tests/test_default_profile_wording_4442.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/tools/",
+      "test_globs": [
+        "tests/test_2652_exclusive_maintenance_completeness_3882.py",
+        "tests/test_engramd_batch_a_acceptance.py",
+        "tests/test_first_session_forum_hint_3563.py",
+        "tests/test_stray_master_ref_check.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/viz/",
+      "test_globs": [
+        "tests/test_viz_server_select_control.py",
+        "tests/test_viz_sqlite_ro.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/viz/static/",
+      "test_globs": [
+        "tests/test_viz_d3_local_4447.py",
+        "tests/test_viz_quickfix_2257_2566_2770.py",
+        "tests/test_viz_url_for.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/engram/viz/templates/",
+      "test_globs": [
+        "tests/test_viz_d3_local_4447.py",
+        "tests/test_viz_quickfix_2257_2566_2770.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "src/forum/deploy/",
+      "test_globs": [
+        "tests/test_stray_master_ref_check.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
+    },
+    {
+      "path_prefix_or_glob": "tools/probes/mods-recall/hooks/",
+      "test_globs": [
+        "tests/test_probe_mods_recall.py"
+      ],
+      "note": "census 2026-11-18: narrow-directory enumerators of this directory; a new or edited file in it must select them"
     }
   ],
   "unmapped": [
+    {
+      "path": "tools/model_gate_write_count.py",
+      "reason": "engram#4596: a read-only measurement instrument for the model-family gate's sleep-cycle latency line in the PR body; no dedicated test file."
+    },
     {
       "path": "tools/same_batch_shadow_latency.py",
       "reason": "engram-alpha#4390 phase 1: a measurement instrument owed in the PR body, with its own positive arm; no dedicated test file."

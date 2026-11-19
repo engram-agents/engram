@@ -503,7 +503,9 @@ _LINE_KEY = _re.compile(r":\d+$")
 # json_each form, cce0379e...).
 # #2652 (unit 02): the store tool's two typed reads, tools/store_read.py:read_ids (the person-node fairy's
 # id population, 23ce2be5...) and :read_axiom_count (first-session's seed-empty count, 5ee7819d...).
+# #4616: the model-switch read's keyset-paged whole-graph read, tools/model_switch_read.py:fetch_nodes (73de74c4...).
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "73de74c4aad9014d7752a64207a73e615cfc75f43c27b2e211be956f8a575503",
     "25c988d6449b53650b086cf16e62444881dde4258eefc476a78f1b701e23f857",
     "e5aee28773313230ff17dbfd6c63e0aa5c529e4b37742f8789dd577915695c22",
     "cce0379e6be90389fc1b92611982267d65296a8ddf93d705cbc28dc27ebbf82f",

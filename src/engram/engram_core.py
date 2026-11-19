@@ -3296,6 +3296,10 @@ _REWRITE_GUARD_MIN_GIT = (2, 28)
 _REWRITE_GUARD_MARKER = b"# engram: refuse to rewrite a pushed commit (#4205)"
 REWRITE_GUARD_SCRIPT = r"""#!/bin/sh
 # engram: refuse to rewrite a pushed commit (#4205). Managed file: _init_git rewrites it.
+# Scope: this refuses rewriting a commit still reachable from refs/remotes/origin/*, not one
+# that was ever pushed. After a fetch from a remote rewritten elsewhere (a sanctioned repair),
+# the local branch may be reset onto the new history without the override. Intended for a
+# single-writer memory repo; it is not a "never lose a pushed commit" guarantee.
 [ "$1" = "prepared" ] || exit 0
 while read -r old new ref; do
   case "$ref" in refs/heads/*) ;; *) continue ;; esac
@@ -3328,7 +3332,13 @@ def _git_version():
 def _install_rewrite_guard() -> str:
     """Idempotently install the reference-transaction hook; -> the status-file
     rewrite_guard value: "installed" | "unsupported" | "opt-out" | "foreign-hook" (an
-    existing hook without our marker is left alone). Never raises."""
+    existing hook without our marker is left alone). Never raises.
+
+    What the hook protects: it refuses rewriting a commit that is still reachable from
+    refs/remotes/origin/*, not a commit that was ever pushed. After a fetch from a remote
+    someone rewrote elsewhere (a sanctioned repair), the local branch can be reset onto the
+    new history without ENGRAM_ALLOW_HISTORY_REWRITE=1, dropping commits that had been
+    pushed. For a single-writer memory repo that is intended."""
     try:
         ver = _git_version()
         if ver is None or ver[:2] < _REWRITE_GUARD_MIN_GIT:
