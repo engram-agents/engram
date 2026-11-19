@@ -316,7 +316,7 @@ def test_c10_an_exception_is_logged_once_per_job_too(store, monkeypatch):
     server, d = store
     wk, job, snap = _make_job(server)
 
-    def boom(_):
+    def boom(_, **_kw):  # the worker passes the job's captured_at too (#4647)
         raise RuntimeError("regen exploded")
 
     monkeypatch.setattr(wk, "_regenerate_derived_files", boom)
