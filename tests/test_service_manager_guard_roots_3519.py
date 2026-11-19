@@ -20,6 +20,7 @@ A broken guard therefore reaches the spy, never a real tool.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import stat
@@ -30,6 +31,28 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_root_conftest():
+    """The real root conftest.py as a module object, loaded BY FILE PATH (never sys.path), registered in
+    sys.modules before exec; None when the repo has no root conftest. `_layout` reads the live-forum guard's
+    DEFAULT_URL_SOURCES from THIS object, so the sources it copies are never retyped here (#4475)."""
+    path = REPO_ROOT / "conftest.py"
+    if not path.exists():
+        return None
+    name = "_root_conftest_roots_3519"
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return mod
+
+
+_ROOT_CONFTEST = _load_root_conftest()
 
 ROOTS = {
     "tests": "tests/test_probe_3519.py",
@@ -113,9 +136,30 @@ def _layout(tmp_path: Path) -> Path:
     shutil.copy(REPO_ROOT / "tests" / "conftest.py", root / "tests" / "conftest.py")
     if (REPO_ROOT / "conftest.py").exists():
         shutil.copy(REPO_ROOT / "conftest.py", root / "conftest.py")
+        # The copied conftest READS its default-URL sources at import (#4475 guard, fails closed without
+        # them), so the throwaway repo carries exactly the files the guard names, taken from its own list.
+        for rel in _ROOT_CONFTEST.DEFAULT_URL_SOURCES:
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(REPO_ROOT / rel, root / rel)
     for init in ("src/forum/__init__.py", "src/forum/tests/__init__.py", "tools/__init__.py"):
         (root / init).write_text("")
     return root
+
+
+def test_layout_carries_every_default_url_source_the_guard_names(tmp_path):
+    root = _layout(tmp_path)
+    assert _ROOT_CONFTEST.DEFAULT_URL_SOURCES, "the guard names no sources"
+    for rel in _ROOT_CONFTEST.DEFAULT_URL_SOURCES:
+        assert (root / rel).read_bytes() == (REPO_ROOT / rel).read_bytes(), rel
+
+
+def test_layout_takes_its_sources_from_the_guards_list_not_a_retyped_one(tmp_path, monkeypatch):
+    """A future source added to DEFAULT_URL_SOURCES must reach the throwaway repo with no edit here."""
+    extra = "README.md"  # any tracked file: only its presence at the same relative path matters
+    assert (REPO_ROOT / extra).is_file()
+    monkeypatch.setattr(_ROOT_CONFTEST, "DEFAULT_URL_SOURCES", tuple(_ROOT_CONFTEST.DEFAULT_URL_SOURCES) + (extra,))
+    root = _layout(tmp_path)
+    assert (root / extra).read_bytes() == (REPO_ROOT / extra).read_bytes()
 
 
 def _outer_env(spy_dir: Path) -> dict:

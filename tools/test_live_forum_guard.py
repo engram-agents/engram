@@ -582,3 +582,207 @@ def test_zz_B_these_cells_leave_the_session_list_empty(request):
     assert lst is not None, "the session-level install did not run (no list on the config)"
     mine = [e for e in lst if Path(__file__).name in str(e[2])]
     assert mine == [], mine
+
+
+# ---------------------------------------------------------------- fold 2 on #4903: a default-URL source that is not usable
+# fails CLOSED with ONE named failure. The guard reads the files in DEFAULT_URL_SOURCES relative to the conftest's own
+# directory; a copy of the conftest in a tree without them used to die with a bare FileNotFoundError at import (the
+# #3519 throwaway repo did), while a missing constant raised the guard's own RuntimeError: two shapes for one problem.
+# G1: five ways a source can be unusable, one `RuntimeError("#4475 guard: <relative path>: <reason>")`.
+# G2: with the sources absent the endpoint functions raise (never an empty set), and a preset snapshot cannot stand in.
+# G3: a copied conftest in a tree WITHOUT the sources fails at collection; the same copy WITH them guards.
+
+import os
+import subprocess
+import sys
+
+_GOOD_SOURCE = '_DEFAULT_FORUM_URL = "http://localhost:5077"\n'
+
+
+def _source_tree(root):
+    """A tree carrying every default-URL source with a good constant."""
+    for rel in G.DEFAULT_URL_SOURCES:
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_GOOD_SOURCE)
+    return root
+
+
+def _break_source(root, rel, case):
+    """Make the source at `rel` unusable in the way `case` names; returns the reason text the guard must give."""
+    p = root / rel
+    if case == "missing":
+        p.unlink()
+        return "file missing"
+    if case == "directory":  # a directory in place of the file (not a regular file)
+        p.unlink()
+        p.mkdir()
+        return "not a regular file"
+    if case == "permission":  # chmod 000 (skipped when running as root, or when the mode does not bite)
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("running as root: chmod 000 does not make a file unreadable")
+        p.chmod(0)
+        try:
+            p.read_bytes()
+        except PermissionError:
+            return "unreadable (permission denied)"
+        pytest.skip("chmod 000 did not make the file unreadable on this platform")
+    if case == "not-utf8":
+        p.write_bytes(b'\xff\xfe_DEFAULT_FORUM_URL = "http://localhost:5077"\n')
+        return "not valid UTF-8"
+    if case == "no-constant":
+        p.write_text("_OTHER = 1\n")
+        return "no _DEFAULT_FORUM_URL constant"
+    raise AssertionError(case)
+
+
+_G1_CASES = ["missing", "directory", "permission", "not-utf8", "no-constant"]
+
+
+@pytest.mark.parametrize("which", [0, 1])
+@pytest.mark.parametrize("case", _G1_CASES)
+def test_G1_every_unusable_default_url_source_gives_one_named_runtime_error(tmp_path, case, which):
+    root = _source_tree(tmp_path / "repo")
+    rel = G.DEFAULT_URL_SOURCES[which]
+    reason = _break_source(root, rel, case)
+    with pytest.raises(Exception) as ei:
+        G.live_forum_endpoints({}, tmp_path / "absent.json", repo_root=root)
+    exc = ei.value
+    assert type(exc) is RuntimeError, (type(exc), exc)  # not OSError / FileNotFoundError / UnicodeDecodeError
+    assert not isinstance(exc, OSError)
+    msg = str(exc)
+    assert msg.startswith(f"#4475 guard: {rel}: "), msg
+    assert reason in msg, (reason, msg)
+
+
+def test_G2_default_forum_endpoints_raises_when_the_sources_are_absent_and_never_returns_an_empty_set(tmp_path):
+    with pytest.raises(RuntimeError, match=r"^#4475 guard: .*engram-forum-prompt-hook\.py: file missing"):
+        G.default_forum_endpoints(repo_root=tmp_path / "no-sources")
+
+
+_G2_PRESETS = [None, "[]", '[["localhost", 5002]]', '[["forum.example.test", 5055]]']
+
+
+@pytest.mark.parametrize("preset", _G2_PRESETS, ids=["no-preset", "empty-list", "default-pair", "other-pair"])
+def test_G2_session_endpoints_raise_without_sources_whatever_the_preset_says(tmp_path, monkeypatch, preset):
+    """A preset snapshot (even a valid non-empty one) cannot stand in for missing sources; a failed
+    attempt leaves the session set unset and the environment as it found it."""
+    monkeypatch.setattr(G, "_LFG_REPO_ROOT", tmp_path / "no-sources")
+    monkeypatch.setattr(G, "_LFG_SESSION_ENDPOINTS", None)
+    monkeypatch.delenv("FORUM_URL", raising=False)
+    monkeypatch.setenv("ENGRAM_HOME", str(tmp_path / "home"))
+    if preset is None:
+        monkeypatch.delenv(G._LFG_SNAPSHOT_KEY, raising=False)
+    else:
+        monkeypatch.setenv(G._LFG_SNAPSHOT_KEY, preset)
+    with pytest.raises(RuntimeError, match=r"^#4475 guard: "):
+        G.session_live_forum_endpoints()
+    assert G._LFG_SESSION_ENDPOINTS is None  # not an empty or partial set
+    assert os.environ.get(G._LFG_SNAPSHOT_KEY) == preset  # no half-written snapshot either
+
+
+_G3_CHILD_STUB = '''
+import json, os, socket
+
+_PORT, _REC = int(os.environ["LFG_PORT"]), os.environ["LFG_REC"]
+_rc, _rcx = socket.socket.connect, socket.socket.connect_ex
+
+
+def _hit(a):
+    return isinstance(a, tuple) and len(a) >= 2 and a[1] == _PORT
+
+
+def _note(via):
+    with open(_REC, "a") as fh:
+        fh.write(json.dumps({"via": via}) + "\\n")
+
+
+def _c(self, a):
+    if _hit(a):
+        _note("connect")
+        raise ConnectionRefusedError(111, "recording stub: the planted port was reached")
+    return _rc(self, a)
+
+
+def _cx(self, a):
+    if _hit(a):
+        _note("connect_ex")
+        return 111
+    return _rcx(self, a)
+
+
+socket.socket.connect, socket.socket.connect_ex = _c, _cx
+'''
+
+_G3_CHILD_PROBE = '''
+import os, socket
+
+
+def test_planted_port_is_refused_by_the_guard():
+    s = socket.socket()
+    try:
+        s.connect(("127.0.0.1", int(os.environ["LFG_PORT"])))
+    except ConnectionRefusedError as exc:
+        assert "guard #4475" in str(exc), str(exc)
+    else:
+        raise AssertionError("connected")
+    finally:
+        s.close()
+'''
+
+
+def _free_port():
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def _copied_conftest_run(tmp_path, carry):
+    """A COPY of the real root conftest in a fresh tree carrying the sources named by `carry` (indexes into
+    DEFAULT_URL_SOURCES); a child pytest over a probe. A recording stub (stubplug) sits beneath the guard, so a
+    broken guard reaches the stub (which refuses and records), never a real connection. Returns (run, records)."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    shutil.copy(_CONFTEST, tree / "conftest.py")
+    for i in carry:
+        rel = G.DEFAULT_URL_SOURCES[i]
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(REPO_ROOT / rel, tree / rel)
+    port = _free_port()
+    home = tmp_path / "home"
+    (home / ".engram").mkdir(parents=True)
+    (home / ".engram" / "config.json").write_text(json.dumps({"forum": {"url": f"http://127.0.0.1:{port}"}}))
+    (tree / "stubplug.py").write_text(_G3_CHILD_STUB)
+    (tree / "test_probe.py").write_text(_G3_CHILD_PROBE)
+    rec = tmp_path / "rec.jsonl"
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTEST_ADDOPTS", "FORUM_URL", G._LFG_SNAPSHOT_KEY)}
+    env.update(HOME=str(home), ENGRAM_HOME=str(home / ".engram"), PYTHONPATH=str(tree), LFG_PORT=str(port), LFG_REC=str(rec))
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "stubplug", "--rootdir", str(tree),
+         "--confcutdir", str(tree), str(tree / "test_probe.py")],
+        cwd=str(tree), env=env, capture_output=True, text=True, timeout=180,
+    )
+    return r, (rec.read_text().splitlines() if rec.exists() else [])
+
+
+@pytest.mark.parametrize("carry", [(), (0,), (1,)], ids=["neither-source", "only-first", "only-second"])
+def test_G3_a_copied_conftest_without_its_sources_fails_at_collection_naming_the_missing_path(tmp_path, carry):
+    r, rec = _copied_conftest_run(tmp_path, carry)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "#4475 guard:" in out, out
+    missing = [G.DEFAULT_URL_SOURCES[i] for i in range(len(G.DEFAULT_URL_SOURCES)) if i not in carry]
+    assert missing[0] in out, (missing, out)
+    assert "passed" not in r.stdout, out
+    assert rec == [], rec
+
+
+def test_G3_the_same_copy_in_a_tree_carrying_the_sources_loads_and_refuses_the_planted_port(tmp_path):
+    r, rec = _copied_conftest_run(tmp_path, tuple(range(len(G.DEFAULT_URL_SOURCES))))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "1 passed" in r.stdout, out
+    assert rec == [], rec  # the guard refused it before the recording stub beneath it saw the connect

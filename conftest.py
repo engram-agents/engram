@@ -282,6 +282,14 @@ def _service_manager_guard(service_manager_shim_dir, monkeypatch):
 # that host and port EXACTLY AS WRITTEN: stdlib clients resolve a name first and connect by IP, so a host
 # NAME in forum.url is matched only by a direct connect by that name, an IP literal is matched either way.
 #
+# "My source files are not here": the guard FAILS CLOSED. The two source files are read relative to this file's
+# own directory, so a COPY of this conftest must carry them (tests/test_service_manager_guard_roots_3519.py's
+# throwaway repo copies the files named by DEFAULT_URL_SOURCES, never a retyped list). A source that is missing,
+# not a regular file, unreadable, not UTF-8 or without the constant raises ONE failure,
+# `RuntimeError("#4475 guard: <relative path>: <reason>")`, at import (collection fails); the endpoint functions
+# never return an empty set for it, and a preset ENGRAM_LIVE_FORUM_ENDPOINTS_4475 cannot stand in for the
+# missing sources. Cells: the "fold 2" section of tests/test_live_forum_guard_4475.py and its two copies.
+#
 # This definition is shared: src/forum/tests/conftest.py loads THIS file by path, assigns the same
 # `pytest_configure` / `pytest_unconfigure` hooks into its own namespace and installs the same guard (the
 # forum tests may run on their own), and the cell files load it by path too. Installing twice is a no-op.
@@ -311,6 +319,7 @@ import ipaddress
 import json
 import re
 import socket
+import stat
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -347,6 +356,44 @@ def _lfg_endpoint(url):
     return (host.lower(), port)
 
 
+def _lfg_source_failure(rel, reason):
+    """The ONE failure for an unusable default-URL source: `#4475 guard: <relative path>: <reason>`."""
+    return RuntimeError(f"#4475 guard: {rel}: {reason}")
+
+
+def _lfg_default_url(root, rel):
+    """The `_DEFAULT_FORUM_URL` constant of the source file `root / rel`. Fails CLOSED: a file that is missing, not
+    a regular file, unreadable or not UTF-8, or one without the constant, raises `RuntimeError` in the one shape
+    above (never a bare OSError); the caller never gets an empty answer for a source it could not read."""
+    path = root / rel
+    try:
+        st = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise _lfg_source_failure(rel, "file missing") from exc
+    except PermissionError as exc:
+        raise _lfg_source_failure(rel, "unreadable (permission denied)") from exc
+    except OSError as exc:
+        raise _lfg_source_failure(rel, f"unreadable ({exc.strerror or type(exc).__name__})") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise _lfg_source_failure(rel, "not a regular file")
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise _lfg_source_failure(rel, "file missing") from exc
+    except PermissionError as exc:
+        raise _lfg_source_failure(rel, "unreadable (permission denied)") from exc
+    except OSError as exc:
+        raise _lfg_source_failure(rel, f"unreadable ({exc.strerror or type(exc).__name__})") from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _lfg_source_failure(rel, "not valid UTF-8") from exc
+    m = _DEFAULT_URL_RE.search(text)
+    if m is None:
+        raise _lfg_source_failure(rel, "no _DEFAULT_FORUM_URL constant found")
+    return m.group(1)
+
+
 def live_forum_endpoints(environ, config_json_path, repo_root=None):
     """The set of (host, port) pairs the code may resolve as the forum: the config file's
     `forum.url` (when readable), `$FORUM_URL`, and the `_DEFAULT_FORUM_URL` constant read from the
@@ -362,11 +409,7 @@ def live_forum_endpoints(environ, config_json_path, repo_root=None):
     urls.append((environ or {}).get("FORUM_URL"))
     root = Path(repo_root) if repo_root is not None else _LFG_REPO_ROOT
     for rel in DEFAULT_URL_SOURCES:
-        text = (root / rel).read_text(encoding="utf-8")
-        m = _DEFAULT_URL_RE.search(text)
-        if m is None:
-            raise RuntimeError(f"#4475 guard: no _DEFAULT_FORUM_URL constant found in {rel}")
-        urls.append(m.group(1))
+        urls.append(_lfg_default_url(root, rel))
     return {ep for ep in map(_lfg_endpoint, urls) if ep is not None}
 
 
