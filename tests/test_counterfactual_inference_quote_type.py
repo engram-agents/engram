@@ -27,11 +27,15 @@ def fresh_server():
     for key in list(sys.modules):
         if key == "server" or key.startswith("engram_"):
             del sys.modules[key]
-    import server  # noqa: F401 — side effect: initialises fresh DB in TEST_DIR
+    import server
+    # The data directory is resolved from ENGRAM_HOME at import time, so
+    # importing alone does NOT move it to TEST_DIR (#4881): redirect it
+    # explicitly, then create the (fresh) DB there.
+    server._configure_paths(TEST_DIR)
+    server._ensure_data_dir()
 
 
 def setup_module():
-    os.environ["ENGRAM_DATA_DIR"] = TEST_DIR
     fresh_server()
 
 
@@ -39,7 +43,6 @@ def teardown_module():
     for key in list(sys.modules):
         if key == "server" or key.startswith("engram_"):
             del sys.modules[key]
-    os.environ.pop("ENGRAM_DATA_DIR", None)
 
 
 # ── Unit: CONFIDENCE_MAP contains the new key ─────────────────────────────

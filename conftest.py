@@ -499,8 +499,9 @@ def _snapshot_from_raw(raw):
 
 def session_live_forum_endpoints():
     """The endpoints for the REAL environment, resolved ONCE, at the first import of this file.
-    tests/conftest.py repoints ENGRAM_HOME at a throwaway directory when it is unset, so a later
-    resolution would miss the real config. The snapshot is also kept in the environment so a second
+    tests/conftest.py ALWAYS repoints ENGRAM_HOME at a throwaway directory (#4906; the repoint is
+    unconditional, even when ENGRAM_HOME is exported), so a later resolution would miss the real config.
+    This root conftest loads first and takes the snapshot before that repoint. The snapshot is also kept in the environment so a second
     load of this file (src/forum/tests/conftest.py loads it by path) reuses it.
 
     A preset value is trusted only to ADD endpoints: the default pair read from DEFAULT_URL_SOURCES is always

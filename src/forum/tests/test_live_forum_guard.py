@@ -810,3 +810,44 @@ def test_G3_the_same_copy_in_a_tree_carrying_the_sources_loads_and_refuses_the_p
     assert r.returncode == 0, out
     assert "1 passed" in r.stdout, out
     assert rec == [], rec  # the guard refused it before the recording stub beneath it saw the connect
+
+
+# fold 2b: a failed session resolve leaves os.environ EXACTLY as it found it (no snapshot written before the default pair is
+# known), and a source whose PARENT path component is a regular file is "file missing" too.
+# `resolve_endpoints_from_environ` is stood in for (it would itself raise first on a tree without sources), so these cells
+# reach the line that unions the default pair, which is the one that raises.
+
+_G2B_PRESETS = {
+    "absent": None,
+    "valid-compact": '[["forum.example.test",5055]]',  # json.dumps would respell it with a space: byte-for-byte matters
+    "malformed": "{not json",
+}
+
+
+@pytest.mark.parametrize("preset", list(_G2B_PRESETS), ids=list(_G2B_PRESETS))
+def test_G2_a_failed_session_resolve_leaves_os_environ_exactly_as_it_was(tmp_path, monkeypatch, preset):
+    raw = _G2B_PRESETS[preset]
+    monkeypatch.setattr(G, "_LFG_REPO_ROOT", tmp_path / "no-sources")
+    monkeypatch.setattr(G, "_LFG_SESSION_ENDPOINTS", None)
+    monkeypatch.setattr(G, "resolve_endpoints_from_environ", lambda environ: {("localhost", 5002)})
+    if raw is None:
+        monkeypatch.delenv(G._LFG_SNAPSHOT_KEY, raising=False)
+    else:
+        monkeypatch.setenv(G._LFG_SNAPSHOT_KEY, raw)
+    before = dict(os.environ)
+    with pytest.raises(RuntimeError, match=r"^#4475 guard: "):
+        G.session_live_forum_endpoints()
+    assert G._LFG_SESSION_ENDPOINTS is None
+    assert dict(os.environ) == before
+    assert os.environ.get(G._LFG_SNAPSHOT_KEY) == raw
+
+
+def test_G1_a_source_whose_parent_component_is_a_regular_file_is_file_missing(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    rel = G.DEFAULT_URL_SOURCES[0]
+    (root / rel.split("/")[0]).write_text("not a directory\n")  # `src` is a file: os.stat raises NotADirectoryError
+    with pytest.raises(Exception) as ei:
+        G.live_forum_endpoints({}, tmp_path / "absent.json", repo_root=root)
+    assert type(ei.value) is RuntimeError, (type(ei.value), ei.value)
+    assert str(ei.value) == f"#4475 guard: {rel}: file missing", str(ei.value)

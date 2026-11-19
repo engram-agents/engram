@@ -786,3 +786,121 @@ def test_G3_the_same_copy_in_a_tree_carrying_the_sources_loads_and_refuses_the_p
     assert r.returncode == 0, out
     assert "1 passed" in r.stdout, out
     assert rec == [], rec  # the guard refused it before the recording stub beneath it saw the connect
+
+
+# fold 2b: a failed session resolve leaves os.environ EXACTLY as it found it (no snapshot written before the default pair is
+# known), and a source whose PARENT path component is a regular file is "file missing" too.
+# `resolve_endpoints_from_environ` is stood in for (it would itself raise first on a tree without sources), so these cells
+# reach the line that unions the default pair, which is the one that raises.
+
+_G2B_PRESETS = {
+    "absent": None,
+    "valid-compact": '[["forum.example.test",5055]]',  # json.dumps would respell it with a space: byte-for-byte matters
+    "malformed": "{not json",
+}
+
+
+@pytest.mark.parametrize("preset", list(_G2B_PRESETS), ids=list(_G2B_PRESETS))
+def test_G2_a_failed_session_resolve_leaves_os_environ_exactly_as_it_was(tmp_path, monkeypatch, preset):
+    raw = _G2B_PRESETS[preset]
+    monkeypatch.setattr(G, "_LFG_REPO_ROOT", tmp_path / "no-sources")
+    monkeypatch.setattr(G, "_LFG_SESSION_ENDPOINTS", None)
+    monkeypatch.setattr(G, "resolve_endpoints_from_environ", lambda environ: {("localhost", 5002)})
+    if raw is None:
+        monkeypatch.delenv(G._LFG_SNAPSHOT_KEY, raising=False)
+    else:
+        monkeypatch.setenv(G._LFG_SNAPSHOT_KEY, raw)
+    before = dict(os.environ)
+    with pytest.raises(RuntimeError, match=r"^#4475 guard: "):
+        G.session_live_forum_endpoints()
+    assert G._LFG_SESSION_ENDPOINTS is None
+    assert dict(os.environ) == before
+    assert os.environ.get(G._LFG_SNAPSHOT_KEY) == raw
+
+
+def test_G1_a_source_whose_parent_component_is_a_regular_file_is_file_missing(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    rel = G.DEFAULT_URL_SOURCES[0]
+    (root / rel.split("/")[0]).write_text("not a directory\n")  # `src` is a file: os.stat raises NotADirectoryError
+    with pytest.raises(Exception) as ei:
+        G.live_forum_endpoints({}, tmp_path / "absent.json", repo_root=root)
+    assert type(ei.value) is RuntimeError, (type(ei.value), ei.value)
+    assert str(ei.value) == f"#4475 guard: {rel}: file missing", str(ei.value)
+
+
+# fold 2c: an EXPORTED ENGRAM_HOME that names a forum on a non-default port is still guarded after tests/conftest.py's
+# UNCONDITIONAL repoint of ENGRAM_HOME (#4906). tests/ tree only: tests/conftest.py applies only there. The child
+# tree carries copies of the REAL root conftest and the REAL tests/conftest.py, plus the guard's own DEFAULT_URL_SOURCES;
+# a recording stub (stubplug) sits beneath the guard, so a broken guard reaches the stub, never a real connection.
+
+_G2C_PROBE = '''
+import json, os, socket
+
+
+def test_probe():
+    s = socket.socket()
+    out = {"home": os.environ.get("ENGRAM_HOME")}
+    try:
+        s.connect(("127.0.0.1", int(os.environ["LFG_PORT"])))
+        out["type"] = "connected"
+    except ConnectionRefusedError as exc:
+        out["type"], out["msg"] = type(exc).__name__, str(exc)
+    finally:
+        s.close()
+    with open(os.environ["LFG_OUT"], "w") as fh:
+        json.dump(out, fh)
+'''
+
+
+def _exported_home_run(tmp_path, row):
+    tree = tmp_path / "tree"
+    (tree / "tests").mkdir(parents=True)
+    shutil.copy(REPO_ROOT / "pytest.ini", tree / "pytest.ini")
+    shutil.copy(_CONFTEST, tree / "conftest.py")
+    shutil.copy(REPO_ROOT / "tests" / "conftest.py", tree / "tests" / "conftest.py")
+    for rel in G.DEFAULT_URL_SOURCES:  # from the guard's own list, never retyped
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(REPO_ROOT / rel, tree / rel)
+    (tree / "stubplug.py").write_text(_G3_CHILD_STUB)
+    (tree / "tests" / "test_probe.py").write_text(_G2C_PROBE)
+    port = _free_port()
+    home, tmpdir, exported = tmp_path / "home", tmp_path / "tmp", tmp_path / "exported-home"
+    for d in (home / ".engram", tmpdir, exported):
+        d.mkdir(parents=True, exist_ok=True)
+    cfg = json.dumps({"forum": {"url": f"http://127.0.0.1:{port}"}})
+    if row in ("A", "C"):
+        ((exported if row == "A" else home / ".engram") / "config.json").write_text(cfg)
+    rec, res = tmp_path / "rec.jsonl", tmp_path / "res.json"
+    drop = ("PYTEST_ADDOPTS", "FORUM_URL", "ENGRAM_HOME", G._LFG_SNAPSHOT_KEY)
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    env.update(HOME=str(home), TMPDIR=str(tmpdir), PYTHONPATH=str(tree), LFG_PORT=str(port), LFG_REC=str(rec), LFG_OUT=str(res))
+    if row != "C":
+        env["ENGRAM_HOME"] = str(exported)  # exported, as every seat's shell does
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "stubplug", "--rootdir", str(tree),
+         "--confcutdir", str(tree), str(tree / "tests" / "test_probe.py")],
+        cwd=str(tree), env=env, capture_output=True, text=True, timeout=180,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(res.read_text()), (rec.read_text().splitlines() if rec.exists() else []), str(exported)
+
+
+@pytest.mark.parametrize("row", ["A", "C"])
+def test_G2c_a_config_forum_on_a_non_default_port_is_refused_after_the_unconditional_repoint(tmp_path, row):
+    """A: ENGRAM_HOME exported, its config.json names the planted port. C: ENGRAM_HOME absent, the config is in
+    $HOME/.engram. Both: the guard (not the stub) refuses, and the child really ran in a repointed home."""
+    out, rec, exported = _exported_home_run(tmp_path, row)
+    assert out["type"] == "LiveForumConnectionRefused", out
+    assert "#4475" in out["msg"], out
+    assert rec == [], rec
+    assert out["home"] != exported, out  # tests/conftest.py repointed it: the config was read BEFORE that
+
+
+def test_G2c_control_without_a_config_the_planted_port_is_not_guarded(tmp_path):
+    """B: the exported home holds no config: the probe gets the recording stub's plain refusal, not the guard's."""
+    out, rec, exported = _exported_home_run(tmp_path, "B")
+    assert out["type"] == "ConnectionRefusedError", out
+    assert "#4475" not in out["msg"] and "recording stub" in out["msg"], out
+    assert len(rec) == 1, rec
+    assert out["home"] != exported, out
