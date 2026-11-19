@@ -38,10 +38,10 @@ def _empty_cache_object(obj) -> bool:
     if type(obj) is dict:
         obj.clear()
         return True
-    if type(obj).__module__.partition(".")[0] != "uncalled_for":
-        return False
     emptied = False
     try:
+        if type(obj).__module__.partition(".")[0] != "uncalled_for":
+            return False
         held = list(vars(obj).values())
     except Exception:
         return False

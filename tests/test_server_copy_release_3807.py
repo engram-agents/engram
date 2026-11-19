@@ -409,6 +409,33 @@ def test_r11_hostile_cache_object_does_not_stop_the_sweep(monkeypatch):
     del keep
 
 
+def test_r11b_unreadable_module_attribute_does_not_stop_the_sweep(monkeypatch):
+    class NoModule:
+        pass
+
+    NoModule.__module__ = None  # `type(obj).__module__.partition` would raise on this
+    good = _function_cache_class()()
+    keep = _loaded(good)
+    _fake(monkeypatch, "uncalled_for._r11b_3807", _a_cache=NoModule(), _z_cache=good)
+    assert isinstance(rsc.release_retained_server_copies(), int)
+    assert len(good) == 0
+    del keep
+
+
+def test_r10b_object_holding_nothing_clearable_is_not_counted(monkeypatch):
+    _drop_fastmcp_modules(monkeypatch)
+
+    class Empty:
+        pass
+
+    Empty.__module__ = "uncalled_for.caching"
+    only = _function_cache_class()()
+    keep = _loaded(only)
+    _fake(monkeypatch, "uncalled_for._r10b_3807", _a_cache=Empty(), _b_cache=only)
+    assert rsc.release_retained_server_copies() == 1  # the stand-in with no stores is not a cleared cache
+    del keep
+
+
 def test_r12_real_function_cache_class_is_emptied():
     caching = pytest.importorskip("uncalled_for.caching", reason="uncalled_for < 0.6: no FunctionCache")
     fc = caching.FunctionCache()
