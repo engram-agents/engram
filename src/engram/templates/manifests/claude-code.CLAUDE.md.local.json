@@ -16,6 +16,6 @@
     { "id": "confidence-anchors", "anchor": "Confidence calibration anchors" },
     { "id": "native-tools-ban-local", "anchor": "Parallelization and Delegation" },
     { "id": "engram-reference", "anchor": "ENGRAM Reference" },
-    { "id": "session-start-reading", "anchor": "Session Start Reading" }
+    { "id": "session-start-reading-local", "anchor": "Session Start Reading" }
   ]
 }

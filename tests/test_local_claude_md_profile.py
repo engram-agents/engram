@@ -56,9 +56,12 @@ LOCAL_IDS = [
     "confidence-anchors",
     "native-tools-ban-local",
     "engram-reference",
-    "session-start-reading",
+    "session-start-reading-local",
 ]
 
+SSR_ID = "session-start-reading"
+SSR_LOCAL_ID = "session-start-reading-local"
+SSR_CLAUSE = " Style: §Writing style for auto-load surfaces."
 BAN_ID = "native-tools-ban-local"
 GATE_ID = "model-identity-gate-local"
 NOTES_ID = "user-notes-verbatim-local"
@@ -127,7 +130,8 @@ def test_local_manifest_is_the_listed_ids_in_the_full_manifests_relative_order()
     assert local_ids == LOCAL_IDS
     full_ids = _manifest_ids(FULL_MANIFEST)
     # The profile-only components have no place in the full manifest; the rest keep its relative order.
-    assert [i for i in local_ids if i not in LOCAL_ONLY_IDS] == [i for i in full_ids if i in set(local_ids)], (
+    normalised = [SSR_ID if i == SSR_LOCAL_ID else i for i in local_ids]
+    assert [i for i in normalised if i not in LOCAL_ONLY_IDS] == [i for i in full_ids if i in set(normalised)], (
         "the local manifest must keep the full manifest's relative order"
     )
     # The ban sits where its host section sits in the full file: after the confidence anchors,
@@ -562,8 +566,11 @@ def test_g_boundary_shape_at_each_adjacency(prev_id, next_id):
     """One blank line between components, unless the full document differs at the same boundary."""
     full_ids = _manifest_ids(FULL_MANIFEST)
     # the profile-only components are in no full manifest, so no full-render boundary exists to compare with
+    # the Session Start Reading variant stands where its full source stands, so it is compared as its source
+    as_full = lambda cid: SSR_ID if cid == SSR_LOCAL_ID else cid  # noqa: E731
     adjacent_in_full = (
-        not {BAN_ID, GATE_ID, NOTES_ID} & {prev_id, next_id} and full_ids.index(next_id) == full_ids.index(prev_id) + 1
+        not {BAN_ID, GATE_ID, NOTES_ID} & {prev_id, next_id}
+        and full_ids.index(as_full(next_id)) == full_ids.index(as_full(prev_id)) + 1
     )
     expected = 1
     if adjacent_in_full:
@@ -602,7 +609,8 @@ def test_i_local_is_strictly_shorter_and_has_none_of_the_dropped_headings():
     assert len(local.encode()) < len(full.encode())
     assert len(local.splitlines()) < len(full.splitlines())
     local_headings = set(_headings(local))
-    dropped = set(_manifest_ids(FULL_MANIFEST)) - set(LOCAL_IDS)
+    # the Session Start Reading component is carried through its bound variant, so it is not a dropped one
+    dropped = set(_manifest_ids(FULL_MANIFEST)) - set(LOCAL_IDS) - {SSR_ID}
     seen = 0
     for cid in sorted(dropped):
         for h in _headings(_component_body(cid)):
@@ -625,7 +633,6 @@ def test_i_local_is_strictly_shorter_and_has_none_of_the_dropped_headings():
 
 # --- the Session Start Reading section is restored (ruling: cross-compaction continuity) -------
 
-SSR_ID = "session-start-reading"
 SSR_HEADING = "## Session Start Reading"
 
 
@@ -645,25 +652,47 @@ def test_session_start_reading_renders_with_its_heading_and_its_three_numbered_i
     assert [ln.split(". ", 1)[0] for ln in numbered] == ["1", "2", "3"], numbered
 
 
-def test_session_start_reading_section_is_the_full_files_section_byte_for_byte():
-    assert _section(_local(), SSR_HEADING) == _section(_full(), SSR_HEADING)
+def test_session_start_reading_section_is_the_full_files_section_with_exactly_the_one_clause_removed():
+    full_section = _section(_full(), SSR_HEADING)
+    assert full_section.count(SSR_CLAUSE) == 1
+    assert _section(_local(), SSR_HEADING) == full_section.replace(SSR_CLAUSE, "")
 
 
-def test_session_start_reading_is_the_existing_full_component_not_a_new_one():
-    assert SSR_ID in _manifest_ids(FULL_MANIFEST)
-    assert _manifest_ids(LOCAL_MANIFEST).count(SSR_ID) == 1
-    assert not (TEMPLATES / "components" / f"{SSR_ID}-local.md").exists()
+def _ssr_source_text() -> str:
+    return (TEMPLATES / "components" / f"{SSR_ID}.md").read_text(encoding="utf-8")
 
 
-def test_session_start_reading_sits_where_the_full_manifest_puts_it():
+def test_session_start_reading_local_component_is_the_source_with_exactly_the_one_clause_removed():
+    source_fm, source_body = tcr._load_component(SSR_ID)
+    fm, body = tcr._load_component(SSR_LOCAL_ID)
+    assert source_body.count(SSR_CLAUSE) == 1
+    # string-replace on the source, so any other drift (a word, a line, the dream-triage check) fails
+    assert body == source_body.replace(SSR_CLAUSE, "")
+    assert body != source_body
+    for key in ("kind", "harnesses", "surfaces", "anchor", "order", "merge"):
+        assert fm[key] == source_fm[key], key
+    assert fm["id"] == SSR_LOCAL_ID and fm["version"] >= 1
+
+
+def test_the_local_render_has_no_writing_style_section_or_pointer_but_keeps_the_rest_of_the_reading_section():
+    text = _local()
+    assert "Writing style for auto-load surfaces" not in text
+    assert "## Writing style" not in text
+    section = _section(text, SSR_HEADING)
+    assert "If the SessionStart context includes `⚠️ ENGRAM substrate health:` lines" in section
+    assert "recall falls back to keyword search (FTS) only." in section
+    assert "check that its `## Sleep-end triage (parent)` section covers every item under `## For the awake seat`" in section
+    assert "Triage any uncovered item now (do now / file / defer with a reason) before the first task." in section
+    assert "The SessionStart hook injects a pointer to this list; this section is the stable copy if the pointer is missing." in section
+
+
+def test_session_start_reading_local_is_in_the_local_manifest_in_the_full_manifests_place_and_the_full_one_is_not():
     full_ids, ids = _manifest_ids(FULL_MANIFEST), _manifest_ids(LOCAL_MANIFEST)
-    # the full manifest puts it right after the ENGRAM Reference; so does the local one
+    assert SSR_LOCAL_ID in ids and SSR_ID not in ids
+    assert SSR_LOCAL_ID not in full_ids and SSR_ID in full_ids
+    # the full manifest puts the section right after the ENGRAM Reference; so does the local one
     assert full_ids.index(SSR_ID) == full_ids.index("engram-reference") + 1
-    assert ids.index(SSR_ID) == ids.index("engram-reference") + 1
-    # and its place among the components the two manifests share is the full manifest's place
-    shared = [i for i in ids if i in set(full_ids)]
-    assert shared == [i for i in full_ids if i in set(shared)]
-    assert shared.index(SSR_ID) == shared.index("engram-reference") + 1
+    assert ids.index(SSR_LOCAL_ID) == ids.index("engram-reference") + 1
 
 
 # --- the profile is a SUBSET of the full template: every component is a full component or a bound variant of one
@@ -673,6 +702,7 @@ BOUND_VARIANT_OF = {
     GATE_ID: "model-identity-gate",
     BAN_ID: "fairy-tool-policy-claude-code",
     NOTES_ID: "cross-surface-persistence",
+    SSR_LOCAL_ID: SSR_ID,
 }
 
 
