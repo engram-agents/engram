@@ -167,11 +167,29 @@ def _is_uncalled_for_cache(obj) -> bool:
     return type(obj) is dict or type(obj).__module__.partition(".")[0] == "uncalled_for"
 
 
+def _known_shape(obj) -> bool:
+    """A shape the helper knows (#4909): a plain dict, or the 0.6.2 `FunctionCache` layout: two weak
+    stores plus a plain dict holding what cannot be weakly referenced. Any third shape is not known."""
+    if type(obj) is dict:
+        return True
+    return (
+        isinstance(getattr(obj, "_functions", None), weakref.WeakKeyDictionary)
+        and isinstance(getattr(obj, "_methods", None), weakref.WeakKeyDictionary)
+        and type(getattr(obj, "_unreferenceable", None)) is dict
+    )
+
+
+def _strong_store(obj):
+    """The store that holds callables strongly: the dict itself, or the object's `_unreferenceable`."""
+    return obj if type(obj) is dict else obj._unreferenceable
+
+
 def test_c2_real_introspection_dicts_exist():
     # #4909: 0.6.2 made these `FunctionCache` objects; both shapes count, neither may be absent.
     import uncalled_for.introspection as i
 
-    assert _is_uncalled_for_cache(i._signature_cache) and _is_uncalled_for_cache(i._parameter_cache)
+    for cache in (i._signature_cache, i._parameter_cache):
+        assert _known_shape(cache), f"a cache shape the helper does not know: {type(cache)!r}"
 
 
 # ---- C2b (#4541): uncalled_for `*_cache` plain dicts, by rule ----------------------------
@@ -243,23 +261,24 @@ def test_r6_never_raises_on_hostile_modules(monkeypatch):
     assert good._z_cache == {}  # a hostile neighbour does not stop the sweep
 
 
-def _fill(obj, name, keep):
-    """Put one sentinel entry in a real cache of either shape; `keep` holds the key alive (weak caches)."""
+class _NotWeaklyReferenceable:
+    __slots__ = ()
+
+    def __call__(self):
+        pass
+
+
+def _fill_strong(obj, name):
+    """Put one entry in the store that holds callables strongly (the dict, or `_unreferenceable`)."""
     if type(obj) is dict:
         obj[("sentinel3807", name)] = 1
     else:
-        def key():  # a distinct function object per cache, referenced strongly by `keep`
-            return name
-
-        keep.append(key)
-        obj[key] = 1
+        obj[_NotWeaklyReferenceable()] = 1  # a slotted callable: `FunctionCache` cannot weak-key it
 
 
-def _size(obj) -> int:
-    return len(obj)
-
-
+# Name kept for the test-id set (test-id-set-check); it now pins a known shape and an empty strong store (#4909).
 def test_r7_every_real_uncalled_for_cache_dict_is_cleared():
+    # Not "no cache left non-empty": a weak store's length depends on what else is alive (#4909).
     import importlib
     import pkgutil
 
@@ -267,18 +286,28 @@ def test_r7_every_real_uncalled_for_cache_dict_is_cleared():
     mods = [uf]
     for info in pkgutil.walk_packages(uf.__path__, "uncalled_for."):
         mods.append(importlib.import_module(info.name))
-    filled, keep = [], []
-    for mod in mods:
-        for name, obj in list(vars(mod).items()):
-            if name.endswith("_cache") and _is_uncalled_for_cache(obj):
-                _fill(obj, name, keep)
-                filled.append((mod.__name__, name))
-    assert filled, "found no uncalled_for *_cache objects at all: the guard would pass vacuously"
-    assert all(_size(getattr(sys.modules[m], n)) >= 1 for m, n in filled), "the fill did not take"
+    found = [(m, n, o) for m in mods for n, o in list(vars(m).items())
+             if n.endswith("_cache") and _is_uncalled_for_cache(o)]
+    assert found, "found no uncalled_for *_cache objects at all: the guard would pass vacuously"
+    unknown = [(m.__name__, n, type(o).__name__) for m, n, o in found if not _known_shape(o)]
+    assert not unknown, f"uncalled_for cache of a shape the helper does not know: {unknown}"
+    for _m, n, o in found:
+        _fill_strong(o, n)
+    assert all(len(_strong_store(o)) >= 1 for _m, _n, o in found), "the fill did not take"
     rsc.release_retained_server_copies()
-    left = [(m.__name__, n) for m in mods for n, o in vars(m).items()
-            if n.endswith("_cache") and _is_uncalled_for_cache(o) and _size(o)]
-    assert not left, f"uncalled_for caches survived the release: {left}"
+    left = [(m.__name__, n) for m, n, o in found if len(_strong_store(o))]
+    assert not left, f"uncalled_for strong stores survived the release: {left}"
+
+
+def test_r7b_the_shape_canary_fires_on_a_third_shape():
+    """Pins the canary itself: a cache that is neither a dict nor the known layout is not 'known'."""
+    class Third:
+        pass
+
+    Third.__module__ = "uncalled_for.caching"
+    assert not _known_shape(Third())
+    assert not _known_shape([])
+    assert _known_shape({}) and _known_shape(_function_cache_class()())
 
 
 # ---- C2c (#4909): the cache object shape `uncalled_for` 0.6.2 introduced ----------------------
