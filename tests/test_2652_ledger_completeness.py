@@ -1241,9 +1241,10 @@ def _real_checker():
     return mod
 
 
-def test_i8_real_ledger_direct_count_is_15_and_equals_the_ceiling_unchanged():
-    # The decision on #4799 was ROUTE 1: the ceiling stays 15. Population: the
-    # Section-2 rows whose state cell is exactly plain `direct`.
+def test_i8_real_ledger_direct_count_is_14_and_equals_the_ceiling():
+    # The decision on #4799 was ROUTE 1: the ceiling stayed 15. #2652 unit 04 then removed row 81 (the
+    # installer's own count, now tools/store_read.py node-count), so direct and the ceiling are 14.
+    # Population: the Section-2 rows whose state cell is exactly plain `direct`.
     mod = _real_checker()
     text = _real_ledger_text()
     states, problems = mod.row_states(text)
@@ -1251,8 +1252,8 @@ def test_i8_real_ledger_direct_count_is_15_and_equals_the_ceiling_unchanged():
     plain_direct = [n for n, v in states if v == "direct"]
     ceiling, problem = mod.section1_ceiling(text)
     assert problem is None, problem
-    assert len(plain_direct) == 15, plain_direct
-    assert ceiling == 15
+    assert len(plain_direct) == 14, plain_direct
+    assert ceiling == 14
 
 
 def test_i9_real_row_87_is_direct_by_design_under_independent_check_and_ro():
