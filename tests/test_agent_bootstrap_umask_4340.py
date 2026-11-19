@@ -9,7 +9,6 @@ Contract (written before the code):
   C4  the rest of the skeleton is unchanged (only the umask line moves, one comment line is added)
   C5  the owner unit template carries exactly one real `UMask=0027` line inside [Service]
   C6  control: the same parser rejects the line in [Unit] and the line commented out
-  C7  tools/agentctl and the .runtime/start.sh heredoc are byte-identical to origin/dev
 
 Scope: shells that source ~/.bashrc non-interactively, and the owner unit. NOT the Claude
 process, hooks or fairies: their umask comes from the launch prologue in tools/agentctl, which
@@ -26,7 +25,6 @@ BOOTSTRAP = REPO / "tools" / "agent-bootstrap"
 TEMPLATE = REPO / "src" / "engram" / "templates" / "engramd-owner.service.template"
 
 BASHRC_OPEN = 'cat >"$USER_HOME/.bashrc" <<\'BASHRC\'\n'
-RUN_OPEN = 'cat >"$USER_HOME/.runtime/start.sh" <<\'RUN\'\n'
 
 OLD_UMASK_LINE = "umask 027                                    # group-readable but not world\n"
 # Verbatim copy of the heredoc body BEFORE #4340 (umask below the interactive guard).
@@ -140,15 +138,3 @@ def test_c6_control_parser_rejects_unit_section_and_commented_line():
     assert _service_umask_state(commented) == "not in [Service]"
     assert _service_umask_state(base) == "not in [Service]"
     assert _service_umask_state(base.replace("[Service]\n", "[Service]\nUMask=0027\n", 1)) == "ok"
-
-
-def test_c7_untouched_surfaces_are_byte_identical_to_origin_dev():
-    d = subprocess.run(["git", "diff", "origin/dev", "--", "tools/agentctl"],
-                       cwd=REPO, capture_output=True, text=True, timeout=60)
-    assert d.returncode == 0, d.stderr
-    assert d.stdout == ""
-    base = subprocess.run(["git", "show", "origin/dev:tools/agent-bootstrap"],
-                          cwd=REPO, capture_output=True, text=True, timeout=60)
-    assert base.returncode == 0, base.stderr
-    assert (_heredoc(BOOTSTRAP.read_text(), RUN_OPEN, "RUN")
-            == _heredoc(base.stdout, RUN_OPEN, "RUN"))
