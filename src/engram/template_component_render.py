@@ -46,6 +46,7 @@ Design notes (from #2140 sec3's six standing rulings + PR1's own local calls):
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -71,16 +72,71 @@ class TemplateComponentError(Exception):
     """
 
 
-def _manifest_path(harness: str, surface: str) -> Path:
-    return MANIFESTS_DIR / f"{harness}.{surface}.json"
+# A profile is a plain name: it becomes one dotted segment of a manifest file name, so
+# anything with a path character (or a dot, or nothing at all) is refused before a path
+# is built.
+_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
-def _load_manifest(harness: str, surface: str) -> dict[str, Any]:
-    path = _manifest_path(harness, surface)
+def _check_profile(profile: Any) -> None:
+    if not isinstance(profile, str) or _PROFILE_NAME.fullmatch(profile) is None:
+        raise TemplateComponentError(
+            f"profile {profile!r} is not a plain name (letters, digits, '-' and '_' only); "
+            "refusing before any manifest path is built"
+        )
+
+
+_PLACEHOLDER = re.compile(r"\{\{[^{}\n]+\}\}")
+
+
+def _known_placeholders() -> set[str]:
+    """Every ``{{NAME}}`` placeholder some component file already uses (the only ones a header may carry)."""
+    found: set[str] = set()
+    if COMPONENTS_DIR.exists():
+        for path in sorted(COMPONENTS_DIR.glob("*.md")):
+            found.update(_PLACEHOLDER.findall(path.read_text(encoding="utf-8")))
+    return found
+
+
+def _check_header(header: Any, profile: str | None) -> str:
+    """Validate a manifest's optional ``header`` and return it.
+
+    The header is one line that opens the rendered file of a profile (the line naming the profile and its
+    purpose). It must be a non-empty string with no line break, and may carry only placeholders the
+    components already use. The default manifest takes none: the full render must stay byte-identical.
+    """
+    if profile is None:
+        raise TemplateComponentError(
+            "the default manifest carries a 'header': only a profile manifest may have one, so the "
+            "default render stays byte-identical"
+        )
+    if not isinstance(header, str) or not header.strip():
+        raise TemplateComponentError(
+            f"manifest 'header' must be a non-empty string, got {header!r}"
+        )
+    if "\n" in header or "\r" in header:
+        raise TemplateComponentError("manifest 'header' must be a single line (it holds a line break)")
+    unknown = sorted(set(_PLACEHOLDER.findall(header)) - _known_placeholders())
+    if unknown:
+        raise TemplateComponentError(
+            f"manifest 'header' uses placeholder(s) no component uses: {unknown}"
+        )
+    return header
+
+
+def _manifest_path(harness: str, surface: str, profile: str | None = None) -> Path:
+    if profile is None:
+        return MANIFESTS_DIR / f"{harness}.{surface}.json"
+    return MANIFESTS_DIR / f"{harness}.{surface}.{profile}.json"
+
+
+def _load_manifest(harness: str, surface: str, profile: str | None = None) -> dict[str, Any]:
+    path = _manifest_path(harness, surface, profile)
     if not path.exists():
         raise TemplateComponentError(
             f"no manifest found for harness={harness!r} surface={surface!r} "
-            f"(expected {path})"
+            + (f"profile={profile!r} " if profile is not None else "")
+            + f"(expected {path})"
         )
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -149,8 +205,18 @@ def _all_referenced_component_ids() -> set[str]:
     return referenced
 
 
-def render(harness: str, surface: str) -> tuple[str, dict[str, Any]]:
+def render(
+    harness: str, surface: str, profile: str | None = None
+) -> tuple[str, dict[str, Any]]:
     """Render a template surface for a harness from its components.
+
+    ``profile`` selects a second manifest over the same components
+    (``manifests/<harness>.<surface>.<profile>.json``); ``None`` is the default
+    manifest and returns today's bytes. A profile manifest may carry an optional
+    one-line ``"header"`` string, rendered as the first line of the file followed by
+    a blank line (validated: see ``_check_header``; the default manifest takes none). A profile that is not a plain name, or
+    names no manifest, raises ``TemplateComponentError`` -- it never falls back
+    to the default manifest.
 
     Returns ``(rendered_text, build_receipt)`` where ``build_receipt`` is
     ``{"components": [{"id": ..., "version": ...}], "excluded": [...]}``.
@@ -166,7 +232,10 @@ def render(harness: str, surface: str) -> tuple[str, dict[str, Any]]:
       build FAILURE, not a fact merely noted in the receipt of a return that
       otherwise succeeds.
     """
-    manifest = _load_manifest(harness, surface)
+    if profile is not None:
+        _check_profile(profile)
+    manifest = _load_manifest(harness, surface, profile)
+    header = _check_header(manifest["header"], profile) if "header" in manifest else None
 
     included: list[dict[str, Any]] = []
     bodies: list[str] = []
@@ -196,5 +265,13 @@ def render(harness: str, surface: str) -> tuple[str, dict[str, Any]]:
     # loop-mode-arm-claude-code) where the source has ZERO blank lines
     # because it's a continued numbered list, not a new block.
     rendered = "\n".join(bodies) + "\n"
+    if profile is not None:
+        # A profile can end on a component that, in the default document, is followed by
+        # another one -- so it owns a trailing blank separator there. Close the document
+        # with exactly one newline. (The default render is left exactly as it was.)
+        rendered = rendered.rstrip("\n") + "\n"
+    if header is not None:
+        # The manifest's one-line header opens the file, then one blank line, then the first component.
+        rendered = header + "\n\n" + rendered
     receipt: dict[str, Any] = {"components": included, "excluded": []}
     return rendered, receipt

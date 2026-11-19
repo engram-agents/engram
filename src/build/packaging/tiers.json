@@ -1498,6 +1498,10 @@
       "tier": "essential"
     },
     {
+      "path": "templates/template.CLAUDE.local.md",
+      "tier": "essential"
+    },
+    {
       "path": "templates/compact-instructions.md",
       "tier": "essential"
     },

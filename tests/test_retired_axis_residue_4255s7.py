@@ -57,6 +57,13 @@ ALLOWED = (
     ("tools/test_pre_dispatch_check.py", "it no longer says single-agent", _RETIRE + ": docstring of the absence assert"),
     ("tools/test_pre_dispatch_check.py", '"single-agent" not in result.stdout', _RETIRE + ": the absence assert"),
     ("tools/claude_md_moves.json", "so a single-agent contributor is just as", "a pinned verbatim quote of the last sentence of a block moved out of CLAUDE.md; the checker matches it byte for byte"),
+    # -- the `local` CLAUDE.md profile's header: the one sentence that may carry the word (#4802) ----------
+    # Lei's 11-17 ruling (relayed by Kepler): the profile is "a purely local, single-agent setup". Exactly the two lines
+    # that carry that sentence, matched whole; any other use of the word under src/ or tools/ still fails.
+    ("src/engram/templates/manifests/claude-code.CLAUDE.md.local.json", '"header": "> Profile: local. A purely local, single-agent setup: one agent working with one user on one machine, no agent team, no long-running autonomous loop. Not fully tested. Made for the local benchmark effort (https://github.com/engram-agents/engram-benchmarks); see README-AGENT.md.",',
+     "Lei's 11-17 ruling (relayed by Kepler): the sentence 'a purely local, single-agent setup' in the profile's header field", True),
+    ("src/engram/templates/template.CLAUDE.local.md", '> Profile: local. A purely local, single-agent setup: one agent working with one user on one machine, no agent team, no long-running autonomous loop. Not fully tested. Made for the local benchmark effort (https://github.com/engram-agents/engram-benchmarks); see README-AGENT.md.',
+     "Lei's 11-17 ruling (relayed by Kepler): the same sentence, the rendered file's first line", True),
     # -- a real historical artifact --------------------------------------------------------------------
     ("src/engram/viz/agents.py", "viz-server-multi-agent-2026-05-04.md", "the real filename of a dated design note (active-work/); renaming it in prose would cite a file that does not exist"),
     # -- a fixture of the past -------------------------------------------------------------------------

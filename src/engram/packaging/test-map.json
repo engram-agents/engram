@@ -392,7 +392,7 @@
     },
     {
       "path_prefix_or_glob": "tools/check-claude-md-drift.py",
-      "test_globs": ["tests/test_check_claude_md_drift.py"],
+      "test_globs": ["tests/test_check_claude_md_drift.py", "tests/test_check_claude_md_drift_profile.py"],
       "note": "standalone subprocess CLI (not import-reachable); dedicated CLI test covers arg handling + exit codes 0/1/2 + drift-diff output"
     },
     {
@@ -1049,9 +1049,11 @@
       "test_globs": [
         "tests/test_tiers_manifest.py",
         "tests/test_bootstrap_codex.py",
-        "tests/test_3898_embedding_device.py"
+        "tests/test_3898_embedding_device.py",
+        "tests/test_template_components.py",
+        "tests/test_local_claude_md_profile.py"
       ],
-      "note": "Template changes trigger manifest gate and bootstrap codex tests; test_3898_embedding_device.py reads config.json.example for the embedding.device / cpu_threads keys"
+      "note": "Template changes trigger manifest gate and bootstrap codex tests; test_3898_embedding_device.py reads config.json.example for the embedding.device / cpu_threads keys. test_template_components.py pins the full render to template.CLAUDE.md, and test_local_claude_md_profile.py pins the local render to template.CLAUDE.local.md and runs bootstrap and the upgrade template-gate for the local profile (both read components/ and manifests/ as well)."
     },
     {
       "path_prefix_or_glob": "packaging/tiers.json",
