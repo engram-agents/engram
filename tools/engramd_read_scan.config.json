@@ -675,6 +675,7 @@
   "tools/inspect_raw.py:read_row",
   "tools/store_read.py:read_ids",
   "tools/store_read.py:read_axiom_count",
+  "tools/store_read.py:read_node_count",
   "tools/anchoring_report.py:_fetch_population",
   "tools/model_switch_read.py:fetch_nodes",
   "tools/install_selfcheck.py:_read_counts",

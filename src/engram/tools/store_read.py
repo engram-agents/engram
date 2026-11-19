@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Two typed reads of the live store, for the agent documents that used to open knowledge.db themselves
-(#2652 unit 02: ledger rows 1 and 42).
+"""Three typed reads of the live store, for the agent documents that used to open knowledge.db themselves
+(#2652 unit 02: ledger rows 1 and 42) and for the scripted installer's step-6 node count (#2652 unit 04: row 81).
 
     store_read.py ids --since <iso|""> [--db PATH]    the ids of the current, non-retracted observations
                                                       (observation_factual, observation_predictive) created at
                                                       or after --since, one per line, sorted ascending;
                                                       --since "" means the whole graph
     store_read.py axiom-count [--db PATH]             the number of axiom nodes (0 = an empty seed)
+    store_read.py node-count [--db PATH]              the number of rows in `nodes` (0 = an empty store, which the
+                                                      installer re-seeds); NOT axiom-count, which reads 0 for a
+                                                      store that has nodes but no axioms
 
-There is no free SQL subcommand: exactly these two reads, each a literal statement registered as a read template
+There is no free SQL subcommand: exactly these three reads, each a literal statement registered as a read template
 (tools/engramd_read_scan.config.json roots them), so the engramd owner admits them byte for byte.
 
 Which path a run takes (the install self-check's ruled shape, #4118), decided once and named on ONE stderr line:
@@ -32,7 +35,8 @@ Exit codes: 0 ok; 1 the store path is not a usable store (missing, uncheckable, 
 sqlite cannot read as a store; the class is named on stderr); 2 usage (argparse) or a RELATIVE ENGRAM_HOME;
 3 the owner refused or its answer could not be used.
 
-Stdlib only; Python 3.9+.
+Stdlib only. Python 3.10+: the flag-ON path imports the runtime client, which needs 3.10 (the scripted
+installer already refuses a python3 older than 3.10.7 before its step 6 calls node-count).
 """
 
 import argparse
@@ -70,7 +74,7 @@ def _say(message: str) -> None:
 def _spec(home: Path):
     return owner_read.OwnerReadSpec(
         flag_key=FLAG_KEY, error_cls=StoreReadOwnerError, home=home,
-        never_empty="An unreadable store is a refusal here, never an empty id list or a zero axiom count.")
+        never_empty="An unreadable store is a refusal here, never an empty id list or a zero count.")
 
 
 def _open_ro(db_path):
@@ -95,8 +99,8 @@ def _decide(spec, db_path):
     return "refused", None, str(owner_read.failure(spec, client, result))
 
 
-# The two statements. Each is a literal at its execute call so the read-template scanner registers it
-# (tools/engramd_read_scan.config.json roots these two functions).
+# The three statements. Each is a literal at its execute call so the read-template scanner registers it
+# (tools/engramd_read_scan.config.json roots these three functions).
 def read_ids(con, since):
     """The row-1 population: ids sorted ascending in Python. Both paths run the same statement."""
     rows = con.execute(
@@ -112,23 +116,45 @@ def read_ids(con, since):
     return sorted(ids)
 
 
-def read_axiom_count(con):
-    """The row-42 count of axiom nodes."""
-    rows = con.execute("SELECT COUNT(*) FROM nodes WHERE type='axiom'").fetchall()
+def _one_integer(rows):
     if (not isinstance(rows, (list, tuple)) or len(rows) != 1 or not isinstance(rows[0], (list, tuple))
             or len(rows[0]) != 1 or isinstance(rows[0][0], bool) or not isinstance(rows[0][0], int)):
         raise ValueError("the answer is not one integer")
     return rows[0][0]
 
 
+def read_axiom_count(con):
+    """The row-42 count of axiom nodes."""
+    return _one_integer(con.execute("SELECT COUNT(*) FROM nodes WHERE type='axiom'").fetchall())
+
+
+def read_node_count(con):
+    """The installer's row-81 count of all rows in `nodes`.
+
+    On the direct path, a store with no `nodes` table (a zero-byte file, an aborted seed) counts 0: such a file is an
+    empty store, and re-seeding it is what the installer has always done. That is the ONE read problem that yields 0.
+    Every other failure raises, because 0 means re-seed, and a store we could not read must never be re-seeded over.
+    Through the owner the same missing table is the owner's error, so it is a refusal (exit 3), never 0: the safe
+    side."""
+    try:
+        rows = con.execute("SELECT COUNT(*) FROM nodes").fetchall()
+    except sqlite3.OperationalError as exc:
+        if str(exc) != "no such table: nodes":
+            raise
+        return 0
+    return _one_integer(rows)
+
+
 def _parser():
-    p = argparse.ArgumentParser(prog="store_read.py", description="Two typed read-only reads of the ENGRAM store.")
+    p = argparse.ArgumentParser(prog="store_read.py", description="Three typed read-only reads of the ENGRAM store.")
     sub = p.add_subparsers(dest="cmd", required=True)
     ids = sub.add_parser("ids", help="ids of current non-retracted observations created at or after --since")
     ids.add_argument("--since", required=True, help='ISO timestamp; "" means the whole graph')
     ids.add_argument("--db", default=None, help="store path (default: $ENGRAM_HOME/knowledge.db)")
     cnt = sub.add_parser("axiom-count", help="the number of axiom nodes")
     cnt.add_argument("--db", default=None, help="store path (default: $ENGRAM_HOME/knowledge.db)")
+    nodes = sub.add_parser("node-count", help="the number of rows in nodes (the installer's empty-store check)")
+    nodes.add_argument("--db", default=None, help="store path (default: $ENGRAM_HOME/knowledge.db)")
     return p
 
 
@@ -156,8 +182,10 @@ def main(argv=None) -> int:
         if args.cmd == "ids":
             for one in read_ids(con, args.since):
                 print(one)
-        else:
+        elif args.cmd == "axiom-count":
             print(read_axiom_count(con))
+        else:
+            print(read_node_count(con))
     except StoreReadOwnerError as exc:
         _say("refused (%s)" % _one_line(exc))
         return REFUSED_EXIT
