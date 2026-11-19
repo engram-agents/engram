@@ -289,6 +289,9 @@ def _service_manager_guard(service_manager_shim_dir, monkeypatch):
 # `RuntimeError("#4475 guard: <relative path>: <reason>")`, at import (collection fails); the endpoint functions
 # never return an empty set for it, and a preset ENGRAM_LIVE_FORUM_ENDPOINTS_4475 cannot stand in for the
 # missing sources. Cells: the "fold 2" section of tests/test_live_forum_guard_4475.py and its two copies.
+# NOT checked: a constant that is present but names no host (e.g. "http://") yields no endpoint from that source
+# (the other source still gives the default pair); and src/engram/tools/forum.py defines a third
+# _DEFAULT_FORUM_URL that is not a source here (same value today; if it moves, the guard keeps the old pair).
 #
 # This definition is shared: src/forum/tests/conftest.py loads THIS file by path, assigns the same
 # `pytest_configure` / `pytest_unconfigure` hooks into its own namespace and installs the same guard (the
