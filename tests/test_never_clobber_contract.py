@@ -987,7 +987,8 @@ def test_static_write_sites_are_reviewed():
     py_bad = _py_violations(BOOTSTRAP_PY.read_text(), BOOTSTRAP_ALLOWLIST)
     install_text = INSTALL_SH.read_text()
     sh_bad = _sh_write_sites(install_text)
-    assert len(_heredoc_python_blocks(install_text)) >= 3, "the heredoc extractor found no PY_* blocks in install.sh"
+    # Two since #2652 unit 04 moved PY_NODE_COUNT into tools/store_read.py (PY_CONFIG, PY_PLUGIN_ENABLED remain).
+    assert len(_heredoc_python_blocks(install_text)) >= 2, "the heredoc extractor found too few PY_* blocks in install.sh"
     heredoc_bad = _heredoc_violations(install_text, INSTALL_SH_PY_ALLOWLIST)
     market_text = MARKETPLACE_SH.read_text()
     market_sh_bad = _sh_write_sites(market_text)
