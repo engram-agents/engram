@@ -462,10 +462,11 @@ cat >"$USER_HOME/.bashrc" <<'BASHRC'
 # `export GOOGLE_API_KEY=...` here. Headless CLI calls will silently
 # route to a metered API tier instead of the OAuth Max subscription
 # pool (billing-leak guard — never let a co-located agent inherit another's API key).
+# umask is ABOVE the guard: non-interactive shells that source this file return at it, so a line below never runs for them.
+umask 027                                    # group-readable but not world
 [ -z "$PS1" ] && return
 export PATH="$HOME/.local/bin:$PATH"
 export ENGRAM_HOME="$HOME/.engram"          # explicit, no fallback
-umask 027                                    # group-readable but not world
 PS1='\[\e[1;33m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
 BASHRC
 chown "$USER_NAME:$USER_NAME" "$USER_HOME/.bashrc"
