@@ -214,9 +214,36 @@ def _gate_mismatch_bullet() -> str:
     return _gate_lines_of(GATE_FULL_COMPONENT.read_text(encoding="utf-8"))[1]
 
 
+GATE_MATCH_START = "- **Match**"
+GATE_READ_START = "The procedure is the `engram-model-switch-read` skill:"
+GATE_READ_END = "which means the read failed as an instrument."
+
+
+def _gate_match_bullet() -> str:
+    """The whole Match bullet (its last clause says to run the self-recognition read below), from the FULL component file."""
+    lines = [ln for ln in GATE_FULL_COMPONENT.read_text(encoding="utf-8").split("\n") if ln.startswith(GATE_MATCH_START)]
+    assert len(lines) == 1
+    return lines[0]
+
+
+def _gate_read_sentence() -> str:
+    """The one sentence of the source's 'Why the gate exists' paragraph that names the skill, read at test time."""
+    text = GATE_FULL_COMPONENT.read_text(encoding="utf-8")
+    assert text.count(GATE_READ_START) == 1 and text.count(GATE_READ_END) == 1
+    start = text.index(GATE_READ_START)
+    end = text.index(GATE_READ_END, start) + len(GATE_READ_END)
+    sentence = text[start:end]
+    assert "\n" not in sentence and ". " not in sentence, "the carried text must be exactly one sentence"
+    assert text[end] == "\n", "the sentence ends its paragraph in the source"
+    return sentence
+
+
 def _gate_text() -> str:
-    """The two lines the local gate carries, as the full file lays them out: the paragraph, a blank line, the bullet."""
-    return _gate_paragraph() + "\n\n" + _gate_mismatch_bullet()
+    """What the local gate carries, as the full file lays it out: the paragraph; the Match and Mismatch bullets
+    (adjacent lines); a blank line; the one sentence that names the read's skill."""
+    return (
+        _gate_paragraph() + "\n\n" + _gate_match_bullet() + "\n" + _gate_mismatch_bullet() + "\n\n" + _gate_read_sentence()
+    )
 
 
 def _notes_sentence() -> str:
@@ -282,35 +309,79 @@ def test_gate_lines_are_the_ones_the_ruling_names():
     assert bullet.endswith("Changing family is an identity decision, never a silent swap.")
 
 
-def test_gate_component_body_is_the_heading_and_the_two_full_file_lines_byte_for_byte():
+def test_gate_match_bullet_and_read_sentence_are_the_ones_the_ruling_names():
+    match, sentence = _gate_match_bullet(), _gate_read_sentence()
+    assert match.startswith("- **Match** (same family, any point version")
+    assert match.endswith("run the self-recognition read below.")
+    assert sentence.startswith("The procedure is the `engram-model-switch-read` skill:")
+    assert sentence.endswith("which means the read failed as an instrument.")
+
+
+def test_gate_component_body_is_the_heading_and_the_full_file_items_byte_for_byte():
     fm, body = tcr._load_component(GATE_ID)
     # heading rule: the anchor heading is absent from the local file, so the component brings its own;
-    # the lines are laid out as the full file lays them out (paragraph, blank line, bullet); the body owns its
-    # trailing blank line (whitespace-ownership rule).
-    assert body == "## " + fm["anchor"] + "\n\n" + _gate_paragraph() + "\n\n" + _gate_mismatch_bullet() + "\n"
+    # the items are laid out as the full file lays them out (paragraph, blank line, Match and Mismatch bullets on
+    # adjacent lines, blank line, the one sentence); the body owns its trailing blank line (whitespace-ownership rule).
+    assert body == "## " + fm["anchor"] + "\n\n" + _gate_text() + "\n"
 
 
-def test_gate_component_version_was_bumped_past_the_one_sentence_version():
+def test_gate_component_body_lines_each_occur_verbatim_in_the_source_and_the_carried_sentence_is_in_it():
+    _, body = tcr._load_component(GATE_ID)
+    source = GATE_FULL_COMPONENT.read_text(encoding="utf-8")
+    source_lines = source.split("\n")
+    body_lines = [ln for ln in body.split("\n") if ln.strip()]
+    assert body_lines[0] == "## Model Identity Gate"
+    not_whole_lines = [ln for ln in body_lines if ln not in source_lines]
+    # exactly one body line is not a whole source line: the carried sentence, found verbatim inside the source's paragraph
+    assert not_whole_lines == [_gate_read_sentence()]
+    assert not_whole_lines[0] in source
+    assert len(body_lines) == 5  # heading, paragraph, Match, Mismatch, sentence: no other new words
+
+
+def test_gate_component_version_was_bumped_past_the_two_line_version():
     fm, _ = tcr._load_component(GATE_ID)
-    assert fm["version"] >= 2, "the component's text changed; its version must move"
+    assert fm["version"] >= 3, "the component's text changed again (the read pointer joined); its version must move"
 
 
-def test_gate_lines_render_once_each_in_local_and_once_each_in_the_full_template_and_render():
-    para, bullet = _gate_paragraph(), _gate_mismatch_bullet()
+def test_the_rendered_local_file_carries_the_match_bullet_and_the_sentence_naming_the_skill():
+    text = _local()
+    assert text.split("\n").count(_gate_match_bullet()) == 1
+    assert text.count(_gate_read_sentence()) == 1
+    assert text.count("`engram-model-switch-read`") == 1
+
+
+def test_the_match_bullets_read_below_is_followed_later_in_the_section_by_the_sentence():
+    lines = _local().splitlines()
+    start = lines.index("## Model Identity Gate") + 1
+    end = next(i for i in range(start, len(lines)) if lines[i].startswith("## "))
+    section = lines[start:end]
+    below = [i for i, ln in enumerate(section) if "run the self-recognition read below" in ln]
+    pointed = [i for i, ln in enumerate(section) if _gate_read_sentence() in ln]
+    assert len(below) == 1 and len(pointed) == 1, (below, pointed)
+    assert below[0] < pointed[0], "the 'below' in the Match bullet must point at text that follows it in the section"
+
+
+def test_gate_items_render_once_each_in_local_and_once_each_in_the_full_template_and_render():
+    para, match, bullet = _gate_paragraph(), _gate_match_bullet(), _gate_mismatch_bullet()
     local = _local()
-    for line in (para, bullet):
+    for line in (para, match, bullet):
         assert local.split("\n").count(line) == 1
         assert _full().split("\n").count(line) == 1
         # the committed full template carries them too, so a drift in the template alone is caught here as well
         assert FULL_TEMPLATE.read_text(encoding="utf-8").split("\n").count(line) == 1
-    assert ("## Model Identity Gate\n\n" + para + "\n\n" + bullet + "\n") in local
+    sentence = _gate_read_sentence()
+    assert local.count(sentence) == 1 and _full().count(sentence) == 1
+    assert FULL_TEMPLATE.read_text(encoding="utf-8").count(sentence) == 1
+    assert ("## Model Identity Gate\n\n" + _gate_text() + "\n") in local
 
 
-def test_gate_section_in_the_local_render_holds_exactly_the_two_lines():
+def test_gate_section_in_the_local_render_holds_exactly_the_four_items():
     lines = _local().splitlines()
     start = lines.index("## Model Identity Gate") + 1
     end = next(i for i in range(start, len(lines)) if lines[i].startswith("## "))
-    assert [ln for ln in lines[start:end] if ln.strip()] == [_gate_paragraph(), _gate_mismatch_bullet()]
+    assert [ln for ln in lines[start:end] if ln.strip()] == [
+        _gate_paragraph(), _gate_match_bullet(), _gate_mismatch_bullet(), _gate_read_sentence()
+    ]
 
 # --- heading rule: a profile-only component at an absent anchor brings its own heading ----------
 
@@ -1022,15 +1093,16 @@ def test_first_session_skill_does_not_say_the_local_file_has_no_model_identity_g
     assert "has no such section" not in skill
 
 
-def test_first_session_skill_pins_the_true_two_lines_claim_against_the_local_render():
-    """The skill says the local gate section holds two lines; the local render must keep that true."""
+def test_first_session_skill_pins_the_true_four_lines_claim_against_the_local_render():
+    """The skill says the local gate section holds four lines; the local render must keep that true."""
     skill = " ".join(FIRST_SESSION_SKILL.read_text(encoding="utf-8").split())
-    assert "in a local-profile file that section holds two lines" in skill
-    assert "one sentence" not in skill.split("Model Identity Gate", 1)[1][:400]
+    assert "in a local-profile file that section holds four lines" in skill
+    assert "two lines" not in skill.split("Model Identity Gate", 1)[1][:600]
+    assert "`engram-model-switch-read`" in skill.split("Model Identity Gate", 1)[1][:600]
     lines = _local().splitlines()
     start = lines.index("## Model Identity Gate") + 1
     end = next(i for i in range(start, len(lines)) if lines[i].startswith("## "))
-    assert len([ln for ln in lines[start:end] if ln.strip()]) == 2
+    assert len([ln for ln in lines[start:end] if ln.strip()]) == 4
 
 
 def _bootstrap_profile_facts() -> dict:
