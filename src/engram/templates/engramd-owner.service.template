@@ -59,6 +59,9 @@ RestartMaxDelaySec=300s
 # floor (the surface daemon unit's is 243, because of its ExecCondition).
 StandardOutput=append:{{ENGRAM_HOME}}/engramd-owner.log
 StandardError=append:{{ENGRAM_HOME}}/engramd-owner.log
+# The one long-running writer under the store: it inherits the user manager's umask (measured
+# 0002 on one seat), so the unit pins group-readable-not-world explicitly.
+UMask=0027
 
 # No User=/Group=: this is a `systemctl --user` unit and runs as the seat's own user.
 # U4a's peer-credential check compares the connecting uid with the owner's uid.
