@@ -142,6 +142,13 @@ Python deps are declared in `requirements/requirements.txt` (`fastmcp`, `sentenc
 `requirements/requirements-lock.txt` is Linux-x86_64 CI-only (pinned to the CPU-torch wheel that
 only resolves on Linux) — do not use it on macOS or Windows.
 
+SQL graph backups also need a working dump iterator in the interpreter that runs
+the ENGRAM venv. Native `Connection.iterdump` is used when present; otherwise
+ENGRAM can use that interpreter's installed CPython `sqlite3/dump.py` helper.
+This fallback is a measured CPython-3.12 compatibility path, not a new Python
+3.12 requirement. The install self-check performs a real scratch dump and
+restore, so `sql-backup` must pass rather than merely importing SQLite.
+
 On a Mac, also read [`docs/macos-agent-setup.md`](docs/macos-agent-setup.md): it
 carries the macOS-specific differences for the install and for the daily run.
 
@@ -501,7 +508,10 @@ routes to [Troubleshooting](#troubleshooting):
 4. **Hooks firing.** Open a fresh session; the SessionStart hook injects the
    session-start reading banner. If nothing injects, the plugin is
    installed-but-not-*enabled* — re-run `/plugin enable engram` and restart.
-5. **Surface daemon up.** `ls -l ~/.engram/recall-daemon.sock` shows a unix socket
+5. **SQL backup verified.** The install self-check's `sql-backup` line is `PASS`;
+   it reports a real scratch dump and restore from the installed venv, not just
+   SQLite importability.
+6. **Surface daemon up.** `ls -l ~/.engram/recall-daemon.sock` shows a unix socket
    (semantic recall is live). The first cold launch can take a few seconds to load
    the model; later launches hit the warm cache.
 

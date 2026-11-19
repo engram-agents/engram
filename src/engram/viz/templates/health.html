@@ -78,6 +78,9 @@
        Page-scoped (not base.css): this control only exists on health.html. */
     .health-header { display: flex; align-items: center; justify-content: space-between;
                       flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+    .backup-capability-banner { margin: -4px 0 20px; padding: 10px 14px; border-radius: 6px; font-size: 0.9em; }
+    .backup-capability-banner.available { background: #153d2a; color: #b9f6ca; }
+    .backup-capability-banner.unavailable { background: #4a2020; color: #ffb4b4; }
     .health-header h1 { margin-bottom: 0; }
     .health-header-controls { display: flex; align-items: center; gap: 12px; }
     .view-toggle { display: inline-flex; border: 1px solid #1a4a8a; border-radius: 4px;
@@ -194,6 +197,7 @@
       </div>
     </div>
   </div>
+  <div id="backup-capability-banner" class="backup-capability-banner" role="status"></div>
   <div id="normal-view">
     <div id="loading">Loading health data...</div>
     <div id="dashboard" style="display:none;">
@@ -241,6 +245,7 @@
         document.getElementById('loading').style.display = 'none';
         document.getElementById('dashboard').style.display = 'block';
         if (data.error) {
+          renderBackupCapability(data.backup_capability);
           document.getElementById('cards').innerHTML = '<div class="card"><p>' + data.error + '</p></div>';
           return;
         }
@@ -321,6 +326,7 @@
   loadHealth();
 
   function render(d, v2) {
+    renderBackupCapability(d.backup_capability);
     const cards = document.getElementById('cards');
     let html = '';
 
@@ -472,6 +478,23 @@
 
     // Draw trend line
     if (trend.length > 1) drawTrend(trend);
+  }
+
+  function renderBackupCapability(capability) {
+    const banner = document.getElementById('backup-capability-banner');
+    if (!capability || capability.available !== true) {
+      const cause = capability && capability.error ? capability.error : 'no diagnostic was returned';
+      banner.className = 'backup-capability-banner unavailable';
+      banner.textContent = 'SQL backup unavailable here: ' + cause +
+        ' (dashboard interpreter; not a selected agent or remote worker).';
+      return;
+    }
+    const runtime = [capability.python_version && ('Python ' + capability.python_version),
+                     capability.backend_sqlite_version && ('SQLite ' + capability.backend_sqlite_version),
+                     capability.iterator_kind].filter(Boolean).join('; ');
+    banner.className = 'backup-capability-banner available';
+    banner.textContent = 'SQL backup available in this dashboard interpreter' +
+      (runtime ? ' (' + runtime + ')' : '') + '.';
   }
 
   function metric(label, value, cls) {

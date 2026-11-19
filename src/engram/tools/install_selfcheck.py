@@ -228,6 +228,44 @@ def check_venv_imports(ctx):
     return PASS, ""
 
 
+_SQL_BACKUP_SNIPPET = """
+import json
+import sys
+sys.path.append(sys.argv[1])
+import engram_backup
+print(json.dumps(engram_backup.probe_sql_backup_capability()))
+"""
+
+
+def check_sql_backup(ctx):
+    """Run the installed runtime's real SQL-backup round-trip in its venv."""
+    problem = _venv_problem(ctx)
+    if problem:
+        return problem
+    try:
+        proc = _run_venv(ctx, _SQL_BACKUP_SNIPPET, str(ctx.plugin_dir), timeout=180)
+    except subprocess.TimeoutExpired:
+        return _fail("SQL backup capability probe timed out in the venv", "re-run tools/install-local-marketplace.sh and check the venv")
+    if proc.returncode != 0:
+        return _fail("SQL backup capability probe exited rc=%s: %s" % (proc.returncode, _tail(proc.stderr) or _tail(proc.stdout)),
+                     "re-run tools/install-local-marketplace.sh; the installed backup runtime is missing or broken")
+    try:
+        report = json.loads(proc.stdout)
+    except ValueError as exc:
+        return _fail("SQL backup capability probe printed non-JSON (%s): %s" % (exc, _tail(proc.stdout)),
+                     "re-run tools/install-local-marketplace.sh; the installed backup runtime is broken")
+    if not isinstance(report, dict):
+        return _fail("SQL backup capability probe returned JSON that is not an object",
+                     "re-run tools/install-local-marketplace.sh; the installed backup runtime is broken")
+    if report.get("available") is not True:
+        return _fail("SQL backup unavailable here: %s" % (report.get("error") or "probe did not report a cause"),
+                     "use an interpreter/backend with a working SQL dump capability, then re-run tools/install-local-marketplace.sh")
+    detail = "; ".join(str(v) for v in (
+        report.get("python_version"), report.get("backend_sqlite_version"), report.get("iterator_kind")
+    ) if v)
+    return PASS, detail
+
+
 _MODEL_SNIPPET = """
 import os
 import sys
@@ -821,6 +859,7 @@ def check_claude_md_present(ctx):
 COMMON_CHECKS = [
     ("python", check_python),
     ("venv-imports", check_venv_imports),
+    ("sql-backup", check_sql_backup),
     ("model-cached", check_model_cached),
     ("plugin-tree", check_plugin_tree),
     ("deployed-version", check_deployed_version),

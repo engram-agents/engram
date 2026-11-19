@@ -33,12 +33,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL = REPO_ROOT / "tools" / "install_selfcheck.py"
 
 ALL_INSTALLED = [
-    "python", "venv-imports", "model-cached", "plugin-tree", "deployed-version",
+    "python", "venv-imports", "sql-backup", "model-cached", "plugin-tree", "deployed-version",
     "marketplace-registered", "plugin-enabled", "mcp-handshake",
     "graph-opens", "seed-ids-present", "claude-md-present",
 ]
 ALL_PRE = [
-    "python", "venv-imports", "model-cached", "plugin-tree", "deployed-version",
+    "python", "venv-imports", "sql-backup", "model-cached", "plugin-tree", "deployed-version",
     "marketplace-registered", "plugin-enabled", "mcp-handshake",
     "seed-graph", "first-run-pending", "claude-md-rendered",
 ]
@@ -66,6 +66,12 @@ FAKE_CORE_PY = '''\
 DEFAULT_EMBEDDING_MODEL = "fake-model"
 def _get_embedding_config():
     return {"model": DEFAULT_EMBEDDING_MODEL}
+'''
+FAKE_BACKUP_PY = '''\
+def probe_sql_backup_capability():
+    return {"available": True, "error": None, "python_version": "3.test",
+            "backend_sqlite_version": "sqlite.test", "interpreter": "fake",
+            "iterator_kind": "native"}
 '''
 
 # A fake MCP server: reads one JSON-RPC line, records what it saw, answers by MODE.
@@ -167,6 +173,7 @@ class Seat:
         (self.plugin / "plugin.json").write_text(json.dumps({"name": "engram", "version": "9.9.9"}))
         (self.plugin / "server.py").write_text(FAKE_SERVER_PY)
         (self.plugin / "engram_core.py").write_text(FAKE_CORE_PY)
+        (self.plugin / "engram_backup.py").write_text(FAKE_BACKUP_PY)
         _exe(self.plugin / "fake-launch.sh", FAKE_LAUNCH_SH)
         (self.plugin / ".mcp.json").write_text(json.dumps(
             {"mcpServers": {"engram": {"command": "${CLAUDE_PLUGIN_ROOT}/fake-launch.sh", "args": []}}}))
@@ -300,7 +307,7 @@ def test_healthy_installed_seat_passes_every_check_in_order(seat):
     lines = _lines(r)
     names = [ln.split(" ", 1)[1].split(":")[0] for ln in lines if ln.startswith("PASS ")]
     assert names == ALL_INSTALLED
-    assert lines[-1] == "SELFCHECK PASS 11/11"
+    assert lines[-1] == "SELFCHECK PASS 12/12"
     assert not any(ln.startswith(("FAIL", "SKIP")) for ln in lines)
 
 
@@ -309,7 +316,7 @@ def test_healthy_pre_first_session_seat_passes_every_check_in_order(pre_seat):
     assert r.returncode == 0, (r.stdout, r.stderr)
     names = [ln.split(" ", 1)[1].split(":")[0] for ln in _lines(r) if ln.startswith("PASS ")]
     assert names == ALL_PRE
-    assert _lines(r)[-1] == "SELFCHECK PASS 11/11"
+    assert _lines(r)[-1] == "SELFCHECK PASS 12/12"
 
 
 def test_default_phase_is_installed(seat):
@@ -365,7 +372,41 @@ def test_venv_imports_runs_in_the_venv_not_the_callers_python(seat):
     assert _line_for(r, "venv-imports").startswith("FAIL venv-imports:")
 
 
-# ── 3 model-cached ───────────────────────────────────────────────────────────
+# ── 3 sql-backup ─────────────────────────────────────────────────────────────
+
+def test_sql_backup_snippet_appends_the_plugin_path():
+    """The installed plugin is added without taking precedence over the venv."""
+    mod = _load_tool("install_selfcheck_sql_backup_snippet")
+    assert "sys.path.append(sys.argv[1])" in mod._SQL_BACKUP_SNIPPET
+    assert "sys.path.insert(0, sys.argv[1])" not in mod._SQL_BACKUP_SNIPPET
+
+
+def test_sql_backup_fails_when_the_installed_runtime_reports_no_real_capability(seat):
+    (seat.plugin / "engram_backup.py").write_text(
+        "def probe_sql_backup_capability():\n"
+        "    return {'available': False, 'error': 'missing iterator', 'iterator_kind': None}\n"
+    )
+    line = _line_for(seat.run(), "sql-backup")
+    assert line.startswith("FAIL sql-backup:") and "SQL backup unavailable here: missing iterator" in line
+
+
+def test_sql_backup_fails_when_the_installed_backup_runtime_is_missing(seat):
+    (seat.plugin / "engram_backup.py").unlink()
+    line = _line_for(seat.run(), "sql-backup")
+    assert line.startswith("FAIL sql-backup:") and "exited rc=" in line
+
+
+def test_sql_backup_fails_when_the_probe_prints_non_json(seat):
+    (seat.plugin / "engram_backup.py").write_text(
+        "print('not json')\n"
+        "def probe_sql_backup_capability():\n"
+        "    return {'available': True}\n"
+    )
+    line = _line_for(seat.run(), "sql-backup")
+    assert line.startswith("FAIL sql-backup:") and "non-JSON" in line
+
+
+# ── 4 model-cached ───────────────────────────────────────────────────────────
 
 def test_model_cached_fails_when_the_model_is_not_in_the_cache(seat):
     (seat.hf / "cached-fake-model").unlink()
@@ -844,7 +885,7 @@ def test_summary_counts_failures_and_exit_code_is_one(seat):
     (seat.engram / ".deployed-version").unlink()
     seat.set_claude(marketplaces=[], plugins=[])
     r = seat.run()
-    assert _lines(r)[-1] == "SELFCHECK FAIL 3/11 failed"
+    assert _lines(r)[-1] == "SELFCHECK FAIL 3/12 failed"
     assert_only_fails(r, "deployed-version", "marketplace-registered", "plugin-enabled")
 
 
@@ -852,12 +893,12 @@ def test_one_failing_check_still_fails_the_run(seat):
     (seat.engram / ".deployed-version").unlink()
     r = seat.run()
     assert r.returncode == 1
-    assert _lines(r)[-1] == "SELFCHECK FAIL 1/11 failed"
+    assert _lines(r)[-1] == "SELFCHECK FAIL 1/12 failed"
 
 
 def test_skip_is_not_counted_in_the_denominator(seat):
     r = seat.run(ENGRAM_NO_EMBEDDINGS="1")
-    assert _lines(r)[-1] == "SELFCHECK PASS 10/10"
+    assert _lines(r)[-1] == "SELFCHECK PASS 11/11"
     assert r.returncode == 0
 
 
