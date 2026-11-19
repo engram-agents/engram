@@ -175,7 +175,7 @@ step confirms it and records it, and is the safety net if they hadn't chosen yet
        json.dump(cfg, f, indent=2)
    ```
 
-   This arms the **Model Identity Gate** (in your CLAUDE.md; in a local-profile file that section holds four lines, the paragraph that says to compare the model family at session start, the Match and Mismatch bullets, and one sentence that names the `engram-model-switch-read` skill, and the rest of the gate is not in the file, and recording `self_lineage` is still right) so a future
+   This arms the **Model Identity Gate** (in your CLAUDE.md; in a local-profile file that section holds five lines, the paragraph that says to compare the model family at session start, the Match, Mismatch and unset bullets, and one sentence that names the `engram-model-switch-read` skill, and the rest of the gate is not in the file, and recording `self_lineage` is still right) so a future
    cross-family session is caught, and it activates the standpoint `null=self`
    convention (your own unmarked observations now count as your own lineage). The
    value must be lowercase `provider:family`. There is **no write-time check** —
