@@ -17,6 +17,7 @@ nothing.
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -40,7 +41,7 @@ _spec.loader.exec_module(_mod)
 '''
 
 _PROBE_TEST = '''
-import json, os, sys, tempfile
+import json, os, stat, sys, tempfile
 from pathlib import Path
 
 
@@ -66,6 +67,7 @@ def test_probe():
                 "data_dir": str(engram_core.DATA_DIR),
                 "default_home": str(Path.home() / ".engram"),
                 "tempdir": tempfile.gettempdir(),
+                "home_mode": stat.S_IMODE(os.stat(os.environ["ENGRAM_HOME"]).st_mode),
                 "result": result,
             },
             fh,
@@ -118,6 +120,9 @@ def _assert_throwaway(probe, ambient_dir=None):
     if ambient_dir is not None:
         assert os.path.realpath(home) != os.path.realpath(str(ambient_dir))
     assert Path(probe["data_dir"]).resolve() == Path(home).resolve(), probe
+    # C7: the throwaway is private (0700); the conftest comment's cross-uid
+    # collision argument depends on it.
+    assert probe["home_mode"] == 0o700, f"child throwaway mode {probe['home_mode']:o}"
 
 
 def test_c1_exported_ambient_home_is_not_written(tmp_path):
@@ -197,6 +202,16 @@ def test_c5_this_session_runs_in_a_throwaway_home():
         assert os.path.realpath(fallback) != os.path.realpath(ambient), msg
 
 
+def test_c7_throwaway_home_is_private():
+    """C7: this session's throwaway home is mode 0700."""
+    mod = _find_conftest_module()
+    assert mod is not None, "tests/conftest.py not found among loaded modules"
+    fallback = getattr(mod, "_FALLBACK_ENGRAM_HOME", None)
+    assert fallback, "conftest has no _FALLBACK_ENGRAM_HOME"
+    mode = stat.S_IMODE(os.stat(fallback).st_mode)
+    assert mode == 0o700, f"{fallback} has mode {mode:o}, expected 700"
+
+
 def test_c6_counterfactual_file_isolates_what_the_code_reads(monkeypatch):
     """C6 (#4881 pin): the counterfactual file's setup_module() must redirect
     engram_core.DATA_DIR to its TEST_DIR (it set a variable nothing reads)."""
@@ -213,6 +228,11 @@ def test_c6_counterfactual_file_isolates_what_the_code_reads(monkeypatch):
 
             assert Path(engram_core.DATA_DIR).resolve() == Path(cf.TEST_DIR).resolve(), (
                 f"DATA_DIR={engram_core.DATA_DIR!r} is not the file's TEST_DIR={cf.TEST_DIR!r}"
+            )
+            # fresh_server() deletes TEST_DIR first, so only _ensure_data_dir()
+            # brings it back: pins that call as well as _configure_paths().
+            assert Path(cf.TEST_DIR).is_dir(), (
+                f"{cf.TEST_DIR} was not created: _ensure_data_dir() not called"
             )
         finally:
             cf.teardown_module()
