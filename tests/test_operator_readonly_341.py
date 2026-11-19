@@ -8,20 +8,29 @@ Cells:
     shell variable, so ``u:$SUDO_USER:rw`` and ``u:spt:rw`` are caught as well
     as the operator names. Group entries (``g:``) are out of scope. Roots: src,
     tools, deploy, tests/spawn, README.md, USER_GUIDE.md, docs.
-    Shell and other text: backslash-continued lines are joined, then every
-    logical line with ``setfacl`` is read; comment lines and echo/printf lines
-    are skipped. Python: parsed with ``ast``; for each call, the constant parts
-    of its arguments (``+``, f-strings, ``%``, ``.format``, lists, ``" ".join``
-    folded; variables become a placeholder) are read, so docstrings, comments and
-    print/logging text are never mistaken for a grant. The small ALLOW table
-    lists the known synthetic grants with a reason, and fails when an entry
-    stops matching.
+    Shell and other text: backslash-continued lines are joined, quote characters
+    and backslash escapes are removed the way a shell joins word pieces (so
+    ``'u:op:r'w``, ``"u:op:r"'w'`` and ``u:op:r\\w`` read as ``u:op:rw``; the line is
+    also read as written), then every logical line with ``setfacl`` is read;
+    comment lines and echo/printf lines are skipped. Python: parsed with ``ast``;
+    for each call, the constant parts of its arguments (``+``, f-strings, ``%``,
+    ``.format``, lists, ``" ".join`` folded; variables become a placeholder) are
+    read, so docstrings, comments and print/logging text are never mistaken for
+    a grant. An ACL taken from content the guard cannot read is a hit by itself:
+    any shipped ``--set-file``, ``--restore``, ``-M`` / ``--modify-file``,
+    ``-X`` / ``--remove-file`` or ``--set`` (``-b``, strip, stays allowed). The
+    small ALLOW table lists the known synthetic grants with a reason, and fails
+    when an entry stops matching; the tree has no such unreadable-ACL use today,
+    so none is listed.
     WHAT STILL ESCAPES (the guard is text and syntax, not execution): a grant
     assembled across separate statements or variables (``e = "u:x:rw"`` on one
     line, ``setfacl ... e`` on another); a grant built or run by a helper
     function the guard cannot see into; ``setfacl`` called through a name that is
     not the literal word (an alias, ``$SETFACL``); a grant read from a
-    file or the environment at run time; and binary or non-text files.
+    file or the environment at run time, other than through the flags above; and
+    binary or non-text files. A grant inside a here-document or a generated script string is
+    scanned only if the file that holds it is scanned (a root listed above and a
+    text file); a script written to disk at run time is not.
   * mocked bootstrap 5.7 cell (runs everywhere): the issued setfacl arguments.
   * agentctl finalize-name text cell (runs everywhere).
   * real-ACL cells 1-3 (Linux only, skipped without setfacl/getfacl).
@@ -69,7 +78,23 @@ def _perm_writes(perm: str) -> bool:
     return perm in "2367" if perm.isdigit() else "w" in perm
 
 
+# An ACL the guard cannot read: taken from a file or stdin (--set-file,
+# --restore, -M/--modify-file, -X/--remove-file) or replaced wholesale (--set).
+# ``-b`` (strip) is not in this list and stays allowed.
+_UNREADABLE_LONG = re.compile(
+    r"(?<!\S)--(?:set|set-file|restore|modify-file|remove-file)(?![A-Za-z0-9_-])")
+_UNREADABLE_SHORT = re.compile(r"(?<!\S)-[A-Za-z]*[MX]")
+
+
+def _unquote(text: str) -> str:
+    """Join shell word pieces the way a shell does: drop quote characters and
+    backslash escapes (``'u:op:r'w`` and ``u:op:r\\w`` both become ``u:op:rw``)."""
+    return re.sub(r"\\(.)", r"\1", text, flags=re.S).replace("'", "").replace('"', "")
+
+
 def _segment_hits(segment: str) -> bool:
+    if _UNREADABLE_LONG.search(segment) or _UNREADABLE_SHORT.search(segment):
+        return True
     for m in _USER_ENTRY.finditer(segment):
         if _perm_writes(m.group(2)):
             return True
@@ -107,14 +132,20 @@ def _scan_shell_like(text: str):
             logical = logical[:-1] + physical[i]
         i += 1
         stripped = logical.strip()
-        if not stripped or stripped.startswith("#") or "setfacl" not in stripped:
+        if stripped.startswith("#"):
             continue
-        if re.match(r"(echo|printf)\b", stripped):
+        joined = _unquote(logical)
+        if not stripped or "setfacl" not in joined:
             continue
-        code = re.sub(r"\s#.*$", "", logical)
-        for seg in _setfacl_segments(code):
-            if _segment_hits(seg):
-                hits.append((start + 1, seg.strip()))
+        if re.match(r"(echo|printf)\b", _unquote(stripped)):
+            continue
+        # Read the line both as written (Python-like lines in docs) and with the
+        # shell's quote/backslash joining applied; either reading can be a hit.
+        for text in (logical, joined):
+            code = re.sub(r"\s#.*$", "", text)
+            for seg in _setfacl_segments(code):
+                if _segment_hits(seg) and (start + 1, seg.strip()) not in hits:
+                    hits.append((start + 1, seg.strip()))
     return hits
 
 
@@ -160,7 +191,7 @@ def _scan_python(text: str):
         folded = " ".join(_flat(a) for a in node.args + [k.value for k in node.keywords])
         if "setfacl" not in folded:
             continue
-        for seg in _setfacl_segments(folded):
+        for seg in _setfacl_segments(_unquote(folded)):
             if _segment_hits(seg):
                 found[seg.strip()] = node.lineno  # inner calls are walked later, so they win
     return sorted((ln, seg) for seg, ln in found.items())
@@ -335,6 +366,54 @@ class TestStructuralGuard:
             assert [h for h in scan_tree(tmp_path) if h[0] == rel], rel
             f.unlink() if old is None else f.write_text(old)
 
+    # ---- round 3: two escapes found by the round-2 review ----
+
+    @pytest.mark.parametrize("planted", [
+        "setfacl -m 'u:op:r'w f",
+        "setfacl -m \"u:op:r\"'w' f",
+        "setfacl -m u:op:r\\w f",
+        "setfacl -m u:${OP}:'rw' f",
+        "setfacl -m 'm::r'wx f",
+        "set'fa'cl -m u:op:rw f",
+    ])
+    def test_gap_f_word_split_by_quoting_or_backslash(self, planted):
+        assert scan_source(planted + "\n", "x.sh"), planted
+
+    @pytest.mark.parametrize("quiet", [
+        "setfacl -m 'u:op:r'X f",
+        "setfacl -m 'u:op:r'x f",
+        "setfacl -m \"u:op:r\"'-' f",
+        "echo 'setfacl -m u:op:r'w f",
+    ])
+    def test_gap_f_split_but_read_only_stays_quiet(self, quiet):
+        assert scan_source(quiet + "\n", "x.sh") == [], quiet
+
+    @pytest.mark.parametrize("planted,name", [
+        ('getfacl -p src | setfacl --set-file=- dst', "x.sh"),
+        ('setfacl --set-file=/etc/acl.txt "$f"', "x.sh"),
+        ('setfacl --restore=backup.acl', "x.sh"),
+        ('setfacl -M acl.txt "$f"', "x.sh"),
+        ('setfacl -X acl.txt "$f"', "x.sh"),
+        ('setfacl --set "u:op:rw" "$f"', "x.sh"),
+        ('setfacl --set "$spec" "$f"', "x.sh"),
+        ('setfacl -RM acl.txt "$d"', "x.sh"),
+        ('setfacl --modify-file=acl.txt "$f"', "x.sh"),
+        ('run(["setfacl", "--set-file=-", dst])', "x.py"),
+        ('run("getfacl -p a | setfacl -M - b", shell=True)', "x.py"),
+    ])
+    def test_gap_g_acl_taken_from_unreadable_content(self, planted, name):
+        assert scan_source(planted + "\n", name), planted
+
+    @pytest.mark.parametrize("quiet", [
+        'setfacl -b "$f"',
+        'setfacl -R -m "u:op:rX" "$f"',
+        'echo "setfacl --set-file=- dst"',
+        '# setfacl -M file f',
+        'setfacl -m "u:op:rX,m::rX" --max-x "$f"',
+    ])
+    def test_gap_g_ordinary_read_only_forms_stay_quiet(self, quiet):
+        assert scan_source(quiet + "\n", "x.sh") == [], quiet
+
     def test_allow_table_entry_that_matches_nothing_fails(self, tmp_path):
         (tmp_path / "tools").mkdir()
         (tmp_path / "tools" / "a.sh").write_text('setfacl -m "u:root:rw" "$f"\n')
@@ -361,6 +440,8 @@ class TestStructuralGuard:
             ("tools/split.sh", 'setfacl -m \\\n  "u:${OP}:rw" \\\n  "$f"\n'),
             ("src/concat.py", 'run(["setfacl", "-m",\n     "u:" + who + ":rw", p])\n'),
             ("deploy/mask.sh", 'setfacl \\\n  -m "m::rwx" "$f"\n'),
+            ("tools/quoted.sh", "setfacl -m 'u:op:r'w \"$f\"\n"),
+            ("deploy/setfile.sh", 'getfacl -p a | setfacl --set-file=- "$f"\n'),
         ]:
             f = tmp_path / rel
             f.parent.mkdir(exist_ok=True)
