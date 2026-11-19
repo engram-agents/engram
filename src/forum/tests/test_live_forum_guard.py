@@ -105,8 +105,9 @@ def test_guard_is_active_in_this_tree():
 
 
 @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1"])
-def test_G1_connect_to_the_live_port_is_refused_and_names_the_guard(host):
+def test_G1_connect_to_the_live_port_is_refused_and_names_the_guard(host, monkeypatch):
     _require_guard()
+    G.install_live_forum_guard(monkeypatch, force=True)  # own wrapper, own list: the session list stays clean
     fam = socket.AF_INET6 if ":" in host else socket.AF_INET
     try:
         s = socket.socket(fam, socket.SOCK_STREAM)
@@ -121,8 +122,9 @@ def test_G1_connect_to_the_live_port_is_refused_and_names_the_guard(host):
 
 
 @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1"])
-def test_G1_connect_ex_to_the_live_port_returns_econnrefused(host):
+def test_G1_connect_ex_to_the_live_port_returns_econnrefused(host, monkeypatch):
     _require_guard()
+    G.install_live_forum_guard(monkeypatch, force=True)  # own wrapper, own list: the session list stays clean
     fam = socket.AF_INET6 if ":" in host else socket.AF_INET
     try:
         s = socket.socket(fam, socket.SOCK_STREAM)
@@ -135,8 +137,9 @@ def test_G1_connect_ex_to_the_live_port_returns_econnrefused(host):
     assert _refused_count() == before + 1
 
 
-def test_G4_unmocked_urlopen_of_the_default_forum_url_is_refused_by_the_guard():
+def test_G4_unmocked_urlopen_of_the_default_forum_url_is_refused_by_the_guard(monkeypatch):
     _require_guard()
+    G.install_live_forum_guard(monkeypatch, force=True)  # own wrapper, own list: the session list stays clean
     before = _refused_count()
     with pytest.raises(urllib.error.URLError) as ei:
         urllib.request.urlopen("http://localhost:5002/api/agents/status", timeout=2)
@@ -146,8 +149,9 @@ def test_G4_unmocked_urlopen_of_the_default_forum_url_is_refused_by_the_guard():
     assert _refused_count() == before + 1  # the guard refused it; no connect ever ran
 
 
-def test_other_stdlib_connect_paths_are_refused():
+def test_other_stdlib_connect_paths_are_refused(monkeypatch):
     _require_guard()
+    G.install_live_forum_guard(monkeypatch, force=True)  # own wrapper, own list: the session list stays clean
     with pytest.raises(ConnectionRefusedError, match="#4475"):
         socket.create_connection(("127.0.0.1", 5002), timeout=2)
     conn = http.client.HTTPConnection("localhost", 5002, timeout=2)
@@ -358,8 +362,9 @@ _spec = importlib.util.spec_from_file_location("_lfg_child_conftest_under_test",
 _mod = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _mod
 _spec.loader.exec_module(_mod)
-if hasattr(_mod, "pytest_configure"):
-    pytest_configure = _mod.pytest_configure
+for _name in ("pytest_configure", "pytest_sessionfinish", "_live_forum_guard"):
+    if hasattr(_mod, _name):
+        globals()[_name] = getattr(_mod, _name)
 
 
 def pytest_unconfigure(config):
@@ -378,14 +383,15 @@ import pytest
 
 def _probe():
     out = {}
-    with socket.socket() as s:
-        try:
-            s.connect(("127.0.0.1", 5002))
-            out["connect"] = "connected"
-        except ConnectionRefusedError as e:
-            out["connect"] = type(e).__name__
-    with socket.socket() as s:
-        out["connect_ex"] = s.connect_ex(("127.0.0.1", 5002))
+    if os.environ.get("LFG_MODE") != "quiet":
+        with socket.socket() as s:
+            try:
+                s.connect(("127.0.0.1", 5002))
+                out["connect"] = "connected"
+            except ConnectionRefusedError as e:
+                out["connect"] = type(e).__name__
+        with socket.socket() as s:
+            out["connect_ex"] = s.connect_ex(("127.0.0.1", 5002))
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
@@ -430,6 +436,12 @@ class TestInClass(unittest.TestCase):
 
 def test_function(_module_fixture, _session_fixture):
     _note("test_function")
+
+
+def test_zz_session_list(request):
+    lst = getattr(request.config, "_live_forum_guard_refused_4475", None)
+    with open(os.environ["LFG_RES"], "a") as fh:
+        fh.write(json.dumps({"where": "session_list", "entries": None if lst is None else [list(e) for e in lst]}) + "\\n")
 '''
 
 _LFG_WHERE = ["import", "setup_module", "module_fixture", "session_fixture", "setUpClass", "test_function"]
@@ -440,13 +452,13 @@ def _forum_conftest():
     return REPO_ROOT / "src" / "forum" / "tests" / "conftest.py"
 
 
-def _child_run(conftest_path):
+def _child_run(conftest_path, mode="live"):
     """Run the probe under a child pytest; returns (results by place, stub-recorded live attempts, the run)."""
     import os
     import subprocess
     import sys
 
-    key = str(conftest_path)
+    key = (str(conftest_path), mode)
     if key in _LFG_CHILD_CACHE:
         return _LFG_CHILD_CACHE[key]
     work = Path(tempfile.mkdtemp(prefix="lfg4475child"))
@@ -454,7 +466,7 @@ def _child_run(conftest_path):
         (work / "conftest.py").write_text(_CHILD_CONFTEST)
         (work / "test_probe.py").write_text(_CHILD_PROBE)
         env = {k: v for k, v in os.environ.items() if k != "PYTEST_ADDOPTS"}
-        env.update(LFG_REC=str(work / "rec.jsonl"), LFG_RES=str(work / "res.jsonl"), LFG_CONFTEST=str(conftest_path))
+        env.update(LFG_REC=str(work / "rec.jsonl"), LFG_RES=str(work / "res.jsonl"), LFG_CONFTEST=str(conftest_path), LFG_MODE=mode)
         r = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(work),
              "--confcutdir", str(work), str(work / "test_probe.py")],
@@ -508,3 +520,89 @@ def test_installing_the_guard_twice_stays_a_no_op():
             G.install_live_forum_guard(inner)  # already in place: nothing installed
             assert (socket.socket.connect, socket.socket.connect_ex) == first
         assert (socket.socket.connect, socket.socket.connect_ex) == first
+
+
+# ---------------------------------------------------------------- fold 1b on #4903 (A): the endpoint set ALWAYS holds the
+# default pair, whatever the snapshot variable carries; (B): refusals under the session install are reported.
+
+
+def _guard_module_with_snapshot(monkeypatch, tmp_path, raw):
+    monkeypatch.setenv("ENGRAM_HOME", str(tmp_path))  # an empty home: a fresh resolve yields the default pair only
+    monkeypatch.delenv("FORUM_URL", raising=False)
+    monkeypatch.setenv(G._LFG_SNAPSHOT_KEY, raw)
+    return _load_guard_module()  # importing it takes the snapshot: a malformed value must not crash this
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["[]", '[["forum.example.test", 5055]]', "{not json", '{"a": 1}', '"text"', "null", '[["only-one"]]', '[["localhost", "x"]]', "[[1, 5002]]"],
+)
+def test_A_whatever_the_snapshot_variable_holds_the_default_pair_is_still_refused(monkeypatch, tmp_path, raw):
+    mod = _guard_module_with_snapshot(monkeypatch, tmp_path, raw)
+    eps = mod.session_live_forum_endpoints()
+    assert ("localhost", 5002) in eps, eps
+    for host in ("localhost", "127.0.0.1", "::1"):
+        assert mod.is_live_forum_target((host, 5002), eps), host
+
+
+def test_A_a_preset_may_add_endpoints_and_the_default_stays(monkeypatch, tmp_path):
+    mod = _guard_module_with_snapshot(monkeypatch, tmp_path, '[["forum.example.test", 5055]]')
+    eps = mod.session_live_forum_endpoints()
+    assert mod.is_live_forum_target(("forum.example.test", 5055), eps)
+    assert mod.is_live_forum_target(("localhost", 5002), eps)
+    assert not mod.is_live_forum_target(("forum.example.test", 5056), eps)
+
+
+def test_A_the_default_pair_is_read_from_the_source_files_not_retyped(monkeypatch, tmp_path):
+    fake = tmp_path / "repo"
+    for rel in G.DEFAULT_URL_SOURCES:
+        p = fake / rel
+        p.parent.mkdir(parents=True)
+        p.write_text('_DEFAULT_FORUM_URL = "http://localhost:5077"\n')
+    assert ("localhost", 5077) in G.default_forum_endpoints(repo_root=fake)
+
+
+def _own_session_list(request):
+    return getattr(request.config, "_live_forum_guard_refused_4475", None)
+
+
+@pytest.mark.parametrize("conftest_path", _LFG_CONFTESTS)
+def test_B_a_refusal_under_the_session_install_is_recorded_in_the_session_list(conftest_path):
+    by_where, stub_hits, _ = _child_run(conftest_path)
+    entries = by_where["session_list"]["entries"]
+    assert entries is not None, "no session-level list on the config"
+    # 7 places probed (import, setup_module, module fixture, session fixture, setUpClass, the unittest method,
+    # the function), each one connect and one connect_ex
+    assert len(entries) == 14, entries
+    assert all(e[0] == "127.0.0.1" and e[1] == 5002 for e in entries), entries
+    assert any("test_probe.py" in str(e[2]) for e in entries), entries  # the running test name is recorded
+    assert stub_hits == []
+
+
+@pytest.mark.parametrize("conftest_path", _LFG_CONFTESTS)
+def test_B_sessionfinish_prints_one_line_naming_count_targets_and_tests(conftest_path):
+    _, stub_hits, r = _child_run(conftest_path)
+    out = r.stdout + r.stderr
+    lines = [ln for ln in out.splitlines() if "[live-forum guard #4475]" in ln]
+    assert len(lines) == 1, out[-1500:]
+    assert "14" in lines[0] and "127.0.0.1:5002" in lines[0] and "test_probe.py" in lines[0], lines[0]
+    assert r.returncode == 0, out[-1500:]  # report only: it does not fail the run
+    assert stub_hits == []
+
+
+@pytest.mark.parametrize("conftest_path", _LFG_CONFTESTS)
+def test_B_sessionfinish_prints_nothing_when_nothing_was_refused(conftest_path):
+    by_where, stub_hits, r = _child_run(conftest_path, mode="quiet")
+    assert by_where["session_list"]["entries"] == []
+    assert "#4475" not in r.stdout + r.stderr, (r.stdout + r.stderr)[-1500:]
+    assert r.returncode == 0
+    assert stub_hits == []
+
+
+def test_zz_B_these_cells_leave_the_session_list_empty(request):
+    """Cells that provoke refusals use their own forced install and list; a clean run shows an empty session list.
+    (Entries from OTHER files in a whole-suite session are theirs to answer for, so only this file's are counted.)"""
+    lst = _own_session_list(request)
+    assert lst is not None, "the session-level install did not run (no list on the config)"
+    mine = [e for e in lst if Path(__file__).name in str(e[2])]
+    assert mine == [], mine

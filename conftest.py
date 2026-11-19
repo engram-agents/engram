@@ -294,13 +294,20 @@ def _service_manager_guard(service_manager_shim_dir, monkeypatch):
 #     loopback spellings are widened, so `connect(("<LAN ip>", 5002))` passes through);
 #   - a raw `sock.connect((<this machine's hostname>, port))` by NAME (stdlib clients resolve first and
 #     connect by IP, which is refused; a hand-made connect by hostname is not matched);
-#   - an ENGRAM_LIVE_FORUM_ENDPOINTS_4475 already set in the environment is trusted whole (it is the
-#     snapshot a second load reuses), and `[]` there disables the guard.
+#   - an ENGRAM_LIVE_FORUM_ENDPOINTS_4475 already set in the environment may ADD endpoints (it is the
+#     snapshot a second load reuses); it never removes the default pair, and a malformed value is
+#     replaced by a fresh resolve.
+#
+# REPORT: the session install keeps one list of its refusals (host, port, running test). At
+# `pytest_sessionfinish` a non-empty list prints one line (count, first targets and tests) and an empty
+# one prints nothing. Report only: it never fails the run. The guard cells use their own forced
+# installs, so a clean suite reports nothing.
 import errno
 import ipaddress
 import json
 import re
 import socket
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -418,26 +425,57 @@ def resolve_endpoints_from_environ(environ):
     return live_forum_endpoints(environ, os.path.join(home, "config.json"))
 
 
+def default_forum_endpoints(repo_root=None):
+    """The default pair(s): the `_DEFAULT_FORUM_URL` constants READ from DEFAULT_URL_SOURCES. Always part of the
+    endpoint set the guard uses, whatever the environment says."""
+    root = Path(repo_root) if repo_root is not None else _LFG_REPO_ROOT
+    return live_forum_endpoints({}, os.devnull, repo_root=root)
+
+
+def _snapshot_from_raw(raw):
+    """The endpoint set a preset snapshot value describes, or None when it is malformed (not JSON, not a list,
+    or an item that is not a [host, port] pair)."""
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    out = set()
+    for item in data:
+        if not (isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str)
+                and isinstance(item[1], int) and not isinstance(item[1], bool)):
+            return None
+        out.add((item[0].lower(), item[1]))
+    return out
+
+
 def session_live_forum_endpoints():
     """The endpoints for the REAL environment, resolved ONCE, at the first import of this file.
     tests/conftest.py repoints ENGRAM_HOME at a throwaway directory when it is unset, so a later
     resolution would miss the real config. The snapshot is also kept in the environment so a second
-    load of this file (src/forum/tests/conftest.py loads it by path) reuses it."""
+    load of this file (src/forum/tests/conftest.py loads it by path) reuses it.
+
+    A preset value is trusted only to ADD endpoints: the default pair read from DEFAULT_URL_SOURCES is always
+    in the set (`[]`, a preset without the default, or a malformed value cannot switch the guard off; a
+    malformed value falls back to a fresh resolve). The merged set is written back to the environment."""
     global _LFG_SESSION_ENDPOINTS
     if _LFG_SESSION_ENDPOINTS is None:
-        raw = os.environ.get(_LFG_SNAPSHOT_KEY)
-        if raw:
-            _LFG_SESSION_ENDPOINTS = {(h, p) for h, p in json.loads(raw)}
-        else:
-            _LFG_SESSION_ENDPOINTS = resolve_endpoints_from_environ(os.environ)
-            os.environ[_LFG_SNAPSHOT_KEY] = json.dumps(sorted(_LFG_SESSION_ENDPOINTS))
+        preset = _snapshot_from_raw(os.environ.get(_LFG_SNAPSHOT_KEY) or "")
+        if preset is None:
+            preset = resolve_endpoints_from_environ(os.environ)
+        _LFG_SESSION_ENDPOINTS = set(preset) | default_forum_endpoints()
+        os.environ[_LFG_SNAPSHOT_KEY] = json.dumps(sorted(_LFG_SESSION_ENDPOINTS))
     return _LFG_SESSION_ENDPOINTS
 
 
 session_live_forum_endpoints()  # take the snapshot now, before tests/conftest.py touches ENGRAM_HOME
 
 
-def install_live_forum_guard(monkeypatch, endpoints=None, force=False):
+_LFG_SESSION_REFUSED = []  # the record the session-level install keeps (entries: (host, port, running test))
+
+
+def install_live_forum_guard(monkeypatch, endpoints=None, force=False, refused=None):
     """Wrap socket.socket.connect / connect_ex (undone by `monkeypatch`). Idempotent: a second
     install while the wrappers are in place does nothing, unless `force` (the cells use it to wrap
     on top with a custom endpoint set)."""
@@ -447,10 +485,11 @@ def install_live_forum_guard(monkeypatch, endpoints=None, force=False):
         return
     eps = session_live_forum_endpoints() if endpoints is None else endpoints
     real_connect, real_connect_ex = socket.socket.connect, socket.socket.connect_ex
-    refused = []
+    if refused is None:
+        refused = []  # a forced install (the cells) keeps its own record
 
     def _refusal(addr):
-        refused.append(addr)
+        refused.append((addr[0], addr[1], os.environ.get("PYTEST_CURRENT_TEST", "unknown")))
         return LiveForumConnectionRefused(
             errno.ECONNREFUSED,
             f"[conftest.py guard #4475] refused connect to {addr[0]}:{addr[1]}: tests must not "
@@ -477,6 +516,8 @@ def install_live_forum_guard(monkeypatch, endpoints=None, force=False):
 
 
 _LFG_MP_ATTR = "_live_forum_guard_monkeypatches_4475"
+_LFG_REFUSED_ATTR = "_live_forum_guard_refused_4475"
+_LFG_REPORTED_ATTR = "_live_forum_guard_reported_4475"
 
 
 def pytest_configure(config):
@@ -485,10 +526,31 @@ def pytest_configure(config):
     refused too. The undo handle is KEPT on the config (a list: a second plugin registering these same hooks,
     src/forum/tests/conftest.py, appends its own, which holds nothing because installing twice is a no-op)."""
     mp = pytest.MonkeyPatch()
-    install_live_forum_guard(mp)
+    if getattr(config, _LFG_REFUSED_ATTR, None) is None:
+        setattr(config, _LFG_REFUSED_ATTR, _LFG_SESSION_REFUSED)
+    install_live_forum_guard(mp, refused=getattr(config, _LFG_REFUSED_ATTR))
     if getattr(config, _LFG_MP_ATTR, None) is None:
         setattr(config, _LFG_MP_ATTR, [])
     getattr(config, _LFG_MP_ATTR).append(mp)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """#4475: REPORT (never fail) the refusals the session install recorded: one line, only when there are any."""
+    config = session.config
+    refused = getattr(config, _LFG_REFUSED_ATTR, None)
+    if not refused or getattr(config, _LFG_REPORTED_ATTR, False):
+        return
+    setattr(config, _LFG_REPORTED_ATTR, True)  # the forum conftest registers this hook too: print once
+    targets = list(dict.fromkeys(f"{h}:{p}" for h, p, _ in refused))
+    tests = list(dict.fromkeys(str(t).split(" (")[0] for _, _, t in refused))
+    line = (f"[live-forum guard #4475] refused {len(refused)} connect(s) to the live forum; "
+            f"targets: {', '.join(targets[:5])}{' ...' if len(targets) > 5 else ''}; "
+            f"running tests: {', '.join(tests[:5])}{' ...' if len(tests) > 5 else ''}")
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(line)
+    else:
+        print(line, file=sys.stderr)
 
 
 def pytest_unconfigure(config):

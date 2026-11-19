@@ -35,6 +35,7 @@ _ROOT_CONFTEST_4475 = _load_root_conftest_4475()
 # registered here too so a run that never loads the root conftest still gets them. Installing twice is a no-op.
 # `pytest_unconfigure` is assigned as is; `pytest_configure` is defined below (the #1459 marker) and calls the root's.
 pytest_unconfigure = _ROOT_CONFTEST_4475.pytest_unconfigure
+pytest_sessionfinish = _ROOT_CONFTEST_4475.pytest_sessionfinish  # the refusal report (printed once)
 
 
 @pytest.fixture(autouse=True)
