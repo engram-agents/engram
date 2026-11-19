@@ -161,6 +161,16 @@ def test_a_python_310_stand_in_without_the_code_attribute_classifies_by_message(
     assert line is not None and "cannot be written" in line
 
 
+def test_a_control_the_same_real_error_with_the_folder_writable_again_is_not_classified(locked_wal, home):
+    """The read-only shape names permissions only while the folder really cannot be written: the same REAL error,
+    classified after the folder is chmod 0755 again, must not be read as exit 4 (colleague read's surviving mutant)."""
+    db, real = locked_wal
+    os.chmod(home, 0o755)  # the fixture's teardown sets 0755 again; harmless
+    assert os.access(home, os.W_OK | os.X_OK)
+    mod = load_tool()
+    assert mod.unreadable_but_healthy(real, db) is None
+
+
 # ------------------------------------------------------------------------------------------ B
 
 def test_b_code_14_on_a_wal_store_with_no_shm_is_named_and_says_nothing_of_permissions(home):
