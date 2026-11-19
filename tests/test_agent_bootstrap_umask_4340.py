@@ -123,7 +123,7 @@ def _service_umask_state(text: str) -> str:
 
 def _template_without_umask() -> str:
     return "".join(ln for ln in TEMPLATE.read_text().splitlines(keepends=True)
-                   if ln.strip() != "UMask=0027")
+                   if not ln.strip().startswith("UMask="))
 
 
 def test_c5_owner_unit_has_one_real_umask_in_service():
