@@ -277,7 +277,7 @@ def test_a_listed_loopback_listener_is_really_refused_by_connect_and_connect_ex(
         unlisted.close()
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "", "::", "127.1", "0x7f.0.0.1", "2130706433", "localhost.", "ip6-localhost", b"127.0.0.1"])
+@pytest.mark.parametrize("host", ["0.0.0.0", "", "::", "127.1", "0x7f.0.0.1", "2130706433", "localhost.", "ip6-localhost", b"127.0.0.1", "::ffff:127.0.0.1", "::ffff:0.0.0.0"])
 def test_non_canonical_loopback_spellings_are_matched(host):
     assert G.is_live_forum_target((host, 5002), {("localhost", 5002)}), host
     assert not G.is_live_forum_target((host, 5003), {("localhost", 5002)}), host
@@ -290,3 +290,197 @@ def test_the_wrappers_are_undone_when_their_monkeypatch_context_ends():
         G.install_live_forum_guard(mp, endpoints=set(), force=True)
         assert (socket.socket.connect, socket.socket.connect_ex) != before
     assert (socket.socket.connect, socket.socket.connect_ex) == before
+
+
+# ---------------------------------------------------------------- fold 1 on #4903: the guard must hold OUTSIDE a test
+# function's own scope (module import at collection, setup_module, module/session fixtures, setUpClass), from
+# pytest_configure to pytest_unconfigure. Each probe runs in a CHILD pytest whose conftest puts a RECORDING STUB beneath
+# the guard before it loads the conftest under test: with the guard broken a live-port connect is recorded and refused
+# by the stub, and no connect to the real port ever happens. A connect to a non-forum loopback port passes through.
+
+_CHILD_CONFTEST = '''
+import importlib.util, json, os, socket, sys
+
+_real_connect, _real_connect_ex = socket.socket.connect, socket.socket.connect_ex
+_REC = os.environ["LFG_REC"]
+
+
+def _live(address):
+    return isinstance(address, tuple) and len(address) >= 2 and address[1] == 5002
+
+
+def _note(path, obj):
+    with open(path, "a") as fh:
+        fh.write(json.dumps(obj) + "\\n")
+
+
+def _stub_connect(self, address):
+    if _live(address):
+        _note(_REC, {"via": "connect", "address": list(address[:2])})
+        raise ConnectionRefusedError(111, "recording stub: the live port was reached")
+    return _real_connect(self, address)
+
+
+def _stub_connect_ex(self, address):
+    if _live(address):
+        _note(_REC, {"via": "connect_ex", "address": list(address[:2])})
+        return 111
+    return _real_connect_ex(self, address)
+
+
+socket.socket.connect, socket.socket.connect_ex = _stub_connect, _stub_connect_ex
+
+_spec = importlib.util.spec_from_file_location("_lfg_child_conftest_under_test", os.environ["LFG_CONFTEST"])
+_mod = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _mod
+_spec.loader.exec_module(_mod)
+if hasattr(_mod, "pytest_configure"):
+    pytest_configure = _mod.pytest_configure
+
+
+def pytest_unconfigure(config):
+    if hasattr(_mod, "pytest_unconfigure"):
+        _mod.pytest_unconfigure(config)
+    _note(os.environ["LFG_RES"], {
+        "where": "after_unconfigure",
+        "stub_back": socket.socket.connect is _stub_connect and socket.socket.connect_ex is _stub_connect_ex,
+    })
+'''
+
+_CHILD_PROBE = '''
+import errno, json, os, socket, unittest
+import pytest
+
+
+def _probe():
+    out = {}
+    with socket.socket() as s:
+        try:
+            s.connect(("127.0.0.1", 5002))
+            out["connect"] = "connected"
+        except ConnectionRefusedError as e:
+            out["connect"] = type(e).__name__
+    with socket.socket() as s:
+        out["connect_ex"] = s.connect_ex(("127.0.0.1", 5002))
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    try:
+        with socket.socket() as c:
+            out["non_forum"] = c.connect_ex(("127.0.0.1", srv.getsockname()[1]))
+    finally:
+        srv.close()
+    return out
+
+
+def _note(where):
+    with open(os.environ["LFG_RES"], "a") as fh:
+        fh.write(json.dumps(dict(_probe(), where=where)) + "\\n")
+
+
+_note("import")
+
+
+def setup_module(module):
+    _note("setup_module")
+
+
+@pytest.fixture(scope="module")
+def _module_fixture():
+    _note("module_fixture")
+
+
+@pytest.fixture(scope="session")
+def _session_fixture():
+    _note("session_fixture")
+
+
+class TestInClass(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        _note("setUpClass")
+
+    def test_unittest_cell(self):
+        _note("unittest_test_method")
+
+
+def test_function(_module_fixture, _session_fixture):
+    _note("test_function")
+'''
+
+_LFG_WHERE = ["import", "setup_module", "module_fixture", "session_fixture", "setUpClass", "test_function"]
+_LFG_CHILD_CACHE = {}
+
+
+def _forum_conftest():
+    return REPO_ROOT / "src" / "forum" / "tests" / "conftest.py"
+
+
+def _child_run(conftest_path):
+    """Run the probe under a child pytest; returns (results by place, stub-recorded live attempts, the run)."""
+    import os
+    import subprocess
+    import sys
+
+    key = str(conftest_path)
+    if key in _LFG_CHILD_CACHE:
+        return _LFG_CHILD_CACHE[key]
+    work = Path(tempfile.mkdtemp(prefix="lfg4475child"))
+    try:
+        (work / "conftest.py").write_text(_CHILD_CONFTEST)
+        (work / "test_probe.py").write_text(_CHILD_PROBE)
+        env = {k: v for k, v in os.environ.items() if k != "PYTEST_ADDOPTS"}
+        env.update(LFG_REC=str(work / "rec.jsonl"), LFG_RES=str(work / "res.jsonl"), LFG_CONFTEST=str(conftest_path))
+        r = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(work),
+             "--confcutdir", str(work), str(work / "test_probe.py")],
+            cwd=str(work), env=env, capture_output=True, text=True, timeout=180,
+        )
+
+        def _lines(name):
+            p = work / name
+            return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+        out = ({x["where"]: x for x in _lines("res.jsonl")}, _lines("rec.jsonl"), r)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    _LFG_CHILD_CACHE[key] = out
+    return out
+
+
+_LFG_CONFTESTS = [pytest.param(_CONFTEST, id="root-conftest"), pytest.param(_forum_conftest(), id="forum-conftest")]
+
+
+@pytest.mark.parametrize("conftest_path", _LFG_CONFTESTS)
+@pytest.mark.parametrize("where", _LFG_WHERE)
+def test_guard_holds_outside_the_test_function_scope(conftest_path, where):
+    by_where, stub_hits, _ = _child_run(conftest_path)
+    assert where in by_where, f"the probe at {where} did not run: {sorted(by_where)}"
+    got = by_where[where]
+    assert got["connect"] == "LiveForumConnectionRefused", got
+    assert got["connect_ex"] == errno.ECONNREFUSED, got
+    assert got["non_forum"] == 0, got  # a non-forum loopback listener still answers: pass-through
+    assert stub_hits == [], "the live-port connect reached the stub beneath the guard"
+
+
+@pytest.mark.parametrize("conftest_path", _LFG_CONFTESTS)
+def test_the_unittest_method_runs_guarded_too(conftest_path):
+    by_where, _, _ = _child_run(conftest_path)
+    assert by_where["unittest_test_method"]["connect"] == "LiveForumConnectionRefused"
+
+
+@pytest.mark.parametrize("conftest_path", _LFG_CONFTESTS)
+def test_pytest_unconfigure_restores_the_originals(conftest_path):
+    by_where, _, r = _child_run(conftest_path)
+    assert by_where.get("after_unconfigure", {}).get("stub_back") is True, r.stdout[-1500:]
+    assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-800:]
+
+
+def test_installing_the_guard_twice_stays_a_no_op():
+    with pytest.MonkeyPatch.context() as outer:
+        G.install_live_forum_guard(outer, endpoints={("localhost", 5002)}, force=True)
+        first = (socket.socket.connect, socket.socket.connect_ex)
+        with pytest.MonkeyPatch.context() as inner:
+            G.install_live_forum_guard(inner)  # already in place: nothing installed
+            assert (socket.socket.connect, socket.socket.connect_ex) == first
+        assert (socket.socket.connect, socket.socket.connect_ex) == first

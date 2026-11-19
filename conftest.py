@@ -268,22 +268,34 @@ def _service_manager_guard(service_manager_shim_dir, monkeypatch):
 # the live URL. With the live port refused every one of those cells still passes (the code reads a
 # refused connect as "unreachable"), so the guard needs no change to any cell.
 #
-# `socket.socket.connect` and `connect_ex` are wrapped for every test. A connect to a live forum
-# endpoint raises a ConnectionRefusedError subclass naming this guard (`connect_ex` returns
-# ECONNREFUSED); everything else passes to the real method (other loopback ports, unix sockets).
+# `socket.socket.connect` and `connect_ex` are wrapped from `pytest_configure` to `pytest_unconfigure`
+# (a session-long install; `pytest_configure` is below), so the guard covers collection (module import
+# time), `setup_module`, `setUpClass`, module/session/class-scoped fixtures and the test functions
+# themselves. A function-scoped autouse fixture installs it again per test, a no-op while it is in
+# place. A connect to a live forum endpoint raises a ConnectionRefusedError subclass naming this guard
+# (`connect_ex` returns ECONNREFUSED); everything else passes to the real method (other loopback ports,
+# unix sockets).
 # The live endpoints are those the CODE resolves: `forum.url` of $ENGRAM_HOME/config.json,
 # `$FORUM_URL`, and the default constant READ from the two source files that define it. A loopback
-# endpoint refuses every loopback spelling (localhost, 127.0.0.0/8, ::1, the unspecified address and
-# the inet_aton forms such as 127.1) on its port; a non-loopback endpoint refuses that host and port
-# EXACTLY AS WRITTEN: stdlib clients resolve a name first and connect by IP, so a host NAME in
-# forum.url is matched only by a direct connect by that name, an IP literal is matched either way.
+# endpoint refuses every loopback spelling (localhost, 127.0.0.0/8, ::1, the unspecified address, their
+# IPv4-mapped forms and the inet_aton forms such as 127.1) on its port; a non-loopback endpoint refuses
+# that host and port EXACTLY AS WRITTEN: stdlib clients resolve a name first and connect by IP, so a host
+# NAME in forum.url is matched only by a direct connect by that name, an IP literal is matched either way.
 #
-# This definition is shared: src/forum/tests/conftest.py loads THIS file by path and installs the
-# same guard (the forum tests may run on their own), and the cell files load it by path too.
-# Installing twice is a no-op. No opt-out: a test that needs the live forum is a finding.
+# This definition is shared: src/forum/tests/conftest.py loads THIS file by path, assigns the same
+# `pytest_configure` / `pytest_unconfigure` hooks into its own namespace and installs the same guard (the
+# forum tests may run on their own), and the cell files load it by path too. Installing twice is a no-op.
+# No opt-out: a test that needs the live forum is a finding.
 #
 # NOT COVERED (unmeasured routes): a C-level `_socket.socket` used directly, connects made by a
 # subprocess (curl, a child python), and non-forum services (the world servers on 5003 / 5005).
+# Also not covered, by construction of the matcher:
+#   - the host's OWN non-loopback address on the forum port (the forum binds 0.0.0.0, but only the
+#     loopback spellings are widened, so `connect(("<LAN ip>", 5002))` passes through);
+#   - a raw `sock.connect((<this machine's hostname>, port))` by NAME (stdlib clients resolve first and
+#     connect by IP, which is refused; a hand-made connect by hostname is not matched);
+#   - an ENGRAM_LIVE_FORUM_ENDPOINTS_4475 already set in the environment is trusted whole (it is the
+#     snapshot a second load reuses), and `[]` there disables the guard.
 import errno
 import ipaddress
 import json
@@ -464,9 +476,32 @@ def install_live_forum_guard(monkeypatch, endpoints=None, force=False):
     monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
 
 
+_LFG_MP_ATTR = "_live_forum_guard_monkeypatches_4475"
+
+
+def pytest_configure(config):
+    """#4475: put the guard in place for the whole session, from here to `pytest_unconfigure`, so a connect
+    made at module import (collection), in `setup_module`, `setUpClass` or a module/session-scoped fixture is
+    refused too. The undo handle is KEPT on the config (a list: a second plugin registering these same hooks,
+    src/forum/tests/conftest.py, appends its own, which holds nothing because installing twice is a no-op)."""
+    mp = pytest.MonkeyPatch()
+    install_live_forum_guard(mp)
+    if getattr(config, _LFG_MP_ATTR, None) is None:
+        setattr(config, _LFG_MP_ATTR, [])
+    getattr(config, _LFG_MP_ATTR).append(mp)
+
+
+def pytest_unconfigure(config):
+    """#4475: undo what `pytest_configure` installed (in reverse order)."""
+    for mp in reversed(getattr(config, _LFG_MP_ATTR, None) or []):
+        mp.undo()
+    setattr(config, _LFG_MP_ATTR, [])
+
+
 @pytest.fixture(autouse=True)
 def _live_forum_guard(monkeypatch):
-    """#4475: no test may connect to the live forum (see the block comment above)."""
+    """#4475: the guard again around each test (see the block comment above). A no-op while the session
+    install from `pytest_configure` is in place; it brings the guard back if something restored the originals."""
     install_live_forum_guard(monkeypatch)
 
 

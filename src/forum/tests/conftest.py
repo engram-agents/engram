@@ -31,6 +31,10 @@ def _load_root_conftest_4475():
 
 
 _ROOT_CONFTEST_4475 = _load_root_conftest_4475()
+# The session-long install (import/collection, setup_module, module-scoped fixtures): the root conftest's hooks,
+# registered here too so a run that never loads the root conftest still gets them. Installing twice is a no-op.
+# `pytest_unconfigure` is assigned as is; `pytest_configure` is defined below (the #1459 marker) and calls the root's.
+pytest_unconfigure = _ROOT_CONFTEST_4475.pytest_unconfigure
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +65,7 @@ def _stub_pr_identity(monkeypatch):
 # unaided server. No production switch bypasses the guard.
 # ---------------------------------------------------------------------------
 def pytest_configure(config):
+    _ROOT_CONFTEST_4475.pytest_configure(config)  # #4475: the session-long live-forum guard
     config.addinivalue_line(
         "markers",
         "raw_auth: do not add the #1459 test-client auth plumbing; exercise the real guard")
