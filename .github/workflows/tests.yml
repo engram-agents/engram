@@ -156,6 +156,7 @@ jobs:
             tools/test_forum_backup_stamp.py \
             tools/test_forum_cli.py \
             tools/test_forum_status_backup.py \
+            tools/test_live_forum_guard.py \
             tools/test_pre_dispatch_check.py \
             -v --tb=short || rc=1
           pytest src/engram/tools/test_tripwire.py -v --tb=short || rc=1

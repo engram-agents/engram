@@ -428,7 +428,11 @@ seat can run it and any other seat can check that it ran.
    the docs; `git ls-files`; a glob over a shipped directory), directly or through
    the tool it runs, instead of naming them, so a change to a file the test never names can redden it while rule 1's
    basename selection never picks it; the guard set is then the only place it runs
-   before the nightly. Today they are `tests/test_atomic_writer_modes_4013.py`,
+   before the nightly. A second kind belongs by the same rule: a test that **copies a shared
+   conftest into another tree** (the real root `conftest.py`, or the `conftest.py` that sits in `tests/`, written
+   into a throwaway repository), because whatever that conftest reads at import has to be carried along, so
+   a change to what a conftest reads can redden the test while no changed file names it. Today they are
+   `tests/test_atomic_writer_modes_4013.py`,
    `tests/test_truncating_writes_ratchet_4380.py`,
    `tests/test_forum_process_spawn_ratchet_3518.py`,
    `tests/test_no_db_creation_before_bootstrap_4107.py`,
@@ -445,7 +449,12 @@ seat can run it and any other seat can check that it ran.
    `git ls-files` and a walk of `src/` and `tools/`) and
    `tests/test_hook_injection_bounds.py` (it globs `src/engram/hooks/claude/*.py` and names only
    the 13 files of its own exemption list, so a hook it does not name never selects it; about
-   0.2 s, 27 cells when measured on 2026-11-18). *Evidence:* #4613 added a hook that built its
+   0.2 s, 27 cells when measured on 2026-11-18) and
+   `tests/test_service_manager_guard_roots_3519.py` (it copies the real root `conftest.py` into a
+   throwaway repository and runs a child pytest there, the second kind above; measured red at the
+   merge seat's scratch merge of #4903 on 2026-11-19, 9 failed and 1 passed, because the live-forum
+   guard in that conftest reads two source files at import and the copy carried neither; it is not
+   named by the files a PR changes and `pr-checks` does not run `tests/`). *Evidence:* #4613 added a hook that built its
    `additionalContext` without `emit_context()`; the test-map rows were first-match-wins until the runner took the union of matching rows, so a hook
    with its own rows never reached this test through the map, and the PR's seat run was green. It
    was first seen red in a hand-started whole-suite run on `dev` later on 2026-11-18 (the
@@ -899,14 +908,18 @@ with a scope of the changed test, the scanner test and the guard set — left tw
 `tests/test_relative_engram_home_refused_3863.py`, which names the changed hook by basename and sits
 in no other half. `git grep -l` for that hook's name finds exactly two files; one of them was run.
 
-Measured with the selector at dev `c3a013ab`, so the halves are not guesses: a change to
-`tools/forum_backup.py` selects **no** file under `tools/` — 23 files, 22 of them the guard set and
-the 23rd (`tests/test_forum_backup.py`) selected because it imports the changed module. The counts
+Measured with the selector at dev `b9be5523` plus the one row #4903 adds to item 4 (first measured
+at dev `c3a013ab`, where the figures were 23 and 22), so the halves are not
+guesses: a change to `tools/forum_backup.py` selects **no** file under `tools/` — 55 files, 54 of
+them the guard set and the 55th (`tests/test_forum_backup.py`) selected because it imports the
+changed module. The counts
 move whenever item 4's list does, so read them as measured at that commit, never as constants. Those
 tool tests are named explicitly by two workflows: the full suite (`tests.yml`) and the per-PR
 `pr-checks.yml`, which runs the same set on every pull request with the forum-dependent cells
-skipping. A forum-installer change selects 26 files at the same commit, none of them in
-`src/forum/tests/`.
+skipping. A forum-installer change (`src/forum/deploy/install-forum-service.sh`) selects 57
+`tests/` files at the same base, 54 of them the guard set, and separately 14 of the 113
+`src/forum/tests/` files (the forum half, which the selector lists apart from the `tests/`
+selection).
 
 **Why the forum half is a directory run and the hooks half is a guard-set entry.** Both are tests
 that discover their subject **structurally**, so item 1 cannot select them — but they are fixed in
