@@ -80,6 +80,11 @@ Options:
   --no-recall-service   do not install it
   --viz-service         install the viz dashboard service (Linux only; a no-op line on macOS)
   --forum-url URL       write forum.url into config.json
+  --claude-md-profile NAME
+                        pass NAME to bootstrap.py, which checks it (a fresh seed only). local is a
+                        shorter CLAUDE.md for one agent working with one user on one machine, with no agent
+                        team and no long-running loop; it is NOT fully tested. Made for the team's local
+                        benchmark work: https://github.com/engram-agents/engram-benchmarks
   --install-claude-code run Claude Code's native installer if `claude` is missing
                         (off by default; --yes never implies it)
   --yes                 non-interactive: answer yes to the CLAUDE.md question (replace it; it is
@@ -101,6 +106,9 @@ TIER="$DEFAULT_TIER"
 RECALL_SERVICE="$DEFAULT_RECALL_SERVICE"
 VIZ_SERVICE=0
 FORUM_URL=""
+# Passed straight to bootstrap.py, which checks the value; the installer keeps no list of its own.
+CLAUDE_MD_PROFILE_SET=0
+CLAUDE_MD_PROFILE=""
 INSTALL_CLAUDE_CODE="$DEFAULT_INSTALL_CLAUDE_CODE"
 ASSUME_YES=0
 SANDBOX_UNTAGGED=0
@@ -131,6 +139,10 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || _arg_error "--forum-url requires a URL"
       FORUM_URL="$2"; shift 2 ;;
     --forum-url=*) FORUM_URL="${1#--forum-url=}"; shift ;;
+    --claude-md-profile)
+      [ $# -ge 2 ] || _arg_error "--claude-md-profile requires a value (bootstrap.py checks it)"
+      CLAUDE_MD_PROFILE_SET=1; CLAUDE_MD_PROFILE="$2"; shift 2 ;;
+    --claude-md-profile=*) CLAUDE_MD_PROFILE_SET=1; CLAUDE_MD_PROFILE="${1#--claude-md-profile=}"; shift ;;
     --install-claude-code) INSTALL_CLAUDE_CODE=1; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --sandbox-untagged) SANDBOX_UNTAGGED=1; shift ;;
@@ -623,6 +635,10 @@ if [ "$_run_bootstrap" -eq 1 ]; then
     printf '[step 6] CLAUDE.md: %s will be replaced after bootstrap saves the current file to %s (once) and to a time-stamped %s.engram-backup.<UTC> copy\n' "$CLAUDE_MD" "$CLAUDE_MD_BACKUP" "$CLAUDE_MD"
   fi
 
+  if [ "$CLAUDE_MD_PROFILE_SET" -eq 1 ]; then
+    _bootstrap_flags+=(--claude-md-profile "$CLAUDE_MD_PROFILE")
+  fi
+
   printf '[step 6] %s\n' "$_state_note"
   if [ "$_force_empty" -eq 1 ]; then
     env -u FORCE FORCE_RESEED_EMPTY=1 \
@@ -642,6 +658,9 @@ if [ "$_run_bootstrap" -eq 1 ]; then
   BOOTSTRAP_RAN=1
   step_ok "$_state_note"
 else
+  if [ "$CLAUDE_MD_PROFILE_SET" -eq 1 ]; then
+    printf '[step 6] --claude-md-profile %s ignored: bootstrap was skipped, so CLAUDE.md is not re-rendered\n' "$CLAUDE_MD_PROFILE"
+  fi
   step_ok "$_state_note"
 fi
 

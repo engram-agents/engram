@@ -81,6 +81,7 @@ CODEX_HOME = Path(os.environ["CODEX_HOME"]) if TARGET == "codex" else None
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import server  # noqa: E402
 import engram_file_guard as fg  # noqa: E402
+import engram_config_io  # noqa: E402
 
 
 def _add(fn, **kwargs) -> str:
@@ -609,7 +610,73 @@ def _seed_ids_on_empty_graph() -> dict[str, str]:
 _FIXED_SEED_IDS = _seed_ids_on_empty_graph()
 
 
-def _predicted_claude_render() -> str | None:
+# The CLAUDE.md profiles bootstrap can render. `full` is the default and is never recorded;
+# `local` is the same identity template with fewer components, for one agent working with one user
+# on one machine (the purpose and limits text: LOCAL_PROFILE_NOTICE below).
+CLAUDE_MD_PROFILES = ("full", "local")
+CLAUDE_MD_PROFILE_CONFIG_KEY = "claude_md_profile"
+_CLAUDE_MD_TEMPLATE_NAMES = {"full": "template.CLAUDE.md", "local": "template.CLAUDE.local.md"}
+
+# What bootstrap prints when that profile is chosen: the facts the README, the installer's
+# --help and the changelog state too, in at most six lines.
+LOCAL_PROFILE_NOTICE = (
+    "  CLAUDE.md profile: local. A shorter CLAUDE.md designed for one agent working with one user on one machine,",
+    "  with no agent team and no long-running autonomous loop. It keeps the authority table, the trust-tier pointer and the",
+    "  signature rule for outward messages. It does not carry agent coordination, the loop-mode policy, the fairy and delegation",
+    "  sections (the ban on the native deep-research and Workflow tools stays), \"Who I Am\", \"My Collaborator\" or the infrastructure",
+    "  locations. NOT fully tested: not measured with a real bootstrap on a fresh home, a real upgrade, or the whole test suite.",
+    "  Made for the team's local benchmark work: https://github.com/engram-agents/engram-benchmarks. The full profile stays the default.",
+)
+
+
+def _claude_template_path(profile: "str | None") -> Path:
+    """The template file for a profile (None = the default, full)."""
+    return TEMPLATES_DIR / _CLAUDE_MD_TEMPLATE_NAMES[profile or "full"]
+
+
+def _record_claude_md_profile(profile: "str | None") -> None:
+    """Keep config.json's CLAUDE.md profile record in step with the template about to be written,
+    so a later upgrade compares the user's file against the template the file was rendered from.
+
+    A `local` run records `local`. A default or explicit `full` run records nothing new, but a
+    STALE `claude_md_profile` key already in config.json (an aborted local run re-run with the
+    default profile) is overwritten with `full`, never left saying local over a full file. The
+    key is overwritten rather than removed because the config writer refuses to shrink the file.
+    Both go through the config writer (temp file and rename, with a backup of a changed file).
+    This runs after the seed graph exists and never creates config.json from empty.
+    """
+    config_path = ENGRAM_HOME / "config.json"
+    if profile in (None, "full"):
+        if not config_path.is_file():
+            return
+        try:
+            config = engram_config_io.read_config_json(config_path)
+            if CLAUDE_MD_PROFILE_CONFIG_KEY in config and config[CLAUDE_MD_PROFILE_CONFIG_KEY] != "full":
+                config[CLAUDE_MD_PROFILE_CONFIG_KEY] = "full"
+                engram_config_io.write_engram_config(config_path, config)
+        except (OSError, ValueError, TypeError) as e:
+            raise SystemExit(
+                f"[bootstrap] REFUSED: could not clear a stale CLAUDE.md profile record in "
+                f"{config_path} ({e}). The graph was already seeded; CLAUDE.md was not written."
+            )
+        return
+    if not config_path.is_file():
+        raise SystemExit(
+            f"[bootstrap] REFUSED: {config_path} is missing, so the {profile!r} CLAUDE.md profile "
+            f"cannot be recorded there. The graph was already seeded; CLAUDE.md was not written."
+        )
+    try:
+        config = engram_config_io.read_config_json(config_path)
+        config[CLAUDE_MD_PROFILE_CONFIG_KEY] = profile
+        engram_config_io.write_engram_config(config_path, config)
+    except (OSError, ValueError, TypeError) as e:
+        raise SystemExit(
+            f"[bootstrap] REFUSED: could not record the {profile!r} CLAUDE.md profile in "
+            f"{config_path} ({e}). The graph was already seeded; CLAUDE.md was not written."
+        )
+
+
+def _predicted_claude_render(profile: "str | None" = None) -> str | None:
     """What this run would write to CLAUDE.md, for the check-only pass.
 
     The seed IDs are fixed (`_FIXED_SEED_IDS`), so no seed manifest is read. An unreadable
@@ -617,7 +684,7 @@ def _predicted_claude_render() -> str | None:
     """
     try:
         return _render_template_text(
-            TEMPLATES_DIR / "template.CLAUDE.md",
+            _claude_template_path(profile),
             _build_substitutions(dict(_FIXED_SEED_IDS), quiet=True),
         )
     except OSError:
@@ -765,6 +832,7 @@ def _refuse_existing_memory(found: "list[str]", db_state: str) -> None:
 class _Args(NamedTuple):
     consent: "fg.Consent"
     retention_days: "int | None"
+    claude_md_profile: "str | None" = None
 
 
 def _parse_args(argv: list[str]) -> _Args:
@@ -773,11 +841,13 @@ def _parse_args(argv: list[str]) -> _Args:
     `--force` is consent to replace every differing file the refusal lists; `--replace PATH`
     (repeatable) is consent for that path only. Either one is for use only after the user has
     seen the list and said yes. `--retention-days N` is the only way bootstrap touches
-    ~/.claude/settings.json; N must be an integer 1..36500.
+    ~/.claude/settings.json; N must be an integer 1..36500. `--claude-md-profile NAME`
+    (full or local) picks which CLAUDE.md template is rendered; local is for one agent working with one user.
     """
     force = False
     replace: list[str] = []
     retention_days = None
+    claude_md_profile = None
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -803,13 +873,23 @@ def _parse_args(argv: list[str]) -> _Args:
                 )
             retention_days = n
             i += 1
+        elif arg == "--claude-md-profile":
+            value = argv[i + 1] if i + 1 < len(argv) else None
+            if value not in CLAUDE_MD_PROFILES:
+                raise SystemExit(
+                    f"[bootstrap] --claude-md-profile needs one of {', '.join(CLAUDE_MD_PROFILES)} "
+                    f"(local is for one agent working with one user; full is the default), got "
+                    f"{value if value is not None else 'nothing'!r}"
+                )
+            claude_md_profile = value
+            i += 1
         else:
             raise SystemExit(
                 f"[bootstrap] unknown argument {arg!r}; the options are --force, "
-                f"--replace PATH and --retention-days N"
+                f"--replace PATH, --retention-days N and --claude-md-profile NAME"
             )
         i += 1
-    return _Args(fg.consent_for(force, replace), retention_days)
+    return _Args(fg.consent_for(force, replace), retention_days, claude_md_profile)
 
 
 def _tighten_home_step() -> None:
@@ -916,7 +996,8 @@ def main() -> None:
         "created": _now_iso(),
         "install_path": str(ALPHA_DIR),
     }, indent=2)
-    predicted_claude = _predicted_claude_render()
+    profile = _args.claude_md_profile if TARGET == "claude" else None
+    predicted_claude = _predicted_claude_render(profile)
     predicted_agents = _predicted_agents_render()
     if (TARGET == "claude" and predicted_claude is None) or (TARGET == "codex" and predicted_agents is None):
         raise SystemExit(
@@ -1104,12 +1185,16 @@ def main() -> None:
 
     substitutions = _build_substitutions(ids)
 
+    # The profile is recorded BEFORE CLAUDE.md is written: a file rendered from a non-default
+    # template must never exist without the record that tells an upgrade which template it follows.
+    _record_claude_md_profile(profile)
+
     # Every protected write goes through the guard: absent -> written; identical -> left
     # alone; differs and consented -> backed up first. The guard judges the REAL renders here
     # (the check-only pass judged predicted ones), so a path that changed meanwhile is refused.
     final_items = _write_items(
         ids, substitutions, marker_payload,
-        _render_template_text(TEMPLATES_DIR / "template.CLAUDE.md", substitutions) if TARGET == "claude" else None,
+        _render_template_text(_claude_template_path(profile), substitutions) if TARGET == "claude" else None,
         _render_template_text(TEMPLATES_DIR / "template.AGENTS.md", substitutions) if TARGET == "codex" else None,
     )
     try:
@@ -1129,6 +1214,11 @@ def main() -> None:
             print(f"  {item.path.name} → {item.path}", flush=True)
         else:
             print(f"  {item.path.name} unchanged (already holds what ENGRAM would write)", flush=True)
+    if TARGET == "claude" and profile == "local":
+        print("", flush=True)
+        for line in LOCAL_PROFILE_NOTICE:
+            print(line, flush=True)
+        print("", flush=True)
 
     # Owner-only data home (#4445), both targets. Runs BEFORE the settings step below so a
     # refusal there never skips it.
@@ -1141,6 +1231,12 @@ def main() -> None:
             _set_cleanup_period_days(CLAUDE_HOME, _args.retention_days)
 
     elif TARGET == "codex":
+        if _args.claude_md_profile is not None:
+            print(
+                "  --claude-md-profile applies to the Claude target only and was ignored "
+                "(nothing was recorded in config.json)",
+                flush=True,
+            )
         if _args.retention_days is not None:
             print(
                 "  --retention-days applies to the Claude target only and was ignored "

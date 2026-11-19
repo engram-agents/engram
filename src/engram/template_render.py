@@ -44,6 +44,8 @@ render_identity_surface(templates_dir) -> str
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -58,13 +60,56 @@ CLAUDE_RENDER_SOURCES: list[str] = [
     "template.CLAUDE.md",
 ]
 
+#: The template each recorded CLAUDE.md profile follows (config.json key
+#: ``claude_md_profile``; no record = full). Mirrors the table in
+#: src/build/engine/flows.py (the upgrade flow); tests/test_local_claude_md_profile.py
+#: pins that both read the same answer for every config shape.
+CLAUDE_MD_PROFILE_KEY = "claude_md_profile"
+CLAUDE_MD_PROFILE_SOURCES: dict[str, list[str]] = {
+    "full": CLAUDE_RENDER_SOURCES,
+    "local": ["template.CLAUDE.local.md"],
+}
+#: The one template file each profile renders from (always a member of that
+#: profile's CLAUDE_MD_PROFILE_SOURCES list; the list may widen, this name does not move).
+CLAUDE_MD_PROFILE_TEMPLATE: dict[str, str] = {
+    "full": "template.CLAUDE.md",
+    "local": "template.CLAUDE.local.md",
+}
+PROFILE_UNDETERMINED = "undetermined"
+
+
+def recorded_claude_md_profile(engram_home: str) -> str:
+    """The profile a home recorded: "full", "local" or "undetermined".
+
+    No home, no config.json, no key, null or "full" is full. An unreadable
+    config.json, a non-object one, or any other value is undetermined, so no
+    template is compared (a guess could compare the wrong one).
+    """
+    if not engram_home:
+        return "full"
+    try:
+        with open(os.path.join(engram_home, "config.json"), encoding="utf-8") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        return "full"
+    except (OSError, ValueError):
+        return PROFILE_UNDETERMINED
+    if not isinstance(config, dict):
+        return PROFILE_UNDETERMINED
+    value = config.get(CLAUDE_MD_PROFILE_KEY)
+    if value is None or value == "full":
+        return "full"
+    if value == "local":
+        return "local"
+    return PROFILE_UNDETERMINED
+
 
 # ---------------------------------------------------------------------------
 # High-level render helper
 # ---------------------------------------------------------------------------
 
 
-def render_identity_surface(templates_dir: Path) -> str:
+def render_identity_surface(templates_dir: Path, profile: str = "full") -> str:
     """Render the CLAUDE.md identity surface from a templates directory.
 
     Reads ``template.CLAUDE.md`` from *templates_dir* and returns its raw
@@ -77,12 +122,15 @@ def render_identity_surface(templates_dir: Path) -> str:
     Parameters
     ----------
     templates_dir:
-        Path to a directory that contains ``template.CLAUDE.md``.
+        Path to a directory that contains the profile's template
+        (``template.CLAUDE.md`` for full, ``template.CLAUDE.local.md`` for local).
+    profile:
+        "full" (default) or "local".
 
     Returns
     -------
     str
         The raw template text, placeholders intact.
     """
-    template_path = templates_dir / "template.CLAUDE.md"
+    template_path = templates_dir / CLAUDE_MD_PROFILE_TEMPLATE[profile]
     return template_path.read_text(encoding="utf-8")

@@ -1167,6 +1167,148 @@ def test_forum_url_hint_names_the_tier_not_the_retired_flag(sb):
     assert "convenience or dev" in r.stderr
 
 
+# ── #4802: --claude-md-profile is passed straight through to bootstrap.py ─────────────────────
+def _bootstrap_argvs(sb):
+    return [json.loads(c[len("argv-of-bootstrap "):]) for c in sb.calls_starting("argv-of-bootstrap")]
+
+
+@pytest.mark.parametrize("given", [["--claude-md-profile", "local"], ["--claude-md-profile=local"]])
+def test_claude_md_profile_flag_is_forwarded_to_bootstrap(sb, given):
+    r = sb.run("--yes", *given)
+    assert r.returncode == 0, r.all
+    assert _bootstrap_argvs(sb) == [["--claude-md-profile", "local"]]
+
+
+def test_claude_md_profile_value_is_forwarded_verbatim_not_hardcoded(sb):
+    r = sb.run("--yes", "--claude-md-profile", "whatever-bootstrap-decides")
+    assert r.returncode == 0, r.all  # the fake bootstrap accepts anything: the installer judged nothing
+    assert _bootstrap_argvs(sb) == [["--claude-md-profile", "whatever-bootstrap-decides"]]
+
+
+def test_claude_md_profile_forwards_beside_replace(sb):
+    sb.claude_home.mkdir(parents=True)
+    (sb.claude_home / "CLAUDE.md").write_text("mine\n")
+    r = sb.run("--yes", "--claude-md-profile", "local")
+    assert r.returncode == 0, r.all
+    assert _bootstrap_argvs(sb) == [["--replace", str(sb.claude_home / "CLAUDE.md"), "--claude-md-profile", "local"]]
+
+
+def test_without_the_flag_the_bootstrap_argv_is_unchanged(sb):
+    assert sb.run("--yes").returncode == 0
+    assert _bootstrap_argvs(sb) == [[]]
+
+
+def test_without_the_flag_the_replace_argv_is_unchanged(sb):
+    sb.claude_home.mkdir(parents=True)
+    (sb.claude_home / "CLAUDE.md").write_text("mine\n")
+    assert sb.run("--yes").returncode == 0
+    assert _bootstrap_argvs(sb) == [["--replace", str(sb.claude_home / "CLAUDE.md")]]
+
+
+def test_both_bootstrap_command_lines_are_byte_identical_to_before():
+    src = REAL_INSTALL_SH.read_text()
+    line = '"$VENV_PY" "$PLUGIN_ROOT/bootstrap.py" ${_bootstrap_flags[@]+"${_bootstrap_flags[@]}"} \\'
+    assert src.count("      " + line + "\n") == 2
+
+
+def test_claude_md_profile_without_a_value_fails_loud_and_runs_nothing(sb):
+    r = sb.run("--yes", "--claude-md-profile")
+    assert r.returncode == 2, r.all
+    assert "--claude-md-profile requires a value" in r.stderr and "(see --help)" in r.stderr
+    assert not sb.calls.exists() or sb.call_lines() == []
+
+
+def test_a_bad_value_is_refused_by_bootstrap_not_by_the_installer(sb):
+    sb.use_real_bootstrap()
+    r = sb.run("--yes", "--claude-md-profile", "tiny")
+    assert r.returncode != 0, r.all
+    assert "--claude-md-profile needs one of" in r.all  # bootstrap's own message
+    assert "bootstrap.py failed" in r.stderr
+    assert "install.sh: invalid" not in r.all
+
+
+def _usage_block(src: str) -> str:
+    """The text of the usage() function: from `usage() {` to its closing brace line."""
+    start = src.index("usage() {")
+    return src[start : src.index("\n}\n", start)]
+
+
+def test_installer_source_holds_no_profile_list_of_its_own():
+    # Rule (#4802 rework): the --help text may NAME the local profile (its purpose and its limit), but
+    # the installer keeps no profile list and judges no value: the profile value appears nowhere outside the
+    # usage text, and no code path compares against it. (`local` is also a bash keyword, so the cells below
+    # look for the VALUE: quoted, a case/alternation arm, or beside the flag name.)
+    src = REAL_INSTALL_SH.read_text()
+    usage = _usage_block(src)
+    outside_usage = src.replace(usage, "")
+    assert not re.search(r"""["']local["']""", outside_usage)
+    assert not re.search(r"claude-md-profile[^\n]*\blocal\b", outside_usage)
+    assert not re.search(r"""(?<![-\w])local\s*[|)]|[|(]\s*local""", src)
+    assert not re.search(r"""(?:^|[\s"'(|])full\s*[|)]""", src, re.MULTILINE)
+    assert not re.search(r"""[|(]\s*full\b|"full"|'full'""", src)
+
+
+def test_the_real_bootstrap_renders_and_records_the_local_profile_through_the_installer(sb):
+    sb.use_real_bootstrap()
+    r = sb.run("--yes", "--claude-md-profile", "local")
+    assert r.returncode == 0, r.all
+    assert json.loads((sb.engram / "config.json").read_text()).get("claude_md_profile") == "local"
+    assert "## Model Identity Gate" in (sb.claude_home / "CLAUDE.md").read_text()
+
+
+def test_a_profile_given_on_a_seeded_home_is_reported_ignored_not_silently_dropped(sb):
+    sb.make_db(6)
+    r = sb.run("--yes", "--claude-md-profile", "local")
+    assert r.returncode == 0, r.all
+    assert sb.calls_starting("argv-of-bootstrap") == []
+    assert "--claude-md-profile local ignored" in r.stdout
+
+
+def _flag_help_lines(stdout: str) -> list[str]:
+    """The help text of --claude-md-profile: from its option line to the next option line."""
+    lines = stdout.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip().startswith("--claude-md-profile"))
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("--")), len(lines))
+    return [ln.strip() for ln in lines[start + 1 : end] if ln.strip()]
+
+
+def test_help_names_the_local_profile_with_its_purpose_and_limit_in_at_most_four_lines(sb):
+    r = sb.run("--help")
+    assert r.returncode == 0
+    assert "--claude-md-profile" in r.stdout
+    block = _flag_help_lines(r.stdout)
+    assert 1 <= len(block) <= 4, block
+    text = " ".join(block)
+    assert "local is a shorter CLAUDE.md" in text
+    assert "one agent" in text and "one user" in text and "one machine" in text
+    assert re.search(r"not fully tested", text, re.IGNORECASE)
+    assert "https://github.com/engram-agents/engram-benchmarks" in text
+    # the installer still passes the value through: the help says bootstrap checks it
+    assert "bootstrap.py" in text and "checks it" in text
+    for banned in (r"small[- ]context", r"\blean\b", r"local[- ]only"):
+        assert not re.search(banned, text, re.IGNORECASE), banned
+
+
+_EMPTY_PROFILE_FORMS = [["--claude-md-profile", ""], ["--claude-md-profile="]]
+
+
+@pytest.mark.parametrize("given", _EMPTY_PROFILE_FORMS)
+def test_an_empty_claude_md_profile_is_forwarded_as_an_empty_argv_element(sb, given):
+    r = sb.run("--yes", *given)
+    assert r.returncode == 0, r.all  # the stub accepts anything; the installer judged nothing
+    assert _bootstrap_argvs(sb) == [["--claude-md-profile", ""]]
+
+
+@pytest.mark.parametrize("given", _EMPTY_PROFILE_FORMS)
+def test_an_empty_claude_md_profile_fails_loud_in_the_real_bootstrap_not_silently_full(sb, given):
+    sb.use_real_bootstrap()
+    r = sb.run("--yes", *given)
+    assert r.returncode != 0, r.all
+    assert "--claude-md-profile needs one of" in r.all and "got ''" in r.all
+    assert "bootstrap.py failed" in r.stderr
+    assert not (sb.claude_home / "CLAUDE.md").exists()
+
+
 # --------------------------------------------------------------------- #4795: a timeout kills the tree
 
 def _pid_alive(pid):
