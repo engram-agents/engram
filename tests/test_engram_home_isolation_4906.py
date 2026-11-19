@@ -212,7 +212,7 @@ def test_c7_throwaway_home_is_private():
     assert mode == 0o700, f"{fallback} has mode {mode:o}, expected 700"
 
 
-def test_c6_counterfactual_file_isolates_what_the_code_reads(monkeypatch):
+def test_c6_counterfactual_file_isolates_what_the_code_reads(monkeypatch, tmp_path):
     """C6 (#4881 pin): the counterfactual file's setup_module() must redirect
     engram_core.DATA_DIR to its TEST_DIR (it set a variable nothing reads)."""
     name = "counterfactual_quote_type_under_test"
@@ -221,7 +221,9 @@ def test_c6_counterfactual_file_isolates_what_the_code_reads(monkeypatch):
     sys.modules[name] = cf
     try:
         spec.loader.exec_module(cf)
-        monkeypatch.setenv("ENGRAM_HOME", tempfile.mkdtemp(prefix="engram-c6-home-"))
+        c6_home = tmp_path / "c6-home"
+        c6_home.mkdir()
+        monkeypatch.setenv("ENGRAM_HOME", str(c6_home))
         cf.setup_module()
         try:
             import engram_core
