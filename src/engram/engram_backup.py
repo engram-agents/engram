@@ -37,6 +37,64 @@ import sqlite3
 import stat
 import sys
 import tempfile
+from datetime import datetime, timezone
+
+# First line of every dump: a SQL comment (every reader that runs the dump skips it) that says WHEN the dump was
+# taken. The restore drill reads it to tell a difference made after the dump from one that is not.
+DUMP_MARKER_PREFIX = "-- engram-dumped-at: "
+# The marker's time is the moment the dump's content was TRUE of the live graph: the capture time. Exactly the
+# format ``format_dump_time`` writes; ``dump_stripped(dumped_at=...)`` refuses anything else (a newline in it
+# would inject a statement line into the dump).
+_DUMP_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
+
+
+def format_dump_time(epoch: "float | None" = None) -> str:
+    """The marker time format (UTC ISO, microseconds, trailing Z) for ``epoch`` seconds, or for now."""
+    t = datetime.now(timezone.utc) if epoch is None else datetime.fromtimestamp(epoch, timezone.utc)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _without_marker(data: bytes) -> bytes:
+    """``data`` minus its first line when that line is the dump marker (only the first line is the marker)."""
+    if data.startswith(DUMP_MARKER_PREFIX.encode("ascii")):
+        nl = data.find(b"\n")
+        return b"" if nl < 0 else data[nl + 1:]
+    return data
+
+
+def dump_matches_committed(new_path, old) -> bool:
+    """True when the dump at ``new_path`` equals ``old`` EXCLUDING the marker line on either side.
+
+    ``old`` is the committed dump: its bytes (``bytes``) or the path of a file (anything else). If nothing but the
+    marker differs, the old content is still true from the old marker time on, so a commit path keeps the OLD file
+    (old marker included) instead of committing a one-line diff. A missing file or a ``None`` ``old`` is "changed"
+    (False): the caller then commits as before. Never raises."""
+    try:
+        if old is None:
+            return False
+        old_bytes = bytes(old) if isinstance(old, (bytes, bytearray)) else open(old, "rb").read()
+        with open(new_path, "rb") as f:
+            return _without_marker(f.read()) == _without_marker(old_bytes)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def keep_committed_dump_if_unchanged(git, sql_path, name: str = "knowledge.sql") -> bool:
+    """The one skip-unchanged step both commit paths use. ``git`` runs git in the repo that tracks ``name`` (the
+    caller's own runner, text mode). When the fresh dump at ``sql_path`` differs from ``HEAD:name`` by the marker
+    line only, restore the committed file with ``git checkout HEAD -- name`` (exact bytes, old marker) and return
+    True; the caller's ``git status`` then shows nothing to commit for it. In every other case, including any git
+    failure or a committed file git cannot decode, return False and leave the fresh dump in place. Never raises:
+    "unchanged" is an optimisation, a failed check must fall back to committing."""
+    try:
+        shown = git("show", f"HEAD:{name}")
+        if shown.returncode != 0 or not isinstance(shown.stdout, str):
+            return False
+        if not dump_matches_committed(sql_path, shown.stdout.encode("utf-8")):
+            return False
+        return git("checkout", "HEAD", "--", name).returncode == 0
+    except Exception:  # noqa: BLE001 - see the docstring
+        return False
 
 
 # Tables whose contents are derived/regenerable and must never reach the dump.
@@ -157,7 +215,7 @@ def _verify_dump_restores(sql_path: str, expected_nodes: "int | None") -> "int |
     return got
 
 
-def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
+def dump_stripped(src_db_path: str, out_sql_path: str, dumped_at: "str | None" = None) -> dict:
     """Write a regenerable-stripped SQL text dump of ``src_db_path`` to ``out_sql_path``.
 
     Pure-Python: takes a consistent hot backup via the sqlite3 module's
@@ -172,11 +230,24 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
     failure the temp is removed, the previous ``out_sql_path`` is left
     byte-identical (or absent), and the error is raised.
 
+    The first line of the dump is the comment ``-- engram-dumped-at: <UTC ISO time>``
+    (``DUMP_MARKER_PREFIX``): the moment the dump's content was true of the live graph. By default that is now,
+    read before the hot backup. A caller that dumps a CAPTURED copy later than it captured it (the snapshot
+    worker) passes ``dumped_at`` (``format_dump_time`` format) with the capture time; anything else raises
+    ``ValueError`` before anything is written.
+
     Returns a stats dict: ``{statements, bytes, fts_excluded, vec_excluded,
-    verified_nodes}``.
+    verified_nodes, dumped_at}``.
     Raises on failure — callers MUST surface errors, never ``except: pass`` them
     (silent skip is the failure mode this module exists to eliminate).
     """
+    # The dump time is read BEFORE the hot backup, so it is never later than the data it stamps: a change made
+    # between this read and the backup is in the dump AND stamped after it, which only makes a later drill
+    # more lenient, never wrongly strict.
+    if dumped_at is None:
+        dumped_at = format_dump_time()
+    elif not isinstance(dumped_at, str) or not _DUMP_TIME_RE.match(dumped_at):
+        raise ValueError("dumped_at must be a UTC time like 2026-01-02T03:04:05.123456Z (see format_dump_time)")
     src = sqlite3.connect(src_db_path)
     fd, snap = tempfile.mkstemp(
         suffix=".snap.db", dir=os.path.dirname(os.path.abspath(src_db_path)), prefix=".engram-bk-"
@@ -259,6 +330,7 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
             ).fetchone()
             statements = 0
             with out_f as f:
+                f.write(DUMP_MARKER_PREFIX + dumped_at + "\n")  # a comment, not a statement: not counted
                 for line in bk.iterdump():
                     if not has_autoinc and line.startswith('DELETE FROM "sqlite_sequence"'):
                         continue
@@ -298,6 +370,7 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
         "fts_excluded": fts_excluded,
         "vec_excluded": vec_excluded,
         "verified_nodes": verified_nodes,
+        "dumped_at": dumped_at,
     }
 
 

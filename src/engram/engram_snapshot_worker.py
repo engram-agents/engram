@@ -236,7 +236,8 @@ def write_durable_snapshot(conn: sqlite3.Connection, turn: int, seq: int) -> dic
     would open a different, empty DB, so that is a failure, not a silent empty
     snapshot.
 
-    Returns {"path", "bytes", "fsynced": True} on success or {"error": str}.
+    Returns {"path", "bytes", "fsynced": True, "captured_at"} on success or {"error": str}; ``captured_at`` is the
+    time the copy was taken (``engram_backup.format_dump_time`` format), carried to the dump's marker (#4647).
     """
     pending = _pending_dir()
     final = pending / _snapshot_name(turn, seq)
@@ -253,6 +254,13 @@ def write_durable_snapshot(conn: sqlite3.Connection, turn: int, seq: int) -> dic
                 "(empty main path: :memory: or temp DB); a fresh connection would "
                 "open a different, empty database"
             )
+        # The CAPTURE time, read before the copy so it is never later than the state it stamps (#4647): the dump
+        # of this copy happens later, and its marker must say when the content was true of the live graph.
+        try:
+            import engram_backup  # lazy, like the other worker imports
+            captured_at = engram_backup.format_dump_time()
+        except Exception:  # noqa: BLE001 - a missing stamp must never fail the capture; the dump falls back to the mtime
+            captured_at = None
         src = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
         try:
             dest = sqlite3.connect(str(tmp))
@@ -265,7 +273,7 @@ def write_durable_snapshot(conn: sqlite3.Connection, turn: int, seq: int) -> dic
         _fsync_file(tmp)
         os.replace(str(tmp), str(final))
         _fsync_dir(pending)
-        return {"path": str(final), "bytes": final.stat().st_size, "fsynced": True}
+        return {"path": str(final), "bytes": final.stat().st_size, "fsynced": True, **({"captured_at": captured_at} if captured_at else {})}
     except Exception as e:
         try:
             tmp.unlink(missing_ok=True)
@@ -275,9 +283,13 @@ def write_durable_snapshot(conn: sqlite3.Connection, turn: int, seq: int) -> dic
         return {"error": str(e)}
 
 
-def enqueue_job(turn: int, seq: int, message: str, mode: str) -> dict:
+def enqueue_job(turn: int, seq: int, message: str, mode: str, captured_at: Optional[str] = None) -> dict:
     """Durably enqueue the async commit job for a captured snapshot and wake the
-    worker. fsync'd before returning — advance_turn returns only after this."""
+    worker. fsync'd before returning — advance_turn returns only after this.
+
+    ``captured_at`` (``write_durable_snapshot``'s) rides in the job record: the worker stamps it into the dump of the
+    captured copy as the dump's marker time (#4647). A record without one (an older queue) falls back to the
+    captured file's mtime."""
     entry = {
         "type": "job",
         "turn": turn,
@@ -287,6 +299,8 @@ def enqueue_job(turn: int, seq: int, message: str, mode: str) -> dict:
         "message": message,
         "mode": mode,
     }
+    if captured_at:
+        entry["captured_at"] = captured_at
     with _lock:
         _append_entry(entry)
     _work_event.set()
@@ -399,7 +413,7 @@ def _record_push_status(engram_core, push, commit_sha) -> None:
         _log(f"could not record backup push status: {e}")
 
 
-def _regenerate_derived_files(snapshot_path: Path) -> None:
+def _regenerate_derived_files(snapshot_path: Path, captured_at: Optional[str] = None) -> None:
     """Regenerate knowledge.sql AND graph_snapshot.md from the *captured* immutable
     snapshot (not the live DB).
 
@@ -413,7 +427,17 @@ def _regenerate_derived_files(snapshot_path: Path) -> None:
     import engram_core  # lazy
     # knowledge.sql from the captured binary
     import engram_backup
-    engram_backup.dump_stripped(str(snapshot_path), str(engram_core.DATA_DIR / "knowledge.sql"))
+    # The marker is the CAPTURE time (#4647), not the time of this dump: the job's captured_at, else (a record from
+    # before the field existed) the captured file's mtime, the closest value the worker still has.
+    if not captured_at:
+        try:
+            captured_at = engram_backup.format_dump_time(Path(snapshot_path).stat().st_mtime)
+        except OSError:
+            captured_at = None
+    engram_backup.dump_stripped(str(snapshot_path), str(engram_core.DATA_DIR / "knowledge.sql"),
+                                dumped_at=captured_at)
+    # A dump that differs from the committed one by the marker alone is unchanged: keep the old file.
+    engram_backup.keep_committed_dump_if_unchanged(engram_core._git, engram_core.DATA_DIR / "knowledge.sql")
     # graph_snapshot.md from the captured binary (read-only)
     # immutable=1: the captured snapshot never changes, so tell SQLite to skip all
     # locking and WAL/-shm handling — otherwise a WAL-header'd snapshot leaves -wal/
@@ -471,7 +495,7 @@ def _process_job(job: dict) -> bool:
             _log(f"CRITICAL: snapshot missing for job turn={turn},seq={seq} ({snap.name}); retiring job")
             _mark_done(turn, seq)
             return False
-        _regenerate_derived_files(snap)
+        _regenerate_derived_files(snap, captured_at=job.get("captured_at"))
         commit = _commit_snapshot_files(job.get("mode", "nap"), job.get("message", ""))
         if not commit.get("git_committed") and not _is_benign_no_commit(commit.get("reason", "")):
             # Allow-list (#4843): ONLY the reasons in _is_benign_no_commit retire a job

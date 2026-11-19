@@ -10817,7 +10817,7 @@ def _commit_snapshot_async(
 
     # 5. Durably enqueue the async commit job (fsync'd inside enqueue_job) — the tool
     #    returns only after this, honoring the "return after enqueue + fsync" guarantee.
-    _sw.enqueue_job(turn, seq, message, mode)
+    _sw.enqueue_job(turn, seq, message, mode, captured_at=capture.get("captured_at"))
 
     result = {
         "async": True,
@@ -11050,6 +11050,13 @@ def _commit_snapshot_sync(
         _dump_fields["read_mark_error"] = _read_mark_error
     if _read_mark_release_error is not None:
         _dump_fields["read_mark_release_error"] = _read_mark_release_error
+
+    # 2d. A dump that differs from the committed one by its marker line only is NOT a change (#4647): keep the
+    #     committed file (old marker; its content is still true from that time on) so the status check below
+    #     skips it as it did before the marker existed.
+    if _dump_stats is not None and _dump_error is None:
+        import engram_backup as _eb
+        _eb.keep_committed_dump_if_unchanged(_git, sql_dump_path)
 
     # 3. Stage explicit files only (never `git add .` — would pull in backups,
     #    daemon sockets, etc.)

@@ -175,6 +175,11 @@ def unguarded_direct_openers(tools_dir: Path, ledger_text: str, known_direct=KNO
                 continue
             if head == "direct-by-design" and phase == "pre-owner":
                 continue
+            # #4799: a read-only checker of the store (phase `independent-check`); the checker of the ledger
+            # (tools/check_2652_ledger.py) owns the `ro` access rule, this guard owns "every direct opener is
+            # accounted for", so it accepts exactly the phase with a stated reason and nothing near it
+            if head == "direct-by-design" and re.fullmatch(r"independent-check\s*—\s*\S.*", phase, re.S):
+                continue
             if head == "direct-by-design" and phase == "exclusive-maintenance":
                 if not locks:
                     problems.append(f"{path.name}: ledger says exclusive-maintenance but the tool takes no "
@@ -276,6 +281,38 @@ def _tools(tmp_path, files):
 
 
 EXCL = "direct-by-design: exclusive-maintenance"
+
+
+IC = "direct-by-design: independent-check"
+IC_REASON = " — compares the live store with its restored copy; the owner may be what is wrong"
+
+
+def test_c6_independent_check_with_a_reason_is_green_without_the_lock(tmp_path):
+    """#4799: a read-only checker of the store may open it directly; the phase carries a reason."""
+    d = _tools(tmp_path, {"drill.py": OPENS})
+    ledger = _ledger([("drill.py", "live store", IC + IC_REASON)])
+    assert unguarded_direct_openers(d, ledger, known_direct={}) == []
+
+
+@pytest.mark.parametrize("state", [
+    IC,                                  # no reason
+    IC + " —",                           # a dash and nothing after it
+    IC + " —   ",                        # only whitespace after it
+    "direct-by-design: independent-checks" + IC_REASON,   # a near-miss spelling is another phase
+    "direct-by-design: independent-check-ish" + IC_REASON,
+    "direct-by-design: independent-check:" + IC_REASON,   # a colon is not the separator
+    "direct-by-design: self-check" + IC_REASON,           # an unknown phase
+])
+def test_c6_independent_check_needs_its_exact_phase_and_a_reason_else_unclassified(tmp_path, state):
+    d = _tools(tmp_path, {"drill.py": OPENS})
+    problems = unguarded_direct_openers(d, _ledger([("drill.py", "live store", state)]), known_direct={})
+    assert any("drill.py" in p and "unclassified state" in p for p in problems), problems
+
+
+def test_c6_a_plain_direct_row_is_not_rescued_by_the_new_phase(tmp_path):
+    d = _tools(tmp_path, {"drill.py": OPENS})
+    problems = unguarded_direct_openers(d, _ledger([("drill.py", "live store", "direct")]), known_direct={})
+    assert any("drill.py" in p and "known-direct" in p for p in problems), problems
 
 
 def test_c6_a_planted_tool_that_opens_directly_without_the_lock_and_is_not_in_the_ledger_is_red(tmp_path):

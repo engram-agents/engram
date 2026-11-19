@@ -218,7 +218,7 @@ def test_write_durable_snapshot_creates_fsynced_immutable_file(_isolated):
 
 # ── _process_job orchestration (helpers monkeypatched) ─────────────────────
 def _stub_ok_helpers(monkeypatch, commit_result):
-    monkeypatch.setattr(w, "_regenerate_derived_files", lambda p: None)
+    monkeypatch.setattr(w, "_regenerate_derived_files", lambda p, **kw: None)
     monkeypatch.setattr(w, "_commit_snapshot_files", lambda mode, msg: commit_result)
 
 
@@ -271,7 +271,7 @@ def test_drain_stops_on_failure_preserving_order(monkeypatch, _isolated):
         return {"git_committed": False, "reason": "git commit failed"} if _current["turn"] == 2 \
             else {"git_committed": True}
     _current = {"turn": None}
-    def regen(p):
+    def regen(p, **kw):
         # p is snapshot-<turn>-1.db
         _current["turn"] = int(p.stem.split("-")[1])
     monkeypatch.setattr(w, "_regenerate_derived_files", regen)
@@ -292,7 +292,7 @@ def test_start_worker_replays_pending_on_startup(monkeypatch, _isolated):
     w.enqueue_job(5, 1, "pre-crash job", "sleep")
     assert len(w._pending_jobs()) == 1
     # Stub the git/regen helpers so replay does no real git.
-    monkeypatch.setattr(w, "_regenerate_derived_files", lambda p: None)
+    monkeypatch.setattr(w, "_regenerate_derived_files", lambda p, **kw: None)
     monkeypatch.setattr(w, "_commit_snapshot_files", lambda mode, msg: {"git_committed": True})
     w.start_worker()
     try:

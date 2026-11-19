@@ -475,7 +475,14 @@ def _tree(root: Path) -> dict:
         if p.name == "knowledge.db" or SAFETY_RE.search(p.name):
             out[rel] = "db"  # a db file's bytes are not reproducible; its rows are compared below
         else:
-            out[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+            data = p.read_bytes()
+            if p.name == "knowledge.sql":
+                # A dump's first line is a time-varying marker (``-- engram-dumped-at: ...``); two runs
+                # never agree on it, so it is dropped here. Every other byte is still compared.
+                head, sep, rest = data.partition(b"\n")
+                if head.startswith(b"-- engram-dumped-at: "):
+                    data = rest
+            out[rel] = hashlib.sha256(data).hexdigest()
     return out
 
 

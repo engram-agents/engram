@@ -545,6 +545,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/restore_drill.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/install_selfcheck.py",
       "tier": "essential"
     },
