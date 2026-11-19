@@ -34,8 +34,8 @@ The tool never writes: every direct open is `mode=ro`.
 Exit codes: 0 ok; 1 the store path is not a usable store (missing, uncheckable, not a regular file, or a file
 sqlite cannot read as a store; the class is named on stderr); 2 usage (argparse) or a RELATIVE ENGRAM_HOME;
 3 the owner refused or its answer could not be used; 4 the store looks healthy but a read-only open cannot read it
-(a WAL store, no -wal/-shm beside it, and a folder the reader cannot write: the cause is named on stderr; fix the
-folder or read through the owner, never restore the store over it).
+(a WAL store, no -shm beside it, and a folder the reader cannot write: the cause is named on stderr; fix the
+folder or read through the owner first, and restore only if the read still fails after that).
 
 Stdlib only. Python 3.10+: the flag-ON path imports the runtime client, which needs 3.10 (the scripted
 installer already refuses a python3 older than 3.10.7 before its step 6 calls node-count).
@@ -119,7 +119,7 @@ def unreadable_but_healthy(exc, db_path):
         if os.access(folder, os.W_OK | os.X_OK):
             return None
         return ("%s: the folder %s cannot be written, and a WAL store needs its -wal/-shm beside it to be read; "
-                "the store itself is not damaged" % (store, folder))
+                "the store itself is not shown to be damaged" % (store, folder))
     return ("%s: a read-only open could not create the -shm a WAL store needs beside it; "
             "the store itself is not shown to be damaged" % store)
 

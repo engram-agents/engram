@@ -8,12 +8,12 @@ Contract (each cell written before the change, red first):
 
   A   direct path, WAL store, no sidecars, folder not writable, a real SQLITE_READONLY error: node-count / ids /
       axiom-count exit 4, stdout empty, ONE stderr line saying the folder cannot be written, a WAL store needs its
-      -wal/-shm beside it, and the store is not damaged
+      -wal/-shm beside it, and the store is not shown to be damaged
   B   a real code-14 error ("unable to open database file") on a store whose header says WAL with no -shm beside
       it: exit 4, the line says a read-only open could not create the -shm, and does NOT say "permissions" (14 also
       fires in writable folders on some builds). Any other code-14 case stays exit 1 with today's wording
   C   every other sqlite3.Error stays exit 1 with today's wording (garbage bytes pinned)
-  D   install.sh step 6: exit 4 has its own FAIL (store not damaged, do not restore from backup, fix the folder or
+  D   install.sh step 6: exit 4 has its own FAIL (store not shown to be damaged, do not restore from backup yet, fix the folder or
       start the owner); exit 3 and other non-zero keep their messages
   E   the step-6 header comment says an owner can serve a zero-byte store, so that case stops at the owner refusal
   F   the docstring lists exit 4
@@ -139,7 +139,7 @@ def test_a_a_wal_store_in_an_unwritable_folder_exits_4_and_names_the_folder(lock
     line = bad[0]
     assert "cannot be written" in line, line
     assert "-wal" in line and "-shm" in line, line
-    assert "not damaged" in line, line
+    assert "not shown to be damaged" in line, line
     assert "does not read as a store" not in line, line
 
 
@@ -247,7 +247,7 @@ def test_d_installer_exit_4_has_its_own_fail_and_never_says_restore_from_backup(
     _stub_exit(sb, 4)
     sb.make_db(3)
     r, fail_line, boot = _step6_fail(sb)
-    assert "not damaged" in fail_line, fail_line
+    assert "not shown to be damaged" in fail_line and "restore it from backup yet" in fail_line, fail_line
     assert "do not restore" in fail_line.lower(), fail_line
     assert "permissions" in fail_line and str(sb.engram) in fail_line, fail_line
     assert "owner" in fail_line, fail_line
