@@ -297,6 +297,10 @@ def _service_manager_guard(service_manager_shim_dir, monkeypatch):
 #   - an ENGRAM_LIVE_FORUM_ENDPOINTS_4475 already set in the environment may ADD endpoints (it is the
 #     snapshot a second load reuses); it never removes the default pair, and a malformed value is
 #     replaced by a fresh resolve.
+#   - a test that monkeypatches `socket.socket.connect` / `connect_ex` ITSELF replaces the guard for that
+#     test's duration (three existing cells do, in tests/test_engram_pkg_render.py,
+#     tests/test_engram_signature.py and tests/test_engram_signature_codex.py; all install deny stubs,
+#     stricter than the guard, so nothing is open today; a pass-through patch would be).
 #
 # REPORT: the session install keeps one list of its refusals (host, port, running test). At
 # `pytest_sessionfinish` a non-empty list prints one line (count, first targets and tests) and an empty
