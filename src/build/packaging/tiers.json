@@ -1494,7 +1494,7 @@
       "tier": "essential"
     },
     {
-      "path": "templates/template.CLAUDE.single-agent.md",
+      "path": "templates/template.CLAUDE.local.md",
       "tier": "essential"
     },
     {

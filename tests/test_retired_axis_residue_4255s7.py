@@ -39,7 +39,6 @@ SCANNED = ("src", "tools")
 # (path, text, reason[, whole_line]) -> a hit line on that path may keep the word if the TEXT occurs in it
 # (or, with whole_line=True, if the stripped line equals the text).  No line numbers, on purpose.
 _RETIRE = "retirement machinery: the retired word is the point (#4255)"
-_PROFILE = "the single-agent CLAUDE.md profile's own name (#4802): one agent with one user, not the retired topology axis"
 ALLOWED = (
     # -- retirement machinery ------------------------------------------------------------------------
     ("src/build/engine/cli.py", '"--multi-agent",', _RETIRE + ": the accepted-and-ignored build flag", True),
@@ -58,50 +57,13 @@ ALLOWED = (
     ("tools/test_pre_dispatch_check.py", "it no longer says single-agent", _RETIRE + ": docstring of the absence assert"),
     ("tools/test_pre_dispatch_check.py", '"single-agent" not in result.stdout', _RETIRE + ": the absence assert"),
     ("tools/claude_md_moves.json", "so a single-agent contributor is just as", "a pinned verbatim quote of the last sentence of a block moved out of CLAUDE.md; the checker matches it byte for byte"),
-    # -- the single-agent CLAUDE.md profile's own name (#4802) -----------------------------------------------
-    # A profile for one agent working with one user. It is a name for a rendering of the identity template, not
-    # the retired multi-agent / single-agent topology axis (#4255); one entry per distinct line text.
-    ('src/build/engine/flows.py', '"single-agent": "template.CLAUDE.single-agent.md"', _PROFILE),
-    ('src/build/engine/flows.py', '"full", "single-agent" or "undetermined"', _PROFILE),
-    ('src/build/engine/flows.py', 'value == "single-agent"', _PROFILE),
-    ('src/build/engine/flows.py', 'return "single-agent"', _PROFILE),
-    ('src/build/packaging/tiers.json', 'templates/template.CLAUDE.single-agent.md', _PROFILE),
-    ('src/engram/bootstrap.py', '# `single-agent` is the same identity template', _PROFILE),
-    ('src/engram/bootstrap.py', 'CLAUDE_MD_PROFILES = ("full", "single-agent")', _PROFILE),
-    ('src/engram/bootstrap.py', '"single-agent": "template.CLAUDE.single-agent.md"', _PROFILE),
-    ('src/engram/bootstrap.py', 'A `single-agent` run records', _PROFILE),
-    ('src/engram/bootstrap.py', 'an aborted single-agent run', _PROFILE),
-    ('src/engram/bootstrap.py', 'never left saying single-agent over', _PROFILE),
-    ('src/engram/bootstrap.py', '(full or single-agent) picks', _PROFILE),
-    ('src/engram/bootstrap.py', '(single-agent is for one agent', _PROFILE),
-    ('src/engram/packaging/test-map.json', '"tests/test_single_agent_claude_md_profile.py"', _PROFILE),
-    ('src/engram/packaging/test-map.json', 'pins the single-agent render', _PROFILE),
-    ('src/engram/skills/claude/engram-first-session/SKILL.md', 'in a single-agent-profile file', _PROFILE),
-    ('src/engram/skills/claude/engram-first-session/SKILL.md', 'A single-agent-profile CLAUDE.md has no', _PROFILE),
-    ('src/engram/skills/claude/engram-upgrade/SKILL.md', 'single-agent = bootstrapped with', _PROFILE),
-    ('src/engram/skills/claude/engram-upgrade/SKILL.md', '[[:space:]]*"single-agent"', _PROFILE),
-    ('src/engram/template_render.py', 'tests/test_single_agent_claude_md_profile.py', _PROFILE),
-    ('src/engram/template_render.py', '"single-agent": ["template.CLAUDE.single-agent.md"]', _PROFILE),
-    ('src/engram/template_render.py', '"single-agent": "template.CLAUDE.single-agent.md"', _PROFILE),
-    ('src/engram/template_render.py', '"full", "single-agent" or "undetermined"', _PROFILE),
-    ('src/engram/template_render.py', 'value == "single-agent"', _PROFILE),
-    ('src/engram/template_render.py', 'return "single-agent"', _PROFILE),
-    ('src/engram/template_render.py', 'for single-agent)', _PROFILE),
-    ('src/engram/template_render.py', 'or "single-agent".', _PROFILE),
-    ('src/engram/templates/components/model-identity-gate-single-agent.md', 'id: model-identity-gate-single-agent', _PROFILE),
-    ('src/engram/templates/components/native-tools-ban-single-agent.md', 'id: native-tools-ban-single-agent', _PROFILE),
-    ('src/engram/templates/components/user-notes-verbatim-single-agent.md', 'id: user-notes-verbatim-single-agent', _PROFILE),
-    ('src/engram/templates/manifests/claude-code.CLAUDE.md.single-agent.json', '"profile": "single-agent"', _PROFILE),
-    ('src/engram/templates/manifests/claude-code.CLAUDE.md.single-agent.json', '"id": "user-notes-verbatim-single-agent"', _PROFILE),
-    ('src/engram/templates/manifests/claude-code.CLAUDE.md.single-agent.json', '"id": "model-identity-gate-single-agent"', _PROFILE),
-    ('src/engram/templates/manifests/claude-code.CLAUDE.md.single-agent.json', '"id": "native-tools-ban-single-agent"', _PROFILE),
-    ('src/engram/tools/check-claude-md-drift.py', '(single-agent -> template.CLAUDE.single-agent.md)', _PROFILE),
-    ('src/engram/templates/manifests/claude-code.CLAUDE.md.single-agent.json', '"header": "> Profile: single-agent.', _PROFILE),
-    ('src/engram/templates/template.CLAUDE.single-agent.md', '> Profile: single-agent.', _PROFILE),
-    ('src/engram/bootstrap.py', 'SINGLE_AGENT_PROFILE_NOTICE', _PROFILE),
-    ('src/engram/bootstrap.py', 'profile == "single-agent"', _PROFILE),
-    ('src/engram/bootstrap.py', 'CLAUDE.md profile: single-agent.', _PROFILE),
-    ('src/engram/tools/install.sh', 'single-agent is a', _PROFILE),
+    # -- the `local` CLAUDE.md profile's header: the one sentence that may carry the word (#4802) ----------
+    # Lei's 11-17 ruling (relayed by Kepler): the profile is "a purely local, single-agent setup". Exactly the two lines
+    # that carry that sentence, matched whole; any other use of the word under src/ or tools/ still fails.
+    ("src/engram/templates/manifests/claude-code.CLAUDE.md.local.json", '"header": "> Profile: local. A purely local, single-agent setup: one agent working with one user on one machine, no agent team, no long-running autonomous loop. Not fully tested. Made for the local benchmark effort (https://github.com/engram-agents/engram-benchmarks); see README-AGENT.md.",',
+     "Lei's 11-17 ruling (relayed by Kepler): the sentence 'a purely local, single-agent setup' in the profile's header field", True),
+    ("src/engram/templates/template.CLAUDE.local.md", '> Profile: local. A purely local, single-agent setup: one agent working with one user on one machine, no agent team, no long-running autonomous loop. Not fully tested. Made for the local benchmark effort (https://github.com/engram-agents/engram-benchmarks); see README-AGENT.md.',
+     "Lei's 11-17 ruling (relayed by Kepler): the same sentence, the rendered file's first line", True),
     # -- a real historical artifact --------------------------------------------------------------------
     ("src/engram/viz/agents.py", "viz-server-multi-agent-2026-05-04.md", "the real filename of a dated design note (active-work/); renaming it in prose would cite a file that does not exist"),
     # -- a fixture of the past -------------------------------------------------------------------------
@@ -300,8 +262,6 @@ DOC_ALLOWED = (
     ("docs/internal/DEVELOPMENT.md", "from the 2026-05-02 multi-agent", "a dated historical aside about the 2026-05-02 migration"),
     ("docs/internal/2574-telemetry-design.md", "multi_agent", "a design record: it quotes the tiers.json entry shape as it stood when the design was written"),
     ("docs/internal/864-multi-env-harness-design.md", "single / multi-agent", "a design record: the harness matrix as it stood when #864 was designed"),
-    ("README-AGENT.md", "install.sh --claude-md-profile single-agent", _PROFILE),
-    ("README-AGENT.md", "**What the `single-agent` profile is.**", _PROFILE),
     # the block "Moved from CLAUDE.md ... Verbatim; moved, not edited" (Ariadne's ruling B): a dated verbatim record, pinned by
     # tools/claude_md_moves.json; the live rule sits in CLAUDE.md. One entry per quoted line that carries the words.
     ("docs/internal/PR-MERGE-POLICY.md", "it holds identically in single-agent and", "verbatim move record (2026-10-03, #3322): the quoted rule text"),

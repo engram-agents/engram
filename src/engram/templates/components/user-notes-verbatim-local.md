@@ -1,5 +1,5 @@
 ---
-id: user-notes-verbatim-single-agent
+id: user-notes-verbatim-local
 kind: rule
 harnesses: [claude-code]
 surfaces: [CLAUDE.md]

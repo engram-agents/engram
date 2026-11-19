@@ -611,16 +611,16 @@ _FIXED_SEED_IDS = _seed_ids_on_empty_graph()
 
 
 # The CLAUDE.md profiles bootstrap can render. `full` is the default and is never recorded;
-# `single-agent` is the same identity template with fewer components, for one agent working with one user
-# on one machine (the purpose and limits text: SINGLE_AGENT_PROFILE_NOTICE below).
-CLAUDE_MD_PROFILES = ("full", "single-agent")
+# `local` is the same identity template with fewer components, for one agent working with one user
+# on one machine (the purpose and limits text: LOCAL_PROFILE_NOTICE below).
+CLAUDE_MD_PROFILES = ("full", "local")
 CLAUDE_MD_PROFILE_CONFIG_KEY = "claude_md_profile"
-_CLAUDE_MD_TEMPLATE_NAMES = {"full": "template.CLAUDE.md", "single-agent": "template.CLAUDE.single-agent.md"}
+_CLAUDE_MD_TEMPLATE_NAMES = {"full": "template.CLAUDE.md", "local": "template.CLAUDE.local.md"}
 
 # What bootstrap prints when that profile is chosen: the facts the README, the installer's
 # --help and the changelog state too, in at most six lines.
-SINGLE_AGENT_PROFILE_NOTICE = (
-    "  CLAUDE.md profile: single-agent. A shorter CLAUDE.md designed for one agent working with one user on one machine,",
+LOCAL_PROFILE_NOTICE = (
+    "  CLAUDE.md profile: local. A shorter CLAUDE.md designed for one agent working with one user on one machine,",
     "  with no agent team and no long-running autonomous loop. It keeps the authority table, the trust-tier pointer and the",
     "  signature rule for outward messages. It does not carry agent coordination, the loop-mode policy, the fairy and delegation",
     "  sections (the ban on the native deep-research and Workflow tools stays), \"Who I Am\", \"My Collaborator\" or the infrastructure",
@@ -638,9 +638,9 @@ def _record_claude_md_profile(profile: "str | None") -> None:
     """Keep config.json's CLAUDE.md profile record in step with the template about to be written,
     so a later upgrade compares the user's file against the template the file was rendered from.
 
-    A `single-agent` run records `single-agent`. A default or explicit `full` run records nothing new, but a
-    STALE `claude_md_profile` key already in config.json (an aborted single-agent run re-run with the
-    default profile) is overwritten with `full`, never left saying single-agent over a full file. The
+    A `local` run records `local`. A default or explicit `full` run records nothing new, but a
+    STALE `claude_md_profile` key already in config.json (an aborted local run re-run with the
+    default profile) is overwritten with `full`, never left saying local over a full file. The
     key is overwritten rather than removed because the config writer refuses to shrink the file.
     Both go through the config writer (temp file and rename, with a backup of a changed file).
     This runs after the seed graph exists and never creates config.json from empty.
@@ -842,7 +842,7 @@ def _parse_args(argv: list[str]) -> _Args:
     (repeatable) is consent for that path only. Either one is for use only after the user has
     seen the list and said yes. `--retention-days N` is the only way bootstrap touches
     ~/.claude/settings.json; N must be an integer 1..36500. `--claude-md-profile NAME`
-    (full or single-agent) picks which CLAUDE.md template is rendered; single-agent is for one agent working with one user.
+    (full or local) picks which CLAUDE.md template is rendered; local is for one agent working with one user.
     """
     force = False
     replace: list[str] = []
@@ -878,7 +878,7 @@ def _parse_args(argv: list[str]) -> _Args:
             if value not in CLAUDE_MD_PROFILES:
                 raise SystemExit(
                     f"[bootstrap] --claude-md-profile needs one of {', '.join(CLAUDE_MD_PROFILES)} "
-                    f"(single-agent is for one agent working with one user; full is the default), got "
+                    f"(local is for one agent working with one user; full is the default), got "
                     f"{value if value is not None else 'nothing'!r}"
                 )
             claude_md_profile = value
@@ -1214,9 +1214,9 @@ def main() -> None:
             print(f"  {item.path.name} → {item.path}", flush=True)
         else:
             print(f"  {item.path.name} unchanged (already holds what ENGRAM would write)", flush=True)
-    if TARGET == "claude" and profile == "single-agent":
+    if TARGET == "claude" and profile == "local":
         print("", flush=True)
-        for line in SINGLE_AGENT_PROFILE_NOTICE:
+        for line in LOCAL_PROFILE_NOTICE:
             print(line, flush=True)
         print("", flush=True)
 

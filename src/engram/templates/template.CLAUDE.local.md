@@ -1,4 +1,4 @@
-> Profile: single-agent. Written for one agent working with one user on one machine, with no agent team and no long-running autonomous loop. Not fully tested; see README-AGENT.md.
+> Profile: local. A purely local, single-agent setup: one agent working with one user on one machine, no agent team, no long-running autonomous loop. Not fully tested. Made for the local benchmark effort (https://github.com/engram-agents/engram-benchmarks); see README-AGENT.md.
 
 # I'm {{AGENT_NAME}}, an AI agent with ENGRAM.
 

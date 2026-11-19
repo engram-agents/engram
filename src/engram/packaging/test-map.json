@@ -1051,9 +1051,9 @@
         "tests/test_bootstrap_codex.py",
         "tests/test_3898_embedding_device.py",
         "tests/test_template_components.py",
-        "tests/test_single_agent_claude_md_profile.py"
+        "tests/test_local_claude_md_profile.py"
       ],
-      "note": "Template changes trigger manifest gate and bootstrap codex tests; test_3898_embedding_device.py reads config.json.example for the embedding.device / cpu_threads keys. test_template_components.py pins the full render to template.CLAUDE.md, and test_single_agent_claude_md_profile.py pins the single-agent render to template.CLAUDE.single-agent.md and runs bootstrap and the upgrade template-gate for the single-agent profile (both read components/ and manifests/ as well)."
+      "note": "Template changes trigger manifest gate and bootstrap codex tests; test_3898_embedding_device.py reads config.json.example for the embedding.device / cpu_threads keys. test_template_components.py pins the full render to template.CLAUDE.md, and test_local_claude_md_profile.py pins the local render to template.CLAUDE.local.md and runs bootstrap and the upgrade template-gate for the local profile (both read components/ and manifests/ as well)."
     },
     {
       "path_prefix_or_glob": "packaging/tiers.json",

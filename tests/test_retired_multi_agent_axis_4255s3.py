@@ -235,37 +235,19 @@ def test_project_claude_md_moves_check_passes():
     assert r.returncode == 0, r.stdout + r.stderr
 
 
-# The single-agent CLAUDE.md profile (#4802) is named in the two skills that must read or explain the recorded value
-# (the upgrade skill's template pick; the first-session skill's note on the model gate). That is a profile name, not the
-# retired topology axis, so exactly these phrases are set aside before the scan; any other use of the words still fails.
-PROFILE_NAME_PHRASES = (
-    "template.CLAUDE.single-agent.md",
-    "--claude-md-profile single-agent",
-    '"single-agent"',
-    "single-agent = bootstrapped",
-    "single-agent-profile",
-)
-
-
-def _without_profile_name(text: str) -> str:
-    for phrase in PROFILE_NAME_PHRASES:
-        text = text.replace(phrase, "")
-    return text
-
-
 # ── C5: the skills ──────────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("name", ELEVEN_SKILLS)
 def test_skill_names_no_retired_words(name):
     path = SKILLS / name / "SKILL.md"
     assert path.is_file()
-    m = RETIRED_WORDS.search(_without_profile_name(path.read_text(encoding="utf-8")))
+    m = RETIRED_WORDS.search(path.read_text(encoding="utf-8"))
     assert m is None, m and m.group(0)
 
 
 def test_no_shipped_skill_names_the_retired_words():
     bad = {}
     for p in sorted(SKILLS.glob("*/SKILL.md")):
-        m = RETIRED_WORDS.search(_without_profile_name(p.read_text(encoding="utf-8")))
+        m = RETIRED_WORDS.search(p.read_text(encoding="utf-8"))
         if m:
             bad[p.parent.name] = m.group(0)
     assert bad == {}

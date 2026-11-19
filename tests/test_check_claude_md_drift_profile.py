@@ -1,8 +1,8 @@
 """The CLAUDE.md drift tool diffs the profile the home RECORDED, not always the full template.
 
 Contract (config.json `claude_md_profile`; no record = full):
-  - a single-agent home reports NO drift against the single-agent template and never reports the full
-    template's extra sections as missing; a change to the full template alone is not single-agent drift;
+  - a local home reports NO drift against the local template and never reports the full
+    template's extra sections as missing; a change to the full template alone is not local drift;
   - a full home (record "full", null, or none) behaves as before;
   - an unrecognised recorded value is "undetermined": exit 2, a message, nothing compared,
     and no fallback to the full template.
@@ -20,8 +20,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI_PATH = REPO_ROOT / "src" / "engram" / "tools" / "check-claude-md-drift.py"
 
-_SINGLE_AGENT = "# Identity\n\nSingle-agent paragraph one.\n\nSingle-agent paragraph two.\n"
-_FULL = _SINGLE_AGENT + "\n## Full only section\n\nFull-only paragraph about fairies.\n"
+_LOCAL = "# Identity\n\nLocal paragraph one.\n\nLocal paragraph two.\n"
+_FULL = _LOCAL + "\n## Full only section\n\nFull-only paragraph about fairies.\n"
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -42,7 +42,7 @@ def repo(tmp_path: Path) -> Path:
     _git(r, "config", "user.email", "t@t.invalid")
     _git(r, "config", "user.name", "T")
     (d / "template.CLAUDE.md").write_text(_FULL, encoding="utf-8")
-    (d / "template.CLAUDE.single-agent.md").write_text(_SINGLE_AGENT, encoding="utf-8")
+    (d / "template.CLAUDE.local.md").write_text(_LOCAL, encoding="utf-8")
     _commit(r, "base")
     return r
 
@@ -75,9 +75,9 @@ def _two_ref(repo, home):
 
 # ---- live mode -------------------------------------------------------------
 
-def test_single_agent_home_live_no_drift_and_no_full_sections_missing(repo, tmp_path):
-    home = _home(tmp_path, {"claude_md_profile": "single-agent"})
-    rc, out, err = _live(repo, home, _SINGLE_AGENT, tmp_path)
+def test_local_home_live_no_drift_and_no_full_sections_missing(repo, tmp_path):
+    home = _home(tmp_path, {"claude_md_profile": "local"})
+    rc, out, err = _live(repo, home, _LOCAL, tmp_path)
     assert rc == 0, (out, err)
     assert "Full only" not in out and "fairies" not in out
     assert "0 missing" in out
@@ -86,34 +86,34 @@ def test_single_agent_home_live_no_drift_and_no_full_sections_missing(repo, tmp_
 def test_full_home_live_still_reports_full_sections_missing(repo, tmp_path):
     for record in (None, {}, {"claude_md_profile": "full"}, {"claude_md_profile": None}):
         home = _home(tmp_path, record)
-        rc, out, _ = _live(repo, home, _SINGLE_AGENT, tmp_path)
+        rc, out, _ = _live(repo, home, _LOCAL, tmp_path)
         assert rc == 1, record
         assert "Full-only paragraph" in out, record
 
 
-def test_single_agent_home_live_reports_a_missing_single_agent_paragraph(repo, tmp_path):
-    home = _home(tmp_path, {"claude_md_profile": "single-agent"})
-    rc, out, _ = _live(repo, home, "# Identity\n\nSingle-agent paragraph one.\n", tmp_path)
-    assert rc == 1 and "Single-agent paragraph two" in out
+def test_local_home_live_reports_a_missing_local_paragraph(repo, tmp_path):
+    home = _home(tmp_path, {"claude_md_profile": "local"})
+    rc, out, _ = _live(repo, home, "# Identity\n\nLocal paragraph one.\n", tmp_path)
+    assert rc == 1 and "Local paragraph two" in out
 
 
 # ---- two-ref mode ----------------------------------------------------------
 
-def test_single_agent_home_ignores_a_full_only_template_change(repo, tmp_path):
+def test_local_home_ignores_a_full_only_template_change(repo, tmp_path):
     t = repo / "src" / "engram" / "templates" / "template.CLAUDE.md"
     t.write_text(_FULL + "\nMore full text.\n", encoding="utf-8")
     _commit(repo, "full change")
-    assert _two_ref(repo, _home(tmp_path, {"claude_md_profile": "single-agent"}))[0] == 0
+    assert _two_ref(repo, _home(tmp_path, {"claude_md_profile": "local"}))[0] == 0
     rc, out, _ = _two_ref(repo, _home(tmp_path, None))
     assert rc == 1 and "More full text" in out
 
 
-def test_single_agent_home_sees_a_single_agent_template_change(repo, tmp_path):
-    t = repo / "src" / "engram" / "templates" / "template.CLAUDE.single-agent.md"
-    t.write_text(_SINGLE_AGENT + "\nNew single-agent text.\n", encoding="utf-8")
-    _commit(repo, "single-agent change")
-    rc, out, _ = _two_ref(repo, _home(tmp_path, {"claude_md_profile": "single-agent"}))
-    assert rc == 1 and "New single-agent text" in out
+def test_local_home_sees_a_local_template_change(repo, tmp_path):
+    t = repo / "src" / "engram" / "templates" / "template.CLAUDE.local.md"
+    t.write_text(_LOCAL + "\nNew local text.\n", encoding="utf-8")
+    _commit(repo, "local change")
+    rc, out, _ = _two_ref(repo, _home(tmp_path, {"claude_md_profile": "local"}))
+    assert rc == 1 and "New local text" in out
     assert _two_ref(repo, _home(tmp_path, None))[0] == 0
 
 
@@ -125,7 +125,7 @@ def test_unrecognised_record_is_undetermined_in_both_modes(repo, tmp_path, recor
     t = repo / "src" / "engram" / "templates" / "template.CLAUDE.md"
     t.write_text(_FULL + "\nMore full text.\n", encoding="utf-8")
     _commit(repo, "full change")
-    for rc, out, err in (_two_ref(repo, home), _live(repo, home, _SINGLE_AGENT, tmp_path)):
+    for rc, out, err in (_two_ref(repo, home), _live(repo, home, _LOCAL, tmp_path)):
         assert rc == 2
         assert "undetermined" in err and "ask the user" in err.lower()
         assert out == ""  # nothing compared, no fallback to the full template
@@ -160,8 +160,8 @@ def test_tool_and_upgrade_flow_read_the_same_profile(tmp_path):
     flows_reader = ns["_recorded_claude_md_profile"]
 
     cases = [None, "{not json", "[1]", "{}", '{"claude_md_profile": null}', '{"claude_md_profile": "full"}',
-             '{"claude_md_profile": "single-agent"}', '{"claude_md_profile": "tiny"}', '{"claude_md_profile": 3}',
-             '{"claude_md_profile": "Single-agent"}', '{"claude_md_profile": "single-agent "}',
+             '{"claude_md_profile": "local"}', '{"claude_md_profile": "tiny"}', '{"claude_md_profile": 3}',
+             '{"claude_md_profile": "Local"}', '{"claude_md_profile": "local "}',
              '{"claude_md_profile": "lean"}']
     for i, raw in enumerate(cases):
         h = tmp_path / f"h{i}"
@@ -170,9 +170,9 @@ def test_tool_and_upgrade_flow_read_the_same_profile(tmp_path):
             (h / "config.json").write_text(raw, encoding="utf-8")
         assert template_render.recorded_claude_md_profile(str(h)) == flows_reader(str(h)), raw
     assert template_render.recorded_claude_md_profile("") == flows_reader("") == "full"
-    # Case-variant and padded values are not "single-agent", and the retired working name "lean" is no
+    # Case-variant and padded values are not "local", and the retired working name "lean" is no
     # alias for it: both readers must refuse them the same way.
     for i, raw in enumerate(cases):
-        if raw and ("Single-agent" in raw or "single-agent \"" in raw or "lean" in raw):
+        if raw and ("Local" in raw or "local \"" in raw or "lean" in raw):
             h = tmp_path / f"h{i}"
             assert template_render.recorded_claude_md_profile(str(h)) == flows_reader(str(h)) == "undetermined", raw

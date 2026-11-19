@@ -1,5 +1,5 @@
 ---
-id: model-identity-gate-single-agent
+id: model-identity-gate-local
 kind: rule
 harnesses: [claude-code]
 surfaces: [CLAUDE.md]

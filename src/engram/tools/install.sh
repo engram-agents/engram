@@ -81,7 +81,7 @@ Options:
   --viz-service         install the viz dashboard service (Linux only; a no-op line on macOS)
   --forum-url URL       write forum.url into config.json
   --claude-md-profile NAME
-                        pass NAME to bootstrap.py, which checks it (a fresh seed only). single-agent is a
+                        pass NAME to bootstrap.py, which checks it (a fresh seed only). local is a
                         shorter CLAUDE.md for one agent working with one user on one machine, with no agent
                         team and no long-running loop; it is NOT fully tested. Made for the team's local
                         benchmark work: https://github.com/engram-agents/engram-benchmarks

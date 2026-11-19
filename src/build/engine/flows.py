@@ -207,12 +207,12 @@ def _is_clean(source_dir: str) -> bool:
 # offers the other one. A recorded value outside this table is "undetermined": nothing is compared.
 _CLAUDE_MD_PROFILE_KEY = "claude_md_profile"
 _CLAUDE_MD_TEMPLATE_DIR = "src/engram/templates"
-_CLAUDE_MD_TEMPLATES = {"full": "template.CLAUDE.md", "single-agent": "template.CLAUDE.single-agent.md"}
+_CLAUDE_MD_TEMPLATES = {"full": "template.CLAUDE.md", "local": "template.CLAUDE.local.md"}
 _PROFILE_UNDETERMINED = "undetermined"
 
 
 def _recorded_claude_md_profile(engram_home: str) -> str:
-    """The CLAUDE.md profile this home recorded: "full", "single-agent" or "undetermined".
+    """The CLAUDE.md profile this home recorded: "full", "local" or "undetermined".
 
     No config.json, no key, null, or "full" is the full profile. An unreadable config.json or
     any other value is undetermined, so no template is offered (a guess could offer the wrong one).
@@ -232,8 +232,8 @@ def _recorded_claude_md_profile(engram_home: str) -> str:
     value = config.get(_CLAUDE_MD_PROFILE_KEY)
     if value is None or value == "full":
         return "full"
-    if value == "single-agent":
-        return "single-agent"
+    if value == "local":
+        return "local"
     return _PROFILE_UNDETERMINED
 
 

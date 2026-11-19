@@ -1,6 +1,6 @@
-"""The `single-agent` CLAUDE.md profile: a second manifest over the existing components.
+"""The `local` CLAUDE.md profile: a second manifest over the existing components.
 
-`single-agent` is for one agent working with one user. It is a second, named rendering of the
+`local` is for one agent working with one user. It is a second, named rendering of the
 identity template: the same component files, fewer of them. These cells pin the
 contract written before the implementation:
 
@@ -10,11 +10,11 @@ contract written before the implementation:
       against the template OF THE RECORDED PROFILE, never offers the other one, and never
       writes the user's CLAUDE.md.
   (d) the new shippables are tiered.
-  (e) the single-agent render keeps the consent paragraph and the authority table.
+  (e) the local render keeps the consent paragraph and the authority table.
   (f) the dead-component rule still works with two manifests.
   (g) the joins at the new adjacencies are clean.
-  (h) bootstrap resolves the single-agent file's placeholders the way it resolves the full one's.
-  (i) the single-agent render is shorter and carries none of the dropped components' headings.
+  (h) bootstrap resolves the local file's placeholders the way it resolves the full one's.
+  (i) the local render is shorter and carries none of the dropped components' headings.
 
 All bootstrap runs use scratch homes through the environment.
 """
@@ -38,32 +38,32 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src" / "engram"
 TEMPLATES = SRC / "templates"
 FULL_TEMPLATE = TEMPLATES / "template.CLAUDE.md"
-SINGLE_AGENT_TEMPLATE = TEMPLATES / "template.CLAUDE.single-agent.md"
-SINGLE_AGENT_MANIFEST = TEMPLATES / "manifests" / "claude-code.CLAUDE.md.single-agent.json"
+LOCAL_TEMPLATE = TEMPLATES / "template.CLAUDE.local.md"
+LOCAL_MANIFEST = TEMPLATES / "manifests" / "claude-code.CLAUDE.md.local.json"
 FULL_MANIFEST = TEMPLATES / "manifests" / "claude-code.CLAUDE.md.json"
 BOOTSTRAP = SRC / "bootstrap.py"
 
-SINGLE_AGENT_IDS = [
+LOCAL_IDS = [
     "identity-opening",
-    "user-notes-verbatim-single-agent",
+    "user-notes-verbatim-local",
     "authority-structure-intro",
     "authority-structure-table-claude-code",
     "authority-structure-close",
     "trust-tier-pointer",
-    "model-identity-gate-single-agent",
+    "model-identity-gate-local",
     "engram-write-discipline",
     "engram-read-discipline",
     "confidence-anchors",
-    "native-tools-ban-single-agent",
+    "native-tools-ban-local",
     "engram-reference",
     "session-start-reading",
 ]
 
-BAN_ID = "native-tools-ban-single-agent"
-GATE_ID = "model-identity-gate-single-agent"
-NOTES_ID = "user-notes-verbatim-single-agent"
-# every single-agent-only component: in the single-agent manifest, in no full manifest
-SINGLE_AGENT_ONLY_IDS = (BAN_ID, GATE_ID, NOTES_ID)
+BAN_ID = "native-tools-ban-local"
+GATE_ID = "model-identity-gate-local"
+NOTES_ID = "user-notes-verbatim-local"
+# every profile-only component: in the local manifest, in no full manifest
+LOCAL_ONLY_IDS = (BAN_ID, GATE_ID, NOTES_ID)
 
 PLACEHOLDER = re.compile(r"\{\{[^}]+\}\}")
 
@@ -72,8 +72,8 @@ def _manifest_ids(path: Path) -> list[str]:
     return [e["id"] for e in json.loads(path.read_text(encoding="utf-8"))["components"]]
 
 
-def _single_agent() -> str:
-    return tcr.render("claude-code", "CLAUDE.md", "single-agent")[0]
+def _local() -> str:
+    return tcr.render("claude-code", "CLAUDE.md", "local")[0]
 
 
 def _full() -> str:
@@ -93,7 +93,7 @@ def test_a_profile_none_is_todays_bytes_positional_and_keyword():
 # --- (b) refusals --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["nonexistent", "Single-agent2", "single-agent-x", "full"])
+@pytest.mark.parametrize("name", ["nonexistent", "Local2", "local-x", "full"])
 def test_b_unknown_profile_raises_and_never_falls_back(name):
     with pytest.raises(tcr.TemplateComponentError):
         tcr.render("claude-code", "CLAUDE.md", name)
@@ -101,7 +101,7 @@ def test_b_unknown_profile_raises_and_never_falls_back(name):
 
 @pytest.mark.parametrize(
     "name",
-    ["../x", "a/b", "", ".", "..", "a\\b", "single-agent/../single-agent", "../../etc/passwd", "single-agent.json", " single-agent", "single-agent\n", "/abs"],
+    ["../x", "a/b", "", ".", "..", "a\\b", "local/../local", "../../etc/passwd", "local.json", " local", "local\n", "/abs"],
 )
 def test_b_path_shaped_name_raises_before_any_file_is_read(name, monkeypatch):
     def boom(*a, **k):
@@ -119,43 +119,43 @@ def test_b_non_string_profile_raises():
         tcr.render("claude-code", "CLAUDE.md", 7)  # type: ignore[arg-type]
 
 
-# --- the single-agent manifest and the committed single-agent template ------------------------------------
+# --- the local manifest and the committed local template ------------------------------------
 
 
-def test_single_agent_manifest_is_the_listed_ids_in_the_full_manifests_relative_order():
-    single_agent_ids = _manifest_ids(SINGLE_AGENT_MANIFEST)
-    assert single_agent_ids == SINGLE_AGENT_IDS
+def test_local_manifest_is_the_listed_ids_in_the_full_manifests_relative_order():
+    local_ids = _manifest_ids(LOCAL_MANIFEST)
+    assert local_ids == LOCAL_IDS
     full_ids = _manifest_ids(FULL_MANIFEST)
-    # The single-agent-only components have no place in the full manifest; the rest keep its relative order.
-    assert [i for i in single_agent_ids if i not in SINGLE_AGENT_ONLY_IDS] == [i for i in full_ids if i in set(single_agent_ids)], (
-        "the single-agent manifest must keep the full manifest's relative order"
+    # The profile-only components have no place in the full manifest; the rest keep its relative order.
+    assert [i for i in local_ids if i not in LOCAL_ONLY_IDS] == [i for i in full_ids if i in set(local_ids)], (
+        "the local manifest must keep the full manifest's relative order"
     )
     # The ban sits where its host section sits in the full file: after the confidence anchors,
     # before the ENGRAM Reference.
-    assert single_agent_ids.index(BAN_ID) == single_agent_ids.index("confidence-anchors") + 1
-    assert single_agent_ids.index(BAN_ID) == single_agent_ids.index("engram-reference") - 1
+    assert local_ids.index(BAN_ID) == local_ids.index("confidence-anchors") + 1
+    assert local_ids.index(BAN_ID) == local_ids.index("engram-reference") - 1
     # Each sentence sits where its host section sits in the full file: the gate sentence before the
     # write discipline (the full file has model-identity-gate just before it), the notes sentence
     # between the write and read disciplines (cross-surface-persistence's place).
-    assert single_agent_ids.index(GATE_ID) == single_agent_ids.index("engram-write-discipline") - 1
-    assert single_agent_ids.index(NOTES_ID) == single_agent_ids.index("identity-opening") + 1
-    assert single_agent_ids.index(NOTES_ID) == single_agent_ids.index("authority-structure-intro") - 1
+    assert local_ids.index(GATE_ID) == local_ids.index("engram-write-discipline") - 1
+    assert local_ids.index(NOTES_ID) == local_ids.index("identity-opening") + 1
+    assert local_ids.index(NOTES_ID) == local_ids.index("authority-structure-intro") - 1
 
 
-def test_single_agent_render_receipt_lists_the_manifest_ids():
-    _, receipt = tcr.render("claude-code", "CLAUDE.md", "single-agent")
-    assert [c["id"] for c in receipt["components"]] == SINGLE_AGENT_IDS
+def test_local_render_receipt_lists_the_manifest_ids():
+    _, receipt = tcr.render("claude-code", "CLAUDE.md", "local")
+    assert [c["id"] for c in receipt["components"]] == LOCAL_IDS
     assert receipt["excluded"] == []
 
 
-def test_single_agent_template_is_pinned_byte_identical_to_the_render():
-    assert SINGLE_AGENT_TEMPLATE.read_bytes() == _single_agent().encode("utf-8"), (
-        "template.CLAUDE.single-agent.md is generated by render('claude-code','CLAUDE.md','single-agent'); "
+def test_local_template_is_pinned_byte_identical_to_the_render():
+    assert LOCAL_TEMPLATE.read_bytes() == _local().encode("utf-8"), (
+        "template.CLAUDE.local.md is generated by render('claude-code','CLAUDE.md','local'); "
         "regenerate it with the renderer, never by hand"
     )
 
 
-# --- the single-agent-only native-tools ban ---------------------------------------------------------
+# --- the profile-only native-tools ban ---------------------------------------------------------
 
 BAN_START = "**BANNED"
 
@@ -169,27 +169,27 @@ def _full_ban_paragraph() -> str:
     return text[start:end]
 
 
-def test_ban_single_agent_component_body_equals_the_full_components_paragraph_byte_for_byte():
+def test_ban_local_component_body_equals_the_full_components_paragraph_byte_for_byte():
     para = _full_ban_paragraph()
     assert para.strip() and "NATIVE deep-research" in para and "`Workflow`" in para
     fm, body = tcr._load_component(BAN_ID)
-    # heading rule: a single-agent-only component at an absent anchor renders as its own heading, then the paragraph;
+    # heading rule: a profile-only component at an absent anchor renders as its own heading, then the paragraph;
     # the body owns its trailing blank line (whitespace-ownership rule): paragraph, then one "\n"
     assert body == "## " + fm["anchor"] + "\n\n" + para + "\n"
 
 
-def test_ban_single_agent_component_is_in_the_single_agent_manifest_and_not_in_the_full_manifest():
-    assert BAN_ID in _manifest_ids(SINGLE_AGENT_MANIFEST)
+def test_ban_local_component_is_in_the_local_manifest_and_not_in_the_full_manifest():
+    assert BAN_ID in _manifest_ids(LOCAL_MANIFEST)
     assert BAN_ID not in _manifest_ids(FULL_MANIFEST)
 
 
-def test_ban_paragraph_renders_exactly_once_in_single_agent_and_exactly_once_in_full():
+def test_ban_paragraph_renders_exactly_once_in_local_and_exactly_once_in_full():
     para = _full_ban_paragraph()
-    assert _single_agent().count(para) == 1
+    assert _local().count(para) == 1
     assert _full().count(para) == 1
 
 
-# --- the two single-agent-only sentences (model identity gate; notes stay verbatim) ----------------
+# --- the two profile-only sentences (model identity gate; notes stay verbatim) ----------------
 
 
 GATE_PARAGRAPH_START = "My trusted family is recorded once, at the first session"
@@ -215,7 +215,7 @@ def _gate_mismatch_bullet() -> str:
 
 
 def _gate_text() -> str:
-    """The two lines the single-agent gate carries, as the full file lays them out: the paragraph, a blank line, the bullet."""
+    """The two lines the local gate carries, as the full file lays them out: the paragraph, a blank line, the bullet."""
     return _gate_paragraph() + "\n\n" + _gate_mismatch_bullet()
 
 
@@ -244,7 +244,7 @@ _SENTENCES = [
 
 
 @pytest.mark.parametrize("cid,get_sentence,marker", _SENTENCES)
-def test_single_agent_sentence_component_body_equals_the_full_files_sentence_byte_for_byte(cid, get_sentence, marker):
+def test_local_sentence_component_body_equals_the_full_files_sentence_byte_for_byte(cid, get_sentence, marker):
     sentence = get_sentence()
     assert sentence.strip() and marker in sentence and "\n" not in sentence
     fm, body = tcr._load_component(cid)
@@ -254,15 +254,15 @@ def test_single_agent_sentence_component_body_equals_the_full_files_sentence_byt
 
 
 @pytest.mark.parametrize("cid", [GATE_ID, NOTES_ID], ids=["gate", "notes"])
-def test_single_agent_sentence_component_is_in_the_single_agent_manifest_and_not_in_the_full_manifest(cid):
-    assert cid in _manifest_ids(SINGLE_AGENT_MANIFEST)
+def test_local_sentence_component_is_in_the_local_manifest_and_not_in_the_full_manifest(cid):
+    assert cid in _manifest_ids(LOCAL_MANIFEST)
     assert cid not in _manifest_ids(FULL_MANIFEST)
 
 
 @pytest.mark.parametrize("cid,get_sentence,marker", _SENTENCES)
-def test_single_agent_sentence_renders_exactly_once_in_single_agent_and_exactly_once_in_full(cid, get_sentence, marker):
+def test_local_sentence_renders_exactly_once_in_local_and_exactly_once_in_full(cid, get_sentence, marker):
     sentence = get_sentence()
-    assert _single_agent().count(sentence) == 1
+    assert _local().count(sentence) == 1
     assert _full().count(sentence) == 1
 
 
@@ -284,7 +284,7 @@ def test_gate_lines_are_the_ones_the_ruling_names():
 
 def test_gate_component_body_is_the_heading_and_the_two_full_file_lines_byte_for_byte():
     fm, body = tcr._load_component(GATE_ID)
-    # heading rule: the anchor heading is absent from the single-agent file, so the component brings its own;
+    # heading rule: the anchor heading is absent from the local file, so the component brings its own;
     # the lines are laid out as the full file lays them out (paragraph, blank line, bullet); the body owns its
     # trailing blank line (whitespace-ownership rule).
     assert body == "## " + fm["anchor"] + "\n\n" + _gate_paragraph() + "\n\n" + _gate_mismatch_bullet() + "\n"
@@ -295,24 +295,24 @@ def test_gate_component_version_was_bumped_past_the_one_sentence_version():
     assert fm["version"] >= 2, "the component's text changed; its version must move"
 
 
-def test_gate_lines_render_once_each_in_single_agent_and_once_each_in_the_full_template_and_render():
+def test_gate_lines_render_once_each_in_local_and_once_each_in_the_full_template_and_render():
     para, bullet = _gate_paragraph(), _gate_mismatch_bullet()
-    single_agent = _single_agent()
+    local = _local()
     for line in (para, bullet):
-        assert single_agent.split("\n").count(line) == 1
+        assert local.split("\n").count(line) == 1
         assert _full().split("\n").count(line) == 1
         # the committed full template carries them too, so a drift in the template alone is caught here as well
         assert FULL_TEMPLATE.read_text(encoding="utf-8").split("\n").count(line) == 1
-    assert ("## Model Identity Gate\n\n" + para + "\n\n" + bullet + "\n") in single_agent
+    assert ("## Model Identity Gate\n\n" + para + "\n\n" + bullet + "\n") in local
 
 
-def test_gate_section_in_the_single_agent_render_holds_exactly_the_two_lines():
-    lines = _single_agent().splitlines()
+def test_gate_section_in_the_local_render_holds_exactly_the_two_lines():
+    lines = _local().splitlines()
     start = lines.index("## Model Identity Gate") + 1
     end = next(i for i in range(start, len(lines)) if lines[i].startswith("## "))
     assert [ln for ln in lines[start:end] if ln.strip()] == [_gate_paragraph(), _gate_mismatch_bullet()]
 
-# --- heading rule: a single-agent-only component at an absent anchor brings its own heading ----------
+# --- heading rule: a profile-only component at an absent anchor brings its own heading ----------
 
 _HEADED = [
     pytest.param(GATE_ID, "Model Identity Gate", "External interactions", "trust-tier-pointer", _gate_text, id="gate"),
@@ -331,32 +331,32 @@ def test_heading_line_equals_the_components_own_anchor_field(cid, anchor, prev_s
 
 
 @pytest.mark.parametrize("cid,anchor,prev_section,prev_id,get_text", _HEADED)
-def test_heading_appears_once_in_single_agent_with_the_text_directly_under_it(cid, anchor, prev_section, prev_id, get_text):
-    single_agent = _single_agent()
-    assert single_agent.split("\n").count("## " + anchor) == 1
-    assert ("## " + anchor + "\n\n" + get_text() + "\n") in single_agent
+def test_heading_appears_once_in_local_with_the_text_directly_under_it(cid, anchor, prev_section, prev_id, get_text):
+    local = _local()
+    assert local.split("\n").count("## " + anchor) == 1
+    assert ("## " + anchor + "\n\n" + get_text() + "\n") in local
     # the full render keeps its own single heading from the full components
     assert _full().split("\n").count("## " + anchor) == 1
 
 
 @pytest.mark.parametrize("cid,anchor,prev_section,prev_id,get_text", _HEADED)
 def test_the_text_no_longer_sits_at_the_end_of_the_previous_section(cid, anchor, prev_section, prev_id, get_text):
-    lines = _single_agent().split("\n")
+    lines = _local().split("\n")
     blanks, before = _blank_lines_before(lines, lines.index("## " + anchor))
     assert blanks == 1
-    # the line before the blank is the previous single-agent component's last line, not the moved text
+    # the line before the blank is the previous local component's last line, not the moved text
     assert before == _last_line(prev_id)
     assert before != get_text()
 
 
 def test_notes_scope_line_and_sentence_sit_after_my_goal_and_before_authority_structure():
-    single_agent = _single_agent()
+    local = _local()
     block = _scope_line() + "\n\n" + _notes_sentence() + "\n"
-    assert single_agent.count(block) == 1
-    at = single_agent.index(block)
-    assert single_agent.index("## My Goal") < at < single_agent.index("## Authority Structure")
+    assert local.count(block) == 1
+    at = local.index(block)
+    assert local.index("## My Goal") < at < local.index("## Authority Structure")
     # directly before the Authority Structure heading: block, one blank line, heading
-    assert single_agent[at + len(block):].startswith("\n## Authority Structure")
+    assert local[at + len(block):].startswith("\n## Authority Structure")
 
 
 # --- (e) consent paragraph and authority table --------------------------------------------
@@ -367,18 +367,18 @@ def _component_body(component_id: str) -> str:
     return raw.split("\n---\n", 1)[1]
 
 
-def test_e_single_agent_keeps_the_consent_paragraph_and_the_authority_table():
+def test_e_local_keeps_the_consent_paragraph_and_the_authority_table():
     close = _component_body("authority-structure-close")
     match = re.search(r"[^.\n]*claims no consent[^.\n]*\.", close)
     assert match, "authority-structure-close no longer holds the 'claims no consent' sentence"
     sentence = match.group(0).strip()
     assert sentence and "claims no consent" in sentence
-    single_agent = _single_agent()
-    assert sentence in single_agent
+    local = _local()
+    assert sentence in local
     table_header = "| Class | Examples | My authority |"
     assert table_header in _component_body("authority-structure-table-claude-code")
-    assert table_header in single_agent
-    ids = [c["id"] for c in tcr.render("claude-code", "CLAUDE.md", "single-agent")[1]["components"]]
+    assert table_header in local
+    ids = [c["id"] for c in tcr.render("claude-code", "CLAUDE.md", "local")[1]["components"]]
     assert "authority-structure-close" in ids
     assert "authority-structure-table-claude-code" in ids
 
@@ -412,34 +412,34 @@ def _component_file(component_id: str) -> str:
 
 
 def test_f_a_component_listed_only_in_the_full_manifest_is_live_not_dead():
-    only_full = set(_manifest_ids(FULL_MANIFEST)) - set(_manifest_ids(SINGLE_AGENT_MANIFEST))
-    assert only_full, "the single-agent manifest should drop some components"
-    # Rendering single-agent succeeds: nothing in components/ is flagged dead.
-    tcr.render("claude-code", "CLAUDE.md", "single-agent")
+    only_full = set(_manifest_ids(FULL_MANIFEST)) - set(_manifest_ids(LOCAL_MANIFEST))
+    assert only_full, "the local manifest should drop some components"
+    # Rendering local succeeds: nothing in components/ is flagged dead.
+    tcr.render("claude-code", "CLAUDE.md", "local")
     assert only_full <= tcr._all_referenced_component_ids()
 
 
-def test_f_a_component_in_no_manifest_still_fails_a_single_agent_render(tmp_path, monkeypatch):
+def test_f_a_component_in_no_manifest_still_fails_a_local_render(tmp_path, monkeypatch):
     scratch = _scratch(tmp_path, monkeypatch)
-    (scratch / "components" / "orphan-for-single-agent.md").write_text(
-        _component_file("orphan-for-single-agent"), encoding="utf-8"
+    (scratch / "components" / "orphan-for-local.md").write_text(
+        _component_file("orphan-for-local"), encoding="utf-8"
     )
-    with pytest.raises(tcr.TemplateComponentError, match="orphan-for-single-agent"):
-        tcr.render("claude-code", "CLAUDE.md", "single-agent")
-    with pytest.raises(tcr.TemplateComponentError, match="orphan-for-single-agent"):
+    with pytest.raises(tcr.TemplateComponentError, match="orphan-for-local"):
+        tcr.render("claude-code", "CLAUDE.md", "local")
+    with pytest.raises(tcr.TemplateComponentError, match="orphan-for-local"):
         tcr.render("claude-code", "CLAUDE.md")
 
 
-def test_f_a_component_listed_only_in_the_single_agent_manifest_is_live(tmp_path, monkeypatch):
+def test_f_a_component_listed_only_in_the_local_manifest_is_live(tmp_path, monkeypatch):
     scratch = _scratch(tmp_path, monkeypatch)
-    (scratch / "components" / "single-agent-only-extra.md").write_text(
-        _component_file("single-agent-only-extra"), encoding="utf-8"
+    (scratch / "components" / "profile-only-extra.md").write_text(
+        _component_file("profile-only-extra"), encoding="utf-8"
     )
-    path = scratch / "manifests" / "claude-code.CLAUDE.md.single-agent.json"
+    path = scratch / "manifests" / "claude-code.CLAUDE.md.local.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    manifest["components"].append({"id": "single-agent-only-extra", "anchor": "Nowhere"})
+    manifest["components"].append({"id": "profile-only-extra", "anchor": "Nowhere"})
     path.write_text(json.dumps(manifest), encoding="utf-8")
-    text, _ = tcr.render("claude-code", "CLAUDE.md", "single-agent")
+    text, _ = tcr.render("claude-code", "CLAUDE.md", "local")
     assert "A scratch component." in text
     tcr.render("claude-code", "CLAUDE.md")
 
@@ -467,14 +467,14 @@ def _blank_lines_before(lines: list[str], index: int) -> tuple[int, str]:
 
 
 def test_g_no_run_of_three_blank_lines_and_one_final_newline():
-    single_agent = _single_agent()
-    assert "\n\n\n\n" not in single_agent, "a run of 3+ blank lines"
-    assert single_agent.endswith("\n") and not single_agent.endswith("\n\n"), "must end with exactly one newline"
-    assert not single_agent.startswith("\n")
+    local = _local()
+    assert "\n\n\n\n" not in local, "a run of 3+ blank lines"
+    assert local.endswith("\n") and not local.endswith("\n\n"), "must end with exactly one newline"
+    assert not local.startswith("\n")
 
 
 def test_g_every_heading_is_preceded_by_a_blank_line():
-    lines = _single_agent().split("\n")
+    lines = _local().split("\n")
     in_fence = False
     for i, line in enumerate(lines):
         if line.lstrip().startswith("```"):
@@ -483,14 +483,14 @@ def test_g_every_heading_is_preceded_by_a_blank_line():
             assert lines[i - 1].strip() == "", f"heading glued to the paragraph above: {line!r}"
 
 
-_PAIRS = list(zip(SINGLE_AGENT_IDS, SINGLE_AGENT_IDS[1:]))
+_PAIRS = list(zip(LOCAL_IDS, LOCAL_IDS[1:]))
 
 
 @pytest.mark.parametrize("prev_id,next_id", _PAIRS)
 def test_g_boundary_shape_at_each_adjacency(prev_id, next_id):
     """One blank line between components, unless the full document differs at the same boundary."""
     full_ids = _manifest_ids(FULL_MANIFEST)
-    # the single-agent-only components are in no full manifest, so no full-render boundary exists to compare with
+    # the profile-only components are in no full manifest, so no full-render boundary exists to compare with
     adjacent_in_full = (
         not {BAN_ID, GATE_ID, NOTES_ID} & {prev_id, next_id} and full_ids.index(next_id) == full_ids.index(prev_id) + 1
     )
@@ -501,12 +501,12 @@ def test_g_boundary_shape_at_each_adjacency(prev_id, next_id):
         assert flines.count(nf) == 1, f"{next_id}: first line not unique in the full render"
         expected, before = _blank_lines_before(flines, flines.index(nf))
         assert before == _last_line(prev_id)
-    lines = _single_agent().split("\n")
+    lines = _local().split("\n")
     nl = _first_line(next_id)
-    assert lines.count(nl) == 1, f"{next_id}: first line not unique in the single-agent render"
+    assert lines.count(nl) == 1, f"{next_id}: first line not unique in the local render"
     blanks, before = _blank_lines_before(lines, lines.index(nl))
     assert before == _last_line(prev_id), (
-        f"{prev_id} does not directly precede {next_id} in the single-agent render"
+        f"{prev_id} does not directly precede {next_id} in the local render"
     )
     assert blanks == expected == 1, (
         f"{prev_id} -> {next_id}: {blanks} blank line(s), expected {expected}"
@@ -526,29 +526,29 @@ def _headings(text: str) -> list[str]:
     return out
 
 
-def test_i_single_agent_is_strictly_shorter_and_has_none_of_the_dropped_headings():
-    single_agent, full = _single_agent(), _full()
-    assert len(single_agent.encode()) < len(full.encode())
-    assert len(single_agent.splitlines()) < len(full.splitlines())
-    single_agent_headings = set(_headings(single_agent))
-    dropped = set(_manifest_ids(FULL_MANIFEST)) - set(SINGLE_AGENT_IDS)
+def test_i_local_is_strictly_shorter_and_has_none_of_the_dropped_headings():
+    local, full = _local(), _full()
+    assert len(local.encode()) < len(full.encode())
+    assert len(local.splitlines()) < len(full.splitlines())
+    local_headings = set(_headings(local))
+    dropped = set(_manifest_ids(FULL_MANIFEST)) - set(LOCAL_IDS)
     seen = 0
     for cid in sorted(dropped):
         for h in _headings(_component_body(cid)):
             seen += 1
             if h in ("## Model Identity Gate", "## Parallelization and Delegation"):
-                continue  # rendered by the single-agent-only components (heading rule), asserted below
-            assert h not in single_agent_headings, f"{cid}: dropped heading {h!r} is in the single-agent render"
+                continue  # rendered by the profile-only components (heading rule), asserted below
+            assert h not in local_headings, f"{cid}: dropped heading {h!r} is in the local render"
     assert seen >= 4
     for named in ("Agent coordination", "Loop-mode policy"):
         assert named in full
-        assert named not in single_agent, named
-    # the two single-agent-only components bring their own heading at their absent anchor (heading rule)
+        assert named not in local, named
+    # the two profile-only components bring their own heading at their absent anchor (heading rule)
     for named in ("Model Identity Gate", "Parallelization and Delegation"):
         assert named in full
-        assert ("## " + named) in single_agent_headings
-    assert "## ENGRAM Write Discipline" in single_agent_headings
-    assert "## ENGRAM Read Discipline" in single_agent_headings
+        assert ("## " + named) in local_headings
+    assert "## ENGRAM Write Discipline" in local_headings
+    assert "## ENGRAM Read Discipline" in local_headings
 
 
 
@@ -567,7 +567,7 @@ def _section(text: str, heading: str) -> str:
 
 
 def test_session_start_reading_renders_with_its_heading_and_its_three_numbered_items():
-    text = _single_agent()
+    text = _local()
     assert text.split("\n").count(SSR_HEADING) == 1
     section = _section(text, SSR_HEADING)
     numbered = [ln for ln in section.split("\n") if re.match(r"\d+\. ", ln)]
@@ -575,18 +575,18 @@ def test_session_start_reading_renders_with_its_heading_and_its_three_numbered_i
 
 
 def test_session_start_reading_section_is_the_full_files_section_byte_for_byte():
-    assert _section(_single_agent(), SSR_HEADING) == _section(_full(), SSR_HEADING)
+    assert _section(_local(), SSR_HEADING) == _section(_full(), SSR_HEADING)
 
 
 def test_session_start_reading_is_the_existing_full_component_not_a_new_one():
     assert SSR_ID in _manifest_ids(FULL_MANIFEST)
-    assert _manifest_ids(SINGLE_AGENT_MANIFEST).count(SSR_ID) == 1
-    assert not (TEMPLATES / "components" / f"{SSR_ID}-single-agent.md").exists()
+    assert _manifest_ids(LOCAL_MANIFEST).count(SSR_ID) == 1
+    assert not (TEMPLATES / "components" / f"{SSR_ID}-local.md").exists()
 
 
 def test_session_start_reading_sits_where_the_full_manifest_puts_it():
-    full_ids, ids = _manifest_ids(FULL_MANIFEST), _manifest_ids(SINGLE_AGENT_MANIFEST)
-    # the full manifest puts it right after the ENGRAM Reference; so does the single-agent one
+    full_ids, ids = _manifest_ids(FULL_MANIFEST), _manifest_ids(LOCAL_MANIFEST)
+    # the full manifest puts it right after the ENGRAM Reference; so does the local one
     assert full_ids.index(SSR_ID) == full_ids.index("engram-reference") + 1
     assert ids.index(SSR_ID) == ids.index("engram-reference") + 1
     # and its place among the components the two manifests share is the full manifest's place
@@ -605,9 +605,9 @@ BOUND_VARIANT_OF = {
 }
 
 
-def test_every_single_agent_component_is_a_full_component_or_a_bound_variant_of_one():
+def test_every_local_component_is_a_full_component_or_a_bound_variant_of_one():
     full_ids = set(_manifest_ids(FULL_MANIFEST))
-    ids = _manifest_ids(SINGLE_AGENT_MANIFEST)
+    ids = _manifest_ids(LOCAL_MANIFEST)
     not_in_full = [i for i in ids if i not in full_ids]
     # the components that are not full components are exactly the ones declared as bound variants
     assert sorted(not_in_full) == sorted(BOUND_VARIANT_OF), not_in_full
@@ -649,9 +649,9 @@ def _bootstrap(tmp_path: Path, args: list[str] | None = None, extra_env: dict | 
 
 
 @pytest.fixture(scope="module")
-def single_agent_home(tmp_path_factory):
-    home = tmp_path_factory.mktemp("single-agent-home")
-    r = _bootstrap(home, ["--claude-md-profile", "single-agent"])
+def local_home(tmp_path_factory):
+    home = tmp_path_factory.mktemp("local-home")
+    r = _bootstrap(home, ["--claude-md-profile", "local"])
     assert r.returncode == 0, r.stdout + r.stderr
     return home
 
@@ -672,12 +672,12 @@ def _claude_md(home: Path) -> str:
     return (home / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
 
 
-def test_c1_single_agent_option_records_the_profile_and_writes_the_single_agent_render(single_agent_home, full_home):
-    assert _config(single_agent_home)["claude_md_profile"] == "single-agent"
-    single_agent_md = _claude_md(single_agent_home)
-    assert "Loop-mode policy" not in single_agent_md  # a dropped component; the gate's own heading now renders
-    assert "## ENGRAM Write Discipline" in single_agent_md
-    assert len(single_agent_md) < len(_claude_md(full_home))
+def test_c1_local_option_records_the_profile_and_writes_the_local_render(local_home, full_home):
+    assert _config(local_home)["claude_md_profile"] == "local"
+    local_md = _claude_md(local_home)
+    assert "Loop-mode policy" not in local_md  # a dropped component; the gate's own heading now renders
+    assert "## ENGRAM Write Discipline" in local_md
+    assert len(local_md) < len(_claude_md(full_home))
 
 
 def test_c1_default_records_nothing_and_writes_todays_render(full_home):
@@ -726,8 +726,8 @@ def _call_record_step(tmp_path: Path, profile: str | None, config_text: str | No
 
 
 @pytest.mark.parametrize("profile", [None, "full"])
-def test_c1_a_default_or_full_run_overwrites_a_stale_single_agent_record(tmp_path, profile):
-    r, home = _call_record_step(tmp_path, profile, json.dumps({"self_lineage": "x:y", "claude_md_profile": "single-agent"}))
+def test_c1_a_default_or_full_run_overwrites_a_stale_local_record(tmp_path, profile):
+    r, home = _call_record_step(tmp_path, profile, json.dumps({"self_lineage": "x:y", "claude_md_profile": "local"}))
     assert r.returncode == 0, r.stderr
     cfg = json.loads((home / "config.json").read_text(encoding="utf-8"))
     assert cfg["claude_md_profile"] == "full" and cfg["self_lineage"] == "x:y"
@@ -742,13 +742,13 @@ def test_c1_a_default_run_with_no_record_writes_nothing(tmp_path, profile):
 
 
 def test_c1_a_non_dict_config_is_refused_not_a_traceback(tmp_path):
-    r, _ = _call_record_step(tmp_path, "single-agent", "5")
+    r, _ = _call_record_step(tmp_path, "local", "5")
     assert r.returncode != 0 and "Traceback" not in r.stderr
     assert "REFUSED" in r.stderr and "CLAUDE.md was not written" in r.stderr
 
 
 def test_c1_missing_config_refusal_says_the_graph_was_already_seeded(tmp_path):
-    r, _ = _call_record_step(tmp_path, "single-agent", None)
+    r, _ = _call_record_step(tmp_path, "local", None)
     assert r.returncode != 0
     msg = r.stderr + r.stdout
     assert "REFUSED" in msg and "is missing" in msg
@@ -769,17 +769,17 @@ def test_c1_the_option_needs_a_value(tmp_path):
     assert not (tmp_path / ".claude" / "CLAUDE.md").exists()
 
 
-def test_h_single_agent_file_leaves_the_same_unresolved_placeholders_as_the_full_file(single_agent_home, full_home):
-    single_agent_md, full_md = _claude_md(single_agent_home), _claude_md(full_home)
-    # The run really rendered the single-agent file (an option that is ignored would pass the set check).
-    assert "Loop-mode policy" not in single_agent_md and "Loop-mode policy" in full_md
-    single_agent_left = set(PLACEHOLDER.findall(single_agent_md))
+def test_h_local_file_leaves_the_same_unresolved_placeholders_as_the_full_file(local_home, full_home):
+    local_md, full_md = _claude_md(local_home), _claude_md(full_home)
+    # The run really rendered the local file (an option that is ignored would pass the set check).
+    assert "Loop-mode policy" not in local_md and "Loop-mode policy" in full_md
+    local_left = set(PLACEHOLDER.findall(local_md))
     full_left = set(PLACEHOLDER.findall(full_md))
-    assert single_agent_left == full_left, (single_agent_left, full_left)
-    # What bootstrap resolves is resolved in the single-agent file too; the names left are the ones the
+    assert local_left == full_left, (local_left, full_left)
+    # What bootstrap resolves is resolved in the local file too; the names left are the ones the
     # first-session skill fills in, in both files.
     for name in ("{{ENGRAM_HOME}}", "{{TODAY}}", "{{AX_HONESTY}}", "{{DF_EPISTEMIC_IDENTITY}}"):
-        assert name not in single_agent_md
+        assert name not in local_md
 
 
 # --- (c2)-(c4): the upgrade flow's template-gate ------------------------------------------
@@ -787,7 +787,7 @@ def test_h_single_agent_file_leaves_the_same_unresolved_placeholders_as_the_full
 from tools.engine import flows  # noqa: E402
 
 FULL_REL = "src/engram/templates/template.CLAUDE.md"
-SINGLE_AGENT_REL = "src/engram/templates/template.CLAUDE.single-agent.md"
+LOCAL_REL = "src/engram/templates/template.CLAUDE.local.md"
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -801,21 +801,21 @@ def _write(path: Path, text: str) -> None:
 
 
 def _upgrade_fixture(tmp_path: Path, *, profile, change: str):
-    """A source repo with both templates at commit A; `change` ('full', 'single-agent', 'both') edits at commit B."""
+    """A source repo with both templates at commit A; `change` ('full', 'local', 'both') edits at commit B."""
     src = tmp_path / "source"
     src.mkdir()
     _git(src, "init", "-b", "dev")
     _git(src, "config", "user.email", "t@t")
     _git(src, "config", "user.name", "T")
     _write(src / FULL_REL, "FULL TEMPLATE v1\n")
-    _write(src / SINGLE_AGENT_REL, "SINGLE-AGENT TEMPLATE v1\n")
+    _write(src / LOCAL_REL, "LOCAL TEMPLATE v1\n")
     _git(src, "add", "-A")
     _git(src, "commit", "-m", "a")
     a = _git(src, "rev-parse", "HEAD")
     if change in ("full", "both"):
         _write(src / FULL_REL, "FULL TEMPLATE v2\n")
-    if change in ("single-agent", "both"):
-        _write(src / SINGLE_AGENT_REL, "SINGLE-AGENT TEMPLATE v2\n")
+    if change in ("local", "both"):
+        _write(src / LOCAL_REL, "LOCAL TEMPLATE v2\n")
     _git(src, "add", "-A")
     _git(src, "commit", "-m", "b")
     home = tmp_path / "engram_home"
@@ -839,31 +839,31 @@ def _run_gate(ctx):
     return ctx
 
 
-def test_c2_single_agent_home_full_template_changed_only_reports_no_change(tmp_path):
-    ctx = _run_gate(_upgrade_fixture(tmp_path, profile="single-agent", change="full"))
+def test_c2_local_home_full_template_changed_only_reports_no_change(tmp_path):
+    ctx = _run_gate(_upgrade_fixture(tmp_path, profile="local", change="full"))
     assert ctx["_template_changed"] is False
     assert ctx["_template_diff"] is None
     assert ctx["_template_gate_done"] is True
 
 
-def test_c2_single_agent_home_single_agent_template_changed_surfaces_the_single_agent_template(tmp_path):
-    ctx = _run_gate(_upgrade_fixture(tmp_path, profile="single-agent", change="single-agent"))
+def test_c2_local_home_local_template_changed_surfaces_the_local_template(tmp_path):
+    ctx = _run_gate(_upgrade_fixture(tmp_path, profile="local", change="local"))
     assert ctx["_template_changed"] is True
-    assert "SINGLE-AGENT TEMPLATE v2" in ctx["_template_diff"]
+    assert "LOCAL TEMPLATE v2" in ctx["_template_diff"]
     assert "FULL TEMPLATE" not in ctx["_template_diff"]
 
 
-def test_c2_single_agent_home_both_changed_surfaces_only_the_single_agent_template(tmp_path):
-    ctx = _run_gate(_upgrade_fixture(tmp_path, profile="single-agent", change="both"))
-    assert "SINGLE-AGENT TEMPLATE v2" in ctx["_template_diff"]
+def test_c2_local_home_both_changed_surfaces_only_the_local_template(tmp_path):
+    ctx = _run_gate(_upgrade_fixture(tmp_path, profile="local", change="both"))
+    assert "LOCAL TEMPLATE v2" in ctx["_template_diff"]
     assert "FULL TEMPLATE" not in ctx["_template_diff"]
 
 
-def test_c2_full_home_single_agent_template_changed_only_reports_no_change(tmp_path):
+def test_c2_full_home_local_template_changed_only_reports_no_change(tmp_path):
     for profile in (None, "full"):
         sub = tmp_path / f"p-{profile}"
         sub.mkdir()
-        ctx = _run_gate(_upgrade_fixture(sub, profile=profile, change="single-agent"))
+        ctx = _run_gate(_upgrade_fixture(sub, profile=profile, change="local"))
         assert ctx["_template_changed"] is False, profile
         assert ctx["_template_diff"] is None, profile
 
@@ -872,7 +872,7 @@ def test_c3_home_with_no_recorded_profile_behaves_as_today(tmp_path):
     ctx = _run_gate(_upgrade_fixture(tmp_path, profile=None, change="full"))
     assert ctx["_template_changed"] is True
     assert "FULL TEMPLATE v2" in ctx["_template_diff"]
-    assert "SINGLE-AGENT TEMPLATE" not in ctx["_template_diff"]
+    assert "LOCAL TEMPLATE" not in ctx["_template_diff"]
 
 
 def test_c3_home_with_no_config_json_behaves_as_today(tmp_path):
@@ -882,7 +882,7 @@ def test_c3_home_with_no_config_json_behaves_as_today(tmp_path):
     assert "FULL TEMPLATE v2" in ctx["_template_diff"]
 
 
-@pytest.mark.parametrize("bad", ["weird", "lean", "../single-agent", 7, ["single-agent"], ""])
+@pytest.mark.parametrize("bad", ["weird", "lean", "../local", 7, ["local"], ""])
 def test_c3_an_unrecognized_recorded_profile_never_offers_either_template(tmp_path, bad):
     ctx = _run_gate(_upgrade_fixture(tmp_path, profile=bad, change="both"))
     assert ctx["_template_gate_done"] is True
@@ -892,13 +892,13 @@ def test_c3_an_unrecognized_recorded_profile_never_offers_either_template(tmp_pa
 
 
 def test_c3_an_unreadable_config_never_offers_either_template(tmp_path):
-    ctx = _upgrade_fixture(tmp_path, profile="single-agent", change="both")
+    ctx = _upgrade_fixture(tmp_path, profile="local", change="both")
     (Path(ctx["engram_home"]) / "config.json").write_text("{not json", encoding="utf-8")
     _run_gate(ctx)
     assert "TEMPLATE v" not in (ctx["_template_diff"] or "")
 
 
-@pytest.mark.parametrize("profile", [None, "single-agent"])
+@pytest.mark.parametrize("profile", [None, "local"])
 def test_c4_the_gate_never_writes_the_users_claude_md(tmp_path, profile, monkeypatch):
     ctx = _upgrade_fixture(tmp_path, profile=profile, change="both")
     claude_dir = tmp_path / "fake_home" / ".claude"
@@ -933,16 +933,16 @@ def test_d_the_new_shippables_are_tiered():
 
         walk(tiers)
     full = entries["templates/template.CLAUDE.md"]
-    single_agent = entries["templates/template.CLAUDE.single-agent.md"]
-    assert single_agent["tier"] == full["tier"], "bootstrap reads the single-agent file, so it ships where the full one does"
+    local = entries["templates/template.CLAUDE.local.md"]
+    assert local["tier"] == full["tier"], "bootstrap reads the local file, so it ships where the full one does"
     assert "templates/manifests" in entries
 
 
 # --- round 3: Codex ignores the option; the upgrade skill's Step 2 snippet ----------------------
 
 
-def test_c1_codex_target_with_single_agent_option_records_no_profile(tmp_path):
-    r = _bootstrap(tmp_path, ["--claude-md-profile", "single-agent"], extra_env={"TARGET": "codex"})
+def test_c1_codex_target_with_local_option_records_no_profile(tmp_path):
+    r = _bootstrap(tmp_path, ["--claude-md-profile", "local"], extra_env={"TARGET": "codex"})
     assert r.returncode == 0, r.stdout + r.stderr
     assert "ignored" in r.stdout + r.stderr
     cfg_path = tmp_path / ".engram" / "config.json"
@@ -984,13 +984,13 @@ _STEP2_SHELLS = [s for s in ("/bin/bash", "/bin/sh") if os.path.exists(s)]
 @pytest.mark.parametrize(
     "config_text, expected",
     [
-        ('{"claude_md_profile": "single-agent"}', "template.CLAUDE.single-agent.md"),
+        ('{"claude_md_profile": "local"}', "template.CLAUDE.local.md"),
         ('{"install_tier": "convenience"}', "template.CLAUDE.md"),
         (None, "template.CLAUDE.md"),
         ('{"claude_md_profile": "tiny"}', "template.CLAUDE.md"),
         ('{"claude_md_profile": "lean"}', "template.CLAUDE.md"),
     ],
-    ids=["single-agent", "unrecorded", "no-config", "unrecognised", "retired-working-name"],
+    ids=["local", "unrecorded", "no-config", "unrecognised", "retired-working-name"],
 )
 def test_upgrade_skill_step2_snippet_picks_the_template(tmp_path, shell, config_text, expected):
     assert _pick_template(shell, tmp_path / "home", config_text) == expected
@@ -999,11 +999,11 @@ def test_upgrade_skill_step2_snippet_picks_the_template(tmp_path, shell, config_
 def test_render_reads_the_named_template_even_if_the_sources_list_widens(tmp_path, monkeypatch):
     import template_render as tr
 
-    (tmp_path / "template.CLAUDE.single-agent.md").write_text("SINGLE-AGENT", encoding="utf-8")
+    (tmp_path / "template.CLAUDE.local.md").write_text("LOCAL", encoding="utf-8")
     (tmp_path / "template.CLAUDE.md").write_text("FULL", encoding="utf-8")
     (tmp_path / "other.md").write_text("OTHER", encoding="utf-8")
-    monkeypatch.setitem(tr.CLAUDE_MD_PROFILE_SOURCES, "single-agent", ["other.md", "template.CLAUDE.single-agent.md"])
-    assert tr.render_identity_surface(tmp_path, "single-agent") == "SINGLE-AGENT"
+    monkeypatch.setitem(tr.CLAUDE_MD_PROFILE_SOURCES, "local", ["other.md", "template.CLAUDE.local.md"])
+    assert tr.render_identity_surface(tmp_path, "local") == "LOCAL"
     for profile, name in tr.CLAUDE_MD_PROFILE_TEMPLATE.items():
         assert name in tr.CLAUDE_MD_PROFILE_SOURCES[profile]
 
@@ -1015,19 +1015,19 @@ README = REPO_ROOT / "README.md"
 FIRST_SESSION_SKILL = SRC / "skills" / "claude" / "engram-first-session" / "SKILL.md"
 
 
-def test_first_session_skill_does_not_say_the_single_agent_file_has_no_model_identity_gate_section():
-    """The single-agent render HAS a `## Model Identity Gate` section, so the skill must not deny it."""
-    assert "## Model Identity Gate" in _single_agent().splitlines()
+def test_first_session_skill_does_not_say_the_local_file_has_no_model_identity_gate_section():
+    """The local render HAS a `## Model Identity Gate` section, so the skill must not deny it."""
+    assert "## Model Identity Gate" in _local().splitlines()
     skill = " ".join(FIRST_SESSION_SKILL.read_text(encoding="utf-8").split())
     assert "has no such section" not in skill
 
 
-def test_first_session_skill_pins_the_true_two_lines_claim_against_the_single_agent_render():
-    """The skill says the single-agent gate section holds two lines; the single-agent render must keep that true."""
+def test_first_session_skill_pins_the_true_two_lines_claim_against_the_local_render():
+    """The skill says the local gate section holds two lines; the local render must keep that true."""
     skill = " ".join(FIRST_SESSION_SKILL.read_text(encoding="utf-8").split())
-    assert "in a single-agent-profile file that section holds two lines" in skill
+    assert "in a local-profile file that section holds two lines" in skill
     assert "one sentence" not in skill.split("Model Identity Gate", 1)[1][:400]
-    lines = _single_agent().splitlines()
+    lines = _local().splitlines()
     start = lines.index("## Model Identity Gate") + 1
     end = next(i for i in range(start, len(lines)) if lines[i].startswith("## "))
     assert len([ln for ln in lines[start:end] if ln.strip()]) == 2
@@ -1101,57 +1101,59 @@ def test_readme_runs_no_bootstrap_of_its_own_so_it_carries_no_profile_line():
 # --- the one-line header: a manifest-level field, not a component (#4802 rework) ----------------
 
 HEADER = (
-    "> Profile: single-agent. Written for one agent working with one user on one machine, with no agent team "
-    "and no long-running autonomous loop. Not fully tested; see README-AGENT.md."
+    "> Profile: local. A purely local, single-agent setup: one agent working with one user on one machine, "
+    "no agent team, no long-running autonomous loop. Not fully tested. Made for the local benchmark effort "
+    "(https://github.com/engram-agents/engram-benchmarks); see README-AGENT.md."
 )
 
 
 def _scratch_with_manifest_edit(tmp_path, monkeypatch, edit):
-    """A scratch copy of the templates whose single-agent manifest is passed through `edit` (a dict -> None)."""
+    """A scratch copy of the templates whose local manifest is passed through `edit` (a dict -> None)."""
     scratch = _scratch(tmp_path, monkeypatch)
-    path = scratch / "manifests" / "claude-code.CLAUDE.md.single-agent.json"
+    path = scratch / "manifests" / "claude-code.CLAUDE.md.local.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
     edit(manifest)
     path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
 def test_the_manifest_carries_the_header_and_the_header_is_one_line_naming_profile_and_purpose():
-    header = json.loads(SINGLE_AGENT_MANIFEST.read_text(encoding="utf-8"))["header"]
+    header = json.loads(LOCAL_MANIFEST.read_text(encoding="utf-8"))["header"]
     assert header == HEADER
     assert "\n" not in header and "\r" not in header
-    assert header.startswith("> Profile: single-agent. ")
+    assert header.startswith("> Profile: local. ")
 
 
 def test_the_rendered_files_first_line_is_the_header_then_a_blank_line_then_the_identity_opening():
-    lines = _single_agent().split("\n")
+    lines = _local().split("\n")
     assert lines[0] == HEADER
     assert lines[1] == ""
     assert lines[2].startswith("# ")
     # and the committed file starts the same way
-    assert SINGLE_AGENT_TEMPLATE.read_text(encoding="utf-8").split("\n")[0] == HEADER
+    assert LOCAL_TEMPLATE.read_text(encoding="utf-8").split("\n")[0] == HEADER
 
 
 def test_the_header_sentence_is_pinned_word_for_word():
-    text = SINGLE_AGENT_TEMPLATE.read_text(encoding="utf-8")
+    text = LOCAL_TEMPLATE.read_text(encoding="utf-8")
     assert (
-        "Written for one agent working with one user on one machine, with no agent team and no long-running "
-        "autonomous loop. Not fully tested; see README-AGENT.md."
+        "A purely local, single-agent setup: one agent working with one user on one machine, no agent team, "
+        "no long-running autonomous loop. Not fully tested. Made for the local benchmark effort "
+        "(https://github.com/engram-agents/engram-benchmarks); see README-AGENT.md."
     ) in text.split("\n")[0]
 
 
 def test_the_header_is_in_no_component_and_not_in_the_full_render_or_full_manifest():
     assert "header" not in json.loads(FULL_MANIFEST.read_text(encoding="utf-8"))
-    assert "Profile: single-agent" not in _full()
+    assert "Profile: local" not in _full()
     assert not _full().startswith(">")
     for path in (TEMPLATES / "components").glob("*.md"):
-        assert "Profile: single-agent" not in path.read_text(encoding="utf-8"), path.name
-    assert [c["id"] for c in tcr.render("claude-code", "CLAUDE.md", "single-agent")[1]["components"]] == SINGLE_AGENT_IDS
+        assert "Profile: local" not in path.read_text(encoding="utf-8"), path.name
+    assert [c["id"] for c in tcr.render("claude-code", "CLAUDE.md", "local")[1]["components"]] == LOCAL_IDS
 
 
 def test_a_manifest_without_a_header_renders_exactly_as_before(tmp_path, monkeypatch):
-    with_header = _single_agent()
+    with_header = _local()
     _scratch_with_manifest_edit(tmp_path, monkeypatch, lambda m: m.pop("header"))
-    without = tcr.render("claude-code", "CLAUDE.md", "single-agent")[0]
+    without = tcr.render("claude-code", "CLAUDE.md", "local")[0]
     assert without == with_header[len(HEADER) + 2 :]
     assert without.startswith("# ") and not without.startswith(">")
     # the default manifest has none: its render is the committed full template, byte for byte
@@ -1175,15 +1177,15 @@ def test_a_manifest_without_a_header_renders_exactly_as_before(tmp_path, monkeyp
 def test_a_malformed_header_is_a_build_failure_not_a_silent_render(tmp_path, monkeypatch, bad):
     _scratch_with_manifest_edit(tmp_path, monkeypatch, lambda m: m.__setitem__("header", bad))
     with pytest.raises(tcr.TemplateComponentError, match="header"):
-        tcr.render("claude-code", "CLAUDE.md", "single-agent")
+        tcr.render("claude-code", "CLAUDE.md", "local")
 
 
 def test_a_header_may_use_a_placeholder_the_components_already_use(tmp_path, monkeypatch):
     _scratch_with_manifest_edit(
-        tmp_path, monkeypatch, lambda m: m.__setitem__("header", "> Profile: single-agent, for {{USER_NAME}}.")
+        tmp_path, monkeypatch, lambda m: m.__setitem__("header", "> Profile: local, for {{USER_NAME}}.")
     )
-    assert tcr.render("claude-code", "CLAUDE.md", "single-agent")[0].split("\n")[0] == (
-        "> Profile: single-agent, for {{USER_NAME}}."
+    assert tcr.render("claude-code", "CLAUDE.md", "local")[0].split("\n")[0] == (
+        "> Profile: local, for {{USER_NAME}}."
     )
 
 
@@ -1224,9 +1226,9 @@ def _purpose_text_help() -> str:
 
 
 @pytest.fixture(scope="module")
-def single_agent_run(tmp_path_factory):
-    home = tmp_path_factory.mktemp("single-agent-run")
-    r = _bootstrap(home, ["--claude-md-profile", "single-agent"])
+def local_run(tmp_path_factory):
+    home = tmp_path_factory.mktemp("local-run")
+    r = _bootstrap(home, ["--claude-md-profile", "local"])
     assert r.returncode == 0, r.stdout + r.stderr
     return r
 
@@ -1234,14 +1236,14 @@ def single_agent_run(tmp_path_factory):
 def _purpose_text_bootstrap(run) -> str:
     """The paragraph bootstrap prints when the profile is chosen: from its first line to the first blank line."""
     lines = run.stdout.splitlines()
-    start = next(i for i, ln in enumerate(lines) if ln.strip().startswith("CLAUDE.md profile: single-agent"))
+    start = next(i for i, ln in enumerate(lines) if ln.strip().startswith("CLAUDE.md profile: local"))
     end = next((i for i in range(start + 1, len(lines)) if not lines[i].strip()), len(lines))
     return "\n".join(lines[start:end])
 
 
 def _purpose_text_changelog() -> str:
     text = (REPO_ROOT / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
-    entries = [e for e in re.split(r"\n(?=- )", text) if e.startswith("- A `single-agent` CLAUDE.md profile")]
+    entries = [e for e in re.split(r"\n(?=- )", text) if e.startswith("- A `local` CLAUDE.md profile")]
     assert len(entries) == 1, len(entries)
     return entries[0]
 
@@ -1249,19 +1251,19 @@ def _purpose_text_changelog() -> str:
 _PLACES = ["readme", "help", "bootstrap", "changelog"]
 
 
-def _place_text(place, single_agent_run) -> str:
+def _place_text(place, local_run) -> str:
     if place == "readme":
         return _purpose_text_readme()
     if place == "help":
         return _purpose_text_help()
     if place == "bootstrap":
-        return _purpose_text_bootstrap(single_agent_run)
+        return _purpose_text_bootstrap(local_run)
     return _purpose_text_changelog()
 
 
 @pytest.mark.parametrize("place", _PLACES)
-def test_purpose_text_names_one_agent_one_user_one_machine_not_fully_tested_and_the_benchmark_repo(place, single_agent_run):
-    text = " ".join(_place_text(place, single_agent_run).split())
+def test_purpose_text_names_one_agent_one_user_one_machine_not_fully_tested_and_the_benchmark_repo(place, local_run):
+    text = " ".join(_place_text(place, local_run).split())
     low = text.lower()
     assert "one agent" in low and "one user" in low and "one machine" in low, text
     assert "not fully tested" in low, text
@@ -1269,15 +1271,15 @@ def test_purpose_text_names_one_agent_one_user_one_machine_not_fully_tested_and_
 
 
 @pytest.mark.parametrize("place", _PLACES)
-def test_purpose_text_never_says_small_context_lean_or_local_only(place, single_agent_run):
-    text = _place_text(place, single_agent_run)
+def test_purpose_text_never_says_small_context_lean_or_local_only(place, local_run):
+    text = _place_text(place, local_run)
     for banned in _BANNED_IN_PURPOSE_TEXT:
         assert not re.search(banned, text, re.IGNORECASE), (place, banned)
 
 
 @pytest.mark.parametrize("place", ["readme", "bootstrap", "changelog"])
-def test_purpose_text_says_the_authority_table_trust_tier_pointer_and_signature_rule_are_kept(place, single_agent_run):
-    text = " ".join(_place_text(place, single_agent_run).split())
+def test_purpose_text_says_the_authority_table_trust_tier_pointer_and_signature_rule_are_kept(place, local_run):
+    text = " ".join(_place_text(place, local_run).split())
     low = text.lower()
     for term in _KEPT_TERMS:
         assert term in low, (place, term)
@@ -1285,8 +1287,8 @@ def test_purpose_text_says_the_authority_table_trust_tier_pointer_and_signature_
 
 
 @pytest.mark.parametrize("place", ["readme", "bootstrap", "changelog"])
-def test_purpose_text_says_what_the_profile_does_not_carry_and_what_it_was_not_measured_with(place, single_agent_run):
-    low = " ".join(_place_text(place, single_agent_run).split()).lower()
+def test_purpose_text_says_what_the_profile_does_not_carry_and_what_it_was_not_measured_with(place, local_run):
+    low = " ".join(_place_text(place, local_run).split()).lower()
     for named in ("agent coordination", "loop-mode policy", "who i am", "my collaborator", "infrastructure locations"):
         assert named in low, (place, named)
     for unmeasured in ("fresh home", "real upgrade", "whole test suite"):
@@ -1296,17 +1298,17 @@ def test_purpose_text_says_what_the_profile_does_not_carry_and_what_it_was_not_m
     assert "session start reading" not in dropped_part.split("not fully tested")[0], place
 
 
-def test_the_bootstrap_paragraph_is_at_most_six_lines_and_only_for_the_single_agent_choice(single_agent_run, tmp_path):
-    assert len(_purpose_text_bootstrap(single_agent_run).splitlines()) <= 6
+def test_the_bootstrap_paragraph_is_at_most_six_lines_and_only_for_the_local_choice(local_run, tmp_path):
+    assert len(_purpose_text_bootstrap(local_run).splitlines()) <= 6
     default = _bootstrap(tmp_path)
     assert default.returncode == 0, default.stdout + default.stderr
-    assert "CLAUDE.md profile: single-agent" not in default.stdout
+    assert "CLAUDE.md profile: local" not in default.stdout
 
 
 def test_the_bootstrap_paragraph_is_not_printed_for_a_codex_run_that_ignores_the_option(tmp_path):
-    r = _bootstrap(tmp_path, ["--claude-md-profile", "single-agent"], extra_env={"TARGET": "codex"})
+    r = _bootstrap(tmp_path, ["--claude-md-profile", "local"], extra_env={"TARGET": "codex"})
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "CLAUDE.md profile: single-agent" not in r.stdout
+    assert "CLAUDE.md profile: local" not in r.stdout
 
 # --- the working name `lean` is retired, not aliased (#4802 rework) -------------------------------
 
@@ -1315,14 +1317,14 @@ def test_bootstrap_refuses_the_retired_working_name_and_lists_the_real_profiles(
     r = _bootstrap(tmp_path, ["--claude-md-profile", "lean"])
     assert r.returncode != 0
     msg = r.stderr + r.stdout
-    assert "--claude-md-profile needs one of full, single-agent" in msg
+    assert "--claude-md-profile needs one of full, local" in msg
     assert "'lean'" in msg  # the refused value is echoed back
     assert not (tmp_path / ".claude" / "CLAUDE.md").exists()
     assert not (tmp_path / ".engram" / "knowledge.db").exists()
 
 
-def test_bootstrap_profile_list_is_full_and_single_agent_and_nothing_else():
-    assert _bootstrap_profile_facts()["profiles"] == ["full", "single-agent"]
+def test_bootstrap_profile_list_is_full_and_local_and_nothing_else():
+    assert _bootstrap_profile_facts()["profiles"] == ["full", "local"]
 
 
 def test_a_recorded_retired_working_name_reads_as_undetermined_in_the_renderer_module(tmp_path):
@@ -1330,14 +1332,71 @@ def test_a_recorded_retired_working_name_reads_as_undetermined_in_the_renderer_m
 
     (tmp_path / "config.json").write_text(json.dumps({"claude_md_profile": "lean"}), encoding="utf-8")
     assert tr.recorded_claude_md_profile(str(tmp_path)) == tr.PROFILE_UNDETERMINED
-    (tmp_path / "config.json").write_text(json.dumps({"claude_md_profile": "single-agent"}), encoding="utf-8")
-    assert tr.recorded_claude_md_profile(str(tmp_path)) == "single-agent"
+    (tmp_path / "config.json").write_text(json.dumps({"claude_md_profile": "local"}), encoding="utf-8")
+    assert tr.recorded_claude_md_profile(str(tmp_path)) == "local"
 
 
 def test_the_profile_map_has_no_key_for_the_retired_working_name():
     import template_render as tr
 
-    assert sorted(tr.CLAUDE_MD_PROFILE_SOURCES) == ["full", "single-agent"]
-    assert sorted(tr.CLAUDE_MD_PROFILE_TEMPLATE) == ["full", "single-agent"]
+    assert sorted(tr.CLAUDE_MD_PROFILE_SOURCES) == ["full", "local"]
+    assert sorted(tr.CLAUDE_MD_PROFILE_TEMPLATE) == ["full", "local"]
     with pytest.raises(tcr.TemplateComponentError):
         tcr.render("claude-code", "CLAUDE.md", "lean")
+
+
+# --- the retired axis word stays out of the profile's own surface (#4802 round 2) --------------
+# Lei's 11-17 ruling (relayed by Kepler) allows ONE sentence to carry the retired word: "a purely local,
+# single-agent setup". Every other hit under the shipped trees is a line of the retirement machinery (#4255).
+# A new use of the word, in any profile file, fails here.
+
+_SENTENCE = "a purely local, single-agent setup"
+_LEI_LINES = (
+    # the manifest's header field and the rendered file's first line carry the sentence
+    '"header": "' + HEADER + '",',
+    HEADER,
+)
+# retirement machinery that predates the profile: (path, whole stripped line)
+_RETIRED_AXIS_LINES = (
+    ("src/engram/tools/install.sh", '--multi-agent|--single-agent) _retired_flag "$1"; shift ;;'),
+)
+# whole files outside the profile's surface whose hits are the retirement machinery (#4255), policed by their own gates
+_RETIRED_AXIS_FILES = ("tools/test_pre_dispatch_check.py", "tools/claude_md_moves.json")
+_SCANNED_PATHS = ("src", "tools", "README-AGENT.md")
+
+
+def _retired_word_hits():
+    out = subprocess.run(
+        ["git", "grep", "-n", "-i", "-E", r"single[-_ ]agent", "--", *_SCANNED_PATHS],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    assert out.returncode in (0, 1), out.stderr
+    hits = []
+    for raw in out.stdout.splitlines():
+        path, lineno, text = raw.split(":", 2)
+        hits.append((path, int(lineno), text.strip()))
+    return hits
+
+
+def _allowed_hit(path, text):
+    if text in _LEI_LINES:
+        return True
+    if path in _RETIRED_AXIS_FILES:
+        return True
+    return any(path == p and text == t for p, t in _RETIRED_AXIS_LINES)
+
+
+def test_retired_word_appears_only_in_leis_sentence_lines_and_the_retirement_machinery():
+    bad = [f"{p}:{n}: {t[:110]}" for p, n, t in _retired_word_hits() if not _allowed_hit(p, t)]
+    assert not bad, "the retired word outside the allowed lines:\n" + "\n".join(bad)
+
+
+def test_every_line_that_carries_leis_sentence_carries_it_exactly():
+    # the allowed lines are exact: the sentence is not a licence for a looser line that merely contains the word
+    lei = [(p, t) for p, _n, t in _retired_word_hits() if _SENTENCE in t.lower()]
+    assert lei, "the header sentence is gone"
+    assert all(t in _LEI_LINES for _p, t in lei), lei
+    assert sorted({p for p, _t in lei}) == [
+        "src/engram/templates/manifests/claude-code.CLAUDE.md.local.json",
+        "src/engram/templates/template.CLAUDE.local.md",
+    ]
