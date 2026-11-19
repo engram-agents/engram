@@ -6,9 +6,12 @@ module set, ~4 MB each) forever. Clearing them right after a fresh import makes 
 collectable. Pure memoization is cleared, so this is semantically safe.
 
 Swept, and nothing else: every module-level `functools.lru_cache` wrapper in a module whose
-top-level package is `fastmcp` or `uncalled_for`, plus every module-level plain `dict`
-(`type(x) is dict`) whose name ends in `_cache` in a module whose top-level package is
-`uncalled_for` (a rule, not a name list: releases of uncalled_for add such dicts). Never imports anything, never raises.
+top-level package is `fastmcp` or `uncalled_for`, plus every module-level `*_cache` object in a
+module whose top-level package is `uncalled_for` that takes one of two shapes (a rule, not a name
+list: releases of uncalled_for add such caches): a plain `dict` (`type(x) is dict`), or an instance
+of a class defined in `uncalled_for` (0.6.2 made them `uncalled_for.caching.FunctionCache`, which
+has no `.clear()`, #4909), emptied by clearing each plain dict or weak-keyed/weak-valued dict it
+holds as an attribute. Never imports anything, never raises.
 """
 
 from __future__ import annotations
@@ -28,6 +31,30 @@ def _is_lru_wrapper(obj) -> bool:
         and callable(getattr(obj, "cache_clear", None))
         and callable(getattr(obj, "cache_info", None))
     )
+
+
+def _empty_cache_object(obj) -> bool:
+    """Empty one `uncalled_for` `*_cache` object in place; True if it was a swept shape."""
+    if type(obj) is dict:
+        obj.clear()
+        return True
+    if type(obj).__module__.partition(".")[0] != "uncalled_for":
+        return False
+    emptied = False
+    try:
+        held = list(vars(obj).values())
+    except Exception:
+        return False
+    for value in held:
+        try:
+            if type(value) is dict or isinstance(
+                value, (weakref.WeakKeyDictionary, weakref.WeakValueDictionary)
+            ):
+                value.clear()
+                emptied = True
+        except Exception:
+            continue
+    return emptied
 
 
 def release_retained_server_copies() -> int:
@@ -52,8 +79,7 @@ def release_retained_server_copies() -> int:
             if mod is None or name.partition(".")[0] != "uncalled_for":
                 continue
             for attr, obj in list(vars(mod).items()):
-                if attr.endswith("_cache") and type(obj) is dict:
-                    obj.clear()
+                if attr.endswith("_cache") and _empty_cache_object(obj):
                     cleared += 1
         except Exception:
             continue

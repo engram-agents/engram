@@ -162,10 +162,16 @@ def test_c2_missing_dict_names_do_not_raise(monkeypatch):
     assert isinstance(rsc.release_retained_server_copies(), int)  # must not raise
 
 
+def _is_uncalled_for_cache(obj) -> bool:
+    """The two shapes a real `*_cache` takes: a plain dict, or an instance of an uncalled_for class."""
+    return type(obj) is dict or type(obj).__module__.partition(".")[0] == "uncalled_for"
+
+
 def test_c2_real_introspection_dicts_exist():
+    # #4909: 0.6.2 made these `FunctionCache` objects; both shapes count, neither may be absent.
     import uncalled_for.introspection as i
 
-    assert isinstance(i._signature_cache, dict) and isinstance(i._parameter_cache, dict)
+    assert _is_uncalled_for_cache(i._signature_cache) and _is_uncalled_for_cache(i._parameter_cache)
 
 
 # ---- C2b (#4541): uncalled_for `*_cache` plain dicts, by rule ----------------------------
@@ -237,6 +243,22 @@ def test_r6_never_raises_on_hostile_modules(monkeypatch):
     assert good._z_cache == {}  # a hostile neighbour does not stop the sweep
 
 
+def _fill(obj, name, keep):
+    """Put one sentinel entry in a real cache of either shape; `keep` holds the key alive (weak caches)."""
+    if type(obj) is dict:
+        obj[("sentinel3807", name)] = 1
+    else:
+        def key():  # a distinct function object per cache, referenced strongly by `keep`
+            return name
+
+        keep.append(key)
+        obj[key] = 1
+
+
+def _size(obj) -> int:
+    return len(obj)
+
+
 def test_r7_every_real_uncalled_for_cache_dict_is_cleared():
     import importlib
     import pkgutil
@@ -245,17 +267,148 @@ def test_r7_every_real_uncalled_for_cache_dict_is_cleared():
     mods = [uf]
     for info in pkgutil.walk_packages(uf.__path__, "uncalled_for."):
         mods.append(importlib.import_module(info.name))
-    filled = []
+    filled, keep = [], []
     for mod in mods:
         for name, obj in list(vars(mod).items()):
-            if name.endswith("_cache") and type(obj) is dict:
-                obj[("sentinel3807", name)] = 1
+            if name.endswith("_cache") and _is_uncalled_for_cache(obj):
+                _fill(obj, name, keep)
                 filled.append((mod.__name__, name))
-    assert filled, "found no uncalled_for *_cache dicts at all: the guard would pass vacuously"
+    assert filled, "found no uncalled_for *_cache objects at all: the guard would pass vacuously"
+    assert all(_size(getattr(sys.modules[m], n)) >= 1 for m, n in filled), "the fill did not take"
     rsc.release_retained_server_copies()
     left = [(m.__name__, n) for m in mods for n, o in vars(m).items()
-            if n.endswith("_cache") and type(o) is dict and o]
-    assert not left, f"uncalled_for cache dicts survived the release: {left}"
+            if n.endswith("_cache") and _is_uncalled_for_cache(o) and _size(o)]
+    assert not left, f"uncalled_for caches survived the release: {left}"
+
+
+# ---- C2c (#4909): the cache object shape `uncalled_for` 0.6.2 introduced ----------------------
+
+def _function_cache_class(module="uncalled_for.caching"):
+    """A stand-in with `FunctionCache`'s layout (three internal maps, no `.clear()`), version-free."""
+    class FunctionCache:
+        def __init__(self):
+            self._functions = weakref.WeakKeyDictionary()
+            self._methods = weakref.WeakKeyDictionary()
+            self._unreferenceable = {}
+
+        def __setitem__(self, k, v):
+            self._functions[k] = v
+
+        def __len__(self):
+            return len(self._functions) + len(self._methods) + len(self._unreferenceable)
+
+    FunctionCache.__module__ = module
+    return FunctionCache
+
+
+def _loaded(cache):
+    def f():
+        pass
+
+    cache._functions[f] = 1
+    cache._methods[f] = 2
+    cache._unreferenceable["k"] = 3
+    return f  # the caller keeps the weak key alive
+
+
+def test_r8_function_cache_shape_is_emptied_in_every_container(monkeypatch):
+    c = _function_cache_class()()
+    keep = _loaded(c)
+    m = _fake(monkeypatch, "uncalled_for._r8_3807", _sig_cache=c)
+    assert len(c) == 3
+    rsc.release_retained_server_copies()
+    assert len(c) == 0 and not c._functions and not c._methods and not c._unreferenceable
+    assert m._sig_cache is c  # emptied in place, never replaced
+    del keep
+
+
+def test_r9_same_shape_from_another_package_is_untouched(monkeypatch):
+    c = _function_cache_class("otherpkg3807.caching")()
+    keep = _loaded(c)
+    _fake(monkeypatch, "uncalled_for._r9_3807", _x_cache=c)
+    _fake(monkeypatch, "fastmcp._r9_3807", _y_cache=c)
+    rsc.release_retained_server_copies()
+    assert len(c) == 3
+    del keep
+
+
+def test_r9b_non_cache_name_holding_the_shape_is_untouched(monkeypatch):
+    c = _function_cache_class()()
+    keep = _loaded(c)
+    _fake(monkeypatch, "uncalled_for._r9b_3807", _registry=c)
+    rsc.release_retained_server_copies()
+    assert len(c) == 3
+    del keep
+
+
+def test_r10_exact_count_with_both_shapes(monkeypatch):
+    _drop_fastmcp_modules(monkeypatch)
+    c = _function_cache_class()()
+    keep = _loaded(c)
+    _fake(monkeypatch, "uncalled_for._r10_3807", _a_cache=c, _b_cache={1: 1}, _registry={2: 2},
+          _n_cache=None)
+    assert rsc.release_retained_server_copies() == 2
+    del keep
+
+
+def test_r11_hostile_cache_object_does_not_stop_the_sweep(monkeypatch):
+    class Boom:
+        @property
+        def __dict__(self):
+            raise RuntimeError("no vars")
+
+    Boom.__module__ = "uncalled_for.caching"
+
+    class Slots:
+        __slots__ = ()
+
+    Slots.__module__ = "uncalled_for.caching"
+
+    class BadMap(weakref.WeakKeyDictionary):
+        def clear(self):
+            raise RuntimeError("no clear")
+
+    holder = _function_cache_class()()
+    holder._functions = BadMap()  # a container-shaped attribute whose clear() raises
+    good = _function_cache_class()()
+    keep = _loaded(good)
+    # one module, hostile caches first: the module-level guard cannot be what saves `_z_cache`
+    _fake(monkeypatch, "uncalled_for._r11_3807", _a_cache=Boom(), _b_cache=Slots(), _c_cache=holder,
+          _z_cache=good)
+    assert isinstance(rsc.release_retained_server_copies(), int)
+    assert len(good) == 0  # the neighbours after the hostile ones were still swept
+    del keep
+
+
+def test_r12_real_function_cache_class_is_emptied():
+    caching = pytest.importorskip("uncalled_for.caching", reason="uncalled_for < 0.6: no FunctionCache")
+    fc = caching.FunctionCache()
+
+    def f():
+        pass
+
+    class WithMethod:
+        def m(self):
+            pass
+
+    class Slotted:
+        __slots__ = ()
+
+        def __call__(self):
+            pass
+
+    slotted = Slotted()  # cannot be weakly referenced: held in `_unreferenceable`
+    bound = WithMethod().m
+    fc[f], fc[bound], fc[slotted] = 1, 2, 3
+    assert len(fc) == 3
+    _fake_mod = types.ModuleType("uncalled_for._r12_3807")
+    _fake_mod._real_cache = fc
+    sys.modules["uncalled_for._r12_3807"] = _fake_mod
+    try:
+        rsc.release_retained_server_copies()
+    finally:
+        del sys.modules["uncalled_for._r12_3807"]
+    assert len(fc) == 0 and fc.get(f) is None and fc.get(bound) is None and fc.get(slotted) is None
 
 
 # ---- C3: trigger ---------------------------------------------------------------------------
