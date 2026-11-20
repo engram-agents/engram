@@ -568,15 +568,15 @@ def test_cell16_the_only_flag_limits_the_run(script, tmp_path, live, tree, capsy
 # --- the shipped table -------------------------------------------------------------------------
 
 def test_cell17_the_shipped_table_names_the_batch_a_flags_and_each_resolves_in_the_dev_tree(script):
-    """The shipped table lists the thirteen Batch A flags in fourteen rows (anchoring_report and
-    quote_quality_survey share one flag, so they are two rows told apart by label), and every row resolves to
+    """The shipped table lists the fourteen Batch A flags in seventeen rows (anchoring_report and
+    quote_quality_survey share one flag, and store_read has three rows on one, so those are rows told apart by label), and every row resolves to
     a tool file in this checkout that carries its flag key, with every named normalisation defined. A table
     that drifted from the tree would SKIP silently (a SKIPPED is not a failure), so this is where drift turns
     red. cell17b is the reverse direction."""
     tree = REPO_ROOT / "src" / "engram"
     flags = [e["flag"] for e in script.TOOLS]
     labels = [script._label(e) for e in script.TOOLS]
-    assert len(flags) == 14 and len(set(flags)) == 13 and len(set(labels)) == 14
+    assert len(flags) == 17 and len(set(flags)) == 14 and len(set(labels)) == 17
     for e in script.TOOLS:
         path = script._resolve_tool(tree, e)
         assert path is not None, e["flag"]
@@ -604,10 +604,6 @@ NOT_BATCHED_FLAGS = {
     "install_selfcheck_reads_via_owner": (
         "install-time diagnostic, not on any hook path; its ON output differs from OFF by design (it names "
         "the path taken and FAILs on an unhealthy owner); flips as its own one-flag step after #4118 lands"
-    ),
-    "store_read_reads_via_owner": (
-        "new in #2652 unit 02 (tools/store_read.py, the person-node fairy's id read and first-session's axiom "
-        "count); default OFF; not yet assigned to a batch, which is the epic owner's call"
     ),
     "repair_embeddings_via_owner": (
         "a ROUTING flag for the embedding repair's publish write through the owner op publish_prepared_embeddings "
@@ -683,6 +679,74 @@ def test_cell17c_the_anchoring_report_and_the_survey_are_two_rows_on_one_flag_wi
         assert argv[argv.index(opt) + 1].startswith("${work}/"), opt
     assert all(a.startswith("${work}/") for a in survey["artifacts"])
     assert "generated_at_field" in survey["normalise"] and "generated_at_field" in survey["artifact_normalise"]
+
+
+# --- store_read: three subcommands, one flag, three rows ------------------------------------------------
+
+_STORE_READ_FLAG = "store_read_reads_via_owner"
+# STORE_READ_PATH points the completeness cell at a mutated copy of the tool (the red-run evidence).
+STORE_READ_PATH = Path(os.environ.get("STORE_READ_PATH") or REPO_ROOT / "tools" / "store_read.py")
+
+
+def _store_read_subcommands(path):
+    """The subcommand names a store_read.py file defines, read from its own parser (the subparsers' choices),
+    not from a list written here."""
+    spec = importlib.util.spec_from_file_location("store_read_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    import argparse
+    for action in mod._parser()._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return sorted(action.choices)
+    raise AssertionError("the parser defines no subcommands")
+
+
+def _store_read_rows(script):
+    return [e for e in script.TOOLS if e["flag"] == _STORE_READ_FLAG]
+
+
+def test_cell18_the_shipped_table_carries_three_store_read_rows_with_distinct_labels(script):
+    """store_read.py joined Batch A on one flag with one row per subcommand: ids (a fixed ISO --since),
+    axiom-count and node-count, each told apart by label. Red under: a missing row, a renamed label, a row
+    running a different subcommand, or the three collapsed into one."""
+    rows = {script._label(e): e for e in _store_read_rows(script)}
+    assert sorted(rows) == [f"{_STORE_READ_FLAG}:axiom-count", f"{_STORE_READ_FLAG}:ids",
+                            f"{_STORE_READ_FLAG}:node-count"]
+    for e in rows.values():
+        assert e["tool"] == ["tools/store_read.py"]
+    ids = rows[f"{_STORE_READ_FLAG}:ids"]["argv"]
+    assert ids[0] == "ids" and ids[1] == "--since" and len(ids) == 3
+    assert rows[f"{_STORE_READ_FLAG}:axiom-count"]["argv"] == ["axiom-count"]
+    assert rows[f"{_STORE_READ_FLAG}:node-count"]["argv"] == ["node-count"]
+
+
+def test_cell18b_every_store_read_subcommand_has_exactly_one_row(script):
+    """Completeness, derived from the tool's own parser: a subcommand added to store_read.py without a row
+    would never be compared OFF vs ON. Red under: a dropped row, a duplicated row, or a new subcommand."""
+    subs = _store_read_subcommands(STORE_READ_PATH)
+    ran = sorted(e["argv"][0] for e in _store_read_rows(script))
+    assert ran == subs, f"subcommands without exactly one row: tool has {subs}, table runs {ran}"
+
+
+def test_cell18c_the_subcommand_reader_sees_a_planted_fourth_subcommand(tmp_path):
+    """The completeness cell can say no: the same reader, pointed at a copy of the tool with a fourth
+    subcommand planted in its parser, returns four names."""
+    text = (REPO_ROOT / "tools" / "store_read.py").read_text()
+    marker = '    return p\n\n\ndef main'
+    assert text.count(marker) == 1
+    planted = tmp_path / "store_read_planted.py"
+    planted.write_text(text.replace(marker, '    sub.add_parser("planted-fourth")\n' + marker))
+    assert _store_read_subcommands(planted) == sorted(_store_read_subcommands(REPO_ROOT / "tools" / "store_read.py") + ["planted-fourth"])
+
+
+def test_cell18d_the_ids_row_since_is_a_fixed_iso_before_2001(script):
+    """The ids row's --since is a fixed past instant, so it precedes every created_at in any real copy and
+    the read returns the whole graph both runs. Red under: an empty value, a non-ISO value, or a recent date."""
+    from datetime import datetime
+    row = next(e for e in _store_read_rows(script) if e["argv"][0] == "ids")
+    since = row["argv"][row["argv"].index("--since") + 1]
+    parsed = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    assert parsed.year < 2001
 
 
 # --- two rows on one flag, and masked artifacts --------------------------------------------------------

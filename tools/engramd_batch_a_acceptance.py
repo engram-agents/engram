@@ -206,6 +206,16 @@ TOOLS: List[Dict[str, Any]] = [
               "--judging-key", "${work}/survey-key.json"],
      "artifacts": ["${work}/survey-sheet.md", "${work}/survey-key.json"],
      "normalise": ["generated_at_field"], "artifact_normalise": ["generated_at_field"]},
+    # store_read.py has three subcommands behind ONE flag, and each reads a different statement, so each is its
+    # own row (told apart by `label`), the way anchoring_report and the survey are. It prints its result on
+    # stdout and its path label only on stderr, so stdout and exit code are the compared output. The ids
+    # row's --since is a fixed instant before any real created_at, so the read returns the whole graph.
+    {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:ids",
+     "tool": ["tools/store_read.py"], "argv": ["ids", "--since", "2000-01-01T00:00:00Z"]},
+    {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:axiom-count",
+     "tool": ["tools/store_read.py"], "argv": ["axiom-count"]},
+    {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:node-count",
+     "tool": ["tools/store_read.py"], "argv": ["node-count"]},
 ]
 
 # Named normalisations. Each is named per tool in the table AND in the report, with why.
