@@ -31,74 +31,110 @@
 #   tools/coverage-diff.sh [--base REF]
 #
 # EXIT CODES
-#   0   ran to completion (regardless of how much/little is covered — this is
-#       a finder, not a gate)
-#   1   setup/environment error (missing venv, git failure, etc.)
-#   2   the affected-tests run itself failed (red suite) — the diff-coverage
-#       report is still produced against whatever coverage.xml resulted, same
-#       "a red suite still yields its partial report" spirit as the nightly.
+#   Advisory by contract (#4358): nonzero ONLY for a usage error, and that
+#   code is 2. Everything else exits 0 and prints one plain line saying what
+#   happened.
+#   2   usage error: an unknown option; --base with no value; a --base ref
+#       that does not resolve to a commit (checked before any test run); or
+#       the selector's own refusal (its exit 2-6; its output is printed).
+#   0   everything else, including:
+#       - the selector named a full-suite trigger (its exit 7): no tests ran,
+#         so there is no coverage report and diff-cover is not called;
+#       - the interpreter, coverage, pytest-cov or diff-cover is missing: the
+#         line names the missing piece, the interpreter path and how it was
+#         chosen (ENGRAM_PY or the default); nothing is run;
+#       - the test run was red (selector exit 1): the report is still
+#         produced from whatever coverage.xml resulted, and says so;
+#       - no coverage.xml was written after a run; or diff-cover itself failed
+#         (its exit code is printed).
+#   A report is always followed by a caveat: it reflects only the tests this
+#   run selected, the full suite runs nightly, and code that runs as a
+#   subprocess is not measured.
 #
 # TIER: dev (T3 — developer tooling only, tiers.json)
 
 set -uo pipefail
 
+say() { echo "coverage-diff.sh: $*"; }
+
 # ---------------------------------------------------------------------------
 # Repo root resolution — robust, not fixed parent count (same pattern as
-# tools/run-all-tests.sh).
+# tools/run-all-tests.sh). Advisory contract: not being able to find the repo
+# is "nothing to report", not a usage error, so it exits 0 with a line.
 # ---------------------------------------------------------------------------
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(git -C "$(dirname "$SCRIPT_PATH")" rev-parse --show-toplevel 2>/dev/null)"
 if [ -z "$REPO_ROOT" ]; then
-    echo "coverage-diff.sh: ERROR — could not resolve repo root via git" >&2
-    exit 1
+    say "could not resolve the repo root via git; nothing was run."
+    exit 0
 fi
 cd "$REPO_ROOT" || {
-    echo "coverage-diff.sh: ERROR — could not cd to repo root: $REPO_ROOT" >&2
-    exit 1
+    say "could not cd to the repo root ($REPO_ROOT); nothing was run."
+    exit 0
 }
 
 # ---------------------------------------------------------------------------
-# Python interpreter resolution — same override convention as
-# tools/run-all-tests.sh (ENGRAM_PY env var, default ~/.engram/venv).
-# ---------------------------------------------------------------------------
-ENGRAM_PY="${ENGRAM_PY:-${HOME}/.engram/venv/bin/python}"
-
-if [ ! -x "$ENGRAM_PY" ]; then
-    echo "coverage-diff.sh: ERROR — python not found at: $ENGRAM_PY" >&2
-    echo "  Set ENGRAM_PY=/path/to/python to override." >&2
-    exit 1
-fi
-
-DIFF_COVER="$(dirname "$ENGRAM_PY")/diff-cover"
-if [ ! -x "$DIFF_COVER" ]; then
-    echo "coverage-diff.sh: ERROR — diff-cover not found at: $DIFF_COVER" >&2
-    echo "  Install it into that venv: $ENGRAM_PY -m pip install diff-cover" >&2
-    echo "  (it's in requirements/requirements-dev.txt)" >&2
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Argument parsing
+# Argument parsing — the only place besides the base-ref check and the
+# selector's own refusal that exits nonzero (2).
 # ---------------------------------------------------------------------------
 BASE="origin/dev"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --base)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                echo "coverage-diff.sh: --base needs a value (a git ref)." >&2
+                echo "Usage: $0 [--base REF]" >&2
+                exit 2
+            fi
             BASE="$2"
             shift 2
             ;;
         -h|--help)
-            sed -n '2,42p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
+            sed -n '2,/^# TIER/p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
             echo "coverage-diff.sh: unknown option: $1" >&2
             echo "Usage: $0 [--base REF]" >&2
-            exit 1
+            exit 2
             ;;
     esac
 done
+
+if ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null 2>&1; then
+    echo "coverage-diff.sh: --base $BASE does not resolve to a commit in this repo; nothing was run." >&2
+    exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Tool check — BEFORE running anything. A missing piece is an environment
+# fact to report, not a failure of the PR: say what is missing, which
+# interpreter was looked at and how it was chosen, and exit 0.
+# ---------------------------------------------------------------------------
+if [ -n "${ENGRAM_PY:-}" ]; then
+    PY_HOW="ENGRAM_PY from the environment"
+else
+    PY_HOW="the default ~/.engram/venv/bin/python (ENGRAM_PY is not set)"
+fi
+ENGRAM_PY="${ENGRAM_PY:-${HOME}/.engram/venv/bin/python}"
+DIFF_COVER="$(dirname "$ENGRAM_PY")/diff-cover"
+
+MISSING=()
+if [ ! -x "$ENGRAM_PY" ]; then
+    MISSING+=("the python interpreter")
+else
+    "$ENGRAM_PY" -c 'import coverage' >/dev/null 2>&1 || MISSING+=("the python package coverage")
+    "$ENGRAM_PY" -c 'import pytest_cov' >/dev/null 2>&1 || MISSING+=("the python package pytest_cov")
+fi
+[ -x "$DIFF_COVER" ] || MISSING+=("diff-cover at $DIFF_COVER")
+
+if [ "${#MISSING[@]}" -gt 0 ]; then
+    say "no coverage report: missing ${MISSING[*]}."
+    say "  interpreter: $ENGRAM_PY, chosen via $PY_HOW."
+    say "  Install: $ENGRAM_PY -m pip install coverage pytest-cov diff-cover (see requirements/requirements-dev.txt), or set ENGRAM_PY=/path/to/python."
+    exit 0
+fi
 
 COVERAGE_XML="$REPO_ROOT/coverage.xml"
 
@@ -124,42 +160,51 @@ COVERAGE_XML="$REPO_ROOT/coverage.xml"
 # same reasoning, as .github/workflows/nightly.yml's "Run full pytest suite"
 # step — keep both in sync if this ever changes.
 # ---------------------------------------------------------------------------
-echo "coverage-diff.sh: running affected tests vs $BASE with coverage..." >&2
-SUITE_RC=0
+say "running affected tests vs $BASE with coverage..." >&2
 SUITE_LOG="$(mktemp)"
 trap 'rm -f "$SUITE_LOG"' EXIT
+# A coverage.xml left by an earlier run must not be mistaken for this run's.
+rm -f "$COVERAGE_XML"
 # stdout is piped through tee (to capture $SUITE_LOG for TESTS_RAN_DESC below)
-# while stderr still goes straight to the terminal; CPython block-buffers
-# stdout once it's not a tty, so without this the two streams arrive out of
-# order for a human watching live. PYTHONUNBUFFERED=1 keeps stdout
-# line-buffered so the interleaving stays real-time — captured content is
-# unaffected either way.
+# while stderr still goes straight to the terminal; PYTHONUNBUFFERED=1 keeps
+# the two streams interleaved in real time for a human watching live.
 PYTHONUNBUFFERED=1 "$ENGRAM_PY" tools/run_touched_tests.py --base "$BASE" -- \
     --cov=src --cov-branch \
     --cov-report="xml:${COVERAGE_XML}" --cov-report=term \
     | tee "$SUITE_LOG"
 SUITE_RC="${PIPESTATUS[0]}"
 
-if [ ! -f "$COVERAGE_XML" ]; then
-    echo "coverage-diff.sh: ERROR — $COVERAGE_XML was not produced (the affected-tests run likely failed before pytest-cov could write it)" >&2
-    exit 1
+# The selector's exit code decides what happened, never its wording.
+if [ "$SUITE_RC" -eq 7 ]; then
+    say "no tests ran because the selector named a full-suite trigger (exit 7), so there is no coverage report."
+    exit 0
+fi
+if [ "$SUITE_RC" -ge 2 ]; then
+    say "the selector refused (exit $SUITE_RC); its output is above."
+    exit 2
 fi
 
-# Which tests actually ran this invocation — captured from
-# run_touched_tests.py's own honesty-line output (see its docstring's
-# "Output honesty" section), so the caveat below can name the ACTUAL subset
-# rather than a generic disclaimer. Falls back to a mechanism description if
-# neither line is found (e.g. a red run that exited before printing either).
-TESTS_RAN_DESC="$(grep -E '^SUBSET green|^\[run_touched_tests\] FULL MAIN SUITE' "$SUITE_LOG" | tail -1)"
+if [ ! -f "$COVERAGE_XML" ]; then
+    say "no coverage data was written ($COVERAGE_XML is absent after the run, selector exit $SUITE_RC)."
+    exit 0
+fi
+
+if [ "$SUITE_RC" -eq 1 ]; then
+    say "NOTE — the test run was red (exit 1); the report reflects that run."
+fi
+
+# Which tests ran this invocation — the selector's own SUBSET line, if it
+# printed one, so the caveat names the ACTUAL subset.
+TESTS_RAN_DESC="$(grep -E '^SUBSET green' "$SUITE_LOG" | tail -1)"
 if [ -z "$TESTS_RAN_DESC" ]; then
-    TESTS_RAN_DESC="affected-tests selection via tools/run_touched_tests.py --base $BASE (selection heuristic — see the run output above for detail)"
+    TESTS_RAN_DESC="see the selector's output above"
 fi
 
 # ---------------------------------------------------------------------------
 # Step 2 — diff-scoped report: uncovered lines within the CHANGED lines only,
 # compared against $BASE. No --fail-under: this is a finder, not a gate.
 # ---------------------------------------------------------------------------
-echo "coverage-diff.sh: diff coverage vs $BASE (changed lines only)..." >&2
+say "diff coverage vs $BASE (changed lines only)..." >&2
 # NOTE: deliberately NOT --show-uncovered — that flag additionally dumps the
 # full highlighted SOURCE of every uncovered line, which is far more than the
 # "uncovered changed lines as file:line" this tool is asked for (#2774). The
@@ -169,40 +214,29 @@ echo "coverage-diff.sh: diff coverage vs $BASE (changed lines only)..." >&2
 "$DIFF_COVER" "$COVERAGE_XML" \
     --compare-branch="$BASE" \
     --branch-coverage
-
 DIFF_RC=$?
 
+if [ "$DIFF_RC" -ne 0 ]; then
+    say "diff-cover failed (exit $DIFF_RC); no report."
+    exit 0
+fi
+
 # ---------------------------------------------------------------------------
-# Caveat — printed EVERY run, unconditionally, immediately after the report
-# above (never only on a flag, never only in a comment/README). diff-cover's
-# "Missing lines" is computed from THIS run's coverage.xml only, which came
-# from the narrow affected-tests subset above (or the full suite, if that's
-# what got selected) — NOT from the full suite by default. A changed line
-# this run reports as "Missing" may still be genuinely covered by tests this
-# invocation didn't select; run_touched_tests.py's own docstring says the
-# full suite remains the convergence gate, i.e. this selection is an admitted
-# heuristic, not a completeness guarantee. So: read "Missing lines" above as
-# "not covered by the tests THIS RUN selected" — never as "uncovered".
+# Caveat — printed EVERY time a report is printed, right after it. Read
+# "Missing lines" above as "not covered by the tests THIS RUN selected",
+# never as "uncovered".
 # ---------------------------------------------------------------------------
 cat <<CAVEAT
 
 -----------------------------------------------------------------------------
-CAVEAT: the "Missing lines" report above reflects coverage from the tests
-THIS RUN selected — it is NOT a claim that those lines are genuinely
-uncovered.
+CAVEAT: the "Missing lines" report above reflects only the tests THIS run selected.
+It is NOT a claim that those lines are genuinely uncovered.
   Tests that ran this invocation: ${TESTS_RAN_DESC}
-A line flagged above may still be exercised by tests this run did not
-select or run (affected-tests selection is a heuristic, not a completeness
-guarantee — see tools/run_touched_tests.py's docstring: "Full suite remains
-the convergence gate"). Treat a flagged line as a lead to investigate, not
-a verdict — confirm against the nightly's full-suite coverage report (the
-authoritative source) before concluding a line is genuinely unspecified.
+- A flagged line may be exercised by tests this run did not select.
+- The full suite runs nightly on dev and at the release cut.
+- Code that runs as a subprocess (hooks, shell scripts, tools a test starts as a process) is not measured, because subprocess coverage is not configured, so such changed lines can read as missing even when a test runs them.
+Treat a flagged line as a lead to investigate, not a verdict.
 -----------------------------------------------------------------------------
 CAVEAT
 
-if [ "$SUITE_RC" -ne 0 ]; then
-    echo "coverage-diff.sh: NOTE — the affected-tests run above was red (exit $SUITE_RC); the diff-coverage report above reflects a partial/failed run." >&2
-    exit 2
-fi
-
-exit "$DIFF_RC"
+exit 0
