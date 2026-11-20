@@ -1937,7 +1937,14 @@ def _read_acl_entries(fd: int, run_dir=None, *, notsup: "list[str] | None" = Non
     absent the base triple comes from the mode bits (`os.fstat(fd).st_mode`), as
     getfacl printed it, so the judge always sees a base triple. `notsup`, if
     given, receives the names that answered ENOTSUP (the caller logs the
-    no-ACL-filesystem branch from it)."""
+    no-ACL-filesystem branch from it).
+
+    Bound: ENOTSUP/ENODATA from the POSIX ACL xattrs means no POSIX ACL, NOT
+    no ACL enforcement. NFSv4 keeps its ACLs in `system.nfs4_acl`, which this
+    read does not look at, and newer kernels answer ENODATA rather than
+    EOPNOTSUPP for the POSIX names there, so even the no-ACL log line stays
+    silent. run/ must be on a filesystem whose ACLs are POSIX ACLs (or none);
+    `getfacl` had the same blind spot."""
     where = str(run_dir) if run_dir is not None else f"fd {fd}"
     entries: list[str] = []
     access_present = False
