@@ -209,10 +209,14 @@ TOOLS: List[Dict[str, Any]] = [
      "normalise": ["generated_at_field"], "artifact_normalise": ["generated_at_field"]},
     # store_read.py has three subcommands behind ONE flag, and each reads a different statement, so each is its
     # own row (told apart by `label`), the way anchoring_report and the survey are. It prints its result on
-    # stdout and its path label only on stderr, so stdout and exit code are the compared output. The ids
-    # row's --since is a fixed instant before any real created_at, so the read returns the whole graph.
+    # stdout and its path label only on stderr, so stdout and exit code are the compared output. `ids` has TWO
+    # rows: --since before any real created_at (the whole graph, so the type/status/is_current filters are
+    # compared) and --since a fixed mid-history instant (a proper subset on a real graph, so an ON path that
+    # dropped or mis-bound the created_at bound would print more ids than OFF and FAIL).
     {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:ids",
      "tool": ["tools/store_read.py"], "argv": ["ids", "--since", "2000-01-01T00:00:00Z"]},
+    {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:ids-recent",
+     "tool": ["tools/store_read.py"], "argv": ["ids", "--since", "2026-09-01T00:00:00Z"]},
     {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:axiom-count",
      "tool": ["tools/store_read.py"], "argv": ["axiom-count"]},
     {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:node-count",
