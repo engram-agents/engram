@@ -878,7 +878,9 @@ seat's run is:
 3. **A coverage flag on new code**, advisory, not a gate. Changed Python code that no selected
    test reaches is a red flag for the reviewer to answer on the PR. It is not a gate because
    coverage cannot see code that runs as a subprocess, which covers this repo's hooks and shell
-   scripts, until subprocess coverage is configured.
+   scripts, until subprocess coverage is configured. `tools/coverage-diff.sh` produces the flag:
+   run `tools/coverage-diff.sh --base origin/dev` with `ENGRAM_PY` pointing at an interpreter
+   that has coverage, pytest-cov and diff-cover.
 
 **The scope is the union, and what each half covers (ruled 2026-11-18).** A seat's per-PR run is
 item 1's selection, **plus** item 2's guard set, **plus** two halves the selection does not reach —
