@@ -34,8 +34,9 @@ The tool never writes: every direct open is `mode=ro`.
 Exit codes: 0 ok; 1 the store path is not a usable store (missing, uncheckable, not a regular file, or a file
 sqlite cannot read as a store; the class is named on stderr); 2 usage (argparse) or a RELATIVE ENGRAM_HOME;
 3 the owner refused or its answer could not be used; 4 the store looks healthy but a read-only open cannot read it
-(a WAL store, no -shm beside it, and a folder the reader cannot write: the cause is named on stderr; fix the
-folder or read through the owner first, and restore only if the read still fails after that).
+(a WAL store whose folder the reader cannot write, or, on a build that raises CANTOPEN, a WAL store with no -shm
+beside it: the cause is named on stderr; fix the folder or read through the owner first, and restore only if the
+read still fails after that).
 
 Stdlib only. Python 3.10+: the flag-ON path imports the runtime client, which needs 3.10 (the scripted
 installer already refuses a python3 older than 3.10.7 before its step 6 calls node-count).
@@ -104,6 +105,8 @@ def unreadable_but_healthy(exc, db_path):
     SQLITE_READONLY (base code 8, 1544 SQLITE_READONLY_DIRECTORY here) in a folder the reader cannot write, and
     SQLITE_CANTOPEN (14) where the build cannot create the -shm. 14 is NOT a permissions signal by itself (one build
     raises it in a writable folder too), so it counts only for a WAL header with no -shm beside the store.
+    That -shm test does not apply to the READONLY shape: its evidence is the folder itself (os.access), so a stray
+    -shm beside the store does not hide it.
     `sqlite_errorcode` exists only on Python 3.11+, so it is read with getattr and the message is the fallback."""
     code = getattr(exc, "sqlite_errorcode", None)
     message = str(exc)
@@ -112,7 +115,7 @@ def unreadable_but_healthy(exc, db_path):
     if not (readonly or cantopen):
         return None
     store = Path(db_path)
-    if not _is_wal_store(store) or Path(str(store) + "-shm").exists():
+    if not _is_wal_store(store):
         return None
     folder = store.resolve().parent
     if readonly:
@@ -120,6 +123,8 @@ def unreadable_but_healthy(exc, db_path):
             return None
         return ("%s: the folder %s cannot be written, and a WAL store needs its -wal/-shm beside it to be read; "
                 "the store itself is not shown to be damaged" % (store, folder))
+    if Path(str(store) + "-shm").exists():
+        return None
     return ("%s: a read-only open could not create the -shm a WAL store needs beside it; "
             "the store itself is not shown to be damaged" % store)
 
