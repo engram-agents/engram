@@ -28,9 +28,17 @@ pytestmark = pytest.mark.skipif(
     reason="needs bash and git",
 )
 
+# Two modes, two exit codes: `--json` is the classify phase (STUB_JSON_RC, default 0;
+# its message goes to stderr like the real selector's refusals); anything else is the
+# run phase, whose exit code is pytest's (STUB_RC, default 0).
 SELECTOR_STUB = '''\
 import os, sys
-open(os.environ["RUN_MARK"], "a").write("ran\\n")
+if "--json" in sys.argv:
+    open(os.environ["RUN_MARK"], "a").write("json\\n")
+    print(os.environ.get("STUB_JSON_OUT", ""), file=sys.stderr)
+    print("{}")
+    sys.exit(int(os.environ.get("STUB_JSON_RC", "0")))
+open(os.environ["RUN_MARK"], "a").write("run\\n")
 print(os.environ.get("STUB_OUT", ""))
 if os.environ.get("STUB_WRITE_XML") == "1":
     for a in sys.argv:
@@ -110,7 +118,12 @@ def run(env, *args, extra=None, engram_py=True):
 
 
 def selector_ran(env):
+    """Any selector invocation at all (classify or run)."""
     return env["run_mark"].exists()
+
+
+def run_mode_ran(env):
+    return env["run_mark"].exists() and "run" in env["run_mark"].read_text().split()
 
 
 def dc_called(env):
@@ -151,10 +164,11 @@ def test_default_base_unresolvable_in_this_repo_exits_2(env):
 @pytest.mark.parametrize("sel_rc", [2, 3, 4, 5, 6])
 def test_selector_refusal_exits_2_and_prints_its_output(env, sel_rc):
     rc, out = run(env, "--base", "HEAD",
-                  extra={"STUB_RC": str(sel_rc), "STUB_OUT": "SELECTOR-SAYS-NO"})
+                  extra={"STUB_JSON_RC": str(sel_rc), "STUB_JSON_OUT": "SELECTOR-SAYS-NO"})
     assert rc == 2
     assert "SELECTOR-SAYS-NO" in out
-    assert f"exit {sel_rc}" in out
+    assert "the selector refused" in out and f"exit {sel_rc}" in out
+    assert not run_mode_ran(env)  # the refusal is read from --json; no test run
     assert not dc_called(env)
 
 
@@ -162,10 +176,11 @@ def test_selector_refusal_exits_2_and_prints_its_output(env, sel_rc):
 
 def test_exit_7_is_a_full_suite_trigger_even_without_the_phrase(env):
     rc, out = run(env, "--base", "HEAD",
-                  extra={"STUB_RC": "7", "STUB_OUT": "some unrelated words"})
+                  extra={"STUB_JSON_RC": "7", "STUB_JSON_OUT": "some unrelated words"})
     assert rc == 0
     assert "full-suite trigger" in out and "exit 7" in out
     assert "no tests ran" in out and "no coverage report" in out
+    assert not run_mode_ran(env)
     assert not dc_called(env)
     assert not (env["repo"] / "coverage.xml").exists()
 
@@ -177,6 +192,33 @@ def test_trigger_phrase_in_output_is_not_a_trigger_when_exit_is_0(env):
     assert rc == 0
     assert dc_called(env)
     assert "no tests ran" not in out
+
+
+# --- round 2: classify with --json, then run; the run phase's code is pytest's ---
+
+def test_json_unknown_code_is_named_and_exits_0(env):
+    rc, out = run(env, "--base", "HEAD", extra={"STUB_JSON_RC": "9"})
+    assert rc == 0
+    assert "exited 9" in out
+    assert not run_mode_ran(env) and not dc_called(env)
+
+
+def test_collection_error_in_run_phase_is_not_a_refusal(env):
+    # --json classifies cleanly (0); pytest then exits 2 (collection error).
+    rc, out = run(env, "--base", "HEAD",
+                  extra={"STUB_JSON_RC": "0", "STUB_RC": "2", "STUB_WRITE_XML": "1"})
+    assert rc == 0
+    assert "the selector refused" not in out
+    assert "exited 2" in out and "pytest" in out and "collection error" in out
+    assert dc_called(env) and "DIFFCOVER-REPORT" in out
+    assert "subprocess" in out  # caveat still printed
+
+
+def test_collection_error_without_coverage_xml_exits_0(env):
+    rc, out = run(env, "--base", "HEAD", extra={"STUB_RC": "2"})
+    assert rc == 0
+    assert "no coverage data" in out
+    assert not dc_called(env)
 
 
 # --- item 2: missing tools --------------------------------------------------
@@ -228,7 +270,7 @@ def test_red_run_still_reports_and_exits_0(env):
                   extra={"STUB_RC": "1", "STUB_WRITE_XML": "1"})
     assert rc == 0
     assert dc_called(env) and "DIFFCOVER-REPORT" in out
-    assert "red" in out and "exit 1" in out
+    assert "the test run exited 1" in out and "tests failed" in out
     assert "report reflects that run" in out
     assert "subprocess" in out  # caveat still printed
 

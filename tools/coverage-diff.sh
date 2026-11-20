@@ -36,15 +36,19 @@
 #   happened.
 #   2   usage error: an unknown option; --base with no value; a --base ref
 #       that does not resolve to a commit (checked before any test run); or
-#       the selector's own refusal (its exit 2-6; its output is printed).
+#       the selector's own refusal (its exit 2-6, read from a `--json`
+#       classify call BEFORE any test run; its output is printed).
 #   0   everything else, including:
-#       - the selector named a full-suite trigger (its exit 7): no tests ran,
+#       - the selector named a full-suite trigger (its exit 7 on the classify
+#         call): no tests ran,
 #         so there is no coverage report and diff-cover is not called;
 #       - the interpreter, coverage, pytest-cov or diff-cover is missing: the
 #         line names the missing piece, the interpreter path and how it was
 #         chosen (ENGRAM_PY or the default); nothing is run;
-#       - the test run was red (selector exit 1): the report is still
-#         produced from whatever coverage.xml resulted, and says so;
+#       - the test run exited nonzero (from the run phase that is PYTEST's
+#         code, never a refusal: 1 = tests failed, 2 = interrupted or a
+#         collection error): the report is still produced from whatever
+#         coverage.xml resulted, and says so;
 #       - no coverage.xml was written after a run; or diff-cover itself failed
 #         (its exit code is printed).
 #   A report is always followed by a caveat: it reflects only the tests this
@@ -139,7 +143,33 @@ fi
 COVERAGE_XML="$REPO_ROOT/coverage.xml"
 
 # ---------------------------------------------------------------------------
-# Step 1 — affected tests, with branch coverage, against $BASE.
+# Phase 1 — CLASSIFY, with no test run. `--json` makes the selector print its
+# selection and exit with ITS OWN code only (it never starts pytest in that
+# mode): 0 = a selection, 7 = full-suite trigger, 2-6 = its own refusal. The
+# selector's stderr (the refusal text) goes straight to the terminal.
+# ---------------------------------------------------------------------------
+SELECTION_JSON="$(mktemp)"
+SUITE_LOG="$(mktemp)"
+trap 'rm -f "$SELECTION_JSON" "$SUITE_LOG"' EXIT
+"$ENGRAM_PY" tools/run_touched_tests.py --base "$BASE" --json >"$SELECTION_JSON"
+SELECT_RC=$?
+
+# The selector's exit code decides what happened, never its wording.
+if [ "$SELECT_RC" -eq 7 ]; then
+    say "no tests ran because the selector named a full-suite trigger (exit 7), so there is no coverage report."
+    exit 0
+fi
+if [ "$SELECT_RC" -ge 2 ] && [ "$SELECT_RC" -le 6 ]; then
+    say "the selector refused (exit $SELECT_RC); its output is above."
+    exit 2
+fi
+if [ "$SELECT_RC" -ne 0 ]; then
+    say "no coverage report: the selector exited $SELECT_RC, which is not a code it documents; nothing was run."
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Coverage flags for the Phase 2 run below (the two phases follow this note).
 #
 # ⚠ `--cov=src`, ONE root — NOT `--cov=src/engram --cov=src/forum`. Do not
 # split this "for clarity"; it silently reintroduces a real, measured defect.
@@ -160,9 +190,11 @@ COVERAGE_XML="$REPO_ROOT/coverage.xml"
 # same reasoning, as .github/workflows/nightly.yml's "Run full pytest suite"
 # step — keep both in sync if this ever changes.
 # ---------------------------------------------------------------------------
+# Phase 2 — RUN the affected tests, with branch coverage, against $BASE. From
+# here the exit code is PYTEST's, not the selector's: any nonzero is a note,
+# never a usage error (2 here means interrupted or a collection error).
+# ---------------------------------------------------------------------------
 say "running affected tests vs $BASE with coverage..." >&2
-SUITE_LOG="$(mktemp)"
-trap 'rm -f "$SUITE_LOG"' EXIT
 # A coverage.xml left by an earlier run must not be mistaken for this run's.
 rm -f "$COVERAGE_XML"
 # stdout is piped through tee (to capture $SUITE_LOG for TESTS_RAN_DESC below)
@@ -174,23 +206,13 @@ PYTHONUNBUFFERED=1 "$ENGRAM_PY" tools/run_touched_tests.py --base "$BASE" -- \
     | tee "$SUITE_LOG"
 SUITE_RC="${PIPESTATUS[0]}"
 
-# The selector's exit code decides what happened, never its wording.
-if [ "$SUITE_RC" -eq 7 ]; then
-    say "no tests ran because the selector named a full-suite trigger (exit 7), so there is no coverage report."
-    exit 0
-fi
-if [ "$SUITE_RC" -ge 2 ]; then
-    say "the selector refused (exit $SUITE_RC); its output is above."
-    exit 2
-fi
-
 if [ ! -f "$COVERAGE_XML" ]; then
-    say "no coverage data was written ($COVERAGE_XML is absent after the run, selector exit $SUITE_RC)."
+    say "no coverage data was written ($COVERAGE_XML is absent after the run, test run exit $SUITE_RC)."
     exit 0
 fi
 
-if [ "$SUITE_RC" -eq 1 ]; then
-    say "NOTE — the test run was red (exit 1); the report reflects that run."
+if [ "$SUITE_RC" -ne 0 ]; then
+    say "NOTE — the test run exited $SUITE_RC (pytest's code; 1 = tests failed, 2 = interrupted or a collection error); the report reflects that run."
 fi
 
 # Which tests ran this invocation — the selector's own SUBSET line, if it
