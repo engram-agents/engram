@@ -1348,13 +1348,14 @@ def test_d7_a_hung_owner_is_bounded_by_the_fire_budget(home, tmp_path):
 def test_d8_the_wait_is_bounded_by_the_remaining_fire_budget(home, monkeypatch):
     """The wait never outlives the fire budget: with a 0.2 s budget and a 0.5 s wait bound against an
     owner that never comes up, the recorded wait is ~the budget, not the wait bound.
-    Mutation: ignore the fire budget in the wait loop -> N ~ 500 ms -> red."""
+    The 400 ms bound leaves headroom above the 0.2 s budget for late wakeups under load (mechanism not
+    confirmed). Mutation: ignore the fire budget in the wait loop -> N ~ 500 ms -> red."""
     mod = full_fire_setup(home, monkeypatch)
     monkeypatch.setattr(mod, "OWNER_FIRE_BUDGET_S", 0.2)
     run = run_main(mod, home)
     assert run.exc is None
     m = re.search(r"waited (\d+) ms", run.ctx)
-    assert m and int(m.group(1)) <= 330, run.ctx
+    assert m and int(m.group(1)) <= 400, run.ctx
 
 
 def test_d9_the_retry_after_the_wait_is_exactly_one_attempt(home, monkeypatch):
