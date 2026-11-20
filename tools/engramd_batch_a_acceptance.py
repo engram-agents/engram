@@ -68,7 +68,8 @@ STATED LIMITS (what a PASS does not cover):
     when it is started with -I (isolated mode: ignores PYTHONPATH, so the hook is never found), with -S
     (no `site`, so no sitecustomize import), or with PYTHONPATH or the environment cleared. Opens made in such
     a child are not counted; one armed process anywhere in a run is enough for the "armed" control. Checked
-    by grep in the fourteen shipped tool files (anchoring_report and quote_quality_survey included) and the shell scripts under tools/engram-pkg and
+    by grep in the fifteen shipped tool files (anchoring_report, quote_quality_survey and store_read included; store_read and its
+    shared helper _owner_read start no subprocess at all) and the shell scripts under tools/engram-pkg and
     engram-fix-git-backup.sh: none starts Python with -I/-S or a cleared environment (the only
     subprocess in them that sets an environment is the backup tool's git call, which extends os.environ and
     starts no Python). Modules the tools import were not searched.
@@ -206,6 +207,20 @@ TOOLS: List[Dict[str, Any]] = [
               "--judging-key", "${work}/survey-key.json"],
      "artifacts": ["${work}/survey-sheet.md", "${work}/survey-key.json"],
      "normalise": ["generated_at_field"], "artifact_normalise": ["generated_at_field"]},
+    # store_read.py has three subcommands behind ONE flag, and each reads a different statement, so each is its
+    # own row (told apart by `label`), the way anchoring_report and the survey are. It prints its result on
+    # stdout and its path label only on stderr, so stdout and exit code are the compared output. `ids` has TWO
+    # rows: --since before any real created_at (the whole graph, so the type/status/is_current filters are
+    # compared) and --since a fixed mid-history instant (a proper subset on a real graph, so an ON path that
+    # dropped or mis-bound the created_at bound would print more ids than OFF and FAIL).
+    {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:ids",
+     "tool": ["tools/store_read.py"], "argv": ["ids", "--since", "2000-01-01T00:00:00Z"]},
+    {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:ids-recent",
+     "tool": ["tools/store_read.py"], "argv": ["ids", "--since", "2026-09-01T00:00:00Z"]},
+    {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:axiom-count",
+     "tool": ["tools/store_read.py"], "argv": ["axiom-count"]},
+    {"flag": "store_read_reads_via_owner", "label": "store_read_reads_via_owner:node-count",
+     "tool": ["tools/store_read.py"], "argv": ["node-count"]},
 ]
 
 # Named normalisations. Each is named per tool in the table AND in the report, with why.
@@ -1132,7 +1147,7 @@ stated limits (what a PASS does not cover):
   - the open counter arms per Python process: each tool runs with PYTHONPATH pointing at a scratch directory
     that holds a sitecustomize module. A Python child escapes it only when started with -I/-S (-I ignores
     PYTHONPATH, -S skips site and so sitecustomize) or with PYTHONPATH/the environment cleared; its opens
-    are then not counted. Not found in the fourteen shipped tool files or their shell helpers (imported modules
+    are then not counted. Not found in the fifteen shipped tool files (store_read included) or their shell helpers (imported modules
     were not searched).
   - for the tools that write the store (regen_embeddings, backup) the resulting store state is not compared,
     only the output they print and the artifacts they declare."""
