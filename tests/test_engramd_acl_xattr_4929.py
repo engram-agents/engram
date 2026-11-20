@@ -145,10 +145,14 @@ def _enotsup():
 
 
 def _plant(path, name: str, blob: bytes) -> None:
+    """Plant an ACL xattr. Only 'this filesystem has no ACLs' skips; any other error (EINVAL from a
+    malformed blob, a permission error) is the fixture's fault and FAILS, never a quiet skip."""
     try:
         os.setxattr(str(path), name, blob)
     except OSError as exc:
-        pytest.skip(f"fixture filesystem does not support ACLs: {exc}")
+        if exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            pytest.skip(f"fixture filesystem does not support ACLs: {exc}")
+        pytest.fail(f"planting {name} on {path} failed (the fixture's blob or setup, not the filesystem): {exc}")
 
 
 def _xattr_absent(path, name: str) -> bool:

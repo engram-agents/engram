@@ -140,10 +140,14 @@ def standin(monkeypatch):
 
 
 def _plant(path, name: str, blob: bytes) -> None:
+    """Plant an ACL xattr. Only 'this filesystem has no ACLs' skips; any other error (EINVAL from a
+    malformed blob, a permission error) is the fixture's fault and FAILS, never a quiet skip."""
     try:
         os.setxattr(str(path), name, blob)
     except OSError as exc:
-        pytest.skip(f"fixture filesystem does not support ACLs: {exc}")
+        if exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            pytest.skip(f"fixture filesystem does not support ACLs: {exc}")
+        pytest.fail(f"planting {name} on {path} failed (the fixture's blob or setup, not the filesystem): {exc}")
 
 
 def _skip_if_socket_path_too_long(home: Path) -> None:
@@ -169,7 +173,8 @@ def _home_with_run(base: Path) -> tuple[Path, Path]:
 # What the stand-in shows for each leftover shape, and the entry the refusal must name.
 _LEFTOVER_CASES = [
     pytest.param(ACCESS, _named_user(), f"user:{_NOBODY}:", id="named-user"),
-    pytest.param(DEFAULT, _BASE + [(2, 7, int(_NOBODY))], "default:user:", id="default-only"),
+    # A named entry needs a mask entry (and the kernel's entry order) or setxattr refuses it with EINVAL.
+    pytest.param(DEFAULT, _named_user(), f"default:user:{_NOBODY}:", id="default-only"),
     pytest.param(ACCESS, _named_group(), f"group:{_NOBODY}:", id="named-group"),
 ]
 

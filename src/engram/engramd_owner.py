@@ -4090,7 +4090,8 @@ class EngramdOwner:
         extended here to the ACL-strip requirement of §2.1). This build
         implements the Linux arm (#3194) and the Darwin arm (#3666), chosen
         by `_owner_arm()` (#3708). Any other platform, a Linux seat missing
-        `os.getxattr`, `os.removexattr` or socket.SO_PEERCRED, or a Darwin seat missing
+        `os.getxattr`, `os.removexattr` or socket.SO_PEERCRED, or a Darwin
+        seat missing
         socket.LOCAL_PEERCRED, `/bin/chmod` or `/dev/fd` refuses here rather
         than starting with a silently-unenforced permission layer.
 
@@ -4299,7 +4300,7 @@ class EngramdOwner:
             os.fchmod(fd, RUN_DIR_MODE)
             if _owner_arm() == "darwin":
                 # #3666: the Darwin strip + fd-based read-back; the finally
-                # below still closes fd. The Linux setfacl arm is untouched.
+                # below still closes fd. The Linux arm (xattr strip, #4929) follows.
                 self._strip_run_dir_acl_darwin(fd, run_dir)
                 return
             # #4929: strip BOTH ACL xattrs through the open fd (no setfacl).
@@ -4350,7 +4351,8 @@ class EngramdOwner:
         same fd -- never the path, so a swap between strip and read-back
         cannot show a clean read for a different directory -- and any entry
         left over refuses the start. `chmod -N` exiting 0 is not evidence the
-        strip worked; nothing on the Linux arm re-reads the ACL either (#3698)."""
+        strip worked, just as a successful `os.removexattr` is not on the Linux
+        arm, which reads its strip back the same way (#3698, #4929)."""
         try:
             proc = subprocess.run(
                 [DARWIN_CHMOD, "-N", f"{DARWIN_DEV_FD}/{fd}"],
