@@ -34,11 +34,11 @@ pytestmark = pytest.mark.skipif(
 SELECTOR_STUB = '''\
 import os, sys
 if "--json" in sys.argv:
-    open(os.environ["RUN_MARK"], "a").write("json\\n")
+    open(os.environ["RUN_MARK"], "a").write("json " + " ".join(sys.argv[1:]) + "\\n")
     print(os.environ.get("STUB_JSON_OUT", ""), file=sys.stderr)
     print("{}")
     sys.exit(int(os.environ.get("STUB_JSON_RC", "0")))
-open(os.environ["RUN_MARK"], "a").write("run\\n")
+open(os.environ["RUN_MARK"], "a").write("run " + " ".join(sys.argv[1:]) + "\\n")
 print(os.environ.get("STUB_OUT", ""))
 if os.environ.get("STUB_WRITE_XML") == "1":
     for a in sys.argv:
@@ -123,7 +123,15 @@ def selector_ran(env):
 
 
 def run_mode_ran(env):
-    return env["run_mark"].exists() and "run" in env["run_mark"].read_text().split()
+    return bool(calls(env, "run"))
+
+
+def calls(env, mode):
+    """The selector's argv lines for one mode ('json' or 'run'), after the mode word."""
+    if not env["run_mark"].exists():
+        return []
+    return [ln.split(" ", 1)[1] for ln in env["run_mark"].read_text().splitlines()
+            if ln.split(" ", 1)[0] == mode]
 
 
 def dc_called(env):
@@ -142,7 +150,7 @@ def test_unknown_option_exits_2(env):
 def test_base_without_value_exits_2(env):
     rc, out = run(env, "--base")
     assert rc == 2
-    assert "--base" in out and "value" in out
+    assert "--base needs a value" in out
     assert not selector_ran(env)
 
 
@@ -261,6 +269,35 @@ def test_missing_interpreter_from_environment_is_stated(env):
     assert str(gone) in out
     assert "ENGRAM_PY" in out and "environment" in out
     assert not selector_ran(env)
+
+
+def test_two_missing_pieces_are_separated_and_both_named(env):
+    env["dc"].unlink()
+    rc, out = run(env, "--base", "HEAD", extra={"STUB_MISSING": "coverage"})
+    assert rc == 0
+    assert "the python package coverage; diff-cover at " + str(env["bin"] / "diff-cover") in out
+    assert not selector_ran(env)
+
+
+def test_three_missing_pieces_are_all_separated(env):
+    env["dc"].unlink()
+    rc, out = run(env, "--base", "HEAD", extra={"STUB_MISSING": "coverage pytest_cov"})
+    assert rc == 0
+    assert ("missing the python package coverage; the python package pytest_cov; "
+            "diff-cover at ") in out
+
+
+# --- the selector's argv, both phases ---------------------------------------
+
+def test_selector_argv_classify_and_run_phases(env):
+    rc, out = run(env, "--base", "HEAD", extra={"STUB_WRITE_XML": "1"})
+    assert rc == 0
+    (cl,) = calls(env, "json")
+    (rn,) = calls(env, "run")
+    assert "--base HEAD" in cl and "--json" in cl.split()
+    assert "--base HEAD" in rn and "--json" not in rn.split()
+    after = rn.split(" -- ", 1)[1].split()
+    assert "--cov=src" in after and "--cov-branch" in after
 
 
 # --- item 3: red run --------------------------------------------------------

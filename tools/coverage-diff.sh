@@ -32,8 +32,9 @@
 #
 # EXIT CODES
 #   Advisory by contract (#4358): nonzero ONLY for a usage error, and that
-#   code is 2. Everything else exits 0 and prints one plain line saying what
-#   happened.
+#   code is 2. Everything else exits 0 and prints a plain line saying what
+#   happened (the missing-tool case adds two indented lines: the interpreter
+#   and how it was chosen, and the install line).
 #   2   usage error: an unknown option; --base with no value; a --base ref
 #       that does not resolve to a commit (checked before any test run); or
 #       the selector's own refusal (its exit 2-6, read from a `--json`
@@ -134,7 +135,11 @@ fi
 [ -x "$DIFF_COVER" ] || MISSING+=("diff-cover at $DIFF_COVER")
 
 if [ "${#MISSING[@]}" -gt 0 ]; then
-    say "no coverage report: missing ${MISSING[*]}."
+    MISSING_LIST=""
+    for item in "${MISSING[@]}"; do
+        MISSING_LIST="${MISSING_LIST:+$MISSING_LIST; }$item"
+    done
+    say "no coverage report: missing ${MISSING_LIST}."
     say "  interpreter: $ENGRAM_PY, chosen via $PY_HOW."
     say "  Install: $ENGRAM_PY -m pip install coverage pytest-cov diff-cover (see requirements/requirements-dev.txt), or set ENGRAM_PY=/path/to/python."
     exit 0
