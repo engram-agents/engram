@@ -730,12 +730,14 @@ class OwnerPermissionUnsupported(RuntimeError):
     the deployment would believe it has one. This build implements the
     Linux arm (#3194) and the Darwin arm (#3666: LOCAL_PEERCRED, `/bin/chmod
     -N` on the run/ fd). A seat on any other platform, or one missing an
-    arm's prerequisite (Linux: `setfacl` or `getfacl` -- #3698: the strip is
-    read back -- or SO_PEERCRED; Darwin: LOCAL_PEERCRED, `/bin/chmod`,
-    `/dev/fd`), refuses to start via this exception rather than starting
-    with a silently-unenforced permission layer. So does a strip command
-    that exits non-zero (both arms) or, on Darwin, does not finish within
-    its timeout; what the READ-BACK finds is OwnerAclNotStripped."""
+    arm's prerequisite (Linux: `os.getxattr` / `os.removexattr` -- #4929: the
+    strip and its read-back are xattr calls, no `setfacl`/`getfacl` -- or
+    SO_PEERCRED; Darwin: LOCAL_PEERCRED, `/bin/chmod`, `/dev/fd`), refuses to
+    start via this exception rather than starting with a silently-unenforced
+    permission layer. So does a strip that fails (Linux: an `os.removexattr`
+    error other than ENODATA/ENOTSUP; Darwin: a `chmod -N` that exits
+    non-zero or does not finish within its timeout); what the READ-BACK finds
+    is OwnerAclNotStripped."""
 
 
 class OwnerStalePathUnsafe(RuntimeError):
@@ -804,11 +806,13 @@ class OwnerPeerCredentialsMalformed(RuntimeError):
 
 class OwnerAclNotStripped(RuntimeError):
     """Raised by EngramdOwner.start() when the run/ directory's ACL, read back
-    through the same fd the `setfacl -b` strip used, still carries an entry
-    beyond the base user::/group::/other:: triple (a named user or group, a
-    mask::, any default: line) -- or when that read-back itself cannot be
-    completed (getfacl failed, timed out or printed nothing parseable), because
-    an unverifiable strip is the silent-gap shape (#3698, design doc §2.2).
+    through the same fd the xattr strip used (`os.getxattr` on
+    `system.posix_acl_access` and `system.posix_acl_default`, #4929), still
+    carries an entry beyond the base user::/group::/other:: triple (a named
+    user or group, a mask::, any default: entry) -- or when that read-back
+    itself cannot be completed (an `os.getxattr` error other than
+    ENODATA/ENOTSUP, or an xattr blob that does not decode), because an
+    unverifiable strip is the silent-gap shape (#3698, design doc §2.2).
     Darwin (#3666) raises it for the same three outcomes of its own read-back
     (`acl_get_fd_np` through the strip's fd): any entry left after `chmod -N`,
     a read-back that cannot complete, and a mode other than 0700.
@@ -1811,9 +1815,10 @@ def _owner_arm() -> str | None:
 def platform_unsupported_reason() -> str | None:
     """Why this seat cannot run the owner, or None when it can (#3194, #3292).
 
-    Linux: four checks, in this order, first failure wins: (1) not Linux,
-    (2) no `setfacl` on PATH, (3) no `getfacl` on PATH (the strip's
-    read-back, #3698), (4) no `socket.SO_PEERCRED`.
+    Linux: three checks, in this order, first failure wins: (1) not Linux,
+    (2) no `os.getxattr` or no `os.removexattr` (the strip and its read-back
+    are xattr calls on the run/ fd, #4929; no `setfacl`/`getfacl` binary is
+    needed), (3) no `socket.SO_PEERCRED`.
     Darwin (#3666): `_darwin_unsupported_reason()` -- `socket.LOCAL_PEERCRED`,
     `/bin/chmod` and `/dev/fd`, each named when missing. Any other platform
     refuses.
@@ -1831,17 +1836,14 @@ def platform_unsupported_reason() -> str | None:
             f"implemented for Linux and Darwin in this build; this seat "
             f"reports platform.system() == {platform.system()!r}"
         )
-    if shutil.which("setfacl") is None:
+    missing_xattr = [n for n in ("getxattr", "removexattr") if not hasattr(os, n)]
+    if missing_xattr:
         return (
-            "refusing to start: `setfacl` is required to strip "
-            "inherited ACLs on the socket's run/ directory (design "
-            "doc §2.1) and was not found on PATH"
-        )
-    if shutil.which("getfacl") is None:
-        return (
-            "refusing to start: `getfacl` is required to read back the "
-            "ACL strip on the socket's run/ directory (design doc §2.2: "
-            "an unverified strip is a silent gap) and was not found on PATH"
+            f"refusing to start: this Python/OS build has no "
+            f"{' or '.join('os.' + n for n in missing_xattr)} -- the ACL "
+            f"strip on the socket's run/ directory (design doc §2.1) and "
+            f"its read-back (§2.2: an unverified strip is a silent gap) "
+            f"cannot run here"
         )
     if not hasattr(socket, "SO_PEERCRED"):
         return (
@@ -1856,51 +1858,127 @@ def platform_unsupported_reason() -> str | None:
 _ACL_LEFTOVER_LIST_MAX = 10
 _ACL_BASE_RE = re.compile(r"^(user|group|other)::\S*(\s+#.*)?$")
 
+# The two xattrs that carry a directory's POSIX ACL (#4929). The access ACL holds
+# the named entries and the mask; the default ACL is what new children inherit.
+_ACL_XATTR_ACCESS = "system.posix_acl_access"
+_ACL_XATTR_DEFAULT = "system.posix_acl_default"
+_ACL_XATTR_NAMES = (_ACL_XATTR_ACCESS, _ACL_XATTR_DEFAULT)
+# "No ACL here": ENODATA = nothing set; ENOTSUP = this filesystem has no ACLs, so
+# nothing can be set (EOPNOTSUPP is a different number on some kernels).
+_ACL_NOTSUP_ERRNOS = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP})
+_ACL_ABSENT_ERRNOS = frozenset({errno.ENODATA}) | _ACL_NOTSUP_ERRNOS
+_ACL_XATTR_VERSION = 2
+_ACL_XATTR_ENTRY = struct.Struct("<HHI")
+_ACL_XATTR_TAGS = {1: "user", 2: "user", 4: "group", 8: "group", 16: "mask", 32: "other"}
+_ACL_XATTR_NAMED_TAGS = frozenset({2, 8})
 
-def _read_acl_entries(fd: int, run_dir=None) -> list[str]:
-    """The ACL entries of the directory open as `fd`, one string per line,
-    blank and `#` comment lines dropped (#3698). Reads through
-    /proc/self/fd/<fd> -- the SAME fd the strip used -- never a path, so a
-    swap of run/ between strip and read-back cannot report a clean ACL for a
-    different directory. A getfacl failure (non-zero exit, timeout, missing
-    binary) or output with no entry at all raises OwnerAclNotStripped with its
-    own reason: an unverifiable strip refuses. stderr is NOT a failure signal
-    (getfacl always warns about the leading '/')."""
-    where = str(run_dir) if run_dir is not None else f"/proc/self/fd/{fd}"
-    try:
-        proc = subprocess.run(
-            ["getfacl", "-c", "-n", f"/proc/self/fd/{fd}"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            pass_fds=[fd],
+
+def _errno_name(exc: OSError) -> str:
+    if exc.errno is None:
+        return "unknown errno"
+    return errno.errorcode.get(exc.errno, str(exc.errno))
+
+
+def _perm_text(bits: int) -> str:
+    return ("r" if bits & 4 else "-") + ("w" if bits & 2 else "-") + ("x" if bits & 1 else "-")
+
+
+def _decode_posix_acl_xattr(blob: bytes, default: bool = False, where: str | None = None) -> list[str]:
+    """Decode a `system.posix_acl_{access,default}` xattr value into getfacl-style
+    entry strings (#4929): `user::rwx`, `user:<uid>:rwx`, `group::r-x`,
+    `group:<gid>:r-x`, `mask::rwx`, `other::---`, each prefixed `default:` when
+    `default` is set. Format: a little-endian u32 version (must be 2), then N
+    8-byte entries `<HHI` = (tag, perm, id); tags 1 user_obj, 2 user, 4 group_obj,
+    8 group, 16 mask, 32 other; perm bits 4=r 2=w 1=x; id is meaningful for tags 2
+    and 8 only. A blob that does not parse (short, wrong version, a length that is
+    not 4 + 8k, an unknown tag) raises OwnerAclNotStripped: an ACL that cannot be
+    read cannot be called stripped. Never struct.error / IndexError, never a
+    silent skip."""
+    where = where if where is not None else "the run/ directory"
+    prefix = "default:" if default else ""
+    xname = _ACL_XATTR_DEFAULT if default else _ACL_XATTR_ACCESS
+
+    def refuse(reason: str) -> "OwnerAclNotStripped":
+        return OwnerAclNotStripped(
+            f"refusing to start: the {xname} value on {where} is malformed "
+            f"({reason}) -- the ACL strip could not be verified"
         )
-    except subprocess.TimeoutExpired as exc:
-        raise OwnerAclNotStripped(
-            f"refusing to start: `getfacl` on {where} timed out after "
-            f"{exc.timeout}s -- the ACL strip could not be verified"
-        ) from exc
-    except OSError as exc:
-        raise OwnerAclNotStripped(
-            f"refusing to start: `getfacl` could not be run on {where} "
-            f"({exc}) -- the ACL strip could not be verified"
-        ) from exc
-    if proc.returncode != 0:
-        raise OwnerAclNotStripped(
-            f"refusing to start: `getfacl` on {where} failed (exit "
-            f"{proc.returncode}): {proc.stderr.strip()} -- the ACL strip "
-            f"could not be verified"
-        )
-    entries = [
-        ln.strip()
-        for ln in proc.stdout.splitlines()
-        if ln.strip() and not ln.lstrip().startswith("#")
-    ]
-    if not entries:
-        raise OwnerAclNotStripped(
-            f"refusing to start: `getfacl` on {where} printed no ACL entries "
-            f"(unparseable output) -- the ACL strip could not be verified"
-        )
+
+    if not isinstance(blob, (bytes, bytearray)):
+        raise refuse(f"expected bytes, got {type(blob).__name__}")
+    if len(blob) < 4:
+        raise refuse(f"{len(blob)} bytes is shorter than the 4-byte version header")
+    (version,) = struct.unpack_from("<I", blob, 0)
+    if version != _ACL_XATTR_VERSION:
+        raise refuse(f"version {version}, expected {_ACL_XATTR_VERSION}")
+    if (len(blob) - 4) % _ACL_XATTR_ENTRY.size:
+        raise refuse(f"length {len(blob)} is not 4 + {_ACL_XATTR_ENTRY.size}k")
+    entries: list[str] = []
+    for off in range(4, len(blob), _ACL_XATTR_ENTRY.size):
+        tag, perm, ident = _ACL_XATTR_ENTRY.unpack_from(blob, off)
+        kind = _ACL_XATTR_TAGS.get(tag)
+        if kind is None:
+            raise refuse(f"unknown entry tag {tag}")
+        qualifier = str(ident) if tag in _ACL_XATTR_NAMED_TAGS else ""
+        entries.append(f"{prefix}{kind}:{qualifier}:{_perm_text(perm)}")
+    return entries
+
+
+def _read_acl_entries(fd: int, run_dir=None, *, notsup: "list[str] | None" = None) -> list[str]:
+    """The ACL entries of the directory open as `fd`, one getfacl-style string
+    per entry (#3698, #4929). Reads `os.getxattr(fd, name)` for
+    `system.posix_acl_access` and `system.posix_acl_default` through the SAME fd
+    the strip used -- never a path, so a swap of run/ between strip and read-back
+    cannot report a clean ACL for a different directory. ENODATA or ENOTSUP for a
+    name means that ACL is absent; any other OSError raises OwnerAclNotStripped
+    ("could not be verified"): an unverifiable strip refuses. A present blob is
+    decoded by `_decode_posix_acl_xattr` (a blob that does not decode refuses the
+    same way), and `_acl_leftovers` remains the one judge. When the ACCESS ACL is
+    absent the base triple comes from the mode bits (`os.fstat(fd).st_mode`), as
+    getfacl printed it, so the judge always sees a base triple. `notsup`, if
+    given, receives the names that answered ENOTSUP (the caller logs the
+    no-ACL-filesystem branch from it).
+
+    Bound: ENOTSUP/ENODATA from the POSIX ACL xattrs means no POSIX ACL, NOT
+    no ACL enforcement. NFSv4 keeps its ACLs in `system.nfs4_acl`, which this
+    read does not look at, and newer kernels answer ENODATA rather than
+    EOPNOTSUPP for the POSIX names there, so even the no-ACL log line stays
+    silent. run/ must be on a filesystem whose ACLs are POSIX ACLs (or none);
+    `getfacl` had the same blind spot."""
+    where = str(run_dir) if run_dir is not None else f"fd {fd}"
+    entries: list[str] = []
+    access_present = False
+    for name in _ACL_XATTR_NAMES:
+        is_default = name == _ACL_XATTR_DEFAULT
+        try:
+            blob = os.getxattr(fd, name)
+        except OSError as exc:
+            if exc.errno in _ACL_ABSENT_ERRNOS:
+                if notsup is not None and exc.errno in _ACL_NOTSUP_ERRNOS:
+                    notsup.append(name)
+                continue
+            raise OwnerAclNotStripped(
+                f"refusing to start: `os.getxattr` of {name} on {where} (via "
+                f"its open fd) failed with {_errno_name(exc)} ({exc.strerror}) "
+                f"-- the ACL strip could not be verified"
+            ) from exc
+        entries.extend(_decode_posix_acl_xattr(blob, default=is_default, where=where))
+        if not is_default:
+            access_present = True
+    if not access_present:
+        try:
+            mode = os.fstat(fd).st_mode
+        except OSError as exc:
+            raise OwnerAclNotStripped(
+                f"refusing to start: the mode of {where} could not be read "
+                f"({exc}) -- the ACL strip could not be verified"
+            ) from exc
+        base = [
+            f"user::{_perm_text(mode >> 6)}",
+            f"group::{_perm_text(mode >> 3)}",
+            f"other::{_perm_text(mode)}",
+        ]
+        entries = base + entries
     return entries
 
 
@@ -3703,7 +3781,7 @@ class EngramdOwner:
         # `run/` (the socket's parent) MUST be hardened -- and, load-
         # bearing, its own symlink/ownership refusal checked -- BEFORE
         # `_check_stale_socket_or_raise()` runs, not merely before
-        # `_harden_run_dir()`'s own chmod/setfacl calls (#3194, Mira's
+        # `_harden_run_dir()`'s own chmod/ACL-strip calls (#3194, Mira's
         # ordering finding on #3201's exact head 18cd14b2: with the
         # OLD ordering, `self.socket_path` -- which traverses `run/` as a
         # path COMPONENT -- resolves through a `run -> elsewhere` symlink
@@ -4019,7 +4097,8 @@ class EngramdOwner:
         extended here to the ACL-strip requirement of §2.1). This build
         implements the Linux arm (#3194) and the Darwin arm (#3666), chosen
         by `_owner_arm()` (#3708). Any other platform, a Linux seat missing
-        `setfacl`, `getfacl` or socket.SO_PEERCRED, or a Darwin seat missing
+        `os.getxattr`, `os.removexattr` or socket.SO_PEERCRED, or a Darwin
+        seat missing
         socket.LOCAL_PEERCRED, `/bin/chmod` or `/dev/fd` refuses here rather
         than starting with a silently-unenforced permission layer.
 
@@ -4118,10 +4197,11 @@ class EngramdOwner:
         0700` -- `chmod` only affects the ACCESS ACL/mode, not an
         inherited DEFAULT ACL, and the default ACL survives and would
         apply to the socket file created inside (measured directly by the
-        dispatching agent; see issue #3194's comment thread). `setfacl -b`
-        strips BOTH the access-ACL's named entries and the inherited
-        default ACL, leaving only the standard user/group/other mode-bit
-        entries (also measured there).
+        dispatching agent; see issue #3194's comment thread). Removing the
+        `system.posix_acl_access` and `system.posix_acl_default` xattrs
+        (#4929; `setfacl -b` before that) strips BOTH the access-ACL's
+        named entries and the inherited default ACL, leaving only the
+        standard user/group/other mode-bit entries (also measured there).
 
         `os.umask(0o077)` is set explicitly around the directory creation
         rather than relying on whatever the process's current umask
@@ -4152,14 +4232,15 @@ class EngramdOwner:
         are refusals, caught generically) to open a symlink at all, never
         silently following it. Every subsequent mutation
         (ownership check via `os.fstat`, mode via `os.fchmod`, ACL-strip
-        via `setfacl -b /proc/self/fd/<fd>` -- the standard Linux
-        fd-relative-path trick for tools that only take a path argument,
-        verified directly: it operates on the FD'S target, not on
-        whatever the original path string re-resolves to) goes through
+        via `os.removexattr(fd, ...)` -- since #4929; it was `setfacl -b
+        /proc/self/fd/<fd>`, the Linux fd-relative-path trick for tools
+        that only take a path argument -- both operate on the FD'S
+        target, not on whatever the original path string re-resolves
+        to) goes through
         this SAME fd, never re-resolving the path string again. A
         directory that does not yet exist is `mkdir()`'d fresh first (so
         we know we created it, hence own it) before this same open+fstat+
-        fchmod+setfacl sequence re-secures it -- re-securing is not
+        fchmod+ACL-strip sequence re-secures it -- re-securing is not
         skipped just because we made it ourselves this call, matching the
         "runs on EVERY start()" posture above. `FileExistsError` from that
         `mkdir()` is the normal "already there from a prior start()"
@@ -4226,42 +4307,44 @@ class EngramdOwner:
             os.fchmod(fd, RUN_DIR_MODE)
             if _owner_arm() == "darwin":
                 # #3666: the Darwin strip + fd-based read-back; the finally
-                # below still closes fd. The Linux setfacl arm is untouched.
+                # below still closes fd. The Linux arm (xattr strip, #4929) follows.
                 self._strip_run_dir_acl_darwin(fd, run_dir)
                 return
-            try:
-                proc = subprocess.run(
-                    ["setfacl", "-b", f"/proc/self/fd/{fd}"],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=30,
-                    pass_fds=[fd],
-                )
-            except subprocess.TimeoutExpired as exc:
-                # Parity with the Darwin `chmod -N` refusal (#3708): a hung
-                # strip is a named refusal, not a bare traceback.
-                raise OwnerPermissionUnsupported(
-                    f"refusing to start: `setfacl -b` on {run_dir} did not "
-                    f"finish within {exc.timeout}s"
-                ) from exc
-            if proc.returncode != 0:
-                raise OwnerPermissionUnsupported(
-                    f"refusing to start: `setfacl -b` on {run_dir} (via "
-                    f"its open fd, never by re-resolving the path) "
-                    f"failed (exit {proc.returncode}): {proc.stderr.strip()}"
-                )
+            # #4929: strip BOTH ACL xattrs through the open fd (no setfacl).
+            # ENODATA = nothing there; ENOTSUP = this filesystem has no ACLs.
+            for xname in _ACL_XATTR_NAMES:
+                try:
+                    os.removexattr(fd, xname)
+                except OSError as exc:
+                    if exc.errno in _ACL_ABSENT_ERRNOS:
+                        continue
+                    raise OwnerPermissionUnsupported(
+                        f"refusing to start: `os.removexattr` of {xname} on "
+                        f"{run_dir} (via its open fd, never by re-resolving "
+                        f"the path) failed with {_errno_name(exc)} "
+                        f"({exc.strerror})"
+                    ) from exc
             # #3698: trust the strip only after reading it back, through the
-            # SAME fd (never the path), before the fd is closed.
-            leftovers = _acl_leftovers(_read_acl_entries(fd, run_dir))
+            # SAME fd (never the path), before the fd is closed. A remove that
+            # returns success is not evidence of a strip (#4929: a second
+            # remove on a clean dir also raises nothing).
+            notsup: list[str] = []
+            leftovers = _acl_leftovers(_read_acl_entries(fd, run_dir, notsup=notsup))
             if leftovers:
                 shown = leftovers[:_ACL_LEFTOVER_LIST_MAX]
                 rest = len(leftovers) - len(shown)
                 more = f" (and {rest} more)" if rest else ""
                 raise OwnerAclNotStripped(
                     f"refusing to start: {run_dir} still carries leftover ACL "
-                    f"entries after `setfacl -b` (read back via its open fd): "
+                    f"entries after the xattr strip (read back via its open fd): "
                     f"{'; '.join(shown)}{more}"
+                )
+            if len(set(notsup)) == len(_ACL_XATTR_NAMES):
+                logging.getLogger("engramd_owner").warning(
+                    "run/ filesystem has no POSIX ACL support (ENOTSUP on both "
+                    "ACL xattrs of %s): no ACL can be set there, so the mode "
+                    "bits decide alone",
+                    run_dir,
                 )
         finally:
             os.close(fd)
@@ -4275,7 +4358,8 @@ class EngramdOwner:
         same fd -- never the path, so a swap between strip and read-back
         cannot show a clean read for a different directory -- and any entry
         left over refuses the start. `chmod -N` exiting 0 is not evidence the
-        strip worked; nothing on the Linux arm re-reads the ACL either (#3698)."""
+        strip worked, just as a successful `os.removexattr` is not on the Linux
+        arm, which reads its strip back the same way (#3698, #4929)."""
         try:
             proc = subprocess.run(
                 [DARWIN_CHMOD, "-N", f"{DARWIN_DEV_FD}/{fd}"],

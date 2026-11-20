@@ -132,6 +132,7 @@ _EVIDENCE = (
 # elsewhere), with the reason. Adding a line here is a statement a reviewer can read.
 _ALLOWLIST = {
     "test_engramd_owner_arm_3708.py": "constructs owners to test peer-credential dispatch; never calls start()",
+    "test_engramd_acl_xattr_4929.py": "constructs owners to drive _harden_run_dir (the strip + read-back); never calls start()",
     "test_engramd_owner_schema_gate_3753.py": "the gate's own file; controls the store version itself",
     "test_owner_launchd_3709.py": "its only EngramdOwner( is inside a CHILD-process code string (K6 shared-predicate cell); the in-process owner is never started here",
 }

@@ -2,7 +2,8 @@
 
 `EngramdOwner.start()` refuses on any seat that `engramd_owner.
 platform_unsupported_reason()` reports as unsupported (#3194): on Linux, no
-`setfacl` or `getfacl` on PATH (#3698) or no `socket.SO_PEERCRED`; on Darwin (#3666), no
+`os.getxattr` / `os.removexattr` (#4929: the run/ ACL strip and its read-back are xattr
+calls; `setfacl`/`getfacl` are no longer needed) or no `socket.SO_PEERCRED`; on Darwin (#3666), no
 `socket.LOCAL_PEERCRED`, `/bin/chmod` or `/dev/fd`; any other platform -- by
 design. A test that calls `start()` (directly, or through a fixture that does)
 therefore cannot pass on a seat the predicate refuses; it carries
@@ -22,8 +23,8 @@ The marker uses the owner's OWN predicate -- the very function
 `_check_platform_support()` raises from -- evaluated once, at import
 (collection) time. Skip and refusal therefore share one definition and cannot
 disagree. That is sufficient because the seat does not change within a run; a
-simulation of another seat must patch `platform.system` / `shutil.which` /
-`socket.SO_PEERCRED` before collection. Tests that do not need a running owner
+simulation of another seat must patch `platform.system` / `os.getxattr` /
+`os.removexattr` / `socket.SO_PEERCRED` before collection. Tests that do not need a running owner
 (pure helpers, constants, and the refusal tests themselves) must NOT carry this
 marker: they run on every platform.
 """
