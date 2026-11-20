@@ -18,9 +18,12 @@ Contract (each cell written before the change, red first):
   E   the step-6 header comment says an owner can serve a zero-byte store, so that case stops at the owner refusal
   F   the docstring lists exit 4
 
-Every sqlite error here is PROVOKED (a real WAL store under a chmod-ed folder, a real open of a missing directory),
-never constructed: a hand-built sqlite3.OperationalError has no `sqlite_errorcode`. The one copy made without the
-attribute is made FROM a real error, to stand in for Python 3.10, which does not have it.
+In sections A to F every sqlite error is PROVOKED (a real WAL store under a chmod-ed folder, a real open of a missing
+directory), never constructed: a hand-built sqlite3.OperationalError has no `sqlite_errorcode`. The one copy made
+without the attribute is made FROM a real error, to stand in for Python 3.10, which does not have it. Section G's
+unit cells (C3, C4, C6) are the exception: they hand-build errors (with a chosen `sqlite_errorcode`, or without it
+for the message-fallback twins), because which code a build raises for these states varies; its end-to-end cells
+(C1, C2, C5) still run the real tool on real stores.
 
 Mutation controls (run by hand, recorded in the PR):
   M1  exit 4 mapped back to 1                         -> A and D red
@@ -307,14 +310,15 @@ def test_f_the_docstring_lists_exit_4():
 #       `readonly or cantopen` gate); the message-fallback twin
 #   C5  end to end: a WAL-header garbage file in a writable folder -> exit 1 (the end-to-end outcome only: the tool's
 #       own open leaves a -shm beside the file before the error is classified, so the cantopen branch's -shm test
-#       also returns None here and this cell does NOT redden under M1; C4 is the cell that pins the gate)
+#       also returns None here and this cell does NOT redden under N1; C4 is the cell that pins the gate)
 #   C6  unit: code 14, WAL header: -shm present -> None; no -shm -> the cantopen line (the fix did not loosen 14)
 #
-# Mutation controls (run by hand, recorded in the PR):
-#   M1  drop the `readonly or cantopen` gate        -> C4 red (both twins)
-#   M2  -shm test back in front of both branches    -> C1, C3 red
-#   M3  drop the -shm test entirely                 -> C6 red
-#   M4  drop the os.access check (readonly branch)  -> the writable-folder control cell red
+# Mutation controls for section G (run by hand, recorded in the PR; named N1-N4 so they do not collide with the
+# module docstring's M1-M3):
+#   N1  drop the `readonly or cantopen` gate        -> C4 red (both twins)
+#   N2  -shm test back in front of both branches    -> C1, C3 red
+#   N3  drop the -shm test entirely                 -> C6 red
+#   N4  drop the os.access check (readonly branch)  -> the writable-folder control cell red
 
 _STRAY_SHM = b"\0" * 32768
 _READONLY_MSG = "attempt to write a readonly database"
