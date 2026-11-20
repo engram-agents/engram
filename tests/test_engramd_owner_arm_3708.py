@@ -17,7 +17,8 @@ runs on every seat, because each patches what it depends on.
 Cell map: (a)(b)(c) peer-check dispatch; (d) one behavioural cell per site,
 `_owner_arm` patched to the OTHER arm than `platform.system()` says -- the
 discriminating control, no source grep; (e) main() exits cleanly on an
-unsupported seat; (f) a hung `setfacl -b` refuses by name.
+unsupported seat; (f) a failing Linux xattr strip refuses by name (#4929: was a hung
+`setfacl -b`).
 """
 
 from __future__ import annotations
@@ -142,9 +143,12 @@ def test_owner_arm_is_keyed_on_platform_system(monkeypatch, system, arm):
 def test_d1_platform_gate_follows_the_helper(monkeypatch):
     _system(monkeypatch, "Darwin")
     _arm(monkeypatch, "linux")
-    monkeypatch.setattr(shutil, "which", lambda name, *a, **k: None)
+    # #4929: the Linux checks are now os.getxattr / os.removexattr (then SO_PEERCRED),
+    # not setfacl/getfacl on PATH. Delete the xattr functions so the cell fails the
+    # same way on a Linux host (where they exist) and on a Mac (where they never do).
+    monkeypatch.delattr(os, "getxattr", raising=False)
     reason = eo.platform_unsupported_reason()
-    assert reason is not None and "setfacl" in reason, (
+    assert reason is not None and "getxattr" in reason, (
         "system says Darwin but the helper says linux: the gate must run the Linux checks"
     )
 
@@ -166,10 +170,15 @@ def test_d3_harden_run_dir_follows_the_helper(home, monkeypatch):
         owner, "_strip_run_dir_acl_darwin", lambda fd, run_dir: darwin_strips.append(run_dir)
     )
 
-    def no_subprocess(*a, **k):
-        raise AssertionError("the Linux setfacl strip ran although the helper says darwin")
+    def no_linux_strip(*a, **k):
+        raise AssertionError("the Linux xattr strip ran although the helper says darwin")
 
-    monkeypatch.setattr(subprocess, "run", no_subprocess)
+    # #4929: the Linux strip is os.removexattr / os.getxattr (it no longer runs a
+    # subprocess), so guard those; the subprocess guard stays for the Darwin-vs-Linux
+    # mix-up the cell was written for.
+    monkeypatch.setattr(os, "removexattr", no_linux_strip, raising=False)
+    monkeypatch.setattr(os, "getxattr", no_linux_strip, raising=False)
+    monkeypatch.setattr(subprocess, "run", no_linux_strip)
     owner._harden_run_dir()
     assert len(darwin_strips) == 1
 
@@ -201,43 +210,29 @@ def test_e_main_exits_cleanly_when_the_seat_is_unsupported(home, monkeypatch, ca
 
 
 # ---------------------------------------------------------------------------
-# (f) -- a hung `setfacl -b` refuses by name (never a real sleep)
+# (f) -- a failing Linux strip refuses by name (#4929: was a hung `setfacl -b`)
 # ---------------------------------------------------------------------------
+#
+# The #3708 pair pinned two properties of the SUBPROCESS strip: a hang refuses by name
+# (a timeout), and stderr is decoded with errors="replace". #4929 removed the subprocess:
+# `os.removexattr` on the fd cannot hang on a timer and has no stderr, so neither property
+# has a referent any more. What survives is the one both guarded: a strip that fails
+# refuses with a named OwnerPermissionUnsupported, never a bare traceback.
 
 
-def _is_setfacl_strip(argv) -> bool:
-    return isinstance(argv, (list, tuple)) and len(argv) >= 2 and list(argv[:2]) == ["setfacl", "-b"]
-
-
-def test_f_a_hung_setfacl_strip_refuses_with_a_named_reason(home, monkeypatch):
-    # Drives the real Linux branch of _harden_run_dir on any seat: platform.system
-    # is patched to Linux and subprocess.run raises TimeoutExpired for the strip.
-    _system(monkeypatch, "Linux")
+def test_f_a_failing_xattr_strip_refuses_with_a_named_reason(home, monkeypatch):
+    # Drives the real Linux branch of _harden_run_dir on any seat: the arm helper says
+    # linux and os.removexattr is a stand-in that fails (a Mac's os has none).
+    _arm(monkeypatch, "linux")
     owner = _owner(home)
 
-    def hung(argv, *a, **kw):
-        assert _is_setfacl_strip(argv), f"unexpected subprocess call {argv!r}"
-        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+    def failing(fd, name, *a, **kw):
+        raise OSError(5, "boom")  # EIO
 
-    monkeypatch.setattr(subprocess, "run", hung)
+    monkeypatch.setattr(os, "removexattr", failing, raising=False)
+    monkeypatch.setattr(os, "getxattr", lambda *a, **k: b"", raising=False)
     with pytest.raises(eo.OwnerPermissionUnsupported) as exc:
         owner._harden_run_dir()
     msg = str(exc.value)
-    assert "did not finish" in msg
-    assert msg.startswith("refusing to start: `setfacl -b` on ")
-    assert "within 30s" in msg
-
-
-def test_f2_setfacl_strip_decodes_stderr_with_errors_replace(home, monkeypatch):
-    _system(monkeypatch, "Linux")
-    owner = _owner(home)
-    seen = {}
-
-    def fail(argv, *a, **kw):
-        seen.update(kw)
-        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
-
-    monkeypatch.setattr(subprocess, "run", fail)
-    with pytest.raises(eo.OwnerPermissionUnsupported):
-        owner._harden_run_dir()
-    assert seen.get("errors") == "replace" and seen.get("text") is True
+    assert msg.startswith("refusing to start: `os.removexattr` of system.posix_acl_access on ")
+    assert "EIO" in msg

@@ -2858,11 +2858,15 @@ def test_start_refuses_on_an_unsupported_platform_before_any_side_effect(engram_
 # ---------------------------------------------------------------------------
 
 
-def _patch_platform(monkeypatch, *, system="Linux", setfacl=True, peercred=True):
+def _patch_platform(monkeypatch, *, system="Linux", xattr=True, peercred=True):
     monkeypatch.setattr(eo.platform, "system", lambda: system)
-    monkeypatch.setattr(
-        eo.shutil, "which", lambda name, *a, **k: "/usr/bin/" + name if setfacl else None
-    )
+    # #4929: the Linux arm needs os.getxattr / os.removexattr (a Mac's os has neither),
+    # not setfacl/getfacl. Present = stand-ins; absent = deleted, on any host.
+    for fn in ("getxattr", "removexattr"):
+        if xattr:
+            monkeypatch.setattr(eo.os, fn, lambda *a, **k: None, raising=False)
+        else:
+            monkeypatch.delattr(eo.os, fn, raising=False)
     if peercred:
         monkeypatch.setattr(eo.socket, "SO_PEERCRED", 17, raising=False)
     else:
@@ -2871,7 +2875,7 @@ def _patch_platform(monkeypatch, *, system="Linux", setfacl=True, peercred=True)
 
 _PLATFORM_CASES = [
     pytest.param({"system": "FreeBSD"}, "platform.system()", id="unsupported-platform"),
-    pytest.param({"setfacl": False}, "setfacl", id="no-setfacl"),
+    pytest.param({"xattr": False}, "getxattr", id="no-xattr"),
     pytest.param({"peercred": False}, "SO_PEERCRED", id="no-so-peercred"),
 ]
 
@@ -2892,8 +2896,8 @@ def test_platform_unsupported_reason_names_each_failing_condition(monkeypatch, k
 def test_platform_unsupported_reason_order_platform_first(monkeypatch):
     _patch_platform(monkeypatch, system="FreeBSD", peercred=False)
     assert "platform.system()" in eo.platform_unsupported_reason()
-    _patch_platform(monkeypatch, setfacl=False, peercred=False)
-    assert "setfacl" in eo.platform_unsupported_reason()
+    _patch_platform(monkeypatch, xattr=False, peercred=False)
+    assert "getxattr" in eo.platform_unsupported_reason()
 
 
 @pytest.mark.parametrize("kw,needle", _PLATFORM_CASES)
