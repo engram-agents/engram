@@ -214,7 +214,9 @@ def unwrap(text: str) -> str:
     if loc is None:
         return text
     inside = text[lines[loc[0]].end:lines[loc[1]].start].replace("\r\n", "\n")
-    return inside.split("\n", 1)[1] if "\n" in inside else ""
+    first, sep, rest = inside.partition("\n")
+    # Only the notice line is dropped: an edited or deleted notice line must stay visible to the comparators.
+    return rest if sep and first == NOTICE_LINE else inside
 
 
 def _body_matches_hash(text: str) -> bool:
@@ -235,7 +237,8 @@ def plan_removal(text: str, real_path: str, record: "dict | None") -> "tuple[str
                           (its record matches and the body still hashes to the BEGIN hash): today's rule (D1)
       ("pure_other", "")  nothing but whitespace outside the block, but not provably what this install wrote:
                           today's rule too, and the caller says the replaced text did not match (D3c)
-      ("remove", text)    text outside the block: `text` is the file without the block (D2)
+      ("remove", text)    text outside the block and an UNEDITED body: `text` is the file without the block (D2);
+                          an edited body (or an END line moved over the user's text) is a "leave" (D6b)
 
     D6: the block is removed only when THIS ENGRAM home's record (B12) names this file (compared as real
     paths) and the hash in the BEGIN line equals the recorded hash. `record` is the parsed record or None."""
@@ -253,6 +256,11 @@ def plan_removal(text: str, real_path: str, record: "dict | None") -> "tuple[str
         return ("pure" if recorded_ok and _body_matches_hash(text) else "pure_other"), ""
     if not recorded_ok:
         return "leave", "no record in this ENGRAM home names this file's block, so ENGRAM does not remove it"
+    if not _body_matches_hash(text):  # D6b: edited inside, or the END line moved down over the user's text
+        return "leave", (
+            "the block was changed after ENGRAM wrote it, so ENGRAM does not remove it; delete the lines "
+            "between the two markers by hand if you want it gone"
+        )
     return "remove", remove_block(text)
 
 

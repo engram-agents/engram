@@ -384,8 +384,10 @@ def test_D6_cell3_a_record_whose_hash_differs_from_the_begin_hash_leaves_the_fil
 
 
 def test_D6_cell4_the_matching_record_lets_the_block_go_after_the_pre_uninstall_copy(rig):
-    """D6 cell 4: the record names this path and the BEGIN hash: the current file is saved to
-    `.pre-uninstall.<UTC>` and then only the block and its blank line are removed."""
+    """D6 cell 4 and D6b (c), the CONTROL: the record names this path and the BEGIN hash and the body is
+    UNEDITED: the current file is saved to `.pre-uninstall.<UTC>` and then only the block and its blank line are
+    removed, and the line "Removed ENGRAM's block from ...; your own text is kept." prints. A body check that
+    refused everything would turn this red."""
     original, planted = _d6_planted()
     md = _setup(rig, planted, record=None)
     sha = re.search(rb"sha256=([0-9a-f]{64})", planted).group(1).decode()
@@ -394,24 +396,51 @@ def test_D6_cell4_the_matching_record_lets_the_block_go_after_the_pre_uninstall_
     saved = _saved(rig)
     assert len(saved) == 1 and saved[0].read_bytes() == planted and str(saved[0]) in out
     assert md.read_bytes() == original
+    assert f"Removed ENGRAM's block from {md}; your own text is kept." in out  # D6b (c): the control, line still printed
 
 
-def test_D6_documents_that_the_hash_is_the_begin_line_hash_so_a_body_edit_goes_with_the_block_but_stays_in_the_copy(rig):
-    """D6 (documents the choice, green by design): the recorded hash is compared with the hash in the BEGIN
-    LINE, not with a fresh hash of the body. A block whose BODY was edited by hand but whose BEGIN line is
-    unchanged, with a matching record, is therefore removed with the rest of the block; the text outside it is
-    kept, and the edit inside survives only in the `.pre-uninstall.<UTC>` copy (saved first). If a later change
-    made uninstall hash the body, this cell would go red and the contract line would need a ruling."""
+LEFT_PHRASES = ("left untouched", "was changed after ENGRAM wrote it",
+                "delete the lines between the two markers by hand")
+
+
+def _assert_d6b_left(rig, md, planted, out):
+    assert md.read_bytes() == planted, "uninstall touched a block whose body no longer hashes"
+    assert _saved(rig) == [], "a .pre-uninstall copy was made for a file that was left"
+    named = _lines_naming(out, md)
+    assert len(named) == 1, named
+    for phrase in LEFT_PHRASES:
+        assert phrase in named[0], (phrase, named[0])
+    assert not re.search(r"\bRemoved\b|\bkept\b", named[0]), "the line must claim nothing was removed or kept"
+    assert (rig.claude_home / "CLAUDE.md.pre-engram").read_bytes() == STALE, "the stale first copy was restored"
+
+
+def test_D6b_cell_a_an_edited_body_with_text_outside_is_left_untouched_with_one_plain_line(rig):
+    """D6b (a), Kepler's option B: the record matches and the BEGIN hash is unchanged, but the BODY was edited by
+    hand and there is text outside the block: the file is LEFT (byte-identical, no `.pre-uninstall` copy), and
+    ONE line says it is left untouched, that the block was changed after ENGRAM wrote it, and what to do (delete
+    the lines between the two markers); it claims nothing was removed or kept. Uninstall is never more willing
+    than merge, which refuses an edited block. If the body were not hashed here (M31) the block, the edit
+    included, would be cut and the edit would survive only in a copy."""
     original = b"my rules\nsecond line\n"
     planted = original + b"\n" + _hand_block()
     md = _setup(rig, planted)  # the record holds the BEGIN line's hash
     edited = planted.replace(b"First rule.", b"First rule, EDITED BY HAND.")
     assert edited != planted
     md.write_bytes(edited)
-    out = _run(rig)
-    assert md.read_bytes() == original, "the block (edit included) goes, the outside text stays"
-    saved = _saved(rig)
-    assert len(saved) == 1 and saved[0].read_bytes() == edited and str(saved[0]) in out
+    _assert_d6b_left(rig, md, edited, _run(rig))
+
+
+def test_D6b_cell_b_the_end_line_moved_down_over_the_users_text_is_left_untouched(rig):
+    """D6b (b): the END line was moved down over the user's own text, so that text now sits INSIDE the block
+    while the BEGIN hash and the record are unchanged. Same result as (a): the file is left and one plain line
+    says so. This is the costly shape: removing 'the block' here would delete the user's own lines."""
+    original = b"my rules\nsecond line\n"
+    lines = _hand_block().split(b"\n")  # BEGIN, notice, render lines..., END, ""
+    assert lines[-2] == END_LIT
+    moved = b"\n".join(lines[:-2]) + b"\nMY OWN TAIL TEXT\n" + END_LIT + b"\n"
+    planted = original + b"\n" + moved
+    md = _setup(rig, planted)  # the record holds the (unchanged) BEGIN hash
+    _assert_d6b_left(rig, md, planted, _run(rig))
 
 
 def test_D6_cell4b_paths_are_compared_as_real_paths(rig, tmp_path):
@@ -467,3 +496,44 @@ def test_D6_the_nothing_to_uninstall_branch_leaves_the_file_alone_without_a_matc
     named = _lines_naming(out, md)
     assert len(named) == 1 and re.search(r"record", named[0], re.I), named
     assert (rig.claude_home / "CLAUDE.md.pre-engram").read_bytes() == STALE
+
+
+# ------------------------------------------------------------------------------ symlink and dry run (pin existing behaviour)
+
+def test_E5_a_symlinked_claude_md_is_skipped_by_the_block_step_and_nothing_is_written_through_the_link(rig):
+    """E5 / D5: the block step skips a SYMLINKED CLAUDE.md (`[[ -f && ! -L ]]`), even with a matching record and a
+    valid block: the link and its target stay byte-identical, no `.pre-uninstall` copy is made and nothing is
+    written through the link. The step prints nothing of its own for the skip; with no `.pre-engram` the existing
+    restore rule says the file is left untouched (the line asserted). Pins existing behaviour: a block step that
+    followed the link would cut the block out of the target (a file ENGRAM does not own the name of)."""
+    original = b"my rules\nsecond line\n"
+    planted = original + b"\n" + _hand_block()
+    real = rig.tmp / "real-claude.md"
+    real.write_bytes(planted)
+    rig.claude_home.mkdir(parents=True, exist_ok=True)
+    link = _md(rig)
+    link.symlink_to(real)
+    sha = re.search(rb"sha256=([0-9a-f]{64})", planted).group(1).decode()
+    _write_record(rig, link, sha)  # a matching record (real-path compare), so only the symlink rule can stop it
+    out = _run(rig)
+    assert link.is_symlink() and os.readlink(link) == str(real)
+    assert real.read_bytes() == planted, "something was written through the link"
+    assert _saved(rig) == [] and not [p for p in rig.claude_home.iterdir() if "pre-uninstall" in p.name]
+    named = [ln for ln in out.splitlines() if str(link) in ln]
+    assert len(named) == 1 and "left untouched" in named[0], named
+    assert "Removed ENGRAM's block" not in out
+
+
+def test_D5_dry_run_of_the_block_removal_changes_nothing_and_says_what_it_would_do(rig):
+    """D5 with `--dry-run`: a merged file with a matching record and an unedited block is left byte-identical, no
+    `.pre-uninstall` copy is made, and the line "(dry-run) Would copy ... then remove ENGRAM's block" is
+    printed. Pins existing behaviour: a dry run that wrote the copy or cut the block would change a file the
+    user asked it not to touch."""
+    original = b"my rules\nsecond line\n"
+    planted = original + b"\n" + _hand_block()
+    md = _setup(rig, planted)
+    out = _run(rig, "--dry-run")
+    assert md.read_bytes() == planted and _saved(rig) == []
+    hits = [ln for ln in out.splitlines() if "(dry-run) Would copy" in ln and "remove ENGRAM's block" in ln]
+    assert len(hits) == 1 and str(md) in hits[0], out
+    assert "Removed ENGRAM's block" not in out

@@ -704,6 +704,33 @@ def test_A1_unwrap_returns_the_blocks_inside_without_the_notice_and_ignores_text
     assert blk.unwrap("top\n\n" + blk.wrap(R_NEW) + "\nbottom\n") == R_NEW
 
 
+def test_A1_unwrap_shows_an_edited_notice_line_instead_of_dropping_it():
+    """A1: unwrap drops the first line inside the block ONLY when it is the notice line. A notice line replaced
+    by another line comes out as the first line of the unwrapped text, so the comparators can see the edit. If
+    the first line were dropped unconditionally, the edit would vanish and the drift tool would read clean."""
+    blk = _blk()
+    lines = blk.wrap(R_OLD).split("\n")
+    lines[1] = "A DIFFERENT FIRST LINE"
+    assert blk.unwrap("\n".join(lines)).startswith("A DIFFERENT FIRST LINE\n")
+
+
+def test_A1_unwrap_keeps_the_first_render_line_when_the_notice_line_was_deleted():
+    """A1: a block whose notice line was deleted has a render line first; unwrap keeps it (the whole render comes
+    back). Dropping 'the first line' would silently cut the render's own heading."""
+    blk = _blk()
+    lines = blk.wrap(R_OLD).split("\n")
+    del lines[1]
+    assert blk.unwrap("\n".join(lines)) == R_OLD
+
+
+def test_A1_control_an_unedited_block_unwraps_to_exactly_the_render_also_as_crlf():
+    """A1 control: the notice line is still dropped when it is the notice line, in LF and in CRLF (read as LF),
+    so the fix did not turn into 'never drop it'."""
+    blk = _blk()
+    assert blk.unwrap(blk.wrap(R_NEW)) == R_NEW
+    assert blk.unwrap(blk.wrap(R_NEW).replace("\n", "\r\n")) == R_NEW
+
+
 def test_A1_unwrap_strips_the_begin_line_by_prefix_and_suffix_not_by_one_exact_string():
     """A1 / M10: the BEGIN line is recognised by its constant prefix and suffix. A block whose hash is
     any 64 hex digits (here another one) must still unwrap; a comparator keyed on one exact string
@@ -830,3 +857,54 @@ def _walk(node):
     elif isinstance(node, list):
         for v in node:
             yield from _walk(v)
+
+
+# ------------------------------------------------------------------------------ plan_removal (D6, D6b, D6c)
+
+def _removal_text(body_edit: bool, outside: str):
+    blk = _blk()
+    w = blk.wrap(R_OLD)
+    if body_edit:
+        w = w.replace("First rule.", "First rule, EDITED BY HAND.")
+    return outside + w, blk.block_hash(outside + w)
+
+
+def test_D6b_plan_removal_leaves_an_edited_body_with_text_outside_and_removes_an_unedited_one():
+    """D6 / D6b: with text outside the block and a matching record, an edited body is ("leave", one plain line
+    that claims nothing removed or kept) and an unedited body is ("remove", the text without the block). If
+    the body were not hashed on the remove branch (M31) the edited case would also say "remove"."""
+    blk = _blk()
+    path = "/home/x/.claude/CLAUDE.md"
+    text, h = _removal_text(False, "my rules\n\n")
+    action, detail = blk.plan_removal(text, path, {"path": path, "sha256": h})
+    assert (action, detail) == ("remove", "my rules\n")
+    edited, h2 = _removal_text(True, "my rules\n\n")
+    action, detail = blk.plan_removal(edited, path, {"path": path, "sha256": h2})
+    assert action == "leave" and "\n" not in detail
+    assert "was changed after ENGRAM wrote it" in detail and "delete the lines between the two markers" in detail
+    assert not re.search(r"\bremoved\b|\bkept\b", detail, re.I)
+
+
+def test_D6b_plan_removal_leaves_an_end_line_moved_down_over_the_users_text():
+    """D6b (b) at the function level: the END line moved below the user's own text (the BEGIN hash unchanged)
+    is ("leave", ...), never ("remove", ...), which would cut the user's lines."""
+    blk = _blk()
+    path = "/home/x/.claude/CLAUDE.md"
+    lines = blk.wrap(R_OLD).split("\n")
+    moved = "\n".join(lines[:-2]) + "\nMY OWN TAIL TEXT\n" + END_LIT + "\n"
+    text = "my rules\n\n" + moved
+    action, _ = blk.plan_removal(text, path, {"path": path, "sha256": blk.block_hash(text)})
+    assert action == "leave"
+
+
+def test_D6c_plan_removal_is_unchanged_for_an_edited_body_with_only_whitespace_outside():
+    """D6c (deliberate asymmetry, not changed by v5): nothing but whitespace outside the block and an edited body
+    stays ("pure_other", ""): the restore rule replaces the file and the replaced text is saved first. Applying
+    the D6b body check to this branch would turn it into a leave."""
+    blk = _blk()
+    path = "/home/x/.claude/CLAUDE.md"
+    for outside in ("", "\n  \n"):
+        edited, h = _removal_text(True, outside)
+        assert blk.plan_removal(edited, path, {"path": path, "sha256": h}) == ("pure_other", "")
+        clean, h2 = _removal_text(False, outside)
+        assert blk.plan_removal(clean, path, {"path": path, "sha256": h2}) == ("pure", "")
