@@ -1463,8 +1463,8 @@ def _log_engram_tool_event(
 # Certain fields are opaque to agent reasoning and bloat the context window
 # with no semantic gain: embeddings (384-float arrays), content hashes, git
 # SHAs, parsed_metadata (pure redundancy with the raw metadata string), raw
-# match_type + similarity inside similar_existing blocks (action_hint already
-# encodes the actionable summary), and confidence_history (forensics-only).
+# match_type + similarity inside similar_existing blocks (the severity word and
+# the lead's action line carry the actionable summary), and confidence_history (forensics-only).
 #
 # CRITICAL: strip at the AGENT-RETURN boundary only. Internal computation
 # paths (dedup reads embedding/similarity, verifier reads content_hash) must
@@ -1820,6 +1820,32 @@ def engram_add_observation(payload_json: str) -> str:
     Minimal call, citing the current chat:
         {"quoted_text": "...", "interpretation": "...", "claim": "...",
          "session_id": "<the session id injected at session start>"}
+
+    Reading the reply. The similar-node block (`similar_existing_lead`,
+    `similar_existing`) is similarity-graded and source-aware, one severity per
+    match. From a different source: `corroborate` (high similarity: independent
+    support for the claim), `related` (moderate similarity),
+    `keyword_overlap_other_source` (a keyword match with no similarity score) and
+    `weak_match` (low similarity; counted in `similar_not_shown` only). From the
+    same source: `duplicate`, `distinct_from_same_source` and
+    `keyword_overlap_same_source`. `polarity_alert` marks a match whose claim the
+    contradiction check finds to be the opposite of this one. Entry shapes:
+    `duplicate` and `polarity_alert` come in full (act on these); `corroborate`,
+    `keyword_overlap_same_source` and `distinct_from_same_source` carry `id`,
+    `severity`, `recall_summary` and `confidence`; `related` and
+    `keyword_overlap_other_source` carry `id`, `severity` and `keywords`.
+    `similar_existing_lead` names the action once, for the severities present.
+    `duplicate` fires at similarity 0.85 or more within one document or web page,
+    and only at 0.92 or more within a long-running source (a conversation or a
+    file); a semantic same-source match under that is `distinct_from_same_source`,
+    usually a different fact, and a keyword-only one is
+    `keyword_overlap_same_source`. `anchoring_advisory` carries the measurements
+    plus `flags`: `hard_data_unanchored` (a hard_data claim has tokens the quote
+    lacks: widen the quote, move the fact to interpretation, or downgrade
+    quote_type) and `low_similarity` (quote-claim similarity under 0.2: widen the
+    quote, narrow the claim, or derive it from premises). `person_mentions` lists
+    person nodes whose name appears in the claim; a mention is not aboutness, so
+    link with engram_link_about only when the claim is about that person.
 
     Worked examples, the quote-verification workflow, quote_type/source_class
     selection, node-grain guidance, and the advisory response keys: the

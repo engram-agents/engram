@@ -386,7 +386,7 @@ class TestSimilarExistingStripping:
                 f"similarity should be stripped from similar_existing: {entry}"
             )
 
-    def test_action_hint_kept_in_similar_existing(self):
+    def test_severity_and_scent_kept_in_similar_existing(self):
         """action_hint must survive stripping — it encodes the actionable summary."""
         server = fresh_server()
         first_id = _add_obs(server, "Original anchor claim C.",
@@ -403,8 +403,10 @@ class TestSimilarExistingStripping:
         })))
         assert r.get("similar_existing"), r  # #4424: guard against a vacuous loop
         for entry in r.get("similar_existing", []):
-            assert "action_hint" in entry, (
-                f"action_hint must NOT be stripped from similar_existing: {entry}"
+            # #4847 (D2), changed on purpose: a tier-B entry has no action_hint prose (the lead
+            # says the action); what the strip must still not remove is severity and the scent.
+            assert "severity" in entry and "recall_summary" in entry, (
+                f"severity and recall_summary must NOT be stripped from similar_existing: {entry}"
             )
 
 

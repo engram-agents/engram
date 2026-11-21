@@ -70,8 +70,10 @@ def test_hard_data_advisory_hint_present_when_unanchored():
     adv = r["anchoring_advisory"]
     assert "ob_9999" in adv["unanchored"]
     assert "42000" in adv["unanchored"]
-    assert "hint" in adv
-    assert "hard_data" in adv["hint"]
+    # #4847 (D4), changed on purpose: the sentence is a flag now (the tool description
+    # says what it means).
+    assert "hint" not in adv
+    assert "hard_data_unanchored" in adv["flags"]
 
 
 def test_hard_data_advisory_no_hint_when_fully_anchored():
@@ -84,7 +86,8 @@ def test_hard_data_advisory_no_hint_when_fully_anchored():
     assert r["status"] == "created", r
     adv = r["anchoring_advisory"]
     assert adv["unanchored"] == []
-    assert "hint" not in adv
+    # #4847 (D4): the sentence is gone, so "no hint" must be asserted on the flag
+    assert "hint" not in adv and "hard_data_unanchored" not in adv.get("flags", [])
 
 
 def test_non_hard_data_advisory_reports_but_never_hints():
@@ -99,8 +102,8 @@ def test_non_hard_data_advisory_reports_but_never_hints():
     adv = r["anchoring_advisory"]
     # The unanchored tokens are still reported (advisory, not gated)...
     assert "ob_9999" in adv["unanchored"]
-    # ...but the hint is hard_data-only.
-    assert "hint" not in adv
+    # ...but the flag is hard_data-only (#4847: the sentence is gone, so assert the flag).
+    assert "hint" not in adv and "hard_data_unanchored" not in adv.get("flags", [])
 
 
 # ── similarity column, embeddings disabled in test fixtures ────────────────
