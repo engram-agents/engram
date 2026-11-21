@@ -313,8 +313,10 @@ def refusal(p: Plan, consent: Consent = NO_CONSENT, context: str = "") -> "str |
             "Backups accumulate: every replace adds one, and nothing deletes them automatically. "
             "Show the user this list and get their yes first. Then re-run with "
             "--replace PATH (repeat it for each path they agreed to) or --force (every path "
-            "listed). For CLAUDE.md, --merge keeps your own text and replaces only ENGRAM's block. "
-            "Or leave a file as it is: move it aside yourself, then re-run."
+            "listed). "
+            + ("For CLAUDE.md, --merge keeps your own text and replaces only ENGRAM's block. "
+               if any(e.path.name == "CLAUDE.md" for e in need) else "")
+            + "Or leave a file as it is: move it aside yourself, then re-run."
         )
     for e in stuck:
         where = _canon(e.path)

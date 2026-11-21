@@ -40,7 +40,7 @@ APPEND_LINE = (
     "still there and now appears twice; remove the older copy by hand"
 )
 DIFF_LINES_SHOWN = 40
-_BOM = "﻿"
+_BOM = "\ufeff"
 _HASH_RE = re.compile(r"[0-9a-f]{64}")
 
 

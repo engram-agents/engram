@@ -355,6 +355,24 @@ def test_C2_the_refusal_without_a_flag_names_merge_beside_replace_and_force(tmp_
     assert "--merge" in out and "--replace" in out and "--force" in out, out
 
 
+def test_C2b_the_merge_hint_is_only_in_a_claude_md_refusal(tmp_path):
+    """C2 family: the `--merge` hint belongs to a refusal that lists CLAUDE.md. A refusal that lists only the
+    Codex config.toml (where --merge is refused) must not offer it; the CLAUDE.md refusal still names it.
+    A hint printed for every path list would send a Codex user to a flag that is then refused."""
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_bytes(b'model = "x"\n')
+    r = _run(tmp_path, target="codex")
+    out = _out(r)
+    assert r.returncode != 0 and "REFUSED" in out and str(cfg) in out, out
+    assert "--merge" not in out, out
+    other = tmp_path / "claude-home"
+    other.mkdir()
+    _plant(other, b"my own rules\n")
+    r2 = _run(other)
+    assert r2.returncode != 0 and "--merge" in _out(r2), _out(r2)
+
+
 @pytest.mark.parametrize("prof", PROFILES)
 def test_C3_force_together_with_merge_writes_the_merge_text_and_keeps_outside_text(tmp_path, prof):
     """C3: `--force --merge` writes the MERGE text; a force never discards text outside the block when
