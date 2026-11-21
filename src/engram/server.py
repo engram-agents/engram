@@ -1821,6 +1821,24 @@ def engram_add_observation(payload_json: str) -> str:
         {"quoted_text": "...", "interpretation": "...", "claim": "...",
          "session_id": "<the session id injected at session start>"}
 
+    Reading the reply. The similar-node block (`similar_existing_lead`,
+    `similar_existing`) is similarity-graded and source-aware, one severity per
+    match: `duplicate` and `polarity_alert` (full entry: act on these),
+    `corroborate`, `keyword_overlap_same_source` and `distinct_from_same_source`
+    (id, scent, confidence), `related` and `keyword_overlap_other_source` (id and
+    keywords), `weak_match` (counted in `similar_not_shown` only).
+    `similar_existing_lead` names the action once, for the severities present.
+    `duplicate` fires at similarity 0.85 or more within one document or web page,
+    and only at 0.92 or more within a long-running source (a conversation or a
+    file); a same-source match under that is `distinct_from_same_source`, usually
+    a different fact. `anchoring_advisory` carries the measurements plus `flags`:
+    `hard_data_unanchored` (a hard_data claim has tokens the quote lacks: widen
+    the quote, move the fact to interpretation, or downgrade quote_type) and
+    `low_similarity` (quote-claim similarity under 0.2: widen the quote, narrow
+    the claim, or derive it from premises). `person_mentions` lists person nodes
+    whose name appears in the claim; a mention is not aboutness, so link with
+    engram_link_about only when the claim is about that person.
+
     Worked examples, the quote-verification workflow, quote_type/source_class
     selection, node-grain guidance, and the advisory response keys: the
     engram-observe skill. Identifier conventions for standpoint_author_id: the

@@ -70,7 +70,6 @@ import errno
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import shutil
@@ -1599,25 +1598,21 @@ def _build_anchoring_advisory(
         }
         if similarity is None and similarity_reason:
             advisory["similarity_status"] = f"unavailable: {similarity_reason}"
+        # #4847 (D4): the two guidance SENTENCES that used to be set here ("hint",
+        # "low_similarity_hint") were the same text on every write that crossed the
+        # threshold (about half of one seat's writes for the first, 5.8% for the
+        # second). The reply now names the threshold crossed in `flags`; what each
+        # flag means is said once, in the engram_add_observation tool description.
+        flags = []
         if quote_type == "hard_data" and result.unanchored:
-            advisory["hint"] = (
-                f"hard_data: {len(result.unanchored)} claim token(s) absent from the "
-                "quote — widen the quote, move the fact to `interpretation`, or "
-                "downgrade quote_type. Advisory only (#2602 facet 2)."
-            )
+            flags.append("hard_data_unanchored")
         # Strictly below the floor, and only for a real measurement: a None
         # similarity (embedder unavailable) must never read as a low one.
         low_similarity = similarity is not None and similarity < LOW_QUOTE_CLAIM_SIMILARITY
         if low_similarity:
-            # Floor, not round: {:.2f} would show 0.1996 as "0.20 is below 0.2".
-            shown_similarity = math.floor(similarity * 100) / 100
-            advisory["low_similarity_hint"] = (
-                f"quote-claim similarity {shown_similarity:.2f} is below "
-                f"{LOW_QUOTE_CLAIM_SIMILARITY:g}: the quote may not carry this "
-                "claim. Widen the quote, narrow the claim to what the quote says, "
-                "or move the rest into a derivation with its own premises. "
-                "Advisory only (#4050)."
-            )
+            flags.append("low_similarity")
+        if flags:
+            advisory["flags"] = flags
 
         _log_anchoring_advisory({
             "ts": core._now(),
@@ -2409,11 +2404,8 @@ def _add_observation_impl(
             if _not_shown:
                 result["similar_not_shown"] = _not_shown
             result["similar_count"] = len(similar_matches)
-            result["dedup_guidance"] = (
-                "Similarity-graded matches. Action hints account for source type "
-                "(document vs conversation/file) and similarity score. "
-                "DUPLICATE only fires for high-similarity matches in discrete documents."
-            )
+            # #4847 (D5): `dedup_guidance` was the same fixed sentence on every
+            # reply with matches; it now lives once, in the tool description.
 
         if _yellow_forward:
             result["yellow_card_warning"] = _yellow_forward
@@ -2511,7 +2503,6 @@ def _add_observation_impl(
                     person_mentions.append({
                         "person_id": prow["id"],
                         "person_name": pname,
-                        "message": f"mentions {pname} — wire an about-edge?",
                     })
             if person_mentions:
                 result["person_mentions"] = person_mentions

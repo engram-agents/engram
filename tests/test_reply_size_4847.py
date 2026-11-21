@@ -209,6 +209,20 @@ def test_e_low_similarity_gets_the_flag_not_the_sentence(monkeypatch):
     assert "low_similarity" in adv.get("flags", []), adv
 
 
+def test_e_low_similarity_flag_absent_at_or_above_the_threshold(monkeypatch):
+    # Found by a mutant: with the flag forced on, no cell of this file went red, because
+    # only the hard_data flag had an absence cell here. (test_low_similarity_hint_4050.py
+    # carries the boundary cells; this one makes this file discriminate on its own.)
+    server = T.fresh_server()
+    sim = {"v": 0.5}
+    monkeypatch.setattr(sys.modules["engram_observation"], "_quote_claim_similarity",
+                        lambda q, c: (sim["v"], None))
+    for v in (0.2, 0.5):
+        sim["v"] = v
+        adv = _advisory_for(server, "attributed_analysis", "words about harbours", "words about harbours")
+        assert "low_similarity" not in adv.get("flags", []), (v, adv)
+
+
 # ── (m) the whole reply, size (written last; the bound is logged above) ──────
 def test_m_whole_reply_is_at_most_the_bound_percent_of_todays():
     assert DEV_WHOLE_REPLY_CHARS is not None, (

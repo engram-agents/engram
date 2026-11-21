@@ -403,8 +403,10 @@ class TestSimilarExistingStripping:
         })))
         assert r.get("similar_existing"), r  # #4424: guard against a vacuous loop
         for entry in r.get("similar_existing", []):
-            assert "action_hint" in entry, (
-                f"action_hint must NOT be stripped from similar_existing: {entry}"
+            # #4847 (D2), changed on purpose: a tier-B entry has no action_hint prose (the lead
+            # says the action); what the strip must still not remove is severity and the scent.
+            assert "severity" in entry and "recall_summary" in entry, (
+                f"severity and recall_summary must NOT be stripped from similar_existing: {entry}"
             )
 
 

@@ -255,9 +255,10 @@ def test_no_polarity_alert_below_threshold():
     _stub_semantic_with(server, similarity=0.70, target_id=first_id,
                         target_claim="Topic Z is X.")
     r = _add_second_obs(server, claim="Topic Z is X with extra detail.")
-    hint = r["similar_existing"][0]["action_hint"]
-    assert not hint.startswith("POLARITY_ALERT"), f"Should not fire below threshold: {hint}"
-    assert hint.startswith("CORROBORATE"), f"Expected plain CORROBORATE, got: {hint}"
+    # #4847 (D2), changed on purpose: a tier-B entry carries its severity, no action_hint prose; the lead says the action.
+    hint = r["similar_existing"][0]["severity"]
+    assert not hint == "polarity_alert", f"Should not fire below threshold: {hint}"
+    assert hint == "corroborate", f"Expected plain CORROBORATE, got: {hint}"
 
 
 def test_polarity_disabled_via_env_var():
@@ -267,8 +268,9 @@ def test_polarity_disabled_via_env_var():
     _stub_semantic_with(server, similarity=0.70, target_id=first_id,
                         target_claim="Topic Z is X.")
     r = _add_second_obs(server, claim="Topic Z is NOT X.")
-    hint = r["similar_existing"][0]["action_hint"]
-    assert not hint.startswith("POLARITY_ALERT"), (
+    # #4847 (D2), changed on purpose: a tier-B entry carries its severity, no action_hint prose; the lead says the action.
+    hint = r["similar_existing"][0]["severity"]
+    assert not hint == "polarity_alert", (
         f"ENGRAM_NO_POLARITY should suppress: {hint}"
     )
 
@@ -291,8 +293,9 @@ def test_polarity_disabled_via_config():
     _stub_semantic_with(server, similarity=0.70, target_id=first_id,
                         target_claim="Topic Z is X.")
     r = _add_second_obs(server, claim="Topic Z is NOT X.")
-    hint = r["similar_existing"][0]["action_hint"]
-    assert not hint.startswith("POLARITY_ALERT"), (
+    # #4847 (D2), changed on purpose: a tier-B entry carries its severity, no action_hint prose; the lead says the action.
+    hint = r["similar_existing"][0]["severity"]
+    assert not hint == "polarity_alert", (
         f"config.polarity.enabled=False should suppress: {hint}"
     )
 
@@ -357,8 +360,9 @@ def test_polarity_threshold_configurable():
     _stub_semantic_with(server, similarity=0.70, target_id=first_id,
                         target_claim="Topic Z is X.")
     r = _add_second_obs(server, claim="Topic Z is NOT X.")
-    hint = r["similar_existing"][0]["action_hint"]
-    assert not hint.startswith("POLARITY_ALERT"), (
+    # #4847 (D2), changed on purpose: a tier-B entry carries its severity, no action_hint prose; the lead says the action.
+    hint = r["similar_existing"][0]["severity"]
+    assert not hint == "polarity_alert", (
         f"threshold=0.80, score=0.50 should not fire: {hint}"
     )
 
@@ -378,10 +382,11 @@ def test_polarity_nli_returning_none_is_safe():
     _stub_semantic_with(server, similarity=0.70, target_id=first_id,
                         target_claim="Topic Z is X.")
     r = _add_second_obs(server, claim="Topic Z is NOT X.")
-    hint = r["similar_existing"][0]["action_hint"]
+    # #4847 (D2), changed on purpose: a tier-B entry carries its severity, no action_hint prose; the lead says the action.
+    hint = r["similar_existing"][0]["severity"]
     # No POLARITY_ALERT, but the underlying tier hint must still work
-    assert not hint.startswith("POLARITY_ALERT"), hint
-    assert hint.startswith("CORROBORATE"), f"Tier hint must still work: {hint}"
+    assert not hint == "polarity_alert", hint
+    assert hint == "corroborate", f"Tier hint must still work: {hint}"
 
 
 def test_batched_polarity_one_call_per_write():
