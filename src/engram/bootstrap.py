@@ -809,7 +809,11 @@ def _write_items(
                 _read_existing_text(config_path), instructions_body, str(compact_path)
             ),
             first_identity=True,
-            new_text_fn=lambda current: merged_codex_config_text(current, instructions_body, str(compact_path)),
+            # CRLF and a lone CR read as LF, as the old universal-newline read did, so a config an editor
+            # converted to CRLF comes out as the same clean render (merged_codex_config_text is line-based).
+            new_text_fn=lambda current: merged_codex_config_text(
+                current.replace("\r\n", "\n").replace("\r", "\n"), instructions_body, str(compact_path)
+            ),
         ))
         items.append(fg.Item(CODEX_HOME / "AGENTS.md", agents_md_text, first_identity=True))
     return items

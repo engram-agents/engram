@@ -404,6 +404,45 @@ def test_codex_config_second_run_is_byte_identical_and_takes_no_backup_4939(tmp_
     assert _names(cfg.parent) == names, "the second run took a backup"
 
 
+def test_codex_config_converted_to_crlf_comes_out_as_the_clean_lf_render_and_stays_put_4939(tmp_path):
+    """Issue 4939 (line endings): a config.toml converted to CRLF throughout (an editor did it), with ENGRAM's
+    identity block and one foreign stanza, is rewritten to exactly the LF render the first run wrote, the
+    foreign stanza kept, and a second run changes nothing (bytes, mtime, backups). The old read translated
+    CRLF and lone CR to LF before merging; a new_text_fn that merged the raw CRLF text would leave stray blank
+    CRLF lines where the old identity lines were stripped."""
+    import shutil
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text(FOREIGN_STANZA, encoding="utf-8")
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(tmp_path), "ALPHA_DIR": str(REPO_ROOT), "ALPHA_TEMPLATES_DIR": str(SRC / "templates"),
+        "ENGRAM_HOME": str(tmp_path / ".engram"), "CLAUDE_HOME": str(tmp_path / ".claude"),
+        "CODEX_HOME": str(tmp_path / ".codex"), "TARGET": "codex", "PYTHON_BIN": sys.executable,
+        "ENGRAM_NO_EMBEDDINGS": "1",
+    })
+
+    def run(*args):
+        shutil.rmtree(tmp_path / ".engram", ignore_errors=True)
+        (tmp_path / ".engram").mkdir()
+        r = subprocess.run([sys.executable, str(SRC / "bootstrap.py"), *args], env=env, capture_output=True,
+                           text=True, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    run("--force")
+    lf_render = cfg.read_bytes()
+    assert b"\r" not in lf_render and FOREIGN_STANZA.encode() in lf_render
+    cfg.write_bytes(lf_render.replace(b"\n", b"\r\n"))  # the whole file, identity block and stanza, as CRLF
+    run("--force")
+    assert cfg.read_bytes() == lf_render, "the CRLF file did not come out as the clean LF render"
+    os.utime(cfg, (1_000_000_000, 1_000_000_000))
+    names = _names(cfg.parent)
+    run()
+    assert cfg.read_bytes() == lf_render
+    assert cfg.stat().st_mtime_ns == 1_000_000_000 * 10**9, "the second run rewrote config.toml"
+    assert _names(cfg.parent) == names, "the second run took a backup"
+
+
 def test_B8_an_unreadable_file_with_a_new_text_fn_is_a_one_line_refusal_not_an_escaping_error(tmp_path):
     """B8 / plan(): a file the guard cannot read (mode 000) must not let an OSError out of the check-only
     pass. The entry is refused with ONE REFUSED line naming the file, nothing is written. Without the catch
