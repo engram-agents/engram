@@ -967,6 +967,25 @@ def test_B12_a_refused_run_writes_no_record_and_keeps_an_existing_one_byte_for_b
         assert rec.read_bytes() == planted, "a refused run changed the record"
 
 
+@pytest.mark.parametrize("prof", PROFILES)
+def test_B12_a_record_that_cannot_be_written_is_one_line_after_claude_md_was_written(tmp_path, prof):
+    """B12: CLAUDE.md is written first and the record after it. When the record cannot be written (here a
+    folder sits at its name) the run says so in ONE line (CLAUDE.md was written, the record was not, what
+    follows) and exits non-zero, never a traceback; the file stays written. If the guard's refusal escaped,
+    the user would get a traceback after a successful write and no hint that uninstall will now leave the
+    block."""
+    (tmp_path / ".engram").mkdir(exist_ok=True)
+    (tmp_path / ".engram" / RECORD_NAME).mkdir()
+    r = _run(tmp_path, prof)
+    out = _out(r)
+    assert "Traceback" not in out, out
+    assert r.returncode != 0, out
+    hits = [ln for ln in out.splitlines() if "CLAUDE.md was written" in ln]
+    assert len(hits) == 1 and RECORD_NAME in hits[0] and "uninstall" in hits[0].lower(), out
+    _split_block(_md(tmp_path).read_bytes())
+    assert (tmp_path / ".engram" / RECORD_NAME).is_dir()
+
+
 def test_B12_the_record_name_is_in_the_guards_owned_names():
     """B12: the file is ENGRAM's own bookkeeping, listed among the guard's owned names (rewritten when it
     differs, never backed up). Without the entry the guard would refuse to rewrite it or back it up."""

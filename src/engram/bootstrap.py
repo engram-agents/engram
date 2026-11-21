@@ -751,7 +751,7 @@ def _claude_item(path: Path, wrapped: "str | None") -> "fg.Item":
     return fg.Item(path, wrapped, first_identity=True, new_text_fn=merged)
 
 
-def _write_claude_record(claude_md: Path) -> None:
+def _write_claude_record(claude_md: Path) -> "str | None":
     """B12: after CLAUDE.md was written, record which file and which block hash this home wrote (the
     uninstaller acts on a block only when this record matches, D6). Two keys, ENGRAM's own bookkeeping."""
     try:
@@ -760,9 +760,18 @@ def _write_claude_record(claude_md: Path) -> None:
     except (OSError, UnicodeDecodeError, blk.MergeRefused):
         digest = None
     if digest is None:
-        return  # not a block ENGRAM can vouch for: no record rather than a wrong one
+        return None  # not a block ENGRAM can vouch for: no record rather than a wrong one
     record = json.dumps({"path": os.path.realpath(claude_md), "sha256": digest}, indent=2) + "\n"
-    fg.apply(fg.plan([fg.Item(ENGRAM_HOME / CLAUDE_MD_RECORD_NAME, record, owned=True)], home=ENGRAM_HOME))
+    try:
+        fg.apply(fg.plan([fg.Item(ENGRAM_HOME / CLAUDE_MD_RECORD_NAME, record, owned=True)], home=ENGRAM_HOME))
+    except fg.Refused:
+        where = ENGRAM_HOME / CLAUDE_MD_RECORD_NAME
+        return (
+            f"[bootstrap] REFUSED: CLAUDE.md was written, but its record {where} was not (something that is not a "
+            f"regular file is in the way). Move {where} aside; until the record exists, uninstall leaves the "
+            f"block in {claude_md} in place."
+        )
+    return None
 
 
 def _write_items(
@@ -1321,8 +1330,9 @@ def main() -> None:
             print("  " + outcome.line, flush=True)
         elif outcome.kind == "updated" and saved_copy is not None:
             print(f"  {outcome.line}; the previous file is in {saved_copy}", flush=True)
+    record_problem = None
     if TARGET == "claude" and CLAUDE_HOME / "CLAUDE.md" in written:
-        _write_claude_record(CLAUDE_HOME / "CLAUDE.md")
+        record_problem = _write_claude_record(CLAUDE_HOME / "CLAUDE.md")
     for item in final_items:
         if item.path in written:
             print(f"  {item.path.name} → {item.path}", flush=True)
@@ -1357,6 +1367,10 @@ def main() -> None:
                 "(settings.json was not touched)",
                 flush=True,
             )
+    # Last, like the settings step: everything else is done, so the exit status is the only thing left to say
+    # that CLAUDE.md was written but its record was not (one line; the same non-zero exit a refused item gets).
+    if record_problem is not None:
+        raise SystemExit(record_problem)
 
 
 if __name__ == "__main__":

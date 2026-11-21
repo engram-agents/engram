@@ -1031,14 +1031,15 @@ uninstall_services
 if [[ ! -d "$MARKETPLACE_ROOT" && ! -f "$VERSION_MARKER" ]]; then
   log "Nothing to uninstall — marketplace and version marker both absent."
   # A leftover .pre-engram backup must still be restored (the restore has no dependence on
-  # the marketplace tree); with no backup this logs "left untouched" and changes nothing.
+  # the marketplace tree); with no backup this logs "left untouched" and changes nothing. The block
+  # step goes first (#4444 D5): a file with ENGRAM's block must not be restored over.
+  uninstall_claude_block
   restore_identity_files
   if [[ $SKIP_CLI -eq 0 ]]; then
     warn "If the plugin is still registered with Claude Code, run:"
     warn "  claude plugin marketplace remove engram-local"
     warn "  (or from inside Claude Code: /plugin disable engram)"
   fi
-  uninstall_claude_block
   # The file rows (#4446 2b) do not depend on the marketplace tree either; B15 uses its marker-line test here.
   uninstall_files
   print_services_summary

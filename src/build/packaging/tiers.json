@@ -287,7 +287,7 @@
     {
       "path": "engram_claude_block.py",
       "tier": "essential",
-      "note": "engram-alpha#4444: the ENGRAM block in CLAUDE.md (marker constants, wrap, merge, unwrap, plan_removal). Pure and stdlib-only. Essential because bootstrap.py and engram_file_guard.py import it at module level (hard dependencies, like the file guard) and the uninstaller removes the block through it."
+      "note": "engram-alpha#4444: the ENGRAM block in CLAUDE.md (marker constants, wrap, merge, unwrap, plan_removal). Pure and stdlib-only. Essential because bootstrap.py imports it at module level (a hard dependency, like the file guard), engram_file_guard.py imports it lazily (inside _refusal_types) to recognise its MergeRefused, and the uninstaller removes the block through it."
     },
     {
       "path": "engram_home_registry.py",

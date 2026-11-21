@@ -409,3 +409,43 @@ def test_D6_cell4b_paths_are_compared_as_real_paths(rig, tmp_path):
     _write_record(rig, real / "CLAUDE.md", sha)
     _run(rig)
     assert (real / "CLAUDE.md").read_bytes() == original
+
+
+# ------------------------------------------------------------------------------ the "Nothing to uninstall" branch
+
+def test_D2_the_nothing_to_uninstall_branch_removes_the_block_before_it_restores_anything(rig):
+    """D2 / D5 on the early-exit branch: with the marketplace tree and version marker already gone, a merged
+    file (user text, a blank line, the block) with a matching record loses only the block, the current file
+    is saved to `.pre-uninstall.<UTC>` first, and the stale `.pre-engram` is NOT restored over the user's
+    text. If that branch restored first (the old order), the user's text would be replaced by the stale copy
+    and the block step would find nothing to do."""
+    original = b"my rules\nsecond line\n"
+    planted = original + b"\n" + _hand_block()
+    md = _setup(rig, planted)
+    rig.nothing_to_uninstall()
+    out = _run(rig)
+    assert "Nothing to uninstall" in out
+    assert md.read_bytes() == original
+    saved = _saved(rig)
+    assert len(saved) == 1 and saved[0].read_bytes() == planted and str(saved[0]) in out
+    assert (rig.claude_home / "CLAUDE.md.pre-engram").read_bytes() == STALE
+
+
+@pytest.mark.parametrize("why", ["no_record", "record_hash_differs"])
+def test_D6_the_nothing_to_uninstall_branch_leaves_the_file_alone_without_a_matching_record(rig, why):
+    """D3 / D6 on the early-exit branch: no record, or a record whose hash is not the BEGIN line's (the block
+    was replaced since), means the file is left untouched with one line and the `.pre-engram` copy is NOT restored over
+    it, exactly as on the main path (uninstall never guesses). Restoring first would overwrite text ENGRAM
+    cannot vouch for."""
+    original = b"my rules\nsecond line\n"
+    planted = original + b"\n" + _hand_block()
+    md = _setup(rig, planted, record=None)
+    if why == "record_hash_differs":
+        _write_record(rig, md, "f" * 64)
+    rig.nothing_to_uninstall()
+    out = _run(rig)
+    assert "Nothing to uninstall" in out
+    assert md.read_bytes() == planted
+    named = _lines_naming(out, md)
+    assert len(named) == 1 and re.search(r"record", named[0], re.I), named
+    assert (rig.claude_home / "CLAUDE.md.pre-engram").read_bytes() == STALE

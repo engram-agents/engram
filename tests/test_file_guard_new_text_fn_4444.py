@@ -334,6 +334,11 @@ print(json.dumps({"survived": b"user_edit = true" in final, "raised": raised,
 """
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="issue 4939: the Codex config.toml item still passes a fixed text computed before apply, so an edit "
+           "made after the check-only pass is lost; remove this marker when the Codex item moves to new_text_fn",
+)
 def test_measure_codex_item_stale_text_4939(tmp_path):
     """MEASUREMENT for issue 4939 (NOT a contract of #4444). The CURRENT Codex `config.toml` item is
     built the way bootstrap builds it (`merged_codex_config_text(_read_existing_text(config_path), ...)`),
@@ -362,3 +367,27 @@ def test_measure_codex_item_stale_text_4939(tmp_path):
         f"raised={result['raised']}; backups={result['backups']}; final head={result['final_head']!r}; "
         f"final tail={result['final_tail']!r}"
     )
+
+
+def test_B8_an_unreadable_file_with_a_new_text_fn_is_a_one_line_refusal_not_an_escaping_error(tmp_path):
+    """B8 / plan(): a file the guard cannot read (mode 000) must not let an OSError out of the check-only
+    pass. The entry is refused with ONE REFUSED line naming the file, nothing is written. Without the catch
+    the PermissionError would reach the user as a traceback before any backup or write."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root ignores file modes, so an unreadable file cannot be made here")
+    fg = _fg()
+    p = tmp_path / "CLAUDE.md"
+    p.write_bytes(b"my rules\n")
+    os.chmod(p, 0)
+    try:
+        try:
+            item = fg.Item(p, "x\n", new_text_fn=lambda cur: cur + "y\n", first_identity=True)
+        except TypeError as e:
+            raise AssertionError("fg.Item has no new_text_fn field: stage 2") from e
+        plan = fg.plan([item])  # must not raise
+        msg = fg.refusal(plan, fg.consent_for(False, [str(p)]))
+    finally:
+        os.chmod(p, 0o644)
+    assert msg is not None and "REFUSED" in msg and p.name in msg, msg
+    assert len(msg.strip().splitlines()) == 1, msg
+    assert p.read_bytes() == b"my rules\n" and _names(tmp_path) == ["CLAUDE.md"]

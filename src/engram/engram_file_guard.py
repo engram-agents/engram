@@ -262,6 +262,8 @@ def plan(items: Iterable[Item], stamp: "str | None" = None, home: "Path | None" 
                 new_text = it.new_text_fn(cur)
             except UnicodeDecodeError as e:
                 merge_state, note = "merge_refused", f"cannot read as UTF-8 text ({e}), so ENGRAM cannot merge into it. Move it aside, then re-run."
+            except OSError as e:  # a file that cannot be read (mode 000): refused in one line, never a traceback
+                merge_state, note = "merge_refused", f"cannot read it ({e}), so ENGRAM cannot merge into it. Fix its permissions or move it aside, then re-run."
             except _refusal_types() as e:
                 merge_state, note = "merge_refused", str(e)
         state = merge_state or classify(it.path, new_text)
