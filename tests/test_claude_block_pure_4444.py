@@ -380,6 +380,59 @@ def test_B4_control_marker_text_inside_a_longer_line_is_ordinary_text():
     assert out.text.endswith(blk.wrap(R_NEW))
 
 
+def test_B4_a_bom_that_is_not_on_line_1_makes_the_line_ordinary_text_not_a_marker():
+    """B4 / Definitions: a leading byte-order mark is ignored ONLY on the first line, and a BOM is not
+    whitespace, so a marker line that starts with a BOM further down is neither a clean marker nor an
+    indented near-miss: it is ordinary text (chosen over a refusal: the near-miss rule names only leading
+    whitespace). Observable: a file holding such BEGIN and END lines is appended to (no block found), and
+    next to a real block the stray lines survive and the real block is the one replaced. If the BOM were
+    ignored on every line, the stray lines would be read as a block (or as a second one, a refusal)."""
+    blk = _blk()
+    stray = "\ufeff" + _begin() + "\nnot ours\n" + "\ufeff" + END_LIT + "\n"
+    existing = "top\n" + stray
+    out = blk.merge(existing, R_NEW)
+    assert out.kind == "appended" and out.text.startswith(existing)
+    assert out.text.endswith(blk.wrap(R_NEW))
+    with_block = "top\n" + stray + "\n" + blk.wrap(R_OLD)
+    out2 = blk.merge(with_block, R_NEW)
+    assert out2.kind == "updated"
+    assert out2.text == "top\n" + stray + "\n" + blk.wrap(R_NEW)
+    # a later BOM-prefixed END alone does not make an otherwise clean block ambiguous
+    out3 = blk.merge(blk.wrap(R_OLD) + "\ufeff" + END_LIT + "\n", R_NEW)
+    assert out3.kind == "updated" and out3.text.endswith("\ufeff" + END_LIT + "\n")
+
+
+def test_B4_a_begin_like_line_without_its_suffix_is_ordinary_text():
+    """B4 / Definitions: a BEGIN line is the prefix, a hash part and the ` -->` suffix. A line that starts
+    `<!-- engram:begin sha256=` but has no ` -->` ending is ordinary text (not a damaged marker: the
+    damaged-marker state (c) needs a complete line with a bad hash). Observable: it is appended to, and next
+    to a real block it survives untouched while the real block is replaced. If the suffix were not
+    required, the line would count as a BEGIN with no END and the merge would refuse."""
+    blk = _blk()
+    for line in (BEGIN_LIT + "abc", BEGIN_LIT + SHA0, BEGIN_LIT, BEGIN_LIT + SHA0 + " --", BEGIN_LIT + SHA0 + "-->"):
+        existing = "top\n" + line + "\nmore\n"
+        out = blk.merge(existing, R_NEW)
+        assert out.kind == "appended" and out.text.startswith(existing), line
+        both = "top\n" + line + "\n\n" + blk.wrap(R_OLD)
+        out2 = blk.merge(both, R_NEW)
+        assert out2.kind == "updated" and out2.text == "top\n" + line + "\n\n" + blk.wrap(R_NEW), line
+
+
+@pytest.mark.parametrize("original", [
+    pytest.param("my rules\n\n", id="one_blank_line"),
+    pytest.param("my rules\n\n\n", id="two_blank_lines"),
+    pytest.param("my rules\n\n\n\n", id="three_blank_lines"),
+    pytest.param("a\r\nb\r\n\r\n\r\n", id="crlf_two_blank_lines"),
+])
+def test_D2_an_original_ending_in_blank_lines_comes_back_byte_for_byte(original):
+    """D2: removal takes only the ONE blank line merge put before the block. An original that itself ends in
+    one, two or three blank lines must come back exactly. A removal that stripped every blank line before the
+    block (`rstrip`) would eat the user's own trailing blank lines."""
+    blk = _blk()
+    merged = blk.merge(original, R_NEW).text
+    assert blk.remove_block(merged) == original
+
+
 # ------------------------------------------------------------------------------ B5 note
 # B5 (a file that is not UTF-8 text is refused) is a byte-level rule on the file read; the function
 # takes str, so its cell is at the command-line level (test_bootstrap_merge_block_4444.py).

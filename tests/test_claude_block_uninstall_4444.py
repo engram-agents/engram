@@ -206,6 +206,16 @@ def test_D2_round_trip_through_the_real_merge_function(rig, name, original):
     assert md.read_bytes() == expected
 
 
+@pytest.mark.parametrize("original", [b"my rules\n\n", b"my rules\n\n\n", b"a\r\nb\r\n\r\n\r\n"], ids=["one_blank", "two_blank", "crlf_two_blank"])
+def test_D2_an_original_ending_in_blank_lines_keeps_them_at_uninstall(rig, original):
+    """D2 at uninstall level: only the one blank line merge added goes. The user's own trailing blank lines
+    (one, two, CRLF) stay, byte for byte. A removal that stripped all blank lines before the block would
+    shorten the file."""
+    md = _setup(rig, original + b"\n" + _hand_block())
+    _run(rig)
+    assert md.read_bytes() == original
+
+
 def test_D2b_text_after_the_end_line_is_joined_cleanly_to_the_text_before(rig):
     """D2b: text on BOTH sides of the block: the block lines and the one blank line before them go and the
     two sides join cleanly (before + after, nothing else). A removal from the first BEGIN to the end of the
